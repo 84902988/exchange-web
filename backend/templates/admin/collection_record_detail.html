@@ -1,0 +1,149 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}归集批次详情{% endblock %}
+{% block page_title %}归集批次详情{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看一次归集批次下所有地址的处理情况。</div>
+{% endblock %}
+
+{% block content %}
+  {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+
+  <section class="page-section">
+    <div class="filter-actions">
+      <a href="/admin/collections/batches" class="btn secondary admin-btn admin-btn-secondary">返回归集统计</a>
+      <a href="/admin/collections/center" class="btn secondary admin-btn admin-btn-secondary">返回归集中心</a>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">安全说明</div>
+      <p class="muted">本页用于查看一次归集批次下所有地址的处理情况。真实发送仍受安全开关、白名单、限额和确认文本保护。</p>
+    </div>
+  </section>
+
+  {% if batch %}
+    <section class="metric-grid">
+      <div class="metric-card">
+        <div class="metric-label">批次ID</div>
+        <div class="metric-value">{{ summary.batch_id|default(batch.batch_no, true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">网络</div>
+        <div class="metric-value">{{ summary.chain_key|default('-', true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">币种</div>
+        <div class="metric-value">{{ summary.coin_symbol|default('-', true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">总归集金额</div>
+        <div class="metric-value">{{ summary.total_amount|default('-', true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">任务数</div>
+        <div class="metric-value">{{ summary.task_count|default(0, true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">成功数</div>
+        <div class="metric-value">{{ summary.success_count|default(0, true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">失败数</div>
+        <div class="metric-value">{{ summary.failed_count|default(0, true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">待处理数</div>
+        <div class="metric-value">{{ summary.pending_count|default(0, true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">需补 Gas 数</div>
+        <div class="metric-value">{{ summary.gas_required_count|default(0, true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">批次状态</div>
+        <div class="metric-value"><span class="admin-badge admin-badge-{{ summary.status_badge|default('neutral', true) }}">{{ summary.status_label|default('-', true) }}</span></div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">创建时间</div>
+        <div class="metric-value">{{ summary.created_at|default('-', true) }}</div>
+      </div>
+    </section>
+
+    <section class="page-section">
+      <div class="table-card">
+        <div class="section-title">地址处理明细</div>
+        {% if items %}
+          <div class="table-wrap admin-table-wrap">
+            <table class="data-table admin-table">
+              <thead>
+                <tr>
+                  <th>用户ID</th>
+                  <th>来源地址</th>
+                  <th>目标地址</th>
+                  <th class="text-right admin-number">任务金额</th>
+                  <th>Gas 状态</th>
+                  <th>归集状态</th>
+                  <th>归集 TxID</th>
+                  <th>补 Gas TxID</th>
+                  <th>失败原因</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for item in items %}
+                  <tr>
+                    <td class="mono admin-number admin-id">{{ item.user_id }}</td>
+                    <td class="mono nowrap" title="{{ item.from_address }}">{{ item.from_address_short }}</td>
+                    <td class="mono nowrap" title="{{ item.to_address }}">{{ item.to_address_short }}</td>
+                    <td class="mono text-right admin-number admin-amount">{{ item.amount }}</td>
+                    <td><span class="admin-badge admin-badge-{{ item.gas_status_badge }}">{{ item.gas_status_label }}</span></td>
+                    <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                    <td class="mono nowrap" title="{{ item.tx_hash }}">{{ item.tx_hash_short }}</td>
+                    <td class="mono nowrap" title="{{ item.gas_tx_hash }}">{{ item.gas_tx_hash_short }}</td>
+                    <td class="admin-muted" title="{{ item.error }}">{{ item.error_short }}</td>
+                    <td class="nowrap">
+                      <div class="admin-table-actions">
+                        <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" href="/admin/collections/tasks?task_no={{ item.task_no }}">查看详情</a>
+                        {% if item.status in ['PENDING', 'QUEUED', 'FAILED'] %}
+                          {% if real_send_enabled %}
+                            <form method="post" action="/admin/collections/tasks/{{ item.id }}/real-send" onsubmit="return confirm('确认真实发送链上归集交易？这会签名并广播链上交易，无法撤回。');">
+                              <input type="hidden" name="next_path" value="{{ current_url }}" />
+                              <button type="submit" class="btn danger admin-btn admin-btn-danger admin-btn-sm">真实发送</button>
+                            </form>
+                          {% else %}
+                            <span class="table-inline-note admin-muted">真实发送基础设施总闸未开启</span>
+                          {% endif %}
+                        {% else %}
+                          <span class="table-inline-note admin-muted">-</span>
+                        {% endif %}
+                      </div>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="empty-state admin-empty">
+            <div class="admin-empty-title">该批次暂无归集任务</div>
+          </div>
+        {% endif %}
+        <div class="pagination admin-pagination">
+          <div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+          <div class="pagination-actions">
+            {% if pagination.page > 1 %}<a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>{% endif %}
+            {% if pagination.page < pagination.pages %}<a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>{% endif %}
+          </div>
+        </div>
+      </div>
+    </section>
+  {% else %}
+    <section class="page-section">
+      <div class="empty-state admin-empty">
+        <div class="admin-empty-title">批次不存在</div>
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}

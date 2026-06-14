@@ -1,0 +1,103 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}平台账户 / 平台对手方敞口{% endblock %}
+{% block page_title %}平台账户 / 平台对手方敞口{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">当前为平台系统账户资产总览，用于平台对手方记账和敞口核查。</div>
+{% endblock %}
+
+{% block content %}
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/platform-account" class="filter-form">
+        <div class="field">
+          <label for="coin_symbol">币种</label>
+          <input id="coin_symbol" type="text" name="coin_symbol" value="{{ filters.coin_symbol or '' }}" placeholder="例如 USDT" />
+        </div>
+        <div class="field">
+          <label for="chain_key">链标识</label>
+          <input id="chain_key" type="text" name="chain_key" value="{{ filters.chain_key or '' }}" placeholder="例如 BSC 网络" />
+        </div>
+        <div class="field">
+          <label for="has_balance">余额范围</label>
+          <select id="has_balance" name="has_balance">
+            <option value="1" {% if filters.has_balance == '1' %}selected{% endif %}>仅看非零余额</option>
+            <option value="" {% if not filters.has_balance %}selected{% endif %}>显示全部</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="has_frozen">冻结筛选</label>
+          <select id="has_frozen" name="has_frozen">
+            <option value="">全部</option>
+            <option value="1" {% if filters.has_frozen == '1' %}selected{% endif %}>仅看有冻结</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/platform-account" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">平台账户资产列表</div>
+      <div class="table-inline-note">
+        当前平台账户用户ID：<span class="admin-badge admin-badge-purple">{{ platform_user_id }}</span>
+      </div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>用户ID</th>
+                <th class="nowrap">币种</th>
+                <th class="nowrap">链标识</th>
+                <th class="text-right">可用余额</th>
+                <th class="text-right">冻结余额</th>
+                <th class="text-right">总余额</th>
+                <th class="nowrap">更新时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td class="mono nowrap">{{ item.coin_symbol }}</td>
+                  <td class="mono nowrap">{{ item.chain_key }}</td>
+                  <td class="admin-amount">{{ item.available_amount }}</td>
+                  <td class="admin-amount">{{ item.frozen_amount }}</td>
+                  <td class="admin-amount">{{ item.total_amount }}</td>
+                  <td class="nowrap admin-time">{{ item.updated_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无符合条件的平台账户资产数据</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

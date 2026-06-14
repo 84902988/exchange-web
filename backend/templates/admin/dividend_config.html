@@ -1,0 +1,531 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}分红配置{% endblock %}
+{% block page_title %}分红配置{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">规则配置中心：只维护 SVIP 分红规则、VIP 费率规则和全局参数，不展示批次结果。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/dividend-stats" class="btn secondary admin-btn admin-btn-secondary">分红统计</a>
+  <a href="/admin/dividend-pools" class="btn secondary admin-btn admin-btn-secondary">分红管理</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .rule-card{ padding:12px 12px 14px; }
+    .rule-table{
+      width:100%;
+      min-width:0;
+      table-layout:fixed;
+      font-size:12px;
+    }
+    .rule-table th,
+    .rule-table td{
+      padding:8px 8px;
+      line-height:1.28;
+      vertical-align:middle;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .rule-table th{
+      white-space:nowrap;
+      font-size:12px;
+    }
+    .rule-table th.text-right,
+    .rule-table td.text-right{
+      text-align:right;
+    }
+    .rule-level{
+      font-weight:800;
+      white-space:nowrap;
+      padding:0;
+    }
+    .rule-level-note{
+      margin-top:2px;
+      color:var(--muted);
+      font-size:11px;
+      white-space:nowrap;
+    }
+    .rule-number{
+      font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;
+      font-variant-numeric:tabular-nums;
+      white-space:nowrap;
+      font-size:12px;
+    }
+    .rule-actions{ display:inline-flex; gap:5px; align-items:center; flex-wrap:nowrap; }
+    .rule-actions .btn{
+      min-height:28px;
+      padding:0 9px;
+      border-radius:8px;
+      font-size:11px;
+      white-space:nowrap;
+    }
+    .rule-table .badge{
+      min-height:22px;
+      padding:0 8px;
+      font-size:11px;
+    }
+    .rule-table td.rule-action-cell,
+    .rule-table th.rule-action-cell{
+      width:150px;
+      overflow:visible;
+      text-align:left;
+    }
+    .rule-status-cell{ width:70px; }
+    .rule-level-cell{ width:140px; }
+    .rule-num-cell{ width:128px; }
+    .rule-short-cell{ width:96px; }
+    .rule-rate-cell{ width:94px; }
+    .global-grid{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:12px;
+      margin-bottom:14px;
+    }
+    .global-item{
+      padding:14px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:12px;
+      background:rgba(255,255,255,.03);
+    }
+    .global-label{ color:var(--muted); font-size:12px; margin-bottom:6px; }
+    .global-value{ font-weight:800; }
+    .modal-backdrop{
+      position:fixed;
+      inset:0;
+      z-index:100;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      padding:24px;
+      background:rgba(0,0,0,.62);
+      backdrop-filter:blur(4px);
+    }
+    .modal-backdrop.is-open{ display:flex; }
+    .rule-modal{
+      width:min(620px,90vw);
+      max-height:88vh;
+      overflow:auto;
+      border:1px solid #2b2d36;
+      border-radius:14px;
+      background:linear-gradient(180deg,#1f2028,#17181f);
+      box-shadow:0 22px 70px rgba(0,0,0,.55);
+    }
+    .rule-modal-head{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:14px;
+      padding:18px 20px;
+      border-bottom:1px solid #2b2d36;
+    }
+    .rule-modal-title{
+      margin:0;
+      font-size:18px;
+      font-weight:900;
+      line-height:1.25;
+    }
+    .modal-close{
+      width:34px;
+      height:34px;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:10px;
+      background:rgba(255,255,255,.05);
+      color:#fff;
+      cursor:pointer;
+      font-size:20px;
+      line-height:1;
+    }
+    .rule-modal-body{ padding:18px 20px 20px; }
+    .readonly-grid{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:10px;
+      margin-bottom:16px;
+    }
+    .readonly-item{
+      min-width:0;
+      padding:12px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:12px;
+      background:rgba(255,255,255,.03);
+    }
+    .readonly-label{ color:var(--muted); font-size:12px; margin-bottom:5px; }
+    .readonly-value{ font-weight:800; word-break:break-word; }
+    .modal-form-grid{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:12px;
+    }
+    .modal-form-grid.is-vip{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .modal-error{
+      display:none;
+      margin-top:12px;
+      padding:10px 12px;
+      border:1px solid rgba(216,89,89,.32);
+      border-radius:10px;
+      background:rgba(177,52,52,.14);
+      color:#ffb4b4;
+      font-size:13px;
+    }
+    .modal-error.is-visible{ display:block; }
+    .modal-actions{
+      display:flex;
+      justify-content:flex-end;
+      gap:10px;
+      margin-top:18px;
+      padding-top:16px;
+      border-top:1px solid #2b2d36;
+    }
+    .body-modal-open{ overflow:hidden; }
+    @media (max-width:900px){
+      .global-grid{ grid-template-columns:1fr; }
+      .readonly-grid,
+      .modal-form-grid,
+      .modal-form-grid.is-vip{ grid-template-columns:1fr; }
+      .modal-actions{ justify-content:stretch; }
+      .modal-actions .btn{ flex:1; }
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section"><div class="card"><div class="section-title">操作成功</div><p class="muted">{{ notice }}</p></div></section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section"><div class="card"><div class="section-title">操作失败</div><p class="muted">{{ error }}</p></div></section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="table-card rule-card">
+      <div class="section-title">SVIP 分红规则</div>
+      {% if svip_rules %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table rule-table">
+            <colgroup>
+              <col class="rule-level-cell" />
+              <col class="rule-num-cell" />
+              <col class="rule-short-cell" />
+              <col class="rule-rate-cell" />
+              <col class="rule-rate-cell" />
+              <col class="rule-rate-cell" />
+              <col class="rule-status-cell" />
+              <col class="rule-action-cell" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>SVIP等级</th>
+                <th class="text-right">锁仓数量</th>
+                <th class="text-right">锁仓周期</th>
+                <th class="text-right">分红比例</th>
+                <th class="text-right">maker费率</th>
+                <th class="text-right">taker费率</th>
+                <th class="rule-status-cell">状态</th>
+                <th class="rule-action-cell">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in svip_rules %}
+                <tr>
+                  <td>
+                    <div class="rule-level">{{ item.level_code }}</div>
+                  </td>
+                  <td class="text-right rule-number admin-amount">{{ item.min_lock_amount }}</td>
+                  <td class="text-right rule-number admin-number">{{ item.lock_period_days }} 天</td>
+                  <td class="text-right rule-number admin-amount">{{ item.dividend_rate }}</td>
+                  <td class="text-right rule-number admin-amount">{{ item.spot_maker_fee }}</td>
+                  <td class="text-right rule-number admin-amount">{{ item.spot_taker_fee }}</td>
+                  <td><span class="admin-badge admin-badge-{{ 'secondary' if item.status_badge in ['danger', 'neutral', 'muted'] and not item.is_enabled else item.status_badge }}">{{ item.status_label }}</span></td>
+                  <td class="rule-action-cell">
+                    <div class="rule-actions">
+                      <button
+                        type="button"
+                        class="btn secondary js-edit-rule admin-btn admin-btn-secondary"
+                        data-rule-type="SVIP"
+                        data-rule-id="{{ item.id }}"
+                        data-level-code="{{ item.level_code|e }}"
+                        data-level-name="{{ item.level_name|e }}"
+                        data-min-lock-amount="{{ item.min_lock_amount|e }}"
+                        data-lock-period-days="{{ item.lock_period_days|e }}"
+                        data-dividend-rate="{{ item.dividend_rate_input|e }}"
+                        data-maker-rate="{{ item.spot_maker_fee_input|e }}"
+                        data-taker-rate="{{ item.spot_taker_fee_input|e }}"
+                      >编辑</button>
+                      <form method="post" action="/admin/dividend-config/rules/{{ item.id }}/toggle" onsubmit="return confirm('{{ '确认停用该等级？停用后对应规则不再生效。' if item.is_enabled else '确认启用该等级？启用后对应规则将重新生效。' }}');">
+                        <button type="submit" class="btn secondary admin-btn admin-btn-secondary">{{ '禁用' if item.is_enabled else '启用' }}</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无 SVIP 规则。</div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card rule-card">
+      <div class="section-title">VIP 费率规则</div>
+      {% if vip_rules %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table rule-table">
+            <colgroup>
+              <col class="rule-level-cell" />
+              <col class="rule-num-cell" />
+              <col class="rule-num-cell" />
+              <col class="rule-rate-cell" />
+              <col class="rule-rate-cell" />
+              <col class="rule-status-cell" />
+              <col class="rule-action-cell" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>VIP等级</th>
+                <th class="text-right">30天交易量门槛</th>
+                <th class="text-right">RCB持有量门槛</th>
+                <th class="text-right">maker费率</th>
+                <th class="text-right">taker费率</th>
+                <th class="rule-status-cell">状态</th>
+                <th class="rule-action-cell">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in vip_rules %}
+                <tr>
+                  <td>
+                    <div class="rule-level">{{ item.level_code }}</div>
+                  </td>
+                  <td class="text-right rule-number admin-amount">{{ item.min_30d_volume }}</td>
+                  <td class="text-right rule-number admin-amount">{{ item.min_rcb_hold }}</td>
+                  <td class="text-right rule-number admin-amount">{{ item.spot_maker_fee }}</td>
+                  <td class="text-right rule-number admin-amount">{{ item.spot_taker_fee }}</td>
+                  <td><span class="admin-badge admin-badge-{{ 'secondary' if item.status_badge in ['danger', 'neutral', 'muted'] and not item.is_enabled else item.status_badge }}">{{ item.status_label }}</span></td>
+                  <td class="rule-action-cell">
+                    <div class="rule-actions">
+                      <button
+                        type="button"
+                        class="btn secondary js-edit-rule admin-btn admin-btn-secondary"
+                        data-rule-type="VIP"
+                        data-rule-id="{{ item.id }}"
+                        data-level-code="{{ item.level_code|e }}"
+                        data-level-name="{{ item.level_name|e }}"
+                        data-min-volume="{{ item.min_30d_volume|e }}"
+                        data-min-rcb-hold="{{ item.min_rcb_hold|e }}"
+                        data-maker-rate="{{ item.spot_maker_fee_input|e }}"
+                        data-taker-rate="{{ item.spot_taker_fee_input|e }}"
+                      >编辑</button>
+                      <form method="post" action="/admin/dividend-config/rules/{{ item.id }}/toggle" onsubmit="return confirm('{{ '确认停用该等级？停用后对应规则不再生效。' if item.is_enabled else '确认启用该等级？启用后对应规则将重新生效。' }}');">
+                        <button type="submit" class="btn secondary admin-btn admin-btn-secondary">{{ '禁用' if item.is_enabled else '启用' }}</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无 VIP 规则。</div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">分红全局参数</div>
+      <div class="global-grid">
+        <div class="global-item"><div class="global-label">分红周期</div><div class="global-value">每日</div></div>
+        <div class="global-item"><div class="global-label">每日计划执行时间</div><div class="global-value">{{ config.run_time_utc or '00:10' }} UTC</div></div>
+        <div class="global-item"><div class="global-label">最低分红金额</div><div class="global-value">按批次实际计算</div></div>
+        <div class="global-item"><div class="global-label">手续费归集范围</div><div class="global-value">平台交易手续费池</div></div>
+        <div class="global-item"><div class="global-label">每日价格快照时间</div><div class="global-value">{{ config.rcb_price_snapshot_time or '00:00' }} UTC</div></div>
+        <div class="global-item"><div class="global-label">自动执行开关</div><div class="global-value"><span class="admin-badge admin-badge-success">启用</span></div></div>
+      </div>
+      <form method="post" action="/admin/dividend-config" class="filter-form">
+        <div class="field">
+          <label for="run_time_utc">每日计划执行时间</label>
+          <input id="run_time_utc" name="run_time_utc" value="{{ config.run_time_utc or '00:10' }}" placeholder="HH:MM" />
+        </div>
+        <div class="field">
+          <label for="rcb_price_snapshot_time">每日价格快照时间</label>
+          <input id="rcb_price_snapshot_time" name="rcb_price_snapshot_time" value="{{ config.rcb_price_snapshot_time or '00:00' }}" placeholder="HH:MM" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">保存参数</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <div class="modal-backdrop" id="rule-modal-backdrop" aria-hidden="true">
+    <div class="rule-modal" role="dialog" aria-modal="true" aria-labelledby="rule-modal-title">
+      <div class="rule-modal-head">
+        <h2 class="rule-modal-title" id="rule-modal-title">编辑规则</h2>
+        <button type="button" class="modal-close" id="rule-modal-close" aria-label="关闭">×</button>
+      </div>
+      <form method="post" id="rule-modal-form" action="/admin/dividend-config/rules/0" novalidate>
+        <div class="rule-modal-body">
+          <div class="readonly-grid" id="modal-readonly-grid"></div>
+          <div class="modal-form-grid" id="modal-form-grid">
+            <div class="field" id="dividend-rate-field">
+              <label for="modal-dividend-rate">分红比例(%)</label>
+              <input id="modal-dividend-rate" name="dividend_rate" inputmode="decimal" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="modal-maker-rate">maker费率(%)</label>
+              <input id="modal-maker-rate" name="spot_maker_fee" inputmode="decimal" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="modal-taker-rate">taker费率(%)</label>
+              <input id="modal-taker-rate" name="spot_taker_fee" inputmode="decimal" autocomplete="off" />
+            </div>
+          </div>
+          <div class="modal-error" id="rule-modal-error"></div>
+          <div class="modal-actions">
+            <button type="button" class="btn secondary admin-btn admin-btn-secondary" id="rule-modal-cancel">取消</button>
+            <button type="submit" class="btn admin-btn admin-btn-primary">保存修改</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    (function(){
+      var backdrop = document.getElementById("rule-modal-backdrop");
+      var form = document.getElementById("rule-modal-form");
+      var title = document.getElementById("rule-modal-title");
+      var readonlyGrid = document.getElementById("modal-readonly-grid");
+      var formGrid = document.getElementById("modal-form-grid");
+      var dividendField = document.getElementById("dividend-rate-field");
+      var dividendInput = document.getElementById("modal-dividend-rate");
+      var makerInput = document.getElementById("modal-maker-rate");
+      var takerInput = document.getElementById("modal-taker-rate");
+      var errorBox = document.getElementById("rule-modal-error");
+      var closeButtons = [
+        document.getElementById("rule-modal-close"),
+        document.getElementById("rule-modal-cancel")
+      ];
+
+      function escapeHtml(value){
+        return String(value || "").replace(/[&<>"']/g, function(ch){
+          return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch];
+        });
+      }
+
+      function readonlyItem(label, value){
+        return '<div class="readonly-item"><div class="readonly-label">' + escapeHtml(label) +
+          '</div><div class="readonly-value">' + escapeHtml(value || "-") + '</div></div>';
+      }
+
+      function showError(message){
+        errorBox.textContent = message;
+        errorBox.classList.add("is-visible");
+      }
+
+      function clearError(){
+        errorBox.textContent = "";
+        errorBox.classList.remove("is-visible");
+      }
+
+      function closeModal(){
+        backdrop.classList.remove("is-open");
+        backdrop.setAttribute("aria-hidden", "true");
+        document.body.classList.remove("body-modal-open");
+        clearError();
+      }
+
+      function openModal(button){
+        var type = button.dataset.ruleType;
+        var levelCode = button.dataset.levelCode || "";
+        title.textContent = "编辑 " + type + " 规则 - " + levelCode;
+        form.action = "/admin/dividend-config/rules/" + button.dataset.ruleId;
+        makerInput.value = button.dataset.makerRate || "";
+        takerInput.value = button.dataset.takerRate || "";
+
+        if (type === "SVIP") {
+          readonlyGrid.innerHTML =
+            readonlyItem("SVIP等级", levelCode) +
+            readonlyItem("锁仓数量", button.dataset.minLockAmount) +
+            readonlyItem("锁仓周期", (button.dataset.lockPeriodDays || "-") + " 天");
+          dividendField.style.display = "";
+          dividendInput.disabled = false;
+          dividendInput.value = button.dataset.dividendRate || "";
+          formGrid.classList.remove("is-vip");
+        } else {
+          readonlyGrid.innerHTML =
+            readonlyItem("VIP等级", levelCode) +
+            readonlyItem("30天交易量门槛", button.dataset.minVolume) +
+            readonlyItem("RCB持有量门槛", button.dataset.minRcbHold);
+          dividendField.style.display = "none";
+          dividendInput.disabled = false;
+          dividendInput.value = "0";
+          formGrid.classList.add("is-vip");
+        }
+
+        clearError();
+        backdrop.classList.add("is-open");
+        backdrop.setAttribute("aria-hidden", "false");
+        document.body.classList.add("body-modal-open");
+        setTimeout(function(){ makerInput.focus(); }, 0);
+      }
+
+      function readPercent(input, label){
+        var text = String(input.value || "").trim().replace(/%$/, "").trim();
+        if (!text) {
+          throw new Error(label + "不能为空");
+        }
+        var value = Number(text);
+        if (!Number.isFinite(value)) {
+          throw new Error(label + "必须是数字");
+        }
+        if (value < 0 || value > 100) {
+          throw new Error(label + "必须在 0~100 之间");
+        }
+        input.value = String(value);
+        return value;
+      }
+
+      document.querySelectorAll(".js-edit-rule").forEach(function(button){
+        button.addEventListener("click", function(){ openModal(button); });
+      });
+
+      closeButtons.forEach(function(button){
+        button.addEventListener("click", closeModal);
+      });
+
+      backdrop.addEventListener("click", function(event){
+        if (event.target === backdrop) {
+          closeModal();
+        }
+      });
+
+      document.addEventListener("keydown", function(event){
+        if (event.key === "Escape" && backdrop.classList.contains("is-open")) {
+          closeModal();
+        }
+      });
+
+      form.addEventListener("submit", function(event){
+        try {
+          clearError();
+          if (dividendField.style.display !== "none") {
+            readPercent(dividendInput, "分红比例");
+          }
+          readPercent(makerInput, "maker费率");
+          readPercent(takerInput, "taker费率");
+          if (!window.confirm("确认修改该等级费率配置？保存后会影响后续费率计算。")) {
+            event.preventDefault();
+          }
+        } catch (err) {
+          event.preventDefault();
+          showError(err.message || "请检查输入内容");
+        }
+      });
+    })();
+  </script>
+{% endblock %}

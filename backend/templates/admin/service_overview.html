@@ -1,0 +1,140 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}常驻服务总览{% endblock %}
+{% block page_title %}常驻服务总览{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">只读查看上线必须常驻的 API、RQ worker、scheduler、loop、scanner 清单和可观测状态。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/system/services" class="btn secondary admin-btn admin-btn-secondary">刷新</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .service-summary-grid{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(0, 1fr));
+      gap:14px;
+    }
+    .service-name{
+      font-weight:800;
+      color:#fff;
+      white-space:nowrap;
+    }
+    .service-command{
+      max-width:260px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .service-impact{
+      min-width:220px;
+      color:var(--muted);
+      line-height:1.45;
+    }
+    .service-observed-detail{
+      margin-top:6px;
+      color:var(--muted);
+      font-size:12px;
+      white-space:nowrap;
+    }
+    @media (max-width: 1180px){
+      .service-summary-grid{ grid-template-columns:1fr; }
+    }
+  </style>
+
+  {% if service_overview.error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">观测提示</div>
+        <p class="muted">{{ service_overview.error }}。RQ worker 数量暂时按 0 展示。</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="service-summary-grid">
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">服务项</div>
+          <div class="stat-icon">S</div>
+        </div>
+        <div class="stat-value admin-number">{{ service_overview.summary.service_count }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">可观测正常</div>
+          <div class="stat-icon">O</div>
+        </div>
+        <div class="stat-value admin-number">{{ service_overview.summary.running_count }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">未观测</div>
+          <div class="stat-icon">A</div>
+        </div>
+        <div class="stat-value admin-number">{{ service_overview.summary.unobserved_count }}</div>
+        <div class="stat-note">未观测</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">异常</div>
+          <div class="stat-icon">E</div>
+        </div>
+        <div class="stat-value admin-number">{{ service_overview.summary.abnormal_count }}</div>
+      </div>
+    </div>
+    <div class="stat-note">刷新时间：{{ service_overview.as_of }}</div>
+  </section>
+
+  {% for group in service_overview.groups %}
+    <section class="page-section">
+      <div class="table-card">
+        <div class="section-title">{{ group.title }}</div>
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>服务名称</th>
+                <th>类型</th>
+                <th>期望状态</th>
+                <th>运行模式</th>
+                <th>当前可观测状态</th>
+                <th>漏启动影响</th>
+                <th>Linux systemd service</th>
+                <th>本地 Windows 对应窗口/命令</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in group.services %}
+                <tr>
+                  <td><span class="service-name">{{ item.name }}</span></td>
+                  <td><span class="admin-badge admin-badge-info">{{ item.type }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ item.expected_badge }}">{{ item.expected }}</span></td>
+                  <td><span class="admin-badge admin-badge-neutral">{{ item.run_mode }}</span></td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.observed_badge }}">{{ item.observed }}</span>
+                    {% if item.observed_detail %}
+                      <div class="service-observed-detail">{{ item.observed_detail }}</div>
+                    {% endif %}
+                  </td>
+                  <td class="service-impact">{{ item.impact }}</td>
+                  <td class="mono service-command" title="{{ item.systemd }}">{{ item.systemd }}</td>
+                  <td class="mono service-command" title="{{ item.windows }}">{{ item.windows }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  {% endfor %}
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">说明</div>
+      <p class="muted">API、RQ Worker 与已接入 Redis heartbeat 的 scheduler / loop / scanner 当前可在页面中观测。V1 页面暂不调用 systemctl，不读取服务器进程表；后续可继续扩展更多服务心跳。</p>
+    </div>
+  </section>
+{% endblock %}

@@ -1,0 +1,277 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}资产查询{% endblock %}
+{% block page_title %}资产查询{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">按用户与币种聚合查看 Funding / Spot / Contract 资产分布。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .asset-detail-modal[hidden] {
+      display: none;
+    }
+
+    .asset-detail-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(3, 7, 18, 0.72);
+    }
+
+    .asset-detail-dialog {
+      width: min(980px, 100%);
+      max-height: calc(100vh - 48px);
+      overflow: auto;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 12px;
+      background: #111827;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+    }
+
+    .asset-detail-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 20px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+    }
+
+    .asset-detail-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: #f8fafc;
+    }
+
+    .asset-detail-body {
+      padding: 16px 20px 20px;
+    }
+
+    .asset-summary-coins {
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  </style>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/assets" class="filter-form">
+        <div class="field">
+          <label for="user_id">用户 ID</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" placeholder="请输入 user_id" />
+        </div>
+        <div class="field">
+          <label for="keyword">关键词</label>
+          <input id="keyword" type="text" name="keyword" value="{{ filters.keyword or '' }}" placeholder="email / phone" />
+        </div>
+        <div class="field">
+          <label for="coin_symbol">币种</label>
+          <input id="coin_symbol" type="text" name="coin_symbol" value="{{ filters.coin_symbol or '' }}" placeholder="例如 USDT" />
+        </div>
+        <div class="field">
+          <label for="account_type">账户类型</label>
+          <select id="account_type" name="account_type">
+            <option value="">全部</option>
+            <option value="funding" {% if filters.account_type == 'funding' or filters.chain_key == 'funding' %}selected{% endif %}>Funding</option>
+            <option value="spot" {% if filters.account_type == 'spot' or filters.chain_key == 'spot' %}selected{% endif %}>Spot</option>
+            <option value="contract" {% if filters.account_type == 'contract' or filters.chain_key == 'contract' %}selected{% endif %}>Contract</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="non_zero_only">仅看非零余额</label>
+          <select id="non_zero_only" name="non_zero_only">
+            <option value="">全部</option>
+            <option value="1" {% if filters.non_zero_only == '1' %}selected{% endif %}>是</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="has_frozen">仅看有冻结</label>
+          <select id="has_frozen" name="has_frozen">
+            <option value="">全部</option>
+            <option value="1" {% if filters.has_frozen == '1' %}selected{% endif %}>是</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/assets" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+      {% if filters.non_zero_only == '1' %}
+        <div class="empty-state admin-empty">默认仅显示非零余额资产</div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">用户资产聚合视图</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="admin-table">
+            <thead>
+              <tr>
+                <th>用户ID</th>
+                <th>邮箱 / 手机</th>
+                <th class="text-right admin-number">币种数量</th>
+                <th>有余额币种</th>
+                <th>Funding资产</th>
+                <th>Spot资产</th>
+                <th>Contract资产</th>
+                <th>冻结资产</th>
+                <th>最后更新时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td>
+                    <div>{{ item.email_display }}</div>
+                    <div class="admin-muted">{{ item.phone_display }}</div>
+                  </td>
+                  <td class="admin-amount">{{ item.asset_coin_count }}</td>
+                  <td class="mono asset-summary-coins" title="{{ item.coin_symbols_display }}">{{ item.coin_symbols_display }}</td>
+                  <td>{{ item.funding_total_display }}</td>
+                  <td>{{ item.spot_total_display }}</td>
+                  <td>{{ item.contract_total_display }}</td>
+                  <td>{{ item.frozen_total_display }}</td>
+                  <td class="nowrap admin-time">{{ item.latest_updated_at_display or '-' }}</td>
+                  <td>
+                    <button
+                      type="button"
+                      class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+                      data-asset-detail-open="{{ item.user_id }}"
+                    >查看资产</button>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        {% for item in items %}
+          <section class="asset-detail-modal" data-asset-detail-modal="{{ item.user_id }}" hidden>
+            <div class="asset-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="asset-detail-title-{{ item.user_id }}">
+              <div class="asset-detail-head">
+                <div>
+                  <div id="asset-detail-title-{{ item.user_id }}" class="asset-detail-title">用户资产明细 - 用户ID {{ item.user_id }}</div>
+                  <div class="admin-muted">{{ item.email_display }} / {{ item.phone_display }}</div>
+                </div>
+                <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-asset-detail-close>关闭</button>
+              </div>
+              <div class="asset-detail-body">
+                {% if item.asset_details %}
+                  <div class="table-wrap admin-table-wrap">
+                    <table class="admin-table">
+                      <thead>
+                        <tr>
+                          <th>币种</th>
+                          <th class="text-right admin-number">Funding账户</th>
+                          <th class="text-right admin-number">Spot账户</th>
+                          <th class="text-right admin-number">Contract账户</th>
+                          <th class="text-right admin-number">冻结总额</th>
+                          <th class="text-right admin-number">小计</th>
+                          <th>更新时间</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {% for detail in item.asset_details %}
+                          <tr>
+                            <td class="mono nowrap">{{ detail.coin_symbol }}</td>
+                            <td class="admin-amount">{{ detail.funding_available }}</td>
+                            <td class="admin-amount">{{ detail.spot_available }}</td>
+                            <td class="admin-amount">{{ detail.contract_available }}</td>
+                            <td class="admin-amount">{{ detail.frozen_total }}</td>
+                            <td class="admin-amount">{{ detail.total_amount }}</td>
+                            <td class="nowrap admin-time">{{ detail.updated_at or '-' }}</td>
+                          </tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                {% else %}
+                  <div class="admin-empty">暂无符合条件的资产明细</div>
+                {% endif %}
+              </div>
+            </div>
+          </section>
+        {% endfor %}
+      {% else %}
+        <div class="empty-state admin-empty">暂无符合条件的资产数据</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <script>
+    (function () {
+      function closeModal(modal) {
+        if (!modal) {
+          return;
+        }
+        modal.hidden = true;
+        document.body.style.overflow = "";
+      }
+
+      document.querySelectorAll("[data-asset-detail-open]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          var userId = button.getAttribute("data-asset-detail-open");
+          var modal = document.querySelector('[data-asset-detail-modal="' + userId + '"]');
+          if (!modal) {
+            return;
+          }
+          modal.hidden = false;
+          document.body.style.overflow = "hidden";
+        });
+      });
+
+      document.querySelectorAll("[data-asset-detail-close]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          closeModal(button.closest("[data-asset-detail-modal]"));
+        });
+      });
+
+      document.querySelectorAll("[data-asset-detail-modal]").forEach(function (modal) {
+        modal.addEventListener("click", function (event) {
+          if (event.target === modal) {
+            closeModal(modal);
+          }
+        });
+      });
+
+      document.addEventListener("keydown", function (event) {
+        if (event.key !== "Escape") {
+          return;
+        }
+        document.querySelectorAll("[data-asset-detail-modal]:not([hidden])").forEach(closeModal);
+      });
+    })();
+  </script>
+{% endblock %}

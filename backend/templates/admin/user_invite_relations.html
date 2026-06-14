@@ -1,0 +1,108 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}邀请关系{% endblock %}
+{% block page_title %}邀请关系{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">运营查看普通邀请绑定关系，用于核对邀请人、被邀请人、绑定来源与绑定时间。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .invite-filter-form{grid-template-columns:repeat(4,minmax(0,1fr)) auto}
+    .invite-table{min-width:0;table-layout:fixed}
+    .invite-cell{min-width:0;overflow-wrap:anywhere;word-break:break-word;line-height:1.45}
+    .invite-muted{margin-top:4px;color:var(--muted);font-size:12px;line-height:1.45;overflow-wrap:anywhere;word-break:break-word}
+    .invite-number{font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
+    @media (max-width:1180px){.invite-filter-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media (max-width:720px){.invite-filter-form{grid-template-columns:1fr}.invite-table{min-width:760px}}
+  </style>
+
+  <section class="page-section">
+    <div class="filter-card admin-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/invite/relations" class="filter-form invite-filter-form">
+        <div class="field">
+          <label for="inviter_user_id">邀请人</label>
+          <input id="inviter_user_id" name="inviter_user_id" value="{{ filters.inviter_user_id or '' }}" />
+        </div>
+        <div class="field">
+          <label for="invitee_user_id">被邀请人</label>
+          <input id="invitee_user_id" name="invitee_user_id" value="{{ filters.invitee_user_id or '' }}" />
+        </div>
+        <div class="field">
+          <label for="invite_code">邀请码</label>
+          <input id="invite_code" name="invite_code" value="{{ filters.invite_code or '' }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="" {% if not filters.status %}selected{% endif %}>全部</option>
+            <option value="ACTIVE" {% if filters.status == 'ACTIVE' %}selected{% endif %}>生效中</option>
+            <option value="DISABLED" {% if filters.status == 'DISABLED' %}selected{% endif %}>已停用</option>
+            <option value="INACTIVE" {% if filters.status == 'INACTIVE' %}selected{% endif %}>已停用</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/invite/relations" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card admin-card">
+      <div class="section-title">邀请关系列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table invite-table">
+            <colgroup><col style="width:12%"><col style="width:26%"><col style="width:18%"><col style="width:14%"><col style="width:14%"><col style="width:16%"></colgroup>
+            <thead>
+              <tr>
+                <th>记录</th>
+                <th>用户关系</th>
+                <th>邀请码</th>
+                <th>来源</th>
+                <th>状态</th>
+                <th>时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td><div class="invite-cell invite-number admin-id">#{{ item.id }}</div></td>
+                  <td>
+                    <div class="invite-cell admin-id">邀请人 用户 {{ item.inviter_user_id }}</div>
+                    <div class="invite-muted admin-id">被邀请人 用户 {{ item.invitee_user_id }}</div>
+                    <div class="invite-muted admin-time">绑定时间 {{ item.created_at }}</div>
+                  </td>
+                  <td><div class="invite-cell invite-number">{{ item.invite_code or '--' }}</div></td>
+                  <td><span class="admin-badge admin-badge-{{ item.source_badge }}">{{ item.source_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></td>
+                  <td>
+                    <div class="invite-cell admin-time">{{ item.created_at }}</div>
+                    <div class="invite-muted admin-time">更新 {{ item.updated_at }}</div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无数据</div><p class="admin-empty-desc">暂无符合条件的邀请关系</p></div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

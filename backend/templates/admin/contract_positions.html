@@ -1,0 +1,108 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}合约持仓{% endblock %}
+{% block page_title %}合约持仓{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看用户 CFD 持仓、保证金与强平检测状态，只读查询。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .pnl-positive{color:#86efac;}
+    .pnl-negative{color:#fca5a5;}
+    .pnl-zero{color:var(--muted);}
+  </style>
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/contract-positions" class="filter-form">
+        <div class="field"><label for="user_id">user_id</label><input id="user_id" name="user_id" value="{{ filters.user_id or '' }}" /></div>
+        <div class="field"><label for="symbol">symbol</label><input id="symbol" name="symbol" value="{{ filters.symbol or '' }}" placeholder="BTCUSDT_PERP" /></div>
+        <div class="field">
+          <label for="side">方向</label>
+          <select id="side" name="side">
+            <option value="">全部</option>
+            <option value="LONG" {% if filters.side == "LONG" %}selected{% endif %}>做多</option>
+            <option value="SHORT" {% if filters.side == "SHORT" %}selected{% endif %}>做空</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="OPEN" {% if filters.status == "OPEN" %}selected{% endif %}>持仓中</option>
+            <option value="CLOSED" {% if filters.status == "CLOSED" %}selected{% endif %}>已平仓</option>
+            <option value="LIQUIDATED" {% if filters.status == "LIQUIDATED" %}selected{% endif %}>已强平</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="is_liquidatable">is_liquidatable</label>
+          <select id="is_liquidatable" name="is_liquidatable">
+            <option value="">全部</option>
+            <option value="1" {% if filters.is_liquidatable == '1' %}selected{% endif %}>是</option>
+            <option value="0" {% if filters.is_liquidatable == '0' %}selected{% endif %}>否</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/contract-positions" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">合约持仓列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th><th>用户ID</th><th>合约</th><th>方向</th><th>杠杆</th>
+                <th class="text-right admin-number">数量</th><th class="text-right admin-number">开仓价</th><th class="text-right admin-number">标记价</th>
+                <th class="text-right admin-number">保证金</th><th class="text-right admin-number">未实现盈亏</th><th class="text-right admin-number">已实现盈亏</th>
+                <th class="text-right admin-number">强平价</th><th class="text-right admin-number">预警价</th><th>风险</th><th>状态</th>
+                <th>开仓时间</th><th>平仓时间</th>
+                <th>close_reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.id }}</td>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td class="mono nowrap">{{ item.symbol }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.side_badge }}" title="{{ item.side }}">{{ item.side_label }}</span></td>
+                  <td class="admin-amount">{{ item.leverage_text }}</td>
+                  <td class="admin-amount">{{ item.quantity }}</td>
+                  <td class="admin-amount">{{ item.entry_price }}</td>
+                  <td class="admin-amount">{{ item.mark_price }}</td>
+                  <td class="admin-amount">{{ item.margin_amount }}</td>
+                  <td class="admin-amount {{ item.unrealized_pnl_class }}">{{ item.unrealized_pnl }}</td>
+                  <td class="admin-amount {{ item.realized_pnl_class }}">{{ item.realized_pnl }}</td>
+                  <td class="admin-amount">{{ item.liquidation_price }}</td>
+                  <td class="admin-amount">{{ item.warning_price }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.is_liquidatable_badge }}">{{ item.is_liquidatable_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                  <td class="nowrap admin-time">{{ item.opened_at }}</td>
+                  <td class="nowrap admin-time">{{ item.closed_at }}</td>
+                  <td class="admin-muted">{{ item.close_reason }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无合约持仓数据</div>
+      {% endif %}
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}<a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>{% endif %}
+          {% if pagination.page < pagination.pages %}<a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>{% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

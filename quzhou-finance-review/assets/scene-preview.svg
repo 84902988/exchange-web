@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <style>
+      text{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;fill:#f1f4f8}
+      .small{font-size:21px;fill:#c8d0d9}.head{font-size:28px;font-weight:800;fill:#c9a24d}
+      .big{font-size:42px;font-weight:900}.price{font-size:36px;font-weight:900}.up{fill:#42b56b}.down{fill:#d94a3f}.gold{fill:#c9a24d}.purple{fill:#9b6de3}
+      .card{fill:#0b121c;stroke:#2d3340;stroke-width:2}.line{fill:none;stroke-width:5;stroke-linecap:round;stroke-linejoin:round}
+    </style>
+  </defs>
+  <rect width="1920" height="1080" fill="#f4f4f2"/>
+  <text x="274" y="64" fill="#090b0e" font-size="54" font-weight="900">衢州发展（原新湖中宝）七年阴跌史 <tspan fill="#a82727">（2019-2026）</tspan></text>
+  <g transform="translate(10 106)">
+    <g>
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">00:00-00:05</text>
+      <text x="84" y="105" class="big">衢州发展</text>
+      <text x="118" y="148" class="head">七年阴跌史（2019-2026）</text>
+      <text x="126" y="195" class="small">反弹即套　阴跌不止</text>
+      <path class="line down" d="M270 68l52 48 42-14 54 72 24-18"/>
+    </g>
+    <g transform="translate(480 0)">
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">00:05-00:15</text>
+      <text x="48" y="76" class="head">2019-2021 低位筑底，题材冲高</text>
+      <text x="54" y="142" class="price">2.80元 → <tspan class="up">5.13元</tspan></text>
+      <path class="line up" d="M54 210l76-42 70 18 88-72 104-48"/>
+    </g>
+    <g transform="translate(960 0)">
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">00:15-00:25</text>
+      <text x="48" y="76" class="head">2021-2024 见顶回落，三年深度阴跌</text>
+      <text x="54" y="142" class="price"><tspan class="gold">5.13元</tspan> → <tspan class="down">1.58元</tspan></text>
+      <path class="line down" d="M54 70l88 38 76-8 84 64 102 54"/>
+    </g>
+    <g transform="translate(1440 0)">
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">00:25-00:31</text>
+      <text x="108" y="80" class="head">历史真实成交最低价</text>
+      <text x="128" y="150" font-size="72" font-weight="900" fill="#c9a24d">1.58元</text>
+      <text x="78" y="205" class="small">盘中前复权低点：1.55元（2024/7/8）</text>
+    </g>
+  </g>
+  <g transform="translate(10 382)">
+    <g>
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">00:31-00:40</text>
+      <text x="68" y="116" font-size="58" font-weight="900" fill="#9ec8ee">国资入主</text>
+      <text x="210" y="85" class="small">2024年7月</text>
+      <text x="210" y="125" class="small">衢州国资正式入主，公司更名</text>
+      <text x="210" y="175" class="small">仅起到短期维稳作用</text>
+      <text x="210" y="212" class="small">未能扭转下跌趋势</text>
+    </g>
+    <g transform="translate(480 0)">
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">00:40-00:50</text>
+      <text x="48" y="76" class="head">2024-2025 国资入驻，半导体题材爆炒</text>
+      <text x="42" y="144" class="price">1.58 → <tspan class="up">6.03</tspan> → <tspan class="down">3.50元</tspan></text>
+      <path class="line down" d="M46 218l92-42 70-102 64-24 80 120 54 24"/>
+    </g>
+    <g transform="translate(960 0)">
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">00:50-01:00</text>
+      <text x="48" y="76" class="head">2026至今 转型失败，再度破位阴跌</text>
+      <text x="58" y="142" class="price"><tspan class="gold">5.51元</tspan> → <tspan class="down">2.76元</tspan></text>
+      <path class="line purple" stroke="#9b6de3" d="M54 82l70 38 86 22 76 52 108 28"/>
+    </g>
+    <g transform="translate(1440 0)">
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">01:00-01:10</text>
+      <text x="150" y="70" class="head">五大核心原因</text>
+      <text x="42" y="118" class="small">主业持续走弱，缺乏业绩支撑</text>
+      <text x="42" y="150" class="small">反复炒作概念，市场信心耗尽</text>
+      <text x="42" y="182" class="small">债务、股权双重风险</text>
+      <text x="42" y="214" class="small">资金结构恶劣，国资托而不举</text>
+    </g>
+  </g>
+  <g transform="translate(10 658)">
+    <g>
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">01:10-01:20</text>
+      <text x="154" y="70" class="head">三、整体总结</text>
+      <text x="44" y="124" class="price">2019 <tspan class="up">2.80</tspan> → 2021 <tspan class="up">5.13</tspan></text>
+      <text x="44" y="170" class="price">2024 <tspan class="down">1.58</tspan> → 2025 <tspan class="down">6.03</tspan> → 2026 <tspan class="purple">2.76</tspan></text>
+      <text x="72" y="220" class="head">反弹即套，阴跌不止</text>
+    </g>
+    <g transform="translate(480 0)">
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">01:20-01:25</text>
+      <text x="98" y="112" class="big">股市有风险</text>
+      <text x="98" y="164" class="big">投资需谨慎</text>
+      <text x="126" y="212" class="small">理性看待　风险自担</text>
+    </g>
+    <g transform="translate(960 0)">
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">01:25-01:28</text>
+      <text x="138" y="104" font-size="54" font-weight="900" fill="#c9a24d">感谢观看</text>
+      <text x="86" y="176" class="big">点赞　关注　收藏</text>
+    </g>
+    <g transform="translate(1440 0)">
+      <rect class="card" width="455" height="252" rx="6"/>
+      <text x="18" y="35" class="small">01:28-01:30</text>
+      <text x="72" y="104" font-size="42" font-weight="900" fill="#c9a24d">更多深度复盘 敬请期待</text>
+      <rect x="170" y="150" width="116" height="72" rx="10" fill="none" stroke="#f1f4f8" stroke-width="3"/>
+      <path d="M216 168l36 18-36 18z" fill="#f1f4f8"/>
+    </g>
+  </g>
+  <text x="320" y="1036" fill="#1a1d22" font-size="24">视频时长：约90秒　|　适合平台：抖音 / 视频号 / B站 / 今日头条　|　建议分辨率：1080P（16:9）</text>
+</svg>

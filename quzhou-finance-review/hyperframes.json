@@ -1,0 +1,19 @@
+{
+  "name": "quzhou-finance-review",
+  "version": "1.0.0",
+  "composition": "index.html",
+  "width": 1920,
+  "height": 1080,
+  "duration": 90,
+  "fps": 30,
+  "output": {
+    "format": "mp4",
+    "quality": "standard"
+  },
+  "stage": "preview",
+  "notes": [
+    "Final MP4 render is held until storyboard and preview approval.",
+    "All charts are synthetic infographic animations.",
+    "No real K-line screenshots or real market data source is used."
+  ]
+}

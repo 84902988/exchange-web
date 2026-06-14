@@ -1,0 +1,478 @@
+{% set active = active|default('') %}
+{% set active_group = active_group|default('') %}
+{% set perms = current_admin_permissions|default([]) %}
+{% set is_sa = is_super_admin|default(false) %}
+{% set collection_nav_active = ['collection_center', 'collection_manual', 'collection_tools', 'collection_auto_settings', 'collection_records', 'collection_batches', 'collection_tasks'] %}
+
+{% set can_dashboard = is_sa or 'dashboard.view' in perms %}
+{% set can_users = is_sa or 'users.view' in perms %}
+{% set can_assets = is_sa or 'assets.view' in perms %}
+{% set can_balance_logs = is_sa or 'balance_logs.view' in perms %}
+{% set can_deposits = is_sa or 'deposit_records.view' in perms %}
+{% set can_withdraws = is_sa or 'withdraw_records.view' in perms %}
+{% set can_withdraw_anomalies = is_sa or 'withdraw_anomalies.view' in perms %}
+{% set can_withdraw_reviews = is_sa or 'withdraw_reviews.view' in perms %}
+{% set can_user_transfers = is_sa or 'user_transfers.view' in perms %}
+{% set can_orders = is_sa or 'orders.view' in perms %}
+{% set can_trades = is_sa or 'trades.view' in perms %}
+{% set can_market_analysis = is_sa or 'market_analysis.view' in perms %}
+{% set can_fee_settings = is_sa or 'fee_settings.manage' in perms %}
+{% set can_contract_orders = is_sa or 'contract_orders.view' in perms %}
+{% set can_contract_trades = is_sa or 'contract_trades.view' in perms %}
+{% set can_contract_positions = is_sa or 'contract_positions.view' in perms %}
+{% set can_contract_accounts = is_sa or 'contract_accounts.view' in perms %}
+{% set can_contract_liquidations = is_sa or 'contract_liquidations.view' in perms %}
+{% set can_pairs = is_sa or 'trading_pairs.manage' in perms %}
+{% set can_contract_symbols = is_sa or 'contract_symbols.manage' in perms %}
+{% set can_asset_configs = is_sa or 'asset_configs.manage' in perms %}
+{% set can_platform_accounts = is_sa or 'platform_accounts.view' in perms %}
+{% set can_platform_adjust = is_sa or 'platform_adjust.manage' in perms %}
+{% set can_collection_tasks = is_sa or 'collection_tasks.manage' in perms %}
+{% set can_hot_wallets = can_collection_tasks %}
+{% set can_dealer_risk = is_sa or 'dealer_risk.manage' in perms %}
+{% set can_vip = is_sa or 'vip.view' in perms %}
+{% set can_dividend = is_sa or 'dividend.view' in perms %}
+{% set can_bd = is_sa or 'bd.view' in perms %}
+{% set can_invite = is_sa or 'invite.view' in perms %}
+{% set can_stock_locks = is_sa or 'stock_locks.view' in perms %}
+{% set can_site_settings = is_sa or 'site_settings.manage' in perms %}
+{% set can_banners = is_sa or 'banners.manage' in perms %}
+{% set can_announcements = is_sa or 'announcements.manage' in perms %}
+{% set can_audit = is_sa or 'audit.view' in perms %}
+
+{% set show_overview = can_dashboard %}
+{% set show_market_analysis = can_market_analysis %}
+{% set show_users = can_users or can_vip or can_bd or can_invite %}
+{% set show_funds = can_assets or can_balance_logs or can_deposits or can_withdraws or can_withdraw_anomalies or can_withdraw_reviews or can_user_transfers or can_platform_adjust or can_collection_tasks or can_hot_wallets or can_stock_locks or can_asset_configs %}
+{% set show_trade = can_orders or can_trades or can_fee_settings or can_pairs or can_contract_orders or can_contract_trades or can_contract_positions or can_contract_accounts or can_contract_liquidations or can_contract_symbols or can_platform_accounts or can_dealer_risk %}
+{% set show_operations = can_site_settings or can_banners or can_announcements or can_dividend %}
+{% set show_system_tasks = is_sa or can_stock_locks or can_bd or can_dividend %}
+{% set show_system_security = is_sa or can_audit %}
+{% set show_system = show_system_tasks or show_system_security %}
+
+<aside class="sidebar">
+  {% if show_overview %}
+    <details class="group" {% if active_group == 'overview' or active in ['dashboard', 'funds_dashboard', 'trading_dashboard', 'risk_dashboard'] %}open{% endif %}>
+      <summary>概览 <span class="chev">▾</span></summary>
+      <div class="nav">
+        <a href="/admin/dashboard" class="{% if active == 'dashboard' %}active{% endif %}">
+          <span class="icon">D</span> 总览驾驶舱
+        </a>
+        <a href="/admin/funds-dashboard" class="{% if active == 'funds_dashboard' %}active{% endif %}">
+          <span class="icon">F</span> 资金驾驶舱
+        </a>
+        <a href="/admin/trading-dashboard" class="{% if active == 'trading_dashboard' %}active{% endif %}">
+          <span class="icon">T</span> 交易驾驶舱
+        </a>
+        <a href="/admin/risk-dashboard" class="{% if active == 'risk_dashboard' %}active{% endif %}">
+          <span class="icon">R</span> 风控驾驶舱
+        </a>
+      </div>
+    </details>
+  {% endif %}
+
+  {% if show_market_analysis %}
+    <details class="group" {% if active_group == 'market_analysis' or active in ['market_analysis_pairs'] %}open{% endif %}>
+      <summary>市场分析 <span class="chev">▾</span></summary>
+      <div class="nav">
+        <a href="/admin/market-analysis/pairs" class="{% if active == 'market_analysis_pairs' %}active{% endif %}">
+          <span class="icon">M</span> 交易对分析
+        </a>
+      </div>
+    </details>
+  {% endif %}
+
+  {% if show_users %}
+    <details class="group" {% if active_group == 'users' or active in ['users_list', 'kyc_submissions', 'vip_users', 'vip_levels', 'vip_fee_preferences', 'bd_applications', 'bd_commissions', 'bd_team_stats', 'user_invite_relations', 'user_invite_commissions'] %}open{% endif %}>
+      <summary>用户 <span class="chev">▾</span></summary>
+      <div class="nav">
+        {% if can_users %}
+          <details class="admin-nav-group" {% if active in ['users_list', 'kyc_submissions'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">用户管理 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              <a href="/admin/users" class="{% if active == 'users_list' %}active{% endif %}">
+                <span class="icon">U</span> 用户列表
+              </a>
+              <a href="/admin/kyc/submissions" class="{% if active == 'kyc_submissions' %}active{% endif %}">
+                <span class="icon">K</span> KYC 审核
+              </a>
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_vip %}
+          <details class="admin-nav-group" {% if active in ['vip_users', 'vip_levels', 'vip_fee_preferences'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">会员体系 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              <a href="/admin/vip/users" class="{% if active == 'vip_users' %}active{% endif %}">
+                <span class="icon">V</span> VIP 用户
+              </a>
+              <a href="/admin/vip/levels" class="{% if active == 'vip_levels' %}active{% endif %}">
+                <span class="icon">V</span> VIP 等级配置
+              </a>
+              <a href="/admin/vip/fee-preferences" class="{% if active == 'vip_fee_preferences' %}active{% endif %}">
+                <span class="icon">V</span> 手续费偏好
+              </a>
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_bd or can_invite %}
+          <details class="admin-nav-group" {% if active in ['bd_applications', 'bd_team_stats', 'bd_commissions', 'user_invite_relations', 'user_invite_commissions'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">BD / 邀请 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if can_bd %}
+                <a href="/admin/bd/applications" class="{% if active == 'bd_applications' %}active{% endif %}">
+                  <span class="icon">B</span> BD 申请
+                </a>
+                <a href="/admin/bd/team" class="{% if active == 'bd_team_stats' %}active{% endif %}">
+                  <span class="icon">B</span> BD 团队统计
+                </a>
+                <a href="/admin/bd/commissions" class="{% if active == 'bd_commissions' %}active{% endif %}">
+                  <span class="icon">B</span> BD 分佣
+                </a>
+              {% endif %}
+              {% if can_invite %}
+                <a href="/admin/invite/relations" class="{% if active == 'user_invite_relations' %}active{% endif %}">
+                  <span class="icon">I</span> 邀请关系
+                </a>
+                <a href="/admin/invite/commissions" class="{% if active == 'user_invite_commissions' %}active{% endif %}">
+                  <span class="icon">I</span> 邀请分佣
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+      </div>
+    </details>
+  {% endif %}
+
+  {% if show_funds %}
+    <details class="group" {% if active_group == 'funds' or active in collection_nav_active or active in ['assets_query', 'deposit_records', 'withdraw_records', 'withdraw_anomalies', 'user_transfers', 'balance_logs', 'withdraw_reviews', 'platform_adjust', 'platform_adjust_logs', 'hot_wallets', 'stock_token_lock_configs', 'stock_token_locks', 'asset_configs', 'chain_health'] %}open{% endif %}>
+      <summary>资金 <span class="chev">▾</span></summary>
+      <div class="nav">
+        {% if can_assets or can_balance_logs or can_user_transfers %}
+          <details class="admin-nav-group" {% if active in ['assets_query', 'balance_logs', 'user_transfers'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">用户资金 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if can_assets %}
+                <a href="/admin/assets" class="{% if active == 'assets_query' %}active{% endif %}">
+                  <span class="icon">A</span> 资产查询
+                </a>
+              {% endif %}
+              {% if can_balance_logs %}
+                <a href="/admin/balance-logs" class="{% if active == 'balance_logs' %}active{% endif %}">
+                  <span class="icon">L</span> 资金流水
+                </a>
+              {% endif %}
+              {% if can_user_transfers %}
+                <a href="/admin/user-transfers" class="{% if active == 'user_transfers' %}active{% endif %}">
+                  <span class="icon">T</span> 站内划转记录
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_deposits or can_withdraws or can_withdraw_anomalies or can_withdraw_reviews %}
+          <details class="admin-nav-group" {% if active in ['deposit_records', 'withdraw_records', 'withdraw_anomalies', 'withdraw_reviews'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">充提管理 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if can_deposits %}
+                <a href="/admin/deposit-records" class="{% if active == 'deposit_records' %}active{% endif %}">
+                  <span class="icon">D</span> 充值记录
+                </a>
+              {% endif %}
+              {% if can_withdraws %}
+                <a href="/admin/withdraw-records" class="{% if active == 'withdraw_records' %}active{% endif %}">
+                  <span class="icon">W</span> 提现记录
+                </a>
+              {% endif %}
+              {% if can_withdraw_anomalies %}
+                <a href="/admin/withdraw-anomalies" class="{% if active == 'withdraw_anomalies' %}active{% endif %}">
+                  <span class="icon">X</span> 提现异常治理
+                </a>
+              {% endif %}
+              {% if can_withdraw_reviews %}
+                <a href="/admin/withdraw-reviews" class="{% if active == 'withdraw_reviews' %}active{% endif %}">
+                  <span class="icon">R</span> 出金审核
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_platform_adjust or can_collection_tasks or can_hot_wallets %}
+          <details class="admin-nav-group" {% if active in collection_nav_active or active in ['platform_adjust', 'platform_adjust_logs', 'hot_wallets'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">平台资金 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if can_platform_adjust %}
+                <a href="/admin/platform/adjust" class="{% if active == 'platform_adjust' %}active{% endif %}">
+                  <span class="icon">A</span> 平台调账
+                </a>
+                <a href="/admin/platform/adjust-logs" class="{% if active == 'platform_adjust_logs' %}active{% endif %}">
+                  <span class="icon">L</span> 调账记录
+                </a>
+              {% endif %}
+              {% if can_collection_tasks %}
+                <a href="/admin/collections/center" class="{% if active in collection_nav_active %}active{% endif %}">
+                  <span class="icon">C</span> 归集中心
+                </a>
+              {% endif %}
+              {% if can_hot_wallets %}
+                <a href="/admin/hot-wallets" class="{% if active == 'hot_wallets' %}active{% endif %}">
+                  <span class="icon">H</span> 热钱包监控
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_stock_locks %}
+          <details class="admin-nav-group" {% if active in ['stock_token_lock_configs', 'stock_token_locks'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">股票锁仓 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              <a href="/admin/stock-token-lock-configs" class="{% if active == 'stock_token_lock_configs' %}active{% endif %}">
+                <span class="icon">S</span> 股票锁仓配置
+              </a>
+              <a href="/admin/stock-token-locks" class="{% if active == 'stock_token_locks' %}active{% endif %}">
+                <span class="icon">S</span> 股票锁仓批次
+              </a>
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_asset_configs %}
+          <details class="admin-nav-group" {% if active in ['asset_configs', 'chain_health'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">资产配置 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              <a href="/admin/asset-configs" class="{% if active == 'asset_configs' %}active{% endif %}">
+                <span class="icon">C</span> 资产配置
+              </a>
+              <a href="/admin/chain-health" class="{% if active == 'chain_health' %}active{% endif %}">
+                <span class="icon">H</span> 链配置检查
+              </a>
+            </div>
+          </details>
+        {% endif %}
+      </div>
+    </details>
+  {% endif %}
+
+  {% if show_trade %}
+    <details class="group" {% if active_group == 'trade' or active in ['order_manage', 'trade_manage', 'spot_fee_settings', 'pair_config', 'contract_orders', 'contract_trades', 'contract_positions', 'contract_accounts', 'contract_liquidations', 'contract_symbols', 'platform_dealer', 'dealer_risk', 'dealer_risk_logs'] %}open{% endif %}>
+      <summary>交易 <span class="chev">▾</span></summary>
+      <div class="nav">
+        {% if can_orders or can_trades or can_fee_settings or can_pairs %}
+          <details class="admin-nav-group" {% if active in ['order_manage', 'trade_manage', 'spot_fee_settings', 'pair_config'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">现货交易 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if can_orders %}
+                <a href="/admin/orders" class="{% if active == 'order_manage' %}active{% endif %}">
+                  <span class="icon">O</span> 订单管理
+                </a>
+              {% endif %}
+              {% if can_trades %}
+                <a href="/admin/trades" class="{% if active == 'trade_manage' %}active{% endif %}">
+                  <span class="icon">T</span> 成交管理
+                </a>
+              {% endif %}
+              {% if can_pairs %}
+                <a href="/admin/pairs" class="{% if active == 'pair_config' %}active{% endif %}">
+                  <span class="icon">P</span> 交易对配置
+                </a>
+              {% endif %}
+              {% if can_fee_settings %}
+                <a href="/admin/spot-fee-settings" class="{% if active == 'spot_fee_settings' %}active{% endif %}">
+                  <span class="icon">F</span> 现货手续费配置
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_contract_accounts or can_contract_positions or can_contract_orders or can_contract_trades or can_contract_liquidations or can_contract_symbols %}
+          <details class="admin-nav-group" {% if active in ['contract_accounts', 'contract_positions', 'contract_orders', 'contract_trades', 'contract_liquidations', 'contract_symbols'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">合约交易 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if can_contract_accounts %}
+                <a href="/admin/contract-accounts" class="{% if active == 'contract_accounts' %}active{% endif %}">
+                  <span class="icon">A</span> 合约账户
+                </a>
+              {% endif %}
+              {% if can_contract_positions %}
+                <a href="/admin/contract-positions" class="{% if active == 'contract_positions' %}active{% endif %}">
+                  <span class="icon">P</span> 合约持仓
+                </a>
+              {% endif %}
+              {% if can_contract_orders %}
+                <a href="/admin/contract-orders" class="{% if active == 'contract_orders' %}active{% endif %}">
+                  <span class="icon">O</span> 合约订单
+                </a>
+              {% endif %}
+              {% if can_contract_trades %}
+                <a href="/admin/contract-trades" class="{% if active == 'contract_trades' %}active{% endif %}">
+                  <span class="icon">T</span> 合约成交
+                </a>
+              {% endif %}
+              {% if can_contract_liquidations %}
+                <a href="/admin/contract-liquidations" class="{% if active == 'contract_liquidations' %}active{% endif %}">
+                  <span class="icon">L</span> 强平记录
+                </a>
+              {% endif %}
+              {% if can_contract_symbols %}
+                <a href="/admin/contract-symbols" class="{% if active == 'contract_symbols' %}active{% endif %}">
+                  <span class="icon">S</span> 合约品种配置
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_platform_accounts or can_dealer_risk %}
+          <details class="admin-nav-group" {% if active in ['platform_dealer', 'dealer_risk', 'dealer_risk_logs'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">Dealer / 风控 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if can_platform_accounts %}
+                <a href="/admin/platform-account" class="{% if active == 'platform_dealer' %}active{% endif %}">
+                  <span class="icon">D</span> 平台账户
+                </a>
+              {% endif %}
+              {% if can_dealer_risk %}
+                <a href="/admin/platform/dealer-risk" class="{% if active == 'dealer_risk' %}active{% endif %}">
+                  <span class="icon">R</span> Dealer 风控配置
+                </a>
+                <a href="/admin/platform/dealer-risk-logs" class="{% if active == 'dealer_risk_logs' %}active{% endif %}">
+                  <span class="icon">H</span> 风控命中记录
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+      </div>
+    </details>
+  {% endif %}
+
+  {% if show_operations %}
+    <details class="group" {% if active_group == 'operations' or active in ['reference_overlays', 'site_settings', 'home_banners', 'activity_banners', 'activities', 'announcements', 'dividend_config', 'dividend_pools', 'dividend_stats'] %}open{% endif %}>
+      <summary>运营 <span class="chev">▾</span></summary>
+      <div class="nav">
+        {% if can_site_settings or can_banners or can_announcements or can_pairs %}
+          <details class="admin-nav-group" {% if active in ['site_settings', 'home_banners', 'activity_banners', 'activities', 'announcements', 'reference_overlays'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">内容运营 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if can_site_settings %}
+                <a href="/admin/site-settings" class="{% if active == 'site_settings' %}active{% endif %}">
+                  <span class="icon">S</span> 站点配置
+                </a>
+              {% endif %}
+              {% if can_banners %}
+                <a href="/admin/home-banners" class="{% if active == 'home_banners' %}active{% endif %}">
+                  <span class="icon">H</span> 首页 Banner
+                </a>
+                <a href="/admin/activity-banners" class="{% if active == 'activity_banners' %}active{% endif %}">
+                  <span class="icon">B</span> 活动 Banner
+                </a>
+                <a href="/admin/activities" class="{% if active == 'activities' %}active{% endif %}">
+                  <span class="icon">A</span> 活动管理
+                </a>
+              {% endif %}
+              {% if can_announcements %}
+                <a href="/admin/announcements" class="{% if active == 'announcements' %}active{% endif %}">
+                  <span class="icon">N</span> 公告管理
+                </a>
+              {% endif %}
+              {% if can_pairs %}
+                <a href="/admin/reference-overlays" class="{% if active == 'reference_overlays' %}active{% endif %}">
+                  <span class="icon">R</span> RWA参考价管理
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_dividend %}
+          <details class="admin-nav-group" {% if active in ['dividend_config', 'dividend_pools', 'dividend_stats'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">收益运营 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              <a href="/admin/dividend-config" class="{% if active == 'dividend_config' %}active{% endif %}">
+                <span class="icon">D</span> 分红配置
+              </a>
+              <a href="/admin/dividend-pools" class="{% if active == 'dividend_pools' %}active{% endif %}">
+                <span class="icon">D</span> 分红管理
+              </a>
+              <a href="/admin/dividend-stats" class="{% if active == 'dividend_stats' %}active{% endif %}">
+                <span class="icon">D</span> 分红统计
+              </a>
+            </div>
+          </details>
+        {% endif %}
+      </div>
+    </details>
+  {% endif %}
+
+  {% if show_system %}
+    <details class="group" {% if (active_group == 'system' and active not in collection_nav_active) or active in ['market_cache_monitor', 'operations_center', 'service_overview', 'rq_status', 'stock_token_release_logs', 'bd_commission_job_logs', 'dividend_job_logs', 'admin_users', 'admin_roles', 'audit_list'] %}open{% endif %}>
+      <summary>系统 <span class="chev">▾</span></summary>
+      <div class="nav">
+        {% if show_system_tasks %}
+          <details class="admin-nav-group" {% if active in ['market_cache_monitor', 'operations_center', 'service_overview', 'rq_status', 'stock_token_release_logs', 'bd_commission_job_logs', 'dividend_job_logs'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">任务与监控 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if is_sa %}
+                <a href="/admin/system/operations" class="{% if active == 'operations_center' %}active{% endif %}">
+                  <span class="icon">O</span> 系统运行中心
+                </a>
+                <a href="/admin/market-cache-monitor" class="{% if active == 'market_cache_monitor' %}active{% endif %}">
+                  <span class="icon">C</span> 行情缓存监控
+                </a>
+                <a href="/admin/system/services" class="{% if active == 'service_overview' %}active{% endif %}">
+                  <span class="icon">S</span> 常驻服务总览
+                </a>
+                <a href="/admin/system/rq" class="{% if active == 'rq_status' %}active{% endif %}">
+                  <span class="icon">Q</span> RQ 队列监控
+                </a>
+              {% endif %}
+              {% if can_stock_locks %}
+                <a href="/admin/stock-token-release-logs" class="{% if active == 'stock_token_release_logs' %}active{% endif %}">
+                  <span class="icon">L</span> 股票释放日志
+                </a>
+              {% endif %}
+              {% if can_bd %}
+                <a href="/admin/bd/commission-job-logs" class="{% if active == 'bd_commission_job_logs' %}active{% endif %}">
+                  <span class="icon">L</span> BD 发放任务日志
+                </a>
+              {% endif %}
+              {% if can_dividend %}
+                <a href="/admin/dividends/job-logs" class="{% if active == 'dividend_job_logs' %}active{% endif %}">
+                  <span class="icon">L</span> 分红任务日志
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+
+        {% if show_system_security %}
+          <details class="admin-nav-group" {% if active in ['admin_users', 'admin_roles', 'audit_list'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">安全审计 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              {% if is_sa %}
+                <a href="/admin/admin-users" class="{% if active == 'admin_users' %}active{% endif %}">
+                  <span class="icon">A</span> 管理员管理
+                </a>
+                <a href="/admin/admin-roles" class="{% if active == 'admin_roles' %}active{% endif %}">
+                  <span class="icon">R</span> 角色管理
+                </a>
+              {% endif %}
+              {% if can_audit %}
+                <a href="/admin/audit" class="{% if active == 'audit_list' %}active{% endif %}">
+                  <span class="icon">A</span> 操作审计
+                </a>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+      </div>
+    </details>
+  {% endif %}
+</aside>

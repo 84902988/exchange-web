@@ -1,0 +1,107 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}现货手续费配置{% endblock %}
+{% block page_title %}现货手续费配置{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">控制现货交易中 RCB 手续费抵扣的全局规则。历史委托和成交手续费按已落库数据展示，不会重新计算。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .spot-fee-grid{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(320px,.9fr);gap:16px;align-items:start}
+    .spot-fee-form{display:grid;gap:16px;max-width:680px}
+    .spot-fee-toggle{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .spot-fee-radio{display:inline-flex;align-items:center;gap:8px;min-height:40px;padding:0 14px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.04);cursor:pointer}
+    .spot-fee-radio input{width:auto}
+    .spot-fee-help{color:var(--muted);font-size:12px;line-height:1.6;margin-top:6px}
+    .spot-fee-summary{display:grid;gap:12px}
+    .spot-fee-summary-item{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.08)}
+    .spot-fee-summary-item:last-child{border-bottom:0}
+    .spot-fee-label{color:var(--muted);font-size:12px}
+    .spot-fee-value{font-weight:800;font-variant-numeric:tabular-nums}
+    .spot-fee-actions{display:flex;gap:10px;align-items:center;justify-content:flex-start;margin-top:4px}
+    @media (max-width:980px){.spot-fee-grid{grid-template-columns:1fr}}
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card admin-card">
+        <div class="section-title">操作成功</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card admin-card">
+        <div class="section-title">操作提示</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="spot-fee-grid">
+      <div class="admin-card">
+        <div class="section-title">RCB抵扣配置</div>
+        <form method="post" action="/admin/spot-fee-settings" class="spot-fee-form">
+          <div class="field">
+            <label>RCB手续费抵扣</label>
+            <div class="spot-fee-toggle">
+              <label class="spot-fee-radio">
+                <input type="radio" name="spot_rcb_fee_enabled" value="1" {% if settings.spot_rcb_fee_enabled %}checked{% endif %} />
+                开启
+              </label>
+              <label class="spot-fee-radio">
+                <input type="radio" name="spot_rcb_fee_enabled" value="0" {% if not settings.spot_rcb_fee_enabled %}checked{% endif %} />
+                关闭
+              </label>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="rcb_fee_discount_percent">RCB抵扣比例</label>
+            <input
+              id="rcb_fee_discount_percent"
+              type="text"
+              name="rcb_fee_discount_percent"
+              value="{{ discount_percent_input }}"
+              placeholder="75"
+            />
+            <div class="spot-fee-help">按百分比填写，例如 75 表示按 USDT 手续费的 75% 折算扣 RCB。有效范围：大于 0 且不超过 100。</div>
+          </div>
+
+          <div class="spot-fee-actions">
+            <button type="submit" class="btn admin-btn admin-btn-primary">保存配置</button>
+            <a href="/admin/spot-fee-settings" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+          </div>
+        </form>
+      </div>
+
+      <div class="admin-card">
+        <div class="section-title">当前生效口径</div>
+        <div class="spot-fee-summary">
+          <div class="spot-fee-summary-item">
+            <div class="spot-fee-label">平台 RCB 抵扣</div>
+            <div class="spot-fee-value">
+              <span class="admin-badge admin-badge-{% if settings.spot_rcb_fee_enabled %}success{% else %}secondary{% endif %}">
+                {% if settings.spot_rcb_fee_enabled %}开启{% else %}关闭{% endif %}
+              </span>
+            </div>
+          </div>
+          <div class="spot-fee-summary-item">
+            <div class="spot-fee-label">抵扣比例</div>
+            <div class="spot-fee-value">{{ discount_percent_input }}%</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="admin-alert admin-alert-warning">
+      平台关闭后，即使用户开启 RCB 抵扣，也统一使用 USDT 支付手续费。平台开启后，仍需用户在前台开启且 RCB余额足够，才会使用 RCB。
+    </div>
+  </section>
+{% endblock %}

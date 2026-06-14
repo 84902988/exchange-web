@@ -1,0 +1,19 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}无权限访问{% endblock %}
+{% block page_title %}无权限访问{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">当前账号没有访问该页面的权限，请联系超级管理员。</div>
+{% endblock %}
+
+{% block content %}
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">无权限访问</div>
+      <p class="muted">当前账号没有访问该页面的权限，请联系超级管理员。</p>
+      <div style="margin-top:14px;">
+        <a class="btn admin-btn" href="/admin">返回后台首页</a>
+      </div>
+    </div>
+  </section>
+{% endblock %}

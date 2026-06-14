@@ -1,0 +1,126 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}活动管理{% endblock %}
+{% block page_title %}活动管理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">维护活动中心卡片、详情内容、奖励、排序和启用状态。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/activities/new" class="btn admin-btn admin-btn-primary">新增活动</a>
+  <a href="/admin/activity-banners" class="btn secondary admin-btn admin-btn-secondary">活动 Banner</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .activity-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .activity-actions form{margin:0}
+    .btn.danger{border:1px solid rgba(248,113,113,.45);background:rgba(127,29,29,.12);color:#fecaca}
+    .btn.danger:hover{border-color:rgba(248,113,113,.72);background:rgba(127,29,29,.22)}
+    .activity-desc{max-width:320px;white-space:normal;color:var(--muted)}
+  </style>
+
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+  {% set activity_status_labels = {'active': '进行中', 'inactive': '已禁用', 'ended': '已结束'} %}
+  {% set activity_status_badges = {'active': 'success', 'inactive': 'secondary', 'ended': 'secondary'} %}
+
+  {% if notice %}
+    <section class="page-section"><div class="card"><div class="section-title">操作结果</div><p class="muted">{{ notice }}</p></div></section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section"><div class="card"><div class="section-title">提示信息</div><p class="muted">{{ error }}</p></div></section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/activities" class="filter-form">
+        <div class="field">
+          <label for="keyword">关键词</label>
+          <input id="keyword" name="keyword" type="text" value="{{ filters.keyword or '' }}" placeholder="标题或简介" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="active" {% if filters.status == 'active' %}selected{% endif %}>进行中</option>
+            <option value="inactive" {% if filters.status == 'inactive' %}selected{% endif %}>未启用</option>
+            <option value="ended" {% if filters.status == 'ended' %}selected{% endif %}>已结束</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/activities" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">活动列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>标题</th>
+                <th>简介</th>
+                <th>奖励</th>
+                <th>结束时间</th>
+                <th class="text-right">排序</th>
+                <th>状态</th>
+                <th>翻译</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.id }}</td>
+                  <td>{{ item.title }}</td>
+                  <td class="activity-desc">{{ item.description or '-' }}</td>
+                  <td>{{ item.reward_text or '-' }}</td>
+                  <td class="nowrap admin-time">{{ item.end_at_admin or '-' }}</td>
+                  <td class="text-right admin-number">{{ item.sort_order }}</td>
+                  <td><span class="admin-badge admin-badge-{{ activity_status_badges.get(item.status, 'secondary') }}" title="{{ item.status }}">{{ activity_status_labels.get(item.status, item.status_label) }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ 'success' if item.i18n_complete_count == item.i18n_total_count else 'secondary' }}" title="{{ item.i18n_missing_locales|join(', ') }}">{{ item.i18n_status_label or '0/4' }}</span></td>
+                  <td>
+                    <div class="activity-actions admin-table-actions">
+                      <a href="/admin/activities/{{ item.id }}/edit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">编辑</a>
+                      <form method="post" action="/admin/activities/{{ item.id }}/toggle-status">
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn {% if item.status == 'active' %}danger admin-btn-danger{% else %}admin-btn-primary{% endif %} admin-btn admin-btn-sm">{% if item.status == 'active' %}禁用{% else %}启用{% endif %}</button>
+                      </form>
+                      <form method="post" action="/admin/activities/{{ item.id }}/delete" onsubmit="return confirm('确定删除该活动吗？');">
+                        <button type="submit" class="btn danger admin-btn admin-btn-danger admin-btn-sm">删除</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无活动</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

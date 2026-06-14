@@ -1,0 +1,283 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}自动归集规则{% endblock %}
+{% block page_title %}自动归集规则{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看各网络自动归集规则、最近扫描结果和归集相关服务状态。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .collection-auto-nav{display:flex;flex-wrap:wrap;gap:8px}
+    .collection-auto-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+    .collection-auto-card{background:linear-gradient(180deg,#181b22,#111318);border:1px solid rgba(148,163,184,.18);border-radius:8px;padding:14px;box-shadow:0 12px 28px rgba(0,0,0,.18)}
+    .collection-auto-label{color:#9ca3af;font-size:12px;font-weight:700}
+    .collection-auto-value{margin-top:8px;color:#f8fafc;font-size:21px;font-weight:900;font-variant-numeric:tabular-nums}
+    .collection-service-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+    .collection-service-card{background:linear-gradient(180deg,#181b22,#111318);border:1px solid rgba(148,163,184,.18);border-radius:8px;padding:14px;box-shadow:0 12px 28px rgba(0,0,0,.18);display:grid;gap:8px}
+    .collection-service-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+    .collection-service-head strong{color:#f8fafc}
+    .collection-auto-table{width:100%;table-layout:fixed;font-size:13px}
+    .collection-auto-table th,.collection-auto-table td{padding:10px;vertical-align:top;overflow:hidden;text-overflow:ellipsis}
+    .collection-auto-table th{white-space:nowrap}
+    .collection-auto-table td{white-space:normal}
+    .collection-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+    .collection-auto-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+    .collection-auto-note{color:#9ca3af;font-size:12px;line-height:1.5}
+    .collection-alert-list{display:grid;gap:8px}
+    .collection-rule-form{display:grid;gap:10px}
+    .collection-rule-form label{display:grid;gap:4px;color:#9ca3af;font-size:12px;font-weight:700}
+    .collection-rule-form input,.collection-rule-form select{width:100%;border:1px solid rgba(148,163,184,.2);border-radius:8px;background:#0b0f16;color:#f8fafc;padding:8px 10px}
+    .collection-rule-form-grid{display:grid;gap:12px}
+    .collection-rule-modal{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:22px;background:rgba(0,0,0,.68)}
+    .collection-rule-modal.is-open{display:flex}
+    .collection-rule-dialog{width:min(520px,100%);max-height:min(88vh,760px);overflow:auto;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:#101827;box-shadow:0 22px 80px rgba(0,0,0,.45)}
+    .collection-rule-modal-header,.collection-rule-modal-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid rgba(255,255,255,.08)}
+    .collection-rule-modal-footer{justify-content:flex-end;border-top:1px solid rgba(255,255,255,.08);border-bottom:0}
+    .collection-rule-modal-title{color:#fff;font-size:16px;font-weight:900}
+    .collection-rule-modal-close{width:32px;height:32px;border:1px solid rgba(255,255,255,.14);border-radius:8px;background:rgba(255,255,255,.06);color:#fff;cursor:pointer}
+    .collection-rule-modal-body{display:grid;gap:14px;padding:18px}
+    .collection-rule-meta{color:#9ca3af;font-size:12px;line-height:1.5}
+    body.collection-rule-modal-open{overflow:hidden}
+    @media (max-width:760px){.collection-auto-table{table-layout:auto}.collection-auto-table th,.collection-auto-table td{white-space:normal}}
+    @media (max-width:560px){.collection-rule-modal{align-items:flex-start;padding:12px}.collection-rule-dialog{max-height:calc(100vh - 24px)}.collection-rule-modal-footer{flex-wrap:wrap}.collection-rule-modal-footer .btn{flex:1}}
+  </style>
+
+  <section class="page-section">
+    <div class="collection-auto-nav">
+      <a href="/admin/collections/center" class="btn secondary admin-btn admin-btn-secondary">归集中心</a>
+      <a href="/admin/collections/tasks" class="btn secondary admin-btn admin-btn-secondary">归集任务</a>
+      <a href="/admin/collections/batches" class="btn secondary admin-btn admin-btn-secondary">归集统计</a>
+      <a href="/admin/collections/auto-settings" class="btn admin-btn admin-btn-primary">自动归集规则</a>
+    </div>
+  </section>
+
+  {% if notice %}
+    <section class="page-section"><div class="admin-alert admin-alert-success">{{ notice }}</div></section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section"><div class="admin-alert admin-alert-warning">{{ error }}</div></section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="collection-auto-grid">
+      <div class="collection-auto-card"><div class="collection-auto-label">启用网络数</div><div class="collection-auto-value">{{ overview.enabled_network_count or 0 }}</div></div>
+      <div class="collection-auto-card"><div class="collection-auto-label">自动归集网络数</div><div class="collection-auto-value">{{ overview.auto_collect_count or 0 }}</div></div>
+      <div class="collection-auto-card"><div class="collection-auto-label">自动补 Gas 网络数</div><div class="collection-auto-value">{{ overview.auto_gas_count or 0 }}</div></div>
+      <div class="collection-auto-card"><div class="collection-auto-label">异常网络数</div><div class="collection-auto-value">{{ overview.abnormal_count or 0 }}</div></div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">自动归集规则</div>
+      <p class="collection-auto-note">网络归集开关决定该网络是否参与自动归集；各币种网络的最低归集金额仍以资产网络配置为准。留空最低归集金额时，不覆盖币种网络配置。</p>
+      {% if rules %}
+        <table class="data-table admin-table collection-auto-table">
+          <thead>
+            <tr>
+              <th>网络</th>
+              <th>自动归集</th>
+              <th>自动补 Gas</th>
+              <th>最低归集金额</th>
+              <th>扫描周期</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in rules %}
+              <tr>
+                <td><strong>{{ item.display_name }}</strong><div class="muted collection-mono">{{ item.chain_key }}</div></td>
+                <td><span class="admin-badge admin-badge-{{ item.auto_task_badge }}">{{ item.auto_task_label }}</span></td>
+                <td><span class="admin-badge admin-badge-{{ item.auto_gas_badge }}">{{ item.auto_gas_label }}</span></td>
+                <td class="collection-mono">{{ item.min_collect_label }}</td>
+                <td class="collection-mono">
+                  {{ item.scan_interval_label }}
+                  <div class="muted">单次 {{ item.max_addresses_label }}</div>
+                </td>
+                <td>
+                  <span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span>
+                  {% if item.status_note %}
+                    <div class="muted">{{ item.status_note }}</div>
+                  {% endif %}
+                </td>
+                <td>
+                  <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-collection-rule-modal-open="collection-rule-modal-{{ loop.index }}">编辑规则</button>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% for item in rules %}
+          <div class="collection-rule-modal" id="collection-rule-modal-{{ loop.index }}" aria-hidden="true">
+            <div class="collection-rule-dialog" role="dialog" aria-modal="true" aria-labelledby="collection-rule-modal-title-{{ loop.index }}">
+              <form class="collection-rule-form" method="post" action="/admin/collections/auto-settings/{{ item.chain_key }}/update">
+                <div class="collection-rule-modal-header">
+                  <div>
+                    <div class="collection-rule-modal-title" id="collection-rule-modal-title-{{ loop.index }}">编辑自动归集规则 - {{ item.display_name }}</div>
+                    <div class="collection-rule-meta collection-mono">{{ item.chain_key }}</div>
+                  </div>
+                  <button type="button" class="collection-rule-modal-close" data-collection-rule-modal-close aria-label="关闭">×</button>
+                </div>
+                <div class="collection-rule-modal-body">
+                  <div class="collection-rule-form-grid">
+                    <label>
+                      自动归集
+                      <select name="auto_collect_enabled">
+                        <option value="1" {% if item.auto_task_enabled %}selected{% endif %}>启用</option>
+                        <option value="0" {% if not item.auto_task_enabled %}selected{% endif %}>停用</option>
+                      </select>
+                    </label>
+                    <label>
+                      自动补 Gas
+                      <select name="auto_gas_enabled">
+                        <option value="1" {% if item.auto_gas_enabled %}selected{% endif %}>启用</option>
+                        <option value="0" {% if not item.auto_gas_enabled %}selected{% endif %}>停用</option>
+                      </select>
+                    </label>
+                    <label>
+                      最低归集金额
+                      <input name="min_collect_amount" value="{{ item.min_collect_amount_form }}" placeholder="留空按币种网络配置">
+                    </label>
+                    <label>
+                      扫描周期（秒）
+                      <input name="scan_interval_seconds" value="{{ item.scan_interval_seconds }}" inputmode="numeric" placeholder="至少 60">
+                    </label>
+                    <label>
+                      单次扫描数量
+                      <input name="max_addresses" value="{{ item.max_addresses }}" inputmode="numeric" placeholder="1-500">
+                    </label>
+                    <input type="hidden" name="reserve_gas_balance" value="{{ item.reserve_gas_balance }}">
+                  </div>
+                </div>
+                <div class="collection-rule-modal-footer">
+                  <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-collection-rule-modal-close>取消</button>
+                  <button type="submit" class="btn admin-btn admin-btn-primary">保存</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class="empty-state admin-empty">暂无自动归集规则</div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">归集服务状态</div>
+      <div class="collection-service-grid">
+        {% for service in services %}
+          <div class="collection-service-card">
+            <div class="collection-service-head">
+              <strong>{{ service.label }}</strong>
+              <span class="admin-badge admin-badge-{{ service.status_badge }}">{{ service.status_label }}</span>
+            </div>
+            <div class="muted">最近心跳：{{ service.last_seen_label }}</div>
+            <div class="muted">Worker：{{ service.worker_label }}</div>
+            {% if service.stale_worker_label %}
+              <div class="muted">{{ service.stale_worker_label }}</div>
+            {% endif %}
+            <div class="muted">队列长度：{{ service.queue_length or 0 }}</div>
+            {% if service.status_key != "running" and service.impact %}
+              <div class="muted">{{ service.impact }}</div>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">最近扫描 / 最近归集结果</div>
+      {% if rules %}
+        <table class="data-table admin-table collection-auto-table">
+          <thead>
+            <tr>
+              <th>网络</th>
+              <th>最近扫描</th>
+              <th>最近归集</th>
+              <th>最近补 Gas</th>
+              <th>最近成功 Tx</th>
+              <th>最近失败原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in rules %}
+              <tr>
+                <td><strong>{{ item.display_name }}</strong><div class="muted collection-mono">{{ item.chain_key }}</div></td>
+                <td title="{{ item.recent_scan_at }}">{{ item.recent_scan_label }}</td>
+                <td>{{ item.recent_collection_label }}</td>
+                <td>{{ item.recent_gas_label }}</td>
+                <td class="collection-mono" title="{{ item.recent_success_tx_full }}">{{ item.recent_success_tx }}</td>
+                <td title="{{ item.recent_fail_reason_full }}">{{ item.recent_fail_reason }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <div class="empty-state admin-empty">暂无最近结果</div>
+      {% endif %}
+      <div class="collection-auto-actions">
+        <a href="/admin/collections/center" class="btn secondary admin-btn admin-btn-secondary">查看归集中心</a>
+        <a href="/admin/collections/tasks" class="btn secondary admin-btn admin-btn-secondary">查看归集任务</a>
+      </div>
+    </div>
+  </section>
+
+  {% if service_alerts %}
+    <section class="page-section">
+      <div class="collection-alert-list">
+        {% for message in service_alerts %}
+          <div class="admin-alert admin-alert-warning">{{ message }}</div>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+  <script>
+    (function(){
+      function closeRuleModal(modal){
+        if(!modal){ return; }
+        modal.classList.remove("is-open");
+        modal.setAttribute("aria-hidden", "true");
+        if(!document.querySelector(".collection-rule-modal.is-open")){
+          document.body.classList.remove("collection-rule-modal-open");
+        }
+      }
+
+      function openRuleModal(modal){
+        if(!modal){ return; }
+        modal.classList.add("is-open");
+        modal.setAttribute("aria-hidden", "false");
+        document.body.classList.add("collection-rule-modal-open");
+        var firstInput = modal.querySelector("select:not(:disabled), input:not([type='hidden']):not(:disabled), button:not([data-collection-rule-modal-close])");
+        if(firstInput){
+          window.setTimeout(function(){ firstInput.focus(); }, 0);
+        }
+      }
+
+      document.addEventListener("click", function(event){
+        var openButton = event.target.closest("[data-collection-rule-modal-open]");
+        if(openButton){
+          var modal = document.getElementById(openButton.getAttribute("data-collection-rule-modal-open"));
+          openRuleModal(modal);
+          return;
+        }
+
+        var closeButton = event.target.closest("[data-collection-rule-modal-close]");
+        var backdrop = event.target.classList && event.target.classList.contains("collection-rule-modal") ? event.target : null;
+        if(closeButton || backdrop){
+          closeRuleModal((closeButton || backdrop).closest(".collection-rule-modal"));
+        }
+      });
+
+      document.addEventListener("keydown", function(event){
+        if(event.key !== "Escape"){ return; }
+        document.querySelectorAll(".collection-rule-modal.is-open").forEach(closeRuleModal);
+      });
+    })();
+  </script>
+{% endblock %}

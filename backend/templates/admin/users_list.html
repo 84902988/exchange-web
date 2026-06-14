@@ -1,0 +1,421 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}用户管理{% endblock %}
+{% block page_title %}用户管理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">面向运营的用户检索与状态查看，聚合账户、认证与登录信息。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .users-filter-card{
+      padding:14px 16px;
+    }
+    .users-filter-head{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:10px;
+    }
+    .users-filter-title{
+      color:#fff;
+      font-size:14px;
+      font-weight:800;
+    }
+    .users-filter-form{
+      display:grid;
+      gap:12px;
+    }
+    .users-filter-row{
+      display:grid;
+      gap:10px;
+      align-items:end;
+      min-width:0;
+    }
+    .users-filter-row-primary{
+      grid-template-columns:minmax(150px,1fr) minmax(260px,1.5fr) minmax(220px,1.2fr);
+    }
+    .users-filter-row-secondary{
+      grid-template-columns:minmax(120px,.85fr) minmax(130px,.9fr) minmax(150px,1fr) minmax(150px,1fr) minmax(150px,1fr) auto;
+    }
+    .users-date-range{
+      display:grid;
+      grid-template-columns:1fr 1fr;
+      gap:8px;
+    }
+    .users-filter-form .field label{
+      margin-bottom:5px;
+      font-size:11px;
+    }
+    .users-filter-form .field input,
+    .users-filter-form .field select{
+      height:36px;
+      padding:7px 10px;
+      border-radius:9px;
+    }
+    .admin-date-input{
+      font-variant-numeric:tabular-nums;
+    }
+    .users-filter-actions{
+      display:flex;
+      gap:8px;
+      justify-content:flex-end;
+      align-items:center;
+      white-space:nowrap;
+      justify-self:end;
+    }
+    .users-filter-actions .btn{
+      min-height:36px;
+      border-radius:9px;
+      padding:0 12px;
+    }
+    .users-table-wrap{
+      overflow-x:hidden;
+    }
+    .users-table{
+      width:100%;
+      min-width:0;
+      table-layout:fixed;
+    }
+    .users-table th,
+    .users-table td{
+      padding:10px 9px;
+      vertical-align:middle;
+    }
+    .user-cell{
+      display:grid;
+      gap:4px;
+      min-width:0;
+      max-width:240px;
+    }
+    .user-primary{
+      color:rgba(255,255,255,.82);
+      font-size:13px;
+      font-weight:700;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .user-uid{
+      color:var(--muted);
+      font-size:11px;
+      font-variant-numeric:tabular-nums;
+    }
+    .user-nickname{
+      color:var(--muted);
+      font-size:11px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .admin-time-cell{
+      min-width:118px;
+      white-space:nowrap;
+      line-height:1.35;
+      font-variant-numeric:tabular-nums;
+      color:rgba(255,255,255,.72);
+      font-size:12px;
+    }
+    .admin-time-sub{
+      color:var(--admin-muted, var(--muted));
+      font-size:12px;
+      margin-top:2px;
+    }
+    .users-nowrap{
+      white-space:nowrap;
+    }
+    .users-actions-col{
+      width:150px;
+    }
+    .withdraw-lock-cell{
+      display:grid;
+      gap:5px;
+      min-width:0;
+    }
+    .withdraw-lock-reason{
+      color:var(--muted);
+      font-size:11px;
+      line-height:1.35;
+      overflow-wrap:anywhere;
+    }
+    .users-action-stack{
+      display:grid;
+      gap:6px;
+    }
+    .users-action-stack + .users-action-stack{
+      margin-top:6px;
+    }
+    .users-action-stack input[type="text"]{
+      width:100%;
+      min-width:0;
+      height:30px;
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(0,0,0,.22);
+      color:#fff;
+      padding:5px 8px;
+      font-size:11px;
+      outline:none;
+    }
+    .users-action-stack .btn{
+      min-height:30px;
+      border-radius:8px;
+      padding:0 9px;
+      font-size:11px;
+      width:100%;
+    }
+    .users-action-stack .btn.danger{
+      border:1px solid rgba(248,113,113,.45);
+      background:rgba(127,29,29,.14);
+      color:#fecaca;
+    }
+    @media (max-width: 1180px){
+      .users-filter-row-primary,
+      .users-filter-row-secondary{
+        grid-template-columns:repeat(2, minmax(0, 1fr));
+      }
+      .users-filter-actions{
+        justify-content:flex-start;
+        justify-self:start;
+      }
+      .users-table{
+        table-layout:fixed;
+      }
+    }
+    @media (max-width: 720px){
+      .users-filter-row-primary,
+      .users-filter-row-secondary,
+      .users-date-range{
+        grid-template-columns:1fr;
+      }
+      .users-filter-head{
+        align-items:flex-start;
+        flex-direction:column;
+      }
+    }
+  </style>
+
+  <section class="page-section">
+    <div class="filter-card users-filter-card">
+      <div class="users-filter-head">
+        <div class="users-filter-title">筛选条件</div>
+        <div class="table-inline-note">支持组合筛选</div>
+      </div>
+      <form method="get" action="/admin/users" class="users-filter-form">
+        <div class="users-filter-row users-filter-row-primary">
+          <div class="field">
+            <label for="user_id">UID</label>
+            <input
+              id="user_id"
+              type="text"
+              name="user_id"
+              value="{{ filters.user_id or '' }}"
+              placeholder="例如 100000027"
+              inputmode="numeric"
+            />
+          </div>
+          <div class="field">
+            <label for="email">邮箱</label>
+            <input
+              id="email"
+              type="text"
+              name="email"
+              value="{{ filters.email or '' }}"
+              placeholder="例如 test@example.com"
+            />
+          </div>
+          <div class="field">
+            <label for="phone">手机号</label>
+            <input
+              id="phone"
+              type="text"
+              name="phone"
+              value="{{ filters.phone or '' }}"
+              placeholder="例如 13800138000"
+              inputmode="tel"
+            />
+          </div>
+        </div>
+
+        <div class="users-filter-row users-filter-row-secondary">
+          <div class="field">
+            <label for="status">状态</label>
+            <select id="status" name="status">
+              <option value="">全部</option>
+              <option value="1" {% if filters.status == '1' %}selected{% endif %}>正常</option>
+              <option value="2" {% if filters.status == '2' %}selected{% endif %}>已停用</option>
+              <option value="3" {% if filters.status == '3' %}selected{% endif %}>未激活</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="kyc_level">KYC等级</label>
+            <select id="kyc_level" name="kyc_level">
+              <option value="">全部</option>
+              <option value="0" {% if filters.kyc_level == '0' %}selected{% endif %}>未认证</option>
+              <option value="1" {% if filters.kyc_level == '1' %}selected{% endif %}>基础认证</option>
+              <option value="2" {% if filters.kyc_level == '2' %}selected{% endif %}>高级认证</option>
+              <option value="3" {% if filters.kyc_level == '3' %}selected{% endif %}>高级认证+</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="source_type">邀请来源</label>
+            <select id="source_type" name="source_type">
+              <option value="" {% if not filters.source_type %}selected{% endif %}>全部</option>
+              <option value="BD" {% if filters.source_type == 'BD' %}selected{% endif %}>BD</option>
+              <option value="USER_INVITE" {% if filters.source_type == 'USER_INVITE' %}selected{% endif %}>普通分享</option>
+              <option value="NONE" {% if filters.source_type == 'NONE' %}selected{% endif %}>无</option>
+              <option value="AMBIGUOUS" {% if filters.source_type == 'AMBIGUOUS' %}selected{% endif %}>异常（双关系）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="registered_from">注册开始</label>
+            <input
+              id="registered_from"
+              class="admin-date-input"
+              type="text"
+              name="registered_from"
+              value="{{ filters.registered_from or '' }}"
+              placeholder="YYYY-MM-DD"
+              inputmode="numeric"
+            />
+          </div>
+          <div class="field">
+            <label for="registered_to">注册结束</label>
+            <input
+              id="registered_to"
+              class="admin-date-input"
+              type="text"
+              name="registered_to"
+              value="{{ filters.registered_to or '' }}"
+              placeholder="YYYY-MM-DD"
+              inputmode="numeric"
+            />
+          </div>
+          <div class="users-filter-actions">
+            <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+            <a href="/admin/users" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+          </div>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">用户列表</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap users-table-wrap">
+          <table class="data-table admin-table users-table">
+            <thead>
+              <tr>
+                <th style="width:240px;">用户</th>
+                <th class="users-nowrap" style="width:76px;">状态</th>
+                <th class="users-nowrap" style="width:82px;">KYC</th>
+                <th class="users-nowrap" style="width:96px;">邀请来源</th>
+                <th class="users-nowrap" style="width:112px;">出金状态</th>
+                <th style="width:138px;">注册时间</th>
+                <th style="width:138px;">最近登录</th>
+                <th class="users-actions-col">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td>
+                    <div class="user-cell">
+                      <div class="user-primary" title="{{ item.primary_contact or '--' }}">{{ item.primary_contact or '--' }}</div>
+                      <div class="user-uid admin-id">UID: {{ item.user_id }}</div>
+                      {% if item.nickname and item.nickname != item.primary_contact %}
+                        <div class="user-nickname" title="{{ item.nickname }}">昵称：{{ item.nickname }}</div>
+                      {% endif %}
+                    </div>
+                  </td>
+                  <td class="users-nowrap"><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></td>
+                  <td class="users-nowrap"><span class="admin-badge admin-badge-{{ item.kyc_badge }}">{{ item.kyc_label }}</span></td>
+                  <td class="users-nowrap"><span class="admin-badge admin-badge-{{ item.referral_source_badge }}">{{ item.referral_source_label }}</span></td>
+                  <td class="users-nowrap">
+                    <div class="withdraw-lock-cell">
+                      <span class="admin-badge admin-badge-{{ item.withdraw_lock_badge }}">{{ item.withdraw_lock_label }}</span>
+                      {% if item.withdraw_locked %}
+                        {% if item.withdraw_locked_at %}
+                          <div class="withdraw-lock-reason">锁定时间：{{ item.withdraw_locked_at }}</div>
+                        {% endif %}
+                      {% endif %}
+                    </div>
+                  </td>
+                  <td>
+                    {% if item.created_at %}
+                      <div class="admin-time-cell">
+                        <div>{{ item.created_at[:10] }}</div>
+                        <div class="admin-time-sub">{{ item.created_at[11:19] }}</div>
+                      </div>
+                    {% else %}
+                      <div class="admin-time-cell">--</div>
+                    {% endif %}
+                  </td>
+                  <td>
+                    {% if item.last_login_at %}
+                      <div class="admin-time-cell">
+                        <div>{{ item.last_login_at[:10] }}</div>
+                        <div class="admin-time-sub">{{ item.last_login_at[11:19] }}</div>
+                      </div>
+                    {% else %}
+                      <div class="admin-time-cell">--</div>
+                    {% endif %}
+                  </td>
+                  <td class="users-actions-col">
+                    {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+                    {% if item.is_disabled %}
+                      <form method="post" action="/admin/users/{{ item.user_id }}/enable" class="users-action-stack" onsubmit="return confirm('确认启用该用户账户？');">
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">启用账户</button>
+                      </form>
+                    {% else %}
+                      <form method="post" action="/admin/users/{{ item.user_id }}/disable" class="users-action-stack" onsubmit="return confirm('确认停用该用户账户？停用后用户不能登录。');">
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn danger admin-btn admin-btn-danger admin-btn-sm">停用账户</button>
+                      </form>
+                    {% endif %}
+                    {% if item.withdraw_locked %}
+                      <form method="post" action="/admin/users/{{ item.user_id }}/withdraw-unlock" class="users-action-stack" onsubmit="return confirm('确认解锁该用户出金？');">
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">解锁出金</button>
+                      </form>
+                    {% else %}
+                      <form method="post" action="/admin/users/{{ item.user_id }}/withdraw-lock" class="users-action-stack" onsubmit="return confirm('确认锁定该用户出金？锁定后用户不能提现和站内转账。');">
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn danger admin-btn admin-btn-danger admin-btn-sm">锁定出金</button>
+                      </form>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无符合条件的用户数据</div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

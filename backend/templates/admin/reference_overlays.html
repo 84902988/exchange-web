@@ -1,0 +1,209 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}RWA参考价管理{% endblock %}
+{% block page_title %}RWA参考价管理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">管理 RWA 标的参考价、自动同步状态与前端展示配置</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/reference-overlays/create" class="btn admin-btn admin-btn-primary">新增RWA参考价</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .rwa-action-cell {
+      min-width: 220px;
+      width: 220px;
+      white-space: nowrap;
+    }
+    .rwa-action-list {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: nowrap;
+    }
+    .rwa-action-list form {
+      display: inline-flex;
+      margin: 0;
+    }
+    .rwa-action-list .admin-btn,
+    .rwa-action-list .admin-badge {
+      white-space: nowrap;
+    }
+    .rwa-error-cell {
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .rwa-status-badge {
+      min-width: 48px;
+      width: auto;
+      height: auto;
+      overflow: visible;
+      border-radius: 999px;
+    }
+  </style>
+
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作结果</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">提示信息</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="admin-alert">
+      <div class="section-title">说明</div>
+      <ul class="admin-muted">
+        <li>MFCUSDT → 铁粉参考价（IRON62）</li>
+        <li>IGCUSDT → 黄金参考价（XAUUSD）</li>
+        <li>BON-2 / CREG-2 / IMAA-2 → 股票参考价</li>
+        <li>AUTO 表示自动同步</li>
+        <li>MANUAL 表示手工维护</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/reference-overlays" class="filter-form">
+        <div class="field">
+          <label for="symbol">交易对</label>
+          <input id="symbol" type="text" name="symbol" value="{{ filters.symbol or '' }}" placeholder="MFCUSDT" />
+        </div>
+        <div class="field">
+          <label for="kind">参考类型</label>
+          <select id="kind" name="kind">
+            <option value="">全部</option>
+            {% for option, label in [("IRON", "铁粉"), ("GOLD", "黄金"), ("STOCK", "股票")] %}
+              <option value="{{ option }}" {% if filters.kind == option %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="enabled">状态</label>
+          <select id="enabled" name="enabled">
+            <option value="">全部</option>
+            <option value="1" {% if filters.enabled == '1' %}selected{% endif %}>启用</option>
+            <option value="0" {% if filters.enabled == '0' %}selected{% endif %}>禁用</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/reference-overlays" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">RWA参考价列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>交易对</th>
+                <th>参考类型</th>
+                <th>价格来源</th>
+                <th>自动来源</th>
+                <th>来源标的</th>
+                <th>启用</th>
+                <th>画线价格</th>
+                <th>展示文案</th>
+                <th>市场状态</th>
+                <th>价格时间</th>
+                <th>最近同步</th>
+                <th>同步错误</th>
+                <th class="rwa-action-cell">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="mono nowrap">{{ item.symbol }}</td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.reference_type_badge }}">{{ item.reference_type_label }}</span>
+                  </td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.price_source_badge }}">{{ item.price_source_label }}</span>
+                  </td>
+                  <td class="mono nowrap">{{ item.auto_source or '-' }}</td>
+                  <td class="mono nowrap">{{ item.source_symbol or '-' }}</td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.enabled_badge }}">{{ item.enabled_label }}</span>
+                  </td>
+                  <td class="mono nowrap">{{ item.display_price or '-' }} {{ item.display_unit or '' }}</td>
+                  <td class="nowrap" title="{{ item.display_value_label or '-' }}">{{ item.display_value_label or '-' }}</td>
+                  <td>
+                    <span class="admin-badge rwa-status-badge {{ item.market_status_badge_class or 'admin-badge-secondary' }}" title="{{ item.market_status_text or '' }}">
+                      {{ item.market_status_text or '--' }}
+                    </span>
+                  </td>
+                  <td class="nowrap admin-time">{{ item.price_time or '-' }}</td>
+                  <td class="nowrap admin-time">{{ item.last_sync_at or '-' }}</td>
+                  <td class="rwa-error-cell" title="{{ item.sync_error or '' }}">{{ item.sync_error_short if item.sync_error else '--' }}</td>
+                  <td class="rwa-action-cell">
+                    <div class="rwa-action-list">
+                      <a href="/admin/reference-overlays/{{ item.id }}/edit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">编辑</a>
+                      {% if item.price_source == 'AUTO' %}
+                        <form method="post" action="/admin/reference-overlays/{{ item.id }}/sync">
+                          <input type="hidden" name="next_path" value="{{ current_url }}" />
+                          <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">同步</button>
+                        </form>
+                      {% else %}
+                        <span class="admin-badge admin-badge-secondary" title="手动价无需同步">无需同步</span>
+                      {% endif %}
+                      <form method="post" action="/admin/reference-overlays/{{ item.id }}/toggle-enabled">
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn admin-btn admin-btn-sm {% if item.enabled == 1 %}admin-btn-danger{% else %}admin-btn-primary{% endif %}">
+                          {% if item.enabled == 1 %}禁用{% else %}启用{% endif %}
+                        </button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无数据</div>
+          <p class="admin-empty-desc">当前筛选条件下暂无RWA参考价。</p>
+        </div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}
