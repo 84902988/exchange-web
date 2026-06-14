@@ -1,5 +1,8 @@
 import { request } from "@/lib/api/core/request";
 import { withContentLanguage } from "@/lib/api/core/locale";
+import type { Language } from "@/utils/language";
+
+type LocalizedText = Partial<Record<Language, string>>;
 
 export type SiteConfig = {
   id?: number;
@@ -14,6 +17,7 @@ export type SiteConfig = {
   home_hero_title?: string;
   home_hero_subtitle?: string;
   home_hero_cta_text?: string;
+  home_hero_cta_text_i18n?: LocalizedText | null;
   home_hero_cta_link?: string;
   home_hero_image?: string;
   show_risk_link?: boolean;

@@ -67,7 +67,7 @@ export default function HomeHero({
 
   const fallbackHeroTitle = t("heroTitle", "home");
   const emailPhonePlaceholder = t("heroPlaceholder", "home");
-  const getStartedText = ctaText || t("heroRegister", "home");
+  const getStartedText = ctaText || t("heroStart", "home");
 
   const handleRegisterClick = (e: React.MouseEvent) => {
     e.preventDefault();

@@ -1,0 +1,129 @@
+{% extends "admin/layout.html" %}
+
+{% if is_edit %}
+  {% set form_title = "编辑帮助分类" %}
+{% else %}
+  {% set form_title = "新增帮助分类" %}
+{% endif %}
+
+{% block title %}{{ form_title }}{% endblock %}
+{% block page_title %}{{ form_title }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">简体中文为默认内容，其他语言未填写时前台自动显示简体中文。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/help/categories" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .help-form{display:grid;gap:18px;margin-top:18px}
+    .help-form-section{display:grid;gap:16px;padding:16px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(255,255,255,.025)}
+    .help-form-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px}
+    .help-field{grid-column:span 6;display:flex;flex-direction:column;gap:8px}
+    .help-field-small{grid-column:span 3}
+    .help-form input,.help-form textarea{width:100%;border-radius:10px}
+    .help-form input{height:46px;padding:0 14px}
+    .help-form textarea{min-height:110px;padding:12px 14px;resize:vertical}
+    .help-check{display:flex;align-items:flex-start;gap:10px;min-height:46px}
+    .help-check input{width:auto;height:auto}
+    .help-check-copy{display:grid;gap:4px}
+    .help-check-title{color:#fff;font-weight:800;line-height:1.35}
+    .help-hint{margin:0;color:var(--muted);font-size:12px;line-height:1.65}
+    .help-tabs{display:flex;gap:8px;flex-wrap:wrap}
+    .help-tab-button{min-height:38px;padding:0 12px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:rgba(255,255,255,.04);color:var(--muted);font-weight:800;cursor:pointer}
+    .help-tab-button.is-active{border-color:rgba(250,204,21,.55);background:rgba(250,204,21,.14);color:#fff}
+    .help-tab-panel{display:none;gap:14px}
+    .help-tab-panel.is-active{display:grid}
+    .help-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    @media (max-width:720px){.help-form-grid{grid-template-columns:1fr}.help-field,.help-field-small{grid-column:1/-1}}
+  </style>
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">表单校验失败</div>
+        {% for error in errors %}
+          <p class="muted">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">{{ form_title }}</div>
+      <form method="post" action="{{ form_action }}" class="help-form" data-help-tab-form>
+        <section class="help-form-section">
+          <div class="section-title">基础信息</div>
+          <div class="help-form-grid">
+            <div class="field help-field">
+              <label for="category_key">分类标识</label>
+              <input id="category_key" name="category_key" type="text" value="{{ form.category_key or '' }}" placeholder="account-management" required />
+            </div>
+            <div class="field help-field-small">
+              <label for="sort_order">排序</label>
+              <input id="sort_order" name="sort_order" type="number" value="{{ form.sort_order or 0 }}" />
+            </div>
+            <label class="help-check help-field-small">
+              <input name="enabled" type="checkbox" value="1" {% if form.enabled %}checked{% endif %} />
+              <span class="help-check-copy">
+                <span class="help-check-title">在帮助中心显示</span>
+                <span class="help-hint">关闭后该分类不会在前台帮助中心出现。</span>
+              </span>
+            </label>
+          </div>
+        </section>
+
+        <section class="help-form-section">
+          <div class="section-title">内容编辑</div>
+          <p class="muted">简体中文 Tab 会写入主字段 title / description，同时写入 title_i18n.zh / description_i18n.zh。</p>
+          <div class="help-tabs" role="tablist" aria-label="分类多语言内容">
+            {% for suffix, label in [('zh','简体中文'),('zh_TW','繁体中文'),('en','English'),('ja','日本語')] %}
+              <button type="button" class="help-tab-button {% if suffix == 'zh' %}is-active{% endif %}" data-help-tab="{{ suffix }}" role="tab" aria-selected="{{ 'true' if suffix == 'zh' else 'false' }}">{{ label }}</button>
+            {% endfor %}
+          </div>
+
+          {% for suffix, label in [('zh','简体中文'),('zh_TW','繁体中文'),('en','English'),('ja','日本語')] %}
+            <div class="help-tab-panel {% if suffix == 'zh' %}is-active{% endif %}" data-help-panel="{{ suffix }}" role="tabpanel">
+              <div class="field">
+                <label for="title_i18n_{{ suffix }}">标题 - {{ label }}</label>
+                <input id="title_i18n_{{ suffix }}" name="title_i18n_{{ suffix }}" type="text" value="{{ form['title_i18n_' ~ suffix] or '' }}" {% if suffix == 'zh' %}required{% endif %} />
+              </div>
+              <div class="field">
+                <label for="description_i18n_{{ suffix }}">描述 - {{ label }}</label>
+                <textarea id="description_i18n_{{ suffix }}" name="description_i18n_{{ suffix }}">{{ form['description_i18n_' ~ suffix] or '' }}</textarea>
+              </div>
+            </div>
+          {% endfor %}
+        </section>
+
+        <div class="help-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">保存</button>
+          <a href="/admin/help/categories" class="btn secondary admin-btn admin-btn-secondary">取消</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <script>
+    document.querySelectorAll("[data-help-tab-form]").forEach((form) => {
+      const tabs = Array.from(form.querySelectorAll("[data-help-tab]"));
+      const panels = Array.from(form.querySelectorAll("[data-help-panel]"));
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => {
+          const target = tab.getAttribute("data-help-tab");
+          tabs.forEach((item) => {
+            const active = item === tab;
+            item.classList.toggle("is-active", active);
+            item.setAttribute("aria-selected", active ? "true" : "false");
+          });
+          panels.forEach((panel) => {
+            panel.classList.toggle("is-active", panel.getAttribute("data-help-panel") === target);
+          });
+        });
+      });
+    });
+  </script>
+{% endblock %}

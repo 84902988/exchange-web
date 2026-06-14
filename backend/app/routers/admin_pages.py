@@ -180,6 +180,8 @@ from app.services.bd_team_query import (
     update_bd_account_status,
 )
 from app.services.collection_send_helper import is_collection_real_send_enabled
+from app.services.collection_send_guard import validate_collection_send_allowed
+from app.services.collection_service import create_gas_task, mark_collection_task_wait_gas
 from app.services.collection_candidate_scanner import (
     ScanResult,
     admin_create_collection_tasks,
@@ -228,6 +230,30 @@ from app.services.site_content_service import (
     admin_update_home_banner,
     get_or_create_site_settings,
     update_site_settings,
+)
+from app.services.help_content_service import (
+    admin_create_help_article,
+    admin_create_help_category,
+    admin_get_help_article,
+    admin_get_help_category,
+    admin_help_article_form_from_payload,
+    admin_help_category_form_from_payload,
+    admin_list_help_category_options,
+    admin_query_help_articles,
+    admin_query_help_categories,
+    admin_toggle_help_article_enabled,
+    admin_toggle_help_article_hot,
+    admin_toggle_help_category_enabled,
+    admin_update_help_article,
+    admin_update_help_category,
+)
+from app.services.support_ticket_service import (
+    SUPPORT_TICKET_CATEGORIES,
+    SUPPORT_TICKET_STATUS_OPTIONS,
+    admin_get_support_ticket,
+    admin_query_support_tickets,
+    admin_reply_support_ticket,
+    admin_update_support_ticket_status,
 )
 from app.services.user_withdraw_lock_service import (
     DEFAULT_WITHDRAW_LOCK_REASON,
@@ -374,6 +400,8 @@ ADMIN_DOC_RESOURCE_LABELS: tuple[tuple[str, str, str], ...] = (
     ("/site-settings", "站点设置", "site settings"),
     ("/home-banners", "首页 Banner", "home banner"),
     ("/announcements", "公告", "announcement"),
+    ("/help/categories", "帮助分类", "help category"),
+    ("/help/articles", "帮助文章", "help article"),
     ("", "后台首页", "admin home"),
 )
 
@@ -476,7 +504,7 @@ def _admin_doc_tag(path: str) -> str:
         return ADMIN_DOC_TAGS["dividend"]
     if relative_path.startswith(("/system", "/audit")):
         return ADMIN_DOC_TAGS["system"]
-    if relative_path.startswith(("/site-settings", "/home-banners", "/announcements", "/uploads")):
+    if relative_path.startswith(("/site-settings", "/home-banners", "/announcements", "/help", "/uploads")):
         return ADMIN_DOC_TAGS["activity"]
     return ADMIN_DOC_TAGS["admin"]
 
@@ -753,6 +781,7 @@ ADMIN_GET_PERMISSION_EXACT: Dict[str, str] = {
     "/admin/system/services": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/rq": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/site-settings": "site_settings.manage",
+    "/admin/support-tickets": "support_tickets.manage",
     "/admin/admin-users": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/admin-roles": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
 }
@@ -774,6 +803,9 @@ ADMIN_GET_PERMISSION_PREFIXES: tuple[tuple[str, str], ...] = (
     ("/admin/activity-banners", "banners.manage"),
     ("/admin/activities", "banners.manage"),
     ("/admin/announcements", "announcements.manage"),
+    ("/admin/help/categories", "site_content.manage"),
+    ("/admin/help/articles", "site_content.manage"),
+    ("/admin/support-tickets", "support_tickets.manage"),
     ("/admin/admin-users", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/admin-roles", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/system/operations", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
@@ -1168,6 +1200,31 @@ def _collection_create_text(value: Any, default: str = "-") -> str:
 def _collection_create_skip_item(raw_item: Any) -> Dict[str, Any]:
     item = dict(raw_item or {}) if isinstance(raw_item, dict) else {}
     reason = str(item.get("skip_reason") or item.get("reason") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    action = str(item.get("action") or "").strip().lower()
+    task_id = item.get("task_id") or ""
+    batch_id = item.get("batch_id") or ""
+    task_status = str(item.get("task_status") or "").strip().upper()
+    task_completed = bool(task_status in {"CONFIRMED", "SUCCESS", "COMPLETED"})
+    action_labels = {
+        "created": "已新建任务",
+        "reused_existing": "近期已归集完成" if task_completed else "已存在",
+        "duplicate_active": "已有处理中任务",
+        "skipped_zero": "链上余额为 0",
+        "skipped_below_min": "低于最小归集额",
+        "skipped_config": "配置不可用",
+        "error": "创建失败",
+    }
+    action_groups = {
+        "error": ("异常", "danger", 10),
+        "enqueue_error": ("异常", "danger", 10),
+        "created": ("新建", "success", 20),
+        "reused_existing": ("已存在", "warning", 30),
+        "duplicate_active": ("已存在", "warning", 31),
+        "skipped_zero": ("跳过", "neutral", 40),
+        "skipped_below_min": ("跳过", "neutral", 41),
+        "skipped_config": ("跳过", "neutral", 42),
+    }
+    action_group, action_tone, action_sort = action_groups.get(action, ("跳过", "neutral", 50))
     address = _collection_create_text(item.get("address"), "")
     return {
         "candidate_id": item.get("candidate_id") or item.get("id") or "",
@@ -1183,6 +1240,16 @@ def _collection_create_skip_item(raw_item: Any) -> Dict[str, Any]:
         "min_collect_amount": _collection_create_text(item.get("min_collect_amount")),
         "skip_reason": reason,
         "skip_reason_label": _collection_create_skip_reason_label(reason),
+        "action": action,
+        "action_label": action_labels.get(action) or _collection_create_skip_reason_label(reason),
+        "action_group": action_group,
+        "action_tone": action_tone,
+        "action_sort": action_sort,
+        "task_id": task_id,
+        "task_status": task_status,
+        "batch_id": batch_id,
+        "batch_no": item.get("batch_no") or "",
+        "detail_url": f"/admin/collections/tasks?batch_id={batch_id}" if batch_id else "",
     }
 
 
@@ -1204,6 +1271,10 @@ def _collection_create_safe_technical_value(value: Any) -> Any:
 def _build_collection_create_detail(result: Dict[str, Any], enqueue_result: Dict[str, Any]) -> Dict[str, Any]:
     created_count = int(result.get("created_task_count") or 0)
     skipped_count = int(result.get("skipped_count") or 0)
+    candidate_count = int(result.get("candidate_count") or 0)
+    reused_existing_count = int(result.get("reused_existing_count") or 0)
+    duplicate_active_count = int(result.get("duplicate_active_count") or 0)
+    reused_count = int(result.get("reused_count") or 0) or reused_existing_count + duplicate_active_count
     skipped_reason_stats = result.get("skipped_reason_stats") or {}
     reason_items = []
     for reason, count in skipped_reason_stats.items():
@@ -1219,27 +1290,64 @@ def _build_collection_create_detail(result: Dict[str, Any], enqueue_result: Dict
         )
     raw_debug_items = result.get("skipped_items") or result.get("debug_items") or []
     raw_items = raw_debug_items if isinstance(raw_debug_items, list) else [raw_debug_items]
+    if candidate_count <= 0 and raw_debug_items:
+        candidate_count = len(raw_items)
     skipped_items = [
         _collection_create_skip_item(item)
         for item in raw_items
-        if isinstance(item, dict) and str(item.get("skip_reason") or item.get("reason") or "").strip()
+        if isinstance(item, dict)
+        and str(item.get("action") or item.get("skip_reason") or item.get("reason") or "").strip()
+    ]
+    actual_skipped_items = [
+        item
+        for item in skipped_items
+        if str(item.get("action") or "").strip().lower() not in {"created", "reused_existing", "duplicate_active"}
+        and str(item.get("skip_reason") or "").strip().upper()
+        not in {"EXISTING_IDEMPOTENT_TASK", "EXISTING_COLLECTION_TASK", "ACTIVE_COLLECTION_TASK_EXISTS"}
     ]
     if not reason_items and skipped_items:
         reason_counts: Dict[str, int] = {}
-        for item in skipped_items:
+        for item in actual_skipped_items:
             reason = str(item.get("skip_reason") or "UNKNOWN").strip().upper() or "UNKNOWN"
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
         reason_items = [
             {"reason": reason, "label": _collection_create_skip_reason_label(reason), "count": count}
             for reason, count in sorted(reason_counts.items())
         ]
-    if skipped_count <= 0 and skipped_items:
-        skipped_count = len(skipped_items)
+    if skipped_count <= 0 and actual_skipped_items:
+        skipped_count = len(actual_skipped_items)
     errors = enqueue_result.get("errors") or []
     enqueue_error_count = len(errors) if isinstance(errors, list) else (1 if errors else 0)
+    skipped_items = sorted(
+        skipped_items,
+        key=lambda item: (
+            int(item.get("action_sort") or 99),
+            str(item.get("chain_key") or ""),
+            str(item.get("coin_symbol") or ""),
+            str(item.get("address") or ""),
+        ),
+    )
+    if enqueue_error_count > 0:
+        result_status_label = "部分任务异常，请查看详情"
+        result_status_tone = "danger"
+    elif created_count > 0:
+        result_status_label = "已创建新归集任务"
+        result_status_tone = "success"
+    elif skipped_count > 0 or reused_count > 0:
+        result_status_label = "没有新建任务"
+        result_status_tone = "warning"
+    else:
+        result_status_label = "创建检查完成"
+        result_status_tone = "info"
     return {
+        "result_status_label": result_status_label,
+        "result_status_tone": result_status_tone,
+        "candidate_count": candidate_count,
         "created_count": created_count,
         "skipped_count": skipped_count,
+        "reused_count": reused_count,
+        "reused_existing_count": reused_existing_count,
+        "duplicate_active_count": duplicate_active_count,
         "enqueue_error_count": enqueue_error_count,
         "skipped_reasons": reason_items,
         "skipped_items": skipped_items,
@@ -1256,21 +1364,25 @@ def _build_collection_create_detail(result: Dict[str, Any], enqueue_result: Dict
 
 def _build_collection_create_notice(result: Dict[str, Any], enqueue_result: Dict[str, Any]) -> tuple[str, str]:
     detail = _build_collection_create_detail(result, enqueue_result)
+    candidate_count = int(detail.get("candidate_count") or 0)
     created_count = int(detail.get("created_count") or 0)
     skipped_count = int(detail.get("skipped_count") or 0)
+    reused_count = int(detail.get("reused_count") or 0)
     reason_items = list(detail.get("skipped_reasons") or [])
     reason_summary = ", ".join(item["label"] for item in reason_items[:2])
     if len(reason_items) > 2:
         reason_summary = f"{reason_summary}等"
 
-    notice = f"本次创建归集任务 {created_count} 个"
+    notice = f"本次扫描候选 {candidate_count} 个；新建归集任务 {created_count} 个"
     if skipped_count > 0:
-        notice = f"{notice}，跳过 {skipped_count} 个"
+        notice = f"{notice}；跳过 {skipped_count} 个"
         if reason_summary:
             notice = f"{notice}（{reason_summary}）"
+    if reused_count > 0:
+        notice = f"{notice}；复用/已存在 {reused_count} 个"
     enqueue_error_count = int(detail.get("enqueue_error_count") or 0)
     if enqueue_error_count:
-        notice = f"{notice}，入队异常 {enqueue_error_count} 个，请查看详情"
+        notice = f"{notice}；入队异常 {enqueue_error_count} 个，请查看详情"
     return notice, json.dumps(detail, ensure_ascii=False, default=str)
 
 
@@ -1845,6 +1957,7 @@ _ADMIN_ROLE_PERMISSION_DISPLAY: Dict[str, Dict[str, str]] = {
     "banners.manage": {"name": "Banner 管理", "description": "可维护首页 Banner 和运营活动展示"},
     "announcements.manage": {"name": "公告管理", "description": "可维护公告内容和上下架状"},
     "site_content.manage": {"name": "内容管理", "description": "可维护站点配置、Banner、公告和图片上传"},
+    "support_tickets.manage": {"name": "支持工单管理", "description": "可查看、回复和更新用户支持工单状态"},
     "audit.view": {"name": "操作审计查看", "description": "可查看后台操作审计记"},
     "admin_users.manage": {"name": "管理员账号管", "description": "可新增、启停、重置后台管理员账号，并执行用户账号高风险控"},
     "admin_roles.manage": {"name": "角色权限管理", "description": "可新增和编辑角色，并配置角色权限"},
@@ -1871,6 +1984,7 @@ _ADMIN_ROLE_PERMISSION_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "withdraw_reviews.view",
             "withdraw_reviews.manage",
             "user_transfers.view",
+            "support_tickets.manage",
             "platform_accounts.view",
             "platform_adjust.manage",
             "asset_configs.manage",
@@ -4277,6 +4391,7 @@ def collection_batches_page(
             "summary": result.get("summary") or {},
             "network_stats": result.get("network_stats") or [],
             "symbol_stats": result.get("symbol_stats") or [],
+            "filter_options": result.get("filter_options") or {},
             "range_notice": range_notice,
             "filters": {
                 **_result_filters(result),
@@ -4555,6 +4670,109 @@ async def collection_tasks_events(
     )
 
 
+def _admin_real_tx_hash(value: object) -> bool:
+    tx_hash = str(value or "").strip()
+    return bool(tx_hash.lower().startswith("0x") and not _admin_is_dry_run_tx_hash(tx_hash))
+
+
+def _admin_guard_error_label(error: str) -> str:
+    upper = str(error or "").upper()
+    if "REAL_SEND_MASTER_SWITCH_DISABLED" in upper or "MASTER_SWITCH_OFF" in upper:
+        return "Gas发送总开关未开启"
+    if "CHAIN_NOT_ALLOWED" in upper:
+        return "当前网络未开放补Gas"
+    return error or "补Gas已被安全策略拦截"
+
+
+def _admin_mark_gas_task_guard_blocked(db: Session, gas_task: GasTask, error: str) -> None:
+    gas_task.status = GasTaskStatus.FAILED.value
+    gas_task.last_error = (error or "GUARD_REJECTED")[:1000]
+    gas_task.next_retry_at = None
+    gas_task.locked_at = None
+    gas_task.updated_at = datetime.utcnow()
+    db.flush()
+
+
+def _admin_collection_gas_guard_error(db: Session, gas_task: GasTask) -> str:
+    result = validate_collection_send_allowed(
+        db=db,
+        chain_key=str(gas_task.chain_key or ""),
+        to_address=str(gas_task.to_address or ""),
+        amount=Decimal(str(gas_task.topup_amount or 0)),
+        coin_symbol="NATIVE",
+        is_gas=True,
+    )
+    return "" if result.allowed else f"GUARD_REJECTED:{result.reason}"
+
+
+def _admin_parse_wait_gas_reason(reason: object) -> tuple[str, Decimal]:
+    parts = str(reason or "").strip().split(":")
+    if len(parts) >= 3 and parts[0].upper() in {"WAIT_GAS", "WAITING_GAS", "GAS_REQUIRED"}:
+        try:
+            return parts[1].strip().upper(), Decimal(str(parts[2] or "0"))
+        except Exception:
+            return parts[1].strip().upper(), Decimal("0")
+    return "", Decimal("0")
+
+
+def _admin_chain_hot_wallet_address(db: Session, chain_key: object) -> str:
+    row = db.execute(
+        text("SELECT hot_wallet_address FROM chains WHERE LOWER(chain_key)=:chain_key LIMIT 1"),
+        {"chain_key": str(chain_key or "").strip().lower()},
+    ).mappings().first()
+    return str((row or {}).get("hot_wallet_address") or "").strip()
+
+
+def _admin_ensure_collection_gas_task(db: Session, task: CollectionTask) -> tuple[Optional[GasTask], str]:
+    linked_gas_task: Optional[GasTask] = None
+    invalid_link_reason = ""
+    if task.gas_task_id:
+        linked_gas_task = db.query(GasTask).filter(GasTask.id == int(task.gas_task_id)).first()
+        if not linked_gas_task:
+            invalid_link_reason = f"Gas任务 {task.gas_task_id} 不存在"
+        elif int(linked_gas_task.collection_task_id or 0) != int(task.id):
+            invalid_link_reason = (
+                f"Gas任务关联异常，可重新生成Gas任务"
+                f"(gas_task_id={linked_gas_task.id}, belongs_to={linked_gas_task.collection_task_id or '-'})"
+            )
+        else:
+            return linked_gas_task, ""
+
+    source_gas_task = linked_gas_task
+    gas_symbol, topup_amount = _admin_parse_wait_gas_reason(getattr(task, "reason", ""))
+    if source_gas_task:
+        gas_symbol = str(source_gas_task.gas_coin_symbol or gas_symbol or get_native_gas_coin_symbol(str(task.chain_key or ""))).strip().upper()
+        topup_amount = Decimal(str(source_gas_task.topup_amount or topup_amount or 0))
+    if not gas_symbol:
+        gas_symbol = get_native_gas_coin_symbol(str(task.chain_key or ""))
+    if topup_amount <= 0:
+        return None, invalid_link_reason or "缺少可创建 Gas 任务的补 Gas 数量"
+
+    hot_wallet_address = _admin_chain_hot_wallet_address(db, task.chain_key)
+    if not hot_wallet_address:
+        return None, invalid_link_reason or "链未配置热钱包地址，无法创建 Gas 任务"
+
+    gas_task = create_gas_task(
+        db,
+        collection_task_id=int(task.id),
+        user_id=int(task.user_id),
+        chain_key=str(task.chain_key or ""),
+        gas_coin_symbol=gas_symbol,
+        from_address=hot_wallet_address,
+        to_address=str(task.from_address or ""),
+        topup_amount=topup_amount,
+        target_balance=Decimal(str(getattr(source_gas_task, "target_balance", None) or topup_amount)),
+    )
+    mark_collection_task_wait_gas(
+        db,
+        int(task.id),
+        gas_task_id=int(gas_task.id),
+        reason=f"WAIT_GAS:{gas_symbol}:{format(topup_amount, 'f')}",
+    )
+    db.flush()
+    return gas_task, invalid_link_reason
+
+
 @router.post("/collections/tasks/{batch_id}/requeue")
 def collection_tasks_requeue_batch(
     request: Request,
@@ -4569,8 +4787,20 @@ def collection_tasks_requeue_batch(
     collection_enqueued = 0
     gas_enqueued = 0
     skipped_active = 0
+    skipped_reasons: list[str] = []
     errors: list[str] = []
     eligible_statuses = {"PENDING", "WAITING"}
+    waiting_gas_statuses = {"GAS_REQUIRED", "WAITING_GAS", "WAIT_GAS", "GAS_QUEUED"}
+    gas_requeue_statuses = {
+        "PENDING",
+        "WAITING",
+        "FAILED",
+        "TIMEOUT",
+        "CANCELED",
+        "CANCELLED",
+        "QUEUED",
+    }
+
     try:
         tasks = (
             db.query(CollectionTask)
@@ -4580,26 +4810,129 @@ def collection_tasks_requeue_batch(
         )
         for task in tasks:
             task_status = str(task.status or "").upper()
-            if task_status not in eligible_statuses or task.tx_hash:
+            task_label = f"task {int(task.id)}"
+            if task.tx_hash and _admin_real_tx_hash(task.tx_hash):
+                skipped_reasons.append(f"{task_label}: 已有真实tx")
                 continue
+
+            if task_status in waiting_gas_statuses:
+                gas_task, ensure_reason = _admin_ensure_collection_gas_task(db, task)
+                if ensure_reason:
+                    skipped_reasons.append(f"{task_label}: {ensure_reason}")
+                if not gas_task:
+                    skipped_reasons.append(f"{task_label}: gas_task无效且无法重新生成")
+                    continue
+                gas_status = str(gas_task.status or "").upper()
+                gas_tx_hash = str(gas_task.tx_hash or "").strip()
+                if gas_tx_hash and _admin_real_tx_hash(gas_tx_hash):
+                    skipped_reasons.append(f"{task_label}: Gas任务已有真实tx")
+                    continue
+                if gas_tx_hash and _admin_is_dry_run_tx_hash(gas_tx_hash):
+                    gas_task.tx_hash = None
+                    gas_task.sent_at = None
+                    gas_task.confirmed_at = None
+                    gas_task.block_number = None
+                    gas_task.status = GasTaskStatus.PENDING.value
+                    gas_task.updated_at = datetime.utcnow()
+                    db.flush()
+                    gas_status = GasTaskStatus.PENDING.value
+                if gas_status not in gas_requeue_statuses:
+                    skipped_reasons.append(f"{task_label}: Gas任务状态 {gas_status or '-'} 不允许重入队")
+                    continue
+                guard_error = _admin_collection_gas_guard_error(db, gas_task)
+                if guard_error:
+                    _admin_mark_gas_task_guard_blocked(db, gas_task, guard_error)
+                    skipped_reasons.append(f"{task_label}: {_admin_guard_error_label(guard_error)}")
+                    continue
+                if gas_status != GasTaskStatus.PENDING.value:
+                    gas_task.status = GasTaskStatus.PENDING.value
+                    gas_task.updated_at = datetime.utcnow()
+                    db.flush()
+                if is_gas_task_job_active(int(gas_task.id)):
+                    skipped_active += 1
+                    continue
+                enqueue_gas_task(int(gas_task.id), allow_real_send=True)
+                gas_enqueued += 1
+                continue
+
+            if task_status not in eligible_statuses:
+                skipped_reasons.append(f"{task_label}: 状态 {task_status or '-'} 不允许重入队")
+                continue
+
             if task.gas_task_id:
                 gas_task = db.query(GasTask).filter(GasTask.id == int(task.gas_task_id)).first()
+                if gas_task and int(gas_task.collection_task_id or 0) != int(task.id):
+                    skipped_reasons.append(f"{task_label}: gas_task归属异常")
+                    gas_task = None
                 if gas_task:
                     gas_status = str(gas_task.status or "").upper()
-                    if gas_status in eligible_statuses and not gas_task.tx_hash:
-                        if is_gas_task_job_active(int(gas_task.id)):
+                    gas_tx_hash = str(gas_task.tx_hash or "").strip()
+                    if gas_tx_hash and _admin_real_tx_hash(gas_tx_hash):
+                        skipped_reasons.append(f"{task_label}: Gas任务已有真实tx")
+                    elif gas_status in gas_requeue_statuses:
+                        guard_error = _admin_collection_gas_guard_error(db, gas_task)
+                        if guard_error:
+                            _admin_mark_gas_task_guard_blocked(db, gas_task, guard_error)
+                            skipped_reasons.append(f"{task_label}: {_admin_guard_error_label(guard_error)}")
+                        elif is_gas_task_job_active(int(gas_task.id)):
                             skipped_active += 1
                         else:
+                            if gas_status != GasTaskStatus.PENDING.value:
+                                gas_task.status = GasTaskStatus.PENDING.value
+                                gas_task.updated_at = datetime.utcnow()
+                                db.flush()
                             enqueue_gas_task(int(gas_task.id), allow_real_send=True)
                             gas_enqueued += 1
+
             if is_collection_task_job_active(int(task.id)):
                 skipped_active += 1
                 continue
             enqueue_collection_task(int(task.id), allow_real_send=True)
             collection_enqueued += 1
+        db.commit()
     except Exception as exc:
+        db.rollback()
         errors.append(str(exc)[:180])
         logger.warning("collection batch requeue failed batch_id=%s", batch_id, exc_info=True)
+
+    if collection_enqueued or gas_enqueued:
+        notice = f"已重新入队 {collection_enqueued} 个归集任务，{gas_enqueued} 个补 Gas 任务"
+        if skipped_active:
+            notice = f"{notice}；跳过 {skipped_active} 个已在队列中的任务"
+        if skipped_reasons:
+            notice = f"{notice}；跳过原因：{'; '.join(skipped_reasons[:6])}"
+        if errors:
+            notice = f"{notice}；部分失败：{'; '.join(errors)}"
+        return RedirectResponse(
+            url=_build_collection_tasks_redirect_url(next_path=next_path, notice=notice),
+            status_code=302,
+        )
+
+    if skipped_reasons or skipped_active or errors:
+        detail_parts: list[str] = []
+        if skipped_reasons:
+            detail_parts.append(f"跳过原因：{'; '.join(skipped_reasons[:8])}")
+        if skipped_active:
+            detail_parts.append(f"{skipped_active} 个任务已在队列中")
+        if errors:
+            detail_parts.append(f"失败：{'; '.join(errors)}")
+        message = f"未入队；{'；'.join(detail_parts)}"
+        return RedirectResponse(
+            url=_build_collection_tasks_redirect_url(next_path=next_path, error=message),
+            status_code=302,
+        )
+
+    message = "没有可处理的重入队任务"
+    if skipped_active:
+        message = f"{message}；{skipped_active} 个任务已在队列中"
+    if skipped_reasons:
+        message = f"{message}；跳过原因：{'; '.join(skipped_reasons[:8])}"
+    if errors:
+        message = f"{message}；{'; '.join(errors)}"
+    return RedirectResponse(
+        url=_build_collection_tasks_redirect_url(next_path=next_path, error=message),
+        status_code=302,
+    )
 
     if collection_enqueued or gas_enqueued:
         notice = f"已重新入队 {collection_enqueued} 个归集任务，{gas_enqueued} 个补 Gas 任务"
@@ -6406,6 +6739,8 @@ def collection_center_create_one(
             if (
                 "ACTIVE_COLLECTION_TASK_EXISTS" in reasons
                 or int(result.get("skipped_duplicate_count") or 0) > 0
+                or int(result.get("reused_existing_count") or 0) > 0
+                or int(result.get("duplicate_active_count") or 0) > 0
                 or int(skipped_stats.get("ACTIVE_COLLECTION_TASK_EXISTS") or 0) > 0
             ):
                 return "ACTIVE_COLLECTION_TASK_EXISTS", "已有归集任务"
@@ -6463,6 +6798,10 @@ def collection_center_create_one(
                     "ok": False,
                     "created_task_count": int(result.get("created_task_count") or 0),
                     "created_gas_task_count": int(result.get("created_gas_task_count") or 0),
+                    "candidate_count": int(create_detail.get("candidate_count") or 0),
+                    "reused_count": int(create_detail.get("reused_count") or 0),
+                    "reused_existing_count": int(create_detail.get("reused_existing_count") or 0),
+                    "duplicate_active_count": int(create_detail.get("duplicate_active_count") or 0),
                     "reason": reason,
                     "message": message,
                     "skipped_count": int(create_detail.get("skipped_count") or 0),
@@ -6497,6 +6836,10 @@ def collection_center_create_one(
                 {
                     "ok": True,
                     "created_gas_task_count": created_count,
+                    "candidate_count": int(create_detail.get("candidate_count") or 0),
+                    "reused_count": int(create_detail.get("reused_count") or 0),
+                    "reused_existing_count": int(create_detail.get("reused_existing_count") or 0),
+                    "duplicate_active_count": int(create_detail.get("duplicate_active_count") or 0),
                     "gas_job_ids": enqueue_result.get("gas_job_ids") or [],
                     "skipped_count": int(create_detail.get("skipped_count") or 0),
                     "enqueue_error_count": int(create_detail.get("enqueue_error_count") or 0),
@@ -6531,6 +6874,10 @@ def collection_center_create_one(
                 {
                     "ok": True,
                     "created_task_count": created_count,
+                    "candidate_count": int(create_detail.get("candidate_count") or 0),
+                    "reused_count": int(create_detail.get("reused_count") or 0),
+                    "reused_existing_count": int(create_detail.get("reused_existing_count") or 0),
+                    "duplicate_active_count": int(create_detail.get("duplicate_active_count") or 0),
                     "collection_job_ids": enqueue_result.get("collection_job_ids") or [],
                     "gas_job_ids": enqueue_result.get("gas_job_ids") or [],
                     "skipped_count": int(create_detail.get("skipped_count") or 0),
@@ -6987,7 +7334,7 @@ def gas_task_real_send(
             db.commit()
         result = process_gas_task(int(task_id), allow_real_send=True)
         if result.get("ok") and result.get("status") == GasTaskStatus.SENT.value:
-            notice = f"补 Gas 任务 {task_id} 已真实发送，状态：已发送，链上交易哈希：{result.get('tx_hash') or '-'}"
+            notice = f"补 Gas 任务 {task_id} 已发送，状态：已发送，链上交易哈希：{result.get('tx_hash') or '-'}"
             error = ""
         else:
             notice = ""
@@ -7022,7 +7369,7 @@ def gas_task_confirm_requeue(
 
     gas_status = str(task.status or "").upper()
     gas_tx_hash = str(task.tx_hash or "").strip()
-    if gas_status not in {GasTaskStatus.SENT.value, "GAS_SENT"}:
+    if gas_status not in {GasTaskStatus.SENT.value, GasTaskStatus.CONFIRMING.value, "GAS_SENT"}:
         return RedirectResponse(
             url=_build_gas_tasks_redirect_url(next_path=next_path, error=f"补 Gas 任务 {task_id} 当前状态不允许重投确认：{task.status}"),
             status_code=302,
@@ -13235,6 +13582,754 @@ def announcement_toggle_status(
             notice=result["message"] if result["ok"] else "",
             error="" if result["ok"] else result["message"],
             next_path=next_path,
+        ),
+        status_code=302,
+    )
+
+
+@router.get("/help/categories", response_class=HTMLResponse)
+def help_categories_page(
+    request: Request,
+    keyword: str = "",
+    enabled: str = "",
+    notice: str = "",
+    error: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    result = admin_query_help_categories(
+        db,
+        {
+            "keyword": keyword,
+            "enabled": enabled,
+            "page": page,
+            "page_size": page_size,
+        },
+    )
+    return render(
+        request,
+        "admin/help_categories.html",
+        ctx={
+            "active_group": "operations",
+            "active": "help_categories",
+            "items": _result_items(result),
+            "filters": {"keyword": keyword, "enabled": enabled},
+            "pagination": {
+                "page": _result_page(result),
+                "page_size": _result_page_size(result),
+                "total": _result_total(result),
+                "pages": _result_pages(result),
+            },
+            "notice": notice,
+            "error": error,
+        },
+    )
+
+
+@router.get("/help/categories/new", response_class=HTMLResponse)
+def help_category_create_page(request: Request):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    return render(
+        request,
+        "admin/help_category_form.html",
+        ctx={
+            "active_group": "operations",
+            "active": "help_categories",
+            "is_edit": False,
+            "errors": [],
+            "form_action": "/admin/help/categories/new",
+            "form": {
+                "category_key": "",
+                "title": "",
+                "description": "",
+                "sort_order": 0,
+                "enabled": True,
+            },
+        },
+    )
+
+
+@router.post("/help/categories/new")
+def help_category_create_submit(
+    request: Request,
+    category_key: str = Form(""),
+    title: str = Form(""),
+    description: str = Form(""),
+    title_i18n_zh: str = Form(""),
+    title_i18n_en: str = Form(""),
+    title_i18n_zh_TW: str = Form(""),
+    title_i18n_ja: str = Form(""),
+    description_i18n_zh: str = Form(""),
+    description_i18n_en: str = Form(""),
+    description_i18n_zh_TW: str = Form(""),
+    description_i18n_ja: str = Form(""),
+    sort_order: str = Form("0"),
+    enabled: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
+
+    payload = {
+        "category_key": category_key,
+        "title": title,
+        "description": description,
+        "title_i18n_zh": title_i18n_zh,
+        "title_i18n_en": title_i18n_en,
+        "title_i18n_zh_TW": title_i18n_zh_TW,
+        "title_i18n_ja": title_i18n_ja,
+        "description_i18n_zh": description_i18n_zh,
+        "description_i18n_en": description_i18n_en,
+        "description_i18n_zh_TW": description_i18n_zh_TW,
+        "description_i18n_ja": description_i18n_ja,
+        "sort_order": sort_order,
+        "enabled": enabled,
+    }
+    result = admin_create_help_category(db, payload)
+    if not result["ok"]:
+        return render(
+            request,
+            "admin/help_category_form.html",
+            ctx={
+                "active_group": "operations",
+                "active": "help_categories",
+                "is_edit": False,
+                "errors": result["errors"],
+                "form_action": "/admin/help/categories/new",
+                "form": admin_help_category_form_from_payload(payload),
+            },
+            status_code=400,
+        )
+    return RedirectResponse(
+        url=_build_site_content_redirect_url("/admin/help/categories", notice="帮助分类创建成功"),
+        status_code=302,
+    )
+
+
+@router.get("/help/categories/{category_id}/edit", response_class=HTMLResponse)
+def help_category_edit_page(
+    request: Request,
+    category_id: int,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    item = admin_get_help_category(db, category_id)
+    if item is None:
+        return RedirectResponse(
+            url=_build_site_content_redirect_url("/admin/help/categories", error="帮助分类不存在"),
+            status_code=302,
+        )
+    return render(
+        request,
+        "admin/help_category_form.html",
+        ctx={
+            "active_group": "operations",
+            "active": "help_categories",
+            "is_edit": True,
+            "errors": [],
+            "form_action": f"/admin/help/categories/{category_id}/edit",
+            "form": item,
+        },
+    )
+
+
+@router.post("/help/categories/{category_id}/edit")
+def help_category_edit_submit(
+    request: Request,
+    category_id: int,
+    category_key: str = Form(""),
+    title: str = Form(""),
+    description: str = Form(""),
+    title_i18n_zh: str = Form(""),
+    title_i18n_en: str = Form(""),
+    title_i18n_zh_TW: str = Form(""),
+    title_i18n_ja: str = Form(""),
+    description_i18n_zh: str = Form(""),
+    description_i18n_en: str = Form(""),
+    description_i18n_zh_TW: str = Form(""),
+    description_i18n_ja: str = Form(""),
+    sort_order: str = Form("0"),
+    enabled: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
+
+    payload = {
+        "category_key": category_key,
+        "title": title,
+        "description": description,
+        "title_i18n_zh": title_i18n_zh,
+        "title_i18n_en": title_i18n_en,
+        "title_i18n_zh_TW": title_i18n_zh_TW,
+        "title_i18n_ja": title_i18n_ja,
+        "description_i18n_zh": description_i18n_zh,
+        "description_i18n_en": description_i18n_en,
+        "description_i18n_zh_TW": description_i18n_zh_TW,
+        "description_i18n_ja": description_i18n_ja,
+        "sort_order": sort_order,
+        "enabled": enabled,
+    }
+    result = admin_update_help_category(db, category_id, payload)
+    if not result["ok"]:
+        if result.get("not_found"):
+            return RedirectResponse(
+                url=_build_site_content_redirect_url("/admin/help/categories", error="帮助分类不存在"),
+                status_code=302,
+            )
+        return render(
+            request,
+            "admin/help_category_form.html",
+            ctx={
+                "active_group": "operations",
+                "active": "help_categories",
+                "is_edit": True,
+                "errors": result["errors"],
+                "form_action": f"/admin/help/categories/{category_id}/edit",
+                "form": admin_help_category_form_from_payload(payload),
+            },
+            status_code=400,
+        )
+    return RedirectResponse(
+        url=_build_site_content_redirect_url("/admin/help/categories", notice="帮助分类保存成功"),
+        status_code=302,
+    )
+
+
+@router.post("/help/categories/{category_id}/toggle-enabled")
+def help_category_toggle_enabled(
+    request: Request,
+    category_id: int,
+    next_path: str = Form("/admin/help/categories"),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
+
+    result = admin_toggle_help_category_enabled(db, category_id)
+    return RedirectResponse(
+        url=_build_site_content_redirect_url(
+            "/admin/help/categories",
+            notice=result["message"] if result["ok"] else "",
+            error="" if result["ok"] else result["message"],
+            next_path=next_path,
+        ),
+        status_code=302,
+    )
+
+
+@router.get("/help/articles", response_class=HTMLResponse)
+def help_articles_page(
+    request: Request,
+    keyword: str = "",
+    category_id: int = 0,
+    enabled: str = "",
+    hot: str = "",
+    notice: str = "",
+    error: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    result = admin_query_help_articles(
+        db,
+        {
+            "keyword": keyword,
+            "category_id": category_id,
+            "enabled": enabled,
+            "hot": hot,
+            "page": page,
+            "page_size": page_size,
+        },
+    )
+    return render(
+        request,
+        "admin/help_articles.html",
+        ctx={
+            "active_group": "operations",
+            "active": "help_articles",
+            "items": _result_items(result),
+            "filters": {"keyword": keyword, "category_id": category_id, "enabled": enabled, "hot": hot},
+            "category_options": admin_list_help_category_options(db),
+            "pagination": {
+                "page": _result_page(result),
+                "page_size": _result_page_size(result),
+                "total": _result_total(result),
+                "pages": _result_pages(result),
+            },
+            "notice": notice,
+            "error": error,
+        },
+    )
+
+
+@router.get("/help/articles/new", response_class=HTMLResponse)
+def help_article_create_page(
+    request: Request,
+    category_id: int = 0,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    return render(
+        request,
+        "admin/help_article_form.html",
+        ctx={
+            "active_group": "operations",
+            "active": "help_articles",
+            "is_edit": False,
+            "errors": [],
+            "form_action": "/admin/help/articles/new",
+            "category_options": admin_list_help_category_options(db),
+            "form": {
+                "category_id": category_id,
+                "slug": "",
+                "title": "",
+                "summary": "",
+                "content": "",
+                "tags": "",
+                "is_hot": False,
+                "sort_order": 0,
+                "enabled": True,
+                "source_type": "cms",
+            },
+        },
+    )
+
+
+@router.post("/help/articles/new")
+def help_article_create_submit(
+    request: Request,
+    category_id: str = Form("0"),
+    slug: str = Form(""),
+    title: str = Form(""),
+    summary: str = Form(""),
+    content: str = Form(""),
+    title_i18n_zh: str = Form(""),
+    title_i18n_en: str = Form(""),
+    title_i18n_zh_TW: str = Form(""),
+    title_i18n_ja: str = Form(""),
+    summary_i18n_zh: str = Form(""),
+    summary_i18n_en: str = Form(""),
+    summary_i18n_zh_TW: str = Form(""),
+    summary_i18n_ja: str = Form(""),
+    content_i18n_zh: str = Form(""),
+    content_i18n_en: str = Form(""),
+    content_i18n_zh_TW: str = Form(""),
+    content_i18n_ja: str = Form(""),
+    tags: str = Form(""),
+    is_hot: str = Form(""),
+    sort_order: str = Form("0"),
+    enabled: str = Form(""),
+    source_type: str = Form("cms"),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
+
+    payload = {
+        "category_id": category_id,
+        "slug": slug,
+        "title": title,
+        "summary": summary,
+        "content": content,
+        "title_i18n_zh": title_i18n_zh,
+        "title_i18n_en": title_i18n_en,
+        "title_i18n_zh_TW": title_i18n_zh_TW,
+        "title_i18n_ja": title_i18n_ja,
+        "summary_i18n_zh": summary_i18n_zh,
+        "summary_i18n_en": summary_i18n_en,
+        "summary_i18n_zh_TW": summary_i18n_zh_TW,
+        "summary_i18n_ja": summary_i18n_ja,
+        "content_i18n_zh": content_i18n_zh,
+        "content_i18n_en": content_i18n_en,
+        "content_i18n_zh_TW": content_i18n_zh_TW,
+        "content_i18n_ja": content_i18n_ja,
+        "tags": tags,
+        "is_hot": is_hot,
+        "sort_order": sort_order,
+        "enabled": enabled,
+        "source_type": source_type,
+    }
+    result = admin_create_help_article(db, payload)
+    if not result["ok"]:
+        return render(
+            request,
+            "admin/help_article_form.html",
+            ctx={
+                "active_group": "operations",
+                "active": "help_articles",
+                "is_edit": False,
+                "errors": result["errors"],
+                "form_action": "/admin/help/articles/new",
+                "category_options": admin_list_help_category_options(db),
+                "form": admin_help_article_form_from_payload(payload),
+            },
+            status_code=400,
+        )
+    return RedirectResponse(
+        url=_build_site_content_redirect_url("/admin/help/articles", notice="帮助文章创建成功"),
+        status_code=302,
+    )
+
+
+@router.get("/help/articles/{article_id}/edit", response_class=HTMLResponse)
+def help_article_edit_page(
+    request: Request,
+    article_id: int,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    item = admin_get_help_article(db, article_id)
+    if item is None:
+        return RedirectResponse(
+            url=_build_site_content_redirect_url("/admin/help/articles", error="帮助文章不存在"),
+            status_code=302,
+        )
+    return render(
+        request,
+        "admin/help_article_form.html",
+        ctx={
+            "active_group": "operations",
+            "active": "help_articles",
+            "is_edit": True,
+            "errors": [],
+            "form_action": f"/admin/help/articles/{article_id}/edit",
+            "category_options": admin_list_help_category_options(db),
+            "form": item,
+        },
+    )
+
+
+@router.post("/help/articles/{article_id}/edit")
+def help_article_edit_submit(
+    request: Request,
+    article_id: int,
+    category_id: str = Form("0"),
+    slug: str = Form(""),
+    title: str = Form(""),
+    summary: str = Form(""),
+    content: str = Form(""),
+    title_i18n_zh: str = Form(""),
+    title_i18n_en: str = Form(""),
+    title_i18n_zh_TW: str = Form(""),
+    title_i18n_ja: str = Form(""),
+    summary_i18n_zh: str = Form(""),
+    summary_i18n_en: str = Form(""),
+    summary_i18n_zh_TW: str = Form(""),
+    summary_i18n_ja: str = Form(""),
+    content_i18n_zh: str = Form(""),
+    content_i18n_en: str = Form(""),
+    content_i18n_zh_TW: str = Form(""),
+    content_i18n_ja: str = Form(""),
+    tags: str = Form(""),
+    is_hot: str = Form(""),
+    sort_order: str = Form("0"),
+    enabled: str = Form(""),
+    source_type: str = Form("cms"),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
+
+    payload = {
+        "category_id": category_id,
+        "slug": slug,
+        "title": title,
+        "summary": summary,
+        "content": content,
+        "title_i18n_zh": title_i18n_zh,
+        "title_i18n_en": title_i18n_en,
+        "title_i18n_zh_TW": title_i18n_zh_TW,
+        "title_i18n_ja": title_i18n_ja,
+        "summary_i18n_zh": summary_i18n_zh,
+        "summary_i18n_en": summary_i18n_en,
+        "summary_i18n_zh_TW": summary_i18n_zh_TW,
+        "summary_i18n_ja": summary_i18n_ja,
+        "content_i18n_zh": content_i18n_zh,
+        "content_i18n_en": content_i18n_en,
+        "content_i18n_zh_TW": content_i18n_zh_TW,
+        "content_i18n_ja": content_i18n_ja,
+        "tags": tags,
+        "is_hot": is_hot,
+        "sort_order": sort_order,
+        "enabled": enabled,
+        "source_type": source_type,
+    }
+    result = admin_update_help_article(db, article_id, payload)
+    if not result["ok"]:
+        if result.get("not_found"):
+            return RedirectResponse(
+                url=_build_site_content_redirect_url("/admin/help/articles", error="帮助文章不存在"),
+                status_code=302,
+            )
+        return render(
+            request,
+            "admin/help_article_form.html",
+            ctx={
+                "active_group": "operations",
+                "active": "help_articles",
+                "is_edit": True,
+                "errors": result["errors"],
+                "form_action": f"/admin/help/articles/{article_id}/edit",
+                "category_options": admin_list_help_category_options(db),
+                "form": admin_help_article_form_from_payload(payload),
+            },
+            status_code=400,
+        )
+    return RedirectResponse(
+        url=_build_site_content_redirect_url("/admin/help/articles", notice="帮助文章保存成功"),
+        status_code=302,
+    )
+
+
+@router.post("/help/articles/{article_id}/toggle-enabled")
+def help_article_toggle_enabled(
+    request: Request,
+    article_id: int,
+    next_path: str = Form("/admin/help/articles"),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
+
+    result = admin_toggle_help_article_enabled(db, article_id)
+    return RedirectResponse(
+        url=_build_site_content_redirect_url(
+            "/admin/help/articles",
+            notice=result["message"] if result["ok"] else "",
+            error="" if result["ok"] else result["message"],
+            next_path=next_path,
+        ),
+        status_code=302,
+    )
+
+
+@router.post("/help/articles/{article_id}/toggle-hot")
+def help_article_toggle_hot(
+    request: Request,
+    article_id: int,
+    next_path: str = Form("/admin/help/articles"),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
+
+    result = admin_toggle_help_article_hot(db, article_id)
+    return RedirectResponse(
+        url=_build_site_content_redirect_url(
+            "/admin/help/articles",
+            notice=result["message"] if result["ok"] else "",
+            error="" if result["ok"] else result["message"],
+            next_path=next_path,
+        ),
+        status_code=302,
+    )
+
+
+@router.get("/support-tickets", response_class=HTMLResponse)
+def support_tickets_page(
+    request: Request,
+    keyword: str = "",
+    user_id: str = "",
+    status: str = "",
+    category: str = "",
+    notice: str = "",
+    error: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    result = admin_query_support_tickets(
+        db,
+        {
+            "keyword": keyword,
+            "user_id": user_id,
+            "status": status,
+            "category": category,
+            "page": page,
+            "page_size": page_size,
+        },
+    )
+    return render(
+        request,
+        "admin/support_tickets.html",
+        ctx={
+            "active_group": "users",
+            "active": "support_tickets",
+            "items": _result_items(result),
+            "filters": {"keyword": keyword, "user_id": user_id, "status": status, "category": category},
+            "status_options": SUPPORT_TICKET_STATUS_OPTIONS,
+            "category_options": SUPPORT_TICKET_CATEGORIES,
+            "pagination": {
+                "page": _result_page(result),
+                "page_size": _result_page_size(result),
+                "total": _result_total(result),
+                "pages": _result_pages(result),
+            },
+            "notice": notice,
+            "error": error,
+        },
+    )
+
+
+@router.get("/support-tickets/{ticket_id}", response_class=HTMLResponse)
+def support_ticket_detail_page(
+    request: Request,
+    ticket_id: int,
+    notice: str = "",
+    error: str = "",
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    ticket = admin_get_support_ticket(db, ticket_id)
+    if ticket is None:
+        return RedirectResponse(
+            url=_build_site_content_redirect_url("/admin/support-tickets", error="工单不存在"),
+            status_code=302,
+        )
+    return render(
+        request,
+        "admin/support_ticket_detail.html",
+        ctx={
+            "active_group": "users",
+            "active": "support_tickets",
+            "ticket": ticket,
+            "status_options": SUPPORT_TICKET_STATUS_OPTIONS,
+            "notice": notice,
+            "error": error,
+        },
+    )
+
+
+@router.post("/support-tickets/{ticket_id}/reply")
+def support_ticket_reply_submit(
+    request: Request,
+    ticket_id: int,
+    message: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "support_tickets.manage")
+    if redir:
+        return redir
+
+    admin = get_admin_from_request(request) or {}
+    try:
+        result = admin_reply_support_ticket(
+            db,
+            ticket_id=ticket_id,
+            admin_user_id=int(admin.get("id") or 0),
+            message=message,
+        )
+        if result["ok"]:
+            db.commit()
+        else:
+            db.rollback()
+    except HTTPException as exc:
+        db.rollback()
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        result = {"ok": False, "message": str(detail.get("message") or exc.detail or "回复失败")}
+    except Exception:
+        db.rollback()
+        result = {"ok": False, "message": "回复失败，请稍后重试"}
+
+    return RedirectResponse(
+        url=_build_site_content_redirect_url(
+            f"/admin/support-tickets/{ticket_id}",
+            notice=result["message"] if result["ok"] else "",
+            error="" if result["ok"] else result["message"],
+        ),
+        status_code=302,
+    )
+
+
+@router.post("/support-tickets/{ticket_id}/status")
+def support_ticket_status_submit(
+    request: Request,
+    ticket_id: int,
+    status: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "support_tickets.manage")
+    if redir:
+        return redir
+
+    try:
+        result = admin_update_support_ticket_status(db, ticket_id=ticket_id, status=status)
+        if result["ok"]:
+            db.commit()
+        else:
+            db.rollback()
+    except Exception:
+        db.rollback()
+        result = {"ok": False, "message": "状态更新失败，请稍后重试"}
+
+    return RedirectResponse(
+        url=_build_site_content_redirect_url(
+            f"/admin/support-tickets/{ticket_id}",
+            notice=result["message"] if result["ok"] else "",
+            error="" if result["ok"] else result["message"],
         ),
         status_code=302,
     )

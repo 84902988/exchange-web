@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.content_locale import resolve_content_locale
 from app.db.session import get_db
 from app.schemas.response import ok
+from app.services.help_content_service import get_public_help_content
 from app.services.site_content_service import (
     get_public_announcement,
     get_public_announcements,
@@ -41,6 +42,17 @@ def home_banners(
     trace_id = getattr(request.state, "trace_id", None)
     locale = resolve_content_locale(lang, request.headers.get("accept-language"))
     return ok(data={"items": get_public_home_banners(db, limit=limit, locale=locale)}, trace_id=trace_id)
+
+
+@router.get("/help/content")
+def help_content(
+    request: Request,
+    lang: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    trace_id = getattr(request.state, "trace_id", None)
+    locale = resolve_content_locale(lang, request.headers.get("accept-language"))
+    return ok(data=get_public_help_content(db, locale=locale), trace_id=trace_id)
 
 
 @router.get("/announcements/latest")

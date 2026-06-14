@@ -1,268 +1,283 @@
-'use client';
+"use client";
 
-import { useMemo, useState } from 'react';
-import { motion } from 'framer-motion';
-import { useLocaleContext } from '@/contexts/LocaleContext';
+import { useEffect, useMemo, useState } from "react";
 
-interface HelpCategory {
-  id: string;
-  titleKey: string;
-  icon: string;
-  items: {
-    id: string;
-    titleKey: string;
-    contentKey: string;
-  }[];
+import { useLocaleContext } from "@/contexts/LocaleContext";
+import { getHelpContent, type HelpContentCategoryDTO, type HelpContentSectionDTO } from "@/lib/api/modules/help";
+import {
+  flattenHelpArticles,
+  helpCategories,
+  helpText,
+  type HelpArticle,
+  type HelpCategory,
+} from "@/lib/help/helpContent";
+
+type ArticleWithCategory = ReturnType<typeof flattenHelpArticles>[number];
+
+function localized(value: string | undefined, locale: Parameters<typeof helpText>[1]) {
+  const text = value || "";
+  return {
+    zh: text,
+    [locale]: text,
+  };
 }
 
-const HELP_CATEGORIES: HelpCategory[] = [
-  {
-    id: 'account',
-    titleKey: 'helpCategoryAccount',
-    icon: '👤',
-    items: [
-      { id: 'account-create', titleKey: 'helpAccountCreateTitle', contentKey: 'helpAccountCreateContent' },
-      { id: 'account-login', titleKey: 'helpAccountLoginTitle', contentKey: 'helpAccountLoginContent' },
-      { id: 'account-security', titleKey: 'helpAccountSecurityTitle', contentKey: 'helpAccountSecurityContent' },
-      { id: 'account-kyc', titleKey: 'helpAccountKycTitle', contentKey: 'helpAccountKycContent' },
-    ],
-  },
-  {
-    id: 'trading',
-    titleKey: 'helpCategoryTrading',
-    icon: '📊',
-    items: [
-      { id: 'trading-spot', titleKey: 'helpTradingSpotTitle', contentKey: 'helpTradingSpotContent' },
-      { id: 'trading-futures', titleKey: 'helpTradingFuturesTitle', contentKey: 'helpTradingFuturesContent' },
-      { id: 'trading-order', titleKey: 'helpTradingOrderTitle', contentKey: 'helpTradingOrderContent' },
-      { id: 'trading-fees', titleKey: 'helpTradingFeesTitle', contentKey: 'helpTradingFeesContent' },
-    ],
-  },
-  {
-    id: 'deposit-withdraw',
-    titleKey: 'helpCategoryDepositWithdraw',
-    icon: '💳',
-    items: [
-      { id: 'deposit-crypto', titleKey: 'helpDepositCryptoTitle', contentKey: 'helpDepositCryptoContent' },
-      { id: 'withdraw-crypto', titleKey: 'helpWithdrawCryptoTitle', contentKey: 'helpWithdrawCryptoContent' },
-      { id: 'deposit-fiat', titleKey: 'helpDepositFiatTitle', contentKey: 'helpDepositFiatContent' },
-      { id: 'withdraw-fiat', titleKey: 'helpWithdrawFiatTitle', contentKey: 'helpWithdrawFiatContent' },
-    ],
-  },
-  {
-    id: 'security',
-    titleKey: 'helpCategorySecurity',
-    icon: '🔐',
-    items: [
-      { id: 'security-2fa', titleKey: 'helpSecurity2faTitle', contentKey: 'helpSecurity2faContent' },
-      { id: 'security-password', titleKey: 'helpSecurityPasswordTitle', contentKey: 'helpSecurityPasswordContent' },
-      { id: 'security-phishing', titleKey: 'helpSecurityPhishingTitle', contentKey: 'helpSecurityPhishingContent' },
-      { id: 'security-alert', titleKey: 'helpSecurityAlertTitle', contentKey: 'helpSecurityAlertContent' },
-    ],
-  },
-  {
-    id: 'api',
-    titleKey: 'helpCategoryApi',
-    icon: '🔌',
-    items: [
-      { id: 'api-create', titleKey: 'helpApiCreateTitle', contentKey: 'helpApiCreateContent' },
-      { id: 'api-docs', titleKey: 'helpApiDocsTitle', contentKey: 'helpApiDocsContent' },
-      { id: 'api-security', titleKey: 'helpApiSecurityTitle', contentKey: 'helpApiSecurityContent' },
-      { id: 'api-limit', titleKey: 'helpApiLimitTitle', contentKey: 'helpApiLimitContent' },
-    ],
-  },
-  {
-    id: 'platform',
-    titleKey: 'helpCategoryPlatform',
-    icon: '📋',
-    items: [
-      { id: 'platform-risk', titleKey: 'helpPlatformRiskTitle', contentKey: 'helpPlatformRiskContent' },
-      { id: 'platform-terms', titleKey: 'helpPlatformTermsTitle', contentKey: 'helpPlatformTermsContent' },
-      { id: 'platform-privacy', titleKey: 'helpPlatformPrivacyTitle', contentKey: 'helpPlatformPrivacyContent' },
-      { id: 'platform-compliance', titleKey: 'helpPlatformComplianceTitle', contentKey: 'helpPlatformComplianceContent' },
-      { id: 'platform-fees', titleKey: 'helpPlatformFeesTitle', contentKey: 'helpPlatformFeesContent' },
-    ],
-  },
-];
+function mapHelpSection(section: HelpContentSectionDTO, locale: Parameters<typeof helpText>[1]) {
+  return {
+    heading: localized(section.heading || "", locale),
+    body: section.body?.map((item) => localized(item, locale)),
+    steps: section.steps?.map((item) => localized(item, locale)),
+    bullets: section.bullets?.map((item) => localized(item, locale)),
+  };
+}
 
-const QUICK_LINKS = [
-  { href: '/help/faq', icon: '❓', labelKey: 'helpQuickFaq' },
-  { href: '#', icon: '💬', labelKey: 'helpQuickSupport' },
-  { href: '#', icon: '📝', labelKey: 'helpQuickTicket' },
-  { href: '#', icon: '📋', labelKey: 'helpQuickTerms' },
-];
+function mapCmsHelpCategories(categories: HelpContentCategoryDTO[] | undefined, locale: Parameters<typeof helpText>[1]): HelpCategory[] {
+  return (categories || [])
+    .map((category): HelpCategory => ({
+      id: category.category_key || category.id,
+      title: localized(category.title, locale),
+      description: localized(category.description, locale),
+      articles: (category.articles || []).map((article): HelpArticle => ({
+        id: article.id,
+        slug: article.slug,
+        title: localized(article.title, locale),
+        summary: localized(article.summary, locale),
+        tags: article.tags || [],
+        hot: article.hot ?? article.is_hot ?? false,
+        sections: article.sections?.length
+          ? article.sections.map((section) => mapHelpSection(section, locale))
+          : [
+              {
+                heading: localized(locale === "en" ? "Content" : "正文内容", locale),
+                body: article.content
+                  ?.split(/\r?\n/)
+                  .map((line) => line.trim())
+                  .filter(Boolean)
+                  .map((line) => localized(line, locale)),
+              },
+            ],
+      })),
+    }))
+    .filter((category) => category.articles.length > 0);
+}
 
-const HOT_QUESTIONS = [
-  'helpHotResetPassword',
-  'helpHotWithdrawTime',
-  'helpHotEnable2fa',
-  'helpHotTradingFees',
-];
+function articleDirectoryText(article: ArticleWithCategory, locale: Parameters<typeof helpText>[1]): string {
+  return [
+    helpText(article.title, locale),
+    helpText(article.summary, locale),
+    helpText(article.categoryTitle, locale),
+    article.tags.join(" "),
+  ].join(" ").toLowerCase();
+}
+
+function HelpSectionList({ article }: { article: HelpArticle }) {
+  const { locale } = useLocaleContext();
+
+  return (
+    <div className="space-y-7">
+      {article.sections.map((section) => (
+        <section key={helpText(section.heading, locale)} className="border-t border-white/10 pt-6 first:border-t-0 first:pt-0">
+          <h3 className="mb-3 text-lg font-semibold text-white">{helpText(section.heading, locale)}</h3>
+
+          {section.body?.map((item) => (
+            <p key={helpText(item, locale)} className="mb-3 text-sm leading-7 text-white/72">
+              {helpText(item, locale)}
+            </p>
+          ))}
+
+          {section.steps && (
+            <ol className="space-y-3 pl-5 text-sm leading-7 text-white/72">
+              {section.steps.map((step) => (
+                <li key={helpText(step, locale)} className="list-decimal pl-1">
+                  {helpText(step, locale)}
+                </li>
+              ))}
+            </ol>
+          )}
+
+          {section.bullets && (
+            <ul className="space-y-3 pl-5 text-sm leading-7 text-white/72">
+              {section.bullets.map((bullet) => (
+                <li key={helpText(bullet, locale)} className="list-disc pl-1">
+                  {helpText(bullet, locale)}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      ))}
+    </div>
+  );
+}
 
 export default function HelpPage() {
-  const { t } = useLocaleContext();
-  const [expandedCategory, setExpandedCategory] = useState<string>(HELP_CATEGORIES[0].id);
-  const [selectedItem, setSelectedItem] = useState<string>(HELP_CATEGORIES[0].items[0].id);
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(false);
+  const { locale, t } = useLocaleContext();
+  const [cmsCategories, setCmsCategories] = useState<HelpCategory[] | null>(null);
+  const sourceCategories = cmsCategories?.length ? cmsCategories : helpCategories;
+  const allArticles = useMemo(() => flattenHelpArticles(sourceCategories), [sourceCategories]);
+  const [selectedArticleId, setSelectedArticleId] = useState<string>(helpCategories[0].articles[0].id);
+  const [query, setQuery] = useState("");
 
-  const currentContent = useMemo(() => {
-    const category = HELP_CATEGORIES.find((item) => item.id === expandedCategory) || HELP_CATEGORIES[0];
-    return category.items.find((item) => item.id === selectedItem) || category.items[0];
-  }, [expandedCategory, selectedItem]);
+  useEffect(() => {
+    let cancelled = false;
 
-  const toggleCategory = (categoryId: string) => {
-    const nextCategory = HELP_CATEGORIES.find((item) => item.id === categoryId) || HELP_CATEGORIES[0];
-    setExpandedCategory(expandedCategory === categoryId ? '' : categoryId);
-    setSelectedItem(nextCategory.items[0].id);
+    getHelpContent(locale)
+      .then((data) => {
+        if (cancelled) return;
+        const categories = mapCmsHelpCategories(data.categories, locale);
+        setCmsCategories(categories.length > 0 ? categories : null);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCmsCategories(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [locale]);
+
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleArticleIds = useMemo(() => {
+    if (!normalizedQuery) {
+      return new Set(allArticles.map((article) => article.id));
+    }
+    return new Set(
+      allArticles
+        .filter((article) => articleDirectoryText(article, locale).includes(normalizedQuery))
+        .map((article) => article.id),
+    );
+  }, [allArticles, locale, normalizedQuery]);
+
+  const visibleCategories = useMemo(() => {
+    return sourceCategories
+      .map((category): HelpCategory => ({
+        ...category,
+        articles: category.articles.filter((article) => visibleArticleIds.has(article.id)),
+      }))
+      .filter((category) => category.articles.length > 0);
+  }, [sourceCategories, visibleArticleIds]);
+
+  const selectedArticle = useMemo(() => {
+    return allArticles.find((article) => article.id === selectedArticleId) || allArticles[0];
+  }, [allArticles, selectedArticleId]);
+
+  const hotArticles = useMemo(() => allArticles.filter((article) => article.hot).slice(0, 4), [allArticles]);
+
+  const selectArticle = (articleId: string) => {
+    setSelectedArticleId(articleId);
   };
 
   return (
-    <div className="min-h-screen bg-[#0b0b0f] text-white flex flex-col">
-      <div className="border-b border-white/10 z-10">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex h-16 items-center justify-between">
-            <div className="flex items-center">
-              <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-amber-400 to-white">
-                {t('helpCenterTitle', 'common')}
+    <main className="min-h-screen bg-[#0b0b0f] text-white">
+      <div className="border-b border-white/10 bg-[#101015]">
+        <div className="mx-auto flex max-w-7xl flex-col gap-5 px-4 py-8 sm:px-6 lg:px-8">
+          <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h1 className="text-2xl font-semibold tracking-normal text-white md:text-3xl">
+                {t("helpCenterTitle", "common")}
               </h1>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-white/62">
+                {t("helpCenterSubtitle", "common")}
+              </p>
             </div>
-            <div className="flex items-center space-x-4">
-              <button className="px-4 py-2 bg-blue-600/20 hover:bg-blue-600/30 rounded-lg text-sm font-medium transition-colors">
-                {t('helpContactSupport', 'common')}
-              </button>
-            </div>
+            <a
+              href="/user/support-tickets"
+              className="inline-flex h-10 items-center justify-center rounded-md border border-amber-400/40 px-4 text-sm font-medium text-amber-300 transition-colors hover:border-amber-300 hover:bg-amber-400/10"
+            >
+              {t("helpContactSupport", "common")}
+            </a>
           </div>
+
+          <label className="relative block max-w-4xl">
+            <span className="sr-only">{t("helpSearchPlaceholder", "common")}</span>
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder={t("helpSearchPlaceholder", "common")}
+              className="h-12 w-full rounded-md border border-white/12 bg-black/30 px-4 text-sm text-white outline-none transition-colors placeholder:text-white/35 focus:border-amber-300/70"
+            />
+          </label>
+
+          <section className="rounded-md border border-white/10 bg-black/20 p-4">
+            <h2 className="mb-3 text-sm font-semibold text-white/82">{t("helpPopularArticles", "common")}</h2>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              {hotArticles.map((article) => (
+                <button
+                  key={article.id}
+                  type="button"
+                  onClick={() => selectArticle(article.id)}
+                  className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-3 text-left text-sm font-medium leading-6 text-white/72 transition-colors hover:border-amber-400/40 hover:text-amber-300"
+                >
+                  {helpText(article.title, locale)}
+                </button>
+              ))}
+            </div>
+          </section>
         </div>
       </div>
 
-      <div className="flex flex-1 overflow-hidden">
-        <motion.div
-          initial={{ opacity: 0, x: -20 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ duration: 0.5 }}
-          className={`bg-[#121217] border-r border-white/10 flex-shrink-0 transition-all duration-300 overflow-hidden ${isSidebarCollapsed ? 'w-16' : 'w-64'}`}
-        >
-          <div className="flex justify-end p-4">
-            <button
-              onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
-              className="p-2 text-gray-500 hover:text-gray-300 transition-colors"
-              aria-label={isSidebarCollapsed ? t('helpExpandSidebar', 'common') : t('helpCollapseSidebar', 'common')}
-            >
-              {isSidebarCollapsed ? '>' : '<'}
-            </button>
+      <div className="mx-auto grid max-w-7xl grid-cols-1 gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[290px_minmax(0,1fr)] lg:px-8">
+        <aside className="rounded-md border border-white/10 bg-[#101015] lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:self-start lg:overflow-y-auto">
+          <div className="border-b border-white/10 px-4 py-3 text-sm font-semibold text-white/82">
+            {t("helpAllArticles", "common")}
           </div>
 
-          <nav className="space-y-2 px-2">
-            {HELP_CATEGORIES.map((category) => (
-              <div key={category.id} className="space-y-1">
-                <button
-                  onClick={() => toggleCategory(category.id)}
-                  className={`w-full flex items-center justify-between p-3 rounded-lg text-left transition-colors ${expandedCategory === category.id ? 'bg-amber-600/20 text-amber-400' : 'hover:bg-white/10 text-gray-300'}`}
-                >
-                  <div className="flex items-center space-x-3">
-                    <span>{category.icon}</span>
-                    {!isSidebarCollapsed && <span className="font-medium">{t(category.titleKey, 'common')}</span>}
-                  </div>
-                  {!isSidebarCollapsed && (
-                    <span className={`transform transition-transform ${expandedCategory === category.id ? 'rotate-90' : ''}`}>
-                      &gt;
-                    </span>
-                  )}
-                </button>
+          <nav className="space-y-5 p-4">
+            {visibleCategories.length === 0 && (
+              <div className="py-6 text-sm leading-6 text-white/50">{t("helpNoResults", "common")}</div>
+            )}
 
-                {!isSidebarCollapsed && expandedCategory === category.id && (
-                  <motion.div
-                    initial={{ opacity: 0, height: 0 }}
-                    animate={{ opacity: 1, height: 'auto' }}
-                    exit={{ opacity: 0, height: 0 }}
-                    transition={{ duration: 0.3 }}
-                    className="pl-12 space-y-1"
-                  >
-                    {category.items.map((item) => (
-                      <button
-                        key={item.id}
-                        onClick={() => setSelectedItem(item.id)}
-                        className={`w-full text-left p-2.5 rounded-lg transition-colors text-sm ${selectedItem === item.id ? 'bg-amber-600/20 text-amber-400' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
-                      >
-                        {t(item.titleKey, 'common')}
-                      </button>
-                    ))}
-                  </motion.div>
-                )}
-              </div>
+            {visibleCategories.map((category) => (
+              <section key={category.id}>
+                <h2 className="mb-2 text-sm font-semibold text-white">{helpText(category.title, locale)}</h2>
+                <div className="space-y-1">
+                  {category.articles.map((article) => (
+                    <button
+                      key={article.id}
+                      type="button"
+                      onClick={() => selectArticle(article.id)}
+                      className={`w-full rounded-md px-3 py-2 text-left text-sm leading-5 transition-colors ${
+                        selectedArticle.id === article.id
+                          ? "bg-amber-400/10 text-amber-300"
+                          : "text-white/58 hover:bg-white/[0.04] hover:text-white"
+                      }`}
+                    >
+                      {helpText(article.title, locale)}
+                    </button>
+                  ))}
+                </div>
+              </section>
             ))}
           </nav>
-        </motion.div>
+        </aside>
 
-        <div className="flex-1 overflow-y-auto p-8">
-          <div className="max-w-6xl mx-auto">
-            <div className="flex flex-col lg:flex-row gap-8">
-              <motion.div
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.5, delay: 0.2 }}
-                className="flex-1"
-              >
-                <div className="p-4 md:p-0">
-                  <h2 className="text-2xl font-bold mb-6 text-white">{t(currentContent.titleKey, 'common')}</h2>
-                  <div className="prose prose-invert max-w-none">
-                    <p className="text-gray-300 leading-relaxed">{t(currentContent.contentKey, 'common')}</p>
-
-                    <div className="mt-8 bg-white/5 p-6 rounded-lg">
-                      <h3 className="text-lg font-semibold mb-3 text-white">{t('helpRelatedSteps', 'common')}</h3>
-                      <ol className="list-decimal pl-5 space-y-2 text-gray-300">
-                        <li>{t('helpRelatedStepLogin', 'common')}</li>
-                        <li>{t('helpRelatedStepOpenPage', 'common')}</li>
-                        <li>{t('helpRelatedStepFollowPrompt', 'common')}</li>
-                        <li>{t('helpRelatedStepConfirm', 'common')}</li>
-                      </ol>
-                    </div>
-
-                    <div className="mt-8 bg-amber-600/10 p-6 rounded-lg border border-amber-600/30">
-                      <h3 className="text-lg font-semibold mb-3 text-amber-400">{t('helpWarmTips', 'common')}</h3>
-                      <p className="text-gray-300">{t('helpWarmTipsContent', 'common')}</p>
-                    </div>
-                  </div>
-                </div>
-              </motion.div>
-
-              <motion.div
-                initial={{ opacity: 0, x: 20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ duration: 0.5, delay: 0.4 }}
-                className="lg:w-64 flex-shrink-0"
-              >
-                <div className="bg-[#121217] rounded-lg border border-white/10 p-6 mb-6">
-                  <h3 className="text-lg font-semibold mb-4 text-white">{t('helpQuickLinks', 'common')}</h3>
-                  <ul className="space-y-3">
-                    {QUICK_LINKS.map((link) => (
-                      <li key={link.labelKey}>
-                        <a href={link.href} className="flex items-center space-x-2 text-gray-400 hover:text-white transition-colors">
-                          <span>{link.icon}</span>
-                          <span>{t(link.labelKey, 'common')}</span>
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-
-                <div className="bg-[#121217] rounded-lg border border-white/10 p-6">
-                  <h3 className="text-lg font-semibold mb-4 text-white">{t('helpHotQuestions', 'common')}</h3>
-                  <ul className="space-y-3">
-                    {HOT_QUESTIONS.map((key) => (
-                      <li key={key}>
-                        <a href="#" className="text-sm text-gray-400 hover:text-white transition-colors line-clamp-2">
-                          {t(key, 'common')}
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              </motion.div>
+        <article className="min-w-0 rounded-md border border-white/10 bg-[#101015] px-5 py-6 md:px-8 lg:px-10">
+          <div className="mb-7 border-b border-white/10 pb-6">
+            <div className="mb-3 text-xs font-medium text-amber-300">
+              {helpText(selectedArticle.categoryTitle, locale)}
+            </div>
+            <h2 className="text-2xl font-semibold leading-snug text-white md:text-3xl">
+              {helpText(selectedArticle.title, locale)}
+            </h2>
+            <p className="mt-3 max-w-4xl text-sm leading-7 text-white/62">
+              {helpText(selectedArticle.summary, locale)}
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              {selectedArticle.tags.map((tag) => (
+                <span key={tag} className="rounded border border-white/10 bg-white/[0.04] px-2 py-1 text-xs text-white/52">
+                  {tag}
+                </span>
+              ))}
             </div>
           </div>
-        </div>
+
+          <div className="max-w-4xl">
+            <HelpSectionList article={selectedArticle} />
+          </div>
+        </article>
       </div>
-    </div>
+    </main>
   );
 }

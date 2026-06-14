@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS contract_symbols (
   KEY idx_contract_symbols_category (category),
   KEY idx_contract_symbols_provider (provider),
   KEY idx_contract_symbols_status (status),
-  CONSTRAINT ck_contract_symbols_spread_x_range CHECK (spread_x >= 0 AND spread_x <= 50),
+  CONSTRAINT ck_contract_symbols_spread_x_range CHECK (spread_x >= 0 AND spread_x <= 100),
   CONSTRAINT ck_contract_symbols_max_leverage_range CHECK (max_leverage >= 1 AND max_leverage <= 200),
   CONSTRAINT ck_contract_symbols_status CHECK (status IN (0, 1)),
   CONSTRAINT ck_contract_symbols_tp_sl_trigger_price_type CHECK (tp_sl_trigger_price_type IN ('MARK_PRICE', 'LAST_PRICE'))

@@ -414,10 +414,86 @@ def _is_market_closed(status: ItickMarketStatus) -> bool:
     return status.market_status == MARKET_STATUS_CLOSED
 
 
+def _fixed_spread_x(contract_symbol: Optional[ContractSymbol]) -> Decimal:
+    spread_x = _to_decimal(getattr(contract_symbol, "spread_x", None))
+    if spread_x is None or spread_x < 0:
+        return Decimal("0")
+    return spread_x
+
+
+def apply_fixed_spread_x(raw_bid: Decimal, raw_ask: Decimal, spread_x: Decimal) -> tuple[Decimal, Decimal]:
+    spread = spread_x if spread_x > Decimal("0") else Decimal("0")
+    return raw_bid - spread, raw_ask + spread
+
+
+def _apply_fixed_spread_x_to_quote(quote: dict[str, Any], contract_symbol: Optional[ContractSymbol]) -> dict[str, Any]:
+    if quote.get("spread_x_applied"):
+        return quote
+
+    spread_x = _fixed_spread_x(contract_symbol)
+    quote["spread_x"] = spread_x
+    if spread_x <= Decimal("0"):
+        quote["spread_x_applied"] = True
+        return quote
+
+    raw_bid = _require_positive(_to_decimal(quote.get("bid_price")), "bid_price")
+    raw_ask = _require_positive(_to_decimal(quote.get("ask_price")), "ask_price")
+    adjusted_bid, adjusted_ask = apply_fixed_spread_x(raw_bid, raw_ask, spread_x)
+    quote["raw_bid_price"] = quote.get("raw_bid_price", raw_bid)
+    quote["raw_ask_price"] = quote.get("raw_ask_price", raw_ask)
+    quote["bid_price"] = adjusted_bid
+    quote["ask_price"] = adjusted_ask
+    quote["spread_x_applied"] = True
+    return quote
+
+
+def _shift_depth_levels(levels: Any, delta: Decimal) -> list[list[Decimal]]:
+    shifted: list[list[Decimal]] = []
+    if not isinstance(levels, list):
+        return shifted
+    for level in levels:
+        if not isinstance(level, list) or len(level) < 2:
+            continue
+        price = _to_decimal(level[0])
+        quantity = _to_decimal(level[1])
+        if price is None or quantity is None:
+            continue
+        shifted.append([price + delta, quantity])
+    return shifted
+
+
+def _apply_fixed_spread_x_to_depth(depth: dict[str, Any], contract_symbol: Optional[ContractSymbol]) -> dict[str, Any]:
+    if depth.get("spread_x_applied"):
+        return depth
+
+    spread_x = _fixed_spread_x(contract_symbol)
+    depth["spread_x"] = spread_x
+    if spread_x <= Decimal("0"):
+        depth["spread_x_applied"] = True
+        return depth
+
+    raw_bids = _copy_depth_levels(depth.get("bids") or [])
+    raw_asks = _copy_depth_levels(depth.get("asks") or [])
+    depth["raw_bids"] = depth.get("raw_bids", raw_bids)
+    depth["raw_asks"] = depth.get("raw_asks", raw_asks)
+    depth["raw_best_bid"] = depth.get("raw_best_bid", depth.get("best_bid"))
+    depth["raw_best_ask"] = depth.get("raw_best_ask", depth.get("best_ask"))
+    depth["bids"] = _shift_depth_levels(raw_bids, -spread_x)
+    depth["asks"] = _shift_depth_levels(raw_asks, spread_x)
+    depth["best_bid"] = _best_depth_price(depth["bids"], side="bid")
+    depth["best_ask"] = _best_depth_price(depth["asks"], side="ask")
+    depth["spread_x_applied"] = True
+    return depth
+
+
 def _copy_depth_payload(depth: dict[str, Any], *, limit: Optional[int] = None) -> dict[str, Any]:
     copied = dict(depth)
     copied["bids"] = _copy_depth_levels(depth.get("bids") or [], limit)
     copied["asks"] = _copy_depth_levels(depth.get("asks") or [], limit)
+    if "raw_bids" in depth:
+        copied["raw_bids"] = _copy_depth_levels(depth.get("raw_bids") or [], limit)
+    if "raw_asks" in depth:
+        copied["raw_asks"] = _copy_depth_levels(depth.get("raw_asks") or [], limit)
     copied["best_bid"] = _best_depth_price(copied["bids"], side="bid")
     copied["best_ask"] = _best_depth_price(copied["asks"], side="ask")
     return copied
@@ -1910,6 +1986,22 @@ def _get_itick_live_quote(contract_symbol: ContractSymbol, *, log_context: str =
     )
 
 
+def _contract_quote_with_status(
+    quote: dict[str, Any],
+    status: ItickMarketStatus,
+    contract_symbol: Optional[ContractSymbol],
+) -> dict[str, Any]:
+    return _apply_fixed_spread_x_to_quote(_with_market_status(quote, status), contract_symbol)
+
+
+def _contract_depth_with_status(
+    depth: dict[str, Any],
+    status: ItickMarketStatus,
+    contract_symbol: Optional[ContractSymbol],
+) -> dict[str, Any]:
+    return _apply_fixed_spread_x_to_depth(_with_market_status(depth, status), contract_symbol)
+
+
 def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract_quote") -> dict[str, Any]:
     normalized_symbol = _normalize_symbol(symbol)
     try:
@@ -1920,10 +2012,10 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
         market_status = _market_status_for_stock_contract_symbol()
         frozen_quote = _get_closed_quote(normalized_symbol) if _is_market_closed(market_status) else None
         if frozen_quote is not None:
-            return _with_market_status(frozen_quote, market_status)
+            return _contract_quote_with_status(frozen_quote, market_status, None)
         try:
             quote = _freeze_quote_if_closed(_get_stock_contract_quote(normalized_symbol, log_context=log_context), market_status)
-            return _with_market_status(quote, market_status)
+            return _contract_quote_with_status(quote, market_status, None)
         except Exception as exc:
             cached_depth = _get_cached_depth(normalized_symbol, limit=5, source="LAST_VALID")
             if cached_depth is not None:
@@ -1941,7 +2033,7 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
                     ),
                 )
                 quote = _freeze_quote_if_closed(_quote_from_stock_depth(normalized_symbol, cached_depth, source="LAST_VALID"), market_status)
-                return _with_market_status(quote, market_status)
+                return _contract_quote_with_status(quote, market_status, None)
             raise
 
     provider = str(contract_symbol.provider or "").strip().upper()
@@ -1950,7 +2042,7 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
     if frozen_quote is None and _is_market_closed(market_status):
         frozen_quote = _seed_closed_quote_from_last_good(db, contract_symbol)
     if frozen_quote is not None:
-        return _with_market_status(frozen_quote, market_status)
+        return _contract_quote_with_status(frozen_quote, market_status, contract_symbol)
 
     try:
         if provider == "BINANCE":
@@ -1977,7 +2069,7 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
             ts=quote["ts"],
         )
         db.commit()
-        return _with_market_status(quote, market_status)
+        return _contract_quote_with_status(quote, market_status, contract_symbol)
     except Exception as exc:
         db.rollback()
         cached_depth = _get_cached_depth(contract_symbol.symbol, limit=5, source="LAST_VALID")
@@ -2004,7 +2096,7 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
             quote = _quote_from_depth(contract_symbol, cached_depth, source="LAST_VALID")
             quote["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
             quote = _freeze_quote_if_closed(quote, market_status)
-            return _with_market_status(quote, market_status)
+            return _contract_quote_with_status(quote, market_status, contract_symbol)
         fallback = get_last_valid_contract_quote(db, contract_symbol.symbol)
         if fallback is not None:
             _log_contract_market_warning(
@@ -2028,7 +2120,7 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
             )
             fallback["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
             fallback = _freeze_quote_if_closed(fallback, market_status)
-            return _with_market_status(fallback, market_status)
+            return _contract_quote_with_status(fallback, market_status, contract_symbol)
         if provider == "ITICK":
             raise ItickQuoteUnavailable("ITICK_QUOTE_UNAVAILABLE")
         raise
@@ -2408,12 +2500,12 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
         market_status = _market_status_for_stock_contract_symbol()
         frozen_depth = _get_closed_depth(normalized_symbol, limit=safe_limit) if _is_market_closed(market_status) else None
         if frozen_depth is not None:
-            return _with_market_status(frozen_depth, market_status)
+            return _contract_depth_with_status(frozen_depth, market_status, None)
         try:
             depth = _get_stock_contract_depth(normalized_symbol, limit=safe_limit)
             depth = _freeze_depth_if_closed(depth, market_status, limit=safe_limit)
             _cache_depth(depth)
-            return _with_market_status(depth, market_status)
+            return _contract_depth_with_status(depth, market_status, None)
         except Exception as exc:
             if not allow_fallback:
                 raise
@@ -2429,7 +2521,7 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
                 )
                 cached_depth["price_precision"] = 2
                 cached_depth = _freeze_depth_if_closed(cached_depth, market_status, limit=safe_limit)
-                return _with_market_status(cached_depth, market_status)
+                return _contract_depth_with_status(cached_depth, market_status, None)
             raise
 
     provider = str(contract_symbol.provider or "").strip().upper()
@@ -2438,7 +2530,7 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
     if frozen_depth is None and _is_market_closed(market_status):
         frozen_depth = _seed_closed_depth_from_last_good(db, contract_symbol, limit=safe_limit)
     if frozen_depth is not None:
-        return _with_market_status(frozen_depth, market_status)
+        return _contract_depth_with_status(frozen_depth, market_status, contract_symbol)
 
     try:
         if provider == "BINANCE":
@@ -2474,7 +2566,7 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
         )
         _cache_depth(depth)
         db.commit()
-        return _with_market_status(depth, market_status)
+        return _contract_depth_with_status(depth, market_status, contract_symbol)
     except Exception as exc:
         db.rollback()
         if not allow_fallback:
@@ -2495,7 +2587,7 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
             )
             cached_depth["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
             cached_depth = _freeze_depth_if_closed(cached_depth, market_status, limit=safe_limit)
-            return _with_market_status(cached_depth, market_status)
+            return _contract_depth_with_status(cached_depth, market_status, contract_symbol)
         fallback = get_last_valid_contract_quote(db, contract_symbol.symbol)
         if fallback is not None:
             bid = _require_positive(_to_decimal(fallback.get("bid_price")), "bid_price")
@@ -2522,7 +2614,7 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
             )
             depth["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
             depth = _freeze_depth_if_closed(depth, market_status, limit=safe_limit)
-            return _with_market_status(depth, market_status)
+            return _contract_depth_with_status(depth, market_status, contract_symbol)
         if provider == "ITICK":
             raise ItickQuoteUnavailable("ITICK_QUOTE_UNAVAILABLE")
         raise
@@ -2993,8 +3085,11 @@ def contract_quote_to_response(quote: dict[str, Any]) -> dict[str, Any]:
         "market_trading_hours": quote.get("market_trading_hours"),
         "market_session_type": quote.get("market_session_type"),
         "quote_freshness": quote.get("quote_freshness") or _quote_freshness_for_payload(quote),
+        "spread_x": _format_decimal(_to_decimal(quote.get("spread_x")) or Decimal("0")),
         "bid_price": _format_decimal(quote["bid_price"]),
         "ask_price": _format_decimal(quote["ask_price"]),
+        "raw_bid_price": _format_optional_decimal(_to_decimal(quote.get("raw_bid_price"))),
+        "raw_ask_price": _format_optional_decimal(_to_decimal(quote.get("raw_ask_price"))),
         "last_price": _format_decimal(quote["last_price"]),
         "mark_price": _format_decimal(quote["mark_price"]),
         "index_price": _format_optional_decimal(_to_decimal(quote.get("index_price"))),
@@ -3018,10 +3113,15 @@ def contract_depth_to_response(depth: dict[str, Any]) -> dict[str, Any]:
         "market_trading_hours": depth.get("market_trading_hours"),
         "market_session_type": depth.get("market_session_type"),
         "quote_freshness": depth.get("quote_freshness") or _quote_freshness_for_payload(depth),
+        "spread_x": _format_decimal(_to_decimal(depth.get("spread_x")) or Decimal("0")),
         "bids": _format_depth_levels(depth["bids"]),
         "asks": _format_depth_levels(depth["asks"]),
+        "raw_bids": _format_depth_levels(depth["raw_bids"]) if depth.get("raw_bids") is not None else None,
+        "raw_asks": _format_depth_levels(depth["raw_asks"]) if depth.get("raw_asks") is not None else None,
         "best_bid": _format_decimal(depth["best_bid"]) if depth.get("best_bid") is not None else None,
         "best_ask": _format_decimal(depth["best_ask"]) if depth.get("best_ask") is not None else None,
+        "raw_best_bid": _format_optional_decimal(_to_decimal(depth.get("raw_best_bid"))),
+        "raw_best_ask": _format_optional_decimal(_to_decimal(depth.get("raw_best_ask"))),
         "source": depth["source"],
         "ts": depth["ts"],
     }

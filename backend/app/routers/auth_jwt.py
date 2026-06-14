@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.cookie_policy import clear_auth_cookies, set_access_cookie, set_refresh_cookie
 from app.core.redis import get_redis, get_refresh_jti_owner, revoke_refresh_jti, set_refresh_jti
-from app.core.request_utils import get_user_agent
+from app.core.request_utils import get_geo_country_code, get_user_agent
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -324,6 +324,10 @@ def _add_login_log(
     failure_reason: Optional[str] = None,
 ) -> None:
     ua = get_user_agent(request) or ""
+    country_code = get_geo_country_code(
+        request,
+        str(getattr(settings, "GEO_RESTRICTION_HEADER", "CF-IPCountry") or "CF-IPCountry"),
+    )
     db.add(
         UserLoginLog(
             user_id=user_id,
@@ -331,6 +335,7 @@ def _add_login_log(
             ip_address=get_client_ip(request) or "",
             user_agent=ua[:512],
             device_name=_device_name(ua)[:128],
+            country_code=country_code[:8],
             login_status=status,
             failure_reason=failure_reason,
             created_at=_utcnow(),

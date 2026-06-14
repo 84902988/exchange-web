@@ -37,8 +37,11 @@ export type ContractQuote = {
   market_trading_hours?: string | null
   market_session_type?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
+  spread_x?: string | number | null
   bid_price: string
   ask_price: string
+  raw_bid_price?: string | number | null
+  raw_ask_price?: string | number | null
   last_price: string
   mark_price: string
   index_price?: string | number | null
@@ -65,10 +68,15 @@ export type ContractDepth = {
   market_trading_hours?: string | null
   market_session_type?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
+  spread_x?: string | number | null
   bids: ContractDepthLevel[]
   asks: ContractDepthLevel[]
+  raw_bids?: ContractDepthLevel[] | null
+  raw_asks?: ContractDepthLevel[] | null
   best_bid?: string | null
   best_ask?: string | null
+  raw_best_bid?: string | number | null
+  raw_best_ask?: string | number | null
   source: string
   ts: string
 }
@@ -392,15 +400,19 @@ export function getContractTickers(params: {
 }
 
 export async function getContractDepth(symbol: string, limit = 20): Promise<ContractDepth> {
-  const depth = await request<Omit<ContractDepth, 'bids' | 'asks'> & {
+  const depth = await request<Omit<ContractDepth, 'bids' | 'asks' | 'raw_bids' | 'raw_asks'> & {
     bids: string[][]
     asks: string[][]
+    raw_bids?: string[][] | null
+    raw_asks?: string[][] | null
   }>(withQuery('/contract/market/depth', { symbol, limit }))
 
   return {
     ...depth,
     bids: depth.bids.map(([price, amount]) => ({ price, amount })),
     asks: depth.asks.map(([price, amount]) => ({ price, amount })),
+    raw_bids: depth.raw_bids?.map(([price, amount]) => ({ price, amount })) ?? null,
+    raw_asks: depth.raw_asks?.map(([price, amount]) => ({ price, amount })) ?? null,
   }
 }
 

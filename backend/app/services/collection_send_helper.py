@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 from uuid import uuid4
 
 from eth_account import Account
@@ -26,6 +27,7 @@ ERC20_TRANSFER_ABI = [
         "outputs": [{"name": "", "type": "bool"}],
     }
 ]
+DEFAULT_EIP1559_PRIORITY_FEE_GWEI = "1"
 
 
 @dataclass(frozen=True)
@@ -166,9 +168,130 @@ def assert_private_key_matches_address(private_key: str, expected_address: str) 
 
 def _gas_price(w3):
     try:
-        return w3.eth.gas_price
+        value = int(w3.eth.gas_price)
+        if value > 0:
+            return value
     except Exception:
-        return w3.to_wei("3", "gwei")
+        pass
+    return int(w3.to_wei("3", "gwei"))
+
+
+def _rpc_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        return int(text, 16) if text.lower().startswith("0x") else int(text)
+    return int(value)
+
+
+def _latest_base_fee_per_gas(w3) -> int | None:
+    for _attempt in range(3):
+        try:
+            block = w3.eth.get_block("latest")
+            if isinstance(block, dict):
+                value = block.get("baseFeePerGas")
+            else:
+                value = getattr(block, "baseFeePerGas", None)
+            base_fee = _rpc_int(value)
+            if base_fee and base_fee > 0:
+                return base_fee
+        except Exception:
+            continue
+    try:
+        history = w3.eth.fee_history(1, "latest", [])
+        base_fees = history.get("baseFeePerGas") if isinstance(history, dict) else getattr(history, "baseFeePerGas", None)
+        if base_fees:
+            base_fee = _rpc_int(base_fees[-1])
+            if base_fee and base_fee > 0:
+                return base_fee
+    except Exception:
+        return None
+    return None
+
+
+def _max_priority_fee_per_gas(w3) -> int:
+    default_priority_fee = int(w3.to_wei(DEFAULT_EIP1559_PRIORITY_FEE_GWEI, "gwei"))
+    for getter in (
+        lambda: getattr(w3.eth, "max_priority_fee"),
+        lambda: w3.manager.request_blocking("eth_maxPriorityFeePerGas", []),
+    ):
+        try:
+            value = _rpc_int(getter())
+            if value and value > 0:
+                return max(value, default_priority_fee)
+        except Exception:
+            continue
+    return default_priority_fee
+
+
+def _evm_fee_fields(w3) -> tuple[dict[str, int], dict[str, int | str | None]]:
+    base_fee = _latest_base_fee_per_gas(w3)
+    if base_fee is not None:
+        priority_fee = _max_priority_fee_per_gas(w3)
+        max_fee = max((base_fee * 2) + priority_fee, base_fee + priority_fee)
+        return (
+            {
+                "maxPriorityFeePerGas": int(priority_fee),
+                "maxFeePerGas": int(max_fee),
+            },
+            {
+                "type": "eip1559",
+                "baseFeePerGas": int(base_fee),
+                "maxPriorityFeePerGas": int(priority_fee),
+                "maxFeePerGas": int(max_fee),
+                "gasPrice": None,
+            },
+        )
+    gas_price = max(_gas_price(w3) * 2, int(w3.to_wei("3", "gwei")))
+    return (
+        {"gasPrice": int(gas_price)},
+        {
+            "type": "legacy",
+            "baseFeePerGas": None,
+            "maxPriorityFeePerGas": None,
+            "maxFeePerGas": None,
+            "gasPrice": int(gas_price),
+        },
+    )
+
+
+def _estimate_gas_with_buffer(w3, tx: dict[str, Any]) -> int:
+    estimate = int(w3.eth.estimate_gas(dict(tx)))
+    return max(estimate, int(estimate * 12 / 10), 21000)
+
+
+def _erc20_transfer_data(token, checksum_to: str, value_int: int) -> str:
+    transfer = token.functions.transfer(checksum_to, value_int)
+    if hasattr(transfer, "_encode_transaction_data"):
+        return transfer._encode_transaction_data()
+    return transfer.build_transaction({"gas": 1}).get("data")
+
+
+def _build_erc20_transfer_tx(
+    w3,
+    *,
+    checksum_from: str,
+    checksum_to: str,
+    checksum_token: str,
+    token,
+    value_int: int,
+) -> tuple[dict[str, Any], dict[str, int | str | None]]:
+    nonce = w3.eth.get_transaction_count(checksum_from, "pending")
+    fee_fields, fee_debug = _evm_fee_fields(w3)
+    tx: dict[str, Any] = {
+        "from": checksum_from,
+        "to": checksum_token,
+        "value": 0,
+        "nonce": int(nonce),
+        "chainId": int(w3.eth.chain_id),
+        "data": _erc20_transfer_data(token, checksum_to, value_int),
+        **fee_fields,
+    }
+    tx["gas"] = _estimate_gas_with_buffer(w3, tx)
+    return tx, fee_debug
 
 
 def _sign_and_broadcast(w3, private_key: str, tx: dict) -> str:
@@ -297,16 +420,27 @@ def send_native_gas_topup(
     checksum_from = w3.to_checksum_address(matched_address)
     checksum_to = w3.to_checksum_address(to_addr)
     nonce = w3.eth.get_transaction_count(checksum_from, "pending")
+    fee_fields, _fee_debug = _evm_fee_fields(w3)
     tx = {
         "from": checksum_from,
         "to": checksum_to,
         "value": int(w3.to_wei(send_amount, "ether")),
         "nonce": int(nonce),
         "gas": 21000,
-        "gasPrice": _gas_price(w3),
         "chainId": int(w3.eth.chain_id),
+        **fee_fields,
     }
-    tx_hash = _sign_and_broadcast(w3, private_key, tx)
+    try:
+        tx_hash = _sign_and_broadcast(w3, private_key, tx)
+    except Exception as exc:
+        return _dependency_result(
+            error_message=f"EVM_NATIVE_SEND_FAILED:{str(exc)[:500]}",
+            chain_key=ck,
+            from_address=from_addr,
+            to_address=to_addr,
+            amount=send_amount,
+            coin_symbol="NATIVE",
+        )
     return SendResult(
         ok=True,
         dry_run=False,
@@ -328,6 +462,57 @@ def _decimal_to_token_int(amount: Decimal, decimals: int) -> int:
     if raw <= 0:
         raise ValueError("token amount is too small")
     return raw
+
+
+def preview_erc20_collect_transfer_tx(
+    *,
+    chain_key: str,
+    token_contract_address: str,
+    token_decimals: int,
+    from_address: str,
+    to_address: str,
+    amount: Decimal,
+    db=None,
+) -> dict[str, object]:
+    ck = _normalize_chain_key(chain_key)
+    token_contract = _normalize_address(token_contract_address, "token_contract_address")
+    from_addr = _normalize_address(from_address, "from_address")
+    to_addr = _normalize_address(to_address, "to_address")
+    send_amount = _to_decimal(amount)
+
+    w3 = get_web3_for_chain(ck, db=db)
+    checksum_from = w3.to_checksum_address(from_addr)
+    checksum_to = w3.to_checksum_address(to_addr)
+    checksum_token = w3.to_checksum_address(token_contract)
+    token = w3.eth.contract(address=checksum_token, abi=ERC20_TRANSFER_ABI)
+    value_int = _decimal_to_token_int(send_amount, token_decimals)
+    tx, fee_debug = _build_erc20_transfer_tx(
+        w3,
+        checksum_from=checksum_from,
+        checksum_to=checksum_to,
+        checksum_token=checksum_token,
+        token=token,
+        value_int=value_int,
+    )
+    return {
+        "chain_key": ck,
+        "from_address": checksum_from,
+        "to_address": checksum_to,
+        "token_contract_address": checksum_token,
+        "amount": str(send_amount),
+        "token_value_int": value_int,
+        "chain_id": tx.get("chainId"),
+        "nonce": tx.get("nonce"),
+        "gas": tx.get("gas"),
+        "fee_type": fee_debug.get("type"),
+        "baseFeePerGas": fee_debug.get("baseFeePerGas"),
+        "maxPriorityFeePerGas": fee_debug.get("maxPriorityFeePerGas"),
+        "maxFeePerGas": fee_debug.get("maxFeePerGas"),
+        "gasPrice": fee_debug.get("gasPrice"),
+        "raw_tx_created": True,
+        "signed": False,
+        "broadcasted": False,
+    }
 
 
 def send_erc20_collect_transfer(
@@ -433,20 +618,25 @@ def send_erc20_collect_transfer(
     checksum_token = w3.to_checksum_address(token_contract)
     token = w3.eth.contract(address=checksum_token, abi=ERC20_TRANSFER_ABI)
     value_int = _decimal_to_token_int(send_amount, token_decimals)
-    nonce = w3.eth.get_transaction_count(checksum_from, "pending")
-    tx_base = {
-        "from": checksum_from,
-        "nonce": int(nonce),
-        "gasPrice": _gas_price(w3),
-        "chainId": int(w3.eth.chain_id),
-    }
-    tx = token.functions.transfer(checksum_to, value_int).build_transaction(tx_base)
-    if not tx.get("gas"):
-        try:
-            tx["gas"] = int(w3.eth.estimate_gas(tx))
-        except Exception:
-            tx["gas"] = 120000
-    tx_hash = _sign_and_broadcast(w3, private_key, tx)
+    try:
+        tx, _fee_debug = _build_erc20_transfer_tx(
+            w3,
+            checksum_from=checksum_from,
+            checksum_to=checksum_to,
+            checksum_token=checksum_token,
+            token=token,
+            value_int=value_int,
+        )
+        tx_hash = _sign_and_broadcast(w3, private_key, tx)
+    except Exception as exc:
+        return _dependency_result(
+            error_message=f"EVM_ERC20_SEND_FAILED:{str(exc)[:500]}",
+            chain_key=ck,
+            from_address=from_addr,
+            to_address=to_addr,
+            amount=send_amount,
+            coin_symbol=symbol,
+        )
     return SendResult(
         ok=True,
         dry_run=False,

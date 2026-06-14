@@ -68,13 +68,14 @@ export default function Header() {
   useEffect(() => {
     let cancelled = false;
 
-    getSiteConfig()
+    getSiteConfig(currentLanguage)
       .then((config) => {
         if (cancelled) return;
-        setSiteBrand((prev) => ({
-          ...prev,
+        setSiteBrand({
+          logoUrl: config.logo_url || FALLBACK_LOGO_URL,
           siteName: config.site_name || FALLBACK_SITE_NAME,
-        }));
+          siteSlogan: config.site_slogan ?? FALLBACK_SITE_SLOGAN,
+        });
       })
       .catch(() => {
         if (cancelled) return;
@@ -88,7 +89,7 @@ export default function Header() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [currentLanguage]);
 
   useEffect(() => {
     let cancelled = false;

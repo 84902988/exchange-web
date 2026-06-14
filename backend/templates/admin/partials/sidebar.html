@@ -38,14 +38,16 @@
 {% set can_site_settings = is_sa or 'site_settings.manage' in perms %}
 {% set can_banners = is_sa or 'banners.manage' in perms %}
 {% set can_announcements = is_sa or 'announcements.manage' in perms %}
+{% set can_help_content = is_sa or 'site_content.manage' in perms %}
+{% set can_support_tickets = is_sa or 'support_tickets.manage' in perms %}
 {% set can_audit = is_sa or 'audit.view' in perms %}
 
 {% set show_overview = can_dashboard %}
 {% set show_market_analysis = can_market_analysis %}
-{% set show_users = can_users or can_vip or can_bd or can_invite %}
+{% set show_users = can_users or can_vip or can_bd or can_invite or can_support_tickets %}
 {% set show_funds = can_assets or can_balance_logs or can_deposits or can_withdraws or can_withdraw_anomalies or can_withdraw_reviews or can_user_transfers or can_platform_adjust or can_collection_tasks or can_hot_wallets or can_stock_locks or can_asset_configs %}
 {% set show_trade = can_orders or can_trades or can_fee_settings or can_pairs or can_contract_orders or can_contract_trades or can_contract_positions or can_contract_accounts or can_contract_liquidations or can_contract_symbols or can_platform_accounts or can_dealer_risk %}
-{% set show_operations = can_site_settings or can_banners or can_announcements or can_dividend %}
+{% set show_operations = can_site_settings or can_banners or can_announcements or can_help_content or can_dividend %}
 {% set show_system_tasks = is_sa or can_stock_locks or can_bd or can_dividend %}
 {% set show_system_security = is_sa or can_audit %}
 {% set show_system = show_system_tasks or show_system_security %}
@@ -83,7 +85,7 @@
   {% endif %}
 
   {% if show_users %}
-    <details class="group" {% if active_group == 'users' or active in ['users_list', 'kyc_submissions', 'vip_users', 'vip_levels', 'vip_fee_preferences', 'bd_applications', 'bd_commissions', 'bd_team_stats', 'user_invite_relations', 'user_invite_commissions'] %}open{% endif %}>
+    <details class="group" {% if active_group == 'users' or active in ['users_list', 'kyc_submissions', 'support_tickets', 'vip_users', 'vip_levels', 'vip_fee_preferences', 'bd_applications', 'bd_commissions', 'bd_team_stats', 'user_invite_relations', 'user_invite_commissions'] %}open{% endif %}>
       <summary>用户 <span class="chev">▾</span></summary>
       <div class="nav">
         {% if can_users %}
@@ -95,6 +97,17 @@
               </a>
               <a href="/admin/kyc/submissions" class="{% if active == 'kyc_submissions' %}active{% endif %}">
                 <span class="icon">K</span> KYC 审核
+              </a>
+            </div>
+          </details>
+        {% endif %}
+
+        {% if can_support_tickets %}
+          <details class="admin-nav-group" {% if active in ['support_tickets'] %}open{% endif %}>
+            <summary class="admin-nav-group-summary">客服支持 <span class="chev">▾</span></summary>
+            <div class="admin-nav-group-items">
+              <a href="/admin/support-tickets" class="{% if active == 'support_tickets' %}active{% endif %}">
+                <span class="icon">S</span> 支持工单
               </a>
             </div>
           </details>
@@ -354,11 +367,11 @@
   {% endif %}
 
   {% if show_operations %}
-    <details class="group" {% if active_group == 'operations' or active in ['reference_overlays', 'site_settings', 'home_banners', 'activity_banners', 'activities', 'announcements', 'dividend_config', 'dividend_pools', 'dividend_stats'] %}open{% endif %}>
+    <details class="group" {% if active_group == 'operations' or active in ['reference_overlays', 'site_settings', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'dividend_config', 'dividend_pools', 'dividend_stats'] %}open{% endif %}>
       <summary>运营 <span class="chev">▾</span></summary>
       <div class="nav">
-        {% if can_site_settings or can_banners or can_announcements or can_pairs %}
-          <details class="admin-nav-group" {% if active in ['site_settings', 'home_banners', 'activity_banners', 'activities', 'announcements', 'reference_overlays'] %}open{% endif %}>
+        {% if can_site_settings or can_banners or can_announcements or can_help_content or can_pairs %}
+          <details class="admin-nav-group" {% if active in ['site_settings', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'reference_overlays'] %}open{% endif %}>
             <summary class="admin-nav-group-summary">内容运营 <span class="chev">▾</span></summary>
             <div class="admin-nav-group-items">
               {% if can_site_settings %}
@@ -380,6 +393,14 @@
               {% if can_announcements %}
                 <a href="/admin/announcements" class="{% if active == 'announcements' %}active{% endif %}">
                   <span class="icon">N</span> 公告管理
+                </a>
+              {% endif %}
+              {% if can_help_content %}
+                <a href="/admin/help/categories" class="{% if active == 'help_categories' %}active{% endif %}">
+                  <span class="icon">C</span> 帮助分类
+                </a>
+                <a href="/admin/help/articles" class="{% if active == 'help_articles' %}active{% endif %}">
+                  <span class="icon">Q</span> 帮助文章
                 </a>
               {% endif %}
               {% if can_pairs %}

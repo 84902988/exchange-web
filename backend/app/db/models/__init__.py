@@ -21,7 +21,8 @@ from .user_rcb_lock import UserRcbLock
 from .user_fee_preference import UserFeePreference
 from .spot_fee_settings import SpotFeeSettings
 from .system_config import SystemConfig
-from .site_content import Announcement, HomeBanner, SiteSettings
+from .site_content import Announcement, HelpArticle, HelpCategory, HomeBanner, SiteSettings
+from .support_ticket import SupportTicket, SupportTicketMessage
 from .activity import Activity, ActivityBanner
 from .dividend import DividendPool, DividendPoolItem, UserDividendRecord
 from .dividend_job_log import DividendJobLog
@@ -96,8 +97,12 @@ __all__ = [
     "SpotFeeSettings",
     "SystemConfig",
     "Announcement",
+    "HelpArticle",
+    "HelpCategory",
     "HomeBanner",
     "SiteSettings",
+    "SupportTicket",
+    "SupportTicketMessage",
     "Activity",
     "ActivityBanner",
     "DividendPool",

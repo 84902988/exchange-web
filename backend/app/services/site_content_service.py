@@ -728,6 +728,8 @@ def serialize_site_config(
             data[key] = value
     data["id"] = int(row.id)
     _localize_payload_fields(data, row, SITE_SETTINGS_I18N_FIELDS, locale, include_i18n=include_i18n)
+    if include_i18n:
+        data["home_hero_cta_text_i18n"] = _read_i18n_dict(row, "home_hero_cta_text_i18n")
     return data
 
 

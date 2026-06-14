@@ -1,0 +1,253 @@
+{% extends "admin/layout.html" %}
+
+{% if is_edit %}
+  {% set form_title = "编辑帮助文章" %}
+{% else %}
+  {% set form_title = "新增帮助文章" %}
+{% endif %}
+
+{% block title %}{{ form_title }}{% endblock %}
+{% block page_title %}{{ form_title }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">简体中文为默认内容，其他语言未填写时前台自动显示简体中文。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/help/articles" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .help-form{display:grid;gap:18px;margin-top:18px}
+    .help-form-section{display:grid;gap:16px;padding:16px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(255,255,255,.025)}
+    .help-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+    .help-switch-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+    .help-field{display:flex;min-width:0;flex-direction:column;gap:8px}
+    .help-field-full{grid-column:1/-1}
+    .help-form input,.help-form select,.help-form textarea{width:100%;border-radius:10px}
+    .help-form input,.help-form select{height:46px;padding:0 14px}
+    .help-form textarea{min-height:96px;padding:12px 14px;resize:vertical}
+    .help-form textarea.help-content{min-height:360px}
+    .help-check{display:flex;align-items:flex-start;gap:10px;min-height:46px}
+    .help-check input{width:auto;height:auto}
+    .help-check-copy{display:grid;gap:4px}
+    .help-check-title{color:#fff;font-weight:800;line-height:1.35}
+    .help-hint{margin:0;color:var(--muted);font-size:12px;line-height:1.65}
+    .help-hint-examples{display:block;margin-top:4px;white-space:pre-line}
+    .help-form input[readonly]{background:rgba(255,255,255,.035);color:var(--muted);cursor:not-allowed}
+    .help-tabs{display:flex;gap:8px;flex-wrap:wrap}
+    .help-tab-button{min-height:38px;padding:0 12px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:rgba(255,255,255,.04);color:var(--muted);font-weight:800;cursor:pointer}
+    .help-tab-button.is-active{border-color:rgba(250,204,21,.55);background:rgba(250,204,21,.14);color:#fff}
+    .help-tab-panel{display:none;gap:14px}
+    .help-tab-panel.is-active{display:grid}
+    .help-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    @media (max-width:720px){.help-form-grid,.help-switch-grid{grid-template-columns:1fr}.help-field,.help-field-full{grid-column:1/-1}}
+  </style>
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">表单校验失败</div>
+        {% for error in errors %}
+          <p class="muted">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  {% if not category_options %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">需要先创建分类</div>
+        <p class="muted">请先新增帮助分类，再发布帮助文章。</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">{{ form_title }}</div>
+      <form method="post" action="{{ form_action }}" class="help-form" data-help-tab-form>
+        <section class="help-form-section">
+          <div class="section-title">基础信息</div>
+          <div class="help-form-grid">
+            <div class="field help-field">
+              <label for="category_id">所属分类</label>
+              <select id="category_id" name="category_id" required>
+                <option value="0">请选择分类</option>
+                {% for category in category_options %}
+                  <option value="{{ category.id }}" {% if form.category_id == category.id %}selected{% endif %}>
+                    {{ category.title }}{% if not category.enabled %}（已禁用）{% endif %}
+                  </option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field help-field">
+              <label for="slug">文章标识（slug）</label>
+              <input id="slug" name="slug" type="text" value="{{ form.slug or '' }}" placeholder="how-to-deposit" required readonly />
+              <p class="help-hint">系统内部标识，不建议修改。新增文章时会根据简体中文标题自动生成。</p>
+            </div>
+            <div class="field help-field">
+              <label for="tags">标签</label>
+              <input id="tags" name="tags" type="text" value="{{ form.tags or '' }}" placeholder="充值, 账户, KYC" />
+              <p class="help-hint">
+                可选，用于帮助搜索和相关文章推荐。多个标签使用英文逗号分隔。
+                <span class="help-hint-examples">例如：
+KYC, 身份认证, 合规
+充值, USDT, 链上
+提现, 风控, 审核</span>
+              </p>
+            </div>
+            <div class="field help-field">
+              <label for="sort_order">排序</label>
+              <input id="sort_order" name="sort_order" type="number" value="{{ form.sort_order or 0 }}" />
+              <p class="help-hint">数字越小越靠前显示。</p>
+            </div>
+          </div>
+          <input type="hidden" name="source_type" value="{{ form.source_type or 'cms' }}" />
+          <div class="help-switch-grid">
+            <label class="help-check">
+              <input name="enabled" type="checkbox" value="1" {% if form.enabled %}checked{% endif %} />
+              <span class="help-check-copy">
+                <span class="help-check-title">在帮助中心显示</span>
+                <span class="help-hint">关闭后文章不会在前台帮助中心出现。</span>
+              </span>
+            </label>
+            <label class="help-check">
+              <input name="is_hot" type="checkbox" value="1" {% if form.is_hot %}checked{% endif %} />
+              <span class="help-check-copy">
+                <span class="help-check-title">设为热门问题</span>
+                <span class="help-hint">将出现在帮助中心首页热门问题区域。</span>
+              </span>
+            </label>
+          </div>
+        </section>
+
+        <section class="help-form-section">
+          <div class="section-title">内容编辑</div>
+          <p class="muted">简体中文 Tab 会写入主字段 title / summary / content，同时写入 title_i18n.zh / summary_i18n.zh / content_i18n.zh。正文换行渲染为段落，以 -、* 或数字开头的行会渲染为列表。</p>
+          <div class="help-tabs" role="tablist" aria-label="文章多语言内容">
+            {% for suffix, label in [('zh','简体中文'),('zh_TW','繁体中文'),('en','English'),('ja','日本語')] %}
+              <button type="button" class="help-tab-button {% if suffix == 'zh' %}is-active{% endif %}" data-help-tab="{{ suffix }}" role="tab" aria-selected="{{ 'true' if suffix == 'zh' else 'false' }}">{{ label }}</button>
+            {% endfor %}
+          </div>
+
+          {% for suffix, label in [('zh','简体中文'),('zh_TW','繁体中文'),('en','English'),('ja','日本語')] %}
+            <div class="help-tab-panel {% if suffix == 'zh' %}is-active{% endif %}" data-help-panel="{{ suffix }}" role="tabpanel">
+              <div class="field">
+                <label for="title_i18n_{{ suffix }}">标题 - {{ label }}</label>
+                <input id="title_i18n_{{ suffix }}" name="title_i18n_{{ suffix }}" type="text" value="{{ form['title_i18n_' ~ suffix] or '' }}" {% if suffix == 'zh' %}required{% endif %} />
+              </div>
+              <div class="field">
+                <label for="summary_i18n_{{ suffix }}">摘要 - {{ label }}</label>
+                <textarea id="summary_i18n_{{ suffix }}" name="summary_i18n_{{ suffix }}">{{ form['summary_i18n_' ~ suffix] or '' }}</textarea>
+              </div>
+              <div class="field">
+                <label for="content_i18n_{{ suffix }}">正文 - {{ label }}</label>
+                <textarea id="content_i18n_{{ suffix }}" name="content_i18n_{{ suffix }}" class="help-content">{{ form['content_i18n_' ~ suffix] or '' }}</textarea>
+              </div>
+            </div>
+          {% endfor %}
+        </section>
+
+        <div class="help-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary" {% if not category_options %}disabled{% endif %}>保存</button>
+          <a href="/admin/help/articles" class="btn secondary admin-btn admin-btn-secondary">取消</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <script>
+    document.querySelectorAll("[data-help-tab-form]").forEach((form) => {
+      const tabs = Array.from(form.querySelectorAll("[data-help-tab]"));
+      const panels = Array.from(form.querySelectorAll("[data-help-panel]"));
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => {
+          const target = tab.getAttribute("data-help-tab");
+          tabs.forEach((item) => {
+            const active = item === tab;
+            item.classList.toggle("is-active", active);
+            item.setAttribute("aria-selected", active ? "true" : "false");
+          });
+          panels.forEach((panel) => {
+            panel.classList.toggle("is-active", panel.getAttribute("data-help-panel") === target);
+          });
+        });
+      });
+
+      const shouldAutoSlug = "{{ 'false' if is_edit else 'true' }}" === "true";
+      const titleInput = form.querySelector("#title_i18n_zh");
+      const slugInput = form.querySelector("#slug");
+      let slugTouched = false;
+
+      const phraseMap = [
+        ["什么是KYC认证", "what-is-kyc"],
+        ["什么是KYC", "what-is-kyc"],
+        ["如何充值加密货币", "how-to-deposit"],
+        ["如何充值", "how-to-deposit"],
+        ["如何提现加密货币", "how-to-withdraw"],
+        ["如何提现", "how-to-withdraw"],
+        ["如何注册账户", "how-to-register"],
+        ["如何登录账户", "how-to-login"],
+        ["如何重置密码", "how-to-reset-password"],
+        ["如何进行现货交易", "how-to-spot-trade"],
+        ["如何进行合约交易", "how-to-contract-trade"],
+        ["限价单和市价单说明", "order-types"],
+        ["限价单与市价单", "order-types"],
+        ["风险提示", "risk-warning"],
+      ];
+
+      const wordMap = [
+        ["什么是", "what-is"],
+        ["如何", "how-to"],
+        ["账户", "account"],
+        ["注册", "register"],
+        ["登录", "login"],
+        ["重置", "reset"],
+        ["密码", "password"],
+        ["充值", "deposit"],
+        ["提现", "withdraw"],
+        ["身份认证", "kyc"],
+        ["认证", "kyc"],
+        ["加密货币", "crypto"],
+        ["现货", "spot"],
+        ["合约", "contract"],
+        ["交易", "trade"],
+        ["限价单", "limit-order"],
+        ["市价单", "market-order"],
+        ["手续费", "fees"],
+        ["风险", "risk"],
+        ["安全", "security"],
+      ];
+
+      const buildSlug = (value) => {
+        const compact = String(value || "").replace(/\s+/g, "");
+        const phrase = phraseMap.find(([source]) => compact.includes(source));
+        if (phrase) return phrase[1];
+
+        let next = String(value || "").trim();
+        wordMap.forEach(([source, target]) => {
+          next = next.replaceAll(source, ` ${target} `);
+        });
+        return next
+          .normalize("NFKD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/-+/g, "-")
+          .replace(/^-|-$/g, "");
+      };
+
+      if (shouldAutoSlug && titleInput && slugInput && !slugInput.value.trim()) {
+        slugInput.addEventListener("input", () => {
+          slugTouched = true;
+        });
+        titleInput.addEventListener("input", () => {
+          if (slugTouched) return;
+          slugInput.value = buildSlug(titleInput.value);
+        });
+      }
+    });
+  </script>
+{% endblock %}

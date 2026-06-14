@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-from sqlalchemy import and_, event, or_
+from sqlalchemy import and_, event, or_, text
 from sqlalchemy.orm import Session
 
 from app.db.models.collection import (
@@ -20,6 +22,8 @@ from app.db.models.collection import (
 )
 from app.services.collection_center_events import publish_collection_center_event
 
+
+logger = logging.getLogger(__name__)
 
 COLLECTION_TASK_EVENT_QUEUE_KEY = "collection_task_status_events"
 
@@ -65,6 +69,10 @@ def _queue_collection_task_changed(db: Session, task: CollectionTask) -> None:
     )
 
 
+def queue_collection_task_changed(db: Session, task: CollectionTask) -> None:
+    _queue_collection_task_changed(db, task)
+
+
 def _queue_gas_task_changed(db: Session, task: GasTask) -> None:
     batch_id = None
     if task.collection_task_id:
@@ -89,6 +97,284 @@ def _queue_gas_task_changed(db: Session, task: GasTask) -> None:
             "updated_at": task.updated_at,
         },
     )
+
+
+def _collection_candidate_amount_label(value: Any, symbol: str) -> str:
+    try:
+        amount = Decimal(str(value or "0"))
+    except Exception:
+        amount = Decimal("0")
+    text_value = format(amount.normalize(), "f")
+    if text_value == "-0":
+        text_value = "0"
+    return f"{text_value} {str(symbol or '').upper()}".strip()
+
+
+def _queue_candidate_balance_synced(
+    db: Session,
+    *,
+    candidate_id: int,
+    chain_key: str,
+    coin_symbol: str,
+    address: str,
+    user_id: Any,
+    balance: Decimal,
+    checked_at: datetime,
+) -> None:
+    balance_label = _collection_candidate_amount_label(balance, coin_symbol)
+    scan_at_label = checked_at.strftime("%Y-%m-%d %H:%M:%S")
+    has_balance = balance > 0
+    _queue_collection_status_event(
+        db,
+        "candidate_verify_completed",
+        {
+            "candidate_id": int(candidate_id),
+            "chain_key": str(chain_key or "").lower(),
+            "asset_symbol": str(coin_symbol or "").upper(),
+            "coin_symbol": str(coin_symbol or "").upper(),
+            "address": str(address or "").lower(),
+            "user_id": user_id,
+            "status": "completed",
+            "balance_amount": str(balance),
+            "last_balance_amount": str(balance),
+            "balance_label": balance_label,
+            "last_balance_amount_display": balance_label,
+            "verified_at": checked_at.isoformat(timespec="seconds"),
+            "last_scan_at": checked_at.isoformat(timespec="seconds"),
+            "last_scan_at_display": scan_at_label,
+            "status_label": "可归集" if has_balance else "无可归集余额",
+            "collection_status_label": "可归集" if has_balance else "无可归集余额",
+            "collection_status_badge": "success" if has_balance else "neutral",
+            "can_create_collection_task": has_balance,
+            "verify_status_text": "已复核",
+            "verify_button_label": "复核",
+            "message": "归集确认后已同步链上余额",
+        },
+    )
+
+
+def _queue_candidate_balance_sync_failed(
+    db: Session,
+    *,
+    candidate_id: int,
+    chain_key: str,
+    coin_symbol: str,
+    address: str,
+    user_id: Any,
+    error: str,
+) -> None:
+    _queue_collection_status_event(
+        db,
+        "candidate_verify_failed",
+        {
+            "candidate_id": int(candidate_id),
+            "chain_key": str(chain_key or "").lower(),
+            "asset_symbol": str(coin_symbol or "").upper(),
+            "coin_symbol": str(coin_symbol or "").upper(),
+            "address": str(address or "").lower(),
+            "user_id": user_id,
+            "status": "failed",
+            "error": (error or "余额同步失败")[:200],
+            "message": "归集确认后余额同步失败，请手动复核",
+        },
+    )
+
+
+def sync_collection_candidate_balance_for_task(db: Session, task_id: int) -> Dict[str, Any]:
+    task = _get_collection_task(db, task_id)
+    chain_key = str(task.chain_key or "").strip().lower()
+    coin_symbol = str(task.coin_symbol or "").strip().upper()
+    from_address = str(task.from_address or "").strip().lower()
+    if not chain_key or not coin_symbol or not from_address:
+        return {"ok": False, "task_id": int(task.id), "reason": "TASK_FIELDS_INCOMPLETE"}
+
+    row = db.execute(
+        text(
+            """
+            SELECT cc.id AS candidate_id,
+                   cc.user_id,
+                   cc.chain_key,
+                   cc.asset_symbol,
+                   cc.address,
+                   cc.token_contract,
+                   cc.status AS candidate_status,
+                   cc.last_balance_amount,
+                   ac.contract_address,
+                   ac.decimals
+            FROM collection_candidates cc
+            LEFT JOIN asset_chains ac ON ac.id = cc.asset_chain_id
+            WHERE LOWER(cc.chain_key) = :chain_key
+              AND UPPER(cc.asset_symbol) = :coin_symbol
+              AND LOWER(cc.address) = :from_address
+              AND (:asset_chain_id IS NULL OR cc.asset_chain_id = :asset_chain_id)
+            ORDER BY cc.id ASC
+            LIMIT 1
+            """
+        ),
+        {
+            "chain_key": chain_key,
+            "coin_symbol": coin_symbol,
+            "from_address": from_address,
+            "asset_chain_id": int(task.asset_chain_id) if task.asset_chain_id is not None else None,
+        },
+    ).mappings().first()
+    if not row:
+        return {"ok": False, "task_id": int(task.id), "reason": "CANDIDATE_NOT_FOUND"}
+
+    candidate_id = int(row.get("candidate_id") or 0)
+    task_amount = _to_decimal(task.amount or 0)
+    last_balance_value = row.get("last_balance_amount")
+    checked_at = _now()
+    try:
+        if last_balance_value is not None:
+            last_balance = _to_decimal(last_balance_value)
+            if task_amount >= 0 and last_balance >= task_amount:
+                balance = max(last_balance - task_amount, Decimal("0"))
+                db.execute(
+                    text(
+                        """
+                        UPDATE collection_candidates
+                        SET last_balance_amount = :balance,
+                            last_scan_at = :checked_at,
+                            status = CASE WHEN status = 'DISABLED' THEN 'DISABLED' ELSE 'ACTIVE' END,
+                            updated_at = :checked_at
+                        WHERE id = :candidate_id
+                        """
+                    ),
+                    {"candidate_id": candidate_id, "balance": balance, "checked_at": checked_at},
+                )
+                _queue_candidate_balance_synced(
+                    db,
+                    candidate_id=candidate_id,
+                    chain_key=chain_key,
+                    coin_symbol=coin_symbol,
+                    address=from_address,
+                    user_id=row.get("user_id"),
+                    balance=balance,
+                    checked_at=checked_at,
+                )
+                return {
+                    "ok": True,
+                    "task_id": int(task.id),
+                    "candidate_id": candidate_id,
+                    "chain_key": chain_key,
+                    "coin_symbol": coin_symbol,
+                    "address": from_address,
+                    "balance": str(balance),
+                    "method": "deduct_cached_balance",
+                }
+    except Exception as exc:
+        logger.warning(
+            "collection candidate cached balance deduction failed task_id=%s candidate_id=%s balance=%s amount=%s error=%s",
+            task_id,
+            candidate_id,
+            last_balance_value,
+            task_amount,
+            exc,
+        )
+
+    token_contract = str(row.get("contract_address") or row.get("token_contract") or "").strip()
+    decimals = row.get("decimals")
+    if not token_contract:
+        db.execute(
+            text(
+                """
+                UPDATE collection_candidates
+                SET status = CASE WHEN status = 'DISABLED' THEN 'DISABLED' ELSE 'PENDING_VERIFY' END,
+                    updated_at = :updated_at
+                WHERE id = :candidate_id
+                """
+            ),
+            {"candidate_id": candidate_id, "updated_at": _now()},
+        )
+        _queue_candidate_balance_sync_failed(
+            db,
+            candidate_id=candidate_id,
+            chain_key=chain_key,
+            coin_symbol=coin_symbol,
+            address=from_address,
+            user_id=row.get("user_id"),
+            error="TOKEN_CONTRACT_MISSING",
+        )
+        return {"ok": False, "task_id": int(task.id), "candidate_id": candidate_id, "reason": "TOKEN_CONTRACT_MISSING"}
+
+    try:
+        from app.services.collection_balance_checker import get_erc20_balance
+
+        balance = get_erc20_balance(
+            chain_key=chain_key,
+            token_contract_address=token_contract,
+            address=from_address,
+            decimals=int(decimals) if decimals is not None else None,
+            db=db,
+        )
+    except Exception as exc:
+        error = str(exc)[:500]
+        db.execute(
+            text(
+                """
+                UPDATE collection_candidates
+                SET status = CASE WHEN status = 'DISABLED' THEN 'DISABLED' ELSE 'PENDING_VERIFY' END,
+                    updated_at = :updated_at
+                WHERE id = :candidate_id
+                """
+            ),
+            {"candidate_id": candidate_id, "updated_at": _now()},
+        )
+        _queue_candidate_balance_sync_failed(
+            db,
+            candidate_id=candidate_id,
+            chain_key=chain_key,
+            coin_symbol=coin_symbol,
+            address=from_address,
+            user_id=row.get("user_id"),
+            error=error,
+        )
+        logger.warning(
+            "collection candidate balance sync failed task_id=%s candidate_id=%s chain=%s coin=%s address=%s error=%s",
+            task_id,
+            candidate_id,
+            chain_key,
+            coin_symbol,
+            from_address,
+            error,
+        )
+        return {"ok": False, "task_id": int(task.id), "candidate_id": candidate_id, "reason": "BALANCE_READ_FAILED", "error": error}
+
+    checked_at = _now()
+    db.execute(
+        text(
+            """
+            UPDATE collection_candidates
+            SET last_balance_amount = :balance,
+                last_scan_at = :checked_at,
+                status = CASE WHEN status = 'DISABLED' THEN 'DISABLED' ELSE 'ACTIVE' END,
+                updated_at = :checked_at
+            WHERE id = :candidate_id
+            """
+        ),
+        {"candidate_id": candidate_id, "balance": balance, "checked_at": checked_at},
+    )
+    _queue_candidate_balance_synced(
+        db,
+        candidate_id=candidate_id,
+        chain_key=chain_key,
+        coin_symbol=coin_symbol,
+        address=from_address,
+        user_id=row.get("user_id"),
+        balance=balance,
+        checked_at=checked_at,
+    )
+    return {
+        "ok": True,
+        "task_id": int(task.id),
+        "candidate_id": candidate_id,
+        "chain_key": chain_key,
+        "coin_symbol": coin_symbol,
+        "address": from_address,
+        "balance": str(balance),
+        "method": "onchain_verify",
+    }
 
 
 def _new_no(prefix: str) -> str:
@@ -138,6 +424,14 @@ ACTIVE_COLLECTION_STATUSES = {
     CollectionTaskStatus.READY.value,
     CollectionTaskStatus.SENDING.value,
     CollectionTaskStatus.SENT.value,
+    "READY_TO_COLLECT",
+    "WAITING_COLLECTION",
+    "WAIT_COLLECTION",
+    "PROCESSING",
+    "RUNNING",
+    "CONFIRMING",
+    "COLLECTION_SENT",
+    "COLLECTION_CONFIRMING",
 }
 
 ACTIVE_GAS_STATUSES = {
@@ -177,7 +471,29 @@ COLLECTION_TASK_SENT_STATUSES = {
     CollectionTaskStatus.SENT.value,
     "GAS_SENT",
     "CONFIRMING",
+    "COLLECTION_SENT",
+    "COLLECTION_CONFIRMING",
 }
+
+COLLECTION_TASK_CONFIRMABLE_STATUSES = {
+    CollectionTaskStatus.SENT.value,
+    CollectionTaskStatus.SENDING.value,
+    CollectionTaskStatus.QUEUED.value,
+    CollectionTaskStatus.GAS_REQUIRED.value,
+    "CONFIRMING",
+    "COLLECTION_SENT",
+    "COLLECTION_CONFIRMING",
+    "PROCESSING",
+}
+
+
+@dataclass(frozen=True)
+class CollectionTaskCreateResult:
+    task: CollectionTask
+    created_new: bool
+    existing: bool = False
+    duplicate: bool = False
+    skipped: bool = False
 
 
 def _retryable_failed_clause(model):
@@ -236,6 +552,7 @@ def find_active_gas_task_duplicate(
 
 def _collection_task_idempotency_key(
     *,
+    batch_id: Optional[int] = None,
     user_id: int,
     chain_key: str,
     coin_symbol: str,
@@ -243,11 +560,94 @@ def _collection_task_idempotency_key(
     to_address: str,
     amount: Decimal,
 ) -> str:
+    amount_label = _idempotency_amount_labels(amount)[0]
+    batch_scope = f":batch:{int(batch_id)}" if batch_id is not None else ""
     raw = (
         f"collect:{int(user_id)}:{chain_key}:{coin_symbol}:"
-        f"{from_address}:{to_address}:{format(amount, 'f')}"
+        f"{from_address}:{to_address}:{amount_label}{batch_scope}"
     )
     return f"collect:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+
+
+def _idempotency_amount_labels(amount: Decimal) -> list[str]:
+    amount_value = Decimal(str(amount))
+    canonical = format(amount_value.normalize(), "f")
+    if canonical == "-0":
+        canonical = "0"
+    raw = format(amount_value, "f")
+    labels: list[str] = []
+    for label in (canonical, raw):
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _collection_task_idempotency_key_candidates(
+    *,
+    batch_id: Optional[int] = None,
+    user_id: int,
+    chain_key: str,
+    coin_symbol: str,
+    from_address: str,
+    to_address: str,
+    amount: Decimal,
+) -> list[str]:
+    keys: list[str] = []
+    for amount_label in _idempotency_amount_labels(amount):
+        scopes = [f":batch:{int(batch_id)}"] if batch_id is not None else []
+        scopes.append("")
+        for scope in scopes:
+            raw = (
+                f"collect:{int(user_id)}:{chain_key}:{coin_symbol}:"
+                f"{from_address}:{to_address}:{amount_label}{scope}"
+            )
+            key = f"collect:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+            if key not in keys:
+                keys.append(key)
+    return keys
+
+
+def find_collection_task_by_idempotency(
+    db: Session,
+    *,
+    batch_id: Optional[int] = None,
+    include_terminal: bool = False,
+    user_id: int,
+    chain_key: str,
+    coin_symbol: str,
+    from_address: str,
+    to_address: str,
+    amount: Decimal,
+) -> Optional[CollectionTask]:
+    ck = _normalize_chain_key(chain_key)
+    symbol = _normalize_symbol(coin_symbol)
+    from_addr = _normalize_address(from_address, "from_address")
+    to_addr = _normalize_address(to_address, "to_address")
+    task_amount = _to_decimal(amount)
+    idempotency_keys = _collection_task_idempotency_key_candidates(
+        batch_id=batch_id,
+        user_id=user_id,
+        chain_key=ck,
+        coin_symbol=symbol,
+        from_address=from_addr,
+        to_address=to_addr,
+        amount=task_amount,
+    )
+    blocking_clause = or_(
+        CollectionTask.status.in_(ACTIVE_COLLECTION_STATUSES),
+        _retryable_failed_clause(CollectionTask),
+    )
+    if batch_id is not None:
+        blocking_clause = or_(CollectionTask.batch_id == int(batch_id), blocking_clause)
+    elif include_terminal:
+        blocking_clause = True
+    return (
+        db.query(CollectionTask)
+        .filter(CollectionTask.idempotency_key.in_(idempotency_keys))
+        .filter(blocking_clause)
+        .order_by(CollectionTask.id.desc())
+        .first()
+    )
 
 
 def _gas_task_idempotency_key(
@@ -389,8 +789,9 @@ def refresh_collection_batch_aggregate(db: Session, batch_id: Optional[int]) -> 
     batch.total_amount = total_amount
     batch.success_amount = success_amount
     if total_tasks <= 0:
-        batch.status = CollectionBatchStatus.PENDING.value
-        batch.finished_at = None
+        batch.status = CollectionBatchStatus.CANCELED.value
+        batch.error_message = batch.error_message or "EMPTY_BATCH_NO_TASKS"
+        batch.finished_at = batch.finished_at or now
     elif success_tasks == total_tasks:
         batch.status = "COMPLETED"
         batch.finished_at = batch.finished_at or now
@@ -490,7 +891,7 @@ def create_collection_batch(
     return batch
 
 
-def create_collection_task(
+def create_collection_task_with_result(
     db: Session,
     *,
     batch_id: Optional[int],
@@ -502,13 +903,14 @@ def create_collection_task(
     to_address: str,
     amount: Decimal,
     reason: Optional[str] = None,
-) -> CollectionTask:
+) -> CollectionTaskCreateResult:
     ck = _normalize_chain_key(chain_key)
     symbol = _normalize_symbol(coin_symbol)
     from_addr = _normalize_address(from_address, "from_address")
     to_addr = _normalize_address(to_address, "to_address")
     task_amount = _to_decimal(amount)
     idempotency_key = _collection_task_idempotency_key(
+        batch_id=batch_id,
         user_id=user_id,
         chain_key=ck,
         coin_symbol=symbol,
@@ -517,9 +919,19 @@ def create_collection_task(
         amount=task_amount,
     )
 
-    existing = db.query(CollectionTask).filter(CollectionTask.idempotency_key == idempotency_key).first()
+    existing = find_collection_task_by_idempotency(
+        db,
+        batch_id=batch_id,
+        include_terminal=batch_id is None,
+        user_id=user_id,
+        chain_key=ck,
+        coin_symbol=symbol,
+        from_address=from_addr,
+        to_address=to_addr,
+        amount=task_amount,
+    )
     if existing:
-        return existing
+        return CollectionTaskCreateResult(task=existing, created_new=False, existing=True)
 
     active_duplicate = find_active_collection_task_duplicate(
         db,
@@ -529,7 +941,7 @@ def create_collection_task(
         from_address=from_addr,
     )
     if active_duplicate:
-        return active_duplicate
+        return CollectionTaskCreateResult(task=active_duplicate, created_new=False, duplicate=True)
 
     task = CollectionTask(
         task_no=_new_no("CT"),
@@ -551,7 +963,34 @@ def create_collection_task(
     db.flush()
     _update_batch_for_task_created(db, task)
     db.flush()
-    return task
+    return CollectionTaskCreateResult(task=task, created_new=True)
+
+
+def create_collection_task(
+    db: Session,
+    *,
+    batch_id: Optional[int],
+    user_id: int,
+    chain_key: str,
+    coin_symbol: str,
+    asset_chain_id: Optional[int],
+    from_address: str,
+    to_address: str,
+    amount: Decimal,
+    reason: Optional[str] = None,
+) -> CollectionTask:
+    return create_collection_task_with_result(
+        db,
+        batch_id=batch_id,
+        user_id=user_id,
+        chain_key=chain_key,
+        coin_symbol=coin_symbol,
+        asset_chain_id=asset_chain_id,
+        from_address=from_address,
+        to_address=to_address,
+        amount=amount,
+        reason=reason,
+    ).task
 
 
 def create_gas_task(
@@ -592,7 +1031,10 @@ def create_gas_task(
         chain_key=ck,
         to_address=to_addr,
     )
-    if active_duplicate:
+    if active_duplicate and (
+        collection_task_id is None
+        or int(active_duplicate.collection_task_id or 0) == int(collection_task_id)
+    ):
         return active_duplicate
 
     task = GasTask(
@@ -656,7 +1098,29 @@ def mark_collection_task_sent(db: Session, task_id: int, tx_hash: str) -> Collec
         raise ValueError(f"cannot mark collection task sent from status {task.status}")
     task.status = CollectionTaskStatus.SENT.value
     task.tx_hash = tx
+    if _is_real_collection_tx_hash(tx):
+        task.last_error = None
     task.sent_at = task.sent_at or _now()
+    task.updated_at = _now()
+    refresh_collection_batch_aggregate(db, task.batch_id)
+    db.flush()
+    _queue_collection_task_changed(db, task)
+    return task
+
+
+def mark_collection_task_confirming(db: Session, task_id: int) -> CollectionTask:
+    task = _get_collection_task(db, task_id)
+    if task.status not in {
+        CollectionTaskStatus.SENT.value,
+        CollectionTaskStatus.QUEUED.value,
+        CollectionTaskStatus.GAS_REQUIRED.value,
+        "CONFIRMING",
+        "COLLECTION_SENT",
+        "COLLECTION_CONFIRMING",
+        "PROCESSING",
+    }:
+        raise ValueError(f"cannot mark collection task confirming from status {task.status}")
+    task.status = "CONFIRMING"
     task.updated_at = _now()
     refresh_collection_batch_aggregate(db, task.batch_id)
     db.flush()
@@ -670,13 +1134,17 @@ def mark_collection_task_confirmed(
     block_number: Optional[int] = None,
 ) -> CollectionTask:
     task = _get_collection_task(db, task_id)
-    if task.status not in {CollectionTaskStatus.SENT.value, CollectionTaskStatus.SENDING.value}:
+    if task.status not in COLLECTION_TASK_CONFIRMABLE_STATUSES:
         raise ValueError(f"cannot confirm collection task from status {task.status}")
     task.status = CollectionTaskStatus.CONFIRMED.value
     task.block_number = block_number
     task.confirmed_at = task.confirmed_at or _now()
+    task.last_error = None
+    task.next_retry_at = None
+    task.locked_at = None
     task.updated_at = _now()
     _update_batch_for_task_confirmed(db, task)
+    sync_collection_candidate_balance_for_task(db, int(task.id))
     db.flush()
     _queue_collection_task_changed(db, task)
     return task
@@ -804,7 +1272,20 @@ def mark_gas_task_sent(db: Session, task_id: int, tx_hash: str) -> GasTask:
         raise ValueError(f"cannot mark gas task sent from status {task.status}")
     task.status = GasTaskStatus.SENT.value
     task.tx_hash = tx
+    task.last_error = None
+    task.next_retry_at = None
     task.sent_at = task.sent_at or _now()
+    task.updated_at = _now()
+    db.flush()
+    _queue_gas_task_changed(db, task)
+    return task
+
+
+def mark_gas_task_confirming(db: Session, task_id: int) -> GasTask:
+    task = _get_gas_task(db, task_id)
+    if task.status not in {GasTaskStatus.SENT.value, GasTaskStatus.CONFIRMING.value}:
+        raise ValueError(f"cannot mark gas task confirming from status {task.status}")
+    task.status = GasTaskStatus.CONFIRMING.value
     task.updated_at = _now()
     db.flush()
     _queue_gas_task_changed(db, task)
@@ -813,10 +1294,13 @@ def mark_gas_task_sent(db: Session, task_id: int, tx_hash: str) -> GasTask:
 
 def mark_gas_task_confirmed(db: Session, task_id: int, block_number: Optional[int] = None) -> GasTask:
     task = _get_gas_task(db, task_id)
-    if task.status not in {GasTaskStatus.SENT.value, GasTaskStatus.SENDING.value}:
+    if task.status not in {GasTaskStatus.SENT.value, GasTaskStatus.SENDING.value, GasTaskStatus.CONFIRMING.value}:
         raise ValueError(f"cannot confirm gas task from status {task.status}")
     task.status = GasTaskStatus.CONFIRMED.value
     task.block_number = block_number
+    task.last_error = None
+    task.next_retry_at = None
+    task.locked_at = None
     task.confirmed_at = task.confirmed_at or _now()
     task.updated_at = _now()
     db.flush()

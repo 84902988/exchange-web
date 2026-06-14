@@ -52,6 +52,7 @@ export interface UserLoginLog {
   ip_address: string;
   user_agent: string;
   device_name: string;
+  country_code?: string;
   login_status: LoginStatus;
   failure_reason: string | null;
   created_at: string | null;

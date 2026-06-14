@@ -1,0 +1,94 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}支持工单详情{% endblock %}
+{% block page_title %}支持工单详情{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">工单号：{{ ticket.ticket_no }} · 用户ID：{{ ticket.user_id }}</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/support-tickets" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .ticket-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
+    .ticket-message-list{display:flex;flex-direction:column;gap:12px}
+    .ticket-message{border:1px solid var(--border);border-radius:10px;padding:14px;background:rgba(255,255,255,.035)}
+    .ticket-message.admin{border-color:rgba(189,52,25,.35);background:rgba(189,52,25,.08)}
+    .ticket-message-head{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px;margin-bottom:8px}
+    .ticket-message-body{white-space:pre-wrap;line-height:1.7}
+    .ticket-info-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.08)}
+    .ticket-info-row:last-child{border-bottom:0}
+    .ticket-form-stack{display:flex;flex-direction:column;gap:12px}
+    .ticket-form-stack textarea{min-height:160px}
+    @media (max-width: 1100px){.ticket-detail-grid{grid-template-columns:1fr}}
+  </style>
+
+  {% if notice %}
+    <section class="page-section"><div class="card"><div class="section-title">操作结果</div><p class="muted">{{ notice }}</p></div></section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section"><div class="card"><div class="section-title">提示信息</div><p class="muted">{{ error }}</p></div></section>
+  {% endif %}
+
+  <div class="ticket-detail-grid">
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">{{ ticket.subject }}</div>
+        <div class="ticket-message-list">
+          {% for message in ticket.messages %}
+            <div class="ticket-message {% if message.sender_type == 'ADMIN' %}admin{% endif %}">
+              <div class="ticket-message-head">
+                <span>{% if message.sender_type == 'ADMIN' %}客服回复{% else %}用户消息{% endif %}</span>
+                <span>{{ message.created_at or '-' }}</span>
+              </div>
+              <div class="ticket-message-body">{{ message.message }}</div>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+
+    <aside class="page-section">
+      <div class="card">
+        <div class="section-title">工单信息</div>
+        <div class="ticket-info-row"><span class="muted">分类</span><span>{{ ticket.category_label }}</span></div>
+        <div class="ticket-info-row"><span class="muted">状态</span><span class="admin-badge admin-badge-{{ ticket.status_badge }}">{{ ticket.status_label }}</span></div>
+        <div class="ticket-info-row"><span class="muted">优先级</span><span>{{ ticket.priority_label }}</span></div>
+        <div class="ticket-info-row"><span class="muted">创建时间</span><span>{{ ticket.created_at or '-' }}</span></div>
+        <div class="ticket-info-row"><span class="muted">更新时间</span><span>{{ ticket.updated_at or '-' }}</span></div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <div class="section-title">更新状态</div>
+        <form method="post" action="/admin/support-tickets/{{ ticket.id }}/status" class="ticket-form-stack">
+          <div class="field">
+            <label for="status">状态</label>
+            <select id="status" name="status">
+              {% for option in status_options %}
+                <option value="{{ option.value }}" {% if ticket.status == option.value %}selected{% endif %}>{{ option.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <button type="submit" class="btn admin-btn admin-btn-primary">保存状态</button>
+        </form>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <div class="section-title">回复用户</div>
+        {% if ticket.status == 'CLOSED' %}
+          <p class="muted">工单已关闭，如需回复请先将状态改为待处理或处理中。</p>
+        {% else %}
+          <form method="post" action="/admin/support-tickets/{{ ticket.id }}/reply" class="ticket-form-stack">
+            <div class="field">
+              <label for="message">回复内容</label>
+              <textarea id="message" name="message" placeholder="输入客服回复内容" required></textarea>
+            </div>
+            <button type="submit" class="btn admin-btn admin-btn-primary">发送回复</button>
+          </form>
+        {% endif %}
+      </div>
+    </aside>
+  </div>
+{% endblock %}

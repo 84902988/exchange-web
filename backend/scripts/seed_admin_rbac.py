@@ -63,6 +63,7 @@ PERMISSIONS: tuple[dict[str, str], ...] = (
     {"code": "banners.manage", "name": "Banners Manage", "group_code": "system"},
     {"code": "announcements.manage", "name": "Announcements Manage", "group_code": "system"},
     {"code": "site_content.manage", "name": "站点配置、Banner、公告、运营内容管理", "group_code": "system"},
+    {"code": "support_tickets.manage", "name": "支持工单管理", "group_code": "users"},
     {"code": "audit.view", "name": "Audit View", "group_code": "system"},
     {"code": "admin_users.manage", "name": "管理员账号管理", "group_code": "system"},
     {"code": "admin_roles.manage", "name": "角色权限管理", "group_code": "system"},

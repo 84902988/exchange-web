@@ -20,3 +20,9 @@ def get_client_ip(request: Request) -> Optional[str]:
 def get_user_agent(request: Request) -> Optional[str]:
     ua = request.headers.get("user-agent")
     return ua.strip() if ua else None
+
+
+def get_geo_country_code(request: Request, header_name: str = "CF-IPCountry") -> str:
+    code = request.headers.get(header_name)
+    normalized = (code or "").strip().upper()
+    return normalized or "UNKNOWN"

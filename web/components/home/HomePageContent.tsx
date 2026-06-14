@@ -15,6 +15,24 @@ import {
   LatestAnnouncement,
   SiteConfig,
 } from "@/lib/api/modules/site";
+import type { Language } from "@/utils/language";
+
+type LocalizedText = Partial<Record<Language | "zh_tw", string>>;
+
+function pickCurrentLocaleText(value: LocalizedText | null | undefined, locale: Language): string {
+  if (!value) {
+    return "";
+  }
+
+  const keys: Array<keyof LocalizedText> = locale === "zh-TW" ? ["zh-TW", "zh_tw"] : [locale];
+  for (const key of keys) {
+    const text = value[key]?.trim();
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
 
 function mapBannerToPromoCard(banner: HomeBanner): PromoCardItem {
   return {
@@ -37,7 +55,7 @@ function mapAnnouncement(item: LatestAnnouncement): NoticeItem {
 }
 
 export default function HomePageContent() {
-  const { locale } = useLocaleContext();
+  const { locale, t } = useLocaleContext();
   const [siteConfig, setSiteConfig] = useState<SiteConfig>(fallbackSiteConfig);
   const [homeHeroMedia, setHomeHeroMedia] = useState("");
   const [banners, setBanners] = useState<HomeBanner[]>([]);
@@ -82,13 +100,15 @@ export default function HomePageContent() {
 
   const promoItems = useMemo(() => banners.map(mapBannerToPromoCard), [banners]);
   const noticeItems = useMemo(() => announcements.map(mapAnnouncement), [announcements]);
+  const heroCtaText =
+    pickCurrentLocaleText(siteConfig.home_hero_cta_text_i18n, locale) || t("heroStart", "home");
 
   return (
     <div className="min-h-screen bg-[#0b0b0f] text-white">
       <HomeHero
         heroTitle={siteConfig.home_hero_title}
         heroSubtitle={siteConfig.home_hero_subtitle}
-        ctaText={siteConfig.home_hero_cta_text}
+        ctaText={heroCtaText}
         ctaLink={siteConfig.home_hero_cta_link}
         backgroundMediaSrc={homeHeroMedia}
       />

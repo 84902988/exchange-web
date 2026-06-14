@@ -18,8 +18,11 @@ class ContractQuoteResponse(BaseModel):
     market_trading_hours: Optional[str] = None
     market_session_type: Optional[str] = None
     quote_freshness: str = "FALLBACK"
+    spread_x: str = "0"
     bid_price: str
     ask_price: str
+    raw_bid_price: Optional[str] = None
+    raw_ask_price: Optional[str] = None
     last_price: str
     mark_price: str
     index_price: Optional[str] = None
@@ -41,10 +44,15 @@ class ContractDepthResponse(BaseModel):
     market_trading_hours: Optional[str] = None
     market_session_type: Optional[str] = None
     quote_freshness: str = "FALLBACK"
+    spread_x: str = "0"
     bids: List[List[str]]
     asks: List[List[str]]
+    raw_bids: Optional[List[List[str]]] = None
+    raw_asks: Optional[List[List[str]]] = None
     best_bid: Optional[str] = None
     best_ask: Optional[str] = None
+    raw_best_bid: Optional[str] = None
+    raw_best_ask: Optional[str] = None
     source: str
     ts: datetime
 
