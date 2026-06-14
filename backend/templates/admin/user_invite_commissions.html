@@ -1,0 +1,240 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}邀请分成记录{% endblock %}
+{% block page_title %}邀请分成记录{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">运营查看普通邀请分成明细，维护普通用户邀请分成比例，并手动发放待处理分成记录。</div>
+{% endblock %}
+
+{% block content %}
+  {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+
+  <style>
+    .invite-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
+    .invite-stat-card{padding:14px 16px}
+    .invite-stat-label{color:var(--muted);font-size:12px;margin-bottom:8px}
+    .invite-stat-value{font-size:20px;font-weight:900;line-height:1.25;white-space:normal;overflow-wrap:anywhere}
+    .invite-filter-form{grid-template-columns:repeat(4,minmax(0,1fr)) auto}
+    .invite-pay-form{grid-template-columns:minmax(0,1fr) auto}
+    .invite-config-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}
+    .invite-table{min-width:0;table-layout:fixed}
+    .invite-cell{min-width:0;overflow-wrap:anywhere;word-break:break-word}
+    .invite-muted{margin-top:4px;color:var(--muted);font-size:12px;line-height:1.45;overflow-wrap:anywhere;word-break:break-word}
+    .invite-number{font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
+    .invite-row-actions{display:flex;align-items:center;gap:8px;flex-wrap:nowrap}
+    @media (max-width:1180px){.invite-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.invite-filter-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media (max-width:720px){.invite-stat-grid,.invite-filter-form,.invite-pay-form,.invite-config-form{grid-template-columns:1fr}.invite-table{min-width:760px}}
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card admin-card">
+        <div class="section-title">操作成功</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card admin-card">
+        <div class="section-title">操作提示</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="invite-stat-grid">
+      <div class="admin-card invite-stat-card">
+        <div class="invite-stat-label">当前分成比例</div>
+        <div class="invite-stat-value invite-number">{{ invite_commission_config.commission_percent|default('15') }}%</div>
+      </div>
+      <div class="admin-card invite-stat-card">
+        <div class="invite-stat-label">待发放金额</div>
+        <div class="invite-stat-value invite-number">{{ summary.pending_amount_display|default(summary.pending_amount_rcb|default('0')) }}</div>
+      </div>
+      <div class="admin-card invite-stat-card">
+        <div class="invite-stat-label">已发放金额</div>
+        <div class="invite-stat-value invite-number">{{ summary.paid_amount_display|default(summary.paid_amount_rcb|default('0')) }}</div>
+      </div>
+      <div class="admin-card invite-stat-card">
+        <div class="invite-stat-label">待发放记录数</div>
+        <div class="invite-stat-value invite-number">{{ summary.pending_count|default(0) }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section two-col">
+    <div class="filter-card admin-card">
+      <div class="section-title">普通用户邀请分成比例</div>
+      <form method="post" action="/admin/invite/commissions/config" class="invite-config-form">
+        <input type="hidden" name="next_path" value="{{ current_url }}" />
+        <div class="field">
+          <label for="commission_percent">普通用户邀请分成比例（%）</label>
+          <input
+            id="commission_percent"
+            type="number"
+            name="commission_percent"
+            min="0"
+            max="100"
+            step="0.01"
+            value="{{ invite_commission_percent_input|default('15') }}"
+            required
+          />
+          <p class="muted">页面按百分比输入，例如 15 表示 15%。保存后只影响新生成的普通邀请分成记录，历史记录不重算。</p>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">保存配置</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="filter-card admin-card">
+      <div class="section-title">批量发放</div>
+      <form
+        method="post"
+        action="/admin/invite/commissions/pay-pending"
+        class="filter-form invite-pay-form"
+        onsubmit="return confirm('确认批量发放 PENDING 状态的邀请分成？');"
+      >
+        <input type="hidden" name="next_path" value="{{ current_url }}" />
+        <div class="field">
+          <label for="batch_limit">本次最多处理</label>
+          <input id="batch_limit" type="number" name="limit" min="1" max="500" value="100" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">发放待处理分成</button>
+        </div>
+      </form>
+      <p class="muted">只处理 PENDING 记录，单条失败不会中断整批。</p>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card admin-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/invite/commissions" class="filter-form invite-filter-form">
+        <div class="field">
+          <label for="inviter_user_id">邀请人ID</label>
+          <input id="inviter_user_id" type="number" name="inviter_user_id" min="1" value="{{ filters.inviter_user_id }}" />
+        </div>
+        <div class="field">
+          <label for="invitee_user_id">来源用户ID</label>
+          <input id="invitee_user_id" type="number" name="invitee_user_id" min="1" value="{{ filters.invitee_user_id }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="" {% if not filters.status %}selected{% endif %}>全部</option>
+            <option value="PENDING" {% if filters.status == 'PENDING' %}selected{% endif %}>待发放</option>
+            <option value="PAID" {% if filters.status == 'PAID' %}selected{% endif %}>已发放</option>
+            <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="fee_coin_symbol">手续费币种</label>
+          <select id="fee_coin_symbol" name="fee_coin_symbol">
+            <option value="" {% if not filters.fee_coin_symbol %}selected{% endif %}>全部</option>
+            <option value="USDT" {% if filters.fee_coin_symbol == 'USDT' %}selected{% endif %}>USDT</option>
+            <option value="RCB" {% if filters.fee_coin_symbol == 'RCB' %}selected{% endif %}>RCB</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="date_from">开始日期</label>
+          <input id="date_from" type="date" name="date_from" value="{{ filters.date_from }}" />
+        </div>
+        <div class="field">
+          <label for="date_to">结束日期</label>
+          <input id="date_to" type="date" name="date_to" value="{{ filters.date_to }}" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/invite/commissions" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card admin-card">
+      <div class="section-title">邀请分成列表</div>
+
+      {% if records %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table invite-table">
+            <colgroup><col style="width:12%"><col style="width:24%"><col style="width:14%"><col style="width:18%"><col style="width:12%"><col style="width:12%"><col style="width:8%"></colgroup>
+            <thead>
+              <tr>
+                <th>记录</th>
+                <th>来源信息</th>
+                <th>手续费</th>
+                <th class="text-right">分成金额</th>
+                <th>状态</th>
+                <th>时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in records %}
+                <tr>
+                  <td><div class="invite-cell invite-number admin-id">#{{ item.id }}</div></td>
+                  <td>
+                    <div class="invite-cell admin-id">邀请人 {{ item.inviter_user_id|default('-') }}</div>
+                    <div class="invite-muted admin-id">来源用户 {{ item.source_user_id|default(item.invitee_user_id|default('-')) }}</div>
+                    <div class="invite-muted admin-id">订单 {{ item.source_order_id|default(item.order_id|default('-')) }} / 成交 {{ item.source_trade_id|default(item.trade_id|default('-')) }}</div>
+                  </td>
+                  <td>
+                    <div class="invite-cell invite-number admin-amount">{{ item.fee_amount }} {{ item.fee_coin_symbol }}</div>
+                    <div class="invite-muted invite-number admin-amount">约 {{ item.fee_usdt_value }} USDT</div>
+                  </td>
+                  <td class="text-right">
+                    <div class="invite-cell invite-number admin-amount">{{ item.commission_rcb_amount }} RCB</div>
+                    <div class="invite-muted invite-number">比例 {{ item.commission_rate_percent }}</div>
+                  </td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></td>
+                  <td>
+                    <div class="invite-cell admin-time">{{ item.created_at }}</div>
+                    {% if item.status == 'PAID' %}
+                      <div class="invite-muted admin-time">发放 {{ item.paid_at }}</div>
+                    {% endif %}
+                  </td>
+                  <td>
+                    {% if item.status == 'PENDING' %}
+                      <div class="invite-row-actions">
+                        <form method="post" action="/admin/invite/commissions/{{ item.id }}/pay" onsubmit="return confirm('确认发放该邀请分成？');">
+                          <input type="hidden" name="next_path" value="{{ current_url }}" />
+                          <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">发放</button>
+                        </form>
+                      </div>
+                    {% elif item.status == 'PAID' %}
+                      <span class="table-inline-note">已发放</span>
+                    {% elif item.status == 'FAILED' %}
+                      <span class="table-inline-note" title="{{ item.fail_reason }}">失败</span>
+                    {% else %}
+                      <span class="table-inline-note">只读</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无数据</div><p class="admin-empty-desc">暂无邀请分成记录</p></div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

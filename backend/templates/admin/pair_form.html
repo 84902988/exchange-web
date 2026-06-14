@@ -1,0 +1,494 @@
+{% extends "admin/layout.html" %}
+
+{% if is_edit %}
+  {% set pair_page_title = "编辑现货交易对" %}
+  {% set pair_page_subtitle = "修改现货交易对的市场模式、状态和交易精度配置。" %}
+{% else %}
+  {% set pair_page_title = "新增现货交易对" %}
+  {% set pair_page_subtitle = "创建新的现货交易对配置，基础币和计价币来自 assets 真实表。" %}
+{% endif %}
+{% set market_mode_labels = {"INTERNAL": "内盘撮合", "DEALER": "平台对手方"} %}
+{% set asset_type_labels = {"CRYPTO": "数字货币", "STOCK": "股票", "RWA": "RWA", "STOCK_TOKEN": "股票代币"} %}
+{% set display_category_labels = {
+  "MAINSTREAM": "主流币",
+  "PLATFORM": "平台币",
+  "RWA": "RWA",
+  "STOCK": "股票",
+  "INDEX": "指数",
+  "FOREX": "外汇",
+  "METAL": "贵金属",
+  "COMMODITY": "商品",
+  "ETF": "ETF"
+} %}
+{% set data_source_labels = {"INTERNAL": "内部行情", "BINANCE": "Binance 行情", "ITICK": "iTick 行情", "LOCAL": "本地行情"} %}
+
+{% block title %}{{ pair_page_title }}{% endblock %}
+{% block page_title %}{{ pair_page_title }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">{{ pair_page_subtitle }}</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/pairs" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .pair-logo-section {
+      grid-column: 1 / -1;
+      width: min(100%, 760px);
+      min-width: 0;
+      margin-top: 6px;
+      padding: 16px;
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 12px;
+      background: rgba(255,255,255,.03);
+    }
+    .pair-logo-section-title {
+      margin: 0 0 4px;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 800;
+    }
+    .pair-logo-section-desc {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .pair-logo-toggle {
+      display: inline-flex;
+      width: fit-content;
+      max-width: 220px;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+    .pair-logo-toggle input {
+      width: auto;
+      margin: 0;
+      accent-color: var(--brand);
+    }
+    .pair-logo-upload {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .pair-logo-current {
+      margin-top: 14px;
+    }
+    .pair-logo-preview {
+      margin-top: 8px;
+    }
+    .pair-logo-current-title {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .pair-logo-preview-card {
+      display: none;
+      width: min(100%, 320px);
+      height: 90px;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,.1);
+      border-radius: 16px;
+      background: rgba(10,14,20,.95);
+    }
+    .pair-logo-preview-card.is-visible {
+      display: flex;
+    }
+    .pair-logo-preview-card img {
+      display: block;
+      max-width: 86%;
+      max-height: 66px;
+      object-fit: contain;
+    }
+    .pair-logo-empty {
+      display: none;
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .pair-logo-empty.is-visible {
+      display: block;
+    }
+    .pair-logo-status {
+      display: none;
+      margin-top: 12px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.5;
+      white-space: pre-line;
+    }
+    .pair-logo-status.is-visible {
+      display: block;
+    }
+    .pair-logo-status.is-warning,
+    .pair-logo-status.is-error {
+      border: 1px solid rgba(239,68,68,.45);
+      background: rgba(239,68,68,.12);
+      color: #fca5a5;
+    }
+    .pair-logo-status.is-success {
+      border: 1px solid rgba(16,185,129,.45);
+      background: rgba(16,185,129,.12);
+      color: #6ee7b7;
+    }
+    .pair-logo-status.is-info {
+      border: 1px solid rgba(148,163,184,.35);
+      background: rgba(148,163,184,.1);
+      color: var(--muted);
+    }
+    @media (max-width: 640px) {
+      .pair-logo-section {
+        width: 100%;
+      }
+    }
+  </style>
+
+  {% set base_asset_options = asset_options.base_assets if asset_options.base_assets is defined else asset_options %}
+  {% set quote_asset_options = asset_options.quote_assets if asset_options.quote_assets is defined else asset_options %}
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">表单校验失败</div>
+        {% for error in errors %}
+          <p class="muted">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">{{ pair_page_title }}</div>
+      <form method="post" action="{{ form_action }}" class="filter-form">
+        {% if is_edit %}
+          <div class="field">
+            <label for="symbol_display">交易对</label>
+            <input id="symbol_display" type="text" value="{{ form.symbol }}" disabled />
+          </div>
+          <div class="field">
+            <label for="base_asset_display">基础币</label>
+            <input id="base_asset_display" type="text" value="{{ form.base_asset_symbol }}" disabled />
+          </div>
+          <div class="field">
+            <label for="quote_asset_display">计价币</label>
+            <input id="quote_asset_display" type="text" value="{{ form.quote_asset_symbol }}" disabled />
+          </div>
+        {% else %}
+          <div class="field">
+            <label for="symbol">交易对</label>
+            <input id="symbol" type="text" name="symbol" value="{{ form.symbol or '' }}" placeholder="例如 BTCUSDT" />
+          </div>
+          <div class="field">
+            <label for="base_asset_id">基础币</label>
+            <select id="base_asset_id" name="base_asset_id">
+              <option value="">请选择基础币</option>
+              {% for option in base_asset_options %}
+                <option value="{{ option.id }}" {% if option.id == (form.base_asset_id or 0)|int %}selected{% endif %}>
+                  {{ option.symbol }} / {{ option.name }}{% if not option.enabled %}（已禁用）{% endif %}
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="field">
+            <label for="quote_asset_id">计价币</label>
+            <select id="quote_asset_id" name="quote_asset_id">
+              <option value="">请选择计价币</option>
+              {% for option in quote_asset_options %}
+                <option value="{{ option.id }}" {% if option.id == (form.quote_asset_id or 0)|int %}selected{% endif %}>
+                  {{ option.symbol }} / {{ option.name }}{% if not option.enabled %}（已禁用）{% endif %}
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+        {% endif %}
+
+        <div class="field">
+          <label for="market_mode">市场模式</label>
+          <select id="market_mode" name="market_mode">
+            {% for option in ["INTERNAL", "DEALER"] %}
+              <option value="{{ option }}" {% if form.market_mode == option %}selected{% endif %}>{{ market_mode_labels.get(option, option) }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="asset_type">资产类型</label>
+          <select id="asset_type" name="asset_type">
+            {% for option in ["CRYPTO", "STOCK", "RWA", "STOCK_TOKEN"] %}
+              <option value="{{ option }}" {% if form.asset_type == option %}selected{% endif %}>{{ asset_type_labels.get(option, option) }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="display_category">前端展示分类</label>
+          <select id="display_category" name="display_category">
+            <option value="" {% if not form.display_category %}selected{% endif %}>未设置</option>
+            {% for option in ["MAINSTREAM", "PLATFORM", "RWA", "STOCK", "INDEX", "FOREX", "METAL", "COMMODITY", "ETF"] %}
+              <option value="{{ option }}" {% if form.display_category == option %}selected{% endif %}>{{ display_category_labels.get(option, option) }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="data_source">行情源</label>
+          <select id="data_source" name="data_source">
+            {% for option in ["INTERNAL", "BINANCE", "ITICK", "LOCAL"] %}
+              <option value="{{ option }}" {% if form.data_source == option %}selected{% endif %}>{{ data_source_labels.get(option, option) }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="external_symbol">外部标的</label>
+          <input id="external_symbol" type="text" name="external_symbol" value="{{ form.external_symbol or '' }}" placeholder="例如 BTCUSDT / AAPL" />
+        </div>
+        <div class="field">
+          <label for="external_region">外部地区</label>
+          <input id="external_region" type="text" name="external_region" value="{{ form.external_region or '' }}" placeholder="股票行情可填写 US 等地区" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="1" {% if form.status|string == '1' %}selected{% endif %}>启用</option>
+            <option value="0" {% if form.status|string == '0' %}selected{% endif %}>禁用</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="price_precision">价格精度</label>
+          <input id="price_precision" type="number" min="0" name="price_precision" value="{{ form.price_precision or '8' }}" />
+        </div>
+        <div class="field">
+          <label for="amount_precision">数量精度</label>
+          <input id="amount_precision" type="number" min="0" name="amount_precision" value="{{ form.amount_precision or '8' }}" />
+        </div>
+        <div class="field">
+          <label for="min_amount">最小数量</label>
+          <input id="min_amount" type="text" name="min_amount" value="{{ form.min_amount or '0' }}" placeholder="例如 0.001" />
+        </div>
+        <div class="field">
+          <label for="min_notional">最小成交额（USDT）</label>
+          <input id="min_notional" type="text" name="min_notional" value="{{ form.min_notional or '0' }}" placeholder="例如 1" />
+        </div>
+        <div class="pair-logo-section">
+          <div class="pair-logo-section-title">现货页 LOGO 设置</div>
+          <p class="pair-logo-section-desc">仅 RWA / 股票代币类交易对生效。</p>
+          <input id="show_spot_logo" type="hidden" name="show_spot_logo" value="{{ '1' if form.show_spot_logo|string == '1' else '0' }}" />
+          <label class="pair-logo-toggle" for="show_spot_logo_toggle">
+            <input id="show_spot_logo_toggle" type="checkbox" value="1" {% if form.show_spot_logo|string == '1' %}checked{% endif %} />
+            在现货页显示 LOGO
+          </label>
+          <input id="spot_logo_url" type="hidden" name="spot_logo_url" value="{{ form.spot_logo_url or '' }}" />
+          <input id="spot_logo_file" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden />
+          <div class="pair-logo-upload">
+            <button id="spot_logo_choose_btn" type="button" class="btn secondary admin-btn admin-btn-secondary">选择图片</button>
+            <button id="spot_logo_upload_btn" type="button" class="btn secondary admin-btn admin-btn-secondary" disabled>上传</button>
+            <button id="spot_logo_delete_btn" type="button" class="btn secondary admin-btn admin-btn-secondary">删除图片</button>
+          </div>
+          <div id="spot_logo_upload_status" class="pair-logo-status" aria-live="polite"></div>
+          <div class="pair-logo-current">
+            <p class="pair-logo-current-title">当前预览：</p>
+            <div id="spot_logo_preview_card" class="pair-logo-preview-card">
+              <img id="spot_logo_preview_img" {% if form.spot_logo_url %}src="{{ form.spot_logo_url }}"{% endif %} alt="当前已配置LOGO" />
+            </div>
+            <p id="spot_logo_empty" class="pair-logo-empty">暂未上传 LOGO</p>
+          </div>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary" data-role="pair-save-button">{% if is_edit %}保存修改{% else %}创建现货交易对{% endif %}</button>
+          <a href="/admin/pairs" class="btn secondary admin-btn admin-btn-secondary">取消</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <script>
+    (function () {
+      const logoEnabledInput = document.getElementById("show_spot_logo");
+      const logoToggle = document.getElementById("show_spot_logo_toggle");
+      const logoInput = document.getElementById("spot_logo_url");
+      const fileInput = document.getElementById("spot_logo_file");
+      const chooseButton = document.getElementById("spot_logo_choose_btn");
+      const uploadButton = document.getElementById("spot_logo_upload_btn");
+      const deleteButton = document.getElementById("spot_logo_delete_btn");
+      const status = document.getElementById("spot_logo_upload_status");
+      const previewCard = document.getElementById("spot_logo_preview_card");
+      const previewImage = document.getElementById("spot_logo_preview_img");
+      const emptyText = document.getElementById("spot_logo_empty");
+
+      if (!logoEnabledInput || !logoToggle || !logoInput || !fileInput || !chooseButton || !uploadButton || !deleteButton || !status || !previewCard || !previewImage || !emptyText) {
+        return;
+      }
+      const form = logoInput.closest("form");
+
+      const saveButton = form ? form.querySelector('[data-role="pair-save-button"]') : null;
+      const originalSaveText = saveButton ? saveButton.textContent : "";
+
+      function hasPendingLocalFile() {
+        return Boolean(fileInput.files && fileInput.files[0]);
+      }
+
+      function setSaveBlocked(blocked) {
+        if (!saveButton) {
+          return;
+        }
+        saveButton.disabled = blocked;
+        saveButton.title = blocked ? "当前 LOGO 图片仅本地预览，尚未上传。" : "";
+        saveButton.textContent = blocked ? "请先上传LOGO" : originalSaveText;
+      }
+
+      function setStatus(message, type) {
+        status.textContent = message || "";
+        status.className = "pair-logo-status";
+        if (message) {
+          status.classList.add("is-visible", `is-${type || "info"}`);
+        }
+      }
+
+      function showPendingUploadWarning() {
+        setStatus("⚠ 图片已选择，但尚未上传\n请先点击“上传”，上传成功后再保存交易对。", "warning");
+        setSaveBlocked(true);
+      }
+
+      let localPreviewUrl = "";
+
+      function clearLocalPreview() {
+        if (localPreviewUrl) {
+          URL.revokeObjectURL(localPreviewUrl);
+          localPreviewUrl = "";
+        }
+      }
+
+      function showPreview(url) {
+        if (!url) {
+          previewImage.removeAttribute("src");
+          previewCard.classList.remove("is-visible");
+          emptyText.classList.add("is-visible");
+          return;
+        }
+
+        previewImage.src = url;
+        previewCard.classList.add("is-visible");
+        emptyText.classList.remove("is-visible");
+      }
+
+      function updatePreview() {
+        const url = String(logoInput.value || "").trim();
+        if (url) {
+          showPreview(url);
+          deleteButton.disabled = false;
+        } else {
+          showPreview("");
+          deleteButton.disabled = true;
+        }
+      }
+
+      logoToggle.addEventListener("change", () => {
+        logoEnabledInput.value = logoToggle.checked ? "1" : "0";
+      });
+
+      chooseButton.addEventListener("click", () => fileInput.click());
+
+      fileInput.addEventListener("change", () => {
+        const file = fileInput.files && fileInput.files[0];
+        uploadButton.disabled = !file;
+        clearLocalPreview();
+        if (file) {
+          localPreviewUrl = URL.createObjectURL(file);
+          showPreview(localPreviewUrl);
+          deleteButton.disabled = false;
+          showPendingUploadWarning();
+        } else {
+          updatePreview();
+          setStatus("", "");
+          setSaveBlocked(false);
+        }
+      });
+
+      uploadButton.addEventListener("click", async () => {
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) {
+          setStatus("请先选择图片");
+          return;
+        }
+
+        const originalText = uploadButton.textContent;
+        chooseButton.disabled = true;
+        uploadButton.disabled = true;
+        uploadButton.textContent = "上传中";
+        setStatus("LOGO 上传中...", "info");
+        setSaveBlocked(true);
+
+        try {
+          const formData = new FormData();
+          formData.append("file", file);
+          const response = await fetch("/admin/uploads/image", {
+            method: "POST",
+            body: formData,
+            credentials: "same-origin",
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(data.detail || "上传失败");
+          }
+          logoInput.value = data.url || "";
+          clearLocalPreview();
+          fileInput.value = "";
+          setStatus("✓ LOGO 上传成功\n已上传，可保存交易对配置。", "success");
+          setSaveBlocked(false);
+          updatePreview();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "上传失败";
+          setStatus(`⚠ ${message}\n请重新点击“上传”，上传成功后再保存交易对。`, "error");
+          setSaveBlocked(true);
+        } finally {
+          chooseButton.disabled = false;
+          uploadButton.textContent = originalText;
+          uploadButton.disabled = !hasPendingLocalFile();
+        }
+      });
+
+      deleteButton.addEventListener("click", () => {
+        logoInput.value = "";
+        clearLocalPreview();
+        fileInput.value = "";
+        uploadButton.disabled = true;
+        setStatus("", "");
+        setSaveBlocked(false);
+        updatePreview();
+      });
+
+      if (form) {
+        form.addEventListener("submit", (event) => {
+          const hasPendingLocalFile = Boolean(fileInput.files && fileInput.files[0]);
+          if (hasPendingLocalFile) {
+            event.preventDefault();
+            showPendingUploadWarning();
+          }
+        });
+      }
+
+      previewImage.addEventListener("error", () => {
+        previewImage.removeAttribute("src");
+        previewCard.classList.remove("is-visible");
+        emptyText.classList.add("is-visible");
+        setStatus("图片加载失败，请重新上传。");
+      });
+
+      window.addEventListener("beforeunload", clearLocalPreview);
+
+      logoEnabledInput.value = logoToggle.checked ? "1" : "0";
+      updatePreview();
+      setSaveBlocked(false);
+    })();
+  </script>
+{% endblock %}

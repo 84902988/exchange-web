@@ -1,0 +1,343 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}现货交易对配置{% endblock %}
+{% block page_title %}现货交易对配置{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看并维护当前现货交易对配置，支持新增、编辑和启用/禁用。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/pairs/create" class="btn admin-btn admin-btn-primary">新增现货交易对</a>
+{% endblock %}
+
+{% block content %}
+{% set mode_labels = {"INTERNAL": "内盘", "DEALER": "Dealer"} %}
+  {% set source_labels = {"INTERNAL": "内部行情", "BINANCE": "Binance 行情", "ITICK": "iTick 行情", "LOCAL": "本地行情"} %}
+  {% set asset_type_labels = {"CRYPTO": "数字货币", "STOCK": "股票", "FOREX": "外汇", "INDEX": "指数", "METAL": "贵金属", "COMMODITY": "大宗商品"} %}
+  {% set display_category_labels = {"MAINSTREAM": "主流币", "STOCK": "股票", "PLATFORM": "平台币", "RWA": "RWA", "INDEX": "指数", "FOREX": "外汇", "METAL": "贵金属", "COMMODITY": "商品", "ETF": "ETF"} %}
+  <style>
+    .pair-actions{
+      display:flex;
+      flex-direction:row;
+      align-items:center;
+      gap:.5rem;
+      flex-wrap:nowrap;
+      white-space:nowrap;
+    }
+    .pair-actions form{ margin:0; }
+    .pair-actions .btn{
+      min-height:32px;
+      padding:0 10px;
+      border-radius:8px;
+      line-height:1;
+    }
+    .pair-actions .btn.danger{
+      border-color:rgba(248,113,113,.55);
+      background:rgba(127,29,29,.12);
+      color:#fecaca;
+    }
+    .pair-actions .btn.danger:hover{
+      border-color:rgba(248,113,113,.8);
+      background:rgba(127,29,29,.22);
+    }
+    .pairs-compact-table{
+      table-layout:fixed;
+      width:100%;
+    }
+    .pairs-compact-table th,
+    .pairs-compact-table td{
+      padding:8px 12px;
+      height:60px;
+      vertical-align:middle;
+      line-height:1.25;
+      font-size:14px;
+    }
+    .pairs-compact-table tbody tr{
+      height:60px;
+    }
+    .pairs-compact-table .admin-badge{
+      min-height:22px;
+      padding:3px 8px;
+      border-radius:7px;
+      font-size:12px;
+      line-height:1.25;
+      white-space:nowrap;
+    }
+    .pairs-compact-table .pair-symbol-cell{
+      cursor:help;
+      max-width:240px;
+    }
+    .pairs-compact-table .pair-symbol-main{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      min-width:0;
+    }
+    .pairs-compact-table .pair-symbol-main strong{
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      color:var(--text);
+      font-size:15px;
+      font-weight:700;
+      letter-spacing:0;
+    }
+    .pairs-compact-table .pair-subline,
+    .pairs-compact-table .pair-rule-subline,
+    .pairs-compact-table .pair-external-subline{
+      margin-top:3px;
+      color:rgba(255,255,255,.48);
+      font-size:13px;
+      line-height:1.25;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .pairs-compact-table .pair-rule-main,
+    .pairs-compact-table .pair-external-main{
+      color:rgba(255,255,255,.84);
+      font-size:14px;
+      line-height:1.25;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      font-variant-numeric:tabular-nums;
+    }
+    .pairs-compact-table .pair-hover-hint{
+      flex:0 0 auto;
+      color:rgba(255,255,255,.42);
+      font-size:11px;
+      font-family:var(--font-sans, inherit);
+    }
+    .pairs-compact-table .pair-actions{
+      gap:6px;
+      justify-content:flex-end;
+    }
+    .pairs-compact-table .pair-actions .btn{
+      min-height:28px;
+      padding:0 9px;
+      border-radius:7px;
+      font-size:13px;
+    }
+    .pairs-compact-table .pair-col-symbol{ width:18%; }
+    .pairs-compact-table .pair-col-mode{ width:10%; }
+    .pairs-compact-table .pair-col-category{ width:10%; }
+    .pairs-compact-table .pair-col-source{ width:11%; }
+    .pairs-compact-table .pair-col-rules{ width:14%; }
+    .pairs-compact-table .pair-col-external{ width:12%; }
+    .pairs-compact-table .pair-col-status{ width:8%; }
+    .pairs-compact-table .pair-col-actions{ width:17%; }
+    .pairs-compact-table .pair-status-cell{
+      text-align:center;
+      padding-right:18px;
+    }
+    .pairs-compact-table .pair-actions-cell{
+      padding-left:18px;
+    }
+    .pairs-compact-table th:last-child,
+    .pairs-compact-table td:last-child{
+      text-align:right;
+    }
+  </style>
+
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作结果</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">提示信息</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="admin-alert admin-alert-warning">交易对或合约品种状态会影响前端交易入口，请谨慎启用或禁用。</div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/pairs" class="filter-form">
+        <div class="field">
+          <label for="symbol">交易对</label>
+          <input id="symbol" type="text" name="symbol" value="{{ filters.symbol or '' }}" placeholder="例如 BTCUSDT" />
+        </div>
+        <div class="field">
+          <label for="market_mode">市场模式</label>
+          <select id="market_mode" name="market_mode">
+            <option value="">全部</option>
+            <option value="INTERNAL" {% if filters.market_mode == 'INTERNAL' %}selected{% endif %}>内盘撮合</option>
+            <option value="DEALER" {% if filters.market_mode == 'DEALER' %}selected{% endif %}>平台对手方</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="data_source">行情源</label>
+          <select id="data_source" name="data_source">
+            <option value="">全部</option>
+            <option value="INTERNAL" {% if filters.data_source == 'INTERNAL' %}selected{% endif %}>内部行情</option>
+            <option value="BINANCE" {% if filters.data_source == 'BINANCE' %}selected{% endif %}>Binance 行情</option>
+            <option value="ITICK" {% if filters.data_source == 'ITICK' %}selected{% endif %}>iTick 行情</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="1" {% if filters.status == '1' %}selected{% endif %}>启用</option>
+            <option value="0" {% if filters.status == '0' %}selected{% endif %}>禁用</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/pairs" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">现货交易对列表</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table pairs-compact-table">
+            <colgroup>
+              <col class="pair-col-symbol" />
+              <col class="pair-col-mode" />
+              <col class="pair-col-category" />
+              <col class="pair-col-source" />
+              <col class="pair-col-rules" />
+              <col class="pair-col-external" />
+              <col class="pair-col-status" />
+              <col class="pair-col-actions" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th class="nowrap">交易对</th>
+                <th class="nowrap">市场模式</th>
+                <th class="nowrap">前端分类</th>
+                <th class="nowrap">行情源</th>
+                <th class="nowrap">精度/规则</th>
+                <th class="nowrap">外部配置</th>
+                <th class="nowrap">状态</th>
+                <th class="nowrap">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td
+                    class="mono pair-symbol-cell"
+                    title="基础币：{{ item.base_asset_symbol }}&#10;计价币：{{ item.quote_asset_symbol }}&#10;资产类型：{{ asset_type_labels.get(item.asset_type, item.asset_type) }}&#10;外部标的：{{ item.external_symbol or '--' }}&#10;外部地区：{{ item.external_region or '--' }}&#10;价格精度：{{ item.price_precision }}&#10;数量精度：{{ item.amount_precision }}&#10;最小数量：{{ item.min_amount }}&#10;最小成交额：{{ item.min_notional }}&#10;创建时间：{{ item.created_at }}"
+                  >
+                    <div class="pair-symbol-main">
+                      <strong>{{ item.symbol }}</strong>
+                      <span class="pair-hover-hint">详情</span>
+                    </div>
+                    <div class="pair-subline">{{ item.base_asset_symbol }} / {{ item.quote_asset_symbol }}</div>
+                  </td>
+                  <td>
+                    {% if item.market_mode == 'INTERNAL' %}
+                      <span class="admin-badge admin-badge-info" title="{{ item.market_mode }}">{{ item.market_mode_label }}</span>
+                    {% elif item.market_mode == 'DEALER' %}
+                      <span class="admin-badge admin-badge-purple" title="{{ item.market_mode }}">{{ item.market_mode_label }}</span>
+                    {% else %}
+                      <span class="admin-badge admin-badge-secondary" title="{{ item.market_mode }}">{{ item.market_mode_label }}</span>
+                    {% endif %}
+                  </td>
+                  <td class="mono nowrap">{{ display_category_labels.get(item.display_category, item.display_category) if item.display_category else "未设置" }}</td>
+                  <td>
+                    {% if item.data_source == 'INTERNAL' %}
+                      <span class="admin-badge admin-badge-info">{{ source_labels.get(item.data_source, item.data_source) }}</span>
+                    {% elif item.data_source in ['BINANCE', 'ITICK'] %}
+                      <span class="admin-badge admin-badge-secondary">{{ source_labels.get(item.data_source, item.data_source) }}</span>
+                    {% else %}
+                      <span class="admin-badge admin-badge-{{ item.data_source_badge }}">{{ source_labels.get(item.data_source, item.data_source) }}</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    <div class="pair-rule-main">价格 {{ item.price_precision }} / 数量 {{ item.amount_precision }}</div>
+                    <div class="pair-rule-subline">最小量 {{ item.min_amount }}</div>
+                  </td>
+                  <td>
+                    {% if item.data_source in ['INTERNAL', 'LOCAL'] %}
+                      <div class="pair-external-main">--</div>
+                      <div class="pair-external-subline">--</div>
+                    {% else %}
+                      <div class="pair-external-main">{{ item.external_symbol or '--' }}</div>
+                      <div class="pair-external-subline">{{ item.external_region or '--' }}</div>
+                    {% endif %}
+                  </td>
+                  <td class="pair-status-cell"><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></td>
+                  <td class="pair-actions-cell">
+                    <div class="pair-actions admin-table-actions">
+                      <a href="/admin/pairs/{{ item.id }}/edit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">编辑</a>
+                      <form
+                        method="post"
+                        action="/admin/pairs/{{ item.id }}/toggle-status"
+                        onsubmit="return confirm('{% if item.status == 1 %}确认禁用该交易对？禁用后前端将不可继续交易。{% else %}确认启用该交易对？启用后前端可能恢复该交易入口。{% endif %}');"
+                      >
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn {% if item.status == 1 %}danger admin-btn-danger{% else %}admin-btn-primary{% endif %} admin-btn admin-btn-sm">
+                          {% if item.status == 1 %}禁用{% else %}启用{% endif %}
+                        </button>
+                      </form>
+                      {% if item.can_delete %}
+                        <form
+                          method="post"
+                          action="/admin/pairs/{{ item.id }}/delete"
+                          onsubmit="return confirm('确认删除现货交易对 {{ item.symbol }}？删除后不可恢复，前端也将不再展示该交易入口。');"
+                        >
+                          <input type="hidden" name="next_path" value="{{ current_url }}" />
+                          <button type="submit" class="btn danger admin-btn admin-btn-danger admin-btn-sm">删除</button>
+                        </form>
+                      {% endif %}
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无数据</div>
+          <p class="admin-empty-desc">当前筛选条件下暂无记录，可调整筛选条件后重试</p>
+        </div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+

@@ -1,0 +1,957 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}热钱包监控{% endblock %}
+{% block page_title %}热钱包监控{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看各网络热钱包余额和 Gas 是否充足。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .hot-wallet-head{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:14px;
+      flex-wrap:wrap;
+    }
+    .hot-wallet-note{
+      margin:0;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.7;
+    }
+    .hot-wallet-stats{
+      display:grid;
+      grid-template-columns:repeat(4,minmax(0,1fr));
+      gap:12px;
+    }
+    .hot-wallet-card{
+      border:1px solid rgba(148,163,184,.18);
+      border-radius:8px;
+      background:linear-gradient(180deg,#181b22,#111318);
+      padding:14px;
+      min-width:0;
+    }
+    .hot-wallet-card-label{
+      color:#9ca3af;
+      font-size:12px;
+      font-weight:800;
+    }
+    .hot-wallet-card-value{
+      margin-top:8px;
+      color:#f8fafc;
+      font-size:24px;
+      line-height:1.1;
+      font-weight:900;
+      font-variant-numeric:tabular-nums;
+    }
+    .hot-wallet-filters{
+      display:grid;
+      grid-template-columns:repeat(4,minmax(150px,1fr));
+      gap:12px;
+      align-items:end;
+    }
+    .hot-wallet-filters label{
+      display:block;
+      margin-bottom:6px;
+      color:#9ca3af;
+      font-size:12px;
+      font-weight:800;
+    }
+    .hot-wallet-filters select{
+      width:100%;
+      min-height:38px;
+      border:1px solid rgba(148,163,184,.22);
+      border-radius:8px;
+      background:#111318;
+      color:#f8fafc;
+      padding:8px 10px;
+    }
+    .hot-wallet-filter-actions{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .hot-wallet-address{
+      display:flex;
+      align-items:center;
+      gap:6px;
+      min-width:150px;
+      max-width:240px;
+    }
+    .hot-wallet-address-code{
+      color:#dbeafe;
+      font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;
+      font-size:12px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-copy{
+      border:1px solid rgba(148,163,184,.28);
+      background:#171a21;
+      color:#d1d5db;
+      border-radius:6px;
+      padding:2px 6px;
+      font-size:11px;
+      cursor:pointer;
+    }
+    .hot-wallet-amount{
+      white-space:nowrap;
+      font-variant-numeric:tabular-nums;
+    }
+    .hot-wallet-error{
+      display:block;
+      margin-top:4px;
+      max-width:220px;
+      color:#fca5a5;
+      font-size:11px;
+      line-height:1.4;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-actions{
+      display:flex;
+      align-items:center;
+      gap:6px;
+      flex-wrap:wrap;
+      white-space:nowrap;
+    }
+    .hot-wallet-actions form{
+      margin:0;
+    }
+    .hot-wallet-dashboard-grid{
+      display:grid;
+      grid-template-columns:minmax(280px,.95fr) minmax(420px,1.55fr);
+      gap:14px;
+      align-items:stretch;
+    }
+    .hot-wallet-section-head{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:12px;
+    }
+    .hot-wallet-section-title{
+      color:#f8fafc;
+      font-size:16px;
+      font-weight:900;
+    }
+    .hot-wallet-section-subtitle{
+      margin-top:4px;
+      color:#9ca3af;
+      font-size:12px;
+      line-height:1.5;
+    }
+    .hot-wallet-risk-list{
+      display:grid;
+      gap:8px;
+    }
+    .hot-wallet-risk-item{
+      display:grid;
+      grid-template-columns:minmax(74px,.8fr) minmax(58px,.55fr) minmax(96px,1fr);
+      gap:8px;
+      align-items:center;
+      border:1px solid rgba(248,113,113,.22);
+      background:rgba(127,29,29,.12);
+      border-radius:8px;
+      padding:10px;
+      min-width:0;
+    }
+    .hot-wallet-risk-item.pending{
+      border-color:rgba(148,163,184,.18);
+      background:rgba(148,163,184,.08);
+    }
+    .hot-wallet-risk-main{
+      min-width:0;
+    }
+    .hot-wallet-risk-network{
+      color:#f8fafc;
+      font-size:13px;
+      font-weight:900;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-risk-symbol{
+      color:#dbeafe;
+      font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;
+      font-size:13px;
+      font-weight:900;
+    }
+    .hot-wallet-risk-balance{
+      min-width:0;
+      color:#cbd5e1;
+      font-size:12px;
+      line-height:1.45;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-empty{
+      border:1px dashed rgba(148,163,184,.25);
+      border-radius:8px;
+      padding:18px;
+      color:#9ca3af;
+      text-align:center;
+      font-size:13px;
+      background:rgba(255,255,255,.02);
+    }
+    .hot-wallet-network-grid{
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+      gap:10px;
+    }
+    .hot-wallet-network-card{
+      border:1px solid rgba(148,163,184,.18);
+      border-radius:8px;
+      background:#111318;
+      padding:12px;
+      min-width:0;
+    }
+    .hot-wallet-network-card.warning{
+      border-color:rgba(251,191,36,.35);
+      background:rgba(251,191,36,.08);
+    }
+    .hot-wallet-network-card.danger{
+      border-color:rgba(248,113,113,.38);
+      background:rgba(127,29,29,.12);
+    }
+    .hot-wallet-network-top{
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      align-items:flex-start;
+      margin-bottom:10px;
+    }
+    .hot-wallet-network-name{
+      color:#f8fafc;
+      font-size:14px;
+      font-weight:900;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-network-key,
+    .hot-wallet-network-address{
+      margin-top:3px;
+      color:#9ca3af;
+      font-size:11px;
+      font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-network-metrics{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:8px;
+    }
+    .hot-wallet-network-label{
+      color:#9ca3af;
+      font-size:11px;
+      font-weight:800;
+    }
+    .hot-wallet-network-value{
+      margin-top:4px;
+      color:#f8fafc;
+      font-size:13px;
+      font-weight:900;
+      font-variant-numeric:tabular-nums;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-detail-title{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      padding:14px 16px 0;
+    }
+    .hot-wallet-detail-title h2{
+      margin:0;
+      color:#f8fafc;
+      font-size:16px;
+      font-weight:900;
+    }
+    .hot-wallet-detail-actions{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .hot-wallet-detail-meta{
+      color:#9ca3af;
+      font-size:12px;
+    }
+    .hot-wallet-compact-table th,
+    .hot-wallet-compact-table td{
+      padding:6px 8px;
+      vertical-align:middle;
+    }
+    .hot-wallet-compact-table tbody tr{
+      height:58px;
+    }
+    .hot-wallet-primary{
+      color:#f8fafc;
+      font-size:13px;
+      font-weight:850;
+      line-height:1.2;
+      max-width:150px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-secondary{
+      margin-top:2px;
+      color:#9ca3af;
+      font-size:11px;
+      line-height:1.15;
+      max-width:150px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-address-actions{
+      display:flex;
+      align-items:center;
+      gap:6px;
+      min-width:0;
+    }
+    .hot-wallet-row-link{
+      color:#93c5fd;
+      font-size:11px;
+      font-weight:800;
+      text-decoration:none;
+    }
+    .hot-wallet-row-link:hover{
+      text-decoration:underline;
+    }
+    .hot-wallet-cell-meta{
+      margin-top:3px;
+      color:#9ca3af;
+      font-size:10px;
+      line-height:1.15;
+      max-width:150px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-safety{
+      display:grid;
+      gap:4px;
+      min-width:118px;
+      max-width:150px;
+    }
+    .hot-wallet-safety-text{
+      display:flex;
+      justify-content:space-between;
+      gap:8px;
+      color:#cbd5e1;
+      font-size:12px;
+      line-height:1.2;
+    }
+    .hot-wallet-safety-value{
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .hot-wallet-safety-track{
+      height:4px;
+      border-radius:999px;
+      background:rgba(148,163,184,.18);
+      overflow:hidden;
+    }
+    .hot-wallet-safety-fill{
+      width:var(--safety-width,0%);
+      height:100%;
+      border-radius:999px;
+      background:#22c55e;
+      transition:width .2s ease, background .2s ease;
+    }
+    .hot-wallet-safety.warn .hot-wallet-safety-fill{
+      background:#f59e0b;
+    }
+    .hot-wallet-safety.danger .hot-wallet-safety-fill{
+      background:#ef4444;
+    }
+    @media (max-width:960px){
+      .hot-wallet-stats{grid-template-columns:repeat(2,minmax(0,1fr));}
+      .hot-wallet-filters{grid-template-columns:repeat(2,minmax(0,1fr));}
+      .hot-wallet-dashboard-grid{grid-template-columns:1fr;}
+    }
+    @media (max-width:560px){
+      .hot-wallet-stats,.hot-wallet-filters{grid-template-columns:1fr;}
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section"><div class="admin-alert admin-alert-success">{{ notice }}</div></section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section"><div class="admin-alert admin-alert-warning">{{ error }}</div></section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="card">
+      <div class="hot-wallet-head">
+        <div>
+          <h2>热钱包监控 V1</h2>
+          <p class="hot-wallet-note">查看各网络热钱包余额和 Gas 是否充足。</p>
+          <p class="hot-wallet-note">余额过低可能影响提现或链上操作，余额读取结果短缓存 {{ cache_seconds }} 秒。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="hot-wallet-stats">
+      <div class="hot-wallet-card">
+        <div class="hot-wallet-card-label">总监控项</div>
+        <div class="hot-wallet-card-value">{{ summary.total or 0 }}</div>
+      </div>
+      <div class="hot-wallet-card">
+        <div class="hot-wallet-card-label">正常</div>
+        <div class="hot-wallet-card-value">{{ summary.normal or 0 }}</div>
+      </div>
+      <div class="hot-wallet-card">
+        <div class="hot-wallet-card-label">预警</div>
+        <div class="hot-wallet-card-value">{{ summary.warning or 0 }}</div>
+      </div>
+      <div class="hot-wallet-card">
+        <div class="hot-wallet-card-label">读取失败</div>
+        <div class="hot-wallet-card-value">{{ summary.read_failed or 0 }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="hot-wallet-dashboard-grid">
+      <div class="card">
+        <div class="hot-wallet-section-head">
+          <div>
+            <div class="hot-wallet-section-title">需要处理</div>
+            <div class="hot-wallet-section-subtitle">展示非正常状态的热钱包监控项。</div>
+          </div>
+        </div>
+        <div class="hot-wallet-risk-list" data-risk-list></div>
+      </div>
+      <div class="card">
+        <div class="hot-wallet-section-head">
+          <div>
+            <div class="hot-wallet-section-title">网络概览</div>
+            <div class="hot-wallet-section-subtitle">按网络查看 Gas、币种数量和风险数量。</div>
+          </div>
+        </div>
+        <div class="hot-wallet-network-grid" data-network-grid></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <form class="hot-wallet-filters" method="get" action="/admin/hot-wallets">
+        <div>
+          <label for="filter-chain">网络</label>
+          <select id="filter-chain" name="chain_key">
+            <option value="">全部网络</option>
+            {% for chain in chain_options %}
+              <option value="{{ chain.chain_key }}" {% if filters.chain_key == chain.chain_key %}selected{% endif %}>{{ chain.chain_name }} / {{ chain.chain_key }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="filter-symbol">币种</label>
+          <select id="filter-symbol" name="symbol">
+            <option value="">全部币种</option>
+            {% for asset in symbol_options %}
+              <option value="{{ asset.symbol }}" {% if filters.symbol == asset.symbol %}selected{% endif %}>{{ asset.symbol }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="filter-status">状态</label>
+          <select id="filter-status" name="status">
+            <option value="" {% if not filters.status %}selected{% endif %}>全部状态</option>
+            <option value="NORMAL" {% if filters.status == "NORMAL" %}selected{% endif %}>正常</option>
+            <option value="WARNING" {% if filters.status == "WARNING" %}selected{% endif %}>预警</option>
+            <option value="UNCONFIGURED" {% if filters.status == "UNCONFIGURED" %}selected{% endif %}>未配置</option>
+            <option value="TOKEN_LOW" {% if filters.status == "TOKEN_LOW" %}selected{% endif %}>币种余额偏低</option>
+            <option value="GAS_LOW" {% if filters.status == "GAS_LOW" %}selected{% endif %}>Gas不足</option>
+            <option value="READ_FAILED" {% if filters.status == "READ_FAILED" %}selected{% endif %}>读取失败</option>
+          </select>
+        </div>
+        <div class="hot-wallet-filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">筛选</button>
+          <a href="/admin/hot-wallets" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="hot-wallet-detail-title">
+        <h2>详细资产列表</h2>
+        <div class="hot-wallet-detail-actions">
+          <span class="hot-wallet-detail-meta">当前筛选范围内逐行刷新，最多并发 2 个</span>
+          <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-refresh-all>刷新全部</button>
+        </div>
+      </div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table hot-wallet-compact-table">
+            <thead>
+              <tr>
+                <th>网络</th>
+                <th>币种</th>
+                <th>热钱包</th>
+                <th>币种余额</th>
+                <th>Gas余额</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr
+                  data-hot-wallet-row
+                  data-asset-chain-id="{{ item.asset_chain_id }}"
+                  data-asset-id="{{ item.asset_id }}"
+                  data-chain-key="{{ item.chain_key }}"
+                  data-chain-name="{{ item.chain_name }}"
+                  data-symbol="{{ item.symbol }}"
+                  data-address-short="{{ item.hot_wallet_address_short }}"
+                  data-token-threshold-label="{{ item.token_threshold_label }}"
+                  data-gas-threshold-label="{{ item.gas_threshold_label }}"
+                  data-checked-at-label="{{ item.checked_at_label }}"
+                  data-needs-refresh="{% if item.needs_refresh %}1{% else %}0{% endif %}"
+                >
+                  <td>
+                    <div class="hot-wallet-primary" title="{{ item.chain_name }}">{{ item.chain_name }}</div>
+                    <div class="hot-wallet-secondary mono" title="{{ item.chain_key }}">{{ item.chain_key }}</div>
+                  </td>
+                  <td>
+                    <div class="hot-wallet-primary mono" title="{{ item.symbol }}">{{ item.symbol }}</div>
+                    {% if item.asset_name %}<div class="hot-wallet-secondary" title="{{ item.asset_name }}">{{ item.asset_name }}</div>{% endif %}
+                  </td>
+                  <td>
+                    <div class="hot-wallet-address">
+                      <span class="hot-wallet-address-code" title="{{ item.hot_wallet_address }}">{{ item.hot_wallet_address_short }}</span>
+                      <span class="hot-wallet-address-actions">
+                        {% if item.hot_wallet_address %}
+                          <button type="button" class="hot-wallet-copy" data-copy="{{ item.hot_wallet_address }}">复制</button>
+                        {% endif %}
+                        {% if item.explorer_address_url %}
+                          <a class="hot-wallet-row-link" href="{{ item.explorer_address_url }}" target="_blank" rel="noopener">浏览器</a>
+                        {% endif %}
+                      </span>
+                    </div>
+                  </td>
+                  <td class="hot-wallet-amount">
+                    <div class="hot-wallet-safety" data-safety="token" title="预警阈值：{{ item.token_threshold_label }}；最近检测：{{ item.checked_at_label }}">
+                      <div class="hot-wallet-safety-text">
+                        <span class="hot-wallet-safety-value" data-token-balance>{{ item.token_balance_label }}</span>
+                      </div>
+                      <div class="hot-wallet-safety-track"><div class="hot-wallet-safety-fill"></div></div>
+                      <div class="hot-wallet-cell-meta">阈值 <span data-token-threshold>{{ item.token_threshold_label }}</span></div>
+                    </div>
+                  </td>
+                  <td class="hot-wallet-amount">
+                    <div class="hot-wallet-safety" data-safety="gas" title="预警阈值：{{ item.gas_threshold_label }}；最近检测：{{ item.checked_at_label }}">
+                      <div class="hot-wallet-safety-text">
+                        <span class="hot-wallet-safety-value" data-gas-balance>{{ item.gas_balance_label }}</span>
+                      </div>
+                      <div class="hot-wallet-safety-track"><div class="hot-wallet-safety-fill"></div></div>
+                      <div class="hot-wallet-cell-meta">阈值 <span data-gas-threshold>{{ item.gas_threshold_label }}</span></div>
+                    </div>
+                  </td>
+                  <td data-status-cell>
+                    <span class="admin-badge admin-badge-{{ item.status_badge }}" data-status-badge>{{ item.status_label }}</span>
+                    <span class="hot-wallet-error" data-error title="{{ item.error }}" {% if not item.error %}hidden{% endif %}>{{ item.error }}</span>
+                    <div class="hot-wallet-cell-meta">检测 <span data-checked-at>{{ item.checked_at_label }}</span></div>
+                  </td>
+                  <td>
+                    <div class="hot-wallet-actions">
+                      <form method="post" action="/admin/hot-wallets/refresh" data-hot-wallet-refresh-form>
+                        <input type="hidden" name="asset_chain_id" value="{{ item.asset_chain_id }}">
+                        <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                        <input type="hidden" name="chain_key" value="{{ item.chain_key }}">
+                        <input type="hidden" name="symbol" value="{{ item.symbol }}">
+                        <input type="hidden" name="filter_chain_key" value="{{ filters.chain_key or '' }}">
+                        <input type="hidden" name="filter_symbol" value="{{ filters.symbol or '' }}">
+                        <input type="hidden" name="filter_status" value="{{ filters.status or '' }}">
+                        <button type="submit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-refresh-button>刷新余额</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无符合条件的热钱包监控项。</div>
+      {% endif %}
+    </div>
+  </section>
+
+  <script>
+    function hotWalletParseAmount(label) {
+      const text = String(label || "").replace(/,/g, "").trim();
+      const match = text.match(/-?\d+(?:\.\d+)?/);
+      return match ? Number(match[0]) : null;
+    }
+
+    function hotWalletStatus(row) {
+      const badge = row.querySelector("[data-status-badge]");
+      return {
+        label: badge ? badge.textContent.trim() : "",
+        badge: badge ? Array.from(badge.classList).find(function(name) { return name.indexOf("admin-badge-") === 0 && name !== "admin-badge"; }) : ""
+      };
+    }
+
+    function hotWalletStatusKind(label) {
+      if (label === "正常") return "normal";
+      if (label === "读取失败") return "failed";
+      if (label === "未配置") return "unconfigured";
+      if (label === "读取中" || label === "待刷新") return "pending";
+      return "warning";
+    }
+
+    function hotWalletRows() {
+      return Array.from(document.querySelectorAll("[data-hot-wallet-row]"));
+    }
+
+    function hotWalletRowData(row) {
+      const status = hotWalletStatus(row);
+      const tokenLabel = (row.querySelector("[data-token-balance]") || {}).textContent || "-";
+      const gasLabel = (row.querySelector("[data-gas-balance]") || {}).textContent || "-";
+      return {
+        row: row,
+        chainKey: row.dataset.chainKey || "",
+        chainName: row.dataset.chainName || row.dataset.chainKey || "",
+        symbol: row.dataset.symbol || "",
+        addressShort: row.dataset.addressShort || "-",
+        tokenLabel: tokenLabel.trim(),
+        gasLabel: gasLabel.trim(),
+        tokenThresholdLabel: ((row.querySelector("[data-token-threshold]") || {}).textContent || "-").trim(),
+        gasThresholdLabel: ((row.querySelector("[data-gas-threshold]") || {}).textContent || "-").trim(),
+        statusLabel: status.label || "-",
+        statusKind: hotWalletStatusKind(status.label || "")
+      };
+    }
+
+    function hotWalletEscaped(text) {
+      return String(text == null ? "" : text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function updateHotWalletSafety(row) {
+      ["token", "gas"].forEach(function(kind) {
+        const box = row.querySelector("[data-safety='" + kind + "']");
+        if (!box) return;
+        const balanceSelector = kind === "token" ? "[data-token-balance]" : "[data-gas-balance]";
+        const thresholdSelector = kind === "token" ? "[data-token-threshold]" : "[data-gas-threshold]";
+        const balance = hotWalletParseAmount((row.querySelector(balanceSelector) || {}).textContent);
+        const threshold = hotWalletParseAmount((row.querySelector(thresholdSelector) || {}).textContent);
+        let width = 0;
+        let tone = "danger";
+        if (balance === null || threshold === null) {
+          width = 0;
+          tone = "warn";
+        } else if (threshold <= 0) {
+          width = balance > 0 ? 100 : 5;
+          tone = balance > 0 ? "" : "danger";
+        } else {
+          const ratio = balance / threshold;
+          width = Math.max(4, Math.min(100, ratio * 100));
+          tone = ratio < 1 ? "danger" : (ratio < 2 ? "warn" : "");
+        }
+        box.style.setProperty("--safety-width", width + "%");
+        box.classList.toggle("danger", tone === "danger");
+        box.classList.toggle("warn", tone === "warn");
+      });
+    }
+
+    function renderHotWalletRisks() {
+      const list = document.querySelector("[data-risk-list]");
+      if (!list) return;
+      const risks = hotWalletRows()
+        .map(hotWalletRowData)
+        .filter(function(item) { return item.statusLabel !== "正常"; });
+      if (!risks.length) {
+        list.innerHTML = '<div class="hot-wallet-empty">当前无需要处理的热钱包风险</div>';
+        return;
+      }
+      list.innerHTML = risks.map(function(item) {
+        const pendingClass = item.statusKind === "pending" ? " pending" : "";
+        const balance = item.statusLabel === "Gas不足" ? item.gasLabel : item.tokenLabel;
+        return [
+          '<div class="hot-wallet-risk-item' + pendingClass + '">',
+          '<div class="hot-wallet-risk-main">',
+          '<div class="hot-wallet-risk-network">' + hotWalletEscaped(item.chainName) + '</div>',
+          '<div class="hot-wallet-network-key">' + hotWalletEscaped(item.chainKey) + '</div>',
+          '</div>',
+          '<div class="hot-wallet-risk-symbol">' + hotWalletEscaped(item.symbol) + '</div>',
+          '<div>',
+          '<span class="admin-badge admin-badge-' + (item.statusKind === "failed" ? "danger" : "warning") + '">' + hotWalletEscaped(item.statusLabel) + '</span>',
+          '<div class="hot-wallet-risk-balance" title="' + hotWalletEscaped(balance) + '">' + hotWalletEscaped(balance) + '</div>',
+          '</div>',
+          '</div>'
+        ].join("");
+      }).join("");
+    }
+
+    function renderHotWalletNetworks() {
+      const grid = document.querySelector("[data-network-grid]");
+      if (!grid) return;
+      const groups = new Map();
+      hotWalletRows().map(hotWalletRowData).forEach(function(item) {
+        if (!groups.has(item.chainKey)) {
+          groups.set(item.chainKey, {
+            chainKey: item.chainKey,
+            chainName: item.chainName,
+            addressShort: item.addressShort,
+            gasLabel: item.gasLabel,
+            count: 0,
+            risks: 0,
+            hasFailed: false,
+            hasUnconfigured: false,
+            hasPending: false
+          });
+        }
+        const group = groups.get(item.chainKey);
+        group.count += 1;
+        group.gasLabel = item.gasLabel !== "-" ? item.gasLabel : group.gasLabel;
+        if (item.addressShort && item.addressShort !== "-") group.addressShort = item.addressShort;
+        if (item.statusLabel !== "正常") group.risks += 1;
+        if (item.statusKind === "failed") group.hasFailed = true;
+        if (item.statusKind === "unconfigured") group.hasUnconfigured = true;
+        if (item.statusKind === "pending") group.hasPending = true;
+      });
+      if (!groups.size) {
+        grid.innerHTML = '<div class="hot-wallet-empty">暂无网络监控项</div>';
+        return;
+      }
+      grid.innerHTML = Array.from(groups.values()).map(function(group) {
+        let label = "正常";
+        let badge = "success";
+        let cardTone = "";
+        if (group.hasFailed) {
+          label = "读取失败";
+          badge = "danger";
+          cardTone = " danger";
+        } else if (group.hasUnconfigured) {
+          label = "未配置";
+          badge = "warning";
+          cardTone = " warning";
+        } else if (group.risks > 0 || group.hasPending) {
+          label = "预警";
+          badge = "warning";
+          cardTone = " warning";
+        }
+        return [
+          '<div class="hot-wallet-network-card' + cardTone + '">',
+          '<div class="hot-wallet-network-top">',
+          '<div>',
+          '<div class="hot-wallet-network-name">' + hotWalletEscaped(group.chainName) + '</div>',
+          '<div class="hot-wallet-network-key">' + hotWalletEscaped(group.chainKey) + '</div>',
+          '<div class="hot-wallet-network-address" title="' + hotWalletEscaped(group.addressShort) + '">' + hotWalletEscaped(group.addressShort) + '</div>',
+          '</div>',
+          '<span class="admin-badge admin-badge-' + badge + '">' + label + '</span>',
+          '</div>',
+          '<div class="hot-wallet-network-metrics">',
+          '<div><div class="hot-wallet-network-label">Gas余额</div><div class="hot-wallet-network-value">' + hotWalletEscaped(group.gasLabel) + '</div></div>',
+          '<div><div class="hot-wallet-network-label">币种数量</div><div class="hot-wallet-network-value">' + group.count + '</div></div>',
+          '<div><div class="hot-wallet-network-label">风险数量</div><div class="hot-wallet-network-value">' + group.risks + '</div></div>',
+          '</div>',
+          '</div>'
+        ].join("");
+      }).join("");
+    }
+
+    function renderHotWalletDashboard() {
+      hotWalletRows().forEach(updateHotWalletSafety);
+      renderHotWalletRisks();
+      renderHotWalletNetworks();
+    }
+
+    function setHotWalletBadge(row, label, badge) {
+      const badgeEl = row.querySelector("[data-status-badge]");
+      if (!badgeEl) return;
+      badgeEl.className = "admin-badge admin-badge-" + (badge || "neutral");
+      badgeEl.textContent = label || "-";
+    }
+
+    function setHotWalletError(row, message) {
+      const errorEl = row.querySelector("[data-error]");
+      if (!errorEl) return;
+      const text = message || "";
+      errorEl.textContent = text;
+      errorEl.title = text;
+      errorEl.hidden = !text;
+    }
+
+    function updateHotWalletRow(row, item) {
+      if (!row || !item) return;
+      const tokenEl = row.querySelector("[data-token-balance]");
+      const gasEl = row.querySelector("[data-gas-balance]");
+      const tokenThresholdEl = row.querySelector("[data-token-threshold]");
+      const gasThresholdEl = row.querySelector("[data-gas-threshold]");
+      const checkedAtEl = row.querySelector("[data-checked-at]");
+      if (tokenEl) tokenEl.textContent = item.token_balance_label || "-";
+      if (gasEl) gasEl.textContent = item.gas_balance_label || "-";
+      if (tokenThresholdEl) tokenThresholdEl.textContent = item.token_threshold_label || "-";
+      if (gasThresholdEl) gasThresholdEl.textContent = item.gas_threshold_label || "-";
+      if (checkedAtEl) checkedAtEl.textContent = item.checked_at_label || "-";
+      row.dataset.tokenThresholdLabel = item.token_threshold_label || "-";
+      row.dataset.gasThresholdLabel = item.gas_threshold_label || "-";
+      row.dataset.checkedAtLabel = item.checked_at_label || "-";
+      const tokenSafety = row.querySelector("[data-safety='token']");
+      const gasSafety = row.querySelector("[data-safety='gas']");
+      if (tokenSafety) tokenSafety.title = "预警阈值：" + (item.token_threshold_label || "-") + "；最近检测：" + (item.checked_at_label || "-");
+      if (gasSafety) gasSafety.title = "预警阈值：" + (item.gas_threshold_label || "-") + "；最近检测：" + (item.checked_at_label || "-");
+      setHotWalletBadge(row, item.status_label || "-", item.status_badge || "neutral");
+      setHotWalletError(row, item.error || "");
+      row.dataset.needsRefresh = item.needs_refresh ? "1" : "0";
+      updateHotWalletSafety(row);
+      renderHotWalletDashboard();
+    }
+
+    function setHotWalletReading(row, reading) {
+      const button = row.querySelector("[data-refresh-button]");
+      if (button) {
+        button.disabled = reading;
+        button.textContent = reading ? "读取中" : "刷新余额";
+      }
+      if (reading) {
+        setHotWalletBadge(row, "读取中", "info");
+        setHotWalletError(row, "");
+      }
+      row.dataset.refreshing = reading ? "1" : "0";
+      renderHotWalletDashboard();
+    }
+
+    async function refreshHotWalletRow(row) {
+      if (!row || row.dataset.refreshing === "1") return;
+      const form = row.querySelector("[data-hot-wallet-refresh-form]");
+      if (!form) return;
+      setHotWalletReading(row, true);
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(function() {
+        controller.abort();
+      }, 12000);
+      try {
+        const response = await fetch(form.action, {
+          method: "POST",
+          body: new FormData(form),
+          headers: {
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest"
+          },
+          signal: controller.signal
+        });
+        const payload = await response.json();
+        if (payload && payload.item) {
+          updateHotWalletRow(row, payload.item);
+        } else {
+          setHotWalletBadge(row, "读取失败", "danger");
+          setHotWalletError(row, (payload && payload.error) || "刷新失败");
+        }
+      } catch (error) {
+        setHotWalletBadge(row, "读取失败", "danger");
+        setHotWalletError(row, error && error.name === "AbortError" ? "刷新超时" : "刷新失败");
+      } finally {
+        window.clearTimeout(timeoutId);
+        setHotWalletReading(row, false);
+      }
+    }
+
+    function startHotWalletAutoRefresh() {
+      const queue = Array.from(document.querySelectorAll("[data-hot-wallet-row][data-needs-refresh='1']"));
+      refreshHotWalletQueue(queue);
+    }
+
+    function refreshHotWalletQueue(queue, done) {
+      const maxConcurrent = 2;
+      let active = 0;
+      let index = 0;
+      const rows = Array.from(queue || []);
+      function pump() {
+        while (active < maxConcurrent && index < rows.length) {
+          const row = rows[index++];
+          active += 1;
+          refreshHotWalletRow(row).finally(function() {
+            active -= 1;
+            pump();
+          });
+        }
+        if (active === 0 && index >= rows.length && typeof done === "function") {
+          done();
+        }
+      }
+      pump();
+    }
+
+    function refreshAllHotWalletRows() {
+      const button = document.querySelector("[data-refresh-all]");
+      const rows = hotWalletRows();
+      if (!rows.length) return;
+      if (button) {
+        button.disabled = true;
+        button.textContent = "刷新中";
+      }
+      refreshHotWalletQueue(rows, function() {
+        if (button) {
+          button.disabled = false;
+          button.textContent = "刷新全部";
+        }
+      });
+    }
+
+    document.addEventListener("submit", function(event) {
+      const form = event.target.closest("[data-hot-wallet-refresh-form]");
+      if (!form) return;
+      event.preventDefault();
+      const row = form.closest("[data-hot-wallet-row]");
+      refreshHotWalletRow(row);
+    });
+
+    document.addEventListener("click", async function(event) {
+      const refreshAllButton = event.target.closest("[data-refresh-all]");
+      if (refreshAllButton) {
+        refreshAllHotWalletRows();
+        return;
+      }
+      const button = event.target.closest("[data-copy]");
+      if (!button) return;
+      const value = button.getAttribute("data-copy") || "";
+      if (!value) return;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(value);
+        }
+        button.textContent = "已复制";
+        window.setTimeout(function() {
+          button.textContent = "复制";
+        }, 1200);
+      } catch (error) {
+        button.textContent = "复制失败";
+        window.setTimeout(function() {
+          button.textContent = "复制";
+        }, 1200);
+      }
+    });
+
+    document.addEventListener("DOMContentLoaded", startHotWalletAutoRefresh);
+    document.addEventListener("DOMContentLoaded", renderHotWalletDashboard);
+  </script>
+{% endblock %}

@@ -1,0 +1,75 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+id_rsa*
+id_ed25519*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+.venv*/
+venv/
+env/
+
+# Node / frontend
+node_modules/
+.npm-cache/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+.next/
+.next.*/
+out/
+build/
+coverage/
+next-env.d.ts
+*.tsbuildinfo
+
+# Logs and runtime data
+*.log
+*.err.log
+*.out.log
+logs/
+*.pid
+*.sqlite
+*.sqlite3
+*.db
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local artifacts, archives, and temporary work
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+.tmp*/
+tmp.py
+tmp2.py
+*-diff.txt
+next
+ffmpeg-*-essentials_build/

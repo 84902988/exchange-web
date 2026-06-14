@@ -1,0 +1,141 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}公告管理{% endblock %}
+{% block page_title %}公告管理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">维护首页最新公告。置顶公告会优先显示。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/announcements/new" class="btn admin-btn admin-btn-primary">新增公告</a>
+{% endblock %}
+
+{% block content %}
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+  {% set announcement_status_labels = {'DRAFT': '草稿', 'PUBLISHED': '已发布', 'DISABLED': '禁用', 'OFFLINE': '已下线', 'ARCHIVED': '已下线'} %}
+  {% set announcement_status_badges = {'DRAFT': 'secondary', 'PUBLISHED': 'success', 'DISABLED': 'secondary', 'OFFLINE': 'secondary', 'ARCHIVED': 'secondary'} %}
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card"><div class="section-title">操作结果</div><p class="muted">{{ notice }}</p></div>
+    </section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section">
+      <div class="card"><div class="section-title">提示信息</div><p class="muted">{{ error }}</p></div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="admin-alert admin-alert-warning">公告状态会影响前台信息展示，启用、禁用或置顶前请确认运营内容和发布时间。</div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/announcements" class="filter-form">
+        <div class="field">
+          <label for="keyword">标题 / slug</label>
+          <input id="keyword" name="keyword" type="text" value="{{ filters.keyword or '' }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="PUBLISHED" {% if filters.status == 'PUBLISHED' %}selected{% endif %}>已发布</option>
+            <option value="DISABLED" {% if filters.status == 'DISABLED' %}selected{% endif %}>禁用</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="category">分类</label>
+          <select id="category" name="category">
+            <option value="">全部</option>
+            {% for option in category_options %}
+              <option value="{{ option.value }}" {% if filters.category == option.value %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/announcements" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">公告列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>标题</th>
+                <th>分类</th>
+                <th>slug</th>
+                <th>摘要</th>
+                <th>置顶</th>
+                <th>状态</th>
+                <th>翻译</th>
+                <th>发布时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.id }}</td>
+                  <td>{{ item.title }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.category_badge }}">{{ item.category_label or '-' }}</span></td>
+                  <td class="admin-id">{{ item.slug }}</td>
+                  <td>{{ item.summary or '-' }}</td>
+                  <td>{% if item.is_pinned %}<span class="admin-badge admin-badge-brand">置顶</span>{% else %}-{% endif %}</td>
+                  <td><span class="admin-badge admin-badge-{{ announcement_status_badges.get(item.status, 'secondary') }}" title="{{ item.status }}">{{ announcement_status_labels.get(item.status, item.status_label) }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ 'success' if item.i18n_complete_count == item.i18n_total_count else 'secondary' }}" title="{{ item.i18n_missing_locales|join(', ') }}">{{ item.i18n_status_label or '0/4' }}</span></td>
+                  <td class="nowrap admin-time">{{ item.publish_at_admin or '-' }}</td>
+                  <td>
+                    <div class="filter-actions admin-table-actions">
+                      <a href="/admin/announcements/{{ item.id }}/edit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">编辑</a>
+                      <form
+                        method="post"
+                        action="/admin/announcements/{{ item.id }}/toggle-status"
+                        onsubmit="return confirm('{% if item.status == 'PUBLISHED' %}确认禁用该公告？禁用后前台将不再展示。{% else %}确认启用该公告？启用后前台可能立即展示。{% endif %}');"
+                      >
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn {% if item.status == 'PUBLISHED' %}danger admin-btn-danger{% else %}admin-btn-primary{% endif %} admin-btn admin-btn-sm">
+                          {% if item.status == 'PUBLISHED' %}禁用{% else %}启用{% endif %}
+                        </button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无数据</div>
+          <p class="admin-empty-desc">当前筛选条件下暂无记录，可调整筛选条件后重试</p>
+        </div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

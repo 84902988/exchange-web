@@ -1,0 +1,750 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}KYC审核{% endblock %}
+{% block page_title %}KYC审核{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看用户提交的身份认证资料，并进行通过或拒绝审核。</div>
+{% endblock %}
+
+{% block content %}
+  {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+
+  <style>
+    .kyc-tabs{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .kyc-tab{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      min-height:38px;
+      padding:0 14px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(255,255,255,.045);
+      color:rgba(255,255,255,.78);
+      font-size:13px;
+      font-weight:800;
+      white-space:nowrap;
+    }
+    .kyc-tab:hover{
+      text-decoration:none;
+      border-color:rgba(227,171,57,.30);
+      background:rgba(189,134,25,.10);
+      color:#fff;
+    }
+    .kyc-tab.active{
+      border-color:rgba(189,52,25,.48);
+      background:rgba(189,52,25,.18);
+      color:#ffc1b4;
+      box-shadow:0 0 0 3px rgba(189,52,25,.08);
+    }
+    .kyc-tab-count{
+      color:rgba(255,255,255,.58);
+      font-size:12px;
+      font-weight:900;
+    }
+    .kyc-tab.active .kyc-tab-count{
+      color:#ffd3ca;
+    }
+    .kyc-filter-form{
+      grid-template-columns:96px 116px 112px 136px 132px 132px auto;
+      gap:10px;
+    }
+    .kyc-filter-form .field input,
+    .kyc-filter-form .field select{
+      min-height:38px;
+      padding:8px 10px;
+    }
+    .kyc-table{
+      min-width:0;
+      table-layout:fixed;
+    }
+    .kyc-col-user{ width:19%; }
+    .kyc-col-doc{ width:32%; }
+    .kyc-col-status{ width:16%; }
+    .kyc-col-time{ width:17%; }
+    .kyc-col-action{ width:16%; }
+    .kyc-cell-main{
+      min-width:0;
+      color:#fff;
+      font-weight:800;
+      line-height:1.35;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .kyc-cell-sub{
+      min-width:0;
+      margin-top:4px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.35;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .kyc-cell-sub.mono{
+      display:block;
+      word-break:normal;
+    }
+    .kyc-doc-number{
+      display:inline-block;
+      max-width:100%;
+      padding:0;
+      border:0;
+      background:transparent;
+      color:rgba(255,255,255,.76);
+      cursor:pointer;
+      font-family:Consolas, "SFMono-Regular", "Liberation Mono", monospace;
+      font-size:12px;
+      font-variant-numeric:tabular-nums;
+      font-feature-settings:"tnum" 1;
+      letter-spacing:.02em;
+      line-height:1.35;
+      overflow:hidden;
+      text-align:left;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .kyc-doc-number:hover{
+      color:#fff;
+      text-decoration:underline;
+      text-underline-offset:3px;
+    }
+    .kyc-copy-toast{
+      position:fixed;
+      top:72px;
+      right:22px;
+      z-index:1200;
+      padding:9px 12px;
+      border:1px solid rgba(49,177,119,.32);
+      border-radius:10px;
+      background:rgba(31,122,85,.94);
+      color:#d7ffe9;
+      font-size:13px;
+      font-weight:800;
+      line-height:1;
+      box-shadow:0 12px 32px rgba(0,0,0,.34);
+      opacity:0;
+      transform:translateY(-6px);
+      pointer-events:none;
+      transition:opacity .16s ease, transform .16s ease;
+    }
+    .kyc-copy-toast.is-visible{
+      opacity:1;
+      transform:translateY(0);
+    }
+    .kyc-status-stack{
+      min-width:0;
+      display:grid;
+      gap:5px;
+    }
+    .kyc-reject-note{
+      min-width:0;
+      color:rgba(255,255,255,.72);
+      font-size:12px;
+      line-height:1.35;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .kyc-image-links{
+      display:flex;
+      gap:6px;
+      flex-wrap:nowrap;
+      max-width:none;
+    }
+    .kyc-image-links .admin-btn,
+    .kyc-image-links .kyc-upload-missing{
+      min-width:48px;
+      min-height:28px;
+      border-radius:8px;
+      padding:0 8px;
+      font-size:12px;
+      white-space:nowrap;
+    }
+    .kyc-upload-missing{
+      color:rgba(255,255,255,.52);
+    }
+    .kyc-actions{
+      display:flex;
+      align-items:flex-start;
+      gap:6px;
+      flex-wrap:wrap;
+    }
+    .kyc-action-form{
+      display:inline-flex;
+      gap:6px;
+      align-items:center;
+      flex-wrap:nowrap;
+      margin:0;
+    }
+    .kyc-danger-btn{
+      background:rgba(177,52,52,.22);
+      border-color:rgba(216,89,89,.34);
+      color:#ffb4b4;
+    }
+    .kyc-notice-card{
+      border-color:rgba(49,177,119,.26);
+      background:rgba(31,122,85,.10);
+    }
+    .kyc-error-card{
+      border-color:rgba(216,89,89,.30);
+      background:rgba(177,52,52,.12);
+    }
+    .kyc-preview-modal[hidden]{
+      display:none;
+    }
+    .kyc-preview-modal{
+      position:fixed;
+      inset:0;
+      z-index:1000;
+      display:grid;
+      place-items:center;
+      padding:20px;
+      background:rgba(0,0,0,.74);
+      backdrop-filter:blur(8px);
+    }
+    .kyc-preview-dialog{
+      width:min(96vw, 1120px);
+      max-height:92vh;
+      display:grid;
+      grid-template-rows:auto minmax(0, 1fr) auto;
+      gap:14px;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:16px;
+      background:linear-gradient(180deg, rgba(24,25,32,.98), rgba(13,14,20,.98));
+      box-shadow:0 24px 70px rgba(0,0,0,.52);
+      padding:16px;
+    }
+    .kyc-preview-head{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+    }
+    .kyc-preview-title{
+      min-width:0;
+      color:#fff;
+      font-size:16px;
+      font-weight:900;
+      line-height:1.35;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .kyc-preview-close{
+      width:32px;
+      height:32px;
+      flex:0 0 auto;
+      border-radius:9px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.04);
+      color:var(--text);
+      cursor:pointer;
+      font-size:18px;
+      line-height:1;
+    }
+    .kyc-preview-body{
+      min-height:220px;
+      display:grid;
+      place-items:center;
+      overflow:auto;
+      border-radius:12px;
+      background:rgba(0,0,0,.28);
+    }
+    .kyc-preview-image{
+      display:block;
+      max-width:90vw;
+      max-height:80vh;
+      object-fit:contain;
+    }
+    .kyc-preview-foot{
+      display:flex;
+      justify-content:flex-end;
+    }
+    .kyc-reject-modal[hidden]{
+      display:none;
+    }
+    .kyc-reject-modal{
+      position:fixed;
+      inset:0;
+      z-index:1000;
+      display:grid;
+      place-items:center;
+      padding:20px;
+      background:rgba(0,0,0,.68);
+      backdrop-filter:blur(8px);
+    }
+    .kyc-reject-dialog{
+      width:min(520px, 100%);
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:16px;
+      background:linear-gradient(180deg, rgba(24,25,32,.98), rgba(13,14,20,.98));
+      box-shadow:0 24px 70px rgba(0,0,0,.52);
+      padding:18px;
+    }
+    .kyc-reject-head{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:14px;
+    }
+    .kyc-reject-title{
+      color:#fff;
+      font-size:17px;
+      font-weight:900;
+    }
+    .kyc-reject-subtitle{
+      margin-top:5px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .kyc-reject-close{
+      width:32px;
+      height:32px;
+      border-radius:9px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.04);
+      color:var(--text);
+      cursor:pointer;
+      font-size:18px;
+      line-height:1;
+    }
+    .kyc-reject-form{
+      display:grid;
+      gap:12px;
+    }
+    .kyc-reject-actions{
+      display:flex;
+      justify-content:flex-end;
+      gap:10px;
+    }
+    @media (max-width: 1280px){
+      .kyc-filter-form{
+        grid-template-columns:repeat(4, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 860px){
+      .kyc-table{
+        min-width:760px;
+      }
+      .kyc-filter-form{
+        grid-template-columns:repeat(2, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 720px){
+      .kyc-filter-form{
+        grid-template-columns:1fr;
+      }
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card admin-card kyc-notice-card">
+        <div class="section-title">操作成功</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card admin-card kyc-error-card">
+        <div class="section-title">操作提示</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="card admin-card">
+      <div class="kyc-tabs">
+        <a
+          href="{{ request.url.include_query_params(tab='pending', page=1, status='') }}"
+          class="kyc-tab {% if active_tab == 'pending' %}active{% endif %}"
+        >当前审核 <span class="kyc-tab-count">({{ tab_counts.pending }})</span></a>
+        <a
+          href="{{ request.url.include_query_params(tab='approved', page=1, status='') }}"
+          class="kyc-tab {% if active_tab == 'approved' %}active{% endif %}"
+        >已通过 <span class="kyc-tab-count">({{ tab_counts.approved }})</span></a>
+        <a
+          href="{{ request.url.include_query_params(tab='rejected', page=1, status='') }}"
+          class="kyc-tab {% if active_tab == 'rejected' %}active{% endif %}"
+        >已拒绝 <span class="kyc-tab-count">({{ tab_counts.rejected }})</span></a>
+        <a
+          href="{{ request.url.include_query_params(tab='all', page=1, status='') }}"
+          class="kyc-tab {% if active_tab == 'all' %}active{% endif %}"
+        >全部 <span class="kyc-tab-count">({{ tab_counts.all }})</span></a>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card admin-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/kyc/submissions" class="filter-form kyc-filter-form">
+        <input type="hidden" name="tab" value="{{ active_tab }}" />
+        <div class="field">
+          <label for="user_id">用户ID</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status" {% if status_filter_disabled %}disabled{% endif %}>
+            <option value="" {% if not filters.status %}selected{% endif %}>全部</option>
+            <option value="PENDING" {% if filters.status == 'PENDING' %}selected{% endif %}>待审核</option>
+            <option value="APPROVED" {% if filters.status == 'APPROVED' %}selected{% endif %}>已通过</option>
+            <option value="REJECTED" {% if filters.status == 'REJECTED' %}selected{% endif %}>已拒绝</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="country_code">国家/地区</label>
+          <input id="country_code" type="text" name="country_code" value="{{ filters.country_code or '' }}" placeholder="CN / US" />
+        </div>
+        <div class="field">
+          <label for="id_type">证件类型</label>
+          <select id="id_type" name="id_type">
+            <option value="" {% if not filters.id_type %}selected{% endif %}>全部</option>
+            <option value="ID_CARD" {% if filters.id_type == 'ID_CARD' %}selected{% endif %}>身份证/证件</option>
+            <option value="PASSPORT" {% if filters.id_type == 'PASSPORT' %}selected{% endif %}>护照</option>
+            <option value="DRIVER_LICENSE" {% if filters.id_type == 'DRIVER_LICENSE' %}selected{% endif %}>驾照</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="created_from">提交开始</label>
+          <input id="created_from" type="date" name="created_from" value="{{ filters.created_from or '' }}" />
+        </div>
+        <div class="field">
+          <label for="created_to">提交结束</label>
+          <input id="created_to" type="date" name="created_to" value="{{ filters.created_to or '' }}" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/kyc/submissions?tab=pending" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card admin-card">
+      <div class="section-title">KYC提交列表</div>
+
+      {% if items %}
+        {% set id_type_labels = {'ID_CARD': '身份证/证件', 'PASSPORT': '护照', 'DRIVER_LICENSE': '驾照'} %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table kyc-table">
+            <colgroup>
+              <col class="kyc-col-user" />
+              <col class="kyc-col-doc" />
+              <col class="kyc-col-status" />
+              <col class="kyc-col-time" />
+              <col class="kyc-col-action" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>用户</th>
+                <th>证件</th>
+                <th>状态</th>
+                <th>时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                {% set doc_number = item.id_number or '' %}
+                <tr>
+                  <td>
+                    <div class="kyc-cell-main">用户ID {{ item.user_id }}</div>
+                    <div class="kyc-cell-sub" title="{{ item.full_name }}">{{ item.full_name or '-' }}</div>
+                  </td>
+                  <td>
+                    <div class="kyc-cell-main">{{ item.country_code or '-' }} · {{ id_type_labels.get(item.id_type, item.id_type or '-') }}</div>
+                    <div class="kyc-cell-sub mono">
+                      {% if doc_number %}
+                        <button
+                          type="button"
+                          class="kyc-doc-number"
+                          title="{{ doc_number }}"
+                          data-full-id="{{ doc_number }}"
+                          data-copy-id-number
+                        >{{ doc_number }}</button>
+                      {% else %}
+                        <span class="kyc-doc-number">-</span>
+                      {% endif %}
+                    </div>
+                  </td>
+                  <td>
+                    <div class="kyc-status-stack">
+                      <span><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></span>
+                      {% if item.review_status == 'REJECTED' and item.review_note and item.review_note != '-' %}
+                        <div class="kyc-reject-note" title="{{ item.review_note }}">{{ item.review_note }}</div>
+                      {% endif %}
+                    </div>
+                  </td>
+                  <td>
+                    <div class="kyc-cell-main admin-time">{{ item.created_at }}</div>
+                    <div class="kyc-cell-sub admin-time">{{ item.reviewed_at }}</div>
+                  </td>
+                  <td>
+                    <div class="kyc-actions">
+                      <div class="kyc-image-links">
+                        {% if item.front_image_url %}
+                          <button
+                            type="button"
+                            class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+                            data-kyc-image-preview
+                            data-image-url="{{ item.front_image_url }}"
+                            data-image-label="正面"
+                          >正面</button>
+                        {% else %}
+                          <span class="admin-badge admin-badge-secondary kyc-upload-missing">未上传</span>
+                        {% endif %}
+                        {% if item.back_image_url %}
+                          <button
+                            type="button"
+                            class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+                            data-kyc-image-preview
+                            data-image-url="{{ item.back_image_url }}"
+                            data-image-label="反面"
+                          >反面</button>
+                        {% else %}
+                          <span class="admin-badge admin-badge-secondary kyc-upload-missing">未上传</span>
+                        {% endif %}
+                        {% if item.selfie_image_url %}
+                          <button
+                            type="button"
+                            class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+                            data-kyc-image-preview
+                            data-image-url="{{ item.selfie_image_url }}"
+                            data-image-label="自拍"
+                          >自拍</button>
+                        {% else %}
+                          <span class="admin-badge admin-badge-secondary kyc-upload-missing">未上传</span>
+                        {% endif %}
+                      </div>
+
+                      {% if item.can_review %}
+                        <form method="post" action="/admin/kyc/{{ item.id }}/approve" class="kyc-action-form" onsubmit="return confirm('确认通过该用户的 KYC 审核？');">
+                          <input type="hidden" name="next_path" value="{{ current_url }}" />
+                          <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">通过</button>
+                        </form>
+                        <button
+                          type="button"
+                          class="btn secondary admin-btn admin-btn-secondary admin-btn-sm kyc-danger-btn"
+                          data-kyc-reject
+                          data-submission-id="{{ item.id }}"
+                        >拒绝</button>
+                      {% endif %}
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无数据</div>
+          <p class="admin-empty-desc">当前筛选条件下暂无 KYC 记录</p>
+        </div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">首页</a>
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+            <a href="{{ request.url.include_query_params(page=pagination.pages, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">尾页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="kyc-copy-toast" data-copy-toast hidden>证件号码已复制</div>
+
+  <div class="kyc-preview-modal" data-kyc-preview-modal hidden>
+    <div class="kyc-preview-dialog">
+      <div class="kyc-preview-head">
+        <div class="kyc-preview-title" data-kyc-preview-title>KYC 图片预览</div>
+        <button type="button" class="kyc-preview-close" data-kyc-preview-close aria-label="关闭">×</button>
+      </div>
+      <div class="kyc-preview-body">
+        <img class="kyc-preview-image" data-kyc-preview-image src="" alt="KYC 图片预览" />
+      </div>
+      <div class="kyc-preview-foot">
+        <a class="admin-btn admin-btn-secondary admin-btn-sm" data-kyc-preview-open href="#" target="_blank" rel="noopener">新窗口打开</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="kyc-reject-modal" data-kyc-reject-modal hidden>
+    <div class="kyc-reject-dialog">
+      <div class="kyc-reject-head">
+        <div>
+          <div class="kyc-reject-title">拒绝 KYC 审核</div>
+          <div class="kyc-reject-subtitle">请填写拒绝原因，提交后会保存到该 KYC 记录。</div>
+        </div>
+        <button type="button" class="kyc-reject-close" data-kyc-reject-close aria-label="关闭">×</button>
+      </div>
+      <form method="post" action="" class="kyc-reject-form" data-kyc-reject-form>
+        <input type="hidden" name="next_path" value="{{ current_url }}" />
+        <div class="field">
+          <label for="kyc-reject-note">拒绝原因</label>
+          <textarea id="kyc-reject-note" name="review_note" required placeholder="请输入拒绝原因"></textarea>
+        </div>
+        <div class="kyc-reject-actions">
+          <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-kyc-reject-close>取消</button>
+          <button type="submit" class="btn secondary admin-btn admin-btn-secondary kyc-danger-btn">确认拒绝</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const toast = document.querySelector("[data-copy-toast]");
+      let toastTimer = null;
+
+      const showToast = () => {
+        if (!toast) return;
+        toast.hidden = false;
+        window.requestAnimationFrame(() => {
+          toast.classList.add("is-visible");
+        });
+        window.clearTimeout(toastTimer);
+        toastTimer = window.setTimeout(() => {
+          toast.classList.remove("is-visible");
+          window.setTimeout(() => {
+            toast.hidden = true;
+          }, 180);
+        }, 1400);
+      };
+
+      const fallbackCopy = (text) => {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        textarea.style.top = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand("copy");
+        } finally {
+          textarea.remove();
+        }
+      };
+
+      const copyText = async (text) => {
+        if (!text) return;
+        if (navigator.clipboard && window.isSecureContext) {
+          try {
+            await navigator.clipboard.writeText(text);
+            showToast();
+            return;
+          } catch (error) {
+            fallbackCopy(text);
+            showToast();
+            return;
+          }
+        }
+        fallbackCopy(text);
+        showToast();
+      };
+
+      document.querySelectorAll("[data-copy-id-number]").forEach((button) => {
+        button.addEventListener("click", () => {
+          copyText(button.getAttribute("data-full-id") || "");
+        });
+      });
+    })();
+
+    (() => {
+      const modal = document.querySelector("[data-kyc-preview-modal]");
+      const title = document.querySelector("[data-kyc-preview-title]");
+      const image = document.querySelector("[data-kyc-preview-image]");
+      const openLink = document.querySelector("[data-kyc-preview-open]");
+      if (!modal || !title || !image || !openLink) return;
+
+      const closeModal = () => {
+        modal.hidden = true;
+        image.removeAttribute("src");
+        openLink.setAttribute("href", "#");
+      };
+
+      document.querySelectorAll("[data-kyc-image-preview]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const imageUrl = button.getAttribute("data-image-url") || "";
+          const imageLabel = button.getAttribute("data-image-label") || "";
+          if (!imageUrl) return;
+          title.textContent = `KYC 图片预览 - ${imageLabel || "图片"}`;
+          image.setAttribute("src", imageUrl);
+          image.setAttribute("alt", `KYC 图片预览 - ${imageLabel || "图片"}`);
+          openLink.setAttribute("href", imageUrl);
+          modal.hidden = false;
+        });
+      });
+
+      document.querySelectorAll("[data-kyc-preview-close]").forEach((button) => {
+        button.addEventListener("click", closeModal);
+      });
+
+      modal.addEventListener("click", (event) => {
+        if (event.target === modal) closeModal();
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !modal.hidden) closeModal();
+      });
+    })();
+
+    (() => {
+      const modal = document.querySelector("[data-kyc-reject-modal]");
+      const form = document.querySelector("[data-kyc-reject-form]");
+      const note = document.querySelector("#kyc-reject-note");
+      if (!modal || !form || !note) return;
+
+      const closeModal = () => {
+        modal.hidden = true;
+        form.setAttribute("action", "");
+        note.value = "";
+      };
+
+      document.querySelectorAll("[data-kyc-reject]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const submissionId = button.getAttribute("data-submission-id");
+          if (!submissionId) return;
+          form.setAttribute("action", `/admin/kyc/${submissionId}/reject`);
+          modal.hidden = false;
+          note.focus();
+        });
+      });
+
+      document.querySelectorAll("[data-kyc-reject-close]").forEach((button) => {
+        button.addEventListener("click", closeModal);
+      });
+
+      modal.addEventListener("click", (event) => {
+        if (event.target === modal) closeModal();
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !modal.hidden) closeModal();
+      });
+    })();
+  </script>
+{% endblock %}

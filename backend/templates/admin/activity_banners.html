@@ -1,0 +1,125 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}活动 Banner{% endblock %}
+{% block page_title %}活动 Banner{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">配置活动中心顶部轮播，支持图片或视频 URL。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/activity-banners/new" class="btn admin-btn admin-btn-primary">新增 Banner</a>
+  <a href="/admin/activities" class="btn secondary admin-btn admin-btn-secondary">活动列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .banner-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .banner-actions form{margin:0}
+    .ops-link{display:inline-block;max-width:150px;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;white-space:nowrap}
+    .btn.danger{border:1px solid rgba(248,113,113,.45);background:rgba(127,29,29,.12);color:#fecaca}
+    .btn.danger:hover{border-color:rgba(248,113,113,.72);background:rgba(127,29,29,.22)}
+  </style>
+
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+
+  {% if notice %}
+    <section class="page-section"><div class="card"><div class="section-title">操作结果</div><p class="muted">{{ notice }}</p></div></section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section"><div class="card"><div class="section-title">提示信息</div><p class="muted">{{ error }}</p></div></section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/activity-banners" class="filter-form">
+        <div class="field">
+          <label for="keyword">标题</label>
+          <input id="keyword" name="keyword" type="text" value="{{ filters.keyword or '' }}" />
+        </div>
+        <div class="field">
+          <label for="enabled">状态</label>
+          <select id="enabled" name="enabled">
+            <option value="">全部</option>
+            <option value="1" {% if filters.enabled == '1' %}selected{% endif %}>启用</option>
+            <option value="0" {% if filters.enabled == '0' %}selected{% endif %}>禁用</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/activity-banners" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">Banner 列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>标题</th>
+                <th>副标题</th>
+                <th>类型</th>
+                <th>媒体 URL</th>
+                <th>链接</th>
+                <th class="text-right">排序</th>
+                <th>状态</th>
+                <th>翻译</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.id }}</td>
+                  <td>{{ item.title }}</td>
+                  <td>{{ item.subtitle or '-' }}</td>
+                  <td>{{ '视频' if item.media_type == 'video' else '图片' }}</td>
+                  <td>
+                    {% if item.media_url %}
+                      <a class="ops-link admin-id" href="{{ item.media_url }}" target="_blank" rel="noopener" title="{{ item.media_url }}">{{ '查看视频' if item.media_type == 'video' else '查看图片' }}</a>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
+                  <td>
+                    {% if item.link_url %}
+                      <a class="ops-link admin-id" href="{{ item.link_url }}" target="_blank" rel="noopener" title="{{ item.link_url }}">打开链接</a>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
+                  <td class="text-right admin-number">{{ item.sort_order }}</td>
+                  <td><span class="admin-badge admin-badge-{{ 'secondary' if item.status_badge in ['neutral', 'muted'] else item.status_badge }}" title="{{ item.enabled }}">{{ item.status_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ 'success' if item.i18n_complete_count == item.i18n_total_count else 'secondary' }}" title="{{ item.i18n_missing_locales|join(', ') }}">{{ item.i18n_status_label or '0/4' }}</span></td>
+                  <td>
+                    <div class="banner-actions admin-table-actions">
+                      <a href="/admin/activity-banners/{{ item.id }}/edit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">编辑</a>
+                      <form method="post" action="/admin/activity-banners/{{ item.id }}/toggle-enabled">
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn {% if item.enabled %}danger admin-btn-danger{% else %}admin-btn-primary{% endif %} admin-btn admin-btn-sm">{% if item.enabled %}禁用{% else %}启用{% endif %}</button>
+                      </form>
+                      <form method="post" action="/admin/activity-banners/{{ item.id }}/delete" onsubmit="return confirm('确定删除该 Banner 吗？');">
+                        <button type="submit" class="btn danger admin-btn admin-btn-danger admin-btn-sm">删除</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无活动 Banner</div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

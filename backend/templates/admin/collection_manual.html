@@ -1,0 +1,165 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}手动归集{% endblock %}
+{% block page_title %}手动归集{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">按网络扫描充值地址余额并创建归集任务。创建任务不代表已链上发送，实际发送由 collection RQ worker 执行。</div>
+{% endblock %}
+
+{% block content %}
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">安全说明</div>
+      <p class="muted">创建归集任务只生成 PENDING 任务；真实链上发送仍受环境开关、链白名单、目标地址白名单、单笔上限、日限额、归集地址、热钱包和 Gas 检查约束。</p>
+      {% if collection_address_missing %}
+        <p class="muted"><strong>当前网络未配置归集地址，禁止创建真实归集任务。</strong></p>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作结果</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作提示</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">扫描条件</div>
+      <form method="get" action="/admin/collection/manual" class="filter-form">
+        <div class="field">
+          <label for="chain_key">网络</label>
+          <select id="chain_key" name="chain_key">
+            {% for chain in chains %}
+              <option value="{{ chain.chain_key }}" {% if filters.chain_key == chain.chain_key %}selected{% endif %}>
+                {{ chain.name }} / {{ chain.chain_key }}
+              </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="asset_symbol">币种</label>
+          <select id="asset_symbol" name="asset_symbol">
+            {% for asset in assets %}
+              <option value="{{ asset.symbol }}" {% if filters.asset_symbol == asset.symbol %}selected{% endif %}>
+                {{ asset.symbol }}{% if asset.name %} / {{ asset.name }}{% endif %}
+              </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="min_amount">最小归集金额</label>
+          <input id="min_amount" name="min_amount" value="{{ filters.min_amount or '' }}" placeholder="{{ filters.default_min_amount or '10' }}" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn secondary admin-btn admin-btn-secondary">刷新条件</button>
+          <a href="/admin/collection/manual" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+
+      <div class="admin-table-actions" style="margin-top:12px;">
+        <form method="post" action="/admin/collection/manual/create" onsubmit="return confirm('确认创建归集任务？此操作不会直接链上发送，实际发送由 collection RQ worker 执行。');">
+          <input type="hidden" name="chain_key" value="{{ filters.chain_key }}" />
+          <input type="hidden" name="asset_symbol" value="{{ filters.asset_symbol }}" />
+          <input type="hidden" name="min_amount" value="{{ filters.min_amount }}" />
+          <input type="text" name="confirm_text" placeholder="COLLECT" autocomplete="off" />
+          <button type="submit" class="btn danger admin-btn admin-btn-danger" {% if collection_address_missing or not filters.chain_key or not filters.asset_symbol %}disabled{% endif %}>创建归集任务</button>
+        </form>
+      </div>
+
+      <div class="page-subtitle" style="margin-top:12px;">
+        归集地址：{{ selected_chain.collection_address if selected_chain and selected_chain.collection_address else '未配置' }}
+      </div>
+    </div>
+  </section>
+
+  {% if preview_summary %}
+    <section class="page-section">
+      <div class="table-card">
+        <div class="section-title">扫描结果</div>
+        <div class="summary-grid">
+          <div class="summary-card"><span>候选地址</span><strong>{{ preview_summary.collectible_count }}</strong></div>
+          <div class="summary-card"><span>总余额</span><strong>{{ preview_summary.total_balance }} {{ filters.asset_symbol }}</strong></div>
+          <div class="summary-card"><span>预计任务数</span><strong>{{ preview_summary.collectible_count }}</strong></div>
+          <div class="summary-card"><span>需补 Gas</span><strong>{{ preview_summary.gas_required_count }}{% if preview_summary.gas_coin_symbol %} / {{ preview_summary.gas_topup_amount }} {{ preview_summary.gas_coin_symbol }}{% endif %}</strong></div>
+        </div>
+        {% if preview_summary.warnings %}
+          <div class="page-subtitle" style="margin-top:12px;">提示：{{ preview_summary.warnings | join('；') }}</div>
+        {% endif %}
+        {% if preview_candidates %}
+          <div class="table-wrap admin-table-wrap" style="margin-top:12px;">
+            <table class="data-table admin-table">
+              <thead>
+                <tr><th>用户ID</th><th>网络</th><th>币种</th><th>来源地址</th><th>目标地址</th><th class="text-right">余额</th><th class="text-right">归集金额</th><th>Gas</th><th>原因</th></tr>
+              </thead>
+              <tbody>
+                {% for item in preview_candidates %}
+                  <tr>
+                    <td class="mono admin-number">{{ item.user_id }}</td>
+                    <td class="mono">{{ item.chain_key }}</td>
+                    <td class="mono">{{ item.coin_symbol }}</td>
+                    <td class="mono nowrap" title="{{ item.from_address }}">{{ item.from_address[:10] }}...{{ item.from_address[-8:] }}</td>
+                    <td class="mono nowrap" title="{{ item.to_address }}">{{ item.to_address[:10] }}...{{ item.to_address[-8:] }}</td>
+                    <td class="mono text-right">{{ item.token_balance }}</td>
+                    <td class="mono text-right">{{ item.evaluation.collect_amount }}</td>
+                    <td>{% if item.evaluation.gas_required %}<span class="admin-badge admin-badge-warning">需补 Gas</span>{% else %}<span class="admin-badge admin-badge-success">充足</span>{% endif %}</td>
+                    <td class="admin-muted">{{ item.reason }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">最近归集任务</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr><th>任务ID</th><th>网络</th><th>币种</th><th>来源地址</th><th>目标地址</th><th class="text-right">金额</th><th>状态</th><th>链上交易</th><th>错误</th><th>创建时间</th><th>更新时间</th></tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="mono admin-number">{{ item.id }}</td>
+                  <td class="mono">{{ item.chain_key }}</td>
+                  <td class="mono">{{ item.coin_symbol }}</td>
+                  <td class="mono nowrap" title="{{ item.from_address }}">{{ item.from_address_short }}</td>
+                  <td class="mono nowrap" title="{{ item.to_address }}">{{ item.to_address_short }}</td>
+                  <td class="mono text-right">{{ item.amount }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></td>
+                  <td class="mono nowrap" title="{{ item.tx_hash }}">{{ item.tx_hash_short }}</td>
+                  <td class="admin-muted" title="{{ item.last_error }}">{{ item.last_error_short }}</td>
+                  <td class="nowrap admin-time">{{ item.created_at }}</td>
+                  <td class="nowrap admin-time">{{ item.updated_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无数据</div>
+          <p class="admin-empty-desc">当前网络和币种下暂无归集任务。</p>
+        </div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

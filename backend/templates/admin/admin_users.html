@@ -1,0 +1,548 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}管理员管理{% endblock %}
+{% block page_title %}管理员管理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看后台管理员账号、绑定角色和基础启停状态。</div>
+{% endblock %}
+
+{% block page_actions %}
+  {% if can_manage_admin_users %}
+    <button type="button" class="btn admin-btn admin-btn-primary" data-admin-modal-open="admin-user-create-modal">新增管理员</button>
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+  <style>
+    .admin-users-filter-form{
+      display:grid;
+      grid-template-columns:minmax(180px, 1fr) minmax(130px, .6fr) minmax(160px, .7fr) auto;
+      gap:10px;
+      align-items:end;
+    }
+    .admin-users-form-section{
+      display:grid;
+      gap:12px;
+      padding:14px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:8px;
+      background:rgba(255,255,255,.035);
+    }
+    .admin-users-section-title{
+      color:#fff;
+      font-size:13px;
+      font-weight:900;
+    }
+    .admin-users-section-desc{
+      color:rgba(255,255,255,.62);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .admin-users-field-grid{
+      display:grid;
+      grid-template-columns:repeat(3, minmax(0, 1fr));
+      gap:12px;
+      align-items:end;
+    }
+    .admin-users-field-grid-single{
+      grid-template-columns:minmax(220px, 420px);
+    }
+    .admin-users-role-options{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0, 1fr));
+      gap:10px;
+    }
+    .admin-users-role-card{
+      display:flex;
+      align-items:flex-start;
+      gap:10px;
+      margin:0;
+      min-height:112px;
+      padding:12px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:8px;
+      background:rgba(0,0,0,.12);
+      color:rgba(255,255,255,.82);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .admin-users-role-card input{
+      margin-top:3px;
+      flex:0 0 auto;
+    }
+    .admin-users-role-name{
+      display:block;
+      color:#fff;
+      font-size:13px;
+      font-weight:900;
+    }
+    .admin-users-role-code{
+      display:block;
+      margin-top:2px;
+      font-family:Consolas, "SFMono-Regular", "Liberation Mono", monospace;
+      color:rgba(125,211,252,.9);
+      overflow-wrap:anywhere;
+    }
+    .admin-users-role-desc{
+      display:block;
+      margin-top:5px;
+      color:rgba(255,255,255,.64);
+    }
+    .admin-users-role-count{
+      display:inline-flex;
+      margin-top:8px;
+      padding:2px 7px;
+      border-radius:999px;
+      background:rgba(59,130,246,.14);
+      color:#bfdbfe;
+      font-size:11px;
+      font-weight:800;
+    }
+    .admin-users-role-system{
+      display:inline-flex;
+      margin-left:6px;
+      padding:2px 6px;
+      border-radius:999px;
+      background:rgba(250,204,21,.16);
+      color:#fde68a;
+      font-size:11px;
+      font-weight:800;
+    }
+    .admin-users-role-list{
+      display:flex;
+      flex-wrap:wrap;
+      gap:6px;
+    }
+    .admin-users-actions{
+      display:flex;
+      flex-wrap:nowrap;
+      gap:8px;
+      min-width:170px;
+    }
+    .admin-users-current{
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .admin-modal{
+      position:fixed;
+      inset:0;
+      z-index:80;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      padding:22px;
+      background:rgba(0,0,0,.68);
+    }
+    .admin-modal.is-open{
+      display:flex;
+    }
+    .admin-modal-dialog{
+      width:min(900px, 100%);
+      max-height:min(88vh, 840px);
+      overflow:auto;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:10px;
+      background:#101827;
+      box-shadow:0 22px 80px rgba(0,0,0,.45);
+    }
+    .admin-modal-dialog-create-admin{
+      width:min(820px, 100%);
+      max-height:min(84vh, 760px);
+    }
+    .admin-modal-dialog-narrow{
+      width:min(560px, 100%);
+    }
+    .admin-modal-header,
+    .admin-modal-footer{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      padding:16px 18px;
+      border-bottom:1px solid rgba(255,255,255,.08);
+    }
+    .admin-modal-footer{
+      justify-content:flex-end;
+      border-top:1px solid rgba(255,255,255,.08);
+      border-bottom:0;
+    }
+    .admin-modal-title{
+      color:#fff;
+      font-size:16px;
+      font-weight:900;
+    }
+    .admin-modal-close{
+      width:32px;
+      height:32px;
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:8px;
+      background:rgba(255,255,255,.06);
+      color:#fff;
+      cursor:pointer;
+    }
+    .admin-modal-body{
+      display:grid;
+      gap:14px;
+      padding:18px;
+    }
+    .admin-users-table{
+      width:100%;
+      table-layout:fixed;
+    }
+    .admin-users-table th:nth-child(1),
+    .admin-users-table td:nth-child(1){
+      width:64px;
+    }
+    .admin-users-table th:nth-child(2),
+    .admin-users-table td:nth-child(2){
+      width:18%;
+    }
+    .admin-users-table th:nth-child(3),
+    .admin-users-table td:nth-child(3){
+      width:86px;
+    }
+    .admin-users-table th:nth-child(5),
+    .admin-users-table td:nth-child(5),
+    .admin-users-table th:nth-child(6),
+    .admin-users-table td:nth-child(6){
+      width:136px;
+    }
+    .admin-users-table th:nth-child(7),
+    .admin-users-table td:nth-child(7){
+      width:190px;
+    }
+    @media (max-width: 980px){
+      .admin-users-filter-form,
+      .admin-users-field-grid{
+        grid-template-columns:1fr 1fr;
+      }
+      .admin-users-role-options{
+        grid-template-columns:1fr;
+      }
+    }
+    @media (max-width: 640px){
+      .admin-users-filter-form,
+      .admin-users-field-grid{
+        grid-template-columns:1fr;
+      }
+    }
+  </style>
+
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="admin-alert admin-alert-info">{{ notice }}</div>
+    </section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section">
+      <div class="admin-alert admin-alert-danger">{{ error }}</div>
+    </section>
+  {% endif %}
+
+  {% if can_manage_admin_users %}
+    <div class="admin-modal" id="admin-user-create-modal" aria-hidden="true">
+      <div class="admin-modal-dialog admin-modal-dialog-create-admin" role="dialog" aria-modal="true" aria-labelledby="admin-user-create-title">
+        <form method="post" action="/admin/admin-users">
+          <div class="admin-modal-header">
+            <div class="admin-modal-title" id="admin-user-create-title">新增管理员账号</div>
+            <button type="button" class="admin-modal-close" data-admin-modal-close aria-label="关闭">×</button>
+          </div>
+          <div class="admin-modal-body">
+            <section class="admin-users-form-section">
+              <div>
+                <div class="admin-users-section-title">基础信息</div>
+              </div>
+              <div class="admin-users-field-grid admin-users-field-grid-single">
+                <div class="field">
+                  <label for="create_username">用户名 *</label>
+                  <input id="create_username" name="username" type="text" required autocomplete="off" />
+                </div>
+              </div>
+            </section>
+
+            <section class="admin-users-form-section">
+              <div>
+                <div class="admin-users-section-title">角色配置 *</div>
+                <div class="admin-users-section-desc">可同时选择多个角色，权限将自动合并。</div>
+              </div>
+              <div class="admin-users-role-options">
+                {% for role in active_roles %}
+                  <label class="admin-users-role-card">
+                    <input type="checkbox" name="role_codes" value="{{ role.code }}" />
+                    <span>
+                      <span class="admin-users-role-name">
+                        {{ role.name or role.code }}
+                        {% if role.code == 'super_admin' %}
+                          <span class="admin-users-role-system">超级管理员</span>
+                        {% endif %}
+                      </span>
+                      <span class="admin-users-role-code">{{ role.code }}</span>
+                      <span class="admin-users-role-desc">
+                        {% if role.code == 'super_admin' %}
+                          拥有全部后台权限
+                        {% elif role.description %}
+                          {{ role.description }}
+                        {% else %}
+                          普通后台角色
+                        {% endif %}
+                      </span>
+                      <span class="admin-users-role-count">{{ role.permission_count }} 个权限</span>
+                    </span>
+                  </label>
+                {% else %}
+                  <span class="admin-muted">暂无可用角色</span>
+                {% endfor %}
+              </div>
+            </section>
+
+            <section class="admin-users-form-section">
+              <div class="admin-users-section-title">账号安全</div>
+              <div class="admin-users-field-grid">
+                <div class="field">
+                  <label for="create_password">初始密码 *</label>
+                  <input id="create_password" name="password" type="password" required autocomplete="new-password" />
+                </div>
+                <div class="field">
+                  <label for="create_confirm_password">确认密码 *</label>
+                  <input id="create_confirm_password" name="confirm_password" type="password" required autocomplete="new-password" />
+                </div>
+                <div class="field">
+                  <label for="create_status">状态</label>
+                  <select id="create_status" name="status">
+                    <option value="ACTIVE" selected>启用</option>
+                    <option value="DISABLED">停用</option>
+                  </select>
+                </div>
+              </div>
+            </section>
+          </div>
+          <div class="admin-modal-footer">
+            <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-admin-modal-close>取消</button>
+            <button type="submit" class="btn admin-btn admin-btn-primary">创建管理员</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/admin-users" class="admin-users-filter-form">
+        <div class="field">
+          <label for="username">用户名</label>
+          <input id="username" name="username" type="text" value="{{ filters.username or '' }}" placeholder="按用户名搜索" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="ACTIVE" {% if filters.status == 'ACTIVE' %}selected{% endif %}>启用</option>
+            <option value="DISABLED" {% if filters.status == 'DISABLED' %}selected{% endif %}>停用</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="role_code">角色</label>
+          <input id="role_code" name="role_code" type="text" value="{{ filters.role_code or '' }}" placeholder="super_admin" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/admin-users" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">管理员列表</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table admin-users-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>用户名</th>
+                <th>状态</th>
+                <th>角色</th>
+                <th>最后登录时间</th>
+                <th>创建时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.id }}</td>
+                  <td>{{ item.username }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></td>
+                  <td>
+                    <div class="admin-users-role-list" title="{{ item.role_titles }}">
+                      {% for role_code in item.role_codes %}
+                        <span class="admin-badge admin-badge-secondary">{{ role_code }}</span>
+                      {% else %}
+                        <span class="admin-muted">-</span>
+                      {% endfor %}
+                    </div>
+                  </td>
+                  <td class="admin-time">{{ item.last_login_at }}</td>
+                  <td class="admin-time">{{ item.created_at }}</td>
+                  <td>
+                    <div class="admin-users-actions">
+                      {% if can_manage_admin_users %}
+                        <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-admin-modal-open="admin-user-reset-modal-{{ item.id }}">重置密码</button>
+                        {% if item.id == admin.id %}
+                          <span class="admin-users-current">当前登录账号不可禁用</span>
+                        {% elif item.is_active %}
+                          <button type="button" class="btn danger admin-btn admin-btn-danger admin-btn-sm" data-admin-modal-open="admin-user-disable-modal-{{ item.id }}">禁用</button>
+                        {% else %}
+                          <button type="button" class="btn admin-btn admin-btn-primary admin-btn-sm" data-admin-modal-open="admin-user-enable-modal-{{ item.id }}">启用</button>
+                        {% endif %}
+                      {% endif %}
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无管理员</div>
+          <p class="admin-empty-desc">当前筛选条件下没有管理员记录。</p>
+        </div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  {% if can_manage_admin_users %}
+    {% for item in items %}
+      <div class="admin-modal" id="admin-user-reset-modal-{{ item.id }}" aria-hidden="true">
+        <div class="admin-modal-dialog admin-modal-dialog-narrow" role="dialog" aria-modal="true" aria-labelledby="admin-user-reset-title-{{ item.id }}">
+          <form method="post" action="/admin/admin-users/{{ item.id }}/reset-password" onsubmit="return confirm('确认重置该管理员密码？');">
+            <input type="hidden" name="next_path" value="{{ current_url }}" />
+            <div class="admin-modal-header">
+              <div class="admin-modal-title" id="admin-user-reset-title-{{ item.id }}">重置管理员密码</div>
+              <button type="button" class="admin-modal-close" data-admin-modal-close aria-label="关闭">×</button>
+            </div>
+            <div class="admin-modal-body">
+              <div class="admin-users-section-desc">账号：{{ item.username }}</div>
+              <div class="admin-users-field-grid">
+                <div class="field">
+                  <label for="reset_password_{{ item.id }}">新密码</label>
+                  <input id="reset_password_{{ item.id }}" name="password" type="password" required autocomplete="new-password" />
+                </div>
+                <div class="field">
+                  <label for="reset_confirm_password_{{ item.id }}">确认密码</label>
+                  <input id="reset_confirm_password_{{ item.id }}" name="confirm_password" type="password" required autocomplete="new-password" />
+                </div>
+              </div>
+            </div>
+            <div class="admin-modal-footer">
+              <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-admin-modal-close>取消</button>
+              <button type="submit" class="btn admin-btn admin-btn-primary">确认重置</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      {% if item.id != admin.id %}
+        {% if item.is_active %}
+          <div class="admin-modal" id="admin-user-disable-modal-{{ item.id }}" aria-hidden="true">
+            <div class="admin-modal-dialog admin-modal-dialog-narrow" role="dialog" aria-modal="true" aria-labelledby="admin-user-disable-title-{{ item.id }}">
+              <form method="post" action="/admin/admin-users/{{ item.id }}/disable" onsubmit="return confirm('确认停用该管理员？停用后该管理员将不能登录后台。');">
+                <input type="hidden" name="next_path" value="{{ current_url }}" />
+                <div class="admin-modal-header">
+                  <div class="admin-modal-title" id="admin-user-disable-title-{{ item.id }}">禁用管理员账号</div>
+                  <button type="button" class="admin-modal-close" data-admin-modal-close aria-label="关闭">×</button>
+                </div>
+                <div class="admin-modal-body">
+                  <div class="admin-alert admin-alert-danger">确认禁用管理员 {{ item.username }}？禁用后该账号将不能登录后台。</div>
+                </div>
+                <div class="admin-modal-footer">
+                  <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-admin-modal-close>取消</button>
+                  <button type="submit" class="btn danger admin-btn admin-btn-danger">确认禁用</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        {% else %}
+          <div class="admin-modal" id="admin-user-enable-modal-{{ item.id }}" aria-hidden="true">
+            <div class="admin-modal-dialog admin-modal-dialog-narrow" role="dialog" aria-modal="true" aria-labelledby="admin-user-enable-title-{{ item.id }}">
+              <form method="post" action="/admin/admin-users/{{ item.id }}/enable">
+                <input type="hidden" name="next_path" value="{{ current_url }}" />
+                <div class="admin-modal-header">
+                  <div class="admin-modal-title" id="admin-user-enable-title-{{ item.id }}">启用管理员账号</div>
+                  <button type="button" class="admin-modal-close" data-admin-modal-close aria-label="关闭">×</button>
+                </div>
+                <div class="admin-modal-body">
+                  <div class="admin-alert admin-alert-info">确认启用管理员 {{ item.username }}？启用后该账号可重新登录后台。</div>
+                </div>
+                <div class="admin-modal-footer">
+                  <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-admin-modal-close>取消</button>
+                  <button type="submit" class="btn admin-btn admin-btn-primary">确认启用</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        {% endif %}
+      {% endif %}
+    {% endfor %}
+  {% endif %}
+
+  <script>
+    document.addEventListener("click", function(event){
+      var openButton = event.target.closest("[data-admin-modal-open]");
+      if (openButton) {
+        var modal = document.getElementById(openButton.getAttribute("data-admin-modal-open"));
+        if (modal) {
+          modal.classList.add("is-open");
+          modal.setAttribute("aria-hidden", "false");
+          var firstInput = modal.querySelector("input:not([type='hidden']):not(:disabled), select:not(:disabled), button:not([data-admin-modal-close])");
+          if (firstInput) {
+            window.setTimeout(function(){ firstInput.focus(); }, 0);
+          }
+        }
+      }
+
+      var closeButton = event.target.closest("[data-admin-modal-close]");
+      var backdrop = event.target.classList && event.target.classList.contains("admin-modal") ? event.target : null;
+      if (closeButton || backdrop) {
+        var openModal = (closeButton || backdrop).closest(".admin-modal");
+        if (openModal) {
+          openModal.classList.remove("is-open");
+          openModal.setAttribute("aria-hidden", "true");
+        }
+      }
+    });
+
+    document.addEventListener("keydown", function(event){
+      if (event.key !== "Escape") {
+        return;
+      }
+      document.querySelectorAll(".admin-modal.is-open").forEach(function(modal){
+        modal.classList.remove("is-open");
+        modal.setAttribute("aria-hidden", "true");
+      });
+    });
+  </script>
+{% endblock %}

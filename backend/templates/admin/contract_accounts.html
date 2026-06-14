@@ -1,0 +1,100 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}合约账户{% endblock %}
+{% block page_title %}合约账户{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看用户合约保证金账户余额与盈亏汇总，只读查询。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .pnl-positive{color:#86efac;}
+    .pnl-negative{color:#fca5a5;}
+    .pnl-zero{color:var(--muted);}
+  </style>
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/contract-accounts" class="filter-form">
+        <div class="field">
+          <label for="user_id">user_id</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" />
+        </div>
+        <div class="field">
+          <label for="margin_asset">margin_asset</label>
+          <input id="margin_asset" type="text" name="margin_asset" value="{{ filters.margin_asset or '' }}" placeholder="USDT" />
+        </div>
+        <div class="field">
+          <label for="has_position_margin">有持仓保证金</label>
+          <select id="has_position_margin" name="has_position_margin">
+            <option value="">全部</option>
+            <option value="1" {% if filters.has_position_margin == '1' %}selected{% endif %}>是</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="has_available_margin">有可用余额</label>
+          <select id="has_available_margin" name="has_available_margin">
+            <option value="">全部</option>
+            <option value="1" {% if filters.has_available_margin == '1' %}selected{% endif %}>是</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/contract-accounts" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">合约账户列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>user_id</th>
+                <th>margin_asset</th>
+                <th class="text-right">available_margin</th>
+                <th class="text-right">frozen_margin</th>
+                <th class="text-right">position_margin</th>
+                <th class="text-right">realized_pnl</th>
+                <th class="text-right">unrealized_pnl</th>
+                <th>updated_at</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td><span class="admin-badge admin-badge-secondary">{{ item.margin_asset }}</span></td>
+                  <td class="admin-amount">{{ item.available_margin }}</td>
+                  <td class="admin-amount">{{ item.frozen_margin }}</td>
+                  <td class="admin-amount">{{ item.position_margin }}</td>
+                  <td class="admin-amount {{ item.realized_pnl_class }}">{{ item.realized_pnl }}</td>
+                  <td class="admin-amount {{ item.unrealized_pnl_class }}">{{ item.unrealized_pnl }}</td>
+                  <td class="nowrap admin-time">{{ item.updated_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无合约账户数据</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

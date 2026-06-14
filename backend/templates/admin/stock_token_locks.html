@@ -1,0 +1,274 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}股票锁仓批次{% endblock %}
+{% block page_title %}股票锁仓批次{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看用户股票代币锁仓、释放进度与可兑换数量。</div>
+{% endblock %}
+
+{% block page_actions %}
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+  <form method="post" action="/admin/stock-token-locks/release">
+    <input type="hidden" name="next_path" value="{{ current_url }}" />
+    <button type="submit" class="btn admin-btn admin-btn-primary">执行释放任务</button>
+  </form>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .stock-token-table {
+      table-layout: fixed;
+      width: 100%;
+    }
+    .stock-token-table.data-table,
+    .stock-token-table.admin-table {
+      min-width: 0;
+    }
+    .stock-token-table-wrap {
+      overflow-x: hidden;
+    }
+    .stock-token-table th,
+    .stock-token-table td {
+      padding-left: 10px;
+      padding-right: 10px;
+      vertical-align: top;
+    }
+    .stock-token-table .col-id {
+      width: 72px;
+    }
+    .stock-token-table .col-user {
+      width: 106px;
+    }
+    .stock-token-table .col-status {
+      width: 86px;
+    }
+    .stock-token-table .col-time {
+      width: 132px;
+    }
+    .stock-token-table .col-action {
+      width: 86px;
+    }
+    .lock-info-main {
+      align-items: center;
+      color: var(--text);
+      display: flex;
+      font-size: 15px;
+      font-weight: 800;
+      gap: 6px;
+      line-height: 1.25;
+      min-width: 0;
+      white-space: nowrap;
+    }
+    .lock-info-main .mono,
+    .lock-info-sub {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .lock-arrow {
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .lock-info-sub,
+    .lock-metric-line,
+    .time-rule-line {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin-top: 5px;
+    }
+    .lock-metric-line {
+      display: grid;
+      gap: 6px;
+      grid-template-columns: 60px minmax(0, 1fr);
+    }
+    .lock-metric-line span:first-child,
+    .time-rule-label {
+      color: var(--muted);
+    }
+    .lock-metric-line strong,
+    .time-rule-value {
+      color: var(--text);
+      font-weight: 800;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .time-rule-date {
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 800;
+      line-height: 1.4;
+      white-space: nowrap;
+    }
+    .progress-bar {
+      background: rgba(255,255,255,.08);
+      border-radius: 999px;
+      height: 8px;
+      margin-top: 8px;
+      overflow: hidden;
+      width: 100%;
+    }
+    .progress-fill {
+      background: linear-gradient(90deg, #f0b90b, #22c55e);
+      border-radius: inherit;
+      height: 100%;
+    }
+    .stock-token-table .admin-badge {
+      white-space: nowrap;
+    }
+    .stock-token-action {
+      white-space: nowrap;
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作结果</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">提示信息</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/stock-token-locks" class="filter-form">
+        <div class="field">
+          <label for="user_id">用户ID</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" placeholder="用户 ID" />
+        </div>
+        <div class="field">
+          <label for="lock_symbol">锁仓币种</label>
+          <input id="lock_symbol" type="text" name="lock_symbol" value="{{ filters.lock_symbol or '' }}" placeholder="BON-1" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="ACTIVE" {% if filters.status == 'ACTIVE' %}selected{% endif %}>释放中 / 锁仓中</option>
+            <option value="RELEASED" {% if filters.status == 'RELEASED' %}selected{% endif %}>已完成</option>
+            <option value="COMPLETED" {% if filters.status == 'COMPLETED' %}selected{% endif %}>已完成</option>
+            <option value="CANCELED" {% if filters.status == 'CANCELED' %}selected{% endif %}>已取消</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/stock-token-locks" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">锁仓批次列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap stock-token-table-wrap">
+          <table class="data-table admin-table stock-token-table">
+            <thead>
+              <tr>
+                <th class="col-id">批次ID</th>
+                <th class="col-user nowrap">用户ID</th>
+                <th>锁仓信息</th>
+                <th class="col-status nowrap">状态</th>
+                <th class="col-time nowrap">时间规则</th>
+                <th>资产进度</th>
+                <th class="col-action nowrap">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="mono">{{ item.id }}</td>
+                  <td class="mono nowrap">{{ item.user_id }}</td>
+                  <td>
+                    <div class="lock-info-main">
+                      <span class="mono">{{ item.lock_symbol }}</span>
+                      <span class="lock-arrow">→</span>
+                      <span class="mono">{{ item.trade_symbol or '-' }}</span>
+                    </div>
+                    <div class="lock-info-sub">汇率：<span class="tabular-nums">{{ item.conversion_rate_compact_text }}</span></div>
+                    {% if item.display_name and item.display_name != item.lock_symbol %}
+                      <div class="lock-info-sub" title="{{ item.display_name }}">{{ item.display_name }}</div>
+                    {% endif %}
+                  </td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span>
+                  </td>
+                  <td>
+                    <div class="time-rule-line">
+                      <span class="time-rule-value">{{ item.lock_days_text }}</span>
+                    </div>
+                    <div class="time-rule-date">{{ item.start_date_text or '--' }}</div>
+                    <div class="time-rule-line">→</div>
+                    <div class="time-rule-date">{{ item.end_date_text or '--' }}</div>
+                  </td>
+                  <td>
+                    <div class="lock-metric-line">
+                      <span>总锁仓</span>
+                      <strong class="tabular-nums" title="{{ item.total_amount_text }}">{{ item.total_amount_compact_text }}</strong>
+                    </div>
+                    <div class="lock-metric-line">
+                      <span>已释放</span>
+                      <strong class="tabular-nums" title="{{ item.released_amount_text }}">{{ item.released_amount_compact_text }}</strong>
+                    </div>
+                    <div class="lock-metric-line">
+                      <span>待释放</span>
+                      <strong class="tabular-nums" title="{{ item.locked_amount_text }}">{{ item.locked_amount_compact_text }}</strong>
+                    </div>
+                    <div class="lock-metric-line">
+                      <span>可兑换</span>
+                      <strong class="tabular-nums" title="{{ item.available_amount_text }}">{{ item.available_amount_compact_text }}</strong>
+                    </div>
+                    <div class="progress-bar" aria-label="释放进度">
+                      <div class="progress-fill" style="width: {{ item.release_progress_ratio }}%;"></div>
+                    </div>
+                  </td>
+                  <td class="stock-token-action">
+                    <a href="/admin/stock-token-locks/{{ item.id }}">详情</a>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无股票锁仓批次</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

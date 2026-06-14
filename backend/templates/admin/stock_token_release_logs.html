@@ -1,0 +1,103 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}股票锁仓释放日志{% endblock %}
+{% block page_title %}股票锁仓释放日志{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">记录自动任务、后台手动释放和单批次强制释放的执行结果。</div>
+{% endblock %}
+
+{% block content %}
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/stock-token-release-logs" class="filter-form">
+        <div class="field">
+          <label for="trigger_type">trigger_type</label>
+          <select id="trigger_type" name="trigger_type">
+            <option value="">全部</option>
+            <option value="AUTO" {% if filters.trigger_type == 'AUTO' %}selected{% endif %}>自动任务</option>
+            <option value="MANUAL" {% if filters.trigger_type == 'MANUAL' %}selected{% endif %}>手动触发</option>
+            <option value="FORCE" {% if filters.trigger_type == 'FORCE' %}selected{% endif %}>强制释放</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="status">status</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="SUCCESS" {% if filters.status == 'SUCCESS' %}selected{% endif %}>成功</option>
+            <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
+            <option value="SKIPPED" {% if filters.status == 'SKIPPED' %}selected{% endif %}>已跳过</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/stock-token-release-logs" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">释放日志列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th class="nowrap">run_time</th>
+                <th class="nowrap">trigger_type</th>
+                <th class="nowrap">status</th>
+                <th class="text-right">scanned_count</th>
+                <th class="text-right">released_count</th>
+                <th class="text-right">total_release_amount</th>
+                <th>item_ids</th>
+                <th>message</th>
+                <th>error_message</th>
+                <th class="nowrap">created_at</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="mono nowrap admin-id">{{ item.id }}</td>
+                  <td class="nowrap admin-time">{{ item.run_time }}</td>
+                  <td><span class="admin-badge admin-badge-info" title="{{ item.trigger_type }}">{{ item.trigger_type_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                  <td class="text-right mono admin-number">{{ item.scanned_count }}</td>
+                  <td class="text-right mono admin-number">{{ item.released_count }}</td>
+                  <td class="text-right mono admin-amount">{{ item.total_release_amount }}</td>
+                  <td class="mono nowrap admin-id" title="{{ item.item_ids }}">{{ item.item_ids_short }}</td>
+                  <td>{{ item.message }}</td>
+                  <td>{{ item.error_message or '-' }}</td>
+                  <td class="nowrap admin-time">{{ item.created_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无释放日志</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

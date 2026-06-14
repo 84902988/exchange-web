@@ -1,0 +1,529 @@
+{% extends "admin/layout.html" %}
+
+{% if is_edit %}
+  {% set form_title = "编辑首页 Banner" %}
+{% else %}
+  {% set form_title = "新增首页 Banner" %}
+{% endif %}
+
+{% block title %}{{ form_title }}{% endblock %}
+{% block page_title %}{{ form_title }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">配置首页 Banner 内容。排序数字越小越靠前。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/home-banners" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .banner-form {
+      display: block;
+      margin-top: 18px;
+    }
+    .banner-form-grid {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 20px 18px;
+      align-items: start;
+    }
+    .banner-field {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 8px;
+      margin: 0;
+    }
+    .banner-field-upload {
+      grid-column: span 5;
+    }
+    .banner-field-link {
+      grid-column: span 4;
+    }
+    .banner-field-sort,
+    .banner-field-status {
+      grid-column: span 2;
+    }
+    .banner-form .field label {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+    .banner-form .field input,
+    .banner-form .field select,
+    .banner-form .field textarea {
+      width: 100%;
+      min-width: 0;
+      border-radius: 10px;
+    }
+    .banner-form .field input,
+    .banner-form .field select {
+      height: 50px;
+      padding: 0 14px;
+    }
+    .banner-form .field textarea {
+      height: 68px;
+      min-height: 56px;
+      max-height: 72px;
+      padding: 12px 14px;
+      resize: vertical;
+    }
+    .upload-control {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+    }
+    .upload-control .btn {
+      height: 50px;
+      min-height: 50px;
+      padding-top: 0;
+      padding-bottom: 0;
+      white-space: nowrap;
+    }
+    .upload-status {
+      display: block;
+      min-height: 18px;
+      margin-top: 6px;
+      font-size: 12px;
+    }
+    .banner-form-actions {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-top: 20px;
+      flex-wrap: wrap;
+    }
+    .i18n-panel {
+      grid-column: 1 / -1;
+      display: grid;
+      gap: 14px;
+      padding: 14px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 12px;
+      background: rgba(255,255,255,.035);
+    }
+    .i18n-title {
+      color: #fff;
+      font-size: 14px;
+      font-weight: 800;
+    }
+    .i18n-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .i18n-summary-item,
+    .i18n-tab-status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 0 8px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 999px;
+      background: rgba(255,255,255,.055);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .i18n-summary-item strong {
+      margin-left: 4px;
+      color: #fff;
+      font-weight: 800;
+    }
+    .i18n-fallback-note {
+      margin: 0;
+      color: #facc15;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .i18n-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .i18n-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 7px 10px;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 8px;
+      background: rgba(255,255,255,.045);
+      color: var(--muted);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .i18n-tab.is-active {
+      border-color: rgba(250,204,21,.55);
+      background: rgba(250,204,21,.14);
+      color: #fff;
+    }
+    .i18n-tab.is-active .i18n-tab-status {
+      border-color: rgba(250,204,21,.28);
+      color: #fde68a;
+    }
+    .i18n-toolbar {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .i18n-copy-btn:disabled {
+      opacity: .45;
+      cursor: not-allowed;
+    }
+    .i18n-tab-panel {
+      display: none;
+    }
+    .i18n-tab-panel.is-active {
+      display: grid;
+      gap: 14px;
+    }
+    .i18n-language-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .i18n-fields-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    .i18n-fields-grid textarea {
+      min-height: 92px;
+      max-height: none;
+    }
+    @media (max-width: 640px) {
+      .banner-form-grid {
+        grid-template-columns: 1fr;
+        gap: 16px;
+      }
+      .banner-field-upload,
+      .banner-field-link,
+      .banner-field-sort,
+      .banner-field-status {
+        grid-column: 1 / -1;
+      }
+      .upload-control {
+        grid-template-columns: 1fr;
+      }
+      .upload-control .btn {
+        width: 100%;
+      }
+      .i18n-fields-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">表单校验失败</div>
+        {% for error in errors %}
+          <p class="muted">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">{{ form_title }}</div>
+      <form method="post" action="{{ form_action }}" class="banner-form" id="home-banner-form">
+        <div hidden>
+          <input type="hidden" name="title" value="{{ form.title or '' }}" />
+          <textarea name="subtitle">{{ form.subtitle or '' }}</textarea>
+        </div>
+        <div class="banner-form-grid">
+          <div class="i18n-panel">
+            <div class="i18n-title">多语言内容</div>
+            {% set i18n_languages = [('zh', '中文'), ('en', 'English'), ('zh_TW', '繁體'), ('ja', '日本語')] %}
+            {% set banner_i18n_fields = [
+              ('title', '标题', 'input'),
+              ('subtitle', '副标题', 'textarea')
+            ] %}
+            <div class="i18n-summary" aria-live="polite">
+              {% for suffix, label in i18n_languages %}
+                <span class="i18n-summary-item" data-i18n-summary="{{ suffix }}">{{ label }}：<strong>未填写</strong></span>
+              {% endfor %}
+            </div>
+            <p class="i18n-fallback-note">中文内容会作为默认 fallback 保存，其他语言未填写时前台将显示中文。</p>
+            <div class="i18n-tabs" role="tablist" aria-label="首页 Banner 多语言内容编辑">
+              {% for suffix, label in i18n_languages %}
+                <button
+                  type="button"
+                  id="home_banner_i18n_tab_{{ suffix }}"
+                  class="i18n-tab{% if loop.first %} is-active{% endif %}"
+                  role="tab"
+                  aria-selected="{% if loop.first %}true{% else %}false{% endif %}"
+                  aria-controls="home_banner_i18n_panel_{{ suffix }}"
+                  data-i18n-tab="{{ suffix }}"
+                >
+                  <span>{{ label }}</span>
+                  <span class="i18n-tab-status" data-i18n-tab-status="{{ suffix }}">未填写</span>
+                </button>
+              {% endfor %}
+            </div>
+            <div class="i18n-toolbar">
+              <button type="button" class="btn secondary admin-btn admin-btn-secondary i18n-copy-btn" data-i18n-copy-current disabled>从中文复制到当前语言</button>
+            </div>
+            <div class="i18n-tab-panels">
+              {% for suffix, label in i18n_languages %}
+                <div
+                  id="home_banner_i18n_panel_{{ suffix }}"
+                  class="i18n-tab-panel{% if loop.first %} is-active{% endif %}"
+                  role="tabpanel"
+                  aria-labelledby="home_banner_i18n_tab_{{ suffix }}"
+                  data-i18n-panel="{{ suffix }}"
+                  {% if not loop.first %}hidden{% endif %}
+                >
+                  <div class="i18n-language-heading">
+                    <span>{{ label }}</span>
+                    <span class="i18n-tab-status" data-i18n-panel-status="{{ suffix }}">未填写</span>
+                  </div>
+                  <div class="i18n-fields-grid">
+                    {% for field_name, field_label, field_type in banner_i18n_fields %}
+                      {% set input_name = field_name ~ '_i18n_' ~ suffix %}
+                      {% set input_value = form[input_name] or '' %}
+                      {% if suffix == 'zh' and not input_value %}
+                        {% set input_value = form[field_name] or '' %}
+                      {% endif %}
+                      <div class="field banner-field" data-i18n-lang="{{ suffix }}" data-i18n-field="{{ field_name }}">
+                        <label for="{{ input_name }}">{{ field_label }}</label>
+                        {% if field_type == 'textarea' %}
+                          <textarea id="{{ input_name }}" name="{{ input_name }}">{{ input_value }}</textarea>
+                        {% else %}
+                          <input id="{{ input_name }}" name="{{ input_name }}" type="text" value="{{ input_value }}" />
+                        {% endif %}
+                      </div>
+                    {% endfor %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="field banner-field banner-field-upload">
+          <label for="image_url">图片地址 (image_url)</label>
+          <div class="upload-control">
+            <input id="image_url" name="image_url" type="text" value="{{ form.image_url or '' }}" placeholder="/banner.png" />
+            <input id="image_url_upload" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml,video/mp4,video/webm" hidden />
+            <button id="image_url_upload_btn" type="button" class="btn secondary admin-btn admin-btn-secondary">上传媒体</button>
+          </div>
+          <span class="muted upload-status">图片最大 20MB，上传后会自动压缩；视频最大 100MB，上传后会自动转码压缩，建议 10～30 秒；首页背景建议使用 16:9 或 2:1 横幅图片/视频。</span>
+          <span id="image_url_upload_status" class="muted upload-status"></span>
+          </div>
+          <div class="field banner-field banner-field-link">
+          <label for="link_url">跳转链接 (link_url)</label>
+          <input id="link_url" name="link_url" type="text" value="{{ form.link_url or '' }}" placeholder="/trade" />
+          </div>
+          <div class="field banner-field banner-field-sort">
+          <label for="sort_order">排序 (sort_order)</label>
+          <input id="sort_order" name="sort_order" type="number" value="{{ form.sort_order or 0 }}" />
+          </div>
+          <div class="field banner-field banner-field-status">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="ACTIVE" {% if form.status == 'ACTIVE' %}selected{% endif %}>启用</option>
+            <option value="DISABLED" {% if form.status == 'DISABLED' %}selected{% endif %}>禁用</option>
+          </select>
+          </div>
+        </div>
+        <div class="banner-form-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">{% if is_edit %}保存修改{% else %}创建 Banner{% endif %}</button>
+          <a href="/admin/home-banners" class="btn secondary admin-btn admin-btn-secondary">取消</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <script>
+    (function(){
+      const tabs = Array.from(document.querySelectorAll("[data-i18n-tab]"));
+      const panels = Array.from(document.querySelectorAll("[data-i18n-panel]"));
+      const copyButton = document.querySelector("[data-i18n-copy-current]");
+      if (!tabs.length || !panels.length) return;
+
+      let activeLang = "zh";
+      const statusLabels = {
+        empty: "未填写",
+        partial: "部分填写",
+        complete: "已完成",
+      };
+
+      function getFieldControl(field) {
+        return field.querySelector("input, textarea");
+      }
+
+      function getLangFields(lang) {
+        return Array.from(document.querySelectorAll(`[data-i18n-lang="${lang}"]`));
+      }
+
+      function getFieldControlByName(lang, fieldName) {
+        const field = document.querySelector(`[data-i18n-lang="${lang}"][data-i18n-field="${fieldName}"]`);
+        return field ? getFieldControl(field) : null;
+      }
+
+      function getControlValue(control) {
+        return control ? control.value : "";
+      }
+
+      function setControlValue(control, value) {
+        if (!control) return;
+        control.value = value;
+        control.dispatchEvent(new Event("input", { bubbles: true }));
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+
+      function getLangStatus(lang) {
+        const fields = getLangFields(lang);
+        const total = fields.length;
+        const filled = fields.filter((field) => {
+          const control = getFieldControl(field);
+          return getControlValue(control).trim().length > 0;
+        }).length;
+        if (!filled) return "empty";
+        if (filled === total) return "complete";
+        return "partial";
+      }
+
+      function setStatusText(attribute, lang, label) {
+        document.querySelectorAll(`[${attribute}="${lang}"]`).forEach((node) => {
+          const strong = node.querySelector("strong");
+          if (strong) {
+            strong.textContent = label;
+          } else {
+            node.textContent = label;
+          }
+        });
+      }
+
+      function refreshStatuses() {
+        tabs.forEach((tab) => {
+          const lang = tab.dataset.i18nTab;
+          const label = statusLabels[getLangStatus(lang)];
+          setStatusText("data-i18n-summary", lang, label);
+          setStatusText("data-i18n-tab-status", lang, label);
+          setStatusText("data-i18n-panel-status", lang, label);
+        });
+      }
+
+      function activateTab(lang) {
+        activeLang = lang;
+        tabs.forEach((tab) => {
+          const selected = tab.dataset.i18nTab === lang;
+          tab.classList.toggle("is-active", selected);
+          tab.setAttribute("aria-selected", selected ? "true" : "false");
+        });
+        panels.forEach((panel) => {
+          const selected = panel.dataset.i18nPanel === lang;
+          panel.classList.toggle("is-active", selected);
+          panel.hidden = !selected;
+        });
+        if (copyButton) {
+          copyButton.disabled = lang === "zh";
+        }
+      }
+
+      function syncChineseFallbackFields() {
+        ["title", "subtitle"].forEach((fieldName) => {
+          const source = getFieldControlByName("zh", fieldName);
+          const target = document.querySelector(`[name="${fieldName}"]`);
+          if (source && target) {
+            target.value = getControlValue(source);
+          }
+        });
+      }
+
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => activateTab(tab.dataset.i18nTab));
+      });
+
+      document.querySelectorAll("[data-i18n-lang] input, [data-i18n-lang] textarea").forEach((control) => {
+        control.addEventListener("input", refreshStatuses);
+        control.addEventListener("change", refreshStatuses);
+      });
+
+      if (copyButton) {
+        copyButton.addEventListener("click", () => {
+          if (activeLang === "zh") return;
+          ["title", "subtitle"].forEach((fieldName) => {
+            const source = getFieldControlByName("zh", fieldName);
+            const target = getFieldControlByName(activeLang, fieldName);
+            if (source && target) {
+              setControlValue(target, getControlValue(source));
+            }
+          });
+          refreshStatuses();
+        });
+      }
+
+      const form = document.getElementById("home-banner-form");
+      if (form) {
+        form.addEventListener("submit", () => {
+          syncChineseFallbackFields();
+        });
+      }
+
+      refreshStatuses();
+      activateTab("zh");
+      window.refreshHomeBannerI18nStatuses = refreshStatuses;
+      window.syncHomeBannerChineseFallbackFields = syncChineseFallbackFields;
+    })();
+
+    function bindImageUpload(inputId) {
+      const textInput = document.getElementById(inputId);
+      const fileInput = document.getElementById(`${inputId}_upload`);
+      const button = document.getElementById(`${inputId}_upload_btn`);
+      const status = document.getElementById(`${inputId}_upload_status`);
+      if (!textInput || !fileInput || !button || !status) return;
+
+      button.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) return;
+
+        const originalText = button.textContent;
+        button.disabled = true;
+        button.textContent = "上传中";
+        status.textContent = "";
+
+        try {
+          const formData = new FormData();
+          formData.append("file", file);
+          const response = await fetch("/admin/uploads/image", {
+            method: "POST",
+            body: formData,
+            credentials: "same-origin",
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(data.detail || "上传失败");
+          }
+          textInput.value = data.url || "";
+          status.textContent = "上传成功";
+        } catch (error) {
+          status.textContent = error instanceof Error ? error.message : "上传失败";
+        } finally {
+          button.disabled = false;
+          button.textContent = originalText;
+          fileInput.value = "";
+        }
+      });
+    }
+
+    bindImageUpload("image_url");
+  </script>
+{% endblock %}

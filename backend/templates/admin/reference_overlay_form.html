@@ -1,0 +1,302 @@
+{% extends "admin/layout.html" %}
+
+{% if is_edit %}
+  {% set page_heading = "编辑RWA参考价" %}
+{% else %}
+  {% set page_heading = "新增RWA参考价" %}
+{% endif %}
+
+{% block title %}{{ page_heading }}{% endblock %}
+{% block page_title %}{{ page_heading }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">维护 RWA 标的参考价、展示文案与同步参数</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/reference-overlays" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .rwa-form {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .rwa-form-section {
+      border: 1px solid rgba(148, 163, 184, .18);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, .28);
+      padding: 14px;
+    }
+    .rwa-section-title {
+      margin-bottom: 12px;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .rwa-form-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .rwa-field-wide {
+      grid-column: span 2;
+    }
+    .rwa-field-full {
+      grid-column: 1 / -1;
+    }
+    .rwa-help-card {
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border: 1px solid rgba(148, 163, 184, .14);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, .22);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .rwa-help-card strong,
+    .rwa-help-card code {
+      color: #a8b3c7;
+      font-weight: 600;
+    }
+    .rwa-status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .rwa-status-item {
+      min-height: 58px;
+      padding: 10px 12px;
+      border: 1px solid rgba(148, 163, 184, .16);
+      border-radius: 8px;
+      background: rgba(2, 6, 23, .24);
+    }
+    .rwa-status-label {
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .rwa-status-value {
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+    .rwa-sync-error {
+      max-height: 80px;
+      overflow: auto;
+      white-space: pre-wrap;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #cbd5e1;
+    }
+    .rwa-form-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 2px;
+    }
+    @media (max-width: 960px) {
+      .rwa-form-grid,
+      .rwa-status-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .rwa-field-wide {
+        grid-column: 1 / -1;
+      }
+    }
+    @media (max-width: 640px) {
+      .rwa-form-grid,
+      .rwa-status-grid {
+        grid-template-columns: 1fr;
+      }
+      .rwa-form-actions {
+        justify-content: flex-start;
+        flex-wrap: wrap;
+      }
+    }
+  </style>
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">表单校验失败</div>
+        {% for error in errors %}
+          <p class="muted">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  {% set reference_type_value = form.reference_type or form.kind or 'STOCK' %}
+  {% set price_source_value = form.price_source or 'MANUAL' %}
+  <section class="page-section">
+    <form method="post" action="{{ form_action }}" class="rwa-form" data-rwa-reference-form>
+      <input type="hidden" id="kind" name="kind" value="{{ form.kind or reference_type_value }}" data-rwa-kind />
+      <input type="hidden" name="data_source" value="{{ form.data_source or 'MANUAL' }}" />
+      <input type="hidden" name="source_region" value="{{ form.source_region or '' }}" />
+      <input type="hidden" name="conversion_type" value="{{ form.conversion_type or '' }}" />
+      <input type="hidden" name="conversion_factor" value="{{ form.conversion_factor or '' }}" />
+
+      <div class="rwa-form-section">
+        <div class="rwa-section-title">基础信息</div>
+        <div class="rwa-form-grid">
+          <div class="field">
+            <label for="symbol">交易对</label>
+            <input id="symbol" type="text" name="symbol" value="{{ form.symbol or '' }}" placeholder="MFCUSDT" {% if is_edit %}disabled{% endif %} />
+          </div>
+          <div class="field">
+            <label for="reference_type">类型</label>
+            <select id="reference_type" name="reference_type" data-rwa-reference-type>
+              <option value="IRON" {% if reference_type_value == 'IRON' %}selected{% endif %}>铁粉</option>
+              <option value="GOLD" {% if reference_type_value == 'GOLD' %}selected{% endif %}>黄金</option>
+              <option value="STOCK" {% if reference_type_value == 'STOCK' %}selected{% endif %}>股票</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="enabled">状态</label>
+            <select id="enabled" name="enabled">
+              <option value="1" {% if form.enabled|string == '1' %}selected{% endif %}>启用</option>
+              <option value="0" {% if form.enabled|string == '0' %}selected{% endif %}>禁用</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="title">标题</label>
+            <input id="title" type="text" name="title" value="{{ form.title or '' }}" placeholder="铁粉参考价" />
+          </div>
+          <div class="field">
+            <label for="subtitle">副标题</label>
+            <input id="subtitle" type="text" name="subtitle" value="{{ form.source_label or form.subtitle or '' }}" placeholder="IRON62/USD" />
+          </div>
+          <div class="field rwa-field-wide">
+            <label for="description">描述</label>
+            <input id="description" type="text" name="description" value="{{ form.description or '' }}" placeholder="1 MFC ≈ 1KG 铁粉" />
+          </div>
+        </div>
+      </div>
+
+      <div class="rwa-form-section">
+        <div class="rwa-section-title">展示配置</div>
+        <div class="rwa-form-grid">
+          <div class="field">
+            <label for="line_color">线颜色</label>
+            <input id="line_color" type="text" name="line_color" value="{{ form.line_color or '#f0b90b' }}" placeholder="#f0b90b" />
+          </div>
+          <div class="field">
+            <label for="badge_color">卡片颜色</label>
+            <input id="badge_color" type="text" name="badge_color" value="{{ form.badge_color or '#f0b90b' }}" placeholder="#f0b90b" />
+          </div>
+          <div class="field">
+            <label for="display_value_label">展示文案</label>
+            <input id="display_value_label" type="text" name="display_value_label" value="{{ form.display_value_label or '' }}" placeholder="108 USD/吨" />
+          </div>
+          <div class="field">
+            <label for="line_title">线标题</label>
+            <input id="line_title" type="text" name="line_title" value="{{ form.line_title or '' }}" placeholder="铁粉参考价" />
+          </div>
+          <div class="field">
+            <label for="display_unit">展示单位</label>
+            <input id="display_unit" type="text" name="display_unit" value="{{ form.display_unit or 'USDT' }}" placeholder="USDT" />
+          </div>
+          <div class="field">
+            <label for="display_price">画线价格</label>
+            <input id="display_price" type="text" name="display_price" value="{{ form.display_price or '' }}" placeholder="0.108" />
+          </div>
+        </div>
+      </div>
+
+      <div class="rwa-form-section">
+        <div class="rwa-section-title">自动同步</div>
+        <div class="rwa-help-card">
+          <div><strong>自动来源配置：</strong> <code>IRON</code> → <code>IRON62</code>；<code>GOLD</code> → <code>XAUUSD</code>；<code>STOCK</code> → <code>ITICK_STOCK</code></div>
+          <div><strong>来源标的：</strong> GOLD 填 <code>XAUUSD</code>；STOCK 填真实股票代码，例如 <code>BON</code> / <code>CREG</code> / <code>IMAA</code>；IRON 可填 <code>IRON62</code> 或留空。</div>
+          <div><strong>同步状态：</strong>只有 SUCCESS 且启用时，前台才展示参考价。</div>
+        </div>
+        <div class="rwa-form-grid">
+          <div class="field">
+            <label for="price_source">价格来源</label>
+            <select id="price_source" name="price_source">
+              <option value="MANUAL" {% if price_source_value == 'MANUAL' %}selected{% endif %}>手动</option>
+              <option value="AUTO" {% if price_source_value == 'AUTO' %}selected{% endif %}>自动</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="auto_source">自动来源</label>
+            <input id="auto_source" type="text" name="auto_source" value="{{ form.auto_source or '' }}" placeholder="IRON62 / XAUUSD / ITICK_STOCK" />
+          </div>
+          <div class="field">
+            <label for="source_symbol">来源标的</label>
+            <input id="source_symbol" type="text" name="source_symbol" value="{{ form.source_symbol or '' }}" placeholder="IRON62" />
+          </div>
+          <div class="field">
+            <label for="refresh_interval_sec">刷新周期（秒）</label>
+            <input id="refresh_interval_sec" type="number" min="15" max="86400" name="refresh_interval_sec" value="{{ form.refresh_interval_sec or '300' }}" placeholder="300" />
+          </div>
+          <div class="field">
+            <label for="sort_order">排序</label>
+            <input id="sort_order" type="number" name="sort_order" value="{{ form.sort_order or '0' }}" />
+          </div>
+        </div>
+      </div>
+
+      <div class="rwa-form-section">
+        <div class="rwa-section-title">同步状态</div>
+        <div class="rwa-status-grid">
+          <div class="rwa-status-item">
+            <div class="rwa-status-label">同步状态</div>
+            <div class="rwa-status-value">
+              <span class="admin-badge {{ form.sync_status_badge_class or 'admin-badge-secondary' }}">{{ form.sync_status_label or form.sync_status or 'PENDING' }}</span>
+            </div>
+          </div>
+          <div class="rwa-status-item">
+            <div class="rwa-status-label">市场状态</div>
+            <div class="rwa-status-value">
+              <span class="admin-badge {{ form.market_status_badge_class or 'admin-badge-secondary' }}">{{ form.market_status_text or form.market_status_label or form.market_status or '未知' }}</span>
+            </div>
+          </div>
+          <div class="rwa-status-item">
+            <div class="rwa-status-label">实时行情</div>
+            <div class="rwa-status-value">
+              <span class="admin-badge {{ form.realtime_badge_class or 'admin-badge-secondary' }}">{{ form.is_realtime_label or form.realtime_label or '否' }}</span>
+            </div>
+          </div>
+          <div class="rwa-status-item">
+            <div class="rwa-status-label">最近同步</div>
+            <div class="rwa-status-value admin-time">{{ form.last_sync_at or '-' }}</div>
+          </div>
+          <div class="rwa-status-item">
+            <div class="rwa-status-label">价格时间</div>
+            <div class="rwa-status-value admin-time">{{ form.price_time or '-' }}</div>
+          </div>
+          <div class="rwa-status-item rwa-field-full">
+            <div class="rwa-status-label">同步错误</div>
+            <pre class="rwa-status-value rwa-sync-error">{{ form.sync_error or '无' }}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="rwa-form-actions">
+        <button type="submit" class="btn admin-btn admin-btn-primary">{% if is_edit %}保存修改{% else %}创建{% endif %}</button>
+        <a href="/admin/reference-overlays" class="btn secondary admin-btn admin-btn-secondary">取消</a>
+      </div>
+    </form>
+  </section>
+
+  <script>
+    (function () {
+      var typeSelect = document.querySelector("[data-rwa-reference-type]");
+      var kindInput = document.querySelector("[data-rwa-kind]");
+      if (!typeSelect || !kindInput) {
+        return;
+      }
+      function syncKind() {
+        kindInput.value = typeSelect.value || "STOCK";
+      }
+      typeSelect.addEventListener("change", syncKind);
+      syncKind();
+    })();
+  </script>
+{% endblock %}

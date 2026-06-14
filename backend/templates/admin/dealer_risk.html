@@ -1,0 +1,204 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}平台对手方限额{% endblock %}
+{% block page_title %}平台对手方限额{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">仅对平台对手方模式生效，用于控制单笔成交额、基础资产净敞口和计价资产净敞口。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/platform/dealer-risk-logs" class="btn secondary admin-btn admin-btn-secondary">查看风控命中记录</a>
+{% endblock %}
+
+{% block content %}
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作成功</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作失败</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">提交失败</div>
+        <div class="muted">
+          {% for err in errors %}
+            <div>{{ err }}</div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="admin-alert admin-alert-warning">Dealer 风控会影响平台对手方成交能力，请谨慎调整限额。</div>
+  </section>
+
+  <section class="page-section two-col">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/platform/dealer-risk" class="filter-form">
+        <div class="field">
+          <label for="symbol">交易对</label>
+          <input id="symbol" type="text" name="symbol" value="{{ filters.symbol or '' }}" placeholder="例如 BTCUSDT" />
+        </div>
+        <div class="field">
+          <label for="enabled">启用状态</label>
+          <select id="enabled" name="enabled">
+            <option value="">全部</option>
+            <option value="1" {% if filters.enabled == '1' %}selected{% endif %}>启用</option>
+            <option value="0" {% if filters.enabled == '0' %}selected{% endif %}>停用</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="status">运行状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="ACTIVE" {% if filters.status == 'ACTIVE' %}selected{% endif %}>运行中</option>
+            <option value="PAUSED" {% if filters.status == 'PAUSED' %}selected{% endif %}>已暂停</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/platform/dealer-risk" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+
+    <div class="filter-card">
+      <div class="section-title">{% if editing %}编辑平台对手方限额{% else %}新增平台对手方限额{% endif %}</div>
+      <div class="table-inline-note">停用会直接关闭该交易对的平台对手方限额；暂停会保留配置，但阻止平台对手方成交继续执行。</div>
+      <form method="post" action="/admin/platform/dealer-risk/save" class="filter-form">
+        <input type="hidden" name="id" value="{{ form.id or '' }}" />
+        <div class="field">
+          <label for="form_symbol">交易对</label>
+          <input id="form_symbol" type="text" name="symbol" value="{{ form.symbol or '' }}" placeholder="例如 BTCUSDT" {% if editing %}readonly{% endif %} />
+        </div>
+        <div class="field">
+          <label for="form_enabled">启用状态</label>
+          <select id="form_enabled" name="enabled">
+            <option value="1" {% if form.enabled == '1' %}selected{% endif %}>启用</option>
+            <option value="0" {% if form.enabled == '0' %}selected{% endif %}>停用</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="form_status">运行状态</label>
+          <select id="form_status" name="status">
+            <option value="ACTIVE" {% if form.status == 'ACTIVE' %}selected{% endif %}>运行中</option>
+            <option value="PAUSED" {% if form.status == 'PAUSED' %}selected{% endif %}>已暂停</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="max_single_notional">单笔最大成交额</label>
+          <input id="max_single_notional" type="text" name="max_single_notional" value="{{ form.max_single_notional or '' }}" placeholder="留空表示不限额" />
+        </div>
+        <div class="field">
+          <label for="max_net_base_position">基础资产净敞口上限</label>
+          <input id="max_net_base_position" type="text" name="max_net_base_position" value="{{ form.max_net_base_position or '' }}" placeholder="留空表示不限额" />
+        </div>
+        <div class="field">
+          <label for="max_net_quote_exposure">计价资产净敞口上限</label>
+          <input id="max_net_quote_exposure" type="text" name="max_net_quote_exposure" value="{{ form.max_net_quote_exposure or '' }}" placeholder="留空表示不限额" />
+        </div>
+        <div class="field">
+          <label for="remark">备注</label>
+          <textarea id="remark" name="remark" rows="3" placeholder="可选备注">{{ form.remark or '' }}</textarea>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">{% if editing %}保存修改{% else %}创建配置{% endif %}</button>
+          <a href="/admin/platform/dealer-risk" class="btn secondary admin-btn admin-btn-secondary">清空表单</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">平台对手方限额列表</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th class="nowrap">交易对</th>
+                <th class="nowrap">启用状态</th>
+                <th class="nowrap">运行状态</th>
+                <th class="text-right">单笔最大成交额</th>
+                <th class="text-right">基础资产净敞口上限</th>
+                <th class="text-right">计价资产净敞口上限</th>
+                <th>备注</th>
+                <th class="nowrap">更新时间</th>
+                <th class="nowrap">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.id }}</td>
+                  <td class="mono nowrap">{{ item.symbol }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.enabled_badge }}">{{ item.enabled_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                  <td class="admin-amount">{{ item.max_single_notional }}</td>
+                  <td class="admin-amount">{{ item.max_net_base_position }}</td>
+                  <td class="admin-amount">{{ item.max_net_quote_exposure }}</td>
+                  <td>{{ item.remark }}</td>
+                  <td class="nowrap admin-time">{{ item.updated_at }}</td>
+                  <td>
+                    <div class="filter-actions admin-table-actions">
+                      <a href="{{ request.url.include_query_params(edit_id=item.id) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">编辑</a>
+                      <form
+                        method="post"
+                        action="/admin/platform/dealer-risk/{{ item.id }}/toggle-enabled"
+                        onsubmit="return confirm('{% if item.enabled == 1 %}确认停用该平台对手方限额？停用后该交易对平台对手方成交能力将受影响。{% else %}确认启用该平台对手方限额？启用后该交易对将恢复限额控制。{% endif %}');"
+                      >
+                        <input type="hidden" name="next_path" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}" />
+                        <button type="submit" class="btn {% if item.enabled == 1 %}danger admin-btn-danger{% else %}admin-btn-primary{% endif %} admin-btn admin-btn-sm">{% if item.enabled == 1 %}停用{% else %}启用{% endif %}</button>
+                      </form>
+                      <form
+                        method="post"
+                        action="/admin/platform/dealer-risk/{{ item.id }}/toggle-status"
+                        onsubmit="return confirm('{% if item.status == 'PAUSED' %}确认恢复该平台对手方配置？恢复后平台对手方成交将继续执行限额控制。{% else %}确认暂停该平台对手方配置？暂停后该交易对平台对手方成交将被阻止。{% endif %}');"
+                      >
+                        <input type="hidden" name="next_path" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}" />
+                        <button type="submit" class="btn {% if item.status == 'PAUSED' %}admin-btn-primary{% else %}danger admin-btn-danger{% endif %} admin-btn admin-btn-sm">{% if item.status == 'PAUSED' %}启用{% else %}暂停{% endif %}</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><span class="admin-badge admin-badge-secondary">暂无平台对手方限额配置</span></div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+

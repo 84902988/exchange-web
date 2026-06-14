@@ -1,0 +1,266 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}市场分析{% endblock %}
+{% block page_title %}市场分析{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">按交易对汇总现货、RWA、合约、股票合约与 CFD 的交易量、手续费、涨跌和平台盈亏情况。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .market-analysis-stat-grid{
+      display:grid;
+      grid-template-columns:repeat(6,minmax(0,1fr));
+      gap:12px;
+    }
+    .market-analysis-stat{
+      min-width:0;
+      overflow:hidden;
+    }
+    .market-analysis-fee-stat{
+      overflow:visible;
+    }
+    .market-analysis-stat .stat-value{
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      font-variant-numeric:tabular-nums;
+      font-size:clamp(18px,1.5vw,24px);
+    }
+    .market-analysis-stat .market-analysis-fee-value{
+      display:flex;
+      flex-direction:column;
+      align-items:flex-start;
+      gap:6px;
+      overflow:visible;
+      text-overflow:clip;
+      white-space:normal;
+      line-height:1.15;
+      font-size:clamp(16px,1.1vw,20px);
+    }
+    .market-analysis-stat .market-analysis-fee-line{
+      min-width:0;
+      overflow:visible;
+      text-overflow:clip;
+      white-space:normal;
+      word-break:break-all;
+    }
+    .market-analysis-filter{
+      grid-template-columns:1fr 1fr 1.4fr 1fr auto;
+    }
+    .market-analysis-table-wrap{
+      overflow-x:auto;
+      border-radius:10px;
+    }
+    .market-analysis-table{
+      width:100%;
+      min-width:1080px;
+      table-layout:fixed;
+    }
+    .market-analysis-table th,
+    .market-analysis-table td{
+      vertical-align:middle;
+      white-space:nowrap;
+    }
+    .market-analysis-table th:nth-child(1), .market-analysis-table td:nth-child(1){ width:58px; }
+    .market-analysis-table th:nth-child(2), .market-analysis-table td:nth-child(2){ width:130px; }
+    .market-analysis-table th:nth-child(3), .market-analysis-table td:nth-child(3){ width:100px; }
+    .market-analysis-table th:nth-child(4), .market-analysis-table td:nth-child(4){ width:130px; }
+    .market-analysis-table th:nth-child(5), .market-analysis-table td:nth-child(5){ width:120px; }
+    .market-analysis-table th:nth-child(6), .market-analysis-table td:nth-child(6){ width:92px; }
+    .market-analysis-table th:nth-child(7), .market-analysis-table td:nth-child(7){ width:150px; }
+    .market-analysis-table th:nth-child(8), .market-analysis-table td:nth-child(8){ width:90px; }
+    .market-analysis-table th:nth-child(9), .market-analysis-table td:nth-child(9){ width:120px; }
+    .market-analysis-table th:nth-child(10), .market-analysis-table td:nth-child(10){ width:88px; }
+    .market-analysis-table th:nth-child(11), .market-analysis-table td:nth-child(11){ width:150px; }
+    .market-analysis-symbol{
+      font-weight:800;
+      color:#fff;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .market-analysis-note{
+      margin-top:14px;
+      padding:12px 14px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:10px;
+      background:rgba(255,255,255,.04);
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.65;
+    }
+    .market-analysis-note ul{
+      margin:0;
+      padding-left:18px;
+    }
+    .market-analysis-notice{
+      margin-bottom:12px;
+      padding:10px 12px;
+      border:1px solid rgba(227,171,57,.28);
+      border-radius:10px;
+      background:rgba(189,134,25,.12);
+      color:#ffd68a;
+      font-size:13px;
+    }
+    .pnl-positive{ color:#6ee7a8; }
+    .pnl-negative{ color:#ff8f8f; }
+    .pnl-zero{ color:var(--muted); }
+    @media (max-width:1380px){
+      .market-analysis-stat-grid{ grid-template-columns:repeat(3,minmax(0,1fr)); }
+      .market-analysis-filter{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .market-analysis-filter .filter-actions{ grid-column:1 / -1; }
+    }
+    @media (max-width:720px){
+      .market-analysis-stat-grid{ grid-template-columns:1fr; }
+      .market-analysis-filter{ grid-template-columns:1fr; }
+    }
+  </style>
+
+  <section class="page-section">
+    <div class="market-analysis-stat-grid">
+      <div class="stat-card market-analysis-stat market-analysis-fee-stat">
+        <div class="stat-label">总成交额</div>
+        <div class="stat-value admin-amount" title="{{ summary.total_turnover_usdt or '0.00' }}">{{ summary.total_turnover_usdt or '0.00' }}</div>
+      </div>
+      <div class="stat-card market-analysis-stat">
+        <div class="stat-label">总交易笔数</div>
+        <div class="stat-value admin-number" title="{{ summary.total_trade_count or 0 }}">{{ summary.total_trade_count or 0 }}</div>
+      </div>
+      <div class="stat-card market-analysis-stat">
+        <div class="stat-label">总手续费收入</div>
+        <div class="stat-value admin-amount market-analysis-fee-value" title="{{ summary.total_fee_display or '--' }}">
+          {% if summary.total_fee_lines %}
+            {% for fee in summary.total_fee_lines %}
+              <div class="market-analysis-fee-line">{{ fee.coin }}：{{ fee.amount }}</div>
+            {% endfor %}
+          {% else %}
+            --
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat-card market-analysis-stat">
+        <div class="stat-label">总平台盈亏</div>
+        <div class="stat-value admin-amount {{ summary.total_platform_pnl_class or 'pnl-zero' }}" title="{{ summary.total_platform_pnl_usdt or '--' }}">{{ summary.total_platform_pnl_usdt or '--' }}</div>
+      </div>
+      <div class="stat-card market-analysis-stat">
+        <div class="stat-label">活跃交易人数</div>
+        <div class="stat-value admin-number" title="{{ summary.active_user_count or 0 }}">{{ summary.active_user_count or 0 }}</div>
+      </div>
+      <div class="stat-card market-analysis-stat">
+        <div class="stat-label">交易对数量</div>
+        <div class="stat-value admin-number" title="{{ summary.pair_count or 0 }}">{{ summary.pair_count or 0 }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/market-analysis/pairs" class="filter-form market-analysis-filter">
+        <div class="field">
+          <label for="range_key">时间范围</label>
+          <select id="range_key" name="range_key">
+            {% for option in range_options %}
+              <option value="{{ option.value }}" {% if filters.range_key == option.value %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="market_type">市场类型</label>
+          <select id="market_type" name="market_type">
+            {% for option in market_type_options %}
+              <option value="{{ option.value }}" {% if filters.market_type == option.value %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="keyword">交易对搜索</label>
+          <input id="keyword" type="text" name="keyword" value="{{ filters.keyword or '' }}" placeholder="symbol keyword" />
+        </div>
+        <div class="field">
+          <label for="sort_by">排序</label>
+          <select id="sort_by" name="sort_by">
+            {% for option in sort_options %}
+              <option value="{{ option.value }}" {% if filters.sort_by == option.value %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/market-analysis/pairs" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">交易对分析</div>
+      {% if performance_notice %}
+        <div class="market-analysis-notice">{{ performance_notice }}</div>
+      {% endif %}
+      {% if items %}
+        <div class="table-wrap admin-table-wrap market-analysis-table-wrap">
+          <table class="data-table admin-table market-analysis-table">
+            <thead>
+              <tr>
+                <th>排名</th>
+                <th>交易对</th>
+                <th>市场类型</th>
+                <th class="text-right">成交额</th>
+                <th class="text-right">成交数量</th>
+                <th class="text-right">交易笔数</th>
+                <th class="text-right">手续费收入</th>
+                <th class="text-right">涨跌幅</th>
+                <th class="text-right">平台盈亏</th>
+                <th class="text-right">活跃人数</th>
+                <th>更新时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-number">#{{ item.rank }}</td>
+                  <td><div class="market-analysis-symbol" title="{{ item.symbol }}">{{ item.symbol }}</div></td>
+                  <td><span class="admin-badge admin-badge-{{ item.market_type_badge }}" title="{{ item.market_type }}">{{ item.market_type_text }}</span></td>
+                  <td class="text-right admin-amount">{{ item.turnover_usdt_display }}</td>
+                  <td class="text-right admin-amount">{{ item.amount_display }}</td>
+                  <td class="text-right admin-number">{{ item.trade_count }}</td>
+                  <td class="text-right admin-amount" title="{{ item.fee_display }}">{{ item.fee_display }}</td>
+                  <td class="text-right admin-amount {{ item.price_change_class }}">{{ item.price_change_display }}</td>
+                  <td class="text-right admin-amount {{ item.platform_pnl_class }}">{{ item.platform_pnl_display }}</td>
+                  <td class="text-right admin-number">{{ item.active_user_count }}</td>
+                  <td class="admin-number">{{ item.updated_at_display }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无市场分析数据</div>
+      {% endif %}
+
+      <div class="market-analysis-note">
+        <ul>
+          <li>现货成交额按 trades.quote_amount 统计。</li>
+          <li>合约/CFD 成交额按已落库 notional 统计；缺失时使用 price * quantity。</li>
+          <li>手续费收入按 USDT 与 RCB 分开展示，未做临时折算。</li>
+          <li>平台盈亏：合约按已实现盈亏统计；现货 Dealer 按成交价与成交时参考价价差统计，不含手续费，历史成交如未记录参考价则显示“缺少参考价”。</li>
+          <li>本页面用于运营分析，不作为财务结算最终依据。</li>
+        </ul>
+      </div>
+
+      <div class="pagination admin-pagination">
+        <div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.has_prev %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.has_next %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

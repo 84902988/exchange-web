@@ -1,0 +1,568 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}平台调账{% endblock %}
+{% block page_title %}平台调账{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">仅支持平台账户（user_id = {{ platform_user_id }}）可用余额调账，不支持普通用户调账，也不支持手工修改冻结余额。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/platform/adjust-logs" class="btn secondary admin-btn admin-btn-secondary">查看调账记录</a>
+{% endblock %}
+
+{% block content %}
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作成功</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作失败</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">提交失败</div>
+        <div class="muted">
+          {% for err in errors %}
+            <div>{{ err }}</div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="admin-alert admin-alert-danger">平台调账会直接影响平台账户余额，请确认币种、账户、方向和金额后再提交。</div>
+  </section>
+
+  <style>
+    .adjust-confirm-modal{
+      position:fixed;
+      inset:0;
+      z-index:50;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      padding:18px;
+      background:rgba(0,0,0,.62);
+      backdrop-filter:blur(6px);
+    }
+    .adjust-confirm-modal.is-open{
+      display:flex;
+    }
+    .adjust-confirm-panel{
+      width:min(760px, 100%);
+      max-height:calc(100vh - 36px);
+      overflow:auto;
+      border:1px solid rgba(189,52,25,.34);
+      border-radius:12px;
+      background:linear-gradient(180deg, rgba(28,23,25,.98), rgba(15,15,20,.98));
+      box-shadow:0 22px 70px rgba(0,0,0,.55);
+      padding:18px;
+    }
+    .adjust-confirm-head{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:12px;
+    }
+    .confirm-status{
+      flex:0 0 auto;
+      padding:5px 9px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.14);
+      color:var(--muted);
+      font-size:12px;
+      line-height:1;
+      background:rgba(0,0,0,.24);
+    }
+    .confirm-status.is-ready{
+      color:#fff;
+      border-color:rgba(53,171,86,.5);
+      background:rgba(53,171,86,.18);
+    }
+    .confirm-status.is-blocked{
+      color:#fff;
+      border-color:rgba(189,52,25,.65);
+      background:rgba(189,52,25,.24);
+    }
+    .adjust-confirm-grid{
+      display:grid;
+      grid-template-columns:repeat(3, minmax(0, 1fr));
+      gap:10px;
+      margin:0 0 12px;
+    }
+    .adjust-confirm-grid div{
+      min-width:0;
+      padding:10px 12px;
+      border-radius:10px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(0,0,0,.22);
+    }
+    .adjust-confirm-grid dt{
+      margin:0 0 5px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .adjust-confirm-grid dd{
+      margin:0;
+      color:#fff;
+      font-weight:700;
+      word-break:normal;
+      overflow-wrap:anywhere;
+    }
+    #confirm-amount,
+    #confirm-current-available,
+    #confirm-after-available{
+      font-family:Consolas, "SFMono-Regular", "Liberation Mono", monospace;
+      font-variant-numeric:tabular-nums;
+      font-size:13px;
+      line-height:1.35;
+    }
+    .confirm-reason-row{
+      grid-column:1 / -1;
+    }
+    .adjust-client-error{
+      margin-bottom:12px;
+      color:#ffb4a8;
+      font-size:13px;
+    }
+    .confirm-input-field{
+      max-width:360px;
+    }
+    .adjust-confirm-actions{
+      display:flex;
+      justify-content:flex-end;
+      gap:10px;
+      margin-top:14px;
+    }
+    .btn:disabled{
+      opacity:.45;
+      cursor:not-allowed;
+    }
+    .platform-adjust-layout{
+      display:grid;
+      grid-template-columns:minmax(0, 7fr) minmax(280px, 3fr);
+      gap:16px;
+      align-items:start;
+    }
+    .platform-adjust-card,
+    .platform-adjust-help{
+      min-width:0;
+      margin-bottom:0;
+    }
+    .platform-adjust-form{
+      display:grid;
+      grid-template-columns:1fr;
+      gap:16px;
+      align-items:start;
+    }
+    .platform-adjust-row{
+      display:grid;
+      grid-template-columns:minmax(0, 1fr) minmax(260px, 1fr);
+      gap:14px;
+      align-items:start;
+    }
+    .platform-adjust-row.amount-row{
+      grid-template-columns:minmax(180px, .8fr) minmax(320px, 1.2fr);
+    }
+    .platform-adjust-form .field textarea{
+      min-height:92px;
+    }
+    .platform-adjust-form .reason-field input{
+      border-color:rgba(189,52,25,.36);
+      background:rgba(189,52,25,.08);
+      font-weight:700;
+    }
+    .platform-adjust-form .remark-field label,
+    .platform-adjust-form .remark-field textarea{
+      color:var(--muted);
+    }
+    .platform-adjust-form .form-note{
+      margin-top:-4px;
+    }
+    .platform-adjust-form .form-actions{
+      justify-content:flex-end;
+      padding-top:4px;
+      border-top:1px solid rgba(255,255,255,.08);
+    }
+    .platform-adjust-form #platform-adjust-submit{
+      background:rgba(189,52,25,.78);
+      border-color:rgba(189,52,25,.44);
+      box-shadow:none;
+      transition:background .16s ease, border-color .16s ease, transform .16s ease;
+    }
+    .platform-adjust-form #platform-adjust-submit:hover{
+      background:#BD3419;
+      border-color:rgba(255,143,120,.55);
+      transform:translateY(-1px);
+    }
+    .platform-adjust-help{
+      width:100%;
+    }
+    .platform-adjust-help-list{
+      margin:0;
+      padding-left:20px;
+      display:grid;
+      gap:10px;
+      line-height:1.7;
+    }
+    @media (max-width: 900px){
+      .adjust-confirm-grid{ grid-template-columns:1fr; }
+      .adjust-confirm-head{ flex-direction:column; }
+      .adjust-confirm-actions{ justify-content:stretch; }
+      .adjust-confirm-actions .btn{ flex:1; }
+      .platform-adjust-layout{ grid-template-columns:1fr; }
+      .platform-adjust-row,
+      .platform-adjust-row.amount-row{ grid-template-columns:1fr; }
+    }
+    @media (max-width: 640px){
+      .platform-adjust-form .form-actions{ justify-content:stretch; }
+      .platform-adjust-form .form-actions .btn{ flex:1; }
+    }
+  </style>
+
+  <section class="page-section platform-adjust-layout">
+    <div class="filter-card platform-adjust-card">
+      <div class="section-title">平台调账表单</div>
+      <form method="post" action="/admin/platform/adjust" class="filter-form platform-adjust-form" id="platform-adjust-form" oninput="syncPlatformAdjustPreview(this);" onsubmit="return handlePlatformAdjustSubmit(this);">
+        <div class="platform-adjust-row">
+          <div class="field">
+            <label for="coin_symbol">币种</label>
+            <input id="coin_symbol" type="text" name="coin_symbol" value="{{ form.coin_symbol or '' }}" placeholder="例如 USDT" />
+          </div>
+          <div class="field">
+            <label for="chain_key">余额账户</label>
+            <input id="chain_key" type="text" name="chain_key" value="{{ form.chain_key or 'spot' }}" placeholder="默认 spot" />
+          </div>
+        </div>
+
+        <div class="platform-adjust-row amount-row">
+          <div class="field">
+            <label for="direction">调账方向</label>
+            <select id="direction" name="direction" onchange="syncAdjustDangerState(this.form); syncPlatformAdjustPreview(this.form);">
+              <option value="INCREASE" {% if (form.direction or 'INCREASE') == 'INCREASE' %}selected{% endif %}>增加</option>
+              <option value="DECREASE" {% if form.direction == 'DECREASE' %}selected{% endif %}>减少</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="amount">数量</label>
+            <input id="amount" type="text" name="amount" value="{{ form.amount or '' }}" placeholder="请输入调账数量" />
+          </div>
+        </div>
+
+        <div class="field reason-field">
+          <label for="reason">原因</label>
+          <input id="reason" type="text" name="reason" value="{{ form.reason or '' }}" placeholder="例如 运营补充流动性" required minlength="4" />
+        </div>
+        <div class="field remark-field">
+          <label for="remark">备注</label>
+          <textarea id="remark" name="remark" rows="3" placeholder="可选备注">{{ form.remark or '' }}</textarea>
+        </div>
+
+        <div id="adjust-danger-note" class="table-inline-note form-note" style="display:none; color:#b42318;">
+          减少余额属于危险操作，请确认币种、链标识和数量无误后再提交。
+        </div>
+
+        <input id="confirm_text" class="form-hidden" type="hidden" name="confirm_text" value="" />
+
+        <div class="filter-actions form-actions">
+          <button type="submit" class="btn danger admin-btn admin-btn-danger" id="platform-adjust-submit">提交调账</button>
+          <a href="/admin/platform/adjust" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+
+      <div class="adjust-confirm-modal" id="adjust-confirm-modal" aria-hidden="true">
+        <div class="adjust-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="adjust-confirm-title">
+          <div class="adjust-confirm-head">
+            <div>
+              <div class="section-title" id="adjust-confirm-title">安全确认</div>
+              <div class="table-inline-note">确认提交平台调账？该操作会直接改变平台账户余额，请仔细核对后输入 CONFIRM。</div>
+            </div>
+            <span id="adjust-preview-status" class="confirm-status">待确认</span>
+          </div>
+          <dl class="adjust-confirm-grid">
+            <div><dt>币种</dt><dd id="confirm-coin-symbol">-</dd></div>
+            <div><dt>链标识</dt><dd id="confirm-chain-key">-</dd></div>
+            <div><dt>调账方向</dt><dd id="confirm-direction">-</dd></div>
+            <div><dt>调账数量</dt><dd id="confirm-amount">-</dd></div>
+            <div><dt>当前可用余额</dt><dd id="confirm-current-available">0</dd></div>
+            <div><dt>调整后可用余额</dt><dd id="confirm-after-available">0</dd></div>
+            <div class="confirm-reason-row"><dt>原因</dt><dd id="confirm-reason">-</dd></div>
+          </dl>
+          <div id="adjust-client-error" class="adjust-client-error" style="display:none;"></div>
+          <div class="field confirm-input-field">
+            <label for="confirm_text_modal">安全确认</label>
+            <input id="confirm_text_modal" type="text" value="" placeholder="请输入 CONFIRM" autocomplete="off" oninput="syncModalConfirmState();" />
+          </div>
+          <div class="adjust-confirm-actions">
+            <button type="button" class="btn secondary admin-btn admin-btn-secondary" onclick="closeAdjustConfirmModal();">取消</button>
+            <button type="button" class="btn danger admin-btn admin-btn-danger" id="adjust-confirm-submit" onclick="submitPlatformAdjustAfterConfirm();" disabled>确认提交</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card platform-adjust-help">
+      <div class="section-title">操作说明</div>
+      <ol class="muted platform-adjust-help-list">
+        <li>当前仅支持平台账户 user_id = {{ platform_user_id }}。</li>
+        <li>本轮仅修改 available_amount，不处理 frozen_amount。</li>
+        <li>调账成功后会同时写入 user_balances、balance_logs、admin_balance_adjust_logs。</li>
+        <li>减少余额时会校验可用余额，不能减成负数。</li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">当前余额筛选</div>
+      <form method="get" action="/admin/platform/adjust" class="filter-form">
+        <div class="field">
+          <label for="filter_coin_symbol">币种</label>
+          <input id="filter_coin_symbol" type="text" name="coin_symbol" value="{{ balance_filters.coin_symbol or '' }}" placeholder="例如 USDT" />
+        </div>
+        <div class="field">
+          <label for="filter_chain_key">链标识</label>
+          <input id="filter_chain_key" type="text" name="chain_key" value="{{ balance_filters.chain_key or 'spot' }}" placeholder="例如 spot" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询余额</button>
+          <a href="/admin/platform/adjust" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">平台账户当前余额</div>
+      <div class="table-inline-note">默认展示平台账户的非零余额资产，用于调账前核对。</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>用户ID</th>
+                <th class="nowrap">币种</th>
+                <th class="nowrap">链标识</th>
+                <th class="text-right">可用余额</th>
+                <th class="text-right">冻结余额</th>
+                <th class="text-right">总余额</th>
+                <th class="nowrap">更新时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td class="mono nowrap">{{ item.coin_symbol }}</td>
+                  <td class="mono nowrap">{{ item.chain_key }}</td>
+                  <td class="admin-amount">{{ item.available_amount }}</td>
+                  <td class="admin-amount">{{ item.frozen_amount }}</td>
+                  <td class="admin-amount">{{ item.total_amount }}</td>
+                  <td class="nowrap">{{ item.updated_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无符合条件的平台账户余额数据</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <script>
+    var platformBalanceLookup = {{ balance_lookup | tojson }};
+    var DECIMAL_SCALE = 18;
+    var DECIMAL_BASE = 1000000000000000000n;
+
+    function setText(id, value) {
+      document.getElementById(id).textContent = value || "-";
+    }
+
+    function parseFixedDecimal(value) {
+      var text = String(value || "").trim();
+      if (!/^\d+(\.\d+)?$/.test(text)) {
+        return null;
+      }
+      var parts = text.split(".");
+      var whole = parts[0] || "0";
+      var fraction = (parts[1] || "").slice(0, DECIMAL_SCALE).padEnd(DECIMAL_SCALE, "0");
+      return BigInt(whole) * DECIMAL_BASE + BigInt(fraction || "0");
+    }
+
+    function formatFixedDecimal(value) {
+      var negative = value < 0n;
+      var absolute = negative ? -value : value;
+      var whole = absolute / DECIMAL_BASE;
+      var fraction = String(absolute % DECIMAL_BASE).padStart(DECIMAL_SCALE, "0").replace(/0+$/, "");
+      return (negative ? "-" : "") + whole.toString() + (fraction ? "." + fraction : "");
+    }
+
+    function currentBalanceFor(form) {
+      var coinSymbol = (form.coin_symbol.value || "").trim().toUpperCase();
+      var chainKey = (form.chain_key.value || "spot").trim().toLowerCase();
+      return platformBalanceLookup[coinSymbol + "|" + chainKey] || {
+        available_amount: "0",
+        available_amount_raw: "0"
+      };
+    }
+
+    function syncAdjustDangerState(form) {
+      var select = form.direction;
+      var submitButton = document.getElementById("platform-adjust-submit");
+      var note = document.getElementById("adjust-danger-note");
+      var isDecrease = (select.value || "") === "DECREASE";
+      submitButton.textContent = isDecrease ? "确认减少余额" : "提交调账";
+      note.style.display = isDecrease ? "block" : "none";
+    }
+
+    function syncPlatformAdjustPreview(form) {
+      var coinSymbol = (form.coin_symbol.value || "").trim().toUpperCase();
+      var chainKey = (form.chain_key.value || "spot").trim().toLowerCase();
+      var directionCode = form.direction.value === "DECREASE" ? "DECREASE" : "INCREASE";
+      var directionLabel = directionCode === "DECREASE" ? "减少" : "增加";
+      var amountText = (form.amount.value || "").trim();
+      var reason = (form.reason.value || "").trim();
+      var balance = currentBalanceFor(form);
+      var currentFixed = parseFixedDecimal(balance.available_amount_raw);
+      var amountFixed = parseFixedDecimal(amountText);
+      var afterFixed = currentFixed !== null && amountFixed !== null
+        ? (directionCode === "DECREASE" ? currentFixed - amountFixed : currentFixed + amountFixed)
+        : currentFixed;
+      var clientError = "";
+
+      if (reason.length < 4) {
+        clientError = "调账原因不能为空，且最少 4 个字符。";
+      } else if (!amountText) {
+        clientError = "请输入调账数量。";
+      } else if (amountText && amountFixed === null) {
+        clientError = "请输入有效的调账数量。";
+      } else if (amountFixed !== null && amountFixed <= 0n) {
+        clientError = "调账数量必须大于 0。";
+      } else if (directionCode === "DECREASE" && afterFixed !== null && afterFixed < 0n) {
+        clientError = "减少后可用余额不能小于 0，请调整数量后再提交。";
+      }
+
+      setText("confirm-coin-symbol", coinSymbol || "-");
+      setText("confirm-chain-key", chainKey || "spot");
+      setText("confirm-direction", directionLabel);
+      setText("confirm-amount", amountText || "-");
+      setText("confirm-current-available", balance.available_amount || "0");
+      setText("confirm-after-available", afterFixed === null ? "-" : formatFixedDecimal(afterFixed));
+      setText("confirm-reason", reason || "-");
+
+      var errorBox = document.getElementById("adjust-client-error");
+      var status = document.getElementById("adjust-preview-status");
+      errorBox.style.display = clientError ? "block" : "none";
+      errorBox.textContent = clientError;
+      status.className = "confirm-status" + (clientError ? " is-blocked" : " is-ready");
+      status.textContent = clientError ? "需修正" : "可确认";
+      return clientError;
+    }
+
+    function openAdjustConfirmModal(form) {
+      var modal = document.getElementById("adjust-confirm-modal");
+      var modalInput = document.getElementById("confirm_text_modal");
+      form.confirm_text.value = "";
+      modalInput.value = "";
+      syncModalConfirmState();
+      modal.classList.add("is-open");
+      modal.setAttribute("aria-hidden", "false");
+      setTimeout(function() { modalInput.focus(); }, 0);
+    }
+
+    function closeAdjustConfirmModal() {
+      var modal = document.getElementById("adjust-confirm-modal");
+      modal.classList.remove("is-open");
+      modal.setAttribute("aria-hidden", "true");
+      document.getElementById("confirm_text_modal").value = "";
+      document.getElementById("confirm_text").value = "";
+      syncModalConfirmState();
+    }
+
+    function syncModalConfirmState() {
+      var modalInput = document.getElementById("confirm_text_modal");
+      var confirmButton = document.getElementById("adjust-confirm-submit");
+      confirmButton.disabled = (modalInput.value || "").trim().toUpperCase() !== "CONFIRM";
+    }
+
+    function handlePlatformAdjustSubmit(form) {
+      if (form.dataset.submitting === "1") {
+        return false;
+      }
+
+      var reason = (form.reason.value || "").trim();
+      var clientError = syncPlatformAdjustPreview(form);
+      if (reason.length < 4) {
+        alert("调账原因不能为空，且最少 4 个字符。");
+        form.reason.focus();
+        return false;
+      }
+      if (clientError) {
+        alert(clientError);
+        return false;
+      }
+
+      openAdjustConfirmModal(form);
+      return false;
+    }
+
+    function submitPlatformAdjustAfterConfirm() {
+      var form = document.getElementById("platform-adjust-form");
+      var modalInput = document.getElementById("confirm_text_modal");
+      if ((modalInput.value || "").trim().toUpperCase() !== "CONFIRM") {
+        modalInput.focus();
+        return;
+      }
+
+      form.confirm_text.value = "CONFIRM";
+      form.dataset.submitting = "1";
+      var submitButton = document.getElementById("platform-adjust-submit");
+      submitButton.disabled = true;
+      submitButton.textContent = "提交中...";
+      form.submit();
+    }
+
+    var platformAdjustForm = document.getElementById("platform-adjust-form");
+    syncAdjustDangerState(platformAdjustForm);
+    syncPlatformAdjustPreview(platformAdjustForm);
+    document.getElementById("adjust-confirm-modal").addEventListener("click", function(event) {
+      if (event.target === this) {
+        closeAdjustConfirmModal();
+      }
+    });
+    document.addEventListener("keydown", function(event) {
+      if (event.key === "Escape") {
+        closeAdjustConfirmModal();
+      }
+    });
+  </script>
+{% endblock %}

@@ -1,0 +1,244 @@
+{% extends "admin/layout.html" %}
+
+{% if is_edit %}
+  {% set form_title = "编辑合约品种" %}
+{% else %}
+  {% set form_title = "新增合约品种" %}
+{% endif %}
+{% set category_labels = {
+  "STOCK": "股票合约",
+  "INDEX": "指数合约",
+  "FOREX": "外汇合约",
+  "METAL": "贵金属合约",
+  "GOLD": "贵金属合约",
+  "COMMODITY": "大宗商品合约",
+  "FUTURES": "大宗商品合约",
+  "CRYPTO": "数字货币合约"
+} %}
+{% set provider_labels = {
+  "ITICK": "iTick 行情",
+  "BINANCE": "Binance 行情",
+  "INTERNAL": "内部行情",
+  "MANUAL": "手动行情"
+} %}
+{% set tp_sl_trigger_price_type_labels = {
+  "MARK_PRICE": "标记价格",
+  "LAST_PRICE": "最新价格"
+} %}
+
+{% block title %}{{ form_title }}{% endblock %}
+{% block page_title %}{{ form_title }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">配置 CFD 合约的基础展示、行情来源、交易精度、最小下单量和杠杆参数。不修改历史订单和持仓。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/contract-symbols" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .contract-form{ display:block; }
+    .form-section{
+      margin-bottom:18px;
+      padding:16px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:12px;
+      background:rgba(255,255,255,.025);
+    }
+    .form-section:last-of-type{ margin-bottom:14px; }
+    .form-section-title{
+      margin:0 0 14px;
+      font-size:15px;
+      font-weight:800;
+      color:#fff;
+    }
+    .form-grid{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:14px;
+      align-items:start;
+    }
+    .field-help{
+      min-height:34px;
+      margin:5px 0 8px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .field input[readonly]{
+      color:rgba(255,255,255,.72);
+      background:rgba(255,255,255,.045);
+      cursor:not-allowed;
+    }
+    .form-footer{
+      display:flex;
+      justify-content:flex-end;
+      gap:10px;
+      margin-top:16px;
+    }
+    @media (max-width:1100px){
+      .form-grid{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+    }
+    @media (max-width:680px){
+      .form-grid{ grid-template-columns:1fr; }
+      .form-footer{ justify-content:stretch; }
+      .form-footer .btn{ flex:1; }
+    }
+  </style>
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">表单校验失败</div>
+        {% for error in errors %}
+          <p class="muted">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">{{ form_title }}</div>
+      <form method="post" action="{{ form_action }}" class="contract-form">
+        <div class="form-section">
+          <h3 class="form-section-title">基础信息</h3>
+          <div class="form-grid">
+            <div class="field">
+              <label for="symbol">合约代码</label>
+              <div class="field-help">系统内唯一标识，例如 BTCUSDT_PERP。编辑时只读，避免影响历史订单和持仓。</div>
+              {% if is_edit %}
+                <input id="symbol" type="text" value="{{ form.symbol or '' }}" readonly />
+              {% else %}
+                <input id="symbol" type="text" name="symbol" value="{{ form.symbol or '' }}" placeholder="例如 BTCUSDT_PERP" />
+              {% endif %}
+            </div>
+            <div class="field">
+              <label for="display_name">显示名称</label>
+              <div class="field-help">后台和用户端展示名称，例如 BTC/USDT 永续。</div>
+              <input id="display_name" type="text" name="display_name" value="{{ form.display_name or '' }}" placeholder="例如 BTC/USDT 永续" />
+            </div>
+            <div class="field">
+              <label for="category">品种类型</label>
+              <div class="field-help">用于区分股票、指数、贵金属、数字货币等合约展示分类。</div>
+              <select id="category" name="category">
+                {% for option in category_options %}
+                  <option value="{{ option }}" {% if form.category == option %}selected{% endif %}>{{ category_labels.get(option, option) }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field">
+              <label for="status">状态</label>
+              <div class="field-help">启用后可在业务侧展示或使用；禁用后用于下架或暂停展示。</div>
+              {% if is_edit %}
+                <input id="status" type="text" value="{% if form.status == '1' %}启用{% else %}禁用{% endif %}" readonly />
+              {% else %}
+                <select id="status" name="status">
+                  <option value="1" {% if form.status == '1' %}selected{% endif %}>启用</option>
+                  <option value="0" {% if form.status == '0' %}selected{% endif %}>禁用</option>
+                </select>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <h3 class="form-section-title">行情来源</h3>
+          <div class="form-grid">
+            <div class="field">
+              <label for="provider">行情来源</label>
+              <div class="field-help">该合约价格使用的行情提供方。</div>
+              <select id="provider" name="provider">
+                {% for option in provider_options %}
+                  <option value="{{ option }}" {% if form.provider == option %}selected{% endif %}>{{ provider_labels.get(option, option) }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field">
+              <label for="provider_symbol">外部行情代码</label>
+              <div class="field-help">行情源侧标的代码。编辑时只读，避免和历史行情、订单引用不一致。</div>
+              <input id="provider_symbol" type="text" name="provider_symbol" value="{{ form.provider_symbol or '' }}" placeholder="例如 BTCUSDT / AAPL" {% if is_edit %}readonly{% endif %} />
+            </div>
+            <div class="field">
+              <label for="quote_asset">计价币种</label>
+              <div class="field-help">盈亏、保证金和价格展示使用的计价币种。编辑时只读。</div>
+              <input id="quote_asset" type="text" name="quote_asset" value="{{ form.quote_asset or 'USDT' }}" {% if is_edit %}readonly{% endif %} />
+            </div>
+            <div class="field">
+              <label for="tp_sl_trigger_price_type">TP/SL 触发价源</label>
+              <div class="field-help">强平固定使用标记价格；这里只控制止盈止损按哪个价格触发。</div>
+              <select id="tp_sl_trigger_price_type" name="tp_sl_trigger_price_type">
+                {% for option in tp_sl_trigger_price_type_options %}
+                  <option value="{{ option }}" {% if (form.tp_sl_trigger_price_type or 'MARK_PRICE') == option %}selected{% endif %}>{{ tp_sl_trigger_price_type_labels.get(option, option) }}</option>
+                {% endfor %}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <h3 class="form-section-title">交易规则</h3>
+          <div class="form-grid">
+            <div class="field">
+              <label for="price_precision">价格精度</label>
+              <div class="field-help">价格保留的小数位数，用于下单输入、行情和持仓展示。</div>
+              <input id="price_precision" type="number" min="0" name="price_precision" value="{{ form.price_precision or '8' }}" />
+            </div>
+            <div class="field">
+              <label for="quantity_precision">数量精度</label>
+              <div class="field-help">下单数量保留的小数位数。</div>
+              <input id="quantity_precision" type="number" min="0" name="quantity_precision" value="{{ form.quantity_precision or '8' }}" />
+            </div>
+            <div class="field">
+              <label for="min_quantity">最小下单数量</label>
+              <div class="field-help">单笔订单允许提交的最小合约数量。</div>
+              <input id="min_quantity" type="text" name="min_quantity" value="{{ form.min_quantity or '' }}" placeholder="例如 0.001" />
+            </div>
+            <div class="field">
+              <label for="max_quantity">最大下单数量</label>
+              <div class="field-help">单笔订单允许提交的最大合约数量，0 表示不限制。</div>
+              <input id="max_quantity" type="text" name="max_quantity" value="{{ form.max_quantity or '' }}" placeholder="0 表示不限制" />
+            </div>
+            <div class="field">
+              <label for="min_margin">最小保证金</label>
+              <div class="field-help">开仓时最低需要投入的保证金金额。</div>
+              <input id="min_margin" type="text" name="min_margin" value="{{ form.min_margin or '' }}" placeholder="例如 10" />
+            </div>
+            <div class="field">
+              <label for="max_leverage">最大杠杆</label>
+              <div class="field-help">该合约允许选择的最大杠杆倍数。</div>
+              <input id="max_leverage" type="number" min="1" max="200" name="max_leverage" value="{{ form.max_leverage or '100' }}" />
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <h3 class="form-section-title">风控参数</h3>
+          <div class="form-grid">
+            <div class="field">
+              <label for="spread_x">点差系数</label>
+              <div class="field-help">预留参数，当前仅用于后台配置展示。</div>
+              <input id="spread_x" type="number" min="0" max="50" step="0.1" name="spread_x" value="{{ form.spread_x or '0.0' }}" />
+            </div>
+            <div class="field">
+              <label for="liquidation_threshold">强平阈值</label>
+              <div class="field-help">预留参数，当前仅用于后台配置展示。</div>
+              <input id="liquidation_threshold" type="text" name="liquidation_threshold" value="{{ form.liquidation_threshold or '' }}" placeholder="例如 0.8" />
+            </div>
+            <div class="field">
+              <label for="warning_threshold">预警阈值</label>
+              <div class="field-help">预留参数，当前仅用于后台配置展示。</div>
+              <input id="warning_threshold" type="text" name="warning_threshold" value="{{ form.warning_threshold or '' }}" placeholder="例如 0.9" />
+            </div>
+          </div>
+        </div>
+
+        <div class="form-footer">
+          <button type="submit" class="btn admin-btn admin-btn-primary">{% if is_edit %}保存修改{% else %}创建合约品种{% endif %}</button>
+          <a href="/admin/contract-symbols" class="btn secondary admin-btn admin-btn-secondary">取消</a>
+        </div>
+      </form>
+    </div>
+  </section>
+{% endblock %}

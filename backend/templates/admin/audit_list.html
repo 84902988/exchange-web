@@ -1,0 +1,145 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}操作审计{% endblock %}
+{% block page_title %}操作审计{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">后台操作审计只读查询，用于追踪管理员操作、请求来源和关键对象。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .audit-policy{margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,255,255,.10);border-radius:8px;background:rgba(255,255,255,.04);color:rgba(255,255,255,.70);font-size:13px;line-height:1.6;}
+    .audit-policy.warning{border-color:rgba(227,171,57,.28);background:rgba(189,134,25,.12);color:#ffd68a;}
+    .audit-quick-ranges{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px;}
+    .audit-quick-ranges .active{background:var(--brand-soft);border-color:rgba(189,52,25,.35);color:#fff;}
+    .audit-time-hint{margin-top:6px;color:rgba(255,255,255,.46);font-size:12px;line-height:1.45;}
+    .audit-detail{max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:rgba(255,255,255,.68);}
+  </style>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <div class="audit-policy">{{ large_table_notice }}</div>
+      {% if query_notice %}
+        <div class="audit-policy warning">{{ query_notice }}</div>
+      {% endif %}
+      <div class="audit-quick-ranges" aria-label="快捷日期">
+        {% for range_item in quick_ranges %}
+          <a
+            href="{{ request.url.include_query_params(created_from=range_item.date_from, created_to=range_item.date_to, date_from=range_item.date_from, date_to=range_item.date_to, start_time=range_item.date_from, end_time=range_item.date_to, page=1) }}"
+            class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if active_range_days == range_item.days %}active{% endif %}"
+          >最近{{ range_item.days }}天</a>
+        {% endfor %}
+      </div>
+      <form method="get" action="/admin/audit" class="filter-form">
+        <div class="field">
+          <label for="audit_id">审计ID</label>
+          <input id="audit_id" type="text" name="audit_id" value="{{ filters.audit_id or '' }}" placeholder="audit_logs.id" />
+        </div>
+        <div class="field">
+          <label for="admin_user_id">管理员ID</label>
+          <input id="admin_user_id" type="text" name="admin_user_id" value="{{ filters.admin_user_id or '' }}" placeholder="管理员ID" />
+        </div>
+        <div class="field">
+          <label for="operator_id">操作人ID</label>
+          <input id="operator_id" type="text" name="operator_id" value="{{ filters.operator_id or '' }}" placeholder="如有 operator_id" />
+        </div>
+        <div class="field">
+          <label for="target_user_id">目标用户ID</label>
+          <input id="target_user_id" type="text" name="target_user_id" value="{{ filters.target_user_id or '' }}" placeholder="如有 target_user_id" />
+        </div>
+        <div class="field">
+          <label for="module">操作模块</label>
+          <input id="module" type="text" name="module" value="{{ filters.module or '' }}" placeholder="例如 funds / user" />
+        </div>
+        <div class="field">
+          <label for="action">动作</label>
+          <input id="action" type="text" name="action" value="{{ filters.action or '' }}" placeholder="例如 created / updated" />
+        </div>
+        <div class="field">
+          <label for="request_id">请求ID</label>
+          <input id="request_id" type="text" name="request_id" value="{{ filters.request_id or '' }}" placeholder="如有 request_id" />
+        </div>
+        <div class="field">
+          <label for="ip">IP</label>
+          <input id="ip" type="text" name="ip" value="{{ filters.ip or '' }}" placeholder="管理员来源 IP" />
+        </div>
+        <div class="field">
+          <label for="created_from">开始日期</label>
+          <input id="created_from" type="date" name="created_from" value="{{ filters.created_from or '' }}" />
+          <div class="audit-time-hint">默认最近7天；普通查询最大范围30天。</div>
+        </div>
+        <div class="field">
+          <label for="created_to">结束日期</label>
+          <input id="created_to" type="date" name="created_to" value="{{ filters.created_to or '' }}" />
+          <div class="audit-time-hint">超过30天请填写审计ID、管理员ID、模块、动作、请求ID或IP。</div>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/audit" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">操作审计列表</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>审计ID</th>
+                <th>时间</th>
+                <th>管理员ID</th>
+                <th>操作人ID</th>
+                <th>目标用户ID</th>
+                <th>模块</th>
+                <th>动作</th>
+                <th>请求ID</th>
+                <th>IP</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.audit_id }}</td>
+                  <td class="nowrap">{{ item.created_at }}</td>
+                  <td class="admin-id">{{ item.admin_user_id or '-' }}</td>
+                  <td class="admin-id">{{ item.operator_id or '-' }}</td>
+                  <td class="admin-id">{{ item.target_user_id or '-' }}</td>
+                  <td>
+                    <span class="admin-badge admin-badge-secondary" title="{{ item.module }}">{{ item.module_label }}</span>
+                  </td>
+                  <td>
+                    <span class="admin-badge admin-badge-info" title="{{ item.action }}">{{ item.action_label }}</span>
+                  </td>
+                  <td class="admin-hash" title="{{ item.request_id }}">{{ item.request_id_short }}</td>
+                  <td class="admin-mono nowrap">{{ item.ip }}</td>
+                  <td class="audit-detail" title="{{ item.detail }}">{{ item.detail }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="admin-empty">暂无操作审计记录。</div>
+      {% endif %}
+
+      {% if pagination.pages > 1 %}
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a class="btn secondary admin-btn admin-btn-secondary" href="{{ request.url.include_query_params(page=pagination.page - 1) }}">上一页</a>
+          {% endif %}
+          <span>第 {{ pagination.page }} / {{ pagination.pages }} 页，共 {{ pagination.total }} 条</span>
+          {% if pagination.page < pagination.pages %}
+            <a class="btn secondary admin-btn admin-btn-secondary" href="{{ request.url.include_query_params(page=pagination.page + 1) }}">下一页</a>
+          {% endif %}
+        </div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}
