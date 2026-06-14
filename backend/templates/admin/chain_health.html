@@ -1,0 +1,200 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}链配置检查{% endblock %}
+{% block page_title %}链配置检查{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">只读检查链级归集地址、热钱包地址、网络开放状态与上线风险。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .health-summary-grid{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(0, 1fr));
+      gap:12px;
+    }
+    .health-card{
+      min-width:0;
+      padding:16px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,.08);
+      background:rgba(255,255,255,.03);
+    }
+    .health-card-label{
+      color:var(--muted);
+      font-size:12px;
+      margin-bottom:6px;
+    }
+    .health-card-value{
+      font-size:28px;
+      line-height:1.1;
+      font-weight:900;
+    }
+    .health-address{
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      min-width:128px;
+    }
+    .health-address-short{
+      color:#dbeafe;
+      font-family:Consolas, "SFMono-Regular", "Liberation Mono", monospace;
+      font-size:12px;
+      word-break:break-all;
+    }
+    .health-address-short.empty{
+      color:var(--muted);
+      font-family:inherit;
+    }
+    .health-risk-list,
+    .health-suggestion-list{
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      min-width:180px;
+      max-width:280px;
+    }
+    .health-risk{
+      display:inline-flex;
+      width:max-content;
+      max-width:100%;
+      padding:5px 8px;
+      border-radius:8px;
+      font-size:12px;
+      line-height:1.45;
+      font-weight:700;
+      white-space:normal;
+    }
+    .health-risk.warning{
+      border:1px solid rgba(251,191,36,.35);
+      background:rgba(251,191,36,.12);
+      color:#fde68a;
+    }
+    .health-risk.danger{
+      border:1px solid rgba(248,113,113,.42);
+      background:rgba(127,29,29,.18);
+      color:#fecaca;
+    }
+    .health-suggestion{
+      color:rgba(255,255,255,.82);
+      font-size:12px;
+      line-height:1.55;
+    }
+    .health-note{
+      margin:0;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.7;
+    }
+    @media (max-width: 960px){
+      .health-summary-grid{ grid-template-columns:repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 560px){
+      .health-summary-grid{ grid-template-columns:1fr; }
+    }
+  </style>
+
+  <section class="page-section">
+    <div class="health-summary-grid">
+      <div class="health-card">
+        <div class="health-card-label">总链数</div>
+        <div class="health-card-value">{{ summary.total_chains }}</div>
+      </div>
+      <div class="health-card">
+        <div class="health-card-label">已开放充值链数</div>
+        <div class="health-card-value">{{ summary.deposit_open_chains }}</div>
+      </div>
+      <div class="health-card">
+        <div class="health-card-label">已开放提现链数</div>
+        <div class="health-card-value">{{ summary.withdraw_open_chains }}</div>
+      </div>
+      <div class="health-card">
+        <div class="health-card-label">有风险链数</div>
+        <div class="health-card-value">{{ summary.risk_chains }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <p class="health-note">本页只读取配置状态，不访问外部 RPC，不触发归集、补 Gas、充值监听或提现发送。</p>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>链名称</th>
+                <th>code</th>
+                <th>native_symbol</th>
+                <th>enabled</th>
+                <th>归集地址状态</th>
+                <th>热钱包地址状态</th>
+                <th class="text-right">充值网络数</th>
+                <th class="text-right">已开放充值网络数</th>
+                <th class="text-right">提现网络数</th>
+                <th class="text-right">已开放提现网络数</th>
+                <th>链能力状态</th>
+                <th>风险等级</th>
+                <th>风险项</th>
+                <th>建议操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td>{{ item.name }}</td>
+                  <td class="mono nowrap">{{ item.chain_key }}</td>
+                  <td class="mono nowrap">{{ item.native_symbol }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.enabled_badge }}">{{ item.enabled_label }}</span></td>
+                  <td>
+                    <div class="health-address">
+                      <span class="admin-badge admin-badge-{{ item.collection_address_status_badge }}">{{ item.collection_address_status_label }}</span>
+                      <span class="health-address-short {% if item.collection_address_status_label == '未配置' %}empty{% endif %}" title="{{ item.collection_address_display }}">{{ item.collection_address_short }}</span>
+                    </div>
+                  </td>
+                  <td>
+                    <div class="health-address">
+                      <span class="admin-badge admin-badge-{{ item.hot_wallet_address_status_badge }}">{{ item.hot_wallet_address_status_label }}</span>
+                      <span class="health-address-short {% if item.hot_wallet_address_status_label == '未配置' %}empty{% endif %}" title="{{ item.hot_wallet_address_display }}">{{ item.hot_wallet_address_short }}</span>
+                    </div>
+                  </td>
+                  <td class="text-right mono">{{ item.deposit_network_count }}</td>
+                  <td class="text-right mono">{{ item.deposit_open_count }}</td>
+                  <td class="text-right mono">{{ item.withdraw_network_count }}</td>
+                  <td class="text-right mono">{{ item.withdraw_open_count }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.capability_badge }}">{{ item.capability_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ item.risk_badge }}">{{ item.risk_label }}</span></td>
+                  <td>
+                    {% if item.risks %}
+                      <div class="health-risk-list">
+                        {% for risk in item.risks %}
+                          <span class="health-risk {{ risk.level }}">{{ risk.message }}</span>
+                        {% endfor %}
+                      </div>
+                    {% else %}
+                      <span class="admin-badge admin-badge-success">正常</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    <div class="health-suggestion-list">
+                      {% for suggestion in item.suggestions %}
+                        <div class="health-suggestion">{{ suggestion }}</div>
+                      {% endfor %}
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无链配置</div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

@@ -1,0 +1,197 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}BD团队长详情{% endblock %}
+{% block page_title %}BD团队长详情{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">只读展示该 BD 团队长名下团队成员现货交易与手续费分成明细。</div>
+{% endblock %}
+
+{% block content %}
+  {% macro coin_stack(items) -%}
+    <div class="bd-detail-coin-stack">
+      {% for coin in items %}
+        <span class="bd-detail-coin-tag">
+          <span class="bd-detail-coin-symbol">{{ coin.coin_symbol }}</span>
+          <span class="bd-detail-coin-value">{{ coin.amount_display }}</span>
+        </span>
+      {% endfor %}
+    </div>
+  {%- endmacro %}
+
+  <style>
+    .bd-detail-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap}
+    .bd-detail-meta{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
+    .bd-detail-meta-item{min-width:0;padding:10px 12px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(255,255,255,.035)}
+    .bd-detail-meta-label{color:var(--muted);font-size:12px;margin-bottom:5px}
+    .bd-detail-meta-value{color:var(--text);font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:14px;font-weight:800;overflow-wrap:anywhere}
+    .bd-detail-actions{display:flex;gap:8px;flex-wrap:wrap}
+    .bd-detail-filter{grid-template-columns:minmax(160px,220px) minmax(160px,220px) minmax(120px,150px) auto}
+    .bd-detail-quick-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+    .bd-summary-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+    .bd-summary-card{min-width:0;padding:14px 16px}
+    .bd-summary-label{color:var(--muted);font-size:12px;margin-bottom:8px}
+    .bd-summary-value{font-size:22px;font-weight:900;line-height:1.15}
+    .bd-detail-table{width:100%;min-width:0;table-layout:fixed}
+    .bd-detail-table th,.bd-detail-table td{min-width:0;padding-left:8px;padding-right:8px;vertical-align:top}
+    .bd-detail-table th{white-space:normal;line-height:1.25}
+    .bd-detail-number{font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+    .bd-detail-member-cell{width:100%;min-width:0;max-width:100%;overflow:hidden}
+    .bd-detail-member,.bd-detail-member-sub{display:block;width:100%;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .bd-detail-member{color:var(--text)}
+    .bd-detail-member-sub{margin-top:4px;color:var(--muted);font-size:12px}
+    .bd-detail-coin-stack{display:flex;flex-direction:column;align-items:stretch;gap:4px;min-width:0}
+    .bd-detail-coin-tag{display:flex;align-items:center;justify-content:space-between;gap:5px;width:100%;min-height:22px;padding:3px 6px;border:1px solid rgba(255,255,255,.10);border-radius:7px;background:rgba(255,255,255,.045);line-height:1.2}
+    .bd-detail-coin-symbol{color:var(--muted);font-size:11px;font-weight:800}
+    .bd-detail-coin-value{color:#fff;font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:11px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;overflow-wrap:anywhere;text-align:right}
+    .bd-detail-note{color:var(--muted);font-size:12px;line-height:1.6}
+    @media (max-width:1260px){.bd-detail-meta{grid-template-columns:repeat(3,minmax(0,1fr))}.bd-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bd-detail-table th,.bd-detail-table td{padding-left:6px;padding-right:6px}.bd-detail-coin-value{font-size:10.5px}}
+    @media (max-width:920px){.bd-detail-meta,.bd-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bd-detail-filter{grid-template-columns:1fr}.bd-detail-head{display:grid}.bd-detail-actions{width:100%}.bd-detail-table{font-size:12px}}
+  </style>
+
+  <section class="page-section">
+    <div class="admin-card">
+      <div class="bd-detail-head">
+        <div>
+          <div class="section-title">团队长信息</div>
+          <div class="bd-detail-meta">
+            <div class="bd-detail-meta-item"><div class="bd-detail-meta-label">BD用户ID</div><div class="bd-detail-meta-value">{{ account.bd_user_id }}</div></div>
+            <div class="bd-detail-meta-item"><div class="bd-detail-meta-label">昵称</div><div class="bd-detail-meta-value">{{ account.nickname or '-' }}</div></div>
+            <div class="bd-detail-meta-item"><div class="bd-detail-meta-label">BD等级</div><div class="bd-detail-meta-value">{{ account.bd_level or '-' }}</div></div>
+            <div class="bd-detail-meta-item"><div class="bd-detail-meta-label">BD分成比例</div><div class="bd-detail-meta-value">{{ account.commission_rate_percent }}</div></div>
+            <div class="bd-detail-meta-item"><div class="bd-detail-meta-label">团队人数</div><div class="bd-detail-meta-value">{{ summary.member_count|default(0) }}</div></div>
+          </div>
+        </div>
+        <div class="bd-detail-actions">
+          <a href="/admin/bd/team" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card admin-card">
+      <div class="section-title">筛选周期</div>
+      <div class="bd-detail-quick-actions">
+        <a href="/admin/bd/teams/{{ account.bd_user_id }}?date=today&page_size={{ pagination.page_size }}" class="btn admin-btn {% if filters.date == 'today' and not filters.range %}admin-btn-primary{% else %}admin-btn-secondary secondary{% endif %}">今日</a>
+        <a href="/admin/bd/teams/{{ account.bd_user_id }}?date=yesterday&page_size={{ pagination.page_size }}" class="btn admin-btn {% if filters.date == 'yesterday' %}admin-btn-primary{% else %}admin-btn-secondary secondary{% endif %}">昨日</a>
+        <a href="/admin/bd/teams/{{ account.bd_user_id }}?range=7d&page_size={{ pagination.page_size }}" class="btn admin-btn {% if filters.range == '7d' %}admin-btn-primary{% else %}admin-btn-secondary secondary{% endif %}">近7天</a>
+        <a href="/admin/bd/teams/{{ account.bd_user_id }}?range=30d&page_size={{ pagination.page_size }}" class="btn admin-btn {% if filters.range == '30d' %}admin-btn-primary{% else %}admin-btn-secondary secondary{% endif %}">近30天</a>
+      </div>
+      <form method="get" action="/admin/bd/teams/{{ account.bd_user_id }}" class="filter-form bd-detail-filter">
+        <div class="field">
+          <label for="start_date">开始日期</label>
+          <input id="start_date" type="date" name="start_date" value="{{ filters.start_date or '' }}" />
+        </div>
+        <div class="field">
+          <label for="end_date">结束日期</label>
+          <input id="end_date" type="date" name="end_date" value="{{ filters.end_date or '' }}" />
+        </div>
+        <div class="field">
+          <label for="page_size">每页条数</label>
+          <input id="page_size" type="number" name="page_size" min="1" max="100" value="{{ pagination.page_size }}" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/bd/teams/{{ account.bd_user_id }}" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="bd-summary-grid">
+      <div class="admin-card bd-summary-card">
+        <div class="bd-summary-label">团队周期交易量</div>
+        <div class="bd-summary-value bd-detail-number">{{ summary.team_period_volume|default('0.00 USDT') }}</div>
+      </div>
+      <div class="admin-card bd-summary-card">
+        <div class="bd-summary-label">团队周期手续费</div>
+        {{ coin_stack(summary.team_period_fee_items) }}
+      </div>
+      <div class="admin-card bd-summary-card">
+        <div class="bd-summary-label">团队BD收益</div>
+        {{ coin_stack(summary.team_period_commission_items) }}
+      </div>
+      <div class="admin-card bd-summary-card">
+        <div class="bd-summary-label">团队成员数</div>
+        <div class="bd-summary-value bd-detail-number">{{ summary.member_count|default(0) }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card admin-card">
+      <div class="section-title">团队成员明细</div>
+      <p class="bd-detail-note">周期数据按所选日期或快捷范围聚合；总数据为当前页成员历史累计。手续费与 BD 收益按原币种分组展示。</p>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table bd-detail-table">
+            <colgroup>
+              <col style="width:9%">
+              <col style="width:11%">
+              <col style="width:9%">
+              <col style="width:10%">
+              <col style="width:12%">
+              <col style="width:10%">
+              <col style="width:11%">
+              <col style="width:12%">
+              <col style="width:14%">
+            </colgroup>
+            <thead>
+              <tr>
+                <th>团队成员ID</th>
+                <th>昵称</th>
+                <th>关系状态</th>
+                <th class="text-right">周期交易量（现货）</th>
+                <th>周期手续费（现货）</th>
+                <th class="text-right">总交易量（现货）</th>
+                <th>手续费总收益（现货）</th>
+                <th>BD周期收益</th>
+                <th>BD总收益</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="bd-detail-number">{{ item.user_id }}</td>
+                  <td class="bd-detail-member-cell">
+                    <div class="bd-detail-member" title="{{ item.nickname }}">{{ item.nickname }}</div>
+                    {% if item.email or item.phone %}
+                      <div class="bd-detail-member-sub" title="{{ item.email or item.phone }}">{{ item.email or item.phone }}</div>
+                    {% endif %}
+                  </td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.relation_status_badge }}">
+                      {{ item.relation_status_label }}
+                    </span>
+                  </td>
+                  <td class="text-right bd-detail-number">{{ item.daily_volume }}</td>
+                  <td>{{ coin_stack(item.daily_fee_items) }}</td>
+                  <td class="text-right bd-detail-number">{{ item.total_volume }}</td>
+                  <td>{{ coin_stack(item.total_fee_items) }}</td>
+                  <td>{{ coin_stack(item.daily_commission_items) }}</td>
+                  <td>{{ coin_stack(item.total_commission_items) }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无数据</div><p class="admin-empty-desc">该 BD 团队长暂无生效团队成员</p></div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

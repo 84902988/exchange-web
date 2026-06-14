@@ -1,0 +1,292 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}系统运行中心{% endblock %}
+{% block page_title %}系统运行中心{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">集中查看 API、Redis、RQ 队列、常驻服务和失败任务状态。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <div class="ops-actions">
+    <a href="/admin/system/rq" class="btn secondary admin-btn admin-btn-secondary">RQ 队列详情</a>
+    <a href="/admin/system/services" class="btn secondary admin-btn admin-btn-secondary">服务总览</a>
+    <a href="/admin/collections/center" class="btn secondary admin-btn admin-btn-secondary">归集中心</a>
+    <a href="/admin/withdraw-records" class="btn secondary admin-btn admin-btn-secondary">提现记录</a>
+  </div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .ops-actions{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+    }
+    .ops-summary-grid{
+      display:grid;
+      grid-template-columns:repeat(6, minmax(0, 1fr));
+      gap:14px;
+    }
+    .ops-alert-list{
+      display:grid;
+      gap:10px;
+    }
+    .ops-alert{
+      padding:12px 14px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(255,255,255,.04);
+      color:#fff;
+      line-height:1.45;
+    }
+    .ops-alert-danger{
+      border-color:rgba(255,90,90,.36);
+      background:rgba(255,90,90,.10);
+      color:#ffd6d6;
+    }
+    .ops-alert-warning{
+      border-color:rgba(255,193,7,.34);
+      background:rgba(255,193,7,.10);
+      color:#ffe6a6;
+    }
+    .ops-mini-grid{
+      display:grid;
+      grid-template-columns:repeat(3, minmax(0, 1fr));
+      gap:14px;
+    }
+    .ops-panel{
+      min-width:0;
+      padding:16px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,.08);
+      background:rgba(255,255,255,.03);
+    }
+    .ops-panel-title{
+      margin:0 0 10px;
+      font-size:14px;
+      font-weight:800;
+      color:#fff;
+    }
+    .ops-list{
+      display:grid;
+      gap:8px;
+      margin:0;
+      padding:0;
+      list-style:none;
+    }
+    .ops-list li{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      color:var(--muted);
+      font-size:13px;
+    }
+    .ops-table-note{
+      margin:0 0 12px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .ops-impact{
+      max-width:240px;
+      color:var(--muted);
+      line-height:1.45;
+    }
+    .ops-desc{
+      max-width:180px;
+      color:rgba(255,255,255,.78);
+      line-height:1.45;
+    }
+    .ops-number{
+      font-variant-numeric:tabular-nums;
+      font-feature-settings:"tnum" 1;
+    }
+    @media (max-width: 1320px){
+      .ops-summary-grid{ grid-template-columns:repeat(3, minmax(0, 1fr)); }
+      .ops-mini-grid{ grid-template-columns:1fr; }
+    }
+    @media (max-width: 760px){
+      .ops-summary-grid{ grid-template-columns:1fr; }
+      .ops-actions{ justify-content:flex-start; }
+    }
+  </style>
+
+  {% set oc = operations_center %}
+  {% set summary = oc.summary %}
+
+  {% if oc.risk_alerts %}
+    <section class="page-section">
+      <div class="ops-alert-list">
+        {% for alert in oc.risk_alerts %}
+          <div class="ops-alert ops-alert-{{ alert.level }}">{{ alert.message }}</div>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="ops-summary-grid">
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">API 状态</div>
+          <div class="stat-icon">A</div>
+        </div>
+        <div class="stat-value"><span class="admin-badge admin-badge-{{ summary.api_status_badge }}">{{ summary.api_status }}</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">Redis 状态</div>
+          <div class="stat-icon">R</div>
+        </div>
+        <div class="stat-value"><span class="admin-badge admin-badge-{{ summary.redis_status_badge }}">{{ summary.redis_status }}</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">在线 Worker</div>
+          <div class="stat-icon">W</div>
+        </div>
+        <div class="stat-value ops-number">{{ summary.online_workers }} / {{ summary.registered_workers }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">队列积压</div>
+          <div class="stat-icon">Q</div>
+        </div>
+        <div class="stat-value ops-number">{{ summary.queued_total }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">失败任务</div>
+          <div class="stat-icon">F</div>
+        </div>
+        <div class="stat-value ops-number">{{ summary.failed_total }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">异常服务</div>
+          <div class="stat-icon">S</div>
+        </div>
+        <div class="stat-value ops-number">{{ summary.abnormal_service_count }}</div>
+      </div>
+    </div>
+    <div class="stat-note">刷新时间：{{ oc.as_of }}</div>
+  </section>
+
+  <section class="page-section">
+    <div class="ops-mini-grid">
+      <div class="ops-panel">
+        <div class="ops-panel-title">队列积压</div>
+        {% if oc.backlog_rows %}
+          <ul class="ops-list">
+            {% for row in oc.backlog_rows %}
+              <li><span class="mono">{{ row.name }}</span><span class="ops-number">queued {{ row.queued_count }}</span></li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <div class="empty-state admin-empty">暂无队列积压</div>
+        {% endif %}
+      </div>
+      <div class="ops-panel">
+        <div class="ops-panel-title">失败任务</div>
+        {% if oc.failed_queue_rows %}
+          <ul class="ops-list">
+            {% for row in oc.failed_queue_rows %}
+              <li><span class="mono">{{ row.name }}</span><span class="ops-number">failed {{ row.failed_count }}</span></li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <div class="empty-state admin-empty">暂无失败任务</div>
+        {% endif %}
+      </div>
+      <div class="ops-panel">
+        <div class="ops-panel-title">异常服务</div>
+        {% if oc.abnormal_services %}
+          <ul class="ops-list">
+            {% for row in oc.abnormal_services %}
+              <li><span>{{ row.name }}</span><span class="admin-badge admin-badge-{{ row.status_badge }}">{{ row.status_label }}</span></li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <div class="empty-state admin-empty">暂无异常服务</div>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">RQ 队列状态</div>
+      <p class="ops-table-note">展示核心队列的在线处理能力、积压和失败任务数量。</p>
+      <div class="table-wrap admin-table-wrap">
+        <table class="data-table admin-table">
+          <thead>
+            <tr>
+              <th>队列</th>
+              <th class="text-right">在线 Worker</th>
+              <th class="text-right">queued</th>
+              <th class="text-right">deferred</th>
+              <th class="text-right">failed</th>
+              <th class="text-right">scheduled</th>
+              <th>最近心跳</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in oc.queue_rows %}
+              <tr>
+                <td class="mono nowrap">{{ row.name }}</td>
+                <td class="text-right mono ops-number">{{ row.online_workers }}</td>
+                <td class="text-right mono ops-number">{{ row.queued_count }}</td>
+                <td class="text-right mono ops-number">{{ row.deferred_count }}</td>
+                <td class="text-right mono ops-number">{{ row.failed_count }}</td>
+                <td class="text-right mono ops-number">{{ row.scheduled_count }}</td>
+                <td class="mono nowrap">{{ row.recent_heartbeat }}</td>
+                <td><span class="admin-badge admin-badge-{{ row.status_badge }}">{{ row.status_label }}</span></td>
+              </tr>
+            {% else %}
+              <tr><td colspan="8"><div class="empty-state admin-empty">暂无队列状态</div></td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">常驻服务状态</div>
+      <p class="ops-table-note">展示上线后需要持续运行的后台服务状态及异常影响。</p>
+      <div class="table-wrap admin-table-wrap">
+        <table class="data-table admin-table">
+          <thead>
+            <tr>
+              <th>服务</th>
+              <th>状态</th>
+              <th>最后心跳</th>
+              <th>PID</th>
+              <th>主机</th>
+              <th>说明</th>
+              <th>影响</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in oc.service_rows %}
+              <tr>
+                <td class="nowrap">{{ row.name }}</td>
+                <td><span class="admin-badge admin-badge-{{ row.status_badge }}">{{ row.status_label }}</span></td>
+                <td class="mono nowrap">{{ row.last_heartbeat }}</td>
+                <td class="mono nowrap">{{ row.pid }}</td>
+                <td class="mono nowrap">{{ row.host }}</td>
+                <td class="ops-desc">{{ row.description }}</td>
+                <td class="ops-impact">{{ row.impact }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="7"><div class="empty-state admin-empty">暂无服务状态</div></td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+{% endblock %}

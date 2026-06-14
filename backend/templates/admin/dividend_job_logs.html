@@ -1,0 +1,129 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}分红任务日志{% endblock %}
+{% block page_title %}分红任务日志{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看分红定时任务每次执行、跳过、恢复和失败原因。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/dividend-pools" class="btn secondary admin-btn admin-btn-secondary">分红管理</a>
+  <a href="/admin/dividend-stats" class="btn secondary admin-btn admin-btn-secondary">分红统计</a>
+{% endblock %}
+
+{% block content %}
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/dividends/job-logs" class="filter-form">
+        <div class="field">
+          <label for="dividend_date">分红日期</label>
+          <input id="dividend_date" type="date" name="dividend_date" value="{{ filters.dividend_date_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="start_date">开始日期</label>
+          <input id="start_date" type="date" name="start_date" value="{{ filters.start_date_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="end_date">结束日期</label>
+          <input id="end_date" type="date" name="end_date" value="{{ filters.end_date_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <input id="status" type="text" name="status" value="{{ filters.status or '' }}" placeholder="例如 FAILED" />
+        </div>
+        <div class="field">
+          <label for="trigger_type">触发类型</label>
+          <select id="trigger_type" name="trigger_type">
+            <option value="">全部</option>
+            <option value="AUTO" {% if filters.trigger_type == 'AUTO' %}selected{% endif %}>自动任务</option>
+            <option value="MANUAL" {% if filters.trigger_type == 'MANUAL' %}selected{% endif %}>手动触发</option>
+            <option value="MANUAL_TRIGGER" {% if filters.trigger_type == 'MANUAL_TRIGGER' %}selected{% endif %}>手动补跑</option>
+            <option value="RETRY" {% if filters.trigger_type == 'RETRY' %}selected{% endif %}>重试</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/dividends/job-logs" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">任务执行记录</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>分红日期</th>
+                <th>运行时间</th>
+                <th>触发</th>
+                <th>状态</th>
+                <th>步骤</th>
+                <th>分红池</th>
+                <th>说明</th>
+                <th>错误</th>
+                <th>创建时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="mono nowrap admin-id">{{ item.id }}</td>
+                  <td class="nowrap admin-time">{{ item.dividend_date }}</td>
+                  <td class="nowrap admin-time">{{ item.run_time }}</td>
+                  <td><span class="admin-badge admin-badge-info" title="{{ item.trigger_type }}">{{ item.trigger_type_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-secondary" title="{{ item.step }}">{{ item.step_label }}</span></td>
+                  <td>
+                    {% if item.pool_id %}
+                      <a class="mono admin-id" href="/admin/dividend-pools/{{ item.pool_id }}">#{{ item.pool_id }}</a>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
+                  <td>{{ item.message }}</td>
+                  <td>
+                    {% if item.error_message %}
+                      <details>
+                        <summary>查看错误</summary>
+                        <div class="mono admin-hash" title="{{ item.error_message }}">{{ item.error_message }}</div>
+                      </details>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
+                  <td class="nowrap admin-time">{{ item.created_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">当前筛选范围内暂无任务日志</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

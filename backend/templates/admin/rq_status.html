@@ -1,0 +1,205 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}RQ 队列监控{% endblock %}
+{% block page_title %}RQ 队列监控{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">只读查看 RQ 队列积压、失败任务和 worker 基础状态。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/system/rq" class="btn secondary admin-btn admin-btn-secondary">刷新</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .rq-summary-grid{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(0, 1fr));
+      gap:14px;
+    }
+    .rq-failed-list{
+      display:grid;
+      gap:8px;
+      min-width:280px;
+    }
+    .rq-failed-item{
+      padding:10px 12px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:10px;
+      background:rgba(255,255,255,.03);
+    }
+    .rq-failed-meta{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      margin-bottom:6px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .rq-error{
+      color:#ffb4b4;
+      word-break:break-word;
+    }
+    .rq-worker-list{
+      display:grid;
+      gap:10px;
+    }
+    .rq-worker-row{
+      display:grid;
+      grid-template-columns:minmax(180px, 1fr) minmax(90px, .5fr) minmax(220px, 1.2fr) minmax(180px, 1fr) minmax(180px, 1fr);
+      gap:12px;
+      align-items:center;
+      padding:12px 14px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:12px;
+      background:rgba(255,255,255,.03);
+    }
+    .rq-worker-label{
+      color:var(--muted);
+      font-size:12px;
+      margin-bottom:4px;
+    }
+    @media (max-width: 1180px){
+      .rq-summary-grid{ grid-template-columns:repeat(2, minmax(0, 1fr)); }
+      .rq-worker-row{ grid-template-columns:1fr 1fr; }
+    }
+    @media (max-width: 640px){
+      .rq-summary-grid,
+      .rq-worker-row{ grid-template-columns:1fr; }
+    }
+  </style>
+
+  {% if not rq_status.redis_connected %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">Redis 未连接</div>
+        <p class="muted">当前无法读取 RQ 队列状态，请检查 Redis 服务、连接配置和网络连通性。</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="rq-summary-grid">
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">队列数量</div>
+          <div class="stat-icon">Q</div>
+        </div>
+        <div class="stat-value admin-number">{{ rq_status.summary.queue_count }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">worker 数量</div>
+          <div class="stat-icon">W</div>
+        </div>
+        <div class="stat-value admin-number">{{ rq_status.summary.worker_count }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">queued 总数</div>
+          <div class="stat-icon">J</div>
+        </div>
+        <div class="stat-value admin-number">{{ rq_status.summary.queued_total }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">failed 总数</div>
+          <div class="stat-icon">F</div>
+        </div>
+        <div class="stat-value admin-number">{{ rq_status.summary.failed_total }}</div>
+      </div>
+    </div>
+    <div class="stat-note">刷新时间：{{ rq_status.as_of }}</div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">队列状态</div>
+      <div class="table-wrap admin-table-wrap">
+        <table class="data-table admin-table">
+          <thead>
+            <tr>
+              <th>队列名</th>
+              <th class="text-right">queued</th>
+              <th class="text-right">started</th>
+              <th class="text-right">deferred</th>
+              <th class="text-right">failed</th>
+              <th class="text-right">finished</th>
+              <th class="text-right">worker</th>
+              <th>状态</th>
+              <th>最近失败 job 摘要</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for queue in rq_status.queues %}
+              <tr>
+                <td class="mono nowrap">{{ queue.name }}</td>
+                <td class="text-right mono admin-number">{{ queue.queued_count }}</td>
+                <td class="text-right mono admin-number">{{ queue.started_count }}</td>
+                <td class="text-right mono admin-number">{{ queue.deferred_count }}</td>
+                <td class="text-right mono admin-number">{{ queue.failed_count }}</td>
+                <td class="text-right mono admin-number">{{ queue.finished_count }}</td>
+                <td class="text-right mono admin-number">{{ queue.worker_count }}</td>
+                <td><span class="admin-badge admin-badge-{{ queue.status_badge }}">{{ queue.status_label }}</span></td>
+                <td>
+                  {% if queue.failed_jobs %}
+                    <div class="rq-failed-list">
+                      {% for job in queue.failed_jobs %}
+                        <div class="rq-failed-item">
+                          <div class="rq-failed-meta">
+                            <span class="mono" title="{{ job.id }}">{{ job.id }}</span>
+                            <span class="mono">{{ job.func_name }}</span>
+                            <span>{{ job.ended_at }}</span>
+                          </div>
+                          <div class="rq-error" title="{{ job.error }}">{{ job.error }}</div>
+                        </div>
+                      {% endfor %}
+                    </div>
+                  {% else %}
+                    <span class="admin-muted">-</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">Worker 基础状态</div>
+      {% if rq_status.workers %}
+        <div class="rq-worker-list">
+          {% for worker in rq_status.workers %}
+            <div class="rq-worker-row">
+              <div>
+                <div class="rq-worker-label">worker</div>
+                <div class="mono" title="{{ worker.name }}">{{ worker.name }}</div>
+              </div>
+              <div>
+                <div class="rq-worker-label">状态</div>
+                <span class="admin-badge admin-badge-info">{{ worker.state }}</span>
+              </div>
+              <div>
+                <div class="rq-worker-label">队列</div>
+                <div class="mono">{{ worker.queues }}</div>
+              </div>
+              <div>
+                <div class="rq-worker-label">最近心跳</div>
+                <div class="mono">{{ worker.last_heartbeat }}</div>
+              </div>
+              <div>
+                <div class="rq-worker-label">启动时间</div>
+                <div class="mono">{{ worker.birth_date }}</div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无 worker 在线</div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

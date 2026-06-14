@@ -1,0 +1,324 @@
+/* Admin UI foundation classes. Keep these scoped with the admin prefix. */
+
+.admin-page{
+  flex:1 1 auto;
+  min-width:0;
+  padding:18px 18px 30px;
+  overflow-x:auto;
+}
+
+.admin-page-header{
+  display:flex;
+  align-items:flex-end;
+  justify-content:space-between;
+  gap:16px;
+  margin:8px 0 16px;
+}
+
+.admin-page-title{
+  margin:0;
+  font-size:24px;
+  font-weight:900;
+  line-height:1.2;
+  letter-spacing:0;
+}
+
+.admin-page-subtitle{
+  margin-top:6px;
+  color:var(--muted);
+  font-size:13px;
+  line-height:1.5;
+}
+
+.admin-section{
+  margin-bottom:18px;
+}
+
+.admin-card{
+  background:linear-gradient(180deg, var(--panel-strong), var(--panel));
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  box-shadow:var(--shadow);
+  padding:18px;
+  margin-bottom:14px;
+}
+
+.admin-table-wrap{
+  width:100%;
+  overflow:auto;
+}
+
+.admin-table{
+  width:100%;
+  min-width:640px;
+  border-collapse:collapse;
+}
+
+.admin-table th,
+.admin-table td{
+  padding:10px 9px;
+  border-bottom:1px solid rgba(255,255,255,.08);
+  font-size:13px;
+  line-height:1.45;
+  text-align:left;
+  vertical-align:top;
+}
+
+.admin-table th{
+  color:var(--muted);
+  font-weight:600;
+  white-space:nowrap;
+}
+
+.admin-table tr:last-child td{
+  border-bottom:none;
+}
+
+.admin-table tbody tr:hover{
+  background:rgba(255,255,255,.025);
+}
+
+.admin-table-actions{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  flex-wrap:wrap;
+}
+
+.admin-number,
+.admin-time{
+  font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;
+}
+
+.admin-number{
+  text-align:right;
+}
+
+.admin-time{
+  white-space:nowrap;
+}
+
+.admin-pagination{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin-top:14px;
+  color:var(--muted);
+  font-size:13px;
+  line-height:1.45;
+  flex-wrap:wrap;
+}
+
+.admin-pagination .pagination-actions,
+.admin-pagination .orders-pagination-actions,
+.admin-pagination .trade-pagination-actions,
+.admin-pagination .contract-pagination-actions{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+
+.admin-muted{
+  color:var(--muted);
+}
+
+.admin-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:40px;
+  padding:0 14px;
+  border:1px solid transparent;
+  border-radius:10px;
+  background:var(--brand);
+  color:#fff;
+  font:inherit;
+  font-size:14px;
+  font-weight:700;
+  line-height:1;
+  cursor:pointer;
+  text-decoration:none;
+  white-space:nowrap;
+}
+
+.admin-btn:hover{
+  text-decoration:none;
+}
+
+.admin-btn-primary{
+  background:var(--brand);
+  border-color:transparent;
+  color:#fff;
+}
+
+.admin-btn-secondary{
+  background:rgba(255,255,255,.05);
+  border-color:var(--border);
+  color:var(--text);
+}
+
+.admin-btn-danger{
+  background:#a92f22;
+  border-color:rgba(255,255,255,.08);
+  color:#fff;
+}
+
+.admin-btn-ghost{
+  background:transparent;
+  border-color:rgba(255,255,255,.12);
+  color:var(--text);
+}
+
+.admin-btn-sm{
+  min-height:32px;
+  padding:0 10px;
+  border-radius:8px;
+  font-size:12px;
+}
+
+.admin-badge{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:26px;
+  padding:0 10px;
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:999px;
+  background:rgba(255,255,255,.05);
+  color:#fff;
+  font-size:12px;
+  font-weight:700;
+  line-height:1;
+  white-space:nowrap;
+}
+
+.admin-badge-success{
+  background:rgba(31,122,85,.18);
+  border-color:rgba(49,177,119,.32);
+  color:#a8f0cd;
+}
+
+.admin-badge-warning{
+  background:rgba(189,134,25,.18);
+  border-color:rgba(227,171,57,.30);
+  color:#ffd68a;
+}
+
+.admin-badge-danger{
+  background:rgba(177,52,52,.18);
+  border-color:rgba(216,89,89,.30);
+  color:#ffb4b4;
+}
+
+.admin-badge-info{
+  background:rgba(62,112,178,.18);
+  border-color:rgba(87,148,229,.32);
+  color:#b8d9ff;
+}
+
+.admin-badge-muted{
+  background:rgba(255,255,255,.06);
+  border-color:rgba(255,255,255,.12);
+  color:rgba(255,255,255,.82);
+}
+
+.admin-badge-neutral{
+  background:rgba(255,255,255,.06);
+  border-color:rgba(255,255,255,.12);
+  color:rgba(255,255,255,.82);
+}
+
+.admin-badge-secondary{
+  background:rgba(255,255,255,.06);
+  border-color:rgba(255,255,255,.12);
+  color:rgba(255,255,255,.82);
+}
+
+.admin-badge-ok{
+  background:rgba(31,122,85,.18);
+  border-color:rgba(49,177,119,.32);
+  color:#a8f0cd;
+}
+
+.admin-badge-warn{
+  background:rgba(189,134,25,.18);
+  border-color:rgba(227,171,57,.30);
+  color:#ffd68a;
+}
+
+.admin-badge-brand{
+  background:rgba(189,52,25,.18);
+  border-color:rgba(189,52,25,.32);
+  color:#ffc1b4;
+}
+
+.admin-badge-purple{
+  background:rgba(133,92,214,.18);
+  border-color:rgba(156,120,230,.32);
+  color:#d6c7ff;
+}
+
+.admin-empty{
+  padding:28px 12px;
+  text-align:center;
+  color:var(--muted);
+}
+
+.admin-empty-title{
+  margin:0 0 6px;
+  color:var(--text);
+  font-size:15px;
+  font-weight:800;
+  line-height:1.35;
+}
+
+.admin-empty-desc{
+  margin:0;
+  color:var(--muted);
+  font-size:13px;
+  line-height:1.5;
+}
+
+.admin-alert{
+  padding:12px 14px;
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:12px;
+  background:rgba(255,255,255,.04);
+  color:var(--text);
+  font-size:13px;
+  line-height:1.5;
+}
+
+.admin-alert-info{
+  background:rgba(62,112,178,.12);
+  border-color:rgba(87,148,229,.24);
+  color:#cbe4ff;
+}
+
+.admin-alert-warning{
+  background:rgba(189,134,25,.12);
+  border-color:rgba(227,171,57,.24);
+  color:#ffe0a3;
+}
+
+.admin-alert-danger{
+  background:rgba(177,52,52,.12);
+  border-color:rgba(216,89,89,.24);
+  color:#ffc6c6;
+}
+
+@media (max-width:980px){
+  .admin-page{
+    padding:14px;
+  }
+}
+
+@media (max-width:640px){
+  .admin-page-header{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+}

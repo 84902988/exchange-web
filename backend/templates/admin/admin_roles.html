@@ -1,0 +1,678 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}角色管理{% endblock %}
+{% block page_title %}角色管理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">维护后台角色基础信息，并按业务模块配置角色权限点。</div>
+{% endblock %}
+
+{% block page_actions %}
+  {% if can_manage_admin_roles %}
+    <button type="button" class="btn admin-btn admin-btn-primary" data-admin-modal-open="admin-role-create-modal">新增角色</button>
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+  <style>
+    .admin-roles-filter-form{
+      display:grid;
+      grid-template-columns:minmax(150px, 1fr) minmax(130px, .65fr) 1fr auto;
+      gap:10px;
+      align-items:end;
+    }
+    .admin-role-create-fields,
+    .admin-role-edit-fields{
+      display:grid;
+      grid-template-columns:minmax(150px, 1fr) minmax(180px, 1fr) minmax(130px, .65fr);
+      gap:10px;
+      align-items:start;
+    }
+    .admin-role-create-fields{
+      grid-template-columns:minmax(220px, 1fr) minmax(150px, .45fr);
+    }
+    .admin-roles-action-buttons{
+      display:flex;
+      flex-wrap:nowrap;
+      gap:8px;
+      min-width:132px;
+    }
+    .admin-roles-action-buttons form{
+      margin:0;
+    }
+    .admin-roles-description{
+      max-width:360px;
+      overflow-wrap:anywhere;
+    }
+    .admin-roles-table{
+      width:100%;
+      table-layout:fixed;
+    }
+    .admin-roles-table th:nth-child(1),
+    .admin-roles-table td:nth-child(1){
+      width:64px;
+    }
+    .admin-roles-table th:nth-child(2),
+    .admin-roles-table td:nth-child(2){
+      width:16%;
+    }
+    .admin-roles-table th:nth-child(4),
+    .admin-roles-table td:nth-child(4),
+    .admin-roles-table th:nth-child(5),
+    .admin-roles-table td:nth-child(5),
+    .admin-roles-table th:nth-child(6),
+    .admin-roles-table td:nth-child(6){
+      width:86px;
+    }
+    .admin-roles-table th:nth-child(7),
+    .admin-roles-table td:nth-child(7){
+      width:136px;
+    }
+    .admin-roles-table th:nth-child(8),
+    .admin-roles-table td:nth-child(8){
+      width:230px;
+    }
+    .admin-role-code{
+      font-family:Consolas, "SFMono-Regular", "Liberation Mono", monospace;
+      font-size:12px;
+      overflow-wrap:anywhere;
+    }
+    .admin-role-permissions{
+      display:grid;
+      gap:12px;
+    }
+    .admin-role-super-hint{
+      padding:10px 12px;
+      border:1px solid rgba(250,204,21,.28);
+      border-radius:8px;
+      background:rgba(250,204,21,.08);
+      color:#fde68a;
+      font-size:12px;
+      line-height:1.5;
+    }
+    .admin-role-permission-group{
+      padding:12px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:8px;
+      background:rgba(255,255,255,.035);
+    }
+    .admin-role-permission-group-head{
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:10px;
+    }
+    .admin-role-permission-title{
+      color:#fff;
+      font-size:13px;
+      font-weight:800;
+    }
+    .admin-role-permission-desc{
+      margin-top:3px;
+      color:rgba(255,255,255,.58);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .admin-role-permission-actions{
+      display:flex;
+      gap:6px;
+      flex:0 0 auto;
+    }
+    .admin-role-permission-options{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0, 1fr));
+      gap:8px;
+    }
+    .admin-role-permission-option{
+      display:flex;
+      align-items:flex-start;
+      gap:8px;
+      min-height:76px;
+      padding:10px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:8px;
+      background:rgba(0,0,0,.12);
+      color:rgba(255,255,255,.86);
+      font-size:12px;
+      line-height:1.35;
+    }
+    .admin-role-permission-option input{
+      margin-top:2px;
+      flex:0 0 auto;
+    }
+    .admin-role-permission-name{
+      display:block;
+      color:#fff;
+      font-weight:800;
+    }
+    .admin-role-permission-code{
+      display:block;
+      margin-top:6px;
+      font-family:Consolas, "SFMono-Regular", "Liberation Mono", monospace;
+      color:rgba(148,163,184,.82);
+      font-size:11px;
+      overflow-wrap:anywhere;
+    }
+    .admin-role-permission-help{
+      display:block;
+      margin-top:4px;
+      color:rgba(255,255,255,.62);
+    }
+    .admin-modal{
+      position:fixed;
+      inset:0;
+      z-index:80;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      padding:22px;
+      background:rgba(0,0,0,.68);
+    }
+    .admin-modal.is-open{
+      display:flex;
+    }
+    .admin-modal-dialog{
+      width:min(980px, 100%);
+      max-height:min(88vh, 860px);
+      overflow:auto;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:10px;
+      background:#101827;
+      box-shadow:0 22px 80px rgba(0,0,0,.45);
+    }
+    .admin-modal-dialog-narrow{
+      width:min(720px, 100%);
+    }
+    .admin-modal-header,
+    .admin-modal-footer{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      padding:16px 18px;
+      border-bottom:1px solid rgba(255,255,255,.08);
+    }
+    .admin-modal-footer{
+      justify-content:flex-end;
+      border-top:1px solid rgba(255,255,255,.08);
+      border-bottom:0;
+    }
+    .admin-modal-title{
+      color:#fff;
+      font-size:16px;
+      font-weight:900;
+    }
+    .admin-modal-close{
+      width:32px;
+      height:32px;
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:8px;
+      background:rgba(255,255,255,.06);
+      color:#fff;
+      cursor:pointer;
+    }
+    .admin-modal-body{
+      display:grid;
+      gap:16px;
+      padding:18px;
+    }
+    .admin-role-modal-meta{
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px;
+      color:rgba(255,255,255,.68);
+      font-size:12px;
+    }
+    .admin-role-field-help{
+      margin-top:6px;
+      color:rgba(255,255,255,.52);
+      font-size:12px;
+      line-height:1.45;
+    }
+    @media (max-width: 980px){
+      .admin-roles-filter-form,
+      .admin-role-create-fields,
+      .admin-role-edit-fields{
+        grid-template-columns:1fr 1fr;
+      }
+      .admin-role-permission-options{
+        grid-template-columns:1fr;
+      }
+    }
+    @media (max-width: 640px){
+      .admin-roles-filter-form,
+      .admin-role-create-fields,
+      .admin-role-edit-fields{
+        grid-template-columns:1fr;
+      }
+      .admin-role-permission-group-head{
+        flex-direction:column;
+      }
+    }
+  </style>
+
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="admin-alert admin-alert-info">{{ notice }}</div>
+    </section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section">
+      <div class="admin-alert admin-alert-danger">{{ error }}</div>
+    </section>
+  {% endif %}
+
+  {% if can_manage_admin_roles %}
+    <div class="admin-modal" id="admin-role-create-modal" aria-hidden="true">
+      <div class="admin-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="admin-role-create-title">
+        <form method="post" action="/admin/admin-roles">
+          <input id="create_code" name="code" type="hidden" value="" />
+          <div class="admin-modal-header">
+            <div class="admin-modal-title" id="admin-role-create-title">新增普通角色</div>
+            <button type="button" class="admin-modal-close" data-admin-modal-close aria-label="关闭">×</button>
+          </div>
+          <div class="admin-modal-body">
+            <div class="admin-role-create-fields">
+              <div class="field">
+                <label for="create_name">角色名称 *</label>
+                <input id="create_name" name="name" type="text" required autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="create_status">状态</label>
+                <select id="create_status" name="status">
+                  <option value="ACTIVE" selected>启用</option>
+                  <option value="DISABLED">停用</option>
+                </select>
+              </div>
+              <div class="field" style="grid-column:1 / -1;">
+                <label for="create_description">角色说明</label>
+                <input id="create_description" name="description" type="text" autocomplete="off" />
+              </div>
+            </div>
+            <div class="admin-role-super-hint">只能创建普通角色，超级管理员默认拥有全部权限。</div>
+            <div class="admin-role-permissions">
+              {% for group in permission_groups %}
+                {% set group_key = 'create-role-group-' ~ loop.index %}
+                <div class="admin-role-permission-group" data-permission-group="{{ group_key }}">
+                  <div class="admin-role-permission-group-head">
+                    <div>
+                      <div class="admin-role-permission-title">{{ group.title }}</div>
+                      <div class="admin-role-permission-desc">{{ group.description }}</div>
+                    </div>
+                    <div class="admin-role-permission-actions">
+                      <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-permission-group-action="check">全选</button>
+                      <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-permission-group-action="uncheck">取消全选</button>
+                    </div>
+                  </div>
+                  <div class="admin-role-permission-options">
+                    {% for permission in group.permissions %}
+                      <label class="admin-role-permission-option">
+                        <input type="checkbox" name="permission_ids" value="{{ permission.id }}" />
+                        <span>
+                          <span class="admin-role-permission-name">{{ permission.display_name }}</span>
+                          <span class="admin-role-permission-help">{{ permission.display_description }}</span>
+                          <span class="admin-role-permission-code">{{ permission.code }}</span>
+                        </span>
+                      </label>
+                    {% endfor %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="admin-modal-footer">
+            <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-admin-modal-close>取消</button>
+            <button type="submit" class="btn admin-btn admin-btn-primary">创建角色</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/admin-roles" class="admin-roles-filter-form">
+        <div class="field">
+          <label for="code">角色编码</label>
+          <input id="code" name="code" type="text" value="{{ filters.code or '' }}" placeholder="按角色编码搜索" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="ACTIVE" {% if filters.status == 'ACTIVE' %}selected{% endif %}>启用</option>
+            <option value="DISABLED" {% if filters.status == 'DISABLED' %}selected{% endif %}>停用</option>
+          </select>
+        </div>
+        <div></div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/admin-roles" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">角色列表</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table admin-roles-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>角色名称</th>
+                <th>角色说明</th>
+                <th>状态</th>
+                <th>类型</th>
+                <th>权限数量</th>
+                <th>创建时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                {% set role_display_name = '超级管理员' if item.code == 'super_admin' else item.name %}
+                {% set role_display_description = '拥有全部后台权限的系统角色' if item.code == 'super_admin' else item.description %}
+                <tr>
+                  <td class="admin-id">{{ item.id }}</td>
+                  <td>{{ role_display_name }}</td>
+                  <td class="admin-roles-description">{{ role_display_description or '-' }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></td>
+                  <td>
+                    {% if item.is_system %}
+                      <span class="admin-badge admin-badge-warning">系统</span>
+                    {% else %}
+                      <span class="admin-badge admin-badge-secondary">普通</span>
+                    {% endif %}
+                  </td>
+                  <td>{{ item.permission_count }}</td>
+                  <td class="admin-time">{{ item.created_at }}</td>
+                  <td>
+                    {% if can_manage_admin_roles %}
+                      <div class="admin-roles-action-buttons">
+                        <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-admin-modal-open="admin-role-edit-modal-{{ item.id }}">编辑</button>
+                        <button type="button" class="btn admin-btn admin-btn-primary admin-btn-sm" data-admin-modal-open="admin-role-permissions-modal-{{ item.id }}">权限配置</button>
+                        {% if item.is_system or item.code == 'super_admin' %}
+                          <span class="admin-muted">系统角色不可删除</span>
+                        {% else %}
+                          <form
+                            method="post"
+                            action="/admin/admin-roles/{{ item.id }}/delete"
+                            onsubmit="return confirm('确认删除该角色？删除后不可恢复。');"
+                          >
+                            <input type="hidden" name="next_path" value="{{ current_url }}" />
+                            <button type="submit" class="btn danger admin-btn admin-btn-danger admin-btn-sm">删除</button>
+                          </form>
+                        {% endif %}
+                      </div>
+                    {% else %}
+                      <span class="admin-muted">仅可查看</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无角色</div>
+          <p class="admin-empty-desc">当前筛选条件下没有角色记录。</p>
+        </div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  {% if can_manage_admin_roles %}
+    {% for item in items %}
+      {% set selected_permission_ids = role_permission_ids.get(item.id, []) %}
+
+      <div class="admin-modal" id="admin-role-edit-modal-{{ item.id }}" aria-hidden="true">
+        <div class="admin-modal-dialog admin-modal-dialog-narrow" role="dialog" aria-modal="true" aria-labelledby="admin-role-edit-title-{{ item.id }}">
+          {% if item.code == 'super_admin' %}
+            <div class="admin-modal-header">
+              <div class="admin-modal-title" id="admin-role-edit-title-{{ item.id }}">编辑角色</div>
+              <button type="button" class="admin-modal-close" data-admin-modal-close aria-label="关闭">×</button>
+            </div>
+            <div class="admin-modal-body">
+              <div class="admin-role-modal-meta">
+                <span>角色编码：</span>
+                <span class="admin-role-code">{{ item.code }}</span>
+                {% if item.is_system %}
+                  <span class="admin-badge admin-badge-warning">系统角色</span>
+                {% endif %}
+              </div>
+              <div class="admin-role-edit-fields">
+                <div class="field">
+                  <label for="edit_name_{{ item.id }}">角色名称</label>
+                  <input id="edit_name_{{ item.id }}" type="text" value="超级管理员" disabled />
+                </div>
+                <div class="field">
+                  <label for="edit_description_{{ item.id }}">角色说明</label>
+                  <input id="edit_description_{{ item.id }}" type="text" value="拥有全部后台权限的系统角色" disabled />
+                </div>
+                <div class="field">
+                  <label for="edit_status_{{ item.id }}">状态</label>
+                  <select id="edit_status_{{ item.id }}" disabled>
+                    <option selected>启用</option>
+                  </select>
+                </div>
+              </div>
+              <div class="admin-role-super-hint">超级管理员是系统角色，不支持修改基础信息。</div>
+            </div>
+            <div class="admin-modal-footer">
+              <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-admin-modal-close>关闭</button>
+            </div>
+          {% else %}
+            <form method="post" action="/admin/admin-roles/{{ item.id }}/edit">
+              <input type="hidden" name="next_path" value="{{ current_url }}" />
+              <div class="admin-modal-header">
+                <div class="admin-modal-title" id="admin-role-edit-title-{{ item.id }}">编辑角色</div>
+                <button type="button" class="admin-modal-close" data-admin-modal-close aria-label="关闭">×</button>
+              </div>
+              <div class="admin-modal-body">
+                <div class="admin-role-modal-meta">
+                  <span>角色编码：</span>
+                  <span class="admin-role-code">{{ item.code }}</span>
+                  {% if item.is_system %}
+                    <span class="admin-badge admin-badge-warning">系统角色</span>
+                  {% endif %}
+                </div>
+                <div class="admin-role-edit-fields">
+                  <div class="field">
+                    <label for="edit_name_{{ item.id }}">角色名称</label>
+                    <input id="edit_name_{{ item.id }}" name="name" type="text" value="{{ item.name }}" required />
+                  </div>
+                  <div class="field">
+                    <label for="edit_description_{{ item.id }}">角色说明</label>
+                    <input id="edit_description_{{ item.id }}" name="description" type="text" value="{{ item.description }}" />
+                  </div>
+                  <div class="field">
+                    <label for="edit_status_{{ item.id }}">状态</label>
+                    <select id="edit_status_{{ item.id }}" name="status">
+                      <option value="ACTIVE" {% if item.status == 'ACTIVE' %}selected{% endif %}>启用</option>
+                      <option value="DISABLED" {% if item.status == 'DISABLED' %}selected{% endif %}>停用</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <div class="admin-modal-footer">
+                <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-admin-modal-close>取消</button>
+                <button type="submit" class="btn admin-btn admin-btn-primary">保存</button>
+              </div>
+            </form>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="admin-modal" id="admin-role-permissions-modal-{{ item.id }}" aria-hidden="true">
+        <div class="admin-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="admin-role-permissions-title-{{ item.id }}">
+          {% if item.code == 'super_admin' %}
+            <div class="admin-modal-header">
+              <div class="admin-modal-title" id="admin-role-permissions-title-{{ item.id }}">配置角色权限</div>
+              <button type="button" class="admin-modal-close" data-admin-modal-close aria-label="关闭">×</button>
+            </div>
+            <div class="admin-modal-body">
+              <div class="admin-role-modal-meta">
+                <span>角色：</span>
+                <span>{{ '超级管理员' if item.code == 'super_admin' else item.name }}</span>
+                <span class="admin-role-code">{{ item.code }}</span>
+              </div>
+              <div class="admin-role-super-hint">超级管理员默认拥有全部权限，无需手动勾选权限点。</div>
+            </div>
+            <div class="admin-modal-footer">
+              <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-admin-modal-close>关闭</button>
+            </div>
+          {% else %}
+            <form method="post" action="/admin/admin-roles/{{ item.id }}/permissions">
+              <input type="hidden" name="next_path" value="{{ current_url }}" />
+              <div class="admin-modal-header">
+                <div class="admin-modal-title" id="admin-role-permissions-title-{{ item.id }}">配置角色权限</div>
+                <button type="button" class="admin-modal-close" data-admin-modal-close aria-label="关闭">×</button>
+              </div>
+              <div class="admin-modal-body">
+                <div class="admin-role-modal-meta">
+                  <span>角色：</span>
+                  <span>{{ '超级管理员' if item.code == 'super_admin' else item.name }}</span>
+                  <span class="admin-role-code">{{ item.code }}</span>
+                </div>
+                <div class="admin-role-permissions">
+                  {% for group in permission_groups %}
+                    {% set group_key = 'role-' ~ item.id ~ '-group-' ~ loop.index %}
+                    <div class="admin-role-permission-group" data-permission-group="{{ group_key }}">
+                      <div class="admin-role-permission-group-head">
+                        <div>
+                          <div class="admin-role-permission-title">{{ group.title }}</div>
+                          <div class="admin-role-permission-desc">{{ group.description }}</div>
+                        </div>
+                        <div class="admin-role-permission-actions">
+                          <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-permission-group-action="check">全选</button>
+                          <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-permission-group-action="uncheck">取消全选</button>
+                        </div>
+                      </div>
+                      <div class="admin-role-permission-options">
+                        {% for permission in group.permissions %}
+                          <label class="admin-role-permission-option">
+                            <input
+                              type="checkbox"
+                              name="permission_ids"
+                              value="{{ permission.id }}"
+                              {% if permission.id in selected_permission_ids %}checked{% endif %}
+                            />
+                            <span>
+                              <span class="admin-role-permission-name">{{ permission.display_name }}</span>
+                              <span class="admin-role-permission-help">{{ permission.display_description }}</span>
+                              <span class="admin-role-permission-code">{{ permission.code }}</span>
+                            </span>
+                          </label>
+                        {% endfor %}
+                      </div>
+                    </div>
+                  {% endfor %}
+                </div>
+              </div>
+              <div class="admin-modal-footer">
+                <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-admin-modal-close>取消</button>
+                <button type="submit" class="btn admin-btn admin-btn-primary">保存权限</button>
+              </div>
+            </form>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  {% endif %}
+
+  <script>
+    document.addEventListener("click", function(event){
+      var openButton = event.target.closest("[data-admin-modal-open]");
+      if (openButton) {
+        var modal = document.getElementById(openButton.getAttribute("data-admin-modal-open"));
+        if (modal) {
+          modal.classList.add("is-open");
+          modal.setAttribute("aria-hidden", "false");
+          var firstInput = modal.querySelector("input:not([type='hidden']):not(:disabled), select:not(:disabled), button:not([data-admin-modal-close])");
+          if (firstInput) {
+            window.setTimeout(function(){ firstInput.focus(); }, 0);
+          }
+        }
+      }
+
+      var closeButton = event.target.closest("[data-admin-modal-close]");
+      var backdrop = event.target.classList && event.target.classList.contains("admin-modal") ? event.target : null;
+      if (closeButton || backdrop) {
+        var openModal = (closeButton || backdrop).closest(".admin-modal");
+        if (openModal) {
+          openModal.classList.remove("is-open");
+          openModal.setAttribute("aria-hidden", "true");
+        }
+      }
+    });
+
+    document.addEventListener("keydown", function(event){
+      if (event.key !== "Escape") {
+        return;
+      }
+      document.querySelectorAll(".admin-modal.is-open").forEach(function(modal){
+        modal.classList.remove("is-open");
+        modal.setAttribute("aria-hidden", "true");
+      });
+    });
+
+    function generateAdminRoleCode(){
+      var timePart = Date.now().toString(36);
+      var randomPart = Math.random().toString(36).slice(2, 8);
+      return "role_" + timePart + "_" + randomPart;
+    }
+
+    document.addEventListener("submit", function(event){
+      var form = event.target.closest('form[action="/admin/admin-roles"]');
+      if (!form) {
+        return;
+      }
+      var codeInput = form.querySelector('input[name="code"]');
+      if (!codeInput) {
+        return;
+      }
+      var generatedCode = generateAdminRoleCode();
+      if (generatedCode === "super_admin") {
+        generatedCode = generateAdminRoleCode();
+      }
+      codeInput.value = generatedCode;
+    });
+
+    document.addEventListener("click", function(event){
+      var button = event.target.closest("[data-permission-group-action]");
+      if (!button) {
+        return;
+      }
+      var group = button.closest("[data-permission-group]");
+      if (!group) {
+        return;
+      }
+      var checked = button.getAttribute("data-permission-group-action") === "check";
+      group.querySelectorAll('input[type="checkbox"][name="permission_ids"]:not(:disabled)').forEach(function(input){
+        input.checked = checked;
+      });
+    });
+  </script>
+{% endblock %}

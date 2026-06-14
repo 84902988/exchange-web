@@ -1,0 +1,612 @@
+{% extends "admin/layout.html" %}
+
+{% if is_edit %}
+  {% set form_title = "编辑公告" %}
+{% else %}
+  {% set form_title = "新增公告" %}
+{% endif %}
+
+{% block title %}{{ form_title }}{% endblock %}
+{% block page_title %}{{ form_title }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">配置首页最新公告。正文支持图片、表格和富文本排版，slug 用于前台详情页地址。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/announcements" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .announcement-form-card{
+      max-width:1180px;
+      margin:0 auto;
+    }
+    .announcement-form{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(0, 1fr));
+      gap:14px;
+      align-items:start;
+    }
+    .announcement-form .field{
+      min-width:0;
+    }
+    .announcement-form .field-summary,
+    .announcement-form .field-content,
+    .announcement-form .announcement-form-footer{
+      grid-column:1 / -1;
+    }
+    .announcement-form .field-content{
+      padding-bottom:8px;
+    }
+    .announcement-form .field-summary textarea{
+      min-height:88px;
+    }
+    .tinymce-source{
+      min-height:420px;
+      font-family:Consolas, "Microsoft YaHei", monospace;
+    }
+    .tox.tox-tinymce{
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:12px;
+      overflow:hidden;
+    }
+    .tox .tox-edit-area__iframe{
+      background:#111216;
+    }
+    .rich-content-tip{
+      margin-top:8px;
+      font-size:12px;
+      color:var(--muted);
+    }
+    .i18n-panel{
+      grid-column:1 / -1;
+      display:grid;
+      gap:14px;
+      padding:14px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:12px;
+      background:rgba(255,255,255,.035);
+    }
+    .i18n-title{
+      color:#fff;
+      font-size:14px;
+      font-weight:800;
+    }
+    .i18n-summary{
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px;
+    }
+    .i18n-summary-item,
+    .i18n-tab-status{
+      display:inline-flex;
+      align-items:center;
+      min-height:22px;
+      padding:0 8px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.055);
+      color:var(--muted);
+      font-size:12px;
+      line-height:1;
+      white-space:nowrap;
+    }
+    .i18n-summary-item strong{
+      margin-left:4px;
+      color:#fff;
+      font-weight:800;
+    }
+    .i18n-fallback-note{
+      margin:0;
+      color:#facc15;
+      font-size:12px;
+      line-height:1.55;
+    }
+    .i18n-tabs{
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px;
+      align-items:center;
+    }
+    .i18n-tab{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      min-height:38px;
+      padding:7px 10px;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:8px;
+      background:rgba(255,255,255,.045);
+      color:var(--muted);
+      font:inherit;
+      font-size:13px;
+      font-weight:800;
+      cursor:pointer;
+    }
+    .i18n-tab.is-active{
+      border-color:rgba(250,204,21,.55);
+      background:rgba(250,204,21,.14);
+      color:#fff;
+    }
+    .i18n-tab.is-active .i18n-tab-status{
+      border-color:rgba(250,204,21,.28);
+      color:#fde68a;
+    }
+    .i18n-toolbar{
+      display:flex;
+      justify-content:flex-end;
+      gap:8px;
+    }
+    .i18n-copy-btn:disabled{
+      opacity:.45;
+      cursor:not-allowed;
+    }
+    .i18n-tab-panel{
+      display:none;
+    }
+    .i18n-tab-panel.is-active{
+      display:grid;
+      gap:14px;
+    }
+    .i18n-language-heading{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      color:#fff;
+      font-size:13px;
+      font-weight:900;
+    }
+    .i18n-fields-grid{
+      display:grid;
+      grid-template-columns:1fr;
+      gap:12px;
+      align-items:start;
+    }
+    .i18n-fields-grid textarea{
+      min-height:96px;
+    }
+    .i18n-fields-grid textarea.content-i18n{
+      min-height:220px;
+      font-family:Consolas, "Microsoft YaHei", monospace;
+    }
+    .announcement-form-footer{
+      position:static;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:14px;
+      margin-top:20px;
+      padding:20px 0 0;
+      border-top:1px solid rgba(255,255,255,.12);
+      background:transparent;
+    }
+    .announcement-form-footer-fields{
+      display:grid;
+      grid-template-columns:minmax(220px, 320px) minmax(140px, 180px);
+      gap:14px;
+      align-items:end;
+      flex:1;
+    }
+    .announcement-form-footer-actions{
+      display:flex;
+      gap:10px;
+      align-items:center;
+      justify-content:flex-end;
+      flex-wrap:wrap;
+    }
+    @media (max-width:1180px){
+      .announcement-form{
+        grid-template-columns:repeat(2, minmax(0, 1fr));
+      }
+    }
+    @media (max-width:720px){
+      .announcement-form,
+      .announcement-form-footer-fields,
+      .i18n-fields-grid{
+        grid-template-columns:1fr;
+      }
+      .announcement-form-footer{
+        position:static;
+        align-items:stretch;
+        flex-direction:column;
+      }
+      .announcement-form-footer-actions{
+        justify-content:flex-start;
+      }
+    }
+  </style>
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">表单校验失败</div>
+        {% for error in errors %}
+          <p class="muted">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card announcement-form-card">
+      <div class="section-title">{{ form_title }}</div>
+      <form method="post" action="{{ form_action }}" class="announcement-form" id="announcement-form">
+        <div hidden>
+          <input type="hidden" name="title" value="{{ form.title or '' }}" />
+          <textarea name="summary">{{ form.summary or '' }}</textarea>
+          <textarea name="content">{{ form.content or '' }}</textarea>
+        </div>
+        <div class="field">
+          <label for="slug">slug</label>
+          <input id="slug" name="slug" type="text" value="{{ form.slug or '' }}" placeholder="system-upgrade" />
+        </div>
+        <div class="field">
+          <label for="category">分类</label>
+          <select id="category" name="category">
+            {% for option in category_options %}
+              <option value="{{ option.value }}" {% if form.category == option.value %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="PUBLISHED" {% if form.status == 'PUBLISHED' %}selected{% endif %}>启用</option>
+            <option value="DISABLED" {% if form.status == 'DISABLED' %}selected{% endif %}>禁用</option>
+          </select>
+        </div>
+
+        <div class="i18n-panel">
+          <div class="i18n-title">多语言内容</div>
+          {% set i18n_languages = [('zh', '中文'), ('en', 'English'), ('zh_TW', '繁體'), ('ja', '日本語')] %}
+          {% set announcement_i18n_fields = [
+            ('title', '标题', 'input'),
+            ('summary', '摘要', 'textarea'),
+            ('content', '正文 HTML', 'textarea')
+          ] %}
+          <div class="i18n-summary" aria-live="polite">
+            {% for suffix, label in i18n_languages %}
+              <span class="i18n-summary-item" data-i18n-summary="{{ suffix }}">{{ label }}：<strong>未填写</strong></span>
+            {% endfor %}
+          </div>
+          <p class="i18n-fallback-note">中文内容会作为默认 fallback 保存，其他语言未填写时前台将显示中文。</p>
+          <div class="i18n-tabs" role="tablist" aria-label="公告多语言内容编辑">
+            {% for suffix, label in i18n_languages %}
+              <button
+                type="button"
+                id="announcement_i18n_tab_{{ suffix }}"
+                class="i18n-tab{% if loop.first %} is-active{% endif %}"
+                role="tab"
+                aria-selected="{% if loop.first %}true{% else %}false{% endif %}"
+                aria-controls="announcement_i18n_panel_{{ suffix }}"
+                data-i18n-tab="{{ suffix }}"
+              >
+                <span>{{ label }}</span>
+                <span class="i18n-tab-status" data-i18n-tab-status="{{ suffix }}">未填写</span>
+              </button>
+            {% endfor %}
+          </div>
+          <div class="i18n-toolbar">
+            <button type="button" class="btn secondary admin-btn admin-btn-secondary i18n-copy-btn" data-i18n-copy-current disabled>从中文复制到当前语言</button>
+          </div>
+          <div class="i18n-tab-panels">
+            {% for suffix, label in i18n_languages %}
+              <div
+                id="announcement_i18n_panel_{{ suffix }}"
+                class="i18n-tab-panel{% if loop.first %} is-active{% endif %}"
+                role="tabpanel"
+                aria-labelledby="announcement_i18n_tab_{{ suffix }}"
+                data-i18n-panel="{{ suffix }}"
+                {% if not loop.first %}hidden{% endif %}
+              >
+                <div class="i18n-language-heading">
+                  <span>{{ label }}</span>
+                  <span class="i18n-tab-status" data-i18n-panel-status="{{ suffix }}">未填写</span>
+                </div>
+                <div class="i18n-fields-grid">
+                  {% for field_name, field_label, field_type in announcement_i18n_fields %}
+                    {% set input_name = field_name ~ '_i18n_' ~ suffix %}
+                    {% set input_value = form[input_name] or '' %}
+                    {% if suffix == 'zh' and not input_value %}
+                      {% set input_value = form[field_name] or '' %}
+                    {% endif %}
+                    <div class="field" data-i18n-lang="{{ suffix }}" data-i18n-field="{{ field_name }}">
+                      <label for="{{ input_name }}">{{ field_label }}</label>
+                      {% if field_type == 'textarea' %}
+                        <textarea id="{{ input_name }}" name="{{ input_name }}" class="{% if field_name == 'content' %}content-i18n{% endif %}">{{ input_value }}</textarea>
+                      {% else %}
+                        <input id="{{ input_name }}" name="{{ input_name }}" type="text" value="{{ input_value }}" />
+                      {% endif %}
+                    </div>
+                  {% endfor %}
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+          <div class="rich-content-tip">公告正文支持 HTML；公告图片请使用已上传后的图片地址，外链图片保存时可能被过滤。</div>
+        </div>
+
+        <div class="announcement-form-footer">
+          <div class="announcement-form-footer-fields">
+            <div class="field">
+              <label for="publish_at">发布时间</label>
+              <input id="publish_at" name="publish_at" type="datetime-local" value="{{ form.publish_at_input or '' }}" />
+            </div>
+            <div class="field">
+              <label for="is_pinned">置顶</label>
+              <select id="is_pinned" name="is_pinned">
+                <option value="" {% if not form.is_pinned %}selected{% endif %}>否</option>
+                <option value="1" {% if form.is_pinned %}selected{% endif %}>是</option>
+              </select>
+            </div>
+          </div>
+          <div class="announcement-form-footer-actions">
+            <button type="submit" class="btn admin-btn admin-btn-primary">{% if is_edit %}保存修改{% else %}创建公告{% endif %}</button>
+            <a href="/admin/announcements" class="btn secondary admin-btn admin-btn-secondary">取消</a>
+          </div>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <script src="/static/vendor/tinymce/tinymce.min.js"></script>
+  <script>
+    (function(){
+      var tabs = Array.prototype.slice.call(document.querySelectorAll("[data-i18n-tab]"));
+      var panels = Array.prototype.slice.call(document.querySelectorAll("[data-i18n-panel]"));
+      var copyButton = document.querySelector("[data-i18n-copy-current]");
+      var activeLang = "zh";
+      var statusLabels = {
+        empty: "未填写",
+        partial: "部分填写",
+        complete: "已完成"
+      };
+
+      if (!tabs.length || !panels.length) {
+        return;
+      }
+
+      function getFieldControl(field) {
+        return field.querySelector("input, textarea");
+      }
+
+      function getLangFields(lang) {
+        return Array.prototype.slice.call(document.querySelectorAll('[data-i18n-lang="' + lang + '"]'));
+      }
+
+      function getFieldControlByName(lang, fieldName) {
+        var field = document.querySelector('[data-i18n-lang="' + lang + '"][data-i18n-field="' + fieldName + '"]');
+        return field ? getFieldControl(field) : null;
+      }
+
+      function getRichTextEditor(control) {
+        if (!control || !control.id || !window.tinymce || typeof window.tinymce.get !== "function") {
+          return null;
+        }
+        return window.tinymce.get(control.id);
+      }
+
+      function syncRichTextEditors() {
+        if (window.tinymce && typeof window.tinymce.triggerSave === "function") {
+          window.tinymce.triggerSave();
+        }
+      }
+
+      function getControlValue(control) {
+        var editor = getRichTextEditor(control);
+        if (editor && typeof editor.getContent === "function") {
+          return editor.getContent();
+        }
+        return control ? control.value : "";
+      }
+
+      function setControlValue(control, value) {
+        var nextValue = value || "";
+        var editor = getRichTextEditor(control);
+        if (editor && typeof editor.setContent === "function") {
+          editor.setContent(nextValue);
+          if (typeof editor.save === "function") {
+            editor.save();
+          }
+          return;
+        }
+        if (control) {
+          control.value = nextValue;
+        }
+      }
+
+      function syncChineseFallbackFields() {
+        syncRichTextEditors();
+        getLangFields("zh").forEach(function(field) {
+          var fieldName = field.dataset.i18nField;
+          var source = getFieldControl(field);
+          var target = document.querySelector('[name="' + fieldName + '"]');
+          if (!fieldName || !source || !target) return;
+          target.value = getControlValue(source);
+        });
+      }
+
+      function getStatus(fields) {
+        var total = fields.length;
+        var filled = fields.filter(function(field) {
+          var control = getFieldControl(field);
+          return control && String(getControlValue(control) || "").trim();
+        }).length;
+        if (!filled) return { key: "empty", text: statusLabels.empty, filled: filled, total: total };
+        if (filled === total) return { key: "complete", text: statusLabels.complete, filled: filled, total: total };
+        return { key: "partial", text: statusLabels.partial, filled: filled, total: total };
+      }
+
+      function setStatusText(lang, status) {
+        document.querySelectorAll('[data-i18n-tab-status="' + lang + '"], [data-i18n-panel-status="' + lang + '"]').forEach(function(node) {
+          node.textContent = status.text;
+        });
+      }
+
+      function updateStatuses() {
+        panels.forEach(function(panel) {
+          var lang = panel.dataset.i18nPanel;
+          var status = getStatus(getLangFields(lang));
+          var summary = document.querySelector('[data-i18n-summary="' + lang + '"] strong');
+          setStatusText(lang, status);
+          if (summary) {
+            summary.textContent = status.text + " " + status.filled + "/" + status.total;
+          }
+        });
+      }
+
+      function activateTab(lang) {
+        activeLang = lang;
+        tabs.forEach(function(tab) {
+          var isActive = tab.dataset.i18nTab === lang;
+          tab.classList.toggle("is-active", isActive);
+          tab.setAttribute("aria-selected", isActive ? "true" : "false");
+        });
+        panels.forEach(function(panel) {
+          var isActive = panel.dataset.i18nPanel === lang;
+          panel.classList.toggle("is-active", isActive);
+          panel.hidden = !isActive;
+        });
+        if (copyButton) {
+          copyButton.disabled = lang === "zh";
+        }
+      }
+
+      tabs.forEach(function(tab) {
+        tab.addEventListener("click", function() {
+          activateTab(tab.dataset.i18nTab || "zh");
+        });
+      });
+
+      panels.forEach(function(panel) {
+        panel.querySelectorAll("input, textarea").forEach(function(control) {
+          control.addEventListener("input", updateStatuses);
+        });
+      });
+
+      if (copyButton) {
+        copyButton.addEventListener("click", function() {
+          if (activeLang === "zh") return;
+          getLangFields(activeLang).forEach(function(field) {
+            var fieldName = field.dataset.i18nField;
+            var source = getFieldControlByName("zh", fieldName);
+            var target = getFieldControl(field);
+            if (!source || !target) return;
+            setControlValue(target, getControlValue(source));
+            target.dispatchEvent(new Event("input", { bubbles: true }));
+          });
+          updateStatuses();
+        });
+      }
+
+      var form = document.getElementById("announcement-form");
+      if (form) {
+        form.addEventListener("submit", syncChineseFallbackFields);
+      }
+
+      activateTab("zh");
+      syncChineseFallbackFields();
+      updateStatuses();
+      window.refreshAnnouncementI18nStatuses = updateStatuses;
+      window.syncAnnouncementChineseFallbackFields = syncChineseFallbackFields;
+    })();
+
+    (function(){
+      if (!window.tinymce) {
+        return;
+      }
+
+      tinymce.init({
+        selector: "textarea.content-i18n",
+        base_url: "/static/vendor/tinymce",
+        suffix: ".min",
+        language: "zh_CN",
+        language_url: "/static/vendor/tinymce/langs/zh_CN.js",
+        promotion: false,
+        branding: false,
+        menubar: "file edit view insert format table tools",
+        skin: "oxide-dark",
+        content_css: "dark",
+        plugins: [
+          "advlist autolink lists link image charmap preview anchor",
+          "searchreplace visualblocks visualchars code fullscreen",
+          "insertdatetime media table help wordcount quickbars",
+          "emoticons codesample nonbreaking pagebreak directionality autoresize"
+        ].join(" "),
+        toolbar: [
+          "undo redo | blocks fontfamily fontsize",
+          "bold italic underline strikethrough forecolor backcolor",
+          "alignleft aligncenter alignright alignjustify",
+          "bullist numlist outdent indent",
+          "link image media table codesample blockquote",
+          "removeformat searchreplace preview code fullscreen help"
+        ].join(" | "),
+        block_formats: "Paragraph=p; Heading 1=h1; Heading 2=h2; Heading 3=h3; Heading 4=h4",
+        font_family_formats: "微软雅黑=Microsoft YaHei,微软雅黑,sans-serif; 苹方=PingFang SC,Microsoft YaHei,sans-serif; 思源黑体=Noto Sans SC,Microsoft YaHei,sans-serif; Arial=arial,helvetica,sans-serif",
+        font_size_formats: "12px 14px 16px 18px 20px 24px 28px 32px",
+        content_style: [
+          "body { background: #111216; color: #e5e7eb; font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; line-height: 1.7; }",
+          "a { color: #f5b301; }",
+          "table { border-collapse: collapse; width: 100%; }",
+          "table, th, td { border: 1px solid #2f3138; }",
+          "th, td { padding: 8px 10px; }",
+          "blockquote { border-left: 3px solid #f5b301; margin: 12px 0; padding: 8px 12px; background: rgba(245,179,1,.08); }",
+          "img { max-width: 100%; height: auto; }"
+        ].join(" "),
+        min_height: 520,
+        max_height: 720,
+        autoresize_bottom_margin: 24,
+        quickbars_selection_toolbar: "bold italic | quicklink h2 h3 blockquote",
+        quickbars_insert_toolbar: "quickimage quicktable",
+        paste_data_images: false,
+        convert_urls: false,
+        extended_valid_elements: "div[style|title],span[style|title],p[style|title],h1[style|title],h2[style|title],h3[style|title],h4[style|title],h5[style|title],h6[style|title],a[href|title|target|rel|style],img[src|alt|title|width|height|style],table[style|title],thead[style|title],tbody[style|title],tr[style|title],th[colspan|rowspan|style|title],td[colspan|rowspan|style|title],pre[style|title],code[style|title],hr",
+        images_upload_url: "/admin/uploads/image",
+        automatic_uploads: true,
+        images_reuse_filename: false,
+        images_upload_credentials: true,
+        file_picker_types: "image",
+        images_upload_handler: function(blobInfo, progress) {
+          var formData = new FormData();
+          formData.append("file", blobInfo.blob(), blobInfo.filename());
+          return fetch("/admin/uploads/image", {
+            method: "POST",
+            body: formData,
+            credentials: "same-origin"
+          }).then(function(response) {
+            if (!response.ok) {
+              throw new Error("图片上传失败");
+            }
+            return response.json();
+          }).then(function(data) {
+            var location = data.location || data.url;
+            if (!location) {
+              throw new Error("图片上传接口未返回地址");
+            }
+            return location;
+          });
+        },
+        setup: function(editor) {
+          var buttons = editor.ui.registry.getAll().buttons || {};
+          if (!buttons.hr) {
+            editor.ui.registry.addButton("hr", {
+              icon: "horizontal-rule",
+              tooltip: "Horizontal line",
+              onAction: function() {
+                editor.insertContent("<hr>");
+              }
+            });
+          }
+          editor.on("change keyup undo redo SetContent input", function() {
+            editor.save();
+            if (window.refreshAnnouncementI18nStatuses) {
+              window.refreshAnnouncementI18nStatuses();
+            }
+          });
+        }
+      });
+    })();
+  </script>
+{% endblock %}

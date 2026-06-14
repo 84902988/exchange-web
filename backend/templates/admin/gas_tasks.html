@@ -1,0 +1,151 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}补 Gas 任务{% endblock %}
+{% block page_title %}补 Gas 任务{% endblock %}
+{% block page_subtitle %}<div class="page-subtitle">只读查看补 Gas 任务，供技术排查归集流程内部 Gas 步骤。</div>{% endblock %}
+
+{% block content %}
+  <style>
+    .collection-ops-nav{display:flex;flex-wrap:wrap;gap:8px}
+    .collection-stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+    .collection-stat-card{background:#fff;border:1px solid var(--border,#e5e7eb);border-radius:8px;padding:14px}
+    .collection-stat-label{color:#64748b;font-size:12px;font-weight:700}
+    .collection-stat-value{margin-top:8px;font-size:22px;font-weight:900;font-variant-numeric:tabular-nums}
+    .collection-ops-table{font-size:13px}
+    .collection-ops-table th,.collection-ops-table td{padding:9px 10px;vertical-align:top}
+    .collection-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+    .collection-amount{font-variant-numeric:tabular-nums;white-space:nowrap}
+    .collection-address{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .collection-error{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .collection-copy{border:1px solid var(--border,#e5e7eb);background:#fff;border-radius:6px;padding:2px 6px;margin-left:6px;font-size:12px;cursor:pointer}
+  </style>
+
+  <section class="page-section">
+    <div class="collection-ops-nav">
+      <a href="/admin/collections/center" class="btn secondary admin-btn admin-btn-secondary">归集中心</a>
+      <a href="/admin/collections/tasks" class="btn secondary admin-btn admin-btn-secondary">归集任务</a>
+      <a href="/admin/collections/batches" class="btn secondary admin-btn admin-btn-secondary">归集统计</a>
+      <a href="/admin/collections/auto-settings" class="btn secondary admin-btn admin-btn-secondary">自动归集规则</a>
+    </div>
+  </section>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作成功</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作提示</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if range_notice %}
+    <section class="page-section">
+      <div class="admin-alert admin-alert-warning">{{ range_notice }}</div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="collection-stat-grid">
+      <div class="collection-stat-card"><div class="collection-stat-label">今日补 Gas 任务</div><div class="collection-stat-value">{{ summary.today_tasks or 0 }}</div></div>
+      <div class="collection-stat-card"><div class="collection-stat-label">今日成功</div><div class="collection-stat-value">{{ summary.today_success or 0 }}</div></div>
+      <div class="collection-stat-card"><div class="collection-stat-label">今日失败</div><div class="collection-stat-value">{{ summary.today_failed or 0 }}</div></div>
+      <div class="collection-stat-card"><div class="collection-stat-label">进行中</div><div class="collection-stat-value">{{ summary.active_tasks or 0 }}</div></div>
+      <div class="collection-stat-card"><div class="collection-stat-label">待补 Gas 地址数</div><div class="collection-stat-value">{{ summary.pending_address_count or 0 }}</div></div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">排查说明</div>
+      <p class="muted"><strong>Gas 任务已降级为归集流程内部步骤。</strong></p>
+      <p class="muted">本页仅保留只读查询能力，运营入口已从归集中心和菜单隐藏。</p>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选 Gas 任务</div>
+      <form method="get" class="filter-form">
+        <div class="field"><label for="task_no">任务ID</label><input id="task_no" name="task_no" value="{{ filters.task_no or '' }}" placeholder="任务编号" /></div>
+        <div class="field"><label for="collection_task_id">归集任务ID</label><input id="collection_task_id" name="collection_task_id" value="{{ filters.collection_task_id or '' }}" /></div>
+        <div class="field"><label for="user_id">用户ID</label><input id="user_id" name="user_id" value="{{ filters.user_id or '' }}" /></div>
+        <div class="field"><label for="chain_key">网络</label><input id="chain_key" name="chain_key" value="{{ filters.chain_key or '' }}" placeholder="bsc" /></div>
+        <div class="field"><label for="coin_symbol">币种</label><input id="coin_symbol" name="coin_symbol" value="{{ filters.coin_symbol or '' }}" placeholder="BNB" /></div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="PENDING" {% if filters.status == 'PENDING' %}selected{% endif %}>等待中</option>
+            <option value="PROCESSING" {% if filters.status == 'PROCESSING' %}selected{% endif %}>处理中</option>
+            <option value="SENT" {% if filters.status == 'SENT' %}selected{% endif %}>已发送</option>
+            <option value="SUCCESS" {% if filters.status == 'SUCCESS' %}selected{% endif %}>已完成</option>
+            <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
+            <option value="TIMEOUT" {% if filters.status == 'TIMEOUT' %}selected{% endif %}>超时</option>
+            <option value="CANCELED" {% if filters.status == 'CANCELED' %}selected{% endif %}>已取消</option>
+          </select>
+        </div>
+        <div class="field"><label for="address">地址</label><input id="address" name="address" value="{{ filters.address or '' }}" placeholder="来源或目标地址" /></div>
+        <div class="field"><label for="tx_hash">tx_hash</label><input id="tx_hash" name="tx_hash" value="{{ filters.tx_hash or '' }}" placeholder="链上交易哈希" /></div>
+        <div class="field"><label for="created_from">开始日期</label><input id="created_from" type="date" name="created_from" value="{{ filters.created_from or '' }}" /></div>
+        <div class="field"><label for="created_to">结束日期</label><input id="created_to" type="date" name="created_to" value="{{ filters.created_to or '' }}" /></div>
+        <div class="filter-actions"><button type="submit" class="btn admin-btn admin-btn-primary">查询</button><a href="{{ request.url.path }}" class="btn secondary admin-btn admin-btn-secondary">重置</a></div>
+      </form>
+    </div>
+  </section>
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">补 Gas 任务列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table collection-ops-table">
+            <thead><tr><th>任务ID</th><th>网络</th><th>地址</th><th class="text-right admin-number">Gas数量</th><th>状态</th><th>tx_hash</th><th>失败原因</th><th>创建时间</th><th>完成时间</th></tr></thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="collection-mono nowrap admin-id">{{ item.task_no or item.id }}</td>
+                  <td class="collection-mono">{{ item.chain_key }}</td>
+                  <td><div class="collection-mono collection-address" title="{{ item.to_address }}">{{ item.to_address_short }}</div></td>
+                  <td class="collection-mono text-right collection-amount">{{ item.topup_amount_label }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                  <td class="collection-mono nowrap" title="{{ item.tx_hash }}">
+                    {{ item.tx_hash_display }}
+                    {% if item.has_tx_hash %}<button type="button" class="collection-copy" data-copy="{{ item.tx_hash }}">复制</button>{% endif %}
+                  </td>
+                  <td><div class="collection-error" title="{{ item.last_error_full }}">{{ item.last_error_short }}</div></td>
+                  <td class="collection-mono nowrap admin-time">{{ item.created_at or "-" }}</td>
+                  <td class="collection-mono nowrap admin-time">{{ item.finished_at or "-" }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无 Gas 任务</div>
+          <p class="admin-empty-desc">当前筛选条件下暂无 Gas 任务，可调整筛选条件后重试。</p>
+        </div>
+      {% endif %}
+      <div class="pagination admin-pagination"><div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div><div class="pagination-actions">{% if pagination.page > 1 %}<a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>{% endif %}{% if pagination.page < pagination.pages %}<a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>{% endif %}</div></div>
+    </div>
+  </section>
+  <script>
+    document.querySelectorAll("[data-copy]").forEach(function(button){
+      button.addEventListener("click", function(){
+        var value = button.getAttribute("data-copy") || "";
+        if(!value){ return; }
+        if(navigator.clipboard && navigator.clipboard.writeText){
+          navigator.clipboard.writeText(value);
+        }
+      });
+    });
+  </script>
+{% endblock %}

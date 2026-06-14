@@ -1,0 +1,890 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}归集候选工作台{% endblock %}
+{% block page_title %}归集候选工作台{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">候选地址是待归集地址池。运营核实余额后可直接执行归集，此页面为归集工作台主入口。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .collection-page{display:grid;gap:12px}
+    .collection-panel,.collection-stat-card,.collection-network-card{border:1px solid var(--border);border-radius:8px;background:linear-gradient(145deg,rgba(255,255,255,.055),rgba(255,255,255,.025));box-shadow:0 14px 34px rgba(0,0,0,.18)}
+    .collection-panel{padding:16px}
+    .collection-panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}
+    .collection-title{font-size:18px;font-weight:900}
+    .collection-meta{color:var(--muted);font-size:12px;font-weight:800}
+    .collection-actions,.collection-row-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+    .collection-row-actions{flex-wrap:nowrap}
+    .collection-row-actions form{margin:0}
+    .collection-nav{display:flex;gap:8px;flex-wrap:wrap}
+    .collection-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+    .collection-current-stats{margin:10px 0 14px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+    .collection-current-stats .collection-stat-card{padding:10px 12px}
+    .collection-current-stats .collection-stat-value{font-size:18px;margin-top:5px}
+    .collection-stat-card[data-amount-card]{cursor:pointer;transition:border-color .15s ease,background .15s ease,transform .15s ease}
+    .collection-stat-card[data-amount-card]:hover{border-color:rgba(255,96,56,.75);background:rgba(255,96,56,.08);transform:translateY(-1px)}
+    .collection-stat-card.is-empty{cursor:default}
+    .collection-stat-card.is-empty:hover{border-color:var(--border);background:linear-gradient(145deg,rgba(255,255,255,.055),rgba(255,255,255,.025));transform:none}
+    .collection-amount-modal{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(0,0,0,.55)}
+    .collection-amount-modal.is-open{display:flex}
+    .collection-amount-dialog{width:min(520px,100%);border:1px solid var(--border);border-radius:8px;background:#14151b;box-shadow:0 22px 70px rgba(0,0,0,.45);overflow:hidden}
+    .collection-amount-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border)}
+    .collection-amount-dialog-title{font-weight:900;font-size:16px}
+    .collection-amount-dialog-close{border:1px solid var(--border);border-radius:6px;background:rgba(255,255,255,.04);color:var(--text);min-width:32px;min-height:30px;cursor:pointer}
+    .collection-amount-dialog-body{padding:14px 16px}
+    .collection-amount-table{width:100%;border-collapse:collapse;table-layout:fixed}
+    .collection-amount-table th,.collection-amount-table td{padding:9px 8px;border-bottom:1px solid var(--border);text-align:left}
+    .collection-amount-table th{color:var(--muted);font-size:12px;font-weight:900}
+    .collection-amount-table td{font-size:13px}
+    .collection-amount-dialog-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;color:var(--muted);font-size:12px;font-weight:800}
+    .collection-amount-dialog-actions{display:flex;gap:6px}
+    .collection-result-panel{border:1px solid rgba(255,255,255,.14);border-radius:8px;background:rgba(255,255,255,.045);padding:12px;margin:0 0 12px}
+    .collection-result-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+    .collection-result-title{font-size:15px;font-weight:900}
+    .collection-result-summary{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:8px;margin-bottom:10px}
+    .collection-result-summary-item{border:1px solid var(--border);border-radius:8px;padding:9px 10px;background:rgba(0,0,0,.16)}
+    .collection-result-summary-label{color:var(--muted);font-size:11px;font-weight:900}
+    .collection-result-summary-value{font-size:18px;font-weight:900;margin-top:4px;font-variant-numeric:tabular-nums}
+    .collection-result-table{width:100%;border-collapse:collapse;table-layout:fixed;margin-top:8px}
+    .collection-result-table th,.collection-result-table td{padding:8px 7px;border-bottom:1px solid var(--border);text-align:left;font-size:12px;overflow:hidden;text-overflow:ellipsis}
+    .collection-result-table th{color:var(--muted);font-weight:900;white-space:nowrap}
+    .collection-result-table td{vertical-align:top}
+    .collection-result-detail{margin-top:10px}
+    .collection-result-detail summary{cursor:pointer;color:var(--muted);font-size:12px;font-weight:900}
+    .collection-result-detail pre{max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:rgba(0,0,0,.28);padding:10px;white-space:pre-wrap;word-break:break-word;font-size:12px}
+    .collection-result-modal{position:fixed;inset:0;z-index:95;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(0,0,0,.55)}
+    .collection-result-modal.is-open{display:flex}
+    .collection-result-dialog{width:min(860px,100%);max-height:min(86vh,760px);overflow:auto;border:1px solid var(--border);border-radius:8px;background:#14151b;box-shadow:0 22px 70px rgba(0,0,0,.45)}
+    .collection-result-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border)}
+    .collection-result-dialog-body{padding:14px 16px}
+    .collection-result-dialog-title{font-weight:900;font-size:16px}
+    .collection-result-dialog-close{border:1px solid var(--border);border-radius:6px;background:rgba(255,255,255,.04);color:var(--text);min-width:32px;min-height:30px;cursor:pointer}
+    .collection-stat-card{padding:14px}
+    .collection-stat-label{color:var(--muted);font-size:12px;font-weight:800}
+    .collection-stat-value{font-size:24px;font-weight:900;margin-top:8px}
+    .collection-network-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+    .collection-network-card{display:block;padding:14px;color:var(--text);text-decoration:none}
+    .collection-network-card:hover{border-color:rgba(255,96,56,.75);background:rgba(255,96,56,.08)}
+    .collection-network-card.is-active{border-color:#ff6038;background:rgba(255,96,56,.12)}
+    .collection-network-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:12px}
+    .collection-network-title{font-weight:900}
+    .collection-network-key{color:var(--muted);font-size:12px;margin-top:3px}
+    .collection-network-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+    .collection-network-label{color:var(--muted);font-size:11px;font-weight:800;white-space:nowrap}
+    .collection-network-value{font-weight:900;margin-top:4px;font-variant-numeric:tabular-nums}
+    .collection-filter-grid{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:10px;align-items:end}
+    .collection-filter-grid label{display:block;color:var(--muted);font-size:12px;font-weight:800;margin-bottom:6px}
+    .collection-filter-grid input,.collection-filter-grid select{width:100%;min-height:38px}
+    .collection-table-wrap{width:100%;overflow-x:hidden}
+    .collection-table{width:100%;border-collapse:collapse;table-layout:fixed}
+    .collection-table th,.collection-table td{padding:7px 6px;border-bottom:1px solid var(--border);vertical-align:middle;text-align:left;overflow:hidden;text-overflow:ellipsis}
+    .collection-table th{color:var(--muted);font-size:12px;font-weight:900;white-space:nowrap}
+    .collection-table td{font-size:13px}
+    .collection-address,.collection-mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+    .collection-address-copy{border:0;background:transparent;color:var(--text);padding:0;cursor:pointer;text-align:left}
+    .collection-address-copy:hover{color:#ff6038}
+    .collection-address{display:inline-block;max-width:118px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
+    .collection-amount{font-variant-numeric:tabular-nums;white-space:nowrap}
+    .collection-table th:nth-child(1),.collection-table td:nth-child(1){width:11%}
+    .collection-table th:nth-child(2),.collection-table td:nth-child(2){width:9%;white-space:nowrap}
+    .collection-table th:nth-child(3),.collection-table td:nth-child(3){width:8%}
+    .collection-table th:nth-child(4),.collection-table td:nth-child(4){width:6%}
+    .collection-table th:nth-child(5),.collection-table td:nth-child(5){width:12%;white-space:nowrap}
+    .collection-table th:nth-child(6),.collection-table td:nth-child(6){width:12%;white-space:nowrap}
+    .collection-table th:nth-child(7),.collection-table td:nth-child(7){width:9%}
+    .collection-table th:nth-child(8),.collection-table td:nth-child(8){width:9%}
+    .collection-table th:nth-child(9),.collection-table td:nth-child(9){width:6%}
+    .collection-table th:last-child,.collection-table td:last-child{width:12%;white-space:nowrap}
+    .collection-empty{padding:22px;text-align:center;color:var(--muted);border:1px dashed var(--border);border-radius:8px}
+    .collection-row-actions .btn,.collection-row-actions button{min-height:28px;padding:5px 8px}
+    .collection-pagination{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:12px;color:var(--muted);font-size:12px;font-weight:800}
+    .collection-pagination-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+    .collection-pagination select{min-height:30px;width:auto}
+    .collection-pagination .is-disabled{opacity:.45;pointer-events:none}
+    @media (max-width:1100px){.collection-filter-grid{grid-template-columns:repeat(2,minmax(120px,1fr))}}
+    @media (max-width:640px){.collection-panel-head{display:block}.collection-nav{margin-top:10px}.collection-filter-grid,.collection-stats,.collection-network-grid,.collection-result-summary{grid-template-columns:1fr}}
+  </style>
+
+  {% set stats = stats or {} %}
+  {% set filters = filters or {} %}
+  {% set network_cards = network_cards or [] %}
+  {% set pagination = pagination or {} %}
+  {% set notice_detail = notice_detail or {} %}
+
+  {% if notice %}
+    <div class="alert success">{{ notice }}</div>
+  {% endif %}
+  {% if notice_detail %}
+    <div class="collection-result-panel">
+      <div class="collection-result-head">
+        <div class="collection-result-title">创建结果</div>
+      </div>
+      <div class="collection-result-summary">
+        <div class="collection-result-summary-item">
+          <div class="collection-result-summary-label">创建任务数</div>
+          <div class="collection-result-summary-value">{{ notice_detail.created_count or 0 }}</div>
+        </div>
+        <div class="collection-result-summary-item">
+          <div class="collection-result-summary-label">跳过数量</div>
+          <div class="collection-result-summary-value">{{ notice_detail.skipped_count or 0 }}</div>
+        </div>
+        <div class="collection-result-summary-item">
+          <div class="collection-result-summary-label">入队异常数量</div>
+          <div class="collection-result-summary-value">{{ notice_detail.enqueue_error_count or 0 }}</div>
+        </div>
+      </div>
+      {% if notice_detail.skipped_items %}
+        <table class="collection-result-table">
+          <thead>
+            <tr>
+              <th>网络</th>
+              <th>币种</th>
+              <th>地址</th>
+              <th>链上核实余额</th>
+              <th>最小归集额</th>
+              <th>跳过原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in notice_detail.skipped_items %}
+              <tr>
+                <td class="collection-mono">{{ item.chain_key or "-" }}</td>
+                <td class="collection-mono">{{ item.coin_symbol or "-" }}</td>
+                <td class="collection-mono" title="{{ item.address or '' }}">{{ item.address_short or "-" }}</td>
+                <td class="collection-mono">{{ item.verified_onchain_amount or "-" }}</td>
+                <td class="collection-mono">{{ item.min_collect_amount or "-" }}</td>
+                <td>{{ item.skip_reason_label or "未满足归集条件" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
+      <details class="collection-result-detail">
+        <summary>技术详情</summary>
+        <pre>{{ notice_detail.technical_detail|default({})|tojson }}</pre>
+      </details>
+    </div>
+  {% endif %}
+  {% if error %}
+    <div class="alert danger">{{ error }}</div>
+  {% endif %}
+  <div id="collection-sse-warning" class="alert warning" style="display:none">实时状态已断开，可刷新页面。</div>
+
+  <div class="collection-page">
+    <div class="collection-panel">
+      <div class="collection-panel-head">
+        <div>
+          <div class="collection-title">归集候选工作台</div>
+          <div class="collection-meta">候选地址是待归集地址池，运营核实余额后可直接执行归集。</div>
+          <div class="collection-meta">候选金额未复核时显示候选累计；已复核后显示链上真实余额，并扣减已成功归集金额。</div>
+        </div>
+        <div class="collection-nav">
+          <a class="btn secondary admin-btn admin-btn-secondary" href="/admin/collections/tools">高级工具</a>
+          <a class="btn secondary admin-btn admin-btn-secondary" href="/admin/collections/tasks">归集任务</a>
+          <a class="btn secondary admin-btn admin-btn-secondary" href="/admin/collections/batches">归集统计</a>
+          <a class="btn secondary admin-btn admin-btn-secondary" href="/admin/collections/auto-settings">自动归集规则</a>
+        </div>
+      </div>
+      <div class="collection-stats">
+        <div class="collection-stat-card">
+          <div class="collection-stat-label">候选地址数</div>
+          <div class="collection-stat-value">{{ stats.candidate_count or 0 }}</div>
+        </div>
+        <div class="collection-stat-card">
+          <div class="collection-stat-label">已核实</div>
+          <div class="collection-stat-value">{{ stats.verified_address_count or 0 }}</div>
+        </div>
+        <div class="collection-stat-card">
+          <div class="collection-stat-label">可归集</div>
+          <div class="collection-stat-value">{{ stats.collectible_count or 0 }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="collection-panel">
+      <div class="collection-panel-head">
+        <div>
+          <div class="collection-title">网络候选</div>
+          <div class="collection-meta">以已配置的可归集网络为基础，候选数量来自 collection_candidates。</div>
+        </div>
+      </div>
+      {% if network_cards %}
+        <div class="collection-network-grid">
+          {% for card in network_cards %}
+            <a class="collection-network-card {% if filters.chain_key == card.chain_key %}is-active{% endif %}" href="/admin/collections/center?chain_key={{ card.chain_key }}">
+              <div class="collection-network-head">
+                <div>
+                  <div class="collection-network-title">{{ card.chain_name or card.chain_key }}</div>
+                  <div class="collection-network-key">{{ card.chain_key }}</div>
+                  {% if card.collection_enabled == 0 %}
+                    <div class="collection-network-key">归集关闭</div>
+                  {% endif %}
+                </div>
+                {% if filters.chain_key == card.chain_key %}
+                  <span class="badge info">当前</span>
+                {% endif %}
+              </div>
+              <div class="collection-network-metrics">
+                <div>
+                  <div class="collection-network-label">候选</div>
+                  <div class="collection-network-value">{{ card.candidate_count or 0 }}</div>
+                </div>
+                <div>
+                  <div class="collection-network-label">已核实</div>
+                  <div class="collection-network-value">{{ (card.candidate_count or 0) - (card.pending_verify_count or 0) }}</div>
+                </div>
+                <div>
+                  <div class="collection-network-label">可归集</div>
+                  <div class="collection-network-value">{{ card.collectible_count or 0 }}</div>
+                </div>
+              </div>
+            </a>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="collection-empty">暂无已配置的可归集网络。</div>
+      {% endif %}
+    </div>
+
+    <div class="collection-panel">
+      <form method="get" action="/admin/collections/center" class="collection-filter-grid">
+        <input type="hidden" name="page" value="1">
+        <input type="hidden" name="per_page" value="{{ pagination.per_page or filters.per_page or 20 }}">
+        <input type="hidden" name="chain_key" value="{{ filters.chain_key or '' }}">
+        <div>
+          <label for="filter-status">状态</label>
+          <select id="filter-status" name="status">
+            <option value="PENDING" {% if (filters.status or "PENDING") == "PENDING" %}selected{% endif %}>待处理</option>
+            <option value="NO_BALANCE" {% if filters.status == "NO_BALANCE" %}selected{% endif %}>无可归集余额</option>
+            <option value="ALL" {% if filters.status == "ALL" %}selected{% endif %}>全部</option>
+            <option value="COLLECTED" {% if filters.status == "COLLECTED" %}selected{% endif %}>已归集</option>
+          </select>
+        </div>
+        <div>
+          <label for="filter-coin">币种</label>
+          <select id="filter-coin" name="coin_symbol">
+            <option value="">全部币种</option>
+            {% for asset in assets %}
+              {% set symbol = (asset.symbol or "")|upper %}
+              {% if symbol and symbol not in ["ALL", "*", "__ALL__"] %}
+                <option value="{{ symbol }}" {% if filters.coin_symbol == symbol %}selected{% endif %}>{{ symbol }}{% if asset.name and asset.name|upper != symbol %} - {{ asset.name }}{% endif %}</option>
+              {% endif %}
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="filter-source">来源</label>
+          <select id="filter-source" name="source">
+            <option value="">全部来源</option>
+            <option value="DEPOSIT" {% if filters.source == "DEPOSIT" %}selected{% endif %}>充值</option>
+            <option value="MANUAL" {% if filters.source == "MANUAL" %}selected{% endif %}>手工</option>
+            <option value="SCAN" {% if filters.source == "SCAN" %}selected{% endif %}>补漏</option>
+          </select>
+        </div>
+        <div>
+          <label for="filter-user">用户ID</label>
+          <input id="filter-user" name="user_id" value="{{ filters.user_id or '' }}" placeholder="全部">
+        </div>
+        <div>
+          <label for="filter-address">地址</label>
+          <input id="filter-address" name="address" value="{{ filters.address or '' }}" placeholder="地址关键字">
+        </div>
+        <div class="collection-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a class="btn secondary admin-btn admin-btn-secondary" href="/admin/collections/center">重置</a>
+        </div>
+      </form>
+    </div>
+
+    <div class="collection-panel" id="candidate-list">
+      <div class="collection-panel-head">
+        <div>
+          <div class="collection-title">候选地址</div>
+          <div class="collection-meta">提交后由归集任务执行阶段检查 Gas，Gas 不足时系统自动创建补 Gas 任务。</div>
+        </div>
+        <form method="post" action="/admin/collections/center/create-batch" class="collection-actions" onsubmit="return window.confirm('确认一键归集当前网络？系统会先核实链上余额，并为满足最小归集额且无活跃归集任务的候选地址创建归集任务。');">
+          <input type="hidden" name="view" value="addresses">
+          <input type="hidden" name="chain_key" value="{{ filters.chain_key or '' }}">
+          <input type="hidden" name="coin_symbol" value="{{ filters.coin_symbol or '' }}">
+          <input type="hidden" name="status" value="{{ filters.status or 'PENDING' }}">
+          <input type="hidden" name="source" value="{{ filters.source or '' }}">
+          <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}">
+          <input type="hidden" name="address" value="{{ filters.address or '' }}">
+          <input type="hidden" name="page" value="{{ pagination.page or 1 }}">
+          <input type="hidden" name="per_page" value="{{ pagination.per_page or 20 }}">
+          <input type="hidden" name="confirm_text" value="COLLECT">
+          <button type="submit" class="btn admin-btn admin-btn-primary" title="{% if stats.chain_collection_enabled == 0 %}当前网络未开启归集{% endif %}" {% if not filters.chain_key or not (stats.candidate_count or 0) or stats.chain_collection_enabled == 0 %}disabled{% endif %}>一键归集当前网络</button>
+        </form>
+      </div>
+      <div class="collection-current-stats collection-stats">
+        <div class="collection-stat-card {% if not stats.candidate_amount_detail_items %}is-empty{% endif %}" data-amount-card data-amount-title="候选金额合计明细" data-amount-items='{{ stats.candidate_amount_detail_items|default([])|tojson }}'>
+          <div class="collection-stat-label">候选金额合计</div>
+          <div class="collection-stat-value">{{ stats.candidate_amount_total_label or '-' }}</div>
+        </div>
+        <div class="collection-stat-card">
+          <div class="collection-stat-label">可归集地址数</div>
+          <div class="collection-stat-value">{{ stats.collectible_count or 0 }}</div>
+        </div>
+        <div class="collection-stat-card">
+          <div class="collection-stat-label">已复核地址数</div>
+          <div class="collection-stat-value">{{ stats.verified_address_count or 0 }}</div>
+        </div>
+        <div class="collection-stat-card">
+          <div class="collection-stat-label">未复核地址数</div>
+          <div class="collection-stat-value">{{ stats.unverified_address_count or 0 }}</div>
+        </div>
+      </div>
+      <div class="collection-amount-modal" id="collection-amount-modal" aria-hidden="true">
+        <div class="collection-amount-dialog" role="dialog" aria-modal="true" aria-labelledby="collection-amount-modal-title">
+          <div class="collection-amount-dialog-head">
+            <div class="collection-amount-dialog-title" id="collection-amount-modal-title">金额明细</div>
+            <button type="button" class="collection-amount-dialog-close" data-amount-modal-close aria-label="关闭">×</button>
+          </div>
+          <div class="collection-amount-dialog-body">
+            <table class="collection-amount-table">
+              <thead>
+                <tr>
+                  <th>币种</th>
+                  <th>金额</th>
+                </tr>
+              </thead>
+              <tbody id="collection-amount-modal-body"></tbody>
+            </table>
+            <div class="collection-amount-dialog-foot">
+              <div id="collection-amount-modal-page">共 0 个币种，当前第 1 / 1 页</div>
+              <div class="collection-amount-dialog-actions">
+                <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-amount-prev>上一页</button>
+                <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-amount-next>下一页</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      {% if candidate_items %}
+        <div class="collection-table-wrap">
+          <table class="collection-table">
+            <thead>
+              <tr>
+                <th>地址</th>
+                <th>用户ID</th>
+                <th>网络</th>
+                <th>币种</th>
+                <th>候选金额</th>
+                <th>最近复核时间</th>
+                <th>复核状态</th>
+                <th>归集状态</th>
+                <th>来源</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in candidate_items %}
+                <tr data-candidate-id="{{ item.id }}">
+                  <td>
+                    {% set address_text = item.address or "" %}
+                    {% set address_label = (address_text[:8] ~ "..." ~ address_text[-6:]) if address_text|length > 18 else address_text %}
+                    <button type="button" class="collection-address-copy collection-address" title="{{ address_text }}" data-copy-address="{{ address_text }}">{{ address_label }}</button>
+                  </td>
+                  <td class="collection-mono" title="{{ item.user_id }}">{{ item.user_id }}</td>
+                  <td title="{{ item.chain_name or item.chain_key }}">{{ item.chain_name or item.chain_key }}</td>
+                  <td>{{ item.asset_symbol }}</td>
+                  <td class="collection-amount" data-field="candidate-amount" title="{{ item.candidate_amount_label }}">{{ item.candidate_amount_label }}</td>
+                  <td data-field="last-scan-at" title="{{ item.verify_button_title or item.verified_at }}">{{ item.verified_at }}</td>
+                  <td data-field="verify-status">
+                    {% if item.verify_running %}
+                      <span class="badge warning" data-verify-badge="1" title="{{ item.verify_button_title or '' }}">复核中</span>
+                    {% elif item.verify_failed %}
+                      <span class="badge danger" data-verify-badge="1" title="{{ item.verify_button_title or '' }}">复核失败</span>
+                    {% elif item.is_verified %}
+                      <span class="badge success" data-verify-badge="1" title="{{ item.verify_button_title or '' }}">已复核 ✓</span>
+                    {% else %}
+                      <span class="badge neutral" data-verify-badge="1" title="{{ item.verify_button_title or '' }}">未复核</span>
+                    {% endif %}
+                    {% if item.need_verify and not item.verify_running %}<br><span class="collection-meta">有新充值待核实</span>{% endif %}
+                  </td>
+                  <td data-field="collect-status">
+                    <span class="badge {{ item.status_badge or 'neutral' }}">{{ item.status_label }}</span>
+                  </td>
+                  <td>
+                    {% set source_value = (item.source or "")|upper %}
+                    {% if source_value == "MANUAL" %}
+                      手工
+                    {% elif source_value == "DEPOSIT" %}
+                      充值
+                    {% elif source_value == "SCAN" %}
+                      补漏
+                    {% else %}
+                      {{ item.source_label or source_value or "-" }}
+                    {% endif %}
+                  </td>
+                  <td>
+                    <div class="collection-row-actions">
+                      <form method="post" action="/admin/collections/center/verify" data-verify-form="1">
+                        <input type="hidden" name="chain_key" value="{{ item.chain_key }}">
+                        <input type="hidden" name="coin_symbol" value="{{ item.asset_symbol }}">
+                        <input type="hidden" name="candidate_id" value="{{ item.id }}">
+                        <input type="hidden" name="user_id" value="{{ item.user_id }}">
+                        <input type="hidden" name="address" value="{{ item.address }}">
+                        <input type="hidden" name="source" value="{{ filters.source or '' }}">
+                        <input type="hidden" name="page" value="{{ pagination.page or 1 }}">
+                        <input type="hidden" name="per_page" value="{{ pagination.per_page or 20 }}">
+                        <input type="hidden" name="return_chain_key" value="{{ filters.chain_key or '' }}">
+                        <input type="hidden" name="return_asset_symbol" value="{{ filters.coin_symbol or '' }}">
+                        <input type="hidden" name="return_status" value="{{ filters.status or 'PENDING' }}">
+                        <input type="hidden" name="return_source" value="{{ filters.source or '' }}">
+                        <input type="hidden" name="return_user_id" value="{{ filters.user_id or '' }}">
+                        <input type="hidden" name="return_address_keyword" value="{{ filters.address or '' }}">
+                        <input type="hidden" name="return_page" value="{{ pagination.page or 1 }}">
+                        <input type="hidden" name="return_per_page" value="{{ pagination.per_page or 20 }}">
+                        <button type="submit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-action="verify" title="{{ item.verify_button_title or '' }}" {% if not item.can_verify %}disabled{% endif %}>{{ item.verify_button_label or '核实' }}</button>
+                      </form>
+                      <form method="post" action="/admin/collections/center/create-one" data-submit-action="collect" data-confirm="确认提交该地址归集任务？系统将按归集安全规则创建任务，并由后台 worker 执行链上发送。">
+                        <input type="hidden" name="view" value="addresses">
+                        <input type="hidden" name="chain_key" value="{{ item.chain_key }}">
+                        <input type="hidden" name="coin_symbol" value="{{ item.asset_symbol }}">
+                        <input type="hidden" name="candidate_id" value="{{ item.id }}">
+                        <input type="hidden" name="user_id" value="{{ item.user_id }}">
+                        <input type="hidden" name="address" value="{{ item.address }}">
+                        <input type="hidden" name="source" value="{{ filters.source or '' }}">
+                        <input type="hidden" name="action_mode" value="collection">
+                        <input type="hidden" name="page" value="{{ pagination.page or 1 }}">
+                        <input type="hidden" name="per_page" value="{{ pagination.per_page or 20 }}">
+                        <input type="hidden" name="return_chain_key" value="{{ filters.chain_key or '' }}">
+                        <input type="hidden" name="return_asset_symbol" value="{{ filters.coin_symbol or '' }}">
+                        <input type="hidden" name="return_status" value="{{ filters.status or 'PENDING' }}">
+                        <input type="hidden" name="return_source" value="{{ filters.source or '' }}">
+                        <input type="hidden" name="return_user_id" value="{{ filters.user_id or '' }}">
+                        <input type="hidden" name="return_address_keyword" value="{{ filters.address or '' }}">
+                        <input type="hidden" name="return_page" value="{{ pagination.page or 1 }}">
+                        <input type="hidden" name="return_per_page" value="{{ pagination.per_page or 20 }}">
+                        {% set collect_button_disabled = not item.can_create_collection_task %}
+                        {% set collect_button_title = item.collect_disabled_reason or ("请先核实链上余额后再创建归集任务。" if not item.is_verified else item.min_collect_amount_label or "") %}
+                        <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm" data-action="collect" title="{{ collect_button_title }}" {% if collect_button_disabled %}disabled{% endif %}>归集</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="collection-empty">当前筛选条件下暂无归集候选。可先确认是否已有充值入账，或进入高级工具做单地址排查。</div>
+      {% endif %}
+      <div class="collection-pagination">
+        <div>共 {{ pagination.total or 0 }} 条，当前第 {{ pagination.page or 1 }} / {{ pagination.pages or 1 }} 页</div>
+        <div class="collection-pagination-actions">
+          <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if not pagination.has_prev %}is-disabled{% endif %}" href="{{ request.url.include_query_params(page=1, per_page=pagination.per_page or 20) }}">首页</a>
+          <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if not pagination.has_prev %}is-disabled{% endif %}" href="{{ request.url.include_query_params(page=(pagination.page or 1) - 1, per_page=pagination.per_page or 20) }}">上一页</a>
+          <form method="get" action="/admin/collections/center" class="collection-pagination-actions">
+            <input type="hidden" name="chain_key" value="{{ filters.chain_key or '' }}">
+            <input type="hidden" name="coin_symbol" value="{{ filters.coin_symbol or '' }}">
+            <input type="hidden" name="status" value="{{ filters.status or 'PENDING' }}">
+            <input type="hidden" name="source" value="{{ filters.source or '' }}">
+            <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}">
+            <input type="hidden" name="address" value="{{ filters.address or '' }}">
+            <select name="page" onchange="this.form.submit()">
+              {% for page_no in pagination.page_numbers or [1] %}
+                <option value="{{ page_no }}" {% if page_no == pagination.page %}selected{% endif %}>{{ page_no }}</option>
+              {% endfor %}
+            </select>
+            <span>/ {{ pagination.pages or 1 }} 页</span>
+            <span>每页</span>
+            <select name="per_page" onchange="this.form.page.value=1; this.form.submit()">
+              {% for size in pagination.allowed_per_page or [10,20,50,100] %}
+                <option value="{{ size }}" {% if size == pagination.per_page %}selected{% endif %}>{{ size }}</option>
+              {% endfor %}
+            </select>
+          </form>
+          <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if not pagination.has_next %}is-disabled{% endif %}" href="{{ request.url.include_query_params(page=(pagination.page or 1) + 1, per_page=pagination.per_page or 20) }}">下一页</a>
+          <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if not pagination.has_next %}is-disabled{% endif %}" href="{{ request.url.include_query_params(page=pagination.pages or 1, per_page=pagination.per_page or 20) }}">尾页</a>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="collection-result-modal" id="collection-result-modal" aria-hidden="true">
+    <div class="collection-result-dialog" role="dialog" aria-modal="true" aria-labelledby="collection-result-modal-title">
+      <div class="collection-result-dialog-head">
+        <div class="collection-result-dialog-title" id="collection-result-modal-title">创建结果</div>
+        <button type="button" class="collection-result-dialog-close" data-result-modal-close aria-label="关闭">×</button>
+      </div>
+      <div class="collection-result-dialog-body" id="collection-result-modal-body"></div>
+    </div>
+  </div>
+  <script>
+    (function(){
+      let eventSource = null;
+      const amountModal = document.getElementById("collection-amount-modal");
+      const amountModalTitle = document.getElementById("collection-amount-modal-title");
+      const amountModalBody = document.getElementById("collection-amount-modal-body");
+      const amountModalPage = document.getElementById("collection-amount-modal-page");
+      const amountPrev = document.querySelector("[data-amount-prev]");
+      const amountNext = document.querySelector("[data-amount-next]");
+      const resultModal = document.getElementById("collection-result-modal");
+      const resultModalBody = document.getElementById("collection-result-modal-body");
+      const amountPageSize = 10;
+      let amountItems = [];
+      let amountPage = 1;
+      function appendTextCell(row, value, className, title) {
+        const cell = document.createElement("td");
+        if (className) cell.className = className;
+        cell.textContent = value || "-";
+        if (title) cell.title = title;
+        row.appendChild(cell);
+        return cell;
+      }
+      function resultCount(data, key) {
+        return Number(data && data[key] ? data[key] : 0) || 0;
+      }
+      function appendResultSummary(container, label, value) {
+        const item = document.createElement("div");
+        item.className = "collection-result-summary-item";
+        const labelNode = document.createElement("div");
+        labelNode.className = "collection-result-summary-label";
+        labelNode.textContent = label;
+        const valueNode = document.createElement("div");
+        valueNode.className = "collection-result-summary-value";
+        valueNode.textContent = String(value || 0);
+        item.appendChild(labelNode);
+        item.appendChild(valueNode);
+        container.appendChild(item);
+      }
+      function renderResultDetail(data) {
+        const wrapper = document.createElement("div");
+        const summary = document.createElement("div");
+        summary.className = "collection-result-summary";
+        appendResultSummary(summary, "创建任务数", resultCount(data, "created_task_count") || resultCount(data, "created_count"));
+        appendResultSummary(summary, "跳过数量", resultCount(data, "skipped_count"));
+        appendResultSummary(summary, "入队异常数量", resultCount(data, "enqueue_error_count") || resultCount(data.diagnostics || {}, "enqueue_error_count"));
+        wrapper.appendChild(summary);
+
+        const skippedItems = Array.isArray(data.skipped_items) ? data.skipped_items : [];
+        if (skippedItems.length) {
+          const table = document.createElement("table");
+          table.className = "collection-result-table";
+          const thead = document.createElement("thead");
+          const headRow = document.createElement("tr");
+          ["网络", "币种", "地址", "链上核实余额", "最小归集额", "跳过原因"].forEach((label) => {
+            const th = document.createElement("th");
+            th.textContent = label;
+            headRow.appendChild(th);
+          });
+          thead.appendChild(headRow);
+          table.appendChild(thead);
+          const tbody = document.createElement("tbody");
+          skippedItems.forEach((item) => {
+            const row = document.createElement("tr");
+            appendTextCell(row, item.chain_key, "collection-mono");
+            appendTextCell(row, item.coin_symbol, "collection-mono");
+            appendTextCell(row, item.address_short || item.address, "collection-mono", item.address || "");
+            appendTextCell(row, item.verified_onchain_amount, "collection-mono");
+            appendTextCell(row, item.min_collect_amount, "collection-mono");
+            appendTextCell(row, item.skip_reason_label || "未满足归集条件", "");
+            tbody.appendChild(row);
+          });
+          table.appendChild(tbody);
+          wrapper.appendChild(table);
+        }
+
+        const details = document.createElement("details");
+        details.className = "collection-result-detail";
+        const detailsSummary = document.createElement("summary");
+        detailsSummary.textContent = "技术详情";
+        const pre = document.createElement("pre");
+        pre.textContent = JSON.stringify(data.technical_detail || {}, null, 2);
+        details.appendChild(detailsSummary);
+        details.appendChild(pre);
+        wrapper.appendChild(details);
+        return wrapper;
+      }
+      function openResultModal(data) {
+        if (!resultModal || !resultModalBody) return;
+        resultModalBody.innerHTML = "";
+        resultModalBody.appendChild(renderResultDetail(data || {}));
+        resultModal.classList.add("is-open");
+        resultModal.setAttribute("aria-hidden", "false");
+      }
+      function closeResultModal() {
+        if (!resultModal) return;
+        resultModal.classList.remove("is-open");
+        resultModal.setAttribute("aria-hidden", "true");
+      }
+      function normalizeAmountItems(raw) {
+        return (Array.isArray(raw) ? raw : []).filter((item) => item && (item.coin_symbol || item.symbol) && (item.amount_label || item.amount));
+      }
+      function renderAmountModal() {
+        if (!amountModalBody || !amountModalPage) return;
+        const total = amountItems.length;
+        const pages = Math.max(1, Math.ceil(total / amountPageSize));
+        amountPage = Math.min(Math.max(1, amountPage), pages);
+        const start = (amountPage - 1) * amountPageSize;
+        const currentItems = amountItems.slice(start, start + amountPageSize);
+        amountModalBody.innerHTML = "";
+        currentItems.forEach((item) => {
+          const row = document.createElement("tr");
+          const symbolCell = document.createElement("td");
+          const amountCell = document.createElement("td");
+          symbolCell.className = "collection-mono";
+          amountCell.className = "collection-mono";
+          symbolCell.textContent = item.coin_symbol || item.symbol || "-";
+          amountCell.textContent = item.amount_label || ((item.amount || "-") + " " + (item.coin_symbol || item.symbol || "")).trim();
+          row.appendChild(symbolCell);
+          row.appendChild(amountCell);
+          amountModalBody.appendChild(row);
+        });
+        amountModalPage.textContent = "共 " + total + " 个币种，当前第 " + amountPage + " / " + pages + " 页";
+        if (amountPrev) amountPrev.disabled = total <= amountPageSize || amountPage <= 1;
+        if (amountNext) amountNext.disabled = total <= amountPageSize || amountPage >= pages;
+      }
+      function openAmountModal(title, items) {
+        amountItems = normalizeAmountItems(items);
+        if (!amountItems.length) {
+          window.alert("暂无明细");
+          return;
+        }
+        amountPage = 1;
+        if (amountModalTitle) amountModalTitle.textContent = title || "金额明细";
+        renderAmountModal();
+        if (amountModal) {
+          amountModal.classList.add("is-open");
+          amountModal.setAttribute("aria-hidden", "false");
+        }
+      }
+      function closeAmountModal() {
+        if (!amountModal) return;
+        amountModal.classList.remove("is-open");
+        amountModal.setAttribute("aria-hidden", "true");
+      }
+      document.querySelectorAll("[data-amount-card]").forEach((card) => {
+        card.addEventListener("click", () => {
+          let items = [];
+          try {
+            items = JSON.parse(card.getAttribute("data-amount-items") || "[]");
+          } catch (err) {
+            items = [];
+          }
+          openAmountModal(card.getAttribute("data-amount-title") || "金额明细", items);
+        });
+      });
+      document.querySelectorAll("[data-amount-modal-close]").forEach((button) => {
+        button.addEventListener("click", closeAmountModal);
+      });
+      document.querySelectorAll("[data-result-modal-close]").forEach((button) => {
+        button.addEventListener("click", closeResultModal);
+      });
+      if (amountModal) {
+        amountModal.addEventListener("click", (event) => {
+          if (event.target === amountModal) closeAmountModal();
+        });
+      }
+      if (resultModal) {
+        resultModal.addEventListener("click", (event) => {
+          if (event.target === resultModal) closeResultModal();
+        });
+      }
+      if (amountPrev) {
+        amountPrev.addEventListener("click", () => {
+          amountPage -= 1;
+          renderAmountModal();
+        });
+      }
+      if (amountNext) {
+        amountNext.addEventListener("click", () => {
+          amountPage += 1;
+          renderAmountModal();
+        });
+      }
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          closeAmountModal();
+          closeResultModal();
+        }
+      });
+      function copyText(value){
+        if (!value) return Promise.resolve(false);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          return navigator.clipboard.writeText(value).then(() => true).catch(() => false);
+        }
+        const input = document.createElement("textarea");
+        input.value = value;
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        let ok = false;
+        try {
+          ok = document.execCommand("copy");
+        } catch (err) {
+          ok = false;
+        }
+        document.body.removeChild(input);
+        return Promise.resolve(ok);
+      }
+      document.querySelectorAll("[data-copy-address]").forEach((node) => {
+        const original = node.textContent;
+        node.addEventListener("click", () => {
+          const address = node.getAttribute("data-copy-address") || "";
+          copyText(address).then((ok) => {
+            if (!ok) return;
+            node.textContent = "已复制";
+            window.setTimeout(() => {
+              node.textContent = original;
+            }, 900);
+          });
+        });
+      });
+      function rowForCandidate(candidateId) {
+        if (!candidateId) return null;
+        return document.querySelector('[data-candidate-id="' + String(candidateId) + '"]');
+      }
+      function setActionButton(row, action, text, disabled, title) {
+        const button = row && row.querySelector('[data-action="' + action + '"]');
+        if (!button) return;
+        button.textContent = text;
+        button.disabled = !!disabled;
+        if (title) button.title = title;
+      }
+      function setVerifyBadge(row, text, tone, title) {
+        const cell = row && row.querySelector('[data-field="verify-status"]');
+        if (!cell) return;
+        let badge = cell.querySelector("[data-verify-badge]");
+        if (!badge) {
+          badge = document.createElement("span");
+          badge.setAttribute("data-verify-badge", "1");
+          cell.appendChild(document.createElement("br"));
+          cell.appendChild(badge);
+        }
+        badge.className = "badge " + (tone || "neutral");
+        badge.textContent = text || "";
+        badge.title = title || "";
+      }
+      function markVerifyRunning(row) {
+        setVerifyBadge(row, "复核中", "warning", "链上核实正在处理");
+        setActionButton(row, "verify", "复核中", true, "链上核实正在处理");
+      }
+      function markVerifyCompleted(row, event) {
+        const balanceCell = row.querySelector('[data-field="candidate-amount"]');
+        const scanAtCell = row.querySelector('[data-field="last-scan-at"]');
+        if (balanceCell && event.last_balance_amount_display) {
+          balanceCell.textContent = event.last_balance_amount_display;
+          balanceCell.title = event.last_balance_amount_display;
+        }
+        if (scanAtCell && event.last_scan_at_display) {
+          scanAtCell.textContent = event.last_scan_at_display;
+          scanAtCell.title = "最近复核：" + event.last_scan_at_display;
+        }
+        setVerifyBadge(row, "已复核 ✓", "success", event.message || "已复核");
+        setActionButton(row, "verify", "复核", false, event.message || "已复核");
+      }
+      function markVerifyFailed(row, event) {
+        const reason = event.error || event.message || "复核失败";
+        setVerifyBadge(row, "复核失败", "danger", reason);
+        setActionButton(row, "verify", "重试", false, reason);
+      }
+      function markSubmitted(row, action, text) {
+        setVerifyBadge(row, text, "info", text);
+        setActionButton(row, action, "已提交", true, text);
+      }
+      function markNotCreated(row, action, text) {
+        const label = text || "未创建归集任务";
+        setVerifyBadge(row, label, "warning", label);
+        setActionButton(row, action, "归集", false, label);
+      }
+      function applyEvent(event) {
+        const row = rowForCandidate(event.candidate_id);
+        if (!row) return;
+        const type = event.event_type || "";
+        if (type === "candidate_verify_started") {
+          markVerifyRunning(row);
+        } else if (type === "candidate_verify_completed") {
+          markVerifyCompleted(row, event);
+        } else if (type === "candidate_verify_failed") {
+          markVerifyFailed(row, event);
+        } else if (type === "collection_task_submitted") {
+          if (Number(event.created_task_count || 0) > 0) {
+            markSubmitted(row, "collect", event.message || "归集已提交");
+          }
+        } else if (type === "collection_task_not_created") {
+          markNotCreated(row, "collect", event.message || "未创建归集任务");
+        }
+      }
+      function submitRowForm(form, action) {
+        const row = form.closest("[data-candidate-id]");
+        const confirmText = form.getAttribute("data-confirm");
+        if (confirmText && !window.confirm(confirmText)) return;
+        if (action === "verify") {
+          markVerifyRunning(row);
+        } else if (action === "collect") {
+          setActionButton(row, "collect", "提交中", true, "归集任务提交中");
+        }
+        fetch(form.action, {
+          method: "POST",
+          body: new FormData(form),
+          credentials: "same-origin",
+          headers: action === "collect" ? { "Accept": "application/json" } : {}
+        }).then((response) => {
+          if (action !== "collect") {
+            if (!response.ok) throw new Error("request failed");
+            return null;
+          }
+          return response.json().catch(() => ({ ok: false, message: "提交失败，请重试" }));
+        }).then((data) => {
+          if (!data || action !== "collect") return;
+          openResultModal(data);
+          if (action === "collect") {
+            if (data.ok === true && Number(data.created_task_count || 0) > 0) {
+              markSubmitted(row, "collect", data.message || "归集已提交");
+            } else {
+              markNotCreated(row, "collect", data.message || "未创建归集任务");
+            }
+          }
+        }).catch(() => {
+          if (action === "verify") {
+            markVerifyFailed(row, { error: "提交失败，请重试" });
+          } else {
+            setActionButton(row, action, "归集", false, "提交失败，请重试");
+          }
+        });
+      }
+      document.querySelectorAll("[data-verify-form]").forEach((form) => {
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          submitRowForm(form, "verify");
+        });
+      });
+      document.querySelectorAll("[data-submit-action]").forEach((form) => {
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          submitRowForm(form, form.getAttribute("data-submit-action") || "");
+        });
+      });
+      function startEvents() {
+        if (!window.EventSource) return;
+        const warning = document.getElementById("collection-sse-warning");
+        const params = new URLSearchParams(window.location.search);
+        if (!params.get("chain_key")) {
+          params.set("chain_key", "{{ filters.chain_key or '' }}");
+        }
+        if (params.get("coin_symbol") && !params.get("asset_symbol")) {
+          params.set("asset_symbol", params.get("coin_symbol"));
+        }
+        eventSource = new EventSource("/admin/collections/center/events?" + params.toString());
+        ["candidate_verify_started", "candidate_verify_completed", "candidate_verify_failed", "collection_task_submitted", "collection_task_not_created"].forEach((type) => {
+          eventSource.addEventListener(type, (message) => {
+            try {
+              applyEvent(JSON.parse(message.data || "{}"));
+            } catch (err) {}
+          });
+        });
+        eventSource.addEventListener("error", () => {
+          if (warning) warning.style.display = "block";
+        });
+      }
+      startEvents();
+      window.addEventListener("beforeunload", () => {
+        if (eventSource) eventSource.close();
+      });
+    })();
+  </script>
+{% endblock %}

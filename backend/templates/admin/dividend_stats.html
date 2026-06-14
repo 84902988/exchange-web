@@ -1,0 +1,197 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}分红统计{% endblock %}
+{% block page_title %}分红统计{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">运营总览 Dashboard：只看分红数据，不做发放、重算或规则编辑。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/dividend-config" class="btn secondary admin-btn admin-btn-secondary">分红配置</a>
+  <a href="/admin/dividend-pools" class="btn secondary admin-btn admin-btn-secondary">分红管理</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .dividend-stats-grid{ grid-template-columns:repeat(6,minmax(0,1fr)); }
+    .mono-cell{ font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace; white-space:nowrap; }
+    .source-type-label{ min-width:112px; white-space:nowrap; }
+    .dividend-stat-card{ min-width:0; overflow:hidden; }
+    .dividend-stat-value{ display:block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-variant-numeric:tabular-nums; font-size:clamp(18px,1.7vw,26px); line-height:1.15; }
+    .dividend-two-col{ display:grid; grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr); gap:16px; }
+    .dividend-compact-wrap{ overflow-x:hidden; }
+    .dividend-compact-table{ min-width:0; width:100%; table-layout:fixed; }
+    .dividend-compact-table th{ white-space:nowrap; overflow:visible; text-overflow:clip; font-size:12px; }
+    .dividend-compact-table td{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .dividend-level-table th:nth-child(1),.dividend-level-table td:nth-child(1){ width:18%; }
+    .dividend-level-table th:nth-child(2),.dividend-level-table td:nth-child(2){ width:16%; }
+    .dividend-level-table th:nth-child(3),.dividend-level-table td:nth-child(3){ width:16%; }
+    .dividend-level-table th:nth-child(4),.dividend-level-table td:nth-child(4){ width:24%; }
+    .dividend-level-table th:nth-child(5),.dividend-level-table td:nth-child(5){ width:26%; }
+    .dividend-trend-wrap{ overflow-x:auto; }
+    .dividend-trend-table{ width:100%; min-width:720px; table-layout:fixed; }
+    .dividend-trend-table th,.dividend-trend-table td{ white-space:nowrap; }
+    .dividend-trend-table th:nth-child(1),.dividend-trend-table td:nth-child(1){ width:24%; }
+    .dividend-trend-table th:nth-child(2),.dividend-trend-table td:nth-child(2){ width:30%; }
+    .dividend-trend-table th:nth-child(3),.dividend-trend-table td:nth-child(3){ width:26%; }
+    .dividend-trend-table th:nth-child(4),.dividend-trend-table td:nth-child(4){ width:20%; }
+    @media (max-width:1180px){ .dividend-stats-grid{ grid-template-columns:repeat(3,minmax(0,1fr)); } }
+    @media (max-width:1180px){ .dividend-two-col{ grid-template-columns:1fr; } }
+    @media (max-width:640px){ .dividend-stats-grid{ grid-template-columns:1fr; } .dividend-trend-table{ min-width:620px; } }
+  </style>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/dividend-stats" class="filter-form">
+        <div class="field">
+          <label for="start_date">开始日期</label>
+          <input id="start_date" type="date" name="start_date" value="{{ filters.start_date_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="end_date">结束日期</label>
+          <input id="end_date" type="date" name="end_date" value="{{ filters.end_date_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="PENDING" {% if filters.status == 'PENDING' %}selected{% endif %}>待处理</option>
+            <option value="CALCULATED" {% if filters.status == 'CALCULATED' %}selected{% endif %}>已计算</option>
+            <option value="PAID" {% if filters.status == 'PAID' %}selected{% endif %}>已发放</option>
+            <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
+            <option value="SKIPPED" {% if filters.status == 'SKIPPED' %}selected{% endif %}>已跳过</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/dividend-stats" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="mini-stat-grid dividend-stats-grid">
+      <div class="mini-stat dividend-stat-card"><div class="mini-stat-label">总手续费折算 USDT</div><div class="mini-stat-value admin-amount dividend-stat-value" title="{{ summary.total_fee_usdt }}">{{ summary.total_fee_usdt }}</div></div>
+      <div class="mini-stat dividend-stat-card"><div class="mini-stat-label">已发放 RCB</div><div class="mini-stat-value admin-amount dividend-stat-value" title="{{ summary.paid_rcb }}">{{ summary.paid_rcb }}</div></div>
+      <div class="mini-stat dividend-stat-card"><div class="mini-stat-label">待发放 RCB</div><div class="mini-stat-value admin-amount dividend-stat-value" title="{{ summary.pending_rcb }}">{{ summary.pending_rcb }}</div></div>
+      <div class="mini-stat dividend-stat-card"><div class="mini-stat-label">分红池数量</div><div class="mini-stat-value dividend-stat-value" title="{{ summary.pool_count }}">{{ summary.pool_count }}</div></div>
+      <div class="mini-stat dividend-stat-card"><div class="mini-stat-label">成功发放次数</div><div class="mini-stat-value dividend-stat-value" title="{{ summary.paid_pool_count }}">{{ summary.paid_pool_count }}</div></div>
+      <div class="mini-stat dividend-stat-card"><div class="mini-stat-label">失败次数</div><div class="mini-stat-value dividend-stat-value" title="{{ summary.failed_pool_count }}">{{ summary.failed_pool_count }}</div></div>
+    </div>
+  </section>
+
+  <section class="page-section dividend-two-col">
+    <div class="table-card">
+      <div class="section-title">SVIP档位分布</div>
+      {% if levels %}
+        <div class="table-wrap admin-table-wrap dividend-compact-wrap">
+          <table class="data-table admin-table dividend-compact-table dividend-level-table">
+            <thead>
+              <tr>
+                <th>档位</th>
+                <th class="text-right">当前人数</th>
+                <th class="text-right">分红比例</th>
+                <th class="text-right">本期预计 RCB</th>
+                <th class="text-right">累计已发 RCB</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in levels %}
+                <tr>
+                  <td class="mono-cell">{{ item.level_code }}</td>
+                  <td class="text-right admin-number">{{ item.current_user_count }}</td>
+                  <td class="admin-amount">{{ item.dividend_rate }}</td>
+                  <td class="admin-amount">{{ item.estimated_dividend_rcb }}</td>
+                  <td class="admin-amount">{{ item.total_paid_rcb }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无 SVIP 档位数据。</div>
+      {% endif %}
+    </div>
+
+    <div class="table-card">
+      <div class="section-title">手续费来源结构</div>
+      {% if source_breakdown %}
+        <div class="table-wrap admin-table-wrap dividend-compact-wrap">
+          <table class="data-table admin-table dividend-compact-table">
+            <thead>
+              <tr>
+                <th>来源类型</th>
+                <th class="text-right">手续费折算 USDT</th>
+                <th class="text-right">占比</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in source_breakdown %}
+                <tr>
+                  <td class="source-type-label">{{ item.source_type_label }}</td>
+                  <td class="admin-amount">{{ item.fee_usdt }}</td>
+                  <td class="admin-amount">{{ item.ratio }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无手续费来源数据。</div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">分红趋势</div>
+      {% if trends %}
+        <div class="table-wrap admin-table-wrap dividend-trend-wrap">
+          <table class="data-table admin-table dividend-trend-table">
+            <thead>
+              <tr>
+                <th>分红日期</th>
+                <th class="text-right">手续费折算 USDT</th>
+                <th class="text-right">分红 RCB</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in trends %}
+                <tr>
+                  <td class="mono-cell">{{ item.dividend_date }}</td>
+                  <td class="admin-amount">{{ item.total_fee_usdt }}</td>
+                  <td class="admin-amount">{{ item.total_dividend_rcb }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">当前筛选范围内暂无分红批次。</div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">分红状态分布</div>
+      <div class="table-wrap admin-table-wrap dividend-compact-wrap">
+        <table class="data-table admin-table dividend-compact-table">
+          <thead><tr><th>状态</th><th class="text-right">数量</th></tr></thead>
+          <tbody>
+            {% for item in status_counts %}
+              <tr>
+                <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                <td class="text-right admin-number">{{ item.count }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+{% endblock %}

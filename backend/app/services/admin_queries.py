@@ -1,0 +1,21759 @@
+from __future__ import annotations
+
+import logging
+import json
+from copy import deepcopy
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_UP
+from time import monotonic
+from typing import Any, Dict, Iterable, Optional
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import bindparam, inspect, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.core.security import hash_password
+from app.core.rq import get_redis_connection
+from app.db.models.system_config import SystemConfig
+from app.core.chain_capabilities import (
+    CONFIG_ONLY,
+    EVM,
+    READY,
+    build_admin_chain_capability_view,
+    get_chain_capability,
+    get_chain_runtime_status,
+    is_chain_deposit_supported,
+    is_chain_withdraw_supported,
+)
+from app.core.chain_config import normalize_rpc_urls_text
+from app.core.chain_config import get_chain_config
+from app.services.hot_wallet_key_service import (
+    get_chain_hot_wallet_key_meta,
+    save_chain_hot_wallet_private_key,
+)
+from app.services.moralis_chain_mapping import (
+    build_moralis_chain_mapping,
+    validate_effective_moralis_mapping,
+)
+from app.services.moralis_service import get_stream_id_for_chain
+from app.services.service_heartbeat import heartbeat_age_seconds, is_heartbeat_alive, read_service_heartbeat
+from app.services.solana_wallet import is_solana_address
+from app.services.withdraw_fee_service import maintain_withdraw_fee_once
+from app.services.withdraw_anomaly_service import query_withdraw_anomalies
+from app.services.collection_candidate_scanner import (
+    ScanResult,
+    admin_create_collection_tasks,
+    admin_preview_collection_candidates,
+    load_candidate_verify_statuses,
+)
+from app.services.collection_balance_checker import confirm_collection_candidate_onchain
+from app.services.collection_service import (
+    create_collection_batch,
+    create_collection_task,
+    find_active_collection_task_duplicate,
+)
+from app.services.collection_scan_cache import (
+    get_scan_statuses,
+    load_scan_snapshot,
+    normalize_scan_chain_key,
+    scan_status_running,
+)
+from app.services.market_cache import clear_market_metadata_cache
+
+
+logger = logging.getLogger(__name__)
+_WITHDRAW_ANOMALY_CACHE: Dict[str, Any] = {"expires_at": 0.0, "limit": 0, "data": None}
+_WITHDRAW_ANOMALY_CACHE_SECONDS = 60
+ADMIN_OPERATIONS_TIMEZONE = "Asia/Shanghai"
+
+PLATFORM_ACCOUNT_USER_ID = 99999999
+UNSUPPORTED_CHAIN_ERROR = "当前系统不支持 Tron 网络"
+SUPPORTED_CHAIN_KEYS = {"bsc", "polygon", "avaxc", "ethereum", "optimism", "solana", "base"}
+WITHDRAW_FEE_QUANT = Decimal("0.001")
+WITHDRAW_COST_QUANT = Decimal("0.000001")
+ADMIN_RQ_QUEUE_NAMES = (
+    "email",
+    "withdraw",
+    "payout",
+    "release",
+    "tx_confirm",
+    "collection",
+    "gas",
+    "maintenance",
+)
+ADMIN_RQ_WORKER_ONLINE_SECONDS = 60
+ADMIN_HEARTBEAT_SERVICE_NAMES = {
+    "withdraw_fee_scheduler",
+    "dealer_loop",
+    "liquidation_scanner",
+    "tp_sl_scanner",
+    "dividend_job",
+}
+ADMIN_PAGINATION_ALLOWED_PER_PAGE = (10, 20, 50, 100)
+
+
+def normalize_admin_pagination(
+    page: Any,
+    per_page: Any,
+    allowed: tuple[int, ...] = ADMIN_PAGINATION_ALLOWED_PER_PAGE,
+    default: int = 20,
+) -> tuple[int, int]:
+    try:
+        normalized_page = int(page or 1)
+    except Exception:
+        normalized_page = 1
+    try:
+        normalized_per_page = int(per_page or default)
+    except Exception:
+        normalized_per_page = default
+    if normalized_page < 1:
+        normalized_page = 1
+    if normalized_per_page not in allowed:
+        normalized_per_page = default
+    return normalized_page, normalized_per_page
+
+
+def build_pagination_meta(total: Any, page: Any, per_page: Any) -> Dict[str, Any]:
+    try:
+        total_count = max(0, int(total or 0))
+    except Exception:
+        total_count = 0
+    normalized_page, normalized_per_page = normalize_admin_pagination(page, per_page)
+    total_pages = max(1, (total_count + normalized_per_page - 1) // normalized_per_page)
+    if normalized_page > total_pages:
+        normalized_page = total_pages
+    return {
+        "total": total_count,
+        "page": normalized_page,
+        "per_page": normalized_per_page,
+        "page_size": normalized_per_page,
+        "pages": total_pages,
+        "total_pages": total_pages,
+        "has_prev": normalized_page > 1,
+        "has_next": normalized_page < total_pages,
+        "allowed_per_page": list(ADMIN_PAGINATION_ALLOWED_PER_PAGE),
+        "page_numbers": list(range(1, total_pages + 1)),
+    }
+ADMIN_SERVICE_OVERVIEW_GROUPS = (
+    {
+        "title": "核心服务",
+        "services": (
+            {
+                "key": "api",
+                "name": "API",
+                "type": "API",
+                "expected": "应启动",
+                "impact": "用户端、后台页面、Webhook 和接口不可用。",
+                "systemd": "exchange-api.service",
+                "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
+            },
+            {
+                "key": "redis",
+                "name": "Redis",
+                "type": "Redis",
+                "expected": "应启动",
+                "impact": "RQ 队列、验证码、登录限流、缓存和后台监控不可用。",
+                "systemd": "redis.service / redis-server.service",
+                "windows": "本地 Redis 服务或 redis-server",
+            },
+        ),
+    },
+    {
+        "title": "RQ Workers",
+        "services": tuple(
+            {
+                "key": f"rq_{queue_name}",
+                "queue": queue_name,
+                "name": queue_name,
+                "type": "RQ Worker",
+                "expected": "应启动",
+                "impact": {
+                    "email": "验证码和通知邮件会积压，用户无法及时收到邮件。",
+                    "withdraw": "提现链上发送任务会积压，提现可能停留在处理中。",
+                    "payout": "返佣、分红等出款类任务会积压。",
+                    "release": "股票锁仓释放任务会积压，用户资产释放延迟。",
+                    "tx_confirm": "链上交易确认状态可能不更新。",
+                    "collection": "归集任务不会继续执行。",
+                    "gas": "Gas 补给任务不会继续执行，链上发送可能卡住。",
+                    "maintenance": "维护类任务不会执行，例如提现手续费自动维护。",
+                }.get(queue_name, "对应 RQ 任务会积压。"),
+                "systemd": f"exchange-rq-{queue_name.replace('_', '-')}.service",
+                "windows": f"python backend/scripts/start_rq_worker.py {queue_name}",
+            }
+            for queue_name in ADMIN_RQ_QUEUE_NAMES
+        ),
+    },
+    {
+        "title": "Scheduler / Loop / Scanner",
+        "services": (
+            {
+                "key": "withdraw_fee_scheduler",
+                "name": "withdraw fee scheduler",
+                "type": "Scheduler",
+                "expected": "应启动",
+                "impact": "不会自动投递提现手续费维护任务，maintenance worker 可能空转。",
+                "systemd": "exchange-withdraw-fee-scheduler.service",
+                "windows": "python backend/scripts/start_withdraw_fee_scheduler.py",
+            },
+            {
+                "key": "dealer_loop",
+                "name": "dealer loop",
+                "type": "Loop",
+                "expected": "单实例",
+                "impact": "Dealer 相关订单处理不继续推进；重复启动可能造成重复扫描。",
+                "systemd": "exchange-dealer-loop.service",
+                "windows": "python backend/scripts/start_dealer_loop.py",
+            },
+            {
+                "key": "liquidation_scanner",
+                "name": "liquidation scanner",
+                "type": "Scanner",
+                "expected": "单实例",
+                "impact": "风险仓位不会被自动扫描执行强平。",
+                "systemd": "exchange-liquidation-scanner.service",
+                "windows": "python backend/scripts/start_liquidation_scanner.py",
+            },
+            {
+                "key": "tp_sl_scanner",
+                "name": "TP/SL scanner",
+                "type": "Scanner",
+                "expected": "单实例",
+                "impact": "合约止盈止损条件不会被自动触发。",
+                "systemd": "exchange-tp-sl-scanner.service",
+                "windows": "python backend/scripts/start_tp_sl_scanner.py",
+            },
+            {
+                "key": "dividend_job",
+                "name": "dividend job",
+                "type": "Scheduler",
+                "expected": "single instance",
+                "impact": "SVIP dividends will not be checked or paid automatically.",
+                "systemd": "embedded in exchange-api.service",
+                "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
+            },
+        ),
+    },
+)
+
+
+class WithdrawReviewError(ValueError):
+    pass
+
+
+class AdminWithdrawUnfreezeError(ValueError):
+    pass
+
+
+def _admin_rq_datetime(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
+
+def _admin_rq_registry_count(registry: Any) -> int:
+    try:
+        return int(getattr(registry, "count"))
+    except Exception:
+        try:
+            return len(registry.get_job_ids())
+        except Exception:
+            return 0
+
+
+def _admin_rq_registry_job_ids(registry: Any, limit: int) -> list[str]:
+    try:
+        return list(registry.get_job_ids(0, limit))
+    except TypeError:
+        try:
+            return list(registry.get_job_ids())[:limit]
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+def _admin_rq_error_summary(exc_info: Any) -> str:
+    lines = [line.strip() for line in str(exc_info or "").splitlines() if line.strip()]
+    if not lines:
+        return "-"
+    summary = lines[-1]
+    return summary[:220] + ("..." if len(summary) > 220 else "")
+
+
+def _admin_rq_worker_queue_names(worker: Any) -> list[str]:
+    raw_names = getattr(worker, "queue_names", None)
+    if callable(raw_names):
+        try:
+            raw_names = raw_names()
+        except Exception:
+            raw_names = None
+    if raw_names:
+        return [str(name) for name in raw_names]
+
+    queues = getattr(worker, "queues", None) or []
+    names: list[str] = []
+    for queue in queues:
+        name = getattr(queue, "name", None)
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _admin_rq_worker_heartbeat_age_seconds(value: Any, now: datetime) -> Optional[float]:
+    heartbeat = value
+    if not isinstance(heartbeat, datetime):
+        try:
+            heartbeat = datetime.fromisoformat(str(heartbeat or "").replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if heartbeat.tzinfo is not None and heartbeat.utcoffset() is not None:
+        heartbeat = heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
+    return max(0.0, (now - heartbeat).total_seconds())
+
+
+def _admin_rq_worker_is_online(worker: Any, now: datetime) -> bool:
+    age_seconds = _admin_rq_worker_heartbeat_age_seconds(getattr(worker, "last_heartbeat", None), now)
+    return age_seconds is not None and age_seconds <= ADMIN_RQ_WORKER_ONLINE_SECONDS
+
+
+def _admin_rq_status_meta(
+    *,
+    worker_count: int,
+    stale_worker_count: int = 0,
+    queued: int,
+    deferred: int,
+    failed: int,
+) -> tuple[str, str]:
+    if worker_count <= 0:
+        if stale_worker_count > 0:
+            return f"过期注册 {stale_worker_count}", "neutral"
+        return "无 worker", "neutral"
+    if failed > 0:
+        return "有失败", "danger"
+    if queued > 0 or deferred > 0:
+        return "有积压", "warning"
+    return "正常", "success"
+
+
+def _admin_rq_empty_queue(name: str, *, redis_error: bool = False) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "queued_count": 0,
+        "started_count": 0,
+        "deferred_count": 0,
+        "scheduled_count": 0,
+        "failed_count": 0,
+        "finished_count": 0,
+        "worker_count": 0,
+        "stale_worker_count": 0,
+        "status_label": "Redis 未连接" if redis_error else "无 worker",
+        "status_badge": "danger" if redis_error else "neutral",
+        "failed_jobs": [],
+    }
+
+
+def admin_query_rq_status() -> Dict[str, Any]:
+    queues = [_admin_rq_empty_queue(name) for name in ADMIN_RQ_QUEUE_NAMES]
+    worker_rows: list[Dict[str, Any]] = []
+    worker_counts = _admin_service_empty_worker_counts()
+
+    try:
+        from rq import Worker
+        from rq.job import Job
+        from rq.registry import DeferredJobRegistry, FailedJobRegistry, FinishedJobRegistry, StartedJobRegistry
+        try:
+            from rq.registry import ScheduledJobRegistry
+        except Exception:
+            ScheduledJobRegistry = None
+
+        from app.core.rq import get_queue, get_redis_connection
+
+        connection = get_redis_connection()
+        connection.ping()
+        workers = list(Worker.all(connection=connection))
+    except Exception as exc:
+        logger.warning("admin_query_rq_status redis/rq unavailable: %r", exc)
+        return {
+            "redis_connected": False,
+            "error": "Redis 未连接",
+            "as_of": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "queues": [_admin_rq_empty_queue(name, redis_error=True) for name in ADMIN_RQ_QUEUE_NAMES],
+            "workers": [],
+            "summary": {
+                "queue_count": len(ADMIN_RQ_QUEUE_NAMES),
+                "worker_count": 0,
+                "stale_worker_count": 0,
+                "queued_total": 0,
+                "failed_total": 0,
+            },
+        }
+
+    now = datetime.utcnow()
+    online_worker_total = 0
+    stale_worker_total = 0
+    for worker in workers:
+        worker_name = str(getattr(worker, "name", "") or "-")
+        worker_state = str(getattr(worker, "state", "") or "-")
+        last_heartbeat = getattr(worker, "last_heartbeat", None)
+        queue_names = _admin_rq_worker_queue_names(worker)
+        is_online = _admin_rq_worker_is_online(worker, now)
+        if is_online:
+            online_worker_total += 1
+        else:
+            stale_worker_total += 1
+        bucket = "online" if is_online else "stale"
+        for queue_name in queue_names:
+            if queue_name in worker_counts:
+                worker_counts[queue_name][bucket] += 1
+        worker_rows.append(
+            {
+                "name": worker_name,
+                "state": worker_state,
+                "queues": ", ".join(queue_names) if queue_names else "-",
+                "last_heartbeat": _admin_rq_datetime(last_heartbeat),
+                "birth_date": _admin_rq_datetime(getattr(worker, "birth_date", None)),
+                "is_online": is_online,
+            }
+        )
+
+    queue_rows: list[Dict[str, Any]] = []
+    queued_total = 0
+    failed_total = 0
+    for queue_name in ADMIN_RQ_QUEUE_NAMES:
+        try:
+            queue = get_queue(queue_name)
+            started_registry = StartedJobRegistry(queue_name, connection=connection)
+            deferred_registry = DeferredJobRegistry(queue_name, connection=connection)
+            failed_registry = FailedJobRegistry(queue_name, connection=connection)
+            finished_registry = FinishedJobRegistry(queue_name, connection=connection)
+
+            queued_count = int(getattr(queue, "count", 0) or 0)
+            started_count = _admin_rq_registry_count(started_registry)
+            deferred_count = _admin_rq_registry_count(deferred_registry)
+            scheduled_count = 0
+            if ScheduledJobRegistry is not None:
+                scheduled_registry = ScheduledJobRegistry(queue_name, connection=connection)
+                scheduled_count = _admin_rq_registry_count(scheduled_registry)
+            failed_count = _admin_rq_registry_count(failed_registry)
+            finished_count = _admin_rq_registry_count(finished_registry)
+            counts = worker_counts.get(queue_name) or {}
+            worker_count = int(counts.get("online") or 0)
+            stale_worker_count = int(counts.get("stale") or 0)
+            status_label, status_badge = _admin_rq_status_meta(
+                worker_count=worker_count,
+                stale_worker_count=stale_worker_count,
+                queued=queued_count,
+                deferred=deferred_count,
+                failed=failed_count,
+            )
+
+            failed_jobs: list[Dict[str, Any]] = []
+            for job_id in _admin_rq_registry_job_ids(failed_registry, 5):
+                try:
+                    job = Job.fetch(job_id, connection=connection)
+                    failed_jobs.append(
+                        {
+                            "id": str(job_id),
+                            "func_name": str(getattr(job, "func_name", "") or "-"),
+                            "created_at": _admin_rq_datetime(getattr(job, "created_at", None)),
+                            "ended_at": _admin_rq_datetime(getattr(job, "ended_at", None)),
+                            "error": _admin_rq_error_summary(getattr(job, "exc_info", "")),
+                        }
+                    )
+                except Exception as exc:
+                    failed_jobs.append(
+                        {
+                            "id": str(job_id),
+                            "func_name": "-",
+                            "created_at": "-",
+                            "ended_at": "-",
+                            "error": _admin_rq_error_summary(exc),
+                        }
+                    )
+
+            queued_total += queued_count
+            failed_total += failed_count
+            queue_rows.append(
+                {
+                    "name": queue_name,
+                    "queued_count": queued_count,
+                    "started_count": started_count,
+                    "deferred_count": deferred_count,
+                    "scheduled_count": scheduled_count,
+                    "failed_count": failed_count,
+                    "finished_count": finished_count,
+                    "worker_count": worker_count,
+                    "stale_worker_count": stale_worker_count,
+                    "status_label": status_label,
+                    "status_badge": status_badge,
+                    "failed_jobs": failed_jobs,
+                }
+            )
+        except Exception as exc:
+            logger.warning("admin_query_rq_status queue=%s failed: %r", queue_name, exc)
+            queue_rows.append(_admin_rq_empty_queue(queue_name, redis_error=True))
+
+    return {
+        "redis_connected": True,
+        "error": "",
+        "as_of": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "queues": queue_rows,
+        "workers": worker_rows,
+        "summary": {
+            "queue_count": len(ADMIN_RQ_QUEUE_NAMES),
+            "worker_count": online_worker_total,
+            "stale_worker_count": stale_worker_total,
+            "queued_total": queued_total,
+            "failed_total": failed_total,
+        },
+    }
+
+
+def _admin_service_status_meta(status_text: str) -> tuple[str, str]:
+    if status_text in {"可访问", "已连接", "运行中"} or status_text.startswith("worker 数量 "):
+        if status_text.endswith(" 0"):
+            return status_text, "warning"
+        return status_text, "success"
+    if status_text.startswith("过期注册 "):
+        return status_text, "neutral"
+    if status_text in {"心跳超时", "心跳异常"}:
+        return status_text, "danger"
+    if status_text in {"不可访问", "未连接"}:
+        return status_text, "danger"
+    return status_text, "neutral"
+
+
+def _admin_service_empty_worker_counts() -> dict[str, Dict[str, int]]:
+    return {queue_name: {"online": 0, "stale": 0} for queue_name in ADMIN_RQ_QUEUE_NAMES}
+
+
+def _admin_service_empty_heartbeats() -> dict[str, Dict[str, Any]]:
+    return {
+        service_name: {
+            "status": "missing",
+            "observed": "未启动",
+            "observed_badge": "danger",
+            "detail": "",
+        }
+        for service_name in ADMIN_HEARTBEAT_SERVICE_NAMES
+    }
+
+
+def _admin_service_heartbeat_meta(redis_conn: Any, service_name: str) -> Dict[str, Any]:
+    try:
+        payload = read_service_heartbeat(redis_conn, service_name)
+    except Exception as exc:
+        logger.warning("admin_query_service_overview heartbeat read failed service=%s error=%r", service_name, exc)
+        return {"status": "error", "observed": "心跳异常", "observed_badge": "danger", "detail": str(exc)[:160]}
+
+    if payload.get("parse_error"):
+        return {
+            "status": "parse_error",
+            "observed": "心跳异常",
+            "observed_badge": "danger",
+            "detail": str(payload.get("error") or "")[:160],
+            "payload": payload,
+        }
+    if not payload.get("exists"):
+        return {"status": "missing", "observed": "未启动", "observed_badge": "danger", "detail": "", "payload": payload}
+
+    age_seconds = heartbeat_age_seconds(payload)
+    if is_heartbeat_alive(payload):
+        observed = "运行中"
+        badge = "success"
+        status = "alive"
+    else:
+        observed = "心跳超时"
+        badge = "danger"
+        status = "timeout"
+
+    detail_parts = []
+    if payload.get("pid") not in (None, ""):
+        detail_parts.append(f"pid {payload.get('pid')}")
+    if payload.get("hostname"):
+        detail_parts.append(str(payload.get("hostname")))
+    if age_seconds is not None:
+        detail_parts.append(f"last seen {age_seconds}s ago")
+    elif payload.get("last_seen_at"):
+        detail_parts.append(f"last seen {payload.get('last_seen_at')}")
+    if payload.get("run_time_utc"):
+        detail_parts.append(f"run {payload.get('run_time_utc')} UTC")
+    if payload.get("last_check_result"):
+        detail_parts.append(f"last check {payload.get('last_check_result')}")
+
+    return {
+        "status": status,
+        "observed": observed,
+        "observed_badge": badge,
+        "detail": " · ".join(detail_parts),
+        "age_seconds": age_seconds,
+        "payload": payload,
+    }
+
+
+def _admin_service_observe_redis_and_workers() -> tuple[bool, dict[str, Dict[str, int]], dict[str, Dict[str, Any]], str]:
+    worker_counts = _admin_service_empty_worker_counts()
+    heartbeats = _admin_service_empty_heartbeats()
+    try:
+        from rq import Worker
+
+        from app.core.rq import get_redis_connection
+
+        connection = get_redis_connection()
+        connection.ping()
+        now = datetime.utcnow()
+        for worker in Worker.all(connection=connection):
+            worker_name = str(getattr(worker, "name", "") or "")
+            worker_state = str(getattr(worker, "state", "") or "")
+            last_heartbeat = getattr(worker, "last_heartbeat", None)
+            queue_names = _admin_rq_worker_queue_names(worker)
+            is_online = _admin_rq_worker_is_online(worker, now)
+            bucket = "online" if is_online else "stale"
+            logger.debug(
+                "admin_service_rq_worker_observed name=%s state=%s queues=%s last_heartbeat=%s bucket=%s",
+                worker_name,
+                worker_state,
+                queue_names,
+                _admin_rq_datetime(last_heartbeat),
+                bucket,
+            )
+            for queue_name in queue_names:
+                if queue_name in worker_counts:
+                    worker_counts[queue_name][bucket] += 1
+        for service_name in ADMIN_HEARTBEAT_SERVICE_NAMES:
+            heartbeats[service_name] = _admin_service_heartbeat_meta(connection, service_name)
+        return True, worker_counts, heartbeats, ""
+    except Exception as exc:
+        logger.warning("admin_query_service_overview redis/rq unavailable: %r", exc)
+        return False, worker_counts, heartbeats, "Redis 未连接"
+
+
+def admin_query_service_overview() -> Dict[str, Any]:
+    redis_connected, worker_counts, heartbeats, error = _admin_service_observe_redis_and_workers()
+    groups: list[Dict[str, Any]] = []
+    running_count = 0
+    unobserved_count = 0
+    abnormal_count = 0
+
+    for group in ADMIN_SERVICE_OVERVIEW_GROUPS:
+        service_rows: list[Dict[str, Any]] = []
+        for service in group["services"]:
+            key = str(service.get("key") or "")
+            observed_detail = ""
+            if key == "api":
+                observed = "可访问"
+            elif key == "redis":
+                observed = "已连接" if redis_connected else "未连接"
+            elif service.get("type") == "RQ Worker":
+                queue_name = str(service.get("queue") or "")
+                counts = worker_counts.get(queue_name) or {}
+                online_count = int(counts.get("online") or 0)
+                stale_count = int(counts.get("stale") or 0)
+                if online_count > 0:
+                    observed = f"worker 数量 {online_count}"
+                elif stale_count > 0:
+                    observed = f"过期注册 {stale_count}"
+                else:
+                    observed = "未连接"
+            elif key in ADMIN_HEARTBEAT_SERVICE_NAMES:
+                heartbeat = heartbeats.get(key) or {}
+                observed = str(heartbeat.get("observed") or "心跳超时")
+                observed_detail = str(heartbeat.get("detail") or "")
+            else:
+                observed = "未接心跳 / 需 systemd 观察"
+
+            observed_label, observed_badge = _admin_service_status_meta(observed)
+            if key in ADMIN_HEARTBEAT_SERVICE_NAMES:
+                observed_badge = str((heartbeats.get(key) or {}).get("observed_badge") or observed_badge)
+            expected = str(service.get("expected") or "")
+            if observed_badge == "success":
+                running_count += 1
+            elif observed_label.startswith("未接心跳") or observed_label.startswith("过期注册"):
+                unobserved_count += 1
+            elif observed_badge in {"warning", "danger"}:
+                abnormal_count += 1
+
+            service_rows.append(
+                {
+                    **service,
+                    "run_mode": "独立 systemd 服务",
+                    "observed": observed_label,
+                    "observed_badge": observed_badge,
+                    "observed_detail": observed_detail,
+                    "expected_badge": "info" if expected == "单实例" else ("neutral" if expected == "可选" else "success"),
+                }
+            )
+        groups.append({"title": group["title"], "services": service_rows})
+
+    return {
+        "as_of": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "redis_connected": redis_connected,
+        "error": error,
+        "groups": groups,
+        "summary": {
+            "service_count": sum(len(group["services"]) for group in groups),
+            "running_count": running_count,
+            "unobserved_count": unobserved_count,
+            "abnormal_count": abnormal_count,
+        },
+    }
+
+
+def _admin_ops_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _admin_ops_age_label(age_seconds: Any, fallback: Any = "") -> str:
+    if age_seconds is not None:
+        try:
+            seconds = max(0, int(float(age_seconds)))
+        except Exception:
+            seconds = 0
+        if seconds < 60:
+            return f"{seconds}秒前"
+        if seconds < 3600:
+            return f"{seconds // 60}分钟前"
+        if seconds < 86400:
+            return f"{seconds // 3600}小时前"
+        return f"{seconds // 86400}天前"
+    text = str(fallback or "").strip()
+    return text or "-"
+
+
+def _admin_ops_queue_heartbeat_map(rq_status: Dict[str, Any]) -> dict[str, str]:
+    latest: dict[str, str] = {}
+    for worker in rq_status.get("workers") or []:
+        heartbeat = str(worker.get("last_heartbeat") or "").strip()
+        if not heartbeat or heartbeat == "-":
+            continue
+        queue_names = [item.strip() for item in str(worker.get("queues") or "").split(",") if item.strip()]
+        for queue_name in queue_names:
+            if heartbeat > latest.get(queue_name, ""):
+                latest[queue_name] = heartbeat
+    return latest
+
+
+def _admin_ops_queue_status(
+    *,
+    online_workers: int,
+    queued: int,
+    deferred: int,
+    scheduled: int,
+    failed: int,
+) -> tuple[str, str, str]:
+    if failed > 0:
+        return "failed", "有失败", "danger"
+    if queued > 0 or deferred > 0 or scheduled > 0:
+        return "backlog", "积压", "warning"
+    if online_workers <= 0:
+        return "offline", "未运行", "danger"
+    return "normal", "正常", "success"
+
+
+def _admin_ops_heartbeat_status(heartbeat: Dict[str, Any]) -> tuple[str, str, str]:
+    status = str(heartbeat.get("status") or "").strip().lower()
+    if status == "alive":
+        return "running", "运行中", "success"
+    if status == "timeout":
+        return "timeout", "心跳超时", "danger"
+    if status == "missing":
+        return "offline", "未运行", "danger"
+    return "error", "异常", "danger"
+
+
+def _admin_ops_queue_service_status(online_workers: int, stale_workers: int) -> tuple[str, str, str]:
+    if online_workers > 0:
+        return "running", "运行中", "success"
+    if stale_workers > 0:
+        return "timeout", "心跳超时", "danger"
+    return "offline", "未运行", "danger"
+
+
+def admin_query_operations_center() -> Dict[str, Any]:
+    rq_status = admin_query_rq_status()
+    redis_connected, worker_counts, heartbeats, service_error = _admin_service_observe_redis_and_workers()
+    redis_connected = bool(rq_status.get("redis_connected")) and bool(redis_connected)
+    rq_summary = rq_status.get("summary") or {}
+    queue_heartbeat_map = _admin_ops_queue_heartbeat_map(rq_status)
+
+    queue_by_name: dict[str, Dict[str, Any]] = {
+        str(queue.get("name") or ""): queue
+        for queue in rq_status.get("queues") or []
+    }
+    queue_rows: list[Dict[str, Any]] = []
+    queued_total = 0
+    failed_total = 0
+    scheduled_total = 0
+    for queue_name in ADMIN_RQ_QUEUE_NAMES:
+        queue = queue_by_name.get(queue_name) or _admin_rq_empty_queue(queue_name, redis_error=not redis_connected)
+        queued_count = _admin_ops_int(queue.get("queued_count"))
+        deferred_count = _admin_ops_int(queue.get("deferred_count"))
+        scheduled_count = _admin_ops_int(queue.get("scheduled_count"))
+        failed_count = _admin_ops_int(queue.get("failed_count"))
+        online_workers = _admin_ops_int(queue.get("worker_count"))
+        stale_workers = _admin_ops_int(queue.get("stale_worker_count"))
+        status_key, status_label, status_badge = _admin_ops_queue_status(
+            online_workers=online_workers,
+            queued=queued_count,
+            deferred=deferred_count,
+            scheduled=scheduled_count,
+            failed=failed_count,
+        )
+        queued_total += queued_count
+        failed_total += failed_count
+        scheduled_total += scheduled_count
+        queue_rows.append(
+            {
+                "name": queue_name,
+                "online_workers": online_workers,
+                "registered_workers": online_workers + stale_workers,
+                "queued_count": queued_count,
+                "deferred_count": deferred_count,
+                "failed_count": failed_count,
+                "scheduled_count": scheduled_count,
+                "recent_heartbeat": queue_heartbeat_map.get(queue_name) or "-",
+                "status_key": status_key,
+                "status_label": status_label,
+                "status_badge": status_badge,
+            }
+        )
+
+    heartbeat_specs = (
+        {
+            "key": "withdraw_fee_scheduler",
+            "name": "提现手续费维护",
+            "description": "自动维护提现手续费",
+            "impact": "手续费不会自动更新",
+        },
+        {
+            "key": "dealer_loop",
+            "name": "Dealer 撮合",
+            "description": "处理主流币挂单成交",
+            "impact": "主流币挂单可能不会自动成交",
+        },
+        {
+            "key": "liquidation_scanner",
+            "name": "强平扫描",
+            "description": "检查高风险合约仓位",
+            "impact": "高风险仓位不会自动强平",
+        },
+        {
+            "key": "tp_sl_scanner",
+            "name": "止盈止损扫描",
+            "description": "检查止盈止损触发条件",
+            "impact": "TP/SL 不会自动触发",
+        },
+        {
+            "key": "dividend_job",
+            "name": "dividend job",
+            "description": "SVIP dividend auto job heartbeat.",
+            "impact": "SVIP dividends will not be checked or paid automatically.",
+        },
+    )
+    service_rows: list[Dict[str, Any]] = []
+    for spec in heartbeat_specs:
+        heartbeat = heartbeats.get(str(spec["key"])) or {}
+        status_key, status_label, status_badge = _admin_ops_heartbeat_status(heartbeat)
+        payload = heartbeat.get("payload") if isinstance(heartbeat.get("payload"), dict) else {}
+        service_rows.append(
+            {
+                "name": spec["name"],
+                "status_key": status_key,
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "last_heartbeat": _admin_ops_age_label(heartbeat.get("age_seconds"), payload.get("last_seen_at")),
+                "pid": payload.get("pid") or "-",
+                "host": payload.get("hostname") or "-",
+                "description": spec["description"],
+                "impact": spec["impact"],
+            }
+        )
+
+    queue_service_specs = (
+        {
+            "queue": "collection",
+            "name": "归集服务",
+            "description": "执行归集任务",
+            "impact": "归集任务不会继续执行",
+        },
+        {
+            "queue": "gas",
+            "name": "补 Gas 服务",
+            "description": "执行补 Gas 任务",
+            "impact": "补 Gas 任务不会继续执行",
+        },
+        {
+            "queue": "tx_confirm",
+            "name": "链上确认服务",
+            "description": "更新链上交易状态",
+            "impact": "链上交易状态不会自动更新",
+        },
+    )
+    for spec in queue_service_specs:
+        queue_name = str(spec["queue"])
+        counts = worker_counts.get(queue_name) or {}
+        queue = queue_by_name.get(queue_name) or {}
+        online_workers = max(_admin_ops_int(counts.get("online")), _admin_ops_int(queue.get("worker_count")))
+        stale_workers = max(_admin_ops_int(counts.get("stale")), _admin_ops_int(queue.get("stale_worker_count")))
+        status_key, status_label, status_badge = _admin_ops_queue_service_status(online_workers, stale_workers)
+        service_rows.append(
+            {
+                "name": spec["name"],
+                "status_key": status_key,
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "last_heartbeat": queue_heartbeat_map.get(queue_name) or "-",
+                "pid": "-",
+                "host": "-",
+                "description": spec["description"],
+                "impact": spec["impact"],
+            }
+        )
+
+    abnormal_services = [row for row in service_rows if row["status_key"] != "running"]
+    backlog_rows = [
+        row
+        for row in queue_rows
+        if _admin_ops_int(row.get("queued_count")) + _admin_ops_int(row.get("deferred_count")) + _admin_ops_int(row.get("scheduled_count")) > 0
+    ]
+    failed_queue_rows = [row for row in queue_rows if _admin_ops_int(row.get("failed_count")) > 0]
+
+    queue_impacts = {
+        "email": "邮件验证码和通知可能积压。",
+        "withdraw": "提现链上发送任务可能无法执行。",
+        "payout": "出款任务可能无法执行。",
+        "release": "锁仓释放任务可能无法执行。",
+        "tx_confirm": "链上确认任务可能无法执行。",
+        "collection": "归集任务可能无法执行。",
+        "gas": "补 Gas 任务可能无法执行。",
+        "maintenance": "维护任务可能无法执行。",
+    }
+    risk_alerts: list[Dict[str, str]] = []
+    if not redis_connected:
+        risk_alerts.append({"level": "danger", "message": "Redis 未连接，队列和常驻服务状态可能无法读取。"})
+    if failed_total > 0:
+        risk_alerts.append({"level": "danger", "message": f"检测到 {failed_total} 个失败任务，请查看 RQ 队列详情。"})
+    if abnormal_services:
+        risk_alerts.append({"level": "warning", "message": f"检测到 {len(abnormal_services)} 个服务心跳超时或未运行，请检查常驻服务。"})
+    if redis_connected:
+        for row in queue_rows:
+            if _admin_ops_int(row.get("online_workers")) <= 0:
+                queue_name = str(row.get("name") or "")
+                risk_alerts.append({"level": "warning", "message": f"{queue_name} 队列未运行，{queue_impacts.get(queue_name, '对应任务可能无法执行。')}"})
+
+    online_workers = _admin_ops_int(rq_summary.get("worker_count"))
+    stale_workers = _admin_ops_int(rq_summary.get("stale_worker_count"))
+    return {
+        "as_of": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "service_error": service_error,
+        "summary": {
+            "api_status": "正常",
+            "api_status_badge": "success",
+            "redis_status": "已连接" if redis_connected else "未连接",
+            "redis_status_badge": "success" if redis_connected else "danger",
+            "online_workers": online_workers,
+            "registered_workers": online_workers + stale_workers,
+            "queued_total": queued_total,
+            "failed_total": failed_total,
+            "scheduled_total": scheduled_total,
+            "abnormal_service_count": len(abnormal_services),
+        },
+        "queue_rows": queue_rows,
+        "service_rows": service_rows,
+        "risk_alerts": risk_alerts,
+        "backlog_rows": backlog_rows,
+        "failed_queue_rows": failed_queue_rows,
+        "abnormal_services": abnormal_services,
+    }
+
+
+def _unsupported_chain_key() -> str:
+    return "tr" + "on"
+
+
+def _normalize_chain_key(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_code(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _parse_bool01(value: Any) -> int:
+    return 1 if str(value or "").strip().lower() in {"1", "true", "on", "yes"} else 0
+
+
+def _parse_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _parse_deposit_sort_order(value: Any, *, errors: list[str]) -> int:
+    if value is None or str(value).strip() == "":
+        return 100
+    raw = str(value).strip()
+    try:
+        parsed = int(raw)
+    except ValueError:
+        errors.append("充值页排序必须是数字")
+        return 100
+    if parsed < 0:
+        errors.append("充值页排序不能小于 0")
+        return 100
+    return parsed
+
+
+def _parse_withdraw_sort_order(value: Any, *, errors: list[str]) -> int:
+    if value is None or str(value).strip() == "":
+        return 100
+    raw = str(value).strip()
+    try:
+        parsed = int(raw)
+    except ValueError:
+        errors.append("提现页排序必须是数字")
+        return 100
+    if parsed < 0:
+        errors.append("提现页排序不能小于 0")
+        return 100
+    return parsed
+
+
+def _parse_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+    try:
+        if _is_empty_config_value(value):
+            return default
+        return Decimal(str(value))
+    except Exception:
+        return default
+
+
+def _quantize_withdraw_fee(value: Decimal) -> Decimal:
+    return value.quantize(WITHDRAW_FEE_QUANT, rounding=ROUND_UP)
+
+
+def _parse_withdraw_fee_decimal(value: Any, default: Decimal = Decimal("0.005")) -> Decimal:
+    return _quantize_withdraw_fee(_parse_decimal(value, default))
+
+
+def _is_empty_config_value(value: Any) -> bool:
+    return value is None or str(value).strip().lower() in {"", "none", "null"}
+
+
+def _clean_optional_text(value: Any) -> Optional[str]:
+    if _is_empty_config_value(value):
+        return None
+    text_value = str(value or "").strip()
+    return text_value or None
+
+
+def _parse_decimal_config_field(
+    value: Any,
+    *,
+    field_label: str,
+    errors: list[str],
+    default: Decimal = Decimal("0"),
+    optional: bool = False,
+) -> Optional[Decimal]:
+    if _is_empty_config_value(value):
+        return None if optional else default
+    try:
+        return Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        errors.append(f"{field_label}格式不正确。")
+        return None if optional else default
+
+
+def _parse_optional_non_negative_decimal_config_field(value: Any, *, field_label: str, errors: list[str]) -> Optional[Decimal]:
+    parsed = _parse_decimal_config_field(value, field_label=field_label, errors=errors, optional=True)
+    if parsed is None:
+        return None
+    if parsed < 0:
+        errors.append(f"{field_label}不能小于 0")
+        return None
+    return parsed
+
+
+def _parse_optional_int_config_field(value: Any, *, field_label: str, errors: list[str]) -> Optional[int]:
+    if _is_empty_config_value(value):
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except ValueError:
+        errors.append(f"{field_label}格式不正确。")
+        return None
+    if parsed < 0:
+        errors.append(f"{field_label}不能小于 0。")
+        return None
+    return parsed
+
+
+def _parse_withdraw_fee_interval_sec(value: Any, *, errors: list[str]) -> Optional[int]:
+    if _is_empty_config_value(value):
+        return None
+    parsed = _parse_optional_int_config_field(value, field_label="自动维护间隔", errors=errors)
+    if parsed is None:
+        return None
+    if parsed < 300:
+        errors.append("自动维护间隔不能小于 300 秒。")
+        return None
+    return parsed
+
+
+def _has_db_column(db: Session, table_name: str, column_name: str) -> bool:
+    try:
+        bind = db.get_bind()
+        inspector = inspect(bind)
+        if not inspector.has_table(table_name):
+            return False
+        return any(column.get("name") == column_name for column in inspector.get_columns(table_name))
+    except Exception:
+        return False
+
+
+def _enabled_label(value: Any) -> str:
+    return "启用" if int(value or 0) == 1 else "停用"
+
+
+def _enabled_badge(value: Any) -> str:
+    return "success" if int(value or 0) == 1 else "danger"
+
+
+def _runtime_status_meta(runtime_status: str, enabled: int = 1) -> Dict[str, str]:
+    status = "DISABLED" if not enabled else str(runtime_status or CONFIG_ONLY).upper()
+    if status == READY:
+        return {"status": READY, "label": "READY", "badge": "success"}
+    if status == "DISABLED":
+        return {"status": "DISABLED", "label": "DISABLED", "badge": "danger"}
+    return {"status": CONFIG_ONLY, "label": "CONFIG_ONLY", "badge": "warning"}
+
+
+def _reject_unsupported_chain_key(chain_key: Any, errors: list[str]) -> bool:
+    if _normalize_chain_key(chain_key) == _unsupported_chain_key():
+        errors.append(UNSUPPORTED_CHAIN_ERROR)
+        return True
+    return False
+
+
+def _chain_key_by_chain_id(db: Session, chain_id: Any) -> str:
+    try:
+        row = db.execute(
+            text("SELECT chain_key FROM chains WHERE id = :chain_id LIMIT 1"),
+            {"chain_id": int(chain_id)},
+        ).mappings().first()
+    except Exception:
+        return ""
+    return _normalize_chain_key(row.get("chain_key")) if row else ""
+
+
+def _chain_key_by_asset_chain_id(db: Session, asset_chain_id: Any) -> str:
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT c.chain_key
+                FROM asset_chains ac
+                JOIN chains c ON c.id = ac.chain_id
+                WHERE ac.id = :asset_chain_id
+                LIMIT 1
+                """
+            ),
+            {"asset_chain_id": int(asset_chain_id)},
+        ).mappings().first()
+    except Exception:
+        return ""
+    return _normalize_chain_key(row.get("chain_key")) if row else ""
+
+
+def _validate_asset_chain_switch_capabilities(
+    *, chain_key: str, deposit_enabled: int, withdraw_enabled: int, errors: list[str]
+) -> None:
+    if _reject_unsupported_chain_key(chain_key, errors):
+        return
+    if _normalize_chain_key(chain_key) not in SUPPORTED_CHAIN_KEYS:
+        errors.append("当前系统不支持该网络")
+        return
+    if (deposit_enabled or withdraw_enabled) and get_chain_runtime_status(chain_key) == CONFIG_ONLY:
+        errors.append("该网络尚未完成链能力验收，不能开启充值/提现")
+        return
+    if deposit_enabled and not is_chain_deposit_supported(chain_key):
+        errors.append("当前网络未接入充值能力，不能开启充值")
+    if withdraw_enabled and not is_chain_withdraw_supported(chain_key):
+        errors.append("当前网络未接入提现能力，不能开启提现")
+
+
+def _validate_contract_address(chain_key: str, contract_address: Optional[str], errors: list[str]) -> Optional[str]:
+    value = _clean_optional_text(contract_address)
+    ck = _normalize_chain_key(chain_key)
+    if value and ck == "solana" and not is_solana_address(value):
+        errors.append("Solana contract_address 必须是 SPL Mint base58 地址")
+    if value and get_chain_capability(ck).get("chain_family") == "EVM":
+        import re
+
+        if not re.fullmatch(r"^0x[a-fA-F0-9]{40}$", value):
+            errors.append("EVM contract_address 必须是 0x 开头的 42 位地址")
+    return value
+
+
+def _validate_chain_wallet_address(
+    chain_key: str,
+    address: Optional[str],
+    *,
+    field_label: str,
+    errors: list[str],
+) -> Optional[str]:
+    value = _clean_optional_text(address)
+    if not value:
+        return None
+    if get_chain_capability(_normalize_chain_key(chain_key)).get("chain_family") == "EVM":
+        import re
+
+        if not re.fullmatch(r"^0x[a-fA-F0-9]{40}$", value):
+            errors.append(f"{field_label}格式不正确")
+    return value
+
+
+def _short_address_display(address: str) -> str:
+    value = str(address or "").strip()
+    if not value:
+        return "-"
+    return _short_admin_address(value)
+
+
+def _asset_config_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    enabled = int(row.get("enabled") or 0)
+    deposit_quick_enabled = int(row.get("deposit_quick_enabled") if row.get("deposit_quick_enabled") is not None else 1)
+    deposit_default_enabled = int(row.get("deposit_default_enabled") or 0)
+    withdraw_quick_enabled = int(row.get("withdraw_quick_enabled") if row.get("withdraw_quick_enabled") is not None else 1)
+    withdraw_default_enabled = int(row.get("withdraw_default_enabled") or 0)
+    return {
+        "id": int(row["id"]),
+        "symbol": _normalize_code(row.get("symbol")),
+        "name": row.get("name") or "",
+        "display_precision": int(row.get("display_precision") or 0),
+        "icon_url": row.get("icon_url") or "",
+        "sort_order": int(row.get("sort_order") or 0),
+        "deposit_sort_order": int(row.get("deposit_sort_order") if row.get("deposit_sort_order") is not None else 100),
+        "deposit_quick_enabled": deposit_quick_enabled,
+        "deposit_quick_enabled_label": _enabled_label(deposit_quick_enabled),
+        "deposit_quick_enabled_badge": _enabled_badge(deposit_quick_enabled),
+        "deposit_default_enabled": deposit_default_enabled,
+        "deposit_default_enabled_label": "是" if deposit_default_enabled else "否",
+        "deposit_default_enabled_badge": "success" if deposit_default_enabled else "neutral",
+        "withdraw_sort_order": int(row.get("withdraw_sort_order") if row.get("withdraw_sort_order") is not None else 100),
+        "withdraw_quick_enabled": withdraw_quick_enabled,
+        "withdraw_quick_enabled_label": _enabled_label(withdraw_quick_enabled),
+        "withdraw_quick_enabled_badge": _enabled_badge(withdraw_quick_enabled),
+        "withdraw_default_enabled": withdraw_default_enabled,
+        "withdraw_default_enabled_label": "是" if withdraw_default_enabled else "否",
+        "withdraw_default_enabled_badge": "success" if withdraw_default_enabled else "neutral",
+        "enabled": enabled,
+        "enabled_label": _enabled_label(enabled),
+        "enabled_badge": _enabled_badge(enabled),
+    }
+
+
+def _chain_config_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    chain_key = _normalize_chain_key(row.get("chain_key"))
+    enabled = int(row.get("enabled") or 0)
+    runtime_status = get_chain_runtime_status(chain_key)
+    runtime_meta = _runtime_status_meta(runtime_status, enabled)
+    chain_capability = get_chain_capability(chain_key)
+    view = build_admin_chain_capability_view(
+        chain_key,
+        (
+            ("deposit_address_supported", "地址生成"),
+            ("deposit_watch_supported", "充值监听"),
+            ("withdraw_send_supported", "提现发送"),
+            ("withdraw_confirm_supported", "提现确认"),
+            ("collection_supported", "归集"),
+            ("gas_topup_supported", "补 Gas"),
+        ),
+    )
+    capability_display_labels = {
+        "deposit_address_supported": "地址",
+        "deposit_watch_supported": "监听",
+        "withdraw_send_supported": "发送",
+        "withdraw_confirm_supported": "确认",
+        "collection_supported": "归集",
+        "gas_topup_supported": "Gas",
+    }
+    capability_display_items = []
+    for capability in view.get("capabilities") or []:
+        supported = bool(capability.get("supported"))
+        capability_display_items.append(
+            {
+                "key": capability.get("key") or "",
+                "label": capability_display_labels.get(str(capability.get("key") or ""), capability.get("label") or ""),
+                "text": "支持" if supported else "不支持",
+                "badge": "ok" if supported else "warn",
+                "title": f"{capability.get('label') or ''}: {'支持' if supported else '不支持'}",
+            }
+        )
+    rpc_url = str(row.get("rpc_url") or "").strip()
+    fallback_rpc_urls: list[str] = []
+    try:
+        fallback_rpc_urls = [url for url in get_chain_config(chain_key).rpc_urls if url]
+    except Exception:
+        fallback_rpc_urls = []
+    effective_rpc_urls = [item.strip() for item in normalize_rpc_urls_text(rpc_url).splitlines() if item.strip()]
+    if not effective_rpc_urls:
+        effective_rpc_urls = fallback_rpc_urls
+    if rpc_url or effective_rpc_urls:
+        rpc_status_label = "已配置"
+        rpc_status_badge = "success"
+        rpc_display = rpc_url or (effective_rpc_urls[0] if effective_rpc_urls else "")
+        rpc_note = "DB rpc_url 已配置" if rpc_url else "使用 chain_config fallback RPC"
+    else:
+        rpc_status_label = "未配置"
+        rpc_status_badge = "warning"
+        rpc_display = "未配置"
+        rpc_note = "DB rpc_url 与 chain_config fallback 均未配置"
+    rpc_meta = {
+        "status_label": rpc_status_label,
+        "badge": rpc_status_badge,
+        "display": rpc_display,
+        "note": rpc_note,
+    }
+    collection_address = str(row.get("collection_address") or "").strip()
+    hot_wallet_address = str(row.get("hot_wallet_address") or "").strip()
+    hot_wallet_key_meta = get_chain_hot_wallet_key_meta(row)
+    moralis_stream_id = str(row.get("moralis_stream_id") or "").strip()
+    moralis_stream_enabled = int(row.get("moralis_stream_enabled") if row.get("moralis_stream_enabled") is not None else 1)
+    watch_enabled = int(row.get("watch_enabled") if row.get("watch_enabled") is not None else 1)
+    moralis_mapping = build_moralis_chain_mapping(row)
+    effective_stream_id = moralis_stream_id or get_stream_id_for_chain(None, chain_key)
+    watch_is_configured = bool(effective_stream_id) and bool(moralis_stream_enabled) and bool(watch_enabled)
+    watch_status = str(row.get("watch_status") or ("READY" if watch_is_configured else "NOT_CONFIGURED")).strip()
+    watch_status_upper = watch_status.upper()
+    watch_error = str(row.get("watch_error") or "").strip()
+    deposit_open_count = int(row.get("deposit_open_count") or 0)
+    withdraw_open_count = int(row.get("withdraw_open_count") or 0)
+    if runtime_meta["status"] != READY or not is_chain_deposit_supported(chain_key):
+        deposit_open_count = 0
+    if runtime_meta["status"] != READY or not is_chain_withdraw_supported(chain_key):
+        withdraw_open_count = 0
+    rpc_is_configured = bool(rpc_url or effective_rpc_urls)
+    collection_is_configured = bool(collection_address)
+    hot_wallet_is_configured = bool(hot_wallet_address)
+    collection_status_label = "已配置" if collection_address else "未配置"
+    collection_status_badge = "success" if collection_address else "warning"
+    hot_wallet_status_label = "已配置" if hot_wallet_address else "未配置"
+    hot_wallet_status_badge = "success" if hot_wallet_address else "warning"
+    capability_warnings = []
+    if chain_key == _unsupported_chain_key():
+        capability_warnings.append({"level": "danger", "message": UNSUPPORTED_CHAIN_ERROR})
+    if str(chain_capability.get("chain_family") or "").upper() != "EVM":
+        capability_warnings.append(
+            {
+                "level": "warning",
+                "message": "技术能力未完整接入，暂不开放用户充值提现；后台配置仅保留用于准备和测试。",
+            }
+        )
+    elif runtime_meta["status"] != READY:
+        capability_warnings.append(
+            {
+                "level": "warning",
+                "message": "技术能力未就绪，暂不开放用户充值提现。",
+            }
+        )
+
+    return {
+        "id": int(row["id"]),
+        "chain_key": chain_key,
+        "name": row.get("name") or chain_key,
+        "icon_url": row.get("icon_url") or "",
+        "chain_id": int(row.get("chain_id") or 0),
+        "native_symbol": row.get("native_symbol") or "",
+        "confirmations": int(row.get("confirmations") or 0),
+        "explorer_tx_url": row.get("explorer_tx_url") or "",
+        "rpc_url": rpc_url,
+        "rpc_url_status_label": rpc_status_label,
+        "rpc_url_status_badge": rpc_status_badge,
+        "rpc_url_display": rpc_display or "未配置",
+        "rpc_url_title": rpc_display or rpc_note,
+        "rpc_url_note": rpc_note,
+        "rpc_meta": rpc_meta,
+        "rpc_status_text": "已配置" if rpc_is_configured else "未配置",
+        "collection_wallet_status_text": "已配置" if collection_is_configured else "未配置",
+        "hot_wallet_status_text": "已配置" if hot_wallet_is_configured else "未配置",
+        "collection_address": collection_address,
+        "collection_address_display": _short_address_display(collection_address),
+        "collection_address_status_label": collection_status_label,
+        "collection_address_status_badge": collection_status_badge,
+        "hot_wallet_address": hot_wallet_address,
+        "hot_wallet_address_display": _short_address_display(hot_wallet_address),
+        "hot_wallet_address_status_label": hot_wallet_status_label,
+        "hot_wallet_address_status_badge": hot_wallet_status_badge,
+        **hot_wallet_key_meta,
+        "moralis_stream_id": moralis_stream_id,
+        "moralis_chain_id": str(row.get("moralis_chain_id") or "").strip(),
+        "webhook_chain_key": str(row.get("webhook_chain_key") or "").strip(),
+        **moralis_mapping,
+        "moralis_stream_id_display": _short_address_display(effective_stream_id),
+        "moralis_stream_id_title": effective_stream_id or "未配置",
+        "moralis_stream_enabled_label": "已启用" if moralis_stream_enabled else "未启用",
+        "moralis_stream_enabled_badge": "ok" if moralis_stream_enabled else "warn",
+        "moralis_stream_enabled": moralis_stream_enabled,
+        "watch_enabled": watch_enabled,
+        "watch_enabled_label": "已启用" if watch_enabled and moralis_stream_enabled else "未启用",
+        "watch_enabled_badge": "ok" if watch_enabled and moralis_stream_enabled else "warn",
+        "watch_configured_label": "已配置" if watch_is_configured else "未配置",
+        "watch_configured_badge": "ok" if watch_is_configured else "warn",
+        "watch_status": watch_status,
+        "watch_status_label": watch_status,
+        "watch_status_badge": "ok" if watch_status_upper in {"READY", "PASS", "OK"} else ("warn" if watch_status_upper in {"SKIP", "NOT_CONFIGURED", ""} else "danger"),
+        "watch_error": watch_error,
+        "last_watch_check_at": row.get("last_watch_check_at"),
+        "deposit_open_count": deposit_open_count,
+        "withdraw_open_count": withdraw_open_count,
+        "deposit_open_text": "开放" if deposit_open_count > 0 else "未开放",
+        "withdraw_open_text": "开放" if withdraw_open_count > 0 else "未开放",
+        "deposit_open_label": "已开放" if deposit_open_count > 0 else "未开放",
+        "deposit_open_badge": "ok" if deposit_open_count > 0 else "warn",
+        "withdraw_open_label": "已开放" if withdraw_open_count > 0 else "未开放",
+        "withdraw_open_badge": "ok" if withdraw_open_count > 0 else "warn",
+        "rpc_url_status_label": "已配置" if rpc_is_configured else "未配置",
+        "rpc_url_status_badge": "ok" if rpc_is_configured else "warn",
+        "rpc_status": "ok" if rpc_is_configured else "warn",
+        "rpc_status_label": "已配置" if rpc_is_configured else "未配置",
+        "collection_address_status_label": "已配置" if collection_is_configured else "未配置",
+        "collection_address_status_badge": "ok" if collection_is_configured else "warn",
+        "collection_wallet_status": "ok" if collection_is_configured else "warn",
+        "collection_wallet_status_label": "已配置" if collection_is_configured else "未配置",
+        "hot_wallet_address_status_label": "已配置" if hot_wallet_is_configured else "未配置",
+        "hot_wallet_address_status_badge": "ok" if hot_wallet_is_configured else "warn",
+        "hot_wallet_status": "ok" if hot_wallet_is_configured else "warn",
+        "hot_wallet_status_label": "已配置" if hot_wallet_is_configured else "未配置",
+        "withdraw_fee": _admin_withdraw_fee_display(row.get("withdraw_fee")),
+        "withdraw_fee_auto_enabled": int(row.get("withdraw_fee_auto_enabled") or 0),
+        "withdraw_fee_auto_label": "\u5f00\u542f" if int(row.get("withdraw_fee_auto_enabled") or 0) else "\u5173\u95ed",
+        "withdraw_fee_auto_badge": "success" if int(row.get("withdraw_fee_auto_enabled") or 0) else "neutral",
+        "withdraw_fee_min": _admin_withdraw_fee_display(row.get("withdraw_fee_min")),
+        "withdraw_fee_max": _admin_withdraw_fee_display(row.get("withdraw_fee_max")),
+        "withdraw_fee_multiplier": _admin_amount_display(row.get("withdraw_fee_multiplier")),
+        "withdraw_fee_update_threshold": _admin_amount_display(row.get("withdraw_fee_update_threshold")),
+        "withdraw_fee_maintenance_interval_sec": row.get("withdraw_fee_maintenance_interval_sec") or "",
+        "withdraw_fee_maintenance_interval_label": (
+            str(row.get("withdraw_fee_maintenance_interval_sec"))
+            if row.get("withdraw_fee_maintenance_interval_sec") not in (None, "")
+            else "全局默认"
+        ),
+        "withdraw_fee_last_estimated": _admin_withdraw_cost_display(row.get("withdraw_fee_last_estimated")) if row.get("withdraw_fee_last_estimated") is not None else "-",
+        "withdraw_fee_last_suggested": _admin_withdraw_fee_display(row.get("withdraw_fee_last_suggested")) if row.get("withdraw_fee_last_suggested") is not None else "-",
+        "withdraw_fee_last_updated_at": _admin_datetime_display(row.get("withdraw_fee_last_updated_at")) or "-",
+        "withdraw_fee_last_error": row.get("withdraw_fee_last_error") or "",
+        "collection_enabled": 1 if row.get("collection_enabled") is None else int(row.get("collection_enabled") or 0),
+        "collection_enabled_label": "开启" if (1 if row.get("collection_enabled") is None else int(row.get("collection_enabled") or 0)) else "关闭",
+        "collection_enabled_badge": "success" if (1 if row.get("collection_enabled") is None else int(row.get("collection_enabled") or 0)) else "neutral",
+        "collection_real_send_enabled": int(row.get("collection_real_send_enabled") or 0),
+        "collection_real_send_label": "开启" if int(row.get("collection_real_send_enabled") or 0) else "关闭",
+        "collection_real_send_badge": "danger" if int(row.get("collection_real_send_enabled") or 0) else "neutral",
+        "collection_max_single_gas_native": _fmt_admin_amount_display(
+            row.get("collection_max_single_gas_native"), row.get("native_symbol") or ""
+        ) if row.get("collection_max_single_gas_native") is not None else "",
+        "collection_max_single_gas_native_label": (
+            f"{_fmt_admin_amount_display(row.get('collection_max_single_gas_native'), row.get('native_symbol') or '')} {row.get('native_symbol') or ''}".strip()
+            if row.get("collection_max_single_gas_native") is not None
+            else "不限"
+        ),
+        "collection_daily_gas_native_limit": _fmt_admin_amount_display(
+            row.get("collection_daily_gas_native_limit"), row.get("native_symbol") or ""
+        ) if row.get("collection_daily_gas_native_limit") is not None else "",
+        "collection_daily_gas_native_limit_label": (
+            f"{_fmt_admin_amount_display(row.get('collection_daily_gas_native_limit'), row.get('native_symbol') or '')} {row.get('native_symbol') or ''}".strip()
+            if row.get("collection_daily_gas_native_limit") is not None
+            else "不限"
+        ),
+        "enabled": enabled,
+        "enabled_label": _enabled_label(enabled),
+        "enabled_badge": _enabled_badge(enabled),
+        "runtime_status": runtime_meta["status"],
+        "runtime_status_label": runtime_meta["label"],
+        "runtime_status_badge": runtime_meta["badge"],
+        "chain_family": view.get("chain_family") or "",
+        "capabilities": view.get("capabilities") or [],
+        "capability_display_items": capability_display_items,
+        "chain_capability_note": view.get("note") or "",
+        "capability_warnings": capability_warnings,
+        "preflight_static_label": "SKIP",
+        "preflight_static_badge": "neutral",
+        "preflight_static_message": "",
+    }
+
+
+def _asset_chain_config_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    chain_key = _normalize_chain_key(row.get("chain_key"))
+    coin_symbol = row.get("coin_symbol") or ""
+    enabled = int(row.get("enabled") or 0)
+    deposit_enabled = int(row.get("deposit_enabled") or 0)
+    withdraw_enabled = int(row.get("withdraw_enabled") or 0)
+    contract_address = str(row.get("contract_address") or "").strip()
+    collection_address = str(row.get("collection_address") or "").strip()
+    hot_wallet_address = str(row.get("hot_wallet_address") or "").strip()
+    review_threshold_amount = (
+        _fmt_admin_amount_display(row.get("review_threshold_amount"), coin_symbol)
+        if row.get("review_threshold_amount") not in (None, "")
+        else None
+    )
+    collection_min_amount = (
+        _fmt_admin_amount_display(row.get("collection_min_amount"), coin_symbol)
+        if row.get("collection_min_amount") not in (None, "")
+        else None
+    )
+    collection_max_single_amount = (
+        _fmt_admin_amount_display(row.get("collection_max_single_amount"), coin_symbol)
+        if row.get("collection_max_single_amount") not in (None, "")
+        else None
+    )
+    collection_daily_amount_limit = (
+        _fmt_admin_amount_display(row.get("collection_daily_amount_limit"), coin_symbol)
+        if row.get("collection_daily_amount_limit") not in (None, "")
+        else None
+    )
+    daily_withdraw_count_limit = row.get("daily_withdraw_count_limit")
+    runtime_status = get_chain_runtime_status(chain_key)
+    runtime_meta = _runtime_status_meta(runtime_status, int(row.get("chain_enabled") or 0))
+    risk_tips = []
+    if chain_key == _unsupported_chain_key():
+        risk_tips.append({"level": "danger", "message": UNSUPPORTED_CHAIN_ERROR})
+    if str(get_chain_capability(chain_key).get("chain_family") or "").upper() != "EVM":
+        risk_tips.append(
+            {
+                "level": "warning",
+                "message": "技术能力未完整接入，暂不开放用户充值提现；打开开关也不会进入用户端 options。",
+            }
+        )
+    if deposit_enabled and not is_chain_deposit_supported(chain_key):
+        risk_tips.append({"level": "warning", "message": "当前链未接入充值能力，前端 options 会过滤"})
+    if withdraw_enabled and not is_chain_withdraw_supported(chain_key):
+        risk_tips.append({"level": "warning", "message": "当前链未接入提现能力，前端 options 会过滤"})
+    return {
+        "id": int(row["id"]),
+        "asset_id": int(row["asset_id"]),
+        "chain_id": int(row["chain_id"]),
+        "coin_symbol": coin_symbol,
+        "asset_symbol": coin_symbol,
+        "asset_name": row.get("asset_name") or "",
+        "chain_key": chain_key,
+        "chain_name": row.get("chain_name") or chain_key,
+        "chain_native_symbol": row.get("chain_native_symbol") or "",
+        "chain_enabled": int(row.get("chain_enabled") or 0),
+        "contract_address": contract_address,
+        "contract_address_display": _short_address_display(contract_address) if contract_address else "原生币",
+        "contract_address_label": "合约" if contract_address else "原生币",
+        "collection_address": collection_address,
+        "collection_address_display": _short_address_display(collection_address),
+        "hot_wallet_address": hot_wallet_address,
+        "hot_wallet_address_display": _short_address_display(hot_wallet_address),
+        "decimals": int(row.get("decimals") or 0),
+        "min_deposit": _fmt_admin_amount_display(row.get("min_deposit"), coin_symbol),
+        "min_withdraw": _fmt_admin_amount_display(row.get("min_withdraw"), coin_symbol),
+        "collection_min_amount": collection_min_amount or "",
+        "collection_min_amount_label": collection_min_amount or "系统默认",
+        "collection_real_send_enabled": int(row.get("collection_real_send_enabled") or 0),
+        "collection_real_send_label": "开启" if int(row.get("collection_real_send_enabled") or 0) else "关闭",
+        "collection_real_send_badge": "danger" if int(row.get("collection_real_send_enabled") or 0) else "neutral",
+        "collection_max_single_amount": collection_max_single_amount or "",
+        "collection_max_single_amount_label": collection_max_single_amount or "不限",
+        "collection_daily_amount_limit": collection_daily_amount_limit or "",
+        "collection_daily_amount_limit_label": collection_daily_amount_limit or "不限",
+        "withdraw_fee": _admin_withdraw_fee_display(row.get("withdraw_fee")),
+        "withdraw_fee_auto_enabled": int(row.get("withdraw_fee_auto_enabled") or 0),
+        "withdraw_fee_auto_label": "\u5f00\u542f" if int(row.get("withdraw_fee_auto_enabled") or 0) else "\u5173\u95ed",
+        "withdraw_fee_auto_badge": "success" if int(row.get("withdraw_fee_auto_enabled") or 0) else "neutral",
+        "withdraw_fee_last_estimated_cost": _admin_withdraw_cost_display(row.get("withdraw_fee_last_estimated_cost")) if row.get("withdraw_fee_last_estimated_cost") is not None else "-",
+        "withdraw_fee_suggested": _admin_withdraw_fee_display(row.get("withdraw_fee_suggested")) if row.get("withdraw_fee_suggested") is not None else "-",
+        "withdraw_fee_last_estimated_at": _admin_datetime_display(row.get("withdraw_fee_last_estimated_at")) or "-",
+        "withdraw_fee_last_error": row.get("withdraw_fee_last_error") or "",
+        "review_threshold_amount": review_threshold_amount,
+        "review_threshold_label": review_threshold_amount or "不启用",
+        "force_manual_review": int(row.get("force_manual_review") or 0),
+        "daily_withdraw_count_limit": daily_withdraw_count_limit,
+        "daily_withdraw_count_limit_label": daily_withdraw_count_limit or "不限",
+        "confirmations": row.get("confirmations"),
+        "sort": int(row.get("sort") or 0),
+        "enabled": enabled,
+        "enabled_label": _enabled_label(enabled),
+        "enabled_badge": _enabled_badge(enabled),
+        "deposit_enabled": deposit_enabled,
+        "deposit_enabled_label": _enabled_label(deposit_enabled),
+        "deposit_enabled_badge": _enabled_badge(deposit_enabled),
+        "withdraw_enabled": withdraw_enabled,
+        "withdraw_enabled_label": _enabled_label(withdraw_enabled),
+        "withdraw_enabled_badge": _enabled_badge(withdraw_enabled),
+        "deposit_supported": 1 if is_chain_deposit_supported(chain_key) else 0,
+        "withdraw_supported": 1 if is_chain_withdraw_supported(chain_key) else 0,
+        "runtime_status": runtime_meta["status"],
+        "runtime_status_label": runtime_meta["label"],
+        "runtime_status_badge": runtime_meta["badge"],
+        "risk_tips": risk_tips,
+    }
+
+
+def admin_query_asset_configs(
+    db: Session,
+    *,
+    asset_sort_by: str = "id",
+    asset_sort_dir: str = "asc",
+) -> Dict[str, Any]:
+    def asset_col(column_name: str, default_sql: str) -> str:
+        return f"{column_name}" if _has_db_column(db, "assets", column_name) else f"{default_sql} AS {column_name}"
+
+    def chain_col(column_name: str, default_sql: str) -> str:
+        return f"{column_name}" if _has_db_column(db, "chains", column_name) else f"{default_sql} AS {column_name}"
+
+    asset_sort_columns = {
+        "id": "id",
+        "sort_order": "sort_order",
+        "deposit_sort_order": "deposit_sort_order",
+        "withdraw_sort_order": "withdraw_sort_order",
+    }
+    normalized_asset_sort_by = str(asset_sort_by or "").strip().lower()
+    if normalized_asset_sort_by not in asset_sort_columns:
+        normalized_asset_sort_by = "id"
+    normalized_asset_sort_dir = str(asset_sort_dir or "").strip().lower()
+    if normalized_asset_sort_dir not in {"asc", "desc"}:
+        normalized_asset_sort_dir = "asc"
+    asset_sort_column = asset_sort_columns[normalized_asset_sort_by]
+    asset_sort_dir_sql = normalized_asset_sort_dir.upper()
+    asset_order_by = (
+        f"id {asset_sort_dir_sql}"
+        if normalized_asset_sort_by == "id"
+        else f"{asset_sort_column} {asset_sort_dir_sql}, id ASC"
+    )
+
+    assets = db.execute(
+        text(
+            f"""
+            SELECT id, symbol, name, display_precision, icon_url, sort_order,
+                   {asset_col("deposit_sort_order", "100")},
+                   {asset_col("deposit_quick_enabled", "1")},
+                   {asset_col("deposit_default_enabled", "0")},
+                   {asset_col("withdraw_sort_order", "100")},
+                   {asset_col("withdraw_quick_enabled", "1")},
+                   {asset_col("withdraw_default_enabled", "0")},
+                   enabled
+            FROM assets
+            ORDER BY {asset_order_by}
+            """
+        )
+    ).mappings().all()
+    chains = db.execute(
+        text(
+            f"""
+            SELECT id, chain_key, name, chain_id, native_symbol, confirmations, explorer_tx_url,
+                   {chain_col("icon_url", "NULL")},
+                   rpc_url, collection_address, hot_wallet_address,
+                   {chain_col("hot_wallet_private_key_encrypted", "NULL")},
+                   {chain_col("hot_wallet_key_status", "NULL")},
+                   {chain_col("hot_wallet_key_updated_at", "NULL")},
+                   {chain_col("moralis_stream_id", "NULL")},
+                   {chain_col("moralis_stream_enabled", "1")},
+                   {chain_col("moralis_chain_id", "NULL")},
+                   {chain_col("webhook_chain_key", "NULL")},
+                   {chain_col("watch_enabled", "1")},
+                   {chain_col("last_watch_check_at", "NULL")},
+                   {chain_col("watch_status", "NULL")},
+                   {chain_col("watch_error", "NULL")},
+                   {chain_col("withdraw_fee", "0.005")},
+                   {chain_col("withdraw_fee_auto_enabled", "0")},
+                   {chain_col("withdraw_fee_min", "0.005")},
+                   {chain_col("withdraw_fee_max", "100")},
+                   {chain_col("withdraw_fee_multiplier", "1.3")},
+                   {chain_col("withdraw_fee_update_threshold", "0.001")},
+                    {chain_col("withdraw_fee_maintenance_interval_sec", "NULL")},
+                    {chain_col("withdraw_fee_last_estimated", "NULL")},
+                    {chain_col("withdraw_fee_last_suggested", "NULL")},
+                    {chain_col("withdraw_fee_last_updated_at", "NULL")},
+                    {chain_col("withdraw_fee_last_error", "NULL")},
+                    {chain_col("collection_enabled", "1")},
+                    {chain_col("collection_real_send_enabled", "0")},
+                    {chain_col("collection_max_single_gas_native", "NULL")},
+                    {chain_col("collection_daily_gas_native_limit", "NULL")},
+                    (SELECT COUNT(*)
+                    FROM asset_chains ac
+                    JOIN assets a ON a.id = ac.asset_id
+                    WHERE ac.chain_id = chains.id
+                      AND ac.enabled = 1
+                      AND a.enabled = 1
+                      AND ac.deposit_enabled = 1) AS deposit_open_count,
+                   (SELECT COUNT(*)
+                    FROM asset_chains ac
+                    JOIN assets a ON a.id = ac.asset_id
+                    WHERE ac.chain_id = chains.id
+                      AND ac.enabled = 1
+                      AND a.enabled = 1
+                      AND ac.withdraw_enabled = 1) AS withdraw_open_count,
+                   enabled
+            FROM chains
+            WHERE LOWER(chain_key) <> :unsupported OR enabled = 1
+            ORDER BY enabled DESC, id ASC
+            """
+        ),
+        {"unsupported": _unsupported_chain_key()},
+    ).mappings().all()
+    asset_chains = db.execute(
+        text(
+            """
+            SELECT ac.*, a.symbol AS coin_symbol, a.name AS asset_name,
+                   c.chain_key, c.name AS chain_name, c.native_symbol AS chain_native_symbol,
+                   c.collection_address AS collection_address, c.hot_wallet_address AS hot_wallet_address,
+                   c.enabled AS chain_enabled
+            FROM asset_chains ac
+            JOIN assets a ON a.id = ac.asset_id
+            JOIN chains c ON c.id = ac.chain_id
+            WHERE LOWER(c.chain_key) <> :unsupported OR c.enabled = 1
+            ORDER BY a.symbol ASC, ac.sort ASC, c.name ASC
+            """
+        ),
+        {"unsupported": _unsupported_chain_key()},
+    ).mappings().all()
+    asset_rows = [_asset_config_row(dict(row)) for row in assets]
+    chain_rows = [_chain_config_row(dict(row)) for row in chains]
+    asset_chain_rows = [_asset_chain_config_row(dict(row)) for row in asset_chains]
+    return {
+        "items": asset_chain_rows,
+        "filters": {},
+        "pagination": {
+            "page": 1,
+            "page_size": max(20, len(asset_chain_rows)),
+            "total": len(asset_chain_rows),
+            "pages": 1,
+        },
+        "summary": {},
+        "stats": {},
+        "asset_sort": {
+            "sort_by": normalized_asset_sort_by,
+            "sort_dir": normalized_asset_sort_dir,
+        },
+        "assets": asset_rows,
+        "chains": chain_rows,
+        "asset_chains": asset_chain_rows,
+    }
+
+
+def get_admin_chain_health(db: Session) -> Dict[str, Any]:
+    items = admin_query_asset_configs(db)["chains"]
+    return _empty_page(items=items, total=len(items), page_size=max(20, len(items)))
+
+
+def admin_create_asset_config(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = _normalize_code(payload.get("symbol"))
+    errors: list[str] = []
+    if not symbol:
+        errors.append("币种标识不能为空")
+    deposit_sort_order = _parse_deposit_sort_order(payload.get("deposit_sort_order"), errors=errors)
+    withdraw_sort_order = _parse_withdraw_sort_order(payload.get("withdraw_sort_order"), errors=errors)
+    if errors:
+        return {"ok": False, "errors": errors}
+    try:
+        has_deposit_config = all(
+            _has_db_column(db, "assets", column_name)
+            for column_name in ("deposit_sort_order", "deposit_quick_enabled", "deposit_default_enabled")
+        )
+        if not has_deposit_config:
+            return {"ok": False, "errors": ["数据库缺少充值页展示配置字段，请先执行资产配置迁移"]}
+        has_withdraw_config = all(
+            _has_db_column(db, "assets", column_name)
+            for column_name in ("withdraw_sort_order", "withdraw_quick_enabled", "withdraw_default_enabled")
+        )
+        if not has_withdraw_config:
+            return {"ok": False, "errors": ["数据库缺少提现页展示配置字段，请先执行资产配置迁移"]}
+        deposit_quick_enabled = _parse_bool01(payload.get("deposit_quick_enabled", "1"))
+        deposit_default_enabled = _parse_bool01(payload.get("deposit_default_enabled"))
+        withdraw_quick_enabled = _parse_bool01(payload.get("withdraw_quick_enabled", "1"))
+        withdraw_default_enabled = _parse_bool01(payload.get("withdraw_default_enabled"))
+        db.execute(
+            text(
+                """
+                INSERT INTO assets
+                  (symbol, name, asset_type, display_precision, enabled, icon_url, sort_order,
+                   deposit_sort_order, deposit_quick_enabled, deposit_default_enabled,
+                   withdraw_sort_order, withdraw_quick_enabled, withdraw_default_enabled,
+                   created_at, updated_at)
+                VALUES
+                  (:symbol, :name, 'token', :display_precision, :enabled, :icon_url, :sort_order,
+                   :deposit_sort_order, :deposit_quick_enabled, :deposit_default_enabled,
+                   :withdraw_sort_order, :withdraw_quick_enabled, :withdraw_default_enabled,
+                   UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "symbol": symbol,
+                "name": str(payload.get("name") or symbol).strip(),
+                "display_precision": _parse_int(payload.get("display_precision"), 0),
+                "enabled": _parse_bool01(payload.get("enabled")),
+                "icon_url": _clean_optional_text(payload.get("icon_url")),
+                "sort_order": _parse_int(payload.get("sort_order"), 0),
+                "deposit_sort_order": deposit_sort_order,
+                "deposit_quick_enabled": deposit_quick_enabled,
+                "deposit_default_enabled": deposit_default_enabled,
+                "withdraw_sort_order": withdraw_sort_order,
+                "withdraw_quick_enabled": withdraw_quick_enabled,
+                "withdraw_default_enabled": withdraw_default_enabled,
+            },
+        )
+        db.commit()
+        return {"ok": True}
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["币种创建失败，请检查唯一性"]}
+    except Exception as exc:
+        db.rollback()
+        return {"ok": False, "errors": [f"币种创建失败，请检查资产配置字段或数据库状态（{type(exc).__name__}）"]}
+
+
+def admin_update_asset_config(db: Session, asset_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    errors: list[str] = []
+    deposit_sort_order = _parse_deposit_sort_order(payload.get("deposit_sort_order"), errors=errors)
+    withdraw_sort_order = _parse_withdraw_sort_order(payload.get("withdraw_sort_order"), errors=errors)
+    if errors:
+        return {"ok": False, "errors": errors}
+    try:
+        has_deposit_config = all(
+            _has_db_column(db, "assets", column_name)
+            for column_name in ("deposit_sort_order", "deposit_quick_enabled", "deposit_default_enabled")
+        )
+        if not has_deposit_config:
+            return {"ok": False, "errors": ["数据库缺少充值页展示配置字段，请先执行资产配置迁移"]}
+        has_withdraw_config = all(
+            _has_db_column(db, "assets", column_name)
+            for column_name in ("withdraw_sort_order", "withdraw_quick_enabled", "withdraw_default_enabled")
+        )
+        if not has_withdraw_config:
+            return {"ok": False, "errors": ["数据库缺少提现页展示配置字段，请先执行资产配置迁移"]}
+        result = db.execute(
+            text(
+                """
+                UPDATE assets
+                SET name=:name, display_precision=:display_precision, enabled=:enabled,
+                    icon_url=:icon_url, sort_order=:sort_order,
+                    deposit_sort_order=:deposit_sort_order,
+                    deposit_quick_enabled=:deposit_quick_enabled,
+                    deposit_default_enabled=:deposit_default_enabled,
+                    withdraw_sort_order=:withdraw_sort_order,
+                    withdraw_quick_enabled=:withdraw_quick_enabled,
+                    withdraw_default_enabled=:withdraw_default_enabled,
+                    updated_at=UTC_TIMESTAMP()
+                WHERE id=:asset_id
+                """
+            ),
+            {
+                "asset_id": int(asset_id),
+                "name": str(payload.get("name") or "").strip(),
+                "display_precision": _parse_int(payload.get("display_precision"), 0),
+                "enabled": _parse_bool01(payload.get("enabled")),
+                "icon_url": _clean_optional_text(payload.get("icon_url")),
+                "sort_order": _parse_int(payload.get("sort_order"), 0),
+                "deposit_sort_order": deposit_sort_order,
+                "deposit_quick_enabled": _parse_bool01(payload.get("deposit_quick_enabled")),
+                "deposit_default_enabled": _parse_bool01(payload.get("deposit_default_enabled")),
+                "withdraw_sort_order": withdraw_sort_order,
+                "withdraw_quick_enabled": _parse_bool01(payload.get("withdraw_quick_enabled")),
+                "withdraw_default_enabled": _parse_bool01(payload.get("withdraw_default_enabled")),
+            },
+        )
+        if getattr(result, "rowcount", 0) == 0:
+            db.rollback()
+            return {"ok": False, "errors": [f"币种配置 {asset_id} 不存在"]}
+        db.commit()
+        return {"ok": True}
+    except Exception as exc:
+        db.rollback()
+        return {"ok": False, "errors": [f"币种保存失败，请检查资产配置字段或数据库状态（{type(exc).__name__}）"]}
+
+
+def admin_create_chain_config(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    errors: list[str] = []
+    chain_key = _normalize_chain_key(payload.get("chain_key"))
+    hot_wallet_private_key = str(payload.get("hot_wallet_private_key") or "").strip()
+    if _reject_unsupported_chain_key(chain_key, errors):
+        return {"ok": False, "errors": errors}
+    if chain_key not in SUPPORTED_CHAIN_KEYS:
+        errors.append("当前系统不支持该网络")
+    if not chain_key:
+        errors.append("网络标识不能为空")
+    if hot_wallet_private_key and get_chain_capability(chain_key).get("chain_family") != "EVM":
+        errors.append("仅 EVM 网络支持热钱包私钥配置")
+    chain_value = _parse_int(payload.get("chain_id"), 0)
+    moralis_stream_enabled = _parse_bool01(payload.get("moralis_stream_enabled"))
+    watch_enabled = _parse_bool01(payload.get("watch_enabled"))
+    withdraw_fee_maintenance_interval_sec = _parse_withdraw_fee_interval_sec(
+        payload.get("withdraw_fee_maintenance_interval_sec"),
+        errors=errors,
+    )
+    collection_max_single_gas_native_value = _parse_optional_non_negative_decimal_config_field(
+        payload.get("collection_max_single_gas_native"), field_label="单笔补 Gas 上限", errors=errors
+    )
+    collection_daily_gas_native_limit_value = _parse_optional_non_negative_decimal_config_field(
+        payload.get("collection_daily_gas_native_limit"), field_label="每日补 Gas 上限", errors=errors
+    )
+    errors.extend(
+        validate_effective_moralis_mapping(
+            chain_id=chain_value,
+            chain_key=chain_key,
+            moralis_stream_enabled=moralis_stream_enabled,
+            watch_enabled=watch_enabled,
+        )
+    )
+    if errors:
+        return {"ok": False, "errors": errors}
+    columns = [
+        "chain_key",
+        "name",
+        "chain_id",
+        "native_symbol",
+        "explorer_tx_url",
+        "rpc_url",
+        "collection_address",
+        "hot_wallet_address",
+        "confirmations",
+        "enabled",
+        "created_at",
+        "updated_at",
+    ]
+    values = [
+        ":chain_key",
+        ":name",
+        ":chain_id",
+        ":native_symbol",
+        ":explorer_tx_url",
+        ":rpc_url",
+        ":collection_address",
+        ":hot_wallet_address",
+        ":confirmations",
+        ":enabled",
+        "UTC_TIMESTAMP()",
+        "UTC_TIMESTAMP()",
+    ]
+    params = {
+        "chain_key": chain_key,
+        "name": str(payload.get("name") or chain_key).strip(),
+        "chain_id": chain_value,
+        "native_symbol": str(payload.get("native_symbol") or "").strip(),
+        "explorer_tx_url": _clean_optional_text(payload.get("explorer_tx_url")),
+        "rpc_url": _clean_optional_text(normalize_rpc_urls_text(payload.get("rpc_url"))),
+        "collection_address": _clean_optional_text(payload.get("collection_address")),
+        "hot_wallet_address": _clean_optional_text(payload.get("hot_wallet_address")),
+        "confirmations": _parse_int(payload.get("confirmations"), 0),
+        "enabled": _parse_bool01(payload.get("enabled")),
+    }
+    optional_fields = {
+        "icon_url": _clean_optional_text(payload.get("icon_url")),
+        "moralis_stream_id": _clean_optional_text(payload.get("moralis_stream_id")),
+        "moralis_stream_enabled": moralis_stream_enabled,
+        "moralis_chain_id": _clean_optional_text(payload.get("moralis_chain_id")),
+        "webhook_chain_key": _clean_optional_text(payload.get("webhook_chain_key")),
+        "watch_enabled": watch_enabled,
+        "withdraw_fee": _parse_withdraw_fee_decimal(payload.get("withdraw_fee"), Decimal("0.005")),
+        "withdraw_fee_auto_enabled": _parse_bool01(payload.get("withdraw_fee_auto_enabled")),
+        "withdraw_fee_min": _parse_withdraw_fee_decimal(payload.get("withdraw_fee_min"), Decimal("0.005")),
+        "withdraw_fee_max": _parse_withdraw_fee_decimal(payload.get("withdraw_fee_max"), Decimal("100")),
+        "withdraw_fee_multiplier": _parse_decimal(payload.get("withdraw_fee_multiplier"), Decimal("1.3")),
+        "withdraw_fee_update_threshold": _parse_decimal(payload.get("withdraw_fee_update_threshold"), Decimal("0.001")),
+        "withdraw_fee_maintenance_interval_sec": withdraw_fee_maintenance_interval_sec,
+        "collection_enabled": _parse_bool01(payload.get("collection_enabled", "1")),
+        "collection_real_send_enabled": _parse_bool01(payload.get("collection_real_send_enabled")),
+        "collection_max_single_gas_native": collection_max_single_gas_native_value,
+        "collection_daily_gas_native_limit": collection_daily_gas_native_limit_value,
+    }
+    for field_name, field_value in optional_fields.items():
+        if _has_db_column(db, "chains", field_name):
+            columns.append(field_name)
+            values.append(f":{field_name}")
+            params[field_name] = field_value
+    try:
+        db.execute(
+            text(
+                f"""
+                INSERT INTO chains
+                  ({", ".join(columns)})
+                VALUES
+                  ({", ".join(values)})
+                """
+            ),
+            params,
+        )
+        if hot_wallet_private_key:
+            row = db.execute(
+                text("SELECT id FROM chains WHERE LOWER(chain_key)=:chain_key LIMIT 1"),
+                {"chain_key": chain_key},
+            ).mappings().first()
+            if not row:
+                raise ValueError("网络创建后未找到记录，无法保存热钱包私钥")
+            save_chain_hot_wallet_private_key(
+                db,
+                chain_id=int(row["id"]),
+                private_key=hot_wallet_private_key,
+                hot_wallet_address=str(params.get("hot_wallet_address") or ""),
+            )
+        db.commit()
+        return {"ok": True}
+    except ValueError as exc:
+        db.rollback()
+        return {"ok": False, "errors": [str(exc)]}
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["网络创建失败，请检查唯一性"]}
+
+
+def admin_update_chain_config(db: Session, chain_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    errors: list[str] = []
+    chain_key = _chain_key_by_chain_id(db, chain_id)
+    hot_wallet_private_key = str(payload.get("hot_wallet_private_key") or "").strip()
+    if _reject_unsupported_chain_key(chain_key, errors):
+        return {"ok": False, "errors": errors}
+    if hot_wallet_private_key and get_chain_capability(chain_key).get("chain_family") != "EVM":
+        errors.append("仅 EVM 网络支持热钱包私钥配置")
+    chain_value = _parse_int(payload.get("chain_id"), 0)
+    moralis_stream_enabled = _parse_bool01(payload.get("moralis_stream_enabled"))
+    watch_enabled = _parse_bool01(payload.get("watch_enabled"))
+    withdraw_fee_maintenance_interval_sec = _parse_withdraw_fee_interval_sec(
+        payload.get("withdraw_fee_maintenance_interval_sec"),
+        errors=errors,
+    )
+    collection_max_single_gas_native_value = _parse_optional_non_negative_decimal_config_field(
+        payload.get("collection_max_single_gas_native"), field_label="单笔补 Gas 上限", errors=errors
+    )
+    collection_daily_gas_native_limit_value = _parse_optional_non_negative_decimal_config_field(
+        payload.get("collection_daily_gas_native_limit"), field_label="每日补 Gas 上限", errors=errors
+    )
+    errors.extend(
+        validate_effective_moralis_mapping(
+            chain_id=chain_value,
+            chain_key=chain_key,
+            moralis_stream_enabled=moralis_stream_enabled,
+            watch_enabled=watch_enabled,
+        )
+    )
+    if errors:
+        return {"ok": False, "errors": errors}
+    set_clauses = [
+        "name=:name",
+        "chain_id=:chain_value",
+        "native_symbol=:native_symbol",
+        "confirmations=:confirmations",
+        "explorer_tx_url=:explorer_tx_url",
+        "rpc_url=:rpc_url",
+        "collection_address=:collection_address",
+        "hot_wallet_address=:hot_wallet_address",
+        "enabled=:enabled",
+        "updated_at=UTC_TIMESTAMP()",
+    ]
+    params = {
+        "record_id": int(chain_id),
+        "name": str(payload.get("name") or "").strip(),
+        "chain_value": chain_value,
+        "native_symbol": str(payload.get("native_symbol") or "").strip(),
+        "confirmations": _parse_int(payload.get("confirmations"), 0),
+        "explorer_tx_url": _clean_optional_text(payload.get("explorer_tx_url")),
+        "rpc_url": _clean_optional_text(normalize_rpc_urls_text(payload.get("rpc_url"))),
+        "collection_address": _clean_optional_text(payload.get("collection_address")),
+        "hot_wallet_address": _clean_optional_text(payload.get("hot_wallet_address")),
+        "enabled": _parse_bool01(payload.get("enabled")),
+    }
+    optional_fields = {
+        "icon_url": _clean_optional_text(payload.get("icon_url")),
+        "moralis_stream_id": _clean_optional_text(payload.get("moralis_stream_id")),
+        "moralis_stream_enabled": moralis_stream_enabled,
+        "moralis_chain_id": _clean_optional_text(payload.get("moralis_chain_id")),
+        "webhook_chain_key": _clean_optional_text(payload.get("webhook_chain_key")),
+        "watch_enabled": watch_enabled,
+        "withdraw_fee": _parse_withdraw_fee_decimal(payload.get("withdraw_fee"), Decimal("0.005")),
+        "withdraw_fee_auto_enabled": _parse_bool01(payload.get("withdraw_fee_auto_enabled")),
+        "withdraw_fee_min": _parse_withdraw_fee_decimal(payload.get("withdraw_fee_min"), Decimal("0.005")),
+        "withdraw_fee_max": _parse_withdraw_fee_decimal(payload.get("withdraw_fee_max"), Decimal("100")),
+        "withdraw_fee_multiplier": _parse_decimal(payload.get("withdraw_fee_multiplier"), Decimal("1.3")),
+        "withdraw_fee_update_threshold": _parse_decimal(payload.get("withdraw_fee_update_threshold"), Decimal("0.001")),
+        "withdraw_fee_maintenance_interval_sec": withdraw_fee_maintenance_interval_sec,
+        "collection_enabled": _parse_bool01(payload.get("collection_enabled", "1")),
+        "collection_real_send_enabled": _parse_bool01(payload.get("collection_real_send_enabled")),
+        "collection_max_single_gas_native": collection_max_single_gas_native_value,
+        "collection_daily_gas_native_limit": collection_daily_gas_native_limit_value,
+    }
+    for field_name, field_value in optional_fields.items():
+        if _has_db_column(db, "chains", field_name):
+            set_clauses.append(f"{field_name}=:{field_name}")
+            params[field_name] = field_value
+    try:
+        db.execute(
+            text(
+                f"""
+                UPDATE chains
+                SET {", ".join(set_clauses)}
+                WHERE id=:record_id
+                """
+            ),
+            params,
+        )
+        if hot_wallet_private_key:
+            save_chain_hot_wallet_private_key(
+                db,
+                chain_id=int(chain_id),
+                private_key=hot_wallet_private_key,
+                hot_wallet_address=str(params.get("hot_wallet_address") or ""),
+            )
+        db.commit()
+        return {"ok": True}
+    except ValueError as exc:
+        db.rollback()
+        return {"ok": False, "errors": [str(exc)]}
+
+
+def _chain_withdraw_fee_snapshot(db: Session, chain_id: int) -> Dict[str, Any]:
+    row = db.execute(
+        text(
+            """
+            SELECT id, chain_key, withdraw_fee, withdraw_fee_auto_enabled,
+                   withdraw_fee_last_estimated, withdraw_fee_last_suggested,
+                   withdraw_fee_last_updated_at, withdraw_fee_last_error
+            FROM chains
+            WHERE id = :chain_id
+            LIMIT 1
+            """
+        ),
+        {"chain_id": int(chain_id)},
+    ).mappings().first()
+    if not row:
+        return {}
+    return {
+        "chain_id": int(row["id"]),
+        "chain_key": str(row.get("chain_key") or ""),
+        "withdraw_fee": _admin_withdraw_fee_display(row.get("withdraw_fee")),
+        "withdraw_fee_auto_enabled": int(row.get("withdraw_fee_auto_enabled") or 0),
+        "withdraw_fee_auto_label": "开启" if int(row.get("withdraw_fee_auto_enabled") or 0) else "关闭",
+        "withdraw_fee_last_estimated": (
+            _admin_withdraw_cost_display(row.get("withdraw_fee_last_estimated"))
+            if row.get("withdraw_fee_last_estimated") is not None
+            else "-"
+        ),
+        "withdraw_fee_last_suggested": (
+            _admin_withdraw_fee_display(row.get("withdraw_fee_last_suggested"))
+            if row.get("withdraw_fee_last_suggested") is not None
+            else "-"
+        ),
+        "withdraw_fee_last_updated_at": _admin_datetime_display(row.get("withdraw_fee_last_updated_at")) or "-",
+        "withdraw_fee_last_error": row.get("withdraw_fee_last_error") or "",
+    }
+
+
+def admin_sync_chain_withdraw_fee(db: Session, chain_id: int) -> Dict[str, Any]:
+    snapshot = _chain_withdraw_fee_snapshot(db, chain_id)
+    if not snapshot:
+        return {"ok": False, "error": "网络配置不存在"}
+    if int(snapshot.get("withdraw_fee_auto_enabled") or 0) != 1:
+        return {"ok": False, "error": "请先启用自动维护，再立即同步手续费。", "chain": snapshot}
+
+    chain_key = str(snapshot.get("chain_key") or "").strip().lower()
+    if not chain_key:
+        return {"ok": False, "error": "网络标识缺失，无法同步手续费。", "chain": snapshot}
+
+    try:
+        result = maintain_withdraw_fee_once(db, chain_keys=[chain_key])
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        return {"ok": False, "error": f"手续费同步失败：{exc}", "chain": snapshot}
+
+    refreshed = _chain_withdraw_fee_snapshot(db, chain_id)
+    if int(result.get("failed") or 0) > 0:
+        detail = (result.get("details") or [{}])[0]
+        return {
+            "ok": False,
+            "error": detail.get("error") or "手续费同步失败，请查看最近错误。",
+            "result": result,
+            "chain": refreshed,
+        }
+    if int(result.get("estimated") or 0) <= 0:
+        return {
+            "ok": False,
+            "error": "当前网络未启用自动维护或暂无可估算币种，未刷新手续费。",
+            "result": result,
+            "chain": refreshed,
+        }
+    return {"ok": True, "message": "手续费已同步。", "result": result, "chain": refreshed}
+
+
+def _asset_chain_identity(db: Session, asset_chain_id: int) -> Optional[Dict[str, Any]]:
+    row = db.execute(
+        text(
+            """
+            SELECT
+              ac.id,
+              ac.asset_id,
+              ac.chain_id,
+              a.symbol AS asset_symbol,
+              c.chain_key AS chain_key
+            FROM asset_chains ac
+            JOIN assets a ON a.id = ac.asset_id
+            JOIN chains c ON c.id = ac.chain_id
+            WHERE ac.id = :asset_chain_id
+            LIMIT 1
+            """
+        ),
+        {"asset_chain_id": int(asset_chain_id)},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _asset_chain_related_row_exists(
+    db: Session,
+    *,
+    table_name: str,
+    identity: Dict[str, Any],
+    candidate_columns: Iterable[str],
+) -> bool:
+    if not _admin_table_exists(db, table_name):
+        return False
+
+    columns = _admin_table_column_set(db, table_name, candidate_columns)
+    predicates: list[str] = []
+    params: Dict[str, Any] = {
+        "asset_chain_id": int(identity["id"]),
+        "asset_id": int(identity["asset_id"]),
+        "asset_symbol": str(identity["asset_symbol"] or "").upper(),
+        "chain_key": str(identity["chain_key"] or "").lower(),
+    }
+
+    if "asset_chain_id" in columns:
+        predicates.append("asset_chain_id = :asset_chain_id")
+    if "asset_id" in columns and "chain_key" in columns:
+        predicates.append("(asset_id = :asset_id AND LOWER(chain_key) = :chain_key)")
+    if "coin_symbol" in columns and "chain_key" in columns:
+        predicates.append("(UPPER(coin_symbol) = :asset_symbol AND LOWER(chain_key) = :chain_key)")
+    if not predicates:
+        return False
+
+    row = db.execute(
+        text(f"SELECT 1 FROM {table_name} WHERE {' OR '.join(predicates)} LIMIT 1"),
+        params,
+    ).first()
+    return row is not None
+
+
+def _asset_chain_has_related_history(db: Session, identity: Dict[str, Any]) -> bool:
+    relation_checks = (
+        ("deposit_logs", ("asset_chain_id", "asset_id", "coin_symbol", "chain_key")),
+        ("deposits", ("asset_chain_id", "asset_id", "coin_symbol", "chain_key")),
+        ("withdraw_logs", ("asset_chain_id", "asset_id", "coin_symbol", "chain_key")),
+        ("withdraws", ("asset_chain_id", "asset_id", "coin_symbol", "chain_key")),
+        ("user_balances", ("asset_chain_id", "asset_id", "coin_symbol", "chain_key")),
+        ("balance_logs", ("asset_chain_id", "asset_id", "coin_symbol", "chain_key")),
+        ("collection_batches", ("asset_chain_id", "asset_id", "coin_symbol", "chain_key")),
+        ("collection_tasks", ("asset_chain_id", "asset_id", "coin_symbol", "chain_key")),
+        ("admin_balance_adjust_logs", ("asset_chain_id", "asset_id", "coin_symbol", "chain_key")),
+    )
+    return any(
+        _asset_chain_related_row_exists(
+            db,
+            table_name=table_name,
+            identity=identity,
+            candidate_columns=candidate_columns,
+        )
+        for table_name, candidate_columns in relation_checks
+    )
+
+
+def admin_create_asset_chain_config(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    errors: list[str] = []
+    asset_id = _parse_int(payload.get("asset_id"), 0)
+    chain_id = _parse_int(payload.get("chain_id"), 0)
+    if asset_id <= 0 or chain_id <= 0:
+        return {"ok": False, "errors": ["请填写币种和网络。"]}
+
+    asset_row = db.execute(
+        text("SELECT id, symbol FROM assets WHERE id = :asset_id LIMIT 1"),
+        {"asset_id": asset_id},
+    ).mappings().first()
+    chain_row = db.execute(
+        text("SELECT id, chain_key FROM chains WHERE id = :chain_id LIMIT 1"),
+        {"chain_id": chain_id},
+    ).mappings().first()
+    if not asset_row or not chain_row:
+        return {"ok": False, "errors": ["币种或网络不存在，请刷新后重试。"]}
+
+    duplicate_row = db.execute(
+        text(
+            """
+            SELECT id
+            FROM asset_chains
+            WHERE asset_id = :asset_id AND chain_id = :chain_id
+            LIMIT 1
+            """
+        ),
+        {"asset_id": asset_id, "chain_id": chain_id},
+    ).first()
+    if duplicate_row:
+        return {"ok": False, "errors": ["该币种和网络的配置已存在，请直接编辑或启用。"]}
+
+    chain_key = _normalize_chain_key(chain_row.get("chain_key"))
+    deposit_enabled = _parse_bool01(payload.get("deposit_enabled"))
+    withdraw_enabled = _parse_bool01(payload.get("withdraw_enabled"))
+    capability_errors: list[str] = []
+    _validate_asset_chain_switch_capabilities(
+        chain_key=chain_key,
+        deposit_enabled=deposit_enabled,
+        withdraw_enabled=withdraw_enabled,
+        errors=capability_errors,
+    )
+    if capability_errors:
+        errors.extend([f"后端保护规则拦截：{message}" for message in capability_errors])
+
+    contract_errors: list[str] = []
+    contract_address = _validate_contract_address(chain_key, payload.get("contract_address"), contract_errors)
+    if contract_errors:
+        errors.append("合约地址格式不正确。")
+
+    if contract_address:
+        contract_row = db.execute(
+            text(
+                """
+                SELECT id
+                FROM asset_chains
+                WHERE chain_id = :chain_id
+                  AND contract_address IS NOT NULL
+                  AND LOWER(contract_address) = LOWER(:contract_address)
+                LIMIT 1
+                """
+            ),
+            {"chain_id": chain_id, "contract_address": contract_address},
+        ).first()
+        if contract_row:
+            errors.append("该合约地址已绑定其它币种-网络配置，请检查后重试。")
+
+    collection_address = _validate_chain_wallet_address(
+        chain_key,
+        payload.get("collection_address"),
+        field_label="归集钱包地址",
+        errors=errors,
+    )
+    hot_wallet_address = _validate_chain_wallet_address(
+        chain_key,
+        payload.get("hot_wallet_address"),
+        field_label="平台热钱包地址",
+        errors=errors,
+    )
+    min_deposit_value = _parse_decimal_config_field(
+        payload.get("min_deposit"), field_label="最小充值", errors=errors
+    )
+    min_withdraw_value = _parse_decimal_config_field(
+        payload.get("min_withdraw"), field_label="最小提现", errors=errors
+    )
+    collection_min_amount_value = _parse_optional_non_negative_decimal_config_field(
+        payload.get("collection_min_amount"), field_label="最小归集金额", errors=errors
+    )
+    collection_max_single_amount_value = _parse_optional_non_negative_decimal_config_field(
+        payload.get("collection_max_single_amount"), field_label="单笔归集上限", errors=errors
+    )
+    collection_daily_amount_limit_value = _parse_optional_non_negative_decimal_config_field(
+        payload.get("collection_daily_amount_limit"), field_label="每日归集上限", errors=errors
+    )
+    review_threshold_value = _parse_decimal_config_field(
+        payload.get("review_threshold_amount"), field_label="金额审核阈值", errors=errors, optional=True
+    )
+    daily_withdraw_count_limit_value = _parse_optional_int_config_field(
+        payload.get("daily_withdraw_count_limit"), field_label="每日提现次数限制", errors=errors
+    )
+    confirmations_value = _parse_optional_int_config_field(
+        payload.get("confirmations"), field_label="确认数", errors=errors
+    )
+    required_collection_real_send_columns = (
+        "collection_real_send_enabled",
+        "collection_max_single_amount",
+        "collection_daily_amount_limit",
+    )
+    missing_collection_columns = [
+        column for column in required_collection_real_send_columns if not _has_db_column(db, "asset_chains", column)
+    ]
+    if missing_collection_columns:
+        errors.append(f"币种-网络真实归集配置字段未迁移：{', '.join(missing_collection_columns)}")
+    if errors:
+        return {"ok": False, "errors": errors}
+    try:
+        has_collection_min_amount = _has_db_column(db, "asset_chains", "collection_min_amount")
+        optional_collection_columns = []
+        optional_collection_values = []
+        optional_params = {}
+        if has_collection_min_amount:
+            optional_collection_columns.append("collection_min_amount")
+            optional_collection_values.append(":collection_min_amount")
+            optional_params["collection_min_amount"] = collection_min_amount_value
+        if _has_db_column(db, "asset_chains", "collection_real_send_enabled"):
+            optional_collection_columns.append("collection_real_send_enabled")
+            optional_collection_values.append(":collection_real_send_enabled")
+            optional_params["collection_real_send_enabled"] = _parse_bool01(payload.get("collection_real_send_enabled"))
+        if _has_db_column(db, "asset_chains", "collection_max_single_amount"):
+            optional_collection_columns.append("collection_max_single_amount")
+            optional_collection_values.append(":collection_max_single_amount")
+            optional_params["collection_max_single_amount"] = collection_max_single_amount_value
+        if _has_db_column(db, "asset_chains", "collection_daily_amount_limit"):
+            optional_collection_columns.append("collection_daily_amount_limit")
+            optional_collection_values.append(":collection_daily_amount_limit")
+            optional_params["collection_daily_amount_limit"] = collection_daily_amount_limit_value
+        collection_column_sql = f", {', '.join(optional_collection_columns)}" if optional_collection_columns else ""
+        collection_value_sql = f", {', '.join(optional_collection_values)}" if optional_collection_values else ""
+        db.execute(
+            text(
+                f"""
+                INSERT INTO asset_chains
+                  (asset_id, chain_id, contract_address, decimals, deposit_enabled, withdraw_enabled,
+                   enabled, min_deposit, min_withdraw, review_threshold_amount, force_manual_review,
+                   daily_withdraw_count_limit, confirmations, sort{collection_column_sql}, created_at, updated_at)
+                VALUES
+                  (:asset_id, :chain_id, :contract_address, :decimals, :deposit_enabled, :withdraw_enabled,
+                   :enabled, :min_deposit, :min_withdraw, :review_threshold_amount, :force_manual_review,
+                   :daily_withdraw_count_limit, :confirmations, :sort{collection_value_sql}, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "asset_id": asset_id,
+                "chain_id": chain_id,
+                "contract_address": contract_address,
+                "decimals": _parse_int(payload.get("decimals"), 0),
+                "deposit_enabled": deposit_enabled,
+                "withdraw_enabled": withdraw_enabled,
+                "enabled": _parse_bool01(payload.get("enabled")),
+                "min_deposit": min_deposit_value,
+                "min_withdraw": min_withdraw_value,
+                "review_threshold_amount": review_threshold_value,
+                "force_manual_review": _parse_bool01(payload.get("force_manual_review")),
+                "daily_withdraw_count_limit": daily_withdraw_count_limit_value,
+                "confirmations": confirmations_value,
+                "sort": _parse_int(payload.get("sort"), 0),
+                **optional_params,
+            },
+        )
+        chain_wallet_updates: list[str] = []
+        chain_wallet_params: Dict[str, Any] = {"chain_id": chain_id}
+        if not _is_empty_config_value(payload.get("collection_address")) and _has_db_column(db, "chains", "collection_address"):
+            chain_wallet_updates.append("collection_address=:collection_address")
+            chain_wallet_params["collection_address"] = collection_address
+        if not _is_empty_config_value(payload.get("hot_wallet_address")) and _has_db_column(db, "chains", "hot_wallet_address"):
+            chain_wallet_updates.append("hot_wallet_address=:hot_wallet_address")
+            chain_wallet_params["hot_wallet_address"] = hot_wallet_address
+        if chain_wallet_updates:
+            chain_wallet_updates.append("updated_at=UTC_TIMESTAMP()")
+            db.execute(
+                text(
+                    f"""
+                    UPDATE chains
+                    SET {", ".join(chain_wallet_updates)}
+                    WHERE id=:chain_id
+                    """
+                ),
+                chain_wallet_params,
+            )
+        db.commit()
+        return {"ok": True}
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["该币种和网络的配置已存在，请直接编辑或启用。"]}
+    except (ValueError, InvalidOperation):
+        db.rollback()
+        return {"ok": False, "errors": ["字段格式不正确，请检查后重试。"]}
+    except SQLAlchemyError:
+        db.rollback()
+        return {"ok": False, "errors": ["新增币种-网络配置失败，后端保护规则已拦截。"]}
+
+
+def admin_update_asset_chain_config(db: Session, asset_chain_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        errors: list[str] = []
+        identity = _asset_chain_identity(db, int(asset_chain_id))
+        if not identity:
+            return {"ok": False, "errors": ["币种-网络配置不存在，请刷新后重试。"]}
+
+        chain_key = _normalize_chain_key(identity.get("chain_key"))
+        deposit_enabled = _parse_bool01(payload.get("deposit_enabled"))
+        withdraw_enabled = _parse_bool01(payload.get("withdraw_enabled"))
+        _validate_asset_chain_switch_capabilities(
+            chain_key=chain_key,
+            deposit_enabled=deposit_enabled,
+            withdraw_enabled=withdraw_enabled,
+            errors=errors,
+        )
+
+        contract_errors: list[str] = []
+        contract_address = _validate_contract_address(chain_key, payload.get("contract_address"), contract_errors)
+        if contract_errors:
+            errors.append("合约地址格式不正确。")
+        collection_address = _validate_chain_wallet_address(
+            chain_key,
+            payload.get("collection_address"),
+            field_label="归集钱包地址",
+            errors=errors,
+        )
+        hot_wallet_address = _validate_chain_wallet_address(
+            chain_key,
+            payload.get("hot_wallet_address"),
+            field_label="平台热钱包地址",
+            errors=errors,
+        )
+        min_deposit_value = _parse_decimal_config_field(
+            payload.get("min_deposit"), field_label="最小充值", errors=errors
+        )
+        min_withdraw_value = _parse_decimal_config_field(
+            payload.get("min_withdraw"), field_label="最小提现", errors=errors
+        )
+        collection_min_amount_value = _parse_optional_non_negative_decimal_config_field(
+            payload.get("collection_min_amount"), field_label="最小归集金额", errors=errors
+        )
+        collection_max_single_amount_value = _parse_optional_non_negative_decimal_config_field(
+            payload.get("collection_max_single_amount"), field_label="单笔归集上限", errors=errors
+        )
+        collection_daily_amount_limit_value = _parse_optional_non_negative_decimal_config_field(
+            payload.get("collection_daily_amount_limit"), field_label="每日归集上限", errors=errors
+        )
+        review_threshold_value = _parse_decimal_config_field(
+            payload.get("review_threshold_amount"), field_label="审核阈值", errors=errors, optional=True
+        )
+        daily_withdraw_count_limit_value = _parse_optional_int_config_field(
+            payload.get("daily_withdraw_count_limit"), field_label="每日提现次数限制", errors=errors
+        )
+        confirmations_value = _parse_optional_int_config_field(
+            payload.get("confirmations"), field_label="确认数", errors=errors
+        )
+        required_collection_real_send_columns = (
+            "collection_real_send_enabled",
+            "collection_max_single_amount",
+            "collection_daily_amount_limit",
+        )
+        missing_collection_columns = [
+            column for column in required_collection_real_send_columns if not _has_db_column(db, "asset_chains", column)
+        ]
+        if missing_collection_columns:
+            errors.append(f"币种-网络真实归集配置字段未迁移：{', '.join(missing_collection_columns)}")
+        if errors:
+            return {"ok": False, "errors": errors}
+
+        has_collection_min_amount = _has_db_column(db, "asset_chains", "collection_min_amount")
+        collection_set_clauses = []
+        optional_params = {}
+        if has_collection_min_amount:
+            collection_set_clauses.append("collection_min_amount=:collection_min_amount")
+            optional_params["collection_min_amount"] = collection_min_amount_value
+        if _has_db_column(db, "asset_chains", "collection_real_send_enabled"):
+            collection_set_clauses.append("collection_real_send_enabled=:collection_real_send_enabled")
+            optional_params["collection_real_send_enabled"] = _parse_bool01(payload.get("collection_real_send_enabled"))
+        if _has_db_column(db, "asset_chains", "collection_max_single_amount"):
+            collection_set_clauses.append("collection_max_single_amount=:collection_max_single_amount")
+            optional_params["collection_max_single_amount"] = collection_max_single_amount_value
+        if _has_db_column(db, "asset_chains", "collection_daily_amount_limit"):
+            collection_set_clauses.append("collection_daily_amount_limit=:collection_daily_amount_limit")
+            optional_params["collection_daily_amount_limit"] = collection_daily_amount_limit_value
+        collection_set_sql = f", {', '.join(collection_set_clauses)}" if collection_set_clauses else ""
+
+        db.execute(
+            text(
+                f"""
+                UPDATE asset_chains
+                SET contract_address=:contract_address, decimals=:decimals, min_deposit=:min_deposit,
+                    min_withdraw=:min_withdraw, review_threshold_amount=:review_threshold_amount,
+                    force_manual_review=:force_manual_review, daily_withdraw_count_limit=:daily_withdraw_count_limit,
+                    confirmations=:confirmations, deposit_enabled=:deposit_enabled, withdraw_enabled=:withdraw_enabled,
+                    enabled=:enabled, sort=:sort{collection_set_sql}, updated_at=UTC_TIMESTAMP()
+                WHERE id=:asset_chain_id
+                """
+            ),
+            {
+                "asset_chain_id": int(asset_chain_id),
+                "contract_address": contract_address,
+                "decimals": _parse_int(payload.get("decimals"), 0),
+                "min_deposit": min_deposit_value,
+                "min_withdraw": min_withdraw_value,
+                "review_threshold_amount": review_threshold_value,
+                "force_manual_review": _parse_bool01(payload.get("force_manual_review")),
+                "daily_withdraw_count_limit": daily_withdraw_count_limit_value,
+                "confirmations": confirmations_value,
+                "deposit_enabled": deposit_enabled,
+                "withdraw_enabled": withdraw_enabled,
+                "enabled": _parse_bool01(payload.get("enabled")),
+                "sort": _parse_int(payload.get("sort"), 0),
+                **optional_params,
+            },
+        )
+        if _has_db_column(db, "chains", "collection_address") and _has_db_column(db, "chains", "hot_wallet_address"):
+            db.execute(
+                text(
+                    """
+                    UPDATE chains
+                    SET collection_address=:collection_address,
+                        hot_wallet_address=:hot_wallet_address,
+                        updated_at=UTC_TIMESTAMP()
+                    WHERE id=:chain_id
+                    """
+                ),
+                {
+                    "chain_id": int(identity["chain_id"]),
+                    "collection_address": collection_address,
+                    "hot_wallet_address": hot_wallet_address,
+                },
+            )
+        db.commit()
+        return {"ok": True}
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["保存失败，配置已与现有记录冲突。"]}
+    except (ValueError, InvalidOperation):
+        db.rollback()
+        return {"ok": False, "errors": ["保存失败，请检查配置后重试。"]}
+    except SQLAlchemyError:
+        db.rollback()
+        return {"ok": False, "errors": ["保存失败，请检查配置后重试。"]}
+    except Exception:
+        db.rollback()
+        return {"ok": False, "errors": ["保存失败，请检查配置后重试。"]}
+
+
+def admin_delete_asset_config(db: Session, asset_id: int) -> Dict[str, Any]:
+    db.execute(text("UPDATE assets SET enabled=0, updated_at=UTC_TIMESTAMP() WHERE id=:id"), {"id": int(asset_id)})
+    db.commit()
+    return {"ok": True}
+
+
+def admin_delete_chain_config(db: Session, chain_id: int) -> Dict[str, Any]:
+    db.execute(text("UPDATE chains SET enabled=0, updated_at=UTC_TIMESTAMP() WHERE id=:id"), {"id": int(chain_id)})
+    db.commit()
+    return {"ok": True}
+
+
+def admin_delete_asset_chain_config(db: Session, asset_chain_id: int) -> Dict[str, Any]:
+    try:
+        identity = _asset_chain_identity(db, int(asset_chain_id))
+        if not identity:
+            return {"ok": False, "errors": ["币种-网络配置不存在，请刷新后重试。"]}
+        if _asset_chain_has_related_history(db, identity):
+            return {"ok": False, "errors": ["该币种-网络已有历史数据，不能删除。请改为停用。"]}
+        result = db.execute(text("DELETE FROM asset_chains WHERE id=:id"), {"id": int(asset_chain_id)})
+        db.commit()
+        if result.rowcount == 0:
+            return {"ok": False, "errors": ["币种-网络配置不存在，请刷新后重试。"]}
+        return {"ok": True}
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["该币种-网络已有历史数据，不能删除。请改为停用。"]}
+    except SQLAlchemyError:
+        db.rollback()
+        return {"ok": False, "errors": ["删除前检查历史数据失败，请稍后重试。"]}
+
+
+def _empty_page(**extra: Any) -> Dict[str, Any]:
+    items = extra.pop("items", None) or []
+    filters = extra.pop("filters", None) or {}
+    summary = extra.pop("summary", None) or {}
+    stats = extra.pop("stats", None) or {}
+    page = int(extra.pop("page", 1) or 1)
+    page_size = int(extra.pop("page_size", 20) or 20)
+    total = int(extra.pop("total", len(items)) or 0)
+    pages = int(extra.pop("pages", 0) or max(1, (total + page_size - 1) // page_size))
+    pagination = extra.pop("pagination", None) or {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": pages,
+    }
+    return {
+        "items": items,
+        "filters": filters,
+        "pagination": pagination,
+        "summary": summary,
+        "stats": stats,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        **extra,
+    }
+
+
+def _ok_stub(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return {"ok": True}
+
+
+def _none_stub(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+def _list_stub(*args: Any, **kwargs: Any) -> list[Any]:
+    return []
+
+
+def _dict_stub(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return {}
+
+
+def _page_stub(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _empty_page()
+
+
+def _dashboard_scalar(db: Session, sql: str, params: Optional[Dict[str, Any]] = None, default: Any = 0) -> Any:
+    try:
+        value = db.execute(text(sql), params or {}).scalar()
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def _dashboard_count(db: Session, table_name: str, where_sql: str = "", params: Optional[Dict[str, Any]] = None) -> int:
+    where_clause = f" WHERE {where_sql}" if where_sql else ""
+    return int(_dashboard_scalar(db, f"SELECT COUNT(*) FROM {table_name}{where_clause}", params, 0) or 0)
+
+
+def _dashboard_sum(
+    db: Session,
+    table_name: str,
+    expression: str,
+    where_sql: str = "",
+    params: Optional[Dict[str, Any]] = None,
+) -> Decimal:
+    where_clause = f" WHERE {where_sql}" if where_sql else ""
+    value = _dashboard_scalar(db, f"SELECT COALESCE(SUM({expression}), 0) FROM {table_name}{where_clause}", params, 0)
+    try:
+        return Decimal(str(value or "0"))
+    except Exception:
+        return Decimal("0")
+
+
+def _dashboard_money(value: Any, places: int = 2) -> str:
+    try:
+        amount = Decimal(str(value or "0"))
+    except Exception:
+        amount = Decimal("0")
+    quant = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
+    return f"{amount.quantize(quant):,}"
+
+
+def _dashboard_int(value: Any) -> str:
+    try:
+        return f"{int(value or 0):,}"
+    except Exception:
+        return "0"
+
+
+def _dashboard_decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+
+
+def _dashboard_rows(db: Session, sql: str, params: Optional[Dict[str, Any]] = None) -> list[Dict[str, Any]]:
+    try:
+        return [dict(row) for row in db.execute(text(sql), params or {}).mappings().all()]
+    except Exception as exc:
+        logger.warning("[dashboard] query failed: %s", exc)
+        return []
+
+
+def _dashboard_table_exists(db: Session, table_name: str) -> bool:
+    try:
+        return _admin_table_exists(db, table_name)
+    except Exception:
+        return False
+
+
+def _dashboard_first_existing_table(db: Session, table_names: Iterable[str]) -> Optional[str]:
+    for table_name in table_names:
+        if _dashboard_table_exists(db, str(table_name)):
+            return str(table_name)
+    return None
+
+
+def _dashboard_badge(tone: str) -> str:
+    return {
+        "success": "success",
+        "warning": "warning",
+        "danger": "danger",
+        "info": "info",
+        "neutral": "secondary",
+    }.get(str(tone or "").strip().lower(), "secondary")
+
+
+def _dashboard_symbol_sort_key(symbol: Any) -> tuple[int, str]:
+    normalized = str(symbol or "").strip().upper()
+    priority = {"USDT": 0, "USDC": 1, "BTC": 2, "ETH": 3, "RCB": 4}
+    return (priority.get(normalized, 99), normalized)
+
+
+def _dashboard_amount_text(value: Any, symbol: str = "", places: int = 6) -> str:
+    amount = _dashboard_decimal(value)
+    if amount == 0:
+        text_value = "0"
+    else:
+        quant = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
+        text_value = f"{amount.quantize(quant):,}".rstrip("0").rstrip(".")
+    return f"{text_value} {symbol}".strip()
+
+
+WITHDRAW_PENDING_REVIEW_STATUSES = ("REVIEWING", "VERIFYING", "FROZEN")
+WITHDRAW_FAILED_STATUSES = ("FAILED", "SEND_FAILED")
+
+
+def _admin_withdraw_status_values(status: str, status_group: str = "") -> tuple[str, ...]:
+    status_value = str(status or "").strip().upper()
+    group_value = str(status_group or "").strip().upper()
+    lookup_value = group_value or status_value
+    if lookup_value in {"PENDING_REVIEW", "PENDING_REVIEW_GROUP"}:
+        return WITHDRAW_PENDING_REVIEW_STATUSES
+    if lookup_value in {"FAILED_GROUP", "WITHDRAW_FAILED_GROUP"}:
+        return WITHDRAW_FAILED_STATUSES
+    if "," in status_value:
+        return tuple(value.strip().upper() for value in status_value.split(",") if value.strip())
+    return (status_value,) if status_value else ()
+
+
+def _dashboard_single_or_by_coin(rows: list[Dict[str, Any]], amount_key: str, *, fallback_note: str = "按币种查看") -> tuple[str, str]:
+    non_zero_rows = [
+        row
+        for row in rows
+        if _dashboard_decimal(row.get(amount_key)) != 0
+    ]
+    if not non_zero_rows:
+        return "0", ""
+    if len(non_zero_rows) == 1:
+        row = non_zero_rows[0]
+        return _dashboard_amount_text(row.get(amount_key), str(row.get("coin_symbol") or "")), ""
+    usdt_row = next((row for row in non_zero_rows if str(row.get("coin_symbol") or "").upper() == "USDT"), None)
+    note = f"{len(non_zero_rows)} 个币种，{fallback_note}"
+    if usdt_row:
+        return _dashboard_amount_text(usdt_row.get(amount_key), "USDT"), note
+    return fallback_note, note
+
+
+def _dashboard_status_counts(
+    db: Session,
+    table_name: str,
+    *,
+    pending_statuses: Iterable[str],
+    failed_statuses: Iterable[str],
+    time_column: str = "updated_at",
+) -> Dict[str, Any]:
+    if not _dashboard_table_exists(db, table_name):
+        return {"pending": 0, "failed": 0, "last_seen": "-", "available": False}
+    pending_list = tuple(str(status).upper() for status in pending_statuses)
+    failed_list = tuple(str(status).upper() for status in failed_statuses)
+    params: Dict[str, Any] = {}
+    pending_sql = "0"
+    failed_sql = "0"
+    if pending_list:
+        pending_placeholders = []
+        for index, status in enumerate(pending_list):
+            key = f"pending_{index}"
+            params[key] = status
+            pending_placeholders.append(f":{key}")
+        pending_sql = f"SUM(CASE WHEN UPPER(status) IN ({', '.join(pending_placeholders)}) THEN 1 ELSE 0 END)"
+    if failed_list:
+        failed_placeholders = []
+        for index, status in enumerate(failed_list):
+            key = f"failed_{index}"
+            params[key] = status
+            failed_placeholders.append(f":{key}")
+        failed_sql = f"SUM(CASE WHEN UPPER(status) IN ({', '.join(failed_placeholders)}) THEN 1 ELSE 0 END)"
+    time_expr = time_column if time_column else "updated_at"
+    row = db.execute(
+        text(
+            f"""
+            SELECT
+                COALESCE({pending_sql}, 0) AS pending_count,
+                COALESCE({failed_sql}, 0) AS failed_count,
+                MAX({time_expr}) AS last_seen
+            FROM {table_name}
+            """
+        ),
+        params,
+    ).mappings().first()
+    return {
+        "pending": int((row or {}).get("pending_count") or 0),
+        "failed": int((row or {}).get("failed_count") or 0),
+        "last_seen": _dashboard_datetime((row or {}).get("last_seen")),
+        "available": True,
+    }
+
+
+def _admin_timezone(timezone_name: str = ADMIN_OPERATIONS_TIMEZONE) -> ZoneInfo:
+    try:
+        return ZoneInfo(str(timezone_name or ADMIN_OPERATIONS_TIMEZONE))
+    except Exception:
+        return ZoneInfo(ADMIN_OPERATIONS_TIMEZONE)
+
+
+def _to_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _utc_naive_to_admin_time(
+    value: datetime,
+    timezone_name: str = ADMIN_OPERATIONS_TIMEZONE,
+) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(_admin_timezone(timezone_name)).replace(tzinfo=None)
+
+
+def get_admin_today_date(timezone: str = ADMIN_OPERATIONS_TIMEZONE) -> date:
+    return datetime.now(_admin_timezone(timezone)).date()
+
+
+def get_admin_date_time_window(
+    start_date: date,
+    end_date: date,
+    timezone: str = ADMIN_OPERATIONS_TIMEZONE,
+) -> tuple[datetime, datetime]:
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    admin_tz = _admin_timezone(timezone)
+    start_local = datetime.combine(start_date, time.min, tzinfo=admin_tz)
+    end_local = datetime.combine(end_date, time.max, tzinfo=admin_tz)
+    return _to_utc_naive(start_local), _to_utc_naive(end_local)
+
+
+def get_admin_time_window(
+    range_type: Any,
+    timezone: str = ADMIN_OPERATIONS_TIMEZONE,
+) -> tuple[str, datetime, datetime]:
+    normalized = str(range_type or "today").strip().lower()
+    if normalized not in {"today", "yesterday", "7d", "30d"}:
+        normalized = "today"
+    today = get_admin_today_date(timezone)
+    if normalized == "yesterday":
+        start_date = today - timedelta(days=1)
+        end_date = start_date
+    elif normalized == "7d":
+        start_date = today - timedelta(days=6)
+        end_date = today
+    elif normalized == "30d":
+        start_date = today - timedelta(days=29)
+        end_date = today
+    else:
+        start_date = today
+        end_date = today
+    start_utc, end_utc = get_admin_date_time_window(start_date, end_date, timezone)
+    return normalized, start_utc, end_utc
+
+
+def _dashboard_datetime(value: Any) -> str:
+    if isinstance(value, datetime):
+        return _utc_naive_to_admin_time(value).strftime("%Y-%m-%d %H:%M:%S")
+    return str(value or "-")
+
+
+def _dashboard_kpi(
+    label: str,
+    value: Any,
+    *,
+    note: str = "",
+    tone: str = "info",
+    unit: str = "",
+    sub_value: str = "",
+    extra_lines: Optional[list[str]] = None,
+) -> Dict[str, Any]:
+    return {
+        "label": label,
+        "value": str(value),
+        "note": note,
+        "tone": tone,
+        "unit": unit,
+        "sub_value": sub_value,
+        "extra_lines": extra_lines or [],
+    }
+
+
+def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
+    _, today_start, today_end = get_admin_time_window("today")
+    today_params = {"today_start": today_start, "now": today_end}
+    now = datetime.utcnow()
+
+    deposit_table = _dashboard_first_existing_table(db, ("deposit_logs", "deposits"))
+    withdraw_table = _dashboard_first_existing_table(db, ("withdraw_logs", "withdraws"))
+
+    deposit_rows: list[Dict[str, Any]] = []
+    if deposit_table:
+        deposit_rows = _dashboard_rows(
+            db,
+            f"""
+            SELECT
+                UPPER(COALESCE(coin_symbol, '')) AS coin_symbol,
+                COALESCE(SUM(amount), 0) AS deposit_amount,
+                COUNT(*) AS deposit_count
+            FROM {deposit_table}
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+              AND UPPER(status) IN ('SUCCESS', 'SUCCEEDED', 'CONFIRMED', 'COMPLETED', 'CREDITED')
+            GROUP BY UPPER(COALESCE(coin_symbol, ''))
+            """,
+            today_params,
+        )
+
+    withdraw_rows: list[Dict[str, Any]] = []
+    if withdraw_table:
+        withdraw_rows = _dashboard_rows(
+            db,
+            f"""
+            SELECT
+                UPPER(COALESCE(coin_symbol, '')) AS coin_symbol,
+                COALESCE(SUM(CASE WHEN UPPER(status) IN ('SUCCESS', 'SUCCEEDED', 'CONFIRMED', 'COMPLETED') THEN COALESCE(amount, net_amount, 0) ELSE 0 END), 0) AS success_amount,
+                SUM(CASE WHEN UPPER(status) IN ('SUCCESS', 'SUCCEEDED', 'CONFIRMED', 'COMPLETED') THEN 1 ELSE 0 END) AS success_count,
+                COALESCE(SUM(CASE WHEN UPPER(status) IN ('SENDING', 'SENT') THEN COALESCE(amount, net_amount, 0) ELSE 0 END), 0) AS pending_amount,
+                SUM(CASE WHEN UPPER(status) IN ('SENDING', 'SENT') THEN 1 ELSE 0 END) AS pending_count
+            FROM {withdraw_table}
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+            GROUP BY UPPER(COALESCE(coin_symbol, ''))
+            """,
+            today_params,
+        )
+
+    fund_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for row in deposit_rows:
+        symbol = str(row.get("coin_symbol") or "").upper() or "--"
+        fund_by_symbol.setdefault(
+            symbol,
+            {
+                "coin_symbol": symbol,
+                "deposit_amount": Decimal("0"),
+                "deposit_count": 0,
+                "success_withdraw_amount": Decimal("0"),
+                "success_withdraw_count": 0,
+                "pending_withdraw_amount": Decimal("0"),
+                "pending_withdraw_count": 0,
+            },
+        )
+        fund_by_symbol[symbol]["deposit_amount"] = _dashboard_decimal(row.get("deposit_amount"))
+        fund_by_symbol[symbol]["deposit_count"] = int(row.get("deposit_count") or 0)
+
+    for row in withdraw_rows:
+        symbol = str(row.get("coin_symbol") or "").upper() or "--"
+        fund_by_symbol.setdefault(
+            symbol,
+            {
+                "coin_symbol": symbol,
+                "deposit_amount": Decimal("0"),
+                "deposit_count": 0,
+                "success_withdraw_amount": Decimal("0"),
+                "success_withdraw_count": 0,
+                "pending_withdraw_amount": Decimal("0"),
+                "pending_withdraw_count": 0,
+            },
+        )
+        fund_by_symbol[symbol]["success_withdraw_amount"] = _dashboard_decimal(row.get("success_amount"))
+        fund_by_symbol[symbol]["success_withdraw_count"] = int(row.get("success_count") or 0)
+        fund_by_symbol[symbol]["pending_withdraw_amount"] = _dashboard_decimal(row.get("pending_amount"))
+        fund_by_symbol[symbol]["pending_withdraw_count"] = int(row.get("pending_count") or 0)
+
+    fund_flow_rows = []
+    for symbol in sorted(fund_by_symbol, key=_dashboard_symbol_sort_key):
+        item = fund_by_symbol[symbol]
+        surplus = _dashboard_decimal(item["deposit_amount"]) - _dashboard_decimal(item["success_withdraw_amount"])
+        fund_flow_rows.append(
+            {
+                "coin_symbol": symbol,
+                "deposit_amount": _dashboard_amount_text(item["deposit_amount"], symbol),
+                "deposit_count": int(item["deposit_count"] or 0),
+                "success_withdraw_amount": _dashboard_amount_text(item["success_withdraw_amount"], symbol),
+                "success_withdraw_count": int(item["success_withdraw_count"] or 0),
+                "pending_withdraw_amount": _dashboard_amount_text(item["pending_withdraw_amount"], symbol),
+                "pending_withdraw_count": int(item["pending_withdraw_count"] or 0),
+                "surplus_amount": _dashboard_amount_text(surplus, symbol),
+                "surplus_negative": surplus < 0,
+            }
+        )
+
+    total_deposit_by_coin = [
+        {"coin_symbol": row["coin_symbol"], "amount": row["deposit_amount"]}
+        for row in fund_by_symbol.values()
+    ]
+    total_success_withdraw_by_coin = [
+        {"coin_symbol": row["coin_symbol"], "amount": row["success_withdraw_amount"]}
+        for row in fund_by_symbol.values()
+    ]
+    total_net_by_coin = [
+        {
+            "coin_symbol": row["coin_symbol"],
+            "amount": _dashboard_decimal(row["deposit_amount"]) - _dashboard_decimal(row["success_withdraw_amount"]),
+        }
+        for row in fund_by_symbol.values()
+    ]
+    today_deposit_value, today_deposit_note = _dashboard_single_or_by_coin(total_deposit_by_coin, "amount")
+    today_withdraw_value, today_withdraw_note = _dashboard_single_or_by_coin(total_success_withdraw_by_coin, "amount")
+    today_net_value, today_net_note = _dashboard_single_or_by_coin(total_net_by_coin, "amount")
+
+    spot_today = _dashboard_rows(
+        db,
+        """
+        SELECT
+            COALESCE(SUM(COALESCE(quote_amount, price * amount, 0)), 0) AS volume,
+            COUNT(*) AS trade_count,
+            COALESCE(SUM(
+                CASE WHEN UPPER(COALESCE(buyer_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(buyer_fee_amount, 0) ELSE 0 END
+              + CASE WHEN UPPER(COALESCE(seller_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(seller_fee_amount, 0) ELSE 0 END
+              + CASE
+                    WHEN COALESCE(buyer_fee_amount, 0) = 0
+                     AND COALESCE(seller_fee_amount, 0) = 0
+                     AND UPPER(COALESCE(fee_asset_symbol, '')) = 'USDT'
+                    THEN COALESCE(fee_amount, 0)
+                    ELSE 0
+                END
+            ), 0) AS fee_usdt
+        FROM trades
+        WHERE created_at >= :today_start
+          AND created_at <= :now
+        """,
+        today_params,
+    )[0] if _dashboard_table_exists(db, "trades") else {}
+    spot_orders_today = _dashboard_count(db, "orders", "created_at >= :today_start AND created_at <= :now", today_params) if _dashboard_table_exists(db, "orders") else 0
+    dealer_today = _dashboard_rows(
+        db,
+        """
+        SELECT
+            COALESCE(SUM(COALESCE(t.quote_amount, t.price * t.amount, 0)), 0) AS volume,
+            COUNT(*) AS trade_count
+        FROM trades t
+        LEFT JOIN orders bo ON bo.id = t.buy_order_id
+        LEFT JOIN orders so ON so.id = t.sell_order_id
+        WHERE t.created_at >= :today_start
+          AND t.created_at <= :now
+          AND (
+              UPPER(COALESCE(t.counterparty_type, '')) IN ('PLATFORM', 'DEALER')
+              OR UPPER(COALESCE(bo.execution_mode, '')) = 'DEALER'
+              OR UPPER(COALESCE(so.execution_mode, '')) = 'DEALER'
+          )
+        """,
+        today_params,
+    )[0] if _dashboard_table_exists(db, "trades") else {}
+
+    contract_today = _dashboard_rows(
+        db,
+        """
+        SELECT
+            COALESCE(SUM(COALESCE(notional, price * quantity, 0)), 0) AS volume,
+            COUNT(*) AS trade_count,
+            COALESCE(SUM(COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0)), 0) AS fee_usdt
+        FROM contract_trades
+        WHERE created_at >= :today_start
+          AND created_at <= :now
+        """,
+        today_params,
+    )[0] if _dashboard_table_exists(db, "contract_trades") else {}
+    contract_orders_today = _dashboard_count(db, "contract_orders", "created_at >= :today_start AND created_at <= :now", today_params) if _dashboard_table_exists(db, "contract_orders") else 0
+
+    today_spot_fee_usdt = _dashboard_decimal(spot_today.get("fee_usdt"))
+    contract_fee_usdt = _dashboard_decimal(contract_today.get("fee_usdt"))
+    platform_revenue_usdt = _dashboard_sum(
+        db,
+        "trades",
+        "CASE WHEN UPPER(COALESCE(buyer_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(buyer_fee_amount, 0) ELSE 0 END"
+        " + CASE WHEN UPPER(COALESCE(seller_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(seller_fee_amount, 0) ELSE 0 END"
+        " + CASE WHEN COALESCE(buyer_fee_amount, 0) = 0 AND COALESCE(seller_fee_amount, 0) = 0"
+        " AND UPPER(COALESCE(fee_asset_symbol, '')) = 'USDT' THEN COALESCE(fee_amount, 0) ELSE 0 END",
+    ) if _dashboard_table_exists(db, "trades") else Decimal("0")
+    if _dashboard_table_exists(db, "contract_trades"):
+        platform_revenue_usdt += _dashboard_sum(db, "contract_trades", "COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0)")
+
+    anomaly_summary: Dict[str, Any] = {}
+    try:
+        anomaly_summary = admin_query_withdraw_anomalies(db, limit=50).get("summary") or {}
+    except Exception as exc:
+        logger.warning("[dashboard] withdraw anomaly summary failed: %s", exc)
+        anomaly_summary = {}
+
+    pending_withdraws = _dashboard_count(
+        db,
+        withdraw_table,
+        "UPPER(status) IN ('REVIEWING', 'VERIFYING', 'FROZEN')",
+    ) if withdraw_table else 0
+    failed_withdraws = _dashboard_count(db, withdraw_table, "UPPER(status) IN ('FAILED', 'SEND_FAILED')") if withdraw_table else 0
+    precheck_failures = _dashboard_count(
+        db,
+        withdraw_table,
+        "UPPER(COALESCE(fail_reason, '')) LIKE 'PRECHECK:%' AND (tx_hash IS NULL OR tx_hash = '')",
+    ) if withdraw_table else 0
+    kyc_pending = _dashboard_count(db, "kyc_submissions", "UPPER(review_status) = 'PENDING'") if _dashboard_table_exists(db, "kyc_submissions") else 0
+    abnormal_balance_logs = _dashboard_count(
+        db,
+        "balance_logs",
+        "created_at >= :today_start AND created_at <= :now AND UPPER(change_type) IN ('ADMIN_REPAIR', 'ADMIN_ADJUST')",
+        today_params,
+    ) if _dashboard_table_exists(db, "balance_logs") else 0
+    dealer_risk_today = _dashboard_count(db, "dealer_risk_hit_logs", "created_at >= :today_start AND created_at <= :now", today_params) if _dashboard_table_exists(db, "dealer_risk_hit_logs") else 0
+
+    risk_items = [
+        {"label": "待审核提现", "value": pending_withdraws, "note": "REVIEWING / VERIFYING / FROZEN", "href": "/admin/withdraw-reviews?status=PENDING_REVIEW"},
+        {"label": "提现失败", "value": failed_withdraws, "note": "FAILED / SEND_FAILED", "href": "/admin/withdraw-records?status=FAILED_GROUP"},
+        {"label": "预检失败", "value": precheck_failures, "note": "发送前检查失败", "href": "/admin/withdraw-anomalies#precheck-failures"},
+        {"label": "KYC 待处理", "value": kyc_pending, "note": "待审核身份认证", "href": "/admin/kyc/submissions?tab=pending"},
+        {"label": "异常资金流水", "value": abnormal_balance_logs, "note": "今日人工修复/调整", "href": "/admin/balance-logs"},
+        {"label": "Dealer 风控命中", "value": dealer_risk_today, "note": "今日命中风控记录", "href": "/admin/platform/dealer-risk-logs"},
+    ]
+    for item in risk_items:
+        value = int(item.get("value") or 0)
+        item["value_text"] = _dashboard_int(value)
+        item["tone"] = "success" if value <= 0 else ("danger" if item["label"] in {"提现失败", "预检失败"} else "warning")
+        item["badge"] = _dashboard_badge(item["tone"])
+        item["status"] = "正常" if value <= 0 else "待处理"
+
+    def task_row(label: str, table_name: str, pending: Iterable[str], failed: Iterable[str], href: str, time_column: str = "updated_at") -> Dict[str, Any]:
+        try:
+            stats = _dashboard_status_counts(db, table_name, pending_statuses=pending, failed_statuses=failed, time_column=time_column)
+        except Exception as exc:
+            logger.warning("[dashboard] task stats failed table=%s error=%s", table_name, exc)
+            stats = {"pending": 0, "failed": 0, "last_seen": "-", "available": False}
+        failed_count = int(stats.get("failed") or 0)
+        pending_count = int(stats.get("pending") or 0)
+        tone = "danger" if failed_count > 0 else ("warning" if pending_count > 0 else "success")
+        return {
+            "label": label,
+            "pending": pending_count,
+            "failed": failed_count,
+            "last_seen": stats.get("last_seen") or "-",
+            "status": "未接入表" if not stats.get("available") else ("有失败" if failed_count else ("有待处理" if pending_count else "正常")),
+            "tone": tone if stats.get("available") else "neutral",
+            "badge": _dashboard_badge(tone if stats.get("available") else "neutral"),
+            "href": href,
+        }
+
+    def withdraw_fee_task_row() -> Dict[str, Any]:
+        if not _dashboard_table_exists(db, "chains"):
+            return {
+                "label": "提现手续费维护",
+                "pending": 0,
+                "failed": 0,
+                "last_seen": "-",
+                "status": "未接入表",
+                "tone": "neutral",
+                "badge": "secondary",
+                "href": "/admin/asset-configs",
+            }
+        row = _dashboard_rows(
+            db,
+            """
+            SELECT
+                SUM(CASE WHEN enabled = 1 AND withdraw_fee_auto_enabled = 1 THEN 1 ELSE 0 END) AS enabled_count,
+                SUM(CASE WHEN enabled = 1 AND withdraw_fee_auto_enabled = 1 AND NULLIF(withdraw_fee_last_error, '') IS NOT NULL THEN 1 ELSE 0 END) AS failed_count,
+                MAX(withdraw_fee_last_updated_at) AS last_seen
+            FROM chains
+            """,
+        )
+        stats = row[0] if row else {}
+        pending_count = int(stats.get("enabled_count") or 0)
+        failed_count = int(stats.get("failed_count") or 0)
+        tone = "danger" if failed_count > 0 else ("warning" if pending_count > 0 else "success")
+        return {
+            "label": "提现手续费维护",
+            "pending": pending_count,
+            "failed": failed_count,
+            "last_seen": _dashboard_datetime(stats.get("last_seen")),
+            "status": "有错误" if failed_count else ("自动维护启用" if pending_count else "未启用"),
+            "tone": tone,
+            "badge": _dashboard_badge(tone),
+            "href": "/admin/asset-configs",
+        }
+
+    task_center = [
+        task_row("归集任务", "collection_tasks", ("PENDING", "RUNNING", "RETRYING"), ("FAILED",), "/admin/collections/tasks"),
+        task_row("补 Gas", "gas_tasks", ("PENDING", "RUNNING", "RETRYING"), ("FAILED",), "/admin/collections/gas-tasks"),
+        task_row("分红任务", "dividend_pools", ("PENDING", "CALCULATED", "PROCESSING"), ("FAILED",), "/admin/dividends/pools", "updated_at"),
+        task_row("BD 发放", "bd_commission_records", ("PENDING", "PROCESSING"), ("FAILED",), "/admin/bd/commissions"),
+        task_row("邀请发放", "user_invite_commission_records", ("PENDING", "PROCESSING"), ("FAILED",), "/admin/invite/commissions"),
+        task_row("股票锁仓释放", "user_stock_token_locks", ("ACTIVE", "RELEASING"), ("FAILED",), "/admin/stock-token-release-logs", "updated_at"),
+        withdraw_fee_task_row(),
+    ]
+
+    trading_ops = [
+        {"label": "现货成交额", "value": _dashboard_amount_text(spot_today.get("volume"), "USDT", places=2), "note": f"成交 {_dashboard_int(spot_today.get('trade_count'))} 笔"},
+        {"label": "现货订单数", "value": _dashboard_int(spot_orders_today), "note": "今日提交订单"},
+        {"label": "合约成交额", "value": _dashboard_amount_text(contract_today.get("volume"), "USDT", places=2), "note": f"成交 {_dashboard_int(contract_today.get('trade_count'))} 笔"},
+        {"label": "合约订单数", "value": _dashboard_int(contract_orders_today), "note": "今日合约订单"},
+        {"label": "Dealer 成交", "value": _dashboard_amount_text(dealer_today.get("volume"), "USDT", places=2), "note": f"成交 {_dashboard_int(dealer_today.get('trade_count'))} 笔"},
+        {"label": "合约收入", "value": _dashboard_amount_text(contract_fee_usdt, "USDT", places=2), "note": "合约价差费用"},
+        {"label": "手续费收入", "value": _dashboard_amount_text(today_spot_fee_usdt, "USDT", places=2), "note": "今日现货 USDT"},
+    ]
+
+    core_metrics = [
+        {"label": "平台收益", "value": _dashboard_amount_text(platform_revenue_usdt, "USDT", places=2), "note": "累计 USDT 手续费口径", "tone": "total"},
+        {"label": "今日手续费", "value": _dashboard_amount_text(today_spot_fee_usdt, "USDT", places=2), "note": "今日现货 USDT", "tone": "success"},
+        {"label": "今日充值", "value": today_deposit_value, "note": today_deposit_note or "成功到账", "tone": "info"},
+        {"label": "今日提现", "value": today_withdraw_value, "note": today_withdraw_note or "成功提现", "tone": "warning"},
+        {"label": "今日净流入", "value": today_net_value, "note": today_net_note or "充值 - 成功提现", "tone": "success"},
+    ]
+
+    risk_total = sum(int(item.get("value") or 0) for item in risk_items)
+    return {
+        "as_of": f"{_dashboard_datetime(now)} Asia/Shanghai",
+        "statuses": [
+            {"label": "市场同步", "status": "正常", "tone": "success"},
+            {"label": "Redis", "status": "监控页查看", "tone": "info"},
+            {"label": "RQ", "status": "监控页查看", "tone": "info"},
+            {"label": "WebSocket", "status": "运行中", "tone": "success"},
+            {"label": "行情", "status": "运行中", "tone": "success"},
+        ],
+        "core_metrics": core_metrics,
+        "fund_flow_rows": fund_flow_rows,
+        "trading_ops": trading_ops,
+        "risk_items": risk_items,
+        "task_center": task_center,
+        "anomaly_summary": anomaly_summary,
+        "debug_summary": {
+            "today_deposit_coin_count": len([row for row in total_deposit_by_coin if _dashboard_decimal(row.get("amount")) != 0]),
+            "today_withdraw_coin_count": len([row for row in total_success_withdraw_by_coin if _dashboard_decimal(row.get("amount")) != 0]),
+            "today_net_coin_count": len([row for row in total_net_by_coin if _dashboard_decimal(row.get("amount")) != 0]),
+            "risk_pending_total": risk_total,
+            "task_center_count": len(task_center),
+        },
+    }
+
+
+def admin_query_funds_dashboard(db: Session) -> Dict[str, Any]:
+    _, today_start, today_end = get_admin_time_window("today")
+    today_params = {"today_start": today_start, "now": today_end}
+    now = datetime.utcnow()
+
+    deposit_table = _dashboard_first_existing_table(db, ("deposit_logs", "deposits"))
+    withdraw_table = _dashboard_first_existing_table(db, ("withdraw_logs", "withdraws"))
+
+    deposit_rows: list[Dict[str, Any]] = []
+    if deposit_table:
+        deposit_rows = _dashboard_rows(
+            db,
+            f"""
+            SELECT
+                UPPER(COALESCE(coin_symbol, '')) AS coin_symbol,
+                COALESCE(SUM(amount), 0) AS deposit_amount,
+                COUNT(*) AS deposit_count
+            FROM {deposit_table}
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+              AND UPPER(status) IN ('SUCCESS', 'SUCCEEDED', 'CONFIRMED', 'COMPLETED', 'CREDITED')
+            GROUP BY UPPER(COALESCE(coin_symbol, ''))
+            """,
+            today_params,
+        )
+
+    withdraw_rows: list[Dict[str, Any]] = []
+    if withdraw_table:
+        withdraw_rows = _dashboard_rows(
+            db,
+            f"""
+            SELECT
+                UPPER(COALESCE(coin_symbol, '')) AS coin_symbol,
+                COALESCE(SUM(CASE WHEN UPPER(status) IN ('SUCCESS', 'SUCCEEDED', 'CONFIRMED', 'COMPLETED') THEN COALESCE(amount, net_amount, 0) ELSE 0 END), 0) AS success_amount,
+                SUM(CASE WHEN UPPER(status) IN ('SUCCESS', 'SUCCEEDED', 'CONFIRMED', 'COMPLETED') THEN 1 ELSE 0 END) AS success_count,
+                COALESCE(SUM(CASE WHEN UPPER(status) IN ('SENDING', 'SENT') THEN COALESCE(amount, net_amount, 0) ELSE 0 END), 0) AS pending_amount,
+                SUM(CASE WHEN UPPER(status) IN ('SENDING', 'SENT') THEN 1 ELSE 0 END) AS pending_count
+            FROM {withdraw_table}
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+            GROUP BY UPPER(COALESCE(coin_symbol, ''))
+            """,
+            today_params,
+        )
+
+    fund_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for row in deposit_rows:
+        symbol = str(row.get("coin_symbol") or "").upper() or "--"
+        fund_by_symbol.setdefault(
+            symbol,
+            {
+                "coin_symbol": symbol,
+                "deposit_amount": Decimal("0"),
+                "deposit_count": 0,
+                "success_withdraw_amount": Decimal("0"),
+                "success_withdraw_count": 0,
+                "pending_withdraw_amount": Decimal("0"),
+                "pending_withdraw_count": 0,
+            },
+        )
+        fund_by_symbol[symbol]["deposit_amount"] = _dashboard_decimal(row.get("deposit_amount"))
+        fund_by_symbol[symbol]["deposit_count"] = int(row.get("deposit_count") or 0)
+
+    for row in withdraw_rows:
+        symbol = str(row.get("coin_symbol") or "").upper() or "--"
+        fund_by_symbol.setdefault(
+            symbol,
+            {
+                "coin_symbol": symbol,
+                "deposit_amount": Decimal("0"),
+                "deposit_count": 0,
+                "success_withdraw_amount": Decimal("0"),
+                "success_withdraw_count": 0,
+                "pending_withdraw_amount": Decimal("0"),
+                "pending_withdraw_count": 0,
+            },
+        )
+        fund_by_symbol[symbol]["success_withdraw_amount"] = _dashboard_decimal(row.get("success_amount"))
+        fund_by_symbol[symbol]["success_withdraw_count"] = int(row.get("success_count") or 0)
+        fund_by_symbol[symbol]["pending_withdraw_amount"] = _dashboard_decimal(row.get("pending_amount"))
+        fund_by_symbol[symbol]["pending_withdraw_count"] = int(row.get("pending_count") or 0)
+
+    flow_rows = []
+    total_deposit_by_coin = []
+    total_success_withdraw_by_coin = []
+    total_net_by_coin = []
+    for symbol in sorted(fund_by_symbol, key=_dashboard_symbol_sort_key):
+        item = fund_by_symbol[symbol]
+        deposit_amount = _dashboard_decimal(item.get("deposit_amount"))
+        withdraw_amount = _dashboard_decimal(item.get("success_withdraw_amount"))
+        pending_amount = _dashboard_decimal(item.get("pending_withdraw_amount"))
+        net_amount = deposit_amount - withdraw_amount
+        flow_rows.append(
+            {
+                "coin_symbol": symbol,
+                "deposit_amount": _dashboard_amount_text(deposit_amount, symbol),
+                "deposit_count": int(item.get("deposit_count") or 0),
+                "withdraw_amount": _dashboard_amount_text(withdraw_amount, symbol),
+                "withdraw_count": int(item.get("success_withdraw_count") or 0),
+                "pending_amount": _dashboard_amount_text(pending_amount, symbol),
+                "pending_count": int(item.get("pending_withdraw_count") or 0),
+                "net_amount": _dashboard_amount_text(net_amount, symbol),
+                "net_negative": net_amount < 0,
+            }
+        )
+        total_deposit_by_coin.append({"coin_symbol": symbol, "amount": deposit_amount})
+        total_success_withdraw_by_coin.append({"coin_symbol": symbol, "amount": withdraw_amount})
+        total_net_by_coin.append({"coin_symbol": symbol, "amount": net_amount})
+
+    today_deposit_value, today_deposit_note = _dashboard_single_or_by_coin(
+        total_deposit_by_coin,
+        "amount",
+        fallback_note="按币种查看",
+    )
+    today_withdraw_value, today_withdraw_note = _dashboard_single_or_by_coin(
+        total_success_withdraw_by_coin,
+        "amount",
+        fallback_note="按币种查看",
+    )
+    today_net_value, today_net_note = _dashboard_single_or_by_coin(
+        total_net_by_coin,
+        "amount",
+        fallback_note="按币种查看",
+    )
+
+    today_deposit_users = 0
+    if deposit_table:
+        today_deposit_users = _dashboard_count(
+            db,
+            deposit_table,
+            "created_at >= :today_start AND created_at <= :now AND UPPER(status) IN ('SUCCESS', 'SUCCEEDED', 'CONFIRMED', 'COMPLETED', 'CREDITED')",
+            today_params,
+        )
+        try:
+            today_deposit_users = int(
+                _dashboard_scalar(
+                    db,
+                    f"""
+                    SELECT COUNT(DISTINCT user_id)
+                    FROM {deposit_table}
+                    WHERE created_at >= :today_start
+                      AND created_at <= :now
+                      AND UPPER(status) IN ('SUCCESS', 'SUCCEEDED', 'CONFIRMED', 'COMPLETED', 'CREDITED')
+                    """,
+                    today_params,
+                    0,
+                )
+                or 0
+            )
+        except Exception:
+            today_deposit_users = 0
+
+    today_withdraw_users = 0
+    pending_review_count = 0
+    if withdraw_table:
+        try:
+            today_withdraw_users = int(
+                _dashboard_scalar(
+                    db,
+                    f"""
+                    SELECT COUNT(DISTINCT user_id)
+                    FROM {withdraw_table}
+                    WHERE created_at >= :today_start
+                      AND created_at <= :now
+                    """,
+                    today_params,
+                    0,
+                )
+                or 0
+            )
+        except Exception:
+            today_withdraw_users = 0
+        pending_review_count = _dashboard_count(
+            db,
+            withdraw_table,
+            "UPPER(status) IN ('REVIEWING', 'VERIFYING', 'FROZEN')",
+        )
+
+    platform_assets = []
+    if _dashboard_table_exists(db, "user_balances"):
+        rows = _dashboard_rows(
+            db,
+            """
+            SELECT
+                UPPER(COALESCE(coin_symbol, '')) AS coin_symbol,
+                COALESCE(SUM(available_amount), 0) AS available_amount,
+                COALESCE(SUM(frozen_amount), 0) AS frozen_amount
+            FROM user_balances
+            WHERE user_id = :platform_user_id
+              AND (available_amount <> 0 OR frozen_amount <> 0)
+            GROUP BY UPPER(COALESCE(coin_symbol, ''))
+            """,
+            {"platform_user_id": PLATFORM_ACCOUNT_USER_ID},
+        )
+        for row in sorted(rows, key=lambda item: _dashboard_symbol_sort_key(item.get("coin_symbol"))):
+            symbol = str(row.get("coin_symbol") or "").upper() or "--"
+            platform_assets.append(
+                {
+                    "coin_symbol": symbol,
+                    "available_amount": _dashboard_amount_text(row.get("available_amount"), symbol),
+                    "frozen_amount": _dashboard_amount_text(row.get("frozen_amount"), symbol),
+                    "yesterday_change": "--",
+                }
+            )
+
+    deposit_top = []
+    if deposit_table:
+        rows = _dashboard_rows(
+            db,
+            f"""
+            SELECT user_id, UPPER(COALESCE(coin_symbol, '')) AS coin_symbol, amount, created_at
+            FROM {deposit_table}
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+              AND UPPER(status) IN ('SUCCESS', 'SUCCEEDED', 'CONFIRMED', 'COMPLETED', 'CREDITED')
+            ORDER BY amount DESC, created_at DESC, id DESC
+            LIMIT 10
+            """,
+            today_params,
+        )
+        deposit_top = [
+            {
+                "user_id": row.get("user_id"),
+                "coin_symbol": str(row.get("coin_symbol") or "").upper() or "--",
+                "amount": _dashboard_amount_text(row.get("amount"), str(row.get("coin_symbol") or "").upper()),
+                "created_at": _dashboard_datetime(row.get("created_at")),
+            }
+            for row in rows
+        ]
+
+    withdraw_top = []
+    if withdraw_table:
+        rows = _dashboard_rows(
+            db,
+            f"""
+            SELECT user_id, UPPER(COALESCE(coin_symbol, '')) AS coin_symbol, amount, status, created_at
+            FROM {withdraw_table}
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+            ORDER BY amount DESC, created_at DESC, id DESC
+            LIMIT 10
+            """,
+            today_params,
+        )
+        withdraw_top = [
+            {
+                "user_id": row.get("user_id"),
+                "coin_symbol": str(row.get("coin_symbol") or "").upper() or "--",
+                "amount": _dashboard_amount_text(row.get("amount"), str(row.get("coin_symbol") or "").upper()),
+                "status": str(row.get("status") or "-"),
+                "created_at": _dashboard_datetime(row.get("created_at")),
+            }
+            for row in rows
+        ]
+
+    withdraw_status_cards = []
+    if withdraw_table:
+        status_specs = [
+            ("审核中", ("REVIEWING",), "/admin/withdraw-reviews"),
+            ("验证中", ("VERIFYING",), "/admin/withdraw-records?status=VERIFYING"),
+            ("冻结中", ("FROZEN",), "/admin/withdraw-records?status=FROZEN"),
+            ("发送中", ("SENDING", "SENT"), "/admin/withdraw-records?status=SENDING"),
+            ("失败", ("FAILED", "SEND_FAILED"), "/admin/withdraw-records?status=FAILED"),
+        ]
+        for label, statuses, href in status_specs:
+            placeholders = []
+            params: Dict[str, Any] = {}
+            for index, status in enumerate(statuses):
+                key = f"status_{len(withdraw_status_cards)}_{index}"
+                params[key] = status
+                placeholders.append(f":{key}")
+            count = _dashboard_count(
+                db,
+                withdraw_table,
+                f"UPPER(status) IN ({', '.join(placeholders)})",
+                params,
+            )
+            tone = "danger" if label == "失败" and count > 0 else ("warning" if count > 0 else "success")
+            withdraw_status_cards.append(
+                {
+                    "label": label,
+                    "count": count,
+                    "count_text": _dashboard_int(count),
+                    "href": href,
+                    "badge": _dashboard_badge(tone),
+                }
+            )
+    else:
+        for label in ("审核中", "验证中", "冻结中", "发送中", "失败"):
+            withdraw_status_cards.append(
+                {
+                    "label": label,
+                    "count": 0,
+                    "count_text": "0",
+                    "href": "/admin/withdraw-records",
+                    "badge": "secondary",
+                }
+            )
+
+    core_metrics = [
+        {"label": "今日充值", "value": today_deposit_value, "note": today_deposit_note or "成功到账", "tone": "success"},
+        {"label": "今日提现", "value": today_withdraw_value, "note": today_withdraw_note or "成功提现", "tone": "warning"},
+        {"label": "今日净流入", "value": today_net_value, "note": today_net_note or "充值 - 成功提现", "tone": "info"},
+        {"label": "今日充值用户", "value": _dashboard_int(today_deposit_users), "note": "成功充值去重用户", "tone": "success"},
+        {"label": "今日提现用户", "value": _dashboard_int(today_withdraw_users), "note": "今日提交提现去重用户", "tone": "warning"},
+        {"label": "提现待审核", "value": _dashboard_int(pending_review_count), "note": "REVIEWING / VERIFYING / FROZEN", "tone": "danger" if pending_review_count > 0 else "success"},
+    ]
+
+    return {
+        "as_of": f"{_dashboard_datetime(now)} Asia/Shanghai",
+        "core_metrics": core_metrics,
+        "flow_rows": flow_rows,
+        "platform_assets": platform_assets,
+        "deposit_top": deposit_top,
+        "withdraw_top": withdraw_top,
+        "withdraw_status_cards": withdraw_status_cards,
+        "summary": {
+            "deposit_coin_count": len([row for row in total_deposit_by_coin if _dashboard_decimal(row.get("amount")) != 0]),
+            "withdraw_coin_count": len([row for row in total_success_withdraw_by_coin if _dashboard_decimal(row.get("amount")) != 0]),
+            "top10_count": len(deposit_top) + len(withdraw_top),
+            "pending_review_count": pending_review_count,
+            "platform_asset_count": len(platform_assets),
+        },
+    }
+
+
+def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
+    _, today_start, today_end = get_admin_time_window("today")
+    today_params = {"today_start": today_start, "now": today_end}
+    now = datetime.utcnow()
+
+    has_trades = _dashboard_table_exists(db, "trades")
+    has_orders = _dashboard_table_exists(db, "orders")
+    has_pairs = _dashboard_table_exists(db, "trading_pairs")
+    has_assets = _dashboard_table_exists(db, "assets")
+    has_contract_trades = _dashboard_table_exists(db, "contract_trades")
+    has_contract_orders = _dashboard_table_exists(db, "contract_orders")
+    has_liquidations = _dashboard_table_exists(db, "contract_liquidation_records")
+    has_dealer_risk = _dashboard_table_exists(db, "dealer_risk_hit_logs")
+    withdraw_table = _dashboard_first_existing_table(db, ("withdraw_logs", "withdraws"))
+
+    spot_volume_by_coin: list[Dict[str, Any]] = []
+    if has_trades:
+        quote_expr = "UPPER(COALESCE(qa.symbol, 'QUOTE'))" if has_pairs and has_assets else "'QUOTE'"
+        join_expr = (
+            """
+            LEFT JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+            LEFT JOIN assets qa ON qa.id = tp.quote_asset_id
+            """
+            if has_pairs and has_assets
+            else ""
+        )
+        spot_volume_by_coin = _dashboard_rows(
+            db,
+            f"""
+            SELECT
+                {quote_expr} AS coin_symbol,
+                COALESCE(SUM(COALESCE(t.quote_amount, t.price * t.amount, 0)), 0) AS amount,
+                COUNT(*) AS trade_count
+            FROM trades t
+            {join_expr}
+            WHERE t.created_at >= :today_start
+              AND t.created_at <= :now
+            GROUP BY {quote_expr}
+            """,
+            today_params,
+        )
+
+    spot_volume_value, spot_volume_note = _dashboard_single_or_by_coin(
+        [{"coin_symbol": row.get("coin_symbol"), "amount": row.get("amount")} for row in spot_volume_by_coin],
+        "amount",
+        fallback_note="按币种查看",
+    )
+    spot_trade_count = sum(int(row.get("trade_count") or 0) for row in spot_volume_by_coin)
+    spot_order_count = (
+        _dashboard_count(db, "orders", "created_at >= :today_start AND created_at <= :now", today_params)
+        if has_orders
+        else 0
+    )
+
+    contract_today = (
+        _dashboard_rows(
+            db,
+            """
+            SELECT
+                COALESCE(SUM(COALESCE(notional, price * quantity, 0)), 0) AS volume,
+                COUNT(*) AS trade_count,
+                COALESCE(SUM(COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0)), 0) AS fee_amount
+            FROM contract_trades
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+            """,
+            today_params,
+        )[0]
+        if has_contract_trades
+        else {}
+    )
+    contract_order_count = (
+        _dashboard_count(db, "contract_orders", "created_at >= :today_start AND created_at <= :now", today_params)
+        if has_contract_orders
+        else 0
+    )
+
+    fee_rows_raw: list[Dict[str, Any]] = []
+    if has_trades:
+        fee_rows_raw.extend(
+            _dashboard_rows(
+                db,
+                """
+                SELECT '现货手续费' AS source, UPPER(COALESCE(fee_coin, '')) AS fee_coin,
+                       COALESCE(SUM(fee_amount), 0) AS today_amount, COUNT(*) AS today_count
+                FROM (
+                    SELECT buyer_fee_asset_symbol AS fee_coin, buyer_fee_amount AS fee_amount, created_at
+                    FROM trades
+                    WHERE created_at >= :today_start AND created_at <= :now
+                      AND buyer_fee_amount IS NOT NULL AND buyer_fee_amount > 0
+                    UNION ALL
+                    SELECT seller_fee_asset_symbol AS fee_coin, seller_fee_amount AS fee_amount, created_at
+                    FROM trades
+                    WHERE created_at >= :today_start AND created_at <= :now
+                      AND seller_fee_amount IS NOT NULL AND seller_fee_amount > 0
+                    UNION ALL
+                    SELECT fee_asset_symbol AS fee_coin, fee_amount AS fee_amount, created_at
+                    FROM trades
+                    WHERE created_at >= :today_start AND created_at <= :now
+                      AND fee_amount IS NOT NULL AND fee_amount > 0
+                      AND COALESCE(buyer_fee_amount, 0) = 0
+                      AND COALESCE(seller_fee_amount, 0) = 0
+                ) fee_items
+                WHERE COALESCE(fee_coin, '') <> ''
+                GROUP BY UPPER(COALESCE(fee_coin, ''))
+                """,
+                today_params,
+            )
+        )
+
+    fee_structure = []
+    fee_by_coin: Dict[str, Decimal] = {}
+    today_fee_nonzero: list[Dict[str, Any]] = []
+    for row in fee_rows_raw:
+        source = str(row.get("source") or "--")
+        coin = str(row.get("fee_coin") or "--").upper()
+        amount = _dashboard_decimal(row.get("today_amount"))
+        count = int(row.get("today_count") or 0)
+        if amount == 0 and count == 0:
+            continue
+        fee_by_coin[coin] = fee_by_coin.get(coin, Decimal("0")) + amount
+        today_fee_nonzero.append({"coin_symbol": coin, "amount": amount})
+        fee_structure.append(
+            {
+                "source": source,
+                "fee_coin": coin,
+                "today_amount": _dashboard_amount_text(amount, coin),
+                "total_amount": "--",
+                "today_count": count,
+            }
+        )
+    fee_structure.sort(key=lambda row: (str(row.get("source") or ""), _dashboard_symbol_sort_key(row.get("fee_coin"))))
+    fee_value, fee_note = _dashboard_single_or_by_coin(today_fee_nonzero, "amount", fallback_note="按币种查看")
+
+    spot_pair_rows = []
+    if has_trades:
+        pair_expr = "COALESCE(tp.symbol, CONCAT('PAIR#', t.trading_pair_id))" if has_pairs else "CONCAT('PAIR#', t.trading_pair_id)"
+        quote_expr = "UPPER(COALESCE(qa.symbol, 'QUOTE'))" if has_pairs and has_assets else "'QUOTE'"
+        join_expr = (
+            """
+            LEFT JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+            LEFT JOIN assets qa ON qa.id = tp.quote_asset_id
+            """
+            if has_pairs and has_assets
+            else ("LEFT JOIN trading_pairs tp ON tp.id = t.trading_pair_id" if has_pairs else "")
+        )
+        trade_rows = _dashboard_rows(
+            db,
+            f"""
+            SELECT
+                t.trading_pair_id,
+                {pair_expr} AS symbol,
+                {quote_expr} AS quote_symbol,
+                COALESCE(SUM(COALESCE(t.quote_amount, t.price * t.amount, 0)), 0) AS volume,
+                COUNT(*) AS trade_count
+            FROM trades t
+            {join_expr}
+            WHERE t.created_at >= :today_start
+              AND t.created_at <= :now
+            GROUP BY t.trading_pair_id, {pair_expr}, {quote_expr}
+            ORDER BY volume DESC
+            LIMIT 10
+            """,
+            today_params,
+        )
+        order_map = {}
+        if has_orders:
+            order_map = {
+                int(row.get("trading_pair_id") or 0): int(row.get("order_count") or 0)
+                for row in _dashboard_rows(
+                    db,
+                    """
+                    SELECT trading_pair_id, COUNT(*) AS order_count
+                    FROM orders
+                    WHERE created_at >= :today_start
+                      AND created_at <= :now
+                    GROUP BY trading_pair_id
+                    """,
+                    today_params,
+                )
+            }
+        user_map = {
+            int(row.get("trading_pair_id") or 0): int(row.get("user_count") or 0)
+            for row in _dashboard_rows(
+                db,
+                """
+                SELECT trading_pair_id, COUNT(DISTINCT user_id) AS user_count
+                FROM (
+                    SELECT trading_pair_id, buyer_user_id AS user_id
+                    FROM trades
+                    WHERE created_at >= :today_start AND created_at <= :now AND buyer_user_id IS NOT NULL
+                    UNION ALL
+                    SELECT trading_pair_id, seller_user_id AS user_id
+                    FROM trades
+                    WHERE created_at >= :today_start AND created_at <= :now AND seller_user_id IS NOT NULL
+                ) trade_users
+                GROUP BY trading_pair_id
+                """,
+                today_params,
+            )
+        }
+        fee_map: Dict[int, list[str]] = {}
+        fee_pair_rows = _dashboard_rows(
+            db,
+            """
+            SELECT trading_pair_id, UPPER(COALESCE(fee_coin, '')) AS fee_coin, COALESCE(SUM(fee_amount), 0) AS fee_amount
+            FROM (
+                SELECT trading_pair_id, buyer_fee_asset_symbol AS fee_coin, buyer_fee_amount AS fee_amount, created_at
+                FROM trades
+                WHERE created_at >= :today_start AND created_at <= :now
+                  AND buyer_fee_amount IS NOT NULL AND buyer_fee_amount > 0
+                UNION ALL
+                SELECT trading_pair_id, seller_fee_asset_symbol AS fee_coin, seller_fee_amount AS fee_amount, created_at
+                FROM trades
+                WHERE created_at >= :today_start AND created_at <= :now
+                  AND seller_fee_amount IS NOT NULL AND seller_fee_amount > 0
+                UNION ALL
+                SELECT trading_pair_id, fee_asset_symbol AS fee_coin, fee_amount AS fee_amount, created_at
+                FROM trades
+                WHERE created_at >= :today_start AND created_at <= :now
+                  AND fee_amount IS NOT NULL AND fee_amount > 0
+                  AND COALESCE(buyer_fee_amount, 0) = 0
+                  AND COALESCE(seller_fee_amount, 0) = 0
+            ) fee_items
+            WHERE COALESCE(fee_coin, '') <> ''
+            GROUP BY trading_pair_id, UPPER(COALESCE(fee_coin, ''))
+            """,
+            today_params,
+        )
+        for row in fee_pair_rows:
+            pair_id = int(row.get("trading_pair_id") or 0)
+            coin = str(row.get("fee_coin") or "").upper()
+            fee_map.setdefault(pair_id, []).append(_dashboard_amount_text(row.get("fee_amount"), coin))
+        for row in trade_rows:
+            pair_id = int(row.get("trading_pair_id") or 0)
+            quote = str(row.get("quote_symbol") or "QUOTE").upper()
+            spot_pair_rows.append(
+                {
+                    "symbol": row.get("symbol") or f"PAIR#{pair_id}",
+                    "volume": _dashboard_amount_text(row.get("volume"), quote, places=2),
+                    "trade_count": int(row.get("trade_count") or 0),
+                    "order_count": int(order_map.get(pair_id, 0)),
+                    "user_count": int(user_map.get(pair_id, 0)),
+                    "fee": " / ".join(fee_map.get(pair_id) or []) or "--",
+                }
+            )
+
+    contract_symbol_rows = []
+    if has_contract_trades:
+        trade_rows = _dashboard_rows(
+            db,
+            """
+            SELECT
+                symbol,
+                COALESCE(SUM(COALESCE(notional, price * quantity, 0)), 0) AS volume,
+                COUNT(*) AS trade_count,
+                COUNT(DISTINCT user_id) AS user_count,
+                COALESCE(SUM(COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0)), 0) AS fee_amount
+            FROM contract_trades
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+            GROUP BY symbol
+            ORDER BY volume DESC
+            LIMIT 10
+            """,
+            today_params,
+        )
+        order_map = {}
+        if has_contract_orders:
+            order_map = {
+                str(row.get("symbol") or ""): int(row.get("order_count") or 0)
+                for row in _dashboard_rows(
+                    db,
+                    """
+                    SELECT symbol, COUNT(*) AS order_count
+                    FROM contract_orders
+                    WHERE created_at >= :today_start
+                      AND created_at <= :now
+                    GROUP BY symbol
+                    """,
+                    today_params,
+                )
+            }
+        liquidation_map = {}
+        if has_liquidations:
+            liquidation_map = {
+                str(row.get("symbol") or ""): int(row.get("liquidation_count") or 0)
+                for row in _dashboard_rows(
+                    db,
+                    """
+                    SELECT symbol, COUNT(*) AS liquidation_count
+                    FROM contract_liquidation_records
+                    WHERE created_at >= :today_start
+                      AND created_at <= :now
+                    GROUP BY symbol
+                    """,
+                    today_params,
+                )
+            }
+        for row in trade_rows:
+            symbol = str(row.get("symbol") or "--")
+            contract_symbol_rows.append(
+                {
+                    "symbol": symbol,
+                    "volume": _dashboard_amount_text(row.get("volume"), "USDT", places=2),
+                    "trade_count": int(row.get("trade_count") or 0),
+                    "order_count": int(order_map.get(symbol, 0)),
+                    "user_count": int(row.get("user_count") or 0),
+                    "fee": _dashboard_amount_text(row.get("fee_amount"), "USDT"),
+                    "liquidation_count": int(liquidation_map.get(symbol, 0)),
+                }
+            )
+
+    dealer_fee_by_coin: Dict[str, Decimal] = {}
+    dealer_stats = {
+        "volume": "0 USDT",
+        "trade_count": "0",
+        "buy_volume": "0 USDT",
+        "sell_volume": "0 USDT",
+        "fee": "--",
+        "risk_hit_count": "0",
+        "reliable_profit": "--",
+        "profit_note": "当前无可靠 Dealer 收益字段",
+    }
+    if has_trades:
+        dealer_order_join_sql = ""
+        dealer_scope_expr = "UPPER(COALESCE(t.counterparty_type, '')) IN ('PLATFORM', 'DEALER')"
+        dealer_order_side_expr = "''"
+        if has_orders:
+            dealer_order_join_sql = """
+                LEFT JOIN orders bo ON bo.id = t.buy_order_id
+                LEFT JOIN orders so ON so.id = t.sell_order_id
+            """
+            dealer_scope_expr = (
+                f"({dealer_scope_expr} "
+                "OR UPPER(COALESCE(bo.execution_mode, '')) = 'DEALER' "
+                "OR UPPER(COALESCE(so.execution_mode, '')) = 'DEALER')"
+            )
+            dealer_order_side_expr = "UPPER(COALESCE(bo.side, so.side, ''))"
+        dealer_row = (
+            _dashboard_rows(
+                db,
+                f"""
+                SELECT
+                    COALESCE(SUM(COALESCE(t.quote_amount, t.price * t.amount, 0)), 0) AS volume,
+                    COUNT(*) AS trade_count,
+                    COALESCE(SUM(CASE WHEN {dealer_order_side_expr} = 'BUY' THEN COALESCE(t.quote_amount, t.price * t.amount, 0) ELSE 0 END), 0) AS buy_volume,
+                    COALESCE(SUM(CASE WHEN {dealer_order_side_expr} = 'SELL' THEN COALESCE(t.quote_amount, t.price * t.amount, 0) ELSE 0 END), 0) AS sell_volume
+                FROM trades t
+                {dealer_order_join_sql}
+                WHERE t.created_at >= :today_start
+                  AND t.created_at <= :now
+                  AND {dealer_scope_expr}
+                """,
+                today_params,
+            )
+            or [{}]
+        )[0]
+        for row in _dashboard_rows(
+            db,
+            f"""
+            SELECT UPPER(COALESCE(fee_coin, '')) AS fee_coin, COALESCE(SUM(fee_amount), 0) AS fee_amount
+            FROM (
+                SELECT t.buyer_fee_asset_symbol AS fee_coin, t.buyer_fee_amount AS fee_amount
+                FROM trades t
+                {dealer_order_join_sql}
+                WHERE t.created_at >= :today_start AND t.created_at <= :now
+                  AND {dealer_scope_expr}
+                  AND t.buyer_fee_amount IS NOT NULL AND t.buyer_fee_amount > 0
+                UNION ALL
+                SELECT t.seller_fee_asset_symbol AS fee_coin, t.seller_fee_amount AS fee_amount
+                FROM trades t
+                {dealer_order_join_sql}
+                WHERE t.created_at >= :today_start AND t.created_at <= :now
+                  AND {dealer_scope_expr}
+                  AND t.seller_fee_amount IS NOT NULL AND t.seller_fee_amount > 0
+                UNION ALL
+                SELECT t.fee_asset_symbol AS fee_coin, t.fee_amount AS fee_amount
+                FROM trades t
+                {dealer_order_join_sql}
+                WHERE t.created_at >= :today_start AND t.created_at <= :now
+                  AND {dealer_scope_expr}
+                  AND t.fee_amount IS NOT NULL AND t.fee_amount > 0
+                  AND COALESCE(t.buyer_fee_amount, 0) = 0
+                  AND COALESCE(t.seller_fee_amount, 0) = 0
+            ) fee_items
+            WHERE COALESCE(fee_coin, '') <> ''
+            GROUP BY UPPER(COALESCE(fee_coin, ''))
+            """,
+            today_params,
+        ):
+            coin = str(row.get("fee_coin") or "").upper()
+            if coin:
+                dealer_fee_by_coin[coin] = dealer_fee_by_coin.get(coin, Decimal("0")) + _dashboard_decimal(row.get("fee_amount"))
+        dealer_stats.update(
+            {
+                "volume": _dashboard_amount_text(dealer_row.get("volume"), "USDT", places=2),
+                "trade_count": _dashboard_int(dealer_row.get("trade_count")),
+                "buy_volume": _dashboard_amount_text(dealer_row.get("buy_volume"), "USDT", places=2),
+                "sell_volume": _dashboard_amount_text(dealer_row.get("sell_volume"), "USDT", places=2),
+                "fee": " / ".join(
+                    _dashboard_amount_text(amount, coin)
+                    for coin, amount in sorted(dealer_fee_by_coin.items(), key=lambda item: _dashboard_symbol_sort_key(item[0]))
+                ) or "--",
+            }
+        )
+    if has_dealer_risk:
+        risk_count = _dashboard_count(
+            db,
+            "dealer_risk_hit_logs",
+            "created_at >= :today_start AND created_at <= :now",
+            today_params,
+        )
+        dealer_stats["risk_hit_count"] = _dashboard_int(risk_count)
+
+    trading_top_rows = []
+    top_sql_parts = []
+    if has_trades:
+        top_quote_expr = "UPPER(COALESCE(qa.symbol, 'QUOTE'))" if has_pairs and has_assets else "'QUOTE'"
+        top_join_expr = (
+            """
+            LEFT JOIN trading_pairs tp ON tp.id = trades.trading_pair_id
+            LEFT JOIN assets qa ON qa.id = tp.quote_asset_id
+            """
+            if has_pairs and has_assets
+            else ""
+        )
+        top_sql_parts.extend(
+            [
+                f"""
+                SELECT buyer_user_id AS user_id, {top_quote_expr} AS coin_symbol,
+                       COALESCE(quote_amount, price * amount, 0) AS volume, 1 AS trade_count, trades.created_at
+                FROM trades
+                {top_join_expr}
+                WHERE trades.created_at >= :today_start AND trades.created_at <= :now AND buyer_user_id IS NOT NULL
+                """,
+                f"""
+                SELECT seller_user_id AS user_id, {top_quote_expr} AS coin_symbol,
+                       COALESCE(quote_amount, price * amount, 0) AS volume, 1 AS trade_count, trades.created_at
+                FROM trades
+                {top_join_expr}
+                WHERE trades.created_at >= :today_start AND trades.created_at <= :now AND seller_user_id IS NOT NULL
+                """,
+            ]
+        )
+    if has_contract_trades:
+        top_sql_parts.append(
+            """
+            SELECT user_id, 'USDT' AS coin_symbol, COALESCE(notional, price * quantity, 0) AS volume, 1 AS trade_count, created_at
+            FROM contract_trades
+            WHERE created_at >= :today_start AND created_at <= :now AND user_id IS NOT NULL
+            """
+        )
+    if top_sql_parts:
+        trading_top_raw = _dashboard_rows(
+            db,
+            f"""
+            SELECT user_id, coin_symbol, COALESCE(SUM(volume), 0) AS volume, COALESCE(SUM(trade_count), 0) AS trade_count, MAX(created_at) AS last_trade_at
+            FROM ({' UNION ALL '.join(top_sql_parts)}) trade_items
+            GROUP BY user_id, coin_symbol
+            ORDER BY volume DESC
+            LIMIT 10
+            """,
+            today_params,
+        )
+        trading_top_fee: Dict[int, list[str]] = {}
+        fee_top_parts = []
+        if has_trades:
+            fee_top_parts.extend(
+                [
+                    """
+                    SELECT buyer_user_id AS user_id, buyer_fee_asset_symbol AS fee_coin, buyer_fee_amount AS fee_amount, created_at
+                    FROM trades
+                    WHERE created_at >= :today_start AND created_at <= :now
+                      AND buyer_user_id IS NOT NULL AND buyer_fee_amount IS NOT NULL AND buyer_fee_amount > 0
+                    """,
+                    """
+                    SELECT seller_user_id AS user_id, seller_fee_asset_symbol AS fee_coin, seller_fee_amount AS fee_amount, created_at
+                    FROM trades
+                    WHERE created_at >= :today_start AND created_at <= :now
+                      AND seller_user_id IS NOT NULL AND seller_fee_amount IS NOT NULL AND seller_fee_amount > 0
+                    """,
+                ]
+            )
+        if has_contract_trades:
+            fee_top_parts.append(
+                """
+                SELECT user_id, 'USDT' AS fee_coin, COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0) AS fee_amount, created_at
+                FROM contract_trades
+                WHERE created_at >= :today_start AND created_at <= :now
+                  AND user_id IS NOT NULL AND COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0) > 0
+                """
+            )
+        if fee_top_parts:
+            for row in _dashboard_rows(
+                db,
+                f"""
+                SELECT user_id, UPPER(COALESCE(fee_coin, '')) AS fee_coin, COALESCE(SUM(fee_amount), 0) AS fee_amount
+                FROM ({' UNION ALL '.join(fee_top_parts)}) fee_items
+                WHERE COALESCE(fee_coin, '') <> ''
+                GROUP BY user_id, UPPER(COALESCE(fee_coin, ''))
+                """,
+                today_params,
+            ):
+                user_id = int(row.get("user_id") or 0)
+                coin = str(row.get("fee_coin") or "").upper()
+                trading_top_fee.setdefault(user_id, []).append(_dashboard_amount_text(row.get("fee_amount"), coin))
+        for row in trading_top_raw:
+            user_id = int(row.get("user_id") or 0)
+            trading_top_rows.append(
+                {
+                    "user_id": user_id,
+                    "volume": _dashboard_amount_text(row.get("volume"), str(row.get("coin_symbol") or "").upper(), places=2),
+                    "trade_count": int(row.get("trade_count") or 0),
+                    "fee": " / ".join(trading_top_fee.get(user_id) or []) or "--",
+                    "last_trade_at": _dashboard_datetime(row.get("last_trade_at")),
+                }
+            )
+
+    fee_top_rows = []
+    fee_top_parts = []
+    if has_trades:
+        fee_top_parts.extend(
+            [
+                """
+                SELECT buyer_user_id AS user_id, buyer_fee_asset_symbol AS fee_coin, buyer_fee_amount AS fee_amount, '现货' AS source, created_at
+                FROM trades
+                WHERE created_at >= :today_start AND created_at <= :now
+                  AND buyer_user_id IS NOT NULL AND buyer_fee_amount IS NOT NULL AND buyer_fee_amount > 0
+                """,
+                """
+                SELECT seller_user_id AS user_id, seller_fee_asset_symbol AS fee_coin, seller_fee_amount AS fee_amount, '现货' AS source, created_at
+                FROM trades
+                WHERE created_at >= :today_start AND created_at <= :now
+                  AND seller_user_id IS NOT NULL AND seller_fee_amount IS NOT NULL AND seller_fee_amount > 0
+                """,
+            ]
+        )
+    if has_contract_trades:
+        fee_top_parts.append(
+            """
+            SELECT user_id, 'USDT' AS fee_coin, COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0) AS fee_amount, '合约' AS source, created_at
+            FROM contract_trades
+            WHERE created_at >= :today_start AND created_at <= :now
+              AND user_id IS NOT NULL AND COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0) > 0
+            """
+        )
+    if fee_top_parts:
+        rows = _dashboard_rows(
+            db,
+            f"""
+            SELECT user_id, UPPER(COALESCE(fee_coin, '')) AS fee_coin, source,
+                   COALESCE(SUM(fee_amount), 0) AS fee_amount, MAX(created_at) AS last_trade_at
+            FROM ({' UNION ALL '.join(fee_top_parts)}) fee_items
+            WHERE COALESCE(fee_coin, '') <> ''
+            GROUP BY user_id, UPPER(COALESCE(fee_coin, '')), source
+            ORDER BY fee_amount DESC
+            LIMIT 10
+            """,
+            today_params,
+        )
+        fee_top_rows = [
+            {
+                "user_id": row.get("user_id"),
+                "fee_coin": str(row.get("fee_coin") or "--").upper(),
+                "fee_amount": _dashboard_amount_text(row.get("fee_amount"), str(row.get("fee_coin") or "").upper()),
+                "source": row.get("source") or "--",
+                "last_trade_at": _dashboard_datetime(row.get("last_trade_at")),
+            }
+            for row in rows
+        ]
+
+    trading_user_count = 0
+    user_parts = []
+    if has_trades:
+        user_parts.extend(
+            [
+                "SELECT buyer_user_id AS user_id FROM trades WHERE created_at >= :today_start AND created_at <= :now AND buyer_user_id IS NOT NULL",
+                "SELECT seller_user_id AS user_id FROM trades WHERE created_at >= :today_start AND created_at <= :now AND seller_user_id IS NOT NULL",
+            ]
+        )
+    if has_contract_trades:
+        user_parts.append(
+            "SELECT user_id FROM contract_trades WHERE created_at >= :today_start AND created_at <= :now AND user_id IS NOT NULL"
+        )
+    if user_parts:
+        try:
+            trading_user_count = int(
+                _dashboard_scalar(
+                    db,
+                    f"SELECT COUNT(DISTINCT user_id) FROM ({' UNION ALL '.join(user_parts)}) users_today",
+                    today_params,
+                    0,
+                )
+                or 0
+            )
+        except Exception:
+            trading_user_count = 0
+
+    core_metrics = [
+        {"label": "今日现货成交额", "value": spot_volume_value, "note": spot_volume_note or "按 quote_amount 统计", "tone": "success"},
+        {"label": "今日现货订单数", "value": _dashboard_int(spot_order_count), "note": f"成交 {_dashboard_int(spot_trade_count)} 笔", "tone": "info"},
+        {"label": "今日合约成交额", "value": _dashboard_amount_text(contract_today.get("volume"), "USDT", places=2), "note": "按 notional 统计", "tone": "success"},
+        {"label": "今日合约订单数", "value": _dashboard_int(contract_order_count), "note": f"成交 {_dashboard_int(contract_today.get('trade_count'))} 笔", "tone": "info"},
+        {"label": "今日现货手续费", "value": fee_value, "note": fee_note or "按支付币种分开展示", "tone": "warning"},
+        {"label": "今日合约收入", "value": _dashboard_amount_text(contract_today.get("fee_amount"), "USDT"), "note": "合约价差费用", "tone": "warning"},
+        {"label": "今日交易用户数", "value": _dashboard_int(trading_user_count), "note": "现货买卖双方 + 合约去重", "tone": "info"},
+    ]
+
+    return {
+        "as_of": f"{_dashboard_datetime(now)} Asia/Shanghai",
+        "core_metrics": core_metrics,
+        "fee_structure": fee_structure,
+        "spot_pairs": spot_pair_rows,
+        "contract_symbols": contract_symbol_rows,
+        "dealer": dealer_stats,
+        "trading_top": trading_top_rows,
+        "fee_top": fee_top_rows,
+        "summary": {
+            "spot_volume_item_count": len([row for row in spot_pair_rows if row.get("volume")]),
+            "contract_volume_item_count": len([row for row in contract_symbol_rows if row.get("volume")]),
+            "fee_coin_count": len([coin for coin, amount in fee_by_coin.items() if amount != 0]),
+            "trading_top_count": len(trading_top_rows),
+            "fee_top_count": len(fee_top_rows),
+            "dealer_has_reliable_profit_field": False,
+        },
+    }
+
+
+def admin_query_risk_dashboard(db: Session) -> Dict[str, Any]:
+    _, today_start, today_end = get_admin_time_window("today")
+    today_params = {"today_start": today_start, "now": today_end}
+    now = datetime.utcnow()
+
+    withdraw_table = _dashboard_first_existing_table(db, ("withdraw_logs", "withdraws"))
+    has_dealer_risk = _dashboard_table_exists(db, "dealer_risk_hit_logs")
+    has_liquidations = _dashboard_table_exists(db, "contract_liquidation_records")
+    has_positions = _dashboard_table_exists(db, "contract_positions")
+    has_balance_logs = _dashboard_table_exists(db, "balance_logs")
+    has_adjust_logs = _dashboard_table_exists(db, "admin_balance_adjust_logs")
+
+    withdraw_risk_rows = []
+    withdraw_counts: Dict[str, int] = {}
+    precheck_failed_count = 0
+    pending_withdraw_count = 0
+    failed_withdraw_count = 0
+    if withdraw_table:
+        status_specs = [
+            ("REVIEWING", ("REVIEWING",), "/admin/withdraw-reviews"),
+            ("VERIFYING", ("VERIFYING",), "/admin/withdraw-records?status=VERIFYING"),
+            ("FROZEN", ("FROZEN",), "/admin/withdraw-records?status=FROZEN"),
+            ("SENDING / SENT", ("SENDING", "SENT"), "/admin/withdraw-records?status=SENDING"),
+            ("FAILED", ("FAILED", "SEND_FAILED"), "/admin/withdraw-records?status=FAILED"),
+        ]
+        for label, statuses, href in status_specs:
+            params: Dict[str, Any] = {}
+            placeholders = []
+            for index, status in enumerate(statuses):
+                key = f"withdraw_status_{len(withdraw_risk_rows)}_{index}"
+                params[key] = status
+                placeholders.append(f":{key}")
+            rows = _dashboard_rows(
+                db,
+                f"""
+                SELECT
+                    UPPER(COALESCE(coin_symbol, '')) AS coin_symbol,
+                    COUNT(*) AS item_count,
+                    COALESCE(SUM(COALESCE(amount, net_amount, 0)), 0) AS amount_sum,
+                    MAX(updated_at) AS latest_at
+                FROM {withdraw_table}
+                WHERE UPPER(status) IN ({', '.join(placeholders)})
+                GROUP BY UPPER(COALESCE(coin_symbol, ''))
+                """,
+                params,
+            )
+            count = sum(int(row.get("item_count") or 0) for row in rows)
+            amount_text, amount_note = _dashboard_single_or_by_coin(
+                [{"coin_symbol": row.get("coin_symbol"), "amount": row.get("amount_sum")} for row in rows],
+                "amount",
+                fallback_note="按币种查看",
+            )
+            latest_values = [
+                row.get("latest_at")
+                for row in rows
+                if row.get("latest_at") is not None
+            ]
+            latest_at = max(latest_values) if latest_values else None
+            withdraw_counts[label] = count
+            pending_withdraw_count += count if label in {"REVIEWING", "VERIFYING", "FROZEN"} else 0
+            failed_withdraw_count += count if label == "FAILED" else 0
+            withdraw_risk_rows.append(
+                {
+                    "status": label,
+                    "count": count,
+                    "amount": amount_text,
+                    "amount_note": amount_note,
+                    "latest_at": _dashboard_datetime(latest_at),
+                    "href": href,
+                    "badge": "danger" if label == "FAILED" and count > 0 else ("warning" if count > 0 else "success"),
+                }
+            )
+
+        precheck_rows = _dashboard_rows(
+            db,
+            f"""
+            SELECT
+                UPPER(COALESCE(coin_symbol, '')) AS coin_symbol,
+                COUNT(*) AS item_count,
+                COALESCE(SUM(COALESCE(amount, net_amount, 0)), 0) AS amount_sum,
+                MAX(updated_at) AS latest_at
+            FROM {withdraw_table}
+            WHERE UPPER(COALESCE(fail_reason, '')) LIKE 'PRECHECK:%'
+              AND (tx_hash IS NULL OR tx_hash = '')
+            GROUP BY UPPER(COALESCE(coin_symbol, ''))
+            """,
+        )
+        precheck_failed_count = sum(int(row.get("item_count") or 0) for row in precheck_rows)
+        precheck_amount_text, precheck_amount_note = _dashboard_single_or_by_coin(
+            [{"coin_symbol": row.get("coin_symbol"), "amount": row.get("amount_sum")} for row in precheck_rows],
+            "amount",
+            fallback_note="按币种查看",
+        )
+        precheck_latest_values = [
+            row.get("latest_at")
+            for row in precheck_rows
+            if row.get("latest_at") is not None
+        ]
+        precheck_latest_at = max(precheck_latest_values) if precheck_latest_values else None
+        withdraw_risk_rows.append(
+            {
+                "status": "PRECHECK_FAILED",
+                "count": precheck_failed_count,
+                "amount": precheck_amount_text,
+                "amount_note": precheck_amount_note,
+                "latest_at": _dashboard_datetime(precheck_latest_at),
+                "href": "/admin/withdraw-anomalies#precheck-failures",
+                "badge": "danger" if precheck_failed_count > 0 else "success",
+            }
+        )
+
+    dealer_risk_rows = []
+    dealer_risk_today = 0
+    if has_dealer_risk:
+        rows = _dashboard_rows(
+            db,
+            """
+            SELECT
+                COALESCE(risk_type, 'UNKNOWN') AS risk_type,
+                COUNT(*) AS hit_count,
+                COUNT(DISTINCT user_id) AS user_count,
+                MAX(created_at) AS latest_at
+            FROM dealer_risk_hit_logs
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+            GROUP BY COALESCE(risk_type, 'UNKNOWN')
+            ORDER BY hit_count DESC, latest_at DESC
+            LIMIT 20
+            """,
+            today_params,
+        )
+        for row in rows:
+            count = int(row.get("hit_count") or 0)
+            dealer_risk_today += count
+            dealer_risk_rows.append(
+                {
+                    "risk_type": row.get("risk_type") or "UNKNOWN",
+                    "hit_count": count,
+                    "user_count": int(row.get("user_count") or 0),
+                    "latest_at": _dashboard_datetime(row.get("latest_at")),
+                    "status": "需关注" if count > 0 else "正常",
+                    "badge": "warning" if count > 0 else "success",
+                }
+            )
+
+    liquidation_count = 0
+    liquidation_notional = Decimal("0")
+    recent_liquidations = []
+    if has_liquidations:
+        liq_row = (
+            _dashboard_rows(
+                db,
+                """
+                SELECT
+                    COUNT(*) AS item_count,
+                    COALESCE(SUM(COALESCE(mark_price, 0) * COALESCE(quantity, 0)), 0) AS notional_sum
+                FROM contract_liquidation_records
+                WHERE created_at >= :today_start
+                  AND created_at <= :now
+                """,
+                today_params,
+            )
+            or [{}]
+        )[0]
+        liquidation_count = int(liq_row.get("item_count") or 0)
+        liquidation_notional = _dashboard_decimal(liq_row.get("notional_sum"))
+        recent_liquidations = [
+            {
+                "id": row.get("id"),
+                "user_id": row.get("user_id"),
+                "symbol": row.get("symbol") or "--",
+                "side": row.get("side") or "--",
+                "notional": _dashboard_amount_text(
+                    _dashboard_decimal(row.get("mark_price")) * _dashboard_decimal(row.get("quantity")),
+                    "USDT",
+                    places=2,
+                ),
+                "status": row.get("status") or "--",
+                "created_at": _dashboard_datetime(row.get("created_at")),
+            }
+            for row in _dashboard_rows(
+                db,
+                """
+                SELECT id, user_id, symbol, side, mark_price, quantity, status, created_at
+                FROM contract_liquidation_records
+                WHERE created_at >= :today_start
+                  AND created_at <= :now
+                ORDER BY created_at DESC, id DESC
+                LIMIT 5
+                """,
+                today_params,
+            )
+        ]
+
+    risk_position_count = 0
+    if has_positions:
+        risk_position_count = _dashboard_count(
+            db,
+            "contract_positions",
+            "UPPER(status) = 'OPEN' AND COALESCE(quantity, 0) > 0 AND (COALESCE(is_liquidatable, 0) = 1 OR liquidation_price IS NOT NULL OR warning_price IS NOT NULL)",
+        )
+
+    task_rows = []
+    task_failed_total = 0
+    try:
+        rq_status = admin_query_rq_status()
+        for queue in rq_status.get("queues") or []:
+            name = str(queue.get("name") or "-")
+            failed_count = int(queue.get("failed_count") or 0)
+            pending_count = int(queue.get("queued_count") or 0) + int(queue.get("started_count") or 0) + int(queue.get("deferred_count") or 0)
+            task_failed_total += failed_count
+            failed_jobs = queue.get("failed_jobs") or []
+            latest_failed = failed_jobs[0].get("ended_at") if failed_jobs else "-"
+            tone = "danger" if failed_count > 0 else ("warning" if pending_count > 0 else "success")
+            task_rows.append(
+                {
+                    "name": name,
+                    "failed_count": failed_count,
+                    "pending_count": pending_count,
+                    "latest_failed_at": latest_failed or "-",
+                    "status": queue.get("status_label") or ("有失败" if failed_count else "正常"),
+                    "badge": _dashboard_badge(tone),
+                }
+            )
+    except Exception as exc:
+        logger.warning("[risk_dashboard] rq summary failed: %s", exc)
+        task_rows = []
+        task_failed_total = 0
+
+    task_table_specs = [
+        ("collection", "collection_tasks", ("PENDING", "RUNNING", "RETRYING"), ("FAILED",), "updated_at"),
+        ("gas", "gas_tasks", ("PENDING", "RUNNING", "RETRYING"), ("FAILED",), "updated_at"),
+        ("maintenance", "dividend_pools", ("PENDING", "CALCULATED", "PROCESSING"), ("FAILED",), "updated_at"),
+        ("payout", "bd_commission_records", ("PENDING", "PROCESSING"), ("FAILED",), "updated_at"),
+        ("release", "user_stock_token_locks", ("ACTIVE", "RELEASING"), ("FAILED",), "updated_at"),
+    ]
+    known_task_names = {str(row.get("name") or "") for row in task_rows}
+    for name, table_name, pending_statuses, failed_statuses, time_column in task_table_specs:
+        if name in known_task_names or not _dashboard_table_exists(db, table_name):
+            continue
+        try:
+            stats = _dashboard_status_counts(
+                db,
+                table_name,
+                pending_statuses=pending_statuses,
+                failed_statuses=failed_statuses,
+                time_column=time_column,
+            )
+        except Exception:
+            stats = {"pending": 0, "failed": 0, "last_seen": "-", "available": False}
+        failed_count = int(stats.get("failed") or 0)
+        pending_count = int(stats.get("pending") or 0)
+        task_failed_total += failed_count
+        tone = "danger" if failed_count > 0 else ("warning" if pending_count > 0 else "success")
+        task_rows.append(
+            {
+                "name": name,
+                "failed_count": failed_count,
+                "pending_count": pending_count,
+                "latest_failed_at": stats.get("last_seen") or "-",
+                "status": "有失败" if failed_count else ("有待处理" if pending_count else "正常"),
+                "badge": _dashboard_badge(tone),
+            }
+        )
+
+    large_negative_rows = []
+    frequent_balance_users = []
+    adjustment_count = 0
+    adjustment_rows = []
+    if has_balance_logs:
+        large_negative_rows = [
+            {
+                "id": row.get("id"),
+                "user_id": row.get("user_id"),
+                "coin_symbol": row.get("coin_symbol") or "--",
+                "change_type": row.get("change_type") or "--",
+                "amount": _dashboard_amount_text(row.get("abs_amount"), row.get("coin_symbol") or ""),
+                "created_at": _dashboard_datetime(row.get("created_at")),
+            }
+            for row in _dashboard_rows(
+                db,
+                """
+                SELECT id, user_id, coin_symbol, change_type, ABS(change_amount) AS abs_amount, created_at
+                FROM balance_logs
+                WHERE created_at >= :today_start
+                  AND created_at <= :now
+                  AND direction < 0
+                ORDER BY ABS(change_amount) DESC, created_at DESC, id DESC
+                LIMIT 10
+                """,
+                today_params,
+            )
+        ]
+        frequent_balance_users = [
+            {
+                "user_id": row.get("user_id"),
+                "change_count": int(row.get("change_count") or 0),
+                "coin_count": int(row.get("coin_count") or 0),
+                "latest_at": _dashboard_datetime(row.get("latest_at")),
+            }
+            for row in _dashboard_rows(
+                db,
+                """
+                SELECT user_id, COUNT(*) AS change_count, COUNT(DISTINCT coin_symbol) AS coin_count, MAX(created_at) AS latest_at
+                FROM balance_logs
+                WHERE created_at >= :today_start
+                  AND created_at <= :now
+                GROUP BY user_id
+                ORDER BY change_count DESC, latest_at DESC
+                LIMIT 10
+                """,
+                today_params,
+            )
+        ]
+        adjustment_count = _dashboard_count(
+            db,
+            "balance_logs",
+            "created_at >= :today_start AND created_at <= :now AND UPPER(change_type) IN ('ADMIN_REPAIR', 'ADMIN_ADJUST', 'ADMIN_INCREASE', 'ADMIN_DECREASE')",
+            today_params,
+        )
+
+    if has_adjust_logs:
+        adjustment_rows = [
+            {
+                "coin_symbol": row.get("coin_symbol") or "--",
+                "amount": _dashboard_amount_text(row.get("amount_sum"), row.get("coin_symbol") or ""),
+                "count": int(row.get("item_count") or 0),
+            }
+            for row in _dashboard_rows(
+                db,
+                """
+                SELECT coin_symbol, COALESCE(SUM(amount), 0) AS amount_sum, COUNT(*) AS item_count
+                FROM admin_balance_adjust_logs
+                WHERE created_at >= :today_start
+                  AND created_at <= :now
+                GROUP BY coin_symbol
+                ORDER BY amount_sum DESC
+                LIMIT 10
+                """,
+                today_params,
+            )
+        ]
+        adjustment_count = max(
+            adjustment_count,
+            _dashboard_count(
+                db,
+                "admin_balance_adjust_logs",
+                "created_at >= :today_start AND created_at <= :now",
+                today_params,
+            ),
+        )
+
+    fund_attention_count = len(large_negative_rows) + len(frequent_balance_users) + adjustment_count
+
+    core_metrics = [
+        {"label": "待审核提现", "value": _dashboard_int(pending_withdraw_count), "note": "REVIEWING / VERIFYING / FROZEN", "tone": "warning" if pending_withdraw_count else "success"},
+        {"label": "提现失败", "value": _dashboard_int(failed_withdraw_count), "note": "FAILED / SEND_FAILED", "tone": "danger" if failed_withdraw_count else "success"},
+        {"label": "预检失败", "value": _dashboard_int(precheck_failed_count), "note": "PRECHECK 且未广播", "tone": "danger" if precheck_failed_count else "success"},
+        {"label": "Dealer 风控命中", "value": _dashboard_int(dealer_risk_today), "note": "今日命中次数", "tone": "warning" if dealer_risk_today else "success"},
+        {"label": "合约强平今日", "value": _dashboard_int(liquidation_count), "note": _dashboard_amount_text(liquidation_notional, "USDT", places=2), "tone": "danger" if liquidation_count else "success"},
+        {"label": "失败任务", "value": _dashboard_int(task_failed_total), "note": "RQ / 业务任务失败", "tone": "danger" if task_failed_total else "success"},
+    ]
+
+    return {
+        "as_of": f"{_dashboard_datetime(now)} Asia/Shanghai",
+        "core_metrics": core_metrics,
+        "withdraw_risks": withdraw_risk_rows,
+        "dealer_risks": dealer_risk_rows,
+        "contract_risk": {
+            "liquidation_count": liquidation_count,
+            "liquidation_notional": _dashboard_amount_text(liquidation_notional, "USDT", places=2),
+            "risk_position_count": risk_position_count,
+            "tp_sl_exception_count": "--",
+            "recent_liquidations": recent_liquidations,
+        },
+        "task_rows": task_rows,
+        "fund_attention": {
+            "large_negative_rows": large_negative_rows,
+            "frequent_users": frequent_balance_users,
+            "adjustment_count": adjustment_count,
+            "adjustment_rows": adjustment_rows,
+        },
+        "summary": {
+            "pending_withdraw_count": pending_withdraw_count,
+            "failed_withdraw_count": failed_withdraw_count,
+            "dealer_risk_hit_count": dealer_risk_today,
+            "liquidation_count": liquidation_count,
+            "failed_task_count": task_failed_total,
+            "fund_attention_count": fund_attention_count,
+        },
+    }
+
+
+def get_admin_users(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    email = str(filters.get("email") or "").strip()
+    phone = str(filters.get("phone") or "").strip()
+    status = str(filters.get("status") or "").strip()
+    kyc_level = str(filters.get("kyc_level") or "").strip()
+    source_type = str(filters.get("source_type") or "").strip().upper()
+    registered_from = _admin_query_date_value(filters.get("registered_from") or filters.get("date_from"))
+    registered_to = _admin_query_date_value(filters.get("registered_to") or filters.get("date_to"))
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id and user_id.isdigit():
+        where_parts.append("u.id = :user_id")
+        params["user_id"] = int(user_id)
+    if email:
+        where_parts.append("u.email LIKE :email")
+        params["email"] = f"%{email}%"
+    if phone:
+        where_parts.append("(u.phone LIKE :phone OR up.phone LIKE :phone)")
+        params["phone"] = f"%{phone}%"
+    if status:
+        where_parts.append("u.status = :status")
+        params["status"] = _parse_int(status)
+    if kyc_level:
+        where_parts.append("COALESCE(up.kyc_level, u.kyc_level, 0) = :kyc_level")
+        params["kyc_level"] = _parse_int(kyc_level)
+    if registered_from:
+        where_parts.append("DATE(u.created_at) >= :registered_from")
+        params["registered_from"] = registered_from
+    if registered_to:
+        where_parts.append("DATE(u.created_at) <= :registered_to")
+        params["registered_to"] = registered_to
+
+    bd_exists_sql = "EXISTS (SELECT 1 FROM bd_user_relations bur WHERE bur.user_id = u.id AND bur.status = 'ACTIVE')"
+    invite_exists_sql = "EXISTS (SELECT 1 FROM user_invite_relations uir WHERE uir.invitee_user_id = u.id AND uir.status = 'ACTIVE')"
+    if source_type == "BD":
+        where_parts.append(bd_exists_sql)
+    elif source_type == "USER_INVITE":
+        where_parts.append(invite_exists_sql)
+    elif source_type == "NONE":
+        where_parts.append(f"NOT {bd_exists_sql} AND NOT {invite_exists_sql}")
+    elif source_type == "AMBIGUOUS":
+        where_parts.append(f"{bd_exists_sql} AND {invite_exists_sql}")
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM users u
+        LEFT JOIN user_profiles up ON up.user_id = u.id
+    """
+    total = int(
+        db.execute(
+            text(f"SELECT COUNT(*) {from_sql} {where_sql}"),
+            params,
+        ).scalar()
+        or 0
+    )
+    pages = max(1, (total + page_size - 1) // page_size)
+    if page > pages:
+        page = pages
+    offset = (page - 1) * page_size
+    query_params = {**params, "limit": page_size, "offset": offset}
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                u.id AS user_id,
+                u.email,
+                u.phone AS user_phone,
+                u.status,
+                COALESCE(u.withdraw_locked, 0) AS withdraw_locked,
+                u.withdraw_locked_reason,
+                u.withdraw_locked_at,
+                u.withdraw_locked_by,
+                COALESCE(up.kyc_level, u.kyc_level, 0) AS kyc_level,
+                COALESCE(up.kyc_status, u.kyc_status, 'NONE') AS kyc_status,
+                u.created_at,
+                u.last_login_at,
+                up.username,
+                up.nickname,
+                up.phone AS profile_phone,
+                {bd_exists_sql} AS has_bd_relation,
+                {invite_exists_sql} AS has_invite_relation
+            {from_sql}
+            {where_sql}
+            ORDER BY u.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        query_params,
+    ).mappings().all()
+
+    def _format_dt(value: Any) -> str:
+        return value.strftime("%Y-%m-%d %H:%M:%S") if hasattr(value, "strftime") else (str(value) if value else "")
+
+    def _status_meta(value: Any) -> tuple[str, str]:
+        status_value = _parse_int(value)
+        if status_value == 1:
+            return "正常", "success"
+        if status_value == 2:
+            return "禁用", "danger"
+        if status_value == 3:
+            return "冻结", "warning"
+        return "未知", "secondary"
+
+    def _kyc_meta(level: Any, status_value: Any) -> tuple[str, str]:
+        level_value = _parse_int(level)
+        status_text = str(status_value or "NONE").upper()
+        labels = {0: "未认证", 1: "基础认证", 2: "高级认证", 3: "高级认证+"}
+        if status_text in {"PENDING", "REVIEWING"}:
+            return f"{labels.get(level_value, f'Lv{level_value}')} 待审", "warning"
+        if status_text in {"REJECTED", "FAILED"}:
+            return "认证驳回", "danger"
+        return labels.get(level_value, f"Lv{level_value}"), "success" if level_value > 0 else "secondary"
+
+    def _source_meta(has_bd: Any, has_invite: Any) -> tuple[str, str]:
+        bd_active = bool(has_bd)
+        invite_active = bool(has_invite)
+        if bd_active and invite_active:
+            return "异常", "danger"
+        if bd_active:
+            return "BD", "success"
+        if invite_active:
+            return "普通分享", "info"
+        return "无", "secondary"
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_label, status_badge = _status_meta(row_dict.get("status"))
+        kyc_label, kyc_badge = _kyc_meta(row_dict.get("kyc_level"), row_dict.get("kyc_status"))
+        source_label, source_badge = _source_meta(row_dict.get("has_bd_relation"), row_dict.get("has_invite_relation"))
+        primary_contact = row_dict.get("email") or row_dict.get("user_phone") or row_dict.get("profile_phone") or ""
+        display_name = row_dict.get("nickname") or row_dict.get("username") or primary_contact
+        items.append(
+            {
+                "user_id": row_dict.get("user_id"),
+                "primary_contact": primary_contact,
+                "display_name": display_name,
+                "username": row_dict.get("username") or "",
+                "nickname": row_dict.get("nickname") or "",
+                "status": row_dict.get("status"),
+                "is_disabled": _parse_int(row_dict.get("status")) == 2,
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "withdraw_locked": bool(row_dict.get("withdraw_locked")),
+                "withdraw_lock_label": "出金锁定" if bool(row_dict.get("withdraw_locked")) else "正常",
+                "withdraw_lock_badge": "danger" if bool(row_dict.get("withdraw_locked")) else "success",
+                "withdraw_locked_reason": row_dict.get("withdraw_locked_reason") or "",
+                "withdraw_locked_at": _format_dt(row_dict.get("withdraw_locked_at")),
+                "withdraw_locked_by": row_dict.get("withdraw_locked_by"),
+                "kyc_level": _parse_int(row_dict.get("kyc_level")),
+                "kyc_label": kyc_label,
+                "kyc_badge": kyc_badge,
+                "referral_source_label": source_label,
+                "referral_source_badge": source_badge,
+                "created_at": _format_dt(row_dict.get("created_at")),
+                "last_login_at": _format_dt(row_dict.get("last_login_at")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "keyword": "",
+            "user_id": user_id,
+            "email": email,
+            "phone": phone,
+            "status": status,
+            "kyc_level": kyc_level,
+            "source_type": source_type,
+            "registered_from": registered_from,
+            "registered_to": registered_to,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_admin_users(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    username = str(filters.get("username") or "").strip()
+    status = str(filters.get("status") or "").strip().upper()
+    role_code = str(filters.get("role_code") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if username:
+        where_parts.append("au.username LIKE :username")
+        params["username"] = f"%{username}%"
+    if status in {"ACTIVE", "DISABLED"}:
+        where_parts.append("au.status = :status")
+        params["status"] = status
+    if role_code:
+        where_parts.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM admin_user_roles filter_aur
+                INNER JOIN admin_roles filter_ar ON filter_ar.id = filter_aur.role_id
+                WHERE filter_aur.admin_user_id = au.id
+                  AND filter_ar.code = :role_code
+            )
+            """
+        )
+        params["role_code"] = role_code
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    role_agg_sql = """
+        SELECT
+            aur.admin_user_id,
+            GROUP_CONCAT(ar.code ORDER BY ar.code SEPARATOR ',') AS role_codes,
+            GROUP_CONCAT(ar.name ORDER BY ar.code SEPARATOR ',') AS role_names
+        FROM admin_user_roles aur
+        INNER JOIN admin_roles ar ON ar.id = aur.role_id
+        GROUP BY aur.admin_user_id
+    """
+    from_sql = f"""
+        FROM admin_users au
+        LEFT JOIN ({role_agg_sql}) roles ON roles.admin_user_id = au.id
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    offset = (page - 1) * page_size
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                au.id,
+                au.username,
+                au.display_name,
+                au.email,
+                au.status,
+                au.last_login_at,
+                au.created_at,
+                au.updated_at,
+                COALESCE(roles.role_codes, '') AS role_codes,
+                COALESCE(roles.role_names, '') AS role_names
+            {from_sql}
+            {where_sql}
+            ORDER BY au.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": offset},
+    ).mappings().all()
+
+    def _status_meta(value: Any) -> tuple[str, str]:
+        status_value = str(value or "").upper()
+        if status_value == "ACTIVE":
+            return "启用", "success"
+        if status_value == "DISABLED":
+            return "停用", "danger"
+        return "未知", "secondary"
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_label, status_badge = _status_meta(row_dict.get("status"))
+        role_codes = [code for code in str(row_dict.get("role_codes") or "").split(",") if code]
+        role_names = [name for name in str(row_dict.get("role_names") or "").split(",") if name]
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "username": row_dict.get("username") or "",
+                "display_name": row_dict.get("display_name") or "",
+                "email": row_dict.get("email") or "",
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "is_active": str(row_dict.get("status") or "").upper() == "ACTIVE",
+                "role_codes": role_codes,
+                "role_names": role_names,
+                "roles_display": "、".join(role_codes) if role_codes else "-",
+                "role_titles": "、".join(role_names) if role_names else "",
+                "last_login_at": _admin_datetime_display(row_dict.get("last_login_at")) or "-",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")) or "-",
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")) or "-",
+            }
+        )
+
+    return {
+        "items": items,
+        "filters": {
+            "username": username,
+            "status": status if status in {"ACTIVE", "DISABLED"} else "",
+            "role_code": role_code,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": {"page": page, "page_size": page_size, "total": total, "pages": pages},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_user_is_super_admin(db: Session, admin_user_id: Optional[int]) -> bool:
+    if admin_user_id is None:
+        return False
+    return bool(
+        db.execute(
+            text(
+                """
+                SELECT 1
+                FROM admin_users au
+                INNER JOIN admin_user_roles aur ON aur.admin_user_id = au.id
+                INNER JOIN admin_roles ar ON ar.id = aur.role_id
+                WHERE au.id = :admin_user_id
+                  AND au.status = 'ACTIVE'
+                  AND ar.code = 'super_admin'
+                  AND ar.status = 'ACTIVE'
+                LIMIT 1
+                """
+            ),
+            {"admin_user_id": int(admin_user_id)},
+        ).scalar()
+    )
+
+
+def admin_get_current_admin_rbac_context(db: Session, admin_user_id: Optional[int]) -> Dict[str, Any]:
+    if admin_user_id is None:
+        return {"is_super_admin": False, "permissions": set()}
+
+    admin_active = bool(
+        db.execute(
+            text(
+                """
+                SELECT 1
+                FROM admin_users
+                WHERE id = :admin_user_id
+                  AND status = 'ACTIVE'
+                LIMIT 1
+                """
+            ),
+            {"admin_user_id": int(admin_user_id)},
+        ).scalar()
+    )
+    if not admin_active:
+        return {"is_super_admin": False, "permissions": set()}
+
+    is_super_admin = admin_user_is_super_admin(db, admin_user_id)
+    if is_super_admin:
+        rows = db.execute(text("SELECT code FROM admin_permissions")).all()
+        return {"is_super_admin": True, "permissions": {str(row[0]) for row in rows}}
+
+    rows = db.execute(
+        text(
+            """
+            SELECT DISTINCT ap.code
+            FROM admin_user_roles aur
+            INNER JOIN admin_roles ar ON ar.id = aur.role_id
+            INNER JOIN admin_role_permissions arp ON arp.role_id = ar.id
+            INNER JOIN admin_permissions ap ON ap.id = arp.permission_id
+            WHERE aur.admin_user_id = :admin_user_id
+              AND ar.status = 'ACTIVE'
+            """
+        ),
+        {"admin_user_id": int(admin_user_id)},
+    ).all()
+    return {"is_super_admin": False, "permissions": {str(row[0]) for row in rows}}
+
+
+def admin_list_active_roles(db: Session) -> list[Dict[str, Any]]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                ar.id,
+                ar.code,
+                ar.name,
+                ar.description,
+                ar.is_system,
+                COALESCE(rp.permission_count, 0) AS permission_count
+            FROM admin_roles ar
+            LEFT JOIN (
+                SELECT role_id, COUNT(*) AS permission_count
+                FROM admin_role_permissions
+                GROUP BY role_id
+            ) rp ON rp.role_id = ar.id
+            WHERE ar.status = 'ACTIVE'
+            ORDER BY ar.is_system DESC, ar.code ASC
+            """
+        )
+    ).mappings().all()
+    return [
+        {
+            "id": row["id"],
+            "code": row["code"],
+            "name": row["name"],
+            "description": row["description"] or "",
+            "is_system": bool(row["is_system"]),
+            "permission_count": int(row["permission_count"] or 0),
+        }
+        for row in rows
+    ]
+
+
+def _admin_password_errors(password: str, confirm_password: str) -> list[str]:
+    errors: list[str] = []
+    if len(password) < 8:
+        errors.append("密码至少 8 位")
+    if not any(ch.isdigit() for ch in password) or not any(("a" <= ch.lower() <= "z") for ch in password):
+        errors.append("密码必须包含字母和数字")
+    if password != confirm_password:
+        errors.append("两次输入的密码不一致")
+    return errors
+
+
+def _normalize_admin_role_codes(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = [value]
+    else:
+        raw_values = list(value)
+    role_codes: list[str] = []
+    seen = set()
+    for raw_value in raw_values:
+        role_code = str(raw_value or "").strip()
+        if not role_code or role_code in seen:
+            continue
+        role_codes.append(role_code)
+        seen.add(role_code)
+    return role_codes
+
+
+def _load_active_admin_roles_by_code(db: Session) -> Dict[str, Dict[str, Any]]:
+    return {item["code"]: item for item in admin_list_active_roles(db)}
+
+
+def admin_create_admin_user(
+    db: Session,
+    payload: Dict[str, Any],
+    current_admin_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not admin_user_is_super_admin(db, current_admin_user_id):
+        return {"ok": False, "message": "仅超级管理员可执行此操作。"}
+
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    confirm_password = str(payload.get("confirm_password") or "")
+    display_name = str(payload.get("display_name") or "").strip()
+    email = _clean_optional_text(payload.get("email"))
+    status = str(payload.get("status") or "ACTIVE").strip().upper()
+    role_codes = _normalize_admin_role_codes(payload.get("role_codes"))
+
+    errors: list[str] = []
+    if not username:
+        errors.append("用户名不能为空")
+    if status not in {"ACTIVE", "DISABLED"}:
+        errors.append("管理员状态只能为 ACTIVE 或 DISABLED")
+    errors.extend(_admin_password_errors(password, confirm_password))
+    if not role_codes:
+        errors.append("请至少选择一个角色")
+
+    active_roles_by_code = _load_active_admin_roles_by_code(db)
+    selected_roles = []
+    for role_code in role_codes:
+        role = active_roles_by_code.get(role_code)
+        if role is None:
+            errors.append("请选择有效角色")
+            break
+        selected_roles.append(role)
+
+    if errors:
+        return {"ok": False, "message": "；".join(errors)}
+
+    exists = bool(
+        db.execute(
+            text("SELECT 1 FROM admin_users WHERE username = :username LIMIT 1"),
+            {"username": username},
+        ).scalar()
+    )
+    if exists:
+        return {"ok": False, "message": "管理员用户名已存在"}
+
+    try:
+        result = db.execute(
+            text(
+                """
+                INSERT INTO admin_users (
+                    username, password_hash, display_name, email, status,
+                    created_at, updated_at
+                )
+                VALUES (
+                    :username, :password_hash, :display_name, :email, :status,
+                    UTC_TIMESTAMP(), UTC_TIMESTAMP()
+                )
+                """
+            ),
+            {
+                "username": username,
+                "password_hash": hash_password(password),
+                "display_name": display_name or username,
+                "email": email,
+                "status": status,
+            },
+        )
+        admin_user_id = int(result.lastrowid)
+        for role in selected_roles:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO admin_user_roles (admin_user_id, role_id, created_at)
+                    VALUES (:admin_user_id, :role_id, UTC_TIMESTAMP())
+                    """
+                ),
+                {"admin_user_id": admin_user_id, "role_id": int(role["id"])},
+            )
+        db.commit()
+        return {"ok": True, "message": "管理员已创建", "admin_user_id": admin_user_id}
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "message": "管理员用户名已存在"}
+
+
+def admin_reset_admin_user_password(
+    db: Session,
+    admin_user_id: int,
+    password: str,
+    confirm_password: str,
+    current_admin_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not admin_user_is_super_admin(db, current_admin_user_id):
+        return {"ok": False, "message": "仅超级管理员可执行此操作。"}
+
+    row = (
+        db.execute(
+            text("SELECT id, username FROM admin_users WHERE id = :admin_user_id"),
+            {"admin_user_id": int(admin_user_id)},
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        return {"ok": False, "message": "管理员不存在"}
+
+    errors = _admin_password_errors(str(password or ""), str(confirm_password or ""))
+    if errors:
+        return {"ok": False, "message": "；".join(errors)}
+
+    db.execute(
+        text(
+            """
+            UPDATE admin_users
+            SET password_hash = :password_hash,
+                updated_at = UTC_TIMESTAMP()
+            WHERE id = :admin_user_id
+            """
+        ),
+        {"admin_user_id": int(admin_user_id), "password_hash": hash_password(str(password or ""))},
+    )
+    db.commit()
+    if current_admin_user_id is not None and int(admin_user_id) == int(current_admin_user_id):
+        return {"ok": True, "message": "密码已重置，建议重新登录"}
+    return {"ok": True, "message": "密码已重置"}
+
+
+def admin_query_admin_roles(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    code = str(filters.get("code") or "").strip()
+    status = str(filters.get("status") or "").strip().upper()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if code:
+        where_parts.append("ar.code LIKE :code")
+        params["code"] = f"%{code}%"
+    if status in {"ACTIVE", "DISABLED"}:
+        where_parts.append("ar.status = :status")
+        params["status"] = status
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM admin_roles ar
+        LEFT JOIN (
+            SELECT role_id, COUNT(*) AS permission_count
+            FROM admin_role_permissions
+            GROUP BY role_id
+        ) rp ON rp.role_id = ar.id
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                ar.id,
+                ar.code,
+                ar.name,
+                ar.description,
+                ar.is_system,
+                ar.status,
+                COALESCE(rp.permission_count, 0) AS permission_count,
+                ar.created_at,
+                ar.updated_at
+            {from_sql}
+            {where_sql}
+            ORDER BY ar.is_system DESC, ar.id ASC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+
+    def _status_meta(value: Any) -> tuple[str, str]:
+        status_value = str(value or "").upper()
+        if status_value == "ACTIVE":
+            return "启用", "success"
+        if status_value == "DISABLED":
+            return "停用", "danger"
+        return "未知", "secondary"
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_label, status_badge = _status_meta(row_dict.get("status"))
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "code": row_dict.get("code") or "",
+                "name": row_dict.get("name") or "",
+                "description": row_dict.get("description") or "",
+                "is_system": bool(row_dict.get("is_system")),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "permission_count": int(row_dict.get("permission_count") or 0),
+                "created_at": _admin_datetime_display(row_dict.get("created_at")) or "-",
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")) or "-",
+            }
+        )
+
+    return {
+        "items": items,
+        "filters": {
+            "code": code,
+            "status": status if status in {"ACTIVE", "DISABLED"} else "",
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": {"page": page, "page_size": page_size, "total": total, "pages": pages},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_list_permissions_by_group(db: Session) -> list[Dict[str, Any]]:
+    rows = db.execute(
+        text(
+            """
+            SELECT id, code, name, group_code, description
+            FROM admin_permissions
+            ORDER BY group_code ASC, code ASC
+            """
+        )
+    ).mappings().all()
+    groups: dict[str, list[Dict[str, Any]]] = {}
+    for row in rows:
+        row_dict = dict(row)
+        group_code = str(row_dict.get("group_code") or "system")
+        groups.setdefault(group_code, []).append(
+            {
+                "id": row_dict.get("id"),
+                "code": row_dict.get("code") or "",
+                "name": row_dict.get("name") or "",
+                "description": row_dict.get("description") or "",
+            }
+        )
+    return [{"group_code": group_code, "permissions": permissions} for group_code, permissions in groups.items()]
+
+
+def admin_get_role_permission_ids(db: Session, role_id: int) -> set[int]:
+    rows = db.execute(
+        text(
+            """
+            SELECT permission_id
+            FROM admin_role_permissions
+            WHERE role_id = :role_id
+            """
+        ),
+        {"role_id": int(role_id)},
+    ).all()
+    return {int(row[0]) for row in rows}
+
+
+def admin_get_all_role_permission_ids(db: Session) -> Dict[int, set[int]]:
+    rows = db.execute(
+        text(
+            """
+            SELECT role_id, permission_id
+            FROM admin_role_permissions
+            """
+        )
+    ).all()
+    result: Dict[int, set[int]] = {}
+    for role_id, permission_id in rows:
+        result.setdefault(int(role_id), set()).add(int(permission_id))
+    return result
+
+
+def _admin_role_code_errors(code: str) -> list[str]:
+    if not code:
+        return ["角色 code 不能为空"]
+    if not all(ch.islower() or ch.isdigit() or ch == "_" for ch in code):
+        return ["角色 code 只能包含小写英文、数字、下划线"]
+    return []
+
+
+def admin_create_admin_role(
+    db: Session,
+    payload: Dict[str, Any],
+    current_admin_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not admin_user_is_super_admin(db, current_admin_user_id):
+        return {"ok": False, "message": "仅超级管理员可执行此操作。"}
+
+    code = str(payload.get("code") or "").strip()
+    name = str(payload.get("name") or "").strip()
+    description = _clean_optional_text(payload.get("description"))
+    status = str(payload.get("status") or "ACTIVE").strip().upper()
+
+    errors = _admin_role_code_errors(code)
+    if not name:
+        errors.append("角色名称不能为空")
+    if status not in {"ACTIVE", "DISABLED"}:
+        errors.append("角色状态只能为 ACTIVE 或 DISABLED")
+    if errors:
+        return {"ok": False, "message": "；".join(errors)}
+
+    exists = bool(db.execute(text("SELECT 1 FROM admin_roles WHERE code = :code LIMIT 1"), {"code": code}).scalar())
+    if exists:
+        return {"ok": False, "message": "角色 code 已存在"}
+
+    try:
+        result = db.execute(
+            text(
+                """
+                INSERT INTO admin_roles (code, name, description, is_system, status, created_at, updated_at)
+                VALUES (:code, :name, :description, 0, :status, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                """
+            ),
+            {"code": code, "name": name, "description": description, "status": status},
+        )
+        role_id = int(result.lastrowid or 0)
+        if role_id <= 0:
+            role_id = int(db.execute(text("SELECT id FROM admin_roles WHERE code = :code"), {"code": code}).scalar() or 0)
+        db.commit()
+        return {"ok": True, "message": "角色已创建", "role_id": role_id}
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "message": "角色 code 已存在"}
+
+
+def _load_admin_role_row(db: Session, role_id: int) -> Optional[Dict[str, Any]]:
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT id, code, name, description, is_system, status
+                FROM admin_roles
+                WHERE id = :role_id
+                """
+            ),
+            {"role_id": int(role_id)},
+        )
+        .mappings()
+        .first()
+    )
+    return dict(row) if row else None
+
+
+def admin_update_admin_role(
+    db: Session,
+    role_id: int,
+    payload: Dict[str, Any],
+    current_admin_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not admin_user_is_super_admin(db, current_admin_user_id):
+        return {"ok": False, "message": "仅超级管理员可执行此操作。"}
+
+    role = _load_admin_role_row(db, role_id)
+    if role is None:
+        return {"ok": False, "message": "角色不存在"}
+
+    name = str(payload.get("name") or "").strip()
+    description = _clean_optional_text(payload.get("description"))
+    status = str(payload.get("status") or "ACTIVE").strip().upper()
+
+    errors: list[str] = []
+    if not name:
+        errors.append("角色名称不能为空")
+    if status not in {"ACTIVE", "DISABLED"}:
+        errors.append("角色状态只能为 ACTIVE 或 DISABLED")
+    if role.get("code") == "super_admin" and status != "ACTIVE":
+        errors.append("super_admin 系统角色不能停用")
+    if errors:
+        return {"ok": False, "message": "；".join(errors)}
+
+    db.execute(
+        text(
+            """
+            UPDATE admin_roles
+            SET name = :name,
+                description = :description,
+                status = :status,
+                updated_at = UTC_TIMESTAMP()
+            WHERE id = :role_id
+            """
+        ),
+        {"role_id": int(role_id), "name": name, "description": description, "status": status},
+    )
+    db.commit()
+    return {"ok": True, "message": "角色已保存"}
+
+
+def admin_update_admin_role_permissions(
+    db: Session,
+    role_id: int,
+    permission_ids: Any,
+    current_admin_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not admin_user_is_super_admin(db, current_admin_user_id):
+        return {"ok": False, "message": "仅超级管理员可执行此操作。"}
+
+    role = _load_admin_role_row(db, role_id)
+    if role is None:
+        return {"ok": False, "message": "角色不存在"}
+
+    if permission_ids is None:
+        requested_ids: set[int] = set()
+    elif isinstance(permission_ids, str):
+        requested_ids = {_parse_int(permission_ids) for permission_ids in [permission_ids]}
+    else:
+        requested_ids = {_parse_int(value) for value in list(permission_ids)}
+    requested_ids.discard(0)
+
+    valid_ids = {
+        int(row[0])
+        for row in db.execute(text("SELECT id FROM admin_permissions")).all()
+    }
+    selected_ids = requested_ids & valid_ids
+
+    if role.get("code") == "super_admin":
+        missing_ids = valid_ids - admin_get_role_permission_ids(db, role_id)
+        for permission_id in missing_ids:
+            db.execute(
+                text(
+                    """
+                    INSERT IGNORE INTO admin_role_permissions (role_id, permission_id, created_at)
+                    VALUES (:role_id, :permission_id, UTC_TIMESTAMP())
+                    """
+                ),
+                {"role_id": int(role_id), "permission_id": int(permission_id)},
+            )
+        db.commit()
+        return {"ok": True, "message": "super_admin 权限已补齐"}
+
+    db.execute(text("DELETE FROM admin_role_permissions WHERE role_id = :role_id"), {"role_id": int(role_id)})
+    for permission_id in selected_ids:
+        db.execute(
+            text(
+                """
+                INSERT INTO admin_role_permissions (role_id, permission_id, created_at)
+                VALUES (:role_id, :permission_id, UTC_TIMESTAMP())
+                """
+            ),
+            {"role_id": int(role_id), "permission_id": int(permission_id)},
+        )
+    db.commit()
+    return {"ok": True, "message": "角色权限已更新"}
+
+
+def admin_delete_admin_role(
+    db: Session,
+    role_id: int,
+    current_admin_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not admin_user_is_super_admin(db, current_admin_user_id):
+        return {"ok": False, "message": "仅超级管理员可执行此操作。"}
+
+    role = _load_admin_role_row(db, role_id)
+    if role is None:
+        return {"ok": False, "message": "角色不存在"}
+
+    if bool(role.get("is_system")) or str(role.get("code") or "") == "super_admin":
+        return {"ok": False, "message": "系统角色不允许删除。"}
+
+    used_count = int(
+        db.execute(
+            text("SELECT COUNT(*) FROM admin_user_roles WHERE role_id = :role_id"),
+            {"role_id": int(role_id)},
+        ).scalar()
+        or 0
+    )
+    if used_count > 0:
+        return {"ok": False, "message": "当前角色已被管理员使用，不能删除。"}
+
+    try:
+        db.execute(text("DELETE FROM admin_role_permissions WHERE role_id = :role_id"), {"role_id": int(role_id)})
+        db.execute(text("DELETE FROM admin_roles WHERE id = :role_id"), {"role_id": int(role_id)})
+        db.commit()
+        return {"ok": True, "message": "角色已删除"}
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Failed to delete admin role: role_id=%s", role_id)
+        return {"ok": False, "message": "角色删除失败"}
+
+
+def admin_set_admin_user_status(
+    db: Session,
+    admin_user_id: int,
+    status: str,
+    current_admin_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    target_status = str(status or "").strip().upper()
+    if target_status not in {"ACTIVE", "DISABLED"}:
+        return {"ok": False, "message": "管理员状态只能为 ACTIVE 或 DISABLED"}
+
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT id, username, status
+                FROM admin_users
+                WHERE id = :admin_user_id
+                """
+            ),
+            {"admin_user_id": int(admin_user_id)},
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        return {"ok": False, "message": "管理员不存在"}
+
+    row_dict = dict(row)
+    if target_status == "DISABLED":
+        if current_admin_user_id is not None and int(row_dict["id"]) == int(current_admin_user_id):
+            return {"ok": False, "message": "不能停用当前登录管理员自己"}
+
+        is_super_admin = bool(
+            db.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM admin_user_roles aur
+                    INNER JOIN admin_roles ar ON ar.id = aur.role_id
+                    WHERE aur.admin_user_id = :admin_user_id
+                      AND ar.code = 'super_admin'
+                    LIMIT 1
+                    """
+                ),
+                {"admin_user_id": int(admin_user_id)},
+            ).scalar()
+        )
+        if is_super_admin:
+            active_super_admin_count = int(
+                db.execute(
+                    text(
+                        """
+                        SELECT COUNT(DISTINCT au.id)
+                        FROM admin_users au
+                        INNER JOIN admin_user_roles aur ON aur.admin_user_id = au.id
+                        INNER JOIN admin_roles ar ON ar.id = aur.role_id
+                        WHERE au.status = 'ACTIVE'
+                          AND ar.code = 'super_admin'
+                        """
+                    )
+                ).scalar()
+                or 0
+            )
+            if str(row_dict.get("status") or "").upper() == "ACTIVE" and active_super_admin_count <= 1:
+                return {"ok": False, "message": "不能停用最后一个启用状态的 super_admin 管理员"}
+
+    if str(row_dict.get("status") or "").upper() == target_status:
+        return {"ok": True, "message": "管理员状态未变化"}
+
+    db.execute(
+        text(
+            """
+            UPDATE admin_users
+            SET status = :status,
+                updated_at = UTC_TIMESTAMP()
+            WHERE id = :admin_user_id
+            """
+        ),
+        {"admin_user_id": int(admin_user_id), "status": target_status},
+    )
+    db.commit()
+    action = "启用" if target_status == "ACTIVE" else "停用"
+    return {"ok": True, "message": f"管理员 {row_dict.get('username')} 已{action}"}
+
+
+def get_admin_balances(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    keyword = str(filters.get("keyword") or "").strip()
+    coin_symbol = _normalize_code(filters.get("coin_symbol"))
+    account_type = _normalize_chain_key(
+        filters.get("chain_key")
+        or filters.get("account_type")
+        or filters.get("account_key")
+    )
+    non_zero_only = str(filters.get("non_zero_only") or filters.get("only_non_zero") or "").strip()
+    has_frozen = str(filters.get("has_frozen") or filters.get("frozen_only") or filters.get("only_frozen") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    base_where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        base_where_parts.append("account_rows.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if keyword:
+        base_where_parts.append(
+            """
+            (
+                CAST(account_rows.user_id AS CHAR) LIKE :keyword
+                OR u.email LIKE :keyword
+                OR u.phone LIKE :keyword
+            )
+            """
+        )
+        params["keyword"] = f"%{keyword}%"
+    if coin_symbol:
+        base_where_parts.append("account_rows.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if account_type:
+        base_where_parts.append(
+            """
+            (
+                (:account_type = 'funding' AND (account_rows.funding_available <> 0 OR account_rows.funding_frozen <> 0))
+                OR (:account_type = 'spot' AND (account_rows.spot_available <> 0 OR account_rows.spot_frozen <> 0))
+                OR (:account_type = 'contract' AND (account_rows.contract_available <> 0 OR account_rows.contract_frozen <> 0))
+            )
+            """
+        )
+        params["account_type"] = account_type
+    if non_zero_only == "1":
+        base_where_parts.append(
+            """
+            (
+                account_rows.funding_available <> 0
+                OR account_rows.spot_available <> 0
+                OR account_rows.contract_available <> 0
+                OR account_rows.frozen_total <> 0
+            )
+            """
+        )
+    if has_frozen == "1":
+        base_where_parts.append("account_rows.frozen_total <> 0")
+
+    union_sql = """
+        SELECT
+            ub.user_id,
+            CAST(ub.coin_symbol AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS coin_symbol,
+            CASE WHEN ub.chain_key = 'funding' THEN COALESCE(ub.available_amount, 0) ELSE 0 END AS funding_available,
+            CASE WHEN ub.chain_key = 'spot' THEN COALESCE(ub.available_amount, 0) ELSE 0 END AS spot_available,
+            0 AS contract_available,
+            CASE WHEN ub.chain_key = 'funding' THEN COALESCE(ub.frozen_amount, 0) ELSE 0 END AS funding_frozen,
+            CASE WHEN ub.chain_key = 'spot' THEN COALESCE(ub.frozen_amount, 0) ELSE 0 END AS spot_frozen,
+            0 AS contract_frozen,
+            CASE WHEN ub.chain_key = 'funding' THEN 1 ELSE 0 END AS has_funding,
+            CASE WHEN ub.chain_key = 'spot' THEN 1 ELSE 0 END AS has_spot,
+            0 AS has_contract,
+            ub.updated_at
+        FROM user_balances ub
+
+        UNION ALL
+
+        SELECT
+            ca.user_id,
+            CAST(ca.margin_asset AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS coin_symbol,
+            0 AS funding_available,
+            0 AS spot_available,
+            COALESCE(ca.available_margin, 0) AS contract_available,
+            0 AS funding_frozen,
+            0 AS spot_frozen,
+            (COALESCE(ca.frozen_margin, 0) + COALESCE(ca.position_margin, 0)) AS contract_frozen,
+            0 AS has_funding,
+            0 AS has_spot,
+            1 AS has_contract,
+            ca.updated_at
+        FROM contract_accounts ca
+    """
+    grouped_sql = f"""
+        FROM (
+            SELECT
+                raw.user_id,
+                raw.coin_symbol,
+                SUM(raw.funding_available) AS funding_available,
+                SUM(raw.spot_available) AS spot_available,
+                SUM(raw.contract_available) AS contract_available,
+                SUM(raw.funding_frozen) AS funding_frozen,
+                SUM(raw.spot_frozen) AS spot_frozen,
+                SUM(raw.contract_frozen) AS contract_frozen,
+                SUM(raw.has_funding) AS has_funding,
+                SUM(raw.has_spot) AS has_spot,
+                SUM(raw.has_contract) AS has_contract,
+                (
+                    SUM(raw.funding_frozen)
+                    + SUM(raw.spot_frozen)
+                    + SUM(raw.contract_frozen)
+                ) AS frozen_total,
+                (
+                    SUM(raw.funding_available)
+                    + SUM(raw.spot_available)
+                    + SUM(raw.contract_available)
+                    + SUM(raw.funding_frozen)
+                    + SUM(raw.spot_frozen)
+                    + SUM(raw.contract_frozen)
+                ) AS total_amount,
+                MAX(raw.updated_at) AS updated_at
+            FROM ({union_sql}) AS raw
+            GROUP BY raw.user_id, raw.coin_symbol
+        ) AS account_rows
+        LEFT JOIN users u ON u.id = account_rows.user_id
+    """
+    where_sql = f"WHERE {' AND '.join(base_where_parts)}" if base_where_parts else ""
+    total = int(
+        db.execute(
+            text(
+                f"""
+                SELECT COUNT(*)
+                FROM (
+                    SELECT account_rows.user_id
+                    {grouped_sql}
+                    {where_sql}
+                    GROUP BY account_rows.user_id
+                ) AS user_rows
+                """
+            ),
+            params,
+        ).scalar()
+        or 0
+    )
+    pages = max(1, (total + page_size - 1) // page_size)
+    if page > pages:
+        page = pages
+    offset = (page - 1) * page_size
+    query_params = {**params, "limit": page_size, "offset": offset}
+    user_rows = db.execute(
+        text(
+            f"""
+            SELECT
+                account_rows.user_id,
+                u.email,
+                u.phone,
+                COUNT(*) AS asset_coin_count,
+                SUM(CASE WHEN account_rows.total_amount <> 0 THEN 1 ELSE 0 END) AS nonzero_coin_count,
+                SUM(CASE WHEN account_rows.has_funding > 0 THEN 1 ELSE 0 END) AS funding_coin_count,
+                SUM(CASE WHEN account_rows.has_spot > 0 THEN 1 ELSE 0 END) AS spot_coin_count,
+                SUM(CASE WHEN account_rows.has_contract > 0 THEN 1 ELSE 0 END) AS contract_coin_count,
+                SUM(CASE WHEN account_rows.frozen_total <> 0 THEN 1 ELSE 0 END) AS frozen_coin_count,
+                MAX(account_rows.updated_at) AS latest_updated_at
+            {grouped_sql}
+            {where_sql}
+            GROUP BY account_rows.user_id, u.email, u.phone
+            ORDER BY account_rows.user_id ASC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        query_params,
+    ).mappings().all()
+
+    def _format_dt(value: Any) -> str:
+        return value.strftime("%Y-%m-%d %H:%M:%S") if hasattr(value, "strftime") else (str(value) if value else "")
+
+    def _detail_item(row_dict: Dict[str, Any]) -> Dict[str, Any]:
+        coin_symbol_display = row_dict.get("coin_symbol") or ""
+        return {
+            "user_id": _parse_int(row_dict.get("user_id")),
+            "coin_symbol": coin_symbol_display,
+            "funding_available": (
+                _fmt_admin_amount_display(row_dict.get("funding_available"), coin_symbol_display)
+                if _parse_int(row_dict.get("has_funding")) > 0
+                else "-"
+            ),
+            "spot_available": (
+                _fmt_admin_amount_display(row_dict.get("spot_available"), coin_symbol_display)
+                if _parse_int(row_dict.get("has_spot")) > 0
+                else "-"
+            ),
+            "contract_available": (
+                _fmt_admin_amount_display(row_dict.get("contract_available"), coin_symbol_display)
+                if _parse_int(row_dict.get("has_contract")) > 0
+                else "-"
+            ),
+            "funding_frozen": _fmt_admin_amount_display(row_dict.get("funding_frozen"), coin_symbol_display),
+            "spot_frozen": _fmt_admin_amount_display(row_dict.get("spot_frozen"), coin_symbol_display),
+            "contract_frozen": _fmt_admin_amount_display(row_dict.get("contract_frozen"), coin_symbol_display),
+            "frozen_total": _fmt_admin_amount_display(row_dict.get("frozen_total"), coin_symbol_display),
+            "total_amount": _fmt_admin_amount_display(row_dict.get("total_amount"), coin_symbol_display),
+            "updated_at": _format_dt(row_dict.get("updated_at")),
+            "funding_present": _parse_int(row_dict.get("has_funding")) > 0,
+            "spot_present": _parse_int(row_dict.get("has_spot")) > 0,
+            "contract_present": _parse_int(row_dict.get("has_contract")) > 0,
+            "funding_nonzero": _parse_decimal(row_dict.get("funding_available")) != Decimal("0")
+            or _parse_decimal(row_dict.get("funding_frozen")) != Decimal("0"),
+            "spot_nonzero": _parse_decimal(row_dict.get("spot_available")) != Decimal("0")
+            or _parse_decimal(row_dict.get("spot_frozen")) != Decimal("0"),
+            "contract_nonzero": _parse_decimal(row_dict.get("contract_available")) != Decimal("0")
+            or _parse_decimal(row_dict.get("contract_frozen")) != Decimal("0"),
+            "frozen_nonzero": _parse_decimal(row_dict.get("frozen_total")) != Decimal("0"),
+        }
+
+    def _detail_has_balance(item: Dict[str, Any]) -> bool:
+        return bool(
+            item.get("funding_nonzero")
+            or item.get("spot_nonzero")
+            or item.get("contract_nonzero")
+            or item.get("frozen_nonzero")
+        )
+
+    def _coin_symbols_display(details: list[Dict[str, Any]]) -> str:
+        symbols = [
+            str(item.get("coin_symbol") or "").strip()
+            for item in details
+            if item.get("coin_symbol") and _detail_has_balance(item)
+        ]
+        if not symbols:
+            return "-"
+        visible = symbols[:3]
+        suffix = f" +{len(symbols) - len(visible)}" if len(symbols) > len(visible) else ""
+        return ", ".join(visible) + suffix
+
+    def _account_summary(details: list[Dict[str, Any]], key: str) -> str:
+        present_key = f"{key}_present"
+        nonzero_key = f"{key}_nonzero"
+        amount_key = f"{key}_available"
+        matched = [item for item in details if item.get(present_key) and item.get(nonzero_key)]
+        if not matched:
+            return "-"
+        if len(matched) == 1:
+            item = matched[0]
+            return f"{item.get('coin_symbol')} {item.get(amount_key)}"
+        return f"{len(matched)} 币种"
+
+    def _frozen_summary(details: list[Dict[str, Any]]) -> str:
+        matched = [item for item in details if item.get("frozen_nonzero")]
+        if not matched:
+            return "-"
+        if len(matched) == 1:
+            item = matched[0]
+            return f"{item.get('coin_symbol')} {item.get('frozen_total')}"
+        return f"{len(matched)} 币种有冻结"
+
+    page_user_ids = [_parse_int(row.get("user_id")) for row in user_rows if row.get("user_id") is not None]
+    details_by_user: Dict[int, list[Dict[str, Any]]] = {user_id_value: [] for user_id_value in page_user_ids}
+    if page_user_ids:
+        page_user_params = {f"page_user_{index}": value for index, value in enumerate(page_user_ids)}
+        page_user_placeholders = ", ".join(f":page_user_{index}" for index in range(len(page_user_ids)))
+        detail_where_parts = list(base_where_parts)
+        detail_where_parts.append(f"account_rows.user_id IN ({page_user_placeholders})")
+        detail_where_sql = f"WHERE {' AND '.join(detail_where_parts)}"
+        detail_rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    account_rows.user_id,
+                    account_rows.coin_symbol,
+                    account_rows.funding_available,
+                    account_rows.spot_available,
+                    account_rows.contract_available,
+                    account_rows.funding_frozen,
+                    account_rows.spot_frozen,
+                    account_rows.contract_frozen,
+                    account_rows.has_funding,
+                    account_rows.has_spot,
+                    account_rows.has_contract,
+                    account_rows.frozen_total,
+                    account_rows.total_amount,
+                    account_rows.updated_at
+                {grouped_sql}
+                {detail_where_sql}
+                ORDER BY account_rows.user_id ASC, account_rows.total_amount DESC, account_rows.coin_symbol ASC
+                """
+            ),
+            {**params, **page_user_params},
+        ).mappings().all()
+        for row in detail_rows:
+            detail = _detail_item(dict(row))
+            details_by_user.setdefault(detail["user_id"], []).append(detail)
+
+    items = []
+    for row in user_rows:
+        row_dict = dict(row)
+        user_id_value = _parse_int(row_dict.get("user_id"))
+        details = details_by_user.get(user_id_value, [])
+        nonzero_details = [item for item in details if _detail_has_balance(item)]
+        items.append(
+            {
+                "user_id": user_id_value,
+                "email": row_dict.get("email") or "",
+                "phone": row_dict.get("phone") or "",
+                "email_display": row_dict.get("email") or "-",
+                "phone_display": row_dict.get("phone") or "-",
+                "asset_coin_count": len(nonzero_details),
+                "nonzero_coin_count": len(nonzero_details),
+                "coin_symbols_display": _coin_symbols_display(details),
+                "funding_total_display": _account_summary(details, "funding"),
+                "spot_total_display": _account_summary(details, "spot"),
+                "contract_total_display": _account_summary(details, "contract"),
+                "frozen_total_display": _frozen_summary(details),
+                "latest_updated_at_display": _format_dt(row_dict.get("latest_updated_at")),
+                "asset_details": details,
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "user_id": user_id,
+            "keyword": keyword,
+            "coin_symbol": coin_symbol,
+            "chain_key": account_type,
+            "account_type": account_type,
+            "non_zero_only": non_zero_only,
+            "has_frozen": has_frozen,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+def _admin_amount_display(value: Any) -> str:
+    try:
+        amount = Decimal(str(value or "0"))
+    except Exception:
+        amount = Decimal("0")
+    text_value = format(amount.normalize(), "f")
+    return "0" if text_value == "-0" else text_value
+
+
+def _admin_withdraw_fee_display(value: Any) -> str:
+    try:
+        amount = _quantize_withdraw_fee(Decimal(str(value or "0")))
+    except Exception:
+        amount = Decimal("0")
+    text_value = format(amount.normalize(), "f")
+    return "0" if text_value == "-0" else text_value
+
+
+def _admin_withdraw_cost_display(value: Any) -> str:
+    try:
+        amount = Decimal(str(value or "0")).quantize(WITHDRAW_COST_QUANT, rounding=ROUND_HALF_UP)
+    except Exception:
+        amount = Decimal("0")
+    text_value = format(amount.normalize(), "f")
+    return "0" if text_value == "-0" else text_value
+
+
+def _fmt_admin_amount_display(value: Any, coin_symbol: Any = "", *, signed: bool = False) -> str:
+    try:
+        amount = Decimal(str(value or "0"))
+    except Exception:
+        amount = Decimal("0")
+    symbol = str(coin_symbol or "").strip().upper()
+    if symbol == "USDT":
+        rounded = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        text_value = format(rounded, "f")
+        if text_value == "-0.00":
+            text_value = "0.00"
+    else:
+        rounded = amount.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+        text_value = format(rounded.normalize(), "f")
+        if text_value == "-0":
+            text_value = "0"
+    if signed and rounded > 0:
+        return f"+{text_value}"
+    return text_value
+
+
+def _fmt_admin_change_amount_display(value: Any, coin_symbol: Any = "", direction: Any = None) -> str:
+    try:
+        amount = Decimal(str(value or "0"))
+    except Exception:
+        amount = Decimal("0")
+    try:
+        direction_int = int(direction)
+    except Exception:
+        direction_int = 0
+    if direction_int < 0 and amount > 0:
+        amount = -amount
+    return _fmt_admin_amount_display(amount, coin_symbol, signed=True)
+
+
+def _fmt_admin_decimal(value: Any, precision: int = 2) -> str:
+    try:
+        amount = Decimal(str(value or "0"))
+    except Exception:
+        amount = Decimal("0")
+    precision = max(0, int(precision or 0))
+    quant = Decimal("1") if precision <= 0 else Decimal("1").scaleb(-precision)
+    rounded = amount.quantize(quant, rounding=ROUND_HALF_UP)
+    text_value = format(rounded, "f")
+    return "0" if text_value == "-0" else text_value
+
+
+def _admin_datetime_display(value: Any) -> str:
+    if isinstance(value, datetime):
+        return _utc_naive_to_admin_time(value).strftime("%Y-%m-%d %H:%M:%S")
+    return str(value) if value else ""
+
+
+def _admin_dividend_run_at_display(value: Any) -> str:
+    text_value = _admin_datetime_display(value).strip()
+    if not text_value:
+        return "未执行"
+    if text_value.upper().endswith(" ASIA/SHANGHAI"):
+        return text_value
+    return f"{text_value} Asia/Shanghai"
+
+
+DIVIDEND_PREMATURE_POOL_MESSAGE = "该批次日期尚未结束，属于异常提前创建批次。"
+
+
+def _admin_query_date_value(value: Any) -> Optional[date]:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    try:
+        return date.fromisoformat(text_value[:10])
+    except ValueError:
+        return None
+
+
+def _admin_short_text(value: Any, prefix: int = 8, suffix: int = 6) -> str:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return "--"
+    if len(text_value) > prefix + suffix + 3:
+        return f"{text_value[:prefix]}...{text_value[-suffix:]}"
+    return text_value
+
+
+def _short_admin_address(value: Any) -> str:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return "-"
+    if len(text_value) > 15:
+        return f"{text_value[:6]}...{text_value[-6:]}"
+    return text_value
+
+
+def _short_admin_hash(value: Any) -> str:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return "-"
+    if len(text_value) > 21:
+        return f"{text_value[:10]}...{text_value[-8:]}"
+    return text_value
+
+
+def _admin_system_status_meta(status: Any) -> tuple[str, str]:
+    value = str(status or "").strip().upper()
+    labels = {
+        "PENDING": "待处理",
+        "QUEUED": "待处理",
+        "RUNNING": "执行中",
+        "PROCESSING": "执行中",
+        "SENDING": "执行中",
+        "SENT": "已发送",
+        "CONFIRMED": "成功",
+        "SUCCESS": "成功",
+        "COMPLETED": "成功",
+        "DUE": "到点检查",
+        "THREAD_STARTED": "线程已启动",
+        "THREAD_LOOP_FAILED": "线程循环异常",
+        "SKIPPED_IN_PROCESS": "进程内已跳过",
+        "CREATED_CALCULATED_PAID": "创建计算并发放",
+        "EXISTING_PAID": "已发放跳过",
+        "EXISTING_PENDING": "已有待处理批次",
+        "EXISTING_CALCULATED": "已有已计算批次",
+        "EXISTING_FAILED": "已有失败批次",
+        "FAILED": "失败",
+        "PARTIAL_FAILED": "部分失败",
+        "SKIPPED": "已跳过",
+        "CANCELED": "已取消",
+        "CANCELLED": "已取消",
+        "LOCKED": "已锁定",
+    }
+    badges = {
+        "PENDING": "warning",
+        "QUEUED": "warning",
+        "RUNNING": "info",
+        "PROCESSING": "info",
+        "SENDING": "info",
+        "SENT": "info",
+        "CONFIRMED": "success",
+        "SUCCESS": "success",
+        "COMPLETED": "success",
+        "DUE": "info",
+        "THREAD_STARTED": "success",
+        "THREAD_LOOP_FAILED": "danger",
+        "SKIPPED_IN_PROCESS": "secondary",
+        "CREATED_CALCULATED_PAID": "success",
+        "EXISTING_PAID": "secondary",
+        "EXISTING_PENDING": "success",
+        "EXISTING_CALCULATED": "success",
+        "EXISTING_FAILED": "warning",
+        "FAILED": "danger",
+        "PARTIAL_FAILED": "danger",
+        "SKIPPED": "secondary",
+        "CANCELED": "secondary",
+        "CANCELLED": "secondary",
+        "LOCKED": "warning",
+    }
+    return labels.get(value, value or "-"), badges.get(value, "secondary")
+
+
+def _admin_system_type_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    labels = {
+        "COLLECTION": "资金归集",
+        "GAS_TOPUP": "补 Gas",
+        "DIVIDEND": "分红任务",
+        "BD_COMMISSION": "BD 发放",
+        "STOCK_RELEASE": "股票释放",
+        "CACHE_REFRESH": "缓存刷新",
+        "LOGIN": "登录",
+        "AUDIT": "审计",
+        "AUTO": "自动任务",
+        "MANUAL": "手动触发",
+        "MANUAL_TRIGGER": "手动补跑",
+        "FORCE": "强制释放",
+        "RETRY": "重试",
+        "ADMIN_BATCH": "后台批量",
+        "UNKNOWN": "UNKNOWN",
+        "CHECK_DATE": "检查日期",
+        "CHECK_POOL": "检查批次",
+        "CREATE_POOL": "创建批次",
+    }
+    return labels.get(normalized, normalized or "-")
+
+
+def _admin_audit_action_label(value: Any) -> str:
+    normalized = str(value or "").strip()
+    key = normalized.upper()
+    labels = {
+        "CREATE": "创建",
+        "CREATED": "创建",
+        "UPDATE": "更新",
+        "UPDATED": "更新",
+        "DELETE": "删除",
+        "DELETED": "删除",
+        "LOGIN": "登录",
+        "LOGOUT": "退出",
+        "APPROVE": "审核通过",
+        "APPROVED": "审核通过",
+        "REJECT": "审核拒绝",
+        "REJECTED": "审核拒绝",
+        "ENABLE": "启用",
+        "ENABLED": "启用",
+        "DISABLE": "禁用",
+        "DISABLED": "禁用",
+        "EXPORT": "导出",
+        "IMPORT": "导入",
+    }
+    return labels.get(key, normalized or "-")
+
+
+def _admin_audit_module_label(value: Any) -> str:
+    normalized = str(value or "").strip()
+    key = normalized.upper()
+    labels = {
+        "USER": "用户",
+        "USERS": "用户",
+        "KYC": "KYC",
+        "FUNDS": "资金",
+        "BALANCE": "资金",
+        "WITHDRAW": "提现",
+        "DEPOSIT": "充值",
+        "TRANSFER": "站内划转",
+        "ORDER": "订单",
+        "ORDERS": "订单",
+        "TRADE": "成交",
+        "TRADES": "成交",
+        "CONTRACT": "合约",
+        "SYSTEM": "系统",
+        "OPERATIONS": "运营",
+        "AUDIT": "审计",
+        "ADMIN": "管理员",
+    }
+    return labels.get(key, normalized or "-")
+
+
+def _admin_send_mode_meta(value: Any) -> tuple[str, str]:
+    normalized = str(value or "").strip().upper()
+    if normalized == "DRY_RUN":
+        return "演练模式", "info"
+    if normalized == "REAL_SEND":
+        return "真实发送", "danger"
+    return _admin_system_type_label(normalized), "secondary"
+
+
+def _admin_status_badge(status: Any) -> str:
+    status_value = str(status or "").strip().upper()
+    if status_value in {"SUCCESS", "CONFIRMED", "COMPLETED", "SENT"}:
+        return "success"
+    if status_value in {"FAILED", "REJECTED", "CANCELED", "CANCELLED", "IGNORED"}:
+        return "danger"
+    if status_value in {"REVIEWING", "VERIFYING", "FROZEN", "PENDING", "PROCESSING", "APPROVED", "SENDING"}:
+        return "warning"
+    return "neutral"
+
+
+def _admin_deposit_status_meta(status: Any) -> tuple[str, str]:
+    status_value = str(status or "").strip().upper()
+    if status_value in {"SUCCESS", "CONFIRMED", "COMPLETED", "SUCCEEDED"}:
+        return "成功", "success"
+    if status_value in {"PENDING", "PROCESSING", "VERIFYING"}:
+        return "处理中", "warning"
+    if status_value in {"FAILED", "FAIL"}:
+        return "失败", "danger"
+    if status_value in {"CANCELED", "CANCELLED"}:
+        return "已取消", "secondary"
+    return (status_value or "未知"), "secondary"
+
+
+def _admin_withdraw_status_meta(status: Any) -> tuple[str, str]:
+    status_value = str(status or "").strip().upper()
+    if status_value == "REVIEWING":
+        return "待审核", "info"
+    if status_value == "VERIFYING":
+        return "待验证", "warning"
+    if status_value == "FROZEN":
+        return "已冻结", "warning"
+    if status_value in {"SENDING", "SENT", "BROADCASTING", "PROCESSING"}:
+        return "出金中", "warning"
+    if status_value in {"SUCCESS", "CONFIRMED", "COMPLETED", "SUCCEEDED"}:
+        return "成功", "success"
+    if status_value in {"FAILED", "REJECTED"}:
+        return "失败", "danger"
+    if status_value in {"CANCELED", "CANCELLED"}:
+        return "已取消", "secondary"
+    return (status_value or "未知"), "secondary"
+
+
+def _admin_transfer_status_meta(status: Any) -> tuple[str, str]:
+    status_value = str(status or "").strip().upper()
+    if status_value in {"SUCCESS", "COMPLETED"}:
+        return "成功", "success"
+    if status_value in {"PENDING", "PROCESSING"}:
+        return "处理中", "warning"
+    if status_value == "FAILED":
+        return "失败", "danger"
+    if status_value in {"CANCELED", "CANCELLED"}:
+        return "已取消", "secondary"
+    return (status_value or "未知"), "secondary"
+
+
+def _admin_adjust_status_meta(status: Any) -> tuple[str, str]:
+    status_value = str(status or "").strip().upper()
+    if status_value in {"SUCCESS", "COMPLETED"}:
+        return "成功", "success"
+    if status_value in {"PENDING", "PROCESSING"}:
+        return "处理中", "warning"
+    if status_value in {"FAILED", "REJECTED"}:
+        return "失败", "danger"
+    if status_value in {"CANCELED", "CANCELLED"}:
+        return "已取消", "secondary"
+    return (status_value or "未知"), "secondary"
+
+
+def _format_balance_log_type_label(value: Any) -> str:
+    value_text = str(value or "").strip().upper()
+    labels = {
+        "FREEZE": "冻结",
+        "UNFREEZE": "解冻",
+        "TRANSFER_IN": "转入",
+        "TRANSFER_OUT": "转出",
+        "DEPOSIT": "充值到账",
+        "CHAIN_DEPOSIT": "充值到账",
+        "DEPOSIT_CONFIRM": "充值到账",
+        "WITHDRAW": "提现冻结",
+        "WITHDRAW_FREEZE": "提现冻结",
+        "WITHDRAW_FEE_FREEZE": "提现手续费冻结",
+        "WITHDRAW_SEND": "提现发送",
+        "WITHDRAW_SUCCESS": "提现成功",
+        "WITHDRAW_FEE_SUCCESS": "提现手续费扣除",
+        "WITHDRAW_UNFREEZE": "提现解冻",
+        "WITHDRAW_FEE_UNFREEZE": "提现手续费解冻",
+        "WITHDRAW_CANCEL": "提现取消",
+        "WITHDRAW_FEE_CANCEL": "提现手续费取消",
+        "WITHDRAW_FAILED": "提现失败",
+        "TRADE_BUY": "现货买入",
+        "SPOT_BUY": "现货买入",
+        "TRADE_SELL": "现货卖出",
+        "SPOT_SELL": "现货卖出",
+        "TRADE_FREEZE": "交易冻结",
+        "TRADE_UNFREEZE": "交易解冻",
+        "TRADE_FEE_DEBIT": "交易手续费扣除",
+        "TRADE_FEE_CREDIT": "平台手续费收入",
+        "TRANSFER": "站内划转",
+        "USER_TRANSFER": "站内划转",
+        "USER_TRANSFER_OUT": "站内转出",
+        "USER_TRANSFER_IN": "站内转入",
+        "ACCOUNT_TRANSFER": "账户划转",
+        "PLATFORM_ADJUST": "平台调账",
+        "ADMIN_ADJUST": "后台调账",
+        "MANUAL_ADJUST": "人工调账",
+        "DIVIDEND_PAYOUT": "SVIP 分红发放",
+        "BD_COMMISSION_PAYOUT": "BD 佣金发放",
+        "USER_INVITE_COMMISSION_PAYOUT": "邀请奖励发放",
+        "INVITE_REWARD": "邀请奖励",
+        "STOCK_TOKEN_LOCK": "股票代币锁仓",
+        "STOCK_TOKEN_RELEASE": "股票代币释放",
+        "STOCK_TOKEN_CONVERT": "股票代币兑换",
+        "GAS_TOPUP": "补 Gas",
+        "COLLECTION": "资金归集",
+        "CONTRACT_TRANSFER_IN": "合约转入",
+        "CONTRACT_TRANSFER_OUT": "合约转出",
+        "CONTRACT_OPEN_MARGIN": "合约开仓保证金",
+        "CONTRACT_MARGIN_RELEASE": "合约保证金释放",
+        "CONTRACT_REALIZED_PNL": "合约已实现盈亏",
+        "CONTRACT_LIQUIDATION": "合约强平",
+        "LIQUIDATION_ZERO": "合约强平清零",
+        "CONTRACT_TRANSFER": "合约划转",
+        "REALIZED_PNL": "已实现盈亏",
+        "OPEN_MARGIN_FREEZE": "开仓保证金冻结",
+        "OPEN_MARGIN_USED": "开仓保证金占用",
+        "OPEN_FEE": "开仓手续费",
+        "CLOSE_RELEASE": "平仓释放",
+        "CONTRACT_SPREAD_FEE": "合约点差费",
+        "MATCHING_DIRTY_ORDER_RELEASE": "异常订单释放",
+        "RCB_LOCK": "RCB 锁仓",
+        "DIVIDEND_CREDIT": "分红入账",
+        "DIVIDEND_DEBIT": "分红扣款",
+        "BD_COMMISSION_CREDIT": "BD 佣金入账",
+        "BD_COMMISSION_DEBIT": "BD 佣金扣款",
+        "USER_INVITE_COMMISSION_CREDIT": "邀请奖励入账",
+        "USER_INVITE_COMMISSION_DEBIT": "邀请奖励扣款",
+    }
+    return labels.get(value_text, value_text or "--")
+
+
+def _format_balance_log_biz_type_label(value: Any) -> str:
+    return _format_balance_log_type_label(value)
+
+
+def _format_balance_log_remark_cn(raw_remark: Any, business_type: Any = None) -> str:
+    remark = str(raw_remark or "").strip()
+    if not remark:
+        return "--"
+    if any("\u4e00" <= char <= "\u9fff" for char in remark):
+        return remark
+
+    normalized = " ".join(
+        remark.lower()
+        .replace("_", " ")
+        .replace("-", " ")
+        .split()
+    )
+    labels = {
+        "liquidation realized pnl": "强平已实现盈亏",
+        "liquidation margin release": "强平保证金释放",
+        "contract close spread cost": "平仓点差费",
+        "close realized pnl": "平仓已实现盈亏",
+        "contract open spread cost": "开仓点差费",
+        "contract margin freeze": "合约保证金冻结",
+        "contract margin release": "合约保证金释放",
+        "order created": "下单冻结",
+        "order canceled": "撤单释放",
+        "order cancelled": "撤单释放",
+        "trade fee": "交易手续费",
+        "withdraw freeze": "提现冻结",
+        "withdraw unfreeze": "提现解冻",
+        "withdraw fee freeze": "提现手续费冻结",
+        "deposit confirmed": "充值到账",
+    }
+    if normalized in labels:
+        return labels[normalized]
+    for prefix, label in labels.items():
+        if normalized.startswith(f"{prefix} "):
+            return label
+
+    business_key = str(business_type or "").strip().upper()
+    if business_key in {"DEPOSIT", "CHAIN_DEPOSIT", "DEPOSIT_CONFIRM"}:
+        return "充值到账"
+    if business_key in {"TRADE_FEE", "TRADE_FEE_DEBIT", "TRADE_FEE_CREDIT"}:
+        return "交易手续费"
+    return "--"
+
+
+def _admin_withdraw_status_label(status: Any) -> str:
+    status_value = str(status or "").strip().upper()
+    labels = {
+        "REVIEWING": "REVIEWING",
+        "VERIFYING": "VERIFYING",
+        "FROZEN": "FROZEN",
+        "PENDING": "PENDING",
+        "PROCESSING": "PROCESSING",
+        "APPROVED": "APPROVED",
+        "SENDING": "SENDING",
+        "SENT": "SENT",
+        "SUCCESS": "SUCCESS",
+        "FAILED": "FAILED",
+        "REJECTED": "REJECTED",
+        "CANCELED": "CANCELED",
+        "CANCELLED": "CANCELLED",
+    }
+    return labels.get(status_value, status_value or "--")
+
+
+def _admin_withdraw_review_reason_expr(db: Session) -> str:
+    candidates = (
+        "review_reason",
+        "risk_reason",
+        "reject_reason",
+        "reason",
+        "audit_reason",
+        "remark",
+        "error_message",
+        "fail_reason",
+    )
+    params = {f"reason_col_{index}": column for index, column in enumerate(candidates)}
+    placeholders = ", ".join(f":reason_col_{index}" for index in range(len(candidates)))
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT COLUMN_NAME AS column_name
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'withdraw_logs'
+                  AND COLUMN_NAME IN ({placeholders})
+                """
+            ),
+            params,
+        ).mappings().all()
+    except Exception:
+        return "w.fail_reason AS risk_reason"
+
+    existing = {str(row.get("column_name") or "") for row in rows}
+    reason_columns = [column for column in candidates if column in existing]
+    if not reason_columns:
+        return "w.fail_reason AS risk_reason"
+    if len(reason_columns) == 1:
+        return f"NULLIF(w.{reason_columns[0]}, '') AS risk_reason"
+    joined = ", ".join(f"NULLIF(w.{column}, '')" for column in reason_columns)
+    return f"COALESCE({joined}) AS risk_reason"
+
+
+def _withdraw_review_note_column(db: Session) -> Optional[str]:
+    candidates = (
+        "review_reason",
+        "audit_reason",
+        "remark",
+        "reason",
+        "risk_reason",
+        "reject_reason",
+        "fail_reason",
+        "error_message",
+    )
+    existing = _admin_table_column_set(db, "withdraw_logs", candidates)
+    for column in candidates:
+        if column in existing:
+            return column
+    return None
+
+
+def admin_review_withdraw(
+    db: Session,
+    withdraw_id: int,
+    action: str,
+    risk_reason: str = "",
+) -> Dict[str, Any]:
+    action_value = str(action or "").strip().upper()
+    if action_value not in {"APPROVE", "APPROVED", "REJECT", "REJECTED"}:
+        raise WithdrawReviewError("Unsupported withdraw review action")
+
+    row = db.execute(
+        text(
+            """
+            SELECT id, status, tx_hash
+            FROM withdraw_logs
+            WHERE id = :withdraw_id
+            """
+        ),
+        {"withdraw_id": int(withdraw_id)},
+    ).mappings().first()
+    if not row:
+        raise WithdrawReviewError("Withdraw review record not found")
+
+    current_status = str(row.get("status") or "").strip().upper()
+    if current_status != "REVIEWING":
+        raise WithdrawReviewError(f"Withdraw status is {current_status or 'UNKNOWN'}, cannot review")
+
+    columns = _admin_table_column_set(
+        db,
+        "withdraw_logs",
+        (
+            "verify_code_hash",
+            "verify_expires_at",
+            "updated_at",
+            "reviewed_at",
+            "review_at",
+            "audit_at",
+            "approved_at",
+            "rejected_at",
+        ),
+    )
+    note_column = _withdraw_review_note_column(db)
+    set_parts = ["status = :next_status"]
+    params: Dict[str, Any] = {
+        "withdraw_id": int(withdraw_id),
+        "current_status": current_status,
+    }
+
+    if "verify_code_hash" in columns:
+        set_parts.append("verify_code_hash = NULL")
+    if "verify_expires_at" in columns:
+        set_parts.append("verify_expires_at = NULL")
+    if "updated_at" in columns:
+        set_parts.append("updated_at = UTC_TIMESTAMP()")
+    for timestamp_column in ("reviewed_at", "review_at", "audit_at"):
+        if timestamp_column in columns:
+            set_parts.append(f"{timestamp_column} = UTC_TIMESTAMP()")
+
+    if action_value in {"APPROVE", "APPROVED"}:
+        next_status = "VERIFYING"
+        review_note = "admin_approved_email_verification_required"
+        if "approved_at" in columns:
+            set_parts.append("approved_at = UTC_TIMESTAMP()")
+    else:
+        next_status = "REJECTED"
+        review_note = str(risk_reason or "admin_rejected").strip()[:255]
+        if "rejected_at" in columns:
+            set_parts.append("rejected_at = UTC_TIMESTAMP()")
+
+    params.update({"next_status": next_status, "review_note": review_note})
+    if note_column:
+        set_parts.append(f"{note_column} = :review_note")
+
+    result = db.execute(
+        text(
+            f"""
+            UPDATE withdraw_logs
+            SET {", ".join(set_parts)}
+            WHERE id = :withdraw_id
+              AND status = :current_status
+              AND (tx_hash IS NULL OR tx_hash = '')
+            """
+        ),
+        params,
+    )
+    if result.rowcount != 1:
+        raise WithdrawReviewError("Withdraw status changed, cannot review")
+
+    return {"ok": True, "withdraw_id": int(withdraw_id), "status": next_status}
+
+
+def _admin_decimal(value: Any) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+
+
+def _admin_withdraw_release_amount(value: Any) -> Optional[Decimal]:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    try:
+        amount = Decimal(text_value)
+    except (InvalidOperation, ValueError):
+        raise AdminWithdrawUnfreezeError("释放金额格式不正确")
+    if amount <= 0:
+        raise AdminWithdrawUnfreezeError("释放金额必须大于 0")
+    return amount
+
+
+def _admin_withdraw_log_sum(db: Session, withdraw_id: int, change_types: Iterable[str], coin_symbol: str) -> Decimal:
+    types = tuple(change_types)
+    if not types:
+        return Decimal("0")
+    params = {f"ct_{idx}": change_type for idx, change_type in enumerate(types)}
+    placeholders = ", ".join(f":ct_{idx}" for idx in range(len(types)))
+    row = db.execute(
+        text(
+            f"""
+            SELECT COALESCE(SUM(change_amount), 0) AS amount
+            FROM balance_logs
+            WHERE biz_type='WITHDRAW'
+              AND biz_id=:biz_id
+              AND coin_symbol=:coin_symbol
+              AND change_type IN ({placeholders})
+            """
+        ),
+        {"biz_id": str(int(withdraw_id)), "coin_symbol": coin_symbol, **params},
+    ).mappings().first()
+    return _admin_decimal(row.get("amount") if row else 0)
+
+
+def _admin_withdraw_release_components(db: Session, withdraw_id: int, coin_symbol: str) -> list[Dict[str, Any]]:
+    principal_coin = str(coin_symbol or "").strip().upper()
+    principal_frozen = _admin_withdraw_log_sum(db, withdraw_id, ("WITHDRAW_FREEZE",), principal_coin)
+    principal_closed = _admin_withdraw_log_sum(
+        db,
+        withdraw_id,
+        ("WITHDRAW_UNFREEZE", "WITHDRAW_CANCEL", "WITHDRAW_SUCCESS"),
+        principal_coin,
+    )
+    fee_frozen = _admin_withdraw_log_sum(db, withdraw_id, ("WITHDRAW_FEE_FREEZE",), "USDT")
+    fee_closed = _admin_withdraw_log_sum(
+        db,
+        withdraw_id,
+        ("WITHDRAW_FEE_UNFREEZE", "WITHDRAW_FEE_CANCEL", "WITHDRAW_FEE_SUCCESS"),
+        "USDT",
+    )
+    components: list[Dict[str, Any]] = []
+    principal_remaining = principal_frozen - principal_closed
+    if principal_remaining > 0:
+        components.append(
+            {
+                "coin_symbol": principal_coin,
+                "amount": principal_remaining,
+                "change_type": "WITHDRAW_UNFREEZE",
+                "remark": "admin_release_unbroadcast principal",
+            }
+        )
+    fee_remaining = fee_frozen - fee_closed
+    if fee_remaining > 0:
+        components.append(
+            {
+                "coin_symbol": "USDT",
+                "amount": fee_remaining,
+                "change_type": "WITHDRAW_FEE_UNFREEZE",
+                "remark": "admin_release_unbroadcast fee",
+            }
+        )
+    return components
+
+
+def _admin_withdraw_release_confirm_amount(components: list[Dict[str, Any]], coin_symbol: str) -> Decimal:
+    principal_coin = str(coin_symbol or "").strip().upper()
+    total = Decimal("0")
+    for component in components:
+        component_coin = str(component.get("coin_symbol") or "").strip().upper()
+        change_type = str(component.get("change_type") or "").strip().upper()
+        if change_type == "WITHDRAW_UNFREEZE" or component_coin == principal_coin:
+            total += _admin_decimal(component.get("amount"))
+    return total
+
+
+def _admin_apply_withdraw_unfreeze_component(
+    db: Session,
+    *,
+    user_id: int,
+    coin_symbol: str,
+    withdraw_id: int,
+    amount: Decimal,
+    change_type: str,
+    remark: str,
+) -> None:
+    if amount <= 0:
+        return
+
+    bal = db.execute(
+        text(
+            """
+            SELECT id, available_amount, frozen_amount
+            FROM user_balances
+            WHERE user_id=:user_id
+              AND coin_symbol=:coin_symbol
+              AND chain_key='funding'
+            FOR UPDATE
+            """
+        ),
+        {"user_id": int(user_id), "coin_symbol": coin_symbol},
+    ).mappings().first()
+    if not bal:
+        raise AdminWithdrawUnfreezeError(f"Funding balance missing for {coin_symbol}")
+
+    before_available = _admin_decimal(bal.get("available_amount"))
+    before_frozen = _admin_decimal(bal.get("frozen_amount"))
+    if before_frozen < amount:
+        raise AdminWithdrawUnfreezeError(
+            f"{coin_symbol} 冻结余额不足：当前冻结 {before_frozen}，需要释放 {amount}"
+        )
+
+    after_available = before_available + amount
+    after_frozen = before_frozen - amount
+    now = datetime.utcnow()
+    result = db.execute(
+        text(
+            """
+            UPDATE user_balances
+            SET available_amount=:after_available,
+                frozen_amount=:after_frozen,
+                version=version+1,
+                updated_at=:now
+            WHERE id=:id
+            """
+        ),
+        {
+            "after_available": after_available,
+            "after_frozen": after_frozen,
+            "now": now,
+            "id": bal.get("id"),
+        },
+    )
+    if result.rowcount != 1:
+        raise AdminWithdrawUnfreezeError("Update user balance failed")
+
+    db.execute(
+        text(
+            """
+            INSERT INTO balance_logs
+              (user_id, coin_symbol, chain_key,
+               change_type, direction, change_amount,
+               before_available, after_available,
+               before_frozen, after_frozen,
+               biz_type, biz_id, request_id, remark, created_at)
+            VALUES
+              (:user_id, :coin_symbol, 'funding',
+               :change_type, 1, :amount,
+               :before_available, :after_available,
+               :before_frozen, :after_frozen,
+               'WITHDRAW', :biz_id, :request_id, :remark, :now)
+            """
+        ),
+        {
+            "user_id": int(user_id),
+            "coin_symbol": coin_symbol,
+            "change_type": change_type,
+            "amount": amount,
+            "before_available": before_available,
+            "after_available": after_available,
+            "before_frozen": before_frozen,
+            "after_frozen": after_frozen,
+            "biz_id": str(int(withdraw_id)),
+            "request_id": f"ADMIN_RELEASE:{int(withdraw_id)}:{change_type}",
+            "remark": remark,
+            "now": now,
+        },
+    )
+
+
+def admin_release_unbroadcast_withdraw_frozen(
+    db: Session,
+    withdraw_id: int,
+    *,
+    release_amount: Any = None,
+    admin_note: str = "",
+) -> Dict[str, Any]:
+    row = db.execute(
+        text(
+            """
+            SELECT id, user_id, coin_symbol, status, tx_hash
+            FROM withdraw_logs
+            WHERE id=:withdraw_id
+            FOR UPDATE
+            """
+        ),
+        {"withdraw_id": int(withdraw_id)},
+    ).mappings().first()
+    if not row:
+        raise AdminWithdrawUnfreezeError("提现记录不存在")
+
+    status = str(row.get("status") or "").strip().upper()
+    releasable_statuses = {"FAILED", "FROZEN", "SEND_FAILED", "PROCESSING", "APPROVED"}
+    if status not in releasable_statuses:
+        raise AdminWithdrawUnfreezeError(f"当前状态 {status or 'UNKNOWN'} 不允许释放冻结金额")
+    if str(row.get("tx_hash") or "").strip():
+        raise AdminWithdrawUnfreezeError("该提现已存在 TxID，不能在后台直接释放冻结金额")
+
+    components = _admin_withdraw_release_components(db, int(withdraw_id), str(row.get("coin_symbol") or ""))
+    total_remaining = sum((_admin_decimal(component.get("amount")) for component in components), Decimal("0"))
+    confirm_amount = _admin_withdraw_release_confirm_amount(
+        components,
+        str(row.get("coin_symbol") or ""),
+    )
+    if not components:
+        raise AdminWithdrawUnfreezeError("无可释放冻结金额")
+
+    requested_release_amount = _admin_withdraw_release_amount(release_amount)
+    if requested_release_amount is not None:
+        if requested_release_amount > confirm_amount:
+            raise AdminWithdrawUnfreezeError(
+                f"释放金额不能超过该提现单实际冻结剩余金额：{confirm_amount}"
+            )
+        if requested_release_amount != confirm_amount:
+            raise AdminWithdrawUnfreezeError(
+                f"请输入该提现单实际可释放金额 {confirm_amount} 后再提交"
+            )
+
+    released: list[Dict[str, Any]] = []
+    for component in components:
+        _admin_apply_withdraw_unfreeze_component(
+            db,
+            user_id=int(row.get("user_id")),
+            coin_symbol=str(component["coin_symbol"]),
+            withdraw_id=int(withdraw_id),
+            amount=component["amount"],
+            change_type=str(component["change_type"]),
+            remark=str(component["remark"]),
+        )
+        released.append(
+            {
+                "coin_symbol": str(component["coin_symbol"]),
+                "amount": str(component["amount"]),
+                "change_type": str(component["change_type"]),
+            }
+        )
+
+    note = (admin_note or "ADMIN_RELEASE_UNBROADCAST: chain tx not broadcast, frozen balance released")[:255]
+    note_column = _withdraw_review_note_column(db)
+    set_parts = ["status='CANCELED'", "updated_at=UTC_TIMESTAMP()"]
+    params: Dict[str, Any] = {
+        "withdraw_id": int(withdraw_id),
+        "note": note,
+        **{f"release_status_{index}": value for index, value in enumerate(sorted(releasable_statuses))},
+    }
+    status_placeholders = ", ".join(
+        f":release_status_{index}" for index in range(len(releasable_statuses))
+    )
+    if note_column:
+        set_parts.append(f"{note_column}=:note")
+    result = db.execute(
+        text(
+            f"""
+            UPDATE withdraw_logs
+            SET {", ".join(set_parts)}
+            WHERE id=:withdraw_id
+              AND status IN ({status_placeholders})
+              AND (tx_hash IS NULL OR tx_hash = '')
+            """
+        ),
+        params,
+    )
+    if result.rowcount != 1:
+        raise AdminWithdrawUnfreezeError("提现状态已变化，无法释放冻结金额")
+
+    return {
+        "ok": True,
+        "withdraw_id": int(withdraw_id),
+        "status": "CANCELED",
+        "released_total": str(total_remaining),
+        "release_confirm_amount": str(confirm_amount),
+        "released": released,
+    }
+
+
+def admin_query_withdraw_anomalies(db: Session, limit: int = 50) -> Dict[str, Any]:
+    safe_limit = max(1, min(int(limit or 50), 100))
+    now = monotonic()
+    cached = _WITHDRAW_ANOMALY_CACHE.get("data")
+    if (
+        cached is not None
+        and int(_WITHDRAW_ANOMALY_CACHE.get("limit") or 0) == safe_limit
+        and float(_WITHDRAW_ANOMALY_CACHE.get("expires_at") or 0) > now
+    ):
+        return deepcopy(cached)
+    result = query_withdraw_anomalies(db, limit=safe_limit)
+    _WITHDRAW_ANOMALY_CACHE.update(
+        {
+            "expires_at": now + _WITHDRAW_ANOMALY_CACHE_SECONDS,
+            "limit": safe_limit,
+            "data": deepcopy(result),
+        }
+    )
+    return result
+
+
+def _admin_table_column_set(db: Session, table_name: str, candidates: Iterable[str]) -> set[str]:
+    candidate_list = [str(column or "").strip() for column in candidates if str(column or "").strip()]
+    if not candidate_list:
+        return set()
+    params: Dict[str, Any] = {"table_name": table_name}
+    placeholders = []
+    for index, column in enumerate(candidate_list):
+        key = f"column_{index}"
+        params[key] = column
+        placeholders.append(f":{key}")
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT COLUMN_NAME AS column_name
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = :table_name
+                  AND COLUMN_NAME IN ({", ".join(placeholders)})
+                """
+            ),
+            params,
+        ).mappings().all()
+    except Exception:
+        return set()
+    return {str(row.get("column_name") or "") for row in rows}
+
+
+def _admin_table_exists(db: Session, table_name: str) -> bool:
+    try:
+        bind = db.get_bind()
+        return bool(inspect(bind).has_table(table_name))
+    except Exception:
+        return False
+
+
+def _admin_withdraw_risk_reason_display(value: Any, status: Any = None) -> str:
+    raw = str(value or "").strip()
+    if raw.startswith("withdraw_risk:"):
+        raw = raw[len("withdraw_risk:") :].strip()
+    if not raw:
+        status_value = str(status or "").strip().upper()
+        return "触发人工审核" if status_value == "REVIEWING" else "-"
+
+    labels = {
+        "force_manual_review": "强制人工审核",
+        "manual_review": "触发人工审核",
+        "amount_threshold": "超过单笔审核阈值",
+        "daily_count_limit": "达到当日提现次数限制",
+        "daily_withdraw_count_limit": "达到当日提现次数限制",
+        "risk_review": "触发人工审核",
+    }
+    parts = []
+    for part in raw.replace(";", ",").replace("，", ",").split(","):
+        key = part.strip()
+        if not key:
+            continue
+        parts.append(labels.get(key, key))
+    return "、".join(dict.fromkeys(parts)) if parts else raw
+
+
+def _admin_withdraw_fail_reason_summary(value: Any, status: Any = None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "--"
+    upper = raw.upper()
+    status_value = str(status or "").strip().upper()
+    if "ADMIN_RELEASE" in upper:
+        return "已释放冻结"
+    if status_value == "SUCCESS":
+        return "--"
+    if upper.startswith("PRECHECK:") or "PRECHECK" in upper:
+        return "预检失败"
+    if "INSUFFICIENT" in upper or "BALANCE" in upper or "余额不足" in raw:
+        return "余额不足"
+    display = _admin_withdraw_risk_reason_display(raw, status)
+    if display and display not in {"-", raw}:
+        return display
+    if any("\u4e00" <= char <= "\u9fff" for char in raw):
+        return _admin_short_text(raw, 80)
+    return "提现处理失败"
+
+
+def _admin_page_meta(total: int, page: int, page_size: int) -> tuple[int, int, int]:
+    page = max(1, int(page or 1))
+    page_size = min(max(1, int(page_size or 20)), 100)
+    pages = max(1, (int(total or 0) + page_size - 1) // page_size)
+    if page > pages:
+        page = pages
+    return page, page_size, pages
+
+
+def admin_query_audit_logs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    audit_id = str(filters.get("audit_id") or "").strip()
+    admin_user_id = str(filters.get("admin_user_id") or "").strip()
+    operator_id = str(filters.get("operator_id") or "").strip()
+    target_user_id = str(filters.get("target_user_id") or "").strip()
+    action = str(filters.get("action") or "").strip()
+    module = str(filters.get("module") or "").strip()
+    request_id = str(filters.get("request_id") or "").strip()
+    ip = str(filters.get("ip") or "").strip()
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    normalized_filters = {
+        "audit_id": audit_id,
+        "admin_user_id": admin_user_id,
+        "operator_id": operator_id,
+        "target_user_id": target_user_id,
+        "action": action,
+        "module": module,
+        "request_id": request_id,
+        "ip": ip,
+        "created_from": created_from,
+        "created_to": created_to,
+        "date_from": created_from,
+        "date_to": created_to,
+        "page": page,
+        "page_size": page_size,
+    }
+
+    if not _admin_table_exists(db, "audit_logs"):
+        pagination = {"page": 1, "page_size": page_size, "total": 0, "pages": 1}
+        return {
+            "items": [],
+            "filters": normalized_filters,
+            "pagination": pagination,
+            "summary": {},
+            "stats": {},
+            "total": 0,
+            "page": 1,
+            "page_size": page_size,
+            "pages": 1,
+        }
+
+    optional_columns = _admin_table_column_set(
+        db,
+        "audit_logs",
+        (
+            "id",
+            "admin_user_id",
+            "operator_id",
+            "target_user_id",
+            "action",
+            "module",
+            "request_id",
+            "ip",
+            "ip_address",
+            "admin_ip",
+            "client_ip",
+            "detail",
+            "details",
+            "remark",
+            "description",
+            "created_at",
+            "updated_at",
+        ),
+    )
+    if "id" not in optional_columns or "created_at" not in optional_columns:
+        pagination = {"page": 1, "page_size": page_size, "total": 0, "pages": 1}
+        return {
+            "items": [],
+            "filters": normalized_filters,
+            "pagination": pagination,
+            "summary": {},
+            "stats": {},
+            "total": 0,
+            "page": 1,
+            "page_size": page_size,
+            "pages": 1,
+        }
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if audit_id:
+        where_parts.append("al.id = :audit_id")
+        params["audit_id"] = _parse_int(audit_id)
+    if admin_user_id:
+        if "admin_user_id" in optional_columns:
+            where_parts.append("al.admin_user_id = :admin_user_id")
+            params["admin_user_id"] = _parse_int(admin_user_id)
+        elif "operator_id" in optional_columns:
+            where_parts.append("al.operator_id = :admin_user_id")
+            params["admin_user_id"] = _parse_int(admin_user_id)
+        else:
+            where_parts.append("1 = 0")
+    if operator_id:
+        if "operator_id" in optional_columns:
+            where_parts.append("al.operator_id = :operator_id")
+            params["operator_id"] = _parse_int(operator_id)
+        elif "admin_user_id" in optional_columns:
+            where_parts.append("al.admin_user_id = :operator_id")
+            params["operator_id"] = _parse_int(operator_id)
+        else:
+            where_parts.append("1 = 0")
+    if target_user_id:
+        if "target_user_id" in optional_columns:
+            where_parts.append("al.target_user_id = :target_user_id")
+            params["target_user_id"] = _parse_int(target_user_id)
+        else:
+            where_parts.append("1 = 0")
+    if action:
+        if "action" in optional_columns:
+            where_parts.append("al.action = :action")
+            params["action"] = action
+        else:
+            where_parts.append("1 = 0")
+    if module:
+        if "module" in optional_columns:
+            where_parts.append("al.module = :module")
+            params["module"] = module
+        else:
+            where_parts.append("1 = 0")
+    if request_id:
+        if "request_id" in optional_columns:
+            where_parts.append("al.request_id LIKE :request_id")
+            params["request_id"] = f"%{request_id}%"
+        else:
+            where_parts.append("1 = 0")
+    if ip:
+        ip_columns = [column for column in ("ip", "ip_address", "admin_ip", "client_ip") if column in optional_columns]
+        if ip_columns:
+            where_parts.append("(" + " OR ".join(f"al.{column} LIKE :ip" for column in ip_columns) + ")")
+            params["ip"] = f"%{ip}%"
+        else:
+            where_parts.append("1 = 0")
+    if created_from:
+        where_parts.append("DATE(al.created_at) >= :created_from")
+        params["created_from"] = created_from
+    if created_to:
+        where_parts.append("DATE(al.created_at) <= :created_to")
+        params["created_to"] = created_to
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM audit_logs al {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    query_params = {**params, "limit": page_size, "offset": (page - 1) * page_size}
+
+    def _select_column(column: str, alias: Optional[str] = None) -> str:
+        output_name = alias or column
+        return f"al.{column} AS {output_name}" if column in optional_columns else f"NULL AS {output_name}"
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                al.id,
+                {_select_column("admin_user_id")},
+                {_select_column("operator_id")},
+                {_select_column("target_user_id")},
+                {_select_column("action")},
+                {_select_column("module")},
+                {_select_column("request_id")},
+                {_select_column("ip")},
+                {_select_column("ip_address")},
+                {_select_column("admin_ip")},
+                {_select_column("client_ip")},
+                {_select_column("detail")},
+                {_select_column("details")},
+                {_select_column("remark")},
+                {_select_column("description")},
+                al.created_at,
+                {_select_column("updated_at")}
+            FROM audit_logs al
+            {where_sql}
+            ORDER BY al.created_at DESC, al.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        query_params,
+    ).mappings().all()
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        action_value = row_dict.get("action") or ""
+        module_value = row_dict.get("module") or ""
+        request_id_value = row_dict.get("request_id") or ""
+        ip_value = (
+            row_dict.get("ip")
+            or row_dict.get("ip_address")
+            or row_dict.get("admin_ip")
+            or row_dict.get("client_ip")
+            or ""
+        )
+        detail_value = (
+            row_dict.get("detail")
+            or row_dict.get("details")
+            or row_dict.get("remark")
+            or row_dict.get("description")
+            or ""
+        )
+        operator_value = row_dict.get("operator_id") or row_dict.get("admin_user_id")
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "audit_id": row_dict.get("id"),
+                "admin_user_id": row_dict.get("admin_user_id"),
+                "operator_id": operator_value,
+                "target_user_id": row_dict.get("target_user_id"),
+                "action": action_value,
+                "action_label": _admin_audit_action_label(action_value),
+                "module": module_value,
+                "module_label": _admin_audit_module_label(module_value),
+                "request_id": request_id_value,
+                "request_id_short": _short_admin_hash(request_id_value),
+                "ip": ip_value or "-",
+                "detail": detail_value or "-",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": normalized_filters,
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_deposit_records(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    deposit_id = str(filters.get("deposit_id") or "").strip()
+    deposit_no = str(filters.get("deposit_no") or "").strip()
+    user_id = str(filters.get("user_id") or "").strip()
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or filters.get("asset_symbol"))
+    chain_key = _normalize_chain_key(filters.get("chain_key") or filters.get("chain") or filters.get("network"))
+    status = str(filters.get("status") or "").strip().upper()
+    txid = str(filters.get("txid") or filters.get("tx_hash") or "").strip()
+    request_id = str(filters.get("request_id") or "").strip()
+    address = str(filters.get("address") or "").strip()
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    optional_columns = _admin_table_column_set(db, "deposits", ("deposit_no", "request_id"))
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if deposit_id:
+        where_parts.append("d.id = :deposit_id")
+        params["deposit_id"] = _parse_int(deposit_id)
+    if deposit_no:
+        if "deposit_no" in optional_columns:
+            where_parts.append("d.deposit_no LIKE :deposit_no")
+            params["deposit_no"] = f"%{deposit_no}%"
+        else:
+            where_parts.append("1 = 0")
+    if user_id:
+        where_parts.append("d.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if coin_symbol:
+        where_parts.append("d.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if chain_key:
+        where_parts.append("d.chain_key = :chain_key")
+        params["chain_key"] = chain_key
+    if status:
+        where_parts.append("d.status = :status")
+        params["status"] = status
+    if txid:
+        where_parts.append("d.txid LIKE :txid")
+        params["txid"] = f"%{txid}%"
+    if request_id:
+        if "request_id" in optional_columns:
+            where_parts.append("d.request_id LIKE :request_id")
+            params["request_id"] = f"%{request_id}%"
+        else:
+            where_parts.append("1 = 0")
+    if address:
+        where_parts.append("(d.address LIKE :address OR d.from_address LIKE :address)")
+        params["address"] = f"%{address}%"
+    if created_from:
+        where_parts.append("DATE(d.created_at) >= :created_from")
+        params["created_from"] = created_from
+    if created_to:
+        where_parts.append("DATE(d.created_at) <= :created_to")
+        params["created_to"] = created_to
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM deposits d {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    query_params = {**params, "limit": page_size, "offset": (page - 1) * page_size}
+    deposit_no_select = "d.deposit_no" if "deposit_no" in optional_columns else "NULL AS deposit_no"
+    request_id_select = "d.request_id" if "request_id" in optional_columns else "NULL AS request_id"
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                d.id,
+                d.user_id,
+                d.coin_symbol,
+                d.chain_key,
+                d.amount,
+                d.status,
+                d.confirmations,
+                d.confirm_required,
+                d.txid,
+                {deposit_no_select},
+                {request_id_select},
+                d.from_address,
+                d.address,
+                d.created_at,
+                d.confirmed_at
+            FROM deposits d
+            {where_sql}
+            ORDER BY d.created_at DESC, d.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        query_params,
+    ).mappings().all()
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        coin_symbol_display = row_dict.get("coin_symbol") or ""
+        status_label, status_badge = _admin_deposit_status_meta(row_dict.get("status"))
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "deposit_id": row_dict.get("id"),
+                "deposit_no": row_dict.get("deposit_no") or "",
+                "deposit_no_short": _short_admin_hash(row_dict.get("deposit_no")),
+                "user_id": row_dict.get("user_id"),
+                "coin_symbol": coin_symbol_display,
+                "chain_key": row_dict.get("chain_key") or "",
+                "amount": _fmt_admin_amount_display(row_dict.get("amount"), coin_symbol_display),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "confirmations": int(row_dict.get("confirmations") or 0),
+                "confirm_required": int(row_dict.get("confirm_required") or 0),
+                "txid": row_dict.get("txid") or "",
+                "txid_short": _short_admin_hash(row_dict.get("txid")),
+                "tx_hash": row_dict.get("txid") or "",
+                "tx_hash_short": _short_admin_hash(row_dict.get("txid")),
+                "request_id": row_dict.get("request_id") or "",
+                "request_id_short": _short_admin_hash(row_dict.get("request_id")),
+                "from_address": row_dict.get("from_address") or "",
+                "from_address_short": _short_admin_address(row_dict.get("from_address")),
+                "address": row_dict.get("address") or "",
+                "address_short": _short_admin_address(row_dict.get("address")),
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "confirmed_at": _admin_datetime_display(row_dict.get("confirmed_at")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "deposit_id": deposit_id,
+            "deposit_no": deposit_no,
+            "user_id": user_id,
+            "coin_symbol": coin_symbol,
+            "chain_key": chain_key,
+            "status": status,
+            "txid": txid,
+            "tx_hash": txid,
+            "request_id": request_id,
+            "address": address,
+            "created_from": created_from,
+            "created_to": created_to,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_withdraw_records(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    withdraw_id = str(filters.get("withdraw_id") or "").strip()
+    withdraw_no = str(filters.get("withdraw_no") or "").strip()
+    user_id = str(filters.get("user_id") or "").strip()
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or filters.get("asset_symbol"))
+    chain_key = _normalize_chain_key(filters.get("chain_key") or filters.get("chain") or filters.get("network"))
+    status = str(filters.get("status") or "").strip().upper()
+    status_group = str(filters.get("status_group") or "").strip().upper()
+    status_values = _admin_withdraw_status_values(status, status_group)
+    tx_hash = str(filters.get("tx_hash") or "").strip()
+    request_id = str(filters.get("request_id") or "").strip()
+    to_address = str(filters.get("to_address") or "").strip()
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    optional_columns = _admin_table_column_set(db, "withdraw_logs", ("withdraw_no", "request_id"))
+    reason_expr = _admin_withdraw_review_reason_expr(db)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if withdraw_id:
+        where_parts.append("w.id = :withdraw_id")
+        params["withdraw_id"] = _parse_int(withdraw_id)
+    if withdraw_no:
+        if "withdraw_no" in optional_columns:
+            where_parts.append("w.withdraw_no LIKE :withdraw_no")
+            params["withdraw_no"] = f"%{withdraw_no}%"
+        else:
+            where_parts.append("1 = 0")
+    if user_id:
+        where_parts.append("w.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if coin_symbol:
+        where_parts.append("w.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if chain_key:
+        where_parts.append("w.chain_key = :chain_key")
+        params["chain_key"] = chain_key
+    if status_values:
+        status_params = []
+        for index, status_value in enumerate(status_values):
+            key = f"status_{index}"
+            status_params.append(f":{key}")
+            params[key] = status_value
+        where_parts.append(f"w.status IN ({', '.join(status_params)})")
+    if tx_hash:
+        where_parts.append("w.tx_hash LIKE :tx_hash")
+        params["tx_hash"] = f"%{tx_hash}%"
+    if request_id:
+        if "request_id" in optional_columns:
+            where_parts.append("w.request_id LIKE :request_id")
+            params["request_id"] = f"%{request_id}%"
+        else:
+            where_parts.append("1 = 0")
+    if to_address:
+        where_parts.append("w.to_address LIKE :to_address")
+        params["to_address"] = f"%{to_address}%"
+    if created_from:
+        where_parts.append("DATE(w.created_at) >= :created_from")
+        params["created_from"] = created_from
+    if created_to:
+        where_parts.append("DATE(w.created_at) <= :created_to")
+        params["created_to"] = created_to
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM withdraw_logs w {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    query_params = {**params, "limit": page_size, "offset": (page - 1) * page_size}
+    withdraw_no_select = "w.withdraw_no" if "withdraw_no" in optional_columns else "NULL AS withdraw_no"
+    request_id_select = "w.request_id" if "request_id" in optional_columns else "NULL AS request_id"
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                w.id,
+                w.user_id,
+                w.coin_symbol,
+                w.chain_key,
+                w.to_address,
+                w.amount,
+                w.fee,
+                w.net_amount,
+                w.status,
+                w.tx_hash,
+                {reason_expr},
+                {withdraw_no_select},
+                {request_id_select},
+                (
+                    SELECT
+                        COALESCE(SUM(CASE
+                            WHEN bl.change_type IN ('WITHDRAW_FREEZE', 'WITHDRAW_FEE_FREEZE')
+                            THEN bl.change_amount
+                            ELSE 0
+                        END), 0)
+                        -
+                        COALESCE(SUM(CASE
+                            WHEN bl.change_type IN (
+                                'WITHDRAW_UNFREEZE',
+                                'WITHDRAW_FEE_UNFREEZE',
+                                'WITHDRAW_CANCEL',
+                                'WITHDRAW_FEE_CANCEL',
+                                'WITHDRAW_SUCCESS',
+                                'WITHDRAW_FEE_SUCCESS'
+                            )
+                            THEN bl.change_amount
+                            ELSE 0
+                        END), 0)
+                    FROM balance_logs bl
+                    WHERE bl.biz_type='WITHDRAW'
+                      AND bl.biz_id=CAST(w.id AS CHAR)
+                ) AS frozen_remaining,
+                (
+                    SELECT
+                        COALESCE(SUM(CASE
+                            WHEN bl.change_type = 'WITHDRAW_FREEZE'
+                            THEN bl.change_amount
+                            ELSE 0
+                        END), 0)
+                        -
+                        COALESCE(SUM(CASE
+                            WHEN bl.change_type IN ('WITHDRAW_UNFREEZE', 'WITHDRAW_CANCEL', 'WITHDRAW_SUCCESS')
+                            THEN bl.change_amount
+                            ELSE 0
+                        END), 0)
+                    FROM balance_logs bl
+                    WHERE bl.biz_type='WITHDRAW'
+                      AND bl.biz_id=CAST(w.id AS CHAR)
+                      AND bl.coin_symbol=w.coin_symbol
+                ) AS principal_frozen_remaining,
+                (
+                    SELECT
+                        COALESCE(SUM(CASE
+                            WHEN bl.change_type = 'WITHDRAW_FEE_FREEZE'
+                            THEN bl.change_amount
+                            ELSE 0
+                        END), 0)
+                        -
+                        COALESCE(SUM(CASE
+                            WHEN bl.change_type IN ('WITHDRAW_FEE_UNFREEZE', 'WITHDRAW_FEE_CANCEL', 'WITHDRAW_FEE_SUCCESS')
+                            THEN bl.change_amount
+                            ELSE 0
+                        END), 0)
+                    FROM balance_logs bl
+                    WHERE bl.biz_type='WITHDRAW'
+                      AND bl.biz_id=CAST(w.id AS CHAR)
+                      AND bl.coin_symbol='USDT'
+                ) AS fee_frozen_remaining,
+                w.created_at,
+                w.updated_at
+            FROM withdraw_logs w
+            {where_sql}
+            ORDER BY w.created_at DESC, w.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        query_params,
+    ).mappings().all()
+
+    anomaly_overview = admin_query_withdraw_anomalies(db, limit=100)
+    anomaly_summary = anomaly_overview.get("summary") or {}
+    failed_frozen_ids = {int(item.get("withdraw_id")) for item in anomaly_overview.get("failed_frozen_candidates", [])}
+    fee_issue_ids = {int(item.get("withdraw_id")) for item in anomaly_overview.get("fee_issues", [])}
+    precheck_failure_ids = {int(item.get("withdraw_id")) for item in anomaly_overview.get("precheck_failures", [])}
+    amount_net_mismatch_ids = {int(item.get("withdraw_id")) for item in anomaly_overview.get("amount_net_mismatch", [])}
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        withdraw_id_value = int(row_dict.get("id"))
+        coin_symbol_display = row_dict.get("coin_symbol") or ""
+        status_label, status_badge = _admin_withdraw_status_meta(row_dict.get("status"))
+        status_value = str(row_dict.get("status") or "").strip().upper()
+        frozen_remaining = _admin_decimal(row_dict.get("frozen_remaining"))
+        principal_frozen_remaining = _admin_decimal(row_dict.get("principal_frozen_remaining"))
+        fee_frozen_remaining = _admin_decimal(row_dict.get("fee_frozen_remaining"))
+        release_confirm_amount = (
+            principal_frozen_remaining + fee_frozen_remaining
+            if coin_symbol_display.upper() == "USDT"
+            else principal_frozen_remaining
+        )
+        tx_hash_value = row_dict.get("tx_hash") or ""
+        fail_reason = str(row_dict.get("risk_reason") or "").strip()
+        fail_reason_display = _admin_withdraw_fail_reason_summary(fail_reason, row_dict.get("status"))
+        fail_reason_upper = fail_reason.upper()
+        if fail_reason_upper.startswith("PRECHECK:") or withdraw_id_value in precheck_failure_ids:
+            fail_reason_badge = "danger"
+            risk_label = "预检失败"
+            risk_badge = "danger"
+        elif "ADMIN_RELEASE" in fail_reason_upper:
+            fail_reason_badge = "warning"
+            risk_label = "已释放冻结"
+            risk_badge = "warning"
+        elif status_value == "FAILED" and not str(tx_hash_value).strip():
+            fail_reason_badge = "secondary"
+            risk_label = "未广播"
+            risk_badge = "danger"
+        elif withdraw_id_value in fee_issue_ids:
+            fail_reason_badge = "secondary"
+            risk_label = "手续费异常候选"
+            risk_badge = "warning"
+        elif withdraw_id_value in amount_net_mismatch_ids:
+            fail_reason_badge = "secondary"
+            risk_label = "历史口径异常"
+            risk_badge = "secondary"
+        elif status_value == "SUCCESS":
+            fail_reason_badge = "secondary"
+            risk_label = "正常"
+            risk_badge = "success"
+        else:
+            fail_reason_badge = "secondary"
+            risk_label = "-"
+            risk_badge = "secondary"
+        items.append(
+            {
+                "id": withdraw_id_value,
+                "withdraw_id": withdraw_id_value,
+                "withdraw_no": row_dict.get("withdraw_no") or "",
+                "withdraw_no_short": _short_admin_hash(row_dict.get("withdraw_no")),
+                "user_id": row_dict.get("user_id"),
+                "coin_symbol": coin_symbol_display,
+                "chain_key": row_dict.get("chain_key") or "",
+                "amount": _fmt_admin_amount_display(row_dict.get("amount"), coin_symbol_display),
+                "fee": _fmt_admin_amount_display(row_dict.get("fee"), coin_symbol_display),
+                "net_amount": _fmt_admin_amount_display(row_dict.get("net_amount"), coin_symbol_display),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "tx_hash": tx_hash_value,
+                "tx_hash_short": _short_admin_hash(tx_hash_value),
+                "fail_reason": fail_reason,
+                "fail_reason_display": fail_reason_display,
+                "fail_reason_short": _admin_short_text(fail_reason_display, 40) if fail_reason_display != "--" else "--",
+                "fail_reason_badge": fail_reason_badge,
+                "risk_label": risk_label,
+                "risk_badge": risk_badge,
+                "anomaly_url": f"/admin/withdraw-anomalies?withdraw_id={withdraw_id_value}",
+                "is_failed_frozen_candidate": withdraw_id_value in failed_frozen_ids,
+                "is_fee_issue": withdraw_id_value in fee_issue_ids,
+                "is_precheck_failure": withdraw_id_value in precheck_failure_ids,
+                "is_amount_net_mismatch": withdraw_id_value in amount_net_mismatch_ids,
+                "frozen_remaining": str(frozen_remaining),
+                "frozen_remaining_display": _fmt_admin_amount_display(release_confirm_amount, coin_symbol_display),
+                "release_amount_value": format(release_confirm_amount.normalize(), "f") if release_confirm_amount > 0 else "",
+                "can_release_frozen": (
+                    status_value in {"FAILED", "FROZEN", "SEND_FAILED", "PROCESSING", "APPROVED"}
+                    and not str(tx_hash_value).strip()
+                    and frozen_remaining > 0
+                ),
+                "request_id": row_dict.get("request_id") or "",
+                "request_id_short": _short_admin_hash(row_dict.get("request_id")),
+                "to_address": row_dict.get("to_address") or "",
+                "to_address_short": _short_admin_address(row_dict.get("to_address")),
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "withdraw_id": withdraw_id,
+            "withdraw_no": withdraw_no,
+            "user_id": user_id,
+            "coin_symbol": coin_symbol,
+            "chain_key": chain_key,
+            "status": status,
+            "status_group": status_group,
+            "tx_hash": tx_hash,
+            "request_id": request_id,
+            "to_address": to_address,
+            "created_from": created_from,
+            "created_to": created_to,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "anomaly_summary": anomaly_summary,
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_withdraw_reviews(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or filters.get("asset_symbol"))
+    chain_key = _normalize_chain_key(filters.get("chain_key") or filters.get("network"))
+    status = str(filters.get("status") or "").strip().upper()
+    status_group = str(filters.get("status_group") or "").strip().upper()
+    status_values = _admin_withdraw_status_values(status, status_group)
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    review_statuses = WITHDRAW_PENDING_REVIEW_STATUSES
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("w.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if coin_symbol:
+        where_parts.append("w.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if chain_key:
+        where_parts.append("w.chain_key = :chain_key")
+        params["chain_key"] = chain_key
+    if status_values:
+        status_params = []
+        for index, status_value in enumerate(status_values):
+            key = f"status_{index}"
+            status_params.append(f":{key}")
+            params[key] = status_value
+        where_parts.append(f"w.status IN ({', '.join(status_params)})")
+    else:
+        status_params = []
+        for index, status_value in enumerate(review_statuses):
+            key = f"review_status_{index}"
+            status_params.append(f":{key}")
+            params[key] = status_value
+        where_parts.append(f"w.status IN ({', '.join(status_params)})")
+    if created_from:
+        where_parts.append("DATE(w.created_at) >= :created_from")
+        params["created_from"] = created_from
+    if created_to:
+        where_parts.append("DATE(w.created_at) <= :created_to")
+        params["created_to"] = created_to
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM withdraw_logs w {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    query_params = {**params, "limit": page_size, "offset": (page - 1) * page_size}
+    risk_reason_expr = _admin_withdraw_review_reason_expr(db)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                w.id,
+                w.user_id,
+                w.coin_symbol,
+                w.chain_key,
+                w.to_address,
+                w.amount,
+                w.fee,
+                w.net_amount,
+                w.status,
+                {risk_reason_expr},
+                w.created_at
+            FROM withdraw_logs w
+            {where_sql}
+            ORDER BY w.created_at DESC, w.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        query_params,
+    ).mappings().all()
+
+    row_dicts = [dict(row) for row in rows]
+    user_ids = sorted(
+        {
+            int(row_dict.get("user_id"))
+            for row_dict in row_dicts
+            if row_dict.get("user_id") is not None
+        }
+    )
+    current_ids = sorted(
+        {
+            int(row_dict.get("id"))
+            for row_dict in row_dicts
+            if row_dict.get("id") is not None
+        }
+    )
+
+    today_apply_count_by_user: Dict[int, int] = {}
+    today_success_count_by_user: Dict[int, int] = {}
+    today_amount_by_user_coin: Dict[tuple[int, str], Any] = {}
+    failed_count_by_user: Dict[int, int] = {}
+    successful_address_keys: set[tuple[int, str]] = set()
+
+    if user_ids:
+        user_params = {f"risk_user_{index}": value for index, value in enumerate(user_ids)}
+        user_placeholders = ", ".join(f":risk_user_{index}" for index in range(len(user_ids)))
+        current_id_params = {f"risk_current_id_{index}": value for index, value in enumerate(current_ids)}
+        current_id_placeholders = ", ".join(f":risk_current_id_{index}" for index in range(len(current_ids)))
+        exclude_current_sql = f"AND id NOT IN ({current_id_placeholders})" if current_ids else ""
+        _, today_start, today_end = get_admin_time_window("today")
+
+        try:
+            today_rows = db.execute(
+                text(
+                    f"""
+                    SELECT user_id, COUNT(*) AS withdraw_count
+                    FROM withdraw_logs
+                    WHERE user_id IN ({user_placeholders})
+                      AND created_at >= :today_start
+                      AND created_at <= :today_end
+                    GROUP BY user_id
+                    """
+                ),
+                {**user_params, "today_start": today_start, "today_end": today_end},
+            ).mappings().all()
+            today_apply_count_by_user = {
+                int(row.get("user_id")): int(row.get("withdraw_count") or 0)
+                for row in today_rows
+                if row.get("user_id") is not None
+            }
+        except SQLAlchemyError:
+            today_apply_count_by_user = {}
+
+        try:
+            today_success_rows = db.execute(
+                text(
+                    f"""
+                    SELECT user_id, COUNT(*) AS success_count
+                    FROM withdraw_logs
+                    WHERE user_id IN ({user_placeholders})
+                      AND created_at >= :today_start
+                      AND created_at <= :today_end
+                      AND status IN ('SUCCESS', 'SUCCEEDED', 'COMPLETED')
+                    GROUP BY user_id
+                    """
+                ),
+                {**user_params, "today_start": today_start, "today_end": today_end},
+            ).mappings().all()
+            today_success_count_by_user = {
+                int(row.get("user_id")): int(row.get("success_count") or 0)
+                for row in today_success_rows
+                if row.get("user_id") is not None
+            }
+        except SQLAlchemyError:
+            today_success_count_by_user = {}
+
+        try:
+            today_amount_rows = db.execute(
+                text(
+                    f"""
+                    SELECT user_id, coin_symbol, COALESCE(SUM(amount), 0) AS withdraw_amount
+                    FROM withdraw_logs
+                    WHERE user_id IN ({user_placeholders})
+                      AND created_at >= :today_start
+                      AND created_at <= :today_end
+                    GROUP BY user_id, coin_symbol
+                    """
+                ),
+                {**user_params, "today_start": today_start, "today_end": today_end},
+            ).mappings().all()
+            today_amount_by_user_coin = {
+                (int(row.get("user_id")), str(row.get("coin_symbol") or "").upper()): row.get("withdraw_amount") or 0
+                for row in today_amount_rows
+                if row.get("user_id") is not None
+            }
+        except SQLAlchemyError:
+            today_amount_by_user_coin = {}
+
+        try:
+            failed_rows = db.execute(
+                text(
+                    f"""
+                    SELECT user_id, COUNT(*) AS failed_count
+                    FROM withdraw_logs
+                    WHERE user_id IN ({user_placeholders})
+                      AND status IN ('FAILED', 'REJECTED')
+                      {exclude_current_sql}
+                    GROUP BY user_id
+                    """
+                ),
+                {**user_params, **current_id_params},
+            ).mappings().all()
+            failed_count_by_user = {
+                int(row.get("user_id")): int(row.get("failed_count") or 0)
+                for row in failed_rows
+                if row.get("user_id") is not None
+            }
+        except SQLAlchemyError:
+            failed_count_by_user = {}
+
+        address_keys = sorted(
+            {
+                str(row_dict.get("to_address") or "").strip().lower()
+                for row_dict in row_dicts
+                if str(row_dict.get("to_address") or "").strip()
+            }
+        )
+        if address_keys:
+            address_params = {f"risk_address_{index}": value for index, value in enumerate(address_keys)}
+            address_placeholders = ", ".join(f":risk_address_{index}" for index in range(len(address_keys)))
+            try:
+                address_rows = db.execute(
+                    text(
+                        f"""
+                        SELECT user_id, LOWER(to_address) AS address_key
+                        FROM withdraw_logs
+                        WHERE user_id IN ({user_placeholders})
+                          AND LOWER(to_address) IN ({address_placeholders})
+                          AND status IN ('SUCCESS', 'CONFIRMED', 'COMPLETED', 'SUCCEEDED')
+                          {exclude_current_sql}
+                        GROUP BY user_id, LOWER(to_address)
+                        """
+                    ),
+                    {**user_params, **address_params, **current_id_params},
+                ).mappings().all()
+                successful_address_keys = {
+                    (int(row.get("user_id")), str(row.get("address_key") or "").strip().lower())
+                    for row in address_rows
+                    if row.get("user_id") is not None and str(row.get("address_key") or "").strip()
+                }
+            except SQLAlchemyError:
+                successful_address_keys = set()
+
+    items = []
+    for row_dict in row_dicts:
+        risk_reason = row_dict.get("risk_reason") or ""
+        coin_symbol_display = row_dict.get("coin_symbol") or ""
+        coin_key = coin_symbol_display.upper()
+        user_id_value = int(row_dict.get("user_id") or 0)
+        address_key = str(row_dict.get("to_address") or "").strip().lower()
+        today_apply_count = today_apply_count_by_user.get(user_id_value, 0)
+        today_success_count = today_success_count_by_user.get(user_id_value, 0)
+        today_amount = today_amount_by_user_coin.get((user_id_value, coin_key), 0)
+        failed_count = failed_count_by_user.get(user_id_value, 0)
+        address_label = "-"
+        address_badge = "secondary"
+        if address_key:
+            if (user_id_value, address_key) in successful_address_keys:
+                address_label = "常用地址"
+                address_badge = "success"
+            else:
+                address_label = "新地址"
+                address_badge = "warning"
+        risk_reason_display = _admin_withdraw_risk_reason_display(risk_reason, row_dict.get("status"))
+        status_label, status_badge = _admin_withdraw_status_meta(row_dict.get("status"))
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "withdraw_id": row_dict.get("id"),
+                "user_id": row_dict.get("user_id"),
+                "coin_symbol": coin_symbol_display,
+                "chain_key": row_dict.get("chain_key") or "",
+                "amount": _fmt_admin_amount_display(row_dict.get("amount"), coin_symbol_display),
+                "fee": _fmt_admin_amount_display(row_dict.get("fee"), coin_symbol_display),
+                "net_amount": _fmt_admin_amount_display(row_dict.get("net_amount"), coin_symbol_display),
+                "to_address": row_dict.get("to_address") or "",
+                "to_address_short": _short_admin_address(row_dict.get("to_address")),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "risk_reason": risk_reason,
+                "risk_reason_short": _admin_short_text(risk_reason, 16, 8) if risk_reason else "",
+                "risk_reason_display": risk_reason_display,
+                "risk_reason_display_short": _admin_short_text(risk_reason_display, 16, 8) if risk_reason_display != "-" else "",
+                "today_withdraw_count": today_apply_count,
+                "today_withdraw_count_display": f"{today_apply_count} 次",
+                "today_apply_count": today_apply_count,
+                "today_apply_count_display": f"{today_apply_count} 次",
+                "today_success_count": today_success_count,
+                "today_success_count_display": f"{today_success_count} 次",
+                "today_stat_scope": "按 UTC 日期统计",
+                "today_withdraw_amount_display": f"{_fmt_admin_amount_display(today_amount, coin_symbol_display)} {coin_symbol_display}".strip(),
+                "today_apply_amount_display": f"{_fmt_admin_amount_display(today_amount, coin_symbol_display)} {coin_symbol_display}".strip(),
+                "failed_withdraw_count": failed_count,
+                "failed_withdraw_count_display": f"{failed_count} 次",
+                "failed_withdraw_badge": "danger" if failed_count > 0 else "secondary",
+                "address_risk_label": address_label,
+                "address_risk_badge": address_badge,
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "user_id": user_id,
+            "coin_symbol": coin_symbol,
+            "chain_key": chain_key,
+            "status": status,
+            "status_group": status_group,
+            "created_from": created_from,
+            "created_to": created_to,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def _admin_transfer_status_label(status: Any) -> str:
+    status_value = str(status or "").strip().upper()
+    labels = {
+        "SUCCESS": "已完成",
+        "FAILED": "失败",
+        "PENDING": "处理中",
+        "PROCESSING": "处理中",
+        "CANCELED": "已取消",
+        "CANCELLED": "已取消",
+    }
+    return labels.get(status_value, status_value or "--")
+
+
+def _admin_balance_direction_label(direction: Any) -> str:
+    value = str(direction or "").strip()
+    if value == "1":
+        return "收入"
+    if value == "-1":
+        return "支出"
+    return value or "--"
+
+
+def _admin_balance_account_label(value: Any) -> str:
+    value_text = str(value or "").strip()
+    normalized = value_text.lower()
+    labels = {
+        "funding": "资金账户",
+        "spot": "现货账户",
+        "contract": "合约账户",
+    }
+    return labels.get(normalized, value_text or "--")
+
+
+def admin_query_user_transfer_records(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    transfer_id = str(filters.get("transfer_id") or "").strip()
+    transfer_no = str(filters.get("transfer_no") or "").strip()
+    user_id = str(filters.get("user_id") or "").strip()
+    from_user_id = str(filters.get("from_user_id") or "").strip()
+    to_user_id = str(filters.get("to_user_id") or "").strip()
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or filters.get("asset_symbol"))
+    request_id = str(filters.get("request_id") or "").strip()
+    direction = str(filters.get("direction") or "all").strip().lower() or "all"
+    status = str(filters.get("status") or "").strip().upper()
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    normalized_filters = {
+        "transfer_id": transfer_id,
+        "transfer_no": transfer_no,
+        "user_id": user_id,
+        "from_user_id": from_user_id,
+        "to_user_id": to_user_id,
+        "coin_symbol": coin_symbol,
+        "request_id": request_id,
+        "direction": direction,
+        "status": status,
+        "created_from": created_from,
+        "created_to": created_to,
+        "page": page,
+        "page_size": page_size,
+    }
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if transfer_id:
+        where_parts.append("ut.id = :transfer_id")
+        params["transfer_id"] = _parse_int(transfer_id)
+    if transfer_no:
+        where_parts.append("ut.transfer_no LIKE :transfer_no")
+        params["transfer_no"] = f"%{transfer_no}%"
+    if user_id:
+        where_parts.append("(ut.from_user_id = :user_id OR ut.to_user_id = :user_id)")
+        params["user_id"] = _parse_int(user_id)
+    if from_user_id:
+        where_parts.append("ut.from_user_id = :from_user_id")
+        params["from_user_id"] = _parse_int(from_user_id)
+    if to_user_id:
+        where_parts.append("ut.to_user_id = :to_user_id")
+        params["to_user_id"] = _parse_int(to_user_id)
+    if coin_symbol:
+        where_parts.append("ut.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if request_id:
+        where_parts.append("ut.request_id LIKE :request_id")
+        params["request_id"] = f"%{request_id}%"
+    if status:
+        where_parts.append("ut.status = :status")
+        params["status"] = status
+    if created_from:
+        where_parts.append("DATE(ut.created_at) >= :created_from")
+        params["created_from"] = created_from
+    if created_to:
+        where_parts.append("DATE(ut.created_at) <= :created_to")
+        params["created_to"] = created_to
+
+    try:
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        total = int(db.execute(text(f"SELECT COUNT(*) FROM user_transfers ut {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    ut.id,
+                    ut.transfer_no,
+                    ut.request_id,
+                    ut.from_user_id,
+                    ut.to_user_id,
+                    ut.coin_symbol,
+                    ut.from_account,
+                    ut.to_account,
+                    ut.amount,
+                    ut.fee_amount,
+                    ut.net_amount,
+                    ut.status,
+                    ut.remark,
+                    ut.created_at
+                FROM user_transfers ut
+                {where_sql}
+                ORDER BY ut.created_at DESC, ut.id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        return _empty_page(filters=normalized_filters, page=page, page_size=page_size, total=0)
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        coin_symbol_display = row_dict.get("coin_symbol") or ""
+        status_label, status_badge = _admin_transfer_status_meta(row_dict.get("status"))
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "transfer_id": row_dict.get("id"),
+                "transfer_no": row_dict.get("transfer_no") or "",
+                "transfer_no_short": _short_admin_hash(row_dict.get("transfer_no")),
+                "request_id": row_dict.get("request_id") or "",
+                "request_id_short": _short_admin_hash(row_dict.get("request_id")),
+                "direction_label": f"{row_dict.get('from_account') or '--'} -> {row_dict.get('to_account') or '--'}",
+                "from_user_id": row_dict.get("from_user_id"),
+                "to_user_id": row_dict.get("to_user_id"),
+                "coin_symbol": coin_symbol_display,
+                "amount": _fmt_admin_amount_display(row_dict.get("amount"), coin_symbol_display),
+                "fee": _fmt_admin_amount_display(row_dict.get("fee_amount"), coin_symbol_display),
+                "net_amount": _fmt_admin_amount_display(row_dict.get("net_amount"), coin_symbol_display),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "remark": row_dict.get("remark") or "--",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {**normalized_filters, "page": page, "page_size": page_size},
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_balance_logs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or filters.get("asset_symbol"))
+    chain_key = _normalize_chain_key(filters.get("chain_key") or filters.get("account_type") or filters.get("account_key"))
+    change_type = str(filters.get("change_type") or "").strip().upper()
+    biz_type = str(filters.get("biz_type") or "").strip().upper()
+    biz_id = str(filters.get("biz_id") or "").strip()
+    request_id = str(filters.get("request_id") or "").strip()
+    tx_hash = str(filters.get("tx_hash") or filters.get("txid") or "").strip()
+    direction = str(filters.get("direction") or "").strip()
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    def _date_start(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        text_value = str(value or "").strip()
+        if not text_value:
+            return None
+        try:
+            return datetime.combine(date.fromisoformat(text_value[:10]), datetime.min.time())
+        except ValueError:
+            return None
+
+    normalized_filters = {
+        "user_id": user_id,
+        "coin_symbol": coin_symbol,
+        "chain_key": chain_key,
+        "account_type": chain_key,
+        "change_type": change_type,
+        "biz_type": biz_type,
+        "biz_id": biz_id,
+        "request_id": request_id,
+        "tx_hash": tx_hash,
+        "direction": direction,
+        "created_from": created_from,
+        "created_to": created_to,
+        "date_from": created_from,
+        "date_to": created_to,
+        "page": page,
+        "page_size": page_size,
+    }
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("bl.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if coin_symbol:
+        where_parts.append("bl.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if chain_key:
+        where_parts.append("bl.chain_key = :chain_key")
+        params["chain_key"] = chain_key
+    if change_type:
+        where_parts.append("bl.change_type = :change_type")
+        params["change_type"] = change_type
+    if biz_type:
+        where_parts.append("bl.biz_type = :biz_type")
+        params["biz_type"] = biz_type
+    if biz_id:
+        where_parts.append("bl.biz_id = :biz_id")
+        params["biz_id"] = biz_id
+    if request_id:
+        where_parts.append("bl.request_id LIKE :request_id")
+        params["request_id"] = f"%{request_id}%"
+    if tx_hash:
+        where_parts.append(
+            """
+            (
+                bl.request_id LIKE :tx_hash
+                OR bl.biz_id LIKE :tx_hash
+                OR bl.remark LIKE :tx_hash
+            )
+            """
+        )
+        params["tx_hash"] = f"%{tx_hash}%"
+    if direction in {"1", "-1"}:
+        where_parts.append("bl.direction = :direction")
+        params["direction"] = int(direction)
+    created_from_start = _date_start(created_from)
+    created_to_start = _date_start(created_to)
+    if created_from_start:
+        where_parts.append("bl.created_at >= :created_from")
+        params["created_from"] = created_from_start
+    if created_to_start:
+        where_parts.append("bl.created_at < :created_to_exclusive")
+        params["created_to_exclusive"] = created_to_start + timedelta(days=1)
+
+    try:
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        from_sql = """
+            FROM balance_logs bl
+        """
+        total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    bl.id,
+                    bl.user_id,
+                    bl.coin_symbol,
+                    bl.chain_key,
+                    bl.change_type,
+                    bl.direction,
+                    bl.change_amount,
+                    bl.before_available,
+                    bl.after_available,
+                    bl.before_frozen,
+                    bl.after_frozen,
+                    bl.biz_type,
+                    bl.biz_id,
+                    bl.request_id,
+                    bl.remark,
+                    bl.created_at
+                {from_sql}
+                {where_sql}
+                ORDER BY bl.created_at DESC, bl.id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        return _empty_page(filters=normalized_filters, page=page, page_size=page_size, total=0)
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        coin_symbol_display = row_dict.get("coin_symbol") or ""
+        row_change_type = row_dict.get("change_type") or ""
+        row_biz_type = row_dict.get("biz_type") or ""
+        row_direction = row_dict.get("direction")
+        signed_change_amount = _fmt_admin_change_amount_display(
+            row_dict.get("change_amount"), coin_symbol_display, row_direction
+        )
+        change_amount_decimal = _parse_decimal(signed_change_amount)
+        if change_amount_decimal > 0:
+            amount_class = "admin-amount-positive"
+        elif change_amount_decimal < 0:
+            amount_class = "admin-amount-negative"
+        else:
+            amount_class = ""
+        request_id_value = row_dict.get("request_id") or ""
+        biz_id_value = row_dict.get("biz_id") or ""
+        remark_value = row_dict.get("remark") or ""
+        remark_display = _format_balance_log_remark_cn(remark_value, row_biz_type or row_change_type)
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "user_id": row_dict.get("user_id"),
+                "coin_symbol": coin_symbol_display,
+                "chain_key": row_dict.get("chain_key") or "",
+                "account_type": row_dict.get("chain_key") or "",
+                "account_type_label": _admin_balance_account_label(row_dict.get("chain_key")),
+                "change_type": row_change_type,
+                "change_type_label": _format_balance_log_type_label(row_change_type),
+                "direction": row_direction,
+                "direction_label": _admin_balance_direction_label(row_direction),
+                "change_amount": signed_change_amount,
+                "change_amount_class": amount_class,
+                "before_available": _fmt_admin_amount_display(row_dict.get("before_available"), coin_symbol_display),
+                "after_available": _fmt_admin_amount_display(row_dict.get("after_available"), coin_symbol_display),
+                "before_frozen": _fmt_admin_amount_display(row_dict.get("before_frozen"), coin_symbol_display),
+                "after_frozen": _fmt_admin_amount_display(row_dict.get("after_frozen"), coin_symbol_display),
+                "biz_type": row_biz_type,
+                "biz_type_label": _format_balance_log_biz_type_label(row_biz_type),
+                "biz_id": biz_id_value,
+                "biz_id_short": _short_admin_hash(biz_id_value),
+                "request_id": request_id_value,
+                "request_id_short": _short_admin_hash(request_id_value),
+                "related_id_display": _short_admin_hash(request_id_value or biz_id_value),
+                "related_id_full": request_id_value or biz_id_value,
+                "remark": remark_display,
+                "remark_short": _admin_short_text(remark_display, 18, 8) if remark_display != "--" else "--",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {**normalized_filters, "page": page, "page_size": page_size},
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_unified_balance_logs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or filters.get("asset_symbol"))
+    chain_key = _normalize_chain_key(filters.get("chain_key") or filters.get("account_type") or filters.get("account_key"))
+    change_type = str(filters.get("change_type") or "").strip().upper()
+    biz_type = str(filters.get("biz_type") or "").strip().upper()
+    biz_id = str(filters.get("biz_id") or "").strip()
+    request_id = str(filters.get("request_id") or "").strip()
+    tx_hash = str(filters.get("tx_hash") or filters.get("txid") or "").strip()
+    direction = str(filters.get("direction") or "").strip()
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    def _date_start(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        text_value = str(value or "").strip()
+        if not text_value:
+            return None
+        try:
+            return datetime.combine(date.fromisoformat(text_value[:10]), datetime.min.time())
+        except ValueError:
+            return None
+
+    normalized_filters = {
+        "user_id": user_id,
+        "coin_symbol": coin_symbol,
+        "chain_key": chain_key,
+        "account_type": chain_key,
+        "change_type": change_type,
+        "biz_type": biz_type,
+        "biz_id": biz_id,
+        "request_id": request_id,
+        "tx_hash": tx_hash,
+        "direction": direction,
+        "created_from": created_from,
+        "created_to": created_to,
+        "date_from": created_from,
+        "date_to": created_to,
+        "page": page,
+        "page_size": page_size,
+    }
+
+    balance_select = """
+        SELECT
+            bl.id AS source_id,
+            bl.created_at AS event_time,
+            bl.user_id AS user_id,
+            CAST(bl.coin_symbol AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS coin_symbol,
+            CAST(bl.chain_key AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS account_type,
+            CAST(bl.change_type AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS change_type,
+            CAST(bl.biz_type AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS biz_type,
+            CAST(bl.biz_id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS related_id,
+            CAST(bl.request_id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS request_id,
+            CAST(bl.remark AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS remark,
+            CASE
+                WHEN bl.direction < 0 AND bl.change_amount > 0 THEN -bl.change_amount
+                ELSE bl.change_amount
+            END AS change_amount,
+            bl.direction AS direction,
+            bl.before_available AS before_available,
+            bl.after_available AS after_balance,
+            bl.before_frozen AS before_frozen,
+            bl.after_frozen AS after_frozen,
+            CAST('BALANCE' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS source
+        FROM balance_logs bl
+    """
+    union_parts = [balance_select]
+    if _admin_table_exists(db, "contract_margin_logs"):
+        contract_change_type_expr = """
+            CASE
+                WHEN cml.change_type IN ('OPEN_MARGIN_FREEZE', 'OPEN_MARGIN_USED') THEN 'CONTRACT_OPEN_MARGIN'
+                WHEN cml.change_type = 'CLOSE_RELEASE' THEN 'CONTRACT_MARGIN_RELEASE'
+                WHEN cml.change_type IN ('OPEN_FEE', 'CLOSE_FEE') THEN 'CONTRACT_SPREAD_FEE'
+                WHEN cml.change_type = 'REALIZED_PNL' AND LOWER(COALESCE(cml.remark, '')) LIKE 'liquidation%' THEN 'CONTRACT_LIQUIDATION'
+                WHEN cml.change_type = 'REALIZED_PNL' THEN 'CONTRACT_REALIZED_PNL'
+                WHEN cml.change_type = 'LIQUIDATION_ZERO' THEN 'LIQUIDATION_ZERO'
+                WHEN cml.change_type IN ('TRANSFER_IN', 'TRANSFER_OUT') THEN 'CONTRACT_TRANSFER'
+                ELSE cml.change_type
+            END
+        """
+        contract_amount_expr = """
+            CASE
+                WHEN cml.change_type IN ('OPEN_MARGIN_FREEZE', 'OPEN_MARGIN_USED', 'OPEN_FEE', 'CLOSE_FEE', 'TRANSFER_OUT', 'LIQUIDATION_ZERO')
+                    THEN -ABS(cml.change_amount)
+                WHEN cml.change_type = 'TRANSFER_IN'
+                    THEN ABS(cml.change_amount)
+                ELSE cml.change_amount
+            END
+        """
+        contract_select = f"""
+            SELECT
+                cml.id AS source_id,
+                cml.created_at AS event_time,
+                cml.user_id AS user_id,
+                CAST('USDT' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS coin_symbol,
+                CAST('contract' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS account_type,
+                CAST({contract_change_type_expr} AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS change_type,
+                CAST({contract_change_type_expr} AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS biz_type,
+                CAST(CASE
+                    WHEN cml.order_id IS NOT NULL THEN CONCAT('order:', cml.order_id)
+                    WHEN cml.position_id IS NOT NULL THEN CONCAT('position:', cml.position_id)
+                    WHEN cml.account_id IS NOT NULL THEN CONCAT('account:', cml.account_id)
+                    ELSE CONCAT('contract-margin:', cml.id)
+                END AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS related_id,
+                CAST(NULL AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS request_id,
+                CAST(cml.remark AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS remark,
+                {contract_amount_expr} AS change_amount,
+                CASE
+                    WHEN {contract_amount_expr} > 0 THEN 1
+                    WHEN {contract_amount_expr} < 0 THEN -1
+                    ELSE 0
+                END AS direction,
+                cml.before_available AS before_available,
+                cml.after_available AS after_balance,
+                cml.before_frozen AS before_frozen,
+                cml.after_frozen AS after_frozen,
+                CAST('CONTRACT' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS source
+            FROM contract_margin_logs cml
+        """
+        union_parts.append(contract_select)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("unified.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if coin_symbol:
+        where_parts.append("unified.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if chain_key:
+        where_parts.append("unified.account_type = :chain_key")
+        params["chain_key"] = chain_key
+    if change_type:
+        if change_type == "CONTRACT_TRANSFER":
+            where_parts.append(
+                """
+                (
+                    unified.change_type IN ('CONTRACT_TRANSFER', 'CONTRACT_TRANSFER_IN', 'CONTRACT_TRANSFER_OUT')
+                    OR unified.biz_type IN ('CONTRACT_TRANSFER', 'CONTRACT_TRANSFER_IN', 'CONTRACT_TRANSFER_OUT')
+                )
+                """
+            )
+        else:
+            where_parts.append("unified.change_type = :change_type")
+            params["change_type"] = change_type
+    if biz_type:
+        if biz_type == "CONTRACT":
+            where_parts.append(
+                """
+                (
+                    unified.source = 'CONTRACT'
+                    OR unified.account_type = 'contract'
+                    OR unified.biz_type LIKE 'CONTRACT%'
+                    OR unified.change_type LIKE 'CONTRACT%'
+                )
+                """
+            )
+        elif biz_type == "CONTRACT_TRANSFER":
+            where_parts.append(
+                """
+                (
+                    unified.biz_type IN ('CONTRACT_TRANSFER', 'CONTRACT_TRANSFER_IN', 'CONTRACT_TRANSFER_OUT')
+                    OR unified.change_type IN ('CONTRACT_TRANSFER', 'CONTRACT_TRANSFER_IN', 'CONTRACT_TRANSFER_OUT')
+                )
+                """
+            )
+        else:
+            where_parts.append("unified.biz_type = :biz_type")
+            params["biz_type"] = biz_type
+    if biz_id:
+        where_parts.append("unified.related_id = :biz_id")
+        params["biz_id"] = biz_id
+    if request_id:
+        where_parts.append("unified.request_id LIKE :request_id")
+        params["request_id"] = f"%{request_id}%"
+    if tx_hash:
+        where_parts.append(
+            """
+            (
+                unified.request_id LIKE :tx_hash
+                OR unified.related_id LIKE :tx_hash
+                OR unified.remark LIKE :tx_hash
+            )
+            """
+        )
+        params["tx_hash"] = f"%{tx_hash}%"
+    if direction in {"1", "-1"}:
+        where_parts.append("unified.direction = :direction")
+        params["direction"] = int(direction)
+    created_from_start = _date_start(created_from)
+    created_to_start = _date_start(created_to)
+    if created_from_start:
+        where_parts.append("unified.event_time >= :created_from")
+        params["created_from"] = created_from_start
+    if created_to_start:
+        where_parts.append("unified.event_time < :created_to_exclusive")
+        params["created_to_exclusive"] = created_to_start + timedelta(days=1)
+
+    union_sql = "\nUNION ALL\n".join(union_parts)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = f"""
+        FROM (
+            {union_sql}
+        ) unified
+    """
+
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    unified.source_id,
+                    unified.event_time,
+                    unified.user_id,
+                    unified.coin_symbol,
+                    unified.account_type,
+                    unified.change_type,
+                    unified.biz_type,
+                    unified.related_id,
+                    unified.request_id,
+                    unified.remark,
+                    unified.change_amount,
+                    unified.direction,
+                    unified.before_available,
+                    unified.after_balance,
+                    unified.before_frozen,
+                    unified.after_frozen,
+                    unified.source
+                {from_sql}
+                {where_sql}
+                ORDER BY unified.event_time DESC, unified.source_id DESC, unified.source ASC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        return _empty_page(filters=normalized_filters, page=page, page_size=page_size, total=0)
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        coin_symbol_display = row_dict.get("coin_symbol") or ""
+        row_change_type = row_dict.get("change_type") or ""
+        row_biz_type = row_dict.get("biz_type") or ""
+        row_direction = row_dict.get("direction")
+        signed_change_amount = _fmt_admin_change_amount_display(
+            row_dict.get("change_amount"), coin_symbol_display, row_direction
+        )
+        change_amount_decimal = _parse_decimal(signed_change_amount)
+        if change_amount_decimal > 0:
+            amount_class = "admin-amount-positive"
+        elif change_amount_decimal < 0:
+            amount_class = "admin-amount-negative"
+        else:
+            amount_class = ""
+        request_id_value = row_dict.get("request_id") or ""
+        related_id_value = row_dict.get("related_id") or ""
+        remark_value = row_dict.get("remark") or ""
+        remark_display = _format_balance_log_remark_cn(remark_value, row_biz_type or row_change_type)
+        source_value = str(row_dict.get("source") or "").strip().upper()
+        items.append(
+            {
+                "id": row_dict.get("source_id"),
+                "time": _admin_datetime_display(row_dict.get("event_time")),
+                "user_id": row_dict.get("user_id"),
+                "coin": coin_symbol_display,
+                "coin_symbol": coin_symbol_display,
+                "chain_key": row_dict.get("account_type") or "",
+                "account_type": row_dict.get("account_type") or "",
+                "account_type_label": _admin_balance_account_label(row_dict.get("account_type")),
+                "change_type": row_change_type,
+                "change_type_label": _format_balance_log_type_label(row_change_type),
+                "direction": row_direction,
+                "direction_label": _admin_balance_direction_label(row_direction),
+                "change_amount": signed_change_amount,
+                "change_amount_class": amount_class,
+                "before_available": _fmt_admin_amount_display(row_dict.get("before_available"), coin_symbol_display),
+                "after_available": _fmt_admin_amount_display(row_dict.get("after_balance"), coin_symbol_display),
+                "after_balance": _fmt_admin_amount_display(row_dict.get("after_balance"), coin_symbol_display),
+                "before_frozen": _fmt_admin_amount_display(row_dict.get("before_frozen"), coin_symbol_display),
+                "after_frozen": _fmt_admin_amount_display(row_dict.get("after_frozen"), coin_symbol_display),
+                "biz_type": row_biz_type,
+                "biz_type_label": _format_balance_log_biz_type_label(row_biz_type),
+                "biz_id": related_id_value,
+                "biz_id_short": _short_admin_hash(related_id_value),
+                "request_id": request_id_value,
+                "request_id_short": _short_admin_hash(request_id_value),
+                "related_id_display": _short_admin_hash(request_id_value or related_id_value),
+                "related_id_full": request_id_value or related_id_value,
+                "source": source_value,
+                "source_label": "合约保证金" if source_value == "CONTRACT" else "资金流水",
+                "remark": remark_display,
+                "remark_short": _admin_short_text(remark_display, 18, 8) if remark_display != "--" else "--",
+                "created_at": _admin_datetime_display(row_dict.get("event_time")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {**normalized_filters, "page": page, "page_size": page_size},
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def _admin_percent_display(value: Any, places: int = 2) -> str:
+    try:
+        amount = Decimal(str(value or "0")) * Decimal("100")
+    except Exception:
+        amount = Decimal("0")
+    quant = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
+    return f"{amount.quantize(quant)}%"
+
+
+ADMIN_BD_DETAIL_ASSET_SYMBOLS = ("USDT", "RCB")
+
+
+def _admin_bd_asset_totals() -> Dict[str, Decimal]:
+    return {symbol: Decimal("0") for symbol in ADMIN_BD_DETAIL_ASSET_SYMBOLS}
+
+
+def _admin_bd_coin_items(values: Optional[Dict[str, Any]]) -> list[Dict[str, str]]:
+    raw_values = values or {}
+    items: list[Dict[str, str]] = []
+    seen: set[str] = set()
+    for symbol in ADMIN_BD_DETAIL_ASSET_SYMBOLS:
+        amount = _parse_decimal(raw_values.get(symbol))
+        items.append(
+            {
+                "coin_symbol": symbol,
+                "amount_display": _fmt_admin_decimal(amount, precision=2),
+                "amount_raw": format(amount, "f"),
+            }
+        )
+        seen.add(symbol)
+    for symbol in sorted(str(item or "").strip().upper() for item in raw_values):
+        if not symbol or symbol in seen:
+            continue
+        amount = _parse_decimal(raw_values.get(symbol))
+        items.append(
+            {
+                "coin_symbol": symbol,
+                "amount_display": _fmt_admin_decimal(amount, precision=2),
+                "amount_raw": format(amount, "f"),
+            }
+        )
+    return items
+
+
+def _admin_bd_coin_text(values: Optional[Dict[str, Any]]) -> str:
+    return " / ".join(
+        f"{item['coin_symbol']} {item['amount_display']}"
+        for item in _admin_bd_coin_items(values)
+    )
+
+
+def _admin_bd_sum_coin_totals(values_by_member: Dict[int, Dict[str, Decimal]]) -> Dict[str, Decimal]:
+    totals = _admin_bd_asset_totals()
+    for values in values_by_member.values():
+        for symbol, amount in (values or {}).items():
+            normalized_symbol = _normalize_code(symbol)
+            if normalized_symbol:
+                totals[normalized_symbol] = totals.get(normalized_symbol, Decimal("0")) + _parse_decimal(amount)
+    return totals
+
+
+def _admin_bd_selected_bounds(
+    date_value: Any,
+    range_value: Any,
+    start_date_value: Any = None,
+    end_date_value: Any = None,
+) -> tuple[date, datetime, datetime, str, str, str, str, str]:
+    today = get_admin_today_date()
+    start_date = _admin_query_date_value(start_date_value)
+    end_date = _admin_query_date_value(end_date_value)
+    if start_date or end_date:
+        if start_date is None:
+            start_date = end_date
+        if end_date is None:
+            end_date = start_date
+        if start_date and end_date and start_date > end_date:
+            start_date, end_date = end_date, start_date
+        assert start_date is not None
+        assert end_date is not None
+        day_start, day_end_inclusive = get_admin_date_time_window(start_date, end_date)
+        day_end = day_end_inclusive + timedelta(microseconds=1)
+        range_label = start_date.isoformat() if start_date == end_date else f"{start_date.isoformat()} 至 {end_date.isoformat()}"
+        return end_date, day_start, day_end, "", "custom", range_label, start_date.isoformat(), end_date.isoformat()
+    normalized_range = str(range_value or "").strip().lower()
+    if normalized_range in {"7d", "30d"}:
+        _, day_start, day_end_inclusive = get_admin_time_window(normalized_range)
+        day_end = day_end_inclusive + timedelta(microseconds=1)
+        days = 7 if normalized_range == "7d" else 30
+        return today, day_start, day_end, "", normalized_range, f"近{days}天", "", ""
+
+    raw_date = str(date_value or "").strip().lower()
+    if raw_date == "yesterday":
+        day_value = today - timedelta(days=1)
+        date_filter = "yesterday"
+    elif raw_date == "today" or not raw_date:
+        day_value = today
+        date_filter = "today"
+    else:
+        day_value = _admin_query_date_value(raw_date) or today
+        date_filter = day_value.isoformat()
+
+    day_start, day_end_inclusive = get_admin_date_time_window(day_value, day_value)
+    day_end = day_end_inclusive + timedelta(microseconds=1)
+    return day_value, day_start, day_end, date_filter, "", day_value.isoformat(), "", ""
+
+
+def _admin_bd_volume_by_member(
+    db: Session,
+    *,
+    member_ids: list[int],
+    day_start: Optional[datetime] = None,
+    day_end: Optional[datetime] = None,
+) -> Dict[int, Decimal]:
+    if not member_ids or not _admin_table_exists(db, "trades"):
+        return {}
+
+    time_filter = ""
+    params: Dict[str, Any] = {"member_ids": member_ids}
+    if day_start is not None and day_end is not None:
+        time_filter = "AND created_at >= :day_start AND created_at < :day_end"
+        params.update({"day_start": day_start, "day_end": day_end})
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT user_id, COALESCE(SUM(volume), 0) AS volume
+            FROM (
+                SELECT buyer_user_id AS user_id, COALESCE(quote_amount, price * amount, 0) AS volume
+                FROM trades
+                WHERE buyer_user_id IN :member_ids {time_filter}
+                UNION ALL
+                SELECT seller_user_id AS user_id, COALESCE(quote_amount, price * amount, 0) AS volume
+                FROM trades
+                WHERE seller_user_id IN :member_ids {time_filter}
+            ) member_trades
+            WHERE user_id IS NOT NULL
+            GROUP BY user_id
+            """
+        ).bindparams(bindparam("member_ids", expanding=True)),
+        params,
+    ).mappings().all()
+    return {int(row["user_id"]): _parse_decimal(row.get("volume")) for row in rows}
+
+
+def _admin_bd_fee_totals_by_member(
+    db: Session,
+    *,
+    bd_user_id: int,
+    member_ids: list[int],
+    day_start: Optional[datetime] = None,
+    day_end: Optional[datetime] = None,
+) -> Dict[int, Dict[str, Decimal]]:
+    totals: Dict[int, Dict[str, Decimal]] = {
+        member_id: _admin_bd_asset_totals() for member_id in member_ids
+    }
+    if not member_ids or not _admin_table_exists(db, "bd_commission_records"):
+        return totals
+
+    time_filter = ""
+    params: Dict[str, Any] = {"bd_user_id": int(bd_user_id), "member_ids": member_ids}
+    if day_start is not None and day_end is not None:
+        time_filter = "AND bcr.created_at >= :day_start AND bcr.created_at < :day_end"
+        params.update({"day_start": day_start, "day_end": day_end})
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                bcr.user_id,
+                UPPER(COALESCE(bcr.fee_coin_symbol, '')) AS coin_symbol,
+                COALESCE(SUM(bcr.original_fee_amount), 0) AS amount
+            FROM bd_commission_records bcr
+            WHERE bcr.bd_user_id = :bd_user_id
+              AND bcr.user_id IN :member_ids
+              {time_filter}
+            GROUP BY bcr.user_id, UPPER(COALESCE(bcr.fee_coin_symbol, ''))
+            """
+        ).bindparams(bindparam("member_ids", expanding=True)),
+        params,
+    ).mappings().all()
+    for row in rows:
+        user_id = int(row["user_id"])
+        symbol = _normalize_code(row.get("coin_symbol"))
+        if symbol:
+            totals.setdefault(user_id, _admin_bd_asset_totals())[symbol] = _parse_decimal(row.get("amount"))
+    return totals
+
+
+def _admin_bd_commission_totals_by_member(
+    db: Session,
+    *,
+    bd_user_id: int,
+    member_ids: list[int],
+    day_start: Optional[datetime] = None,
+    day_end: Optional[datetime] = None,
+) -> Dict[int, Dict[str, Decimal]]:
+    totals: Dict[int, Dict[str, Decimal]] = {
+        member_id: _admin_bd_asset_totals() for member_id in member_ids
+    }
+    if not member_ids or not _admin_table_exists(db, "bd_commission_records"):
+        return totals
+
+    time_filter = ""
+    params: Dict[str, Any] = {"bd_user_id": int(bd_user_id), "member_ids": member_ids}
+    if day_start is not None and day_end is not None:
+        time_filter = "AND bcr.created_at >= :day_start AND bcr.created_at < :day_end"
+        params.update({"day_start": day_start, "day_end": day_end})
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                bcr.user_id,
+                UPPER(COALESCE(bcr.commission_asset_symbol, bcr.fee_coin_symbol, 'RCB')) AS coin_symbol,
+                COALESCE(SUM(bcr.commission_amount), 0) AS amount
+            FROM bd_commission_records bcr
+            WHERE bcr.bd_user_id = :bd_user_id
+              AND bcr.user_id IN :member_ids
+              {time_filter}
+            GROUP BY bcr.user_id, UPPER(COALESCE(bcr.commission_asset_symbol, bcr.fee_coin_symbol, 'RCB'))
+            """
+        ).bindparams(bindparam("member_ids", expanding=True)),
+        params,
+    ).mappings().all()
+    for row in rows:
+        user_id = int(row["user_id"])
+        symbol = _normalize_code(row.get("coin_symbol")) or "RCB"
+        totals.setdefault(user_id, _admin_bd_asset_totals())[symbol] = _parse_decimal(row.get("amount"))
+    return totals
+
+
+def admin_query_bd_team_detail(
+    db: Session,
+    bd_user_id: int,
+    filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    filters = filters or {}
+    bd_user_id = int(bd_user_id)
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    stat_date, day_start, day_end, date_filter, range_filter, range_label, start_date_filter, end_date_filter = _admin_bd_selected_bounds(
+        filters.get("date"),
+        filters.get("range"),
+        filters.get("start_date"),
+        filters.get("end_date"),
+    )
+
+    account = db.execute(
+        text(
+            """
+            SELECT
+                ba.user_id,
+                ba.bd_level,
+                ba.commission_rate,
+                ba.invite_code,
+                ba.status,
+                ba.created_at,
+                up.nickname,
+                up.username
+            FROM bd_accounts ba
+            LEFT JOIN user_profiles up ON up.user_id = ba.user_id
+            WHERE ba.user_id = :bd_user_id
+            LIMIT 1
+            """
+        ),
+        {"bd_user_id": bd_user_id},
+    ).mappings().first()
+
+    if not account:
+        return _empty_page(
+            filters={
+                "date": date_filter,
+                "date_input": stat_date.isoformat(),
+                "range": range_filter,
+                "start_date": start_date_filter,
+                "end_date": end_date_filter,
+                "page": page,
+                "page_size": page_size,
+            },
+            page=page,
+            page_size=page_size,
+            total=0,
+            account=None,
+            account_exists=False,
+            summary={},
+        )
+
+    params: Dict[str, Any] = {"bd_user_id": bd_user_id}
+    member_source_sql = """
+        FROM (
+            SELECT
+                source.user_id,
+                MAX(source.has_active_relation) AS has_active_relation,
+                MIN(source.bound_at) AS bound_at,
+                MAX(source.invite_code) AS invite_code,
+                MAX(source.last_commission_at) AS last_commission_at
+            FROM (
+                SELECT
+                    bur.user_id,
+                    1 AS has_active_relation,
+                    bur.bound_at AS bound_at,
+                    bur.invite_code AS invite_code,
+                    NULL AS last_commission_at
+                FROM bd_user_relations bur
+                WHERE bur.bd_user_id = :bd_user_id
+                  AND bur.status = 'ACTIVE'
+                UNION ALL
+                SELECT
+                    bcr.user_id,
+                    0 AS has_active_relation,
+                    NULL AS bound_at,
+                    NULL AS invite_code,
+                    MAX(bcr.created_at) AS last_commission_at
+                FROM bd_commission_records bcr
+                WHERE bcr.bd_user_id = :bd_user_id
+                  AND bcr.user_id IS NOT NULL
+                GROUP BY bcr.user_id
+            ) source
+            GROUP BY source.user_id
+        ) member_scope
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {member_source_sql}"), params).scalar() or 0)
+    all_member_rows = db.execute(
+        text(f"SELECT member_scope.user_id {member_source_sql}"),
+        params,
+    ).mappings().all()
+    all_member_ids = [
+        int(row["user_id"])
+        for row in all_member_rows
+        if row.get("user_id") is not None
+    ]
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                member_scope.user_id,
+                member_scope.bound_at,
+                member_scope.invite_code,
+                member_scope.has_active_relation,
+                member_scope.last_commission_at,
+                up.nickname,
+                up.username,
+                u.email,
+                u.phone
+            {member_source_sql}
+            LEFT JOIN user_profiles up ON up.user_id = member_scope.user_id
+            LEFT JOIN users u ON u.id = member_scope.user_id
+            ORDER BY
+                member_scope.has_active_relation DESC,
+                COALESCE(member_scope.bound_at, member_scope.last_commission_at) DESC,
+                member_scope.user_id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+
+    member_rows = [dict(row) for row in rows]
+    member_ids = [int(row["user_id"]) for row in member_rows if row.get("user_id") is not None]
+    daily_volume = _admin_bd_volume_by_member(db, member_ids=member_ids, day_start=day_start, day_end=day_end)
+    total_volume = _admin_bd_volume_by_member(db, member_ids=member_ids)
+    daily_fees = _admin_bd_fee_totals_by_member(
+        db,
+        bd_user_id=bd_user_id,
+        member_ids=member_ids,
+        day_start=day_start,
+        day_end=day_end,
+    )
+    total_fees = _admin_bd_fee_totals_by_member(db, bd_user_id=bd_user_id, member_ids=member_ids)
+    daily_commissions = _admin_bd_commission_totals_by_member(
+        db,
+        bd_user_id=bd_user_id,
+        member_ids=member_ids,
+        day_start=day_start,
+        day_end=day_end,
+    )
+    total_commissions = _admin_bd_commission_totals_by_member(db, bd_user_id=bd_user_id, member_ids=member_ids)
+    team_period_volume = sum(
+        _admin_bd_volume_by_member(
+            db,
+            member_ids=all_member_ids,
+            day_start=day_start,
+            day_end=day_end,
+        ).values(),
+        Decimal("0"),
+    )
+    team_period_fees = _admin_bd_sum_coin_totals(
+        _admin_bd_fee_totals_by_member(
+            db,
+            bd_user_id=bd_user_id,
+            member_ids=all_member_ids,
+            day_start=day_start,
+            day_end=day_end,
+        )
+    )
+    team_period_commissions = _admin_bd_sum_coin_totals(
+        _admin_bd_commission_totals_by_member(
+            db,
+            bd_user_id=bd_user_id,
+            member_ids=all_member_ids,
+            day_start=day_start,
+            day_end=day_end,
+        )
+    )
+
+    commission_rate = account.get("commission_rate")
+    items = []
+    for row in member_rows:
+        member_id = int(row["user_id"])
+        nickname = row.get("nickname") or row.get("username") or ""
+        daily_fee_totals = daily_fees.get(member_id, _admin_bd_asset_totals())
+        total_fee_totals = total_fees.get(member_id, _admin_bd_asset_totals())
+        daily_commission_totals = daily_commissions.get(member_id, _admin_bd_asset_totals())
+        total_commission_totals = total_commissions.get(member_id, _admin_bd_asset_totals())
+        items.append(
+            {
+                "user_id": member_id,
+                "nickname": nickname or "-",
+                "email": row.get("email") or "",
+                "phone": row.get("phone") or "",
+                "bound_at": _admin_datetime_display(row.get("bound_at")),
+                "relation_status": "ACTIVE" if int(row.get("has_active_relation") or 0) == 1 else "HISTORICAL",
+                "relation_status_label": "生效成员" if int(row.get("has_active_relation") or 0) == 1 else "历史贡献成员",
+                "relation_status_badge": "success" if int(row.get("has_active_relation") or 0) == 1 else "warning",
+                "last_commission_at": _admin_datetime_display(row.get("last_commission_at")),
+                "daily_volume": _admin_usdt_display(daily_volume.get(member_id, Decimal("0"))),
+                "total_volume": _admin_usdt_display(total_volume.get(member_id, Decimal("0"))),
+                "daily_fee_items": _admin_bd_coin_items(daily_fee_totals),
+                "daily_fee_text": _admin_bd_coin_text(daily_fee_totals),
+                "total_fee_items": _admin_bd_coin_items(total_fee_totals),
+                "total_fee_text": _admin_bd_coin_text(total_fee_totals),
+                "daily_commission_items": _admin_bd_coin_items(daily_commission_totals),
+                "daily_commission_text": _admin_bd_coin_text(daily_commission_totals),
+                "total_commission_items": _admin_bd_coin_items(total_commission_totals),
+                "total_commission_text": _admin_bd_coin_text(total_commission_totals),
+            }
+        )
+
+    account_payload = {
+        "bd_user_id": int(account["user_id"]),
+        "bd_level": account.get("bd_level") or "",
+        "commission_rate_percent": _admin_percent_display(account.get("commission_rate")),
+        "invite_code": account.get("invite_code") or "",
+        "status": account.get("status") or "",
+        "nickname": account.get("nickname") or account.get("username") or "",
+        "created_at": _admin_datetime_display(account.get("created_at")),
+    }
+    summary = {
+        "member_count": total,
+        "date": stat_date.isoformat(),
+        "date_filter": date_filter,
+        "range": range_filter,
+        "range_label": range_label,
+        "start_date": start_date_filter,
+        "end_date": end_date_filter,
+        "day_start": _admin_datetime_display(day_start),
+        "day_end": _admin_datetime_display(day_end),
+        "asset_symbols": list(ADMIN_BD_DETAIL_ASSET_SYMBOLS),
+        "team_period_volume": _admin_usdt_display(team_period_volume),
+        "team_period_fee_items": _admin_bd_coin_items(team_period_fees),
+        "team_period_fee_text": _admin_bd_coin_text(team_period_fees),
+        "team_period_commission_items": _admin_bd_coin_items(team_period_commissions),
+        "team_period_commission_text": _admin_bd_coin_text(team_period_commissions),
+    }
+    return _empty_page(
+        items=items,
+        filters={
+            "date": date_filter,
+            "date_input": stat_date.isoformat(),
+            "range": range_filter,
+            "start_date": start_date_filter,
+            "end_date": end_date_filter,
+            "page": page,
+            "page_size": page_size,
+        },
+        pagination={"page": page, "page_size": page_size, "total": total, "pages": pages},
+        summary=summary,
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+        account=account_payload,
+        account_exists=True,
+    )
+
+
+def _fmt_admin_rcb_compact_display(value: Any, places: int = 4) -> str:
+    try:
+        amount = Decimal(str(value or "0"))
+    except Exception:
+        amount = Decimal("0")
+    quant = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
+    text_value = format(amount.quantize(quant, rounding=ROUND_HALF_UP).normalize(), "f")
+    return "0" if text_value == "-0" else text_value
+
+
+def _admin_dividend_level_sort_key(level_code: Any) -> tuple[int, int, str]:
+    code = str(level_code or "").strip().upper()
+    if code.startswith("SVIP"):
+        try:
+            return (0, int(code[4:] or "0"), code)
+        except ValueError:
+            return (0, 999, code)
+    if code == "LP":
+        return (1, 0, code)
+    return (2, 999, code)
+
+
+def _admin_enabled_meta(value: Any) -> tuple[str, str]:
+    enabled = str(value or "").strip() in {"1", "true", "True", "YES", "yes"}
+    return ("启用", "success") if enabled else ("禁用", "danger")
+
+
+def _admin_status_badge_any(status: Any) -> str:
+    value = str(status or "").strip().upper()
+    if value in {"SUCCESS", "PAID", "APPROVED", "ACTIVE", "CALCULATED", "CREATED_CALCULATED_PAID", "COMPLETED"}:
+        return "success"
+    if value in {"PENDING", "PROCESSING", "RUNNING", "CREATED", "REVIEWING"}:
+        return "warning"
+    if value in {"FAILED", "REJECTED", "CANCELED", "CANCELLED", "DISABLED", "INACTIVE", "EXPIRED", "PARTIAL_FAILED"}:
+        return "danger"
+    return "secondary"
+
+
+def _admin_display_id(value: Any) -> str:
+    if value is None or value == "":
+        return "--"
+    return str(value)
+
+
+def _admin_money_total_text(
+    rows: list[Dict[str, Any]],
+    amount_key: str,
+    symbol_key: str,
+    *,
+    precision: int = 2,
+) -> str:
+    totals: Dict[str, Decimal] = {}
+    for row in rows:
+        symbol = str(row.get(symbol_key) or "RCB").strip().upper() or "RCB"
+        totals[symbol] = totals.get(symbol, Decimal("0")) + _parse_decimal(row.get(amount_key))
+    if not totals:
+        return "0"
+    return " / ".join(f"{_fmt_admin_amount_display(amount, symbol)} {symbol}" for symbol, amount in sorted(totals.items()))
+
+
+def _admin_invite_commission_status_meta(status: Any) -> tuple[str, str]:
+    value = str(status or "").strip().upper()
+    labels = {
+        "PENDING": "待发放",
+        "PAID": "已发放",
+        "FAILED": "失败",
+    }
+    return labels.get(value, value or "--"), _admin_status_badge_any(value)
+
+
+def _admin_invite_relation_status_meta(status: Any) -> tuple[str, str]:
+    value = str(status or "").strip().upper()
+    labels = {
+        "ACTIVE": "生效中",
+        "DISABLED": "已停用",
+        "INACTIVE": "已停用",
+        "EXPIRED": "已过期",
+    }
+    return labels.get(value, value or "--"), _admin_status_badge_any(value)
+
+
+def _admin_invite_relation_source_meta(source: Any) -> tuple[str, str]:
+    value = str(source or "").strip().upper()
+    labels = {
+        "REGISTER_BIND": "注册绑定",
+        "MANUAL_BIND": "人工绑定",
+        "IMPORT": "导入绑定",
+    }
+    return labels.get(value, value or "--"), "info" if value else "secondary"
+
+
+def _admin_vip_rule_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    enabled_label, enabled_badge = _admin_enabled_meta(row.get("is_enabled"))
+    return {
+        "id": row.get("id"),
+        "vip_type": row.get("vip_type") or "",
+        "level_code": row.get("level_code") or "",
+        "level_name": row.get("level_name") or "",
+        "is_enabled": bool(row.get("is_enabled")),
+        "status_label": enabled_label,
+        "status_badge": enabled_badge,
+        "min_30d_volume": _fmt_admin_amount_display(row.get("min_30d_volume"), "USDT"),
+        "min_rcb_hold": _fmt_admin_amount_display(row.get("min_rcb_hold"), "RCB"),
+        "min_lock_amount": _fmt_admin_amount_display(row.get("min_lock_amount"), "RCB"),
+        "lock_period_days": int(row.get("lock_period_days") or 0),
+        "dividend_rate": _admin_percent_display(row.get("dividend_rate")),
+        "dividend_rate_input": _admin_amount_display(row.get("dividend_rate")),
+        "spot_maker_fee": _admin_percent_display(row.get("spot_maker_fee")),
+        "spot_maker_fee_input": _admin_amount_display(row.get("spot_maker_fee")),
+        "spot_taker_fee": _admin_percent_display(row.get("spot_taker_fee")),
+        "spot_taker_fee_input": _admin_amount_display(row.get("spot_taker_fee")),
+    }
+
+
+def admin_query_dividend_config_rules(db: Session) -> Dict[str, Any]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                vfl.id,
+                vfl.vip_type,
+                vfl.level_code,
+                vfl.level_name,
+                vfl.sort_order,
+                vfl.is_enabled,
+                vfl.spot_maker_fee,
+                vfl.spot_taker_fee,
+                vflc.min_30d_volume,
+                vflc.min_rcb_hold,
+                vflc.min_lock_amount,
+                vflc.lock_period_days,
+                vflc.dividend_rate
+            FROM vip_fee_levels vfl
+            LEFT JOIN vip_fee_level_conditions vflc ON vflc.vip_fee_level_id = vfl.id
+            ORDER BY vfl.vip_type DESC, vfl.sort_order ASC, vfl.id ASC
+            """
+        )
+    ).mappings().all()
+    svip_rules = []
+    vip_rules = []
+    for row in rows:
+        item = _admin_vip_rule_row(dict(row))
+        if str(item.get("vip_type") or "").upper() == "SVIP":
+            svip_rules.append(item)
+        else:
+            vip_rules.append(item)
+    return {"svip_rules": svip_rules, "vip_rules": vip_rules}
+
+
+def admin_query_bd_applications(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    status = str(filters.get("status") or "").strip().upper()
+    apply_level = str(filters.get("apply_level") or "").strip().upper()
+    created_from = filters.get("created_from")
+    created_to = filters.get("created_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("ba.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if status:
+        where_parts.append("ba.status = :status")
+        params["status"] = status
+    if apply_level:
+        where_parts.append("ba.apply_level = :apply_level")
+        params["apply_level"] = apply_level
+    if created_from:
+        where_parts.append("DATE(ba.created_at) >= :created_from")
+        params["created_from"] = created_from
+    if created_to:
+        where_parts.append("DATE(ba.created_at) <= :created_to")
+        params["created_to"] = created_to
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM bd_applications ba {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT ba.*, bda.status AS bd_account_status
+            FROM bd_applications ba
+            LEFT JOIN bd_accounts bda ON bda.user_id = ba.user_id
+            {where_sql}
+            ORDER BY ba.created_at DESC, ba.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_value = str(row_dict.get("status") or "").strip().upper()
+        status_labels = {"PENDING": "待审核", "APPROVED": "已通过", "REJECTED": "已拒绝", "CANCELED": "已取消", "CANCELLED": "已取消"}
+        status_badges = {"PENDING": "warning", "APPROVED": "success", "REJECTED": "danger", "CANCELED": "secondary", "CANCELLED": "secondary"}
+        bd_account_status = str(row_dict.get("bd_account_status") or "").strip().upper()
+        bd_account_status_labels = {
+            "ACTIVE": "生效中",
+            "DISABLED": "已停用",
+            "INACTIVE": "已停用",
+            "EXPIRED": "已过期",
+        }
+        bd_account_status_badges = {
+            "ACTIVE": "success",
+            "DISABLED": "danger",
+            "INACTIVE": "danger",
+            "EXPIRED": "warning",
+        }
+        deposit_coin_symbol = row_dict.get("deposit_coin_symbol") or ""
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "user_id": row_dict.get("user_id"),
+                "apply_level": row_dict.get("apply_level") or "",
+                "deposit_coin_symbol": deposit_coin_symbol,
+                "deposit_amount": _fmt_admin_amount_display(row_dict.get("deposit_amount"), deposit_coin_symbol),
+                "status": status_value,
+                "status_label": status_labels.get(status_value, status_value or "未知"),
+                "status_badge": status_badges.get(status_value, "secondary"),
+                "bd_account_status": bd_account_status,
+                "bd_account_status_text": bd_account_status_labels.get(bd_account_status, "无BD账户"),
+                "bd_account_status_badge_class": bd_account_status_badges.get(bd_account_status, "secondary"),
+                "can_revoke_bd": status_value == "APPROVED" and bd_account_status == "ACTIVE",
+                "can_restore_bd": status_value == "APPROVED" and bd_account_status in {"DISABLED", "INACTIVE", "EXPIRED"},
+                "remark": row_dict.get("remark") or "--",
+                "admin_remark": row_dict.get("admin_remark") or "--",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "reviewed_at": _admin_datetime_display(row_dict.get("reviewed_at")),
+                "reviewed_by": row_dict.get("reviewed_by") if row_dict.get("reviewed_by") is not None else "--",
+            }
+        )
+    try:
+        stats_row = db.execute(
+            text(
+                """
+                SELECT
+                  SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) AS pending_count,
+                  SUM(CASE WHEN status = 'APPROVED' THEN 1 ELSE 0 END) AS approved_count,
+                  SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END) AS rejected_count,
+                  SUM(CASE WHEN DATE(created_at) = UTC_DATE() THEN 1 ELSE 0 END) AS today_count
+                FROM bd_applications
+                """
+            )
+        ).mappings().first()
+    except Exception:
+        stats_row = None
+    stats = {
+        "pending_count": int((stats_row or {}).get("pending_count") or 0),
+        "approved_count": int((stats_row or {}).get("approved_count") or 0),
+        "rejected_count": int((stats_row or {}).get("rejected_count") or 0),
+        "today_count": int((stats_row or {}).get("today_count") or 0),
+    }
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "user_id": user_id,
+            "status": status,
+            "apply_level": apply_level,
+            "created_from": created_from,
+            "created_to": created_to,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": stats,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_revoke_bd_application_account(db: Session, application_id: int) -> Dict[str, Any]:
+    application = db.execute(
+        text(
+            """
+            SELECT id, user_id, status
+            FROM bd_applications
+            WHERE id = :application_id
+            LIMIT 1
+            """
+        ),
+        {"application_id": int(application_id)},
+    ).mappings().first()
+    if not application:
+        return {"ok": False, "message": "BD申请不存在"}
+    if str(application.get("status") or "").strip().upper() != "APPROVED":
+        return {"ok": False, "message": "只有已通过的BD申请可以取消资格"}
+
+    account = db.execute(
+        text(
+            """
+            SELECT id, user_id, status
+            FROM bd_accounts
+            WHERE user_id = :user_id
+            LIMIT 1
+            FOR UPDATE
+            """
+        ),
+        {"user_id": int(application.get("user_id"))},
+    ).mappings().first()
+    if not account:
+        return {"ok": False, "message": "该用户没有BD账号"}
+    if str(account.get("status") or "").strip().upper() != "ACTIVE":
+        return {"ok": False, "message": "该BD账号已不是生效状态"}
+
+    db.execute(
+        text(
+            """
+            UPDATE bd_accounts
+            SET status = 'DISABLED', updated_at = UTC_TIMESTAMP()
+            WHERE id = :account_id
+            """
+        ),
+        {"account_id": int(account.get("id"))},
+    )
+    return {"ok": True, "message": "已取消该用户BD资格"}
+
+
+def admin_restore_bd_application_account(db: Session, application_id: int) -> Dict[str, Any]:
+    application = db.execute(
+        text(
+            """
+            SELECT id, user_id, status
+            FROM bd_applications
+            WHERE id = :application_id
+            LIMIT 1
+            """
+        ),
+        {"application_id": int(application_id)},
+    ).mappings().first()
+    if not application:
+        return {"ok": False, "message": "BD申请不存在"}
+    if str(application.get("status") or "").strip().upper() != "APPROVED":
+        return {"ok": False, "message": "只有已通过的BD申请可以恢复资格"}
+
+    account = db.execute(
+        text(
+            """
+            SELECT id, user_id, status
+            FROM bd_accounts
+            WHERE user_id = :user_id
+            LIMIT 1
+            FOR UPDATE
+            """
+        ),
+        {"user_id": int(application.get("user_id"))},
+    ).mappings().first()
+    if not account:
+        return {"ok": False, "message": "该用户没有BD账号"}
+
+    account_status = str(account.get("status") or "").strip().upper()
+    if account_status == "ACTIVE":
+        return {"ok": False, "message": "该BD账号已是生效状态"}
+    if account_status not in {"DISABLED", "INACTIVE", "EXPIRED"}:
+        return {"ok": False, "message": "该BD账号当前状态不可恢复"}
+
+    db.execute(
+        text(
+            """
+            UPDATE bd_accounts
+            SET status = 'ACTIVE', updated_at = UTC_TIMESTAMP()
+            WHERE id = :account_id
+            """
+        ),
+        {"account_id": int(account.get("id"))},
+    )
+    return {"ok": True, "message": "已恢复该用户BD资格"}
+
+
+def get_bd_commission_records(
+    db: Session,
+    *,
+    page: int = 1,
+    page_size: int = 20,
+    status: str = "",
+    bd_user_id: str = "",
+    user_id: str = "",
+    fee_coin_symbol: str = "",
+) -> Dict[str, Any]:
+    status = str(status or "").strip().upper()
+    bd_user_id = str(bd_user_id or "").strip()
+    user_id = str(user_id or "").strip()
+    fee_coin_symbol = _normalize_code(fee_coin_symbol)
+    page = max(1, _parse_int(page, 1))
+    page_size = min(max(1, _parse_int(page_size, 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if status:
+        where_parts.append("bcr.status = :status")
+        params["status"] = status
+    if bd_user_id:
+        where_parts.append("bcr.bd_user_id = :bd_user_id")
+        params["bd_user_id"] = _parse_int(bd_user_id)
+    if user_id:
+        where_parts.append("bcr.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if fee_coin_symbol:
+        where_parts.append("bcr.fee_coin_symbol = :fee_coin_symbol")
+        params["fee_coin_symbol"] = fee_coin_symbol
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM bd_commission_records bcr {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT bcr.*
+            FROM bd_commission_records bcr
+            {where_sql}
+            ORDER BY bcr.created_at DESC, bcr.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    all_rows = [dict(row) for row in db.execute(text(f"SELECT * FROM bd_commission_records bcr {where_sql}"), params).mappings().all()]
+    pending_rows = [row for row in all_rows if str(row.get("status") or "").upper() == "PENDING"]
+    paid_rows = [row for row in all_rows if str(row.get("status") or "").upper() == "PAID"]
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        commission_symbol = row_dict.get("commission_asset_symbol") or row_dict.get("fee_coin_symbol") or ""
+        status_value = str(row_dict.get("status") or "").upper()
+        status_labels = {"PENDING": "待发放", "PAID": "已发放", "FAILED": "失败"}
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "bd_user_id": row_dict.get("bd_user_id"),
+                "user_id": row_dict.get("user_id"),
+                "source_user_id": _admin_display_id(row_dict.get("user_id")),
+                "source_order_id": _admin_display_id(row_dict.get("source_order_id") or row_dict.get("order_id")),
+                "source_trade_id": _admin_display_id(row_dict.get("source_trade_id") or row_dict.get("trade_id")),
+                "order_id": _admin_display_id(row_dict.get("source_order_id") or row_dict.get("order_id")),
+                "trade_id": _admin_display_id(row_dict.get("source_trade_id") or row_dict.get("trade_id")),
+                "fee_coin_symbol": row_dict.get("fee_coin_symbol") or "",
+                "original_fee_amount": _fmt_admin_amount_display(row_dict.get("original_fee_amount"), row_dict.get("fee_coin_symbol")),
+                "commission_rate_percent": _admin_percent_display(row_dict.get("commission_rate")),
+                "commission_text": f"{_fmt_admin_amount_display(row_dict.get('commission_amount'), commission_symbol)} {commission_symbol}".strip(),
+                "pool_amount": _fmt_admin_amount_display(row_dict.get("pool_amount"), commission_symbol),
+                "status": status_value,
+                "status_label": status_labels.get(status_value, status_value),
+                "status_badge": _admin_status_badge_any(status_value),
+                "paid_balance_log_id": row_dict.get("paid_balance_log_id") or "--",
+                "paid_at": _admin_datetime_display(row_dict.get("paid_at")),
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+    summary = {
+        "total_text": _admin_money_total_text(all_rows, "commission_amount", "commission_asset_symbol"),
+        "total_display": _admin_money_total_text(all_rows, "commission_amount", "commission_asset_symbol", precision=2),
+        "pending_text": _admin_money_total_text(pending_rows, "commission_amount", "commission_asset_symbol"),
+        "pending_display": _admin_money_total_text(pending_rows, "commission_amount", "commission_asset_symbol", precision=2),
+        "paid_text": _admin_money_total_text(paid_rows, "commission_amount", "commission_asset_symbol"),
+        "paid_display": _admin_money_total_text(paid_rows, "commission_amount", "commission_asset_symbol", precision=2),
+    }
+    today_rows = [
+        row for row in all_rows
+        if row.get("created_at") and _admin_datetime_display(row.get("created_at")).startswith(datetime.utcnow().strftime("%Y-%m-%d"))
+    ]
+    month_prefix = datetime.utcnow().strftime("%Y-%m")
+    month_rows = [
+        row for row in all_rows
+        if row.get("created_at") and _admin_datetime_display(row.get("created_at")).startswith(month_prefix)
+    ]
+    stats = {
+        "today_text": _admin_money_total_text(today_rows, "commission_amount", "commission_asset_symbol"),
+        "today_display": _admin_money_total_text(today_rows, "commission_amount", "commission_asset_symbol", precision=2),
+        "month_text": _admin_money_total_text(month_rows, "commission_amount", "commission_asset_symbol"),
+        "month_display": _admin_money_total_text(month_rows, "commission_amount", "commission_asset_symbol", precision=2),
+        "total_text": summary["total_text"],
+        "total_display": summary["total_display"],
+        "pending_text": summary["pending_text"],
+        "pending_display": summary["pending_display"],
+    }
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "records": items,
+        "filters": {
+            "status": status,
+            "bd_user_id": bd_user_id,
+            "user_id": user_id,
+            "fee_coin_symbol": fee_coin_symbol,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": summary,
+        "stats": stats,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_bd_commission_job_logs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    status = str(filters.get("status") or "").strip().upper()
+    start_date = filters.get("start_date")
+    end_date = filters.get("end_date")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if status:
+        where_parts.append("status = :status")
+        params["status"] = status
+    if start_date:
+        where_parts.append("DATE(created_at) >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        where_parts.append("DATE(created_at) <= :end_date")
+        params["end_date"] = end_date
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM bd_commission_job_logs {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT *
+            FROM bd_commission_job_logs
+            {where_sql}
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_label, status_badge = _admin_system_status_meta(row_dict.get("status"))
+        step_label = _admin_system_type_label(row_dict.get("step") or "BD_COMMISSION")
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "run_time": _admin_datetime_display(row_dict.get("run_time")),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "step": row_dict.get("step") or "",
+                "step_label": step_label,
+                "processed_count": int(row_dict.get("processed_count") or 0),
+                "success_count": int(row_dict.get("success_count") or 0),
+                "failed_count": int(row_dict.get("failed_count") or 0),
+                "paid_totals_text": "--",
+                "message": row_dict.get("message") or "-",
+                "error_message": row_dict.get("error_message") or "",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {"status": status, "start_date": start_date, "end_date": end_date, "page": page, "page_size": page_size},
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def get_user_invite_commission_records(
+    db: Session,
+    *,
+    inviter_user_id: str = "",
+    invitee_user_id: str = "",
+    status: str = "",
+    fee_coin_symbol: str = "",
+    date_from: Any = None,
+    date_to: Any = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> Dict[str, Any]:
+    inviter_user_id = str(inviter_user_id or "").strip()
+    invitee_user_id = str(invitee_user_id or "").strip()
+    status = str(status or "").strip().upper()
+    fee_coin_symbol = _normalize_code(fee_coin_symbol)
+    page = max(1, _parse_int(page, 1))
+    page_size = min(max(1, _parse_int(page_size, 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if inviter_user_id:
+        where_parts.append("uicr.inviter_user_id = :inviter_user_id")
+        params["inviter_user_id"] = _parse_int(inviter_user_id)
+    if invitee_user_id:
+        where_parts.append("uicr.invitee_user_id = :invitee_user_id")
+        params["invitee_user_id"] = _parse_int(invitee_user_id)
+    if status:
+        where_parts.append("uicr.status = :status")
+        params["status"] = status
+    if fee_coin_symbol:
+        where_parts.append("uicr.fee_coin_symbol = :fee_coin_symbol")
+        params["fee_coin_symbol"] = fee_coin_symbol
+    if date_from:
+        where_parts.append("DATE(uicr.created_at) >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        where_parts.append("DATE(uicr.created_at) <= :date_to")
+        params["date_to"] = date_to
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM user_invite_commission_records uicr {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT uicr.*
+            FROM user_invite_commission_records uicr
+            {where_sql}
+            ORDER BY uicr.created_at DESC, uicr.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_value = str(row_dict.get("status") or "").strip().upper()
+        status_label, status_badge = _admin_invite_commission_status_meta(status_value)
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "inviter_user_id": row_dict.get("inviter_user_id"),
+                "invitee_user_id": row_dict.get("invitee_user_id"),
+                "source_user_id": _admin_display_id(row_dict.get("invitee_user_id")),
+                "source_order_id": _admin_display_id(row_dict.get("order_id")),
+                "source_trade_id": _admin_display_id(row_dict.get("trade_id")),
+                "order_id": _admin_display_id(row_dict.get("order_id")),
+                "trade_id": _admin_display_id(row_dict.get("trade_id")),
+                "source_label": "普通邀请",
+                "source_badge": "info",
+                "fee_amount": _fmt_admin_amount_display(row_dict.get("fee_amount"), row_dict.get("fee_coin_symbol")),
+                "fee_coin_symbol": row_dict.get("fee_coin_symbol") or "",
+                "fee_usdt_value": _fmt_admin_amount_display(row_dict.get("fee_usdt_value"), "USDT"),
+                "commission_rate_percent": _admin_percent_display(row_dict.get("commission_rate")),
+                "commission_rcb_amount": _fmt_admin_amount_display(
+                    row_dict.get("commission_rcb_amount") or row_dict.get("commission_amount"),
+                    "RCB",
+                ),
+                "status": status_value,
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "fail_reason": row_dict.get("fail_reason") or "",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "paid_at": _admin_datetime_display(row_dict.get("paid_at")),
+            }
+        )
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "records": items,
+        "filters": {
+            "inviter_user_id": inviter_user_id,
+            "invitee_user_id": invitee_user_id,
+            "status": status,
+            "fee_coin_symbol": fee_coin_symbol,
+            "date_from": date_from,
+            "date_to": date_to,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def get_user_invite_commission_summary(db: Session) -> Dict[str, Any]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                status,
+                COUNT(*) AS row_count,
+                COALESCE(SUM(commission_rcb_amount), SUM(commission_amount), 0) AS amount
+            FROM user_invite_commission_records
+            GROUP BY status
+            """
+        )
+    ).mappings().all()
+    pending_amount = Decimal("0")
+    paid_amount = Decimal("0")
+    pending_count = 0
+    for row in rows:
+        status = str(row.get("status") or "").upper()
+        if status == "PENDING":
+            pending_amount += _parse_decimal(row.get("amount"))
+            pending_count += int(row.get("row_count") or 0)
+        if status == "PAID":
+            paid_amount += _parse_decimal(row.get("amount"))
+    today_paid_count = int(
+        db.execute(
+            text("SELECT COUNT(*) FROM user_invite_commission_records WHERE status='PAID' AND DATE(paid_at)=CURRENT_DATE()")
+        ).scalar()
+        or 0
+    )
+    return {
+        "pending_amount_rcb": _fmt_admin_decimal(pending_amount, precision=6),
+        "pending_amount_display": f"{_fmt_admin_decimal(pending_amount, precision=2)} RCB",
+        "paid_amount_rcb": _fmt_admin_decimal(paid_amount, precision=6),
+        "paid_amount_display": f"{_fmt_admin_decimal(paid_amount, precision=2)} RCB",
+        "pending_count": pending_count,
+        "today_paid_count": today_paid_count,
+    }
+
+
+def admin_query_user_invite_relations(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    inviter_user_id = str(filters.get("inviter_user_id") or "").strip()
+    invitee_user_id = str(filters.get("invitee_user_id") or "").strip()
+    status = str(filters.get("status") or "").strip().upper()
+    invite_code = str(filters.get("invite_code") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if inviter_user_id:
+        where_parts.append("uir.inviter_user_id = :inviter_user_id")
+        params["inviter_user_id"] = _parse_int(inviter_user_id)
+    if invitee_user_id:
+        where_parts.append("uir.invitee_user_id = :invitee_user_id")
+        params["invitee_user_id"] = _parse_int(invitee_user_id)
+    if status:
+        where_parts.append("uir.status = :status")
+        params["status"] = status
+    if invite_code:
+        where_parts.append("uir.invite_code LIKE :invite_code")
+        params["invite_code"] = f"%{invite_code}%"
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM user_invite_relations uir {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT *
+            FROM user_invite_relations uir
+            {where_sql}
+            ORDER BY uir.created_at DESC, uir.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_value = str(row_dict.get("status") or "").strip().upper()
+        status_label, status_badge = _admin_invite_relation_status_meta(status_value)
+        source_value = row_dict.get("source_type") or row_dict.get("bind_source") or row_dict.get("bind_type") or "REGISTER_BIND"
+        source_label, source_badge = _admin_invite_relation_source_meta(source_value)
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "inviter_user_id": _admin_display_id(row_dict.get("inviter_user_id")),
+                "invitee_user_id": _admin_display_id(row_dict.get("invitee_user_id")),
+                "invite_code": row_dict.get("invite_code") or "",
+                "commission_rate_percent": _admin_percent_display(row_dict.get("commission_rate")),
+                "status": status_value,
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "source_type": str(source_value or "").strip().upper(),
+                "source_label": source_label,
+                "source_badge": source_badge,
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+            }
+        )
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "inviter_user_id": inviter_user_id,
+            "invitee_user_id": invitee_user_id,
+            "status": status,
+            "invite_code": invite_code,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_vip_users(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    vip_level_code = str(filters.get("vip_level_code") or "").strip().upper()
+    svip_level_code = str(filters.get("svip_level_code") or "").strip().upper()
+    effective_level_code = str(filters.get("effective_level_code") or "").strip().upper()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("uvs.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if vip_level_code:
+        where_parts.append("uvs.vip_level_code = :vip_level_code")
+        params["vip_level_code"] = vip_level_code
+    if svip_level_code:
+        where_parts.append("uvs.svip_level_code = :svip_level_code")
+        params["svip_level_code"] = svip_level_code
+    if effective_level_code:
+        where_parts.append("uvs.effective_level_code = :effective_level_code")
+        params["effective_level_code"] = effective_level_code
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM user_vip_snapshots uvs {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT *
+            FROM user_vip_snapshots uvs
+            {where_sql}
+            ORDER BY uvs.updated_at DESC, uvs.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "user_id": row_dict.get("user_id"),
+                "vip_level_code": row_dict.get("vip_level_code") or "",
+                "svip_level_code": row_dict.get("svip_level_code") or "",
+                "effective_level_code": row_dict.get("effective_level_code") or "",
+                "effective_fee_source": row_dict.get("effective_fee_source") or "",
+                "volume_30d": _fmt_admin_amount_display(row_dict.get("volume_30d"), "USDT"),
+                "rcb_available": _fmt_admin_amount_display(row_dict.get("rcb_available"), "RCB"),
+                "rcb_locked": _fmt_admin_amount_display(row_dict.get("rcb_locked"), "RCB"),
+                "spot_maker_fee": _admin_percent_display(row_dict.get("effective_spot_maker_fee")),
+                "spot_taker_fee": _admin_percent_display(row_dict.get("effective_spot_taker_fee")),
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+            }
+        )
+    try:
+        stats_row = db.execute(
+            text(
+                """
+                SELECT
+                  SUM(CASE WHEN COALESCE(vip_level_code, '') NOT IN ('', 'VIP0', 'NORMAL', 'NONE') THEN 1 ELSE 0 END) AS vip_user_count,
+                  SUM(CASE WHEN COALESCE(svip_level_code, '') NOT IN ('', 'SVIP0', 'NORMAL', 'NONE') THEN 1 ELSE 0 END) AS svip_user_count,
+                  COALESCE(SUM(rcb_locked), 0) AS rcb_locked_total,
+                  COALESCE(SUM(volume_30d), 0) AS volume_30d_total
+                FROM user_vip_snapshots
+                """
+            )
+        ).mappings().first()
+    except Exception:
+        stats_row = None
+    try:
+        expiring_lock_user_count = int(
+            db.execute(
+                text(
+                    """
+                    SELECT COUNT(DISTINCT user_id)
+                    FROM user_rcb_locks
+                    WHERE status = 'LOCKED'
+                      AND end_time >= UTC_TIMESTAMP()
+                      AND end_time < DATE_ADD(UTC_TIMESTAMP(), INTERVAL 7 DAY)
+                    """
+                )
+            ).scalar()
+            or 0
+        )
+    except Exception:
+        expiring_lock_user_count = 0
+    stats = {
+        "vip_user_count": int((stats_row or {}).get("vip_user_count") or 0),
+        "svip_user_count": int((stats_row or {}).get("svip_user_count") or 0),
+        "rcb_locked_total": _fmt_admin_amount_display((stats_row or {}).get("rcb_locked_total"), "RCB"),
+        "volume_30d_total": _fmt_admin_amount_display((stats_row or {}).get("volume_30d_total"), "USDT"),
+        "expiring_lock_user_count": expiring_lock_user_count,
+    }
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "user_id": user_id,
+            "vip_level_code": vip_level_code,
+            "svip_level_code": svip_level_code,
+            "effective_level_code": effective_level_code,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": stats,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_vip_levels(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    vip_type = str(filters.get("vip_type") or "").strip().upper()
+    level_code = str(filters.get("level_code") or "").strip().upper()
+    is_enabled = str(filters.get("is_enabled") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if vip_type:
+        where_parts.append("vfl.vip_type = :vip_type")
+        params["vip_type"] = vip_type
+    if level_code:
+        where_parts.append("vfl.level_code = :level_code")
+        params["level_code"] = level_code
+    if is_enabled in {"0", "1"}:
+        where_parts.append("vfl.is_enabled = :is_enabled")
+        params["is_enabled"] = _parse_int(is_enabled)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM vip_fee_levels vfl
+        LEFT JOIN vip_fee_level_conditions vflc ON vflc.vip_fee_level_id = vfl.id
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                vfl.id,
+                vfl.vip_type,
+                vfl.level_code,
+                vfl.level_name,
+                vfl.sort_order,
+                vfl.is_enabled,
+                vfl.spot_maker_fee,
+                vfl.spot_taker_fee,
+                vflc.min_30d_volume,
+                vflc.min_rcb_hold,
+                vflc.min_lock_amount,
+                vflc.lock_period_days,
+                vflc.dividend_rate
+            {from_sql}
+            {where_sql}
+            ORDER BY vfl.vip_type ASC, vfl.sort_order ASC, vfl.id ASC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    items = [_admin_vip_rule_row(dict(row)) for row in rows]
+    try:
+        stats_row = db.execute(
+            text(
+                """
+                SELECT
+                  SUM(CASE WHEN is_enabled = 1 THEN 1 ELSE 0 END) AS enabled_level_count,
+                  SUM(CASE WHEN vip_type = 'VIP' THEN 1 ELSE 0 END) AS vip_level_count,
+                  SUM(CASE WHEN vip_type = 'SVIP' THEN 1 ELSE 0 END) AS svip_level_count
+                FROM vip_fee_levels
+                """
+            )
+        ).mappings().first()
+    except Exception:
+        stats_row = None
+    try:
+        highest_row = db.execute(
+            text(
+                """
+                SELECT level_code
+                FROM vip_fee_levels
+                WHERE is_enabled = 1
+                ORDER BY CASE WHEN vip_type = 'SVIP' THEN 2 ELSE 1 END DESC, sort_order DESC, id DESC
+                LIMIT 1
+                """
+            )
+        ).mappings().first()
+    except Exception:
+        highest_row = None
+    stats = {
+        "enabled_level_count": int((stats_row or {}).get("enabled_level_count") or 0),
+        "vip_level_count": int((stats_row or {}).get("vip_level_count") or 0),
+        "svip_level_count": int((stats_row or {}).get("svip_level_count") or 0),
+        "highest_level": (highest_row or {}).get("level_code") or "-",
+    }
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {"vip_type": vip_type, "level_code": level_code, "is_enabled": is_enabled, "page": page, "page_size": page_size},
+        "pagination": pagination,
+        "summary": {},
+        "stats": stats,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_vip_fee_preferences(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    use_rcb_fee = str(filters.get("use_rcb_fee") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("ufp.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if use_rcb_fee in {"0", "1"}:
+        where_parts.append("ufp.use_rcb_fee = :use_rcb_fee")
+        params["use_rcb_fee"] = _parse_int(use_rcb_fee)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM user_fee_preferences ufp {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT *
+            FROM user_fee_preferences ufp
+            {where_sql}
+            ORDER BY ufp.updated_at DESC, ufp.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        enabled_label = "使用 RCB" if int(row_dict.get("use_rcb_fee") or 0) == 1 else "不使用 RCB"
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "user_id": row_dict.get("user_id"),
+                "use_rcb_fee": int(row_dict.get("use_rcb_fee") or 0),
+                "use_rcb_fee_label": enabled_label,
+                "status_badge": "success" if int(row_dict.get("use_rcb_fee") or 0) == 1 else "secondary",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+            }
+        )
+    try:
+        fee_stats = db.execute(
+            text(
+                """
+                SELECT
+                  SUM(CASE WHEN is_enabled = 1 THEN 1 ELSE 0 END) AS enabled_fee_rule_count,
+                  MIN(CASE WHEN is_enabled = 1 THEN spot_maker_fee ELSE NULL END) AS min_maker_fee,
+                  MIN(CASE WHEN is_enabled = 1 THEN spot_taker_fee ELSE NULL END) AS min_taker_fee
+                FROM vip_fee_levels
+                """
+            )
+        ).mappings().first()
+    except Exception:
+        fee_stats = None
+    try:
+        discount_user_count = int(
+            db.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM user_vip_snapshots
+                    WHERE COALESCE(effective_level_code, '') NOT IN ('', 'VIP0', 'NORMAL', 'NONE')
+                    """
+                )
+            ).scalar()
+            or 0
+        )
+    except Exception:
+        discount_user_count = 0
+    stats = {
+        "enabled_fee_rule_count": int((fee_stats or {}).get("enabled_fee_rule_count") or 0),
+        "min_maker_fee": _admin_percent_display((fee_stats or {}).get("min_maker_fee")),
+        "min_taker_fee": _admin_percent_display((fee_stats or {}).get("min_taker_fee")),
+        "discount_user_count": discount_user_count,
+    }
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {"user_id": user_id, "use_rcb_fee": use_rcb_fee, "page": page, "page_size": page_size},
+        "pagination": pagination,
+        "summary": {},
+        "stats": stats,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_get_pair_asset_options(db: Session) -> Dict[str, Any]:
+    rows = db.execute(
+        text(
+            """
+            SELECT id, symbol, name, enabled
+            FROM assets
+            ORDER BY enabled DESC, sort_order ASC, symbol ASC
+            """
+        )
+    ).mappings().all()
+    assets = [
+        {
+            "id": row.get("id"),
+            "symbol": row.get("symbol") or "",
+            "name": row.get("name") or row.get("symbol") or "",
+            "enabled": int(row.get("enabled") or 0),
+        }
+        for row in rows
+    ]
+    return {"assets": assets, "base_assets": assets, "quote_assets": assets}
+
+
+def _admin_pair_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    status = int(row.get("status") or 0)
+    market_mode = row.get("market_mode") or ""
+    data_source = row.get("data_source") or ""
+    display_category = row.get("display_category") or ""
+    return {
+        "id": row.get("id"),
+        "symbol": row.get("symbol") or "",
+        "base_asset_id": row.get("base_asset_id"),
+        "quote_asset_id": row.get("quote_asset_id"),
+        "base_asset_symbol": row.get("base_asset_symbol") or "",
+        "quote_asset_symbol": row.get("quote_asset_symbol") or "",
+        "market_mode": market_mode,
+        "market_mode_label": _admin_trade_mode_label(market_mode),
+        "market_mode_badge": "success" if str(market_mode).upper() in {"INTERNAL", "MATCHING"} else "warning",
+        "asset_type": row.get("asset_type") or "",
+        "display_category": display_category,
+        "frontend_category": display_category,
+        "data_source": data_source,
+        "data_source_badge": "success" if str(data_source).upper() == "INTERNAL" else "info",
+        "external_symbol": row.get("external_symbol") or "",
+        "external_region": row.get("external_region") or "",
+        "show_spot_logo": int(row.get("show_spot_logo") or 0),
+        "spot_logo_url": row.get("spot_logo_url") or "",
+        "spot_logo_alt": row.get("spot_logo_alt") or "",
+        "status": status,
+        "status_label": "启用" if status == 1 else "禁用",
+        "status_badge": "success" if status == 1 else "secondary",
+        "price_precision": int(row.get("price_precision") or 0),
+        "amount_precision": int(row.get("amount_precision") or 0),
+        "min_amount": _admin_trade_quantity_display(row.get("min_amount")),
+        "min_notional": _admin_usdt_display(row.get("min_notional")),
+        "maker_fee_rate": _admin_percent_display(row.get("maker_fee_rate")),
+        "taker_fee_rate": _admin_percent_display(row.get("taker_fee_rate")),
+        "created_at": _admin_datetime_display(row.get("created_at")),
+        "can_delete": True,
+    }
+
+
+_PAIR_MARKET_MODE_OPTIONS = {"INTERNAL", "DEALER", "MATCHING"}
+_PAIR_ASSET_TYPE_OPTIONS = {"CRYPTO", "STOCK", "RWA", "STOCK_TOKEN", "FOREX", "INDEX", "METAL", "COMMODITY"}
+_PAIR_DISPLAY_CATEGORY_OPTIONS = {
+    "",
+    "MAINSTREAM",
+    "PLATFORM",
+    "RWA",
+    "STOCK",
+    "INDEX",
+    "FOREX",
+    "METAL",
+    "COMMODITY",
+    "ETF",
+}
+_PAIR_DATA_SOURCE_OPTIONS = {"INTERNAL", "BINANCE", "ITICK", "LOCAL"}
+
+
+def _admin_pair_form_from_payload(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    existing = existing or {}
+    def field_value(key: str, default: Any = "") -> Any:
+        return payload[key] if key in payload else existing.get(key, default)
+
+    return {
+        "id": existing.get("id"),
+        "symbol": _normalize_code(field_value("symbol")),
+        "base_asset_id": str(field_value("base_asset_id") or "").strip(),
+        "quote_asset_id": str(field_value("quote_asset_id") or "").strip(),
+        "base_asset_symbol": existing.get("base_asset_symbol") or "",
+        "quote_asset_symbol": existing.get("quote_asset_symbol") or "",
+        "market_mode": _normalize_code(field_value("market_mode", "INTERNAL") or "INTERNAL"),
+        "asset_type": _normalize_code(field_value("asset_type", "CRYPTO") or "CRYPTO"),
+        "display_category": _normalize_code(field_value("display_category", "")),
+        "data_source": _normalize_code(field_value("data_source", "INTERNAL") or "INTERNAL"),
+        "external_symbol": _normalize_code(field_value("external_symbol", "")),
+        "external_region": _normalize_code(field_value("external_region", "")),
+        "show_spot_logo": str(_parse_bool01(field_value("show_spot_logo", "0"))),
+        "spot_logo_url": str(field_value("spot_logo_url", "") or "").strip(),
+        "spot_logo_alt": str(field_value("spot_logo_alt", "") or "").strip(),
+        "status": str(field_value("status", "1") if field_value("status", "1") is not None else "1").strip(),
+        "price_precision": str(field_value("price_precision", "8")).strip(),
+        "amount_precision": str(field_value("amount_precision", "8")).strip(),
+        "min_amount": str(field_value("min_amount", "0")).strip(),
+        "min_notional": str(field_value("min_notional", "0")).strip(),
+    }
+
+
+def _parse_pair_positive_int(value: Any, field_error: str, errors: list[str], *, allow_zero: bool = False) -> int:
+    try:
+        result = int(str(value).strip())
+    except Exception:
+        errors.append(field_error)
+        return 0
+    if result < 0 or (result == 0 and not allow_zero):
+        errors.append(field_error)
+    return result
+
+
+def _parse_pair_decimal(value: Any, field_error: str, errors: list[str]) -> Decimal:
+    if _is_empty_config_value(value):
+        return Decimal("0")
+    try:
+        result = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        errors.append(field_error)
+        return Decimal("0")
+    if result < 0:
+        errors.append(field_error)
+    return result
+
+
+def _validate_admin_pair_form(db: Session, form: Dict[str, Any], *, is_create: bool) -> tuple[Dict[str, Any], list[str]]:
+    errors: list[str] = []
+    if is_create and not form["symbol"]:
+        errors.append("交易对不能为空")
+    if form["market_mode"] not in _PAIR_MARKET_MODE_OPTIONS:
+        errors.append("市场模式不正确")
+    if form["asset_type"] not in _PAIR_ASSET_TYPE_OPTIONS:
+        errors.append("资产类型不正确")
+    if form["display_category"] not in _PAIR_DISPLAY_CATEGORY_OPTIONS:
+        errors.append("前端展示分类不正确")
+    if form["data_source"] not in _PAIR_DATA_SOURCE_OPTIONS:
+        errors.append("行情源不正确")
+    if form["status"] not in {"0", "1"}:
+        errors.append("状态不正确")
+
+    base_asset_id = _parse_pair_positive_int(form["base_asset_id"], "基础币不存在", errors)
+    quote_asset_id = _parse_pair_positive_int(form["quote_asset_id"], "计价币不存在", errors)
+    if is_create and base_asset_id and quote_asset_id and base_asset_id == quote_asset_id:
+        errors.append("基础币和计价币不能相同")
+    if is_create and base_asset_id and quote_asset_id:
+        found_assets = int(
+            db.execute(
+                text("SELECT COUNT(*) FROM assets WHERE id IN (:base_asset_id, :quote_asset_id)"),
+                {"base_asset_id": base_asset_id, "quote_asset_id": quote_asset_id},
+            ).scalar()
+            or 0
+        )
+        if found_assets != 2:
+            errors.append("基础币或计价币不存在")
+
+    price_precision = _parse_pair_positive_int(form["price_precision"], "价格精度格式不正确", errors, allow_zero=True)
+    amount_precision = _parse_pair_positive_int(form["amount_precision"], "数量精度格式不正确", errors, allow_zero=True)
+    min_amount = _parse_pair_decimal(form["min_amount"], "最小数量格式不正确", errors)
+    min_notional = _parse_pair_decimal(form["min_notional"], "最小成交额格式不正确", errors)
+
+    values = {
+        "symbol": form["symbol"],
+        "base_asset_id": base_asset_id,
+        "quote_asset_id": quote_asset_id,
+        "market_mode": form["market_mode"],
+        "asset_type": form["asset_type"],
+        "display_category": form["display_category"] or None,
+        "data_source": form["data_source"],
+        "external_symbol": form["external_symbol"] or None,
+        "external_region": form["external_region"] or None,
+        "show_spot_logo": _parse_bool01(form.get("show_spot_logo")),
+        "spot_logo_url": form["spot_logo_url"] or None,
+        "spot_logo_alt": form["spot_logo_alt"] or None,
+        "status": int(form["status"]) if form["status"] in {"0", "1"} else 0,
+        "price_precision": price_precision,
+        "amount_precision": amount_precision,
+        "min_amount": min_amount,
+        "min_notional": min_notional,
+    }
+    return values, errors
+
+
+def admin_create_pair(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    form = _admin_pair_form_from_payload(payload)
+    values, errors = _validate_admin_pair_form(db, form, is_create=True)
+    if errors:
+        return {"ok": False, "errors": errors, "form": form}
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO trading_pairs (
+                    symbol, base_asset_id, quote_asset_id, market_mode, asset_type,
+                    display_category, data_source, external_symbol, external_region,
+                    show_spot_logo, spot_logo_url, spot_logo_alt,
+                    status, price_precision, amount_precision, min_amount, min_notional,
+                    maker_fee_rate, taker_fee_rate, created_at, updated_at
+                ) VALUES (
+                    :symbol, :base_asset_id, :quote_asset_id, :market_mode, :asset_type,
+                    :display_category, :data_source, :external_symbol, :external_region,
+                    :show_spot_logo, :spot_logo_url, :spot_logo_alt,
+                    :status, :price_precision, :amount_precision, :min_amount, :min_notional,
+                    :maker_fee_rate, :taker_fee_rate, UTC_TIMESTAMP(), UTC_TIMESTAMP()
+                )
+                """
+            ),
+            {**values, "maker_fee_rate": Decimal("0.00100000"), "taker_fee_rate": Decimal("0.00100000")},
+        )
+        db.commit()
+        clear_market_metadata_cache()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["交易对代码或基础币/计价币组合已存在"], "form": form}
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_create_pair failed")
+        return {"ok": False, "errors": ["现货交易对创建失败"], "form": form}
+    return {"ok": True, "errors": [], "form": form}
+
+
+def admin_update_pair(db: Session, pair_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    current = admin_get_pair_detail(db, pair_id)
+    if not current:
+        return {"ok": False, "not_found": True, "errors": ["现货交易对不存在"], "form": {}}
+    form = _admin_pair_form_from_payload(payload, current)
+    values, errors = _validate_admin_pair_form(db, form, is_create=False)
+    values["pair_id"] = int(pair_id)
+    if errors:
+        return {"ok": False, "errors": errors, "form": form}
+    try:
+        result = db.execute(
+            text(
+                """
+                UPDATE trading_pairs
+                SET market_mode = :market_mode,
+                    asset_type = :asset_type,
+                    display_category = :display_category,
+                    data_source = :data_source,
+                    external_symbol = :external_symbol,
+                    external_region = :external_region,
+                    show_spot_logo = :show_spot_logo,
+                    spot_logo_url = :spot_logo_url,
+                    spot_logo_alt = :spot_logo_alt,
+                    status = :status,
+                    price_precision = :price_precision,
+                    amount_precision = :amount_precision,
+                    min_amount = :min_amount,
+                    min_notional = :min_notional,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :pair_id
+                """
+            ),
+            values,
+        )
+        if result.rowcount == 0:
+            db.rollback()
+            return {"ok": False, "not_found": True, "errors": ["现货交易对不存在"], "form": form}
+        db.commit()
+        clear_market_metadata_cache()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["交易对配置不满足唯一性或表约束"], "form": form}
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_update_pair failed")
+        return {"ok": False, "errors": ["现货交易对更新失败"], "form": form}
+    return {"ok": True, "errors": [], "form": form}
+
+
+def admin_toggle_pair_status(db: Session, pair_id: int) -> Dict[str, Any]:
+    current = admin_get_pair_detail(db, pair_id)
+    if not current:
+        return {"ok": False, "message": "现货交易对不存在"}
+    current_status = _parse_int(current.get("status"), 0)
+    next_status = 0 if current_status == 1 else 1
+    try:
+        db.execute(
+            text("UPDATE trading_pairs SET status = :status, updated_at = UTC_TIMESTAMP() WHERE id = :pair_id"),
+            {"status": next_status, "pair_id": int(pair_id)},
+        )
+        db.commit()
+        clear_market_metadata_cache()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_toggle_pair_status failed")
+        return {"ok": False, "message": "现货交易对状态更新失败"}
+    return {"ok": True, "message": "现货交易对已启用" if next_status == 1 else "现货交易对已停用"}
+
+
+def admin_delete_pair(db: Session, pair_id: int) -> Dict[str, Any]:
+    current = admin_get_pair_detail(db, pair_id)
+    if not current:
+        return {"ok": False, "message": "现货交易对不存在"}
+    try:
+        result = db.execute(text("DELETE FROM trading_pairs WHERE id = :pair_id"), {"pair_id": int(pair_id)})
+        if result.rowcount == 0:
+            db.rollback()
+            return {"ok": False, "message": "现货交易对不存在"}
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "message": "该交易对已有业务数据，不能删除，请改为停用"}
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_delete_pair failed")
+        return {"ok": False, "message": "现货交易对删除失败"}
+    return {"ok": True, "message": "现货交易对已删除"}
+
+
+def _admin_contract_symbol_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    status = int(row.get("status") or 0)
+    leverage = int(row.get("max_leverage") or 0)
+    tp_sl_trigger_price_type = str(row.get("tp_sl_trigger_price_type") or "MARK_PRICE").strip().upper()
+    if tp_sl_trigger_price_type not in {"MARK_PRICE", "LAST_PRICE"}:
+        tp_sl_trigger_price_type = "MARK_PRICE"
+    return {
+        "id": row.get("id"),
+        "symbol": row.get("symbol") or "",
+        "display_name": row.get("display_name") or "",
+        "category": row.get("category") or "",
+        "provider": row.get("provider") or "",
+        "provider_symbol": row.get("provider_symbol") or "",
+        "quote_asset": row.get("quote_asset") or "",
+        "tp_sl_trigger_price_type": tp_sl_trigger_price_type,
+        "tp_sl_trigger_price_type_label": "最新价格" if tp_sl_trigger_price_type == "LAST_PRICE" else "标记价格",
+        "price_precision": int(row.get("price_precision") or 0),
+        "quantity_precision": int(row.get("quantity_precision") or 0),
+        "min_quantity": _admin_trade_quantity_display(row.get("min_quantity")),
+        "max_quantity": _admin_trade_quantity_display(row.get("max_quantity")),
+        "min_margin": _admin_usdt_display(row.get("min_margin")),
+        "leverage": leverage,
+        "max_leverage": leverage,
+        "leverage_text": _admin_leverage_display(leverage),
+        "spread_x": _admin_percent_display(row.get("spread_x")),
+        "liquidation_threshold": _admin_percent_display(row.get("liquidation_threshold")),
+        "warning_threshold": _admin_percent_display(row.get("warning_threshold")),
+        "status": status,
+        "status_label": "启用" if status == 1 else "禁用",
+        "status_badge": "success" if status == 1 else "secondary",
+        "created_at": _admin_datetime_display(row.get("created_at")),
+        "updated_at": _admin_datetime_display(row.get("updated_at")),
+    }
+
+
+def _admin_contract_symbol_form_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    item = _admin_contract_symbol_row(row)
+    item["status"] = str(int(row.get("status") or 0))
+    item["price_precision"] = str(int(row.get("price_precision") or 0))
+    item["quantity_precision"] = str(int(row.get("quantity_precision") or 0))
+    item["max_leverage"] = str(int(row.get("max_leverage") or 0))
+    return item
+
+
+def _contract_symbol_form_from_payload(payload: Dict[str, Any], existing_symbol: str = "") -> Dict[str, Any]:
+    return {
+        "symbol": _normalize_code(payload.get("symbol") or existing_symbol),
+        "display_name": str(payload.get("display_name") or "").strip(),
+        "category": str(payload.get("category") or "").strip().upper(),
+        "provider": str(payload.get("provider") or "").strip().upper(),
+        "provider_symbol": _normalize_code(payload.get("provider_symbol")),
+        "quote_asset": _normalize_code(payload.get("quote_asset") or "USDT"),
+        "tp_sl_trigger_price_type": str(payload.get("tp_sl_trigger_price_type") or "MARK_PRICE").strip().upper(),
+        "price_precision": str(payload.get("price_precision") or "8").strip(),
+        "quantity_precision": str(payload.get("quantity_precision") or "8").strip(),
+        "min_quantity": str(payload.get("min_quantity") or "").strip(),
+        "max_quantity": str(payload.get("max_quantity") or "").strip(),
+        "min_margin": str(payload.get("min_margin") or "").strip(),
+        "max_leverage": str(payload.get("max_leverage") or "100").strip(),
+        "spread_x": str(payload.get("spread_x") or "0").strip(),
+        "liquidation_threshold": str(payload.get("liquidation_threshold") or "").strip(),
+        "warning_threshold": str(payload.get("warning_threshold") or "").strip(),
+        "status": str(payload.get("status") or "1").strip(),
+    }
+
+
+def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> tuple[Dict[str, Any], list[str]]:
+    errors: list[str] = []
+    category_options = {"CRYPTO", "STOCK", "INDEX", "FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES"}
+    provider_options = {"BINANCE", "ITICK", "INTERNAL", "MANUAL"}
+    trigger_price_type_options = {"MARK_PRICE", "LAST_PRICE"}
+
+    if is_create and not form["symbol"]:
+        errors.append("合约代码不能为空")
+    if not form["display_name"]:
+        errors.append("显示名称不能为空")
+    if form["category"] not in category_options:
+        errors.append("品种类型无效")
+    if form["provider"] not in provider_options:
+        errors.append("行情来源无效")
+    if not form["provider_symbol"]:
+        errors.append("外部行情代码不能为空")
+    if not form["quote_asset"]:
+        errors.append("计价币种不能为空")
+    if form["status"] not in {"0", "1"}:
+        errors.append("状态无效")
+
+    if form["tp_sl_trigger_price_type"] not in trigger_price_type_options:
+        errors.append("TP/SL trigger price type is invalid")
+
+    price_precision = _parse_int(form["price_precision"], -1)
+    quantity_precision = _parse_int(form["quantity_precision"], -1)
+    max_leverage = _parse_int(form["max_leverage"], 0)
+    spread_x = _parse_decimal(form["spread_x"], Decimal("-1"))
+    min_quantity = _parse_decimal(form["min_quantity"], Decimal("0"))
+    max_quantity = _parse_decimal(form["max_quantity"], Decimal("0"))
+    min_margin = _parse_decimal(form["min_margin"], Decimal("0"))
+    liquidation_threshold = _parse_decimal(form["liquidation_threshold"], Decimal("0"))
+    warning_threshold = _parse_decimal(form["warning_threshold"], Decimal("0"))
+
+    if price_precision < 0:
+        errors.append("价格精度必须大于等于 0")
+    if quantity_precision < 0:
+        errors.append("数量精度必须大于等于 0")
+    if max_leverage < 1 or max_leverage > 200:
+        errors.append("最大杠杆必须在 1 到 200 之间")
+    if spread_x < 0 or spread_x > 50:
+        errors.append("点差系数必须在 0 到 50 之间")
+    if min_quantity < 0 or max_quantity < 0 or min_margin < 0:
+        errors.append("交易规则数值不能小于 0")
+    if liquidation_threshold < 0 or warning_threshold < 0:
+        errors.append("风控阈值不能小于 0")
+
+    values = {
+        **form,
+        "price_precision": price_precision,
+        "quantity_precision": quantity_precision,
+        "min_quantity": min_quantity,
+        "max_quantity": max_quantity,
+        "min_margin": min_margin,
+        "max_leverage": max_leverage,
+        "spread_x": spread_x,
+        "liquidation_threshold": liquidation_threshold,
+        "warning_threshold": warning_threshold,
+        "status": _parse_int(form["status"], 1),
+        "tp_sl_trigger_price_type": form["tp_sl_trigger_price_type"],
+    }
+    return values, errors
+
+
+def admin_get_contract_symbol(db: Session, symbol_id: int) -> Dict[str, Any]:
+    row = db.execute(
+        text(
+            """
+            SELECT
+                id, symbol, display_name, category, provider, provider_symbol,
+                quote_asset, tp_sl_trigger_price_type, price_precision, quantity_precision, min_quantity,
+                max_quantity, min_margin, max_leverage, spread_x,
+                liquidation_threshold, warning_threshold, status, created_at, updated_at
+            FROM contract_symbols
+            WHERE id = :symbol_id
+            LIMIT 1
+            """
+        ),
+        {"symbol_id": int(symbol_id)},
+    ).mappings().first()
+    return _admin_contract_symbol_form_row(dict(row)) if row else {}
+
+
+def admin_create_contract_symbol(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    form = _contract_symbol_form_from_payload(payload)
+    values, errors = _validate_contract_symbol_form(form, is_create=True)
+    if errors:
+        return {"ok": False, "errors": errors, "form": form}
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO contract_symbols (
+                    symbol, display_name, category, provider, provider_symbol, quote_asset,
+                    tp_sl_trigger_price_type,
+                    price_precision, quantity_precision, min_quantity, max_quantity,
+                    min_margin, max_leverage, spread_x, liquidation_threshold,
+                    warning_threshold, status, created_at, updated_at
+                ) VALUES (
+                    :symbol, :display_name, :category, :provider, :provider_symbol, :quote_asset,
+                    :tp_sl_trigger_price_type,
+                    :price_precision, :quantity_precision, :min_quantity, :max_quantity,
+                    :min_margin, :max_leverage, :spread_x, :liquidation_threshold,
+                    :warning_threshold, :status, UTC_TIMESTAMP(), UTC_TIMESTAMP()
+                )
+                """
+            ),
+            values,
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["合约代码已存在或数据不满足约束"], "form": form}
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_create_contract_symbol failed")
+        return {"ok": False, "errors": ["合约品种创建失败"], "form": form}
+    return {"ok": True, "errors": [], "form": form}
+
+
+def admin_update_contract_symbol(db: Session, symbol_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    current = admin_get_contract_symbol(db, symbol_id)
+    if not current:
+        return {"ok": False, "not_found": True, "errors": ["Contract symbol not found"], "form": {}}
+    form = _contract_symbol_form_from_payload(payload, existing_symbol=current.get("symbol") or "")
+    form["status"] = current.get("status") or "1"
+    values, errors = _validate_contract_symbol_form(form, is_create=False)
+    values["symbol_id"] = int(symbol_id)
+    if errors:
+        return {"ok": False, "errors": errors, "form": form}
+    try:
+        result = db.execute(
+            text(
+                """
+                UPDATE contract_symbols
+                SET display_name = :display_name,
+                    category = :category,
+                    provider = :provider,
+                    provider_symbol = :provider_symbol,
+                    quote_asset = :quote_asset,
+                    tp_sl_trigger_price_type = :tp_sl_trigger_price_type,
+                    price_precision = :price_precision,
+                    quantity_precision = :quantity_precision,
+                    min_quantity = :min_quantity,
+                    max_quantity = :max_quantity,
+                    min_margin = :min_margin,
+                    max_leverage = :max_leverage,
+                    spread_x = :spread_x,
+                    liquidation_threshold = :liquidation_threshold,
+                    warning_threshold = :warning_threshold,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :symbol_id
+                """
+            ),
+            values,
+        )
+        if result.rowcount == 0:
+            db.rollback()
+            return {"ok": False, "not_found": True, "errors": ["Contract symbol not found"], "form": form}
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["数据不满足唯一性或表约束"], "form": form}
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_update_contract_symbol failed")
+        return {"ok": False, "errors": ["合约品种更新失败"], "form": form}
+    return {"ok": True, "errors": [], "form": form}
+
+
+def admin_toggle_contract_symbol_status(db: Session, symbol_id: int) -> Dict[str, Any]:
+    current = admin_get_contract_symbol(db, symbol_id)
+    if not current:
+        return {"ok": False, "message": "Contract symbol not found"}
+    current_status = _parse_int(current.get("status"), 0)
+    next_status = 0 if current_status == 1 else 1
+    try:
+        db.execute(
+            text("UPDATE contract_symbols SET status = :status, updated_at = UTC_TIMESTAMP() WHERE id = :symbol_id"),
+            {"status": next_status, "symbol_id": int(symbol_id)},
+        )
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_toggle_contract_symbol_status failed")
+        return {"ok": False, "message": "合约品种状态更新失败"}
+    return {"ok": True, "message": "合约品种已启用" if next_status == 1 else "合约品种已禁用"}
+
+
+def admin_query_contract_symbols(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    symbol = _normalize_code(filters.get("symbol"))
+    category = str(filters.get("category") or "").strip().upper()
+    provider = str(filters.get("provider") or "").strip().upper()
+    status = str(filters.get("status") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if symbol:
+        where_parts.append("(cs.symbol LIKE :symbol OR cs.provider_symbol LIKE :symbol)")
+        params["symbol"] = f"%{symbol}%"
+    if category:
+        where_parts.append("cs.category = :category")
+        params["category"] = category
+    if provider:
+        where_parts.append("cs.provider = :provider")
+        params["provider"] = provider
+    if status in {"0", "1"}:
+        where_parts.append("cs.status = :status")
+        params["status"] = _parse_int(status)
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) FROM contract_symbols cs {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    cs.id,
+                    cs.symbol,
+                    cs.display_name,
+                    cs.category,
+                    cs.provider,
+                    cs.provider_symbol,
+                    cs.quote_asset,
+                    cs.tp_sl_trigger_price_type,
+                    cs.price_precision,
+                    cs.quantity_precision,
+                    cs.min_quantity,
+                    cs.max_quantity,
+                    cs.min_margin,
+                    cs.max_leverage,
+                    cs.spread_x,
+                    cs.liquidation_threshold,
+                    cs.warning_threshold,
+                    cs.status,
+                    cs.created_at,
+                    cs.updated_at
+                FROM contract_symbols cs
+                {where_sql}
+                ORDER BY cs.category ASC, cs.provider ASC, cs.symbol ASC, cs.id ASC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        logger.exception("admin_query_contract_symbols failed")
+        return _admin_read_error_page("admin_query_contract_symbols", filters)
+
+    return _empty_page(
+        items=[_admin_contract_symbol_row(dict(row)) for row in rows],
+        filters={
+            "symbol": symbol,
+            "category": category,
+            "provider": provider,
+            "status": status,
+            "page": page,
+            "page_size": page_size,
+        },
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+def admin_get_pair_detail(db: Session, pair_id: int) -> Dict[str, Any]:
+    row = db.execute(
+        text(
+            """
+            SELECT
+                tp.*,
+                base.symbol AS base_asset_symbol,
+                quote.symbol AS quote_asset_symbol
+            FROM trading_pairs tp
+            LEFT JOIN assets base ON base.id = tp.base_asset_id
+            LEFT JOIN assets quote ON quote.id = tp.quote_asset_id
+            WHERE tp.id = :pair_id
+            LIMIT 1
+            """
+        ),
+        {"pair_id": int(pair_id)},
+    ).mappings().first()
+    return _admin_pair_row(dict(row)) if row else {}
+
+
+def admin_query_pairs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    symbol = _normalize_code(filters.get("symbol"))
+    market_mode = str(filters.get("market_mode") or "").strip().upper()
+    data_source = str(filters.get("data_source") or "").strip().upper()
+    status = str(filters.get("status") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if symbol:
+        where_parts.append("tp.symbol LIKE :symbol")
+        params["symbol"] = f"%{symbol}%"
+    if market_mode:
+        where_parts.append("tp.market_mode = :market_mode")
+        params["market_mode"] = market_mode
+    if data_source:
+        where_parts.append("tp.data_source = :data_source")
+        params["data_source"] = data_source
+    if status in {"0", "1"}:
+        where_parts.append("tp.status = :status")
+        params["status"] = _parse_int(status)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM trading_pairs tp
+        LEFT JOIN assets base ON base.id = tp.base_asset_id
+        LEFT JOIN assets quote ON quote.id = tp.quote_asset_id
+    """
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    tp.*,
+                    base.symbol AS base_asset_symbol,
+                    quote.symbol AS quote_asset_symbol
+                {from_sql}
+                {where_sql}
+                ORDER BY tp.sort_order ASC, tp.id ASC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        return _empty_page(
+            filters={"symbol": symbol, "market_mode": market_mode, "data_source": data_source, "status": status},
+            page=page,
+            page_size=page_size,
+            total=0,
+        )
+    items = [_admin_pair_row(dict(row)) for row in rows]
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "symbol": symbol,
+            "market_mode": market_mode,
+            "data_source": data_source,
+            "status": status,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+REFERENCE_OVERLAY_TYPE_LABELS = {
+    "IRON": "铁粉",
+    "GOLD": "黄金",
+    "STOCK": "股票",
+}
+
+REFERENCE_OVERLAY_PRICE_SOURCE_LABELS = {
+    "MANUAL": "手动",
+    "AUTO": "自动",
+}
+
+REFERENCE_OVERLAY_SYNC_STATUS_LABELS = {
+    "PENDING": "PENDING",
+    "SUCCESS": "SUCCESS",
+    "FAILED": "FAILED",
+}
+
+REFERENCE_OVERLAY_MARKET_STATUS_LABELS = {
+    "OPEN": "实时",
+    "CLOSED": "已闭市",
+    "HOLIDAY": "休市",
+    "UNKNOWN": "未知",
+}
+
+
+REFERENCE_OVERLAY_TYPE_LABELS.update({
+    "IRON": "铁粉",
+    "GOLD": "黄金",
+    "STOCK": "股票",
+})
+REFERENCE_OVERLAY_PRICE_SOURCE_LABELS.update({
+    "MANUAL": "手动",
+    "AUTO": "自动",
+})
+REFERENCE_OVERLAY_SYNC_STATUS_LABELS.update({
+    "PENDING": "待同步",
+    "SUCCESS": "成功",
+    "FAILED": "失败",
+})
+REFERENCE_OVERLAY_MARKET_STATUS_LABELS.update({
+    "OPEN": "开盘",
+    "CLOSED": "休市",
+    "HOLIDAY": "假期",
+    "UNKNOWN": "未知",
+})
+
+
+REFERENCE_OVERLAY_TYPE_LABELS.update({
+    "IRON": "铁粉",
+    "GOLD": "黄金",
+    "STOCK": "股票",
+})
+REFERENCE_OVERLAY_PRICE_SOURCE_LABELS.update({
+    "MANUAL": "手动",
+    "AUTO": "自动",
+})
+REFERENCE_OVERLAY_SYNC_STATUS_LABELS.update({
+    "PENDING": "待同步",
+    "SUCCESS": "成功",
+    "FAILED": "失败",
+})
+REFERENCE_OVERLAY_MARKET_STATUS_LABELS.update({
+    "OPEN": "交易中",
+    "CLOSED": "已收盘",
+    "HOLIDAY": "休市",
+    "UNKNOWN": "未知",
+})
+
+
+def _admin_reference_overlay_type_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    return REFERENCE_OVERLAY_TYPE_LABELS.get(normalized, normalized or "-")
+
+
+def _admin_reference_overlay_price_source_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    return REFERENCE_OVERLAY_PRICE_SOURCE_LABELS.get(normalized, normalized or "-")
+
+
+def _admin_reference_overlay_sync_status_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    return REFERENCE_OVERLAY_SYNC_STATUS_LABELS.get(normalized, normalized or "--")
+
+
+def _admin_reference_overlay_market_status_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    return REFERENCE_OVERLAY_MARKET_STATUS_LABELS.get(normalized, normalized or "--")
+
+
+def _admin_reference_overlay_sync_status_badge(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized == "SUCCESS":
+        return "success"
+    if normalized == "FAILED":
+        return "danger"
+    if normalized == "PENDING":
+        return "warning"
+    return "secondary"
+
+
+def _admin_reference_overlay_market_status_badge(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized == "OPEN":
+        return "success"
+    if normalized == "HOLIDAY":
+        return "warning"
+    return "secondary"
+
+
+def _admin_reference_overlay_bool_state(value: Any) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, Decimal)):
+        return bool(int(value))
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on", "实时"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off", "延迟"}:
+        return False
+    return None
+
+
+def _admin_reference_overlay_realtime_label(value: Optional[bool]) -> str:
+    if value is True:
+        return "实时"
+    if value is False:
+        return "延迟"
+    return "--"
+
+
+def _admin_reference_overlay_realtime_badge(value: Optional[bool]) -> str:
+    if value is True:
+        return "success"
+    return "secondary"
+
+
+def _admin_reference_overlay_badge_class(value: str) -> str:
+    suffix = str(value or "secondary").strip()
+    return f"admin-badge-{suffix or 'secondary'}"
+
+
+def _admin_short_text(value: Any, limit: int = 28, suffix: Optional[int] = None) -> str:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return "-"
+    if suffix is not None:
+        prefix = max(0, int(limit or 0))
+        suffix_value = max(0, int(suffix or 0))
+        if len(text_value) > prefix + suffix_value + 3:
+            return f"{text_value[:prefix]}...{text_value[-suffix_value:]}"
+        return text_value
+    limit_value = max(0, int(limit or 0))
+    if len(text_value) <= limit_value:
+        return text_value
+    return f"{text_value[:limit_value]}..."
+
+
+def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    enabled = _parse_int(row.get("enabled"), 0)
+    reference_type = str(row.get("reference_type") or row.get("kind") or "STOCK").strip().upper()
+    price_source = str(row.get("price_source") or "MANUAL").strip().upper()
+    sync_status = str(row.get("sync_status") or "").strip().upper()
+    market_status = str(row.get("market_status") or "").strip().upper()
+    is_realtime_state = _admin_reference_overlay_bool_state(row.get("is_realtime"))
+    if price_source == "MANUAL" and market_status == "UNKNOWN" and not row.get("price_time"):
+        market_status = ""
+        is_realtime_state = None
+    return {
+        "id": row.get("id"),
+        "symbol": row.get("symbol") or "",
+        "enabled": enabled,
+        "enabled_label": "启用" if enabled == 1 else "禁用",
+        "enabled_badge": "success" if enabled == 1 else "secondary",
+        "reference_type": reference_type,
+        "reference_type_label": _admin_reference_overlay_type_label(reference_type),
+        "reference_type_badge": "warning" if reference_type == "IRON" else "success" if reference_type == "GOLD" else "secondary",
+        "price_source": price_source,
+        "price_source_label": _admin_reference_overlay_price_source_label(price_source),
+        "price_source_badge": "success" if price_source == "AUTO" else "secondary",
+        "auto_source": row.get("auto_source") or "",
+        "refresh_interval_sec": _parse_int(row.get("refresh_interval_sec"), 300),
+        "last_ref_price": "" if row.get("last_ref_price") is None else _admin_amount_display(row.get("last_ref_price")),
+        "last_ref_label": row.get("last_ref_label") or "",
+        "last_sync_at": _admin_datetime_display(row.get("last_sync_at")),
+        "sync_status": sync_status,
+        "sync_status_label": _admin_reference_overlay_sync_status_label(sync_status),
+        "sync_status_text": _admin_reference_overlay_sync_status_label(sync_status),
+        "sync_status_badge": _admin_reference_overlay_sync_status_badge(sync_status),
+        "sync_status_badge_class": _admin_reference_overlay_badge_class(_admin_reference_overlay_sync_status_badge(sync_status)),
+        "sync_error": row.get("sync_error") or "",
+        "sync_error_short": _admin_short_text(row.get("sync_error")),
+        "market_status": market_status,
+        "market_status_label": _admin_reference_overlay_market_status_label(market_status),
+        "market_status_text": _admin_reference_overlay_market_status_label(market_status),
+        "market_status_detail": row.get("market_status_text") or "",
+        "market_status_badge": _admin_reference_overlay_market_status_badge(market_status),
+        "market_status_badge_class": _admin_reference_overlay_badge_class(_admin_reference_overlay_market_status_badge(market_status)),
+        "price_time": _admin_datetime_display(row.get("price_time")),
+        "is_realtime": is_realtime_state,
+        "is_realtime_display": _admin_reference_overlay_realtime_label(is_realtime_state),
+        "is_realtime_label": _admin_reference_overlay_realtime_label(is_realtime_state),
+        "is_realtime_badge": _admin_reference_overlay_realtime_badge(is_realtime_state),
+        "realtime_label": _admin_reference_overlay_realtime_label(is_realtime_state),
+        "realtime_text": _admin_reference_overlay_realtime_label(is_realtime_state),
+        "realtime_badge_class": _admin_reference_overlay_badge_class(_admin_reference_overlay_realtime_badge(is_realtime_state)),
+        "kind": row.get("kind") or "",
+        "title": row.get("title") or "",
+        "source_label": row.get("source_label") or "",
+        "description": row.get("description") or "",
+        "line_title": row.get("line_title") or "",
+        "line_color": row.get("line_color") or "",
+        "badge_color": row.get("badge_color") or "",
+        "display_value_label": row.get("display_value_label") or "",
+        "display_price": "" if row.get("display_price") is None else _admin_amount_display(row.get("display_price")),
+        "display_unit": row.get("display_unit") or "",
+        "data_source": row.get("data_source") or "",
+        "source_symbol": row.get("source_symbol") or "",
+        "source_region": row.get("source_region") or "",
+        "conversion_type": row.get("conversion_type") or "",
+        "conversion_factor": "" if row.get("conversion_factor") is None else _admin_amount_display(row.get("conversion_factor")),
+        "sort_order": _parse_int(row.get("sort_order"), 0),
+        "created_at": _admin_datetime_display(row.get("created_at")),
+        "updated_at": _admin_datetime_display(row.get("updated_at")),
+    }
+
+
+def admin_reference_overlay_form_from_payload(payload: Dict[str, Any], existing_symbol: str = "") -> Dict[str, Any]:
+    return {
+        "symbol": _normalize_code(payload.get("symbol") or existing_symbol),
+        "enabled": str(payload.get("enabled") if payload.get("enabled") not in (None, "") else "1"),
+        "reference_type": str(payload.get("reference_type") or payload.get("kind") or "STOCK").strip().upper(),
+        "price_source": str(payload.get("price_source") or "MANUAL").strip().upper(),
+        "auto_source": str(payload.get("auto_source") or "").strip().upper(),
+        "refresh_interval_sec": str(payload.get("refresh_interval_sec") or "300").strip(),
+        "sync_status": str(payload.get("sync_status") or "PENDING").strip().upper(),
+        "sync_error": str(payload.get("sync_error") or "").strip(),
+        "kind": str(payload.get("kind") or payload.get("reference_type") or "STOCK").strip().upper(),
+        "title": str(payload.get("title") or "").strip(),
+        "source_label": str(payload.get("source_label") or payload.get("subtitle") or "").strip(),
+        "description": str(payload.get("description") or "").strip(),
+        "line_title": str(payload.get("line_title") or payload.get("title") or "").strip(),
+        "line_color": str(payload.get("line_color") or "#f0b90b").strip(),
+        "badge_color": str(payload.get("badge_color") or payload.get("line_color") or "#f0b90b").strip(),
+        "display_value_label": str(payload.get("display_value_label") or "").strip(),
+        "display_price": str(payload.get("display_price") or "").strip(),
+        "display_unit": str(payload.get("display_unit") or "USDT").strip().upper(),
+        "data_source": str(payload.get("data_source") or "MANUAL").strip().upper(),
+        "source_symbol": str(payload.get("source_symbol") or "").strip().upper(),
+        "source_region": str(payload.get("source_region") or "").strip().upper(),
+        "conversion_type": str(payload.get("conversion_type") or "").strip().upper(),
+        "conversion_factor": str(payload.get("conversion_factor") or "").strip(),
+        "sort_order": str(payload.get("sort_order") or "0").strip(),
+    }
+
+
+def _validate_reference_overlay_form(form: Dict[str, Any], *, is_create: bool) -> tuple[Dict[str, Any], list[str]]:
+    errors: list[str] = []
+    if is_create and not form["symbol"]:
+        errors.append("交易对不能为空")
+    if not form["kind"]:
+        errors.append("类型不能为空")
+    if not form["title"]:
+        errors.append("标题不能为空")
+    if form.get("reference_type") not in REFERENCE_OVERLAY_TYPE_LABELS:
+        errors.append("参考类型不正确")
+    if form.get("price_source") not in REFERENCE_OVERLAY_PRICE_SOURCE_LABELS:
+        errors.append("价格来源不正确")
+    if form.get("sync_status") not in REFERENCE_OVERLAY_SYNC_STATUS_LABELS:
+        errors.append("同步状态不正确")
+
+    if form.get("reference_type") == "STOCK" and not form.get("source_symbol"):
+        errors.append("股票参考价必须配置来源股票代码")
+
+    enabled = _parse_bool01(form.get("enabled"))
+    sort_order = _parse_int(form.get("sort_order"), 0)
+    refresh_interval_sec = _parse_int(form.get("refresh_interval_sec"), 300)
+    display_price = None if not form.get("display_price") else _parse_decimal(form.get("display_price"))
+    conversion_factor = None if not form.get("conversion_factor") else _parse_decimal(form.get("conversion_factor"))
+    if refresh_interval_sec < 15 or refresh_interval_sec > 86400:
+        errors.append("刷新周期必须在 15 到 86400 秒之间")
+    if display_price is None or display_price <= 0:
+        errors.append("展示价格必须为正数")
+    if form.get("conversion_factor") and conversion_factor is not None and conversion_factor < 0:
+        errors.append("换算系数不能小于 0")
+
+    values = {
+        **form,
+        "enabled": enabled,
+        "reference_type": form.get("reference_type") if form.get("reference_type") in REFERENCE_OVERLAY_TYPE_LABELS else "STOCK",
+        "price_source": form.get("price_source") if form.get("price_source") in REFERENCE_OVERLAY_PRICE_SOURCE_LABELS else "MANUAL",
+        "auto_source": _clean_optional_text(form.get("auto_source")),
+        "refresh_interval_sec": refresh_interval_sec,
+        "sync_status": form.get("sync_status") if form.get("sync_status") in REFERENCE_OVERLAY_SYNC_STATUS_LABELS else "PENDING",
+        "sync_error": _clean_optional_text(form.get("sync_error")),
+        "display_price": display_price,
+        "conversion_factor": conversion_factor,
+        "sort_order": sort_order,
+        "source_label": _clean_optional_text(form.get("source_label")),
+        "description": _clean_optional_text(form.get("description")),
+        "line_title": _clean_optional_text(form.get("line_title")) or form["title"],
+        "line_color": _clean_optional_text(form.get("line_color")) or "#f0b90b",
+        "badge_color": _clean_optional_text(form.get("badge_color")) or _clean_optional_text(form.get("line_color")) or "#f0b90b",
+        "display_value_label": _clean_optional_text(form.get("display_value_label")),
+        "display_unit": _clean_optional_text(form.get("display_unit")),
+        "data_source": _clean_optional_text(form.get("data_source")),
+        "source_symbol": _clean_optional_text(form.get("source_symbol")),
+        "source_region": _clean_optional_text(form.get("source_region")),
+        "conversion_type": _clean_optional_text(form.get("conversion_type")),
+    }
+    return values, errors
+
+
+def admin_query_reference_overlays(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    symbol = _normalize_code(filters.get("symbol"))
+    kind = str(filters.get("kind") or "").strip().upper()
+    enabled = str(filters.get("enabled") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if symbol:
+        where_parts.append("symbol LIKE :symbol")
+        params["symbol"] = f"%{symbol}%"
+    if kind:
+        where_parts.append("kind = :kind")
+        params["kind"] = kind
+    if enabled in {"0", "1"}:
+        where_parts.append("enabled = :enabled")
+        params["enabled"] = _parse_int(enabled)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) FROM reference_overlays {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT *
+                FROM reference_overlays
+                {where_sql}
+                ORDER BY sort_order ASC, symbol ASC, id ASC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        logger.exception("admin_query_reference_overlays failed")
+        return _empty_page(filters=filters, page=page, page_size=page_size, total=0)
+
+    return _empty_page(
+        items=[_admin_reference_overlay_row(dict(row)) for row in rows],
+        filters={"symbol": symbol, "kind": kind, "enabled": enabled, "page": page, "page_size": page_size},
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+def admin_get_reference_overlay(db: Session, overlay_id: int) -> Dict[str, Any]:
+    row = db.execute(
+        text("SELECT * FROM reference_overlays WHERE id = :overlay_id LIMIT 1"),
+        {"overlay_id": int(overlay_id)},
+    ).mappings().first()
+    if not row:
+        return {}
+    item = _admin_reference_overlay_row(dict(row))
+    item["enabled"] = str(item["enabled"])
+    return item
+
+
+def admin_create_reference_overlay(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    form = admin_reference_overlay_form_from_payload(payload)
+    values, errors = _validate_reference_overlay_form(form, is_create=True)
+    if errors:
+        return {"ok": False, "errors": errors, "form": form}
+
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO reference_overlays (
+                    symbol, enabled, reference_type, kind, title, source_label, description,
+                    line_title, line_color, badge_color, display_value_label,
+                    display_price, display_unit, data_source, source_symbol,
+                    price_source, auto_source, refresh_interval_sec, sync_status, sync_error,
+                    source_region, conversion_type, conversion_factor, sort_order,
+                    created_at, updated_at
+                ) VALUES (
+                    :symbol, :enabled, :reference_type, :kind, :title, :source_label, :description,
+                    :line_title, :line_color, :badge_color, :display_value_label,
+                    :display_price, :display_unit, :data_source, :source_symbol,
+                    :price_source, :auto_source, :refresh_interval_sec, :sync_status, :sync_error,
+                    :source_region, :conversion_type, :conversion_factor, :sort_order,
+                    UTC_TIMESTAMP(), UTC_TIMESTAMP()
+                )
+                """
+            ),
+            values,
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["该交易对的RWA参考价已存在"], "form": form}
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_create_reference_overlay failed")
+        return {"ok": False, "errors": ["RWA参考价创建失败"], "form": form}
+    return {"ok": True, "errors": [], "form": form}
+
+
+def admin_update_reference_overlay(db: Session, overlay_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    current = admin_get_reference_overlay(db, overlay_id)
+    if not current:
+        return {"ok": False, "not_found": True, "errors": ["RWA参考价不存在"], "form": {}}
+
+    form = admin_reference_overlay_form_from_payload({**current, **payload}, existing_symbol=current.get("symbol") or "")
+    values, errors = _validate_reference_overlay_form(form, is_create=False)
+    values["overlay_id"] = int(overlay_id)
+    if errors:
+        return {"ok": False, "errors": errors, "form": form}
+
+    try:
+        result = db.execute(
+            text(
+                """
+                UPDATE reference_overlays
+                SET enabled = :enabled,
+                    reference_type = :reference_type,
+                    kind = :kind,
+                    title = :title,
+                    source_label = :source_label,
+                    description = :description,
+                    line_title = :line_title,
+                    line_color = :line_color,
+                    badge_color = :badge_color,
+                    display_value_label = :display_value_label,
+                    display_price = :display_price,
+                    display_unit = :display_unit,
+                    data_source = :data_source,
+                    price_source = :price_source,
+                    auto_source = :auto_source,
+                    refresh_interval_sec = :refresh_interval_sec,
+                    sync_status = :sync_status,
+                    sync_error = :sync_error,
+                    source_symbol = :source_symbol,
+                    source_region = :source_region,
+                    conversion_type = :conversion_type,
+                    conversion_factor = :conversion_factor,
+                    sort_order = :sort_order,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :overlay_id
+                """
+            ),
+            values,
+        )
+        if result.rowcount == 0:
+            db.rollback()
+            return {"ok": False, "not_found": True, "errors": ["RWA参考价不存在"], "form": form}
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_update_reference_overlay failed")
+        return {"ok": False, "errors": ["RWA参考价更新失败"], "form": form}
+    return {"ok": True, "errors": [], "form": form}
+
+
+def admin_toggle_reference_overlay_enabled(db: Session, overlay_id: int) -> Dict[str, Any]:
+    current = admin_get_reference_overlay(db, overlay_id)
+    if not current:
+        return {"ok": False, "message": "RWA参考价不存在"}
+    next_enabled = 0 if _parse_int(current.get("enabled"), 0) == 1 else 1
+    try:
+        db.execute(
+            text("UPDATE reference_overlays SET enabled = :enabled, updated_at = UTC_TIMESTAMP() WHERE id = :overlay_id"),
+            {"enabled": next_enabled, "overlay_id": int(overlay_id)},
+        )
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_toggle_reference_overlay_enabled failed")
+        return {"ok": False, "message": "RWA参考价状态更新失败"}
+    return {"ok": True, "message": "RWA参考价已启用" if next_enabled == 1 else "RWA参考价已禁用"}
+
+
+def admin_query_platform_balances(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    platform_user_id = _parse_int(filters.get("platform_user_id"), PLATFORM_ACCOUNT_USER_ID)
+    coin_symbol = _normalize_code(filters.get("coin_symbol"))
+    chain_key = _normalize_chain_key(filters.get("chain_key"))
+    has_balance = str(filters.get("has_balance") or "").strip()
+    has_frozen = str(filters.get("has_frozen") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = ["ub.user_id = :platform_user_id"]
+    params: Dict[str, Any] = {"platform_user_id": platform_user_id}
+    if coin_symbol:
+        where_parts.append("ub.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if chain_key:
+        where_parts.append("ub.chain_key = :chain_key")
+        params["chain_key"] = chain_key
+    if has_balance == "1":
+        where_parts.append("(ub.available_amount <> 0 OR ub.frozen_amount <> 0)")
+    if has_frozen == "1":
+        where_parts.append("ub.frozen_amount <> 0")
+    where_sql = f"WHERE {' AND '.join(where_parts)}"
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) FROM user_balances ub {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    ub.id,
+                    ub.user_id,
+                    ub.coin_symbol,
+                    ub.chain_key,
+                    ub.available_amount,
+                    ub.frozen_amount,
+                    (ub.available_amount + ub.frozen_amount) AS total_amount,
+                    ub.updated_at
+                FROM user_balances ub
+                {where_sql}
+                ORDER BY ub.coin_symbol ASC, ub.chain_key ASC, ub.id ASC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        return _empty_page(filters=filters, platform_user_id=platform_user_id, page=page, page_size=page_size, total=0)
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        coin_symbol_display = row_dict.get("coin_symbol") or ""
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "user_id": row_dict.get("user_id"),
+                "coin_symbol": coin_symbol_display,
+                "chain_key": row_dict.get("chain_key") or "",
+                "available_amount": _fmt_admin_amount_display(row_dict.get("available_amount"), coin_symbol_display),
+                "available_amount_raw": _admin_amount_display(row_dict.get("available_amount")),
+                "frozen_amount": _fmt_admin_amount_display(row_dict.get("frozen_amount"), coin_symbol_display),
+                "total_amount": _fmt_admin_amount_display(row_dict.get("total_amount"), coin_symbol_display),
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+            }
+        )
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "platform_user_id": platform_user_id,
+            "coin_symbol": coin_symbol,
+            "chain_key": chain_key,
+            "has_balance": has_balance,
+            "has_frozen": has_frozen,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "platform_user_id": platform_user_id,
+    }
+
+
+def admin_query_platform_adjust_logs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    coin_symbol = _normalize_code(filters.get("coin_symbol"))
+    chain_key = _normalize_chain_key(filters.get("chain_key"))
+    admin_user = str(filters.get("admin_user") or "").strip()
+    date_from = _admin_query_date_value(filters.get("date_from"))
+    date_to = _admin_query_date_value(filters.get("date_to"))
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if coin_symbol:
+        where_parts.append("coin_symbol = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if chain_key:
+        where_parts.append("chain_key = :chain_key")
+        params["chain_key"] = chain_key
+    if admin_user:
+        where_parts.append("admin_user LIKE :admin_user")
+        params["admin_user"] = f"%{admin_user}%"
+    if date_from:
+        where_parts.append("DATE(created_at) >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        where_parts.append("DATE(created_at) <= :date_to")
+        params["date_to"] = date_to
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) FROM admin_balance_adjust_logs {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT *
+                FROM admin_balance_adjust_logs
+                {where_sql}
+                ORDER BY created_at DESC, id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        return _empty_page(filters=filters, page=page, page_size=page_size, total=0)
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        direction = str(row_dict.get("direction") or "").upper()
+        coin_symbol_display = row_dict.get("coin_symbol") or ""
+        status_value = row_dict.get("status") or "SUCCESS"
+        status_label, status_badge = _admin_adjust_status_meta(status_value)
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "admin_ip": row_dict.get("admin_ip") or "",
+                "request_id": row_dict.get("request_id") or "",
+                "admin_user": row_dict.get("admin_user") or "",
+                "target_user_id": row_dict.get("target_user_id"),
+                "coin_symbol": coin_symbol_display,
+                "chain_key": row_dict.get("chain_key") or "",
+                "direction": direction,
+                "direction_label": "增加" if direction == "INCREASE" else "减少",
+                "direction_badge": "success" if direction == "INCREASE" else "danger",
+                "status": status_value,
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "amount": _fmt_admin_amount_display(row_dict.get("amount"), coin_symbol_display),
+                "before_available": _fmt_admin_amount_display(row_dict.get("before_available"), coin_symbol_display),
+                "after_available": _fmt_admin_amount_display(row_dict.get("after_available"), coin_symbol_display),
+                "reason": row_dict.get("reason") or "",
+                "remark": row_dict.get("remark") or "--",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "coin_symbol": coin_symbol,
+            "chain_key": chain_key,
+            "admin_user": admin_user,
+            "date_from": date_from,
+            "date_to": date_to,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def _admin_dealer_limit_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    enabled = int(row.get("enabled") or 0)
+    status = str(row.get("status") or "ACTIVE").upper()
+    active_enabled = enabled == 1 and status == "ACTIVE"
+    return {
+        "id": row.get("id"),
+        "symbol": row.get("symbol") or "",
+        "enabled": enabled,
+        "enabled_label": "启用" if enabled == 1 else "禁用",
+        "enabled_badge": "success" if enabled == 1 else "secondary",
+        "status": status,
+        "status_label": "启用" if active_enabled else "禁用",
+        "status_badge": "success" if active_enabled else "secondary",
+        "max_single_notional": _admin_usdt_display(row.get("max_single_notional")),
+        "max_net_base_position": _admin_trade_quantity_display(row.get("max_net_base_position")),
+        "max_net_quote_exposure": _admin_usdt_display(row.get("max_net_quote_exposure")),
+        "remark": row.get("remark") or "-",
+        "updated_at": _admin_datetime_display(row.get("updated_at")),
+    }
+
+
+def admin_get_dealer_risk_limit(db: Session, risk_id: int) -> Dict[str, Any]:
+    row = db.execute(
+        text("SELECT * FROM dealer_risk_limits WHERE id = :risk_id LIMIT 1"),
+        {"risk_id": int(risk_id)},
+    ).mappings().first()
+    if not row:
+        return {}
+    item = _admin_dealer_limit_row(dict(row))
+    return {**item, "enabled": str(item["enabled"])}
+
+
+def admin_query_dealer_risk_limits(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    symbol = _normalize_code(filters.get("symbol"))
+    status = str(filters.get("status") or "").strip().upper()
+    enabled = str(filters.get("enabled") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if symbol:
+        where_parts.append("symbol LIKE :symbol")
+        params["symbol"] = f"%{symbol}%"
+    if status:
+        where_parts.append("status = :status")
+        params["status"] = status
+    if enabled in {"0", "1"}:
+        where_parts.append("enabled = :enabled")
+        params["enabled"] = _parse_int(enabled)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) FROM dealer_risk_limits {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT *
+                FROM dealer_risk_limits
+                {where_sql}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        return _empty_page(filters=filters, page=page, page_size=page_size, total=0)
+    items = [_admin_dealer_limit_row(dict(row)) for row in rows]
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {"symbol": symbol, "status": status, "enabled": enabled, "page": page, "page_size": page_size},
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_dealer_risk_hit_logs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    symbol = _normalize_code(filters.get("symbol"))
+    risk_type = str(filters.get("risk_type") or "").strip().upper()
+    date_from = _admin_query_date_value(filters.get("date_from"))
+    date_to = _admin_query_date_value(filters.get("date_to"))
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if symbol:
+        where_parts.append("symbol LIKE :symbol")
+        params["symbol"] = f"%{symbol}%"
+    if risk_type:
+        where_parts.append("risk_type = :risk_type")
+        params["risk_type"] = risk_type
+    if date_from:
+        where_parts.append("DATE(created_at) >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        where_parts.append("DATE(created_at) <= :date_to")
+        params["date_to"] = date_to
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) FROM dealer_risk_hit_logs {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT *
+                FROM dealer_risk_hit_logs
+                {where_sql}
+                ORDER BY created_at DESC, id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except SQLAlchemyError:
+        return _empty_page(filters=filters, page=page, page_size=page_size, total=0)
+    risk_labels = {
+        "MAX_SINGLE_NOTIONAL": "单笔成交额超限",
+        "MAX_NET_BASE_POSITION": "Base 净敞口超限",
+        "MAX_NET_QUOTE_EXPOSURE": "Quote 净敞口超限",
+        "DEALER_DISABLED": "Dealer 已禁用",
+        "DEALER_PAUSED": "Dealer 已暂停",
+        "HIT": "已触发",
+        "TRIGGERED": "已触发",
+    }
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        risk_value = str(row_dict.get("risk_type") or "").upper()
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "symbol": row_dict.get("symbol") or "",
+                "order_id": row_dict.get("order_id") or "--",
+                "user_id": row_dict.get("user_id") or "--",
+                "risk_type": risk_value,
+                "risk_type_label": risk_labels.get(risk_value, risk_value),
+                "risk_type_badge": "danger",
+                "risk_value": _admin_trade_price_display(row_dict.get("risk_value")),
+                "limit_value": _admin_trade_price_display(row_dict.get("limit_value")),
+                "message": row_dict.get("message") or "-",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {"symbol": symbol, "risk_type": risk_type, "date_from": date_from, "date_to": date_to, "page": page, "page_size": page_size},
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def _admin_dividend_status_meta(status: Any) -> tuple[str, str]:
+    value = str(status or "").strip().upper()
+    labels = {
+        "PENDING": "待处理",
+        "CALCULATED": "已计算",
+        "PAID": "已发放",
+        "FAILED": "失败",
+        "SKIPPED": "已跳过",
+    }
+    badges = {
+        "PENDING": "warning",
+        "CALCULATED": "info",
+        "PAID": "success",
+        "FAILED": "danger",
+        "SKIPPED": "secondary",
+    }
+    return labels.get(value, value or "-"), badges.get(value, "secondary")
+
+
+def _admin_dividend_pool_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(row.get("status") or "").strip().upper()
+    source = str(row.get("source") or "").strip().upper() or "UNKNOWN"
+    status_label, status_badge = _admin_dividend_status_meta(status)
+    dividend_date_value = _admin_query_date_value(row.get("dividend_date"))
+    is_premature = bool(dividend_date_value and dividend_date_value >= datetime.utcnow().date())
+    return {
+        "id": row.get("id"),
+        "dividend_date": str(row.get("dividend_date") or ""),
+        "total_fee_usdt": _fmt_admin_amount_display(row.get("total_fee_usdt"), "USDT"),
+        "rcb_price_used": _fmt_admin_amount_display(row.get("rcb_price_used"), "USDT"),
+        "total_dividend_rcb": _fmt_admin_amount_display(row.get("total_dividend_rcb"), "RCB"),
+        "user_count": int(row.get("user_count") or 0),
+        "status": status,
+        "status_label": status_label,
+        "status_badge": status_badge,
+        "source": source,
+        "source_label": _admin_system_type_label(source),
+        "created_at": _admin_datetime_display(row.get("created_at")),
+        "run_at": _admin_dividend_run_at_display(row.get("run_at")),
+        "failure_reason": row.get("failure_reason") or "-",
+        "is_premature": is_premature,
+        "premature_warning": DIVIDEND_PREMATURE_POOL_MESSAGE if is_premature else "",
+        "can_calculate": status == "PENDING" and not is_premature,
+        "can_distribute": status == "CALCULATED" and not is_premature,
+    }
+
+
+def admin_query_dividend_pools(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    dividend_date = filters.get("dividend_date")
+    status = str(filters.get("status") or "").strip().upper()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if dividend_date:
+        where_parts.append("dp.dividend_date = :dividend_date")
+        params["dividend_date"] = dividend_date
+    if status:
+        where_parts.append("dp.status = :status")
+        params["status"] = status
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM dividend_pools dp
+        LEFT JOIN (
+            SELECT pool_id, COUNT(*) AS user_count
+            FROM user_dividend_records
+            GROUP BY pool_id
+        ) udr ON udr.pool_id = dp.id
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT dp.*, COALESCE(udr.user_count, 0) AS user_count
+            {from_sql}
+            {where_sql}
+            ORDER BY dp.dividend_date DESC, dp.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    items = [_admin_dividend_pool_item(dict(row)) for row in rows]
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {"dividend_date": dividend_date, "status": status, "page": page, "page_size": page_size},
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_query_dividend_job_logs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    pool_id = str(filters.get("pool_id") or "").strip()
+    dividend_date = filters.get("dividend_date")
+    status = str(filters.get("status") or "").strip().upper()
+    trigger_type = str(filters.get("trigger_type") or "").strip().upper()
+    start_date = filters.get("start_date")
+    end_date = filters.get("end_date")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if pool_id:
+        where_parts.append("djl.pool_id = :pool_id")
+        params["pool_id"] = _parse_int(pool_id)
+    if dividend_date:
+        where_parts.append("djl.dividend_date = :dividend_date")
+        params["dividend_date"] = dividend_date
+    if status:
+        where_parts.append("djl.status = :status")
+        params["status"] = status
+    if trigger_type:
+        where_parts.append("djl.trigger_type = :trigger_type")
+        params["trigger_type"] = trigger_type
+    if start_date:
+        where_parts.append("DATE(djl.created_at) >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        where_parts.append("DATE(djl.created_at) <= :end_date")
+        params["end_date"] = end_date
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    total = int(db.execute(text(f"SELECT COUNT(*) FROM dividend_job_logs djl {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT *
+            FROM dividend_job_logs djl
+            {where_sql}
+            ORDER BY djl.created_at DESC, djl.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_label, status_badge = _admin_system_status_meta(row_dict.get("status"))
+        trigger_type = row_dict.get("trigger_type") or ""
+        step = row_dict.get("step") or ""
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "dividend_date": str(row_dict.get("dividend_date") or ""),
+                "run_time": _admin_datetime_display(row_dict.get("run_time")),
+                "trigger_type": trigger_type,
+                "trigger_type_label": _admin_system_type_label(trigger_type),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "step": step,
+                "step_label": _admin_system_type_label(step or "DIVIDEND"),
+                "pool_id": row_dict.get("pool_id"),
+                "message": row_dict.get("message") or "-",
+                "error_message": row_dict.get("error_message") or "",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "pool_id": pool_id,
+            "dividend_date": dividend_date,
+            "status": status,
+            "trigger_type": trigger_type,
+            "start_date": start_date,
+            "end_date": end_date,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
+def admin_get_dividend_pool_detail(db: Session, pool_id: int) -> Optional[Dict[str, Any]]:
+    pool_row = db.execute(
+        text(
+            """
+            SELECT dp.*, COALESCE(user_counts.user_count, 0) AS user_count
+            FROM dividend_pools dp
+            LEFT JOIN (
+                SELECT pool_id, COUNT(*) AS user_count
+                FROM user_dividend_records
+                GROUP BY pool_id
+            ) user_counts ON user_counts.pool_id = dp.id
+            WHERE dp.id = :pool_id
+            LIMIT 1
+            """
+        ),
+        {"pool_id": int(pool_id)},
+    ).mappings().first()
+    if not pool_row:
+        return None
+    pool = _admin_dividend_pool_item(dict(pool_row))
+    item_rows = db.execute(
+        text(
+            """
+            SELECT *
+            FROM dividend_pool_items
+            WHERE pool_id = :pool_id
+            ORDER BY
+                CASE
+                    WHEN level_code = 'SVIP1' THEN 1
+                    WHEN level_code = 'SVIP2' THEN 2
+                    WHEN level_code = 'SVIP3' THEN 3
+                    WHEN level_code = 'SVIP4' THEN 4
+                    WHEN level_code = 'SVIP5' THEN 5
+                    WHEN level_code = 'SVIP6' THEN 6
+                    WHEN level_code = 'SVIP7' THEN 7
+                    WHEN level_code = 'SVIP8' THEN 8
+                    WHEN level_code = 'LP' THEN 9
+                    ELSE 99
+                END,
+                level_code ASC,
+                id ASC
+            """
+        ),
+        {"pool_id": int(pool_id)},
+    ).mappings().all()
+    items = []
+    for row in item_rows:
+        row_dict = dict(row)
+        allocated_rcb = _parse_decimal(row_dict.get("per_user_rcb")) * Decimal(str(row_dict.get("eligible_user_count") or 0))
+        items.append(
+            {
+                "level_code": row_dict.get("level_code") or "",
+                "eligible_user_count": int(row_dict.get("eligible_user_count") or 0),
+                "level_dividend_rate": _admin_percent_display(row_dict.get("level_dividend_rate")),
+                "allocated_rcb": _fmt_admin_amount_display(allocated_rcb, "RCB"),
+                "per_user_rcb": _fmt_admin_amount_display(row_dict.get("per_user_rcb"), "RCB"),
+            }
+        )
+    record_rows = db.execute(
+        text(
+            """
+            SELECT *
+            FROM user_dividend_records
+            WHERE pool_id = :pool_id
+            ORDER BY id ASC
+            """
+        ),
+        {"pool_id": int(pool_id)},
+    ).mappings().all()
+    records = []
+    for row in record_rows:
+        row_dict = dict(row)
+        status_label, status_badge = _admin_dividend_status_meta(row_dict.get("status"))
+        records.append(
+            {
+                "user_id": row_dict.get("user_id"),
+                "level_code": row_dict.get("level_code") or "",
+                "dividend_rcb": _fmt_admin_amount_display(row_dict.get("dividend_rcb"), "RCB"),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "paid_at": _admin_datetime_display(row_dict.get("paid_at")),
+            }
+        )
+    log_rows = db.execute(
+        text(
+            """
+            SELECT *
+            FROM dividend_job_logs
+            WHERE pool_id = :pool_id
+            ORDER BY created_at DESC, id DESC
+            """
+        ),
+        {"pool_id": int(pool_id)},
+    ).mappings().all()
+    logs = []
+    for row in log_rows:
+        row_dict = dict(row)
+        status_label, status_badge = _admin_dividend_status_meta(row_dict.get("status"))
+        logs.append(
+            {
+                "action": row_dict.get("step") or row_dict.get("trigger_type") or "",
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "message": row_dict.get("message") or row_dict.get("error_message") or "",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+    return {"pool": pool, "items": items, "records": records, "logs": logs}
+
+
+def admin_query_dividend_stats(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    start_date = filters.get("start_date")
+    end_date = filters.get("end_date")
+    status = str(filters.get("status") or "").strip().upper()
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if start_date:
+        where_parts.append("dividend_date >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        where_parts.append("dividend_date <= :end_date")
+        params["end_date"] = end_date
+    if status:
+        where_parts.append("status = :status")
+        params["status"] = status
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    summary_row = db.execute(
+        text(
+            f"""
+            SELECT
+                COALESCE(SUM(total_fee_usdt), 0) AS total_fee_usdt,
+                COALESCE(SUM(CASE WHEN status='PAID' THEN total_dividend_rcb ELSE 0 END), 0) AS paid_rcb,
+                COALESCE(SUM(CASE WHEN status IN ('PENDING', 'CALCULATED') THEN total_dividend_rcb ELSE 0 END), 0) AS pending_rcb,
+                COUNT(*) AS pool_count,
+                SUM(CASE WHEN status='PAID' THEN 1 ELSE 0 END) AS paid_pool_count,
+                SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_pool_count
+            FROM dividend_pools
+            {where_sql}
+            """
+        ),
+        params,
+    ).mappings().first() or {}
+    status_rows = db.execute(
+        text(f"SELECT status, COUNT(*) AS count FROM dividend_pools {where_sql} GROUP BY status ORDER BY count DESC"),
+        params,
+    ).mappings().all()
+    trend_rows = db.execute(
+        text(
+            f"""
+            SELECT *
+            FROM dividend_pools
+            {where_sql}
+            ORDER BY dividend_date DESC, id DESC
+            LIMIT 30
+            """
+        ),
+        params,
+    ).mappings().all()
+    current_level_rows = db.execute(
+        text(
+            """
+            SELECT
+                UPPER(TRIM(svip_level_code)) AS level_code,
+                COUNT(DISTINCT user_id) AS current_user_count
+            FROM user_vip_snapshots
+            WHERE COALESCE(TRIM(svip_level_code), '') NOT IN ('', 'NORMAL', 'SVIP0', 'NONE')
+            GROUP BY UPPER(TRIM(svip_level_code))
+            """
+        )
+    ).mappings().all()
+    paid_level_rows = db.execute(
+        text(
+            """
+            SELECT
+                UPPER(TRIM(level_code)) AS level_code,
+                COALESCE(SUM(CASE WHEN status = 'PAID' THEN dividend_rcb ELSE 0 END), 0) AS total_paid_rcb
+            FROM user_dividend_records
+            WHERE COALESCE(TRIM(level_code), '') <> ''
+            GROUP BY UPPER(TRIM(level_code))
+            """
+        )
+    ).mappings().all()
+    rules = admin_query_dividend_config_rules(db).get("svip_rules", [])
+    rule_by_code = {str(row.get("level_code") or "").strip().upper(): row for row in rules}
+    configured_level_codes = {
+        level_code
+        for level_code in rule_by_code.keys()
+        if level_code not in {"", "NORMAL", "SVIP0", "NONE"}
+    }
+    paid_by_code = {
+        str(row.get("level_code") or "").strip().upper(): row.get("total_paid_rcb")
+        for row in paid_level_rows
+    }
+    current_by_code = {
+        str(row.get("level_code") or "").strip().upper(): int(row.get("current_user_count") or 0)
+        for row in current_level_rows
+    }
+    level_codes = sorted(
+        configured_level_codes | set(current_by_code.keys()) | set(paid_by_code.keys()),
+        key=_admin_dividend_level_sort_key,
+    )
+    levels = []
+    for level_code in level_codes:
+        rule = rule_by_code.get(level_code, {})
+        levels.append(
+            {
+                "level_code": level_code,
+                "current_user_count": current_by_code.get(level_code, 0),
+                "dividend_rate": rule.get("dividend_rate", "0%"),
+                "estimated_dividend_rcb": "0",
+                "total_paid_rcb": _fmt_admin_rcb_compact_display(paid_by_code.get(level_code)),
+            }
+        )
+    trends = []
+    for row in trend_rows:
+        row_dict = dict(row)
+        item = _admin_dividend_pool_item(row_dict)
+        item["total_dividend_rcb"] = _fmt_admin_rcb_compact_display(row_dict.get("total_dividend_rcb"))
+        trends.append(item)
+    stats = {
+        "filters": {"start_date": start_date or "", "end_date": end_date or "", "status": status},
+        "summary": {
+            "total_fee_usdt": _fmt_admin_amount_display(summary_row.get("total_fee_usdt"), "USDT"),
+            "paid_rcb": _fmt_admin_rcb_compact_display(summary_row.get("paid_rcb")),
+            "pending_rcb": _fmt_admin_rcb_compact_display(summary_row.get("pending_rcb")),
+            "pool_count": int(summary_row.get("pool_count") or 0),
+            "paid_pool_count": int(summary_row.get("paid_pool_count") or 0),
+            "failed_pool_count": int(summary_row.get("failed_pool_count") or 0),
+        },
+        "status_counts": [
+            {
+                "status": row.get("status") or "",
+                "status_label": _admin_dividend_status_meta(row.get("status"))[0],
+                "status_badge": _admin_dividend_status_meta(row.get("status"))[1],
+                "count": int(row.get("count") or 0),
+            }
+            for row in status_rows
+        ],
+        "trends": trends,
+        "levels": levels,
+        "source_breakdown": [
+            {"source_type_label": "手续费分红", "fee_usdt": _fmt_admin_amount_display(summary_row.get("total_fee_usdt"), "USDT"), "ratio": "100.00%"}
+        ],
+    }
+    return stats
+
+
+def _admin_order_side_meta(side: Any) -> tuple[str, str]:
+    side_value = str(side or "").strip().upper()
+    if side_value == "BUY":
+        return "买入", "success"
+    if side_value == "SELL":
+        return "卖出", "danger"
+    return side_value or "--", "secondary"
+
+
+def _admin_order_type_badge(order_type: Any) -> str:
+    type_value = str(order_type or "").strip().upper()
+    if type_value == "MARKET":
+        return "warning"
+    if type_value == "LIMIT":
+        return "info"
+    return "secondary"
+
+
+def _admin_execution_badge(execution_mode: Any) -> str:
+    mode_value = str(execution_mode or "").strip().upper()
+    if mode_value == "DEALER":
+        return "warning"
+    if mode_value in {"MATCHING", "INTERNAL"}:
+        return "success"
+    return "secondary"
+
+
+def _admin_order_status_meta(status: Any) -> tuple[str, str]:
+    status_value = str(status or "").strip().upper()
+    labels = {
+        "OPEN": "未成交",
+        "NEW": "未成交",
+        "PENDING": "未成交",
+        "PARTIALLY_FILLED": "部分成交",
+        "PARTIAL": "部分成交",
+        "FILLED": "已完成",
+        "SUCCESS": "已完成",
+        "COMPLETED": "已完成",
+        "CANCELED": "已取消",
+        "CANCELLED": "已取消",
+        "REJECTED": "失败",
+        "FAILED": "失败",
+    }
+    badges = {
+        "OPEN": "info",
+        "NEW": "info",
+        "PENDING": "info",
+        "PARTIALLY_FILLED": "warning",
+        "PARTIAL": "warning",
+        "FILLED": "success",
+        "SUCCESS": "success",
+        "COMPLETED": "success",
+        "CANCELED": "secondary",
+        "CANCELLED": "secondary",
+        "REJECTED": "danger",
+        "FAILED": "danger",
+    }
+    return labels.get(status_value, status_value or "--"), badges.get(status_value, "secondary")
+
+
+def _admin_contract_order_status_meta(status: Any) -> tuple[str, str]:
+    status_value = str(status or "").strip().upper()
+    labels = {
+        "PENDING": "委托中",
+        "OPEN": "委托中",
+        "NEW": "委托中",
+        "PARTIALLY_FILLED": "部分成交",
+        "PARTIAL": "部分成交",
+        "FILLED": "已成交",
+        "CANCELED": "已取消",
+        "CANCELLED": "已取消",
+        "FAILED": "失败",
+        "REJECTED": "失败",
+    }
+    badges = {
+        "PENDING": "info",
+        "OPEN": "info",
+        "NEW": "info",
+        "PARTIALLY_FILLED": "warning",
+        "PARTIAL": "warning",
+        "FILLED": "success",
+        "CANCELED": "secondary",
+        "CANCELLED": "secondary",
+        "FAILED": "danger",
+        "REJECTED": "danger",
+    }
+    return labels.get(status_value, status_value or "--"), badges.get(status_value, "secondary")
+
+
+def _admin_contract_position_status_meta(status: Any) -> tuple[str, str]:
+    status_value = str(status or "").strip().upper()
+    labels = {
+        "OPEN": "持仓中",
+        "CLOSED": "已平仓",
+        "LIQUIDATED": "已强平",
+    }
+    badges = {
+        "OPEN": "info",
+        "CLOSED": "success",
+        "LIQUIDATED": "danger",
+    }
+    return labels.get(status_value, status_value or "--"), badges.get(status_value, "secondary")
+
+
+def _admin_side_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    return {
+        "BUY": "买入",
+        "SELL": "卖出",
+        "LONG": "做多",
+        "SHORT": "做空",
+    }.get(normalized, normalized or "--")
+
+
+def _admin_order_type_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    return {"LIMIT": "限价", "MARKET": "市价"}.get(normalized, normalized or "--")
+
+
+def _admin_trade_mode_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    return {"INTERNAL": "内盘", "MATCHING": "内盘", "DEALER": "Dealer"}.get(normalized, normalized or "--")
+
+
+def _admin_counterparty_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    return {"USER": "用户", "PLATFORM": "平台", "DEALER": "平台", "INTERNAL": "用户"}.get(normalized, normalized or "--")
+
+
+def _admin_contract_action_label(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    return {"OPEN": "开仓", "CLOSE": "平仓"}.get(normalized, normalized or "--")
+
+
+def _admin_trade_price_display(value: Any) -> str:
+    return _fmt_admin_amount_display(value, "")
+
+
+def _admin_trade_quantity_display(value: Any) -> str:
+    return _fmt_admin_amount_display(value, "")
+
+
+def _admin_usdt_display(value: Any, *, signed: bool = False) -> str:
+    return _fmt_admin_amount_display(value, "USDT", signed=signed)
+
+
+def _admin_leverage_display(value: Any) -> str:
+    if value is None or value == "":
+        return "--"
+    text_value = str(value).strip()
+    if not text_value:
+        return "--"
+    return text_value if text_value.lower().endswith("x") else f"{text_value}x"
+
+
+def _admin_pnl_class(value: Any) -> str:
+    amount = _parse_decimal(value)
+    if amount > 0:
+        return "pnl-positive"
+    if amount < 0:
+        return "pnl-negative"
+    return "pnl-zero"
+
+
+def _admin_counterparty_badge(counterparty_type: Any) -> str:
+    value = str(counterparty_type or "").strip().upper()
+    if value in {"PLATFORM", "DEALER"}:
+        return "warning"
+    if value in {"USER", "INTERNAL"}:
+        return "success"
+    return "secondary"
+
+
+def _admin_fee_text(amount: Any, symbol: Any) -> str:
+    symbol_text = str(symbol or "").strip()
+    amount_text = _fmt_admin_amount_display(amount, symbol_text)
+    if amount_text == "0" and not symbol_text:
+        return "--"
+    return f"{amount_text} {symbol_text}".strip()
+
+
+def _admin_market_range(range_key: Any) -> tuple[str, datetime, datetime]:
+    return get_admin_time_window(range_key)
+
+
+def _admin_market_type_meta(market_type: Any) -> tuple[str, str, str]:
+    normalized = str(market_type or "").strip().upper()
+    mapping = {
+        "SPOT": ("SPOT", "现货", "info"),
+        "RWA": ("RWA", "RWA", "brand"),
+        "CONTRACT": ("CONTRACT", "合约", "purple"),
+        "STOCK_CFD": ("STOCK_CFD", "股票合约", "warning"),
+        "CFD": ("CFD", "CFD", "secondary"),
+    }
+    return mapping.get(normalized, (normalized or "--", normalized or "--", "secondary"))
+
+
+def _admin_contract_market_type(category: Any, symbol: Any = None) -> str:
+    normalized = str(category or "").strip().upper()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if normalized == "STOCK" or normalized_symbol.endswith("ONUSDT_PERP"):
+        return "STOCK_CFD"
+    if normalized in {"INDEX", "FOREX", "METAL", "COMMODITY", "GOLD", "FUTURES"}:
+        return "CFD"
+    return "CONTRACT"
+
+
+def _admin_market_fee_display(fee_usdt: Any, fee_rcb: Any) -> str:
+    usdt = _parse_decimal(fee_usdt)
+    rcb = _parse_decimal(fee_rcb)
+    parts = []
+    if usdt:
+        parts.append(f"{_fmt_admin_amount_display(usdt, 'USDT')} USDT")
+    if rcb:
+        parts.append(f"{_fmt_admin_amount_display(rcb, 'RCB')} RCB")
+    return " / ".join(parts) if parts else "--"
+
+
+def _admin_market_fee_lines(fee_usdt: Any, fee_rcb: Any) -> list[Dict[str, str]]:
+    lines: list[Dict[str, str]] = []
+    usdt = _parse_decimal(fee_usdt)
+    rcb = _parse_decimal(fee_rcb)
+    if usdt:
+        lines.append({"coin": "USDT", "amount": _fmt_admin_amount_display(usdt, "USDT")})
+    if rcb:
+        lines.append({"coin": "RCB", "amount": _fmt_admin_amount_display(rcb, "RCB")})
+    return lines
+
+
+def _admin_market_optional_usdt_display(value: Any, *, signed: bool = False) -> str:
+    if value is None:
+        return "未统计"
+    return _admin_usdt_display(value, signed=signed)
+
+
+def _admin_market_percent_optional_display(value: Any) -> str:
+    if value is None:
+        return "--"
+    return _admin_percent_display(value)
+
+
+def _admin_table_columns(db: Session, table_name: str) -> set[str]:
+    try:
+        return {str(column.get("name") or "") for column in inspect(db.get_bind()).get_columns(table_name)}
+    except Exception:
+        return set()
+
+
+def _admin_market_first_existing_expr(
+    columns: set[str],
+    table_alias: str,
+    candidates: tuple[str, ...],
+) -> list[str]:
+    return [f"NULLIF({table_alias}.{column}, 0)" for column in candidates if column in columns]
+
+
+def _admin_market_bbo_mid_expr(columns: set[str], table_alias: str) -> str | None:
+    for bid_column, ask_column in (("dealer_best_bid", "dealer_best_ask"), ("best_bid", "best_ask")):
+        if {bid_column, ask_column}.issubset(columns):
+            return f"(({table_alias}.{bid_column} + {table_alias}.{ask_column}) / 2)"
+    return None
+
+
+def _admin_market_dealer_reference_expr(db: Session) -> tuple[str | None, bool]:
+    trade_columns = _admin_table_columns(db, "trades")
+    order_columns = _admin_table_columns(db, "orders") if _admin_table_exists(db, "orders") else set()
+    direct_candidates = ("reference_price", "dealer_ref_price", "ref_price", "external_price", "mid_price", "dealer_mid")
+    expressions = _admin_market_first_existing_expr(trade_columns, "t", direct_candidates)
+    if (trade_bbo_expr := _admin_market_bbo_mid_expr(trade_columns, "t")):
+        expressions.append(trade_bbo_expr)
+    for alias in ("bo", "so"):
+        expressions.extend(_admin_market_first_existing_expr(order_columns, alias, direct_candidates))
+        if (order_bbo_expr := _admin_market_bbo_mid_expr(order_columns, alias)):
+            expressions.append(order_bbo_expr)
+    if not expressions:
+        return None, bool(order_columns)
+    return f"COALESCE({', '.join(expressions)})", bool(order_columns)
+
+
+def _admin_market_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    market_type, market_type_text, market_type_badge = _admin_market_type_meta(row.get("market_type"))
+    platform_pnl = row.get("platform_pnl_usdt")
+    platform_pnl_display = str(row.get("platform_pnl_display") or "").strip()
+    if not platform_pnl_display:
+        platform_pnl_display = _admin_market_optional_usdt_display(platform_pnl, signed=True)
+    price_change = row.get("price_change_percent")
+    return {
+        "rank": int(row.get("rank") or 0),
+        "symbol": str(row.get("symbol") or ""),
+        "market_type": market_type,
+        "market_type_text": market_type_text,
+        "market_type_badge": market_type_badge,
+        "turnover_usdt": row.get("turnover_usdt") or Decimal("0"),
+        "turnover_usdt_display": _admin_usdt_display(row.get("turnover_usdt")),
+        "amount": row.get("amount") or Decimal("0"),
+        "amount_display": _admin_trade_quantity_display(row.get("amount")),
+        "trade_count": int(row.get("trade_count") or 0),
+        "fee_usdt": row.get("fee_usdt") or Decimal("0"),
+        "fee_rcb": row.get("fee_rcb") or Decimal("0"),
+        "fee_display": _admin_market_fee_display(row.get("fee_usdt"), row.get("fee_rcb")),
+        "price_change_percent": price_change,
+        "price_change_display": _admin_market_percent_optional_display(price_change),
+        "price_change_class": _admin_pnl_class(price_change),
+        "platform_pnl_usdt": platform_pnl,
+        "platform_pnl_display": platform_pnl_display,
+        "platform_pnl_class": _admin_pnl_class(platform_pnl),
+        "active_user_count": int(row.get("active_user_count") or 0),
+        "updated_at": row.get("updated_at"),
+        "updated_at_display": _admin_datetime_display(row.get("updated_at")) or "--",
+    }
+
+
+def _admin_market_sort_value(item: Dict[str, Any], sort_by: str) -> tuple[int, Decimal | int]:
+    if sort_by == "trade_count":
+        return 1, int(item.get("trade_count") or 0)
+    if sort_by == "fee":
+        return 1, _parse_decimal(item.get("fee_usdt")) + _parse_decimal(item.get("fee_rcb"))
+    if sort_by == "pnl":
+        value = item.get("platform_pnl_usdt")
+        return (0, Decimal("0")) if value is None else (1, _parse_decimal(value))
+    if sort_by == "users":
+        return 1, int(item.get("active_user_count") or 0)
+    return 1, _parse_decimal(item.get("turnover_usdt"))
+
+
+def _admin_market_spot_rows(
+    db: Session,
+    *,
+    start_time: datetime,
+    end_time: datetime,
+    market_type: str,
+    keyword: str,
+) -> list[Dict[str, Any]]:
+    if not (_admin_table_exists(db, "trades") and _admin_table_exists(db, "trading_pairs")):
+        return []
+    if market_type not in {"all", "spot", "rwa"}:
+        return []
+
+    rwa_expr = (
+        "(UPPER(COALESCE(tp.asset_type, '')) = 'RWA' "
+        "OR UPPER(COALESCE(tp.display_category, '')) = 'RWA' "
+        "OR UPPER(COALESCE(tp.market_category, '')) = 'RWA')"
+    )
+    where_parts = ["t.created_at >= :start_time", "t.created_at <= :end_time"]
+    params: Dict[str, Any] = {"start_time": start_time, "end_time": end_time}
+    if keyword:
+        where_parts.append("tp.symbol LIKE :keyword")
+        params["keyword"] = f"%{keyword}%"
+    if market_type == "spot":
+        where_parts.append(f"NOT {rwa_expr}")
+    elif market_type == "rwa":
+        where_parts.append(rwa_expr)
+    where_sql = " AND ".join(where_parts)
+    dealer_reference_expr, has_order_table = _admin_market_dealer_reference_expr(db)
+    order_join_sql = ""
+    order_side_expr = "NULL"
+    dealer_pnl_expr = "NULL"
+    dealer_ref_count_expr = "0"
+    dealer_scope_expr = "UPPER(COALESCE(t.counterparty_type, '')) IN ('PLATFORM', 'DEALER')"
+    if has_order_table:
+        order_join_sql = """
+            LEFT JOIN orders bo ON bo.id = t.buy_order_id
+            LEFT JOIN orders so ON so.id = t.sell_order_id
+        """
+        order_side_expr = "UPPER(COALESCE(bo.side, so.side, ''))"
+        dealer_scope_expr = (
+            f"({dealer_scope_expr} "
+            "OR UPPER(COALESCE(bo.execution_mode, '')) = 'DEALER' "
+            "OR UPPER(COALESCE(so.execution_mode, '')) = 'DEALER')"
+        )
+    dealer_trade_count_expr = f"SUM(CASE WHEN {dealer_scope_expr} THEN 1 ELSE 0 END)"
+    if dealer_reference_expr:
+        dealer_ref_count_expr = (
+            f"SUM(CASE WHEN {dealer_scope_expr} "
+            f"AND {dealer_reference_expr} IS NOT NULL THEN 1 ELSE 0 END)"
+        )
+        dealer_pnl_expr = f"""
+                SUM(
+                    CASE
+                        WHEN NOT ({dealer_scope_expr})
+                            THEN 0
+                        WHEN {dealer_reference_expr} IS NULL
+                            THEN 0
+                        WHEN {order_side_expr} = 'BUY'
+                            THEN (t.price - {dealer_reference_expr}) * t.amount
+                        WHEN {order_side_expr} = 'SELL'
+                            THEN ({dealer_reference_expr} - t.price) * t.amount
+                        ELSE 0
+                    END
+                )
+        """
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                tp.symbol,
+                CASE WHEN {rwa_expr} THEN 'RWA' ELSE 'SPOT' END AS market_type,
+                COALESCE(tp.market_mode, 'INTERNAL') AS market_mode,
+                SUM(COALESCE(t.quote_amount, t.price * t.amount, 0)) AS turnover_usdt,
+                SUM(COALESCE(t.amount, 0)) AS amount,
+                COUNT(t.id) AS trade_count,
+                SUM(
+                    CASE WHEN UPPER(COALESCE(t.buyer_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(t.buyer_fee_amount, 0) ELSE 0 END
+                    + CASE WHEN UPPER(COALESCE(t.seller_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(t.seller_fee_amount, 0) ELSE 0 END
+                    + CASE
+                        WHEN COALESCE(t.buyer_fee_amount, 0) = 0
+                         AND COALESCE(t.seller_fee_amount, 0) = 0
+                         AND UPPER(COALESCE(t.fee_asset_symbol, '')) = 'USDT'
+                        THEN COALESCE(t.fee_amount, 0)
+                        ELSE 0
+                      END
+                ) AS fee_usdt,
+                SUM(
+                    CASE WHEN UPPER(COALESCE(t.buyer_fee_asset_symbol, '')) = 'RCB' THEN COALESCE(t.buyer_fee_amount, 0) ELSE 0 END
+                    + CASE WHEN UPPER(COALESCE(t.seller_fee_asset_symbol, '')) = 'RCB' THEN COALESCE(t.seller_fee_amount, 0) ELSE 0 END
+                    + CASE
+                        WHEN COALESCE(t.buyer_fee_amount, 0) = 0
+                         AND COALESCE(t.seller_fee_amount, 0) = 0
+                         AND UPPER(COALESCE(t.fee_asset_symbol, '')) = 'RCB'
+                        THEN COALESCE(t.fee_amount, 0)
+                        ELSE 0
+                      END
+                ) AS fee_rcb,
+                {dealer_pnl_expr} AS dealer_platform_pnl_usdt,
+                {dealer_ref_count_expr} AS dealer_reference_count,
+                {dealer_trade_count_expr} AS dealer_trade_count,
+                MAX(t.created_at) AS updated_at
+            FROM trades t
+            JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+            {order_join_sql}
+            WHERE {where_sql}
+            GROUP BY tp.symbol, market_type, tp.market_mode
+            """
+        ),
+        params,
+    ).mappings().all()
+
+    active_rows = db.execute(
+        text(
+            f"""
+            SELECT symbol, COUNT(DISTINCT user_id) AS active_user_count
+            FROM (
+                SELECT tp.symbol AS symbol, t.buyer_user_id AS user_id
+                FROM trades t
+                JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+                WHERE {where_sql}
+                UNION ALL
+                SELECT tp.symbol AS symbol, t.seller_user_id AS user_id
+                FROM trades t
+                JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+                WHERE {where_sql}
+            ) user_scope
+            GROUP BY symbol
+            """
+        ),
+        params,
+    ).mappings().all()
+    active_by_symbol = {str(row.get("symbol") or ""): int(row.get("active_user_count") or 0) for row in active_rows}
+
+    items: list[Dict[str, Any]] = []
+    for row in rows:
+        row_dict = dict(row)
+        market_mode = str(row_dict.get("market_mode") or "").strip().upper()
+        dealer_trade_count = int(row_dict.get("dealer_trade_count") or 0)
+        dealer_reference_count = int(row_dict.get("dealer_reference_count") or 0)
+        if market_mode in {"DEALER", "PLATFORM"} or dealer_trade_count > 0:
+            if dealer_reference_count > 0:
+                platform_pnl = _parse_decimal(row_dict.get("dealer_platform_pnl_usdt"))
+                platform_pnl_display = ""
+                if dealer_reference_count < dealer_trade_count:
+                    platform_pnl_display = f"{_admin_usdt_display(platform_pnl, signed=True)} 部分缺少参考价"
+            else:
+                platform_pnl = None
+                platform_pnl_display = "缺少参考价"
+        else:
+            platform_pnl = Decimal("0")
+            platform_pnl_display = ""
+        items.append(
+            {
+                "symbol": row_dict.get("symbol") or "",
+                "market_type": row_dict.get("market_type") or "SPOT",
+                "turnover_usdt": _parse_decimal(row_dict.get("turnover_usdt")),
+                "amount": _parse_decimal(row_dict.get("amount")),
+                "trade_count": int(row_dict.get("trade_count") or 0),
+                "fee_usdt": _parse_decimal(row_dict.get("fee_usdt")),
+                "fee_rcb": _parse_decimal(row_dict.get("fee_rcb")),
+                "price_change_percent": None,
+                "platform_pnl_usdt": platform_pnl,
+                "platform_pnl_display": platform_pnl_display,
+                "active_user_count": active_by_symbol.get(str(row_dict.get("symbol") or ""), 0),
+                "updated_at": row_dict.get("updated_at"),
+            }
+        )
+    return items
+
+
+def _admin_market_contract_rows(
+    db: Session,
+    *,
+    start_time: datetime,
+    end_time: datetime,
+    market_type: str,
+    keyword: str,
+) -> list[Dict[str, Any]]:
+    if not _admin_table_exists(db, "contract_trades"):
+        return []
+    if market_type in {"spot", "rwa"}:
+        return []
+
+    try:
+        contract_columns = {str(column.get("name") or "") for column in inspect(db.get_bind()).get_columns("contract_trades")}
+    except Exception:
+        contract_columns = _admin_table_column_set(
+            db,
+            "contract_trades",
+            (
+                "id",
+                "user_id",
+                "symbol",
+                "created_at",
+                "quantity",
+                "notional",
+                "quote_amount",
+                "price",
+                "fee_amount",
+                "spread_fee",
+                "realized_pnl",
+            ),
+        )
+    time_column = next((column for column in ("created_at", "executed_at", "trade_time") if column in contract_columns), None)
+    required_columns = {"id", "user_id"}
+    if not required_columns.issubset(contract_columns):
+        return []
+    if time_column is None:
+        return []
+
+    has_symbol = "symbol" in contract_columns
+    has_contract_symbols = _admin_table_exists(db, "contract_symbols") and has_symbol
+    contract_symbol_columns = _admin_table_columns(db, "contract_symbols") if has_contract_symbols else set()
+    symbol_expr = "COALESCE(cs.symbol, ct.symbol)" if has_contract_symbols else ("ct.symbol" if has_symbol else "''")
+    category_parts = []
+    if has_contract_symbols and "asset_type" in contract_symbol_columns:
+        category_parts.append("cs.asset_type")
+    if has_contract_symbols and "category" in contract_symbol_columns:
+        category_parts.append("cs.category")
+    category_expr = f"COALESCE({', '.join(category_parts)}, 'CRYPTO')" if category_parts else "'CRYPTO'"
+    join_sql = "LEFT JOIN contract_symbols cs ON UPPER(cs.symbol) = UPPER(ct.symbol)" if has_contract_symbols else ""
+
+    turnover_parts = []
+    if "notional" in contract_columns:
+        turnover_parts.append("ct.notional")
+    if "quote_amount" in contract_columns:
+        turnover_parts.append("ct.quote_amount")
+    if {"price", "quantity"}.issubset(contract_columns):
+        turnover_parts.append("ct.price * ct.quantity")
+    turnover_expr = f"COALESCE({', '.join(turnover_parts)}, 0)" if turnover_parts else "0"
+    amount_expr = "COALESCE(ct.quantity, 0)" if "quantity" in contract_columns else "0"
+    fee_terms = []
+    if "fee_amount" in contract_columns:
+        fee_terms.append("COALESCE(ct.fee_amount, 0)")
+    if "spread_fee" in contract_columns:
+        fee_terms.append("COALESCE(ct.spread_fee, 0)")
+    fee_expr = " + ".join(fee_terms) if fee_terms else "0"
+    platform_pnl_expr = "SUM(0 - COALESCE(ct.realized_pnl, 0))" if "realized_pnl" in contract_columns else "NULL"
+    time_expr = f"ct.{time_column}"
+    where_parts = [f"{time_expr} >= :start_time", f"{time_expr} <= :end_time"]
+    params: Dict[str, Any] = {"start_time": start_time, "end_time": end_time}
+    if keyword and has_symbol:
+        where_parts.append("ct.symbol LIKE :keyword")
+        params["keyword"] = f"%{keyword}%"
+    where_sql = " AND ".join(where_parts)
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                {symbol_expr} AS symbol,
+                {category_expr} AS category,
+                SUM({turnover_expr}) AS turnover_usdt,
+                SUM({amount_expr}) AS amount,
+                COUNT(ct.id) AS trade_count,
+                SUM({fee_expr}) AS fee_usdt,
+                SUM(0) AS fee_rcb,
+                {platform_pnl_expr} AS platform_pnl_usdt,
+                COUNT(DISTINCT ct.user_id) AS active_user_count,
+                MAX({time_expr}) AS updated_at
+            FROM contract_trades ct
+            {join_sql}
+            WHERE {where_sql}
+            GROUP BY symbol, category
+            """
+        ),
+        params,
+    ).mappings().all()
+
+    items: list[Dict[str, Any]] = []
+    for row in rows:
+        row_dict = dict(row)
+        item_market_type = _admin_contract_market_type(row_dict.get("category"), row_dict.get("symbol"))
+        if market_type not in {"all", "contract"} and item_market_type.lower() != market_type:
+            continue
+        items.append(
+            {
+                "symbol": row_dict.get("symbol") or "",
+                "market_type": item_market_type,
+                "turnover_usdt": _parse_decimal(row_dict.get("turnover_usdt")),
+                "amount": _parse_decimal(row_dict.get("amount")),
+                "trade_count": int(row_dict.get("trade_count") or 0),
+                "fee_usdt": _parse_decimal(row_dict.get("fee_usdt")),
+                "fee_rcb": Decimal("0"),
+                "price_change_percent": None,
+                "platform_pnl_usdt": (
+                    _parse_decimal(row_dict.get("platform_pnl_usdt"))
+                    if row_dict.get("platform_pnl_usdt") is not None
+                    else None
+                ),
+                "active_user_count": int(row_dict.get("active_user_count") or 0),
+                "updated_at": row_dict.get("updated_at"),
+            }
+        )
+    return items
+
+
+def _admin_market_active_user_ids(
+    db: Session,
+    *,
+    start_time: datetime,
+    end_time: datetime,
+    market_type: str,
+    keyword: str,
+) -> set[int]:
+    user_ids: set[int] = set()
+    if _admin_table_exists(db, "trades") and _admin_table_exists(db, "trading_pairs") and market_type in {"all", "spot", "rwa"}:
+        rwa_expr = (
+            "(UPPER(COALESCE(tp.asset_type, '')) = 'RWA' "
+            "OR UPPER(COALESCE(tp.display_category, '')) = 'RWA' "
+            "OR UPPER(COALESCE(tp.market_category, '')) = 'RWA')"
+        )
+        where_parts = ["t.created_at >= :start_time", "t.created_at <= :end_time"]
+        params: Dict[str, Any] = {"start_time": start_time, "end_time": end_time}
+        if keyword:
+            where_parts.append("tp.symbol LIKE :keyword")
+            params["keyword"] = f"%{keyword}%"
+        if market_type == "spot":
+            where_parts.append(f"NOT {rwa_expr}")
+        elif market_type == "rwa":
+            where_parts.append(rwa_expr)
+        where_sql = " AND ".join(where_parts)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT DISTINCT user_id
+                FROM (
+                    SELECT t.buyer_user_id AS user_id
+                    FROM trades t
+                    JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+                    WHERE {where_sql}
+                    UNION ALL
+                    SELECT t.seller_user_id AS user_id
+                    FROM trades t
+                    JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+                    WHERE {where_sql}
+                ) user_scope
+                WHERE user_id IS NOT NULL
+                """
+            ),
+            params,
+        ).mappings().all()
+        user_ids.update(int(row.get("user_id")) for row in rows if row.get("user_id") is not None)
+
+    if _admin_table_exists(db, "contract_trades") and market_type not in {"spot", "rwa"}:
+        contract_columns = _admin_table_columns(db, "contract_trades")
+        time_column = next((column for column in ("created_at", "executed_at", "trade_time") if column in contract_columns), None)
+        has_symbol = "symbol" in contract_columns
+        has_contract_symbols = _admin_table_exists(db, "contract_symbols") and has_symbol
+        contract_symbol_columns = _admin_table_columns(db, "contract_symbols") if has_contract_symbols else set()
+        join_sql = "LEFT JOIN contract_symbols cs ON UPPER(cs.symbol) = UPPER(ct.symbol)" if has_contract_symbols else ""
+        category_parts = []
+        if has_contract_symbols and "asset_type" in contract_symbol_columns:
+            category_parts.append("cs.asset_type")
+        if has_contract_symbols and "category" in contract_symbol_columns:
+            category_parts.append("cs.category")
+        category_expr = f"UPPER(COALESCE({', '.join(category_parts)}, 'CRYPTO'))" if category_parts else "'CRYPTO'"
+        symbol_expr = "UPPER(COALESCE(cs.symbol, ct.symbol, ''))" if has_contract_symbols else ("UPPER(COALESCE(ct.symbol, ''))" if has_symbol else "''")
+        if time_column is None or "user_id" not in contract_columns:
+            return user_ids
+        time_expr = f"ct.{time_column}"
+        where_parts = [f"{time_expr} >= :start_time", f"{time_expr} <= :end_time"]
+        params = {"start_time": start_time, "end_time": end_time}
+        if keyword and has_symbol:
+            where_parts.append("ct.symbol LIKE :keyword")
+            params["keyword"] = f"%{keyword}%"
+        if market_type == "stock_cfd":
+            where_parts.append(f"({category_expr} = 'STOCK' OR {symbol_expr} LIKE '%ONUSDT_PERP')")
+        elif market_type == "cfd":
+            where_parts.append(f"{category_expr} IN ('INDEX', 'FOREX', 'METAL', 'COMMODITY', 'GOLD', 'FUTURES')")
+        elif market_type == "contract":
+            where_parts.append(f"({category_expr} NOT IN ('STOCK', 'INDEX', 'FOREX', 'METAL', 'COMMODITY', 'GOLD', 'FUTURES') AND {symbol_expr} NOT LIKE '%ONUSDT_PERP')")
+        where_sql = " AND ".join(where_parts)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT DISTINCT ct.user_id
+                FROM contract_trades ct
+                {join_sql}
+                WHERE {where_sql}
+                  AND ct.user_id IS NOT NULL
+                """
+            ),
+            params,
+        ).mappings().all()
+        user_ids.update(int(row.get("user_id")) for row in rows if row.get("user_id") is not None)
+
+    return user_ids
+
+
+def admin_query_market_analysis_pairs(
+    db: Session,
+    range_key: str = "today",
+    market_type: str = "all",
+    keyword: str | None = None,
+    sort_by: str = "turnover",
+    page: int = 1,
+    page_size: int = 50,
+) -> Dict[str, Any]:
+    normalized_range, start_time, end_time = _admin_market_range(range_key)
+    normalized_market_type = str(market_type or "all").strip().lower() or "all"
+    if normalized_market_type not in {"all", "spot", "rwa", "contract", "stock_cfd", "cfd"}:
+        normalized_market_type = "all"
+    normalized_sort = str(sort_by or "turnover").strip().lower() or "turnover"
+    if normalized_sort not in {"turnover", "trade_count", "fee", "pnl", "users"}:
+        normalized_sort = "turnover"
+    keyword_value = str(keyword or "").strip().upper()
+    page = max(1, _parse_int(page, 1))
+    page_size = min(max(1, _parse_int(page_size, 50)), 100)
+
+    try:
+        raw_items: list[Dict[str, Any]] = []
+        source_errors: list[str] = []
+        try:
+            raw_items.extend(
+                _admin_market_spot_rows(
+                    db,
+                    start_time=start_time,
+                    end_time=end_time,
+                    market_type=normalized_market_type,
+                    keyword=keyword_value,
+                )
+            )
+        except Exception:
+            logger.exception("admin_query_market_analysis_pairs spot source failed")
+            source_errors.append("现货/RWA")
+        try:
+            raw_items.extend(
+                _admin_market_contract_rows(
+                    db,
+                    start_time=start_time,
+                    end_time=end_time,
+                    market_type=normalized_market_type,
+                    keyword=keyword_value,
+                )
+            )
+        except Exception:
+            logger.exception("admin_query_market_analysis_pairs contract source failed")
+            source_errors.append("合约/CFD")
+
+        raw_items.sort(key=lambda item: _admin_market_sort_value(item, normalized_sort), reverse=True)
+        for index, item in enumerate(raw_items, start=1):
+            item["rank"] = index
+
+        total = len(raw_items)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        offset = (page - 1) * page_size
+        items = [_admin_market_item(item) for item in raw_items[offset : offset + page_size]]
+
+        total_turnover = sum((_parse_decimal(item.get("turnover_usdt")) for item in raw_items), Decimal("0"))
+        total_trade_count = sum(int(item.get("trade_count") or 0) for item in raw_items)
+        total_fee_usdt = sum((_parse_decimal(item.get("fee_usdt")) for item in raw_items), Decimal("0"))
+        total_fee_rcb = sum((_parse_decimal(item.get("fee_rcb")) for item in raw_items), Decimal("0"))
+        known_pnl_values = [item.get("platform_pnl_usdt") for item in raw_items if item.get("platform_pnl_usdt") is not None]
+        total_platform_pnl = sum((_parse_decimal(value) for value in known_pnl_values), Decimal("0")) if known_pnl_values else None
+        try:
+            active_user_count = len(
+                _admin_market_active_user_ids(
+                    db,
+                    start_time=start_time,
+                    end_time=end_time,
+                    market_type=normalized_market_type,
+                    keyword=keyword_value,
+                )
+            )
+        except Exception:
+            logger.exception("admin_query_market_analysis_pairs active user count failed")
+            active_user_count = sum(int(item.get("active_user_count") or 0) for item in raw_items)
+        summary = {
+            "total_turnover_usdt": _admin_usdt_display(total_turnover),
+            "total_trade_count": total_trade_count,
+            "total_fee_usdt": _admin_usdt_display(total_fee_usdt),
+            "total_fee_rcb": _fmt_admin_amount_display(total_fee_rcb, "RCB"),
+            "total_fee_display": _admin_market_fee_display(total_fee_usdt, total_fee_rcb),
+            "total_fee_lines": _admin_market_fee_lines(total_fee_usdt, total_fee_rcb),
+            "total_platform_pnl_usdt": _admin_market_optional_usdt_display(total_platform_pnl, signed=True),
+            "total_platform_pnl_class": _admin_pnl_class(total_platform_pnl),
+            "active_user_count": active_user_count,
+            "pair_count": total,
+        }
+        performance_notice = ""
+        if source_errors:
+            performance_notice = f"{'、'.join(source_errors)} 数据源暂不可用，相关字段已按空数据处理。"
+
+        return _empty_page(
+            items=items,
+            filters={
+                "range_key": normalized_range,
+                "market_type": normalized_market_type,
+                "keyword": keyword_value,
+                "sort_by": normalized_sort,
+                "page": page,
+                "page_size": page_size,
+            },
+            summary=summary,
+            total=total,
+            page=page,
+            page_size=page_size,
+            pages=pages,
+            performance_notice=performance_notice,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    except Exception:
+        return _admin_read_error_page(
+            "admin_query_market_analysis_pairs",
+            {
+                "range_key": normalized_range,
+                "market_type": normalized_market_type,
+                "keyword": keyword_value,
+                "sort_by": normalized_sort,
+                "page": page,
+                "page_size": page_size,
+            },
+        )
+
+
+def admin_query_orders(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    query_scope = str(filters.get("query_scope") or "recent").strip().lower() or "recent"
+    order_id = str(filters.get("order_id") or "").strip()
+    order_no = str(filters.get("order_no") or "").strip()
+    user_id = str(filters.get("user_id") or "").strip()
+    symbol = _normalize_code(filters.get("symbol"))
+    side = str(filters.get("side") or "").strip().upper()
+    order_type = str(filters.get("order_type") or "").strip().upper()
+    execution_mode = str(filters.get("execution_mode") or "").strip().upper()
+    market_mode = str(filters.get("market_mode") or "").strip().upper()
+    status = str(filters.get("status") or "").strip().upper()
+    start_time = filters.get("start_time") or filters.get("date_from")
+    end_time = filters.get("end_time") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if order_id:
+        where_parts.append("o.id = :order_id")
+        params["order_id"] = _parse_int(order_id)
+    if order_no:
+        where_parts.append("o.order_no LIKE :order_no")
+        params["order_no"] = f"%{order_no}%"
+    if user_id:
+        where_parts.append("o.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if symbol:
+        where_parts.append("tp.symbol = :symbol")
+        params["symbol"] = symbol
+    if side:
+        where_parts.append("o.side = :side")
+        params["side"] = side
+    if order_type:
+        where_parts.append("o.order_type = :order_type")
+        params["order_type"] = order_type
+    if execution_mode:
+        where_parts.append("o.execution_mode = :execution_mode")
+        params["execution_mode"] = execution_mode
+    if market_mode:
+        where_parts.append("tp.market_mode = :market_mode")
+        params["market_mode"] = market_mode
+    if status:
+        if status == "CANCELED":
+            where_parts.append("o.status IN ('CANCELED', 'CANCELLED')")
+        else:
+            where_parts.append("o.status = :status")
+            params["status"] = status
+    if start_time:
+        where_parts.append("o.created_at >= :start_time")
+        params["start_time"] = start_time
+    if end_time:
+        where_parts.append("o.created_at <= :end_time")
+        params["end_time"] = end_time
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM orders o
+        LEFT JOIN trading_pairs tp ON tp.id = o.trading_pair_id
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    query_params = {**params, "limit": page_size, "offset": (page - 1) * page_size}
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                o.id,
+                o.order_no,
+                o.user_id,
+                o.trading_pair_id,
+                tp.symbol,
+                o.side,
+                o.order_type,
+                o.price,
+                o.amount,
+                o.filled_amount,
+                o.avg_price,
+                o.frozen_amount,
+                o.fee_amount,
+                o.fee_asset_symbol,
+                o.status,
+                o.created_at,
+                o.execution_mode,
+                tp.market_mode
+            {from_sql}
+            {where_sql}
+            ORDER BY o.created_at DESC, o.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        query_params,
+    ).mappings().all()
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        side_label, side_badge = _admin_order_side_meta(row_dict.get("side"))
+        status_label, status_badge = _admin_order_status_meta(row_dict.get("status"))
+        amount = _parse_decimal(row_dict.get("amount"))
+        filled_amount = _parse_decimal(row_dict.get("filled_amount"))
+        remaining_amount = amount - filled_amount
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "order_id": row_dict.get("id"),
+                "order_no": row_dict.get("order_no") or "",
+                "user_id": row_dict.get("user_id"),
+                "trading_pair_id": row_dict.get("trading_pair_id"),
+                "symbol": row_dict.get("symbol") or "",
+                "side": row_dict.get("side") or "",
+                "side_label": side_label,
+                "side_badge": side_badge,
+                "order_type": row_dict.get("order_type") or "",
+                "order_type_label": _admin_order_type_label(row_dict.get("order_type")),
+                "order_type_badge": _admin_order_type_badge(row_dict.get("order_type")),
+                "execution_mode": row_dict.get("execution_mode") or row_dict.get("market_mode") or "--",
+                "execution_mode_badge": _admin_execution_badge(row_dict.get("execution_mode") or row_dict.get("market_mode")),
+                "execution_mode_label": _admin_trade_mode_label(row_dict.get("execution_mode") or row_dict.get("market_mode")),
+                "price": _admin_trade_price_display(row_dict.get("price")),
+                "amount": _admin_trade_quantity_display(row_dict.get("amount")),
+                "filled_amount": _admin_trade_quantity_display(row_dict.get("filled_amount")),
+                "remaining_amount": _admin_trade_quantity_display(remaining_amount),
+                "avg_price": _admin_trade_price_display(row_dict.get("avg_price")),
+                "frozen_amount": _admin_usdt_display(row_dict.get("frozen_amount")),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "fee_text": _admin_fee_text(row_dict.get("fee_amount"), row_dict.get("fee_asset_symbol")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "query_scope": query_scope,
+            "order_id": order_id,
+            "order_no": order_no,
+            "user_id": user_id,
+            "symbol": symbol,
+            "side": side,
+            "order_type": order_type,
+            "execution_mode": execution_mode,
+            "market_mode": market_mode,
+            "status": status,
+            "start_time": start_time,
+            "end_time": end_time,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "total_pages": pages,
+        "has_next": page < pages,
+        "has_prev": page > 1,
+        "is_page_limited": False,
+        "pagination_mode": "page",
+        "performance_notice": "",
+        "query_scope": query_scope,
+        "effective_start_time": start_time,
+        "effective_end_time": end_time,
+    }
+
+
+def admin_query_trades(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    query_scope = str(filters.get("query_scope") or "recent").strip().lower() or "recent"
+    trade_id = str(filters.get("trade_id") or "").strip()
+    symbol = _normalize_code(filters.get("symbol"))
+    user_id = str(filters.get("user_id") or "").strip()
+    buyer_user_id = str(filters.get("buyer_user_id") or "").strip()
+    seller_user_id = str(filters.get("seller_user_id") or "").strip()
+    buy_order_id = str(filters.get("buy_order_id") or filters.get("order_id") or "").strip()
+    sell_order_id = str(filters.get("sell_order_id") or "").strip()
+    maker_order_id = str(filters.get("maker_order_id") or "").strip()
+    taker_order_id = str(filters.get("taker_order_id") or "").strip()
+    counterparty_type = str(filters.get("counterparty_type") or "").strip().upper()
+    start_time = filters.get("start_time") or filters.get("date_from")
+    end_time = filters.get("end_time") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if trade_id:
+        where_parts.append("t.id = :trade_id")
+        params["trade_id"] = _parse_int(trade_id)
+    if symbol:
+        where_parts.append("tp.symbol = :symbol")
+        params["symbol"] = symbol
+    if user_id:
+        where_parts.append("(t.buyer_user_id = :user_id OR t.seller_user_id = :user_id)")
+        params["user_id"] = _parse_int(user_id)
+    if buyer_user_id:
+        where_parts.append("t.buyer_user_id = :buyer_user_id")
+        params["buyer_user_id"] = _parse_int(buyer_user_id)
+    if seller_user_id:
+        where_parts.append("t.seller_user_id = :seller_user_id")
+        params["seller_user_id"] = _parse_int(seller_user_id)
+    if buy_order_id:
+        where_parts.append("(t.buy_order_id = :buy_order_id OR t.sell_order_id = :buy_order_id OR t.maker_order_id = :buy_order_id OR t.taker_order_id = :buy_order_id)")
+        params["buy_order_id"] = _parse_int(buy_order_id)
+    if sell_order_id:
+        where_parts.append("t.sell_order_id = :sell_order_id")
+        params["sell_order_id"] = _parse_int(sell_order_id)
+    if maker_order_id:
+        where_parts.append("t.maker_order_id = :maker_order_id")
+        params["maker_order_id"] = _parse_int(maker_order_id)
+    if taker_order_id:
+        where_parts.append("t.taker_order_id = :taker_order_id")
+        params["taker_order_id"] = _parse_int(taker_order_id)
+    if counterparty_type:
+        where_parts.append("t.counterparty_type = :counterparty_type")
+        params["counterparty_type"] = counterparty_type
+    if start_time:
+        where_parts.append("t.created_at >= :start_time")
+        params["start_time"] = start_time
+    if end_time:
+        where_parts.append("t.created_at <= :end_time")
+        params["end_time"] = end_time
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM trades t
+        LEFT JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    query_params = {**params, "limit": page_size, "offset": (page - 1) * page_size}
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                t.id,
+                t.trading_pair_id,
+                tp.symbol,
+                t.buy_order_id,
+                t.sell_order_id,
+                t.buyer_user_id,
+                t.seller_user_id,
+                t.price,
+                t.amount,
+                COALESCE(t.quote_amount, t.price * t.amount) AS quote_amount,
+                t.counterparty_type,
+                t.fee_amount,
+                t.fee_asset_symbol,
+                t.buyer_fee_amount,
+                t.buyer_fee_asset_symbol,
+                t.seller_fee_amount,
+                t.seller_fee_asset_symbol,
+                t.created_at
+            {from_sql}
+            {where_sql}
+            ORDER BY t.created_at DESC, t.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        query_params,
+    ).mappings().all()
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        buyer_fee_text = _admin_fee_text(row_dict.get("buyer_fee_amount"), row_dict.get("buyer_fee_asset_symbol"))
+        seller_fee_text = _admin_fee_text(row_dict.get("seller_fee_amount"), row_dict.get("seller_fee_asset_symbol"))
+        platform_fee_text = _admin_fee_text(row_dict.get("fee_amount"), row_dict.get("fee_asset_symbol"))
+        fee_logs = []
+        if row_dict.get("buyer_fee_amount") is not None:
+            fee_logs.append(
+                {
+                    "user_id": row_dict.get("buyer_user_id"),
+                    "coin_symbol": row_dict.get("buyer_fee_asset_symbol") or "",
+                    "change_amount": _fmt_admin_amount_display(row_dict.get("buyer_fee_amount"), row_dict.get("buyer_fee_asset_symbol")),
+                    "direction": "支出",
+                    "change_type": "交易手续费扣除",
+                    "biz_type": "现货交易",
+                    "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                    "remark": "买方手续费",
+                }
+            )
+        if row_dict.get("seller_fee_amount") is not None:
+            fee_logs.append(
+                {
+                    "user_id": row_dict.get("seller_user_id"),
+                    "coin_symbol": row_dict.get("seller_fee_asset_symbol") or "",
+                    "change_amount": _fmt_admin_amount_display(row_dict.get("seller_fee_amount"), row_dict.get("seller_fee_asset_symbol")),
+                    "direction": "支出",
+                    "change_type": "交易手续费扣除",
+                    "biz_type": "现货交易",
+                    "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                    "remark": "卖方手续费",
+                }
+            )
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "trade_id": row_dict.get("id"),
+                "trading_pair_id": row_dict.get("trading_pair_id"),
+                "symbol": row_dict.get("symbol") or "",
+                "buy_order_id": row_dict.get("buy_order_id"),
+                "sell_order_id": row_dict.get("sell_order_id"),
+                "buyer_user_id": row_dict.get("buyer_user_id"),
+                "seller_user_id": row_dict.get("seller_user_id"),
+                "price": _admin_trade_price_display(row_dict.get("price")),
+                "amount": _admin_trade_quantity_display(row_dict.get("amount")),
+                "quote_amount": _admin_usdt_display(row_dict.get("quote_amount")),
+                "counterparty_type": row_dict.get("counterparty_type") or "--",
+                "counterparty_type_label": _admin_counterparty_label(row_dict.get("counterparty_type")),
+                "counterparty_type_badge": _admin_counterparty_badge(row_dict.get("counterparty_type")),
+                "fee_summary": {
+                    "buyer_fee_text": buyer_fee_text,
+                    "seller_fee_text": seller_fee_text,
+                    "platform_fee_text": platform_fee_text,
+                },
+                "fee_logs": fee_logs,
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    return {
+        "items": items,
+        "filters": {
+            "query_scope": query_scope,
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "user_id": user_id,
+            "buyer_user_id": buyer_user_id,
+            "seller_user_id": seller_user_id,
+            "buy_order_id": buy_order_id,
+            "sell_order_id": sell_order_id,
+            "maker_order_id": maker_order_id,
+            "taker_order_id": taker_order_id,
+            "counterparty_type": counterparty_type,
+            "start_time": start_time,
+            "end_time": end_time,
+            "page": page,
+            "page_size": page_size,
+        },
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "total_pages": pages,
+        "has_next": page < pages,
+        "has_prev": page > 1,
+        "is_page_limited": False,
+        "pagination_mode": "page",
+        "performance_notice": "",
+        "query_scope": query_scope,
+        "effective_start_time": start_time,
+        "effective_end_time": end_time,
+    }
+
+
+def _admin_contract_position_badge(position_side: Any) -> str:
+    value = str(position_side or "").strip().upper()
+    if value in {"LONG", "BUY"}:
+        return "success"
+    if value in {"SHORT", "SELL"}:
+        return "danger"
+    return "secondary"
+
+
+def _admin_contract_action_badge(action: Any) -> str:
+    value = str(action or "").strip().upper()
+    if value == "OPEN":
+        return "info"
+    if value == "CLOSE":
+        return "warning"
+    return "secondary"
+
+
+def _admin_contract_status_badge(status: Any) -> str:
+    return _admin_contract_order_status_meta(status)[1]
+
+
+def _admin_contract_liquidatable_meta(value: Any) -> tuple[str, str]:
+    is_enabled = str(value or "").strip() in {"1", "true", "True", "YES", "yes"}
+    return ("是", "danger") if is_enabled else ("否", "secondary")
+
+
+def _admin_contract_page_result(
+    *,
+    items: list[Dict[str, Any]],
+    filters: Dict[str, Any],
+    total: int,
+    page: int,
+    page_size: int,
+    pages: int,
+    query_scope: str = "",
+    effective_start_time: Any = None,
+    effective_end_time: Any = None,
+) -> Dict[str, Any]:
+    pagination = {"page": page, "page_size": page_size, "total": total, "pages": pages}
+    result = {
+        "items": items,
+        "filters": filters,
+        "pagination": pagination,
+        "summary": {},
+        "stats": {},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "total_pages": pages,
+        "has_next": page < pages,
+        "has_prev": page > 1,
+        "is_page_limited": False,
+        "pagination_mode": "page",
+        "performance_notice": "",
+    }
+    if query_scope:
+        result["query_scope"] = query_scope
+        result["effective_start_time"] = effective_start_time
+        result["effective_end_time"] = effective_end_time
+    return result
+
+
+def list_admin_contract_accounts(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    margin_asset = _normalize_code(filters.get("margin_asset") or filters.get("coin_symbol") or filters.get("asset_symbol"))
+    has_position_margin = str(filters.get("has_position_margin") or "").strip()
+    has_available_margin = str(filters.get("has_available_margin") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("ca.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if margin_asset:
+        where_parts.append("ca.margin_asset = :margin_asset")
+        params["margin_asset"] = margin_asset
+    if has_position_margin == "1":
+        where_parts.append("ca.position_margin <> 0")
+    if has_available_margin == "1":
+        where_parts.append("ca.available_margin <> 0")
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM contract_accounts ca
+        LEFT JOIN users u ON u.id = ca.user_id
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                ca.id,
+                ca.user_id,
+                ca.margin_asset,
+                ca.available_margin,
+                ca.frozen_margin,
+                ca.position_margin,
+                ca.realized_pnl,
+                ca.unrealized_pnl,
+                ca.updated_at
+            {from_sql}
+            {where_sql}
+            ORDER BY ca.updated_at DESC, ca.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        margin_asset_display = row_dict.get("margin_asset") or "USDT"
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "user_id": row_dict.get("user_id"),
+                "margin_asset": margin_asset_display,
+                "available_margin": _fmt_admin_amount_display(row_dict.get("available_margin"), margin_asset_display),
+                "frozen_margin": _fmt_admin_amount_display(row_dict.get("frozen_margin"), margin_asset_display),
+                "position_margin": _fmt_admin_amount_display(row_dict.get("position_margin"), margin_asset_display),
+                "realized_pnl": _fmt_admin_amount_display(row_dict.get("realized_pnl"), margin_asset_display),
+                "realized_pnl_class": _admin_pnl_class(row_dict.get("realized_pnl")),
+                "unrealized_pnl": _fmt_admin_amount_display(row_dict.get("unrealized_pnl"), margin_asset_display),
+                "unrealized_pnl_class": _admin_pnl_class(row_dict.get("unrealized_pnl")),
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+            }
+        )
+
+    return _admin_contract_page_result(
+        items=items,
+        filters={
+            "user_id": user_id,
+            "margin_asset": margin_asset,
+            "has_position_margin": has_position_margin,
+            "has_available_margin": has_available_margin,
+            "page": page,
+            "page_size": page_size,
+        },
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+def list_admin_contract_orders(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    query_scope = str(filters.get("query_scope") or "recent").strip().lower() or "recent"
+    order_id = str(filters.get("order_id") or "").strip()
+    order_no = str(filters.get("order_no") or "").strip()
+    user_id = str(filters.get("user_id") or "").strip()
+    symbol = _normalize_code(filters.get("symbol"))
+    position_id = str(filters.get("position_id") or "").strip()
+    side = str(filters.get("side") or "").strip().upper()
+    action = str(filters.get("action") or "").strip().upper()
+    position_side = str(filters.get("position_side") or "").strip().upper()
+    order_type = str(filters.get("order_type") or "").strip().upper()
+    status = str(filters.get("status") or "").strip().upper()
+    start_time = filters.get("start_time") or filters.get("date_from")
+    end_time = filters.get("end_time") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if order_id:
+        where_parts.append("co.id = :order_id")
+        params["order_id"] = _parse_int(order_id)
+    if order_no:
+        where_parts.append("co.order_no LIKE :order_no")
+        params["order_no"] = f"%{order_no}%"
+    if user_id:
+        where_parts.append("co.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if symbol:
+        where_parts.append("co.symbol = :symbol")
+        params["symbol"] = symbol
+    if position_id:
+        where_parts.append("co.position_id = :position_id")
+        params["position_id"] = _parse_int(position_id)
+    if side:
+        where_parts.append("co.side = :side")
+        params["side"] = side
+    if action:
+        where_parts.append("co.action = :action")
+        params["action"] = action
+    if position_side:
+        where_parts.append("co.position_side = :position_side")
+        params["position_side"] = position_side
+    if order_type:
+        where_parts.append("co.order_type = :order_type")
+        params["order_type"] = order_type
+    if status:
+        if status == "CANCELED":
+            where_parts.append("co.status IN ('CANCELED', 'CANCELLED')")
+        else:
+            where_parts.append("co.status = :status")
+            params["status"] = status
+    if start_time:
+        where_parts.append("co.created_at >= :start_time")
+        params["start_time"] = start_time
+    if end_time:
+        where_parts.append("co.created_at <= :end_time")
+        params["end_time"] = end_time
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM contract_orders co
+        LEFT JOIN contract_symbols cs ON cs.symbol = co.symbol
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                co.id,
+                co.order_no,
+                co.user_id,
+                co.symbol,
+                co.position_id,
+                co.side,
+                co.position_side,
+                co.action,
+                co.order_type,
+                co.price,
+                co.quantity,
+                co.leverage,
+                co.margin_amount,
+                co.spread_fee,
+                co.filled_quantity,
+                co.avg_price,
+                co.status,
+                co.fail_reason,
+                co.created_at,
+                co.updated_at,
+                cs.category,
+                cs.provider
+            {from_sql}
+            {where_sql}
+            ORDER BY co.created_at DESC, co.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_label, status_badge = _admin_contract_order_status_meta(row_dict.get("status"))
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "order_no": row_dict.get("order_no") or "",
+                "user_id": row_dict.get("user_id"),
+                "symbol": row_dict.get("symbol") or "",
+                "position_id": row_dict.get("position_id") or "",
+                "side": row_dict.get("side") or "",
+                "side_label": _admin_side_label(row_dict.get("side")),
+                "side_badge": _admin_contract_position_badge(row_dict.get("side")),
+                "position_side": row_dict.get("position_side") or "",
+                "position_side_label": _admin_side_label(row_dict.get("position_side")),
+                "position_side_badge": _admin_contract_position_badge(row_dict.get("position_side")),
+                "action": row_dict.get("action") or "",
+                "action_label": _admin_contract_action_label(row_dict.get("action")),
+                "action_badge": _admin_contract_action_badge(row_dict.get("action")),
+                "order_type": row_dict.get("order_type") or "",
+                "order_type_label": _admin_order_type_label(row_dict.get("order_type")),
+                "price": _admin_trade_price_display(row_dict.get("price")),
+                "quantity": _admin_trade_quantity_display(row_dict.get("quantity")),
+                "leverage": int(row_dict.get("leverage") or 0),
+                "leverage_text": _admin_leverage_display(row_dict.get("leverage")),
+                "margin_amount": _admin_usdt_display(row_dict.get("margin_amount")),
+                "spread_fee": _admin_usdt_display(row_dict.get("spread_fee")),
+                "filled_quantity": _admin_trade_quantity_display(row_dict.get("filled_quantity")),
+                "avg_price": _admin_trade_price_display(row_dict.get("avg_price")),
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "fail_reason": row_dict.get("fail_reason") or "-",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+                "category": row_dict.get("category") or "",
+                "provider": row_dict.get("provider") or "",
+            }
+        )
+
+    return _admin_contract_page_result(
+        items=items,
+        filters={
+            "query_scope": query_scope,
+            "order_id": order_id,
+            "order_no": order_no,
+            "user_id": user_id,
+            "symbol": symbol,
+            "position_id": position_id,
+            "side": side,
+            "action": action,
+            "position_side": position_side,
+            "order_type": order_type,
+            "status": status,
+            "start_time": start_time,
+            "end_time": end_time,
+            "page": page,
+            "page_size": page_size,
+        },
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+        query_scope=query_scope,
+        effective_start_time=start_time,
+        effective_end_time=end_time,
+    )
+
+
+def list_admin_contract_trades(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    query_scope = str(filters.get("query_scope") or "recent").strip().lower() or "recent"
+    trade_id = str(filters.get("trade_id") or "").strip()
+    trade_no = str(filters.get("trade_no") or "").strip()
+    user_id = str(filters.get("user_id") or "").strip()
+    symbol = _normalize_code(filters.get("symbol"))
+    order_id = str(filters.get("order_id") or "").strip()
+    position_id = str(filters.get("position_id") or "").strip()
+    side = str(filters.get("side") or "").strip().upper()
+    action = str(filters.get("action") or "").strip().upper()
+    position_side = str(filters.get("position_side") or "").strip().upper()
+    order_type = str(filters.get("order_type") or "").strip().upper()
+    start_time = filters.get("start_time") or filters.get("date_from")
+    end_time = filters.get("end_time") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if trade_id:
+        where_parts.append("ct.id = :trade_id")
+        params["trade_id"] = _parse_int(trade_id)
+    if trade_no:
+        where_parts.append("ct.trade_no LIKE :trade_no")
+        params["trade_no"] = f"%{trade_no}%"
+    if user_id:
+        where_parts.append("ct.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if symbol:
+        where_parts.append("ct.symbol = :symbol")
+        params["symbol"] = symbol
+    if order_id:
+        where_parts.append("ct.order_id = :order_id")
+        params["order_id"] = _parse_int(order_id)
+    if position_id:
+        where_parts.append("ct.position_id = :position_id")
+        params["position_id"] = _parse_int(position_id)
+    if side:
+        where_parts.append("ct.side = :side")
+        params["side"] = side
+    if action:
+        where_parts.append("ct.action = :action")
+        params["action"] = action
+    if position_side:
+        where_parts.append("ct.position_side = :position_side")
+        params["position_side"] = position_side
+    if order_type:
+        where_parts.append("co.order_type = :order_type")
+        params["order_type"] = order_type
+    if start_time:
+        where_parts.append("ct.created_at >= :start_time")
+        params["start_time"] = start_time
+    if end_time:
+        where_parts.append("ct.created_at <= :end_time")
+        params["end_time"] = end_time
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM contract_trades ct
+        LEFT JOIN contract_symbols cs ON cs.symbol = ct.symbol
+        LEFT JOIN contract_orders co ON co.id = ct.order_id
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                ct.id,
+                ct.trade_no,
+                ct.order_id,
+                ct.position_id,
+                ct.user_id,
+                ct.symbol,
+                ct.side,
+                ct.position_side,
+                ct.action,
+                ct.price,
+                ct.quantity,
+                ct.notional,
+                ct.leverage,
+                ct.margin_amount,
+                ct.spread_fee,
+                ct.realized_pnl,
+                ct.created_at,
+                cs.category,
+                cs.provider
+            {from_sql}
+            {where_sql}
+            ORDER BY ct.created_at DESC, ct.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "trade_no": row_dict.get("trade_no") or "",
+                "order_id": row_dict.get("order_id") or "",
+                "position_id": row_dict.get("position_id") or "",
+                "user_id": row_dict.get("user_id"),
+                "symbol": row_dict.get("symbol") or "",
+                "side": row_dict.get("side") or "",
+                "side_label": _admin_side_label(row_dict.get("side")),
+                "side_badge": _admin_contract_position_badge(row_dict.get("side")),
+                "position_side": row_dict.get("position_side") or "",
+                "position_side_label": _admin_side_label(row_dict.get("position_side")),
+                "position_side_badge": _admin_contract_position_badge(row_dict.get("position_side")),
+                "action": row_dict.get("action") or "",
+                "action_label": _admin_contract_action_label(row_dict.get("action")),
+                "action_badge": _admin_contract_action_badge(row_dict.get("action")),
+                "price": _admin_trade_price_display(row_dict.get("price")),
+                "quantity": _admin_trade_quantity_display(row_dict.get("quantity")),
+                "notional": _admin_usdt_display(row_dict.get("notional")),
+                "leverage": int(row_dict.get("leverage") or 0),
+                "leverage_text": _admin_leverage_display(row_dict.get("leverage")),
+                "margin_amount": _admin_usdt_display(row_dict.get("margin_amount")),
+                "spread_fee": _admin_usdt_display(row_dict.get("spread_fee")),
+                "realized_pnl": _admin_usdt_display(row_dict.get("realized_pnl"), signed=True),
+                "realized_pnl_class": _admin_pnl_class(row_dict.get("realized_pnl")),
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "category": row_dict.get("category") or "",
+                "provider": row_dict.get("provider") or "",
+            }
+        )
+
+    return _admin_contract_page_result(
+        items=items,
+        filters={
+            "query_scope": query_scope,
+            "trade_id": trade_id,
+            "trade_no": trade_no,
+            "user_id": user_id,
+            "symbol": symbol,
+            "order_id": order_id,
+            "position_id": position_id,
+            "side": side,
+            "action": action,
+            "position_side": position_side,
+            "order_type": order_type,
+            "start_time": start_time,
+            "end_time": end_time,
+            "page": page,
+            "page_size": page_size,
+        },
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+        query_scope=query_scope,
+        effective_start_time=start_time,
+        effective_end_time=end_time,
+    )
+
+
+def list_admin_contract_positions(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    symbol = _normalize_code(filters.get("symbol"))
+    side = str(filters.get("side") or "").strip().upper()
+    status = str(filters.get("status") or "").strip().upper()
+    is_liquidatable = str(filters.get("is_liquidatable") or "").strip()
+    start_time = filters.get("start_time") or filters.get("date_from")
+    end_time = filters.get("end_time") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("cp.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if symbol:
+        where_parts.append("cp.symbol = :symbol")
+        params["symbol"] = symbol
+    if side:
+        where_parts.append("cp.side = :side")
+        params["side"] = side
+    if status:
+        where_parts.append("cp.status = :status")
+        params["status"] = status
+    if is_liquidatable in {"0", "1"}:
+        where_parts.append("cp.is_liquidatable = :is_liquidatable")
+        params["is_liquidatable"] = _parse_int(is_liquidatable)
+    if start_time:
+        where_parts.append("cp.opened_at >= :start_time")
+        params["start_time"] = start_time
+    if end_time:
+        where_parts.append("cp.opened_at <= :end_time")
+        params["end_time"] = end_time
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM contract_positions cp
+        LEFT JOIN contract_symbols cs ON cs.symbol = cp.symbol
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                cp.id,
+                cp.user_id,
+                cp.symbol,
+                cp.side,
+                cp.leverage,
+                cp.quantity,
+                cp.entry_price,
+                cp.mark_price,
+                cp.margin_amount,
+                cp.unrealized_pnl,
+                cp.realized_pnl,
+                cp.liquidation_price,
+                cp.warning_price,
+                cp.is_liquidatable,
+                cp.status,
+                cp.close_reason,
+                cp.opened_at,
+                cp.closed_at,
+                cs.category,
+                cs.provider
+            {from_sql}
+            {where_sql}
+            ORDER BY cp.opened_at DESC, cp.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        liquidatable_label, liquidatable_badge = _admin_contract_liquidatable_meta(row_dict.get("is_liquidatable"))
+        status_label, status_badge = _admin_contract_position_status_meta(row_dict.get("status"))
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "user_id": row_dict.get("user_id"),
+                "symbol": row_dict.get("symbol") or "",
+                "side": row_dict.get("side") or "",
+                "side_label": _admin_side_label(row_dict.get("side")),
+                "side_badge": _admin_contract_position_badge(row_dict.get("side")),
+                "leverage": int(row_dict.get("leverage") or 0),
+                "leverage_text": _admin_leverage_display(row_dict.get("leverage")),
+                "quantity": _admin_trade_quantity_display(row_dict.get("quantity")),
+                "entry_price": _admin_trade_price_display(row_dict.get("entry_price")),
+                "mark_price": _admin_trade_price_display(row_dict.get("mark_price")),
+                "margin_amount": _admin_usdt_display(row_dict.get("margin_amount")),
+                "unrealized_pnl": _admin_usdt_display(row_dict.get("unrealized_pnl"), signed=True),
+                "unrealized_pnl_class": _admin_pnl_class(row_dict.get("unrealized_pnl")),
+                "realized_pnl": _admin_usdt_display(row_dict.get("realized_pnl"), signed=True),
+                "realized_pnl_class": _admin_pnl_class(row_dict.get("realized_pnl")),
+                "liquidation_price": _admin_trade_price_display(row_dict.get("liquidation_price")),
+                "warning_price": _admin_trade_price_display(row_dict.get("warning_price")),
+                "is_liquidatable_label": liquidatable_label,
+                "is_liquidatable_badge": liquidatable_badge,
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "close_reason": row_dict.get("close_reason") or "-",
+                "opened_at": _admin_datetime_display(row_dict.get("opened_at")),
+                "closed_at": _admin_datetime_display(row_dict.get("closed_at")),
+                "category": row_dict.get("category") or "",
+                "provider": row_dict.get("provider") or "",
+            }
+        )
+
+    return _admin_contract_page_result(
+        items=items,
+        filters={
+            "user_id": user_id,
+            "symbol": symbol,
+            "side": side,
+            "status": status,
+            "is_liquidatable": is_liquidatable,
+            "start_time": start_time,
+            "end_time": end_time,
+            "page": page,
+            "page_size": page_size,
+        },
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+def _admin_contract_liquidation_status_meta(status: Any) -> tuple[str, str]:
+    status_value = str(status or "").strip().upper()
+    labels = {
+        "TRIGGERED": "\u5f85\u5904\u7406",
+        "DONE": "\u5df2\u5f3a\u5e73",
+        "FAILED": "\u5931\u8d25",
+    }
+    badges = {
+        "TRIGGERED": "warning",
+        "DONE": "danger",
+        "FAILED": "secondary",
+    }
+    return labels.get(status_value, status_value or "--"), badges.get(status_value, "secondary")
+
+
+def _admin_contract_liquidation_datetime(value: Any, *, is_end: bool = False) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.max.time() if is_end else datetime.min.time())
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    normalized = text_value.replace("T", " ")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if len(text_value) <= 10:
+            return datetime.combine(parsed.date(), datetime.max.time() if is_end else datetime.min.time())
+        return parsed
+    except ValueError:
+        return None
+
+
+def list_admin_contract_liquidations(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    symbol = _normalize_code(filters.get("symbol"))
+    position_id = str(filters.get("position_id") or "").strip()
+    side = str(filters.get("side") or "").strip().upper()
+    status = str(filters.get("status") or "").strip().upper()
+    start_time = _admin_contract_liquidation_datetime(
+        filters.get("start_time") or filters.get("date_from"),
+        is_end=False,
+    )
+    end_time = _admin_contract_liquidation_datetime(
+        filters.get("end_time") or filters.get("date_to"),
+        is_end=True,
+    )
+    now = datetime.utcnow()
+    used_default_range = start_time is None and end_time is None
+    if used_default_range:
+        start_time = datetime.combine((now - timedelta(days=6)).date(), datetime.min.time())
+        end_time = now
+    elif start_time is None and end_time is not None:
+        start_time = end_time - timedelta(days=6)
+    elif end_time is None and start_time is not None:
+        end_time = now
+    if start_time is not None and end_time is not None and start_time > end_time:
+        start_time, end_time = end_time, start_time
+
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    query_scope = "recent" if used_default_range else "history"
+    precise = any(str(value or "").strip() for value in (user_id, symbol, position_id))
+    base_filters = {
+        "user_id": user_id,
+        "symbol": symbol,
+        "position_id": position_id,
+        "side": side,
+        "status": status,
+        "start_time": start_time,
+        "end_time": end_time,
+        "date_from": start_time,
+        "date_to": end_time,
+        "page": page,
+        "page_size": page_size,
+    }
+    if start_time is not None and end_time is not None and not precise:
+        range_days = (end_time.date() - start_time.date()).days + 1
+        if range_days > 30:
+            result = _admin_contract_page_result(
+                items=[],
+                filters=base_filters,
+                total=0,
+                page=1,
+                page_size=page_size,
+                pages=1,
+                query_scope=query_scope,
+                effective_start_time=start_time,
+                effective_end_time=end_time,
+            )
+            result["performance_notice"] = "\u67e5\u8be2\u8303\u56f4\u8d85\u8fc730\u5929\uff0c\u8bf7\u8f93\u5165\u7528\u6237ID\u3001\u6301\u4ed3ID\u6216\u5408\u7ea6\u54c1\u79cd\u540e\u518d\u67e5\u8be2\u3002"
+            result["summary"] = {"total_count": 0, "done_count": 0, "failed_count": 0, "loss_total": "0.00", "loss_total_class": "pnl-zero"}
+            return result
+
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("clr.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if symbol:
+        where_parts.append("clr.symbol = :symbol")
+        params["symbol"] = symbol
+    if position_id:
+        where_parts.append("clr.position_id = :position_id")
+        params["position_id"] = _parse_int(position_id)
+    if side:
+        where_parts.append("clr.side = :side")
+        params["side"] = side
+    if status:
+        where_parts.append("clr.status = :status")
+        params["status"] = status
+    if start_time is not None:
+        where_parts.append("clr.created_at >= :start_time")
+        params["start_time"] = start_time
+    if end_time is not None:
+        where_parts.append("clr.created_at <= :end_time")
+        params["end_time"] = end_time
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    from_sql = """
+        FROM contract_liquidation_records clr
+        LEFT JOIN contract_positions cp ON cp.id = clr.position_id
+        LEFT JOIN contract_symbols cs ON cs.symbol = clr.symbol
+        LEFT JOIN (
+            SELECT position_id, MAX(id) AS close_order_id
+            FROM contract_orders
+            WHERE action = 'CLOSE' AND fail_reason = 'LIQUIDATION'
+            GROUP BY position_id
+        ) lo ON lo.position_id = clr.position_id
+    """
+    total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+    page, page_size, pages = _admin_page_meta(total, page, page_size)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                clr.id,
+                clr.user_id,
+                clr.position_id,
+                clr.symbol,
+                clr.side,
+                COALESCE(cp.side, clr.side) AS position_side,
+                clr.leverage,
+                clr.quantity,
+                clr.entry_price,
+                clr.mark_price,
+                clr.liquidation_price,
+                clr.margin_amount,
+                clr.unrealized_pnl,
+                clr.remaining_amount,
+                clr.status,
+                clr.created_at,
+                clr.updated_at,
+                lo.close_order_id,
+                cs.category,
+                cs.provider
+            {from_sql}
+            {where_sql}
+            ORDER BY clr.created_at DESC, clr.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    ).mappings().all()
+
+    summary_row = db.execute(
+        text(
+            f"""
+            SELECT
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN clr.status = 'DONE' THEN 1 ELSE 0 END) AS done_count,
+                SUM(CASE WHEN clr.status = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
+                COALESCE(SUM(clr.unrealized_pnl), 0) AS loss_total
+            {from_sql}
+            {where_sql}
+            """
+        ),
+        params,
+    ).mappings().first()
+    summary = dict(summary_row or {})
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_label, status_badge = _admin_contract_liquidation_status_meta(row_dict.get("status"))
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "user_id": row_dict.get("user_id"),
+                "position_id": row_dict.get("position_id"),
+                "order_id": row_dict.get("close_order_id") or "--",
+                "close_order_id": row_dict.get("close_order_id") or "--",
+                "symbol": row_dict.get("symbol") or "",
+                "side": row_dict.get("side") or "",
+                "side_label": _admin_side_label(row_dict.get("side")),
+                "side_badge": _admin_contract_position_badge(row_dict.get("side")),
+                "position_side": row_dict.get("position_side") or row_dict.get("side") or "",
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "leverage_text": _admin_leverage_display(row_dict.get("leverage")),
+                "quantity": _admin_trade_quantity_display(row_dict.get("quantity")),
+                "entry_price": _admin_trade_price_display(row_dict.get("entry_price")),
+                "mark_price": _admin_trade_price_display(row_dict.get("mark_price")),
+                "liquidation_price": _admin_trade_price_display(row_dict.get("liquidation_price")),
+                "margin_amount": _admin_usdt_display(row_dict.get("margin_amount")),
+                "unrealized_pnl": _admin_usdt_display(row_dict.get("unrealized_pnl"), signed=True),
+                "pnl_class": _admin_pnl_class(row_dict.get("unrealized_pnl")),
+                "remaining_amount": _admin_usdt_display(row_dict.get("remaining_amount")),
+                "reason": "--",
+                "error": "--",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "executed_at": _admin_datetime_display(row_dict.get("updated_at")) if str(row_dict.get("status") or "").upper() == "DONE" else "--",
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+                "category": row_dict.get("category") or "",
+                "provider": row_dict.get("provider") or "",
+            }
+        )
+
+    loss_total = summary.get("loss_total") if summary else 0
+    result = _admin_contract_page_result(
+        items=items,
+        filters=base_filters,
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+        query_scope=query_scope,
+        effective_start_time=start_time,
+        effective_end_time=end_time,
+    )
+    result["summary"] = {
+        "total_count": int(summary.get("total_count") or 0),
+        "done_count": int(summary.get("done_count") or 0),
+        "failed_count": int(summary.get("failed_count") or 0),
+        "loss_total": _admin_usdt_display(loss_total, signed=True),
+        "loss_total_class": _admin_pnl_class(loss_total),
+    }
+    return result
+
+
+def _admin_read_error_page(function_name: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    logger.exception("%s query failed", function_name)
+    return _empty_page(filters=filters or {})
+
+
+def _admin_lock_status_meta(status: Any) -> tuple[str, str]:
+    status_value = str(status or "").strip().upper()
+    labels = {
+        "ACTIVE": "进行中",
+        "RELEASED": "已完成",
+        "COMPLETED": "已完成",
+        "CANCELED": "已结束",
+        "CANCELLED": "已结束",
+        "EXPIRED": "已结束",
+        "ENDED": "已结束",
+    }
+    badges = {
+        "ACTIVE": "warning",
+        "RELEASED": "success",
+        "COMPLETED": "success",
+        "CANCELED": "danger",
+        "CANCELLED": "danger",
+        "EXPIRED": "neutral",
+        "ENDED": "neutral",
+    }
+    return labels.get(status_value, status_value or "--"), badges.get(status_value, "neutral")
+
+
+def _admin_active_meta(value: Any) -> tuple[str, str]:
+    try:
+        enabled = int(value or 0) == 1
+    except Exception:
+        enabled = False
+    return ("启用", "success") if enabled else ("停用", "danger")
+
+
+def _admin_percent_number_display(value: Any) -> str:
+    amount = _parse_decimal(value)
+    text_value = format((amount * Decimal("100")).quantize(Decimal("0.0001")).normalize(), "f")
+    return "0" if text_value == "-0" else text_value
+
+
+def _admin_stock_token_clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _admin_stock_token_has_garbled_text(value: Any) -> bool:
+    text_value = _admin_stock_token_clean_text(value)
+    if not text_value:
+        return False
+    return "?" in text_value or "\ufffd" in text_value
+
+
+def _admin_stock_token_display_name(row: Dict[str, Any]) -> str:
+    display_name = _admin_stock_token_clean_text(row.get("display_name"))
+    if display_name and not _admin_stock_token_has_garbled_text(display_name):
+        return display_name
+
+    lock_symbol = _admin_stock_token_clean_text(row.get("lock_symbol"))
+    trade_symbol = _admin_stock_token_clean_text(row.get("trade_symbol"))
+    if lock_symbol and trade_symbol:
+        return f"{lock_symbol} 到 {trade_symbol}"
+    return lock_symbol or trade_symbol or "当前批次"
+
+
+def _admin_stock_token_detail_subtitle(row: Dict[str, Any]) -> str:
+    lock_symbol = _admin_stock_token_clean_text(row.get("lock_symbol"))
+    trade_symbol = _admin_stock_token_clean_text(row.get("trade_symbol"))
+    if lock_symbol and trade_symbol:
+        return f"{lock_symbol} 到 {trade_symbol} 的锁仓、释放与兑换进度。"
+    return "当前批次的锁仓、释放与兑换进度。"
+
+
+def _admin_stock_token_compact_amount(value: Any) -> str:
+    amount = _parse_decimal(value)
+    rounded = amount.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    text_value = format(rounded.normalize(), "f")
+    return "0" if text_value == "-0" else text_value
+
+
+def _admin_stock_token_date_only(value: Any) -> str:
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    text_value = str(value or "").strip()
+    return text_value[:10] if text_value else ""
+
+
+def _admin_stock_token_lock_days(row: Dict[str, Any]) -> str:
+    lock_days = _parse_int(row.get("lock_days"), 0)
+    if lock_days > 0:
+        return f"{lock_days}天"
+
+    start_value = row.get("start_at")
+    end_value = row.get("end_at")
+    if hasattr(start_value, "date") and hasattr(end_value, "date"):
+        days = (end_value.date() - start_value.date()).days
+        if days > 0:
+            return f"{days}天"
+    return "--"
+
+
+def _admin_stock_lock_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    total_amount = _parse_decimal(row.get("total_amount"))
+    locked_amount = _parse_decimal(row.get("locked_amount"))
+    available_amount = _parse_decimal(row.get("available_amount"))
+    converted_amount = _parse_decimal(row.get("converted_amount"))
+    released_amount = total_amount - locked_amount
+    if released_amount < Decimal("0"):
+        released_amount = Decimal("0")
+    if total_amount > 0:
+        progress = (released_amount / total_amount * Decimal("100")).quantize(Decimal("0.01"))
+    else:
+        progress = Decimal("0")
+    if progress < 0:
+        progress = Decimal("0")
+    if progress > 100:
+        progress = Decimal("100")
+    status_label, status_badge = _admin_lock_status_meta(row.get("status"))
+    start_at = _admin_datetime_display(row.get("start_at"))
+    end_at = _admin_datetime_display(row.get("end_at"))
+    conversion_rate = row.get("conversion_rate_snapshot") or row.get("conversion_rate") or "1"
+    current_rate = row.get("current_conversion_rate") or row.get("conversion_rate") or conversion_rate
+    daily_rate = row.get("daily_release_rate_snapshot") or row.get("daily_release_rate") or "0"
+    display_name = _admin_stock_token_display_name(row)
+    return {
+        "id": row.get("id"),
+        "user_id": row.get("user_id"),
+        "config_id": row.get("config_id"),
+        "lock_symbol": row.get("lock_symbol") or "",
+        "display_name": display_name,
+        "detail_subtitle": _admin_stock_token_detail_subtitle(row),
+        "trade_symbol": row.get("trade_symbol") or "",
+        "conversion_rate_text": _admin_amount_display(conversion_rate),
+        "conversion_rate_compact_text": _admin_stock_token_compact_amount(conversion_rate),
+        "current_conversion_rate_text": _admin_amount_display(current_rate),
+        "daily_release_rate_percent": _admin_percent_number_display(daily_rate),
+        "total_amount_text": _admin_amount_display(total_amount),
+        "total_amount_compact_text": _admin_stock_token_compact_amount(total_amount),
+        "released_amount_text": _admin_amount_display(released_amount),
+        "released_amount_compact_text": _admin_stock_token_compact_amount(released_amount),
+        "locked_amount_text": _admin_amount_display(locked_amount),
+        "locked_amount_compact_text": _admin_stock_token_compact_amount(locked_amount),
+        "available_amount_text": _admin_amount_display(available_amount),
+        "available_amount_compact_text": _admin_stock_token_compact_amount(available_amount),
+        "converted_amount_text": _admin_amount_display(converted_amount),
+        "converted_amount_compact_text": _admin_stock_token_compact_amount(converted_amount),
+        "release_progress": _admin_amount_display(progress),
+        "release_progress_ratio": _admin_amount_display(progress),
+        "lock_period_text": f"{start_at} ~ {end_at}" if start_at or end_at else "",
+        "lock_days_text": _admin_stock_token_lock_days(row),
+        "start_date_text": _admin_stock_token_date_only(row.get("start_at")),
+        "end_date_text": _admin_stock_token_date_only(row.get("end_at")),
+        "unlock_at": end_at,
+        "status": row.get("status") or "",
+        "status_label": status_label,
+        "status_badge": status_badge,
+        "source_type": row.get("source_type") or "",
+        "source_id": row.get("source_id"),
+        "created_at": _admin_datetime_display(row.get("created_at")),
+        "updated_at": _admin_datetime_display(row.get("updated_at")),
+        "can_force_release": locked_amount > 0 and str(row.get("status") or "").upper() == "ACTIVE",
+    }
+
+
+def admin_get_stock_token_lock_config(db: Session, config_id: int) -> Optional[Dict[str, Any]]:
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT id, lock_symbol, trade_symbol, display_name, lock_days,
+                       daily_release_rate, conversion_rate, is_active, remark,
+                       created_at, updated_at
+                FROM stock_token_lock_configs
+                WHERE id = :id
+                """
+            ),
+            {"id": int(config_id)},
+        ).mappings().first()
+    except Exception:
+        logger.exception("admin_get_stock_token_lock_config query failed")
+        return None
+    if not row:
+        return None
+    row_dict = dict(row)
+    return {
+        **row_dict,
+        "daily_release_rate": _admin_amount_display(row_dict.get("daily_release_rate")),
+        "conversion_rate": _admin_amount_display(row_dict.get("conversion_rate")),
+        "is_active": str(int(row_dict.get("is_active") or 0)),
+        "lock_symbols_locked": True,
+    }
+
+
+def admin_query_stock_token_lock_configs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    lock_symbol = _normalize_code(filters.get("lock_symbol"))
+    trade_symbol = _normalize_code(filters.get("trade_symbol"))
+    is_active = str(filters.get("is_active") or "").strip()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if lock_symbol:
+        where_parts.append("lock_symbol LIKE :lock_symbol")
+        params["lock_symbol"] = f"%{lock_symbol}%"
+    if trade_symbol:
+        where_parts.append("trade_symbol LIKE :trade_symbol")
+        params["trade_symbol"] = f"%{trade_symbol}%"
+    if is_active in {"0", "1"}:
+        where_parts.append("is_active = :is_active")
+        params["is_active"] = int(is_active)
+    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+    try:
+        total = int(
+            db.execute(text(f"SELECT COUNT(*) FROM stock_token_lock_configs {where_sql}"), params).scalar() or 0
+        )
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT id, lock_symbol, trade_symbol, display_name, lock_days,
+                       daily_release_rate, conversion_rate, is_active, remark, created_at, updated_at
+                FROM stock_token_lock_configs
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except Exception:
+        return _admin_read_error_page("admin_query_stock_token_lock_configs", filters)
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        active_label, active_badge = _admin_active_meta(row_dict.get("is_active"))
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "lock_symbol": row_dict.get("lock_symbol") or "",
+                "trade_symbol": row_dict.get("trade_symbol") or "",
+                "display_name": row_dict.get("display_name") or "",
+                "lock_days": int(row_dict.get("lock_days") or 0),
+                "daily_release_rate": _admin_amount_display(row_dict.get("daily_release_rate")),
+                "conversion_rate": _admin_amount_display(row_dict.get("conversion_rate")),
+                "is_active": int(row_dict.get("is_active") or 0),
+                "active_label": active_label,
+                "active_badge": active_badge,
+                "remark": row_dict.get("remark") or "",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+                "updated_at": _admin_datetime_display(row_dict.get("updated_at")),
+            }
+        )
+    return _empty_page(
+        items=items,
+        filters={**filters, "lock_symbol": lock_symbol, "trade_symbol": trade_symbol, "is_active": is_active},
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+def _admin_stock_token_lock_config_form_from_payload(
+    payload: Dict[str, Any],
+    existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    existing = existing or {}
+
+    def field_value(key: str, default: Any = "") -> Any:
+        return payload[key] if key in payload else existing.get(key, default)
+
+    lock_symbol = _normalize_code(field_value("lock_symbol"))
+    trade_symbol = _normalize_code(field_value("trade_symbol"))
+    display_name_value = str(field_value("display_name") or "").strip()
+    if existing and not display_name_value:
+        display_name_value = str(existing.get("display_name") or "").strip()
+    return {
+        "id": existing.get("id"),
+        "lock_symbol": lock_symbol,
+        "trade_symbol": trade_symbol,
+        "display_name": display_name_value,
+        "lock_days": str(field_value("lock_days", "90") or "90").strip(),
+        "daily_release_rate": str(field_value("daily_release_rate", "0.05000000") or "0.05000000").strip(),
+        "conversion_rate": str(field_value("conversion_rate", "1.000000000000000000") or "1.000000000000000000").strip(),
+        "is_active": str(field_value("is_active", "1") if field_value("is_active", "1") is not None else "1").strip(),
+        "remark": str(field_value("remark") or "").strip(),
+        "lock_symbols_locked": bool(existing.get("lock_symbols_locked")),
+    }
+
+
+def _validate_admin_stock_token_lock_config_form(form: Dict[str, Any]) -> tuple[Dict[str, Any], list[str]]:
+    errors: list[str] = []
+    if not form["lock_symbol"]:
+        errors.append("锁仓币种不能为空")
+    if not form["trade_symbol"]:
+        errors.append("释放/兑换币种不能为空")
+    if form["lock_symbol"] and form["trade_symbol"] and form["lock_symbol"] == form["trade_symbol"]:
+        errors.append("锁仓币种和释放/兑换币种不能相同")
+    if form["is_active"] not in {"0", "1"}:
+        errors.append("启用状态不正确")
+
+    try:
+        lock_days = int(form["lock_days"])
+    except Exception:
+        lock_days = 0
+        errors.append("锁定期格式不正确")
+    if lock_days < 1:
+        errors.append("锁定期必须大于 0")
+
+    try:
+        daily_release_rate = Decimal(str(form["daily_release_rate"]).strip())
+    except (InvalidOperation, ValueError):
+        daily_release_rate = Decimal("0")
+        errors.append("解锁后每日释放比例格式不正确")
+    if daily_release_rate <= 0 or daily_release_rate > 1:
+        errors.append("解锁后每日释放比例必须大于 0 且不超过 1")
+
+    try:
+        conversion_rate = Decimal(str(form["conversion_rate"]).strip())
+    except (InvalidOperation, ValueError):
+        conversion_rate = Decimal("0")
+        errors.append("兑换比例格式不正确")
+    if conversion_rate <= 0:
+        errors.append("兑换比例必须大于 0")
+
+    display_name = form["display_name"] or (
+        f"{form['lock_symbol']} 到 {form['trade_symbol']}" if form["lock_symbol"] and form["trade_symbol"] else ""
+    )
+    values = {
+        "lock_symbol": form["lock_symbol"],
+        "trade_symbol": form["trade_symbol"],
+        "display_name": display_name,
+        "lock_days": lock_days,
+        "daily_release_rate": daily_release_rate,
+        "conversion_rate": conversion_rate,
+        "is_active": int(form["is_active"]) if form["is_active"] in {"0", "1"} else 0,
+        "remark": form["remark"] or None,
+    }
+    return values, errors
+
+
+def admin_create_stock_token_lock_config(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    form = _admin_stock_token_lock_config_form_from_payload(payload)
+    values, errors = _validate_admin_stock_token_lock_config_form(form)
+    if errors:
+        return {"ok": False, "errors": errors, "form": form}
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO stock_token_lock_configs (
+                    lock_symbol, trade_symbol, display_name, lock_days,
+                    daily_release_rate, conversion_rate, is_active, remark,
+                    created_at, updated_at
+                ) VALUES (
+                    :lock_symbol, :trade_symbol, :display_name, :lock_days,
+                    :daily_release_rate, :conversion_rate, :is_active, :remark,
+                    UTC_TIMESTAMP(), UTC_TIMESTAMP()
+                )
+                """
+            ),
+            values,
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["股票锁仓配置已存在或不满足唯一性约束"], "form": form}
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_create_stock_token_lock_config failed")
+        return {"ok": False, "errors": ["股票锁仓配置创建失败"], "form": form}
+    return {"ok": True, "errors": [], "form": form}
+
+
+def admin_update_stock_token_lock_config(db: Session, config_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    current = admin_get_stock_token_lock_config(db, config_id)
+    if not current:
+        return {"ok": False, "not_found": True, "errors": ["股票锁仓配置不存在"], "form": {}}
+    form = _admin_stock_token_lock_config_form_from_payload(payload, current)
+    values, errors = _validate_admin_stock_token_lock_config_form(form)
+    values["config_id"] = int(config_id)
+    if errors:
+        return {"ok": False, "errors": errors, "form": form}
+    try:
+        result = db.execute(
+            text(
+                """
+                UPDATE stock_token_lock_configs
+                SET lock_symbol = :lock_symbol,
+                    trade_symbol = :trade_symbol,
+                    display_name = :display_name,
+                    lock_days = :lock_days,
+                    daily_release_rate = :daily_release_rate,
+                    conversion_rate = :conversion_rate,
+                    is_active = :is_active,
+                    remark = :remark,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :config_id
+                """
+            ),
+            values,
+        )
+        if result.rowcount == 0:
+            db.rollback()
+            return {"ok": False, "not_found": True, "errors": ["股票锁仓配置不存在"], "form": form}
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "errors": ["股票锁仓配置不满足唯一性或表约束"], "form": form}
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_update_stock_token_lock_config failed")
+        return {"ok": False, "errors": ["股票锁仓配置更新失败"], "form": form}
+    return {"ok": True, "errors": [], "form": form}
+
+
+def admin_toggle_stock_token_lock_config_active(db: Session, config_id: int) -> Dict[str, Any]:
+    current = admin_get_stock_token_lock_config(db, config_id)
+    if not current:
+        return {"ok": False, "message": "股票锁仓配置不存在"}
+    current_active = _parse_int(current.get("is_active"), 0)
+    next_active = 0 if current_active == 1 else 1
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE stock_token_lock_configs
+                SET is_active = :is_active, updated_at = UTC_TIMESTAMP()
+                WHERE id = :config_id
+                """
+            ),
+            {"is_active": next_active, "config_id": int(config_id)},
+        )
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("admin_toggle_stock_token_lock_config_active failed")
+        return {"ok": False, "message": "股票锁仓配置状态更新失败"}
+    return {"ok": True, "message": "股票锁仓配置已启用" if next_active == 1 else "股票锁仓配置已停用"}
+
+
+def admin_query_stock_token_locks(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    user_id = str(filters.get("user_id") or "").strip()
+    lock_symbol = _normalize_code(filters.get("lock_symbol"))
+    status = str(filters.get("status") or "").strip().upper()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if user_id:
+        where_parts.append("l.user_id = :user_id")
+        params["user_id"] = _parse_int(user_id)
+    if lock_symbol:
+        where_parts.append("l.lock_symbol LIKE :lock_symbol")
+        params["lock_symbol"] = f"%{lock_symbol}%"
+    if status:
+        where_parts.append("l.status = :status")
+        params["status"] = status
+    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+    from_sql = """
+        FROM user_stock_token_locks l
+        LEFT JOIN stock_token_lock_configs c ON c.id = l.config_id
+    """
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT l.id, l.user_id, l.config_id, l.lock_symbol, l.total_amount, l.locked_amount,
+                       l.available_amount, l.converted_amount, l.conversion_rate_snapshot,
+                       l.daily_release_rate_snapshot, l.start_at, l.end_at, l.status, l.source_type,
+                       l.source_id, l.created_at, l.updated_at, c.display_name, c.trade_symbol,
+                       c.lock_days, c.conversion_rate AS current_conversion_rate, c.daily_release_rate
+                {from_sql}
+                {where_sql}
+                ORDER BY l.created_at DESC, l.id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except Exception:
+        return _admin_read_error_page("admin_query_stock_token_locks", filters)
+
+    items = [_admin_stock_lock_item(dict(row)) for row in rows]
+    return _empty_page(
+        items=items,
+        filters={**filters, "user_id": user_id, "lock_symbol": lock_symbol, "status": status},
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+def admin_get_stock_token_lock_detail(db: Session, lock_item_id: int) -> Optional[Dict[str, Any]]:
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT l.id, l.user_id, l.config_id, l.lock_symbol, l.total_amount, l.locked_amount,
+                       l.available_amount, l.converted_amount, l.conversion_rate_snapshot,
+                       l.daily_release_rate_snapshot, l.start_at, l.end_at, l.status, l.source_type,
+                       l.source_id, l.created_at, l.updated_at, c.display_name, c.trade_symbol,
+                       c.lock_days, c.conversion_rate AS current_conversion_rate, c.daily_release_rate
+                FROM user_stock_token_locks l
+                LEFT JOIN stock_token_lock_configs c ON c.id = l.config_id
+                WHERE l.id = :id
+                """
+            ),
+            {"id": int(lock_item_id)},
+        ).mappings().first()
+    except Exception:
+        logger.exception("admin_get_stock_token_lock_detail query failed")
+        return None
+    return _admin_stock_lock_item(dict(row)) if row else None
+
+
+def admin_query_stock_token_release_logs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    trigger_type = str(filters.get("trigger_type") or "").strip().upper()
+    status = str(filters.get("status") or "").strip().upper()
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if trigger_type:
+        where_parts.append("trigger_type = :trigger_type")
+        params["trigger_type"] = trigger_type
+    if status:
+        where_parts.append("status = :status")
+        params["status"] = status
+    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+    try:
+        total = int(db.execute(text(f"SELECT COUNT(*) FROM stock_token_release_logs {where_sql}"), params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT id, run_time, trigger_type, status, scanned_count, released_count,
+                       total_release_amount, item_ids, message, error_message, created_at
+                FROM stock_token_release_logs
+                {where_sql}
+                ORDER BY run_time DESC, id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except Exception:
+        return _admin_read_error_page("admin_query_stock_token_release_logs", filters)
+
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        status_label, status_badge = _admin_system_status_meta(row_dict.get("status"))
+        trigger_type_label = _admin_system_type_label(row_dict.get("trigger_type") or "STOCK_RELEASE")
+        items.append(
+            {
+                "id": row_dict.get("id"),
+                "run_time": _admin_datetime_display(row_dict.get("run_time")),
+                "trigger_type": row_dict.get("trigger_type") or "",
+                "trigger_type_label": trigger_type_label,
+                "status": row_dict.get("status") or "",
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "scanned_count": int(row_dict.get("scanned_count") or 0),
+                "released_count": int(row_dict.get("released_count") or 0),
+                "total_release_amount": _fmt_admin_amount_display(row_dict.get("total_release_amount"), ""),
+                "item_ids": row_dict.get("item_ids") or "",
+                "item_ids_short": _admin_short_text(row_dict.get("item_ids"), 18, 8),
+                "message": row_dict.get("message") or "-",
+                "error_message": row_dict.get("error_message") or "",
+                "created_at": _admin_datetime_display(row_dict.get("created_at")),
+            }
+        )
+    return _empty_page(
+        items=items,
+        filters={**filters, "trigger_type": trigger_type, "status": status},
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+COLLECTION_OP_WAITING_STATUSES = ("PENDING", "QUEUED")
+COLLECTION_OP_PROCESSING_STATUSES = ("RUNNING", "PROCESSING", "SENDING", "READY", "GAS_REQUIRED", "GAS_QUEUED", "CONFIRMING")
+COLLECTION_OP_SENT_STATUSES = ("SENT", "GAS_SENT")
+COLLECTION_OP_SUCCESS_STATUSES = ("CONFIRMED", "SUCCESS", "COMPLETED")
+COLLECTION_OP_FAILED_STATUSES = ("FAILED", "ERROR")
+COLLECTION_OP_TIMEOUT_STATUSES = ("TIMEOUT",)
+COLLECTION_OP_CANCELED_STATUSES = ("CANCELED", "CANCELLED")
+COLLECTION_TASK_MANUAL_RETRY_STATUSES = ("FAILED", "SKIPPED", "TIMEOUT", "PENDING")
+COLLECTION_OP_ACTIVE_STATUSES = (
+    *COLLECTION_OP_WAITING_STATUSES,
+    *COLLECTION_OP_PROCESSING_STATUSES,
+    *COLLECTION_OP_SENT_STATUSES,
+)
+COLLECTION_OP_TERMINAL_STATUSES = (
+    *COLLECTION_OP_SUCCESS_STATUSES,
+    *COLLECTION_OP_FAILED_STATUSES,
+    *COLLECTION_OP_TIMEOUT_STATUSES,
+    *COLLECTION_OP_CANCELED_STATUSES,
+)
+
+
+def is_collection_task_retryable(status: Any, tx_hash: Any, retry_count: Any, max_retry: Any) -> bool:
+    status_value = str(status or "").strip().upper()
+    tx_hash_value = str(tx_hash or "").strip()
+    if status_value not in COLLECTION_TASK_MANUAL_RETRY_STATUSES or tx_hash_value:
+        return False
+    try:
+        retry_count_value = int(retry_count or 0)
+    except Exception:
+        retry_count_value = 0
+    try:
+        max_retry_value = int(max_retry or 0)
+    except Exception:
+        max_retry_value = 0
+    return retry_count_value < max_retry_value
+
+
+def _is_legacy_collection_gas_required_failure_value(status: Any, reason: Any, last_error: Any, tx_hash: Any) -> bool:
+    if str(tx_hash or "").strip():
+        return False
+    if str(status or "").strip().upper() != "FAILED":
+        return False
+    text_value = f"{last_error or ''} {reason or ''}".upper()
+    return any(
+        marker in text_value
+        for marker in (
+            "DRY_RUN_GAS_REQUIRED",
+            "GAS_REQUIRED",
+            "CREATE A POSITIVE TOPUP GAS TASK",
+        )
+    )
+
+
+def _collection_finished_at_display(row: Dict[str, Any]) -> str:
+    status = str(row.get("status") or "").strip().upper()
+    if status not in COLLECTION_OP_TERMINAL_STATUSES:
+        return ""
+    if status in COLLECTION_OP_SUCCESS_STATUSES:
+        return _admin_datetime_display(row.get("confirmed_at") or row.get("finished_at") or row.get("updated_at"))
+    return _admin_datetime_display(row.get("finished_at") or row.get("updated_at") or row.get("confirmed_at") or row.get("sent_at"))
+
+
+def _collection_failure_reason(value: Any) -> Dict[str, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return {"full": "", "label": "-", "short": "-"}
+    upper = raw.upper()
+    if "MASTER_SWITCH_OFF" in upper:
+        label = "真实发送总闸未开启，请开启基础设施安全开关后再发送。"
+    elif "COLLECT_SYMBOL_NOT_ALLOWED" in upper:
+        label = "归集币种未加入真实归集白名单，请先在归集安全配置中允许该币种后重试。"
+    elif "CHAIN_NOT_ALLOWED" in upper:
+        label = "当前网络未开启真实归集，请先在链配置中启用后重试。"
+    elif "TARGET_ADDRESS_NOT_ALLOWED" in upper:
+        label = "归集目标地址未通过真实归集白名单校验，请检查归集地址配置。"
+    elif "ASSET_CHAIN_NOT_ALLOWED" in upper:
+        label = "币种网络未开启真实归集，请先在币种网络配置中启用后重试。"
+    elif "COLLECT_SINGLE_LIMIT_EXCEEDED" in upper:
+        label = "超过单笔归集上限，请调整归集安全配置后重试。"
+    elif "COLLECT_DAILY_LIMIT_EXCEEDED" in upper:
+        label = "超过每日归集上限，请调整归集安全配置后重试。"
+    elif upper.startswith("DRY_RUN_NOT_COLLECTIBLE"):
+        label = "低于最小归集额"
+    elif upper.startswith("AVAILABLE_AMOUNT_BELOW_MIN_COLLECT"):
+        label = "低于最小归集额"
+    elif upper.startswith("PRECHECK"):
+        label = "预检失败"
+    elif upper.startswith("RPC"):
+        label = "RPC异常"
+    elif upper.startswith("GAS"):
+        label = "Gas不足"
+    else:
+        label = raw
+    return {"full": raw, "label": label, "short": _admin_short_text(label, 24, 8)}
+
+
+def _collection_tx_hash_meta(value: Any) -> Dict[str, Any]:
+    tx_hash = str(value or "").strip()
+    return {
+        "tx_hash": tx_hash,
+        "tx_hash_short": _short_admin_hash(tx_hash) if tx_hash else "",
+        "tx_hash_display": _short_admin_hash(tx_hash) if tx_hash else "未生成",
+        "has_tx_hash": bool(tx_hash),
+        "is_dry_run_tx_hash": _is_collection_dry_run_hash(tx_hash),
+    }
+
+
+def _is_collection_dry_run_hash(value: Any) -> bool:
+    tx_hash = str(value or "").strip().upper()
+    return bool(tx_hash.startswith("DRYGAS_") or tx_hash.startswith("DRYRUN_"))
+
+
+def _is_guard_rejected_error(value: Any) -> bool:
+    return "GUARD_REJECTED" in str(value or "").upper()
+
+
+def _collection_is_dry_run_tx_sql(column_name: str) -> str:
+    return f"(UPPER(COALESCE({column_name}, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE({column_name}, '')) LIKE 'DRYGAS_%')"
+
+
+def _collection_amount_summary_from_raw(
+    raw: Any,
+    *,
+    fallback_amount: Any = None,
+    fallback_symbol: Any = "",
+) -> Dict[str, Any]:
+    amounts: Dict[str, Decimal] = {}
+    raw_text = str(raw or "").strip()
+    if raw_text:
+        for part in raw_text.split("|"):
+            if ":" not in part:
+                continue
+            symbol, amount_text = part.split(":", 1)
+            symbol = _normalize_code(symbol) or "--"
+            try:
+                amount = Decimal(str(amount_text or "0"))
+            except Exception:
+                amount = Decimal("0")
+            amounts[symbol] = amounts.get(symbol, Decimal("0")) + amount
+    if not amounts:
+        symbol = _normalize_code(fallback_symbol)
+        if symbol:
+            try:
+                amount = Decimal(str(fallback_amount if fallback_amount is not None else "0"))
+            except Exception:
+                amount = Decimal("0")
+            amounts[symbol] = amount
+    items = []
+    for symbol, amount in sorted(amounts.items()):
+        if amount <= 0:
+            continue
+        amount_text = _fmt_admin_amount_display(amount, symbol)
+        items.append(
+            {
+                "coin_symbol": symbol,
+                "amount": amount_text,
+                "amount_label": f"{amount_text} {symbol}".strip(),
+                "detail_label": f"{symbol} {amount_text}".strip(),
+            }
+        )
+    if not items:
+        return {
+            "label": "-",
+            "detail_label": "",
+            "items": [],
+            "coin_count": 0,
+            "is_multi_coin": False,
+        }
+    if len(items) == 1:
+        label = items[0]["amount_label"]
+    else:
+        label = f"{len(items)} 个币种"
+    return {
+        "label": label,
+        "detail_label": " / ".join(item["detail_label"] for item in items),
+        "items": items,
+        "coin_count": len(items),
+        "is_multi_coin": len(items) > 1,
+    }
+
+
+def _collection_task_gas_status(row: Dict[str, Any]) -> Dict[str, str]:
+    task_status = str(row.get("status") or "").strip().upper()
+    gas_task_id = row.get("gas_task_id")
+    gas_task_status = str(row.get("gas_task_status") or "").strip().upper()
+    gas_tx_hash = str(row.get("gas_tx_hash") or "").strip()
+    gas_confirmed_at = row.get("gas_confirmed_at")
+    gas_has_real_tx = bool(gas_tx_hash and not _is_collection_dry_run_hash(gas_tx_hash))
+    gas_is_dry_run = _is_collection_dry_run_hash(gas_tx_hash)
+    gas_coin_symbol = str(row.get("gas_topup_coin_symbol") or "").strip().upper()
+    gas_topup_raw = row.get("gas_topup_amount")
+    has_topup_amount = gas_topup_raw is not None and str(gas_topup_raw).strip() != ""
+    if has_topup_amount:
+        gas_topup_amount = _fmt_admin_amount_display(gas_topup_raw, gas_coin_symbol)
+        gas_topup_label = f"{gas_topup_amount} {gas_coin_symbol}".strip()
+    else:
+        gas_topup_amount = ""
+        gas_topup_label = "待补Gas" if gas_task_id else "-"
+
+    if not gas_task_id:
+        if task_status in {"GAS_REQUIRED", "GAS_QUEUED", "WAIT_GAS", "WAITING_GAS"}:
+            gas_topup_label = "待补Gas"
+            gas_status_label = "待补Gas"
+            gas_status_badge = "warning"
+        else:
+            gas_topup_label = "-"
+            gas_status_label = "无需Gas"
+            gas_status_badge = "neutral"
+        return {
+            "gas_task_status": "",
+            "gas_topup_amount": gas_topup_amount,
+            "gas_topup_coin_symbol": gas_coin_symbol,
+            "gas_topup_label": gas_topup_label,
+            "gas_status_label": gas_status_label,
+            "gas_status_badge": gas_status_badge,
+            "gas_tx_hash": "",
+            "gas_tx_hash_short": "",
+            "gas_tx_hash_display": "未生成",
+            "gas_has_tx_hash": False,
+            "gas_can_confirm_requeue": False,
+        }
+    if gas_task_status in {"FAILED", "ERROR"}:
+        label, badge = "Gas失败", "danger"
+    elif gas_is_dry_run:
+        label, badge = "待补Gas", "warning"
+    elif gas_task_status == "SENDING":
+        label, badge = "Gas发送中", "info"
+    elif gas_task_status in {"SENT", "GAS_SENT"} and gas_has_real_tx:
+        label, badge = "Gas确认中", "info"
+    elif gas_task_status in {"SUCCESS", "COMPLETED", "CONFIRMED"} and gas_has_real_tx:
+        label, badge = "已补Gas", "success"
+    elif gas_task_status in {"SUCCESS", "COMPLETED", "CONFIRMED"}:
+        label, badge = "待补Gas", "warning"
+    elif gas_task_status in {"PENDING", "QUEUED"}:
+        label, badge = "待补Gas", "warning"
+    elif gas_task_status in {"RUNNING", "PROCESSING"}:
+        label, badge = "Gas处理中", "info"
+    elif gas_task_status in {"SKIPPED", "CANCELED", "CANCELLED"}:
+        label, badge = "待补Gas", "warning"
+    else:
+        label, badge = "待补Gas", "warning"
+    gas_tx_hash_short = _short_admin_hash(gas_tx_hash) if gas_tx_hash else ""
+    return {
+        "gas_task_status": gas_task_status,
+        "gas_topup_amount": gas_topup_amount,
+        "gas_topup_coin_symbol": gas_coin_symbol,
+        "gas_topup_label": gas_topup_label,
+        "gas_tx_hash": gas_tx_hash,
+        "gas_tx_hash_short": gas_tx_hash_short,
+        "gas_tx_hash_display": gas_tx_hash_short if gas_tx_hash else "未生成",
+        "gas_has_tx_hash": bool(gas_tx_hash),
+        "gas_is_dry_run": gas_is_dry_run,
+        "gas_has_real_tx": gas_has_real_tx,
+        "gas_confirmed_at": _admin_datetime_display(gas_confirmed_at),
+        "gas_can_confirm_requeue": bool(
+            gas_task_status in {"SENT", "GAS_SENT"}
+            and gas_has_real_tx
+            and not gas_confirmed_at
+        ),
+        "gas_status_label": label,
+        "gas_status_badge": badge,
+    }
+
+
+def _admin_collection_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    if row.get("task_status_aggregate"):
+        status, status_label, status_badge = _collection_task_batch_status(
+            {
+                "address_count": row.get("task_aggregate_count") or row.get("total_tasks"),
+                "success_count": row.get("real_success_tasks") if row.get("real_success_tasks") is not None else row.get("success_tasks"),
+                "failed_count": row.get("aggregate_failed_tasks") if row.get("aggregate_failed_tasks") is not None else row.get("failed_tasks"),
+                "processing_count": row.get("processing_count"),
+                "waiting_count": row.get("waiting_count"),
+                "sent_count": row.get("sent_count"),
+                "dry_run_count": row.get("dry_run_count"),
+                "batch_status": row.get("status"),
+            }
+        )
+    else:
+        status = row.get("status") or ""
+        status_label, status_badge = _collection_status_meta(status, COLLECTION_BATCH_STATUS_LABELS)
+    trigger_type = row.get("trigger_type") or ""
+    coin_symbol = row.get("coin_symbol") or ""
+    total_amount = _fmt_admin_amount_display(row.get("total_amount"), coin_symbol)
+    success_amount = _fmt_admin_amount_display(row.get("success_amount"), coin_symbol)
+    total_summary = _collection_amount_summary_from_raw(
+        row.get("amount_rows_raw"),
+        fallback_amount=row.get("total_amount"),
+        fallback_symbol=coin_symbol,
+    )
+    success_summary = _collection_amount_summary_from_raw(
+        row.get("success_amount_rows_raw"),
+        fallback_amount=row.get("success_amount"),
+        fallback_symbol=coin_symbol,
+    )
+    return {
+        "id": row.get("id"),
+        "batch_no": row.get("batch_no") or "",
+        "trigger_type": trigger_type,
+        "trigger_type_label": _admin_system_type_label(trigger_type or "COLLECTION"),
+        "chain_key": row.get("chain_key") or "",
+        "coin_symbol": coin_symbol,
+        "coin_symbol_label": "多币种"
+        if total_summary["is_multi_coin"]
+        else ((total_summary["items"][0]["coin_symbol"] if total_summary["items"] else coin_symbol) or "-"),
+        "target_address": row.get("target_address") or "",
+        "target_address_short": _short_admin_address(row.get("target_address")),
+        "status": status,
+        "status_label": status_label,
+        "status_badge": status_badge,
+        "address_count": int(row.get("address_count") or row.get("total_tasks") or 0),
+        "task_count": int(row.get("task_aggregate_count") or row.get("total_tasks") or 0),
+        "total_tasks": int(row.get("total_tasks") or 0),
+        "success_tasks": int((row.get("real_success_tasks") if row.get("real_success_tasks") is not None else row.get("success_tasks")) or 0),
+        "failed_tasks": int((row.get("aggregate_failed_tasks") if row.get("aggregate_failed_tasks") is not None else row.get("failed_tasks")) or 0),
+        "skipped_tasks": int(row.get("skipped_tasks") or 0),
+        "total_amount": total_amount,
+        "total_amount_label": total_summary["label"],
+        "total_amount_detail_label": total_summary["detail_label"],
+        "total_amount_detail_items": total_summary["items"],
+        "total_amount_coin_count": total_summary["coin_count"],
+        "success_amount": success_amount,
+        "success_amount_label": success_summary["label"],
+        "success_amount_detail_label": success_summary["detail_label"],
+        "success_amount_detail_items": success_summary["items"],
+        "success_amount_coin_count": success_summary["coin_count"],
+        "error_message": row.get("error_message") or "",
+        "created_by": row.get("created_by") or "",
+        "started_at": _admin_datetime_display(row.get("started_at")),
+        "finished_at": _admin_datetime_display(row.get("finished_at")),
+        "created_at": _admin_datetime_display(row.get("created_at")),
+        "updated_at": _admin_datetime_display(row.get("updated_at")),
+    }
+
+
+def _admin_collection_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    status_label, status_badge = _collection_status_meta(row.get("status"), COLLECTION_TASK_STATUS_LABELS)
+    coin_symbol = row.get("coin_symbol") or ""
+    amount = _fmt_admin_amount_display(row.get("amount"), coin_symbol)
+    status_value = str(row.get("status") or "").strip().upper()
+    tx_hash_value = str(row.get("tx_hash") or "").strip()
+    retry_count = int(row.get("retry_count") or 0)
+    max_retry = int(row.get("max_retry") or 0)
+    reason_value = row.get("reason")
+    failure_value = row.get("last_error")
+    if not failure_value and status_value == "SKIPPED":
+        failure_value = reason_value
+    can_retry = is_collection_task_retryable(status_value, tx_hash_value, retry_count, max_retry)
+    if not can_retry and _is_legacy_collection_gas_required_failure_value(
+        status_value,
+        reason_value,
+        failure_value,
+        tx_hash_value,
+    ):
+        can_retry = True
+    failure = _collection_failure_reason(failure_value)
+    tx_meta = _collection_tx_hash_meta(tx_hash_value)
+    gas_meta = _collection_task_gas_status(row)
+    gas_task_status = str(gas_meta.get("gas_task_status") or "").upper()
+    collection_can_confirm_requeue = bool(
+        status_value in {"SENT", "CONFIRMING"}
+        and tx_meta.get("has_tx_hash")
+        and not tx_meta.get("is_dry_run_tx_hash")
+        and not row.get("confirmed_at")
+    )
+    has_real_tx_hash = bool(tx_hash_value.lower().startswith("0x") and not tx_meta.get("is_dry_run_tx_hash"))
+    can_send = bool(
+        not has_real_tx_hash
+        and (
+            tx_meta.get("is_dry_run_tx_hash")
+            or status_value in {"PENDING", "QUEUED", "READY", "FAILED", "SKIPPED", "TIMEOUT"}
+        )
+    )
+    if status_value in {"SENT", "GAS_SENT", "CONFIRMING"}:
+        status_label, status_badge = "归集已发送 / 确认中", "info"
+    if status_value in {"GAS_REQUIRED", "GAS_QUEUED"}:
+        if gas_task_status in {"SENT", "GAS_SENT"}:
+            status_label, status_badge = "等待Gas确认", "info"
+        elif gas_task_status in {"CONFIRMED", "SUCCESS", "COMPLETED"} and gas_meta.get("gas_has_real_tx"):
+            status_label, status_badge = "Gas已确认，等待续跑", "success"
+        else:
+            status_label, status_badge = "等待Gas", "warning"
+    if tx_meta.get("is_dry_run_tx_hash") and status_value in {"SENT", "CONFIRMED", "SUCCESS", "COMPLETED"}:
+        status_label, status_badge = "待真实发送", "warning"
+    if status_value in {"PENDING", "QUEUED"} and _is_guard_rejected_error(failure.get("full")):
+        status_label, status_badge = "待真实发送", "warning"
+    if tx_hash_value and gas_task_status in {"CONFIRMED", "SUCCESS", "COMPLETED"}:
+        gas_meta["gas_status_badge"] = "neutral"
+    status_display_label = status_label
+    status_display_badge = status_badge
+    if failure["label"] == "低于最小归集额":
+        status_display_label = failure["label"]
+        status_display_badge = "neutral"
+    gas_can_real_send = bool(
+        row.get("gas_task_id")
+        and (
+            gas_task_status in {"PENDING", "QUEUED", "FAILED"}
+            or bool(gas_meta.get("gas_is_dry_run"))
+        )
+    )
+    return {
+        "id": row.get("id"),
+        "task_no": row.get("task_no") or "",
+        "batch_id": row.get("batch_id"),
+        "user_id": row.get("user_id"),
+        "chain_key": row.get("chain_key") or "",
+        "coin_symbol": row.get("coin_symbol") or "",
+        "asset_chain_id": row.get("asset_chain_id"),
+        "from_address": row.get("from_address") or "",
+        "to_address": row.get("to_address") or "",
+        "from_address_short": _short_admin_address(row.get("from_address")),
+        "to_address_short": _short_admin_address(row.get("to_address")),
+        "amount": amount,
+        "amount_label": f"{amount} {coin_symbol}".strip(),
+        "status": row.get("status") or "",
+        "status_label": status_label,
+        "status_badge": status_badge,
+        "status_display_label": status_display_label,
+        "status_display_badge": status_display_badge,
+        "can_send": can_send,
+        "can_retry": can_retry,
+        "collection_can_confirm_requeue": collection_can_confirm_requeue,
+        "reason": reason_value or "",
+        **tx_meta,
+        "block_number": row.get("block_number"),
+        "gas_task_id": row.get("gas_task_id"),
+        **gas_meta,
+        "gas_can_real_send": gas_can_real_send,
+        "idempotency_key": row.get("idempotency_key") or "",
+        "retry_count": retry_count,
+        "max_retry": max_retry,
+        "next_retry_at": _admin_datetime_display(row.get("next_retry_at")),
+        "last_error": row.get("last_error") or "",
+        "last_error_label": failure["label"],
+        "last_error_short": failure["short"],
+        "last_error_full": failure["full"],
+        "locked_at": _admin_datetime_display(row.get("locked_at")),
+        "sent_at": _admin_datetime_display(row.get("sent_at")),
+        "confirmed_at": _admin_datetime_display(row.get("confirmed_at")),
+        "finished_at": _collection_finished_at_display(row),
+        "created_at": _admin_datetime_display(row.get("created_at")),
+        "updated_at": _admin_datetime_display(row.get("updated_at")),
+    }
+
+
+COLLECTION_BATCH_STATUS_LABELS = {
+    "PENDING": ("等待中", "neutral"),
+    "QUEUED": ("等待中", "neutral"),
+    "RUNNING": ("处理中", "info"),
+    "PROCESSING": ("处理中", "info"),
+    "PARTIAL": ("部分成功", "warning"),
+    "SUCCESS": ("已完成", "success"),
+    "COMPLETED": ("已完成", "success"),
+    "CONFIRMED": ("已完成", "success"),
+    "FAILED": ("失败", "danger"),
+    "ERROR": ("失败", "danger"),
+    "TIMEOUT": ("超时", "danger"),
+    "CANCELED": ("已取消", "neutral"),
+    "CANCELLED": ("已取消", "neutral"),
+}
+
+COLLECTION_TASK_STATUS_LABELS = {
+    "PENDING": ("等待中", "neutral"),
+    "QUEUED": ("等待中", "neutral"),
+    "RUNNING": ("处理中", "info"),
+    "PROCESSING": ("处理中", "info"),
+    "GAS_REQUIRED": ("等待Gas", "warning"),
+    "GAS_QUEUED": ("等待Gas", "warning"),
+    "GAS_SENT": ("已发送", "info"),
+    "READY": ("处理中", "info"),
+    "SENDING": ("处理中", "info"),
+    "SENT": ("已发送", "info"),
+    "CONFIRMED": ("已完成", "success"),
+    "SUCCESS": ("已完成", "success"),
+    "COMPLETED": ("已完成", "success"),
+    "FAILED": ("失败", "danger"),
+    "ERROR": ("失败", "danger"),
+    "TIMEOUT": ("超时", "danger"),
+    "SKIPPED": ("已跳过", "neutral"),
+    "CANCELED": ("已取消", "neutral"),
+    "CANCELLED": ("已取消", "neutral"),
+    "DRY_RUN": ("预览", "info"),
+    "REAL_SEND": ("真实发送", "danger"),
+}
+
+COLLECTION_GAS_STATUS_LABELS = {
+    "PENDING": ("等待中", "neutral"),
+    "QUEUED": ("等待中", "neutral"),
+    "RUNNING": ("处理中", "info"),
+    "PROCESSING": ("处理中", "info"),
+    "SENDING": ("处理中", "info"),
+    "SENT": ("已发送", "info"),
+    "GAS_SENT": ("已发送", "info"),
+    "CONFIRMED": ("已完成", "success"),
+    "SUCCESS": ("已完成", "success"),
+    "COMPLETED": ("已完成", "success"),
+    "FAILED": ("失败", "danger"),
+    "ERROR": ("失败", "danger"),
+    "TIMEOUT": ("超时", "danger"),
+    "SKIPPED": ("已跳过", "neutral"),
+    "CANCELED": ("已取消", "neutral"),
+    "CANCELLED": ("已取消", "neutral"),
+}
+
+
+def _collection_status_meta(status: Any, mapping: Dict[str, tuple[str, str]]) -> tuple[str, str]:
+    status_text = str(status or "").strip().upper()
+    if not status_text:
+        return "-", "neutral"
+    return mapping.get(status_text, (status_text, "neutral"))
+
+
+def _admin_gas_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    status_label, status_badge = _collection_status_meta(row.get("status"), COLLECTION_GAS_STATUS_LABELS)
+    gas_coin_symbol = row.get("gas_coin_symbol") or ""
+    topup_amount = _fmt_admin_amount_display(row.get("topup_amount"), gas_coin_symbol)
+    failure = _collection_failure_reason(row.get("last_error"))
+    tx_meta = _collection_tx_hash_meta(row.get("tx_hash"))
+    status_value = str(row.get("status") or "").strip().upper()
+    if status_value in {"CONFIRMED", "SUCCESS", "COMPLETED"} and tx_meta.get("is_dry_run_tx_hash"):
+        status_label, status_badge = "需真实补 Gas", "warning"
+    elif status_value == "SENDING":
+        status_label, status_badge = "发送中", "info"
+    elif status_value in {"SENT", "GAS_SENT"} and tx_meta.get("has_tx_hash") and not tx_meta.get("is_dry_run_tx_hash"):
+        status_label, status_badge = "Gas已发送 / 确认中", "info"
+    elif status_value in {"CONFIRMED", "SUCCESS", "COMPLETED"} and tx_meta.get("has_tx_hash") and not tx_meta.get("is_dry_run_tx_hash"):
+        status_label, status_badge = "Gas已确认", "success"
+    can_real_send = bool(
+        status_value in {"PENDING", "QUEUED", "FAILED"}
+        or (status_value in {"CONFIRMED", "SUCCESS", "COMPLETED"} and tx_meta.get("is_dry_run_tx_hash"))
+    )
+    can_confirm_requeue = bool(
+        status_value in {"SENT", "GAS_SENT"}
+        and tx_meta.get("has_tx_hash")
+        and not tx_meta.get("is_dry_run_tx_hash")
+        and not row.get("confirmed_at")
+    )
+    return {
+        "id": row.get("id"),
+        "task_no": row.get("task_no") or "",
+        "collection_task_id": row.get("collection_task_id"),
+        "user_id": row.get("user_id"),
+        "chain_key": row.get("chain_key") or "",
+        "gas_coin_symbol": row.get("gas_coin_symbol") or "",
+        "from_address": row.get("from_address") or "",
+        "to_address": row.get("to_address") or "",
+        "from_address_short": _short_admin_address(row.get("from_address")),
+        "to_address_short": _short_admin_address(row.get("to_address")),
+        "target_balance": _fmt_admin_amount_display(row.get("target_balance"), gas_coin_symbol),
+        "topup_amount": topup_amount,
+        "topup_amount_label": f"{topup_amount} {gas_coin_symbol}".strip(),
+        "status": row.get("status") or "",
+        "status_label": status_label,
+        "status_badge": status_badge,
+        "can_real_send": can_real_send,
+        "can_confirm_requeue": can_confirm_requeue,
+        **tx_meta,
+        "block_number": row.get("block_number"),
+        "idempotency_key": row.get("idempotency_key") or "",
+        "retry_count": int(row.get("retry_count") or 0),
+        "max_retry": int(row.get("max_retry") or 0),
+        "next_retry_at": _admin_datetime_display(row.get("next_retry_at")),
+        "last_error": row.get("last_error") or "",
+        "last_error_label": failure["label"],
+        "last_error_short": failure["short"],
+        "last_error_full": failure["full"],
+        "locked_at": _admin_datetime_display(row.get("locked_at")),
+        "sent_at": _admin_datetime_display(row.get("sent_at")),
+        "confirmed_at": _admin_datetime_display(row.get("confirmed_at")),
+        "finished_at": _collection_finished_at_display(row),
+        "created_at": _admin_datetime_display(row.get("created_at")),
+        "updated_at": _admin_datetime_display(row.get("updated_at")),
+    }
+
+
+def _collection_task_batch_status(row: Dict[str, Any]) -> tuple[str, str, str]:
+    total = int(row.get("address_count") or 0)
+    success = int(row.get("success_count") or 0)
+    failed = int(row.get("failed_count") or 0)
+    processing = int(row.get("processing_count") or 0)
+    waiting = int(row.get("waiting_count") or 0)
+    sent = int(row.get("sent_count") or 0)
+    dry_run = int(row.get("dry_run_count") or 0)
+    if dry_run > 0 or sent > 0 or processing > 0 or waiting > 0:
+        return "PROCESSING", "处理中", "info"
+    if total > 0 and success >= total:
+        return "SUCCESS", "已完成", "success"
+    if failed > 0:
+        return "FAILED", "有失败", "danger"
+    return str(row.get("batch_status") or "PENDING"), "等待中", "neutral"
+
+
+def _admin_collection_task_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    coin_symbol = row.get("coin_symbol") or ""
+    status, status_label, status_badge = _collection_task_batch_status(row)
+    total_amount = _fmt_admin_amount_display(row.get("total_amount"), coin_symbol)
+    total_summary = _collection_amount_summary_from_raw(
+        row.get("amount_rows_raw"),
+        fallback_amount=row.get("total_amount"),
+        fallback_symbol=coin_symbol,
+    )
+    gas_linked_count = int(row.get("gas_linked_count") or 0)
+    gas_sent_count = int(row.get("gas_sent_count") or 0)
+    gas_confirmed_count = int(row.get("gas_confirmed_count") or 0)
+    gas_failed_count = int(row.get("gas_failed_count") or 0)
+    gas_coin_symbol = row.get("gas_coin_symbol") or ""
+    gas_topup_amount = _fmt_admin_amount_display(row.get("gas_topup_amount"), gas_coin_symbol)
+    gas_topup_label = f"{gas_topup_amount} {gas_coin_symbol}".strip() if gas_linked_count > 0 else "-"
+    if gas_linked_count <= 0:
+        gas_summary, gas_badge = "无需Gas", "neutral"
+    elif gas_confirmed_count >= gas_linked_count:
+        gas_summary, gas_badge = "已补Gas", "success"
+    elif gas_sent_count > 0:
+        gas_summary, gas_badge = "Gas确认中", "info"
+    elif gas_failed_count > 0:
+        gas_summary, gas_badge = "Gas失败", "danger"
+    else:
+        gas_summary, gas_badge = "待补Gas", "warning"
+    requeue_collection_count = int(row.get("requeue_collection_count") or 0)
+    requeue_gas_count = int(row.get("requeue_gas_count") or 0)
+    can_send_count = int(row.get("can_send_count") or 0)
+    batch_id = row.get("batch_id")
+    fallback_task_id = row.get("fallback_task_id")
+    return {
+        "group_id": row.get("group_id"),
+        "batch_id": batch_id,
+        "fallback_task_id": fallback_task_id,
+        "batch_no": row.get("batch_no") or (f"单任务-{fallback_task_id}" if fallback_task_id else "-"),
+        "chain_key": row.get("chain_key") or "",
+        "coin_symbol": coin_symbol,
+        "coin_symbol_label": "多币种"
+        if total_summary["is_multi_coin"]
+        else ((total_summary["items"][0]["coin_symbol"] if total_summary["items"] else coin_symbol) or "-"),
+        "address_count": int(row.get("address_count") or 0),
+        "total_amount": total_amount,
+        "total_amount_label": total_summary["label"],
+        "total_amount_detail_label": total_summary["detail_label"],
+        "total_amount_detail_items": total_summary["items"],
+        "total_amount_coin_count": total_summary["coin_count"],
+        "success_count": int(row.get("success_count") or 0),
+        "sent_count": int(row.get("sent_count") or 0),
+        "failed_count": int(row.get("failed_count") or 0),
+        "waiting_count": int(row.get("waiting_count") or 0),
+        "processing_count": int(row.get("processing_count") or 0),
+        "dry_run_count": int(row.get("dry_run_count") or 0),
+        "gas_linked_count": gas_linked_count,
+        "gas_sent_count": gas_sent_count,
+        "gas_confirmed_count": gas_confirmed_count,
+        "gas_failed_count": gas_failed_count,
+        "gas_coin_symbol": gas_coin_symbol,
+        "gas_topup_amount": gas_topup_amount,
+        "gas_topup_label": gas_topup_label,
+        "gas_summary": gas_summary,
+        "gas_badge": gas_badge,
+        "requeue_collection_count": requeue_collection_count,
+        "requeue_gas_count": requeue_gas_count,
+        "can_send_count": can_send_count,
+        "can_send_batch": bool(batch_id and can_send_count > 0),
+        "can_requeue": bool(batch_id and (requeue_collection_count > 0 or requeue_gas_count > 0)),
+        "requeue_url": f"/admin/collections/tasks/{batch_id}/requeue" if batch_id else "",
+        "status": status,
+        "status_label": status_label,
+        "status_badge": status_badge,
+        "created_at": _admin_datetime_display(row.get("created_at")),
+        "finished_at": _admin_datetime_display(row.get("finished_at")),
+        "detail_url": f"/admin/collections/tasks?batch_id={batch_id}" if batch_id else f"/admin/collections/tasks?task_no={row.get('task_no') or ''}",
+    }
+
+
+def _collection_amount_rows_label(rows: Iterable[Dict[str, Any]], *, symbol_key: str = "coin_symbol", amount_key: str = "amount") -> str:
+    amounts: Dict[str, Decimal] = {}
+    for row in rows:
+        symbol = _normalize_code(row.get(symbol_key))
+        if not symbol:
+            continue
+        amounts[symbol] = amounts.get(symbol, Decimal("0")) + Decimal(str(row.get(amount_key) or "0"))
+    if not amounts:
+        return "0"
+    return " / ".join(
+        f"{_fmt_admin_amount_display(amount, symbol)} {symbol}"
+        for symbol, amount in sorted(amounts.items())
+        if amount > 0
+    ) or "0"
+
+
+def _collection_amount_rows_summary(
+    rows: Iterable[Dict[str, Any]],
+    *,
+    symbol_key: str = "coin_symbol",
+    amount_key: str = "amount",
+) -> Dict[str, Any]:
+    amounts: Dict[str, Decimal] = {}
+    for row in rows:
+        symbol = _normalize_code(row.get(symbol_key))
+        if not symbol:
+            continue
+        try:
+            amount = Decimal(str(row.get(amount_key) or "0"))
+        except Exception:
+            amount = Decimal("0")
+        amounts[symbol] = amounts.get(symbol, Decimal("0")) + amount
+    items = []
+    for symbol, amount in sorted(amounts.items()):
+        if amount <= 0:
+            continue
+        amount_text = _fmt_admin_amount_display(amount, symbol)
+        items.append(
+            {
+                "coin_symbol": symbol,
+                "amount": amount_text,
+                "amount_label": f"{amount_text} {symbol}".strip(),
+                "detail_label": f"{symbol} {amount_text}".strip(),
+            }
+        )
+    if not items:
+        return {
+            "label": "-",
+            "detail_label": "",
+            "items": [],
+            "coin_count": 0,
+            "is_multi_coin": False,
+        }
+    if len(items) == 1:
+        label = items[0]["amount_label"]
+    else:
+        label = f"{len(items)} 个币种"
+    return {
+        "label": label,
+        "detail_label": " / ".join(item["detail_label"] for item in items),
+        "items": items,
+        "coin_count": len(items),
+        "is_multi_coin": len(items) > 1,
+    }
+
+
+def _collection_task_scope(filters: Dict[str, Any]) -> tuple[list[str], Dict[str, Any]]:
+    parts: list[str] = []
+    params: Dict[str, Any] = {}
+    if filters.get("task_no"):
+        parts.append("collection_tasks.task_no LIKE :task_no")
+        params["task_no"] = f"%{filters['task_no']}%"
+    if filters.get("batch_id"):
+        parts.append("collection_tasks.batch_id = :batch_id")
+        params["batch_id"] = _parse_int(filters["batch_id"])
+    if filters.get("user_id"):
+        parts.append("collection_tasks.user_id = :user_id")
+        params["user_id"] = _parse_int(filters["user_id"])
+    if filters.get("chain_key"):
+        parts.append("collection_tasks.chain_key = :chain_key")
+        params["chain_key"] = filters["chain_key"]
+    if filters.get("coin_symbol"):
+        parts.append("collection_tasks.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = filters["coin_symbol"]
+    if filters.get("address"):
+        parts.append("(LOWER(collection_tasks.from_address) LIKE :address OR LOWER(collection_tasks.to_address) LIKE :address)")
+        params["address"] = f"%{str(filters['address']).lower()}%"
+    if filters.get("tx_hash"):
+        parts.append("collection_tasks.tx_hash LIKE :tx_hash")
+        params["tx_hash"] = f"%{filters['tx_hash']}%"
+    return parts, params
+
+
+def _gas_task_scope(filters: Dict[str, Any]) -> tuple[list[str], Dict[str, Any]]:
+    parts: list[str] = []
+    params: Dict[str, Any] = {}
+    if filters.get("task_no"):
+        parts.append("task_no LIKE :task_no")
+        params["task_no"] = f"%{filters['task_no']}%"
+    if filters.get("collection_task_id"):
+        parts.append("collection_task_id = :collection_task_id")
+        params["collection_task_id"] = _parse_int(filters["collection_task_id"])
+    if filters.get("user_id"):
+        parts.append("user_id = :user_id")
+        params["user_id"] = _parse_int(filters["user_id"])
+    if filters.get("chain_key"):
+        parts.append("chain_key = :chain_key")
+        params["chain_key"] = filters["chain_key"]
+    if filters.get("coin_symbol"):
+        parts.append("gas_coin_symbol = :coin_symbol")
+        params["coin_symbol"] = filters["coin_symbol"]
+    if filters.get("address"):
+        parts.append("(LOWER(from_address) LIKE :address OR LOWER(to_address) LIKE :address)")
+        params["address"] = f"%{str(filters['address']).lower()}%"
+    if filters.get("tx_hash"):
+        parts.append("tx_hash LIKE :tx_hash")
+        params["tx_hash"] = f"%{filters['tx_hash']}%"
+    return parts, params
+
+
+def _collection_batch_scope(filters: Dict[str, Any]) -> tuple[list[str], Dict[str, Any]]:
+    parts: list[str] = []
+    params: Dict[str, Any] = {}
+    if filters.get("batch_no"):
+        parts.append("batch_no LIKE :batch_no")
+        params["batch_no"] = f"%{filters['batch_no']}%"
+    if filters.get("chain_key"):
+        parts.append("chain_key = :chain_key")
+        params["chain_key"] = filters["chain_key"]
+    if filters.get("coin_symbol"):
+        parts.append("coin_symbol = :coin_symbol")
+        params["coin_symbol"] = filters["coin_symbol"]
+    if filters.get("trigger_type"):
+        parts.append("trigger_type = :trigger_type")
+        params["trigger_type"] = filters["trigger_type"]
+    if filters.get("user_id"):
+        parts.append(
+            "EXISTS (SELECT 1 FROM collection_tasks ct WHERE ct.batch_id = collection_batches.id AND ct.user_id = :user_id)"
+        )
+        params["user_id"] = _parse_int(filters["user_id"])
+    if filters.get("address"):
+        parts.append(
+            "EXISTS (SELECT 1 FROM collection_tasks ct WHERE ct.batch_id = collection_batches.id "
+            "AND (LOWER(ct.from_address) LIKE :address OR LOWER(ct.to_address) LIKE :address))"
+        )
+        params["address"] = f"%{str(filters['address']).lower()}%"
+    if filters.get("tx_hash"):
+        parts.append(
+            "EXISTS (SELECT 1 FROM collection_tasks ct WHERE ct.batch_id = collection_batches.id AND ct.tx_hash LIKE :tx_hash)"
+        )
+        params["tx_hash"] = f"%{filters['tx_hash']}%"
+    return parts, params
+
+
+def _collection_batch_task_scope(filters: Dict[str, Any]) -> tuple[list[str], Dict[str, Any]]:
+    parts: list[str] = []
+    params: Dict[str, Any] = {}
+    if filters.get("batch_no"):
+        parts.append("cb.batch_no LIKE :batch_no")
+        params["batch_no"] = f"%{filters['batch_no']}%"
+    if filters.get("chain_key"):
+        parts.append("COALESCE(NULLIF(ct.chain_key, ''), cb.chain_key) = :chain_key")
+        params["chain_key"] = filters["chain_key"]
+    if filters.get("coin_symbol"):
+        parts.append("ct.coin_symbol = :coin_symbol")
+        params["coin_symbol"] = filters["coin_symbol"]
+    if filters.get("trigger_type"):
+        parts.append("cb.trigger_type = :trigger_type")
+        params["trigger_type"] = filters["trigger_type"]
+    if filters.get("user_id"):
+        parts.append("ct.user_id = :user_id")
+        params["user_id"] = _parse_int(filters["user_id"])
+    if filters.get("address"):
+        parts.append("(LOWER(ct.from_address) LIKE :address OR LOWER(ct.to_address) LIKE :address)")
+        params["address"] = f"%{str(filters['address']).lower()}%"
+    if filters.get("tx_hash"):
+        parts.append("ct.tx_hash LIKE :tx_hash")
+        params["tx_hash"] = f"%{filters['tx_hash']}%"
+    if filters.get("created_from"):
+        parts.append("DATE(cb.created_at) >= :created_from")
+        params["created_from"] = str(filters["created_from"])
+    if filters.get("created_to"):
+        parts.append("DATE(cb.created_at) <= :created_to")
+        params["created_to"] = str(filters["created_to"])
+    return parts, params
+
+
+def _collection_where(parts: list[str]) -> str:
+    return "WHERE " + " AND ".join(parts) if parts else ""
+
+
+def _collection_tasks_summary(db: Session, filters: Dict[str, Any]) -> Dict[str, Any]:
+    scope_parts, params = _collection_task_scope(filters)
+    active_parts = [*scope_parts, "UPPER(status) IN :active_statuses"]
+    today_parts = [*scope_parts, "DATE(created_at) = CURDATE()"]
+    today_success_parts = [
+        *today_parts,
+        "UPPER(status) IN :success_statuses",
+        "NOT (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%')",
+    ]
+    today_failed_parts = [*today_parts, "UPPER(status) IN :failed_statuses"]
+    amount_parts = [
+        *scope_parts,
+        "UPPER(status) IN :success_statuses",
+        "NOT (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%')",
+        "DATE(COALESCE(confirmed_at, updated_at, created_at)) = CURDATE()",
+    ]
+    try:
+        today_count = int(db.execute(text(f"SELECT COUNT(*) FROM collection_tasks {_collection_where(today_parts)}"), params).scalar() or 0)
+        today_success = int(
+            db.execute(
+                text(f"SELECT COUNT(*) FROM collection_tasks {_collection_where(today_success_parts)}").bindparams(
+                    bindparam("success_statuses", expanding=True)
+                ),
+                {**params, "success_statuses": COLLECTION_OP_SUCCESS_STATUSES},
+            ).scalar()
+            or 0
+        )
+        today_failed = int(
+            db.execute(
+                text(f"SELECT COUNT(*) FROM collection_tasks {_collection_where(today_failed_parts)}").bindparams(
+                    bindparam("failed_statuses", expanding=True)
+                ),
+                {**params, "failed_statuses": (*COLLECTION_OP_FAILED_STATUSES, *COLLECTION_OP_TIMEOUT_STATUSES)},
+            ).scalar()
+            or 0
+        )
+        active_count = int(
+            db.execute(
+                text(f"SELECT COUNT(*) FROM collection_tasks {_collection_where(active_parts)}").bindparams(
+                    bindparam("active_statuses", expanding=True)
+                ),
+                {**params, "active_statuses": COLLECTION_OP_ACTIVE_STATUSES},
+            ).scalar()
+            or 0
+        )
+        amount_rows = db.execute(
+            text(
+                f"""
+                SELECT coin_symbol, COALESCE(SUM(amount), 0) AS amount
+                FROM collection_tasks
+                {_collection_where(amount_parts)}
+                GROUP BY coin_symbol
+                """
+            ).bindparams(bindparam("success_statuses", expanding=True)),
+            {**params, "success_statuses": COLLECTION_OP_SUCCESS_STATUSES},
+        ).mappings().all()
+        amount_summary = _collection_amount_rows_summary(amount_rows)
+    except Exception:
+        logger.exception("collection tasks summary query failed")
+        return {
+            "today_tasks": 0,
+            "today_success": 0,
+            "today_failed": 0,
+            "active_tasks": 0,
+            "today_amount_label": "-",
+            "today_amount_detail_label": "",
+            "today_amount_detail_items": [],
+            "today_amount_coin_count": 0,
+        }
+    return {
+        "today_tasks": today_count,
+        "today_success": today_success,
+        "today_failed": today_failed,
+        "active_tasks": active_count,
+        "today_amount_label": amount_summary["label"],
+        "today_amount_detail_label": amount_summary["detail_label"],
+        "today_amount_detail_items": amount_summary["items"],
+        "today_amount_coin_count": amount_summary["coin_count"],
+    }
+
+
+def _gas_tasks_summary(db: Session, filters: Dict[str, Any]) -> Dict[str, Any]:
+    scope_parts, params = _gas_task_scope(filters)
+    active_parts = [*scope_parts, "UPPER(status) IN :active_statuses"]
+    today_parts = [*scope_parts, "DATE(created_at) = CURDATE()"]
+    today_success_parts = [*today_parts, "UPPER(status) IN :success_statuses"]
+    today_failed_parts = [*today_parts, "UPPER(status) IN :failed_statuses"]
+    try:
+        today_count = int(db.execute(text(f"SELECT COUNT(*) FROM gas_tasks {_collection_where(today_parts)}"), params).scalar() or 0)
+        today_success = int(
+            db.execute(
+                text(f"SELECT COUNT(*) FROM gas_tasks {_collection_where(today_success_parts)}").bindparams(
+                    bindparam("success_statuses", expanding=True)
+                ),
+                {**params, "success_statuses": COLLECTION_OP_SUCCESS_STATUSES},
+            ).scalar()
+            or 0
+        )
+        today_failed = int(
+            db.execute(
+                text(f"SELECT COUNT(*) FROM gas_tasks {_collection_where(today_failed_parts)}").bindparams(
+                    bindparam("failed_statuses", expanding=True)
+                ),
+                {**params, "failed_statuses": (*COLLECTION_OP_FAILED_STATUSES, *COLLECTION_OP_TIMEOUT_STATUSES)},
+            ).scalar()
+            or 0
+        )
+        active_count = int(
+            db.execute(
+                text(f"SELECT COUNT(*) FROM gas_tasks {_collection_where(active_parts)}").bindparams(
+                    bindparam("active_statuses", expanding=True)
+                ),
+                {**params, "active_statuses": COLLECTION_OP_ACTIVE_STATUSES},
+            ).scalar()
+            or 0
+        )
+        pending_address_count = int(
+            db.execute(
+                text(f"SELECT COUNT(DISTINCT LOWER(to_address)) FROM gas_tasks {_collection_where(active_parts)}").bindparams(
+                    bindparam("active_statuses", expanding=True)
+                ),
+                {**params, "active_statuses": COLLECTION_OP_ACTIVE_STATUSES},
+            ).scalar()
+            or 0
+        )
+    except Exception:
+        logger.exception("gas tasks summary query failed")
+        return {"today_tasks": 0, "today_success": 0, "today_failed": 0, "active_tasks": 0, "pending_address_count": 0}
+    return {
+        "today_tasks": today_count,
+        "today_success": today_success,
+        "today_failed": today_failed,
+        "active_tasks": active_count,
+        "pending_address_count": pending_address_count,
+    }
+
+
+def _collection_batches_summary(db: Session, filters: Dict[str, Any]) -> Dict[str, Any]:
+    scope_parts, params = _collection_batch_scope(filters)
+    task_scope_parts, task_params = _collection_batch_task_scope(filters)
+    today_parts = [*scope_parts, "DATE(created_at) = CURDATE()"]
+    task_today_parts = [*task_scope_parts, "DATE(ct.created_at) = CURDATE()"]
+    real_success_predicate = (
+        "UPPER(ct.status) IN :task_success_statuses "
+        "AND ct.tx_hash IS NOT NULL "
+        "AND LOWER(ct.tx_hash) LIKE '0x%' "
+        "AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')"
+    )
+    try:
+        today_batches = int(db.execute(text(f"SELECT COUNT(*) FROM collection_batches {_collection_where(today_parts)}"), params).scalar() or 0)
+        today_task_count = int(
+            db.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM collection_tasks ct
+                    JOIN collection_batches cb ON cb.id = ct.batch_id
+                    {_collection_where(task_today_parts)}
+                    """
+                ),
+                task_params,
+            ).scalar()
+            or 0
+        )
+        today_success = int(
+            db.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM collection_tasks ct
+                    JOIN collection_batches cb ON cb.id = ct.batch_id
+                    {_collection_where([*task_today_parts, real_success_predicate])}
+                    """
+                ).bindparams(
+                    bindparam("task_success_statuses", expanding=True)
+                ),
+                {**task_params, "task_success_statuses": COLLECTION_OP_SUCCESS_STATUSES},
+            ).scalar()
+            or 0
+        )
+        today_failed = int(
+            db.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM collection_tasks ct
+                    JOIN collection_batches cb ON cb.id = ct.batch_id
+                    {_collection_where([*task_today_parts, "UPPER(ct.status) IN :failed_statuses"])}
+                    """
+                ).bindparams(bindparam("failed_statuses", expanding=True)),
+                {**task_params, "failed_statuses": (*COLLECTION_OP_FAILED_STATUSES, *COLLECTION_OP_TIMEOUT_STATUSES)},
+            ).scalar()
+            or 0
+        )
+        active_tasks = int(
+            db.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM collection_tasks ct
+                    JOIN collection_batches cb ON cb.id = ct.batch_id
+                    {_collection_where([*task_scope_parts, "UPPER(ct.status) IN :active_statuses"])}
+                    """
+                ).bindparams(bindparam("active_statuses", expanding=True)),
+                {**task_params, "active_statuses": COLLECTION_OP_ACTIVE_STATUSES},
+            ).scalar()
+            or 0
+        )
+        waiting_gas_tasks = int(
+            db.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM collection_tasks ct
+                    JOIN collection_batches cb ON cb.id = ct.batch_id
+                    {_collection_where([*task_scope_parts, "UPPER(ct.status) IN ('GAS_REQUIRED', 'GAS_QUEUED', 'WAIT_GAS', 'WAITING_GAS')"])}
+                    """
+                ),
+                task_params,
+            ).scalar()
+            or 0
+        )
+        amount_rows = db.execute(
+            text(
+                f"""
+                SELECT ct.coin_symbol, COALESCE(SUM(ct.amount), 0) AS amount
+                FROM collection_tasks ct
+                WHERE ct.batch_id IN (
+                  SELECT collection_batches.id
+                  FROM collection_batches
+                  {_collection_where(scope_parts)}
+                )
+                  AND UPPER(ct.status) IN :task_success_statuses
+                  AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                  AND DATE(COALESCE(ct.confirmed_at, ct.updated_at, ct.created_at)) = CURDATE()
+                GROUP BY ct.coin_symbol
+                """
+            ).bindparams(
+                bindparam("task_success_statuses", expanding=True),
+            ),
+            {
+                **params,
+                "task_success_statuses": COLLECTION_OP_SUCCESS_STATUSES,
+            },
+        ).mappings().all()
+        amount_summary = _collection_amount_rows_summary(amount_rows)
+    except Exception:
+        logger.exception("collection batches summary query failed")
+        return {
+            "today_batches": 0,
+            "today_success": 0,
+            "today_failed": 0,
+            "active_tasks": 0,
+            "waiting_gas_tasks": 0,
+            "today_amount_label": "-",
+            "today_amount_detail_label": "",
+            "today_amount_detail_items": [],
+            "today_amount_coin_count": 0,
+            "today_task_count": 0,
+        }
+    return {
+        "today_batches": today_batches,
+        "today_success": today_success,
+        "today_failed": today_failed,
+        "active_tasks": active_tasks,
+        "waiting_gas_tasks": waiting_gas_tasks,
+        "today_amount_label": amount_summary["label"],
+        "today_amount_detail_label": amount_summary["detail_label"],
+        "today_amount_detail_items": amount_summary["items"],
+        "today_amount_coin_count": amount_summary["coin_count"],
+        "today_task_count": today_task_count,
+    }
+
+
+def _collection_stats_amount_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    amount_summary = _collection_amount_summary_from_raw(row.get("amount_rows_raw"))
+    gas_amount_summary = _collection_amount_summary_from_raw(row.get("gas_amount_rows_raw"))
+    return {
+        **row,
+        "batch_count": int(row.get("batch_count") or 0),
+        "network_count": int(row.get("network_count") or 0),
+        "task_count": int(row.get("task_count") or 0),
+        "success_count": int(row.get("success_count") or 0),
+        "failed_count": int(row.get("failed_count") or 0),
+        "gas_amount_label": gas_amount_summary["label"],
+        "gas_amount_detail_label": gas_amount_summary["detail_label"],
+        "gas_amount_detail_items": gas_amount_summary["items"],
+        "gas_amount_coin_count": gas_amount_summary["coin_count"],
+        "amount_label": amount_summary["label"],
+        "amount_detail_label": amount_summary["detail_label"],
+        "amount_detail_items": amount_summary["items"],
+        "amount_coin_count": amount_summary["coin_count"],
+        "latest_collected_at": _admin_datetime_display(row.get("latest_collected_at")),
+    }
+
+
+def _collection_batches_network_stats(db: Session, filters: Dict[str, Any]) -> list[Dict[str, Any]]:
+    scope_parts, params = _collection_batch_task_scope(filters)
+    where_sql = _collection_where(scope_parts)
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                  COALESCE(NULLIF(ct.chain_key, ''), cb.chain_key, '-') AS chain_key,
+                  COUNT(DISTINCT cb.id) AS batch_count,
+                  COUNT(ct.id) AS task_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                            AND ct.tx_hash IS NOT NULL
+                            AND LOWER(ct.tx_hash) LIKE '0x%'
+                            AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                           THEN 1 ELSE 0 END) AS success_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('FAILED', 'ERROR', 'TIMEOUT') THEN 1 ELSE 0 END) AS failed_count,
+                  MAX(CASE WHEN UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                            AND ct.tx_hash IS NOT NULL
+                            AND LOWER(ct.tx_hash) LIKE '0x%'
+                            AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                           THEN COALESCE(ct.confirmed_at, ct.updated_at, ct.created_at) ELSE NULL END) AS latest_collected_at,
+                  GROUP_CONCAT(CASE WHEN UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                                      AND ct.tx_hash IS NOT NULL
+                                      AND LOWER(ct.tx_hash) LIKE '0x%'
+                                      AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                                     THEN CONCAT(COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--'), ':', COALESCE(ct.amount, 0)) ELSE NULL END
+                               ORDER BY ct.coin_symbol SEPARATOR '|') AS amount_rows_raw
+                FROM collection_tasks ct
+                JOIN collection_batches cb ON cb.id = ct.batch_id
+                {where_sql}
+                GROUP BY COALESCE(NULLIF(ct.chain_key, ''), cb.chain_key, '-')
+                ORDER BY task_count DESC, chain_key ASC
+                LIMIT 50
+                """
+            ),
+            params,
+        ).mappings().all()
+        gas_parts: list[str] = [
+            "UPPER(status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')",
+            "tx_hash IS NOT NULL",
+            "LOWER(tx_hash) LIKE '0x%'",
+            "NOT (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%')",
+        ]
+        gas_params: Dict[str, Any] = {}
+        if filters.get("chain_key"):
+            gas_parts.append("chain_key = :chain_key")
+            gas_params["chain_key"] = filters["chain_key"]
+        if filters.get("user_id"):
+            gas_parts.append("user_id = :user_id")
+            gas_params["user_id"] = _parse_int(filters["user_id"])
+        if filters.get("address"):
+            gas_parts.append("(LOWER(from_address) LIKE :address OR LOWER(to_address) LIKE :address)")
+            gas_params["address"] = f"%{str(filters['address']).lower()}%"
+        if filters.get("tx_hash"):
+            gas_parts.append("tx_hash LIKE :tx_hash")
+            gas_params["tx_hash"] = f"%{filters['tx_hash']}%"
+        if filters.get("created_from"):
+            gas_parts.append("DATE(created_at) >= :created_from")
+            gas_params["created_from"] = str(filters["created_from"])
+        if filters.get("created_to"):
+            gas_parts.append("DATE(created_at) <= :created_to")
+            gas_params["created_to"] = str(filters["created_to"])
+        gas_rows = db.execute(
+            text(
+                f"""
+                SELECT
+                  COALESCE(NULLIF(chain_key, ''), '-') AS chain_key,
+                  GROUP_CONCAT(CONCAT(COALESCE(NULLIF(UPPER(gas_coin_symbol), ''), '--'), ':', COALESCE(topup_amount, 0)) ORDER BY gas_coin_symbol SEPARATOR '|') AS gas_amount_rows_raw
+                FROM gas_tasks
+                {_collection_where(gas_parts)}
+                GROUP BY COALESCE(NULLIF(chain_key, ''), '-')
+                """
+            ),
+            gas_params,
+        ).mappings().all()
+    except Exception:
+        logger.exception("collection network stats query failed")
+        return []
+    gas_by_chain = {str(row.get("chain_key") or "-"): dict(row) for row in gas_rows}
+    items = []
+    for row in rows:
+        row_dict = dict(row)
+        row_dict.update(gas_by_chain.get(str(row_dict.get("chain_key") or "-"), {}))
+        items.append(_collection_stats_amount_item(row_dict))
+    return items
+
+
+def _collection_batches_symbol_stats(db: Session, filters: Dict[str, Any]) -> list[Dict[str, Any]]:
+    scope_parts, params = _collection_batch_task_scope(filters)
+    where_sql = _collection_where(scope_parts)
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                  COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--') AS coin_symbol,
+                  COUNT(DISTINCT COALESCE(NULLIF(ct.chain_key, ''), cb.chain_key, '-')) AS network_count,
+                  COUNT(ct.id) AS task_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                            AND ct.tx_hash IS NOT NULL
+                            AND LOWER(ct.tx_hash) LIKE '0x%'
+                            AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                           THEN 1 ELSE 0 END) AS success_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('FAILED', 'ERROR', 'TIMEOUT') THEN 1 ELSE 0 END) AS failed_count,
+                  MAX(CASE WHEN UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                            AND ct.tx_hash IS NOT NULL
+                            AND LOWER(ct.tx_hash) LIKE '0x%'
+                            AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                           THEN COALESCE(ct.confirmed_at, ct.updated_at, ct.created_at) ELSE NULL END) AS latest_collected_at,
+                  GROUP_CONCAT(CASE WHEN UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                                      AND ct.tx_hash IS NOT NULL
+                                      AND LOWER(ct.tx_hash) LIKE '0x%'
+                                      AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                                     THEN CONCAT(COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--'), ':', COALESCE(ct.amount, 0)) ELSE NULL END
+                               ORDER BY ct.coin_symbol SEPARATOR '|') AS amount_rows_raw
+                FROM collection_tasks ct
+                JOIN collection_batches cb ON cb.id = ct.batch_id
+                {where_sql}
+                GROUP BY COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--')
+                ORDER BY task_count DESC, coin_symbol ASC
+                LIMIT 50
+                """
+            ),
+            params,
+        ).mappings().all()
+    except Exception:
+        logger.exception("collection symbol stats query failed")
+        return []
+    return [_collection_stats_amount_item(dict(row)) for row in rows]
+
+
+def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    batch_no = str(filters.get("batch_no") or "").strip()
+    status = str(filters.get("status") or "").strip().upper()
+    chain_key = _normalize_chain_key(filters.get("chain_key"))
+    coin_symbol = _normalize_code(filters.get("coin_symbol"))
+    trigger_type = str(filters.get("trigger_type") or "").strip().upper()
+    user_id = str(filters.get("user_id") or "").strip()
+    address = str(filters.get("address") or "").strip()
+    tx_hash = str(filters.get("tx_hash") or "").strip()
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    normalized_filters = {
+        "batch_no": batch_no,
+        "status": status,
+        "chain_key": chain_key,
+        "coin_symbol": coin_symbol,
+        "trigger_type": trigger_type,
+        "user_id": user_id,
+        "address": address,
+        "tx_hash": tx_hash,
+    }
+    stats_filters = {
+        **normalized_filters,
+        "created_from": created_from,
+        "created_to": created_to,
+    }
+    where_parts, params = _collection_batch_scope(normalized_filters)
+    status_values: tuple[str, ...] | None = None
+    if status:
+        if status == "ACTIVE":
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_ACTIVE_STATUSES
+        elif status in {"FAILED", "FAIL", "ERROR"}:
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_FAILED_STATUSES
+            status = "FAILED"
+        elif status in {"SUCCESS", "COMPLETED", "CONFIRMED"}:
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_SUCCESS_STATUSES
+            status = "SUCCESS"
+        elif status in {"PENDING", "QUEUED"}:
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_WAITING_STATUSES
+            status = "PENDING"
+        elif status in {"PROCESSING", "RUNNING"}:
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = ("RUNNING", "PROCESSING")
+            status = "PROCESSING"
+        else:
+            where_parts.append("UPPER(status) = :status")
+            params["status"] = status
+    if status_values:
+        params["status_values"] = status_values
+    if created_from:
+        where_parts.append("DATE(collection_batches.created_at) >= :created_from")
+        params["created_from"] = str(created_from)
+    if created_to:
+        where_parts.append("DATE(collection_batches.created_at) <= :created_to")
+        params["created_to"] = str(created_to)
+    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+    try:
+        count_stmt = text(f"SELECT COUNT(*) FROM collection_batches {where_sql}")
+        if status_values:
+            count_stmt = count_stmt.bindparams(bindparam("status_values", expanding=True))
+        total = int(db.execute(count_stmt, params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        row_stmt = text(
+            f"""
+            SELECT id, batch_no, trigger_type, target_address, chain_key, coin_symbol, status,
+                   total_tasks, success_tasks, failed_tasks, skipped_tasks, total_amount,
+                   success_amount, error_message, created_by, started_at, finished_at,
+                   created_at, updated_at,
+                   cta.task_count AS task_aggregate_count,
+                   cta.address_count,
+                   cta.real_success_count AS real_success_tasks,
+                   cta.failed_count AS aggregate_failed_tasks,
+                   cta.waiting_count,
+                   cta.processing_count,
+                   cta.sent_count,
+                   cta.dry_run_count,
+                   1 AS task_status_aggregate,
+                   (
+                     SELECT GROUP_CONCAT(CONCAT(COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--'), ':', COALESCE(ct.amount, 0)) ORDER BY ct.coin_symbol SEPARATOR '|')
+                     FROM collection_tasks ct
+                     WHERE ct.batch_id = collection_batches.id
+                   ) AS amount_rows_raw,
+                   (
+                     SELECT GROUP_CONCAT(CONCAT(COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--'), ':', COALESCE(ct.amount, 0)) ORDER BY ct.coin_symbol SEPARATOR '|')
+                     FROM collection_tasks ct
+                     WHERE ct.batch_id = collection_batches.id
+                       AND UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                       AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                   ) AS success_amount_rows_raw
+            FROM collection_batches
+            LEFT JOIN (
+              SELECT
+                batch_id,
+                COUNT(*) AS task_count,
+                COUNT(DISTINCT LOWER(from_address)) AS address_count,
+                SUM(CASE WHEN UPPER(status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND NOT (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS real_success_count,
+                SUM(CASE WHEN UPPER(status) IN ('FAILED', 'ERROR', 'TIMEOUT') THEN 1 ELSE 0 END) AS failed_count,
+                SUM(CASE WHEN UPPER(status) IN ('PENDING', 'QUEUED', 'GAS_REQUIRED', 'GAS_QUEUED', 'READY') OR (UPPER(status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%')) THEN 1 ELSE 0 END) AS waiting_count,
+                SUM(CASE WHEN UPPER(status) IN ('RUNNING', 'PROCESSING', 'SENDING') THEN 1 ELSE 0 END) AS processing_count,
+                SUM(CASE WHEN UPPER(status) IN ('SENT', 'GAS_SENT', 'CONFIRMING') THEN 1 ELSE 0 END) AS sent_count,
+                SUM(CASE WHEN UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%' THEN 1 ELSE 0 END) AS dry_run_count
+              FROM collection_tasks
+              GROUP BY batch_id
+            ) cta ON cta.batch_id = collection_batches.id
+            {where_sql}
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        )
+        if status_values:
+            row_stmt = row_stmt.bindparams(bindparam("status_values", expanding=True))
+        rows = db.execute(
+            row_stmt,
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except Exception:
+        return _admin_read_error_page("list_collection_batches", filters)
+    return _empty_page(
+        items=[_admin_collection_batch_item(dict(row)) for row in rows],
+        filters={
+            **filters,
+            "batch_no": batch_no,
+            "status": status,
+            "chain_key": chain_key,
+            "coin_symbol": coin_symbol,
+            "trigger_type": trigger_type,
+            "user_id": user_id,
+            "address": address,
+            "tx_hash": tx_hash,
+        },
+        summary=_collection_batches_summary(db, normalized_filters),
+        network_stats=_collection_batches_network_stats(db, stats_filters),
+        symbol_stats=_collection_batches_symbol_stats(db, stats_filters),
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+def get_collection_batch_detail(
+    db: Session,
+    batch_id: int,
+    filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    filters = filters or {}
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 100)), 200)
+    try:
+        batch_row = db.execute(
+            text(
+                """
+                SELECT id, batch_no, trigger_type, target_address, chain_key, coin_symbol, status,
+                       total_tasks, success_tasks, failed_tasks, skipped_tasks, total_amount,
+                       success_amount, error_message, created_by, started_at, finished_at,
+                       created_at, updated_at,
+                       (
+                         SELECT GROUP_CONCAT(CONCAT(COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--'), ':', COALESCE(ct.amount, 0)) ORDER BY ct.coin_symbol SEPARATOR '|')
+                         FROM collection_tasks ct
+                         WHERE ct.batch_id = collection_batches.id
+                       ) AS amount_rows_raw,
+                       (
+                         SELECT GROUP_CONCAT(CONCAT(COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--'), ':', COALESCE(ct.amount, 0)) ORDER BY ct.coin_symbol SEPARATOR '|')
+                         FROM collection_tasks ct
+                         WHERE ct.batch_id = collection_batches.id
+                           AND UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                           AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                       ) AS success_amount_rows_raw
+                FROM collection_batches
+                WHERE id = :id
+                """
+            ),
+            {"id": int(batch_id)},
+        ).mappings().first()
+        total = int(
+            db.execute(
+                text("SELECT COUNT(*) FROM collection_tasks WHERE batch_id = :batch_id"),
+                {"batch_id": int(batch_id)},
+            ).scalar()
+            or 0
+        )
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        task_rows = db.execute(
+            text(
+                """
+                SELECT id, task_no, batch_id, user_id, chain_key, coin_symbol, asset_chain_id,
+                       from_address, to_address, amount, status, reason, tx_hash, block_number,
+                       gas_task_id, idempotency_key, retry_count, max_retry, next_retry_at,
+                       last_error, locked_at, sent_at, confirmed_at, created_at, updated_at
+                FROM collection_tasks
+                WHERE batch_id = :batch_id
+                ORDER BY created_at DESC, id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"batch_id": int(batch_id), "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except Exception:
+        logger.exception("get_collection_batch_detail query failed")
+        return _empty_page(batch=None, tasks=[], filters=filters)
+    return _empty_page(
+        items=[_admin_collection_task_item(dict(row)) for row in task_rows],
+        batch=_admin_collection_batch_item(dict(batch_row)) if batch_row else None,
+        tasks=[_admin_collection_task_item(dict(row)) for row in task_rows],
+        filters=filters,
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+def _collection_record_gas_meta(task: Dict[str, Any], gas: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    task_status = str(task.get("status") or "").strip().upper()
+    if gas:
+        label, badge = _collection_status_meta(gas.get("status"), COLLECTION_GAS_STATUS_LABELS)
+        tx_hash = gas.get("tx_hash") or ""
+        return {
+            "gas_task_id": gas.get("id"),
+            "gas_status": gas.get("status") or "",
+            "gas_status_label": label,
+            "gas_status_badge": badge,
+            "gas_tx_hash": tx_hash,
+            "gas_tx_hash_short": _short_admin_hash(tx_hash),
+            "gas_error": gas.get("last_error") or "",
+        }
+    if task_status in {"GAS_REQUIRED", "GAS_QUEUED"}:
+        return {
+            "gas_task_id": task.get("gas_task_id"),
+            "gas_status": task_status,
+            "gas_status_label": "需补 Gas",
+            "gas_status_badge": "warning",
+            "gas_tx_hash": "",
+            "gas_tx_hash_short": "-",
+            "gas_error": "",
+        }
+    return {
+        "gas_task_id": task.get("gas_task_id"),
+        "gas_status": "",
+        "gas_status_label": "不需要",
+        "gas_status_badge": "neutral",
+        "gas_tx_hash": "",
+        "gas_tx_hash_short": "-",
+        "gas_error": "",
+    }
+
+
+def _collection_record_task_item(task: Dict[str, Any], gas: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    status_label, status_badge = _collection_status_meta(task.get("status"), COLLECTION_TASK_STATUS_LABELS)
+    gas_meta = _collection_record_gas_meta(task, gas)
+    coin_symbol = str(task.get("coin_symbol") or "").upper()
+    tx_hash = task.get("tx_hash") or ""
+    error_text = task.get("last_error") or gas_meta.get("gas_error") or ""
+    if not error_text and str(task.get("status") or "").strip().upper() == "SKIPPED":
+        error_text = _collection_failure_reason(task.get("reason"))["label"]
+    return {
+        "id": task.get("id"),
+        "task_no": task.get("task_no") or "",
+        "batch_id": task.get("batch_id"),
+        "user_id": task.get("user_id"),
+        "chain_key": task.get("chain_key") or "",
+        "coin_symbol": coin_symbol,
+        "from_address": task.get("from_address") or "",
+        "from_address_short": _short_admin_address(task.get("from_address")),
+        "to_address": task.get("to_address") or "",
+        "to_address_short": _short_admin_address(task.get("to_address")),
+        "amount": _fmt_admin_amount_display(task.get("amount"), coin_symbol),
+        "status": task.get("status") or "",
+        "status_label": status_label,
+        "status_badge": status_badge,
+        "reason": task.get("reason") or "",
+        "reason_label": _collection_reason_label(task.get("reason")),
+        "tx_hash": tx_hash,
+        "tx_hash_short": _short_admin_hash(tx_hash),
+        "error": error_text,
+        "error_short": _admin_short_text(error_text, 20, 8),
+        "created_at": _admin_datetime_display(task.get("created_at")),
+        **gas_meta,
+    }
+
+
+def admin_query_collection_batch_detail(
+    db: Session,
+    batch_id: int,
+    filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    filters = filters or {}
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 100)), 200)
+    try:
+        batch_row = db.execute(
+            text(
+                """
+                SELECT id, batch_no, trigger_type, target_address, chain_key, coin_symbol, status,
+                       total_tasks, success_tasks, failed_tasks, skipped_tasks, total_amount,
+                       success_amount, error_message, created_by, started_at, finished_at,
+                       created_at, updated_at,
+                       (
+                         SELECT GROUP_CONCAT(CONCAT(COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--'), ':', COALESCE(ct.amount, 0)) ORDER BY ct.coin_symbol SEPARATOR '|')
+                         FROM collection_tasks ct
+                         WHERE ct.batch_id = collection_batches.id
+                       ) AS amount_rows_raw,
+                       (
+                         SELECT GROUP_CONCAT(CONCAT(COALESCE(NULLIF(UPPER(ct.coin_symbol), ''), '--'), ':', COALESCE(ct.amount, 0)) ORDER BY ct.coin_symbol SEPARATOR '|')
+                         FROM collection_tasks ct
+                         WHERE ct.batch_id = collection_batches.id
+                           AND UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                           AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%')
+                       ) AS success_amount_rows_raw
+                FROM collection_batches
+                WHERE id = :id
+                """
+            ),
+            {"id": int(batch_id)},
+        ).mappings().first()
+        if not batch_row:
+            return _empty_page(batch=None, summary={}, items=[], tasks=[], filters=filters)
+
+        aggregate = db.execute(
+            text(
+                """
+                SELECT
+                  COUNT(*) AS task_count,
+                  COALESCE(SUM(amount), 0) AS total_amount,
+                  SUM(CASE WHEN status IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND NOT (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS success_count,
+                  SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
+                  SUM(CASE WHEN status IN ('SKIPPED', 'CANCELED') THEN 1 ELSE 0 END) AS skipped_count,
+                  SUM(CASE WHEN status NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED', 'FAILED', 'SKIPPED', 'CANCELED') OR (status IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%')) THEN 1 ELSE 0 END) AS pending_count,
+                  SUM(CASE WHEN status IN ('SENT', 'GAS_SENT', 'CONFIRMING') THEN 1 ELSE 0 END) AS sent_count,
+                  SUM(CASE WHEN status IN ('RUNNING', 'PROCESSING', 'SENDING') THEN 1 ELSE 0 END) AS processing_count,
+                  SUM(CASE WHEN UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%' THEN 1 ELSE 0 END) AS dry_run_count,
+                  SUM(CASE WHEN status IN ('GAS_REQUIRED', 'GAS_QUEUED') OR gas_task_id IS NOT NULL THEN 1 ELSE 0 END) AS gas_required_count
+                FROM collection_tasks
+                WHERE batch_id = :batch_id
+                """
+            ),
+            {"batch_id": int(batch_id)},
+        ).mappings().first()
+
+        total = int((aggregate or {}).get("task_count") or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        task_rows = db.execute(
+            text(
+                """
+                SELECT id, task_no, batch_id, user_id, chain_key, coin_symbol, asset_chain_id,
+                       from_address, to_address, amount, status, reason, tx_hash, block_number,
+                       gas_task_id, idempotency_key, retry_count, max_retry, next_retry_at,
+                       last_error, locked_at, sent_at, confirmed_at, created_at, updated_at
+                FROM collection_tasks
+                WHERE batch_id = :batch_id
+                ORDER BY created_at DESC, id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"batch_id": int(batch_id), "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+        task_dicts = [dict(row) for row in task_rows]
+
+        gas_by_collection_task: Dict[int, Dict[str, Any]] = {}
+        gas_by_id: Dict[int, Dict[str, Any]] = {}
+        gas_fallback: Dict[tuple[int, str, str], Dict[str, Any]] = {}
+        task_ids = [int(row["id"]) for row in task_dicts if row.get("id") is not None]
+        gas_task_ids = [int(row["gas_task_id"]) for row in task_dicts if row.get("gas_task_id") is not None]
+        user_ids = sorted({int(row["user_id"]) for row in task_dicts if row.get("user_id") is not None})
+        chain_keys = sorted({str(row["chain_key"] or "").strip().lower() for row in task_dicts if row.get("chain_key")})
+        from_addresses = sorted({str(row["from_address"] or "").strip().lower() for row in task_dicts if row.get("from_address")})
+
+        gas_rows = []
+        if task_ids or gas_task_ids:
+            conditions = []
+            params: Dict[str, Any] = {}
+            gas_sql = text(
+                """
+                SELECT id, task_no, collection_task_id, user_id, chain_key, gas_coin_symbol,
+                       from_address, to_address, topup_amount, status, tx_hash, last_error,
+                       created_at, updated_at
+                FROM gas_tasks
+                WHERE {where_sql}
+                ORDER BY created_at DESC, id DESC
+                """.replace("{where_sql}", "collection_task_id IN :task_ids" if task_ids else "id IN :gas_task_ids")
+            )
+            if task_ids:
+                gas_sql = gas_sql.bindparams(bindparam("task_ids", expanding=True))
+                params["task_ids"] = task_ids
+            else:
+                gas_sql = gas_sql.bindparams(bindparam("gas_task_ids", expanding=True))
+                params["gas_task_ids"] = gas_task_ids
+            gas_rows.extend(db.execute(gas_sql, params).mappings().all())
+
+        if gas_task_ids:
+            gas_sql = text(
+                """
+                SELECT id, task_no, collection_task_id, user_id, chain_key, gas_coin_symbol,
+                       from_address, to_address, topup_amount, status, tx_hash, last_error,
+                       created_at, updated_at
+                FROM gas_tasks
+                WHERE id IN :gas_task_ids
+                ORDER BY created_at DESC, id DESC
+                """
+            ).bindparams(bindparam("gas_task_ids", expanding=True))
+            gas_rows.extend(db.execute(gas_sql, {"gas_task_ids": gas_task_ids}).mappings().all())
+
+        if user_ids and chain_keys and from_addresses:
+            fallback_sql = text(
+                """
+                SELECT id, task_no, collection_task_id, user_id, chain_key, gas_coin_symbol,
+                       from_address, to_address, topup_amount, status, tx_hash, last_error,
+                       created_at, updated_at
+                FROM gas_tasks
+                WHERE user_id IN :user_ids
+                  AND LOWER(chain_key) IN :chain_keys
+                  AND LOWER(to_address) IN :from_addresses
+                ORDER BY created_at DESC, id DESC
+                LIMIT 500
+                """
+            ).bindparams(
+                bindparam("user_ids", expanding=True),
+                bindparam("chain_keys", expanding=True),
+                bindparam("from_addresses", expanding=True),
+            )
+            gas_rows.extend(
+                db.execute(
+                    fallback_sql,
+                    {"user_ids": user_ids, "chain_keys": chain_keys, "from_addresses": from_addresses},
+                ).mappings().all()
+            )
+
+        seen_gas_ids: set[int] = set()
+        for row in gas_rows:
+            gas = dict(row)
+            gas_id = int(gas.get("id") or 0)
+            if gas_id in seen_gas_ids:
+                continue
+            seen_gas_ids.add(gas_id)
+            if gas_id:
+                gas_by_id[gas_id] = gas
+            if gas.get("collection_task_id") is not None:
+                gas_by_collection_task.setdefault(int(gas["collection_task_id"]), gas)
+            fallback_key = (
+                int(gas.get("user_id") or 0),
+                str(gas.get("chain_key") or "").strip().lower(),
+                str(gas.get("to_address") or "").strip().lower(),
+            )
+            gas_fallback.setdefault(fallback_key, gas)
+
+        items = []
+        for task in task_dicts:
+            gas = None
+            if task.get("gas_task_id") is not None:
+                gas = gas_by_id.get(int(task["gas_task_id"]))
+            if gas is None and task.get("id") is not None:
+                gas = gas_by_collection_task.get(int(task["id"]))
+            if gas is None:
+                gas = gas_fallback.get(
+                    (
+                        int(task.get("user_id") or 0),
+                        str(task.get("chain_key") or "").strip().lower(),
+                        str(task.get("from_address") or "").strip().lower(),
+                    )
+                )
+            items.append(_collection_record_task_item(task, gas))
+
+        batch_row_dict = dict(batch_row)
+        batch_row_dict.update(
+            {
+                "task_status_aggregate": 1,
+                "task_aggregate_count": int((aggregate or {}).get("task_count") or 0),
+                "real_success_tasks": int((aggregate or {}).get("success_count") or 0),
+                "aggregate_failed_tasks": int((aggregate or {}).get("failed_count") or 0),
+                "waiting_count": int((aggregate or {}).get("pending_count") or 0),
+                "processing_count": int((aggregate or {}).get("processing_count") or 0),
+                "sent_count": int((aggregate or {}).get("sent_count") or 0),
+                "dry_run_count": int((aggregate or {}).get("dry_run_count") or 0),
+            }
+        )
+        batch = _admin_collection_batch_item(batch_row_dict)
+        batch_label, batch_badge = batch.get("status_label"), batch.get("status_badge")
+        symbol = batch.get("coin_symbol") or ""
+        total_amount = (aggregate or {}).get("total_amount") or batch_row.get("total_amount") or Decimal("0")
+        summary = {
+            "batch_id": batch.get("batch_no") or batch.get("id"),
+            "chain_key": batch.get("chain_key") or "-",
+            "coin_symbol": symbol or "-",
+            "total_amount": batch.get("total_amount_label") or _fmt_admin_amount_display(total_amount, symbol),
+            "total_amount_detail_label": batch.get("total_amount_detail_label") or "",
+            "task_count": int((aggregate or {}).get("task_count") or 0),
+            "success_count": int((aggregate or {}).get("success_count") or 0),
+            "failed_count": int((aggregate or {}).get("failed_count") or 0),
+            "pending_count": int((aggregate or {}).get("pending_count") or 0),
+            "skipped_count": int((aggregate or {}).get("skipped_count") or 0),
+            "gas_required_count": int((aggregate or {}).get("gas_required_count") or 0),
+            "status_label": batch_label,
+            "status_badge": batch_badge,
+            "created_at": batch.get("created_at"),
+        }
+    except Exception:
+        logger.exception("admin_query_collection_batch_detail query failed")
+        return _empty_page(batch=None, summary={}, items=[], tasks=[], filters=filters)
+
+    return _empty_page(
+        batch=batch,
+        summary=summary,
+        items=items,
+        tasks=items,
+        filters=filters,
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+def _collection_center_network_rows(db: Session) -> list[Dict[str, Any]]:
+    collection_enabled_sql = (
+        "COALESCE(c.collection_enabled, 0) AS collection_enabled"
+        if _has_db_column(db, "chains", "collection_enabled")
+        else "1 AS collection_enabled"
+    )
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+              c.id,
+              c.chain_key,
+              c.name,
+              c.native_symbol,
+              c.collection_address,
+              {collection_enabled_sql},
+              COUNT(DISTINCT ac.id) AS asset_count
+            FROM chains c
+            JOIN asset_chains ac ON ac.chain_id = c.id
+            JOIN assets a ON a.id = ac.asset_id
+            WHERE c.enabled = 1
+              AND ac.enabled = 1
+              AND a.enabled = 1
+            GROUP BY c.id, c.chain_key, c.name, c.native_symbol, c.collection_address, collection_enabled
+            ORDER BY c.name ASC, c.chain_key ASC
+            """
+        )
+    ).mappings().all()
+    items: list[Dict[str, Any]] = []
+    for row in rows:
+        chain_key = _normalize_chain_key(row.get("chain_key"))
+        if not chain_key:
+            continue
+        capability = get_chain_capability(chain_key)
+        chain_family = str(capability.get("chain_family") or "").upper()
+        if chain_family != EVM:
+            continue
+        runtime_status = str(capability.get("runtime_status") or CONFIG_ONLY).upper()
+        collection_supported = bool(capability.get("collection_supported"))
+        collection_enabled = 1 if row.get("collection_enabled") is None else int(row.get("collection_enabled") or 0)
+        can_collect = runtime_status == READY and collection_supported and bool(collection_enabled)
+        items.append(
+            {
+                "id": int(row.get("id") or 0),
+                "chain_key": chain_key,
+                "chain_name": row.get("name") or chain_key,
+                "display_name": row.get("name") or chain_key,
+                "native_symbol": row.get("native_symbol") or "",
+                "runtime_status": runtime_status,
+                "capability": "READY" if can_collect else runtime_status,
+                "collection_supported": collection_supported,
+                "collection_enabled": collection_enabled,
+                "collection_address": row.get("collection_address") or "",
+                "asset_count": int(row.get("asset_count") or 0),
+                "can_collect": can_collect,
+                "status_label": "可归集" if can_collect else "配置中，暂不可归集",
+                "status_badge": "success" if can_collect else "warning",
+            }
+        )
+    return items
+
+
+def admin_query_collection_center_filters(db: Session) -> Dict[str, Any]:
+    networks = _collection_center_network_rows(db)
+    chain_keys = [item["chain_key"] for item in networks]
+    assets: list[Dict[str, Any]] = []
+    if chain_keys:
+        rows = db.execute(
+            text(
+                """
+                SELECT DISTINCT a.symbol, a.name, LOWER(c.chain_key) AS chain_key
+                FROM asset_chains ac
+                JOIN assets a ON a.id = ac.asset_id
+                JOIN chains c ON c.id = ac.chain_id
+                WHERE c.enabled = 1
+                  AND ac.enabled = 1
+                  AND a.enabled = 1
+                  AND LOWER(c.chain_key) IN :chain_keys
+                  AND ac.contract_address IS NOT NULL
+                  AND TRIM(ac.contract_address) <> ''
+                ORDER BY a.symbol ASC
+                """
+            ).bindparams(bindparam("chain_keys", expanding=True)),
+            {"chain_keys": chain_keys},
+        ).mappings().all()
+        asset_map: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            symbol = _normalize_code(row.get("symbol"))
+            chain_key = _normalize_chain_key(row.get("chain_key"))
+            if not symbol or not chain_key:
+                continue
+            item = asset_map.setdefault(
+                symbol,
+                {
+                    "symbol": symbol,
+                    "name": row.get("name") or symbol,
+                    "chain_keys": set(),
+                },
+            )
+            item["chain_keys"].add(chain_key)
+        assets = [
+            {
+                "symbol": item["symbol"],
+                "name": item["name"],
+                "chain_keys": sorted(item["chain_keys"]),
+            }
+            for item in sorted(asset_map.values(), key=lambda row: str(row.get("symbol") or ""))
+        ]
+    if not any(item.get("symbol") == "USDT" for item in assets):
+        assets.insert(0, {"symbol": "USDT", "name": "USDT", "chain_keys": []})
+    asset_networks = {
+        str(item.get("symbol") or ""): list(item.get("chain_keys") or [])
+        for item in assets
+        if item.get("symbol")
+    }
+    network_assets: Dict[str, list[str]] = {chain: [] for chain in chain_keys}
+    for item in assets:
+        symbol = str(item.get("symbol") or "")
+        for chain in item.get("chain_keys") or []:
+            network_assets.setdefault(str(chain), []).append(symbol)
+    return {"networks": networks, "assets": assets, "asset_networks": asset_networks, "network_assets": network_assets}
+
+
+def _collection_auto_parse_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text_value = str(value or "").strip()
+        if not text_value:
+            return None
+        normalized = text_value.replace("Z", "+00:00").replace("T", " ")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+    if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _collection_auto_relative_time(value: Any) -> str:
+    parsed = _collection_auto_parse_datetime(value)
+    if not parsed:
+        return "-"
+    seconds = max(0, int((datetime.utcnow() - parsed).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}秒前"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}分钟前"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}小时前"
+    days = hours // 24
+    return f"{days}天前"
+
+
+def _collection_auto_enabled_label(enabled: bool) -> Dict[str, str]:
+    return {
+        "label": "开启" if enabled else "关闭",
+        "badge": "success" if enabled else "neutral",
+    }
+
+
+def _collection_auto_service_rows() -> tuple[list[Dict[str, Any]], list[str], Dict[str, str]]:
+    services = {
+        "collection_auto_scheduler": {
+            "label": "自动扫描调度",
+            "delay_impact": "自动扫描调度最近无心跳，自动创建归集任务可能延迟",
+            "missing_impact": "未检测到自动扫描调度心跳；如需自动创建任务，请启动 start_collection_auto_scheduler.py",
+        },
+        "collection": {
+            "label": "归集服务",
+            "delay_impact": "归集服务未检测到心跳，自动归集可能延迟",
+            "missing_impact": "未检测到心跳数据，请确认常驻服务是否已接入 heartbeat",
+        },
+        "gas": {
+            "label": "补Gas服务",
+            "delay_impact": "补 Gas 服务未检测到心跳，Gas 补给可能延迟",
+            "missing_impact": "未检测到心跳数据，请确认常驻服务是否已接入 heartbeat",
+        },
+        "tx_confirm": {
+            "label": "链上确认服务",
+            "delay_impact": "链上确认服务未检测到心跳，交易确认状态可能延迟",
+            "missing_impact": "未检测到心跳数据，请确认常驻服务是否已接入 heartbeat",
+        },
+    }
+    observed: Dict[str, Dict[str, Any]] = {
+        key: {"online": 0, "stale": 0, "latest_seen": None, "queue_length": 0}
+        for key in services
+    }
+    try:
+        from rq import Worker
+
+        from app.core.rq import get_queue, get_redis_connection
+
+        connection = get_redis_connection()
+        connection.ping()
+        for queue_name in observed:
+            try:
+                observed[queue_name]["queue_length"] = int(get_queue(queue_name).count)
+            except Exception:
+                observed[queue_name]["queue_length"] = 0
+        scheduler_heartbeat = read_service_heartbeat(connection, "collection_auto_scheduler")
+        if scheduler_heartbeat.get("exists"):
+            scheduler_alive = is_heartbeat_alive(scheduler_heartbeat)
+            observed["collection_auto_scheduler"]["online" if scheduler_alive else "stale"] = 1
+            observed["collection_auto_scheduler"]["latest_seen"] = scheduler_heartbeat.get("last_seen_at")
+        now = datetime.utcnow()
+        for item in Worker.all(connection=connection):
+            last_seen = getattr(item, "last_heartbeat", None)
+            is_online = _admin_rq_worker_is_online(item, now)
+            bucket = "online" if is_online else "stale"
+            for queue_name in _admin_rq_worker_queue_names(item):
+                if queue_name not in observed:
+                    continue
+                observed[queue_name][bucket] = int(observed[queue_name].get(bucket) or 0) + 1
+                current_latest = observed[queue_name].get("latest_seen")
+                last_seen_dt = _collection_auto_parse_datetime(last_seen)
+                current_dt = _collection_auto_parse_datetime(current_latest)
+                if last_seen_dt and (not current_dt or last_seen_dt > current_dt):
+                    observed[queue_name]["latest_seen"] = last_seen
+    except Exception as exc:
+        logger.warning("collection auto service status query failed: %r", exc)
+
+    rows: list[Dict[str, Any]] = []
+    alerts: list[str] = []
+    status_by_key: Dict[str, str] = {}
+    for key, meta in services.items():
+        state = observed.get(key) or {}
+        online = int(state.get("online") or 0)
+        stale = int(state.get("stale") or 0)
+        if online > 0:
+            status_key = "running"
+            status_label = "运行中"
+            status_badge = "success"
+            impact = ""
+        elif stale > 0:
+            status_key = "stale"
+            status_label = "最近无心跳"
+            status_badge = "warning"
+            impact = str(meta["delay_impact"])
+        else:
+            status_key = "unconfigured"
+            status_label = "未配置心跳"
+            status_badge = "neutral"
+            impact = str(meta["missing_impact"])
+        status_by_key[key] = status_key
+        if status_key in {"stale", "offline"}:
+            alerts.append(str(meta["delay_impact"]))
+        rows.append(
+            {
+                "key": key,
+                "label": meta["label"],
+                "status_key": status_key,
+                "status_label": status_label,
+                "status_badge": status_badge,
+                "last_seen_label": _collection_auto_relative_time(state.get("latest_seen")),
+                "worker_count": online,
+                "stale_worker_count": stale,
+                "worker_label": f"{online} 在线",
+                "stale_worker_label": f"历史过期 {stale}" if stale > 0 else "",
+                "queue_length": int(state.get("queue_length") or 0),
+                "impact": impact,
+            }
+        )
+    return rows, alerts, status_by_key
+
+
+def _collection_auto_min_amount_label(chain_key: str, assets: list[Dict[str, Any]]) -> str:
+    selected: Dict[str, Any] = {}
+    for item in assets:
+        if _normalize_code(item.get("symbol")) == "USDT":
+            selected = item
+            break
+    if not selected and assets:
+        selected = assets[0]
+    symbol = _normalize_code(selected.get("symbol")) if selected else ""
+    if not symbol:
+        return "-"
+    try:
+        from app.services.collection_chain_helper import compute_min_collect_amount
+
+        configured_min = selected.get("collection_min_amount")
+        amount = compute_min_collect_amount(
+            chain_key=chain_key,
+            coin_symbol=symbol,
+            configured_min_amount=_parse_decimal(configured_min) if configured_min is not None else None,
+        )
+    except Exception:
+        amount = Decimal("0")
+    return f"{_fmt_admin_amount_display(amount, symbol)} {symbol}"
+
+
+def _collection_auto_chain_assets(db: Session, chain_keys: list[str]) -> Dict[str, list[Dict[str, Any]]]:
+    if not chain_keys:
+        return {}
+    collection_min_amount_sql = (
+        "ac.collection_min_amount AS collection_min_amount"
+        if _has_db_column(db, "asset_chains", "collection_min_amount")
+        else "NULL AS collection_min_amount"
+    )
+    rows = db.execute(
+        text(
+            f"""
+            SELECT LOWER(c.chain_key) AS chain_key, a.symbol, a.name, {collection_min_amount_sql}
+            FROM asset_chains ac
+            JOIN chains c ON c.id = ac.chain_id
+            JOIN assets a ON a.id = ac.asset_id
+            WHERE c.enabled = 1
+              AND ac.enabled = 1
+              AND a.enabled = 1
+              AND LOWER(c.chain_key) IN :chain_keys
+            ORDER BY LOWER(c.chain_key), a.symbol
+            """
+        ).bindparams(bindparam("chain_keys", expanding=True)),
+        {"chain_keys": chain_keys},
+    ).mappings().all()
+    result: Dict[str, list[Dict[str, Any]]] = {chain: [] for chain in chain_keys}
+    for row in rows:
+        chain_key = _normalize_chain_key(row.get("chain_key"))
+        symbol = _normalize_code(row.get("symbol"))
+        if chain_key and symbol:
+            result.setdefault(chain_key, []).append(
+                {
+                    "symbol": symbol,
+                    "name": row.get("name") or symbol,
+                    "collection_min_amount": row.get("collection_min_amount"),
+                }
+            )
+    return result
+
+
+COLLECTION_AUTO_RULE_CONFIG_PREFIX = "collection_auto_rule:"
+COLLECTION_AUTO_DEFAULT_SCAN_INTERVAL_SECONDS = 300
+COLLECTION_AUTO_DEFAULT_MAX_ADDRESSES = 200
+
+
+def _collection_auto_config_key(chain_key: str) -> str:
+    return f"{COLLECTION_AUTO_RULE_CONFIG_PREFIX}{_normalize_chain_key(chain_key)}"
+
+
+def _collection_auto_decimal_form_value(value: Any) -> str:
+    if _is_empty_config_value(value):
+        return ""
+    try:
+        return format(Decimal(str(value)), "f")
+    except Exception:
+        return ""
+
+
+def _collection_auto_load_rule_configs(db: Session, chain_keys: list[str]) -> Dict[str, Dict[str, Any]]:
+    if not chain_keys:
+        return {}
+    config_keys = [_collection_auto_config_key(chain_key) for chain_key in chain_keys if chain_key]
+    if not config_keys:
+        return {}
+    rows = (
+        db.query(SystemConfig)
+        .filter(SystemConfig.config_key.in_(config_keys))
+        .all()
+    )
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        suffix = str(row.config_key or "").replace(COLLECTION_AUTO_RULE_CONFIG_PREFIX, "", 1)
+        chain_key = _normalize_chain_key(suffix)
+        try:
+            payload = json.loads(row.config_value or "{}")
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            result[chain_key] = payload
+    return result
+
+
+def _collection_auto_int_from_config(value: Any, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(str(value or "").strip())
+    except Exception:
+        parsed = default
+    if parsed < minimum:
+        parsed = minimum
+    if parsed > maximum:
+        parsed = maximum
+    return parsed
+
+
+def _collection_auto_bool_from_config(value: Any, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "on", "yes", "enabled"}
+
+
+def _collection_auto_rule_config_from_payload(payload: Dict[str, Any]) -> tuple[Dict[str, Any], list[str]]:
+    errors: list[str] = []
+    auto_collect_enabled = bool(_parse_bool01(payload.get("auto_collect_enabled")))
+    auto_gas_enabled = bool(_parse_bool01(payload.get("auto_gas_enabled")))
+    min_collect_amount = _parse_optional_non_negative_decimal_config_field(
+        payload.get("min_collect_amount"),
+        field_label="最低归集金额",
+        errors=errors,
+    )
+    reserve_gas_balance = _parse_optional_non_negative_decimal_config_field(
+        payload.get("reserve_gas_balance"),
+        field_label="保留 Gas 余额",
+        errors=errors,
+    )
+    scan_interval = _parse_int(payload.get("scan_interval_seconds"), COLLECTION_AUTO_DEFAULT_SCAN_INTERVAL_SECONDS)
+    if scan_interval < 60:
+        errors.append("扫描周期不能小于 60 秒")
+        scan_interval = 60
+    max_addresses = _parse_int(payload.get("max_addresses"), COLLECTION_AUTO_DEFAULT_MAX_ADDRESSES)
+    if max_addresses < 1 or max_addresses > 500:
+        errors.append("单次最大地址数必须在 1 到 500 之间")
+        max_addresses = min(500, max(1, max_addresses))
+    return {
+        "auto_collect_enabled": auto_collect_enabled,
+        "auto_gas_enabled": auto_gas_enabled,
+        "min_collect_amount": _collection_auto_decimal_form_value(min_collect_amount),
+        "scan_interval_seconds": scan_interval,
+        "max_addresses": max_addresses,
+        "reserve_gas_balance": _collection_auto_decimal_form_value(reserve_gas_balance),
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }, errors
+
+
+def save_collection_auto_rule_config(db: Session, chain_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized_chain_key = _normalize_chain_key(chain_key)
+    if not normalized_chain_key:
+        raise ValueError("CHAIN_KEY_REQUIRED")
+    chain_row = db.execute(
+        text(
+            """
+            SELECT id, chain_key
+            FROM chains
+            WHERE LOWER(chain_key) = :chain_key
+            LIMIT 1
+            """
+        ),
+        {"chain_key": normalized_chain_key},
+    ).mappings().first()
+    if not chain_row:
+        raise ValueError("CHAIN_NOT_FOUND")
+    config, errors = _collection_auto_rule_config_from_payload(payload)
+    if errors:
+        raise ValueError("; ".join(errors))
+    if _has_db_column(db, "chains", "collection_enabled"):
+        set_clauses = ["collection_enabled=:collection_enabled"]
+        params: Dict[str, Any] = {
+            "chain_key": normalized_chain_key,
+            "collection_enabled": 1 if config["auto_collect_enabled"] else 0,
+        }
+        if _has_db_column(db, "chains", "updated_at"):
+            set_clauses.append("updated_at=:updated_at")
+            params["updated_at"] = datetime.utcnow()
+        db.execute(
+            text(
+                f"""
+                UPDATE chains
+                SET {", ".join(set_clauses)}
+                WHERE LOWER(chain_key)=:chain_key
+                """
+            ),
+            params,
+        )
+    config_key = _collection_auto_config_key(normalized_chain_key)
+    config_row = (
+        db.query(SystemConfig)
+        .filter(SystemConfig.config_key == config_key)
+        .first()
+    )
+    config_value = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+    if config_row:
+        config_row.config_value = config_value
+        config_row.description = "Collection auto rule settings"
+        config_row.updated_at = datetime.utcnow()
+    else:
+        db.add(
+            SystemConfig(
+                config_key=config_key,
+                config_value=config_value,
+                description="Collection auto rule settings",
+            )
+        )
+    db.flush()
+    return {"chain_key": normalized_chain_key, "config": config}
+
+
+def _collection_auto_recent_task_meta(db: Session, chain_key: str) -> Dict[str, str]:
+    try:
+        collection_row = db.execute(
+            text(
+                """
+                SELECT confirmed_at, sent_at, updated_at
+                FROM collection_tasks
+                WHERE chain_key = :chain_key
+                  AND UPPER(status) IN :success_statuses
+                ORDER BY COALESCE(confirmed_at, sent_at, updated_at, created_at) DESC, id DESC
+                LIMIT 1
+                """
+            ).bindparams(bindparam("success_statuses", expanding=True)),
+            {"chain_key": chain_key, "success_statuses": COLLECTION_OP_SUCCESS_STATUSES},
+        ).mappings().first()
+        gas_row = db.execute(
+            text(
+                """
+                SELECT confirmed_at, sent_at, updated_at
+                FROM gas_tasks
+                WHERE chain_key = :chain_key
+                  AND UPPER(status) IN :success_statuses
+                ORDER BY COALESCE(confirmed_at, sent_at, updated_at, created_at) DESC, id DESC
+                LIMIT 1
+                """
+            ).bindparams(bindparam("success_statuses", expanding=True)),
+            {"chain_key": chain_key, "success_statuses": COLLECTION_OP_SUCCESS_STATUSES},
+        ).mappings().first()
+        success_tx = db.execute(
+            text(
+                """
+                SELECT tx_hash, finished_at FROM (
+                  SELECT tx_hash, COALESCE(confirmed_at, sent_at, updated_at, created_at) AS finished_at
+                  FROM collection_tasks
+                  WHERE chain_key = :chain_key AND UPPER(status) IN :success_statuses AND NULLIF(tx_hash, '') IS NOT NULL
+                  UNION ALL
+                  SELECT tx_hash, COALESCE(confirmed_at, sent_at, updated_at, created_at) AS finished_at
+                  FROM gas_tasks
+                  WHERE chain_key = :chain_key AND UPPER(status) IN :success_statuses AND NULLIF(tx_hash, '') IS NOT NULL
+                ) tx_rows
+                ORDER BY finished_at DESC
+                LIMIT 1
+                """
+            ).bindparams(bindparam("success_statuses", expanding=True)),
+            {"chain_key": chain_key, "success_statuses": COLLECTION_OP_SUCCESS_STATUSES},
+        ).mappings().first()
+        failed_row = db.execute(
+            text(
+                """
+                SELECT last_error, updated_at FROM (
+                  SELECT last_error, updated_at, created_at
+                  FROM collection_tasks
+                  WHERE chain_key = :chain_key AND UPPER(status) IN :failed_statuses
+                  UNION ALL
+                  SELECT last_error, updated_at, created_at
+                  FROM gas_tasks
+                  WHERE chain_key = :chain_key AND UPPER(status) IN :failed_statuses
+                ) fail_rows
+                ORDER BY COALESCE(updated_at, created_at) DESC
+                LIMIT 1
+                """
+            ).bindparams(bindparam("failed_statuses", expanding=True)),
+            {"chain_key": chain_key, "failed_statuses": (*COLLECTION_OP_FAILED_STATUSES, *COLLECTION_OP_TIMEOUT_STATUSES)},
+        ).mappings().first()
+    except Exception:
+        logger.exception("collection auto recent task query failed chain=%s", chain_key)
+        collection_row = gas_row = success_tx = failed_row = None
+    tx_hash = str((success_tx or {}).get("tx_hash") or "")
+    failure = _collection_failure_reason((failed_row or {}).get("last_error"))
+    return {
+        "recent_collection_label": _collection_auto_relative_time((collection_row or {}).get("confirmed_at") or (collection_row or {}).get("sent_at") or (collection_row or {}).get("updated_at")),
+        "recent_gas_label": _collection_auto_relative_time((gas_row or {}).get("confirmed_at") or (gas_row or {}).get("sent_at") or (gas_row or {}).get("updated_at")),
+        "recent_success_tx": _short_admin_hash(tx_hash) if tx_hash else "-",
+        "recent_success_tx_full": tx_hash,
+        "recent_fail_reason": failure["short"] if failure["full"] else "-",
+        "recent_fail_reason_full": failure["full"],
+    }
+
+
+def admin_query_collection_auto_settings(db: Session) -> Dict[str, Any]:
+    networks = _collection_center_network_rows(db)
+    chain_keys = [str(item.get("chain_key") or "") for item in networks if item.get("chain_key")]
+    assets_by_chain = _collection_auto_chain_assets(db, chain_keys)
+    rule_configs = _collection_auto_load_rule_configs(db, chain_keys)
+    statuses = get_scan_statuses(chain_keys)
+    service_rows, service_alerts, service_status = _collection_auto_service_rows()
+    scheduler_status = service_status.get("collection_auto_scheduler") or "unconfigured"
+    gas_service_status = service_status.get("gas") or "unconfigured"
+    tx_confirm_service_status = service_status.get("tx_confirm") or "unconfigured"
+    scheduler_running = scheduler_status == "running"
+    scan_interval = 300
+    try:
+        import os
+
+        scan_interval = max(1, int(os.getenv("COLLECTION_AUTO_SCAN_INTERVAL_SECONDS", "300") or "300"))
+    except Exception:
+        scan_interval = 300
+
+    rows: list[Dict[str, Any]] = []
+    enabled_network_count = 0
+    auto_collect_count = 0
+    auto_gas_count = 0
+    abnormal_count = 0
+    for network in networks:
+        chain_key = _normalize_chain_key(network.get("chain_key"))
+        if not chain_key:
+            continue
+        can_collect = bool(network.get("can_collect"))
+        capability = get_chain_capability(chain_key)
+        rule_config = rule_configs.get(chain_key) or {}
+        auto_gas_default = can_collect and bool(capability.get("gas_topup_supported", True))
+        auto_gas_enabled = can_collect and _collection_auto_bool_from_config(
+            rule_config.get("auto_gas_enabled"),
+            auto_gas_default,
+        )
+        auto_task_enabled = can_collect
+        rule_scan_interval = _collection_auto_int_from_config(
+            rule_config.get("scan_interval_seconds"),
+            scan_interval,
+            minimum=60,
+            maximum=86400,
+        )
+        rule_max_addresses = _collection_auto_int_from_config(
+            rule_config.get("max_addresses"),
+            COLLECTION_AUTO_DEFAULT_MAX_ADDRESSES,
+            minimum=1,
+            maximum=500,
+        )
+        rule_min_collect_amount = str(rule_config.get("min_collect_amount") or "").strip()
+        min_collect_label = (
+            _fmt_admin_amount_display(rule_min_collect_amount, "")
+            if rule_min_collect_amount
+            else _collection_auto_min_amount_label(chain_key, assets_by_chain.get(chain_key) or [])
+        )
+        reserve_gas_balance = str(rule_config.get("reserve_gas_balance") or "").strip()
+        if can_collect:
+            enabled_network_count += 1
+        if auto_task_enabled:
+            auto_collect_count += 1
+        if auto_gas_enabled:
+            auto_gas_count += 1
+        status = statuses.get(chain_key) or {}
+        cached = load_scan_snapshot(chain_key, {"chain_key": chain_key}) or load_scan_snapshot(chain_key, {})
+        scan_meta = (cached or {}).get("scan") or (cached or {}).get("scan_meta") or {}
+        raw_scan_status = status.get("status") or scan_meta.get("status") or ""
+        scan_label_time = (
+            status.get("finished_at")
+            or status.get("updated_at")
+            or scan_meta.get("finished_at")
+            or (cached or {}).get("snapshot_saved_at")
+            or ""
+        )
+        rule_notes: list[str] = []
+        scan_abnormal = _collection_center_normalize_scan_status(raw_scan_status) in {"failed", "timeout"}
+        if auto_gas_enabled and gas_service_status != "running":
+            rule_notes.append("补 Gas worker 未运行，Gas 补给可能延迟")
+        if tx_confirm_service_status != "running":
+            rule_notes.append("链上确认 worker 未运行，确认状态可能延迟")
+        if not can_collect:
+            rule_status_label = "已暂停"
+            rule_status_badge = "neutral"
+        elif not scheduler_running:
+            rule_status_label = "调度未运行"
+            rule_status_badge = "warning"
+            abnormal_count += 1
+        elif scan_abnormal:
+            rule_status_label = "异常"
+            rule_status_badge = "danger"
+            abnormal_count += 1
+        else:
+            rule_status_label = "正常"
+            rule_status_badge = "success"
+        recent = _collection_auto_recent_task_meta(db, chain_key)
+        auto_gas_meta = _collection_auto_enabled_label(auto_gas_enabled)
+        auto_task_meta = _collection_auto_enabled_label(auto_task_enabled)
+        rows.append(
+            {
+                "chain_key": chain_key,
+                "display_name": network.get("display_name") or chain_key,
+                "min_collect_label": min_collect_label,
+                "min_collect_amount_form": rule_min_collect_amount,
+                "auto_gas_label": auto_gas_meta["label"],
+                "auto_gas_badge": auto_gas_meta["badge"],
+                "auto_gas_enabled": auto_gas_enabled,
+                "auto_task_label": auto_task_meta["label"],
+                "auto_task_badge": auto_task_meta["badge"],
+                "auto_task_enabled": auto_task_enabled,
+                "scan_interval_seconds": rule_scan_interval,
+                "scan_interval_label": f"{rule_scan_interval}秒",
+                "max_addresses": rule_max_addresses,
+                "max_addresses_label": str(rule_max_addresses),
+                "reserve_gas_balance": reserve_gas_balance,
+                "reserve_gas_balance_label": reserve_gas_balance or "-",
+                "recent_scan_label": _collection_auto_relative_time(scan_label_time),
+                "status_label": rule_status_label,
+                "status_badge": rule_status_badge,
+                "status_note": "；".join(rule_notes),
+                "recent_scan_at": _admin_datetime_display(_collection_auto_parse_datetime(scan_label_time)) or "-",
+                **recent,
+            }
+        )
+
+    return {
+        "overview": {
+            "enabled_network_count": enabled_network_count,
+            "auto_collect_count": auto_collect_count,
+            "auto_gas_count": auto_gas_count,
+            "abnormal_count": abnormal_count,
+        },
+        "services": service_rows,
+        "service_alerts": service_alerts,
+        "rules": rows,
+    }
+
+
+def _collection_center_user_id(value: Any) -> Optional[int]:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    parsed = _parse_int(text_value, 0)
+    return parsed if parsed > 0 else None
+
+
+def _collection_center_decimal_form_value(value: Any) -> str:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return ""
+    try:
+        amount = Decimal(text_value)
+    except Exception:
+        return ""
+    return format(amount, "f")
+
+
+def _collection_center_min_amount(value: Any) -> Optional[Decimal]:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    amount = _parse_decimal(text_value, Decimal("0"))
+    if amount <= 0:
+        raise ValueError("最小余额必须大于 0")
+    return amount
+
+
+COLLECTION_CENTER_VIEWS = {"networks", "addresses", "assets"}
+
+
+def _collection_center_view(value: Any) -> str:
+    view = str(value or "").strip().lower()
+    return view if view in COLLECTION_CENTER_VIEWS else "networks"
+
+
+def _collection_center_filter_values(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    filters = filters or {}
+    candidate_source = str(filters.get("candidate_source") or "").strip().lower()
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or filters.get("symbol"))
+    if not coin_symbol and candidate_source != "address_book_missing_candidates":
+        coin_symbol = "USDT"
+    return {
+        "view": _collection_center_view(filters.get("view")),
+        "chain_key": _normalize_chain_key(filters.get("chain_key") or filters.get("network")),
+        "coin_symbol": coin_symbol,
+        "min_amount": _collection_center_decimal_form_value(filters.get("min_amount")),
+        "user_id": str(filters.get("user_id") or "").strip(),
+        "address": str(filters.get("address") or "").strip(),
+        "candidate_source": candidate_source,
+        "scan_batch_id": str(filters.get("scan_batch_id") or "").strip(),
+        "scan_batch_started_at": str(filters.get("scan_batch_started_at") or "").strip(),
+    }
+
+
+COLLECTION_REASON_LABELS = {
+    "TOKEN_BALANCE_NOT_ABOVE_RESERVE": "余额未超过保留额度",
+    "AVAILABLE_AMOUNT_BELOW_MIN_COLLECT": "低于最小归集金额",
+    "COLLECTIBLE_BUT_GAS_REQUIRED": "可归集，需补 Gas",
+    "COLLECTIBLE_GAS_SUFFICIENT": "可归集",
+    "COLLECTIBLE": "可归集",
+    "GAS_TOPUP_REQUIRED": "需要补 Gas",
+    "CONFIG_INCOMPLETE": "地址配置不完整",
+    "TOKEN_CONTRACT_ADDRESS_MISSING": "token 合约地址缺失",
+}
+
+COLLECTION_CENTER_WAITING_TASK_STATUSES = ("PENDING", "QUEUED")
+COLLECTION_CENTER_PROCESSING_TASK_STATUSES = (
+    "RUNNING",
+    "PROCESSING",
+    "SENDING",
+    "SENT",
+    "READY",
+    "GAS_REQUIRED",
+    "GAS_QUEUED",
+)
+COLLECTION_CENTER_ACTIVE_TASK_STATUSES = (
+    *COLLECTION_CENTER_WAITING_TASK_STATUSES,
+    *COLLECTION_CENTER_PROCESSING_TASK_STATUSES,
+)
+COLLECTION_CENTER_SUCCESS_TASK_STATUSES = ("SUCCESS", "COMPLETED", "CONFIRMED")
+COLLECTION_CENTER_FAILED_TASK_STATUSES = ("FAILED", "ERROR", "TIMEOUT")
+COLLECTION_CENTER_CANCELED_TASK_STATUSES = ("CANCELED", "CANCELLED")
+COLLECTION_CENTER_ACTIVE_COLLECTION_STATUSES = COLLECTION_CENTER_ACTIVE_TASK_STATUSES
+COLLECTION_CENTER_ACTIVE_GAS_STATUSES = COLLECTION_CENTER_ACTIVE_TASK_STATUSES
+COLLECTION_CENTER_SUCCESS_COLLECTION_STATUSES = COLLECTION_CENTER_SUCCESS_TASK_STATUSES
+COLLECTION_CENTER_SCAN_STATUS_LABELS = {
+    "completed": ("已完成", "success"),
+    "success": ("已完成", "success"),
+    "running": ("扫描中", "info"),
+    "queued": ("等待中", "info"),
+    "failed": ("扫描失败", "warning"),
+    "timeout": ("扫描超时", "warning"),
+    "none": ("未扫描", "neutral"),
+}
+COLLECTION_CENTER_SCAN_STATUS_LABELS["completed_with_errors"] = ("已完成（有失败）", "warning")
+
+
+def _collection_center_normalize_scan_status(value: Any) -> str:
+    status = str(value or "").strip().lower()
+    if status in {"completed", "completed_with_errors", "success", "running", "queued", "failed", "timeout"}:
+        return status
+    if status in {"scanned", "read_ok"}:
+        return "completed"
+    if status in {"read_failed"}:
+        return "failed"
+    return "none"
+
+
+def _collection_center_scan_status_meta(value: Any) -> tuple[str, str]:
+    return COLLECTION_CENTER_SCAN_STATUS_LABELS.get(
+        _collection_center_normalize_scan_status(value),
+        COLLECTION_CENTER_SCAN_STATUS_LABELS["none"],
+    )
+
+
+def _collection_center_scan_time_label(value: Any) -> str:
+    text_value = str(value or "").strip()
+    return text_value if text_value and text_value not in {"-", "未扫描", "待扫描"} else "未扫描"
+
+
+def _collection_reason_label(reason: Any) -> str:
+    reason_text = str(reason or "").strip()
+    if not reason_text:
+        return "-"
+    if reason_text.startswith("ONCHAIN_BALANCE_CHECK_FAILED"):
+        return "链上余额扫描失败"
+    if reason_text.startswith("ACTIVE_COLLECTION_TASK_EXISTS"):
+        return "已有归集任务"
+    return COLLECTION_REASON_LABELS.get(reason_text, reason_text)
+
+
+def _collection_center_balance_source_label(value: Any) -> str:
+    text_value = str(value or "").strip().upper()
+    return "链上扫描" if text_value in {"CHAIN", "ONCHAIN", "链上扫描"} else (str(value or "").strip() or "链上扫描")
+
+
+def _collection_center_balance_error_label(value: Any) -> str:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return ""
+    lowered = text_value.lower()
+    if any(keyword in lowered for keyword in ("rpc", "timeout", "connection", "connected", "connect", "node")):
+        return "链上节点暂时不可用"
+    if any(keyword in lowered for keyword in ("contract", "token", "address missing", "address_required", "address is required", "missing")):
+        return "Token 合约配置缺失"
+    if any(keyword in lowered for keyword in ("decimals", "balanceof", "balance_of")):
+        return "Token 余额读取失败"
+    return "链上扫描失败"
+
+
+def _collection_center_task_maps(db: Session, candidates: list[Any]) -> Dict[str, Dict[str, Any]]:
+    addresses = sorted({str(getattr(item, "from_address", "") or "").strip().lower() for item in candidates})
+    addresses = [item for item in addresses if item]
+    if not addresses:
+        return {"collection_active": {}, "collection_failed": {}, "gas_active": {}, "gas_failed": {}}
+
+    collection_active: Dict[str, Any] = {}
+    collection_failed: Dict[str, Any] = {}
+    gas_active: Dict[str, Any] = {}
+    gas_failed: Dict[str, Any] = {}
+
+    collection_rows = db.execute(
+        text(
+            """
+            SELECT id, from_address, status
+            FROM collection_tasks
+            WHERE LOWER(from_address) IN :addresses
+              AND UPPER(status) IN :visible_statuses
+            ORDER BY id DESC
+            """
+        ).bindparams(bindparam("addresses", expanding=True), bindparam("visible_statuses", expanding=True)),
+        {"addresses": addresses, "visible_statuses": (*COLLECTION_CENTER_ACTIVE_TASK_STATUSES, *COLLECTION_CENTER_FAILED_TASK_STATUSES)},
+    ).mappings().all()
+    for row in collection_rows:
+        address = str(row.get("from_address") or "").strip().lower()
+        status = str(row.get("status") or "").upper()
+        if status in COLLECTION_CENTER_ACTIVE_COLLECTION_STATUSES and address not in collection_active:
+            collection_active[address] = dict(row)
+        if status in COLLECTION_CENTER_FAILED_TASK_STATUSES and address not in collection_failed:
+            collection_failed[address] = dict(row)
+
+    gas_rows = db.execute(
+        text(
+            """
+            SELECT id, to_address, status
+            FROM gas_tasks
+            WHERE LOWER(to_address) IN :addresses
+              AND UPPER(status) IN :visible_statuses
+            ORDER BY id DESC
+            """
+        ).bindparams(bindparam("addresses", expanding=True), bindparam("visible_statuses", expanding=True)),
+        {"addresses": addresses, "visible_statuses": (*COLLECTION_CENTER_ACTIVE_TASK_STATUSES, *COLLECTION_CENTER_FAILED_TASK_STATUSES)},
+    ).mappings().all()
+    for row in gas_rows:
+        address = str(row.get("to_address") or "").strip().lower()
+        status = str(row.get("status") or "").upper()
+        if status in COLLECTION_CENTER_ACTIVE_GAS_STATUSES and address not in gas_active:
+            gas_active[address] = dict(row)
+        if status in COLLECTION_CENTER_FAILED_TASK_STATUSES and address not in gas_failed:
+            gas_failed[address] = dict(row)
+
+    return {
+        "collection_active": collection_active,
+        "collection_failed": collection_failed,
+        "gas_active": gas_active,
+        "gas_failed": gas_failed,
+    }
+
+
+def _collection_center_dashboard_counts(db: Session, values: Dict[str, Any], scan: ScanResult) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    collection_filters = []
+    gas_filters = []
+    if values.get("chain_key"):
+        collection_filters.append("chain_key = :chain_key")
+        gas_filters.append("chain_key = :chain_key")
+        params["chain_key"] = values["chain_key"]
+    if values.get("coin_symbol"):
+        collection_filters.append("coin_symbol = :coin_symbol")
+        params["coin_symbol"] = values["coin_symbol"]
+    if values.get("user_id"):
+        collection_filters.append("user_id = :user_id")
+        gas_filters.append("user_id = :user_id")
+        params["user_id"] = _parse_int(values["user_id"], 0)
+    if values.get("address"):
+        collection_filters.append("LOWER(from_address) LIKE :address")
+        gas_filters.append("LOWER(to_address) LIKE :address")
+        params["address"] = f"%{str(values['address']).lower()}%"
+
+    collection_where = (" AND " + " AND ".join(collection_filters)) if collection_filters else ""
+    gas_where = (" AND " + " AND ".join(gas_filters)) if gas_filters else ""
+    try:
+        status_params = {
+            **params,
+            "active_statuses": COLLECTION_CENTER_ACTIVE_TASK_STATUSES,
+            "failed_statuses": COLLECTION_CENTER_FAILED_TASK_STATUSES,
+        }
+        active_collection_tasks = int(
+            db.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM collection_tasks
+                    WHERE UPPER(status) IN :active_statuses
+                    {collection_where}
+                    """
+                ).bindparams(bindparam("active_statuses", expanding=True)),
+                status_params,
+            ).scalar()
+            or 0
+        )
+        failed_collection_tasks = int(
+            db.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM collection_tasks
+                    WHERE UPPER(status) IN :failed_statuses
+                    {collection_where}
+                    """
+                ).bindparams(bindparam("failed_statuses", expanding=True)),
+                status_params,
+            ).scalar()
+            or 0
+        )
+        gas_status_params = {
+            **params,
+            "active_statuses": COLLECTION_CENTER_ACTIVE_TASK_STATUSES,
+            "failed_statuses": COLLECTION_CENTER_FAILED_TASK_STATUSES,
+        }
+        active_gas_tasks = int(
+            db.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM gas_tasks
+                    WHERE UPPER(status) IN :active_statuses
+                    {gas_where}
+                    """
+                ).bindparams(bindparam("active_statuses", expanding=True)),
+                gas_status_params,
+            ).scalar()
+            or 0
+        )
+        failed_gas_tasks = int(
+            db.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM gas_tasks
+                    WHERE UPPER(status) IN :failed_statuses
+                    {gas_where}
+                    """
+                ).bindparams(bindparam("failed_statuses", expanding=True)),
+                gas_status_params,
+            ).scalar()
+            or 0
+        )
+    except Exception:
+        logger.exception("collection center dashboard query failed")
+        active_collection_tasks = 0
+        active_gas_tasks = 0
+        failed_collection_tasks = 0
+        failed_gas_tasks = 0
+    collectible_addresses = {
+        (_normalize_chain_key(getattr(item, "chain_key", "")), str(getattr(item, "from_address", "") or "").lower())
+        for item in scan.candidates
+        if bool(getattr(item, "should_create_task", False))
+    }
+    gas_required_addresses = {
+        (_normalize_chain_key(getattr(item, "chain_key", "")), str(getattr(item, "from_address", "") or "").lower())
+        for item in scan.candidates
+        if bool(getattr(getattr(item, "evaluation", None), "gas_required", False))
+    }
+    today_collected = _collection_center_today_collected_stats(db, values)
+    return {
+        "collectible_addresses": len({item for item in collectible_addresses if item[0] and item[1]}),
+        "gas_required_addresses": len({item for item in gas_required_addresses if item[0] and item[1]}),
+        "active_collection_tasks": active_collection_tasks + active_gas_tasks,
+        "failed_tasks": failed_collection_tasks + failed_gas_tasks,
+        **today_collected,
+    }
+
+
+def _collection_center_scan(
+    db: Session,
+    filters: Optional[Dict[str, Any]],
+    *,
+    create_tasks: bool = False,
+    admin_user_id: Optional[int] = None,
+    limit: int = 200,
+    deadline_monotonic: Optional[float] = None,
+) -> ScanResult:
+    values = _collection_center_filter_values(filters)
+    min_amount = _collection_center_min_amount(values["min_amount"])
+    user_id = _collection_center_user_id(values["user_id"])
+    address = values["address"]
+    selected_chain = values["chain_key"]
+    selected_symbol = values["coin_symbol"]
+    candidate_source = values.get("candidate_source") or "events"
+    networks = _collection_center_network_rows(db)
+    network_by_chain = {item["chain_key"]: item for item in networks}
+    allowed_chain_keys = [item["chain_key"] for item in networks if item.get("can_collect")]
+    if selected_chain:
+        if selected_chain not in network_by_chain:
+            raise ValueError("当前网络不存在或未启用")
+        if create_tasks and selected_chain not in allowed_chain_keys:
+            raise ValueError("当前网络不可创建归集批次或尚未就绪")
+        allowed_chain_keys = [selected_chain]
+
+    combined: Optional[ScanResult] = None
+    for chain_key in allowed_chain_keys:
+        if deadline_monotonic is not None and monotonic() >= deadline_monotonic:
+            break
+        scan_config_only = bool(not create_tasks and not network_by_chain.get(chain_key, {}).get("can_collect"))
+        if create_tasks:
+            scan = admin_create_collection_tasks(
+                db,
+                chain_key=chain_key,
+                asset_symbol=selected_symbol,
+                min_amount=min_amount,
+                operator_id=admin_user_id,
+                user_id=user_id,
+                address=address,
+                limit=limit,
+                deadline_monotonic=deadline_monotonic,
+                candidate_source=candidate_source,
+            )
+        else:
+            scan = admin_preview_collection_candidates(
+                db,
+                chain_key=chain_key,
+                asset_symbol=selected_symbol,
+                min_amount=min_amount,
+                user_id=user_id,
+                address=address,
+                limit=limit,
+                include_config_only_chains=scan_config_only,
+                deadline_monotonic=deadline_monotonic,
+                candidate_source=candidate_source,
+                scan_batch_id=values.get("scan_batch_id") or "",
+            )
+        if combined is None:
+            combined = scan
+            continue
+        combined = ScanResult(
+            total_addresses=combined.total_addresses + scan.total_addresses,
+            evaluated_count=combined.evaluated_count + scan.evaluated_count,
+            collectible_count=combined.collectible_count + scan.collectible_count,
+            gas_required_count=combined.gas_required_count + scan.gas_required_count,
+            skipped_count=combined.skipped_count + scan.skipped_count,
+            created_task_count=combined.created_task_count + scan.created_task_count,
+            created_gas_task_count=combined.created_gas_task_count + scan.created_gas_task_count,
+            candidates=[*combined.candidates, *scan.candidates],
+            skipped_duplicate_count=combined.skipped_duplicate_count + scan.skipped_duplicate_count,
+            skipped_gas_required_count=combined.skipped_gas_required_count + scan.skipped_gas_required_count,
+            gas_task_skipped_duplicate_count=(
+                combined.gas_task_skipped_duplicate_count + scan.gas_task_skipped_duplicate_count
+            ),
+            gas_task_skipped_config_missing_count=(
+                combined.gas_task_skipped_config_missing_count + scan.gas_task_skipped_config_missing_count
+            ),
+            created_task_ids=[*combined.created_task_ids, *scan.created_task_ids],
+            created_gas_task_ids=[*combined.created_gas_task_ids, *scan.created_gas_task_ids],
+            batch_id=scan.batch_id or combined.batch_id,
+            batch_no=scan.batch_no or combined.batch_no,
+            warnings=[*combined.warnings, *[item for item in scan.warnings if item not in combined.warnings]],
+            error_message=None,
+        )
+    if combined is None:
+        return ScanResult(
+            total_addresses=0,
+            evaluated_count=0,
+            collectible_count=0,
+            gas_required_count=0,
+            skipped_count=0,
+            created_task_count=0,
+            created_gas_task_count=0,
+            candidates=[],
+            warnings=[],
+        )
+    return combined
+
+
+def _collection_center_decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except Exception:
+        return Decimal("0")
+
+
+def _collection_center_amount_total(value: Any) -> Decimal:
+    if isinstance(value, dict):
+        total = Decimal("0")
+        for amount in value.values():
+            total += _collection_center_decimal(amount)
+        return total
+    if isinstance(value, (list, tuple, set)):
+        total = Decimal("0")
+        for amount in value:
+            total += _collection_center_amount_total(amount)
+        return total
+    return _collection_center_decimal(value)
+
+
+def _collection_center_candidate_balance_status(
+    *,
+    balance_error: str,
+    token_balance: Decimal,
+    collect_amount: Decimal,
+    min_collect_amount: Decimal,
+    gas_required: bool,
+) -> str:
+    if balance_error:
+        return "READ_FAILED"
+    if token_balance <= 0:
+        return "NO_COLLECTABLE_BALANCE"
+    if collect_amount <= 0 or collect_amount < min_collect_amount:
+        return "BALANCE_BELOW_MIN"
+    if gas_required:
+        return "COLLECTIBLE_GAS_REQUIRED"
+    return "COLLECTIBLE_GAS_SUFFICIENT"
+
+
+def _collection_center_candidate_item(candidate: Any, task_maps: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    task_maps = task_maps or {}
+    reason = str(candidate.reason or "").strip()
+    reason_label = _collection_reason_label(reason)
+    raw_balance_error = getattr(candidate, "balance_error", "") or ""
+    balance_error_label = _collection_center_balance_error_label(raw_balance_error)
+    token_balance_raw = _collection_center_decimal(getattr(candidate, "token_balance", Decimal("0")))
+    collect_amount_raw = _collection_center_decimal(getattr(candidate.evaluation, "collect_amount", Decimal("0")))
+    min_collect_amount_raw = _collection_center_decimal(getattr(candidate.evaluation, "min_collect_amount", Decimal("0")))
+    has_collectable_token = bool(
+        not raw_balance_error
+        and token_balance_raw > 0
+        and collect_amount_raw > 0
+        and collect_amount_raw >= min_collect_amount_raw
+    )
+    gas_required = bool(candidate.evaluation.gas_required and has_collectable_token)
+    should_create = bool(candidate.should_create_task and has_collectable_token)
+    balance_status = _collection_center_candidate_balance_status(
+        balance_error=raw_balance_error,
+        token_balance=token_balance_raw,
+        collect_amount=collect_amount_raw,
+        min_collect_amount=min_collect_amount_raw,
+        gas_required=gas_required,
+    )
+    address_key = str(candidate.from_address or "").strip().lower()
+    active_collection_task = (task_maps.get("collection_active") or {}).get(address_key)
+    failed_collection_task = (task_maps.get("collection_failed") or {}).get(address_key)
+    active_gas_task = (task_maps.get("gas_active") or {}).get(address_key)
+    failed_gas_task = (task_maps.get("gas_failed") or {}).get(address_key)
+    has_active_task = bool(active_collection_task or active_gas_task or reason.startswith("ACTIVE_COLLECTION_TASK_EXISTS"))
+    has_failed_task = bool(failed_collection_task or failed_gas_task)
+
+    if has_failed_task:
+        operation_status_label = "失败"
+        operation_status_badge = "danger"
+    elif raw_balance_error:
+        operation_status_label = "余额读取失败"
+        operation_status_badge = "warning"
+    elif has_active_task:
+        operation_status_label = "已有任务"
+        operation_status_badge = "info"
+    elif gas_required:
+        operation_status_label = "需补 Gas"
+        operation_status_badge = "warning"
+    elif should_create:
+        operation_status_label = "可归集"
+        operation_status_badge = "success"
+    elif balance_status == "NO_COLLECTABLE_BALANCE":
+        operation_status_label = "无可归集余额"
+        operation_status_badge = "neutral"
+    elif balance_status == "BALANCE_BELOW_MIN":
+        operation_status_label = "余额不足"
+        operation_status_badge = "neutral"
+    else:
+        operation_status_label = "待扫描"
+        operation_status_badge = "neutral"
+
+    if raw_balance_error:
+        gas_status_label = "未知"
+        gas_status_badge = "warning"
+        processing_advice = balance_error_label or "重新扫描"
+    elif gas_required:
+        gas_status_label = "不足"
+        gas_status_badge = "warning"
+        processing_advice = "先创建 Gas 任务"
+    elif has_collectable_token:
+        gas_status_label = "充足"
+        gas_status_badge = "success"
+        processing_advice = "可创建归集任务"
+    else:
+        gas_status_label = "-"
+        gas_status_badge = "neutral"
+        processing_advice = balance_error_label or reason_label
+    if active_collection_task:
+        task_status_label = "已有归集任务"
+        task_status_badge = "info"
+    elif active_gas_task:
+        task_status_label = "已有Gas任务"
+        task_status_badge = "info"
+    elif has_failed_task:
+        task_status_label = "失败任务"
+        task_status_badge = "danger"
+    else:
+        task_status_label = "无任务"
+        task_status_badge = "neutral"
+    last_scan_at = _admin_datetime_display(getattr(candidate, "balance_checked_at", None)) or "-"
+    if raw_balance_error:
+        scan_status = "READ_FAILED"
+    elif last_scan_at != "-":
+        scan_status = "SCANNED"
+    else:
+        scan_status = "PENDING_SCAN"
+    gas_status = "GAS_REQUIRED" if gas_required else ("GAS_SUFFICIENT" if has_collectable_token else "NOT_APPLICABLE")
+    if raw_balance_error:
+        display_balance_label = "读取失败"
+    elif scan_status == "SCANNED":
+        display_balance_label = _collection_center_amounts_label_with_zero({candidate.coin_symbol: token_balance_raw})
+    else:
+        display_balance_label = "待扫描"
+    return {
+        "chain_key": candidate.chain_key,
+        "coin_symbol": candidate.coin_symbol,
+        "user_id": candidate.user_id,
+        "from_address": candidate.from_address,
+        "from_address_short": _short_admin_address(candidate.from_address),
+        "to_address": candidate.to_address,
+        "to_address_short": _short_admin_address(candidate.to_address),
+        "token_balance": _fmt_admin_amount_display(token_balance_raw, candidate.coin_symbol),
+        "scan_token_balance": display_balance_label,
+        "display_balance": display_balance_label,
+        "collect_amount": _fmt_admin_amount_display(collect_amount_raw, candidate.coin_symbol),
+        "collectable_amount": _fmt_admin_amount_display(collect_amount_raw, candidate.coin_symbol),
+        "min_collect_amount": _fmt_admin_amount_display(min_collect_amount_raw, candidate.coin_symbol),
+        "native_balance": _fmt_admin_amount_display(getattr(candidate, "native_balance", Decimal("0")), ""),
+        "token_balance_raw": token_balance_raw,
+        "collect_amount_raw": collect_amount_raw,
+        "collectable_amount_raw": collect_amount_raw,
+        "min_collect_amount_raw": min_collect_amount_raw,
+        "native_balance_raw": getattr(candidate, "native_balance", Decimal("0")),
+        "required_gas": _fmt_admin_amount_display(getattr(candidate.evaluation, "estimated_gas_native", Decimal("0")), ""),
+        "required_gas_raw": getattr(candidate.evaluation, "estimated_gas_native", Decimal("0")),
+        "gas_topup_amount": getattr(candidate.evaluation, "gas_topup_amount", Decimal("0")),
+        "balance_status": balance_status,
+        "scanned_at": last_scan_at,
+        "scan_status": scan_status,
+        "balance_source": _collection_center_balance_source_label(getattr(candidate, "balance_source", "CHAIN")),
+        "balance_error": balance_error_label,
+        "balance_error_raw": raw_balance_error,
+        "should_create_task": should_create,
+        "gas_required": gas_required,
+        "last_scan_at": last_scan_at,
+        "status": operation_status_label,
+        "status_label": operation_status_label,
+        "status_badge": operation_status_badge,
+        "operation_status_label": operation_status_label,
+        "operation_status_badge": operation_status_badge,
+        "gas_status_label": gas_status_label,
+        "gas_status_badge": gas_status_badge,
+        "gas_status": gas_status,
+        "task_status_label": task_status_label,
+        "task_status_badge": task_status_badge,
+        "has_active_task": has_active_task,
+        "has_failed_task": has_failed_task,
+        "active_collection_task_id": active_collection_task.get("id") if active_collection_task else "",
+        "active_gas_task_id": active_gas_task.get("id") if active_gas_task else "",
+        "failed_collection_task_id": failed_collection_task.get("id") if failed_collection_task else "",
+        "failed_gas_task_id": failed_gas_task.get("id") if failed_gas_task else "",
+        "action_mode": "gas" if gas_required else "collection",
+        "can_create_collection_task": bool(should_create and not gas_required and not has_active_task),
+        "can_create_gas_task": bool(gas_required and not has_active_task),
+        "processing_advice": processing_advice,
+        "reason": reason,
+        "reason_label": reason_label,
+    }
+
+
+def _collection_center_amounts_label(amounts: Dict[str, Decimal]) -> str:
+    parts = []
+    for symbol, amount in sorted(amounts.items()):
+        if amount <= 0:
+            continue
+        parts.append(f"{_fmt_admin_amount_display(amount, symbol)} {symbol}")
+    return " / ".join(parts) if parts else "-"
+
+
+def _collection_center_amounts_label_with_zero(amounts: Dict[str, Decimal]) -> str:
+    if not amounts:
+        return "-"
+    parts = []
+    for symbol, amount in sorted(amounts.items()):
+        amount = Decimal(str(amount or "0"))
+        parts.append(f"{_fmt_admin_amount_display(amount, symbol)} {symbol}")
+    return " / ".join(parts) if parts else "-"
+
+
+def _collection_center_amount_summary(amounts: Dict[str, Decimal]) -> Dict[str, Any]:
+    items = []
+    for symbol, amount in sorted((amounts or {}).items()):
+        amount = Decimal(str(amount or "0"))
+        if amount <= 0:
+            continue
+        items.append(
+            {
+                "coin_symbol": symbol,
+                "amount_label": f"{_fmt_admin_amount_display(amount, symbol)} {symbol}",
+                "symbol": symbol,
+                "amount": _fmt_admin_amount_display(amount, symbol),
+                "label": f"{symbol} {_fmt_admin_amount_display(amount, symbol)}",
+            }
+        )
+    count = len(items)
+    return {
+        "label": f"{count} 个币种" if count else "-",
+        "count": count,
+        "items": items,
+        "detail_label": " / ".join(item["label"] for item in items) if items else "-",
+    }
+
+
+def _collection_center_first_balance_symbol(item: Dict[str, Any]) -> str:
+    symbol = _normalize_code(item.get("coin_symbol"))
+    if symbol:
+        return symbol
+    asset_symbols = item.get("asset_symbols") or []
+    if isinstance(asset_symbols, str):
+        symbol = _normalize_code(asset_symbols)
+        if symbol:
+            return symbol
+    else:
+        for value in asset_symbols:
+            symbol = _normalize_code(value)
+            if symbol:
+                return symbol
+    for key in ("balance_amounts_raw", "token_balance_raw", "collect_amounts_raw", "gas_required_amounts_raw"):
+        raw_value = item.get(key)
+        if isinstance(raw_value, dict):
+            for value in raw_value.keys():
+                symbol = _normalize_code(value)
+                if symbol:
+                    return symbol
+    for asset in item.get("assets") or []:
+        if isinstance(asset, dict):
+            symbol = _normalize_code(asset.get("coin_symbol"))
+            if symbol:
+                return symbol
+    return ""
+
+
+def _collection_center_token_balance_amounts(item: Dict[str, Any]) -> Dict[str, Decimal]:
+    for key in ("balance_amounts_raw", "token_balance_raw"):
+        raw_value = item.get(key)
+        if isinstance(raw_value, dict) and raw_value:
+            amounts: Dict[str, Decimal] = {}
+            for symbol, amount in raw_value.items():
+                normalized_symbol = _normalize_code(symbol)
+                if normalized_symbol:
+                    amounts[normalized_symbol] = amounts.get(normalized_symbol, Decimal("0")) + _collection_center_decimal(amount)
+            if amounts:
+                return amounts
+    symbol = _collection_center_first_balance_symbol(item)
+    raw_value = item.get("token_balance_raw")
+    if symbol and raw_value is not None and not isinstance(raw_value, (dict, list, tuple, set)):
+        return {symbol: _collection_center_decimal(raw_value)}
+    amounts: Dict[str, Decimal] = {}
+    for asset in item.get("assets") or []:
+        if not isinstance(asset, dict):
+            continue
+        asset_symbol = _normalize_code(asset.get("coin_symbol"))
+        if not asset_symbol:
+            continue
+        amounts[asset_symbol] = amounts.get(asset_symbol, Decimal("0")) + _collection_center_decimal(asset.get("token_balance_raw"))
+    return amounts
+
+
+def _collection_center_token_balance_label(item: Dict[str, Any]) -> str:
+    amounts = _collection_center_token_balance_amounts(item)
+    if amounts:
+        return _collection_center_amounts_label_with_zero(amounts)
+    symbol = _collection_center_first_balance_symbol(item)
+    if symbol:
+        return f"{_fmt_admin_amount_display(Decimal('0'), symbol)} {symbol}"
+    text_value = str(item.get("token_balance") or item.get("onchain_balance_label") or "").strip()
+    return text_value if text_value and text_value != "-" else "待扫描"
+
+
+def _collection_center_balance_display(group: Dict[str, Any]) -> str:
+    errors = [str(item or "") for item in group.get("balance_errors") or [] if str(item or "").strip()]
+    if errors:
+        first_error = errors[0].lower()
+        if "token" in first_error or "合约" in first_error or "配置" in first_error:
+            return "Token未配置"
+        return "读取失败"
+    if group.get("gas_required") and group.get("balance_amounts_raw"):
+        return _collection_center_amounts_label_with_zero(group.get("balance_amounts_raw") or {})
+    if str(group.get("last_scan_at") or "").strip():
+        return _collection_center_amounts_label_with_zero(group.get("balance_amounts_raw") or {})
+    return "未扫描"
+
+
+def _collection_center_collectable_balance_display(group: Dict[str, Any]) -> str:
+    errors = [str(item or "") for item in group.get("balance_errors") or [] if str(item or "").strip()]
+    if errors:
+        return "读取失败"
+    if group.get("gas_required") and group.get("gas_required_amounts_raw"):
+        return _collection_center_amounts_label_with_zero(group.get("gas_required_amounts_raw") or {})
+    if group.get("gas_required") and group.get("balance_amounts_raw"):
+        return _collection_center_amounts_label_with_zero(group.get("balance_amounts_raw") or {})
+    if str(group.get("last_scan_at") or "").strip():
+        collect_amounts = group.get("collect_amounts_raw") or {}
+        if collect_amounts:
+            return _collection_center_amounts_label_with_zero(collect_amounts)
+        return _collection_center_amounts_label_with_zero(group.get("balance_amounts_raw") or {})
+    return "待扫描"
+
+
+def _collection_center_today_collected_stats(db: Session, values: Dict[str, Any]) -> Dict[str, Any]:
+    task_filters = [
+        "UPPER(status) IN :success_statuses",
+        "DATE(COALESCE(confirmed_at, updated_at, created_at)) = CURDATE()",
+    ]
+    params: Dict[str, Any] = {}
+    if values.get("chain_key"):
+        task_filters.append("chain_key = :chain_key")
+        params["chain_key"] = values["chain_key"]
+    if values.get("coin_symbol"):
+        task_filters.append("coin_symbol = :coin_symbol")
+        params["coin_symbol"] = values["coin_symbol"]
+    if values.get("user_id"):
+        task_filters.append("user_id = :user_id")
+        params["user_id"] = _parse_int(values["user_id"], 0)
+    if values.get("address"):
+        task_filters.append("LOWER(from_address) LIKE :address")
+        params["address"] = f"%{str(values['address']).lower()}%"
+    task_where_sql = "WHERE " + " AND ".join(task_filters)
+    query_params = {**params, "success_statuses": COLLECTION_CENTER_SUCCESS_TASK_STATUSES}
+    try:
+        task_count = int(
+            db.execute(
+                text(f"SELECT COUNT(*) FROM collection_tasks {task_where_sql}").bindparams(
+                    bindparam("success_statuses", expanding=True)
+                ),
+                query_params,
+            ).scalar()
+            or 0
+        )
+        rows = db.execute(
+            text(
+                f"""
+                SELECT coin_symbol, COALESCE(SUM(amount), 0) AS amount
+                FROM collection_tasks
+                {task_where_sql}
+                GROUP BY coin_symbol
+                """
+            ).bindparams(bindparam("success_statuses", expanding=True)),
+            query_params,
+        ).mappings().all()
+        gas_filters = [
+            "UPPER(status) IN :success_statuses",
+            "DATE(COALESCE(confirmed_at, updated_at, created_at)) = CURDATE()",
+        ]
+        gas_params: Dict[str, Any] = {"success_statuses": COLLECTION_CENTER_SUCCESS_TASK_STATUSES}
+        if values.get("chain_key"):
+            gas_filters.append("chain_key = :chain_key")
+            gas_params["chain_key"] = values["chain_key"]
+        if values.get("user_id"):
+            gas_filters.append("user_id = :user_id")
+            gas_params["user_id"] = _parse_int(values["user_id"], 0)
+        if values.get("address"):
+            gas_filters.append("LOWER(to_address) LIKE :address")
+            gas_params["address"] = f"%{str(values['address']).lower()}%"
+        gas_where_sql = "WHERE " + " AND ".join(gas_filters)
+        today_gas_success_count = int(
+            db.execute(
+                text(f"SELECT COUNT(*) FROM gas_tasks {gas_where_sql}").bindparams(
+                    bindparam("success_statuses", expanding=True)
+                ),
+                gas_params,
+            ).scalar()
+            or 0
+        )
+    except Exception:
+        logger.exception("collection center today collected query failed")
+        return {
+            "today_collected_tasks": 0,
+            "today_collected_amounts": [],
+            "today_collected_label": "-",
+            "today_collected_usd_label": "--",
+            "today_gas_success_count": 0,
+        }
+    amounts: Dict[str, Decimal] = {}
+    for row in rows:
+        symbol = _normalize_code(row.get("coin_symbol"))
+        if not symbol:
+            continue
+        amounts[symbol] = Decimal(str(row.get("amount") or "0"))
+    usd_label = "0.00 USDT"
+    if amounts:
+        price_map = _collection_center_usd_price_map(db, set(amounts.keys()))
+        total_usd = Decimal("0")
+        missing_price = False
+        for symbol, amount in amounts.items():
+            if amount <= 0:
+                continue
+            price = Decimal(str(price_map.get(symbol) or "0"))
+            if price <= 0:
+                missing_price = True
+                break
+            total_usd += amount * price
+        usd_label = "--" if missing_price else f"{_collection_center_usd_display(total_usd)} USDT"
+    return {
+        "today_collected_tasks": task_count,
+        "today_collected_amounts": _collection_center_amounts_list(amounts),
+        "today_collected_label": _collection_center_amounts_label(amounts),
+        "today_collected_usd_label": usd_label,
+        "today_gas_success_count": today_gas_success_count,
+    }
+
+
+def _collection_center_amounts_list(amounts: Dict[str, Decimal]) -> list[Dict[str, str]]:
+    return [
+        {
+            "symbol": symbol,
+            "amount": _fmt_admin_amount_display(amount, symbol),
+            "label": f"{_fmt_admin_amount_display(amount, symbol)} {symbol}",
+        }
+        for symbol, amount in sorted(amounts.items())
+        if amount > 0
+    ]
+
+
+def _collection_center_usd_display(value: Any) -> str:
+    try:
+        amount = Decimal(str(value or "0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except Exception:
+        amount = Decimal("0.00")
+    return f"{amount:,.2f}"
+
+
+def _collection_center_usd_price_map(db: Session, symbols: set[str]) -> Dict[str, Decimal]:
+    normalized_symbols = {_normalize_code(symbol) for symbol in symbols if _normalize_code(symbol)}
+    prices: Dict[str, Decimal] = {
+        "USD": Decimal("1"),
+        "USDT": Decimal("1"),
+        "USDC": Decimal("1"),
+    }
+    lookup_symbols = sorted(symbol for symbol in normalized_symbols if symbol not in prices)
+    if not lookup_symbols:
+        return {symbol: prices.get(symbol, Decimal("0")) for symbol in normalized_symbols}
+    try:
+        if not (_admin_table_exists(db, "trades") and _admin_table_exists(db, "trading_pairs") and _admin_table_exists(db, "assets")):
+            return {symbol: prices.get(symbol, Decimal("0")) for symbol in normalized_symbols}
+        rows = db.execute(
+            text(
+                """
+                SELECT UPPER(base.symbol) AS base_symbol, COALESCE(MAX(t.price), 0) AS price
+                FROM trades t
+                JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+                JOIN assets base ON base.id = tp.base_asset_id
+                JOIN assets quote ON quote.id = tp.quote_asset_id
+                WHERE UPPER(base.symbol) IN :symbols
+                  AND UPPER(quote.symbol) IN ('USDT', 'USDC')
+                  AND COALESCE(t.price, 0) > 0
+                GROUP BY UPPER(base.symbol)
+                """
+            ).bindparams(bindparam("symbols", expanding=True)),
+            {"symbols": lookup_symbols},
+        ).mappings().all()
+        for row in rows:
+            symbol = _normalize_code(row.get("base_symbol"))
+            if symbol:
+                prices[symbol] = Decimal(str(row.get("price") or "0"))
+    except Exception:
+        logger.exception("collection center usd price query failed")
+    return {symbol: prices.get(symbol, Decimal("0")) for symbol in normalized_symbols}
+
+
+def _collection_center_apply_usd_estimates(db: Session, asset_items: list[Dict[str, Any]]) -> None:
+    symbols = {_normalize_code(item.get("coin_symbol")) for item in asset_items}
+    price_map = _collection_center_usd_price_map(db, symbols)
+    for item in asset_items:
+        symbol = _normalize_code(item.get("coin_symbol"))
+        price = price_map.get(symbol, Decimal("0"))
+        try:
+            amount = Decimal(str(item.get("collect_amount_raw") or "0"))
+        except Exception:
+            amount = Decimal("0")
+        usd_amount = amount * price if amount > 0 and price > 0 else Decimal("0")
+        item["usd_price_raw"] = price
+        item["usd_estimate_raw"] = usd_amount
+        item["usd_estimate_label"] = _collection_center_usd_display(usd_amount)
+        item["estimated_usd"] = usd_amount
+        item["estimated_usd_label"] = item["usd_estimate_label"]
+        item["collectable_value_usd"] = usd_amount
+        item["collectable_value_usd_label"] = item["usd_estimate_label"]
+
+
+def _collection_center_address_items(items: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    grouped: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+    for item in items:
+        chain_key = _normalize_chain_key(item.get("chain_key"))
+        address = str(item.get("from_address") or "").strip()
+        address_key = address.lower()
+        symbol_key = _normalize_code(item.get("coin_symbol"))
+        if not chain_key or not address_key:
+            continue
+        key = (chain_key, address_key, symbol_key)
+        group = grouped.get(key)
+        if group is None:
+            group = {
+                "chain_key": chain_key,
+                "from_address": address,
+                "from_address_short": item.get("from_address_short") or _short_admin_address(address),
+                "user_ids": set(),
+                "assets": [],
+                "asset_symbols": set(),
+                "collect_amounts_raw": {},
+                "gas_required_amounts_raw": {},
+                "balance_amounts_raw": {},
+                "usd_estimate_raw": Decimal("0"),
+                "last_scan_at": "",
+                "balance_source": "链上扫描",
+                "balance_errors": [],
+                "active_task_ids": set(),
+                "failed_task_ids": set(),
+                "gas_required": False,
+                "has_active_task": False,
+                "has_failed_task": False,
+                "can_create_collection_task": False,
+                "can_create_gas_task": False,
+                "should_create_task": False,
+            }
+            grouped[key] = group
+        if item.get("user_id"):
+            group["user_ids"].add(item.get("user_id"))
+        symbol = _normalize_code(item.get("coin_symbol"))
+        if symbol:
+            group["asset_symbols"].add(symbol)
+            group["balance_amounts_raw"][symbol] = group["balance_amounts_raw"].get(symbol, Decimal("0")) + Decimal(
+                str(item.get("token_balance_raw") or "0")
+            )
+            if item.get("should_create_task") and not item.get("gas_required"):
+                group["collect_amounts_raw"][symbol] = group["collect_amounts_raw"].get(symbol, Decimal("0")) + Decimal(
+                    str(item.get("collect_amount_raw") or "0")
+                )
+            if item.get("gas_required"):
+                group["gas_required_amounts_raw"][symbol] = group["gas_required_amounts_raw"].get(symbol, Decimal("0")) + Decimal(
+                    str(item.get("collect_amount_raw") or "0")
+                )
+        group["assets"].append(item)
+        if item.get("balance_error"):
+            group["balance_errors"].append(str(item.get("balance_error")))
+        group["usd_estimate_raw"] += Decimal(str(item.get("usd_estimate_raw") or "0"))
+        scan_at = str(item.get("last_scan_at") or "")
+        if scan_at and scan_at != "-" and (not group["last_scan_at"] or scan_at > group["last_scan_at"]):
+            group["last_scan_at"] = scan_at
+        group["gas_required"] = bool(group["gas_required"] or item.get("gas_required"))
+        group["has_active_task"] = bool(group["has_active_task"] or item.get("has_active_task"))
+        group["has_failed_task"] = bool(group["has_failed_task"] or item.get("has_failed_task"))
+        group["can_create_collection_task"] = bool(
+            group["can_create_collection_task"] or item.get("can_create_collection_task")
+        )
+        group["can_create_gas_task"] = bool(group["can_create_gas_task"] or item.get("can_create_gas_task"))
+        group["should_create_task"] = bool(group["should_create_task"] or item.get("should_create_task"))
+        for task_id_key in ("active_collection_task_id", "active_gas_task_id"):
+            if item.get(task_id_key):
+                group["active_task_ids"].add(item.get(task_id_key))
+        for task_id_key in ("failed_collection_task_id", "failed_gas_task_id"):
+            if item.get(task_id_key):
+                group["failed_task_ids"].add(item.get(task_id_key))
+
+    result: list[Dict[str, Any]] = []
+    for group in grouped.values():
+        user_ids = sorted(group["user_ids"])
+        has_balance_error = bool(group["balance_errors"])
+        balance_error_label = group["balance_errors"][0] if group["balance_errors"] else ""
+        if group["has_failed_task"]:
+            task_status_label = "失败任务"
+            task_status_badge = "danger"
+        elif has_balance_error:
+            task_status_label = "不可归集"
+            task_status_badge = "warning"
+        elif group["has_active_task"]:
+            task_status_label = "已有任务"
+            task_status_badge = "info"
+        else:
+            task_status_label = "无任务"
+            task_status_badge = "neutral"
+
+        has_positive_balance = any(Decimal(str(amount or "0")) > 0 for amount in group["balance_amounts_raw"].values())
+        has_collectable_amount = any(Decimal(str(amount or "0")) > 0 for amount in group["collect_amounts_raw"].values()) or any(
+            Decimal(str(amount or "0")) > 0 for amount in group["gas_required_amounts_raw"].values()
+        )
+
+        if has_balance_error:
+            gas_status_label = "未知"
+            gas_status_badge = "warning"
+        elif group["gas_required"]:
+            gas_status_label = "不足"
+            gas_status_badge = "warning"
+        elif group["should_create_task"] or has_collectable_amount:
+            gas_status_label = "充足"
+            gas_status_badge = "success"
+        else:
+            gas_status_label = "-"
+            gas_status_badge = "neutral"
+
+        if group["has_failed_task"]:
+            operation_status_label = "失败"
+            operation_status_badge = "danger"
+        elif has_balance_error:
+            operation_status_label = "余额读取失败"
+            operation_status_badge = "warning"
+        elif group["has_active_task"]:
+            operation_status_label = "已有任务"
+            operation_status_badge = "info"
+        elif group["gas_required"]:
+            operation_status_label = "需补 Gas"
+            operation_status_badge = "warning"
+        elif group["should_create_task"]:
+            operation_status_label = "可归集"
+            operation_status_badge = "success"
+        elif group["last_scan_at"] and not has_positive_balance:
+            operation_status_label = "无可归集余额"
+            operation_status_badge = "neutral"
+        elif group["last_scan_at"]:
+            operation_status_label = "余额不足"
+            operation_status_badge = "neutral"
+        else:
+            operation_status_label = "待扫描"
+            operation_status_badge = "neutral"
+
+        assets = sorted(group["assets"], key=lambda row: str(row.get("coin_symbol") or ""))
+        result.append(
+            {
+                "chain_key": group["chain_key"],
+                "from_address": group["from_address"],
+                "from_address_short": group["from_address_short"],
+                "user_ids": user_ids,
+                "user_label": str(user_ids[0]) if len(user_ids) == 1 else (f"{len(user_ids)} users" if user_ids else "-"),
+                "asset_count": len(group["asset_symbols"]),
+                "asset_symbols": sorted(group["asset_symbols"]),
+                "assets": assets,
+                "collect_amounts": _collection_center_amounts_list(group["collect_amounts_raw"]),
+                "collect_amounts_raw": group["collect_amounts_raw"],
+                "gas_required_amounts_raw": group["gas_required_amounts_raw"],
+                "collect_amount_label": _collection_center_amounts_label(group["collect_amounts_raw"]),
+                "balance_amount_label": _collection_center_amounts_label(group["balance_amounts_raw"]),
+                "onchain_balance_label": _collection_center_balance_display(group),
+                "onchain_collectable_balance_label": _collection_center_collectable_balance_display(group),
+                "token_balance": _collection_center_balance_display(group),
+                "token_balance_raw": group["balance_amounts_raw"],
+                "usd_estimate_raw": group["usd_estimate_raw"],
+                "usd_estimate_label": _collection_center_usd_display(group["usd_estimate_raw"]),
+                "estimated_usd": group["usd_estimate_raw"],
+                "estimated_usd_label": _collection_center_usd_display(group["usd_estimate_raw"]),
+                "last_scan_at": group["last_scan_at"] or "-",
+                "scanned_at": group["last_scan_at"] or "-",
+                "balance_source": group["balance_source"],
+                "balance_error": balance_error_label,
+                "gas_required": group["gas_required"],
+                "gas_status_label": gas_status_label,
+                "gas_status_badge": gas_status_badge,
+                "gas_status": "GAS_REQUIRED" if group["gas_required"] else ("GAS_SUFFICIENT" if (group["should_create_task"] or has_collectable_amount) else "NOT_APPLICABLE"),
+                "task_status_label": task_status_label,
+                "task_status_badge": task_status_badge,
+                "operation_status_label": operation_status_label,
+                "operation_status_badge": operation_status_badge,
+                "has_active_task": group["has_active_task"],
+                "has_failed_task": group["has_failed_task"],
+                "can_create_collection_task": group["can_create_collection_task"],
+                "can_create_gas_task": group["can_create_gas_task"],
+                "should_create_task": group["should_create_task"],
+                "active_task_count": len(group["active_task_ids"]),
+                "failed_task_count": len(group["failed_task_ids"]),
+            }
+        )
+    return sorted(result, key=lambda row: (row["chain_key"], str(row.get("from_address") or "")))
+
+
+def _collection_center_address_balance_total(item: Dict[str, Any]) -> Decimal:
+    total = _collection_center_amount_total(item.get("balance_amounts_raw"))
+    if total <= 0:
+        total = _collection_center_amount_total(item.get("token_balance_raw"))
+    if total <= 0:
+        for asset in item.get("assets") or []:
+            if isinstance(asset, dict):
+                total += _collection_center_decimal(asset.get("token_balance_raw"))
+    return total
+
+
+def _collection_center_direct_collect_total(item: Dict[str, Any]) -> Decimal:
+    total = _collection_center_amount_total(item.get("collect_amounts_raw"))
+    if total <= 0:
+        for asset in item.get("assets") or []:
+            if isinstance(asset, dict) and asset.get("should_create_task") and not asset.get("gas_required"):
+                total += _collection_center_decimal(asset.get("collect_amount_raw"))
+    return total
+
+
+def _collection_center_gas_collect_total(item: Dict[str, Any]) -> Decimal:
+    total = _collection_center_amount_total(item.get("gas_required_amounts_raw"))
+    if total <= 0:
+        for asset in item.get("assets") or []:
+            if isinstance(asset, dict) and asset.get("gas_required"):
+                total += _collection_center_decimal(asset.get("collect_amount_raw"))
+    return total
+
+
+def _collection_center_sanitize_address_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(item)
+    balance_error = str(data.get("balance_error") or data.get("balance_error_raw") or "").strip()
+    balance_total = _collection_center_address_balance_total(data)
+    direct_collect_total = _collection_center_direct_collect_total(data)
+    gas_collect_total = _collection_center_gas_collect_total(data)
+    valid_gas_required = bool(data.get("gas_required") and not balance_error and balance_total > 0 and gas_collect_total > 0)
+    if not valid_gas_required:
+        data["gas_required"] = False
+        data["can_create_gas_task"] = False
+        data["gas_required_amounts_raw"] = data.get("gas_required_amounts_raw") or {}
+
+    scanned = str(data.get("last_scan_at") or data.get("scanned_at") or "").strip()
+    scanned = bool(scanned and scanned != "-")
+    scanned_balance_label = _collection_center_token_balance_label(data) if scanned else "待扫描"
+    if balance_error:
+        data["balance_status"] = "READ_FAILED"
+        data["gas_status"] = "UNKNOWN"
+        data["gas_status_label"] = "未知"
+        data["gas_status_badge"] = "warning"
+        data["operation_status_label"] = "余额读取失败"
+        data["operation_status_badge"] = "warning"
+        data["status_label"] = "余额读取失败"
+        data["status"] = "余额读取失败"
+        data["onchain_collectable_balance_label"] = "读取失败"
+    elif valid_gas_required:
+        data["balance_status"] = "COLLECTIBLE_GAS_REQUIRED"
+        data["gas_status"] = "GAS_REQUIRED"
+        data["gas_status_label"] = "不足"
+        data["gas_status_badge"] = "warning"
+        data["operation_status_label"] = "需补 Gas"
+        data["operation_status_badge"] = "warning"
+        data["status_label"] = "需补 Gas"
+        data["status"] = "需补 Gas"
+        if data.get("gas_required_amounts_raw"):
+            data["onchain_collectable_balance_label"] = _collection_center_amounts_label_with_zero(data.get("gas_required_amounts_raw") or {})
+    elif direct_collect_total > 0:
+        data["balance_status"] = "COLLECTIBLE_GAS_SUFFICIENT"
+        data["gas_status"] = "GAS_SUFFICIENT"
+        data["gas_status_label"] = "充足"
+        data["gas_status_badge"] = "success"
+        if not data.get("has_active_task") and not data.get("has_failed_task"):
+            data["operation_status_label"] = "可归集"
+            data["operation_status_badge"] = "success"
+            data["status_label"] = "可归集"
+            data["status"] = "可归集"
+    elif scanned and balance_total <= 0:
+        data["balance_status"] = "NO_COLLECTABLE_BALANCE"
+        data["gas_status"] = "NOT_APPLICABLE"
+        data["gas_status_label"] = "-"
+        data["gas_status_badge"] = "neutral"
+        data["operation_status_label"] = "无可归集余额"
+        data["operation_status_badge"] = "neutral"
+        data["status_label"] = "无可归集余额"
+        data["status"] = "无可归集余额"
+        if data.get("balance_amounts_raw"):
+            data["onchain_collectable_balance_label"] = _collection_center_amounts_label_with_zero(data.get("balance_amounts_raw") or {})
+    elif scanned:
+        data["balance_status"] = "BALANCE_BELOW_MIN"
+        data["gas_status"] = "NOT_APPLICABLE"
+        data["gas_status_label"] = "-"
+        data["gas_status_badge"] = "neutral"
+        data["operation_status_label"] = "余额不足"
+        data["operation_status_badge"] = "neutral"
+        data["status_label"] = "余额不足"
+        data["status"] = "余额不足"
+    if balance_error:
+        data["onchain_collectable_balance_label"] = "读取失败"
+        data["scan_token_balance"] = "读取失败"
+        data["display_balance"] = "读取失败"
+    elif scanned:
+        balance_status = str(data.get("balance_status") or "").strip().upper()
+        if balance_status in {
+            "COLLECTIBLE_GAS_REQUIRED",
+            "COLLECTIBLE_GAS_SUFFICIENT",
+            "NO_COLLECTABLE_BALANCE",
+            "BALANCE_BELOW_MIN",
+        }:
+            data["onchain_collectable_balance_label"] = scanned_balance_label
+            data["scan_token_balance"] = scanned_balance_label
+            data["display_balance"] = scanned_balance_label
+    else:
+        data["scan_token_balance"] = data.get("scan_token_balance") or "待扫描"
+        data["display_balance"] = data.get("display_balance") or data.get("scan_token_balance") or "待扫描"
+    return data
+
+
+def _collection_center_event_candidate_items(
+    db: Session,
+    values: Dict[str, Any],
+    *,
+    limit: int = 500,
+) -> list[Dict[str, Any]]:
+    if not _admin_table_exists(db, "collection_candidates"):
+        return []
+    filters = [
+        "cc.status IN ('PENDING', 'ACTIVE')",
+        "cc.address IS NOT NULL",
+        "TRIM(cc.address) <> ''",
+    ]
+    params: Dict[str, Any] = {"limit": int(limit)}
+    chain_key = _normalize_chain_key(values.get("chain_key"))
+    coin_symbol = _normalize_code(values.get("coin_symbol"))
+    user_id = _collection_center_user_id(values.get("user_id"))
+    address = str(values.get("address") or "").strip().lower()
+    if chain_key:
+        filters.append("LOWER(cc.chain_key) = :chain_key")
+        params["chain_key"] = chain_key
+    if coin_symbol:
+        filters.append("UPPER(cc.asset_symbol) = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if user_id is not None:
+        filters.append("cc.user_id = :user_id")
+        params["user_id"] = int(user_id)
+    if address:
+        filters.append("LOWER(cc.address) LIKE :address")
+        params["address"] = f"%{address}%"
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                  cc.user_id,
+                  LOWER(cc.chain_key) AS chain_key,
+                  UPPER(cc.asset_symbol) AS asset_symbol,
+                  LOWER(cc.address) AS address,
+                  cc.token_contract,
+                  cc.total_detected_amount,
+                  cc.latest_deposit_amount,
+                  cc.latest_tx_hash,
+                  cc.latest_deposit_at,
+                  cc.last_scan_at,
+                  cc.last_balance_amount
+                FROM collection_candidates cc
+                WHERE {" AND ".join(filters)}
+                ORDER BY cc.latest_deposit_at DESC, cc.updated_at DESC, cc.id DESC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings().all()
+    except Exception:
+        logger.exception("collection center event candidate query failed")
+        return []
+
+    result: list[Dict[str, Any]] = []
+    for row in rows:
+        chain = _normalize_chain_key(row.get("chain_key"))
+        symbol = _normalize_code(row.get("asset_symbol"))
+        address_value = str(row.get("address") or "").strip().lower()
+        last_scan_at = _admin_datetime_display(row.get("last_scan_at")) or "-"
+        last_balance = row.get("last_balance_amount")
+        has_last_balance = last_balance is not None
+        token_balance_raw = _collection_center_decimal(last_balance) if has_last_balance else Decimal("0")
+        balance_label = _fmt_admin_amount_display(token_balance_raw, symbol) if has_last_balance else "待扫描"
+        result.append(
+            {
+                "chain_key": chain,
+                "coin_symbol": symbol,
+                "user_id": int(row.get("user_id") or 0),
+                "from_address": address_value,
+                "from_address_short": _short_admin_address(address_value),
+                "to_address": "",
+                "to_address_short": "-",
+                "token_balance": balance_label,
+                "collect_amount": "0",
+                "collectable_amount": "0",
+                "min_collect_amount": "0",
+                "native_balance": "0",
+                "token_balance_raw": token_balance_raw,
+                "collect_amount_raw": Decimal("0"),
+                "collectable_amount_raw": Decimal("0"),
+                "min_collect_amount_raw": Decimal("0"),
+                "native_balance_raw": Decimal("0"),
+                "required_gas": "0",
+                "required_gas_raw": Decimal("0"),
+                "gas_topup_amount": Decimal("0"),
+                "balance_status": "SCANNED" if has_last_balance else "PENDING_SCAN",
+                "scanned_at": last_scan_at,
+                "scan_status": "SCANNED" if has_last_balance else "PENDING_SCAN",
+                "balance_source": "已确认充值候选",
+                "balance_error": "",
+                "balance_error_raw": "",
+                "should_create_task": False,
+                "gas_required": False,
+                "last_scan_at": last_scan_at,
+                "status": "待扫描" if not has_last_balance else "已扫描",
+                "status_label": "待扫描" if not has_last_balance else "已扫描",
+                "status_badge": "neutral",
+                "operation_status_label": "待扫描" if not has_last_balance else "已扫描",
+                "operation_status_badge": "neutral",
+                "gas_status_label": "-",
+                "gas_status_badge": "neutral",
+                "gas_status": "NOT_APPLICABLE",
+                "task_status_label": "无任务",
+                "task_status_badge": "neutral",
+                "has_active_task": False,
+                "has_failed_task": False,
+                "active_collection_task_id": "",
+                "active_gas_task_id": "",
+                "failed_collection_task_id": "",
+                "failed_gas_task_id": "",
+                "action_mode": "collection",
+                "can_create_collection_task": False,
+                "can_create_gas_task": False,
+                "processing_advice": "等待补漏扫描",
+                "reason": "DEPOSIT_CANDIDATE",
+                "reason_label": "已确认充值候选",
+                "latest_deposit_at": _admin_datetime_display(row.get("latest_deposit_at")) or "-",
+                "latest_tx_hash": row.get("latest_tx_hash") or "",
+                "token_contract": row.get("token_contract") or "",
+            }
+        )
+    return result
+
+
+def _collection_candidate_source_label(value: Any) -> str:
+    source = str(value or "").strip().upper()
+    if source == "DEPOSIT":
+        return "充值候选"
+    if source == "MANUAL":
+        return "手工加入"
+    if source in {"SCAN", "BACKFILL"}:
+        return "补漏扫描"
+    return source or "-"
+
+
+def _collection_candidate_datetime_value(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _collection_candidate_snapshot_index(row: Dict[str, Any]) -> Dict[str, Any]:
+    chain_key = _normalize_chain_key(row.get("chain_key"))
+    symbol = _normalize_code(row.get("asset_symbol"))
+    address = str(row.get("address") or "").strip().lower()
+    if not chain_key or not symbol or not address:
+        return {}
+    try:
+        cached = load_scan_snapshot(
+            chain_key,
+            {
+                "coin_symbol": symbol,
+                "user_id": str(row.get("user_id") or ""),
+                "address": address,
+            },
+        )
+    except Exception:
+        logger.exception("collection candidate snapshot lookup failed chain=%s symbol=%s", chain_key, symbol)
+        cached = None
+    if not cached:
+        return {}
+    for item in cached.get("address_items") or []:
+        if not isinstance(item, dict):
+            continue
+        item_chain = _normalize_chain_key(item.get("chain_key"))
+        item_address = str(item.get("from_address") or "").strip().lower()
+        if item_chain == chain_key and item_address == address:
+            return dict(item)
+    return {}
+
+
+def _collection_candidate_status_meta(
+    *,
+    candidate_amount: Decimal,
+    need_verify: bool,
+    verified_amount: Optional[Decimal],
+    snapshot_item: Dict[str, Any],
+    has_active_task: bool,
+    has_success_task: bool,
+    has_active_gas_task: bool,
+) -> Dict[str, Any]:
+    if has_active_task:
+        return {"status": "HAS_TASK", "status_label": "已有任务", "status_badge": "info", "gas_status_label": "-"}
+    if has_success_task and candidate_amount <= 0 and (verified_amount is None or verified_amount <= 0):
+        return {"status": "COLLECTED", "status_label": "已归集", "status_badge": "success", "gas_status_label": "-"}
+    if need_verify or verified_amount is None:
+        return {"status": "PENDING_VERIFY", "status_label": "待链上核实", "status_badge": "neutral", "gas_status_label": "待核实"}
+    if verified_amount <= 0:
+        return {"status": "NO_BALANCE", "status_label": "无可归集余额", "status_badge": "neutral", "gas_status_label": "-"}
+    return {"status": "COLLECTIBLE", "status_label": "可归集", "status_badge": "success", "gas_status_label": "-"}
+
+
+def _collection_candidate_network_card_bases(db: Session) -> list[Dict[str, Any]]:
+    try:
+        networks = _collection_center_network_rows(db)
+    except Exception:
+        logger.exception("collection candidate network card base query failed")
+        return []
+    cards: list[Dict[str, Any]] = []
+    for network in networks:
+        chain_key = _normalize_chain_key(network.get("chain_key"))
+        if not chain_key:
+            continue
+        cards.append(
+            {
+                "chain_key": chain_key,
+                "chain_name": network.get("chain_name") or network.get("display_name") or chain_key,
+                "collection_enabled": int(network.get("collection_enabled") or 0),
+                "collection_enabled_label": "开启" if int(network.get("collection_enabled") or 0) else "关闭",
+                "candidate_count": 0,
+                "pending_verify_count": 0,
+                "collectible_count": 0,
+            }
+        )
+    return cards
+
+
+def _collection_tool_scan_progress_key(scan_batch_id: str) -> str:
+    return f"collection:tool_scan:{str(scan_batch_id or '').strip()}"
+
+
+def _load_collection_tool_scan_progress(scan_batch_id: Any) -> Dict[str, Any]:
+    batch_id = str(scan_batch_id or "").strip()
+    if not batch_id:
+        return {}
+    try:
+        raw = get_redis_connection().get(_collection_tool_scan_progress_key(batch_id))
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(str(raw or "{}"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_collection_tool_scan_progress(scan_batch_id: Any, payload: Dict[str, Any]) -> bool:
+    batch_id = str(scan_batch_id or "").strip()
+    if not batch_id or not isinstance(payload, dict):
+        return False
+    try:
+        get_redis_connection().set(
+            _collection_tool_scan_progress_key(batch_id),
+            json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True),
+            ex=24 * 60 * 60,
+        )
+        return True
+    except Exception:
+        logger.warning("collection tool scan progress update failed scan_batch_id=%s", batch_id, exc_info=True)
+        return False
+
+
+def admin_update_collection_tool_candidate_row(
+    scan_batch_id: Any,
+    *,
+    chain_key: str,
+    asset_symbol: str,
+    address: str,
+    user_id: Any = None,
+    added: bool = False,
+    already_exists: bool = False,
+    failed: bool = False,
+    message: str = "",
+) -> bool:
+    """Update one row in an existing collection tool scan snapshot after add-candidate."""
+    batch_id = str(scan_batch_id or "").strip()
+    if not batch_id:
+        return False
+    payload = _load_collection_tool_scan_progress(batch_id)
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return False
+
+    target_chain = _normalize_chain_key(chain_key)
+    target_symbol = _normalize_code(asset_symbol)
+    target_address = str(address or "").strip().lower()
+    try:
+        target_user_id = int(user_id or 0)
+    except Exception:
+        target_user_id = 0
+    if not target_symbol or not target_address:
+        return False
+
+    changed = False
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_symbol = _normalize_code(row.get("asset_symbol") or row.get("coin_symbol"))
+        row_address = str(row.get("address") or row.get("from_address") or "").strip().lower()
+        row_chain = _normalize_chain_key(row.get("chain_key") or payload.get("chain_key") or target_chain)
+        try:
+            row_user_id = int(row.get("user_id") or 0)
+        except Exception:
+            row_user_id = 0
+        if row_symbol != target_symbol or row_address != target_address:
+            continue
+        if target_chain and row_chain and row_chain != target_chain:
+            continue
+        if target_user_id > 0 and row_user_id > 0 and row_user_id != target_user_id:
+            continue
+
+        if failed:
+            row["add_status_text"] = message or "加入失败"
+            row["add_error"] = message or "ADD_CANDIDATE_FAILED"
+            row["add_failed"] = True
+        else:
+            row["candidate_exists"] = True
+            row["can_add_candidate"] = False
+            row["add_status_text"] = "已存在" if already_exists else ("已加入" if added else "已存在")
+            row["add_error"] = ""
+            row["add_failed"] = False
+        row["candidate_updated_at"] = now_iso
+        changed = True
+
+    if not changed:
+        return False
+    payload["rows"] = rows
+    payload["updated_at"] = now_iso
+    return _save_collection_tool_scan_progress(batch_id, payload)
+
+
+def _collection_tool_progress_label(status: Any) -> str:
+    value = str(status or "").strip().lower()
+    if value == "queued":
+        return "排队中"
+    if value == "running":
+        return "扫描中"
+    if value == "completed":
+        return "已完成"
+    if value in {"failed", "timeout"}:
+        return "失败"
+    return "未扫描"
+
+
+def _collection_tool_row_status_label(status: Any) -> tuple[str, str]:
+    value = str(status or "").strip().lower()
+    if value == "pending":
+        return "待扫描", "neutral"
+    if value in {"running", "scanning"}:
+        return "扫描中", "info"
+    if value == "completed":
+        return "已完成", "success"
+    if value in {"failed", "timeout"}:
+        return "读取失败", "warning"
+    if value == "skipped":
+        return "已跳过", "neutral"
+    return "待扫描", "neutral"
+
+
+def admin_query_collection_tool_results(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    chain_key = _normalize_chain_key(filters.get("chain_key"))
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or "USDT")
+    user_id_text = str(filters.get("user_id") or "").strip()
+    address = str(filters.get("address") or "").strip().lower()
+    scan_batch_id = str(filters.get("scan_batch_id") or "").strip()
+    page, per_page = normalize_admin_pagination(filters.get("page"), filters.get("per_page"))
+    paginate = filters.get("paginate", True) is not False
+    progress_payload = _load_collection_tool_scan_progress(scan_batch_id) if scan_batch_id else {}
+    payload_filters = progress_payload.get("filters") or {}
+    if progress_payload:
+        chain_key = chain_key or _normalize_chain_key(progress_payload.get("chain_key") or payload_filters.get("chain_key"))
+        coin_symbol = coin_symbol or _normalize_code(progress_payload.get("coin_symbol") or payload_filters.get("coin_symbol") or "USDT")
+        user_id_text = user_id_text or str(payload_filters.get("user_id") or "").strip()
+        address = address or str(payload_filters.get("address") or "").strip().lower()
+    empty_progress = {
+        "status": "none",
+        "status_label": "未扫描",
+        "chain_key": chain_key,
+        "coin_symbol": coin_symbol,
+        "scan_batch_id": scan_batch_id,
+        "total": 0,
+        "scanned": 0,
+        "current_address": "",
+        "success_count": 0,
+        "positive_count": 0,
+        "zero_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "message": "",
+    }
+    if not chain_key or not coin_symbol:
+        return {
+            "items": [],
+            "progress": empty_progress,
+            "pagination": build_pagination_meta(0, page, per_page),
+            "addable_count": 0,
+            "filters": {"chain_key": chain_key, "coin_symbol": coin_symbol, "user_id": user_id_text, "address": address, "scan_batch_id": scan_batch_id, "page": page, "per_page": per_page},
+            "error": "",
+        }
+
+    existing_keys: set[tuple[str, str]] = set()
+    if _admin_table_exists(db, "collection_candidates"):
+        try:
+            existing_where = [
+                "LOWER(chain_key) = :chain_key",
+                "UPPER(asset_symbol) = :asset_symbol",
+                "status <> 'DISABLED'",
+            ]
+            params: Dict[str, Any] = {"chain_key": chain_key, "asset_symbol": coin_symbol}
+            if address:
+                existing_where.append("LOWER(address) LIKE :address")
+                params["address"] = f"%{address}%"
+            if user_id_text:
+                existing_where.append("user_id = :user_id")
+                params["user_id"] = int(user_id_text)
+            existing_rows = db.execute(
+                text(
+                    f"""
+                    SELECT UPPER(asset_symbol) AS asset_symbol, LOWER(address) AS address
+                    FROM collection_candidates
+                    WHERE {" AND ".join(existing_where)}
+                    """
+                ),
+                params,
+            ).mappings().all()
+            existing_keys = {
+                (_normalize_code(row.get("asset_symbol")), str(row.get("address") or "").strip().lower())
+                for row in existing_rows
+            }
+        except Exception:
+            logger.exception("collection tool candidate existence query failed")
+
+    items: list[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    progress = dict(empty_progress)
+    if scan_batch_id and progress_payload:
+        progress.update(
+            {
+                "status": progress_payload.get("status") or "running",
+                "chain_key": _normalize_chain_key(progress_payload.get("chain_key")) or chain_key,
+                "coin_symbol": _normalize_code(progress_payload.get("coin_symbol")) or coin_symbol,
+                "scan_batch_id": scan_batch_id,
+                "total": int(progress_payload.get("total") or 0),
+                "scanned": int(progress_payload.get("scanned") or 0),
+                "current_address": progress_payload.get("current_address") or "",
+                "success_count": int(progress_payload.get("success_count") or 0),
+                "positive_count": int(progress_payload.get("positive_count") or 0),
+                "zero_count": int(progress_payload.get("zero_count") or 0),
+                "failed_count": int(progress_payload.get("failed_count") or 0),
+                "skipped_count": int(progress_payload.get("skipped_count") or 0),
+                "message": progress_payload.get("message") or "",
+            }
+        )
+        if progress.get("status") == "completed" and int(progress.get("total") or 0) == 0:
+            progress["message"] = progress.get("message") or "当前筛选范围内暂无未入候选地址"
+        rows = progress_payload.get("rows") or []
+    elif scan_batch_id:
+        progress.update(
+            {
+                "status": "queued",
+                "chain_key": chain_key,
+                "coin_symbol": coin_symbol,
+                "scan_batch_id": scan_batch_id,
+                "message": "扫描任务已提交，等待 worker 写入进度",
+            }
+        )
+        rows = []
+    else:
+        rows = []
+
+    if rows:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_symbol = _normalize_code(row.get("asset_symbol") or row.get("coin_symbol")) or coin_symbol
+            row_address = str(row.get("address") or row.get("from_address") or "").strip().lower()
+            if row_symbol != coin_symbol:
+                continue
+            if address and address not in row_address:
+                continue
+            row_key = (row_symbol, row_address)
+            if row_key in seen:
+                continue
+            seen.add(row_key)
+            balance_amount = _collection_center_decimal(row.get("balance_amount") or 0)
+            exists = bool(row.get("candidate_exists")) or row_key in existing_keys
+            user_id = int(row.get("user_id") or 0)
+            row_status_label, row_status_badge = _collection_tool_row_status_label(row.get("status"))
+            add_failed = bool(row.get("add_failed"))
+            add_status_text = str(row.get("add_status_text") or "").strip()
+            can_add_candidate = bool(row.get("status") == "completed" and balance_amount > 0 and not exists and user_id > 0 and not add_failed)
+            if exists:
+                candidate_status_label = add_status_text or "已存在"
+                candidate_status_badge = "success"
+            elif add_failed:
+                candidate_status_label = add_status_text or "加入失败"
+                candidate_status_badge = "warning"
+            elif can_add_candidate:
+                candidate_status_label = "可加入"
+                candidate_status_badge = "info"
+            elif row.get("status") in {"pending", "running", "scanning"}:
+                candidate_status_label = "未加入"
+                candidate_status_badge = "neutral"
+            else:
+                candidate_status_label = "不可加入"
+                candidate_status_badge = "neutral"
+            items.append(
+                {
+                    "chain_key": chain_key,
+                    "coin_symbol": row_symbol,
+                    "address": row_address,
+                    "address_short": _short_admin_address(row_address),
+                    "user_id": user_id,
+                    "balance_amount": balance_amount,
+                    "balance_label": "-" if row.get("status") in {"pending", "running", "scanning"} else f"{_fmt_admin_amount_display(balance_amount, row_symbol)} {row_symbol}",
+                    "scan_status_label": row_status_label,
+                    "scan_status_badge": row_status_badge,
+                    "error": row.get("error") or "",
+                    "candidate_exists": exists,
+                    "candidate_status_label": candidate_status_label,
+                    "candidate_status_badge": candidate_status_badge,
+                    "can_add_candidate": can_add_candidate,
+                    "add_status_text": add_status_text,
+                    "add_error": row.get("add_error") or "",
+                    "add_failed": add_failed,
+                }
+            )
+    total_items = len(items)
+    pagination = build_pagination_meta(total_items, page, per_page)
+    addable_count = sum(1 for item in items if item.get("can_add_candidate"))
+    if paginate:
+        start = (int(pagination["page"]) - 1) * int(pagination["per_page"])
+        end = start + int(pagination["per_page"])
+        paged_items = items[start:end]
+    else:
+        paged_items = items
+    progress["status_label"] = _collection_tool_progress_label(progress.get("status"))
+    return {
+        "items": paged_items,
+        "all_items": items,
+        "progress": progress,
+        "pagination": pagination,
+        "addable_count": addable_count,
+        "filters": {"chain_key": chain_key, "coin_symbol": coin_symbol, "user_id": user_id_text, "address": address, "scan_batch_id": scan_batch_id, "page": pagination["page"], "per_page": pagination["per_page"]},
+        "error": "",
+    }
+
+
+def admin_add_manual_collection_candidate(
+    db: Session,
+    *,
+    chain_key: str,
+    asset_symbol: str,
+    address: str,
+    user_id: Any,
+    balance_amount: Any,
+) -> Dict[str, Any]:
+    chain = _normalize_chain_key(chain_key)
+    symbol = _normalize_code(asset_symbol)
+    user_address = str(address or "").strip().lower()
+    amount = _collection_center_decimal(balance_amount)
+    try:
+        parsed_user_id = int(user_id or 0)
+    except Exception:
+        parsed_user_id = 0
+    if not chain or not symbol or not user_address or parsed_user_id <= 0:
+        return {"ok": False, "message": "请提供网络、币种、地址和用户ID。"}
+    if amount <= 0:
+        return {"ok": False, "message": "链上余额必须大于 0，才能加入归集候选。"}
+    if not _admin_table_exists(db, "collection_candidates"):
+        return {"ok": False, "message": "collection_candidates 表不存在，无法加入候选。"}
+
+    config = db.execute(
+        text(
+            """
+            SELECT a.id AS asset_id, ac.id AS asset_chain_id, LOWER(ac.contract_address) AS token_contract
+            FROM asset_chains ac
+            JOIN assets a ON a.id = ac.asset_id
+            JOIN chains c ON c.id = ac.chain_id
+            WHERE c.enabled = 1
+              AND ac.enabled = 1
+              AND a.enabled = 1
+              AND LOWER(c.chain_key) = :chain_key
+              AND UPPER(a.symbol) = :asset_symbol
+              AND ac.contract_address IS NOT NULL
+              AND TRIM(ac.contract_address) <> ''
+            ORDER BY ac.id ASC
+            LIMIT 1
+            """
+        ),
+        {"chain_key": chain, "asset_symbol": symbol},
+    ).mappings().first()
+    if not config:
+        return {"ok": False, "message": "所选币种未配置该网络，无法加入候选。"}
+    token_contract = str(config.get("token_contract") or "").strip().lower()
+    existing = db.execute(
+        text(
+            """
+            SELECT id
+            FROM collection_candidates
+            WHERE LOWER(chain_key) = :chain_key
+              AND LOWER(token_contract) = :token_contract
+              AND LOWER(address) = :address
+              AND status <> 'DISABLED'
+            LIMIT 1
+            """
+        ),
+        {"chain_key": chain, "token_contract": token_contract, "address": user_address},
+    ).mappings().first()
+    if existing:
+        return {"ok": True, "already_exists": True, "message": "候选已存在。"}
+
+    now = datetime.utcnow()
+    db.execute(
+        text(
+            """
+            INSERT INTO collection_candidates (
+                user_id, chain_key, asset_symbol, asset_id, asset_chain_id,
+                token_contract, address, total_detected_amount, latest_deposit_amount,
+                latest_tx_hash, source, status, detected_at, latest_deposit_at,
+                last_scan_at, last_balance_amount, created_at, updated_at
+            ) VALUES (
+                :user_id, :chain_key, :asset_symbol, :asset_id, :asset_chain_id,
+                :token_contract, :address, :balance_amount, 0,
+                NULL, 'MANUAL', 'PENDING_VERIFY', :now, :now,
+                :now, :balance_amount, :now, :now
+            )
+            """
+        ),
+        {
+            "user_id": parsed_user_id,
+            "chain_key": chain,
+            "asset_symbol": symbol,
+            "asset_id": int(config.get("asset_id") or 0) or None,
+            "asset_chain_id": int(config.get("asset_chain_id") or 0) or None,
+            "token_contract": token_contract,
+            "address": user_address,
+            "balance_amount": amount,
+            "now": now,
+        },
+    )
+    db.commit()
+    return {"ok": True, "already_exists": False, "message": "已加入归集候选。"}
+
+
+def admin_query_collection_candidate_workbench(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    selected_candidate_id = _parse_int(filters.get("candidate_id"), 0)
+    chain_key = _normalize_chain_key(filters.get("chain_key") or filters.get("network"))
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or filters.get("symbol"))
+    status_filter = str(filters.get("status") or filters.get("candidate_status") or "PENDING").strip().upper()
+    if status_filter not in {"PENDING", "ALL", "COLLECTED", "NO_BALANCE"}:
+        status_filter = "PENDING"
+    source_filter = str(filters.get("source") or "").strip().upper()
+    user_id = _collection_center_user_id(filters.get("user_id"))
+    address = str(filters.get("address") or "").strip().lower()
+    page, per_page = normalize_admin_pagination(filters.get("page"), filters.get("per_page"))
+    include_all = bool(filters.get("include_all"))
+    network_card_bases = _collection_candidate_network_card_bases(db)
+
+    if not _admin_table_exists(db, "collection_candidates"):
+        pagination = build_pagination_meta(0, page, per_page)
+        return {
+            "items": [],
+            "network_cards": network_card_bases,
+            "asset_options": [],
+            "stats": {"candidate_count": 0, "pending_verify_count": 0, "collectible_count": 0, "has_task_count": 0},
+            "pagination": pagination,
+            "filters": {
+                "chain_key": chain_key,
+                "coin_symbol": coin_symbol,
+                "status": status_filter,
+                "source": source_filter,
+                "user_id": str(filters.get("user_id") or "").strip(),
+                "address": address,
+                "page": pagination["page"],
+                "per_page": pagination["per_page"],
+            },
+            "error": "",
+        }
+
+    asset_options: list[Dict[str, Any]] = []
+    if chain_key:
+        try:
+            asset_options = [
+                {
+                    "symbol": str(row.get("symbol") or "").upper(),
+                    "name": row.get("asset_name") or "",
+                }
+                for row in db.execute(
+                    text(
+                        """
+                        SELECT UPPER(cc.asset_symbol) AS symbol, MAX(a.name) AS asset_name
+                        FROM collection_candidates cc
+                        LEFT JOIN assets a ON a.id = cc.asset_id
+                        WHERE cc.status <> 'DISABLED'
+                          AND LOWER(cc.chain_key) = :chain_key
+                          AND cc.asset_symbol IS NOT NULL
+                          AND cc.asset_symbol <> ''
+                        GROUP BY UPPER(cc.asset_symbol)
+                        ORDER BY UPPER(cc.asset_symbol)
+                        """
+                    ),
+                    {"chain_key": chain_key},
+                ).mappings().all()
+                if row.get("symbol")
+            ]
+        except Exception:
+            logger.exception("collection candidate asset options query failed", extra={"chain_key": chain_key})
+            asset_options = []
+        available_symbols = {str(item.get("symbol") or "").upper() for item in asset_options}
+        if coin_symbol and coin_symbol not in available_symbols:
+            coin_symbol = ""
+
+    where_parts = ["cc.status <> 'DISABLED'"]
+    params: Dict[str, Any] = {}
+    # Keep network cards available for switching networks. The selected chain
+    # is applied after rows are enriched with status metadata.
+    if coin_symbol:
+        where_parts.append("UPPER(cc.asset_symbol) = :coin_symbol")
+        params["coin_symbol"] = coin_symbol
+    if source_filter:
+        where_parts.append("UPPER(cc.source) = :source")
+        params["source"] = source_filter
+    if user_id is not None:
+        where_parts.append("cc.user_id = :user_id")
+        params["user_id"] = int(user_id)
+    if address:
+        where_parts.append("LOWER(cc.address) LIKE :address")
+        params["address"] = f"%{address}%"
+    if selected_candidate_id > 0:
+        where_parts.append("cc.id = :candidate_id")
+        params["candidate_id"] = selected_candidate_id
+
+    collection_min_amount_sql = (
+        "ac.collection_min_amount AS collection_min_amount"
+        if _has_db_column(db, "asset_chains", "collection_min_amount")
+        else "NULL AS collection_min_amount"
+    )
+    chain_collection_enabled_sql = (
+        "COALESCE(c.collection_enabled, 0) AS chain_collection_enabled"
+        if _has_db_column(db, "chains", "collection_enabled")
+        else "1 AS chain_collection_enabled"
+    )
+
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                  cc.id,
+                  cc.user_id,
+                  LOWER(cc.chain_key) AS chain_key,
+                  UPPER(cc.asset_symbol) AS asset_symbol,
+                  cc.asset_id,
+                  cc.asset_chain_id,
+                  LOWER(cc.token_contract) AS token_contract,
+                  ac.decimals AS token_decimals,
+                  LOWER(cc.address) AS address,
+                  cc.total_detected_amount,
+                  cc.latest_deposit_amount,
+                  cc.latest_tx_hash,
+                  cc.source,
+                  cc.status AS candidate_status,
+                  cc.detected_at,
+                  cc.latest_deposit_at,
+                  cc.last_scan_at,
+                  cc.last_balance_amount,
+                  cc.created_at,
+                  cc.updated_at,
+                  c.name AS chain_name,
+                  a.name AS asset_name,
+                  {collection_min_amount_sql},
+                  {chain_collection_enabled_sql}
+                FROM collection_candidates cc
+                LEFT JOIN chains c ON LOWER(c.chain_key) = LOWER(cc.chain_key)
+                LEFT JOIN assets a ON a.id = cc.asset_id
+                LEFT JOIN asset_chains ac ON ac.id = cc.asset_chain_id
+                WHERE {" AND ".join(where_parts)}
+                ORDER BY COALESCE(cc.latest_deposit_at, cc.updated_at, cc.created_at) DESC, cc.id DESC
+                """
+            ),
+            params,
+        ).mappings().all()
+    except Exception:
+        logger.exception("collection candidate workbench query failed")
+        pagination = build_pagination_meta(0, page, per_page)
+        return {
+            "items": [],
+            "network_cards": network_card_bases,
+            "asset_options": asset_options,
+            "stats": {"candidate_count": 0, "pending_verify_count": 0, "collectible_count": 0, "has_task_count": 0},
+            "pagination": pagination,
+            "filters": {
+                "chain_key": chain_key,
+                "coin_symbol": coin_symbol,
+                "status": status_filter,
+                "source": source_filter,
+                "user_id": str(filters.get("user_id") or "").strip(),
+                "address": address,
+                "page": pagination["page"],
+                "per_page": pagination["per_page"],
+            },
+            "error": "归集候选读取失败，请稍后重试",
+        }
+
+    verify_statuses = load_candidate_verify_statuses([row.get("id") for row in rows])
+    addresses = sorted({str(row.get("address") or "").strip().lower() for row in rows if row.get("address")})
+    chain_keys = sorted({_normalize_chain_key(row.get("chain_key")) for row in rows if row.get("chain_key")})
+    symbols = sorted({_normalize_code(row.get("asset_symbol")) for row in rows if row.get("asset_symbol")})
+    active_task_keys: set[tuple[str, str, str]] = set()
+    success_task_rows_by_key: Dict[tuple[str, str, str], list[Dict[str, Any]]] = {}
+    active_gas_keys: set[tuple[str, str, str]] = set()
+    if addresses and chain_keys and symbols:
+        try:
+            task_rows = db.execute(
+                text(
+                    """
+                    SELECT LOWER(chain_key) AS chain_key, UPPER(coin_symbol) AS coin_symbol,
+                           LOWER(from_address) AS address, UPPER(status) AS status,
+                           amount, confirmed_at, updated_at
+                    FROM collection_tasks
+                    WHERE LOWER(from_address) IN :addresses
+                      AND LOWER(chain_key) IN :chain_keys
+                      AND UPPER(coin_symbol) IN :symbols
+                    ORDER BY created_at DESC, id DESC
+                    """
+                ).bindparams(
+                    bindparam("addresses", expanding=True),
+                    bindparam("chain_keys", expanding=True),
+                    bindparam("symbols", expanding=True),
+                ),
+                {"addresses": addresses, "chain_keys": chain_keys, "symbols": symbols},
+            ).mappings().all()
+            for task in task_rows:
+                key = (_normalize_chain_key(task.get("chain_key")), _normalize_code(task.get("coin_symbol")), str(task.get("address") or "").strip().lower())
+                status = str(task.get("status") or "").upper()
+                if status in COLLECTION_CENTER_SUCCESS_TASK_STATUSES:
+                    success_task_rows_by_key.setdefault(key, []).append(dict(task))
+                elif status in COLLECTION_CENTER_ACTIVE_TASK_STATUSES:
+                    active_task_keys.add(key)
+            gas_rows = db.execute(
+                text(
+                    """
+                    SELECT LOWER(chain_key) AS chain_key, LOWER(to_address) AS address, UPPER(status) AS status
+                    FROM gas_tasks
+                    WHERE LOWER(to_address) IN :addresses
+                      AND LOWER(chain_key) IN :chain_keys
+                    ORDER BY created_at DESC, id DESC
+                    """
+                ).bindparams(
+                    bindparam("addresses", expanding=True),
+                    bindparam("chain_keys", expanding=True),
+                ),
+                {"addresses": addresses, "chain_keys": chain_keys},
+            ).mappings().all()
+            for gas_task in gas_rows:
+                status = str(gas_task.get("status") or "").upper()
+                if status not in COLLECTION_CENTER_ACTIVE_TASK_STATUSES:
+                    continue
+                chain = _normalize_chain_key(gas_task.get("chain_key"))
+                gas_address = str(gas_task.get("address") or "").strip().lower()
+                for symbol in symbols:
+                    active_gas_keys.add((chain, symbol, gas_address))
+        except Exception:
+            logger.exception("collection candidate task overlay query failed")
+
+    items: list[Dict[str, Any]] = []
+    stats = {
+        "candidate_count": 0,
+        "pending_verify_count": 0,
+        "collectible_count": 0,
+        "has_task_count": 0,
+        "verified_address_count": 0,
+        "unverified_address_count": 0,
+        "candidate_amount_totals": {},
+        "verified_amount_totals": {},
+        "collectible_amount_totals": {},
+        "candidate_amount_total_label": "-",
+        "verified_amount_total_label": "-",
+        "collectible_amount_total_label": "-",
+        "candidate_amount_detail_items": [],
+        "verified_amount_detail_items": [],
+        "collectible_amount_detail_items": [],
+        "chain_collection_enabled": 1,
+    }
+    network_cards_by_chain: Dict[str, Dict[str, Any]] = {
+        card["chain_key"]: dict(card)
+        for card in network_card_bases
+        if card.get("chain_key")
+    }
+    for row in rows:
+        chain = _normalize_chain_key(row.get("chain_key"))
+        symbol = _normalize_code(row.get("asset_symbol"))
+        candidate_address = str(row.get("address") or "").strip().lower()
+        key = (chain, symbol, candidate_address)
+        snapshot_item = _collection_candidate_snapshot_index(dict(row))
+        raw_candidate_amount = _collection_center_decimal(row.get("total_detected_amount"))
+        verified_value = row.get("last_balance_amount")
+        raw_verified_amount = _collection_center_decimal(verified_value) if verified_value is not None else None
+        verified_amount = raw_verified_amount
+        last_scan_at_raw = row.get("last_scan_at")
+        latest_deposit_at_raw = row.get("latest_deposit_at")
+        candidate_status = str(row.get("candidate_status") or "").strip().upper()
+        need_verify = bool(last_scan_at_raw is None or candidate_status == "PENDING_VERIFY")
+        if last_scan_at_raw is not None and latest_deposit_at_raw is not None:
+            try:
+                need_verify = latest_deposit_at_raw > last_scan_at_raw
+            except Exception:
+                need_verify = False
+        item_candidate_id = int(row.get("id") or 0)
+        verify_status = verify_statuses.get(item_candidate_id) or {}
+        verify_status_value = str(verify_status.get("status") or "").strip().lower()
+        verify_started_at = _collection_candidate_datetime_value(verify_status.get("started_at"))
+        last_scan_at_value = _collection_candidate_datetime_value(last_scan_at_raw)
+        if verify_status_value == "running" and last_scan_at_value and verify_started_at and last_scan_at_value >= verify_started_at:
+            verify_status_value = "completed"
+        elif verify_status_value == "running" and verify_started_at and datetime.utcnow() - verify_started_at > timedelta(minutes=10):
+            verify_status_value = "failed"
+            verify_status = {**verify_status, "error": "复核超时，请重试"}
+        if verify_status_value == "completed":
+            if verified_amount is None and verify_status.get("balance_amount") is not None:
+                verified_amount = _collection_center_decimal(verify_status.get("balance_amount"))
+            if last_scan_at_raw is None and verify_status.get("completed_at"):
+                last_scan_at_raw = verify_status.get("completed_at")
+        last_scan_at_value = _collection_candidate_datetime_value(last_scan_at_raw)
+        collected_amount = Decimal("0")
+        for success_task in success_task_rows_by_key.get(key, []):
+            collected_amount += _collection_center_decimal(success_task.get("amount"))
+        candidate_amount = max(Decimal("0"), raw_candidate_amount - collected_amount)
+        if verified_amount is not None and collected_amount > 0:
+            verified_amount = max(Decimal("0"), verified_amount - collected_amount)
+        verify_running = verify_status_value == "running"
+        verify_failed = verify_status_value == "failed"
+        verify_completed_recently = verify_status_value == "completed"
+        verified_at_label = _admin_datetime_display(last_scan_at_raw) or "-"
+        is_verified = bool(last_scan_at_raw is not None and verified_amount is not None)
+        meta = _collection_candidate_status_meta(
+            candidate_amount=candidate_amount,
+            need_verify=need_verify,
+            verified_amount=verified_amount,
+            snapshot_item=snapshot_item,
+            has_active_task=key in active_task_keys,
+            has_success_task=collected_amount > 0,
+            has_active_gas_task=key in active_gas_keys,
+        )
+        min_collect_amount = Decimal("0")
+        collect_disabled_reason = ""
+        chain_collection_enabled = 1 if row.get("chain_collection_enabled") is None else int(row.get("chain_collection_enabled") or 0)
+        has_configured_min_collect_amount = row.get("collection_min_amount") is not None
+        try:
+            from app.services.collection_chain_helper import compute_min_collect_amount
+
+            configured_min = row.get("collection_min_amount")
+            min_collect_amount = compute_min_collect_amount(
+                chain_key=chain,
+                coin_symbol=symbol,
+                configured_min_amount=_collection_center_decimal(configured_min) if configured_min is not None else None,
+            )
+        except Exception:
+            min_collect_amount = Decimal("0")
+        if (
+            meta.get("status") == "COLLECTIBLE"
+            and verified_amount is not None
+            and verified_amount > 0
+            and min_collect_amount > 0
+            and verified_amount < min_collect_amount
+        ):
+            meta = {**meta, "status": "BALANCE_LOW", "status_label": "未达最小", "status_badge": "warning"}
+            collect_disabled_reason = "未达最小归集金额"
+        elif meta.get("status") == "COLLECTED":
+            collect_disabled_reason = "已归集，暂无剩余可归集金额"
+        if not chain_collection_enabled:
+            collect_disabled_reason = "当前网络未开启归集"
+        display_candidate_amount = verified_amount if is_verified and verified_amount is not None else candidate_amount
+        is_collected_zero = bool(meta.get("status") == "COLLECTED" and display_candidate_amount <= 0)
+        is_no_balance = bool(meta.get("status") == "NO_BALANCE")
+        include_candidate = (
+            status_filter == "ALL"
+            or (status_filter == "COLLECTED" and is_collected_zero)
+            or (status_filter == "NO_BALANCE" and is_no_balance)
+            or (include_all and status_filter == "PENDING" and is_no_balance)
+            or (status_filter == "PENDING" and not is_collected_zero and not is_no_balance)
+        )
+        network_card = network_cards_by_chain.setdefault(
+            chain,
+            {
+                "chain_key": chain,
+                "chain_name": row.get("chain_name") or chain,
+                "candidate_count": 0,
+                "pending_verify_count": 0,
+                "collectible_count": 0,
+            },
+        )
+        if include_candidate:
+            network_card["candidate_count"] += 1
+            if meta["status"] == "PENDING_VERIFY":
+                network_card["pending_verify_count"] += 1
+            if meta["status"] == "COLLECTIBLE":
+                network_card["collectible_count"] += 1
+        if chain_key and chain != chain_key:
+            continue
+        if not include_candidate:
+            continue
+        stats["chain_collection_enabled"] = chain_collection_enabled
+        source_label = _collection_candidate_source_label(row.get("source"))
+        verified_label = (
+            f"{_fmt_admin_amount_display(verified_amount, symbol)} {symbol}"
+            if verified_amount is not None
+            else "-"
+        )
+        collected_label = (
+            f"{_fmt_admin_amount_display(collected_amount, symbol)} {symbol}"
+            if collected_amount > 0
+            else "-"
+        )
+        can_submit_collection_request = bool(meta["status"] == "COLLECTIBLE" and verified_amount is not None and verified_amount > 0)
+        can_create_collection_task = bool(can_submit_collection_request and not collect_disabled_reason)
+        stats["candidate_count"] += 1
+        if meta["status"] == "PENDING_VERIFY":
+            stats["pending_verify_count"] += 1
+        if meta["status"] == "COLLECTIBLE":
+            stats["collectible_count"] += 1
+        if meta["status"] == "HAS_TASK":
+            stats["has_task_count"] += 1
+        stats["candidate_amount_totals"][symbol] = stats["candidate_amount_totals"].get(symbol, Decimal("0")) + display_candidate_amount
+        if is_verified:
+            stats["verified_address_count"] += 1
+            if verified_amount is not None:
+                stats["verified_amount_totals"][symbol] = stats["verified_amount_totals"].get(symbol, Decimal("0")) + verified_amount
+        else:
+            stats["unverified_address_count"] += 1
+        if can_create_collection_task and verified_amount is not None and verified_amount > 0:
+            stats["collectible_amount_totals"][symbol] = stats["collectible_amount_totals"].get(symbol, Decimal("0")) + verified_amount
+        if verify_running:
+            verify_status_text = "复核中"
+            verify_button_label = "复核中"
+            verify_button_title = "链上核实正在处理"
+        elif verify_failed:
+            verify_status_text = "复核失败"
+            verify_button_label = "重试"
+            verify_button_title = str(verify_status.get("error") or "复核失败，请重试")
+        elif is_verified:
+            verify_status_text = "已复核"
+            verify_button_label = "复核"
+            verify_button_title = f"最近核实：{verified_at_label}"
+        else:
+            verify_status_text = "未核实"
+            verify_button_label = "核实"
+            verify_button_title = "尚未核实"
+        items.append(
+            {
+                "id": item_candidate_id,
+                "user_id": int(row.get("user_id") or 0),
+                "chain_key": chain,
+                "chain_name": row.get("chain_name") or chain,
+                "chain_collection_enabled": chain_collection_enabled,
+                "chain_collection_enabled_label": "开启" if chain_collection_enabled else "关闭",
+                "asset_symbol": symbol,
+                "asset_chain_id": int(row.get("asset_chain_id") or 0) or None,
+                "token_contract": row.get("token_contract") or "",
+                "token_decimals": int(row.get("token_decimals") or 18),
+                "asset_name": row.get("asset_name") or "",
+                "address": candidate_address,
+                "address_short": _short_admin_address(candidate_address),
+                "candidate_amount": display_candidate_amount,
+                "candidate_amount_label": f"{_fmt_admin_amount_display(display_candidate_amount, symbol)} {symbol}",
+                "candidate_amount_raw": raw_candidate_amount,
+                "verified_onchain_amount_raw": raw_verified_amount,
+                "verified_onchain_amount": verified_amount,
+                "verified_onchain_amount_label": verified_label,
+                "collected_amount": collected_amount,
+                "collected_amount_label": collected_label,
+                "min_collect_amount": min_collect_amount,
+                "min_collect_amount_label": f"{_fmt_admin_amount_display(min_collect_amount, symbol)} {symbol}" if (has_configured_min_collect_amount or min_collect_amount > 0) else "",
+                "collect_disabled_reason": collect_disabled_reason,
+                "verified_at": verified_at_label,
+                "is_verified": is_verified,
+                "verify_status_text": verify_status_text,
+                "verify_running": verify_running,
+                "verify_failed": verify_failed,
+                "verify_completed_recently": verify_completed_recently,
+                "verify_button_label": verify_button_label,
+                "verify_button_title": verify_button_title,
+                "need_verify": need_verify,
+                "gas_status_label": meta.get("gas_status_label") or "-",
+                "source": str(row.get("source") or ""),
+                "source_label": source_label,
+                "latest_tx_hash": row.get("latest_tx_hash") or "",
+                "latest_tx_hash_short": _short_admin_hash(row.get("latest_tx_hash")) if row.get("latest_tx_hash") else "",
+                "latest_deposit_at": _admin_datetime_display(latest_deposit_at_raw) or "-",
+                "deposit_records_url": (
+                    f"/admin/deposit-records?user_id={int(row.get('user_id') or 0)}"
+                    f"&coin_symbol={symbol}&chain_key={chain}&tx_hash={row.get('latest_tx_hash') or ''}"
+                ),
+                "_sort_status_rank": {"COLLECTIBLE": 0, "PENDING_VERIFY": 1, "BALANCE_LOW": 2, "HAS_TASK": 3, "NO_BALANCE": 4, "COLLECTED": 5}.get(meta["status"], 9),
+                "_sort_latest_deposit_at": latest_deposit_at_raw or datetime.min,
+                "_sort_last_scan_at": last_scan_at_raw or datetime.min,
+                "can_verify": bool(chain and symbol and candidate_address and not verify_running),
+                "can_create_collection_task": can_create_collection_task,
+                "can_submit_collection_request": can_submit_collection_request,
+                "can_create_gas_task": False,
+                **meta,
+            }
+        )
+    items.sort(key=lambda item: int(item.get("id") or 0), reverse=True)
+    items.sort(key=lambda item: item.get("_sort_last_scan_at") or datetime.min, reverse=True)
+    items.sort(key=lambda item: item.get("_sort_latest_deposit_at") or datetime.min, reverse=True)
+    items.sort(key=lambda item: int(item.get("_sort_status_rank") or 9))
+    total_items = len(items)
+    pagination = build_pagination_meta(total_items, page, per_page)
+    start = (int(pagination["page"]) - 1) * int(pagination["per_page"])
+    end = start + int(pagination["per_page"])
+    candidate_amount_summary = _collection_center_amount_summary(stats["candidate_amount_totals"])
+    verified_amount_summary = _collection_center_amount_summary(stats["verified_amount_totals"])
+    collectible_amount_summary = _collection_center_amount_summary(stats["collectible_amount_totals"])
+    stats["candidate_amount_total_label"] = candidate_amount_summary["label"]
+    stats["verified_amount_total_label"] = verified_amount_summary["label"]
+    stats["collectible_amount_total_label"] = collectible_amount_summary["label"]
+    stats["candidate_amount_summary_label"] = candidate_amount_summary["label"]
+    stats["verified_amount_summary_label"] = verified_amount_summary["label"]
+    stats["collectible_amount_summary_label"] = collectible_amount_summary["label"]
+    stats["candidate_amount_detail_label"] = candidate_amount_summary["detail_label"]
+    stats["verified_amount_detail_label"] = verified_amount_summary["detail_label"]
+    stats["collectible_amount_detail_label"] = collectible_amount_summary["detail_label"]
+    stats["candidate_amount_detail_items"] = candidate_amount_summary["items"]
+    stats["verified_amount_detail_items"] = verified_amount_summary["items"]
+    stats["collectible_amount_detail_items"] = collectible_amount_summary["items"]
+    stats["candidate_amount_totals"] = {
+        symbol: _fmt_admin_amount_display(amount, symbol)
+        for symbol, amount in sorted(stats["candidate_amount_totals"].items())
+    }
+    stats["verified_amount_totals"] = {
+        symbol: _fmt_admin_amount_display(amount, symbol)
+        for symbol, amount in sorted(stats["verified_amount_totals"].items())
+    }
+    stats["collectible_amount_totals"] = {
+        symbol: _fmt_admin_amount_display(amount, symbol)
+        for symbol, amount in sorted(stats["collectible_amount_totals"].items())
+    }
+    visible_items = items if include_all else items[start:end]
+    paged_items = [
+        {key: value for key, value in item.items() if not str(key).startswith("_sort_")}
+        for item in visible_items
+    ]
+    return {
+        "items": paged_items,
+        "has_verify_running": any(bool(item.get("verify_running")) for item in paged_items),
+        "asset_options": asset_options,
+        "network_cards": sorted(
+            network_cards_by_chain.values(),
+            key=lambda item: (str(item.get("chain_name") or ""), str(item.get("chain_key") or "")),
+        ),
+        "stats": stats,
+        "pagination": pagination,
+        "filters": {
+            "chain_key": chain_key,
+            "coin_symbol": coin_symbol,
+            "status": status_filter,
+            "source": source_filter,
+            "user_id": str(filters.get("user_id") or "").strip(),
+            "address": address,
+            "candidate_id": selected_candidate_id,
+            "page": pagination["page"],
+            "per_page": pagination["per_page"],
+        },
+        "error": "",
+    }
+
+
+def _collection_center_skip_reason_stats(skipped_reasons: list[str]) -> Dict[str, int]:
+    stats: Dict[str, int] = {}
+    for reason in skipped_reasons:
+        key = str(reason or "OTHER").strip().upper() or "OTHER"
+        stats[key] = stats.get(key, 0) + 1
+    return stats
+
+
+def _collection_center_chain_collection_address(db: Session, chain_key: str) -> str:
+    meta = _collection_center_chain_collection_meta(db, chain_key)
+    return str(meta.get("collection_address") or "").strip().lower()
+
+
+def _collection_center_chain_collection_meta(db: Session, chain_key: str) -> Dict[str, Any]:
+    collection_enabled_sql = (
+        "COALESCE(collection_enabled, 0) AS collection_enabled"
+        if _has_db_column(db, "chains", "collection_enabled")
+        else "1 AS collection_enabled"
+    )
+    row = db.execute(
+        text(
+            f"""
+            SELECT collection_address, {collection_enabled_sql}
+            FROM chains
+            WHERE LOWER(chain_key) = :chain_key
+            LIMIT 1
+            """
+        ),
+        {"chain_key": chain_key.lower()},
+    ).mappings().first()
+    if not row:
+        return {"collection_address": "", "collection_enabled": 0}
+    return {
+        "collection_address": str(row.get("collection_address") or "").strip().lower(),
+        "collection_enabled": 1 if row.get("collection_enabled") is None else int(row.get("collection_enabled") or 0),
+    }
+
+
+def _collection_center_candidate_debug_item(
+    item: Dict[str, Any],
+    *,
+    verified_amount: Any = None,
+    min_collect_amount: Any = None,
+    skip_reason: str = "",
+) -> Dict[str, Any]:
+    verified_value = item.get("verified_onchain_amount") if verified_amount is None else verified_amount
+    min_value = item.get("min_collect_amount") if min_collect_amount is None else min_collect_amount
+    verified_label = "" if verified_value is None else str(verified_value)
+    min_label = "0" if min_value is None else str(min_value)
+    address = str(item.get("address") or "").strip().lower()
+    return {
+        "candidate_id": item.get("id"),
+        "chain_key": item.get("chain_key") or "",
+        "coin_symbol": item.get("asset_symbol") or item.get("coin_symbol") or "",
+        "address": address,
+        "address_short": _short_admin_address(address),
+        "candidate_amount": str(item.get("candidate_amount") or "0"),
+        "verified_onchain_amount": verified_label,
+        "min_collect_amount": min_label,
+        "skip_reason": str(skip_reason or ""),
+    }
+
+
+def _collection_center_refresh_candidate_onchain(
+    db: Session,
+    item: Dict[str, Any],
+    *,
+    collection_address: str,
+) -> Any:
+    token_contract = str(item.get("token_contract") or "").strip()
+    if not token_contract:
+        raise ValueError("TOKEN_CONTRACT_MISSING")
+    min_collect_amount = _collection_center_decimal(item.get("min_collect_amount"))
+    evaluation = confirm_collection_candidate_onchain(
+        chain_key=str(item.get("chain_key") or ""),
+        coin_symbol=str(item.get("asset_symbol") or ""),
+        from_address=str(item.get("address") or ""),
+        to_address=collection_address,
+        token_contract_address=token_contract,
+        token_decimals=int(item.get("token_decimals") or 18),
+        min_collect_amount=min_collect_amount,
+        db=db,
+    )
+    checked_at = datetime.utcnow()
+    db.execute(
+        text(
+            """
+            UPDATE collection_candidates
+            SET last_scan_at = :checked_at,
+                last_balance_amount = :balance_amount,
+                status = CASE WHEN status = 'DISABLED' THEN 'DISABLED' ELSE 'ACTIVE' END,
+                updated_at = :checked_at
+            WHERE id = :candidate_id
+            """
+        ),
+        {
+            "checked_at": checked_at,
+            "balance_amount": evaluation.token_balance,
+            "candidate_id": int(item.get("id") or 0),
+        },
+    )
+    item["verified_onchain_amount"] = evaluation.token_balance
+    item["verified_onchain_amount_label"] = f"{_fmt_admin_amount_display(evaluation.token_balance, str(item.get('asset_symbol') or ''))} {str(item.get('asset_symbol') or '').upper()}"
+    item["min_collect_amount"] = evaluation.min_collect_amount
+    item["is_verified"] = True
+    item["verified_at"] = _admin_datetime_display(checked_at) or ""
+    return evaluation
+
+
+def admin_create_collection_batch_from_verified_candidates(
+    db: Session,
+    admin_user_id: Optional[int],
+    filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    values = dict(filters or {})
+    chain_key = _normalize_chain_key(values.get("chain_key"))
+    if not chain_key:
+        raise ValueError("请选择当前网络后再创建归集任务。")
+
+    result = admin_query_collection_candidate_workbench(
+        db,
+        {
+            **values,
+            "chain_key": chain_key,
+            "include_all": True,
+            "page": 1,
+            "per_page": 100,
+        },
+    )
+    items = list(result.get("items") or [])
+    skipped_reasons: list[str] = []
+    debug_items: list[Dict[str, Any]] = []
+    created_task_ids: list[int] = []
+    batch = None
+
+    chain_collection_meta = _collection_center_chain_collection_meta(db, chain_key)
+    if not int(chain_collection_meta.get("collection_enabled") or 0):
+        skip_reason = "CHAIN_COLLECTION_DISABLED"
+        return {
+            "ok": True,
+            "batch_id": None,
+            "batch_no": "",
+            "created_task_count": 0,
+            "created_gas_task_count": 0,
+            "created_task_ids": [],
+            "created_gas_task_ids": [],
+            "skipped_count": len(items),
+            "skipped_reason_stats": {skip_reason: len(items)} if items else {},
+            "debug_items": [_collection_center_candidate_debug_item(item, skip_reason=skip_reason) for item in items],
+            "skipped_duplicate_count": 0,
+            "skipped_gas_required_count": 0,
+            "gas_task_skipped_duplicate_count": 0,
+            "gas_task_skipped_config_missing_count": 0,
+            "warnings": [],
+        }
+    collection_address = str(chain_collection_meta.get("collection_address") or "").strip().lower()
+    if not collection_address:
+        raise ValueError("当前网络未配置归集地址，无法创建归集任务。")
+    batch_coin_symbol = str(values.get("coin_symbol") or "").strip().upper() or None
+
+    for item in items:
+        duplicate = find_active_collection_task_duplicate(
+            db,
+            user_id=int(item.get("user_id") or 0),
+            chain_key=chain_key,
+            coin_symbol=str(item.get("asset_symbol") or "").upper(),
+            from_address=str(item.get("address") or "").lower(),
+        )
+        if duplicate:
+            skip_reason = "ACTIVE_COLLECTION_TASK_EXISTS"
+            skipped_reasons.append(skip_reason)
+            debug_items.append(_collection_center_candidate_debug_item(item, skip_reason=skip_reason))
+            continue
+        try:
+            evaluation = _collection_center_refresh_candidate_onchain(db, item, collection_address=collection_address)
+        except Exception as exc:
+            skip_reason = "ONCHAIN_VERIFY_FAILED"
+            skipped_reasons.append(skip_reason)
+            debug_item = _collection_center_candidate_debug_item(item, skip_reason=skip_reason)
+            debug_item["error"] = str(exc)[:180]
+            debug_items.append(debug_item)
+            continue
+        verified_amount = evaluation.token_balance
+        min_collect_amount = evaluation.min_collect_amount
+        amount = evaluation.collect_amount
+        if verified_amount <= 0:
+            skip_reason = "ZERO_VERIFIED_BALANCE"
+            skipped_reasons.append(skip_reason)
+            debug_items.append(
+                _collection_center_candidate_debug_item(
+                    item,
+                    verified_amount=verified_amount,
+                    min_collect_amount=min_collect_amount,
+                    skip_reason=skip_reason,
+                )
+            )
+            continue
+        if not evaluation.should_collect:
+            skip_reason = "BELOW_MIN_COLLECT_AMOUNT"
+            skipped_reasons.append(skip_reason)
+            debug_items.append(
+                _collection_center_candidate_debug_item(
+                    item,
+                    verified_amount=verified_amount,
+                    min_collect_amount=min_collect_amount,
+                    skip_reason=skip_reason,
+                )
+            )
+            continue
+        if amount <= 0:
+            skip_reason = "BELOW_MIN_COLLECT_AMOUNT"
+            skipped_reasons.append(skip_reason)
+            debug_items.append(
+                _collection_center_candidate_debug_item(
+                    item,
+                    verified_amount=verified_amount,
+                    min_collect_amount=min_collect_amount,
+                    skip_reason=skip_reason,
+                )
+            )
+            continue
+        if batch is None:
+            batch = create_collection_batch(
+                db,
+                trigger_type="MANUAL",
+                target_address=collection_address,
+                chain_key=chain_key,
+                coin_symbol=batch_coin_symbol,
+                created_by=admin_user_id,
+            )
+        task = create_collection_task(
+            db,
+            batch_id=int(batch.id),
+            user_id=int(item.get("user_id") or 0),
+            chain_key=chain_key,
+            coin_symbol=str(item.get("asset_symbol") or "").upper(),
+            asset_chain_id=item.get("asset_chain_id"),
+            from_address=str(item.get("address") or "").lower(),
+            to_address=collection_address,
+            amount=amount,
+            reason="VERIFIED_ONCHAIN_BALANCE",
+        )
+        if int(task.id) not in created_task_ids:
+            created_task_ids.append(int(task.id))
+        debug_items.append(
+            _collection_center_candidate_debug_item(
+                item,
+                verified_amount=verified_amount,
+                min_collect_amount=min_collect_amount,
+                skip_reason="",
+            )
+        )
+
+    skipped_reason_stats = _collection_center_skip_reason_stats(skipped_reasons)
+    return {
+        "ok": True,
+        "batch_id": int(batch.id) if batch is not None else None,
+        "batch_no": str(batch.batch_no) if batch is not None else "",
+        "created_task_count": len(created_task_ids),
+        "created_gas_task_count": 0,
+        "created_task_ids": created_task_ids,
+        "created_gas_task_ids": [],
+        "skipped_count": len(skipped_reasons),
+        "skipped_reason_stats": skipped_reason_stats,
+        "debug_items": debug_items,
+        "skipped_duplicate_count": skipped_reason_stats.get("ACTIVE_COLLECTION_TASK_EXISTS", 0),
+        "skipped_gas_required_count": 0,
+        "gas_task_skipped_duplicate_count": 0,
+        "gas_task_skipped_config_missing_count": 0,
+        "warnings": [],
+    }
+
+
+def _collection_center_network_items(
+    address_items: list[Dict[str, Any]],
+    networks: Optional[list[Dict[str, Any]]] = None,
+) -> list[Dict[str, Any]]:
+    network_map: Dict[str, Dict[str, Any]] = {}
+    for network in networks or []:
+        chain_key = _normalize_chain_key(network.get("chain_key"))
+        if not chain_key:
+            continue
+        network_map[chain_key] = {
+            "chain_key": chain_key,
+            "display_name": network.get("display_name") or network.get("chain_name") or chain_key,
+            "native_symbol": network.get("native_symbol") or "",
+            "can_collect": bool(network.get("can_collect")),
+            "status_label": network.get("status_label") or "",
+            "status_badge": network.get("status_badge") or "neutral",
+            "address_count": 0,
+            "gas_required_count": 0,
+            "collect_amounts_raw": {},
+            "collect_usd_raw": Decimal("0"),
+            "asset_summary": {},
+            "last_scan_at": "",
+            "balance_source": "链上扫描",
+            "active_task_ids": set(),
+            "failed_task_ids": set(),
+        }
+
+    for item in address_items:
+        chain_key = _normalize_chain_key(item.get("chain_key"))
+        if not chain_key:
+            continue
+        network = network_map.setdefault(
+            chain_key,
+            {
+                "chain_key": chain_key,
+                "display_name": chain_key,
+                "native_symbol": "",
+                "can_collect": True,
+                "status_label": "",
+                "status_badge": "neutral",
+                "address_count": 0,
+                "gas_required_count": 0,
+                "collect_amounts_raw": {},
+                "collect_usd_raw": Decimal("0"),
+                "asset_summary": {},
+                "last_scan_at": "",
+                "balance_source": "链上扫描",
+                "active_task_ids": set(),
+                "failed_task_ids": set(),
+            },
+        )
+        if item.get("should_create_task") or item.get("gas_required"):
+            network["address_count"] += 1
+        if item.get("gas_required"):
+            network["gas_required_count"] += 1
+        scan_at = str(item.get("last_scan_at") or "")
+        if scan_at and scan_at != "-" and (not network["last_scan_at"] or scan_at > network["last_scan_at"]):
+            network["last_scan_at"] = scan_at
+        for symbol, amount in (item.get("collect_amounts_raw") or {}).items():
+            symbol = _normalize_code(symbol)
+            if not symbol:
+                continue
+            amount = Decimal(str(amount or "0"))
+            network["collect_amounts_raw"][symbol] = network["collect_amounts_raw"].get(symbol, Decimal("0")) + amount
+            asset_summary = network["asset_summary"].setdefault(
+                symbol,
+                {
+                    "symbol": symbol,
+                    "collect_amount_raw": Decimal("0"),
+                    "usd_estimate_raw": Decimal("0"),
+                    "addresses": set(),
+                },
+            )
+            asset_summary["collect_amount_raw"] += amount
+            asset_summary["addresses"].add(str(item.get("from_address") or "").strip().lower())
+        if item.get("should_create_task") and not item.get("gas_required"):
+            network["collect_usd_raw"] += Decimal(str(item.get("usd_estimate_raw") or "0"))
+        for asset in item.get("assets") or []:
+            if not asset.get("should_create_task") or asset.get("gas_required"):
+                continue
+            symbol = _normalize_code(asset.get("coin_symbol"))
+            if not symbol:
+                continue
+            asset_summary = network["asset_summary"].setdefault(
+                symbol,
+                {
+                    "symbol": symbol,
+                    "collect_amount_raw": Decimal("0"),
+                    "usd_estimate_raw": Decimal("0"),
+                    "addresses": set(),
+                },
+            )
+            asset_summary["usd_estimate_raw"] += Decimal(str(asset.get("usd_estimate_raw") or "0"))
+        if item.get("active_task_count"):
+            network["active_task_ids"].add(f"{chain_key}:{item.get('from_address')}:active")
+        if item.get("failed_task_count"):
+            network["failed_task_ids"].add(f"{chain_key}:{item.get('from_address')}:failed")
+
+    result = []
+    for network in network_map.values():
+        asset_summary_rows = []
+        for asset in sorted(network["asset_summary"].values(), key=lambda row: str(row.get("symbol") or "")):
+            symbol = _normalize_code(asset.get("symbol"))
+            collect_amount = Decimal(str(asset.get("collect_amount_raw") or "0"))
+            usd_estimate = Decimal(str(asset.get("usd_estimate_raw") or "0"))
+            asset_summary_rows.append(
+                {
+                    "symbol": symbol,
+                    "collect_amount_raw": collect_amount,
+                    "collect_amount": _fmt_admin_amount_display(collect_amount, symbol),
+                    "collect_amount_label": f"{_fmt_admin_amount_display(collect_amount, symbol)} {symbol}",
+                    "usd_estimate": _collection_center_usd_display(usd_estimate),
+                    "usd_estimate_raw": usd_estimate,
+                    "estimated_usd": usd_estimate,
+                    "estimated_usd_label": _collection_center_usd_display(usd_estimate),
+                    "address_count": len({addr for addr in asset.get("addresses", set()) if addr}),
+                }
+            )
+        asset_count = len(asset_summary_rows)
+        primary_asset = (
+            max(
+                asset_summary_rows,
+                key=lambda row: (
+                    Decimal(str(row.get("usd_estimate_raw") or "0")),
+                    Decimal(str(row.get("collect_amount_raw") or "0")),
+                    str(row.get("symbol") or ""),
+                ),
+            )
+            if asset_summary_rows
+            else None
+        )
+        scanned_at_label = _collection_center_scan_time_label(network["last_scan_at"])
+        scan_status = "completed" if scanned_at_label != "未扫描" else "none"
+        scan_status_label, scan_status_badge = _collection_center_scan_status_meta(scan_status)
+        result.append(
+            {
+                "chain_key": network["chain_key"],
+                "display_name": network["display_name"],
+                "native_symbol": network["native_symbol"],
+                "can_collect": network["can_collect"],
+                "status_label": network["status_label"],
+                "status_badge": network["status_badge"],
+                "address_count": int(network["address_count"] or 0),
+                "gas_required_count": int(network["gas_required_count"] or 0),
+                "collect_amount_label": _collection_center_amounts_label(network["collect_amounts_raw"]),
+                "collect_amounts": _collection_center_amounts_list(network["collect_amounts_raw"]),
+                "collect_usd_raw": network["collect_usd_raw"],
+                "collect_usd_label": _collection_center_usd_display(network["collect_usd_raw"]),
+                "estimated_usd": network["collect_usd_raw"],
+                "estimated_usd_label": _collection_center_usd_display(network["collect_usd_raw"]),
+                "primary_asset_symbol": primary_asset.get("symbol") if primary_asset else "",
+                "primary_asset_amount": primary_asset.get("collect_amount") if primary_asset else "",
+                "primary_asset_amount_label": primary_asset.get("collect_amount_label") if primary_asset else "",
+                "primary_asset_usd_label": primary_asset.get("estimated_usd_label") if primary_asset else "",
+                "asset_count": asset_count,
+                "asset_count_label": f"包含 {asset_count} 个币种" if asset_count > 1 else "",
+                "asset_summary": asset_summary_rows,
+                "last_scan_at": scanned_at_label,
+                "scanned_at": scanned_at_label,
+                "scanned_at_label": scanned_at_label,
+                "balance_source": network["balance_source"],
+                "gas_status": "GAS_REQUIRED" if int(network["gas_required_count"] or 0) > 0 else "GAS_SUFFICIENT",
+                "scan_status": scan_status,
+                "scan_status_label": scan_status_label,
+                "scan_status_badge": scan_status_badge,
+                "active_task_count": len(network["active_task_ids"]),
+                "failed_task_count": len(network["failed_task_ids"]),
+            }
+        )
+    return sorted(result, key=lambda row: (str(row.get("display_name") or ""), str(row.get("chain_key") or "")))
+
+
+def _collection_center_task_status_display(status: Any) -> Dict[str, str]:
+    value = str(status or "").strip().upper()
+    mapping = {
+        "PENDING": ("等待中", "neutral"),
+        "QUEUED": ("等待中", "info"),
+        "RUNNING": ("处理中", "info"),
+        "PROCESSING": ("处理中", "info"),
+        "READY": ("处理中", "info"),
+        "GAS_REQUIRED": ("处理中", "info"),
+        "GAS_QUEUED": ("处理中", "info"),
+        "SENDING": ("处理中", "info"),
+        "SENT": ("处理中", "info"),
+        "CONFIRMED": ("已完成", "success"),
+        "COMPLETED": ("已完成", "success"),
+        "SUCCESS": ("已完成", "success"),
+        "FAILED": ("失败", "danger"),
+        "ERROR": ("失败", "danger"),
+        "TIMEOUT": ("超时", "warning"),
+        "SKIPPED": ("已跳过", "neutral"),
+        "CANCELED": ("已取消", "neutral"),
+        "CANCELLED": ("已取消", "neutral"),
+    }
+    label, badge = mapping.get(value, (value or "-", "neutral"))
+    return {"status_label": label, "status_badge": badge}
+
+
+def _collection_center_task_finished_at(item: Dict[str, Any]) -> str:
+    return _admin_datetime_display(item.get("confirmed_at") or item.get("sent_at") or item.get("updated_at"))
+
+
+def _collection_center_recent_task_summary(tasks: list[Dict[str, Any]]) -> Dict[str, str]:
+    for task in tasks:
+        status = str(task.get("raw_status") or "").upper()
+        if status not in COLLECTION_CENTER_SUCCESS_TASK_STATUSES and status not in COLLECTION_CENTER_FAILED_TASK_STATUSES:
+            continue
+        result_label = "成功" if status in COLLECTION_CENTER_SUCCESS_TASK_STATUSES else ("超时" if status == "TIMEOUT" else "失败")
+        details = []
+        if task.get("tx_hash_short"):
+            details.append(str(task["tx_hash_short"]))
+        if task.get("finished_at"):
+            details.append(str(task["finished_at"]))
+        suffix = f" · {' · '.join(details)}" if details else ""
+        return {
+            "label": f"{result_label}{suffix}",
+            "status": result_label,
+            "badge": "success" if status in COLLECTION_CENTER_SUCCESS_TASK_STATUSES else "danger",
+        }
+    return {"label": "暂无记录", "status": "无记录", "badge": "neutral"}
+
+
+def _collection_center_attach_network_tasks(db: Session, network_items: list[Dict[str, Any]]) -> None:
+    chain_keys = [item.get("chain_key") for item in network_items if item.get("chain_key")]
+    if not chain_keys:
+        return
+    task_map: Dict[str, list[Dict[str, Any]]] = {str(chain): [] for chain in chain_keys}
+    gas_map: Dict[str, list[Dict[str, Any]]] = {str(chain): [] for chain in chain_keys}
+    try:
+        task_rows = db.execute(
+            text(
+                """
+                SELECT id, task_no, user_id, chain_key, coin_symbol, amount, status,
+                       from_address, tx_hash, last_error, sent_at, confirmed_at, created_at, updated_at
+                FROM collection_tasks
+                WHERE chain_key IN :chain_keys
+                ORDER BY created_at DESC, id DESC
+                LIMIT 120
+                """
+            ).bindparams(bindparam("chain_keys", expanding=True)),
+            {"chain_keys": chain_keys},
+        ).mappings().all()
+        gas_rows = db.execute(
+            text(
+                """
+                SELECT id, task_no, user_id, chain_key, gas_coin_symbol, topup_amount, status,
+                       to_address, tx_hash, last_error, sent_at, confirmed_at, created_at, updated_at
+                FROM gas_tasks
+                WHERE chain_key IN :chain_keys
+                ORDER BY created_at DESC, id DESC
+                LIMIT 120
+                """
+            ).bindparams(bindparam("chain_keys", expanding=True)),
+            {"chain_keys": chain_keys},
+        ).mappings().all()
+    except Exception:
+        logger.exception("collection center recent task query failed")
+        return
+    for row in task_rows:
+        item = dict(row)
+        chain_key = _normalize_chain_key(item.get("chain_key"))
+        if chain_key not in task_map or len(task_map[chain_key]) >= 10:
+            continue
+        symbol = _normalize_code(item.get("coin_symbol"))
+        tx_hash = str(item.get("tx_hash") or "")
+        task_map[chain_key].append(
+            {
+                "id": item.get("id"),
+                "task_no": item.get("task_no") or "",
+                "user_id": item.get("user_id") or "",
+                "coin_symbol": symbol,
+                "amount": _fmt_admin_amount_display(item.get("amount"), symbol),
+                "from_address": item.get("from_address") or "",
+                "from_address_short": _short_admin_address(item.get("from_address")),
+                "tx_hash": tx_hash,
+                "tx_hash_short": _admin_short_text(tx_hash, 8, 6) if tx_hash else "",
+                "last_error": item.get("last_error") or "",
+                "created_at": _admin_datetime_display(item.get("created_at")),
+                "finished_at": _collection_center_task_finished_at(item),
+                "raw_status": str(item.get("status") or "").upper(),
+                **_collection_center_task_status_display(item.get("status")),
+            }
+        )
+    for row in gas_rows:
+        item = dict(row)
+        chain_key = _normalize_chain_key(item.get("chain_key"))
+        if chain_key not in gas_map or len(gas_map[chain_key]) >= 10:
+            continue
+        symbol = _normalize_code(item.get("gas_coin_symbol"))
+        tx_hash = str(item.get("tx_hash") or "")
+        gas_map[chain_key].append(
+            {
+                "id": item.get("id"),
+                "task_no": item.get("task_no") or "",
+                "user_id": item.get("user_id") or "",
+                "coin_symbol": symbol,
+                "amount": _fmt_admin_amount_display(item.get("topup_amount"), symbol),
+                "to_address": item.get("to_address") or "",
+                "to_address_short": _short_admin_address(item.get("to_address")),
+                "tx_hash": tx_hash,
+                "tx_hash_short": _admin_short_text(tx_hash, 8, 6) if tx_hash else "",
+                "last_error": item.get("last_error") or "",
+                "created_at": _admin_datetime_display(item.get("created_at")),
+                "finished_at": _collection_center_task_finished_at(item),
+                "raw_status": str(item.get("status") or "").upper(),
+                **_collection_center_task_status_display(item.get("status")),
+            }
+        )
+    for item in network_items:
+        chain_key = _normalize_chain_key(item.get("chain_key"))
+        collection_tasks = task_map.get(chain_key, [])
+        gas_tasks = gas_map.get(chain_key, [])
+        active_collection_count = sum(
+            1
+            for task in collection_tasks
+            if str(task.get("raw_status") or "").upper() in COLLECTION_CENTER_ACTIVE_COLLECTION_STATUSES
+        )
+        active_gas_count = sum(
+            1
+            for task in gas_tasks
+            if str(task.get("raw_status") or "").upper() in COLLECTION_CENTER_ACTIVE_GAS_STATUSES
+        )
+        item["recent_collection_tasks"] = collection_tasks
+        item["recent_gas_tasks"] = gas_tasks
+        item["recent_collection_summary"] = _collection_center_recent_task_summary(collection_tasks)
+        item["recent_gas_summary"] = _collection_center_recent_task_summary(gas_tasks)
+        item["active_collection_task_count"] = active_collection_count
+        item["active_gas_task_count"] = active_gas_count
+        item["active_task_count"] = active_collection_count + active_gas_count
+
+
+def _collection_center_scope_scan(scan: ScanResult, filters: Optional[Dict[str, Any]]) -> ScanResult:
+    values = _collection_center_filter_values(filters)
+    selected_chain = values["chain_key"]
+    selected_symbol = values["coin_symbol"]
+    if not selected_chain and not selected_symbol:
+        return scan
+
+    candidates = []
+    filtered_count = 0
+    filtered_chains: set[str] = set()
+    filtered_symbols: set[str] = set()
+    for candidate in scan.candidates:
+        candidate_chain = _normalize_chain_key(getattr(candidate, "chain_key", ""))
+        candidate_symbol = _normalize_code(getattr(candidate, "coin_symbol", ""))
+        if selected_chain and candidate_chain != selected_chain:
+            filtered_count += 1
+            filtered_chains.add(candidate_chain or "-")
+            continue
+        if selected_symbol and candidate_symbol != selected_symbol:
+            filtered_count += 1
+            filtered_symbols.add(candidate_symbol or "-")
+            continue
+        candidates.append(candidate)
+
+    if filtered_count <= 0:
+        return scan
+
+    warnings = list(scan.warnings)
+    if filtered_chains:
+        warnings.append(
+            "已过滤非当前网络结果："
+            + "、".join(sorted(filtered_chains))
+            + f"；当前网络：{selected_chain}"
+        )
+    if filtered_symbols:
+        warnings.append(
+            "已过滤非当前币种结果："
+            + "、".join(sorted(filtered_symbols))
+            + f"；当前币种：{selected_symbol}"
+        )
+
+    return ScanResult(
+        total_addresses=len(candidates),
+        evaluated_count=len(candidates),
+        collectible_count=sum(1 for item in candidates if item.should_create_task),
+        gas_required_count=sum(1 for item in candidates if item.evaluation.gas_required),
+        skipped_count=scan.skipped_count + filtered_count,
+        created_task_count=scan.created_task_count,
+        created_gas_task_count=scan.created_gas_task_count,
+        candidates=candidates,
+        skipped_duplicate_count=scan.skipped_duplicate_count,
+        skipped_gas_required_count=scan.skipped_gas_required_count,
+        gas_task_skipped_duplicate_count=scan.gas_task_skipped_duplicate_count,
+        gas_task_skipped_config_missing_count=scan.gas_task_skipped_config_missing_count,
+        batch_id=scan.batch_id,
+        batch_no=scan.batch_no,
+        warnings=warnings,
+        error_message=scan.error_message,
+    )
+
+
+def admin_query_collection_candidates(
+    db: Session,
+    filters: Optional[Dict[str, Any]] = None,
+    *,
+    deadline_monotonic: Optional[float] = None,
+) -> Dict[str, Any]:
+    values = _collection_center_filter_values(filters)
+    try:
+        scan = _collection_center_scan(db, filters, create_tasks=False, deadline_monotonic=deadline_monotonic)
+        scan = _collection_center_scope_scan(scan, values)
+    except Exception as exc:
+        try:
+            network_items = _collection_center_network_items([], _collection_center_network_rows(db))
+        except Exception:
+            network_items = []
+        return {
+            "scan": None,
+            "items": [],
+            "asset_items": [],
+            "address_items": [],
+            "network_items": network_items,
+            "summary": _collection_center_scan_summary(
+                ScanResult(
+                    total_addresses=0,
+                    evaluated_count=0,
+                    collectible_count=0,
+                    gas_required_count=0,
+                    skipped_count=0,
+                    created_task_count=0,
+                    created_gas_task_count=0,
+                    candidates=[],
+                ),
+                values,
+            ),
+            "error": str(exc),
+            "filters": values,
+        }
+    task_maps = _collection_center_task_maps(db, scan.candidates[:200])
+    summary = _collection_center_scan_summary(scan, values)
+    summary["dashboard"] = _collection_center_dashboard_counts(db, values, scan)
+    asset_items = [_collection_center_candidate_item(item, task_maps) for item in scan.candidates[:200]]
+    _collection_center_apply_usd_estimates(db, asset_items)
+    address_items = [_collection_center_sanitize_address_item(item) for item in _collection_center_address_items(asset_items)]
+    network_items = _collection_center_network_items(address_items, _collection_center_network_rows(db))
+    _collection_center_attach_network_tasks(db, network_items)
+    summary["network_cards"] = network_items
+    return {
+        "scan": scan,
+        "items": asset_items,
+        "asset_items": asset_items,
+        "address_items": address_items,
+        "network_items": network_items,
+        "summary": summary,
+        "error": "",
+        "filters": values,
+    }
+
+
+def _collection_center_scan_chain_keys(values: Dict[str, Any], networks: list[Dict[str, Any]]) -> list[str]:
+    selected_chain = _normalize_chain_key(values.get("chain_key"))
+    if selected_chain:
+        return [selected_chain]
+    return [
+        chain
+        for chain in (_normalize_chain_key(item.get("chain_key")) for item in networks)
+        if chain
+    ]
+
+
+def _collection_center_scan_status_badge(status: Optional[Dict[str, Any]]) -> str:
+    return _collection_center_scan_status_meta((status or {}).get("status"))[1]
+
+
+def _collection_center_scan_status_is_active(status: Any) -> bool:
+    return _collection_center_normalize_scan_status(status) in {"queued", "running"}
+
+
+def _collection_center_scan_status_finished_at(status: Dict[str, Any]) -> str:
+    return str(status.get("finished_at") or status.get("last_scan_at") or "").strip()
+
+
+def _collection_center_apply_scan_status(
+    network_items: list[Dict[str, Any]],
+    statuses: Dict[str, Dict[str, Any]],
+) -> None:
+    def _first_int(*values: Any) -> int:
+        for value in values:
+            if value is None or value == "":
+                continue
+            try:
+                return int(value)
+            except Exception:
+                continue
+        return 0
+
+    for item in network_items:
+        chain_key = _normalize_chain_key(item.get("chain_key"))
+        status = statuses.get(chain_key) or {}
+        status_value = _collection_center_normalize_scan_status(status.get("status"))
+        item_status_value = _collection_center_normalize_scan_status(item.get("scan_status"))
+        status_finished_at = _collection_center_scan_status_finished_at(status)
+        scanned_at = _collection_center_scan_time_label(
+            item.get("scanned_at") or item.get("last_scan_at") or status_finished_at
+        )
+        has_cached_scan = scanned_at != "未扫描"
+        if status_value in {"queued", "running"}:
+            effective_status = status_value
+        elif status_value in {"failed", "timeout"} and status_finished_at:
+            effective_status = "failed"
+        elif status_value == "completed" and status_finished_at:
+            effective_status = "completed"
+        elif item_status_value != "none":
+            effective_status = item_status_value
+        elif status_value != "none" and status_finished_at:
+            effective_status = status_value
+        elif has_cached_scan:
+            effective_status = "completed"
+        else:
+            effective_status = "none"
+        if effective_status == "completed" and _first_int(status.get("balance_error_count"), status.get("failed_count"), item.get("balance_error_count"), 0) > 0:
+            effective_status = "completed_with_errors"
+        scan_status_label_text, scan_status_badge = _collection_center_scan_status_meta(effective_status)
+        item["scan_status"] = effective_status
+        item["scan_status_label"] = scan_status_label_text
+        item["scan_status_badge"] = scan_status_badge
+        item["scan_running"] = effective_status in {"queued", "running"}
+        item["scan_failed_count"] = _first_int(status.get("balance_error_count"), status.get("failed_count"), 0)
+        item["scanned_address_count"] = _first_int(status.get("scanned_address_count"), item.get("scanned_address_count"), 0)
+        item["collectable_address_count"] = _first_int(
+            status.get("collectable_address_count"), item.get("collectable_address_count"), item.get("address_count"), 0
+        )
+        item["gas_needed_count"] = _first_int(status.get("gas_needed_count"), item.get("gas_needed_count"), item.get("gas_required_count"), 0)
+        item["balance_error_count"] = _first_int(status.get("balance_error_count"), item.get("balance_error_count"), item.get("scan_failed_count"), 0)
+        item["scan_error"] = str(status.get("error") or "").strip()
+        status_scan_at = status_finished_at
+        if status_scan_at and scanned_at == "未扫描":
+            scanned_at = _collection_center_scan_time_label(status_scan_at)
+        item["last_scan_at"] = scanned_at
+        item["scanned_at"] = scanned_at
+        item["scanned_at_label"] = scanned_at
+
+
+def _collection_center_cached_dashboard(
+    db: Session,
+    values: Dict[str, Any],
+    address_items: list[Dict[str, Any]],
+    empty_scan: ScanResult,
+) -> Dict[str, Any]:
+    dashboard = _collection_center_dashboard_counts(db, values, empty_scan)
+    collectible_addresses = {
+        (_normalize_chain_key(item.get("chain_key")), str(item.get("from_address") or "").strip().lower())
+        for item in address_items
+        if item.get("can_create_collection_task")
+    }
+    gas_required_addresses = {
+        (_normalize_chain_key(item.get("chain_key")), str(item.get("from_address") or "").strip().lower())
+        for item in address_items
+        if item.get("gas_required") or item.get("can_create_gas_task")
+    }
+    dashboard["collectible_addresses"] = len({item for item in collectible_addresses if item[0] and item[1]})
+    dashboard["gas_required_addresses"] = len({item for item in gas_required_addresses if item[0] and item[1]})
+    return dashboard
+
+
+def _collection_center_scan_status_time(item: Dict[str, Any]) -> str:
+    return str(
+        item.get("scan_batch_started_at")
+        or item.get("batch_started_at")
+        or item.get("queued_at")
+        or item.get("started_at")
+        or item.get("finished_at")
+        or item.get("last_scan_at")
+        or item.get("updated_at")
+        or ""
+    ).strip()
+
+
+def _collection_center_latest_scan_batch_id(statuses: Dict[str, Dict[str, Any]]) -> str:
+    candidates: list[tuple[str, str]] = []
+    for item in statuses.values():
+        batch_id = str(item.get("scan_batch_id") or "").strip()
+        if not batch_id:
+            continue
+        candidates.append((_collection_center_scan_status_time(item), batch_id))
+    if not candidates:
+        return ""
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _collection_center_statuses_for_latest_batch(statuses: Dict[str, Dict[str, Any]]) -> tuple[Dict[str, Dict[str, Any]], str]:
+    batch_id = _collection_center_latest_scan_batch_id(statuses)
+    if not batch_id:
+        return statuses, ""
+    return {
+        chain: item
+        for chain, item in statuses.items()
+        if str(item.get("scan_batch_id") or "").strip() == batch_id
+    }, batch_id
+
+
+def _collection_center_scan_meta_status(chain: str, scan_meta: Dict[str, Any], snapshot_saved_at: Any = "") -> Dict[str, Any]:
+    finished_at = str(scan_meta.get("finished_at") or snapshot_saved_at or "").strip()
+    return {
+        "status": scan_meta.get("status") or "completed",
+        "scan_batch_id": str(scan_meta.get("scan_batch_id") or "").strip(),
+        "scan_batch_started_at": scan_meta.get("scan_batch_started_at") or "",
+        "finished_at": finished_at,
+        "last_scan_at": scan_meta.get("last_scan_at") or finished_at,
+        "updated_at": finished_at,
+        "failed_count": int(scan_meta.get("balance_error_count") or 0),
+        "scanned_address_count": int(scan_meta.get("scanned_address_count") or 0),
+        "collectable_address_count": int(scan_meta.get("collectable_address_count") or 0),
+        "gas_needed_count": int(scan_meta.get("gas_needed_count") or 0),
+        "balance_error_count": int(scan_meta.get("balance_error_count") or 0),
+        "error": scan_meta.get("error") or "",
+        "chain_key": chain,
+        "coin_symbol": _normalize_code(scan_meta.get("coin_symbol")),
+        "scanned_symbols": [
+            _normalize_code(symbol)
+            for symbol in (scan_meta.get("scanned_symbols") or [])
+            if _normalize_code(symbol)
+        ],
+    }
+
+
+def _collection_center_status_should_use_snapshot(current: Dict[str, Any], snapshot: Dict[str, Any]) -> bool:
+    if not snapshot:
+        return False
+    if not current:
+        return True
+    current_batch = str(current.get("scan_batch_id") or "").strip()
+    snapshot_batch = str(snapshot.get("scan_batch_id") or "").strip()
+    if snapshot_batch and current_batch != snapshot_batch:
+        return _collection_center_scan_status_time(snapshot) > _collection_center_scan_status_time(current)
+    current_status = _collection_center_normalize_scan_status(current.get("status"))
+    snapshot_status = _collection_center_normalize_scan_status(snapshot.get("status"))
+    if current_status in {"queued", "running"} and snapshot_status in {"completed", "completed_with_errors", "failed", "timeout"}:
+        return bool(_collection_center_scan_status_finished_at(snapshot))
+    if current.get("stale_status_resolved") == "finished" and snapshot_status in {"completed", "completed_with_errors"}:
+        return bool(_collection_center_scan_status_finished_at(snapshot))
+    if current_status in {"completed", "completed_with_errors", "failed", "timeout"} and snapshot_status in {"completed", "completed_with_errors"}:
+        if not int(current.get("scanned_address_count") or 0) and int(snapshot.get("scanned_address_count") or 0):
+            return bool(_collection_center_scan_status_finished_at(snapshot))
+    return _collection_center_scan_status_time(snapshot) >= _collection_center_scan_status_time(current)
+
+
+def _collection_center_scan_overview(
+    statuses: Dict[str, Dict[str, Any]],
+    *,
+    has_snapshot: bool,
+    latest_scan_at: str = "",
+) -> Dict[str, Any]:
+    total_count = len(statuses)
+    def _status_value(item: Dict[str, Any]) -> str:
+        return _collection_center_normalize_scan_status(item.get("status"))
+
+    def _status_finished(item: Dict[str, Any]) -> bool:
+        return bool(_collection_center_scan_status_finished_at(item))
+
+    completed_chains = sorted(
+        chain for chain, item in statuses.items() if _status_value(item) in {"completed", "completed_with_errors"} and _status_finished(item)
+    )
+    failed_chains = sorted(
+        chain for chain, item in statuses.items() if _status_value(item) in {"failed", "timeout"} and _status_finished(item)
+    )
+    completed_with_errors_chains = sorted(
+        chain for chain, item in statuses.items() if _status_value(item) == "completed_with_errors" and _status_finished(item)
+    )
+    ended_chains = sorted(set(completed_chains) | set(failed_chains))
+    active_rows = sorted(
+        (
+            (
+                2 if _status_value(item) == "running" else 1,
+                _collection_center_scan_status_time(item),
+                chain,
+                _status_value(item),
+            )
+            for chain, item in statuses.items()
+            if _status_value(item) in {"queued", "running"}
+        ),
+        reverse=True,
+    )
+    current_active = active_rows[:1]
+    running_chains = [chain for _, _, chain, status in current_active if status == "running"]
+    queued_chains = [chain for _, _, chain, status in current_active if status == "queued"]
+    all_queued_chains = sorted(chain for chain, item in statuses.items() if _status_value(item) == "queued")
+    finished_rows = sorted(
+        (
+            (_collection_center_scan_status_time(item), chain, _status_value(item))
+            for chain, item in statuses.items()
+            if _status_finished(item)
+        ),
+        reverse=True,
+    )
+    running = bool(running_chains or queued_chains)
+    failed = bool(failed_chains)
+    completed_with_errors = bool(completed_with_errors_chains)
+    if running:
+        label = "扫描中" if running_chains else "等待中"
+        badge = "info"
+    elif failed:
+        label = "部分失败"
+        badge = "warning"
+    elif completed_with_errors:
+        label = "已完成（有失败）"
+        badge = "warning"
+    elif has_snapshot:
+        label = "已完成"
+        badge = "success"
+    else:
+        label = "未扫描"
+        badge = "neutral"
+    failed_count = sum(int(item.get("balance_error_count") or item.get("failed_count") or 0) for item in statuses.values())
+    status_scan_times = [
+        _collection_center_scan_status_finished_at(item)
+        for item in statuses.values()
+        if _collection_center_scan_status_finished_at(item)
+    ]
+    return {
+        "scan_running": running,
+        "scan_status_label": label,
+        "scan_status_badge": badge,
+        "scan_failed_count": failed_count,
+        "recent_scan_at": latest_scan_at or (max(status_scan_times) if status_scan_times else ""),
+        "scan_total_networks": total_count,
+        "scan_completed_networks": len(ended_chains),
+        "scan_running_networks": running_chains,
+        "scan_queued_networks": queued_chains,
+        "scan_failed_networks": failed_chains,
+        "scan_queued_count": len(all_queued_chains),
+        "scan_failed_network_count": len(failed_chains),
+        "current_scan_chain_key": ((running_chains or queued_chains or [""])[0]),
+        "current_scan_status": (current_active[0][3] if current_active else ""),
+        "latest_finished_chain_key": finished_rows[0][1] if finished_rows else "",
+        "latest_finished_status": finished_rows[0][2] if finished_rows else "",
+    }
+
+
+def admin_query_collection_center_snapshot(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    values = _collection_center_filter_values(filters)
+    empty_scan = ScanResult(
+        total_addresses=0,
+        evaluated_count=0,
+        collectible_count=0,
+        gas_required_count=0,
+        skipped_count=0,
+        created_task_count=0,
+        created_gas_task_count=0,
+        candidates=[],
+    )
+    try:
+        networks = _collection_center_network_rows(db)
+        display_networks = [
+            item
+            for item in networks
+            if not values["chain_key"] or _normalize_chain_key(item.get("chain_key")) == values["chain_key"]
+        ]
+        base_network_items = _collection_center_network_items([], display_networks)
+        chain_keys = _collection_center_scan_chain_keys(values, networks)
+        all_chain_keys = [
+            chain
+            for chain in (_normalize_chain_key(item.get("chain_key")) for item in networks)
+            if chain
+        ]
+        all_statuses = get_scan_statuses(all_chain_keys)
+        snapshot_cache_by_chain: Dict[str, Dict[str, Any]] = {}
+        merged_statuses = dict(all_statuses)
+        for status_chain_key in all_chain_keys:
+            normalized_chain = normalize_scan_chain_key(status_chain_key)
+            chain_filters = {**values, "chain_key": normalized_chain}
+            cached = load_scan_snapshot(status_chain_key, chain_filters)
+            if not cached:
+                continue
+            snapshot_cache_by_chain[normalized_chain] = cached
+            scan_meta = cached.get("scan_meta") or {}
+            if not scan_meta:
+                continue
+            snapshot_status = _collection_center_scan_meta_status(
+                normalized_chain,
+                scan_meta,
+                cached.get("snapshot_saved_at") or "",
+            )
+            current_status = merged_statuses.get(normalized_chain) or {}
+            if _collection_center_status_should_use_snapshot(current_status, snapshot_status):
+                merged_statuses[normalized_chain] = snapshot_status
+        overview_statuses, latest_scan_batch_id = _collection_center_statuses_for_latest_batch(merged_statuses)
+        statuses = dict(overview_statuses)
+        items: list[Dict[str, Any]] = []
+        asset_items: list[Dict[str, Any]] = []
+        address_items: list[Dict[str, Any]] = []
+        cached_networks: Dict[str, Dict[str, Any]] = {}
+        summary_totals = {
+            "total_addresses": 0,
+            "evaluated_count": 0,
+            "collectible_count": 0,
+            "gas_required_count": 0,
+            "skipped_count": 0,
+        }
+        snapshot_failed_count = 0
+        latest_scan_at = ""
+        has_snapshot = False
+        has_event_candidates = False
+
+        for chain_key in chain_keys:
+            normalized_chain = normalize_scan_chain_key(chain_key)
+            cached = snapshot_cache_by_chain.get(normalized_chain)
+            if not cached:
+                continue
+            scan_meta = cached.get("scan_meta") or {}
+            scan_meta_batch_id = str(scan_meta.get("scan_batch_id") or "").strip()
+            current_status = statuses.get(normalized_chain) or {}
+            current_status_batch_id = str(current_status.get("scan_batch_id") or "").strip()
+            current_status_value = _collection_center_normalize_scan_status(current_status.get("status"))
+            if (
+                current_status_value in {"queued", "running"}
+                and current_status_batch_id
+                and scan_meta_batch_id != current_status_batch_id
+            ):
+                continue
+            has_snapshot = True
+            if (
+                not statuses.get(normalized_chain)
+                and scan_meta
+                and (not latest_scan_batch_id or scan_meta_batch_id == latest_scan_batch_id)
+            ):
+                statuses[normalized_chain] = {
+                    "status": scan_meta.get("status") or "completed",
+                    "scan_batch_id": scan_meta_batch_id,
+                    "scan_batch_started_at": scan_meta.get("scan_batch_started_at") or "",
+                    "finished_at": scan_meta.get("finished_at") or cached.get("snapshot_saved_at") or "",
+                    "last_scan_at": scan_meta.get("finished_at") or cached.get("snapshot_saved_at") or "",
+                    "failed_count": int(scan_meta.get("balance_error_count") or 0),
+                    "scanned_address_count": int(scan_meta.get("scanned_address_count") or 0),
+                    "collectable_address_count": int(scan_meta.get("collectable_address_count") or 0),
+                    "gas_needed_count": int(scan_meta.get("gas_needed_count") or 0),
+                    "balance_error_count": int(scan_meta.get("balance_error_count") or 0),
+                    "coin_symbol": _normalize_code(scan_meta.get("coin_symbol")),
+                    "scanned_symbols": [
+                        _normalize_code(symbol)
+                        for symbol in (scan_meta.get("scanned_symbols") or [])
+                        if _normalize_code(symbol)
+                    ],
+                }
+            items.extend([deepcopy(item) for item in (cached.get("items") or []) if isinstance(item, dict)])
+            asset_items.extend([deepcopy(item) for item in (cached.get("asset_items") or []) if isinstance(item, dict)])
+            address_items.extend([deepcopy(item) for item in (cached.get("address_items") or []) if isinstance(item, dict)])
+            for card in cached.get("network_items") or []:
+                if isinstance(card, dict):
+                    card_chain = _normalize_chain_key(card.get("chain_key"))
+                    if card_chain:
+                        if scan_meta:
+                            card["scanned_address_count"] = int(scan_meta.get("scanned_address_count") or 0)
+                            card["collectable_address_count"] = int(scan_meta.get("collectable_address_count") or 0)
+                            card["gas_needed_count"] = int(scan_meta.get("gas_needed_count") or 0)
+                            card["balance_error_count"] = int(scan_meta.get("balance_error_count") or 0)
+                            card["scan_status"] = card.get("scan_status") or scan_meta.get("status") or "completed"
+                            scan_time = _collection_center_scan_time_label(
+                                card.get("scanned_at") or card.get("last_scan_at") or scan_meta.get("finished_at") or cached.get("snapshot_saved_at")
+                            )
+                            card["last_scan_at"] = scan_time
+                            card["scanned_at"] = scan_time
+                            card["scanned_at_label"] = scan_time
+                        cached_networks[card_chain] = deepcopy(card)
+            snapshot_failed_count += sum(
+                1
+                for item in (cached.get("items") or cached.get("asset_items") or [])
+                if isinstance(item, dict) and item.get("balance_error")
+            )
+            cached_summary = cached.get("summary") or {}
+            for key in summary_totals:
+                summary_totals[key] += int(cached_summary.get(key) or 0)
+            scan_at = str(cached_summary.get("recent_scan_at") or "")
+            if (not scan_at or scan_at == "-") and scan_meta:
+                scan_at = str(scan_meta.get("finished_at") or cached.get("snapshot_saved_at") or "")
+            if scan_at and scan_at != "-" and scan_at > latest_scan_at:
+                latest_scan_at = scan_at
+
+        event_asset_items = _collection_center_event_candidate_items(db, values)
+        if event_asset_items:
+            existing_asset_keys = {
+                (
+                    _normalize_chain_key(item.get("chain_key")),
+                    str(item.get("from_address") or "").strip().lower(),
+                    _normalize_code(item.get("coin_symbol")),
+                )
+                for item in asset_items
+                if isinstance(item, dict)
+            }
+            missing_event_items = [
+                item
+                for item in event_asset_items
+                if (
+                    _normalize_chain_key(item.get("chain_key")),
+                    str(item.get("from_address") or "").strip().lower(),
+                    _normalize_code(item.get("coin_symbol")),
+                )
+                not in existing_asset_keys
+            ]
+            if missing_event_items:
+                has_event_candidates = True
+                items.extend([deepcopy(item) for item in missing_event_items])
+                asset_items.extend([deepcopy(item) for item in missing_event_items])
+                address_items.extend(_collection_center_address_items(missing_event_items))
+
+        address_items = [_collection_center_sanitize_address_item(item) for item in address_items]
+        gas_needed_by_chain: Dict[str, set[str]] = {}
+        collectable_by_chain: Dict[str, set[str]] = {}
+        for address_item in address_items:
+            chain = _normalize_chain_key(address_item.get("chain_key"))
+            address = str(address_item.get("from_address") or "").strip().lower()
+            if not chain or not address:
+                continue
+            if address_item.get("gas_required"):
+                gas_needed_by_chain.setdefault(chain, set()).add(address)
+            if address_item.get("gas_required") or address_item.get("can_create_collection_task") or _collection_center_direct_collect_total(address_item) > 0:
+                collectable_by_chain.setdefault(chain, set()).add(address)
+        if address_items:
+            summary_totals["gas_required_count"] = sum(len(items) for items in gas_needed_by_chain.values())
+            summary_totals["collectible_count"] = sum(len(items) for items in collectable_by_chain.values())
+            for chain, status in statuses.items():
+                status["gas_needed_count"] = len(gas_needed_by_chain.get(chain, set()))
+                status["collectable_address_count"] = len(collectable_by_chain.get(chain, set()))
+
+        fresh_network_items = {
+            _normalize_chain_key(item.get("chain_key")): item
+            for item in _collection_center_network_items(address_items, display_networks)
+            if _normalize_chain_key(item.get("chain_key"))
+        }
+        network_items = []
+        for base_item in base_network_items:
+            chain_key = _normalize_chain_key(base_item.get("chain_key"))
+            item = deepcopy(fresh_network_items.get(chain_key) or base_item)
+            if address_items:
+                item["gas_required_count"] = len(gas_needed_by_chain.get(chain_key, set()))
+                item["gas_needed_count"] = len(gas_needed_by_chain.get(chain_key, set()))
+                item["collectable_address_count"] = len(collectable_by_chain.get(chain_key, set()))
+            display_symbol = values["coin_symbol"] or _normalize_code((statuses.get(chain_key) or {}).get("coin_symbol"))
+            if display_symbol and not str(item.get("primary_asset_amount_label") or "").strip():
+                item["primary_asset_symbol"] = display_symbol
+                item["primary_asset_amount"] = _fmt_admin_amount_display(Decimal("0"), display_symbol)
+                item["primary_asset_amount_label"] = f"{_fmt_admin_amount_display(Decimal('0'), display_symbol)} {display_symbol}"
+                item["asset_count"] = 0
+                item["asset_count_label"] = ""
+                item["asset_summary"] = item.get("asset_summary") or []
+            if not has_snapshot:
+                item["last_scan_at"] = "未扫描"
+                item["balance_source"] = "已确认充值候选" if has_event_candidates else "未扫描"
+            network_items.append(item)
+        for item in network_items:
+            if not str(item.get("last_scan_at") or "").strip():
+                item["last_scan_at"] = "未扫描"
+            if not str(item.get("balance_source") or "").strip():
+                item["balance_source"] = "链上扫描" if has_snapshot else ("已确认充值候选" if has_event_candidates else "未扫描")
+        _collection_center_attach_network_tasks(db, network_items)
+        _collection_center_apply_scan_status(network_items, statuses)
+        failed_count_by_chain: Dict[str, int] = {}
+        for address_item in address_items:
+            if address_item.get("balance_error"):
+                chain_key = _normalize_chain_key(address_item.get("chain_key"))
+                failed_count_by_chain[chain_key] = failed_count_by_chain.get(chain_key, 0) + 1
+        for item in network_items:
+            chain_key = _normalize_chain_key(item.get("chain_key"))
+            balance_error_count = max(int(item.get("balance_error_count") or 0), failed_count_by_chain.get(chain_key, 0))
+            item["balance_error_count"] = balance_error_count
+            item["scan_failed_count"] = max(int(item.get("scan_failed_count") or 0), balance_error_count)
+        summary = _collection_center_scan_summary(empty_scan, values)
+        summary.update(summary_totals)
+        overview = _collection_center_scan_overview(statuses, has_snapshot=has_snapshot or bool(statuses), latest_scan_at=latest_scan_at)
+        summary["recent_scan_at"] = overview["recent_scan_at"] or "未扫描"
+        summary["balance_source"] = "链上扫描" if has_snapshot else ("已确认充值候选" if has_event_candidates else "未扫描")
+        summary["candidate_source_label"] = "已确认充值入账地址"
+        summary["scan_running"] = overview["scan_running"]
+        summary["scan_status_label"] = overview["scan_status_label"]
+        summary["scan_status_badge"] = overview["scan_status_badge"]
+        summary["scan_failed_count"] = max(int(overview["scan_failed_count"] or 0), snapshot_failed_count)
+        summary["scan_total_networks"] = overview["scan_total_networks"]
+        summary["scan_completed_networks"] = overview["scan_completed_networks"]
+        summary["scan_running_networks"] = overview["scan_running_networks"]
+        summary["scan_queued_networks"] = overview["scan_queued_networks"]
+        summary["scan_failed_networks"] = overview["scan_failed_networks"]
+        summary["scan_queued_count"] = overview["scan_queued_count"]
+        summary["scan_failed_network_count"] = overview["scan_failed_network_count"]
+        summary["scan_batch_id"] = latest_scan_batch_id
+        summary["current_scan_chain_key"] = overview.get("current_scan_chain_key") or ""
+        summary["current_scan_status"] = overview.get("current_scan_status") or ""
+        summary["dashboard"] = _collection_center_cached_dashboard(db, values, address_items, empty_scan)
+        summary["network_cards"] = network_items
+        return {
+            "scan": None,
+            "items": items,
+            "asset_items": asset_items,
+            "address_items": address_items,
+            "network_items": network_items,
+            "summary": summary,
+            "error": "",
+            "filters": values,
+        }
+    except Exception:
+        logger.exception("admin_query_collection_center_snapshot failed")
+        summary = _collection_center_scan_summary(empty_scan, values)
+        summary["recent_scan_at"] = "未扫描"
+        summary["balance_source"] = "未扫描"
+        summary["scan_running"] = False
+        summary["scan_status_label"] = "未扫描"
+        summary["scan_status_badge"] = "neutral"
+        summary["scan_failed_count"] = 0
+        summary["scan_total_networks"] = 0
+        summary["scan_completed_networks"] = 0
+        summary["scan_running_networks"] = []
+        summary["scan_queued_networks"] = []
+        summary["scan_failed_networks"] = []
+        summary["scan_queued_count"] = 0
+        summary["scan_failed_network_count"] = 0
+        summary["dashboard"] = {
+            "collectible_addresses": 0,
+            "gas_required_addresses": 0,
+            "active_collection_tasks": 0,
+            "failed_tasks": 0,
+            "today_collected_tasks": 0,
+            "today_collected_amounts": [],
+            "today_collected_label": "-",
+            "today_collected_usd_label": "--",
+            "today_gas_success_count": 0,
+        }
+        summary["network_cards"] = []
+        return {
+            "scan": None,
+            "items": [],
+            "asset_items": [],
+            "address_items": [],
+            "network_items": [],
+            "summary": summary,
+            "error": "归集数据读取失败，请稍后重试",
+            "filters": values,
+        }
+
+
+def _collection_center_scan_summary(scan: ScanResult, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    values = _collection_center_filter_values(filters)
+    by_symbol: Dict[str, Decimal] = {}
+    total_balance_by_symbol: Dict[str, Decimal] = {}
+    result_chain_keys: set[str] = set()
+    result_coin_symbols: set[str] = set()
+    latest_scan_at = ""
+    for candidate in scan.candidates:
+        chain_key = _normalize_chain_key(candidate.chain_key)
+        symbol = str(candidate.coin_symbol or "").upper()
+        if chain_key:
+            result_chain_keys.add(chain_key)
+        if symbol:
+            result_coin_symbols.add(symbol)
+        total_balance_by_symbol[symbol] = total_balance_by_symbol.get(symbol, Decimal("0")) + candidate.token_balance
+        scan_at = _admin_datetime_display(getattr(candidate, "balance_checked_at", None)) or ""
+        if scan_at and scan_at > latest_scan_at:
+            latest_scan_at = scan_at
+        if candidate.should_create_task:
+            by_symbol[symbol] = by_symbol.get(symbol, Decimal("0")) + candidate.evaluation.collect_amount
+    return {
+        "total_addresses": scan.total_addresses,
+        "evaluated_count": scan.evaluated_count,
+        "collectible_count": scan.collectible_count,
+        "gas_required_count": scan.gas_required_count,
+        "skipped_count": scan.skipped_count,
+        "created_task_count": scan.created_task_count,
+        "created_gas_task_count": scan.created_gas_task_count,
+        "created_task_ids": list(scan.created_task_ids),
+        "created_gas_task_ids": list(scan.created_gas_task_ids),
+        "skipped_duplicate_count": scan.skipped_duplicate_count,
+        "skipped_gas_required_count": scan.skipped_gas_required_count,
+        "gas_task_skipped_duplicate_count": scan.gas_task_skipped_duplicate_count,
+        "gas_task_skipped_config_missing_count": scan.gas_task_skipped_config_missing_count,
+        "created": scan.created_task_count,
+        "skipped_duplicate": scan.skipped_duplicate_count,
+        "skipped_gas_required": scan.skipped_gas_required_count,
+        "gas_task_created": scan.created_gas_task_count,
+        "gas_task_skipped_duplicate": scan.gas_task_skipped_duplicate_count,
+        "gas_task_skipped_config_missing": scan.gas_task_skipped_config_missing_count,
+        "batch_id": scan.batch_id,
+        "batch_no": scan.batch_no,
+        "scope_chain_key": values["chain_key"],
+        "scope_chain_label": values["chain_key"] or "全部网络",
+        "scope_coin_symbol": values["coin_symbol"],
+        "scope_coin_label": values["coin_symbol"] or "全部币种",
+        "scope_user_id": values["user_id"] or "全部用户",
+        "scope_address": values["address"] or "全部地址",
+        "recent_scan_at": latest_scan_at or "-",
+        "balance_source": "链上扫描",
+        "result_chain_keys": sorted(result_chain_keys),
+        "result_coin_symbols": sorted(result_coin_symbols),
+        "gas_required_label": f"是（{scan.gas_required_count}）" if scan.gas_required_count else "否",
+        "collect_amounts": [
+            {"symbol": symbol, "amount": _fmt_admin_amount_display(amount, symbol)}
+            for symbol, amount in sorted(by_symbol.items())
+        ],
+        "balance_amounts": [
+            {"symbol": symbol, "amount": _fmt_admin_amount_display(amount, symbol)}
+            for symbol, amount in sorted(total_balance_by_symbol.items())
+        ],
+        "warnings": scan.warnings,
+    }
+
+
+def admin_query_collection_center_stats(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    values = _collection_center_filter_values(filters)
+    where_parts = []
+    params: Dict[str, Any] = {}
+    if values["chain_key"]:
+        where_parts.append("chain_key = :chain_key")
+        params["chain_key"] = values["chain_key"]
+    if values["coin_symbol"]:
+        where_parts.append("coin_symbol = :coin_symbol")
+        params["coin_symbol"] = values["coin_symbol"]
+    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+    task_where_parts = list(where_parts)
+    if values["user_id"]:
+        task_where_parts.append("user_id = :user_id")
+        params["user_id"] = _parse_int(values["user_id"], 0)
+    if values["address"]:
+        task_where_parts.append("LOWER(from_address) LIKE :address")
+        params["address"] = f"%{values['address'].lower()}%"
+    task_where_sql = "WHERE " + " AND ".join(task_where_parts) if task_where_parts else ""
+    today_batches = int(
+        db.execute(
+            text(f"SELECT COUNT(*) FROM collection_batches {where_sql} {'AND' if where_sql else 'WHERE'} DATE(created_at) = CURDATE()"),
+            params,
+        ).scalar()
+        or 0
+    )
+    failed_tasks = int(
+        db.execute(
+            text(
+                f"SELECT COUNT(*) FROM collection_tasks {task_where_sql} {'AND' if task_where_sql else 'WHERE'} UPPER(status) IN :failed_statuses"
+            ).bindparams(bindparam("failed_statuses", expanding=True)),
+            {**params, "failed_statuses": COLLECTION_CENTER_FAILED_TASK_STATUSES},
+        ).scalar()
+        or 0
+    )
+    active_collection_tasks = int(
+        db.execute(
+            text(
+                f"""
+                SELECT COUNT(*)
+                FROM collection_tasks
+                {task_where_sql} {'AND' if task_where_sql else 'WHERE'} UPPER(status) IN :active_statuses
+                """
+            ).bindparams(bindparam("active_statuses", expanding=True)),
+            {**params, "active_statuses": COLLECTION_CENTER_ACTIVE_TASK_STATUSES},
+        ).scalar()
+        or 0
+    )
+    gas_task_where_parts = []
+    gas_params: Dict[str, Any] = {}
+    if values["chain_key"]:
+        gas_task_where_parts.append("chain_key = :chain_key")
+        gas_params["chain_key"] = values["chain_key"]
+    if values["user_id"]:
+        gas_task_where_parts.append("user_id = :user_id")
+        gas_params["user_id"] = _parse_int(values["user_id"], 0)
+    if values["address"]:
+        gas_task_where_parts.append("LOWER(to_address) LIKE :address")
+        gas_params["address"] = f"%{values['address'].lower()}%"
+    gas_task_where_sql = "WHERE " + " AND ".join(gas_task_where_parts) if gas_task_where_parts else ""
+    active_gas_tasks = int(
+        db.execute(
+            text(
+                f"""
+                SELECT COUNT(*)
+                FROM gas_tasks
+                {gas_task_where_sql} {'AND' if gas_task_where_sql else 'WHERE'} UPPER(status) IN :active_statuses
+                """
+            ).bindparams(bindparam("active_statuses", expanding=True)),
+            {**gas_params, "active_statuses": COLLECTION_CENTER_ACTIVE_TASK_STATUSES},
+        ).scalar()
+        or 0
+    )
+    failed_gas_tasks = int(
+        db.execute(
+            text(
+                f"""
+                SELECT COUNT(*)
+                FROM gas_tasks
+                {gas_task_where_sql} {'AND' if gas_task_where_sql else 'WHERE'} UPPER(status) IN :failed_statuses
+                """
+            ).bindparams(bindparam("failed_statuses", expanding=True)),
+            {**gas_params, "failed_statuses": COLLECTION_CENTER_FAILED_TASK_STATUSES},
+        ).scalar()
+        or 0
+    )
+    today_collected = _collection_center_today_collected_stats(db, values)
+    return {
+        "collectible_count": 0,
+        "gas_required_count": 0,
+        "collect_amounts": [],
+        "recent_scan_at": "未扫描",
+        "balance_source": "未扫描",
+        "today_batches": today_batches,
+        "active_collection_tasks": active_collection_tasks + active_gas_tasks,
+        "failed_tasks": failed_tasks + failed_gas_tasks,
+        **today_collected,
+        "candidate_error": "",
+    }
+
+
+def admin_create_collection_batch_from_candidates(
+    db: Session,
+    admin_user_id: Optional[int],
+    filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    scan = _collection_center_scan(db, filters, create_tasks=True, admin_user_id=admin_user_id)
+    return {
+        "ok": True,
+        "scan": scan,
+        "summary": _collection_center_scan_summary(scan),
+        "batch_id": scan.batch_id,
+        "batch_no": scan.batch_no,
+        "created_task_count": scan.created_task_count,
+        "created_gas_task_count": scan.created_gas_task_count,
+        "created_task_ids": list(scan.created_task_ids),
+        "created_gas_task_ids": list(scan.created_gas_task_ids),
+        "skipped_duplicate_count": scan.skipped_duplicate_count,
+        "skipped_gas_required_count": scan.skipped_gas_required_count,
+        "gas_task_skipped_duplicate_count": scan.gas_task_skipped_duplicate_count,
+        "gas_task_skipped_config_missing_count": scan.gas_task_skipped_config_missing_count,
+        "warnings": scan.warnings,
+    }
+
+
+def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    task_no = str(filters.get("task_no") or "").strip()
+    batch_id = str(filters.get("batch_id") or "").strip()
+    user_id = str(filters.get("user_id") or "").strip()
+    chain_key = _normalize_chain_key(filters.get("chain_key"))
+    coin_symbol = _normalize_code(filters.get("coin_symbol"))
+    status = str(filters.get("status") or "").strip().upper()
+    address = str(filters.get("address") or "").strip()
+    tx_hash = str(filters.get("tx_hash") or "").strip()
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    normalized_filters = {
+        "task_no": task_no,
+        "batch_id": batch_id,
+        "user_id": user_id,
+        "chain_key": chain_key,
+        "coin_symbol": coin_symbol,
+        "address": address,
+        "tx_hash": tx_hash,
+    }
+    where_parts, params = _collection_task_scope(normalized_filters)
+    status_values: tuple[str, ...] | None = None
+    if status:
+        if status == "ACTIVE":
+            where_parts.append("UPPER(collection_tasks.status) IN :status_values")
+            status_values = COLLECTION_OP_ACTIVE_STATUSES
+        elif status in {"FAILED", "FAIL", "ERROR"}:
+            where_parts.append("UPPER(collection_tasks.status) IN :status_values")
+            status_values = COLLECTION_OP_FAILED_STATUSES
+            status = "FAILED"
+        elif status in {"SUCCESS", "COMPLETED", "CONFIRMED"}:
+            where_parts.append("UPPER(collection_tasks.status) IN :status_values")
+            status_values = COLLECTION_OP_SUCCESS_STATUSES
+            status = "SUCCESS"
+        elif status in {"PENDING", "QUEUED"}:
+            where_parts.append("UPPER(collection_tasks.status) IN :status_values")
+            status_values = COLLECTION_OP_WAITING_STATUSES
+            status = "PENDING"
+        elif status in {"PROCESSING", "RUNNING", "SENDING"}:
+            where_parts.append("UPPER(collection_tasks.status) IN :status_values")
+            status_values = COLLECTION_OP_PROCESSING_STATUSES
+            status = "PROCESSING"
+        else:
+            where_parts.append("UPPER(collection_tasks.status) = :status")
+            params["status"] = status
+    if status_values:
+        params["status_values"] = status_values
+    if created_from:
+        where_parts.append("DATE(collection_tasks.created_at) >= :created_from")
+        params["created_from"] = str(created_from)
+    if created_to:
+        where_parts.append("DATE(collection_tasks.created_at) <= :created_to")
+        params["created_to"] = str(created_to)
+    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+    try:
+        group_expr = "COALESCE(collection_tasks.batch_id, -collection_tasks.id)"
+        batch_count_stmt = text(
+            f"""
+            SELECT COUNT(*) FROM (
+              SELECT {group_expr} AS group_id
+              FROM collection_tasks
+              LEFT JOIN collection_batches cb ON cb.id = collection_tasks.batch_id
+              {where_sql}
+              GROUP BY {group_expr}
+            ) grouped_batches
+            """
+        )
+        if status_values:
+            batch_count_stmt = batch_count_stmt.bindparams(bindparam("status_values", expanding=True))
+        batch_total = int(db.execute(batch_count_stmt, params).scalar() or 0)
+        batch_page, batch_page_size, batch_pages = _admin_page_meta(batch_total, page, page_size)
+        batch_stmt = text(
+            f"""
+            SELECT
+              {group_expr} AS group_id,
+              collection_tasks.batch_id AS batch_id,
+              cb.batch_no AS batch_no,
+              cb.status AS batch_status,
+              MIN(collection_tasks.id) AS fallback_task_id,
+              MIN(collection_tasks.task_no) AS task_no,
+              COALESCE(cb.chain_key, MIN(collection_tasks.chain_key)) AS chain_key,
+              COALESCE(cb.coin_symbol, MIN(collection_tasks.coin_symbol)) AS coin_symbol,
+              COUNT(*) AS address_count,
+              COALESCE(SUM(collection_tasks.amount), 0) AS total_amount,
+              GROUP_CONCAT(CONCAT(COALESCE(NULLIF(UPPER(collection_tasks.coin_symbol), ''), '--'), ':', COALESCE(collection_tasks.amount, 0)) ORDER BY collection_tasks.coin_symbol SEPARATOR '|') AS amount_rows_raw,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN :success_statuses AND NOT (UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS success_count,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN :sent_statuses THEN 1 ELSE 0 END) AS sent_count,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN :failed_statuses THEN 1 ELSE 0 END) AS failed_count,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN :waiting_statuses OR (UPPER(collection_tasks.status) IN :success_statuses AND (UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%')) THEN 1 ELSE 0 END) AS waiting_count,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN :processing_statuses THEN 1 ELSE 0 END) AS processing_count,
+              SUM(CASE WHEN UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%' THEN 1 ELSE 0 END) AS dry_run_count,
+              SUM(CASE WHEN NOT (LOWER(COALESCE(collection_tasks.tx_hash, '')) LIKE '0x%' AND NOT (UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%')) AND ((UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%') OR UPPER(collection_tasks.status) IN ('PENDING', 'QUEUED', 'READY')) THEN 1 ELSE 0 END) AS can_send_count,
+              SUM(CASE WHEN collection_tasks.gas_task_id IS NOT NULL OR UPPER(collection_tasks.status) IN ('GAS_REQUIRED', 'GAS_QUEUED') THEN 1 ELSE 0 END) AS gas_linked_count,
+              SUM(CASE WHEN UPPER(gt.status) IN ('SENT', 'GAS_SENT') THEN 1 ELSE 0 END) AS gas_sent_count,
+              SUM(CASE WHEN UPPER(gt.status) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED') AND gt.tx_hash IS NOT NULL AND UPPER(gt.tx_hash) NOT LIKE 'DRYGAS_%' AND UPPER(gt.tx_hash) NOT LIKE 'DRYRUN_%' THEN 1 ELSE 0 END) AS gas_confirmed_count,
+              SUM(CASE WHEN UPPER(gt.status) IN ('FAILED', 'ERROR') THEN 1 ELSE 0 END) AS gas_failed_count,
+              COALESCE(SUM(CASE WHEN gt.id IS NOT NULL THEN gt.topup_amount ELSE 0 END), 0) AS gas_topup_amount,
+              MAX(gt.gas_coin_symbol) AS gas_coin_symbol,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN ('PENDING', 'WAITING') AND collection_tasks.tx_hash IS NULL THEN 1 ELSE 0 END) AS requeue_collection_count,
+              SUM(CASE WHEN gt.id IS NOT NULL AND UPPER(gt.status) IN ('PENDING', 'WAITING') AND gt.tx_hash IS NULL THEN 1 ELSE 0 END) AS requeue_gas_count,
+              MIN(collection_tasks.created_at) AS created_at,
+              MAX(COALESCE(collection_tasks.confirmed_at, collection_tasks.sent_at, collection_tasks.updated_at, collection_tasks.created_at)) AS finished_at,
+              MAX(collection_tasks.created_at) AS sort_created_at,
+              MAX(collection_tasks.id) AS sort_id
+            FROM collection_tasks
+            LEFT JOIN collection_batches cb ON cb.id = collection_tasks.batch_id
+            LEFT JOIN gas_tasks gt ON gt.id = collection_tasks.gas_task_id
+            {where_sql}
+            GROUP BY {group_expr}, collection_tasks.batch_id, cb.batch_no, cb.status, cb.chain_key, cb.coin_symbol
+            ORDER BY sort_created_at DESC, sort_id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ).bindparams(
+            bindparam("success_statuses", expanding=True),
+            bindparam("sent_statuses", expanding=True),
+            bindparam("failed_statuses", expanding=True),
+            bindparam("waiting_statuses", expanding=True),
+            bindparam("processing_statuses", expanding=True),
+        )
+        if status_values:
+            batch_stmt = batch_stmt.bindparams(bindparam("status_values", expanding=True))
+        batch_rows = db.execute(
+            batch_stmt,
+            {
+                **params,
+                "success_statuses": COLLECTION_OP_SUCCESS_STATUSES,
+                "sent_statuses": COLLECTION_OP_SENT_STATUSES,
+                "failed_statuses": (*COLLECTION_OP_FAILED_STATUSES, *COLLECTION_OP_TIMEOUT_STATUSES),
+                "waiting_statuses": COLLECTION_OP_WAITING_STATUSES,
+                "processing_statuses": COLLECTION_OP_PROCESSING_STATUSES,
+                "limit": batch_page_size,
+                "offset": (batch_page - 1) * batch_page_size,
+            },
+        ).mappings().all()
+        detail_total = 0
+        detail_page = 1
+        detail_pages = 1
+        rows = []
+        if batch_id or task_no:
+            count_stmt = text(f"SELECT COUNT(*) FROM collection_tasks {where_sql}")
+            if status_values:
+                count_stmt = count_stmt.bindparams(bindparam("status_values", expanding=True))
+            detail_total = int(db.execute(count_stmt, params).scalar() or 0)
+            detail_page, detail_page_size, detail_pages = _admin_page_meta(detail_total, page, page_size)
+            row_stmt = text(
+                f"""
+                SELECT collection_tasks.id, collection_tasks.task_no, collection_tasks.batch_id,
+                       collection_tasks.user_id, collection_tasks.chain_key, collection_tasks.coin_symbol,
+                       collection_tasks.asset_chain_id, collection_tasks.from_address, collection_tasks.to_address,
+                       collection_tasks.amount, collection_tasks.status, collection_tasks.reason,
+                       collection_tasks.tx_hash, collection_tasks.block_number, collection_tasks.gas_task_id,
+                       collection_tasks.idempotency_key, collection_tasks.retry_count, collection_tasks.max_retry,
+                       collection_tasks.next_retry_at, collection_tasks.last_error, collection_tasks.locked_at,
+                       collection_tasks.sent_at, collection_tasks.confirmed_at, collection_tasks.created_at,
+                       collection_tasks.updated_at, gt.topup_amount AS gas_topup_amount,
+                       gt.gas_coin_symbol AS gas_topup_coin_symbol, gt.status AS gas_task_status,
+                       gt.tx_hash AS gas_tx_hash, gt.confirmed_at AS gas_confirmed_at
+                FROM collection_tasks
+                LEFT JOIN gas_tasks gt ON gt.id = collection_tasks.gas_task_id
+                {where_sql}
+                ORDER BY collection_tasks.created_at DESC, collection_tasks.id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            )
+            if status_values:
+                row_stmt = row_stmt.bindparams(bindparam("status_values", expanding=True))
+            rows = db.execute(
+                row_stmt,
+                {**params, "limit": detail_page_size, "offset": (detail_page - 1) * detail_page_size},
+            ).mappings().all()
+    except Exception:
+        return _admin_read_error_page("list_collection_tasks", filters)
+    return _empty_page(
+        items=[_admin_collection_task_item(dict(row)) for row in rows],
+        batch_items=[_admin_collection_task_batch_item(dict(row)) for row in batch_rows],
+        filters={
+            **filters,
+            "task_no": task_no,
+            "batch_id": batch_id,
+            "user_id": user_id,
+            "chain_key": chain_key,
+            "coin_symbol": coin_symbol,
+            "status": status,
+            "address": address,
+            "tx_hash": tx_hash,
+        },
+        summary=_collection_tasks_summary(db, normalized_filters),
+        total=detail_total,
+        page=detail_page,
+        page_size=page_size,
+        pages=detail_pages,
+        batch_pagination={
+            "page": batch_page,
+            "page_size": batch_page_size,
+            "total": batch_total,
+            "pages": batch_pages,
+        },
+        selected_batch_id=batch_id or task_no,
+    )
+
+
+def list_gas_tasks(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    filters = filters or {}
+    task_no = str(filters.get("task_no") or "").strip()
+    collection_task_id = str(filters.get("collection_task_id") or "").strip()
+    user_id = str(filters.get("user_id") or "").strip()
+    chain_key = _normalize_chain_key(filters.get("chain_key"))
+    coin_symbol = _normalize_code(filters.get("coin_symbol"))
+    status = str(filters.get("status") or "").strip().upper()
+    address = str(filters.get("address") or "").strip()
+    tx_hash = str(filters.get("tx_hash") or "").strip()
+    created_from = filters.get("created_from") or filters.get("date_from")
+    created_to = filters.get("created_to") or filters.get("date_to")
+    page = max(1, _parse_int(filters.get("page"), 1))
+    page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    normalized_filters = {
+        "task_no": task_no,
+        "collection_task_id": collection_task_id,
+        "user_id": user_id,
+        "chain_key": chain_key,
+        "coin_symbol": coin_symbol,
+        "address": address,
+        "tx_hash": tx_hash,
+    }
+    where_parts, params = _gas_task_scope(normalized_filters)
+    status_values: tuple[str, ...] | None = None
+    if status:
+        if status == "ACTIVE":
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_ACTIVE_STATUSES
+        elif status in {"FAILED", "FAIL", "ERROR"}:
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_FAILED_STATUSES
+            status = "FAILED"
+        elif status in {"SUCCESS", "COMPLETED", "CONFIRMED"}:
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_SUCCESS_STATUSES
+            status = "SUCCESS"
+        elif status in {"PENDING", "QUEUED"}:
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_WAITING_STATUSES
+            status = "PENDING"
+        elif status in {"PROCESSING", "RUNNING", "SENDING"}:
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_PROCESSING_STATUSES
+            status = "PROCESSING"
+        else:
+            where_parts.append("UPPER(status) = :status")
+            params["status"] = status
+    if status_values:
+        params["status_values"] = status_values
+    if created_from:
+        where_parts.append("DATE(created_at) >= :created_from")
+        params["created_from"] = str(created_from)
+    if created_to:
+        where_parts.append("DATE(created_at) <= :created_to")
+        params["created_to"] = str(created_to)
+    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+    try:
+        count_stmt = text(f"SELECT COUNT(*) FROM gas_tasks {where_sql}")
+        if status_values:
+            count_stmt = count_stmt.bindparams(bindparam("status_values", expanding=True))
+        total = int(db.execute(count_stmt, params).scalar() or 0)
+        page, page_size, pages = _admin_page_meta(total, page, page_size)
+        row_stmt = text(
+            f"""
+            SELECT id, task_no, collection_task_id, user_id, chain_key, gas_coin_symbol,
+                   from_address, to_address, target_balance, topup_amount, status,
+                   tx_hash, block_number, idempotency_key, retry_count, max_retry,
+                   next_retry_at, last_error, locked_at, sent_at, confirmed_at,
+                   created_at, updated_at
+            FROM gas_tasks
+            {where_sql}
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        )
+        if status_values:
+            row_stmt = row_stmt.bindparams(bindparam("status_values", expanding=True))
+        rows = db.execute(
+            row_stmt,
+            {**params, "limit": page_size, "offset": (page - 1) * page_size},
+        ).mappings().all()
+    except Exception:
+        return _admin_read_error_page("list_gas_tasks", filters)
+    return _empty_page(
+        items=[_admin_gas_task_item(dict(row)) for row in rows],
+        filters={
+            **filters,
+            "task_no": task_no,
+            "collection_task_id": collection_task_id,
+            "user_id": user_id,
+            "chain_key": chain_key,
+            "coin_symbol": coin_symbol,
+            "status": status,
+            "address": address,
+            "tx_hash": tx_hash,
+        },
+        summary=_gas_tasks_summary(db, normalized_filters),
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+    )
+
+
+# Generic fallbacks for unrelated admin pages. They keep imports stable while
+# the asset-network rollout code remains the source of truth in this file.
+admin_toggle_vip_fee_level_enabled = _ok_stub
+admin_update_vip_fee_level_rule = _ok_stub
+admin_save_dealer_risk_limit = _ok_stub
+admin_toggle_dealer_risk_enabled = _ok_stub
+admin_toggle_dealer_risk_status = _ok_stub

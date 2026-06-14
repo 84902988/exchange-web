@@ -1,0 +1,211 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}分红管理{% endblock %}
+{% block page_title %}分红管理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">批次执行与排障：处理分红批次、详情、重算、发放和日志，不编辑 VIP/SVIP 规则。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/dividend-config" class="btn secondary admin-btn admin-btn-secondary">分红配置</a>
+  <a href="/admin/dividend-stats" class="btn secondary admin-btn admin-btn-secondary">分红统计</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .pool-table{ min-width:1180px; }
+    .pool-actions{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .pool-actions form{ margin:0; }
+    .mono-cell{ font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace; white-space:nowrap; }
+    .premature-note{
+      margin-top:8px;
+      max-width:260px;
+      color:#ffcdcd;
+      font-size:12px;
+      line-height:1.45;
+      font-weight:700;
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section"><div class="card"><div class="section-title">操作成功</div><p class="muted">{{ notice }}</p></div></section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section"><div class="card"><div class="section-title">操作失败</div><p class="muted">{{ error }}</p></div></section>
+  {% endif %}
+
+  <section class="page-section two-col">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/dividend-pools" class="filter-form">
+        <div class="field">
+          <label for="dividend_date">分红日期</label>
+          <input id="dividend_date" type="date" name="dividend_date" value="{{ filters.dividend_date_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="PENDING" {% if filters.status == 'PENDING' %}selected{% endif %}>待处理</option>
+            <option value="CALCULATED" {% if filters.status == 'CALCULATED' %}selected{% endif %}>已计算</option>
+            <option value="PAID" {% if filters.status == 'PAID' %}selected{% endif %}>已发放</option>
+            <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
+            <option value="SKIPPED" {% if filters.status == 'SKIPPED' %}selected{% endif %}>已跳过</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/dividend-pools" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+
+    <div class="filter-card">
+      <div class="section-title">手动创建批次</div>
+      <form method="post" action="/admin/dividend-pools/create" class="filter-form">
+        <div class="field">
+          <label for="create_dividend_date">分红日期（UTC）</label>
+          <input id="create_dividend_date" type="date" name="dividend_date" value="{{ utc_yesterday }}" max="{{ utc_yesterday }}" data-utc-today="{{ utc_today }}" required />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">创建批次</button>
+        </div>
+      </form>
+      <p class="muted">只能选择已结束的日期，不能选择今天或未来日期。</p>
+    </div>
+
+    <div class="filter-card">
+      <div class="section-title">补跑指定日期自动分红</div>
+      <form method="post" action="/admin/dividend-pools/rerun-auto" class="filter-form" data-rerun-auto-form>
+        <div class="field">
+          <label for="rerun_dividend_date">分红日期（UTC）</label>
+          <input id="rerun_dividend_date" type="date" name="dividend_date" value="{{ utc_yesterday }}" max="{{ utc_yesterday }}" data-utc-today="{{ utc_today }}" required />
+        </div>
+        <input type="hidden" name="confirm_text" value="" data-rerun-confirm />
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-danger">补跑自动分红</button>
+        </div>
+      </form>
+      <p class="muted">仅用于补跑已结束日期的自动分红，不可用于当天分红。</p>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">分红批次列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table pool-table">
+            <thead>
+              <tr>
+                <th>分红日期</th>
+                <th class="text-right">手续费折算 USDT</th>
+                <th class="text-right">RCB价格</th>
+                <th class="text-right">分红 RCB</th>
+                <th class="text-right">用户数</th>
+                <th>状态</th>
+                <th>来源</th>
+                <th>创建时间</th>
+                <th>最近一次执行</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="mono-cell">{{ item.dividend_date }}</td>
+                  <td class="admin-amount">{{ item.total_fee_usdt }}</td>
+                  <td class="admin-amount">{{ item.rcb_price_used }}</td>
+                  <td class="admin-amount">{{ item.total_dividend_rcb }}</td>
+                  <td class="text-right admin-number">{{ item.user_count }}</td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span>
+                    {% if item.is_premature %}
+                      <div class="premature-note">{{ item.premature_warning }}</div>
+                    {% endif %}
+                  </td>
+                  <td><span class="admin-badge admin-badge-info" title="{{ item.source }}">{{ item.source_label }}</span></td>
+                  <td class="mono-cell admin-time">{{ item.created_at or '-' }}</td>
+                  <td class="mono-cell admin-time">{{ item.run_at }}</td>
+                  <td>
+                    <div class="pool-actions admin-table-actions">
+                      <a href="/admin/dividend-pools/{{ item.id }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">查看详情</a>
+                      {% if item.can_calculate %}
+                        <form method="post" action="/admin/dividend-pools/{{ item.id }}/calculate">
+                          <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">重新计算</button>
+                        </form>
+                      {% elif item.status == 'PENDING' and item.is_premature %}
+                        <span class="admin-badge admin-badge-danger">日期未结束，禁止计算</span>
+                      {% endif %}
+                      {% if item.can_distribute %}
+                        <form method="post" action="/admin/dividend-pools/{{ item.id }}/distribute" onsubmit="return confirm('确认发放该分红批次？发放后不可重复执行。');">
+                          <button type="submit" class="btn admin-btn admin-btn-danger admin-btn-sm">重新发放</button>
+                        </form>
+                      {% elif item.status == 'CALCULATED' and item.is_premature %}
+                        <span class="admin-badge admin-badge-danger">日期未结束，禁止发放</span>
+                      {% endif %}
+                      <a href="/admin/dividends/job-logs?pool_id={{ item.id }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">查看日志</a>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无分红批次，请调整筛选条件或先创建批次。</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+  <script>
+    (function () {
+      var form = document.querySelector('form[action="/admin/dividend-pools/create"]');
+      var input = document.getElementById("create_dividend_date");
+      if (!form || !input) {
+        return;
+      }
+      form.addEventListener("submit", function (event) {
+        var utcToday = input.getAttribute("data-utc-today") || "";
+        if (input.value && utcToday && input.value >= utcToday) {
+          event.preventDefault();
+          alert("分红日期必须早于当前 UTC 日期。");
+          input.focus();
+        }
+      });
+      var rerunForm = document.querySelector("[data-rerun-auto-form]");
+      var rerunInput = document.getElementById("rerun_dividend_date");
+      var rerunConfirm = document.querySelector("[data-rerun-confirm]");
+      if (!rerunForm || !rerunInput || !rerunConfirm) {
+        return;
+      }
+      rerunForm.addEventListener("submit", function (event) {
+        var utcTodayValue = rerunInput.getAttribute("data-utc-today") || "";
+        if (rerunInput.value && utcTodayValue && rerunInput.value >= utcTodayValue) {
+          event.preventDefault();
+          alert("只能补跑已结束的 UTC 日期，不能选择今天或未来日期。");
+          rerunInput.focus();
+          return;
+        }
+        var value = prompt("该操作会复用自动分红状态机处理所选日期。请输入 EXECUTE 确认。");
+        if (value !== "EXECUTE") {
+          event.preventDefault();
+          alert("未输入 EXECUTE，已取消补跑。");
+          return;
+        }
+        rerunConfirm.value = value;
+      });
+    })();
+  </script>
+{% endblock %}

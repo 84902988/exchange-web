@@ -1,0 +1,199 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}提现异常治理{% endblock %}
+{% block page_title %}提现异常治理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">运营复核提现异常候选，仅做治理入口，不改变提现主流程。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .withdraw-anomaly-note{margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,255,255,.10);border-radius:8px;background:rgba(255,255,255,.04);color:rgba(255,255,255,.72);font-size:13px;line-height:1.6;}
+    .withdraw-anomaly-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:0 0 14px;}
+    .withdraw-anomaly-stat{padding:12px;border:1px solid rgba(255,255,255,.10);border-radius:8px;background:rgba(255,255,255,.035);}
+    .withdraw-anomaly-stat strong{display:block;font-size:22px;line-height:1.2;color:#fff;}
+    .withdraw-anomaly-stat span{display:block;margin-top:4px;color:rgba(255,255,255,.58);font-size:12px;}
+    .withdraw-anomaly-release{display:flex;align-items:center;gap:6px;white-space:nowrap;}
+    .withdraw-anomaly-release input{width:78px;min-width:78px;padding:5px 6px;font-size:12px;}
+    .withdraw-anomaly-reason{max-width:260px;}
+    @media (max-width:1100px){.withdraw-anomaly-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+  </style>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">治理概览</div>
+      <div class="withdraw-anomaly-note">仅展示最近 {{ limit }} 条候选，完整审计请运行脚本：python backend/scripts/audit_withdraw_fee_and_frozen.py</div>
+      <div class="withdraw-anomaly-grid">
+        <div class="withdraw-anomaly-stat"><strong>{{ summary.failed_frozen_count or 0 }}</strong><span>失败冻结候选</span></div>
+        <div class="withdraw-anomaly-stat"><strong>{{ summary.fee_issue_count or 0 }}</strong><span>手续费异常候选</span></div>
+        <div class="withdraw-anomaly-stat"><strong>{{ summary.precheck_failure_count or 0 }}</strong><span>预检失败记录</span></div>
+        <div class="withdraw-anomaly-stat"><strong>{{ summary.amount_net_mismatch_count or 0 }}</strong><span>口径不一致记录</span></div>
+      </div>
+    </div>
+  </section>
+
+  {% macro release_form(item) -%}
+    {% if item.can_release_frozen %}
+      <form
+        method="post"
+        action="/admin/withdraw-records/{{ item.withdraw_id }}/release-frozen"
+        class="withdraw-anomaly-release"
+        onsubmit="return confirm('确认释放该笔未广播提现的冻结资金？请确认该记录 tx_hash 为空且未发生链上转账。');"
+      >
+        <input type="hidden" name="next_path" value="{{ request.url }}" />
+        <input type="text" name="confirm_text" placeholder="RELEASE" autocomplete="off" />
+        <button type="submit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">释放冻结</button>
+      </form>
+    {% else %}
+      <span class="admin-muted">-</span>
+    {% endif %}
+  {%- endmacro %}
+
+  <section class="page-section" id="failed-frozen">
+    <div class="table-card">
+      <div class="section-title">失败冻结候选</div>
+      <div class="withdraw-anomaly-note">链上未广播但资金仍冻结，需要人工复核后释放。</div>
+      {% if failed_frozen_candidates %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th><th>用户ID</th><th>币种</th><th>网络</th>
+                <th class="text-right">数量</th><th class="text-right">手续费</th><th class="text-right">到账</th><th class="text-right">剩余冻结</th>
+                <th>状态</th><th>失败原因</th><th>创建时间</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in failed_frozen_candidates %}
+                <tr>
+                  <td class="admin-id">{{ item.withdraw_id }}</td>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td class="mono nowrap">{{ item.coin_symbol }}</td>
+                  <td class="mono nowrap">{{ item.chain_key }}</td>
+                  <td class="admin-amount">{{ item.amount }}</td>
+                  <td class="admin-amount">{{ item.fee }}</td>
+                  <td class="admin-amount">{{ item.net_amount }}</td>
+                  <td class="admin-amount">{{ item.frozen_remaining }}</td>
+                  <td><span class="admin-badge admin-badge-warning">{{ item.status }}</span></td>
+                  <td class="admin-hash withdraw-anomaly-reason" title="{{ item.fail_reason }}">{{ item.fail_reason or '-' }}</td>
+                  <td class="nowrap admin-time">{{ item.created_at }}</td>
+                  <td>{{ release_form(item) }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无候选</div></div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section" id="fee-issues">
+    <div class="table-card">
+      <div class="section-title">手续费异常候选</div>
+      <div class="withdraw-anomaly-note">历史版本可能未生成手续费流水，仅审计展示，不自动补扣。</div>
+      {% if fee_issues %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th><th>用户ID</th><th class="text-right">数量</th><th class="text-right">手续费</th><th class="text-right">到账</th>
+                <th>状态</th><th>TxID</th><th>异常原因</th><th>建议</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in fee_issues %}
+                <tr>
+                  <td class="admin-id">{{ item.withdraw_id }}</td>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td class="admin-amount">{{ item.amount }}</td>
+                  <td class="admin-amount">{{ item.fee }}</td>
+                  <td class="admin-amount">{{ item.net_amount }}</td>
+                  <td><span class="admin-badge admin-badge-neutral">{{ item.status }}</span></td>
+                  <td class="admin-hash" title="{{ item.tx_hash }}">{{ item.tx_hash or '-' }}</td>
+                  <td>{{ item.issue_reason }}</td>
+                  <td>{{ item.suggestion }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无候选</div></div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section" id="precheck-failures">
+    <div class="table-card">
+      <div class="section-title">预检失败记录</div>
+      <div class="withdraw-anomaly-note">发送前检查失败，需要处理热钱包/RPC/配置问题。</div>
+      {% if precheck_failures %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th><th>用户ID</th><th>币种</th><th>网络</th><th class="text-right">数量</th><th class="text-right">手续费</th>
+                <th>状态</th><th>失败原因</th><th>创建时间</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in precheck_failures %}
+                <tr>
+                  <td class="admin-id">{{ item.withdraw_id }}</td>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td class="mono nowrap">{{ item.coin_symbol }}</td>
+                  <td class="mono nowrap">{{ item.chain_key }}</td>
+                  <td class="admin-amount">{{ item.amount }}</td>
+                  <td class="admin-amount">{{ item.fee }}</td>
+                  <td><span class="admin-badge admin-badge-warning">{{ item.status }}</span></td>
+                  <td class="admin-hash withdraw-anomaly-reason" title="{{ item.fail_reason }}">{{ item.fail_reason }}</td>
+                  <td class="nowrap admin-time">{{ item.created_at }}</td>
+                  <td>{{ release_form(item) }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无记录</div></div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section" id="amount-mismatch">
+    <div class="table-card">
+      <div class="section-title">口径不一致记录</div>
+      <div class="withdraw-anomaly-note">历史 amount/net_amount 口径不一致，仅审计展示。</div>
+      {% if amount_net_mismatch %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th><th>用户ID</th><th class="text-right">数量</th><th class="text-right">手续费</th><th class="text-right">到账</th>
+                <th>状态</th><th>TxID</th><th>创建时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in amount_net_mismatch %}
+                <tr>
+                  <td class="admin-id">{{ item.withdraw_id }}</td>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td class="admin-amount">{{ item.amount }}</td>
+                  <td class="admin-amount">{{ item.fee }}</td>
+                  <td class="admin-amount">{{ item.net_amount }}</td>
+                  <td><span class="admin-badge admin-badge-neutral">{{ item.status }}</span></td>
+                  <td class="admin-hash" title="{{ item.tx_hash }}">{{ item.tx_hash or '-' }}</td>
+                  <td class="nowrap admin-time">{{ item.created_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无记录</div></div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

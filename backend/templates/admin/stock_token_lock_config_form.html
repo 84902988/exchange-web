@@ -1,0 +1,169 @@
+{% extends "admin/layout.html" %}
+
+{% if is_edit %}
+  {% set form_title = "编辑股票锁仓配置" %}
+{% else %}
+  {% set form_title = "新增股票锁仓配置" %}
+{% endif %}
+
+{% block title %}{{ form_title }}{% endblock %}
+{% block page_title %}{{ form_title }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">配置锁仓币种到释放/兑换币种的自动锁仓与兑换参数。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/stock-token-lock-configs" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .stock-lock-form-card{
+      max-width:1240px;
+    }
+    .stock-lock-form{
+      display:flex;
+      flex-direction:column;
+      gap:18px;
+    }
+    .stock-lock-section{
+      padding:14px 0 2px;
+      border-top:1px solid rgba(255,255,255,.08);
+    }
+    .stock-lock-section:first-child{
+      padding-top:0;
+      border-top:0;
+    }
+    .stock-lock-section-title{
+      margin-bottom:12px;
+      color:var(--text);
+      font-size:14px;
+      font-weight:700;
+    }
+    .stock-lock-grid{
+      display:grid;
+      grid-template-columns:repeat(3, minmax(0, 1fr));
+      gap:14px;
+      align-items:start;
+    }
+    .stock-lock-field-help{
+      margin-top:6px;
+      color:rgba(255,255,255,.48);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .stock-lock-form-actions{
+      display:flex;
+      align-items:center;
+      justify-content:flex-end;
+      gap:10px;
+      padding-top:14px;
+      border-top:1px solid rgba(255,255,255,.08);
+    }
+    .stock-lock-edit-note{
+      margin-top:12px;
+      padding:10px 12px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:8px;
+      background:rgba(255,255,255,.03);
+      color:rgba(255,255,255,.58);
+      font-size:12px;
+      line-height:1.55;
+    }
+    @media (max-width:1100px){
+      .stock-lock-grid{ grid-template-columns:repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width:720px){
+      .stock-lock-grid{ grid-template-columns:1fr; }
+      .stock-lock-form-actions{ justify-content:flex-start; }
+    }
+  </style>
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">表单校验失败</div>
+        {% for error in errors %}
+          <p class="muted">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card stock-lock-form-card">
+      <div class="section-title">{{ form_title }}</div>
+      <form method="post" action="{{ form_action }}" class="stock-lock-form">
+        <div class="stock-lock-section">
+          <div class="stock-lock-section-title">基础配置</div>
+          <div class="stock-lock-grid">
+            <div class="field">
+              <label for="lock_symbol">锁仓币种</label>
+              {% if form.lock_symbols_locked %}
+                <input id="lock_symbol" type="text" value="{{ form.lock_symbol or '' }}" disabled />
+                <input type="hidden" name="lock_symbol" value="{{ form.lock_symbol or '' }}" />
+              {% else %}
+                <input id="lock_symbol" type="text" name="lock_symbol" value="{{ form.lock_symbol or '' }}" placeholder="例如 CREG-1" />
+              {% endif %}
+              <div class="stock-lock-field-help">用户充值后进入锁仓批次的币种，例如 CREG-1。</div>
+            </div>
+            <div class="field">
+              <label for="trade_symbol">释放/兑换币种</label>
+              {% if form.lock_symbols_locked %}
+                <input id="trade_symbol" type="text" value="{{ form.trade_symbol or '' }}" disabled />
+                <input type="hidden" name="trade_symbol" value="{{ form.trade_symbol or '' }}" />
+              {% else %}
+                <input id="trade_symbol" type="text" name="trade_symbol" value="{{ form.trade_symbol or '' }}" placeholder="例如 CREG-2" />
+              {% endif %}
+              <div class="stock-lock-field-help">用户释放后可兑换到账的币种，例如 CREG-2。</div>
+            </div>
+            <div class="field">
+              <label for="is_active">是否启用</label>
+              <select id="is_active" name="is_active">
+                <option value="1" {% if form.is_active == '1' %}selected{% endif %}>启用</option>
+                <option value="0" {% if form.is_active == '0' %}selected{% endif %}>禁用</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="stock-lock-section">
+          <div class="stock-lock-section-title">释放规则</div>
+          <div class="stock-lock-grid">
+            <div class="field">
+              <label for="lock_days">锁定期</label>
+              <input id="lock_days" type="number" min="1" name="lock_days" value="{{ form.lock_days or '90' }}" />
+              <div class="stock-lock-field-help">锁定期内不释放，到期后按每日比例释放。</div>
+            </div>
+            <div class="field">
+              <label for="daily_release_rate">解锁后每日释放比例</label>
+              <input id="daily_release_rate" type="text" name="daily_release_rate" value="{{ form.daily_release_rate or '0.05000000' }}" placeholder="例如 0.05" />
+              <div class="stock-lock-field-help">填写小数比例，例如 0.05 表示 5%。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stock-lock-section">
+          <div class="stock-lock-section-title">兑换规则</div>
+          <div class="stock-lock-grid">
+            <div class="field">
+              <label for="conversion_rate">兑换比例</label>
+              <input id="conversion_rate" type="text" name="conversion_rate" value="{{ form.conversion_rate or '1.000000000000000000' }}" />
+              <div class="stock-lock-field-help">填写 1 表示 1:1；填写 1.2 表示 1 个锁仓币兑换 1.2 个释放币。</div>
+            </div>
+          </div>
+        </div>
+
+        {% if form.lock_symbols_locked %}
+          <div class="stock-lock-edit-note">
+            该配置已存在，锁仓币种和释放/兑换币种不允许修改。兑换比例、锁定期、解锁后每日释放比例只影响后续新批次；已有批次继续使用创建时的配置快照。
+          </div>
+        {% endif %}
+        <div class="stock-lock-form-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">{% if is_edit %}保存修改{% else %}创建配置{% endif %}</button>
+          <a href="/admin/stock-token-lock-configs" class="btn secondary admin-btn admin-btn-secondary">取消</a>
+        </div>
+      </form>
+    </div>
+  </section>
+{% endblock %}

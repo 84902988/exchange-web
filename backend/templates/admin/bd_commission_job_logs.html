@@ -1,0 +1,116 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}BD自动发放日志{% endblock %}
+{% block page_title %}BD自动发放日志{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看 BD 分佣自动发放任务执行结果；发放金额按 RCB / USDT 分组展示。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/bd/commissions" class="btn secondary admin-btn admin-btn-secondary">BD分佣记录</a>
+  <a href="/admin/bd/team" class="btn secondary admin-btn admin-btn-secondary">BD团队统计</a>
+{% endblock %}
+
+{% block content %}
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/bd/commission-job-logs" class="filter-form">
+        <div class="field">
+          <label for="start_date">开始日期</label>
+          <input id="start_date" type="date" name="start_date" value="{{ filters.start_date_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="end_date">结束日期</label>
+          <input id="end_date" type="date" name="end_date" value="{{ filters.end_date_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="SUCCESS" {% if filters.status == 'SUCCESS' %}selected{% endif %}>成功</option>
+            <option value="PARTIAL_FAILED" {% if filters.status == 'PARTIAL_FAILED' %}selected{% endif %}>部分失败</option>
+            <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/bd/commission-job-logs" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">任务执行记录</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>运行时间</th>
+                <th>状态</th>
+                <th>步骤</th>
+                <th class="text-right">处理数</th>
+                <th class="text-right">成功数</th>
+                <th class="text-right">失败数</th>
+                <th>按币种发放汇总</th>
+                <th>说明</th>
+                <th>错误</th>
+                <th>创建时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="mono nowrap admin-id">{{ item.id }}</td>
+                  <td class="nowrap admin-time">{{ item.run_time }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-info" title="{{ item.step }}">{{ item.step_label }}</span></td>
+                  <td class="text-right admin-number">{{ item.processed_count }}</td>
+                  <td class="text-right admin-number">{{ item.success_count }}</td>
+                  <td class="text-right admin-number">{{ item.failed_count }}</td>
+                  <td class="admin-amount">{{ item.paid_totals_text }}</td>
+                  <td>{{ item.message }}</td>
+                  <td>
+                    {% if item.error_message %}
+                      <details>
+                        <summary>查看错误</summary>
+                        <div class="mono admin-hash" title="{{ item.error_message }}">{{ item.error_message }}</div>
+                      </details>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
+                  <td class="nowrap admin-time">{{ item.created_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">当前筛选范围内暂无 BD 自动发放日志</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

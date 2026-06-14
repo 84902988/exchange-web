@@ -1,0 +1,58 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}归集批次详情{% endblock %}
+{% block page_title %}归集批次详情{% endblock %}
+
+{% block content %}
+  {% if batch %}
+    <section class="page-section">
+      <div class="table-card">
+        <div class="section-title">批次信息</div>
+        <table class="data-table admin-table">
+          <tbody>
+            <tr><th>ID</th><td>{{ batch.id }}</td><th>batch_no</th><td class="mono">{{ batch.batch_no }}</td></tr>
+            <tr><th>trigger</th><td>{{ batch.trigger_type }}</td><th>status</th><td><span class="admin-badge admin-badge-{{ batch.status_badge }}">{{ batch.status }}</span></td></tr>
+            <tr><th>chain/coin</th><td>{{ batch.chain_key }} / {{ batch.coin_symbol }}</td><th>target</th><td class="mono" title="{{ batch.target_address }}">{{ batch.target_address_short }}</td></tr>
+            <tr><th>tasks</th><td>{{ batch.total_tasks }} / {{ batch.success_tasks }} / {{ batch.failed_tasks }} / {{ batch.skipped_tasks }}</td><th>amount</th><td>{{ batch.total_amount }} / {{ batch.success_amount }}</td></tr>
+            <tr><th>created</th><td>{{ batch.created_at }}</td><th>finished</th><td>{{ batch.finished_at }}</td></tr>
+            <tr><th>error</th><td colspan="3">{{ batch.error_message }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="page-section">
+      <div class="table-card">
+        <div class="section-title">批次归集任务</div>
+        {% if tasks %}
+          <div class="table-wrap admin-table-wrap">
+            <table class="data-table admin-table">
+              <thead><tr><th>task_no</th><th>user</th><th>chain</th><th>coin</th><th>from</th><th>to</th><th class="text-right">amount</th><th>status</th><th>gas</th><th>tx</th><th>created_at</th></tr></thead>
+              <tbody>
+                {% for item in tasks %}
+                  <tr>
+                    <td class="mono nowrap">{{ item.task_no }}</td>
+                    <td class="mono">{{ item.user_id }}</td>
+                    <td class="mono">{{ item.chain_key }}</td>
+                    <td class="mono">{{ item.coin_symbol }}</td>
+                    <td class="mono nowrap" title="{{ item.from_address }}">{{ item.from_address_short }}</td>
+                    <td class="mono nowrap" title="{{ item.to_address }}">{{ item.to_address_short }}</td>
+                    <td class="mono text-right">{{ item.amount }}</td>
+                    <td><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status }}</span></td>
+                    <td class="mono">{{ item.gas_task_id }}</td>
+                    <td class="mono nowrap" title="{{ item.tx_hash }}">{{ item.tx_hash_short }}</td>
+                    <td class="nowrap">{{ item.created_at }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="empty-state admin-empty">该批次暂无归集任务</div>
+        {% endif %}
+      </div>
+    </section>
+  {% else %}
+    <section class="page-section"><div class="empty-state admin-empty">批次不存在</div></section>
+  {% endif %}
+{% endblock %}

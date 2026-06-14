@@ -1,0 +1,332 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}归集统计{% endblock %}
+{% block page_title %}归集统计{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看归集批次、任务结果、网络和币种归集统计。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .collection-ops-nav{display:flex;flex-wrap:wrap;gap:8px}
+    .collection-stat-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}
+    .collection-stat-card{background:linear-gradient(180deg,#181b22,#111318);border:1px solid rgba(148,163,184,.18);border-radius:8px;padding:14px;box-shadow:0 12px 28px rgba(0,0,0,.18)}
+    .collection-stat-label{color:#9ca3af;font-size:12px;font-weight:700}
+    .collection-stat-value{margin-top:8px;color:#f8fafc;font-size:21px;font-weight:900;font-variant-numeric:tabular-nums}
+    .collection-ops-table{font-size:13px}
+    .collection-ops-table th,.collection-ops-table td{padding:9px 10px;vertical-align:top}
+    .collection-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+    .collection-amount{font-variant-numeric:tabular-nums;white-space:nowrap}
+    .collection-amount-trigger{border:0;background:transparent;color:inherit;font:inherit;font-weight:900;padding:0;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
+    .collection-stat-card[data-amount-card]{cursor:pointer;transition:border-color .15s ease,background .15s ease,transform .15s ease}
+    .collection-stat-card[data-amount-card]:hover{border-color:rgba(255,96,56,.75);background:rgba(255,96,56,.08);transform:translateY(-1px)}
+    .collection-stat-card.is-empty{cursor:default}
+    .collection-stat-card.is-empty:hover{border-color:rgba(148,163,184,.18);background:linear-gradient(180deg,#181b22,#111318);transform:none}
+    .collection-stat-layout{display:grid;grid-template-columns:1fr;gap:14px}
+    .collection-filter-panel{padding:0;overflow:hidden}
+    .collection-filter-panel summary{list-style:none}
+    .collection-filter-panel summary::-webkit-details-marker{display:none}
+    .collection-filter-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;cursor:pointer}
+    .collection-filter-heading{display:flex;align-items:center;gap:8px;min-width:0}
+    .collection-filter-toggle{flex:0 0 auto}
+    .collection-filter-badge{display:inline-flex;align-items:center;border:1px solid rgba(245,158,11,.34);border-radius:999px;padding:2px 8px;color:#fbbf24;background:rgba(245,158,11,.1);font-size:12px;font-weight:800}
+    .collection-filter-body{border-top:1px solid rgba(148,163,184,.14);padding:14px 16px}
+    .collection-stat-table{width:100%;table-layout:fixed}
+    .collection-stat-table th,.collection-stat-table td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .collection-stat-table .num-cell{text-align:right}
+    .collection-stat-table .amount-cell{text-align:right}
+    .collection-stat-table .time-cell{max-width:120px}
+    .collection-batch-table .num-cell{text-align:right}
+    .collection-batch-table .amount-cell{text-align:right}
+    .collection-batch-id{display:inline-block;max-width:220px;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
+    @media (max-width:1280px){.collection-stat-grid{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}}
+    @media (max-width:760px){.collection-stat-layout{grid-template-columns:1fr}.collection-filter-summary{align-items:flex-start;flex-direction:column}.collection-stat-table{table-layout:auto}.collection-stat-table th,.collection-stat-table td{white-space:normal}}
+    .collection-amount-modal{position:fixed;inset:0;z-index:1200;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(0,0,0,.55)}
+    .collection-amount-modal.is-open{display:flex}
+    .collection-amount-dialog{width:min(520px,100%);border:1px solid var(--border,#e5e7eb);border-radius:8px;background:#14151b;color:#f8fafc;box-shadow:0 22px 70px rgba(0,0,0,.45);overflow:hidden}
+    .collection-amount-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid rgba(148,163,184,.22)}
+    .collection-amount-dialog-title{font-weight:900;font-size:16px}
+    .collection-amount-dialog-close{border:1px solid rgba(148,163,184,.24);border-radius:6px;background:rgba(255,255,255,.04);color:#f8fafc;min-width:32px;min-height:30px;cursor:pointer}
+    .collection-amount-dialog-body{padding:14px 16px}
+    .collection-amount-table{width:100%;border-collapse:collapse;table-layout:fixed}
+    .collection-amount-table th,.collection-amount-table td{padding:9px 8px;border-bottom:1px solid rgba(148,163,184,.18);text-align:left}
+    .collection-amount-table th{color:#9ca3af;font-size:12px;font-weight:900}
+    .collection-amount-table td{font-size:13px}
+    .collection-amount-dialog-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;color:#9ca3af;font-size:12px;font-weight:800}
+    .collection-amount-dialog-actions{display:flex;gap:6px}
+  </style>
+
+  <section class="page-section">
+    <div class="collection-ops-nav">
+      <a href="/admin/collections/center" class="btn secondary admin-btn admin-btn-secondary">归集中心</a>
+      <a href="/admin/collections/tasks" class="btn secondary admin-btn admin-btn-secondary">归集任务</a>
+      <a href="/admin/collections/batches" class="btn admin-btn admin-btn-primary">归集统计</a>
+      <a href="/admin/collections/auto-settings" class="btn secondary admin-btn admin-btn-secondary">自动归集规则</a>
+    </div>
+  </section>
+
+  {% if range_notice %}
+    <section class="page-section">
+      <div class="admin-alert admin-alert-warning">{{ range_notice }}</div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="collection-stat-grid">
+      <div class="collection-stat-card"><div class="collection-stat-label">今日归集批次</div><div class="collection-stat-value">{{ summary.today_batches or 0 }}</div></div>
+      <div class="collection-stat-card"><div class="collection-stat-label">今日归集任务</div><div class="collection-stat-value">{{ summary.today_task_count or 0 }}</div></div>
+      <div class="collection-stat-card"><div class="collection-stat-label">今日成功任务</div><div class="collection-stat-value">{{ summary.today_success or 0 }}</div></div>
+      <div class="collection-stat-card"><div class="collection-stat-label">今日失败任务</div><div class="collection-stat-value">{{ summary.today_failed or 0 }}</div></div>
+      <div class="collection-stat-card"><div class="collection-stat-label">处理中任务</div><div class="collection-stat-value">{{ summary.active_tasks or 0 }}</div></div>
+      <div class="collection-stat-card {% if not summary.today_amount_detail_items %}is-empty{% endif %}" {% if summary.today_amount_detail_items %}data-amount-card data-amount-title="今日归集金额明细" data-amount-items='{{ summary.today_amount_detail_items|default([])|tojson }}'{% endif %}>
+        <div class="collection-stat-label">今日归集金额</div>
+        <div class="collection-stat-value">{{ summary.today_amount_label or "-" }}</div>
+      </div>
+    </div>
+  </section>
+
+  {% set has_filters = filters.batch_no or filters.status or filters.chain_key or filters.coin_symbol or filters.trigger_type or filters.user_id or filters.address or filters.tx_hash or filters.created_from or filters.created_to %}
+  <section class="page-section">
+    <details class="filter-card collection-filter-panel">
+      <summary class="collection-filter-summary">
+        <span class="collection-filter-heading">
+          <span class="section-title">筛选归集统计</span>
+          {% if has_filters %}<span class="collection-filter-badge">已筛选</span>{% endif %}
+        </span>
+        <span class="btn secondary admin-btn admin-btn-secondary admin-btn-sm collection-filter-toggle">展开 / 收起</span>
+      </summary>
+      <div class="collection-filter-body">
+      <form method="get" action="/admin/collections/batches" class="filter-form">
+        <div class="field"><label for="batch_no">批次ID</label><input id="batch_no" name="batch_no" value="{{ filters.batch_no or '' }}" placeholder="输入批次编号" /></div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="PENDING" {% if filters.status == 'PENDING' %}selected{% endif %}>等待中</option>
+            <option value="PROCESSING" {% if filters.status == 'PROCESSING' %}selected{% endif %}>处理中</option>
+            <option value="SUCCESS" {% if filters.status == 'SUCCESS' %}selected{% endif %}>已完成</option>
+            <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
+            <option value="TIMEOUT" {% if filters.status == 'TIMEOUT' %}selected{% endif %}>超时</option>
+            <option value="CANCELED" {% if filters.status == 'CANCELED' %}selected{% endif %}>已取消</option>
+          </select>
+        </div>
+        <div class="field"><label for="chain_key">网络</label><input id="chain_key" name="chain_key" value="{{ filters.chain_key or '' }}" placeholder="bsc" /></div>
+        <div class="field"><label for="coin_symbol">币种</label><input id="coin_symbol" name="coin_symbol" value="{{ filters.coin_symbol or '' }}" placeholder="USDT" /></div>
+        <div class="field"><label for="user_id">用户ID</label><input id="user_id" name="user_id" value="{{ filters.user_id or '' }}" placeholder="用户ID" /></div>
+        <div class="field"><label for="address">地址</label><input id="address" name="address" value="{{ filters.address or '' }}" placeholder="来源或目标地址" /></div>
+        <div class="field"><label for="tx_hash">tx_hash</label><input id="tx_hash" name="tx_hash" value="{{ filters.tx_hash or '' }}" placeholder="链上交易哈希" /></div>
+        <div class="field"><label for="trigger_type">归集方式</label><input id="trigger_type" name="trigger_type" value="{{ filters.trigger_type or '' }}" placeholder="MANUAL" /></div>
+        <div class="field"><label for="created_from">开始日期</label><input id="created_from" type="date" name="created_from" value="{{ filters.created_from or '' }}" /></div>
+        <div class="field"><label for="created_to">结束日期</label><input id="created_to" type="date" name="created_to" value="{{ filters.created_to or '' }}" /></div>
+        <div class="filter-actions"><button type="submit" class="btn admin-btn admin-btn-primary">查询</button><a href="/admin/collections/batches" class="btn secondary admin-btn admin-btn-secondary">重置</a></div>
+      </form>
+      </div>
+    </details>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">最近归集批次</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table collection-ops-table collection-batch-table">
+            <thead>
+              <tr>
+                <th>批次ID</th><th>网络</th><th>币种</th><th class="num-cell">地址数</th><th class="num-cell">任务数</th><th class="num-cell">成功数</th><th class="num-cell">失败数</th>
+                <th class="amount-cell">归集金额</th><th>批次状态</th><th>创建时间</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="collection-mono nowrap admin-id"><span class="collection-batch-id" title="{{ item.batch_no }}">{{ item.batch_no }}</span></td>
+                  <td class="collection-mono">{{ item.chain_key }}</td>
+                  <td class="collection-mono">{{ item.coin_symbol_label or item.coin_symbol }}</td>
+                  <td class="collection-mono admin-number num-cell">{{ item.address_count }}</td>
+                  <td class="collection-mono admin-number num-cell">{{ item.task_count }}</td>
+                  <td class="collection-mono admin-number num-cell">{{ item.success_tasks }}</td>
+                  <td class="collection-mono admin-number num-cell">{{ item.failed_tasks }}</td>
+                  <td class="collection-mono collection-amount amount-cell">
+                    {% if item.total_amount_coin_count and item.total_amount_coin_count > 1 %}
+                      <button type="button" class="collection-amount-trigger" data-amount-card data-amount-title="归集金额明细" data-amount-items='{{ item.total_amount_detail_items|default([])|tojson }}'>{{ item.total_amount_label }}</button>
+                    {% else %}
+                      {{ item.total_amount_label }}
+                    {% endif %}
+                  </td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                  <td class="collection-mono nowrap admin-time">{{ item.created_at or "-" }}</td>
+                  <td><a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" href="/admin/collections/tasks?batch_id={{ item.id }}">查看任务</a></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无归集批次</div>
+      {% endif %}
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}<a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>{% endif %}
+          {% if pagination.page < pagination.pages %}<a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>{% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="collection-stat-layout">
+      <div class="table-card">
+        <div class="section-title">网络统计</div>
+        {% if network_stats %}
+          <table class="data-table admin-table collection-ops-table collection-stat-table">
+            <thead><tr><th>网络</th><th class="num-cell">任务数</th><th class="num-cell">成功数</th><th class="num-cell">失败数</th><th class="amount-cell">归集金额</th><th class="amount-cell">补 Gas 总金额</th><th class="time-cell">最近归集</th></tr></thead>
+            <tbody>
+              {% for item in network_stats %}
+                <tr>
+                  <td class="collection-mono" title="{{ item.chain_key or '-' }}">{{ item.chain_key or "-" }}</td>
+                  <td class="collection-mono num-cell">{{ item.task_count }}</td>
+                  <td class="collection-mono num-cell">{{ item.success_count }}</td>
+                  <td class="collection-mono num-cell">{{ item.failed_count }}</td>
+                  <td class="collection-mono collection-amount amount-cell">
+                    {% if item.amount_coin_count and item.amount_coin_count > 1 %}
+                      <button type="button" class="collection-amount-trigger" data-amount-card data-amount-title="归集金额明细" data-amount-items='{{ item.amount_detail_items|default([])|tojson }}'>{{ item.amount_label }}</button>
+                    {% else %}
+                      {{ item.amount_label }}
+                    {% endif %}
+                  </td>
+                  <td class="collection-mono collection-amount amount-cell">
+                    {% if item.gas_amount_coin_count and item.gas_amount_coin_count > 1 %}
+                      <button type="button" class="collection-amount-trigger" data-amount-card data-amount-title="补 Gas 金额明细" data-amount-items='{{ item.gas_amount_detail_items|default([])|tojson }}'>{{ item.gas_amount_label }}</button>
+                    {% else %}
+                      {{ item.gas_amount_label or "-" }}
+                    {% endif %}
+                  </td>
+                  <td class="collection-mono admin-time time-cell" title="{{ item.latest_collected_at or '-' }}">{{ item.latest_collected_at[5:16] if item.latest_collected_at and item.latest_collected_at|length >= 16 else (item.latest_collected_at or "-") }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty-state admin-empty">暂无网络统计</div>
+        {% endif %}
+      </div>
+
+      <div class="table-card">
+        <div class="section-title">币种统计</div>
+        {% if symbol_stats %}
+          <table class="data-table admin-table collection-ops-table collection-stat-table">
+            <thead><tr><th>币种</th><th class="num-cell">网络数</th><th class="num-cell">任务数</th><th class="num-cell">成功数</th><th class="num-cell">失败数</th><th class="amount-cell">总归集金额</th><th class="time-cell">最近归集</th></tr></thead>
+            <tbody>
+              {% for item in symbol_stats %}
+                <tr>
+                  <td class="collection-mono" title="{{ item.coin_symbol or '-' }}">{{ item.coin_symbol or "-" }}</td>
+                  <td class="collection-mono num-cell">{{ item.network_count }}</td>
+                  <td class="collection-mono num-cell">{{ item.task_count }}</td>
+                  <td class="collection-mono num-cell">{{ item.success_count }}</td>
+                  <td class="collection-mono num-cell">{{ item.failed_count }}</td>
+                  <td class="collection-mono collection-amount amount-cell">{{ item.amount_label }}</td>
+                  <td class="collection-mono admin-time time-cell" title="{{ item.latest_collected_at or '-' }}">{{ item.latest_collected_at[5:16] if item.latest_collected_at and item.latest_collected_at|length >= 16 else (item.latest_collected_at or "-") }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty-state admin-empty">暂无币种统计</div>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <div class="collection-amount-modal" id="collection-amount-modal" aria-hidden="true">
+    <div class="collection-amount-dialog" role="dialog" aria-modal="true" aria-labelledby="collection-amount-modal-title">
+      <div class="collection-amount-dialog-head">
+        <div class="collection-amount-dialog-title" id="collection-amount-modal-title">归集金额明细</div>
+        <button type="button" class="collection-amount-dialog-close" data-amount-modal-close aria-label="关闭">×</button>
+      </div>
+      <div class="collection-amount-dialog-body">
+        <table class="collection-amount-table">
+          <thead><tr><th>币种</th><th>金额</th></tr></thead>
+          <tbody id="collection-amount-modal-body"></tbody>
+        </table>
+        <div class="collection-amount-dialog-foot">
+          <div id="collection-amount-modal-page">共 0 个币种，第 1 / 1 页</div>
+          <div class="collection-amount-dialog-actions">
+            <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-amount-prev>上一页</button>
+            <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-amount-next>下一页</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function(){
+      const modal = document.getElementById("collection-amount-modal");
+      const title = document.getElementById("collection-amount-modal-title");
+      const body = document.getElementById("collection-amount-modal-body");
+      const pageNode = document.getElementById("collection-amount-modal-page");
+      const prev = document.querySelector("[data-amount-prev]");
+      const next = document.querySelector("[data-amount-next]");
+      const pageSize = 10;
+      let items = [];
+      let page = 1;
+      function normalize(raw){
+        return (Array.isArray(raw) ? raw : []).filter((item) => item && (item.coin_symbol || item.symbol) && (item.amount_label || item.amount));
+      }
+      function render(){
+        if(!body || !pageNode){ return; }
+        const total = items.length;
+        const pages = Math.max(1, Math.ceil(total / pageSize));
+        page = Math.min(Math.max(1, page), pages);
+        const current = items.slice((page - 1) * pageSize, page * pageSize);
+        body.innerHTML = "";
+        current.forEach((item) => {
+          const row = document.createElement("tr");
+          const symbolCell = document.createElement("td");
+          const amountCell = document.createElement("td");
+          symbolCell.className = "collection-mono";
+          amountCell.className = "collection-mono";
+          symbolCell.textContent = item.coin_symbol || item.symbol || "-";
+          amountCell.textContent = item.amount_label || ((item.amount || "-") + " " + (item.coin_symbol || item.symbol || "")).trim();
+          row.appendChild(symbolCell);
+          row.appendChild(amountCell);
+          body.appendChild(row);
+        });
+        pageNode.textContent = "共 " + total + " 个币种，第 " + page + " / " + pages + " 页";
+        if(prev){ prev.disabled = total <= pageSize || page <= 1; }
+        if(next){ next.disabled = total <= pageSize || page >= pages; }
+      }
+      function openAmountModal(modalTitle, rawItems){
+        items = normalize(rawItems);
+        if(!items.length){ return; }
+        page = 1;
+        if(title){ title.textContent = modalTitle || "归集金额明细"; }
+        render();
+        if(modal){ modal.classList.add("is-open"); modal.setAttribute("aria-hidden", "false"); }
+      }
+      function closeAmountModal(){
+        if(modal){ modal.classList.remove("is-open"); modal.setAttribute("aria-hidden", "true"); }
+      }
+      document.querySelectorAll("[data-amount-card]").forEach((node) => {
+        node.addEventListener("click", () => {
+          let parsed = [];
+          try { parsed = JSON.parse(node.getAttribute("data-amount-items") || "[]"); } catch (err) { parsed = []; }
+          openAmountModal(node.getAttribute("data-amount-title") || "归集金额明细", parsed);
+        });
+      });
+      document.querySelectorAll(".collection-filter-panel").forEach((panel) => {
+        const toggle = panel.querySelector(".collection-filter-toggle");
+        const sync = () => {
+          if(toggle){ toggle.textContent = panel.open ? "收起" : "展开"; }
+        };
+        panel.addEventListener("toggle", sync);
+        sync();
+      });
+      document.querySelectorAll("[data-amount-modal-close]").forEach((node) => node.addEventListener("click", closeAmountModal));
+      if(modal){ modal.addEventListener("click", (event) => { if(event.target === modal){ closeAmountModal(); } }); }
+      if(prev){ prev.addEventListener("click", () => { page -= 1; render(); }); }
+      if(next){ next.addEventListener("click", () => { page += 1; render(); }); }
+      document.addEventListener("keydown", (event) => { if(event.key === "Escape"){ closeAmountModal(); } });
+    })();
+  </script>
+{% endblock %}

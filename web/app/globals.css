@@ -1,0 +1,143 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body {
+  height: 100%;
+  overflow-x: hidden;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: #f4f4f5;
+  color: #111827;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+}
+
+html:has(.vip-page-shell),
+body:has(.vip-page-shell) {
+  height: auto;
+  min-height: 100%;
+}
+
+@keyframes marquee {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.animate-marquee {
+  display: flex;
+  width: max-content;
+  animation: marquee 30s linear infinite;
+}
+
+.animate-marquee > * {
+  white-space: nowrap;
+}
+
+/* Global exchange-style scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+*:hover {
+  scrollbar-color: rgba(148, 163, 184, 0.34) transparent;
+}
+
+*:active {
+  scrollbar-color: rgba(148, 163, 184, 0.5) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border: 2px solid transparent;
+  border-radius: 9999px;
+  background-clip: padding-box;
+  transition:
+    background-color 0.18s ease,
+    border-color 0.18s ease;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.34);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(148, 163, 184, 0.46);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background-color: rgba(148, 163, 184, 0.62);
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Opt-in dark scrollbar utility */
+.dark-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.34) transparent;
+}
+
+.dark-scrollbar:hover {
+  scrollbar-color: rgba(148, 163, 184, 0.46) transparent;
+}
+
+.dark-scrollbar:active {
+  scrollbar-color: rgba(148, 163, 184, 0.62) transparent;
+}
+
+.dark-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.dark-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.dark-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.34);
+  border: 2px solid transparent;
+  border-radius: 9999px;
+  background-clip: padding-box;
+}
+
+.dark-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(148, 163, 184, 0.46);
+}
+
+.dark-scrollbar::-webkit-scrollbar-thumb:active {
+  background-color: rgba(148, 163, 184, 0.62);
+}
+
+/* Fully hide scrollbar but preserve scrolling */
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}

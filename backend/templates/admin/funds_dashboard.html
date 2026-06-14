@@ -1,0 +1,373 @@
+{% extends "admin/layout.html" %}
+
+{% set fd = funds_dashboard|default({}) %}
+
+{% block title %}资金驾驶舱{% endblock %}
+{% block page_title %}资金驾驶舱{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">财务、资金运营与出金审核专用视图。数据更新时间：{{ fd.as_of }}</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .funds-dashboard{
+      display:grid;
+      gap:16px;
+      min-width:0;
+    }
+    .funds-kpi-grid{
+      display:grid;
+      grid-template-columns:repeat(6, minmax(0, 1fr));
+      gap:12px;
+      min-width:0;
+    }
+    .funds-kpi{
+      min-width:0;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:10px;
+      background:rgba(255,255,255,.032);
+      padding:14px;
+      box-shadow:var(--shadow);
+    }
+    .funds-kpi.tone-success{ border-color:rgba(49,177,119,.22); background:rgba(31,122,85,.08); }
+    .funds-kpi.tone-warning{ border-color:rgba(227,171,57,.25); background:rgba(189,134,25,.09); }
+    .funds-kpi.tone-danger{ border-color:rgba(216,89,89,.28); background:rgba(177,52,52,.11); }
+    .funds-kpi.tone-info{ border-color:rgba(80,145,220,.24); background:rgba(80,145,220,.08); }
+    .funds-kpi-label{
+      color:rgba(255,255,255,.62);
+      font-size:12px;
+      font-weight:800;
+    }
+    .funds-kpi-value{
+      margin-top:10px;
+      color:#fff;
+      font-size:20px;
+      line-height:1.15;
+      font-weight:950;
+      font-variant-numeric:tabular-nums;
+      word-break:break-word;
+    }
+    .funds-kpi-note{
+      margin-top:8px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.35;
+    }
+    .funds-section{
+      display:grid;
+      gap:10px;
+      min-width:0;
+    }
+    .funds-section-head{
+      display:flex;
+      align-items:flex-end;
+      justify-content:space-between;
+      gap:12px;
+      min-width:0;
+    }
+    .funds-section-title{
+      margin:0;
+      color:#fff;
+      font-size:15px;
+      font-weight:900;
+    }
+    .funds-section-note{
+      margin-top:4px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .funds-panel{
+      border:1px solid var(--border);
+      border-radius:12px;
+      background:linear-gradient(180deg, var(--panel-strong), var(--panel));
+      box-shadow:var(--shadow);
+      padding:14px;
+      min-width:0;
+    }
+    .funds-table-wrap{
+      overflow-x:auto;
+      min-width:0;
+    }
+    .funds-table{
+      width:100%;
+      min-width:760px;
+      border-collapse:collapse;
+    }
+    .funds-table th,
+    .funds-table td{
+      padding:10px 9px;
+      border-bottom:1px solid rgba(255,255,255,.08);
+      text-align:left;
+      font-size:12px;
+      vertical-align:middle;
+      white-space:nowrap;
+      font-variant-numeric:tabular-nums;
+    }
+    .funds-table th{
+      color:rgba(255,255,255,.55);
+      font-weight:900;
+      background:rgba(255,255,255,.025);
+    }
+    .funds-table td{
+      color:rgba(255,255,255,.78);
+    }
+    .funds-table tr:last-child td{
+      border-bottom:0;
+    }
+    .funds-risk-text{
+      color:#ffb4b4 !important;
+      font-weight:900;
+    }
+    .funds-two-col{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0, 1fr));
+      gap:14px;
+      min-width:0;
+    }
+    .funds-status-grid{
+      display:grid;
+      grid-template-columns:repeat(5, minmax(0, 1fr));
+      gap:10px;
+    }
+    .funds-status-card{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      min-width:0;
+      padding:12px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:10px;
+      background:rgba(255,255,255,.03);
+      color:inherit;
+      text-decoration:none;
+    }
+    .funds-status-card:hover{
+      border-color:rgba(255,255,255,.18);
+      background:rgba(255,255,255,.05);
+      text-decoration:none;
+    }
+    .funds-status-label{
+      color:#fff;
+      font-size:13px;
+      font-weight:900;
+    }
+    .funds-status-value{
+      color:#fff;
+      font-size:18px;
+      font-weight:950;
+      font-variant-numeric:tabular-nums;
+    }
+    .funds-empty{
+      padding:18px 0;
+      color:var(--muted);
+      text-align:center;
+      font-size:13px;
+    }
+    @media (max-width:1360px){
+      .funds-kpi-grid{ grid-template-columns:repeat(3, minmax(0, 1fr)); }
+      .funds-status-grid{ grid-template-columns:repeat(3, minmax(0, 1fr)); }
+    }
+    @media (max-width:900px){
+      .funds-kpi-grid,
+      .funds-two-col,
+      .funds-status-grid{ grid-template-columns:1fr; }
+    }
+  </style>
+
+  <div class="funds-dashboard">
+    <section class="funds-kpi-grid">
+      {% for item in fd.core_metrics|default([]) %}
+        <div class="funds-kpi tone-{{ item.tone }}">
+          <div class="funds-kpi-label">{{ item.label }}</div>
+          <div class="funds-kpi-value">{{ item.value }}</div>
+          <div class="funds-kpi-note">{{ item.note }}</div>
+        </div>
+      {% endfor %}
+    </section>
+
+    <section class="funds-section">
+      <div class="funds-section-head">
+        <div>
+          <h2 class="funds-section-title">今日资金流向</h2>
+          <div class="funds-section-note">按币种分别统计，不做跨币种折算；净流入 = 今日充值 - 今日成功提现。</div>
+        </div>
+      </div>
+      <div class="funds-panel admin-card">
+        {% if fd.flow_rows %}
+          <div class="funds-table-wrap admin-table-wrap">
+            <table class="funds-table admin-table">
+              <thead>
+                <tr>
+                  <th>币种</th>
+                  <th>充值金额</th>
+                  <th>充值笔数</th>
+                  <th>提现金额</th>
+                  <th>提现笔数</th>
+                  <th>处理中提现</th>
+                  <th>处理中笔数</th>
+                  <th>净流入</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in fd.flow_rows %}
+                  <tr>
+                    <td><span class="admin-badge admin-badge-secondary">{{ row.coin_symbol }}</span></td>
+                    <td>{{ row.deposit_amount }}</td>
+                    <td>{{ row.deposit_count }}</td>
+                    <td>{{ row.withdraw_amount }}</td>
+                    <td>{{ row.withdraw_count }}</td>
+                    <td>{{ row.pending_amount }}</td>
+                    <td>{{ row.pending_count }}</td>
+                    <td class="{% if row.net_negative %}funds-risk-text{% endif %}">{{ row.net_amount }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="funds-empty">今日暂无充值或提现资金流向。</div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="funds-section">
+      <div class="funds-section-head">
+        <div>
+          <h2 class="funds-section-title">平台资产</h2>
+          <div class="funds-section-note">平台账户余额快照；昨日快照不存在时显示 --。</div>
+        </div>
+      </div>
+      <div class="funds-panel admin-card">
+        {% if fd.platform_assets %}
+          <div class="funds-table-wrap admin-table-wrap">
+            <table class="funds-table admin-table">
+              <thead>
+                <tr>
+                  <th>币种</th>
+                  <th>平台余额</th>
+                  <th>冻结余额</th>
+                  <th>较昨日变化</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in fd.platform_assets %}
+                  <tr>
+                    <td><span class="admin-badge admin-badge-secondary">{{ row.coin_symbol }}</span></td>
+                    <td>{{ row.available_amount }}</td>
+                    <td>{{ row.frozen_amount }}</td>
+                    <td>{{ row.yesterday_change }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="funds-empty">暂无平台账户余额数据。</div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="funds-two-col">
+      <div class="funds-section">
+        <div class="funds-section-head">
+          <div>
+            <h2 class="funds-section-title">充值 TOP10</h2>
+            <div class="funds-section-note">今日成功到账记录，按金额倒序。</div>
+          </div>
+        </div>
+        <div class="funds-panel admin-card">
+          {% if fd.deposit_top %}
+            <div class="funds-table-wrap admin-table-wrap">
+              <table class="funds-table admin-table">
+                <thead>
+                  <tr>
+                    <th>用户</th>
+                    <th>币种</th>
+                    <th>金额</th>
+                    <th>时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in fd.deposit_top %}
+                    <tr>
+                      <td>{{ row.user_id }}</td>
+                      <td><span class="admin-badge admin-badge-secondary">{{ row.coin_symbol }}</span></td>
+                      <td>{{ row.amount }}</td>
+                      <td>{{ row.created_at }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <div class="funds-empty">今日暂无成功充值。</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="funds-section">
+        <div class="funds-section-head">
+          <div>
+            <h2 class="funds-section-title">提现 TOP10</h2>
+            <div class="funds-section-note">今日提现记录，按金额倒序。</div>
+          </div>
+        </div>
+        <div class="funds-panel admin-card">
+          {% if fd.withdraw_top %}
+            <div class="funds-table-wrap admin-table-wrap">
+              <table class="funds-table admin-table">
+                <thead>
+                  <tr>
+                    <th>用户</th>
+                    <th>币种</th>
+                    <th>金额</th>
+                    <th>状态</th>
+                    <th>时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in fd.withdraw_top %}
+                    <tr>
+                      <td>{{ row.user_id }}</td>
+                      <td><span class="admin-badge admin-badge-secondary">{{ row.coin_symbol }}</span></td>
+                      <td>{{ row.amount }}</td>
+                      <td><span class="admin-badge admin-badge-neutral">{{ row.status }}</span></td>
+                      <td>{{ row.created_at }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <div class="funds-empty">今日暂无提现记录。</div>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
+    <section class="funds-section">
+      <div class="funds-section-head">
+        <div>
+          <h2 class="funds-section-title">提现运营中心</h2>
+          <div class="funds-section-note">当前状态快照，点击进入对应审核或提现记录页面。</div>
+        </div>
+      </div>
+      <div class="funds-panel admin-card">
+        <div class="funds-status-grid">
+          {% for item in fd.withdraw_status_cards|default([]) %}
+            <a class="funds-status-card" href="{{ item.href }}">
+              <div>
+                <div class="funds-status-label">{{ item.label }}</div>
+                <div class="funds-section-note">当前待处理</div>
+              </div>
+              <div>
+                <span class="admin-badge admin-badge-{{ item.badge }}">{{ item.count_text }}</span>
+              </div>
+            </a>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+  </div>
+{% endblock %}

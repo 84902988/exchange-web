@@ -1,0 +1,7 @@
+{
+  "name": "tinymce-vendor",
+  "version": "6.8.5",
+  "source": "https://cdnjs.com/libraries/tinymce/6.8.5",
+  "vendoredAt": "2026-05-22T13:27:49.192Z",
+  "note": "Self-hosted TinyMCE community assets for the admin announcement editor."
+}

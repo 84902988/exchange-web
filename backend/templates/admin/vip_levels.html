@@ -1,0 +1,83 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}VIP 等级{% endblock %}
+{% block page_title %}VIP 等级{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">等级规则总览。本页用于统计、核对和运营查看；规则修改请到 <a href="/admin/dividend-config">分红配置</a>。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .vip-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
+    .vip-stat-card{padding:14px 16px}
+    .vip-stat-label{color:var(--muted);font-size:12px;margin-bottom:8px}
+    .vip-stat-value{font-size:22px;font-weight:900;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .vip-filter-form{grid-template-columns:repeat(3,minmax(0,1fr)) auto}
+    .vip-table{min-width:0;table-layout:fixed}
+    .vip-cell{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .vip-number{font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
+    @media (max-width:1180px){.vip-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.vip-filter-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media (max-width:720px){.vip-stat-grid,.vip-filter-form{grid-template-columns:1fr}.vip-table{min-width:760px}}
+  </style>
+
+  <section class="page-section">
+    <div class="vip-stat-grid">
+      <div class="admin-card vip-stat-card"><div class="vip-stat-label">启用等级数</div><div class="vip-stat-value vip-number">{{ stats.enabled_level_count }}</div></div>
+      <div class="admin-card vip-stat-card"><div class="vip-stat-label">VIP等级数</div><div class="vip-stat-value vip-number">{{ stats.vip_level_count }}</div></div>
+      <div class="admin-card vip-stat-card"><div class="vip-stat-label">SVIP等级数</div><div class="vip-stat-value vip-number">{{ stats.svip_level_count }}</div></div>
+      <div class="admin-card vip-stat-card"><div class="vip-stat-label">当前最高等级</div><div class="vip-stat-value">{{ stats.highest_level }}</div></div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card admin-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/vip/levels" class="filter-form vip-filter-form">
+        <div class="field"><label for="vip_type">类型</label><input id="vip_type" name="vip_type" value="{{ filters.vip_type or '' }}" placeholder="VIP / SVIP" /></div>
+        <div class="field"><label for="level_code">等级代码</label><input id="level_code" name="level_code" value="{{ filters.level_code or '' }}" placeholder="VIP0" /></div>
+        <div class="field"><label for="is_enabled">启用</label><input id="is_enabled" name="is_enabled" value="{{ filters.is_enabled or '' }}" placeholder="1 / 0" /></div>
+        <div class="filter-actions"><button type="submit" class="btn admin-btn admin-btn-primary">查询</button><a href="/admin/vip/levels" class="btn secondary admin-btn admin-btn-secondary">重置</a></div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card admin-card">
+      <div class="section-title">等级规则总览</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table vip-table">
+            <colgroup><col style="width:7%"><col style="width:9%"><col style="width:11%"><col style="width:12%"><col style="width:10%"><col style="width:10%"><col style="width:8%"><col style="width:8%"><col style="width:8%"><col style="width:8%"><col style="width:9%"></colgroup>
+            <thead><tr><th>类型</th><th>等级</th><th>名称</th><th class="text-right">30日交易量</th><th class="text-right">RCB持有</th><th class="text-right">锁仓量</th><th class="text-right">锁仓天数</th><th class="text-right">分红比例</th><th class="text-right">maker费率</th><th class="text-right">taker费率</th><th>状态</th></tr></thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="mono"><div class="vip-cell">{{ item.vip_type }}</div></td>
+                  <td class="mono"><div class="vip-cell">{{ item.level_code }}</div></td>
+                  <td><div class="vip-cell" title="{{ item.level_name }}">{{ item.level_name }}</div></td>
+                  <td class="admin-amount"><div class="vip-cell">{{ item.min_30d_volume }}</div></td>
+                  <td class="admin-amount"><div class="vip-cell">{{ item.min_rcb_hold }}</div></td>
+                  <td class="admin-amount"><div class="vip-cell">{{ item.min_lock_amount }}</div></td>
+                  <td class="text-right vip-number"><div class="vip-cell">{{ item.lock_period_days }}</div></td>
+                  <td class="text-right vip-number"><div class="vip-cell">{{ item.dividend_rate }}</div></td>
+                  <td class="text-right vip-number"><div class="vip-cell">{{ item.spot_maker_fee }}</div></td>
+                  <td class="text-right vip-number"><div class="vip-cell">{{ item.spot_taker_fee }}</div></td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无数据</div><p class="admin-empty-desc">暂无 VIP 等级配置</p></div>
+      {% endif %}
+      <div class="pagination admin-pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}<a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>{% endif %}
+          {% if pagination.page < pagination.pages %}<a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>{% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

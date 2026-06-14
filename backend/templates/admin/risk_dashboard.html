@@ -1,0 +1,451 @@
+{% extends "admin/layout.html" %}
+
+{% set rd = risk_dashboard|default({}) %}
+
+{% block title %}风控驾驶舱{% endblock %}
+{% block page_title %}风控驾驶舱{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">提现异常、Dealer 风控、合约风险、任务失败与资金关注项集中视图。数据更新时间：{{ rd.as_of }}</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .risk-dashboard{
+      display:grid;
+      gap:16px;
+      min-width:0;
+    }
+    .risk-kpi-grid{
+      display:grid;
+      grid-template-columns:repeat(6, minmax(0, 1fr));
+      gap:12px;
+      min-width:0;
+    }
+    .risk-kpi{
+      min-width:0;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:10px;
+      background:rgba(255,255,255,.032);
+      padding:14px;
+      box-shadow:var(--shadow);
+    }
+    .risk-kpi.tone-success{ border-color:rgba(49,177,119,.22); background:rgba(31,122,85,.08); }
+    .risk-kpi.tone-warning{ border-color:rgba(227,171,57,.25); background:rgba(189,134,25,.09); }
+    .risk-kpi.tone-danger{ border-color:rgba(216,89,89,.28); background:rgba(177,52,52,.11); }
+    .risk-kpi-label{
+      color:rgba(255,255,255,.62);
+      font-size:12px;
+      font-weight:800;
+    }
+    .risk-kpi-value{
+      margin-top:10px;
+      color:#fff;
+      font-size:20px;
+      line-height:1.15;
+      font-weight:950;
+      font-variant-numeric:tabular-nums;
+      word-break:break-word;
+    }
+    .risk-kpi-note{
+      margin-top:8px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.35;
+    }
+    .risk-section{
+      display:grid;
+      gap:10px;
+      min-width:0;
+    }
+    .risk-section-head{
+      display:flex;
+      align-items:flex-end;
+      justify-content:space-between;
+      gap:12px;
+      min-width:0;
+    }
+    .risk-section-title{
+      margin:0;
+      color:#fff;
+      font-size:15px;
+      font-weight:900;
+    }
+    .risk-section-note{
+      margin-top:4px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .risk-panel{
+      border:1px solid var(--border);
+      border-radius:12px;
+      background:linear-gradient(180deg, var(--panel-strong), var(--panel));
+      box-shadow:var(--shadow);
+      padding:14px;
+      min-width:0;
+    }
+    .risk-table-wrap{
+      overflow-x:auto;
+      min-width:0;
+    }
+    .risk-table{
+      width:100%;
+      min-width:760px;
+      border-collapse:collapse;
+    }
+    .risk-table th,
+    .risk-table td{
+      padding:10px 9px;
+      border-bottom:1px solid rgba(255,255,255,.08);
+      text-align:left;
+      font-size:12px;
+      vertical-align:middle;
+      white-space:nowrap;
+      font-variant-numeric:tabular-nums;
+    }
+    .risk-table th{
+      color:rgba(255,255,255,.55);
+      font-weight:900;
+      background:rgba(255,255,255,.025);
+    }
+    .risk-table td{
+      color:rgba(255,255,255,.78);
+    }
+    .risk-table tr:last-child td{
+      border-bottom:0;
+    }
+    .risk-two-col{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0, 1fr));
+      gap:14px;
+      min-width:0;
+    }
+    .risk-mini-grid{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(0, 1fr));
+      gap:10px;
+      margin-bottom:12px;
+    }
+    .risk-mini-card{
+      min-width:0;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:10px;
+      background:rgba(255,255,255,.03);
+      padding:12px;
+    }
+    .risk-mini-label{
+      color:rgba(255,255,255,.6);
+      font-size:12px;
+      font-weight:800;
+    }
+    .risk-mini-value{
+      margin-top:8px;
+      color:#fff;
+      font-size:16px;
+      font-weight:950;
+      font-variant-numeric:tabular-nums;
+      word-break:break-word;
+    }
+    .risk-empty{
+      padding:18px 0;
+      color:var(--muted);
+      text-align:center;
+      font-size:13px;
+    }
+    @media (max-width:1360px){
+      .risk-kpi-grid{ grid-template-columns:repeat(3, minmax(0, 1fr)); }
+      .risk-mini-grid{ grid-template-columns:repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width:980px){
+      .risk-kpi-grid,
+      .risk-two-col,
+      .risk-mini-grid{ grid-template-columns:1fr; }
+    }
+  </style>
+
+  <div class="risk-dashboard">
+    <section class="risk-kpi-grid">
+      {% for item in rd.core_metrics|default([]) %}
+        <div class="risk-kpi tone-{{ item.tone }}">
+          <div class="risk-kpi-label">{{ item.label }}</div>
+          <div class="risk-kpi-value">{{ item.value }}</div>
+          <div class="risk-kpi-note">{{ item.note }}</div>
+        </div>
+      {% endfor %}
+    </section>
+
+    <section class="risk-section">
+      <div class="risk-section-head">
+        <div>
+          <h2 class="risk-section-title">提现风控</h2>
+          <div class="risk-section-note">提现状态与预检失败聚合，金额仅按原币种字段展示，不跨币种折算。</div>
+        </div>
+      </div>
+      <div class="risk-panel admin-card">
+        {% if rd.withdraw_risks %}
+          <div class="risk-table-wrap admin-table-wrap">
+            <table class="risk-table admin-table">
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>数量</th>
+                  <th>金额</th>
+                  <th>最近时间</th>
+                  <th>入口</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in rd.withdraw_risks %}
+                  <tr>
+                    <td><span class="admin-badge admin-badge-{{ row.badge }}">{{ row.status }}</span></td>
+                    <td>{{ row.count }}</td>
+                    <td>{{ row.amount }}{% if row.amount_note %}<div class="risk-section-note">{{ row.amount_note }}</div>{% endif %}</td>
+                    <td>{{ row.latest_at }}</td>
+                    <td><a class="admin-btn admin-btn-sm admin-btn-secondary" href="{{ row.href }}">查看</a></td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="risk-empty">暂无提现风控数据。</div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="risk-two-col">
+      <div class="risk-section">
+        <div class="risk-section-head">
+          <div>
+            <h2 class="risk-section-title">Dealer 风控</h2>
+            <div class="risk-section-note">按今日命中类型聚合，表不存在时自动降级为空。</div>
+          </div>
+        </div>
+        <div class="risk-panel admin-card">
+          {% if rd.dealer_risks %}
+            <div class="risk-table-wrap admin-table-wrap">
+              <table class="risk-table admin-table">
+                <thead>
+                  <tr>
+                    <th>风控类型</th>
+                    <th>命中次数</th>
+                    <th>涉及用户数</th>
+                    <th>最近命中时间</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in rd.dealer_risks %}
+                    <tr>
+                      <td>{{ row.risk_type }}</td>
+                      <td>{{ row.hit_count }}</td>
+                      <td>{{ row.user_count }}</td>
+                      <td>{{ row.latest_at }}</td>
+                      <td><span class="admin-badge admin-badge-{{ row.badge }}">{{ row.status }}</span></td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <div class="risk-empty">今日暂无 Dealer 风控命中。</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="risk-section">
+        <div class="risk-section-head">
+          <div>
+            <h2 class="risk-section-title">合约风险</h2>
+            <div class="risk-section-note">强平记录与当前风险持仓快照；TP/SL 异常 V1 暂无可靠字段。</div>
+          </div>
+        </div>
+        <div class="risk-panel admin-card">
+          <div class="risk-mini-grid">
+            <div class="risk-mini-card"><div class="risk-mini-label">今日强平数</div><div class="risk-mini-value">{{ rd.contract_risk.liquidation_count }}</div></div>
+            <div class="risk-mini-card"><div class="risk-mini-label">强平名义金额</div><div class="risk-mini-value">{{ rd.contract_risk.liquidation_notional }}</div></div>
+            <div class="risk-mini-card"><div class="risk-mini-label">当前风险持仓数</div><div class="risk-mini-value">{{ rd.contract_risk.risk_position_count }}</div></div>
+            <div class="risk-mini-card"><div class="risk-mini-label">TP/SL 触发异常</div><div class="risk-mini-value">{{ rd.contract_risk.tp_sl_exception_count }}</div></div>
+          </div>
+          {% if rd.contract_risk.recent_liquidations %}
+            <div class="risk-table-wrap admin-table-wrap">
+              <table class="risk-table admin-table">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>用户</th>
+                    <th>品种</th>
+                    <th>方向</th>
+                    <th>名义金额</th>
+                    <th>状态</th>
+                    <th>时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in rd.contract_risk.recent_liquidations %}
+                    <tr>
+                      <td>{{ row.id }}</td>
+                      <td>{{ row.user_id }}</td>
+                      <td><span class="admin-badge admin-badge-info">{{ row.symbol }}</span></td>
+                      <td>{{ row.side }}</td>
+                      <td>{{ row.notional }}</td>
+                      <td>{{ row.status }}</td>
+                      <td>{{ row.created_at }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <div class="risk-empty">今日暂无强平记录。</div>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
+    <section class="risk-section">
+      <div class="risk-section-head">
+        <div>
+          <h2 class="risk-section-title">任务异常</h2>
+          <div class="risk-section-note">RQ 队列与业务任务状态聚合，只读展示，不提供重试或清理操作。</div>
+        </div>
+      </div>
+      <div class="risk-panel admin-card">
+        {% if rd.task_rows %}
+          <div class="risk-table-wrap admin-table-wrap">
+            <table class="risk-table admin-table">
+              <thead>
+                <tr>
+                  <th>队列/任务</th>
+                  <th>failed 数量</th>
+                  <th>待处理数量</th>
+                  <th>最近失败时间</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in rd.task_rows %}
+                  <tr>
+                    <td>{{ row.name }}</td>
+                    <td>{{ row.failed_count }}</td>
+                    <td>{{ row.pending_count }}</td>
+                    <td>{{ row.latest_failed_at }}</td>
+                    <td><span class="admin-badge admin-badge-{{ row.badge }}">{{ row.status }}</span></td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="risk-empty">暂无任务状态数据，可能 Redis 未连接或队列未接入。</div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="risk-section">
+      <div class="risk-section-head">
+        <div>
+          <h2 class="risk-section-title">资金关注项</h2>
+          <div class="risk-section-note">以下为运营关注项，不代表已确认风险；不做跨币种折算。</div>
+        </div>
+      </div>
+      <div class="risk-two-col">
+        <div class="risk-panel admin-card">
+          <h3 class="risk-section-title">今日负数大额流水 Top 10</h3>
+          {% if rd.fund_attention.large_negative_rows %}
+            <div class="risk-table-wrap admin-table-wrap">
+              <table class="risk-table admin-table">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>用户</th>
+                    <th>币种</th>
+                    <th>类型</th>
+                    <th>金额</th>
+                    <th>时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in rd.fund_attention.large_negative_rows %}
+                    <tr>
+                      <td>{{ row.id }}</td>
+                      <td>{{ row.user_id }}</td>
+                      <td>{{ row.coin_symbol }}</td>
+                      <td>{{ row.change_type }}</td>
+                      <td>{{ row.amount }}</td>
+                      <td>{{ row.created_at }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <div class="risk-empty">今日暂无负数大额流水。</div>
+          {% endif %}
+        </div>
+
+        <div class="risk-panel admin-card">
+          <h3 class="risk-section-title">今日频繁资金变动用户 Top 10</h3>
+          {% if rd.fund_attention.frequent_users %}
+            <div class="risk-table-wrap admin-table-wrap">
+              <table class="risk-table admin-table">
+                <thead>
+                  <tr>
+                    <th>用户</th>
+                    <th>变动次数</th>
+                    <th>涉及币种数</th>
+                    <th>最近时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in rd.fund_attention.frequent_users %}
+                    <tr>
+                      <td>{{ row.user_id }}</td>
+                      <td>{{ row.change_count }}</td>
+                      <td>{{ row.coin_count }}</td>
+                      <td>{{ row.latest_at }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <div class="risk-empty">今日暂无频繁资金变动用户。</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="risk-panel admin-card">
+        <div class="risk-section-head">
+          <div>
+            <h3 class="risk-section-title">今日调账概览</h3>
+            <div class="risk-section-note">今日调账记录数：{{ rd.fund_attention.adjustment_count }}</div>
+          </div>
+        </div>
+        {% if rd.fund_attention.adjustment_rows %}
+          <div class="risk-table-wrap admin-table-wrap">
+            <table class="risk-table admin-table">
+              <thead>
+                <tr>
+                  <th>币种</th>
+                  <th>平台调账金额</th>
+                  <th>调账笔数</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in rd.fund_attention.adjustment_rows %}
+                  <tr>
+                    <td><span class="admin-badge admin-badge-secondary">{{ row.coin_symbol }}</span></td>
+                    <td>{{ row.amount }}</td>
+                    <td>{{ row.count }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="risk-empty">今日暂无平台调账记录。</div>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+{% endblock %}

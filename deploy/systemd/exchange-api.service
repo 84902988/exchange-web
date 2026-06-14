@@ -1,0 +1,17 @@
+[Unit]
+Description=Exchange FastAPI API
+After=network-online.target redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/exchange-web/backend
+EnvironmentFile=/opt/exchange-web/backend/.env
+User=exchange
+Group=exchange
+ExecStart=/opt/exchange-web/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --access-log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

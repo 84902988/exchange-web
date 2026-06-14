@@ -1,0 +1,440 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}归集高级工具{% endblock %}
+{% block page_title %}归集高级工具{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">用于运营排查单个地址的链上余额，不作为归集中心主入口。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .collection-tools-page{display:grid;gap:12px}
+    .collection-tools-panel{border:1px solid var(--border);border-radius:8px;background:linear-gradient(145deg,rgba(255,255,255,.055),rgba(255,255,255,.025));box-shadow:0 14px 34px rgba(0,0,0,.18);padding:16px}
+    .collection-tools-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}
+    .collection-tools-title{font-size:18px;font-weight:900}
+    .collection-tools-meta{color:var(--muted);font-size:12px;font-weight:800}
+    .collection-tools-form{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr)) auto;gap:10px;align-items:end}
+    .collection-tools-form label{display:block;color:var(--muted);font-size:12px;font-weight:800;margin-bottom:6px}
+    .collection-tools-form input,.collection-tools-form select{width:100%;min-height:38px}
+    .collection-tools-nav{display:flex;gap:8px;flex-wrap:wrap}
+    .collection-tools-table-wrap{width:100%;overflow:auto}
+    .collection-tools-table{width:100%;border-collapse:collapse}
+    .collection-tools-table th,.collection-tools-table td{padding:8px 9px;border-bottom:1px solid var(--border);text-align:left;vertical-align:middle}
+    .collection-tools-table th{color:var(--muted);font-size:12px;font-weight:900;white-space:nowrap}
+    .collection-tools-table td{font-size:12px}
+    .collection-tools-table th:first-child,.collection-tools-table td:first-child{min-width:360px;width:42%}
+    .collection-tools-table th:last-child,.collection-tools-table td:last-child{width:96px;white-space:nowrap}
+    .collection-tools-address,.collection-tools-mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+    .collection-tools-address{max-width:560px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .collection-tools-amount{font-variant-numeric:tabular-nums;white-space:nowrap}
+    .collection-tools-empty{padding:18px;text-align:center;color:var(--muted);border:1px dashed var(--border);border-radius:8px}
+    .collection-tools-progress{display:grid;grid-template-columns:1.05fr 1.15fr .9fr 1.25fr .8fr .8fr .8fr .8fr;gap:8px;margin-bottom:12px}
+    .collection-tools-progress-card{border:1px solid var(--border);border-radius:8px;padding:8px 9px;background:rgba(255,255,255,.035);min-width:0}
+    .collection-tools-progress-label{color:var(--muted);font-size:11px;font-weight:800}
+    .collection-tools-progress-value{font-size:14px;font-weight:900;margin-top:4px;font-variant-numeric:tabular-nums;min-width:0}
+    .collection-tools-progress-value.collection-tools-address{max-width:100%}
+    .collection-tools-action-note{display:inline-block;max-width:86px;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
+    .collection-tools-pagination{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:12px;color:var(--muted);font-size:12px;font-weight:800}
+    .collection-tools-pagination-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+    .collection-tools-pagination select{min-height:30px;width:auto}
+    .collection-tools-pagination .is-disabled{opacity:.45;pointer-events:none}
+    @media (max-width:900px){.collection-tools-head{display:block}.collection-tools-nav{margin-top:10px}.collection-tools-form{grid-template-columns:1fr}}
+    @media (max-width:1200px){.collection-tools-progress{grid-template-columns:repeat(auto-fit,minmax(110px,1fr))}.collection-tools-table th:first-child,.collection-tools-table td:first-child{min-width:280px}}
+  </style>
+
+  {% if notice %}
+    <div class="alert success">{{ notice }}</div>
+  {% endif %}
+  {% if error %}
+    <div class="alert danger">{{ error }}</div>
+  {% endif %}
+  {% if candidate_added %}
+    <div class="alert success">
+      已加入归集候选
+      <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" href="{{ workbench_url }}">前往归集工作台</a>
+    </div>
+  {% endif %}
+  {% set addable = namespace(count=0) %}
+  {% for item in scan_results %}
+    {% if item.can_add_candidate %}
+      {% set addable.count = addable.count + 1 %}
+    {% endif %}
+  {% endfor %}
+  {% set scan_progress = scan_progress or {} %}
+  {% set scan_pagination = scan_pagination or {} %}
+  {% set current_scan_address = scan_progress.current_address or "" %}
+  {% set current_scan_address_label = ("..." ~ current_scan_address[-8:]) if current_scan_address else "-" %}
+
+  <div class="collection-tools-page">
+    <div class="collection-tools-panel">
+      <div class="collection-tools-head">
+        <div>
+          <div class="collection-tools-title">归集排查工具</div>
+          <div class="collection-tools-meta">扫描当前网络和币种中尚未进入归集候选的历史地址；可按用户ID或地址关键字缩小范围。</div>
+        </div>
+        <div class="collection-tools-nav">
+          <a class="btn secondary admin-btn admin-btn-secondary" href="/admin/collections/center">归集候选工作台</a>
+          <a class="btn secondary admin-btn admin-btn-secondary" href="/admin/collections/tasks">归集任务</a>
+        </div>
+      </div>
+      <form method="post" action="/admin/collections/tools/scan-missing" class="collection-tools-form">
+        <input type="hidden" name="per_page" value="{{ scan_pagination.per_page or filters.per_page or 20 }}">
+        <div>
+          <label for="tool-chain">网络</label>
+          <select id="tool-chain" name="chain_key" required>
+            <option value="">请选择网络</option>
+            {% for network in networks %}
+              {% if network.can_collect %}
+                <option value="{{ network.chain_key }}" {% if filters.chain_key == network.chain_key %}selected{% endif %}>{{ network.display_name or network.chain_name or network.chain_key }}</option>
+              {% endif %}
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="tool-coin">币种</label>
+          {% set selected_tool_coin = filters.coin_symbol or "USDT" %}
+          <select id="tool-coin" name="coin_symbol" required>
+            <option value="">请选择币种</option>
+            {% for asset in assets %}
+              {% set symbol = (asset.symbol or "")|upper %}
+              {% if symbol and symbol not in ["ALL", "*", "__ALL__"] %}
+                <option value="{{ symbol }}" {% if selected_tool_coin == symbol %}selected{% endif %}>{{ symbol }}{% if asset.name and asset.name|upper != symbol %} - {{ asset.name }}{% endif %}</option>
+              {% endif %}
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="tool-user">用户ID（可选）</label>
+          <input id="tool-user" name="user_id" value="{{ filters.user_id or '' }}" placeholder="全部用户">
+        </div>
+        <div>
+          <label for="tool-address">地址关键字（可选）</label>
+          <input id="tool-address" name="address" value="{{ filters.address or '' }}" placeholder="0x...">
+        </div>
+        <button type="submit" class="btn admin-btn admin-btn-primary">扫描未入候选地址</button>
+      </form>
+    </div>
+
+    <div class="collection-tools-panel">
+      <div class="collection-tools-head">
+        <div>
+          <div class="collection-tools-title">扫描结果</div>
+          <div class="collection-tools-meta">扫描完成后会显示链上余额，并可将有余额地址加入归集候选。</div>
+        </div>
+        <form method="post" action="/admin/collections/tools/add-candidates">
+          <input type="hidden" name="chain_key" value="{{ filters.chain_key or '' }}">
+          <input type="hidden" name="coin_symbol" value="{{ filters.coin_symbol or 'USDT' }}">
+          <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}">
+          <input type="hidden" name="address" value="{{ filters.address or '' }}">
+          <input type="hidden" name="scan_batch_id" value="{{ filters.scan_batch_id or scan_progress.scan_batch_id or '' }}">
+          <input type="hidden" name="page" value="{{ scan_pagination.page or filters.page or 1 }}">
+          <input type="hidden" name="per_page" value="{{ scan_pagination.per_page or filters.per_page or 20 }}">
+          <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm" {% if (scan_addable_count or addable.count) <= 0 %}disabled{% endif %}>全部加入候选</button>
+        </form>
+      </div>
+      <div class="collection-tools-progress">
+        <div class="collection-tools-progress-card">
+          <div class="collection-tools-progress-label">扫描状态</div>
+          <div class="collection-tools-progress-value" data-tool-progress="status">{{ scan_progress.status_label or "未扫描" }}</div>
+        </div>
+        <div class="collection-tools-progress-card">
+          <div class="collection-tools-progress-label">网络 / 币种</div>
+          <div class="collection-tools-progress-value" data-tool-progress="network">{{ scan_progress.chain_key or filters.chain_key or "-" }} / {{ scan_progress.coin_symbol or filters.coin_symbol or "USDT" }}</div>
+        </div>
+        <div class="collection-tools-progress-card">
+          <div class="collection-tools-progress-label">已扫描 / 总数</div>
+          <div class="collection-tools-progress-value" data-tool-progress="scan-count">{{ scan_progress.scanned or 0 }} / {{ scan_progress.total or 0 }}</div>
+        </div>
+        <div class="collection-tools-progress-card">
+          <div class="collection-tools-progress-label">当前地址</div>
+          <div class="collection-tools-progress-value collection-tools-address" data-tool-progress="current-address" title="{{ current_scan_address }}">{{ current_scan_address_label }}</div>
+        </div>
+        <div class="collection-tools-progress-card">
+          <div class="collection-tools-progress-label">成功读取</div>
+          <div class="collection-tools-progress-value" data-tool-progress="success-count">{{ scan_progress.success_count or 0 }}</div>
+        </div>
+        <div class="collection-tools-progress-card">
+          <div class="collection-tools-progress-label">有余额</div>
+          <div class="collection-tools-progress-value" data-tool-progress="positive-count">{{ scan_progress.positive_count or 0 }}</div>
+        </div>
+        <div class="collection-tools-progress-card">
+          <div class="collection-tools-progress-label">余额为0</div>
+          <div class="collection-tools-progress-value" data-tool-progress="zero-count">{{ scan_progress.zero_count or 0 }}</div>
+        </div>
+        <div class="collection-tools-progress-card">
+          <div class="collection-tools-progress-label">失败</div>
+          <div class="collection-tools-progress-value" data-tool-progress="failed-count">{{ scan_progress.failed_count or 0 }}</div>
+        </div>
+      </div>
+      {% if scan_results %}
+        <div class="collection-tools-table-wrap">
+          <table class="collection-tools-table">
+            <thead>
+              <tr>
+                <th>地址</th>
+                <th>用户ID</th>
+                <th>币种</th>
+                <th>状态</th>
+                <th>链上余额</th>
+                <th>是否可加入候选</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody data-tool-scan-rows>
+              {% for item in scan_results %}
+                <tr data-row-key="{{ item.user_id }}|{{ item.address }}|{{ item.coin_symbol }}">
+                  <td><div class="collection-tools-address" title="{{ item.address }}">{{ item.address }}</div></td>
+                  <td>{{ item.user_id or "-" }}</td>
+                  <td>{{ item.coin_symbol }}</td>
+                  <td><span class="badge {{ item.scan_status_badge or 'neutral' }}" data-row-status>{{ item.scan_status_label or "待扫描" }}</span><br><span class="collection-tools-meta" data-row-error>{{ item.error or "" }}</span></td>
+                  <td class="collection-tools-amount" data-row-balance>{{ item.balance_label }}</td>
+                  <td><span class="badge {{ item.candidate_status_badge or 'neutral' }}" data-row-candidate>{{ item.candidate_status_label }}</span></td>
+                  <td data-row-action>
+                    {% if item.can_add_candidate %}
+                      <form method="post" action="/admin/collections/tools/add-candidate">
+                        <input type="hidden" name="chain_key" value="{{ item.chain_key }}">
+                        <input type="hidden" name="asset_symbol" value="{{ item.coin_symbol }}">
+                        <input type="hidden" name="address" value="{{ item.address }}">
+                        <input type="hidden" name="return_address" value="{{ filters.address or '' }}">
+                        <input type="hidden" name="user_id" value="{{ item.user_id }}">
+                        <input type="hidden" name="balance_amount" value="{{ item.balance_amount }}">
+                        <input type="hidden" name="scan_batch_id" value="{{ filters.scan_batch_id or scan_progress.scan_batch_id or '' }}">
+                        <input type="hidden" name="page" value="{{ scan_pagination.page or filters.page or 1 }}">
+                        <input type="hidden" name="per_page" value="{{ scan_pagination.per_page or filters.per_page or 20 }}">
+                        <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">加入归集候选</button>
+                      </form>
+                    {% elif item.candidate_exists %}
+                      <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" href="/admin/collections/center?chain_key={{ item.chain_key }}">前往归集工作台</a>
+                    {% else %}
+                      <span class="collection-tools-meta collection-tools-action-note" title="{% if not item.user_id %}缺少用户ID{% else %}余额为0{% endif %}">不可加入</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="collection-tools-empty">
+          {% if scan_progress.message %}
+            {{ scan_progress.message }}
+          {% elif filters.scan_batch_id %}
+            扫描任务已提交，等待 worker 写入进度。
+          {% else %}
+            暂无扫描结果。提交扫描并等待完成后刷新本页查看。
+          {% endif %}
+        </div>
+      {% endif %}
+      <div class="collection-tools-pagination">
+        <div>共 {{ scan_pagination.total or 0 }} 条，当前第 {{ scan_pagination.page or 1 }} / {{ scan_pagination.pages or 1 }} 页</div>
+        <div class="collection-tools-pagination-actions">
+          <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if not scan_pagination.has_prev %}is-disabled{% endif %}" href="{{ request.url.include_query_params(page=1, per_page=scan_pagination.per_page or 20) }}">首页</a>
+          <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if not scan_pagination.has_prev %}is-disabled{% endif %}" href="{{ request.url.include_query_params(page=(scan_pagination.page or 1) - 1, per_page=scan_pagination.per_page or 20) }}">上一页</a>
+          <form method="get" action="/admin/collections/tools" class="collection-tools-pagination-actions">
+            <input type="hidden" name="chain_key" value="{{ filters.chain_key or '' }}">
+            <input type="hidden" name="coin_symbol" value="{{ filters.coin_symbol or 'USDT' }}">
+            <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}">
+            <input type="hidden" name="address" value="{{ filters.address or '' }}">
+            <input type="hidden" name="scan_batch_id" value="{{ filters.scan_batch_id or scan_progress.scan_batch_id or '' }}">
+            <select name="page" onchange="this.form.submit()">
+              {% for page_no in scan_pagination.page_numbers or [1] %}
+                <option value="{{ page_no }}" {% if page_no == scan_pagination.page %}selected{% endif %}>{{ page_no }}</option>
+              {% endfor %}
+            </select>
+            <span>/ {{ scan_pagination.pages or 1 }} 页</span>
+            <span>每页</span>
+            <select name="per_page" onchange="this.form.page.value=1; this.form.submit()">
+              {% for size in scan_pagination.allowed_per_page or [10,20,50,100] %}
+                <option value="{{ size }}" {% if size == scan_pagination.per_page %}selected{% endif %}>{{ size }}</option>
+              {% endfor %}
+            </select>
+          </form>
+          <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if not scan_pagination.has_next %}is-disabled{% endif %}" href="{{ request.url.include_query_params(page=(scan_pagination.page or 1) + 1, per_page=scan_pagination.per_page or 20) }}">下一页</a>
+          <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if not scan_pagination.has_next %}is-disabled{% endif %}" href="{{ request.url.include_query_params(page=scan_pagination.pages or 1, per_page=scan_pagination.per_page or 20) }}">尾页</a>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function(){
+      const scanBatchId = "{{ filters.scan_batch_id or scan_progress.scan_batch_id or '' }}";
+      const initialStatus = "{{ scan_progress.status or '' }}".toLowerCase();
+      if (!scanBatchId || ["completed", "failed"].includes(initialStatus) || !window.EventSource) {
+        return;
+      }
+      let source = null;
+      const statusText = {
+        queued: "排队中",
+        running: "扫描中",
+        completed: "已完成",
+        failed: "失败",
+        pending: "待扫描",
+        scanning: "扫描中",
+        timeout: "读取失败"
+      };
+      const statusBadge = {
+        pending: "neutral",
+        queued: "info",
+        running: "info",
+        scanning: "info",
+        completed: "success",
+        failed: "warning",
+        timeout: "warning"
+      };
+      const currentFilters = {
+        chainKey: "{{ filters.chain_key or '' }}",
+        coinSymbol: "{{ filters.coin_symbol or 'USDT' }}",
+        userId: "{{ filters.user_id or '' }}",
+        address: "{{ filters.address or '' }}",
+        page: "{{ scan_pagination.page or filters.page or 1 }}",
+        perPage: "{{ scan_pagination.per_page or filters.per_page or 20 }}"
+      };
+      function text(value, fallback){
+        const raw = value === null || value === undefined ? "" : String(value);
+        return raw || fallback || "";
+      }
+      function shortAddress(value){
+        const raw = text(value);
+        return raw ? `...${raw.slice(-8)}` : "-";
+      }
+      function amountLabel(value, symbol, status){
+        const normalizedStatus = String(status || "").toLowerCase();
+        if (["pending", "running", "scanning"].includes(normalizedStatus)) {
+          return "-";
+        }
+        if (normalizedStatus === "failed" || normalizedStatus === "timeout") {
+          return "读取失败";
+        }
+        const raw = value === null || value === undefined || value === "" ? "0" : String(value);
+        const num = Number(raw);
+        const display = Number.isFinite(num) ? num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 }) : raw;
+        return `${display} ${symbol || currentFilters.coinSymbol || ""}`.trim();
+      }
+      function setProgress(name, value, title){
+        const node = document.querySelector(`[data-tool-progress="${name}"]`);
+        if (!node) return;
+        node.textContent = value;
+        if (title !== undefined) node.title = title;
+      }
+      function setBadge(node, status){
+        if (!node) return;
+        const normalized = String(status || "pending").toLowerCase();
+        node.textContent = statusText[normalized] || "待扫描";
+        node.className = `badge ${statusBadge[normalized] || "neutral"}`;
+      }
+      function setCandidateBadge(node, row){
+        if (!node) return;
+        const status = String(row.status || "").toLowerCase();
+        const addFailed = !!row.add_failed;
+        const addStatusText = text(row.add_status_text);
+        const canAdd = status === "completed" && Number(row.balance_amount || 0) > 0 && !row.candidate_exists && Number(row.user_id || 0) > 0 && !addFailed;
+        if (row.candidate_exists) {
+          node.textContent = addStatusText || "已存在";
+          node.className = "badge success";
+        } else if (addFailed) {
+          node.textContent = addStatusText || "加入失败";
+          node.className = "badge warning";
+        } else if (canAdd) {
+          node.textContent = "可加入";
+          node.className = "badge info";
+        } else if (["pending", "running", "scanning"].includes(status)) {
+          node.textContent = "未加入";
+          node.className = "badge neutral";
+        } else {
+          node.textContent = "不可加入";
+          node.className = "badge neutral";
+        }
+      }
+      function rowKey(row){
+        return `${text(row.user_id, "0")}|${text(row.address).toLowerCase()}|${text(row.asset_symbol || row.coin_symbol || currentFilters.coinSymbol).toUpperCase()}`;
+      }
+      function escapeAttr(value){
+        return String(value === null || value === undefined ? "" : value)
+          .replace(/&/g, "&amp;")
+          .replace(/"/g, "&quot;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      }
+      function updateAction(cell, row, snapshot){
+        if (!cell) return;
+        const status = String(row.status || "").toLowerCase();
+        const balance = Number(row.balance_amount || 0);
+        const exists = !!row.candidate_exists;
+        const addFailed = !!row.add_failed;
+        const userId = Number(row.user_id || 0);
+        const chainKey = text(snapshot.chain_key || currentFilters.chainKey);
+        const symbol = text(row.asset_symbol || row.coin_symbol || snapshot.coin_symbol || currentFilters.coinSymbol).toUpperCase();
+        const address = text(row.address).toLowerCase();
+        if (status === "completed" && balance > 0 && !exists && userId > 0 && !addFailed) {
+          cell.innerHTML = [
+            '<form method="post" action="/admin/collections/tools/add-candidate">',
+            `<input type="hidden" name="chain_key" value="${escapeAttr(chainKey)}">`,
+            `<input type="hidden" name="asset_symbol" value="${escapeAttr(symbol)}">`,
+            `<input type="hidden" name="address" value="${escapeAttr(address)}">`,
+            `<input type="hidden" name="return_address" value="${escapeAttr(currentFilters.address)}">`,
+            `<input type="hidden" name="user_id" value="${escapeAttr(userId)}">`,
+            `<input type="hidden" name="balance_amount" value="${escapeAttr(row.balance_amount || "0")}">`,
+            `<input type="hidden" name="scan_batch_id" value="${escapeAttr(scanBatchId)}">`,
+            `<input type="hidden" name="page" value="${escapeAttr(currentFilters.page)}">`,
+            `<input type="hidden" name="per_page" value="${escapeAttr(currentFilters.perPage)}">`,
+            '<button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">加入归集候选</button>',
+            '</form>'
+          ].join("");
+        } else if (exists) {
+          cell.innerHTML = `<a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" href="/admin/collections/center?chain_key=${encodeURIComponent(chainKey)}">前往归集工作台</a>`;
+        } else {
+          const reason = addFailed ? text(row.add_error || row.add_status_text, "加入失败") : (userId > 0 ? "余额为0" : "缺少用户ID");
+          cell.innerHTML = `<span class="collection-tools-meta collection-tools-action-note" title="${escapeAttr(reason)}">不可加入</span>`;
+        }
+      }
+      function applyProgress(snapshot){
+        if (!snapshot || typeof snapshot !== "object") return;
+        setProgress("status", statusText[String(snapshot.status || "").toLowerCase()] || "未扫描");
+        setProgress("network", `${text(snapshot.chain_key || currentFilters.chainKey, "-")} / ${text(snapshot.coin_symbol || currentFilters.coinSymbol, "USDT")}`);
+        setProgress("scan-count", `${Number(snapshot.scanned || 0)} / ${Number(snapshot.total || 0)}`);
+        setProgress("current-address", shortAddress(snapshot.current_address), text(snapshot.current_address));
+        setProgress("success-count", Number(snapshot.success_count || 0));
+        setProgress("positive-count", Number(snapshot.positive_count || 0));
+        setProgress("zero-count", Number(snapshot.zero_count || 0));
+        setProgress("failed-count", Number(snapshot.failed_count || 0));
+        const rows = Array.isArray(snapshot.rows) ? snapshot.rows : [];
+        rows.forEach((row) => {
+          const tr = document.querySelector(`tr[data-row-key="${CSS.escape(rowKey(row))}"]`);
+          if (!tr) return;
+          setBadge(tr.querySelector("[data-row-status]"), row.status);
+          const errorNode = tr.querySelector("[data-row-error]");
+          if (errorNode) errorNode.textContent = text(row.error);
+          const balanceNode = tr.querySelector("[data-row-balance]");
+          if (balanceNode) balanceNode.textContent = amountLabel(row.balance_amount, row.asset_symbol || snapshot.coin_symbol, row.status);
+          setCandidateBadge(tr.querySelector("[data-row-candidate]"), row);
+          updateAction(tr.querySelector("[data-row-action]"), row, snapshot);
+        });
+        const bulkButton = document.querySelector('form[action="/admin/collections/tools/add-candidates"] button[type="submit"]');
+        if (bulkButton) {
+          const canAdd = rows.some((row) => String(row.status || "").toLowerCase() === "completed" && Number(row.balance_amount || 0) > 0 && !row.candidate_exists && !row.add_failed && Number(row.user_id || 0) > 0);
+          bulkButton.disabled = !canAdd;
+        }
+      }
+      function closeSource(){
+        if (source) {
+          source.close();
+          source = null;
+        }
+      }
+      source = new EventSource(`/admin/collections/tools/scan-events?scan_batch_id=${encodeURIComponent(scanBatchId)}`);
+      source.addEventListener("progress", (event) => {
+        try {
+          applyProgress(JSON.parse(event.data || "{}"));
+        } catch (err) {
+          console.warn("collection tool progress parse failed", err);
+        }
+      });
+      source.addEventListener("done", closeSource);
+      source.addEventListener("error", (event) => {
+        if (event && event.data) console.warn("collection tool scan event error", event.data);
+      });
+      window.addEventListener("beforeunload", closeSource);
+      document.querySelector('form[action="/admin/collections/tools/scan-missing"]')?.addEventListener("submit", closeSource);
+    })();
+  </script>
+{% endblock %}

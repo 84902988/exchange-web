@@ -1,0 +1,826 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}站点配置{% endblock %}
+{% block page_title %}站点配置{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">配置首页白标内容。仅保存展示文案与图片地址，不触发交易、资金或发放逻辑。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .site-settings-shell {
+      display: grid;
+      gap: 16px;
+    }
+    .site-settings-form {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+    .filter-card .site-settings-form {
+      display: grid;
+      grid-template-columns: 1fr;
+    }
+    .site-settings-top-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+      min-width: 0;
+    }
+    .settings-card {
+      display: grid;
+      gap: 16px;
+      min-width: 0;
+      padding: 18px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 12px;
+      background: rgba(255,255,255,.035);
+      box-shadow: 0 16px 36px rgba(0,0,0,.16);
+    }
+    .settings-card-header {
+      display: grid;
+      gap: 4px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .settings-card-title {
+      margin: 0;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 800;
+    }
+    .settings-card-desc {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+    .settings-grid.single-column {
+      grid-template-columns: 1fr;
+    }
+    .site-settings-form .field {
+      align-self: start;
+      min-width: 0;
+    }
+    .site-settings-form .field label {
+      min-height: 18px;
+      line-height: 18px;
+      margin-bottom: 8px;
+    }
+    .site-settings-form textarea {
+      min-height: 104px;
+      resize: vertical;
+    }
+    .i18n-panel {
+      display: grid;
+      gap: 14px;
+      padding: 14px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 12px;
+      background: rgba(255,255,255,.035);
+    }
+    .i18n-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .i18n-summary-item,
+    .i18n-tab-status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 0 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.055);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .i18n-summary-item strong {
+      margin-left: 4px;
+      color: #fff;
+      font-weight: 800;
+    }
+    .i18n-fallback-note {
+      margin: 0;
+      color: #facc15;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .i18n-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .i18n-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 7px 10px;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 8px;
+      background: rgba(255,255,255,.045);
+      color: var(--muted);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .i18n-tab.is-active {
+      border-color: rgba(250, 204, 21, .55);
+      background: rgba(250, 204, 21, .14);
+      color: #fff;
+    }
+    .i18n-tab.is-active .i18n-tab-status {
+      border-color: rgba(250, 204, 21, .28);
+      color: #fde68a;
+    }
+    .i18n-toolbar {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .i18n-copy-btn:disabled {
+      opacity: .45;
+      cursor: not-allowed;
+    }
+    .i18n-tab-panel {
+      display: none;
+    }
+    .i18n-tab-panel.is-active {
+      display: grid;
+      gap: 14px;
+    }
+    .i18n-language-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .i18n-fields-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .upload-field {
+      grid-column: 1 / -1;
+    }
+    .upload-control {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 116px;
+      gap: 10px;
+      align-items: stretch;
+    }
+    .upload-control .btn {
+      min-height: 44px;
+      width: 116px;
+      white-space: nowrap;
+    }
+    .upload-status {
+      display: inline-block;
+      margin-top: 6px;
+      font-size: 12px;
+    }
+    .upload-status:empty {
+      display: none;
+    }
+    .hero-settings-layout {
+      display: grid;
+      grid-template-columns: minmax(520px, 1fr) 400px;
+      gap: 18px;
+      align-items: start;
+      min-width: 0;
+    }
+    .hero-settings-fields {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+    .hero-preview-panel {
+      display: grid;
+      gap: 10px;
+      align-content: start;
+      width: 400px;
+      max-width: 100%;
+    }
+    .hero-preview-title {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .hero-media-preview {
+      width: 400px;
+      max-width: 100%;
+      height: 200px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,.14);
+      border-radius: 12px;
+      background: #050505;
+    }
+    .hero-media-preview img,
+    .hero-media-preview video {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      border-radius: 12px;
+      background: #000;
+    }
+    .hero-media-preview-empty {
+      padding: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+    }
+    .footer-link-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .footer-link-card {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+    .toggle-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+    .site-settings-form .toggle-control input {
+      width: auto;
+      margin: 0;
+      accent-color: var(--brand);
+    }
+    .site-notice {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      border-color: rgba(49, 177, 119, .42);
+      background: linear-gradient(180deg, rgba(31, 122, 85, .20), rgba(31, 122, 85, .10));
+      transition: opacity .2s ease, transform .2s ease, margin .2s ease, padding .2s ease;
+    }
+    .site-notice.is-hidden {
+      opacity: 0;
+      transform: translateY(-6px);
+      pointer-events: none;
+    }
+    .site-notice-icon {
+      width: 28px;
+      height: 28px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 999px;
+      background: rgba(49, 177, 119, .22);
+      border: 1px solid rgba(49, 177, 119, .35);
+      color: #a8f0cd;
+      font-weight: 900;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .site-notice-title {
+      margin: 0 0 4px;
+      color: #a8f0cd;
+      font-size: 14px;
+      font-weight: 800;
+    }
+    .site-notice-text {
+      margin: 0;
+      color: #fff;
+      font-size: 14px;
+    }
+    @media (max-width: 960px) {
+      .site-settings-top-row,
+      .settings-grid,
+      .hero-settings-layout,
+      .hero-settings-fields,
+      .i18n-fields-grid {
+        grid-template-columns: 1fr;
+      }
+      .hero-preview-panel {
+        width: 100%;
+        max-width: 400px;
+      }
+    }
+    @media (max-width: 640px) {
+      .upload-field {
+        grid-column: auto;
+      }
+      .upload-control {
+        grid-template-columns: 1fr;
+      }
+      .upload-control .btn {
+        width: 100%;
+      }
+      .footer-link-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card site-notice" id="site_settings_notice">
+        <span class="site-notice-icon">OK</span>
+        <div>
+          <p class="site-notice-title">保存成功</p>
+          <p class="site-notice-text">{{ notice }}</p>
+        </div>
+      </div>
+    </section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section">
+      <div class="card"><div class="section-title">提示信息</div><p class="muted">{{ error }}</p></div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card site-settings-shell">
+      <div>
+        <div class="section-title">基础配置</div>
+        <p class="settings-card-desc">维护前台基础资源、首页媒体和页脚链接；文案统一在多语言内容中编辑。</p>
+      </div>
+      <form method="post" action="/admin/site-settings" class="filter-form site-settings-form">
+        <div hidden>
+          <input type="hidden" name="site_name" value="{{ form.site_name or '' }}" />
+          <input type="hidden" name="site_slogan" value="{{ form.site_slogan or '' }}" />
+          <textarea name="risk_disclaimer">{{ form.risk_disclaimer or '' }}</textarea>
+          <textarea name="footer_disclaimer">{{ form.footer_disclaimer or '' }}</textarea>
+          <input type="hidden" name="home_hero_title" value="{{ form.home_hero_title or '' }}" />
+          <input type="hidden" name="home_hero_subtitle" value="{{ form.home_hero_subtitle or '' }}" />
+          <input type="hidden" name="home_hero_cta_text" value="{{ form.home_hero_cta_text or '' }}" />
+          <input type="hidden" name="stock_token_locks_notice_title" value="{{ form.stock_token_locks_notice_title or '' }}" />
+          <textarea name="stock_token_locks_notice_content">{{ form.stock_token_locks_notice_content or '' }}</textarea>
+        </div>
+        <div class="site-settings-top-row">
+        <div class="settings-card">
+          <div class="settings-card-header">
+            <h3 class="settings-card-title">站点品牌</h3>
+            <p class="settings-card-desc">配置站点基础识别信息和后台运营联系方式。</p>
+          </div>
+          <div class="settings-grid">
+            <div class="field">
+              <label for="support_email">支持邮箱 (support_email)</label>
+              <input id="support_email" name="support_email" type="email" value="{{ form.support_email or '' }}" />
+            </div>
+            <div class="field upload-field">
+              <label for="logo_url">Logo 地址 (logo_url)</label>
+              <div class="upload-control">
+                <input id="logo_url" name="logo_url" type="text" value="{{ form.logo_url or '' }}" placeholder="/icons/logo-1.svg" />
+                <input id="logo_url_upload" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden />
+                <button id="logo_url_upload_btn" type="button" class="btn secondary admin-btn admin-btn-secondary">上传图片</button>
+              </div>
+              <span id="logo_url_upload_status" class="muted upload-status"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-card-header">
+            <h3 class="settings-card-title">风险与页脚</h3>
+            <p class="settings-card-desc">配置页脚可见链接；风险提示和免责声明文案在多语言内容中编辑。</p>
+          </div>
+          <div class="footer-link-grid">
+            <div class="footer-link-card">
+              <label class="toggle-control" for="show_risk_link">
+                <input id="show_risk_link" name="show_risk_link" type="checkbox" value="1" {% if form.show_risk_link %}checked{% endif %} />
+                显示风险提示
+              </label>
+              <div class="field">
+                <label for="risk_link_url">风险提示链接</label>
+                <input id="risk_link_url" name="risk_link_url" type="text" value="{{ form.risk_link_url or '' }}" placeholder="/risk" />
+              </div>
+            </div>
+            <div class="footer-link-card">
+              <label class="toggle-control" for="show_terms_link">
+                <input id="show_terms_link" name="show_terms_link" type="checkbox" value="1" {% if form.show_terms_link %}checked{% endif %} />
+                显示服务条款
+              </label>
+              <div class="field">
+                <label for="terms_link_url">服务条款链接</label>
+                <input id="terms_link_url" name="terms_link_url" type="text" value="{{ form.terms_link_url or '' }}" placeholder="/terms" />
+              </div>
+            </div>
+            <div class="footer-link-card">
+              <label class="toggle-control" for="show_privacy_link">
+                <input id="show_privacy_link" name="show_privacy_link" type="checkbox" value="1" {% if form.show_privacy_link %}checked{% endif %} />
+                显示隐私政策
+              </label>
+              <div class="field">
+                <label for="privacy_link_url">隐私政策链接</label>
+                <input id="privacy_link_url" name="privacy_link_url" type="text" value="{{ form.privacy_link_url or '' }}" placeholder="/privacy" />
+              </div>
+            </div>
+          </div>
+        </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-card-header">
+            <h3 class="settings-card-title">首页 Hero</h3>
+            <p class="settings-card-desc">配置首页按钮跳转和背景媒体。标题、说明和按钮文案在多语言内容中编辑。</p>
+          </div>
+          <div class="hero-settings-layout">
+            <div class="hero-settings-fields">
+              <div class="field">
+                <label for="home_hero_cta_link">按钮链接 (home_hero_cta_link)</label>
+                <input id="home_hero_cta_link" name="home_hero_cta_link" type="text" value="{{ form.home_hero_cta_link or '' }}" placeholder="/register" />
+              </div>
+              <div class="field upload-field">
+                <label for="home_hero_image">首页背景媒体 (home_hero_image)</label>
+                <div class="upload-control">
+                  <input id="home_hero_image" name="home_hero_image" type="text" value="{{ form.home_hero_image or '' }}" placeholder="/homepage-bg.mp4" />
+                  <input id="home_hero_image_upload" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml,video/mp4,video/webm" hidden />
+                  <button id="home_hero_image_upload_btn" type="button" class="btn secondary admin-btn admin-btn-secondary">上传媒体</button>
+                </div>
+                <span class="muted upload-status">图片最大 20MB，上传后会自动压缩；视频最大 100MB，上传后会自动转码压缩，建议 10～30 秒；首页背景建议使用 16:9 或 2:1 横幅图片/视频。</span>
+                <span id="home_hero_image_upload_status" class="muted upload-status"></span>
+              </div>
+            </div>
+            <div class="hero-preview-panel">
+              <div class="hero-preview-title">背景媒体预览</div>
+              <p class="settings-card-desc">预览按首页 Hero 横幅效果裁切展示，建议上传 16:9 或 2:1 横向图片/视频。</p>
+              <div id="home_hero_image_preview" class="hero-media-preview"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-card-header">
+            <h3 class="settings-card-title">多语言内容</h3>
+            <p class="settings-card-desc">原字段继续作为中文 fallback；下方内容会保存到对应 *_i18n JSON 字段。</p>
+          </div>
+          <div class="i18n-panel">
+            {% set i18n_languages = [('zh', '中文'), ('en', 'English'), ('zh_TW', '繁體'), ('ja', '日本語')] %}
+            {% set text_i18n_fields = [
+              ('site_name', '站点名称', 'input'),
+              ('site_slogan', '站点标语', 'input'),
+              ('risk_disclaimer', '风险提示', 'textarea'),
+              ('footer_disclaimer', '页脚免责声明', 'textarea'),
+              ('stock_token_locks_notice_title', '股票锁仓说明标题', 'input'),
+              ('stock_token_locks_notice_content', '股票锁仓说明内容', 'textarea'),
+              ('home_hero_title', '首页 Hero 标题', 'input'),
+              ('home_hero_subtitle', '首页 Hero 副标题', 'textarea'),
+              ('home_hero_cta_text', '首页 Hero 按钮文案', 'input')
+            ] %}
+            <div class="i18n-summary" aria-live="polite">
+              {% for suffix, lang_label in i18n_languages %}
+                <span class="i18n-summary-item" data-i18n-summary="{{ suffix }}">{{ lang_label }}：<strong>未填写</strong></span>
+              {% endfor %}
+            </div>
+            <p class="i18n-fallback-note">中文为默认内容，其他语言未填写时前台将显示中文。中文内容会作为默认 fallback 保存，清空中文内容后前台对应文案也会隐藏或使用系统默认值。</p>
+            <div class="i18n-tabs" role="tablist" aria-label="多语言内容编辑">
+              {% for suffix, lang_label in i18n_languages %}
+                <button
+                  type="button"
+                  id="i18n_tab_{{ suffix }}"
+                  class="i18n-tab{% if loop.first %} is-active{% endif %}"
+                  role="tab"
+                  aria-selected="{% if loop.first %}true{% else %}false{% endif %}"
+                  aria-controls="i18n_panel_{{ suffix }}"
+                  data-i18n-tab="{{ suffix }}"
+                >
+                  <span>{{ lang_label }}</span>
+                  <span class="i18n-tab-status" data-i18n-tab-status="{{ suffix }}">未填写</span>
+                </button>
+              {% endfor %}
+            </div>
+            <div class="i18n-toolbar">
+              <button type="button" class="btn secondary admin-btn admin-btn-secondary i18n-copy-btn" data-i18n-copy-current disabled>从中文复制到当前语言</button>
+            </div>
+            <div class="i18n-tab-panels">
+              {% for suffix, lang_label in i18n_languages %}
+                <div
+                  id="i18n_panel_{{ suffix }}"
+                  class="i18n-tab-panel{% if loop.first %} is-active{% endif %}"
+                  role="tabpanel"
+                  aria-labelledby="i18n_tab_{{ suffix }}"
+                  data-i18n-panel="{{ suffix }}"
+                  {% if not loop.first %}hidden{% endif %}
+                >
+                  <div class="i18n-language-heading">
+                    <span>{{ lang_label }}</span>
+                    <span class="i18n-tab-status" data-i18n-panel-status="{{ suffix }}">未填写</span>
+                  </div>
+                  <div class="i18n-fields-grid">
+                    {% for field_name, field_label, field_type in text_i18n_fields %}
+                      {% set input_name = field_name ~ '_i18n_' ~ suffix %}
+                      {% set input_value = form[input_name] or '' %}
+                      {% if suffix == 'zh' and not input_value %}
+                        {% set input_value = form[field_name] or '' %}
+                      {% endif %}
+                      <div class="field" data-i18n-lang="{{ suffix }}" data-i18n-field="{{ field_name }}">
+                        <label for="{{ input_name }}">{{ field_label }}</label>
+                      {% if field_type == 'textarea' %}
+                        <textarea id="{{ input_name }}" name="{{ input_name }}">{{ input_value }}</textarea>
+                      {% else %}
+                        <input id="{{ input_name }}" name="{{ input_name }}" type="text" value="{{ input_value }}" />
+                      {% endif %}
+                      </div>
+                    {% endfor %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">保存配置</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <script>
+    const siteSettingsNotice = document.getElementById("site_settings_notice");
+    if (siteSettingsNotice) {
+      window.setTimeout(() => {
+        siteSettingsNotice.classList.add("is-hidden");
+        window.setTimeout(() => siteSettingsNotice.remove(), 220);
+      }, 2600);
+
+      const url = new URL(window.location.href);
+      if (url.searchParams.has("notice")) {
+        url.searchParams.delete("notice");
+        window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+      }
+    }
+
+    const imageUploadExtensions = new Set(["png", "jpg", "jpeg", "webp", "svg"]);
+    const heroMediaExtensions = new Set(["png", "jpg", "jpeg", "webp", "svg", "mp4", "webm"]);
+
+    function getFileExtension(value) {
+      const cleanValue = String(value || "").split(/[?#]/)[0];
+      const match = cleanValue.match(/\.([a-z0-9]+)$/i);
+      return match ? match[1].toLowerCase() : "";
+    }
+
+    function getUploadErrorMessage(response, data, fallbackText) {
+      if (data && typeof data === "object") {
+        const detail = data.detail;
+        if (typeof detail === "string" && detail) return detail;
+        if (detail && typeof detail.message === "string" && detail.message) return detail.message;
+        if (typeof data.error === "string" && data.error) return data.error;
+        if (typeof data.message === "string" && data.message) return data.message;
+      }
+      return fallbackText || `上传失败 (${response.status} ${response.statusText || "Error"})`;
+    }
+
+    function initializeI18nTabs() {
+      const tabs = Array.from(document.querySelectorAll("[data-i18n-tab]"));
+      const panels = Array.from(document.querySelectorAll("[data-i18n-panel]"));
+      const copyButton = document.querySelector("[data-i18n-copy-current]");
+      if (!tabs.length || !panels.length) return;
+
+      let activeLang = "zh";
+      const statusLabels = {
+        empty: "未填写",
+        partial: "部分填写",
+        complete: "已完成",
+      };
+
+      function getFieldControl(field) {
+        return field.querySelector("input, textarea");
+      }
+
+      function getLangFields(lang) {
+        return Array.from(document.querySelectorAll(`[data-i18n-lang="${lang}"]`));
+      }
+
+      function getFieldControlByName(lang, fieldName) {
+        const field = document.querySelector(`[data-i18n-lang="${lang}"][data-i18n-field="${fieldName}"]`);
+        return field ? getFieldControl(field) : null;
+      }
+
+      function syncChineseFallbackFields() {
+        getLangFields("zh").forEach((field) => {
+          const fieldName = field.dataset.i18nField;
+          const source = getFieldControl(field);
+          const target = document.querySelector(`[name="${fieldName}"]`);
+          if (!fieldName || !source || !target) return;
+          target.value = source.value;
+        });
+      }
+
+      function getStatus(fields) {
+        const total = fields.length;
+        const filled = fields.filter((field) => {
+          const control = getFieldControl(field);
+          return control && String(control.value || "").trim();
+        }).length;
+        if (!filled) return { key: "empty", text: statusLabels.empty, filled, total };
+        if (filled === total) return { key: "complete", text: statusLabels.complete, filled, total };
+        return { key: "partial", text: statusLabels.partial, filled, total };
+      }
+
+      function setStatusText(selector, lang, status) {
+        document.querySelectorAll(`${selector}[data-i18n-tab-status="${lang}"], ${selector}[data-i18n-panel-status="${lang}"]`).forEach((node) => {
+          node.textContent = status.text;
+        });
+      }
+
+      function updateStatuses() {
+        panels.forEach((panel) => {
+          const lang = panel.dataset.i18nPanel;
+          const status = getStatus(getLangFields(lang));
+          const summary = document.querySelector(`[data-i18n-summary="${lang}"] strong`);
+          setStatusText(".i18n-tab-status", lang, status);
+          if (summary) {
+            summary.textContent = `${status.text} ${status.filled}/${status.total}`;
+          }
+        });
+      }
+
+      function activateTab(lang) {
+        activeLang = lang;
+        tabs.forEach((tab) => {
+          const isActive = tab.dataset.i18nTab === lang;
+          tab.classList.toggle("is-active", isActive);
+          tab.setAttribute("aria-selected", isActive ? "true" : "false");
+        });
+        panels.forEach((panel) => {
+          const isActive = panel.dataset.i18nPanel === lang;
+          panel.classList.toggle("is-active", isActive);
+          panel.hidden = !isActive;
+        });
+        if (copyButton) {
+          copyButton.disabled = lang === "zh";
+        }
+      }
+
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => activateTab(tab.dataset.i18nTab || "zh"));
+      });
+
+      panels.forEach((panel) => {
+        panel.querySelectorAll("input, textarea").forEach((control) => {
+          control.addEventListener("input", updateStatuses);
+        });
+      });
+
+      if (copyButton) {
+        copyButton.addEventListener("click", () => {
+          if (activeLang === "zh") return;
+          getLangFields(activeLang).forEach((field) => {
+            const fieldName = field.dataset.i18nField;
+            const source = getFieldControlByName("zh", fieldName);
+            const target = getFieldControl(field);
+            if (!source || !target) return;
+            target.value = source.value;
+            target.dispatchEvent(new Event("input", { bubbles: true }));
+          });
+          updateStatuses();
+        });
+      }
+
+      const form = document.querySelector(".site-settings-form");
+      if (form) {
+        form.addEventListener("submit", syncChineseFallbackFields);
+      }
+
+      activateTab("zh");
+      syncChineseFallbackFields();
+      updateStatuses();
+    }
+
+    function renderHeroMediaPreview(value) {
+      const preview = document.getElementById("home_hero_image_preview");
+      if (!preview) return;
+
+      const mediaUrl = String(value || "").trim();
+      const ext = getFileExtension(mediaUrl);
+      preview.textContent = "";
+
+      if (!mediaUrl) {
+        const empty = document.createElement("div");
+        empty.className = "hero-media-preview-empty";
+        empty.textContent = "未配置背景媒体";
+        preview.appendChild(empty);
+        return;
+      }
+
+      if (ext === "mp4" || ext === "webm") {
+        const video = document.createElement("video");
+        video.src = mediaUrl;
+        video.controls = true;
+        video.muted = true;
+        video.playsInline = true;
+        preview.appendChild(video);
+        return;
+      }
+
+      if (imageUploadExtensions.has(ext)) {
+        const image = document.createElement("img");
+        image.src = mediaUrl;
+        image.alt = "首页背景媒体预览";
+        preview.appendChild(image);
+        return;
+      }
+
+      const unsupported = document.createElement("div");
+      unsupported.className = "hero-media-preview-empty";
+      unsupported.textContent = "无法预览该媒体格式";
+      preview.appendChild(unsupported);
+    }
+
+    function bindImageUpload(inputId, options = {}) {
+      const textInput = document.getElementById(inputId);
+      const fileInput = document.getElementById(`${inputId}_upload`);
+      const button = document.getElementById(`${inputId}_upload_btn`);
+      const status = document.getElementById(`${inputId}_upload_status`);
+      if (!textInput || !fileInput || !button || !status) return;
+
+      const allowedExtensions = options.allowedExtensions || imageUploadExtensions;
+      const invalidMessage = options.invalidMessage || "仅支持 png、jpg、jpeg、webp、svg";
+
+      button.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) return;
+
+        const ext = getFileExtension(file.name);
+        if (!allowedExtensions.has(ext)) {
+          status.textContent = invalidMessage;
+          fileInput.value = "";
+          return;
+        }
+
+        const originalText = button.textContent;
+        button.disabled = true;
+        button.textContent = "上传中";
+        status.textContent = "";
+
+        try {
+          const formData = new FormData();
+          formData.append("file", file);
+          const response = await fetch("/admin/uploads/image", {
+            method: "POST",
+            body: formData,
+            credentials: "same-origin",
+          });
+          const responseText = await response.text();
+          let data = {};
+          try {
+            data = responseText ? JSON.parse(responseText) : {};
+          } catch {
+            data = {};
+          }
+          if (!response.ok) {
+            throw new Error(getUploadErrorMessage(response, data, responseText));
+          }
+          textInput.value = data.url || "";
+          status.textContent = "上传成功";
+          if (typeof options.onSuccess === "function") {
+            options.onSuccess(textInput.value);
+          }
+        } catch (error) {
+          status.textContent = error instanceof Error ? error.message : "上传失败";
+        } finally {
+          button.disabled = false;
+          button.textContent = originalText;
+          fileInput.value = "";
+        }
+      });
+    }
+
+    bindImageUpload("logo_url");
+    const homeHeroImageInput = document.getElementById("home_hero_image");
+    if (homeHeroImageInput) {
+      renderHeroMediaPreview(homeHeroImageInput.value);
+      homeHeroImageInput.addEventListener("input", () => renderHeroMediaPreview(homeHeroImageInput.value));
+      homeHeroImageInput.addEventListener("change", () => renderHeroMediaPreview(homeHeroImageInput.value));
+    }
+
+    bindImageUpload("home_hero_image", {
+      allowedExtensions: heroMediaExtensions,
+      invalidMessage: "仅支持 png、jpg、jpeg、webp、svg、mp4、webm",
+      onSuccess: renderHeroMediaPreview,
+    });
+    initializeI18nTabs();
+  </script>
+{% endblock %}

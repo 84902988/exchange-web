@@ -1,0 +1,125 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}行情缓存观测{% endblock %}
+{% block page_title %}行情缓存观测{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">按自然日统计 market_cache、last_good 与 K线补数行为；统计保存在进程内存中。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/market-cache-monitor" class="btn secondary admin-btn admin-btn-secondary">手动刷新</a>
+{% endblock %}
+
+{% macro overview_cards(title, data, date_text) %}
+  <section class="page-section">
+    <div class="overview-panel-header">
+      <div>
+        <h3 class="overview-panel-title">{{ title }}</h3>
+        <div class="overview-panel-subtitle">{{ date_text or '-' }}</div>
+      </div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">缓存命中</div>
+          <div class="stat-icon">H</div>
+        </div>
+        <div class="stat-value admin-number">{{ data.hit }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">缓存未命中</div>
+          <div class="stat-icon">M</div>
+        </div>
+        <div class="stat-value admin-number">{{ data.miss }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">外部 API 调用</div>
+          <div class="stat-icon">E</div>
+        </div>
+        <div class="stat-value admin-number">{{ data.external_api_calls }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">使用最后可用缓存</div>
+          <div class="stat-icon">L</div>
+        </div>
+        <div class="stat-value admin-number">{{ data.last_good_used }}</div>
+      </div>
+    </div>
+  </section>
+{% endmacro %}
+
+{% block content %}
+  {{ overview_cards('今日统计', metrics.today.overview, metrics.today.date) }}
+  {{ overview_cards('昨日统计', metrics.yesterday.overview, metrics.yesterday.date) }}
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">今日按类型统计</div>
+      <div class="table-wrap admin-table-wrap">
+        <table class="data-table admin-table">
+          <thead>
+            <tr>
+              <th>类型</th>
+              <th class="text-right">命中</th>
+              <th class="text-right">未命中</th>
+              <th class="text-right">外部 API</th>
+              <th class="text-right">last_good</th>
+              <th class="text-right">次数</th>
+              <th class="text-right">行数</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in metrics.today.type_rows %}
+              <tr>
+                <td class="mono nowrap">{{ row.label }}</td>
+                <td class="text-right admin-number"><span class="admin-badge admin-badge-success">命中</span> {{ row.hit }}</td>
+                <td class="text-right admin-number"><span class="admin-badge admin-badge-warning">未命中</span> {{ row.miss }}</td>
+                <td class="text-right admin-number">{{ row.external_api_calls }}</td>
+                <td class="text-right admin-number">{{ row.last_good_used }}</td>
+                <td class="text-right admin-number">{{ row.count }}</td>
+                <td class="text-right admin-number">{{ row.rows }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">最近 50 条错误</div>
+      {% if metrics.errors %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th class="nowrap">时间</th>
+                <th>provider</th>
+                <th>symbol</th>
+                <th>接口</th>
+                <th>错误</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in metrics.errors %}
+                <tr>
+                  <td class="mono nowrap admin-time">{{ item.time }}</td>
+                  <td class="mono nowrap">{{ item.provider }}</td>
+                  <td class="mono nowrap">{{ item.symbol }}</td>
+                  <td class="mono nowrap admin-hash" title="{{ item.endpoint }}">{{ item.endpoint }}</td>
+                  <td class="mono admin-hash" title="{{ item.error }}">{{ item.error }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无错误记录</div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

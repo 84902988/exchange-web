@@ -1,0 +1,166 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}平台内转账记录{% endblock %}
+{% block page_title %}平台内转账记录{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">基于 user_transfers 表查询平台内用户互转记录，仅用于后台只读核查。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .transfer-policy{margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,255,255,.10);border-radius:8px;background:rgba(255,255,255,.04);color:rgba(255,255,255,.70);font-size:13px;line-height:1.6;}
+    .transfer-policy.warning{border-color:rgba(227,171,57,.28);background:rgba(189,134,25,.12);color:#ffd68a;}
+    .transfer-quick-ranges{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px;}
+    .transfer-quick-ranges .active{background:var(--brand-soft);border-color:rgba(189,52,25,.35);color:#fff;}
+    .transfer-time-hint{margin-top:6px;color:rgba(255,255,255,.46);font-size:12px;line-height:1.45;}
+  </style>
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <div class="transfer-policy">{{ large_table_notice }}</div>
+      {% if query_notice %}
+        <div class="transfer-policy warning">{{ query_notice }}</div>
+      {% endif %}
+      <div class="transfer-quick-ranges" aria-label="快捷日期">
+        {% for range_item in quick_ranges %}
+          <a
+            href="{{ request.url.include_query_params(created_from=range_item.date_from, created_to=range_item.date_to, date_from=range_item.date_from, date_to=range_item.date_to, start_time=range_item.date_from, end_time=range_item.date_to, page=1) }}"
+            class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if active_range_days == range_item.days %}active{% endif %}"
+          >最近{{ range_item.days }}天</a>
+        {% endfor %}
+      </div>
+      <form method="get" action="/admin/user-transfers" class="filter-form">
+        <div class="field">
+          <label for="transfer_id">划转ID</label>
+          <input id="transfer_id" type="text" name="transfer_id" value="{{ filters.transfer_id or '' }}" placeholder="划转ID" />
+        </div>
+        <div class="field">
+          <label for="transfer_no">转账单号</label>
+          <input id="transfer_no" type="text" name="transfer_no" value="{{ filters.transfer_no or '' }}" placeholder="请输入划转单号" />
+        </div>
+        <div class="field">
+          <label for="user_id">用户ID</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" placeholder="匹配转出或转入用户" />
+        </div>
+        <div class="field">
+          <label for="from_user_id">转出用户ID</label>
+          <input id="from_user_id" type="text" name="from_user_id" value="{{ filters.from_user_id or '' }}" placeholder="请输入转出用户ID" />
+        </div>
+        <div class="field">
+          <label for="to_user_id">转入用户ID</label>
+          <input id="to_user_id" type="text" name="to_user_id" value="{{ filters.to_user_id or '' }}" placeholder="请输入转入用户ID" />
+        </div>
+        <div class="field">
+          <label for="coin_symbol">币种</label>
+          <input id="coin_symbol" type="text" name="coin_symbol" value="{{ filters.coin_symbol or '' }}" placeholder="例如 USDT" />
+        </div>
+        <div class="field">
+          <label for="request_id">请求ID</label>
+          <input id="request_id" type="text" name="request_id" value="{{ filters.request_id or '' }}" placeholder="请输入请求ID" />
+        </div>
+        <div class="field">
+          <label for="direction">方向</label>
+          <select id="direction" name="direction">
+            <option value="all" {% if filters.direction == 'all' %}selected{% endif %}>全部</option>
+            <option value="out" {% if filters.direction == 'out' %}selected{% endif %}>平台内转出</option>
+            <option value="in" {% if filters.direction == 'in' %}selected{% endif %}>平台内转入</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="SUCCESS" {% if filters.status == 'SUCCESS' %}selected{% endif %}>已完成</option>
+            <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
+            <option value="PENDING" {% if filters.status == 'PENDING' %}selected{% endif %}>处理中</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="created_from">开始日期</label>
+          <input id="created_from" type="date" name="created_from" value="{{ filters.created_from or '' }}" />
+          <div class="transfer-time-hint">默认最近7天；普通查询最大范围30天。</div>
+        </div>
+        <div class="field">
+          <label for="created_to">结束日期</label>
+          <input id="created_to" type="date" name="created_to" value="{{ filters.created_to or '' }}" />
+          <div class="transfer-time-hint">超过30天请填写划转ID、划转单号、用户ID或币种。</div>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/user-transfers" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">平台内转账列表</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>划转单号</th>
+                <th>请求ID</th>
+                <th>方向</th>
+                <th>转出用户ID</th>
+                <th>转入用户ID</th>
+                <th class="nowrap">币种</th>
+                <th class="text-right">划转数量</th>
+                <th class="text-right">手续费</th>
+                <th class="text-right">实到账</th>
+                <th class="nowrap">状态</th>
+                <th>备注</th>
+                <th class="nowrap">创建时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id" title="{{ item.transfer_no }}">{{ item.transfer_no }}</td>
+                  <td class="admin-hash" title="{{ item.request_id }}">{{ item.request_id_short }}</td>
+                  <td class="nowrap">{{ item.direction_label }}</td>
+                  <td class="admin-id">{{ item.from_user_id }}</td>
+                  <td class="admin-id">{{ item.to_user_id }}</td>
+                  <td class="mono nowrap">{{ item.coin_symbol }}</td>
+                  <td class="admin-amount">{{ item.amount }}</td>
+                  <td class="admin-amount">{{ item.fee }}</td>
+                  <td class="admin-amount">{{ item.net_amount }}</td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">
+                      {{ item.status_label }}
+                    </span>
+                  </td>
+                  <td>{{ item.remark }}</td>
+                  <td class="nowrap">{{ item.created_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无符合条件的平台内转账记录</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

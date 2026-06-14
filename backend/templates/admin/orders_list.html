@@ -1,0 +1,622 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}订单管理{% endblock %}
+{% block page_title %}订单管理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查询撮合与 Dealer 订单，按订单号、用户、交易对、状态和日期范围快速定位。</div>
+{% endblock %}
+
+{% block content %}
+  {% set execution_labels = {"INTERNAL": "内盘撮合", "MATCHING": "撮合成交", "DEALER": "平台对手方"} %}
+  <style>
+    .orders-performance-tip{
+      margin-bottom:14px;
+      padding:12px 14px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:10px;
+      background:rgba(255,255,255,.04);
+      color:rgba(255,255,255,.72);
+      font-size:13px;
+      line-height:1.6;
+    }
+    .orders-performance-tip.warning{
+      border-color:rgba(227,171,57,.28);
+      background:rgba(189,134,25,.12);
+      color:#ffd68a;
+    }
+    .orders-filter-form{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(0, 1fr));
+      gap:14px;
+      align-items:end;
+    }
+    .orders-filter-form .field{ min-width:0; }
+    .orders-time-hint{
+      margin-top:6px;
+      color:rgba(255,255,255,.46);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .orders-filter-actions{
+      grid-column:1 / -1;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:18px;
+      padding-top:10px;
+      border-top:1px solid rgba(255,255,255,.08);
+    }
+    .orders-filter-group{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .orders-filter-group.date-presets{ flex:1 1 auto; }
+    .orders-filter-group.query-actions{
+      flex:0 0 auto;
+      justify-content:flex-end;
+      padding-left:18px;
+      border-left:1px solid rgba(255,255,255,.12);
+    }
+    .orders-quick-label{
+      display:flex;
+      align-items:baseline;
+      gap:8px;
+      margin-right:2px;
+      white-space:nowrap;
+    }
+    .orders-quick-label strong{
+      color:var(--text);
+      font-size:13px;
+      font-weight:600;
+    }
+    .orders-quick-label span{
+      color:rgba(255,255,255,.45);
+      font-size:12px;
+    }
+    .orders-quick-ranges,
+    .orders-pagination-actions{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .orders-submit-scope.is-active{
+      border-color:rgba(92,184,255,.48);
+      background:rgba(49,135,255,.22);
+      color:#d9ecff;
+    }
+    .orders-quick-ranges .active{
+      background:var(--brand-soft);
+      border-color:rgba(189,52,25,.35);
+      color:#fff;
+    }
+    .orders-table-wrap{
+      overflow:auto;
+      border-radius:10px;
+      scrollbar-color:rgba(255,255,255,.24) rgba(255,255,255,.06);
+      scrollbar-width:thin;
+    }
+    .orders-table-wrap::-webkit-scrollbar{ height:8px; }
+    .orders-table-wrap::-webkit-scrollbar-track{
+      background:rgba(255,255,255,.05);
+      border-radius:999px;
+    }
+    .orders-table-wrap::-webkit-scrollbar-thumb{
+      background:rgba(255,255,255,.20);
+      border-radius:999px;
+    }
+    .orders-result-summary,
+    .orders-pagination{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      color:var(--muted);
+      font-size:13px;
+      flex-wrap:wrap;
+    }
+    .orders-result-summary{ margin:0 0 12px; }
+    .orders-pagination{ margin-top:14px; }
+    .orders-page-limit{
+      margin-top:6px;
+      color:#ffd68a;
+    }
+    .orders-page-input,
+    .orders-page-size{
+      height:34px;
+      border-radius:8px;
+      border:1px solid var(--border);
+      background:rgba(0,0,0,.20);
+      color:var(--text);
+      padding:0 10px;
+      font-size:13px;
+      outline:none;
+    }
+    .orders-page-input{
+      width:72px;
+      text-align:center;
+    }
+    .orders-page-size{ width:92px; }
+    .btn.disabled,
+    .btn[aria-disabled="true"]{
+      opacity:.42;
+      cursor:not-allowed;
+      pointer-events:none;
+    }
+    .orders-cursor-summary{
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+      color:var(--muted);
+      line-height:1.45;
+    }
+    .orders-cursor-summary strong{
+      color:var(--text);
+      font-weight:600;
+    }
+    .admin-record-list{
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .admin-record-row{
+      display:grid;
+      grid-template-columns:minmax(0, 4fr) minmax(150px, 1fr);
+      gap:16px;
+      min-height:78px;
+      padding:10px 12px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:8px;
+      background:rgba(255,255,255,.025);
+      transition:background .16s ease, border-color .16s ease;
+    }
+    .admin-record-row:hover{
+      border-color:rgba(92,184,255,.22);
+      background:rgba(255,255,255,.045);
+    }
+    .admin-record-main{
+      min-width:0;
+      display:flex;
+      flex-direction:column;
+      justify-content:center;
+      gap:8px;
+    }
+    .admin-record-top,
+    .admin-record-meta{
+      display:flex;
+      align-items:center;
+      flex-wrap:wrap;
+      gap:8px 10px;
+      min-width:0;
+    }
+    .admin-record-symbol{
+      color:var(--text);
+      font-size:15px;
+      font-weight:700;
+      letter-spacing:0;
+    }
+    .admin-record-user,
+    .admin-record-side-note{
+      color:rgba(255,255,255,.58);
+      font-size:12px;
+    }
+    .admin-record-meta{
+      gap:6px 14px;
+      color:rgba(255,255,255,.76);
+      font-size:13px;
+      font-variant-numeric:tabular-nums;
+    }
+    .admin-record-meta span{
+      white-space:nowrap;
+    }
+    .admin-record-meta strong{
+      color:rgba(255,255,255,.92);
+      font-weight:600;
+    }
+    .admin-record-side{
+      min-width:0;
+      display:flex;
+      flex-direction:column;
+      align-items:flex-end;
+      justify-content:center;
+      gap:6px;
+      text-align:right;
+      color:rgba(255,255,255,.62);
+      font-size:12px;
+      font-variant-numeric:tabular-nums;
+    }
+    .admin-record-time-date{
+      color:rgba(255,255,255,.86);
+      font-size:13px;
+    }
+    .admin-record-time-clock{
+      color:rgba(255,255,255,.54);
+      font-size:12px;
+    }
+    .admin-record-side-badge-buy{
+      border-color:rgba(74,222,128,.35);
+      background:rgba(34,197,94,.14);
+      color:#bbf7d0;
+    }
+    .admin-record-side-badge-sell{
+      border-color:rgba(248,113,113,.38);
+      background:rgba(239,68,68,.14);
+      color:#fecaca;
+    }
+    @media (max-width:1180px){
+      .orders-filter-form{ grid-template-columns:repeat(2, minmax(0, 1fr)); }
+      .orders-filter-actions{ align-items:flex-start; flex-direction:column; }
+      .orders-filter-group.query-actions{
+        padding-left:0;
+        border-left:0;
+        border-top:1px solid rgba(255,255,255,.10);
+        padding-top:10px;
+        width:100%;
+        justify-content:flex-start;
+      }
+    }
+    @media (max-width:720px){
+      .orders-filter-form{ grid-template-columns:1fr; }
+      .admin-record-row{
+        grid-template-columns:1fr;
+        min-height:auto;
+      }
+      .admin-record-side{
+        align-items:flex-start;
+        text-align:left;
+        border-top:1px solid rgba(255,255,255,.08);
+        padding-top:8px;
+      }
+    }
+  </style>
+
+  <div class="orders-performance-tip">
+    {{ large_table_notice }}
+  </div>
+  {% if performance_notice %}
+    <div class="orders-performance-tip warning">{{ performance_notice }}</div>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/orders" class="filter-form orders-filter-form" id="orders-filter-form">
+        <input type="hidden" id="query_scope" name="query_scope" value="{{ query_scope or filters.query_scope or 'recent' }}" />
+        <div class="field">
+          <label for="order_id">订单ID</label>
+          <input id="order_id" type="text" name="order_id" value="{{ filters.order_id or '' }}" placeholder="请输入订单ID" />
+        </div>
+        <div class="field">
+          <label for="order_no">订单号</label>
+          <input id="order_no" type="text" name="order_no" value="{{ filters.order_no or '' }}" placeholder="请输入订单号" />
+        </div>
+        <div class="field">
+          <label for="user_id">用户ID</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" placeholder="请输入用户ID" />
+        </div>
+        <div class="field">
+          <label for="symbol">交易对</label>
+          <input id="symbol" type="text" name="symbol" value="{{ filters.symbol or '' }}" placeholder="例如 BTCUSDT" />
+        </div>
+        <div class="field">
+          <label for="side">方向</label>
+          <select id="side" name="side">
+            <option value="">全部</option>
+            <option value="BUY" {% if filters.side == 'BUY' %}selected{% endif %}>买入</option>
+            <option value="SELL" {% if filters.side == 'SELL' %}selected{% endif %}>卖出</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="order_type">类型</label>
+          <select id="order_type" name="order_type">
+            <option value="">全部</option>
+            <option value="LIMIT" {% if filters.order_type == 'LIMIT' %}selected{% endif %}>限价</option>
+            <option value="MARKET" {% if filters.order_type == 'MARKET' %}selected{% endif %}>市价</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="execution_mode">执行模式</label>
+          <select id="execution_mode" name="execution_mode">
+            <option value="">全部</option>
+            <option value="INTERNAL" {% if filters.execution_mode == 'INTERNAL' %}selected{% endif %}>内盘撮合</option>
+            <option value="MATCHING" {% if filters.execution_mode == 'MATCHING' %}selected{% endif %}>撮合成交</option>
+            <option value="DEALER" {% if filters.execution_mode == 'DEALER' %}selected{% endif %}>平台对手方</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="OPEN" {% if filters.status == 'OPEN' %}selected{% endif %}>进行中</option>
+            <option value="PARTIALLY_FILLED" {% if filters.status == 'PARTIALLY_FILLED' %}selected{% endif %}>部分成交</option>
+            <option value="FILLED" {% if filters.status == 'FILLED' %}selected{% endif %}>已成交</option>
+            <option value="CANCELED" {% if filters.status == 'CANCELED' or filters.status == 'CANCELLED' %}selected{% endif %}>已撤单</option>
+            <option value="REJECTED" {% if filters.status == 'REJECTED' %}selected{% endif %}>已拒绝</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="start_time">开始日期</label>
+          <input id="start_time" type="date" name="start_time" value="{{ filters.start_time or '' }}" />
+          <div class="orders-time-hint">默认最近7天；普通查询最大范围30天。</div>
+        </div>
+        <div class="field">
+          <label for="end_time">结束日期</label>
+          <input id="end_time" type="date" name="end_time" value="{{ filters.end_time or '' }}" />
+          <div class="orders-time-hint">超过30天请填写用户ID、订单ID、订单号或交易对。</div>
+        </div>
+        <div class="orders-filter-actions">
+          <div class="orders-filter-group date-presets">
+            <div class="orders-quick-label">
+              <strong>快捷日期</strong>
+              <span>点击后自动填充开始/结束日期</span>
+            </div>
+            <div class="orders-quick-ranges" aria-label="快捷日期">
+              {% for range_item in quick_ranges %}
+                <a
+                  href="{{ request.url.include_query_params(query_scope='recent', start_time=range_item.date_from, end_time=range_item.date_to, date_from=range_item.date_from, date_to=range_item.date_to, page=1) }}"
+                  class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if active_range_days == range_item.days %}active{% endif %}"
+                >最近{{ range_item.days }}天</a>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="orders-filter-group query-actions">
+            <button type="submit" class="btn orders-submit-scope {% if query_scope == 'recent' %}is-active{% else %}secondary{% endif %} admin-btn" data-scope="recent">查看最近订单</button>
+            <button type="submit" class="btn orders-submit-scope {% if query_scope == 'history' %}is-active{% else %}secondary{% endif %} admin-btn" data-scope="history">按条件查询历史</button>
+            <a href="/admin/orders" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+          </div>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">订单列表</div>
+      <div class="orders-result-summary">
+        {% if pagination.pagination_mode == 'cursor' %}
+          <div>历史查询结果，按下单时间倒序展示；当前批次 {{ items|length }} 条</div>
+        {% else %}
+          <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+          {% if pagination.is_page_limited %}
+            <div class="orders-page-limit">最多翻到第 500 页，请缩小筛选条件。</div>
+          {% endif %}
+        {% endif %}
+      </div>
+
+      {% if items %}
+        <div class="admin-record-list">
+          {% for item in items %}
+            {% set created_parts = (item.created_at|string).split(' ') %}
+            <div class="admin-record-row">
+              <div class="admin-record-main">
+                <div class="admin-record-top">
+                  <span class="mono admin-record-symbol">{{ item.symbol }}</span>
+                  <span class="admin-badge {% if item.side == 'BUY' %}admin-record-side-badge-buy{% elif item.side == 'SELL' %}admin-record-side-badge-sell{% else %}admin-badge-{{ item.side_badge }}{% endif %}">{{ item.side_label }}</span>
+                  <span class="admin-badge admin-badge-{{ item.order_type_badge }}">{{ item.order_type_label }}</span>
+                  {% if item.execution_mode == 'INTERNAL' %}
+                    <span class="admin-badge admin-badge-info" title="{{ item.execution_mode }}">{{ item.execution_mode_label }}</span>
+                  {% elif item.execution_mode == 'DEALER' %}
+                    <span class="admin-badge admin-badge-purple" title="{{ item.execution_mode }}">{{ item.execution_mode_label }}</span>
+                  {% else %}
+                    <span class="admin-badge admin-badge-{{ item.execution_mode_badge }}" title="{{ item.execution_mode }}">{{ item.execution_mode_label }}</span>
+                  {% endif %}
+                  <span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span>
+                  <span class="admin-record-user">用户：{{ item.user_id }}</span>
+                </div>
+                <div class="admin-record-meta">
+                  <span>价格：<strong>{{ item.price }}</strong></span>
+                  <span>数量：<strong>{{ item.amount }}</strong></span>
+                  <span>成交：<strong>{{ item.filled_amount }}</strong></span>
+                  <span>剩余：<strong>{{ item.remaining_amount }}</strong></span>
+                  <span>冻结：<strong>{{ item.frozen_amount }}</strong></span>
+                  <span>均价：<strong>{{ item.avg_price }}</strong></span>
+                  <span>手续费：<strong>{{ item.fee_text }}</strong></span>
+                </div>
+              </div>
+              <div class="admin-record-side">
+                <div>
+                  <div class="admin-record-time-date">{{ created_parts[0] }}</div>
+                  <div class="admin-record-time-clock">{{ created_parts[1] if created_parts|length > 1 else '' }}</div>
+                </div>
+                <div class="admin-record-side-note" title="{{ item.order_no }}">订单：{{ item.order_no }}</div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无数据</div>
+          <p class="admin-empty-desc">当前筛选条件下暂无记录，可调整筛选条件后重试</p>
+        </div>
+      {% endif %}
+
+      <div class="orders-pagination admin-pagination">
+        {% if pagination.pagination_mode == 'cursor' %}
+          <div class="orders-cursor-summary">
+            <strong>历史查询结果，按下单时间倒序展示</strong>
+            <span>当前批次，每批 {{ pagination.page_size }} 条{% if pagination.total is defined %}；当前条件约 {{ pagination.total }} 条{% endif %}</span>
+          </div>
+          <form method="get" action="/admin/orders" class="orders-pagination-actions" id="orders-pagination-form">
+            <input type="hidden" name="query_scope" value="history" />
+            <input type="hidden" name="order_id" value="{{ filters.order_id or '' }}" />
+            <input type="hidden" name="order_no" value="{{ filters.order_no or '' }}" />
+            <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}" />
+            <input type="hidden" name="symbol" value="{{ filters.symbol or '' }}" />
+            <input type="hidden" name="side" value="{{ filters.side or '' }}" />
+            <input type="hidden" name="order_type" value="{{ filters.order_type or '' }}" />
+            <input type="hidden" name="execution_mode" value="{{ filters.execution_mode or '' }}" />
+            <input type="hidden" name="status" value="{{ filters.status or '' }}" />
+            <input type="hidden" name="start_time" value="{{ filters.start_time or '' }}" />
+            <input type="hidden" name="end_time" value="{{ filters.end_time or '' }}" />
+            {% if pagination.has_prev %}
+              <a href="{{ request.url.include_query_params(query_scope='history', order_id=filters.order_id or '', order_no=filters.order_no or '', user_id=filters.user_id or '', symbol=filters.symbol or '', side=filters.side or '', order_type=filters.order_type or '', execution_mode=filters.execution_mode or '', status=filters.status or '', start_time=filters.start_time or '', end_time=filters.end_time or '', cursor_created_at=pagination.prev_cursor_created_at, cursor_id=pagination.prev_cursor_id, direction='prev', page_size=pagination.page_size, page=1) }}" class="btn secondary admin-btn admin-btn-secondary">上一批</a>
+            {% else %}
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">上一批</span>
+            {% endif %}
+            <span>当前批次</span>
+            {% if pagination.has_next %}
+              <a href="{{ request.url.include_query_params(query_scope='history', order_id=filters.order_id or '', order_no=filters.order_no or '', user_id=filters.user_id or '', symbol=filters.symbol or '', side=filters.side or '', order_type=filters.order_type or '', execution_mode=filters.execution_mode or '', status=filters.status or '', start_time=filters.start_time or '', end_time=filters.end_time or '', cursor_created_at=pagination.next_cursor_created_at, cursor_id=pagination.next_cursor_id, direction='next', page_size=pagination.page_size, page=1) }}" class="btn secondary admin-btn admin-btn-secondary">下一批</a>
+            {% else %}
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">下一批</span>
+            {% endif %}
+            <label for="orders-page-size">每批条数</label>
+            <select id="orders-page-size" class="orders-page-size" name="page_size">
+              {% for size in [10, 20, 50, 100] %}
+                <option value="{{ size }}" {% if pagination.page_size == size %}selected{% endif %}>{{ size }}</option>
+              {% endfor %}
+            </select>
+          </form>
+        {% else %}
+          <div>
+            <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+            {% if pagination.is_page_limited %}
+              <div class="orders-page-limit">最多翻到第 500 页，请缩小筛选条件。</div>
+            {% endif %}
+          </div>
+          <form method="get" action="/admin/orders" class="orders-pagination-actions" id="orders-pagination-form">
+            <input type="hidden" name="query_scope" value="{{ query_scope or filters.query_scope or 'recent' }}" />
+            <input type="hidden" name="order_id" value="{{ filters.order_id or '' }}" />
+            <input type="hidden" name="order_no" value="{{ filters.order_no or '' }}" />
+            <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}" />
+            <input type="hidden" name="symbol" value="{{ filters.symbol or '' }}" />
+            <input type="hidden" name="side" value="{{ filters.side or '' }}" />
+            <input type="hidden" name="order_type" value="{{ filters.order_type or '' }}" />
+            <input type="hidden" name="execution_mode" value="{{ filters.execution_mode or '' }}" />
+            <input type="hidden" name="status" value="{{ filters.status or '' }}" />
+            <input type="hidden" name="start_time" value="{{ filters.start_time or '' }}" />
+            <input type="hidden" name="end_time" value="{{ filters.end_time or '' }}" />
+            {% if pagination.has_prev %}
+              <a href="{{ request.url.include_query_params(page=1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">首页</a>
+              <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+            {% else %}
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">首页</span>
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">上一页</span>
+            {% endif %}
+            <span>第</span>
+            <input
+              class="orders-page-input"
+              type="number"
+              name="page"
+              min="1"
+              max="{{ pagination.pages }}"
+              value="{{ pagination.page }}"
+              aria-label="页码"
+            />
+            <span>/ {{ pagination.pages }} 页</span>
+            {% if pagination.has_next %}
+              <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+              <a href="{{ request.url.include_query_params(page=pagination.pages, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">尾页</a>
+            {% else %}
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">下一页</span>
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">尾页</span>
+            {% endif %}
+            <label for="orders-page-size">每页条数</label>
+            <select id="orders-page-size" class="orders-page-size" name="page_size">
+              {% for size in [10, 20, 50, 100] %}
+                <option value="{{ size }}" {% if pagination.page_size == size %}selected{% endif %}>{{ size }}</option>
+              {% endfor %}
+            </select>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <script>
+    function formatOrdersDate(date) {
+      var year = date.getFullYear();
+      var month = String(date.getMonth() + 1).padStart(2, "0");
+      var day = String(date.getDate()).padStart(2, "0");
+      return year + "-" + month + "-" + day;
+    }
+
+    function startOfDay(date) {
+      return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
+    }
+
+    function endOfDay(date) {
+      return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 0, 0);
+    }
+
+    function cleanEmptyOrdersFields(form) {
+      if (!form) return;
+      Array.prototype.forEach.call(form.querySelectorAll("input, select"), function (field) {
+        if (!field.name || field.name === "query_scope" || field.name === "page" || field.name === "page_size") return;
+        if (String(field.value || "").trim() === "") {
+          field.disabled = true;
+        }
+      });
+    }
+
+    (function () {
+      var filterForm = document.getElementById("orders-filter-form");
+      var scopeInput = document.getElementById("query_scope");
+      var startInput = document.getElementById("start_time");
+      var endInput = document.getElementById("end_time");
+      if (!filterForm || !scopeInput) return;
+
+      Array.prototype.forEach.call(filterForm.querySelectorAll(".orders-submit-scope"), function (button) {
+        button.addEventListener("click", function () {
+          scopeInput.value = button.getAttribute("data-scope") || "recent";
+        });
+      });
+
+      Array.prototype.forEach.call(filterForm.querySelectorAll(".orders-range-button"), function (button) {
+        button.addEventListener("click", function () {
+          var now = new Date();
+          var range = button.getAttribute("data-range");
+          var start = new Date(now);
+          var end = new Date(now);
+          if (range === "recent7") {
+            start.setDate(now.getDate() - 7);
+          } else if (range === "last30") {
+            start.setDate(now.getDate() - 30);
+            scopeInput.value = "history";
+          } else if (range === "today") {
+            start = startOfDay(now);
+            end = endOfDay(now);
+            scopeInput.value = "history";
+          } else if (range === "yesterday") {
+            var yesterday = new Date(now);
+            yesterday.setDate(now.getDate() - 1);
+            start = startOfDay(yesterday);
+            end = endOfDay(yesterday);
+            scopeInput.value = "history";
+          }
+          if (startInput) startInput.value = formatOrdersDate(start);
+          if (endInput) endInput.value = formatOrdersDate(end);
+        });
+      });
+
+      filterForm.addEventListener("submit", function () {
+        cleanEmptyOrdersFields(filterForm);
+      });
+    })();
+
+    (function () {
+      var form = document.getElementById("orders-pagination-form");
+      if (!form) return;
+      var pageInput = form.querySelector('input[name="page"]');
+      var pageSize = form.querySelector('select[name="page_size"]');
+      if (pageInput) {
+        pageInput.addEventListener("keydown", function (event) {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            cleanEmptyOrdersFields(form);
+            form.submit();
+          }
+        });
+      }
+      if (pageSize) {
+        pageSize.addEventListener("change", function () {
+          if (pageInput) pageInput.value = "1";
+          cleanEmptyOrdersFields(form);
+          form.submit();
+        });
+      }
+    })();
+  </script>
+{% endblock %}
+

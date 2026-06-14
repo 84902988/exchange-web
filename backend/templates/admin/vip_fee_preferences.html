@@ -1,0 +1,76 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}VIP 费率{% endblock %}
+{% block page_title %}VIP 费率{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">手续费规则与影响。本页用于统计、核对和运营查看；规则修改请到 <a href="/admin/dividend-config">分红配置</a>。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .vip-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
+    .vip-stat-card{padding:14px 16px}
+    .vip-stat-label{color:var(--muted);font-size:12px;margin-bottom:8px}
+    .vip-stat-value{font-size:22px;font-weight:900;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .vip-filter-form{grid-template-columns:repeat(2,minmax(0,1fr)) auto}
+    .vip-table{min-width:0;table-layout:fixed}
+    .vip-cell{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .vip-number{font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
+    @media (max-width:1180px){.vip-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.vip-filter-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media (max-width:720px){.vip-stat-grid,.vip-filter-form{grid-template-columns:1fr}.vip-table{min-width:720px}}
+  </style>
+
+  <section class="page-section">
+    <div class="vip-stat-grid">
+      <div class="admin-card vip-stat-card"><div class="vip-stat-label">启用费率规则数</div><div class="vip-stat-value vip-number">{{ stats.enabled_fee_rule_count }}</div></div>
+      <div class="admin-card vip-stat-card"><div class="vip-stat-label">最低 maker 费率</div><div class="vip-stat-value vip-number">{{ stats.min_maker_fee }}</div></div>
+      <div class="admin-card vip-stat-card"><div class="vip-stat-label">最低 taker 费率</div><div class="vip-stat-value vip-number">{{ stats.min_taker_fee }}</div></div>
+      <div class="admin-card vip-stat-card"><div class="vip-stat-label">享受费率优惠用户数</div><div class="vip-stat-value vip-number">{{ stats.discount_user_count }}</div></div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card admin-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/vip/fee-preferences" class="filter-form vip-filter-form">
+        <div class="field"><label for="user_id">用户ID</label><input id="user_id" name="user_id" value="{{ filters.user_id or '' }}" /></div>
+        <div class="field"><label for="use_rcb_fee">使用 RCB</label><input id="use_rcb_fee" name="use_rcb_fee" value="{{ filters.use_rcb_fee or '' }}" placeholder="1 / 0" /></div>
+        <div class="filter-actions"><button type="submit" class="btn admin-btn admin-btn-primary">查询</button><a href="/admin/vip/fee-preferences" class="btn secondary admin-btn admin-btn-secondary">重置</a></div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card admin-card">
+      <div class="section-title">手续费偏好影响用户</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table vip-table">
+            <colgroup><col style="width:12%"><col style="width:18%"><col style="width:20%"><col style="width:25%"><col style="width:25%"></colgroup>
+            <thead><tr><th>ID</th><th>用户ID</th><th>偏好</th><th>创建时间</th><th>更新时间</th></tr></thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id"><div class="vip-cell">{{ item.id }}</div></td>
+                  <td class="admin-id"><div class="vip-cell">{{ item.user_id }}</div></td>
+                  <td><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.use_rcb_fee_label }}</span></td>
+                  <td class="admin-time"><div class="vip-cell">{{ item.created_at }}</div></td>
+                  <td class="admin-time"><div class="vip-cell">{{ item.updated_at }}</div></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无数据</div><p class="admin-empty-desc">暂无 VIP 费率配置</p></div>
+      {% endif %}
+      <div class="pagination admin-pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}<a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>{% endif %}
+          {% if pagination.page < pagination.pages %}<a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>{% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

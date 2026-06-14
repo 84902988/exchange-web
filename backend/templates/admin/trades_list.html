@@ -1,0 +1,737 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}成交管理{% endblock %}
+{% block page_title %}成交管理{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查询真实成交记录，按用户、订单号、交易对与对手方类型快速定位。</div>
+{% endblock %}
+
+{% block content %}
+  {% set counterparty_labels = {"USER": "用户成交", "PLATFORM": "平台对手方", "DEALER": "平台对手方", "INTERNAL": "内盘撮合"} %}
+  <style>
+    .trade-fee-summary{
+      display:flex;
+      flex-direction:column;
+      gap:3px;
+      min-width:180px;
+      color:rgba(255,255,255,.78);
+      line-height:1.45;
+    }
+    .trade-fee-summary span{
+      white-space:nowrap;
+    }
+    .trade-fee-detail-row[hidden]{ display:none; }
+    .trade-fee-detail{
+      margin:4px 0 8px;
+      padding:14px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:10px;
+      background:rgba(0,0,0,.20);
+    }
+    .trade-fee-detail-title{
+      margin-bottom:10px;
+      font-weight:700;
+      color:rgba(255,255,255,.88);
+    }
+    .trade-fee-detail .data-table{
+      min-width:920px;
+    }
+    .trade-fee-empty{
+      padding:12px;
+      border:1px dashed rgba(255,255,255,.14);
+      border-radius:8px;
+      color:rgba(255,255,255,.52);
+    }
+    .trade-performance-tip{
+      margin-bottom:14px;
+      padding:12px 14px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:10px;
+      background:rgba(255,255,255,.04);
+      color:rgba(255,255,255,.72);
+      font-size:13px;
+      line-height:1.6;
+    }
+    .trade-performance-tip.warning{
+      border-color:rgba(227,171,57,.28);
+      background:rgba(189,134,25,.12);
+      color:#ffd68a;
+    }
+    .trade-pagination{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      margin-top:14px;
+      color:var(--muted);
+      font-size:13px;
+      flex-wrap:wrap;
+    }
+    .trade-pagination-actions{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .trade-page-input,
+    .trade-page-size{
+      height:34px;
+      border-radius:8px;
+      border:1px solid var(--border);
+      background:rgba(0,0,0,.20);
+      color:var(--text);
+      padding:0 10px;
+      font-size:13px;
+      outline:none;
+    }
+    .trade-page-input{
+      width:72px;
+      text-align:center;
+    }
+    .trade-page-size{ width:92px; }
+    .btn.disabled,
+    .btn[aria-disabled="true"]{
+      opacity:.42;
+      cursor:not-allowed;
+      pointer-events:none;
+    }
+    .trade-time-hint{
+      margin-top:6px;
+      color:rgba(255,255,255,.46);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .trade-quick-ranges{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:flex-end;
+    }
+    .trade-filter-form{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(0, 1fr));
+      gap:14px;
+      align-items:end;
+    }
+    .trade-filter-form .field{
+      min-width:0;
+    }
+    .trade-filter-actions{
+      grid-column:1 / -1;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:18px;
+      padding-top:10px;
+      border-top:1px solid rgba(255,255,255,.08);
+    }
+    .trade-filter-group{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .trade-filter-group.date-presets{
+      flex:1 1 auto;
+    }
+    .trade-filter-group.query-actions{
+      flex:0 0 auto;
+      justify-content:flex-end;
+      padding-left:18px;
+      border-left:1px solid rgba(255,255,255,.12);
+    }
+    .trade-quick-label{
+      display:flex;
+      align-items:baseline;
+      gap:8px;
+      margin-right:2px;
+      white-space:nowrap;
+    }
+    .trade-quick-label strong{
+      color:var(--text);
+      font-size:13px;
+      font-weight:600;
+    }
+    .trade-quick-label span{
+      color:rgba(255,255,255,.45);
+      font-size:12px;
+    }
+    .trade-filter-actions .trade-quick-ranges,
+    .trade-filter-actions .filter-actions{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .trade-filter-actions .filter-actions{
+      justify-content:flex-end;
+    }
+    .trade-submit-scope.is-active{
+      border-color:rgba(92,184,255,.48);
+      background:rgba(49,135,255,.22);
+      color:#d9ecff;
+    }
+    .trade-quick-ranges .active{
+      background:var(--brand-soft);
+      border-color:rgba(189,52,25,.35);
+      color:#fff;
+    }
+    .trade-table-wrap{
+      overflow:auto;
+      border-radius:10px;
+      scrollbar-color:rgba(255,255,255,.24) rgba(255,255,255,.06);
+      scrollbar-width:thin;
+    }
+    .trade-table-wrap::-webkit-scrollbar{
+      height:8px;
+    }
+    .trade-table-wrap::-webkit-scrollbar-track{
+      background:rgba(255,255,255,.05);
+      border-radius:999px;
+    }
+    .trade-table-wrap::-webkit-scrollbar-thumb{
+      background:rgba(255,255,255,.20);
+      border-radius:999px;
+    }
+    .trade-page-limit{
+      margin-top:6px;
+      color:#ffd68a;
+    }
+    .trade-result-summary{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      margin:0 0 12px;
+      color:var(--muted);
+      font-size:13px;
+      flex-wrap:wrap;
+    }
+    .trade-cursor-summary{
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+      color:var(--muted);
+      line-height:1.45;
+    }
+    .trade-cursor-summary strong{
+      color:var(--text);
+      font-weight:600;
+    }
+    .admin-record-list{
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .admin-record-row{
+      display:grid;
+      grid-template-columns:minmax(0, 4fr) minmax(150px, 1fr);
+      gap:16px;
+      min-height:82px;
+      padding:10px 12px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:8px;
+      background:rgba(255,255,255,.025);
+      transition:background .16s ease, border-color .16s ease;
+    }
+    .admin-record-row:hover{
+      border-color:rgba(92,184,255,.22);
+      background:rgba(255,255,255,.045);
+    }
+    .admin-record-main{
+      min-width:0;
+      display:flex;
+      flex-direction:column;
+      justify-content:center;
+      gap:8px;
+    }
+    .admin-record-top,
+    .admin-record-meta{
+      display:flex;
+      align-items:center;
+      flex-wrap:wrap;
+      gap:8px 10px;
+      min-width:0;
+    }
+    .admin-record-symbol{
+      color:var(--text);
+      font-size:15px;
+      font-weight:700;
+      letter-spacing:0;
+    }
+    .admin-record-user,
+    .admin-record-side-note{
+      color:rgba(255,255,255,.58);
+      font-size:12px;
+    }
+    .admin-record-meta{
+      gap:6px 14px;
+      color:rgba(255,255,255,.76);
+      font-size:13px;
+      font-variant-numeric:tabular-nums;
+    }
+    .admin-record-meta span{
+      white-space:nowrap;
+    }
+    .admin-record-meta strong{
+      color:rgba(255,255,255,.92);
+      font-weight:600;
+    }
+    .admin-record-side{
+      min-width:0;
+      display:flex;
+      flex-direction:column;
+      align-items:flex-end;
+      justify-content:center;
+      gap:7px;
+      text-align:right;
+      color:rgba(255,255,255,.62);
+      font-size:12px;
+      font-variant-numeric:tabular-nums;
+    }
+    .admin-record-time-date{
+      color:rgba(255,255,255,.86);
+      font-size:13px;
+    }
+    .admin-record-time-clock{
+      color:rgba(255,255,255,.54);
+      font-size:12px;
+    }
+    .admin-record-fees{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      color:rgba(255,255,255,.62);
+      font-size:12px;
+      font-variant-numeric:tabular-nums;
+    }
+    .admin-record-fees strong{
+      color:rgba(255,255,255,.86);
+      font-weight:600;
+    }
+    @media (max-width: 1180px){
+      .trade-filter-form{ grid-template-columns:repeat(2, minmax(0, 1fr)); }
+      .trade-filter-actions{ align-items:flex-start; flex-direction:column; }
+      .trade-filter-group.query-actions{
+        padding-left:0;
+        border-left:0;
+        border-top:1px solid rgba(255,255,255,.10);
+        padding-top:10px;
+        width:100%;
+      }
+      .trade-filter-actions .filter-actions{ justify-content:flex-start; }
+    }
+    @media (max-width: 720px){
+      .trade-filter-form{ grid-template-columns:1fr; }
+      .admin-record-row{
+        grid-template-columns:1fr;
+        min-height:auto;
+      }
+      .admin-record-side{
+        align-items:flex-start;
+        text-align:left;
+        border-top:1px solid rgba(255,255,255,.08);
+        padding-top:8px;
+      }
+    }
+  </style>
+
+  <div class="trade-performance-tip">
+    {{ large_table_notice }}
+  </div>
+  {% if performance_notice %}
+    <div class="trade-performance-tip warning">{{ performance_notice }}</div>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/trades" class="filter-form trade-filter-form" id="trades-filter-form">
+        <input type="hidden" id="query_scope" name="query_scope" value="{{ query_scope or filters.query_scope or 'recent' }}" />
+        <div class="field">
+          <label for="trade_id">成交ID</label>
+          <input id="trade_id" type="text" name="trade_id" value="{{ filters.trade_id or '' }}" placeholder="请输入成交ID" />
+        </div>
+        <div class="field">
+          <label for="symbol">交易对</label>
+          <input id="symbol" type="text" name="symbol" value="{{ filters.symbol or '' }}" placeholder="例如 BTCUSDT" />
+        </div>
+        <div class="field">
+          <label for="user_id">用户ID</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" placeholder="买方或卖方用户ID" />
+        </div>
+        <div class="field">
+          <label for="order_id">订单ID</label>
+          <input id="order_id" type="text" name="order_id" value="{{ filters.order_id or '' }}" placeholder="买单/卖单/挂单/吃单ID" />
+        </div>
+        <div class="field">
+          <label for="buyer_user_id">买方用户</label>
+          <input id="buyer_user_id" type="text" name="buyer_user_id" value="{{ filters.buyer_user_id or '' }}" placeholder="请输入买方用户ID" />
+        </div>
+        <div class="field">
+          <label for="seller_user_id">卖方用户</label>
+          <input id="seller_user_id" type="text" name="seller_user_id" value="{{ filters.seller_user_id or '' }}" placeholder="请输入卖方用户ID" />
+        </div>
+        <div class="field">
+          <label for="counterparty_type">对手方类型</label>
+          <select id="counterparty_type" name="counterparty_type">
+            <option value="">全部</option>
+            <option value="USER" {% if filters.counterparty_type == 'USER' %}selected{% endif %}>用户成交</option>
+            <option value="PLATFORM" {% if filters.counterparty_type == 'PLATFORM' %}selected{% endif %}>平台对手方</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="buy_order_id">买单ID</label>
+          <input id="buy_order_id" type="text" name="buy_order_id" value="{{ filters.buy_order_id or '' }}" placeholder="请输入买单ID" />
+        </div>
+        <div class="field">
+          <label for="sell_order_id">卖单ID</label>
+          <input id="sell_order_id" type="text" name="sell_order_id" value="{{ filters.sell_order_id or '' }}" placeholder="请输入卖单ID" />
+        </div>
+        <div class="field">
+          <label for="start_time">开始日期</label>
+          <input id="start_time" type="date" name="start_time" value="{{ filters.start_time or '' }}" />
+          <div class="trade-time-hint">默认最近7天；普通查询最大范围30天。</div>
+        </div>
+        <div class="field">
+          <label for="end_time">结束日期</label>
+          <input id="end_time" type="date" name="end_time" value="{{ filters.end_time or '' }}" />
+          <div class="trade-time-hint">超过30天请填写用户ID、成交ID、订单ID或交易对。</div>
+        </div>
+        <div class="trade-filter-actions">
+          <div class="trade-filter-group date-presets">
+            <div class="trade-quick-label">
+              <strong>快捷日期</strong>
+              <span>点击后自动填充开始/结束日期</span>
+            </div>
+            <div class="trade-quick-ranges" aria-label="快捷日期">
+              {% for range_item in quick_ranges %}
+                <a
+                  href="{{ request.url.include_query_params(query_scope='recent', start_time=range_item.date_from, end_time=range_item.date_to, date_from=range_item.date_from, date_to=range_item.date_to, page=1) }}"
+                  class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if active_range_days == range_item.days %}active{% endif %}"
+                >最近{{ range_item.days }}天</a>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="trade-filter-group query-actions">
+            <button type="submit" class="btn trade-submit-scope {% if query_scope == 'recent' %}is-active{% else %}secondary{% endif %} admin-btn" data-scope="recent">查看最近成交</button>
+            <button type="submit" class="btn trade-submit-scope {% if query_scope == 'history' %}is-active{% else %}secondary{% endif %} admin-btn" data-scope="history">按条件查询历史</button>
+            <a href="/admin/trades" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+          </div>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">成交列表</div>
+      <div class="trade-result-summary">
+        {% if pagination.pagination_mode == 'cursor' %}
+          <div>历史查询结果，按成交时间倒序展示；当前批次 {{ items|length }} 条</div>
+        {% else %}
+          <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+          {% if pagination.is_page_limited %}
+            <div class="trade-page-limit">最多翻到第 500 页，请缩小筛选条件。</div>
+          {% endif %}
+        {% endif %}
+      </div>
+
+      {% if items %}
+        <div class="admin-record-list">
+          {% for item in items %}
+            {% set fee_summary = item.fee_summary|default({}) %}
+            {% set fee_logs = item.fee_logs|default([]) %}
+            {% set created_parts = (item.created_at|string).split(' ') %}
+            <div class="admin-record-row">
+              <div class="admin-record-main">
+                <div class="admin-record-top">
+                  <span class="mono admin-record-symbol">{{ item.symbol }}</span>
+                  <span class="admin-record-user">买方：{{ item.buyer_user_id }}</span>
+                  <span class="admin-record-user">卖方：{{ item.seller_user_id }}</span>
+                  {% if item.counterparty_type == 'DEALER' %}
+                    <span class="admin-badge admin-badge-purple" title="{{ item.counterparty_type }}">{{ item.counterparty_type_label }}</span>
+                  {% elif item.counterparty_type == 'INTERNAL' %}
+                    <span class="admin-badge admin-badge-info" title="{{ item.counterparty_type }}">{{ item.counterparty_type_label }}</span>
+                  {% else %}
+                    <span class="admin-badge admin-badge-{{ item.counterparty_type_badge }}" title="{{ item.counterparty_type }}">{{ item.counterparty_type_label }}</span>
+                  {% endif %}
+                </div>
+                <div class="admin-record-meta">
+                  <span>成交价：<strong>{{ item.price }}</strong></span>
+                  <span>成交量：<strong>{{ item.amount }}</strong></span>
+                  <span>成交额：<strong>{{ item.quote_amount }}</strong></span>
+                  <span>买单：<strong>{{ item.buy_order_id }}</strong></span>
+                  <span>卖单：<strong>{{ item.sell_order_id }}</strong></span>
+                </div>
+                <div class="admin-record-fees">
+                  <span>手续费</span>
+                  <span>买方：<strong>{{ fee_summary.buyer_fee_text|default('--') }}</strong></span>
+                  <span>卖方：<strong>{{ fee_summary.seller_fee_text|default('--') }}</strong></span>
+                </div>
+              </div>
+              <div class="admin-record-side">
+                <div>
+                  <div class="admin-record-time-date">{{ created_parts[0] }}</div>
+                  <div class="admin-record-time-clock">{{ created_parts[1] if created_parts|length > 1 else '' }}</div>
+                </div>
+                <div class="admin-record-side-note">成交：{{ item.trade_id }}</div>
+                <button
+                  type="button"
+                  class="btn secondary trade-fee-toggle admin-btn admin-btn-secondary admin-btn-sm"
+                  data-target="trade-fee-row-{{ item.trade_id }}"
+                >查看手续费</button>
+              </div>
+            </div>
+            <div id="trade-fee-row-{{ item.trade_id }}" class="trade-fee-detail-row" hidden>
+              <div class="trade-fee-detail">
+                <div class="trade-fee-detail-title">
+                  手续费流水明细
+                  <span class="muted">平台：{{ fee_summary.platform_fee_text|default('--') }}</span>
+                </div>
+                {% if fee_logs %}
+                  <div class="table-wrap admin-table-wrap">
+                    <table class="data-table admin-table">
+                      <thead>
+                        <tr>
+                          <th>用户ID</th>
+                          <th>币种</th>
+                          <th class="text-right admin-number">金额</th>
+                          <th>方向</th>
+                          <th>类型</th>
+                          <th class="nowrap">时间</th>
+                          <th>备注</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {% for log in fee_logs %}
+                          <tr>
+                            <td class="admin-id">{{ log.user_id }}</td>
+                            <td class="mono">{{ log.coin_symbol }}</td>
+                            <td class="admin-amount">{{ log.change_amount }}</td>
+                            <td>{{ log.direction }}</td>
+                            <td>
+                              <div>{{ log.change_type }}</div>
+                              <div class="muted">{{ log.biz_type }}</div>
+                            </td>
+                            <td class="nowrap admin-time">{{ log.created_at }}</td>
+                            <td>{{ log.remark }}</td>
+                          </tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                {% else %}
+                  <div class="trade-fee-empty">暂无手续费扣除记录。</div>
+                {% endif %}
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无数据</div>
+          <p class="admin-empty-desc">当前筛选条件下暂无记录，可调整筛选条件后重试</p>
+        </div>
+      {% endif %}
+
+      <div class="trade-pagination admin-pagination">
+        {% if pagination.pagination_mode == 'cursor' %}
+          <div class="trade-cursor-summary">
+            <strong>历史查询结果，按成交时间倒序展示</strong>
+            <span>当前批次，每批 {{ pagination.page_size }} 条{% if pagination.total is defined %}；当前条件约 {{ pagination.total }} 条{% endif %}</span>
+          </div>
+          <form method="get" action="/admin/trades" class="trade-pagination-actions" id="trades-pagination-form">
+            <input type="hidden" name="query_scope" value="history" />
+            <input type="hidden" name="trade_id" value="{{ filters.trade_id or '' }}" />
+            <input type="hidden" name="symbol" value="{{ filters.symbol or '' }}" />
+            <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}" />
+            <input type="hidden" name="order_id" value="{{ filters.order_id or '' }}" />
+            <input type="hidden" name="buyer_user_id" value="{{ filters.buyer_user_id or '' }}" />
+            <input type="hidden" name="seller_user_id" value="{{ filters.seller_user_id or '' }}" />
+            <input type="hidden" name="buy_order_id" value="{{ filters.buy_order_id or '' }}" />
+            <input type="hidden" name="sell_order_id" value="{{ filters.sell_order_id or '' }}" />
+            <input type="hidden" name="counterparty_type" value="{{ filters.counterparty_type or '' }}" />
+            <input type="hidden" name="start_time" value="{{ filters.start_time or '' }}" />
+            <input type="hidden" name="end_time" value="{{ filters.end_time or '' }}" />
+            {% if pagination.has_prev %}
+              <a href="{{ request.url.include_query_params(query_scope='history', trade_id=filters.trade_id or '', symbol=filters.symbol or '', user_id=filters.user_id or '', order_id=filters.order_id or '', buyer_user_id=filters.buyer_user_id or '', seller_user_id=filters.seller_user_id or '', buy_order_id=filters.buy_order_id or '', sell_order_id=filters.sell_order_id or '', counterparty_type=filters.counterparty_type or '', start_time=filters.start_time or '', end_time=filters.end_time or '', cursor_created_at=pagination.prev_cursor_created_at, cursor_id=pagination.prev_cursor_id, direction='prev', page_size=pagination.page_size, page=1) }}" class="btn secondary admin-btn admin-btn-secondary">上一批</a>
+            {% else %}
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">上一批</span>
+            {% endif %}
+            <span>当前批次</span>
+            {% if pagination.has_next %}
+              <a href="{{ request.url.include_query_params(query_scope='history', trade_id=filters.trade_id or '', symbol=filters.symbol or '', user_id=filters.user_id or '', order_id=filters.order_id or '', buyer_user_id=filters.buyer_user_id or '', seller_user_id=filters.seller_user_id or '', buy_order_id=filters.buy_order_id or '', sell_order_id=filters.sell_order_id or '', counterparty_type=filters.counterparty_type or '', start_time=filters.start_time or '', end_time=filters.end_time or '', cursor_created_at=pagination.next_cursor_created_at, cursor_id=pagination.next_cursor_id, direction='next', page_size=pagination.page_size, page=1) }}" class="btn secondary admin-btn admin-btn-secondary">下一批</a>
+            {% else %}
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">下一批</span>
+            {% endif %}
+            <label for="trade-page-size">每批条数</label>
+            <select id="trade-page-size" class="trade-page-size" name="page_size">
+              {% for size in [10, 20, 50, 100] %}
+                <option value="{{ size }}" {% if pagination.page_size == size %}selected{% endif %}>{{ size }}</option>
+              {% endfor %}
+            </select>
+          </form>
+        {% else %}
+          <div>
+            <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+            {% if pagination.is_page_limited %}
+              <div class="trade-page-limit">最多翻到第 500 页，请缩小筛选条件。</div>
+            {% endif %}
+          </div>
+          <form method="get" action="/admin/trades" class="trade-pagination-actions" id="trades-pagination-form">
+            <input type="hidden" name="query_scope" value="{{ query_scope or filters.query_scope or 'recent' }}" />
+            <input type="hidden" name="trade_id" value="{{ filters.trade_id or '' }}" />
+            <input type="hidden" name="symbol" value="{{ filters.symbol or '' }}" />
+            <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}" />
+            <input type="hidden" name="order_id" value="{{ filters.order_id or '' }}" />
+            <input type="hidden" name="buyer_user_id" value="{{ filters.buyer_user_id or '' }}" />
+            <input type="hidden" name="seller_user_id" value="{{ filters.seller_user_id or '' }}" />
+            <input type="hidden" name="buy_order_id" value="{{ filters.buy_order_id or '' }}" />
+            <input type="hidden" name="sell_order_id" value="{{ filters.sell_order_id or '' }}" />
+            <input type="hidden" name="counterparty_type" value="{{ filters.counterparty_type or '' }}" />
+            <input type="hidden" name="start_time" value="{{ filters.start_time or '' }}" />
+            <input type="hidden" name="end_time" value="{{ filters.end_time or '' }}" />
+            {% if pagination.has_prev %}
+              <a href="{{ request.url.include_query_params(page=1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">首页</a>
+              <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+            {% else %}
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">首页</span>
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">上一页</span>
+            {% endif %}
+            <span>第</span>
+            <input
+              class="trade-page-input"
+              type="number"
+              name="page"
+              min="1"
+              max="{{ pagination.pages }}"
+              value="{{ pagination.page }}"
+              aria-label="页码"
+            />
+            <span>/ {{ pagination.pages }} 页</span>
+            {% if pagination.has_next %}
+              <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+              <a href="{{ request.url.include_query_params(page=pagination.pages, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">尾页</a>
+            {% else %}
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">下一页</span>
+              <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">尾页</span>
+            {% endif %}
+            <label for="trade-page-size">每页条数</label>
+            <select id="trade-page-size" class="trade-page-size" name="page_size">
+              {% for size in [10, 20, 50, 100] %}
+                <option value="{{ size }}" {% if pagination.page_size == size %}selected{% endif %}>{{ size }}</option>
+              {% endfor %}
+            </select>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+  <script>
+    function formatTradeDate(date) {
+      var year = date.getFullYear();
+      var month = String(date.getMonth() + 1).padStart(2, "0");
+      var day = String(date.getDate()).padStart(2, "0");
+      return year + "-" + month + "-" + day;
+    }
+
+    function startOfDay(date) {
+      return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
+    }
+
+    function endOfDay(date) {
+      return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 0, 0);
+    }
+
+    function cleanEmptyTradeFields(form) {
+      if (!form) return;
+      Array.prototype.forEach.call(form.querySelectorAll("input, select"), function (field) {
+        if (!field.name || field.name === "query_scope" || field.name === "page" || field.name === "page_size") return;
+        if (String(field.value || "").trim() === "") {
+          field.disabled = true;
+        }
+      });
+    }
+
+    document.addEventListener("click", function (event) {
+      var button = event.target.closest(".trade-fee-toggle");
+      if (!button) return;
+      var targetId = button.getAttribute("data-target");
+      var detailRow = targetId ? document.getElementById(targetId) : null;
+      if (!detailRow) return;
+      var shouldShow = detailRow.hasAttribute("hidden");
+      detailRow.toggleAttribute("hidden", !shouldShow);
+      button.textContent = shouldShow ? "收起手续费" : "查看手续费";
+    });
+
+    (function () {
+      var filterForm = document.getElementById("trades-filter-form");
+      var scopeInput = document.getElementById("query_scope");
+      var startInput = document.getElementById("start_time");
+      var endInput = document.getElementById("end_time");
+      if (!filterForm || !scopeInput) return;
+
+      Array.prototype.forEach.call(filterForm.querySelectorAll(".trade-submit-scope"), function (button) {
+        button.addEventListener("click", function () {
+          scopeInput.value = button.getAttribute("data-scope") || "recent";
+        });
+      });
+
+      Array.prototype.forEach.call(filterForm.querySelectorAll(".trade-range-button"), function (button) {
+        button.addEventListener("click", function () {
+          var now = new Date();
+          var range = button.getAttribute("data-range");
+          var start = new Date(now);
+          var end = new Date(now);
+          if (range === "recent7") {
+            start.setDate(now.getDate() - 7);
+          } else if (range === "last30") {
+            start.setDate(now.getDate() - 30);
+            scopeInput.value = "history";
+          } else if (range === "today") {
+            start = startOfDay(now);
+            end = endOfDay(now);
+            scopeInput.value = "history";
+          } else if (range === "yesterday") {
+            var yesterday = new Date(now);
+            yesterday.setDate(now.getDate() - 1);
+            start = startOfDay(yesterday);
+            end = endOfDay(yesterday);
+            scopeInput.value = "history";
+          }
+          if (startInput) startInput.value = formatTradeDate(start);
+          if (endInput) endInput.value = formatTradeDate(end);
+        });
+      });
+
+      filterForm.addEventListener("submit", function () {
+        cleanEmptyTradeFields(filterForm);
+      });
+    })();
+
+    (function () {
+      var form = document.getElementById("trades-pagination-form");
+      if (!form) return;
+      var pageInput = form.querySelector('input[name="page"]');
+      var pageSize = form.querySelector('select[name="page_size"]');
+      if (pageInput) {
+        pageInput.addEventListener("keydown", function (event) {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            cleanEmptyTradeFields(form);
+            form.submit();
+          }
+        });
+      }
+      if (pageSize) {
+        pageSize.addEventListener("change", function () {
+          if (pageInput) pageInput.value = "1";
+          cleanEmptyTradeFields(form);
+          form.submit();
+        });
+      }
+    })();
+  </script>
+{% endblock %}
+

@@ -1,0 +1,305 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}BD团队统计{% endblock %}
+{% block page_title %}BD团队统计{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">只读统计 BD 账户、绑定用户与佣金汇总，不触发发放或重新计算。</div>
+{% endblock %}
+
+{% block content %}
+  {% macro coin_stack(items, fallback='0') -%}
+    {% if items %}
+      <div class="bd-coin-stack">
+        {% for coin in items %}
+          <span class="bd-coin-tag">
+            <span class="bd-coin-symbol">{{ coin.coin_symbol|default(coin.symbol) }}</span>
+            <span class="bd-coin-value">{{ coin.amount_display|default(coin.amount) }}</span>
+          </span>
+        {% endfor %}
+      </div>
+    {% else %}
+      <span class="bd-zero bd-number">{{ fallback }}</span>
+    {% endif %}
+  {%- endmacro %}
+
+  {% macro volume_stack(items, fallback='0') -%}
+    {% if items %}
+      <div class="bd-coin-stack bd-volume-stack">
+        {% for coin in items[:3] %}
+          <span class="bd-coin-tag">
+            <span class="bd-coin-symbol">{{ coin.coin_symbol|default(coin.symbol) }}</span>
+            <span class="bd-coin-value">{{ coin.amount_display|default(coin.amount) }}</span>
+          </span>
+        {% endfor %}
+        {% if items|length > 3 %}
+          <button
+            type="button"
+            class="bd-volume-more"
+            data-volume-items='{{ items|tojson|e }}'
+          >查看全部（共 {{ items|length }} 个）</button>
+        {% endif %}
+      </div>
+    {% else %}
+      <span class="bd-zero bd-number">{{ fallback }}</span>
+    {% endif %}
+  {%- endmacro %}
+
+  <style>
+    .bd-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
+    .bd-stat-card{padding:14px 16px}
+    .bd-stat-label{color:var(--muted);font-size:12px;margin-bottom:8px}
+    .bd-stat-value{font-size:22px;font-weight:900;line-height:1.15}
+    .bd-filter-form{grid-template-columns:repeat(2,minmax(0,1fr)) auto}
+    .bd-table{min-width:0;table-layout:fixed}
+    .bd-cell{min-width:0;overflow-wrap:anywhere}
+    .bd-number{font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
+    .bd-coin-stack{display:flex;align-items:flex-start;gap:6px;flex-wrap:wrap;min-width:0}
+    .bd-coin-tag{display:inline-flex;align-items:center;gap:5px;max-width:100%;min-height:24px;padding:3px 7px;border:1px solid rgba(255,255,255,.10);border-radius:7px;background:rgba(255,255,255,.045);line-height:1.2}
+    .bd-coin-symbol{color:var(--muted);font-size:11px;font-weight:800}
+    .bd-coin-value{color:#fff;font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
+    .bd-stat-card .bd-coin-stack{gap:5px}
+    .bd-stat-card .bd-coin-tag{min-height:22px;padding:3px 6px}
+    .bd-volume-more{min-height:24px;padding:3px 7px;border:1px solid rgba(74,144,226,.24);border-radius:7px;background:rgba(74,144,226,.10);color:#9ec5ff;font-size:12px;line-height:1.2;cursor:pointer;white-space:nowrap}
+    .bd-volume-more:hover{background:rgba(74,144,226,.16);color:#fff}
+    .bd-zero{color:var(--muted)}
+    .bd-modal-backdrop[hidden]{display:none}
+    .bd-modal-backdrop{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.68);backdrop-filter:blur(8px)}
+    .bd-volume-modal{width:min(520px,100%);border:1px solid rgba(255,255,255,.12);border-radius:16px;background:linear-gradient(180deg,rgba(24,25,32,.98),rgba(13,14,20,.98));box-shadow:0 24px 70px rgba(0,0,0,.52);padding:18px}
+    .bd-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}
+    .bd-modal-title{font-size:17px;font-weight:800;color:#fff}
+    .bd-modal-subtitle{margin-top:5px;color:var(--muted);font-size:12px}
+    .bd-modal-close{width:32px;height:32px;border-radius:9px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);color:var(--text);cursor:pointer;font-size:18px;line-height:1}
+    .bd-volume-list{display:grid;gap:8px;max-height:48vh;overflow:auto;padding-right:2px}
+    .bd-volume-row{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:34px;padding:7px 10px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(255,255,255,.035)}
+    .bd-volume-row-symbol{color:var(--muted);font-size:12px;font-weight:800}
+    .bd-volume-row-amount{color:#fff;font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:13px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
+    .bd-volume-pager{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px}
+    .bd-volume-page-info{color:var(--muted);font-size:12px}
+    .bd-volume-pager-actions{display:flex;gap:8px}
+    .bd-volume-pager .admin-btn[disabled]{opacity:.45;cursor:not-allowed}
+    @media (max-width:1180px){.bd-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bd-filter-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media (max-width:720px){.bd-stat-grid,.bd-filter-form{grid-template-columns:1fr}.bd-table{min-width:760px}}
+  </style>
+
+  <section class="page-section">
+    <div class="bd-stat-grid">
+      <div class="admin-card bd-stat-card"><div class="bd-stat-label">BD人数</div><div class="bd-stat-value bd-number">{{ stats.bd_count|default(0) }}</div></div>
+      <div class="admin-card bd-stat-card"><div class="bd-stat-label">下级用户数</div><div class="bd-stat-value bd-number">{{ stats.subordinate_count|default(0) }}</div></div>
+      <div class="admin-card bd-stat-card"><div class="bd-stat-label">30日交易量（按币种）</div>{{ volume_stack(stats.volume_30d_total_items, stats.volume_30d_total|default('0')) }}</div>
+      <div class="admin-card bd-stat-card"><div class="bd-stat-label">累计佣金</div>{{ coin_stack(stats.commission_total_items, stats.commission_total|default('0')) }}</div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card admin-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/bd/team" class="filter-form bd-filter-form">
+        <div class="field">
+          <label for="status">BD账户状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="ACTIVE" {% if filters.status == 'ACTIVE' %}selected{% endif %}>生效中</option>
+            <option value="EXPIRED" {% if filters.status == 'EXPIRED' %}selected{% endif %}>已过期</option>
+            <option value="DISABLED" {% if filters.status == 'DISABLED' %}selected{% endif %}>已停用</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="bd_user_id">BD用户ID</label>
+          <input id="bd_user_id" type="text" name="bd_user_id" value="{{ filters.bd_user_id or '' }}" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/bd/team" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card admin-card">
+      <div class="section-title">BD团队汇总</div>
+      <p class="muted">金额按手续费原币种聚合展示，避免 USDT 与 RCB 被错误相加。</p>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table bd-table">
+            <colgroup><col style="width:14%"><col style="width:10%"><col style="width:10%"><col style="width:18%"><col style="width:18%"><col style="width:14%"><col style="width:8%"><col style="width:8%"></colgroup>
+            <thead>
+              <tr>
+                <th>BD用户</th>
+                <th class="text-right">直属人数</th>
+                <th class="text-right">团队人数</th>
+                <th>30日交易量（按币种）</th>
+                <th>累计佣金</th>
+                <th>最近更新时间</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td>
+                    <div class="bd-cell admin-id">用户ID {{ item.bd_user_id }}</div>
+                    <div class="bd-cell admin-muted">等级 {{ item.bd_level }} · {{ item.commission_rate_percent }}</div>
+                  </td>
+                  <td class="text-right bd-number">{{ item.direct_user_count|default(item.bound_user_count) }}</td>
+                  <td class="text-right bd-number">{{ item.team_user_count|default(item.bound_user_count) }}</td>
+                  <td>{{ volume_stack(item.volume_30d_items, item.volume_30d|default('0')) }}</td>
+                  <td>{{ coin_stack(item.total_commission_items, item.total_commission|default('0')) }}</td>
+                  <td class="admin-time"><div class="bd-cell">{{ item.latest_commission_at }}</div></td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.status_badge }}">
+                      {{ item.status_label }}
+                    </span>
+                  </td>
+                  <td>
+                    <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" href="/admin/bd/teams/{{ item.bd_user_id }}">详情</a>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无数据</div><p class="admin-empty-desc">暂无 BD 团队统计数据</p></div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="bdVolumeModal" class="bd-modal-backdrop" hidden>
+    <div class="bd-volume-modal" role="dialog" aria-modal="true" aria-labelledby="bdVolumeModalTitle">
+      <div class="bd-modal-head">
+        <div>
+          <div id="bdVolumeModalTitle" class="bd-modal-title">30日交易量明细</div>
+          <div id="bdVolumeModalSubtitle" class="bd-modal-subtitle"></div>
+        </div>
+        <button type="button" class="bd-modal-close" data-volume-close aria-label="关闭">×</button>
+      </div>
+      <div id="bdVolumeList" class="bd-volume-list"></div>
+      <div class="bd-volume-pager">
+        <div id="bdVolumePageInfo" class="bd-volume-page-info"></div>
+        <div class="bd-volume-pager-actions">
+          <button type="button" id="bdVolumePrev" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</button>
+          <button type="button" id="bdVolumeNext" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function(){
+      const modal = document.getElementById("bdVolumeModal");
+      const list = document.getElementById("bdVolumeList");
+      const subtitle = document.getElementById("bdVolumeModalSubtitle");
+      const pageInfo = document.getElementById("bdVolumePageInfo");
+      const prevBtn = document.getElementById("bdVolumePrev");
+      const nextBtn = document.getElementById("bdVolumeNext");
+      const pageSize = 10;
+      let items = [];
+      let page = 1;
+
+      function normalizeItems(value){
+        if (!Array.isArray(value)) return [];
+        return value.map(function(item){
+          return {
+            coin_symbol: String(item.coin_symbol || item.symbol || ""),
+            amount_display: String(item.amount_display || item.amount || "0"),
+            amount_raw: Number(item.amount_raw || 0)
+          };
+        }).filter(function(item){ return item.coin_symbol; });
+      }
+
+      function renderRows(){
+        const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+        if (page > totalPages) page = totalPages;
+        const start = (page - 1) * pageSize;
+        const pageItems = items.slice(start, start + pageSize);
+        list.innerHTML = "";
+        pageItems.forEach(function(item){
+          const row = document.createElement("div");
+          row.className = "bd-volume-row";
+
+          const symbol = document.createElement("span");
+          symbol.className = "bd-volume-row-symbol";
+          symbol.textContent = item.coin_symbol;
+
+          const amount = document.createElement("span");
+          amount.className = "bd-volume-row-amount";
+          amount.textContent = item.amount_display;
+
+          row.appendChild(symbol);
+          row.appendChild(amount);
+          list.appendChild(row);
+        });
+        subtitle.textContent = "共 " + items.length + " 个币种";
+        pageInfo.textContent = "第 " + page + " / " + totalPages + " 页";
+        prevBtn.disabled = page <= 1;
+        nextBtn.disabled = page >= totalPages;
+      }
+
+      function openModal(rawItems){
+        items = normalizeItems(rawItems);
+        items.sort(function(a, b){ return b.amount_raw - a.amount_raw; });
+        page = 1;
+        renderRows();
+        modal.hidden = false;
+        document.body.style.overflow = "hidden";
+      }
+
+      function closeModal(){
+        modal.hidden = true;
+        document.body.style.overflow = "";
+      }
+
+      document.querySelectorAll(".bd-volume-more").forEach(function(button){
+        button.addEventListener("click", function(){
+          try {
+            openModal(JSON.parse(button.getAttribute("data-volume-items") || "[]"));
+          } catch (error) {
+            openModal([]);
+          }
+        });
+      });
+
+      prevBtn.addEventListener("click", function(){
+        if (page > 1) {
+          page -= 1;
+          renderRows();
+        }
+      });
+
+      nextBtn.addEventListener("click", function(){
+        const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+        if (page < totalPages) {
+          page += 1;
+          renderRows();
+        }
+      });
+
+      document.querySelectorAll("[data-volume-close]").forEach(function(button){
+        button.addEventListener("click", closeModal);
+      });
+
+      modal.addEventListener("click", function(event){
+        if (event.target === modal) closeModal();
+      });
+
+      document.addEventListener("keydown", function(event){
+        if (event.key === "Escape" && !modal.hidden) closeModal();
+      });
+    })();
+  </script>
+{% endblock %}

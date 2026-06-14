@@ -1,0 +1,143 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}股票锁仓配置{% endblock %}
+{% block page_title %}股票代币锁仓配置{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">配置哪些充值币种在链上确认后自动进入股票代币锁仓。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/stock-token-lock-configs/new" class="btn admin-btn admin-btn-primary">新增配置</a>
+{% endblock %}
+
+{% block content %}
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作结果</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">提示信息</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">充值自动锁仓说明</div>
+      <p class="muted">
+        启用后，用户充值该锁仓币种并完成链上确认时，系统不会将该币种直接入普通可用余额，而是自动创建股票代币锁仓批次。用户后续可按释放规则兑换为释放/兑换币种。
+      </p>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/stock-token-lock-configs" class="filter-form">
+        <div class="field">
+          <label for="lock_symbol">锁仓币种</label>
+          <input id="lock_symbol" type="text" name="lock_symbol" value="{{ filters.lock_symbol or '' }}" placeholder="例如 BON-1 / CREG-1" />
+        </div>
+        <div class="field">
+          <label for="trade_symbol">释放/兑换币种</label>
+          <input id="trade_symbol" type="text" name="trade_symbol" value="{{ filters.trade_symbol or '' }}" placeholder="例如 BON-2 / CREG-2" />
+        </div>
+        <div class="field">
+          <label for="is_active">状态</label>
+          <select id="is_active" name="is_active">
+            <option value="">全部</option>
+            <option value="1" {% if filters.is_active == '1' %}selected{% endif %}>启用</option>
+            <option value="0" {% if filters.is_active == '0' %}selected{% endif %}>禁用</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/stock-token-lock-configs" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">配置列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th class="nowrap">锁仓币种</th>
+                <th class="nowrap">释放/兑换币种</th>
+                <th class="text-right">锁定期</th>
+                <th class="text-right">解锁后每日释放比例</th>
+                <th class="text-right">兑换比例</th>
+                <th class="nowrap">是否启用</th>
+                <th class="nowrap">创建时间</th>
+                <th class="nowrap">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td>{{ item.id }}</td>
+                  <td class="mono nowrap">{{ item.lock_symbol }}</td>
+                  <td class="mono nowrap">{{ item.trade_symbol }}</td>
+                  <td class="text-right">{{ item.lock_days }}</td>
+                  <td class="text-right mono">{{ item.daily_release_rate }}</td>
+                  <td class="text-right mono">{{ item.conversion_rate }}</td>
+                  <td><span class="admin-badge admin-badge-{{ item.active_badge }}">{{ item.active_label }}</span></td>
+                  <td class="nowrap">{{ item.created_at }}</td>
+                  <td>
+                    <div class="filter-actions">
+                      <a href="/admin/stock-token-lock-configs/{{ item.id }}/edit" class="btn secondary admin-btn admin-btn-secondary">编辑</a>
+                      <form method="post" action="/admin/stock-token-lock-configs/{{ item.id }}/toggle-active">
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn secondary admin-btn admin-btn-secondary">
+                          {% if item.is_active == 1 %}禁用{% else %}启用{% endif %}
+                        </button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无股票锁仓配置</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

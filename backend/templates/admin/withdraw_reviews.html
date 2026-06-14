@@ -1,0 +1,741 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}出金人工审核{% endblock %}
+{% block page_title %}出金人工审核{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看需要人工审核的出金申请。通过后仅回到待验证状态，用户仍需邮箱验证码确认。</div>
+{% endblock %}
+
+{% block content %}
+  {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+
+  <style>
+    .withdraw-review-page{
+      max-width:100%;
+      overflow-x:hidden;
+    }
+    .withdraw-review-filter{
+      padding:14px;
+    }
+    .withdraw-review-filter .section-title{
+      margin-bottom:10px;
+    }
+    .withdraw-review-filter .filter-form{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(120px, 1fr)) auto;
+      gap:10px;
+      align-items:end;
+    }
+    .withdraw-review-filter .field{
+      min-width:0;
+    }
+    .withdraw-review-filter label{
+      margin-bottom:4px;
+      font-size:11px;
+    }
+    .withdraw-review-filter input,
+    .withdraw-review-filter select{
+      min-height:34px;
+    }
+    .withdraw-review-filter .filter-actions{
+      display:flex;
+      gap:8px;
+      align-items:center;
+      white-space:nowrap;
+    }
+    .withdraw-review-list-card{
+      padding:14px;
+      overflow:hidden;
+    }
+    .withdraw-review-list-head{
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      align-items:center;
+      margin-bottom:10px;
+    }
+    .withdraw-review-list{
+      display:grid;
+      gap:10px;
+    }
+    .withdraw-review-card{
+      display:grid;
+      grid-template-columns:minmax(190px, .95fr) minmax(260px, 1.05fr) minmax(300px, 1.2fr) 116px;
+      gap:12px;
+      align-items:stretch;
+      padding:12px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:12px;
+      background:rgba(255,255,255,.035);
+      max-width:100%;
+      overflow:hidden;
+    }
+    .withdraw-review-card > *{
+      min-width:0;
+    }
+    .withdraw-card-block{
+      min-width:0;
+      display:flex;
+      flex-direction:column;
+      gap:7px;
+    }
+    .withdraw-card-title{
+      color:rgba(255,255,255,.48);
+      font-size:11px;
+      font-weight:900;
+      letter-spacing:0;
+    }
+    .withdraw-kv-grid{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0, 1fr));
+      gap:6px 10px;
+      min-width:0;
+    }
+    .withdraw-kv{
+      min-width:0;
+      display:flex;
+      gap:6px;
+      align-items:center;
+      color:rgba(255,255,255,.72);
+      font-size:12px;
+      line-height:1.35;
+    }
+    .withdraw-kv-label{
+      flex:0 0 auto;
+      color:rgba(255,255,255,.42);
+    }
+    .withdraw-kv-value{
+      min-width:0;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .withdraw-address-line{
+      min-width:0;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      color:rgba(255,255,255,.74);
+      font-size:12px;
+      line-height:1.4;
+    }
+    .withdraw-risk-compact{
+      display:flex;
+      flex-wrap:wrap;
+      gap:6px;
+      align-content:flex-start;
+      min-width:0;
+    }
+    .withdraw-risk-chip{
+      max-width:100%;
+      padding:3px 7px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.04);
+      color:rgba(255,255,255,.76);
+      font-size:11px;
+      font-weight:800;
+      line-height:1.25;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .withdraw-risk-chip.warning{
+      border-color:rgba(227,171,57,.28);
+      background:rgba(189,134,25,.10);
+      color:#ffd98a;
+    }
+    .withdraw-risk-chip.success{
+      border-color:rgba(49,177,119,.28);
+      background:rgba(31,122,85,.12);
+      color:#a8f0cd;
+    }
+    .withdraw-risk-chip.danger{
+      border-color:rgba(216,89,89,.32);
+      background:rgba(177,52,52,.12);
+      color:#ffb4b4;
+    }
+    .withdraw-card-reason{
+      min-width:0;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      color:rgba(255,255,255,.68);
+      font-size:12px;
+      line-height:1.35;
+    }
+    .withdraw-action-panel{
+      width:116px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+      justify-content:center;
+      align-items:stretch;
+      border-left:1px solid rgba(255,255,255,.07);
+      padding-left:10px;
+    }
+    .withdraw-action-panel form{
+      margin:0;
+    }
+    .withdraw-action-panel .btn{
+      width:100%;
+      justify-content:center;
+    }
+    .withdraw-action-note{
+      color:rgba(255,255,255,.48);
+      font-size:12px;
+      line-height:1.4;
+      text-align:center;
+    }
+    .withdraw-review-actions{
+      display:flex;
+      gap:8px;
+      align-items:center;
+      min-width:150px;
+    }
+    .risk-reason-text{
+      display:-webkit-box;
+      max-width:240px;
+      overflow:hidden;
+      color:rgba(255,255,255,.72);
+      line-height:1.45;
+      word-break:break-word;
+      -webkit-line-clamp:2;
+      -webkit-box-orient:vertical;
+    }
+    .withdraw-risk-info{
+      display:grid;
+      gap:5px;
+      min-width:180px;
+      max-width:240px;
+      color:rgba(255,255,255,.68);
+      font-size:12px;
+      line-height:1.35;
+    }
+    .withdraw-risk-row{
+      display:flex;
+      align-items:center;
+      gap:6px;
+      min-width:0;
+      white-space:nowrap;
+    }
+    .withdraw-risk-row .admin-badge{
+      padding:2px 7px;
+      font-size:11px;
+      line-height:1.35;
+    }
+    .withdraw-risk-label{
+      color:rgba(255,255,255,.46);
+      flex:0 0 auto;
+    }
+    .withdraw-risk-value{
+      min-width:0;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .withdraw-notice-card{
+      border-color:rgba(49,177,119,.26);
+      background:rgba(31,122,85,.10);
+    }
+    .withdraw-error-card{
+      border-color:rgba(216,89,89,.30);
+      background:rgba(177,52,52,.12);
+    }
+    .withdraw-notice-card .section-title{
+      color:#a8f0cd;
+    }
+    .withdraw-error-card .section-title{
+      color:#ffb4b4;
+    }
+    .withdraw-reject-modal[hidden]{
+      display:none;
+    }
+    .withdraw-reject-modal{
+      position:fixed;
+      inset:0;
+      z-index:1000;
+      display:grid;
+      place-items:center;
+      padding:20px;
+      background:rgba(0,0,0,.68);
+      backdrop-filter:blur(8px);
+    }
+    .withdraw-reject-dialog{
+      width:min(720px, 100%);
+      max-height:calc(100vh - 40px);
+      overflow:auto;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:16px;
+      background:linear-gradient(180deg, rgba(24,25,32,.98), rgba(13,14,20,.98));
+      box-shadow:0 24px 70px rgba(0,0,0,.52);
+      padding:18px;
+    }
+    .withdraw-reject-head{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:16px;
+    }
+    .withdraw-reject-title{
+      color:#fff;
+      font-size:18px;
+      font-weight:900;
+    }
+    .withdraw-reject-subtitle{
+      margin-top:5px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .withdraw-modal-close{
+      width:32px;
+      height:32px;
+      border-radius:9px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.04);
+      color:var(--text);
+      cursor:pointer;
+      font-size:18px;
+      line-height:1;
+    }
+    .reason-groups{
+      display:grid;
+      gap:14px;
+    }
+    .reason-group-title{
+      margin-bottom:8px;
+      color:var(--muted);
+      font-size:12px;
+      font-weight:800;
+    }
+    .reason-tags{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .reason-tag{
+      min-height:34px;
+      padding:0 12px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(255,255,255,.045);
+      color:rgba(255,255,255,.78);
+      cursor:pointer;
+      font-size:12px;
+      font-weight:800;
+    }
+    .reason-tag:hover{
+      border-color:rgba(227,171,57,.32);
+      background:rgba(189,134,25,.10);
+      color:#fff;
+    }
+    .reason-tag.is-active{
+      border-color:rgba(216,89,89,.46);
+      background:rgba(177,52,52,.18);
+      color:#ffd6d6;
+      box-shadow:0 0 0 3px rgba(216,89,89,.08);
+    }
+    .reject-extra{
+      margin-top:16px;
+    }
+    .reject-extra textarea{
+      min-height:96px;
+      resize:vertical;
+    }
+    .reject-preview{
+      margin-top:12px;
+      padding:10px 12px;
+      border-radius:10px;
+      border:1px solid rgba(255,255,255,.08);
+      background:rgba(255,255,255,.03);
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.5;
+      white-space:pre-wrap;
+    }
+    .reject-error{
+      min-height:18px;
+      margin-top:8px;
+      color:#ffb4b4;
+      font-size:12px;
+      font-weight:700;
+    }
+    .withdraw-modal-actions{
+      display:flex;
+      justify-content:flex-end;
+      gap:10px;
+      margin-top:16px;
+    }
+    .withdraw-modal-actions .btn[disabled]{
+      opacity:.62;
+      cursor:not-allowed;
+    }
+    @media (max-width:1180px){
+      .withdraw-review-filter .filter-form{
+        grid-template-columns:repeat(2, minmax(0, 1fr));
+      }
+      .withdraw-review-filter .filter-actions{
+        grid-column:1 / -1;
+      }
+      .withdraw-review-card{
+        grid-template-columns:repeat(2, minmax(0, 1fr)) 116px;
+      }
+      .withdraw-card-block.risk{
+        grid-column:1 / 3;
+      }
+    }
+    @media (max-width:760px){
+      .withdraw-review-filter .filter-form,
+      .withdraw-review-card{
+        grid-template-columns:1fr;
+      }
+      .withdraw-card-block.risk{
+        grid-column:auto;
+      }
+      .withdraw-action-panel{
+        width:100%;
+        border-left:0;
+        border-top:1px solid rgba(255,255,255,.07);
+        padding-left:0;
+        padding-top:10px;
+      }
+    }
+  </style>
+
+  <div class="withdraw-review-page">
+  {% if notice %}
+    <section class="page-section">
+      <div class="card withdraw-notice-card">
+        <div class="section-title">处理完成</div>
+        <p class="muted">
+          {% if notice == 'approved' %}
+            提现审核已通过，用户仍需完成邮箱验证确认。
+          {% elif notice == 'rejected' %}
+            提现申请已拒绝，拒绝原因已保存。
+          {% else %}
+            {{ notice }}
+          {% endif %}
+        </p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card withdraw-error-card">
+        <div class="section-title">处理失败</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="admin-alert admin-alert-warning">通过审核后用户将进入后续验证或链上发送流程，拒绝前请确认原因。</div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card withdraw-review-filter">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/withdraw-reviews" class="filter-form">
+        <div class="field">
+          <label for="user_id">用户ID</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" />
+        </div>
+        <div class="field">
+          <label for="coin_symbol">币种</label>
+          <input id="coin_symbol" type="text" name="coin_symbol" value="{{ filters.coin_symbol or '' }}" placeholder="USDT" />
+        </div>
+        <div class="field">
+          <label for="chain_key">网络</label>
+          <input id="chain_key" type="text" name="chain_key" value="{{ filters.chain_key or '' }}" placeholder="polygon / bsc" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="" {% if not filters.status %}selected{% endif %}>全部</option>
+            <option value="PENDING_REVIEW" {% if filters.status == 'PENDING_REVIEW' %}selected{% endif %}>待审核/处理中</option>
+            <option value="REVIEWING" {% if filters.status == 'REVIEWING' %}selected{% endif %}>审核中</option>
+            <option value="VERIFYING" {% if filters.status == 'VERIFYING' %}selected{% endif %}>待验证</option>
+            <option value="FROZEN" {% if filters.status == 'FROZEN' %}selected{% endif %}>已冻结</option>
+            <option value="SENDING" {% if filters.status == 'SENDING' %}selected{% endif %}>出金处理中</option>
+            <option value="SENT" {% if filters.status == 'SENT' %}selected{% endif %}>已发送</option>
+            <option value="SUCCESS" {% if filters.status == 'SUCCESS' %}selected{% endif %}>已完成</option>
+            <option value="REJECTED" {% if filters.status == 'REJECTED' %}selected{% endif %}>已拒绝</option>
+            <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
+            <option value="CANCELED" {% if filters.status == 'CANCELED' %}selected{% endif %}>已取消</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/withdraw-reviews" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card withdraw-review-list-card">
+      <div class="withdraw-review-list-head">
+        <div class="section-title">出金申请列表</div>
+        <div class="admin-muted">风控统计按 UTC 日期展示；规则触发口径见后台风控配置。</div>
+      </div>
+
+      {% if items %}
+        <div class="withdraw-review-list">
+          {% for item in items %}
+            <article class="withdraw-review-card">
+              <section class="withdraw-card-block">
+                <div class="withdraw-card-title">用户与订单</div>
+                <div class="withdraw-kv-grid">
+                  <div class="withdraw-kv"><span class="withdraw-kv-label">ID</span><span class="withdraw-kv-value mono">#{{ item.withdraw_id }}</span></div>
+                  <div class="withdraw-kv"><span class="withdraw-kv-label">用户</span><span class="withdraw-kv-value mono">{{ item.user_id }}</span></div>
+                  <div class="withdraw-kv"><span class="withdraw-kv-label">币种</span><span class="withdraw-kv-value mono">{{ item.coin_symbol }}</span></div>
+                  <div class="withdraw-kv"><span class="withdraw-kv-label">网络</span><span class="withdraw-kv-value mono">{{ item.chain_key }}</span></div>
+                  <div class="withdraw-kv"><span class="withdraw-kv-label">状态</span><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></div>
+                  <div class="withdraw-kv"><span class="withdraw-kv-label">创建</span><span class="withdraw-kv-value" title="{{ item.created_at }}">{{ item.created_at }}</span></div>
+                </div>
+              </section>
+
+              <section class="withdraw-card-block">
+                <div class="withdraw-card-title">金额与地址</div>
+                <div class="withdraw-kv-grid">
+                  <div class="withdraw-kv"><span class="withdraw-kv-label">申请</span><span class="withdraw-kv-value">{{ item.amount }} {{ item.coin_symbol }}</span></div>
+                  <div class="withdraw-kv"><span class="withdraw-kv-label">手续费</span><span class="withdraw-kv-value">{{ item.fee }}</span></div>
+                  <div class="withdraw-kv"><span class="withdraw-kv-label">到账</span><span class="withdraw-kv-value">{{ item.net_amount }} {{ item.coin_symbol }}</span></div>
+                </div>
+                <div class="withdraw-address-line" title="{{ item.to_address }}">收款地址：{{ item.to_address_short }}</div>
+              </section>
+
+              <section class="withdraw-card-block risk">
+                <div class="withdraw-card-title">风控信息</div>
+                <div class="withdraw-risk-compact" title="{{ item.today_stat_scope }}">
+                  <span class="withdraw-risk-chip warning">今日申请 {{ item.today_apply_count_display }}</span>
+                  <span class="withdraw-risk-chip success">今日成功 {{ item.today_success_count_display }}</span>
+                  <span class="withdraw-risk-chip">累计申请 {{ item.today_apply_amount_display }}</span>
+                  <span class="withdraw-risk-chip {{ item.failed_withdraw_badge }}">历史失败 {{ item.failed_withdraw_count_display }}</span>
+                  {% if item.address_risk_label != '-' %}
+                    <span class="withdraw-risk-chip {{ item.address_risk_badge }}">{{ item.address_risk_label }}</span>
+                  {% endif %}
+                  {% if item.status == 'FROZEN' %}
+                    <span class="withdraw-risk-chip warning">资金已冻结，待广播</span>
+                  {% endif %}
+                </div>
+                <div class="withdraw-card-reason" title="{{ item.risk_reason_display }}">原因：{{ item.risk_reason_display_short or item.risk_reason_display or '-' }}</div>
+              </section>
+
+              <aside class="withdraw-action-panel">
+                {% if item.status == 'REVIEWING' %}
+                        <form
+                          method="post"
+                          action="/admin/withdraw-reviews/{{ item.withdraw_id }}/approve"
+                          onsubmit="return confirm('确认通过该提现审核？通过后将进入后续出金流程，用户仍需完成验证。');"
+                        >
+                          <input type="hidden" name="next_path" value="{{ current_url }}" />
+                          <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">通过</button>
+                        </form>
+                        <button
+                          type="button"
+                          class="btn danger admin-btn admin-btn-danger admin-btn-sm"
+                          data-withdraw-reject
+                          data-withdraw-id="{{ item.withdraw_id }}"
+                        >拒绝</button>
+                {% elif item.status == 'FROZEN' %}
+                  <span class="withdraw-action-note" title="资金已冻结，尚未广播交易">等待用户继续提交</span>
+                {% else %}
+                  <span class="withdraw-action-note">已处理</span>
+                {% endif %}
+              </aside>
+            </article>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无数据</div>
+          <p class="admin-empty-desc">当前筛选条件下暂无记录，可调整筛选条件后重试</p>
+        </div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+  </div>
+
+  <div id="withdrawRejectModal" class="withdraw-reject-modal" hidden>
+    <div class="withdraw-reject-dialog" role="dialog" aria-modal="true" aria-labelledby="withdrawRejectTitle">
+      <div class="withdraw-reject-head">
+        <div>
+          <div id="withdrawRejectTitle" class="withdraw-reject-title">拒绝提现</div>
+          <div class="withdraw-reject-subtitle">提现单 <span id="withdrawRejectId" class="mono"></span>，请选择风控原因或填写补充说明。</div>
+        </div>
+        <button type="button" class="withdraw-modal-close" data-withdraw-modal-close aria-label="关闭">×</button>
+      </div>
+
+      <form id="withdrawRejectForm" method="post">
+        <input type="hidden" name="next_path" value="{{ current_url }}" />
+        <input id="withdrawRiskReason" type="hidden" name="risk_reason" value="" />
+
+        <div class="reason-groups">
+          {% set reason_groups = [
+            {'category': '身份认证问题', 'items': ['KYC未完成', '证件过期', '姓名与银行卡不一致', '认证等级不足']},
+            {'category': '平台风控触发', 'items': ['短时间大额资金流动', '频繁提币', '频繁更换IP或设备', '高频异常操作']},
+            {'category': '银行或支付渠道限制', 'items': ['银行限制', '异常流水', '跨境转账', '账户信息不一致']},
+            {'category': '链上操作错误', 'items': ['选错网络', '地址填写错误', '未填写Memo/Tag']},
+            {'category': '平台维护或流动性问题', 'items': ['交易所钱包维护', '区块链网络拥堵', '流动性不足']},
+            {'category': '合规与反洗钱调查', 'items': ['涉及异常资金来源', '黑名单地址', '可疑OTC交易', '涉嫌洗钱或诈骗关联资金']}
+          ] %}
+          {% for group in reason_groups %}
+            <div class="reason-group">
+              <div class="reason-group-title">{{ group.category }}</div>
+              <div class="reason-tags">
+                {% for reason in group["items"] %}
+                  <button
+                    type="button"
+                    class="reason-tag"
+                    data-risk-category="{{ group.category }}"
+                    data-risk-reason="{{ reason }}"
+                  >{{ reason }}</button>
+                {% endfor %}
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+
+        <div class="field reject-extra">
+          <label for="withdrawRejectExtra">补充说明（可选）</label>
+          <textarea id="withdrawRejectExtra" placeholder="请输入补充审核说明..."></textarea>
+        </div>
+        <div id="withdrawRejectPreview" class="reject-preview">请选择拒绝原因或填写补充说明。</div>
+        <div id="withdrawRejectError" class="reject-error" aria-live="polite"></div>
+
+        <div class="withdraw-modal-actions">
+          <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-withdraw-modal-close>取消</button>
+          <button id="withdrawRejectSubmit" type="submit" class="btn danger admin-btn admin-btn-danger">确认拒绝</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    (function(){
+      const modal = document.getElementById("withdrawRejectModal");
+      const form = document.getElementById("withdrawRejectForm");
+      const withdrawIdText = document.getElementById("withdrawRejectId");
+      const hiddenReason = document.getElementById("withdrawRiskReason");
+      const extraInput = document.getElementById("withdrawRejectExtra");
+      const preview = document.getElementById("withdrawRejectPreview");
+      const errorText = document.getElementById("withdrawRejectError");
+      const submitButton = document.getElementById("withdrawRejectSubmit");
+      let selectedCategory = "";
+      let selectedReason = "";
+
+      function buildReason(){
+        const extra = extraInput.value.trim();
+        let text = "";
+        if (selectedCategory && selectedReason) {
+          text = selectedCategory + "：" + selectedReason;
+        }
+        if (extra) {
+          text += (text ? "\n" : "") + "补充说明：" + extra;
+        }
+        return text;
+      }
+
+      function updatePreview(){
+        const reason = buildReason();
+        hiddenReason.value = reason;
+        preview.textContent = reason || "请选择拒绝原因或填写补充说明。";
+        if (reason && errorText) errorText.textContent = "";
+      }
+
+      function resetModal(){
+        selectedCategory = "";
+        selectedReason = "";
+        hiddenReason.value = "";
+        extraInput.value = "";
+        if (errorText) errorText.textContent = "";
+        submitButton.disabled = false;
+        submitButton.textContent = "确认拒绝";
+        document.querySelectorAll(".reason-tag.is-active").forEach(function(tag){
+          tag.classList.remove("is-active");
+        });
+        updatePreview();
+      }
+
+      function openModal(withdrawId){
+        resetModal();
+        form.action = "/admin/withdraw-reviews/" + withdrawId + "/reject";
+        withdrawIdText.textContent = "#" + withdrawId;
+        modal.hidden = false;
+        document.body.style.overflow = "hidden";
+      }
+
+      function closeModal(){
+        modal.hidden = true;
+        document.body.style.overflow = "";
+        resetModal();
+      }
+
+      document.querySelectorAll("[data-withdraw-reject]").forEach(function(button){
+        button.addEventListener("click", function(){
+          const withdrawId = button.getAttribute("data-withdraw-id") || "";
+          if (/^[0-9]+$/.test(withdrawId)) openModal(withdrawId);
+        });
+      });
+
+      document.querySelectorAll(".reason-tag").forEach(function(tag){
+        tag.addEventListener("click", function(){
+          const isActive = tag.classList.contains("is-active");
+          document.querySelectorAll(".reason-tag.is-active").forEach(function(activeTag){
+            activeTag.classList.remove("is-active");
+          });
+          if (isActive) {
+            selectedCategory = "";
+            selectedReason = "";
+          } else {
+            tag.classList.add("is-active");
+            selectedCategory = tag.getAttribute("data-risk-category") || "";
+            selectedReason = tag.getAttribute("data-risk-reason") || "";
+          }
+          updatePreview();
+        });
+      });
+
+      extraInput.addEventListener("input", updatePreview);
+
+      document.querySelectorAll("[data-withdraw-modal-close]").forEach(function(button){
+        button.addEventListener("click", closeModal);
+      });
+
+      modal.addEventListener("click", function(event){
+        if (event.target === modal) closeModal();
+      });
+
+      document.addEventListener("keydown", function(event){
+        if (event.key === "Escape" && !modal.hidden) closeModal();
+      });
+
+      form.addEventListener("submit", function(event){
+        updatePreview();
+        if (!hiddenReason.value) {
+          event.preventDefault();
+          if (errorText) errorText.textContent = "请选择拒绝原因或填写补充说明";
+          return;
+        }
+        if (errorText) errorText.textContent = "";
+        submitButton.disabled = true;
+        submitButton.textContent = "提交中...";
+      });
+    })();
+  </script>
+{% endblock %}
+

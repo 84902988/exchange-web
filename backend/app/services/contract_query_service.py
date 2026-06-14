@@ -1,0 +1,486 @@
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Any, Optional
+
+from sqlalchemy import inspect
+from sqlalchemy.orm import Session, load_only
+
+from app.db.models.contract_order import ContractOrder
+from app.db.models.contract_position import ContractPosition
+from app.db.models.contract_trade import ContractTrade
+from app.schemas.contract_order import (
+    ContractOrderListItem,
+    ContractOrderListResponse,
+    ContractTradeListItem,
+    ContractTradeListResponse,
+)
+from app.schemas.contract_position import (
+    ContractPositionItem,
+    ContractPositionListResponse,
+    ContractPositionSummaryItem,
+    ContractPositionSummaryListResponse,
+)
+from app.services.contract_market_service import get_contract_quote
+
+
+DEFAULT_PAGE = 1
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
+
+
+def _normalize_symbol(symbol: Optional[str]) -> str:
+    return str(symbol or "").strip().upper()
+
+
+def _normalize_status(status: Optional[str]) -> str:
+    return str(status or "").strip().upper()
+
+
+def _normalize_page(value: Any) -> int:
+    try:
+        page = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE
+    return page if page > 0 else DEFAULT_PAGE
+
+
+def _normalize_page_size(value: Any) -> int:
+    try:
+        page_size = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE_SIZE
+    if page_size <= 0:
+        return DEFAULT_PAGE_SIZE
+    return min(page_size, MAX_PAGE_SIZE)
+
+
+def _d(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value or "0"))
+
+
+def _fmt_decimal(value: Any) -> str:
+    return format(_d(value), "f")
+
+
+def _fmt_compact_decimal(value: Any) -> str:
+    text = format(_d(value), "f")
+    if "." not in text:
+        return text
+    return text.rstrip("0").rstrip(".") or "0"
+
+
+def _table_has_column(db: Session, table_name: str, column_name: str) -> bool:
+    try:
+        return any(column.get("name") == column_name for column in inspect(db.get_bind()).get_columns(table_name))
+    except Exception:
+        return False
+
+
+def _fmt_datetime(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return value.isoformat()
+
+
+def _position_mark_and_pnl(db: Session, position: ContractPosition) -> tuple[Decimal, Decimal]:
+    table_mark_price = _d(position.mark_price)
+    if _normalize_status(position.status) != "OPEN":
+        return table_mark_price, _d(position.unrealized_pnl)
+
+    try:
+        quote = get_contract_quote(db, position.symbol)
+        mark_price = _d(quote["mark_price"])
+    except Exception:
+        mark_price = table_mark_price
+
+    entry_price = _d(position.entry_price)
+    quantity = _d(position.quantity)
+    side = _normalize_status(position.side)
+    if side == "LONG":
+        unrealized_pnl = (mark_price - entry_price) * quantity
+    elif side == "SHORT":
+        unrealized_pnl = (entry_price - mark_price) * quantity
+    else:
+        unrealized_pnl = _d(position.unrealized_pnl)
+    return mark_price, unrealized_pnl
+
+
+def _tp_sl_key(position: ContractPosition) -> tuple[str, str]:
+    return (
+        _fmt_decimal(position.take_profit_price) if position.take_profit_price is not None else "",
+        _fmt_decimal(position.stop_loss_price) if position.stop_loss_price is not None else "",
+    )
+
+
+def _summary_tp_sl(rows: list[ContractPosition]) -> tuple[str, Optional[str], Optional[str]]:
+    keys = {_tp_sl_key(position) for position in rows}
+    if not keys or keys == {("", "")}:
+        return "NONE", None, None
+    if len(keys) == 1:
+        take_profit_price, stop_loss_price = next(iter(keys))
+        return "SINGLE", take_profit_price or None, stop_loss_price or None
+    return "MIXED", None, None
+
+
+def _summary_liquidation_price(side: str, avg_entry_price: Decimal, margin_amount: Decimal, quantity: Decimal) -> Decimal:
+    if avg_entry_price <= 0 or margin_amount <= 0 or quantity <= 0:
+        return Decimal("0")
+    distance = margin_amount / quantity
+    if side == "LONG":
+        liquidation_price = avg_entry_price - distance
+    elif side == "SHORT":
+        liquidation_price = avg_entry_price + distance
+    else:
+        liquidation_price = Decimal("0")
+    return liquidation_price if liquidation_price > 0 else Decimal("0")
+
+
+def _position_trade_summaries(
+    db: Session,
+    user_id: int,
+    position_ids: list[int],
+) -> dict[int, dict[str, Any]]:
+    if not position_ids:
+        return {}
+
+    summaries: dict[int, dict[str, Any]] = {}
+    rows = (
+        db.query(ContractTrade)
+        .filter(ContractTrade.user_id == int(user_id))
+        .filter(ContractTrade.position_id.in_(position_ids))
+        .all()
+    )
+    for trade in rows:
+        if trade.position_id is None:
+            continue
+        position_id = int(trade.position_id)
+        summary = summaries.setdefault(
+            position_id,
+            {
+                "opened_quantity": Decimal("0"),
+                "closed_quantity": Decimal("0"),
+                "opened_margin_amount": Decimal("0"),
+                "released_margin_amount": Decimal("0"),
+                "close_notional": Decimal("0"),
+                "realized_pnl": Decimal("0"),
+                "closed_at": None,
+            },
+        )
+        action = _normalize_status(trade.action)
+        quantity = _d(trade.quantity)
+        margin_amount = _d(trade.margin_amount)
+        if action == "OPEN":
+            summary["opened_quantity"] += quantity
+            summary["opened_margin_amount"] += margin_amount
+            continue
+        if action == "CLOSE":
+            summary["closed_quantity"] += quantity
+            summary["released_margin_amount"] += margin_amount
+            summary["close_notional"] += _d(trade.price) * quantity
+            summary["realized_pnl"] += _d(trade.realized_pnl)
+            if summary["closed_at"] is None or trade.created_at > summary["closed_at"]:
+                summary["closed_at"] = trade.created_at
+
+    return summaries
+
+
+def get_user_contract_positions(
+    db: Session,
+    user_id: int,
+    symbol: Optional[str] = None,
+    status: str = "OPEN",
+) -> ContractPositionListResponse:
+    query = db.query(ContractPosition).filter(ContractPosition.user_id == int(user_id))
+
+    normalized_symbol = _normalize_symbol(symbol)
+    if normalized_symbol:
+        query = query.filter(ContractPosition.symbol == normalized_symbol)
+
+    normalized_status = _normalize_status(status)
+    if normalized_status and normalized_status != "ALL":
+        query = query.filter(ContractPosition.status == normalized_status)
+
+    rows = query.order_by(ContractPosition.opened_at.desc(), ContractPosition.id.desc()).all()
+    trade_summaries = _position_trade_summaries(db, int(user_id), [int(position.id) for position in rows])
+    items: list[ContractPositionItem] = []
+    for position in rows:
+        mark_price, unrealized_pnl = _position_mark_and_pnl(db, position)
+        trade_summary = trade_summaries.get(int(position.id), {})
+        closed_quantity = _d(trade_summary.get("closed_quantity"))
+        close_avg_price = (
+            _d(trade_summary.get("close_notional")) / closed_quantity
+            if closed_quantity > 0
+            else Decimal("0")
+        )
+        aggregated_closed_at = trade_summary.get("closed_at")
+        items.append(
+            ContractPositionItem(
+                id=int(position.id),
+                symbol=position.symbol,
+                side=position.side,
+                leverage=int(position.leverage),
+                quantity=_fmt_decimal(position.quantity),
+                entry_price=_fmt_decimal(position.entry_price),
+                mark_price=_fmt_decimal(mark_price),
+                margin_amount=_fmt_decimal(position.margin_amount),
+                open_fee=_fmt_decimal(position.open_fee),
+                unrealized_pnl=_fmt_decimal(unrealized_pnl),
+                realized_pnl=_fmt_decimal(position.realized_pnl),
+                liquidation_price=_fmt_decimal(position.liquidation_price),
+                warning_price=_fmt_decimal(position.warning_price),
+                take_profit_price=_fmt_decimal(position.take_profit_price) if position.take_profit_price is not None else None,
+                stop_loss_price=_fmt_decimal(position.stop_loss_price) if position.stop_loss_price is not None else None,
+                close_reason=position.close_reason,
+                opened_quantity=_fmt_decimal(trade_summary.get("opened_quantity", Decimal("0"))),
+                closed_quantity=_fmt_decimal(closed_quantity),
+                opened_margin_amount=_fmt_decimal(trade_summary.get("opened_margin_amount", Decimal("0"))),
+                released_margin_amount=_fmt_decimal(trade_summary.get("released_margin_amount", Decimal("0"))),
+                close_avg_price=_fmt_decimal(close_avg_price) if close_avg_price > 0 else None,
+                status=position.status,
+                opened_at=_fmt_datetime(position.opened_at),
+                closed_at=_fmt_datetime(position.closed_at or aggregated_closed_at),
+            )
+        )
+
+    return ContractPositionListResponse(items=items)
+
+
+def get_user_contract_position_summaries(
+    db: Session,
+    user_id: int,
+    symbol: Optional[str] = None,
+    side: Optional[str] = None,
+) -> ContractPositionSummaryListResponse:
+    query = (
+        db.query(ContractPosition)
+        .filter(ContractPosition.user_id == int(user_id))
+        .filter(ContractPosition.status == "OPEN")
+        .filter(ContractPosition.quantity > 0)
+    )
+
+    normalized_symbol = _normalize_symbol(symbol)
+    if normalized_symbol:
+        query = query.filter(ContractPosition.symbol == normalized_symbol)
+
+    normalized_side = _normalize_status(side)
+    if normalized_side:
+        if normalized_side not in {"LONG", "SHORT"}:
+            return ContractPositionSummaryListResponse(items=[])
+        query = query.filter(ContractPosition.side == normalized_side)
+
+    rows = query.order_by(ContractPosition.symbol.asc(), ContractPosition.side.asc(), ContractPosition.id.asc()).all()
+    grouped: dict[tuple[str, str], list[ContractPosition]] = {}
+    for position in rows:
+        quantity = _d(position.quantity)
+        position_side = _normalize_status(position.side)
+        if quantity <= 0 or position_side not in {"LONG", "SHORT"}:
+            continue
+        key = (_normalize_symbol(position.symbol), position_side)
+        grouped.setdefault(key, []).append(position)
+
+    items: list[ContractPositionSummaryItem] = []
+    for (group_symbol, group_side), group_rows in grouped.items():
+        total_quantity = sum((_d(position.quantity) for position in group_rows), Decimal("0"))
+        if total_quantity <= 0:
+            continue
+
+        weighted_entry_notional = sum(
+            (_d(position.entry_price) * _d(position.quantity) for position in group_rows),
+            Decimal("0"),
+        )
+        avg_entry_price = weighted_entry_notional / total_quantity
+        margin_amount = sum((_d(position.margin_amount) for position in group_rows), Decimal("0"))
+        unrealized_pnl = Decimal("0")
+        for position in group_rows:
+            _, position_unrealized_pnl = _position_mark_and_pnl(db, position)
+            unrealized_pnl += position_unrealized_pnl
+
+        tp_sl_mode, take_profit_price, stop_loss_price = _summary_tp_sl(group_rows)
+        liquidation_price = _summary_liquidation_price(
+            group_side,
+            avg_entry_price,
+            margin_amount,
+            total_quantity,
+        )
+
+        items.append(
+            ContractPositionSummaryItem(
+                symbol=group_symbol,
+                side=group_side,
+                quantity=_fmt_compact_decimal(total_quantity),
+                avg_entry_price=_fmt_compact_decimal(avg_entry_price),
+                margin_amount=_fmt_compact_decimal(margin_amount),
+                unrealized_pnl=_fmt_compact_decimal(unrealized_pnl),
+                liquidation_price=_fmt_compact_decimal(liquidation_price),
+                position_ids=[int(position.id) for position in group_rows],
+                count=len(group_rows),
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price,
+                tp_sl_mode=tp_sl_mode,
+            )
+        )
+
+    return ContractPositionSummaryListResponse(items=items)
+
+
+def get_user_contract_orders(
+    db: Session,
+    user_id: int,
+    symbol: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> ContractOrderListResponse:
+    normalized_page = _normalize_page(page)
+    normalized_page_size = _normalize_page_size(page_size)
+    query = db.query(ContractOrder).filter(ContractOrder.user_id == int(user_id))
+
+    normalized_symbol = _normalize_symbol(symbol)
+    if normalized_symbol:
+        query = query.filter(ContractOrder.symbol == normalized_symbol)
+
+    normalized_status = _normalize_status(status)
+    if normalized_status:
+        query = query.filter(ContractOrder.status == normalized_status)
+
+    has_fee_amount = _table_has_column(db, "contract_orders", "fee_amount")
+    total = int(query.count())
+    if not has_fee_amount:
+        query = query.options(
+            load_only(
+                ContractOrder.id,
+                ContractOrder.order_no,
+                ContractOrder.symbol,
+                ContractOrder.position_id,
+                ContractOrder.side,
+                ContractOrder.position_side,
+                ContractOrder.action,
+                ContractOrder.order_type,
+                ContractOrder.price,
+                ContractOrder.quantity,
+                ContractOrder.leverage,
+                ContractOrder.margin_amount,
+                ContractOrder.spread_fee,
+                ContractOrder.filled_quantity,
+                ContractOrder.avg_price,
+                ContractOrder.status,
+                ContractOrder.fail_reason,
+                ContractOrder.take_profit_price,
+                ContractOrder.stop_loss_price,
+                ContractOrder.created_at,
+            )
+        )
+    rows = (
+        query.order_by(ContractOrder.created_at.desc(), ContractOrder.id.desc())
+        .offset((normalized_page - 1) * normalized_page_size)
+        .limit(normalized_page_size)
+        .all()
+    )
+
+    return ContractOrderListResponse(
+        items=[
+            ContractOrderListItem(
+                id=int(order.id),
+                order_no=order.order_no,
+                symbol=order.symbol,
+                position_id=int(order.position_id) if order.position_id is not None else None,
+                side=order.side,
+                position_side=order.position_side,
+                action=order.action,
+                order_type=order.order_type,
+                price=_fmt_decimal(order.price) if order.price is not None else None,
+                quantity=_fmt_decimal(order.quantity),
+                leverage=int(order.leverage),
+                margin_amount=_fmt_decimal(order.margin_amount),
+                fee_amount=_fmt_decimal(order.fee_amount if has_fee_amount else Decimal("0")),
+                spread_fee=_fmt_decimal(order.spread_fee),
+                filled_quantity=_fmt_decimal(order.filled_quantity),
+                avg_price=_fmt_decimal(order.avg_price),
+                status=order.status,
+                fail_reason=order.fail_reason,
+                take_profit_price=_fmt_decimal(order.take_profit_price) if order.take_profit_price is not None else None,
+                stop_loss_price=_fmt_decimal(order.stop_loss_price) if order.stop_loss_price is not None else None,
+                created_at=_fmt_datetime(order.created_at),
+            )
+            for order in rows
+        ],
+        total=total,
+        page=normalized_page,
+        page_size=normalized_page_size,
+    )
+
+
+def get_user_contract_trades(
+    db: Session,
+    user_id: int,
+    symbol: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> ContractTradeListResponse:
+    normalized_page = _normalize_page(page)
+    normalized_page_size = _normalize_page_size(page_size)
+    query = db.query(ContractTrade).filter(ContractTrade.user_id == int(user_id))
+
+    normalized_symbol = _normalize_symbol(symbol)
+    if normalized_symbol:
+        query = query.filter(ContractTrade.symbol == normalized_symbol)
+
+    has_fee_amount = _table_has_column(db, "contract_trades", "fee_amount")
+    total = int(query.count())
+    if not has_fee_amount:
+        query = query.options(
+            load_only(
+                ContractTrade.id,
+                ContractTrade.trade_no,
+                ContractTrade.order_id,
+                ContractTrade.position_id,
+                ContractTrade.user_id,
+                ContractTrade.symbol,
+                ContractTrade.position_side,
+                ContractTrade.action,
+                ContractTrade.price,
+                ContractTrade.quantity,
+                ContractTrade.notional,
+                ContractTrade.leverage,
+                ContractTrade.margin_amount,
+                ContractTrade.spread_fee,
+                ContractTrade.realized_pnl,
+                ContractTrade.created_at,
+            )
+        )
+    rows = (
+        query.order_by(ContractTrade.created_at.desc(), ContractTrade.id.desc())
+        .offset((normalized_page - 1) * normalized_page_size)
+        .limit(normalized_page_size)
+        .all()
+    )
+
+    return ContractTradeListResponse(
+        items=[
+            ContractTradeListItem(
+                id=int(trade.id),
+                trade_no=trade.trade_no,
+                order_id=int(trade.order_id),
+                position_id=int(trade.position_id) if trade.position_id is not None else None,
+                symbol=trade.symbol,
+                position_side=trade.position_side,
+                action=trade.action,
+                price=_fmt_decimal(trade.price),
+                quantity=_fmt_decimal(trade.quantity),
+                notional=_fmt_decimal(trade.notional),
+                leverage=int(trade.leverage),
+                margin_amount=_fmt_decimal(trade.margin_amount),
+                fee_amount=_fmt_decimal(trade.fee_amount if has_fee_amount else Decimal("0")),
+                spread_fee=_fmt_decimal(trade.spread_fee),
+                realized_pnl=_fmt_decimal(trade.realized_pnl),
+                created_at=_fmt_datetime(trade.created_at),
+            )
+            for trade in rows
+        ],
+        total=total,
+        page=normalized_page,
+        page_size=normalized_page_size,
+    )

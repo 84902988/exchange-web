@@ -1,0 +1,157 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}充值记录{% endblock %}
+{% block page_title %}充值记录{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">基于 deposits 表查询链上充值记录，仅用于后台只读核查。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .deposit-policy{margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,255,255,.10);border-radius:8px;background:rgba(255,255,255,.04);color:rgba(255,255,255,.70);font-size:13px;line-height:1.6;}
+    .deposit-policy.warning{border-color:rgba(227,171,57,.28);background:rgba(189,134,25,.12);color:#ffd68a;}
+    .deposit-quick-ranges{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px;}
+    .deposit-quick-ranges .active{background:var(--brand-soft);border-color:rgba(189,52,25,.35);color:#fff;}
+    .deposit-time-hint{margin-top:6px;color:rgba(255,255,255,.46);font-size:12px;line-height:1.45;}
+  </style>
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <div class="deposit-policy">{{ large_table_notice }}</div>
+      {% if query_notice %}
+        <div class="deposit-policy warning">{{ query_notice }}</div>
+      {% endif %}
+      <div class="deposit-quick-ranges" aria-label="快捷日期">
+        {% for range_item in quick_ranges %}
+          <a
+            href="{{ request.url.include_query_params(created_from=range_item.date_from, created_to=range_item.date_to, date_from=range_item.date_from, date_to=range_item.date_to, start_time=range_item.date_from, end_time=range_item.date_to, page=1) }}"
+            class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if active_range_days == range_item.days %}active{% endif %}"
+          >最近{{ range_item.days }}天</a>
+        {% endfor %}
+      </div>
+      <form method="get" action="/admin/deposit-records" class="filter-form">
+        <div class="field">
+          <label for="deposit_id">充值ID</label>
+          <input id="deposit_id" type="text" name="deposit_id" value="{{ filters.deposit_id or '' }}" placeholder="deposits.id" />
+        </div>
+        <div class="field">
+          <label for="deposit_no">充值单号</label>
+          <input id="deposit_no" type="text" name="deposit_no" value="{{ filters.deposit_no or '' }}" placeholder="如有充值单号" />
+        </div>
+        <div class="field">
+          <label for="user_id">用户ID</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" placeholder="请输入用户ID" />
+        </div>
+        <div class="field">
+          <label for="coin_symbol">币种</label>
+          <input id="coin_symbol" type="text" name="coin_symbol" value="{{ filters.coin_symbol or '' }}" placeholder="例如 USDT" />
+        </div>
+        <div class="field">
+          <label for="chain_key">网络</label>
+          <input id="chain_key" type="text" name="chain_key" value="{{ filters.chain_key or '' }}" placeholder="例如 polygon / bsc" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <input id="status" type="text" name="status" value="{{ filters.status or '' }}" placeholder="例如 CONFIRMED" />
+        </div>
+        <div class="field">
+          <label for="tx_hash">TxID</label>
+          <input id="tx_hash" type="text" name="tx_hash" value="{{ filters.tx_hash or filters.txid or '' }}" placeholder="交易哈希" />
+        </div>
+        <div class="field">
+          <label for="request_id">请求ID</label>
+          <input id="request_id" type="text" name="request_id" value="{{ filters.request_id or '' }}" placeholder="如有请求ID" />
+        </div>
+        <div class="field">
+          <label for="address">充值地址</label>
+          <input id="address" type="text" name="address" value="{{ filters.address or '' }}" placeholder="收款地址" />
+        </div>
+        <div class="field">
+          <label for="created_from">开始日期</label>
+          <input id="created_from" type="date" name="created_from" value="{{ filters.created_from or '' }}" />
+          <div class="deposit-time-hint">默认最近7天；普通查询最大范围30天。</div>
+        </div>
+        <div class="field">
+          <label for="created_to">结束日期</label>
+          <input id="created_to" type="date" name="created_to" value="{{ filters.created_to or '' }}" />
+          <div class="deposit-time-hint">超过30天请填写用户ID、充值ID、TxID、币种、链或地址。</div>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/deposit-records" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">充值记录列表</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>用户ID</th>
+                <th class="nowrap">币种</th>
+                <th class="nowrap">网络</th>
+                <th class="text-right">数量</th>
+                <th class="nowrap">状态</th>
+                <th class="nowrap">确认数</th>
+                <th>TxID</th>
+                <th>来源地址</th>
+                <th>充值地址</th>
+                <th class="nowrap">创建时间</th>
+                <th class="nowrap">确认时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.id }}</td>
+                  <td class="admin-id">{{ item.user_id }}</td>
+                  <td class="mono nowrap">{{ item.coin_symbol }}</td>
+                  <td class="mono nowrap">{{ item.chain_key }}</td>
+                  <td class="admin-amount">{{ item.amount }}</td>
+                  <td>
+                    <span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">
+                      {{ item.status_label }}
+                    </span>
+                  </td>
+                  <td class="nowrap">{{ item.confirmations }} / {{ item.confirm_required }}</td>
+                  <td class="admin-hash" title="{{ item.txid }}">{{ item.txid_short }}</td>
+                  <td class="admin-address" title="{{ item.from_address }}">{{ item.from_address_short }}</td>
+                  <td class="admin-address" title="{{ item.address }}">{{ item.address_short }}</td>
+                  <td class="nowrap">{{ item.created_at }}</td>
+                  <td class="nowrap">{{ item.confirmed_at }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">暂无符合条件的充值记录</div>
+      {% endif %}
+
+      <div class="pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a
+              href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+              class="btn secondary admin-btn admin-btn-secondary"
+            >下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

@@ -1,0 +1,442 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}BD申请审核{% endblock %}
+{% block page_title %}BD申请审核{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看用户提交的 BD 代理申请，并进行通过或拒绝审核。保证金仅记录意向金额，不在此处扣款或冻结。</div>
+{% endblock %}
+
+{% block content %}
+  {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+
+  <style>
+    .bd-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
+    .bd-stat-card{padding:14px 16px}
+    .bd-stat-label{color:var(--muted);font-size:12px;margin-bottom:8px}
+    .bd-stat-value{font-size:22px;font-weight:900;line-height:1.15}
+    .bd-filter-form{grid-template-columns:repeat(5,minmax(0,1fr)) auto}
+    .bd-table{min-width:0;table-layout:fixed}
+    .bd-cell-main{min-width:0;color:#fff;font-weight:800;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .bd-cell-sub{min-width:0;margin-top:4px;color:var(--muted);font-size:12px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .bd-application-info{min-width:360px;max-width:420px;text-align:left}
+    .bd-application-meta{text-align:left;color:var(--muted);font-size:13px;line-height:1.35;margin-top:6px}
+    .bd-note{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .bd-status-cell{white-space:nowrap}
+    .bd-qualification-cell{white-space:nowrap}
+    .bd-number{font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
+    .bd-actions-col,
+    .bd-actions-cell{width:150px;text-align:right}
+    .bd-actions-cell{
+      vertical-align:middle !important;
+    }
+    .bd-row-actions{
+      display:flex;
+      align-items:center;
+      justify-content:flex-end;
+      gap:8px;
+      flex-wrap:nowrap;
+    }
+    .bd-revoke-form{margin:0}
+    .bd-action-btn{
+      min-height:34px;
+      padding:0 12px;
+      border-radius:9px;
+      font-size:12px;
+      white-space:nowrap;
+    }
+    .bd-modal-backdrop[hidden]{
+      display:none;
+    }
+    .bd-modal-backdrop{
+      position:fixed;
+      inset:0;
+      z-index:1000;
+      display:grid;
+      place-items:center;
+      padding:20px;
+      background:rgba(0,0,0,.68);
+      backdrop-filter:blur(8px);
+    }
+    .bd-review-modal{
+      width:min(520px, 100%);
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:16px;
+      background:linear-gradient(180deg, rgba(24,25,32,.98), rgba(13,14,20,.98));
+      box-shadow:0 24px 70px rgba(0,0,0,.52);
+      padding:18px;
+    }
+    .bd-modal-head{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:16px;
+    }
+    .bd-modal-title{
+      font-size:17px;
+      font-weight:800;
+      color:#fff;
+    }
+    .bd-modal-subtitle{
+      margin-top:5px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .bd-modal-close{
+      width:32px;
+      height:32px;
+      border-radius:9px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.04);
+      color:var(--text);
+      cursor:pointer;
+      font-size:18px;
+      line-height:1;
+    }
+    .bd-modal-form{
+      display:grid;
+      gap:12px;
+    }
+    .bd-modal-form textarea{
+      min-height:96px;
+    }
+    .bd-modal-actions{
+      display:flex;
+      justify-content:flex-end;
+      gap:10px;
+      margin-top:4px;
+    }
+    @media (max-width:1180px){.bd-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bd-filter-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media (max-width:720px){.bd-stat-grid,.bd-filter-form{grid-template-columns:1fr}.bd-table{min-width:860px}}
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card admin-card">
+        <div class="section-title">操作成功</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card admin-card">
+        <div class="section-title">操作提示</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="admin-alert admin-alert-warning">BD 申请审核会影响用户代理资格和后续分佣，请确认申请信息、等级和备注后再处理。</div>
+  </section>
+
+  <section class="page-section">
+    <div class="bd-stat-grid">
+      <div class="admin-card bd-stat-card"><div class="bd-stat-label">待审核</div><div class="bd-stat-value bd-number">{{ stats.pending_count|default(0) }}</div></div>
+      <div class="admin-card bd-stat-card"><div class="bd-stat-label">已通过</div><div class="bd-stat-value bd-number">{{ stats.approved_count|default(0) }}</div></div>
+      <div class="admin-card bd-stat-card"><div class="bd-stat-label">已拒绝</div><div class="bd-stat-value bd-number">{{ stats.rejected_count|default(0) }}</div></div>
+      <div class="admin-card bd-stat-card"><div class="bd-stat-label">今日申请</div><div class="bd-stat-value bd-number">{{ stats.today_count|default(0) }}</div></div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card admin-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/bd/applications" class="filter-form bd-filter-form">
+        <div class="field">
+          <label for="user_id">用户ID</label>
+          <input id="user_id" type="text" name="user_id" value="{{ filters.user_id or '' }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="PENDING" {% if filters.status == 'PENDING' %}selected{% endif %}>待审核</option>
+            <option value="APPROVED" {% if filters.status == 'APPROVED' %}selected{% endif %}>已通过</option>
+            <option value="REJECTED" {% if filters.status == 'REJECTED' %}selected{% endif %}>已拒绝</option>
+            <option value="CANCELED" {% if filters.status == 'CANCELED' %}selected{% endif %}>已取消</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="apply_level">申请等级</label>
+          <select id="apply_level" name="apply_level">
+            <option value="">全部</option>
+            <option value="BD1" {% if filters.apply_level == 'BD1' %}selected{% endif %}>BD1</option>
+            <option value="BD2" {% if filters.apply_level == 'BD2' %}selected{% endif %}>BD2</option>
+            <option value="BD3" {% if filters.apply_level == 'BD3' %}selected{% endif %}>BD3</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="created_from">创建开始</label>
+          <input id="created_from" type="date" name="created_from" value="{{ filters.created_from_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="created_to">创建结束</label>
+          <input id="created_to" type="date" name="created_to" value="{{ filters.created_to_text or '' }}" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/bd/applications" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card admin-card">
+      <div class="section-title">BD申请列表</div>
+
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table bd-table">
+            <colgroup>
+              <col style="width:13%">
+              <col style="width:34%">
+              <col style="width:12%">
+              <col style="width:12%">
+              <col style="width:17%">
+              <col style="width:12%">
+            </colgroup>
+            <thead>
+              <tr>
+                <th>用户信息</th>
+                <th>申请信息</th>
+                <th>申请状态</th>
+                <th>BD资格</th>
+                <th>时间</th>
+                <th class="bd-actions-col">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td>
+                    <div class="bd-cell-main admin-id">用户ID {{ item.user_id }}</div>
+                    <div class="bd-cell-sub admin-id">申请单 #{{ item.id }}</div>
+                  </td>
+                  <td class="bd-application-info">
+                    <div class="bd-cell-main">{{ item.apply_level }} · {{ item.deposit_coin_symbol }}</div>
+                    <div class="bd-application-meta bd-number">保证金意向 {{ item.deposit_amount }}</div>
+                    <div class="bd-cell-sub bd-note" title="{{ item.remark }}">说明：{{ item.remark }}</div>
+                    <div class="bd-cell-sub bd-note" title="{{ item.admin_remark }}">备注：{{ item.admin_remark }}</div>
+                  </td>
+                  <td class="bd-status-cell">
+                    <span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span>
+                  </td>
+                  <td class="bd-qualification-cell">
+                    {% if item.status == 'APPROVED' %}
+                      <span class="admin-badge admin-badge-{% if item.bd_account_status == 'EXPIRED' %}secondary{% else %}{{ item.bd_account_status_badge_class }}{% endif %}">{{ item.bd_account_status_text }}</span>
+                    {% else %}
+                      <span class="muted">--</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    <div class="bd-cell-main admin-time">{{ item.created_at }}</div>
+                    <div class="bd-cell-sub admin-time">审核：{{ item.reviewed_at }}</div>
+                  </td>
+                  <td class="bd-actions-cell">
+                    {% if item.status == 'PENDING' %}
+                      <div class="bd-row-actions">
+                        <button
+                          type="button"
+                          class="btn bd-action-btn admin-btn admin-btn-primary admin-btn-sm"
+                          data-bd-approve
+                          data-application-id="{{ item.id }}"
+                          data-apply-level="{{ item.apply_level }}"
+                        >通过</button>
+                        <button
+                          type="button"
+                          class="btn danger bd-action-btn admin-btn admin-btn-danger admin-btn-sm"
+                          data-bd-reject
+                          data-application-id="{{ item.id }}"
+                          data-apply-level="{{ item.apply_level }}"
+                        >拒绝</button>
+                      </div>
+                    {% elif item.status == 'APPROVED' %}
+                      {% if item.can_revoke_bd %}
+                        <form
+                          method="post"
+                          action="/admin/bd/applications/{{ item.id }}/revoke"
+                          class="bd-revoke-form"
+                          onsubmit="return confirm('确认取消该用户 BD 资格？取消后该用户不再作为有效 BD 参与后续分佣，历史记录不会删除。');"
+                        >
+                          <input type="hidden" name="next_path" value="{{ current_url }}" />
+                          <button type="submit" class="btn danger bd-action-btn admin-btn admin-btn-danger admin-btn-sm">取消资格</button>
+                        </form>
+                      {% elif item.can_restore_bd %}
+                        <form
+                          method="post"
+                          action="/admin/bd/applications/{{ item.id }}/restore"
+                          class="bd-revoke-form"
+                          onsubmit="return confirm('确认恢复该用户 BD 资格？恢复后将重新参与后续分佣统计，历史记录不会变更。');"
+                        >
+                          <input type="hidden" name="next_path" value="{{ current_url }}" />
+                          <button type="submit" class="btn bd-action-btn admin-btn admin-btn-primary admin-btn-sm">恢复资格</button>
+                        </form>
+                      {% else %}
+                        <span class="admin-badge admin-badge-{{ item.bd_account_status_badge_class }}">{{ item.bd_account_status_text }}</span>
+                      {% endif %}
+                    {% elif item.status == 'REJECTED' %}
+                      <span class="admin-badge admin-badge-danger">已拒绝</span>
+                    {% else %}
+                      <span class="admin-badge admin-badge-secondary">{{ item.status_label }}</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty"><div class="admin-empty-title">暂无数据</div><p class="admin-empty-desc">暂无 BD 申请记录</p></div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div>共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="bdApproveModal" class="bd-modal-backdrop" hidden>
+    <div class="bd-review-modal" role="dialog" aria-modal="true" aria-labelledby="bdApproveTitle">
+      <div class="bd-modal-head">
+        <div>
+          <div id="bdApproveTitle" class="bd-modal-title">通过BD申请</div>
+          <div class="bd-modal-subtitle">申请单 <span id="bdApproveApplicationId" class="mono"></span></div>
+        </div>
+        <button type="button" class="bd-modal-close" data-bd-modal-close aria-label="关闭">×</button>
+      </div>
+      <form id="bdApproveForm" method="post" class="bd-modal-form" onsubmit="return confirm('确认通过该 BD 申请？通过后用户将获得对应代理资格和分佣配置。');">
+        <input type="hidden" name="next_path" value="{{ current_url }}" />
+        <div class="field">
+          <label for="bdApproveRate">BD分佣比</label>
+          <input
+            id="bdApproveRate"
+            type="number"
+            name="commission_rate"
+            min="0"
+            max="1"
+            step="0.000001"
+            placeholder="留空则按申请等级默认比例"
+          />
+        </div>
+        <div class="field">
+          <label for="bdApproveRemark">审核备注</label>
+          <textarea id="bdApproveRemark" name="admin_remark" rows="3" placeholder="可选"></textarea>
+        </div>
+        <div class="bd-modal-actions">
+          <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-bd-modal-close>取消</button>
+          <button type="submit" class="btn admin-btn admin-btn-primary">确认通过</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="bdRejectModal" class="bd-modal-backdrop" hidden>
+    <div class="bd-review-modal" role="dialog" aria-modal="true" aria-labelledby="bdRejectTitle">
+      <div class="bd-modal-head">
+        <div>
+          <div id="bdRejectTitle" class="bd-modal-title">拒绝BD申请</div>
+          <div class="bd-modal-subtitle">申请单 <span id="bdRejectApplicationId" class="mono"></span></div>
+        </div>
+        <button type="button" class="bd-modal-close" data-bd-modal-close aria-label="关闭">×</button>
+      </div>
+      <form id="bdRejectForm" method="post" class="bd-modal-form" onsubmit="return confirm('确认拒绝该 BD 申请？拒绝原因将写入后台留档。');">
+        <input type="hidden" name="next_path" value="{{ current_url }}" />
+        <div class="field">
+          <label for="bdRejectRemark">拒绝原因</label>
+          <textarea id="bdRejectRemark" name="admin_remark" rows="3" required placeholder="填写给后台留档的拒绝原因"></textarea>
+        </div>
+        <div class="bd-modal-actions">
+          <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-bd-modal-close>取消</button>
+          <button type="submit" class="btn danger admin-btn admin-btn-danger">确认拒绝</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    (function(){
+      const approveModal = document.getElementById("bdApproveModal");
+      const rejectModal = document.getElementById("bdRejectModal");
+      const approveForm = document.getElementById("bdApproveForm");
+      const rejectForm = document.getElementById("bdRejectForm");
+      const approveApplicationId = document.getElementById("bdApproveApplicationId");
+      const rejectApplicationId = document.getElementById("bdRejectApplicationId");
+      const approveRate = document.getElementById("bdApproveRate");
+      const approveRemark = document.getElementById("bdApproveRemark");
+      const rejectRemark = document.getElementById("bdRejectRemark");
+
+      function setBodyLock(locked){
+        document.body.style.overflow = locked ? "hidden" : "";
+      }
+
+      function openModal(modal, focusTarget){
+        modal.hidden = false;
+        setBodyLock(true);
+        window.setTimeout(function(){
+          if (focusTarget) focusTarget.focus();
+        }, 0);
+      }
+
+      function closeModals(){
+        approveModal.hidden = true;
+        rejectModal.hidden = true;
+        setBodyLock(false);
+      }
+
+      function getApplicationId(button){
+        const id = button.getAttribute("data-application-id") || "";
+        return /^[0-9]+$/.test(id) ? id : "";
+      }
+
+      document.querySelectorAll("[data-bd-approve]").forEach(function(button){
+        button.addEventListener("click", function(){
+          const id = getApplicationId(button);
+          if (!id) return;
+          approveForm.action = "/admin/bd/applications/" + id + "/approve";
+          approveApplicationId.textContent = "#" + id;
+          approveRate.value = "";
+          approveRemark.value = "";
+          openModal(approveModal, approveRate);
+        });
+      });
+
+      document.querySelectorAll("[data-bd-reject]").forEach(function(button){
+        button.addEventListener("click", function(){
+          const id = getApplicationId(button);
+          if (!id) return;
+          rejectForm.action = "/admin/bd/applications/" + id + "/reject";
+          rejectApplicationId.textContent = "#" + id;
+          rejectRemark.value = "";
+          openModal(rejectModal, rejectRemark);
+        });
+      });
+
+      document.querySelectorAll("[data-bd-modal-close]").forEach(function(button){
+        button.addEventListener("click", closeModals);
+      });
+
+      [approveModal, rejectModal].forEach(function(modal){
+        modal.addEventListener("click", function(event){
+          if (event.target === modal) closeModals();
+        });
+      });
+
+      document.addEventListener("keydown", function(event){
+        if (event.key === "Escape") closeModals();
+      });
+    })();
+  </script>
+{% endblock %}
+

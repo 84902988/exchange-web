@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>管理员登录 - Exchange Admin</title>
+  <style>
+    :root{
+      --bg:#0b0b0f;
+      --panel:rgba(255,255,255,.06);
+      --border:rgba(255,255,255,.12);
+      --text:#ffffff;
+      --muted:rgba(255,255,255,.72);
+      --brand:#BD3419;
+      --danger:#ff6b6b;
+    }
+    *{ box-sizing:border-box; }
+    body{
+      margin:0;
+      min-height:100vh;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:24px;
+      background:
+        radial-gradient(circle at top, rgba(189,52,25,.18), transparent 35%),
+        var(--bg);
+      color:var(--text);
+      font-family:Arial, "Microsoft YaHei", sans-serif;
+    }
+    .wrap{ width:100%; max-width:420px; }
+    .card{
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius:16px;
+      padding:24px;
+      box-shadow:0 18px 40px rgba(0,0,0,.35);
+    }
+    .title{
+      margin:0 0 8px;
+      font-size:22px;
+      font-weight:800;
+    }
+    .subtitle{
+      margin:0 0 18px;
+      color:var(--muted);
+      font-size:13px;
+      line-height:1.6;
+    }
+    label{
+      display:block;
+      margin:12px 0 6px;
+      font-size:12px;
+      color:var(--muted);
+    }
+    input{
+      width:100%;
+      padding:11px 12px;
+      border-radius:10px;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(0,0,0,.35);
+      color:#fff;
+      outline:none;
+    }
+    button{
+      width:100%;
+      margin-top:18px;
+      padding:11px 12px;
+      border:0;
+      border-radius:10px;
+      background:var(--brand);
+      color:#fff;
+      font-weight:700;
+      cursor:pointer;
+    }
+    .err{
+      margin-top:12px;
+      padding:10px 12px;
+      border-radius:10px;
+      background:rgba(255,107,107,.12);
+      border:1px solid rgba(255,107,107,.25);
+      color:var(--danger);
+      font-size:12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1 class="title">管理员登录</h1>
+      <p class="subtitle">请输入后台管理员账号和密码。</p>
+
+      <form method="post" action="/admin/login">
+        <label for="username">账号</label>
+        <input id="username" name="username" placeholder="请输入后台账号" autocomplete="username" />
+
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" placeholder="请输入后台密码" autocomplete="current-password" />
+
+        <button type="submit">登录</button>
+      </form>
+
+      {% if error %}
+        <div class="err">{{ error }}</div>
+      {% endif %}
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,161 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}首页 Banner{% endblock %}
+{% block page_title %}首页 Banner{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">维护首页 Banner 展示内容、跳转链接、排序和启用状态。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/home-banners/new" class="btn admin-btn admin-btn-primary">新增 Banner</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .banner-actions{
+      display:flex;
+      gap:8px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+    .banner-actions form{ margin:0; }
+    .ops-link{
+      display:inline-block;
+      max-width:150px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      vertical-align:middle;
+      white-space:nowrap;
+    }
+  </style>
+
+  {% set current_url = request.url.path %}
+  {% if request.url.query %}
+    {% set current_url = request.url.path ~ '?' ~ request.url.query %}
+  {% endif %}
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card"><div class="section-title">操作结果</div><p class="muted">{{ notice }}</p></div>
+    </section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section">
+      <div class="card"><div class="section-title">提示信息</div><p class="muted">{{ error }}</p></div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="admin-alert admin-alert-warning">首页 Banner 会影响前台首屏展示，删除或禁用前请确认运营排期。</div>
+  </section>
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">筛选条件</div>
+      <form method="get" action="/admin/home-banners" class="filter-form">
+        <div class="field">
+          <label for="keyword">标题</label>
+          <input id="keyword" name="keyword" type="text" value="{{ filters.keyword or '' }}" />
+        </div>
+        <div class="field">
+          <label for="status">状态</label>
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="ACTIVE" {% if filters.status == 'ACTIVE' %}selected{% endif %}>启用</option>
+            <option value="DISABLED" {% if filters.status == 'DISABLED' %}selected{% endif %}>禁用</option>
+          </select>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">查询</button>
+          <a href="/admin/home-banners" class="btn secondary admin-btn admin-btn-secondary">重置</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">Banner 列表</div>
+      {% if items %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>标题</th>
+                <th>副标题</th>
+                <th>图片</th>
+                <th>链接</th>
+                <th class="text-right admin-number">排序</th>
+                <th>状态</th>
+                <th>翻译</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="admin-id">{{ item.id }}</td>
+                  <td>{{ item.title }}</td>
+                  <td>{{ item.subtitle or '-' }}</td>
+                  <td>
+                    {% if item.image_url %}
+                      <a class="ops-link admin-id" href="{{ item.image_url }}" target="_blank" rel="noopener" title="{{ item.image_url }}">查看图片</a>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
+                  <td>
+                    {% if item.link_url %}
+                      <a class="ops-link admin-id" href="{{ item.link_url }}" target="_blank" rel="noopener" title="{{ item.link_url }}">打开链接</a>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
+                  <td class="text-right admin-number">{{ item.sort_order }}</td>
+                  <td><span class="admin-badge admin-badge-{{ 'secondary' if item.status_badge in ['neutral', 'muted'] else item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
+                  <td><span class="admin-badge admin-badge-{{ 'success' if item.i18n_complete_count == item.i18n_total_count else 'secondary' }}" title="{{ item.i18n_missing_locales|join(', ') }}">{{ item.i18n_status_label or '0/4' }}</span></td>
+                  <td>
+                    <div class="filter-actions banner-actions admin-table-actions">
+                      <a href="/admin/home-banners/{{ item.id }}/edit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">编辑</a>
+                      <form
+                        method="post"
+                        action="/admin/home-banners/{{ item.id }}/toggle-status"
+                        onsubmit="return confirm('{% if item.status == 'ACTIVE' %}确认禁用该 Banner？禁用后前台首页将不再展示。{% else %}确认启用该 Banner？启用后前台首页可能立即展示。{% endif %}');"
+                      >
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn {% if item.status == 'ACTIVE' %}danger admin-btn-danger{% else %}admin-btn-primary{% endif %} admin-btn admin-btn-sm">
+                          {% if item.status == 'ACTIVE' %}禁用{% else %}启用{% endif %}
+                        </button>
+                      </form>
+                      <form method="post" action="/admin/home-banners/{{ item.id }}/delete" onsubmit="return confirm('确认删除该 Banner？删除后不可恢复，前台将不再展示。');">
+                        <button type="submit" class="btn danger admin-btn admin-btn-danger admin-btn-sm">删除</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">
+          <div class="admin-empty-title">暂无数据</div>
+          <p class="admin-empty-desc">当前筛选条件下暂无记录，可调整筛选条件后重试</p>
+        </div>
+      {% endif %}
+
+      <div class="pagination admin-pagination">
+        <div class="admin-muted">共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页</div>
+        <div class="pagination-actions">
+          {% if pagination.page > 1 %}
+            <a href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">上一页</a>
+          {% endif %}
+          {% if pagination.page < pagination.pages %}
+            <a href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

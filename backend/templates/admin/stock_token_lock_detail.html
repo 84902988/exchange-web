@@ -1,0 +1,231 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}股票锁仓批次详情{% endblock %}
+{% block page_title %}股票锁仓批次详情 #{{ item.id }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">{{ item.detail_subtitle or '当前批次的锁仓、释放与兑换进度。' }}</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .lock-detail-grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    @media (max-width: 980px) {
+      .lock-detail-grid { grid-template-columns: 1fr; }
+    }
+    .detail-card {
+      background: linear-gradient(180deg, var(--panel-strong), var(--panel));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+    .detail-card-full {
+      grid-column: 1 / -1;
+    }
+    .kv-grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    @media (max-width: 640px) {
+      .kv-grid { grid-template-columns: 1fr; }
+    }
+    .kv-label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+    .kv-value {
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+    .asset-grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+    }
+    @media (max-width: 1180px) {
+      .asset-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .asset-grid { grid-template-columns: 1fr; }
+    }
+    .asset-box {
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 12px;
+      padding: 14px;
+      background: rgba(255,255,255,.03);
+    }
+    .asset-value {
+      font-size: 20px;
+      font-weight: 900;
+      line-height: 1.2;
+    }
+    .asset-note {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 6px;
+    }
+    .progress-track {
+      background: rgba(255,255,255,.08);
+      border-radius: 999px;
+      height: 12px;
+      margin-top: 14px;
+      overflow: hidden;
+      width: 100%;
+    }
+    .progress-value {
+      background: linear-gradient(90deg, #f0b90b, #22c55e);
+      border-radius: inherit;
+      height: 100%;
+    }
+    .action-row {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作结果</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">提示信息</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="lock-detail-grid">
+      <div class="detail-card">
+        <div class="section-title">批次概览</div>
+        <div class="kv-grid">
+          <div>
+            <div class="kv-label">批次ID</div>
+            <div class="kv-value mono">{{ item.id }}</div>
+          </div>
+          <div>
+            <div class="kv-label">用户ID</div>
+            <div class="kv-value mono">{{ item.user_id }}</div>
+          </div>
+          <div>
+            <div class="kv-label">当前状态</div>
+            <div class="kv-value"><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status_label }}</span></div>
+          </div>
+          <div>
+            <div class="kv-label">锁仓周期</div>
+            <div class="kv-value">{{ item.lock_period_text }}</div>
+          </div>
+          <div>
+            <div class="kv-label">到期时间</div>
+            <div class="kv-value">{{ item.unlock_at }}</div>
+          </div>
+          <div>
+            <div class="kv-label">创建时间</div>
+            <div class="kv-value">{{ item.created_at }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="detail-card">
+        <div class="section-title">兑换规则</div>
+        <div class="kv-grid">
+          <div>
+            <div class="kv-label">锁仓币种</div>
+            <div class="kv-value mono">{{ item.lock_symbol }}</div>
+          </div>
+          <div>
+            <div class="kv-label">兑换币种</div>
+            <div class="kv-value mono">{{ item.trade_symbol or '-' }}</div>
+          </div>
+          <div>
+            <div class="kv-label">创建时汇率快照</div>
+            <div class="kv-value">{{ item.conversion_rate_text }}</div>
+          </div>
+          <div>
+            <div class="kv-label">当前配置汇率</div>
+            <div class="kv-value">{{ item.current_conversion_rate_text }}</div>
+          </div>
+          <div>
+            <div class="kv-label">每日释放比例</div>
+            <div class="kv-value tabular-nums">{{ item.daily_release_rate_percent }}%</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="detail-card detail-card-full">
+        <div class="section-title">资产进度</div>
+        <div class="asset-grid">
+          <div class="asset-box">
+            <div class="kv-label">总锁仓</div>
+            <div class="asset-value tabular-nums">{{ item.total_amount_text }}</div>
+            <div class="asset-note">原始总锁仓数量</div>
+          </div>
+          <div class="asset-box">
+            <div class="kv-label">已释放</div>
+            <div class="asset-value tabular-nums">{{ item.released_amount_text }}</div>
+            <div class="asset-note">总锁仓 - 待释放</div>
+          </div>
+          <div class="asset-box">
+            <div class="kv-label">待释放</div>
+            <div class="asset-value tabular-nums">{{ item.locked_amount_text }}</div>
+            <div class="asset-note">当前剩余锁仓</div>
+          </div>
+          <div class="asset-box">
+            <div class="kv-label">可兑换</div>
+            <div class="asset-value tabular-nums">{{ item.available_amount_text }}</div>
+            <div class="asset-note">已释放但未兑换</div>
+          </div>
+          <div class="asset-box">
+            <div class="kv-label">已兑换</div>
+            <div class="asset-value tabular-nums">{{ item.converted_amount_text }}</div>
+            <div class="asset-note">已提交兑换数量</div>
+          </div>
+        </div>
+        <div class="progress-track" aria-label="释放进度">
+          <div class="progress-value" style="width: {{ item.release_progress_ratio }}%;"></div>
+        </div>
+        <div class="asset-note">释放进度：{{ item.release_progress }}%</div>
+        <div class="asset-note">已释放 = 总锁仓 - 待释放</div>
+        <div class="asset-note">可兑换 = 已释放但尚未兑换的数量</div>
+        <div class="asset-note">已兑换 = 用户已经兑换成交易币种的数量</div>
+      </div>
+
+      <div class="detail-card detail-card-full">
+        <div class="section-title">操作区</div>
+        <div class="action-row">
+          <a href="/admin/stock-token-locks" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+          {% if item.can_force_release %}
+            <form
+              method="post"
+              action="/admin/stock-token-locks/{{ item.id }}/force-release"
+              onsubmit="return confirm('将释放当前剩余待释放数量，请确认后操作。');"
+            >
+              <input type="hidden" name="next_path" value="/admin/stock-token-locks/{{ item.id }}" />
+              <button type="submit" class="btn admin-btn admin-btn-primary">强制释放</button>
+            </form>
+            <span class="muted">仅用于异常处理或人工补偿，正常情况下由系统自动释放。</span>
+          {% else %}
+            <span class="muted">当前批次无可强制释放的待释放数量。</span>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

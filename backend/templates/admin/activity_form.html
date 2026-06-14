@@ -1,0 +1,406 @@
+{% extends "admin/layout.html" %}
+
+{% set form_title = "编辑活动" if is_edit else "新增活动" %}
+
+{% block title %}{{ form_title }}{% endblock %}
+{% block page_title %}{{ form_title }}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">配置活动卡片、详情页媒体、奖励说明、活动规则和跳转链接。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/activities" class="btn secondary admin-btn admin-btn-secondary">返回列表</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .activity-form{display:block;margin-top:18px}
+    .activity-form-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px;align-items:start}
+    .activity-field{display:flex;min-width:0;flex-direction:column;gap:8px;margin:0}
+    .span-2{grid-column:span 2}.span-3{grid-column:span 3}.span-4{grid-column:span 4}.span-6{grid-column:span 6}.span-12{grid-column:1/-1}
+    .activity-form .field input,.activity-form .field select,.activity-form .field textarea{width:100%;min-width:0;border-radius:10px}
+    .activity-form .field input,.activity-form .field select{height:50px;padding:0 14px}
+    .activity-form .field textarea{min-height:86px;padding:12px 14px;resize:vertical}
+    .activity-form .field textarea.rules{min-height:220px}
+    .upload-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center}
+    .upload-control .btn{height:50px;min-height:50px;padding-top:0;padding-bottom:0;white-space:nowrap}
+    .upload-status{display:block;min-height:18px;margin-top:6px;font-size:12px}
+    .activity-form-actions{display:flex;gap:12px;align-items:center;margin-top:20px;flex-wrap:wrap}
+    .i18n-panel{grid-column:1/-1;display:grid;gap:14px;padding:14px;border:1px solid rgba(255,255,255,.10);border-radius:12px;background:rgba(255,255,255,.035)}
+    .i18n-title{color:#fff;font-size:14px;font-weight:800}
+    .i18n-summary{display:flex;flex-wrap:wrap;gap:8px}
+    .i18n-summary-item,.i18n-tab-status{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.055);color:var(--muted);font-size:12px;line-height:1;white-space:nowrap}
+    .i18n-summary-item strong{margin-left:4px;color:#fff;font-weight:800}
+    .i18n-fallback-note{margin:0;color:#facc15;font-size:12px;line-height:1.55}
+    .i18n-tabs{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+    .i18n-tab{display:inline-flex;align-items:center;gap:8px;min-height:38px;padding:7px 10px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:rgba(255,255,255,.045);color:var(--muted);font:inherit;font-size:13px;font-weight:800;cursor:pointer}
+    .i18n-tab.is-active{border-color:rgba(250,204,21,.55);background:rgba(250,204,21,.14);color:#fff}
+    .i18n-tab.is-active .i18n-tab-status{border-color:rgba(250,204,21,.28);color:#fde68a}
+    .i18n-toolbar{display:flex;justify-content:flex-end;gap:8px}
+    .i18n-copy-btn:disabled{opacity:.45;cursor:not-allowed}
+    .i18n-tab-panel{display:none}
+    .i18n-tab-panel.is-active{display:grid;gap:14px}
+    .i18n-language-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#fff;font-size:13px;font-weight:900}
+    .i18n-fields-grid{display:grid;grid-template-columns:1fr;gap:12px;align-items:start}
+    .i18n-fields-grid textarea{min-height:92px}
+    .i18n-fields-grid textarea.rules{min-height:220px}
+    @media (max-width: 800px){.activity-form-grid{grid-template-columns:1fr}.span-2,.span-3,.span-4,.span-6,.span-12{grid-column:1/-1}.upload-control{grid-template-columns:1fr}.i18n-fields-grid{grid-template-columns:1fr}}
+  </style>
+
+  {% if errors %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">表单校验失败</div>
+        {% for error in errors %}
+          <p class="muted">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card">
+      <div class="section-title">{{ form_title }}</div>
+      <form method="post" action="{{ form_action }}" class="activity-form" id="activity-form">
+        <div hidden>
+          <input type="hidden" name="title" value="{{ form.title or '' }}" />
+          <input type="hidden" name="subtitle" value="{{ form.subtitle or '' }}" />
+          <textarea name="description">{{ form.description or '' }}</textarea>
+          <textarea name="detail_content">{{ form.detail_content or '' }}</textarea>
+          <input type="hidden" name="reward_text" value="{{ form.reward_text or '' }}" />
+          <input type="hidden" name="cta_text" value="{{ form.cta_text or '' }}" />
+        </div>
+        <div class="activity-form-grid">
+          <div class="field activity-field span-2">
+            <label for="status">状态</label>
+            <select id="status" name="status">
+              <option value="active" {% if form.status == 'active' %}selected{% endif %}>进行中</option>
+              <option value="inactive" {% if form.status == 'inactive' %}selected{% endif %}>未启用</option>
+              <option value="ended" {% if form.status == 'ended' %}selected{% endif %}>已结束</option>
+            </select>
+          </div>
+          <div class="field activity-field span-2">
+            <label for="sort_order">排序</label>
+            <input id="sort_order" name="sort_order" type="number" value="{{ form.sort_order or 0 }}" />
+          </div>
+
+          <div class="field activity-field span-2">
+            <label for="reward_value">奖励数值</label>
+            <input id="reward_value" name="reward_value" type="number" step="0.00000001" value="{{ form.reward_value or '' }}" />
+          </div>
+          <div class="field activity-field span-3">
+            <label for="start_at">开始时间</label>
+            <input id="start_at" name="start_at" type="datetime-local" value="{{ form.start_at_input or '' }}" />
+          </div>
+          <div class="field activity-field span-3">
+            <label for="end_at">结束时间</label>
+            <input id="end_at" name="end_at" type="datetime-local" value="{{ form.end_at_input or '' }}" />
+          </div>
+
+          <div class="field activity-field span-6">
+            <label for="cover_url">卡片封面 URL</label>
+            <div class="upload-control">
+              <input id="cover_url" name="cover_url" type="text" value="{{ form.cover_url or '' }}" placeholder="/static/uploads/site/example.png" />
+              <input id="cover_url_upload" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden />
+              <button id="cover_url_upload_btn" type="button" class="btn secondary admin-btn admin-btn-secondary">上传图片</button>
+            </div>
+            <span id="cover_url_upload_status" class="muted upload-status"></span>
+          </div>
+          <div class="field activity-field span-3">
+            <label for="banner_type">详情媒体类型</label>
+            <select id="banner_type" name="banner_type">
+              <option value="image" {% if form.banner_type == 'image' %}selected{% endif %}>图片</option>
+              <option value="video" {% if form.banner_type == 'video' %}selected{% endif %}>视频</option>
+            </select>
+          </div>
+          <div class="field activity-field span-3">
+            <label for="video_url">视频 URL</label>
+            <input id="video_url" name="video_url" type="text" value="{{ form.video_url or '' }}" />
+          </div>
+          <div class="field activity-field span-6">
+            <label for="banner_url">详情顶部媒体 URL</label>
+            <div class="upload-control">
+              <input id="banner_url" name="banner_url" type="text" value="{{ form.banner_url or '' }}" placeholder="图片或视频地址" />
+              <input id="banner_url_upload" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden />
+              <button id="banner_url_upload_btn" type="button" class="btn secondary admin-btn admin-btn-secondary">上传图片</button>
+            </div>
+            <span id="banner_url_upload_status" class="muted upload-status"></span>
+          </div>
+          <div class="field activity-field span-3">
+            <label for="cta_url">按钮链接</label>
+            <input id="cta_url" name="cta_url" type="text" value="{{ form.cta_url or '' }}" placeholder="/trade/spot" />
+          </div>
+
+          <div class="i18n-panel">
+            <div class="i18n-title">多语言内容</div>
+            {% set i18n_languages = [('zh', '中文'), ('en', 'English'), ('zh_TW', '繁體'), ('ja', '日本語')] %}
+            {% set activity_i18n_fields = [
+              ('title', '活动标题', 'input'),
+              ('subtitle', '副标题', 'input'),
+              ('description', '活动简介', 'textarea'),
+              ('detail_content', '活动规则与参与条件', 'textarea'),
+              ('reward_text', '奖励说明', 'input'),
+              ('cta_text', '按钮文案', 'input')
+            ] %}
+            <div class="i18n-summary" aria-live="polite">
+              {% for suffix, label in i18n_languages %}
+                <span class="i18n-summary-item" data-i18n-summary="{{ suffix }}">{{ label }}：<strong>未填写</strong></span>
+              {% endfor %}
+            </div>
+            <p class="i18n-fallback-note">中文内容会作为默认 fallback 保存，其他语言未填写时前台将显示中文。</p>
+            <div class="i18n-tabs" role="tablist" aria-label="活动多语言内容编辑">
+              {% for suffix, label in i18n_languages %}
+                <button
+                  type="button"
+                  id="activity_i18n_tab_{{ suffix }}"
+                  class="i18n-tab{% if loop.first %} is-active{% endif %}"
+                  role="tab"
+                  aria-selected="{% if loop.first %}true{% else %}false{% endif %}"
+                  aria-controls="activity_i18n_panel_{{ suffix }}"
+                  data-i18n-tab="{{ suffix }}"
+                >
+                  <span>{{ label }}</span>
+                  <span class="i18n-tab-status" data-i18n-tab-status="{{ suffix }}">未填写</span>
+                </button>
+              {% endfor %}
+            </div>
+            <div class="i18n-toolbar">
+              <button type="button" class="btn secondary admin-btn admin-btn-secondary i18n-copy-btn" data-i18n-copy-current disabled>从中文复制到当前语言</button>
+            </div>
+            <div class="i18n-tab-panels">
+              {% for suffix, label in i18n_languages %}
+                <div
+                  id="activity_i18n_panel_{{ suffix }}"
+                  class="i18n-tab-panel{% if loop.first %} is-active{% endif %}"
+                  role="tabpanel"
+                  aria-labelledby="activity_i18n_tab_{{ suffix }}"
+                  data-i18n-panel="{{ suffix }}"
+                  {% if not loop.first %}hidden{% endif %}
+                >
+                  <div class="i18n-language-heading">
+                    <span>{{ label }}</span>
+                    <span class="i18n-tab-status" data-i18n-panel-status="{{ suffix }}">未填写</span>
+                  </div>
+                  <div class="i18n-fields-grid">
+                    {% for field_name, field_label, field_type in activity_i18n_fields %}
+                      {% set input_name = field_name ~ '_i18n_' ~ suffix %}
+                      {% set input_value = form[input_name] or '' %}
+                      {% if suffix == 'zh' and not input_value %}
+                        {% set input_value = form[field_name] or '' %}
+                      {% endif %}
+                      <div class="field activity-field" data-i18n-lang="{{ suffix }}" data-i18n-field="{{ field_name }}">
+                        <label for="{{ input_name }}">{{ field_label }}</label>
+                        {% if field_type == 'textarea' %}
+                          <textarea id="{{ input_name }}" name="{{ input_name }}" class="{% if field_name == 'detail_content' %}rules{% endif %}">{{ input_value }}</textarea>
+                        {% else %}
+                          <input id="{{ input_name }}" name="{{ input_name }}" type="text" value="{{ input_value }}" />
+                        {% endif %}
+                      </div>
+                    {% endfor %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+        <div class="activity-form-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">{% if is_edit %}保存修改{% else %}创建活动{% endif %}</button>
+          <a href="/admin/activities" class="btn secondary admin-btn admin-btn-secondary">取消</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <script>
+    (function(){
+      const tabs = Array.from(document.querySelectorAll("[data-i18n-tab]"));
+      const panels = Array.from(document.querySelectorAll("[data-i18n-panel]"));
+      const copyButton = document.querySelector("[data-i18n-copy-current]");
+      if (!tabs.length || !panels.length) return;
+
+      let activeLang = "zh";
+      const statusLabels = {
+        empty: "未填写",
+        partial: "部分填写",
+        complete: "已完成",
+      };
+
+      function getFieldControl(field) {
+        return field.querySelector("input, textarea");
+      }
+
+      function getLangFields(lang) {
+        return Array.from(document.querySelectorAll(`[data-i18n-lang="${lang}"]`));
+      }
+
+      function getFieldControlByName(lang, fieldName) {
+        const field = document.querySelector(`[data-i18n-lang="${lang}"][data-i18n-field="${fieldName}"]`);
+        return field ? getFieldControl(field) : null;
+      }
+
+      function getRichTextEditor(control) {
+        if (!control || !control.id || !window.tinymce || typeof window.tinymce.get !== "function") {
+          return null;
+        }
+        return window.tinymce.get(control.id);
+      }
+
+      function syncRichTextEditors() {
+        if (window.tinymce && typeof window.tinymce.triggerSave === "function") {
+          window.tinymce.triggerSave();
+        }
+      }
+
+      function getControlValue(control) {
+        const editor = getRichTextEditor(control);
+        if (editor && typeof editor.getContent === "function") {
+          return editor.getContent();
+        }
+        return control ? control.value : "";
+      }
+
+      function setControlValue(control, value) {
+        const nextValue = value || "";
+        const editor = getRichTextEditor(control);
+        if (editor && typeof editor.setContent === "function") {
+          editor.setContent(nextValue);
+          if (typeof editor.save === "function") {
+            editor.save();
+          }
+          return;
+        }
+        if (control) {
+          control.value = nextValue;
+        }
+      }
+
+      function syncChineseFallbackFields() {
+        syncRichTextEditors();
+        getLangFields("zh").forEach((field) => {
+          const fieldName = field.dataset.i18nField;
+          const source = getFieldControl(field);
+          const target = document.querySelector(`[name="${fieldName}"]`);
+          if (!fieldName || !source || !target) return;
+          target.value = getControlValue(source);
+        });
+      }
+
+      function getStatus(fields) {
+        const total = fields.length;
+        const filled = fields.filter((field) => {
+          const control = getFieldControl(field);
+          return control && String(getControlValue(control) || "").trim();
+        }).length;
+        if (!filled) return { key: "empty", text: statusLabels.empty, filled, total };
+        if (filled === total) return { key: "complete", text: statusLabels.complete, filled, total };
+        return { key: "partial", text: statusLabels.partial, filled, total };
+      }
+
+      function setStatusText(lang, status) {
+        document.querySelectorAll(`[data-i18n-tab-status="${lang}"], [data-i18n-panel-status="${lang}"]`).forEach((node) => {
+          node.textContent = status.text;
+        });
+      }
+
+      function updateStatuses() {
+        panels.forEach((panel) => {
+          const lang = panel.dataset.i18nPanel;
+          const status = getStatus(getLangFields(lang));
+          const summary = document.querySelector(`[data-i18n-summary="${lang}"] strong`);
+          setStatusText(lang, status);
+          if (summary) {
+            summary.textContent = `${status.text} ${status.filled}/${status.total}`;
+          }
+        });
+      }
+
+      function activateTab(lang) {
+        activeLang = lang;
+        tabs.forEach((tab) => {
+          const isActive = tab.dataset.i18nTab === lang;
+          tab.classList.toggle("is-active", isActive);
+          tab.setAttribute("aria-selected", isActive ? "true" : "false");
+        });
+        panels.forEach((panel) => {
+          const isActive = panel.dataset.i18nPanel === lang;
+          panel.classList.toggle("is-active", isActive);
+          panel.hidden = !isActive;
+        });
+        if (copyButton) {
+          copyButton.disabled = lang === "zh";
+        }
+      }
+
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => activateTab(tab.dataset.i18nTab || "zh"));
+      });
+
+      panels.forEach((panel) => {
+        panel.querySelectorAll("input, textarea").forEach((control) => {
+          control.addEventListener("input", updateStatuses);
+        });
+      });
+
+      if (copyButton) {
+        copyButton.addEventListener("click", () => {
+          if (activeLang === "zh") return;
+          getLangFields(activeLang).forEach((field) => {
+            const fieldName = field.dataset.i18nField;
+            const source = getFieldControlByName("zh", fieldName);
+            const target = getFieldControl(field);
+            if (!source || !target) return;
+            setControlValue(target, getControlValue(source));
+            target.dispatchEvent(new Event("input", { bubbles: true }));
+          });
+          updateStatuses();
+        });
+      }
+
+      const form = document.getElementById("activity-form");
+      if (form) {
+        form.addEventListener("submit", syncChineseFallbackFields);
+      }
+
+      activateTab("zh");
+      syncChineseFallbackFields();
+      updateStatuses();
+      window.refreshActivityI18nStatuses = updateStatuses;
+      window.syncActivityChineseFallbackFields = syncChineseFallbackFields;
+    })();
+
+    function bindImageUpload(inputId) {
+      const textInput = document.getElementById(inputId);
+      const fileInput = document.getElementById(`${inputId}_upload`);
+      const button = document.getElementById(`${inputId}_upload_btn`);
+      const status = document.getElementById(`${inputId}_upload_status`);
+      if (!textInput || !fileInput || !button || !status) return;
+
+      button.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) return;
+        const originalText = button.textContent;
+        button.disabled = true;
+        button.textContent = "上传中";
+        status.textContent = "";
+        try {
+          const formData = new FormData();
+          formData.append("file", file);
+          const response = await fetch("/admin/uploads/image", { method: "POST", body: formData, credentials: "same-origin" });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.detail || "上传失败");
+          textInput.value = data.url || "";
+          status.textContent = "上传成功";
+        } catch (error) {
+          status.textContent = error instanceof Error ? error.message : "上传失败";
+        } finally {
+          button.disabled = false;
+          button.textContent = originalText;
+          fileInput.value = "";
+        }
+      });
+    }
+    bindImageUpload("cover_url");
+    bindImageUpload("banner_url");
+  </script>
+{% endblock %}
