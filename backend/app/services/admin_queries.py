@@ -50,8 +50,9 @@ from app.services.collection_candidate_scanner import (
 from app.services.collection_balance_checker import confirm_collection_candidate_onchain
 from app.services.collection_service import (
     create_collection_batch,
-    create_collection_task,
+    create_collection_task_with_result,
     find_active_collection_task_duplicate,
+    find_collection_task_by_idempotency,
 )
 from app.services.collection_scan_cache import (
     get_scan_statuses,
@@ -4743,6 +4744,14 @@ def get_admin_users(db: Session, filters: Optional[Dict[str, Any]] = None) -> Di
                 COALESCE(up.kyc_status, u.kyc_status, 'NONE') AS kyc_status,
                 u.created_at,
                 u.last_login_at,
+                (
+                    SELECT ull.country_code
+                    FROM user_login_logs ull
+                    WHERE ull.user_id = u.id
+                      AND ull.login_status = 'SUCCESS'
+                    ORDER BY ull.created_at DESC, ull.id DESC
+                    LIMIT 1
+                ) AS last_login_country_code,
                 up.username,
                 up.nickname,
                 up.phone AS profile_phone,
@@ -4823,6 +4832,7 @@ def get_admin_users(db: Session, filters: Optional[Dict[str, Any]] = None) -> Di
                 "referral_source_badge": source_badge,
                 "created_at": _format_dt(row_dict.get("created_at")),
                 "last_login_at": _format_dt(row_dict.get("last_login_at")),
+                "last_login_country_code": row_dict.get("last_login_country_code") or "-",
             }
         )
 
@@ -10673,7 +10683,7 @@ def _admin_contract_symbol_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "leverage": leverage,
         "max_leverage": leverage,
         "leverage_text": _admin_leverage_display(leverage),
-        "spread_x": _admin_percent_display(row.get("spread_x")),
+        "spread_x": _admin_amount_display(row.get("spread_x")),
         "liquidation_threshold": _admin_percent_display(row.get("liquidation_threshold")),
         "warning_threshold": _admin_percent_display(row.get("warning_threshold")),
         "status": status,
@@ -10690,6 +10700,7 @@ def _admin_contract_symbol_form_row(row: Dict[str, Any]) -> Dict[str, Any]:
     item["price_precision"] = str(int(row.get("price_precision") or 0))
     item["quantity_precision"] = str(int(row.get("quantity_precision") or 0))
     item["max_leverage"] = str(int(row.get("max_leverage") or 0))
+    item["spread_x"] = _admin_amount_display(row.get("spread_x"))
     return item
 
 
@@ -10755,8 +10766,8 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
         errors.append("数量精度必须大于等于 0")
     if max_leverage < 1 or max_leverage > 200:
         errors.append("最大杠杆必须在 1 到 200 之间")
-    if spread_x < 0 or spread_x > 50:
-        errors.append("点差系数必须在 0 到 50 之间")
+    if spread_x < 0 or spread_x > 100:
+        errors.append("固定点差加点必须在 0 到 100 U 之间")
     if min_quantity < 0 or max_quantity < 0 or min_margin < 0:
         errors.append("交易规则数值不能小于 0")
     if liquidation_threshold < 0 or warning_threshold < 0:
@@ -15019,15 +15030,47 @@ def admin_query_stock_token_release_logs(db: Session, filters: Optional[Dict[str
 
 
 COLLECTION_OP_WAITING_STATUSES = ("PENDING", "QUEUED")
-COLLECTION_OP_PROCESSING_STATUSES = ("RUNNING", "PROCESSING", "SENDING", "READY", "GAS_REQUIRED", "GAS_QUEUED", "CONFIRMING")
-COLLECTION_OP_SENT_STATUSES = ("SENT", "GAS_SENT")
-COLLECTION_OP_SUCCESS_STATUSES = ("CONFIRMED", "SUCCESS", "COMPLETED")
-COLLECTION_OP_FAILED_STATUSES = ("FAILED", "ERROR")
+COLLECTION_OP_GAS_REQUIRED_STATUSES = (
+    "GAS_REQUIRED",
+    "WAITING_GAS",
+    "WAIT_GAS",
+    "GAS_QUEUED",
+    "GAS_CONFIRMING",
+    "WAITING_GAS_CONFIRM",
+    "PENDING_GAS",
+)
+COLLECTION_OP_WAITING_COLLECTION_STATUSES = ("READY_TO_COLLECT", "WAITING_COLLECTION", "WAIT_COLLECTION")
+COLLECTION_OP_COLLECTING_STATUSES = ("RUNNING", "PROCESSING", "SENDING", "QUEUED", "SENT", "CONFIRMING", "COLLECTION_SENT", "COLLECTION_CONFIRMING")
+COLLECTION_OP_PROCESSING_STATUSES = ("RUNNING", "PROCESSING", "SENDING", "READY", "CONFIRMING")
+COLLECTION_OP_SENT_STATUSES = ("SENT", "GAS_SENT", "CONFIRMING", "COLLECTION_SENT", "COLLECTION_CONFIRMING")
+COLLECTION_OP_SUCCESS_STATUSES = ("CONFIRMED", "SUCCESS", "COMPLETED", "PAID")
+COLLECTION_OP_FAILED_STATUSES = ("FAILED", "ERROR", "GAS_FAILED")
 COLLECTION_OP_TIMEOUT_STATUSES = ("TIMEOUT",)
 COLLECTION_OP_CANCELED_STATUSES = ("CANCELED", "CANCELLED")
 COLLECTION_TASK_MANUAL_RETRY_STATUSES = ("FAILED", "SKIPPED", "TIMEOUT", "PENDING")
+COLLECTION_TASK_WORKBENCH_STATUSES = (
+    "PENDING",
+    "QUEUED",
+    "PROCESSING",
+    "RUNNING",
+    "SENDING",
+    "READY",
+    "GAS_REQUIRED",
+    "WAITING_GAS",
+    "WAIT_GAS",
+    "GAS_QUEUED",
+    "GAS_FAILED",
+    "FAILED",
+    "ERROR",
+    "SENT",
+    "GAS_SENT",
+    "CONFIRMING",
+    "PARTIAL",
+)
 COLLECTION_OP_ACTIVE_STATUSES = (
     *COLLECTION_OP_WAITING_STATUSES,
+    *COLLECTION_OP_GAS_REQUIRED_STATUSES,
+    *COLLECTION_OP_WAITING_COLLECTION_STATUSES,
     *COLLECTION_OP_PROCESSING_STATUSES,
     *COLLECTION_OP_SENT_STATUSES,
 )
@@ -15080,10 +15123,96 @@ def _collection_finished_at_display(row: Dict[str, Any]) -> str:
     return _admin_datetime_display(row.get("finished_at") or row.get("updated_at") or row.get("confirmed_at") or row.get("sent_at"))
 
 
+def format_collection_error_for_admin(error_code: Any) -> Dict[str, str]:
+    raw = str(error_code or "").strip()
+    if not raw:
+        return {"full": "", "label": "-", "short": "-"}
+    upper = raw.upper()
+    lower = raw.lower()
+    mappings = (
+        (("GUARD_REJECTED:ASSET_CHAIN_NOT_ALLOWED", "ASSET_CHAIN_NOT_ALLOWED"), "未开启真实归集发送"),
+        (
+            (
+                "GUARD_REJECTED:REAL_SEND_MASTER_SWITCH_DISABLED",
+                "REAL_SEND_MASTER_SWITCH_DISABLED",
+                "GUARD_REJECTED:MASTER_SWITCH_OFF",
+                "MASTER_SWITCH_OFF",
+            ),
+            "真实发送总开关未开启",
+        ),
+        (("GUARD_REJECTED:CHAIN_NOT_ALLOWED", "CHAIN_NOT_ALLOWED"), "当前网络未开放真实归集"),
+        (
+            (
+                "GUARD_REJECTED:DESTINATION_NOT_ALLOWED",
+                "DESTINATION_NOT_ALLOWED",
+                "TARGET_ADDRESS_NOT_ALLOWED",
+            ),
+            "归集目标地址未授权",
+        ),
+        (
+            (
+                "GUARD_REJECTED:AMOUNT_LIMIT_EXCEEDED",
+                "AMOUNT_LIMIT_EXCEEDED",
+                "COLLECT_SINGLE_LIMIT_EXCEEDED",
+            ),
+            "超出单笔归集限额",
+        ),
+        (
+            (
+                "GUARD_REJECTED:DAILY_LIMIT_EXCEEDED",
+                "DAILY_LIMIT_EXCEEDED",
+                "COLLECT_DAILY_LIMIT_EXCEEDED",
+            ),
+            "超出每日归集限额",
+        ),
+        (
+            (
+                "GUARD_REJECTED:HOT_WALLET_NOT_READY",
+                "HOT_WALLET_NOT_READY",
+                "HOT_WALLET_ADDRESS_NOT_CONFIGURED",
+            ),
+            "热钱包未配置或不可用",
+        ),
+        (
+            (
+                "GUARD_REJECTED:PRIVATE_KEY_NOT_READY",
+                "PRIVATE_KEY_NOT_READY",
+                "HOT_WALLET_PRIVATE_KEY_NOT_CONFIGURED",
+            ),
+            "热钱包私钥未配置",
+        ),
+        (("INSUFFICIENT FUNDS FOR GAS", "INSUFFICIENT_GAS"), "Gas钱包余额不足"),
+        (("INSUFFICIENT_TOKEN_BALANCE",), "代币余额不足"),
+        (("RPC_TIMEOUT", "RPC TIMEOUT"), "链上节点连接超时"),
+        (("NONCE TOO LOW",), "交易序号异常"),
+        (("REPLACEMENT TRANSACTION UNDERPRICED",), "Gas价格过低"),
+        (("TX_CONFIRM_TIMEOUT",), "链上确认超时"),
+    )
+    for markers, label in mappings:
+        if any(marker in upper for marker in markers):
+            return {"full": raw, "label": label, "short": _admin_short_text(label, 24, 8)}
+    if "insufficient funds for gas" in lower:
+        label = "Gas钱包余额不足"
+        return {"full": raw, "label": label, "short": _admin_short_text(label, 24, 8)}
+    if "rpc timeout" in lower:
+        label = "链上节点连接超时"
+        return {"full": raw, "label": label, "short": _admin_short_text(label, 24, 8)}
+    if "nonce too low" in lower:
+        label = "交易序号异常"
+        return {"full": raw, "label": label, "short": _admin_short_text(label, 24, 8)}
+    if "replacement transaction underpriced" in lower:
+        label = "Gas价格过低"
+        return {"full": raw, "label": label, "short": _admin_short_text(label, 24, 8)}
+    return {"full": raw, "label": raw, "short": _admin_short_text(raw, 24, 8)}
+
+
 def _collection_failure_reason(value: Any) -> Dict[str, str]:
     raw = str(value or "").strip()
     if not raw:
         return {"full": "", "label": "-", "short": "-"}
+    formatted = format_collection_error_for_admin(raw)
+    if formatted["label"] != raw:
+        return formatted
     upper = raw.upper()
     if "MASTER_SWITCH_OFF" in upper:
         label = "真实发送总闸未开启，请开启基础设施安全开关后再发送。"
@@ -15130,12 +15259,24 @@ def _is_collection_dry_run_hash(value: Any) -> bool:
     return bool(tx_hash.startswith("DRYGAS_") or tx_hash.startswith("DRYRUN_"))
 
 
+def _is_real_collection_tx_hash_value(value: Any) -> bool:
+    tx_hash = str(value or "").strip()
+    return bool(tx_hash.lower().startswith("0x") and not _is_collection_dry_run_hash(tx_hash))
+
+
 def _is_guard_rejected_error(value: Any) -> bool:
     return "GUARD_REJECTED" in str(value or "").upper()
 
 
 def _collection_is_dry_run_tx_sql(column_name: str) -> str:
     return f"(UPPER(COALESCE({column_name}, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE({column_name}, '')) LIKE 'DRYGAS_%')"
+
+
+def _collection_is_real_tx_sql(column_name: str) -> str:
+    return (
+        f"({column_name} IS NOT NULL AND LOWER(COALESCE({column_name}, '')) LIKE '0x%' "
+        f"AND NOT {_collection_is_dry_run_tx_sql(column_name)})"
+    )
 
 
 def _collection_amount_summary_from_raw(
@@ -15201,26 +15342,35 @@ def _collection_amount_summary_from_raw(
 
 def _collection_task_gas_status(row: Dict[str, Any]) -> Dict[str, str]:
     task_status = str(row.get("status") or "").strip().upper()
+    task_id = row.get("id")
     gas_task_id = row.get("gas_task_id")
+    gas_task_owner_id = row.get("gas_collection_task_id")
     gas_task_status = str(row.get("gas_task_status") or "").strip().upper()
     gas_tx_hash = str(row.get("gas_tx_hash") or "").strip()
+    gas_last_error = str(row.get("gas_last_error") or "").strip()
     gas_confirmed_at = row.get("gas_confirmed_at")
-    gas_has_real_tx = bool(gas_tx_hash and not _is_collection_dry_run_hash(gas_tx_hash))
+    gas_has_real_tx = bool(gas_tx_hash.lower().startswith("0x") and not _is_collection_dry_run_hash(gas_tx_hash))
     gas_is_dry_run = _is_collection_dry_run_hash(gas_tx_hash)
     gas_coin_symbol = str(row.get("gas_topup_coin_symbol") or "").strip().upper()
     gas_topup_raw = row.get("gas_topup_amount")
+    gas_link_invalid = False
+    if gas_task_id and gas_task_owner_id is not None:
+        try:
+            gas_link_invalid = int(gas_task_owner_id) != int(task_id or 0)
+        except (TypeError, ValueError):
+            gas_link_invalid = True
     has_topup_amount = gas_topup_raw is not None and str(gas_topup_raw).strip() != ""
     if has_topup_amount:
         gas_topup_amount = _fmt_admin_amount_display(gas_topup_raw, gas_coin_symbol)
         gas_topup_label = f"{gas_topup_amount} {gas_coin_symbol}".strip()
     else:
         gas_topup_amount = ""
-        gas_topup_label = "待补Gas" if gas_task_id else "-"
+        gas_topup_label = "等待补Gas" if gas_task_id else "-"
 
     if not gas_task_id:
         if task_status in {"GAS_REQUIRED", "GAS_QUEUED", "WAIT_GAS", "WAITING_GAS"}:
-            gas_topup_label = "待补Gas"
-            gas_status_label = "待补Gas"
+            gas_topup_label = "等待补Gas"
+            gas_status_label = "等待补Gas"
             gas_status_badge = "warning"
         else:
             gas_topup_label = "-"
@@ -15233,32 +15383,66 @@ def _collection_task_gas_status(row: Dict[str, Any]) -> Dict[str, str]:
             "gas_topup_label": gas_topup_label,
             "gas_status_label": gas_status_label,
             "gas_status_badge": gas_status_badge,
+            "gas_status_detail": "",
+            "gas_link_invalid": False,
             "gas_tx_hash": "",
             "gas_tx_hash_short": "",
             "gas_tx_hash_display": "未生成",
             "gas_has_tx_hash": False,
             "gas_can_confirm_requeue": False,
         }
-    if gas_task_status in {"FAILED", "ERROR"}:
-        label, badge = "Gas失败", "danger"
-    elif gas_is_dry_run:
-        label, badge = "待补Gas", "warning"
-    elif gas_task_status == "SENDING":
-        label, badge = "Gas发送中", "info"
-    elif gas_task_status in {"SENT", "GAS_SENT"} and gas_has_real_tx:
-        label, badge = "Gas确认中", "info"
-    elif gas_task_status in {"SUCCESS", "COMPLETED", "CONFIRMED"} and gas_has_real_tx:
-        label, badge = "已补Gas", "success"
-    elif gas_task_status in {"SUCCESS", "COMPLETED", "CONFIRMED"}:
-        label, badge = "待补Gas", "warning"
-    elif gas_task_status in {"PENDING", "QUEUED"}:
-        label, badge = "待补Gas", "warning"
-    elif gas_task_status in {"RUNNING", "PROCESSING"}:
-        label, badge = "Gas处理中", "info"
-    elif gas_task_status in {"SKIPPED", "CANCELED", "CANCELLED"}:
-        label, badge = "待补Gas", "warning"
+    if gas_link_invalid:
+        gas_tx_hash_short = _short_admin_hash(gas_tx_hash) if gas_tx_hash else ""
+        return {
+            "gas_task_status": gas_task_status,
+            "gas_topup_amount": gas_topup_amount,
+            "gas_topup_coin_symbol": gas_coin_symbol,
+            "gas_topup_label": gas_topup_label,
+            "gas_tx_hash": gas_tx_hash,
+            "gas_tx_hash_short": gas_tx_hash_short,
+            "gas_tx_hash_display": gas_tx_hash_short if gas_tx_hash else "未生成",
+            "gas_has_tx_hash": bool(gas_tx_hash),
+            "gas_is_dry_run": gas_is_dry_run,
+            "gas_has_real_tx": gas_has_real_tx,
+            "gas_confirmed_at": _admin_datetime_display(gas_confirmed_at),
+            "gas_can_confirm_requeue": False,
+            "gas_status_label": "Gas任务关联异常，可重新生成Gas任务",
+            "gas_status_badge": "danger",
+            "gas_status_detail": f"gas_task {gas_task_id} 归属 collection_task {gas_task_owner_id}",
+            "gas_link_invalid": True,
+        }
+    gas_guard_error = gas_last_error.upper()
+    gas_status_detail = gas_last_error
+    if gas_has_real_tx and "GUARD_REJECTED" in gas_guard_error:
+        gas_status_detail = ""
+    if not gas_has_real_tx and "GUARD_REJECTED:CHAIN_NOT_ALLOWED" in gas_guard_error:
+        label, badge = "当前网络未开放补Gas", "danger"
+    elif not gas_has_real_tx and ("GUARD_REJECTED:MASTER_SWITCH_OFF" in gas_guard_error or "REAL_SEND_MASTER_SWITCH_DISABLED" in gas_guard_error):
+        label, badge = "补Gas未开启", "danger"
+    elif task_status in {"GAS_REQUIRED", "GAS_QUEUED", "WAIT_GAS", "WAITING_GAS"} and not gas_has_real_tx:
+        label, badge = "等待补Gas", "warning"
     else:
-        label, badge = "待补Gas", "warning"
+        label = None
+    if label is None and gas_task_status in {"FAILED", "ERROR"}:
+        label, badge = "补Gas失败", "danger"
+    elif label is None and gas_is_dry_run:
+        label, badge = "等待补Gas", "warning"
+    elif label is None and gas_task_status == "SENDING":
+        label, badge = "Gas发送中", "info"
+    elif label is None and gas_task_status in {"SENT", "GAS_SENT", "CONFIRMING"} and gas_has_real_tx:
+        label, badge = "Gas确认中", "info"
+    elif label is None and gas_task_status in {"SUCCESS", "COMPLETED", "CONFIRMED"} and gas_has_real_tx:
+        label, badge = "已补Gas", "success"
+    elif label is None and gas_task_status in {"SUCCESS", "COMPLETED", "CONFIRMED"}:
+        label, badge = "等待补Gas", "warning"
+    elif label is None and gas_task_status in {"PENDING", "QUEUED"}:
+        label, badge = "等待补Gas", "warning"
+    elif label is None and gas_task_status in {"RUNNING", "PROCESSING"}:
+        label, badge = "Gas处理中", "info"
+    elif label is None and gas_task_status in {"SKIPPED", "CANCELED", "CANCELLED"}:
+        label, badge = "等待补Gas", "warning"
+    elif label is None:
+        label, badge = "等待补Gas", "warning"
     gas_tx_hash_short = _short_admin_hash(gas_tx_hash) if gas_tx_hash else ""
     return {
         "gas_task_status": gas_task_status,
@@ -15273,12 +15457,14 @@ def _collection_task_gas_status(row: Dict[str, Any]) -> Dict[str, str]:
         "gas_has_real_tx": gas_has_real_tx,
         "gas_confirmed_at": _admin_datetime_display(gas_confirmed_at),
         "gas_can_confirm_requeue": bool(
-            gas_task_status in {"SENT", "GAS_SENT"}
+            gas_task_status in {"SENT", "GAS_SENT", "CONFIRMING"}
             and gas_has_real_tx
             and not gas_confirmed_at
         ),
         "gas_status_label": label,
         "gas_status_badge": badge,
+        "gas_status_detail": gas_status_detail,
+        "gas_link_invalid": gas_link_invalid,
     }
 
 
@@ -15291,6 +15477,9 @@ def _admin_collection_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
                 "failed_count": row.get("aggregate_failed_tasks") if row.get("aggregate_failed_tasks") is not None else row.get("failed_tasks"),
                 "processing_count": row.get("processing_count"),
                 "waiting_count": row.get("waiting_count"),
+                "waiting_gas_count": row.get("waiting_gas_count"),
+                "waiting_collection_count": row.get("waiting_collection_count"),
+                "collecting_count": row.get("collecting_count"),
                 "sent_count": row.get("sent_count"),
                 "dry_run_count": row.get("dry_run_count"),
                 "batch_status": row.get("status"),
@@ -15313,6 +15502,9 @@ def _admin_collection_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
         fallback_amount=row.get("success_amount"),
         fallback_symbol=coin_symbol,
     )
+    gas_summary = _collection_batch_gas_summary(row)
+    error_message = str(row.get("error_message") or row.get("recent_error") or "").strip()
+    error_meta = _collection_failure_reason(error_message)
     return {
         "id": row.get("id"),
         "batch_no": row.get("batch_no") or "",
@@ -15334,6 +15526,15 @@ def _admin_collection_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "success_tasks": int((row.get("real_success_tasks") if row.get("real_success_tasks") is not None else row.get("success_tasks")) or 0),
         "failed_tasks": int((row.get("aggregate_failed_tasks") if row.get("aggregate_failed_tasks") is not None else row.get("failed_tasks")) or 0),
         "skipped_tasks": int(row.get("skipped_tasks") or 0),
+        "success_count": int((row.get("real_success_tasks") if row.get("real_success_tasks") is not None else row.get("success_tasks")) or 0),
+        "sent_count": int(row.get("sent_count") or 0),
+        "failed_count": int((row.get("aggregate_failed_tasks") if row.get("aggregate_failed_tasks") is not None else row.get("failed_tasks")) or 0),
+        "waiting_gas_count": int(row.get("waiting_gas_count") or 0),
+        "waiting_collection_count": int(row.get("waiting_collection_count") or 0),
+        "collecting_count": int(row.get("collecting_count") or row.get("processing_count") or 0),
+        "processing_count": int(row.get("processing_count") or 0),
+        "waiting_count": int(row.get("waiting_count") or 0),
+        **gas_summary,
         "total_amount": total_amount,
         "total_amount_label": total_summary["label"],
         "total_amount_detail_label": total_summary["detail_label"],
@@ -15344,7 +15545,10 @@ def _admin_collection_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "success_amount_detail_label": success_summary["detail_label"],
         "success_amount_detail_items": success_summary["items"],
         "success_amount_coin_count": success_summary["coin_count"],
-        "error_message": row.get("error_message") or "",
+        "error_message": error_message,
+        "error_message_label": error_meta["label"] if error_message else "",
+        "error_message_short": error_meta["short"] if error_message else "",
+        "error_message_full": error_meta["full"] if error_message else "",
         "created_by": row.get("created_by") or "",
         "started_at": _admin_datetime_display(row.get("started_at")),
         "finished_at": _admin_datetime_display(row.get("finished_at")),
@@ -15373,8 +15577,9 @@ def _admin_collection_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
         tx_hash_value,
     ):
         can_retry = True
-    failure = _collection_failure_reason(failure_value)
     tx_meta = _collection_tx_hash_meta(tx_hash_value)
+    failure = _collection_failure_reason(failure_value)
+    history_failure = failure
     gas_meta = _collection_task_gas_status(row)
     gas_task_status = str(gas_meta.get("gas_task_status") or "").upper()
     collection_can_confirm_requeue = bool(
@@ -15384,6 +15589,9 @@ def _admin_collection_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
         and not row.get("confirmed_at")
     )
     has_real_tx_hash = bool(tx_hash_value.lower().startswith("0x") and not tx_meta.get("is_dry_run_tx_hash"))
+    has_success_real_tx = bool(status_value in COLLECTION_OP_SUCCESS_STATUSES and has_real_tx_hash)
+    if has_success_real_tx:
+        failure = {"full": "", "label": "-", "short": "-"}
     can_send = bool(
         not has_real_tx_hash
         and (
@@ -15394,12 +15602,26 @@ def _admin_collection_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
     if status_value in {"SENT", "GAS_SENT", "CONFIRMING"}:
         status_label, status_badge = "归集已发送 / 确认中", "info"
     if status_value in {"GAS_REQUIRED", "GAS_QUEUED"}:
-        if gas_task_status in {"SENT", "GAS_SENT"}:
+        if gas_task_status in {"SENT", "GAS_SENT", "CONFIRMING"}:
             status_label, status_badge = "等待Gas确认", "info"
         elif gas_task_status in {"CONFIRMED", "SUCCESS", "COMPLETED"} and gas_meta.get("gas_has_real_tx"):
-            status_label, status_badge = "Gas已确认，等待续跑", "success"
+            status_label, status_badge = "等待归集续跑", "warning"
         else:
             status_label, status_badge = "等待Gas", "warning"
+    if (
+        status_value in {"PENDING", "READY"}
+        and gas_task_status in {"CONFIRMED", "SUCCESS", "COMPLETED"}
+        and gas_meta.get("gas_has_real_tx")
+        and not has_real_tx_hash
+    ):
+        status_label, status_badge = "等待归集续跑", "warning"
+    if (
+        status_value == "QUEUED"
+        and gas_task_status in {"CONFIRMED", "SUCCESS", "COMPLETED"}
+        and gas_meta.get("gas_has_real_tx")
+        and not has_real_tx_hash
+    ):
+        status_label, status_badge = "归集中 / 已入队", "info"
     if tx_meta.get("is_dry_run_tx_hash") and status_value in {"SENT", "CONFIRMED", "SUCCESS", "COMPLETED"}:
         status_label, status_badge = "待真实发送", "warning"
     if status_value in {"PENDING", "QUEUED"} and _is_guard_rejected_error(failure.get("full")):
@@ -15413,6 +15635,7 @@ def _admin_collection_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
         status_display_badge = "neutral"
     gas_can_real_send = bool(
         row.get("gas_task_id")
+        and not gas_meta.get("gas_link_invalid")
         and (
             gas_task_status in {"PENDING", "QUEUED", "FAILED"}
             or bool(gas_meta.get("gas_is_dry_run"))
@@ -15454,6 +15677,9 @@ def _admin_collection_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "last_error_label": failure["label"],
         "last_error_short": failure["short"],
         "last_error_full": failure["full"],
+        "last_error_history_label": history_failure["label"],
+        "last_error_history_short": history_failure["short"],
+        "last_error_history_full": history_failure["full"],
         "locked_at": _admin_datetime_display(row.get("locked_at")),
         "sent_at": _admin_datetime_display(row.get("sent_at")),
         "confirmed_at": _admin_datetime_display(row.get("confirmed_at")),
@@ -15511,6 +15737,7 @@ COLLECTION_GAS_STATUS_LABELS = {
     "SENDING": ("处理中", "info"),
     "SENT": ("已发送", "info"),
     "GAS_SENT": ("已发送", "info"),
+    "CONFIRMING": ("已发送 / 确认中", "info"),
     "CONFIRMED": ("已完成", "success"),
     "SUCCESS": ("已完成", "success"),
     "COMPLETED": ("已完成", "success"),
@@ -15538,7 +15765,7 @@ def _admin_gas_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
     tx_meta = _collection_tx_hash_meta(row.get("tx_hash"))
     status_value = str(row.get("status") or "").strip().upper()
     if status_value in {"CONFIRMED", "SUCCESS", "COMPLETED"} and tx_meta.get("is_dry_run_tx_hash"):
-        status_label, status_badge = "需真实补 Gas", "warning"
+        status_label, status_badge = "等待补Gas", "warning"
     elif status_value == "SENDING":
         status_label, status_badge = "发送中", "info"
     elif status_value in {"SENT", "GAS_SENT"} and tx_meta.get("has_tx_hash") and not tx_meta.get("is_dry_run_tx_hash"):
@@ -15599,15 +15826,49 @@ def _collection_task_batch_status(row: Dict[str, Any]) -> tuple[str, str, str]:
     failed = int(row.get("failed_count") or 0)
     processing = int(row.get("processing_count") or 0)
     waiting = int(row.get("waiting_count") or 0)
+    waiting_gas = int(row.get("waiting_gas_count") or 0)
+    waiting_collection = int(row.get("waiting_collection_count") or 0)
+    collecting = int(row.get("collecting_count") or 0)
     sent = int(row.get("sent_count") or 0)
     dry_run = int(row.get("dry_run_count") or 0)
-    if dry_run > 0 or sent > 0 or processing > 0 or waiting > 0:
+    if dry_run > 0 or sent > 0 or processing > 0 or waiting > 0 or waiting_gas > 0 or waiting_collection > 0 or collecting > 0:
         return "PROCESSING", "处理中", "info"
     if total > 0 and success >= total:
         return "SUCCESS", "已完成", "success"
     if failed > 0:
         return "FAILED", "有失败", "danger"
     return str(row.get("batch_status") or "PENDING"), "等待中", "neutral"
+
+
+def _collection_batch_gas_summary(row: Dict[str, Any]) -> Dict[str, Any]:
+    gas_linked_count = int(row.get("gas_linked_count") or row.get("gas_required_count") or 0)
+    gas_sent_count = int(row.get("gas_sent_count") or 0)
+    gas_confirmed_count = int(row.get("gas_confirmed_count") or 0)
+    gas_failed_count = int(row.get("gas_failed_count") or 0)
+    gas_coin_symbol = row.get("gas_coin_symbol") or ""
+    gas_topup_amount = _fmt_admin_amount_display(row.get("gas_topup_amount"), gas_coin_symbol)
+    gas_topup_label = f"{gas_topup_amount} {gas_coin_symbol}".strip() if gas_linked_count > 0 else "-"
+    if gas_linked_count <= 0:
+        gas_summary, gas_badge = "无需Gas", "neutral"
+    elif gas_confirmed_count >= gas_linked_count:
+        gas_summary, gas_badge = "已补Gas", "success"
+    elif gas_sent_count > 0:
+        gas_summary, gas_badge = "Gas确认中", "info"
+    elif gas_failed_count > 0:
+        gas_summary, gas_badge = "补Gas失败", "danger"
+    else:
+        gas_summary, gas_badge = "等待补Gas", "warning"
+    return {
+        "gas_linked_count": gas_linked_count,
+        "gas_sent_count": gas_sent_count,
+        "gas_confirmed_count": gas_confirmed_count,
+        "gas_failed_count": gas_failed_count,
+        "gas_coin_symbol": gas_coin_symbol,
+        "gas_topup_amount": gas_topup_amount,
+        "gas_topup_label": gas_topup_label,
+        "gas_summary": gas_summary,
+        "gas_badge": gas_badge,
+    }
 
 
 def _admin_collection_task_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -15633,14 +15894,27 @@ def _admin_collection_task_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
     elif gas_sent_count > 0:
         gas_summary, gas_badge = "Gas确认中", "info"
     elif gas_failed_count > 0:
-        gas_summary, gas_badge = "Gas失败", "danger"
+        gas_summary, gas_badge = "补Gas失败", "danger"
     else:
-        gas_summary, gas_badge = "待补Gas", "warning"
+        gas_summary, gas_badge = "等待补Gas", "warning"
     requeue_collection_count = int(row.get("requeue_collection_count") or 0)
     requeue_gas_count = int(row.get("requeue_gas_count") or 0)
     can_send_count = int(row.get("can_send_count") or 0)
     batch_id = row.get("batch_id")
     fallback_task_id = row.get("fallback_task_id")
+    recent_error = str(row.get("recent_error") or "").strip()
+    recent_failure = _collection_failure_reason(recent_error)
+    recent_error_label = recent_failure["label"] if recent_error else ""
+    if (
+        recent_error
+        and "ASSET_CHAIN_NOT_ALLOWED" in recent_error.upper()
+        and gas_confirmed_count >= gas_linked_count > 0
+        and int(row.get("waiting_collection_count") or 0) > 0
+    ):
+        recent_error_label = "已补Gas，等待开启真实归集权限"
+    is_completed = status in {"SUCCESS", "COMPLETED", "CONFIRMED", "PAID"}
+    if is_completed:
+        recent_error_label = ""
     return {
         "group_id": row.get("group_id"),
         "batch_id": batch_id,
@@ -15661,6 +15935,9 @@ def _admin_collection_task_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "sent_count": int(row.get("sent_count") or 0),
         "failed_count": int(row.get("failed_count") or 0),
         "waiting_count": int(row.get("waiting_count") or 0),
+        "waiting_gas_count": int(row.get("waiting_gas_count") or 0),
+        "waiting_collection_count": int(row.get("waiting_collection_count") or 0),
+        "collecting_count": int(row.get("collecting_count") or row.get("processing_count") or 0),
         "processing_count": int(row.get("processing_count") or 0),
         "dry_run_count": int(row.get("dry_run_count") or 0),
         "gas_linked_count": gas_linked_count,
@@ -15676,11 +15953,16 @@ def _admin_collection_task_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "requeue_gas_count": requeue_gas_count,
         "can_send_count": can_send_count,
         "can_send_batch": bool(batch_id and can_send_count > 0),
-        "can_requeue": bool(batch_id and (requeue_collection_count > 0 or requeue_gas_count > 0)),
+        "can_requeue": bool(batch_id and not is_completed and (requeue_collection_count > 0 or requeue_gas_count > 0)),
         "requeue_url": f"/admin/collections/tasks/{batch_id}/requeue" if batch_id else "",
         "status": status,
         "status_label": status_label,
         "status_badge": status_badge,
+        "is_completed": is_completed,
+        "recent_error": recent_error,
+        "recent_error_label": recent_error_label,
+        "recent_error_short": _admin_short_text(recent_error_label, 80) if recent_error_label else "",
+        "recent_error_full": recent_failure["full"] if recent_error else "",
         "created_at": _admin_datetime_display(row.get("created_at")),
         "finished_at": _admin_datetime_display(row.get("finished_at")),
         "detail_url": f"/admin/collections/tasks?batch_id={batch_id}" if batch_id else f"/admin/collections/tasks?task_no={row.get('task_no') or ''}",
@@ -16306,6 +16588,94 @@ def _collection_batches_symbol_stats(db: Session, filters: Dict[str, Any]) -> li
     return [_collection_stats_amount_item(dict(row)) for row in rows]
 
 
+def _collection_batch_filter_options(db: Session) -> Dict[str, Any]:
+    chain_options: Dict[str, Dict[str, str]] = {}
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT LOWER(TRIM(chain_key)) AS value,
+                       COALESCE(NULLIF(name, ''), chain_key) AS label
+                FROM chains
+                WHERE chain_key IS NOT NULL AND TRIM(chain_key) <> ''
+                ORDER BY chain_key ASC
+                """
+            )
+        ).mappings().all()
+        for row in rows:
+            value = str(row.get("value") or "").strip()
+            if value:
+                label = str(row.get("label") or value).strip()
+                chain_options[value] = {"value": value, "label": f"{label} ({value})" if label != value else value}
+    except Exception:
+        logger.exception("collection batch configured chain filter options query failed")
+
+    for table_name in ("collection_batches", "collection_tasks"):
+        try:
+            rows = db.execute(
+                text(
+                    f"""
+                    SELECT DISTINCT LOWER(TRIM(chain_key)) AS value
+                    FROM {table_name}
+                    WHERE chain_key IS NOT NULL AND TRIM(chain_key) <> ''
+                    ORDER BY value ASC
+                    """
+                )
+            ).mappings().all()
+            for row in rows:
+                value = str(row.get("value") or "").strip()
+                if value and value not in chain_options:
+                    chain_options[value] = {"value": value, "label": value}
+        except Exception:
+            logger.exception("collection batch %s chain filter options query failed", table_name)
+
+    coin_options: Dict[str, Dict[str, str]] = {}
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT DISTINCT UPPER(TRIM(coin_symbol)) AS value
+                FROM collection_batches
+                WHERE coin_symbol IS NOT NULL AND TRIM(coin_symbol) <> ''
+                ORDER BY value ASC
+                """
+            )
+        ).mappings().all()
+        for row in rows:
+            value = str(row.get("value") or "").strip()
+            if value:
+                coin_options[value] = {"value": value, "label": value}
+    except Exception:
+        logger.exception("collection batch coin filter options query failed")
+
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT DISTINCT UPPER(TRIM(coin_symbol)) AS value
+                FROM collection_tasks
+                WHERE coin_symbol IS NOT NULL AND TRIM(coin_symbol) <> ''
+                ORDER BY value ASC
+                """
+            )
+        ).mappings().all()
+        for row in rows:
+            value = str(row.get("value") or "").strip()
+            if value and value not in coin_options:
+                coin_options[value] = {"value": value, "label": value}
+    except Exception:
+        logger.exception("collection task coin filter options query failed")
+
+    networks = sorted(chain_options.values(), key=lambda item: item.get("value") or "")
+    coins = sorted(coin_options.values(), key=lambda item: item.get("value") or "")
+
+    return {
+        "networks": networks,
+        "chains": networks,
+        "coins": coins,
+    }
+
+
 def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     filters = filters or {}
     batch_no = str(filters.get("batch_no") or "").strip()
@@ -16357,9 +16727,18 @@ def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = Non
             where_parts.append("UPPER(status) IN :status_values")
             status_values = ("RUNNING", "PROCESSING")
             status = "PROCESSING"
+        elif status in {"CANCELED", "CANCELLED", "EMPTY"}:
+            where_parts.append("UPPER(status) IN :status_values")
+            status_values = COLLECTION_OP_CANCELED_STATUSES
+            status = "CANCELED"
         else:
             where_parts.append("UPPER(status) = :status")
             params["status"] = status
+    elif not batch_no:
+        where_parts.append(
+            "(COALESCE(collection_batches.total_tasks, 0) > 0 "
+            "OR EXISTS (SELECT 1 FROM collection_tasks ct_non_empty WHERE ct_non_empty.batch_id = collection_batches.id))"
+        )
     if status_values:
         params["status_values"] = status_values
     if created_from:
@@ -16384,10 +16763,19 @@ def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = Non
                    cta.task_count AS task_aggregate_count,
                    cta.address_count,
                    cta.real_success_count AS real_success_tasks,
-                   cta.failed_count AS aggregate_failed_tasks,
-                   cta.waiting_count,
-                   cta.processing_count,
-                   cta.sent_count,
+                    cta.failed_count AS aggregate_failed_tasks,
+                    cta.waiting_count,
+                    cta.waiting_gas_count,
+                    cta.waiting_collection_count,
+                    cta.collecting_count,
+                    cta.processing_count,
+                    cta.sent_count,
+                   cta.gas_linked_count,
+                   cta.gas_sent_count,
+                   cta.gas_confirmed_count,
+                   cta.gas_failed_count,
+                   cta.gas_topup_amount,
+                   cta.gas_coin_symbol,
                    cta.dry_run_count,
                    1 AS task_status_aggregate,
                    (
@@ -16405,20 +16793,63 @@ def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = Non
             FROM collection_batches
             LEFT JOIN (
               SELECT
-                batch_id,
+                ct.batch_id,
                 COUNT(*) AS task_count,
-                COUNT(DISTINCT LOWER(from_address)) AS address_count,
-                SUM(CASE WHEN UPPER(status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND NOT (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS real_success_count,
-                SUM(CASE WHEN UPPER(status) IN ('FAILED', 'ERROR', 'TIMEOUT') THEN 1 ELSE 0 END) AS failed_count,
-                SUM(CASE WHEN UPPER(status) IN ('PENDING', 'QUEUED', 'GAS_REQUIRED', 'GAS_QUEUED', 'READY') OR (UPPER(status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%')) THEN 1 ELSE 0 END) AS waiting_count,
-                SUM(CASE WHEN UPPER(status) IN ('RUNNING', 'PROCESSING', 'SENDING') THEN 1 ELSE 0 END) AS processing_count,
-                SUM(CASE WHEN UPPER(status) IN ('SENT', 'GAS_SENT', 'CONFIRMING') THEN 1 ELSE 0 END) AS sent_count,
-                SUM(CASE WHEN UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%' THEN 1 ELSE 0 END) AS dry_run_count
-              FROM collection_tasks
-              GROUP BY batch_id
+                COUNT(DISTINCT LOWER(ct.from_address)) AS address_count,
+                SUM(CASE WHEN UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS real_success_count,
+                SUM(CASE WHEN UPPER(ct.status) IN ('FAILED', 'ERROR', 'TIMEOUT') THEN 1 ELSE 0 END) AS failed_count,
+                SUM(CASE WHEN LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND UPPER(ct.status) NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') THEN 1 ELSE 0 END) AS sent_count,
+                SUM(CASE WHEN UPPER(ct.status) IN ('GAS_REQUIRED', 'WAITING_GAS', 'WAIT_GAS', 'GAS_QUEUED', 'GAS_CONFIRMING', 'WAITING_GAS_CONFIRM', 'PENDING_GAS')
+                           AND NOT (
+                             UPPER(COALESCE(gt.status, '')) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED')
+                             AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%'
+                             AND NOT (UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYGAS_%' OR UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYRUN_%')
+                             AND NOT (LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%')
+                           )
+                         THEN 1 ELSE 0 END) AS waiting_gas_count,
+                SUM(CASE WHEN (
+                             UPPER(ct.status) IN ('READY_TO_COLLECT', 'WAITING_COLLECTION', 'WAIT_COLLECTION')
+                             OR (
+                               UPPER(COALESCE(gt.status, '')) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED')
+                               AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%'
+                               AND NOT (UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYGAS_%' OR UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYRUN_%')
+                               AND NOT (LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%')
+                               AND UPPER(ct.status) NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                               AND UPPER(ct.status) NOT IN ('FAILED', 'ERROR', 'TIMEOUT')
+                             )
+                           )
+                         THEN 1 ELSE 0 END) AS waiting_collection_count,
+                SUM(CASE WHEN UPPER(ct.status) IN ('RUNNING', 'PROCESSING', 'SENDING', 'QUEUED', 'SENT', 'CONFIRMING', 'COLLECTION_SENT', 'COLLECTION_CONFIRMING')
+                           OR (LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND UPPER(ct.status) NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED'))
+                         THEN 1 ELSE 0 END) AS collecting_count,
+                SUM(CASE WHEN UPPER(ct.status) IN ('GAS_REQUIRED', 'WAITING_GAS', 'WAIT_GAS', 'GAS_QUEUED', 'GAS_CONFIRMING', 'WAITING_GAS_CONFIRM', 'PENDING_GAS', 'READY_TO_COLLECT', 'WAITING_COLLECTION', 'WAIT_COLLECTION')
+                           OR (UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%'))
+                         THEN 1 ELSE 0 END) AS waiting_count,
+                SUM(CASE WHEN UPPER(ct.status) IN ('RUNNING', 'PROCESSING', 'SENDING', 'QUEUED', 'SENT', 'CONFIRMING', 'COLLECTION_SENT', 'COLLECTION_CONFIRMING')
+                           OR (LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND UPPER(ct.status) NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED'))
+                         THEN 1 ELSE 0 END) AS processing_count,
+                SUM(CASE WHEN UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%' THEN 1 ELSE 0 END) AS dry_run_count
+                ,
+                SUM(CASE WHEN ct.gas_task_id IS NOT NULL OR UPPER(ct.status) IN ('GAS_REQUIRED', 'GAS_QUEUED') THEN 1 ELSE 0 END) AS gas_linked_count,
+                SUM(CASE WHEN UPPER(gt.status) IN ('SENT', 'GAS_SENT', 'CONFIRMING') AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYGAS_%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYRUN_%' THEN 1 ELSE 0 END) AS gas_sent_count,
+                SUM(CASE WHEN UPPER(gt.status) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED') AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYGAS_%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYRUN_%' THEN 1 ELSE 0 END) AS gas_confirmed_count,
+                SUM(CASE WHEN UPPER(gt.status) IN ('FAILED', 'ERROR') THEN 1 ELSE 0 END) AS gas_failed_count,
+                COALESCE(SUM(CASE WHEN gt.id IS NOT NULL THEN gt.topup_amount ELSE 0 END), 0) AS gas_topup_amount,
+                MAX(gt.gas_coin_symbol) AS gas_coin_symbol
+              FROM collection_tasks ct
+              LEFT JOIN gas_tasks gt ON gt.id = ct.gas_task_id
+              GROUP BY ct.batch_id
             ) cta ON cta.batch_id = collection_batches.id
             {where_sql}
-            ORDER BY created_at DESC, id DESC
+            ORDER BY
+              CASE
+                WHEN COALESCE(cta.task_count, collection_batches.total_tasks, 0) <= 0
+                 AND UPPER(COALESCE(collection_batches.status, '')) IN ('CANCELED', 'CANCELLED') THEN 3
+                WHEN COALESCE(cta.real_success_count, collection_batches.success_tasks, 0) >= COALESCE(cta.task_count, collection_batches.total_tasks, 0)
+                 AND COALESCE(cta.task_count, collection_batches.total_tasks, 0) > 0 THEN 2
+                ELSE 0
+              END ASC,
+              created_at DESC, id DESC
             LIMIT :limit OFFSET :offset
             """
         )
@@ -16446,6 +16877,7 @@ def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = Non
         summary=_collection_batches_summary(db, normalized_filters),
         network_stats=_collection_batches_network_stats(db, stats_filters),
         symbol_stats=_collection_batches_symbol_stats(db, stats_filters),
+        filter_options=_collection_batch_filter_options(db),
         total=total,
         page=page,
         page_size=page_size,
@@ -16530,6 +16962,16 @@ def _collection_record_gas_meta(task: Dict[str, Any], gas: Optional[Dict[str, An
     if gas:
         label, badge = _collection_status_meta(gas.get("status"), COLLECTION_GAS_STATUS_LABELS)
         tx_hash = gas.get("tx_hash") or ""
+        gas_error = str(gas.get("last_error") or "").strip()
+        gas_error_upper = gas_error.upper()
+        if "GUARD_REJECTED:CHAIN_NOT_ALLOWED" in gas_error_upper:
+            label, badge = "当前网络未开放补Gas", "danger"
+        elif "GUARD_REJECTED:MASTER_SWITCH_OFF" in gas_error_upper or "REAL_SEND_MASTER_SWITCH_DISABLED" in gas_error_upper:
+            label, badge = "补Gas未开启", "danger"
+        elif task_status in {"GAS_REQUIRED", "GAS_QUEUED", "WAIT_GAS", "WAITING_GAS"} and not tx_hash:
+            label, badge = "等待补Gas", "warning"
+        elif str(gas.get("status") or "").strip().upper() in {"FAILED", "ERROR"}:
+            label, badge = "补Gas失败", "danger"
         return {
             "gas_task_id": gas.get("id"),
             "gas_status": gas.get("status") or "",
@@ -16537,13 +16979,13 @@ def _collection_record_gas_meta(task: Dict[str, Any], gas: Optional[Dict[str, An
             "gas_status_badge": badge,
             "gas_tx_hash": tx_hash,
             "gas_tx_hash_short": _short_admin_hash(tx_hash),
-            "gas_error": gas.get("last_error") or "",
+            "gas_error": gas_error,
         }
     if task_status in {"GAS_REQUIRED", "GAS_QUEUED"}:
         return {
             "gas_task_id": task.get("gas_task_id"),
             "gas_status": task_status,
-            "gas_status_label": "需补 Gas",
+            "gas_status_label": "等待补Gas",
             "gas_status_badge": "warning",
             "gas_tx_hash": "",
             "gas_tx_hash_short": "-",
@@ -16566,8 +17008,13 @@ def _collection_record_task_item(task: Dict[str, Any], gas: Optional[Dict[str, A
     coin_symbol = str(task.get("coin_symbol") or "").upper()
     tx_hash = task.get("tx_hash") or ""
     error_text = task.get("last_error") or gas_meta.get("gas_error") or ""
+    history_error_text = error_text
+    if str(task.get("status") or "").strip().upper() in COLLECTION_OP_SUCCESS_STATUSES and _is_real_collection_tx_hash_value(tx_hash):
+        error_text = ""
     if not error_text and str(task.get("status") or "").strip().upper() == "SKIPPED":
         error_text = _collection_failure_reason(task.get("reason"))["label"]
+    error_meta = _collection_failure_reason(error_text)
+    error_label = error_meta["label"] if error_text else ""
     return {
         "id": task.get("id"),
         "task_no": task.get("task_no") or "",
@@ -16587,8 +17034,11 @@ def _collection_record_task_item(task: Dict[str, Any], gas: Optional[Dict[str, A
         "reason_label": _collection_reason_label(task.get("reason")),
         "tx_hash": tx_hash,
         "tx_hash_short": _short_admin_hash(tx_hash),
-        "error": error_text,
-        "error_short": _admin_short_text(error_text, 20, 8),
+        "error": error_label,
+        "error_short": _admin_short_text(error_label, 20, 8) if error_label else "",
+        "error_full": history_error_text,
+        "history_error": history_error_text,
+        "history_error_short": _admin_short_text(history_error_text, 20, 8),
         "created_at": _admin_datetime_display(task.get("created_at")),
         **gas_meta,
     }
@@ -16637,16 +17087,50 @@ def admin_query_collection_batch_detail(
                 SELECT
                   COUNT(*) AS task_count,
                   COALESCE(SUM(amount), 0) AS total_amount,
-                  SUM(CASE WHEN status IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND NOT (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS success_count,
-                  SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
-                  SUM(CASE WHEN status IN ('SKIPPED', 'CANCELED') THEN 1 ELSE 0 END) AS skipped_count,
-                  SUM(CASE WHEN status NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED', 'FAILED', 'SKIPPED', 'CANCELED') OR (status IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND (UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%')) THEN 1 ELSE 0 END) AS pending_count,
-                  SUM(CASE WHEN status IN ('SENT', 'GAS_SENT', 'CONFIRMING') THEN 1 ELSE 0 END) AS sent_count,
-                  SUM(CASE WHEN status IN ('RUNNING', 'PROCESSING', 'SENDING') THEN 1 ELSE 0 END) AS processing_count,
-                  SUM(CASE WHEN UPPER(COALESCE(tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(tx_hash, '')) LIKE 'DRYGAS_%' THEN 1 ELSE 0 END) AS dry_run_count,
-                  SUM(CASE WHEN status IN ('GAS_REQUIRED', 'GAS_QUEUED') OR gas_task_id IS NOT NULL THEN 1 ELSE 0 END) AS gas_required_count
-                FROM collection_tasks
-                WHERE batch_id = :batch_id
+                  SUM(CASE WHEN UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS success_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('FAILED', 'ERROR', 'TIMEOUT') THEN 1 ELSE 0 END) AS failed_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('SKIPPED', 'CANCELED') THEN 1 ELSE 0 END) AS skipped_count,
+                  SUM(CASE WHEN LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND UPPER(ct.status) NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') THEN 1 ELSE 0 END) AS sent_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('GAS_REQUIRED', 'WAITING_GAS', 'WAIT_GAS', 'GAS_QUEUED', 'GAS_CONFIRMING', 'WAITING_GAS_CONFIRM', 'PENDING_GAS')
+                             AND NOT (
+                               UPPER(COALESCE(gt.status, '')) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED')
+                               AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%'
+                               AND NOT (UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYGAS_%' OR UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYRUN_%')
+                               AND NOT (LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%')
+                             )
+                           THEN 1 ELSE 0 END) AS waiting_gas_count,
+                  SUM(CASE WHEN (
+                               UPPER(ct.status) IN ('READY_TO_COLLECT', 'WAITING_COLLECTION', 'WAIT_COLLECTION')
+                               OR (
+                                 UPPER(COALESCE(gt.status, '')) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED')
+                                 AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%'
+                                 AND NOT (UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYGAS_%' OR UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYRUN_%')
+                                 AND NOT (LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%')
+                                 AND UPPER(ct.status) NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED')
+                                 AND UPPER(ct.status) NOT IN ('FAILED', 'ERROR', 'TIMEOUT')
+                               )
+                             )
+                           THEN 1 ELSE 0 END) AS waiting_collection_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('RUNNING', 'PROCESSING', 'SENDING', 'QUEUED', 'SENT', 'CONFIRMING', 'COLLECTION_SENT', 'COLLECTION_CONFIRMING')
+                             OR (LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND UPPER(ct.status) NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED'))
+                           THEN 1 ELSE 0 END) AS collecting_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('GAS_REQUIRED', 'WAITING_GAS', 'WAIT_GAS', 'GAS_QUEUED', 'GAS_CONFIRMING', 'WAITING_GAS_CONFIRM', 'PENDING_GAS', 'READY_TO_COLLECT', 'WAITING_COLLECTION', 'WAIT_COLLECTION')
+                             OR (UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%'))
+                           THEN 1 ELSE 0 END) AS pending_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('RUNNING', 'PROCESSING', 'SENDING', 'QUEUED', 'SENT', 'CONFIRMING', 'COLLECTION_SENT', 'COLLECTION_CONFIRMING')
+                             OR (LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND UPPER(ct.status) NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED'))
+                           THEN 1 ELSE 0 END) AS processing_count,
+                  SUM(CASE WHEN UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%' THEN 1 ELSE 0 END) AS dry_run_count,
+                  SUM(CASE WHEN UPPER(ct.status) IN ('GAS_REQUIRED', 'GAS_QUEUED') OR ct.gas_task_id IS NOT NULL THEN 1 ELSE 0 END) AS gas_required_count,
+                  SUM(CASE WHEN ct.gas_task_id IS NOT NULL OR UPPER(ct.status) IN ('GAS_REQUIRED', 'GAS_QUEUED') THEN 1 ELSE 0 END) AS gas_linked_count,
+                  SUM(CASE WHEN UPPER(gt.status) IN ('SENT', 'GAS_SENT', 'CONFIRMING') AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYGAS_%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYRUN_%' THEN 1 ELSE 0 END) AS gas_sent_count,
+                  SUM(CASE WHEN UPPER(gt.status) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED') AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYGAS_%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYRUN_%' THEN 1 ELSE 0 END) AS gas_confirmed_count,
+                  SUM(CASE WHEN UPPER(gt.status) IN ('FAILED', 'ERROR') THEN 1 ELSE 0 END) AS gas_failed_count,
+                  COALESCE(SUM(CASE WHEN gt.id IS NOT NULL THEN gt.topup_amount ELSE 0 END), 0) AS gas_topup_amount,
+                  MAX(gt.gas_coin_symbol) AS gas_coin_symbol
+                FROM collection_tasks ct
+                LEFT JOIN gas_tasks gt ON gt.id = ct.gas_task_id
+                WHERE ct.batch_id = :batch_id
                 """
             ),
             {"batch_id": int(batch_id)},
@@ -16673,12 +17157,8 @@ def admin_query_collection_batch_detail(
 
         gas_by_collection_task: Dict[int, Dict[str, Any]] = {}
         gas_by_id: Dict[int, Dict[str, Any]] = {}
-        gas_fallback: Dict[tuple[int, str, str], Dict[str, Any]] = {}
         task_ids = [int(row["id"]) for row in task_dicts if row.get("id") is not None]
         gas_task_ids = [int(row["gas_task_id"]) for row in task_dicts if row.get("gas_task_id") is not None]
-        user_ids = sorted({int(row["user_id"]) for row in task_dicts if row.get("user_id") is not None})
-        chain_keys = sorted({str(row["chain_key"] or "").strip().lower() for row in task_dicts if row.get("chain_key")})
-        from_addresses = sorted({str(row["from_address"] or "").strip().lower() for row in task_dicts if row.get("from_address")})
 
         gas_rows = []
         if task_ids or gas_task_ids:
@@ -16715,31 +17195,6 @@ def admin_query_collection_batch_detail(
             ).bindparams(bindparam("gas_task_ids", expanding=True))
             gas_rows.extend(db.execute(gas_sql, {"gas_task_ids": gas_task_ids}).mappings().all())
 
-        if user_ids and chain_keys and from_addresses:
-            fallback_sql = text(
-                """
-                SELECT id, task_no, collection_task_id, user_id, chain_key, gas_coin_symbol,
-                       from_address, to_address, topup_amount, status, tx_hash, last_error,
-                       created_at, updated_at
-                FROM gas_tasks
-                WHERE user_id IN :user_ids
-                  AND LOWER(chain_key) IN :chain_keys
-                  AND LOWER(to_address) IN :from_addresses
-                ORDER BY created_at DESC, id DESC
-                LIMIT 500
-                """
-            ).bindparams(
-                bindparam("user_ids", expanding=True),
-                bindparam("chain_keys", expanding=True),
-                bindparam("from_addresses", expanding=True),
-            )
-            gas_rows.extend(
-                db.execute(
-                    fallback_sql,
-                    {"user_ids": user_ids, "chain_keys": chain_keys, "from_addresses": from_addresses},
-                ).mappings().all()
-            )
-
         seen_gas_ids: set[int] = set()
         for row in gas_rows:
             gas = dict(row)
@@ -16751,12 +17206,6 @@ def admin_query_collection_batch_detail(
                 gas_by_id[gas_id] = gas
             if gas.get("collection_task_id") is not None:
                 gas_by_collection_task.setdefault(int(gas["collection_task_id"]), gas)
-            fallback_key = (
-                int(gas.get("user_id") or 0),
-                str(gas.get("chain_key") or "").strip().lower(),
-                str(gas.get("to_address") or "").strip().lower(),
-            )
-            gas_fallback.setdefault(fallback_key, gas)
 
         items = []
         for task in task_dicts:
@@ -16765,14 +17214,6 @@ def admin_query_collection_batch_detail(
                 gas = gas_by_id.get(int(task["gas_task_id"]))
             if gas is None and task.get("id") is not None:
                 gas = gas_by_collection_task.get(int(task["id"]))
-            if gas is None:
-                gas = gas_fallback.get(
-                    (
-                        int(task.get("user_id") or 0),
-                        str(task.get("chain_key") or "").strip().lower(),
-                        str(task.get("from_address") or "").strip().lower(),
-                    )
-                )
             items.append(_collection_record_task_item(task, gas))
 
         batch_row_dict = dict(batch_row)
@@ -16783,9 +17224,18 @@ def admin_query_collection_batch_detail(
                 "real_success_tasks": int((aggregate or {}).get("success_count") or 0),
                 "aggregate_failed_tasks": int((aggregate or {}).get("failed_count") or 0),
                 "waiting_count": int((aggregate or {}).get("pending_count") or 0),
+                "waiting_gas_count": int((aggregate or {}).get("waiting_gas_count") or 0),
+                "waiting_collection_count": int((aggregate or {}).get("waiting_collection_count") or 0),
+                "collecting_count": int((aggregate or {}).get("collecting_count") or 0),
                 "processing_count": int((aggregate or {}).get("processing_count") or 0),
                 "sent_count": int((aggregate or {}).get("sent_count") or 0),
                 "dry_run_count": int((aggregate or {}).get("dry_run_count") or 0),
+                "gas_linked_count": int((aggregate or {}).get("gas_linked_count") or 0),
+                "gas_sent_count": int((aggregate or {}).get("gas_sent_count") or 0),
+                "gas_confirmed_count": int((aggregate or {}).get("gas_confirmed_count") or 0),
+                "gas_failed_count": int((aggregate or {}).get("gas_failed_count") or 0),
+                "gas_topup_amount": (aggregate or {}).get("gas_topup_amount"),
+                "gas_coin_symbol": (aggregate or {}).get("gas_coin_symbol"),
             }
         )
         batch = _admin_collection_batch_item(batch_row_dict)
@@ -16793,7 +17243,8 @@ def admin_query_collection_batch_detail(
         symbol = batch.get("coin_symbol") or ""
         total_amount = (aggregate or {}).get("total_amount") or batch_row.get("total_amount") or Decimal("0")
         summary = {
-            "batch_id": batch.get("batch_no") or batch.get("id"),
+            "batch_id": batch.get("id"),
+            "batch_no": batch.get("batch_no") or "",
             "chain_key": batch.get("chain_key") or "-",
             "coin_symbol": symbol or "-",
             "total_amount": batch.get("total_amount_label") or _fmt_admin_amount_display(total_amount, symbol),
@@ -17589,10 +18040,10 @@ def _collection_center_filter_values(filters: Optional[Dict[str, Any]]) -> Dict[
 COLLECTION_REASON_LABELS = {
     "TOKEN_BALANCE_NOT_ABOVE_RESERVE": "余额未超过保留额度",
     "AVAILABLE_AMOUNT_BELOW_MIN_COLLECT": "低于最小归集金额",
-    "COLLECTIBLE_BUT_GAS_REQUIRED": "可归集，需补 Gas",
+    "COLLECTIBLE_BUT_GAS_REQUIRED": "可归集，等待补Gas",
     "COLLECTIBLE_GAS_SUFFICIENT": "可归集",
     "COLLECTIBLE": "可归集",
-    "GAS_TOPUP_REQUIRED": "需要补 Gas",
+    "GAS_TOPUP_REQUIRED": "等待补Gas",
     "CONFIG_INCOMPLETE": "地址配置不完整",
     "TOKEN_CONTRACT_ADDRESS_MISSING": "token 合约地址缺失",
 }
@@ -18038,7 +18489,7 @@ def _collection_center_candidate_item(candidate: Any, task_maps: Optional[Dict[s
         operation_status_label = "已有任务"
         operation_status_badge = "info"
     elif gas_required:
-        operation_status_label = "需补 Gas"
+        operation_status_label = "等待补Gas"
         operation_status_badge = "warning"
     elif should_create:
         operation_status_label = "可归集"
@@ -18592,7 +19043,7 @@ def _collection_center_address_items(items: list[Dict[str, Any]]) -> list[Dict[s
             operation_status_label = "已有任务"
             operation_status_badge = "info"
         elif group["gas_required"]:
-            operation_status_label = "需补 Gas"
+            operation_status_label = "等待补Gas"
             operation_status_badge = "warning"
         elif group["should_create_task"]:
             operation_status_label = "可归集"
@@ -18714,10 +19165,10 @@ def _collection_center_sanitize_address_item(item: Dict[str, Any]) -> Dict[str, 
         data["gas_status"] = "GAS_REQUIRED"
         data["gas_status_label"] = "不足"
         data["gas_status_badge"] = "warning"
-        data["operation_status_label"] = "需补 Gas"
+        data["operation_status_label"] = "等待补Gas"
         data["operation_status_badge"] = "warning"
-        data["status_label"] = "需补 Gas"
-        data["status"] = "需补 Gas"
+        data["status_label"] = "等待补Gas"
+        data["status"] = "等待补Gas"
         if data.get("gas_required_amounts_raw"):
             data["onchain_collectable_balance_label"] = _collection_center_amounts_label_with_zero(data.get("gas_required_amounts_raw") or {})
     elif direct_collect_total > 0:
@@ -19707,9 +20158,7 @@ def admin_query_collection_candidate_workbench(db: Session, filters: Optional[Di
         collected_amount = Decimal("0")
         for success_task in success_task_rows_by_key.get(key, []):
             collected_amount += _collection_center_decimal(success_task.get("amount"))
-        candidate_amount = max(Decimal("0"), raw_candidate_amount - collected_amount)
-        if verified_amount is not None and collected_amount > 0:
-            verified_amount = max(Decimal("0"), verified_amount - collected_amount)
+        candidate_amount = raw_candidate_amount
         verify_running = verify_status_value == "running"
         verify_failed = verify_status_value == "failed"
         verify_completed_recently = verify_status_value == "completed"
@@ -19992,6 +20441,12 @@ def _collection_center_candidate_debug_item(
     verified_amount: Any = None,
     min_collect_amount: Any = None,
     skip_reason: str = "",
+    action: str = "",
+    task_id: Optional[int] = None,
+    task_status: str = "",
+    batch_id: Optional[int] = None,
+    batch_no: str = "",
+    reason: str = "",
 ) -> Dict[str, Any]:
     verified_value = item.get("verified_onchain_amount") if verified_amount is None else verified_amount
     min_value = item.get("min_collect_amount") if min_collect_amount is None else min_collect_amount
@@ -20008,6 +20463,12 @@ def _collection_center_candidate_debug_item(
         "verified_onchain_amount": verified_label,
         "min_collect_amount": min_label,
         "skip_reason": str(skip_reason or ""),
+        "action": str(action or ""),
+        "task_id": task_id,
+        "task_status": str(task_status or ""),
+        "batch_id": batch_id,
+        "batch_no": str(batch_no or ""),
+        "reason": str(reason or skip_reason or ""),
     }
 
 
@@ -20081,7 +20542,27 @@ def admin_create_collection_batch_from_verified_candidates(
     skipped_reasons: list[str] = []
     debug_items: list[Dict[str, Any]] = []
     created_task_ids: list[int] = []
+    reused_task_ids: list[int] = []
+    duplicate_task_ids: list[int] = []
+    batch_no_cache: Dict[int, str] = {}
     batch = None
+
+    def _debug_batch_no(task_batch_id: Any) -> str:
+        if task_batch_id is None:
+            return ""
+        try:
+            batch_id_value = int(task_batch_id)
+        except Exception:
+            return ""
+        if batch_id_value not in batch_no_cache:
+            batch_no_cache[batch_id_value] = str(
+                db.execute(
+                    text("SELECT batch_no FROM collection_batches WHERE id = :batch_id LIMIT 1"),
+                    {"batch_id": batch_id_value},
+                ).scalar()
+                or ""
+            )
+        return batch_no_cache[batch_id_value]
 
     chain_collection_meta = _collection_center_chain_collection_meta(db, chain_key)
     if not int(chain_collection_meta.get("collection_enabled") or 0):
@@ -20096,7 +20577,19 @@ def admin_create_collection_batch_from_verified_candidates(
             "created_gas_task_ids": [],
             "skipped_count": len(items),
             "skipped_reason_stats": {skip_reason: len(items)} if items else {},
-            "debug_items": [_collection_center_candidate_debug_item(item, skip_reason=skip_reason) for item in items],
+            "candidate_count": len(items),
+            "reused_existing_count": 0,
+            "duplicate_active_count": 0,
+            "reused_task_ids": [],
+            "debug_items": [
+                _collection_center_candidate_debug_item(
+                    item,
+                    skip_reason=skip_reason,
+                    action="skipped_config",
+                    reason=skip_reason,
+                )
+                for item in items
+            ],
             "skipped_duplicate_count": 0,
             "skipped_gas_required_count": 0,
             "gas_task_skipped_duplicate_count": 0,
@@ -20118,15 +20611,31 @@ def admin_create_collection_batch_from_verified_candidates(
         )
         if duplicate:
             skip_reason = "ACTIVE_COLLECTION_TASK_EXISTS"
-            skipped_reasons.append(skip_reason)
-            debug_items.append(_collection_center_candidate_debug_item(item, skip_reason=skip_reason))
+            duplicate_task_ids.append(int(duplicate.id))
+            debug_items.append(
+                _collection_center_candidate_debug_item(
+                    item,
+                    skip_reason=skip_reason,
+                    action="duplicate_active",
+                    task_id=int(duplicate.id),
+                    task_status=str(duplicate.status or ""),
+                    batch_id=int(duplicate.batch_id) if duplicate.batch_id is not None else None,
+                    batch_no=_debug_batch_no(duplicate.batch_id),
+                    reason=skip_reason,
+                )
+            )
             continue
         try:
             evaluation = _collection_center_refresh_candidate_onchain(db, item, collection_address=collection_address)
         except Exception as exc:
             skip_reason = "ONCHAIN_VERIFY_FAILED"
             skipped_reasons.append(skip_reason)
-            debug_item = _collection_center_candidate_debug_item(item, skip_reason=skip_reason)
+            debug_item = _collection_center_candidate_debug_item(
+                item,
+                skip_reason=skip_reason,
+                action="error",
+                reason=skip_reason,
+            )
             debug_item["error"] = str(exc)[:180]
             debug_items.append(debug_item)
             continue
@@ -20142,6 +20651,8 @@ def admin_create_collection_batch_from_verified_candidates(
                     verified_amount=verified_amount,
                     min_collect_amount=min_collect_amount,
                     skip_reason=skip_reason,
+                    action="skipped_zero",
+                    reason=skip_reason,
                 )
             )
             continue
@@ -20154,6 +20665,8 @@ def admin_create_collection_batch_from_verified_candidates(
                     verified_amount=verified_amount,
                     min_collect_amount=min_collect_amount,
                     skip_reason=skip_reason,
+                    action="skipped_below_min",
+                    reason=skip_reason,
                 )
             )
             continue
@@ -20166,6 +20679,34 @@ def admin_create_collection_batch_from_verified_candidates(
                     verified_amount=verified_amount,
                     min_collect_amount=min_collect_amount,
                     skip_reason=skip_reason,
+                    action="skipped_below_min",
+                    reason=skip_reason,
+                )
+            )
+            continue
+        existing_task = find_collection_task_by_idempotency(
+            db,
+            user_id=int(item.get("user_id") or 0),
+            chain_key=chain_key,
+            coin_symbol=str(item.get("asset_symbol") or "").upper(),
+            from_address=str(item.get("address") or "").lower(),
+            to_address=collection_address,
+            amount=amount,
+        )
+        if existing_task:
+            reused_task_ids.append(int(existing_task.id))
+            debug_items.append(
+                _collection_center_candidate_debug_item(
+                    item,
+                    verified_amount=verified_amount,
+                    min_collect_amount=min_collect_amount,
+                    skip_reason="EXISTING_IDEMPOTENT_TASK",
+                    action="reused_existing",
+                    task_id=int(existing_task.id),
+                    task_status=str(existing_task.status or ""),
+                    batch_id=int(existing_task.batch_id) if existing_task.batch_id is not None else None,
+                    batch_no=_debug_batch_no(existing_task.batch_id),
+                    reason="EXISTING_IDEMPOTENT_TASK",
                 )
             )
             continue
@@ -20178,7 +20719,7 @@ def admin_create_collection_batch_from_verified_candidates(
                 coin_symbol=batch_coin_symbol,
                 created_by=admin_user_id,
             )
-        task = create_collection_task(
+        create_result = create_collection_task_with_result(
             db,
             batch_id=int(batch.id),
             user_id=int(item.get("user_id") or 0),
@@ -20190,16 +20731,42 @@ def admin_create_collection_batch_from_verified_candidates(
             amount=amount,
             reason="VERIFIED_ONCHAIN_BALANCE",
         )
-        if int(task.id) not in created_task_ids:
-            created_task_ids.append(int(task.id))
+        task = create_result.task
+        if create_result.created_new:
+            if int(task.id) not in created_task_ids:
+                created_task_ids.append(int(task.id))
+            action = "created"
+        elif create_result.existing:
+            if int(task.id) not in reused_task_ids:
+                reused_task_ids.append(int(task.id))
+            action = "reused_existing"
+        elif create_result.duplicate:
+            if int(task.id) not in duplicate_task_ids:
+                duplicate_task_ids.append(int(task.id))
+            action = "duplicate_active"
+        else:
+            action = "skipped"
         debug_items.append(
             _collection_center_candidate_debug_item(
                 item,
                 verified_amount=verified_amount,
                 min_collect_amount=min_collect_amount,
-                skip_reason="",
+                skip_reason="" if create_result.created_new else "EXISTING_COLLECTION_TASK",
+                action=action,
+                task_id=int(task.id),
+                task_status=str(task.status or ""),
+                batch_id=int(task.batch_id) if task.batch_id is not None else None,
+                batch_no=_debug_batch_no(task.batch_id),
+                reason="" if create_result.created_new else "EXISTING_COLLECTION_TASK",
             )
         )
+
+    if batch is not None and not created_task_ids:
+        batch.status = "CANCELED"
+        batch.error_message = batch.error_message or "EMPTY_BATCH_NO_NEW_TASKS"
+        batch.finished_at = batch.finished_at or datetime.utcnow()
+        batch.updated_at = datetime.utcnow()
+        db.flush()
 
     skipped_reason_stats = _collection_center_skip_reason_stats(skipped_reasons)
     return {
@@ -20210,10 +20777,15 @@ def admin_create_collection_batch_from_verified_candidates(
         "created_gas_task_count": 0,
         "created_task_ids": created_task_ids,
         "created_gas_task_ids": [],
+        "candidate_count": len(items),
         "skipped_count": len(skipped_reasons),
         "skipped_reason_stats": skipped_reason_stats,
+        "reused_existing_count": len(set(reused_task_ids)),
+        "duplicate_active_count": len(set(duplicate_task_ids)),
+        "reused_task_ids": sorted(set(reused_task_ids)),
+        "duplicate_task_ids": sorted(set(duplicate_task_ids)),
         "debug_items": debug_items,
-        "skipped_duplicate_count": skipped_reason_stats.get("ACTIVE_COLLECTION_TASK_EXISTS", 0),
+        "skipped_duplicate_count": len(set(duplicate_task_ids)),
         "skipped_gas_required_count": 0,
         "gas_task_skipped_duplicate_count": 0,
         "gas_task_skipped_config_missing_count": 0,
@@ -21455,6 +22027,7 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
     created_to = filters.get("created_to") or filters.get("date_to")
     page = max(1, _parse_int(filters.get("page"), 1))
     page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
+    is_detail_query = bool(batch_id or task_no)
     normalized_filters = {
         "task_no": task_no,
         "batch_id": batch_id,
@@ -21466,16 +22039,38 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
     }
     where_parts, params = _collection_task_scope(normalized_filters)
     status_values: tuple[str, ...] | None = None
-    if status:
-        if status == "ACTIVE":
+    status = status or ("WORKBENCH" if not is_detail_query else "")
+    status_uses_gas_task = False
+    if status and status != "ALL":
+        if status in {"WORKBENCH", "ACTIVE", "TODO"}:
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
-            status_values = COLLECTION_OP_ACTIVE_STATUSES
+            status_values = COLLECTION_TASK_WORKBENCH_STATUSES
+            status = "WORKBENCH"
         elif status in {"FAILED", "FAIL", "ERROR"}:
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
             status_values = COLLECTION_OP_FAILED_STATUSES
             status = "FAILED"
-        elif status in {"SUCCESS", "COMPLETED", "CONFIRMED"}:
+        elif status in {"GAS_FAILED", "GAS_FAIL"}:
+            where_parts.append("(UPPER(collection_tasks.status) IN :status_values OR UPPER(gt.status) IN :gas_status_values)")
+            status_values = ("GAS_FAILED",)
+            params["gas_status_values"] = ("FAILED", "ERROR")
+            status_uses_gas_task = True
+            status = "GAS_FAILED"
+        elif status in {"GAS_REQUIRED", "WAITING_GAS", "WAIT_GAS", "GAS_QUEUED"}:
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
+            status_values = COLLECTION_OP_GAS_REQUIRED_STATUSES
+            status = "GAS_REQUIRED"
+        elif status in {"SUCCESS", "COMPLETED", "CONFIRMED"}:
+            where_parts.append(
+                "collection_tasks.batch_id IS NOT NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM collection_tasks ct_done "
+                "WHERE ct_done.batch_id = collection_tasks.batch_id "
+                "AND (UPPER(ct_done.status) NOT IN :status_values "
+                "OR LOWER(COALESCE(ct_done.tx_hash, '')) NOT LIKE '0x%' "
+                "OR (UPPER(COALESCE(ct_done.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct_done.tx_hash, '')) LIKE 'DRYGAS_%'))"
+                ")"
+            )
             status_values = COLLECTION_OP_SUCCESS_STATUSES
             status = "SUCCESS"
         elif status in {"PENDING", "QUEUED"}:
@@ -21484,8 +22079,12 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
             status = "PENDING"
         elif status in {"PROCESSING", "RUNNING", "SENDING"}:
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
-            status_values = COLLECTION_OP_PROCESSING_STATUSES
+            status_values = ("RUNNING", "PROCESSING", "SENDING", "READY", "PARTIAL")
             status = "PROCESSING"
+        elif status in {"SENT", "CONFIRMING", "GAS_SENT"}:
+            where_parts.append("UPPER(collection_tasks.status) IN :status_values")
+            status_values = ("SENT", "GAS_SENT", "CONFIRMING")
+            status = "SENT"
         else:
             where_parts.append("UPPER(collection_tasks.status) = :status")
             params["status"] = status
@@ -21506,6 +22105,7 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
               SELECT {group_expr} AS group_id
               FROM collection_tasks
               LEFT JOIN collection_batches cb ON cb.id = collection_tasks.batch_id
+              LEFT JOIN gas_tasks gt ON gt.id = collection_tasks.gas_task_id
               {where_sql}
               GROUP BY {group_expr}
             ) grouped_batches
@@ -21513,6 +22113,8 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
         )
         if status_values:
             batch_count_stmt = batch_count_stmt.bindparams(bindparam("status_values", expanding=True))
+        if status_uses_gas_task:
+            batch_count_stmt = batch_count_stmt.bindparams(bindparam("gas_status_values", expanding=True))
         batch_total = int(db.execute(batch_count_stmt, params).scalar() or 0)
         batch_page, batch_page_size, batch_pages = _admin_page_meta(batch_total, page, page_size)
         batch_stmt = text(
@@ -21529,21 +22131,62 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
               COUNT(*) AS address_count,
               COALESCE(SUM(collection_tasks.amount), 0) AS total_amount,
               GROUP_CONCAT(CONCAT(COALESCE(NULLIF(UPPER(collection_tasks.coin_symbol), ''), '--'), ':', COALESCE(collection_tasks.amount, 0)) ORDER BY collection_tasks.coin_symbol SEPARATOR '|') AS amount_rows_raw,
-              SUM(CASE WHEN UPPER(collection_tasks.status) IN :success_statuses AND NOT (UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS success_count,
-              SUM(CASE WHEN UPPER(collection_tasks.status) IN :sent_statuses THEN 1 ELSE 0 END) AS sent_count,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN :success_statuses AND LOWER(COALESCE(collection_tasks.tx_hash, '')) LIKE '0x%' AND NOT (UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS success_count,
+              SUM(CASE WHEN LOWER(COALESCE(collection_tasks.tx_hash, '')) LIKE '0x%' AND UPPER(collection_tasks.status) NOT IN :success_statuses THEN 1 ELSE 0 END) AS sent_count,
               SUM(CASE WHEN UPPER(collection_tasks.status) IN :failed_statuses THEN 1 ELSE 0 END) AS failed_count,
-              SUM(CASE WHEN UPPER(collection_tasks.status) IN :waiting_statuses OR (UPPER(collection_tasks.status) IN :success_statuses AND (UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%')) THEN 1 ELSE 0 END) AS waiting_count,
-              SUM(CASE WHEN UPPER(collection_tasks.status) IN :processing_statuses THEN 1 ELSE 0 END) AS processing_count,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN ('GAS_REQUIRED', 'WAITING_GAS', 'WAIT_GAS', 'GAS_QUEUED', 'GAS_CONFIRMING', 'WAITING_GAS_CONFIRM', 'PENDING_GAS')
+                         AND NOT (
+                           UPPER(COALESCE(gt.status, '')) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED')
+                           AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%'
+                           AND NOT (UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYGAS_%' OR UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYRUN_%')
+                           AND NOT (LOWER(COALESCE(collection_tasks.tx_hash, '')) LIKE '0x%')
+                         )
+                       THEN 1 ELSE 0 END) AS waiting_gas_count,
+              SUM(CASE WHEN (
+                           UPPER(collection_tasks.status) IN ('READY_TO_COLLECT', 'WAITING_COLLECTION', 'WAIT_COLLECTION')
+                           OR (
+                             UPPER(COALESCE(gt.status, '')) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED')
+                             AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%'
+                             AND NOT (UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYGAS_%' OR UPPER(COALESCE(gt.tx_hash, '')) LIKE 'DRYRUN_%')
+                             AND NOT (LOWER(COALESCE(collection_tasks.tx_hash, '')) LIKE '0x%')
+                             AND UPPER(collection_tasks.status) NOT IN :success_statuses
+                             AND UPPER(collection_tasks.status) NOT IN :failed_statuses
+                           )
+                         )
+                       THEN 1 ELSE 0 END) AS waiting_collection_count,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN ('RUNNING', 'PROCESSING', 'SENDING', 'QUEUED', 'SENT', 'CONFIRMING', 'COLLECTION_SENT', 'COLLECTION_CONFIRMING')
+                         OR (LOWER(COALESCE(collection_tasks.tx_hash, '')) LIKE '0x%' AND UPPER(collection_tasks.status) NOT IN :success_statuses)
+                       THEN 1 ELSE 0 END) AS collecting_count,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN ('GAS_REQUIRED', 'WAITING_GAS', 'WAIT_GAS', 'GAS_QUEUED', 'GAS_CONFIRMING', 'WAITING_GAS_CONFIRM', 'PENDING_GAS', 'READY_TO_COLLECT', 'WAITING_COLLECTION', 'WAIT_COLLECTION')
+                         OR (UPPER(collection_tasks.status) IN :success_statuses AND (UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%'))
+                       THEN 1 ELSE 0 END) AS waiting_count,
+              SUM(CASE WHEN UPPER(collection_tasks.status) IN ('RUNNING', 'PROCESSING', 'SENDING', 'QUEUED', 'SENT', 'CONFIRMING', 'COLLECTION_SENT', 'COLLECTION_CONFIRMING')
+                         OR (LOWER(COALESCE(collection_tasks.tx_hash, '')) LIKE '0x%' AND UPPER(collection_tasks.status) NOT IN :success_statuses)
+                       THEN 1 ELSE 0 END) AS processing_count,
               SUM(CASE WHEN UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%' THEN 1 ELSE 0 END) AS dry_run_count,
               SUM(CASE WHEN NOT (LOWER(COALESCE(collection_tasks.tx_hash, '')) LIKE '0x%' AND NOT (UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%')) AND ((UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(collection_tasks.tx_hash, '')) LIKE 'DRYGAS_%') OR UPPER(collection_tasks.status) IN ('PENDING', 'QUEUED', 'READY')) THEN 1 ELSE 0 END) AS can_send_count,
               SUM(CASE WHEN collection_tasks.gas_task_id IS NOT NULL OR UPPER(collection_tasks.status) IN ('GAS_REQUIRED', 'GAS_QUEUED') THEN 1 ELSE 0 END) AS gas_linked_count,
-              SUM(CASE WHEN UPPER(gt.status) IN ('SENT', 'GAS_SENT') THEN 1 ELSE 0 END) AS gas_sent_count,
-              SUM(CASE WHEN UPPER(gt.status) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED') AND gt.tx_hash IS NOT NULL AND UPPER(gt.tx_hash) NOT LIKE 'DRYGAS_%' AND UPPER(gt.tx_hash) NOT LIKE 'DRYRUN_%' THEN 1 ELSE 0 END) AS gas_confirmed_count,
+              SUM(CASE WHEN UPPER(gt.status) IN ('SENT', 'GAS_SENT', 'CONFIRMING') AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYGAS_%' AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYRUN_%' THEN 1 ELSE 0 END) AS gas_sent_count,
+              SUM(CASE WHEN UPPER(gt.status) IN ('SUCCESS', 'COMPLETED', 'CONFIRMED') AND LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%' AND UPPER(gt.tx_hash) NOT LIKE 'DRYGAS_%' AND UPPER(gt.tx_hash) NOT LIKE 'DRYRUN_%' THEN 1 ELSE 0 END) AS gas_confirmed_count,
               SUM(CASE WHEN UPPER(gt.status) IN ('FAILED', 'ERROR') THEN 1 ELSE 0 END) AS gas_failed_count,
               COALESCE(SUM(CASE WHEN gt.id IS NOT NULL THEN gt.topup_amount ELSE 0 END), 0) AS gas_topup_amount,
               MAX(gt.gas_coin_symbol) AS gas_coin_symbol,
+              MAX(COALESCE(
+                NULLIF(collection_tasks.last_error, ''),
+                NULLIF(
+                  CASE
+                    WHEN LOWER(COALESCE(gt.tx_hash, '')) LIKE '0x%'
+                     AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYGAS_%'
+                     AND UPPER(COALESCE(gt.tx_hash, '')) NOT LIKE 'DRYRUN_%'
+                    THEN NULL
+                    ELSE gt.last_error
+                  END,
+                  ''
+                ),
+                NULLIF(cb.error_message, '')
+              )) AS recent_error,
               SUM(CASE WHEN UPPER(collection_tasks.status) IN ('PENDING', 'WAITING') AND collection_tasks.tx_hash IS NULL THEN 1 ELSE 0 END) AS requeue_collection_count,
-              SUM(CASE WHEN gt.id IS NOT NULL AND UPPER(gt.status) IN ('PENDING', 'WAITING') AND gt.tx_hash IS NULL THEN 1 ELSE 0 END) AS requeue_gas_count,
+              SUM(CASE WHEN gt.id IS NOT NULL AND UPPER(gt.status) IN ('PENDING', 'WAITING', 'FAILED', 'TIMEOUT', 'CANCELED', 'CANCELLED', 'QUEUED') AND (gt.tx_hash IS NULL OR UPPER(gt.tx_hash) LIKE 'DRYGAS_%' OR UPPER(gt.tx_hash) LIKE 'DRYRUN_%') THEN 1 ELSE 0 END) AS requeue_gas_count,
               MIN(collection_tasks.created_at) AS created_at,
               MAX(COALESCE(collection_tasks.confirmed_at, collection_tasks.sent_at, collection_tasks.updated_at, collection_tasks.created_at)) AS finished_at,
               MAX(collection_tasks.created_at) AS sort_created_at,
@@ -21553,27 +22196,29 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
             LEFT JOIN gas_tasks gt ON gt.id = collection_tasks.gas_task_id
             {where_sql}
             GROUP BY {group_expr}, collection_tasks.batch_id, cb.batch_no, cb.status, cb.chain_key, cb.coin_symbol
-            ORDER BY sort_created_at DESC, sort_id DESC
+            ORDER BY
+              CASE
+                WHEN address_count <= 0 AND UPPER(COALESCE(batch_status, '')) IN ('CANCELED', 'CANCELLED') THEN 3
+                WHEN success_count >= address_count AND address_count > 0 THEN 2
+                ELSE 0
+              END ASC,
+              sort_created_at DESC, sort_id DESC
             LIMIT :limit OFFSET :offset
             """
         ).bindparams(
             bindparam("success_statuses", expanding=True),
-            bindparam("sent_statuses", expanding=True),
             bindparam("failed_statuses", expanding=True),
-            bindparam("waiting_statuses", expanding=True),
-            bindparam("processing_statuses", expanding=True),
         )
         if status_values:
             batch_stmt = batch_stmt.bindparams(bindparam("status_values", expanding=True))
+        if status_uses_gas_task:
+            batch_stmt = batch_stmt.bindparams(bindparam("gas_status_values", expanding=True))
         batch_rows = db.execute(
             batch_stmt,
             {
                 **params,
                 "success_statuses": COLLECTION_OP_SUCCESS_STATUSES,
-                "sent_statuses": COLLECTION_OP_SENT_STATUSES,
                 "failed_statuses": (*COLLECTION_OP_FAILED_STATUSES, *COLLECTION_OP_TIMEOUT_STATUSES),
-                "waiting_statuses": COLLECTION_OP_WAITING_STATUSES,
-                "processing_statuses": COLLECTION_OP_PROCESSING_STATUSES,
                 "limit": batch_page_size,
                 "offset": (batch_page - 1) * batch_page_size,
             },
@@ -21600,7 +22245,8 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
                        collection_tasks.sent_at, collection_tasks.confirmed_at, collection_tasks.created_at,
                        collection_tasks.updated_at, gt.topup_amount AS gas_topup_amount,
                        gt.gas_coin_symbol AS gas_topup_coin_symbol, gt.status AS gas_task_status,
-                       gt.tx_hash AS gas_tx_hash, gt.confirmed_at AS gas_confirmed_at
+                       gt.tx_hash AS gas_tx_hash, gt.confirmed_at AS gas_confirmed_at,
+                       gt.collection_task_id AS gas_collection_task_id, gt.last_error AS gas_last_error
                 FROM collection_tasks
                 LEFT JOIN gas_tasks gt ON gt.id = collection_tasks.gas_task_id
                 {where_sql}
@@ -21610,6 +22256,8 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
             )
             if status_values:
                 row_stmt = row_stmt.bindparams(bindparam("status_values", expanding=True))
+            if status_uses_gas_task:
+                row_stmt = row_stmt.bindparams(bindparam("gas_status_values", expanding=True))
             rows = db.execute(
                 row_stmt,
                 {**params, "limit": detail_page_size, "offset": (detail_page - 1) * detail_page_size},

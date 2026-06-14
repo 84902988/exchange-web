@@ -207,7 +207,7 @@ function StockLockMetric({ label, value }: { label: string; value: string }) {
 }
 
 export default function StockTokenLocksPage() {
-  const { t } = useLocaleContext();
+  const { locale: currentLanguage, t } = useLocaleContext();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [items, setItems] = useState<StockTokenLockItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -251,7 +251,7 @@ export default function StockTokenLocksPage() {
 
   useEffect(() => {
     let alive = true;
-    getSiteConfig()
+    getSiteConfig(currentLanguage)
       .then((config) => {
         if (alive) {
           setSiteConfig({ ...fallbackSiteConfig, ...config });
@@ -263,7 +263,7 @@ export default function StockTokenLocksPage() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [currentLanguage]);
 
   const openConvertModal = (item: StockTokenLockItem) => {
     setSuccessMessage("");

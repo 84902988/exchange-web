@@ -48,6 +48,7 @@ class GasTaskStatus(str, Enum):
     QUEUED = "QUEUED"
     SENDING = "SENDING"
     SENT = "SENT"
+    CONFIRMING = "CONFIRMING"
     CONFIRMED = "CONFIRMED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"

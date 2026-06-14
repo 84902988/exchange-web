@@ -317,6 +317,7 @@
                 <th class="users-nowrap" style="width:112px;">出金状态</th>
                 <th style="width:138px;">注册时间</th>
                 <th style="width:138px;">最近登录</th>
+                <th class="users-nowrap" style="width:96px;">最近登录国家</th>
                 <th class="users-actions-col">操作</th>
               </tr>
             </thead>
@@ -365,6 +366,7 @@
                       <div class="admin-time-cell">--</div>
                     {% endif %}
                   </td>
+                  <td class="users-nowrap"><span class="admin-badge admin-badge-secondary">{{ item.last_login_country_code or '-' }}</span></td>
                   <td class="users-actions-col">
                     {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
                     {% if item.is_disabled %}

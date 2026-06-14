@@ -217,9 +217,9 @@
           <h3 class="form-section-title">风控参数</h3>
           <div class="form-grid">
             <div class="field">
-              <label for="spread_x">点差系数</label>
-              <div class="field-help">预留参数，当前仅用于后台配置展示。</div>
-              <input id="spread_x" type="number" min="0" max="50" step="0.1" name="spread_x" value="{{ form.spread_x or '0.0' }}" />
+              <label for="spread_x">固定点差加点（U）</label>
+              <div class="field-help">范围 0~100，最小 0.01；按对用户不利方向叠加到合约买卖价。</div>
+              <input id="spread_x" type="number" min="0" max="100" step="0.01" name="spread_x" value="{{ form.spread_x or '0.0' }}" />
             </div>
             <div class="field">
               <label for="liquidation_threshold">强平阈值</label>

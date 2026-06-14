@@ -3,7 +3,7 @@
 {% block title %}归集候选工作台{% endblock %}
 {% block page_title %}归集候选工作台{% endblock %}
 {% block page_subtitle %}
-  <div class="page-subtitle">候选地址是待归集地址池。运营核实余额后可直接执行归集，此页面为归集工作台主入口。</div>
+  <div class="page-subtitle">候选地址来自充值监听或手工添加，金额来自最近一次监听或链上复核；提交归集前系统会再次校验，避免重复或超额归集。</div>
 {% endblock %}
 
 {% block content %}
@@ -42,14 +42,33 @@
     .collection-result-panel{border:1px solid rgba(255,255,255,.14);border-radius:8px;background:rgba(255,255,255,.045);padding:12px;margin:0 0 12px}
     .collection-result-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
     .collection-result-title{font-size:15px;font-weight:900}
-    .collection-result-summary{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:8px;margin-bottom:10px}
+    .collection-result-status{display:flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:8px;padding:9px 10px;margin-bottom:10px;font-size:13px;font-weight:900}
+    .collection-result-status.is-info{color:#bfdbfe;background:rgba(59,130,246,.12);border-color:rgba(96,165,250,.32)}
+    .collection-result-status.is-success{color:#bbf7d0;background:rgba(34,197,94,.12);border-color:rgba(74,222,128,.32)}
+    .collection-result-status.is-warning{color:#fde68a;background:rgba(245,158,11,.12);border-color:rgba(251,191,36,.32)}
+    .collection-result-status.is-danger{color:#fecaca;background:rgba(239,68,68,.12);border-color:rgba(248,113,113,.32)}
+    .collection-result-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px}
     .collection-result-summary-item{border:1px solid var(--border);border-radius:8px;padding:9px 10px;background:rgba(0,0,0,.16)}
+    .collection-result-summary-item.is-info{border-color:rgba(96,165,250,.28);background:rgba(59,130,246,.1)}
+    .collection-result-summary-item.is-success{border-color:rgba(74,222,128,.32);background:rgba(34,197,94,.1)}
+    .collection-result-summary-item.is-warning{border-color:rgba(251,191,36,.34);background:rgba(245,158,11,.11)}
+    .collection-result-summary-item.is-danger{border-color:rgba(248,113,113,.34);background:rgba(239,68,68,.11)}
+    .collection-result-summary-item.is-muted{opacity:.66;background:rgba(255,255,255,.025)}
     .collection-result-summary-label{color:var(--muted);font-size:11px;font-weight:900}
     .collection-result-summary-value{font-size:18px;font-weight:900;margin-top:4px;font-variant-numeric:tabular-nums}
+    .collection-result-action{display:inline-flex;align-items:center;max-width:118px;border:1px solid var(--border);border-radius:999px;padding:3px 7px;font-size:11px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .collection-result-action.is-success{color:#bbf7d0;background:rgba(34,197,94,.12);border-color:rgba(74,222,128,.32)}
+    .collection-result-action.is-warning{color:#fde68a;background:rgba(245,158,11,.12);border-color:rgba(251,191,36,.34)}
+    .collection-result-action.is-danger{color:#fecaca;background:rgba(239,68,68,.12);border-color:rgba(248,113,113,.34)}
+    .collection-result-action.is-neutral{color:#cbd5e1;background:rgba(148,163,184,.1);border-color:rgba(148,163,184,.24)}
     .collection-result-table{width:100%;border-collapse:collapse;table-layout:fixed;margin-top:8px}
     .collection-result-table th,.collection-result-table td{padding:8px 7px;border-bottom:1px solid var(--border);text-align:left;font-size:12px;overflow:hidden;text-overflow:ellipsis}
     .collection-result-table th{color:var(--muted);font-weight:900;white-space:nowrap}
     .collection-result-table td{vertical-align:top}
+    .collection-result-table-wrap{max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:8px;margin-top:8px}
+    .collection-result-table thead th{position:sticky;top:0;z-index:1;background:#14151b}
+    .collection-result-link{color:#93c5fd;font-weight:800;text-decoration:none}
+    .collection-result-link:hover{text-decoration:underline}
     .collection-result-detail{margin-top:10px}
     .collection-result-detail summary{cursor:pointer;color:var(--muted);font-size:12px;font-weight:900}
     .collection-result-detail pre{max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:rgba(0,0,0,.28);padding:10px;white-space:pre-wrap;word-break:break-word;font-size:12px}
@@ -65,14 +84,22 @@
     .collection-stat-value{font-size:24px;font-weight:900;margin-top:8px}
     .collection-network-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
     .collection-network-card{display:block;padding:14px;color:var(--text);text-decoration:none}
+    .collection-network-card.has-collectible{border-color:rgba(74,222,128,.28);background:linear-gradient(145deg,rgba(34,197,94,.09),rgba(255,255,255,.025))}
+    .collection-network-card.is-quiet{opacity:.72}
     .collection-network-card:hover{border-color:rgba(255,96,56,.75);background:rgba(255,96,56,.08)}
     .collection-network-card.is-active{border-color:#ff6038;background:rgba(255,96,56,.12)}
     .collection-network-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:12px}
     .collection-network-title{font-weight:900}
     .collection-network-key{color:var(--muted);font-size:12px;margin-top:3px}
+    .collection-network-state{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:999px;padding:3px 7px;font-size:11px;font-weight:900;white-space:nowrap}
+    .collection-network-state.is-success{color:#bbf7d0;background:rgba(34,197,94,.12);border-color:rgba(74,222,128,.32)}
+    .collection-network-state.is-warning{color:#fde68a;background:rgba(245,158,11,.12);border-color:rgba(251,191,36,.32)}
+    .collection-network-state.is-muted{color:#cbd5e1;background:rgba(148,163,184,.08);border-color:rgba(148,163,184,.22)}
     .collection-network-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
     .collection-network-label{color:var(--muted);font-size:11px;font-weight:800;white-space:nowrap}
     .collection-network-value{font-weight:900;margin-top:4px;font-variant-numeric:tabular-nums}
+    .collection-network-value.is-collectible{color:#86efac}
+    .collection-network-card.is-quiet .collection-network-value.is-collectible{color:#94a3b8}
     .collection-filter-grid{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:10px;align-items:end}
     .collection-filter-grid label{display:block;color:var(--muted);font-size:12px;font-weight:800;margin-bottom:6px}
     .collection-filter-grid input,.collection-filter-grid select{width:100%;min-height:38px}
@@ -86,6 +113,8 @@
     .collection-address-copy:hover{color:#ff6038}
     .collection-address{display:inline-block;max-width:118px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
     .collection-amount{font-variant-numeric:tabular-nums;white-space:nowrap}
+    .collection-amount.is-positive{color:#86efac;font-weight:900}
+    .collection-amount.is-muted{color:#94a3b8}
     .collection-table th:nth-child(1),.collection-table td:nth-child(1){width:11%}
     .collection-table th:nth-child(2),.collection-table td:nth-child(2){width:9%;white-space:nowrap}
     .collection-table th:nth-child(3),.collection-table td:nth-child(3){width:8%}
@@ -118,52 +147,38 @@
   {% if notice_detail %}
     <div class="collection-result-panel">
       <div class="collection-result-head">
-        <div class="collection-result-title">创建结果</div>
+        <div>
+          <div class="collection-result-title">创建结果</div>
+          <div class="collection-meta">复用任务可能位于历史批次，可点击创建详情中的批次入口查看。</div>
+        </div>
+        <button type="button" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" data-initial-result-open>查看创建详情</button>
+      </div>
+      <div class="collection-result-status is-{{ notice_detail.result_status_tone or 'info' }}">
+        {{ notice_detail.result_status_label or '创建检查完成' }}
       </div>
       <div class="collection-result-summary">
-        <div class="collection-result-summary-item">
-          <div class="collection-result-summary-label">创建任务数</div>
+        <div class="collection-result-summary-item is-info">
+          <div class="collection-result-summary-label">扫描候选数</div>
+          <div class="collection-result-summary-value">{{ notice_detail.candidate_count or 0 }}</div>
+        </div>
+        <div class="collection-result-summary-item {% if notice_detail.created_count and notice_detail.created_count > 0 %}is-success{% else %}is-muted{% endif %}">
+          <div class="collection-result-summary-label">新建任务数</div>
           <div class="collection-result-summary-value">{{ notice_detail.created_count or 0 }}</div>
         </div>
-        <div class="collection-result-summary-item">
+        <div class="collection-result-summary-item {% if notice_detail.skipped_count and notice_detail.skipped_count > 0 %}is-muted{% else %}is-muted{% endif %}">
           <div class="collection-result-summary-label">跳过数量</div>
           <div class="collection-result-summary-value">{{ notice_detail.skipped_count or 0 }}</div>
         </div>
-        <div class="collection-result-summary-item">
+        <div class="collection-result-summary-item {% if notice_detail.reused_count and notice_detail.reused_count > 0 %}is-warning{% else %}is-muted{% endif %}">
+          <div class="collection-result-summary-label">已存在/复用</div>
+          <div class="collection-result-summary-value">{{ notice_detail.reused_count or 0 }}</div>
+        </div>
+        <div class="collection-result-summary-item {% if notice_detail.enqueue_error_count and notice_detail.enqueue_error_count > 0 %}is-danger{% else %}is-muted{% endif %}">
           <div class="collection-result-summary-label">入队异常数量</div>
           <div class="collection-result-summary-value">{{ notice_detail.enqueue_error_count or 0 }}</div>
         </div>
       </div>
-      {% if notice_detail.skipped_items %}
-        <table class="collection-result-table">
-          <thead>
-            <tr>
-              <th>网络</th>
-              <th>币种</th>
-              <th>地址</th>
-              <th>链上核实余额</th>
-              <th>最小归集额</th>
-              <th>跳过原因</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for item in notice_detail.skipped_items %}
-              <tr>
-                <td class="collection-mono">{{ item.chain_key or "-" }}</td>
-                <td class="collection-mono">{{ item.coin_symbol or "-" }}</td>
-                <td class="collection-mono" title="{{ item.address or '' }}">{{ item.address_short or "-" }}</td>
-                <td class="collection-mono">{{ item.verified_onchain_amount or "-" }}</td>
-                <td class="collection-mono">{{ item.min_collect_amount or "-" }}</td>
-                <td>{{ item.skip_reason_label or "未满足归集条件" }}</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      {% endif %}
-      <details class="collection-result-detail">
-        <summary>技术详情</summary>
-        <pre>{{ notice_detail.technical_detail|default({})|tojson }}</pre>
-      </details>
+      <script type="application/json" id="collection-initial-result-data">{{ notice_detail|tojson }}</script>
     </div>
   {% endif %}
   {% if error %}
@@ -176,8 +191,8 @@
       <div class="collection-panel-head">
         <div>
           <div class="collection-title">归集候选工作台</div>
-          <div class="collection-meta">候选地址是待归集地址池，运营核实余额后可直接执行归集。</div>
-          <div class="collection-meta">候选金额未复核时显示候选累计；已复核后显示链上真实余额，并扣减已成功归集金额。</div>
+          <div class="collection-meta">候选地址来自充值监听或手工添加，金额来自最近一次监听或链上复核；提交归集前系统会再次校验，避免重复或超额归集。</div>
+          <div class="collection-meta">为避免大量地址实时查链，列表不在每次打开时全量请求链上余额。</div>
         </div>
         <div class="collection-nav">
           <a class="btn secondary admin-btn admin-btn-secondary" href="/admin/collections/tools">高级工具</a>
@@ -212,7 +227,9 @@
       {% if network_cards %}
         <div class="collection-network-grid">
           {% for card in network_cards %}
-            <a class="collection-network-card {% if filters.chain_key == card.chain_key %}is-active{% endif %}" href="/admin/collections/center?chain_key={{ card.chain_key }}">
+            {% set collectible_count = card.collectible_count or 0 %}
+            {% set pending_count = card.pending_verify_count or 0 %}
+            <a class="collection-network-card {% if filters.chain_key == card.chain_key %}is-active{% endif %} {% if collectible_count > 0 %}has-collectible{% else %}is-quiet{% endif %}" href="/admin/collections/center?chain_key={{ card.chain_key }}">
               <div class="collection-network-head">
                 <div>
                   <div class="collection-network-title">{{ card.chain_name or card.chain_key }}</div>
@@ -221,9 +238,18 @@
                     <div class="collection-network-key">归集关闭</div>
                   {% endif %}
                 </div>
-                {% if filters.chain_key == card.chain_key %}
-                  <span class="badge info">当前</span>
-                {% endif %}
+                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
+                  {% if collectible_count > 0 %}
+                    <span class="collection-network-state is-success">可创建</span>
+                  {% elif pending_count > 0 %}
+                    <span class="collection-network-state is-warning">需处理</span>
+                  {% else %}
+                    <span class="collection-network-state is-muted">无可归集</span>
+                  {% endif %}
+                  {% if filters.chain_key == card.chain_key %}
+                    <span class="badge info">当前</span>
+                  {% endif %}
+                </div>
               </div>
               <div class="collection-network-metrics">
                 <div>
@@ -236,7 +262,7 @@
                 </div>
                 <div>
                   <div class="collection-network-label">可归集</div>
-                  <div class="collection-network-value">{{ card.collectible_count or 0 }}</div>
+                  <div class="collection-network-value is-collectible">{{ collectible_count }}</div>
                 </div>
               </div>
             </a>
@@ -318,8 +344,8 @@
         </form>
       </div>
       <div class="collection-current-stats collection-stats">
-        <div class="collection-stat-card {% if not stats.candidate_amount_detail_items %}is-empty{% endif %}" data-amount-card data-amount-title="候选金额合计明细" data-amount-items='{{ stats.candidate_amount_detail_items|default([])|tojson }}'>
-          <div class="collection-stat-label">候选金额合计</div>
+        <div class="collection-stat-card {% if not stats.candidate_amount_detail_items %}is-empty{% endif %}" data-amount-card data-amount-title="可归集金额合计明细" title="为避免大量地址实时查链，列表不在每次打开时全量请求链上余额。" data-amount-items='{{ stats.candidate_amount_detail_items|default([])|tojson }}'>
+          <div class="collection-stat-label">可归集金额合计</div>
           <div class="collection-stat-value">{{ stats.candidate_amount_total_label or '-' }}</div>
         </div>
         <div class="collection-stat-card">
@@ -370,7 +396,7 @@
                 <th>用户ID</th>
                 <th>网络</th>
                 <th>币种</th>
-                <th>候选金额</th>
+                <th title="为避免大量地址实时查链，列表显示最近一次核实的链上余额。">可归集金额</th>
                 <th>最近复核时间</th>
                 <th>复核状态</th>
                 <th>归集状态</th>
@@ -389,7 +415,9 @@
                   <td class="collection-mono" title="{{ item.user_id }}">{{ item.user_id }}</td>
                   <td title="{{ item.chain_name or item.chain_key }}">{{ item.chain_name or item.chain_key }}</td>
                   <td>{{ item.asset_symbol }}</td>
-                  <td class="collection-amount" data-field="candidate-amount" title="{{ item.candidate_amount_label }}">{{ item.candidate_amount_label }}</td>
+                  <td class="collection-amount {% if item.can_create_collection_task %}is-positive{% else %}is-muted{% endif %}" data-field="candidate-amount" title="{{ item.candidate_amount_label }}">
+                    <span data-amount-label>{{ item.candidate_amount_label }}</span>
+                  </td>
                   <td data-field="last-scan-at" title="{{ item.verify_button_title or item.verified_at }}">{{ item.verified_at }}</td>
                   <td data-field="verify-status">
                     {% if item.verify_running %}
@@ -534,12 +562,26 @@
         row.appendChild(cell);
         return cell;
       }
+      function appendLinkCell(row, label, href) {
+        const cell = document.createElement("td");
+        if (href) {
+          const link = document.createElement("a");
+          link.className = "collection-result-link";
+          link.href = href;
+          link.textContent = label || "查看批次";
+          cell.appendChild(link);
+        } else {
+          cell.textContent = "-";
+        }
+        row.appendChild(cell);
+        return cell;
+      }
       function resultCount(data, key) {
         return Number(data && data[key] ? data[key] : 0) || 0;
       }
-      function appendResultSummary(container, label, value) {
+      function appendResultSummary(container, label, value, tone) {
         const item = document.createElement("div");
-        item.className = "collection-result-summary-item";
+        item.className = "collection-result-summary-item" + (tone ? " is-" + tone : "");
         const labelNode = document.createElement("div");
         labelNode.className = "collection-result-summary-label";
         labelNode.textContent = label;
@@ -550,22 +592,51 @@
         item.appendChild(valueNode);
         container.appendChild(item);
       }
+      function appendActionCell(row, item) {
+        const cell = document.createElement("td");
+        const badge = document.createElement("span");
+        const tone = item.action_tone || "neutral";
+        badge.className = "collection-result-action is-" + tone;
+        badge.textContent = item.action_label || item.skip_reason_label || item.action || "已处理";
+        if (item.skip_reason) badge.title = item.skip_reason;
+        cell.appendChild(badge);
+        row.appendChild(cell);
+        return cell;
+      }
       function renderResultDetail(data) {
         const wrapper = document.createElement("div");
+        const status = document.createElement("div");
+        status.className = "collection-result-status is-" + (data.result_status_tone || "info");
+        status.textContent = data.result_status_label || "创建检查完成";
+        wrapper.appendChild(status);
         const summary = document.createElement("div");
         summary.className = "collection-result-summary";
-        appendResultSummary(summary, "创建任务数", resultCount(data, "created_task_count") || resultCount(data, "created_count"));
-        appendResultSummary(summary, "跳过数量", resultCount(data, "skipped_count"));
-        appendResultSummary(summary, "入队异常数量", resultCount(data, "enqueue_error_count") || resultCount(data.diagnostics || {}, "enqueue_error_count"));
+        const created = resultCount(data, "created_task_count") || resultCount(data, "created_count");
+        const skipped = resultCount(data, "skipped_count");
+        const reused = resultCount(data, "reused_count") || resultCount(data, "reused_existing_count") || resultCount(data, "duplicate_active_count");
+        const errors = resultCount(data, "enqueue_error_count") || resultCount(data.diagnostics || {}, "enqueue_error_count");
+        appendResultSummary(summary, "扫描候选数", resultCount(data, "candidate_count"), "info");
+        appendResultSummary(summary, "新建任务数", created, created > 0 ? "success" : "muted");
+        appendResultSummary(summary, "跳过数量", skipped, "muted");
+        appendResultSummary(summary, "已存在/复用", reused, reused > 0 ? "warning" : "muted");
+        appendResultSummary(summary, "入队异常数量", errors, errors > 0 ? "danger" : "muted");
         wrapper.appendChild(summary);
 
-        const skippedItems = Array.isArray(data.skipped_items) ? data.skipped_items : [];
+        const skippedItems = Array.isArray(data.skipped_items) ? data.skipped_items.slice() : [];
         if (skippedItems.length) {
+          skippedItems.sort((a, b) => {
+            const aSort = Number(a.action_sort || 99);
+            const bSort = Number(b.action_sort || 99);
+            if (aSort !== bSort) return aSort - bSort;
+            return String(a.chain_key || "").localeCompare(String(b.chain_key || ""));
+          });
+          const tableWrap = document.createElement("div");
+          tableWrap.className = "collection-result-table-wrap";
           const table = document.createElement("table");
           table.className = "collection-result-table";
           const thead = document.createElement("thead");
           const headRow = document.createElement("tr");
-          ["网络", "币种", "地址", "链上核实余额", "最小归集额", "跳过原因"].forEach((label) => {
+          ["网络", "币种", "地址", "链上余额", "处理结果", "任务ID", "批次ID", "批次号", "操作"].forEach((label) => {
             const th = document.createElement("th");
             th.textContent = label;
             headRow.appendChild(th);
@@ -579,12 +650,16 @@
             appendTextCell(row, item.coin_symbol, "collection-mono");
             appendTextCell(row, item.address_short || item.address, "collection-mono", item.address || "");
             appendTextCell(row, item.verified_onchain_amount, "collection-mono");
-            appendTextCell(row, item.min_collect_amount, "collection-mono");
-            appendTextCell(row, item.skip_reason_label || "未满足归集条件", "");
+            appendActionCell(row, item);
+            appendLinkCell(row, item.task_id ? "#" + item.task_id : "", item.detail_url || "");
+            appendLinkCell(row, item.batch_id ? "#" + item.batch_id : "", item.detail_url || "");
+            appendTextCell(row, item.batch_no, "collection-mono", item.batch_no || "");
+            appendLinkCell(row, item.detail_url ? "查看批次" : "", item.detail_url || "");
             tbody.appendChild(row);
           });
           table.appendChild(tbody);
-          wrapper.appendChild(table);
+          tableWrap.appendChild(table);
+          wrapper.appendChild(tableWrap);
         }
 
         const details = document.createElement("details");
@@ -673,6 +748,20 @@
       document.querySelectorAll("[data-result-modal-close]").forEach((button) => {
         button.addEventListener("click", closeResultModal);
       });
+      document.querySelectorAll("[data-initial-result-open]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const node = document.getElementById("collection-initial-result-data");
+          let data = {};
+          if (node) {
+            try {
+              data = JSON.parse(node.textContent || "{}");
+            } catch (error) {
+              data = {};
+            }
+          }
+          openResultModal(data);
+        });
+      });
       if (amountModal) {
         amountModal.addEventListener("click", (event) => {
           if (event.target === amountModal) closeAmountModal();
@@ -759,6 +848,18 @@
         badge.textContent = text || "";
         badge.title = title || "";
       }
+      function setCollectBadge(row, text, tone, title) {
+        const cell = row && row.querySelector('[data-field="collect-status"]');
+        if (!cell) return;
+        let badge = cell.querySelector(".badge");
+        if (!badge) {
+          badge = document.createElement("span");
+          cell.appendChild(badge);
+        }
+        badge.className = "badge " + (tone || "neutral");
+        badge.textContent = text || "";
+        badge.title = title || "";
+      }
       function markVerifyRunning(row) {
         setVerifyBadge(row, "复核中", "warning", "链上核实正在处理");
         setActionButton(row, "verify", "复核中", true, "链上核实正在处理");
@@ -766,13 +867,37 @@
       function markVerifyCompleted(row, event) {
         const balanceCell = row.querySelector('[data-field="candidate-amount"]');
         const scanAtCell = row.querySelector('[data-field="last-scan-at"]');
+        const amountLabel = balanceCell && balanceCell.querySelector("[data-amount-label]");
+        const amountVerifiedAt = balanceCell && balanceCell.querySelector("[data-amount-verified-at]");
         if (balanceCell && event.last_balance_amount_display) {
-          balanceCell.textContent = event.last_balance_amount_display;
+          if (amountLabel) {
+            amountLabel.textContent = event.last_balance_amount_display;
+          } else {
+            balanceCell.textContent = event.last_balance_amount_display;
+          }
           balanceCell.title = event.last_balance_amount_display;
+          if (event.can_create_collection_task === false || event.collection_status_badge === "neutral") {
+            balanceCell.classList.remove("is-positive");
+            balanceCell.classList.add("is-muted");
+          } else if (event.can_create_collection_task === true) {
+            balanceCell.classList.add("is-positive");
+            balanceCell.classList.remove("is-muted");
+          }
+        }
+        if (amountVerifiedAt && event.last_scan_at_display) {
+          amountVerifiedAt.textContent = "核实 " + event.last_scan_at_display;
         }
         if (scanAtCell && event.last_scan_at_display) {
           scanAtCell.textContent = event.last_scan_at_display;
           scanAtCell.title = "最近复核：" + event.last_scan_at_display;
+        }
+        if (event.collection_status_label) {
+          setCollectBadge(row, event.collection_status_label, event.collection_status_badge || "neutral", event.message || "");
+        }
+        if (event.can_create_collection_task === false) {
+          setActionButton(row, "collect", "归集", true, event.message || "暂无可归集余额");
+        } else if (event.can_create_collection_task === true) {
+          setActionButton(row, "collect", "归集", false, event.message || "可创建归集任务");
         }
         setVerifyBadge(row, "已复核 ✓", "success", event.message || "已复核");
         setActionButton(row, "verify", "复核", false, event.message || "已复核");

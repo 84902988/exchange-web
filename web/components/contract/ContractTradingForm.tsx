@@ -265,6 +265,7 @@ export default function ContractTradingForm({
   const quoteAskPrice = toNumber(quote?.ask_price);
   const quoteMarkPrice = toNumber(quote?.mark_price);
   const quoteLastPrice = toNumber(quote?.last_price);
+  const quoteSpreadX = toNumber(quote?.spread_x);
   const quoteAnchorPrice = quoteBidPrice > 0 && quoteAskPrice > 0
     ? (quoteBidPrice + quoteAskPrice) / 2
     : quoteMarkPrice || quoteLastPrice;
@@ -293,14 +294,14 @@ export default function ContractTradingForm({
   const shortMargin = shortNotional !== null && leverage > 0 ? shortNotional / leverage : null;
 
   const spreadCostHint = useMemo(() => {
-    if (!bidReferencePrice || !askReferencePrice || quantityNumber <= 0) return null;
-    return Math.abs(askReferencePrice - bidReferencePrice) * quantityNumber;
-  }, [askReferencePrice, bidReferencePrice, quantityNumber]);
+    if (quoteSpreadX <= 0 || quantityNumber <= 0) return null;
+    return quoteSpreadX * quantityNumber;
+  }, [quantityNumber, quoteSpreadX]);
 
   const closeSpreadCostHint = useMemo(() => {
-    if (!bidReferencePrice || !askReferencePrice || closeQuantityNumber <= 0) return null;
-    return Math.abs(askReferencePrice - bidReferencePrice) * closeQuantityNumber;
-  }, [askReferencePrice, bidReferencePrice, closeQuantityNumber]);
+    if (quoteSpreadX <= 0 || closeQuantityNumber <= 0) return null;
+    return quoteSpreadX * closeQuantityNumber;
+  }, [closeQuantityNumber, quoteSpreadX]);
 
   const limitPriceNumber = toNumber(price);
   const estimatedExecutionPrice = useMemo(() => {

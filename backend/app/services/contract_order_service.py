@@ -107,10 +107,17 @@ def _fmt_decimal(value: Any) -> str:
     return format(_q18(value), "f")
 
 
-def _contract_spread_fee(*, bid_price: Decimal, ask_price: Decimal, quantity: Decimal) -> Decimal:
-    if bid_price <= Decimal("0") or ask_price <= Decimal("0") or quantity <= Decimal("0"):
+def _quote_spread_x(quote: dict[str, Any], fallback: Any = None) -> Decimal:
+    spread_x = _q18(quote.get("spread_x", fallback))
+    if spread_x < Decimal("0"):
         return Decimal("0")
-    return _q18(abs(ask_price - bid_price) * quantity)
+    return spread_x
+
+
+def _contract_spread_fee(*, spread_x: Decimal, quantity: Decimal) -> Decimal:
+    if spread_x <= Decimal("0") or quantity <= Decimal("0"):
+        return Decimal("0")
+    return _q18(spread_x * quantity)
 
 
 def _normalize_symbol(value: str) -> str:
@@ -407,8 +414,8 @@ def create_contract_open_order(
         stop_loss_price=stop_loss_price,
     )
 
-    spread_x_snapshot = _q18(contract_symbol.spread_x)
-    fee_amount = _contract_spread_fee(bid_price=bid_price, ask_price=ask_price, quantity=quantity)
+    spread_x_snapshot = _quote_spread_x(quote, contract_symbol.spread_x)
+    fee_amount = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=quantity)
     margin_amount = quantity * entry_price / Decimal(leverage)
     total_cost = margin_amount
 
@@ -865,6 +872,7 @@ def _fresh_depth_quote_for_limit_scan(
         "ask_price": ask_price,
         "last_price": mark_price,
         "mark_price": mark_price,
+        "spread_x": _q18(depth.get("spread_x")),
         "source": depth.get("source") or "FRESH_DEPTH",
         "depth_source": depth.get("source") or "LIVE",
         "quote_freshness": depth.get("quote_freshness"),
@@ -965,7 +973,8 @@ def _fill_open_order_locked(
         raise ContractOrderBadRequest("INVALID_ORDER_QUANTITY_OR_LEVERAGE")
 
     fill_price = _limit_fill_price(action="OPEN", position_side=position_side, bid_price=bid_price, ask_price=ask_price)
-    actual_fee_amount = _contract_spread_fee(bid_price=bid_price, ask_price=ask_price, quantity=quantity)
+    spread_x_snapshot = _quote_spread_x(quote, order.spread_x_snapshot)
+    actual_fee_amount = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=quantity)
     actual_margin_amount = quantity * fill_price / Decimal(leverage)
 
     old_frozen_total = _q18(order.margin_amount)
@@ -992,6 +1001,7 @@ def _fill_open_order_locked(
 
     order.margin_amount = actual_margin_amount
     order.fee_amount = actual_fee_amount
+    order.spread_x_snapshot = spread_x_snapshot
     order.spread_fee = actual_fee_amount
     order.filled_quantity = quantity
     order.avg_price = fill_price
@@ -1162,7 +1172,8 @@ def _fill_close_order_locked(
         raise ContractOrderBadRequest("CLOSE_QUANTITY_EXCEEDS_POSITION")
 
     close_price = _limit_fill_price(action="CLOSE", position_side=position_side, bid_price=bid_price, ask_price=ask_price)
-    close_spread_fee = _contract_spread_fee(bid_price=bid_price, ask_price=ask_price, quantity=close_quantity)
+    spread_x_snapshot = _quote_spread_x(quote, order.spread_x_snapshot)
+    close_spread_fee = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=close_quantity)
     entry_price = _q18(position.entry_price)
     old_margin_amount = _q18(position.margin_amount)
     release_margin = old_margin_amount * close_quantity / position_quantity
@@ -1228,6 +1239,7 @@ def _fill_close_order_locked(
     order.avg_price = close_price
     order.margin_amount = release_margin
     order.fee_amount = close_spread_fee
+    order.spread_x_snapshot = spread_x_snapshot
     order.spread_fee = close_spread_fee
     order.status = "FILLED"
     order.fail_reason = close_reason
@@ -1445,7 +1457,7 @@ def close_contract_position(
         leverage=int(position.leverage),
         margin_amount=release_margin,
         fee_amount=Decimal("0"),
-        spread_x_snapshot=_q18(contract_symbol.spread_x),
+        spread_x_snapshot=_quote_spread_x(quote, contract_symbol.spread_x),
         spread_fee=Decimal("0"),
         trigger_price=None,
         take_profit_price=None,

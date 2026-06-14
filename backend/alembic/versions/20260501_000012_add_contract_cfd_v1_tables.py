@@ -64,7 +64,7 @@ def upgrade() -> None:
                 server_default=sa.text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
             ),
             sa.UniqueConstraint("symbol", name="uk_contract_symbols_symbol"),
-            sa.CheckConstraint("spread_x >= 0 AND spread_x <= 50", name="ck_contract_symbols_spread_x_range"),
+            sa.CheckConstraint("spread_x >= 0 AND spread_x <= 100", name="ck_contract_symbols_spread_x_range"),
             sa.CheckConstraint("max_leverage >= 1 AND max_leverage <= 200", name="ck_contract_symbols_max_leverage_range"),
             sa.CheckConstraint("status IN (0, 1)", name="ck_contract_symbols_status"),
         )

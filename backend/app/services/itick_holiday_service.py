@@ -137,6 +137,16 @@ class ItickHolidayService:
         current = self._now_in_timezone(runtime_timezone, now)
         today = current.date().isoformat()
 
+        if current.weekday() >= 5:
+            return ItickMarketStatus(
+                market_status=MARKET_STATUS_CLOSED,
+                market_status_text=MARKET_STATUS_TEXT_CLOSED,
+                market_session_code=normalized_code,
+                market_timezone=timezone_name,
+                market_trading_hours=trading_hours,
+                market_session_type="CLOSED",
+            )
+
         if rows and any(self._date_matches(item.get("d"), today) for item in rows):
             return ItickMarketStatus(
                 market_status=MARKET_STATUS_CLOSED,
