@@ -61,6 +61,7 @@ from app.services.hot_wallet_key_service import (
 DRY_RUN_PRIVATE_KEY_PLACEHOLDER = "0x" + "11" * 32
 COLLECTION_CENTER_SCAN_JOB_TIMEOUT_SECONDS = 10 * 60
 logger = logging.getLogger(__name__)
+TX_CONFIRM_RETRY_MAX_ATTEMPTS = 12
 
 
 def _collection_candidate_amount_label(value: Any, symbol: str) -> str:
@@ -531,21 +532,43 @@ def _enqueue_unique_task_job(queue_name: str, func: object, task_id: int, job_id
 
 
 def enqueue_tx_confirm_collection_task(task_id: int) -> str:
-    job = enqueue_job(
+    job = _enqueue_unique_task_job(
         QUEUE_TX_CONFIRM,
         process_tx_confirm_collection_task,
         int(task_id),
-        job_id=f"tx_confirm_collection_{int(task_id)}",
+        f"tx_confirm_collection_{int(task_id)}",
     )
     return str(job.id)
 
 
 def enqueue_tx_confirm_gas_task(task_id: int) -> str:
-    job = enqueue_job(
+    job = _enqueue_unique_task_job(
         QUEUE_TX_CONFIRM,
         process_tx_confirm_gas_task,
         int(task_id),
-        job_id=f"tx_confirm_gas_{int(task_id)}",
+        f"tx_confirm_gas_{int(task_id)}",
+    )
+    return str(job.id)
+
+
+def _enqueue_tx_confirm_collection_retry_task(task_id: int, confirm_attempt: int) -> str:
+    job = _enqueue_unique_task_job(
+        QUEUE_TX_CONFIRM,
+        process_tx_confirm_collection_task,
+        int(task_id),
+        f"tx_confirm_collection_{int(task_id)}_retry_{int(confirm_attempt)}",
+        confirm_attempt=int(confirm_attempt),
+    )
+    return str(job.id)
+
+
+def _enqueue_tx_confirm_gas_retry_task(task_id: int, confirm_attempt: int) -> str:
+    job = _enqueue_unique_task_job(
+        QUEUE_TX_CONFIRM,
+        process_tx_confirm_gas_task,
+        int(task_id),
+        f"tx_confirm_gas_{int(task_id)}_retry_{int(confirm_attempt)}",
+        confirm_attempt=int(confirm_attempt),
     )
     return str(job.id)
 
@@ -1168,11 +1191,21 @@ def _mark_gas_task_pending_send_reason(db: Session, task: GasTask, message: obje
     db.flush()
 
 
-def process_tx_confirm_collection_task(task_id: int) -> dict[str, object]:
+def _tx_confirm_retry_sleep(confirm_attempt: int) -> None:
+    if confirm_attempt <= 0:
+        return
+    time.sleep(min(5 * int(confirm_attempt), 30))
+
+
+def process_tx_confirm_collection_task(task_id: int, *, confirm_attempt: int = 0) -> dict[str, object]:
+    _tx_confirm_retry_sleep(int(confirm_attempt))
     db = SessionLocal()
+    retry_job_id = ""
     try:
         result = confirm_collection_task_tx(db, int(task_id))
         db.commit()
+        if result.status == "PENDING" and int(confirm_attempt) < TX_CONFIRM_RETRY_MAX_ATTEMPTS:
+            retry_job_id = _enqueue_tx_confirm_collection_retry_task(int(task_id), int(confirm_attempt) + 1)
         return {
             "ok": result.status in {"CONFIRMED", "PENDING", "SKIPPED"},
             "task_type": result.task_type,
@@ -1181,6 +1214,8 @@ def process_tx_confirm_collection_task(task_id: int) -> dict[str, object]:
             "status": result.status,
             "block_number": result.block_number,
             "error_message": result.error_message,
+            "confirm_attempt": int(confirm_attempt),
+            "retry_job_id": retry_job_id,
         }
     except Exception:
         db.rollback()
@@ -1190,17 +1225,20 @@ def process_tx_confirm_collection_task(task_id: int) -> dict[str, object]:
 
 
 REAL_GAS_CONFIRMED_STATUSES = {"CONFIRMED", "SUCCESS", "COMPLETED"}
+COLLECTION_GAS_WAITING_STATUSES = {
+    CollectionTaskStatus.GAS_REQUIRED.value,
+    CollectionTaskStatus.GAS_QUEUED.value,
+    "WAITING_GAS",
+    "WAIT_GAS",
+    "GAS_CONFIRMING",
+    "WAITING_GAS_CONFIRM",
+    "PENDING_GAS",
+}
 COLLECTION_CONTINUE_ALLOWED_STATUSES = {
     CollectionTaskStatus.PENDING.value,
     CollectionTaskStatus.QUEUED.value,
     CollectionTaskStatus.READY.value,
-    CollectionTaskStatus.FAILED.value,
-    CollectionTaskStatus.SKIPPED.value,
-    CollectionTaskStatus.GAS_REQUIRED.value,
-    CollectionTaskStatus.GAS_QUEUED.value,
-    "TIMEOUT",
-    "WAITING",
-    "WAITING_GAS",
+    *COLLECTION_GAS_WAITING_STATUSES,
 }
 COLLECTION_CONTINUE_BLOCKED_STATUSES = {
     CollectionTaskStatus.SENDING.value,
@@ -1236,8 +1274,12 @@ def _find_collection_task_for_gas_task(db: Session, gas_task: GasTask) -> Collec
             CollectionTaskStatus.GAS_QUEUED.value,
             CollectionTaskStatus.PENDING.value,
             CollectionTaskStatus.QUEUED.value,
-            CollectionTaskStatus.FAILED.value,
-            CollectionTaskStatus.SKIPPED.value,
+            CollectionTaskStatus.READY.value,
+            "WAITING_GAS",
+            "WAIT_GAS",
+            "GAS_CONFIRMING",
+            "WAITING_GAS_CONFIRM",
+            "PENDING_GAS",
         ]))
         .order_by(CollectionTask.updated_at.desc(), CollectionTask.id.desc())
         .all()
@@ -1268,7 +1310,7 @@ def _find_collection_task_for_gas_task(db: Session, gas_task: GasTask) -> Collec
 
 def _mark_collection_ready_for_gas_confirmed_continue(db: Session, task: CollectionTask) -> None:
     status_value = str(task.status or "").upper()
-    if status_value not in {CollectionTaskStatus.PENDING.value, CollectionTaskStatus.QUEUED.value, CollectionTaskStatus.FAILED.value}:
+    if status_value not in {CollectionTaskStatus.PENDING.value, CollectionTaskStatus.QUEUED.value, CollectionTaskStatus.READY.value}:
         task.status = CollectionTaskStatus.PENDING.value
     task.next_retry_at = None
     task.locked_at = None
@@ -1288,6 +1330,120 @@ def _record_collection_continue_failure(collection_task_id: int, message: str) -
         db.close()
 
 
+def enqueue_collection_after_real_gas_confirmed(
+    gas_task_id: int,
+    *,
+    dry_run: bool = False,
+    assume_gas_confirmed: bool = False,
+) -> dict[str, object]:
+    db = SessionLocal()
+    try:
+        gas_task = _get_gas_task(db, int(gas_task_id))
+        if not gas_task:
+            return {"continued": False, "reason": "GAS_TASK_NOT_FOUND"}
+        gas_tx_hash = str(gas_task.tx_hash or "").strip()
+        gas_status = str(gas_task.status or "").upper()
+        gas_real_confirmed = gas_status in REAL_GAS_CONFIRMED_STATUSES
+        if not gas_real_confirmed and not assume_gas_confirmed:
+            return {"continued": False, "reason": "GAS_TASK_NOT_REAL_CONFIRMED"}
+        if not gas_tx_hash or _is_dry_run_gas_hash(gas_tx_hash) or not gas_tx_hash.lower().startswith("0x"):
+            return {"continued": False, "reason": "GAS_TX_NOT_REAL"}
+
+        collection_task = _find_collection_task_for_gas_task(db, gas_task)
+        if not collection_task:
+            logger.info("gas confirmed collection enqueue skipped because linked collection task not found gas_task_id=%s", gas_task_id)
+            return {"continued": False, "reason": "COLLECTION_TASK_NOT_FOUND"}
+
+        task_id = int(collection_task.id)
+        collection_tx_hash = str(collection_task.tx_hash or "").strip()
+        if collection_tx_hash.lower().startswith("0x") and not _is_dry_run_gas_hash(collection_tx_hash):
+            logger.info(
+                "collection task enqueue skipped because already has tx_hash after gas confirmed task_id=%s gas_task_id=%s",
+                task_id,
+                gas_task_id,
+            )
+            return {"continued": False, "reason": "COLLECTION_ALREADY_HAS_TX_HASH", "collection_task_id": task_id}
+
+        status_value = str(collection_task.status or "").upper()
+        if status_value in COLLECTION_CONTINUE_BLOCKED_STATUSES:
+            logger.info(
+                "collection task enqueue skipped after gas confirmed because status is blocked task_id=%s gas_task_id=%s status=%s",
+                task_id,
+                gas_task_id,
+                status_value,
+            )
+            return {"continued": False, "reason": f"COLLECTION_STATUS_{status_value}", "collection_task_id": task_id}
+        if status_value not in COLLECTION_CONTINUE_ALLOWED_STATUSES:
+            logger.info(
+                "collection task enqueue skipped after gas confirmed because status is not retryable task_id=%s gas_task_id=%s status=%s",
+                task_id,
+                gas_task_id,
+                status_value,
+            )
+            return {"continued": False, "reason": f"COLLECTION_STATUS_{status_value}", "collection_task_id": task_id}
+
+        retry_count = int(collection_task.retry_count or 0)
+        max_retry = int(collection_task.max_retry or 0)
+        if retry_count >= max_retry:
+            logger.info(
+                "collection task enqueue skipped after gas confirmed because retry limit reached task_id=%s gas_task_id=%s retry_count=%s max_retry=%s",
+                task_id,
+                gas_task_id,
+                retry_count,
+                max_retry,
+            )
+            return {"continued": False, "reason": "COLLECTION_RETRY_LIMIT_REACHED", "collection_task_id": task_id}
+        if _collection_batch_canceled(db, collection_task.batch_id):
+            logger.info(
+                "collection task enqueue skipped after gas confirmed because batch canceled task_id=%s gas_task_id=%s batch_id=%s",
+                task_id,
+                gas_task_id,
+                collection_task.batch_id,
+            )
+            return {"continued": False, "reason": "COLLECTION_BATCH_CANCELED", "collection_task_id": task_id}
+        if is_collection_task_job_active(task_id):
+            logger.info(
+                "collection task enqueue skipped after gas confirmed because active job exists task_id=%s gas_task_id=%s",
+                task_id,
+                gas_task_id,
+            )
+            return {"continued": False, "reason": "COLLECTION_JOB_ACTIVE", "collection_task_id": task_id}
+
+        if dry_run:
+            return {
+                "continued": True,
+                "would_enqueue": True,
+                "collection_task_id": task_id,
+                "from_status": status_value,
+            }
+
+        _mark_collection_ready_for_gas_confirmed_continue(db, collection_task)
+        if str(collection_task.status or "").upper() != CollectionTaskStatus.QUEUED.value:
+            mark_collection_task_queued(db, task_id)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("collection enqueue after gas confirmed preflight failed gas_task_id=%s", gas_task_id, exc_info=True)
+        return {"continued": False, "reason": "COLLECTION_CONTINUE_PREFLIGHT_FAILED", "error": str(exc)[:180]}
+    finally:
+        db.close()
+
+    try:
+        job_id = enqueue_collection_task(task_id, allow_real_send=True)
+    except Exception as exc:
+        message = f"GAS_CONFIRMED_BUT_COLLECTION_ENQUEUE_FAILED:{type(exc).__name__}:{str(exc)[:180]}"
+        _record_collection_continue_failure(task_id, message)
+        logger.warning(
+            "collection enqueue after gas confirmed failed gas_task_id=%s collection_task_id=%s",
+            gas_task_id,
+            task_id,
+            exc_info=True,
+        )
+        return {"continued": False, "reason": "COLLECTION_ENQUEUE_EXCEPTION", "collection_task_id": task_id, "error": str(exc)[:180]}
+    logger.info("gas confirmed, enqueued collection task gas_task_id=%s collection_task_id=%s job_id=%s", gas_task_id, task_id, job_id)
+    return {"continued": True, "enqueued": True, "collection_task_id": task_id, "job_id": job_id}
+
+
 def _continue_collection_after_real_gas_confirmed(gas_task_id: int, confirm_result: Any) -> dict[str, object]:
     result_status = str(getattr(confirm_result, "status", "") or "").upper()
     result_tx_hash = str(getattr(confirm_result, "tx_hash", "") or "").strip()
@@ -1300,123 +1456,18 @@ def _continue_collection_after_real_gas_confirmed(gas_task_id: int, confirm_resu
             result_tx_hash,
         )
         return {"continued": False, "reason": "GAS_TX_NOT_REAL"}
+    return enqueue_collection_after_real_gas_confirmed(int(gas_task_id))
 
+
+def process_tx_confirm_gas_task(task_id: int, *, confirm_attempt: int = 0) -> dict[str, object]:
+    _tx_confirm_retry_sleep(int(confirm_attempt))
     db = SessionLocal()
-    try:
-        gas_task = _get_gas_task(db, int(gas_task_id))
-        if not gas_task:
-            return {"continued": False, "reason": "GAS_TASK_NOT_FOUND"}
-        gas_tx_hash = str(gas_task.tx_hash or "").strip()
-        gas_status = str(gas_task.status or "").upper()
-        if gas_status not in REAL_GAS_CONFIRMED_STATUSES or not gas_tx_hash or _is_dry_run_gas_hash(gas_tx_hash):
-            return {"continued": False, "reason": "GAS_TASK_NOT_REAL_CONFIRMED"}
-
-        collection_task = _find_collection_task_for_gas_task(db, gas_task)
-        if not collection_task:
-            logger.info("gas confirmed collection continue skipped because linked collection task not found gas_task_id=%s", gas_task_id)
-            return {"continued": False, "reason": "COLLECTION_TASK_NOT_FOUND"}
-
-        task_id = int(collection_task.id)
-        if collection_task.tx_hash:
-            logger.info(
-                "collection task skipped because already has tx_hash after gas confirmed task_id=%s gas_task_id=%s",
-                task_id,
-                gas_task_id,
-            )
-            return {"continued": False, "reason": "COLLECTION_ALREADY_HAS_TX_HASH", "collection_task_id": task_id}
-        status_value = str(collection_task.status or "").upper()
-        if status_value in COLLECTION_CONTINUE_BLOCKED_STATUSES:
-            logger.info(
-                "collection task skipped after gas confirmed because status is blocked task_id=%s gas_task_id=%s status=%s",
-                task_id,
-                gas_task_id,
-                status_value,
-            )
-            return {"continued": False, "reason": f"COLLECTION_STATUS_{status_value}", "collection_task_id": task_id}
-        if status_value not in COLLECTION_CONTINUE_ALLOWED_STATUSES:
-            logger.info(
-                "collection task skipped after gas confirmed because status is not retryable task_id=%s gas_task_id=%s status=%s",
-                task_id,
-                gas_task_id,
-                status_value,
-            )
-            return {"continued": False, "reason": f"COLLECTION_STATUS_{status_value}", "collection_task_id": task_id}
-        retry_count = int(collection_task.retry_count or 0)
-        max_retry = int(collection_task.max_retry or 0)
-        if retry_count >= max_retry:
-            logger.info(
-                "collection task skipped after gas confirmed because retry limit reached task_id=%s gas_task_id=%s retry_count=%s max_retry=%s",
-                task_id,
-                gas_task_id,
-                retry_count,
-                max_retry,
-            )
-            return {"continued": False, "reason": "COLLECTION_RETRY_LIMIT_REACHED", "collection_task_id": task_id}
-        if _collection_batch_canceled(db, collection_task.batch_id):
-            logger.info(
-                "collection task skipped after gas confirmed because batch canceled task_id=%s gas_task_id=%s batch_id=%s",
-                task_id,
-                gas_task_id,
-                collection_task.batch_id,
-            )
-            return {"continued": False, "reason": "COLLECTION_BATCH_CANCELED", "collection_task_id": task_id}
-        if is_collection_task_job_active(task_id):
-            logger.info(
-                "collection task skipped after gas confirmed because active job exists task_id=%s gas_task_id=%s",
-                task_id,
-                gas_task_id,
-            )
-            return {"continued": False, "reason": "COLLECTION_JOB_ACTIVE", "collection_task_id": task_id}
-
-        _mark_collection_ready_for_gas_confirmed_continue(db, collection_task)
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        logger.warning("collection continue after gas confirmed preflight failed gas_task_id=%s", gas_task_id, exc_info=True)
-        return {"continued": False, "reason": "COLLECTION_CONTINUE_PREFLIGHT_FAILED", "error": str(exc)[:180]}
-    finally:
-        db.close()
-
-    logger.info("gas confirmed, continue collection task gas_task_id=%s collection_task_id=%s", gas_task_id, task_id)
-    try:
-        collection_result = process_collection_task(task_id, allow_real_send=True)
-    except Exception as exc:
-        message = f"GAS_CONFIRMED_BUT_COLLECTION_RETRY_FAILED:{type(exc).__name__}:{str(exc)[:180]}"
-        _record_collection_continue_failure(task_id, message)
-        logger.warning(
-            "collection retry after gas confirmed failed gas_task_id=%s collection_task_id=%s",
-            gas_task_id,
-            task_id,
-            exc_info=True,
-        )
-        return {"continued": False, "reason": "COLLECTION_RETRY_EXCEPTION", "collection_task_id": task_id, "error": str(exc)[:180]}
-
-    collection_payload = collection_result or {}
-    collection_status = str(collection_payload.get("status") or "").upper()
-    if not (collection_payload.get("ok") and collection_status in {CollectionTaskStatus.SENT.value, CollectionTaskStatus.CONFIRMED.value}):
-        detail = collection_payload.get("error") or collection_payload.get("reason") or collection_payload
-        message = f"GAS_CONFIRMED_BUT_COLLECTION_RETRY_FAILED:{detail}"
-        _record_collection_continue_failure(task_id, message[:1000])
-        logger.warning(
-            "collection retry after gas confirmed returned incomplete gas_task_id=%s collection_task_id=%s result=%s",
-            gas_task_id,
-            task_id,
-            collection_result,
-        )
-        return {
-            "continued": False,
-            "reason": "COLLECTION_RETRY_INCOMPLETE",
-            "collection_task_id": task_id,
-            "result": collection_payload,
-        }
-    return {"continued": True, "collection_task_id": task_id, "result": collection_payload}
-
-
-def process_tx_confirm_gas_task(task_id: int) -> dict[str, object]:
-    db = SessionLocal()
+    retry_job_id = ""
     try:
         result = confirm_gas_task_tx(db, int(task_id))
         db.commit()
+        if result.status == "PENDING" and int(confirm_attempt) < TX_CONFIRM_RETRY_MAX_ATTEMPTS:
+            retry_job_id = _enqueue_tx_confirm_gas_retry_task(int(task_id), int(confirm_attempt) + 1)
         continue_result = _continue_collection_after_real_gas_confirmed(int(task_id), result)
         return {
             "ok": result.status in {"CONFIRMED", "PENDING", "SKIPPED"},
@@ -1426,6 +1477,8 @@ def process_tx_confirm_gas_task(task_id: int) -> dict[str, object]:
             "status": result.status,
             "block_number": result.block_number,
             "error_message": result.error_message,
+            "confirm_attempt": int(confirm_attempt),
+            "retry_job_id": retry_job_id,
             "collection_continue": continue_result,
         }
     except Exception:
@@ -1633,10 +1686,10 @@ def process_gas_task(task_id: int, *, allow_real_send: bool = False) -> dict[str
 
         if allow_real_send and not master_switch_enabled:
             message = "GUARD_REJECTED:MASTER_SWITCH_OFF"
-            _mark_gas_task_pending_send_reason(db, task, message)
+            mark_gas_task_failed(db, task.id, message, retryable=False)
             db.commit()
             _publish_gas_task_changed_now(db, task)
-            return {"ok": False, "status": GasTaskStatus.PENDING.value, "task_id": task_id, "error": message}
+            return {"ok": False, "status": GasTaskStatus.FAILED.value, "task_id": task_id, "error": message}
 
         if task.status != GasTaskStatus.QUEUED.value:
             mark_gas_task_queued(db, task.id)
@@ -1663,12 +1716,12 @@ def process_gas_task(task_id: int, *, allow_real_send: bool = False) -> dict[str
         )
         if not send_result.ok or not send_result.tx_hash:
             if allow_real_send and _is_guard_rejected_error(send_result.error_message):
-                _mark_gas_task_pending_send_reason(db, task, send_result.error_message or "GUARD_REJECTED")
+                mark_gas_task_failed(db, task.id, send_result.error_message or "GUARD_REJECTED", retryable=False)
                 db.commit()
                 _publish_gas_task_changed_now(db, task)
                 return {
                     "ok": False,
-                    "status": GasTaskStatus.PENDING.value,
+                    "status": GasTaskStatus.FAILED.value,
                     "task_id": task.id,
                     "error": send_result.error_message,
                 }

@@ -31,7 +31,7 @@ class ContractSymbol(Base):
     __tablename__ = "contract_symbols"
     __table_args__ = (
         UniqueConstraint("symbol", name="uk_contract_symbols_symbol"),
-        CheckConstraint("spread_x >= 0 AND spread_x <= 50", name="ck_contract_symbols_spread_x_range"),
+        CheckConstraint("spread_x >= 0 AND spread_x <= 100", name="ck_contract_symbols_spread_x_range"),
         CheckConstraint("max_leverage >= 1 AND max_leverage <= 200", name="ck_contract_symbols_max_leverage_range"),
         CheckConstraint("status IN (0, 1)", name="ck_contract_symbols_status"),
         CheckConstraint("tp_sl_trigger_price_type IN ('MARK_PRICE', 'LAST_PRICE')", name="ck_contract_symbols_tp_sl_trigger_price_type"),

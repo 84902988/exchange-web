@@ -20,10 +20,11 @@ from app.services.collection_chain_helper import CollectionEvaluationResult, eva
 from app.services.collection_candidate_registry import mark_collection_candidate_scanned
 from app.services.collection_service import (
     create_collection_batch,
-    create_collection_task,
+    create_collection_task_with_result,
     create_gas_task,
     find_active_collection_task_duplicate,
     find_active_gas_task_duplicate,
+    find_collection_task_by_idempotency,
 )
 
 
@@ -1358,6 +1359,28 @@ def scan_collection_candidates(
                         )
                         continue
 
+            existing_task = find_collection_task_by_idempotency(
+                db,
+                user_id=candidate.user_id,
+                chain_key=candidate.chain_key,
+                coin_symbol=candidate.coin_symbol,
+                from_address=candidate.from_address,
+                to_address=candidate.to_address,
+                amount=evaluation.collect_amount,
+            )
+            if existing_task:
+                skipped_duplicate_count += 1
+                skipped_count += 1
+                _record_warning(
+                    warnings,
+                    (
+                        "skip candidate because an idempotent collection task already exists: "
+                        f"chain_key={candidate.chain_key}, coin={candidate.coin_symbol}, "
+                        f"user_id={candidate.user_id}, address={candidate.from_address}, task_id={existing_task.id}"
+                    ),
+                )
+                continue
+
             if not batch:
                 batch = create_collection_batch(
                     db,
@@ -1368,7 +1391,7 @@ def scan_collection_candidates(
                     created_by=created_by,
                 )
 
-            task = create_collection_task(
+            create_result = create_collection_task_with_result(
                 db,
                 batch_id=batch.id if batch else batch_id,
                 user_id=candidate.user_id,
@@ -1380,10 +1403,23 @@ def scan_collection_candidates(
                 amount=evaluation.collect_amount,
                 reason=evaluation.reason,
             )
-            if int(task.id) not in pre_task_ids:
+            task = create_result.task
+            if create_result.created_new and int(task.id) not in pre_task_ids:
                 created_task_count += 1
                 pre_task_ids.add(int(task.id))
                 created_task_ids.append(int(task.id))
+            elif not create_result.created_new:
+                skipped_duplicate_count += 1
+                skipped_count += 1
+                _record_warning(
+                    warnings,
+                    (
+                        "skip candidate because create_collection_task returned an existing task: "
+                        f"chain_key={candidate.chain_key}, coin={candidate.coin_symbol}, "
+                        f"user_id={candidate.user_id}, address={candidate.from_address}, task_id={task.id}"
+                    ),
+                )
+                continue
 
             if gas_task_to_link is not None:
                 task.gas_task_id = gas_task_to_link.id
@@ -1446,6 +1482,13 @@ def scan_collection_candidates(
             sum(1 for item in candidates if item.balance_error),
             int((time.monotonic() - scan_started) * 1000),
         )
+
+    if batch and created_task_count <= 0:
+        batch.status = "CANCELED"
+        batch.error_message = batch.error_message or "EMPTY_BATCH_NO_NEW_TASKS"
+        batch.finished_at = batch.finished_at or datetime.utcnow()
+        batch.updated_at = datetime.utcnow()
+        db.flush()
 
     if tool_progress is not None:
         _finalize_tool_scan_rows(tool_progress, scan_batch_id=scan_batch_id)

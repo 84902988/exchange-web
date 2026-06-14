@@ -9,10 +9,14 @@ from app.core.chain_config import get_runtime_chain_config
 from app.db.models.collection import CollectionTask, CollectionTaskStatus, GasTask, GasTaskStatus
 from app.services.collection_balance_checker import CollectionBalanceCheckerError, get_web3_for_chain
 from app.services.collection_service import (
+    mark_collection_task_confirming,
     mark_collection_task_confirmed,
     mark_collection_task_failed,
+    queue_collection_task_changed,
     mark_gas_task_confirmed,
+    mark_gas_task_confirming,
     mark_gas_task_failed,
+    refresh_collection_batch_aggregate,
 )
 from app.services.solana_client import get_solana_transaction_status_with_rpc_fallback
 
@@ -71,7 +75,25 @@ def confirm_collection_task_tx(db: Session, task_id: int) -> TxConfirmResult:
         return TxConfirmResult("collection", int(task_id), "", "SKIPPED", None, "TASK_NOT_FOUND")
 
     tx_hash = (task.tx_hash or "").strip()
-    if task.status != CollectionTaskStatus.SENT.value:
+    task_status = str(task.status or "").upper()
+    confirmable_statuses = {
+        CollectionTaskStatus.SENT.value,
+        CollectionTaskStatus.SENDING.value,
+        CollectionTaskStatus.QUEUED.value,
+        CollectionTaskStatus.GAS_REQUIRED.value,
+        "CONFIRMING",
+        "COLLECTION_SENT",
+        "COLLECTION_CONFIRMING",
+        "PROCESSING",
+    }
+    if task_status in {CollectionTaskStatus.CONFIRMED.value, "SUCCESS", "COMPLETED"}:
+        if tx_hash.lower().startswith("0x") and not tx_hash.upper().startswith(("DRYRUN_", "DRYGAS_")) and task.last_error:
+            task.last_error = None
+            db.flush()
+            queue_collection_task_changed(db, task)
+        refresh_collection_batch_aggregate(db, task.batch_id)
+        return TxConfirmResult("collection", int(task.id), tx_hash, "CONFIRMED", task.block_number, None)
+    if task_status not in confirmable_statuses:
         return TxConfirmResult("collection", int(task.id), tx_hash, "SKIPPED", None, f"STATUS_{task.status}")
     if not tx_hash:
         task.last_error = "TX_HASH_EMPTY"
@@ -88,6 +110,13 @@ def confirm_collection_task_tx(db: Session, task_id: int) -> TxConfirmResult:
         db.flush()
         return TxConfirmResult("collection", int(task.id), tx_hash, "PENDING", None, error)
     if receipt_status is None:
+        if task_status in {
+            CollectionTaskStatus.SENT.value,
+            "COLLECTION_SENT",
+            "COLLECTION_CONFIRMING",
+            "CONFIRMING",
+        }:
+            mark_collection_task_confirming(db, int(task.id))
         return TxConfirmResult("collection", int(task.id), tx_hash, "PENDING", None, None)
     if receipt_status == 1:
         mark_collection_task_confirmed(db, int(task.id), block_number=block_number)
@@ -104,7 +133,7 @@ def confirm_gas_task_tx(db: Session, task_id: int) -> TxConfirmResult:
         return TxConfirmResult("gas", int(task_id), "", "SKIPPED", None, "TASK_NOT_FOUND")
 
     tx_hash = (task.tx_hash or "").strip()
-    if task.status != GasTaskStatus.SENT.value:
+    if task.status not in {GasTaskStatus.SENT.value, GasTaskStatus.CONFIRMING.value}:
         return TxConfirmResult("gas", int(task.id), tx_hash, "SKIPPED", None, f"STATUS_{task.status}")
     if not tx_hash:
         task.last_error = "TX_HASH_EMPTY"
@@ -121,6 +150,7 @@ def confirm_gas_task_tx(db: Session, task_id: int) -> TxConfirmResult:
         db.flush()
         return TxConfirmResult("gas", int(task.id), tx_hash, "PENDING", None, error)
     if receipt_status is None:
+        mark_gas_task_confirming(db, int(task.id))
         return TxConfirmResult("gas", int(task.id), tx_hash, "PENDING", None, None)
     if receipt_status == 1:
         mark_gas_task_confirmed(db, int(task.id), block_number=block_number)
@@ -134,7 +164,12 @@ def confirm_gas_task_tx(db: Session, task_id: int) -> TxConfirmResult:
 def scan_sent_collection_tasks_for_confirm(db: Session, limit: int = 100) -> list[TxConfirmResult]:
     rows = (
         db.query(CollectionTask)
-        .filter(CollectionTask.status == CollectionTaskStatus.SENT.value)
+        .filter(CollectionTask.status.in_([
+            CollectionTaskStatus.SENT.value,
+            "CONFIRMING",
+            "COLLECTION_SENT",
+            "COLLECTION_CONFIRMING",
+        ]))
         .filter(CollectionTask.tx_hash.isnot(None))
         .filter(CollectionTask.tx_hash != "")
         .order_by(CollectionTask.sent_at.asc(), CollectionTask.id.asc())
@@ -147,7 +182,7 @@ def scan_sent_collection_tasks_for_confirm(db: Session, limit: int = 100) -> lis
 def scan_sent_gas_tasks_for_confirm(db: Session, limit: int = 100) -> list[TxConfirmResult]:
     rows = (
         db.query(GasTask)
-        .filter(GasTask.status == GasTaskStatus.SENT.value)
+        .filter(GasTask.status.in_([GasTaskStatus.SENT.value, GasTaskStatus.CONFIRMING.value]))
         .filter(GasTask.tx_hash.isnot(None))
         .filter(GasTask.tx_hash != "")
         .order_by(GasTask.sent_at.asc(), GasTask.id.asc())

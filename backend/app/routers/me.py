@@ -403,6 +403,7 @@ def login_logs(
                     "ip_address": item.ip_address,
                     "user_agent": item.user_agent,
                     "device_name": item.device_name,
+                    "country_code": getattr(item, "country_code", "UNKNOWN") or "UNKNOWN",
                     "login_status": item.login_status,
                     "failure_reason": item.failure_reason,
                     "created_at": item.created_at.isoformat() if item.created_at else None,

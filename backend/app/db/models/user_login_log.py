@@ -32,6 +32,7 @@ class UserLoginLog(Base):
     ip_address: Mapped[str] = mapped_column(String(45), nullable=False, default="")
     user_agent: Mapped[str] = mapped_column(String(512), nullable=False, default="")
     device_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    country_code: Mapped[str] = mapped_column(String(8), nullable=False, default="UNKNOWN")
     login_status: Mapped[str] = mapped_column(String(16), nullable=False)
     failure_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)

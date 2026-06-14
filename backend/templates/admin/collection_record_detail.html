@@ -27,7 +27,11 @@
     <section class="metric-grid">
       <div class="metric-card">
         <div class="metric-label">批次ID</div>
-        <div class="metric-value">{{ summary.batch_id|default(batch.batch_no, true) }}</div>
+        <div class="metric-value">{{ summary.batch_id|default(batch.id, true) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">批次号</div>
+        <div class="metric-value collection-mono">{{ summary.batch_no|default(batch.batch_no, true) }}</div>
       </div>
       <div class="metric-card">
         <div class="metric-label">网络</div>
@@ -58,7 +62,7 @@
         <div class="metric-value">{{ summary.pending_count|default(0, true) }}</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">需补 Gas 数</div>
+        <div class="metric-label">等待补Gas数</div>
         <div class="metric-value">{{ summary.gas_required_count|default(0, true) }}</div>
       </div>
       <div class="metric-card">
@@ -102,7 +106,7 @@
                     <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>
                     <td class="mono nowrap" title="{{ item.tx_hash }}">{{ item.tx_hash_short }}</td>
                     <td class="mono nowrap" title="{{ item.gas_tx_hash }}">{{ item.gas_tx_hash_short }}</td>
-                    <td class="admin-muted" title="{{ item.error }}">{{ item.error_short }}</td>
+                    <td class="admin-muted" title="{{ item.error_full or item.error }}">{{ item.error_short }}</td>
                     <td class="nowrap">
                       <div class="admin-table-actions">
                         <a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" href="/admin/collections/tasks?task_no={{ item.task_no }}">查看详情</a>

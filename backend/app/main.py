@@ -27,6 +27,7 @@ load_dotenv(dotenv_path=ENV_PATH, override=False)
 # Config / Settings (reads from env)
 # =========================
 from app.core.config import settings  # noqa: E402
+from app.middleware.geo_restriction import GeoRestrictionMiddleware  # noqa: E402
 
 # Routers
 from app.routers.health import router as health_router  # noqa: E402
@@ -64,6 +65,7 @@ from app.routers.user_invited_friends import router as user_invited_friends_rout
 from app.routers.stock_token import router as stock_token_router
 from app.routers.announcement_reads import router as announcement_reads_router
 from app.routers.site_content import router as site_content_router
+from app.routers.support_tickets import router as support_tickets_router
 from app.routers.activity import router as activity_router
 from app.admin.activity_admin import router as activity_admin_router
 from app.routers.kyc import router as kyc_router
@@ -130,6 +132,7 @@ app.mount(
     StaticFiles(directory=str(BACKEND_DIR / "static"), check_dir=False),
     name="static",
 )
+app.add_middleware(GeoRestrictionMiddleware)
 
 # =========================
 # Trace ID Middleware
@@ -278,6 +281,7 @@ app.include_router(user_invited_friends_router)
 app.include_router(stock_token_router)
 app.include_router(announcement_reads_router)
 app.include_router(site_content_router)
+app.include_router(support_tickets_router)
 app.include_router(activity_router)
 app.include_router(kyc_router)
 

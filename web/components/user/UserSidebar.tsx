@@ -50,6 +50,7 @@ const SIDEBAR_GROUPS: SidebarGroup[] = [
     titleKey: 'helpSupport',
     items: [
       { href: '/help', labelKey: 'helpCenter' },
+      { href: '/user/support-tickets', labelKey: 'supportTickets' },
     ],
   },
 ];
