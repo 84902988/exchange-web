@@ -17,27 +17,17 @@ Operational decisions:
 - `block_unknown=false`.
 - `admin_exempt=true`.
 - `trust CF-IPCountry=true`.
-- Whether production actually blocks traffic is still controlled by `enabled` and `monitor_mode`.
+- Production formal blocking has been confirmed by the project owner in this release flow.
 
-Recommended production rollout:
-
-```text
-enabled=false
-```
-
-or:
-
-```text
-enabled=true
-monitor_mode=true
-```
-
-Only switch to formal blocking after operations confirms:
+Final production values:
 
 ```text
 enabled=true
 monitor_mode=false
 restricted_countries=["CN"]
+block_unknown=false
+admin_exempt=true
+trust CF-IPCountry=true
 ```
 
 ## 2. Current Local DB State
@@ -64,15 +54,17 @@ No other Geo Access fields should be changed when syncing the local DB to the pr
 
 ## 3. Required Operations Confirmation
 
-Operations must confirm before production launch:
+Operations confirmed these production values in this release flow:
 
-- Whether to enable Geo Access.
-- Whether to run formal blocking or monitor mode.
+- Enable Geo Access with formal blocking: `enabled=true` and `monitor_mode=false`.
 - Final restricted country/region list: `["CN"]`.
 - `US` is not included in the production restricted list.
 - `block_unknown=false`.
 - `admin_exempt=true`.
 - Cloudflare `CF-IPCountry` is trusted.
+
+Production deployment must still confirm:
+
 - Cloudflare forwards `CF-Connecting-IP` and `CF-IPCountry` correctly.
 - GeoIP DB deployment path, for example `GEOIP_DB_PATH=/opt/exchange-web/data/GeoLite2-Country.mmdb`.
 - GeoLite2 / MaxMind license, download, deployment, update owner, and update cadence.
@@ -80,7 +72,7 @@ Operations must confirm before production launch:
 
 ## 4. Safety Defaults
 
-Until operations signs off, production should use one of these safe states:
+This release flow has confirmed formal blocking. If deployment ownership changes or Cloudflare / GeoIP readiness is not confirmed, fall back to one of these safe states until operations signs off again:
 
 ```text
 enabled=false
@@ -134,12 +126,16 @@ Launch decision:
 ```text
 [ ] Keep disabled: enabled=false
 [ ] Enable monitor only: enabled=true + monitor_mode=true
-[ ] Enable formal blocking: enabled=true + monitor_mode=false + restricted_countries=["CN"]
+[x] Enable formal blocking: enabled=true + monitor_mode=false + restricted_countries=["CN"]
 ```
+
+Production formal blocking has been confirmed by the project owner in this release flow.
 
 Final production values:
 
 ```text
+enabled=true
+monitor_mode=false
 restricted_countries=["CN"]
 block_unknown=false
 admin_exempt=true
