@@ -1,58 +1,100 @@
 import React from 'react';
-import {StyleSheet, Text, View} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 import {
   createBottomTabNavigator,
   type BottomTabNavigationOptions,
 } from '@react-navigation/bottom-tabs';
+import {
+  ArrowLeftRight,
+  ChartCandlestick,
+  ChartLine,
+  Home,
+  Wallet,
+  type LucideIcon,
+} from 'lucide-react-native';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import HomeScreen from '../screens/home/HomeScreen';
 import MarketsScreen from '../screens/markets/MarketsScreen';
 import TradeScreen from '../screens/trade/TradeScreen';
 import ContractScreen from '../screens/contract/ContractScreen';
 import AssetsScreen from '../screens/assets/AssetsScreen';
 import type {MainTabParamList} from './types';
-import {colors, typography} from '../theme';
+import {colors} from '../theme';
 
 const Tab = createBottomTabNavigator<MainTabParamList>();
+const TAB_BAR_BASE_HEIGHT = 60;
+const TAB_ICON_SIZE = 22;
 
-function TabIcon({mark, focused}: {mark: string; focused: boolean}) {
+function TabIcon({
+  Icon,
+  color,
+  focused,
+}: {
+  Icon: LucideIcon;
+  color: string;
+  focused: boolean;
+}) {
   return (
-    <View style={[styles.icon, focused ? styles.iconFocused : null]}>
-      <Text style={[styles.iconText, focused ? styles.iconTextFocused : null]}>
-        {mark}
-      </Text>
+    <View style={styles.icon}>
+      <Icon
+        color={color}
+        size={TAB_ICON_SIZE}
+        strokeWidth={focused ? 2.4 : 2}
+      />
     </View>
   );
 }
 
 const homeOptions: BottomTabNavigationOptions = {
   tabBarLabel: '首页',
-  tabBarIcon: ({focused}) => <TabIcon mark="H" focused={focused} />,
+  tabBarIcon: ({color, focused}) => (
+    <TabIcon Icon={Home} color={color} focused={focused} />
+  ),
 };
 const marketsOptions: BottomTabNavigationOptions = {
   tabBarLabel: '行情',
-  tabBarIcon: ({focused}) => <TabIcon mark="M" focused={focused} />,
+  tabBarIcon: ({color, focused}) => (
+    <TabIcon Icon={ChartLine} color={color} focused={focused} />
+  ),
 };
 const tradeOptions: BottomTabNavigationOptions = {
   tabBarLabel: '交易',
-  tabBarIcon: ({focused}) => <TabIcon mark="T" focused={focused} />,
+  tabBarIcon: ({color, focused}) => (
+    <TabIcon Icon={ArrowLeftRight} color={color} focused={focused} />
+  ),
 };
 const contractOptions: BottomTabNavigationOptions = {
   tabBarLabel: '合约',
-  tabBarIcon: ({focused}) => <TabIcon mark="C" focused={focused} />,
+  tabBarIcon: ({color, focused}) => (
+    <TabIcon Icon={ChartCandlestick} color={color} focused={focused} />
+  ),
 };
 const assetsOptions: BottomTabNavigationOptions = {
   tabBarLabel: '资产',
-  tabBarIcon: ({focused}) => <TabIcon mark="A" focused={focused} />,
+  tabBarIcon: ({color, focused}) => (
+    <TabIcon Icon={Wallet} color={color} focused={focused} />
+  ),
 };
 
 export default function MainTabs() {
+  const insets = useSafeAreaInsets();
+  const bottomPadding = Math.max(insets.bottom, 8);
+
   return (
     <Tab.Navigator
       screenOptions={{
         headerShown: false,
-        tabBarActiveTintColor: colors.primary,
-        tabBarInactiveTintColor: colors.textSubtle,
-        tabBarStyle: styles.tabBar,
+        tabBarActiveTintColor: colors.tabActive,
+        tabBarInactiveTintColor: colors.tabInactive,
+        tabBarStyle: [
+          styles.tabBar,
+          {
+            height: TAB_BAR_BASE_HEIGHT + bottomPadding,
+            paddingBottom: bottomPadding,
+          },
+        ],
+        tabBarItemStyle: styles.tabBarItem,
+        tabBarIconStyle: styles.tabBarIcon,
         tabBarLabelStyle: styles.tabBarLabel,
       }}>
       <Tab.Screen name="Home" component={HomeScreen} options={homeOptions} />
@@ -74,33 +116,30 @@ export default function MainTabs() {
 
 const styles = StyleSheet.create({
   tabBar: {
-    backgroundColor: colors.bgElevated,
-    borderTopColor: colors.line,
-    height: 68,
-    paddingTop: 6,
-    paddingBottom: 10,
+    backgroundColor: colors.tabBarBackground,
+    borderTopColor: colors.tabBarBorder,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    paddingTop: 7,
+    elevation: 0,
+    shadowOpacity: 0,
+  },
+  tabBarItem: {
+    height: 52,
+    paddingVertical: 3,
+  },
+  tabBarIcon: {
+    marginTop: 1,
   },
   tabBarLabel: {
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '600',
+    marginTop: 1,
+    marginBottom: 0,
   },
   icon: {
-    width: 24,
+    width: 26,
     height: 24,
-    borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  iconFocused: {
-    backgroundColor: colors.primarySoft,
-  },
-  iconText: {
-    ...typography.number,
-    color: colors.textSubtle,
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  iconTextFocused: {
-    color: colors.primary,
   },
 });

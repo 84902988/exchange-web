@@ -1,17 +1,23 @@
 import React from 'react';
-import {StyleSheet, Text, View} from 'react-native';
+import {Pressable, StyleSheet, Text} from 'react-native';
+import {Search} from 'lucide-react-native';
 import {colors} from '../../theme';
 
 type Props = {
   placeholder?: string;
+  onPress?: () => void;
 };
 
-export default function SearchBar({placeholder = '搜索 UNI'}: Props) {
+export default function SearchBar({placeholder = '搜索 UNI', onPress}: Props) {
   return (
-    <View style={styles.container}>
-      <Text style={styles.searchMark}>S</Text>
+    <Pressable
+      accessibilityLabel={placeholder}
+      accessibilityRole={onPress ? 'button' : undefined}
+      style={styles.container}
+      onPress={onPress}>
+      <Search color={colors.textSubtle} size={17} strokeWidth={2.1} />
       <Text style={styles.placeholder}>{placeholder}</Text>
-    </View>
+    </Pressable>
   );
 }
 
@@ -26,12 +32,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.card,
     borderWidth: 1,
     borderColor: colors.line,
-  },
-  searchMark: {
-    color: colors.textSubtle,
-    fontSize: 12,
-    fontWeight: '900',
-    marginRight: 8,
+    gap: 8,
   },
   placeholder: {
     color: colors.textMuted,
