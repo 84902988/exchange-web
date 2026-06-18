@@ -2,7 +2,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import useLocale from '@/hooks/useLocale';
 import { wsService } from '@/services/websocket';
-import { Order, TradeRecord } from '@/types/orderBook';
+import { Order, OrderBookUpdate, TradeRecord, TradeUpdate } from '@/types/orderBook';
 
 /**
  * 订单簿数据获取策略说明
@@ -147,33 +147,35 @@ const OrderBook: React.FC<OrderBookProps> = ({ symbol }) => {
         
         /**
          * 处理订单簿更新
-         * @param {any} update 订单簿更新数据
+         * @param {unknown} update 订单簿更新数据
          */
-        const handleOrderBookUpdate = (update: any) => {
-          if (isMounted) {
-            setBids(update.bids);
-            setAsks(update.asks);
+        const handleOrderBookUpdate = (update: unknown) => {
+          const orderBookUpdate = update as Partial<OrderBookUpdate>;
+          if (isMounted && Array.isArray(orderBookUpdate.bids) && Array.isArray(orderBookUpdate.asks)) {
+            setBids(orderBookUpdate.bids);
+            setAsks(orderBookUpdate.asks);
           }
         };
         
         /**
          * 处理成交记录更新
-         * @param {any} update 成交记录更新数据
+         * @param {unknown} update 成交记录更新数据
          */
-        const handleTradeUpdate = (update: any) => {
-          if (isMounted) {
+        const handleTradeUpdate = (update: unknown) => {
+          const tradeUpdate = update as Partial<TradeUpdate>;
+          if (isMounted && tradeUpdate.trade) {
             setTrades(prev => {
               // 将新成交记录添加到列表开头，限制最大数量为50条
-              return [update.trade, ...prev].slice(0, 50);
+              return [tradeUpdate.trade as TradeRecord, ...prev].slice(0, 50);
             });
           }
         };
         
         /**
          * 处理WebSocket错误
-         * @param {any} wsError WebSocket错误数据
+         * @param {unknown} wsError WebSocket错误数据
          */
-        const handleWebSocketError = (wsError: any) => {
+        const handleWebSocketError = (wsError: unknown) => {
           if (isMounted) {
             console.error('WebSocket错误:', wsError);
             setError('WebSocket连接错误，请刷新页面重试');

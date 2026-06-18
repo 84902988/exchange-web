@@ -52,6 +52,34 @@ def record_last_good_used(key: str) -> None:
     _increment(key, "last_good_used")
 
 
+def record_stale_hit(key: str) -> None:
+    _increment(key, "stale_hit")
+
+
+def record_loader_success(key: str) -> None:
+    _increment(key, "loader_success")
+
+
+def record_loader_error(key: str) -> None:
+    _increment(key, "loader_error")
+
+
+def record_lock_acquired(key: str) -> None:
+    _increment(key, "lock_acquired")
+
+
+def record_lock_busy(key: str) -> None:
+    _increment(key, "lock_busy")
+
+
+def record_redis_unavailable(key: str) -> None:
+    _increment(key, "redis_unavailable")
+
+
+def record_memory_fallback(key: str) -> None:
+    _increment(key, "memory_fallback")
+
+
 def record_external_api_call(key: str) -> None:
     metric_type = _type_for_key(key)
     if metric_type not in _EXTERNAL_CACHE_TYPES:
@@ -171,7 +199,14 @@ def _empty_overall() -> dict[str, int]:
     return {
         "hit": 0,
         "miss": 0,
+        "stale_hit": 0,
         "last_good_used": 0,
+        "loader_success": 0,
+        "loader_error": 0,
+        "lock_acquired": 0,
+        "lock_busy": 0,
+        "redis_unavailable": 0,
+        "memory_fallback": 0,
         "external_api_calls": 0,
     }
 
@@ -191,7 +226,14 @@ def _type_bucket(metric_type: str) -> dict[str, int]:
         {
             "hit": 0,
             "miss": 0,
+            "stale_hit": 0,
             "last_good_used": 0,
+            "loader_success": 0,
+            "loader_error": 0,
+            "lock_acquired": 0,
+            "lock_busy": 0,
+            "redis_unavailable": 0,
+            "memory_fallback": 0,
             "external_api_calls": 0,
             "count": 0,
             "rows": 0,
@@ -206,7 +248,14 @@ def _type_row(key: str, bucket: dict[str, int]) -> dict[str, Any]:
         "label": key,
         "hit": int(bucket.get("hit", 0)),
         "miss": int(bucket.get("miss", 0)),
+        "stale_hit": int(bucket.get("stale_hit", 0)),
         "last_good_used": int(bucket.get("last_good_used", 0)),
+        "loader_success": int(bucket.get("loader_success", 0)),
+        "loader_error": int(bucket.get("loader_error", 0)),
+        "lock_acquired": int(bucket.get("lock_acquired", 0)),
+        "lock_busy": int(bucket.get("lock_busy", 0)),
+        "redis_unavailable": int(bucket.get("redis_unavailable", 0)),
+        "memory_fallback": int(bucket.get("memory_fallback", 0)),
         "external_api_calls": int(bucket.get("external_api_calls", 0)),
         "count": int(bucket.get("count", 0)),
         "rows": int(bucket.get("rows", 0)),

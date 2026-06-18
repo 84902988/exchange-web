@@ -499,10 +499,12 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const appliedCategoryRef = useRef('');
   const [interval, setIntervalValue] = useState('1m');
   const [latestPrice, setLatestPrice] = useState('--');
+  const [latestCandlePatchPrice, setLatestCandlePatchPrice] = useState<string | number | null>(null);
   const [priceDirection, setPriceDirection] = useState<RealtimePriceDirection>('flat');
   const [orderPrice, setOrderPrice] = useState('');
   const [orderPriceSelectNonce, setOrderPriceSelectNonce] = useState(0);
   const [marketHeaderData, setMarketHeaderData] = useState<SpotHeaderMarketData>(EMPTY_MARKET_DATA);
+  const [marketSyncing, setMarketSyncing] = useState(true);
 
   const [refreshKey, setRefreshKey] = useState(0);
   const [accountBalances, setAccountBalances] = useState<SpotAccountBalanceItem[]>([]);
@@ -573,7 +575,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     () => resolveSpotAssetSymbols(symbol, selectedTicker || selectedPair),
     [selectedPair, selectedTicker, symbol],
   );
-  const selectedDataSource = normalizeSpotDataSource(selectedTicker?.dataSource);
+  const selectedDataSourceKnown = Boolean(selectedTicker?.dataSource || selectedPair?.dataSource);
+  const selectedDataSource = normalizeSpotDataSource(selectedTicker?.dataSource || selectedPair?.dataSource);
+  const marketFeedDataSource = selectedDataSourceKnown ? selectedDataSource : 'external';
   const showRwaReference = useMemo(() => {
     return selectedTicker ? pairMatchesInitialCategory(selectedTicker, 'rwa') : false;
   }, [selectedTicker]);
@@ -601,13 +605,13 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
   useEffect(() => {
     const normalizedSymbol = String(symbol || '').trim().toUpperCase();
-    if (!normalizedSymbol || isPollingSpotDataSource(selectedDataSource)) {
+    if (!normalizedSymbol || isPollingSpotDataSource(marketFeedDataSource)) {
       spotMarketRealtime.disconnect();
       return;
     }
 
     spotMarketRealtime.setSymbol(normalizedSymbol);
-  }, [selectedDataSource, symbol]);
+  }, [marketFeedDataSource, symbol]);
 
   useEffect(() => {
     pairOptionsRef.current = pairOptions;
@@ -624,27 +628,35 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     setConfiguredPricePrecision(null);
     const cache = readCurrentSpotMarketCache(symbol);
     const cachedPrice = cache?.lastPrice ? String(cache.lastPrice) : '--';
+    const hasCachedMarketData = Boolean(
+      cache?.lastPrice ||
+      cache?.ticker ||
+      cache?.depth ||
+      (cache?.header && cache.header !== EMPTY_MARKET_DATA)
+    );
     latestPriceRef.current = cachedPrice;
     setLatestPrice(cachedPrice);
+    setLatestCandlePatchPrice(null);
     setMarketHeaderData(cache?.header || EMPTY_MARKET_DATA);
     setHeaderTicker(cache?.ticker || null);
+    setMarketSyncing(!hasCachedMarketData);
     if (cache?.depth) {
       setOrderBookDepth({ asks: cache.depth.asks || [], bids: cache.depth.bids || [] });
       if (Number.isInteger(cache.depth.pricePrecision)) {
         setConfiguredPricePrecision(Number(cache.depth.pricePrecision));
       }
+    } else {
+      setOrderBookDepth({ asks: [], bids: [] });
     }
   }, [symbol]);
 
   useEffect(() => {
     const nextSymbol = normalizeSpotApiSymbol(initialSymbol);
     if (nextSymbol) {
-      setSymbol(nextSymbol);
+      if (nextSymbol !== symbolRef.current) {
+        setSymbol(nextSymbol);
+      }
       return;
-    }
-
-    if (!String(initialCategory || '').trim()) {
-      setSymbol(DEFAULT_SPOT_SYMBOL);
     }
   }, [initialCategory, initialSymbol]);
 
@@ -800,6 +812,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           latestPriceRef.current = '--';
           latestPriceDirectionRef.current = 'flat';
           setLatestPrice('--');
+          setLatestCandlePatchPrice(null);
           setPriceDirection('flat');
           setHeaderTicker(null);
           setMarketHeaderData(EMPTY_MARKET_DATA);
@@ -810,6 +823,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
             header: EMPTY_MARKET_DATA,
             depth: { asks: [], bids: [] },
           });
+          setMarketSyncing(false);
           return;
         }
 
@@ -825,9 +839,11 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           }
           return Array.from(map.values());
         });
+        setMarketSyncing(false);
       } catch (error) {
         if (!cancelled) {
           console.error('SpotPage current ticker load error:', error);
+          setMarketSyncing(false);
         }
       }
     };
@@ -878,6 +894,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
     latestPriceRef.current = formatted;
     setLatestPrice(formatted);
+    setLatestCandlePatchPrice(formatted);
     writeMarketCache<SpotMarketCache>('spot', symbol, {
       lastPrice: formatted,
       ticker: selectedTicker,
@@ -925,6 +942,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           ticker: selectedTicker,
           lastPrice: selectedTicker?.price ?? undefined,
         });
+        setMarketSyncing(false);
         return;
       }
 
@@ -942,6 +960,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         const nextHeader = buildMarketDataFromKlines(symbol, response.items || [], pricePrecision);
         setMarketHeaderData(nextHeader);
         writeMarketCache<SpotMarketCache>('spot', symbol, { header: nextHeader });
+        setMarketSyncing(false);
       } catch (error) {
         if (cancelled) {
           return;
@@ -949,6 +968,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
         console.error('SpotPage market header load error:', error);
         setMarketHeaderData(EMPTY_MARKET_DATA);
+        setMarketSyncing(false);
       }
     };
 
@@ -1035,6 +1055,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       const fallbackPrice = tickerPrice || '--';
       latestPriceRef.current = fallbackPrice;
       setLatestPrice(fallbackPrice);
+      setLatestCandlePatchPrice(tickerPrice || null);
       return;
     }
 
@@ -1046,6 +1067,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     latestPriceRef.current = formatted;
     latestPriceDirectionRef.current = nextDirection;
     setLatestPrice(formatted);
+    setLatestCandlePatchPrice(formatted);
     setPriceDirection(nextDirection);
   },
     [pricePrecision, selectedTicker?.price, symbol]
@@ -1136,18 +1158,30 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const spotMarketStatus = selectedTicker?.marketStatus || selectedPair?.marketStatus || 'OPEN';
   const spotQuoteFreshness = selectedTicker?.quoteFreshness || selectedPair?.quoteFreshness || 'LIVE';
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
+  const marketSyncingText = t('loading', 'common');
+  const shouldShowMarketSyncing = marketSyncing && latestPrice === '--';
+  const displayLatestPrice = shouldShowMarketSyncing ? marketSyncingText : latestPrice;
+  const displayMarketHeaderData = shouldShowMarketSyncing
+    ? {
+      change: marketSyncingText,
+      changeAmount: marketSyncingText,
+      highLow: marketSyncingText,
+      volume: marketSyncingText,
+      turnover: marketSyncingText,
+    }
+    : marketHeaderData;
 
   return (
     <div className="flex flex-col overflow-x-hidden bg-[#0b0e11] text-white">
       <SpotHeader
         symbol={symbol}
         displaySymbol={currentDisplaySymbol}
-        price={latestPrice}
-        change={marketHeaderData.change}
-        changeAmount={marketHeaderData.changeAmount}
-        highLow={marketHeaderData.highLow}
-        volume={marketHeaderData.volume}
-        turnover={marketHeaderData.turnover}
+        price={displayLatestPrice}
+        change={displayMarketHeaderData.change}
+        changeAmount={displayMarketHeaderData.changeAmount}
+        highLow={displayMarketHeaderData.highLow}
+        volume={displayMarketHeaderData.volume}
+        turnover={displayMarketHeaderData.turnover}
         priceDirection={priceDirection}
         marketStatus={spotMarketStatus}
         quoteFreshness={spotQuoteFreshness}
@@ -1182,8 +1216,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                       symbol={symbol}
                       displaySymbol={currentDisplaySymbol}
                       interval={interval}
-                      dataSource={selectedDataSource}
+                      dataSource={marketFeedDataSource}
                       latestPrice={latestPrice}
+                      latestTradeOrTickerPrice={latestCandlePatchPrice}
                       priceDirection={priceDirection}
                       pricePrecision={pricePrecision}
                       showRwaReference={showRwaReference}
@@ -1229,7 +1264,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                         lastPrice={latestPrice}
                         pricePrecision={pricePrecision}
                         priceDirection={priceDirection}
-                        dataSource={selectedDataSource}
+                        dataSource={marketFeedDataSource}
                         initialDepth={readCurrentSpotMarketCache(symbol)?.depth}
                         onPriceClick={handleOrderBookPriceClick}
                         onDepthDataChange={handleDepthDataChange}
@@ -1241,7 +1276,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                         symbol={symbol}
                         displaySymbol={currentDisplaySymbol}
                         pricePrecision={pricePrecision}
-                        dataSource={selectedDataSource}
+                        dataSource={marketFeedDataSource}
                         onPriceClick={handleOrderBookPriceClick}
                         onLastPriceChange={handleLastPriceChange}
                       />

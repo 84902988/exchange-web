@@ -172,10 +172,13 @@ export default function ContractFuturesOrderBook({
   const [bids, setBids] = useState<ContractDepthLevel[]>([]);
   const [source, setSource] = useState<string | null>(null);
   const [depthMarketStatus, setDepthMarketStatus] = useState<string | null>(null);
+  const [depthExecutable, setDepthExecutable] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
   const initialDepthRef = useRef(initialDepth);
   const onDepthDataChangeRef = useRef(onDepthDataChange);
-  const effectiveMarketStatus = marketStatus === 'CLOSED' || depthMarketStatus === 'CLOSED'
+  const isClosedMarketStatus = marketStatus === 'CLOSED' || marketStatus === 'HOLIDAY'
+    || depthMarketStatus === 'CLOSED' || depthMarketStatus === 'HOLIDAY';
+  const effectiveMarketStatus = isClosedMarketStatus
     ? 'CLOSED'
     : marketStatus || depthMarketStatus || null;
 
@@ -203,6 +206,7 @@ export default function ContractFuturesOrderBook({
         setBids(nextBids);
         setSource(depth.source);
         setDepthMarketStatus(depth.market_status || null);
+        setDepthExecutable(depth.executable ?? null);
         onDepthDataChangeRef.current?.({
           asks: nextAsks,
           bids: nextBids,
@@ -224,12 +228,14 @@ export default function ContractFuturesOrderBook({
       setBids(cachedBids);
       setSource(cachedDepth?.source || null);
       setDepthMarketStatus(null);
+      setDepthExecutable(null);
       setLoading(false);
     } else {
       setAsks([]);
       setBids([]);
       setSource(null);
       setDepthMarketStatus(null);
+      setDepthExecutable(null);
       setLoading(true);
     }
     void loadDepth();
@@ -254,6 +260,7 @@ export default function ContractFuturesOrderBook({
       setBids(depth.bids);
       setSource(depth.source);
       setDepthMarketStatus(null);
+      setDepthExecutable(null);
       setLoading(false);
       onDepthDataChangeRef.current?.(depth);
     };
@@ -319,9 +326,14 @@ export default function ContractFuturesOrderBook({
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div className="text-[13px] font-medium text-white/88">{t('orderBook', 'contracts')}</div>
-          {effectiveMarketStatus === 'CLOSED' ? (
+          {effectiveMarketStatus === 'CLOSED' && depthExecutable !== false ? (
             <div className="rounded-full border border-[#f0b90b]/20 bg-[#f0b90b]/10 px-2 py-0.5 text-[11px] font-semibold text-[#f0b90b]">
               {t('platformQuote', 'contracts')}
+            </div>
+          ) : null}
+          {depthExecutable === false ? (
+            <div className="rounded-full border border-[#f6465d]/20 bg-[#f6465d]/10 px-2 py-0.5 text-[11px] font-semibold text-[#f6465d]">
+              {t('quoteUnavailableShort', 'contracts')}
             </div>
           ) : null}
         </div>

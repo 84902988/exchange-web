@@ -294,9 +294,8 @@ export function useContractMarketState({
       const nextQuote = extractRealtimeQuote(message);
       if (!nextQuote) return;
       const previousQuote = contractQuoteRef.current;
-      const shouldCarryPreviousStatus = previousQuote?.market_status && previousQuote.market_status !== 'CLOSED';
       const mergedQuote = {
-        ...(shouldCarryPreviousStatus ? {
+        ...(previousQuote ? {
           market_status: previousQuote?.market_status,
           market_status_text: previousQuote?.market_status_text,
           market_session_code: previousQuote?.market_session_code,
@@ -304,6 +303,11 @@ export function useContractMarketState({
           market_trading_hours: previousQuote?.market_trading_hours,
           market_session_type: previousQuote?.market_session_type,
           quote_freshness: previousQuote?.quote_freshness,
+          quote_source: previousQuote?.quote_source,
+          executable: previousQuote?.executable,
+          is_realtime: previousQuote?.is_realtime,
+          last_good_at: previousQuote?.last_good_at,
+          stale: previousQuote?.stale,
         } : {}),
         ...nextQuote,
       };

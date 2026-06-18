@@ -15,26 +15,33 @@ import {
 } from "@/lib/api/modules/supportTickets";
 
 const FALLBACK_CATEGORIES: SupportTicketOption[] = [
-  { value: "ACCOUNT", label: "账户问题" },
-  { value: "KYC", label: "身份认证" },
-  { value: "DEPOSIT_WITHDRAW", label: "充值提现" },
-  { value: "TRADING", label: "交易问题" },
-  { value: "SECURITY", label: "安全问题" },
-  { value: "OTHER", label: "其他" },
+  { value: "ACCOUNT", label: "" },
+  { value: "KYC", label: "" },
+  { value: "DEPOSIT_WITHDRAW", label: "" },
+  { value: "TRADING", label: "" },
+  { value: "SECURITY", label: "" },
+  { value: "OTHER", label: "" },
 ];
 
 const FALLBACK_STATUSES: SupportTicketOption[] = [
-  { value: "OPEN", label: "待处理", badge: "warning" },
-  { value: "IN_PROGRESS", label: "处理中", badge: "info" },
-  { value: "REPLIED", label: "已回复", badge: "success" },
-  { value: "CLOSED", label: "已关闭", badge: "muted" },
+  { value: "OPEN", label: "", badge: "warning" },
+  { value: "IN_PROGRESS", label: "", badge: "info" },
+  { value: "REPLIED", label: "", badge: "success" },
+  { value: "CLOSED", label: "", badge: "muted" },
 ];
 
-function formatDate(value: string | null | undefined) {
+function toDateLocale(locale: string) {
+  if (locale === "ja") return "ja-JP";
+  if (locale === "en") return "en-US";
+  if (locale === "zh-TW") return "zh-TW";
+  return "zh-CN";
+}
+
+function formatDate(value: string | null | undefined, locale: string) {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString("zh-CN", { hour12: false });
+  return date.toLocaleString(toDateLocale(locale), { hour12: false });
 }
 
 function statusClass(status: string) {
@@ -45,12 +52,34 @@ function statusClass(status: string) {
   return "border-amber-400/30 bg-amber-500/10 text-amber-200";
 }
 
-function messageSenderLabel(senderType: string) {
-  return senderType.toUpperCase() === "ADMIN" ? "客服回复" : "我的补充";
+function categoryLabel(category: string, fallback: string, t: (key: string, namespace?: "user") => string) {
+  const normalized = String(category || "").toUpperCase();
+  if (normalized === "ACCOUNT") return t("supportTicketCategoryAccount", "user");
+  if (normalized === "KYC") return t("supportTicketCategoryKyc", "user");
+  if (normalized === "DEPOSIT_WITHDRAW") return t("supportTicketCategoryDepositWithdraw", "user");
+  if (normalized === "TRADING") return t("supportTicketCategoryTrading", "user");
+  if (normalized === "SECURITY") return t("supportTicketCategorySecurity", "user");
+  if (normalized === "OTHER") return t("supportTicketCategoryOther", "user");
+  return fallback || category || "-";
+}
+
+function statusLabel(status: string, fallback: string, t: (key: string, namespace?: "user") => string) {
+  const normalized = String(status || "").toUpperCase();
+  if (normalized === "OPEN") return t("supportTicketStatusOpen", "user");
+  if (normalized === "IN_PROGRESS") return t("supportTicketStatusInProgress", "user");
+  if (normalized === "REPLIED") return t("supportTicketStatusReplied", "user");
+  if (normalized === "CLOSED") return t("supportTicketStatusClosed", "user");
+  return fallback || status || "-";
+}
+
+function messageSenderLabel(senderType: string, t: (key: string, namespace?: "user") => string) {
+  return senderType.toUpperCase() === "ADMIN"
+    ? t("supportTicketCustomerReply", "user")
+    : t("supportTicketMySupplement", "user");
 }
 
 export default function SupportTicketsPage() {
-  const { t } = useLocaleContext();
+  const { locale, t } = useLocaleContext();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [tickets, setTickets] = useState<SupportTicket[]>([]);
   const [selectedTicket, setSelectedTicket] = useState<SupportTicket | null>(null);
@@ -75,8 +104,14 @@ export default function SupportTicketsPage() {
   const isSelectedClosed = String(selectedTicket?.status || "").toUpperCase() === "CLOSED";
 
   const statusOptions = useMemo(() => {
-    return [{ value: "", label: "全部状态" }, ...statuses];
-  }, [statuses]);
+    return [
+      { value: "", label: t("supportTicketAllStatuses", "user") },
+      ...statuses.map((status) => ({
+        ...status,
+        label: statusLabel(status.value, status.label, t),
+      })),
+    ];
+  }, [statuses, t]);
 
   const loadTickets = useCallback(
     async (nextSelectedId?: number | null) => {
@@ -94,7 +129,7 @@ export default function SupportTicketsPage() {
             setSelectedTicket(detail);
           } catch {
             setSelectedTicket(null);
-            setError("工单详情加载失败，请稍后重试。");
+            setError(t("supportTicketDetailLoadFailed", "user"));
           }
         } else {
           setSelectedTicket(null);
@@ -102,12 +137,12 @@ export default function SupportTicketsPage() {
       } catch {
         setTickets([]);
         setSelectedTicket(null);
-        setError("工单加载失败，请稍后重试。");
+        setError(t("supportTicketLoadFailed", "user"));
       } finally {
         setLoading(false);
       }
     },
-    [selectedTicket?.id, statusFilter],
+    [selectedTicket?.id, statusFilter, t],
   );
 
   useEffect(() => {
@@ -129,7 +164,7 @@ export default function SupportTicketsPage() {
           } catch {
             if (!alive) return;
             setSelectedTicket(null);
-            setError("工单详情加载失败，请稍后重试。");
+            setError(t("supportTicketDetailLoadFailed", "user"));
           }
         } else {
           setSelectedTicket(null);
@@ -138,7 +173,7 @@ export default function SupportTicketsPage() {
         if (!alive) return;
         setTickets([]);
         setSelectedTicket(null);
-        setError("工单加载失败，请稍后重试。");
+        setError(t("supportTicketLoadFailed", "user"));
       } finally {
         if (alive) setLoading(false);
       }
@@ -147,7 +182,7 @@ export default function SupportTicketsPage() {
     return () => {
       alive = false;
     };
-  }, [statusFilter]);
+  }, [statusFilter, t]);
 
   const selectTicket = async (ticketId: number) => {
     setDetailLoading(true);
@@ -156,7 +191,7 @@ export default function SupportTicketsPage() {
       setSelectedTicket(await getSupportTicket(ticketId));
     } catch {
       setSelectedTicket(null);
-      setError("工单详情加载失败，请稍后重试。");
+      setError(t("supportTicketDetailLoadFailed", "user"));
     } finally {
       setDetailLoading(false);
     }
@@ -170,10 +205,10 @@ export default function SupportTicketsPage() {
     try {
       const created = await createSupportTicket(createForm);
       setCreateForm({ category: "ACCOUNT", subject: "", content: "" });
-      setNotice("工单已提交，客服会尽快处理。");
+      setNotice(t("supportTicketSubmittedNotice", "user"));
       await loadTickets(created.id);
     } catch {
-      setError("提交工单失败，请检查标题和问题描述后重试。");
+      setError(t("supportTicketSubmitFailed", "user"));
     } finally {
       setCreating(false);
     }
@@ -189,10 +224,10 @@ export default function SupportTicketsPage() {
       const updated = await addSupportTicketMessage(selectedTicket.id, { message: replyMessage });
       setSelectedTicket(updated);
       setReplyMessage("");
-      setNotice("补充内容已提交。");
+      setNotice(t("supportTicketReplySubmitted", "user"));
       await loadTickets(updated.id);
     } catch {
-      setError("提交补充内容失败，已关闭工单不能继续回复。");
+      setError(t("supportTicketReplySubmitFailed", "user"));
     } finally {
       setReplying(false);
     }
@@ -206,10 +241,10 @@ export default function SupportTicketsPage() {
     try {
       const updated = await closeSupportTicket(selectedTicket.id);
       setSelectedTicket(updated);
-      setNotice("工单已关闭。");
+      setNotice(t("supportTicketClosedNotice", "user"));
       await loadTickets(updated.id);
     } catch {
-      setError("关闭工单失败，请稍后重试。");
+      setError(t("supportTicketCloseFailed", "user"));
     } finally {
       setClosing(false);
     }
@@ -227,7 +262,7 @@ export default function SupportTicketsPage() {
           <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
             <div>
               <h1 className="text-2xl font-bold">{pageTitle}</h1>
-              <p className="mt-2 text-sm text-white/60">提交问题、查看客服回复，并跟进你的历史工单。</p>
+              <p className="mt-2 text-sm text-white/60">{t("supportTicketsDesc", "user")}</p>
             </div>
             <select
               value={statusFilter}
@@ -252,12 +287,12 @@ export default function SupportTicketsPage() {
             <div className="space-y-6">
               <form onSubmit={submitTicket} className="rounded-lg border border-white/10 bg-white/[0.03] p-5">
                 <div className="mb-4">
-                  <h2 className="text-lg font-semibold">新建工单</h2>
-                  <p className="mt-1 text-xs text-white/50">请尽量描述清楚问题、账户、交易或链上信息。</p>
+                  <h2 className="text-lg font-semibold">{t("supportTicketCreateTitle", "user")}</h2>
+                  <p className="mt-1 text-xs text-white/50">{t("supportTicketCreateDesc", "user")}</p>
                 </div>
                 <div className="space-y-4">
                   <label className="block text-sm">
-                    <span className="mb-2 block text-white/70">分类</span>
+                    <span className="mb-2 block text-white/70">{t("supportTicketCategory", "user")}</span>
                     <select
                       value={createForm.category}
                       onChange={(event) => setCreateForm((form) => ({ ...form, category: event.target.value }))}
@@ -265,30 +300,30 @@ export default function SupportTicketsPage() {
                     >
                       {categories.map((category) => (
                         <option key={category.value} value={category.value} className="bg-[#111116]">
-                          {category.label}
+                          {categoryLabel(category.value, category.label, t)}
                         </option>
                       ))}
                     </select>
                   </label>
                   <label className="block text-sm">
-                    <span className="mb-2 block text-white/70">标题</span>
+                    <span className="mb-2 block text-white/70">{t("supportTicketSubject", "user")}</span>
                     <input
                       value={createForm.subject}
                       onChange={(event) => setCreateForm((form) => ({ ...form, subject: event.target.value }))}
                       maxLength={255}
                       required
-                      placeholder="例如：提现长时间未到账"
+                      placeholder={t("supportTicketSubjectPlaceholder", "user")}
                       className="h-11 w-full rounded border border-white/10 bg-white/5 px-3 text-white outline-none placeholder:text-white/30"
                     />
                   </label>
                   <label className="block text-sm">
-                    <span className="mb-2 block text-white/70">问题描述</span>
+                    <span className="mb-2 block text-white/70">{t("supportTicketContent", "user")}</span>
                     <textarea
                       value={createForm.content}
                       onChange={(event) => setCreateForm((form) => ({ ...form, content: event.target.value }))}
                       maxLength={5000}
                       required
-                      placeholder="请输入详细问题描述"
+                      placeholder={t("supportTicketContentPlaceholder", "user")}
                       className="min-h-40 w-full resize-y rounded border border-white/10 bg-white/5 px-3 py-3 text-white outline-none placeholder:text-white/30"
                     />
                   </label>
@@ -297,18 +332,22 @@ export default function SupportTicketsPage() {
                     disabled={creating}
                     className="h-11 w-full rounded bg-amber-500 px-4 text-sm font-semibold text-black transition hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-60"
                   >
-                    {creating ? "提交中..." : "提交工单"}
+                    {creating ? t("supportTicketSubmitting", "user") : t("supportTicketSubmit", "user")}
                   </button>
                 </div>
               </form>
 
               <div className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
                 <div className="mb-3 flex items-center justify-between">
-                  <h2 className="text-lg font-semibold">我的工单</h2>
-                  <span className="text-xs text-white/50">{tickets.length} 条</span>
+                  <h2 className="text-lg font-semibold">{t("supportTicketMyTickets", "user")}</h2>
+                  <span className="text-xs text-white/50">
+                    {tickets.length} {t("supportTicketCountUnit", "user")}
+                  </span>
                 </div>
                 {loading ? (
-                  <div className="rounded border border-white/10 px-4 py-6 text-center text-sm text-white/50">加载中...</div>
+                  <div className="rounded border border-white/10 px-4 py-6 text-center text-sm text-white/50">
+                    {t("supportTicketLoading", "user")}
+                  </div>
                 ) : tickets.length ? (
                   <div className="space-y-2">
                     {tickets.map((ticket) => (
@@ -328,25 +367,27 @@ export default function SupportTicketsPage() {
                             <div className="mt-1 text-xs text-white/45">{ticket.ticket_no}</div>
                           </div>
                           <span className={`shrink-0 rounded-full border px-2 py-1 text-xs ${statusClass(ticket.status)}`}>
-                            {ticket.status_label}
+                            {statusLabel(ticket.status, ticket.status_label, t)}
                           </span>
                         </div>
                         <div className="mt-3 flex items-center justify-between text-xs text-white/45">
-                          <span>{ticket.category_label}</span>
-                          <span>{formatDate(ticket.updated_at)}</span>
+                          <span>{categoryLabel(ticket.category, ticket.category_label, t)}</span>
+                          <span>{formatDate(ticket.updated_at, locale)}</span>
                         </div>
                       </button>
                     ))}
                   </div>
                 ) : (
-                  <div className="rounded border border-white/10 px-4 py-6 text-center text-sm text-white/50">暂无工单</div>
+                  <div className="rounded border border-white/10 px-4 py-6 text-center text-sm text-white/50">
+                    {t("supportTicketEmpty", "user")}
+                  </div>
                 )}
               </div>
             </div>
 
             <div className="min-w-0 rounded-lg border border-white/10 bg-white/[0.03] p-5">
               {detailLoading ? (
-                <div className="py-16 text-center text-white/50">详情加载中...</div>
+                <div className="py-16 text-center text-white/50">{t("supportTicketDetailLoading", "user")}</div>
               ) : selectedTicket ? (
                 <div className="space-y-6">
                   <div className="flex flex-col gap-3 border-b border-white/10 pb-5 lg:flex-row lg:items-start lg:justify-between">
@@ -354,12 +395,14 @@ export default function SupportTicketsPage() {
                       <div className="text-xs text-white/45">{selectedTicket.ticket_no}</div>
                       <h2 className="mt-2 text-xl font-bold">{selectedTicket.subject}</h2>
                       <div className="mt-3 flex flex-wrap gap-2 text-xs">
-                        <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">{selectedTicket.category_label}</span>
+                        <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">
+                          {categoryLabel(selectedTicket.category, selectedTicket.category_label, t)}
+                        </span>
                         <span className={`rounded-full border px-3 py-1 ${statusClass(selectedTicket.status)}`}>
-                          {selectedTicket.status_label}
+                          {statusLabel(selectedTicket.status, selectedTicket.status_label, t)}
                         </span>
                         <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">
-                          更新于 {formatDate(selectedTicket.updated_at)}
+                          {t("supportTicketUpdatedAt", "user")} {formatDate(selectedTicket.updated_at, locale)}
                         </span>
                       </div>
                     </div>
@@ -370,7 +413,7 @@ export default function SupportTicketsPage() {
                         disabled={closing}
                         className="h-10 rounded border border-white/10 px-4 text-sm text-white/75 hover:bg-white/5 disabled:opacity-60"
                       >
-                        {closing ? "关闭中..." : "关闭工单"}
+                        {closing ? t("supportTicketClosing", "user") : t("supportTicketClose", "user")}
                       </button>
                     )}
                   </div>
@@ -386,8 +429,8 @@ export default function SupportTicketsPage() {
                         }`}
                       >
                         <div className="mb-2 flex items-center justify-between gap-3 text-xs text-white/45">
-                          <span>{messageSenderLabel(message.sender_type)}</span>
-                          <span>{formatDate(message.created_at)}</span>
+                          <span>{messageSenderLabel(message.sender_type, t)}</span>
+                          <span>{formatDate(message.created_at, locale)}</span>
                         </div>
                         <div className="whitespace-pre-wrap text-sm leading-7 text-white/85">{message.message}</div>
                       </div>
@@ -396,18 +439,18 @@ export default function SupportTicketsPage() {
 
                   {isSelectedClosed ? (
                     <div className="rounded border border-white/10 bg-white/5 px-4 py-3 text-sm text-white/55">
-                      该工单已关闭，如需继续咨询请提交新的支持工单。
+                      {t("supportTicketClosedHint", "user")}
                     </div>
                   ) : (
                     <form onSubmit={submitReply} className="space-y-3 border-t border-white/10 pt-5">
                       <label className="block text-sm">
-                        <span className="mb-2 block text-white/70">继续补充</span>
+                        <span className="mb-2 block text-white/70">{t("supportTicketContinueSupplement", "user")}</span>
                         <textarea
                           value={replyMessage}
                           onChange={(event) => setReplyMessage(event.target.value)}
                           maxLength={5000}
                           required
-                          placeholder="补充问题或回复客服"
+                          placeholder={t("supportTicketReplyPlaceholder", "user")}
                           className="min-h-32 w-full resize-y rounded border border-white/10 bg-white/5 px-3 py-3 text-white outline-none placeholder:text-white/30"
                         />
                       </label>
@@ -416,13 +459,13 @@ export default function SupportTicketsPage() {
                         disabled={replying}
                         className="h-10 rounded bg-amber-500 px-5 text-sm font-semibold text-black transition hover:bg-amber-400 disabled:opacity-60"
                       >
-                        {replying ? "提交中..." : "提交补充"}
+                        {replying ? t("supportTicketSubmitting", "user") : t("supportTicketReplySubmit", "user")}
                       </button>
                     </form>
                   )}
                 </div>
               ) : (
-                <div className="py-16 text-center text-white/50">请选择左侧工单，或提交一个新的支持工单。</div>
+                <div className="py-16 text-center text-white/50">{t("supportTicketSelectOrCreate", "user")}</div>
               )}
             </div>
           </section>

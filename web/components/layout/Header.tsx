@@ -14,10 +14,12 @@ import { fallbackSiteConfig, getSiteConfig } from '@/lib/api/modules/site';
 import { getAnnouncementUnreadCount } from '@/lib/api/modules/announcements';
 import MobileMenu from './MobileMenu';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import enTranslations from '@/config/locales/en.json';
 
 const FALLBACK_LOGO_URL = fallbackSiteConfig.logo_url || '/icons/logo-1.svg';
 const FALLBACK_SITE_NAME = fallbackSiteConfig.site_name || 'Royal Exchange';
 const FALLBACK_SITE_SLOGAN = fallbackSiteConfig.site_slogan || '';
+const DEFAULT_COMMON_TRANSLATIONS = (enTranslations as { common: Record<string, string> }).common;
 
 
 export default function Header() {
@@ -183,6 +185,7 @@ export default function Header() {
   const handleDownloadLeave = () => setShowQR(false);
 
   const [showMobileMenu, setShowMobileMenu] = useState(false);
+  const headerT = (key: string) => (mounted ? t(key, 'common') : DEFAULT_COMMON_TRANSLATIONS[key] || key);
 
   return (
     <>
@@ -222,7 +225,7 @@ export default function Header() {
           <nav className="hidden items-center gap-7 md:flex">
             {menuConfig.items.map((item) => {
               const hasMegaMenu = 'megaMenu' in item;
-              const translatedLabel = t(item.labelKey, 'common');
+              const translatedLabel = headerT(item.labelKey);
 
               return (
                 <div
@@ -275,14 +278,14 @@ export default function Header() {
           ) : !stableIsLoggedIn ? (
             <div className="hidden md:flex items-center gap-3.5">
               <Link href="/login" className="text-sm font-semibold text-white/80 hover:text-white transition-colors duration-200">
-                {t('login', 'common')}
+                {headerT('login')}
               </Link>
 
               <Link
                 href="/register"
                 className="ml-2 inline-flex h-9 items-center rounded-md bg-white px-4 text-sm font-semibold text-black hover:bg-white/90 transition-colors duration-200"
               >
-                {t('register', 'common')}
+                {headerT('register')}
               </Link>
             </div>
           ) : null}
@@ -291,18 +294,18 @@ export default function Header() {
             <button
               onClick={handleSearchClick}
               className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
-              aria-label={t('search', 'common')}
+              aria-label={headerT('search')}
             >
-              <Image src="/icons/header-search-1.svg" alt={t('search', 'common')} width={11} height={11} className="object-contain" />
+              <Image src="/icons/header-search-1.svg" alt={headerT('search')} width={11} height={11} className="object-contain" />
             </button>
           </div>
 
           <Link href="/notice" className="relative">
             <button
               className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
-              aria-label={t('notice', 'common')}
+              aria-label={headerT('notice')}
             >
-              <Image src="/icons/header-notice-1.svg" alt={t('notice', 'common')} width={13} height={13} className="object-contain" />
+              <Image src="/icons/header-notice-1.svg" alt={headerT('notice')} width={13} height={13} className="object-contain" />
             </button>
             {mounted && unreadAnnouncements > 0 && (
               <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-red-500 px-1.5 py-0.5 text-center text-[10px] font-bold leading-none text-white shadow-sm">
@@ -318,9 +321,9 @@ export default function Header() {
                   onMouseEnter={handleDownloadHover}
                   onMouseLeave={handleDownloadLeave}
                   className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
-                  aria-label={t('download', 'common')}
+                  aria-label={headerT('download')}
                 >
-                  <Image src="/icons/header-download-1.svg" alt={t('download', 'common')} width={13} height={13} className="object-contain" />
+                  <Image src="/icons/header-download-1.svg" alt={headerT('download')} width={13} height={13} className="object-contain" />
                 </button>
 
                 {showQR && (
@@ -330,7 +333,7 @@ export default function Header() {
                     onMouseLeave={handleDownloadLeave}
                   >
                     <div className="flex h-32 w-32 items-center justify-center rounded bg-white/5">
-                      <div className="text-sm text-white/70">{t('qrCode', 'common')}</div>
+                      <div className="text-sm text-white/70">{headerT('qrCode')}</div>
                     </div>
                   </div>
                 )}
@@ -339,11 +342,11 @@ export default function Header() {
               <Link href="/asset">
                 <button
                   className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
-                  aria-label={t('asset', 'common')}
+                  aria-label={headerT('asset')}
                 >
                   <Image
                     src="/icons/header-money-1.svg"
-                    alt={t('asset', 'common')}
+                    alt={headerT('asset')}
                     width={13}
                     height={13}
                     className="object-contain transform translate-y-[15%]"
@@ -358,7 +361,7 @@ export default function Header() {
           <button
             onClick={() => setShowMobileMenu(true)}
             className="md:hidden grid h-9 w-9 place-items-center rounded-md text-white/90 hover:bg-white/10"
-            aria-label={t('menu', 'common')}
+            aria-label={headerT('menu')}
           >
             {'\u2630'}
           </button>
@@ -366,9 +369,9 @@ export default function Header() {
           <button
             onClick={handleLanguageClick}
             className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
-            aria-label={t('language', 'common')}
+            aria-label={headerT('language')}
           >
-            <Image src="/icons/header-language-1.svg" alt={t('language', 'common')} width={13} height={13} className="object-contain" />
+            <Image src="/icons/header-language-1.svg" alt={headerT('language')} width={13} height={13} className="object-contain" />
           </button>
         </div>
 
@@ -376,11 +379,11 @@ export default function Header() {
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#02040a]/85 backdrop-blur-[2px]">
             <div className="relative z-10 w-80 rounded-lg border border-white/10 bg-[#0a0a0d] p-6">
               <div className="mb-4 flex items-center justify-between">
-                <h3 className="text-white font-medium">{t('language', 'common')}</h3>
+                <h3 className="text-white font-medium">{headerT('language')}</h3>
                 <button
                   onClick={handleCloseModal}
                   className="text-white/50 hover:text-white transition-colors"
-                  aria-label={t('close', 'common')}
+                  aria-label={headerT('close')}
                 >
                   {'\u00d7'}
                 </button>
@@ -449,14 +452,14 @@ export default function Header() {
             <div className="relative">
               <input
                 type="text"
-                placeholder={t('searchPlaceholder', 'common')}
+                placeholder={headerT('searchPlaceholder')}
                 className="h-10 w-full rounded-md border border-white/15 bg-white/10 px-4 py-2 text-sm text-white placeholder-white/50 outline-none focus:border-amber-500 transition-colors duration-200"
                 autoFocus
               />
               <button
                 onClick={handleSearchClick}
                 className="absolute right-3 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center text-white/50 hover:text-white transition-colors duration-200"
-                aria-label={t('closeSearch', 'common')}
+                aria-label={headerT('closeSearch')}
               >
                 {'\u00d7'}
               </button>

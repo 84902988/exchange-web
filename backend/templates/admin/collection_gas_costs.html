@@ -1,0 +1,243 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}归集 Gas 配置中心{% endblock %}
+{% block page_title %}归集 Gas 配置中心{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">配置只影响新创建的补 Gas 任务；已创建、执行中、已完成任务不会被重算。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .gas-cost-nav{display:flex;flex-wrap:wrap;gap:8px}
+    .gas-cost-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+    .gas-cost-card{background:linear-gradient(180deg,#181b22,#111318);border:1px solid rgba(148,163,184,.18);border-radius:8px;padding:14px}
+    .gas-cost-label{color:#9ca3af;font-size:12px;font-weight:800}
+    .gas-cost-value{margin-top:8px;color:#f8fafc;font-size:22px;font-weight:900;font-variant-numeric:tabular-nums}
+    .gas-cost-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+    .gas-config-wrap{overflow:visible}
+    .gas-config-table{width:100%;table-layout:fixed;font-size:13px}
+    .gas-config-table th,.gas-config-table td{padding:10px 12px;vertical-align:top}
+    .gas-config-table th:nth-child(1){width:14%}
+    .gas-config-table th:nth-child(2){width:18%}
+    .gas-config-table th:nth-child(3){width:20%}
+    .gas-config-table th:nth-child(4){width:16%}
+    .gas-config-table th:nth-child(5){width:32%}
+    .gas-mode-select{width:100%;min-width:0}
+    .gas-primary-value{font-size:17px;font-weight:900;color:#f8fafc}
+    .gas-muted{color:#9ca3af;font-size:12px;line-height:1.55}
+    .gas-advanced{margin-top:2px}
+    .gas-advanced summary{cursor:pointer;color:#f8fafc;font-weight:800;list-style:none}
+    .gas-advanced summary::-webkit-details-marker{display:none}
+    .gas-advanced summary::after{content:"展开";margin-left:8px;color:#9ca3af;font-size:12px;font-weight:700}
+    .gas-advanced[open] summary::after{content:"收起"}
+    .gas-advanced-panel{margin-top:10px;padding:10px;border:1px solid rgba(148,163,184,.18);border-radius:8px;background:rgba(255,255,255,.03)}
+    .gas-param-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+    .gas-field label{display:block;margin-bottom:4px;color:#9ca3af;font-size:12px;font-weight:800}
+    .gas-field input{width:100%;min-width:0}
+    .gas-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+    .gas-reference-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+    .gas-reference-card{border:1px solid rgba(148,163,184,.16);border-radius:8px;padding:12px;background:rgba(255,255,255,.025)}
+    .gas-reference-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:900}
+    .gas-reference-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
+    .gas-stat{min-width:0}
+    .gas-stat span{display:block;color:#9ca3af;font-size:12px}
+    .gas-stat strong{display:block;margin-top:3px;color:#f8fafc;font-size:13px;word-break:break-all}
+    @media (max-width: 900px){
+      .gas-config-table,.gas-config-table thead,.gas-config-table tbody,.gas-config-table tr,.gas-config-table th,.gas-config-table td{display:block;width:100%}
+      .gas-config-table thead{display:none}
+      .gas-config-table tr{border-bottom:1px solid rgba(148,163,184,.18)}
+      .gas-config-table td{padding:8px 0}
+      .gas-param-grid{grid-template-columns:1fr}
+    }
+  </style>
+
+  <section class="page-section">
+    <div class="gas-cost-nav">
+      <a href="/admin/collections/center" class="btn secondary admin-btn admin-btn-secondary">归集中心</a>
+      <a href="/admin/collections/tasks" class="btn secondary admin-btn admin-btn-secondary">归集任务</a>
+      <a href="/admin/collections/gas-tasks" class="btn secondary admin-btn admin-btn-secondary">补 Gas 任务</a>
+      <a href="/admin/collections/batches" class="btn secondary admin-btn admin-btn-secondary">归集批次</a>
+    </div>
+  </section>
+
+  {% if notice %}
+    <section class="page-section"><div class="admin-alert admin-alert-success">{{ notice }}</div></section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section"><div class="admin-alert admin-alert-danger">{{ error }}</div></section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="gas-cost-grid">
+      <div class="gas-cost-card">
+        <div class="gas-cost-label">7 天成功样本</div>
+        <div class="gas-cost-value">{{ summary.total_7d or 0 }}</div>
+      </div>
+      <div class="gas-cost-card">
+        <div class="gas-cost-label">统计分组</div>
+        <div class="gas-cost-value">{{ summary.groups or 0 }}</div>
+      </div>
+      <div class="gas-cost-card">
+        <div class="gas-cost-label">最近成功</div>
+        <div class="gas-cost-value" style="font-size:15px">{{ summary.latest_success_at or '-' }}</div>
+      </div>
+      <div class="gas-cost-card">
+        <div class="gas-cost-label">记录表状态</div>
+        <div class="gas-cost-value" style="font-size:15px">{{ '未创建' if table_missing else '正常' }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">运营配置概览</div>
+      <p class="gas-muted">
+        自动模式使用系统默认估算；智能模式（推荐）优先参考最近真实成本；手动模式使用“单次最大补Gas量”作为目标余额。
+      </p>
+      {% for item in gas_config_params %}
+        <form id="gas-config-form-{{ item.chain_key }}" method="post" action="/admin/collections/gas-config/update"></form>
+      {% endfor %}
+      <div class="table-wrap admin-table-wrap gas-config-wrap">
+        <table class="data-table admin-table gas-config-table">
+          <thead>
+            <tr>
+              <th>网络</th>
+              <th>模式</th>
+              <th class="text-right admin-number">当前建议补Gas量</th>
+              <th>状态</th>
+              <th>高级参数</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in gas_config_params %}
+              <tr>
+                <td class="gas-cost-mono">
+                  {{ item.chain_key }}
+                  {% if item.is_custom %}
+                    <div><span class="admin-badge admin-badge-warning">已自定义</span></div>
+                  {% endif %}
+                  <input form="gas-config-form-{{ item.chain_key }}" type="hidden" name="chain_key" value="{{ item.chain_key }}">
+                </td>
+                <td>
+                  <select form="gas-config-form-{{ item.chain_key }}" class="admin-input gas-mode-select" name="gas_topup_mode">
+                    {% for mode in item.mode_options %}
+                      <option value="{{ mode }}" {% if item.gas_topup_mode == mode %}selected{% endif %}>
+                        {% if mode == 'DEFAULT' %}自动模式{% elif mode == 'STATS_BASED' %}智能模式（推荐）{% elif mode == 'MANUAL' %}手动模式{% else %}{{ mode }}{% endif %}
+                      </option>
+                    {% endfor %}
+                  </select>
+                  <div class="gas-muted">
+                    当前：
+                    {% if item.gas_topup_mode == 'DEFAULT' %}自动模式{% elif item.gas_topup_mode == 'STATS_BASED' %}智能模式（推荐）{% elif item.gas_topup_mode == 'MANUAL' %}手动模式{% else %}{{ item.gas_topup_mode }}{% endif %}
+                  </div>
+                </td>
+                <td class="text-right">
+                  <div class="gas-primary-value gas-cost-mono">{{ item.target_balance_label }}</div>
+                  <div class="gas-muted">系统目标Gas余额</div>
+                </td>
+                <td>
+                  <span class="admin-badge admin-badge-{{ item.target_status_badge }}">
+                    {% if item.target_gt_cap %}需关注{% else %}正常{% endif %}
+                  </span>
+                  <div class="gas-muted">
+                    {{ item.estimate_source }}，样本 {{ item.stats_sample_count }}，P95 {{ item.stats_p95_native_fee_label }}
+                  </div>
+                </td>
+                <td>
+                  <details class="gas-advanced">
+                    <summary>高级参数</summary>
+                    <div class="gas-advanced-panel">
+                      <div class="gas-param-grid">
+                        <div class="gas-field">
+                          <label>安全倍数</label>
+                          <input form="gas-config-form-{{ item.chain_key }}" class="admin-input gas-cost-mono" name="safe_multiplier" value="{{ item.safe_multiplier_value }}">
+                        </div>
+                        <div class="gas-field">
+                          <label>安全预留Gas</label>
+                          <input form="gas-config-form-{{ item.chain_key }}" class="admin-input gas-cost-mono" name="buffer" value="{{ item.buffer_value }}">
+                        </div>
+                        <div class="gas-field">
+                          <label>单次最大补Gas量</label>
+                          <input form="gas-config-form-{{ item.chain_key }}" class="admin-input gas-cost-mono" name="cap" value="{{ item.cap_value }}">
+                        </div>
+                        <div class="gas-field">
+                          <label>最小补Gas</label>
+                          <input form="gas-config-form-{{ item.chain_key }}" class="admin-input gas-cost-mono" name="min_topup" value="{{ item.min_topup_value }}">
+                        </div>
+                        <div class="gas-field">
+                          <label>最大补Gas</label>
+                          <input form="gas-config-form-{{ item.chain_key }}" class="admin-input gas-cost-mono" name="max_topup" value="{{ item.max_topup_value }}">
+                        </div>
+                        <div class="gas-field">
+                          <label>系统目标Gas余额</label>
+                          <div class="gas-primary-value gas-cost-mono">{{ item.target_balance_label }}</div>
+                        </div>
+                      </div>
+                      <div class="gas-actions">
+                        <button form="gas-config-form-{{ item.chain_key }}" class="btn primary admin-btn admin-btn-primary" type="submit" name="reset_default" value="0">保存配置</button>
+                        <button form="gas-config-form-{{ item.chain_key }}" class="btn secondary admin-btn admin-btn-secondary" type="submit" name="reset_default" value="1">恢复默认</button>
+                      </div>
+                    </div>
+                  </details>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">真实 Gas 成本参考</div>
+      {% if items %}
+        <div class="gas-reference-grid">
+          {% for item in items %}
+            <div class="gas-reference-card">
+              <div class="gas-reference-title">
+                <span class="gas-cost-mono">{{ item.chain_key }} / {{ item.token_symbol }}</span>
+                <span class="admin-badge admin-badge-info">7 天 {{ item.count_7d }} 笔</span>
+              </div>
+              <div class="gas-reference-stats">
+                <div class="gas-stat"><span>24h 笔数</span><strong class="gas-cost-mono">{{ item.count_24h }}</strong></div>
+                <div class="gas-stat"><span>平均成本</span><strong class="gas-cost-mono">{{ item.avg_native_fee_label }}</strong></div>
+                <div class="gas-stat"><span>P95 成本</span><strong class="gas-cost-mono">{{ item.p95_native_fee_label }}</strong></div>
+                <div class="gas-stat"><span>最近成本</span><strong class="gas-cost-mono">{{ item.last_native_fee_label }}</strong></div>
+                <div class="gas-stat"><span>最近成功</span><strong class="gas-cost-mono">{{ item.last_success_at }}</strong></div>
+                <div class="gas-stat"><span>失败 Gas 任务</span><strong class="gas-cost-mono" title="{{ item.latest_failed_reason }}">{{ item.failed_gas_tasks_7d }}</strong></div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="muted">暂无真实归集 Gas 成本记录。</p>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">系统默认参考</div>
+      <div class="gas-reference-grid">
+        {% for item in default_params %}
+          <div class="gas-reference-card">
+            <div class="gas-reference-title">
+              <span class="gas-cost-mono">{{ item.chain_key }}</span>
+              <span class="admin-badge admin-badge-{{ item.target_status_badge }}">
+                {% if item.target_gt_cap %}需关注{% else %}正常{% endif %}
+              </span>
+            </div>
+            <div class="gas-reference-stats">
+              <div class="gas-stat"><span>默认估算Gas</span><strong class="gas-cost-mono">{{ item.estimated_required_native_label }}</strong></div>
+              <div class="gas-stat"><span>安全预留Gas</span><strong class="gas-cost-mono">{{ item.buffer_label }}</strong></div>
+              <div class="gas-stat"><span>单次最大补Gas量</span><strong class="gas-cost-mono">{{ item.topup_cap_label }}</strong></div>
+              <div class="gas-stat"><span>系统目标Gas余额</span><strong class="gas-cost-mono">{{ item.target_balance_label }}</strong></div>
+              <div class="gas-stat"><span>7 天失败 Gas 任务</span><strong class="gas-cost-mono">{{ failed_counts.get(item.chain_key, 0) }}</strong></div>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+{% endblock %}

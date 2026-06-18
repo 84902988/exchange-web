@@ -14,9 +14,9 @@ export function useProfile() {
     try {
       const data = await getUserInfo(); // 调用 /me 接口
       setUserInfo(data);
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error("getUserInfo failed:", e);
-      setError(e?.message || "Failed to load profile");
+      setError(e instanceof Error ? e.message : "Failed to load profile");
       setUserInfo(null);
     } finally {
       setLoading(false);

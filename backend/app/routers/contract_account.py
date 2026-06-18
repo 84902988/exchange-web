@@ -14,6 +14,7 @@ from app.services.contract_account_service import (
     transfer_from_contract,
     transfer_to_contract,
 )
+from app.services.contract_private_ws import publish_contract_user_updates
 
 router = APIRouter(prefix="/contract/account", tags=["contract-account"])
 
@@ -74,6 +75,7 @@ def contract_transfer_in(
             amount=payload.amount,
             from_account=payload.account,
         )
+        publish_contract_user_updates(user_id=int(user_id), include_account=True)
         return ok(data=data.model_dump(), trace_id=trace_id)
     except (ContractAccountBadRequest, ContractAccountInsufficientBalance) as exc:
         db.rollback()
@@ -104,6 +106,7 @@ def contract_transfer_out(
             amount=payload.amount,
             to_account=payload.account,
         )
+        publish_contract_user_updates(user_id=int(user_id), include_account=True)
         return ok(data=data.model_dump(), trace_id=trace_id)
     except (ContractAccountBadRequest, ContractAccountInsufficientBalance) as exc:
         db.rollback()

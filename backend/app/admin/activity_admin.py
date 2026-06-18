@@ -5,7 +5,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.routers.admin_pages import render, require_admin, _build_site_content_redirect_url
+from app.routers.admin_pages import (
+    _build_site_content_redirect_url,
+    render,
+    require_admin,
+    require_admin_post_permission,
+)
 from app.services.activity_service import (
     ACTIVITY_STATUSES,
     MEDIA_TYPES,
@@ -244,6 +249,9 @@ def activity_create_submit(
     redir = require_admin(request)
     if redir:
         return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
 
     payload = _activity_payload(
         title=title,
@@ -386,6 +394,9 @@ def activity_edit_submit(
     redir = require_admin(request)
     if redir:
         return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
 
     payload = _activity_payload(
         title=title,
@@ -467,6 +478,9 @@ def activity_toggle_status(
     redir = require_admin(request)
     if redir:
         return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
     result = admin_toggle_activity_status(db, activity_id)
     return RedirectResponse(
         url=_build_site_content_redirect_url(
@@ -482,6 +496,9 @@ def activity_toggle_status(
 @router.post("/activities/{activity_id}/delete")
 def activity_delete_submit(request: Request, activity_id: int, db: Session = Depends(get_db)):
     redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
     if redir:
         return redir
     result = admin_delete_activity(db, activity_id)
@@ -579,6 +596,9 @@ def activity_banner_create_submit(
     redir = require_admin(request)
     if redir:
         return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
     payload = _banner_payload(
         title=title,
         subtitle=subtitle,
@@ -672,6 +692,9 @@ def activity_banner_edit_submit(
     redir = require_admin(request)
     if redir:
         return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
     payload = _banner_payload(
         title=title,
         subtitle=subtitle,
@@ -728,6 +751,9 @@ def activity_banner_toggle_enabled(
     redir = require_admin(request)
     if redir:
         return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
     result = admin_toggle_activity_banner_enabled(db, banner_id)
     return RedirectResponse(
         url=_build_site_content_redirect_url(
@@ -743,6 +769,9 @@ def activity_banner_toggle_enabled(
 @router.post("/activity-banners/{banner_id}/delete")
 def activity_banner_delete_submit(request: Request, banner_id: int, db: Session = Depends(get_db)):
     redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
     if redir:
         return redir
     result = admin_delete_activity_banner(db, banner_id)

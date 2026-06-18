@@ -2,7 +2,15 @@
 {% set active_group = active_group|default('') %}
 {% set perms = current_admin_permissions|default([]) %}
 {% set is_sa = is_super_admin|default(false) %}
-{% set collection_nav_active = ['collection_center', 'collection_manual', 'collection_tools', 'collection_auto_settings', 'collection_records', 'collection_batches', 'collection_tasks'] %}
+{% set collection_center_active = active == 'collection_center' %}
+{% set collection_manual_active = active == 'collection_manual' %}
+{% set collection_tools_active = active == 'collection_tools' %}
+{% set collection_auto_settings_active = active == 'collection_auto_settings' %}
+{% set collection_records_active = active == 'collection_records' %}
+{% set collection_batches_active = active == 'collection_batches' %}
+{% set collection_tasks_active = active == 'collection_tasks' %}
+{% set collection_gas_costs_active = active == 'collection_gas_costs' %}
+{% set collection_module_active = collection_center_active or collection_manual_active or collection_tools_active or collection_auto_settings_active or collection_records_active or collection_batches_active or collection_tasks_active or collection_gas_costs_active %}
 
 {% set can_dashboard = is_sa or 'dashboard.view' in perms %}
 {% set can_users = is_sa or 'users.view' in perms %}
@@ -24,6 +32,7 @@
 {% set can_contract_liquidations = is_sa or 'contract_liquidations.view' in perms %}
 {% set can_pairs = is_sa or 'trading_pairs.manage' in perms %}
 {% set can_contract_symbols = is_sa or 'contract_symbols.manage' in perms %}
+{% set can_market_providers = can_contract_symbols %}
 {% set can_asset_configs = is_sa or 'asset_configs.manage' in perms %}
 {% set can_platform_accounts = is_sa or 'platform_accounts.view' in perms %}
 {% set can_platform_adjust = is_sa or 'platform_adjust.manage' in perms %}
@@ -43,7 +52,7 @@
 {% set can_audit = is_sa or 'audit.view' in perms %}
 
 {% set show_overview = can_dashboard %}
-{% set show_market_analysis = can_market_analysis %}
+{% set show_market_analysis = can_market_analysis or can_market_providers %}
 {% set show_users = can_users or can_vip or can_bd or can_invite or can_support_tickets %}
 {% set show_funds = can_assets or can_balance_logs or can_deposits or can_withdraws or can_withdraw_anomalies or can_withdraw_reviews or can_user_transfers or can_platform_adjust or can_collection_tasks or can_hot_wallets or can_stock_locks or can_asset_configs %}
 {% set show_trade = can_orders or can_trades or can_fee_settings or can_pairs or can_contract_orders or can_contract_trades or can_contract_positions or can_contract_accounts or can_contract_liquidations or can_contract_symbols or can_platform_accounts or can_dealer_risk %}
@@ -74,12 +83,19 @@
   {% endif %}
 
   {% if show_market_analysis %}
-    <details class="group" {% if active_group == 'market_analysis' or active in ['market_analysis_pairs'] %}open{% endif %}>
+    <details class="group" {% if active_group == 'market_analysis' or active in ['market_analysis_pairs', 'market_providers'] %}open{% endif %}>
       <summary>市场分析 <span class="chev">▾</span></summary>
       <div class="nav">
-        <a href="/admin/market-analysis/pairs" class="{% if active == 'market_analysis_pairs' %}active{% endif %}">
-          <span class="icon">M</span> 交易对分析
-        </a>
+        {% if can_market_analysis %}
+          <a href="/admin/market-analysis/pairs" class="{% if active == 'market_analysis_pairs' %}active{% endif %}">
+            <span class="icon">M</span> 交易对分析
+          </a>
+        {% endif %}
+        {% if can_market_providers %}
+          <a href="/admin/market-providers" class="{% if active == 'market_providers' %}active{% endif %}">
+            <span class="icon">S</span> 行情源配置中心
+          </a>
+        {% endif %}
       </div>
     </details>
   {% endif %}
@@ -161,7 +177,7 @@
   {% endif %}
 
   {% if show_funds %}
-    <details class="group" {% if active_group == 'funds' or active in collection_nav_active or active in ['assets_query', 'deposit_records', 'withdraw_records', 'withdraw_anomalies', 'user_transfers', 'balance_logs', 'withdraw_reviews', 'platform_adjust', 'platform_adjust_logs', 'hot_wallets', 'stock_token_lock_configs', 'stock_token_locks', 'asset_configs', 'chain_health'] %}open{% endif %}>
+    <details class="group" {% if active_group == 'funds' or collection_module_active or active in ['assets_query', 'deposit_records', 'withdraw_records', 'withdraw_anomalies', 'user_transfers', 'balance_logs', 'withdraw_reviews', 'platform_adjust', 'platform_adjust_logs', 'hot_wallets', 'stock_token_lock_configs', 'stock_token_locks', 'asset_configs', 'chain_health'] %}open{% endif %}>
       <summary>资金 <span class="chev">▾</span></summary>
       <div class="nav">
         {% if can_assets or can_balance_logs or can_user_transfers %}
@@ -216,7 +232,7 @@
         {% endif %}
 
         {% if can_platform_adjust or can_collection_tasks or can_hot_wallets %}
-          <details class="admin-nav-group" {% if active in collection_nav_active or active in ['platform_adjust', 'platform_adjust_logs', 'hot_wallets'] %}open{% endif %}>
+          <details class="admin-nav-group" {% if collection_module_active or active in ['platform_adjust', 'platform_adjust_logs', 'hot_wallets'] %}open{% endif %}>
             <summary class="admin-nav-group-summary">平台资金 <span class="chev">▾</span></summary>
             <div class="admin-nav-group-items">
               {% if can_platform_adjust %}
@@ -228,8 +244,11 @@
                 </a>
               {% endif %}
               {% if can_collection_tasks %}
-                <a href="/admin/collections/center" class="{% if active in collection_nav_active %}active{% endif %}">
+                <a href="/admin/collections/center" class="{% if collection_center_active %}active{% endif %}">
                   <span class="icon">C</span> 归集中心
+                </a>
+                <a href="/admin/collections/gas-costs" class="{% if collection_gas_costs_active %}active{% endif %}">
+                  <span class="icon">G</span> Gas 成本统计
                 </a>
               {% endif %}
               {% if can_hot_wallets %}
@@ -367,11 +386,11 @@
   {% endif %}
 
   {% if show_operations %}
-    <details class="group" {% if active_group == 'operations' or active in ['reference_overlays', 'site_settings', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'dividend_config', 'dividend_pools', 'dividend_stats'] %}open{% endif %}>
+    <details class="group" {% if active_group == 'operations' or active in ['reference_overlays', 'site_settings', 'site_legal_pages', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'dividend_config', 'dividend_pools', 'dividend_stats'] %}open{% endif %}>
       <summary>运营 <span class="chev">▾</span></summary>
       <div class="nav">
         {% if can_site_settings or can_banners or can_announcements or can_help_content or can_pairs %}
-          <details class="admin-nav-group" {% if active in ['site_settings', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'reference_overlays'] %}open{% endif %}>
+          <details class="admin-nav-group" {% if active in ['site_settings', 'site_legal_pages', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'reference_overlays'] %}open{% endif %}>
             <summary class="admin-nav-group-summary">内容运营 <span class="chev">▾</span></summary>
             <div class="admin-nav-group-items">
               {% if can_site_settings %}
@@ -396,6 +415,9 @@
                 </a>
               {% endif %}
               {% if can_help_content %}
+                <a href="/admin/site-legal-pages" class="{% if active == 'site_legal_pages' %}active{% endif %}">
+                  <span class="icon">L</span> 风险与协议页面
+                </a>
                 <a href="/admin/help/categories" class="{% if active == 'help_categories' %}active{% endif %}">
                   <span class="icon">C</span> 帮助分类
                 </a>

@@ -29,6 +29,16 @@ from app.services.itick_market_service import (
 )
 from app.services.itick_holiday_service import itick_holiday_service
 from app.services.market_kline_cache import get_klines_cache_first
+from app.services.contract_market_provider_service import (
+    MarketDataProviderConfig,
+    MarketDataProviderError,
+    contract_market_last_good_enabled,
+    enabled_spot_market_providers,
+    mark_contract_market_provider_failure,
+    mark_contract_market_provider_success,
+    request_contract_market_provider_json,
+    resolve_spot_provider_symbol,
+)
 from app.services.stock_dealer_depth_service import (
     get_stock_depth_with_fallback,
     get_stock_trade_context,
@@ -60,6 +70,13 @@ ITICK_KLINE_TYPES = {
 _ITICK_LAST_GOOD_PRICE: Dict[str, Decimal] = {}
 _ITICK_TICKER_CACHE: Dict[str, Tuple[float, TickerItem]] = {}
 _ITICK_TICKER_CACHE_TTL_SECONDS = 30
+_SPOT_LAST_GOOD_TICKERS: Dict[str, TickerItem] = {}
+_SPOT_LAST_GOOD_DEPTHS: Dict[str, DepthResponse] = {}
+_SPOT_LAST_GOOD_TRADES: Dict[str, TradesResponse] = {}
+_SPOT_LAST_GOOD_KLINES: Dict[tuple[str, str], dict[str, Any]] = {}
+_SPOT_PROVIDER_LOG_THROTTLE: Dict[tuple[str, str, str, str], float] = {}
+_SPOT_PROVIDER_LOG_THROTTLE_SECONDS = 60
+_SPOT_PROVIDER_COOLDOWN_REASON = "provider is in cooldown"
 
 _INTERVAL_SECONDS = {
     "1m": 60,
@@ -833,7 +850,7 @@ def get_depth(db: Session, symbol: str, limit: int = 20) -> DepthResponse:
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        return _get_binance_depth(pair, limit=limit)
+        return _get_external_spot_depth(db, pair, limit=limit)
 
     internal_depth = _get_internal_depth(db, pair, limit=limit)
 
@@ -891,6 +908,471 @@ def _get_binance_trades(pair: TradingPair, limit: int = 50) -> TradesResponse:
     )
 
 
+def _spot_provider_rows(payload: Any) -> list[Any]:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return [data]
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _spot_provider_first_row(payload: Any) -> Dict[str, Any]:
+    rows = _spot_provider_rows(payload)
+    if rows and isinstance(rows[0], dict):
+        return rows[0]
+    return {}
+
+
+def _spot_provider_ts(value: Any) -> int:
+    try:
+        timestamp = int(value or 0)
+    except Exception:
+        timestamp = 0
+    if timestamp > 0:
+        return timestamp
+    return _now_ms()
+
+
+def _spot_provider_symbol(db: Session, pair: TradingPair, provider: MarketDataProviderConfig) -> str:
+    return resolve_spot_provider_symbol(
+        db,
+        provider_code=provider.provider_code,
+        local_symbol=pair.symbol,
+        fallback_symbol=_external_symbol(pair),
+    )
+
+
+def _spot_interval_value(provider_code: str, interval: str) -> str:
+    normalized = str(interval or "1m").strip()
+    if provider_code == "OKX_SPOT":
+        return {"1h": "1H", "4h": "4H", "1d": "1D"}.get(normalized, normalized)
+    if provider_code == "BITGET_SPOT":
+        return {
+            "1m": "1min",
+            "5m": "5min",
+            "15m": "15min",
+            "1h": "1h",
+            "4h": "4h",
+            "1d": "1day",
+        }.get(normalized, "1min")
+    return normalized
+
+
+def _spot_kline_extra_params(provider_code: str, interval: str, end_time_ms: Optional[int]) -> dict[str, Any]:
+    if provider_code == "OKX_SPOT":
+        return {"bar": _spot_interval_value(provider_code, interval)}
+    if provider_code == "BITGET_SPOT":
+        params: dict[str, Any] = {"granularity": _spot_interval_value(provider_code, interval)}
+        if end_time_ms:
+            params["endTime"] = max(int(end_time_ms) - 1, 1)
+        return params
+    if provider_code == "BINANCE_SPOT":
+        params = {"interval": interval}
+        if end_time_ms:
+            params["endTime"] = max(int(end_time_ms) - 1, 1)
+        return params
+    return {}
+
+
+def _spot_ticker_from_provider(
+    *,
+    pair: TradingPair,
+    provider_code: str,
+    payload: Any,
+) -> TickerItem:
+    if provider_code == "OKX_SPOT":
+        row = _spot_provider_first_row(payload)
+        last_price = _to_decimal(row.get("last"))
+        open_24h = _to_decimal(row.get("open24h"))
+        high_24h = _to_decimal(row.get("high24h"), last_price)
+        low_24h = _to_decimal(row.get("low24h"), last_price)
+        base_volume = _to_decimal(row.get("vol24h"))
+        quote_volume = _to_decimal(row.get("volCcy24h") or row.get("volCcyQuote24h"))
+        ts_ms = _spot_provider_ts(row.get("ts"))
+    elif provider_code == "BITGET_SPOT":
+        row = _spot_provider_first_row(payload)
+        last_price = _to_decimal(row.get("lastPr") or row.get("last") or row.get("close"))
+        open_24h = _to_decimal(row.get("open24h") or row.get("openUtc"))
+        high_24h = _to_decimal(row.get("high24h"), last_price)
+        low_24h = _to_decimal(row.get("low24h"), last_price)
+        base_volume = _to_decimal(row.get("baseVolume") or row.get("baseVol"))
+        quote_volume = _to_decimal(row.get("quoteVolume") or row.get("quoteVol") or row.get("usdtVolume"))
+        ts_ms = _spot_provider_ts(row.get("ts"))
+    elif provider_code == "BINANCE_SPOT" and isinstance(payload, dict):
+        last_price = _to_decimal(payload.get("lastPrice"))
+        price_change = _to_decimal(payload.get("priceChange"))
+        open_24h = last_price - price_change if last_price > 0 else Decimal("0")
+        high_24h = _to_decimal(payload.get("highPrice"), last_price)
+        low_24h = _to_decimal(payload.get("lowPrice"), last_price)
+        base_volume = _to_decimal(payload.get("volume"))
+        quote_volume = _to_decimal(payload.get("quoteVolume"))
+        ts_ms = _spot_provider_ts(payload.get("closeTime"))
+    else:
+        raise ValueError("unsupported spot ticker provider")
+
+    if last_price <= 0:
+        raise ValueError("spot ticker last_price unavailable")
+    if open_24h <= 0:
+        open_24h = last_price
+    if high_24h <= 0:
+        high_24h = last_price
+    if low_24h <= 0:
+        low_24h = last_price
+    if quote_volume <= 0 and base_volume > 0:
+        quote_volume = base_volume * last_price
+
+    price_change_24h = last_price - open_24h
+    price_change_percent = Decimal("0")
+    if open_24h > 0:
+        price_change_percent = (price_change_24h / open_24h) * Decimal("100")
+    updated_at = datetime.utcfromtimestamp(ts_ms / 1000).isoformat()
+
+    return TickerItem(
+        symbol=pair.symbol,
+        last_price=_format_price_for_pair(pair, last_price),
+        open_24h=_format_price_for_pair(pair, open_24h),
+        price_change_24h=_format_price_for_pair(pair, price_change_24h),
+        price_change_percent=_format_percent(price_change_percent),
+        volume_24h=_format_amount_for_pair(pair, base_volume),
+        base_volume_24h=_format_amount_for_pair(pair, base_volume),
+        high_24h=_format_price_for_pair(pair, high_24h),
+        low_24h=_format_price_for_pair(pair, low_24h),
+        quote_volume_24h=_decimal_to_str(quote_volume),
+        price_precision=int(pair.price_precision or 8),
+        amount_precision=int(pair.amount_precision or 8),
+        source="external",
+        provider=provider_code,
+        stale=False,
+        updated_at=updated_at,
+        quote_freshness="LIVE",
+        ts=updated_at,
+    )
+
+
+def _spot_depth_from_provider(
+    *,
+    pair: TradingPair,
+    provider_code: str,
+    payload: Any,
+    limit: int,
+) -> DepthResponse:
+    data = payload
+    if provider_code == "OKX_SPOT":
+        data = _spot_provider_first_row(payload)
+    elif provider_code == "BITGET_SPOT":
+        data = payload.get("data") if isinstance(payload, dict) else payload
+    bids_raw = data.get("bids") if isinstance(data, dict) else None
+    asks_raw = data.get("asks") if isinstance(data, dict) else None
+
+    def adapt(levels: Any) -> list[DepthItem]:
+        items: list[DepthItem] = []
+        if not isinstance(levels, list):
+            return items
+        for row in levels[:limit]:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            price = _to_decimal(row[0])
+            amount = _to_decimal(row[1])
+            if price <= 0 or amount <= 0:
+                continue
+            items.append(DepthItem(price=_format_price_for_pair(pair, price), amount=_format_amount_for_pair(pair, amount)))
+        return items
+
+    bids = adapt(bids_raw)
+    asks = adapt(asks_raw)
+    if not bids or not asks:
+        raise ValueError("spot depth unavailable")
+    now = datetime.utcnow().isoformat()
+    return DepthResponse(
+        symbol=pair.symbol,
+        price_precision=int(pair.price_precision or 8),
+        bids=bids,
+        asks=asks,
+        ts=_now_ms(),
+        provider=provider_code,
+        stale=False,
+        updated_at=now,
+        source="external",
+        fetched_at=_now_ms(),
+    )
+
+
+def _spot_trades_from_provider(
+    *,
+    pair: TradingPair,
+    provider_code: str,
+    payload: Any,
+    limit: int,
+) -> TradesResponse:
+    rows = _spot_provider_rows(payload)
+    trades: list[TradeItem] = []
+    for row in rows[:limit]:
+        if not isinstance(row, dict):
+            continue
+        if provider_code == "OKX_SPOT":
+            price = row.get("px")
+            amount = row.get("sz")
+            side_text = str(row.get("side") or "").upper()
+            ts = _spot_provider_ts(row.get("ts"))
+        elif provider_code == "BITGET_SPOT":
+            price = row.get("price")
+            amount = row.get("size") or row.get("baseVolume")
+            side_text = str(row.get("side") or "").upper()
+            ts = _spot_provider_ts(row.get("ts"))
+        else:
+            price = row.get("price")
+            amount = row.get("qty")
+            side_text = "SELL" if bool(row.get("isBuyerMaker")) else "BUY"
+            ts = _spot_provider_ts(row.get("time"))
+        if _to_decimal(price) <= 0 or _to_decimal(amount) <= 0:
+            continue
+        trades.append(
+            TradeItem(
+                price=_format_price_for_pair(pair, price),
+                amount=_format_amount_for_pair(pair, amount),
+                side="SELL" if side_text == "SELL" else "BUY",
+                ts=ts,
+            )
+        )
+    if not trades:
+        raise ValueError("spot trades unavailable")
+    return TradesResponse(symbol=pair.symbol, trades=trades, provider=provider_code, stale=False, updated_at=datetime.utcnow().isoformat())
+
+
+def _spot_klines_from_provider(
+    *,
+    provider_code: str,
+    payload: Any,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    rows = _spot_provider_rows(payload)
+    items: list[dict[str, Any]] = []
+    step_ms = _INTERVAL_SECONDS[interval] * 1000
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        try:
+            open_time = int(row[0])
+        except Exception:
+            continue
+        if open_time <= 0:
+            continue
+        if end_time_ms and open_time >= int(end_time_ms):
+            continue
+        quote_volume_index = 6 if provider_code == "BITGET_SPOT" else 7
+        items.append(
+            {
+                "open_time": open_time,
+                "close_time": open_time + step_ms,
+                "open": str(row[1]),
+                "high": str(row[2]),
+                "low": str(row[3]),
+                "close": str(row[4]),
+                "volume": str(row[5] if len(row) > 5 else "0"),
+                "quote_volume": str(row[quote_volume_index] if len(row) > quote_volume_index else "0"),
+            }
+        )
+    items.sort(key=lambda item: int(item["open_time"]))
+    return items[-limit:]
+
+
+def _spot_last_good_ticker(pair: TradingPair) -> Optional[TickerItem]:
+    cached = _SPOT_LAST_GOOD_TICKERS.get(pair.symbol)
+    if cached is None:
+        return None
+    data = cached.model_dump() if hasattr(cached, "model_dump") else cached.dict()
+    data.update({"provider": "LAST_GOOD", "stale": True, "quote_freshness": "LAST_VALID", "source": "external"})
+    return TickerItem(**data)
+
+
+def _is_spot_provider_cooldown_skip(exc: Exception) -> bool:
+    return isinstance(exc, MarketDataProviderError) and str(exc).strip().lower() == _SPOT_PROVIDER_COOLDOWN_REASON
+
+
+def _spot_provider_warning_allowed(
+    *,
+    endpoint: str,
+    symbol: str,
+    provider: str,
+    reason: Exception,
+) -> bool:
+    reason_text = str(reason or "")
+    key = (str(endpoint or ""), str(symbol or ""), str(provider or ""), reason_text)
+    now = time.monotonic()
+    last_at = _SPOT_PROVIDER_LOG_THROTTLE.get(key)
+    if last_at is not None and now - last_at < _SPOT_PROVIDER_LOG_THROTTLE_SECONDS:
+        return False
+    _SPOT_PROVIDER_LOG_THROTTLE[key] = now
+    return True
+
+
+def _get_external_spot_ticker(db: Session, pair: TradingPair) -> Optional[TickerItem]:
+    last_error: Optional[Exception] = None
+    for provider in enabled_spot_market_providers(db):
+        try:
+            provider_symbol = _spot_provider_symbol(db, pair, provider)
+            payload = request_contract_market_provider_json(provider, "ticker", provider_symbol, limit=1)
+            ticker = _spot_ticker_from_provider(pair=pair, provider_code=provider.provider_code, payload=payload)
+            _SPOT_LAST_GOOD_TICKERS[pair.symbol] = ticker
+            mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
+            return ticker
+        except Exception as exc:
+            last_error = exc
+            mark_contract_market_provider_failure(
+                db,
+                provider.provider_code,
+                exc,
+                cooldown_seconds=provider.cooldown_seconds,
+                market_type="SPOT",
+            )
+            logger.warning("spot_provider_ticker_failed symbol=%s provider=%s reason=%s", pair.symbol, provider.provider_code, exc)
+    if contract_market_last_good_enabled(db):
+        fallback = _spot_last_good_ticker(pair)
+        if fallback is not None:
+            return fallback
+    logger.warning("spot_provider_ticker_unavailable symbol=%s reason=%s", pair.symbol, last_error)
+    return None
+
+
+def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20) -> DepthResponse:
+    last_error: Optional[Exception] = None
+    for provider in enabled_spot_market_providers(db):
+        try:
+            provider_symbol = _spot_provider_symbol(db, pair, provider)
+            payload = request_contract_market_provider_json(provider, "depth", provider_symbol, limit=limit)
+            depth = _spot_depth_from_provider(pair=pair, provider_code=provider.provider_code, payload=payload, limit=limit)
+            _SPOT_LAST_GOOD_DEPTHS[pair.symbol] = depth
+            mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
+            return depth
+        except MarketDataProviderError as exc:
+            if _is_spot_provider_cooldown_skip(exc):
+                last_error = exc
+                logger.debug(
+                    "spot_provider_depth_skipped_cooldown symbol=%s provider=%s",
+                    pair.symbol,
+                    provider.provider_code,
+                )
+                continue
+            last_error = exc
+            mark_contract_market_provider_failure(db, provider.provider_code, exc, cooldown_seconds=provider.cooldown_seconds, market_type="SPOT")
+            if _spot_provider_warning_allowed(endpoint="depth", symbol=pair.symbol, provider=provider.provider_code, reason=exc):
+                logger.warning("spot_provider_depth_failed symbol=%s provider=%s reason=%s", pair.symbol, provider.provider_code, exc)
+        except Exception as exc:
+            last_error = exc
+            mark_contract_market_provider_failure(db, provider.provider_code, exc, cooldown_seconds=provider.cooldown_seconds, market_type="SPOT")
+            if _spot_provider_warning_allowed(endpoint="depth", symbol=pair.symbol, provider=provider.provider_code, reason=exc):
+                logger.warning("spot_provider_depth_failed symbol=%s provider=%s reason=%s", pair.symbol, provider.provider_code, exc)
+    if contract_market_last_good_enabled(db) and pair.symbol in _SPOT_LAST_GOOD_DEPTHS:
+        cached = _SPOT_LAST_GOOD_DEPTHS[pair.symbol]
+        data = cached.model_dump() if hasattr(cached, "model_dump") else cached.dict()
+        data.update({"provider": "LAST_GOOD", "stale": True})
+        return DepthResponse(**data)
+    raise ValueError(f"spot external depth unavailable: {last_error}")
+
+
+def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50) -> TradesResponse:
+    last_error: Optional[Exception] = None
+    for provider in enabled_spot_market_providers(db):
+        try:
+            provider_symbol = _spot_provider_symbol(db, pair, provider)
+            payload = request_contract_market_provider_json(provider, "trades", provider_symbol, limit=limit)
+            trades = _spot_trades_from_provider(pair=pair, provider_code=provider.provider_code, payload=payload, limit=limit)
+            _SPOT_LAST_GOOD_TRADES[pair.symbol] = trades
+            mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
+            return trades
+        except MarketDataProviderError as exc:
+            if _is_spot_provider_cooldown_skip(exc):
+                last_error = exc
+                logger.debug(
+                    "spot_provider_trades_skipped_cooldown symbol=%s provider=%s",
+                    pair.symbol,
+                    provider.provider_code,
+                )
+                continue
+            last_error = exc
+            mark_contract_market_provider_failure(db, provider.provider_code, exc, cooldown_seconds=provider.cooldown_seconds, market_type="SPOT")
+            if _spot_provider_warning_allowed(endpoint="trades", symbol=pair.symbol, provider=provider.provider_code, reason=exc):
+                logger.warning("spot_provider_trades_failed symbol=%s provider=%s reason=%s", pair.symbol, provider.provider_code, exc)
+        except Exception as exc:
+            last_error = exc
+            mark_contract_market_provider_failure(db, provider.provider_code, exc, cooldown_seconds=provider.cooldown_seconds, market_type="SPOT")
+            if _spot_provider_warning_allowed(endpoint="trades", symbol=pair.symbol, provider=provider.provider_code, reason=exc):
+                logger.warning("spot_provider_trades_failed symbol=%s provider=%s reason=%s", pair.symbol, provider.provider_code, exc)
+    if contract_market_last_good_enabled(db) and pair.symbol in _SPOT_LAST_GOOD_TRADES:
+        cached = _SPOT_LAST_GOOD_TRADES[pair.symbol]
+        data = cached.model_dump() if hasattr(cached, "model_dump") else cached.dict()
+        data.update({"provider": "LAST_GOOD", "stale": True})
+        return TradesResponse(**data)
+    raise ValueError(f"spot external trades unavailable: {last_error}")
+
+
+def _fetch_external_spot_klines(
+    db: Session,
+    pair: TradingPair,
+    *,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int],
+) -> list[dict[str, Any]]:
+    last_error: Optional[Exception] = None
+    for provider in enabled_spot_market_providers(db):
+        try:
+            provider_symbol = _spot_provider_symbol(db, pair, provider)
+            payload = request_contract_market_provider_json(
+                provider,
+                "kline",
+                provider_symbol,
+                limit=limit,
+                extra_params=_spot_kline_extra_params(provider.provider_code, interval, end_time_ms),
+            )
+            items = _spot_klines_from_provider(
+                provider_code=provider.provider_code,
+                payload=payload,
+                interval=interval,
+                limit=limit,
+                end_time_ms=end_time_ms,
+            )
+            if not items:
+                raise ValueError("spot kline unavailable")
+            _SPOT_LAST_GOOD_KLINES[(pair.symbol, interval)] = {
+                "items": items,
+                "provider": provider.provider_code,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
+            return items
+        except MarketDataProviderError as exc:
+            if _is_spot_provider_cooldown_skip(exc):
+                last_error = exc
+                logger.debug(
+                    "spot_provider_kline_skipped_cooldown symbol=%s provider=%s interval=%s",
+                    pair.symbol,
+                    provider.provider_code,
+                    interval,
+                )
+                continue
+            last_error = exc
+            mark_contract_market_provider_failure(db, provider.provider_code, exc, cooldown_seconds=provider.cooldown_seconds, market_type="SPOT")
+            if _spot_provider_warning_allowed(endpoint=f"kline:{interval}", symbol=pair.symbol, provider=provider.provider_code, reason=exc):
+                logger.warning("spot_provider_kline_failed symbol=%s provider=%s interval=%s reason=%s", pair.symbol, provider.provider_code, interval, exc)
+        except Exception as exc:
+            last_error = exc
+            mark_contract_market_provider_failure(db, provider.provider_code, exc, cooldown_seconds=provider.cooldown_seconds, market_type="SPOT")
+            if _spot_provider_warning_allowed(endpoint=f"kline:{interval}", symbol=pair.symbol, provider=provider.provider_code, reason=exc):
+                logger.warning("spot_provider_kline_failed symbol=%s provider=%s interval=%s reason=%s", pair.symbol, provider.provider_code, interval, exc)
+    if contract_market_last_good_enabled(db):
+        cached = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval))
+        if cached and cached.get("items"):
+            return list(cached["items"])[-limit:]
+    raise ValueError(f"spot external kline unavailable: {last_error}")
+
+
 def _build_itick_fallback_trades(pair: TradingPair, limit: int = 50) -> TradesResponse:
     trade_limit = max(1, min(int(limit or 20), 50))
     mid_price = _itick_ref_price(pair, allow_upstream=False)
@@ -923,7 +1405,7 @@ def get_trades(db: Session, symbol: str, limit: int = 50) -> TradesResponse:
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        return _get_binance_trades(pair, limit=limit)
+        return _get_external_spot_trades(db, pair, limit=limit)
 
     if data_source == DATA_SOURCE_ITICK:
         trades = _get_internal_trades(db, pair, limit=limit)
@@ -1126,6 +1608,7 @@ def _get_itick_daily_snapshot(pair: TradingPair) -> Dict[str, Decimal]:
     base_volume_24h = _to_decimal(latest.get("volume"))
     quote_volume_24h = _to_decimal(latest.get("quote_volume"))
     if quote_volume_24h <= 0 and base_volume_24h > 0 and close_price > 0:
+        # iTick daily kline may not include quote turnover; estimate quote turnover from close price and base volume.
         quote_volume_24h = base_volume_24h * close_price
 
     return {
@@ -1179,6 +1662,7 @@ def _derive_itick_24h_metrics(
         ],
     )
     if quote_volume_24h <= 0 and base_volume_24h > 0 and last_price > 0:
+        # iTick quote payload may not include quote turnover; estimate quote turnover from last price and base volume.
         quote_volume_24h = base_volume_24h * last_price
 
     official_change = _pick_decimal(
@@ -1231,6 +1715,7 @@ def _derive_itick_24h_metrics(
     if quote_volume_24h <= 0:
         quote_volume_24h = daily_snapshot.get("quote_volume_24h", Decimal("0"))
     if quote_volume_24h <= 0 and base_volume_24h > 0 and last_price > 0:
+        # Daily snapshot may still lack quote turnover; estimate quote turnover from last price and base volume.
         quote_volume_24h = base_volume_24h * last_price
 
     price_change_24h = Decimal("0")
@@ -1367,7 +1852,7 @@ def get_tickers(db: Session) -> TickerListResponse:
         data_source = _normalize_data_source(pair)
         ticker = None
         if data_source == DATA_SOURCE_BINANCE:
-            ticker = _get_binance_ticker(pair)
+            ticker = _get_external_spot_ticker(db, pair)
         elif data_source == DATA_SOURCE_ITICK:
             ticker = _get_itick_ticker(pair, allow_upstream=False)
 
@@ -1410,7 +1895,7 @@ def get_market_tickers(db: Session, symbol: Optional[str] = None, symbols: Optio
         data_source = _normalize_data_source(pair)
         ticker = None
         if data_source == DATA_SOURCE_BINANCE:
-            ticker = _get_binance_ticker(pair)
+            ticker = _get_external_spot_ticker(db, pair)
         elif data_source == DATA_SOURCE_ITICK:
             quote_data = itick_quote_batch.get(pair.symbol)
             if _is_itick_stock_pair(pair) and not normalized_symbol and quote_data is None:
@@ -1441,6 +1926,9 @@ def get_market_tickers(db: Session, symbol: Optional[str] = None, symbols: Optio
             "volume_24h": ticker.volume_24h,
             "base_volume_24h": ticker.base_volume_24h,
             "quote_volume_24h": ticker.quote_volume_24h,
+            "provider": ticker.provider,
+            "stale": bool(ticker.stale),
+            "updated_at": ticker.updated_at,
             "source": ticker.source,
             "quote_freshness": ticker.quote_freshness,
             "ts": ticker.ts,
@@ -1790,28 +2278,34 @@ def get_klines(
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        def _fetch_binance_klines(fetch_limit: int, fetch_end_time_ms: Optional[int]):
-            payload = binance_market_service.get_klines(
-                symbol=_external_symbol(pair),
+        def _fetch_external_spot(fetch_limit: int, fetch_end_time_ms: Optional[int]):
+            return _fetch_external_spot_klines(
+                db,
+                pair,
                 interval=interval,
                 limit=fetch_limit,
                 end_time_ms=fetch_end_time_ms,
             )
-            return [item.model_dump() for item in payload.items]
 
+        items = get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol=pair.symbol,
+            interval=interval,
+            limit=limit,
+            end_time_ms=end_time_ms,
+            source="EXTERNAL_SPOT",
+            fetch_external=_fetch_external_spot,
+        )
+        cached_meta = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval), {})
+        provider = str(cached_meta.get("provider") or "EXTERNAL_SPOT")
         return {
             "symbol": pair.symbol,
             "interval": interval,
-            "items": get_klines_cache_first(
-                db,
-                market_type="spot",
-                symbol=pair.symbol,
-                interval=interval,
-                limit=limit,
-                end_time_ms=end_time_ms,
-                source=DATA_SOURCE_BINANCE,
-                fetch_external=_fetch_binance_klines,
-            ),
+            "items": items,
+            "provider": provider,
+            "stale": provider == "LAST_GOOD",
+            "updated_at": cached_meta.get("updated_at"),
         }
 
     if _is_itick_stock_pair(pair):

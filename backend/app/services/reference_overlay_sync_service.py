@@ -160,7 +160,8 @@ def _sync_iron_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbol
         display_price = _decimal_from_payload(
             reference.get("mfc_usdt_price") or (usd_per_ton / Decimal("1000"))
         )
-        display_label = f"{_decimal_text(usd_per_ton)} USD/吨"
+        display_label = f"{_decimal_text(display_price)} USD/公斤"
+        source_label = f"{_decimal_text(usd_per_ton)} USD/吨"
         price_time = datetime.utcnow()
     except Exception as exc:
         db.rollback()
@@ -172,6 +173,7 @@ def _sync_iron_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbol
         normalized_symbol=normalized_symbol,
         display_price=display_price,
         display_label=display_label,
+        source_label=source_label,
         price_time=price_time,
     )
 
@@ -241,6 +243,7 @@ def _mark_success(
     display_price: Decimal,
     display_label: str,
     price_time: datetime,
+    source_label: str | None = None,
     market_status: str = "OPEN",
     market_status_text: str = "实时",
     is_realtime: bool = True,
@@ -251,7 +254,7 @@ def _mark_success(
 
     now = datetime.utcnow()
     overlay.last_ref_price = display_price
-    overlay.last_ref_label = display_label
+    overlay.last_ref_label = source_label or display_label
     overlay.last_sync_at = now
     overlay.sync_status = "SUCCESS"
     overlay.sync_error = None
@@ -269,7 +272,7 @@ def _mark_success(
         "symbol": normalized_symbol,
         "sync_status": "SUCCESS",
         "last_ref_price": _decimal_text(display_price),
-        "last_ref_label": display_label,
+        "last_ref_label": source_label or display_label,
         "display_price": _decimal_text(display_price),
         "display_value_label": display_label,
     }

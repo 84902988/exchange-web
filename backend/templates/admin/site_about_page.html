@@ -1,0 +1,369 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}关于我们页面{% endblock %}
+{% block page_title %}关于我们页面{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">维护前台 /about/who-we-are 页面内容，支持多语言。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .site-about-shell {
+      display: grid;
+      gap: 16px;
+      width: 100%;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+    .site-about-form {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      width: 100%;
+      min-width: 0;
+      align-items: stretch;
+    }
+    .settings-card {
+      display: grid;
+      gap: 16px;
+      min-width: 0;
+      padding: 18px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 12px;
+      background: rgba(255,255,255,.035);
+      box-shadow: 0 16px 36px rgba(0,0,0,.16);
+    }
+    .settings-card-header {
+      display: grid;
+      gap: 4px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .settings-card-title {
+      margin: 0;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 800;
+    }
+    .settings-card-desc {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      align-items: start;
+    }
+    .site-about-form .field {
+      align-self: start;
+      min-width: 0;
+    }
+    .site-about-form .field label {
+      min-height: 18px;
+      line-height: 18px;
+      margin-bottom: 8px;
+    }
+    .site-about-form textarea {
+      width: 100%;
+      min-height: 180px;
+      resize: vertical;
+      line-height: 1.65;
+    }
+    .i18n-panel {
+      display: grid;
+      gap: 18px;
+      padding: 16px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 12px;
+      background: rgba(255,255,255,.035);
+    }
+    .i18n-fallback-note {
+      margin: 0;
+      color: #facc15;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .i18n-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .i18n-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 7px 10px;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 8px;
+      background: rgba(255,255,255,.045);
+      color: var(--muted);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .i18n-tab.is-active {
+      border-color: rgba(250, 204, 21, .55);
+      background: rgba(250, 204, 21, .14);
+      color: #fff;
+    }
+    .i18n-tab-panel {
+      display: none;
+    }
+    .i18n-tab-panel.is-active {
+      display: grid;
+      gap: 18px;
+    }
+    .i18n-language-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .about-section-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .about-section-card {
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 10px;
+      background: rgba(0,0,0,.16);
+    }
+    .about-section-card.is-wide {
+      grid-column: 1 / -1;
+    }
+    .about-section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 800;
+    }
+    .about-section-code {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .about-values-hint {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .site-notice {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      border-color: rgba(49, 177, 119, .42);
+      background: linear-gradient(180deg, rgba(31, 122, 85, .20), rgba(31, 122, 85, .10));
+      transition: opacity .2s ease, transform .2s ease, margin .2s ease, padding .2s ease;
+    }
+    .site-notice.is-hidden {
+      opacity: 0;
+      transform: translateY(-6px);
+      pointer-events: none;
+    }
+    .site-notice-icon {
+      width: 28px;
+      height: 28px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 999px;
+      background: rgba(49, 177, 119, .22);
+      border: 1px solid rgba(49, 177, 119, .35);
+      color: #a8f0cd;
+      font-weight: 900;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .site-notice-title {
+      margin: 0 0 4px;
+      color: #a8f0cd;
+      font-size: 14px;
+      font-weight: 800;
+    }
+    .site-notice-text {
+      margin: 0;
+      color: #fff;
+      font-size: 14px;
+    }
+    @media (max-width: 760px) {
+      .settings-grid,
+      .about-section-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card site-notice" id="site_about_page_notice">
+        <span class="site-notice-icon">OK</span>
+        <div>
+          <p class="site-notice-title">保存成功</p>
+          <p class="site-notice-text">{{ notice }}</p>
+        </div>
+      </div>
+    </section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section">
+      <div class="card"><div class="section-title">提示信息</div><p class="muted">{{ error }}</p></div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card site-about-shell">
+      <form method="post" action="/admin/site-about-page" class="filter-form site-about-form">
+        <div class="settings-card">
+          <div class="settings-card-header">
+            <h3 class="settings-card-title">内容编辑</h3>
+            <p class="settings-card-desc">正文仅支持纯文本换行，不保存富文本 HTML。</p>
+          </div>
+          <div class="i18n-panel">
+            <p class="i18n-fallback-note">中文为默认 fallback；其他语言为空时前台会使用中文内容。</p>
+            <div class="i18n-tabs" role="tablist" aria-label="关于我们页面多语言内容编辑">
+              {% for language in about_page.languages %}
+                <button
+                  type="button"
+                  id="about_i18n_tab_{{ language.suffix }}"
+                  class="i18n-tab{% if loop.first %} is-active{% endif %}"
+                  role="tab"
+                  aria-selected="{% if loop.first %}true{% else %}false{% endif %}"
+                  aria-controls="about_i18n_panel_{{ language.suffix }}"
+                  data-about-i18n-tab="{{ language.suffix }}"
+                >
+                  <span>{{ language.label }}</span>
+                </button>
+              {% endfor %}
+            </div>
+            <div class="i18n-tab-panels">
+              {% for language in about_page.languages %}
+                <div
+                  id="about_i18n_panel_{{ language.suffix }}"
+                  class="i18n-tab-panel{% if loop.first %} is-active{% endif %}"
+                  role="tabpanel"
+                  aria-labelledby="about_i18n_tab_{{ language.suffix }}"
+                  data-about-i18n-panel="{{ language.suffix }}"
+                  {% if not loop.first %}hidden{% endif %}
+                >
+                  <div class="i18n-language-heading">
+                    <span>{{ language.label }}</span>
+                  </div>
+                  <div class="settings-grid">
+                    <div class="field">
+                      <label for="about_page_{{ language.suffix }}_title">页面标题</label>
+                      <input id="about_page_{{ language.suffix }}_title" name="about_page_{{ language.suffix }}_title" type="text" value="{{ language.title }}" />
+                    </div>
+                    <div class="field">
+                      <label for="about_page_{{ language.suffix }}_subtitle">页面副标题</label>
+                      <input id="about_page_{{ language.suffix }}_subtitle" name="about_page_{{ language.suffix }}_subtitle" type="text" value="{{ language.subtitle }}" />
+                    </div>
+                  </div>
+                  <div class="about-section-grid">
+                    {% for section in language.sections %}
+                      <div class="about-section-card{% if section.id == 'values' %} is-wide{% endif %}">
+                        <h4 class="about-section-title">
+                          <span>{{ section.label }}</span>
+                          <span class="about-section-code">{{ section.id }}</span>
+                        </h4>
+                        <div class="field">
+                          <label for="about_page_{{ language.suffix }}_{{ section.id }}_title">section 标题</label>
+                          <input
+                            id="about_page_{{ language.suffix }}_{{ section.id }}_title"
+                            name="about_page_{{ language.suffix }}_{{ section.id }}_title"
+                            type="text"
+                            value="{{ section.title }}"
+                          />
+                        </div>
+                        {% if section.id == 'values' %}
+                          <div class="field">
+                            <label for="about_page_{{ language.suffix }}_{{ section.id }}_items">正文</label>
+                            <textarea
+                              id="about_page_{{ language.suffix }}_{{ section.id }}_items"
+                              name="about_page_{{ language.suffix }}_{{ section.id }}_items"
+                            >{{ section.items_text }}</textarea>
+                            <p class="about-values-hint">每个价值观用空行分隔；每段第一行为小标题，后续行为正文。</p>
+                          </div>
+                        {% else %}
+                          <div class="field">
+                            <label for="about_page_{{ language.suffix }}_{{ section.id }}_body">正文</label>
+                            <textarea
+                              id="about_page_{{ language.suffix }}_{{ section.id }}_body"
+                              name="about_page_{{ language.suffix }}_{{ section.id }}_body"
+                            >{{ section.body_text }}</textarea>
+                          </div>
+                        {% endif %}
+                      </div>
+                    {% endfor %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">保存</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <script>
+    const siteAboutPageNotice = document.getElementById("site_about_page_notice");
+    if (siteAboutPageNotice) {
+      window.setTimeout(() => {
+        siteAboutPageNotice.classList.add("is-hidden");
+        window.setTimeout(() => siteAboutPageNotice.remove(), 220);
+      }, 2600);
+
+      const url = new URL(window.location.href);
+      if (url.searchParams.has("notice")) {
+        url.searchParams.delete("notice");
+        window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+      }
+    }
+
+    function initializeAboutPageTabs() {
+      const tabs = Array.from(document.querySelectorAll("[data-about-i18n-tab]"));
+      const panels = Array.from(document.querySelectorAll("[data-about-i18n-panel]"));
+      if (!tabs.length || !panels.length) return;
+
+      function activateTab(lang) {
+        tabs.forEach((tab) => {
+          const isActive = tab.dataset.aboutI18nTab === lang;
+          tab.classList.toggle("is-active", isActive);
+          tab.setAttribute("aria-selected", isActive ? "true" : "false");
+        });
+        panels.forEach((panel) => {
+          const isActive = panel.dataset.aboutI18nPanel === lang;
+          panel.classList.toggle("is-active", isActive);
+          panel.hidden = !isActive;
+        });
+      }
+
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => activateTab(tab.dataset.aboutI18nTab || "zh"));
+      });
+      activateTab("zh");
+    }
+
+    initializeAboutPageTabs();
+  </script>
+{% endblock %}

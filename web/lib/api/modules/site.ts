@@ -55,6 +55,36 @@ export type LatestAnnouncement = {
   publish_at?: string | null;
 };
 
+export type AboutPageSectionItem = {
+  title: string;
+  body: string[];
+};
+
+export type AboutPageSection = {
+  id: "who" | "story" | "vision" | "mission" | "values" | string;
+  title: string;
+  eyebrow?: string;
+  body: string[];
+  items?: AboutPageSectionItem[];
+};
+
+export type AboutPageContent = {
+  slug: string;
+  title: string;
+  subtitle?: string;
+  sections: AboutPageSection[];
+  locale?: string;
+};
+
+export type LegalPageKey = "risk" | "terms" | "privacy";
+
+export type LegalPageContent = {
+  key: LegalPageKey | string;
+  title: string;
+  content: string;
+  locale?: string;
+};
+
 export const fallbackSiteConfig: SiteConfig = {
   site_name: "RE",
   site_slogan: "",
@@ -88,4 +118,12 @@ export async function getHomeBanners(language?: string): Promise<{ items: HomeBa
 
 export async function getLatestAnnouncements(language?: string): Promise<{ items: LatestAnnouncement[] }> {
   return request<{ items: LatestAnnouncement[] }>(withContentLanguage("/announcements/latest", language));
+}
+
+export async function getAboutPage(language?: string): Promise<AboutPageContent> {
+  return request<AboutPageContent>(withContentLanguage("/site/pages/about", language));
+}
+
+export async function getLegalPage(pageKey: LegalPageKey, language?: string): Promise<LegalPageContent> {
+  return request<LegalPageContent>(withContentLanguage(`/site/pages/legal/${pageKey}`, language));
 }

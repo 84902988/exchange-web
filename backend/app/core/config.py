@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     DB_USER: str
     DB_PASSWORD: str
     DB_NAME: str
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 20
+    DB_POOL_TIMEOUT: int = 30
+    DB_POOL_RECYCLE: int = 3600
+    DB_POOL_PRE_PING: bool = True
 
     # =====================
     # Security / JWT
@@ -93,8 +98,8 @@ class Settings(BaseSettings):
     CONTRACT_CFD_USE_LAST_VALID_PRICE: bool = True
     CONTRACT_CFD_DEFAULT_MAKER_FEE_RATE: str = "0.0002"
     CONTRACT_CFD_DEFAULT_TAKER_FEE_RATE: str = "0.0004"
-    BINANCE_USDM_BASE_URL: str = "https://testnet.binancefuture.com"
-    BINANCE_USDM_FALLBACK_BASE_URLS: str = "https://fapi.binance.com,https://testnet.binancefuture.com"
+    BINANCE_USDM_BASE_URL: str = "https://fapi.binance.com"
+    BINANCE_USDM_FALLBACK_BASE_URLS: str = ""
     BINANCE_USDM_USE_ENV_PROXY: bool = False
     ITICK_API_TOKEN: Optional[str] = None
     ITICK_API_KEY: Optional[str] = None  # legacy alias; prefer ITICK_API_TOKEN

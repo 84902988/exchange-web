@@ -56,12 +56,14 @@ This keeps the development console request log visible:
 INFO: 127.0.0.1:xxxxx - "GET /docs HTTP/1.1" 200 OK
 ```
 
-If you specifically need hot reload debugging, start FastAPI manually and add `--reload` yourself:
+If you specifically need hot reload debugging, keep the reload watcher scoped to backend source files and exclude generated temporary files:
 
 ```powershell
 cd backend
-..\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log --reload
+..\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log --reload --reload-dir app --reload-exclude "../tmp/pdfs/*" --reload-exclude "../tmp/*" --reload-exclude "tmp/*" --reload-exclude "../output/*"
 ```
+
+The all-in-one dev launcher supports the same scoped reload with `backend\scripts\start_dev_all.ps1 -Reload`.
 
 The RQ windows reuse:
 

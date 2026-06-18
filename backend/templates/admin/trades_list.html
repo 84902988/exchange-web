@@ -365,6 +365,10 @@
           <input id="order_id" type="text" name="order_id" value="{{ filters.order_id or '' }}" placeholder="买单/卖单/挂单/吃单ID" />
         </div>
         <div class="field">
+          <label for="order_no">订单号</label>
+          <input id="order_no" type="text" name="order_no" value="{{ filters.order_no or '' }}" placeholder="请输入订单号" />
+        </div>
+        <div class="field">
           <label for="buyer_user_id">买方用户</label>
           <input id="buyer_user_id" type="text" name="buyer_user_id" value="{{ filters.buyer_user_id or '' }}" placeholder="请输入买方用户ID" />
         </div>
@@ -378,6 +382,7 @@
             <option value="">全部</option>
             <option value="USER" {% if filters.counterparty_type == 'USER' %}selected{% endif %}>用户成交</option>
             <option value="PLATFORM" {% if filters.counterparty_type == 'PLATFORM' %}selected{% endif %}>平台对手方</option>
+            <option value="DEALER" {% if filters.counterparty_type == 'DEALER' %}selected{% endif %}>Dealer/平台对手方</option>
           </select>
         </div>
         <div class="field">
@@ -461,8 +466,8 @@
                   <span>成交价：<strong>{{ item.price }}</strong></span>
                   <span>成交量：<strong>{{ item.amount }}</strong></span>
                   <span>成交额：<strong>{{ item.quote_amount }}</strong></span>
-                  <span>买单：<strong>{{ item.buy_order_id }}</strong></span>
-                  <span>卖单：<strong>{{ item.sell_order_id }}</strong></span>
+                  <span>买单：<strong>{{ item.buy_order_id }}</strong>{% if item.buy_order_no %}<em class="muted mono"> {{ item.buy_order_no }}</em>{% endif %}</span>
+                  <span>卖单：<strong>{{ item.sell_order_id }}</strong>{% if item.sell_order_no %}<em class="muted mono"> {{ item.sell_order_no }}</em>{% endif %}</span>
                 </div>
                 <div class="admin-record-fees">
                   <span>手续费</span>
@@ -547,6 +552,7 @@
             <input type="hidden" name="symbol" value="{{ filters.symbol or '' }}" />
             <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}" />
             <input type="hidden" name="order_id" value="{{ filters.order_id or '' }}" />
+            <input type="hidden" name="order_no" value="{{ filters.order_no or '' }}" />
             <input type="hidden" name="buyer_user_id" value="{{ filters.buyer_user_id or '' }}" />
             <input type="hidden" name="seller_user_id" value="{{ filters.seller_user_id or '' }}" />
             <input type="hidden" name="buy_order_id" value="{{ filters.buy_order_id or '' }}" />
@@ -555,13 +561,13 @@
             <input type="hidden" name="start_time" value="{{ filters.start_time or '' }}" />
             <input type="hidden" name="end_time" value="{{ filters.end_time or '' }}" />
             {% if pagination.has_prev %}
-              <a href="{{ request.url.include_query_params(query_scope='history', trade_id=filters.trade_id or '', symbol=filters.symbol or '', user_id=filters.user_id or '', order_id=filters.order_id or '', buyer_user_id=filters.buyer_user_id or '', seller_user_id=filters.seller_user_id or '', buy_order_id=filters.buy_order_id or '', sell_order_id=filters.sell_order_id or '', counterparty_type=filters.counterparty_type or '', start_time=filters.start_time or '', end_time=filters.end_time or '', cursor_created_at=pagination.prev_cursor_created_at, cursor_id=pagination.prev_cursor_id, direction='prev', page_size=pagination.page_size, page=1) }}" class="btn secondary admin-btn admin-btn-secondary">上一批</a>
+              <a href="{{ request.url.include_query_params(query_scope='history', trade_id=filters.trade_id or '', symbol=filters.symbol or '', user_id=filters.user_id or '', order_id=filters.order_id or '', order_no=filters.order_no or '', buyer_user_id=filters.buyer_user_id or '', seller_user_id=filters.seller_user_id or '', buy_order_id=filters.buy_order_id or '', sell_order_id=filters.sell_order_id or '', counterparty_type=filters.counterparty_type or '', start_time=filters.start_time or '', end_time=filters.end_time or '', cursor_created_at=pagination.prev_cursor_created_at, cursor_id=pagination.prev_cursor_id, direction='prev', page_size=pagination.page_size, page=1) }}" class="btn secondary admin-btn admin-btn-secondary">上一批</a>
             {% else %}
               <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">上一批</span>
             {% endif %}
             <span>当前批次</span>
             {% if pagination.has_next %}
-              <a href="{{ request.url.include_query_params(query_scope='history', trade_id=filters.trade_id or '', symbol=filters.symbol or '', user_id=filters.user_id or '', order_id=filters.order_id or '', buyer_user_id=filters.buyer_user_id or '', seller_user_id=filters.seller_user_id or '', buy_order_id=filters.buy_order_id or '', sell_order_id=filters.sell_order_id or '', counterparty_type=filters.counterparty_type or '', start_time=filters.start_time or '', end_time=filters.end_time or '', cursor_created_at=pagination.next_cursor_created_at, cursor_id=pagination.next_cursor_id, direction='next', page_size=pagination.page_size, page=1) }}" class="btn secondary admin-btn admin-btn-secondary">下一批</a>
+              <a href="{{ request.url.include_query_params(query_scope='history', trade_id=filters.trade_id or '', symbol=filters.symbol or '', user_id=filters.user_id or '', order_id=filters.order_id or '', order_no=filters.order_no or '', buyer_user_id=filters.buyer_user_id or '', seller_user_id=filters.seller_user_id or '', buy_order_id=filters.buy_order_id or '', sell_order_id=filters.sell_order_id or '', counterparty_type=filters.counterparty_type or '', start_time=filters.start_time or '', end_time=filters.end_time or '', cursor_created_at=pagination.next_cursor_created_at, cursor_id=pagination.next_cursor_id, direction='next', page_size=pagination.page_size, page=1) }}" class="btn secondary admin-btn admin-btn-secondary">下一批</a>
             {% else %}
               <span class="btn secondary disabled admin-btn admin-btn-secondary" aria-disabled="true">下一批</span>
             {% endif %}
@@ -585,6 +591,7 @@
             <input type="hidden" name="symbol" value="{{ filters.symbol or '' }}" />
             <input type="hidden" name="user_id" value="{{ filters.user_id or '' }}" />
             <input type="hidden" name="order_id" value="{{ filters.order_id or '' }}" />
+            <input type="hidden" name="order_no" value="{{ filters.order_no or '' }}" />
             <input type="hidden" name="buyer_user_id" value="{{ filters.buyer_user_id or '' }}" />
             <input type="hidden" name="seller_user_id" value="{{ filters.seller_user_id or '' }}" />
             <input type="hidden" name="buy_order_id" value="{{ filters.buy_order_id or '' }}" />

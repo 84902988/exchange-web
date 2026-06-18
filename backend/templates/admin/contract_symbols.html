@@ -22,10 +22,10 @@
     "FUTURES": "期货"
   } %}
   {% set provider_labels = {
-    "BINANCE": "Binance 行情",
+    "BINANCE": "外部合约行情",
     "ITICK": "iTick 行情",
-    "INTERNAL": "内部行情",
-    "MANUAL": "手动维护"
+    "INTERNAL": "内部撮合行情",
+    "MANUAL": "已停用行情源"
   } %}
   {% set tp_sl_trigger_price_type_labels = {
     "MARK_PRICE": "标记价格",
@@ -79,7 +79,7 @@
           <label for="provider">行情来源</label>
           <select id="provider" name="provider">
             <option value="">全部</option>
-            {% for option in ["BINANCE", "ITICK", "INTERNAL", "MANUAL"] %}
+            {% for option in ["BINANCE", "ITICK", "INTERNAL"] %}
               <option value="{{ option }}" {% if filters.provider == option %}selected{% endif %}>{{ provider_labels.get(option, option) }}</option>
             {% endfor %}
           </select>

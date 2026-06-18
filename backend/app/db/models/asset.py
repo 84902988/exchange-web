@@ -338,6 +338,7 @@ class BalanceLog(Base):
         UniqueConstraint("user_id", "coin_symbol", "chain_key", "biz_type", "biz_id", name="uq_user_coin_chain_biz"),
         Index("idx_user_time", "user_id", "created_at"),
         Index("idx_biz", "biz_type", "biz_id"),
+        Index("idx_balance_logs_trade_id", "trade_id"),
         Index("idx_coin_chain_time", "coin_symbol", "chain_key", "created_at"),
         {"extend_existing": True},
     )
@@ -361,6 +362,7 @@ class BalanceLog(Base):
 
     biz_type: Mapped[str] = mapped_column(String(32), nullable=False)
     biz_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    trade_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     remark: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

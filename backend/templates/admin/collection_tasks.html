@@ -9,9 +9,14 @@
 {% block content %}
   {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
   {% set is_detail = selected_batch_id %}
-  {% set has_non_batch_filters = request.query_params.get('task_no') or request.query_params.get('user_id') or request.query_params.get('chain_key') or request.query_params.get('coin_symbol') or request.query_params.get('status') or request.query_params.get('address') or request.query_params.get('tx_hash') or request.query_params.get('created_from') or request.query_params.get('created_to') %}
+  {% set has_non_batch_filters = request.query_params.get('task_no') or request.query_params.get('task_id') or request.query_params.get('user_id') or request.query_params.get('chain_key') or request.query_params.get('network') or request.query_params.get('coin_symbol') or request.query_params.get('status') or request.query_params.get('address') or request.query_params.get('tx_hash') or request.query_params.get('created_from') or request.query_params.get('created_to') %}
   {% set current_batch = batch_items[0] if batch_items else none %}
   {% set notice_detail = request.query_params.get('notice_detail') %}
+  {% set task_filter_options = filter_options or {} %}
+  {% set chain_filter_options = task_filter_options.networks or task_filter_options.chains or [] %}
+  {% set coin_filter_options = task_filter_options.coins or [] %}
+  {% set chain_filter_values = chain_filter_options | map(attribute='value') | list %}
+  {% set coin_filter_values = coin_filter_options | map(attribute='value') | list %}
   <style>
     .collection-ops-nav{display:flex;flex-wrap:wrap;gap:8px}
     .collection-stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
@@ -225,21 +230,45 @@
         </summary>
         <div class="collection-filter-body">
           <form method="get" action="/admin/collections/tasks" class="filter-form">
-            <div class="field"><label for="task_no">任务ID</label><input id="task_no" name="task_no" value="{{ filters.task_no or '' }}" placeholder="任务编号" /></div>
+            <div class="field"><label for="task_no">任务ID</label><input id="task_no" name="task_no" value="{{ filters.task_no or filters.task_id or '' }}" placeholder="任务ID或任务编号" /></div>
             <div class="field"><label for="batch_id">批次ID</label><input id="batch_id" name="batch_id" value="{{ filters.batch_id or '' }}" placeholder="输入归集批次ID" /></div>
             <div class="field"><label for="user_id">用户ID</label><input id="user_id" name="user_id" value="{{ filters.user_id or '' }}" placeholder="输入用户ID" /></div>
-            <div class="field"><label for="chain_key">网络</label><input id="chain_key" name="chain_key" value="{{ filters.chain_key or '' }}" placeholder="optimism" /></div>
-            <div class="field"><label for="coin_symbol">币种</label><input id="coin_symbol" name="coin_symbol" value="{{ filters.coin_symbol or '' }}" placeholder="USDT" /></div>
+            <div class="field">
+              <label for="chain_key">网络</label>
+              <select id="chain_key" name="chain_key">
+                <option value="">全部</option>
+                {% if filters.chain_key and filters.chain_key not in chain_filter_values %}
+                  <option value="{{ filters.chain_key }}" selected>{{ filters.chain_key }}</option>
+                {% endif %}
+                {% for option in chain_filter_options %}
+                  <option value="{{ option.value }}" {% if filters.chain_key == option.value %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field">
+              <label for="coin_symbol">币种</label>
+              <select id="coin_symbol" name="coin_symbol">
+                <option value="">全部</option>
+                {% if filters.coin_symbol and filters.coin_symbol not in coin_filter_values %}
+                  <option value="{{ filters.coin_symbol }}" selected>{{ filters.coin_symbol }}</option>
+                {% endif %}
+                {% for option in coin_filter_options %}
+                  <option value="{{ option.value }}" {% if filters.coin_symbol == option.value %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
+              </select>
+            </div>
             <div class="field">
               <label for="status">状态</label>
               <select id="status" name="status">
-                <option value="WORKBENCH" {% if filters.status == 'WORKBENCH' or not filters.status %}selected{% endif %}>待处理</option>
-                <option value="PROCESSING" {% if filters.status == 'PROCESSING' %}selected{% endif %}>处理中</option>
-                <option value="GAS_REQUIRED" {% if filters.status == 'GAS_REQUIRED' %}selected{% endif %}>待补Gas</option>
-                <option value="GAS_FAILED" {% if filters.status == 'GAS_FAILED' %}selected{% endif %}>补Gas失败</option>
-                <option value="SENT" {% if filters.status == 'SENT' %}selected{% endif %}>已发送</option>
-                <option value="SUCCESS" {% if filters.status == 'SUCCESS' %}selected{% endif %}>已完成</option>
                 <option value="ALL" {% if filters.status == 'ALL' %}selected{% endif %}>全部</option>
+                <option value="WORKBENCH" {% if filters.status == 'WORKBENCH' or not filters.status %}selected{% endif %}>待处理</option>
+                <option value="GAS_REQUIRED" {% if filters.status == 'GAS_REQUIRED' %}selected{% endif %}>等待补Gas</option>
+                <option value="GAS_FAILED" {% if filters.status == 'GAS_FAILED' %}selected{% endif %}>补Gas失败</option>
+                <option value="COLLECTING" {% if filters.status == 'COLLECTING' %}selected{% endif %}>归集中</option>
+                <option value="CONFIRMING" {% if filters.status == 'CONFIRMING' %}selected{% endif %}>链上确认中</option>
+                <option value="SUCCESS" {% if filters.status == 'SUCCESS' %}selected{% endif %}>已完成</option>
+                <option value="CANCELED" {% if filters.status == 'CANCELED' %}selected{% endif %}>已取消</option>
+                <option value="FAILED" {% if filters.status == 'FAILED' %}selected{% endif %}>失败</option>
               </select>
             </div>
             <div class="field"><label for="address">地址</label><input id="address" name="address" value="{{ filters.address or '' }}" placeholder="来源或目标地址" /></div>
@@ -265,7 +294,7 @@
                     <span class="collection-batch-muted collection-mono">{{ item.created_at or "-" }}</span>
                   </div>
                   <div class="collection-batch-badges">
-                    <span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span>
+                    <span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status_label }}">{{ item.status_label }}</span>
                     <span class="admin-badge admin-badge-{{ item.gas_badge }}">{{ item.gas_summary }}</span>
                   </div>
                 </div>
@@ -371,8 +400,8 @@
                     <div class="collection-task-field"><span class="collection-task-label">余额</span><span class="collection-task-value collection-mono collection-amount">{{ item.amount_label }}</span></div>
                   </div>
                   <div class="collection-task-status-line">
-                    <div class="collection-task-field"><span class="collection-task-label">归集状态</span><span class="admin-badge admin-badge-{{ item.status_display_badge }}" title="{{ item.status }}">{{ item.status_display_label }}</span></div>
-                    <div class="collection-task-field collection-task-gas"><span class="collection-task-label">Gas状态</span><span class="admin-badge admin-badge-{{ item.gas_status_badge }}" title="{{ item.gas_status_detail or item.gas_task_status or item.gas_status_label }}">{{ item.gas_status_label }}</span></div>
+                    <div class="collection-task-field"><span class="collection-task-label">归集状态</span><span class="admin-badge admin-badge-{{ item.status_display_badge }}" title="{{ item.status_display_label }}">{{ item.status_display_label }}</span></div>
+                    <div class="collection-task-field collection-task-gas"><span class="collection-task-label">Gas状态</span><span class="admin-badge admin-badge-{{ item.gas_status_badge }}" title="{{ item.gas_status_detail or item.gas_status_label }}">{{ item.gas_status_label }}</span></div>
                   </div>
                   {% if item.last_error_full %}
                     <div class="collection-task-status-line">
@@ -413,6 +442,14 @@
                       </div>
                     </div>
                   </div>
+                  {% if item.can_safe_cancel %}
+                    <div class="admin-table-actions collection-task-actions">
+                      <form method="post" action="{{ item.safe_cancel_url }}" onsubmit="return confirm('确认取消该旧归集任务并重新扫描？该操作不会发送链上交易，不会扣减候选余额。');">
+                        <input type="hidden" name="next_path" value="{{ current_url }}" />
+                        <button type="submit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm">取消旧任务并重扫</button>
+                      </form>
+                    </div>
+                  {% endif %}
                 </div>
               </div>
             {% endfor %}

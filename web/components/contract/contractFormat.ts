@@ -7,11 +7,18 @@ const CONTRACT_ERROR_FALLBACKS = {
   contractErrorUnavailable: 'Futures are not available yet',
   contractErrorPriceChanged: 'Price has changed. Please try again',
   contractErrorInsufficientMargin: 'Available margin is insufficient',
+  contractErrorQuoteNotLive: 'Current market quote is not executable. Please try again shortly',
   contractErrorLeverageExceedsLimit: 'Leverage exceeds the current futures limit',
   contractErrorQuantityBelowMin: 'Order quantity is below the minimum',
   contractErrorQuantityAboveMax: 'Order quantity exceeds the maximum',
   contractErrorInvalidPrice: 'Enter a valid price',
   contractErrorInvalidQuantity: 'Enter a valid quantity',
+  contractErrorInvalidPayload: 'Parameter format is invalid. Please check TP/SL prices',
+  contractErrorInvalidReferencePrice: 'Open price is unavailable. Please refresh and try again',
+  contractErrorTakeProfitAboveEntry: 'Take-profit price must be above the open price',
+  contractErrorStopLossBelowEntry: 'Stop-loss price must be below the open price',
+  contractErrorTakeProfitBelowEntry: 'Take-profit price must be below the open price',
+  contractErrorStopLossAboveEntry: 'Stop-loss price must be above the open price',
   contractErrorPositionHasOpenCloseOrder: 'This position already has an open close order',
   contractErrorNoClosablePosition: 'No closable position found',
   contractErrorCloseQuantityExceedsPosition: 'Close quantity cannot exceed closable quantity',
@@ -32,7 +39,8 @@ function contractErrorText(key: ContractErrorKey, t?: ContractErrorTranslator) {
 
 export function toNumber(value?: string | number | null) {
   if (value === undefined || value === null || value === '') return 0;
-  const parsed = Number(value);
+  const normalized = typeof value === 'string' ? value.replace(/,/g, '').trim() : value;
+  const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
@@ -82,6 +90,7 @@ export function friendlyContractError(error: unknown, t?: ContractErrorTranslato
     ) {
       return contractErrorText('contractErrorPriceChanged', t);
     }
+    if (code.includes('CONTRACT_QUOTE_NOT_LIVE')) return contractErrorText('contractErrorQuoteNotLive', t);
     if (normalized.includes('insufficient') || normalized.includes('balance') || normalized.includes('margin') || message.includes('\u4e0d\u8db3')) {
       return contractErrorText('contractErrorInsufficientMargin', t);
     }
@@ -90,6 +99,12 @@ export function friendlyContractError(error: unknown, t?: ContractErrorTranslato
     if (code.includes('QUANTITY_ABOVE_MAX')) return contractErrorText('contractErrorQuantityAboveMax', t);
     if (code.includes('PRICE_MUST_BE_POSITIVE') || code.includes('INVALID_PRICE')) return contractErrorText('contractErrorInvalidPrice', t);
     if (code.includes('QUANTITY_MUST_BE_POSITIVE') || code.includes('INVALID_QUANTITY')) return contractErrorText('contractErrorInvalidQuantity', t);
+    if (code.includes('VALIDATION_ERROR')) return contractErrorText('contractErrorInvalidPayload', t);
+    if (code.includes('INVALID_REFERENCE_PRICE')) return contractErrorText('contractErrorInvalidReferencePrice', t);
+    if (code.includes('TAKE_PROFIT_MUST_BE_ABOVE_ENTRY')) return contractErrorText('contractErrorTakeProfitAboveEntry', t);
+    if (code.includes('STOP_LOSS_MUST_BE_BELOW_ENTRY')) return contractErrorText('contractErrorStopLossBelowEntry', t);
+    if (code.includes('TAKE_PROFIT_MUST_BE_BELOW_ENTRY')) return contractErrorText('contractErrorTakeProfitBelowEntry', t);
+    if (code.includes('STOP_LOSS_MUST_BE_ABOVE_ENTRY')) return contractErrorText('contractErrorStopLossAboveEntry', t);
     if (code.includes('POSITION_HAS_OPEN_CLOSE_ORDER')) return contractErrorText('contractErrorPositionHasOpenCloseOrder', t);
     if (code.includes('POSITION_NOT_FOUND') || normalized.includes('position not found')) return contractErrorText('contractErrorNoClosablePosition', t);
     if (code.includes('POSITION_NOT_OPEN')) return contractErrorText('contractErrorNoClosablePosition', t);

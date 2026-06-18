@@ -7,6 +7,16 @@ import {
   ExternalServiceError
 } from '@/types/external-services';
 
+type ServiceErrorLike = {
+  message?: string;
+  code?: string;
+  status?: number;
+};
+
+const isServiceErrorLike = (value: unknown): value is ServiceErrorLike => (
+  typeof value === 'object' && value !== null
+);
+
 /**
  * 外部服务基础抽象类
  * @template T - 服务配置类型
@@ -178,9 +188,10 @@ export abstract class BaseExternalService<T extends ExternalServiceConfig> imple
   protected async parseResponse<ResType>(response: Response): Promise<ResType> {
     if (!response.ok) {
       // 处理非200状态码
-      let errorData: any;
+      let errorData: ServiceErrorLike;
       try {
-        errorData = await response.json();
+        const parsed = await response.json();
+        errorData = isServiceErrorLike(parsed) ? parsed : {};
       } catch {
         errorData = { message: response.statusText };
       }
@@ -205,7 +216,7 @@ export abstract class BaseExternalService<T extends ExternalServiceConfig> imple
    * @param error - 原始错误
    * @returns 标准化的服务错误
    */
-  protected createServiceError(error: any): ExternalServiceError {
+  protected createServiceError(error: unknown): ExternalServiceError {
     if (error instanceof Error) {
       // 网络错误或其他错误
       return {
@@ -216,11 +227,12 @@ export abstract class BaseExternalService<T extends ExternalServiceConfig> imple
     }
 
     // HTTP错误
+    const serviceError = isServiceErrorLike(error) ? error : {};
     return {
-      code: error.code || 'UNKNOWN_ERROR',
-      message: error.message || 'An unknown error occurred',
+      code: serviceError.code || 'UNKNOWN_ERROR',
+      message: serviceError.message || 'An unknown error occurred',
       provider: this.name,
-      status: error.status,
+      status: serviceError.status,
     };
   }
 
@@ -230,7 +242,7 @@ export abstract class BaseExternalService<T extends ExternalServiceConfig> imple
    * @param params - 查询参数
    * @returns 格式化后的URL
    */
-  protected formatUrl(path: string, params: Record<string, any> = {}): string {
+  protected formatUrl(path: string, params: Record<string, string | number | boolean | null | undefined> = {}): string {
     const queryParams = new URLSearchParams();
     
     Object.entries(params).forEach(([key, value]) => {
