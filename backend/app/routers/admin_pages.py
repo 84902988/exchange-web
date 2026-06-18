@@ -37,6 +37,7 @@ from app.db.models.bd_commission_record import BdCommissionRecord
 from app.db.models.user_invite_commission_record import UserInviteCommissionRecord
 from app.db.models.geo_access import GeoAccessLog, GeoIpRule
 from app.db.models.db_lifecycle_cleanup_log import DbLifecycleCleanupLog
+from app.db.models.core_archive import CoreArchiveBatch
 from app.db.models import AdminUser, User
 from app.db.session import SessionLocal, get_db
 from app.services.admin_balance_adjust_service import (
@@ -399,6 +400,7 @@ ADMIN_DOC_RESOURCE_LABELS: tuple[tuple[str, str, str], ...] = (
     ("/system/rq", "RQ 队列状", "RQ queue status"),
     ("/system/services", "服务概览", "service overview"),
     ("/system/db-lifecycle", "DB 生命周期", "DB lifecycle"),
+    ("/system/core-archives", "Core Archive", "core archive"),
     ("/trading-pairs", "交易", "trading pair"),
     ("/pairs", "交易", "trading pair"),
     ("/reference-overlays", "参考价覆盖", "reference price overlay"),
@@ -831,6 +833,7 @@ ADMIN_GET_PERMISSION_EXACT: Dict[str, str] = {
     "/admin/geo-access": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/operations": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/db-lifecycle": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
+    "/admin/system/core-archives": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/services": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/rq": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/site-settings": "site_settings.manage",
@@ -869,6 +872,7 @@ ADMIN_GET_PERMISSION_PREFIXES: tuple[tuple[str, str], ...] = (
     ("/admin/admin-roles", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/system/operations", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/system/db-lifecycle", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
+    ("/admin/system/core-archives", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/system/services", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/system/rq", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/market-analysis", "market_analysis.view"),
@@ -9104,6 +9108,45 @@ def db_lifecycle_page(request: Request, db: Session = Depends(get_db)):
                 "recent_logs": recent_logs,
                 "protected_tables": sorted(PROTECTED_TABLES),
                 "core_financial_tables": core_financial_table_rows(),
+            },
+        },
+    )
+
+
+@router.get("/system/core-archives", response_class=HTMLResponse)
+def core_archives_page(request: Request, db: Session = Depends(get_db)):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    batches = (
+        db.query(CoreArchiveBatch)
+        .order_by(CoreArchiveBatch.id.desc())
+        .limit(100)
+        .all()
+    )
+    latest_batch = batches[0] if batches else None
+    verified_count = sum(1 for item in batches if item.status == "VERIFIED")
+    failed_count = sum(1 for item in batches if item.status == "FAILED")
+
+    return render(
+        request,
+        "admin/core_archives.html",
+        ctx={
+            "active_group": "system",
+            "active": "core_archives",
+            "core_archives": {
+                "batches": batches,
+                "latest_batch": latest_batch,
+                "verified_count": verified_count,
+                "failed_count": failed_count,
+                "supported_tables": ["orders", "trades"],
+                "safety_notes": [
+                    "V2 pilot is copy-only.",
+                    "Hot table migrate-out is not implemented.",
+                    "deleted_count must remain 0.",
+                    "Statuses MIGRATING_OUT and COMPLETED are intentionally unsupported.",
+                ],
             },
         },
     )

@@ -1,0 +1,141 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}Core Archives{% endblock %}
+{% block page_title %}Core Ledger Archives{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">Copy-only archive batches for core ledger history. No hot-table migrate-out is available in this V2 pilot.</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/system/core-archives" class="btn secondary admin-btn admin-btn-secondary">Refresh</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .archive-summary{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(0, 1fr));
+      gap:14px;
+    }
+    .archive-note-list{
+      margin:10px 0 0;
+      padding-left:18px;
+      color:var(--muted);
+      line-height:1.7;
+    }
+    .archive-code{
+      font-family:Consolas, "Liberation Mono", monospace;
+      font-size:12px;
+      color:#d8e8ff;
+    }
+    @media (max-width: 1180px){
+      .archive-summary{ grid-template-columns:1fr; }
+    }
+  </style>
+
+  <section class="page-section">
+    <div class="archive-summary">
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">Pilot tables</div>
+          <div class="stat-icon">T</div>
+        </div>
+        <div class="stat-value">{{ core_archives.supported_tables|length }}</div>
+        <div class="stat-note">{{ core_archives.supported_tables|join(", ") }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">Recent batches</div>
+          <div class="stat-icon">B</div>
+        </div>
+        <div class="stat-value">{{ core_archives.batches|length }}</div>
+        <div class="stat-note">Latest 100 only</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">Verified</div>
+          <div class="stat-icon">V</div>
+        </div>
+        <div class="stat-value">{{ core_archives.verified_count }}</div>
+        <div class="stat-note">copy-only verification</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">Failed</div>
+          <div class="stat-icon">!</div>
+        </div>
+        <div class="stat-value">{{ core_archives.failed_count }}</div>
+        <div class="stat-note">needs review</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">Safety boundary</div>
+      <ul class="archive-note-list">
+        {% for note in core_archives.safety_notes %}
+          <li>{{ note }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">Archive batches</div>
+      <div class="table-wrap admin-table-wrap">
+        <table class="data-table admin-table">
+          <thead>
+            <tr>
+              <th>batch_id</th>
+              <th>source_table</th>
+              <th>archive_month</th>
+              <th>status</th>
+              <th>dry_run</th>
+              <th>source_count</th>
+              <th>copied_count</th>
+              <th>verified_count</th>
+              <th>deleted_count</th>
+              <th>started_at</th>
+              <th>finished_at</th>
+              <th>error_message</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in core_archives.batches %}
+              <tr>
+                <td class="archive-code">{{ item.batch_id }}</td>
+                <td class="archive-code">{{ item.source_table }}</td>
+                <td>{{ item.archive_month }}</td>
+                <td>
+                  <span class="admin-badge admin-badge-{% if item.status == 'FAILED' %}danger{% elif item.status == 'VERIFIED' %}success{% elif item.status in ['COPYING', 'VERIFYING'] %}warning{% else %}neutral{% endif %}">
+                    {{ item.status }}
+                  </span>
+                </td>
+                <td>{{ "yes" if item.dry_run else "no" }}</td>
+                <td>{{ item.source_count }}</td>
+                <td>{{ item.copied_count }}</td>
+                <td>{{ item.verified_count }}</td>
+                <td>
+                  {% if item.deleted_count %}
+                    <span class="admin-badge admin-badge-danger">{{ item.deleted_count }}</span>
+                  {% else %}
+                    {{ item.deleted_count }}
+                  {% endif %}
+                </td>
+                <td>{{ item.started_at or "-" }}</td>
+                <td>{{ item.finished_at or "-" }}</td>
+                <td class="archive-code">{{ item.error_message or "-" }}</td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="12" class="muted">No archive batches.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+{% endblock %}

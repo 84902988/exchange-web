@@ -51,6 +51,7 @@ from .rwa_reference_price import RwaReferencePrice
 from .reference_overlay import ReferenceOverlay
 from .geo_access import GeoAccessLog, GeoAccessSettings, GeoIpRule
 from .db_lifecycle_cleanup_log import DbLifecycleCleanupLog
+from .core_archive import CoreArchiveBatch
 from .collection import (
     CollectionBatch,
     CollectionBatchStatus,
@@ -152,6 +153,7 @@ __all__ = [
     "GeoAccessSettings",
     "GeoIpRule",
     "DbLifecycleCleanupLog",
+    "CoreArchiveBatch",
     "CollectionBatch",
     "CollectionBatchStatus",
     "CollectionBatchTriggerType",
