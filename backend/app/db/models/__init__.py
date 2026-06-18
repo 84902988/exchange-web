@@ -49,6 +49,7 @@ from .market_data_provider import MarketDataProvider, MarketDataProviderSymbol
 from .market_kline import MarketKline
 from .rwa_reference_price import RwaReferencePrice
 from .reference_overlay import ReferenceOverlay
+from .geo_access import GeoAccessLog, GeoAccessSettings, GeoIpRule
 from .collection import (
     CollectionBatch,
     CollectionBatchStatus,
@@ -146,6 +147,9 @@ __all__ = [
     "MarketKline",
     "RwaReferencePrice",
     "ReferenceOverlay",
+    "GeoAccessLog",
+    "GeoAccessSettings",
+    "GeoIpRule",
     "CollectionBatch",
     "CollectionBatchStatus",
     "CollectionBatchTriggerType",
