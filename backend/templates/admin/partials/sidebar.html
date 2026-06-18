@@ -456,11 +456,11 @@
   {% endif %}
 
   {% if show_system %}
-    <details class="group" {% if (active_group == 'system' and active not in collection_nav_active) or active in ['market_cache_monitor', 'operations_center', 'service_overview', 'rq_status', 'stock_token_release_logs', 'bd_commission_job_logs', 'dividend_job_logs', 'admin_users', 'admin_roles', 'audit_list', 'geo_access'] %}open{% endif %}>
+    <details class="group" {% if (active_group == 'system' and active not in collection_nav_active) or active in ['market_cache_monitor', 'operations_center', 'service_overview', 'db_lifecycle', 'rq_status', 'stock_token_release_logs', 'bd_commission_job_logs', 'dividend_job_logs', 'admin_users', 'admin_roles', 'audit_list', 'geo_access'] %}open{% endif %}>
       <summary>系统 <span class="chev">▾</span></summary>
       <div class="nav">
         {% if show_system_tasks %}
-          <details class="admin-nav-group" {% if active in ['market_cache_monitor', 'operations_center', 'service_overview', 'rq_status', 'stock_token_release_logs', 'bd_commission_job_logs', 'dividend_job_logs'] %}open{% endif %}>
+          <details class="admin-nav-group" {% if active in ['market_cache_monitor', 'operations_center', 'service_overview', 'db_lifecycle', 'rq_status', 'stock_token_release_logs', 'bd_commission_job_logs', 'dividend_job_logs'] %}open{% endif %}>
             <summary class="admin-nav-group-summary">任务与监控 <span class="chev">▾</span></summary>
             <div class="admin-nav-group-items">
               {% if is_sa %}
@@ -472,6 +472,9 @@
                 </a>
                 <a href="/admin/system/services" class="{% if active == 'service_overview' %}active{% endif %}">
                   <span class="icon">S</span> 常驻服务总览
+                </a>
+                <a href="/admin/system/db-lifecycle" class="{% if active == 'db_lifecycle' %}active{% endif %}">
+                  <span class="icon">D</span> DB 生命周期
                 </a>
                 <a href="/admin/system/rq" class="{% if active == 'rq_status' %}active{% endif %}">
                   <span class="icon">Q</span> RQ 队列监控

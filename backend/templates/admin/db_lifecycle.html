@@ -1,0 +1,251 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}DB 生命周期{% endblock %}
+{% block page_title %}DB 生命周期{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">查看数据库生命周期清理任务的安全开关、dry-run 状态和最近执行结果。</div>
+{% endblock %}
+
+{% block page_actions %}
+  <a href="/admin/system/db-lifecycle" class="btn secondary admin-btn admin-btn-secondary">刷新</a>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .db-lifecycle-summary{
+      display:grid;
+      grid-template-columns:repeat(6, minmax(0, 1fr));
+      gap:14px;
+    }
+    .db-lifecycle-note{
+      color:var(--muted);
+      line-height:1.6;
+      margin:8px 0 0;
+    }
+    .db-lifecycle-protected{
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px;
+      margin-top:10px;
+    }
+    .db-lifecycle-protected span{
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:999px;
+      color:var(--muted);
+      padding:4px 8px;
+      font-size:12px;
+      background:rgba(255,255,255,.04);
+    }
+    @media (max-width: 1180px){
+      .db-lifecycle-summary{ grid-template-columns:1fr; }
+    }
+  </style>
+
+  <section class="page-section">
+    <div class="db-lifecycle-summary">
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">cleanup enabled</div>
+          <div class="stat-icon">E</div>
+        </div>
+        <div class="stat-value">
+          {% if db_lifecycle.cleanup_enabled %}
+            <span class="admin-badge admin-badge-success">已启用</span>
+          {% else %}
+            <span class="admin-badge admin-badge-neutral">未启用</span>
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">dry-run</div>
+          <div class="stat-icon">D</div>
+        </div>
+        <div class="stat-value">
+          {% if db_lifecycle.dry_run %}
+            <span class="admin-badge admin-badge-warning">仅演练</span>
+          {% else %}
+            <span class="admin-badge admin-badge-danger">真实清理</span>
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">默认保留天数</div>
+          <div class="stat-icon">R</div>
+        </div>
+        <div class="stat-value admin-number">{{ db_lifecycle.retention_days }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">允许真实删除</div>
+          <div class="stat-icon">X</div>
+        </div>
+        <div class="stat-value">
+          {% if db_lifecycle.can_execute_now %}
+            <span class="admin-badge admin-badge-danger">允许</span>
+          {% else %}
+            <span class="admin-badge admin-badge-success">不允许</span>
+          {% endif %}
+        </div>
+        <div class="stat-note">allow={{ db_lifecycle.allow_execute }} / confirm={{ db_lifecycle.execute_confirm_configured }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">最近执行状态</div>
+          <div class="stat-icon">S</div>
+        </div>
+        <div class="stat-value">
+          {% if db_lifecycle.latest_log %}
+            <span class="admin-badge admin-badge-{% if db_lifecycle.latest_log.status == 'FAILED' %}danger{% elif db_lifecycle.latest_log.dry_run %}warning{% else %}success{% endif %}">
+              {{ db_lifecycle.latest_log.status }}
+            </span>
+          {% else %}
+            <span class="admin-badge admin-badge-neutral">暂无记录</span>
+          {% endif %}
+        </div>
+        {% if db_lifecycle.latest_log %}
+          <div class="stat-note">{{ db_lifecycle.latest_log.finished_at }}</div>
+        {% endif %}
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-head">
+          <div class="stat-label">最近真实删除</div>
+          <div class="stat-icon">!</div>
+        </div>
+        <div class="stat-value">
+          {% if db_lifecycle.latest_real_delete %}
+            <span class="admin-badge admin-badge-danger">存在</span>
+          {% else %}
+            <span class="admin-badge admin-badge-success">未发现</span>
+          {% endif %}
+        </div>
+        {% if db_lifecycle.latest_real_delete %}
+          <div class="stat-note">{{ db_lifecycle.latest_real_delete.table_name }} / {{ db_lifecycle.latest_real_delete.finished_at }}</div>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">安全策略</div>
+      <p class="db-lifecycle-note">
+        cleanup scheduler 默认关闭；worker 默认 dry-run。核心账务表不清理，只允许后续做归档策略。每次清理按表分批执行，单批最多 1000 行，禁止 truncate 和无条件 delete。
+      </p>
+      <div class="db-lifecycle-protected">
+        {% for table_name in db_lifecycle.protected_tables %}
+          <span>{{ table_name }}</span>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">核心账务表保护策略</div>
+      <p class="db-lifecycle-note">核心账务与交易底账不会被 cleanup job 清理。当前策略为禁止清理，只允许归档；归档不等于删除，数据仍需长期保留。</p>
+      <div class="table-wrap admin-table-wrap">
+        <table class="data-table admin-table">
+          <thead>
+            <tr>
+              <th>表名</th>
+              <th>类型</th>
+              <th>当前策略</th>
+              <th>热数据建议保留</th>
+              <th>后续处理方式</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in db_lifecycle.core_financial_tables %}
+              <tr>
+                <td class="mono">{{ item.table_name }}</td>
+                <td>{{ item.type }}</td>
+                <td><span class="admin-badge admin-badge-danger">{{ item.policy }}</span></td>
+                <td>{{ item.hot_retention }}</td>
+                <td>{{ item.next_step }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">最近执行结果</div>
+      <div class="table-wrap admin-table-wrap">
+        <table class="data-table admin-table">
+          <thead>
+            <tr>
+              <th>开始时间</th>
+              <th>结束时间</th>
+              <th>任务</th>
+              <th>表名</th>
+              <th>模式</th>
+              <th>操作模式</th>
+              <th>风险等级</th>
+              <th>保留天数</th>
+              <th>匹配行数</th>
+              <th>删除行数</th>
+              <th>状态</th>
+              <th>跳过</th>
+              <th>原因</th>
+              <th>错误</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in db_lifecycle.recent_logs %}
+              <tr>
+                <td>{{ item.started_at }}</td>
+                <td>{{ item.finished_at }}</td>
+                <td>{{ item.job_name }}</td>
+                <td class="mono">{{ item.table_name }}</td>
+                <td>
+                  {% if item.dry_run %}
+                    <span class="admin-badge admin-badge-warning">dry-run</span>
+                  {% else %}
+                    <span class="admin-badge admin-badge-danger">execute</span>
+                  {% endif %}
+                </td>
+                <td>
+                  <span class="admin-badge admin-badge-{% if item.operation_mode == 'EXECUTE' %}danger{% else %}warning{% endif %}">
+                    {{ item.operation_mode or "DRY_RUN" }}
+                  </span>
+                </td>
+                <td>
+                  <span class="admin-badge admin-badge-{% if item.risk_level == 'REAL_DELETE' %}danger{% else %}success{% endif %}">
+                    {{ item.risk_level or "SAFE_DRY_RUN" }}
+                  </span>
+                </td>
+                <td class="admin-number">{{ item.retention_days }}</td>
+                <td class="admin-number">{{ item.matched_count }}</td>
+                <td class="admin-number">{{ item.deleted_count }}</td>
+                <td>
+                  <span class="admin-badge admin-badge-{% if item.status == 'FAILED' %}danger{% elif item.dry_run %}warning{% else %}success{% endif %}">
+                    {{ item.status }}
+                  </span>
+                </td>
+                <td>
+                  {% if item.skipped %}
+                    <span class="admin-badge admin-badge-warning">是</span>
+                  {% else %}
+                    <span class="admin-badge admin-badge-neutral">否</span>
+                  {% endif %}
+                </td>
+                <td class="mono">{{ item.reason or "" }}</td>
+                <td class="mono">{{ item.error_message or "" }}</td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="14" class="empty">暂无 cleanup 执行记录</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="db-lifecycle-note">当前页面只展示最近 100 条 cleanup 结果。DB Lifecycle V2 再补归档表、keyset pagination 和冷数据导出。</p>
+    </div>
+  </section>
+{% endblock %}

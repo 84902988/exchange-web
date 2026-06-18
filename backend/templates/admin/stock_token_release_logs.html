@@ -10,7 +10,27 @@
   <section class="page-section">
     <div class="filter-card">
       <div class="section-title">筛选条件</div>
+      <div class="admin-muted" style="margin:8px 0 10px">{{ large_table_notice }}</div>
+      {% if query_notice %}
+        <div class="admin-alert admin-alert-warning" style="margin-bottom:10px">{{ query_notice }}</div>
+      {% endif %}
+      <div class="filter-actions" style="margin-bottom:10px">
+        {% for range_item in quick_ranges %}
+          <a
+            href="{{ request.url.include_query_params(start_date=range_item.date_from, end_date=range_item.date_to, page=1) }}"
+            class="btn secondary admin-btn admin-btn-secondary admin-btn-sm {% if active_range_days == range_item.days %}active{% endif %}"
+          >最近{{ range_item.days }}天</a>
+        {% endfor %}
+      </div>
       <form method="get" action="/admin/stock-token-release-logs" class="filter-form">
+        <div class="field">
+          <label for="start_date">开始日期</label>
+          <input id="start_date" type="date" name="start_date" value="{{ filters.start_date_text or '' }}" />
+        </div>
+        <div class="field">
+          <label for="end_date">结束日期</label>
+          <input id="end_date" type="date" name="end_date" value="{{ filters.end_date_text or '' }}" />
+        </div>
         <div class="field">
           <label for="trigger_type">trigger_type</label>
           <select id="trigger_type" name="trigger_type">

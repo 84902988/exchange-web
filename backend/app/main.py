@@ -68,6 +68,7 @@ from app.routers.announcement_reads import router as announcement_reads_router
 from app.routers.site_content import router as site_content_router
 from app.routers.support_tickets import router as support_tickets_router
 from app.routers.activity import router as activity_router
+from app.routers.geo_access import router as geo_access_router
 from app.admin.activity_admin import router as activity_admin_router
 from app.routers.kyc import router as kyc_router
 from app.services.matching import start_auto_match_worker, stop_auto_match_worker
@@ -290,6 +291,7 @@ app.include_router(site_content_router)
 app.include_router(support_tickets_router)
 app.include_router(activity_router)
 app.include_router(kyc_router)
+app.include_router(geo_access_router)
 
 # Moralis Webhook（webhooks/moralis）
 app.include_router(moralis_webhook_router)
