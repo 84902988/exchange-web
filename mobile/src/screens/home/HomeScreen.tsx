@@ -14,25 +14,37 @@ import QuickEntryRow from '../../components/home/QuickEntryRow';
 import TabbedMarketList from '../../components/home/TabbedMarketList';
 import InfoFeed from '../../components/home/InfoFeed';
 import type {RootStackParamList} from '../../navigation/types';
-import {isMockLoggedIn} from '../../store/mockAuth';
+import {useAuth} from '../../store/authStore';
 import {colors} from '../../theme';
 
 type RootNavigation = NativeStackNavigationProp<RootStackParamList>;
 
 export default function HomeScreen() {
   const navigation = useNavigation<RootNavigation>();
+  const {isLoggedIn, loading, user} = useAuth();
   const openLogin = () => navigation.navigate('Auth', {screen: 'Login'});
   const openRegister = () => navigation.navigate('Auth', {screen: 'Register'});
 
   return (
     <AppScreen>
-      <HomeTopBar loggedIn={isMockLoggedIn} navigation={navigation} />
-      {isMockLoggedIn ? (
-        <LoggedInHome />
+      <HomeTopBar loggedIn={isLoggedIn} navigation={navigation} />
+      {loading ? <Text style={styles.status}>正在恢复登录态...</Text> : null}
+      {isLoggedIn ? (
+        <LoggedInHome userLabel={getUserLabel(user)} />
       ) : (
         <GuestHome onLogin={openLogin} onRegister={openRegister} />
       )}
     </AppScreen>
+  );
+}
+
+function getUserLabel(user: ReturnType<typeof useAuth>['user']) {
+  return (
+    user?.profile?.nickname ||
+    user?.profile?.username ||
+    user?.email ||
+    user?.phone ||
+    '已登录用户'
   );
 }
 
@@ -45,7 +57,9 @@ function GuestHome({
 }) {
   return (
     <View>
-      <Text style={styles.status}>未登录 · 浏览行情和活动，登录后查看资产与快捷入口</Text>
+      <Text style={styles.status}>
+        未登录 · 浏览行情和活动，登录后查看资产与快捷入口
+      </Text>
       <HeroBanner onLogin={onLogin} onRegister={onRegister} />
       <SectionTitle title="市场入口" action="占位跳转" />
       <MarketShortcutGrid />
@@ -57,9 +71,10 @@ function GuestHome({
   );
 }
 
-function LoggedInHome() {
+function LoggedInHome({userLabel}: {userLabel: string}) {
   return (
     <View>
+      <Text style={styles.status}>已登录 · {userLabel}</Text>
       <AssetSummary />
       <QuickEntryRow />
       <SectionTitle title="市场入口" action="占位跳转" />
