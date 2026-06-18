@@ -1,18 +1,29 @@
 import React from 'react';
-import {Pressable, StyleSheet, Text} from 'react-native';
+import {Pressable, StyleSheet, View} from 'react-native';
+import type {LucideIcon} from 'lucide-react-native';
 import {colors} from '../../theme';
 
 type Props = {
-  label: string;
+  icon: LucideIcon;
+  accessibilityLabel: string;
   onPress?: () => void;
   badge?: boolean;
 };
 
-export default function IconButton({label, onPress, badge}: Props) {
+export default function IconButton({
+  icon: Icon,
+  accessibilityLabel,
+  onPress,
+  badge,
+}: Props) {
   return (
-    <Pressable style={styles.button} onPress={onPress}>
-      <Text style={styles.label}>{label}</Text>
-      {badge ? <Text style={styles.badge}> </Text> : null}
+    <Pressable
+      accessibilityLabel={accessibilityLabel}
+      accessibilityRole="button"
+      style={styles.button}
+      onPress={onPress}>
+      <Icon color={colors.text} size={21} strokeWidth={2.2} />
+      {badge ? <View style={styles.badge} /> : null}
     </Pressable>
   );
 }
@@ -28,19 +39,15 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.line,
   },
-  label: {
-    color: colors.text,
-    fontSize: 13,
-    fontWeight: '800',
-  },
   badge: {
     position: 'absolute',
-    top: 7,
-    right: 8,
-    width: 7,
-    height: 7,
+    top: 6,
+    right: 7,
+    width: 8,
+    height: 8,
     borderRadius: 4,
-    backgroundColor: colors.red,
-    overflow: 'hidden',
+    backgroundColor: colors.primary,
+    borderWidth: 1,
+    borderColor: colors.card,
   },
 });

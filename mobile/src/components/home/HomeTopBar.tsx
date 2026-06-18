@@ -1,27 +1,45 @@
 import React from 'react';
 import {StyleSheet, View} from 'react-native';
-import type {NativeStackNavigationProp} from '@react-navigation/native-stack';
+import {Bell, CircleUserRound, Headphones} from 'lucide-react-native';
 import IconButton from '../common/IconButton';
 import SearchBar from '../common/SearchBar';
-import type {RootStackParamList} from '../../navigation/types';
 
 type Props = {
-  loggedIn: boolean;
-  navigation: NativeStackNavigationProp<RootStackParamList>;
+  isLoggedIn: boolean;
+  onPressProfile?: () => void;
+  onPressSearch?: () => void;
+  onPressSupport?: () => void;
+  onPressNotifications?: () => void;
 };
 
-export default function HomeTopBar({loggedIn, navigation}: Props) {
+export default function HomeTopBar({
+  isLoggedIn,
+  onPressProfile,
+  onPressSearch,
+  onPressSupport,
+  onPressNotifications,
+}: Props) {
   return (
     <View style={styles.row}>
-      {loggedIn ? null : (
+      <IconButton
+        accessibilityLabel="用户入口"
+        icon={CircleUserRound}
+        onPress={onPressProfile}
+      />
+      <SearchBar placeholder="搜索 UNI" onPress={onPressSearch} />
+      <IconButton
+        accessibilityLabel="客服与帮助中心"
+        icon={Headphones}
+        onPress={onPressSupport}
+      />
+      {isLoggedIn ? (
         <IconButton
-          label="U"
-          onPress={() => navigation.navigate('Auth', {screen: 'Login'})}
+          accessibilityLabel="公告与客服回复"
+          icon={Bell}
+          badge
+          onPress={onPressNotifications}
         />
-      )}
-      <SearchBar placeholder="搜索 UNI" />
-      <IconButton label={loggedIn ? 'N' : '?'} badge={loggedIn} />
-      <IconButton label="C" badge={loggedIn} />
+      ) : null}
     </View>
   );
 }

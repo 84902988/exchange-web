@@ -7,12 +7,11 @@ import SectionTitle from '../../components/common/SectionTitle';
 import HomeTopBar from '../../components/home/HomeTopBar';
 import HeroBanner from '../../components/home/HeroBanner';
 import MarketShortcutGrid from '../../components/home/MarketShortcutGrid';
-import PromoStrip from '../../components/home/PromoStrip';
-import ServiceLinks from '../../components/home/ServiceLinks';
+import HomePromoCarousel from '../../components/home/HomePromoCarousel';
+import HomeNoticeService from '../../components/home/HomeNoticeService';
 import AssetSummary from '../../components/home/AssetSummary';
 import QuickEntryRow from '../../components/home/QuickEntryRow';
 import TabbedMarketList from '../../components/home/TabbedMarketList';
-import InfoFeed from '../../components/home/InfoFeed';
 import type {RootStackParamList} from '../../navigation/types';
 import {useAuth} from '../../store/authStore';
 import {colors} from '../../theme';
@@ -27,7 +26,10 @@ export default function HomeScreen() {
 
   return (
     <AppScreen>
-      <HomeTopBar loggedIn={isLoggedIn} navigation={navigation} />
+      <HomeTopBar
+        isLoggedIn={isLoggedIn}
+        onPressProfile={isLoggedIn ? undefined : openLogin}
+      />
       {loading ? <Text style={styles.status}>正在恢复登录态...</Text> : null}
       {isLoggedIn ? (
         <LoggedInHome userLabel={getUserLabel(user)} />
@@ -64,9 +66,9 @@ function GuestHome({
       <SectionTitle title="市场入口" action="占位跳转" />
       <MarketShortcutGrid />
       <SectionTitle title="活动广告" />
-      <PromoStrip />
+      <HomePromoCarousel />
       <SectionTitle title="公告与服务" />
-      <ServiceLinks />
+      <HomeNoticeService />
     </View>
   );
 }
@@ -80,11 +82,11 @@ function LoggedInHome({userLabel}: {userLabel: string}) {
       <SectionTitle title="市场入口" action="占位跳转" />
       <MarketShortcutGrid />
       <SectionTitle title="活动广告" />
-      <PromoStrip />
+      <HomePromoCarousel />
       <SectionTitle title="行情榜单" action="更多" />
       <TabbedMarketList />
-      <SectionTitle title="公告与活动" />
-      <InfoFeed />
+      <SectionTitle title="公告与服务" />
+      <HomeNoticeService />
     </View>
   );
 }
