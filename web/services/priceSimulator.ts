@@ -1,7 +1,7 @@
 type PriceListener = (price: number) => void;
 
 class PriceSimulator {
-  private timers: Map<string, any> = new Map();
+  private timers: Map<string, ReturnType<typeof setInterval>> = new Map();
   private prices: Map<string, number> = new Map();
   private listeners: Map<string, Set<PriceListener>> = new Map();
 

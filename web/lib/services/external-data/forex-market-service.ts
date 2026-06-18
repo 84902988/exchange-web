@@ -76,9 +76,9 @@ export class ForexMarketService extends BaseExternalService<ForexMarketServiceCo
    * @param endDate - 结束日期（YYYY-MM-DD）
    * @returns 历史汇率数据列表
    */
-  async getHistoricalRates(symbol: string, startDate: string, endDate: string): Promise<{ success: boolean; data?: any[] }> {
+  async getHistoricalRates(symbol: string, startDate: string, endDate: string): Promise<{ success: boolean; data?: unknown[] }> {
     const path = this.formatUrl(`/historical/${symbol}`, { startDate, endDate });
-    const response = await this.request<any[]>(path);
+    const response = await this.request<unknown[]>(path);
     return response;
   }
 

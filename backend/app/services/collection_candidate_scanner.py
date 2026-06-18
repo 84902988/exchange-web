@@ -1100,6 +1100,7 @@ def scan_collection_candidates(
                     native_balance=native_balance,
                     token_contract_address=row.get("token_contract_address"),
                     min_collect_amount=effective_min_collect_amount,
+                    db=db,
                 )
             except Exception as exc:
                 skipped_count += 1
@@ -1447,7 +1448,9 @@ def scan_collection_candidates(
                     from_address=chain_hot_wallet_address,
                     to_address=candidate.from_address,
                     topup_amount=evaluation.gas_topup_amount,
-                    target_balance=candidate.native_balance + evaluation.gas_topup_amount,
+                    target_balance=evaluation.gas_target_balance,
+                    gas_topup_mode=evaluation.gas_topup_mode,
+                    estimate_source=evaluation.estimate_source,
                 )
                 task.gas_task_id = gas_task.id
                 if int(gas_task.id) not in pre_gas_task_ids:

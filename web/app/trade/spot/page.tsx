@@ -12,7 +12,11 @@ function SpotTradePageContent() {
 
   return (
     <div>
-      <SpotPage initialSymbol={symbol || undefined} initialCategory={category} />
+      <SpotPage
+        key={`spot-${symbol || 'default'}-${category || 'all'}`}
+        initialSymbol={symbol || undefined}
+        initialCategory={category}
+      />
     </div>
   );
 }

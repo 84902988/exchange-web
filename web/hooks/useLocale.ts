@@ -2,6 +2,9 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import zhTranslations from '@/config/locales/zh.json';
+import enTranslations from '@/config/locales/en.json';
+import zhTwTranslations from '@/config/locales/zh-TW.json';
+import jaTranslations from '@/config/locales/ja.json';
 
 // 语言类型定义
 type Locale = 'en' | 'zh' | 'zh-TW' | 'ja';
@@ -52,18 +55,27 @@ interface TranslationData {
 
 // 语言配置类型定义
 // 默认语言
-const DEFAULT_LOCALE: Locale = 'zh';
+const DEFAULT_LOCALE: Locale = 'en';
 const SUPPORTED_LOCALES: readonly Locale[] = ['en', 'zh', 'zh-TW', 'ja'];
-const DEFAULT_TRANSLATIONS = zhTranslations as TranslationData;
+const DEFAULT_TRANSLATIONS = enTranslations as TranslationData;
+const LOCALE_TRANSLATIONS: Record<Locale, TranslationData> = {
+  en: enTranslations as TranslationData,
+  zh: zhTranslations as TranslationData,
+  'zh-TW': zhTwTranslations as TranslationData,
+  ja: jaTranslations as TranslationData,
+};
 
 const normalizeLocale = (locale: string | null): Locale => (
   SUPPORTED_LOCALES.includes(locale as Locale) ? (locale as Locale) : DEFAULT_LOCALE
 );
 
+const getLocaleTranslations = (locale: Locale): TranslationData => (
+  LOCALE_TRANSLATIONS[normalizeLocale(locale)] || DEFAULT_TRANSLATIONS
+);
+
 // 加载语言配置
 const loadLocaleData = async (locale: Locale): Promise<TranslationData> => {
-  const translations = await import(`@/config/locales/${locale}.json`);
-  return translations.default;
+  return getLocaleTranslations(locale);
 };
 
 // 获取存储的语言
@@ -71,9 +83,13 @@ const getStoredLocale = (): Locale => {
   if (typeof window === 'undefined') {
     return DEFAULT_LOCALE;
   }
-  // 同时支持旧系统的'language'键和新系统的'locale'键，优先使用旧系统的键
-  const storedLocale = localStorage.getItem('language') || localStorage.getItem('locale');
-  return normalizeLocale(storedLocale);
+  try {
+    // 同时支持旧系统的'language'键和新系统的'locale'键，优先使用旧系统的键
+    const storedLocale = localStorage.getItem('language') || localStorage.getItem('locale');
+    return normalizeLocale(storedLocale);
+  } catch {
+    return DEFAULT_LOCALE;
+  }
 };
 
 // 存储语言
@@ -87,9 +103,9 @@ const storeLocale = (locale: Locale) => {
 
 export default function useLocale() {
   const [locale, setLocale] = useState<Locale>(DEFAULT_LOCALE);
-// 初始化加载
   const [translations, setTranslations] = useState<TranslationData>(DEFAULT_TRANSLATIONS);
   const [isLoading, setIsLoading] = useState(false);
+  const [isInitialized, setIsInitialized] = useState(false);
 
   // 加载语言数据
   const loadTranslations = useCallback(async (lang: Locale) => {
@@ -109,12 +125,14 @@ export default function useLocale() {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [setTranslations]);
 
   // 初始化加载
   useEffect(() => {
     const storedLocale = getStoredLocale();
-    loadTranslations(storedLocale);
+    setTranslations(getLocaleTranslations(storedLocale));
+    setLocale(storedLocale);
+    setIsInitialized(true);
     
     // 监听语言变化事件（来自旧的国际化实现）
     const handleLanguageChange = (event: CustomEvent) => {
@@ -127,16 +145,27 @@ export default function useLocale() {
     return () => {
       window.removeEventListener('languageChanged', handleLanguageChange as EventListener);
     };
-  }, [loadTranslations]);
+  }, [loadTranslations, setTranslations]);
 
   // 切换语言
+  useEffect(() => {
+    if (!isInitialized || typeof window === 'undefined') return;
+
+    const frameId = window.requestAnimationFrame(() => {
+      document.documentElement.classList.remove('locale-preload');
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [isInitialized, locale]);
+
   const changeLocale = useCallback((lang: Locale) => {
     loadTranslations(normalizeLocale(lang));
   }, [loadTranslations]);
 
   // 获取翻译文本
   const t = useCallback(<T extends string>(key: string, namespace: 'common' | 'auth' | 'home' | 'footer' | 'asset' | 'markets' | 'opportunities' | 'user' | 'committee' | 'contracts' | 'activity' = 'common'): T => {
-    const value = translations[namespace]?.[key];
+    const activeTranslations = isInitialized ? translations : DEFAULT_TRANSLATIONS;
+    const value = activeTranslations[namespace]?.[key];
     if (typeof value === 'string') return value as T;
     
     // 返回key作为默认值
@@ -144,7 +173,7 @@ export default function useLocale() {
     if (typeof fallbackValue === 'string') return fallbackValue as T;
     
     return '' as T;
-  }, [translations]);
+  }, [isInitialized, translations]);
 
 // 可用语言列表
   return {

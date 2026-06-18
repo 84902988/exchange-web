@@ -61,6 +61,12 @@ class SpotMarketRealtimeClient {
     }
 
     if (previousSymbol !== nextSymbol) {
+      if (this.socketOpenedWithSymbol && this.socketOpenedWithSymbol !== nextSymbol) {
+        this.closeCurrentSocketForReconnect();
+        this.connect(nextSymbol);
+        return;
+      }
+
       this.sendSubscribeIfOpen(nextSymbol);
     }
   }
@@ -145,6 +151,21 @@ class SpotMarketRealtimeClient {
         this.connect(this.requestedSymbol);
       }, 1500);
     };
+  }
+
+  private closeCurrentSocketForReconnect() {
+    this.clearReconnectTimer();
+    this.socketOpenedWithSymbol = '';
+
+    if (!this.ws) return;
+
+    const ws = this.ws;
+    this.ws = null;
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.onclose = null;
+    ws.close(1000, 'symbol changed');
   }
 
   private sendSubscribeIfOpen(symbol: string) {

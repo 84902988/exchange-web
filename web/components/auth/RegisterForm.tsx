@@ -5,6 +5,11 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { ApiError, register, sendOtp, validateBdInvite, validateUserInvite } from '@/lib/api';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import { getLegalPage, type LegalPageContent, type LegalPageKey } from '@/lib/api/modules/site';
+import {
+  REGISTER_PRIVACY_POLICY_CONTENT,
+  REGISTER_USER_AGREEMENT_CONTENT,
+} from './registerLegalContent';
 
 type RegisterFormData = {
   email: string;
@@ -16,6 +21,7 @@ type RegisterFormData = {
 
 type RegisterErrors = Partial<Record<keyof RegisterFormData, string>>;
 type InviteValidationStatus = 'idle' | 'checking' | 'valid' | 'invalid';
+type LegalModalType = 'terms' | 'privacy';
 type InviteInfo = {
   type: 'bd' | 'user';
   invite_code: string;
@@ -174,7 +180,7 @@ const resolveInviteInfo = async (inviteCode: string, inviteType: string): Promis
 export default function RegisterForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { t } = useLocaleContext();
+  const { locale, t } = useLocaleContext();
   const [formData, setFormData] = useState<RegisterFormData>({
     email: '',
     password: '',
@@ -192,6 +198,10 @@ export default function RegisterForm() {
   const [inviteStatus, setInviteStatus] = useState<InviteValidationStatus>('idle');
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [inviteInfo, setInviteInfo] = useState<InviteInfo | null>(null);
+  const [legalModalType, setLegalModalType] = useState<LegalModalType | null>(null);
+  const [legalModalContent, setLegalModalContent] = useState<LegalPageContent | null>(null);
+  const [legalModalLoading, setLegalModalLoading] = useState(false);
+  const [legalModalError, setLegalModalError] = useState('');
 
   const strength = useMemo(() => passwordChecks(formData.password), [formData.password]);
   const inviteRegisterBlocked = hasUrlInviteCode && inviteStatus !== 'valid';
@@ -201,6 +211,31 @@ export default function RegisterForm() {
       ? formatText(t('inviteConfirmedWithName', 'auth'), { name: inviteInfo.inviter_name })
       : t('inviteConfirmed', 'auth')
     : null;
+  const legalModal = useMemo(() => {
+    const fallback = legalModalType === 'privacy'
+      ? {
+        title: t('privacyPolicy', 'auth'),
+        content: REGISTER_PRIVACY_POLICY_CONTENT,
+      }
+      : {
+        title: t('userAgreement', 'auth'),
+        content: REGISTER_USER_AGREEMENT_CONTENT,
+      };
+
+    if (legalModalType === 'terms') {
+      return {
+        title: legalModalContent?.title || fallback.title,
+        content: legalModalContent?.content || fallback.content,
+      };
+    }
+    if (legalModalType === 'privacy') {
+      return {
+        title: legalModalContent?.title || fallback.title,
+        content: legalModalContent?.content || fallback.content,
+      };
+    }
+    return null;
+  }, [legalModalContent, legalModalType, t]);
 
   const emailParts = useMemo(() => {
     const raw = formData.email.trim();
@@ -276,6 +311,40 @@ export default function RegisterForm() {
     const timer = window.setTimeout(() => setCountdown((value) => value - 1), 1000);
     return () => window.clearTimeout(timer);
   }, [countdown]);
+
+  useEffect(() => {
+    if (!legalModalType) {
+      setLegalModalContent(null);
+      setLegalModalError('');
+      setLegalModalLoading(false);
+      return;
+    }
+
+    let alive = true;
+    const pageKey: LegalPageKey = legalModalType === 'privacy' ? 'privacy' : 'terms';
+    setLegalModalContent(null);
+    setLegalModalError('');
+    setLegalModalLoading(true);
+
+    getLegalPage(pageKey, locale)
+      .then((data) => {
+        if (!alive) return;
+        if (data.content?.trim()) {
+          setLegalModalContent(data);
+        }
+      })
+      .catch(() => {
+        if (!alive) return;
+        setLegalModalError(t('legalPageError', 'common'));
+      })
+      .finally(() => {
+        if (alive) setLegalModalLoading(false);
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [legalModalType, locale, t]);
 
   const updateField = (field: keyof RegisterFormData, value: string | boolean) => {
     setFormData((prev) => {
@@ -381,6 +450,7 @@ export default function RegisterForm() {
   };
 
   return (
+    <>
     <form onSubmit={handleSubmit} className="space-y-4">
       {apiError && <div className="rounded-md bg-red-500/20 p-3 text-sm text-red-400">{apiError}</div>}
 
@@ -515,16 +585,24 @@ export default function RegisterForm() {
           checked={formData.agree}
           onChange={(event) => updateField('agree', event.target.checked)}
         />
-        <label htmlFor="agree" className="text-sm text-white/70">
-          {t('agreeTerms', 'auth')}{' '}
-          <Link href="/help/terms" className="text-amber-400 transition-colors hover:text-amber-300">
+        <div className="text-sm text-white/70">
+          <label htmlFor="agree">{t('agreeTerms', 'auth')}</label>{' '}
+          <button
+            type="button"
+            onClick={() => setLegalModalType('terms')}
+            className="text-amber-400 transition-colors hover:text-amber-300"
+          >
             {t('userAgreement', 'auth')}
-          </Link>{' '}
+          </button>{' '}
           {t('and', 'auth')}{' '}
-          <Link href="/help/privacy" className="text-amber-400 transition-colors hover:text-amber-300">
+          <button
+            type="button"
+            onClick={() => setLegalModalType('privacy')}
+            className="text-amber-400 transition-colors hover:text-amber-300"
+          >
             {t('privacyPolicy', 'auth')}
-          </Link>
-        </label>
+          </button>
+        </div>
       </div>
       {errors.agree && <div className="text-xs text-red-400">{errors.agree}</div>}
 
@@ -543,5 +621,42 @@ export default function RegisterForm() {
         </Link>
       </div>
     </form>
+    {legalModal ? (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="register-legal-modal-title"
+      >
+        <div className="flex max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-white/10 bg-[#10141b] shadow-2xl">
+          <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+            <h2 id="register-legal-modal-title" className="text-lg font-semibold text-white">
+              {legalModal.title}
+            </h2>
+            <button
+              type="button"
+              onClick={() => setLegalModalType(null)}
+              className="rounded-md px-3 py-1 text-sm text-white/60 transition-colors hover:bg-white/10 hover:text-white"
+            >
+              {t('close', 'common')}
+            </button>
+          </div>
+          <div className="overflow-y-auto px-5 py-5 text-sm leading-7 text-white/70">
+            {legalModalLoading ? (
+              <div className="mb-4 rounded-md border border-white/10 bg-white/[0.04] px-4 py-3 text-white/50">
+                {t('legalPageLoading', 'common')}
+              </div>
+            ) : null}
+            {legalModalError ? (
+              <div className="mb-4 rounded-md border border-amber-400/20 bg-amber-400/10 px-4 py-3 text-amber-200">
+                {legalModalError}
+              </div>
+            ) : null}
+            <div className="whitespace-pre-line">{legalModal.content}</div>
+          </div>
+        </div>
+      </div>
+    ) : null}
+    </>
   );
 }

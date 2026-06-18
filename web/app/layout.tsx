@@ -23,7 +23,24 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <style>{`html.locale-preload body{visibility:hidden}`}</style>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function(){
+                try {
+                  var locale = localStorage.getItem('language') || localStorage.getItem('locale');
+                  if (locale && locale !== 'en') {
+                    document.documentElement.classList.add('locale-preload');
+                  }
+                } catch (e) {}
+              })();
+            `,
+          }}
+        />
+      </head>
       <body
         className={[
           "antialiased",

@@ -12,7 +12,7 @@
 
 {% block content %}
 {% set mode_labels = {"INTERNAL": "内盘", "DEALER": "Dealer"} %}
-  {% set source_labels = {"INTERNAL": "内部行情", "BINANCE": "Binance 行情", "ITICK": "iTick 行情", "LOCAL": "本地行情"} %}
+  {% set source_labels = {"INTERNAL": "内部撮合行情", "BINANCE": "外部现货行情", "ITICK": "iTick 行情", "LOCAL": "本地行情"} %}
   {% set asset_type_labels = {"CRYPTO": "数字货币", "STOCK": "股票", "FOREX": "外汇", "INDEX": "指数", "METAL": "贵金属", "COMMODITY": "大宗商品"} %}
   {% set display_category_labels = {"MAINSTREAM": "主流币", "STOCK": "股票", "PLATFORM": "平台币", "RWA": "RWA", "INDEX": "指数", "FOREX": "外汇", "METAL": "贵金属", "COMMODITY": "商品", "ETF": "ETF"} %}
   <style>
@@ -187,8 +187,8 @@
           <label for="data_source">行情源</label>
           <select id="data_source" name="data_source">
             <option value="">全部</option>
-            <option value="INTERNAL" {% if filters.data_source == 'INTERNAL' %}selected{% endif %}>内部行情</option>
-            <option value="BINANCE" {% if filters.data_source == 'BINANCE' %}selected{% endif %}>Binance 行情</option>
+            <option value="INTERNAL" {% if filters.data_source == 'INTERNAL' %}selected{% endif %}>内部撮合行情</option>
+            <option value="BINANCE" {% if filters.data_source == 'BINANCE' %}selected{% endif %}>外部现货行情</option>
             <option value="ITICK" {% if filters.data_source == 'ITICK' %}selected{% endif %}>iTick 行情</option>
           </select>
         </div>

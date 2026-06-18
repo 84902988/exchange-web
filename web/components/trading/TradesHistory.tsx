@@ -69,18 +69,20 @@ const TradesHistory: React.FC<TradesHistoryProps> = ({ symbol }) => {
     
     /**
      * 处理成交记录更新
-     * @param {any} update 成交记录更新数据
+     * @param {unknown} update 成交记录更新数据
      */
-    const handleTradeUpdate = (update: any) => {
-      if (update.type === 'trade' && update.data) {
+    const handleTradeUpdate = (update: unknown) => {
+      const tradeUpdate = update as { type?: string; data?: Partial<TradeRecord> };
+      if (tradeUpdate.type === 'trade' && tradeUpdate.data) {
+        const tradeData = tradeUpdate.data;
         // 将新成交记录添加到列表开头
         setTrades(prev => {
           const newTrade: TradeRecord = {
-            time: update.data.time,
-            price: update.data.price,
-            amount: update.data.amount,
-            total: update.data.total,
-            type: update.data.type
+            time: tradeData.time ?? '',
+            price: tradeData.price ?? '',
+            amount: tradeData.amount ?? '',
+            total: tradeData.total ?? '',
+            type: tradeData.type === 'sell' ? 'sell' : 'buy'
           };
           // 限制最大数量为50条
           return [newTrade, ...prev].slice(0, 50);

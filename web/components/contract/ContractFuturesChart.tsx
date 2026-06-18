@@ -1,6 +1,16 @@
 'use client';
 
-import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  type Dispatch,
+  type KeyboardEvent,
+  type MutableRefObject,
+  type SetStateAction,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { LineStyle, type IChartApi, type ISeriesApi } from 'lightweight-charts';
 import {
   adaptKlines,
@@ -44,9 +54,14 @@ type ContractFuturesChartProps = {
   interval: string;
   height?: number;
   marketStatus?: string | null;
-  latestPrice?: string | number | null;
-  lastPrice?: string | number | null;
-  midPrice?: string | number | null;
+  marketSessionType?: string | null;
+  quoteFreshness?: string | null;
+  pricePrecision?: number | null;
+  latestCandlePatchPrice?: string | number | null;
+  latestPriceTimestamp?: string | number | null;
+  allowLatestPriceCandlePatch?: boolean;
+  latestCandlePatchMaxDeviationRatio?: number | null;
+  allowRealtimeTradeCandlePatch?: boolean;
   positionOverlay?: ContractPositionOverlay | null;
   positionEntryOverlays?: PositionEntryOverlay[];
   positionTpSlOverlays?: PositionTpSlOverlay[];
@@ -84,6 +99,7 @@ const CONTRACT_PRICE_SCALE_ZOOM_FACTOR = 1.35;
 const CONTRACT_CHART_KLINE_LIMIT = 200;
 const CONTRACT_CHART_HISTORY_TRIGGER_BARS = 10;
 const SPOT_CHART_PRICE_SCALE_CONTROL_EVENT = 'spot-chart-price-scale-control';
+const CONTRACT_LATEST_PATCH_MAX_LAG_SECONDS = 15 * 60;
 
 function isTextControlActive() {
   const active = document.activeElement;
@@ -124,8 +140,8 @@ function moveChartLogicalRange(
   });
 }
 
-function pricePrecision(symbol: string) {
-  return getSymbolPricePrecision(symbol) ?? 2;
+function resolveChartPricePrecision(symbol: string, explicitPrecision?: number | null) {
+  return getSymbolPricePrecision(symbol, explicitPrecision) ?? 2;
 }
 
 function calculateVolumeMA(candles: CandleItem[], period: number) {
@@ -175,6 +191,59 @@ function getIndicatorValue(items: Array<{ time: number; value: number }>, time: 
   }
 
   return null;
+}
+
+function normalizeKlinePairs(
+  candles: CandleItem[],
+  volumes: VolumeItem[] = [],
+) {
+  const volumeByTime = new Map<number, VolumeItem>();
+  for (const volume of volumes) {
+    if (!Number.isFinite(volume.time)) continue;
+    volumeByTime.set(volume.time, volume);
+  }
+
+  const candleByTime = new Map<number, CandleItem>();
+  for (const candle of candles) {
+    if (!Number.isFinite(candle.time)) continue;
+    candleByTime.set(candle.time, candle);
+  }
+
+  const nextCandles = Array.from(candleByTime.values()).sort((a, b) => a.time - b.time);
+  const nextVolumes = nextCandles.map((candle) => {
+    const sourceVolume = volumeByTime.get(candle.time);
+    const value = Number.isFinite(sourceVolume?.value)
+      ? Number(sourceVolume?.value)
+      : candle.volume;
+    return makeVolume(candle.time, value, candle.open, candle.close);
+  });
+
+  return {
+    candles: nextCandles,
+    volumes: nextVolumes,
+  };
+}
+
+function setKlinePairState(
+  refs: {
+    candlesRef: MutableRefObject<CandleItem[]>;
+    volumesRef: MutableRefObject<VolumeItem[]>;
+    oldestTimeRef: MutableRefObject<number | null>;
+  },
+  setters: {
+    setCandles: Dispatch<SetStateAction<CandleItem[]>>;
+    setVolumes: Dispatch<SetStateAction<VolumeItem[]>>;
+  },
+  candles: CandleItem[],
+  volumes: VolumeItem[] = [],
+) {
+  const normalized = normalizeKlinePairs(candles, volumes);
+  refs.candlesRef.current = normalized.candles;
+  refs.volumesRef.current = normalized.volumes;
+  refs.oldestTimeRef.current = normalized.candles[0]?.time ?? null;
+  setters.setCandles(normalized.candles);
+  setters.setVolumes(normalized.volumes);
+  return normalized;
 }
 
 function normalizeCrosshairTime(value: unknown) {
@@ -336,6 +405,51 @@ function normalizeMilliseconds(value: unknown) {
   return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
 }
 
+function parseTimestampMs(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === '') return null;
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+  }
+
+  if (typeof value !== 'string') return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getQuoteBucketTime(value: string | number | null | undefined, interval: string) {
+  const timestampMs = parseTimestampMs(value);
+  if (timestampMs === null) return null;
+  return getBucketStart(Math.floor(timestampMs / 1000), interval);
+}
+
+function getIntervalSeconds(interval: string) {
+  const normalized = String(interval || '').trim().toLowerCase();
+  const match = normalized.match(/^(\d+)([mhd])$/);
+  if (!match) return 60;
+
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return 60;
+
+  if (match[2] === 'h') return value * 60 * 60;
+  if (match[2] === 'd') return value * 24 * 60 * 60;
+  return value * 60;
+}
+
+function canPatchLatestCandleWithQuote(
+  latestTime: number,
+  quoteBucketTime: number | null,
+  interval: string,
+) {
+  if (quoteBucketTime === null) return true;
+  if (quoteBucketTime === latestTime) return true;
+
+  const intervalSeconds = getIntervalSeconds(interval);
+  const maxLagSeconds = Math.max(intervalSeconds * 3, CONTRACT_LATEST_PATCH_MAX_LAG_SECONDS);
+  return quoteBucketTime > latestTime && quoteBucketTime - latestTime <= maxLagSeconds;
+}
+
 function extractRealtimeTradeMessage(
   message: ContractMarketRealtimeMessage,
   currentSymbol: string,
@@ -418,9 +532,10 @@ function upsertRealtimeKline(
   nextCandles.sort((a, b) => a.time - b.time);
   nextVolumes.sort((a, b) => a.time - b.time);
 
+  const normalized = normalizeKlinePairs(nextCandles, nextVolumes);
   return {
-    nextCandles,
-    nextVolumes,
+    nextCandles: normalized.candles,
+    nextVolumes: normalized.volumes,
   };
 }
 
@@ -447,63 +562,59 @@ function syncLatestPriceToCurrentCandle(
   volumes: VolumeItem[],
   interval: string,
   price: number,
+  quoteTimestamp: string | number | null | undefined,
+  maxDeviationRatio?: number | null,
 ) {
   if (!Number.isFinite(price) || price <= 0 || !candles.length) return null;
 
-  const bucketTime = getBucketStart(Math.floor(Date.now() / 1000), interval);
   const nextCandles = [...candles];
   const nextVolumes = [...volumes];
-  const candleIndex = nextCandles.findIndex((item) => item.time === bucketTime);
   const latest = getLatestRealCandle(nextCandles);
+  if (!latest) return null;
 
-  if (candleIndex >= 0) {
-    const current = nextCandles[candleIndex];
-    const open = current.isPlaceholder ? price : current.open;
-    const high = current.isPlaceholder ? price : Math.max(current.high, price);
-    const low = current.isPlaceholder ? price : Math.min(current.low, price);
+  const quoteBucketTime = getQuoteBucketTime(quoteTimestamp, interval);
+  if (!canPatchLatestCandleWithQuote(latest.time, quoteBucketTime, interval)) return null;
 
-    if (
-      !current.isPlaceholder &&
-      current.close === price &&
-      current.high === high &&
-      current.low === low
-    ) {
-      return null;
-    }
+  const candleIndex = nextCandles.findIndex((item) => item.time === latest.time);
+  if (candleIndex < 0) return null;
 
-    const updated = makeCandle(bucketTime, open, high, low, price, current.isPlaceholder ? 0 : current.volume);
-    nextCandles[candleIndex] = updated;
-
-    const volumeIndex = nextVolumes.findIndex((item) => item.time === bucketTime);
-    const volumeValue = volumeIndex >= 0 ? nextVolumes[volumeIndex].value : updated.volume;
-    const updatedVolume = makeVolume(bucketTime, volumeValue, updated.open, updated.close);
-    if (volumeIndex >= 0) {
-      nextVolumes[volumeIndex] = updatedVolume;
-    } else {
-      nextVolumes.push(updatedVolume);
-    }
-  } else if (latest && bucketTime > latest.time) {
-    const open = latest.close;
-    const nextCandle: CandleItem = {
-      time: bucketTime,
-      open,
-      high: Math.max(open, price),
-      low: Math.min(open, price),
-      close: price,
-      volume: 0,
-      isPlaceholder: false,
-    };
-    nextCandles.push(nextCandle);
-    nextVolumes.push(makeVolume(bucketTime, 0, nextCandle.open, nextCandle.close));
-  } else {
+  const current = nextCandles[candleIndex];
+  if (current.isPlaceholder) return null;
+  if (
+    typeof maxDeviationRatio === 'number' &&
+    Number.isFinite(maxDeviationRatio) &&
+    maxDeviationRatio > 0 &&
+    current.close > 0 &&
+    Math.abs(price - current.close) / current.close > maxDeviationRatio
+  ) {
     return null;
+  }
+
+  const high = Math.max(current.high, price);
+  const low = Math.min(current.low, price);
+
+  if (current.close === price && current.high === high && current.low === low) {
+    return null;
+  }
+
+  const updated = makeCandle(current.time, current.open, high, low, price, current.volume);
+  nextCandles[candleIndex] = updated;
+
+  const volumeIndex = nextVolumes.findIndex((item) => item.time === current.time);
+  const volumeValue = volumeIndex >= 0 ? nextVolumes[volumeIndex].value : updated.volume;
+  const updatedVolume = makeVolume(current.time, volumeValue, updated.open, updated.close);
+  if (volumeIndex >= 0) {
+    nextVolumes[volumeIndex] = updatedVolume;
+  } else {
+    nextVolumes.push(updatedVolume);
   }
 
   nextCandles.sort((a, b) => a.time - b.time);
   nextVolumes.sort((a, b) => a.time - b.time);
+  const normalized = normalizeKlinePairs(nextCandles, nextVolumes);
   return {
-    nextCandles,
-    nextVolumes,
+    nextCandles: normalized.candles,
+    nextVolumes: normalized.volumes,
   };
 }
 
@@ -512,9 +623,12 @@ export default function ContractFuturesChart({
   interval,
   height = 520,
   marketStatus,
-  latestPrice,
-  lastPrice,
-  midPrice,
+  pricePrecision: explicitPricePrecision,
+  latestCandlePatchPrice,
+  latestPriceTimestamp,
+  allowLatestPriceCandlePatch = true,
+  latestCandlePatchMaxDeviationRatio = null,
+  allowRealtimeTradeCandlePatch = true,
   positionOverlay = null,
   positionEntryOverlays = [],
   positionTpSlOverlays = [],
@@ -537,6 +651,17 @@ export default function ContractFuturesChart({
   const latestPriceLinePriceRef = useRef<number | null>(null);
   const latestPriceLineColorRef = useRef(CONTRACT_CHART_GREEN);
   const flashTimerRef = useRef<number | null>(null);
+  const latestPatchRef = useRef<{
+    allow: boolean;
+    price: number | null;
+    timestamp?: string | number | null;
+    maxDeviationRatio?: number | null;
+  }>({
+    allow: false,
+    price: null,
+    timestamp: null,
+    maxDeviationRatio: null,
+  });
   const candlesRef = useRef<CandleItem[]>([]);
   const volumesRef = useRef<VolumeItem[]>([]);
   const positionedRef = useRef(false);
@@ -564,7 +689,10 @@ export default function ContractFuturesChart({
   const [latestCandleFlashing, setLatestCandleFlashing] = useState(false);
   const [priceZoomLevel, setPriceZoomLevel] = useState(0);
 
-  const precision = useMemo(() => pricePrecision(symbol), [symbol]);
+  const precision = useMemo(
+    () => resolveChartPricePrecision(symbol, explicitPricePrecision),
+    [explicitPricePrecision, symbol],
+  );
   const ma5 = useMemo(() => calculateMA(candles, 5), [candles]);
   const ma10 = useMemo(() => calculateMA(candles, 10), [candles]);
   const ma30 = useMemo(() => calculateMA(candles, 30), [candles]);
@@ -655,7 +783,7 @@ export default function ContractFuturesChart({
     });
 
     const latest = getLatestRealCandle(allCandles);
-    const currentPrice = firstValidPrice(latestPrice, lastPrice, midPrice, latest?.close);
+    const currentPrice = firstValidPrice(latestCandlePatchPrice, latest?.close);
     if (currentPrice !== null) values.push(currentPrice);
 
     const finiteValues = values.filter((value) => Number.isFinite(value) && value > 0);
@@ -682,7 +810,43 @@ export default function ContractFuturesChart({
       from: rangeFrom,
       to: rangeTo,
     });
-  }, [lastPrice, latestPrice, midPrice, precision]);
+  }, [latestCandlePatchPrice, precision]);
+
+  const applyTrustedLatestPricePatch = useCallback((
+    sourceCandles: CandleItem[],
+    sourceVolumes: VolumeItem[],
+  ) => {
+    const normalized = normalizeKlinePairs(sourceCandles, sourceVolumes);
+    const patch = latestPatchRef.current;
+    if (!patch.allow || patch.price === null) return normalized;
+
+    const synced = syncLatestPriceToCurrentCandle(
+      normalized.candles,
+      normalized.volumes,
+      currentIntervalRef.current,
+      patch.price,
+      patch.timestamp,
+      patch.maxDeviationRatio,
+    );
+    if (!synced) return normalized;
+
+    return normalizeKlinePairs(synced.nextCandles, synced.nextVolumes);
+  }, []);
+
+  useEffect(() => {
+    latestPatchRef.current = {
+      allow: allowLatestPriceCandlePatch && marketStatus !== 'CLOSED',
+      price: firstValidPrice(latestCandlePatchPrice),
+      timestamp: latestPriceTimestamp,
+      maxDeviationRatio: latestCandlePatchMaxDeviationRatio,
+    };
+  }, [
+    allowLatestPriceCandlePatch,
+    latestCandlePatchMaxDeviationRatio,
+    latestCandlePatchPrice,
+    latestPriceTimestamp,
+    marketStatus,
+  ]);
 
   const resetChartView = useCallback(() => {
     setPriceZoomLevel(0);
@@ -758,7 +922,8 @@ export default function ContractFuturesChart({
 
       const mergedCandles = mergeCandlesByTime(olderCandles, currentCandles);
       const mergedVolumes = mergeVolumesByTime(olderVolumes, volumesRef.current);
-      const addedCount = mergedCandles.length - currentCandles.length;
+      const normalized = applyTrustedLatestPricePatch(mergedCandles, mergedVolumes);
+      const addedCount = normalized.candles.length - currentCandles.length;
 
       if (addedCount <= 0) {
         hasMoreHistoryRef.current = false;
@@ -773,14 +938,15 @@ export default function ContractFuturesChart({
         };
       }
 
-      candlesRef.current = mergedCandles;
-      volumesRef.current = mergedVolumes;
-      oldestTimeRef.current = mergedCandles[0]?.time ?? null;
-      setCandles(mergedCandles);
-      setVolumes(mergedVolumes);
+      setKlinePairState(
+        { candlesRef, volumesRef, oldestTimeRef },
+        { setCandles, setVolumes },
+        normalized.candles,
+        normalized.volumes,
+      );
       writeContractKlineCache(requestSymbol, requestInterval, {
-        candles: mergedCandles,
-        volumes: mergedVolumes,
+        candles: normalized.candles,
+        volumes: normalized.volumes,
       });
 
       if (olderCandles.length < CONTRACT_CHART_KLINE_LIMIT) {
@@ -793,7 +959,7 @@ export default function ContractFuturesChart({
       isLoadingMoreRef.current = false;
       setLoadingMore(false);
     }
-  }, []);
+  }, [applyTrustedLatestPricePatch]);
 
   useEffect(() => {
     candlesRef.current = candles;
@@ -927,14 +1093,16 @@ export default function ContractFuturesChart({
         const nextVolumes = !shouldReplaceKlines && volumesRef.current.length
           ? mergeVolumesByTime(volumesRef.current, adapted.volumes)
           : adapted.volumes;
-        setCandles(nextCandles);
-        setVolumes(nextVolumes);
-        candlesRef.current = nextCandles;
-        volumesRef.current = nextVolumes;
-        oldestTimeRef.current = nextCandles[0]?.time ?? null;
+        const patched = applyTrustedLatestPricePatch(nextCandles, nextVolumes);
+        const normalized = setKlinePairState(
+          { candlesRef, volumesRef, oldestTimeRef },
+          { setCandles, setVolumes },
+          patched.candles,
+          patched.volumes,
+        );
         writeContractKlineCache(symbol, interval, {
-          candles: nextCandles,
-          volumes: nextVolumes,
+          candles: normalized.candles,
+          volumes: normalized.volumes,
         });
         setError('');
       } catch {
@@ -965,17 +1133,21 @@ export default function ContractFuturesChart({
     setError('');
     const cached = readContractKlineCache(symbol, interval);
     if (cached?.candles?.length) {
-      setCandles(cached.candles);
-      setVolumes(cached.volumes || []);
-      candlesRef.current = cached.candles;
-      volumesRef.current = cached.volumes || [];
-      oldestTimeRef.current = cached.candles[0]?.time ?? null;
+      const patched = applyTrustedLatestPricePatch(cached.candles, cached.volumes || []);
+      setKlinePairState(
+        { candlesRef, volumesRef, oldestTimeRef },
+        { setCandles, setVolumes },
+        patched.candles,
+        patched.volumes,
+      );
       setLoading(false);
     } else {
-      setCandles([]);
-      setVolumes([]);
-      candlesRef.current = [];
-      volumesRef.current = [];
+      setKlinePairState(
+        { candlesRef, volumesRef, oldestTimeRef },
+        { setCandles, setVolumes },
+        [],
+        [],
+      );
       setLoading(true);
     }
     void loadKlines();
@@ -987,7 +1159,7 @@ export default function ContractFuturesChart({
       alive = false;
       window.clearInterval(timer);
     };
-  }, [symbol, interval, t]);
+  }, [applyTrustedLatestPricePatch, symbol, interval, t]);
 
   useEffect(() => {
     const applyRealtimeUpdate = (message: ContractMarketRealtimeMessage) => {
@@ -1004,6 +1176,7 @@ export default function ContractFuturesChart({
         : null;
 
       if (!updated) {
+        if (!allowRealtimeTradeCandlePatch) return;
         const tradeMessage = extractRealtimeTradeMessage(message, symbol);
         if (!tradeMessage) return;
         updated = applySpotTradeUpdate({
@@ -1019,16 +1192,17 @@ export default function ContractFuturesChart({
 
       const nextCandles = updated.nextCandles;
       const nextVolumes = updated.nextVolumes;
-      candlesRef.current = nextCandles;
-      volumesRef.current = nextVolumes;
-      oldestTimeRef.current = nextCandles[0]?.time ?? null;
-      setCandles(nextCandles);
-      setVolumes(nextVolumes);
+      const normalized = setKlinePairState(
+        { candlesRef, volumesRef, oldestTimeRef },
+        { setCandles, setVolumes },
+        nextCandles,
+        nextVolumes,
+      );
       setLoading(false);
       setError('');
       writeContractKlineCache(symbol, interval, {
-        candles: nextCandles,
-        volumes: nextVolumes,
+        candles: normalized.candles,
+        volumes: normalized.volumes,
       });
     };
 
@@ -1039,7 +1213,7 @@ export default function ContractFuturesChart({
       unsubscribeTrade();
       unsubscribeKline();
     };
-  }, [interval, marketStatus, symbol]);
+  }, [allowRealtimeTradeCandlePatch, interval, marketStatus, symbol]);
 
   useEffect(() => {
     if (!candleSeriesRef.current || !volumeSeriesRef.current) return;
@@ -1094,9 +1268,10 @@ export default function ContractFuturesChart({
   ]);
 
   useEffect(() => {
+    if (!allowLatestPriceCandlePatch) return;
     if (marketStatus === 'CLOSED') return;
 
-    const price = firstValidPrice(latestPrice, lastPrice, midPrice);
+    const price = firstValidPrice(latestCandlePatchPrice);
     if (price === null) return;
 
     const synced = syncLatestPriceToCurrentCandle(
@@ -1104,19 +1279,31 @@ export default function ContractFuturesChart({
       volumesRef.current,
       interval,
       price,
+      latestPriceTimestamp,
+      latestCandlePatchMaxDeviationRatio,
     );
     if (!synced) return;
 
-    candlesRef.current = synced.nextCandles;
-    volumesRef.current = synced.nextVolumes;
-    oldestTimeRef.current = synced.nextCandles[0]?.time ?? null;
-    setCandles(synced.nextCandles);
-    setVolumes(synced.nextVolumes);
+    const normalized = setKlinePairState(
+      { candlesRef, volumesRef, oldestTimeRef },
+      { setCandles, setVolumes },
+      synced.nextCandles,
+      synced.nextVolumes,
+    );
     writeContractKlineCache(symbol, interval, {
-      candles: synced.nextCandles,
-      volumes: synced.nextVolumes,
+      candles: normalized.candles,
+      volumes: normalized.volumes,
     });
-  }, [candles, interval, lastPrice, latestPrice, marketStatus, midPrice, symbol]);
+  }, [
+    allowLatestPriceCandlePatch,
+    candles,
+    interval,
+    latestCandlePatchMaxDeviationRatio,
+    latestCandlePatchPrice,
+    latestPriceTimestamp,
+    marketStatus,
+    symbol,
+  ]);
 
   useEffect(() => {
     if (!chartRef.current) return;
@@ -1165,10 +1352,19 @@ export default function ContractFuturesChart({
   useEffect(() => {
     const series = candleSeriesRef.current;
     const latest = getLatestRealCandle(candles);
-    const price = firstValidPrice(latestPrice, lastPrice, midPrice, latest?.close);
+    const trustedPrice = firstValidPrice(latestCandlePatchPrice);
+    const price = firstValidPrice(trustedPrice, latest?.close);
 
     if (!series) return;
-    if (price === null) return;
+    if (price === null) {
+      if (latestPriceLineRef.current) {
+        series.removePriceLine(latestPriceLineRef.current);
+        latestPriceLineRef.current = null;
+        latestPriceLinePriceRef.current = null;
+        latestPriceLineColorRef.current = CONTRACT_CHART_GREEN;
+      }
+      return;
+    }
 
     const previousPrice = latestPriceLinePriceRef.current;
     const color = previousPrice === null || price === previousPrice
@@ -1191,8 +1387,12 @@ export default function ContractFuturesChart({
       return;
     }
 
-    latestPriceLineRef.current.applyOptions({ price, color });
-  }, [candles, lastPrice, latestPrice, midPrice]);
+    latestPriceLineRef.current.applyOptions({
+      price,
+      color,
+      title: '',
+    });
+  }, [candles, latestCandlePatchPrice]);
 
   useEffect(() => {
     const series = candleSeriesRef.current;

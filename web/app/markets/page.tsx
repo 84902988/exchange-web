@@ -299,14 +299,88 @@ function getFiniteNumber(value: unknown): number | null {
   return Number.isFinite(numberValue) ? numberValue : null
 }
 
+function getMarketQuoteVolumeValue(row: MarketTickerItem): number | null {
+  const directValue = getFiniteNumber(row.quote_volume_24h ?? row.turnover ?? row.amount ?? row.value)
+  if (directValue !== null && directValue > 0) return directValue
+
+  const baseVolume = getFiniteNumber(row.base_volume_24h ?? row.volume_24h)
+  const lastPrice = getFiniteNumber(row.last_price ?? row.price ?? row.last ?? row.close)
+  if (baseVolume !== null && baseVolume > 0 && lastPrice !== null && lastPrice > 0) {
+    return baseVolume * lastPrice
+  }
+
+  return getFiniteNumber(row.volume_24h)
+}
+
+function getMarketHighValue(row: MarketTickerItem): number | null {
+  return getFiniteNumber(row.high_24h ?? row.high ?? row.high_price ?? row.highPrice)
+}
+
+function getMarketLowValue(row: MarketTickerItem): number | null {
+  return getFiniteNumber(row.low_24h ?? row.low ?? row.low_price ?? row.lowPrice)
+}
+
 function optionalMarketValue(value: string | number | null | undefined): string | number | undefined {
   return value ?? undefined
+}
+
+function readTickerField(
+  item: (MarketTickerItem | ContractTickerItem) | undefined,
+  keys: string[],
+): string | number | undefined {
+  if (!item) return undefined
+  const record = item as Record<string, unknown>
+  for (const key of keys) {
+    const value = record[key]
+    if (value !== undefined && value !== null && value !== '') {
+      return value as string | number
+    }
+  }
+  return undefined
+}
+
+function getContractTickerHigh(ticker?: ContractTickerItem): string | number | undefined {
+  return optionalMarketValue(
+    readTickerField(ticker, ['high_24h', 'high', 'high_price', 'highPrice', 'day_high', 'dayHigh']),
+  )
+}
+
+function getContractTickerLow(ticker?: ContractTickerItem): string | number | undefined {
+  return optionalMarketValue(
+    readTickerField(ticker, ['low_24h', 'low', 'low_price', 'lowPrice', 'day_low', 'dayLow']),
+  )
+}
+
+function getContractTickerBaseVolume(ticker?: ContractTickerItem): string | number | undefined {
+  return optionalMarketValue(
+    readTickerField(ticker, ['base_volume_24h', 'base_volume', 'baseVolume', 'volume', 'vol', 'volume_24h']),
+  )
+}
+
+function getContractTickerQuoteVolume(ticker?: ContractTickerItem): string | number | undefined {
+  const direct = readTickerField(ticker, [
+    'quote_volume_24h',
+    'turnover',
+    'amount',
+    'value',
+    'quote_volume',
+    'quoteVolume',
+  ])
+  const directNumber = getFiniteNumber(direct)
+  if (directNumber !== null && directNumber > 0) return direct
+
+  const baseVolume = getFiniteNumber(getContractTickerBaseVolume(ticker))
+  const lastPrice = getFiniteNumber(readTickerField(ticker, ['last_price', 'price', 'last', 'close']))
+  if (baseVolume !== null && baseVolume > 0 && lastPrice !== null && lastPrice > 0) {
+    return baseVolume * lastPrice
+  }
+  return undefined
 }
 
 function hasUsableStockTicker(row: MarketTickerItem): boolean {
   if (normalizeCategory(row.market_category) !== 'STOCK') return true
   const price = getFiniteNumber(row.last_price ?? row.price ?? row.last ?? row.close)
-  const quoteVolume = getFiniteNumber(row.quote_volume_24h ?? row.turnover ?? row.amount ?? row.value)
+  const quoteVolume = getMarketQuoteVolumeValue(row)
   const change = getFiniteNumber(row.price_change_percent_24h ?? row.change_24h)
   if (price === null || price <= 0) return false
   if (quoteVolume !== null && quoteVolume > 0) return true
@@ -426,10 +500,10 @@ function buildContractRow(
     price_change_24h: optionalMarketValue(ticker?.price_change_24h),
     price_change_percent_24h:
       optionalMarketValue(ticker?.price_change_percent_24h ?? ticker?.change_24h ?? ticker?.priceChangePercent),
-    high_24h: optionalMarketValue(ticker?.high_24h),
-    low_24h: optionalMarketValue(ticker?.low_24h),
-    base_volume_24h: optionalMarketValue(ticker?.base_volume_24h),
-    quote_volume_24h: optionalMarketValue(ticker?.quote_volume_24h),
+    high_24h: getContractTickerHigh(ticker),
+    low_24h: getContractTickerLow(ticker),
+    base_volume_24h: getContractTickerBaseVolume(ticker),
+    quote_volume_24h: getContractTickerQuoteVolume(ticker),
     price_precision: item.price_precision,
     amount_precision: item.quantity_precision,
     asset_type: contractAssetType,
@@ -484,10 +558,10 @@ function applyTickerCaches(baseRows: MarketTickerItem[]): MarketTickerItem[] {
                   contractTicker.change_24h ??
                   contractTicker.priceChangePercent,
               ),
-            high_24h: optionalMarketValue(contractTicker.high_24h),
-            low_24h: optionalMarketValue(contractTicker.low_24h),
-            base_volume_24h: optionalMarketValue(contractTicker.base_volume_24h),
-            quote_volume_24h: optionalMarketValue(contractTicker.quote_volume_24h),
+            high_24h: getContractTickerHigh(contractTicker),
+            low_24h: getContractTickerLow(contractTicker),
+            base_volume_24h: getContractTickerBaseVolume(contractTicker),
+            quote_volume_24h: getContractTickerQuoteVolume(contractTicker),
           }
         : row
     }
@@ -660,9 +734,9 @@ function sortRows(rows: MarketTickerItem[], secondaryTab: SecondaryTab): MarketT
 function getMarketSortValue(row: MarketTickerItem, key: MarketsSortKey): number | null {
   if (key === 'last_price') return getFiniteNumber(row.last_price ?? row.price ?? row.last ?? row.close)
   if (key === 'price_change_percent_24h') return getFiniteNumber(row.price_change_percent_24h ?? row.change_24h)
-  if (key === 'high_24h') return getFiniteNumber(row.high_24h)
-  if (key === 'low_24h') return getFiniteNumber(row.low_24h)
-  return getFiniteNumber(row.quote_volume_24h ?? row.volume_24h)
+  if (key === 'high_24h') return getMarketHighValue(row)
+  if (key === 'low_24h') return getMarketLowValue(row)
+  return getMarketQuoteVolumeValue(row)
 }
 
 function sortRowsByState(rows: MarketTickerItem[], sortState: MarketsSortState | null): MarketTickerItem[] {

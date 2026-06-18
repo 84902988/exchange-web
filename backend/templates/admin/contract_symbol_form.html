@@ -16,10 +16,10 @@
   "CRYPTO": "数字货币合约"
 } %}
 {% set provider_labels = {
+  "BINANCE": "外部合约行情",
   "ITICK": "iTick 行情",
-  "BINANCE": "Binance 行情",
-  "INTERNAL": "内部行情",
-  "MANUAL": "手动行情"
+  "INTERNAL": "内部撮合行情",
+  "MANUAL": "已停用行情源"
 } %}
 {% set tp_sl_trigger_price_type_labels = {
   "MARK_PRICE": "标记价格",
@@ -148,7 +148,7 @@
           <div class="form-grid">
             <div class="field">
               <label for="provider">行情来源</label>
-              <div class="field-help">该合约价格使用的行情提供方。</div>
+              <div class="field-help">加密合约使用后台【行情源配置中心】中的 provider 优先级，例如 OKX、Bitget、Binance 或最近有效价格兜底。<a href="/admin/market-providers">查看行情源配置中心</a></div>
               <select id="provider" name="provider">
                 {% for option in provider_options %}
                   <option value="{{ option }}" {% if form.provider == option %}selected{% endif %}>{{ provider_labels.get(option, option) }}</option>
@@ -217,8 +217,8 @@
           <h3 class="form-section-title">风控参数</h3>
           <div class="form-grid">
             <div class="field">
-              <label for="spread_x">固定点差加点（U）</label>
-              <div class="field-help">范围 0~100，最小 0.01；按对用户不利方向叠加到合约买卖价。</div>
+              <label for="spread_x">单边固定加点（U）</label>
+              <div class="field-help">设置后，买入方向在 ask 基础上加 X，卖出方向在 bid 基础上减 X。该加点通过成交价体现，不作为手续费单独扣除。</div>
               <input id="spread_x" type="number" min="0" max="100" step="0.01" name="spread_x" value="{{ form.spread_x or '0.0' }}" />
             </div>
             <div class="field">

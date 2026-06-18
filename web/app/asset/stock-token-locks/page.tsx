@@ -15,6 +15,24 @@ import { fallbackSiteConfig, getSiteConfig, type SiteConfig } from "@/lib/api/mo
 
 type AssetTranslator = (key: string, namespace?: "asset") => string;
 
+const DEFAULT_CHINESE_NOTICE_TITLES = new Set([
+  "股票代币兑换股票说明",
+  "股票通证转换指南",
+]);
+
+const DEFAULT_CHINESE_NOTICE_CONTENTS = new Set([
+  [
+    "1. 请在凯恩斯券商平台完成注册（手机应用市场搜索：Keynes Securities）",
+    "2. 请与英交易所官方客服取得联系，联系方式请以官方公告或客服页面为准",
+    "3. 沟通相关股票配发事项",
+  ].join("\n"),
+  [
+    "1. 请在凯恩斯券商平台完成注册（手机应用市场搜索：Keynes Securities）",
+    "2. 请与交易所官方客服联系，联系方式请以官方公告或客服页面为准",
+    "3. 沟通相关股票配发事项",
+  ].join("\n"),
+]);
+
 function formatMessage(template: string, values: Record<string, string | number>) {
   return Object.entries(values).reduce(
     (text, [key, value]) => text.replaceAll(`{${key}}`, String(value)),
@@ -187,6 +205,14 @@ function noticeLines(content?: string | null) {
     .map((line) => line.replace(/^\d+[.)\s]*/, ""));
 }
 
+function normalizeNoticeText(value?: string | null) {
+  return String(value ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
 function StatusBadge({ status, t }: { status: string; t: AssetTranslator }) {
   return (
     <span className={`rounded-full border px-2.5 py-1 text-xs ${statusBadgeClass(status)}`}>
@@ -312,9 +338,18 @@ export default function StockTokenLocksPage() {
   const selectedExpectedAmount = selectedLock
     ? multiplyDecimalStrings(selectedLock.available_amount, selectedLock.conversion_rate_snapshot)
     : "0";
-  const stockTokenNoticeLines = noticeLines(siteConfig.stock_token_locks_notice_content);
+  const apiNoticeTitle = String(siteConfig.stock_token_locks_notice_title || "").trim();
+  const apiNoticeContent = normalizeNoticeText(siteConfig.stock_token_locks_notice_content);
+  const localizedNoticeTitle = t("stockTokenLocksNoticeTitle", "asset");
+  const localizedNoticeContent = t("stockTokenLocksNoticeContent", "asset");
+  const shouldUseLocalizedNotice =
+    currentLanguage !== "zh" &&
+    (DEFAULT_CHINESE_NOTICE_TITLES.has(apiNoticeTitle) || DEFAULT_CHINESE_NOTICE_CONTENTS.has(apiNoticeContent));
   const stockTokenNoticeTitle =
-    String(siteConfig.stock_token_locks_notice_title || "").trim() || t("stockTokenLocksNoticeTitle", "asset");
+    shouldUseLocalizedNotice || !apiNoticeTitle ? localizedNoticeTitle : apiNoticeTitle;
+  const stockTokenNoticeContent =
+    shouldUseLocalizedNotice || !apiNoticeContent ? localizedNoticeContent : apiNoticeContent;
+  const stockTokenNoticeLines = noticeLines(stockTokenNoticeContent);
 
   return (
     <main className="flex min-h-screen bg-[#0a0a0d] py-8 text-white">

@@ -54,6 +54,14 @@ export function getTickerChange(row: MarketTickerItem): unknown {
   return row.price_change_percent_24h ?? row.change_24h ?? null
 }
 
+function getTickerHigh(row: MarketTickerItem): unknown {
+  return row.high_24h ?? row.high ?? row.high_price ?? row.highPrice
+}
+
+function getTickerLow(row: MarketTickerItem): unknown {
+  return row.low_24h ?? row.low ?? row.low_price ?? row.lowPrice
+}
+
 export function isHotTicker(row: MarketTickerItem): boolean {
   if (typeof row.is_hot === 'boolean') return row.is_hot
   if (typeof row.is_hot === 'number') return row.is_hot === 1
@@ -111,7 +119,17 @@ function formatVolume(value: unknown): string {
 }
 
 function getTickerQuoteVolume(row: MarketTickerItem): unknown {
-  return row.quote_volume_24h ?? row.volume_24h ?? row.turnover ?? row.amount ?? row.value
+  const directValue = row.quote_volume_24h ?? row.turnover ?? row.amount ?? row.value
+  const directNumber = toNumber(directValue)
+  if (directNumber !== null && directNumber > 0) return directValue
+
+  const baseVolume = toNumber(row.base_volume_24h ?? row.volume_24h)
+  const lastPrice = toNumber(getTickerPrice(row))
+  if (baseVolume !== null && baseVolume > 0 && lastPrice !== null && lastPrice > 0) {
+    return baseVolume * lastPrice
+  }
+
+  return row.volume_24h
 }
 
 export function getChangeClass(value: unknown): string {
@@ -347,10 +365,10 @@ export default function MarketsTable({
         {renderMarketValue(getTickerChange(row), formatChange(getTickerChange(row)), 'ml-auto w-14')}
       </td>
       <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
-        {renderMarketValue(row.high_24h, formatPrice(row.high_24h, getTickerPricePrecision(row)))}
+        {renderMarketValue(getTickerHigh(row), formatPrice(getTickerHigh(row), getTickerPricePrecision(row)))}
       </td>
       <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
-        {renderMarketValue(row.low_24h, formatPrice(row.low_24h, getTickerPricePrecision(row)))}
+        {renderMarketValue(getTickerLow(row), formatPrice(getTickerLow(row), getTickerPricePrecision(row)))}
       </td>
       <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
         {renderMarketValue(getTickerQuoteVolume(row), formatVolume(getTickerQuoteVolume(row)))}
@@ -404,10 +422,10 @@ export default function MarketsTable({
         {renderMarketValue(getTickerChange(row), formatChange(getTickerChange(row)), 'ml-auto w-14')}
       </td>
       <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
-        {renderMarketValue(row.high_24h, formatPrice(row.high_24h, getTickerPricePrecision(row)))}
+        {renderMarketValue(getTickerHigh(row), formatPrice(getTickerHigh(row), getTickerPricePrecision(row)))}
       </td>
       <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
-        {renderMarketValue(row.low_24h, formatPrice(row.low_24h, getTickerPricePrecision(row)))}
+        {renderMarketValue(getTickerLow(row), formatPrice(getTickerLow(row), getTickerPricePrecision(row)))}
       </td>
       <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
         {renderMarketValue(getTickerQuoteVolume(row), formatVolume(getTickerQuoteVolume(row)))}

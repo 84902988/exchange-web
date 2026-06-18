@@ -265,10 +265,26 @@ export default function ContractTradingForm({
   const quoteAskPrice = toNumber(quote?.ask_price);
   const quoteMarkPrice = toNumber(quote?.mark_price);
   const quoteLastPrice = toNumber(quote?.last_price);
-  const quoteSpreadX = toNumber(quote?.spread_x);
+  const quoteSingleSideSpreadFeePrice = toNumber(quote?.single_side_spread_fee_price)
+    || (toNumber(quote?.effective_total_spread) > 0 ? toNumber(quote?.effective_total_spread) / 2 : 0);
   const quoteAnchorPrice = quoteBidPrice > 0 && quoteAskPrice > 0
     ? (quoteBidPrice + quoteAskPrice) / 2
     : quoteMarkPrice || quoteLastPrice;
+  const normalizedQuoteMarketStatus = String(quote?.market_status || '').trim().toUpperCase();
+  const isClosedMarketQuote = normalizedQuoteMarketStatus === 'CLOSED' || normalizedQuoteMarketStatus === 'HOLIDAY';
+  const quoteUnavailable = quote?.executable === false;
+  const quoteStatusHint = quote
+    ? quoteUnavailable
+      ? t('quoteUnavailableTradingHint', 'contracts')
+      : isClosedMarketQuote
+        ? t('marketClosedTradableHint', 'contracts')
+        : t('marketRealtimeTradableHint', 'contracts')
+    : null;
+  const quoteStatusClassName = quoteUnavailable
+    ? 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]'
+    : isClosedMarketQuote
+      ? 'border-[#f0b90b]/25 bg-[#f0b90b]/10 text-[#f0b90b]'
+      : 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]';
 
   const bidReferencePrice = useMemo(() => (
     pickMarketReferencePrice(toNumber(bestBid), quoteBidPrice, quoteAnchorPrice)
@@ -294,14 +310,14 @@ export default function ContractTradingForm({
   const shortMargin = shortNotional !== null && leverage > 0 ? shortNotional / leverage : null;
 
   const spreadCostHint = useMemo(() => {
-    if (quoteSpreadX <= 0 || quantityNumber <= 0) return null;
-    return quoteSpreadX * quantityNumber;
-  }, [quantityNumber, quoteSpreadX]);
+    if (quoteSingleSideSpreadFeePrice <= 0 || quantityNumber <= 0) return null;
+    return quoteSingleSideSpreadFeePrice * quantityNumber;
+  }, [quantityNumber, quoteSingleSideSpreadFeePrice]);
 
   const closeSpreadCostHint = useMemo(() => {
-    if (quoteSpreadX <= 0 || closeQuantityNumber <= 0) return null;
-    return quoteSpreadX * closeQuantityNumber;
-  }, [closeQuantityNumber, quoteSpreadX]);
+    if (quoteSingleSideSpreadFeePrice <= 0 || closeQuantityNumber <= 0) return null;
+    return quoteSingleSideSpreadFeePrice * closeQuantityNumber;
+  }, [closeQuantityNumber, quoteSingleSideSpreadFeePrice]);
 
   const limitPriceNumber = toNumber(price);
   const estimatedExecutionPrice = useMemo(() => {
@@ -379,7 +395,7 @@ export default function ContractTradingForm({
       : (entry - closePrice) * qty;
   }, [closeQuantity, closeSide, estimatedExecutionPrice, selectedCloseEntryPrice, selectedClosePosition, selectedCloseQuantity, selectedCloseSummary]);
 
-  const submitDisabled = disabled || submitting || !isLoggedIn;
+  const submitDisabled = disabled || submitting || !isLoggedIn || quoteUnavailable;
   const openSubmitDisabled = submitDisabled || availableMarginNumber <= 0;
   const closeDisabled = submitDisabled || (!selectedCloseSummary && !selectedClosePosition);
 
@@ -481,6 +497,7 @@ export default function ContractTradingForm({
 
   function validateOpen(side: ContractPositionSide) {
     if (availableMarginNumber <= 0) return t('transferMarginFirst', 'contracts');
+    if (quoteUnavailable) return t('quoteUnavailableTradingHint', 'contracts');
     if (!quantity.trim()) return t('enterQuantity', 'contracts');
     if (toNumber(quantity) <= 0) return t('enterValidOpenQuantity', 'contracts');
     if (leverage <= 0) return t('enterValidLeverage', 'contracts');
@@ -497,6 +514,7 @@ export default function ContractTradingForm({
 
   function validateClose(position: ContractPositionItem | null, maxQuantity: string) {
     if (!selectedCloseSummary && !position) return t('noClosablePosition', 'contracts');
+    if (quoteUnavailable) return t('quoteUnavailableTradingHint', 'contracts');
     const qty = toNumber(closeQuantity || maxQuantity);
     if (qty <= 0) return t('enterValidCloseQuantity', 'contracts');
     if (qty > toNumber(maxQuantity)) return t('closeQuantityExceedsMax', 'contracts');
@@ -802,9 +820,9 @@ export default function ContractTradingForm({
 
         {feedback ? <FormFeedbackBox feedback={feedback} /> : null}
 
-        {quote?.market_status === 'CLOSED' ? (
-          <div className="rounded-xl border border-[#f0b90b]/25 bg-[#f0b90b]/10 px-2.5 py-1.5 text-[12px] leading-5 text-[#f0b90b]">
-            {t('marketClosedTradingHint', 'contracts')}
+        {quoteStatusHint ? (
+          <div className={`rounded-xl border px-2.5 py-1.5 text-[12px] leading-5 ${quoteStatusClassName}`}>
+            {quoteStatusHint}
           </div>
         ) : null}
 

@@ -2,6 +2,8 @@
 
 import { WsMessage, OrderBookUpdate, TradeUpdate } from '@/types/orderBook';
 
+type WsListener = (data: unknown) => void;
+
 /**
  * WebSocket服务类
  * @description 负责管理WebSocket连接，处理消息订阅和推送，实现自动重连等功能
@@ -28,7 +30,7 @@ class WebSocketService {
   /** 最大重连尝试次数 */
   private maxReconnectAttempts: number = 5;
   /** 事件监听器映射表 */
-  private listeners: Map<string, Function[]> = new Map();
+  private listeners: Map<string, WsListener[]> = new Map();
 
   /**
    * 构造函数
@@ -151,7 +153,7 @@ class WebSocketService {
    * @param {Function} callback 事件处理函数
    * @returns {void}
    */
-  on(event: string, callback: Function): void {
+  on(event: string, callback: WsListener): void {
     // 如果事件类型不存在，创建新的监听器数组
     if (!this.listeners.has(event)) {
       this.listeners.set(event, []);
@@ -167,7 +169,7 @@ class WebSocketService {
    * @param {Function} callback 事件处理函数
    * @returns {void}
    */
-  off(event: string, callback: Function): void {
+  off(event: string, callback: WsListener): void {
     // 如果事件类型存在
     if (this.listeners.has(event)) {
       // 过滤掉要移除的监听器
@@ -187,10 +189,10 @@ class WebSocketService {
    * @description 执行指定事件的所有监听器
    * @private
    * @param {string} event 事件名称
-   * @param {any} data 事件数据
+   * @param {unknown} data 事件数据
    * @returns {void}
    */
-  private emit(event: string, data: any): void {
+  private emit(event: string, data: unknown): void {
     // 获取事件的所有监听器
     this.listeners.get(event)?.forEach(callback => {
       try {
@@ -206,10 +208,10 @@ class WebSocketService {
   /**
    * 发送消息到服务器
    * @description 向WebSocket服务器发送JSON格式的消息
-   * @param {any} data 要发送的数据
+   * @param {unknown} data 要发送的数据
    * @returns {void}
    */
-  send(data: any): void {
+  send(data: unknown): void {
     // 检查WebSocket实例是否存在且状态为OPEN
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       // 发送JSON格式的消息

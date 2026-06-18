@@ -18,9 +18,21 @@ class ContractQuoteResponse(BaseModel):
     market_trading_hours: Optional[str] = None
     market_session_type: Optional[str] = None
     quote_freshness: str = "FALLBACK"
+    quote_source: str = "UNKNOWN"
+    executable: bool = False
+    is_realtime: bool = False
+    last_good_at: Optional[datetime] = None
+    stale: bool = True
     spread_x: str = "0"
+    manual_spread_x: str = "0"
+    effective_total_spread: str = "0"
+    single_side_spread_fee_price: str = "0"
+    bid: str
+    ask: str
     bid_price: str
     ask_price: str
+    best_bid: str
+    best_ask: str
     raw_bid_price: Optional[str] = None
     raw_ask_price: Optional[str] = None
     last_price: str
@@ -44,11 +56,20 @@ class ContractDepthResponse(BaseModel):
     market_trading_hours: Optional[str] = None
     market_session_type: Optional[str] = None
     quote_freshness: str = "FALLBACK"
+    quote_source: str = "UNKNOWN"
+    executable: bool = False
+    is_realtime: bool = False
+    last_good_at: Optional[datetime] = None
     spread_x: str = "0"
+    manual_spread_x: str = "0"
+    effective_total_spread: str = "0"
+    single_side_spread_fee_price: str = "0"
     bids: List[List[str]]
     asks: List[List[str]]
     raw_bids: Optional[List[List[str]]] = None
     raw_asks: Optional[List[List[str]]] = None
+    bid: Optional[str] = None
+    ask: Optional[str] = None
     best_bid: Optional[str] = None
     best_ask: Optional[str] = None
     raw_best_bid: Optional[str] = None

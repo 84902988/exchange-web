@@ -37,9 +37,21 @@ export type ContractQuote = {
   market_trading_hours?: string | null
   market_session_type?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
+  quote_source?: 'LIVE' | 'LAST_GOOD_BBO' | 'LAST_VALID' | 'FALLBACK' | 'STALE' | 'INVALID' | string
+  executable?: boolean
+  is_realtime?: boolean
+  last_good_at?: string | null
+  stale?: boolean
   spread_x?: string | number | null
+  manual_spread_x?: string | number | null
+  effective_total_spread?: string | number | null
+  single_side_spread_fee_price?: string | number | null
+  bid?: string | number | null
+  ask?: string | number | null
   bid_price: string
   ask_price: string
+  best_bid?: string | number | null
+  best_ask?: string | number | null
   raw_bid_price?: string | number | null
   raw_ask_price?: string | number | null
   last_price: string
@@ -68,11 +80,20 @@ export type ContractDepth = {
   market_trading_hours?: string | null
   market_session_type?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
+  quote_source?: 'LIVE' | 'LAST_GOOD_BBO' | 'LAST_VALID' | 'FALLBACK' | 'STALE' | 'INVALID' | string
+  executable?: boolean
+  is_realtime?: boolean
+  last_good_at?: string | null
   spread_x?: string | number | null
+  manual_spread_x?: string | number | null
+  effective_total_spread?: string | number | null
+  single_side_spread_fee_price?: string | number | null
   bids: ContractDepthLevel[]
   asks: ContractDepthLevel[]
   raw_bids?: ContractDepthLevel[] | null
   raw_asks?: ContractDepthLevel[] | null
+  bid?: string | number | null
+  ask?: string | number | null
   best_bid?: string | null
   best_ask?: string | null
   raw_best_bid?: string | number | null
@@ -342,6 +363,27 @@ export type ContractTradeListResponse = {
   page_size: number
 }
 
+export type ContractPrivateWsBridgeHealth = {
+  status: 'ok' | 'degraded' | string
+  channel: string
+  subscriber?: {
+    alive?: boolean
+    age_seconds?: number | null
+    last_seen_at?: string | null
+    loop_status?: string | null
+    pid?: number | string | null
+    hostname?: string | null
+  }
+  publisher?: {
+    status?: string | null
+    failure_count?: number
+    last_success_at?: string | null
+    last_failure_at?: string | null
+    last_error?: string | null
+  }
+  rest_fallback_recommended?: boolean
+}
+
 function withQuery(path: string, params: Record<string, string | number | undefined | null>) {
   const query = new URLSearchParams()
   Object.entries(params).forEach(([key, value]) => {
@@ -500,4 +542,8 @@ export function getContractTrades(params: {
   page_size?: number
 } = {}): Promise<ContractTradeListResponse> {
   return request<ContractTradeListResponse>(withQuery('/contract/trades', params))
+}
+
+export function getContractPrivateWsBridgeHealth(): Promise<ContractPrivateWsBridgeHealth> {
+  return request<ContractPrivateWsBridgeHealth>('/contract/ws/private/health')
 }

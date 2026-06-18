@@ -180,6 +180,19 @@
 
       <div class="rwa-form-section">
         <div class="rwa-section-title">展示配置</div>
+        {% if price_source_value == 'AUTO' %}
+          <div class="rwa-help-card">
+            <div><strong>自动同步模式：</strong>前台价格由同步结果决定，手动填写的划线价格会保存，但不会直接生效；如需手动指定前台价格，请切换为 MANUAL。</div>
+            <div><strong>当前前台有效值：</strong>{{ form.effective_display_label or ((form.last_ref_price or form.display_price or '-') ~ ' ' ~ (form.display_unit or '')) }}</div>
+            {% if form.source_price_label or form.last_ref_label %}
+              <div><strong>来源价格说明：</strong>{{ form.source_price_label or form.last_ref_label }}</div>
+            {% endif %}
+          </div>
+        {% else %}
+          <div class="rwa-help-card">
+            <div><strong>手动模式：</strong>前台价格优先使用这里填写的划线价格和展示文案。</div>
+          </div>
+        {% endif %}
         <div class="rwa-form-grid">
           <div class="field">
             <label for="line_color">线颜色</label>

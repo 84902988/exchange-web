@@ -31,6 +31,7 @@ import { useLocaleContext } from '@/contexts/LocaleContext';
 
 type TabKey = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
 type PositionScope = 'current' | 'all';
+type ContractRealtimeStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 type ContractTranslator = (key: string, namespace?: 'contracts') => string;
 type OrderFeedback = {
   type: 'success' | 'error';
@@ -58,6 +59,7 @@ type ContractPositionTabsProps = {
   scope?: PositionScope;
   positions: ContractPositionItem[];
   positionSummaries: ContractPositionSummaryItem[];
+  activeOrders?: ContractOrderListItem[];
   orders: ContractOrderListItem[];
   trades: ContractTradeListItem[];
   quote?: ContractQuote | null;
@@ -70,6 +72,7 @@ type ContractPositionTabsProps = {
   isAllPositionsLoading?: boolean;
   isOrdersLoading?: boolean;
   isTradesLoading?: boolean;
+  realtimeStatus?: ContractRealtimeStatus;
   onSymbolSelect?: (symbol: string) => void;
   onScopeChange?: (scope: PositionScope) => void;
   onSuccess: () => Promise<void> | void;
@@ -139,6 +142,7 @@ export default function ContractPositionTabs({
   scope: controlledScope,
   positions,
   positionSummaries,
+  activeOrders,
   orders,
   trades,
   quote,
@@ -151,6 +155,7 @@ export default function ContractPositionTabs({
   isAllPositionsLoading = false,
   isOrdersLoading = false,
   isTradesLoading = false,
+  realtimeStatus = 'idle',
   onSymbolSelect,
   onScopeChange,
   onSuccess,
@@ -189,11 +194,11 @@ export default function ContractPositionTabs({
   const [tpSlSaving, setTpSlSaving] = useState(false);
 
   const openOrders = useMemo(
-    () => orders.filter((item) => item.status === 'OPEN' || item.status === 'NEW' || item.status === 'PARTIALLY_FILLED'),
-    [orders],
+    () => activeOrders ?? orders.filter((item) => item.status === 'OPEN' || item.status === 'NEW' || item.status === 'PENDING' || item.status === 'PARTIALLY_FILLED'),
+    [activeOrders, orders],
   );
   const historyOrders = useMemo(
-    () => orders.filter((item) => item.status !== 'OPEN' && item.status !== 'NEW' && item.status !== 'PARTIALLY_FILLED'),
+    () => orders.filter((item) => item.status !== 'OPEN' && item.status !== 'NEW' && item.status !== 'PENDING' && item.status !== 'PARTIALLY_FILLED'),
     [orders],
   );
   const normalizedCurrentSymbol = useMemo(() => normalizeContractSymbol(currentSymbol), [currentSymbol]);
@@ -286,6 +291,14 @@ export default function ContractPositionTabs({
       : loading
         ? t('refreshing', 'contracts')
         : t('contractData', 'contracts');
+  const realtimeBadgeText = realtimeStatus === 'connected' || realtimeStatus === 'idle'
+    ? t('contractData', 'contracts')
+    : t('refreshing', 'contracts');
+  const realtimeDotClass = realtimeStatus === 'connected'
+    ? 'bg-emerald-400'
+    : realtimeStatus === 'connecting' || realtimeStatus === 'reconnecting'
+      ? 'bg-amber-300'
+      : 'bg-white/30';
 
   useEffect(() => {
     if (!orderFeedback) return undefined;
@@ -693,8 +706,9 @@ export default function ContractPositionTabs({
           </button>
         ))}
         </div>
-        <div className="ml-auto shrink-0 self-center text-xs text-white/40" title={statusText}>
-          {loading ? t('refreshing', 'contracts') : t('contractData', 'contracts')}
+        <div className="ml-auto flex shrink-0 items-center gap-1.5 self-center text-xs text-white/40" title={statusText}>
+          <span className={`h-1.5 w-1.5 rounded-full ${realtimeDotClass}`} aria-hidden="true" />
+          <span>{loading ? t('refreshing', 'contracts') : realtimeBadgeText}</span>
         </div>
       </div>
 

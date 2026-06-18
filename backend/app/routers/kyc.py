@@ -126,6 +126,19 @@ def _admin_required(request: Request) -> Optional[RedirectResponse]:
     return None
 
 
+def _admin_reviewer_id(request: Request) -> str:
+    try:
+        from app.routers.admin_pages import get_admin_from_request
+    except Exception:
+        return "legacy_admin_cookie"
+    admin = get_admin_from_request(request) or {}
+    admin_id = admin.get("id")
+    if admin_id is not None:
+        return str(admin_id)[:64]
+    username = str(admin.get("username") or "").strip()
+    return username[:64] if username else "legacy_admin_cookie"
+
+
 def _status_label(status: str) -> str:
     return KYC_STATUS_LABELS.get(str(status or "").upper(), status or "-")
 
@@ -446,8 +459,7 @@ def approve_kyc_submission(
     now = datetime.utcnow()
     item.review_status = "APPROVED"
     item.review_note = review_note.strip() or None
-    # TODO: 后续接入真实管理员 ID。
-    item.reviewed_by = "admin"
+    item.reviewed_by = _admin_reviewer_id(request)
     item.reviewed_at = now
     item.updated_at = now
     user.kyc_status = "APPROVED"
@@ -480,8 +492,7 @@ def reject_kyc_submission(
     now = datetime.utcnow()
     item.review_status = "REJECTED"
     item.review_note = review_note.strip() or "资料未通过审核"
-    # TODO: 后续接入真实管理员 ID。
-    item.reviewed_by = "admin"
+    item.reviewed_by = _admin_reviewer_id(request)
     item.reviewed_at = now
     item.updated_at = now
     if user:

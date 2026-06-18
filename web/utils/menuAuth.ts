@@ -27,5 +27,5 @@ export function canShowMenuItem(
   item: MenuItem,
   isLoggedIn: boolean
 ): boolean {
-  return canShowMenu(item as any, isLoggedIn);
+  return canShowMenu(item as MenuItem & { auth?: MenuAuth }, isLoggedIn);
 }

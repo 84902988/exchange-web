@@ -194,6 +194,8 @@ export type ReferenceOverlayPayload = {
   badge_color?: string | null
   display_value_label?: string | null
   display_price?: string | number | null
+  display_price_label?: string | null
+  source_price_label?: string | null
   display_unit?: string | null
   data_source?: string | null
   source_symbol?: string | null

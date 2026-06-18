@@ -5,6 +5,7 @@ export type ReferenceOverlayConfig = {
   title: string;
   valueLabel: string;
   sourceLabel: string;
+  sourcePriceLabel?: string | null;
   description: string;
   lineTitle: string;
   lineColor: string;
@@ -68,7 +69,7 @@ function localizedReferenceValueLabel(params: {
   if (kind === 'IRON') {
     return formatReferenceText(t('spotReferenceIronValueLabel', 'asset'), {
       price,
-      unit: t('spotReferenceUnitUsdPerTon', 'asset'),
+      unit: t('spotReferenceUnitUsdPerKg', 'asset'),
     });
   }
 
@@ -83,6 +84,17 @@ function localizedReferenceValueLabel(params: {
   return formatReferenceText(t(labelKey, 'asset'), {
     price,
     unit: normalizeReferenceUnit(displayUnit),
+  });
+}
+
+function localizedIronSourcePriceLabel(label: string | null | undefined, t: ReferenceOverlayTranslator) {
+  const text = String(label || '').trim();
+  if (!text) return null;
+  const sourcePrice = text.match(/[\d,.]+(?:\.\d+)?/)?.[0];
+  if (!sourcePrice) return text;
+  return formatReferenceText(t('spotReferenceIronValueLabel', 'asset'), {
+    price: sourcePrice,
+    unit: t('spotReferenceUnitUsdPerTon', 'asset'),
   });
 }
 
@@ -138,7 +150,7 @@ export function getReferenceOverlayConfig(
     const copy = localizedReferenceCopy({
       kind: 'IRON',
       symbol: 'IRON62',
-      displayPrice: 108,
+      displayPrice: 0.108,
       t,
     });
     return {
@@ -148,6 +160,10 @@ export function getReferenceOverlayConfig(
       title: copy.title,
       valueLabel: copy.valueLabel,
       sourceLabel: copy.sourceLabel,
+      sourcePriceLabel: formatReferenceText(t('spotReferenceIronValueLabel', 'asset'), {
+        price: '108',
+        unit: t('spotReferenceUnitUsdPerTon', 'asset'),
+      }),
       description: copy.description,
       lineTitle: copy.lineTitle,
       lineColor: '#f0b90b',
@@ -199,6 +215,11 @@ export function normalizeReferenceOverlayConfig(
   const normalizedDisplayPrice = Number.isFinite(displayPrice) && displayPrice > 0 ? displayPrice : null;
   const displayUnit = normalizeReferenceUnit(String(record.display_unit || 'USDT'));
   const assetSymbol = getReferenceAssetSymbol(record, symbol);
+  const rawSourcePriceLabel = typeof record.source_price_label === 'string'
+    ? record.source_price_label.trim()
+    : typeof record.last_ref_label === 'string'
+      ? record.last_ref_label.trim()
+      : null;
   const copy = localizedReferenceCopy({
     kind,
     symbol: assetSymbol || symbol,
@@ -214,6 +235,7 @@ export function normalizeReferenceOverlayConfig(
     title: copy.title,
     valueLabel: copy.valueLabel,
     sourceLabel: copy.sourceLabel,
+    sourcePriceLabel: kind === 'IRON' ? localizedIronSourcePriceLabel(rawSourcePriceLabel, t) : rawSourcePriceLabel,
     description: copy.description,
     lineTitle: copy.lineTitle,
     lineColor: String(record.line_color || '#f0b90b').trim(),

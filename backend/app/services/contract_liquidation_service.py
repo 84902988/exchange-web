@@ -11,14 +11,14 @@ from sqlalchemy.orm import Session
 
 from app.db.models.contract_account import ContractAccount
 from app.db.models.contract_liquidation_record import ContractLiquidationRecord
-from app.db.models.contract_margin_log import ContractMarginLog
 from app.db.models.contract_order import ContractOrder
 from app.db.models.contract_position import ContractPosition
 from app.db.models.contract_symbol import ContractSymbol
 from app.db.models.contract_trade import ContractTrade
-from app.services.contract_balance_log_service import add_contract_balance_log
+from app.services.contract_balance_log_service import add_contract_balance_log, add_contract_margin_log
 from app.services.contract_market_guard import ContractQuoteNotLive, require_executable_contract_quote
 from app.services.contract_market_service import get_contract_quote
+from app.services.contract_private_ws import publish_contract_user_updates
 
 logger = logging.getLogger(__name__)
 
@@ -595,29 +595,16 @@ def execute_liquidation(db: Session, position_id: int) -> ContractLiquidationExe
     position.updated_at = now
 
     conceptual_after_release = before_available + released_margin
-    db.add(
-        ContractMarginLog(
-            user_id=int(position.user_id),
-            account_id=int(account.id),
-            position_id=int(position.id),
-            order_id=int(order.id),
-            symbol=str(position.symbol),
-            change_type="CLOSE_RELEASE",
-            change_amount=released_margin,
-            before_available=before_available,
-            after_available=conceptual_after_release,
-            before_frozen=before_frozen,
-            after_frozen=before_frozen,
-            remark="liquidation margin release",
-            created_at=now,
-        )
-    )
-    add_contract_balance_log(
+    trade_id = int(trade.id)
+    add_contract_margin_log(
         db,
         user_id=int(position.user_id),
-        change_type="CONTRACT_MARGIN_RELEASE",
-        biz_type="CONTRACT_MARGIN_RELEASE",
-        biz_id=f"liquidation:{int(record.id)}:margin_release",
+        account_id=int(account.id),
+        position_id=int(position.id),
+        order_id=int(order.id),
+        trade_id=trade_id,
+        symbol=str(position.symbol),
+        change_type="CLOSE_RELEASE",
         change_amount=released_margin,
         before_available=before_available,
         after_available=conceptual_after_release,
@@ -626,24 +613,37 @@ def execute_liquidation(db: Session, position_id: int) -> ContractLiquidationExe
         remark="liquidation margin release",
         now=now,
     )
-    db.add(
-        ContractMarginLog(
-            user_id=int(position.user_id),
-            account_id=int(account.id),
-            position_id=int(position.id),
-            order_id=int(order.id),
-            symbol=str(position.symbol),
-            change_type="REALIZED_PNL",
-            change_amount=realized_pnl,
-            before_available=conceptual_after_release,
-            after_available=after_available,
-            before_frozen=before_frozen,
-            after_frozen=before_frozen,
-            remark="liquidation realized pnl capped by margin"
-            if realized_pnl != raw_pnl
-            else "liquidation realized pnl",
-            created_at=now,
-        )
+    add_contract_balance_log(
+        db,
+        user_id=int(position.user_id),
+        change_type="CONTRACT_MARGIN_RELEASE",
+        biz_type="CONTRACT_MARGIN_RELEASE",
+        biz_id=f"liquidation:{int(record.id)}:margin_release",
+        change_amount=released_margin,
+        trade_id=trade_id,
+        before_available=before_available,
+        after_available=conceptual_after_release,
+        before_frozen=before_frozen,
+        after_frozen=before_frozen,
+        remark="liquidation margin release",
+        now=now,
+    )
+    add_contract_margin_log(
+        db,
+        user_id=int(position.user_id),
+        account_id=int(account.id),
+        position_id=int(position.id),
+        order_id=int(order.id),
+        trade_id=trade_id,
+        symbol=str(position.symbol),
+        change_type="REALIZED_PNL",
+        change_amount=realized_pnl,
+        before_available=conceptual_after_release,
+        after_available=after_available,
+        before_frozen=before_frozen,
+        after_frozen=before_frozen,
+        remark="liquidation realized pnl capped by margin" if realized_pnl != raw_pnl else "liquidation realized pnl",
+        now=now,
     )
     add_contract_balance_log(
         db,
@@ -652,6 +652,7 @@ def execute_liquidation(db: Session, position_id: int) -> ContractLiquidationExe
         biz_type="CONTRACT_LIQUIDATION",
         biz_id=f"liquidation:{int(record.id)}:realized_pnl",
         change_amount=realized_pnl,
+        trade_id=trade_id,
         before_available=conceptual_after_release,
         after_available=after_available,
         before_frozen=before_frozen,
@@ -664,25 +665,33 @@ def execute_liquidation(db: Session, position_id: int) -> ContractLiquidationExe
         now=now,
     )
     if settlement == Decimal("0"):
-        db.add(
-            ContractMarginLog(
-                user_id=int(position.user_id),
-                account_id=int(account.id),
-                position_id=int(position.id),
-                order_id=int(order.id),
-                symbol=str(position.symbol),
-                change_type="LIQUIDATION_ZERO",
-                change_amount=released_margin,
-                before_available=after_available,
-                after_available=after_available,
-                before_frozen=before_frozen,
-                after_frozen=before_frozen,
-                remark="liquidation position balance zeroed",
-                created_at=now,
-            )
+        add_contract_margin_log(
+            db,
+            user_id=int(position.user_id),
+            account_id=int(account.id),
+            position_id=int(position.id),
+            order_id=int(order.id),
+            trade_id=trade_id,
+            symbol=str(position.symbol),
+            change_type="LIQUIDATION_ZERO",
+            change_amount=released_margin,
+            before_available=after_available,
+            after_available=after_available,
+            before_frozen=before_frozen,
+            after_frozen=before_frozen,
+            remark="liquidation position balance zeroed",
+            now=now,
         )
 
     db.commit()
+    publish_contract_user_updates(
+        user_id=int(position.user_id),
+        symbols=[str(position.symbol)],
+        position_ids=[int(position.id)],
+        order_ids=[int(order.id)],
+        trade_ids=[int(trade.id)],
+        include_account=True,
+    )
     return ContractLiquidationExecutionResult(
         position_id=int(position.id),
         symbol=str(position.symbol),

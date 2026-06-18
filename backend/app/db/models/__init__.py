@@ -45,6 +45,7 @@ from .contract_trade import ContractTrade
 from .contract_margin_log import ContractMarginChangeType, ContractMarginLog
 from .contract_liquidation_record import ContractLiquidationRecord, ContractLiquidationStatus
 from .contract_market_quote import ContractMarketQuote
+from .market_data_provider import MarketDataProvider, MarketDataProviderSymbol
 from .market_kline import MarketKline
 from .rwa_reference_price import RwaReferencePrice
 from .reference_overlay import ReferenceOverlay
@@ -54,6 +55,7 @@ from .collection import (
     CollectionBatchTriggerType,
     CollectionCandidate,
     CollectionCandidateStatus,
+    CollectionGasCostRecord,
     CollectionTask,
     CollectionTaskStatus,
     GasTask,
@@ -139,6 +141,8 @@ __all__ = [
     "ContractLiquidationRecord",
     "ContractLiquidationStatus",
     "ContractMarketQuote",
+    "MarketDataProvider",
+    "MarketDataProviderSymbol",
     "MarketKline",
     "RwaReferencePrice",
     "ReferenceOverlay",
@@ -147,6 +151,7 @@ __all__ = [
     "CollectionBatchTriggerType",
     "CollectionCandidate",
     "CollectionCandidateStatus",
+    "CollectionGasCostRecord",
     "CollectionTask",
     "CollectionTaskStatus",
     "GasTask",

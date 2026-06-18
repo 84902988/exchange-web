@@ -48,7 +48,15 @@ from app.services.collection_candidate_scanner import (
     load_candidate_verify_statuses,
 )
 from app.services.collection_balance_checker import confirm_collection_candidate_onchain
+from app.services.collection_chain_helper import DEFAULT_GAS_NATIVE, GAS_TOPUP_BUFFER, GAS_TOPUP_CAP
+from app.services.collection_gas_config_service import (
+    GAS_TOPUP_MODES,
+    SUPPORTED_EVM_GAS_CONFIG_CHAINS,
+    load_all_gas_topup_configs,
+    resolve_gas_topup_parameters,
+)
 from app.services.collection_service import (
+    SAFE_CANCEL_COLLECTION_STATUSES,
     create_collection_batch,
     create_collection_task_with_result,
     find_active_collection_task_duplicate,
@@ -89,6 +97,9 @@ ADMIN_HEARTBEAT_SERVICE_NAMES = {
     "dealer_loop",
     "liquidation_scanner",
     "tp_sl_scanner",
+    "contract_limit_order_scanner",
+    "contract_accounting_reconciliation_scheduler",
+    "contract_user_event_subscriber",
     "dividend_job",
 }
 ADMIN_PAGINATION_ALLOWED_PER_PAGE = (10, 20, 50, 100)
@@ -223,6 +234,33 @@ ADMIN_SERVICE_OVERVIEW_GROUPS = (
                 "impact": "合约止盈止损条件不会被自动触发。",
                 "systemd": "exchange-tp-sl-scanner.service",
                 "windows": "python backend/scripts/start_tp_sl_scanner.py",
+            },
+            {
+                "key": "contract_limit_order_scanner",
+                "name": "contract limit order scanner",
+                "type": "Scanner",
+                "expected": "single instance",
+                "impact": "Contract LIMIT orders will not be scanned or filled automatically.",
+                "systemd": "exchange-contract-limit-order-scanner.service",
+                "windows": "python backend/scripts/start_contract_limit_order_scanner.py",
+            },
+            {
+                "key": "contract_accounting_reconciliation_scheduler",
+                "name": "contract accounting reconciliation scheduler",
+                "type": "Scheduler",
+                "expected": "single instance",
+                "impact": "Contract accounting reconciliation jobs will not be enqueued automatically.",
+                "systemd": "exchange-contract-accounting-reconciliation-scheduler.service",
+                "windows": "python backend/scripts/start_contract_accounting_reconciliation_scheduler.py",
+            },
+            {
+                "key": "contract_user_event_subscriber",
+                "name": "Contract WS Bridge",
+                "type": "Bridge",
+                "expected": "API process heartbeat",
+                "impact": "Contract private WebSocket clients may miss TP/SL, liquidation, or order updates in real time.",
+                "systemd": "exchange-api.service",
+                "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
             },
             {
                 "key": "dividend_job",
@@ -849,6 +887,24 @@ def admin_query_operations_center() -> Dict[str, Any]:
             "name": "止盈止损扫描",
             "description": "检查止盈止损触发条件",
             "impact": "TP/SL 不会自动触发",
+        },
+        {
+            "key": "contract_limit_order_scanner",
+            "name": "合约限价单扫描",
+            "description": "扫描并成交合约限价单",
+            "impact": "合约限价单不会自动成交",
+        },
+        {
+            "key": "contract_accounting_reconciliation_scheduler",
+            "name": "合约账务对账调度",
+            "description": "定时投递合约账务对账任务",
+            "impact": "合约账务一致性不会自动校验",
+        },
+        {
+            "key": "contract_user_event_subscriber",
+            "name": "Contract WS Bridge",
+            "description": "订阅合约用户事件并转发到私有 WebSocket",
+            "impact": "合约页可能无法实时收到后台平仓或成交更新",
         },
         {
             "key": "dividend_job",
@@ -2978,6 +3034,33 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
 
     deposit_table = _dashboard_first_existing_table(db, ("deposit_logs", "deposits"))
     withdraw_table = _dashboard_first_existing_table(db, ("withdraw_logs", "withdraws"))
+    has_trades = _dashboard_table_exists(db, "trades")
+    has_orders = _dashboard_table_exists(db, "orders")
+    has_pairs = _dashboard_table_exists(db, "trading_pairs")
+    has_assets = _dashboard_table_exists(db, "assets")
+
+    spot_order_status_filter = (
+        "UPPER(COALESCE(o.status, '')) IN "
+        "('FILLED', 'PARTIALLY_FILLED', 'PARTIAL_FILLED', 'PARTIAL', 'COMPLETED', 'COMPLETE', 'SUCCESS', 'DONE')"
+    )
+    spot_order_filled_filter = "(COALESCE(o.filled_amount, 0) > 0 OR COALESCE(o.executed_quote_amount, 0) > 0)"
+    spot_order_today_filter = (
+        f"o.created_at >= :today_start AND o.created_at <= :now "
+        f"AND {spot_order_status_filter} AND {spot_order_filled_filter}"
+    )
+    spot_order_quote_amount_expr = (
+        "COALESCE("
+        "NULLIF(o.executed_quote_amount, 0), "
+        "COALESCE(NULLIF(o.avg_price, 0), NULLIF(o.price, 0), 0) * COALESCE(o.filled_amount, 0), "
+        "0)"
+    )
+    spot_order_fee_coin_expr = (
+        "UPPER(COALESCE(o.fee_asset_symbol, CONVERT(fa.symbol USING utf8mb4) COLLATE utf8mb4_unicode_ci, ''))"
+        if has_assets
+        else "UPPER(COALESCE(o.fee_asset_symbol, ''))"
+    )
+    spot_order_pair_join_sql = "LEFT JOIN trading_pairs tp ON tp.id = o.trading_pair_id" if has_pairs else ""
+    spot_order_fee_join_sql = "LEFT JOIN assets fa ON fa.id = o.fee_asset_id" if has_assets else ""
 
     deposit_rows: list[Dict[str, Any]] = []
     if deposit_table:
@@ -3090,30 +3173,56 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
     today_withdraw_value, today_withdraw_note = _dashboard_single_or_by_coin(total_success_withdraw_by_coin, "amount")
     today_net_value, today_net_note = _dashboard_single_or_by_coin(total_net_by_coin, "amount")
 
-    spot_today = _dashboard_rows(
-        db,
-        """
-        SELECT
-            COALESCE(SUM(COALESCE(quote_amount, price * amount, 0)), 0) AS volume,
-            COUNT(*) AS trade_count,
-            COALESCE(SUM(
-                CASE WHEN UPPER(COALESCE(buyer_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(buyer_fee_amount, 0) ELSE 0 END
-              + CASE WHEN UPPER(COALESCE(seller_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(seller_fee_amount, 0) ELSE 0 END
-              + CASE
-                    WHEN COALESCE(buyer_fee_amount, 0) = 0
-                     AND COALESCE(seller_fee_amount, 0) = 0
-                     AND UPPER(COALESCE(fee_asset_symbol, '')) = 'USDT'
-                    THEN COALESCE(fee_amount, 0)
-                    ELSE 0
-                END
-            ), 0) AS fee_usdt
-        FROM trades
-        WHERE created_at >= :today_start
-          AND created_at <= :now
-        """,
-        today_params,
-    )[0] if _dashboard_table_exists(db, "trades") else {}
-    spot_orders_today = _dashboard_count(db, "orders", "created_at >= :today_start AND created_at <= :now", today_params) if _dashboard_table_exists(db, "orders") else 0
+    if has_orders:
+        spot_today = (
+            _dashboard_rows(
+                db,
+                f"""
+                SELECT
+                    COALESCE(SUM({spot_order_quote_amount_expr}), 0) AS volume,
+                    COUNT(*) AS trade_count,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN {spot_order_fee_coin_expr} = 'USDT'
+                            THEN COALESCE(o.fee_amount, 0)
+                            ELSE 0
+                        END
+                    ), 0) AS fee_usdt
+                FROM orders o
+                {spot_order_fee_join_sql}
+                WHERE {spot_order_today_filter}
+                  AND o.user_id <> :platform_user_id
+                """,
+                {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
+            )
+            or [{}]
+        )[0]
+        spot_orders_today = int(spot_today.get("trade_count") or 0)
+    else:
+        spot_today = _dashboard_rows(
+            db,
+            """
+            SELECT
+                COALESCE(SUM(COALESCE(quote_amount, price * amount, 0)), 0) AS volume,
+                COUNT(*) AS trade_count,
+                COALESCE(SUM(
+                    CASE WHEN UPPER(COALESCE(buyer_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(buyer_fee_amount, 0) ELSE 0 END
+                  + CASE WHEN UPPER(COALESCE(seller_fee_asset_symbol, '')) = 'USDT' THEN COALESCE(seller_fee_amount, 0) ELSE 0 END
+                  + CASE
+                        WHEN COALESCE(buyer_fee_amount, 0) = 0
+                         AND COALESCE(seller_fee_amount, 0) = 0
+                         AND UPPER(COALESCE(fee_asset_symbol, '')) = 'USDT'
+                        THEN COALESCE(fee_amount, 0)
+                        ELSE 0
+                    END
+                ), 0) AS fee_usdt
+            FROM trades
+            WHERE created_at >= :today_start
+              AND created_at <= :now
+            """,
+            today_params,
+        )[0] if has_trades else {}
+        spot_orders_today = 0
     dealer_today = _dashboard_rows(
         db,
         """
@@ -3140,7 +3249,8 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
         SELECT
             COALESCE(SUM(COALESCE(notional, price * quantity, 0)), 0) AS volume,
             COUNT(*) AS trade_count,
-            COALESCE(SUM(COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0)), 0) AS fee_usdt
+            COALESCE(SUM(COALESCE(spread_fee, 0)), 0) AS fee_usdt,
+            COALESCE(SUM(COALESCE(fee_amount, 0)), 0) AS extra_fee_usdt
         FROM contract_trades
         WHERE created_at >= :today_start
           AND created_at <= :now
@@ -3160,7 +3270,7 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
         " AND UPPER(COALESCE(fee_asset_symbol, '')) = 'USDT' THEN COALESCE(fee_amount, 0) ELSE 0 END",
     ) if _dashboard_table_exists(db, "trades") else Decimal("0")
     if _dashboard_table_exists(db, "contract_trades"):
-        platform_revenue_usdt += _dashboard_sum(db, "contract_trades", "COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0)")
+        platform_revenue_usdt += _dashboard_sum(db, "contract_trades", "COALESCE(spread_fee, 0)")
 
     anomaly_summary: Dict[str, Any] = {}
     try:
@@ -3273,17 +3383,17 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
 
     trading_ops = [
         {"label": "现货成交额", "value": _dashboard_amount_text(spot_today.get("volume"), "USDT", places=2), "note": f"成交 {_dashboard_int(spot_today.get('trade_count'))} 笔"},
-        {"label": "现货订单数", "value": _dashboard_int(spot_orders_today), "note": "今日提交订单"},
+        {"label": "现货订单数", "value": _dashboard_int(spot_orders_today), "note": "今日成交订单"},
         {"label": "合约成交额", "value": _dashboard_amount_text(contract_today.get("volume"), "USDT", places=2), "note": f"成交 {_dashboard_int(contract_today.get('trade_count'))} 笔"},
         {"label": "合约订单数", "value": _dashboard_int(contract_orders_today), "note": "今日合约订单"},
         {"label": "Dealer 成交", "value": _dashboard_amount_text(dealer_today.get("volume"), "USDT", places=2), "note": f"成交 {_dashboard_int(dealer_today.get('trade_count'))} 笔"},
-        {"label": "合约收入", "value": _dashboard_amount_text(contract_fee_usdt, "USDT", places=2), "note": "合约价差费用"},
-        {"label": "手续费收入", "value": _dashboard_amount_text(today_spot_fee_usdt, "USDT", places=2), "note": "今日现货 USDT"},
+        {"label": "合约手续费（点差）", "value": _dashboard_amount_text(contract_fee_usdt, "USDT", places=2), "note": "按 contract_trades.spread_fee"},
+        {"label": "今日现货手续费", "value": _dashboard_amount_text(today_spot_fee_usdt, "USDT"), "note": "按已成交订单 fee_amount / USDT"},
     ]
 
     core_metrics = [
-        {"label": "平台收益", "value": _dashboard_amount_text(platform_revenue_usdt, "USDT", places=2), "note": "累计 USDT 手续费口径", "tone": "total"},
-        {"label": "今日手续费", "value": _dashboard_amount_text(today_spot_fee_usdt, "USDT", places=2), "note": "今日现货 USDT", "tone": "success"},
+        {"label": "平台收益", "value": _dashboard_amount_text(platform_revenue_usdt, "USDT", places=2), "note": "累计 USDT 手续费口径，合约按点差费用", "tone": "total"},
+        {"label": "今日现货手续费", "value": _dashboard_amount_text(today_spot_fee_usdt, "USDT"), "note": "按已成交订单 fee_amount / USDT", "tone": "success"},
         {"label": "今日充值", "value": today_deposit_value, "note": today_deposit_note or "成功到账", "tone": "info"},
         {"label": "今日提现", "value": today_withdraw_value, "note": today_withdraw_note or "成功提现", "tone": "warning"},
         {"label": "今日净流入", "value": today_net_value, "note": today_net_note or "充值 - 成功提现", "tone": "success"},
@@ -3656,31 +3766,54 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
     has_dealer_risk = _dashboard_table_exists(db, "dealer_risk_hit_logs")
     withdraw_table = _dashboard_first_existing_table(db, ("withdraw_logs", "withdraws"))
 
+    spot_order_status_filter = (
+        "UPPER(COALESCE(o.status, '')) IN "
+        "('FILLED', 'PARTIALLY_FILLED', 'PARTIAL_FILLED', 'PARTIAL', 'COMPLETED', 'COMPLETE', 'SUCCESS', 'DONE')"
+    )
+    spot_order_filled_filter = "(COALESCE(o.filled_amount, 0) > 0 OR COALESCE(o.executed_quote_amount, 0) > 0)"
+    spot_order_today_filter = (
+        f"o.created_at >= :today_start AND o.created_at <= :now "
+        f"AND {spot_order_status_filter} AND {spot_order_filled_filter}"
+    )
+    spot_order_quote_amount_expr = (
+        "COALESCE("
+        "NULLIF(o.executed_quote_amount, 0), "
+        "COALESCE(NULLIF(o.avg_price, 0), NULLIF(o.price, 0), 0) * COALESCE(o.filled_amount, 0), "
+        "0)"
+    )
+    spot_order_pair_expr = "COALESCE(tp.symbol, CONCAT('PAIR#', o.trading_pair_id))" if has_pairs else "CONCAT('PAIR#', o.trading_pair_id)"
+    spot_order_quote_coin_expr = "UPPER(COALESCE(qa.symbol, 'QUOTE'))" if has_pairs and has_assets else "'QUOTE'"
+    spot_order_pair_join_sql = (
+        """
+        LEFT JOIN trading_pairs tp ON tp.id = o.trading_pair_id
+        LEFT JOIN assets qa ON qa.id = tp.quote_asset_id
+        """
+        if has_pairs and has_assets
+        else ("LEFT JOIN trading_pairs tp ON tp.id = o.trading_pair_id" if has_pairs else "")
+    )
+    spot_order_fee_coin_expr = (
+        "UPPER(COALESCE(o.fee_asset_symbol, CONVERT(fa.symbol USING utf8mb4) COLLATE utf8mb4_unicode_ci, ''))"
+        if has_assets
+        else "UPPER(COALESCE(o.fee_asset_symbol, ''))"
+    )
+    spot_order_fee_join_sql = "LEFT JOIN assets fa ON fa.id = o.fee_asset_id" if has_assets else ""
+
     spot_volume_by_coin: list[Dict[str, Any]] = []
-    if has_trades:
-        quote_expr = "UPPER(COALESCE(qa.symbol, 'QUOTE'))" if has_pairs and has_assets else "'QUOTE'"
-        join_expr = (
-            """
-            LEFT JOIN trading_pairs tp ON tp.id = t.trading_pair_id
-            LEFT JOIN assets qa ON qa.id = tp.quote_asset_id
-            """
-            if has_pairs and has_assets
-            else ""
-        )
+    if has_orders:
         spot_volume_by_coin = _dashboard_rows(
             db,
             f"""
             SELECT
-                {quote_expr} AS coin_symbol,
-                COALESCE(SUM(COALESCE(t.quote_amount, t.price * t.amount, 0)), 0) AS amount,
+                {spot_order_quote_coin_expr} AS coin_symbol,
+                COALESCE(SUM({spot_order_quote_amount_expr}), 0) AS amount,
                 COUNT(*) AS trade_count
-            FROM trades t
-            {join_expr}
-            WHERE t.created_at >= :today_start
-              AND t.created_at <= :now
-            GROUP BY {quote_expr}
+            FROM orders o
+            {spot_order_pair_join_sql}
+            WHERE {spot_order_today_filter}
+              AND o.user_id <> :platform_user_id
+            GROUP BY {spot_order_quote_coin_expr}
             """,
-            today_params,
+            {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
         )
 
     spot_volume_value, spot_volume_note = _dashboard_single_or_by_coin(
@@ -3690,7 +3823,20 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
     )
     spot_trade_count = sum(int(row.get("trade_count") or 0) for row in spot_volume_by_coin)
     spot_order_count = (
-        _dashboard_count(db, "orders", "created_at >= :today_start AND created_at <= :now", today_params)
+        int(
+            _dashboard_scalar(
+                db,
+                f"""
+                SELECT COUNT(DISTINCT o.id)
+                FROM orders o
+                WHERE {spot_order_today_filter}
+                  AND o.user_id <> :platform_user_id
+                """,
+                {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
+                0,
+            )
+            or 0
+        )
         if has_orders
         else 0
     )
@@ -3702,7 +3848,8 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
             SELECT
                 COALESCE(SUM(COALESCE(notional, price * quantity, 0)), 0) AS volume,
                 COUNT(*) AS trade_count,
-                COALESCE(SUM(COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0)), 0) AS fee_amount
+                COALESCE(SUM(COALESCE(spread_fee, 0)), 0) AS fee_amount,
+                COALESCE(SUM(COALESCE(fee_amount, 0)), 0) AS extra_fee_amount
             FROM contract_trades
             WHERE created_at >= :today_start
               AND created_at <= :now
@@ -3719,38 +3866,24 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
     )
 
     fee_rows_raw: list[Dict[str, Any]] = []
-    if has_trades:
+    if has_orders:
         fee_rows_raw.extend(
             _dashboard_rows(
                 db,
-                """
-                SELECT '现货手续费' AS source, UPPER(COALESCE(fee_coin, '')) AS fee_coin,
-                       COALESCE(SUM(fee_amount), 0) AS today_amount, COUNT(*) AS today_count
-                FROM (
-                    SELECT buyer_fee_asset_symbol AS fee_coin, buyer_fee_amount AS fee_amount, created_at
-                    FROM trades
-                    WHERE created_at >= :today_start AND created_at <= :now
-                      AND buyer_fee_amount IS NOT NULL AND buyer_fee_amount > 0
-                    UNION ALL
-                    SELECT seller_fee_asset_symbol AS fee_coin, seller_fee_amount AS fee_amount, created_at
-                    FROM trades
-                    WHERE created_at >= :today_start AND created_at <= :now
-                      AND seller_fee_amount IS NOT NULL AND seller_fee_amount > 0
-                    UNION ALL
-                    SELECT fee_asset_symbol AS fee_coin, fee_amount AS fee_amount, created_at
-                    FROM trades
-                    WHERE created_at >= :today_start AND created_at <= :now
-                      AND fee_amount IS NOT NULL AND fee_amount > 0
-                      AND COALESCE(buyer_fee_amount, 0) = 0
-                      AND COALESCE(seller_fee_amount, 0) = 0
-                ) fee_items
-                WHERE COALESCE(fee_coin, '') <> ''
-                GROUP BY UPPER(COALESCE(fee_coin, ''))
+                f"""
+                SELECT '现货手续费' AS source, {spot_order_fee_coin_expr} AS fee_coin,
+                       COALESCE(SUM(o.fee_amount), 0) AS today_amount, COUNT(*) AS today_count
+                FROM orders o
+                {spot_order_fee_join_sql}
+                WHERE {spot_order_today_filter}
+                  AND o.user_id <> :platform_user_id
+                  AND o.fee_amount IS NOT NULL
+                  AND o.fee_amount > 0
+                GROUP BY {spot_order_fee_coin_expr}
                 """,
-                today_params,
+                {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
             )
         )
-
     fee_structure = []
     fee_by_coin: Dict[str, Decimal] = {}
     today_fee_nonzero: list[Dict[str, Any]] = []
@@ -3776,99 +3909,42 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
     fee_value, fee_note = _dashboard_single_or_by_coin(today_fee_nonzero, "amount", fallback_note="按币种查看")
 
     spot_pair_rows = []
-    if has_trades:
-        pair_expr = "COALESCE(tp.symbol, CONCAT('PAIR#', t.trading_pair_id))" if has_pairs else "CONCAT('PAIR#', t.trading_pair_id)"
-        quote_expr = "UPPER(COALESCE(qa.symbol, 'QUOTE'))" if has_pairs and has_assets else "'QUOTE'"
-        join_expr = (
-            """
-            LEFT JOIN trading_pairs tp ON tp.id = t.trading_pair_id
-            LEFT JOIN assets qa ON qa.id = tp.quote_asset_id
-            """
-            if has_pairs and has_assets
-            else ("LEFT JOIN trading_pairs tp ON tp.id = t.trading_pair_id" if has_pairs else "")
-        )
+    if has_orders:
         trade_rows = _dashboard_rows(
             db,
             f"""
             SELECT
-                t.trading_pair_id,
-                {pair_expr} AS symbol,
-                {quote_expr} AS quote_symbol,
-                COALESCE(SUM(COALESCE(t.quote_amount, t.price * t.amount, 0)), 0) AS volume,
-                COUNT(*) AS trade_count
-            FROM trades t
-            {join_expr}
-            WHERE t.created_at >= :today_start
-              AND t.created_at <= :now
-            GROUP BY t.trading_pair_id, {pair_expr}, {quote_expr}
+                o.trading_pair_id,
+                {spot_order_pair_expr} AS symbol,
+                {spot_order_quote_coin_expr} AS quote_symbol,
+                COALESCE(SUM({spot_order_quote_amount_expr}), 0) AS volume,
+                COUNT(*) AS trade_count,
+                COUNT(DISTINCT o.id) AS order_count,
+                COUNT(DISTINCT CASE WHEN o.user_id <> :platform_user_id THEN o.user_id ELSE NULL END) AS user_count
+            FROM orders o
+            {spot_order_pair_join_sql}
+            WHERE {spot_order_today_filter}
+              AND o.user_id <> :platform_user_id
+            GROUP BY o.trading_pair_id, {spot_order_pair_expr}, {spot_order_quote_coin_expr}
             ORDER BY volume DESC
             LIMIT 10
             """,
-            today_params,
+            {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
         )
-        order_map = {}
-        if has_orders:
-            order_map = {
-                int(row.get("trading_pair_id") or 0): int(row.get("order_count") or 0)
-                for row in _dashboard_rows(
-                    db,
-                    """
-                    SELECT trading_pair_id, COUNT(*) AS order_count
-                    FROM orders
-                    WHERE created_at >= :today_start
-                      AND created_at <= :now
-                    GROUP BY trading_pair_id
-                    """,
-                    today_params,
-                )
-            }
-        user_map = {
-            int(row.get("trading_pair_id") or 0): int(row.get("user_count") or 0)
-            for row in _dashboard_rows(
-                db,
-                """
-                SELECT trading_pair_id, COUNT(DISTINCT user_id) AS user_count
-                FROM (
-                    SELECT trading_pair_id, buyer_user_id AS user_id
-                    FROM trades
-                    WHERE created_at >= :today_start AND created_at <= :now AND buyer_user_id IS NOT NULL
-                    UNION ALL
-                    SELECT trading_pair_id, seller_user_id AS user_id
-                    FROM trades
-                    WHERE created_at >= :today_start AND created_at <= :now AND seller_user_id IS NOT NULL
-                ) trade_users
-                GROUP BY trading_pair_id
-                """,
-                today_params,
-            )
-        }
         fee_map: Dict[int, list[str]] = {}
         fee_pair_rows = _dashboard_rows(
             db,
-            """
-            SELECT trading_pair_id, UPPER(COALESCE(fee_coin, '')) AS fee_coin, COALESCE(SUM(fee_amount), 0) AS fee_amount
-            FROM (
-                SELECT trading_pair_id, buyer_fee_asset_symbol AS fee_coin, buyer_fee_amount AS fee_amount, created_at
-                FROM trades
-                WHERE created_at >= :today_start AND created_at <= :now
-                  AND buyer_fee_amount IS NOT NULL AND buyer_fee_amount > 0
-                UNION ALL
-                SELECT trading_pair_id, seller_fee_asset_symbol AS fee_coin, seller_fee_amount AS fee_amount, created_at
-                FROM trades
-                WHERE created_at >= :today_start AND created_at <= :now
-                  AND seller_fee_amount IS NOT NULL AND seller_fee_amount > 0
-                UNION ALL
-                SELECT trading_pair_id, fee_asset_symbol AS fee_coin, fee_amount AS fee_amount, created_at
-                FROM trades
-                WHERE created_at >= :today_start AND created_at <= :now
-                  AND fee_amount IS NOT NULL AND fee_amount > 0
-                  AND COALESCE(buyer_fee_amount, 0) = 0
-                  AND COALESCE(seller_fee_amount, 0) = 0
-            ) fee_items
-            WHERE COALESCE(fee_coin, '') <> ''
-            GROUP BY trading_pair_id, UPPER(COALESCE(fee_coin, ''))
+            f"""
+            SELECT o.trading_pair_id, {spot_order_fee_coin_expr} AS fee_coin, COALESCE(SUM(o.fee_amount), 0) AS fee_amount
+            FROM orders o
+            {spot_order_fee_join_sql}
+            WHERE {spot_order_today_filter}
+              AND o.user_id <> :platform_user_id
+              AND o.fee_amount IS NOT NULL
+              AND o.fee_amount > 0
+            GROUP BY o.trading_pair_id, {spot_order_fee_coin_expr}
             """,
-            today_params,
+            {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
         )
         for row in fee_pair_rows:
             pair_id = int(row.get("trading_pair_id") or 0)
@@ -3882,12 +3958,11 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
                     "symbol": row.get("symbol") or f"PAIR#{pair_id}",
                     "volume": _dashboard_amount_text(row.get("volume"), quote, places=2),
                     "trade_count": int(row.get("trade_count") or 0),
-                    "order_count": int(order_map.get(pair_id, 0)),
-                    "user_count": int(user_map.get(pair_id, 0)),
+                    "order_count": int(row.get("order_count") or 0),
+                    "user_count": int(row.get("user_count") or 0),
                     "fee": " / ".join(fee_map.get(pair_id) or []) or "--",
                 }
             )
-
     contract_symbol_rows = []
     if has_contract_trades:
         trade_rows = _dashboard_rows(
@@ -3898,7 +3973,8 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
                 COALESCE(SUM(COALESCE(notional, price * quantity, 0)), 0) AS volume,
                 COUNT(*) AS trade_count,
                 COUNT(DISTINCT user_id) AS user_count,
-                COALESCE(SUM(COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0)), 0) AS fee_amount
+                COALESCE(SUM(COALESCE(spread_fee, 0)), 0) AS fee_amount,
+                COALESCE(SUM(COALESCE(fee_amount, 0)), 0) AS extra_fee_amount
             FROM contract_trades
             WHERE created_at >= :today_start
               AND created_at <= :now
@@ -3965,72 +4041,39 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
         "reliable_profit": "--",
         "profit_note": "当前无可靠 Dealer 收益字段",
     }
-    if has_trades:
-        dealer_order_join_sql = ""
-        dealer_scope_expr = "UPPER(COALESCE(t.counterparty_type, '')) IN ('PLATFORM', 'DEALER')"
-        dealer_order_side_expr = "''"
-        if has_orders:
-            dealer_order_join_sql = """
-                LEFT JOIN orders bo ON bo.id = t.buy_order_id
-                LEFT JOIN orders so ON so.id = t.sell_order_id
-            """
-            dealer_scope_expr = (
-                f"({dealer_scope_expr} "
-                "OR UPPER(COALESCE(bo.execution_mode, '')) = 'DEALER' "
-                "OR UPPER(COALESCE(so.execution_mode, '')) = 'DEALER')"
-            )
-            dealer_order_side_expr = "UPPER(COALESCE(bo.side, so.side, ''))"
+    if has_orders:
         dealer_row = (
             _dashboard_rows(
                 db,
                 f"""
                 SELECT
-                    COALESCE(SUM(COALESCE(t.quote_amount, t.price * t.amount, 0)), 0) AS volume,
+                    COALESCE(SUM({spot_order_quote_amount_expr}), 0) AS volume,
                     COUNT(*) AS trade_count,
-                    COALESCE(SUM(CASE WHEN {dealer_order_side_expr} = 'BUY' THEN COALESCE(t.quote_amount, t.price * t.amount, 0) ELSE 0 END), 0) AS buy_volume,
-                    COALESCE(SUM(CASE WHEN {dealer_order_side_expr} = 'SELL' THEN COALESCE(t.quote_amount, t.price * t.amount, 0) ELSE 0 END), 0) AS sell_volume
-                FROM trades t
-                {dealer_order_join_sql}
-                WHERE t.created_at >= :today_start
-                  AND t.created_at <= :now
-                  AND {dealer_scope_expr}
+                    COALESCE(SUM(CASE WHEN UPPER(COALESCE(o.side, '')) = 'BUY' THEN {spot_order_quote_amount_expr} ELSE 0 END), 0) AS buy_volume,
+                    COALESCE(SUM(CASE WHEN UPPER(COALESCE(o.side, '')) = 'SELL' THEN {spot_order_quote_amount_expr} ELSE 0 END), 0) AS sell_volume
+                FROM orders o
+                WHERE {spot_order_today_filter}
+                  AND o.user_id <> :platform_user_id
+                  AND UPPER(COALESCE(o.execution_mode, '')) = 'DEALER'
                 """,
-                today_params,
+                {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
             )
             or [{}]
         )[0]
         for row in _dashboard_rows(
             db,
             f"""
-            SELECT UPPER(COALESCE(fee_coin, '')) AS fee_coin, COALESCE(SUM(fee_amount), 0) AS fee_amount
-            FROM (
-                SELECT t.buyer_fee_asset_symbol AS fee_coin, t.buyer_fee_amount AS fee_amount
-                FROM trades t
-                {dealer_order_join_sql}
-                WHERE t.created_at >= :today_start AND t.created_at <= :now
-                  AND {dealer_scope_expr}
-                  AND t.buyer_fee_amount IS NOT NULL AND t.buyer_fee_amount > 0
-                UNION ALL
-                SELECT t.seller_fee_asset_symbol AS fee_coin, t.seller_fee_amount AS fee_amount
-                FROM trades t
-                {dealer_order_join_sql}
-                WHERE t.created_at >= :today_start AND t.created_at <= :now
-                  AND {dealer_scope_expr}
-                  AND t.seller_fee_amount IS NOT NULL AND t.seller_fee_amount > 0
-                UNION ALL
-                SELECT t.fee_asset_symbol AS fee_coin, t.fee_amount AS fee_amount
-                FROM trades t
-                {dealer_order_join_sql}
-                WHERE t.created_at >= :today_start AND t.created_at <= :now
-                  AND {dealer_scope_expr}
-                  AND t.fee_amount IS NOT NULL AND t.fee_amount > 0
-                  AND COALESCE(t.buyer_fee_amount, 0) = 0
-                  AND COALESCE(t.seller_fee_amount, 0) = 0
-            ) fee_items
-            WHERE COALESCE(fee_coin, '') <> ''
-            GROUP BY UPPER(COALESCE(fee_coin, ''))
+            SELECT {spot_order_fee_coin_expr} AS fee_coin, COALESCE(SUM(o.fee_amount), 0) AS fee_amount
+            FROM orders o
+            {spot_order_fee_join_sql}
+            WHERE {spot_order_today_filter}
+              AND o.user_id <> :platform_user_id
+              AND UPPER(COALESCE(o.execution_mode, '')) = 'DEALER'
+              AND o.fee_amount IS NOT NULL
+              AND o.fee_amount > 0
+            GROUP BY {spot_order_fee_coin_expr}
             """,
-            today_params,
+            {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
         ):
             coin = str(row.get("fee_coin") or "").upper()
             if coin:
@@ -4058,33 +4101,17 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
 
     trading_top_rows = []
     top_sql_parts = []
-    if has_trades:
-        top_quote_expr = "UPPER(COALESCE(qa.symbol, 'QUOTE'))" if has_pairs and has_assets else "'QUOTE'"
-        top_join_expr = (
+    if has_orders:
+        top_sql_parts.append(
+            f"""
+            SELECT o.user_id AS user_id, {spot_order_quote_coin_expr} AS coin_symbol,
+                   {spot_order_quote_amount_expr} AS volume, 1 AS trade_count, o.created_at
+            FROM orders o
+            {spot_order_pair_join_sql}
+            WHERE {spot_order_today_filter}
+              AND o.user_id IS NOT NULL
+              AND o.user_id <> :platform_user_id
             """
-            LEFT JOIN trading_pairs tp ON tp.id = trades.trading_pair_id
-            LEFT JOIN assets qa ON qa.id = tp.quote_asset_id
-            """
-            if has_pairs and has_assets
-            else ""
-        )
-        top_sql_parts.extend(
-            [
-                f"""
-                SELECT buyer_user_id AS user_id, {top_quote_expr} AS coin_symbol,
-                       COALESCE(quote_amount, price * amount, 0) AS volume, 1 AS trade_count, trades.created_at
-                FROM trades
-                {top_join_expr}
-                WHERE trades.created_at >= :today_start AND trades.created_at <= :now AND buyer_user_id IS NOT NULL
-                """,
-                f"""
-                SELECT seller_user_id AS user_id, {top_quote_expr} AS coin_symbol,
-                       COALESCE(quote_amount, price * amount, 0) AS volume, 1 AS trade_count, trades.created_at
-                FROM trades
-                {top_join_expr}
-                WHERE trades.created_at >= :today_start AND trades.created_at <= :now AND seller_user_id IS NOT NULL
-                """,
-            ]
         )
     if has_contract_trades:
         top_sql_parts.append(
@@ -4104,34 +4131,30 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
             ORDER BY volume DESC
             LIMIT 10
             """,
-            today_params,
+            {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
         )
         trading_top_fee: Dict[int, list[str]] = {}
         fee_top_parts = []
-        if has_trades:
-            fee_top_parts.extend(
-                [
-                    """
-                    SELECT buyer_user_id AS user_id, buyer_fee_asset_symbol AS fee_coin, buyer_fee_amount AS fee_amount, created_at
-                    FROM trades
-                    WHERE created_at >= :today_start AND created_at <= :now
-                      AND buyer_user_id IS NOT NULL AND buyer_fee_amount IS NOT NULL AND buyer_fee_amount > 0
-                    """,
-                    """
-                    SELECT seller_user_id AS user_id, seller_fee_asset_symbol AS fee_coin, seller_fee_amount AS fee_amount, created_at
-                    FROM trades
-                    WHERE created_at >= :today_start AND created_at <= :now
-                      AND seller_user_id IS NOT NULL AND seller_fee_amount IS NOT NULL AND seller_fee_amount > 0
-                    """,
-                ]
+        if has_orders:
+            fee_top_parts.append(
+                f"""
+                SELECT o.user_id AS user_id, {spot_order_fee_coin_expr} AS fee_coin, o.fee_amount AS fee_amount, o.created_at
+                FROM orders o
+                {spot_order_fee_join_sql}
+                WHERE {spot_order_today_filter}
+                  AND o.user_id IS NOT NULL
+                  AND o.user_id <> :platform_user_id
+                  AND o.fee_amount IS NOT NULL
+                  AND o.fee_amount > 0
+                """
             )
         if has_contract_trades:
             fee_top_parts.append(
                 """
-                SELECT user_id, 'USDT' AS fee_coin, COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0) AS fee_amount, created_at
+                SELECT user_id, 'USDT' COLLATE utf8mb4_unicode_ci AS fee_coin, COALESCE(spread_fee, 0) AS fee_amount, created_at
                 FROM contract_trades
                 WHERE created_at >= :today_start AND created_at <= :now
-                  AND user_id IS NOT NULL AND COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0) > 0
+                  AND user_id IS NOT NULL AND COALESCE(spread_fee, 0) > 0
                 """
             )
         if fee_top_parts:
@@ -4143,7 +4166,7 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
                 WHERE COALESCE(fee_coin, '') <> ''
                 GROUP BY user_id, UPPER(COALESCE(fee_coin, ''))
                 """,
-                today_params,
+                {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
             ):
                 user_id = int(row.get("user_id") or 0)
                 coin = str(row.get("fee_coin") or "").upper()
@@ -4162,30 +4185,26 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
 
     fee_top_rows = []
     fee_top_parts = []
-    if has_trades:
-        fee_top_parts.extend(
-            [
-                """
-                SELECT buyer_user_id AS user_id, buyer_fee_asset_symbol AS fee_coin, buyer_fee_amount AS fee_amount, '现货' AS source, created_at
-                FROM trades
-                WHERE created_at >= :today_start AND created_at <= :now
-                  AND buyer_user_id IS NOT NULL AND buyer_fee_amount IS NOT NULL AND buyer_fee_amount > 0
-                """,
-                """
-                SELECT seller_user_id AS user_id, seller_fee_asset_symbol AS fee_coin, seller_fee_amount AS fee_amount, '现货' AS source, created_at
-                FROM trades
-                WHERE created_at >= :today_start AND created_at <= :now
-                  AND seller_user_id IS NOT NULL AND seller_fee_amount IS NOT NULL AND seller_fee_amount > 0
-                """,
-            ]
+    if has_orders:
+        fee_top_parts.append(
+            f"""
+            SELECT o.user_id AS user_id, {spot_order_fee_coin_expr} AS fee_coin, o.fee_amount AS fee_amount, '现货' COLLATE utf8mb4_unicode_ci AS source, o.created_at
+            FROM orders o
+            {spot_order_fee_join_sql}
+            WHERE {spot_order_today_filter}
+              AND o.user_id IS NOT NULL
+              AND o.user_id <> :platform_user_id
+              AND o.fee_amount IS NOT NULL
+              AND o.fee_amount > 0
+            """
         )
     if has_contract_trades:
         fee_top_parts.append(
             """
-            SELECT user_id, 'USDT' AS fee_coin, COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0) AS fee_amount, '合约' AS source, created_at
+            SELECT user_id, 'USDT' COLLATE utf8mb4_unicode_ci AS fee_coin, COALESCE(spread_fee, 0) AS fee_amount, '合约' COLLATE utf8mb4_unicode_ci AS source, created_at
             FROM contract_trades
             WHERE created_at >= :today_start AND created_at <= :now
-              AND user_id IS NOT NULL AND COALESCE(fee_amount, 0) + COALESCE(spread_fee, 0) > 0
+              AND user_id IS NOT NULL AND COALESCE(spread_fee, 0) > 0
             """
         )
     if fee_top_parts:
@@ -4200,7 +4219,7 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
             ORDER BY fee_amount DESC
             LIMIT 10
             """,
-            today_params,
+            {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
         )
         fee_top_rows = [
             {
@@ -4215,12 +4234,15 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
 
     trading_user_count = 0
     user_parts = []
-    if has_trades:
-        user_parts.extend(
-            [
-                "SELECT buyer_user_id AS user_id FROM trades WHERE created_at >= :today_start AND created_at <= :now AND buyer_user_id IS NOT NULL",
-                "SELECT seller_user_id AS user_id FROM trades WHERE created_at >= :today_start AND created_at <= :now AND seller_user_id IS NOT NULL",
-            ]
+    if has_orders:
+        user_parts.append(
+            f"""
+            SELECT o.user_id AS user_id
+            FROM orders o
+            WHERE {spot_order_today_filter}
+              AND o.user_id IS NOT NULL
+              AND o.user_id <> :platform_user_id
+            """
         )
     if has_contract_trades:
         user_parts.append(
@@ -4232,7 +4254,7 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
                 _dashboard_scalar(
                     db,
                     f"SELECT COUNT(DISTINCT user_id) FROM ({' UNION ALL '.join(user_parts)}) users_today",
-                    today_params,
+                    {**today_params, "platform_user_id": PLATFORM_ACCOUNT_USER_ID},
                     0,
                 )
                 or 0
@@ -4246,7 +4268,7 @@ def admin_query_trading_dashboard(db: Session) -> Dict[str, Any]:
         {"label": "今日合约成交额", "value": _dashboard_amount_text(contract_today.get("volume"), "USDT", places=2), "note": "按 notional 统计", "tone": "success"},
         {"label": "今日合约订单数", "value": _dashboard_int(contract_order_count), "note": f"成交 {_dashboard_int(contract_today.get('trade_count'))} 笔", "tone": "info"},
         {"label": "今日现货手续费", "value": fee_value, "note": fee_note or "按支付币种分开展示", "tone": "warning"},
-        {"label": "今日合约收入", "value": _dashboard_amount_text(contract_today.get("fee_amount"), "USDT"), "note": "合约价差费用", "tone": "warning"},
+        {"label": "今日合约手续费（点差）", "value": _dashboard_amount_text(contract_today.get("fee_amount"), "USDT"), "note": "按 contract_trades.spread_fee", "tone": "warning"},
         {"label": "今日交易用户数", "value": _dashboard_int(trading_user_count), "note": "现货买卖双方 + 合约去重", "tone": "info"},
     ]
 
@@ -6425,9 +6447,9 @@ def _format_balance_log_type_label(value: Any) -> str:
         "REALIZED_PNL": "已实现盈亏",
         "OPEN_MARGIN_FREEZE": "开仓保证金冻结",
         "OPEN_MARGIN_USED": "开仓保证金占用",
-        "OPEN_FEE": "开仓手续费",
+        "OPEN_FEE": "历史开仓点差费用",
         "CLOSE_RELEASE": "平仓释放",
-        "CONTRACT_SPREAD_FEE": "合约点差费",
+        "CONTRACT_SPREAD_FEE": "历史点差费用",
         "MATCHING_DIRTY_ORDER_RELEASE": "异常订单释放",
         "RCB_LOCK": "RCB 锁仓",
         "DIVIDEND_CREDIT": "分红入账",
@@ -6457,12 +6479,13 @@ def _format_balance_log_remark_cn(raw_remark: Any, business_type: Any = None) ->
         .replace("-", " ")
         .split()
     )
+    normalized = normalized.replace("spread " + "cost", "spread fee")
     labels = {
         "liquidation realized pnl": "强平已实现盈亏",
         "liquidation margin release": "强平保证金释放",
-        "contract close spread cost": "平仓点差费",
+        "contract close spread fee": "历史平仓点差费用",
         "close realized pnl": "平仓已实现盈亏",
-        "contract open spread cost": "开仓点差费",
+        "contract open spread fee": "历史开仓点差费用",
         "contract margin freeze": "合约保证金冻结",
         "contract margin release": "合约保证金释放",
         "order created": "下单冻结",
@@ -7399,6 +7422,8 @@ def admin_query_deposit_records(db: Session, filters: Optional[Dict[str, Any]] =
         row_dict = dict(row)
         coin_symbol_display = row_dict.get("coin_symbol") or ""
         status_label, status_badge = _admin_deposit_status_meta(row_dict.get("status"))
+        status_value = str(row_dict.get("status") or "").strip().upper()
+        txid_value = row_dict.get("txid") or ""
         items.append(
             {
                 "id": row_dict.get("id"),
@@ -7414,10 +7439,13 @@ def admin_query_deposit_records(db: Session, filters: Optional[Dict[str, Any]] =
                 "status_badge": status_badge,
                 "confirmations": int(row_dict.get("confirmations") or 0),
                 "confirm_required": int(row_dict.get("confirm_required") or 0),
-                "txid": row_dict.get("txid") or "",
-                "txid_short": _short_admin_hash(row_dict.get("txid")),
-                "tx_hash": row_dict.get("txid") or "",
-                "tx_hash_short": _short_admin_hash(row_dict.get("txid")),
+                "txid": txid_value,
+                "txid_short": _short_admin_hash(txid_value),
+                "tx_hash": txid_value,
+                "tx_hash_short": _short_admin_hash(txid_value),
+                "can_recheck_chain_confirmation": bool(
+                    txid_value and status_value in {"DETECTING", "PENDING", "CONFIRMING"}
+                ),
                 "request_id": row_dict.get("request_id") or "",
                 "request_id_short": _short_admin_hash(row_dict.get("request_id")),
                 "from_address": row_dict.get("from_address") or "",
@@ -8505,7 +8533,6 @@ def admin_query_unified_balance_logs(db: Session, filters: Optional[Dict[str, An
             CASE
                 WHEN cml.change_type IN ('OPEN_MARGIN_FREEZE', 'OPEN_MARGIN_USED') THEN 'CONTRACT_OPEN_MARGIN'
                 WHEN cml.change_type = 'CLOSE_RELEASE' THEN 'CONTRACT_MARGIN_RELEASE'
-                WHEN cml.change_type IN ('OPEN_FEE', 'CLOSE_FEE') THEN 'CONTRACT_SPREAD_FEE'
                 WHEN cml.change_type = 'REALIZED_PNL' AND LOWER(COALESCE(cml.remark, '')) LIKE 'liquidation%' THEN 'CONTRACT_LIQUIDATION'
                 WHEN cml.change_type = 'REALIZED_PNL' THEN 'CONTRACT_REALIZED_PNL'
                 WHEN cml.change_type = 'LIQUIDATION_ZERO' THEN 'LIQUIDATION_ZERO'
@@ -8515,7 +8542,7 @@ def admin_query_unified_balance_logs(db: Session, filters: Optional[Dict[str, An
         """
         contract_amount_expr = """
             CASE
-                WHEN cml.change_type IN ('OPEN_MARGIN_FREEZE', 'OPEN_MARGIN_USED', 'OPEN_FEE', 'CLOSE_FEE', 'TRANSFER_OUT', 'LIQUIDATION_ZERO')
+                WHEN cml.change_type IN ('OPEN_MARGIN_FREEZE', 'OPEN_MARGIN_USED', 'TRANSFER_OUT', 'LIQUIDATION_ZERO')
                     THEN -ABS(cml.change_amount)
                 WHEN cml.change_type = 'TRANSFER_IN'
                     THEN ABS(cml.change_amount)
@@ -8551,6 +8578,7 @@ def admin_query_unified_balance_logs(db: Session, filters: Optional[Dict[str, An
                 cml.after_frozen AS after_frozen,
                 CAST('CONTRACT' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS source
             FROM contract_margin_logs cml
+            WHERE cml.change_type NOT IN ('OPEN_FEE', 'CLOSE_FEE')
         """
         union_parts.append(contract_select)
 
@@ -10729,7 +10757,7 @@ def _contract_symbol_form_from_payload(payload: Dict[str, Any], existing_symbol:
 def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> tuple[Dict[str, Any], list[str]]:
     errors: list[str] = []
     category_options = {"CRYPTO", "STOCK", "INDEX", "FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES"}
-    provider_options = {"BINANCE", "ITICK", "INTERNAL", "MANUAL"}
+    provider_options = {"BINANCE", "ITICK", "INTERNAL"}
     trigger_price_type_options = {"MARK_PRICE", "LAST_PRICE"}
 
     if is_create and not form["symbol"]:
@@ -10767,7 +10795,7 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
     if max_leverage < 1 or max_leverage > 200:
         errors.append("最大杠杆必须在 1 到 200 之间")
     if spread_x < 0 or spread_x > 100:
-        errors.append("固定点差加点必须在 0 到 100 U 之间")
+        errors.append("单边固定加点必须在 0 到 100 U 之间")
     if min_quantity < 0 or max_quantity < 0 or min_margin < 0:
         errors.append("交易规则数值不能小于 0")
     if liquidation_threshold < 0 or warning_threshold < 0:
@@ -11257,6 +11285,15 @@ def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
     sync_status = str(row.get("sync_status") or "").strip().upper()
     market_status = str(row.get("market_status") or "").strip().upper()
     is_realtime_state = _admin_reference_overlay_bool_state(row.get("is_realtime"))
+    display_price_text = "" if row.get("display_price") is None else _admin_amount_display(row.get("display_price"))
+    last_ref_price_text = "" if row.get("last_ref_price") is None else _admin_amount_display(row.get("last_ref_price"))
+    effective_display_price = last_ref_price_text if price_source == "AUTO" and last_ref_price_text else display_price_text
+    effective_display_label = row.get("display_value_label") or ""
+    source_price_label = row.get("last_ref_label") or ""
+    if price_source == "AUTO" and reference_type == "IRON" and effective_display_price:
+        effective_display_label = f"{effective_display_price} USD/公斤"
+    elif not effective_display_label and effective_display_price:
+        effective_display_label = f"{effective_display_price} {row.get('display_unit') or ''}".strip()
     if price_source == "MANUAL" and market_status == "UNKNOWN" and not row.get("price_time"):
         market_status = ""
         is_realtime_state = None
@@ -11274,7 +11311,7 @@ def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "price_source_badge": "success" if price_source == "AUTO" else "secondary",
         "auto_source": row.get("auto_source") or "",
         "refresh_interval_sec": _parse_int(row.get("refresh_interval_sec"), 300),
-        "last_ref_price": "" if row.get("last_ref_price") is None else _admin_amount_display(row.get("last_ref_price")),
+        "last_ref_price": last_ref_price_text,
         "last_ref_label": row.get("last_ref_label") or "",
         "last_sync_at": _admin_datetime_display(row.get("last_sync_at")),
         "sync_status": sync_status,
@@ -11306,7 +11343,10 @@ def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "line_color": row.get("line_color") or "",
         "badge_color": row.get("badge_color") or "",
         "display_value_label": row.get("display_value_label") or "",
-        "display_price": "" if row.get("display_price") is None else _admin_amount_display(row.get("display_price")),
+        "display_price": display_price_text,
+        "effective_display_price": effective_display_price,
+        "effective_display_label": effective_display_label,
+        "source_price_label": source_price_label,
         "display_unit": row.get("display_unit") or "",
         "data_source": row.get("data_source") or "",
         "source_symbol": row.get("source_symbol") or "",
@@ -11843,6 +11883,382 @@ def admin_query_dealer_risk_limits(db: Session, filters: Optional[Dict[str, Any]
         "page_size": page_size,
         "pages": pages,
     }
+
+
+def _admin_write_decimal(
+    value: Any,
+    field_label: str,
+    errors: list[str],
+    *,
+    optional: bool = False,
+    min_value: Optional[Decimal] = Decimal("0"),
+) -> Optional[Decimal]:
+    if _is_empty_config_value(value):
+        if optional:
+            return None
+        errors.append(f"{field_label} is required.")
+        return None
+    raw = str(value).strip()
+    try:
+        parsed = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        errors.append(f"{field_label} must be a valid decimal.")
+        return None
+    if min_value is not None and parsed < min_value:
+        errors.append(f"{field_label} cannot be less than {min_value}.")
+        return None
+    return parsed
+
+
+def _admin_write_int(
+    value: Any,
+    field_label: str,
+    errors: list[str],
+    *,
+    optional: bool = False,
+    min_value: Optional[int] = 0,
+) -> Optional[int]:
+    if _is_empty_config_value(value):
+        if optional:
+            return None
+        errors.append(f"{field_label} is required.")
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except ValueError:
+        errors.append(f"{field_label} must be a valid integer.")
+        return None
+    if min_value is not None and parsed < min_value:
+        errors.append(f"{field_label} cannot be less than {min_value}.")
+        return None
+    return parsed
+
+
+def admin_toggle_vip_fee_level_enabled(db: Session, level_id: int) -> Dict[str, Any]:
+    parsed_id = _parse_int(level_id)
+    if parsed_id <= 0:
+        return {"ok": False, "message": "Invalid VIP fee level id."}
+
+    try:
+        row = db.execute(
+            text("SELECT id, level_code, is_enabled FROM vip_fee_levels WHERE id = :level_id LIMIT 1"),
+            {"level_id": parsed_id},
+        ).mappings().first()
+        if not row:
+            return {"ok": False, "message": "VIP fee level not found."}
+
+        next_enabled = 0 if int(row.get("is_enabled") or 0) == 1 else 1
+        result = db.execute(
+            text(
+                """
+                UPDATE vip_fee_levels
+                SET is_enabled = :is_enabled, updated_at = :updated_at
+                WHERE id = :level_id
+                """
+            ),
+            {"level_id": parsed_id, "is_enabled": next_enabled, "updated_at": datetime.utcnow()},
+        )
+        if result.rowcount != 1:
+            return {"ok": False, "message": "VIP fee level update failed."}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        return {"ok": False, "message": f"VIP fee level update failed: {exc.__class__.__name__}"}
+
+    action = "enabled" if next_enabled == 1 else "disabled"
+    return {"ok": True, "message": f"VIP fee level {row.get('level_code') or parsed_id} {action}."}
+
+
+def admin_update_vip_fee_level_rule(db: Session, level_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    errors: list[str] = []
+    parsed_id = _admin_write_int(level_id, "VIP fee level id", errors, min_value=1)
+    spot_maker_fee = _admin_write_decimal(payload.get("spot_maker_fee"), "Spot maker fee", errors)
+    spot_taker_fee = _admin_write_decimal(payload.get("spot_taker_fee"), "Spot taker fee", errors)
+    dividend_rate = _admin_write_decimal(payload.get("dividend_rate"), "Dividend rate", errors, optional=True)
+    if errors:
+        return {"ok": False, "message": "; ".join(errors), "errors": errors}
+
+    try:
+        row = db.execute(
+            text("SELECT id, level_code FROM vip_fee_levels WHERE id = :level_id LIMIT 1"),
+            {"level_id": parsed_id},
+        ).mappings().first()
+        if not row:
+            return {"ok": False, "message": "VIP fee level not found.", "errors": ["VIP fee level not found."]}
+
+        now = datetime.utcnow()
+        result = db.execute(
+            text(
+                """
+                UPDATE vip_fee_levels
+                SET spot_maker_fee = :spot_maker_fee,
+                    spot_taker_fee = :spot_taker_fee,
+                    updated_at = :updated_at
+                WHERE id = :level_id
+                """
+            ),
+            {
+                "level_id": parsed_id,
+                "spot_maker_fee": spot_maker_fee,
+                "spot_taker_fee": spot_taker_fee,
+                "updated_at": now,
+            },
+        )
+        if result.rowcount != 1:
+            return {"ok": False, "message": "VIP fee level update failed.", "errors": ["VIP fee level update failed."]}
+
+        condition = db.execute(
+            text("SELECT id FROM vip_fee_level_conditions WHERE vip_fee_level_id = :level_id LIMIT 1"),
+            {"level_id": parsed_id},
+        ).mappings().first()
+        if condition:
+            db.execute(
+                text(
+                    """
+                    UPDATE vip_fee_level_conditions
+                    SET dividend_rate = :dividend_rate, updated_at = :updated_at
+                    WHERE vip_fee_level_id = :level_id
+                    """
+                ),
+                {"level_id": parsed_id, "dividend_rate": dividend_rate, "updated_at": now},
+            )
+        else:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO vip_fee_level_conditions
+                        (vip_fee_level_id, dividend_rate, created_at, updated_at)
+                    VALUES
+                        (:level_id, :dividend_rate, :created_at, :updated_at)
+                    """
+                ),
+                {
+                    "level_id": parsed_id,
+                    "dividend_rate": dividend_rate,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        return {
+            "ok": False,
+            "message": f"VIP fee rule update failed: {exc.__class__.__name__}",
+            "errors": [f"VIP fee rule update failed: {exc.__class__.__name__}"],
+        }
+
+    return {"ok": True, "message": f"VIP fee rule {row.get('level_code') or parsed_id} updated."}
+
+
+def _dealer_risk_write_form(payload: Dict[str, Any], *, risk_id: Optional[int] = None, symbol: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "id": str(risk_id if risk_id is not None else payload.get("id") or ""),
+        "symbol": symbol if symbol is not None else _normalize_code(payload.get("symbol")),
+        "enabled": str(payload.get("enabled") if str(payload.get("enabled")) in {"0", "1"} else "1"),
+        "status": str(payload.get("status") or "ACTIVE").strip().upper(),
+        "max_single_notional": str(payload.get("max_single_notional") or ""),
+        "max_net_base_position": str(payload.get("max_net_base_position") or ""),
+        "max_net_quote_exposure": str(payload.get("max_net_quote_exposure") or ""),
+        "remark": str(payload.get("remark") or "").strip(),
+    }
+
+
+def admin_save_dealer_risk_limit(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    errors: list[str] = []
+    risk_id = _admin_write_int(payload.get("id"), "Dealer risk id", errors, optional=True, min_value=1)
+    symbol = _normalize_code(payload.get("symbol"))
+    if not symbol:
+        errors.append("Symbol is required.")
+    enabled_raw = str(payload.get("enabled") or "").strip()
+    enabled = 1 if enabled_raw == "1" else 0
+    status = str(payload.get("status") or "ACTIVE").strip().upper()
+    if status not in {"ACTIVE", "PAUSED"}:
+        errors.append("Dealer risk status must be ACTIVE or PAUSED.")
+    max_single_notional = _admin_write_decimal(
+        payload.get("max_single_notional"),
+        "Max single notional",
+        errors,
+        optional=True,
+    )
+    max_net_base_position = _admin_write_decimal(
+        payload.get("max_net_base_position"),
+        "Max net base position",
+        errors,
+        optional=True,
+    )
+    max_net_quote_exposure = _admin_write_decimal(
+        payload.get("max_net_quote_exposure"),
+        "Max net quote exposure",
+        errors,
+        optional=True,
+    )
+    remark = str(payload.get("remark") or "").strip()
+    if len(remark) > 255:
+        errors.append("Remark cannot exceed 255 characters.")
+
+    form = _dealer_risk_write_form(payload, risk_id=risk_id, symbol=symbol)
+    if errors:
+        return {"ok": False, "errors": errors, "form": form, "message": "; ".join(errors)}
+
+    try:
+        now = datetime.utcnow()
+        duplicate = db.execute(
+            text(
+                """
+                SELECT id
+                FROM dealer_risk_limits
+                WHERE symbol = :symbol
+                  AND (:risk_id IS NULL OR id <> :risk_id)
+                LIMIT 1
+                """
+            ),
+            {"symbol": symbol, "risk_id": risk_id},
+        ).mappings().first()
+        if duplicate:
+            return {
+                "ok": False,
+                "errors": ["Dealer risk limit already exists for this symbol."],
+                "form": form,
+                "message": "Dealer risk limit already exists for this symbol.",
+            }
+
+        if risk_id is not None:
+            current = db.execute(
+                text("SELECT id FROM dealer_risk_limits WHERE id = :risk_id LIMIT 1"),
+                {"risk_id": risk_id},
+            ).mappings().first()
+            if not current:
+                return {"ok": False, "errors": ["Dealer risk limit not found."], "form": form, "message": "Dealer risk limit not found."}
+            result = db.execute(
+                text(
+                    """
+                    UPDATE dealer_risk_limits
+                    SET symbol = :symbol,
+                        enabled = :enabled,
+                        status = :status,
+                        max_single_notional = :max_single_notional,
+                        max_net_base_position = :max_net_base_position,
+                        max_net_quote_exposure = :max_net_quote_exposure,
+                        remark = :remark,
+                        updated_at = :updated_at
+                    WHERE id = :risk_id
+                    """
+                ),
+                {
+                    "risk_id": risk_id,
+                    "symbol": symbol,
+                    "enabled": enabled,
+                    "status": status,
+                    "max_single_notional": max_single_notional,
+                    "max_net_base_position": max_net_base_position,
+                    "max_net_quote_exposure": max_net_quote_exposure,
+                    "remark": remark,
+                    "updated_at": now,
+                },
+            )
+            if result.rowcount != 1:
+                return {"ok": False, "errors": ["Dealer risk limit update failed."], "form": form, "message": "Dealer risk limit update failed."}
+            message = f"Dealer risk limit {symbol} updated."
+        else:
+            result = db.execute(
+                text(
+                    """
+                    INSERT INTO dealer_risk_limits
+                        (symbol, enabled, max_single_notional, max_net_base_position,
+                         max_net_quote_exposure, status, remark, created_at, updated_at)
+                    VALUES
+                        (:symbol, :enabled, :max_single_notional, :max_net_base_position,
+                         :max_net_quote_exposure, :status, :remark, :created_at, :updated_at)
+                    """
+                ),
+                {
+                    "symbol": symbol,
+                    "enabled": enabled,
+                    "max_single_notional": max_single_notional,
+                    "max_net_base_position": max_net_base_position,
+                    "max_net_quote_exposure": max_net_quote_exposure,
+                    "status": status,
+                    "remark": remark,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            if result.rowcount != 1:
+                return {"ok": False, "errors": ["Dealer risk limit create failed."], "form": form, "message": "Dealer risk limit create failed."}
+            message = f"Dealer risk limit {symbol} created."
+    except (IntegrityError, SQLAlchemyError) as exc:
+        db.rollback()
+        return {
+            "ok": False,
+            "errors": [f"Dealer risk limit save failed: {exc.__class__.__name__}"],
+            "form": form,
+            "message": f"Dealer risk limit save failed: {exc.__class__.__name__}",
+        }
+
+    return {"ok": True, "message": message}
+
+
+def admin_toggle_dealer_risk_enabled(db: Session, risk_id: int) -> Dict[str, Any]:
+    parsed_id = _parse_int(risk_id)
+    if parsed_id <= 0:
+        return {"ok": False, "message": "Invalid dealer risk id."}
+    try:
+        row = db.execute(
+            text("SELECT id, symbol, enabled FROM dealer_risk_limits WHERE id = :risk_id LIMIT 1"),
+            {"risk_id": parsed_id},
+        ).mappings().first()
+        if not row:
+            return {"ok": False, "message": "Dealer risk limit not found."}
+        next_enabled = 0 if int(row.get("enabled") or 0) == 1 else 1
+        result = db.execute(
+            text(
+                """
+                UPDATE dealer_risk_limits
+                SET enabled = :enabled, updated_at = :updated_at
+                WHERE id = :risk_id
+                """
+            ),
+            {"risk_id": parsed_id, "enabled": next_enabled, "updated_at": datetime.utcnow()},
+        )
+        if result.rowcount != 1:
+            return {"ok": False, "message": "Dealer risk enabled update failed."}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        return {"ok": False, "message": f"Dealer risk enabled update failed: {exc.__class__.__name__}"}
+
+    action = "enabled" if next_enabled == 1 else "disabled"
+    return {"ok": True, "message": f"Dealer risk limit {row.get('symbol') or parsed_id} {action}."}
+
+
+def admin_toggle_dealer_risk_status(db: Session, risk_id: int) -> Dict[str, Any]:
+    parsed_id = _parse_int(risk_id)
+    if parsed_id <= 0:
+        return {"ok": False, "message": "Invalid dealer risk id."}
+    try:
+        row = db.execute(
+            text("SELECT id, symbol, status FROM dealer_risk_limits WHERE id = :risk_id LIMIT 1"),
+            {"risk_id": parsed_id},
+        ).mappings().first()
+        if not row:
+            return {"ok": False, "message": "Dealer risk limit not found."}
+        current_status = str(row.get("status") or "ACTIVE").upper()
+        next_status = "PAUSED" if current_status == "ACTIVE" else "ACTIVE"
+        result = db.execute(
+            text(
+                """
+                UPDATE dealer_risk_limits
+                SET status = :status, updated_at = :updated_at
+                WHERE id = :risk_id
+                """
+            ),
+            {"risk_id": parsed_id, "status": next_status, "updated_at": datetime.utcnow()},
+        )
+        if result.rowcount != 1:
+            return {"ok": False, "message": "Dealer risk status update failed."}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        return {"ok": False, "message": f"Dealer risk status update failed: {exc.__class__.__name__}"}
+
+    return {"ok": True, "message": f"Dealer risk limit {row.get('symbol') or parsed_id} status changed to {next_status}."}
 
 
 def admin_query_dealer_risk_hit_logs(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -12926,12 +13342,12 @@ def _admin_market_contract_rows(
         turnover_parts.append("ct.price * ct.quantity")
     turnover_expr = f"COALESCE({', '.join(turnover_parts)}, 0)" if turnover_parts else "0"
     amount_expr = "COALESCE(ct.quantity, 0)" if "quantity" in contract_columns else "0"
-    fee_terms = []
-    if "fee_amount" in contract_columns:
-        fee_terms.append("COALESCE(ct.fee_amount, 0)")
     if "spread_fee" in contract_columns:
-        fee_terms.append("COALESCE(ct.spread_fee, 0)")
-    fee_expr = " + ".join(fee_terms) if fee_terms else "0"
+        fee_expr = "COALESCE(ct.spread_fee, 0)"
+    elif "fee_amount" in contract_columns:
+        fee_expr = "COALESCE(ct.fee_amount, 0)"
+    else:
+        fee_expr = "0"
     platform_pnl_expr = "SUM(0 - COALESCE(ct.realized_pnl, 0))" if "realized_pnl" in contract_columns else "NULL"
     time_expr = f"ct.{time_column}"
     where_parts = [f"{time_expr} >= :start_time", f"{time_expr} <= :end_time"]
@@ -13393,6 +13809,10 @@ def admin_query_trades(db: Session, filters: Optional[Dict[str, Any]] = None) ->
     buyer_user_id = str(filters.get("buyer_user_id") or "").strip()
     seller_user_id = str(filters.get("seller_user_id") or "").strip()
     buy_order_id = str(filters.get("buy_order_id") or filters.get("order_id") or "").strip()
+    order_no = str(filters.get("order_no") or "").strip()
+    if buy_order_id and not buy_order_id.isdigit() and not order_no:
+        order_no = buy_order_id
+        buy_order_id = ""
     sell_order_id = str(filters.get("sell_order_id") or "").strip()
     maker_order_id = str(filters.get("maker_order_id") or "").strip()
     taker_order_id = str(filters.get("taker_order_id") or "").strip()
@@ -13408,7 +13828,7 @@ def admin_query_trades(db: Session, filters: Optional[Dict[str, Any]] = None) ->
         where_parts.append("t.id = :trade_id")
         params["trade_id"] = _parse_int(trade_id)
     if symbol:
-        where_parts.append("tp.symbol = :symbol")
+        where_parts.append("COALESCE(tp.symbol, order_tp.symbol) = :symbol")
         params["symbol"] = symbol
     if user_id:
         where_parts.append("(t.buyer_user_id = :user_id OR t.seller_user_id = :user_id)")
@@ -13422,6 +13842,11 @@ def admin_query_trades(db: Session, filters: Optional[Dict[str, Any]] = None) ->
     if buy_order_id:
         where_parts.append("(t.buy_order_id = :buy_order_id OR t.sell_order_id = :buy_order_id OR t.maker_order_id = :buy_order_id OR t.taker_order_id = :buy_order_id)")
         params["buy_order_id"] = _parse_int(buy_order_id)
+    if order_no:
+        where_parts.append(
+            "(bo.order_no LIKE :order_no OR so.order_no LIKE :order_no OR mo.order_no LIKE :order_no OR taker_o.order_no LIKE :order_no)"
+        )
+        params["order_no"] = f"%{order_no}%"
     if sell_order_id:
         where_parts.append("t.sell_order_id = :sell_order_id")
         params["sell_order_id"] = _parse_int(sell_order_id)
@@ -13432,8 +13857,11 @@ def admin_query_trades(db: Session, filters: Optional[Dict[str, Any]] = None) ->
         where_parts.append("t.taker_order_id = :taker_order_id")
         params["taker_order_id"] = _parse_int(taker_order_id)
     if counterparty_type:
-        where_parts.append("t.counterparty_type = :counterparty_type")
-        params["counterparty_type"] = counterparty_type
+        if counterparty_type == "DEALER":
+            where_parts.append("UPPER(COALESCE(t.counterparty_type, '')) IN ('PLATFORM', 'DEALER')")
+        else:
+            where_parts.append("t.counterparty_type = :counterparty_type")
+            params["counterparty_type"] = counterparty_type
     if start_time:
         where_parts.append("t.created_at >= :start_time")
         params["start_time"] = start_time
@@ -13444,7 +13872,17 @@ def admin_query_trades(db: Session, filters: Optional[Dict[str, Any]] = None) ->
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     from_sql = """
         FROM trades t
+        LEFT JOIN orders bo ON bo.id = t.buy_order_id
+        LEFT JOIN orders so ON so.id = t.sell_order_id
+        LEFT JOIN orders mo ON mo.id = t.maker_order_id
+        LEFT JOIN orders taker_o ON taker_o.id = t.taker_order_id
         LEFT JOIN trading_pairs tp ON tp.id = t.trading_pair_id
+        LEFT JOIN trading_pairs order_tp ON order_tp.id = COALESCE(
+            bo.trading_pair_id,
+            so.trading_pair_id,
+            mo.trading_pair_id,
+            taker_o.trading_pair_id
+        )
     """
     total = int(db.execute(text(f"SELECT COUNT(*) {from_sql} {where_sql}"), params).scalar() or 0)
     page, page_size, pages = _admin_page_meta(total, page, page_size)
@@ -13455,9 +13893,13 @@ def admin_query_trades(db: Session, filters: Optional[Dict[str, Any]] = None) ->
             SELECT
                 t.id,
                 t.trading_pair_id,
-                tp.symbol,
+                COALESCE(tp.symbol, order_tp.symbol) AS symbol,
                 t.buy_order_id,
                 t.sell_order_id,
+                bo.order_no AS buy_order_no,
+                so.order_no AS sell_order_no,
+                mo.order_no AS maker_order_no,
+                taker_o.order_no AS taker_order_no,
                 t.buyer_user_id,
                 t.seller_user_id,
                 t.price,
@@ -13521,6 +13963,10 @@ def admin_query_trades(db: Session, filters: Optional[Dict[str, Any]] = None) ->
                 "symbol": row_dict.get("symbol") or "",
                 "buy_order_id": row_dict.get("buy_order_id"),
                 "sell_order_id": row_dict.get("sell_order_id"),
+                "buy_order_no": row_dict.get("buy_order_no") or "",
+                "sell_order_no": row_dict.get("sell_order_no") or "",
+                "maker_order_no": row_dict.get("maker_order_no") or "",
+                "taker_order_no": row_dict.get("taker_order_no") or "",
                 "buyer_user_id": row_dict.get("buyer_user_id"),
                 "seller_user_id": row_dict.get("seller_user_id"),
                 "price": _admin_trade_price_display(row_dict.get("price")),
@@ -13549,6 +13995,7 @@ def admin_query_trades(db: Session, filters: Optional[Dict[str, Any]] = None) ->
             "user_id": user_id,
             "buyer_user_id": buyer_user_id,
             "seller_user_id": seller_user_id,
+            "order_no": order_no,
             "buy_order_id": buy_order_id,
             "sell_order_id": sell_order_id,
             "maker_order_id": maker_order_id,
@@ -15030,6 +15477,7 @@ def admin_query_stock_token_release_logs(db: Session, filters: Optional[Dict[str
 
 
 COLLECTION_OP_WAITING_STATUSES = ("PENDING", "QUEUED")
+COLLECTION_TASK_FILTER_PENDING_STATUSES = ("PENDING",)
 COLLECTION_OP_GAS_REQUIRED_STATUSES = (
     "GAS_REQUIRED",
     "WAITING_GAS",
@@ -15041,10 +15489,22 @@ COLLECTION_OP_GAS_REQUIRED_STATUSES = (
 )
 COLLECTION_OP_WAITING_COLLECTION_STATUSES = ("READY_TO_COLLECT", "WAITING_COLLECTION", "WAIT_COLLECTION")
 COLLECTION_OP_COLLECTING_STATUSES = ("RUNNING", "PROCESSING", "SENDING", "QUEUED", "SENT", "CONFIRMING", "COLLECTION_SENT", "COLLECTION_CONFIRMING")
+COLLECTION_TASK_FILTER_COLLECTING_STATUSES = (
+    "QUEUED",
+    "READY",
+    "READY_TO_COLLECT",
+    "WAITING_COLLECTION",
+    "WAIT_COLLECTION",
+    "RUNNING",
+    "PROCESSING",
+    "SENDING",
+    "COLLECTING",
+)
 COLLECTION_OP_PROCESSING_STATUSES = ("RUNNING", "PROCESSING", "SENDING", "READY", "CONFIRMING")
 COLLECTION_OP_SENT_STATUSES = ("SENT", "GAS_SENT", "CONFIRMING", "COLLECTION_SENT", "COLLECTION_CONFIRMING")
 COLLECTION_OP_SUCCESS_STATUSES = ("CONFIRMED", "SUCCESS", "COMPLETED", "PAID")
 COLLECTION_OP_FAILED_STATUSES = ("FAILED", "ERROR", "GAS_FAILED")
+COLLECTION_TASK_FILTER_FAILED_STATUSES = ("FAILED", "ERROR", "TIMEOUT")
 COLLECTION_OP_TIMEOUT_STATUSES = ("TIMEOUT",)
 COLLECTION_OP_CANCELED_STATUSES = ("CANCELED", "CANCELLED")
 COLLECTION_TASK_MANUAL_RETRY_STATUSES = ("FAILED", "SKIPPED", "TIMEOUT", "PENDING")
@@ -15074,6 +15534,31 @@ COLLECTION_OP_ACTIVE_STATUSES = (
     *COLLECTION_OP_PROCESSING_STATUSES,
     *COLLECTION_OP_SENT_STATUSES,
 )
+
+
+def _collection_task_business_status(raw_status: Any, *, default_workbench: bool = False) -> str:
+    status = str(raw_status or "").strip().upper()
+    if not status:
+        return "WORKBENCH" if default_workbench else ""
+    if status == "ALL":
+        return "ALL"
+    if status in {"WORKBENCH", "ACTIVE", "TODO", "PENDING"}:
+        return "WORKBENCH"
+    if status in set(COLLECTION_OP_GAS_REQUIRED_STATUSES):
+        return "GAS_REQUIRED"
+    if status in {"GAS_FAILED", "GAS_FAIL"}:
+        return "GAS_FAILED"
+    if status in set(COLLECTION_TASK_FILTER_COLLECTING_STATUSES) | {"PROCESSING", "RUNNING", "SENDING"}:
+        return "COLLECTING"
+    if status in set(COLLECTION_OP_SENT_STATUSES):
+        return "CONFIRMING"
+    if status in set(COLLECTION_OP_SUCCESS_STATUSES):
+        return "SUCCESS"
+    if status in set(COLLECTION_OP_CANCELED_STATUSES):
+        return "CANCELED"
+    if status in {"FAILED", "FAIL", "ERROR", "TIMEOUT"}:
+        return "FAILED"
+    return status
 COLLECTION_OP_TERMINAL_STATUSES = (
     *COLLECTION_OP_SUCCESS_STATUSES,
     *COLLECTION_OP_FAILED_STATUSES,
@@ -15096,6 +15581,26 @@ def is_collection_task_retryable(status: Any, tx_hash: Any, retry_count: Any, ma
     except Exception:
         max_retry_value = 0
     return retry_count_value < max_retry_value
+
+
+def is_collection_task_safe_cancelable(row: Dict[str, Any]) -> bool:
+    status_value = str(row.get("status") or "").strip().upper()
+    tx_hash_value = str(row.get("tx_hash") or "").strip()
+    if status_value not in SAFE_CANCEL_COLLECTION_STATUSES:
+        return False
+    if tx_hash_value:
+        return False
+    if row.get("sent_at") or row.get("confirmed_at") or row.get("block_number"):
+        return False
+    try:
+        if Decimal(str(row.get("amount") or 0)) <= 0:
+            return False
+    except Exception:
+        return False
+    gas_task_status = str(row.get("gas_task_status") or "").strip().upper()
+    if gas_task_status == "SENDING":
+        return False
+    return True
 
 
 def _is_legacy_collection_gas_required_failure_value(status: Any, reason: Any, last_error: Any, tx_hash: Any) -> bool:
@@ -15599,15 +16104,17 @@ def _admin_collection_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
             or status_value in {"PENDING", "QUEUED", "READY", "FAILED", "SKIPPED", "TIMEOUT"}
         )
     )
-    if status_value in {"SENT", "GAS_SENT", "CONFIRMING"}:
-        status_label, status_badge = "归集已发送 / 确认中", "info"
-    if status_value in {"GAS_REQUIRED", "GAS_QUEUED"}:
-        if gas_task_status in {"SENT", "GAS_SENT", "CONFIRMING"}:
-            status_label, status_badge = "等待Gas确认", "info"
+    if status_value in {"SENT", "GAS_SENT", "CONFIRMING", "COLLECTION_SENT", "COLLECTION_CONFIRMING"}:
+        status_label, status_badge = "链上确认中", "info"
+    if status_value in set(COLLECTION_OP_GAS_REQUIRED_STATUSES) | {"GAS_FAILED"}:
+        if gas_task_status in {"FAILED", "ERROR"} or status_value == "GAS_FAILED":
+            status_label, status_badge = "补Gas失败", "danger"
+        elif gas_task_status in {"SENT", "GAS_SENT", "CONFIRMING"}:
+            status_label, status_badge = "等待补Gas确认", "info"
         elif gas_task_status in {"CONFIRMED", "SUCCESS", "COMPLETED"} and gas_meta.get("gas_has_real_tx"):
             status_label, status_badge = "等待归集续跑", "warning"
         else:
-            status_label, status_badge = "等待Gas", "warning"
+            status_label, status_badge = "等待补Gas", "warning"
     if (
         status_value in {"PENDING", "READY"}
         and gas_task_status in {"CONFIRMED", "SUCCESS", "COMPLETED"}
@@ -15641,6 +16148,7 @@ def _admin_collection_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
             or bool(gas_meta.get("gas_is_dry_run"))
         )
     )
+    can_safe_cancel = is_collection_task_safe_cancelable(row)
     return {
         "id": row.get("id"),
         "task_no": row.get("task_no") or "",
@@ -15662,6 +16170,8 @@ def _admin_collection_task_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "status_display_badge": status_display_badge,
         "can_send": can_send,
         "can_retry": can_retry,
+        "can_safe_cancel": can_safe_cancel,
+        "safe_cancel_url": f"/admin/collections/tasks/{row.get('id')}/safe-cancel",
         "collection_can_confirm_requeue": collection_can_confirm_requeue,
         "reason": reason_value or "",
         **tx_meta,
@@ -15706,16 +16216,29 @@ COLLECTION_BATCH_STATUS_LABELS = {
 }
 
 COLLECTION_TASK_STATUS_LABELS = {
-    "PENDING": ("等待中", "neutral"),
-    "QUEUED": ("等待中", "neutral"),
-    "RUNNING": ("处理中", "info"),
-    "PROCESSING": ("处理中", "info"),
-    "GAS_REQUIRED": ("等待Gas", "warning"),
-    "GAS_QUEUED": ("等待Gas", "warning"),
-    "GAS_SENT": ("已发送", "info"),
-    "READY": ("处理中", "info"),
-    "SENDING": ("处理中", "info"),
-    "SENT": ("已发送", "info"),
+    "PENDING": ("待处理", "neutral"),
+    "QUEUED": ("归集中", "info"),
+    "RUNNING": ("归集中", "info"),
+    "PROCESSING": ("归集中", "info"),
+    "GAS_REQUIRED": ("等待补Gas", "warning"),
+    "WAITING_GAS": ("等待补Gas", "warning"),
+    "WAIT_GAS": ("等待补Gas", "warning"),
+    "GAS_QUEUED": ("等待补Gas", "warning"),
+    "GAS_CONFIRMING": ("等待补Gas确认", "info"),
+    "WAITING_GAS_CONFIRM": ("等待补Gas确认", "info"),
+    "PENDING_GAS": ("等待补Gas", "warning"),
+    "GAS_FAILED": ("补Gas失败", "danger"),
+    "GAS_SENT": ("链上确认中", "info"),
+    "READY": ("归集中", "info"),
+    "READY_TO_COLLECT": ("归集中", "info"),
+    "WAITING_COLLECTION": ("归集中", "info"),
+    "WAIT_COLLECTION": ("归集中", "info"),
+    "COLLECTING": ("归集中", "info"),
+    "SENDING": ("归集中", "info"),
+    "SENT": ("链上确认中", "info"),
+    "CONFIRMING": ("链上确认中", "info"),
+    "COLLECTION_SENT": ("链上确认中", "info"),
+    "COLLECTION_CONFIRMING": ("链上确认中", "info"),
     "CONFIRMED": ("已完成", "success"),
     "SUCCESS": ("已完成", "success"),
     "COMPLETED": ("已完成", "success"),
@@ -16038,6 +16561,10 @@ def _collection_amount_rows_summary(
 def _collection_task_scope(filters: Dict[str, Any]) -> tuple[list[str], Dict[str, Any]]:
     parts: list[str] = []
     params: Dict[str, Any] = {}
+    if filters.get("task_id"):
+        parts.append("collection_tasks.id = :task_id")
+        params["task_id"] = _parse_int(filters["task_id"])
+        return parts, params
     if filters.get("task_no"):
         parts.append("collection_tasks.task_no LIKE :task_no")
         params["task_no"] = f"%{filters['task_no']}%"
@@ -16598,6 +17125,7 @@ def _collection_batch_filter_options(db: Session) -> Dict[str, Any]:
                        COALESCE(NULLIF(name, ''), chain_key) AS label
                 FROM chains
                 WHERE chain_key IS NOT NULL AND TRIM(chain_key) <> ''
+                  AND enabled = 1
                 ORDER BY chain_key ASC
                 """
             )
@@ -16666,6 +17194,30 @@ def _collection_batch_filter_options(db: Session) -> Dict[str, Any]:
     except Exception:
         logger.exception("collection task coin filter options query failed")
 
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT DISTINCT UPPER(TRIM(a.symbol)) AS value
+                FROM asset_chains ac
+                JOIN assets a ON a.id = ac.asset_id
+                JOIN chains c ON c.id = ac.chain_id
+                WHERE ac.enabled = 1
+                  AND a.enabled = 1
+                  AND c.enabled = 1
+                  AND a.symbol IS NOT NULL
+                  AND TRIM(a.symbol) <> ''
+                ORDER BY value ASC
+                """
+            )
+        ).mappings().all()
+        for row in rows:
+            value = str(row.get("value") or "").strip()
+            if value and value not in coin_options:
+                coin_options[value] = {"value": value, "label": value}
+    except Exception:
+        logger.exception("collection configured asset filter options query failed")
+
     networks = sorted(chain_options.values(), key=lambda item: item.get("value") or "")
     coins = sorted(coin_options.values(), key=lambda item: item.get("value") or "")
 
@@ -16680,8 +17232,8 @@ def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = Non
     filters = filters or {}
     batch_no = str(filters.get("batch_no") or "").strip()
     status = str(filters.get("status") or "").strip().upper()
-    chain_key = _normalize_chain_key(filters.get("chain_key"))
-    coin_symbol = _normalize_code(filters.get("coin_symbol"))
+    chain_key = _normalize_chain_key(filters.get("chain_key") or filters.get("network"))
+    coin_symbol = _normalize_code(filters.get("coin_symbol") or filters.get("asset_symbol"))
     trigger_type = str(filters.get("trigger_type") or "").strip().upper()
     user_id = str(filters.get("user_id") or "").strip()
     address = str(filters.get("address") or "").strip()
@@ -22016,51 +22568,52 @@ def admin_create_collection_batch_from_candidates(
 def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     filters = filters or {}
     task_no = str(filters.get("task_no") or "").strip()
+    task_id = str(filters.get("task_id") or "").strip()
+    if not task_id and task_no.isdigit():
+        task_id = task_no
     batch_id = str(filters.get("batch_id") or "").strip()
     user_id = str(filters.get("user_id") or "").strip()
     chain_key = _normalize_chain_key(filters.get("chain_key"))
     coin_symbol = _normalize_code(filters.get("coin_symbol"))
-    status = str(filters.get("status") or "").strip().upper()
+    requested_status = str(filters.get("status") or "").strip().upper()
     address = str(filters.get("address") or "").strip()
     tx_hash = str(filters.get("tx_hash") or "").strip()
     created_from = filters.get("created_from") or filters.get("date_from")
     created_to = filters.get("created_to") or filters.get("date_to")
     page = max(1, _parse_int(filters.get("page"), 1))
     page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
-    is_detail_query = bool(batch_id or task_no)
+    is_exact_task_query = bool(task_id)
+    is_detail_query = bool(batch_id or task_no or is_exact_task_query)
     normalized_filters = {
         "task_no": task_no,
+        "task_id": task_id,
         "batch_id": batch_id,
-        "user_id": user_id,
-        "chain_key": chain_key,
-        "coin_symbol": coin_symbol,
-        "address": address,
-        "tx_hash": tx_hash,
+        "user_id": "" if is_exact_task_query else user_id,
+        "chain_key": "" if is_exact_task_query else chain_key,
+        "coin_symbol": "" if is_exact_task_query else coin_symbol,
+        "address": "" if is_exact_task_query else address,
+        "tx_hash": "" if is_exact_task_query else tx_hash,
     }
     where_parts, params = _collection_task_scope(normalized_filters)
     status_values: tuple[str, ...] | None = None
-    status = status or ("WORKBENCH" if not is_detail_query else "")
+    status = _collection_task_business_status(requested_status, default_workbench=not is_detail_query)
     status_uses_gas_task = False
-    if status and status != "ALL":
-        if status in {"WORKBENCH", "ACTIVE", "TODO"}:
+    if status and status != "ALL" and not is_exact_task_query:
+        if status == "WORKBENCH":
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
-            status_values = COLLECTION_TASK_WORKBENCH_STATUSES
-            status = "WORKBENCH"
-        elif status in {"FAILED", "FAIL", "ERROR"}:
+            status_values = COLLECTION_TASK_FILTER_PENDING_STATUSES
+        elif status == "FAILED":
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
-            status_values = COLLECTION_OP_FAILED_STATUSES
-            status = "FAILED"
-        elif status in {"GAS_FAILED", "GAS_FAIL"}:
+            status_values = COLLECTION_TASK_FILTER_FAILED_STATUSES
+        elif status == "GAS_FAILED":
             where_parts.append("(UPPER(collection_tasks.status) IN :status_values OR UPPER(gt.status) IN :gas_status_values)")
             status_values = ("GAS_FAILED",)
             params["gas_status_values"] = ("FAILED", "ERROR")
             status_uses_gas_task = True
-            status = "GAS_FAILED"
-        elif status in {"GAS_REQUIRED", "WAITING_GAS", "WAIT_GAS", "GAS_QUEUED"}:
+        elif status == "GAS_REQUIRED":
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
             status_values = COLLECTION_OP_GAS_REQUIRED_STATUSES
-            status = "GAS_REQUIRED"
-        elif status in {"SUCCESS", "COMPLETED", "CONFIRMED"}:
+        elif status == "SUCCESS":
             where_parts.append(
                 "collection_tasks.batch_id IS NOT NULL "
                 "AND NOT EXISTS ("
@@ -22072,28 +22625,24 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
                 ")"
             )
             status_values = COLLECTION_OP_SUCCESS_STATUSES
-            status = "SUCCESS"
-        elif status in {"PENDING", "QUEUED"}:
+        elif status == "COLLECTING":
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
-            status_values = COLLECTION_OP_WAITING_STATUSES
-            status = "PENDING"
-        elif status in {"PROCESSING", "RUNNING", "SENDING"}:
+            status_values = COLLECTION_TASK_FILTER_COLLECTING_STATUSES
+        elif status == "CONFIRMING":
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
-            status_values = ("RUNNING", "PROCESSING", "SENDING", "READY", "PARTIAL")
-            status = "PROCESSING"
-        elif status in {"SENT", "CONFIRMING", "GAS_SENT"}:
+            status_values = COLLECTION_OP_SENT_STATUSES
+        elif status == "CANCELED":
             where_parts.append("UPPER(collection_tasks.status) IN :status_values")
-            status_values = ("SENT", "GAS_SENT", "CONFIRMING")
-            status = "SENT"
+            status_values = COLLECTION_OP_CANCELED_STATUSES
         else:
             where_parts.append("UPPER(collection_tasks.status) = :status")
             params["status"] = status
     if status_values:
         params["status_values"] = status_values
-    if created_from:
+    if created_from and not is_exact_task_query:
         where_parts.append("DATE(collection_tasks.created_at) >= :created_from")
         params["created_from"] = str(created_from)
-    if created_to:
+    if created_to and not is_exact_task_query:
         where_parts.append("DATE(collection_tasks.created_at) <= :created_to")
         params["created_to"] = str(created_to)
     where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
@@ -22227,10 +22776,13 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
         detail_page = 1
         detail_pages = 1
         rows = []
-        if batch_id or task_no:
-            count_stmt = text(f"SELECT COUNT(*) FROM collection_tasks {where_sql}")
+        if batch_id or task_no or is_exact_task_query:
+            detail_count_from = "collection_tasks LEFT JOIN gas_tasks gt ON gt.id = collection_tasks.gas_task_id" if status_uses_gas_task else "collection_tasks"
+            count_stmt = text(f"SELECT COUNT(*) FROM {detail_count_from} {where_sql}")
             if status_values:
                 count_stmt = count_stmt.bindparams(bindparam("status_values", expanding=True))
+            if status_uses_gas_task:
+                count_stmt = count_stmt.bindparams(bindparam("gas_status_values", expanding=True))
             detail_total = int(db.execute(count_stmt, params).scalar() or 0)
             detail_page, detail_page_size, detail_pages = _admin_page_meta(detail_total, page, page_size)
             row_stmt = text(
@@ -22270,6 +22822,7 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
         filters={
             **filters,
             "task_no": task_no,
+            "task_id": task_id,
             "batch_id": batch_id,
             "user_id": user_id,
             "chain_key": chain_key,
@@ -22279,6 +22832,7 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
             "tx_hash": tx_hash,
         },
         summary=_collection_tasks_summary(db, normalized_filters),
+        filter_options=_collection_batch_filter_options(db),
         total=detail_total,
         page=detail_page,
         page_size=page_size,
@@ -22289,7 +22843,7 @@ def list_collection_tasks(db: Session, filters: Optional[Dict[str, Any]] = None)
             "total": batch_total,
             "pages": batch_pages,
         },
-        selected_batch_id=batch_id or task_no,
+        selected_batch_id=batch_id or task_id or task_no,
     )
 
 
@@ -22398,10 +22952,244 @@ def list_gas_tasks(db: Session, filters: Optional[Dict[str, Any]] = None) -> Dic
     )
 
 
-# Generic fallbacks for unrelated admin pages. They keep imports stable while
-# the asset-network rollout code remains the source of truth in this file.
-admin_toggle_vip_fee_level_enabled = _ok_stub
-admin_update_vip_fee_level_rule = _ok_stub
-admin_save_dealer_risk_limit = _ok_stub
-admin_toggle_dealer_risk_enabled = _ok_stub
-admin_toggle_dealer_risk_status = _ok_stub
+EVM_COLLECTION_GAS_COST_CHAINS = SUPPORTED_EVM_GAS_CONFIG_CHAINS
+
+
+def _collection_gas_cost_percentile(values: list[Decimal], percentile: Decimal) -> Decimal:
+    if not values:
+        return Decimal("0")
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = Decimal(len(sorted_values) - 1) * percentile
+    lower_index = int(rank)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    fraction = rank - Decimal(lower_index)
+    return sorted_values[lower_index] + (sorted_values[upper_index] - sorted_values[lower_index]) * fraction
+
+
+def _collection_gas_cost_default_params() -> list[Dict[str, Any]]:
+    items: list[Dict[str, Any]] = []
+    safe_multiplier = Decimal("3")
+    for chain_key in EVM_COLLECTION_GAS_COST_CHAINS:
+        estimated = Decimal(str(DEFAULT_GAS_NATIVE.get(chain_key, Decimal("0"))))
+        buffer = Decimal(str(GAS_TOPUP_BUFFER.get(chain_key, Decimal("0"))))
+        cap = Decimal(str(GAS_TOPUP_CAP.get(chain_key, Decimal("0"))))
+        target = estimated * safe_multiplier + buffer
+        items.append(
+            {
+                "chain_key": chain_key,
+                "estimated_required_native": estimated,
+                "estimated_required_native_label": _fmt_admin_amount_display(estimated, ""),
+                "buffer": buffer,
+                "buffer_label": _fmt_admin_amount_display(buffer, ""),
+                "topup_cap": cap,
+                "topup_cap_label": _fmt_admin_amount_display(cap, ""),
+                "target_balance": target,
+                "target_balance_label": _fmt_admin_amount_display(target, ""),
+                "target_gt_cap": target > cap,
+                "target_status_label": "target > cap" if target > cap else "OK",
+                "target_status_badge": "danger" if target > cap else "success",
+            }
+        )
+    return items
+
+
+def _collection_gas_config_params(db: Session) -> list[Dict[str, Any]]:
+    items: list[Dict[str, Any]] = []
+    for config in load_all_gas_topup_configs(db):
+        chain_key = str(config.get("chain_key") or "").lower()
+        estimated = Decimal(str(DEFAULT_GAS_NATIVE.get(chain_key, Decimal("0"))))
+        resolved = resolve_gas_topup_parameters(
+            db,
+            chain_key=chain_key,
+            token_symbol=None,
+            estimated_required_native=estimated,
+        )
+        safe_multiplier = Decimal(str(resolved.get("safe_multiplier") or "0"))
+        buffer_amount = Decimal(str(resolved.get("buffer") or "0"))
+        cap_amount = Decimal(str(resolved.get("cap") or "0"))
+        min_topup = Decimal(str(resolved.get("min_topup") or "0"))
+        max_topup = Decimal(str(resolved.get("max_topup") or "0"))
+        target = Decimal(str(resolved.get("target_balance") or "0"))
+        effective_cap = min(cap_amount, max_topup) if max_topup > 0 else cap_amount
+        target_gt_cap = bool(effective_cap > 0 and target > effective_cap)
+        default_target = estimated * Decimal("3") + Decimal(str(GAS_TOPUP_BUFFER.get(chain_key, Decimal("0"))))
+        items.append(
+            {
+                "chain_key": chain_key,
+                "gas_topup_mode": str(resolved.get("gas_topup_mode") or "DEFAULT").upper(),
+                "mode_options": GAS_TOPUP_MODES,
+                "estimate_source": str(resolved.get("estimate_source") or "DEFAULT"),
+                "stats_sample_count": int(resolved.get("stats_sample_count") or 0),
+                "stats_p95_native_fee_label": _fmt_admin_amount_display(
+                    Decimal(str(resolved.get("stats_p95_native_fee") or "0")), ""
+                ),
+                "safe_multiplier": safe_multiplier,
+                "safe_multiplier_value": format(safe_multiplier, "f"),
+                "buffer": buffer_amount,
+                "buffer_value": format(buffer_amount, "f"),
+                "cap": cap_amount,
+                "cap_value": format(cap_amount, "f"),
+                "min_topup": min_topup,
+                "min_topup_value": format(min_topup, "f"),
+                "max_topup": max_topup,
+                "max_topup_value": format(max_topup, "f"),
+                "target_balance": target,
+                "target_balance_label": _fmt_admin_amount_display(target, ""),
+                "target_gt_cap": target_gt_cap,
+                "target_status_label": "目标超过上限" if target_gt_cap else "正常",
+                "target_status_badge": "danger" if target_gt_cap else "success",
+                "is_custom": bool(resolved.get("is_custom")),
+                "default_estimated_label": _fmt_admin_amount_display(estimated, ""),
+                "default_buffer_label": _fmt_admin_amount_display(Decimal(str(GAS_TOPUP_BUFFER.get(chain_key, Decimal("0")))), ""),
+                "default_cap_label": _fmt_admin_amount_display(Decimal(str(GAS_TOPUP_CAP.get(chain_key, Decimal("0")))), ""),
+                "default_target_label": _fmt_admin_amount_display(default_target, ""),
+            }
+        )
+    return items
+
+
+def admin_query_collection_gas_cost_stats(db: Session) -> Dict[str, Any]:
+    default_params = _collection_gas_cost_default_params()
+    gas_config_params = _collection_gas_config_params(db)
+    default_by_chain = {item["chain_key"]: item for item in default_params}
+    failed_counts = {chain_key: 0 for chain_key in EVM_COLLECTION_GAS_COST_CHAINS}
+    latest_failed_reasons: dict[str, str] = {}
+
+    try:
+        failed_rows = db.execute(
+            text(
+                """
+                SELECT LOWER(chain_key) AS chain_key, COUNT(*) AS failed_count
+                FROM gas_tasks
+                WHERE UPPER(status) = 'FAILED'
+                  AND updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                  AND LOWER(chain_key) IN :chain_keys
+                GROUP BY LOWER(chain_key)
+                """
+            ).bindparams(bindparam("chain_keys", expanding=True)),
+            {"chain_keys": list(EVM_COLLECTION_GAS_COST_CHAINS)},
+        ).mappings().all()
+        for row in failed_rows:
+            failed_counts[str(row.get("chain_key") or "").lower()] = int(row.get("failed_count") or 0)
+
+        reason_rows = db.execute(
+            text(
+                """
+                SELECT gt.chain_key, gt.last_error
+                FROM gas_tasks gt
+                JOIN (
+                    SELECT LOWER(chain_key) AS chain_key, MAX(updated_at) AS latest_updated_at
+                    FROM gas_tasks
+                    WHERE UPPER(status) = 'FAILED'
+                      AND updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                      AND LOWER(chain_key) IN :chain_keys
+                    GROUP BY LOWER(chain_key)
+                ) latest
+                  ON LOWER(gt.chain_key) = latest.chain_key
+                 AND gt.updated_at = latest.latest_updated_at
+                """
+            ).bindparams(bindparam("chain_keys", expanding=True)),
+            {"chain_keys": list(EVM_COLLECTION_GAS_COST_CHAINS)},
+        ).mappings().all()
+        for row in reason_rows:
+            latest_failed_reasons[str(row.get("chain_key") or "").lower()] = str(row.get("last_error") or "")
+    except Exception:
+        logger.exception("collection gas cost failed gas task stats query failed")
+
+    if not _admin_table_exists(db, "collection_gas_cost_records"):
+        return {
+            "items": [],
+            "default_params": default_params,
+            "gas_config_params": gas_config_params,
+            "summary": {"total_7d": 0, "groups": 0, "latest_success_at": ""},
+            "failed_counts": failed_counts,
+            "table_missing": True,
+        }
+
+    rows = db.execute(
+        text(
+            """
+            SELECT chain_key, token_symbol, native_fee, confirmed_at
+            FROM collection_gas_cost_records
+            WHERE confirmed_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+            ORDER BY confirmed_at ASC, id ASC
+            """
+        )
+    ).mappings().all()
+
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    now = datetime.utcnow()
+    cutoff_24h = now - timedelta(hours=24)
+    latest_success_at: Optional[datetime] = None
+    for row in rows:
+        chain_key = str(row.get("chain_key") or "").lower()
+        token_symbol = str(row.get("token_symbol") or "").upper()
+        if not chain_key or not token_symbol:
+            continue
+        key = (chain_key, token_symbol)
+        group = grouped.setdefault(
+            key,
+            {
+                "chain_key": chain_key,
+                "token_symbol": token_symbol,
+                "fees": [],
+                "count_24h": 0,
+                "count_7d": 0,
+                "last_native_fee": Decimal("0"),
+                "last_success_at": None,
+            },
+        )
+        fee = Decimal(str(row.get("native_fee") or "0"))
+        confirmed_at = row.get("confirmed_at")
+        group["fees"].append(fee)
+        group["count_7d"] += 1
+        if isinstance(confirmed_at, datetime) and confirmed_at >= cutoff_24h:
+            group["count_24h"] += 1
+        if isinstance(confirmed_at, datetime) and (
+            group["last_success_at"] is None or confirmed_at >= group["last_success_at"]
+        ):
+            group["last_success_at"] = confirmed_at
+            group["last_native_fee"] = fee
+        if isinstance(confirmed_at, datetime) and (latest_success_at is None or confirmed_at >= latest_success_at):
+            latest_success_at = confirmed_at
+
+    items: list[Dict[str, Any]] = []
+    for (chain_key, token_symbol), group in sorted(grouped.items()):
+        fees: list[Decimal] = group["fees"]
+        avg_fee = sum(fees, Decimal("0")) / Decimal(len(fees)) if fees else Decimal("0")
+        p50_fee = _collection_gas_cost_percentile(fees, Decimal("0.50"))
+        p95_fee = _collection_gas_cost_percentile(fees, Decimal("0.95"))
+        max_fee = max(fees) if fees else Decimal("0")
+        defaults = default_by_chain.get(chain_key, {})
+        items.append(
+            {
+                "chain_key": chain_key,
+                "token_symbol": token_symbol,
+                "count_24h": group["count_24h"],
+                "count_7d": group["count_7d"],
+                "avg_native_fee_label": _fmt_admin_amount_display(avg_fee, ""),
+                "p50_native_fee_label": _fmt_admin_amount_display(p50_fee, ""),
+                "p95_native_fee_label": _fmt_admin_amount_display(p95_fee, ""),
+                "max_native_fee_label": _fmt_admin_amount_display(max_fee, ""),
+                "last_native_fee_label": _fmt_admin_amount_display(group["last_native_fee"], ""),
+                "last_success_at": _admin_datetime_display(group["last_success_at"]) if group["last_success_at"] else "-",
+                "failed_gas_tasks_7d": failed_counts.get(chain_key, 0),
+                "latest_failed_reason": latest_failed_reasons.get(chain_key, ""),
+                "default_params": defaults,
+            }
+        )
+
+    return {
+        "items": items,
+        "default_params": default_params,
+        "gas_config_params": gas_config_params,
+        "summary": {
+            "total_7d": sum(int(item["count_7d"]) for item in items),
+            "groups": len(items),
+            "latest_success_at": _admin_datetime_display(latest_success_at) if latest_success_at else "",
+        },
+        "failed_counts": failed_counts,
+        "table_missing": False,
+    }

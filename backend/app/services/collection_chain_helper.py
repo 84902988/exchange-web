@@ -53,10 +53,10 @@ GAS_TOPUP_BUFFER = {
 GAS_TOPUP_CAP = {
     "bsc": Decimal("0.01"),
     "polygon": Decimal("2"),
-    "avaxc": Decimal("0.2"),
+    "avaxc": Decimal("0.25"),
     "arbitrum": Decimal("0.005"),
     "eth": Decimal("0.02"),
-    "ethereum": Decimal("0.02"),
+    "ethereum": Decimal("0.025"),
     "optimism": Decimal("0.005"),
     "solana": Decimal("0.1"),
 }
@@ -68,6 +68,8 @@ class GasEvaluationResult:
     reason: str
     chain_key: str
     gas_coin_symbol: str
+    gas_topup_mode: str
+    estimate_source: str
     current_native_balance: Decimal
     estimated_required_native: Decimal
     target_native_balance: Decimal
@@ -87,9 +89,14 @@ class CollectionEvaluationResult:
     min_collect_amount: Decimal
     estimated_gas_native: Optional[Decimal]
     estimated_gas_usdt: Optional[Decimal]
+    current_native_balance: Decimal
+    estimated_required_native: Decimal
+    gas_target_balance: Decimal
     gas_required: bool
     gas_topup_amount: Decimal
     gas_coin_symbol: Optional[str]
+    gas_topup_mode: str
+    estimate_source: str
 
 
 def _normalize_chain_key(chain_key: str) -> str:
@@ -182,23 +189,15 @@ def compute_gas_topup_amount(
     chain_key: str,
     current_native_balance: Decimal,
     estimated_required_native: Decimal,
+    coin_symbol: Optional[str] = None,
+    db=None,
 ) -> GasEvaluationResult:
     ck = _normalize_chain_key(chain_key)
     gas_coin_symbol = get_native_gas_coin_symbol(ck)
     current_balance = _to_decimal(current_native_balance)
     estimated_required = _to_decimal(estimated_required_native)
-    if estimated_required <= 0:
-        return GasEvaluationResult(
-            gas_required=False,
-            reason="GAS_ESTIMATE_NOT_POSITIVE",
-            chain_key=ck,
-            gas_coin_symbol=gas_coin_symbol,
-            current_native_balance=current_balance,
-            estimated_required_native=estimated_required,
-            target_native_balance=current_balance,
-            topup_amount=Decimal("0"),
-        )
-
+    gas_topup_mode = "DEFAULT"
+    estimate_source = "DEFAULT"
     min_multiplier = _env_decimal("COLLECTION_GAS_TOPUP_MIN_MULTIPLIER", Decimal("2"))
     safe_multiplier = _env_decimal("COLLECTION_GAS_TOPUP_SAFE_MULTIPLIER", Decimal("3"))
     buffer_amount = _env_decimal(
@@ -209,15 +208,54 @@ def compute_gas_topup_amount(
         _chain_env_name("COLLECTION_GAS_TOPUP_CAP", ck),
         GAS_TOPUP_CAP.get(ck, Decimal("0")),
     )
+    min_topup_amount = Decimal("0")
+    max_topup_amount = cap_amount
+    if db is not None:
+        from app.services.collection_gas_config_service import resolve_gas_topup_parameters
 
-    min_required = estimated_required * min_multiplier
-    target_balance = estimated_required * safe_multiplier + buffer_amount
+        params = resolve_gas_topup_parameters(
+            db,
+            chain_key=ck,
+            token_symbol=coin_symbol,
+            estimated_required_native=estimated_required,
+        )
+        gas_topup_mode = str(params.get("gas_topup_mode") or "DEFAULT").upper()
+        estimate_source = str(params.get("estimate_source") or "DEFAULT").upper()
+        estimated_required = _to_decimal(params.get("estimated_required_native"))
+        safe_multiplier = _to_decimal(params.get("safe_multiplier"))
+        buffer_amount = _to_decimal(params.get("buffer"))
+        cap_amount = _to_decimal(params.get("cap"))
+        min_topup_amount = _to_decimal(params.get("min_topup"))
+        max_topup_amount = _to_decimal(params.get("max_topup"))
+
+    if estimated_required <= 0 and gas_topup_mode != "MANUAL":
+        return GasEvaluationResult(
+            gas_required=False,
+            reason="GAS_ESTIMATE_NOT_POSITIVE",
+            chain_key=ck,
+            gas_coin_symbol=gas_coin_symbol,
+            gas_topup_mode=gas_topup_mode,
+            estimate_source=estimate_source,
+            current_native_balance=current_balance,
+            estimated_required_native=estimated_required,
+            target_native_balance=current_balance,
+            topup_amount=Decimal("0"),
+        )
+
+    if gas_topup_mode == "MANUAL":
+        min_required = cap_amount
+        target_balance = cap_amount
+    else:
+        min_required = estimated_required * min_multiplier
+        target_balance = estimated_required * safe_multiplier + buffer_amount
     if current_balance >= min_required:
         return GasEvaluationResult(
             gas_required=False,
             reason="GAS_BALANCE_SUFFICIENT",
             chain_key=ck,
             gas_coin_symbol=gas_coin_symbol,
+            gas_topup_mode=gas_topup_mode,
+            estimate_source=estimate_source,
             current_native_balance=current_balance,
             estimated_required_native=estimated_required,
             target_native_balance=target_balance,
@@ -225,13 +263,18 @@ def compute_gas_topup_amount(
         )
 
     raw_topup = target_balance - current_balance
-    topup_amount = min(raw_topup, cap_amount)
+    topup_ceiling = min(cap_amount, max_topup_amount)
+    topup_amount = min(raw_topup, topup_ceiling)
+    if topup_amount > 0 and min_topup_amount > 0:
+        topup_amount = min(max(topup_amount, min_topup_amount), topup_ceiling)
     if topup_amount <= 0:
         return GasEvaluationResult(
             gas_required=False,
             reason="GAS_TOPUP_AMOUNT_NOT_POSITIVE",
             chain_key=ck,
             gas_coin_symbol=gas_coin_symbol,
+            gas_topup_mode=gas_topup_mode,
+            estimate_source=estimate_source,
             current_native_balance=current_balance,
             estimated_required_native=estimated_required,
             target_native_balance=target_balance,
@@ -243,6 +286,8 @@ def compute_gas_topup_amount(
         reason="GAS_TOPUP_REQUIRED",
         chain_key=ck,
         gas_coin_symbol=gas_coin_symbol,
+        gas_topup_mode=gas_topup_mode,
+        estimate_source=estimate_source,
         current_native_balance=current_balance,
         estimated_required_native=estimated_required,
         target_native_balance=target_balance,
@@ -286,6 +331,7 @@ def evaluate_collection_candidate(
     estimated_gas_usdt: Optional[Decimal] = None,
     min_collect_amount: Optional[Decimal] = None,
     reserve_amount: Decimal = Decimal("0"),
+    db=None,
 ) -> CollectionEvaluationResult:
     ck = _normalize_chain_key(chain_key)
     symbol = _normalize_symbol(coin_symbol)
@@ -319,8 +365,10 @@ def evaluate_collection_candidate(
     )
     gas_eval = compute_gas_topup_amount(
         chain_key=ck,
+        coin_symbol=symbol,
         current_native_balance=native_amount,
         estimated_required_native=gas_native,
+        db=db,
     )
 
     gas_required = bool(should_collect and collect_amount > 0 and token_amount > 0 and gas_eval.gas_required)
@@ -344,7 +392,12 @@ def evaluate_collection_candidate(
         min_collect_amount=min_collect_amount,
         estimated_gas_native=gas_native,
         estimated_gas_usdt=gas_usdt,
+        current_native_balance=gas_eval.current_native_balance,
+        estimated_required_native=gas_eval.estimated_required_native,
+        gas_target_balance=gas_eval.target_native_balance,
         gas_required=gas_required,
         gas_topup_amount=gas_eval.topup_amount if gas_required else Decimal("0"),
         gas_coin_symbol=gas_eval.gas_coin_symbol,
+        gas_topup_mode=gas_eval.gas_topup_mode,
+        estimate_source=gas_eval.estimate_source,
     )

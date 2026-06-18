@@ -69,9 +69,9 @@ export class StockMarketService extends BaseExternalService<StockMarketServiceCo
    * @param limit - 返回数据数量（默认100）
    * @returns K线数据列表
    */
-  async getKlines(symbol: string, interval: string, limit: number = 100): Promise<{ success: boolean; data?: any[] }> {
+  async getKlines(symbol: string, interval: string, limit: number = 100): Promise<{ success: boolean; data?: unknown[] }> {
     const path = this.formatUrl(`/klines/${symbol}/${interval}`, { limit });
-    const response = await this.request<any[]>(path);
+    const response = await this.request<unknown[]>(path);
     return response;
   }
 
@@ -82,9 +82,9 @@ export class StockMarketService extends BaseExternalService<StockMarketServiceCo
    * @param endDate - 结束日期（YYYY-MM-DD）
    * @returns 历史数据列表
    */
-  async getHistoricalData(symbol: string, startDate: string, endDate: string): Promise<{ success: boolean; data?: any[] }> {
+  async getHistoricalData(symbol: string, startDate: string, endDate: string): Promise<{ success: boolean; data?: unknown[] }> {
     const path = this.formatUrl(`/historical/${symbol}`, { startDate, endDate });
-    const response = await this.request<any[]>(path);
+    const response = await this.request<unknown[]>(path);
     return response;
   }
 
@@ -93,8 +93,8 @@ export class StockMarketService extends BaseExternalService<StockMarketServiceCo
    * @param symbol - 股票代码
    * @returns 股票基本信息
    */
-  async getCompanyProfile(symbol: string): Promise<{ success: boolean; data?: any }> {
-    const response = await this.request<any>(`/profile/${symbol}`);
+  async getCompanyProfile(symbol: string): Promise<{ success: boolean; data?: unknown }> {
+    const response = await this.request<unknown>(`/profile/${symbol}`);
     return response;
   }
 
@@ -104,9 +104,9 @@ export class StockMarketService extends BaseExternalService<StockMarketServiceCo
    * @param reportType - 报告类型（annual, quarterly）
    * @returns 财务数据
    */
-  async getFinancials(symbol: string, reportType: 'annual' | 'quarterly' = 'annual'): Promise<{ success: boolean; data?: any }> {
+  async getFinancials(symbol: string, reportType: 'annual' | 'quarterly' = 'annual'): Promise<{ success: boolean; data?: unknown }> {
     const path = this.formatUrl(`/financials/${symbol}`, { reportType });
-    const response = await this.request<any>(path);
+    const response = await this.request<unknown>(path);
     return response;
   }
 }

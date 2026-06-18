@@ -1,0 +1,17 @@
+[Unit]
+Description=Exchange contract accounting reconciliation scheduler
+After=network-online.target redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/exchange-web/backend
+EnvironmentFile=/opt/exchange-web/backend/.env
+User=exchange
+Group=exchange
+ExecStart=/opt/exchange-web/.venv/bin/python scripts/start_contract_accounting_reconciliation_scheduler.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

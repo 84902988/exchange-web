@@ -1,6 +1,17 @@
 import { createSlice, PayloadAction } from "@reduxjs/toolkit";
 import type { ApiAsset } from "@/types";
 
+type ApiAssetBalanceFields = ApiAsset & {
+  symbol?: string;
+  coin_symbol?: string;
+  chain_key?: string;
+  network_code?: string;
+  available?: unknown;
+  available_amount?: unknown;
+  frozen?: unknown;
+  frozen_amount?: unknown;
+};
+
 /**
  * 新系统的“资产概览”是从 /asset/balances 的列表推导出来的
  * （后端返回每行包含 available/frozen，类型多为 string）
@@ -28,11 +39,13 @@ function toNum(v: unknown): number {
 }
 
 function getSymbol(a: ApiAsset): string {
-  return String((a as any).symbol ?? (a as any).coin_symbol ?? "").toUpperCase();
+  const asset = a as ApiAssetBalanceFields;
+  return String(asset.symbol ?? asset.coin_symbol ?? "").toUpperCase();
 }
 
 function getChainKey(a: ApiAsset): string {
-  return String((a as any).chain_key ?? (a as any).network_code ?? "").toLowerCase();
+  const asset = a as ApiAssetBalanceFields;
+  return String(asset.chain_key ?? asset.network_code ?? "").toLowerCase();
 }
 
 function calcOverview(items: ApiAsset[]): ApiAssetOverview {
@@ -41,8 +54,9 @@ function calcOverview(items: ApiAsset[]): ApiAssetOverview {
 
   for (const it of items) {
     // 新字段 available/frozen，老字段 available_amount/frozen_amount
-    available += toNum((it as any).available ?? (it as any).available_amount ?? 0);
-    frozen += toNum((it as any).frozen ?? (it as any).frozen_amount ?? 0);
+    const asset = it as ApiAssetBalanceFields;
+    available += toNum(asset.available ?? asset.available_amount ?? 0);
+    frozen += toNum(asset.frozen ?? asset.frozen_amount ?? 0);
   }
 
   return {

@@ -7,6 +7,9 @@ import { useAuth } from '@/lib/authContext';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import UserAvatar from '@/components/user/UserAvatar';
 import { getUserDisplayName } from '@/lib/userAvatar';
+import enTranslations from '@/config/locales/en.json';
+
+const DEFAULT_COMMON_TRANSLATIONS = (enTranslations as { common: Record<string, string> }).common;
 
 export default function UserDropdown() {
   const router = useRouter();
@@ -14,7 +17,13 @@ export default function UserDropdown() {
   const { t } = useLocaleContext();
 
   const [open, setOpen] = useState(false);
+  const [mounted, setMounted] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setMounted(true), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     const onDocMouseDown = (e: MouseEvent) => {
@@ -28,6 +37,7 @@ export default function UserDropdown() {
   const displayName = getUserDisplayName(user) || `UID: ${user?.id ?? '-'}`;
   const emailText = (user?.email || '').trim();
   const secondaryText = emailText && emailText !== displayName ? emailText : user?.id ? `UID: ${user.id}` : '';
+  const menuT = (key: string) => (mounted ? t(key, 'common') : DEFAULT_COMMON_TRANSLATIONS[key] || key);
 
   const handleLogout = async () => {
     try {
@@ -44,7 +54,7 @@ export default function UserDropdown() {
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="grid h-9 w-9 place-items-center rounded-full border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
-        aria-label={t('userMenu', 'common')}
+        aria-label={menuT('userMenu')}
       >
         <UserAvatar user={user} className="h-8 w-8" fallbackClassName="text-sm" />
       </button>
@@ -56,7 +66,7 @@ export default function UserDropdown() {
               <UserAvatar user={user} className="h-10 w-10" fallbackClassName="text-base" />
               <div className="min-w-0">
                 <div className="text-white font-semibold truncate">
-                  {displayName || t('user', 'common')}
+                  {displayName || menuT('user')}
                 </div>
                 {secondaryText ? <div className="text-white/50 text-xs truncate">{secondaryText}</div> : null}
               </div>
@@ -69,7 +79,7 @@ export default function UserDropdown() {
               onClick={() => setOpen(false)}
               className="flex items-center justify-between px-4 py-2 text-sm text-white/85 hover:bg-white/10 transition-colors"
             >
-              {t('personalCenter', 'common')}
+              {menuT('personalCenter')}
               <span className="text-white/40">{'>'}</span>
             </Link>
 
@@ -78,7 +88,7 @@ export default function UserDropdown() {
               onClick={() => setOpen(false)}
               className="flex items-center justify-between px-4 py-2 text-sm text-white/85 hover:bg-white/10 transition-colors"
             >
-              {t('assets', 'common')}
+              {menuT('assets')}
               <span className="text-white/40">{'>'}</span>
             </Link>
 
@@ -87,7 +97,7 @@ export default function UserDropdown() {
               onClick={() => setOpen(false)}
               className="flex items-center justify-between px-4 py-2 text-sm text-white/85 hover:bg-white/10 transition-colors"
             >
-              {t('notifications', 'common')}
+              {menuT('notifications')}
               <span className="text-white/40">{'>'}</span>
             </Link>
           </div>
@@ -98,7 +108,7 @@ export default function UserDropdown() {
               onClick={handleLogout}
               className="w-full h-10 rounded-lg bg-white/10 hover:bg-white/15 text-white font-semibold transition-colors"
             >
-              {t('logout', 'common')}
+              {menuT('logout')}
             </button>
           </div>
         </div>

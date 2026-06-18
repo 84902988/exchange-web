@@ -379,4 +379,5 @@ def confirm_collection_candidate_onchain(
         estimated_gas_native=estimated_gas_native,
         estimated_gas_usdt=estimated_gas_usdt,
         min_collect_amount=min_collect_amount,
+        db=db,
     )

@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.services.moralis_signature import verify_signature
 from app.services.balance import FUNDING_BALANCE_CHAIN_KEY, credit_available
+from app.services.deposit_status_service import mark_deposit_confirmed
 from app.db.models.asset import Deposit
 from app.db.models.stock_token_lock_config import StockTokenLockConfig
 from app.services.stock_token_lock_service import (
@@ -849,19 +850,31 @@ async def _moralis_webhook_impl(request: Request, db: Session) -> Dict[str, Any]
                             log_index=log_index,
                             from_address=from_addr if is_exact_address_chain else from_addr.lower(),
                             amount=amount,
-                            status="CONFIRMED" if is_confirmed else "DETECTING",
+                            status="DETECTING",
                             confirmations=confirm_required if is_confirmed else 0,
                             confirm_required=confirm_required,
                             created_at=now,
                             updated_at=now,
                         )
+                        if is_confirmed:
+                            mark_deposit_confirmed(
+                                dep,
+                                status="CONFIRMED",
+                                confirmations=confirm_required,
+                                confirm_required=confirm_required,
+                                confirmed_at=now,
+                            )
                         db.add(dep)
                         db.flush()
                     else:
-                        if is_confirmed and dep.status != "CONFIRMED":
-                            dep.status = "CONFIRMED"
-                            dep.confirmations = confirm_required
-                            dep.updated_at = now
+                        if is_confirmed:
+                            mark_deposit_confirmed(
+                                dep,
+                                status="CONFIRMED",
+                                confirmations=confirm_required,
+                                confirm_required=confirm_required,
+                                confirmed_at=now,
+                            )
 
                 handled += 1
 

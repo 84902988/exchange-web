@@ -6,8 +6,20 @@ import Image from 'next/image';
 // 移除motion库导入，使用CSS动画替代
 
 const CommitteePage: React.FC = () => {
-  const { t, locale, translations } = useLocale();
-  const [selectedMember, setSelectedMember] = React.useState<any>(null);
+  const { t, translations } = useLocale();
+  type CommitteeIllustration = {
+    src: string;
+    aspect?: '1/1' | '16/9' | string;
+  };
+  type CommitteeMember = {
+    name: string;
+    position: string;
+    image?: string;
+    illustration?: string;
+    illustrations?: CommitteeIllustration[];
+    bio: string;
+  };
+  const [selectedMember, setSelectedMember] = React.useState<CommitteeMember | null>(null);
   const [isModalOpen, setIsModalOpen] = React.useState(false);
   
   React.useEffect(() => {
@@ -25,11 +37,13 @@ const CommitteePage: React.FC = () => {
   }, [isModalOpen]);
 
   // 获取本地化的成员数据
-  const members = Array.isArray(translations.committee.members) ? translations.committee.members : [];
+  const members: CommitteeMember[] = Array.isArray(translations.committee.members)
+    ? translations.committee.members as CommitteeMember[]
+    : [];
   const memberPlaceholder = t('memberPlaceholder', 'committee');
 
   // 打开弹窗
-  const openModal = (member: any) => {
+  const openModal = (member: CommitteeMember) => {
     setSelectedMember(member);
     setIsModalOpen(true);
   };
@@ -62,7 +76,7 @@ const CommitteePage: React.FC = () => {
         {/* 成员展示区域 */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 max-w-7xl mx-auto">
           {/* 动态渲染成员卡片 */}
-          {members.map((member: any, index: number) => (
+          {members.map((member: CommitteeMember, index: number) => (
             <div key={index} className="space-y-4 w-[85%] mx-auto">
               {/* 图片卡片 - 外框与图片尺寸相同 */}
               <div className="relative aspect-[4/5] w-full cursor-pointer overflow-hidden group" onClick={() => openModal(member)}>
@@ -151,7 +165,7 @@ const CommitteePage: React.FC = () => {
                     {/* 新增修改-2026.1.20-人物详情卡内多图或图集*/}
                     {Array.isArray(selectedMember.illustrations) && (
                       <div className="space-y-6">
-                        {selectedMember.illustrations.map((img: any, i: number) => (
+                        {selectedMember.illustrations.map((img: CommitteeIllustration, i: number) => (
                         <div
                           key={i}
                           className={`relative w-full overflow-hidden rounded-lg ${

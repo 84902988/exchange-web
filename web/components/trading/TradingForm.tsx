@@ -1,5 +1,5 @@
 'use client';
-import React, { useState, useEffect } from 'react';
+import React, { useMemo, useState } from 'react';
 import useLocale from '@/hooks/useLocale';
 
 /**
@@ -65,9 +65,6 @@ const TradingForm: React.FC<TradingFormProps> = ({ assetData }) => {
   /** 订单数量 */
   const [amount, setAmount] = useState('');
   
-  /** 订单总金额 */
-  const [total, setTotal] = useState('0.00');
-  
   /** 杠杆倍数 */
   const [leverage, setLeverage] = useState('20x');
 
@@ -75,7 +72,7 @@ const TradingForm: React.FC<TradingFormProps> = ({ assetData }) => {
    * 计算订单总金额
    * @description 根据价格和数量计算订单总金额，并格式化显示
    */
-  const calculateTotal = () => {
+  const total = useMemo(() => {
     // 清除价格中的逗号，转换为数字
     const cleanedPrice = parseFloat(price.replace(/,/g, ''));
     // 将数量转换为数字
@@ -85,18 +82,9 @@ const TradingForm: React.FC<TradingFormProps> = ({ assetData }) => {
     if (!isNaN(cleanedPrice) && !isNaN(cleanedAmount)) {
       const calculatedTotal = cleanedPrice * cleanedAmount;
       // 格式化总金额，保留两位小数
-      setTotal(calculatedTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
-    } else {
-      setTotal('0.00');
+      return calculatedTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     }
-  };
-
-  /**
-   * 监听价格和数量变化，重新计算总金额
-   * @description 当价格或数量改变时，自动更新总金额
-   */
-  useEffect(() => {
-    calculateTotal();
+    return '0.00';
   }, [price, amount]);
 
   /**

@@ -139,7 +139,7 @@ export function formatOrderType(value: string, t?: ContractTranslator) {
 }
 
 export function formatContractOrderStatus(status: string, filledQuantity = 0, t?: ContractTranslator) {
-  if (status === 'OPEN' || status === 'NEW') return t ? t('orderStatusPendingFill', 'contracts') : status;
+  if (status === 'OPEN' || status === 'NEW' || status === 'PENDING') return t ? t('orderStatusPendingFill', 'contracts') : status;
   if (status === 'PARTIALLY_FILLED') return t ? t('orderStatusPartiallyFilled', 'contracts') : status;
   if (status === 'FILLED') return t ? t('orderStatusFilled', 'contracts') : status;
   if (status === 'CANCELED' || status === 'CANCELLED') {
@@ -157,7 +157,7 @@ function actionBadgeClassName(tone?: 'green' | 'red') {
 }
 
 function statusClassName(value: string) {
-  if (value === 'OPEN' || value === 'NEW') return 'border-[#177ddc]/30 bg-[#177ddc]/12 text-[#69c0ff]';
+  if (value === 'OPEN' || value === 'NEW' || value === 'PENDING') return 'border-[#177ddc]/30 bg-[#177ddc]/12 text-[#69c0ff]';
   if (value === 'PARTIALLY_FILLED') return 'border-[#f0b90b]/30 bg-[#f0b90b]/12 text-[#f0b90b]';
   if (value === 'FILLED') return 'border-[#00c087]/30 bg-[#00c087]/12 text-[#00c087]';
   if (value === 'CANCELED' || value === 'CANCELLED') return 'border-white/10 bg-white/[0.04] text-white/55';

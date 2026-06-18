@@ -13,11 +13,50 @@
     .deposit-quick-ranges{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px;}
     .deposit-quick-ranges .active{background:var(--brand-soft);border-color:rgba(189,52,25,.35);color:#fff;}
     .deposit-time-hint{margin-top:6px;color:rgba(255,255,255,.46);font-size:12px;line-height:1.45;}
+    .deposit-records-wrap{overflow-x:hidden;}
+    .deposit-records-table{width:100%;table-layout:fixed;font-size:12px;}
+    .deposit-records-table th,
+    .deposit-records-table td{padding:6px 8px;line-height:1.25;vertical-align:middle;}
+    .deposit-records-table thead th{position:sticky;top:0;z-index:1;background:#15171d;}
+    .deposit-records-table tbody tr{min-height:42px;}
+    .deposit-col-id{width:46px;}
+    .deposit-col-user{width:94px;}
+    .deposit-col-asset{width:86px;}
+    .deposit-col-amount{width:82px;}
+    .deposit-col-status{width:92px;}
+    .deposit-col-hash{width:146px;}
+    .deposit-col-address{width:146px;}
+    .deposit-col-time{width:122px;}
+    .deposit-col-action{width:98px;}
+    .deposit-stack{display:flex;flex-direction:column;gap:3px;min-width:0;}
+    .deposit-stack-main{font-weight:700;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .deposit-stack-sub{color:rgba(255,255,255,.58);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .deposit-time-line{display:block;color:rgba(255,255,255,.72);white-space:nowrap;}
+    .deposit-time-line + .deposit-time-line{margin-top:3px;}
+    .deposit-time-label{color:rgba(255,255,255,.45);}
+    .deposit-copy-cell{display:inline-flex;align-items:center;gap:4px;max-width:100%;}
+    .deposit-copy-text{display:inline-block;min-width:0;max-width:108px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .deposit-copy-btn{width:20px;height:20px;border:1px solid rgba(148,163,184,.28);background:#171a21;color:#d1d5db;border-radius:5px;padding:0;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;flex:0 0 auto;font-size:10px;line-height:1;}
+    .deposit-copy-btn:hover{border-color:rgba(147,197,253,.45);color:#bfdbfe;background:#1b2230;}
+    .deposit-copy-btn.is-copied{border-color:rgba(74,222,128,.45);color:#86efac;background:rgba(22,101,52,.18);}
+    .deposit-flash{margin:0 0 12px;padding:10px 12px;border-radius:8px;font-size:13px;line-height:1.6;}
+    .deposit-flash.notice{border:1px solid rgba(74,222,128,.30);background:rgba(22,101,52,.16);color:#bbf7d0;}
+    .deposit-flash.error{border:1px solid rgba(248,113,113,.35);background:rgba(127,29,29,.18);color:#fecaca;}
+    .deposit-row-actions{display:flex;align-items:center;gap:8px;white-space:nowrap;}
+    .deposit-recheck-form{margin:0;}
+    .deposit-recheck-btn{border:1px solid rgba(147,197,253,.35);background:rgba(30,64,175,.20);color:#bfdbfe;border-radius:7px;padding:5px 8px;font-size:12px;line-height:1.15;cursor:pointer;white-space:normal;text-align:center;}
+    .deposit-recheck-btn:hover{border-color:rgba(147,197,253,.65);background:rgba(37,99,235,.28);color:#eff6ff;}
   </style>
   <section class="page-section">
     <div class="filter-card">
       <div class="section-title">筛选条件</div>
       <div class="deposit-policy">{{ large_table_notice }}</div>
+      {% if notice %}
+        <div class="deposit-flash notice">{{ notice }}</div>
+      {% endif %}
+      {% if error %}
+        <div class="deposit-flash error">{{ error }}</div>
+      {% endif %}
       {% if query_notice %}
         <div class="deposit-policy warning">{{ query_notice }}</div>
       {% endif %}
@@ -89,22 +128,19 @@
       <div class="section-title">充值记录列表</div>
 
       {% if items %}
-        <div class="table-wrap admin-table-wrap">
-          <table class="data-table admin-table">
+        <div class="table-wrap admin-table-wrap deposit-records-wrap">
+          <table class="data-table admin-table deposit-records-table">
             <thead>
               <tr>
-                <th>ID</th>
-                <th>用户ID</th>
-                <th class="nowrap">币种</th>
-                <th class="nowrap">网络</th>
-                <th class="text-right">数量</th>
-                <th class="nowrap">状态</th>
-                <th class="nowrap">确认数</th>
-                <th>TxID</th>
-                <th>来源地址</th>
-                <th>充值地址</th>
-                <th class="nowrap">创建时间</th>
-                <th class="nowrap">确认时间</th>
+                <th class="deposit-col-id">ID</th>
+                <th class="deposit-col-user">用户ID</th>
+                <th class="deposit-col-asset">资产</th>
+                <th class="deposit-col-amount text-right">数量</th>
+                <th class="deposit-col-status nowrap">状态</th>
+                <th class="deposit-col-hash">TxID</th>
+                <th class="deposit-col-address">充值地址</th>
+                <th class="deposit-col-time nowrap">时间</th>
+                <th class="deposit-col-action nowrap">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -112,20 +148,55 @@
                 <tr>
                   <td class="admin-id">{{ item.id }}</td>
                   <td class="admin-id">{{ item.user_id }}</td>
-                  <td class="mono nowrap">{{ item.coin_symbol }}</td>
-                  <td class="mono nowrap">{{ item.chain_key }}</td>
-                  <td class="admin-amount">{{ item.amount }}</td>
-                  <td>
-                    <span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">
-                      {{ item.status_label }}
+                  <td class="mono">
+                    <span class="deposit-stack" title="{{ item.coin_symbol }} / {{ item.chain_key }}">
+                      <span class="deposit-stack-main">{{ item.coin_symbol }}</span>
+                      <span class="deposit-stack-sub">{{ item.chain_key }}</span>
                     </span>
                   </td>
-                  <td class="nowrap">{{ item.confirmations }} / {{ item.confirm_required }}</td>
-                  <td class="admin-hash" title="{{ item.txid }}">{{ item.txid_short }}</td>
-                  <td class="admin-address" title="{{ item.from_address }}">{{ item.from_address_short }}</td>
-                  <td class="admin-address" title="{{ item.address }}">{{ item.address_short }}</td>
-                  <td class="nowrap">{{ item.created_at }}</td>
-                  <td class="nowrap">{{ item.confirmed_at }}</td>
+                  <td class="admin-amount">{{ item.amount }}</td>
+                  <td>
+                    <span class="deposit-stack" title="{{ item.status }}，确认数 {{ item.confirmations }} / {{ item.confirm_required }}">
+                      <span>
+                        <span class="admin-badge admin-badge-{{ item.status_badge }}">
+                          {{ item.status_label }}
+                        </span>
+                      </span>
+                      <span class="deposit-stack-sub">{{ item.confirmations }} / {{ item.confirm_required }}</span>
+                    </span>
+                  </td>
+                  <td class="admin-hash" title="{{ item.txid }}">
+                    <span class="deposit-copy-cell">
+                      <span class="deposit-copy-text">{{ item.txid_short }}</span>
+                      {% if item.txid %}
+                        <button type="button" class="deposit-copy-btn" data-copy="{{ item.txid }}" title="复制完整 TxID" aria-label="复制完整 TxID">copy</button>
+                      {% endif %}
+                    </span>
+                  </td>
+                  <td class="admin-address" title="充值地址: {{ item.address }}&#10;来源地址: {{ item.from_address or '--' }}">
+                    <span class="deposit-copy-cell">
+                      <span class="deposit-copy-text">{{ item.address_short }}</span>
+                      {% if item.address %}
+                        <button type="button" class="deposit-copy-btn" data-copy="{{ item.address }}" title="复制充值地址" aria-label="复制充值地址">copy</button>
+                      {% endif %}
+                    </span>
+                  </td>
+                  <td class="nowrap" title="创建时间: {{ item.created_at }}&#10;确认时间: {{ item.confirmed_at or '--' }}">
+                    <span class="deposit-time-line"><span class="deposit-time-label">创建</span> {% if item.created_at and item.created_at != '--' %}{{ item.created_at[5:16] }}{% else %}--{% endif %}</span>
+                    <span class="deposit-time-line"><span class="deposit-time-label">确认</span> {% if item.confirmed_at and item.confirmed_at != '--' %}{{ item.confirmed_at[5:16] }}{% else %}--{% endif %}</span>
+                  </td>
+                  <td>
+                    <div class="deposit-row-actions">
+                      {% if item.can_recheck_chain_confirmation %}
+                        <form class="deposit-recheck-form" method="post" action="/admin/deposit-records/{{ item.id }}/recheck-chain-confirmation">
+                          <input type="hidden" name="next_path" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}" />
+                          <button type="submit" class="deposit-recheck-btn">重查链上确认</button>
+                        </form>
+                      {% else %}
+                        <span class="muted">--</span>
+                      {% endif %}
+                    </div>
+                  </td>
                 </tr>
               {% endfor %}
             </tbody>
@@ -154,4 +225,47 @@
       </div>
     </div>
   </section>
+  <script>
+    (function(){
+      function fallbackCopy(value){
+        var textarea = document.createElement("textarea");
+        textarea.value = value;
+        textarea.setAttribute("readonly", "readonly");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand("copy");
+        } finally {
+          document.body.removeChild(textarea);
+        }
+      }
+
+      document.querySelectorAll("[data-copy]").forEach(function(button){
+        button.addEventListener("click", function(){
+          var value = button.getAttribute("data-copy") || "";
+          if(!value){ return; }
+          var done = function(){
+            var original = button.textContent;
+            button.textContent = "ok";
+            button.classList.add("is-copied");
+            window.setTimeout(function(){
+              button.textContent = original || "copy";
+              button.classList.remove("is-copied");
+            }, 1000);
+          };
+          if(navigator.clipboard && navigator.clipboard.writeText){
+            navigator.clipboard.writeText(value).then(done).catch(function(){
+              fallbackCopy(value);
+              done();
+            });
+            return;
+          }
+          fallbackCopy(value);
+          done();
+        });
+      });
+    })();
+  </script>
 {% endblock %}

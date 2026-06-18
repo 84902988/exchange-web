@@ -35,6 +35,25 @@ def _get_cookie_token(request: Request) -> Optional[str]:
     return token or None
 
 
+def get_optional_current_user_id(request: Request) -> Optional[int]:
+    token = _get_bearer_token(request) or _get_cookie_token(request)
+    if not token:
+        return None
+    try:
+        payload = decode_token(token, audience="user")
+    except JWTError:
+        return None
+    if payload.get("type") != "access":
+        return None
+    sub = payload.get("sub")
+    if not sub:
+        return None
+    try:
+        return int(sub)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_current_user_id(request: Request, db: Session = Depends(get_db)) -> str:
     """
     ✅ 同时支持两种鉴权来源：

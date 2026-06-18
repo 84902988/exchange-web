@@ -13,6 +13,8 @@ export type Announcement = {
   is_pinned?: boolean;
   status?: string;
   publish_at?: string | null;
+  is_read?: boolean | null;
+  read_at?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
 };

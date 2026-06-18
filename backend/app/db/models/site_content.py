@@ -36,6 +36,8 @@ class SiteSettings(Base):
     home_hero_cta_text_i18n: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     home_hero_cta_link: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     home_hero_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    about_page_sections_i18n: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    legal_pages_i18n: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     show_risk_link: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     risk_link_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     show_terms_link: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

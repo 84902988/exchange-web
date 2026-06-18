@@ -609,6 +609,7 @@ class ItickMarketService:
             volume_number = self._to_quote_number(volume)
             latest_number = self._to_quote_number(latest_price)
             if volume_number is not None and latest_number is not None:
+                # iTick may omit quote turnover; estimate quote turnover from latest price and base volume.
                 quote_volume = volume_number * latest_number
 
         self._set_quote_default(enriched, ["latest_price", "price"], latest_price)

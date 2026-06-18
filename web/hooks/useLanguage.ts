@@ -11,7 +11,9 @@ export function useLanguage() {
   const [currentLanguage, setCurrentLanguageState] = useState(DEFAULT_LANGUAGE);
 
   useEffect(() => {
-    setCurrentLanguageState(getCurrentLanguage());
+    const timer = window.setTimeout(() => {
+      setCurrentLanguageState(getCurrentLanguage());
+    }, 0);
 
     const handleLanguageChanged = (event: LanguageChangedEvent) => {
       setCurrentLanguageState(event.detail);
@@ -19,6 +21,7 @@ export function useLanguage() {
 
     window.addEventListener("languageChanged", handleLanguageChanged as EventListener);
     return () => {
+      window.clearTimeout(timer);
       window.removeEventListener("languageChanged", handleLanguageChanged as EventListener);
     };
   }, []);

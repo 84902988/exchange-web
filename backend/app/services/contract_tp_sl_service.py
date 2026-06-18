@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.contract_position import ContractPosition
 from app.db.models.contract_symbol import ContractSymbol
+from app.db.models.contract_trade import ContractTrade
 from app.schemas.contract_order import ContractCloseOrderRequest
 from app.services.contract_liquidation_service import _risk_from_mark_price
 from app.services.contract_market_guard import ContractQuoteNotLive, require_executable_contract_quote
@@ -21,6 +22,7 @@ from app.services.contract_order_service import (
     ContractPositionNotOpen,
     close_contract_position,
 )
+from app.services.contract_private_ws import publish_contract_user_updates
 
 logger = logging.getLogger(__name__)
 TP_SL_TRIGGER_MARK_PRICE = "MARK_PRICE"
@@ -103,6 +105,26 @@ def _quote_last_price(quote: dict[str, Any]) -> Decimal:
     return _q18(quote.get("price"))
 
 
+def _quote_bid_ask_mid_price(quote: dict[str, Any]) -> Decimal:
+    bid_price = _q18(quote.get("bid_price"))
+    ask_price = _q18(quote.get("ask_price"))
+    if bid_price > 0 and ask_price > 0:
+        return (bid_price + ask_price) / Decimal("2")
+    return Decimal("0")
+
+
+def _is_last_price_detached_from_quote(quote: dict[str, Any], last_price: Decimal, mark_price: Decimal) -> bool:
+    if last_price <= 0:
+        return False
+    reference_price = _quote_bid_ask_mid_price(quote)
+    if reference_price <= 0:
+        reference_price = mark_price
+    if reference_price <= 0:
+        return False
+    tolerance = max(reference_price * Decimal("0.05"), Decimal("0.00000001"))
+    return abs(last_price - reference_price) > tolerance
+
+
 def _tp_sl_trigger_price_from_quote(
     quote: dict[str, Any],
     mark_price: Decimal,
@@ -114,9 +136,35 @@ def _tp_sl_trigger_price_from_quote(
     if normalized_type == TP_SL_TRIGGER_LAST_PRICE:
         last_price = _quote_last_price(quote)
         if last_price > 0:
+            if _is_last_price_detached_from_quote(quote, last_price, mark_price):
+                fallback_price = mark_price if mark_price > 0 else _quote_bid_ask_mid_price(quote)
+                if fallback_price > 0:
+                    _log_detached_last_price_fallback(
+                        symbol=symbol,
+                        last_price=last_price,
+                        fallback_price=fallback_price,
+                    )
+                    return fallback_price, True
             return last_price, False
         _log_last_price_fallback(symbol=symbol, mark_price=mark_price)
     return mark_price, normalized_type == TP_SL_TRIGGER_LAST_PRICE
+
+
+def _log_detached_last_price_fallback(*, symbol: Any, last_price: Decimal, fallback_price: Decimal) -> None:
+    normalized_symbol = str(symbol or "").strip().upper() or "-"
+    key = ("detached_last_price_fallback", normalized_symbol, "")
+    now = time.monotonic()
+    last_at = _tp_sl_scan_log_last_at.get(key)
+    if last_at is not None and now - last_at < _TP_SL_SCAN_LOG_COOLDOWN_SECONDS:
+        return
+    _tp_sl_scan_log_last_at[key] = now
+    logger.warning(
+        "contract_tp_sl_last_price_detached_fallback symbol=%s trigger_price_type=%s last_price=%s fallback_price=%s",
+        normalized_symbol,
+        TP_SL_TRIGGER_LAST_PRICE,
+        _fmt_decimal(last_price),
+        _fmt_decimal(fallback_price),
+    )
 
 
 def _log_last_price_fallback(*, symbol: Any, mark_price: Decimal) -> None:
@@ -175,6 +223,57 @@ def _log_scan_symbol(
     )
 
 
+def _log_scan_position_decision(
+    *,
+    level: int,
+    event: str,
+    position: ContractPosition,
+    trigger_price_type: str,
+    trigger_price: Any,
+    mark_price: Any,
+    last_price: Any,
+    quote: Optional[dict[str, Any]],
+    decision: str,
+    reason: str = "-",
+) -> None:
+    position_id = str(getattr(position, "id", "") or "-")
+    normalized_symbol = str(getattr(position, "symbol", "") or "").strip().upper() or "-"
+    normalized_event = str(event or "decision")
+    normalized_decision = str(decision or "none")
+    normalized_reason = str(reason or "-")
+    key = (normalized_event, normalized_symbol, position_id)
+    now = time.monotonic()
+    last_at = _tp_sl_scan_log_last_at.get(key)
+    if level <= logging.DEBUG and last_at is not None and now - last_at < _TP_SL_SCAN_LOG_COOLDOWN_SECONDS:
+        return
+    _tp_sl_scan_log_last_at[key] = now
+    logger.log(
+        level,
+        "contract_tp_sl_scan_position event=%s position_id=%s symbol=%s user_id=%s side=%s status=%s "
+        "quantity=%s trigger_price_type=%s trigger_price=%s mark_price=%s last_price=%s bid_price=%s ask_price=%s "
+        "take_profit_price=%s stop_loss_price=%s decision=%s reason=%s quote_source=%s quote_freshness=%s",
+        normalized_event,
+        getattr(position, "id", None),
+        normalized_symbol,
+        getattr(position, "user_id", None),
+        getattr(position, "side", None),
+        getattr(position, "status", None),
+        _fmt_decimal(getattr(position, "quantity", None)),
+        normalize_tp_sl_trigger_price_type(trigger_price_type),
+        _fmt_decimal(trigger_price) if trigger_price is not None else "-",
+        _fmt_decimal(mark_price) if mark_price is not None else "-",
+        _fmt_decimal(last_price) if last_price is not None else "-",
+        quote.get("bid_price") if quote else None,
+        quote.get("ask_price") if quote else None,
+        _fmt_decimal(position.take_profit_price) if position.take_profit_price is not None else "-",
+        _fmt_decimal(position.stop_loss_price) if position.stop_loss_price is not None else "-",
+        normalized_decision,
+        normalized_reason,
+        quote.get("source") if quote else None,
+        quote.get("quote_freshness") if quote else None,
+    )
+
+
 def _normalize_position_side(value: Any) -> str:
     normalized = str(value or "").strip().upper()
     if normalized in {"LONG", "SHORT"}:
@@ -187,6 +286,7 @@ def _normalize_position_side(value: Any) -> str:
 
 
 def _get_executable_tp_sl_quote(db: Session, position: ContractPosition) -> dict[str, Any]:
+    quote: Optional[dict[str, Any]] = None
     try:
         quote = get_contract_quote(db, str(position.symbol), log_context="tp_sl_scanner")
         require_executable_contract_quote(
@@ -197,8 +297,30 @@ def _get_executable_tp_sl_quote(db: Session, position: ContractPosition) -> dict
             user_id=getattr(position, "user_id", None),
         )
     except ContractQuoteNotLive as exc:
+        logger.warning(
+            "contract_tp_sl_quote_not_live position_id=%s symbol=%s user_id=%s source=%s "
+            "quote_freshness=%s bid_price=%s ask_price=%s last_price=%s mark_price=%s reason=%s",
+            getattr(position, "id", None),
+            getattr(position, "symbol", None),
+            getattr(position, "user_id", None),
+            quote.get("source") if quote else None,
+            quote.get("quote_freshness") if quote else None,
+            quote.get("bid_price") if quote else None,
+            quote.get("ask_price") if quote else None,
+            quote.get("last_price") if quote else None,
+            quote.get("mark_price") if quote else None,
+            "CONTRACT_QUOTE_NOT_LIVE",
+        )
         raise ContractTpSlNotTriggered("CONTRACT_QUOTE_NOT_LIVE") from exc
     except Exception as exc:
+        logger.warning(
+            "contract_tp_sl_quote_unavailable position_id=%s symbol=%s user_id=%s reason=%s error=%s",
+            getattr(position, "id", None),
+            getattr(position, "symbol", None),
+            getattr(position, "user_id", None),
+            "CONTRACT_QUOTE_UNAVAILABLE",
+            exc,
+        )
         raise ContractTpSlNotTriggered("CONTRACT_QUOTE_UNAVAILABLE") from exc
     return quote
 
@@ -267,21 +389,108 @@ def execute_contract_tp_sl(
         trigger_price_type,
         symbol=position.symbol,
     )
+    last_price = _quote_last_price(quote)
     trigger_type = _detect_tp_sl_trigger(position, trigger_price)
     if trigger_type is None:
+        _log_scan_position_decision(
+            level=logging.DEBUG,
+            event="decision",
+            position=position,
+            trigger_price_type=trigger_price_type,
+            trigger_price=trigger_price,
+            mark_price=mark_price,
+            last_price=last_price,
+            quote=quote,
+            decision="none",
+            reason="TP_SL_NOT_TRIGGERED",
+        )
         raise ContractTpSlNotTriggered("TP_SL_NOT_TRIGGERED")
 
-    response = close_contract_position(
-        db,
-        int(position.user_id),
-        ContractCloseOrderRequest(
-            position_id=int(position.id),
-            order_type="MARKET",
-            price=None,
-            quantity=None,
-        ),
-        close_reason=trigger_type,
-        quote_override=quote,
+    _log_scan_position_decision(
+        level=logging.INFO,
+        event="hit",
+        position=position,
+        trigger_price_type=trigger_price_type,
+        trigger_price=trigger_price,
+        mark_price=mark_price,
+        last_price=last_price,
+        quote=quote,
+        decision=trigger_type,
+    )
+    logger.info(
+        "contract_tp_sl_trigger_detected position_id=%s symbol=%s user_id=%s side=%s "
+        "trigger_type=%s trigger_price_type=%s trigger_price=%s mark_price=%s last_price=%s "
+        "take_profit_price=%s stop_loss_price=%s quote_source=%s quote_freshness=%s",
+        getattr(position, "id", None),
+        getattr(position, "symbol", None),
+        getattr(position, "user_id", None),
+        getattr(position, "side", None),
+        trigger_type,
+        trigger_price_type,
+        _fmt_decimal(trigger_price),
+        _fmt_decimal(mark_price),
+        _fmt_decimal(last_price),
+        _fmt_decimal(position.take_profit_price) if position.take_profit_price is not None else "-",
+        _fmt_decimal(position.stop_loss_price) if position.stop_loss_price is not None else "-",
+        quote.get("source"),
+        quote.get("quote_freshness"),
+    )
+
+    try:
+        response = close_contract_position(
+            db,
+            int(position.user_id),
+            ContractCloseOrderRequest(
+                position_id=int(position.id),
+                order_type="MARKET",
+                price=None,
+                quantity=None,
+            ),
+            close_reason=trigger_type,
+            quote_override=quote,
+        )
+    except ContractOrderError as exc:
+        _log_scan_position_decision(
+            level=logging.WARNING,
+            event="close_failed",
+            position=position,
+            trigger_price_type=trigger_price_type,
+            trigger_price=trigger_price,
+            mark_price=mark_price,
+            last_price=last_price,
+            quote=quote,
+            decision=trigger_type,
+            reason=_error_code(exc),
+        )
+        raise
+    close_trade = (
+        db.query(ContractTrade)
+        .filter(ContractTrade.order_id == int(response.order_id))
+        .order_by(ContractTrade.id.desc())
+        .first()
+    )
+    closed_position = db.query(ContractPosition).filter(ContractPosition.id == int(position.id)).first()
+    logger.info(
+        "contract_tp_sl_close_succeeded position_id=%s symbol=%s user_id=%s trigger_type=%s "
+        "trigger_price_type=%s trigger_price=%s close_order_id=%s trade_id=%s status=%s closed_at=%s",
+        getattr(position, "id", None),
+        getattr(position, "symbol", None),
+        getattr(position, "user_id", None),
+        trigger_type,
+        trigger_price_type,
+        _fmt_decimal(trigger_price),
+        response.order_id,
+        getattr(close_trade, "id", None),
+        response.status,
+        getattr(closed_position, "closed_at", None),
+    )
+    publish_contract_user_updates(
+        user_id=int(position.user_id),
+        symbols=[str(position.symbol)],
+        position_ids=[int(position.id)],
+        order_ids=[int(response.order_id)],
+        trade_ids=[int(close_trade.id)] if close_trade is not None else None,
+        include_account=True,
     )
     return ContractTpSlExecutionResult(
         position_id=int(position.id),

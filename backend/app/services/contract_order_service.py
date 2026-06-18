@@ -24,7 +24,7 @@ from app.schemas.contract_order import (
     ContractOpenOrderRequest,
     ContractOrderResponse,
 )
-from app.services.contract_balance_log_service import add_contract_balance_log
+from app.services.contract_balance_log_service import add_contract_balance_log, add_contract_margin_log
 from app.services.contract_market_guard import (
     CONTRACT_QUOTE_NOT_LIVE,
     ContractQuoteNotLive,
@@ -33,6 +33,7 @@ from app.services.contract_market_guard import (
     should_log_contract_quote_skip,
 )
 from app.services.contract_market_service import get_contract_depth, get_contract_quote
+from app.services.contract_private_ws import publish_contract_user_updates
 
 
 logger = logging.getLogger(__name__)
@@ -108,15 +109,23 @@ def _fmt_decimal(value: Any) -> str:
 
 
 def _quote_spread_x(quote: dict[str, Any], fallback: Any = None) -> Decimal:
-    spread_x = _q18(quote.get("spread_x", fallback))
-    if spread_x < Decimal("0"):
+    if quote.get("single_side_spread_fee_price") is not None:
+        single_side_price = _q18(quote.get("single_side_spread_fee_price"))
+    elif quote.get("effective_total_spread") is not None:
+        single_side_price = _q18(quote.get("effective_total_spread")) / Decimal("2")
+    elif quote.get("spread_x") is not None:
+        single_side_price = _q18(quote.get("spread_x")) / Decimal("2")
+    else:
+        single_side_price = _q18(fallback)
+    if single_side_price < Decimal("0"):
         return Decimal("0")
-    return spread_x
+    return single_side_price
 
 
 def _contract_spread_fee(*, spread_x: Decimal, quantity: Decimal) -> Decimal:
     if spread_x <= Decimal("0") or quantity <= Decimal("0"):
         return Decimal("0")
+    # In order context, spread_x_snapshot stores the single-side spread fee price.
     return _q18(spread_x * quantity)
 
 
@@ -415,7 +424,7 @@ def create_contract_open_order(
     )
 
     spread_x_snapshot = _quote_spread_x(quote, contract_symbol.spread_x)
-    fee_amount = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=quantity)
+    spread_fee_amount = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=quantity)
     margin_amount = quantity * entry_price / Decimal(leverage)
     total_cost = margin_amount
 
@@ -441,9 +450,9 @@ def create_contract_open_order(
         quantity=quantity,
         leverage=leverage,
         margin_amount=margin_amount,
-        fee_amount=fee_amount,
+        fee_amount=Decimal("0"),
         spread_x_snapshot=spread_x_snapshot,
-        spread_fee=fee_amount,
+        spread_fee=spread_fee_amount,
         trigger_price=None,
         take_profit_price=take_profit_price,
         stop_loss_price=stop_loss_price,
@@ -460,8 +469,7 @@ def create_contract_open_order(
     position_id: Optional[int] = None
     if should_fill:
         after_margin_available = before_available - margin_amount
-        after_fee_available = after_margin_available
-        account.available_margin = after_fee_available
+        account.available_margin = after_margin_available
         account.position_margin = before_position_margin + margin_amount
         account.version = int(account.version or 0) + 1
         account.updated_at = now
@@ -476,7 +484,7 @@ def create_contract_open_order(
             entry_price=entry_price,
             mark_price=mark_price,
             margin_amount=margin_amount,
-            open_fee=fee_amount,
+            open_fee=Decimal("0"),
             unrealized_pnl=Decimal("0"),
             realized_pnl=Decimal("0"),
             liquidation_price=Decimal("0"),
@@ -494,43 +502,44 @@ def create_contract_open_order(
         position_id = int(position.id)
         order.position_id = position_id
 
-        db.add(
-            ContractTrade(
-                trade_no=_build_trade_no(now),
-                order_id=int(order.id),
-                position_id=position_id,
-                user_id=int(user_id),
-                symbol=symbol,
-                side=order_side,
-                position_side=position_side,
-                action="OPEN",
-                price=entry_price,
-                quantity=quantity,
-                notional=entry_price * quantity,
-                leverage=leverage,
-                margin_amount=margin_amount,
-                fee_amount=fee_amount,
-                spread_fee=fee_amount,
-                realized_pnl=Decimal("0"),
-                created_at=now,
-            )
+        trade = ContractTrade(
+            trade_no=_build_trade_no(now),
+            order_id=int(order.id),
+            position_id=position_id,
+            user_id=int(user_id),
+            symbol=symbol,
+            side=order_side,
+            position_side=position_side,
+            action="OPEN",
+            price=entry_price,
+            quantity=quantity,
+            notional=entry_price * quantity,
+            leverage=leverage,
+            margin_amount=margin_amount,
+            fee_amount=Decimal("0"),
+            spread_fee=spread_fee_amount,
+            realized_pnl=Decimal("0"),
+            created_at=now,
         )
-        db.add(
-            ContractMarginLog(
-                user_id=int(user_id),
-                account_id=int(account.id),
-                position_id=position_id,
-                order_id=int(order.id),
-                symbol=symbol,
-                change_type="OPEN_MARGIN_USED",
-                change_amount=margin_amount,
-                before_available=before_available,
-                after_available=after_margin_available,
-                before_frozen=before_frozen,
-                after_frozen=before_frozen,
-                remark=f"open {position_side} isolated margin used",
-                created_at=now,
-            )
+        db.add(trade)
+        db.flush()
+        trade_id = int(trade.id)
+        add_contract_margin_log(
+            db,
+            user_id=int(user_id),
+            account_id=int(account.id),
+            position_id=position_id,
+            order_id=int(order.id),
+            trade_id=trade_id,
+            symbol=symbol,
+            change_type="OPEN_MARGIN_USED",
+            change_amount=margin_amount,
+            before_available=before_available,
+            after_available=after_margin_available,
+            before_frozen=before_frozen,
+            after_frozen=before_frozen,
+            remark=f"open {position_side} isolated margin used",
+            now=now,
         )
         add_contract_balance_log(
             db,
@@ -539,6 +548,7 @@ def create_contract_open_order(
             biz_type="CONTRACT_OPEN_MARGIN",
             biz_id=f"order:{int(order.id)}:open_margin",
             change_amount=-margin_amount,
+            trade_id=trade_id,
             before_available=before_available,
             after_available=after_margin_available,
             before_frozen=before_frozen,
@@ -546,38 +556,6 @@ def create_contract_open_order(
             remark=f"open {position_side} isolated margin used",
             now=now,
         )
-        db.add(
-            ContractMarginLog(
-                user_id=int(user_id),
-                account_id=int(account.id),
-                position_id=position_id,
-                order_id=int(order.id),
-                symbol=symbol,
-                change_type="OPEN_FEE",
-                change_amount=fee_amount,
-                before_available=after_margin_available,
-                after_available=after_fee_available,
-                before_frozen=before_frozen,
-                after_frozen=before_frozen,
-                remark="contract open spread cost",
-                created_at=now,
-            )
-        )
-        if fee_amount > Decimal("0"):
-            add_contract_balance_log(
-                db,
-                user_id=int(user_id),
-                change_type="CONTRACT_SPREAD_FEE",
-                biz_type="CONTRACT_SPREAD_FEE",
-                biz_id=f"order:{int(order.id)}:open_spread_fee",
-                change_amount=-fee_amount,
-                before_available=after_margin_available,
-                after_available=after_fee_available,
-                before_frozen=before_frozen,
-                after_frozen=before_frozen,
-                remark="contract open spread cost",
-                now=now,
-            )
     else:
         after_available = before_available - total_cost
         after_frozen = before_frozen + total_cost
@@ -873,6 +851,9 @@ def _fresh_depth_quote_for_limit_scan(
         "last_price": mark_price,
         "mark_price": mark_price,
         "spread_x": _q18(depth.get("spread_x")),
+        "manual_spread_x": _q18(depth.get("manual_spread_x")),
+        "effective_total_spread": _q18(depth.get("effective_total_spread")),
+        "single_side_spread_fee_price": _q18(depth.get("single_side_spread_fee_price")),
         "source": depth.get("source") or "FRESH_DEPTH",
         "depth_source": depth.get("source") or "LIVE",
         "quote_freshness": depth.get("quote_freshness"),
@@ -974,7 +955,7 @@ def _fill_open_order_locked(
 
     fill_price = _limit_fill_price(action="OPEN", position_side=position_side, bid_price=bid_price, ask_price=ask_price)
     spread_x_snapshot = _quote_spread_x(quote, order.spread_x_snapshot)
-    actual_fee_amount = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=quantity)
+    spread_fee_amount = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=quantity)
     actual_margin_amount = quantity * fill_price / Decimal(leverage)
 
     old_frozen_total = _q18(order.margin_amount)
@@ -1000,9 +981,9 @@ def _fill_open_order_locked(
     account.updated_at = now
 
     order.margin_amount = actual_margin_amount
-    order.fee_amount = actual_fee_amount
+    order.fee_amount = Decimal("0")
     order.spread_x_snapshot = spread_x_snapshot
-    order.spread_fee = actual_fee_amount
+    order.spread_fee = spread_fee_amount
     order.filled_quantity = quantity
     order.avg_price = fill_price
     order.status = "FILLED"
@@ -1019,7 +1000,7 @@ def _fill_open_order_locked(
         entry_price=fill_price,
         mark_price=mark_price,
         margin_amount=actual_margin_amount,
-        open_fee=actual_fee_amount,
+        open_fee=Decimal("0"),
         unrealized_pnl=Decimal("0"),
         realized_pnl=Decimal("0"),
         liquidation_price=Decimal("0"),
@@ -1036,43 +1017,44 @@ def _fill_open_order_locked(
     db.flush()
     order.position_id = int(position.id)
 
-    db.add(
-        ContractTrade(
-            trade_no=_build_trade_no(now),
-            order_id=int(order.id),
-            position_id=int(position.id),
-            user_id=int(order.user_id),
-            symbol=symbol,
-            side=order_side,
-            position_side=position_side,
-            action="OPEN",
-            price=fill_price,
-            quantity=quantity,
-            notional=fill_price * quantity,
-            leverage=leverage,
-            margin_amount=actual_margin_amount,
-            fee_amount=actual_fee_amount,
-            spread_fee=actual_fee_amount,
-            realized_pnl=Decimal("0"),
-            created_at=now,
-        )
+    trade = ContractTrade(
+        trade_no=_build_trade_no(now),
+        order_id=int(order.id),
+        position_id=int(position.id),
+        user_id=int(order.user_id),
+        symbol=symbol,
+        side=order_side,
+        position_side=position_side,
+        action="OPEN",
+        price=fill_price,
+        quantity=quantity,
+        notional=fill_price * quantity,
+        leverage=leverage,
+        margin_amount=actual_margin_amount,
+        fee_amount=Decimal("0"),
+        spread_fee=spread_fee_amount,
+        realized_pnl=Decimal("0"),
+        created_at=now,
     )
-    db.add(
-        ContractMarginLog(
-            user_id=int(order.user_id),
-            account_id=int(account.id),
-            position_id=int(position.id),
-            order_id=int(order.id),
-            symbol=symbol,
-            change_type="OPEN_MARGIN_USED",
-            change_amount=actual_margin_amount,
-            before_available=before_available,
-            after_available=after_available,
-            before_frozen=before_frozen,
-            after_frozen=after_frozen,
-            remark="limit open order margin used",
-            created_at=now,
-        )
+    db.add(trade)
+    db.flush()
+    trade_id = int(trade.id)
+    add_contract_margin_log(
+        db,
+        user_id=int(order.user_id),
+        account_id=int(account.id),
+        position_id=int(position.id),
+        order_id=int(order.id),
+        trade_id=trade_id,
+        symbol=symbol,
+        change_type="OPEN_MARGIN_USED",
+        change_amount=actual_margin_amount,
+        before_available=before_available,
+        after_available=after_available,
+        before_frozen=before_frozen,
+        after_frozen=after_frozen,
+        remark="limit open order margin used",
+        now=now,
     )
     add_contract_balance_log(
         db,
@@ -1081,6 +1063,7 @@ def _fill_open_order_locked(
         biz_type="CONTRACT_OPEN_MARGIN",
         biz_id=f"order:{int(order.id)}:fill_open_margin",
         change_amount=-actual_margin_amount,
+        trade_id=trade_id,
         before_available=before_available,
         after_available=after_available,
         before_frozen=before_frozen,
@@ -1088,38 +1071,6 @@ def _fill_open_order_locked(
         remark="limit open order margin used",
         now=now,
     )
-    db.add(
-        ContractMarginLog(
-            user_id=int(order.user_id),
-            account_id=int(account.id),
-            position_id=int(position.id),
-            order_id=int(order.id),
-            symbol=symbol,
-            change_type="OPEN_FEE",
-            change_amount=actual_fee_amount,
-            before_available=after_available,
-            after_available=after_available,
-            before_frozen=after_frozen,
-            after_frozen=after_frozen,
-            remark="limit open order spread cost",
-            created_at=now,
-        )
-    )
-    if actual_fee_amount > Decimal("0"):
-        add_contract_balance_log(
-            db,
-            user_id=int(order.user_id),
-            change_type="CONTRACT_SPREAD_FEE",
-            biz_type="CONTRACT_SPREAD_FEE",
-            biz_id=f"order:{int(order.id)}:fill_open_spread_fee",
-            change_amount=-actual_fee_amount,
-            before_available=after_available,
-            after_available=after_available,
-            before_frozen=after_frozen,
-            after_frozen=after_frozen,
-            remark="limit open order spread cost",
-            now=now,
-        )
     return int(position.id)
 
 
@@ -1173,7 +1124,7 @@ def _fill_close_order_locked(
 
     close_price = _limit_fill_price(action="CLOSE", position_side=position_side, bid_price=bid_price, ask_price=ask_price)
     spread_x_snapshot = _quote_spread_x(quote, order.spread_x_snapshot)
-    close_spread_fee = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=close_quantity)
+    close_spread_fee_amount = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=close_quantity)
     entry_price = _q18(position.entry_price)
     old_margin_amount = _q18(position.margin_amount)
     release_margin = old_margin_amount * close_quantity / position_quantity
@@ -1238,60 +1189,47 @@ def _fill_close_order_locked(
     order.filled_quantity = close_quantity
     order.avg_price = close_price
     order.margin_amount = release_margin
-    order.fee_amount = close_spread_fee
+    order.fee_amount = Decimal("0")
     order.spread_x_snapshot = spread_x_snapshot
-    order.spread_fee = close_spread_fee
+    order.spread_fee = close_spread_fee_amount
     order.status = "FILLED"
     order.fail_reason = close_reason
     order.updated_at = now
 
     order_side = "SELL" if position_side == "LONG" else "BUY"
-    db.add(
-        ContractTrade(
-            trade_no=_build_trade_no(now),
-            order_id=int(order.id),
-            position_id=int(position.id),
-            user_id=int(order.user_id),
-            symbol=order.symbol,
-            side=order_side,
-            position_side=position_side,
-            action="CLOSE",
-            price=close_price,
-            quantity=close_quantity,
-            notional=close_price * close_quantity,
-            leverage=int(position.leverage),
-            margin_amount=release_margin,
-            fee_amount=close_spread_fee,
-            spread_fee=close_spread_fee,
-            realized_pnl=realized_pnl,
-            created_at=now,
-        )
+    trade = ContractTrade(
+        trade_no=_build_trade_no(now),
+        order_id=int(order.id),
+        position_id=int(position.id),
+        user_id=int(order.user_id),
+        symbol=order.symbol,
+        side=order_side,
+        position_side=position_side,
+        action="CLOSE",
+        price=close_price,
+        quantity=close_quantity,
+        notional=close_price * close_quantity,
+        leverage=int(position.leverage),
+        margin_amount=release_margin,
+        fee_amount=Decimal("0"),
+        spread_fee=close_spread_fee_amount,
+        realized_pnl=realized_pnl,
+        created_at=now,
     )
+    db.add(trade)
+    db.flush()
+    trade_id = int(trade.id)
 
     conceptual_after_release = before_available + release_margin
-    db.add(
-        ContractMarginLog(
-            user_id=int(order.user_id),
-            account_id=int(account.id),
-            position_id=int(position.id),
-            order_id=int(order.id),
-            symbol=order.symbol,
-            change_type="CLOSE_RELEASE",
-            change_amount=release_margin,
-            before_available=before_available,
-            after_available=conceptual_after_release,
-            before_frozen=before_frozen,
-            after_frozen=before_frozen,
-            remark="contract close margin release",
-            created_at=now,
-        )
-    )
-    add_contract_balance_log(
+    add_contract_margin_log(
         db,
         user_id=int(order.user_id),
-        change_type="CONTRACT_MARGIN_RELEASE",
-        biz_type="CONTRACT_MARGIN_RELEASE",
-        biz_id=f"order:{int(order.id)}:close_margin_release",
+        account_id=int(account.id),
+        position_id=int(position.id),
+        order_id=int(order.id),
+        trade_id=trade_id,
+        symbol=order.symbol,
+        change_type="CLOSE_RELEASE",
         change_amount=release_margin,
         before_available=before_available,
         after_available=conceptual_after_release,
@@ -1300,29 +1238,30 @@ def _fill_close_order_locked(
         remark="contract close margin release",
         now=now,
     )
-    db.add(
-        ContractMarginLog(
-            user_id=int(order.user_id),
-            account_id=int(account.id),
-            position_id=int(position.id),
-            order_id=int(order.id),
-            symbol=order.symbol,
-            change_type="REALIZED_PNL",
-            change_amount=realized_pnl,
-            before_available=conceptual_after_release,
-            after_available=after_available_after_pnl,
-            before_frozen=before_frozen,
-            after_frozen=before_frozen,
-            remark="pnl capped by margin" if pnl_capped else "close realized pnl",
-            created_at=now,
-        )
-    )
     add_contract_balance_log(
         db,
         user_id=int(order.user_id),
-        change_type="CONTRACT_REALIZED_PNL",
-        biz_type="CONTRACT_REALIZED_PNL",
-        biz_id=f"order:{int(order.id)}:close_realized_pnl",
+        change_type="CONTRACT_MARGIN_RELEASE",
+        biz_type="CONTRACT_MARGIN_RELEASE",
+        biz_id=f"order:{int(order.id)}:close_margin_release",
+        change_amount=release_margin,
+        trade_id=trade_id,
+        before_available=before_available,
+        after_available=conceptual_after_release,
+        before_frozen=before_frozen,
+        after_frozen=before_frozen,
+        remark="contract close margin release",
+        now=now,
+    )
+    add_contract_margin_log(
+        db,
+        user_id=int(order.user_id),
+        account_id=int(account.id),
+        position_id=int(position.id),
+        order_id=int(order.id),
+        trade_id=trade_id,
+        symbol=order.symbol,
+        change_type="REALIZED_PNL",
         change_amount=realized_pnl,
         before_available=conceptual_after_release,
         after_available=after_available_after_pnl,
@@ -1331,38 +1270,21 @@ def _fill_close_order_locked(
         remark="pnl capped by margin" if pnl_capped else "close realized pnl",
         now=now,
     )
-    if close_spread_fee > Decimal("0"):
-        db.add(
-            ContractMarginLog(
-                user_id=int(order.user_id),
-                account_id=int(account.id),
-                position_id=int(position.id),
-                order_id=int(order.id),
-                symbol=order.symbol,
-                change_type="CLOSE_FEE",
-                change_amount=close_spread_fee,
-                before_available=after_available_after_pnl,
-                after_available=after_available_after_pnl,
-                before_frozen=before_frozen,
-                after_frozen=before_frozen,
-                remark="contract close spread cost",
-                created_at=now,
-            )
-        )
-        add_contract_balance_log(
-            db,
-            user_id=int(order.user_id),
-            change_type="CONTRACT_SPREAD_FEE",
-            biz_type="CONTRACT_SPREAD_FEE",
-            biz_id=f"order:{int(order.id)}:close_spread_fee",
-            change_amount=-close_spread_fee,
-            before_available=after_available_after_pnl,
-            after_available=after_available_after_pnl,
-            before_frozen=before_frozen,
-            after_frozen=before_frozen,
-            remark="contract close spread cost",
-            now=now,
-        )
+    add_contract_balance_log(
+        db,
+        user_id=int(order.user_id),
+        change_type="CONTRACT_REALIZED_PNL",
+        biz_type="CONTRACT_REALIZED_PNL",
+        biz_id=f"order:{int(order.id)}:close_realized_pnl",
+        change_amount=realized_pnl,
+        trade_id=trade_id,
+        before_available=conceptual_after_release,
+        after_available=after_available_after_pnl,
+        before_frozen=before_frozen,
+        after_frozen=before_frozen,
+        remark="pnl capped by margin" if pnl_capped else "close realized pnl",
+        now=now,
+    )
     return realized_pnl, release_margin, remaining_quantity
 
 
@@ -1780,6 +1702,20 @@ def scan_and_execute_contract_limit_orders(db: Session, limit: int = 100) -> lis
                     db.rollback()
                     continue
                 db.commit()
+                trade_row = (
+                    db.query(ContractTrade.id)
+                    .filter(ContractTrade.order_id == int(order.id))
+                    .order_by(ContractTrade.id.desc())
+                    .first()
+                )
+                publish_contract_user_updates(
+                    user_id=int(order.user_id),
+                    symbols=[str(order.symbol)],
+                    position_ids=[int(position_id)],
+                    order_ids=[int(order.id)],
+                    trade_ids=[int(trade_row[0])] if trade_row else None,
+                    include_account=True,
+                )
                 results.append({"order_id": int(order.id), "action": "OPEN", "position_id": position_id})
                 continue
 
@@ -1787,6 +1723,12 @@ def scan_and_execute_contract_limit_orders(db: Session, limit: int = 100) -> lis
                 if int(order.position_id or 0) <= 0:
                     _mark_order_failed(db, order=order, reason="POSITION_ID_REQUIRED")
                     db.commit()
+                    publish_contract_user_updates(
+                        user_id=int(order.user_id),
+                        symbols=[str(order.symbol)],
+                        order_ids=[int(order.id)],
+                        include_account=False,
+                    )
                     results.append({"order_id": int(order.id), "action": "CLOSE", "status": "FAILED"})
                     continue
 
@@ -1800,6 +1742,13 @@ def scan_and_execute_contract_limit_orders(db: Session, limit: int = 100) -> lis
                 if position is None or position.status != "OPEN" or _q18(position.quantity) <= Decimal("0"):
                     _mark_order_failed(db, order=order, reason="POSITION_NOT_OPEN")
                     db.commit()
+                    publish_contract_user_updates(
+                        user_id=int(order.user_id),
+                        symbols=[str(order.symbol)],
+                        position_ids=[int(order.position_id)] if int(order.position_id or 0) > 0 else None,
+                        order_ids=[int(order.id)],
+                        include_account=False,
+                    )
                     results.append({"order_id": int(order.id), "action": "CLOSE", "status": "FAILED"})
                     continue
 
@@ -1813,6 +1762,20 @@ def scan_and_execute_contract_limit_orders(db: Session, limit: int = 100) -> lis
                     db.rollback()
                     continue
                 db.commit()
+                trade_row = (
+                    db.query(ContractTrade.id)
+                    .filter(ContractTrade.order_id == int(order.id))
+                    .order_by(ContractTrade.id.desc())
+                    .first()
+                )
+                publish_contract_user_updates(
+                    user_id=int(order.user_id),
+                    symbols=[str(order.symbol)],
+                    position_ids=[int(position.id)],
+                    order_ids=[int(order.id)],
+                    trade_ids=[int(trade_row[0])] if trade_row else None,
+                    include_account=True,
+                )
                 results.append(
                     {
                         "order_id": int(order.id),
@@ -1827,6 +1790,13 @@ def scan_and_execute_contract_limit_orders(db: Session, limit: int = 100) -> lis
 
             _mark_order_failed(db, order=order, reason="INVALID_ACTION")
             db.commit()
+            publish_contract_user_updates(
+                user_id=int(order.user_id),
+                symbols=[str(order.symbol)],
+                position_ids=[int(order.position_id)] if int(order.position_id or 0) > 0 else None,
+                order_ids=[int(order.id)],
+                include_account=False,
+            )
             results.append({"order_id": int(order.id), "action": action, "status": "FAILED"})
         except Exception as exc:
             db.rollback()

@@ -496,6 +496,29 @@ class CollectionTaskCreateResult:
     skipped: bool = False
 
 
+@dataclass(frozen=True)
+class CollectionTaskSafeCancelResult:
+    task: CollectionTask
+    gas_task: Optional[GasTask]
+    gas_task_canceled: bool
+    gas_task_preserved: bool
+    reason: str
+
+
+SAFE_CANCEL_COLLECTION_STATUSES = {
+    CollectionTaskStatus.PENDING.value,
+    CollectionTaskStatus.GAS_REQUIRED.value,
+    CollectionTaskStatus.GAS_QUEUED.value,
+    CollectionTaskStatus.FAILED.value,
+}
+
+SAFE_CANCEL_GAS_STATUSES = {
+    GasTaskStatus.PENDING.value,
+    GasTaskStatus.QUEUED.value,
+    GasTaskStatus.FAILED.value,
+}
+
+
 def _retryable_failed_clause(model):
     return and_(
         model.status == "FAILED",
@@ -710,6 +733,10 @@ def _is_real_collection_tx_hash(value: Optional[str]) -> bool:
     )
 
 
+def _has_any_tx_hash(value: Optional[str]) -> bool:
+    return bool(str(value or "").strip())
+
+
 def _collection_batch_amount_totals(tasks: list[CollectionTask]) -> tuple[Optional[str], Decimal, Decimal]:
     total_by_symbol: dict[str, Decimal] = {}
     success_by_symbol: dict[str, Decimal] = {}
@@ -858,6 +885,80 @@ def _get_gas_task(db: Session, task_id: int) -> GasTask:
     return task
 
 
+def collection_task_safe_cancel_block_reason(task: CollectionTask, gas_task: Optional[GasTask] = None) -> str:
+    status = str(task.status or "").strip().upper()
+    if status not in SAFE_CANCEL_COLLECTION_STATUSES:
+        return f"STATUS_NOT_CANCELABLE:{status or 'EMPTY'}"
+    if _has_any_tx_hash(task.tx_hash):
+        return "COLLECTION_TX_HASH_EXISTS"
+    if task.sent_at or task.confirmed_at or task.block_number:
+        return "COLLECTION_SEND_MARKER_EXISTS"
+    try:
+        amount = Decimal(str(task.amount or 0))
+    except Exception:
+        amount = Decimal("0")
+    if amount <= 0:
+        return "COLLECTION_AMOUNT_NOT_POSITIVE"
+    if gas_task is not None:
+        gas_status = str(gas_task.status or "").strip().upper()
+        if gas_status in {GasTaskStatus.SENDING.value}:
+            return "GAS_TASK_SENDING"
+    return ""
+
+
+def can_safe_cancel_collection_task(task: CollectionTask, gas_task: Optional[GasTask] = None) -> bool:
+    return collection_task_safe_cancel_block_reason(task, gas_task) == ""
+
+
+def safe_cancel_collection_task(
+    db: Session,
+    task_id: int,
+    *,
+    reason: str = "ADMIN_CANCEL_STALE_AMOUNT_RESCAN_REQUIRED",
+) -> CollectionTaskSafeCancelResult:
+    task = _get_collection_task(db, int(task_id))
+    gas_task = db.query(GasTask).filter(GasTask.id == int(task.gas_task_id)).first() if task.gas_task_id else None
+    block_reason = collection_task_safe_cancel_block_reason(task, gas_task)
+    if block_reason:
+        raise ValueError(f"collection task cannot be safely canceled: {block_reason}")
+
+    cancel_reason = (reason or "ADMIN_CANCEL_STALE_AMOUNT_RESCAN_REQUIRED").strip()[:255]
+    gas_task_canceled = False
+    gas_task_preserved = False
+    now = _now()
+
+    if gas_task is not None:
+        gas_status = str(gas_task.status or "").strip().upper()
+        gas_tx_hash = str(gas_task.tx_hash or "").strip()
+        if not gas_tx_hash and gas_status in SAFE_CANCEL_GAS_STATUSES:
+            gas_task.status = GasTaskStatus.CANCELED.value
+            gas_task.last_error = "PARENT_COLLECTION_TASK_CANCELED"
+            gas_task.next_retry_at = None
+            gas_task.locked_at = None
+            gas_task.updated_at = now
+            gas_task_canceled = True
+            _queue_gas_task_changed(db, gas_task)
+        else:
+            gas_task_preserved = True
+
+    task.status = CollectionTaskStatus.CANCELED.value
+    task.reason = cancel_reason
+    task.last_error = cancel_reason
+    task.next_retry_at = None
+    task.locked_at = None
+    task.updated_at = now
+    refresh_collection_batch_aggregate(db, task.batch_id)
+    db.flush()
+    _queue_collection_task_changed(db, task)
+    return CollectionTaskSafeCancelResult(
+        task=task,
+        gas_task=gas_task,
+        gas_task_canceled=gas_task_canceled,
+        gas_task_preserved=gas_task_preserved,
+        reason=cancel_reason,
+    )
+
+
 def create_collection_batch(
     db: Session,
     *,
@@ -1004,6 +1105,8 @@ def create_gas_task(
     to_address: str,
     topup_amount: Decimal,
     target_balance: Optional[Decimal] = None,
+    gas_topup_mode: Optional[str] = None,
+    estimate_source: Optional[str] = None,
 ) -> GasTask:
     ck = _normalize_chain_key(chain_key)
     gas_symbol = _normalize_symbol(gas_coin_symbol)
@@ -1012,6 +1115,8 @@ def create_gas_task(
     topup = _to_decimal(topup_amount)
     topup = _to_positive_decimal(topup, "topup_amount")
     target = _to_decimal(target_balance) if target_balance is not None else None
+    mode = (gas_topup_mode or "").strip().upper() or None
+    source = (estimate_source or "").strip().upper() or None
     idempotency_key = _gas_task_idempotency_key(
         collection_task_id=collection_task_id,
         user_id=user_id,
@@ -1031,10 +1136,16 @@ def create_gas_task(
         chain_key=ck,
         to_address=to_addr,
     )
-    if active_duplicate and (
-        collection_task_id is None
-        or int(active_duplicate.collection_task_id or 0) == int(collection_task_id)
-    ):
+    if active_duplicate:
+        logger.info(
+            "Reusing address-level gas task chain_key=%s to_address=%s "
+            "existing_gas_task_id=%s existing_collection_task_id=%s requested_collection_task_id=%s",
+            ck,
+            to_addr,
+            active_duplicate.id,
+            active_duplicate.collection_task_id,
+            collection_task_id,
+        )
         return active_duplicate
 
     task = GasTask(
@@ -1047,6 +1158,8 @@ def create_gas_task(
         to_address=to_addr,
         target_balance=target,
         topup_amount=topup,
+        gas_topup_mode=mode,
+        estimate_source=source,
         status=GasTaskStatus.PENDING.value,
         idempotency_key=idempotency_key,
         retry_count=0,
@@ -1063,6 +1176,8 @@ def mark_collection_task_queued(db: Session, task_id: int) -> CollectionTask:
         CollectionTaskStatus.PENDING.value,
         CollectionTaskStatus.READY.value,
         CollectionTaskStatus.FAILED.value,
+        CollectionTaskStatus.GAS_REQUIRED.value,
+        CollectionTaskStatus.GAS_QUEUED.value,
     }:
         raise ValueError(f"cannot queue collection task from status {task.status}")
     task.status = CollectionTaskStatus.QUEUED.value

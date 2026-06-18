@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import base64
+import html
 import io
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import uuid
@@ -24,6 +27,8 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
 from app.core.chain_capabilities import CONFIG_ONLY, EVM, READY, get_chain_capability, get_chain_runtime_status
+from app.core.config import settings
+from app.core.redis import get_redis
 from app.core.request_utils import get_client_ip, get_user_agent
 from app.core.security import verify_password
 from app.db.models.collection import CollectionTask, CollectionTaskStatus, GasTask, GasTaskStatus
@@ -40,6 +45,7 @@ from app.services.hot_wallet_monitor_service import (
     query_hot_wallet_monitor,
     refresh_hot_wallet_monitor_item,
 )
+from app.services.deposit_tx_confirm_service import recheck_deposit_chain_confirmation
 from app.services.admin_queries import (
     PLATFORM_ACCOUNT_USER_ID,
     admin_create_reference_overlay,
@@ -146,6 +152,7 @@ from app.services.admin_queries import (
     admin_query_collection_center_filters,
     admin_query_collection_center_snapshot,
     admin_query_collection_center_stats,
+    admin_query_collection_gas_cost_stats,
     admin_query_collection_tool_results,
     admin_query_risk_dashboard,
     admin_query_trading_dashboard,
@@ -181,7 +188,12 @@ from app.services.bd_team_query import (
 )
 from app.services.collection_send_helper import is_collection_real_send_enabled
 from app.services.collection_send_guard import validate_collection_send_allowed
-from app.services.collection_service import create_gas_task, mark_collection_task_wait_gas
+from app.services.collection_gas_config_service import (
+    CollectionGasConfigError,
+    reset_gas_topup_config,
+    save_gas_topup_config,
+)
+from app.services.collection_service import create_gas_task, mark_collection_task_wait_gas, safe_cancel_collection_task
 from app.services.collection_candidate_scanner import (
     ScanResult,
     admin_create_collection_tasks,
@@ -205,6 +217,12 @@ from app.services.spot_fee_settings_service import (
     load_spot_fee_settings,
     update_spot_fee_settings,
 )
+from app.services.contract_market_provider_service import (
+    admin_list_contract_market_providers,
+    admin_update_contract_market_provider,
+    classify_market_provider_error,
+    test_contract_market_provider_connection,
+)
 from app.services.moralis_service import add_address_to_streams
 from app.services.stock_token_lock_service import (
     StockTokenLockError,
@@ -214,8 +232,10 @@ from app.services.stock_token_lock_service import (
 )
 from app.services.site_content_service import (
     ANNOUNCEMENT_CATEGORY_OPTIONS,
+    admin_about_page_form,
     admin_announcement_form_from_payload,
     admin_banner_form_from_payload,
+    admin_legal_pages_form,
     admin_create_announcement,
     admin_create_home_banner,
     admin_delete_home_banner,
@@ -229,6 +249,8 @@ from app.services.site_content_service import (
     admin_update_announcement,
     admin_update_home_banner,
     get_or_create_site_settings,
+    update_about_page_sections,
+    update_legal_pages,
     update_site_settings,
 )
 from app.services.help_content_service import (
@@ -339,6 +361,7 @@ ADMIN_DOC_RESOURCE_LABELS: tuple[tuple[str, str, str], ...] = (
     ("/collections/tasks", "归集任务", "collection task"),
     ("/collections/batches", "归集批次", "collection batch"),
     ("/collections/records", "归集记录", "collection record"),
+    ("/collections/gas-costs", "归集 Gas 成本统计", "collection gas cost stats"),
     ("/asset-configs/chains", "链配", "chain config"),
     ("/asset-configs/asset-chains", "资产链配", "asset-chain config"),
     ("/asset-configs/assets", "资产配置", "asset config"),
@@ -596,6 +619,10 @@ ADMIN_POST_FORBIDDEN_MESSAGE = "当前账号没有执行此操作的权限，请
 ADMIN_STATUS_ACTIVE = "ACTIVE"
 ADMIN_LOGIN_INVALID_MESSAGE = "用户名或密码错误"
 ADMIN_LOGIN_DISABLED_MESSAGE = "管理员账号已停用"
+ADMIN_LOGIN_CAPTCHA_REQUIRED_MESSAGE = "请输入图形验证码"
+ADMIN_LOGIN_CAPTCHA_INVALID_MESSAGE = "验证码错误或已过期"
+ADMIN_LOGIN_CAPTCHA_UNAVAILABLE_MESSAGE = "验证码服务暂不可用，请稍后重试"
+ADMIN_LOGIN_CAPTCHA_TTL_SECONDS = int(getattr(settings, "LOGIN_CAPTCHA_TTL_SECONDS", 5 * 60))
 ADMIN_RBAC_UNINITIALIZED_MESSAGE = "后台权限系统未初始化，请先执行数据库迁移和初始化脚本"
 UPLOAD_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 UPLOAD_IMAGE_TYPES = {
@@ -757,6 +784,7 @@ ADMIN_GET_PERMISSION_EXACT: Dict[str, str] = {
     "/admin/contract-positions": "contract_positions.view",
     "/admin/contract-accounts": "contract_accounts.view",
     "/admin/contract-liquidations": "contract_liquidations.view",
+    "/admin/market-providers": "contract_symbols.manage",
     "/admin/trading-pairs": "trading_pairs.manage",
     "/admin/pairs": "trading_pairs.manage",
     "/admin/reference-overlays": "trading_pairs.manage",
@@ -781,6 +809,8 @@ ADMIN_GET_PERMISSION_EXACT: Dict[str, str] = {
     "/admin/system/services": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/rq": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/site-settings": "site_settings.manage",
+    "/admin/site-about-page": "site_content.manage",
+    "/admin/site-legal-pages": "site_content.manage",
     "/admin/support-tickets": "support_tickets.manage",
     "/admin/admin-users": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/admin-roles": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
@@ -790,6 +820,7 @@ ADMIN_GET_PERMISSION_PREFIXES: tuple[tuple[str, str], ...] = (
     ("/admin/pairs", "trading_pairs.manage"),
     ("/admin/reference-overlays", "trading_pairs.manage"),
     ("/admin/contract-symbols", "contract_symbols.manage"),
+    ("/admin/market-providers", "contract_symbols.manage"),
     ("/admin/asset-configs", "asset_configs.manage"),
     ("/admin/vip", "vip.view"),
     ("/admin/bd", "bd.view"),
@@ -803,6 +834,8 @@ ADMIN_GET_PERMISSION_PREFIXES: tuple[tuple[str, str], ...] = (
     ("/admin/activity-banners", "banners.manage"),
     ("/admin/activities", "banners.manage"),
     ("/admin/announcements", "announcements.manage"),
+    ("/admin/site-about-page", "site_content.manage"),
+    ("/admin/site-legal-pages", "site_content.manage"),
     ("/admin/help/categories", "site_content.manage"),
     ("/admin/help/articles", "site_content.manage"),
     ("/admin/support-tickets", "support_tickets.manage"),
@@ -831,6 +864,92 @@ PLACEHOLDER_PAGE_TEMPLATE = """
   </section>
 {% endblock %}
 """
+
+
+def _admin_redis_key(key: str) -> str:
+    prefix = getattr(settings, "REDIS_KEY_PREFIX", "exchange")
+    return f"{prefix}:{key}"
+
+
+def _admin_login_captcha_key(captcha_id: str) -> str:
+    return _admin_redis_key(f"admin_login_captcha:{captcha_id}")
+
+
+def _decode_redis_value(value: Any) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8")
+    return str(value or "")
+
+
+def _generate_admin_login_captcha_code(length: int = 5) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _build_admin_login_captcha_image(code: str) -> str:
+    escaped = html.escape(code)
+    lines = []
+    for _ in range(6):
+        x1 = secrets.randbelow(130)
+        y1 = 12 + secrets.randbelow(30)
+        x2 = secrets.randbelow(130)
+        y2 = 12 + secrets.randbelow(30)
+        color = secrets.choice(["#8bb8ff", "#f6c76f", "#7dd3fc", "#c084fc"])
+        lines.append(
+            f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" '
+            f'stroke="{color}" stroke-width="1.2" opacity="0.65" />'
+        )
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="132" height="44" viewBox="0 0 132 44">
+<rect width="132" height="44" rx="6" fill="#10141c"/>
+{''.join(lines)}
+<text x="66" y="29" text-anchor="middle" font-family="Consolas, Menlo, monospace" font-size="24" font-weight="700" fill="#f8fafc" letter-spacing="4">{escaped}</text>
+</svg>"""
+    encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+def _create_admin_login_captcha() -> Dict[str, str]:
+    captcha_id = secrets.token_urlsafe(24)
+    code = _generate_admin_login_captcha_code()
+    get_redis().setex(_admin_login_captcha_key(captcha_id), ADMIN_LOGIN_CAPTCHA_TTL_SECONDS, code)
+    return {"id": captcha_id, "image": _build_admin_login_captcha_image(code)}
+
+
+def _admin_login_template_ctx(*, error: str = "") -> Dict[str, Any]:
+    ctx: Dict[str, Any] = {
+        "active_group": "system",
+        "active": "admin_login",
+        "error": error,
+        "captcha": None,
+    }
+    try:
+        ctx["captcha"] = _create_admin_login_captcha()
+    except Exception:
+        logger.exception("Failed to create admin login captcha")
+        if not error:
+            ctx["error"] = ADMIN_LOGIN_CAPTCHA_UNAVAILABLE_MESSAGE
+    return ctx
+
+
+def _verify_admin_login_captcha(captcha_id: str, captcha_code: str) -> tuple[bool, str]:
+    cid = str(captcha_id or "").strip()
+    code = str(captcha_code or "").strip().upper()
+    if not cid or not code:
+        return False, ADMIN_LOGIN_CAPTCHA_REQUIRED_MESSAGE
+
+    try:
+        redis = get_redis()
+        key = _admin_login_captcha_key(cid)
+        expected = _decode_redis_value(redis.get(key)).upper()
+        redis.delete(key)
+    except Exception:
+        logger.exception("Failed to verify admin login captcha")
+        return False, ADMIN_LOGIN_CAPTCHA_UNAVAILABLE_MESSAGE
+
+    if not expected or not secrets.compare_digest(expected, code):
+        return False, ADMIN_LOGIN_CAPTCHA_INVALID_MESSAGE
+    return True, ""
 
 
 def get_admin_from_request(request: Request) -> Optional[Dict[str, Any]]:
@@ -1125,6 +1244,24 @@ def _build_withdraw_records_redirect_url(
         if next_path.startswith("/admin/withdraw-records") or next_path.startswith("/admin/withdraw-anomalies")
         else "/admin/withdraw-records"
     )
+    params = []
+    if notice:
+        params.append(f"notice={quote(notice)}")
+    if error:
+        params.append(f"error={quote(error)}")
+    if not params:
+        return base
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}{'&'.join(params)}"
+
+
+def _build_deposit_records_redirect_url(
+    *,
+    notice: str = "",
+    error: str = "",
+    next_path: str = "/admin/deposit-records",
+) -> str:
+    base = next_path if str(next_path or "").startswith("/admin/deposit-records") else "/admin/deposit-records"
     params = []
     if notice:
         params.append(f"notice={quote(notice)}")
@@ -2531,7 +2668,23 @@ def login_page(request: Request):
     return render(
         request,
         "admin/login.html",
-        ctx={"active_group": "system", "active": "admin_login"},
+        ctx=_admin_login_template_ctx(),
+    )
+
+
+@router.get("/login/captcha")
+def login_captcha():
+    try:
+        captcha = _create_admin_login_captcha()
+    except Exception:
+        logger.exception("Failed to refresh admin login captcha")
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "message": ADMIN_LOGIN_CAPTCHA_UNAVAILABLE_MESSAGE},
+        )
+    return JSONResponse(
+        content={"ok": True, "captcha": captcha},
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -2540,10 +2693,21 @@ def login_submit(
     request: Request,
     username: str = Form(...),
     password: str = Form(...),
+    captcha_id: str = Form(""),
+    captcha_code: str = Form(""),
     db: Session = Depends(get_db),
 ):
     login_username = str(username or "").strip()
     login_password = str(password or "")
+
+    captcha_ok, captcha_error = _verify_admin_login_captcha(captcha_id, captcha_code)
+    if not captcha_ok:
+        return render(
+            request,
+            "admin/login.html",
+            ctx=_admin_login_template_ctx(error=captcha_error),
+            status_code=400,
+        )
 
     try:
         admin_user = db.query(AdminUser).filter(AdminUser.username == login_username).first()
@@ -2551,11 +2715,7 @@ def login_submit(
         return render(
             request,
             "admin/login.html",
-            ctx={
-                "error": ADMIN_RBAC_UNINITIALIZED_MESSAGE,
-                "active_group": "system",
-                "active": "admin_login",
-            },
+            ctx=_admin_login_template_ctx(error=ADMIN_RBAC_UNINITIALIZED_MESSAGE),
             status_code=500,
         )
 
@@ -2570,11 +2730,7 @@ def login_submit(
         return render(
             request,
             "admin/login.html",
-            ctx={
-                "error": ADMIN_LOGIN_INVALID_MESSAGE,
-                "active_group": "system",
-                "active": "admin_login",
-            },
+            ctx=_admin_login_template_ctx(error=ADMIN_LOGIN_INVALID_MESSAGE),
             status_code=400,
         )
 
@@ -2582,11 +2738,7 @@ def login_submit(
         return render(
             request,
             "admin/login.html",
-            ctx={
-                "error": ADMIN_LOGIN_DISABLED_MESSAGE,
-                "active_group": "system",
-                "active": "admin_login",
-            },
+            ctx=_admin_login_template_ctx(error=ADMIN_LOGIN_DISABLED_MESSAGE),
             status_code=400,
         )
 
@@ -3323,6 +3475,8 @@ def deposit_records_page(
     end_time: str = "",
     created_from: str = "",
     created_to: str = "",
+    notice: str = "",
+    error: str = "",
     page: int = 1,
     page_size: int = 20,
     db: Session = Depends(get_db),
@@ -3340,6 +3494,8 @@ def deposit_records_page(
     tx_hash_value = _clean_query_text(tx_hash or txid)
     request_id_value = _clean_query_text(request_id)
     address_value = _clean_query_text(address)
+    notice_value = _clean_query_text(notice)
+    error_value = _clean_query_text(error)
     range_from, range_to, query_notices, used_default_range = _balance_log_date_range(
         date_from_text=date_from or start_time,
         date_to_text=date_to or end_time,
@@ -3432,9 +3588,46 @@ def deposit_records_page(
             },
             "large_table_notice": DEPOSIT_RECORDS_LARGE_TABLE_NOTICE,
             "query_notice": query_notice,
+            "notice": notice_value,
+            "error": error_value,
             "quick_ranges": quick_ranges,
             "active_range_days": active_range_days,
         },
+    )
+
+
+@router.post("/deposit-records/{deposit_id}/recheck-chain-confirmation")
+def recheck_deposit_chain_confirmation_action(
+    request: Request,
+    deposit_id: int,
+    next_path: str = Form("/admin/deposit-records"),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, "deposit_records.view")
+    if redir:
+        return redir
+
+    try:
+        result = recheck_deposit_chain_confirmation(db, int(deposit_id))
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        return RedirectResponse(
+            url=_build_deposit_records_redirect_url(
+                next_path=next_path,
+                error=f"链上查询失败，请稍后重试：{str(exc)[:160]}",
+            ),
+            status_code=303,
+        )
+
+    if result.error_message and result.status not in {"PENDING", "ALREADY_CONFIRMED", "ALREADY_CREDITED"}:
+        return RedirectResponse(
+            url=_build_deposit_records_redirect_url(next_path=next_path, error=result.message),
+            status_code=303,
+        )
+    return RedirectResponse(
+        url=_build_deposit_records_redirect_url(next_path=next_path, notice=result.message),
+        status_code=303,
     )
 
 
@@ -3818,7 +4011,7 @@ BALANCE_LOG_CHANGE_TYPE_OPTIONS = [
     ("CONTRACT_OPEN_MARGIN", "合约开仓保证金"),
     ("CONTRACT_MARGIN_RELEASE", "合约保证金释"),
     ("CONTRACT_REALIZED_PNL", "合约已实现盈"),
-    ("CONTRACT_SPREAD_FEE", "合约手续"),
+    ("CONTRACT_SPREAD_FEE", "历史点差费用"),
     ("CONTRACT_LIQUIDATION", "合约强平"),
     ("LIQUIDATION_ZERO", "合约强平清零"),
     ("CONTRACT_TRANSFER", "合约划转"),
@@ -3836,7 +4029,7 @@ BALANCE_LOG_BIZ_TYPE_OPTIONS = [
     ("CONTRACT_OPEN_MARGIN", "合约开仓保证金"),
     ("CONTRACT_MARGIN_RELEASE", "合约保证金释"),
     ("CONTRACT_REALIZED_PNL", "合约已实现盈"),
-    ("CONTRACT_SPREAD_FEE", "合约手续"),
+    ("CONTRACT_SPREAD_FEE", "历史点差费用"),
     ("CONTRACT_LIQUIDATION", "合约强平"),
     ("LIQUIDATION_ZERO", "合约强平清零"),
     ("CONTRACT_TRANSFER", "合约划转"),
@@ -4424,9 +4617,11 @@ def collection_batch_detail_page(
 def collection_tasks_page(
     request: Request,
     task_no: str = "",
+    task_id: str = "",
     batch_id: str = "",
     user_id: str = "",
     chain_key: str = "",
+    network: str = "",
     coin_symbol: str = "",
     status: str = "",
     address: str = "",
@@ -4456,9 +4651,10 @@ def collection_tasks_page(
         db,
         {
             "task_no": task_no,
+            "task_id": task_id,
             "batch_id": batch_id,
             "user_id": user_id,
-            "chain_key": chain_key,
+            "chain_key": chain_key or network,
             "coin_symbol": coin_symbol,
             "status": status,
             "address": address,
@@ -4483,6 +4679,7 @@ def collection_tasks_page(
             "batch_pagination": result.get("batch_pagination") or {},
             "selected_batch_id": result.get("selected_batch_id") or "",
             "summary": result.get("summary") or {},
+            "filter_options": result.get("filter_options") or {},
             "range_notice": range_notice,
             "filters": {
                 **_result_filters(result),
@@ -4762,6 +4959,8 @@ def _admin_ensure_collection_gas_task(db: Session, task: CollectionTask) -> tupl
         to_address=str(task.from_address or ""),
         topup_amount=topup_amount,
         target_balance=Decimal(str(getattr(source_gas_task, "target_balance", None) or topup_amount)),
+        gas_topup_mode=str(getattr(source_gas_task, "gas_topup_mode", "") or ""),
+        estimate_source=str(getattr(source_gas_task, "estimate_source", "") or ""),
     )
     mark_collection_task_wait_gas(
         db,
@@ -5005,6 +5204,8 @@ def _collection_task_send_allowed(task: CollectionTask) -> bool:
             CollectionTaskStatus.QUEUED.value,
             CollectionTaskStatus.READY.value,
             CollectionTaskStatus.FAILED.value,
+            CollectionTaskStatus.GAS_REQUIRED.value,
+            CollectionTaskStatus.GAS_QUEUED.value,
             CollectionTaskStatus.SKIPPED.value,
             "TIMEOUT",
         }
@@ -5172,6 +5373,47 @@ def collection_task_send(
         task_id=int(task_id),
         next_path=next_path,
         action_label="发",
+    )
+
+
+@router.post("/collections/tasks/{task_id}/safe-cancel")
+def collection_task_safe_cancel(
+    request: Request,
+    task_id: int,
+    next_path: str = Form("/admin/collections/tasks"),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, "collection_tasks.manage")
+    if redir:
+        return redir
+    try:
+        result = safe_cancel_collection_task(
+            db,
+            int(task_id),
+            reason="ADMIN_CANCEL_STALE_AMOUNT_RESCAN_REQUIRED",
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        return RedirectResponse(
+            url=_build_collection_tasks_redirect_url(
+                next_path=next_path,
+                error=f"safe cancel collection task {task_id} failed: {str(exc)[:180]}",
+            ),
+            status_code=302,
+        )
+
+    gas_note = ""
+    if result.gas_task_canceled and result.gas_task is not None:
+        gas_note = f", linked gas_task {result.gas_task.id} canceled"
+    elif result.gas_task_preserved and result.gas_task is not None:
+        gas_note = f", linked gas_task {result.gas_task.id} preserved"
+    return RedirectResponse(
+        url=_build_collection_tasks_redirect_url(
+            next_path=next_path,
+            notice=f"collection task {task_id} canceled for rescan{gas_note}",
+        ),
+        status_code=302,
     )
 
 
@@ -7235,6 +7477,80 @@ def gas_tasks_page(
     )
 
 
+@router.get("/collections/gas-costs", response_class=HTMLResponse)
+def collection_gas_costs_page(
+    request: Request,
+    notice: str = "",
+    error: str = "",
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    result = admin_query_collection_gas_cost_stats(db)
+    return render(
+        request,
+        "admin/collection_gas_costs.html",
+        ctx={
+            "items": result.get("items") or [],
+            "default_params": result.get("default_params") or [],
+            "gas_config_params": result.get("gas_config_params") or [],
+            "summary": result.get("summary") or {},
+            "failed_counts": result.get("failed_counts") or {},
+            "table_missing": bool(result.get("table_missing")),
+            "active_group": "funds",
+            "active": "collection_gas_costs",
+            "notice": notice,
+            "error": error,
+        },
+    )
+
+
+@router.post("/collections/gas-config/update")
+def collection_gas_config_update(
+    request: Request,
+    chain_key: str = Form(...),
+    gas_topup_mode: str = Form("DEFAULT"),
+    safe_multiplier: str = Form("3"),
+    buffer: str = Form("0"),
+    cap: str = Form("0"),
+    min_topup: str = Form("0"),
+    max_topup: str = Form("0"),
+    reset_default: str = Form("0"),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, "gas_tasks.manage")
+    if redir:
+        return redir
+
+    try:
+        if str(reset_default or "") == "1":
+            reset_gas_topup_config(db, chain_key=chain_key)
+            notice = f"{chain_key} 已恢复默认补 Gas 参数"
+        else:
+            save_gas_topup_config(
+                db,
+                chain_key=chain_key,
+                gas_topup_mode=gas_topup_mode,
+                safe_multiplier=safe_multiplier,
+                buffer=buffer,
+                cap=cap,
+                min_topup=min_topup,
+                max_topup=max_topup,
+            )
+            notice = f"{chain_key} 补 Gas 参数已保存"
+        db.commit()
+        return RedirectResponse(url=f"/admin/collections/gas-costs?notice={quote(notice)}", status_code=303)
+    except CollectionGasConfigError as exc:
+        db.rollback()
+        return RedirectResponse(url=f"/admin/collections/gas-costs?error={quote(str(exc))}", status_code=303)
+    except Exception as exc:
+        db.rollback()
+        logger.exception("collection gas config update failed chain_key=%s", chain_key)
+        return RedirectResponse(url=f"/admin/collections/gas-costs?error={quote(str(exc)[:160])}", status_code=303)
+
+
 @router.post("/collections/gas-tasks/{task_id}/dry-run")
 def gas_task_dry_run(
     request: Request,
@@ -8448,6 +8764,7 @@ def trades_page(
     trade_id: str = "",
     user_id: str = "",
     order_id: str = "",
+    order_no: str = "",
     symbol: str = "",
     buyer_user_id: str = "",
     seller_user_id: str = "",
@@ -8473,6 +8790,10 @@ def trades_page(
     trade_id_value = _clean_query_text(trade_id)
     user_id_value = _clean_query_text(user_id)
     order_id_value = _clean_query_text(order_id)
+    order_no_value = _clean_query_text(order_no)
+    if order_id_value and not order_id_value.isdigit() and not order_no_value:
+        order_no_value = order_id_value
+        order_id_value = ""
     symbol_value = _clean_query_text(symbol).upper()
     buyer_user_id_value = _clean_query_text(buyer_user_id)
     seller_user_id_value = _clean_query_text(seller_user_id)
@@ -8485,7 +8806,8 @@ def trades_page(
         created_from_text=start_time,
         created_to_text=end_time,
     )
-    start_time_value, end_time_value = get_admin_date_time_window(range_from, range_to)
+    start_time_value = datetime.combine(range_from, datetime.min.time())
+    end_time_value = datetime.combine(range_to, datetime.max.time())
     range_days = (range_to - range_from).days + 1
     has_precise_condition = _balance_log_has_precise_condition(
         user_id_value,
@@ -8493,6 +8815,7 @@ def trades_page(
         seller_user_id_value,
         trade_id_value,
         order_id_value,
+        order_no_value,
         buy_order_id_value,
         sell_order_id_value,
         symbol_value,
@@ -8519,6 +8842,7 @@ def trades_page(
         "trade_id": trade_id_value,
         "symbol": symbol_value,
         "user_id": user_id_value,
+        "order_no": order_no_value,
         "buyer_user_id": buyer_user_id_value,
         "seller_user_id": seller_user_id_value,
         "buy_order_id": buy_order_id_value,
@@ -8579,6 +8903,7 @@ def trades_page(
         "symbol": symbol_value,
         "user_id": user_id_value,
         "order_id": order_id_value,
+        "order_no": order_no_value,
         "buyer_user_id": buyer_user_id_value,
         "seller_user_id": seller_user_id_value,
         "buy_order_id": buy_order_id_value,
@@ -9464,6 +9789,152 @@ def contract_symbols_page(
     )
 
 
+_MARKET_PROVIDER_TEST_REASON_MESSAGES: Dict[str, str] = {
+    "REGION_RESTRICTED": "当前访问地区受行情源限制，建议保持该行情源停用或切换备用源。",
+    "COOLDOWN": "行情源暂时冷却中，系统稍后会自动重试。",
+    "TIMEOUT": "连接超时，请稍后重试。",
+    "RATE_LIMITED": "请求过于频繁，请稍后再测。",
+    "AUTH_FAILED": "认证失败，请检查 API Key。",
+    "SYMBOL_NOT_FOUND": "交易对或标的不存在，请检查 symbol 映射。",
+    "DNS_FAILED": "域名解析失败，请检查行情源地址或网络。",
+    "CONNECTION_FAILED": "连接失败，请检查网络或行情源地址。",
+    "UNKNOWN": "测试失败，请联系技术查看日志。",
+}
+
+
+def _market_provider_display_label(items: list[Dict[str, Any]], provider_code: str = "") -> str:
+    normalized = str(provider_code or "").strip().upper()
+    if not normalized:
+        return ""
+    for item in items:
+        if str(item.get("provider_code") or "").strip().upper() == normalized:
+            return str(item.get("display_name") or item.get("provider_name") or normalized)
+    return normalized
+
+
+def _market_provider_test_feedback(test_result: str = "", reason: str = "", provider_label: str = "") -> tuple[str, str]:
+    result = str(test_result or "").strip().lower()
+    if not result:
+        return "", ""
+    prefix = f"{provider_label}：" if provider_label else ""
+    if result == "success":
+        return f"{prefix}测试成功，行情源连接正常。", ""
+    normalized_reason = str(reason or "UNKNOWN").strip().upper()
+    message = _MARKET_PROVIDER_TEST_REASON_MESSAGES.get(
+        normalized_reason,
+        _MARKET_PROVIDER_TEST_REASON_MESSAGES["UNKNOWN"],
+    )
+    return "", f"{prefix}{message}"
+
+
+def _build_market_providers_redirect_url(
+    notice: str = "",
+    error: str = "",
+    test_result: str = "",
+    reason: str = "",
+    provider: str = "",
+) -> str:
+    params: Dict[str, str] = {}
+    if notice:
+        params["notice"] = notice
+    if error:
+        params["error"] = error
+    if test_result:
+        params["test_result"] = test_result
+    if reason:
+        params["reason"] = reason
+    if provider:
+        params["provider"] = provider
+    query = urlencode(params)
+    return f"/admin/market-providers?{query}" if query else "/admin/market-providers"
+
+
+@router.get("/market-providers", response_class=HTMLResponse)
+def market_providers_page(
+    request: Request,
+    notice: str = "",
+    error: str = "",
+    test_result: str = "",
+    reason: str = "",
+    provider: str = "",
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    items = admin_list_contract_market_providers(db)
+    provider_label = _market_provider_display_label(items, provider)
+    test_notice, test_error = _market_provider_test_feedback(test_result, reason, provider_label)
+    return render(
+        request,
+        "admin/market_providers.html",
+        ctx={
+            "items": items,
+            "notice": notice or test_notice,
+            "error": error or test_error,
+            "active_group": "market_analysis",
+            "active": "market_providers",
+        },
+    )
+
+
+@router.post("/market-providers/{provider_code}/update")
+def market_provider_update_submit(
+    request: Request,
+    provider_code: str,
+    enabled: str = Form(""),
+    priority: str = Form(""),
+    base_url: str = Form(""),
+    timeout_ms: str = Form(""),
+    cooldown_seconds: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, "contract_symbols.manage")
+    if redir:
+        return redir
+    result = admin_update_contract_market_provider(
+        db,
+        provider_code,
+        {
+            "enabled": enabled,
+            "priority": priority,
+            "base_url": base_url,
+            "timeout_ms": timeout_ms,
+            "cooldown_seconds": cooldown_seconds,
+        },
+    )
+    return RedirectResponse(
+        url=_build_market_providers_redirect_url(
+            notice="行情源配置已更新" if result.get("ok") else "",
+            error="" if result.get("ok") else str(result.get("message") or "行情源配置更新失败"),
+        ),
+        status_code=302,
+    )
+
+
+@router.post("/market-providers/{provider_code}/test")
+def market_provider_test_submit(
+    request: Request,
+    provider_code: str,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, "contract_symbols.manage")
+    if redir:
+        return redir
+    result = test_contract_market_provider_connection(db, provider_code)
+    ok = bool(result.get("ok"))
+    reason = "" if ok else classify_market_provider_error(str(result.get("message") or ""))
+    return RedirectResponse(
+        url=_build_market_providers_redirect_url(
+            test_result="success" if ok else "failed",
+            reason=reason if not ok else "",
+            provider=str(provider_code or "").strip().upper(),
+        ),
+        status_code=302,
+    )
+
+
 @router.get("/contract-accounts", response_class=HTMLResponse)
 def contract_accounts_page(
     request: Request,
@@ -10062,7 +10533,7 @@ def _default_contract_symbol_form() -> Dict[str, str]:
 def _contract_symbol_form_options() -> Dict[str, list[str]]:
     return {
         "category_options": ["CRYPTO", "STOCK", "INDEX", "FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES"],
-        "provider_options": ["BINANCE", "ITICK", "INTERNAL", "MANUAL"],
+        "provider_options": ["BINANCE", "ITICK", "INTERNAL"],
         "tp_sl_trigger_price_type_options": ["MARK_PRICE", "LAST_PRICE"],
     }
 
@@ -12586,6 +13057,8 @@ def dealer_risk_save(
         )
 
     notice_message = "平台对手方限额已更新" if str(id).isdigit() else "平台对手方限额已创建"
+    db.commit()
+    notice_message = result.get("message") or notice_message
     return RedirectResponse(
         url=_build_platform_redirect_url(
             next_path="/admin/platform/dealer-risk",
@@ -12607,6 +13080,8 @@ def dealer_risk_toggle_enabled(
         return redir
 
     result = admin_toggle_dealer_risk_enabled(db, risk_id)
+    if result["ok"]:
+        db.commit()
     return RedirectResponse(
         url=_build_platform_redirect_url(
             next_path=next_path,
@@ -12629,6 +13104,8 @@ def dealer_risk_toggle_status(
         return redir
 
     result = admin_toggle_dealer_risk_status(db, risk_id)
+    if result["ok"]:
+        db.commit()
     return RedirectResponse(
         url=_build_platform_redirect_url(
             next_path=next_path,
@@ -12922,11 +13399,11 @@ def site_settings_submit(
     home_hero_cta_link: str = Form(""),
     home_hero_image: str = Form(""),
     show_risk_link: bool = Form(False),
-    risk_link_url: str = Form(""),
+    risk_link_url: Optional[str] = Form(None),
     show_terms_link: bool = Form(False),
-    terms_link_url: str = Form(""),
+    terms_link_url: Optional[str] = Form(None),
     show_privacy_link: bool = Form(False),
-    privacy_link_url: str = Form(""),
+    privacy_link_url: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     redir = require_admin(request)
@@ -12998,6 +13475,98 @@ def site_settings_submit(
     )
     return RedirectResponse(
         url=_build_site_content_redirect_url("/admin/site-settings", notice="Site settings saved"),
+        status_code=302,
+    )
+
+
+@router.get("/site-about-page", response_class=HTMLResponse)
+def site_about_page(
+    request: Request,
+    notice: str = "",
+    error: str = "",
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    settings_row = get_or_create_site_settings(db)
+    return render(
+        request,
+        "admin/site_about_page.html",
+        ctx={
+            "active_group": "operations",
+            "active": "site_about_page",
+            "notice": notice,
+            "error": error,
+            "about_page": admin_about_page_form(settings_row),
+        },
+    )
+
+
+@router.post("/site-about-page")
+async def site_about_page_submit(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
+
+    form_data = await request.form()
+    payload = {key: str(value) for key, value in form_data.items()}
+    update_about_page_sections(db, payload)
+    return RedirectResponse(
+        url=_build_site_content_redirect_url("/admin/site-about-page", notice="关于我们页面内容已保存"),
+        status_code=302,
+    )
+
+
+@router.get("/site-legal-pages", response_class=HTMLResponse)
+def site_legal_pages(
+    request: Request,
+    notice: str = "",
+    error: str = "",
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    settings_row = get_or_create_site_settings(db)
+    return render(
+        request,
+        "admin/site_legal_pages.html",
+        ctx={
+            "active_group": "operations",
+            "active": "site_legal_pages",
+            "notice": notice,
+            "error": error,
+            "legal_pages": admin_legal_pages_form(settings_row),
+        },
+    )
+
+
+@router.post("/site-legal-pages")
+async def site_legal_pages_submit(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+    redir = require_admin_post_permission(request, db, "site_content.manage")
+    if redir:
+        return redir
+
+    form_data = await request.form()
+    payload = {key: str(value) for key, value in form_data.items()}
+    update_legal_pages(db, payload)
+    return RedirectResponse(
+        url=_build_site_content_redirect_url("/admin/site-legal-pages", notice="风险与协议页面内容已保存"),
         status_code=302,
     )
 
@@ -14340,5 +14909,3 @@ def logout():
     resp = RedirectResponse(url="/admin/login", status_code=302)
     _delete_admin_login_cookies(resp)
     return resp
-
-

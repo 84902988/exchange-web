@@ -23,18 +23,28 @@ from app.services.itick_holiday_service import (
 )
 from app.services.itick_market_service import ItickMarketServiceError, itick_market_service
 from app.services.market_kline_cache import get_klines_cache_first, upsert_klines
+from app.services.contract_market_provider_service import (
+    MarketDataProviderConfig,
+    contract_market_last_good_enabled,
+    enabled_contract_market_providers,
+    mark_contract_market_provider_failure,
+    mark_contract_market_provider_success,
+    request_contract_market_provider_json,
+    resolve_contract_provider_symbol,
+)
 
 
 logger = logging.getLogger(__name__)
 
 CONTRACT_MARKET_SESSION_POLICY_VERSION = "v1"
 CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION = "ld"
-CONTRACT_MARKET_STATUS_VERSION = "v2.1"
+CONTRACT_MARKET_STATUS_VERSION = "v2.2"
 
 QUOTE_FRESHNESS_LIVE = "LIVE"
 QUOTE_FRESHNESS_STALE = "STALE"
 QUOTE_FRESHNESS_LAST_VALID = "LAST_VALID"
 QUOTE_FRESHNESS_FALLBACK = "FALLBACK"
+QUOTE_SOURCE_LAST_GOOD_BBO = "LAST_GOOD_BBO"
 QUOTE_FRESHNESS_LIVE_SECONDS = 30
 QUOTE_FRESHNESS_LAST_VALID_SECONDS = 300
 
@@ -404,41 +414,115 @@ def _quote_freshness_for_payload(payload: dict[str, Any]) -> str:
     return QUOTE_FRESHNESS_LAST_VALID
 
 
-def _with_market_status(payload: dict[str, Any], status: ItickMarketStatus) -> dict[str, Any]:
-    payload.update(status.to_payload())
-    payload["quote_freshness"] = _quote_freshness_for_payload(payload)
+def _payload_quote_source(payload: dict[str, Any]) -> str:
+    return str(payload.get("quote_source") or payload.get("source") or "").strip().upper()
+
+
+def _is_closed_market_status_value(value: Any) -> bool:
+    return str(value or "").strip().upper() in {"CLOSED", "HOLIDAY"}
+
+
+def _payload_has_valid_bbo(payload: dict[str, Any]) -> bool:
+    bid = _to_decimal(payload.get("bid_price") or payload.get("best_bid") or payload.get("bid"))
+    ask = _to_decimal(payload.get("ask_price") or payload.get("best_ask") or payload.get("ask"))
+    return bid is not None and ask is not None and bid > 0 and ask > 0 and ask >= bid
+
+
+def _payload_quote_executable(payload: dict[str, Any]) -> bool:
+    quote_source = _payload_quote_source(payload)
+    market_status = str(payload.get("market_status") or "").strip().upper()
+    if (
+        quote_source == QUOTE_SOURCE_LAST_GOOD_BBO
+        and _is_closed_market_status_value(market_status)
+        and _payload_has_valid_bbo(payload)
+    ):
+        return True
+    if payload.get("quote_freshness") != QUOTE_FRESHNESS_LIVE:
+        return False
+    if any(token in quote_source for token in ("FALLBACK", "LAST_VALID", "STALE", "INVALID")):
+        return False
+    return _payload_has_valid_bbo(payload)
+
+
+def _augment_contract_quote_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    payload["quote_source"] = _payload_quote_source(payload) or str(payload.get("source") or "UNKNOWN")
+    payload["is_realtime"] = (
+        payload.get("quote_freshness") == QUOTE_FRESHNESS_LIVE
+        and payload["quote_source"] != QUOTE_SOURCE_LAST_GOOD_BBO
+    )
+    if payload["quote_source"] == QUOTE_SOURCE_LAST_GOOD_BBO:
+        payload["last_good_at"] = payload.get("last_good_at") or payload.get("ts")
+    else:
+        payload.setdefault("last_good_at", None)
+    payload["executable"] = _payload_quote_executable(payload)
     return payload
 
 
+def _with_market_status(payload: dict[str, Any], status: ItickMarketStatus) -> dict[str, Any]:
+    payload.update(status.to_payload())
+    payload["quote_freshness"] = _quote_freshness_for_payload(payload)
+    return _augment_contract_quote_payload(payload)
+
+
 def _is_market_closed(status: ItickMarketStatus) -> bool:
-    return status.market_status == MARKET_STATUS_CLOSED
+    return status.market_status == MARKET_STATUS_CLOSED or _is_closed_market_status_value(status.market_status)
 
 
-def _fixed_spread_x(contract_symbol: Optional[ContractSymbol]) -> Decimal:
-    spread_x = _to_decimal(getattr(contract_symbol, "spread_x", None))
-    if spread_x is None or spread_x < 0:
+def _manual_spread_addon(contract_symbol: Optional[ContractSymbol]) -> Decimal:
+    # contract_symbols.spread_x stores the manual addon, not a replacement spread.
+    manual_addon = _to_decimal(getattr(contract_symbol, "spread_x", None))
+    if manual_addon is None or manual_addon < 0:
         return Decimal("0")
-    return spread_x
+    return manual_addon
 
 
-def apply_fixed_spread_x(raw_bid: Decimal, raw_ask: Decimal, spread_x: Decimal) -> tuple[Decimal, Decimal]:
-    spread = spread_x if spread_x > Decimal("0") else Decimal("0")
-    return raw_bid - spread, raw_ask + spread
+def _auto_spread_from_prices(bid_price: Optional[Decimal], ask_price: Optional[Decimal]) -> Decimal:
+    if bid_price is None or ask_price is None or bid_price <= 0 or ask_price <= 0:
+        return Decimal("0")
+    spread = ask_price - bid_price
+    if spread <= 0:
+        return Decimal("0")
+    return spread
 
 
-def _apply_fixed_spread_x_to_quote(quote: dict[str, Any], contract_symbol: Optional[ContractSymbol]) -> dict[str, Any]:
+def _effective_spread_x(auto_spread: Decimal, manual_addon: Decimal) -> Decimal:
+    return max(auto_spread, Decimal("0")) + max(manual_addon, Decimal("0")) * Decimal("2")
+
+
+def _single_side_spread_fee_price(effective_spread: Decimal) -> Decimal:
+    if effective_spread <= Decimal("0"):
+        return Decimal("0")
+    return effective_spread / Decimal("2")
+
+
+def apply_manual_spread_addon(
+    raw_bid: Decimal,
+    raw_ask: Decimal,
+    manual_addon: Decimal,
+) -> tuple[Decimal, Decimal]:
+    addon = manual_addon if manual_addon > Decimal("0") else Decimal("0")
+    return raw_bid - addon, raw_ask + addon
+
+
+def _apply_effective_spread_x_to_quote(quote: dict[str, Any], contract_symbol: Optional[ContractSymbol]) -> dict[str, Any]:
     if quote.get("spread_x_applied"):
-        return quote
-
-    spread_x = _fixed_spread_x(contract_symbol)
-    quote["spread_x"] = spread_x
-    if spread_x <= Decimal("0"):
-        quote["spread_x_applied"] = True
         return quote
 
     raw_bid = _require_positive(_to_decimal(quote.get("bid_price")), "bid_price")
     raw_ask = _require_positive(_to_decimal(quote.get("ask_price")), "ask_price")
-    adjusted_bid, adjusted_ask = apply_fixed_spread_x(raw_bid, raw_ask, spread_x)
+    auto_spread = _auto_spread_from_prices(raw_bid, raw_ask)
+    manual_addon = _manual_spread_addon(contract_symbol)
+    effective_spread = _effective_spread_x(auto_spread, manual_addon)
+    quote["manual_spread_x"] = manual_addon
+    quote["effective_total_spread"] = effective_spread
+    quote["single_side_spread_fee_price"] = _single_side_spread_fee_price(effective_spread)
+    quote["spread_x"] = effective_spread
+
+    if manual_addon <= Decimal("0"):
+        quote["spread_x_applied"] = True
+        return quote
+
+    adjusted_bid, adjusted_ask = apply_manual_spread_addon(raw_bid, raw_ask, manual_addon)
     quote["raw_bid_price"] = quote.get("raw_bid_price", raw_bid)
     quote["raw_ask_price"] = quote.get("raw_ask_price", raw_ask)
     quote["bid_price"] = adjusted_bid
@@ -462,24 +546,32 @@ def _shift_depth_levels(levels: Any, delta: Decimal) -> list[list[Decimal]]:
     return shifted
 
 
-def _apply_fixed_spread_x_to_depth(depth: dict[str, Any], contract_symbol: Optional[ContractSymbol]) -> dict[str, Any]:
+def _apply_effective_spread_x_to_depth(depth: dict[str, Any], contract_symbol: Optional[ContractSymbol]) -> dict[str, Any]:
     if depth.get("spread_x_applied"):
-        return depth
-
-    spread_x = _fixed_spread_x(contract_symbol)
-    depth["spread_x"] = spread_x
-    if spread_x <= Decimal("0"):
-        depth["spread_x_applied"] = True
         return depth
 
     raw_bids = _copy_depth_levels(depth.get("bids") or [])
     raw_asks = _copy_depth_levels(depth.get("asks") or [])
+    raw_best_bid = _best_depth_price(raw_bids, side="bid")
+    raw_best_ask = _best_depth_price(raw_asks, side="ask")
+    auto_spread = _auto_spread_from_prices(raw_best_bid, raw_best_ask)
+    manual_addon = _manual_spread_addon(contract_symbol)
+    effective_spread = _effective_spread_x(auto_spread, manual_addon)
+    depth["manual_spread_x"] = manual_addon
+    depth["effective_total_spread"] = effective_spread
+    depth["single_side_spread_fee_price"] = _single_side_spread_fee_price(effective_spread)
+    depth["spread_x"] = effective_spread
+
+    if manual_addon <= Decimal("0"):
+        depth["spread_x_applied"] = True
+        return depth
+
     depth["raw_bids"] = depth.get("raw_bids", raw_bids)
     depth["raw_asks"] = depth.get("raw_asks", raw_asks)
-    depth["raw_best_bid"] = depth.get("raw_best_bid", depth.get("best_bid"))
-    depth["raw_best_ask"] = depth.get("raw_best_ask", depth.get("best_ask"))
-    depth["bids"] = _shift_depth_levels(raw_bids, -spread_x)
-    depth["asks"] = _shift_depth_levels(raw_asks, spread_x)
+    depth["raw_best_bid"] = depth.get("raw_best_bid", raw_best_bid)
+    depth["raw_best_ask"] = depth.get("raw_best_ask", raw_best_ask)
+    depth["bids"] = _shift_depth_levels(raw_bids, -manual_addon)
+    depth["asks"] = _shift_depth_levels(raw_asks, manual_addon)
     depth["best_bid"] = _best_depth_price(depth["bids"], side="bid")
     depth["best_ask"] = _best_depth_price(depth["asks"], side="ask")
     depth["spread_x_applied"] = True
@@ -506,10 +598,22 @@ def _get_closed_depth(symbol: str, *, limit: Optional[int] = None) -> Optional[d
     return _copy_depth_payload(cached, limit=limit)
 
 
+def _is_safe_last_good_bbo_source(source: Any) -> bool:
+    normalized = str(source or "").strip().upper()
+    return bool(normalized) and not any(token in normalized for token in ("FALLBACK", "STALE", "INVALID"))
+
+
 def _set_closed_depth(depth: dict[str, Any]) -> dict[str, Any]:
     symbol = _normalize_symbol(str(depth.get("symbol") or ""))
     frozen = _copy_depth_payload(depth)
-    frozen["source"] = str(frozen.get("source") or "PLATFORM_BBO")
+    original_source = str(frozen.get("source") or "PLATFORM_BBO")
+    frozen["source"] = original_source
+    frozen["quote_source"] = original_source
+    frozen["is_realtime"] = False
+    frozen["last_good_at"] = frozen.get("last_good_at") or frozen.get("ts")
+    if _is_safe_last_good_bbo_source(original_source) and _payload_has_valid_bbo(frozen):
+        frozen["source"] = QUOTE_SOURCE_LAST_GOOD_BBO
+        frozen["quote_source"] = QUOTE_SOURCE_LAST_GOOD_BBO
     _closed_market_depth_cache[symbol] = frozen
     return _copy_depth_payload(frozen)
 
@@ -543,7 +647,14 @@ def _get_closed_quote(symbol: str) -> Optional[dict[str, Any]]:
 def _set_closed_quote(quote: dict[str, Any]) -> dict[str, Any]:
     symbol = _normalize_symbol(str(quote.get("symbol") or ""))
     frozen = _copy_closed_quote(quote)
-    frozen["source"] = str(frozen.get("source") or "PLATFORM_BBO")
+    original_source = str(frozen.get("source") or "PLATFORM_BBO")
+    frozen["source"] = original_source
+    frozen["quote_source"] = original_source
+    frozen["is_realtime"] = False
+    frozen["last_good_at"] = frozen.get("last_good_at") or frozen.get("ts")
+    if _is_safe_last_good_bbo_source(original_source) and _payload_has_valid_bbo(frozen):
+        frozen["source"] = QUOTE_SOURCE_LAST_GOOD_BBO
+        frozen["quote_source"] = QUOTE_SOURCE_LAST_GOOD_BBO
     _closed_market_quote_cache[symbol] = frozen
     return _copy_closed_quote(frozen)
 
@@ -905,6 +1016,35 @@ def get_last_valid_contract_quote(db: Session, symbol: str) -> Optional[dict[str
     )
 
 
+def _recent_persisted_contract_quote(
+    db: Session,
+    contract_symbol: ContractSymbol,
+    *,
+    max_age_seconds: float = QUOTE_FRESHNESS_LIVE_SECONDS,
+) -> Optional[dict[str, Any]]:
+    quote = get_last_valid_contract_quote(db, contract_symbol.symbol)
+    if quote is None:
+        return None
+
+    ts = _normalize_quote_ts(quote.get("ts"))
+    if ts is None:
+        return None
+
+    age_seconds = (datetime.utcnow() - ts).total_seconds()
+    if age_seconds < -QUOTE_FRESHNESS_LIVE_SECONDS:
+        return None
+    if age_seconds < 0:
+        age_seconds = 0
+    if age_seconds > max_age_seconds:
+        return None
+
+    quote = dict(quote)
+    quote["source"] = "PERSISTED_LIVE"
+    quote["ts"] = ts
+    quote["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
+    return quote
+
+
 def save_last_valid_contract_quote(
     db: Session,
     *,
@@ -1024,10 +1164,27 @@ def _format_optional_decimal(value: Optional[Decimal]) -> Optional[str]:
     return _format_decimal(value)
 
 
-def _extract_itick_24h_ticker_fields(data: Dict[str, Any]) -> dict[str, Optional[str]]:
+def _quote_display_index_price(quote: dict[str, Any]) -> Optional[Decimal]:
+    index_price = _to_decimal(quote.get("index_price"))
+    if index_price is not None and index_price > 0:
+        return index_price
+    mark_price = _to_decimal(quote.get("mark_price"))
+    if mark_price is not None and mark_price > 0:
+        return mark_price
+    last_price = _to_decimal(quote.get("last_price"))
+    if last_price is not None and last_price > 0:
+        return last_price
+    return None
+
+
+def _extract_itick_24h_ticker_fields(
+    data: Dict[str, Any],
+    *,
+    last_price: Optional[Decimal] = None,
+) -> dict[str, Optional[str]]:
     base_volume_24h = _pick_decimal_present(
         data,
-        ["v", "volume", "vol", "base_volume_24h", "volume_24h", "baseVolume"],
+        ["v", "volume", "vol", "base_volume", "base_volume_24h", "volume_24h", "baseVolume"],
     )
     quote_volume_24h = _pick_decimal_present(
         data,
@@ -1045,6 +1202,15 @@ def _extract_itick_24h_ticker_fields(data: Dict[str, Any]) -> dict[str, Optional
             "turnover_24h",
         ],
     )
+    if (
+        (quote_volume_24h is None or quote_volume_24h <= 0)
+        and base_volume_24h is not None
+        and base_volume_24h > 0
+        and last_price is not None
+        and last_price > 0
+    ):
+        # iTick stock contract quote may omit quote turnover; estimate it from last price and base volume.
+        quote_volume_24h = base_volume_24h * last_price
     return {
         "price_change_24h": _format_optional_decimal(
             _pick_decimal_present(
@@ -1053,10 +1219,18 @@ def _extract_itick_24h_ticker_fields(data: Dict[str, Any]) -> dict[str, Optional
             )
         ),
         "high_24h": _format_optional_decimal(
-            _pick_decimal_present(data, ["h", "high", "high_price", "high_24h", "highPrice"], positive=True)
+            _pick_decimal_present(
+                data,
+                ["h", "high", "high_price", "high_24h", "highPrice", "day_high", "dayHigh"],
+                positive=True,
+            )
         ),
         "low_24h": _format_optional_decimal(
-            _pick_decimal_present(data, ["l", "low", "low_price", "low_24h", "lowPrice"], positive=True)
+            _pick_decimal_present(
+                data,
+                ["l", "low", "low_price", "low_24h", "lowPrice", "day_low", "dayLow"],
+                positive=True,
+            )
         ),
         "base_volume_24h": _format_optional_decimal(base_volume_24h),
         "quote_volume_24h": _format_optional_decimal(quote_volume_24h),
@@ -1560,7 +1734,15 @@ def _get_itick_cfd_reference_price(contract_symbol: ContractSymbol) -> tuple[Dec
             ),
         )
 
-    return _stable_reference_price(provider_symbol, category), "CFD_FALLBACK", None, datetime.utcnow()
+    fallback_price = _stable_reference_price(provider_symbol, category)
+    logger.debug(
+        "tradfi_cfd_reference_price_fallback symbol=%s provider_symbol=%s category=%s fallback_price=%s",
+        contract_symbol.symbol,
+        provider_symbol,
+        category,
+        _format_decimal(fallback_price),
+    )
+    return fallback_price, "CFD_FALLBACK", None, datetime.utcnow()
 
 
 def _extend_cfd_depth_side(
@@ -1687,6 +1869,419 @@ def _depth_to_quote(
         source="LIVE",
         ts=datetime.utcnow(),
     )
+
+
+def _provider_data_rows(payload: Any) -> list[Any]:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return [data]
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _provider_first_row(payload: Any) -> dict[str, Any]:
+    rows = _provider_data_rows(payload)
+    if rows and isinstance(rows[0], dict):
+        return rows[0]
+    return {}
+
+
+def _provider_timestamp_ms(value: Any) -> int:
+    timestamp = _to_timestamp_ms(value)
+    return timestamp or int(datetime.utcnow().timestamp() * 1000)
+
+
+def _normalize_provider_depth(
+    *,
+    provider: MarketDataProviderConfig,
+    contract_symbol: ContractSymbol,
+    provider_symbol: str,
+    payload: Any,
+    limit: int,
+) -> dict[str, Any]:
+    data = payload
+    if provider.provider_code == "OKX_SWAP":
+        row = _provider_first_row(payload)
+        data = row
+    elif provider.provider_code == "BITGET_USDT_FUTURES":
+        data = payload.get("data") if isinstance(payload, dict) else payload
+
+    bids = _normalize_depth_levels(data.get("bids") if isinstance(data, dict) else None)
+    asks = _normalize_depth_levels(data.get("asks") if isinstance(data, dict) else None)
+    if not bids or not asks:
+        raise ContractQuoteUnavailable(f"{provider.provider_code}_DEPTH_UNAVAILABLE")
+    return _depth_payload(
+        symbol=contract_symbol.symbol,
+        provider=provider.provider_code,
+        provider_symbol=provider_symbol,
+        bids=bids[:limit],
+        asks=asks[:limit],
+        source="LIVE",
+        ts=datetime.utcnow(),
+    )
+
+
+def _provider_ticker_last_price(provider_code: str, payload: Any) -> Optional[Decimal]:
+    if provider_code == "OKX_SWAP":
+        row = _provider_first_row(payload)
+        return _to_decimal(row.get("last"))
+    if provider_code == "BITGET_USDT_FUTURES":
+        row = _provider_first_row(payload)
+        return _to_decimal(_pick_first_present(row, ["lastPr", "last", "close"]))
+    if provider_code == "BINANCE_USDM" and isinstance(payload, dict):
+        return _to_decimal(_pick_first_present(payload, ["lastPrice", "price"]))
+    return None
+
+
+def _provider_funding_rate(provider_code: str, payload: Any) -> Optional[Decimal]:
+    if provider_code in {"OKX_SWAP", "BITGET_USDT_FUTURES"}:
+        row = _provider_first_row(payload)
+        return _to_decimal(row.get("fundingRate"))
+    if provider_code == "BINANCE_USDM":
+        rows = _provider_data_rows(payload)
+        if rows and isinstance(rows[0], dict):
+            return _to_decimal(rows[0].get("fundingRate"))
+        if isinstance(payload, dict):
+            return _to_decimal(payload.get("lastFundingRate") or payload.get("fundingRate"))
+    return None
+
+
+def _configured_provider_symbol(
+    db: Session,
+    provider: MarketDataProviderConfig,
+    contract_symbol: ContractSymbol,
+) -> str:
+    return resolve_contract_provider_symbol(
+        db,
+        provider_code=provider.provider_code,
+        local_symbol=contract_symbol.symbol,
+        fallback_symbol=getattr(contract_symbol, "provider_symbol", None),
+    )
+
+
+def _get_configured_contract_live_depth(
+    db: Session,
+    contract_symbol: ContractSymbol,
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    last_error: Optional[Exception] = None
+    for provider in enabled_contract_market_providers(db):
+        try:
+            provider_symbol = _configured_provider_symbol(db, provider, contract_symbol)
+            payload = request_contract_market_provider_json(provider, "depth", provider_symbol, limit=limit)
+            depth = _normalize_provider_depth(
+                provider=provider,
+                contract_symbol=contract_symbol,
+                provider_symbol=provider_symbol,
+                payload=payload,
+                limit=limit,
+            )
+            mark_contract_market_provider_success(db, provider.provider_code)
+            logger.info(
+                "contract_provider_depth_success symbol=%s provider=%s provider_symbol=%s best_bid=%s best_ask=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+                provider_symbol,
+                depth.get("best_bid"),
+                depth.get("best_ask"),
+            )
+            return depth
+        except Exception as exc:
+            last_error = exc
+            mark_contract_market_provider_failure(
+                db,
+                provider.provider_code,
+                exc,
+                cooldown_seconds=provider.cooldown_seconds,
+            )
+            logger.warning(
+                "contract_provider_depth_failed symbol=%s provider=%s reason=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+                exc,
+            )
+            continue
+    raise ContractQuoteUnavailable("CONTRACT_MARKET_PROVIDER_DEPTH_UNAVAILABLE") from last_error
+
+
+def _get_configured_contract_live_quote(db: Session, contract_symbol: ContractSymbol) -> dict[str, Any]:
+    last_error: Optional[Exception] = None
+    for provider in enabled_contract_market_providers(db):
+        try:
+            provider_symbol = _configured_provider_symbol(db, provider, contract_symbol)
+            depth_payload = request_contract_market_provider_json(provider, "depth", provider_symbol, limit=5)
+            depth = _normalize_provider_depth(
+                provider=provider,
+                contract_symbol=contract_symbol,
+                provider_symbol=provider_symbol,
+                payload=depth_payload,
+                limit=5,
+            )
+            last_price: Optional[Decimal] = None
+            funding_rate: Optional[Decimal] = None
+            try:
+                ticker_payload = request_contract_market_provider_json(provider, "ticker", provider_symbol, limit=1)
+                last_price = _provider_ticker_last_price(provider.provider_code, ticker_payload)
+            except Exception:
+                last_price = None
+            try:
+                funding_payload = request_contract_market_provider_json(provider, "funding", provider_symbol, limit=1)
+                funding_rate = _provider_funding_rate(provider.provider_code, funding_payload)
+            except Exception:
+                funding_rate = None
+            quote = _depth_to_quote(contract_symbol=contract_symbol, depth=depth, last_price=last_price)
+            quote["provider"] = provider.provider_code
+            quote["provider_symbol"] = provider_symbol
+            if funding_rate is not None:
+                quote["funding_rate"] = funding_rate
+            _cache_depth(depth)
+            mark_contract_market_provider_success(db, provider.provider_code)
+            logger.debug(
+                "contract_provider_quote_success symbol=%s provider=%s provider_symbol=%s bid=%s ask=%s last=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+                provider_symbol,
+                quote.get("bid_price"),
+                quote.get("ask_price"),
+                quote.get("last_price"),
+            )
+            return quote
+        except Exception as exc:
+            last_error = exc
+            mark_contract_market_provider_failure(
+                db,
+                provider.provider_code,
+                exc,
+                cooldown_seconds=provider.cooldown_seconds,
+            )
+            logger.warning(
+                "contract_provider_quote_failed symbol=%s provider=%s reason=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+                exc,
+            )
+            continue
+    raise ContractQuoteUnavailable("CONTRACT_MARKET_PROVIDER_QUOTE_UNAVAILABLE") from last_error
+
+
+def _configured_contract_ticker(db: Session, contract_symbol: ContractSymbol) -> dict[str, Any]:
+    last_error: Optional[Exception] = None
+    for provider in enabled_contract_market_providers(db):
+        try:
+            provider_symbol = _configured_provider_symbol(db, provider, contract_symbol)
+            payload = request_contract_market_provider_json(provider, "ticker", provider_symbol, limit=1)
+            last_price = _provider_ticker_last_price(provider.provider_code, payload)
+            if last_price is None or last_price <= 0:
+                raise ContractQuoteUnavailable(f"{provider.provider_code}_TICKER_UNAVAILABLE")
+            row = _provider_first_row(payload)
+            if provider.provider_code == "OKX_SWAP":
+                high_24h = _to_decimal(row.get("high24h"))
+                low_24h = _to_decimal(row.get("low24h"))
+                volume = _to_decimal(row.get("vol24h"))
+                quote_volume = _to_decimal(row.get("volCcy24h"))
+            elif provider.provider_code == "BITGET_USDT_FUTURES":
+                high_24h = _to_decimal(row.get("high24h"))
+                low_24h = _to_decimal(row.get("low24h"))
+                volume = _to_decimal(row.get("baseVolume"))
+                quote_volume = _to_decimal(row.get("quoteVolume"))
+            else:
+                high_24h = _to_decimal(payload.get("highPrice")) if isinstance(payload, dict) else None
+                low_24h = _to_decimal(payload.get("lowPrice")) if isinstance(payload, dict) else None
+                volume = _to_decimal(payload.get("volume")) if isinstance(payload, dict) else None
+                quote_volume = _to_decimal(payload.get("quoteVolume")) if isinstance(payload, dict) else None
+            mark_contract_market_provider_success(db, provider.provider_code)
+            return {
+                "symbol": contract_symbol.symbol,
+                "last_price": _format_decimal(last_price),
+                "price_change_24h": None,
+                "price_change_percent_24h": str(row.get("change24h") or row.get("priceChangePercent") or "")
+                or None,
+                "high_24h": _format_optional_decimal(high_24h),
+                "low_24h": _format_optional_decimal(low_24h),
+                "base_volume_24h": _format_optional_decimal(volume),
+                "quote_volume_24h": _format_optional_decimal(quote_volume),
+                "source": "LIVE",
+                "ts": datetime.utcnow(),
+            }
+        except Exception as exc:
+            last_error = exc
+            mark_contract_market_provider_failure(
+                db,
+                provider.provider_code,
+                exc,
+                cooldown_seconds=provider.cooldown_seconds,
+            )
+            continue
+    raise ContractQuoteUnavailable("CONTRACT_MARKET_PROVIDER_TICKER_UNAVAILABLE") from last_error
+
+
+def _provider_bar_value(provider_code: str, interval: str) -> str:
+    normalized = _normalize_contract_interval(interval)
+    if provider_code in {"OKX_SWAP", "BITGET_USDT_FUTURES"}:
+        return {
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D",
+            "1w": "1W",
+        }.get(normalized, normalized)
+    return normalized
+
+
+def _provider_kline_extra_params(provider_code: str, interval: str, end_time_ms: Optional[int]) -> dict[str, Any]:
+    bar = _provider_bar_value(provider_code, interval)
+    if provider_code == "OKX_SWAP":
+        params: dict[str, Any] = {"bar": bar}
+    elif provider_code == "BITGET_USDT_FUTURES":
+        params = {"granularity": bar}
+    elif provider_code == "BINANCE_USDM":
+        params = {"interval": _normalize_contract_interval(interval)}
+    else:
+        params = {}
+    if end_time_ms and provider_code == "BINANCE_USDM":
+        params["endTime"] = max(int(end_time_ms) - 1, 1)
+    if end_time_ms and provider_code == "BITGET_USDT_FUTURES":
+        params["endTime"] = max(int(end_time_ms) - 1, 1)
+    return params
+
+
+def _normalize_provider_kline_rows(provider_code: str, payload: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    raw_rows = _provider_data_rows(payload)
+    for row in raw_rows:
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        open_time = _provider_timestamp_ms(row[0])
+        if any(_to_decimal(value) is None for value in (row[1], row[2], row[3], row[4])):
+            continue
+        rows.append(
+            {
+                "open_time": open_time,
+                "open": str(row[1]),
+                "high": str(row[2]),
+                "low": str(row[3]),
+                "close": str(row[4]),
+                "volume": str(row[5] if len(row) > 5 else "0"),
+                "quote_volume": str(row[6] if len(row) > 6 else "0"),
+            }
+        )
+    rows.sort(key=lambda item: int(item["open_time"]))
+    return rows
+
+
+def _get_configured_contract_klines(
+    db: Session,
+    contract_symbol: ContractSymbol,
+    *,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    last_error: Optional[Exception] = None
+    for provider in enabled_contract_market_providers(db):
+        try:
+            provider_symbol = _configured_provider_symbol(db, provider, contract_symbol)
+            payload = request_contract_market_provider_json(
+                provider,
+                "kline",
+                provider_symbol,
+                limit=limit,
+                extra_params=_provider_kline_extra_params(provider.provider_code, interval, end_time_ms),
+            )
+            rows = _normalize_provider_kline_rows(provider.provider_code, payload)
+            if end_time_ms:
+                rows = [row for row in rows if int(row.get("open_time") or 0) < int(end_time_ms)]
+            rows = rows[-limit:] if rows else []
+            if not rows:
+                raise ContractQuoteUnavailable(f"{provider.provider_code}_KLINE_UNAVAILABLE")
+            mark_contract_market_provider_success(db, provider.provider_code)
+            return rows
+        except Exception as exc:
+            last_error = exc
+            mark_contract_market_provider_failure(
+                db,
+                provider.provider_code,
+                exc,
+                cooldown_seconds=provider.cooldown_seconds,
+            )
+            logger.warning(
+                "contract_provider_kline_failed symbol=%s provider=%s interval=%s reason=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+                interval,
+                exc,
+            )
+            continue
+    raise ContractQuoteUnavailable("CONTRACT_MARKET_PROVIDER_KLINE_UNAVAILABLE") from last_error
+
+
+def _normalize_provider_trade_rows(provider_code: str, payload: Any, limit: int) -> list[dict[str, Any]]:
+    rows = _provider_data_rows(payload)
+    normalized: list[dict[str, Any]] = []
+    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    for index, row in enumerate(rows[:limit]):
+        if not isinstance(row, dict):
+            continue
+        if provider_code == "OKX_SWAP":
+            trade_id = row.get("tradeId") or row.get("ts") or now_ms - index
+            price = row.get("px")
+            qty = row.get("sz")
+            ts = _provider_timestamp_ms(row.get("ts"))
+            side_text = str(row.get("side") or "").lower()
+            is_buyer_maker = side_text == "sell"
+        elif provider_code == "BITGET_USDT_FUTURES":
+            trade_id = row.get("tradeId") or row.get("ts") or now_ms - index
+            price = row.get("price")
+            qty = row.get("size")
+            ts = _provider_timestamp_ms(row.get("ts"))
+            side_text = str(row.get("side") or "").lower()
+            is_buyer_maker = side_text == "sell"
+        else:
+            trade_id = row.get("id") or row.get("time") or now_ms - index
+            price = row.get("price")
+            qty = row.get("qty")
+            ts = _provider_timestamp_ms(row.get("time"))
+            is_buyer_maker = bool(row.get("isBuyerMaker"))
+        if _to_decimal(price) is None or _to_decimal(qty) is None:
+            continue
+        normalized.append(
+            {
+                "id": trade_id,
+                "price": str(price),
+                "qty": str(qty),
+                "quoteQty": str(price),
+                "time": ts,
+                "isBuyerMaker": is_buyer_maker,
+            }
+        )
+    return normalized
+
+
+def _get_configured_contract_recent_trades(db: Session, contract_symbol: ContractSymbol, *, limit: int) -> list[dict[str, Any]]:
+    last_error: Optional[Exception] = None
+    for provider in enabled_contract_market_providers(db):
+        try:
+            provider_symbol = _configured_provider_symbol(db, provider, contract_symbol)
+            payload = request_contract_market_provider_json(provider, "trades", provider_symbol, limit=limit)
+            rows = _normalize_provider_trade_rows(provider.provider_code, payload, limit)
+            if not rows:
+                raise ContractQuoteUnavailable(f"{provider.provider_code}_TRADES_UNAVAILABLE")
+            mark_contract_market_provider_success(db, provider.provider_code)
+            return rows
+        except Exception as exc:
+            last_error = exc
+            mark_contract_market_provider_failure(
+                db,
+                provider.provider_code,
+                exc,
+                cooldown_seconds=provider.cooldown_seconds,
+            )
+            continue
+    raise ContractQuoteUnavailable("CONTRACT_MARKET_PROVIDER_TRADES_UNAVAILABLE") from last_error
 
 
 def _get_binance_live_quote(contract_symbol: ContractSymbol) -> dict[str, Any]:
@@ -1828,7 +2423,7 @@ def _candidate_binance_usdm_base_urls() -> list[str]:
         base = item.rstrip("/")
         if base and base not in normalized:
             normalized.append(base)
-    return normalized or ["https://testnet.binancefuture.com"]
+    return normalized or ["https://fapi.binance.com"]
 
 
 def _mark_binance_failure(provider_symbol: str, base_url: Optional[str] = None) -> None:
@@ -1991,7 +2586,7 @@ def _contract_quote_with_status(
     status: ItickMarketStatus,
     contract_symbol: Optional[ContractSymbol],
 ) -> dict[str, Any]:
-    return _apply_fixed_spread_x_to_quote(_with_market_status(quote, status), contract_symbol)
+    return _apply_effective_spread_x_to_quote(_with_market_status(quote, status), contract_symbol)
 
 
 def _contract_depth_with_status(
@@ -1999,7 +2594,7 @@ def _contract_depth_with_status(
     status: ItickMarketStatus,
     contract_symbol: Optional[ContractSymbol],
 ) -> dict[str, Any]:
-    return _apply_fixed_spread_x_to_depth(_with_market_status(depth, status), contract_symbol)
+    return _apply_effective_spread_x_to_depth(_with_market_status(depth, status), contract_symbol)
 
 
 def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract_quote") -> dict[str, Any]:
@@ -2046,9 +2641,7 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
 
     try:
         if provider == "BINANCE":
-            provider_symbol = _contract_provider_symbol(contract_symbol)
-            quote = _recent_cached_quote(contract_symbol) or _get_binance_live_quote(contract_symbol)
-            quote = _with_binance_premium_fields(quote, provider_symbol)
+            quote = _recent_cached_quote(contract_symbol) or _get_configured_contract_live_quote(db, contract_symbol)
         elif provider == "ITICK":
             quote = _get_itick_live_quote(contract_symbol, log_context=log_context)
         else:
@@ -2056,22 +2649,87 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
 
         quote["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
         quote = _freeze_quote_if_closed(quote, market_status)
-        save_last_valid_contract_quote(
-            db,
-            symbol=quote["symbol"],
-            provider=quote["provider"],
-            provider_symbol=quote["provider_symbol"],
-            bid_price=quote["bid_price"],
-            ask_price=quote["ask_price"],
-            last_price=quote["last_price"],
-            mark_price=quote["mark_price"],
-            source="LIVE",
-            ts=quote["ts"],
-        )
+        quote_source = str(quote.get("source") or "LIVE")
+        quote_freshness = _quote_freshness_for_payload(quote)
+        if (
+            quote_freshness != QUOTE_FRESHNESS_LIVE
+            and provider == "ITICK"
+            and _is_tradfi_cfd_contract(contract_symbol)
+        ):
+            recent_quote = _recent_persisted_contract_quote(db, contract_symbol)
+            if recent_quote is not None:
+                logger.info(
+                    "contract_quote_recent_persisted_fallback symbol=%s provider_symbol=%s provider=%s "
+                    "degraded_source=%s fallback_bid=%s fallback_ask=%s persisted_bid=%s persisted_ask=%s",
+                    contract_symbol.symbol,
+                    contract_symbol.provider_symbol,
+                    provider,
+                    quote_source,
+                    quote.get("bid_price"),
+                    quote.get("ask_price"),
+                    recent_quote.get("bid_price"),
+                    recent_quote.get("ask_price"),
+                )
+                return _contract_quote_with_status(
+                    _freeze_quote_if_closed(recent_quote, market_status),
+                    market_status,
+                    contract_symbol,
+                )
+
+        if quote_freshness == QUOTE_FRESHNESS_LIVE:
+            save_last_valid_contract_quote(
+                db,
+                symbol=quote["symbol"],
+                provider=quote["provider"],
+                provider_symbol=quote["provider_symbol"],
+                bid_price=quote["bid_price"],
+                ask_price=quote["ask_price"],
+                last_price=quote["last_price"],
+                mark_price=quote["mark_price"],
+                source=quote_source,
+                ts=quote["ts"],
+            )
+        else:
+            _log_contract_market_warning(
+                log_context=log_context,
+                event="contract_quote_skip_last_valid_save",
+                symbol=contract_symbol.symbol,
+                reason=quote_source,
+                message="contract_quote_skip_last_valid_save symbol=%s provider_symbol=%s provider=%s source=%s",
+                args=(contract_symbol.symbol, contract_symbol.provider_symbol, provider, quote_source),
+            )
         db.commit()
         return _contract_quote_with_status(quote, market_status, contract_symbol)
     except Exception as exc:
         db.rollback()
+        if provider == "BINANCE" and not contract_market_last_good_enabled(db):
+            raise
+        if provider == "ITICK" and _is_tradfi_cfd_contract(contract_symbol):
+            recent_quote = _recent_persisted_contract_quote(db, contract_symbol)
+            if recent_quote is not None:
+                _log_contract_market_warning(
+                    log_context=log_context,
+                    event="contract_quote_recent_persisted_error_fallback",
+                    symbol=contract_symbol.symbol,
+                    reason=exc,
+                    message=(
+                        "contract_quote_recent_persisted_error_fallback symbol=%s provider_symbol=%s "
+                        "provider=%s reason=%s fallback_bid=%s fallback_ask=%s"
+                    ),
+                    args=(
+                        contract_symbol.symbol,
+                        contract_symbol.provider_symbol,
+                        provider,
+                        exc,
+                        recent_quote.get("bid_price"),
+                        recent_quote.get("ask_price"),
+                    ),
+                )
+                return _contract_quote_with_status(
+                    _freeze_quote_if_closed(recent_quote, market_status),
+                    market_status,
+                    contract_symbol,
+                )
         cached_depth = _get_cached_depth(contract_symbol.symbol, limit=5, source="LAST_VALID")
         if cached_depth is not None:
             _log_contract_market_warning(
@@ -2126,35 +2784,16 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
         raise
 
 
-def _contract_ticker_from_binance(contract_symbol: ContractSymbol) -> dict[str, Any]:
-    provider_symbol = str(contract_symbol.provider_symbol or "").strip().upper()
-    if not provider_symbol:
-        raise ContractQuoteUnavailable("provider_symbol is required")
-
-    payload = _request_binance_usdm_json("/fapi/v1/ticker/24hr", {"symbol": provider_symbol}, timeout=1.0)
-    if not isinstance(payload, dict):
-        raise ContractQuoteUnavailable("BINANCE_FUTURES_TICKER_UNAVAILABLE")
-
-    last_price = _to_decimal(payload.get("lastPrice"))
-    price_change = _to_decimal(payload.get("priceChange"))
-    high_24h = _to_decimal(payload.get("highPrice"))
-    low_24h = _to_decimal(payload.get("lowPrice"))
-    base_volume_24h = _to_decimal(payload.get("volume"))
-    quote_volume_24h = _to_decimal(payload.get("quoteVolume"))
-    return {
-        "symbol": contract_symbol.symbol,
-        "last_price": _format_decimal(last_price) if last_price is not None and last_price > 0 else None,
-        "price_change_24h": _format_optional_decimal(price_change),
-        "price_change_percent_24h": str(payload.get("priceChangePercent"))
-        if payload.get("priceChangePercent") not in (None, "")
-        else None,
-        "high_24h": _format_optional_decimal(high_24h),
-        "low_24h": _format_optional_decimal(low_24h),
-        "base_volume_24h": _format_optional_decimal(base_volume_24h),
-        "quote_volume_24h": _format_optional_decimal(quote_volume_24h),
-        "source": "LIVE",
-        "ts": datetime.utcnow(),
-    }
+def _contract_ticker_from_binance(db: Session, contract_symbol: ContractSymbol) -> dict[str, Any]:
+    try:
+        return _configured_contract_ticker(db, contract_symbol)
+    except Exception as exc:
+        if not contract_market_last_good_enabled(db):
+            raise
+        fallback = get_last_valid_contract_quote(db, contract_symbol.symbol)
+        if fallback is not None:
+            return _ticker_from_quote_payload(contract_symbol.symbol, fallback)
+        raise ContractQuoteUnavailable("CONTRACT_MARKET_PROVIDER_TICKER_UNAVAILABLE") from exc
 
 
 def _quote_from_stock_quote_item(
@@ -2194,7 +2833,9 @@ def _contract_ticker_from_stock_contract(
             normalized_symbol,
             allow_stale=itick_market_service.is_quote_depth_cooldown_active(),
         )
-        if cached_ticker is not None:
+        if cached_ticker is not None and (
+            itick_market_service.is_quote_depth_cooldown_active() or _has_ticker_24h_fields(cached_ticker)
+        ):
             return cached_ticker
         if itick_market_service.is_quote_depth_cooldown_active():
             return {"symbol": normalized_symbol, "last_price": None, "price_change_percent_24h": None}
@@ -2211,6 +2852,7 @@ def _contract_ticker_from_stock_contract(
         data,
         ["chp", "rate", "change_percent", "price_change_percent", "percent", "pct_chg"],
     )
+    ticker_24h_fields = _extract_itick_24h_ticker_fields(data, last_price=last_price)
     if last_price is not None and last_price > 0:
         quote_ts = _itick_quote_timestamp(data)
         quote = _quote_from_stock_quote_item(
@@ -2218,6 +2860,8 @@ def _contract_ticker_from_stock_contract(
             provider_symbol=normalized_provider_symbol,
             data=data,
         )
+        quote.update(ticker_24h_fields)
+        quote["price_change_percent_24h"] = str(change_percent) if change_percent not in (None, "") else None
         _cache_tradfi_quote(quote)
     return {
         "symbol": normalized_symbol,
@@ -2225,6 +2869,7 @@ def _contract_ticker_from_stock_contract(
         "price_change_percent_24h": str(change_percent) if change_percent not in (None, "") else None,
         "source": "ITICK_QUOTE" if last_price is not None and last_price > 0 else None,
         "ts": quote_ts if last_price is not None and last_price > 0 else None,
+        **ticker_24h_fields,
     }
 
 
@@ -2252,7 +2897,7 @@ def _contract_ticker_from_itick_cfd(contract_symbol: ContractSymbol) -> dict[str
             data,
             ["chp", "rate", "change_percent", "price_change_percent", "percent", "pct_chg"],
         )
-        ticker_24h_fields = _extract_itick_24h_ticker_fields(data)
+        ticker_24h_fields = _extract_itick_24h_ticker_fields(data, last_price=last_price)
         if last_price is not None and last_price > 0:
             quote_ts = _itick_quote_timestamp(data)
             depth = _build_cfd_depth_from_price(
@@ -2423,7 +3068,7 @@ def get_contract_tickers(
         provider = str(contract_symbol.provider or "").strip().upper()
         try:
             if provider == "BINANCE":
-                items.append(_contract_ticker_from_binance(contract_symbol))
+                items.append(_contract_ticker_from_binance(db, contract_symbol))
                 continue
             if provider == "ITICK":
                 if _is_stock_contract_config(contract_symbol):
@@ -2534,7 +3179,7 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
 
     try:
         if provider == "BINANCE":
-            depth = _get_binance_live_depth(contract_symbol, limit=safe_limit)
+            depth = _get_configured_contract_live_depth(db, contract_symbol, limit=safe_limit)
         elif provider == "ITICK":
             if _is_tradfi_cfd_contract(contract_symbol):
                 depth = _get_itick_cfd_depth(contract_symbol, limit=safe_limit)
@@ -2548,28 +3193,45 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
         depth = _freeze_depth_if_closed(depth, market_status, limit=safe_limit)
         best_bid = _require_positive(depth.get("best_bid"), "bid_price")
         best_ask = _require_positive(depth.get("best_ask"), "ask_price")
+        depth_mid_price = (best_bid + best_ask) / Decimal("2")
         last_valid = get_last_valid_contract_quote(db, contract_symbol.symbol)
         last_price = _to_decimal(last_valid.get("last_price")) if last_valid else None
-        last_price = last_price if last_price is not None and last_price > 0 else (best_bid + best_ask) / Decimal("2")
+        if provider == "ITICK" and _is_tradfi_cfd_contract(contract_symbol):
+            last_price = depth_mid_price
+        else:
+            last_price = last_price if last_price is not None and last_price > 0 else depth_mid_price
         mark_price = _calculate_mark_price(bid_price=best_bid, ask_price=best_ask, last_price=last_price)
-        save_last_valid_contract_quote(
-            db,
-            symbol=contract_symbol.symbol,
-            provider=depth["provider"],
-            provider_symbol=depth["provider_symbol"],
-            bid_price=best_bid,
-            ask_price=best_ask,
-            last_price=last_price,
-            mark_price=mark_price,
-            source="LIVE",
-            ts=depth["ts"],
-        )
-        _cache_depth(depth)
+        depth_source = str(depth.get("source") or "LIVE")
+        if _quote_freshness_for_payload(depth) == QUOTE_FRESHNESS_LIVE:
+            save_last_valid_contract_quote(
+                db,
+                symbol=contract_symbol.symbol,
+                provider=depth["provider"],
+                provider_symbol=depth["provider_symbol"],
+                bid_price=best_bid,
+                ask_price=best_ask,
+                last_price=last_price,
+                mark_price=mark_price,
+                source=depth_source,
+                ts=depth["ts"],
+            )
+            _cache_depth(depth)
+        else:
+            _log_contract_market_warning(
+                log_context="contract_depth",
+                event="contract_depth_skip_last_valid_save",
+                symbol=contract_symbol.symbol,
+                reason=depth_source,
+                message="contract_depth_skip_last_valid_save symbol=%s provider_symbol=%s provider=%s source=%s",
+                args=(contract_symbol.symbol, contract_symbol.provider_symbol, provider, depth_source),
+            )
         db.commit()
         return _contract_depth_with_status(depth, market_status, contract_symbol)
     except Exception as exc:
         db.rollback()
         if not allow_fallback:
+            raise
+        if provider == "BINANCE" and not contract_market_last_good_enabled(db):
             raise
         cached_depth = _get_cached_depth(contract_symbol.symbol, limit=safe_limit, source="LAST_VALID")
         if cached_depth is not None:
@@ -2872,45 +3534,42 @@ def get_contract_klines(
     provider = str(contract_symbol.provider or "").strip().upper()
     provider_symbol = _contract_provider_symbol(contract_symbol)
     if provider == "BINANCE":
-        def _fetch_binance_contract_klines(fetch_limit: int, _fetch_end_time_ms: Optional[int]):
-            params: dict[str, Any] = {
-                "symbol": provider_symbol,
-                "interval": normalized_interval,
-                "limit": fetch_limit,
-            }
-            if _fetch_end_time_ms:
-                params["endTime"] = max(int(_fetch_end_time_ms) - 1, 1)
-            rows = _request_binance_usdm_json(
-                "/fapi/v1/klines",
-                params,
-                timeout=1.2,
+        def _fetch_configured_contract_klines(fetch_limit: int, _fetch_end_time_ms: Optional[int]):
+            return _get_configured_contract_klines(
+                db,
+                contract_symbol,
+                interval=normalized_interval,
+                limit=fetch_limit,
+                end_time_ms=_fetch_end_time_ms,
             )
-            if not isinstance(rows, list):
-                raise ContractQuoteUnavailable("BINANCE_FUTURES_KLINE_UNAVAILABLE")
-            return [
-                {
-                    "open_time": row[0],
-                    "open": row[1],
-                    "high": row[2],
-                    "low": row[3],
-                    "close": row[4],
-                    "volume": row[5],
-                    "quote_volume": row[7] if len(row) > 7 else "0",
-                }
-                for row in rows
-                if isinstance(row, list) and len(row) >= 6
-            ]
 
-        return get_klines_cache_first(
-            db,
-            market_type="contract",
-            symbol=contract_symbol.symbol,
-            interval=normalized_interval,
-            limit=safe_limit,
-            end_time_ms=end_time_ms,
-            source="BINANCE",
-            fetch_external=_fetch_binance_contract_klines,
-        )
+        try:
+            return get_klines_cache_first(
+                db,
+                market_type="contract",
+                symbol=contract_symbol.symbol,
+                interval=normalized_interval,
+                limit=safe_limit,
+                end_time_ms=end_time_ms,
+                source="CONFIGURED",
+                fetch_external=_fetch_configured_contract_klines,
+            )
+        except Exception:
+            if not contract_market_last_good_enabled(db):
+                raise
+            fallback_quote = get_last_valid_contract_quote(db, contract_symbol.symbol)
+            fallback_price = _to_decimal(fallback_quote.get("last_price")) if fallback_quote else None
+            if fallback_price is not None and fallback_price > 0:
+                return _fallback_contract_klines(
+                    symbol=contract_symbol.symbol,
+                    provider_symbol=provider_symbol,
+                    category=_contract_asset_category(contract_symbol),
+                    interval=normalized_interval,
+                    limit=safe_limit,
+                    reference_price=fallback_price,
+                    precision=int(getattr(contract_symbol, "price_precision", 2) or 2),
+                    end_time_ms=end_time_ms,
+                )
 
     precision = int(getattr(contract_symbol, "price_precision", 2) or 2)
     category = _contract_asset_category(contract_symbol)
@@ -3038,13 +3697,11 @@ def get_contract_recent_trades(db: Session, symbol: str, limit: int = 30) -> lis
     else:
         provider = str(contract_symbol.provider or "").strip().upper()
         if provider == "BINANCE":
-            provider_symbol = _contract_provider_symbol(contract_symbol)
-            rows = _request_binance_usdm_json(
-                "/fapi/v1/trades",
-                {"symbol": provider_symbol, "limit": safe_limit},
-                timeout=1.0,
-            )
-            return rows if isinstance(rows, list) else []
+            try:
+                return _get_configured_contract_recent_trades(db, contract_symbol, limit=safe_limit)
+            except Exception:
+                if not contract_market_last_good_enabled(db):
+                    raise
         if provider == "ITICK" and _is_market_closed(_market_status_for_contract_symbol(contract_symbol)):
             return []
         quote = get_contract_quote(db, normalized_symbol)
@@ -3073,6 +3730,10 @@ def get_contract_recent_trades(db: Session, symbol: str, limit: int = 30) -> lis
 
 
 def contract_quote_to_response(quote: dict[str, Any]) -> dict[str, Any]:
+    quote_freshness = quote.get("quote_freshness") or _quote_freshness_for_payload(quote)
+    quote_source = quote.get("quote_source") or quote.get("source") or "UNKNOWN"
+    bid_price = quote["bid_price"]
+    ask_price = quote["ask_price"]
     return {
         "symbol": quote["symbol"],
         "provider": quote["provider"],
@@ -3084,15 +3745,27 @@ def contract_quote_to_response(quote: dict[str, Any]) -> dict[str, Any]:
         "market_timezone": quote.get("market_timezone"),
         "market_trading_hours": quote.get("market_trading_hours"),
         "market_session_type": quote.get("market_session_type"),
-        "quote_freshness": quote.get("quote_freshness") or _quote_freshness_for_payload(quote),
+        "quote_freshness": quote_freshness,
+        "quote_source": quote_source,
+        "executable": bool(quote.get("executable") if quote.get("executable") is not None else _payload_quote_executable({**quote, "quote_freshness": quote_freshness})),
+        "is_realtime": bool(quote.get("is_realtime") if quote.get("is_realtime") is not None else quote_freshness == QUOTE_FRESHNESS_LIVE),
+        "last_good_at": quote.get("last_good_at"),
+        "stale": quote_freshness != QUOTE_FRESHNESS_LIVE,
         "spread_x": _format_decimal(_to_decimal(quote.get("spread_x")) or Decimal("0")),
-        "bid_price": _format_decimal(quote["bid_price"]),
-        "ask_price": _format_decimal(quote["ask_price"]),
+        "manual_spread_x": _format_decimal(_to_decimal(quote.get("manual_spread_x")) or Decimal("0")),
+        "effective_total_spread": _format_decimal(_to_decimal(quote.get("effective_total_spread")) or Decimal("0")),
+        "single_side_spread_fee_price": _format_decimal(_to_decimal(quote.get("single_side_spread_fee_price")) or Decimal("0")),
+        "bid": _format_decimal(bid_price),
+        "ask": _format_decimal(ask_price),
+        "bid_price": _format_decimal(bid_price),
+        "ask_price": _format_decimal(ask_price),
+        "best_bid": _format_decimal(bid_price),
+        "best_ask": _format_decimal(ask_price),
         "raw_bid_price": _format_optional_decimal(_to_decimal(quote.get("raw_bid_price"))),
         "raw_ask_price": _format_optional_decimal(_to_decimal(quote.get("raw_ask_price"))),
         "last_price": _format_decimal(quote["last_price"]),
         "mark_price": _format_decimal(quote["mark_price"]),
-        "index_price": _format_optional_decimal(_to_decimal(quote.get("index_price"))),
+        "index_price": _format_optional_decimal(_quote_display_index_price(quote)),
         "funding_rate": _format_optional_decimal(_to_decimal(quote.get("funding_rate"))),
         "next_funding_time": quote.get("next_funding_time"),
         "source": quote["source"],
@@ -3101,6 +3774,8 @@ def contract_quote_to_response(quote: dict[str, Any]) -> dict[str, Any]:
 
 
 def contract_depth_to_response(depth: dict[str, Any]) -> dict[str, Any]:
+    quote_freshness = depth.get("quote_freshness") or _quote_freshness_for_payload(depth)
+    quote_source = depth.get("quote_source") or depth.get("source") or "UNKNOWN"
     return {
         "symbol": depth["symbol"],
         "provider": depth["provider"],
@@ -3112,12 +3787,21 @@ def contract_depth_to_response(depth: dict[str, Any]) -> dict[str, Any]:
         "market_timezone": depth.get("market_timezone"),
         "market_trading_hours": depth.get("market_trading_hours"),
         "market_session_type": depth.get("market_session_type"),
-        "quote_freshness": depth.get("quote_freshness") or _quote_freshness_for_payload(depth),
+        "quote_freshness": quote_freshness,
+        "quote_source": quote_source,
+        "executable": bool(depth.get("executable") if depth.get("executable") is not None else _payload_quote_executable({**depth, "quote_freshness": quote_freshness})),
+        "is_realtime": bool(depth.get("is_realtime") if depth.get("is_realtime") is not None else quote_freshness == QUOTE_FRESHNESS_LIVE),
+        "last_good_at": depth.get("last_good_at"),
         "spread_x": _format_decimal(_to_decimal(depth.get("spread_x")) or Decimal("0")),
+        "manual_spread_x": _format_decimal(_to_decimal(depth.get("manual_spread_x")) or Decimal("0")),
+        "effective_total_spread": _format_decimal(_to_decimal(depth.get("effective_total_spread")) or Decimal("0")),
+        "single_side_spread_fee_price": _format_decimal(_to_decimal(depth.get("single_side_spread_fee_price")) or Decimal("0")),
         "bids": _format_depth_levels(depth["bids"]),
         "asks": _format_depth_levels(depth["asks"]),
         "raw_bids": _format_depth_levels(depth["raw_bids"]) if depth.get("raw_bids") is not None else None,
         "raw_asks": _format_depth_levels(depth["raw_asks"]) if depth.get("raw_asks") is not None else None,
+        "bid": _format_decimal(depth["best_bid"]) if depth.get("best_bid") is not None else None,
+        "ask": _format_decimal(depth["best_ask"]) if depth.get("best_ask") is not None else None,
         "best_bid": _format_decimal(depth["best_bid"]) if depth.get("best_bid") is not None else None,
         "best_ask": _format_decimal(depth["best_ask"]) if depth.get("best_ask") is not None else None,
         "raw_best_bid": _format_optional_decimal(_to_decimal(depth.get("raw_best_bid"))),

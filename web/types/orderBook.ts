@@ -36,7 +36,7 @@ export interface WsMessage {
   /** 消息类型（orderbook: 订单簿更新, trade: 成交记录, market_summary: 市场摘要, error: 错误消息） */
   type: 'orderbook' | 'trade' | 'market_summary' | 'error';
   /** 消息数据（具体类型根据type字段确定） */
-  data: any;
+  data: unknown;
 }
 
 /**

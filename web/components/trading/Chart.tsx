@@ -2,13 +2,47 @@
 
 declare global {
   interface Window {
-    TradingView?: any;
+    TradingView?: TradingViewGlobal;
   }
 }
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import useLocale from '@/hooks/useLocale';
 import { MACD, RSI, BollingerBands, SMA } from 'technicalindicators';
+
+type TradingViewWidget = {
+  remove: () => void;
+};
+
+type TradingViewGlobal = {
+  widget: new (options: Record<string, unknown>) => TradingViewWidget;
+};
+
+type MacdPoint = {
+  macd?: number;
+  signal?: number;
+  histogram?: number;
+};
+
+type BollingerBandPoint = {
+  upper?: number;
+  middle?: number;
+  lower?: number;
+  pb?: number;
+};
+
+type KlineApiItem = {
+  timestamp: number | string;
+  open: number | string;
+  high: number | string;
+  low: number | string;
+  close: number | string;
+  volume: number | string;
+};
+
+type KlineApiResponse = {
+  data?: KlineApiItem[];
+};
 
 /**
  * 图表组件属性
@@ -43,11 +77,11 @@ interface KlineData {
  */
 interface TechnicalIndicators {
   /** MACD指标数据 */
-  macd?: any[];
+  macd?: MacdPoint[];
   /** RSI指标数据 */
   rsi?: number[];
   /** 布林带指标数据 */
-  bollingerBands?: any[];
+  bollingerBands?: BollingerBandPoint[];
 }
 
 /**
@@ -68,7 +102,7 @@ const Chart: React.FC<ChartProps> = ({ symbol }) => {
   const chartRef = useRef<HTMLDivElement>(null);
   
   /** TradingView图表实例引用 - 用于管理图表生命周期 */
-  const tradingViewRef = useRef<any>(null);
+  const tradingViewRef = useRef<TradingViewWidget | null>(null);
   
   /** WebSocket连接实例引用 - 用于管理实时数据连接 */
   const wsRef = useRef<WebSocket | null>(null);
@@ -87,7 +121,7 @@ const Chart: React.FC<ChartProps> = ({ symbol }) => {
    * 计算技术指标
    * @param data K线数据数组
    */
-  const calculateTechnicalIndicators = (data: KlineData[]) => {
+  const calculateTechnicalIndicators = useCallback((data: KlineData[]) => {
     if (data.length < 20) return; // 确保有足够的数据计算指标
     
     const closePrices = data.map(d => d.close);
@@ -136,7 +170,7 @@ const Chart: React.FC<ChartProps> = ({ symbol }) => {
     } catch (error) {
       console.error('技术指标计算错误:', error);
     }
-  };
+  }, []);
 
   // ============================ REST API 数据源 ============================
   /**
@@ -145,23 +179,23 @@ const Chart: React.FC<ChartProps> = ({ symbol }) => {
    * @param interval 时间周期 (如: 1m, 5m, 15m, 1h, 4h, 1d)
    * @param limit 数据条数
    */
-  const fetchKlineDataFromREST = async (symbol: string, interval: string = '1m', limit: number = 100) => {
+  const fetchKlineDataFromREST = useCallback(async (symbol: string, interval: string = '1m', limit: number = 100) => {
     setIsLoading(true);
     try {
       // 这里替换为实际的REST API URL
       const apiUrl = `https://api.example.com/api/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
       
       const response = await fetch(apiUrl);
-      const result = await response.json();
+      const result = await response.json() as KlineApiResponse;
       
       // 处理API返回的数据，转换为标准K线格式
-      const formattedData: KlineData[] = result.data.map((item: any) => ({
-        timestamp: item.timestamp,
-        open: parseFloat(item.open),
-        high: parseFloat(item.high),
-        low: parseFloat(item.low),
-        close: parseFloat(item.close),
-        volume: parseFloat(item.volume)
+      const formattedData: KlineData[] = (result.data ?? []).map((item) => ({
+        timestamp: Number(item.timestamp),
+        open: parseFloat(String(item.open)),
+        high: parseFloat(String(item.high)),
+        low: parseFloat(String(item.low)),
+        close: parseFloat(String(item.close)),
+        volume: parseFloat(String(item.volume))
       }));
       
       setKlineData(formattedData);
@@ -174,7 +208,7 @@ const Chart: React.FC<ChartProps> = ({ symbol }) => {
       setIsLoading(false);
       return [];
     }
-  };
+  }, [calculateTechnicalIndicators]);
 
   // ============================ WebSocket 数据源 ============================
   /**
@@ -257,7 +291,7 @@ const Chart: React.FC<ChartProps> = ({ symbol }) => {
    * @param container 图表容器DOM元素
    * @param symbol 交易对
    */
-  const initTradingView = (container: HTMLDivElement, symbol: string) => {
+  const initTradingView = useCallback((container: HTMLDivElement, symbol: string) => {
     // 确保TradingView库已加载
     if (typeof window === 'undefined' || !window.TradingView) {
       console.error('TradingView库未加载');
@@ -303,7 +337,7 @@ const Chart: React.FC<ChartProps> = ({ symbol }) => {
       console.error('TradingView初始化错误:', error);
       return null;
     }
-  };
+  }, []);
 
   // ============================ 组件生命周期 ============================
   // 初始化图表和数据源
@@ -311,7 +345,7 @@ const Chart: React.FC<ChartProps> = ({ symbol }) => {
     console.log(`初始化K线图，交易对：${symbol}`);
     
     // 1. 从REST API获取历史数据
-    fetchKlineDataFromREST(symbol);
+    void Promise.resolve().then(() => fetchKlineDataFromREST(symbol));
     
     // 2. 连接WebSocket获取实时数据
     // 注意：当前为注释状态，如需启用请取消注释
@@ -354,14 +388,15 @@ const Chart: React.FC<ChartProps> = ({ symbol }) => {
         wsRef.current = null;
       }
     };
-  }, [symbol]);
+  }, [fetchKlineDataFromREST, initTradingView, symbol]);
   
   // 当K线数据更新时，更新技术指标
   useEffect(() => {
     if (klineData.length > 0) {
-      calculateTechnicalIndicators(klineData);
+      const timer = window.setTimeout(() => calculateTechnicalIndicators(klineData), 0);
+      return () => window.clearTimeout(timer);
     }
-  }, [klineData]);
+  }, [calculateTechnicalIndicators, klineData]);
 
   return (
     <div className="bg-[#0b0b0f] overflow-hidden w-full">

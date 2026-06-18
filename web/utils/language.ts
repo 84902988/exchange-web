@@ -3,7 +3,7 @@ import type { Language as BaseLanguage } from "@/config/menuConfig";
 export type Language = BaseLanguage;
 export type LanguageChangedEvent = CustomEvent<Language>;
 
-const DEFAULT_LANGUAGE: Language = "zh";
+const DEFAULT_LANGUAGE: Language = "en";
 const SUPPORTED_LANGUAGES: readonly Language[] = ["en", "zh", "zh-TW", "ja"];
 
 const isSupportedLanguage = (language: string | null): language is Language => (
@@ -15,7 +15,7 @@ const getCurrentLanguage = (): Language => {
     return DEFAULT_LANGUAGE;
   }
 
-  const savedLanguage = localStorage.getItem("language");
+  const savedLanguage = localStorage.getItem("language") || localStorage.getItem("locale");
   return isSupportedLanguage(savedLanguage) ? savedLanguage : DEFAULT_LANGUAGE;
 };
 
@@ -23,6 +23,7 @@ const setCurrentLanguage = (language: Language): void => {
   if (typeof window !== "undefined") {
     const nextLanguage = isSupportedLanguage(language) ? language : DEFAULT_LANGUAGE;
     localStorage.setItem("language", nextLanguage);
+    localStorage.setItem("locale", nextLanguage);
   }
 };
 

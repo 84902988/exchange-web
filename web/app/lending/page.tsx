@@ -12,8 +12,9 @@ export default function LendingPage() {
   
   // 初始化语言和监听语言变化
   useEffect(() => {
-    // 初始加载时获取当前语言
-    setCurrentLanguage(getCurrentLanguage());
+    const timer = window.setTimeout(() => {
+      setCurrentLanguage(getCurrentLanguage());
+    }, 0);
     
     // 监听语言变化事件
     const handleLanguageChanged = (event: LanguageChangedEvent) => {
@@ -23,6 +24,7 @@ export default function LendingPage() {
     window.addEventListener('languageChanged', handleLanguageChanged as EventListener);
     
     return () => {
+      window.clearTimeout(timer);
       window.removeEventListener('languageChanged', handleLanguageChanged as EventListener);
     };
   }, []);

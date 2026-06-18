@@ -79,7 +79,7 @@ export function canAccessMenuItem(
   role?: string
 ): boolean {
   // 兼容 MenuItem 中 auth 不存在或未声明的情况
-  const auth = (item as any).auth as MenuAuth | undefined;
+  const auth = (item as MenuItem & { auth?: MenuAuth }).auth;
   return canAccess(auth, isLoggedIn, role);
 }
 

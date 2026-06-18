@@ -5,9 +5,8 @@ import TradingHeader from './TradingHeader';
 import Chart from './Chart';
 import ChartToolbar from './ChartToolbar';
 import OrderBook from './OrderBook';
-import TradesHistory from './TradesHistory';
 import TradingForm from './TradingForm';
-import AssetInfo from './AssetInfo';
+import AssetInfo, { type AssetData } from './AssetInfo';
 
 /**
  * 币股合约交易对数据类型
@@ -82,28 +81,25 @@ const symbolDataMap: Record<string, SymbolData> = {
   }
 };
 
-/**
- * 模拟资产数据
- * @description 用于组件开发和测试的模拟资产数据
- */
-const mockAssetData = {
-  totalBalance: 500.00,
-  availableBalance: 500.00,
-  lockedBalance: 0.00,
-  marginBalance: 0.00,
-  positionMargin: 0.00,
-  unrealizedPnl: 0.00,
-  realizedPnl: 0.00,
-  usdtEquity: 0.00,
-  walletBalance: 0.00,
-  roi: 0.00,
-  bonus: 0.00,
-  positionBonus: 0.00,
-  fundingLeverage: 0.00,
-  used: 0.00,
-  frozen: 0.00,
-  maintenanceMarginRate: 2.08,
-  maintenanceMargin: 0.0409,
+// Empty account values for legacy routes until a real account source is wired.
+const EMPTY_ASSET_DATA: AssetData = {
+  totalBalance: 0,
+  availableBalance: 0,
+  lockedBalance: 0,
+  marginBalance: 0,
+  positionMargin: 0,
+  unrealizedPnl: 0,
+  realizedPnl: 0,
+  usdtEquity: 0,
+  walletBalance: 0,
+  roi: 0,
+  bonus: 0,
+  positionBonus: 0,
+  fundingLeverage: 0,
+  used: 0,
+  frozen: 0,
+  maintenanceMarginRate: 0,
+  maintenanceMargin: 0,
 };
 
 /**
@@ -132,7 +128,7 @@ const TradingPage: React.FC = () => {
   const [priceChangeAmount, setPriceChangeAmount] = useState(symbolDataMap['AAPL/USDT'].changeAmount);
   
   /** 资产数据，包括总余额、可用余额等 */
-  const [assetData, setAssetData] = useState(mockAssetData);
+  const assetData = EMPTY_ASSET_DATA;
   
   /** 24小时最高价/最低价 */
   const [highLow, setHighLow] = useState(symbolDataMap['AAPL/USDT'].highLow);

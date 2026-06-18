@@ -34,6 +34,7 @@ class ContractMarginLog(Base):
         Index("idx_contract_margin_logs_account", "account_id"),
         Index("idx_contract_margin_logs_position", "position_id"),
         Index("idx_contract_margin_logs_order", "order_id"),
+        Index("idx_contract_margin_logs_trade", "trade_id"),
         Index("idx_contract_margin_logs_change_type", "change_type"),
         Index("idx_contract_margin_logs_created_at", "created_at"),
         {"extend_existing": True},
@@ -44,6 +45,7 @@ class ContractMarginLog(Base):
     account_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     position_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     order_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    trade_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     change_type: Mapped[str] = mapped_column(String(40), nullable=False)
     change_amount: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False)

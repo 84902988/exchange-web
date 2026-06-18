@@ -21,7 +21,7 @@ global.navigator.mediaDevices = {
       getSettings: () => ({ width: 1280, height: 720 })
     }]
   })
-} as any;
+} as unknown as MediaDevices;
 
 describe('FaceCapture Component', () => {
   const mockOnFaceVerified = jest.fn();

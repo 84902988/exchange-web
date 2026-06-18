@@ -454,7 +454,7 @@ function ContractTradesTable({
               <th className="py-3 text-left font-medium">{t('openClose', 'asset')}</th>
               <th className="py-3 text-right font-medium">{t('price', 'asset')}</th>
               <th className="py-3 text-right font-medium">{t('quantity', 'asset')}</th>
-              <th className="py-3 text-right font-medium">{t('spreadCost', 'asset')}</th>
+              <th className="py-3 text-right font-medium" title={t('spreadCostHelp', 'contracts')}>{t('spreadCost', 'asset')}</th>
               <th className="py-3 text-right font-medium">{t('realizedPnl', 'asset')}</th>
               <th className="py-3 text-right font-medium">{t('time', 'asset')}</th>
             </tr>
@@ -469,7 +469,7 @@ function ContractTradesTable({
                   <td className="py-3 text-white/70">{actionText(item.action, t)}</td>
                   <td className="py-3 text-right font-mono text-white">{formatNum(item.price)}</td>
                   <td className="py-3 text-right font-mono text-white">{formatNum(item.quantity)}</td>
-                  <td className="py-3 text-right font-mono text-white/70">{formatNum(item.spread_fee ?? item.fee_amount, 6)}</td>
+                  <td className="py-3 text-right font-mono text-white/70" title={t('spreadCostHelp', 'contracts')}>{formatNum(item.spread_fee ?? item.fee_amount, 6)}</td>
                   <td className={`py-3 text-right font-mono ${pnl > 0 ? 'text-[#00c087]' : pnl < 0 ? 'text-[#f6465d]' : 'text-white/70'}`}>
                     {formatNum(item.realized_pnl)}
                   </td>

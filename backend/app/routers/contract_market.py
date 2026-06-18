@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from app.db.models.contract_symbol import ContractSymbol
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.schemas.contract_market import (
     ContractDepthResponse,
     ContractQuoteResponse,
@@ -35,6 +35,21 @@ from app.services.market_cache import cache_fetch_json, market_cache_key
 
 router = APIRouter(prefix="/contract/market", tags=["contract-market"])
 logger = logging.getLogger(__name__)
+
+CONTRACT_TICKER_CACHE_VERSION = "1"
+CONTRACT_TICKER_FIELD_VERSION = "ticker_fields_v2"
+CONTRACT_TICKER_PROVIDER_VERSION = "default"
+
+
+def _load_with_short_session(loader: Callable[[Session], dict]):
+    db = SessionLocal()
+    try:
+        return loader(db)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def _normalize_contract_category(value: str) -> str:
@@ -77,7 +92,6 @@ def contract_market_symbols(
     keyword: Optional[str] = Query(None, description="symbol search keyword"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
-    db: Session = Depends(get_db),
 ):
     trace_id = getattr(request.state, "trace_id", None)
     normalized_category = _normalize_contract_category(category)
@@ -99,7 +113,7 @@ def contract_market_symbols(
         },
     )
 
-    def load_data() -> dict:
+    def load_data(db: Session) -> dict:
         query = db.query(ContractSymbol).filter(ContractSymbol.status == 1)
         if normalized_category != "all":
             query = query.filter(ContractSymbol.category == normalized_category)
@@ -130,14 +144,13 @@ def contract_market_symbols(
         )
         return data.model_dump()
 
-    return ok(data=cache_fetch_json(cache_key, 120, load_data), trace_id=trace_id)
+    return ok(data=cache_fetch_json(cache_key, 120, lambda: _load_with_short_session(load_data)), trace_id=trace_id)
 
 
 @router.get("/quote")
 def contract_market_quote(
     request: Request,
     symbol: str = Query(..., description="Contract symbol, e.g. BTCUSDT_PERP"),
-    db: Session = Depends(get_db),
 ):
     trace_id = getattr(request.state, "trace_id", None)
     normalized_symbol = str(symbol or "").strip().upper()
@@ -151,23 +164,23 @@ def contract_market_quote(
         },
     )
     try:
+        def load_data(db: Session) -> dict:
+            quote_payload = get_contract_quote(db, normalized_symbol)
+            return ContractQuoteResponse(**contract_quote_to_response(quote_payload)).model_dump()
+
         data = cache_fetch_json(
             cache_key,
             3,
-            lambda: ContractQuoteResponse(**contract_quote_to_response(get_contract_quote(db, normalized_symbol))).model_dump(),
+            lambda: _load_with_short_session(load_data),
         )
         return ok(data=data, trace_id=trace_id)
     except ContractSymbolNotFound as exc:
-        db.rollback()
         raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)})
     except ContractMarketError as exc:
-        db.rollback()
         raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)})
     except HTTPException:
-        db.rollback()
         raise
     except Exception:
-        db.rollback()
         raise HTTPException(
             status_code=503,
             detail={"code": "CONTRACT_QUOTE_UNAVAILABLE", "message": "contract quote unavailable"},
@@ -179,28 +192,44 @@ def contract_market_tickers(
     request: Request,
     symbols: Optional[str] = Query(None, description="Comma separated contract symbols"),
     limit: int = Query(100, ge=1, le=200),
-    db: Session = Depends(get_db),
 ):
     trace_id = getattr(request.state, "trace_id", None)
     selected_symbols: Optional[List[str]] = None
     if symbols:
         selected_symbols = sorted({item.strip().upper() for item in symbols.split(",") if item.strip()})
     safe_limit = max(1, min(int(limit or 100), 200))
+    query_params = {
+        "session_policy": CONTRACT_MARKET_SESSION_POLICY_VERSION,
+        "market_status_version": CONTRACT_MARKET_STATUS_VERSION,
+        "forex_price_field_version": CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION,
+        "symbols": selected_symbols or [],
+        "limit": safe_limit,
+    }
     cache_key = market_cache_key(
         "contract:ticker_batch",
         {
             "session_policy": CONTRACT_MARKET_SESSION_POLICY_VERSION,
-            "market_status": CONTRACT_MARKET_STATUS_VERSION,
+            "market_status_version": CONTRACT_MARKET_STATUS_VERSION,
             "forex_price_field": CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION,
-            "symbols": selected_symbols or [],
-            "limit": safe_limit,
         },
+        version=CONTRACT_TICKER_CACHE_VERSION,
+        symbols=selected_symbols or [],
+        market_type="contract",
+        asset_type="mixed",
+        category="all",
+        provider_version=CONTRACT_TICKER_PROVIDER_VERSION,
+        field_version=CONTRACT_TICKER_FIELD_VERSION,
+        query_params=query_params,
     )
 
     data = cache_fetch_json(
         cache_key,
         15,
-        lambda: ContractTickerListResponse(items=get_contract_tickers(db, symbols=selected_symbols, limit=safe_limit)).model_dump(),
+        lambda: _load_with_short_session(
+            lambda db: ContractTickerListResponse(
+                items=get_contract_tickers(db, symbols=selected_symbols, limit=safe_limit)
+            ).model_dump()
+        ),
     )
     return ok(data=data, trace_id=trace_id)
 
@@ -210,7 +239,6 @@ def contract_market_depth(
     request: Request,
     symbol: str = Query(..., description="Contract symbol, e.g. BTCUSDT_PERP"),
     limit: int = Query(20, ge=5, le=100),
-    db: Session = Depends(get_db),
 ):
     trace_id = getattr(request.state, "trace_id", None)
     normalized_symbol = str(symbol or "").strip().upper()
@@ -226,7 +254,7 @@ def contract_market_depth(
         },
     )
     try:
-        def load_data() -> dict:
+        def load_data(db: Session) -> dict:
             depth = get_contract_depth(db, normalized_symbol, limit=safe_limit)
             logger.info(
                 "contract_market_depth_response symbol=%s provider_symbol=%s source=%s bids_count=%s asks_count=%s "
@@ -241,18 +269,14 @@ def contract_market_depth(
             )
             return ContractDepthResponse(**contract_depth_to_response(depth)).model_dump()
 
-        return ok(data=cache_fetch_json(cache_key, 3, load_data), trace_id=trace_id)
+        return ok(data=cache_fetch_json(cache_key, 3, lambda: _load_with_short_session(load_data)), trace_id=trace_id)
     except ContractSymbolNotFound as exc:
-        db.rollback()
         raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)})
     except ContractMarketError as exc:
-        db.rollback()
         raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)})
     except HTTPException:
-        db.rollback()
         raise
     except Exception:
-        db.rollback()
         raise HTTPException(
             status_code=503,
             detail={"code": "CONTRACT_DEPTH_UNAVAILABLE", "message": "contract depth unavailable"},

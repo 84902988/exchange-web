@@ -27,6 +27,7 @@ from app.services.contract_market_service import get_contract_quote
 DEFAULT_PAGE = 1
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
+ACTIVE_ORDER_STATUSES = ("OPEN", "NEW", "PENDING", "PARTIALLY_FILLED")
 
 
 def _normalize_symbol(symbol: Optional[str]) -> str:
@@ -343,7 +344,9 @@ def get_user_contract_orders(
         query = query.filter(ContractOrder.symbol == normalized_symbol)
 
     normalized_status = _normalize_status(status)
-    if normalized_status:
+    if normalized_status == "ACTIVE":
+        query = query.filter(ContractOrder.status.in_(ACTIVE_ORDER_STATUSES))
+    elif normalized_status and normalized_status != "ALL":
         query = query.filter(ContractOrder.status == normalized_status)
 
     has_fee_amount = _table_has_column(db, "contract_orders", "fee_amount")

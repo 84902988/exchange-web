@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import useLocale from '@/hooks/useLocale';
 
 export default function UnderDevelopment() {
@@ -16,12 +17,12 @@ export default function UnderDevelopment() {
           {t('underDevelopmentDesc', 'common')}
         </p>
         <div className="flex flex-col md:flex-row justify-center gap-4">
-          <a 
-            href="/" 
+          <Link
+            href="/"
             className="px-6 py-3 bg-amber-500 hover:bg-amber-600 text-white font-medium rounded-md transition-colors duration-200"
           >
             {t('returnHome', 'common')}
-          </a>
+          </Link>
         </div>
       </div>
     </div>

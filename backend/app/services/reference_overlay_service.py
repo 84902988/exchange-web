@@ -43,6 +43,18 @@ def _positive_decimal(value: Any) -> Decimal | None:
     return decimal_value if decimal_value > 0 else None
 
 
+def _display_price_label(
+    *,
+    reference_type: str,
+    display_price: Decimal,
+    display_label: str | None,
+) -> str | None:
+    price_text = _decimal_to_text(display_price)
+    if reference_type == "IRON" and price_text:
+        return f"{price_text} USD/公斤"
+    return display_label or price_text
+
+
 def _normalize_text(value: Any) -> str:
     return str(value or "").strip().upper()
 
@@ -114,6 +126,8 @@ def serialize_reference_overlay(overlay: ReferenceOverlay | None, *, requested_s
 
     display_price = _positive_decimal(overlay.display_price)
     display_label = overlay.display_value_label
+    source_price_label: str | None = None
+    reference_type = str(overlay.reference_type or overlay.kind or "").strip().upper()
     price_source = str(overlay.price_source or "MANUAL").strip().upper()
     sync_status = str(overlay.sync_status or "PENDING").strip().upper()
     stale = False
@@ -121,11 +135,17 @@ def serialize_reference_overlay(overlay: ReferenceOverlay | None, *, requested_s
         last_ref_price = _positive_decimal(overlay.last_ref_price)
         if last_ref_price is not None:
             display_price = last_ref_price
-            display_label = overlay.last_ref_label or display_label
+            source_price_label = overlay.last_ref_label or None
         stale = sync_status == "FAILED"
 
     if display_price is None:
         return _disabled_payload(str(overlay.symbol or requested_symbol or "").strip().upper())
+
+    display_price_label = _display_price_label(
+        reference_type=reference_type,
+        display_price=display_price,
+        display_label=display_label,
+    )
 
     return {
         "symbol": overlay.symbol,
@@ -137,6 +157,8 @@ def serialize_reference_overlay(overlay: ReferenceOverlay | None, *, requested_s
         "stale": stale,
         "auto_source": overlay.auto_source,
         "refresh_interval_sec": overlay.refresh_interval_sec,
+        "last_ref_price": _decimal_to_text(overlay.last_ref_price),
+        "last_ref_label": overlay.last_ref_label,
         "last_sync_at": _datetime_to_text(overlay.last_sync_at),
         "market_status": overlay.market_status or "UNKNOWN",
         "market_status_text": overlay.market_status_text,
@@ -152,6 +174,8 @@ def serialize_reference_overlay(overlay: ReferenceOverlay | None, *, requested_s
         "badge_color": overlay.badge_color or overlay.line_color or "#f0b90b",
         "display_value_label": display_label,
         "display_price": _decimal_to_text(display_price),
+        "display_price_label": display_price_label,
+        "source_price_label": source_price_label,
         "display_unit": overlay.display_unit,
         "data_source": overlay.data_source,
         "source_symbol": overlay.source_symbol,

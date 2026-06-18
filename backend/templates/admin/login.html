@@ -73,6 +73,28 @@
       font-weight:700;
       cursor:pointer;
     }
+    .captcha-row{
+      display:grid;
+      grid-template-columns:1fr 132px;
+      gap:10px;
+      align-items:center;
+    }
+    .captcha-row input{ min-width:0; }
+    .captcha-img{
+      width:132px;
+      height:44px;
+      border-radius:10px;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(0,0,0,.28);
+      object-fit:cover;
+      cursor:pointer;
+    }
+    .hint{
+      margin:6px 0 0;
+      color:var(--muted);
+      font-size:11px;
+      line-height:1.5;
+    }
     .err{
       margin-top:12px;
       padding:10px 12px;
@@ -97,6 +119,18 @@
         <label for="password">密码</label>
         <input id="password" name="password" type="password" placeholder="请输入后台密码" autocomplete="current-password" />
 
+        <label for="captcha_code">图形验证码</label>
+        <input id="captcha_id" type="hidden" name="captcha_id" value="{{ captcha.id if captcha else '' }}" />
+        <div class="captcha-row">
+          <input id="captcha_code" name="captcha_code" placeholder="请输入图形验证码" autocomplete="off" required />
+          {% if captcha %}
+            <img id="captcha_image" class="captcha-img" src="{{ captcha.image }}" alt="图形验证码" title="点击刷新验证码" role="button" tabindex="0" />
+          {% else %}
+            <div id="captcha_image" class="captcha-img" aria-hidden="true"></div>
+          {% endif %}
+        </div>
+        <p class="hint">看不清请点击验证码图片刷新。</p>
+
         <button type="submit">登录</button>
       </form>
 
@@ -105,5 +139,37 @@
       {% endif %}
     </div>
   </div>
+  <script>
+    (function(){
+      var image = document.getElementById("captcha_image");
+      var captchaId = document.getElementById("captcha_id");
+      var captchaCode = document.getElementById("captcha_code");
+      if (!image || !captchaId) return;
+
+      function refreshCaptcha(){
+        fetch("/admin/login/captcha", { cache: "no-store", credentials: "same-origin" })
+          .then(function(resp){ return resp.ok ? resp.json() : Promise.reject(); })
+          .then(function(payload){
+            if (!payload || !payload.ok || !payload.captcha) return;
+            captchaId.value = payload.captcha.id || "";
+            if (image.tagName && image.tagName.toLowerCase() === "img") {
+              image.src = payload.captcha.image || "";
+            }
+            if (captchaCode) captchaCode.value = "";
+          })
+          .catch(function(){
+            if (captchaCode) captchaCode.value = "";
+          });
+      }
+
+      image.addEventListener("click", refreshCaptcha);
+      image.addEventListener("keydown", function(event){
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          refreshCaptcha();
+        }
+      });
+    })();
+  </script>
 </body>
 </html>

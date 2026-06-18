@@ -128,7 +128,7 @@
                 <th>自动来源</th>
                 <th>来源标的</th>
                 <th>启用</th>
-                <th>画线价格</th>
+                <th>前台有效值</th>
                 <th>展示文案</th>
                 <th>市场状态</th>
                 <th>价格时间</th>
@@ -152,7 +152,7 @@
                   <td>
                     <span class="admin-badge admin-badge-{{ item.enabled_badge }}">{{ item.enabled_label }}</span>
                   </td>
-                  <td class="mono nowrap">{{ item.display_price or '-' }} {{ item.display_unit or '' }}</td>
+                  <td class="mono nowrap">{{ item.effective_display_label or ((item.display_price or '-') ~ ' ' ~ (item.display_unit or '')) }}</td>
                   <td class="nowrap" title="{{ item.display_value_label or '-' }}">{{ item.display_value_label or '-' }}</td>
                   <td>
                     <span class="admin-badge rwa-status-badge {{ item.market_status_badge_class or 'admin-badge-secondary' }}" title="{{ item.market_status_text or '' }}">

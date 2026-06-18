@@ -10,10 +10,13 @@ export default function ReferenceOverlayBadge({
 }) {
   const { t } = useLocaleContext();
   const badgeColor = config.badgeColor || config.lineColor;
+  const titleParts = [config.title, config.sourceLabel, config.sourcePriceLabel, config.description]
+    .filter(Boolean)
+    .join('\n');
 
   return (
     <div
-      title={`${config.title}\n${config.sourceLabel}\n${config.description}`}
+      title={titleParts}
       className="pointer-events-auto absolute left-3 top-3 z-10 max-w-[calc(100%-1.5rem)] rounded-lg border bg-[#090b10]/82 px-3 py-2 shadow-lg shadow-black/25 backdrop-blur-sm"
       style={{ borderColor: `${badgeColor}59` }}
     >
@@ -26,6 +29,11 @@ export default function ReferenceOverlayBadge({
       <div className="mt-0.5 truncate text-[10px] leading-4 text-white/52">
         {config.sourceLabel || '--'}
       </div>
+      {config.sourcePriceLabel ? (
+        <div className="mt-0.5 truncate text-[10px] leading-4 text-white/52">
+          {config.sourcePriceLabel}
+        </div>
+      ) : null}
       {config.description ? (
         <div className="mt-0.5 truncate text-[10px] leading-4 text-white/48">
           {config.description}

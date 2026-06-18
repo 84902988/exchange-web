@@ -55,7 +55,6 @@ import {
 const EXTERNAL_CHART_POLL_MS = 1500;
 const CHART_KEYBOARD_STEP = 3;
 const CHART_KEYBOARD_FAST_STEP = 10;
-const REFERENCE_OVERLAY_PRICE_PRECISION = 4;
 const SPOT_LAST_PRICE_FLAT = '#8A919E';
 const PRICE_SCALE_ZOOM_MIN = -3;
 const PRICE_SCALE_ZOOM_MAX = 4;
@@ -270,6 +269,54 @@ function getLatestRealCandle(candles: CandleItem[]) {
   return null;
 }
 
+function getLatestRealCandleIndex(candles: CandleItem[]) {
+  for (let i = candles.length - 1; i >= 0; i -= 1) {
+    if (!candles[i].isPlaceholder) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+function patchLatestRealCandleClose(
+  candles: CandleItem[],
+  patchPrice: number | null,
+  interval: string,
+) {
+  if (patchPrice === null || !Number.isFinite(patchPrice) || patchPrice <= 0) return null;
+  if (!candles.length || !interval) return null;
+
+  const latestIndex = getLatestRealCandleIndex(candles);
+  if (latestIndex < 0) return null;
+
+  const latest = candles[latestIndex];
+  if (!latest || latest.isPlaceholder || latest.isReferenceFallback) return null;
+
+  const currentBucket = getBucketStart(Math.floor(Date.now() / 1000), interval);
+  if (latest.time !== currentBucket) return null;
+
+  const nextHigh = Math.max(latest.high, patchPrice);
+  const nextLow = Math.min(latest.low, patchPrice);
+  if (
+    latest.close === patchPrice &&
+    latest.high === nextHigh &&
+    latest.low === nextLow
+  ) {
+    return null;
+  }
+
+  const nextCandles = candles.slice();
+  nextCandles[latestIndex] = {
+    ...latest,
+    close: patchPrice,
+    high: nextHigh,
+    low: nextLow,
+  };
+
+  return nextCandles;
+}
+
 function getCandleByTime(candles: CandleItem[], time: number | null) {
   if (time === null) return null;
 
@@ -352,17 +399,6 @@ function formatPrice(value: number | null | undefined, precision: number) {
   }
 
   return value.toFixed(precision);
-}
-
-function formatCompactPrice(value: number | null | undefined, precision: number) {
-  if (value === null || value === undefined || !Number.isFinite(value)) {
-    return '--';
-  }
-
-  return value.toLocaleString(undefined, {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: precision,
-  });
 }
 
 function formatVolume(value: number | null | undefined) {
@@ -492,6 +528,7 @@ export default function SpotChart({
   height = 520,
   dataSource,
   latestPrice,
+  latestTradeOrTickerPrice,
   priceDirection = 'flat',
   pricePrecision: explicitPricePrecision,
 }: SpotChartProps) {
@@ -501,6 +538,10 @@ export default function SpotChart({
     [explicitPricePrecision, symbol]
   );
   const latestPriceNumber = useMemo(() => parseLatestPrice(latestPrice), [latestPrice]);
+  const latestTradeOrTickerPriceNumber = useMemo(
+    () => parseLatestPrice(latestTradeOrTickerPrice),
+    [latestTradeOrTickerPrice]
+  );
   const fallbackReferenceOverlayConfig = useMemo(() => getReferenceOverlayConfig(symbol, t), [symbol, t]);
   const [referenceOverlayConfig, setReferenceOverlayConfig] = useState<typeof fallbackReferenceOverlayConfig>(null);
   const hasReferenceOverlay = !!referenceOverlayConfig?.enabled;
@@ -518,6 +559,8 @@ export default function SpotChart({
   const referenceOverlayPriceLineRef = useRef<ReturnType<ISeriesApi<'Candlestick'>['createPriceLine']> | null>(null);
   const latestCloseRef = useRef<number | null>(null);
   const flashTimerRef = useRef<number | null>(null);
+  const suppressLatestPatchFlashRef = useRef(false);
+  const latestTradeOrTickerPriceRef = useRef<number | null>(null);
 
   const realtimeConnectionRef = useRef<SpotChartRealtimeConnection | null>(null);
   const destroyedRef = useRef(false);
@@ -669,6 +712,27 @@ export default function SpotChart({
     () => getSpotChartPriceScaleMargins(showReferenceOverlayLine),
     [showReferenceOverlayLine]
   );
+
+  const applyLatestTradeOrTickerPatch = useCallback(() => {
+    const normalizedSymbol = currentSymbolRef.current;
+    const currentInterval = currentIntervalRef.current;
+    if (!normalizedSymbol || !currentInterval) return;
+
+    const nextCandles = patchLatestRealCandleClose(
+      candlesRef.current,
+      latestTradeOrTickerPriceRef.current,
+      currentInterval,
+    );
+    if (!nextCandles) return;
+
+    suppressLatestPatchFlashRef.current = true;
+    candlesRef.current = nextCandles;
+    setCandles(nextCandles);
+    writeMarketCache<SpotChartCache>('spot', normalizedSymbol, {
+      candles: nextCandles,
+      volumes: volumesRef.current,
+    });
+  }, []);
 
   useEffect(() => {
     displayCandlesRef.current = displayCandles;
@@ -852,13 +916,21 @@ export default function SpotChart({
 
       const mergedCandles = mergeCandlesByTime(candlesRef.current, result.candles || []);
       const mergedVolumes = mergeVolumesByTime(volumesRef.current, result.volumes || []);
+      const patchedCandles = patchLatestRealCandleClose(
+        mergedCandles,
+        latestTradeOrTickerPriceRef.current,
+        requestInterval,
+      ) || mergedCandles;
 
-      candlesRef.current = mergedCandles;
+      if (patchedCandles !== mergedCandles) {
+        suppressLatestPatchFlashRef.current = true;
+      }
+      candlesRef.current = patchedCandles;
       volumesRef.current = mergedVolumes;
-      setCandles(mergedCandles);
+      setCandles(patchedCandles);
       setVolumes(mergedVolumes);
       writeMarketCache<SpotChartCache>('spot', requestSymbol, {
-        candles: mergedCandles,
+        candles: patchedCandles,
         volumes: mergedVolumes,
       });
       setError('');
@@ -1174,6 +1246,7 @@ export default function SpotChart({
     setShowScrollToLatest(false);
     setPriceZoomLevel(0);
     latestCloseRef.current = null;
+    suppressLatestPatchFlashRef.current = false;
   }, [symbol, interval]);
 
   useEffect(() => {
@@ -1181,7 +1254,9 @@ export default function SpotChart({
     if (!latest) return;
 
     const previousClose = latestCloseRef.current;
-    if (previousClose !== null && latest.close !== previousClose) {
+    const shouldSuppressFlash = suppressLatestPatchFlashRef.current;
+    suppressLatestPatchFlashRef.current = false;
+    if (previousClose !== null && latest.close !== previousClose && !shouldSuppressFlash) {
       setLatestCandleFlashing(true);
       if (flashTimerRef.current !== null) {
         window.clearTimeout(flashTimerRef.current);
@@ -1193,6 +1268,11 @@ export default function SpotChart({
     }
     latestCloseRef.current = latest.close;
   }, [candles]);
+
+  useEffect(() => {
+    latestTradeOrTickerPriceRef.current = latestTradeOrTickerPriceNumber;
+    applyLatestTradeOrTickerPatch();
+  }, [applyLatestTradeOrTickerPatch, interval, latestTradeOrTickerPriceNumber, symbol]);
 
   useEffect(() => {
     const series = candleSeriesRef.current;
@@ -1267,15 +1347,23 @@ export default function SpotChart({
           return;
         }
 
-        const nextCandles =
+        const mergedCandles =
           candlesRef.current.length > 0
             ? mergeCandlesByTime(candlesRef.current, result.candles)
             : result.candles;
+        const nextCandles = patchLatestRealCandleClose(
+          mergedCandles,
+          latestTradeOrTickerPriceRef.current,
+          requestInterval,
+        ) || mergedCandles;
         const nextVolumes =
           volumesRef.current.length > 0
             ? mergeVolumesByTime(volumesRef.current, result.volumes)
             : result.volumes;
 
+        if (nextCandles !== mergedCandles) {
+          suppressLatestPatchFlashRef.current = true;
+        }
         setCandles(nextCandles);
         setVolumes(nextVolumes);
         candlesRef.current = nextCandles;
@@ -1391,12 +1479,20 @@ export default function SpotChart({
       nextCandles: CandleItem[],
       nextVolumes: VolumeItem[]
     ) => {
-      candlesRef.current = nextCandles;
+      const patchedCandles = patchLatestRealCandleClose(
+        nextCandles,
+        latestTradeOrTickerPriceRef.current,
+        interval,
+      ) || nextCandles;
+      if (patchedCandles !== nextCandles) {
+        suppressLatestPatchFlashRef.current = true;
+      }
+      candlesRef.current = patchedCandles;
       volumesRef.current = nextVolumes;
-      setCandles(nextCandles);
+      setCandles(patchedCandles);
       setVolumes(nextVolumes);
       writeMarketCache<SpotChartCache>('spot', normalizedSymbol, {
-        candles: nextCandles,
+        candles: patchedCandles,
         volumes: nextVolumes,
       });
     };
@@ -1445,10 +1541,6 @@ export default function SpotChart({
   const activeVolumeText = activeCandle?.isReferenceFallback
     ? '--'
     : formatVolume(activeCandle?.volume);
-  const latestReferenceOverlayText = formatCompactPrice(
-    latestReferenceOverlayValue,
-    REFERENCE_OVERLAY_PRICE_PRECISION
-  );
   const { change, changePercent } = useMemo(
     () => getChangeMetrics(activeCandle),
     [activeCandle]
@@ -1536,7 +1628,7 @@ export default function SpotChart({
               className="font-medium"
               style={{ color: referenceOverlayConfig.lineColor }}
             >
-              {`${referenceOverlayConfig.title} ${latestReferenceOverlayText} ${referenceOverlayConfig.displayUnit || 'USDT'}`}
+              {`${referenceOverlayConfig.title} ${referenceOverlayConfig.valueLabel || '--'}`}
             </span>
           ) : null}
         </div>

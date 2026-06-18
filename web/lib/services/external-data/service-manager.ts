@@ -1,7 +1,8 @@
 // 外部服务管理器
 import {
+  ExternalService,
+  ExternalServiceConfig,
   ExternalServiceType,
-  ExternalServiceConfigMap,
   CryptoMarketServiceConfig,
   StockMarketServiceConfig,
   ForexMarketServiceConfig,
@@ -18,7 +19,7 @@ import { WorldTimeService } from './world-time-service';
  */
 export class ExternalServiceManager {
   private static instance: ExternalServiceManager;
-  private services: Map<ExternalServiceType, any> = new Map();
+  private services: Map<ExternalServiceType, ExternalService<ExternalServiceConfig>> = new Map();
   private initialized: boolean = false;
 
   private constructor() {
@@ -92,8 +93,8 @@ export class ExternalServiceManager {
    * @param type - 服务类型
    * @returns 服务实例或undefined（如果服务未启用或初始化失败）
    */
-  public getService<T>(type: ExternalServiceType): T | undefined {
-    return this.services.get(type) as T;
+  public getService<T extends ExternalService<ExternalServiceConfig>>(type: ExternalServiceType): T | undefined {
+    return this.services.get(type) as T | undefined;
   }
 
   /**

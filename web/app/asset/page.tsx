@@ -401,6 +401,9 @@ export default function AssetPage() {
     account: null,
   });
   const [accountDetailPage, setAccountDetailPage] = useState(1);
+  const [isRefreshingAssets, setIsRefreshingAssets] = useState(false);
+  const [assetRefreshStatus, setAssetRefreshStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [assetRefreshTime, setAssetRefreshTime] = useState('');
 
   const accountBalancesQuery = useQuery({
     queryKey: ['assetAccountBalances'],
@@ -614,11 +617,28 @@ export default function AssetPage() {
   };
 
   const refreshAssetData = async () => {
-    await Promise.all([
-      accountBalancesQuery.refetch(),
-      contractAccountQuery.refetch(),
-      transferRecordsQuery.refetch(),
-    ]);
+    if (isRefreshingAssets) return;
+    setIsRefreshingAssets(true);
+    setAssetRefreshStatus('idle');
+    const startedAt = Date.now();
+    try {
+      await Promise.all([
+        accountBalancesQuery.refetch(),
+        coinsQuery.refetch(),
+        contractAccountQuery.refetch(),
+        transferRecordsQuery.refetch(),
+      ]);
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < 600) {
+        await new Promise((resolve) => setTimeout(resolve, 600 - elapsed));
+      }
+      setAssetRefreshTime(new Date().toLocaleTimeString('en-US', { hour12: false }));
+      setAssetRefreshStatus('success');
+    } catch {
+      setAssetRefreshStatus('error');
+    } finally {
+      setIsRefreshingAssets(false);
+    }
   };
 
   const handleRetry = async () => {
@@ -652,14 +672,45 @@ export default function AssetPage() {
             <p className="mt-2 text-sm text-white/55">
               {t('assetOverviewDesc', 'asset')}
             </p>
+            {isRefreshingAssets ? (
+              <p className="mt-2 text-xs text-[#f0b90b]">{t('assetRefreshing', 'asset')}</p>
+            ) : assetRefreshStatus === 'success' ? (
+              <p className="mt-2 text-xs text-emerald-300">
+                {t('assetRefreshSuccess', 'asset')} {assetRefreshTime}
+              </p>
+            ) : assetRefreshStatus === 'error' ? (
+              <p className="mt-2 text-xs text-red-300">{t('assetRefreshFailed', 'asset')}</p>
+            ) : null}
           </div>
           <button
             type="button"
-            onClick={refreshAssetData}
-            className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/[0.03] text-lg text-white/70 transition hover:bg-white/[0.08] hover:text-white"
+            onClick={() => void refreshAssetData()}
+            disabled={isRefreshingAssets}
+            className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/[0.03] text-white/70 transition hover:bg-white/[0.08] hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
             aria-label={t('refreshAssetData', 'asset')}
+            title={t('refreshAssetData', 'asset')}
           >
-            ↻
+            <svg
+              className={`h-4 w-4 ${isRefreshingAssets ? 'animate-spin' : ''}`}
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d="M20 12a8 8 0 1 1-2.34-5.66"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M20 4v5h-5"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
           </button>
         </div>
 

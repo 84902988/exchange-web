@@ -57,6 +57,7 @@ from app.routers.contract_order import router as contract_order_router
 from app.routers.contract_query import router as contract_query_router
 from app.routers.contract_liquidation import router as contract_liquidation_router
 from app.routers.contract_tp_sl import router as contract_tp_sl_router
+from app.routers.contract_ws_private import router as contract_ws_private_router
 from app.routers.vip import router as vip_router
 from app.routers.dividend import router as dividend_router
 from app.routers.bd_team import router as bd_team_router
@@ -83,6 +84,10 @@ from app.jobs.stock_dealer_trade_job import (
 )
 from app.jobs.contract_tp_sl_job import ContractTpSlJob
 from app.jobs.contract_limit_order_job import ContractLimitOrderJob
+from app.services.contract_private_ws import (
+    start_contract_user_event_subscriber,
+    stop_contract_user_event_subscriber,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -273,6 +278,7 @@ app.include_router(contract_order_router)
 app.include_router(contract_query_router)
 app.include_router(contract_liquidation_router)
 app.include_router(contract_tp_sl_router)
+app.include_router(contract_ws_private_router)
 app.include_router(vip_router)
 app.include_router(dividend_router)
 app.include_router(bd_team_router)
@@ -462,7 +468,7 @@ def _startup():
         else:
             logger.info("[contract_tp_sl_job] disabled by ENABLE_CONTRACT_TP_SL_JOB")
 
-    if _env_enabled("ENABLE_CONTRACT_LIMIT_ORDER_JOB", default=True):
+    if _env_enabled("ENABLE_CONTRACT_LIMIT_ORDER_JOB", default=False):
         try:
             interval = int(os.getenv("CONTRACT_LIMIT_ORDER_INTERVAL", "2"))
             _contract_limit_order_job = ContractLimitOrderJob(_get_session_local(), interval_seconds=interval)
@@ -471,29 +477,43 @@ def _startup():
         except Exception as e:
             logger.exception("[contract_limit_order_job] start failed")
             _contract_limit_order_job = None
+    else:
+        logger.info("[contract_limit_order_job] disabled; use backend/scripts/start_contract_limit_order_scanner.py")
 
-    try:
-        from app.jobs.dividend_job import start_dividend_job  # noqa: E402
+    if _env_enabled("ENABLE_DIVIDEND_JOB", default=False):
+        try:
+            from app.jobs.dividend_job import start_dividend_job  # noqa: E402
 
-        # WARNING: dividend job should run in single instance only.
-        start_dividend_job()
-    except Exception as e:
-        logger.exception("[dividend_job] start failed")
+            # WARNING: dividend job should run in single instance only.
+            start_dividend_job()
+        except Exception as e:
+            logger.exception("[dividend_job] start failed")
+    else:
+        logger.info("[dividend_job] disabled")
 
-    try:
-        start_bd_commission_job()
-    except Exception as e:
-        logger.exception("[bd_commission_job] start failed")
+    if _env_enabled("ENABLE_BD_COMMISSION_JOB", default=False):
+        try:
+            start_bd_commission_job()
+        except Exception as e:
+            logger.exception("[bd_commission_job] start failed")
+    else:
+        logger.info("[bd_commission_job] disabled")
 
-    try:
-        start_stock_token_release_job()
-    except Exception as e:
-        logger.exception("[stock_token_release_job] start failed")
+    if _env_enabled("ENABLE_STOCK_TOKEN_RELEASE_JOB", default=False):
+        try:
+            start_stock_token_release_job()
+        except Exception as e:
+            logger.exception("[stock_token_release_job] start failed")
+    else:
+        logger.info("[stock_token_release_job] disabled")
 
-    try:
-        start_rwa_reference_job()
-    except Exception as e:
-        logger.exception("[rwa_reference_job] start failed")
+    if _env_enabled("ENABLE_RWA_REFERENCE_JOB", default=False):
+        try:
+            start_rwa_reference_job()
+        except Exception as e:
+            logger.exception("[rwa_reference_job] start failed")
+    else:
+        logger.info("[rwa_reference_job] disabled")
 
     if _env_enabled("ENABLE_STOCK_DEALER_TRADE_JOB", default=False):
         try:
@@ -502,6 +522,11 @@ def _startup():
             logger.exception("[stock_dealer_trade_job] start failed")
     else:
         logger.info("[stock_dealer_trade_job] disabled")
+
+
+@app.on_event("startup")
+async def _startup_contract_private_ws_subscriber():
+    start_contract_user_event_subscriber()
 
 
 @app.on_event("shutdown")
@@ -545,6 +570,11 @@ def _shutdown():
         _withdraw_watcher = None
         _contract_tp_sl_job = None
         _contract_limit_order_job = None
+
+
+@app.on_event("shutdown")
+async def _shutdown_contract_private_ws_subscriber():
+    await stop_contract_user_event_subscriber()
 
 
 # =========================

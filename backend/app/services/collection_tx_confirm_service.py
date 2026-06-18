@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.chain_config import get_runtime_chain_config
 from app.db.models.collection import CollectionTask, CollectionTaskStatus, GasTask, GasTaskStatus
+from app.services.collection_gas_cost_service import best_effort_record_collection_gas_cost
 from app.services.collection_balance_checker import CollectionBalanceCheckerError, get_web3_for_chain
 from app.services.collection_service import (
     mark_collection_task_confirming,
@@ -119,7 +120,8 @@ def confirm_collection_task_tx(db: Session, task_id: int) -> TxConfirmResult:
             mark_collection_task_confirming(db, int(task.id))
         return TxConfirmResult("collection", int(task.id), tx_hash, "PENDING", None, None)
     if receipt_status == 1:
-        mark_collection_task_confirmed(db, int(task.id), block_number=block_number)
+        confirmed_task = mark_collection_task_confirmed(db, int(task.id), block_number=block_number)
+        best_effort_record_collection_gas_cost(db, confirmed_task)
         return TxConfirmResult("collection", int(task.id), tx_hash, "CONFIRMED", block_number, None)
 
     error_message = f"TX_FAILED status={receipt_status}"
