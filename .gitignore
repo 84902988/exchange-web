@@ -73,3 +73,18 @@ tmp2.py
 *-diff.txt
 next
 ffmpeg-*-essentials_build/
+
+# Mobile app local artifacts
+mobile/node_modules/
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/android/build/
+mobile/.metro-cache/
+mobile/.env
+mobile/.env.local
+mobile/ios/Pods/
+mobile/ios/build/
+mobile/*.keystore
+mobile/*.jks
+mobile/**/*.keystore
+mobile/**/*.jks
