@@ -10,6 +10,7 @@
 *.crt
 *.cer
 *.jks
+*.keystore
 id_rsa*
 id_ed25519*
 
@@ -40,6 +41,7 @@ node_modules/
 .next.*/
 out/
 build/
+dist/
 coverage/
 next-env.d.ts
 *.tsbuildinfo
@@ -71,6 +73,10 @@ Thumbs.db
 *.tar.gz
 *.tgz
 *.rar
+*.sql.gz
+*.dump
+dumps/
+backups/
 .tmp*/
 tmp.py
 tmp2.py
