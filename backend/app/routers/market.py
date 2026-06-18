@@ -24,6 +24,10 @@ router = APIRouter(
 )
 logger = logging.getLogger(__name__)
 
+MARKET_TICKER_CACHE_VERSION = "1"
+MARKET_TICKER_FIELD_VERSION = "ticker_fields_v2"
+MARKET_TICKER_PROVIDER_VERSION = "default"
+
 
 @router.get(
     "/tickers",
@@ -78,12 +82,21 @@ def get_tickers(
         for item in str(symbols or "").split(",")
         if item.strip()
     )
+    query_params = {
+        "symbol": normalized_symbol,
+        "symbols": normalized_symbols,
+    }
     cache_key = market_cache_key(
-        "market:ticker_batch:v3",
-        {
-            "symbol": normalized_symbol,
-            "symbols": normalized_symbols,
-        },
+        "market:ticker_batch",
+        version=MARKET_TICKER_CACHE_VERSION,
+        symbol=normalized_symbol or None,
+        symbols=normalized_symbols,
+        market_type="spot",
+        asset_type="mixed",
+        category="all",
+        provider_version=MARKET_TICKER_PROVIDER_VERSION,
+        field_version=MARKET_TICKER_FIELD_VERSION,
+        query_params=query_params,
     )
     try:
         return cache_fetch_json(

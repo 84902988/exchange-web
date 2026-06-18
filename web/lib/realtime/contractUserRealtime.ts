@@ -1,22 +1,33 @@
 'use client';
 
+import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl';
+import { getAccessToken } from '@/lib/api/core/token';
+
 export type ContractUserRealtimeEventType = 'snapshot' | 'account' | 'positions' | 'orders' | 'trades';
+export type ContractUserRealtimeStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 
 export type ContractUserRealtimeMessage = {
   type: string;
+  event_id?: string;
+  seq?: number | string;
+  server_ts?: string;
   symbol?: string;
   account?: unknown;
   summary?: unknown;
   positions?: unknown;
   position?: unknown;
+  position_summaries?: unknown;
+  position_summary?: unknown;
   orders?: unknown;
   order?: unknown;
   trades?: unknown;
   trade?: unknown;
+  payload?: unknown;
   data?: unknown;
 };
 
 export type ContractUserRealtimeHandler = (message: ContractUserRealtimeMessage) => void;
+export type ContractUserRealtimeStatusHandler = (status: ContractUserRealtimeStatus) => void;
 
 type ContractUserSession = {
   isLoggedIn: boolean;
@@ -27,35 +38,59 @@ function normalizeSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase();
 }
 
-function getConfiguredWsUrl(symbol: string) {
-  const explicitUrl = process.env.NEXT_PUBLIC_CONTRACT_USER_WS_URL;
-  if (!explicitUrl) return '';
-
-  const normalizedSymbol = normalizeSymbol(symbol);
-  if (!normalizedSymbol) return '';
-
-  try {
-    const url = new URL(explicitUrl);
-    if (!url.searchParams.has('symbol')) {
-      url.searchParams.set('symbol', normalizedSymbol);
-    }
-    return url.toString();
-  } catch {
-    return explicitUrl.includes('?')
-      ? `${explicitUrl}&symbol=${encodeURIComponent(normalizedSymbol)}`
-      : `${explicitUrl}?symbol=${encodeURIComponent(normalizedSymbol)}`;
-  }
-}
-
 function getPayload(message: ContractUserRealtimeMessage) {
-  return message.data && typeof message.data === 'object' && !Array.isArray(message.data)
-    ? message.data as Record<string, unknown>
-    : message as Record<string, unknown>;
+  if (message.payload && typeof message.payload === 'object' && !Array.isArray(message.payload)) {
+    return message.payload as Record<string, unknown>;
+  }
+  if (message.data && typeof message.data === 'object' && !Array.isArray(message.data)) {
+    return message.data as Record<string, unknown>;
+  }
+  return message as Record<string, unknown>;
 }
 
 function messageHasPayload(message: ContractUserRealtimeMessage, keys: string[]) {
   const payload = getPayload(message);
   return keys.some((key) => payload[key] !== undefined || message[key as keyof ContractUserRealtimeMessage] !== undefined);
+}
+
+function appendSessionParams(rawUrl: string, symbol: string) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  if (!normalizedSymbol) return '';
+
+  const accessToken = getAccessToken();
+  try {
+    const url = new URL(rawUrl);
+    if (!url.searchParams.has('symbol')) {
+      url.searchParams.set('symbol', normalizedSymbol);
+    }
+    if (accessToken && !url.searchParams.has('access_token')) {
+      url.searchParams.set('access_token', accessToken);
+    }
+    return url.toString();
+  } catch {
+    const params = new URLSearchParams({ symbol: normalizedSymbol });
+    if (accessToken) {
+      params.set('access_token', accessToken);
+    }
+    return rawUrl.includes('?')
+      ? `${rawUrl}&${params.toString()}`
+      : `${rawUrl}?${params.toString()}`;
+  }
+}
+
+function getConfiguredWsUrl(symbol: string) {
+  const explicitUrl = process.env.NEXT_PUBLIC_CONTRACT_USER_WS_URL?.trim();
+  if (explicitUrl) {
+    return appendSessionParams(explicitUrl, symbol);
+  }
+
+  try {
+    const url = new URL('/contract/ws/private', getRuntimeApiBaseUrl());
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    return appendSessionParams(url.toString(), symbol);
+  } catch {
+    return '';
+  }
 }
 
 class ContractUserRealtimeClient {
@@ -66,6 +101,8 @@ class ContractUserRealtimeClient {
   private closedByClient = false;
   private loggedIn = false;
   private handlers = new Map<ContractUserRealtimeEventType, Set<ContractUserRealtimeHandler>>();
+  private statusHandlers = new Set<ContractUserRealtimeStatusHandler>();
+  private status: ContractUserRealtimeStatus = 'idle';
 
   setSession(session: ContractUserSession) {
     const nextSymbol = normalizeSymbol(session.symbol);
@@ -81,6 +118,7 @@ class ContractUserRealtimeClient {
     this.closedByClient = false;
 
     if (!getConfiguredWsUrl(nextSymbol)) {
+      this.setStatus('disconnected');
       return;
     }
 
@@ -104,6 +142,18 @@ class ContractUserRealtimeClient {
     };
   }
 
+  subscribeStatus(handler: ContractUserRealtimeStatusHandler) {
+    this.statusHandlers.add(handler);
+    handler(this.status);
+    return () => {
+      this.statusHandlers.delete(handler);
+    };
+  }
+
+  getStatus() {
+    return this.status;
+  }
+
   unsubscribe(type: ContractUserRealtimeEventType, handler: ContractUserRealtimeHandler) {
     const bucket = this.handlers.get(type);
     if (!bucket) return;
@@ -120,6 +170,7 @@ class ContractUserRealtimeClient {
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = '';
     this.requestedSymbol = '';
+    this.setStatus('idle');
 
     if (!this.ws) return;
 
@@ -140,11 +191,13 @@ class ContractUserRealtimeClient {
 
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = symbol;
+    this.setStatus(this.status === 'disconnected' || this.status === 'reconnecting' ? 'reconnecting' : 'connecting');
 
     const ws = new WebSocket(wsUrl);
     this.ws = ws;
 
     ws.onopen = () => {
+      this.setStatus('connected');
       const latestSymbol = this.requestedSymbol;
       if (latestSymbol && latestSymbol !== this.socketOpenedWithSymbol) {
         this.sendSubscribeIfOpen(latestSymbol);
@@ -163,7 +216,7 @@ class ContractUserRealtimeClient {
     };
 
     ws.onerror = () => {
-      // REST polling remains the authoritative fallback.
+      this.setStatus('disconnected');
     };
 
     ws.onclose = () => {
@@ -171,9 +224,13 @@ class ContractUserRealtimeClient {
         this.ws = null;
       }
 
-      if (this.closedByClient || !this.loggedIn || !this.requestedSymbol) return;
+      if (this.closedByClient || !this.loggedIn || !this.requestedSymbol) {
+        this.setStatus('idle');
+        return;
+      }
 
       this.clearReconnectTimer();
+      this.setStatus('reconnecting');
       this.reconnectTimer = window.setTimeout(() => {
         this.connect(this.requestedSymbol);
       }, 1500);
@@ -184,7 +241,7 @@ class ContractUserRealtimeClient {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
     try {
-      this.ws.send(`subscribe:${symbol}`);
+      this.ws.send(JSON.stringify({ type: 'subscribe', symbol }));
     } catch (err) {
       console.warn('[contractUserRealtime] subscribe failed:', err);
     }
@@ -202,7 +259,10 @@ class ContractUserRealtimeClient {
       this.emit('account', message);
     }
 
-    if (type.includes('position') || messageHasPayload(message, ['position', 'positions'])) {
+    if (
+      type.includes('position')
+      || messageHasPayload(message, ['position', 'positions', 'position_summaries', 'position_summary'])
+    ) {
       this.emit('positions', message);
     }
 
@@ -228,6 +288,14 @@ class ContractUserRealtimeClient {
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+  }
+
+  private setStatus(status: ContractUserRealtimeStatus) {
+    if (this.status === status) return;
+    this.status = status;
+    for (const handler of Array.from(this.statusHandlers)) {
+      handler(status);
     }
   }
 }

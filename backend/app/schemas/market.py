@@ -13,6 +13,9 @@ class DepthResponse(BaseModel):
     bids: List[DepthItem]
     asks: List[DepthItem]
     ts: int
+    provider: Optional[str] = None
+    stale: bool = False
+    updated_at: Optional[str] = None
     last_price: Optional[str] = None
     mid_price: Optional[str] = None
     ref_price: Optional[str] = None
@@ -33,6 +36,9 @@ class TradeItem(BaseModel):
 class TradesResponse(BaseModel):
     symbol: str
     trades: List[TradeItem]
+    provider: Optional[str] = None
+    stale: bool = False
+    updated_at: Optional[str] = None
 
 
 
@@ -59,6 +65,9 @@ class KlineResponse(BaseModel):
     symbol: str
     interval: KlineInterval
     items: List[KlineItem]
+    provider: Optional[str] = None
+    stale: bool = False
+    updated_at: Optional[str] = None
 
 
 class TickerItem(BaseModel):
@@ -75,6 +84,9 @@ class TickerItem(BaseModel):
     price_precision: int = 8
     amount_precision: int = 8
     source: Literal["internal", "binance", "itick", "external"]
+    provider: Optional[str] = None
+    stale: bool = False
+    updated_at: Optional[str] = None
     market_status: str = "UNKNOWN"
     market_status_text: str = ""
     market_session_code: Optional[str] = None

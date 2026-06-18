@@ -91,8 +91,9 @@ export const menuConfig: NavMenuConfig = {
             titleKey: 'navAboutUs',
             items: [
               { labelKey: 'navWhoWeAre', href: '/about/who-we-are' },
-              { labelKey: 'navPlatformStatement', href: '/about/platform-statement' },
-              { labelKey: 'navAboutDigitalFinance', href: '/about/digital-finance' },
+              { labelKey: 'navOurStory', href: '/about/who-we-are#story' },
+              { labelKey: 'navOurVision', href: '/about/who-we-are#vision' },
+              { labelKey: 'navOurMission', href: '/about/who-we-are#mission' },
             ],
           },
         ],

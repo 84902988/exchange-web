@@ -39,10 +39,12 @@ import { isMockStockContractSymbol, toStockContractSymbol } from '@/lib/stockCon
 type RightPanelTab = 'orderbook' | 'trades';
 type ContractUrlCategory = 'usdt' | 'stock' | 'cfd' | '';
 type ContractDataScope = 'current' | 'all';
-type ContractTranslator = (key: string, namespace?: 'contracts') => string;
+type ContractTranslator = (key: string, namespace?: 'contracts' | 'markets') => string;
 
 const DEFAULT_CONTRACT_SYMBOL = 'BTCUSDT_PERP';
 const CFD_CONTRACT_CATEGORIES = new Set(['GOLD', 'FUTURES', 'INDEX', 'FOREX', 'METAL', 'COMMODITY']);
+const TRADFI_PRICE_DEVIATION_RATIO = 0.005;
+const TRADFI_PRICE_SPREAD_MULTIPLIER = 3;
 
 const CONTRACT_SYMBOL_OPTIONS = [
   { contractSymbol: DEFAULT_CONTRACT_SYMBOL, marketSymbol: 'BTCUSDT', pricePrecision: 1 },
@@ -211,6 +213,180 @@ function pickDisplayPrice(...values: Array<string | number | null | undefined>) 
     if (price > 0) return String(value);
   }
   return null;
+}
+
+function getPositivePrice(value?: string | number | null) {
+  const price = toNumber(value);
+  return price > 0 ? price : null;
+}
+
+function getBestBidAskMid(bestBid?: string | number | null, bestAsk?: string | number | null) {
+  const bid = getPositivePrice(bestBid);
+  const ask = getPositivePrice(bestAsk);
+  if (bid === null || ask === null || ask <= bid) return null;
+  return {
+    bid,
+    ask,
+    mid: (bid + ask) / 2,
+    spread: ask - bid,
+  };
+}
+
+function isPriceNearBestBidAsk(
+  price: number,
+  best: ReturnType<typeof getBestBidAskMid>,
+  pricePrecision: number,
+) {
+  if (!best) return true;
+  const minTick = 1 / Math.pow(10, Math.max(pricePrecision, 0));
+  const tolerance = Math.max(
+    best.mid * TRADFI_PRICE_DEVIATION_RATIO,
+    best.spread * TRADFI_PRICE_SPREAD_MULTIPLIER,
+    minTick * 5,
+  );
+  return price >= best.bid - tolerance && price <= best.ask + tolerance;
+}
+
+function normalizeMarketStatus(value?: string | null) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function normalizeMarketSessionType(value?: string | null) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function normalizeQuoteFreshness(value?: string | null) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function isExtendedContractSession(sessionType: string) {
+  return sessionType === 'PRE_MARKET' || sessionType === 'AFTER_HOURS';
+}
+
+function isContractQuoteStale(
+  quote: { stale?: boolean; is_stale?: boolean } | null | undefined,
+  freshness?: string | null,
+) {
+  const normalized = normalizeQuoteFreshness(freshness);
+  return (
+    !!quote?.stale ||
+    !!quote?.is_stale ||
+    normalized === 'STALE' ||
+    normalized === 'LAST_VALID' ||
+    normalized === 'FALLBACK'
+  );
+}
+
+type ContractPriceLineSource = 'MARK_PRICE' | 'LAST_PRICE' | 'MID_PRICE';
+
+type TrustedContractDisplayPrice = {
+  price: string | null;
+  source: ContractPriceLineSource;
+  usesLatestMarketPrice: boolean;
+};
+
+function shouldPatchContractChartCandle({
+  isCryptoContract,
+  marketStatus,
+  sessionType,
+  isStale,
+}: {
+  isCryptoContract: boolean;
+  marketStatus?: string | null;
+  sessionType?: string | null;
+  isStale: boolean;
+}) {
+  if (isStale) return false;
+
+  const normalizedStatus = normalizeMarketStatus(marketStatus);
+  if (normalizedStatus === 'CLOSED' || normalizedStatus === 'HOLIDAY') return false;
+
+  if (isCryptoContract) return true;
+
+  const normalizedSession = normalizeMarketSessionType(sessionType);
+  if (isExtendedContractSession(normalizedSession)) return false;
+  if (normalizedSession === 'CLOSED' || normalizedSession === 'HOLIDAY' || normalizedSession === 'UNKNOWN') {
+    return false;
+  }
+
+  return normalizedStatus === 'OPEN' || normalizedSession === 'REGULAR';
+}
+
+function getContractQuoteTimestamp(quote: unknown) {
+  if (!quote || typeof quote !== 'object') return null;
+  const record = quote as Record<string, unknown>;
+  const value = record.source_updated_at ?? record.ts ?? null;
+  return typeof value === 'string' || typeof value === 'number' ? value : null;
+}
+
+function buildTrustedContractDisplayPrice({
+  isCryptoContract,
+  latestMarketPrice,
+  quoteLastPrice,
+  quoteMarkPrice,
+  bestBid,
+  bestAsk,
+  pricePrecision,
+  isStale,
+}: {
+  isCryptoContract: boolean;
+  latestMarketPrice?: string | number | null;
+  quoteLastPrice?: string | number | null;
+  quoteMarkPrice?: string | number | null;
+  bestBid?: string | number | null;
+  bestAsk?: string | number | null;
+  pricePrecision: number;
+  isStale: boolean;
+}): TrustedContractDisplayPrice {
+  const best = getBestBidAskMid(bestBid, bestAsk);
+
+  if (isCryptoContract) {
+    const price = pickDisplayPrice(latestMarketPrice, quoteLastPrice, quoteMarkPrice, best?.mid);
+    const numericPrice = getPositivePrice(price);
+    const mark = getPositivePrice(quoteMarkPrice);
+    const latest = getPositivePrice(latestMarketPrice);
+    const source = numericPrice !== null && mark !== null && Math.abs(mark - numericPrice) < Number.EPSILON
+      ? 'MARK_PRICE'
+      : 'LAST_PRICE';
+    return { price, source, usesLatestMarketPrice: latest !== null && numericPrice === latest };
+  }
+
+  if (best) {
+    return { price: String(best.mid), source: 'MID_PRICE', usesLatestMarketPrice: false };
+  }
+
+  if (isStale) {
+    return { price: null, source: 'LAST_PRICE', usesLatestMarketPrice: false };
+  }
+
+  const candidates: Array<{
+    value?: string | number | null;
+    source: ContractPriceLineSource;
+  }> = [
+    { value: quoteMarkPrice, source: 'MARK_PRICE' },
+    { value: latestMarketPrice, source: 'LAST_PRICE' },
+    { value: quoteLastPrice, source: 'LAST_PRICE' },
+  ];
+
+  for (const candidate of candidates) {
+    const price = getPositivePrice(candidate.value);
+    if (price === null) continue;
+    if (!isPriceNearBestBidAsk(price, best, pricePrecision)) continue;
+    return {
+      price: String(candidate.value),
+      source: candidate.source,
+      usesLatestMarketPrice: candidate.value === latestMarketPrice,
+    };
+  }
+
+  const fallback = pickDisplayPrice(quoteMarkPrice, latestMarketPrice, quoteLastPrice);
+  return {
+    price: fallback,
+    source: fallback !== null && getPositivePrice(quoteMarkPrice) === getPositivePrice(fallback)
+      ? 'MARK_PRICE'
+      : 'LAST_PRICE',
+    usesLatestMarketPrice: fallback !== null && getPositivePrice(latestMarketPrice) === getPositivePrice(fallback),
+  };
 }
 
 function getTickerChangePercent(ticker: ContractTickerItem | null) {
@@ -422,7 +598,6 @@ function ContractPageContent() {
     latestMarketPrice,
     bestBid,
     bestAsk,
-    midPrice,
     bestBidFromDepth,
     bestAskFromDepth,
     contractQuote,
@@ -436,15 +611,37 @@ function ContractPageContent() {
   } = useContractMarketState({
     contractSymbol,
     symbolOptionMarketSymbol: symbolOption?.marketSymbol,
-    symbolOptionPricePrecision: symbolOption?.pricePrecision,
+    symbolOptionPricePrecision: currentContractPair?.pricePrecision ?? symbolOption?.pricePrecision,
   });
-  const lastPrice = pickDisplayPrice(latestMarketPrice, contractQuote?.last_price, midPrice);
-  const displayLastPrice = lastPrice ? formatPrice(lastPrice, pricePrecision) : '--';
   const isCryptoContract = isCryptoContractPair(currentContractPair) || (!!symbolOption && !currentContractPair);
   const contractMarketStatus = contractQuote?.market_status || contractTicker?.market_status || currentContractPair?.marketStatus || null;
   const contractMarketStatusText = contractQuote?.market_status_text || contractTicker?.market_status_text || currentContractPair?.marketStatusText || null;
   const contractQuoteFreshness = contractQuote?.quote_freshness || contractTicker?.quote_freshness || null;
   const contractMarketSessionType = contractQuote?.market_session_type || contractTicker?.market_session_type || currentContractPair?.marketSessionType || null;
+  const contractQuoteIsStale = isContractQuoteStale(contractQuote, contractQuoteFreshness);
+  const trustedContractDisplayPrice = buildTrustedContractDisplayPrice({
+    isCryptoContract,
+    latestMarketPrice,
+    quoteLastPrice: contractQuote?.last_price,
+    quoteMarkPrice: contractQuote?.mark_price,
+    bestBid,
+    bestAsk,
+    pricePrecision,
+    isStale: contractQuoteIsStale,
+  });
+  const latestCandlePatchPrice = trustedContractDisplayPrice.price;
+  const latestCandlePatchSource = trustedContractDisplayPrice.source;
+  const chartPriceIsStale = contractQuoteIsStale && latestCandlePatchSource !== 'MID_PRICE';
+  const displayLastPrice = latestCandlePatchPrice ? formatPrice(latestCandlePatchPrice, pricePrecision) : '--';
+  const latestCandlePatchTime = trustedContractDisplayPrice.usesLatestMarketPrice || latestCandlePatchSource === 'MID_PRICE'
+    ? null
+    : getContractQuoteTimestamp(contractQuote);
+  const allowLatestPriceCandlePatch = shouldPatchContractChartCandle({
+    isCryptoContract,
+    marketStatus: contractMarketStatus,
+    sessionType: contractMarketSessionType,
+    isStale: chartPriceIsStale,
+  });
   const tpSlTriggerPriceType = normalizeTpSlTriggerPriceType(currentContractPair?.tpSlTriggerPriceType);
   const headerMetrics = useMemo<HeaderMetric[]>(() => {
     const bidAsk = `${formatPrice(bestBid, pricePrecision)} / ${formatPrice(bestAsk, pricePrecision)}`;
@@ -484,6 +681,7 @@ function ContractPageContent() {
     account,
     positions,
     positionSummaries,
+    activeOrders,
     orders,
     trades,
     privateLoading,
@@ -492,6 +690,7 @@ function ContractPageContent() {
     isOrdersLoading,
     isTradesLoading,
     accountError,
+    realtimeStatus,
     openPositionsForTrading,
     refreshPrivateSilently,
   } = useContractUserState({
@@ -512,7 +711,7 @@ function ContractPageContent() {
     () => buildPositionTpSlOverlays(positions, contractSymbol),
     [contractSymbol, positions],
   );
-  const chartCurrentPrice = lastPrice;
+  const chartCurrentPrice = latestCandlePatchPrice;
 
   const contractPairSymbols = useMemo(
     () => contractPairs.map((item) => item.symbol),
@@ -706,9 +905,14 @@ function ContractPageContent() {
                       symbol={contractSymbol}
                       interval={interval}
                       marketStatus={contractMarketStatus}
-                      latestPrice={chartCurrentPrice}
-                      lastPrice={lastPrice}
-                      midPrice={midPrice}
+                      pricePrecision={pricePrecision}
+                      latestCandlePatchPrice={chartCurrentPrice}
+                      latestPriceTimestamp={latestCandlePatchTime}
+                      allowLatestPriceCandlePatch={allowLatestPriceCandlePatch}
+                      latestCandlePatchMaxDeviationRatio={isCryptoContract ? null : 0.002}
+                      allowRealtimeTradeCandlePatch={isCryptoContract}
+                      marketSessionType={contractMarketSessionType}
+                      quoteFreshness={contractQuoteFreshness}
                       positionOverlay={positionOverlay}
                       positionEntryOverlays={positionEntryOverlays}
                       positionTpSlOverlays={positionTpSlOverlays}
@@ -781,6 +985,7 @@ function ContractPageContent() {
                   scope={contractDataScope}
                   positions={positions}
                   positionSummaries={positionSummaries}
+                  activeOrders={activeOrders}
                   orders={orders}
                   trades={trades}
                   quote={contractQuote}
@@ -792,6 +997,7 @@ function ContractPageContent() {
                   isAllPositionsLoading={isAllPositionsLoading}
                   isOrdersLoading={isOrdersLoading}
                   isTradesLoading={isTradesLoading}
+                  realtimeStatus={realtimeStatus}
                   onSymbolSelect={(symbol) => selectContractSymbol(symbol)}
                   onScopeChange={setContractDataScope}
                   onSuccess={refreshPrivateSilently}

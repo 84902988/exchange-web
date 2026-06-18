@@ -97,9 +97,9 @@ export class CryptoMarketService extends BaseExternalService<CryptoMarketService
    * @param limit - 返回的交易数量（默认100）
    * @returns 交易历史数据
    */
-  async getTradeHistory(symbol: string, limit: number = 100): Promise<{ success: boolean; data?: any[] }> {
+  async getTradeHistory(symbol: string, limit: number = 100): Promise<{ success: boolean; data?: unknown[] }> {
     const path = this.formatUrl(`/trades/${symbol}`, { limit });
-    const response = await this.request<any[]>(path);
+    const response = await this.request<unknown[]>(path);
     return response;
   }
 
@@ -109,9 +109,9 @@ export class CryptoMarketService extends BaseExternalService<CryptoMarketService
    * @param level - 深度级别（默认5）
    * @returns 市场深度数据
    */
-  async getDepth(symbol: string, level: number = 5): Promise<{ success: boolean; data?: any }> {
+  async getDepth(symbol: string, level: number = 5): Promise<{ success: boolean; data?: unknown }> {
     const path = this.formatUrl(`/depth/${symbol}`, { level });
-    const response = await this.request<any>(path);
+    const response = await this.request<unknown>(path);
     return response;
   }
 }

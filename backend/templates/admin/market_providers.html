@@ -1,0 +1,250 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}行情源配置中心{% endblock %}
+{% block page_title %}行情源配置中心{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">统一管理现货、合约、股票/CFD、内部撮合行情的数据源、优先级、超时、冷却和兜底策略。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .market-provider-page{max-width:100%;overflow-x:hidden}
+    .provider-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px;padding:4px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(255,255,255,.025)}
+    .provider-tab{appearance:none;border:1px solid transparent;border-radius:10px;background:transparent;color:var(--muted);min-height:36px;padding:0 14px;font-size:13px;font-weight:800;letter-spacing:0;cursor:pointer}
+    .provider-tab:hover{border-color:rgba(255,255,255,.14);background:rgba(255,255,255,.055);color:var(--text)}
+    .provider-tab.is-active{border-color:rgba(96,165,250,.55);background:rgba(37,99,235,.22);color:#bfdbfe;box-shadow:0 0 0 1px rgba(96,165,250,.08) inset}
+    .provider-list{display:flex;flex-direction:column;gap:12px;max-width:100%}
+    .provider-card{border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.035);padding:14px;max-width:100%;overflow:hidden}
+    .provider-card.is-testing{opacity:.72}
+    .provider-summary{display:grid;grid-template-columns:minmax(160px,1.35fr) minmax(70px,.45fr) minmax(74px,.45fr) minmax(96px,.62fr) minmax(132px,.78fr) minmax(0,1fr) minmax(148px,auto);gap:12px;align-items:center;min-width:0}
+    .provider-cell{min-width:0}
+    .provider-label{display:block;margin-bottom:4px;color:var(--muted);font-size:12px;line-height:1.2}
+    .provider-value{font-size:13px;line-height:1.35;min-width:0}
+    .provider-title{font-weight:800;color:#fff}
+    .provider-code{margin-top:3px;color:var(--muted);font-size:12px}
+    .provider-group{margin-top:6px}
+    .provider-error{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .provider-actions{display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap;min-width:0}
+    .js-provider-test-button{display:inline-flex;align-items:center;gap:6px}
+    .admin-spinner{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:admin-spin .8s linear infinite}
+    @keyframes admin-spin{to{transform:rotate(360deg)}}
+    .provider-edit{margin-top:12px;border-top:1px solid rgba(255,255,255,.08);padding-top:12px}
+    .provider-edit summary{cursor:pointer;display:inline-flex;align-items:center;min-height:36px;padding:0 12px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.05);font-weight:700}
+    .provider-edit summary::-webkit-details-marker{display:none}
+    .provider-edit-form{display:grid;grid-template-columns:minmax(96px,.45fr) minmax(92px,.42fr) minmax(220px,1.1fr) minmax(98px,.45fr) minmax(98px,.45fr) auto;gap:12px;align-items:end;margin-top:12px;max-width:100%}
+    .provider-edit-form .field{min-width:0}
+    .provider-edit-form input[type="url"]{max-width:360px}
+    .provider-note{margin-top:12px;color:var(--muted);font-size:13px;line-height:1.55}
+    .provider-fallback-note{padding:10px 12px;border:1px solid rgba(255,255,255,.10);border-radius:10px;background:rgba(255,255,255,.04);color:var(--muted);font-size:13px;line-height:1.55}
+    .provider-toggle{display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+    .provider-toggle input{width:16px;height:16px}
+    @media (max-width:1180px){
+      .provider-summary{grid-template-columns:minmax(180px,1fr) repeat(2,minmax(86px,.5fr)) minmax(120px,.7fr)}
+      .provider-actions{justify-content:flex-start}
+      .provider-edit-form{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .provider-edit-form input[type="url"]{max-width:100%}
+    }
+    @media (max-width:720px){
+      .provider-summary{grid-template-columns:1fr}
+      .provider-edit-form{grid-template-columns:1fr}
+      .provider-actions{align-items:flex-start}
+      .provider-tab{flex:1 1 calc(50% - 8px);padding:0 10px}
+    }
+  </style>
+
+  <div class="market-provider-page">
+    {% if notice %}
+      <section class="page-section">
+        <div class="card">
+          <div class="section-title">操作结果</div>
+          <p class="muted">{{ notice }}</p>
+        </div>
+      </section>
+    {% endif %}
+
+    {% if error %}
+      <section class="page-section">
+        <div class="card">
+          <div class="section-title">提示信息</div>
+          <p class="muted">{{ error }}</p>
+        </div>
+      </section>
+    {% endif %}
+
+    <section class="page-section">
+      <div class="admin-alert admin-alert-warning">
+        后台只允许配置 base_url、启停、优先级、timeout 和 cooldown；不会读取 API key，也不会调用下单、账户、资金或仓位接口。
+      </div>
+    </section>
+
+    <section class="page-section">
+      <div class="table-card">
+        <div class="section-title">Provider 列表</div>
+        <div class="provider-tabs" role="tablist" aria-label="Provider 分类">
+          <button type="button" class="provider-tab is-active" data-provider-tab="all" role="tab" aria-selected="true">全部</button>
+          <button type="button" class="provider-tab" data-provider-tab="crypto" role="tab" aria-selected="false">数字货币行情</button>
+          <button type="button" class="provider-tab" data-provider-tab="stock-cfd" role="tab" aria-selected="false">股票 / CFD 行情</button>
+          <button type="button" class="provider-tab" data-provider-tab="internal" role="tab" aria-selected="false">内部撮合行情</button>
+          <button type="button" class="provider-tab" data-provider-tab="fallback" role="tab" aria-selected="false">兜底策略</button>
+        </div>
+        <div class="provider-list">
+          {% for item in items %}
+            {% set provider_code = (item.provider_code or '')|upper %}
+            {% set provider_market_type = (item.market_type or '')|upper %}
+            {% set provider_group = item.provider_group or '' %}
+            {% if item.is_last_good or provider_code == 'LAST_GOOD' or 'FALLBACK' in provider_code %}
+              {% set provider_tab = 'fallback' %}
+            {% elif provider_code == 'INTERNAL' or 'MATCHING' in provider_code or '内部撮合' in provider_group %}
+              {% set provider_tab = 'internal' %}
+            {% elif provider_code.startswith('ITICK_') %}
+              {% set provider_tab = 'stock-cfd' %}
+            {% elif provider_market_type in ['SPOT', 'CONTRACT', 'FUTURES', 'CRYPTO'] or 'BINANCE' in provider_code or 'OKX' in provider_code or 'BITGET' in provider_code or 'SWAP' in provider_code or 'USDM' in provider_code or 'FUTURES' in provider_code %}
+              {% set provider_tab = 'crypto' %}
+            {% else %}
+              {% set provider_tab = 'stock-cfd' %}
+            {% endif %}
+            <article class="provider-card" data-provider-category="{{ provider_tab }}">
+              <div class="provider-summary">
+                <div class="provider-cell">
+                  <span class="provider-label">Provider</span>
+                  <div class="provider-title">{{ item.display_name or item.provider_name }}</div>
+                  <div class="provider-group">
+                    <span class="admin-badge admin-badge-info">{{ item.provider_group }}</span>
+                  </div>
+                  <div class="provider-code mono">{{ item.provider_code }}</div>
+                </div>
+
+                <div class="provider-cell">
+                  <span class="provider-label">启用</span>
+                  <span class="admin-badge admin-badge-{% if item.enabled %}success{% else %}secondary{% endif %}">
+                    {% if item.enabled %}已启用{% else %}已停用{% endif %}
+                  </span>
+                </div>
+
+                <div class="provider-cell">
+                  <span class="provider-label">优先级</span>
+                  <div class="provider-value admin-number">{{ item.priority }}</div>
+                </div>
+
+                <div class="provider-cell">
+                  <span class="provider-label">状态</span>
+                  <span class="admin-badge admin-badge-{{ item.display_status_badge }}">{{ item.display_status }}</span>
+                </div>
+
+                <div class="provider-cell">
+                  <span class="provider-label">最近成功</span>
+                  <div class="provider-value admin-time">{{ item.last_success_at or '-' }}</div>
+                </div>
+
+                <div class="provider-cell">
+                  <span class="provider-label">最近错误</span>
+                  <span class="provider-error admin-muted">{{ item.last_error_display or '-' }}</span>
+                </div>
+
+                <div class="provider-cell provider-actions">
+                  {% if item.can_test_connection %}
+                    <form method="post" action="/admin/market-providers/{{ item.provider_code }}/test" class="js-provider-test-form">
+                      <button type="submit" class="btn secondary admin-btn admin-btn-secondary admin-btn-sm js-provider-test-button">测试连接</button>
+                    </form>
+                  {% endif %}
+                </div>
+              </div>
+
+              {% if item.is_readonly %}
+                <div class="provider-note">{{ item.readonly_note }}</div>
+              {% else %}
+              <details class="provider-edit">
+                <summary>编辑</summary>
+                <form method="post" action="/admin/market-providers/{{ item.provider_code }}/update" class="provider-edit-form">
+                  <div class="field">
+                    <label>启用</label>
+                    <label class="provider-toggle">
+                      <input type="checkbox" name="enabled" value="1" {% if item.enabled %}checked{% endif %} />
+                      <span>启用</span>
+                    </label>
+                  </div>
+                  <div class="field">
+                    <label>优先级</label>
+                    <input type="number" name="priority" value="{{ item.priority }}" min="1" max="9999" />
+                  </div>
+                  {% if item.is_last_good %}
+                    <div class="provider-fallback-note">
+                      最近有效价格兜底不连接外部 API，不需要 base_url、timeout 或 cooldown。
+                    </div>
+                  {% else %}
+                    <div class="field">
+                      <label>Base URL</label>
+                      <input type="url" name="base_url" value="{{ item.base_url }}" placeholder="https://example.com" />
+                    </div>
+                    <div class="field">
+                      <label>Timeout(ms)</label>
+                      <input type="number" name="timeout_ms" value="{{ item.timeout_ms }}" min="300" max="15000" />
+                    </div>
+                    <div class="field">
+                      <label>Cooldown(s)</label>
+                      <input type="number" name="cooldown_seconds" value="{{ item.cooldown_seconds }}" min="0" max="3600" />
+                    </div>
+                  {% endif %}
+                  <div class="filter-actions">
+                    <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">保存</button>
+                  </div>
+                </form>
+              </details>
+              {% endif %}
+
+              {% if item.is_last_good %}
+                <div class="provider-note">
+                  当 OKX / Bitget 等外部行情源不可用时，系统使用最近一次成功行情，避免交易页空白。
+                </div>
+              {% endif %}
+            </article>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+    (() => {
+      const forms = Array.from(document.querySelectorAll('.js-provider-test-form'));
+      forms.forEach((form) => {
+        form.addEventListener('submit', () => {
+          const button = form.querySelector('.js-provider-test-button, button[type="submit"]');
+          if (!button) return;
+          const originalText = (button.textContent || '').trim() || '测试连接';
+          button.classList.add('js-provider-test-button');
+          button.dataset.originalText = button.dataset.originalText || originalText;
+          button.disabled = true;
+          button.innerHTML = '<span class="admin-spinner" aria-hidden="true"></span><span>测试中...</span>';
+          const card = form.closest('.provider-card');
+          if (card) card.classList.add('is-testing');
+          window.setTimeout(() => {
+            if (!button.isConnected) return;
+            button.disabled = false;
+            button.textContent = button.dataset.originalText || originalText;
+            if (card) card.classList.remove('is-testing');
+          }, 30000);
+        });
+      });
+    })();
+
+    (() => {
+      const tabs = Array.from(document.querySelectorAll('.provider-tab'));
+      const cards = Array.from(document.querySelectorAll('.provider-card[data-provider-category]'));
+      if (!tabs.length || !cards.length) return;
+      const activate = (target) => {
+        tabs.forEach((tab) => {
+          const active = tab.dataset.providerTab === target;
+          tab.classList.toggle('is-active', active);
+          tab.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+        cards.forEach((card) => {
+          card.hidden = target !== 'all' && card.dataset.providerCategory !== target;
+        });
+      };
+      tabs.forEach((tab) => {
+        tab.addEventListener('click', () => activate(tab.dataset.providerTab || 'all'));
+      });
+      activate('all');
+    })();
+  </script>
+{% endblock %}

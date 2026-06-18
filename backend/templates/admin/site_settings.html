@@ -26,8 +26,12 @@
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
       gap: 16px;
-      align-items: start;
+      align-items: stretch;
       min-width: 0;
+    }
+    .site-settings-top-row > .settings-card {
+      height: 100%;
+      align-content: start;
     }
     .settings-card {
       display: grid;
@@ -410,32 +414,21 @@
                 <input id="show_risk_link" name="show_risk_link" type="checkbox" value="1" {% if form.show_risk_link %}checked{% endif %} />
                 显示风险提示
               </label>
-              <div class="field">
-                <label for="risk_link_url">风险提示链接</label>
-                <input id="risk_link_url" name="risk_link_url" type="text" value="{{ form.risk_link_url or '' }}" placeholder="/risk" />
-              </div>
             </div>
             <div class="footer-link-card">
               <label class="toggle-control" for="show_terms_link">
                 <input id="show_terms_link" name="show_terms_link" type="checkbox" value="1" {% if form.show_terms_link %}checked{% endif %} />
                 显示服务条款
               </label>
-              <div class="field">
-                <label for="terms_link_url">服务条款链接</label>
-                <input id="terms_link_url" name="terms_link_url" type="text" value="{{ form.terms_link_url or '' }}" placeholder="/terms" />
-              </div>
             </div>
             <div class="footer-link-card">
               <label class="toggle-control" for="show_privacy_link">
                 <input id="show_privacy_link" name="show_privacy_link" type="checkbox" value="1" {% if form.show_privacy_link %}checked{% endif %} />
                 显示隐私政策
               </label>
-              <div class="field">
-                <label for="privacy_link_url">隐私政策链接</label>
-                <input id="privacy_link_url" name="privacy_link_url" type="text" value="{{ form.privacy_link_url or '' }}" placeholder="/privacy" />
-              </div>
             </div>
           </div>
+          <p class="settings-card-desc">固定页面：/risk、/terms、/privacy，正文请在“风险与协议页面”维护。</p>
         </div>
         </div>
 

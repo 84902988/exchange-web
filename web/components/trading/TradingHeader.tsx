@@ -62,11 +62,7 @@ const TradingHeader: React.FC<TradingHeaderProps> = ({
   ]);
 
   // 如果提供了自定义行情数据，使用自定义数据
-  useEffect(() => {
-    if (customMarketData) {
-      setMarketData(customMarketData);
-    }
-  }, [customMarketData]);
+  const displayedMarketData = customMarketData ?? marketData;
 
   // 实时行情更新（通过WebSocket）
   useEffect(() => {
@@ -82,15 +78,17 @@ const TradingHeader: React.FC<TradingHeaderProps> = ({
      * 处理市场行情更新
      * @param update 市场行情更新数据
      */
-    const handleMarketUpdate = (update: any) => {
-      if (update.type === 'market_summary' && update.data) {
+    const handleMarketUpdate = (update: unknown) => {
+      const marketUpdate = update as { type?: string; data?: MarketScrollItem[] };
+      if (marketUpdate.type === 'market_summary' && Array.isArray(marketUpdate.data)) {
+        const nextMarketData = marketUpdate.data;
         // 更新行情滚动数据
         setMarketData(prev => {
           // 将最新的行情数据与现有数据合并，避免频繁更新导致的闪烁
           const updatedData = [...prev];
           
           // 更新已存在的交易对数据
-          update.data.forEach((newItem: MarketScrollItem) => {
+          nextMarketData.forEach((newItem) => {
             const index = updatedData.findIndex(item => item.symbol === newItem.symbol);
             if (index !== -1) {
               updatedData[index] = newItem;
@@ -126,7 +124,7 @@ const TradingHeader: React.FC<TradingHeaderProps> = ({
         <div className="bg-[#0b0b0f] py-1 overflow-hidden">
           <div className="flex items-center space-x-6 animate-marquee">
             {/* 重复数据以实现无缝滚动效果 */}
-            {[...marketData, ...marketData].map((item, index) => (
+            {[...displayedMarketData, ...displayedMarketData].map((item, index) => (
               <div key={index} className="flex items-center space-x-3">
                 <span className="text-xs text-gray-400">{item.symbol}</span>
                 <span className="text-xs font-medium">{item.price}</span>

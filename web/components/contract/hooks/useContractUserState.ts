@@ -5,6 +5,7 @@ import { toNumber } from '@/components/contract/contractFormat';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
   getContractAccountSummary,
+  getContractPrivateWsBridgeHealth,
   getContractOrders,
   getContractPositionSummaries,
   getContractPositions,
@@ -18,6 +19,7 @@ import {
 import {
   contractUserRealtime,
   type ContractUserRealtimeMessage,
+  type ContractUserRealtimeStatus,
 } from '@/lib/realtime/contractUserRealtime';
 
 type UseContractUserStateParams = {
@@ -28,6 +30,7 @@ type UseContractUserStateParams = {
 };
 
 type ContractDataScope = NonNullable<UseContractUserStateParams['dataScope']>;
+const CONTRACT_WS_BRIDGE_HEALTH_CHECK_MS = 30000;
 
 type PositionScopeCacheEntry = {
   positions: ContractPositionItem[];
@@ -41,6 +44,8 @@ type ListScopeCacheEntry<T> = {
   page: number;
   loadedAt: number;
 };
+
+const ACTIVE_CONTRACT_ORDER_STATUSES = new Set(['OPEN', 'NEW', 'PENDING', 'PARTIALLY_FILLED']);
 
 function normalizeCacheSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase();
@@ -60,6 +65,10 @@ function getListCacheSymbol(scope: ContractDataScope, symbol: string) {
 
 function getOrdersCacheKey(scope: ContractDataScope, symbol: string, page = 1) {
   return `orders:${getListCacheSymbol(scope, symbol)}:${page}`;
+}
+
+function getActiveOrdersCacheKey(scope: ContractDataScope, symbol: string, page = 1) {
+  return `active-orders:${getListCacheSymbol(scope, symbol)}:${page}`;
 }
 
 function getTradesCacheKey(scope: ContractDataScope, symbol: string, page = 1) {
@@ -82,11 +91,20 @@ function getPositionAmount(item: ContractPositionItem) {
   return toNumber(record.quantity ?? record.amount ?? record.size);
 }
 
+function isActiveContractOrder(item: ContractOrderListItem) {
+  return ACTIVE_CONTRACT_ORDER_STATUSES.has(String(item.status || '').trim().toUpperCase());
+}
+
+function filterActiveContractOrders(items: ContractOrderListItem[]) {
+  return items.filter(isActiveContractOrder);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 function getContractUserPayload(message: ContractUserRealtimeMessage) {
+  if (isRecord(message.payload)) return message.payload;
   return isRecord(message.data) ? message.data : message as Record<string, unknown>;
 }
 
@@ -133,6 +151,12 @@ function extractContractPositionsUpdate(
 ) {
   const payload = getContractUserPayload(message);
   if (!isContractUserMessageForSymbol(message, payload, currentSymbol)) return null;
+  const hasSummaryPayload =
+    message.position_summaries !== undefined ||
+    message.position_summary !== undefined ||
+    payload.position_summaries !== undefined ||
+    payload.position_summary !== undefined;
+  if (!hasSummaryPayload) return null;
 
   const items = [
     ...asRecordArray(message.positions),
@@ -148,6 +172,29 @@ function extractContractPositionsUpdate(
   return {
     replace: Array.isArray(message.positions) || Array.isArray(payload.positions),
     items: items as unknown as ContractPositionItem[],
+  };
+}
+
+function extractContractPositionSummariesUpdate(
+  message: ContractUserRealtimeMessage,
+  currentSymbol: string,
+) {
+  const payload = getContractUserPayload(message);
+  if (!isContractUserMessageForSymbol(message, payload, currentSymbol)) return null;
+
+  const items = [
+    ...asRecordArray(message.position_summaries),
+    ...asRecordArray(message.position_summary),
+    ...asRecordArray(payload.position_summaries),
+    ...asRecordArray(payload.position_summary),
+  ].filter((item) => {
+    const itemSymbol = String(item.symbol || '').trim().toUpperCase();
+    return !itemSymbol || itemSymbol === currentSymbol.toUpperCase();
+  });
+
+  return {
+    replace: Array.isArray(message.position_summaries) || Array.isArray(payload.position_summaries),
+    items: items as unknown as ContractPositionSummaryItem[],
   };
 }
 
@@ -212,6 +259,37 @@ function replaceOrMergeById<T extends { id: number }>(previous: T[], items: T[],
   return Array.from(map.values()).sort((a, b) => b.id - a.id);
 }
 
+function replaceOrMergeByIdForSymbol<T extends { id: number; symbol?: string }>(
+  previous: T[],
+  items: T[],
+  replace: boolean,
+  currentSymbol: string,
+) {
+  if (!replace) return replaceOrMergeById(previous, items, false);
+
+  const normalizedSymbol = currentSymbol.toUpperCase();
+  const preserved = previous.filter((item) => String(item.symbol || '').trim().toUpperCase() !== normalizedSymbol);
+  return replaceOrMergeById(preserved, items, false);
+}
+
+function replaceOrMergeActiveOrdersByIdForSymbol(
+  previous: ContractOrderListItem[],
+  items: ContractOrderListItem[],
+  replace: boolean,
+  currentSymbol: string,
+) {
+  const activeItems = filterActiveContractOrders(items);
+  if (replace) return replaceOrMergeByIdForSymbol(previous, activeItems, true, currentSymbol);
+
+  const itemIds = new Set(items.map((item) => Number(item.id)));
+  const normalizedSymbol = currentSymbol.toUpperCase();
+  const preserved = previous.filter((item) => {
+    const itemSymbol = String(item.symbol || '').trim().toUpperCase();
+    return itemSymbol !== normalizedSymbol || !itemIds.has(Number(item.id));
+  });
+  return replaceOrMergeById(preserved, activeItems, false);
+}
+
 function replaceOrMergePositions(
   previous: ContractPositionItem[],
   items: ContractPositionItem[],
@@ -225,6 +303,46 @@ function replaceOrMergePositions(
   return replaceOrMergeById(preserved, items, false);
 }
 
+function replaceOrMergePositionSummaries(
+  previous: ContractPositionSummaryItem[],
+  items: ContractPositionSummaryItem[],
+  replace: boolean,
+  currentSymbol: string,
+) {
+  const normalizedSymbol = currentSymbol.toUpperCase();
+  const currentItems = replace
+    ? items
+    : [
+        ...previous.filter((item) => String(item.symbol || '').trim().toUpperCase() === normalizedSymbol),
+        ...items,
+      ];
+  const map = new Map<string, ContractPositionSummaryItem>();
+  currentItems.forEach((item) => {
+    const key = `${String(item.symbol || '').trim().toUpperCase()}:${String(item.side || '').trim().toUpperCase()}`;
+    map.set(key, item);
+  });
+  const mergedCurrentItems = Array.from(map.values());
+  if (replace) {
+    const preserved = previous.filter((item) => String(item.symbol || '').trim().toUpperCase() !== normalizedSymbol);
+    return [...preserved, ...mergedCurrentItems];
+  }
+  return [
+    ...previous.filter((item) => String(item.symbol || '').trim().toUpperCase() !== normalizedSymbol),
+    ...mergedCurrentItems,
+  ];
+}
+
+function getMessageSeq(message: ContractUserRealtimeMessage) {
+  const value = Number(message.seq);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function getMessageServerTs(message: ContractUserRealtimeMessage) {
+  if (!message.server_ts) return null;
+  const value = Date.parse(message.server_ts);
+  return Number.isFinite(value) ? value : null;
+}
+
 export function useContractUserState({
   contractSymbol,
   dataScope = 'current',
@@ -235,6 +353,7 @@ export function useContractUserState({
   const [account, setAccount] = useState<ContractAccountSummary | null>(null);
   const [positions, setPositions] = useState<ContractPositionItem[]>([]);
   const [positionSummaries, setPositionSummaries] = useState<ContractPositionSummaryItem[]>([]);
+  const [activeOrders, setActiveOrders] = useState<ContractOrderListItem[]>([]);
   const [orders, setOrders] = useState<ContractOrderListItem[]>([]);
   const [trades, setTrades] = useState<ContractTradeListItem[]>([]);
   const [privateLoading, setPrivateLoading] = useState(false);
@@ -243,16 +362,28 @@ export function useContractUserState({
   const [isAllPositionsLoading, setIsAllPositionsLoading] = useState(false);
   const [isOrdersLoading, setIsOrdersLoading] = useState(false);
   const [isTradesLoading, setIsTradesLoading] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] = useState<ContractUserRealtimeStatus>('idle');
   const hasLoadedPrivateRef = useRef(false);
   const positionScopeCacheRef = useRef<Map<string, PositionScopeCacheEntry>>(new Map());
+  const activeOrdersCacheRef = useRef<Map<string, ListScopeCacheEntry<ContractOrderListItem>>>(new Map());
   const ordersCacheRef = useRef<Map<string, ListScopeCacheEntry<ContractOrderListItem>>>(new Map());
   const tradesCacheRef = useRef<Map<string, ListScopeCacheEntry<ContractTradeListItem>>>(new Map());
   const allPrefetchInFlightRef = useRef<Promise<void> | null>(null);
   const ordersTradesPrefetchInFlightRef = useRef<Promise<void> | null>(null);
+  const refreshPrivateRequestSeqRef = useRef(0);
+  const realtimeVersionRef = useRef(0);
+  const lastRealtimeSeqRef = useRef(0);
+  const lastRealtimeTsRef = useRef(0);
+  const positionsRef = useRef<ContractPositionItem[]>([]);
+  const positionSummariesRef = useRef<ContractPositionSummaryItem[]>([]);
   const hasPrefetchedAllRef = useRef(false);
   const hasPrefetchedOrdersTradesRef = useRef(false);
   const activePositionScopeKey = useMemo(
     () => getPositionScopeCacheKey(dataScope, contractSymbol),
+    [contractSymbol, dataScope],
+  );
+  const activeOrdersScopeKey = useMemo(
+    () => getActiveOrdersCacheKey(dataScope, contractSymbol, 1),
     [contractSymbol, dataScope],
   );
   const activeOrdersCacheKey = useMemo(
@@ -264,12 +395,19 @@ export function useContractUserState({
     [contractSymbol, dataScope],
   );
   const activePositionScopeKeyRef = useRef(activePositionScopeKey);
+  const activeOrdersScopeKeyRef = useRef(activeOrdersScopeKey);
   const activeOrdersCacheKeyRef = useRef(activeOrdersCacheKey);
   const activeTradesCacheKeyRef = useRef(activeTradesCacheKey);
 
   useEffect(() => {
     activePositionScopeKeyRef.current = activePositionScopeKey;
   }, [activePositionScopeKey]);
+
+  useEffect(() => {
+    activeOrdersScopeKeyRef.current = activeOrdersScopeKey;
+    const cached = activeOrdersCacheRef.current.get(activeOrdersScopeKey);
+    setActiveOrders(cached?.rows || []);
+  }, [activeOrdersScopeKey]);
 
   useEffect(() => {
     activeOrdersCacheKeyRef.current = activeOrdersCacheKey;
@@ -279,9 +417,23 @@ export function useContractUserState({
     activeTradesCacheKeyRef.current = activeTradesCacheKey;
   }, [activeTradesCacheKey]);
 
+  useEffect(() => {
+    positionsRef.current = positions;
+  }, [positions]);
+
+  useEffect(() => {
+    positionSummariesRef.current = positionSummaries;
+  }, [positionSummaries]);
+
   const applyPositionScopeCache = useCallback((entry: PositionScopeCacheEntry) => {
+    positionsRef.current = entry.positions;
+    positionSummariesRef.current = entry.positionSummaries;
     setPositions(entry.positions);
     setPositionSummaries(entry.positionSummaries);
+  }, []);
+
+  const applyActiveOrdersCache = useCallback((entry: ListScopeCacheEntry<ContractOrderListItem>) => {
+    setActiveOrders(entry.rows);
   }, []);
 
   const applyOrdersCache = useCallback((entry: ListScopeCacheEntry<ContractOrderListItem>) => {
@@ -290,6 +442,41 @@ export function useContractUserState({
 
   const applyTradesCache = useCallback((entry: ListScopeCacheEntry<ContractTradeListItem>) => {
     setTrades(entry.rows);
+  }, []);
+
+  const markRealtimeMessage = useCallback((message: ContractUserRealtimeMessage) => {
+    const seq = getMessageSeq(message);
+    if (seq !== null) {
+      if (seq < lastRealtimeSeqRef.current) return false;
+      if (seq > lastRealtimeSeqRef.current) {
+        lastRealtimeSeqRef.current = seq;
+        realtimeVersionRef.current += 1;
+      }
+      return true;
+    }
+
+    const serverTs = getMessageServerTs(message);
+    if (serverTs !== null) {
+      if (serverTs < lastRealtimeTsRef.current) return false;
+      if (serverTs > lastRealtimeTsRef.current) {
+        lastRealtimeTsRef.current = serverTs;
+        realtimeVersionRef.current += 1;
+      }
+    } else {
+      realtimeVersionRef.current += 1;
+    }
+    return true;
+  }, []);
+
+  const updateActivePositionScopeCache = useCallback((
+    nextPositions: ContractPositionItem[],
+    nextSummaries: ContractPositionSummaryItem[],
+  ) => {
+    positionScopeCacheRef.current.set(activePositionScopeKeyRef.current, {
+      positions: nextPositions,
+      positionSummaries: nextSummaries,
+      loadedAt: Date.now(),
+    });
   }, []);
 
   const prefetchAllPositionScope = useCallback(() => {
@@ -331,17 +518,35 @@ export function useContractUserState({
 
   const prefetchOrdersAndTrades = useCallback(() => {
     if (!isLoggedIn) return null;
+    const activeOrdersScopeKey = getActiveOrdersCacheKey('current', contractSymbol, 1);
     const ordersCacheKey = getOrdersCacheKey('current', contractSymbol, 1);
     const tradesCacheKey = getTradesCacheKey('current', contractSymbol, 1);
-    if (ordersCacheRef.current.has(ordersCacheKey) && tradesCacheRef.current.has(tradesCacheKey)) return null;
+    if (
+      activeOrdersCacheRef.current.has(activeOrdersScopeKey) &&
+      ordersCacheRef.current.has(ordersCacheKey) &&
+      tradesCacheRef.current.has(tradesCacheKey)
+    ) return null;
     if (ordersTradesPrefetchInFlightRef.current) return ordersTradesPrefetchInFlightRef.current;
 
     const scopedSymbol = getScopedSymbol('current', contractSymbol);
     const request = Promise.allSettled([
+      getContractOrders({ symbol: scopedSymbol, status: 'ACTIVE', page: 1, page_size: 100 }),
       getContractOrders({ symbol: scopedSymbol, page: 1, page_size: 50 }),
       getContractTrades({ symbol: scopedSymbol, page: 1, page_size: 50 }),
     ])
-      .then(([ordersResult, tradesResult]) => {
+      .then(([activeOrdersResult, ordersResult, tradesResult]) => {
+        if (activeOrdersResult.status === 'fulfilled') {
+          const entry: ListScopeCacheEntry<ContractOrderListItem> = {
+            rows: activeOrdersResult.value.items || [],
+            total: activeOrdersResult.value.total ?? activeOrdersResult.value.items?.length ?? 0,
+            page: activeOrdersResult.value.page ?? 1,
+            loadedAt: Date.now(),
+          };
+          activeOrdersCacheRef.current.set(activeOrdersScopeKey, entry);
+          if (activeOrdersScopeKeyRef.current === activeOrdersScopeKey) {
+            applyActiveOrdersCache(entry);
+          }
+        }
         if (ordersResult.status === 'fulfilled') {
           const entry: ListScopeCacheEntry<ContractOrderListItem> = {
             rows: ordersResult.value.items || [],
@@ -373,17 +578,22 @@ export function useContractUserState({
 
     ordersTradesPrefetchInFlightRef.current = request;
     return request;
-  }, [applyOrdersCache, applyTradesCache, contractSymbol, isLoggedIn]);
+  }, [applyActiveOrdersCache, applyOrdersCache, applyTradesCache, contractSymbol, isLoggedIn]);
 
   const refreshPrivate = useCallback(async (options?: { silent?: boolean }) => {
     if (!isLoggedIn) return;
 
+    const requestSeq = refreshPrivateRequestSeqRef.current + 1;
+    refreshPrivateRequestSeqRef.current = requestSeq;
+    const realtimeVersionAtStart = realtimeVersionRef.current;
     const requestedScope = dataScope;
     const scopedSymbol = getScopedSymbol(requestedScope, contractSymbol);
     const positionScopeKey = getPositionScopeCacheKey(requestedScope, contractSymbol);
+    const activeOrdersScopeKey = getActiveOrdersCacheKey(requestedScope, contractSymbol, 1);
     const ordersCacheKey = getOrdersCacheKey(requestedScope, contractSymbol, 1);
     const tradesCacheKey = getTradesCacheKey(requestedScope, contractSymbol, 1);
     const isActivePositionScope = () => activePositionScopeKeyRef.current === positionScopeKey;
+    const isActiveCurrentOrdersScope = () => activeOrdersScopeKeyRef.current === activeOrdersScopeKey;
     const isActiveOrdersScope = () => activeOrdersCacheKeyRef.current === ordersCacheKey;
     const isActiveTradesScope = () => activeTradesCacheKeyRef.current === tradesCacheKey;
     const shouldShowLoading = !options?.silent && !hasLoadedPrivateRef.current;
@@ -396,7 +606,7 @@ export function useContractUserState({
     if (requestedScope === 'all') {
       setIsAllPositionsLoading(true);
     }
-    if (isActiveOrdersScope()) {
+    if (isActiveCurrentOrdersScope() || isActiveOrdersScope()) {
       setIsOrdersLoading(true);
     }
     if (isActiveTradesScope()) {
@@ -408,15 +618,24 @@ export function useContractUserState({
         accountResult,
         positionsResult,
         positionSummariesResult,
+        activeOrdersResult,
         ordersResult,
         tradesResult,
       ] = await Promise.allSettled([
         getContractAccountSummary(),
         getContractPositions({ symbol: scopedSymbol, status: 'ALL' }),
         getContractPositionSummaries({ symbol: scopedSymbol }),
+        getContractOrders({ symbol: scopedSymbol, status: 'ACTIVE', page: 1, page_size: 100 }),
         getContractOrders({ symbol: scopedSymbol, page: 1, page_size: 50 }),
         getContractTrades({ symbol: scopedSymbol, page: 1, page_size: 50 }),
       ]);
+
+      if (refreshPrivateRequestSeqRef.current !== requestSeq) {
+        return;
+      }
+      if (realtimeVersionRef.current !== realtimeVersionAtStart) {
+        return;
+      }
 
       if (accountResult.status === 'fulfilled') {
         setAccount(accountResult.value);
@@ -448,10 +667,25 @@ export function useContractUserState({
 
       if (isActivePositionScope()) {
         if (nextPositions) {
+          positionsRef.current = nextPositions;
           setPositions(nextPositions);
         }
         if (nextPositionSummaries) {
+          positionSummariesRef.current = nextPositionSummaries;
           setPositionSummaries(nextPositionSummaries);
+        }
+      }
+
+      if (activeOrdersResult.status === 'fulfilled') {
+        const entry: ListScopeCacheEntry<ContractOrderListItem> = {
+          rows: activeOrdersResult.value.items || [],
+          total: activeOrdersResult.value.total ?? activeOrdersResult.value.items?.length ?? 0,
+          page: activeOrdersResult.value.page ?? 1,
+          loadedAt: Date.now(),
+        };
+        activeOrdersCacheRef.current.set(activeOrdersScopeKey, entry);
+        if (isActiveCurrentOrdersScope()) {
+          applyActiveOrdersCache(entry);
         }
       }
 
@@ -480,7 +714,7 @@ export function useContractUserState({
         }
       }
 
-      const hasDataError = [positionsResult, positionSummariesResult, ordersResult, tradesResult]
+      const hasDataError = [positionsResult, positionSummariesResult, activeOrdersResult, ordersResult, tradesResult]
         .some((item) => item.status === 'rejected');
       if (hasDataError) {
         onErrorChange(t('contractDataLoadFailed', 'contracts'));
@@ -499,6 +733,7 @@ export function useContractUserState({
       }
       if (
         requestedScope === 'current' &&
+        activeOrdersResult.status === 'fulfilled' &&
         ordersResult.status === 'fulfilled' &&
         tradesResult.status === 'fulfilled' &&
         !hasPrefetchedOrdersTradesRef.current
@@ -507,6 +742,9 @@ export function useContractUserState({
         void prefetchOrdersAndTrades();
       }
     } finally {
+      if (refreshPrivateRequestSeqRef.current !== requestSeq) {
+        return;
+      }
       hasLoadedPrivateRef.current = true;
       if (isActivePositionScope()) {
         setIsScopeSwitching(false);
@@ -514,7 +752,7 @@ export function useContractUserState({
       if (requestedScope === 'all') {
         setIsAllPositionsLoading(false);
       }
-      if (isActiveOrdersScope()) {
+      if (isActiveCurrentOrdersScope() || isActiveOrdersScope()) {
         setIsOrdersLoading(false);
       }
       if (isActiveTradesScope()) {
@@ -524,7 +762,7 @@ export function useContractUserState({
         setPrivateLoading(false);
       }
     }
-  }, [applyOrdersCache, applyTradesCache, contractSymbol, dataScope, isLoggedIn, onErrorChange, prefetchAllPositionScope, prefetchOrdersAndTrades, t]);
+  }, [applyActiveOrdersCache, applyOrdersCache, applyTradesCache, contractSymbol, dataScope, isLoggedIn, onErrorChange, prefetchAllPositionScope, prefetchOrdersAndTrades, t]);
 
   const refreshPrivateSilently = useCallback(() => refreshPrivate({ silent: true }), [refreshPrivate]);
 
@@ -535,6 +773,8 @@ export function useContractUserState({
     });
   }, [contractSymbol, isLoggedIn]);
 
+  useEffect(() => contractUserRealtime.subscribeStatus(setRealtimeStatus), []);
+
   useEffect(() => {
     return () => {
       contractUserRealtime.disconnect();
@@ -542,7 +782,104 @@ export function useContractUserState({
   }, []);
 
   useEffect(() => {
+    const applyRealtimePositionState = (
+      positionsUpdate: ReturnType<typeof extractContractPositionsUpdate> | null,
+      summariesUpdate: ReturnType<typeof extractContractPositionSummariesUpdate> | null,
+    ) => {
+      if (!positionsUpdate && !summariesUpdate) return;
+
+      const nextPositions = positionsUpdate
+        ? replaceOrMergePositions(
+            positionsRef.current,
+            positionsUpdate.items,
+            positionsUpdate.replace,
+            contractSymbol,
+          )
+        : positionsRef.current;
+      const nextSummaries = summariesUpdate
+        ? replaceOrMergePositionSummaries(
+            positionSummariesRef.current,
+            summariesUpdate.items,
+            summariesUpdate.replace,
+            contractSymbol,
+          )
+        : positionSummariesRef.current;
+
+      positionsRef.current = nextPositions;
+      positionSummariesRef.current = nextSummaries;
+      setPositions(nextPositions);
+      setPositionSummaries(nextSummaries);
+      updateActivePositionScopeCache(nextPositions, nextSummaries);
+      setIsScopeSwitching(false);
+      hasLoadedPrivateRef.current = true;
+    };
+
+    const handleSnapshotMessage = (message: ContractUserRealtimeMessage) => {
+      if (!markRealtimeMessage(message)) return;
+      const payload = getContractUserPayload(message);
+      if (!isContractUserMessageForSymbol(message, payload, contractSymbol)) return;
+
+      const nextAccount = extractContractAccountUpdate(message);
+      if (nextAccount) {
+        setAccount(nextAccount);
+        setAccountError(null);
+      }
+      applyRealtimePositionState(
+        extractContractPositionsUpdate(message, contractSymbol),
+        extractContractPositionSummariesUpdate(message, contractSymbol),
+      );
+
+      const ordersUpdate = extractContractOrdersUpdate(message, contractSymbol);
+      if (ordersUpdate) {
+        setActiveOrders((previous) => {
+          const nextActiveOrders = replaceOrMergeActiveOrdersByIdForSymbol(
+            previous,
+            ordersUpdate.items,
+            ordersUpdate.replace,
+            contractSymbol,
+          );
+          activeOrdersCacheRef.current.set(activeOrdersScopeKeyRef.current, {
+            rows: nextActiveOrders,
+            total: nextActiveOrders.length,
+            page: 1,
+            loadedAt: Date.now(),
+          });
+          return nextActiveOrders;
+        });
+        setOrders((previous) => {
+          const nextOrders = replaceOrMergeByIdForSymbol(previous, ordersUpdate.items, ordersUpdate.replace, contractSymbol);
+          ordersCacheRef.current.set(activeOrdersCacheKeyRef.current, {
+            rows: nextOrders,
+            total: nextOrders.length,
+            page: 1,
+            loadedAt: Date.now(),
+          });
+          return nextOrders;
+        });
+        setIsOrdersLoading(false);
+      }
+
+      const tradesUpdate = extractContractTradesUpdate(message, contractSymbol);
+      if (tradesUpdate) {
+        setTrades((previous) => {
+          const nextTrades = replaceOrMergeByIdForSymbol(previous, tradesUpdate.items, tradesUpdate.replace, contractSymbol);
+          tradesCacheRef.current.set(activeTradesCacheKeyRef.current, {
+            rows: nextTrades,
+            total: nextTrades.length,
+            page: 1,
+            loadedAt: Date.now(),
+          });
+          return nextTrades;
+        });
+        setIsTradesLoading(false);
+      }
+      hasLoadedPrivateRef.current = true;
+      setPrivateLoading(false);
+    };
+
     const handleAccountMessage = (message: ContractUserRealtimeMessage) => {
+      if (String(message.type || '').toLowerCase().includes('snapshot')) return;
+      if (!markRealtimeMessage(message)) return;
       const nextAccount = extractContractAccountUpdate(message);
       if (nextAccount) {
         setAccount(nextAccount);
@@ -552,38 +889,79 @@ export function useContractUserState({
     };
 
     const handlePositionsMessage = (message: ContractUserRealtimeMessage) => {
-      const update = extractContractPositionsUpdate(message, contractSymbol);
-      if (!update) return;
-      setPositions((previous) => replaceOrMergePositions(previous, update.items, update.replace, contractSymbol));
-      hasLoadedPrivateRef.current = true;
+      if (String(message.type || '').toLowerCase().includes('snapshot')) return;
+      if (!markRealtimeMessage(message)) return;
+      applyRealtimePositionState(
+        extractContractPositionsUpdate(message, contractSymbol),
+        extractContractPositionSummariesUpdate(message, contractSymbol),
+      );
     };
 
     const handleOrdersMessage = (message: ContractUserRealtimeMessage) => {
+      if (String(message.type || '').toLowerCase().includes('snapshot')) return;
+      if (!markRealtimeMessage(message)) return;
       const update = extractContractOrdersUpdate(message, contractSymbol);
       if (!update) return;
-      setOrders((previous) => replaceOrMergeById(previous, update.items, update.replace));
+      setActiveOrders((previous) => {
+        const nextActiveOrders = replaceOrMergeActiveOrdersByIdForSymbol(
+          previous,
+          update.items,
+          update.replace,
+          contractSymbol,
+        );
+        activeOrdersCacheRef.current.set(activeOrdersScopeKeyRef.current, {
+          rows: nextActiveOrders,
+          total: nextActiveOrders.length,
+          page: 1,
+          loadedAt: Date.now(),
+        });
+        return nextActiveOrders;
+      });
+      setOrders((previous) => {
+        const nextOrders = replaceOrMergeByIdForSymbol(previous, update.items, update.replace, contractSymbol);
+        ordersCacheRef.current.set(activeOrdersCacheKeyRef.current, {
+          rows: nextOrders,
+          total: nextOrders.length,
+          page: 1,
+          loadedAt: Date.now(),
+        });
+        return nextOrders;
+      });
       hasLoadedPrivateRef.current = true;
     };
 
     const handleTradesMessage = (message: ContractUserRealtimeMessage) => {
+      if (String(message.type || '').toLowerCase().includes('snapshot')) return;
+      if (!markRealtimeMessage(message)) return;
       const update = extractContractTradesUpdate(message, contractSymbol);
       if (!update) return;
-      setTrades((previous) => replaceOrMergeById(previous, update.items, update.replace));
+      setTrades((previous) => {
+        const nextTrades = replaceOrMergeByIdForSymbol(previous, update.items, update.replace, contractSymbol);
+        tradesCacheRef.current.set(activeTradesCacheKeyRef.current, {
+          rows: nextTrades,
+          total: nextTrades.length,
+          page: 1,
+          loadedAt: Date.now(),
+        });
+        return nextTrades;
+      });
       hasLoadedPrivateRef.current = true;
     };
 
+    const unsubscribeSnapshot = contractUserRealtime.subscribe('snapshot', handleSnapshotMessage);
     const unsubscribeAccount = contractUserRealtime.subscribe('account', handleAccountMessage);
     const unsubscribePositions = contractUserRealtime.subscribe('positions', handlePositionsMessage);
     const unsubscribeOrders = contractUserRealtime.subscribe('orders', handleOrdersMessage);
     const unsubscribeTrades = contractUserRealtime.subscribe('trades', handleTradesMessage);
 
     return () => {
+      unsubscribeSnapshot();
       unsubscribeAccount();
       unsubscribePositions();
       unsubscribeOrders();
       unsubscribeTrades();
     };
-  }, [contractSymbol]);
+  }, [contractSymbol, markRealtimeMessage, updateActivePositionScopeCache]);
 
   useEffect(() => {
     if (!isLoggedIn) {
@@ -602,8 +980,11 @@ export function useContractUserState({
       setIsTradesLoading(false);
       setAccount(null);
       setAccountError(null);
+      positionsRef.current = [];
+      positionSummariesRef.current = [];
       setPositions([]);
       setPositionSummaries([]);
+      setActiveOrders([]);
       setOrders([]);
       setTrades([]);
       return;
@@ -614,19 +995,27 @@ export function useContractUserState({
       applyPositionScopeCache(cachedPositions);
       setIsScopeSwitching(false);
     } else {
+      positionsRef.current = [];
+      positionSummariesRef.current = [];
       setPositions([]);
       setPositionSummaries([]);
       setIsScopeSwitching(true);
     }
 
+    const cachedActiveOrders = activeOrdersCacheRef.current.get(activeOrdersScopeKey);
+    if (cachedActiveOrders) {
+      applyActiveOrdersCache(cachedActiveOrders);
+    } else {
+      setActiveOrders([]);
+    }
+
     const cachedOrders = ordersCacheRef.current.get(activeOrdersCacheKey);
     if (cachedOrders) {
       applyOrdersCache(cachedOrders);
-      setIsOrdersLoading(false);
     } else {
       setOrders([]);
-      setIsOrdersLoading(true);
     }
+    setIsOrdersLoading(!cachedActiveOrders || !cachedOrders);
 
     const cachedTrades = tradesCacheRef.current.get(activeTradesCacheKey);
     if (cachedTrades) {
@@ -638,21 +1027,85 @@ export function useContractUserState({
     }
 
     void refreshPrivate({ silent: hasLoadedPrivateRef.current });
-    const timer = window.setInterval(() => {
-      void refreshPrivate({ silent: true });
-    }, 3000);
-
-    return () => window.clearInterval(timer);
   }, [
     activeOrdersCacheKey,
+    activeOrdersScopeKey,
     activePositionScopeKey,
     activeTradesCacheKey,
+    applyActiveOrdersCache,
     applyOrdersCache,
     applyPositionScopeCache,
     applyTradesCache,
     isLoggedIn,
     refreshPrivate,
   ]);
+
+  useEffect(() => {
+    if (!isLoggedIn) return;
+
+    const refreshIfRealtimeUnavailable = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      if (contractUserRealtime.getStatus() === 'connected') return;
+      void refreshPrivate({ silent: true });
+    };
+    const handleVisibilityChange = () => {
+      if (!document.hidden) refreshIfRealtimeUnavailable();
+    };
+
+    window.addEventListener('focus', refreshIfRealtimeUnavailable);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.removeEventListener('focus', refreshIfRealtimeUnavailable);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [isLoggedIn, refreshPrivate]);
+
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    if (realtimeStatus !== 'disconnected' && realtimeStatus !== 'reconnecting') return;
+    if (typeof document !== 'undefined' && document.hidden) return;
+    void refreshPrivate({ silent: true });
+  }, [isLoggedIn, realtimeStatus, refreshPrivate]);
+
+  useEffect(() => {
+    if (!isLoggedIn || realtimeStatus !== 'connected') return;
+    if (typeof window === 'undefined') return;
+
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const scheduleNext = () => {
+      if (cancelled) return;
+      timer = window.setTimeout(checkBridgeHealth, CONTRACT_WS_BRIDGE_HEALTH_CHECK_MS);
+    };
+
+    const checkBridgeHealth = async () => {
+      if (cancelled) return;
+      if (typeof document !== 'undefined' && document.hidden) {
+        scheduleNext();
+        return;
+      }
+
+      try {
+        const health = await getContractPrivateWsBridgeHealth();
+        if (health.rest_fallback_recommended || String(health.status || '').toLowerCase() !== 'ok') {
+          void refreshPrivate({ silent: true });
+        }
+      } catch {
+        void refreshPrivate({ silent: true });
+      } finally {
+        scheduleNext();
+      }
+    };
+
+    scheduleNext();
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [isLoggedIn, realtimeStatus, refreshPrivate]);
 
   const openPositionsForTrading = useMemo(
     () => positions.filter((item) => (
@@ -667,6 +1120,7 @@ export function useContractUserState({
     account,
     positions,
     positionSummaries,
+    activeOrders,
     orders,
     trades,
     privateLoading,
@@ -674,6 +1128,7 @@ export function useContractUserState({
     isAllPositionsLoading,
     isOrdersLoading,
     isTradesLoading,
+    realtimeStatus,
     accountError,
     openPositionsForTrading,
     refreshPrivateSilently,

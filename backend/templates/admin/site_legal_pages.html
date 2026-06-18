@@ -1,0 +1,348 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}风险与协议页面{% endblock %}
+{% block page_title %}风险与协议页面{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">维护前台风险提示、服务条款和隐私政策页面内容，支持多语言。</div>
+{% endblock %}
+
+{% block content %}
+  <style>
+    .site-legal-shell {
+      display: grid;
+      gap: 16px;
+      width: 100%;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+    .site-legal-form {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      width: 100%;
+      min-width: 0;
+      align-items: stretch;
+    }
+    .settings-card {
+      display: grid;
+      gap: 16px;
+      min-width: 0;
+      padding: 18px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 12px;
+      background: rgba(255,255,255,.035);
+      box-shadow: 0 16px 36px rgba(0,0,0,.16);
+    }
+    .settings-card-header {
+      display: grid;
+      gap: 4px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .settings-card-title {
+      margin: 0;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 800;
+    }
+    .settings-card-desc {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .site-legal-form .field {
+      align-self: start;
+      min-width: 0;
+    }
+    .site-legal-form .field label {
+      min-height: 18px;
+      line-height: 18px;
+      margin-bottom: 8px;
+    }
+    .site-legal-form textarea {
+      width: 100%;
+      min-height: 260px;
+      resize: vertical;
+      line-height: 1.65;
+      white-space: pre-wrap;
+    }
+    .i18n-panel {
+      display: grid;
+      gap: 18px;
+      padding: 16px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 12px;
+      background: rgba(255,255,255,.035);
+    }
+    .i18n-fallback-note {
+      margin: 0;
+      color: #facc15;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .i18n-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .i18n-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 7px 10px;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 8px;
+      background: rgba(255,255,255,.045);
+      color: var(--muted);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .i18n-tab.is-active {
+      border-color: rgba(250, 204, 21, .55);
+      background: rgba(250, 204, 21, .14);
+      color: #fff;
+    }
+    .i18n-tab-panel {
+      display: none;
+    }
+    .i18n-tab-panel.is-active {
+      display: grid;
+      gap: 18px;
+    }
+    .i18n-language-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .legal-page-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      align-items: start;
+    }
+    .legal-page-card {
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+      padding: 16px;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 10px;
+      background: rgba(0,0,0,.16);
+    }
+    .legal-page-card.is-wide {
+      grid-column: 1 / -1;
+    }
+    .legal-page-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 800;
+    }
+    .legal-page-code {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .legal-page-hint {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .site-notice {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      border-color: rgba(49, 177, 119, .42);
+      background: linear-gradient(180deg, rgba(31, 122, 85, .20), rgba(31, 122, 85, .10));
+      transition: opacity .2s ease, transform .2s ease, margin .2s ease, padding .2s ease;
+    }
+    .site-notice.is-hidden {
+      opacity: 0;
+      transform: translateY(-6px);
+      pointer-events: none;
+    }
+    .site-notice-icon {
+      width: 28px;
+      height: 28px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 999px;
+      background: rgba(49, 177, 119, .22);
+      border: 1px solid rgba(49, 177, 119, .35);
+      color: #a8f0cd;
+      font-weight: 900;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .site-notice-title {
+      margin: 0 0 4px;
+      color: #a8f0cd;
+      font-size: 14px;
+      font-weight: 800;
+    }
+    .site-notice-text {
+      margin: 0;
+      color: #fff;
+      font-size: 14px;
+    }
+    @media (max-width: 860px) {
+      .legal-page-grid {
+        grid-template-columns: 1fr;
+      }
+      .legal-page-card.is-wide {
+        grid-column: auto;
+      }
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card site-notice" id="site_legal_pages_notice">
+        <span class="site-notice-icon">OK</span>
+        <div>
+          <p class="site-notice-title">保存成功</p>
+          <p class="site-notice-text">{{ notice }}</p>
+        </div>
+      </div>
+    </section>
+  {% endif %}
+  {% if error %}
+    <section class="page-section">
+      <div class="card"><div class="section-title">提示信息</div><p class="muted">{{ error }}</p></div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="filter-card site-legal-shell">
+      <form method="post" action="/admin/site-legal-pages" class="filter-form site-legal-form">
+        <div class="settings-card">
+          <div class="settings-card-header">
+            <h3 class="settings-card-title">内容编辑</h3>
+            <p class="settings-card-desc">正文仅支持纯文本换行，不保存富文本 HTML。</p>
+          </div>
+          <div class="i18n-panel">
+            <p class="i18n-fallback-note">中文为默认 fallback；其他语言为空时前台会使用中文内容。</p>
+            <div class="i18n-tabs" role="tablist" aria-label="风险与协议页面多语言内容编辑">
+              {% for language in legal_pages.languages %}
+                <button
+                  type="button"
+                  id="legal_i18n_tab_{{ language.suffix }}"
+                  class="i18n-tab{% if loop.first %} is-active{% endif %}"
+                  role="tab"
+                  aria-selected="{% if loop.first %}true{% else %}false{% endif %}"
+                  aria-controls="legal_i18n_panel_{{ language.suffix }}"
+                  data-legal-i18n-tab="{{ language.suffix }}"
+                >
+                  <span>{{ language.label }}</span>
+                </button>
+              {% endfor %}
+            </div>
+            <div class="i18n-tab-panels">
+              {% for language in legal_pages.languages %}
+                <div
+                  id="legal_i18n_panel_{{ language.suffix }}"
+                  class="i18n-tab-panel{% if loop.first %} is-active{% endif %}"
+                  role="tabpanel"
+                  aria-labelledby="legal_i18n_tab_{{ language.suffix }}"
+                  data-legal-i18n-panel="{{ language.suffix }}"
+                  {% if not loop.first %}hidden{% endif %}
+                >
+                  <div class="i18n-language-heading">
+                    <span>{{ language.label }}</span>
+                  </div>
+                  <div class="legal-page-grid">
+                    {% for page in language.pages %}
+                      <div class="legal-page-card{% if page.key == 'privacy' %} is-wide{% endif %}">
+                        <h4 class="legal-page-title">
+                          <span>{{ page.label }}</span>
+                          <span class="legal-page-code">{{ page.key }}</span>
+                        </h4>
+                        <div class="field">
+                          <label for="legal_page_{{ language.suffix }}_{{ page.key }}_title">标题</label>
+                          <input
+                            id="legal_page_{{ language.suffix }}_{{ page.key }}_title"
+                            name="legal_page_{{ language.suffix }}_{{ page.key }}_title"
+                            type="text"
+                            value="{{ page.title }}"
+                          />
+                        </div>
+                        <div class="field">
+                          <label for="legal_page_{{ language.suffix }}_{{ page.key }}_content">正文</label>
+                          <textarea
+                            id="legal_page_{{ language.suffix }}_{{ page.key }}_content"
+                            name="legal_page_{{ language.suffix }}_{{ page.key }}_content"
+                          >{{ page.content }}</textarea>
+                          <p class="legal-page-hint">前台会按纯文本显示并保留换行，不渲染 HTML。</p>
+                        </div>
+                      </div>
+                    {% endfor %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn admin-btn admin-btn-primary">保存</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <script>
+    const siteLegalPagesNotice = document.getElementById("site_legal_pages_notice");
+    if (siteLegalPagesNotice) {
+      window.setTimeout(() => {
+        siteLegalPagesNotice.classList.add("is-hidden");
+        window.setTimeout(() => siteLegalPagesNotice.remove(), 220);
+      }, 2600);
+
+      const url = new URL(window.location.href);
+      if (url.searchParams.has("notice")) {
+        url.searchParams.delete("notice");
+        window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+      }
+    }
+
+    function initializeLegalPageTabs() {
+      const tabs = Array.from(document.querySelectorAll("[data-legal-i18n-tab]"));
+      const panels = Array.from(document.querySelectorAll("[data-legal-i18n-panel]"));
+      if (!tabs.length || !panels.length) return;
+
+      function activateTab(lang) {
+        tabs.forEach((tab) => {
+          const isActive = tab.dataset.legalI18nTab === lang;
+          tab.classList.toggle("is-active", isActive);
+          tab.setAttribute("aria-selected", isActive ? "true" : "false");
+        });
+        panels.forEach((panel) => {
+          const isActive = panel.dataset.legalI18nPanel === lang;
+          panel.classList.toggle("is-active", isActive);
+          panel.hidden = !isActive;
+        });
+      }
+
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => activateTab(tab.dataset.legalI18nTab || "zh"));
+      });
+      activateTab("zh");
+    }
+
+    initializeLegalPageTabs();
+  </script>
+{% endblock %}

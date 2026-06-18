@@ -4,14 +4,17 @@
 import { useState, useEffect } from 'react';
 import { fallbackSiteConfig, getSiteConfig } from '@/lib/api/modules/site';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import enTranslations from '@/config/locales/en.json';
 
 const FALLBACK_SITE_NAME = fallbackSiteConfig.site_name || 'Royal Exchange';
 const FALLBACK_SUPPORT_EMAIL = fallbackSiteConfig.support_email || '';
 const FALLBACK_RISK_DISCLAIMER = fallbackSiteConfig.risk_disclaimer || '';
 const FALLBACK_FOOTER_DISCLAIMER = fallbackSiteConfig.footer_disclaimer || '';
+const DEFAULT_COMMON_TRANSLATIONS = (enTranslations as { common: Record<string, string> }).common;
 
 export default function Footer() {
   const { locale, t } = useLocaleContext();
+  const [mounted, setMounted] = useState(false);
   const [siteFooter, setSiteFooter] = useState({
     siteName: FALLBACK_SITE_NAME,
     supportEmail: '',
@@ -24,6 +27,11 @@ export default function Footer() {
     showPrivacyLink: fallbackSiteConfig.show_privacy_link ?? true,
     privacyLinkUrl: fallbackSiteConfig.privacy_link_url || '',
   });
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setMounted(true), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
   
   useEffect(() => {
     let cancelled = false;
@@ -68,17 +76,17 @@ export default function Footer() {
   const footerLinks = [
     {
       visible: siteFooter.showRiskLink,
-      label: t('riskWarning', 'common'),
+      label: mounted ? t('riskWarning', 'common') : DEFAULT_COMMON_TRANSLATIONS.riskWarning,
       href: siteFooter.riskLinkUrl,
     },
     {
       visible: siteFooter.showTermsLink,
-      label: t('termsOfService', 'common'),
+      label: mounted ? t('termsOfService', 'common') : DEFAULT_COMMON_TRANSLATIONS.termsOfService,
       href: siteFooter.termsLinkUrl,
     },
     {
       visible: siteFooter.showPrivacyLink,
-      label: t('privacyPolicy', 'common'),
+      label: mounted ? t('privacyPolicy', 'common') : DEFAULT_COMMON_TRANSLATIONS.privacyPolicy,
       href: siteFooter.privacyLinkUrl,
     },
   ].filter((item) => item.visible);
@@ -97,7 +105,7 @@ export default function Footer() {
               <>
                 <span className="text-white/30">|</span>
                 <div className="text-white/50">
-                  {t('support', 'common')}: {siteFooter.supportEmail}
+                  {mounted ? t('support', 'common') : DEFAULT_COMMON_TRANSLATIONS.support}: {siteFooter.supportEmail}
                 </div>
               </>
             )}

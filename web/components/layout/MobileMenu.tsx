@@ -7,6 +7,9 @@ import { useAuth } from '@/lib/authContext';
 import { MenuItem } from '@/config/menuConfig';
 import { canShowMenu } from '@/utils/menuAuth';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import enTranslations from '@/config/locales/en.json';
+
+const DEFAULT_COMMON_TRANSLATIONS = (enTranslations as { common: Record<string, string> }).common;
 
 interface MobileMenuProps {
   open: boolean;
@@ -24,6 +27,7 @@ export default function MobileMenu({
   const { logout } = useAuth();
   const router = useRouter();
   const { t } = useLocaleContext();
+  const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
     document.body.style.overflow = open ? 'hidden' : '';
@@ -32,9 +36,15 @@ export default function MobileMenu({
     };
   }, [open]);
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => setMounted(true), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
   const visibleMenuItems = menuItems.filter((item) => canShowMenu(item, isLoggedIn));
   const [openGroup, setOpenGroup] = useState<string | null>(null);
   const normalizeGroup = (item: MenuItem) => item.group ?? 'main';
+  const menuT = (key: string) => (mounted ? t(key, 'common') : DEFAULT_COMMON_TRANSLATIONS[key] || key);
 
   const groupedMenu = {
     main: visibleMenuItems.filter((i) => normalizeGroup(i) === 'main'),
@@ -64,11 +74,11 @@ export default function MobileMenu({
         ${open ? 'translate-x-0' : '-translate-x-full'}`}
       >
         <div className="flex items-center justify-between mb-6">
-          <span className="text-sm font-semibold text-amber-400">{t('menu', 'common')}</span>
+          <span className="text-sm font-semibold text-amber-400">{menuT('menu')}</span>
           <button
             onClick={onClose}
             className="text-white/60 hover:text-white"
-            aria-label={t('close', 'common')}
+            aria-label={menuT('close')}
           >
             {'\u00d7'}
           </button>
@@ -86,7 +96,7 @@ export default function MobileMenu({
                     onClick={() => setOpenGroup(isOpen ? null : item.labelKey)}
                     className="w-full text-left text-sm font-medium text-white/85 hover:text-white transition-colors"
                   >
-                    {t(item.labelKey, 'common')}
+                    {menuT(item.labelKey)}
                   </button>
                 ) : (
                   <Link
@@ -94,7 +104,7 @@ export default function MobileMenu({
                     onClick={onClose}
                     className="block text-sm font-medium text-white/85 hover:text-white transition-colors"
                   >
-                    {t(item.labelKey, 'common')}
+                    {menuT(item.labelKey)}
                   </Link>
                 )}
 
@@ -103,7 +113,7 @@ export default function MobileMenu({
                     {item.megaMenu?.groups.map((group) => (
                       <div key={group.titleKey} className="space-y-1">
                         <div className="text-xs text-white/40 uppercase tracking-wide">
-                          {t(group.titleKey, 'common')}
+                          {menuT(group.titleKey)}
                         </div>
                         {group.items.map((subItem) => (
                           <Link
@@ -112,7 +122,7 @@ export default function MobileMenu({
                             onClick={onClose}
                             className="block text-sm text-white/85 hover:text-white pl-2"
                           >
-                            {t(subItem.labelKey, 'common')}
+                            {menuT(subItem.labelKey)}
                           </Link>
                         ))}
                       </div>
@@ -133,7 +143,7 @@ export default function MobileMenu({
               onClick={onClose}
               className="block text-sm font-semibold text-amber-400"
             >
-              {t('login', 'common')}
+              {menuT('login')}
             </Link>
 
             <Link
@@ -141,7 +151,7 @@ export default function MobileMenu({
               onClick={onClose}
               className="block text-sm font-semibold text-amber-400"
             >
-              {t('register', 'common')}
+              {menuT('register')}
             </Link>
           </div>
         )}
@@ -149,7 +159,7 @@ export default function MobileMenu({
         {isLoggedIn && (
           <div className="space-y-4">
             <div className="text-xs text-white/50">
-              {t('account', 'common')}
+              {menuT('account')}
             </div>
 
             <Link
@@ -157,7 +167,7 @@ export default function MobileMenu({
               onClick={onClose}
               className="block text-sm font-medium text-white/85 hover:text-white"
             >
-              {t('personalCenter', 'common')}
+              {menuT('personalCenter')}
             </Link>
 
             <button
@@ -169,7 +179,7 @@ export default function MobileMenu({
               className="block w-full text-left text-sm font-medium text-red-400 hover:text-red-300"
               type="button"
             >
-              {t('logout', 'common')}
+              {menuT('logout')}
             </button>
           </div>
         )}

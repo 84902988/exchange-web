@@ -1,7 +1,8 @@
 param(
     [string]$ApiHost = "127.0.0.1",
     [int]$ApiPort = 8000,
-    [string]$PythonExe = ""
+    [string]$PythonExe = "",
+    [switch]$Reload
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,6 +47,10 @@ $Command
 }
 
 $QuotedPython = Quote-ForPowerShell $PythonExe
+$ReloadArgs = ""
+if ($Reload) {
+    $ReloadArgs = " --reload --reload-dir app --reload-exclude '../tmp/pdfs/*' --reload-exclude '../tmp/*' --reload-exclude 'tmp/*' --reload-exclude '../output/*'"
+}
 $RqScript = Join-Path $RepoRoot "backend\scripts\start_rq_worker.py"
 if (-not (Test-Path -LiteralPath $RqScript)) {
     throw "Missing RQ worker script: $RqScript"
@@ -76,6 +81,16 @@ if (-not (Test-Path -LiteralPath $TpSlScannerScript)) {
     throw "Missing TP/SL scanner script: $TpSlScannerScript"
 }
 $QuotedTpSlScannerScript = Quote-ForPowerShell $TpSlScannerScript
+$ContractLimitOrderScannerScript = Join-Path $RepoRoot "backend\scripts\start_contract_limit_order_scanner.py"
+if (-not (Test-Path -LiteralPath $ContractLimitOrderScannerScript)) {
+    throw "Missing contract limit order scanner script: $ContractLimitOrderScannerScript"
+}
+$QuotedContractLimitOrderScannerScript = Quote-ForPowerShell $ContractLimitOrderScannerScript
+$ContractAccountingReconciliationSchedulerScript = Join-Path $RepoRoot "backend\scripts\start_contract_accounting_reconciliation_scheduler.py"
+if (-not (Test-Path -LiteralPath $ContractAccountingReconciliationSchedulerScript)) {
+    throw "Missing contract accounting reconciliation scheduler script: $ContractAccountingReconciliationSchedulerScript"
+}
+$QuotedContractAccountingReconciliationSchedulerScript = Quote-ForPowerShell $ContractAccountingReconciliationSchedulerScript
 
 Write-Host "Starting local development processes..."
 Write-Host "Repo root: $RepoRoot"
@@ -85,7 +100,7 @@ Write-Host ""
 Start-DevProcess `
     -Title "exchange FastAPI :$ApiPort" `
     -WorkingDirectory $BackendDir `
-    -Command "& $QuotedPython -m uvicorn app.main:app --host $ApiHost --port $ApiPort --access-log"
+    -Command "& $QuotedPython -m uvicorn app.main:app --host $ApiHost --port $ApiPort --access-log$ReloadArgs"
 
 Start-DevProcess `
     -Title "exchange RQ collection/gas/tx_confirm/withdraw" `
@@ -136,6 +151,16 @@ Start-DevProcess `
     -Title "exchange TP SL scanner" `
     -WorkingDirectory $RepoRoot `
     -Command "& $QuotedPython $QuotedTpSlScannerScript"
+
+Start-DevProcess `
+    -Title "exchange contract limit order scanner" `
+    -WorkingDirectory $RepoRoot `
+    -Command "& $QuotedPython $QuotedContractLimitOrderScannerScript"
+
+Start-DevProcess `
+    -Title "exchange contract accounting reconciliation scheduler" `
+    -WorkingDirectory $RepoRoot `
+    -Command "& $QuotedPython $QuotedContractAccountingReconciliationSchedulerScript"
 
 Write-Host "Started FastAPI, RQ worker, scheduler, loop, and scanner windows."
 Write-Host "Keep Redis, Next.js, and cpolar tunnels running separately as described in docs/local_dev_startup.md."

@@ -125,6 +125,7 @@ function DepositPageContent() {
   );
 
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [openDepositFaqKey, setOpenDepositFaqKey] = useState<string | null>(null);
   const toggleSidebar = () => setIsSidebarCollapsed((v) => !v);
 
   // deposit options
@@ -413,6 +414,23 @@ function DepositPageContent() {
   const depItems: DepositRecord[] = depositsQuery.data?.items ?? [];
   const depHasPrev = depPage > 1;
   const depHasNext = depPage * depPageSize < depTotal;
+  const depositFaqItems = [
+    {
+      key: "howToDeposit",
+      title: t("assetDepositHowToDeposit", "asset"),
+      answer: t("assetDepositHowToDepositDesc", "asset"),
+    },
+    {
+      key: "depositNotArrived",
+      title: t("assetDepositDepositNotArrived", "asset"),
+      answer: t("assetDepositDepositNotArrivedDesc", "asset"),
+    },
+    {
+      key: "wrongNetworkDeposit",
+      title: t("assetDepositWrongNetworkDeposit", "asset"),
+      answer: t("assetDepositWrongNetworkDepositDesc", "asset"),
+    },
+  ];
 
   const formatNetwork = (chainKey: string) => {
     const n = depositOptionItems.find((x) => x.chain_key === chainKey);
@@ -678,15 +696,27 @@ function DepositPageContent() {
                 {t("assetDepositFaq", "asset")}
               </div>
               <div className="mt-4 space-y-3 text-sm">
-                <a className="block text-white/70 hover:text-white" href="#">
-                  {t("assetDepositHowToDeposit", "asset")}
-                </a>
-                <a className="block text-white/70 hover:text-white" href="#">
-                  {t("assetDepositDepositNotArrived", "asset")}
-                </a>
-                <a className="block text-white/70 hover:text-white" href="#">
-                  {t("assetDepositWrongNetworkDeposit", "asset")}
-                </a>
+                {depositFaqItems.map((item) => {
+                  const isOpen = openDepositFaqKey === item.key;
+                  return (
+                    <div key={item.key} className="rounded-xl border border-white/10 bg-black/20">
+                      <button
+                        type="button"
+                        onClick={() => setOpenDepositFaqKey(isOpen ? null : item.key)}
+                        className="flex w-full items-center justify-between gap-3 px-3 py-3 text-left text-white/80 transition-colors hover:text-white"
+                        aria-expanded={isOpen}
+                      >
+                        <span>{item.title}</span>
+                        <span className="text-lg leading-none text-white/45">{isOpen ? "-" : "+"}</span>
+                      </button>
+                      {isOpen ? (
+                        <div className="border-t border-white/10 px-3 pb-3 pt-2 text-xs leading-5 text-white/55">
+                          {item.answer}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           </div>

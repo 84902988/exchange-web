@@ -27,10 +27,13 @@ export default function UnderConstruction({
   
   // 在客户端渲染完成后，异步更新为用户偏好的语言
   useEffect(() => {
-    const userLanguage = getCurrentLanguage();
-    if (userLanguage !== DEFAULT_LANGUAGE) {
-      setCurrentLanguage(userLanguage);
-    }
+    const timer = window.setTimeout(() => {
+      const userLanguage = getCurrentLanguage();
+      if (userLanguage !== DEFAULT_LANGUAGE) {
+        setCurrentLanguage(userLanguage);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   

@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, load_only
 
 from app.core.content_locale import DEFAULT_CONTENT_LOCALE, localize_i18n_value
+from app.db.models.announcement_read import AnnouncementRead
 from app.db.models.site_content import Announcement, HomeBanner, SiteSettings
 
 
@@ -157,6 +158,22 @@ ANNOUNCEMENT_I18N_FIELDS = {
     "summary": "summary_i18n",
     "content": "content_i18n",
 }
+ABOUT_PAGE_SECTIONS_I18N_FIELD = "about_page_sections_i18n"
+ABOUT_PAGE_SECTION_DEFS = (
+    ("who", "我们是谁"),
+    ("story", "我们的故事"),
+    ("vision", "我们的愿景"),
+    ("mission", "我们的使命"),
+    ("values", "我们的价值观"),
+)
+ABOUT_PAGE_SECTION_IDS = tuple(section_id for section_id, _label in ABOUT_PAGE_SECTION_DEFS)
+LEGAL_PAGES_I18N_FIELD = "legal_pages_i18n"
+LEGAL_PAGE_DEFS = (
+    ("risk", "风险提示"),
+    ("terms", "服务条款"),
+    ("privacy", "隐私政策"),
+)
+LEGAL_PAGE_KEYS = tuple(page_key for page_key, _label in LEGAL_PAGE_DEFS)
 ADMIN_I18N_LOCALES = (
     ("zh", "zh"),
     ("en", "en"),
@@ -191,6 +208,11 @@ DEFAULT_SITE_CONFIG = {
     "show_privacy_link": True,
     "privacy_link_url": "/privacy",
     "locale": "zh-CN",
+}
+FIXED_LEGAL_LINK_URLS = {
+    "risk_link_url": "/risk",
+    "terms_link_url": "/terms",
+    "privacy_link_url": "/privacy",
 }
 
 
@@ -690,6 +712,14 @@ def _site_settings_i18n_available(db: Session) -> bool:
     return _i18n_columns_available(db, "site_settings", SITE_SETTINGS_I18N_FIELDS)
 
 
+def _about_page_sections_available(db: Session) -> bool:
+    return _column_available(db, "site_settings", ABOUT_PAGE_SECTIONS_I18N_FIELD)
+
+
+def _legal_pages_available(db: Session) -> bool:
+    return _column_available(db, "site_settings", LEGAL_PAGES_I18N_FIELD)
+
+
 def get_site_settings_row(db: Session, *, include_i18n: bool = False) -> Optional[SiteSettings]:
     query = db.query(SiteSettings)
     if not include_i18n:
@@ -726,6 +756,9 @@ def serialize_site_config(
         value = getattr(row, key, None)
         if value is not None:
             data[key] = value
+    for key, fallback in FIXED_LEGAL_LINK_URLS.items():
+        if not _clean(data.get(key)):
+            data[key] = fallback
     data["id"] = int(row.id)
     _localize_payload_fields(data, row, SITE_SETTINGS_I18N_FIELDS, locale, include_i18n=include_i18n)
     if include_i18n:
@@ -736,6 +769,376 @@ def serialize_site_config(
 def get_public_site_config(db: Session, locale: str = DEFAULT_CONTENT_LOCALE) -> dict[str, Any]:
     include_i18n = _site_settings_i18n_available(db)
     return serialize_site_config(get_site_settings_row(db, include_i18n=include_i18n), locale=locale, include_i18n=include_i18n)
+
+
+def _normalize_about_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_clean(item) for item in value if _clean(item)]
+
+
+def _normalize_about_items(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        title = _clean(item.get("title"))
+        body = _normalize_about_text_list(item.get("body"))
+        if title or body:
+            items.append({"title": title, "body": body})
+    return items
+
+
+def _normalize_about_sections(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    sections: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    allowed_ids = set(ABOUT_PAGE_SECTION_IDS)
+    for section in value:
+        if not isinstance(section, dict):
+            continue
+        section_id = _clean(section.get("id")).lower()
+        if section_id not in allowed_ids or section_id in seen:
+            continue
+        title = _clean(section.get("title"))
+        eyebrow = _clean(section.get("eyebrow"))
+        body = _normalize_about_text_list(section.get("body"))
+        items = _normalize_about_items(section.get("items"))
+        if not title and not body and not items:
+            continue
+        sections.append(
+            {
+                "id": section_id,
+                "title": title,
+                "eyebrow": eyebrow,
+                "body": body,
+                "items": items,
+            }
+        )
+        seen.add(section_id)
+    return sections
+
+
+def _normalize_about_page_payload(value: Any, locale: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    title = _clean(value.get("title")) or ("我们是谁" if locale.startswith("zh") else "Who We Are")
+    subtitle = _clean(value.get("subtitle"))
+    sections = _normalize_about_sections(value.get("sections"))
+    return {
+        "slug": "who-we-are",
+        "title": title,
+        "subtitle": subtitle,
+        "sections": sections,
+        "locale": locale,
+    }
+
+
+def _about_body_to_text(value: Any) -> str:
+    return "\n\n".join(_normalize_about_text_list(value))
+
+
+def _about_text_to_body(value: Any) -> list[str]:
+    text = _clean(value)
+    if not text:
+        return []
+    return [line.strip() for line in re.split(r"\n+", text.replace("\r\n", "\n")) if line.strip()]
+
+
+def _about_items_to_text(value: Any) -> str:
+    blocks: list[str] = []
+    for item in _normalize_about_items(value):
+        lines = [item.get("title", "")]
+        lines.extend(item.get("body") or [])
+        blocks.append("\n".join(line for line in lines if line))
+    return "\n\n".join(blocks)
+
+
+def _about_text_to_items(value: Any) -> list[dict[str, Any]]:
+    text = _clean(value)
+    if not text:
+        return []
+    items: list[dict[str, Any]] = []
+    for block in re.split(r"\n\s*\n+", text.replace("\r\n", "\n")):
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        items.append({"title": lines[0], "body": lines[1:]})
+    return items
+
+
+def _about_section_by_id(sections: list[dict[str, Any]], section_id: str) -> dict[str, Any]:
+    for section in sections:
+        if section.get("id") == section_id:
+            return section
+    return {"id": section_id, "title": "", "eyebrow": "", "body": [], "items": []}
+
+
+def _about_form_key(locale_suffix: str, name: str) -> str:
+    return f"about_page_{locale_suffix}_{name}"
+
+
+def _about_section_form_key(locale_suffix: str, section_id: str, field_name: str) -> str:
+    return _about_form_key(locale_suffix, f"{section_id}_{field_name}")
+
+
+def _about_locale_has_submitted_content(payload: dict[str, Any], locale_suffix: str) -> bool:
+    prefix = f"about_page_{locale_suffix}_"
+    return any(key.startswith(prefix) and _clean(value) for key, value in payload.items())
+
+
+def _about_payload_text(payload: dict[str, Any], key: str, existing: Any) -> str:
+    return _clean(payload.get(key)) if key in payload else _clean(existing)
+
+
+def _about_payload_body(payload: dict[str, Any], key: str, existing: Any) -> list[str]:
+    return _about_text_to_body(payload.get(key)) if key in payload else _normalize_about_text_list(existing)
+
+
+def _about_payload_items(payload: dict[str, Any], key: str, existing: Any) -> list[dict[str, Any]]:
+    return _about_text_to_items(payload.get(key)) if key in payload else _normalize_about_items(existing)
+
+
+def _about_locale_admin_form(locale: str, suffix: str, source: Any) -> dict[str, Any]:
+    source_data = source if isinstance(source, dict) else {}
+    sections = _normalize_about_sections(source_data.get("sections")) if source_data else []
+    form_sections: list[dict[str, Any]] = []
+    for section_id, label in ABOUT_PAGE_SECTION_DEFS:
+        section = _about_section_by_id(sections, section_id)
+        form_sections.append(
+            {
+                "id": section_id,
+                "label": label,
+                "title": _clean(section.get("title")),
+                "eyebrow": _clean(section.get("eyebrow")),
+                "body_text": _about_body_to_text(section.get("body")),
+                "items_text": _about_items_to_text(section.get("items")),
+            }
+        )
+    return {
+        "locale": locale,
+        "suffix": suffix,
+        "label": {"zh": "中文", "zh-TW": "繁體", "en": "English", "ja": "日本語"}.get(locale, locale),
+        "title": _clean(source_data.get("title")),
+        "subtitle": _clean(source_data.get("subtitle")),
+        "sections": form_sections,
+    }
+
+
+def admin_about_page_form(row: Optional[SiteSettings]) -> dict[str, Any]:
+    source = getattr(row, ABOUT_PAGE_SECTIONS_I18N_FIELD, None) if row is not None else {}
+    source = source if isinstance(source, dict) else {}
+    return {
+        "languages": [
+            _about_locale_admin_form(locale, suffix, source.get(locale))
+            for locale, suffix in ADMIN_I18N_LOCALES
+        ],
+        "sections": [{"id": section_id, "label": label} for section_id, label in ABOUT_PAGE_SECTION_DEFS],
+    }
+
+
+def _build_about_locale_payload(
+    payload: dict[str, Any],
+    locale: str,
+    suffix: str,
+    existing: Any,
+) -> dict[str, Any]:
+    current = _normalize_about_page_payload(existing if isinstance(existing, dict) else {}, locale)
+    existing_sections = current.get("sections") if isinstance(current.get("sections"), list) else []
+    sections: list[dict[str, Any]] = []
+
+    for section_id, _label in ABOUT_PAGE_SECTION_DEFS:
+        existing_section = _about_section_by_id(existing_sections, section_id)
+        title_key = _about_section_form_key(suffix, section_id, "title")
+        body_key = _about_section_form_key(suffix, section_id, "body")
+        items_key = _about_section_form_key(suffix, section_id, "items")
+        section = {
+            "id": section_id,
+            "title": _about_payload_text(payload, title_key, existing_section.get("title")),
+            "eyebrow": _clean(existing_section.get("eyebrow")),
+            "body": _about_payload_body(payload, body_key, existing_section.get("body")),
+            "items": _normalize_about_items(existing_section.get("items")),
+        }
+        if section_id == "values":
+            section["body"] = _normalize_about_text_list(existing_section.get("body"))
+            section["items"] = _about_payload_items(payload, items_key, existing_section.get("items"))
+        sections.append(section)
+
+    return {
+        "title": _about_payload_text(payload, _about_form_key(suffix, "title"), current.get("title")),
+        "subtitle": _about_payload_text(payload, _about_form_key(suffix, "subtitle"), current.get("subtitle")),
+        "sections": sections,
+    }
+
+
+def update_about_page_sections(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    if not _about_page_sections_available(db):
+        raise RuntimeError("site_settings.about_page_sections_i18n is missing")
+
+    row = get_or_create_site_settings(db)
+    current_value = getattr(row, ABOUT_PAGE_SECTIONS_I18N_FIELD, None)
+    next_value = dict(current_value) if isinstance(current_value, dict) else {}
+
+    for locale, suffix in ADMIN_I18N_LOCALES:
+        existing = next_value.get(locale)
+        if not isinstance(existing, dict) and not _about_locale_has_submitted_content(payload, suffix):
+            continue
+        next_value[locale] = _build_about_locale_payload(payload, locale, suffix, existing)
+
+    setattr(row, ABOUT_PAGE_SECTIONS_I18N_FIELD, next_value)
+    row.updated_at = _now()
+    db.commit()
+    db.refresh(row)
+    return {"ok": True, "form": admin_site_settings_form(row)}
+
+
+def get_public_about_page(db: Session, locale: str = DEFAULT_CONTENT_LOCALE) -> dict[str, Any]:
+    if not _about_page_sections_available(db):
+        return _normalize_about_page_payload({}, locale)
+    row = get_site_settings_row(db, include_i18n=True)
+    value = localize_i18n_value(getattr(row, ABOUT_PAGE_SECTIONS_I18N_FIELD, None), locale, {}) if row else {}
+    return _normalize_about_page_payload(value, locale)
+
+
+def _legal_page_label(page_key: str) -> str:
+    for key, label in LEGAL_PAGE_DEFS:
+        if key == page_key:
+            return label
+    return page_key
+
+
+def _normalize_legal_page_payload(value: Any, page_key: str, locale: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    return {
+        "key": page_key,
+        "title": _clean(value.get("title")) or _legal_page_label(page_key),
+        "content": _clean(value.get("content")),
+        "locale": locale,
+    }
+
+
+def _legal_locale_candidates(locale: str) -> list[str]:
+    candidates = [locale]
+    if locale == "zh-TW":
+        candidates.extend(["zh_tw", "zh-Hant", "zh"])
+    elif locale == "zh":
+        candidates.extend(["zh-CN", "zh-Hans"])
+    elif locale == "en":
+        candidates.append("en-US")
+    elif locale == "ja":
+        candidates.append("ja-JP")
+    candidates.extend([DEFAULT_CONTENT_LOCALE, "en"])
+    return list(dict.fromkeys(candidates))
+
+
+def _read_legal_page_source(source: Any, locale: str, page_key: str) -> tuple[dict[str, Any], str]:
+    translations = source if isinstance(source, dict) else {}
+    for candidate in _legal_locale_candidates(locale):
+        locale_payload = translations.get(candidate)
+        if not isinstance(locale_payload, dict):
+            continue
+        page_payload = locale_payload.get(page_key)
+        if not isinstance(page_payload, dict):
+            continue
+        normalized = _normalize_legal_page_payload(page_payload, page_key, candidate)
+        if normalized["title"] or normalized["content"]:
+            return normalized, candidate
+    return _normalize_legal_page_payload({}, page_key, locale), locale
+
+
+def get_public_legal_page(db: Session, page_key: str, locale: str = DEFAULT_CONTENT_LOCALE) -> dict[str, Any]:
+    page_key = _clean(page_key).lower()
+    if page_key not in LEGAL_PAGE_KEYS:
+        raise ValueError("Unsupported legal page")
+    if not _legal_pages_available(db):
+        return _normalize_legal_page_payload({}, page_key, locale)
+
+    row = get_site_settings_row(db, include_i18n=True)
+    source = getattr(row, LEGAL_PAGES_I18N_FIELD, None) if row else {}
+    page, resolved_locale = _read_legal_page_source(source, locale, page_key)
+    page["locale"] = resolved_locale
+    return page
+
+
+def _legal_form_key(locale_suffix: str, page_key: str, field_name: str) -> str:
+    return f"legal_page_{locale_suffix}_{page_key}_{field_name}"
+
+
+def _legal_locale_has_submitted_content(payload: dict[str, Any], locale_suffix: str) -> bool:
+    prefix = f"legal_page_{locale_suffix}_"
+    return any(key.startswith(prefix) and _clean(value) for key, value in payload.items())
+
+
+def _legal_locale_admin_form(locale: str, suffix: str, source: Any) -> dict[str, Any]:
+    source_data = source if isinstance(source, dict) else {}
+    pages: list[dict[str, Any]] = []
+    for page_key, label in LEGAL_PAGE_DEFS:
+        page = source_data.get(page_key) if isinstance(source_data.get(page_key), dict) else {}
+        pages.append(
+            {
+                "key": page_key,
+                "label": label,
+                "title": _clean(page.get("title")),
+                "content": _clean(page.get("content")),
+            }
+        )
+    return {
+        "locale": locale,
+        "suffix": suffix,
+        "label": {"zh": "中文", "zh-TW": "繁體", "en": "English", "ja": "日本語"}.get(locale, locale),
+        "pages": pages,
+    }
+
+
+def admin_legal_pages_form(row: Optional[SiteSettings]) -> dict[str, Any]:
+    source = getattr(row, LEGAL_PAGES_I18N_FIELD, None) if row is not None else {}
+    source = source if isinstance(source, dict) else {}
+    return {
+        "languages": [
+            _legal_locale_admin_form(locale, suffix, source.get(locale))
+            for locale, suffix in ADMIN_I18N_LOCALES
+        ],
+        "pages": [{"key": page_key, "label": label} for page_key, label in LEGAL_PAGE_DEFS],
+    }
+
+
+def _build_legal_locale_payload(payload: dict[str, Any], suffix: str, existing: Any) -> dict[str, Any]:
+    existing_data = existing if isinstance(existing, dict) else {}
+    pages: dict[str, dict[str, str]] = {}
+    for page_key, _label in LEGAL_PAGE_DEFS:
+        existing_page = existing_data.get(page_key) if isinstance(existing_data.get(page_key), dict) else {}
+        title_key = _legal_form_key(suffix, page_key, "title")
+        content_key = _legal_form_key(suffix, page_key, "content")
+        pages[page_key] = {
+            "title": _about_payload_text(payload, title_key, existing_page.get("title")),
+            "content": _about_payload_text(payload, content_key, existing_page.get("content")),
+        }
+    return pages
+
+
+def update_legal_pages(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    if not _legal_pages_available(db):
+        raise RuntimeError("site_settings.legal_pages_i18n is missing")
+
+    row = get_or_create_site_settings(db)
+    current_value = getattr(row, LEGAL_PAGES_I18N_FIELD, None)
+    next_value = dict(current_value) if isinstance(current_value, dict) else {}
+
+    for locale, suffix in ADMIN_I18N_LOCALES:
+        existing = next_value.get(locale)
+        if not isinstance(existing, dict) and not _legal_locale_has_submitted_content(payload, suffix):
+            continue
+        next_value[locale] = _build_legal_locale_payload(payload, suffix, existing)
+
+    setattr(row, LEGAL_PAGES_I18N_FIELD, next_value)
+    row.updated_at = _now()
+    db.commit()
+    db.refresh(row)
+    return {"ok": True, "form": admin_legal_pages_form(row)}
 
 
 def update_site_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
@@ -758,7 +1161,13 @@ def update_site_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]
         "terms_link_url",
         "privacy_link_url",
     ):
-        value = _clean(payload.get(field))
+        raw_value = payload.get(field)
+        if field in FIXED_LEGAL_LINK_URLS and raw_value is None:
+            value = _clean(getattr(row, field, None)) or FIXED_LEGAL_LINK_URLS[field]
+        elif field in FIXED_LEGAL_LINK_URLS:
+            value = _clean(raw_value) or FIXED_LEGAL_LINK_URLS[field]
+        else:
+            value = _clean(raw_value)
         if field == "site_name" and not value:
             value = DEFAULT_SITE_CONFIG["site_name"]
         setattr(row, field, value)
@@ -781,7 +1190,9 @@ def admin_site_settings_form(row: Optional[SiteSettings]) -> dict[str, Any]:
             continue
         value = data.get(key)
         form[key] = bool(value) if key.startswith("show_") else str(value if value is not None else "")
-    return _append_i18n_form_fields(form, row or {}, SITE_SETTINGS_I18N_FIELDS)
+    _append_i18n_form_fields(form, row or {}, SITE_SETTINGS_I18N_FIELDS)
+    form["about_page"] = admin_about_page_form(row)
+    return form
 
 
 def serialize_banner(
@@ -1053,6 +1464,7 @@ def get_public_announcements(
     page_size: int = 10,
     category: Optional[str] = None,
     locale: str = DEFAULT_CONTENT_LOCALE,
+    user_id: Optional[int] = None,
 ) -> dict[str, Any]:
     now = _now()
     page = max(1, _parse_int(page, 1))
@@ -1080,11 +1492,34 @@ def get_public_announcements(
         .limit(page_size)
         .all()
     )
+    read_at_by_id: dict[int, datetime] = {}
+    if user_id is not None and rows:
+        announcement_ids = [int(row.id) for row in rows]
+        read_at_by_id = {
+            int(announcement_id): read_at
+            for announcement_id, read_at in (
+                db.query(AnnouncementRead.announcement_id, AnnouncementRead.read_at)
+                .filter(
+                    AnnouncementRead.user_id == int(user_id),
+                    AnnouncementRead.announcement_id.in_(announcement_ids),
+                )
+                .all()
+            )
+            if read_at is not None
+        }
+
+    items = [
+        serialize_announcement(row, include_category=include_category, locale=locale, include_i18n=include_i18n)
+        for row in rows
+    ]
+    if user_id is not None:
+        for item in items:
+            read_at = read_at_by_id.get(int(item["id"]))
+            item["is_read"] = read_at is not None
+            item["read_at"] = _format_datetime(read_at)
+
     return _page_result(
-        items=[
-            serialize_announcement(row, include_category=include_category, locale=locale, include_i18n=include_i18n)
-            for row in rows
-        ],
+        items=items,
         page=page,
         page_size=page_size,
         total=total,

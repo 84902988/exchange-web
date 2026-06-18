@@ -6,12 +6,12 @@ export const apiGet = <T>(path: string): Promise<T> => {
 };
 
 // POST JSON
-export const apiPost = <T, B = any>(path: string, body: B): Promise<T> => {
+export const apiPost = <T, B = unknown>(path: string, body: B): Promise<T> => {
   return request<T>(path, { method: "POST", body: JSON.stringify(body) });
 };
 
 // PUT JSON
-export const apiPut = <T, B = any>(path: string, body: B): Promise<T> => {
+export const apiPut = <T, B = unknown>(path: string, body: B): Promise<T> => {
   return request<T>(path, { method: "PUT", body: JSON.stringify(body) });
 };
 

@@ -17,6 +17,7 @@ from app.services.contract_order_service import (
     close_contract_position,
     create_contract_open_order,
 )
+from app.services.contract_private_ws import publish_contract_user_updates
 
 router = APIRouter(prefix="/contract/orders", tags=["contract-orders"])
 
@@ -31,6 +32,13 @@ def contract_open_order(
     trace_id = getattr(request.state, "trace_id", None)
     try:
         data = create_contract_open_order(db, int(user_id), payload)
+        publish_contract_user_updates(
+            user_id=int(user_id),
+            symbols=[data.symbol],
+            position_ids=[data.position_id] if data.position_id is not None else None,
+            order_ids=[data.order_id],
+            include_account=True,
+        )
         return ok(data=data.model_dump(), trace_id=trace_id)
     except ContractOrderInsufficientMargin as exc:
         db.rollback()
@@ -62,6 +70,13 @@ def contract_close_order(
     trace_id = getattr(request.state, "trace_id", None)
     try:
         data = close_contract_position(db, int(user_id), payload)
+        publish_contract_user_updates(
+            user_id=int(user_id),
+            symbols=[data.symbol],
+            position_ids=[data.position_id] if data.position_id is not None else [payload.position_id],
+            order_ids=[data.order_id],
+            include_account=True,
+        )
         return ok(data=data.model_dump(), trace_id=trace_id)
     except ContractOrderInsufficientMargin as exc:
         db.rollback()
@@ -93,6 +108,14 @@ def contract_close_summary_order(
     trace_id = getattr(request.state, "trace_id", None)
     try:
         data = close_contract_position_summary(db, int(user_id), payload)
+        publish_contract_user_updates(
+            user_id=int(user_id),
+            symbols=[data.symbol],
+            position_ids=data.affected_position_ids,
+            order_ids=data.generated_order_ids,
+            trade_ids=data.generated_trade_ids,
+            include_account=True,
+        )
         return ok(data=data.model_dump(), trace_id=trace_id)
     except ContractOrderInsufficientMargin as exc:
         db.rollback()
@@ -124,6 +147,13 @@ def contract_cancel_order(
     trace_id = getattr(request.state, "trace_id", None)
     try:
         data = cancel_contract_order(db, int(user_id), int(order_id))
+        publish_contract_user_updates(
+            user_id=int(user_id),
+            symbols=[data.symbol],
+            position_ids=[data.position_id] if data.position_id is not None else None,
+            order_ids=[data.order_id],
+            include_account=True,
+        )
         return ok(data=data.model_dump(), trace_id=trace_id)
     except ContractOrderError as exc:
         db.rollback()

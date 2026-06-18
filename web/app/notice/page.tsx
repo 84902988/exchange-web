@@ -115,6 +115,14 @@ function NoticePageContent() {
     setMarkingAll(true);
     try {
       await markAllAnnouncementsRead();
+      const readAt = new Date().toISOString();
+      setItems((currentItems) =>
+        currentItems.map((item) => ({
+          ...item,
+          is_read: true,
+          read_at: item.read_at || readAt,
+        })),
+      );
       notifyAnnouncementReadsChanged();
     } finally {
       setMarkingAll(false);
@@ -195,14 +203,25 @@ function NoticePageContent() {
           <div className="space-y-4">
             {items.map((notice) => {
               const category = String(notice.category || "").toLowerCase();
+              const isUnread = isLoggedIn && notice.is_read === false;
               return (
                 <Link
                   key={notice.id}
                   href={`/notice/${notice.slug || notice.id}`}
-                  className="block rounded-xl border border-white/15 bg-white/5 p-6 transition-colors duration-200 hover:border-white/30 hover:bg-white/10"
+                  className={`block rounded-xl border p-6 transition-colors duration-200 ${
+                    isUnread
+                      ? "border-amber-400/45 bg-amber-400/[0.07] hover:border-amber-300/70 hover:bg-amber-400/[0.1]"
+                      : "border-white/15 bg-white/5 hover:border-white/30 hover:bg-white/10"
+                  }`}
                 >
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div className="flex min-w-0 items-center gap-3">
+                      {isUnread ? (
+                        <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-red-500/15 px-2 py-1 text-xs font-semibold text-red-300">
+                          <span className="h-1.5 w-1.5 rounded-full bg-red-400" />
+                          {t("noticeUnread")}
+                        </span>
+                      ) : null}
                       {notice.is_pinned ? (
                         <span className="rounded-full bg-amber-500/20 px-2 py-1 text-xs font-medium text-amber-300">
                           {t("pinned")}
@@ -215,11 +234,15 @@ function NoticePageContent() {
                       >
                         {noticeCategoryLabel(notice.category, t)}
                       </span>
-                      <h2 className="min-w-0 truncate text-lg font-semibold text-white/90">{notice.title}</h2>
+                      <h2 className={`min-w-0 truncate text-lg font-semibold ${isUnread ? "text-white" : "text-white/90"}`}>
+                        {notice.title}
+                      </h2>
                     </div>
                     <span className="shrink-0 text-xs text-white/50">{formatTime(notice.publish_at, locale)}</span>
                   </div>
-                  <p className="mt-3 line-clamp-2 text-sm leading-relaxed text-white/70">{summaryOf(notice)}</p>
+                  <p className={`mt-3 line-clamp-2 text-sm leading-relaxed ${isUnread ? "text-white/80" : "text-white/70"}`}>
+                    {summaryOf(notice)}
+                  </p>
                 </Link>
               );
             })}
