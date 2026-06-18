@@ -1,0 +1,567 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}地区访问控制{% endblock %}
+{% block page_title %}地区访问控制{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">优先读取 Cloudflare 国家码；无 Cloudflare 头时使用本地 GeoIP 地址库识别；支持限制国家、IP 白名单、黑名单和访问日志。</div>
+{% endblock %}
+
+{% block content %}
+  {% set log_summaries = log_summaries|default([]) %}
+  {% set restricted_country_count = restricted_country_count|default(restricted_country_codes|default([])|length) %}
+  {% set recent_hit_at = recent_hit_at|default(None) %}
+  {% set geo_log_retention_days = geo_log_retention_days|default(90) %}
+  {% set geo_log_filter_error = geo_log_filter_error|default("") %}
+  {% set geo_log_filters = geo_log_filters|default({
+    "ip": "",
+    "country_code": "",
+    "decision": "",
+    "from_time": "",
+    "to_time": "",
+    "limit": 100,
+    "show_debug": false
+  }) %}
+  {% set source_labels = {
+    "CF_HEADER": "Cloudflare",
+    "LOCAL_DB": "本地 IP 库",
+    "UNKNOWN": "未识别"
+  } %}
+  {% set decision_labels = {
+    "ALLOW": "放行",
+    "BLOCK": "拦截",
+    "MONITOR": "监控记录"
+  } %}
+  {% set reason_labels = {
+    "DISABLED": "未启用",
+    "ALLOWLIST": "命中白名单",
+    "BLOCKLIST": "命中黑名单",
+    "COUNTRY_RESTRICTED": "命中限制地区",
+    "UNKNOWN": "未识别地区",
+    "LOCAL_PRIVATE": "本地 / 内网地址",
+    "ADMIN_EXEMPT": "后台豁免",
+    "NO_MATCH": "未命中规则",
+    "DEFAULT_ALLOW": "未命中规则"
+  } %}
+  {% set rule_type_labels = {
+    "ALLOW": "白名单（放行）",
+    "BLOCK": "黑名单（拦截）"
+  } %}
+
+  <style>
+    .geo-status-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}
+    .geo-status-item{min-height:92px;padding:14px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(255,255,255,.035)}
+    .geo-status-label{color:var(--muted);font-size:12px;line-height:1.4}
+    .geo-status-value{margin-top:10px;color:#fff;font-size:18px;font-weight:800;line-height:1.35}
+    .geo-status-meta{margin-top:6px;color:var(--muted);font-size:12px}
+    .geo-settings-grid{display:grid;grid-template-columns:1fr;gap:14px}
+    .geo-checks{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px 14px}
+    .geo-check{display:flex;align-items:center;gap:9px;min-height:36px;color:var(--text);font-size:13px}
+    .geo-check input{width:16px;height:16px}
+    .geo-rule-form{display:grid;grid-template-columns:minmax(120px,.42fr) minmax(180px,.75fr) minmax(180px,1fr) auto;gap:12px;align-items:end}
+    .geo-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .geo-help{margin-top:8px;color:var(--muted);font-size:12px;line-height:1.6}
+    .geo-runbook{margin:0;padding-left:20px;color:var(--muted);font-size:13px;line-height:1.8}
+    .geo-transfer{display:grid;grid-template-columns:minmax(0,1fr) 132px minmax(0,1fr);gap:14px;align-items:center;margin-top:12px}
+    .geo-transfer-column{min-width:0;padding:12px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(255,255,255,.03)}
+    .geo-transfer-title{margin-bottom:10px;font-size:13px;font-weight:800;color:#fff}
+    .geo-transfer-search{width:100%;margin-bottom:10px}
+    .geo-transfer-list{height:290px;overflow-y:auto;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(2,6,23,.25);padding:6px}
+    .geo-transfer-item{appearance:none;width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 6px;padding:9px 10px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--text);text-align:left;cursor:pointer}
+    .geo-transfer-item:last-child{margin-bottom:0}
+    .geo-transfer-item:hover{border-color:rgba(96,165,250,.28);background:rgba(96,165,250,.08)}
+    .geo-transfer-item.is-selected{border-color:rgba(96,165,250,.65);background:rgba(37,99,235,.24);color:#fff}
+    .geo-transfer-name{font-size:13px;font-weight:800}
+    .geo-transfer-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--muted)}
+    .geo-transfer-empty{height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px;text-align:center}
+    .geo-transfer-actions{display:grid;gap:10px}
+    .geo-transfer-actions .btn{width:100%;justify-content:center}
+    .geo-transfer-actions .btn:disabled{opacity:.45;cursor:not-allowed}
+    .geo-log-filters{display:grid;grid-template-columns:repeat(6,minmax(0,1fr)) auto;gap:10px;align-items:end;margin-bottom:14px}
+    .geo-log-debug-toggle{display:flex;align-items:center;gap:8px;color:var(--text);font-size:12px;min-height:34px}
+    .geo-log-debug-toggle input{width:15px;height:15px}
+    .geo-log-warning{margin:0 0 12px;padding:10px 12px;border:1px solid rgba(245,158,11,.22);border-radius:8px;background:rgba(245,158,11,.08);color:#fbbf24;font-size:12px;line-height:1.6}
+    .geo-log-table{min-width:1080px}
+    .geo-log-raw{margin-top:16px}
+    .geo-log-raw summary{cursor:pointer;color:#fff;font-weight:800}
+    .geo-reason{white-space:nowrap}
+    @media (max-width:1180px){
+      .geo-status-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+      .geo-checks{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .geo-log-filters{grid-template-columns:repeat(2,minmax(0,1fr))}
+    }
+    @media (max-width:960px){
+      .geo-rule-form{grid-template-columns:1fr}
+      .geo-transfer{grid-template-columns:1fr}
+      .geo-transfer-actions{grid-template-columns:1fr 1fr}
+    }
+    @media (max-width:640px){
+      .geo-status-grid,.geo-checks,.geo-log-filters{grid-template-columns:1fr}
+    }
+  </style>
+
+  {% if notice %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">操作结果</div>
+        <p class="muted">{{ notice }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if error %}
+    <section class="page-section">
+      <div class="card">
+        <div class="section-title">提示信息</div>
+        <p class="muted">{{ error }}</p>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">状态总览</div>
+      <div class="geo-status-grid">
+        <div class="geo-status-item">
+          <div class="geo-status-label">启用状态</div>
+          <div class="geo-status-value">
+            <span class="badge {% if settings_row.enabled %}badge-danger{% else %}badge-neutral{% endif %}">
+              {% if settings_row.enabled %}已启用{% else %}未启用{% endif %}
+            </span>
+          </div>
+        </div>
+        <div class="geo-status-item">
+          <div class="geo-status-label">运行模式</div>
+          <div class="geo-status-value">
+            <span class="badge {% if settings_row.monitor_mode %}badge-warning{% else %}badge-danger{% endif %}">
+              {% if settings_row.monitor_mode %}仅监控{% else %}正式拦截{% endif %}
+            </span>
+          </div>
+        </div>
+        <div class="geo-status-item">
+          <div class="geo-status-label">未识别地区处理</div>
+          <div class="geo-status-value">
+            <span class="badge {% if settings_row.block_unknown %}badge-danger{% else %}badge-neutral{% endif %}">
+              {% if settings_row.block_unknown %}拦截{% else %}放行{% endif %}
+            </span>
+          </div>
+        </div>
+        <div class="geo-status-item">
+          <div class="geo-status-label">后台路径豁免</div>
+          <div class="geo-status-value">{{ "是" if settings_row.admin_exempt else "否" }}</div>
+        </div>
+        <div class="geo-status-item">
+          <div class="geo-status-label">限制国家/地区数量</div>
+          <div class="geo-status-value">{{ restricted_country_count }}</div>
+          <div class="geo-status-meta">{{ restricted_country_display or "未配置" }}</div>
+        </div>
+        <div class="geo-status-item">
+          <div class="geo-status-label">最近命中时间</div>
+          <div class="geo-status-value">{{ recent_hit_at or "-" }}</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">当前建议流程</div>
+      <ol class="geo-runbook">
+        <li>先开启“启用地区限制”</li>
+        <li>保持“仅监控，不实际拦截”</li>
+        <li>配置限制国家/地区代码</li>
+        <li>观察访问日志摘要</li>
+        <li>确认无误后再关闭“仅监控”进入正式拦截</li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="card">
+      <div class="section-title">访问控制设置</div>
+      <form method="post" action="/admin/geo-access/settings">
+        <div class="geo-settings-grid">
+          <div class="geo-checks">
+            <label class="geo-check"><input type="checkbox" name="enabled" value="1" {% if settings_row.enabled %}checked{% endif %} /> 启用地区限制</label>
+            <label class="geo-check"><input type="checkbox" name="monitor_mode" value="1" {% if settings_row.monitor_mode %}checked{% endif %} /> 仅监控，不实际拦截</label>
+            <label class="geo-check"><input type="checkbox" name="block_unknown" value="1" {% if settings_row.block_unknown %}checked{% endif %} /> 拦截未识别地区</label>
+            <label class="geo-check"><input type="checkbox" name="admin_exempt" value="1" {% if settings_row.admin_exempt %}checked{% endif %} /> 后台路径豁免</label>
+          </div>
+          <div class="field">
+            <label>限制国家/地区</label>
+            <input id="geo_country_hidden" type="hidden" name="restricted_countries" value="{{ restricted_countries }}" />
+            <div class="geo-help">选择需要限制访问的国家/地区。建议先开启“仅监控，不实际拦截”，观察日志确认无误后再关闭监控模式。</div>
+
+            <div class="geo-transfer">
+              <div class="geo-transfer-column">
+                <div class="geo-transfer-title">可选择国家/地区</div>
+                <input id="geo_country_available_search" class="geo-transfer-search" type="search" placeholder="搜索国家/地区名称或代码" />
+                <div id="geo_country_available_list" class="geo-transfer-list" role="listbox" aria-label="可选择国家/地区"></div>
+              </div>
+
+              <div class="geo-transfer-actions">
+                <button id="geo_country_add_selected" type="button" class="btn" disabled>加入限制 →</button>
+                <button id="geo_country_remove_selected" type="button" class="btn secondary" disabled>← 移除限制</button>
+              </div>
+
+              <div class="geo-transfer-column">
+                <div class="geo-transfer-title">已限制国家/地区</div>
+                <input id="geo_country_restricted_search" class="geo-transfer-search" type="search" placeholder="搜索已限制国家/地区" />
+                <div id="geo_country_restricted_list" class="geo-transfer-list" role="listbox" aria-label="已限制国家/地区"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="filter-actions" style="margin-top:12px">
+          <button type="submit" class="btn">保存设置</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">IP 白名单 / 黑名单</div>
+      <form method="post" action="/admin/geo-access/rules" class="geo-rule-form">
+        <div class="field">
+          <label>规则类型</label>
+          <select name="rule_type">
+            <option value="ALLOW">白名单（放行）</option>
+            <option value="BLOCK">黑名单（拦截）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>IP / CIDR</label>
+          <input name="ip_cidr" placeholder="203.0.113.0/24" required />
+        </div>
+        <div class="field">
+          <label>备注</label>
+          <input name="note" maxlength="255" placeholder="运营备注" />
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn">添加规则</button>
+        </div>
+      </form>
+
+      <div class="table-wrap" style="margin-top:16px">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>类型</th>
+              <th>IP / CIDR</th>
+              <th>备注</th>
+              <th>状态</th>
+              <th>更新时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in rules %}
+              <tr>
+                <td class="mono">{{ item.id }}</td>
+                <td><span class="badge {% if item.rule_type == 'ALLOW' %}badge-success{% else %}badge-danger{% endif %}">{{ rule_type_labels.get(item.rule_type, item.rule_type) }}</span></td>
+                <td class="mono">{{ item.ip_cidr }}</td>
+                <td>{{ item.note or "-" }}</td>
+                <td><span class="badge {% if item.enabled %}badge-success{% else %}badge-neutral{% endif %}">{{ "启用" if item.enabled else "禁用" }}</span></td>
+                <td>{{ item.updated_at }}</td>
+                <td>
+                  <div class="geo-actions">
+                    <form method="post" action="/admin/geo-access/rules/{{ item.id }}/toggle">
+                      <input type="hidden" name="enabled" value="{{ '0' if item.enabled else '1' }}" />
+                      <button type="submit" class="btn secondary">{{ "禁用" if item.enabled else "启用" }}</button>
+                    </form>
+                    <form method="post" action="/admin/geo-access/rules/{{ item.id }}/delete" onsubmit="return window.confirm('确认删除该 IP 规则？');">
+                      <button type="submit" class="btn secondary">删除</button>
+                    </form>
+                  </div>
+                </td>
+              </tr>
+            {% else %}
+              <tr><td colspan="7"><div class="empty-state">暂无 IP 规则</div></td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">最近访问摘要</div>
+      <div class="geo-help">默认仅查询最近 24 小时，最多返回 200 条聚合摘要；默认排除本地、内网和后台调试记录；原始日志仅展示最近 100 条，不做全表深分页。Geo Access 日志默认保留最近 {{ geo_log_retention_days }} 天访问控制事件摘要。</div>
+      {% if geo_log_filter_error %}
+        <div class="geo-log-warning">{{ geo_log_filter_error }}</div>
+      {% endif %}
+      <form method="get" action="/admin/geo-access" class="geo-log-filters">
+        <div class="field">
+          <label>IP</label>
+          <input name="ip" value="{{ geo_log_filters.ip }}" placeholder="支持模糊查询" />
+        </div>
+        <div class="field">
+          <label>国家/地区</label>
+          <select name="country_code">
+            <option value="">全部</option>
+            <option value="UNKNOWN" {% if geo_log_filters.country_code == "UNKNOWN" %}selected{% endif %}>未知 UNKNOWN</option>
+            {% for code, label in geo_country_options %}
+              <option value="{{ code }}" {% if geo_log_filters.country_code == code %}selected{% endif %}>{{ label }} {{ code }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label>处理结果</label>
+          <select name="decision">
+            <option value="">全部</option>
+            <option value="ALLOW" {% if geo_log_filters.decision == "ALLOW" %}selected{% endif %}>放行</option>
+            <option value="BLOCK" {% if geo_log_filters.decision == "BLOCK" %}selected{% endif %}>拦截</option>
+            <option value="MONITOR" {% if geo_log_filters.decision == "MONITOR" %}selected{% endif %}>监控记录</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>开始时间</label>
+          <input type="datetime-local" name="from_time" value="{{ geo_log_filters.from_time }}" />
+        </div>
+        <div class="field">
+          <label>结束时间</label>
+          <input type="datetime-local" name="to_time" value="{{ geo_log_filters.to_time }}" />
+        </div>
+        <div class="field">
+          <label>Limit</label>
+          <input type="number" name="limit" min="1" max="200" value="{{ geo_log_filters.limit }}" />
+        </div>
+        <label class="geo-log-debug-toggle">
+          <input type="checkbox" name="show_debug" value="1" {% if geo_log_filters.show_debug %}checked{% endif %} />
+          显示本地/后台调试记录
+        </label>
+        <div class="filter-actions">
+          <button type="submit" class="btn">查询</button>
+        </div>
+      </form>
+
+      <div class="table-wrap">
+        <table class="data-table geo-log-table">
+          <thead>
+            <tr>
+              <th>IP</th>
+              <th>国家/地区</th>
+              <th>识别来源</th>
+              <th>处理结果</th>
+              <th>原因</th>
+              <th>命中次数</th>
+              <th>首次命中时间</th>
+              <th>最后命中时间</th>
+              <th>最近路径</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in log_summaries %}
+              <tr>
+                <td class="mono">{{ item.ip_address }}</td>
+                <td>
+                  {% if item.country_code == "UNKNOWN" %}
+                    未知 UNKNOWN
+                  {% elif geo_country_label_map.get(item.country_code) %}
+                    {{ geo_country_label_map.get(item.country_code) }} {{ item.country_code }}
+                  {% else %}
+                    <span class="mono">{{ item.country_code }}</span>
+                  {% endif %}
+                </td>
+                <td><span class="badge badge-info">{{ source_labels.get(item.source, item.source) }}</span></td>
+                <td><span class="badge {% if item.decision == 'BLOCK' %}badge-danger{% elif item.decision == 'MONITOR' %}badge-warning{% else %}badge-success{% endif %}">{{ decision_labels.get(item.decision, item.decision) }}</span></td>
+                <td class="geo-reason">{{ reason_labels.get(item.reason, item.reason) }}</td>
+                <td class="mono">{{ item.hit_count }}</td>
+                <td>{{ item.first_seen_at }}</td>
+                <td>{{ item.last_seen_at }}</td>
+                <td class="mono">{{ item.last_path or "-" }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="9"><div class="empty-state">暂无访问摘要</div></td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <details class="geo-log-raw">
+        <summary>查看最近 100 条原始日志</summary>
+        <div class="table-wrap" style="margin-top:12px">
+          <table class="data-table geo-log-table">
+            <thead>
+              <tr>
+                <th>最后命中时间</th>
+                <th>IP</th>
+                <th>国家/地区</th>
+                <th>识别来源</th>
+                <th>处理结果</th>
+                <th>原因</th>
+                <th>命中次数</th>
+                <th>方法</th>
+                <th>路径</th>
+                <th>浏览器信息</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in logs %}
+                <tr>
+                  <td>{{ item.last_seen_at }}</td>
+                  <td class="mono">{{ item.ip_address }}</td>
+                  <td>
+                    {% if item.country_code == "UNKNOWN" %}
+                      未知 UNKNOWN
+                    {% elif geo_country_label_map.get(item.country_code) %}
+                      {{ geo_country_label_map.get(item.country_code) }} {{ item.country_code }}
+                    {% else %}
+                      <span class="mono">{{ item.country_code }}</span>
+                    {% endif %}
+                  </td>
+                  <td><span class="badge badge-info">{{ source_labels.get(item.source, item.source) }}</span></td>
+                  <td><span class="badge {% if item.decision == 'BLOCK' %}badge-danger{% elif item.decision == 'MONITOR' %}badge-warning{% else %}badge-success{% endif %}">{{ decision_labels.get(item.decision, item.decision) }}</span></td>
+                  <td class="geo-reason">{{ reason_labels.get(item.reason, item.reason) }}</td>
+                  <td class="mono">{{ item.hit_count }}</td>
+                  <td class="mono">{{ item.method }}</td>
+                  <td class="mono">{{ item.last_path or item.path }}</td>
+                  <td>{{ item.user_agent or "-" }}</td>
+                </tr>
+              {% else %}
+                <tr><td colspan="10"><div class="empty-state">暂无原始日志</div></td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <script>
+    (() => {
+      const countryOptions = [
+        {% for code, label in geo_country_options %}
+          { code: "{{ code }}", label: "{{ label }}" }{% if not loop.last %},{% endif %}
+        {% endfor %}
+      ];
+      const labelMap = new Map(countryOptions.map((item) => [item.code, item.label]));
+      const optionMap = new Map(countryOptions.map((item) => [item.code, item]));
+      const hidden = document.getElementById("geo_country_hidden");
+      const availableSearch = document.getElementById("geo_country_available_search");
+      const restrictedSearch = document.getElementById("geo_country_restricted_search");
+      const availableList = document.getElementById("geo_country_available_list");
+      const restrictedList = document.getElementById("geo_country_restricted_list");
+      const addButton = document.getElementById("geo_country_add_selected");
+      const removeButton = document.getElementById("geo_country_remove_selected");
+      let selected = new Set(
+        String(hidden?.value || "")
+          .split(",")
+          .map((item) => item.trim().toUpperCase())
+          .filter(Boolean)
+      );
+      const activeAvailable = new Set();
+      const activeRestricted = new Set();
+
+      const syncHidden = () => {
+        if (!hidden) return;
+        hidden.value = Array.from(selected).sort().join(",");
+      };
+
+      const getCountry = (code) => optionMap.get(code) || { code, label: code };
+
+      const countryMatches = (item, query) => {
+        const text = String(query || "").trim().toUpperCase();
+        if (!text) return true;
+        return item.code.includes(text) || item.label.toUpperCase().includes(text) || `${item.label} ${item.code}`.toUpperCase().includes(text);
+      };
+
+      const restrictedItems = () => {
+        const known = countryOptions.filter((item) => selected.has(item.code));
+        const extras = Array.from(selected)
+          .filter((code) => !optionMap.has(code))
+          .sort()
+          .map((code) => getCountry(code));
+        return known.concat(extras);
+      };
+
+      const renderList = (container, items, activeSet, emptyText) => {
+        if (!container) return;
+        container.innerHTML = "";
+        if (!items.length) {
+          const empty = document.createElement("div");
+          empty.className = "geo-transfer-empty";
+          empty.textContent = emptyText;
+          container.appendChild(empty);
+          return;
+        }
+        items.forEach((item) => {
+          const row = document.createElement("button");
+          row.type = "button";
+          row.className = "geo-transfer-item";
+          row.setAttribute("role", "option");
+          row.setAttribute("aria-selected", activeSet.has(item.code) ? "true" : "false");
+          if (activeSet.has(item.code)) row.classList.add("is-selected");
+
+          const text = document.createElement("span");
+          text.className = "geo-transfer-name";
+          text.textContent = item.label;
+          row.appendChild(text);
+
+          const codeText = document.createElement("span");
+          codeText.className = "geo-transfer-code";
+          codeText.textContent = item.code;
+          row.appendChild(codeText);
+
+          row.addEventListener("click", () => {
+            if (activeSet.has(item.code)) activeSet.delete(item.code);
+            else activeSet.add(item.code);
+            refresh();
+          });
+          container.appendChild(row);
+        });
+      };
+
+      const pruneActive = () => {
+        activeAvailable.forEach((code) => {
+          if (selected.has(code)) activeAvailable.delete(code);
+        });
+        activeRestricted.forEach((code) => {
+          if (!selected.has(code)) activeRestricted.delete(code);
+        });
+      };
+
+      const syncButtons = () => {
+        if (addButton) addButton.disabled = activeAvailable.size === 0;
+        if (removeButton) removeButton.disabled = activeRestricted.size === 0;
+      };
+
+      const refresh = () => {
+        pruneActive();
+        syncHidden();
+        const availableQuery = availableSearch?.value || "";
+        const restrictedQuery = restrictedSearch?.value || "";
+        const availableItems = countryOptions
+          .filter((item) => !selected.has(item.code))
+          .filter((item) => countryMatches(item, availableQuery));
+        const selectedItems = restrictedItems().filter((item) => countryMatches(item, restrictedQuery));
+        renderList(availableList, availableItems, activeAvailable, "暂无可选择国家/地区");
+        renderList(restrictedList, selectedItems, activeRestricted, "暂无限制国家/地区");
+        syncButtons();
+      };
+
+      addButton?.addEventListener("click", () => {
+        activeAvailable.forEach((code) => {
+          if (labelMap.has(code)) selected.add(code);
+        });
+        activeAvailable.clear();
+        refresh();
+      });
+
+      removeButton?.addEventListener("click", () => {
+        activeRestricted.forEach((code) => {
+          selected.delete(code);
+        });
+        activeRestricted.clear();
+        refresh();
+      });
+
+      availableSearch?.addEventListener("input", refresh);
+      restrictedSearch?.addEventListener("input", refresh);
+
+      refresh();
+    })();
+  </script>
+{% endblock %}

@@ -14,6 +14,7 @@ import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
@@ -22,7 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.routing import APIRoute
 from fastapi.templating import Jinja2Templates
 from passlib.exc import UnknownHashError
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
@@ -34,6 +35,7 @@ from app.core.security import verify_password
 from app.db.models.collection import CollectionTask, CollectionTaskStatus, GasTask, GasTaskStatus
 from app.db.models.bd_commission_record import BdCommissionRecord
 from app.db.models.user_invite_commission_record import UserInviteCommissionRecord
+from app.db.models.geo_access import GeoAccessLog, GeoIpRule
 from app.db.models import AdminUser, User
 from app.db.session import SessionLocal, get_db
 from app.services.admin_balance_adjust_service import (
@@ -222,6 +224,17 @@ from app.services.contract_market_provider_service import (
     admin_update_contract_market_provider,
     classify_market_provider_error,
     test_contract_market_provider_connection,
+)
+from app.services.geo_access_service import (
+    GEO_ACCESS_LOG_RETENTION_DAYS,
+    RULE_ALLOW,
+    RULE_BLOCK,
+    create_geo_ip_rule,
+    delete_geo_ip_rule,
+    get_or_create_geo_access_settings,
+    parse_country_list,
+    set_geo_ip_rule_enabled,
+    update_geo_access_settings,
 )
 from app.services.moralis_service import add_address_to_streams
 from app.services.stock_token_lock_service import (
@@ -525,7 +538,7 @@ def _admin_doc_tag(path: str) -> str:
         return ADMIN_DOC_TAGS["invite"]
     if relative_path.startswith(("/dividend", "/dividends")):
         return ADMIN_DOC_TAGS["dividend"]
-    if relative_path.startswith(("/system", "/audit")):
+    if relative_path.startswith(("/system", "/audit", "/geo-access")):
         return ADMIN_DOC_TAGS["system"]
     if relative_path.startswith(("/site-settings", "/home-banners", "/announcements", "/help", "/uploads")):
         return ADMIN_DOC_TAGS["activity"]
@@ -805,6 +818,7 @@ ADMIN_GET_PERMISSION_EXACT: Dict[str, str] = {
     "/admin/dealer-risk-logs": "dealer_risk.manage",
     "/admin/platform/dealer-risk-logs": "dealer_risk.manage",
     "/admin/audit": "audit.view",
+    "/admin/geo-access": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/operations": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/services": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/rq": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
@@ -839,6 +853,7 @@ ADMIN_GET_PERMISSION_PREFIXES: tuple[tuple[str, str], ...] = (
     ("/admin/help/categories", "site_content.manage"),
     ("/admin/help/articles", "site_content.manage"),
     ("/admin/support-tickets", "support_tickets.manage"),
+    ("/admin/geo-access", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/admin-users", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/admin-roles", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/system/operations", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
@@ -9068,6 +9083,431 @@ def service_overview_page(request: Request):
             "active": "service_overview",
             "service_overview": admin_query_service_overview(),
         },
+    )
+
+
+def _build_geo_access_redirect_url(notice: str = "", error: str = "") -> str:
+    params: list[tuple[str, str]] = []
+    if notice:
+        params.append(("notice", notice))
+    if error:
+        params.append(("error", error))
+    if not params:
+        return "/admin/geo-access"
+    return f"/admin/geo-access?{urlencode(params)}"
+
+
+GEO_ACCESS_COUNTRY_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("CN", "中国大陆"),
+    ("HK", "中国香港"),
+    ("MO", "中国澳门"),
+    ("TW", "中国台湾"),
+    ("US", "美国"),
+    ("CA", "加拿大"),
+    ("GB", "英国"),
+    ("AU", "澳大利亚"),
+    ("JP", "日本"),
+    ("KR", "韩国"),
+    ("SG", "新加坡"),
+    ("TH", "泰国"),
+    ("VN", "越南"),
+    ("ID", "印度尼西亚"),
+    ("MY", "马来西亚"),
+    ("PH", "菲律宾"),
+    ("IN", "印度"),
+    ("AE", "阿联酋"),
+    ("TR", "土耳其"),
+    ("RU", "俄罗斯"),
+    ("IR", "伊朗"),
+    ("KP", "朝鲜"),
+    ("CU", "古巴"),
+    ("SY", "叙利亚"),
+)
+
+
+def _geo_access_country_label_map() -> Dict[str, str]:
+    return {code: name for code, name in GEO_ACCESS_COUNTRY_OPTIONS}
+
+
+def _format_geo_access_country_label(code: str) -> str:
+    normalized = str(code or "").strip().upper()
+    if not normalized:
+        return ""
+    label = _geo_access_country_label_map().get(normalized)
+    return f"{label} {normalized}" if label else normalized
+
+
+def _format_geo_access_country_list(codes: list[str] | tuple[str, ...]) -> str:
+    return "、".join(_format_geo_access_country_label(code) for code in codes if str(code or "").strip())
+
+
+def _parse_geo_access_country_form_codes(value: object) -> tuple[str, ...]:
+    if value is None:
+        return tuple()
+    if isinstance(value, str):
+        text_value = value.strip()
+        if not text_value:
+            return tuple()
+        try:
+            parsed = json.loads(text_value)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            items = parsed
+        else:
+            items = text_value.replace("\n", ",").replace(" ", ",").split(",")
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+
+    codes: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        code = str(item or "").strip().upper()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        codes.append(code)
+    return tuple(codes)
+
+
+def _parse_geo_access_datetime(value: str) -> Optional[datetime]:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    try:
+        return datetime.fromisoformat(text_value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _format_geo_access_datetime_value(value: datetime | None) -> str:
+    if not value:
+        return ""
+    return value.strftime("%Y-%m-%dT%H:%M")
+
+
+def _is_geo_access_debug_path(path: str) -> bool:
+    normalized = str(path or "")
+    if normalized == "/admin/geo-access" or normalized.startswith("/admin/geo-access/"):
+        return True
+    return normalized.startswith(("/static/", "/admin/static/"))
+
+
+def _apply_geo_access_debug_log_filters(query):
+    query = query.filter(
+        GeoAccessLog.ip_address.notin_(("127.0.0.1", "localhost", "::1")),
+        ~GeoAccessLog.ip_address.like("10.%"),
+        ~GeoAccessLog.ip_address.like("192.168.%"),
+        ~GeoAccessLog.ip_address.like("fc%"),
+        ~GeoAccessLog.ip_address.like("fd%"),
+        ~GeoAccessLog.ip_address.like("fe80:%"),
+        ~GeoAccessLog.path.like("/admin/geo-access%"),
+        ~GeoAccessLog.path.like("/static/%"),
+        ~GeoAccessLog.path.like("/admin/static/%"),
+        ~GeoAccessLog.last_path.like("/admin/geo-access%"),
+        ~GeoAccessLog.last_path.like("/static/%"),
+        ~GeoAccessLog.last_path.like("/admin/static/%"),
+    )
+    for second_octet in range(16, 32):
+        query = query.filter(~GeoAccessLog.ip_address.like(f"172.{second_octet}.%"))
+    return query
+
+
+def _geo_access_filtered_log_query(
+    db: Session,
+    *,
+    ip: str = "",
+    country_code: str = "",
+    decision: str = "",
+    from_time: datetime | None = None,
+    to_time: datetime | None = None,
+    include_debug: bool = False,
+):
+    query = db.query(GeoAccessLog)
+    if from_time:
+        query = query.filter(GeoAccessLog.last_seen_at >= from_time)
+    if to_time:
+        query = query.filter(GeoAccessLog.last_seen_at <= to_time)
+    if ip:
+        query = query.filter(GeoAccessLog.ip_address.like(f"%{ip.strip()[:45]}%"))
+    if country_code:
+        query = query.filter(GeoAccessLog.country_code == country_code.strip().upper()[:8])
+    if decision:
+        query = query.filter(GeoAccessLog.decision == decision.strip().upper()[:16])
+    if not include_debug:
+        query = _apply_geo_access_debug_log_filters(query)
+    return query
+
+
+@router.get("/geo-access", response_class=HTMLResponse)
+def geo_access_page(
+    request: Request,
+    notice: str = "",
+    error: str = "",
+    ip: str = "",
+    country_code: str = "",
+    decision: str = "",
+    from_time: str = "",
+    to_time: str = "",
+    limit: int = 100,
+    show_debug: str = "",
+    db: Session = Depends(get_db),
+):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    settings_row = get_or_create_geo_access_settings(db)
+    db.commit()
+    rules = db.query(GeoIpRule).order_by(GeoIpRule.id.desc()).limit(200).all()
+    restricted_country_codes = list(parse_country_list(settings_row.restricted_countries_json))
+    restricted_countries = ",".join(restricted_country_codes)
+    restricted_country_display = _format_geo_access_country_list(restricted_country_codes)
+    safe_limit = min(max(int(limit or 100), 1), 200)
+    default_from_time = datetime.utcnow() - timedelta(hours=24)
+    parsed_from_time = _parse_geo_access_datetime(from_time) or default_from_time
+    parsed_to_time = _parse_geo_access_datetime(to_time)
+    normalized_country_filter = str(country_code or "").strip().upper()
+    normalized_decision_filter = str(decision or "").strip().upper()
+    normalized_ip_filter = str(ip or "").strip()
+    include_debug_logs = str(show_debug or "").lower() in {"1", "true", "on", "yes"}
+    log_filter_error = ""
+
+    if parsed_to_time and parsed_to_time < parsed_from_time:
+        parsed_to_time = None
+        log_filter_error = "结束时间早于开始时间，已忽略结束时间。"
+
+    range_end = parsed_to_time or datetime.utcnow()
+    has_required_long_range_filter = any(
+        (normalized_ip_filter, normalized_country_filter, normalized_decision_filter)
+    )
+    if range_end - parsed_from_time > timedelta(days=30) and not has_required_long_range_filter:
+        parsed_from_time = range_end - timedelta(days=30)
+        log_filter_error = "超过 30 天的日志查询必须输入 IP、国家/地区或处理结果之一，已自动收窄为最近 30 天。"
+
+    filtered_logs = _geo_access_filtered_log_query(
+        db,
+        ip=normalized_ip_filter,
+        country_code=normalized_country_filter,
+        decision=normalized_decision_filter,
+        from_time=parsed_from_time,
+        to_time=parsed_to_time,
+        include_debug=include_debug_logs,
+    )
+    summary_rows = (
+        filtered_logs.with_entities(
+            GeoAccessLog.ip_address.label("ip_address"),
+            GeoAccessLog.country_code.label("country_code"),
+            GeoAccessLog.source.label("source"),
+            GeoAccessLog.decision.label("decision"),
+            GeoAccessLog.reason.label("reason"),
+            func.sum(GeoAccessLog.hit_count).label("hit_count"),
+            func.min(GeoAccessLog.first_seen_at).label("first_seen_at"),
+            func.max(GeoAccessLog.last_seen_at).label("last_seen_at"),
+            func.max(GeoAccessLog.last_path).label("last_path"),
+        )
+        .group_by(
+            GeoAccessLog.ip_address,
+            GeoAccessLog.country_code,
+            GeoAccessLog.source,
+            GeoAccessLog.decision,
+            GeoAccessLog.reason,
+        )
+        .order_by(func.max(GeoAccessLog.last_seen_at).desc())
+        .limit(safe_limit)
+        .all()
+    )
+    log_summaries = []
+    for row in summary_rows:
+        latest_row = (
+            filtered_logs.filter(
+                GeoAccessLog.ip_address == row.ip_address,
+                GeoAccessLog.country_code == row.country_code,
+                GeoAccessLog.source == row.source,
+                GeoAccessLog.decision == row.decision,
+                GeoAccessLog.reason == row.reason,
+            )
+            .order_by(GeoAccessLog.last_seen_at.desc(), GeoAccessLog.id.desc())
+            .first()
+        )
+        log_summaries.append(
+            SimpleNamespace(
+                ip_address=row.ip_address,
+                country_code=row.country_code,
+                source=row.source,
+                decision=row.decision,
+                reason=row.reason,
+                hit_count=row.hit_count,
+                first_seen_at=row.first_seen_at,
+                last_seen_at=row.last_seen_at,
+                last_path=(latest_row.last_path or latest_row.path) if latest_row else row.last_path,
+            )
+        )
+    logs = (
+        filtered_logs.order_by(GeoAccessLog.last_seen_at.desc(), GeoAccessLog.id.desc())
+        .limit(min(safe_limit, 100))
+        .all()
+    )
+    recent_hit_query = db.query(GeoAccessLog)
+    if not include_debug_logs:
+        recent_hit_query = _apply_geo_access_debug_log_filters(recent_hit_query)
+    recent_hit = recent_hit_query.order_by(GeoAccessLog.last_seen_at.desc(), GeoAccessLog.id.desc()).first()
+    recent_hit_at = recent_hit.last_seen_at if recent_hit else None
+
+    return render(
+        request,
+        "admin/geo_access.html",
+        ctx={
+            "active_group": "system",
+            "active": "geo_access",
+            "notice": notice,
+            "error": error,
+            "settings_row": settings_row,
+            "geo_country_options": GEO_ACCESS_COUNTRY_OPTIONS,
+            "geo_country_label_map": _geo_access_country_label_map(),
+            "restricted_country_codes": restricted_country_codes,
+            "restricted_countries": restricted_countries,
+            "restricted_country_display": restricted_country_display,
+            "restricted_country_count": len(restricted_country_codes),
+            "rules": rules,
+            "log_summaries": log_summaries,
+            "logs": logs,
+            "recent_hit_at": recent_hit_at,
+            "geo_log_retention_days": GEO_ACCESS_LOG_RETENTION_DAYS,
+            "geo_log_filter_error": log_filter_error,
+            "geo_log_filters": {
+                "ip": normalized_ip_filter,
+                "country_code": normalized_country_filter,
+                "decision": normalized_decision_filter,
+                "from_time": _format_geo_access_datetime_value(parsed_from_time),
+                "to_time": _format_geo_access_datetime_value(parsed_to_time),
+                "limit": safe_limit,
+                "show_debug": include_debug_logs,
+            },
+        },
+    )
+
+
+@router.post("/geo-access/settings")
+def geo_access_settings_submit(
+    request: Request,
+    enabled: Optional[str] = Form(None),
+    monitor_mode: Optional[str] = Form(None),
+    block_unknown: Optional[str] = Form(None),
+    admin_exempt: Optional[str] = Form(None),
+    restricted_countries: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, ADMIN_PERMISSION_SUPER_ADMIN_ONLY)
+    if redir:
+        return redir
+
+    try:
+        country_codes = list(_parse_geo_access_country_form_codes(restricted_countries))
+        valid_codes = set(_geo_access_country_label_map())
+        invalid_codes = [code for code in country_codes if code not in valid_codes]
+        if invalid_codes:
+            return RedirectResponse(
+                url=_build_geo_access_redirect_url(
+                    error=f"存在无效国家/地区代码：{', '.join(invalid_codes)}"
+                ),
+                status_code=302,
+            )
+        update_geo_access_settings(
+            db,
+            enabled=enabled == "1",
+            monitor_mode=monitor_mode == "1",
+            block_unknown=block_unknown == "1",
+            admin_exempt=admin_exempt == "1",
+            restricted_countries=country_codes,
+        )
+        db.commit()
+        return RedirectResponse(
+            url=_build_geo_access_redirect_url(notice="地区访问控制设置已保存。"),
+            status_code=302,
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.warning("Failed to save geo access settings", exc_info=True)
+        return RedirectResponse(
+            url=_build_geo_access_redirect_url(error=str(exc)[:180]),
+            status_code=302,
+        )
+
+
+@router.post("/geo-access/rules")
+def geo_access_rule_create_submit(
+    request: Request,
+    rule_type: str = Form(RULE_ALLOW),
+    ip_cidr: str = Form(...),
+    note: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, ADMIN_PERMISSION_SUPER_ADMIN_ONLY)
+    if redir:
+        return redir
+
+    try:
+        create_geo_ip_rule(db, rule_type=rule_type, ip_cidr=ip_cidr, note=note)
+        db.commit()
+        return RedirectResponse(
+            url=_build_geo_access_redirect_url(notice="IP 规则已添加。"),
+            status_code=302,
+        )
+    except Exception as exc:
+        db.rollback()
+        return RedirectResponse(
+            url=_build_geo_access_redirect_url(error=str(exc)[:180]),
+            status_code=302,
+        )
+
+
+@router.post("/geo-access/rules/{rule_id}/toggle")
+def geo_access_rule_toggle_submit(
+    request: Request,
+    rule_id: int,
+    enabled: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, ADMIN_PERMISSION_SUPER_ADMIN_ONLY)
+    if redir:
+        return redir
+
+    row = set_geo_ip_rule_enabled(db, rule_id, enabled == "1")
+    db.commit()
+    if not row:
+        return RedirectResponse(
+            url=_build_geo_access_redirect_url(error="IP 规则不存在。"),
+            status_code=302,
+        )
+    return RedirectResponse(
+        url=_build_geo_access_redirect_url(notice="IP 规则已更新。"),
+        status_code=302,
+    )
+
+
+@router.post("/geo-access/rules/{rule_id}/delete")
+def geo_access_rule_delete_submit(
+    request: Request,
+    rule_id: int,
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, ADMIN_PERMISSION_SUPER_ADMIN_ONLY)
+    if redir:
+        return redir
+
+    deleted = delete_geo_ip_rule(db, rule_id)
+    db.commit()
+    if not deleted:
+        return RedirectResponse(
+            url=_build_geo_access_redirect_url(error="IP 规则不存在。"),
+            status_code=302,
+        )
+    return RedirectResponse(
+        url=_build_geo_access_redirect_url(notice="IP 规则已删除。"),
+        status_code=302,
     )
 
 

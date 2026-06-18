@@ -57,8 +57,15 @@ class Settings(BaseSettings):
     COOKIE_PATH: str = "/"
     CORS_ORIGINS: Optional[str] = None
     CORS_ALLOW_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,http://192.168.31.57:3000,https://moralis-hook.zaf.cpolar.io"
-    GEO_RESTRICTION_ENABLED: bool = True
-    GEO_RESTRICTED_COUNTRIES: str = "CN"
+    GEO_ACCESS_ENABLED: bool = False
+    GEO_ACCESS_MONITOR_MODE: bool = True
+    GEO_ACCESS_BLOCK_UNKNOWN: bool = False
+    GEO_ACCESS_ADMIN_EXEMPT: bool = False
+    GEO_ACCESS_RESTRICTED_COUNTRIES: str = ""
+    GEO_ACCESS_TRUST_CF_HEADER: bool = True
+    GEOIP_DB_PATH: str = ""
+    GEO_RESTRICTION_ENABLED: bool = False
+    GEO_RESTRICTED_COUNTRIES: str = ""
     GEO_RESTRICTION_HEADER: str = "CF-IPCountry"
 
     # Cookie Max-Age（秒）

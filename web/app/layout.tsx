@@ -1,9 +1,7 @@
 import type { Metadata } from "next";
-import { Suspense } from "react";
 import "./globals.css";
 
-import Header from "@/components/layout/Header";
-import Footer from "@/components/layout/Footer";
+import AppChrome from "@/components/layout/AppChrome";
 import Providers from "./providers";
 import { LocaleProvider } from "@/contexts/LocaleContext";
 
@@ -52,13 +50,7 @@ export default function RootLayout({
       >
         <LocaleProvider>
           <Providers>
-            <Suspense fallback={null}>
-              <Header />
-            </Suspense>
-
-            {children}
-
-            <Footer />
+            <AppChrome>{children}</AppChrome>
           </Providers>
         </LocaleProvider>
       </body>
