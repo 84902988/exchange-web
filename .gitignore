@@ -53,6 +53,10 @@ logs/
 *.sqlite
 *.sqlite3
 *.db
+*.mmdb
+GeoIP.conf
+data/geoip/
+backend/data/geoip/
 
 # IDE / OS
 .idea/
@@ -70,6 +74,8 @@ Thumbs.db
 .tmp*/
 tmp.py
 tmp2.py
+backend/tmp/
+output/
 *-diff.txt
 next
 ffmpeg-*-essentials_build/
