@@ -50,6 +50,7 @@
 {% set can_help_content = is_sa or 'site_content.manage' in perms %}
 {% set can_support_tickets = is_sa or 'support_tickets.manage' in perms %}
 {% set can_audit = is_sa or 'audit.view' in perms %}
+{% set can_geo_access = is_sa %}
 
 {% set show_overview = can_dashboard %}
 {% set show_market_analysis = can_market_analysis or can_market_providers %}
@@ -58,7 +59,7 @@
 {% set show_trade = can_orders or can_trades or can_fee_settings or can_pairs or can_contract_orders or can_contract_trades or can_contract_positions or can_contract_accounts or can_contract_liquidations or can_contract_symbols or can_platform_accounts or can_dealer_risk %}
 {% set show_operations = can_site_settings or can_banners or can_announcements or can_help_content or can_dividend %}
 {% set show_system_tasks = is_sa or can_stock_locks or can_bd or can_dividend %}
-{% set show_system_security = is_sa or can_audit %}
+{% set show_system_security = is_sa or can_audit or can_geo_access %}
 {% set show_system = show_system_tasks or show_system_security %}
 
 <aside class="sidebar">
@@ -455,7 +456,7 @@
   {% endif %}
 
   {% if show_system %}
-    <details class="group" {% if (active_group == 'system' and active not in collection_nav_active) or active in ['market_cache_monitor', 'operations_center', 'service_overview', 'rq_status', 'stock_token_release_logs', 'bd_commission_job_logs', 'dividend_job_logs', 'admin_users', 'admin_roles', 'audit_list'] %}open{% endif %}>
+    <details class="group" {% if (active_group == 'system' and active not in collection_nav_active) or active in ['market_cache_monitor', 'operations_center', 'service_overview', 'rq_status', 'stock_token_release_logs', 'bd_commission_job_logs', 'dividend_job_logs', 'admin_users', 'admin_roles', 'audit_list', 'geo_access'] %}open{% endif %}>
       <summary>系统 <span class="chev">▾</span></summary>
       <div class="nav">
         {% if show_system_tasks %}
@@ -496,7 +497,7 @@
         {% endif %}
 
         {% if show_system_security %}
-          <details class="admin-nav-group" {% if active in ['admin_users', 'admin_roles', 'audit_list'] %}open{% endif %}>
+          <details class="admin-nav-group" {% if active in ['admin_users', 'admin_roles', 'audit_list', 'geo_access'] %}open{% endif %}>
             <summary class="admin-nav-group-summary">安全审计 <span class="chev">▾</span></summary>
             <div class="admin-nav-group-items">
               {% if is_sa %}
@@ -510,6 +511,11 @@
               {% if can_audit %}
                 <a href="/admin/audit" class="{% if active == 'audit_list' %}active{% endif %}">
                   <span class="icon">A</span> 操作审计
+                </a>
+              {% endif %}
+              {% if can_geo_access %}
+                <a href="/admin/geo-access" class="{% if active == 'geo_access' %}active{% endif %}">
+                  <span class="icon">G</span> 地区访问控制
                 </a>
               {% endif %}
             </div>
