@@ -15412,6 +15412,8 @@ def admin_query_stock_token_release_logs(db: Session, filters: Optional[Dict[str
     filters = filters or {}
     trigger_type = str(filters.get("trigger_type") or "").strip().upper()
     status = str(filters.get("status") or "").strip().upper()
+    start_date = filters.get("start_date") or filters.get("date_from")
+    end_date = filters.get("end_date") or filters.get("date_to")
     page = max(1, _parse_int(filters.get("page"), 1))
     page_size = min(max(1, _parse_int(filters.get("page_size"), 20)), 100)
     where_parts = []
@@ -15422,6 +15424,12 @@ def admin_query_stock_token_release_logs(db: Session, filters: Optional[Dict[str
     if status:
         where_parts.append("status = :status")
         params["status"] = status
+    if start_date:
+        where_parts.append("DATE(created_at) >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        where_parts.append("DATE(created_at) <= :end_date")
+        params["end_date"] = end_date
     where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
     try:
         total = int(db.execute(text(f"SELECT COUNT(*) FROM stock_token_release_logs {where_sql}"), params).scalar() or 0)
@@ -15468,7 +15476,15 @@ def admin_query_stock_token_release_logs(db: Session, filters: Optional[Dict[str
         )
     return _empty_page(
         items=items,
-        filters={**filters, "trigger_type": trigger_type, "status": status},
+        filters={
+            **filters,
+            "trigger_type": trigger_type,
+            "status": status,
+            "start_date": start_date,
+            "end_date": end_date,
+            "date_from": start_date,
+            "date_to": end_date,
+        },
         total=total,
         page=page,
         page_size=page_size,

@@ -36,6 +36,7 @@ from app.db.models.collection import CollectionTask, CollectionTaskStatus, GasTa
 from app.db.models.bd_commission_record import BdCommissionRecord
 from app.db.models.user_invite_commission_record import UserInviteCommissionRecord
 from app.db.models.geo_access import GeoAccessLog, GeoIpRule
+from app.db.models.db_lifecycle_cleanup_log import DbLifecycleCleanupLog
 from app.db.models import AdminUser, User
 from app.db.session import SessionLocal, get_db
 from app.services.admin_balance_adjust_service import (
@@ -212,6 +213,13 @@ from app.services.dividend_service import (
     set_dividend_run_time,
 )
 from app.jobs.dividend_job import process_dividend_job_for_date
+from app.jobs.db_lifecycle_cleanup_job import (
+    OPERATION_MODE_EXECUTE,
+    RISK_LEVEL_REAL_DELETE,
+    PROTECTED_TABLES,
+    can_execute_cleanup,
+    core_financial_table_rows,
+)
 from app.services.market_cache_metrics import get_market_cache_metrics_snapshot
 from app.services.reference_overlay_sync_service import sync_reference_overlay_once
 from app.services.spot_fee_settings_service import (
@@ -390,6 +398,7 @@ ADMIN_DOC_RESOURCE_LABELS: tuple[tuple[str, str, str], ...] = (
     ("/system/operations", "运营中心", "operations center"),
     ("/system/rq", "RQ 队列状", "RQ queue status"),
     ("/system/services", "服务概览", "service overview"),
+    ("/system/db-lifecycle", "DB 生命周期", "DB lifecycle"),
     ("/trading-pairs", "交易", "trading pair"),
     ("/pairs", "交易", "trading pair"),
     ("/reference-overlays", "参考价覆盖", "reference price overlay"),
@@ -433,6 +442,7 @@ ADMIN_DOC_RESOURCE_LABELS: tuple[tuple[str, str, str], ...] = (
     ("/platform/dealer-risk", "做市商风", "dealer risk"),
     ("/dealer-risk", "做市商风", "dealer risk"),
     ("/audit", "审计日志", "audit log"),
+    ("/geo-access", "Geo Access Control", "geo access control"),
     ("/site-settings", "站点设置", "site settings"),
     ("/home-banners", "首页 Banner", "home banner"),
     ("/announcements", "公告", "announcement"),
@@ -820,6 +830,7 @@ ADMIN_GET_PERMISSION_EXACT: Dict[str, str] = {
     "/admin/audit": "audit.view",
     "/admin/geo-access": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/operations": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
+    "/admin/system/db-lifecycle": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/services": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/rq": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/site-settings": "site_settings.manage",
@@ -857,6 +868,7 @@ ADMIN_GET_PERMISSION_PREFIXES: tuple[tuple[str, str], ...] = (
     ("/admin/admin-users", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/admin-roles", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/system/operations", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
+    ("/admin/system/db-lifecycle", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/system/services", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/system/rq", ADMIN_PERMISSION_SUPER_ADMIN_ONLY),
     ("/admin/market-analysis", "market_analysis.view"),
@@ -3524,13 +3536,13 @@ def deposit_records_page(
         deposit_no_value,
         tx_hash_value,
         request_id_value,
-        coin_symbol_value,
-        chain_key_value,
-        address_value,
+        status_value,
     )
     range_blocked = range_days > 30 and not has_precise_condition
     if range_blocked:
         query_notices.append(DEPOSIT_RECORDS_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        range_days = 30
     active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
     today = get_admin_today_date()
     quick_ranges = [
@@ -3559,18 +3571,7 @@ def deposit_records_page(
         "page": page,
         "page_size": page_size,
     }
-    if range_blocked:
-        result = {
-            "items": [],
-            "filters": query_filters,
-            "pagination": {"page": 1, "page_size": page_size, "total": 0, "pages": 1},
-            "total": 0,
-            "page": 1,
-            "page_size": page_size,
-            "pages": 1,
-        }
-    else:
-        result = admin_query_deposit_records(db=db, filters=query_filters)
+    result = admin_query_deposit_records(db=db, filters=query_filters)
     query_notice = " ".join(query_notices)
     return render(
         request,
@@ -3704,12 +3705,15 @@ def withdraw_records_page(
         withdraw_no_value,
         tx_hash_value,
         request_id_value,
-        coin_symbol_value,
-        chain_key_value,
+        status_value,
     )
     range_blocked = False if skip_default_date_filter else range_days > 30 and not has_precise_condition
     if range_blocked:
         query_notices.append(WITHDRAW_RECORDS_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        range_days = 30
+        created_from_filter = range_from.isoformat()
+        created_to_filter = range_to.isoformat()
     active_range_days = 0 if skip_default_date_filter else (range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0))
     today = get_admin_today_date()
     quick_ranges = [
@@ -3737,18 +3741,7 @@ def withdraw_records_page(
         "page": page,
         "page_size": page_size,
     }
-    if range_blocked:
-        result = {
-            "items": [],
-            "filters": query_filters,
-            "pagination": {"page": 1, "page_size": page_size, "total": 0, "pages": 1},
-            "total": 0,
-            "page": 1,
-            "page_size": page_size,
-            "pages": 1,
-        }
-    else:
-        result = admin_query_withdraw_records(db=db, filters=query_filters)
+    result = admin_query_withdraw_records(db=db, filters=query_filters)
     anomaly_summary = result.get("anomaly_summary")
     if anomaly_summary is None:
         anomaly_summary = admin_query_withdraw_anomalies(db, limit=100).get("summary", {})
@@ -4132,6 +4125,10 @@ def _balance_log_has_precise_condition(*values: str) -> bool:
     return any(str(value or "").strip() for value in values)
 
 
+def _narrow_admin_range_to_30_days(range_to: date) -> tuple[date, date]:
+    return range_to - timedelta(days=29), range_to
+
+
 DEPOSIT_RECORDS_LARGE_TABLE_NOTICE = "大表请优先按用户ID、充值ID、TxID、币种、链、地址等条件定位。默认查询最近7天，普通查询最大范围为30天"
 DEPOSIT_RECORDS_RANGE_BLOCK_NOTICE = "查询范围超过30天，请输入用户ID、充值ID、TxID、币种、链或地址等精准条件后再查询"
 WITHDRAW_RECORDS_LARGE_TABLE_NOTICE = "大表请优先按用户ID、提现ID、提现单号、TxID、币种、链等条件定位。默认查询最近7天，普通查询最大范围为30天"
@@ -4148,6 +4145,22 @@ CONTRACT_TRADES_LARGE_TABLE_NOTICE = "大表请优先按用户ID、成交ID、�
 CONTRACT_TRADES_RANGE_BLOCK_NOTICE = "查询范围超过30天，请输入用户ID、成交ID、订单ID、持仓ID或合约品种等精准条件后再查询"
 CONTRACT_ORDERS_LARGE_TABLE_NOTICE = "大表请优先按用户ID、订单ID、订单号、持仓ID、合约品种等条件定位。默认查询最近7天，普通查询最大范围为30天"
 CONTRACT_ORDERS_RANGE_BLOCK_NOTICE = "查询范围超过30天，请输入用户ID、订单ID、持仓ID或合约品种等精准条件后再查询"
+
+
+BALANCE_LOG_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少用户ID、业务ID、请求ID或TxID等精准条件，已自动收窄为最近30天"
+DEPOSIT_RECORDS_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少用户ID、充值ID、TxID、请求ID或状态等精准条件，已自动收窄为最近30天"
+WITHDRAW_RECORDS_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少用户ID、提现ID、提现单号、TxID、请求ID或状态等精准条件，已自动收窄为最近30天"
+AUDIT_LOGS_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少审计ID、管理员ID、请求ID或IP等精准条件，已自动收窄为最近30天"
+ORDERS_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少用户ID、订单ID、订单号、交易对或状态等精准条件，已自动收窄为最近30天"
+TRADES_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少用户ID、成交ID、订单ID、订单号或交易对等精准条件，已自动收窄为最近30天"
+CONTRACT_TRADES_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少用户ID、成交ID、订单ID、持仓ID或合约品种等精准条件，已自动收窄为最近30天"
+CONTRACT_ORDERS_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少用户ID、订单ID、订单号、持仓ID、合约品种或状态等精准条件，已自动收窄为最近30天"
+BD_JOB_LOGS_LARGE_TABLE_NOTICE = "任务日志默认查询最近7天，普通查询最大范围为30天；超过30天请至少输入状态"
+BD_JOB_LOGS_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少状态等精准条件，已自动收窄为最近30天"
+DIVIDEND_JOB_LOGS_LARGE_TABLE_NOTICE = "任务日志默认查询最近7天，普通查询最大范围为30天；超过30天请至少输入分红池、分红日期或状态"
+DIVIDEND_JOB_LOGS_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少分红池、分红日期或状态等精准条件，已自动收窄为最近30天"
+STOCK_TOKEN_RELEASE_LOGS_LARGE_TABLE_NOTICE = "释放日志默认查询最近7天，普通查询最大范围为30天；超过30天请至少输入状态"
+STOCK_TOKEN_RELEASE_LOGS_RANGE_BLOCK_NOTICE = "查询范围超过30天且缺少状态等精准条件，已自动收窄为最近30天"
 
 
 BALANCE_LOGS_INLINE_TEMPLATE = """
@@ -4381,6 +4394,8 @@ def balance_logs_page(
     range_blocked = range_days > 30 and not has_precise_condition
     if range_blocked:
         query_notices.append(BALANCE_LOG_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        range_days = 30
     active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
     today = get_admin_today_date()
     quick_ranges = [
@@ -4410,18 +4425,7 @@ def balance_logs_page(
         "page": page,
         "page_size": page_size,
     }
-    if range_blocked:
-        result = {
-            "items": [],
-            "filters": {**query_filters, "page": page, "page_size": page_size},
-            "pagination": _default_pagination(),
-            "total": 0,
-            "page": 1,
-            "page_size": page_size,
-            "pages": 1,
-        }
-    else:
-        result = admin_query_unified_balance_logs(db=db, filters=query_filters)
+    result = admin_query_unified_balance_logs(db=db, filters=query_filters)
     result_filters = _result_filters(result)
     return render_inline(
         request,
@@ -8661,10 +8665,19 @@ def orders_page(
     )
     start_time_value, end_time_value = get_admin_date_time_window(range_from, range_to)
     range_days = (range_to - range_from).days + 1
-    has_precise_condition = _balance_log_has_precise_condition(order_id_value, order_no_value, user_id_value, symbol_value)
+    has_precise_condition = _balance_log_has_precise_condition(
+        order_id_value,
+        order_no_value,
+        user_id_value,
+        symbol_value,
+        status_value,
+    )
     range_blocked = range_days > 30 and not has_precise_condition
     if range_blocked:
         query_notices.append(ORDERS_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        start_time_value, end_time_value = get_admin_date_time_window(range_from, range_to)
+        range_days = 30
     active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
     today = get_admin_today_date()
     quick_ranges = [
@@ -8697,27 +8710,7 @@ def orders_page(
         "page": page,
         "page_size": page_size,
     }
-    if range_blocked:
-        result = {
-            "items": [],
-            "filters": {**query_filters, "page": page, "page_size": page_size},
-            "pagination": _default_pagination(),
-            "total": 0,
-            "page": 1,
-            "page_size": page_size,
-            "pages": 1,
-            "total_pages": 1,
-            "has_next": False,
-            "has_prev": False,
-            "is_page_limited": False,
-            "pagination_mode": "page",
-            "query_scope": query_scope_value,
-            "effective_start_time": start_time_value,
-            "effective_end_time": end_time_value,
-            "performance_notice": "",
-        }
-    else:
-        result = admin_query_orders(db=db, filters=query_filters)
+    result = admin_query_orders(db=db, filters=query_filters)
     performance_notice = result.get("performance_notice", "")
     if query_notices:
         performance_notice = f"{' '.join(query_notices)} {performance_notice}".strip()
@@ -8838,6 +8831,10 @@ def trades_page(
     range_blocked = range_days > 30 and not has_precise_condition
     if range_blocked:
         query_notices.append(TRADES_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        start_time_value = datetime.combine(range_from, datetime.min.time())
+        end_time_value = datetime.combine(range_to, datetime.max.time())
+        range_days = 30
     active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
     today = get_admin_today_date()
     quick_ranges = [
@@ -8871,27 +8868,7 @@ def trades_page(
         "page": page,
         "page_size": page_size,
     }
-    if range_blocked:
-        result = {
-            "items": [],
-            "filters": {**query_filters, "page": page, "page_size": page_size},
-            "pagination": _default_pagination(),
-            "total": 0,
-            "page": 1,
-            "page_size": page_size,
-            "pages": 1,
-            "total_pages": 1,
-            "has_next": False,
-            "has_prev": False,
-            "is_page_limited": False,
-            "pagination_mode": "page",
-            "query_scope": query_scope_value,
-            "effective_start_time": start_time_value,
-            "effective_end_time": end_time_value,
-            "performance_notice": "",
-        }
-    else:
-        result = admin_query_trades(db=db, filters=query_filters)
+    result = admin_query_trades(db=db, filters=query_filters)
     performance_notice = result.get("performance_notice", "")
     if query_notices:
         performance_notice = f"{' '.join(query_notices)} {performance_notice}".strip()
@@ -9082,6 +9059,52 @@ def service_overview_page(request: Request):
             "active_group": "system",
             "active": "service_overview",
             "service_overview": admin_query_service_overview(),
+        },
+    )
+
+
+@router.get("/system/db-lifecycle", response_class=HTMLResponse)
+def db_lifecycle_page(request: Request, db: Session = Depends(get_db)):
+    redir = require_admin(request)
+    if redir:
+        return redir
+
+    recent_logs = (
+        db.query(DbLifecycleCleanupLog)
+        .order_by(DbLifecycleCleanupLog.started_at.desc(), DbLifecycleCleanupLog.id.desc())
+        .limit(100)
+        .all()
+    )
+    latest_log = recent_logs[0] if recent_logs else None
+    latest_real_delete = (
+        db.query(DbLifecycleCleanupLog)
+        .filter(
+            (DbLifecycleCleanupLog.operation_mode == OPERATION_MODE_EXECUTE)
+            | (DbLifecycleCleanupLog.risk_level == RISK_LEVEL_REAL_DELETE)
+        )
+        .order_by(DbLifecycleCleanupLog.started_at.desc(), DbLifecycleCleanupLog.id.desc())
+        .first()
+    )
+
+    return render(
+        request,
+        "admin/db_lifecycle.html",
+        ctx={
+            "active_group": "system",
+            "active": "db_lifecycle",
+            "db_lifecycle": {
+                "cleanup_enabled": settings.DB_LIFECYCLE_CLEANUP_ENABLED,
+                "dry_run": settings.DB_LIFECYCLE_CLEANUP_DRY_RUN,
+                "allow_execute": settings.DB_LIFECYCLE_CLEANUP_ALLOW_EXECUTE,
+                "execute_confirm_configured": bool(str(settings.DB_LIFECYCLE_CLEANUP_EXECUTE_CONFIRM or "").strip()),
+                "can_execute_now": can_execute_cleanup(settings.DB_LIFECYCLE_CLEANUP_EXECUTE_CONFIRM),
+                "retention_days": settings.DB_LIFECYCLE_CLEANUP_RETENTION_DAYS,
+                "latest_log": latest_log,
+                "latest_real_delete": latest_real_delete,
+                "recent_logs": recent_logs,
+                "protected_tables": sorted(PROTECTED_TABLES),
+                "core_financial_tables": core_financial_table_rows(),
+            },
         },
     )
 
@@ -10515,10 +10538,14 @@ def contract_orders_page(
         order_no_value,
         position_id_value,
         symbol_value,
+        status_value,
     )
     range_blocked = range_days > 30 and not has_precise_condition
     if range_blocked:
         query_notices.append(CONTRACT_ORDERS_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        start_time_value, end_time_value = get_admin_date_time_window(range_from, range_to)
+        range_days = 30
     active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
     today = get_admin_today_date()
     quick_ranges = [
@@ -10550,27 +10577,7 @@ def contract_orders_page(
         "page": page,
         "page_size": page_size,
     }
-    if range_blocked:
-        result = {
-            "items": [],
-            "filters": {**query_filters, "page": page, "page_size": page_size},
-            "pagination": _default_pagination(),
-            "total": 0,
-            "page": 1,
-            "page_size": page_size,
-            "pages": 1,
-            "total_pages": 1,
-            "has_next": False,
-            "has_prev": False,
-            "is_page_limited": False,
-            "pagination_mode": "page",
-            "query_scope": query_scope_value,
-            "effective_start_time": start_time_value,
-            "effective_end_time": end_time_value,
-            "performance_notice": "",
-        }
-    else:
-        result = list_admin_contract_orders(db=db, filters=query_filters)
+    result = list_admin_contract_orders(db=db, filters=query_filters)
     performance_notice = result.get("performance_notice", "")
     if query_notices:
         performance_notice = f"{' '.join(query_notices)} {performance_notice}".strip()
@@ -10686,6 +10693,9 @@ def contract_trades_page(
     range_blocked = range_days > 30 and not has_precise_condition
     if range_blocked:
         query_notices.append(CONTRACT_TRADES_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        start_time_value, end_time_value = get_admin_date_time_window(range_from, range_to)
+        range_days = 30
     active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
     today = get_admin_today_date()
     quick_ranges = [
@@ -10717,27 +10727,7 @@ def contract_trades_page(
         "page": page,
         "page_size": page_size,
     }
-    if range_blocked:
-        result = {
-            "items": [],
-            "filters": {**query_filters, "page": page, "page_size": page_size},
-            "pagination": _default_pagination(),
-            "total": 0,
-            "page": 1,
-            "page_size": page_size,
-            "pages": 1,
-            "total_pages": 1,
-            "has_next": False,
-            "has_prev": False,
-            "is_page_limited": False,
-            "pagination_mode": "page",
-            "query_scope": query_scope_value,
-            "effective_start_time": start_time_value,
-            "effective_end_time": end_time_value,
-            "performance_notice": "",
-        }
-    else:
-        result = list_admin_contract_trades(db=db, filters=query_filters)
+    result = list_admin_contract_trades(db=db, filters=query_filters)
     performance_notice = result.get("performance_notice", "")
     if query_notices:
         performance_notice = f"{' '.join(query_notices)} {performance_notice}".strip()
@@ -11628,6 +11618,8 @@ def stock_token_release_logs_page(
     request: Request,
     trigger_type: str = "",
     status: str = "",
+    start_date: str = "",
+    end_date: str = "",
     page: int = 1,
     page_size: int = 20,
     db: Session = Depends(get_db),
@@ -11636,9 +11628,35 @@ def stock_token_release_logs_page(
     if redir:
         return redir
 
+    trigger_type_value = str(trigger_type or "").strip().upper()
+    status_value = str(status or "").strip().upper()
+    range_from, range_to, query_notices, used_default_range = _balance_log_date_range(
+        date_from_text=start_date,
+        date_to_text=end_date,
+        created_from_text="",
+        created_to_text="",
+    )
+    range_days = (range_to - range_from).days + 1
+    if range_days > 30 and not _balance_log_has_precise_condition(status_value):
+        query_notices.append(STOCK_TOKEN_RELEASE_LOGS_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        range_days = 30
+    active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
+    today = get_admin_today_date()
+    quick_ranges = [
+        {
+            "days": days,
+            "date_from": (today - timedelta(days=days - 1)).isoformat(),
+            "date_to": today.isoformat(),
+        }
+        for days in (7, 15, 30)
+    ]
+
     query_filters = {
-        "trigger_type": trigger_type,
-        "status": status,
+        "trigger_type": trigger_type_value,
+        "status": status_value,
+        "start_date": range_from.isoformat(),
+        "end_date": range_to.isoformat(),
         "page": page,
         "page_size": page_size,
     }
@@ -11651,9 +11669,15 @@ def stock_token_release_logs_page(
             "active_group": "system",
             "active": "stock_token_release_logs",
             "filters": {
-                "trigger_type": trigger_type,
-                "status": status,
+                "trigger_type": trigger_type_value,
+                "status": status_value,
+                "start_date_text": range_from.isoformat(),
+                "end_date_text": range_to.isoformat(),
             },
+            "large_table_notice": STOCK_TOKEN_RELEASE_LOGS_LARGE_TABLE_NOTICE,
+            "query_notice": " ".join(query_notices),
+            "quick_ranges": quick_ranges,
+            "active_range_days": active_range_days,
             "pagination": {
                 "page": _result_page(result),
                 "page_size": _result_page_size(result),
@@ -12917,12 +12941,35 @@ def bd_commission_job_logs_page(
     if redir:
         return redir
 
+    status_value = str(status or "").strip().upper()
+    range_from, range_to, query_notices, used_default_range = _balance_log_date_range(
+        date_from_text=start_date,
+        date_to_text=end_date,
+        created_from_text="",
+        created_to_text="",
+    )
+    range_days = (range_to - range_from).days + 1
+    if range_days > 30 and not _balance_log_has_precise_condition(status_value):
+        query_notices.append(BD_JOB_LOGS_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        range_days = 30
+    active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
+    today = get_admin_today_date()
+    quick_ranges = [
+        {
+            "days": days,
+            "date_from": (today - timedelta(days=days - 1)).isoformat(),
+            "date_to": today.isoformat(),
+        }
+        for days in (7, 15, 30)
+    ]
+
     filters = {
-        "status": str(status or "").strip().upper(),
-        "start_date": _parse_dividend_date_value(start_date),
-        "end_date": _parse_dividend_date_value(end_date),
-        "start_date_text": str(start_date or "").strip(),
-        "end_date_text": str(end_date or "").strip(),
+        "status": status_value,
+        "start_date": range_from,
+        "end_date": range_to,
+        "start_date_text": range_from.isoformat(),
+        "end_date_text": range_to.isoformat(),
         "page": page,
         "page_size": page_size,
     }
@@ -12939,6 +12986,10 @@ def bd_commission_job_logs_page(
             "active_group": "system",
             "active": "bd_commission_job_logs",
             "filters": filters,
+            "large_table_notice": BD_JOB_LOGS_LARGE_TABLE_NOTICE,
+            "query_notice": " ".join(query_notices),
+            "quick_ranges": quick_ranges,
+            "active_range_days": active_range_days,
             "pagination": {
                 "page": _result_page(result),
                 "page_size": _result_page_size(result),
@@ -13235,16 +13286,42 @@ def dividend_job_logs_page(
     if redir:
         return redir
 
+    pool_id_value = str(pool_id or "").strip()
+    dividend_date_value = _parse_dividend_date_value(dividend_date)
+    status_value = str(status or "").strip().upper()
+    trigger_type_value = str(trigger_type or "").strip().upper()
+    range_from, range_to, query_notices, used_default_range = _balance_log_date_range(
+        date_from_text=start_date,
+        date_to_text=end_date,
+        created_from_text="",
+        created_to_text="",
+    )
+    range_days = (range_to - range_from).days + 1
+    if range_days > 30 and not _balance_log_has_precise_condition(pool_id_value, str(dividend_date_value or ""), status_value):
+        query_notices.append(DIVIDEND_JOB_LOGS_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        range_days = 30
+    active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
+    today = get_admin_today_date()
+    quick_ranges = [
+        {
+            "days": days,
+            "date_from": (today - timedelta(days=days - 1)).isoformat(),
+            "date_to": today.isoformat(),
+        }
+        for days in (7, 15, 30)
+    ]
+
     filters = {
-        "pool_id": str(pool_id or "").strip(),
-        "dividend_date": _parse_dividend_date_value(dividend_date),
+        "pool_id": pool_id_value,
+        "dividend_date": dividend_date_value,
         "dividend_date_text": str(dividend_date or "").strip(),
-        "status": str(status or "").strip().upper(),
-        "trigger_type": str(trigger_type or "").strip().upper(),
-        "start_date": _parse_dividend_date_value(start_date),
-        "end_date": _parse_dividend_date_value(end_date),
-        "start_date_text": str(start_date or "").strip(),
-        "end_date_text": str(end_date or "").strip(),
+        "status": status_value,
+        "trigger_type": trigger_type_value,
+        "start_date": range_from,
+        "end_date": range_to,
+        "start_date_text": range_from.isoformat(),
+        "end_date_text": range_to.isoformat(),
         "page": page,
         "page_size": page_size,
     }
@@ -13263,6 +13340,10 @@ def dividend_job_logs_page(
             "active_group": "system",
             "active": "dividend_job_logs",
             "filters": filters,
+            "large_table_notice": DIVIDEND_JOB_LOGS_LARGE_TABLE_NOTICE,
+            "query_notice": " ".join(query_notices),
+            "quick_ranges": quick_ranges,
+            "active_range_days": active_range_days,
             "pagination": {
                 "page": _result_page(result),
                 "page_size": _result_page_size(result),
@@ -13657,15 +13738,14 @@ def audit_page(
         admin_user_id_value,
         operator_id_value,
         target_user_id_value,
-        action_value,
-        module_value,
         request_id_value,
         ip_value,
     )
     should_query = True
     if range_days > 30 and not has_precise_condition:
-        should_query = False
         query_notices.append(AUDIT_LOGS_RANGE_BLOCK_NOTICE)
+        range_from, range_to = _narrow_admin_range_to_30_days(range_to)
+        range_days = 30
     active_range_days = range_days if range_days in {7, 15, 30} else (7 if used_default_range else 0)
 
     today = get_admin_today_date()

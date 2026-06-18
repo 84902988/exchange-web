@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from math import ceil
@@ -15,9 +16,11 @@ from app.db.models.stock_token_release_log import StockTokenReleaseLog
 from app.db.models.user_stock_token_lock import UserStockTokenLock
 
 
+logger = logging.getLogger(__name__)
 Q18 = Decimal("0.000000000000000001")
 SPOT_CHAIN_KEY = "spot"
 STOCK_TOKEN_CONVERT_BIZ_TYPE = "STOCK_TOKEN_CONVERT"
+STOCK_TOKEN_RELEASE_FAILURE_STATUSES = {"FAILED", "ERROR", "PARTIAL_FAILED"}
 
 
 class StockTokenLockError(ValueError):
@@ -194,15 +197,27 @@ def record_stock_token_release_log(
     message: str = "",
     error_message: Optional[str] = None,
     run_time: Optional[datetime] = None,
-) -> StockTokenReleaseLog:
+) -> Optional[StockTokenReleaseLog]:
     data = result or {}
     item_ids = data.get("item_ids") or []
+    normalized_status = str(status or "SUCCESS").strip().upper()[:30]
+    released_count = int(data.get("released_count") or 0)
+    if released_count <= 0 and normalized_status not in STOCK_TOKEN_RELEASE_FAILURE_STATUSES and not error_message:
+        logger.debug(
+            "skip stock token release no-op db log trigger=%s status=%s scanned=%s message=%s",
+            trigger_type,
+            normalized_status,
+            int(data.get("scanned_count") or 0),
+            str(message or "")[:120],
+        )
+        return None
+
     log = StockTokenReleaseLog(
         run_time=run_time or datetime.utcnow(),
         trigger_type=str(trigger_type or "AUTO").strip().upper()[:20],
-        status=str(status or "SUCCESS").strip().upper()[:30],
+        status=normalized_status,
         scanned_count=int(data.get("scanned_count") or 0),
-        released_count=int(data.get("released_count") or 0),
+        released_count=released_count,
         total_release_amount=_q18(data.get("total_release_amount") or 0),
         item_ids=json.dumps([int(item) for item in item_ids], ensure_ascii=False),
         message=str(message or "")[:500],
