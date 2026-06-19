@@ -36,8 +36,4 @@ export const radius = {
   lg: 12,
 };
 
-export const typography = {
-  number: {
-    fontVariant: ['tabular-nums'] as const,
-  },
-};
+export {fontFamily, fontFiles, typography} from './typography';

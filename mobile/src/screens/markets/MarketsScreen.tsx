@@ -4,7 +4,7 @@ import AppScreen from '../../components/common/AppScreen';
 import MarketRow from '../../components/common/MarketRow';
 import SearchBar from '../../components/common/SearchBar';
 import SectionTitle from '../../components/common/SectionTitle';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 const categories = ['总览', '自选', '加密货币', '股票', 'CFD'];
 const instruments = [
@@ -66,9 +66,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primarySoft,
   },
   categoryText: {
+    ...typography.medium,
     color: colors.textMuted,
     fontSize: 12,
-    fontWeight: '700',
   },
   activeCategoryText: {
     color: colors.primary,

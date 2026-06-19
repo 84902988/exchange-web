@@ -19,7 +19,7 @@ import TradeScreen from '../screens/trade/TradeScreen';
 import ContractScreen from '../screens/contract/ContractScreen';
 import AssetsScreen from '../screens/assets/AssetsScreen';
 import type {MainTabParamList} from './types';
-import {colors} from '../theme';
+import {colors, typography} from '../theme';
 
 const Tab = createBottomTabNavigator<MainTabParamList>();
 const TAB_BAR_BASE_HEIGHT = 60;
@@ -131,8 +131,8 @@ const styles = StyleSheet.create({
     marginTop: 1,
   },
   tabBarLabel: {
+    ...typography.medium,
     fontSize: 10,
-    fontWeight: '600',
     marginTop: 1,
     marginBottom: 0,
   },

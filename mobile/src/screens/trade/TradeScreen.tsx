@@ -2,7 +2,7 @@ import React from 'react';
 import {Pressable, StyleSheet, Text, View} from 'react-native';
 import AppScreen from '../../components/common/AppScreen';
 import SectionTitle from '../../components/common/SectionTitle';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 const tradeEntries = [
   {
@@ -39,9 +39,8 @@ export default function TradeScreen() {
 
 const styles = StyleSheet.create({
   hint: {
+    ...typography.body,
     color: colors.textMuted,
-    fontSize: 13,
-    lineHeight: 20,
   },
   list: {
     marginTop: 14,
@@ -56,20 +55,19 @@ const styles = StyleSheet.create({
     borderColor: colors.line,
   },
   title: {
+    ...typography.bold,
     color: colors.text,
     fontSize: 17,
-    fontWeight: '800',
   },
   desc: {
+    ...typography.body,
     marginTop: 8,
     color: colors.textMuted,
-    fontSize: 13,
-    lineHeight: 19,
   },
   action: {
+    ...typography.bold,
     marginTop: 12,
     color: colors.primary,
     fontSize: 12,
-    fontWeight: '800',
   },
 });

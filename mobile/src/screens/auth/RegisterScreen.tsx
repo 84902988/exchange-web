@@ -11,7 +11,7 @@ import AppScreen from '../../components/common/AppScreen';
 import PrimaryButton from '../../components/common/PrimaryButton';
 import type {AuthStackParamList} from '../../navigation/types';
 import {useAuth} from '../../store/authStore';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 type Props = NativeStackScreenProps<AuthStackParamList, 'Register'>;
 
@@ -104,12 +104,12 @@ export default function RegisterScreen({navigation}: Props) {
 
 const styles = StyleSheet.create({
   title: {
+    ...typography.screenTitle,
     marginTop: 24,
     color: colors.text,
-    fontSize: 28,
-    fontWeight: '900',
   },
   subtitle: {
+    ...typography.regular,
     marginTop: 8,
     color: colors.textMuted,
     fontSize: 13,
@@ -119,6 +119,7 @@ const styles = StyleSheet.create({
     gap: 14,
   },
   error: {
+    ...typography.regular,
     borderRadius: 8,
     padding: 12,
     color: colors.red,
@@ -129,6 +130,7 @@ const styles = StyleSheet.create({
     lineHeight: 19,
   },
   input: {
+    ...typography.regular,
     height: 50,
     borderRadius: 8,
     paddingHorizontal: 14,
@@ -143,8 +145,8 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   link: {
+    ...typography.medium,
     color: colors.primary,
     fontSize: 13,
-    fontWeight: '700',
   },
 });

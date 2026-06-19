@@ -1,6 +1,6 @@
 import React from 'react';
 import {StyleSheet, Text, View} from 'react-native';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 type Props = {
   title: string;
@@ -25,13 +25,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   title: {
+    ...typography.sectionTitle,
     color: colors.text,
-    fontSize: 17,
-    fontWeight: '800',
   },
   action: {
+    ...typography.action,
     color: colors.textMuted,
-    fontSize: 12,
-    fontWeight: '600',
   },
 });

@@ -2,7 +2,7 @@ import React from 'react';
 import {Pressable, StyleSheet, Text, View} from 'react-native';
 import AppScreen from '../../components/common/AppScreen';
 import SectionTitle from '../../components/common/SectionTitle';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 const contractTypes = [
   'USDT合约',
@@ -36,9 +36,8 @@ export default function ContractScreen() {
 
 const styles = StyleSheet.create({
   hint: {
+    ...typography.body,
     color: colors.textMuted,
-    fontSize: 13,
-    lineHeight: 20,
   },
   grid: {
     marginTop: 14,
@@ -64,17 +63,18 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primarySoft,
   },
   markText: {
+    ...typography.heavy,
     color: colors.primary,
     fontSize: 14,
-    fontWeight: '900',
   },
   title: {
+    ...typography.bold,
     marginTop: 14,
     color: colors.text,
     fontSize: 16,
-    fontWeight: '800',
   },
   desc: {
+    ...typography.regular,
     marginTop: 6,
     color: colors.textMuted,
     fontSize: 12,

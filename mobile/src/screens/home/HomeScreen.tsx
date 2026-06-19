@@ -12,9 +12,10 @@ import HomeNoticeService from '../../components/home/HomeNoticeService';
 import AssetSummary from '../../components/home/AssetSummary';
 import QuickEntryRow from '../../components/home/QuickEntryRow';
 import TabbedMarketList from '../../components/home/TabbedMarketList';
+import HomeNewsFeed from '../../components/home/HomeNewsFeed';
 import type {RootStackParamList} from '../../navigation/types';
 import {useAuth} from '../../store/authStore';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 type RootNavigation = NativeStackNavigationProp<RootStackParamList>;
 
@@ -85,14 +86,15 @@ function LoggedInHome({userLabel}: {userLabel: string}) {
       <HomePromoCarousel />
       <SectionTitle title="行情榜单" action="更多" />
       <TabbedMarketList />
-      <SectionTitle title="公告与服务" />
-      <HomeNoticeService />
+      <SectionTitle title="公告与活动" />
+      <HomeNewsFeed />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   status: {
+    ...typography.regular,
     marginTop: 12,
     color: colors.textSubtle,
     fontSize: 12,
