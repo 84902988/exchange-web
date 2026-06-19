@@ -49,9 +49,12 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
     borderRadius: 6,
     backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: 'transparent',
   },
   activeTab: {
     backgroundColor: colors.primarySoft,
+    borderColor: 'rgba(214, 168, 50, 0.24)',
   },
   tabText: {
     ...typography.medium,

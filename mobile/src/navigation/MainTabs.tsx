@@ -1,6 +1,7 @@
 import React from 'react';
-import {StyleSheet, View} from 'react-native';
+import {Pressable, StyleSheet, View} from 'react-native';
 import {
+  type BottomTabBarButtonProps,
   createBottomTabNavigator,
   type BottomTabNavigationOptions,
 } from '@react-navigation/bottom-tabs';
@@ -45,6 +46,30 @@ function TabIcon({
   );
 }
 
+function TabBarButton({
+  accessibilityLabel,
+  accessibilityState,
+  children,
+  onLongPress,
+  onPress,
+  style,
+  testID,
+}: BottomTabBarButtonProps) {
+  return (
+    <Pressable
+      accessibilityLabel={accessibilityLabel}
+      accessibilityRole="button"
+      accessibilityState={accessibilityState}
+      android_ripple={{color: 'transparent'}}
+      onLongPress={onLongPress}
+      onPress={onPress}
+      style={style}
+      testID={testID}>
+      {children}
+    </Pressable>
+  );
+}
+
 const homeOptions: BottomTabNavigationOptions = {
   tabBarLabel: '首页',
   tabBarIcon: ({color, focused}) => (
@@ -86,6 +111,9 @@ export default function MainTabs() {
         headerShown: false,
         tabBarActiveTintColor: colors.tabActive,
         tabBarInactiveTintColor: colors.tabInactive,
+        tabBarActiveBackgroundColor: 'transparent',
+        tabBarInactiveBackgroundColor: 'transparent',
+        tabBarButton: TabBarButton,
         tabBarStyle: [
           styles.tabBar,
           {
@@ -126,13 +154,14 @@ const styles = StyleSheet.create({
   tabBarItem: {
     height: 52,
     paddingVertical: 3,
+    backgroundColor: 'transparent',
   },
   tabBarIcon: {
     marginTop: 1,
   },
   tabBarLabel: {
     ...typography.medium,
-    fontSize: 10,
+    fontSize: 11,
     marginTop: 1,
     marginBottom: 0,
   },
