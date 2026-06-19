@@ -2,70 +2,82 @@
 
 ## 已完成
 
-### P0：首页优化
+### Home / Markets
 
-- 检查未登录首页视觉
-- 检查登录后首页结构
-- 优化快捷入口
-- 优化公告 / 新闻 / 活动区
-- 优化行情榜单展示
-- 完成深色金色品牌主题
-
-### Markets V1
-
-- 行情页结构
-- 搜索栏
-- 分类 Tab
-- 总览 6 张行情卡
-- 股票 / 现货 / 合约 CFD / 链上交易分区
-- loading / error / empty / 搜索无结果
-- 数字格式优化
-- skeleton + stale snapshot + fallback 机制
+- 首页深色金色品牌主题
+- 首页未登录 / 登录后状态分层
+- Markets V1
+- mobile market snapshot + fallback 机制
+- 行情页搜索、分类、概览卡、分区列表和状态页
 
 ### Trade V1
 
 - 现货交易页 V1
 - 买入 / 卖出表单
-- 盘口
-- 更多功能 Sheet
-- 未登录可看公开行情、盘口、K线
+- 限价 / 市价
+- BBO 价格输入框内按钮
+- 盘口 7 + 7 固定档位
+- 轻量 B/S 买卖盘占比条
+- 原生 K线和全屏 Modal
 - 未登录不请求私有接口
 - 真实下单仍保留 TODO
 
-### 移动端原生 K线 V1
+### Contract V1
 
-- 蜡烛图
-- 周期切换：1m / 5m / 15m / 1h / 4h / 1d
-- MA5 / MA10 / MA20
-- 价格轴 / 时间轴 / 最新价标签
-- 主页面和 Modal 复用
-- 横向拖动查看历史 K线
+- 合约交易页 V1
+- 合约 quote / depth / kline / trades
+- 合约账户、持仓、订单、成交接口封装
+- 未登录不请求私有合约接口
+- 逐仓、10x、单向、开仓 / 平仓、开多 / 开空表单结构
+- 盘口 7 + 7 固定档位
+- 与 Trade 共用 `mobile/src/constants/tradingLayout.ts`
+- 真实合约下单仍保留 TODO
 
-## 已知问题
+### Assets V1
 
-- Markets 行情首屏仍然感觉慢，尚未完全收口
-- `/market/mobile/overview` 聚合快照已完成代码层改造，但实际体感仍需后续验证和优化
-- 本轮暂缓继续深挖行情性能
+- 总览 / 现货 / 合约 / 邀请 / 代理
+- `account-balances`
+- contract summary
+- invite overview
+- BD team overview
+- 未登录态简化
+- 快捷入口：充值 / 提现 / 划转 / 资金流水
 
-## 下一步
+## P0：真实交易提交联调
 
-### P1：Markets 性能继续优化
+1. 只读复核现货 `/order/create` 参数契约。
+2. 只读复核合约 `/contract/orders/open` 与 `/contract/orders/close-summary` 参数契约。
+3. 增加移动端提交前精度、余额、保证金和风险提示校验。
+4. 接入真实提交时必须避免假成功提示。
+5. 保持未登录不请求私有接口。
 
-1. 后端 mobile overview 预热 / 定时刷新缓存
-2. Redis last-good 命中率验证
-3. 移动端 AsyncStorage 持久化 stale snapshot，冷启动先展示上次数据
-4. Markets WebSocket ticker delta 增量更新
-5. 后端 iTick / 外部行情源慢路径拆分，不阻塞移动端首屏
-6. mobile overview 接口响应时间打点
+## P1：资产子页面
 
-### P2：Trade V1 接口收口
+1. 移动端充值页面。
+2. 移动端提现页面。
+3. 移动端划转页面。
+4. 移动端资金流水页面。
+5. 子页面接入前先复核现有后端接口，不新建 mobile backend。
 
-- 确认余额接口是否使用 `/asset/account-balances`
-- 当前委托 / 历史委托 / 我的成交真实接口核对
-- `/order/create` 下单接口接入前做只读契约复核
-- 保持未登录不请求私有接口
+## P2：资产估值与账户体验
 
-### P3：Contract / Assets 真实接口接入
+1. 非 USDT 币种估值。
+2. 资产汇率 / 标记价格来源复核。
+3. 账户分布图进一步产品化。
+4. 邀请 / 代理数据空态和错误态细化。
 
-- Contract V1 接入
-- Assets V1 接入
+## P3：体验验证
+
+1. 移动端整体真机验证。
+2. 移动端模拟器人工体验验证。
+3. Trade / Contract 首屏视觉复核。
+4. K线横向拖动和 Modal 交互复核。
+5. 未登录 / 已登录分支回归。
+
+## 延后事项
+
+- Markets 行情首屏体感继续优化。
+- mobile overview 预热 / 定时刷新缓存。
+- Redis last-good 命中率验证。
+- 移动端 AsyncStorage 持久化 stale snapshot。
+- WebSocket ticker delta 增量更新。
