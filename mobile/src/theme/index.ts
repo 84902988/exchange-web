@@ -20,6 +20,13 @@ export const colors = {
   text: '#F4F7F8',
   textMuted: '#8F9EA3',
   textSubtle: '#5E6B70',
+  marketBg: '#050505',
+  marketCard: '#14161B',
+  marketCardAlt: '#191B22',
+  marketLine: '#2A2D33',
+  marketText: '#F4F7F8',
+  marketMuted: '#8F9EA3',
+  marketSubtle: '#5E6B70',
   warning: '#F3B34A',
   white: '#FFFFFF',
   black: '#000000',
@@ -39,5 +46,11 @@ export const radius = {
   md: 8,
   lg: 12,
 };
+
+export const layout = {
+  tabBarBaseHeight: 60,
+  tabBarMinBottomInset: 8,
+  tabBarContentInset: 24,
+} as const;
 
 export {fontFamily, fontFiles, typography} from './typography';
