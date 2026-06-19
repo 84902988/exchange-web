@@ -1,22 +1,46 @@
 import React from 'react';
 import {Pressable, StyleSheet, Text, View} from 'react-native';
-import {colors} from '../../theme';
+import {Crown, Handshake, Landmark, UserPlus} from 'lucide-react-native';
+import type {LucideIcon} from 'lucide-react-native';
+import {colors, typography} from '../../theme';
 
-const entries = ['邀请中心', '代理好友', '理财活动', '账单', 'IPO Prime'];
+type QuickEntry = {
+  title: string;
+  description: string;
+  Icon: LucideIcon;
+};
+
+const entries: QuickEntry[] = [
+  {title: '邀请好友', description: '好友奖励', Icon: UserPlus},
+  {title: '代理', description: '团队权益', Icon: Handshake},
+  {title: 'VIP', description: '等级权益', Icon: Crown},
+  {title: '委员会', description: '治理入口', Icon: Landmark},
+];
 
 export default function QuickEntryRow() {
   return (
     <View style={styles.row}>
-      {entries.map(item => (
-        <Pressable key={item} style={styles.item}>
-          <View style={styles.icon}>
-            <Text style={styles.iconText}>{item.slice(0, 1)}</Text>
-          </View>
-          <Text style={styles.label} numberOfLines={1}>
-            {item}
-          </Text>
-        </Pressable>
-      ))}
+      {entries.map(item => {
+        const Icon = item.Icon;
+
+        return (
+          <Pressable
+            accessibilityLabel={`${item.title}, ${item.description}`}
+            accessibilityRole="button"
+            key={item.title}
+            style={styles.item}>
+            <View style={styles.icon}>
+              <Icon color={colors.primary} size={20} strokeWidth={2.2} />
+            </View>
+            <Text style={styles.label} numberOfLines={1}>
+              {item.title}
+            </Text>
+            <Text style={styles.desc} numberOfLines={1}>
+              {item.description}
+            </Text>
+          </Pressable>
+        );
+      })}
     </View>
   );
 }
@@ -25,31 +49,32 @@ const styles = StyleSheet.create({
   row: {
     marginTop: 16,
     flexDirection: 'row',
-    justifyContent: 'space-between',
+    gap: 9,
   },
   item: {
-    width: '19%',
+    flex: 1,
     alignItems: 'center',
   },
   icon: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: colors.card,
     borderWidth: 1,
     borderColor: colors.line,
   },
-  iconText: {
-    color: colors.primary,
-    fontSize: 14,
-    fontWeight: '900',
-  },
   label: {
-    marginTop: 8,
-    color: colors.textMuted,
+    ...typography.bold,
+    marginTop: 7,
+    color: colors.text,
     fontSize: 11,
-    fontWeight: '700',
+  },
+  desc: {
+    ...typography.medium,
+    marginTop: 3,
+    color: colors.textSubtle,
+    fontSize: 10,
   },
 });
