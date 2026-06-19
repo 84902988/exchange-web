@@ -80,7 +80,7 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: colors.line,
+    borderColor: 'rgba(214, 168, 50, 0.14)',
   },
   serviceRow: {
     minHeight: 66,
@@ -92,7 +92,7 @@ const styles = StyleSheet.create({
   },
   divider: {
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: 'rgba(255,255,255,0.06)',
+    borderTopColor: 'rgba(255,255,255,0.07)',
   },
   iconWrap: {
     width: 34,
@@ -100,7 +100,9 @@ const styles = StyleSheet.create({
     borderRadius: 17,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.primarySoft,
+    backgroundColor: 'rgba(214, 168, 50, 0.17)',
+    borderWidth: 1,
+    borderColor: 'rgba(214, 168, 50, 0.2)',
   },
   serviceCopy: {
     flex: 1,
@@ -120,9 +122,9 @@ const styles = StyleSheet.create({
     marginHorizontal: 12,
     marginBottom: 12,
     borderRadius: 10,
-    backgroundColor: colors.bgElevated,
+    backgroundColor: 'rgba(155, 116, 30, 0.24)',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.05)',
+    borderColor: 'rgba(214, 168, 50, 0.13)',
   },
   noticeRow: {
     minHeight: 36,
@@ -133,13 +135,13 @@ const styles = StyleSheet.create({
   },
   noticeDivider: {
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: 'rgba(255,255,255,0.05)',
+    borderTopColor: 'rgba(214, 168, 50, 0.12)',
   },
   noticeDot: {
     width: 5,
     height: 5,
     borderRadius: 3,
-    backgroundColor: colors.primary,
+    backgroundColor: colors.gold,
   },
   noticeText: {
     flex: 1,

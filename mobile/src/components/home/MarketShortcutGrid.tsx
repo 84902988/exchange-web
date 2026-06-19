@@ -39,25 +39,25 @@ const styles = StyleSheet.create({
   },
   card: {
     width: '48.5%',
-    minHeight: 92,
-    padding: 12,
+    minHeight: 96,
+    padding: 13,
     borderRadius: 8,
-    backgroundColor: colors.card,
+    backgroundColor: '#15171D',
     borderWidth: 1,
-    borderColor: colors.line,
+    borderColor: 'rgba(214, 168, 50, 0.12)',
   },
   title: {
-    color: colors.textMuted,
+    color: colors.textSubtle,
     fontSize: 12,
   },
   name: {
-    marginTop: 8,
+    marginTop: 7,
     color: colors.text,
     fontSize: 16,
     fontWeight: '800',
   },
   row: {
-    marginTop: 10,
+    marginTop: 12,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -65,7 +65,7 @@ const styles = StyleSheet.create({
   price: {
     ...typography.number,
     color: colors.text,
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: '700',
   },
   change: {

@@ -92,7 +92,7 @@ const styles = StyleSheet.create({
   },
   activeTab: {
     backgroundColor: colors.primarySoft,
-    borderColor: 'rgba(0, 214, 163, 0.28)',
+    borderColor: 'rgba(214, 168, 50, 0.28)',
   },
   tabText: {
     ...typography.medium,
@@ -107,7 +107,7 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: colors.line,
+    borderColor: 'rgba(214, 168, 50, 0.14)',
   },
   feedRow: {
     minHeight: 54,
