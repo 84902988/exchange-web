@@ -14,7 +14,7 @@ type PromoItem = {
 const promos: PromoItem[] = [
   {
     title: '全民冠军杯',
-    subtitle: '参与交易活动，瓜分 250,000 USDT 奖池',
+    subtitle: '参与交易活动，瓜分250,000 USDT 奖池',
     tag: '限时活动',
     Icon: Trophy,
   },
@@ -92,9 +92,9 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     paddingHorizontal: 14,
     paddingVertical: 12,
-    backgroundColor: '#111827',
+    backgroundColor: '#151424',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.06)',
+    borderColor: 'rgba(214, 168, 50, 0.16)',
   },
   glow: {
     position: 'absolute',
@@ -103,7 +103,7 @@ const styles = StyleSheet.create({
     width: 112,
     height: 112,
     borderRadius: 56,
-    backgroundColor: 'rgba(0, 214, 163, 0.12)',
+    backgroundColor: 'rgba(214, 168, 50, 0.48)',
   },
   iconWrap: {
     width: 46,
@@ -111,9 +111,9 @@ const styles = StyleSheet.create({
     borderRadius: 23,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(0, 214, 163, 0.1)',
+    backgroundColor: 'rgba(214, 168, 50, 0.26)',
     borderWidth: 1,
-    borderColor: 'rgba(0, 214, 163, 0.24)',
+    borderColor: 'rgba(214, 168, 50, 0.34)',
   },
   copy: {
     flex: 1,
@@ -132,7 +132,7 @@ const styles = StyleSheet.create({
     color: colors.primary,
     fontSize: 10,
     fontWeight: '700',
-    backgroundColor: 'rgba(0, 214, 163, 0.1)',
+    backgroundColor: 'rgba(214, 168, 50, 0.16)',
   },
   page: {
     color: colors.textSubtle,

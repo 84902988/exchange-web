@@ -52,7 +52,7 @@ const styles = StyleSheet.create({
     fontSize: 15,
   },
   primaryText: {
-    color: colors.black,
+    color: colors.white,
   },
   text: {
     color: colors.text,

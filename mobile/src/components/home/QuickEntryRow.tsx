@@ -30,7 +30,7 @@ export default function QuickEntryRow() {
             key={item.title}
             style={styles.item}>
             <View style={styles.icon}>
-              <Icon color={colors.primary} size={20} strokeWidth={2.2} />
+              <Icon color={colors.gold} size={20} strokeWidth={2.2} />
             </View>
             <Text style={styles.label} numberOfLines={1}>
               {item.title}
@@ -63,7 +63,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: colors.line,
+    borderColor: 'rgba(214, 168, 50, 0.16)',
   },
   label: {
     ...typography.bold,
