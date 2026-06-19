@@ -94,6 +94,8 @@ MAINSTREAM_PAIR_BASES = {"BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX
 PLATFORM_PAIR_BASES = {"MFC", "RCB"}
 RWA_PAIR_BASES = {"MFC", "IGC", "CREG", "BON"}
 CONTRACT_PAIR_CATEGORIES = {"CONTRACT", "FOREX", "METAL", "COMMODITY", "INDEX", "ETF"}
+MOBILE_OVERVIEW_SYMBOLS = ["BTCUSDT", "RCBUSDT", "NAS100", "XAUUSD", "ETHUSDT", "EURUSD"]
+MOBILE_OVERVIEW_SECTION_LIMIT = 5
 
 
 def _decimal_to_str(v) -> str:
@@ -2014,6 +2016,159 @@ def get_market_pairs(
         "total": total,
         "page": normalized_page,
         "page_size": normalized_page_size,
+    }
+
+
+def _mobile_market_category(pair_data: Dict[str, Any]) -> str:
+    symbol = str(pair_data.get("symbol") or "").upper().strip()
+    asset_type = str(pair_data.get("asset_type") or "").upper().strip()
+    market_category = str(pair_data.get("market_category") or "").upper().strip()
+    market_sub_category = str(pair_data.get("market_sub_category") or "").upper().strip()
+    display_category = str(pair_data.get("display_category") or "").upper().strip()
+    values = {asset_type, market_category, market_sub_category, display_category}
+
+    if "STOCK" in values or any("STOCK" in value for value in values):
+        return "stocks"
+    if (
+        "RWA" in values
+        or "ONCHAIN" in values
+        or any("ONCHAIN" in value for value in values)
+        or symbol in {"SPYX", "COAI", "AGT", "CLO", "TRIA"}
+    ):
+        return "onchain"
+    if (
+        values.intersection({"CONTRACT", "CFD", "INDEX", "FOREX", "METAL", "COMMODITY", "ETF"})
+        or symbol in {"NAS100", "XAUUSD", "XAGUSD", "EURUSD", "USOUSD"}
+    ):
+        return "contract_cfd"
+    return "spot"
+
+
+def _mobile_display_symbol(pair_data: Dict[str, Any]) -> str:
+    symbol = str(pair_data.get("symbol") or "").upper().strip()
+    display = str(pair_data.get("display_symbol") or pair_data.get("base_asset") or "").strip()
+    if display:
+        return display.replace("/USDT", "").replace("USDT", "")
+    if symbol.endswith("USDT"):
+        return symbol[:-4]
+    return symbol
+
+
+def _mobile_market_name(pair_data: Dict[str, Any]) -> str:
+    symbol = str(pair_data.get("symbol") or "").upper().strip()
+    display_symbol = _mobile_display_symbol(pair_data)
+    known_names = {
+        "BTCUSDT": "Bitcoin",
+        "RCBUSDT": "Royal Coin",
+        "ETHUSDT": "Ethereum",
+        "NAS100": "NASDAQ 100",
+        "XAUUSD": "Gold US Dollar",
+        "XAGUSD": "Silver US Dollar",
+        "EURUSD": "Euro vs US Dollar",
+        "USOUSD": "WTI Crude Oil Cash",
+        "NVDA": "NVIDIA",
+        "TSLA": "Tesla",
+    }
+    return known_names.get(symbol) or str(
+        pair_data.get("display_name")
+        or pair_data.get("name")
+        or pair_data.get("spot_logo_alt")
+        or pair_data.get("external_symbol")
+        or display_symbol
+    ).strip()
+
+
+def _mobile_market_item(pair_data: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(pair_data.get("symbol") or "").upper().strip()
+    return {
+        "symbol": symbol,
+        "display_symbol": _mobile_display_symbol(pair_data),
+        "name": _mobile_market_name(pair_data),
+        "category": _mobile_market_category(pair_data),
+        "price": str(pair_data.get("last_price") or pair_data.get("price") or "0"),
+        "change_pct": str(
+            pair_data.get("price_change_percent_24h")
+            or pair_data.get("change_24h")
+            or pair_data.get("price_change_percent")
+            or "0"
+        ),
+        "volume": str(pair_data.get("quote_volume_24h") or pair_data.get("volume_24h") or "0"),
+        "price_precision": int(pair_data.get("price_precision") or 8),
+        "amount_precision": int(pair_data.get("amount_precision") or 8),
+        "source": str(pair_data.get("source") or pair_data.get("data_source") or "api"),
+        "stale": bool(pair_data.get("stale") or pair_data.get("is_stale")),
+        "updated_at": pair_data.get("updated_at") or pair_data.get("cache_updated_at"),
+    }
+
+
+def _mobile_sort_key(item: Dict[str, Any]) -> Tuple[int, int, str]:
+    symbol = str(item.get("symbol") or "").upper()
+    try:
+        change_weight = int(abs(_to_decimal(item.get("change_pct"))) * Decimal("100"))
+    except Exception:
+        change_weight = 0
+    priority = MOBILE_OVERVIEW_SYMBOLS.index(symbol) if symbol in MOBILE_OVERVIEW_SYMBOLS else 999
+    return (priority, -change_weight, symbol)
+
+
+def get_mobile_market_overview(db: Session) -> Dict[str, Any]:
+    pair_payload = get_market_pairs(
+        db=db,
+        market_type="all",
+        category="all",
+        quote="all",
+        page=1,
+        page_size=PAIR_PAGE_SIZE_MAX,
+    )
+    pair_rows = pair_payload.get("items") if isinstance(pair_payload, dict) else []
+    ticker_rows = get_market_tickers(db=db)
+
+    by_symbol: Dict[str, Dict[str, Any]] = {}
+    for row in (pair_rows if isinstance(pair_rows, list) else []):
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if symbol:
+            by_symbol[symbol] = dict(row)
+
+    for row in (ticker_rows if isinstance(ticker_rows, list) else []):
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        by_symbol[symbol] = {**by_symbol.get(symbol, {}), **row}
+
+    items = [_mobile_market_item(item) for item in by_symbol.values()]
+    items = [item for item in items if item.get("symbol")]
+    items.sort(key=_mobile_sort_key)
+
+    overview_cards = [item for symbol in MOBILE_OVERVIEW_SYMBOLS for item in items if item["symbol"] == symbol]
+    if len(overview_cards) < 6:
+        seen = {item["symbol"] for item in overview_cards}
+        overview_cards.extend(item for item in items if item["symbol"] not in seen)
+    overview_cards = overview_cards[:6]
+
+    section_configs = [
+        ("stocks", "股票"),
+        ("spot", "现货"),
+        ("contract_cfd", "合约 / CFD"),
+        ("onchain", "链上交易"),
+    ]
+    sections = []
+    for key, title in section_configs:
+        section_items = [item for item in items if item.get("category") == key]
+        section_items = sorted(section_items, key=_mobile_sort_key)[:MOBILE_OVERVIEW_SECTION_LIMIT]
+        sections.append({"key": key, "title": title, "items": section_items})
+
+    now = datetime.utcnow().replace(microsecond=0)
+    return {
+        "server_time": int(time.time() * 1000),
+        "updated_at": now.isoformat() + "Z",
+        "stale": any(bool(item.get("stale")) for item in items),
+        "source": "live",
+        "overview_cards": overview_cards,
+        "sections": sections,
     }
 
 

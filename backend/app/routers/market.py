@@ -13,8 +13,15 @@ from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal, get_db
 from app.schemas.market import DepthResponse, KlineResponse, TradesResponse
-from app.services.market import get_depth, get_klines, get_market_pairs, get_market_tickers, get_trades
-from app.services.market_cache import cache_fetch_json, market_cache_key
+from app.services.market import (
+    get_depth,
+    get_klines,
+    get_mobile_market_overview,
+    get_market_pairs,
+    get_market_tickers,
+    get_trades,
+)
+from app.services.market_cache import cache_fetch_json, cache_get_json, market_cache_key
 from app.services.market_ws import market_ws_manager
 from app.services.reference_overlay_service import get_reference_overlay_for_symbol
 
@@ -27,6 +34,8 @@ logger = logging.getLogger(__name__)
 MARKET_TICKER_CACHE_VERSION = "1"
 MARKET_TICKER_FIELD_VERSION = "ticker_fields_v2"
 MARKET_TICKER_PROVIDER_VERSION = "default"
+MARKET_MOBILE_OVERVIEW_CACHE_VERSION = "1"
+MARKET_MOBILE_OVERVIEW_FIELD_VERSION = "mobile_overview_v1"
 
 
 @router.get(
@@ -153,6 +162,40 @@ def get_pairs(
     except Exception:
         logger.exception("get pairs failed")
         raise HTTPException(status_code=500, detail="get pairs failed")
+
+
+@router.get("/mobile/overview", summary="Get mobile market overview snapshot")
+def mobile_overview(db: Session = Depends(get_db)):
+    cache_key = market_cache_key(
+        "market:mobile_overview",
+        version=MARKET_MOBILE_OVERVIEW_CACHE_VERSION,
+        market_type="all",
+        category="mobile",
+        field_version=MARKET_MOBILE_OVERVIEW_FIELD_VERSION,
+    )
+    try:
+        active_cached = cache_get_json(cache_key) is not None
+        payload = cache_fetch_json(
+            cache_key,
+            10,
+            lambda: get_mobile_market_overview(db=db),
+            last_good_ttl_seconds=24 * 60 * 60,
+        )
+        if isinstance(payload, dict) and payload.get("is_stale"):
+            payload = {
+                **payload,
+                "stale": True,
+                "source": "last_good",
+            }
+        elif isinstance(payload, dict):
+            payload = {
+                **payload,
+                "source": "cache" if active_cached else payload.get("source", "live"),
+            }
+        return payload
+    except Exception:
+        logger.exception("get mobile market overview failed")
+        raise HTTPException(status_code=500, detail="get mobile market overview failed")
 
 
 @router.get("/reference-overlays", summary="Get chart reference overlay config")

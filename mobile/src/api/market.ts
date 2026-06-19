@@ -1,5 +1,9 @@
 import {apiClient} from './client';
 
+const MARKET_PUBLIC_CACHE_TTL_MS = 5000;
+const publicMarketCache = new Map<string, {expiresAt: number; payload: unknown}>();
+let mobileMarketsCache: {items: MarketInstrument[]; updatedAt: number} | null = null;
+
 export type MarketCategoryKey =
   | 'overview'
   | 'favorites'
@@ -18,6 +22,7 @@ export type MarketInstrument = {
   changePercent: number | null;
   pricePrecision: number;
   source: 'api' | 'fallback';
+  overviewRank?: number;
 };
 
 type MarketPairPayload = {
@@ -26,6 +31,35 @@ type MarketPairPayload = {
   page?: number;
   page_size?: number;
 };
+
+type MobileMarketOverviewSectionPayload = {
+  key?: string;
+  title?: string;
+  items?: unknown[];
+};
+
+type MobileMarketOverviewPayload = {
+  server_time?: number;
+  updated_at?: string;
+  stale?: boolean;
+  source?: string;
+  overview_cards?: unknown[];
+  sections?: MobileMarketOverviewSectionPayload[];
+};
+
+async function getCachedPublic<T>(url: string): Promise<T> {
+  const now = Date.now();
+  const cached = publicMarketCache.get(url);
+  if (cached && cached.expiresAt > now) {
+    return cached.payload as T;
+  }
+  const payload = await apiClient.get<T>(url);
+  publicMarketCache.set(url, {
+    expiresAt: now + MARKET_PUBLIC_CACHE_TTL_MS,
+    payload,
+  });
+  return payload;
+}
 
 const REQUIRED_OVERVIEW_SYMBOLS = [
   'BTCUSDT',
@@ -343,6 +377,7 @@ function getDisplaySymbol(row: Record<string, unknown>, symbol: string) {
 
 function getCategory(row: Record<string, unknown>, symbol: string) {
   const category = readString(row, [
+    'category',
     'market_category',
     'marketCategory',
     'asset_type',
@@ -355,6 +390,10 @@ function getCategory(row: Record<string, unknown>, symbol: string) {
     'marketSubCategory',
   ]).toUpperCase();
 
+  if (category === 'STOCKS') return 'stock';
+  if (category === 'SPOT') return 'crypto';
+  if (category === 'CONTRACT_CFD') return 'cfd';
+  if (category === 'ONCHAIN') return 'onchain';
   if (
     category.includes('STOCK') ||
     subCategory.includes('STOCK') ||
@@ -393,6 +432,7 @@ function mapInstrument(row: unknown): MarketInstrument | null {
 
   const price = readNumber(row, ['last_price', 'price', 'last', 'close']);
   const changePercent = readNumber(row, [
+    'change_pct',
     'price_change_percent_24h',
     'change_24h',
     'percentChange24h',
@@ -421,6 +461,8 @@ function mapInstrument(row: unknown): MarketInstrument | null {
     changePercent,
     pricePrecision: readPrecision(row, price),
     source: 'api',
+    overviewRank:
+      readNumber(row, ['overview_rank', 'overviewRank']) ?? undefined,
   };
 }
 
@@ -442,6 +484,39 @@ function mergeRows(pairs: unknown[], tickers: unknown[]) {
   return Array.from(bySymbol.values());
 }
 
+function readMobileOverviewRows(payload: unknown) {
+  if (!isRecord(payload)) return [];
+  const rows: unknown[] = [];
+  if (Array.isArray(payload.overview_cards)) {
+    rows.push(
+      ...payload.overview_cards.map((item, index) =>
+        isRecord(item) ? {...item, overview_rank: index} : item,
+      ),
+    );
+  }
+  const sections = payload.sections;
+  if (Array.isArray(sections)) {
+    for (const section of sections) {
+      if (isRecord(section) && Array.isArray(section.items)) {
+        rows.push(...section.items);
+      }
+    }
+  }
+  return rows;
+}
+
+function mapMobileOverview(payload: unknown) {
+  const rows = readMobileOverviewRows(payload);
+  if (!rows.length) return [];
+
+  const bySymbol = new Map<string, MarketInstrument>();
+  for (const row of rows) {
+    const mapped = mapInstrument(row);
+    if (mapped) bySymbol.set(mapped.symbol, mapped);
+  }
+  return Array.from(bySymbol.values());
+}
+
 function withRequiredOverviewRows(items: MarketInstrument[]) {
   const bySymbol = new Map(items.map(item => [item.symbol, item]));
 
@@ -458,6 +533,13 @@ function withRequiredOverviewRows(items: MarketInstrument[]) {
 }
 
 export function getOverviewMarkets(items: MarketInstrument[]) {
+  const ranked = items
+    .filter(item => typeof item.overviewRank === 'number')
+    .sort((a, b) => (a.overviewRank || 0) - (b.overviewRank || 0));
+  if (ranked.length > 0) {
+    return ranked.slice(0, 6);
+  }
+
   const bySymbol = new Map(items.map(item => [item.symbol, item]));
   return REQUIRED_OVERVIEW_SYMBOLS.map(symbol => bySymbol.get(symbol)).filter(
     (item): item is MarketInstrument => Boolean(item),
@@ -479,11 +561,54 @@ export function formatMarketPercent(value: number | null) {
   return `${prefix}${value.toFixed(2)}%`;
 }
 
-export async function fetchMobileMarkets() {
+export function getCachedMobileMarkets() {
+  return mobileMarketsCache?.items ?? [];
+}
+
+async function fetchMobileMarketsLegacy() {
   const [pairPayload, tickerPayload] = await Promise.all([
-    apiClient.get<MarketPairPayload>('/market/pairs?market_type=all&page_size=100'),
-    apiClient.get<unknown[]>('/market/tickers'),
+    getCachedPublic<MarketPairPayload>('/market/pairs?market_type=all&page_size=100'),
+    getCachedPublic<unknown[]>('/market/tickers'),
   ]);
-  const rows = mergeRows(readRows(pairPayload), readRows(tickerPayload));
-  return withRequiredOverviewRows(rows);
+  return mergeRows(readRows(pairPayload), readRows(tickerPayload));
+}
+
+export async function fetchMobileMarkets() {
+  const now = Date.now();
+  if (
+    mobileMarketsCache &&
+    now - mobileMarketsCache.updatedAt < MARKET_PUBLIC_CACHE_TTL_MS
+  ) {
+    return mobileMarketsCache.items;
+  }
+
+  let rows: MarketInstrument[] = [];
+  let usedOverviewSnapshot = false;
+  let usedLegacyMarkets = false;
+
+  try {
+    const overviewPayload = await getCachedPublic<MobileMarketOverviewPayload>(
+      '/market/mobile/overview',
+    );
+    rows = mapMobileOverview(overviewPayload);
+    usedOverviewSnapshot = rows.length > 0;
+
+    if (!usedOverviewSnapshot) {
+      rows = await fetchMobileMarketsLegacy();
+      usedLegacyMarkets = rows.length > 0;
+    }
+  } catch {
+    rows = await fetchMobileMarketsLegacy();
+    usedLegacyMarkets = rows.length > 0;
+  }
+
+  // TODO: remove fallback catalog rows once the backend mobile snapshot is
+  // reliable and the legacy public market endpoints always return the full
+  // mobile catalog. These rows are only for unavailable/empty API responses.
+  const items =
+    usedOverviewSnapshot || usedLegacyMarkets
+      ? rows
+      : withRequiredOverviewRows(rows);
+  mobileMarketsCache = {items, updatedAt: Date.now()};
+  return items;
 }
