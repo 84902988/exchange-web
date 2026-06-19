@@ -20,10 +20,9 @@ import TradeScreen from '../screens/trade/TradeScreen';
 import ContractScreen from '../screens/contract/ContractScreen';
 import AssetsScreen from '../screens/assets/AssetsScreen';
 import type {MainTabParamList} from './types';
-import {colors, typography} from '../theme';
+import {colors, layout, typography} from '../theme';
 
 const Tab = createBottomTabNavigator<MainTabParamList>();
-const TAB_BAR_BASE_HEIGHT = 60;
 const TAB_ICON_SIZE = 22;
 
 function TabIcon({
@@ -103,7 +102,7 @@ const assetsOptions: BottomTabNavigationOptions = {
 
 export default function MainTabs() {
   const insets = useSafeAreaInsets();
-  const bottomPadding = Math.max(insets.bottom, 8);
+  const bottomPadding = Math.max(insets.bottom, layout.tabBarMinBottomInset);
 
   return (
     <Tab.Navigator
@@ -117,7 +116,7 @@ export default function MainTabs() {
         tabBarStyle: [
           styles.tabBar,
           {
-            height: TAB_BAR_BASE_HEIGHT + bottomPadding,
+            height: layout.tabBarBaseHeight + bottomPadding,
             paddingBottom: bottomPadding,
           },
         ],

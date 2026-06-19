@@ -48,6 +48,6 @@ export const typography = {
     lineHeight: 16,
   },
   number: {
-    fontVariant: ['tabular-nums'] as const,
+    fontVariant: ['tabular-nums'] as TextStyle['fontVariant'],
   },
 };

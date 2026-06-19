@@ -1,5 +1,5 @@
 import React from 'react';
-import {Image, StyleSheet, Text, View} from 'react-native';
+import {Image, StyleSheet, Text, View, type ImageStyle} from 'react-native';
 import PrimaryButton from '../common/PrimaryButton';
 import {colors, typography} from '../../theme';
 
@@ -14,7 +14,11 @@ export default function HeroBanner({onLogin, onRegister}: Props) {
   return (
     <View style={styles.hero}>
       <View style={styles.glow} />
-      <Image source={brandLogo} style={styles.logo} resizeMode="contain" />
+      <Image
+        source={brandLogo}
+        style={styles.logo as ImageStyle}
+        resizeMode="contain"
+      />
       <Text style={styles.kicker}>WELCOME BONUS</Text>
       <Text style={styles.title}>立即注册，领取6200 USDT</Text>
       <Text style={styles.subtitle}>多市场行情、现货、合约与资产入口已就绪</Text>
