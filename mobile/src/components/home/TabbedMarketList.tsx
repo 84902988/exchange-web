@@ -1,7 +1,7 @@
 import React from 'react';
 import {Pressable, StyleSheet, Text, View} from 'react-native';
 import MarketRow from '../common/MarketRow';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 const tabs = ['自选', '热门', '涨幅榜', '跌幅榜', '新币榜', '成交额榜'];
 
@@ -40,6 +40,7 @@ export default function TabbedMarketList() {
 const styles = StyleSheet.create({
   tabs: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 8,
     marginBottom: 8,
   },
@@ -53,9 +54,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primarySoft,
   },
   tabText: {
+    ...typography.medium,
     color: colors.textMuted,
     fontSize: 12,
-    fontWeight: '700',
   },
   activeText: {
     color: colors.primary,

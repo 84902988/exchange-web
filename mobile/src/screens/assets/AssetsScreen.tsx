@@ -105,15 +105,14 @@ const styles = StyleSheet.create({
     borderColor: colors.line,
   },
   guestTitle: {
+    ...typography.heavy,
     color: colors.text,
     fontSize: 20,
-    fontWeight: '900',
   },
   guestDesc: {
+    ...typography.body,
     marginTop: 10,
     color: colors.textMuted,
-    fontSize: 13,
-    lineHeight: 20,
   },
   guestActions: {
     marginTop: 18,
@@ -132,29 +131,32 @@ const styles = StyleSheet.create({
     borderColor: colors.line,
   },
   label: {
+    ...typography.regular,
     color: colors.textMuted,
     fontSize: 12,
   },
   userName: {
+    ...typography.heavy,
     marginTop: 10,
     color: colors.text,
     fontSize: 20,
-    fontWeight: '900',
   },
   userMeta: {
+    ...typography.regular,
     ...typography.number,
     marginTop: 8,
     color: colors.textSubtle,
     fontSize: 12,
   },
   total: {
+    ...typography.heavy,
     ...typography.number,
     marginTop: 10,
     color: colors.text,
     fontSize: 30,
-    fontWeight: '900',
   },
   placeholder: {
+    ...typography.regular,
     marginTop: 8,
     color: colors.textSubtle,
     fontSize: 12,
@@ -173,9 +175,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primarySoft,
   },
   actionText: {
+    ...typography.bold,
     color: colors.primary,
     fontSize: 12,
-    fontWeight: '800',
   },
   accountList: {
     borderTopWidth: 1,
@@ -190,15 +192,15 @@ const styles = StyleSheet.create({
     borderBottomColor: colors.line,
   },
   accountName: {
+    ...typography.bold,
     color: colors.text,
     fontSize: 15,
-    fontWeight: '800',
   },
   accountAmount: {
+    ...typography.medium,
     ...typography.number,
     color: colors.textMuted,
     fontSize: 14,
-    fontWeight: '700',
   },
   logoutButton: {
     marginTop: 18,

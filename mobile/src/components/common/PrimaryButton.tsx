@@ -1,6 +1,6 @@
 import React from 'react';
 import {Pressable, StyleSheet, Text} from 'react-native';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 type Props = {
   title: string;
@@ -48,8 +48,8 @@ const styles = StyleSheet.create({
     borderColor: colors.line,
   },
   label: {
+    ...typography.bold,
     fontSize: 15,
-    fontWeight: '800',
   },
   primaryText: {
     color: colors.black,
