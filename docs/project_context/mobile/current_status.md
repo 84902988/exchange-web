@@ -17,6 +17,9 @@
 - InfoFeed 已移除
 - mobile 品牌基础提交：`d2464af`
 - 移动端调试脚本提交：`b9b17e2`
+- 移动端首页已完成 PPT 第 2 页右侧黄色主题优化
+- 首页黄色主题提交：`a2959c7 feat(mobile): refine home gold theme`
+- 黄色主题细节：Hero Logo 不再压文字，注册按钮白字，底部 Tab active 金色且无大灰色圆背景
 
 ## 当前可用调试命令
 
@@ -26,5 +29,4 @@ powershell -ExecutionPolicy Bypass -File .\scripts\mobile_dev_start.ps1
 
 ## 当前待做
 
-- 首页体验继续优化
-- 然后做 Markets V1 真实行情接入
+- Markets V1 真实行情接入
