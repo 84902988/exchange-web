@@ -1,25 +1,30 @@
 import React from 'react';
 import {Pressable, StyleSheet, Text, TextInput, View} from 'react-native';
-import {formatSpotNumber} from '../../api/spot';
+import {formatContractNumber, type ContractOrderType} from '../../api/contract';
 import {colors, typography} from '../../theme';
 
-export type TradeSide = 'BUY' | 'SELL';
-export type TradeOrderType = 'LIMIT' | 'MARKET';
+export type ContractActionMode = 'OPEN' | 'CLOSE';
+export type ContractDirection = 'LONG' | 'SHORT';
 
 type Props = {
-  side: TradeSide;
-  orderType: TradeOrderType;
+  actionMode: ContractActionMode;
+  direction: ContractDirection;
+  orderType: ContractOrderType;
   price: string;
-  amount: string;
-  availableText: string;
-  quoteAsset: string;
-  baseAsset: string;
-  isLoggedIn: boolean;
+  quantity: string;
+  leverage: number;
+  availableMargin: number | null;
+  equity: number | null;
   lastPrice: number | null;
-  onSideChange: (side: TradeSide) => void;
-  onOrderTypeChange: (type: TradeOrderType) => void;
+  markPrice: number | null;
+  spreadFeePrice: number | null | undefined;
+  pricePrecision: number;
+  isLoggedIn: boolean;
+  onActionModeChange: (mode: ContractActionMode) => void;
+  onDirectionChange: (direction: ContractDirection) => void;
+  onOrderTypeChange: (type: ContractOrderType) => void;
   onPriceChange: (price: string) => void;
-  onAmountChange: (amount: string) => void;
+  onQuantityChange: (quantity: string) => void;
   onPercentPress: (percent: number) => void;
   onBboPress: () => void;
   onLoginPress: () => void;
@@ -28,47 +33,96 @@ type Props = {
 
 const percentSteps = [25, 50, 75, 100];
 
-function TradeOrderForm({
-  side,
+function ContractOrderForm({
+  actionMode,
+  direction,
   orderType,
   price,
-  amount,
-  availableText,
-  quoteAsset,
-  baseAsset,
-  isLoggedIn,
+  quantity,
+  leverage,
+  availableMargin,
+  equity,
   lastPrice,
-  onSideChange,
+  markPrice,
+  spreadFeePrice,
+  pricePrecision,
+  isLoggedIn,
+  onActionModeChange,
+  onDirectionChange,
   onOrderTypeChange,
   onPriceChange,
-  onAmountChange,
+  onQuantityChange,
   onPercentPress,
   onBboPress,
   onLoginPress,
   onSubmitPress,
 }: Props) {
-  const buy = side === 'BUY';
-  const submitText = isLoggedIn ? `${buy ? '买入' : '卖出'} ${baseAsset}` : '登录';
+  const long = direction === 'LONG';
+  const referencePrice =
+    orderType === 'MARKET' ? markPrice ?? lastPrice : Number(price.replace(/,/g, ''));
+  const quantityNumber = Number(quantity);
+  const referenceValue = referencePrice ?? NaN;
+  const notional =
+    Number.isFinite(referenceValue) && Number.isFinite(quantityNumber)
+      ? referenceValue * quantityNumber
+      : null;
+  const estimatedMargin = notional === null ? null : notional / leverage;
+  const liquidationPrice = getEstimatedLiquidationPrice(
+    referencePrice,
+    direction,
+    leverage,
+  );
+  const actionLabel =
+    actionMode === 'OPEN'
+      ? long
+        ? '买入开多'
+        : '卖出开空'
+      : long
+        ? '平多'
+        : '平空';
+  const submitText = isLoggedIn ? actionLabel : '登录';
   const submitStyle = !isLoggedIn
     ? styles.loginButton
-    : buy
-      ? styles.buyButton
-      : styles.sellButton;
-  const tradeValue = getTradeValue(price, amount, orderType, lastPrice);
+    : long
+      ? styles.longButton
+      : styles.shortButton;
 
   return (
     <View style={styles.card}>
       <View style={styles.topSection}>
-        <View style={styles.sideTabs}>
+        <View style={styles.modeRow}>
+          <Tag label="逐仓" />
+          <Tag label={`${leverage}x`} active />
+          <Tag label="单向" />
+        </View>
+
+        <View style={styles.actionTabs}>
           <Pressable
-            style={[styles.sideTab, buy ? styles.buyActive : null]}
-            onPress={() => onSideChange('BUY')}>
-            <Text style={[styles.sideText, buy ? styles.activeText : null]}>买入</Text>
+            style={[styles.actionTab, actionMode === 'OPEN' ? styles.actionActive : null]}
+            onPress={() => onActionModeChange('OPEN')}>
+            <Text style={styles.actionText}>开仓</Text>
           </Pressable>
           <Pressable
-            style={[styles.sideTab, !buy ? styles.sellActive : null]}
-            onPress={() => onSideChange('SELL')}>
-            <Text style={[styles.sideText, !buy ? styles.activeText : null]}>卖出</Text>
+            style={[styles.actionTab, actionMode === 'CLOSE' ? styles.actionActive : null]}
+            onPress={() => onActionModeChange('CLOSE')}>
+            <Text style={styles.actionText}>平仓</Text>
+          </Pressable>
+        </View>
+
+        <View style={styles.sideTabs}>
+          <Pressable
+            style={[styles.sideTab, long ? styles.longActive : null]}
+            onPress={() => onDirectionChange('LONG')}>
+            <Text style={[styles.sideText, long ? styles.activeSideText : null]}>
+              {actionMode === 'OPEN' ? '开多' : '平多'}
+            </Text>
+          </Pressable>
+          <Pressable
+            style={[styles.sideTab, !long ? styles.shortActive : null]}
+            onPress={() => onDirectionChange('SHORT')}>
+            <Text style={[styles.sideText, !long ? styles.activeSideText : null]}>
+              {actionMode === 'OPEN' ? '开空' : '平空'}
+            </Text>
           </Pressable>
         </View>
 
@@ -87,22 +141,22 @@ function TradeOrderForm({
       </View>
 
       <View style={styles.inputSection}>
-        <Field
-          actionLabel={orderType === 'LIMIT' ? 'BBO' : undefined}
-          editable={orderType === 'LIMIT'}
-          helperText={orderType === 'LIMIT' ? '以当前最优价填入' : undefined}
-          label="价格"
-          suffix={quoteAsset}
-          value={orderType === 'MARKET' ? '按市场最优价' : price}
-          onActionPress={onBboPress}
-          onChangeText={onPriceChange}
-        />
-        <Field
-          label="数量"
-          suffix={baseAsset}
-          value={amount}
-          onChangeText={onAmountChange}
-        />
+      <Field
+        actionLabel={orderType === 'LIMIT' ? 'BBO' : undefined}
+        editable={orderType === 'LIMIT'}
+        helperText={orderType === 'LIMIT' ? '以当前最优价填入' : undefined}
+        label="价格"
+        suffix="USDT"
+        value={orderType === 'MARKET' ? '按市场最优价' : price}
+        onActionPress={onBboPress}
+        onChangeText={onPriceChange}
+      />
+      <Field
+        label="数量"
+        suffix="BTC"
+        value={quantity}
+        onChangeText={onQuantityChange}
+      />
       </View>
 
       <View style={styles.percentRow}>
@@ -117,16 +171,24 @@ function TradeOrderForm({
       </View>
 
       <View style={styles.metrics}>
-        <Metric label="交易额" value={`${tradeValue} ${quoteAsset}`} />
-        <Metric label="可用" value={availableText} />
-        <Metric label="预计手续费" value={`-- ${quoteAsset}`} />
+        <Metric label="账户权益" value={`${formatContractNumber(equity, 2)} USDT`} />
+        <Metric label="可用保证金" value={`${formatContractNumber(availableMargin, 2)} USDT`} />
+        <Metric label="预计保证金" value={`${formatContractNumber(estimatedMargin, 2)} USDT`} />
+        <Metric
+          label="预估强平价"
+          value={formatContractNumber(liquidationPrice, pricePrecision)}
+        />
+        <Metric
+          label="点差/手续费提示"
+          value={`${formatContractNumber(spreadFeePrice, pricePrecision)} USDT`}
+        />
       </View>
 
       <View style={styles.bottomSection}>
         <Text style={styles.loginHint}>
           {isLoggedIn
-            ? '真实下单提交将在下一步接入'
-            : '登录后可交易，当前仍可查看行情和盘口'}
+            ? '真实提交保留 TODO 风险确认'
+            : '登录后可交易，行情/K线可查看'}
         </Text>
 
         <Pressable
@@ -139,16 +201,7 @@ function TradeOrderForm({
   );
 }
 
-export default React.memo(TradeOrderForm);
-
-function Metric({label, value}: {label: string; value: string}) {
-  return (
-    <View style={styles.metaRow}>
-      <Text style={styles.metaLabel}>{label}</Text>
-      <Text style={styles.metaValue}>{value}</Text>
-    </View>
-  );
-}
+export default React.memo(ContractOrderForm);
 
 function Field({
   editable = true,
@@ -195,22 +248,35 @@ function Field({
   );
 }
 
-function getTradeValue(
-  price: string,
-  amount: string,
-  orderType: TradeOrderType,
-  lastPrice: number | null,
+function Metric({label, value}: {label: string; value: string}) {
+  return (
+    <View style={styles.metaRow}>
+      <Text style={styles.metaLabel}>{label}</Text>
+      <Text style={styles.metaValue}>{value}</Text>
+    </View>
+  );
+}
+
+function Tag({label, active = false}: {label: string; active?: boolean}) {
+  return (
+    <View style={[styles.tag, active ? styles.activeTag : null]}>
+      <Text style={[styles.tagText, active ? styles.activeTagText : null]}>{label}</Text>
+    </View>
+  );
+}
+
+function getEstimatedLiquidationPrice(
+  referencePrice: number | null,
+  direction: ContractDirection,
+  leverage: number,
 ) {
-  const priceNumber = orderType === 'MARKET' ? lastPrice : Number(price.replace(/,/g, ''));
-  const amountNumber = Number(amount);
-  if (
-    priceNumber === null ||
-    !Number.isFinite(priceNumber) ||
-    !Number.isFinite(amountNumber)
-  ) {
-    return '--';
+  if (referencePrice === null || !Number.isFinite(referencePrice) || leverage <= 0) {
+    return null;
   }
-  return formatSpotNumber(priceNumber * amountNumber, 2);
+  const buffer = 0.9 / leverage;
+  return direction === 'LONG'
+    ? referencePrice * (1 - buffer)
+    : referencePrice * (1 + buffer);
 }
 
 const styles = StyleSheet.create({
@@ -226,25 +292,70 @@ const styles = StyleSheet.create({
     padding: 8,
   },
   topSection: {
-    minHeight: 70,
+    minHeight: 151,
   },
-  sideTabs: {
+  modeRow: {
+    flexDirection: 'row',
+    gap: 5,
+  },
+  tag: {
+    height: 22,
+    justifyContent: 'center',
+    borderRadius: 5,
+    backgroundColor: colors.cardAlt,
+    paddingHorizontal: 8,
+  },
+  activeTag: {
+    backgroundColor: colors.primarySoft,
+  },
+  tagText: {
+    ...typography.medium,
+    color: colors.textMuted,
+    fontSize: 10,
+  },
+  activeTagText: {
+    color: colors.gold,
+    fontWeight: '900',
+  },
+  actionTabs: {
+    marginTop: 8,
     flexDirection: 'row',
     borderRadius: 6,
     backgroundColor: colors.cardAlt,
     padding: 2,
   },
-  sideTab: {
+  actionTab: {
     flex: 1,
-    height: 29,
+    height: 27,
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 5,
   },
-  buyActive: {
+  actionActive: {
+    backgroundColor: colors.primarySoft,
+  },
+  actionText: {
+    ...typography.bold,
+    color: colors.text,
+    fontSize: 12,
+  },
+  sideTabs: {
+    flexDirection: 'row',
+    gap: 6,
+    marginTop: 8,
+  },
+  sideTab: {
+    flex: 1,
+    height: 31,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 6,
+    backgroundColor: colors.cardAlt,
+  },
+  longActive: {
     backgroundColor: colors.green,
   },
-  sellActive: {
+  shortActive: {
     backgroundColor: colors.red,
   },
   sideText: {
@@ -252,7 +363,7 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     fontSize: 12,
   },
-  activeText: {
+  activeSideText: {
     color: colors.white,
   },
   typeTabs: {
@@ -349,11 +460,11 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   metrics: {
-    minHeight: 74,
+    minHeight: 92,
     justifyContent: 'center',
   },
   metaRow: {
-    minHeight: 21,
+    minHeight: 17,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -361,27 +472,27 @@ const styles = StyleSheet.create({
   },
   metaLabel: {
     color: colors.textSubtle,
-    fontSize: 10,
+    fontSize: 9,
   },
   metaValue: {
     ...typography.number,
     flexShrink: 1,
     color: colors.textMuted,
-    fontSize: 10,
+    fontSize: 9,
     fontWeight: '700',
     textAlign: 'right',
   },
   loginHint: {
     color: colors.textSubtle,
-    fontSize: 10,
-    lineHeight: 13,
+    fontSize: 9,
+    lineHeight: 12,
   },
   bottomSection: {
-    minHeight: 61,
+    minHeight: 58,
     justifyContent: 'flex-end',
   },
   submit: {
-    height: 40,
+    height: 38,
     marginTop: 8,
     alignItems: 'center',
     justifyContent: 'center',
@@ -390,10 +501,10 @@ const styles = StyleSheet.create({
   loginButton: {
     backgroundColor: colors.green,
   },
-  buyButton: {
+  longButton: {
     backgroundColor: colors.green,
   },
-  sellButton: {
+  shortButton: {
     backgroundColor: colors.red,
   },
   submitText: {

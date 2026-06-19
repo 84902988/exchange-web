@@ -8,10 +8,10 @@ import {
 } from 'react-native';
 import OrderBookDepthFooter from '../common/OrderBookDepthFooter';
 import {
-  formatSpotNumber,
-  type SpotOrderBookLevel,
-  type SpotTrade,
-} from '../../api/spot';
+  formatContractNumber,
+  type ContractMarketTrade,
+  type ContractOrderBookLevel,
+} from '../../api/contract';
 import {colors, typography} from '../../theme';
 import {aggregateOrderBookLevels} from '../../utils/orderBookDepth';
 import {
@@ -22,19 +22,21 @@ import {
 } from '../../constants/tradingLayout';
 
 type Props = {
-  asks: SpotOrderBookLevel[];
-  bids: SpotOrderBookLevel[];
-  trades: SpotTrade[];
+  asks: ContractOrderBookLevel[];
+  bids: ContractOrderBookLevel[];
+  trades: ContractMarketTrade[];
   lastPrice: number | null;
+  markPrice: number | null;
   pricePrecision: number;
   onPricePress: (price: string) => void;
 };
 
-function TradeOrderBook({
+function ContractOrderBook({
   asks,
   bids,
   trades,
   lastPrice,
+  markPrice,
   pricePrecision,
   onPricePress,
 }: Props) {
@@ -76,9 +78,11 @@ function TradeOrderBook({
       </View>
       <View style={styles.midPrice}>
         <Text style={[styles.lastPrice, priceUp ? styles.up : styles.down]}>
-          {formatSpotNumber(lastPrice, pricePrecision)}
+          {formatContractNumber(lastPrice, pricePrecision)}
         </Text>
-        <Text style={styles.midMeta}>最新价</Text>
+        <Text style={styles.midMeta}>
+          标记价 {formatContractNumber(markPrice, pricePrecision)}
+        </Text>
       </View>
       <View style={styles.levels}>
         {Array.from({length: MOBILE_ORDER_BOOK_ROWS}).map((_, index) => (
@@ -97,7 +101,7 @@ function TradeOrderBook({
   );
 }
 
-export default React.memo(TradeOrderBook);
+export default React.memo(ContractOrderBook);
 
 function BookLevel({
   color,
@@ -107,13 +111,13 @@ function BookLevel({
   onPress,
 }: {
   color: string;
-  level: SpotOrderBookLevel | null;
+  level: ContractOrderBookLevel | null;
   maxAmount: number;
   pricePrecision: number;
   onPress: (price: string) => void;
 }) {
-  const price = level ? formatSpotNumber(level.price, pricePrecision) : '--';
-  const amount = level ? formatSpotNumber(level.amount, 4) : '--';
+  const price = level ? formatContractNumber(level.price, pricePrecision) : '--';
+  const amount = level ? formatContractNumber(level.amount, 4) : '--';
   const ratio = level
     ? Math.max(8, Math.min(100, (Number(level.amount) / maxAmount) * 100))
     : 0;
