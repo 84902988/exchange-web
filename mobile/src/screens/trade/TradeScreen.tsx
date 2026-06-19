@@ -39,6 +39,12 @@ import {
 } from '../../api/spot';
 import {useAuth} from '../../store/authStore';
 import {colors, typography} from '../../theme';
+import {
+  MOBILE_FORM_PANEL_FLEX,
+  MOBILE_ORDER_BOOK_PANEL_FLEX,
+  MOBILE_TRADING_PANEL_GAP,
+  MOBILE_TRADING_PANEL_HEIGHT,
+} from '../../constants/tradingLayout';
 
 type RootNavigation = NativeStackNavigationProp<RootStackParamList>;
 
@@ -191,6 +197,15 @@ export default function TradeScreen() {
     [availableBase, availableQuote, lastPrice, orderType, price, side],
   );
 
+  const handleBboPress = useCallback(() => {
+    const bestAsk = asks[0]?.price ?? lastPrice;
+    const bestBid = bids[0]?.price ?? lastPrice;
+    const nextPrice = side === 'BUY' ? bestAsk : bestBid;
+    if (nextPrice !== null && nextPrice !== undefined) {
+      setPrice(formatSpotNumber(nextPrice, pricePrecision));
+    }
+  }, [asks, bids, lastPrice, pricePrecision, side]);
+
   const openLogin = useCallback(() => {
     navigation.navigate('Auth', {screen: 'Login'});
   }, [navigation]);
@@ -234,32 +249,37 @@ export default function TradeScreen() {
       />
       {publicError ? <Text style={styles.error}>{publicError}</Text> : null}
       <View style={styles.tradeMain}>
-        <TradeOrderForm
-          amount={amount}
-          availableText={availableText}
-          baseAsset={BASE_ASSET}
-          isLoggedIn={isLoggedIn}
-          lastPrice={lastPrice}
-          orderType={orderType}
-          price={price}
-          quoteAsset={QUOTE_ASSET}
-          side={side}
-          onAmountChange={setAmount}
-          onLoginPress={openLogin}
-          onOrderTypeChange={setOrderType}
-          onPercentPress={handlePercentPress}
-          onPriceChange={setPrice}
-          onSideChange={setSide}
-          onSubmitPress={handleSubmit}
-        />
-        <TradeOrderBook
-          asks={asks}
-          bids={bids}
-          lastPrice={lastPrice}
-          pricePrecision={pricePrecision}
-          trades={trades}
-          onPricePress={setPrice}
-        />
+        <View style={styles.formPanelWrap}>
+          <TradeOrderForm
+            amount={amount}
+            availableText={availableText}
+            baseAsset={BASE_ASSET}
+            isLoggedIn={isLoggedIn}
+            lastPrice={lastPrice}
+            orderType={orderType}
+            price={price}
+            quoteAsset={QUOTE_ASSET}
+            side={side}
+            onAmountChange={setAmount}
+            onBboPress={handleBboPress}
+            onLoginPress={openLogin}
+            onOrderTypeChange={setOrderType}
+            onPercentPress={handlePercentPress}
+            onPriceChange={setPrice}
+            onSideChange={setSide}
+            onSubmitPress={handleSubmit}
+          />
+        </View>
+        <View style={styles.orderBookPanelWrap}>
+          <TradeOrderBook
+            asks={asks}
+            bids={bids}
+            lastPrice={lastPrice}
+            pricePrecision={pricePrecision}
+            trades={trades}
+            onPricePress={setPrice}
+          />
+        </View>
       </View>
 
       <View style={styles.chartCard}>
@@ -330,9 +350,20 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   tradeMain: {
-    marginTop: 12,
+    marginTop: 8,
+    height: MOBILE_TRADING_PANEL_HEIGHT,
     flexDirection: 'row',
-    gap: 10,
+    gap: MOBILE_TRADING_PANEL_GAP,
+  },
+  formPanelWrap: {
+    flex: MOBILE_FORM_PANEL_FLEX,
+    height: '100%',
+    minWidth: 0,
+  },
+  orderBookPanelWrap: {
+    flex: MOBILE_ORDER_BOOK_PANEL_FLEX,
+    height: '100%',
+    minWidth: 0,
   },
   chartCard: {
     marginTop: 12,
