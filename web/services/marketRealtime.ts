@@ -41,6 +41,7 @@ function normalizeSymbol(symbol: string) {
 
 class SpotMarketRealtimeClient {
   private ws: WebSocket | null = null;
+  private connectTimer: number | null = null;
   private reconnectTimer: number | null = null;
   private socketOpenedWithSymbol = '';
   private requestedSymbol = '';
@@ -56,14 +57,14 @@ class SpotMarketRealtimeClient {
     this.closedByClient = false;
 
     if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
-      this.connect(nextSymbol);
+      this.scheduleConnect(nextSymbol);
       return;
     }
 
     if (previousSymbol !== nextSymbol) {
       if (this.socketOpenedWithSymbol && this.socketOpenedWithSymbol !== nextSymbol) {
         this.closeCurrentSocketForReconnect();
-        this.connect(nextSymbol);
+        this.scheduleConnect(nextSymbol);
         return;
       }
 
@@ -93,6 +94,7 @@ class SpotMarketRealtimeClient {
 
   disconnect() {
     this.closedByClient = true;
+    this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = '';
     this.requestedSymbol = '';
@@ -108,9 +110,21 @@ class SpotMarketRealtimeClient {
     ws.close(1000, 'client disconnect');
   }
 
+  private scheduleConnect(symbol: string) {
+    if (typeof window === 'undefined') return;
+
+    this.clearConnectTimer();
+    this.connectTimer = window.setTimeout(() => {
+      this.connectTimer = null;
+      if (this.closedByClient || !this.requestedSymbol) return;
+      this.connect(this.requestedSymbol || symbol);
+    }, 100);
+  }
+
   private connect(symbol: string) {
     if (typeof window === 'undefined') return;
 
+    this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = symbol;
 
@@ -154,6 +168,7 @@ class SpotMarketRealtimeClient {
   }
 
   private closeCurrentSocketForReconnect() {
+    this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = '';
 
@@ -207,6 +222,13 @@ class SpotMarketRealtimeClient {
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+  }
+
+  private clearConnectTimer() {
+    if (this.connectTimer !== null) {
+      window.clearTimeout(this.connectTimer);
+      this.connectTimer = null;
     }
   }
 }

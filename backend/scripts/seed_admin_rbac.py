@@ -30,6 +30,7 @@ PERMISSIONS: tuple[dict[str, str], ...] = (
     {"code": "balance_logs.view", "name": "Balance Logs View", "group_code": "funds"},
     {"code": "deposit_records.view", "name": "Deposit Records View", "group_code": "funds"},
     {"code": "withdraw_records.view", "name": "Withdraw Records View", "group_code": "funds"},
+    {"code": "withdraw_anomalies.view", "name": "提现异常治理查看", "group_code": "funds"},
     {"code": "withdraw_reviews.view", "name": "Withdraw Reviews View", "group_code": "funds"},
     {"code": "user_transfers.view", "name": "User Transfers View", "group_code": "funds"},
     {"code": "orders.view", "name": "Orders View", "group_code": "trading"},

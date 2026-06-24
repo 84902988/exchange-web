@@ -6,7 +6,7 @@ import Providers from "./providers";
 import { LocaleProvider } from "@/contexts/LocaleContext";
 
 export const metadata: Metadata = {
-  title: "RE",
+  title: "Royal Exchange",
   description: "",
   icons: {
     icon: "/icons/logo-1.svg",
