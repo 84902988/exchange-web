@@ -20,6 +20,7 @@ export type ReferenceOverlayConfig = {
 export type ReferenceOverlayTranslator = (key: string, namespace?: 'asset') => string;
 
 const IRON62_USD_PER_TON_TO_MFC_USDT_DIVISOR = 1000;
+const TROY_OUNCE_GRAMS = 31.1034768;
 
 function normalizeReferenceSymbol(symbol: string) {
   return String(symbol || '').replace(/\//g, '').toUpperCase();
@@ -44,11 +45,11 @@ function getReferenceAssetSymbol(record: Record<string, unknown>, normalizedSymb
   return sourceSymbol || stripReferenceQuoteSuffix(normalizedSymbol);
 }
 
-function formatReferenceNumber(value: number | null | undefined) {
+function formatReferenceNumber(value: number | null | undefined, maximumFractionDigits = 8) {
   if (!Number.isFinite(value) || !value || value <= 0) return '';
   return value.toLocaleString('en-US', {
     minimumFractionDigits: 0,
-    maximumFractionDigits: 8,
+    maximumFractionDigits,
   });
 }
 
@@ -56,15 +57,34 @@ function normalizeReferenceUnit(unit: string | null | undefined) {
   return String(unit || 'USDT').trim().toUpperCase() || 'USDT';
 }
 
+function readReferenceText(value: unknown) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text || null;
+}
+
+function parseReferencePriceLabel(label: string | null | undefined) {
+  const match = String(label || '').match(/([0-9][0-9,]*(?:\.[0-9]+)?)/);
+  if (!match) return null;
+  const price = Number(match[1].replace(/,/g, ''));
+  return Number.isFinite(price) && price > 0 ? price : null;
+}
+
+function goldGramPriceFromSourceLabel(label: string | null | undefined) {
+  const sourcePrice = parseReferencePriceLabel(label);
+  return sourcePrice ? sourcePrice / TROY_OUNCE_GRAMS : null;
+}
+
 function localizedReferenceValueLabel(params: {
   kind: ReferenceOverlayConfig['kind'];
   displayPrice: number | null;
   displayUnit?: string | null;
+  priceSource?: string | null;
   t: ReferenceOverlayTranslator;
 }) {
-  const { kind, displayPrice, displayUnit, t } = params;
+  const { kind, displayPrice, displayUnit, priceSource, t } = params;
   const price = formatReferenceNumber(displayPrice);
   if (!price) return '--';
+  const isAuto = String(priceSource || '').toUpperCase() === 'AUTO';
 
   if (kind === 'IRON') {
     return formatReferenceText(t('spotReferenceIronValueLabel', 'asset'), {
@@ -75,8 +95,8 @@ function localizedReferenceValueLabel(params: {
 
   if (kind === 'GOLD') {
     return formatReferenceText(t('spotReferenceGoldValueLabel', 'asset'), {
-      price,
-      unit: t('spotReferenceUnitUsdPerOunce', 'asset'),
+      price: formatReferenceNumber(displayPrice, 2),
+      unit: isAuto ? t('spotReferenceUnitUsdPerGram', 'asset') : normalizeReferenceUnit(displayUnit),
     });
   }
 
@@ -103,11 +123,12 @@ function localizedReferenceCopy(params: {
   symbol: string;
   displayPrice: number | null;
   displayUnit?: string | null;
+  priceSource?: string | null;
   t: ReferenceOverlayTranslator;
 }) {
-  const { kind, symbol, displayPrice, displayUnit, t } = params;
+  const { kind, symbol, displayPrice, displayUnit, priceSource, t } = params;
   const values = { symbol };
-  const valueLabel = localizedReferenceValueLabel({ kind, displayPrice, displayUnit, t });
+  const valueLabel = localizedReferenceValueLabel({ kind, displayPrice, displayUnit, priceSource, t });
 
   if (kind === 'IRON') {
     return {
@@ -211,38 +232,52 @@ export function normalizeReferenceOverlayConfig(
   const symbol = normalizeReferenceSymbol(String(record.symbol || ''));
   if (!symbol) return null;
 
-  const displayPrice = Number(record.display_price);
-  const normalizedDisplayPrice = Number.isFinite(displayPrice) && displayPrice > 0 ? displayPrice : null;
-  const displayUnit = normalizeReferenceUnit(String(record.display_unit || 'USDT'));
-  const assetSymbol = getReferenceAssetSymbol(record, symbol);
   const rawSourcePriceLabel = typeof record.source_price_label === 'string'
     ? record.source_price_label.trim()
     : typeof record.last_ref_label === 'string'
       ? record.last_ref_label.trim()
       : null;
+  const displayPrice = Number(record.display_price);
+  const sourcePrice = String(record.price_source || 'MANUAL').trim().toUpperCase();
+  const goldDisplayPrice = kind === 'GOLD' && sourcePrice === 'AUTO'
+    ? goldGramPriceFromSourceLabel(rawSourcePriceLabel)
+    : null;
+  const normalizedDisplayPrice = goldDisplayPrice !== null
+    ? goldDisplayPrice
+    : Number.isFinite(displayPrice) && displayPrice > 0
+      ? displayPrice
+      : null;
+  const displayUnit = normalizeReferenceUnit(String(record.display_unit || 'USDT'));
+  const assetSymbol = getReferenceAssetSymbol(record, symbol);
   const copy = localizedReferenceCopy({
     kind,
     symbol: assetSymbol || symbol,
     displayPrice: normalizedDisplayPrice,
     displayUnit,
+    priceSource: sourcePrice,
     t,
   });
+  const customTitle = readReferenceText(record.title);
+  const customSourceLabel = readReferenceText(record.source_label) || readReferenceText(record.subtitle);
+  const customLineTitle = readReferenceText(record.line_title);
+  const customDisplayValueLabel = readReferenceText(record.display_value_label);
+  const title = customTitle || copy.title;
 
   return {
     enabled: true,
     kind,
     symbol,
-    title: copy.title,
-    valueLabel: copy.valueLabel,
-    sourceLabel: copy.sourceLabel,
+    title,
+    valueLabel: sourcePrice === 'MANUAL' && customDisplayValueLabel ? customDisplayValueLabel : copy.valueLabel,
+    sourceLabel: customSourceLabel || copy.sourceLabel,
     sourcePriceLabel: kind === 'IRON' ? localizedIronSourcePriceLabel(rawSourcePriceLabel, t) : rawSourcePriceLabel,
-    description: copy.description,
-    lineTitle: copy.lineTitle,
+    description: readReferenceText(record.description) || copy.description,
+    lineTitle: customLineTitle || title || copy.lineTitle,
     lineColor: String(record.line_color || '#f0b90b').trim(),
     badgeColor: String(record.badge_color || record.line_color || '#f0b90b').trim(),
     displayPrice: normalizedDisplayPrice,
     displayUnit,
-    priceSource: String(record.price_source || 'MANUAL').trim().toUpperCase(),
+    priceSource: sourcePrice,
     stale: record.stale === true,
     syncError: typeof record.sync_error === 'string' ? record.sync_error : null,
   };

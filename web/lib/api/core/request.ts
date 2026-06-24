@@ -76,6 +76,7 @@ async function refreshSession(baseUrl: string): Promise<boolean> {
   // 常见：/auth/refresh 或 /auth/token/refresh
   const refreshUrl = joinUrl(baseUrl, "/auth/refresh");
   const refreshToken = getRefreshToken();
+  if (!refreshToken) return false;
 
   try {
     const resp = await fetch(refreshUrl, {

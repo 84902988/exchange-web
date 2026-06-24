@@ -42,6 +42,10 @@ export default function Header() {
     logoUrl: FALLBACK_LOGO_URL,
     siteName: FALLBACK_SITE_NAME,
     siteSlogan: '',
+    appAndroidQrUrl: '',
+    appIosQrUrl: '',
+    appDownloadTitle: '',
+    appDownloadSubtitle: '',
   });
   const [unreadAnnouncements, setUnreadAnnouncements] = useState(0);
   const stableIsLoggedIn = mounted && isLoggedIn;
@@ -77,6 +81,10 @@ export default function Header() {
           logoUrl: config.logo_url || FALLBACK_LOGO_URL,
           siteName: config.site_name || FALLBACK_SITE_NAME,
           siteSlogan: config.site_slogan ?? FALLBACK_SITE_SLOGAN,
+          appAndroidQrUrl: config.app_android_qr_url || '',
+          appIosQrUrl: config.app_ios_qr_url || '',
+          appDownloadTitle: config.app_download_title || '',
+          appDownloadSubtitle: config.app_download_subtitle || '',
         });
       })
       .catch(() => {
@@ -85,6 +93,10 @@ export default function Header() {
           logoUrl: FALLBACK_LOGO_URL,
           siteName: FALLBACK_SITE_NAME,
           siteSlogan: FALLBACK_SITE_SLOGAN,
+          appAndroidQrUrl: fallbackSiteConfig.app_android_qr_url || '',
+          appIosQrUrl: fallbackSiteConfig.app_ios_qr_url || '',
+          appDownloadTitle: fallbackSiteConfig.app_download_title || '',
+          appDownloadSubtitle: fallbackSiteConfig.app_download_subtitle || '',
         });
       });
 
@@ -186,6 +198,12 @@ export default function Header() {
 
   const [showMobileMenu, setShowMobileMenu] = useState(false);
   const headerT = (key: string) => (mounted ? t(key, 'common') : DEFAULT_COMMON_TRANSLATIONS[key] || key);
+  const appDownloadTitle = siteBrand.appDownloadTitle || headerT('appDownloadTitle');
+  const appDownloadSubtitle = siteBrand.appDownloadSubtitle || headerT('appDownloadSubtitle');
+  const appQrItems = [
+    { label: headerT('androidApp'), url: siteBrand.appAndroidQrUrl },
+    { label: headerT('iosApp'), url: siteBrand.appIosQrUrl },
+  ].filter((item) => item.url);
 
   return (
     <>
@@ -199,11 +217,9 @@ export default function Header() {
                   <Image
                     src={siteBrand.logoUrl}
                     alt={siteBrand.siteName}
-                    width={72}
-                    height={72}
-                    className="h-full w-full object-contain"
-                    priority
-                    quality={100}
+                    width={36}
+                    height={36}
+                    className="h-9 w-9 object-contain"
                     sizes="36px"
                   />
                 ) : (
@@ -296,7 +312,7 @@ export default function Header() {
               className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
               aria-label={headerT('search')}
             >
-              <Image src="/icons/header-search-1.svg" alt={headerT('search')} width={11} height={11} className="object-contain" />
+              <Image src="/icons/header-search-1.svg" alt={headerT('search')} width={11} height={11} className="h-[11px] w-[11px] object-contain" />
             </button>
           </div>
 
@@ -305,7 +321,7 @@ export default function Header() {
               className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
               aria-label={headerT('notice')}
             >
-              <Image src="/icons/header-notice-1.svg" alt={headerT('notice')} width={13} height={13} className="object-contain" />
+              <Image src="/icons/header-notice-1.svg" alt={headerT('notice')} width={13} height={13} className="h-[13px] w-[13px] object-contain" />
             </button>
             {mounted && unreadAnnouncements > 0 && (
               <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-red-500 px-1.5 py-0.5 text-center text-[10px] font-bold leading-none text-white shadow-sm">
@@ -323,18 +339,34 @@ export default function Header() {
                   className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
                   aria-label={headerT('download')}
                 >
-                  <Image src="/icons/header-download-1.svg" alt={headerT('download')} width={13} height={13} className="object-contain" />
+                  <Image src="/icons/header-download-1.svg" alt={headerT('download')} width={13} height={13} className="h-[13px] w-[13px] object-contain" />
                 </button>
 
                 {showQR && (
                   <div
-                    className="absolute right-0 mt-2 rounded-md border border-white/10 bg-black/80 backdrop-blur-sm p-4"
+                    className="absolute right-0 z-40 mt-2 w-[284px] rounded-md border border-white/10 bg-black/90 p-4 shadow-2xl shadow-black/40 backdrop-blur-sm"
                     onMouseEnter={handleDownloadHover}
                     onMouseLeave={handleDownloadLeave}
                   >
-                    <div className="flex h-32 w-32 items-center justify-center rounded bg-white/5">
-                      <div className="text-sm text-white/70">{headerT('qrCode')}</div>
-                    </div>
+                    <div className="text-sm font-semibold text-white">{appDownloadTitle}</div>
+                    <div className="mt-1 text-xs leading-5 text-white/55">{appDownloadSubtitle}</div>
+                    {appQrItems.length > 0 ? (
+                      <div className="mt-3 grid grid-cols-2 gap-3">
+                        {appQrItems.map((item) => (
+                          <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.04] p-2">
+                            <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-white">
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img src={item.url} alt={`${item.label} ${headerT('qrCode')}`} className="h-full w-full object-contain" />
+                            </div>
+                            <div className="mt-2 truncate text-center text-xs font-medium text-white/75">{item.label}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="mt-3 flex h-28 items-center justify-center rounded-md border border-dashed border-white/15 bg-white/[0.04] px-4 text-center text-xs leading-5 text-white/45">
+                        {headerT('appQrNotConfigured')}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -349,7 +381,7 @@ export default function Header() {
                     alt={headerT('asset')}
                     width={13}
                     height={13}
-                    className="object-contain transform translate-y-[15%]"
+                    className="h-[13px] w-[13px] object-contain transform translate-y-[15%]"
                   />
                 </button>
               </Link>
@@ -371,7 +403,7 @@ export default function Header() {
             className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
             aria-label={headerT('language')}
           >
-            <Image src="/icons/header-language-1.svg" alt={headerT('language')} width={13} height={13} className="object-contain" />
+            <Image src="/icons/header-language-1.svg" alt={headerT('language')} width={13} height={13} className="h-[13px] w-[13px] object-contain" />
           </button>
         </div>
 

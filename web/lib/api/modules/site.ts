@@ -20,6 +20,10 @@ export type SiteConfig = {
   home_hero_cta_text_i18n?: LocalizedText | null;
   home_hero_cta_link?: string;
   home_hero_image?: string;
+  app_android_qr_url?: string;
+  app_ios_qr_url?: string;
+  app_download_title?: string;
+  app_download_subtitle?: string;
   show_risk_link?: boolean;
   risk_link_url?: string;
   show_terms_link?: boolean;
@@ -86,7 +90,7 @@ export type LegalPageContent = {
 };
 
 export const fallbackSiteConfig: SiteConfig = {
-  site_name: "RE",
+  site_name: "Royal Exchange",
   site_slogan: "",
   logo_url: "/icons/logo-1.svg",
   support_email: "",
@@ -99,6 +103,10 @@ export const fallbackSiteConfig: SiteConfig = {
   home_hero_cta_text: "",
   home_hero_cta_link: "/register",
   home_hero_image: "/homepage-bg.mp4",
+  app_android_qr_url: "",
+  app_ios_qr_url: "",
+  app_download_title: "",
+  app_download_subtitle: "",
   show_risk_link: true,
   risk_link_url: "/risk",
   show_terms_link: true,

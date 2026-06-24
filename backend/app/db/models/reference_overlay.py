@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, JSON, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -24,12 +24,17 @@ class ReferenceOverlay(Base):
     reference_type: Mapped[str] = mapped_column(String(20), nullable=False, default="STOCK")
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     title: Mapped[str] = mapped_column(String(64), nullable=False)
+    title_i18n: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     source_label: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    source_label_i18n: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     description: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    description_i18n: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     line_title: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    line_title_i18n: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     line_color: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     badge_color: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     display_value_label: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    display_value_label_i18n: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     display_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(36, 18), nullable=True)
     display_unit: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     data_source: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)

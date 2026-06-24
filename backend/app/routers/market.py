@@ -6,11 +6,13 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
 )
 from sqlalchemy.orm import Session
 
+from app.core.content_locale import resolve_content_locale
 from app.db.session import SessionLocal, get_db
 from app.schemas.market import DepthResponse, KlineResponse, TradesResponse
 from app.services.market import (
@@ -200,11 +202,14 @@ def mobile_overview(db: Session = Depends(get_db)):
 
 @router.get("/reference-overlays", summary="Get chart reference overlay config")
 def reference_overlays(
+    request: Request,
     symbol: str = Query(..., description="Spot symbol, e.g. MFCUSDT"),
+    lang: Optional[str] = Query(None, description="Optional content language"),
     db: Session = Depends(get_db),
 ):
     try:
-        return get_reference_overlay_for_symbol(db, symbol=symbol)
+        locale = resolve_content_locale(lang, request.headers.get("accept-language"))
+        return get_reference_overlay_for_symbol(db, symbol=symbol, locale=locale)
     except Exception:
         logger.exception("get reference overlay failed")
         raise HTTPException(status_code=500, detail="get reference overlay failed")
