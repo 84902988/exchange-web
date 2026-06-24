@@ -67,6 +67,7 @@ backend/data/geoip/
 Thumbs.db
 
 # Local artifacts, archives, and temporary work
+docs/
 *.zip
 *.7z
 *.tar
