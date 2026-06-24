@@ -39,6 +39,7 @@ sudo systemctl daemon-reload
 | `exchange-rq-maintenance.service` | 消费 `maintenance` 队列，执行维护类任务 | 已入队维护任务不会执行，例如提现手续费维护 |
 | `exchange-withdraw-fee-scheduler.service` | 定时扫描并投递提现手续费维护任务 | 不会产生新的自动维护任务，worker 空转 |
 | `exchange-collection-auto-scheduler.service` | 按自动归集规则扫描候选地址，创建归集任务并投递现有 collection/gas worker | 自动归集规则页无调度心跳，满足条件的候选不会自动生成归集任务 |
+| `exchange-spot-match-worker.service` | 负责现货内盘订单持续撮合 | 现货内盘挂单不会被自动撮合；不应和 `ENABLE_SPOT_AUTO_MATCH_IN_API=1` 同时启用 |
 | `exchange-dealer-loop.service` | dealer 订单撮合/补单 loop 模板 | dealer 相关挂单处理不继续推进；如 API 已内嵌启动，不能重复启用 |
 | `exchange-liquidation-scanner.service` | 合约强平扫描 loop 模板 | 风险仓位不会被自动扫描执行强平 |
 | `exchange-tp-sl-scanner.service` | 合约止盈止损扫描 loop 模板 | TP/SL 条件不会被自动触发 |
@@ -52,7 +53,7 @@ sudo systemctl daemon-reload
 3. Alembic 迁移和必要 seed。
 4. `exchange-api.service`。
 5. RQ workers：`email`、`withdraw`、`payout`、`release`、`tx_confirm`、`collection`、`gas`、`maintenance`。
-6. scheduler/loop/scanner：提现手续费 scheduler、自动归集 scheduler、dealer loop、强平 scanner、TP/SL scanner。
+6. scheduler/loop/scanner：提现手续费 scheduler、自动归集 scheduler、现货内盘撮合 worker、dealer loop、强平 scanner、TP/SL scanner。
 
 Redis 没启动时，RQ worker 和 scheduler 即使被 systemd 拉起，也会反复重启或无法消费队列。
 
@@ -95,7 +96,8 @@ sudo systemctl enable --now \
   exchange-rq-gas.service \
   exchange-rq-maintenance.service \
   exchange-withdraw-fee-scheduler.service \
-  exchange-collection-auto-scheduler.service
+  exchange-collection-auto-scheduler.service \
+  exchange-spot-match-worker.service
 ```
 
 查看状态：
@@ -153,6 +155,14 @@ sudo systemctl disable --now exchange-rq-email.service
 
 不要让同一个 loop 同时被 API 和独立 service 启动，否则可能重复扫描、重复执行或产生锁竞争。若要多 API 副本上线，先确认对应 job 已有 env 开关或独立 runner。
 
+现货内盘撮合生产推荐使用独立 `exchange-spot-match-worker.service` 作为唯一 owner，并保持：
+
+```env
+ENABLE_SPOT_AUTO_MATCH_IN_API=0
+```
+
+不要同时启用 `ENABLE_SPOT_AUTO_MATCH_IN_API=1` 和 `exchange-spot-match-worker.service`，否则 API 内嵌撮合线程与独立 worker 会同时拥有同一类撮合循环。
+
 ## 上线检查清单
 
 1. `.env` 中 Redis、数据库、链上配置、邮件配置均为生产值。
@@ -161,7 +171,7 @@ sudo systemctl disable --now exchange-rq-email.service
 4. `exchange-api.service` 启动正常，`/health` 返回正常。
 5. 每个 RQ worker 的日志中能看到监听对应 queue。
 6. `exchange-withdraw-fee-scheduler.service` 能定时投递维护任务。
-7. 如果启用 loop/scanner 独立服务，确认 API 中没有重复 owner。
+7. 如果启用 loop/scanner 独立服务，确认 API 中没有重复 owner；现货撮合应由 `exchange-spot-match-worker.service` 单独负责，且 `ENABLE_SPOT_AUTO_MATCH_IN_API=0`。
 8. 对 `withdraw`、`payout`、`collection/gas` 这类资金相关服务，先用小流量验证日志和幂等行为。
 
 ## 模板校验
@@ -200,6 +210,7 @@ journalctl -u exchange-api.service -f
 journalctl -u exchange-rq-maintenance.service -f
 journalctl -u exchange-withdraw-fee-scheduler.service -f
 journalctl -u exchange-collection-auto-scheduler.service -f
+journalctl -u exchange-spot-match-worker.service -f
 journalctl -u exchange-dealer-loop.service -f
 journalctl -u exchange-liquidation-scanner.service -f
 journalctl -u exchange-tp-sl-scanner.service -f

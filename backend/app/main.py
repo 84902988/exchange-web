@@ -442,7 +442,10 @@ def _startup():
                 logger.exception("[withdraw_watcher] start failed")
                 _withdraw_watcher = None
 
-    start_auto_match_worker()
+    if _env_enabled("ENABLE_SPOT_AUTO_MATCH_IN_API", default=False):
+        start_auto_match_worker()
+    else:
+        logger.info("[auto_match] disabled in API startup; use backend/scripts/start_spot_match_worker.py")
 
     if not _embed_background_loops_in_api():
         logger.info(
