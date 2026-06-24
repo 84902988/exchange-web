@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import re
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_UP
@@ -11288,6 +11289,86 @@ def _admin_short_text(value: Any, limit: int = 28, suffix: Optional[int] = None)
     return f"{text_value[:limit_value]}..."
 
 
+REFERENCE_OVERLAY_TROY_OUNCE_GRAMS = Decimal("31.1034768")
+REFERENCE_OVERLAY_GOLD_DISPLAY_QUANT = Decimal("0.01")
+REFERENCE_OVERLAY_I18N_LOCALES = (
+    ("zh", "zh"),
+    ("zh-TW", "zh_TW"),
+    ("en", "en"),
+    ("ja", "ja"),
+)
+REFERENCE_OVERLAY_I18N_FIELDS = (
+    "title",
+    "source_label",
+    "description",
+    "line_title",
+    "display_value_label",
+)
+
+
+def _reference_overlay_i18n_form_key(field_name: str, suffix: str) -> str:
+    return f"{field_name}_i18n_{suffix}"
+
+
+def _reference_overlay_i18n_dict(value: Any) -> Dict[str, str]:
+    if isinstance(value, dict):
+        return {str(key): str(item or "") for key, item in value.items() if str(item or "").strip()}
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return {str(key): str(item or "") for key, item in parsed.items() if str(item or "").strip()}
+    return {}
+
+
+def _reference_overlay_append_i18n_form_fields(form: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    for field_name in REFERENCE_OVERLAY_I18N_FIELDS:
+        translations = _reference_overlay_i18n_dict(payload.get(f"{field_name}_i18n"))
+        for locale, suffix in REFERENCE_OVERLAY_I18N_LOCALES:
+            key = _reference_overlay_i18n_form_key(field_name, suffix)
+            value = str(payload.get(key) or "").strip()
+            if not value:
+                value = str(translations.get(locale) or "").strip()
+            if not value and locale == "zh":
+                value = str(payload.get(field_name) or "").strip()
+            form[key] = value
+
+
+def _reference_overlay_build_i18n_payload(form: Dict[str, Any], field_name: str) -> Optional[Dict[str, str]]:
+    values: Dict[str, str] = {}
+    for locale, suffix in REFERENCE_OVERLAY_I18N_LOCALES:
+        value = str(form.get(_reference_overlay_i18n_form_key(field_name, suffix)) or "").strip()
+        if value:
+            values[locale] = value
+    return values or None
+
+
+def _reference_overlay_i18n_json(form: Dict[str, Any], field_name: str) -> Optional[str]:
+    payload = _reference_overlay_build_i18n_payload(form, field_name)
+    return json.dumps(payload, ensure_ascii=False) if payload else None
+
+
+def _reference_overlay_price_from_label(label: Any) -> Optional[Decimal]:
+    match = re.search(r"([0-9][0-9,]*(?:\.[0-9]+)?)", str(label or ""))
+    if not match:
+        return None
+    price = _parse_decimal(match.group(1).replace(",", ""), Decimal("0"))
+    return price if price > 0 else None
+
+
+def _admin_gold_gram_display_price(source_price_label: Any) -> str:
+    source_price = _reference_overlay_price_from_label(source_price_label)
+    if source_price is None:
+        return ""
+    gram_price = (source_price / REFERENCE_OVERLAY_TROY_OUNCE_GRAMS).quantize(
+        REFERENCE_OVERLAY_GOLD_DISPLAY_QUANT,
+        rounding=ROUND_HALF_UP,
+    )
+    return _admin_amount_display(gram_price)
+
+
 def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
     enabled = _parse_int(row.get("enabled"), 0)
     reference_type = str(row.get("reference_type") or row.get("kind") or "STOCK").strip().upper()
@@ -11300,7 +11381,14 @@ def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
     effective_display_price = last_ref_price_text if price_source == "AUTO" and last_ref_price_text else display_price_text
     effective_display_label = row.get("display_value_label") or ""
     source_price_label = row.get("last_ref_label") or ""
-    if price_source == "AUTO" and reference_type == "IRON" and effective_display_price:
+    if price_source == "AUTO" and reference_type == "GOLD":
+        gold_display_price = _admin_gold_gram_display_price(source_price_label)
+        if gold_display_price:
+            effective_display_price = gold_display_price
+            effective_display_label = f"{gold_display_price} USD/g"
+        elif effective_display_price:
+            effective_display_label = f"{effective_display_price} USD/g"
+    elif price_source == "AUTO" and reference_type == "IRON" and effective_display_price:
         effective_display_label = f"{effective_display_price} USD/公斤"
     elif not effective_display_label and effective_display_price:
         effective_display_label = f"{effective_display_price} {row.get('display_unit') or ''}".strip()
@@ -11347,12 +11435,17 @@ def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "realtime_badge_class": _admin_reference_overlay_badge_class(_admin_reference_overlay_realtime_badge(is_realtime_state)),
         "kind": row.get("kind") or "",
         "title": row.get("title") or "",
+        "title_i18n": _reference_overlay_i18n_dict(row.get("title_i18n")),
         "source_label": row.get("source_label") or "",
+        "source_label_i18n": _reference_overlay_i18n_dict(row.get("source_label_i18n")),
         "description": row.get("description") or "",
+        "description_i18n": _reference_overlay_i18n_dict(row.get("description_i18n")),
         "line_title": row.get("line_title") or "",
+        "line_title_i18n": _reference_overlay_i18n_dict(row.get("line_title_i18n")),
         "line_color": row.get("line_color") or "",
         "badge_color": row.get("badge_color") or "",
         "display_value_label": row.get("display_value_label") or "",
+        "display_value_label_i18n": _reference_overlay_i18n_dict(row.get("display_value_label_i18n")),
         "display_price": display_price_text,
         "effective_display_price": effective_display_price,
         "effective_display_label": effective_display_label,
@@ -11370,7 +11463,7 @@ def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def admin_reference_overlay_form_from_payload(payload: Dict[str, Any], existing_symbol: str = "") -> Dict[str, Any]:
-    return {
+    form = {
         "symbol": _normalize_code(payload.get("symbol") or existing_symbol),
         "enabled": str(payload.get("enabled") if payload.get("enabled") not in (None, "") else "1"),
         "reference_type": str(payload.get("reference_type") or payload.get("kind") or "STOCK").strip().upper(),
@@ -11380,13 +11473,13 @@ def admin_reference_overlay_form_from_payload(payload: Dict[str, Any], existing_
         "sync_status": str(payload.get("sync_status") or "PENDING").strip().upper(),
         "sync_error": str(payload.get("sync_error") or "").strip(),
         "kind": str(payload.get("kind") or payload.get("reference_type") or "STOCK").strip().upper(),
-        "title": str(payload.get("title") or "").strip(),
-        "source_label": str(payload.get("source_label") or payload.get("subtitle") or "").strip(),
-        "description": str(payload.get("description") or "").strip(),
-        "line_title": str(payload.get("line_title") or payload.get("title") or "").strip(),
+        "title": str(payload.get("title") or payload.get("title_i18n_zh") or "").strip(),
+        "source_label": str(payload.get("source_label") or payload.get("subtitle") or payload.get("source_label_i18n_zh") or "").strip(),
+        "description": str(payload.get("description") or payload.get("description_i18n_zh") or "").strip(),
+        "line_title": str(payload.get("line_title") or payload.get("line_title_i18n_zh") or payload.get("title") or payload.get("title_i18n_zh") or "").strip(),
         "line_color": str(payload.get("line_color") or "#f0b90b").strip(),
         "badge_color": str(payload.get("badge_color") or payload.get("line_color") or "#f0b90b").strip(),
-        "display_value_label": str(payload.get("display_value_label") or "").strip(),
+        "display_value_label": str(payload.get("display_value_label") or payload.get("display_value_label_i18n_zh") or "").strip(),
         "display_price": str(payload.get("display_price") or "").strip(),
         "display_unit": str(payload.get("display_unit") or "USDT").strip().upper(),
         "data_source": str(payload.get("data_source") or "MANUAL").strip().upper(),
@@ -11396,6 +11489,14 @@ def admin_reference_overlay_form_from_payload(payload: Dict[str, Any], existing_
         "conversion_factor": str(payload.get("conversion_factor") or "").strip(),
         "sort_order": str(payload.get("sort_order") or "0").strip(),
     }
+    _reference_overlay_append_i18n_form_fields(form, payload)
+    for field_name in REFERENCE_OVERLAY_I18N_FIELDS:
+        zh_value = str(form.get(_reference_overlay_i18n_form_key(field_name, "zh")) or "").strip()
+        if zh_value:
+            form[field_name] = zh_value
+    if not form.get("line_title"):
+        form["line_title"] = form.get("title") or ""
+    return form
 
 
 def _validate_reference_overlay_form(form: Dict[str, Any], *, is_create: bool) -> tuple[Dict[str, Any], list[str]]:
@@ -11441,6 +11542,11 @@ def _validate_reference_overlay_form(form: Dict[str, Any], *, is_create: bool) -
         "conversion_factor": conversion_factor,
         "sort_order": sort_order,
         "source_label": _clean_optional_text(form.get("source_label")),
+        "title_i18n": _reference_overlay_i18n_json(form, "title"),
+        "source_label_i18n": _reference_overlay_i18n_json(form, "source_label"),
+        "description_i18n": _reference_overlay_i18n_json(form, "description"),
+        "line_title_i18n": _reference_overlay_i18n_json(form, "line_title"),
+        "display_value_label_i18n": _reference_overlay_i18n_json(form, "display_value_label"),
         "description": _clean_optional_text(form.get("description")),
         "line_title": _clean_optional_text(form.get("line_title")) or form["title"],
         "line_color": _clean_optional_text(form.get("line_color")) or "#f0b90b",
@@ -11511,6 +11617,7 @@ def admin_get_reference_overlay(db: Session, overlay_id: int) -> Dict[str, Any]:
     if not row:
         return {}
     item = _admin_reference_overlay_row(dict(row))
+    _reference_overlay_append_i18n_form_fields(item, item)
     item["enabled"] = str(item["enabled"])
     return item
 
@@ -11526,15 +11633,19 @@ def admin_create_reference_overlay(db: Session, payload: Dict[str, Any]) -> Dict
             text(
                 """
                 INSERT INTO reference_overlays (
-                    symbol, enabled, reference_type, kind, title, source_label, description,
-                    line_title, line_color, badge_color, display_value_label,
+                    symbol, enabled, reference_type, kind, title, title_i18n,
+                    source_label, source_label_i18n, description, description_i18n,
+                    line_title, line_title_i18n, line_color, badge_color,
+                    display_value_label, display_value_label_i18n,
                     display_price, display_unit, data_source, source_symbol,
                     price_source, auto_source, refresh_interval_sec, sync_status, sync_error,
                     source_region, conversion_type, conversion_factor, sort_order,
                     created_at, updated_at
                 ) VALUES (
-                    :symbol, :enabled, :reference_type, :kind, :title, :source_label, :description,
-                    :line_title, :line_color, :badge_color, :display_value_label,
+                    :symbol, :enabled, :reference_type, :kind, :title, :title_i18n,
+                    :source_label, :source_label_i18n, :description, :description_i18n,
+                    :line_title, :line_title_i18n, :line_color, :badge_color,
+                    :display_value_label, :display_value_label_i18n,
                     :display_price, :display_unit, :data_source, :source_symbol,
                     :price_source, :auto_source, :refresh_interval_sec, :sync_status, :sync_error,
                     :source_region, :conversion_type, :conversion_factor, :sort_order,
@@ -11575,12 +11686,17 @@ def admin_update_reference_overlay(db: Session, overlay_id: int, payload: Dict[s
                     reference_type = :reference_type,
                     kind = :kind,
                     title = :title,
+                    title_i18n = :title_i18n,
                     source_label = :source_label,
+                    source_label_i18n = :source_label_i18n,
                     description = :description,
+                    description_i18n = :description_i18n,
                     line_title = :line_title,
+                    line_title_i18n = :line_title_i18n,
                     line_color = :line_color,
                     badge_color = :badge_color,
                     display_value_label = :display_value_label,
+                    display_value_label_i18n = :display_value_label_i18n,
                     display_price = :display_price,
                     display_unit = :display_unit,
                     data_source = :data_source,

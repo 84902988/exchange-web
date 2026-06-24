@@ -8,6 +8,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.content_locale import DEFAULT_CONTENT_LOCALE, localize_i18n_value
 from app.db.models.reference_overlay import ReferenceOverlay
 
 
@@ -52,6 +53,8 @@ def _display_price_label(
     price_text = _decimal_to_text(display_price)
     if reference_type == "IRON" and price_text:
         return f"{price_text} USD/公斤"
+    if reference_type == "GOLD" and price_text:
+        return display_label or f"{price_text} USD/g"
     return display_label or price_text
 
 
@@ -120,7 +123,12 @@ def _disabled_payload(
     return payload
 
 
-def serialize_reference_overlay(overlay: ReferenceOverlay | None, *, requested_symbol: str = "") -> dict[str, Any]:
+def serialize_reference_overlay(
+    overlay: ReferenceOverlay | None,
+    *,
+    requested_symbol: str = "",
+    locale: str = DEFAULT_CONTENT_LOCALE,
+) -> dict[str, Any]:
     if overlay is None or int(overlay.enabled or 0) != 1:
         return _disabled_payload(str(requested_symbol or "").strip().upper())
 
@@ -147,6 +155,33 @@ def serialize_reference_overlay(overlay: ReferenceOverlay | None, *, requested_s
         display_label=display_label,
     )
 
+    localized_title = localize_i18n_value(getattr(overlay, "title_i18n", None), locale, overlay.title)
+    localized_source_label = localize_i18n_value(
+        getattr(overlay, "source_label_i18n", None),
+        locale,
+        overlay.source_label,
+    )
+    localized_description = localize_i18n_value(
+        getattr(overlay, "description_i18n", None),
+        locale,
+        overlay.description,
+    )
+    localized_line_title = localize_i18n_value(
+        getattr(overlay, "line_title_i18n", None),
+        locale,
+        overlay.line_title or localized_title,
+    )
+    localized_display_label = localize_i18n_value(
+        getattr(overlay, "display_value_label_i18n", None),
+        locale,
+        display_label,
+    )
+    display_price_label = _display_price_label(
+        reference_type=reference_type,
+        display_price=display_price,
+        display_label=localized_display_label,
+    )
+
     return {
         "symbol": overlay.symbol,
         "enabled": True,
@@ -165,14 +200,14 @@ def serialize_reference_overlay(overlay: ReferenceOverlay | None, *, requested_s
         "price_time": _datetime_to_text(overlay.price_time),
         "is_realtime": bool(overlay.is_realtime),
         "kind": overlay.kind,
-        "title": overlay.title,
-        "subtitle": overlay.source_label,
-        "source_label": overlay.source_label,
-        "description": overlay.description,
-        "line_title": overlay.line_title or overlay.title,
+        "title": localized_title,
+        "subtitle": localized_source_label,
+        "source_label": localized_source_label,
+        "description": localized_description,
+        "line_title": localized_line_title,
         "line_color": overlay.line_color or "#f0b90b",
         "badge_color": overlay.badge_color or overlay.line_color or "#f0b90b",
-        "display_value_label": display_label,
+        "display_value_label": localized_display_label,
         "display_price": _decimal_to_text(display_price),
         "display_price_label": display_price_label,
         "source_price_label": source_price_label,
@@ -185,7 +220,7 @@ def serialize_reference_overlay(overlay: ReferenceOverlay | None, *, requested_s
     }
 
 
-def get_reference_overlay_for_symbol(db: Session, symbol: str) -> dict[str, Any]:
+def get_reference_overlay_for_symbol(db: Session, symbol: str, *, locale: str = DEFAULT_CONTENT_LOCALE) -> dict[str, Any]:
     normalized_symbol = str(symbol or "").replace("/", "").replace("-", "").strip().upper()
     if not normalized_symbol:
         return {"symbol": "", "enabled": False}
@@ -208,4 +243,4 @@ def get_reference_overlay_for_symbol(db: Session, symbol: str) -> dict[str, Any]
         db.rollback()
         raise
 
-    return serialize_reference_overlay(overlay, requested_symbol=normalized_symbol)
+    return serialize_reference_overlay(overlay, requested_symbol=normalized_symbol, locale=locale)

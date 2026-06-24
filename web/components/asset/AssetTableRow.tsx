@@ -22,20 +22,14 @@ export default function AssetTableRow({
   void onTrade;
 
   const formatBalance = (balance: number): string => {
-    if (asset.symbol === 'USDT') {
-      if (balance > 0 && balance < 0.01) return '< 0.01';
-      if (balance > 0 && balance < 1) {
-        return balance.toLocaleString('en-US', {
-          minimumFractionDigits: 2,
-          maximumFractionDigits: 4,
-        });
-      }
-      return balance.toLocaleString('en-US', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      });
-    }
-    return balance.toFixed(8).replace(/\.?0+$/, '');
+    const precision = Number.isFinite(Number(asset.displayPrecision))
+      ? Math.max(0, Number(asset.displayPrecision))
+      : 4;
+
+    return balance.toLocaleString('en-US', {
+      minimumFractionDigits: precision,
+      maximumFractionDigits: precision,
+    });
   };
 
   const getSymbolColor = (symbol: string): string => {

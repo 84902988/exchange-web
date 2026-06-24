@@ -40,9 +40,14 @@ export function formatRcbPayDiscountText(value: string | number | null | undefin
   return `${trimTrailingZeros((payPercent / 10).toFixed(2))} 折`;
 }
 
-export function formatLockPeriod(days: number | null): string {
-  if (days === null) return "\u65e0";
-  return `${days}\u5929`;
+export function formatLockPeriod(
+  days: number | string | null | undefined,
+  noneText: string,
+  daysTemplate: string,
+): string {
+  const numericDays = Number(days);
+  if (!Number.isFinite(numericDays) || numericDays <= 0) return noneText;
+  return daysTemplate.replace("{days}", trimTrailingZeros(String(numericDays)));
 }
 
 function formatDecimalNumber(

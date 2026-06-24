@@ -61,6 +61,34 @@
       color: #a8b3c7;
       font-weight: 600;
     }
+    .rwa-i18n-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .rwa-i18n-tab {
+      min-height: 34px;
+      padding: 0 12px;
+      border: 1px solid rgba(148, 163, 184, .18);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, .42);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .rwa-i18n-tab.is-active {
+      border-color: rgba(250, 204, 21, .55);
+      background: rgba(250, 204, 21, .14);
+      color: var(--text);
+    }
+    .rwa-i18n-panel {
+      display: none;
+    }
+    .rwa-i18n-panel.is-active {
+      display: block;
+    }
     .rwa-status-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -133,6 +161,7 @@
 
   {% set reference_type_value = form.reference_type or form.kind or 'STOCK' %}
   {% set price_source_value = form.price_source or 'MANUAL' %}
+  {% set i18n_languages = [('zh','简体中文'),('zh_TW','繁體中文'),('en','English'),('ja','日本語')] %}
   <section class="page-section">
     <form method="post" action="{{ form_action }}" class="rwa-form" data-rwa-reference-form>
       <input type="hidden" id="kind" name="kind" value="{{ form.kind or reference_type_value }}" data-rwa-kind />
@@ -163,19 +192,56 @@
               <option value="0" {% if form.enabled|string == '0' %}selected{% endif %}>禁用</option>
             </select>
           </div>
-          <div class="field">
-            <label for="title">标题</label>
-            <input id="title" type="text" name="title" value="{{ form.title or '' }}" placeholder="铁粉参考价" />
-          </div>
-          <div class="field">
-            <label for="subtitle">副标题</label>
-            <input id="subtitle" type="text" name="subtitle" value="{{ form.source_label or form.subtitle or '' }}" placeholder="IRON62/USD" />
-          </div>
-          <div class="field rwa-field-wide">
-            <label for="description">描述</label>
-            <input id="description" type="text" name="description" value="{{ form.description or '' }}" placeholder="1 MFC ≈ 1KG 铁粉" />
-          </div>
         </div>
+      </div>
+
+      <div class="rwa-form-section" data-rwa-i18n-form>
+        <div class="rwa-section-title">多语言文案</div>
+        <div class="rwa-help-card">
+          <div><strong>简体中文：</strong>会同步写入原始字段，作为其他语言未填写时的 fallback。</div>
+          <div><strong>展示单位：</strong>AUTO 模式单位由系统按语言生成，不在这里手填；这里的“展示文案”主要用于 MANUAL 或兜底。</div>
+        </div>
+        <div class="rwa-i18n-tabs" role="tablist" aria-label="RWA参考价多语言文案">
+          {% for suffix, label in i18n_languages %}
+            <button
+              type="button"
+              class="rwa-i18n-tab{% if suffix == 'zh' %} is-active{% endif %}"
+              data-rwa-i18n-tab="{{ suffix }}"
+              role="tab"
+              aria-selected="{{ 'true' if suffix == 'zh' else 'false' }}"
+            >{{ label }}</button>
+          {% endfor %}
+        </div>
+        {% for suffix, label in i18n_languages %}
+          <div
+            class="rwa-i18n-panel{% if suffix == 'zh' %} is-active{% endif %}"
+            data-rwa-i18n-panel="{{ suffix }}"
+            role="tabpanel"
+          >
+            <div class="rwa-form-grid">
+              <div class="field">
+                <label for="title_i18n_{{ suffix }}">标题 - {{ label }}</label>
+                <input id="title_i18n_{{ suffix }}" type="text" name="title_i18n_{{ suffix }}" value="{{ form['title_i18n_' ~ suffix] or '' }}" placeholder="黄金参考价" {% if suffix == 'zh' %}required{% endif %} />
+              </div>
+              <div class="field">
+                <label for="source_label_i18n_{{ suffix }}">副标题 - {{ label }}</label>
+                <input id="source_label_i18n_{{ suffix }}" type="text" name="source_label_i18n_{{ suffix }}" value="{{ form['source_label_i18n_' ~ suffix] or '' }}" placeholder="XAU/USD" />
+              </div>
+              <div class="field">
+                <label for="line_title_i18n_{{ suffix }}">线标题 - {{ label }}</label>
+                <input id="line_title_i18n_{{ suffix }}" type="text" name="line_title_i18n_{{ suffix }}" value="{{ form['line_title_i18n_' ~ suffix] or '' }}" placeholder="黄金参考价" />
+              </div>
+              <div class="field rwa-field-wide">
+                <label for="description_i18n_{{ suffix }}">描述 - {{ label }}</label>
+                <input id="description_i18n_{{ suffix }}" type="text" name="description_i18n_{{ suffix }}" value="{{ form['description_i18n_' ~ suffix] or '' }}" placeholder="1IGC=1克黄金" />
+              </div>
+              <div class="field">
+                <label for="display_value_label_i18n_{{ suffix }}">展示文案 - {{ label }}</label>
+                <input id="display_value_label_i18n_{{ suffix }}" type="text" name="display_value_label_i18n_{{ suffix }}" value="{{ form['display_value_label_i18n_' ~ suffix] or '' }}" placeholder="仅 MANUAL 或兜底使用" />
+              </div>
+            </div>
+          </div>
+        {% endfor %}
       </div>
 
       <div class="rwa-form-section">
@@ -183,6 +249,7 @@
         {% if price_source_value == 'AUTO' %}
           <div class="rwa-help-card">
             <div><strong>自动同步模式：</strong>前台价格由同步结果决定，手动填写的划线价格会保存，但不会直接生效；如需手动指定前台价格，请切换为 MANUAL。</div>
+            <div><strong>自动单位规则：</strong>AUTO 模式下前台单位由系统按类型和语言生成；GOLD 简体/繁体显示 <code>USD/克</code>，English/日本語显示 <code>USD/g</code>。下方“展示单位”仅用于 MANUAL 或兜底。</div>
             <div><strong>当前前台有效值：</strong>{{ form.effective_display_label or ((form.last_ref_price or form.display_price or '-') ~ ' ' ~ (form.display_unit or '')) }}</div>
             {% if form.source_price_label or form.last_ref_label %}
               <div><strong>来源价格说明：</strong>{{ form.source_price_label or form.last_ref_label }}</div>
@@ -226,6 +293,7 @@
         <div class="rwa-help-card">
           <div><strong>自动来源配置：</strong> <code>IRON</code> → <code>IRON62</code>；<code>GOLD</code> → <code>XAUUSD</code>；<code>STOCK</code> → <code>ITICK_STOCK</code></div>
           <div><strong>来源标的：</strong> GOLD 填 <code>XAUUSD</code>；STOCK 填真实股票代码，例如 <code>BON</code> / <code>CREG</code> / <code>IMAA</code>；IRON 可填 <code>IRON62</code> 或留空。</div>
+          <div><strong>GOLD 自动换算：</strong>XAU/USD 原始行情单位为 <code>USD/oz</code>；前台主展示价 = <code>XAU/USD ÷ 31.1034768</code>，单位由系统按语言显示：简体/繁体 <code>USD/克</code>，English/日本語 <code>USD/g</code>。</div>
           <div><strong>同步状态：</strong>只有 SUCCESS 且启用时，前台才展示参考价。</div>
         </div>
         <div class="rwa-form-grid">
@@ -310,6 +378,26 @@
       }
       typeSelect.addEventListener("change", syncKind);
       syncKind();
+    })();
+
+    (function () {
+      document.querySelectorAll("[data-rwa-i18n-form]").forEach(function (form) {
+        var tabs = Array.prototype.slice.call(form.querySelectorAll("[data-rwa-i18n-tab]"));
+        var panels = Array.prototype.slice.call(form.querySelectorAll("[data-rwa-i18n-panel]"));
+        tabs.forEach(function (tab) {
+          tab.addEventListener("click", function () {
+            var target = tab.getAttribute("data-rwa-i18n-tab");
+            tabs.forEach(function (item) {
+              var active = item === tab;
+              item.classList.toggle("is-active", active);
+              item.setAttribute("aria-selected", active ? "true" : "false");
+            });
+            panels.forEach(function (panel) {
+              panel.classList.toggle("is-active", panel.getAttribute("data-rwa-i18n-panel") === target);
+            });
+          });
+        });
+      });
     })();
   </script>
 {% endblock %}

@@ -130,12 +130,13 @@ function formatTransferAmount(value: string | number | null | undefined, symbol?
   });
 }
 
-function formatAssetQuantity(value: string | number | null | undefined): string {
+function formatAssetQuantity(value: string | number | null | undefined, precision = 4): string {
   const num = safeNum(value);
-  if (Math.abs(num) < 0.00000001) return '0';
+  const safePrecision = Math.max(0, Number.isFinite(Number(precision)) ? Number(precision) : 4);
   return num.toLocaleString('en-US', {
-    maximumFractionDigits: 8,
-  }).replace(/\.?0+$/, '');
+    minimumFractionDigits: safePrecision,
+    maximumFractionDigits: safePrecision,
+  });
 }
 
 function formatDistributionPercent(value: number | null): string {
@@ -988,8 +989,8 @@ function AssetDistributionSection({
                 <div className="flex min-w-0 items-center gap-2">
                   <span className="h-3 w-3 rounded-full" style={{ backgroundColor: item.color }} />
                   <span className="shrink-0 font-semibold text-white">{item.symbol}</span>
-                  <span className="truncate font-mono text-xs text-white/45">
-                    {formatAssetQuantity(item.amount)}
+                  <span className="shrink-0 font-mono text-xs tabular-nums text-white/45">
+                    {formatAssetQuantity(item.amount, item.precision)}
                   </span>
                 </div>
                 <div className="shrink-0 text-right text-xs text-white/55">

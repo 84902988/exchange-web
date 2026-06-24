@@ -18,6 +18,7 @@ import {
   type MeOut,
 } from '@/lib/api';
 import { AUTH_EXPIRED_EVENT } from '@/lib/api/core/request';
+import { getAccessToken, getRefreshToken } from '@/lib/api/core/token';
 
 interface AuthState {
   user: MeOut | null;
@@ -63,6 +64,10 @@ function cacheUser(user: MeOut | null) {
     return;
   }
   localStorage.setItem('userInfo', JSON.stringify(user));
+}
+
+function hasStoredAuthSession() {
+  return Boolean(getAccessToken() || getRefreshToken());
 }
 
 function isUnauthorizedError(error: unknown) {
@@ -142,6 +147,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           }));
         } else {
           setAuthState((prev) => ({ ...prev, error: null }));
+        }
+
+        if (!hasStoredAuthSession()) {
+          finishLoggedOut();
+          return;
         }
 
         try {

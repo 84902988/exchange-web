@@ -377,6 +377,8 @@
           <input type="hidden" name="home_hero_title" value="{{ form.home_hero_title or '' }}" />
           <input type="hidden" name="home_hero_subtitle" value="{{ form.home_hero_subtitle or '' }}" />
           <input type="hidden" name="home_hero_cta_text" value="{{ form.home_hero_cta_text or '' }}" />
+          <input type="hidden" name="app_download_title" value="{{ form.app_download_title or '' }}" />
+          <input type="hidden" name="app_download_subtitle" value="{{ form.app_download_subtitle or '' }}" />
           <input type="hidden" name="stock_token_locks_notice_title" value="{{ form.stock_token_locks_notice_title or '' }}" />
           <textarea name="stock_token_locks_notice_content">{{ form.stock_token_locks_notice_content or '' }}</textarea>
         </div>
@@ -434,6 +436,33 @@
 
         <div class="settings-card">
           <div class="settings-card-header">
+            <h3 class="settings-card-title">App 下载二维码</h3>
+            <p class="settings-card-desc">配置顶部下载入口展示的 Android / iOS 二维码；下载标题和说明在多语言内容中编辑。</p>
+          </div>
+          <div class="settings-grid">
+            <div class="field upload-field">
+              <label for="app_android_qr_url">Android 二维码 (app_android_qr_url)</label>
+              <div class="upload-control">
+                <input id="app_android_qr_url" name="app_android_qr_url" type="text" value="{{ form.app_android_qr_url or '' }}" placeholder="/static/uploads/site/android-qr.webp" />
+                <input id="app_android_qr_url_upload" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden />
+                <button id="app_android_qr_url_upload_btn" type="button" class="btn secondary admin-btn admin-btn-secondary">上传图片</button>
+              </div>
+              <span id="app_android_qr_url_upload_status" class="muted upload-status"></span>
+            </div>
+            <div class="field upload-field">
+              <label for="app_ios_qr_url">iOS 二维码 (app_ios_qr_url)</label>
+              <div class="upload-control">
+                <input id="app_ios_qr_url" name="app_ios_qr_url" type="text" value="{{ form.app_ios_qr_url or '' }}" placeholder="/static/uploads/site/ios-qr.webp" />
+                <input id="app_ios_qr_url_upload" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden />
+                <button id="app_ios_qr_url_upload_btn" type="button" class="btn secondary admin-btn admin-btn-secondary">上传图片</button>
+              </div>
+              <span id="app_ios_qr_url_upload_status" class="muted upload-status"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-card-header">
             <h3 class="settings-card-title">首页 Hero</h3>
             <p class="settings-card-desc">配置首页按钮跳转和背景媒体。标题、说明和按钮文案在多语言内容中编辑。</p>
           </div>
@@ -478,7 +507,9 @@
               ('stock_token_locks_notice_content', '股票锁仓说明内容', 'textarea'),
               ('home_hero_title', '首页 Hero 标题', 'input'),
               ('home_hero_subtitle', '首页 Hero 副标题', 'textarea'),
-              ('home_hero_cta_text', '首页 Hero 按钮文案', 'input')
+              ('home_hero_cta_text', '首页 Hero 按钮文案', 'input'),
+              ('app_download_title', 'App 下载标题', 'input'),
+              ('app_download_subtitle', 'App 下载说明', 'textarea')
             ] %}
             <div class="i18n-summary" aria-live="polite">
               {% for suffix, lang_label in i18n_languages %}
@@ -802,6 +833,8 @@
     }
 
     bindImageUpload("logo_url");
+    bindImageUpload("app_android_qr_url");
+    bindImageUpload("app_ios_qr_url");
     const homeHeroImageInput = document.getElementById("home_hero_image");
     if (homeHeroImageInput) {
       renderHeroMediaPreview(homeHeroImageInput.value);

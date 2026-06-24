@@ -894,9 +894,17 @@ export default function SpotOrderTabs({
 
   useEffect(() => {
     let dead = false
+    let connectTimer: number | null = null
 
     const normalizedSymbol = normalizeSymbol(symbol)
     currentSymbolRef.current = normalizedSymbol
+
+    const clearConnectTimer = () => {
+      if (connectTimer !== null) {
+        window.clearTimeout(connectTimer)
+        connectTimer = null
+      }
+    }
 
     const clearReconnectTimer = () => {
       if (reconnectTimerRef.current !== null) {
@@ -906,6 +914,7 @@ export default function SpotOrderTabs({
     }
 
     const closeWs = () => {
+      clearConnectTimer()
       clearReconnectTimer()
 
       if (wsRef.current) {
@@ -1023,7 +1032,10 @@ export default function SpotOrderTabs({
       }
     }
 
-    connect()
+    connectTimer = window.setTimeout(() => {
+      connectTimer = null
+      connect()
+    }, 100)
 
     return () => {
       dead = true
@@ -1309,12 +1321,12 @@ export default function SpotOrderTabs({
               <thead className="text-[12px] text-gray-400">
                 <tr className="border-b border-white/10">
                   <th className="w-[21%] py-1.5 pr-2 font-medium xl:py-2">{t('time', 'asset')}</th>
-                  <th className="w-[10%] py-1.5 pr-2 font-medium xl:py-2">{t('side', 'asset')}</th>
+                  <th className="w-[10%] py-1.5 pr-2 font-medium xl:py-2">{t('spotOrderSide', 'asset')}</th>
                   <th className="w-[13%] py-1.5 pr-2 font-medium xl:py-2">{t('price', 'asset')}</th>
-                  <th className="w-[15%] py-1.5 pr-2 font-medium xl:py-2">{t('amount', 'asset')}</th>
+                  <th className="w-[15%] py-1.5 pr-2 font-medium xl:py-2">{t('spotOrderAmount', 'asset')}</th>
                   <th className="w-[15%] py-1.5 pr-2 font-medium xl:py-2">{t('spotOrderFilledFee', 'asset')}</th>
                   <th className="w-[14%] py-1.5 pr-2 font-medium xl:py-2">{t('status', 'asset')}</th>
-                  <th className="w-[12%] py-1.5 text-right font-medium xl:py-2">{t('action', 'asset')}</th>
+                  <th className="w-[12%] py-1.5 text-right font-medium xl:py-2">{t('spotOrderAction', 'asset')}</th>
                 </tr>
               </thead>
 
@@ -1448,7 +1460,7 @@ function HistoryOrderRecords({ rows }: { rows: SpotOrderItem[] }) {
                 </div>
                 <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-white/45">
                   <RecordMeta label={t('spotOrderOrderPrice', 'asset')} value={formatOrderDisplayPrice(item, t)} />
-                  <RecordMeta label={t('amount', 'asset')} value={fmtAmount(item.amount)} />
+                  <RecordMeta label={t('spotOrderAmount', 'asset')} value={fmtAmount(item.amount)} />
                   <RecordMeta label={t('spotOrderFilledAmount', 'asset')} value={fmtAmount(item.filled_amount)} />
                 </div>
               </div>
@@ -1525,7 +1537,7 @@ function TradeRecords({
                 </div>
                 <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-white/45">
                   <RecordMeta label={t('spotOrderTradePrice', 'asset')} value={fmtPrice(item.price)} />
-                  <RecordMeta label={t('amount', 'asset')} value={fmtAmount(item.amount)} />
+                  <RecordMeta label={t('spotOrderAmount', 'asset')} value={fmtAmount(item.amount)} />
                   <RecordMeta label={t('spotOrderQuoteAmount', 'asset')} value={fmtAmount(item.quote_amount)} />
                 </div>
               </div>

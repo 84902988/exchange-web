@@ -18,6 +18,54 @@ interface VipLevelColumnProps {
   className?: string;
 }
 
+type VipTranslator = (key: string, namespace?: "user" | "common") => string;
+
+const VIP_LEVEL_NAME_KEYS: Record<string, string> = {
+  NORMAL: "vipLevelNameNormal",
+  VIP0: "vipLevelNameVIP0",
+  VIP1: "vipLevelNameVIP1",
+  VIP2: "vipLevelNameVIP2",
+  VIP3: "vipLevelNameVIP3",
+  VIP4: "vipLevelNameVIP4",
+  VIP5: "vipLevelNameVIP5",
+  VIP6: "vipLevelNameVIP6",
+  VIP7: "vipLevelNameVIP7",
+  VIP8: "vipLevelNameVIP8",
+  VIP9: "vipLevelNameVIP9",
+  SVIP0: "vipLevelNameSVIP0",
+  SVIP1: "vipLevelNameSVIP1",
+  SVIP2: "vipLevelNameSVIP2",
+  SVIP3: "vipLevelNameSVIP3",
+  SVIP4: "vipLevelNameSVIP4",
+  SVIP5: "vipLevelNameSVIP5",
+  SVIP6: "vipLevelNameSVIP6",
+  SVIP7: "vipLevelNameSVIP7",
+  SVIP8: "vipLevelNameSVIP8",
+  SVIP9: "vipLevelNameSVIP9",
+};
+
+function getVipLevelDisplayName(
+  t: VipTranslator,
+  levelCode: string | null | undefined,
+  fallbackName: string | null | undefined,
+) {
+  const normalizedCode = String(levelCode ?? "").trim().toUpperCase();
+  if (!normalizedCode) {
+    return fallbackName?.trim() || "--";
+  }
+
+  const translationKey = VIP_LEVEL_NAME_KEYS[normalizedCode];
+  if (translationKey) {
+    return t(translationKey, "user");
+  }
+
+  if (/^(VIP|SVIP)\d+$/.test(normalizedCode)) {
+    return normalizedCode;
+  }
+
+  return fallbackName?.trim() || normalizedCode;
+}
+
 function renderField(label: string, value: string) {
   return (
     <div className="flex h-full min-h-[64px] min-w-0 flex-col rounded-xl border border-white/[0.06] bg-white/[0.03] px-4 py-3">
@@ -40,6 +88,7 @@ export default function VipLevelColumn({
   const { t } = useLocaleContext();
   const isVip = type === "VIP";
   const highlighted = level ? isCurrentLevel(level.level_code, currentLevelCode) : false;
+  const displayLevelName = level ? getVipLevelDisplayName(t, level.level_code, level.level_name) : "";
 
   return (
     <article
@@ -58,7 +107,7 @@ export default function VipLevelColumn({
           <div className="flex min-h-[64px] flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div className="min-w-0">
               <div className="text-xs uppercase tracking-[0.24em] text-slate-500">{level.level_code}</div>
-              <h3 className="mt-2 text-xl font-semibold text-white">{level.level_name}</h3>
+              <h3 className="mt-2 text-xl font-semibold text-white">{displayLevelName}</h3>
             </div>
             {highlighted ? (
               <div className="inline-flex w-fit rounded-full border border-amber-300/25 bg-amber-400/10 px-3 py-1 text-xs font-medium text-amber-200">
@@ -80,7 +129,14 @@ export default function VipLevelColumn({
             ) : (
               <>
                 {renderField(t("rcbLockedAmount", "user"), formatAssetAmount(level.condition.min_lock_amount))}
-                {renderField(t("lockPeriod", "user"), formatLockPeriod(level.condition.lock_period_days))}
+                {renderField(
+                  t("lockPeriod", "user"),
+                  formatLockPeriod(
+                    level.condition.lock_period_days,
+                    t("vipLockPeriodNone", "user"),
+                    t("vipLockPeriodDays", "user"),
+                  ),
+                )}
                 {renderField(
                   t("userLimit", "user"),
                   level.condition.user_limit === null ? "--" : formatNumberLike(String(level.condition.user_limit)),

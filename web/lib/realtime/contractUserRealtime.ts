@@ -95,6 +95,7 @@ function getConfiguredWsUrl(symbol: string) {
 
 class ContractUserRealtimeClient {
   private ws: WebSocket | null = null;
+  private connectTimer: number | null = null;
   private reconnectTimer: number | null = null;
   private socketOpenedWithSymbol = '';
   private requestedSymbol = '';
@@ -123,7 +124,7 @@ class ContractUserRealtimeClient {
     }
 
     if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
-      this.connect(nextSymbol);
+      this.scheduleConnect(nextSymbol);
       return;
     }
 
@@ -167,6 +168,7 @@ class ContractUserRealtimeClient {
   disconnect() {
     this.closedByClient = true;
     this.loggedIn = false;
+    this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = '';
     this.requestedSymbol = '';
@@ -183,12 +185,24 @@ class ContractUserRealtimeClient {
     ws.close(1000, 'client disconnect');
   }
 
+  private scheduleConnect(symbol: string) {
+    if (typeof window === 'undefined') return;
+
+    this.clearConnectTimer();
+    this.connectTimer = window.setTimeout(() => {
+      this.connectTimer = null;
+      if (this.closedByClient || !this.loggedIn || !this.requestedSymbol) return;
+      this.connect(this.requestedSymbol || symbol);
+    }, 100);
+  }
+
   private connect(symbol: string) {
     if (typeof window === 'undefined') return;
 
     const wsUrl = getConfiguredWsUrl(symbol);
     if (!wsUrl) return;
 
+    this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = symbol;
     this.setStatus(this.status === 'disconnected' || this.status === 'reconnecting' ? 'reconnecting' : 'connecting');
@@ -288,6 +302,13 @@ class ContractUserRealtimeClient {
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+  }
+
+  private clearConnectTimer() {
+    if (this.connectTimer !== null) {
+      window.clearTimeout(this.connectTimer);
+      this.connectTimer = null;
     }
   }
 

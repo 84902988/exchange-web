@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -9,6 +9,10 @@ from sqlalchemy.orm import Session
 from app.db.models.reference_overlay import ReferenceOverlay
 from app.services.itick_market_service import itick_market_service
 from app.services.rwa_reference_service import get_iron62_reference_price
+
+
+TROY_OUNCE_GRAMS = Decimal("31.1034768")
+GOLD_DISPLAY_PRICE_QUANT = Decimal("0.01")
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -188,8 +192,9 @@ def _sync_gold_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbol
     try:
         payload = itick_market_service.get_market_quote(market="forex", region="GB", code="XAUUSD")
         xau_usd_price = _pick_decimal(payload, ("ld", "price", "last", "close"))
-        display_price = _decimal_from_payload(xau_usd_price / Decimal("1000"))
-        display_label = f"{_decimal_text(xau_usd_price)} USD/oz"
+        display_price = _decimal_from_payload(xau_usd_price / TROY_OUNCE_GRAMS)
+        display_label = f"{_decimal_text(display_price.quantize(GOLD_DISPLAY_PRICE_QUANT, rounding=ROUND_HALF_UP))} USD/g"
+        source_label = f"{_decimal_text(xau_usd_price)} USD/oz"
         price_time = _quote_time(payload, overlay.last_sync_at or datetime.utcnow())
     except Exception as exc:
         db.rollback()
@@ -201,7 +206,9 @@ def _sync_gold_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbol
         normalized_symbol=normalized_symbol,
         display_price=display_price,
         display_label=display_label,
+        source_label=source_label,
         price_time=price_time,
+        display_unit="USD/g",
     )
 
 
@@ -244,6 +251,7 @@ def _mark_success(
     display_label: str,
     price_time: datetime,
     source_label: str | None = None,
+    display_unit: str | None = None,
     market_status: str = "OPEN",
     market_status_text: str = "实时",
     is_realtime: bool = True,
@@ -264,6 +272,8 @@ def _mark_success(
     overlay.price_time = price_time
     overlay.display_price = display_price
     overlay.display_value_label = display_label
+    if display_unit:
+        overlay.display_unit = display_unit
     overlay.updated_at = now
     db.commit()
 

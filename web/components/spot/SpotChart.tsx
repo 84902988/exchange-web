@@ -1147,7 +1147,6 @@ export default function SpotChart({
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
       axisLabelVisible: true,
-      title: referenceOverlayConfig.lineTitle,
     });
 
     return () => {

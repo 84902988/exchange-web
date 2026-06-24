@@ -13,6 +13,7 @@ export interface AssetItem {
   total: number;
   price?: number;
   change24h?: number;
+  displayPrecision?: number;
 }
 
 interface AssetTableProps {
