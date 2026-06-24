@@ -94,6 +94,7 @@ ADMIN_RQ_QUEUE_NAMES = (
 ADMIN_RQ_WORKER_ONLINE_SECONDS = 60
 ADMIN_HEARTBEAT_SERVICE_NAMES = {
     "withdraw_fee_scheduler",
+    "spot_match_worker",
     "dealer_loop",
     "liquidation_scanner",
     "tp_sl_scanner",
@@ -207,6 +208,15 @@ ADMIN_SERVICE_OVERVIEW_GROUPS = (
                 "impact": "不会自动投递提现手续费维护任务，maintenance worker 可能空转。",
                 "systemd": "exchange-withdraw-fee-scheduler.service",
                 "windows": "python backend/scripts/start_withdraw_fee_scheduler.py",
+            },
+            {
+                "key": "spot_match_worker",
+                "name": "spot match worker",
+                "type": "Worker",
+                "expected": "single instance",
+                "impact": "Spot internal matching orders will not be matched automatically.",
+                "systemd": "exchange-spot-match-worker.service",
+                "windows": "python backend/scripts/start_spot_match_worker.py",
             },
             {
                 "key": "dealer_loop",
