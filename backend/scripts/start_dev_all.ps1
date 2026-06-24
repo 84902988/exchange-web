@@ -66,6 +66,11 @@ if (-not (Test-Path -LiteralPath $CollectionAutoSchedulerScript)) {
     throw "Missing collection auto scheduler script: $CollectionAutoSchedulerScript"
 }
 $QuotedCollectionAutoSchedulerScript = Quote-ForPowerShell $CollectionAutoSchedulerScript
+$SpotMatchWorkerScript = Join-Path $RepoRoot "backend\scripts\start_spot_match_worker.py"
+if (-not (Test-Path -LiteralPath $SpotMatchWorkerScript)) {
+    throw "Missing spot match worker script: $SpotMatchWorkerScript"
+}
+$QuotedSpotMatchWorkerScript = Quote-ForPowerShell $SpotMatchWorkerScript
 $DealerLoopScript = Join-Path $RepoRoot "backend\scripts\start_dealer_loop.py"
 if (-not (Test-Path -LiteralPath $DealerLoopScript)) {
     throw "Missing dealer loop script: $DealerLoopScript"
@@ -136,6 +141,11 @@ Start-DevProcess `
     -Title "exchange collection auto scheduler" `
     -WorkingDirectory $RepoRoot `
     -Command "& $QuotedPython $QuotedCollectionAutoSchedulerScript"
+
+Start-DevProcess `
+    -Title "exchange spot match worker" `
+    -WorkingDirectory $RepoRoot `
+    -Command "& $QuotedPython $QuotedSpotMatchWorkerScript"
 
 Start-DevProcess `
     -Title "exchange dealer loop" `
