@@ -1,5 +1,5 @@
 import React, {useCallback, useEffect, useMemo, useState} from 'react';
-import {Alert, Pressable, StyleSheet, Text, View} from 'react-native';
+import {Pressable, StyleSheet, Text, View} from 'react-native';
 import {useNavigation} from '@react-navigation/native';
 import type {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {BadgeCheck, ShieldCheck} from 'lucide-react-native';
@@ -12,7 +12,9 @@ import AssetCoinList from '../../components/assets/AssetCoinList';
 import AssetEmptyState from '../../components/assets/AssetEmptyState';
 import AssetInviteSummary from '../../components/assets/AssetInviteSummary';
 import AssetOverviewCard from '../../components/assets/AssetOverviewCard';
-import AssetQuickActions from '../../components/assets/AssetQuickActions';
+import AssetQuickActions, {
+  type AssetQuickActionKey,
+} from '../../components/assets/AssetQuickActions';
 import AssetTopTabs, {
   type AssetTabKey,
 } from '../../components/assets/AssetTopTabs';
@@ -158,9 +160,15 @@ export default function AssetsScreen() {
     [balances],
   );
 
-  const handleQuickAction = useCallback((label: string) => {
-    Alert.alert(label, '该入口已预留，V1 暂不进入真实充值、提现、划转或流水流程。');
-  }, []);
+  const handleQuickAction = useCallback(
+    (action: AssetQuickActionKey) => {
+      if (action === 'deposit') navigation.navigate('AssetDeposit');
+      if (action === 'withdraw') navigation.navigate('AssetWithdraw');
+      if (action === 'transfer') navigation.navigate('AssetTransfer');
+      if (action === 'history') navigation.navigate('AssetHistory');
+    },
+    [navigation],
+  );
 
   return (
     <AppScreen>

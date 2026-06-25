@@ -10,21 +10,23 @@ import {
 import {colors, typography} from '../../theme';
 
 type Props = {
-  onActionPress: (label: string) => void;
+  onActionPress: (action: AssetQuickActionKey) => void;
 };
 
-const actions: Array<{label: string; Icon: LucideIcon}> = [
-  {label: '充值', Icon: ArrowDownToLine},
-  {label: '提现', Icon: ArrowUpFromLine},
-  {label: '划转', Icon: ArrowRightLeft},
-  {label: '资金流水', Icon: ReceiptText},
+export type AssetQuickActionKey = 'deposit' | 'withdraw' | 'transfer' | 'history';
+
+const actions: Array<{key: AssetQuickActionKey; label: string; Icon: LucideIcon}> = [
+  {key: 'deposit', label: '充值', Icon: ArrowDownToLine},
+  {key: 'withdraw', label: '提现', Icon: ArrowUpFromLine},
+  {key: 'transfer', label: '划转', Icon: ArrowRightLeft},
+  {key: 'history', label: '资金流水', Icon: ReceiptText},
 ];
 
 function AssetQuickActions({onActionPress}: Props) {
   return (
     <View style={styles.row}>
-      {actions.map(({label, Icon}) => (
-        <Pressable key={label} style={styles.action} onPress={() => onActionPress(label)}>
+      {actions.map(({key, label, Icon}) => (
+        <Pressable key={key} style={styles.action} onPress={() => onActionPress(key)}>
           <View style={styles.iconWrap}>
             <Icon color={colors.gold} size={18} strokeWidth={2.2} />
           </View>
