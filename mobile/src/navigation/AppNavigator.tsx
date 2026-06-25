@@ -8,6 +8,10 @@ import {createNativeStackNavigator} from '@react-navigation/native-stack';
 import SplashScreen from '../screens/SplashScreen';
 import AuthStack from './AuthStack';
 import MainTabs from './MainTabs';
+import AssetHistoryScreen from '../screens/assets/AssetHistoryScreen';
+import DepositScreen from '../screens/assets/DepositScreen';
+import TransferScreen from '../screens/assets/TransferScreen';
+import WithdrawScreen from '../screens/assets/WithdrawScreen';
 import type {RootStackParamList} from './types';
 import {colors} from '../theme';
 
@@ -37,6 +41,10 @@ export default function AppNavigator() {
         }}>
         <Stack.Screen name="Splash" component={SplashScreen} />
         <Stack.Screen name="Main" component={MainTabs} />
+        <Stack.Screen name="AssetDeposit" component={DepositScreen} />
+        <Stack.Screen name="AssetWithdraw" component={WithdrawScreen} />
+        <Stack.Screen name="AssetTransfer" component={TransferScreen} />
+        <Stack.Screen name="AssetHistory" component={AssetHistoryScreen} />
         <Stack.Screen
           name="Auth"
           component={AuthStack}
