@@ -17,4 +17,8 @@ export type RootStackParamList = {
   Splash: undefined;
   Main: undefined;
   Auth: NavigatorScreenParams<AuthStackParamList> | undefined;
+  AssetDeposit: undefined;
+  AssetWithdraw: undefined;
+  AssetTransfer: undefined;
+  AssetHistory: undefined;
 };
