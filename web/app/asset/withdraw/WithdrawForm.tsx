@@ -163,17 +163,17 @@ function resolveAmountPrecision(symbol: string, option?: WithdrawOptionItem | nu
   return defaultPrecisionForCoin(symbol);
 }
 
-function formatCoinAmount(value: unknown, precision: number): string {
+function formatCoinAmount(value: unknown, precision: number, useGrouping = true): string {
   const n = Number(value);
   if (!Number.isFinite(n) || n === 0) return "0";
   return n
-    .toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: precision })
+    .toLocaleString("en-US", { useGrouping, minimumFractionDigits: 0, maximumFractionDigits: precision })
     .replace(/(\.\d*?)0+$/, "$1")
     .replace(/\.$/, "");
 }
 
 function clampDecimals(v: string, precision: number): string {
-  const s = (v ?? "").trim();
+  const s = (v ?? "").trim().replace(/,/g, "");
   if (!s) return "";
   const m = s.match(new RegExp(`^\\d*(?:\\.\\d{0,${precision}})?`));
   return m ? m[0] : "";
@@ -981,7 +981,7 @@ export default function WithdrawForm(props: Props) {
                     }
                     onError("");
                     setInternalError("");
-                    setAmount(formatCoinAmount(currentBalance.availableNum, amountPrecision));
+                    setAmount(formatCoinAmount(currentBalance.availableNum, amountPrecision, false));
                   }}
                   className="text-xs text-white/70 hover:text-white"
                 >

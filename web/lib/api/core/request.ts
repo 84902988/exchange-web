@@ -1,7 +1,7 @@
 import { ApiResponse } from "./types";
 import { ApiError } from "./error";
 import { getRuntimeApiBaseUrl } from "./baseUrl";
-import { getAccessToken, getRefreshToken } from "./token";
+import { getAccessToken, getRefreshToken, setTokens } from "./token";
 
 export const AUTH_EXPIRED_EVENT = "app:auth-expired";
 
@@ -71,12 +71,49 @@ function readString(value: unknown): string | undefined {
 // ====== Refresh 并发控制：同一时间只发一次 refresh ======
 let refreshPromise: Promise<boolean> | null = null;
 
+type RefreshTokenPayload = {
+  access_token?: string;
+  refresh_token?: string;
+  token_type?: string;
+  access_expires_in?: number;
+};
+
+function extractRefreshTokenPayload(payload: unknown): RefreshTokenPayload | null {
+  if (!isRecord(payload)) return null;
+
+  const rootAccessToken = readString(payload.access_token);
+  const rootRefreshToken = readString(payload.refresh_token);
+  if (rootAccessToken || rootRefreshToken) {
+    return {
+      access_token: rootAccessToken,
+      refresh_token: rootRefreshToken,
+      token_type: readString(payload.token_type),
+      access_expires_in:
+        typeof payload.access_expires_in === "number" ? payload.access_expires_in : undefined,
+    };
+  }
+
+  const data = payload.data;
+  if (!isRecord(data)) return null;
+
+  const accessToken = readString(data.access_token);
+  const refreshToken = readString(data.refresh_token);
+  if (!accessToken && !refreshToken) return null;
+
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    token_type: readString(data.token_type),
+    access_expires_in:
+      typeof data.access_expires_in === "number" ? data.access_expires_in : undefined,
+  };
+}
+
 async function refreshSession(baseUrl: string): Promise<boolean> {
   // 你后端 refresh 路径按你项目改：
   // 常见：/auth/refresh 或 /auth/token/refresh
   const refreshUrl = joinUrl(baseUrl, "/auth/refresh");
   const refreshToken = getRefreshToken();
-  if (!refreshToken) return false;
 
   try {
     const resp = await fetch(refreshUrl, {
@@ -92,8 +129,13 @@ async function refreshSession(baseUrl: string): Promise<boolean> {
 
     if (!resp.ok) return false;
 
-    const data = (await resp.json()) as ApiResponse<{ message?: string }>;
-    return !!data?.ok;
+    const data = (await resp.json()) as ApiResponse<RefreshTokenPayload> | RefreshTokenPayload;
+    const tokens = extractRefreshTokenPayload(data);
+    if (tokens) {
+      setTokens(tokens);
+    }
+
+    return isRecord(data) && "ok" in data ? data.ok === true : Boolean(tokens);
   } catch {
     return false;
   }

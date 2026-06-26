@@ -351,7 +351,7 @@ class BalanceLog(Base):
     coin_symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     chain_key: Mapped[str] = mapped_column(String(32), nullable=False)
 
-    change_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    change_type: Mapped[str] = mapped_column(String(64), nullable=False)
     direction: Mapped[int] = mapped_column(Integer, nullable=False)
     change_amount: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False)
 

@@ -6,11 +6,11 @@ const REFRESH_COOKIE = 'refresh_token';
 const RESTRICTED_PATH = '/restricted';
 const LEGACY_RESTRICTED_PATH = '/region-restricted';
 const BACKEND_ORIGIN =
-  process.env.NEXT_PUBLIC_BACKEND_ORIGIN ||
-  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  process.env.INTERNAL_BACKEND_ORIGIN ||
+  process.env.BACKEND_ORIGIN ||
   'http://127.0.0.1:8000';
 const TEST_LOCAL_GEO_ACCESS = process.env.WEB_GEO_ACCESS_TEST_LOCAL === 'true';
-const CHECK_TIMEOUT_MS = Number(process.env.WEB_GEO_ACCESS_CHECK_TIMEOUT_MS || 8000);
+const CHECK_TIMEOUT_MS = Number(process.env.WEB_GEO_ACCESS_CHECK_TIMEOUT_MS || 1500);
 
 const STATIC_FILE_EXTENSIONS =
   /\.(?:avif|bmp|css|cur|gif|ico|jpeg|jpg|js|json|map|mjs|otf|png|svg|ttf|txt|webmanifest|woff|woff2|xml)$/i;
@@ -60,6 +60,9 @@ function shouldCheckGeoAccess(req: NextRequest): { check: boolean; reason?: stri
   if (shouldBypassLocalHost(req)) return { check: false, reason: 'localhost' };
   if (pathname === RESTRICTED_PATH || pathname === LEGACY_RESTRICTED_PATH) {
     return { check: false, reason: 'restricted-page' };
+  }
+  if (pathname === '/geo-access' || pathname.startsWith('/geo-access/')) {
+    return { check: false, reason: 'geo-access' };
   }
   if (pathname === '/api' || pathname.startsWith('/api/')) return { check: false, reason: 'api' };
   if (pathname === '/admin' || pathname.startsWith('/admin/')) return { check: false, reason: 'admin' };

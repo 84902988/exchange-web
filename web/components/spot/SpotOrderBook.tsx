@@ -86,6 +86,7 @@ type WsSnapshotMessage = {
 
 const ORDERBOOK_LEVEL_LIMIT = 9;
 const DEPTH_POLL_MS = 1500;
+const INTERNAL_DEPTH_RECONCILE_MS = 3000;
 
 function toNum(v: string | number | undefined | null): number {
   const n = Number(v);
@@ -196,6 +197,7 @@ export default function SpotOrderBook({
 
     let alive = true;
     let pollTimer: number | null = null;
+    let snapshotRequestPending = false;
 
     const applyDepthSnapshot = (depth?: Partial<SpotDepthResponse> & {
       asks?: SpotDepthLevel[];
@@ -232,6 +234,9 @@ export default function SpotOrderBook({
     };
 
     const loadDepthSnapshot = async () => {
+      if (snapshotRequestPending) return;
+      snapshotRequestPending = true;
+
       try {
         const depth = await getSpotDepth(normalizedSymbol, ORDERBOOK_LEVEL_LIMIT);
 
@@ -249,6 +254,8 @@ export default function SpotOrderBook({
         onDepthDataChangeRef.current?.({ asks: [], bids: [] });
         setLoading(false);
         console.error('[SpotOrderBook] depth load failed:', err);
+      } finally {
+        snapshotRequestPending = false;
       }
     };
 
@@ -318,6 +325,9 @@ export default function SpotOrderBook({
     } else {
       void loadDepthSnapshot();
       subscribeRealtime();
+      pollTimer = window.setInterval(() => {
+        void loadDepthSnapshot();
+      }, INTERNAL_DEPTH_RECONCILE_MS);
     }
 
     return () => {
