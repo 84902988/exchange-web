@@ -5755,7 +5755,7 @@ def _collection_center_context(
         "view": selected_view,
         "chain_key": str(chain_key or "").strip().lower(),
         "coin_symbol": str(coin_symbol or "").strip().upper(),
-        "status": "",
+        "status": "PENDING",
         "source": str(source or "").strip().upper(),
         "min_amount": str(min_amount or "").strip(),
         "user_id": str(user_id or "").strip(),

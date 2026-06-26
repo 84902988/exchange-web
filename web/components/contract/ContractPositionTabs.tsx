@@ -1045,7 +1045,11 @@ function SummaryPositionsCards({
           ? getTpSlReferencePrice(quote, tpSlTriggerPriceType, markPrice)
           : markPrice;
         const liquidationPrice = toNumber(item.liquidation_price);
-        const unrealized = toNumber(item.unrealized_pnl);
+        const realtimeUnrealized = item.positions.reduce(
+          (sum, position) => sum + calculatePositionUnrealizedPnl(position, markPrice),
+          0,
+        );
+        const unrealized = item.positions.length > 0 ? realtimeUnrealized : toNumber(item.unrealized_pnl);
         const pnlPercent = calcUnrealizedPnlPercent(unrealized, item.margin_amount);
         const displayUnit = scope === 'current' ? quantityUnit : inferPositionQuantityUnit(item.symbol, quantityUnit);
         const closing = closingSummaryKey === summaryKey;
@@ -1117,10 +1121,10 @@ function SummaryPositionsCards({
                 label={t('liquidationPrice', 'contracts')}
                 value={liquidationPrice > 0 ? `${formatDisplayPrice(item.liquidation_price, pricePrecision)} USDT` : '--'}
               />
-              <PositionMetric label={t('margin', 'contracts')} value={`${formatNumber(item.margin_amount, 2)} USDT`} />
+              <PositionMetric label={t('margin', 'contracts')} value={`${formatNumber(item.margin_amount, 4)} USDT`} />
               <PositionMetric
                 label={t('unrealizedPnl', 'contracts')}
-                value={`${formatSignedPnl(item.unrealized_pnl, 4)} USDT`}
+                value={`${formatSignedPnl(unrealized, 4)} USDT`}
                 valueClassName={unrealized > 0 ? 'text-[#00c087]' : unrealized < 0 ? 'text-[#f6465d]' : 'text-white/55'}
               />
               <PositionMetric
@@ -1724,8 +1728,7 @@ function PositionDetailCard({
 }) {
   const { t } = useLocaleContext();
   const detailMarkPrice = toNumber(markPrice) > 0 ? markPrice : position.mark_price;
-  const markNumber = toNumber(detailMarkPrice);
-  const unrealized = markNumber > 0 ? calculateUnrealizedPnl(position, markNumber) : toNumber(position.unrealized_pnl);
+  const unrealized = calculatePositionUnrealizedPnl(position, markPrice);
   const takeProfitBadge = formatOptionalTpSlBadge(position.take_profit_price, pricePrecision);
   const stopLossBadge = formatOptionalTpSlBadge(position.stop_loss_price, pricePrecision);
   const isOpen = position.status === 'OPEN';
@@ -2251,6 +2254,12 @@ function calculateUnrealizedPnl(item: ContractPositionItem, markPrice: number) {
   return item.side === 'LONG'
     ? (markPrice - entryPrice) * quantity
     : (entryPrice - markPrice) * quantity;
+}
+
+function calculatePositionUnrealizedPnl(position: ContractPositionItem, markPrice: string | number | null) {
+  const detailMarkPrice = toNumber(markPrice) > 0 ? markPrice : position.mark_price;
+  const markNumber = toNumber(detailMarkPrice);
+  return markNumber > 0 ? calculateUnrealizedPnl(position, markNumber) : toNumber(position.unrealized_pnl);
 }
 
 function statusLabel(value: string, closeReason?: string | null, t?: ContractTranslator) {
