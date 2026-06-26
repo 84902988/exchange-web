@@ -229,7 +229,7 @@
           {% for card in network_cards %}
             {% set collectible_count = card.collectible_count or 0 %}
             {% set pending_count = card.pending_verify_count or 0 %}
-            <a class="collection-network-card {% if filters.chain_key == card.chain_key %}is-active{% endif %} {% if collectible_count > 0 %}has-collectible{% else %}is-quiet{% endif %}" href="/admin/collections/center?chain_key={{ card.chain_key }}">
+            <a class="collection-network-card {% if filters.chain_key == card.chain_key %}is-active{% endif %} {% if collectible_count > 0 %}has-collectible{% else %}is-quiet{% endif %}" href="{{ request.url.include_query_params(chain_key=card.chain_key, page=1) }}">
               <div class="collection-network-head">
                 <div>
                   <div class="collection-network-title">{{ card.chain_name or card.chain_key }}</div>
@@ -278,14 +278,10 @@
         <input type="hidden" name="page" value="1">
         <input type="hidden" name="per_page" value="{{ pagination.per_page or filters.per_page or 20 }}">
         <input type="hidden" name="chain_key" value="{{ filters.chain_key or '' }}">
+        <input type="hidden" name="status" value="PENDING">
         <div>
           <label for="filter-status">状态</label>
-          <select id="filter-status" name="status">
-            <option value="PENDING" {% if (filters.status or "PENDING") == "PENDING" %}selected{% endif %}>待处理</option>
-            <option value="NO_BALANCE" {% if filters.status == "NO_BALANCE" %}selected{% endif %}>无可归集余额</option>
-            <option value="ALL" {% if filters.status == "ALL" %}selected{% endif %}>全部</option>
-            <option value="COLLECTED" {% if filters.status == "COLLECTED" %}selected{% endif %}>已归集</option>
-          </select>
+          <input id="filter-status" value="待处理" readonly>
         </div>
         <div>
           <label for="filter-coin">币种</label>

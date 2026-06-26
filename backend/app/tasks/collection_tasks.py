@@ -49,6 +49,7 @@ from app.services.collection_service import (
     mark_gas_task_sent,
     mark_gas_task_skipped,
     record_collection_task_failure_note,
+    refresh_collection_batch_aggregate,
 )
 from app.services.collection_tx_confirm_service import confirm_collection_task_tx, confirm_gas_task_tx
 from app.services.evm_wallet import derive_evm_private_key_by_chain
@@ -1670,6 +1671,7 @@ def process_collection_task(task_id: int, *, allow_real_send: bool = False) -> d
         gas_required = False
         should_collect = True
         dryrun_note = ""
+        evaluation = None
         try:
             meta = _load_asset_chain_meta(db, task, real_send_enabled=real_send_enabled)
             configured_min_amount = _load_collection_min_amount(db, task)
@@ -1706,8 +1708,34 @@ def process_collection_task(task_id: int, *, allow_real_send: bool = False) -> d
                 gas_required = False
         except (CollectionBalanceCheckerError, Exception) as exc:
             dryrun_note = f"DRY_RUN_ONCHAIN_SKIPPED: {str(exc)[:180]}"
+            if real_send_enabled:
+                _mark_collection_task_pending_send_reason(db, task, dryrun_note)
+                db.commit()
+                _publish_collection_task_changed_now(task)
+                return {
+                    "ok": False,
+                    "status": CollectionTaskStatus.PENDING.value,
+                    "task_id": task.id,
+                    "error": dryrun_note,
+                }
             should_collect = Decimal(str(task.amount or 0)) > 0
             gas_required = False
+
+        if should_collect and evaluation is not None:
+            evaluated_amount = Decimal(str(evaluation.collect_amount or 0))
+            if Decimal(str(task.amount or 0)) != evaluated_amount:
+                logger.info(
+                    "collection task amount resynced from onchain evaluation task_id=%s chain_key=%s coin_symbol=%s old_amount=%s new_amount=%s",
+                    task.id,
+                    task.chain_key,
+                    task.coin_symbol,
+                    task.amount,
+                    evaluated_amount,
+                )
+                task.amount = evaluated_amount
+                task.reason = evaluation.reason
+                db.flush()
+                refresh_collection_batch_aggregate(db, task.batch_id)
 
         if not should_collect:
             mark_collection_task_skipped(db, task.id, "DRY_RUN_NOT_COLLECTIBLE")

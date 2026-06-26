@@ -45,7 +45,6 @@ export type AssetTranslator = (key: string, namespace?: "asset") => string;
 const SUCCESS_WITHDRAW_STATUSES = new Set(["SUCCESS", "SUCCEEDED", "COMPLETED", "CONFIRMED"]);
 const FAILED_WITHDRAW_STATUSES = new Set(["FAILED", "REJECTED", "CANCELED_BY_ADMIN"]);
 const PROCESSING_WITHDRAW_STATUSES = new Set([
-  "FROZEN",
   "SENT",
   "SENDING",
   "PENDING",
@@ -129,6 +128,18 @@ export function getWithdrawStatusMeta(
       title: assetText(t, "withdrawStatusVerifyingTitle"),
       message: assetText(t, "withdrawStatusVerifyingMessage"),
       className: "border-sky-500/30 text-sky-200 bg-sky-500/10",
+      terminal: false,
+    };
+  }
+
+  if (canonical === "FROZEN") {
+    return {
+      canonical,
+      kind: "processing",
+      badge: assetText(t, "withdrawStatusFrozenBadge"),
+      title: assetText(t, "withdrawStatusFrozenTitle"),
+      message: assetText(t, "withdrawStatusFrozenMessage"),
+      className: "border-amber-500/30 text-amber-200 bg-amber-500/10",
       terminal: false,
     };
   }
@@ -262,7 +273,17 @@ export function getWithdrawProgress(status?: string | null, t?: AssetTranslator)
     };
   }
 
-  if (["FROZEN", "APPROVED", "PROCESSING", "PENDING"].includes(canonical)) {
+  if (canonical === "FROZEN") {
+    return {
+      canonical,
+      caption: assetText(t, "withdrawProgressFrozen"),
+      terminal: false,
+      tone: "normal",
+      steps: makeSteps(1, null),
+    };
+  }
+
+  if (["APPROVED", "PROCESSING", "PENDING"].includes(canonical)) {
     return {
       canonical,
       caption: assetText(t, "withdrawProgressProcessing"),
@@ -429,6 +450,13 @@ export function mapWithdrawUserMessage(message?: unknown, t?: AssetTranslator): 
   if (!raw || raw === "-" || raw === "--") return "";
 
   const upper = raw.toUpperCase();
+  const lower = raw.toLowerCase();
+  if (upper.includes("CODE_INVALID") || lower.includes("code incorrect")) {
+    return assetText(t, "assetWithdrawRecordsIncorrectVerificationCode");
+  }
+  if (upper.includes("CODE_EXPIRED") || lower.includes("code expired")) {
+    return assetText(t, "assetWithdrawRecordsVerificationCodeExpired");
+  }
   const hasTechnicalPrefix = WITHDRAW_USER_TECHNICAL_PREFIXES.some((prefix) => upper.startsWith(prefix));
   const hasTechnicalDetail =
     raw.includes("\u5185\u90e8\u7cfb\u7edf\u9519\u8bef") ||
