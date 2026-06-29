@@ -39,6 +39,25 @@ class ContractMarketWsManager:
         self._socket_intervals: dict[WebSocket, str] = {}
         self._lock = asyncio.Lock()
 
+    def _socket_connected(self, websocket: WebSocket) -> bool:
+        return (
+            websocket.application_state == WebSocketState.CONNECTED
+            and websocket.client_state == WebSocketState.CONNECTED
+        )
+
+    def _prune_symbol_locked(self, symbol: str) -> None:
+        room = self._symbol_rooms.get(symbol)
+        if not room:
+            self._symbol_rooms.pop(symbol, None)
+            return
+        dead = [websocket for websocket in room if not self._socket_connected(websocket)]
+        for websocket in dead:
+            room.discard(websocket)
+            self._socket_symbols.pop(websocket, None)
+            self._socket_intervals.pop(websocket, None)
+        if not room:
+            self._symbol_rooms.pop(symbol, None)
+
     async def connect(
         self,
         symbol: str,
@@ -81,16 +100,19 @@ class ContractMarketWsManager:
     async def has_subscribers(self, symbol: str) -> bool:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         async with self._lock:
+            self._prune_symbol_locked(normalized_symbol)
             return bool(self._symbol_rooms.get(normalized_symbol))
 
     async def subscriber_count(self, symbol: str) -> int:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         async with self._lock:
+            self._prune_symbol_locked(normalized_symbol)
             return len(self._symbol_rooms.get(normalized_symbol) or ())
 
     async def subscribed_intervals(self, symbol: str) -> list[str]:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         async with self._lock:
+            self._prune_symbol_locked(normalized_symbol)
             sockets = list(self._symbol_rooms.get(normalized_symbol) or ())
             values = {
                 normalize_contract_ws_interval(self._socket_intervals.get(websocket))
@@ -106,6 +128,7 @@ class ContractMarketWsManager:
         if not normalized_symbol:
             return
         async with self._lock:
+            self._prune_symbol_locked(normalized_symbol)
             sockets = list(self._symbol_rooms.get(normalized_symbol) or ())
         if not sockets:
             return
