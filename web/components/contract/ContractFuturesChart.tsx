@@ -46,6 +46,7 @@ import {
 import {
   contractMarketRealtime,
   type ContractMarketRealtimeMessage,
+  type ContractMarketRealtimeStatus,
 } from '@/lib/realtime/contractMarketRealtime';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 
@@ -56,6 +57,7 @@ type ContractFuturesChartProps = {
   marketStatus?: string | null;
   marketSessionType?: string | null;
   quoteFreshness?: string | null;
+  marketRealtimeStatus?: ContractMarketRealtimeStatus;
   pricePrecision?: number | null;
   latestCandlePatchPrice?: string | number | null;
   latestPriceTimestamp?: string | number | null;
@@ -475,10 +477,13 @@ function extractRealtimeTradeMessage(
 function extractRealtimeKline(
   message: ContractMarketRealtimeMessage,
   currentSymbol: string,
+  currentInterval: string,
 ) {
   const payload = getRealtimePayload(message);
   const msgSymbol = normalizeRealtimeSymbol(message, payload);
   if (msgSymbol && msgSymbol !== currentSymbol.toUpperCase()) return null;
+  const msgInterval = String(message.interval || payload.interval || '').trim().toLowerCase();
+  if (msgInterval && msgInterval !== String(currentInterval || '').trim().toLowerCase()) return null;
 
   const open = payload.open;
   const high = payload.high;
@@ -624,6 +629,7 @@ export default function ContractFuturesChart({
   height = 520,
   marketStatus,
   pricePrecision: explicitPricePrecision,
+  marketRealtimeStatus = 'idle',
   latestCandlePatchPrice,
   latestPriceTimestamp,
   allowLatestPriceCandlePatch = true,
@@ -1151,6 +1157,11 @@ export default function ContractFuturesChart({
       setLoading(true);
     }
     void loadKlines();
+    if (marketRealtimeStatus === 'connected') {
+      return () => {
+        alive = false;
+      };
+    }
     const timer = window.setInterval(() => {
       void loadKlines();
     }, 1500);
@@ -1159,13 +1170,13 @@ export default function ContractFuturesChart({
       alive = false;
       window.clearInterval(timer);
     };
-  }, [applyTrustedLatestPricePatch, symbol, interval, t]);
+  }, [applyTrustedLatestPricePatch, symbol, interval, marketRealtimeStatus, t]);
 
   useEffect(() => {
     const applyRealtimeUpdate = (message: ContractMarketRealtimeMessage) => {
       if (marketStatus === 'CLOSED') return;
 
-      const realtimeKline = extractRealtimeKline(message, symbol);
+      const realtimeKline = extractRealtimeKline(message, symbol, interval);
       let updated = realtimeKline
         ? upsertRealtimeKline(
           candlesRef.current,
@@ -1586,7 +1597,7 @@ export default function ContractFuturesChart({
         )}
         {loadingMore && realCandleCount > 0 && (
           <div className="pointer-events-none absolute left-3 top-3 rounded border border-white/[0.08] bg-black/45 px-2 py-1 text-[11px] text-white/58">
-            Loading history...
+            正在加载历史数据...
           </div>
         )}
       </div>

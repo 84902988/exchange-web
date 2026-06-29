@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 
 from app.db.models.contract_symbol import ContractSymbol
@@ -31,6 +32,12 @@ from app.services.contract_market_service import (
     get_contract_recent_trades,
     get_contract_tickers,
 )
+from app.services.contract_market_gateway import contract_market_gateway
+from app.services.contract_market_ws import (
+    contract_market_ws_manager,
+    normalize_contract_ws_interval,
+    normalize_contract_ws_symbol,
+)
 from app.services.market_cache import cache_fetch_json, market_cache_key
 
 router = APIRouter(prefix="/contract/market", tags=["contract-market"])
@@ -39,6 +46,43 @@ logger = logging.getLogger(__name__)
 CONTRACT_TICKER_CACHE_VERSION = "1"
 CONTRACT_TICKER_FIELD_VERSION = "ticker_fields_v2"
 CONTRACT_TICKER_PROVIDER_VERSION = "default"
+
+
+def _parse_ws_receive(message: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if message.get("type") == "websocket.disconnect":
+        return "disconnect", {}
+    if message.get("type") != "websocket.receive":
+        return "", {}
+
+    if message.get("text") is not None:
+        text = str(message.get("text") or "").strip()
+        if text == "ping":
+            return "ping", {}
+        if text.startswith("subscribe:"):
+            raw_symbol = text.split(":", 1)[1].strip()
+            symbol, _, interval = raw_symbol.partition(":")
+            return "subscribe", {
+                "symbol": normalize_contract_ws_symbol(symbol),
+                "interval": normalize_contract_ws_interval(interval or None),
+            }
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return "", {}
+        if isinstance(parsed, dict):
+            action = str(parsed.get("type") or parsed.get("action") or "").strip().lower()
+            return action, parsed
+        return "", {}
+
+    if message.get("bytes") is not None:
+        try:
+            parsed = json.loads(message["bytes"].decode("utf-8"))
+        except Exception:
+            return "", {}
+        if isinstance(parsed, dict):
+            action = str(parsed.get("type") or parsed.get("action") or "").strip().lower()
+            return action, parsed
+    return "", {}
 
 
 def _load_with_short_session(loader: Callable[[Session], dict]):
@@ -82,6 +126,67 @@ def _contract_symbol_payload(item: ContractSymbol) -> dict:
         "status": item.status,
         **contract_symbol_market_status_payload(item),
     }
+
+
+@router.websocket("/ws")
+async def contract_market_public_ws(
+    websocket: WebSocket,
+    symbol: str = Query(..., description="Contract symbol, e.g. BTCUSDT_PERP"),
+    interval: str = Query("1m", description="Current chart interval"),
+) -> None:
+    connected_symbol = normalize_contract_ws_symbol(symbol)
+    connected_interval = normalize_contract_ws_interval(interval)
+    if not connected_symbol:
+        await websocket.close(code=1008)
+        return
+
+    manager_connected = False
+    try:
+        await contract_market_ws_manager.connect(
+            connected_symbol,
+            websocket,
+            interval=connected_interval,
+        )
+        manager_connected = True
+        snapshot = await contract_market_gateway.snapshot(connected_symbol, connected_interval)
+        await contract_market_ws_manager.send_to_one(websocket, snapshot)
+        await contract_market_gateway.ensure_symbol(connected_symbol)
+
+        while True:
+            try:
+                message = await websocket.receive()
+            except WebSocketDisconnect:
+                break
+            action, payload = _parse_ws_receive(message)
+            if action == "disconnect":
+                break
+            if action == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+            if action == "subscribe":
+                next_symbol = normalize_contract_ws_symbol(payload.get("symbol") or connected_symbol)
+                next_interval = normalize_contract_ws_interval(payload.get("interval") or connected_interval)
+                if not next_symbol:
+                    continue
+                previous_symbol = connected_symbol
+                connected_symbol = next_symbol
+                connected_interval = next_interval
+                await contract_market_ws_manager.connect(
+                    connected_symbol,
+                    websocket,
+                    interval=connected_interval,
+                    accepted=True,
+                )
+                if previous_symbol != connected_symbol:
+                    await contract_market_gateway.release_symbol_if_idle(previous_symbol)
+                snapshot = await contract_market_gateway.snapshot(connected_symbol, connected_interval)
+                await contract_market_ws_manager.send_to_one(websocket, snapshot)
+                await contract_market_gateway.ensure_symbol(connected_symbol)
+    finally:
+        if manager_connected:
+            disconnected_symbol = await contract_market_ws_manager.disconnect(websocket)
+            if disconnected_symbol:
+                await contract_market_gateway.release_symbol_if_idle(disconnected_symbol)
 
 
 @router.get("/symbols")

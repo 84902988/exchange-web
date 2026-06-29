@@ -18,6 +18,7 @@ import {
 import {
   contractMarketRealtime,
   type ContractMarketRealtimeMessage,
+  type ContractMarketRealtimeStatus,
 } from '@/lib/realtime/contractMarketRealtime';
 
 export type PriceDirection = 'up' | 'down' | 'flat';
@@ -30,6 +31,7 @@ type ContractDepthSnapshot = {
 
 type UseContractMarketStateParams = {
   contractSymbol: string;
+  interval?: string;
   symbolOptionMarketSymbol?: string | null;
   symbolOptionPricePrecision?: number | null;
 };
@@ -120,11 +122,13 @@ function isContractSymbolConfigMissing(message: string | null) {
 
 export function useContractMarketState({
   contractSymbol,
+  interval = '1m',
   symbolOptionMarketSymbol,
   symbolOptionPricePrecision,
 }: UseContractMarketStateParams) {
   const { t } = useLocaleContext();
   const [hasHydrated, setHasHydrated] = useState(false);
+  const [marketRealtimeStatus, setMarketRealtimeStatus] = useState<ContractMarketRealtimeStatus>('idle');
   const [priceDirection, setPriceDirection] = useState<PriceDirection>('flat');
   const [latestMarketPrice, setLatestMarketPrice] = useState<number | null>(null);
   const [bestDepth, setBestDepth] = useState<BestDepthState>(() => ({
@@ -277,8 +281,10 @@ export function useContractMarketState({
   }, [contractSymbol]);
 
   useEffect(() => {
-    contractMarketRealtime.setSymbol(contractSymbol);
-  }, [contractSymbol]);
+    contractMarketRealtime.setSession({ symbol: contractSymbol, interval });
+  }, [contractSymbol, interval]);
+
+  useEffect(() => contractMarketRealtime.subscribeStatus(setMarketRealtimeStatus), []);
 
   useEffect(() => {
     return () => {
@@ -328,12 +334,14 @@ export function useContractMarketState({
 
   useEffect(() => {
     void Promise.resolve().then(refreshContractQuote);
+    if (marketRealtimeStatus === 'connected') return undefined;
+
     const timer = window.setInterval(() => {
       void refreshContractQuote();
     }, 2000);
 
     return () => window.clearInterval(timer);
-  }, [refreshContractQuote]);
+  }, [marketRealtimeStatus, refreshContractQuote]);
 
   return {
     marketSymbol,
@@ -351,6 +359,7 @@ export function useContractMarketState({
     pricePrecision,
     spreadInfo,
     quoteHint,
+    marketRealtimeStatus,
     initialDepth,
     applyLatestPrice,
     handleBestPricesChange,

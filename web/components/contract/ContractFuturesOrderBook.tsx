@@ -10,6 +10,7 @@ import { formatPrice } from '@/lib/marketPrecision';
 import {
   contractMarketRealtime,
   type ContractMarketRealtimeMessage,
+  type ContractMarketRealtimeStatus,
 } from '@/lib/realtime/contractMarketRealtime';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 
@@ -19,6 +20,7 @@ type ContractFuturesOrderBookProps = {
   priceDirection?: 'up' | 'down' | 'flat';
   pricePrecision: number;
   marketStatus?: string | null;
+  marketRealtimeStatus?: ContractMarketRealtimeStatus;
   onPriceSelect?: (price: string) => void;
   onBestPricesChange?: (best: {
     bestBid: string | null;
@@ -162,6 +164,7 @@ export default function ContractFuturesOrderBook({
   priceDirection = 'flat',
   pricePrecision,
   marketStatus,
+  marketRealtimeStatus = 'idle',
   onPriceSelect,
   onBestPricesChange,
   initialDepth,
@@ -239,6 +242,11 @@ export default function ContractFuturesOrderBook({
       setLoading(true);
     }
     void loadDepth();
+    if (marketRealtimeStatus === 'connected') {
+      return () => {
+        alive = false;
+      };
+    }
     const timer = window.setInterval(() => {
       void loadDepth();
     }, 1500);
@@ -247,7 +255,7 @@ export default function ContractFuturesOrderBook({
       alive = false;
       window.clearInterval(timer);
     };
-  }, [symbol]);
+  }, [marketRealtimeStatus, symbol]);
 
   useEffect(() => {
     const handleDepthMessage = (message: ContractMarketRealtimeMessage) => {
