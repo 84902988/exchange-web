@@ -19,6 +19,7 @@ from app.services.contract_market_service import (
     ContractMarketError,
     ContractSymbolNotFound,
     _contract_depth_with_status,
+    _contract_quote_with_status,
     _load_contract_symbol,
     _market_status_for_contract_symbol,
     contract_depth_to_response,
@@ -36,8 +37,10 @@ from app.services.contract_market_ws import (
 from app.services.contract_market_provider_ws import (
     force_stop_provider_ws_subscriptions_for_symbol,
     provider_ws_depth_enabled,
+    provider_ws_ticker_enabled,
     provider_ws_trades_enabled,
     select_fresh_provider_ws_depth,
+    select_fresh_provider_ws_ticker,
     select_fresh_provider_ws_trades,
 )
 
@@ -153,6 +156,7 @@ class ContractMarketGateway:
         self._last_full_refresh_at: dict[str, float] = {}
         self._last_depth_broadcast_at: dict[str, float] = {}
         self._last_depth_signature: dict[str, str] = {}
+        self._last_quote_signature: dict[str, str] = {}
         self._last_trade_ids: dict[str, set[str]] = {}
         self._provider_ws_allowed_symbols: set[str] = set()
         self._state_lock = threading.RLock()
@@ -271,6 +275,7 @@ class ContractMarketGateway:
                             intervals,
                             True,
                         )
+                        messages.extend(await asyncio.to_thread(self._refresh_provider_ws_once, symbol))
                         self._last_full_refresh_at[symbol] = now
                     else:
                         messages = await asyncio.to_thread(self._refresh_provider_ws_once, symbol)
@@ -318,6 +323,7 @@ class ContractMarketGateway:
             self._last_full_refresh_at.pop(symbol, None)
             self._last_depth_broadcast_at.pop(symbol, None)
             self._last_depth_signature.pop(symbol, None)
+            self._last_quote_signature.pop(symbol, None)
             self._last_trade_ids.pop(symbol, None)
 
     def _refresh_symbol_once(
@@ -359,9 +365,15 @@ class ContractMarketGateway:
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
 
-        quote_payload = get_contract_quote(db, symbol)
+        quote_payload = self._load_quote_payload(
+            db,
+            symbol,
+            allow_provider_ws=True,
+            ensure_provider_ws=ensure_provider_ws,
+        )
         quote = ContractQuoteResponse(**contract_quote_to_response(quote_payload)).model_dump()
         self._set_latest(CONTRACT_MARKET_CACHE_QUOTE, symbol, quote)
+        self._remember_quote_signature(symbol, quote)
         messages.append(self._quote_message(symbol, quote))
 
         depth_payload = self._load_depth_payload(
@@ -405,8 +417,38 @@ class ContractMarketGateway:
     def _refresh_provider_ws_once(self, symbol: str) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         messages.extend(self._refresh_provider_ws_depth_once(symbol))
+        messages.extend(self._refresh_provider_ws_ticker_once(symbol))
         messages.extend(self._refresh_provider_ws_trades_once(symbol))
         return messages
+
+    def _refresh_provider_ws_ticker_once(self, symbol: str) -> list[dict[str, Any]]:
+        if not provider_ws_ticker_enabled():
+            return []
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        with self._state_lock:
+            ensure_provider_ws = normalized_symbol in self._provider_ws_allowed_symbols
+        if not ensure_provider_ws:
+            return []
+        db = SessionLocal()
+        try:
+            quote_payload = self._load_quote_payload(
+                db,
+                normalized_symbol,
+                allow_provider_ws=True,
+                allow_rest_fallback=False,
+                ensure_provider_ws=True,
+            )
+        finally:
+            db.close()
+        if quote_payload is None:
+            return []
+        quote = ContractQuoteResponse(**contract_quote_to_response(quote_payload)).model_dump()
+        signature = self._quote_signature(quote)
+        if self._last_quote_signature.get(normalized_symbol) == signature:
+            return []
+        self._set_latest(CONTRACT_MARKET_CACHE_QUOTE, normalized_symbol, quote)
+        self._last_quote_signature[normalized_symbol] = signature
+        return [self._quote_message(normalized_symbol, quote)]
 
     def _refresh_provider_ws_depth_once(self, symbol: str) -> list[dict[str, Any]]:
         if not provider_ws_depth_enabled():
@@ -485,6 +527,55 @@ class ContractMarketGateway:
             return None
         return get_contract_depth(db, symbol, limit=CONTRACT_MARKET_WS_DEPTH_LIMIT)
 
+    def _load_quote_payload(
+        self,
+        db: Session,
+        symbol: str,
+        *,
+        allow_provider_ws: bool,
+        allow_rest_fallback: bool = True,
+        ensure_provider_ws: bool = False,
+    ) -> dict[str, Any] | None:
+        if allow_provider_ws and provider_ws_ticker_enabled():
+            payload = select_fresh_provider_ws_ticker(
+                db,
+                symbol,
+                max_age_ms=int(getattr(settings, "CONTRACT_PROVIDER_WS_TICKER_MAX_AGE_MS", 1500) or 1500),
+                ensure_subscription=ensure_provider_ws,
+            )
+            if isinstance(payload, dict):
+                prepared_quote = self._prepare_provider_ws_quote_payload(db, symbol, payload)
+                if prepared_quote is not None:
+                    return prepared_quote
+        if not allow_rest_fallback:
+            return None
+        return get_contract_quote(db, symbol)
+
+    def _prepare_provider_ws_quote_payload(
+        self,
+        db: Session,
+        symbol: str,
+        quote: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            prepared = deepcopy(quote)
+            if not prepared.get("bid_price") or not prepared.get("ask_price"):
+                return None
+            contract_symbol = _load_contract_symbol(db, symbol)
+            market_status = _market_status_for_contract_symbol(contract_symbol)
+            prepared["symbol"] = normalize_contract_ws_symbol(prepared.get("symbol") or symbol)
+            prepared["price_precision"] = int(
+                getattr(contract_symbol, "price_precision", None) or prepared.get("price_precision") or 8
+            )
+            return _contract_quote_with_status(prepared, market_status, contract_symbol)
+        except Exception:
+            logger.debug(
+                "contract_market_gateway_provider_ws_quote_prepare_failed symbol=%s",
+                symbol,
+                exc_info=True,
+            )
+            return None
+
     def _prepare_provider_ws_depth_payload(
         self,
         db: Session,
@@ -552,7 +643,7 @@ class ContractMarketGateway:
         ]
 
     def _refresh_loop_sleep_seconds(self) -> float:
-        if provider_ws_depth_enabled() or provider_ws_trades_enabled():
+        if provider_ws_depth_enabled() or provider_ws_trades_enabled() or provider_ws_ticker_enabled():
             return self._provider_ws_depth_broadcast_interval_seconds()
         return CONTRACT_MARKET_WS_DEPTH_FALLBACK_SLEEP_SECONDS
 
@@ -564,6 +655,10 @@ class ContractMarketGateway:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         self._last_depth_signature[normalized_symbol] = self._depth_signature(depth)
         self._last_depth_broadcast_at[normalized_symbol] = time.monotonic()
+
+    def _remember_quote_signature(self, symbol: str, quote: dict[str, Any]) -> None:
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        self._last_quote_signature[normalized_symbol] = self._quote_signature(quote)
 
     def _remember_trade_ids(self, symbol: str, trades: list[dict[str, Any]]) -> None:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
@@ -593,12 +688,27 @@ class ContractMarketGateway:
             }
         )
 
+    def _quote_signature(self, quote: dict[str, Any]) -> str:
+        return _json_signature(
+            {
+                "provider": quote.get("provider"),
+                "provider_symbol": quote.get("provider_symbol"),
+                "bid_price": quote.get("bid_price"),
+                "ask_price": quote.get("ask_price"),
+                "last_price": quote.get("last_price"),
+                "mark_price": quote.get("mark_price"),
+                "source": quote.get("source"),
+            }
+        )
+
     def _quote_message(self, symbol: str, quote: dict[str, Any]) -> dict[str, Any]:
         return {
             "type": "contract_quote",
             "symbol": normalize_contract_ws_symbol(symbol),
             "market_symbol": _market_symbol(symbol),
             "ts": _timestamp_ms(quote.get("ts")),
+            "source": quote.get("source"),
+            "quote_source": quote.get("quote_source"),
             "data": quote,
             "quote": quote,
         }
