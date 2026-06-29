@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 CONTRACT_PROVIDER_WS_SOURCE = "LIVE_WS"
 _SUPPORTED_DEPTH_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
+_SUPPORTED_TRADES_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,14 @@ class ProviderDepthSubscription:
     provider: str
     provider_symbol: str
     depth_limit: int
+
+
+@dataclass(frozen=True)
+class ProviderTradesSubscription:
+    local_symbol: str
+    provider: str
+    provider_symbol: str
+    trades_limit: int
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -55,8 +64,12 @@ def _depth_limit() -> int:
     return max(5, min(int(getattr(settings, "CONTRACT_PROVIDER_WS_DEPTH_LIMIT", 20) or 20), 100))
 
 
-def _max_age_ms(value: Optional[int] = None) -> int:
-    configured = value if value is not None else getattr(settings, "CONTRACT_PROVIDER_WS_DEPTH_MAX_AGE_MS", 1500)
+def _trades_limit() -> int:
+    return max(1, min(int(getattr(settings, "CONTRACT_PROVIDER_WS_TRADES_LIMIT", 30) or 30), 100))
+
+
+def _max_age_ms(value: Optional[int] = None, *, setting_name: str = "CONTRACT_PROVIDER_WS_DEPTH_MAX_AGE_MS") -> int:
+    configured = value if value is not None else getattr(settings, setting_name, 1500)
     return max(100, int(configured or 1500))
 
 
@@ -65,6 +78,25 @@ def provider_ws_depth_enabled() -> bool:
         getattr(settings, "CONTRACT_PROVIDER_WS_ENABLED", False)
         and getattr(settings, "CONTRACT_PROVIDER_WS_DEPTH_ENABLED", False)
     )
+
+
+def provider_ws_trades_enabled() -> bool:
+    return bool(
+        getattr(settings, "CONTRACT_PROVIDER_WS_ENABLED", False)
+        and getattr(settings, "CONTRACT_PROVIDER_WS_TRADES_ENABLED", False)
+    )
+
+
+def _timestamp_ms_from_value(value: Any) -> int:
+    if value in (None, ""):
+        return int(time.time() * 1000)
+    try:
+        numeric = float(value)
+    except Exception:
+        return int(time.time() * 1000)
+    if numeric <= 0:
+        return int(time.time() * 1000)
+    return int(numeric if numeric > 10_000_000_000 else numeric * 1000)
 
 
 def _sort_depth_side(levels: dict[str, Decimal], *, side: str, limit: int) -> list[list[Decimal]]:
@@ -135,6 +167,11 @@ class ContractMarketProviderWsService:
         self._depth_stops: dict[tuple[str, str], threading.Event] = {}
         self._depth_connections: dict[tuple[str, str], tuple[asyncio.AbstractEventLoop, Any]] = {}
         self._depth_generations: dict[tuple[str, str], int] = {}
+        self._trades_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._trades_tasks: dict[tuple[str, str], threading.Thread] = {}
+        self._trades_stops: dict[tuple[str, str], threading.Event] = {}
+        self._trades_connections: dict[tuple[str, str], tuple[asyncio.AbstractEventLoop, Any]] = {}
+        self._trades_generations: dict[tuple[str, str], int] = {}
         self._lock = threading.RLock()
 
     def get_fresh_provider_ws_depth(
@@ -152,6 +189,31 @@ class ContractMarketProviderWsService:
             candidates = [
                 item
                 for (provider, local_symbol), item in self._depth_cache.items()
+                if local_symbol == normalized_symbol and (normalized_provider is None or provider == normalized_provider)
+            ]
+            candidates.sort(key=lambda item: int(item.get("updated_at_ms") or 0), reverse=True)
+            for item in candidates:
+                updated_at_ms = int(item.get("updated_at_ms") or 0)
+                if updated_at_ms <= 0 or now_ms - updated_at_ms > allowed_age_ms:
+                    continue
+                return deepcopy(item)
+        return None
+
+    def get_fresh_provider_ws_trades(
+        self,
+        symbol: str,
+        provider_code: Optional[str] = None,
+        *,
+        max_age_ms: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        normalized_symbol = _normalize_symbol(symbol)
+        normalized_provider = _normalize_symbol(provider_code) if provider_code else None
+        now_ms = int(time.time() * 1000)
+        allowed_age_ms = _max_age_ms(max_age_ms, setting_name="CONTRACT_PROVIDER_WS_TRADES_MAX_AGE_MS")
+        with self._lock:
+            candidates = [
+                item
+                for (provider, local_symbol), item in self._trades_cache.items()
                 if local_symbol == normalized_symbol and (normalized_provider is None or provider == normalized_provider)
             ]
             candidates.sort(key=lambda item: int(item.get("updated_at_ms") or 0), reverse=True)
@@ -202,6 +264,46 @@ class ContractMarketProviderWsService:
                 return depth
         return None
 
+    def select_fresh_trades_for_enabled_providers(
+        self,
+        db: Session,
+        symbol: str,
+        *,
+        max_age_ms: Optional[int] = None,
+        ensure_subscription: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        if not provider_ws_trades_enabled():
+            return None
+        normalized_symbol = _normalize_symbol(symbol)
+        for provider in enabled_contract_market_providers(db):
+            provider_code = _normalize_symbol(provider.provider_code)
+            if provider_code not in {PROVIDER_OKX_SWAP, PROVIDER_BITGET_USDT_FUTURES}:
+                continue
+            if is_contract_market_provider_in_cooldown(provider_code):
+                logger.debug("contract_provider_ws_trades_skipped_cooldown provider=%s symbol=%s", provider_code, normalized_symbol)
+                self.stop_trades_subscription(local_symbol=normalized_symbol, provider=provider_code)
+                continue
+            provider_symbol = resolve_contract_provider_symbol(
+                db,
+                provider_code=provider_code,
+                local_symbol=normalized_symbol,
+            )
+            if ensure_subscription:
+                self.ensure_trades_subscription(
+                    local_symbol=normalized_symbol,
+                    provider=provider_code,
+                    provider_symbol=provider_symbol,
+                    trades_limit=_trades_limit(),
+                )
+            trades = self.get_fresh_provider_ws_trades(
+                normalized_symbol,
+                provider_code,
+                max_age_ms=max_age_ms,
+            )
+            if trades is not None:
+                return trades
+        return None
+
     def ensure_depth_subscription(
         self,
         *,
@@ -248,6 +350,52 @@ class ContractMarketProviderWsService:
             self._depth_tasks[key] = thread
             thread.start()
 
+    def ensure_trades_subscription(
+        self,
+        *,
+        local_symbol: str,
+        provider: str,
+        provider_symbol: str,
+        trades_limit: int,
+    ) -> None:
+        if not provider_ws_trades_enabled():
+            return
+        normalized_symbol = _normalize_symbol(local_symbol)
+        provider_code = _normalize_symbol(provider)
+        normalized_provider_symbol = _normalize_symbol(provider_symbol)
+        if provider_code not in _SUPPORTED_TRADES_WS_PROVIDERS:
+            logger.debug("contract_provider_ws_trades_unsupported provider=%s symbol=%s", provider_code, normalized_symbol)
+            return
+        key = (provider_code, normalized_symbol)
+        with self._lock:
+            existing = self._trades_tasks.get(key)
+            if existing is not None and existing.is_alive():
+                return
+            logger.info(
+                "contract_provider_ws_trades_subscription_starting provider=%s symbol=%s provider_symbol=%s",
+                provider_code,
+                normalized_symbol,
+                normalized_provider_symbol,
+            )
+            stop_event = threading.Event()
+            generation = self._trades_generations.get(key, 0) + 1
+            self._trades_generations[key] = generation
+            subscription = ProviderTradesSubscription(
+                local_symbol=normalized_symbol,
+                provider=provider_code,
+                provider_symbol=normalized_provider_symbol,
+                trades_limit=max(1, min(int(trades_limit or 30), 100)),
+            )
+            thread = threading.Thread(
+                target=self._run_trades_subscription_thread,
+                args=(subscription, stop_event, generation),
+                name=f"contract-provider-trades-ws-{provider_code}-{normalized_symbol}",
+                daemon=True,
+            )
+            self._trades_stops[key] = stop_event
+            self._trades_tasks[key] = thread
+            thread.start()
+
     def stop_depth_subscription(self, *, local_symbol: str, provider: str) -> None:
         key = (_normalize_symbol(provider), _normalize_symbol(local_symbol))
         with self._lock:
@@ -272,6 +420,30 @@ class ContractMarketProviderWsService:
         self._wait_for_depth_thread_exit(key, thread, timeout_seconds=2.0)
         self._clear_depth_subscription_state(key, remove_cache=False)
 
+    def stop_trades_subscription(self, *, local_symbol: str, provider: str) -> None:
+        key = (_normalize_symbol(provider), _normalize_symbol(local_symbol))
+        with self._lock:
+            stop_event = self._trades_stops.get(key)
+            thread = self._trades_tasks.get(key)
+            connection = self._trades_connections.get(key)
+        if stop_event is None and connection is None and thread is None:
+            logger.debug(
+                "contract_provider_ws_trades_subscription_stop_noop provider=%s symbol=%s",
+                key[0],
+                key[1],
+            )
+            return
+        logger.info(
+            "contract_provider_ws_trades_subscription_stopping provider=%s symbol=%s",
+            key[0],
+            key[1],
+        )
+        if stop_event is not None:
+            stop_event.set()
+        self._close_ws_connection(key, connection, stream="trades")
+        self._wait_for_ws_thread_exit(key, thread, timeout_seconds=2.0, stream="trades")
+        self._clear_trades_subscription_state(key, remove_cache=False)
+
     def stop_depth_subscriptions_for_symbol(self, local_symbol: str) -> None:
         self.force_stop_depth_subscriptions_for_symbol(local_symbol)
 
@@ -291,87 +463,145 @@ class ContractMarketProviderWsService:
                 "alive_after_stop": [],
                 "registry_after": self.debug_provider_ws_depth_subscriptions(),
             }
+        depth_report = self._force_stop_stream_subscriptions_for_symbol(
+            local_symbol=normalized_symbol,
+            wait_seconds=wait_seconds,
+            stream="depth",
+        )
+        trades_report = self._force_stop_stream_subscriptions_for_symbol(
+            local_symbol=normalized_symbol,
+            wait_seconds=wait_seconds,
+            stream="trades",
+        )
+        report = {
+            "symbol": normalized_symbol,
+            "depth": depth_report,
+            "trades": trades_report,
+            "registry_after": self.debug_provider_ws_depth_subscriptions(),
+        }
+        logger.info("contract_provider_ws_subscription_force_stop_report %s", report)
+        return report
+
+    def stop_all(self) -> None:
         with self._lock:
-            all_keys = set(self._depth_stops.keys()) | set(self._depth_tasks.keys()) | set(self._depth_connections.keys())
-            keys = [
-                key
-                for key in all_keys
-                if key[1] == normalized_symbol
-            ]
-            logger.info(
-                "contract_provider_ws_depth_subscription_force_stop_for_symbol symbol=%s task_keys=%s connection_keys=%s matched_keys=%s stop_count=%s",
-                normalized_symbol,
-                sorted(map(str, self._depth_tasks.keys())),
-                sorted(map(str, self._depth_connections.keys())),
-                sorted(map(str, keys)),
-                len(keys),
-            )
-            stop_events = [self._depth_stops.get(key) for key in keys]
-            threads = [self._depth_tasks.get(key) for key in keys]
-            connections = [self._depth_connections.get(key) for key in keys]
-        if not keys:
-            logger.warning(
-                "contract_provider_ws_depth_subscription_stop_miss symbol=%s",
-                normalized_symbol,
-            )
+            depth_symbols = {key[1] for key in set(self._depth_stops) | set(self._depth_tasks) | set(self._depth_connections)}
+            trades_symbols = {key[1] for key in set(self._trades_stops) | set(self._trades_tasks) | set(self._trades_connections)}
+            symbols = sorted(depth_symbols | trades_symbols)
+        for symbol in symbols:
+            self.force_stop_depth_subscriptions_for_symbol(symbol)
+
+    def _force_stop_stream_subscriptions_for_symbol(
+        self,
+        *,
+        local_symbol: str,
+        wait_seconds: float,
+        stream: str,
+    ) -> dict[str, Any]:
+        normalized_symbol = _normalize_symbol(local_symbol)
+        if stream == "depth":
+            stops = self._depth_stops
+            tasks = self._depth_tasks
+            connections = self._depth_connections
+            clear_state = self._clear_depth_subscription_state
+        elif stream == "trades":
+            stops = self._trades_stops
+            tasks = self._trades_tasks
+            connections = self._trades_connections
+            clear_state = self._clear_trades_subscription_state
+        else:
+            raise ValueError(f"unsupported provider ws stream: {stream}")
+        if not normalized_symbol:
             return {
                 "symbol": normalized_symbol,
+                "stream": stream,
                 "matched_keys": [],
                 "closed_count": 0,
                 "cancelled_count": 0,
                 "alive_after_stop": [],
-                "registry_after": self.debug_provider_ws_depth_subscriptions(),
+            }
+        with self._lock:
+            all_keys = set(stops.keys()) | set(tasks.keys()) | set(connections.keys())
+            keys = [key for key in all_keys if key[1] == normalized_symbol]
+            logger.info(
+                "contract_provider_ws_%s_subscription_force_stop_for_symbol symbol=%s task_keys=%s connection_keys=%s matched_keys=%s stop_count=%s",
+                stream,
+                normalized_symbol,
+                sorted(map(str, tasks.keys())),
+                sorted(map(str, connections.keys())),
+                sorted(map(str, keys)),
+                len(keys),
+            )
+            stop_events = [stops.get(key) for key in keys]
+            threads = [tasks.get(key) for key in keys]
+            stream_connections = [connections.get(key) for key in keys]
+        if not keys:
+            logger.debug(
+                "contract_provider_ws_%s_subscription_stop_miss symbol=%s",
+                stream,
+                normalized_symbol,
+            )
+            return {
+                "symbol": normalized_symbol,
+                "stream": stream,
+                "matched_keys": [],
+                "closed_count": 0,
+                "cancelled_count": 0,
+                "alive_after_stop": [],
             }
         closed_count = 0
         cancelled_count = 0
-        for key, stop_event, connection in zip(keys, stop_events, connections):
+        for key, stop_event, connection in zip(keys, stop_events, stream_connections):
             logger.info(
-                "contract_provider_ws_depth_subscription_stopping provider=%s symbol=%s",
+                "contract_provider_ws_%s_subscription_stopping provider=%s symbol=%s",
+                stream,
                 key[0],
                 key[1],
             )
             if stop_event is not None:
                 stop_event.set()
                 cancelled_count += 1
-            self._close_depth_connection(key, connection)
+            self._close_ws_connection(key, connection, stream=stream)
             if connection is not None:
                 closed_count += 1
         alive_after_stop: list[str] = []
         deadline = time.monotonic() + max(0.1, float(wait_seconds or 0))
         for key, thread in zip(keys, threads):
             remaining = max(0.0, deadline - time.monotonic())
-            if not self._wait_for_depth_thread_exit(key, thread, timeout_seconds=remaining):
+            if not self._wait_for_ws_thread_exit(key, thread, timeout_seconds=remaining, stream=stream):
                 alive_after_stop.append(str(key))
-            self._clear_depth_subscription_state(key, remove_cache=True)
-        registry_after = self.debug_provider_ws_depth_subscriptions()
+            clear_state(key, remove_cache=True)
         report = {
             "symbol": normalized_symbol,
+            "stream": stream,
             "matched_keys": [str(key) for key in keys],
             "closed_count": closed_count,
             "cancelled_count": cancelled_count,
             "alive_after_stop": alive_after_stop,
-            "registry_after": registry_after,
         }
-        logger.info("contract_provider_ws_depth_subscription_force_stop_report %s", report)
+        logger.info("contract_provider_ws_%s_subscription_force_stop_report %s", stream, report)
         return report
-
-    def stop_all(self) -> None:
-        with self._lock:
-            symbols = sorted({key[1] for key in set(self._depth_stops) | set(self._depth_tasks) | set(self._depth_connections)})
-        for symbol in symbols:
-            self.force_stop_depth_subscriptions_for_symbol(symbol)
 
     def _close_depth_connection(
         self,
         key: tuple[str, str],
         connection: Optional[tuple[asyncio.AbstractEventLoop, Any]],
     ) -> None:
+        self._close_ws_connection(key, connection, stream="depth")
+
+    def _close_ws_connection(
+        self,
+        key: tuple[str, str],
+        connection: Optional[tuple[asyncio.AbstractEventLoop, Any]],
+        *,
+        stream: str,
+    ) -> None:
         if connection is None:
             return
         loop, websocket = connection
         if loop.is_closed():
             logger.debug(
-                "contract_provider_ws_depth_subscription_close_skipped_loop_closed provider=%s symbol=%s",
+                "contract_provider_ws_%s_subscription_close_skipped_loop_closed provider=%s symbol=%s",
+                stream,
                 key[0],
                 key[1],
             )
@@ -381,7 +611,8 @@ class ContractMarketProviderWsService:
             future.result(timeout=2)
         except Exception:
             logger.info(
-                "contract_provider_ws_depth_subscription_close_failed provider=%s symbol=%s",
+                "contract_provider_ws_%s_subscription_close_failed provider=%s symbol=%s",
+                stream,
                 key[0],
                 key[1],
                 exc_info=True,
@@ -415,6 +646,16 @@ class ContractMarketProviderWsService:
         *,
         timeout_seconds: float,
     ) -> bool:
+        return self._wait_for_ws_thread_exit(key, thread, timeout_seconds=timeout_seconds, stream="depth")
+
+    def _wait_for_ws_thread_exit(
+        self,
+        key: tuple[str, str],
+        thread: Optional[threading.Thread],
+        *,
+        timeout_seconds: float,
+        stream: str,
+    ) -> bool:
         if thread is None:
             return True
         if thread is threading.current_thread():
@@ -424,7 +665,8 @@ class ContractMarketProviderWsService:
         alive = thread.is_alive()
         if alive:
             logger.warning(
-                "contract_provider_ws_depth_subscription_thread_still_alive provider=%s symbol=%s",
+                "contract_provider_ws_%s_subscription_thread_still_alive provider=%s symbol=%s",
+                stream,
                 key[0],
                 key[1],
             )
@@ -438,6 +680,15 @@ class ContractMarketProviderWsService:
             self._depth_generations.pop(key, None)
             if remove_cache:
                 self._depth_cache.pop(key, None)
+
+    def _clear_trades_subscription_state(self, key: tuple[str, str], *, remove_cache: bool) -> None:
+        with self._lock:
+            self._trades_stops.pop(key, None)
+            self._trades_tasks.pop(key, None)
+            self._trades_connections.pop(key, None)
+            self._trades_generations.pop(key, None)
+            if remove_cache:
+                self._trades_cache.pop(key, None)
 
     def debug_provider_ws_depth_subscriptions(self) -> dict[str, Any]:
         now_ms = int(time.time() * 1000)
@@ -464,6 +715,28 @@ class ContractMarketProviderWsService:
                     str(key): generation
                     for key, generation in self._depth_generations.items()
                 },
+                "trades_tasks": {
+                    str(key): bool(thread is not None and thread.is_alive())
+                    for key, thread in self._trades_tasks.items()
+                },
+                "trades_stops": {
+                    str(key): bool(stop_event is not None and stop_event.is_set())
+                    for key, stop_event in self._trades_stops.items()
+                },
+                "trades_connections": sorted(map(str, self._trades_connections.keys())),
+                "trades_cache": {
+                    str(key): {
+                        "provider": key[0],
+                        "local_symbol": key[1],
+                        "age_ms": max(0, now_ms - int(item.get("updated_at_ms") or 0)),
+                        "count": len(item.get("trades") or []),
+                    }
+                    for key, item in self._trades_cache.items()
+                },
+                "trades_generations": {
+                    str(key): generation
+                    for key, generation in self._trades_generations.items()
+                },
             }
 
     def _run_depth_subscription_thread(
@@ -477,6 +750,22 @@ class ContractMarketProviderWsService:
         except Exception:
             logger.warning(
                 "contract_provider_ws_depth_thread_failed provider=%s symbol=%s",
+                subscription.provider,
+                subscription.local_symbol,
+                exc_info=True,
+            )
+
+    def _run_trades_subscription_thread(
+        self,
+        subscription: ProviderTradesSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        try:
+            asyncio.run(self._run_trades_subscription(subscription, stop_event, generation))
+        except Exception:
+            logger.warning(
+                "contract_provider_ws_trades_thread_failed provider=%s symbol=%s",
                 subscription.provider,
                 subscription.local_symbol,
                 exc_info=True,
@@ -515,6 +804,44 @@ class ContractMarketProviderWsService:
                 reconnect_delay = min(reconnect_delay * 2, 15.0)
         logger.info(
             "contract_provider_ws_depth_subscription_thread_exiting provider=%s symbol=%s stop_requested=%s",
+            subscription.provider,
+            subscription.local_symbol,
+            stop_event.is_set(),
+        )
+
+    async def _run_trades_subscription(
+        self,
+        subscription: ProviderTradesSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if subscription.provider != PROVIDER_OKX_SWAP:
+            return
+        reconnect_delay = 1.0
+        while not stop_event.is_set() and provider_ws_trades_enabled():
+            try:
+                await self._run_okx_trades_ws(subscription, stop_event, generation)
+                reconnect_delay = 1.0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if stop_event.is_set():
+                    break
+                logger.warning(
+                    "contract_provider_ws_trades_disconnected provider=%s symbol=%s provider_symbol=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.provider_symbol,
+                    exc_info=True,
+                )
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(stop_event.wait), timeout=reconnect_delay)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                reconnect_delay = min(reconnect_delay * 2, 15.0)
+        logger.info(
+            "contract_provider_ws_trades_subscription_thread_exiting provider=%s symbol=%s stop_requested=%s",
             subscription.provider,
             subscription.local_symbol,
             stop_event.is_set(),
@@ -575,6 +902,59 @@ class ContractMarketProviderWsService:
                     subscription.provider_symbol,
                 )
 
+    async def _run_okx_trades_ws(
+        self,
+        subscription: ProviderTradesSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if stop_event.is_set() or not provider_ws_trades_enabled():
+            return
+        url = str(getattr(settings, "CONTRACT_PROVIDER_WS_OKX_PUBLIC_URL", "") or "").strip()
+        if not url:
+            raise ValueError("CONTRACT_PROVIDER_WS_OKX_PUBLIC_URL is required")
+        subscribe_payload = {
+            "op": "subscribe",
+            "args": [{"channel": "trades", "instId": subscription.provider_symbol}],
+        }
+        key = (subscription.provider, subscription.local_symbol)
+        async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5) as websocket:
+            if stop_event.is_set() or not provider_ws_trades_enabled():
+                await websocket.close()
+                return
+            loop = asyncio.get_running_loop()
+            with self._lock:
+                current_generation = self._trades_generations.get(key)
+                if current_generation != generation:
+                    stop_event.set()
+                    return
+                self._trades_connections[key] = (loop, websocket)
+            logger.info(
+                "contract_provider_ws_trades_subscription_started provider=%s symbol=%s provider_symbol=%s",
+                subscription.provider,
+                subscription.local_symbol,
+                subscription.provider_symbol,
+            )
+            try:
+                await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                while not stop_event.is_set() and provider_ws_trades_enabled():
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    self._handle_okx_trades_message(subscription, raw_message)
+            finally:
+                with self._lock:
+                    current = self._trades_connections.get(key)
+                    if current is not None and current[1] is websocket:
+                        self._trades_connections.pop(key, None)
+                logger.info(
+                    "contract_provider_ws_trades_subscription_stopped provider=%s symbol=%s provider_symbol=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.provider_symbol,
+                )
+
     def _handle_okx_depth_message(
         self,
         subscription: ProviderDepthSubscription,
@@ -612,6 +992,95 @@ class ContractMarketProviderWsService:
             checksum=row.get("checksum"),
             exchange_ts=row.get("ts"),
         )
+
+    def _handle_okx_trades_message(
+        self,
+        subscription: ProviderTradesSubscription,
+        raw_message: Any,
+    ) -> None:
+        try:
+            message = json.loads(raw_message)
+        except Exception:
+            logger.debug("contract_provider_ws_okx_trades_invalid_json symbol=%s", subscription.local_symbol)
+            return
+        if not isinstance(message, dict) or message.get("event"):
+            return
+        data = message.get("data")
+        if not isinstance(data, list) or not data:
+            return
+        trades: list[dict[str, Any]] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            trade = self._normalize_okx_trade(subscription, row)
+            if trade is not None:
+                trades.append(trade)
+        if trades:
+            self._set_trades_cache(subscription, trades)
+
+    def _normalize_okx_trade(
+        self,
+        subscription: ProviderTradesSubscription,
+        row: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        price = _to_decimal(row.get("px"))
+        qty = _to_decimal(row.get("sz"))
+        if price is None or qty is None or price <= 0 or qty <= 0:
+            return None
+        ts = _timestamp_ms_from_value(row.get("ts"))
+        side_text = str(row.get("side") or "").strip().lower()
+        is_buyer_maker = side_text == "sell"
+        trade_id = row.get("tradeId") or f"{subscription.provider_symbol}:{ts}:{format(price, 'f')}:{format(qty, 'f')}"
+        return {
+            "id": str(trade_id),
+            "symbol": subscription.local_symbol,
+            "provider": subscription.provider,
+            "provider_symbol": subscription.provider_symbol,
+            "price": format(price, "f"),
+            "qty": format(qty, "f"),
+            "amount": format(qty, "f"),
+            "quoteQty": format(price * qty, "f"),
+            "time": ts,
+            "ts": ts,
+            "side": side_text.upper() if side_text else None,
+            "isBuyerMaker": is_buyer_maker,
+            "source": CONTRACT_PROVIDER_WS_SOURCE,
+            "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
+            "quote_freshness": "LIVE",
+        }
+
+    def _set_trades_cache(
+        self,
+        subscription: ProviderTradesSubscription,
+        trades: list[dict[str, Any]],
+    ) -> None:
+        now_ms = int(time.time() * 1000)
+        now = datetime.now(timezone.utc)
+        key = (subscription.provider, subscription.local_symbol)
+        with self._lock:
+            previous = list(self._trades_cache.get(key, {}).get("trades") or [])
+            seen: set[str] = set()
+            merged: list[dict[str, Any]] = []
+            for item in trades + previous:
+                trade_id = str(item.get("id") or "")
+                if not trade_id or trade_id in seen:
+                    continue
+                seen.add(trade_id)
+                merged.append(item)
+                if len(merged) >= subscription.trades_limit:
+                    break
+            self._trades_cache[key] = {
+                "symbol": subscription.local_symbol,
+                "provider": subscription.provider,
+                "provider_symbol": subscription.provider_symbol,
+                "trades": merged,
+                "source": CONTRACT_PROVIDER_WS_SOURCE,
+                "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
+                "quote_freshness": "LIVE",
+                "ts": now,
+                "updated_at": now,
+                "updated_at_ms": now_ms,
+            }
 
     def _set_depth_cache(
         self,
@@ -684,11 +1153,50 @@ def select_fresh_provider_ws_depth(
     )
 
 
+def get_fresh_provider_ws_trades(
+    symbol: str,
+    provider_code: Optional[str] = None,
+    *,
+    max_age_ms: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    return contract_market_provider_ws.get_fresh_provider_ws_trades(
+        symbol,
+        provider_code,
+        max_age_ms=max_age_ms,
+    )
+
+
+def select_fresh_provider_ws_trades(
+    db: Session,
+    symbol: str,
+    *,
+    max_age_ms: Optional[int] = None,
+    ensure_subscription: bool = False,
+) -> Optional[dict[str, Any]]:
+    return contract_market_provider_ws.select_fresh_trades_for_enabled_providers(
+        db,
+        symbol,
+        max_age_ms=max_age_ms,
+        ensure_subscription=ensure_subscription,
+    )
+
+
 def stop_provider_ws_depth_subscriptions_for_symbol(symbol: str) -> None:
     contract_market_provider_ws.stop_depth_subscriptions_for_symbol(symbol)
 
 
 def force_stop_provider_ws_depth_subscriptions_for_symbol(
+    symbol: str,
+    *,
+    wait_seconds: float = 3.0,
+) -> dict[str, Any]:
+    return contract_market_provider_ws.force_stop_depth_subscriptions_for_symbol(
+        symbol,
+        wait_seconds=wait_seconds,
+    )
+
+
+def force_stop_provider_ws_subscriptions_for_symbol(
     symbol: str,
     *,
     wait_seconds: float = 3.0,
