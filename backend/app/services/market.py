@@ -32,6 +32,7 @@ from app.services.market_kline_cache import get_klines_cache_first
 from app.services.contract_market_provider_service import (
     MarketDataProviderConfig,
     MarketDataProviderError,
+    ProviderCooldownError,
     contract_market_last_good_enabled,
     enabled_spot_market_providers,
     mark_contract_market_provider_failure,
@@ -76,7 +77,6 @@ _SPOT_LAST_GOOD_TRADES: Dict[str, TradesResponse] = {}
 _SPOT_LAST_GOOD_KLINES: Dict[tuple[str, str], dict[str, Any]] = {}
 _SPOT_PROVIDER_LOG_THROTTLE: Dict[tuple[str, str, str, str], float] = {}
 _SPOT_PROVIDER_LOG_THROTTLE_SECONDS = 60
-_SPOT_PROVIDER_COOLDOWN_REASON = "provider is in cooldown"
 
 _INTERVAL_SECONDS = {
     "1m": 60,
@@ -1194,7 +1194,7 @@ def _spot_last_good_ticker(pair: TradingPair) -> Optional[TickerItem]:
 
 
 def _is_spot_provider_cooldown_skip(exc: Exception) -> bool:
-    return isinstance(exc, MarketDataProviderError) and str(exc).strip().lower() == _SPOT_PROVIDER_COOLDOWN_REASON
+    return isinstance(exc, ProviderCooldownError)
 
 
 def _spot_provider_warning_allowed(
@@ -1224,6 +1224,14 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair) -> Optional[Ticker
             _SPOT_LAST_GOOD_TICKERS[pair.symbol] = ticker
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
             return ticker
+        except ProviderCooldownError as exc:
+            last_error = exc
+            logger.debug(
+                "spot_provider_ticker_skipped_cooldown symbol=%s provider=%s",
+                pair.symbol,
+                provider.provider_code,
+            )
+            continue
         except Exception as exc:
             last_error = exc
             mark_contract_market_provider_failure(

@@ -25,6 +25,7 @@ from app.services.itick_market_service import ItickMarketServiceError, itick_mar
 from app.services.market_kline_cache import get_klines_cache_first, upsert_klines
 from app.services.contract_market_provider_service import (
     MarketDataProviderConfig,
+    ProviderCooldownError,
     contract_market_last_good_enabled,
     enabled_contract_market_providers,
     mark_contract_market_provider_failure,
@@ -1991,6 +1992,14 @@ def _get_configured_contract_live_depth(
                 depth.get("best_ask"),
             )
             return depth
+        except ProviderCooldownError as exc:
+            last_error = exc
+            logger.debug(
+                "contract_provider_depth_skipped_cooldown symbol=%s provider=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+            )
+            continue
         except Exception as exc:
             last_error = exc
             mark_contract_market_provider_failure(
@@ -2051,6 +2060,14 @@ def _get_configured_contract_live_quote(db: Session, contract_symbol: ContractSy
                 quote.get("last_price"),
             )
             return quote
+        except ProviderCooldownError as exc:
+            last_error = exc
+            logger.debug(
+                "contract_provider_quote_skipped_cooldown symbol=%s provider=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+            )
+            continue
         except Exception as exc:
             last_error = exc
             mark_contract_market_provider_failure(
@@ -2108,6 +2125,14 @@ def _configured_contract_ticker(db: Session, contract_symbol: ContractSymbol) ->
                 "source": "LIVE",
                 "ts": datetime.utcnow(),
             }
+        except ProviderCooldownError as exc:
+            last_error = exc
+            logger.debug(
+                "contract_provider_ticker_skipped_cooldown symbol=%s provider=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+            )
+            continue
         except Exception as exc:
             last_error = exc
             mark_contract_market_provider_failure(
@@ -2200,6 +2225,15 @@ def _get_configured_contract_klines(
                 raise ContractQuoteUnavailable(f"{provider.provider_code}_KLINE_UNAVAILABLE")
             mark_contract_market_provider_success(db, provider.provider_code)
             return rows
+        except ProviderCooldownError as exc:
+            last_error = exc
+            logger.debug(
+                "contract_provider_kline_skipped_cooldown symbol=%s provider=%s interval=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+                interval,
+            )
+            continue
         except Exception as exc:
             last_error = exc
             mark_contract_market_provider_failure(
@@ -2272,6 +2306,14 @@ def _get_configured_contract_recent_trades(db: Session, contract_symbol: Contrac
                 raise ContractQuoteUnavailable(f"{provider.provider_code}_TRADES_UNAVAILABLE")
             mark_contract_market_provider_success(db, provider.provider_code)
             return rows
+        except ProviderCooldownError as exc:
+            last_error = exc
+            logger.debug(
+                "contract_provider_trades_skipped_cooldown symbol=%s provider=%s",
+                contract_symbol.symbol,
+                provider.provider_code,
+            )
+            continue
         except Exception as exc:
             last_error = exc
             mark_contract_market_provider_failure(
