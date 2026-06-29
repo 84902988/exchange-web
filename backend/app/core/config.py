@@ -114,6 +114,12 @@ class Settings(BaseSettings):
     BINANCE_USDM_BASE_URL: str = "https://fapi.binance.com"
     BINANCE_USDM_FALLBACK_BASE_URLS: str = ""
     BINANCE_USDM_USE_ENV_PROXY: bool = False
+    CONTRACT_PROVIDER_WS_ENABLED: bool = False
+    CONTRACT_PROVIDER_WS_DEPTH_ENABLED: bool = False
+    CONTRACT_PROVIDER_WS_DEPTH_MAX_AGE_MS: int = 1500
+    CONTRACT_PROVIDER_WS_DEPTH_BROADCAST_INTERVAL_MS: int = 200
+    CONTRACT_PROVIDER_WS_DEPTH_LIMIT: int = 20
+    CONTRACT_PROVIDER_WS_OKX_PUBLIC_URL: str = "wss://ws.okx.com:8443/ws/v5/public"
     ITICK_API_TOKEN: Optional[str] = None
     ITICK_API_KEY: Optional[str] = None  # legacy alias; prefer ITICK_API_TOKEN
     ITICK_BASE_URL: str = "https://api.itick.org"

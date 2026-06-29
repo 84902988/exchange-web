@@ -51,6 +51,10 @@ class MarketDataProviderError(RuntimeError):
     pass
 
 
+class ProviderCooldownError(MarketDataProviderError):
+    pass
+
+
 def classify_market_provider_error(raw_error: str | None) -> str:
     text_value = str(raw_error or "").strip()
     if not text_value or text_value == "-":
@@ -401,7 +405,12 @@ def resolve_spot_provider_symbol(
 def _raise_if_in_cooldown(provider_code: str) -> None:
     until = _provider_cooldown_until.get(_normalize_provider_code(provider_code))
     if until is not None and until > datetime.utcnow():
-        raise MarketDataProviderError("provider is in cooldown")
+        raise ProviderCooldownError("provider is in cooldown")
+
+
+def is_contract_market_provider_in_cooldown(provider_code: str) -> bool:
+    until = _provider_cooldown_until.get(_normalize_provider_code(provider_code))
+    return until is not None and until > datetime.utcnow()
 
 
 def mark_contract_market_provider_failure(
