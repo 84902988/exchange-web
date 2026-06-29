@@ -604,12 +604,14 @@ function ContractPageContent() {
     contractAvailabilityError,
     pricePrecision,
     quoteHint,
+    marketRealtimeStatus,
     initialDepth,
     applyLatestPrice,
     handleBestPricesChange,
     handleDepthDataChange,
   } = useContractMarketState({
     contractSymbol,
+    interval,
     symbolOptionMarketSymbol: symbolOption?.marketSymbol,
     symbolOptionPricePrecision: currentContractPair?.pricePrecision ?? symbolOption?.pricePrecision,
   });
@@ -911,6 +913,7 @@ function ContractPageContent() {
                       allowLatestPriceCandlePatch={allowLatestPriceCandlePatch}
                       latestCandlePatchMaxDeviationRatio={isCryptoContract ? null : 0.002}
                       allowRealtimeTradeCandlePatch={isCryptoContract}
+                      marketRealtimeStatus={marketRealtimeStatus}
                       marketSessionType={contractMarketSessionType}
                       quoteFreshness={contractQuoteFreshness}
                       positionOverlay={positionOverlay}
@@ -958,6 +961,7 @@ function ContractPageContent() {
                         priceDirection={priceDirection}
                         pricePrecision={pricePrecision}
                         marketStatus={contractMarketStatus}
+                        marketRealtimeStatus={marketRealtimeStatus}
                         initialDepth={initialDepth}
                         onPriceSelect={setSelectedPrice}
                         onBestPricesChange={handleBestPricesChange}
@@ -971,6 +975,7 @@ function ContractPageContent() {
                         pricePrecision={pricePrecision}
                         latestPriceDirection={priceDirection}
                         marketStatus={contractMarketStatus}
+                        marketRealtimeStatus={marketRealtimeStatus}
                         onPriceSelect={setSelectedPrice}
                         onLastPriceChange={applyLatestPrice}
                       />
