@@ -13,6 +13,7 @@ import {
 import {
   contractMarketRealtime,
   type ContractMarketRealtimeMessage,
+  type ContractMarketRealtimeStatus,
 } from '@/lib/realtime/contractMarketRealtime';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 
@@ -24,6 +25,7 @@ type ContractFuturesTradesProps = {
   pricePrecision: number;
   latestPriceDirection?: PriceDirection;
   marketStatus?: string | null;
+  marketRealtimeStatus?: ContractMarketRealtimeStatus;
   onPriceSelect?: (price: string) => void;
   onLastPriceChange?: (price: string) => void;
 };
@@ -106,6 +108,7 @@ export default function ContractFuturesTrades({
   pricePrecision,
   latestPriceDirection,
   marketStatus,
+  marketRealtimeStatus = 'idle',
   onPriceSelect,
   onLastPriceChange,
 }: ContractFuturesTradesProps) {
@@ -161,6 +164,11 @@ export default function ContractFuturesTrades({
         alive = false;
       };
     }
+    if (marketRealtimeStatus === 'connected') {
+      return () => {
+        alive = false;
+      };
+    }
     const timer = window.setInterval(() => {
       void loadTrades();
     }, 1500);
@@ -169,7 +177,7 @@ export default function ContractFuturesTrades({
       alive = false;
       window.clearInterval(timer);
     };
-  }, [symbol, limit, marketStatus]);
+  }, [symbol, limit, marketStatus, marketRealtimeStatus]);
 
   const data = useMemo(() => {
     return rows.map((item, index) => {
