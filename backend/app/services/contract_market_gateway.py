@@ -34,9 +34,11 @@ from app.services.contract_market_ws import (
     normalize_contract_ws_symbol,
 )
 from app.services.contract_market_provider_ws import (
-    force_stop_provider_ws_depth_subscriptions_for_symbol,
+    force_stop_provider_ws_subscriptions_for_symbol,
     provider_ws_depth_enabled,
+    provider_ws_trades_enabled,
     select_fresh_provider_ws_depth,
+    select_fresh_provider_ws_trades,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,6 +153,7 @@ class ContractMarketGateway:
         self._last_full_refresh_at: dict[str, float] = {}
         self._last_depth_broadcast_at: dict[str, float] = {}
         self._last_depth_signature: dict[str, str] = {}
+        self._last_trade_ids: dict[str, set[str]] = {}
         self._provider_ws_allowed_symbols: set[str] = set()
         self._state_lock = threading.RLock()
 
@@ -196,9 +199,9 @@ class ContractMarketGateway:
             normalized_symbol,
             cancelled_task,
         )
-        # Provider-native depth cache is process-local. Multi-worker deployments
+        # Provider-native market cache is process-local. Multi-worker deployments
         # keep one provider WS owner per worker until a shared owner/pubsub is added.
-        stop_report = force_stop_provider_ws_depth_subscriptions_for_symbol(normalized_symbol)
+        stop_report = force_stop_provider_ws_subscriptions_for_symbol(normalized_symbol)
         logger.info(
             "contract_market_gateway_release_symbol_if_idle_provider_stop_report symbol=%s report=%s",
             normalized_symbol,
@@ -270,7 +273,7 @@ class ContractMarketGateway:
                         )
                         self._last_full_refresh_at[symbol] = now
                     else:
-                        messages = await asyncio.to_thread(self._refresh_provider_ws_depth_once, symbol)
+                        messages = await asyncio.to_thread(self._refresh_provider_ws_once, symbol)
                 except (ContractSymbolNotFound, ContractMarketError):
                     logger.debug("contract_market_gateway_refresh_unavailable symbol=%s", symbol, exc_info=True)
                     messages = [self._status_message(symbol, "unavailable")]
@@ -300,7 +303,7 @@ class ContractMarketGateway:
                 )
                 with self._state_lock:
                     self._provider_ws_allowed_symbols.discard(symbol)
-                stop_report = force_stop_provider_ws_depth_subscriptions_for_symbol(symbol)
+                stop_report = force_stop_provider_ws_subscriptions_for_symbol(symbol)
                 logger.info(
                     "contract_market_gateway_refresh_loop_provider_stop_report symbol=%s report=%s",
                     symbol,
@@ -315,6 +318,7 @@ class ContractMarketGateway:
             self._last_full_refresh_at.pop(symbol, None)
             self._last_depth_broadcast_at.pop(symbol, None)
             self._last_depth_signature.pop(symbol, None)
+            self._last_trade_ids.pop(symbol, None)
 
     def _refresh_symbol_once(
         self,
@@ -371,13 +375,16 @@ class ContractMarketGateway:
         self._remember_depth_signature(symbol, depth)
         messages.append(self._depth_message(symbol, depth))
 
-        trades = [
-            _normalize_trade(dict(item), fallback_source=quote.get("source"))
-            for item in get_contract_recent_trades(db, symbol=symbol, limit=CONTRACT_MARKET_WS_TRADES_LIMIT)
-            if isinstance(item, dict)
-        ]
+        trades = self._load_trades_payload(
+            db,
+            symbol,
+            fallback_source=quote.get("source"),
+            allow_provider_ws=True,
+            ensure_provider_ws=ensure_provider_ws,
+        )
         self._set_latest(CONTRACT_MARKET_CACHE_TRADES, symbol, trades)
         if trades:
+            self._remember_trade_ids(symbol, trades)
             messages.append(self._trade_message(symbol, trades[0], quote.get("source")))
 
         for interval in sorted({normalize_contract_ws_interval(item) for item in intervals} or {"1m"}):
@@ -393,6 +400,12 @@ class ContractMarketGateway:
                 self._set_latest(CONTRACT_MARKET_CACHE_KLINE, symbol, kline, interval=interval)
                 messages.append(self._kline_message(symbol, interval, kline))
 
+        return messages
+
+    def _refresh_provider_ws_once(self, symbol: str) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        messages.extend(self._refresh_provider_ws_depth_once(symbol))
+        messages.extend(self._refresh_provider_ws_trades_once(symbol))
         return messages
 
     def _refresh_provider_ws_depth_once(self, symbol: str) -> list[dict[str, Any]]:
@@ -423,6 +436,30 @@ class ContractMarketGateway:
         self._last_depth_signature[normalized_symbol] = signature
         self._last_depth_broadcast_at[normalized_symbol] = time.monotonic()
         return [self._depth_message(normalized_symbol, depth)]
+
+    def _refresh_provider_ws_trades_once(self, symbol: str) -> list[dict[str, Any]]:
+        if not provider_ws_trades_enabled():
+            return []
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        db = SessionLocal()
+        try:
+            trades = self._load_trades_payload(
+                db,
+                normalized_symbol,
+                fallback_source=None,
+                allow_provider_ws=True,
+                allow_rest_fallback=False,
+            )
+        finally:
+            db.close()
+        if not trades:
+            return []
+        new_trades = self._filter_new_trades(normalized_symbol, trades)
+        if not new_trades:
+            return []
+        self._set_latest(CONTRACT_MARKET_CACHE_TRADES, normalized_symbol, trades)
+        self._remember_trade_ids(normalized_symbol, trades)
+        return [self._trades_message(normalized_symbol, new_trades)]
 
     def _load_depth_payload(
         self,
@@ -481,8 +518,41 @@ class ContractMarketGateway:
             )
             return None
 
+    def _load_trades_payload(
+        self,
+        db: Session,
+        symbol: str,
+        *,
+        fallback_source: Any = None,
+        allow_provider_ws: bool,
+        allow_rest_fallback: bool = True,
+        ensure_provider_ws: bool = False,
+    ) -> list[dict[str, Any]]:
+        if allow_provider_ws and provider_ws_trades_enabled():
+            payload = select_fresh_provider_ws_trades(
+                db,
+                symbol,
+                max_age_ms=int(getattr(settings, "CONTRACT_PROVIDER_WS_TRADES_MAX_AGE_MS", 1500) or 1500),
+                ensure_subscription=ensure_provider_ws,
+            )
+            if isinstance(payload, dict):
+                trades = [
+                    _normalize_trade(dict(item), fallback_source=payload.get("source") or fallback_source)
+                    for item in payload.get("trades") or []
+                    if isinstance(item, dict)
+                ]
+                if trades:
+                    return trades[:CONTRACT_MARKET_WS_TRADES_LIMIT]
+        if not allow_rest_fallback:
+            return []
+        return [
+            _normalize_trade(dict(item), fallback_source=str(fallback_source or "") or None)
+            for item in get_contract_recent_trades(db, symbol=symbol, limit=CONTRACT_MARKET_WS_TRADES_LIMIT)
+            if isinstance(item, dict)
+        ]
+
     def _refresh_loop_sleep_seconds(self) -> float:
-        if provider_ws_depth_enabled():
+        if provider_ws_depth_enabled() or provider_ws_trades_enabled():
             return self._provider_ws_depth_broadcast_interval_seconds()
         return CONTRACT_MARKET_WS_DEPTH_FALLBACK_SLEEP_SECONDS
 
@@ -494,6 +564,23 @@ class ContractMarketGateway:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         self._last_depth_signature[normalized_symbol] = self._depth_signature(depth)
         self._last_depth_broadcast_at[normalized_symbol] = time.monotonic()
+
+    def _remember_trade_ids(self, symbol: str, trades: list[dict[str, Any]]) -> None:
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        ids = {str(item.get("id") or "") for item in trades if item.get("id") is not None}
+        if ids:
+            self._last_trade_ids[normalized_symbol] = ids
+
+    def _filter_new_trades(self, symbol: str, trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        seen = self._last_trade_ids.get(normalized_symbol) or set()
+        fresh: list[dict[str, Any]] = []
+        for item in trades:
+            trade_id = str(item.get("id") or "")
+            if not trade_id or trade_id in seen:
+                continue
+            fresh.append(item)
+        return fresh
 
     def _depth_signature(self, depth: dict[str, Any]) -> str:
         return _json_signature(
@@ -533,8 +620,24 @@ class ContractMarketGateway:
             "symbol": normalize_contract_ws_symbol(symbol),
             "market_symbol": _market_symbol(symbol),
             "ts": _timestamp_ms(normalized_trade.get("time") or normalized_trade.get("ts")),
+            "source": normalized_trade.get("source"),
+            "quote_source": normalized_trade.get("quote_source"),
             "data": normalized_trade,
             "trade": normalized_trade,
+        }
+
+    def _trades_message(self, symbol: str, trades: list[dict[str, Any]]) -> dict[str, Any]:
+        normalized_trades = [_normalize_trade(dict(item), fallback_source=item.get("source")) for item in trades]
+        return {
+            "type": "contract_trade",
+            "symbol": normalize_contract_ws_symbol(symbol),
+            "market_symbol": _market_symbol(symbol),
+            "ts": _timestamp_ms(normalized_trades[0].get("time") or normalized_trades[0].get("ts")) if normalized_trades else _utc_ms(),
+            "source": normalized_trades[0].get("source") if normalized_trades else None,
+            "quote_source": normalized_trades[0].get("quote_source") if normalized_trades else None,
+            "data": normalized_trades,
+            "trades": normalized_trades,
+            "trade": normalized_trades[0] if normalized_trades else None,
         }
 
     def _kline_message(self, symbol: str, interval: str, kline: dict[str, Any]) -> dict[str, Any]:
