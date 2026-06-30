@@ -120,6 +120,9 @@ def _contract_symbol_payload(item: ContractSymbol) -> dict:
         "provider_symbol": item.provider_symbol,
         "quote_asset": item.quote_asset,
         "tp_sl_trigger_price_type": str(getattr(item, "tp_sl_trigger_price_type", "") or "MARK_PRICE").strip().upper(),
+        "closed_market_execution_mode": str(
+            getattr(item, "closed_market_execution_mode", "") or "DISABLED"
+        ).strip().upper(),
         "price_precision": item.price_precision,
         "quantity_precision": item.quantity_precision,
         "max_leverage": item.max_leverage,

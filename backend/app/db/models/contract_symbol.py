@@ -35,6 +35,10 @@ class ContractSymbol(Base):
         CheckConstraint("max_leverage >= 1 AND max_leverage <= 200", name="ck_contract_symbols_max_leverage_range"),
         CheckConstraint("status IN (0, 1)", name="ck_contract_symbols_status"),
         CheckConstraint("tp_sl_trigger_price_type IN ('MARK_PRICE', 'LAST_PRICE')", name="ck_contract_symbols_tp_sl_trigger_price_type"),
+        CheckConstraint(
+            "closed_market_execution_mode IN ('DISABLED', 'LAST_GOOD_BBO')",
+            name="ck_contract_symbols_closed_market_execution_mode",
+        ),
         Index("idx_contract_symbols_category", "category"),
         Index("idx_contract_symbols_provider", "provider"),
         Index("idx_contract_symbols_status", "status"),
@@ -49,6 +53,7 @@ class ContractSymbol(Base):
     provider_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     quote_asset: Mapped[str] = mapped_column(String(20), nullable=False, default="USDT")
     tp_sl_trigger_price_type: Mapped[str] = mapped_column(String(20), nullable=False, default="MARK_PRICE")
+    closed_market_execution_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="DISABLED")
     price_precision: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
     quantity_precision: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
     min_quantity: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False, default=lambda: Decimal("0"))

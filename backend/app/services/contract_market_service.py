@@ -33,7 +33,10 @@ from app.services.contract_market_provider_service import (
     request_contract_market_provider_json,
     resolve_contract_provider_symbol,
 )
-from app.services.contract_market_guard import require_executable_contract_quote
+from app.services.contract_market_guard import (
+    executable_contract_quote_rejection_reason,
+    require_executable_contract_quote,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -430,19 +433,57 @@ def _payload_has_valid_bbo(payload: dict[str, Any]) -> bool:
     return bid is not None and ask is not None and bid > 0 and ask > 0 and ask >= bid
 
 
-def _payload_quote_executable(payload: dict[str, Any]) -> bool:
-    quote_source = _payload_quote_source(payload)
+def _contract_closed_market_execution_mode(contract_symbol: Optional[ContractSymbol]) -> str:
+    mode = str(getattr(contract_symbol, "closed_market_execution_mode", None) or "DISABLED").strip().upper()
+    return mode if mode in {"DISABLED", "LAST_GOOD_BBO"} else "DISABLED"
+
+
+def _attach_contract_symbol_execution_metadata(
+    payload: dict[str, Any],
+    contract_symbol: Optional[ContractSymbol],
+) -> dict[str, Any]:
+    payload["closed_market_execution_mode"] = _contract_closed_market_execution_mode(contract_symbol)
+    if contract_symbol is not None:
+        payload["category"] = _contract_asset_category(contract_symbol)
+    else:
+        payload.setdefault("category", "UNKNOWN")
+    return payload
+
+
+def _ensure_closed_market_quote_mark_price(payload: dict[str, Any]) -> dict[str, Any]:
+    if str(payload.get("closed_market_execution_mode") or "").strip().upper() != "LAST_GOOD_BBO":
+        return payload
     market_status = str(payload.get("market_status") or "").strip().upper()
-    if market_status in {"", "CLOSED", "HOLIDAY", "SUSPENDED", "UNKNOWN"}:
-        return False
-    if payload.get("quote_freshness") != QUOTE_FRESHNESS_LIVE:
-        return False
-    if any(token in quote_source for token in ("FALLBACK", "LAST_VALID", "LAST_GOOD", "STALE", "INVALID", "CACHE_STALE")):
-        return False
-    return _payload_has_valid_bbo(payload)
+    quote_source = _payload_quote_source(payload)
+    if market_status not in {"CLOSED", "HOLIDAY"} or quote_source != QUOTE_SOURCE_LAST_GOOD_BBO:
+        return payload
+    if _to_decimal(payload.get("mark_price")) is not None:
+        return payload
+    bid = _to_decimal(payload.get("bid_price") or payload.get("best_bid") or payload.get("bid"))
+    ask = _to_decimal(payload.get("ask_price") or payload.get("best_ask") or payload.get("ask"))
+    if bid is not None and ask is not None and bid > 0 and ask > 0 and ask >= bid:
+        payload["mark_price"] = (bid + ask) / Decimal("2")
+    return payload
+
+
+def _payload_quote_executable(
+    payload: dict[str, Any],
+    *,
+    contract_symbol: Optional[ContractSymbol] = None,
+    require_mark_price: bool = False,
+) -> bool:
+    return (
+        executable_contract_quote_rejection_reason(
+            payload,
+            require_mark_price=require_mark_price,
+            contract_symbol=contract_symbol,
+        )
+        is None
+    )
 
 
 def _augment_contract_quote_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    _ensure_closed_market_quote_mark_price(payload)
     payload["quote_source"] = _payload_quote_source(payload) or str(payload.get("source") or "UNKNOWN")
     payload["is_realtime"] = (
         payload.get("quote_freshness") == QUOTE_FRESHNESS_LIVE
@@ -2625,7 +2666,11 @@ def _contract_quote_with_status(
     status: ItickMarketStatus,
     contract_symbol: Optional[ContractSymbol],
 ) -> dict[str, Any]:
-    return _apply_effective_spread_x_to_quote(_with_market_status(quote, status), contract_symbol)
+    payload = _with_market_status(quote, status)
+    _attach_contract_symbol_execution_metadata(payload, contract_symbol)
+    _augment_contract_quote_payload(payload)
+    payload = _apply_effective_spread_x_to_quote(payload, contract_symbol)
+    return _augment_contract_quote_payload(payload)
 
 
 def _contract_depth_with_status(
@@ -2633,7 +2678,11 @@ def _contract_depth_with_status(
     status: ItickMarketStatus,
     contract_symbol: Optional[ContractSymbol],
 ) -> dict[str, Any]:
-    return _apply_effective_spread_x_to_depth(_with_market_status(depth, status), contract_symbol)
+    payload = _with_market_status(depth, status)
+    _attach_contract_symbol_execution_metadata(payload, contract_symbol)
+    _augment_contract_quote_payload(payload)
+    payload = _apply_effective_spread_x_to_depth(payload, contract_symbol)
+    return _augment_contract_quote_payload(payload)
 
 
 def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract_quote") -> dict[str, Any]:
@@ -3333,7 +3382,13 @@ def get_executable_contract_quote(
 ) -> dict[str, Any]:
     normalized_symbol = _normalize_symbol(symbol)
     execution_context = context or "contract_execution"
+    try:
+        contract_symbol = _load_contract_symbol(db, normalized_symbol)
+    except ContractSymbolNotFound:
+        contract_symbol = None
     quote = get_contract_quote(db, normalized_symbol, log_context=log_context or execution_context)
+    _attach_contract_symbol_execution_metadata(quote, contract_symbol)
+    _augment_contract_quote_payload(quote)
     require_executable_contract_quote(
         quote,
         context=execution_context,
@@ -3341,6 +3396,7 @@ def get_executable_contract_quote(
         order_id=order_id,
         position_id=position_id,
         user_id=user_id,
+        contract_symbol=contract_symbol,
     )
     return quote
 
@@ -3357,7 +3413,13 @@ def get_executable_contract_depth(
 ) -> dict[str, Any]:
     normalized_symbol = _normalize_symbol(symbol)
     execution_context = context or "contract_execution_depth"
+    try:
+        contract_symbol = _load_contract_symbol(db, normalized_symbol)
+    except ContractSymbolNotFound:
+        contract_symbol = None
     depth = get_contract_depth(db, normalized_symbol, limit=limit, allow_fallback=False)
+    _attach_contract_symbol_execution_metadata(depth, contract_symbol)
+    _augment_contract_quote_payload(depth)
     require_executable_contract_quote(
         depth,
         context=execution_context,
@@ -3366,6 +3428,7 @@ def get_executable_contract_depth(
         position_id=position_id,
         user_id=user_id,
         require_mark_price=False,
+        contract_symbol=contract_symbol,
     )
     best_bid = _to_decimal(depth.get("best_bid"))
     best_ask = _to_decimal(depth.get("best_ask"))
@@ -3839,6 +3902,7 @@ def contract_quote_to_response(quote: dict[str, Any]) -> dict[str, Any]:
         "market_session_type": quote.get("market_session_type"),
         "quote_freshness": quote_freshness,
         "quote_source": quote_source,
+        "closed_market_execution_mode": quote.get("closed_market_execution_mode") or "DISABLED",
         "executable": bool(quote.get("executable") if quote.get("executable") is not None else _payload_quote_executable({**quote, "quote_freshness": quote_freshness})),
         "is_realtime": bool(quote.get("is_realtime") if quote.get("is_realtime") is not None else quote_freshness == QUOTE_FRESHNESS_LIVE),
         "last_good_at": quote.get("last_good_at"),
@@ -3881,6 +3945,7 @@ def contract_depth_to_response(depth: dict[str, Any]) -> dict[str, Any]:
         "market_session_type": depth.get("market_session_type"),
         "quote_freshness": quote_freshness,
         "quote_source": quote_source,
+        "closed_market_execution_mode": depth.get("closed_market_execution_mode") or "DISABLED",
         "executable": bool(depth.get("executable") if depth.get("executable") is not None else _payload_quote_executable({**depth, "quote_freshness": quote_freshness})),
         "is_realtime": bool(depth.get("is_realtime") if depth.get("is_realtime") is not None else quote_freshness == QUOTE_FRESHNESS_LIVE),
         "last_good_at": depth.get("last_good_at"),

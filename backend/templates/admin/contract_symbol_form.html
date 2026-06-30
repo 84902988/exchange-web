@@ -25,6 +25,10 @@
   "MARK_PRICE": "标记价格",
   "LAST_PRICE": "最新价格"
 } %}
+{% set closed_market_execution_mode_labels = {
+  "DISABLED": "闭市不可交易",
+  "LAST_GOOD_BBO": "按最后有效买卖价成交"
+} %}
 
 {% block title %}{{ form_title }}{% endblock %}
 {% block page_title %}{{ form_title }}{% endblock %}
@@ -171,6 +175,15 @@
               <select id="tp_sl_trigger_price_type" name="tp_sl_trigger_price_type">
                 {% for option in tp_sl_trigger_price_type_options %}
                   <option value="{{ option }}" {% if (form.tp_sl_trigger_price_type or 'MARK_PRICE') == option %}selected{% endif %}>{{ tp_sl_trigger_price_type_labels.get(option, option) }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field">
+              <label for="closed_market_execution_mode">闭市成交模式</label>
+              <div class="field-help">仅适用于股票、指数、贵金属、原油等有交易时段的 CFD 标的。数字货币永续不建议开启。若外部行情长期异常，最后有效报价可能持续作为闭市参考价，后续可按运营需求增加有效期或交易日历控制。</div>
+              <select id="closed_market_execution_mode" name="closed_market_execution_mode">
+                {% for option in closed_market_execution_mode_options %}
+                  <option value="{{ option }}" {% if (form.closed_market_execution_mode or 'DISABLED') == option %}selected{% endif %}>{{ closed_market_execution_mode_labels.get(option, option) }}</option>
                 {% endfor %}
               </select>
             </div>

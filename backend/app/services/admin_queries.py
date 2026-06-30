@@ -10704,6 +10704,9 @@ def _admin_contract_symbol_row(row: Dict[str, Any]) -> Dict[str, Any]:
     tp_sl_trigger_price_type = str(row.get("tp_sl_trigger_price_type") or "MARK_PRICE").strip().upper()
     if tp_sl_trigger_price_type not in {"MARK_PRICE", "LAST_PRICE"}:
         tp_sl_trigger_price_type = "MARK_PRICE"
+    closed_market_execution_mode = str(row.get("closed_market_execution_mode") or "DISABLED").strip().upper()
+    if closed_market_execution_mode not in {"DISABLED", "LAST_GOOD_BBO"}:
+        closed_market_execution_mode = "DISABLED"
     return {
         "id": row.get("id"),
         "symbol": row.get("symbol") or "",
@@ -10714,6 +10717,10 @@ def _admin_contract_symbol_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "quote_asset": row.get("quote_asset") or "",
         "tp_sl_trigger_price_type": tp_sl_trigger_price_type,
         "tp_sl_trigger_price_type_label": "最新价格" if tp_sl_trigger_price_type == "LAST_PRICE" else "标记价格",
+        "closed_market_execution_mode": closed_market_execution_mode,
+        "closed_market_execution_mode_label": (
+            "按最后有效买卖价成交" if closed_market_execution_mode == "LAST_GOOD_BBO" else "闭市不可交易"
+        ),
         "price_precision": int(row.get("price_precision") or 0),
         "quantity_precision": int(row.get("quantity_precision") or 0),
         "min_quantity": _admin_trade_quantity_display(row.get("min_quantity")),
@@ -10752,6 +10759,7 @@ def _contract_symbol_form_from_payload(payload: Dict[str, Any], existing_symbol:
         "provider_symbol": _normalize_code(payload.get("provider_symbol")),
         "quote_asset": _normalize_code(payload.get("quote_asset") or "USDT"),
         "tp_sl_trigger_price_type": str(payload.get("tp_sl_trigger_price_type") or "MARK_PRICE").strip().upper(),
+        "closed_market_execution_mode": str(payload.get("closed_market_execution_mode") or "DISABLED").strip().upper(),
         "price_precision": str(payload.get("price_precision") or "8").strip(),
         "quantity_precision": str(payload.get("quantity_precision") or "8").strip(),
         "min_quantity": str(payload.get("min_quantity") or "").strip(),
@@ -10770,6 +10778,7 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
     category_options = {"CRYPTO", "STOCK", "INDEX", "FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES"}
     provider_options = {"BINANCE", "ITICK", "INTERNAL"}
     trigger_price_type_options = {"MARK_PRICE", "LAST_PRICE"}
+    closed_market_execution_mode_options = {"DISABLED", "LAST_GOOD_BBO"}
 
     if is_create and not form["symbol"]:
         errors.append("合约代码不能为空")
@@ -10788,6 +10797,8 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
 
     if form["tp_sl_trigger_price_type"] not in trigger_price_type_options:
         errors.append("TP/SL trigger price type is invalid")
+    if form["closed_market_execution_mode"] not in closed_market_execution_mode_options:
+        errors.append("闭市成交模式无效")
 
     price_precision = _parse_int(form["price_precision"], -1)
     quantity_precision = _parse_int(form["quantity_precision"], -1)
@@ -10825,6 +10836,7 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
         "warning_threshold": warning_threshold,
         "status": _parse_int(form["status"], 1),
         "tp_sl_trigger_price_type": form["tp_sl_trigger_price_type"],
+        "closed_market_execution_mode": form["closed_market_execution_mode"],
     }
     return values, errors
 
@@ -10835,7 +10847,7 @@ def admin_get_contract_symbol(db: Session, symbol_id: int) -> Dict[str, Any]:
             """
             SELECT
                 id, symbol, display_name, category, provider, provider_symbol,
-                quote_asset, tp_sl_trigger_price_type, price_precision, quantity_precision, min_quantity,
+                quote_asset, tp_sl_trigger_price_type, closed_market_execution_mode, price_precision, quantity_precision, min_quantity,
                 max_quantity, min_margin, max_leverage, spread_x,
                 liquidation_threshold, warning_threshold, status, created_at, updated_at
             FROM contract_symbols
@@ -10859,13 +10871,13 @@ def admin_create_contract_symbol(db: Session, payload: Dict[str, Any]) -> Dict[s
                 """
                 INSERT INTO contract_symbols (
                     symbol, display_name, category, provider, provider_symbol, quote_asset,
-                    tp_sl_trigger_price_type,
+                    tp_sl_trigger_price_type, closed_market_execution_mode,
                     price_precision, quantity_precision, min_quantity, max_quantity,
                     min_margin, max_leverage, spread_x, liquidation_threshold,
                     warning_threshold, status, created_at, updated_at
                 ) VALUES (
                     :symbol, :display_name, :category, :provider, :provider_symbol, :quote_asset,
-                    :tp_sl_trigger_price_type,
+                    :tp_sl_trigger_price_type, :closed_market_execution_mode,
                     :price_precision, :quantity_precision, :min_quantity, :max_quantity,
                     :min_margin, :max_leverage, :spread_x, :liquidation_threshold,
                     :warning_threshold, :status, UTC_TIMESTAMP(), UTC_TIMESTAMP()
@@ -10906,6 +10918,7 @@ def admin_update_contract_symbol(db: Session, symbol_id: int, payload: Dict[str,
                     provider_symbol = :provider_symbol,
                     quote_asset = :quote_asset,
                     tp_sl_trigger_price_type = :tp_sl_trigger_price_type,
+                    closed_market_execution_mode = :closed_market_execution_mode,
                     price_precision = :price_precision,
                     quantity_precision = :quantity_precision,
                     min_quantity = :min_quantity,
@@ -10994,6 +11007,7 @@ def admin_query_contract_symbols(db: Session, filters: Optional[Dict[str, Any]] 
                     cs.provider_symbol,
                     cs.quote_asset,
                     cs.tp_sl_trigger_price_type,
+                    cs.closed_market_execution_mode,
                     cs.price_precision,
                     cs.quantity_precision,
                     cs.min_quantity,
