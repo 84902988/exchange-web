@@ -47,6 +47,11 @@ export type ContractQuoteDisplayStatus =
   | 'EXPIRED_LAST_QUOTE'
   | 'UNAVAILABLE'
 
+const LIVE_QUOTE_SOURCES = new Set(['LIVE_WS', 'LIVE'])
+const PROVIDER_NATIVE_LIVE_QUOTE_SOURCES = new Set(['ITICK_DEPTH', 'ITICK_QUOTE'])
+const UNSAFE_QUOTE_FRESHNESSES = new Set(['STALE', 'FALLBACK', 'LAST_VALID', 'INVALID', 'CACHE_STALE'])
+const UNSAFE_QUOTE_SOURCE_TOKENS = ['FALLBACK', 'STALE', 'LAST_VALID', 'INVALID', 'CACHE_STALE']
+
 function toPositiveQuoteNumber(value?: string | number | null): number {
   if (value === undefined || value === null || value === '') return 0
   const parsed = Number(typeof value === 'string' ? value.replace(/,/g, '').trim() : value)
@@ -82,14 +87,27 @@ export function getContractQuoteDisplayStatus(
   if (options.loading) return 'LOADING'
   if (!quote) return 'UNAVAILABLE'
   if (isExpiredLastGoodBboQuote(quote)) return 'EXPIRED_LAST_QUOTE'
-  if (quote.executable === false) return 'UNAVAILABLE'
 
   const quoteSource = String(quote.quote_source || '').trim().toUpperCase()
   const source = String(quote.source || '').trim().toUpperCase()
+  const freshness = String(quote.quote_freshness || '').trim().toUpperCase()
   const sources = new Set([quoteSource, source].filter(Boolean))
+  const executable = quote.executable === true
 
-  if (sources.has('LIVE_WS') || sources.has('LIVE')) return 'LIVE'
-  if (sources.has('LAST_GOOD_BBO') && quote.executable === true) return 'LAST_QUOTE'
+  if (sources.has('LAST_GOOD_BBO') && executable) return 'LAST_QUOTE'
+  if (quote.executable === false) return 'UNAVAILABLE'
+
+  const hasUnsafeSource = Array.from(sources).some((item) => (
+    UNSAFE_QUOTE_SOURCE_TOKENS.some((token) => item.includes(token))
+  ))
+  if (UNSAFE_QUOTE_FRESHNESSES.has(freshness) || hasUnsafeSource) return 'UNAVAILABLE'
+
+  const hasProviderNativeLiveSource = Array.from(sources).some((item) => (
+    PROVIDER_NATIVE_LIVE_QUOTE_SOURCES.has(item)
+  ))
+  if (executable && freshness === 'LIVE' && hasProviderNativeLiveSource) return 'LIVE'
+  if (executable && freshness === 'LIVE') return 'LIVE'
+  if (executable && Array.from(sources).some((item) => LIVE_QUOTE_SOURCES.has(item))) return 'LIVE'
 
   return 'UNAVAILABLE'
 }
