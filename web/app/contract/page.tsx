@@ -48,6 +48,7 @@ const DEFAULT_CONTRACT_SYMBOL = 'BTCUSDT_PERP';
 const CFD_CONTRACT_CATEGORIES = new Set(['GOLD', 'FUTURES', 'INDEX', 'FOREX', 'METAL', 'COMMODITY']);
 const TRADFI_PRICE_DEVIATION_RATIO = 0.005;
 const TRADFI_PRICE_SPREAD_MULTIPLIER = 3;
+const TRADFI_LIVE_CANDLE_PATCH_MAX_DEVIATION_RATIO = 0.01;
 
 const CONTRACT_SYMBOL_OPTIONS = [
   { contractSymbol: DEFAULT_CONTRACT_SYMBOL, marketSymbol: 'BTCUSDT', pricePrecision: 1 },
@@ -618,6 +619,7 @@ function ContractPageContent() {
     latestMarketPrice,
     bestBid,
     bestAsk,
+    bestDepthTimestamp,
     bestBidFromDepth,
     bestAskFromDepth,
     contractQuote,
@@ -657,17 +659,35 @@ function ContractPageContent() {
     pricePrecision,
     isStale: contractQuoteIsStale,
   });
-  const latestCandlePatchPrice = trustedContractDisplayPrice.price;
-  const latestCandlePatchSource = trustedContractDisplayPrice.source;
-  const chartPriceIsStale = contractQuoteIsStale && latestCandlePatchSource !== 'MID_PRICE';
-  const displayLastPrice = latestCandlePatchPrice ? formatPrice(latestCandlePatchPrice, pricePrecision) : '--';
+  const displayContractPrice = trustedContractDisplayPrice.price;
+  const currentPriceLineSource = trustedContractDisplayPrice.source;
+  const canShowCurrentPriceLine = expiredLastGoodQuote
+    ? false
+    : isCryptoContract
+      ? !contractQuoteIsStale && contractQuote?.executable !== false
+      : contractQuoteDisplayStatus === 'LIVE';
+  const chartCurrentPrice = canShowCurrentPriceLine ? displayContractPrice : null;
+  const latestCandlePatchPrice = isCryptoContract && canShowCurrentPriceLine
+    ? displayContractPrice
+    : null;
+  const latestCandlePatchSource = isCryptoContract ? currentPriceLineSource : null;
+  const chartPriceIsStale = !latestCandlePatchPrice
+    || (contractQuoteIsStale && latestCandlePatchSource !== 'MID_PRICE');
+  const displayLastPrice = displayContractPrice ? formatPrice(displayContractPrice, pricePrecision) : '--';
   const displayKlinePrice = formatPrice(latestKlineClose, pricePrecision);
   const headerDisplayPrice = expiredLastGoodQuote ? (latestKlineClose ? displayKlinePrice : '--') : displayLastPrice;
   const lastGoodQuotePrice = formatPrice(contractQuote?.last_price, pricePrecision);
   const orderBookLastPrice = expiredLastGoodQuote ? lastGoodQuotePrice : displayLastPrice;
-  const latestCandlePatchTime = trustedContractDisplayPrice.usesLatestMarketPrice || latestCandlePatchSource === 'MID_PRICE'
+  const latestCandlePatchTime = latestCandlePatchPrice
+    ? latestCandlePatchSource === 'MID_PRICE'
+      ? bestDepthTimestamp || getContractQuoteTimestamp(contractQuote)
+      : trustedContractDisplayPrice.usesLatestMarketPrice
+        ? null
+        : getContractQuoteTimestamp(contractQuote)
+    : null;
+  const latestCandlePatchMaxDeviationRatio = isCryptoContract
     ? null
-    : getContractQuoteTimestamp(contractQuote);
+    : TRADFI_LIVE_CANDLE_PATCH_MAX_DEVIATION_RATIO;
   const allowLatestPriceCandlePatch = shouldPatchContractChartCandle({
     isCryptoContract,
     marketStatus: contractMarketStatus,
@@ -764,8 +784,6 @@ function ContractPageContent() {
     () => buildPositionTpSlOverlays(positions, contractSymbol),
     [contractSymbol, positions],
   );
-  const chartCurrentPrice = expiredLastGoodQuote ? null : latestCandlePatchPrice;
-
   const contractPairSymbols = useMemo(
     () => contractPairs.map((item) => item.symbol),
     [contractPairs],
@@ -965,10 +983,12 @@ function ContractPageContent() {
                       interval={interval}
                       marketStatus={contractMarketStatus}
                       pricePrecision={pricePrecision}
-                      latestCandlePatchPrice={chartCurrentPrice}
+                      currentPriceLinePrice={chartCurrentPrice}
+                      latestCandlePatchPrice={latestCandlePatchPrice}
                       latestPriceTimestamp={latestCandlePatchTime}
                       allowLatestPriceCandlePatch={allowLatestPriceCandlePatch}
-                      latestCandlePatchMaxDeviationRatio={isCryptoContract ? null : 0.002}
+                      latestCandlePatchMaxDeviationRatio={latestCandlePatchMaxDeviationRatio}
+                      strictLatestPricePatchBucket={!isCryptoContract}
                       allowRealtimeTradeCandlePatch={isCryptoContract}
                       marketRealtimeStatus={marketRealtimeStatus}
                       marketSessionType={contractMarketSessionType}
@@ -1020,6 +1040,8 @@ function ContractPageContent() {
                         pricePrecision={pricePrecision}
                         marketStatus={contractMarketStatus}
                         marketRealtimeStatus={marketRealtimeStatus}
+                        quote={contractQuote}
+                        quoteLoading={quoteStatusLoading}
                         initialDepth={initialDepth}
                         onPriceSelect={setSelectedPrice}
                         onBestPricesChange={handleBestPricesChange}

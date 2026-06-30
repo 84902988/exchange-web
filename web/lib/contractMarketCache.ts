@@ -12,9 +12,16 @@ const CLOSED_QUOTE_CACHE_TTL_MS = 30_000;
 const CONTRACT_KLINE_CACHE_VERSION = 2;
 
 export type ContractDepthCache = {
+  symbol?: string | null;
   asks: ContractDepthLevel[];
   bids: ContractDepthLevel[];
   source?: string | null;
+  quote_freshness?: string | null;
+  quote_source?: string | null;
+  market_status?: string | null;
+  executable?: boolean | null;
+  closed_market_execution_mode?: string | null;
+  ts?: string | number | null;
 };
 
 export type ContractKlineCache = {

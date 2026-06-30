@@ -59,10 +59,12 @@ type ContractFuturesChartProps = {
   quoteFreshness?: string | null;
   marketRealtimeStatus?: ContractMarketRealtimeStatus;
   pricePrecision?: number | null;
+  currentPriceLinePrice?: string | number | null;
   latestCandlePatchPrice?: string | number | null;
   latestPriceTimestamp?: string | number | null;
   allowLatestPriceCandlePatch?: boolean;
   latestCandlePatchMaxDeviationRatio?: number | null;
+  strictLatestPricePatchBucket?: boolean;
   allowRealtimeTradeCandlePatch?: boolean;
   onLatestKlineCloseChange?: (price: string | null) => void;
   positionOverlay?: ContractPositionOverlay | null;
@@ -444,7 +446,11 @@ function canPatchLatestCandleWithQuote(
   latestTime: number,
   quoteBucketTime: number | null,
   interval: string,
+  strictBucket: boolean,
 ) {
+  if (strictBucket) {
+    return quoteBucketTime !== null && quoteBucketTime === latestTime;
+  }
   if (quoteBucketTime === null) return true;
   if (quoteBucketTime === latestTime) return true;
 
@@ -575,6 +581,7 @@ function syncLatestPriceToCurrentCandle(
   price: number,
   quoteTimestamp: string | number | null | undefined,
   maxDeviationRatio?: number | null,
+  strictBucket = false,
 ) {
   if (!Number.isFinite(price) || price <= 0 || !candles.length) return null;
 
@@ -584,7 +591,7 @@ function syncLatestPriceToCurrentCandle(
   if (!latest) return null;
 
   const quoteBucketTime = getQuoteBucketTime(quoteTimestamp, interval);
-  if (!canPatchLatestCandleWithQuote(latest.time, quoteBucketTime, interval)) return null;
+  if (!canPatchLatestCandleWithQuote(latest.time, quoteBucketTime, interval, strictBucket)) return null;
 
   const candleIndex = nextCandles.findIndex((item) => item.time === latest.time);
   if (candleIndex < 0) return null;
@@ -636,10 +643,12 @@ export default function ContractFuturesChart({
   marketStatus,
   pricePrecision: explicitPricePrecision,
   marketRealtimeStatus = 'idle',
+  currentPriceLinePrice,
   latestCandlePatchPrice,
   latestPriceTimestamp,
   allowLatestPriceCandlePatch = true,
   latestCandlePatchMaxDeviationRatio = null,
+  strictLatestPricePatchBucket = false,
   allowRealtimeTradeCandlePatch = true,
   onLatestKlineCloseChange,
   positionOverlay = null,
@@ -669,11 +678,13 @@ export default function ContractFuturesChart({
     price: number | null;
     timestamp?: string | number | null;
     maxDeviationRatio?: number | null;
+    strictBucket: boolean;
   }>({
     allow: false,
     price: null,
     timestamp: null,
     maxDeviationRatio: null,
+    strictBucket: false,
   });
   const candlesRef = useRef<CandleItem[]>([]);
   const volumesRef = useRef<VolumeItem[]>([]);
@@ -796,7 +807,7 @@ export default function ContractFuturesChart({
     });
 
     const latest = getLatestRealCandle(allCandles);
-    const currentPrice = firstValidPrice(latestCandlePatchPrice, latest?.close);
+    const currentPrice = firstValidPrice(currentPriceLinePrice, latestCandlePatchPrice, latest?.close);
     if (currentPrice !== null) values.push(currentPrice);
 
     const finiteValues = values.filter((value) => Number.isFinite(value) && value > 0);
@@ -823,7 +834,7 @@ export default function ContractFuturesChart({
       from: rangeFrom,
       to: rangeTo,
     });
-  }, [latestCandlePatchPrice, precision]);
+  }, [currentPriceLinePrice, latestCandlePatchPrice, precision]);
 
   const applyTrustedLatestPricePatch = useCallback((
     sourceCandles: CandleItem[],
@@ -840,6 +851,7 @@ export default function ContractFuturesChart({
       patch.price,
       patch.timestamp,
       patch.maxDeviationRatio,
+      patch.strictBucket,
     );
     if (!synced) return normalized;
 
@@ -852,6 +864,7 @@ export default function ContractFuturesChart({
       price: firstValidPrice(latestCandlePatchPrice),
       timestamp: latestPriceTimestamp,
       maxDeviationRatio: latestCandlePatchMaxDeviationRatio,
+      strictBucket: strictLatestPricePatchBucket,
     };
   }, [
     allowLatestPriceCandlePatch,
@@ -859,6 +872,7 @@ export default function ContractFuturesChart({
     latestCandlePatchPrice,
     latestPriceTimestamp,
     marketStatus,
+    strictLatestPricePatchBucket,
   ]);
 
   const resetChartView = useCallback(() => {
@@ -1212,11 +1226,12 @@ export default function ContractFuturesChart({
 
       const nextCandles = updated.nextCandles;
       const nextVolumes = updated.nextVolumes;
+      const patched = applyTrustedLatestPricePatch(nextCandles, nextVolumes);
       const normalized = setKlinePairState(
         { candlesRef, volumesRef, oldestTimeRef },
         { setCandles, setVolumes },
-        nextCandles,
-        nextVolumes,
+        patched.candles,
+        patched.volumes,
       );
       setLoading(false);
       setError('');
@@ -1233,7 +1248,7 @@ export default function ContractFuturesChart({
       unsubscribeTrade();
       unsubscribeKline();
     };
-  }, [allowRealtimeTradeCandlePatch, interval, marketStatus, symbol]);
+  }, [allowRealtimeTradeCandlePatch, applyTrustedLatestPricePatch, interval, marketStatus, symbol]);
 
   useEffect(() => {
     if (!candleSeriesRef.current || !volumeSeriesRef.current) return;
@@ -1301,6 +1316,7 @@ export default function ContractFuturesChart({
       price,
       latestPriceTimestamp,
       latestCandlePatchMaxDeviationRatio,
+      strictLatestPricePatchBucket,
     );
     if (!synced) return;
 
@@ -1323,6 +1339,7 @@ export default function ContractFuturesChart({
     latestPriceTimestamp,
     marketStatus,
     symbol,
+    strictLatestPricePatchBucket,
   ]);
 
   useEffect(() => {
@@ -1372,7 +1389,7 @@ export default function ContractFuturesChart({
   useEffect(() => {
     const series = candleSeriesRef.current;
     const latest = getLatestRealCandle(candles);
-    const trustedPrice = firstValidPrice(latestCandlePatchPrice);
+    const trustedPrice = firstValidPrice(currentPriceLinePrice, latestCandlePatchPrice);
     const price = firstValidPrice(trustedPrice, latest?.close);
 
     if (!series) return;
@@ -1412,7 +1429,7 @@ export default function ContractFuturesChart({
       color,
       title: '',
     });
-  }, [candles, latestCandlePatchPrice]);
+  }, [candles, currentPriceLinePrice, latestCandlePatchPrice]);
 
   useEffect(() => {
     const series = candleSeriesRef.current;

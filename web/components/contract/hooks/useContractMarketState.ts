@@ -24,9 +24,16 @@ import {
 export type PriceDirection = 'up' | 'down' | 'flat';
 
 type ContractDepthSnapshot = {
+  symbol?: string | null;
   asks: ContractDepthLevel[];
   bids: ContractDepthLevel[];
   source?: string | null;
+  quote_freshness?: string | null;
+  quote_source?: string | null;
+  market_status?: string | null;
+  executable?: boolean | null;
+  closed_market_execution_mode?: string | null;
+  ts?: string | number | null;
 };
 
 type UseContractMarketStateParams = {
@@ -50,6 +57,7 @@ type BestDepthState = {
   symbol: string;
   bestBid: string | null;
   bestAsk: string | null;
+  ts: string | number | null;
 };
 
 function getMarketSymbol(contractSymbol: string, symbolOptionMarketSymbol?: string | null) {
@@ -135,6 +143,7 @@ export function useContractMarketState({
     symbol: contractSymbol,
     bestBid: null,
     bestAsk: null,
+    ts: null,
   }));
   const [contractQuoteState, setContractQuoteState] = useState<ContractQuoteState>(() => ({
     symbol: contractSymbol,
@@ -169,6 +178,7 @@ export function useContractMarketState({
   ) ?? symbolOptionPricePrecision ?? 2;
   const bestBidFromDepth = bestDepth.symbol === contractSymbol ? bestDepth.bestBid : null;
   const bestAskFromDepth = bestDepth.symbol === contractSymbol ? bestDepth.bestAsk : null;
+  const bestDepthTimestamp = bestDepth.symbol === contractSymbol ? bestDepth.ts : null;
   const bestBid = bestBidFromDepth || null;
   const bestAsk = bestAskFromDepth || null;
   const midPrice = useMemo(() => {
@@ -244,14 +254,17 @@ export function useContractMarketState({
   const handleBestPricesChange = useCallback(({
     bestBid: nextBestBid,
     bestAsk: nextBestAsk,
+    ts,
   }: {
     bestBid: string | null;
     bestAsk: string | null;
+    ts?: string | number | null;
   }) => {
     setBestDepth({
       symbol: contractSymbol,
       bestBid: nextBestBid,
       bestAsk: nextBestAsk,
+      ts: ts ?? null,
     });
   }, [contractSymbol]);
 
@@ -271,6 +284,7 @@ export function useContractMarketState({
         symbol: contractSymbol,
         bestBid: null,
         bestAsk: null,
+        ts: null,
       });
       const cache = readContractQuoteCache(contractSymbol);
       contractQuoteRef.current = cache.quote || null;
@@ -363,6 +377,7 @@ export function useContractMarketState({
     latestMarketPrice: activeLatestMarketPrice,
     bestBid,
     bestAsk,
+    bestDepthTimestamp,
     midPrice,
     bestBidFromDepth,
     bestAskFromDepth,
