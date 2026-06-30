@@ -31,6 +31,10 @@
     "MARK_PRICE": "标记价格",
     "LAST_PRICE": "最新价格"
   } %}
+  {% set closed_market_execution_mode_labels = {
+    "DISABLED": "闭市不可交易",
+    "LAST_GOOD_BBO": "最后有效BBO"
+  } %}
   {% set current_url = request.url.path %}
   {% if request.url.query %}
     {% set current_url = request.url.path ~ '?' ~ request.url.query %}
@@ -115,6 +119,7 @@
                 <th class="nowrap">外部代码</th>
                 <th class="nowrap">计价币种</th>
                 <th class="nowrap">TP/SL 触发</th>
+                <th class="nowrap">闭市成交</th>
                 <th class="text-right admin-number">杠杆</th>
                 <th class="text-right admin-number">固定点差(U)</th>
                 <th class="text-right admin-number">强平阈值</th>
@@ -134,6 +139,7 @@
                   <td class="mono nowrap">{{ item.provider_symbol }}</td>
                   <td class="mono nowrap">{{ item.quote_asset }}</td>
                   <td><span class="admin-badge admin-badge-secondary">{{ tp_sl_trigger_price_type_labels.get(item.tp_sl_trigger_price_type, item.tp_sl_trigger_price_type_label) }}</span></td>
+                  <td><span class="admin-badge admin-badge-secondary">{{ closed_market_execution_mode_labels.get(item.closed_market_execution_mode, item.closed_market_execution_mode_label) }}</span></td>
                   <td class="admin-amount">{{ item.leverage_text }}</td>
                   <td class="admin-amount">{{ item.spread_x }}</td>
                   <td class="admin-amount">{{ item.liquidation_threshold }}</td>
