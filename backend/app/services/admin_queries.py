@@ -10750,16 +10750,44 @@ def _admin_contract_symbol_form_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
+_CLOSED_MARKET_DEFAULT_LAST_GOOD_CATEGORIES = {
+    "STOCK",
+    "CFD",
+    "INDEX",
+    "FOREX",
+    "METAL",
+    "GOLD",
+    "COMMODITY",
+    "FUTURES",
+}
+
+
+def _default_closed_market_execution_mode(category: str, provider: str) -> str:
+    normalized_category = str(category or "").strip().upper()
+    normalized_provider = str(provider or "").strip().upper()
+    if normalized_category == "CRYPTO":
+        return "DISABLED"
+    if normalized_category in _CLOSED_MARKET_DEFAULT_LAST_GOOD_CATEGORIES or normalized_provider == "ITICK":
+        return "LAST_GOOD_BBO"
+    return "DISABLED"
+
+
 def _contract_symbol_form_from_payload(payload: Dict[str, Any], existing_symbol: str = "") -> Dict[str, Any]:
+    category = str(payload.get("category") or "").strip().upper()
+    provider = str(payload.get("provider") or "").strip().upper()
+    mode = str(
+        payload.get("closed_market_execution_mode")
+        or _default_closed_market_execution_mode(category, provider)
+    ).strip().upper()
     return {
         "symbol": _normalize_code(payload.get("symbol") or existing_symbol),
         "display_name": str(payload.get("display_name") or "").strip(),
-        "category": str(payload.get("category") or "").strip().upper(),
-        "provider": str(payload.get("provider") or "").strip().upper(),
+        "category": category,
+        "provider": provider,
         "provider_symbol": _normalize_code(payload.get("provider_symbol")),
         "quote_asset": _normalize_code(payload.get("quote_asset") or "USDT"),
         "tp_sl_trigger_price_type": str(payload.get("tp_sl_trigger_price_type") or "MARK_PRICE").strip().upper(),
-        "closed_market_execution_mode": str(payload.get("closed_market_execution_mode") or "DISABLED").strip().upper(),
+        "closed_market_execution_mode": mode,
         "price_precision": str(payload.get("price_precision") or "8").strip(),
         "quantity_precision": str(payload.get("quantity_precision") or "8").strip(),
         "min_quantity": str(payload.get("min_quantity") or "").strip(),
@@ -10775,7 +10803,7 @@ def _contract_symbol_form_from_payload(payload: Dict[str, Any], existing_symbol:
 
 def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> tuple[Dict[str, Any], list[str]]:
     errors: list[str] = []
-    category_options = {"CRYPTO", "STOCK", "INDEX", "FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES"}
+    category_options = {"CRYPTO", "STOCK", "CFD", "INDEX", "FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES"}
     provider_options = {"BINANCE", "ITICK", "INTERNAL"}
     trigger_price_type_options = {"MARK_PRICE", "LAST_PRICE"}
     closed_market_execution_mode_options = {"DISABLED", "LAST_GOOD_BBO"}

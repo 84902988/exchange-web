@@ -83,7 +83,7 @@ _itick_ticker_24h_fields = (
 _stock_contract_ticker_request_limit = 20
 _stock_contract_region = "US"
 _stock_contract_quote_asset = "USDT"
-_tradfi_cfd_categories = {"INDEX", "FOREX", "METAL", "COMMODITY"}
+_tradfi_cfd_categories = {"CFD", "INDEX", "FOREX", "METAL", "COMMODITY"}
 _holiday_contract_categories = {"STOCK", "INDEX"}
 _contract_24x5_categories = {"FOREX", "METAL", "COMMODITY"}
 _itick_contract_k_type = {
@@ -225,7 +225,7 @@ def _normalize_contract_category(value: Any) -> str:
         return "METAL"
     if upper in ("FUTURES", "COMMODITY"):
         return "COMMODITY"
-    if upper in ("INDEX", "FOREX", "STOCK", "CRYPTO"):
+    if upper in ("CFD", "INDEX", "FOREX", "STOCK", "CRYPTO"):
         return upper
     if upper in ("FX",):
         return "FOREX"
