@@ -26,8 +26,11 @@ import { useLocaleContext } from '@/contexts/LocaleContext';
 import { toNumber } from '@/components/contract/contractFormat';
 import { formatPrice } from '@/lib/marketPrecision';
 import {
+  getContractQuoteDisplayStatus,
   getContractSymbols,
   getContractTickers,
+  isExpiredLastGoodBboQuote,
+  type ContractQuoteDisplayStatus,
   type ContractTickerItem,
   type ContractPositionItem,
   type ContractPositionSummaryItem,
@@ -393,6 +396,22 @@ function getTickerChangePercent(ticker: ContractTickerItem | null) {
   return ticker?.price_change_percent_24h ?? ticker?.priceChangePercent ?? null;
 }
 
+function getContractQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
+  if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
+  if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
+  if (status === 'LAST_QUOTE') return t('lastQuoteLabel', 'contracts');
+  if (status === 'EXPIRED_LAST_QUOTE') return t('lastQuoteExpiredLabel', 'contracts');
+  return t('quoteTemporarilyUnavailableLabel', 'contracts');
+}
+
+function getContractQuoteStatusTone(status: ContractQuoteDisplayStatus) {
+  if (status === 'LOADING') return 'loading' as const;
+  if (status === 'LIVE') return 'live' as const;
+  if (status === 'EXPIRED_LAST_QUOTE') return 'expired' as const;
+  if (status === 'UNAVAILABLE') return 'unavailable' as const;
+  return 'last' as const;
+}
+
 function isCryptoContractPair(pair: GlobalMarketSelectorPair | null | undefined) {
   if (!pair) return false;
   const categories = getContractPairCategories(pair);
@@ -565,6 +584,7 @@ function ContractPageContent() {
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
   const [contractDataScope, setContractDataScope] = useState<ContractDataScope>('current');
   const [selectedPrice, setSelectedPrice] = useState<string | null>(null);
+  const [latestKlineClose, setLatestKlineClose] = useState<string | null>(null);
   const [contractPairs, setContractPairs] = useState<GlobalMarketSelectorPair[]>(() => [
     getFallbackContractPair(DEFAULT_CONTRACT_SYMBOL, 1, t),
   ]);
@@ -601,6 +621,7 @@ function ContractPageContent() {
     bestBidFromDepth,
     bestAskFromDepth,
     contractQuote,
+    contractQuoteLoading,
     contractAvailabilityError,
     pricePrecision,
     quoteHint,
@@ -620,6 +641,11 @@ function ContractPageContent() {
   const contractMarketStatusText = contractQuote?.market_status_text || contractTicker?.market_status_text || currentContractPair?.marketStatusText || null;
   const contractQuoteFreshness = contractQuote?.quote_freshness || contractTicker?.quote_freshness || null;
   const contractMarketSessionType = contractQuote?.market_session_type || contractTicker?.market_session_type || currentContractPair?.marketSessionType || null;
+  const quoteStatusLoading = contractQuoteLoading && (!contractQuote || contractQuote.executable === false);
+  const contractQuoteDisplayStatus = getContractQuoteDisplayStatus(contractQuote, { loading: quoteStatusLoading });
+  const quoteStatusLabel = getContractQuoteStatusLabel(contractQuoteDisplayStatus, t);
+  const quoteStatusTone = getContractQuoteStatusTone(contractQuoteDisplayStatus);
+  const expiredLastGoodQuote = isExpiredLastGoodBboQuote(contractQuote);
   const contractQuoteIsStale = isContractQuoteStale(contractQuote, contractQuoteFreshness);
   const trustedContractDisplayPrice = buildTrustedContractDisplayPrice({
     isCryptoContract,
@@ -635,6 +661,10 @@ function ContractPageContent() {
   const latestCandlePatchSource = trustedContractDisplayPrice.source;
   const chartPriceIsStale = contractQuoteIsStale && latestCandlePatchSource !== 'MID_PRICE';
   const displayLastPrice = latestCandlePatchPrice ? formatPrice(latestCandlePatchPrice, pricePrecision) : '--';
+  const displayKlinePrice = formatPrice(latestKlineClose, pricePrecision);
+  const headerDisplayPrice = expiredLastGoodQuote ? (latestKlineClose ? displayKlinePrice : '--') : displayLastPrice;
+  const lastGoodQuotePrice = formatPrice(contractQuote?.last_price, pricePrecision);
+  const orderBookLastPrice = expiredLastGoodQuote ? lastGoodQuotePrice : displayLastPrice;
   const latestCandlePatchTime = trustedContractDisplayPrice.usesLatestMarketPrice || latestCandlePatchSource === 'MID_PRICE'
     ? null
     : getContractQuoteTimestamp(contractQuote);
@@ -657,6 +687,23 @@ function ContractPageContent() {
       ];
     }
 
+    if (expiredLastGoodQuote) {
+      return [
+        { label: t('latestPrice', 'contracts'), value: headerDisplayPrice },
+        {
+          label: t('expiredLastGoodQuoteLabel', 'contracts'),
+          value: lastGoodQuotePrice,
+          subValue: quoteStatusLabel,
+        },
+        { label: t('spread', 'contracts'), value: spread },
+        {
+          label: t('lastQuoteLabel', 'contracts'),
+          value: bidAsk,
+          subValue: quoteStatusLabel,
+        },
+      ];
+    }
+
     return [
       {
         label: t('markLatest', 'contracts'),
@@ -674,8 +721,12 @@ function ContractPageContent() {
     contractQuote?.mark_price,
     contractTicker,
     displayLastPrice,
+    expiredLastGoodQuote,
+    headerDisplayPrice,
     isCryptoContract,
+    lastGoodQuotePrice,
     pricePrecision,
+    quoteStatusLabel,
     t,
   ]);
 
@@ -713,7 +764,7 @@ function ContractPageContent() {
     () => buildPositionTpSlOverlays(positions, contractSymbol),
     [contractSymbol, positions],
   );
-  const chartCurrentPrice = latestCandlePatchPrice;
+  const chartCurrentPrice = expiredLastGoodQuote ? null : latestCandlePatchPrice;
 
   const contractPairSymbols = useMemo(
     () => contractPairs.map((item) => item.symbol),
@@ -764,6 +815,10 @@ function ContractPageContent() {
   useEffect(() => {
     setSelectedPrice(null);
   }, [contractSymbol]);
+
+  useEffect(() => {
+    setLatestKlineClose(null);
+  }, [contractSymbol, interval]);
 
   useEffect(() => {
     void refreshContractPairs();
@@ -862,7 +917,9 @@ function ContractPageContent() {
     <div className="flex min-h-screen flex-col overflow-y-auto overflow-x-hidden bg-[#0b0e11] text-white">
       <ContractMarketHeader
         marketSymbol={marketSymbol}
-        price={displayLastPrice}
+        price={headerDisplayPrice}
+        quoteStatusLabel={quoteStatusLabel}
+        quoteStatusTone={quoteStatusTone}
         metrics={headerMetrics}
         hint={quoteHint}
         marketStatus={contractMarketStatus}
@@ -916,6 +973,7 @@ function ContractPageContent() {
                       marketRealtimeStatus={marketRealtimeStatus}
                       marketSessionType={contractMarketSessionType}
                       quoteFreshness={contractQuoteFreshness}
+                      onLatestKlineCloseChange={setLatestKlineClose}
                       positionOverlay={positionOverlay}
                       positionEntryOverlays={positionEntryOverlays}
                       positionTpSlOverlays={positionTpSlOverlays}
@@ -957,7 +1015,7 @@ function ContractPageContent() {
                     <div className={rightPanelTab === 'orderbook' ? 'block h-full min-h-0 min-w-0' : 'hidden h-full min-h-0 min-w-0'}>
                       <ContractFuturesOrderBook
                         symbol={contractSymbol}
-                        lastPrice={displayLastPrice}
+                        lastPrice={orderBookLastPrice}
                         priceDirection={priceDirection}
                         pricePrecision={pricePrecision}
                         marketStatus={contractMarketStatus}
@@ -1029,6 +1087,7 @@ function ContractPageContent() {
                   availableMargin={account?.available_margin}
                   isLoggedIn={isLoggedIn && !authLoading}
                   disabled={!!contractAvailabilityError || !contractQuote}
+                  quoteLoading={quoteStatusLoading}
                   onSuccess={refreshPrivateSilently}
                   tpSlTriggerPriceType={tpSlTriggerPriceType}
                 />

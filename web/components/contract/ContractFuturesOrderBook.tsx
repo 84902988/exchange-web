@@ -2,8 +2,10 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  getContractQuoteDisplayStatus,
   getContractDepth,
   isExpiredLastGoodBboQuote,
+  type ContractQuoteDisplayStatus,
   type ContractDepthLevel,
 } from '@/lib/api/modules/contract';
 import { normalizeSide } from '@/components/spot/orderbook/orderbook.utils';
@@ -52,6 +54,23 @@ type Row = {
 
 const FUTURES_DEPTH_LIMIT = 20;
 const UI_DISPLAY_LIMIT = 9;
+
+function getQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
+  if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
+  if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
+  if (status === 'LAST_QUOTE') return t('lastQuoteLabel', 'contracts');
+  if (status === 'EXPIRED_LAST_QUOTE') return t('lastQuoteExpiredLabel', 'contracts');
+  return t('quoteTemporarilyUnavailableLabel', 'contracts');
+}
+
+function quoteStatusBadgeClass(status: ContractQuoteDisplayStatus) {
+  if (status === 'LOADING') return 'border-white/10 bg-white/[0.05] text-white/58';
+  if (status === 'LIVE') return 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]';
+  if (status === 'EXPIRED_LAST_QUOTE' || status === 'UNAVAILABLE') {
+    return 'border-[#f6465d]/20 bg-[#f6465d]/10 text-[#f6465d]';
+  }
+  return 'border-[#f0b90b]/20 bg-[#f0b90b]/10 text-[#f0b90b]';
+}
 
 function toNumber(value?: string | number | null) {
   const n = Number(value);
@@ -352,20 +371,31 @@ export default function ContractFuturesOrderBook({
     quote_source: depthQuoteSource || undefined,
     source,
   });
+  const depthDisplayStatus = getContractQuoteDisplayStatus({
+    executable: depthExecutable ?? undefined,
+    market_status: depthMarketStatus || effectiveMarketStatus || undefined,
+    closed_market_execution_mode: depthClosedMarketExecutionMode || undefined,
+    quote_source: depthQuoteSource || undefined,
+    source,
+  }, {
+    loading: loading && !source && !depthQuoteSource && depthExecutable === null,
+  });
+  const hasDepthQuoteStatus = Boolean(source || depthQuoteSource || depthExecutable !== null);
+  const depthStatusLabel = getQuoteStatusLabel(depthDisplayStatus, t);
+  const titleLabel = depthDisplayStatus === 'LAST_QUOTE' || depthDisplayStatus === 'EXPIRED_LAST_QUOTE'
+    ? t('lastQuoteLabel', 'contracts')
+    : t('orderBook', 'contracts');
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
       <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
         <div className="flex min-w-0 flex-nowrap items-center gap-2">
-          <div className="shrink-0 whitespace-nowrap text-[13px] font-medium text-white/88">{t('orderBook', 'contracts')}</div>
-          {effectiveMarketStatus === 'CLOSED' && depthExecutable !== false ? (
-            <div className="shrink-0 whitespace-nowrap rounded-full border border-[#f0b90b]/20 bg-[#f0b90b]/10 px-2 py-0.5 text-[10px] font-semibold text-[#f0b90b]">
-              {t('platformQuote', 'contracts')}
-            </div>
-          ) : null}
-          {depthExecutable === false ? (
-            <div className="shrink-0 whitespace-nowrap rounded-full border border-[#f6465d]/20 bg-[#f6465d]/10 px-2 py-0.5 text-[10px] font-semibold text-[#f6465d]">
-              {t(isExpiredLastGoodBbo ? 'lastGoodBboExpiredBadge' : 'quoteUnavailableShort', 'contracts')}
+          <div className="shrink-0 whitespace-nowrap text-[13px] font-medium text-white/88">
+            {titleLabel}
+          </div>
+          {hasDepthQuoteStatus ? (
+            <div className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${quoteStatusBadgeClass(depthDisplayStatus)}`}>
+              {isExpiredLastGoodBbo ? t('lastQuoteExpiredLabel', 'contracts') : depthStatusLabel}
             </div>
           ) : null}
         </div>

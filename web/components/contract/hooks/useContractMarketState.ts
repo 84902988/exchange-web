@@ -140,8 +140,10 @@ export function useContractMarketState({
     symbol: contractSymbol,
     quote: null,
   }));
+  const [contractQuoteLoading, setContractQuoteLoading] = useState(true);
   const [contractAvailabilityError, setContractAvailabilityError] = useState<string | null>(null);
   const contractQuoteRef = useRef<ContractQuoteWithPremiumFields | null>(null);
+  const quoteLoadedSymbolRef = useRef<string | null>(null);
   const latestMarketPriceRef = useRef(0);
 
   const marketSymbol = useMemo(
@@ -217,11 +219,15 @@ export function useContractMarketState({
   const initialDepth = hasHydrated ? readContractDepthCache(contractSymbol) || undefined : undefined;
 
   const refreshContractQuote = useCallback(async () => {
+    if (quoteLoadedSymbolRef.current !== contractSymbol) {
+      setContractQuoteLoading(true);
+    }
     try {
       const nextQuote = await getContractQuote(contractSymbol);
       const nextPrice = getQuoteTradePrice(nextQuote);
       applyLatestPrice(nextPrice);
       contractQuoteRef.current = nextQuote;
+      quoteLoadedSymbolRef.current = contractSymbol;
       setContractQuoteState({
         symbol: contractSymbol,
         quote: nextQuote,
@@ -230,6 +236,8 @@ export function useContractMarketState({
       setContractAvailabilityError(null);
     } catch (err) {
       setContractAvailabilityError(friendlyContractError(err, t));
+    } finally {
+      setContractQuoteLoading(false);
     }
   }, [applyLatestPrice, contractSymbol, t]);
 
@@ -257,6 +265,8 @@ export function useContractMarketState({
     void Promise.resolve().then(() => {
       if (!alive) return;
       setHasHydrated(true);
+      quoteLoadedSymbolRef.current = null;
+      setContractQuoteLoading(true);
       setBestDepth({
         symbol: contractSymbol,
         bestBid: null,
@@ -321,6 +331,8 @@ export function useContractMarketState({
       const nextPrice = getQuoteTradePrice(mergedQuote);
       applyLatestPrice(nextPrice);
       contractQuoteRef.current = mergedQuote;
+      quoteLoadedSymbolRef.current = contractSymbol;
+      setContractQuoteLoading(false);
       setContractQuoteState({
         symbol: contractSymbol,
         quote: mergedQuote,
@@ -355,6 +367,7 @@ export function useContractMarketState({
     bestBidFromDepth,
     bestAskFromDepth,
     contractQuote,
+    contractQuoteLoading,
     contractAvailabilityError,
     pricePrecision,
     spreadInfo,

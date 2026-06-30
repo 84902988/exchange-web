@@ -4,8 +4,10 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   closeContractOrder,
   closeContractSummaryOrder,
+  getContractQuoteDisplayStatus,
   isExpiredLastGoodBboQuote,
   openContractOrder,
+  type ContractQuoteDisplayStatus,
   type ContractOrderType,
   type ContractPositionItem,
   type ContractPositionSide,
@@ -50,9 +52,18 @@ type ContractTradingFormProps = {
   availableMargin?: string | null;
   isLoggedIn: boolean;
   disabled?: boolean;
+  quoteLoading?: boolean;
   onSuccess: () => Promise<void> | void;
   tpSlTriggerPriceType?: ContractTpSlTriggerPriceType | string | null;
 };
+
+function getQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
+  if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
+  if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
+  if (status === 'LAST_QUOTE') return t('lastQuoteLabel', 'contracts');
+  if (status === 'EXPIRED_LAST_QUOTE') return t('lastQuoteExpiredLabel', 'contracts');
+  return t('quoteTemporarilyUnavailableLabel', 'contracts');
+}
 
 const DEFAULT_MAX_LEVERAGE = 200;
 const TP_SL_STEP = 1;
@@ -174,6 +185,7 @@ export default function ContractTradingForm({
   availableMargin,
   isLoggedIn,
   disabled = false,
+  quoteLoading = false,
   onSuccess,
   tpSlTriggerPriceType,
 }: ContractTradingFormProps) {
@@ -275,31 +287,40 @@ export default function ContractTradingForm({
   const normalizedQuoteMarketStatus = String(quote?.market_status || '').trim().toUpperCase();
   const isClosedMarketQuote = normalizedQuoteMarketStatus === 'CLOSED' || normalizedQuoteMarketStatus === 'HOLIDAY';
   const quoteUnavailable = quote?.executable === false;
+  const quoteStatusLoading = quoteLoading && (!quote || quoteUnavailable);
+  const quoteDisplayStatus = getContractQuoteDisplayStatus(quote, { loading: quoteStatusLoading });
   const quoteUnavailableReason: QuoteUnavailableReason = isExpiredLastGoodBboQuote(quote)
     ? 'EXPIRED_LAST_GOOD_BBO'
-    : quoteUnavailable
+    : quoteUnavailable && !quoteStatusLoading
       ? 'GENERIC_UNAVAILABLE'
       : null;
+  const quoteLoadingFeedback = quoteStatusLoading ? t('marketDataLoadingLabel', 'contracts') : null;
   const quoteUnavailableFeedback = quoteUnavailableReason === 'EXPIRED_LAST_GOOD_BBO'
     ? t('lastGoodBboExpiredTradingHint', 'contracts')
     : quoteUnavailableReason === 'GENERIC_UNAVAILABLE'
       ? t('quoteUnavailableTradingHint', 'contracts')
       : null;
-  const displayFeedback = quoteUnavailableFeedback
+  const displayFeedback = quoteLoadingFeedback
+    ? { type: 'info' as const, message: quoteLoadingFeedback }
+    : quoteUnavailableFeedback
     ? { type: 'error' as const, message: quoteUnavailableFeedback }
     : feedback;
-  const quoteStatusHint = quote
+  const quoteStatusHint = quoteStatusLoading
+    ? getQuoteStatusLabel(quoteDisplayStatus, t)
+    : quote
     ? quoteUnavailable
       ? null
-      : isClosedMarketQuote
-        ? t('marketClosedTradableHint', 'contracts')
-        : t('marketRealtimeTradableHint', 'contracts')
+      : getQuoteStatusLabel(quoteDisplayStatus, t)
     : null;
-  const quoteStatusClassName = quoteUnavailable
+  const quoteStatusClassName = quoteStatusLoading
+    ? 'border-white/10 bg-white/[0.05] text-white/58'
+    : quoteUnavailable
     ? 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]'
-    : isClosedMarketQuote
+    : quoteDisplayStatus === 'LIVE'
+      ? 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]'
+      : quoteDisplayStatus === 'LAST_QUOTE' || isClosedMarketQuote
       ? 'border-[#f0b90b]/25 bg-[#f0b90b]/10 text-[#f0b90b]'
-      : 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]';
+      : 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]';
 
   const bidReferencePrice = useMemo(() => (
     pickMarketReferencePrice(toNumber(bestBid), quoteBidPrice, quoteAnchorPrice)
@@ -410,7 +431,7 @@ export default function ContractTradingForm({
       : (entry - closePrice) * qty;
   }, [closeQuantity, closeSide, estimatedExecutionPrice, selectedCloseEntryPrice, selectedClosePosition, selectedCloseQuantity, selectedCloseSummary]);
 
-  const submitDisabled = disabled || submitting || !isLoggedIn || quoteUnavailable;
+  const submitDisabled = disabled || submitting || !isLoggedIn || quoteStatusLoading || quoteUnavailable;
   const openSubmitDisabled = submitDisabled || availableMarginNumber <= 0;
   const closeDisabled = submitDisabled || (!selectedCloseSummary && !selectedClosePosition);
 
@@ -512,6 +533,7 @@ export default function ContractTradingForm({
 
   function validateOpen(side: ContractPositionSide) {
     if (availableMarginNumber <= 0) return t('transferMarginFirst', 'contracts');
+    if (quoteStatusLoading) return t('marketDataLoadingLabel', 'contracts');
     if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
     if (!quantity.trim()) return t('enterQuantity', 'contracts');
     if (toNumber(quantity) <= 0) return t('enterValidOpenQuantity', 'contracts');
@@ -529,6 +551,7 @@ export default function ContractTradingForm({
 
   function validateClose(position: ContractPositionItem | null, maxQuantity: string) {
     if (!selectedCloseSummary && !position) return t('noClosablePosition', 'contracts');
+    if (quoteStatusLoading) return t('marketDataLoadingLabel', 'contracts');
     if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
     const qty = toNumber(closeQuantity || maxQuantity);
     if (qty <= 0) return t('enterValidCloseQuantity', 'contracts');
