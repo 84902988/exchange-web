@@ -19,6 +19,7 @@ class ContractQuoteResponse(BaseModel):
     market_session_type: Optional[str] = None
     quote_freshness: str = "FALLBACK"
     quote_source: str = "UNKNOWN"
+    closed_market_execution_mode: str = "DISABLED"
     executable: bool = False
     is_realtime: bool = False
     last_good_at: Optional[datetime] = None
@@ -57,6 +58,7 @@ class ContractDepthResponse(BaseModel):
     market_session_type: Optional[str] = None
     quote_freshness: str = "FALLBACK"
     quote_source: str = "UNKNOWN"
+    closed_market_execution_mode: str = "DISABLED"
     executable: bool = False
     is_realtime: bool = False
     last_good_at: Optional[datetime] = None
@@ -86,6 +88,7 @@ class ContractSymbolItem(BaseModel):
     provider_symbol: str
     quote_asset: str
     tp_sl_trigger_price_type: str = "MARK_PRICE"
+    closed_market_execution_mode: str = "DISABLED"
     price_precision: int = 8
     quantity_precision: int = 8
     max_leverage: int = 1

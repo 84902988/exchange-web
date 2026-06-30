@@ -11090,6 +11090,7 @@ def _default_contract_symbol_form() -> Dict[str, str]:
         "provider_symbol": "",
         "quote_asset": "USDT",
         "tp_sl_trigger_price_type": "MARK_PRICE",
+        "closed_market_execution_mode": "DISABLED",
         "price_precision": "8",
         "quantity_precision": "8",
         "min_quantity": "",
@@ -11108,6 +11109,7 @@ def _contract_symbol_form_options() -> Dict[str, list[str]]:
         "category_options": ["CRYPTO", "STOCK", "INDEX", "FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES"],
         "provider_options": ["BINANCE", "ITICK", "INTERNAL"],
         "tp_sl_trigger_price_type_options": ["MARK_PRICE", "LAST_PRICE"],
+        "closed_market_execution_mode_options": ["DISABLED", "LAST_GOOD_BBO"],
     }
 
 
@@ -11142,6 +11144,7 @@ def contract_symbol_create_submit(
     provider_symbol: str = Form(""),
     quote_asset: str = Form("USDT"),
     tp_sl_trigger_price_type: str = Form("MARK_PRICE"),
+    closed_market_execution_mode: str = Form("DISABLED"),
     price_precision: str = Form("8"),
     quantity_precision: str = Form("8"),
     min_quantity: str = Form(""),
@@ -11168,6 +11171,7 @@ def contract_symbol_create_submit(
             "provider_symbol": provider_symbol,
             "quote_asset": quote_asset,
             "tp_sl_trigger_price_type": tp_sl_trigger_price_type,
+            "closed_market_execution_mode": closed_market_execution_mode,
             "price_precision": price_precision,
             "quantity_precision": quantity_precision,
             "min_quantity": min_quantity,
@@ -11244,6 +11248,7 @@ def contract_symbol_edit_submit(
     provider_symbol: str = Form(""),
     quote_asset: str = Form("USDT"),
     tp_sl_trigger_price_type: str = Form("MARK_PRICE"),
+    closed_market_execution_mode: str = Form("DISABLED"),
     price_precision: str = Form("8"),
     quantity_precision: str = Form("8"),
     min_quantity: str = Form(""),
@@ -11269,6 +11274,7 @@ def contract_symbol_edit_submit(
             "provider_symbol": provider_symbol,
             "quote_asset": quote_asset,
             "tp_sl_trigger_price_type": tp_sl_trigger_price_type,
+            "closed_market_execution_mode": closed_market_execution_mode,
             "price_precision": price_precision,
             "quantity_precision": quantity_precision,
             "min_quantity": min_quantity,
