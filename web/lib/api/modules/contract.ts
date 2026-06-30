@@ -40,6 +40,13 @@ export type ContractQuoteAvailability = {
   best_ask?: string | number | null
 }
 
+export type ContractQuoteDisplayStatus =
+  | 'LOADING'
+  | 'LIVE'
+  | 'LAST_QUOTE'
+  | 'EXPIRED_LAST_QUOTE'
+  | 'UNAVAILABLE'
+
 function toPositiveQuoteNumber(value?: string | number | null): number {
   if (value === undefined || value === null || value === '') return 0
   const parsed = Number(typeof value === 'string' ? value.replace(/,/g, '').trim() : value)
@@ -66,6 +73,25 @@ export function isExpiredLastGoodBboQuote(quote?: ContractQuoteAvailability | nu
     source === 'LAST_GOOD_BBO' ||
     (freshness === 'LAST_VALID' && hasValidBbo)
   )
+}
+
+export function getContractQuoteDisplayStatus(
+  quote?: ContractQuoteAvailability | null,
+  options: { loading?: boolean } = {},
+): ContractQuoteDisplayStatus {
+  if (options.loading) return 'LOADING'
+  if (!quote) return 'UNAVAILABLE'
+  if (isExpiredLastGoodBboQuote(quote)) return 'EXPIRED_LAST_QUOTE'
+  if (quote.executable === false) return 'UNAVAILABLE'
+
+  const quoteSource = String(quote.quote_source || '').trim().toUpperCase()
+  const source = String(quote.source || '').trim().toUpperCase()
+  const sources = new Set([quoteSource, source].filter(Boolean))
+
+  if (sources.has('LIVE_WS') || sources.has('LIVE')) return 'LIVE'
+  if (sources.has('LAST_GOOD_BBO') && quote.executable === true) return 'LAST_QUOTE'
+
+  return 'UNAVAILABLE'
 }
 
 export type ContractQuote = ContractQuoteAvailability & {

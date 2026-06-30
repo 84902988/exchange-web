@@ -14,6 +14,8 @@ export type HeaderMetric = {
 type ContractMarketHeaderProps = {
   marketSymbol: string;
   price: string;
+  quoteStatusLabel?: string | null;
+  quoteStatusTone?: 'loading' | 'live' | 'last' | 'expired' | 'unavailable';
   metrics: HeaderMetric[];
   hint?: string | null;
   marketStatus?: string | null;
@@ -26,6 +28,8 @@ type ContractMarketHeaderProps = {
 export default function ContractMarketHeader({
   marketSymbol,
   price,
+  quoteStatusLabel,
+  quoteStatusTone = 'last',
   metrics,
   hint,
   marketStatus,
@@ -47,15 +51,23 @@ export default function ContractMarketHeader({
         <div className="flex shrink-0 flex-col justify-center gap-1.5 whitespace-nowrap">
           <div className="text-[13px] font-medium text-white/42">
             <span>{marketSymbol} {t('perpetual', 'contracts')}</span>
-            <MarketStatusBadge
-              marketStatus={marketStatus}
-              quoteFreshness={quoteFreshness}
-              marketSessionType={marketSessionType}
-              className="ml-2"
-            />
+            {quoteStatusLabel ? (
+              <span className={`ml-2 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${quoteStatusBadgeClass(quoteStatusTone)}`}>
+                {quoteStatusLabel}
+              </span>
+            ) : (
+              <MarketStatusBadge
+                marketStatus={marketStatus}
+                quoteFreshness={quoteFreshness}
+                marketSessionType={marketSessionType}
+                className="ml-2"
+              />
+            )}
           </div>
-          <div className={`inline-flex w-fit items-center rounded-lg px-2 py-0.5 text-[30px] font-semibold leading-none transition-all duration-200 ${priceColorClass}`}>
-            {price}
+          <div className="flex min-w-0 items-center gap-2">
+            <div className={`inline-flex w-fit items-center rounded-lg px-2 py-0.5 text-[30px] font-semibold leading-none transition-all duration-200 ${priceColorClass}`}>
+              {price}
+            </div>
           </div>
         </div>
 
@@ -73,6 +85,13 @@ export default function ContractMarketHeader({
       {hint ? <div className="mt-1.5 text-[11px] text-yellow-300/85">{hint}</div> : null}
     </div>
   );
+}
+
+function quoteStatusBadgeClass(tone: NonNullable<ContractMarketHeaderProps['quoteStatusTone']>) {
+  if (tone === 'loading') return 'border-white/10 bg-white/[0.05] text-white/58';
+  if (tone === 'live') return 'border-[#00c087]/25 bg-[#00c087]/10 text-[#00c087]';
+  if (tone === 'expired' || tone === 'unavailable') return 'border-[#f6465d]/20 bg-[#f6465d]/10 text-[#f6465d]';
+  return 'border-[#f0b90b]/25 bg-[#f0b90b]/10 text-[#f0b90b]';
 }
 
 function Metric({

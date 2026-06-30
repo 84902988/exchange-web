@@ -64,6 +64,7 @@ type ContractFuturesChartProps = {
   allowLatestPriceCandlePatch?: boolean;
   latestCandlePatchMaxDeviationRatio?: number | null;
   allowRealtimeTradeCandlePatch?: boolean;
+  onLatestKlineCloseChange?: (price: string | null) => void;
   positionOverlay?: ContractPositionOverlay | null;
   positionEntryOverlays?: PositionEntryOverlay[];
   positionTpSlOverlays?: PositionTpSlOverlay[];
@@ -640,6 +641,7 @@ export default function ContractFuturesChart({
   allowLatestPriceCandlePatch = true,
   latestCandlePatchMaxDeviationRatio = null,
   allowRealtimeTradeCandlePatch = true,
+  onLatestKlineCloseChange,
   positionOverlay = null,
   positionEntryOverlays = [],
   positionTpSlOverlays = [],
@@ -976,7 +978,9 @@ export default function ContractFuturesChart({
     candlesRef.current = candles;
     volumesRef.current = volumes;
     oldestTimeRef.current = candles[0]?.time ?? null;
-  }, [candles, volumes]);
+    const latest = getLatestRealCandle(candles);
+    onLatestKlineCloseChange?.(latest ? String(latest.close) : null);
+  }, [candles, onLatestKlineCloseChange, volumes]);
 
   useEffect(() => {
     currentSymbolRef.current = symbol;
