@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import threading
@@ -15,6 +16,7 @@ import websockets
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.db.models.contract_symbol import ContractSymbol
 from app.services.contract_market_provider_service import (
     PROVIDER_BITGET_USDT_FUTURES,
     PROVIDER_OKX_SWAP,
@@ -27,9 +29,10 @@ from app.services.contract_market_provider_service import (
 logger = logging.getLogger(__name__)
 
 CONTRACT_PROVIDER_WS_SOURCE = "LIVE_WS"
+PROVIDER_ITICK = "ITICK"
 _SUPPORTED_DEPTH_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
 _SUPPORTED_TRADES_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
-_SUPPORTED_TICKER_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
+_SUPPORTED_TICKER_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
 _SUPPORTED_KLINE_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
 _OKX_KLINE_CHANNELS = {
     "1m": "candle1m",
@@ -62,6 +65,8 @@ class ProviderTickerSubscription:
     local_symbol: str
     provider: str
     provider_symbol: str
+    ws_symbol: Optional[str] = None
+    ws_url: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +90,63 @@ def _okx_kline_channel(interval: Any) -> Optional[str]:
     return _OKX_KLINE_CHANNELS.get(_normalize_interval(interval))
 
 
+def _normalize_contract_category(value: Any) -> str:
+    upper = str(value or "").strip().upper()
+    if upper in {"GOLD", "SILVER", "METAL"}:
+        return "METAL"
+    if upper in {"FUTURES", "COMMODITY"}:
+        return "COMMODITY"
+    if upper == "FX":
+        return "FOREX"
+    return upper
+
+
+def _itick_quote_subscription_symbol(provider_symbol: Any, category: Any) -> str:
+    symbol = _normalize_symbol(provider_symbol)
+    normalized_category = _normalize_contract_category(category)
+    if normalized_category == "STOCK":
+        region = "US"
+    elif normalized_category in {"INDEX", "FOREX", "METAL", "COMMODITY"}:
+        region = "GB"
+    else:
+        region = ""
+    if region and "$" not in symbol:
+        return f"{symbol}${region}"
+    return symbol
+
+
+def _itick_ws_url_for_category(base_url: Any, category: Any) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    normalized_category = _normalize_contract_category(category)
+    if normalized_category == "STOCK":
+        path = "stock"
+    elif normalized_category == "INDEX":
+        path = "indices"
+    elif normalized_category in {"FOREX", "METAL", "COMMODITY"}:
+        path = "forex"
+    else:
+        path = "future"
+    return f"{base}/{path}" if base else ""
+
+
+def _itick_ws_headers() -> dict[str, str]:
+    token = str(
+        getattr(settings, "ITICK_API_TOKEN", None)
+        or getattr(settings, "ITICK_API_KEY", None)
+        or ""
+    ).strip()
+    if not token:
+        raise ValueError("ITICK_API_TOKEN is required for iTick provider WS")
+    return {"token": token}
+
+
+def _websocket_header_kwargs(headers: dict[str, str]) -> dict[str, dict[str, str]]:
+    parameters = inspect.signature(websockets.connect).parameters
+    if "additional_headers" in parameters:
+        return {"additional_headers": headers}
+    return {"extra_headers": headers}
+
+
 def _to_decimal(value: Any) -> Optional[Decimal]:
     if value in (None, ""):
         return None
@@ -92,6 +154,27 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
         return Decimal(str(value))
     except Exception:
         return None
+
+
+def _pick_first_present(data: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _pick_decimal(data: dict[str, Any], keys: list[str]) -> Optional[Decimal]:
+    value, _key = _pick_decimal_with_key(data, keys)
+    return value
+
+
+def _pick_decimal_with_key(data: dict[str, Any], keys: list[str]) -> tuple[Optional[Decimal], Optional[str]]:
+    for key in keys:
+        value = _to_decimal(data.get(key))
+        if value is not None and value > 0:
+            return value, key
+    return None, None
 
 
 def _depth_limit() -> int:
@@ -132,6 +215,13 @@ def provider_ws_kline_enabled() -> bool:
     return bool(
         getattr(settings, "CONTRACT_PROVIDER_WS_ENABLED", False)
         and getattr(settings, "CONTRACT_PROVIDER_WS_KLINE_ENABLED", False)
+    )
+
+
+def provider_ws_itick_quote_enabled() -> bool:
+    return bool(
+        provider_ws_ticker_enabled()
+        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_ENABLED", False)
     )
 
 
@@ -336,6 +426,51 @@ class ContractMarketProviderWsService:
                 return deepcopy(item)
         return None
 
+    def _itick_ticker_subscription_for_symbol(
+        self,
+        db: Session,
+        symbol: str,
+    ) -> Optional[ProviderTickerSubscription]:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not normalized_symbol or not provider_ws_itick_quote_enabled():
+            return None
+        contract_symbol = (
+            db.query(ContractSymbol)
+            .filter(ContractSymbol.symbol == normalized_symbol)
+            .filter(ContractSymbol.status == 1)
+            .first()
+        )
+        if contract_symbol is None:
+            return None
+        provider_code = _normalize_symbol(getattr(contract_symbol, "provider", None))
+        if provider_code != PROVIDER_ITICK:
+            return None
+        provider_symbol = _normalize_symbol(
+            getattr(contract_symbol, "provider_symbol", None)
+            or normalized_symbol.replace("_PERP", "")
+        )
+        if not provider_symbol:
+            return None
+        ws_symbol = _itick_quote_subscription_symbol(
+            provider_symbol,
+            getattr(contract_symbol, "category", None),
+        )
+        if not ws_symbol:
+            return None
+        ws_url = _itick_ws_url_for_category(
+            getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_URL", ""),
+            getattr(contract_symbol, "category", None),
+        )
+        if not ws_url:
+            return None
+        return ProviderTickerSubscription(
+            local_symbol=normalized_symbol,
+            provider=PROVIDER_ITICK,
+            provider_symbol=provider_symbol,
+            ws_symbol=ws_symbol,
+            ws_url=ws_url,
+        )
+
     def select_fresh_depth_for_enabled_providers(
         self,
         db: Session,
@@ -427,6 +562,28 @@ class ContractMarketProviderWsService:
         if not provider_ws_ticker_enabled():
             return None
         normalized_symbol = _normalize_symbol(symbol)
+        itick_subscription = self._itick_ticker_subscription_for_symbol(db, normalized_symbol)
+        if itick_subscription is not None:
+            if is_contract_market_provider_in_cooldown(PROVIDER_ITICK):
+                logger.debug("contract_provider_ws_ticker_skipped_cooldown provider=%s symbol=%s", PROVIDER_ITICK, normalized_symbol)
+                self.stop_ticker_subscription(local_symbol=normalized_symbol, provider=PROVIDER_ITICK)
+            else:
+                if ensure_subscription:
+                    self.ensure_ticker_subscription(
+                        local_symbol=itick_subscription.local_symbol,
+                        provider=itick_subscription.provider,
+                        provider_symbol=itick_subscription.provider_symbol,
+                        ws_symbol=itick_subscription.ws_symbol,
+                        ws_url=itick_subscription.ws_url,
+                    )
+                ticker = self.get_fresh_provider_ws_ticker(
+                    normalized_symbol,
+                    PROVIDER_ITICK,
+                    max_age_ms=max_age_ms,
+                )
+                if ticker is not None:
+                    return ticker
+                return None
         for provider in enabled_contract_market_providers(db):
             provider_code = _normalize_symbol(provider.provider_code)
             if provider_code not in {PROVIDER_OKX_SWAP, PROVIDER_BITGET_USDT_FUTURES}:
@@ -608,14 +765,20 @@ class ContractMarketProviderWsService:
         local_symbol: str,
         provider: str,
         provider_symbol: str,
+        ws_symbol: Optional[str] = None,
+        ws_url: Optional[str] = None,
     ) -> None:
         if not provider_ws_ticker_enabled():
             return
         normalized_symbol = _normalize_symbol(local_symbol)
         provider_code = _normalize_symbol(provider)
         normalized_provider_symbol = _normalize_symbol(provider_symbol)
+        normalized_ws_symbol = _normalize_symbol(ws_symbol or provider_symbol)
         if provider_code not in _SUPPORTED_TICKER_WS_PROVIDERS:
             logger.debug("contract_provider_ws_ticker_unsupported provider=%s symbol=%s", provider_code, normalized_symbol)
+            return
+        if provider_code == PROVIDER_ITICK and not provider_ws_itick_quote_enabled():
+            logger.debug("contract_provider_ws_ticker_itick_disabled symbol=%s", normalized_symbol)
             return
         key = (provider_code, normalized_symbol)
         with self._lock:
@@ -635,6 +798,8 @@ class ContractMarketProviderWsService:
                 local_symbol=normalized_symbol,
                 provider=provider_code,
                 provider_symbol=normalized_provider_symbol,
+                ws_symbol=normalized_ws_symbol,
+                ws_url=str(ws_url or "").strip() or None,
             )
             thread = threading.Thread(
                 target=self._run_ticker_subscription_thread,
@@ -1329,12 +1494,17 @@ class ContractMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        if subscription.provider != PROVIDER_OKX_SWAP:
+        if subscription.provider not in _SUPPORTED_TICKER_WS_PROVIDERS:
             return
         reconnect_delay = 1.0
         while not stop_event.is_set() and provider_ws_ticker_enabled():
             try:
-                await self._run_okx_ticker_ws(subscription, stop_event, generation)
+                if subscription.provider == PROVIDER_ITICK:
+                    if not provider_ws_itick_quote_enabled():
+                        break
+                    await self._run_itick_ticker_ws(subscription, stop_event, generation)
+                else:
+                    await self._run_okx_ticker_ws(subscription, stop_event, generation)
                 reconnect_delay = 1.0
             except asyncio.CancelledError:
                 raise
@@ -1562,6 +1732,71 @@ class ContractMarketProviderWsService:
                     subscription.provider_symbol,
                 )
 
+    async def _run_itick_ticker_ws(
+        self,
+        subscription: ProviderTickerSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if stop_event.is_set() or not provider_ws_itick_quote_enabled():
+            return
+        url = str(subscription.ws_url or getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_URL", "") or "").strip()
+        if not url:
+            raise ValueError("CONTRACT_PROVIDER_WS_ITICK_URL is required")
+        ws_symbol = _normalize_symbol(subscription.ws_symbol or subscription.provider_symbol)
+        if not ws_symbol:
+            raise ValueError("iTick provider WS subscription symbol is required")
+        subscribe_payload = {
+            "ac": "subscribe",
+            "params": ws_symbol,
+            "types": "quote",
+        }
+        key = (subscription.provider, subscription.local_symbol)
+        connect_kwargs = {
+            "ping_interval": 20,
+            "ping_timeout": 10,
+            "close_timeout": 5,
+            **_websocket_header_kwargs(_itick_ws_headers()),
+        }
+        async with websockets.connect(url, **connect_kwargs) as websocket:
+            if stop_event.is_set() or not provider_ws_itick_quote_enabled():
+                await websocket.close()
+                return
+            loop = asyncio.get_running_loop()
+            with self._lock:
+                current_generation = self._ticker_generations.get(key)
+                if current_generation != generation:
+                    stop_event.set()
+                    return
+                self._ticker_connections[key] = (loop, websocket)
+            logger.info(
+                "contract_provider_ws_ticker_subscription_started provider=%s symbol=%s provider_symbol=%s ws_symbol=%s",
+                subscription.provider,
+                subscription.local_symbol,
+                subscription.provider_symbol,
+                ws_symbol,
+            )
+            try:
+                await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                while not stop_event.is_set() and provider_ws_itick_quote_enabled():
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    self._handle_itick_ticker_message(subscription, raw_message)
+            finally:
+                with self._lock:
+                    current = self._ticker_connections.get(key)
+                    if current is not None and current[1] is websocket:
+                        self._ticker_connections.pop(key, None)
+                logger.info(
+                    "contract_provider_ws_ticker_subscription_stopped provider=%s symbol=%s provider_symbol=%s ws_symbol=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.provider_symbol,
+                    ws_symbol,
+                )
+
     async def _run_okx_kline_ws(
         self,
         subscription: ProviderKlineSubscription,
@@ -1703,6 +1938,40 @@ class ContractMarketProviderWsService:
         if payload is not None:
             self._set_ticker_cache(subscription, payload)
 
+    def _handle_itick_ticker_message(
+        self,
+        subscription: ProviderTickerSubscription,
+        raw_message: Any,
+    ) -> None:
+        try:
+            message = json.loads(raw_message)
+        except Exception:
+            logger.debug("contract_provider_ws_itick_ticker_invalid_json symbol=%s", subscription.local_symbol)
+            return
+        for row in self._extract_itick_quote_rows(message):
+            payload = self._normalize_itick_ticker(subscription, row)
+            if payload is not None:
+                self._set_ticker_cache(subscription, payload)
+
+    def _extract_itick_quote_rows(self, message: Any) -> list[dict[str, Any]]:
+        if isinstance(message, list):
+            return [item for item in message if isinstance(item, dict)]
+        if not isinstance(message, dict):
+            return []
+        if message.get("ac") or str(message.get("type") or message.get("types") or "").lower() in {"subscribe", "subscribed"}:
+            return []
+        data = message.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            return [data]
+        tick = message.get("tick")
+        if isinstance(tick, dict):
+            return [tick]
+        if any(key in message for key in ("p", "ld", "last", "latest_price", "price", "bid", "ask", "bp", "ap")):
+            return [message]
+        return []
+
     def _handle_okx_kline_message(
         self,
         subscription: ProviderKlineSubscription,
@@ -1811,6 +2080,74 @@ class ContractMarketProviderWsService:
             "executable": True,
             "ts": ts,
             "exchange_ts": row.get("ts"),
+        }
+
+    def _normalize_itick_ticker(
+        self,
+        subscription: ProviderTickerSubscription,
+        row: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        last_price, price_field = _pick_decimal_with_key(
+            row,
+            ["p", "ld", "last", "latest_price", "price", "close", "c"],
+        )
+        bid_price = _pick_decimal(
+            row,
+            ["bp", "bid", "bid_price", "bidPrice", "b", "best_bid"],
+        )
+        ask_price = _pick_decimal(
+            row,
+            ["ap", "ask", "ask_price", "askPrice", "a", "best_ask"],
+        )
+        if last_price is None or last_price <= 0:
+            if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0:
+                last_price = (bid_price + ask_price) / Decimal("2")
+            else:
+                return None
+        if bid_price is None or ask_price is None or bid_price <= 0 or ask_price <= 0 or ask_price <= bid_price:
+            spread_half = max(last_price * Decimal("0.0005"), Decimal("0.00000001"))
+            bid_price = last_price - spread_half
+            ask_price = last_price + spread_half
+        mark_price = (bid_price + ask_price) / Decimal("2")
+        ts_value = _pick_first_present(
+            row,
+            ["ts", "t", "time", "timestamp", "quote_time", "price_time"],
+        )
+        ts_ms = _timestamp_ms_from_value(ts_value)
+        ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        market_status = _pick_first_present(row, ["market_status", "marketStatus"])
+        return {
+            "symbol": subscription.local_symbol,
+            "provider": PROVIDER_ITICK,
+            "provider_symbol": subscription.provider_symbol,
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "best_bid": bid_price,
+            "best_ask": ask_price,
+            "raw_bid_price": bid_price,
+            "raw_ask_price": ask_price,
+            "last_price": last_price,
+            "mark_price": mark_price,
+            "index_price": mark_price,
+            "open_24h": _pick_decimal(row, ["o", "open", "open_price", "openPrice"]),
+            "high_24h": _pick_decimal(row, ["h", "high", "high_price", "highPrice"]),
+            "low_24h": _pick_decimal(row, ["l", "low", "low_price", "lowPrice"]),
+            "base_volume_24h": _pick_decimal(row, ["v", "volume", "vol", "base_volume", "baseVolume"]),
+            "quote_volume_24h": _pick_decimal(row, ["tu", "qv", "turnover", "amount", "value"]),
+            "price_change_percent_24h": _pick_decimal(
+                row,
+                ["chp", "rate", "change_percent", "price_change_percent", "pct_chg"],
+            ),
+            "price_field": price_field,
+            "market_status": market_status,
+            "source": CONTRACT_PROVIDER_WS_SOURCE,
+            "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
+            "quote_freshness": "LIVE",
+            "is_realtime": True,
+            "executable": True,
+            "ts": ts,
+            "exchange_ts": ts_value,
+            "ws_symbol": subscription.ws_symbol or subscription.provider_symbol,
         }
 
     def _normalize_okx_kline(

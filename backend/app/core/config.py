@@ -128,6 +128,8 @@ class Settings(BaseSettings):
     CONTRACT_PROVIDER_WS_KLINE_MAX_AGE_MS: int = 1500
     CONTRACT_PROVIDER_WS_OKX_PUBLIC_URL: str = "wss://ws.okx.com:8443/ws/v5/public"
     CONTRACT_PROVIDER_WS_OKX_BUSINESS_URL: str = "wss://ws.okx.com:8443/ws/v5/business"
+    CONTRACT_PROVIDER_WS_ITICK_ENABLED: bool = False
+    CONTRACT_PROVIDER_WS_ITICK_URL: str = "wss://api.itick.org"
     ITICK_API_TOKEN: Optional[str] = None
     ITICK_API_KEY: Optional[str] = None  # legacy alias; prefer ITICK_API_TOKEN
     ITICK_BASE_URL: str = "https://api.itick.org"
