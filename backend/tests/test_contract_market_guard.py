@@ -41,6 +41,29 @@ def test_closed_last_good_bbo_last_valid_expired_is_not_executable():
     assert is_executable_contract_quote(quote) is False
 
 
+def test_closed_last_good_bbo_uses_calendar_validity_annotation():
+    expired_quote = _quote(last_good_at=(datetime.now(timezone.utc) - timedelta(days=4)).isoformat())
+    assert is_executable_contract_quote({**expired_quote, "last_good_bbo_valid": True}) is True
+    assert is_executable_contract_quote({**expired_quote, "last_good_bbo_valid": False}) is False
+
+
+def test_closed_last_good_bbo_stale_requires_calendar_validity_annotation():
+    stale_quote = _quote(quote_freshness="STALE")
+    assert is_executable_contract_quote(stale_quote) is False
+    assert is_executable_contract_quote({**stale_quote, "last_good_bbo_valid": True}) is True
+
+
+def test_plain_stale_quote_remains_not_executable():
+    quote = _quote(
+        market_status="OPEN",
+        quote_source="LIVE",
+        source="LIVE",
+        quote_freshness="STALE",
+        closed_market_execution_mode="DISABLED",
+    )
+    assert is_executable_contract_quote(quote) is False
+
+
 def test_closed_disabled_last_valid_bbo_is_not_executable():
     quote = _quote(closed_market_execution_mode="DISABLED")
     assert is_executable_contract_quote(quote) is False
@@ -60,6 +83,9 @@ def test_invalid_bbo_is_not_executable():
 if __name__ == "__main__":
     test_closed_last_good_bbo_last_valid_recent_is_executable()
     test_closed_last_good_bbo_last_valid_expired_is_not_executable()
+    test_closed_last_good_bbo_uses_calendar_validity_annotation()
+    test_closed_last_good_bbo_stale_requires_calendar_validity_annotation()
+    test_plain_stale_quote_remains_not_executable()
     test_closed_disabled_last_valid_bbo_is_not_executable()
     test_crypto_closed_last_good_bbo_remains_not_executable()
     test_invalid_bbo_is_not_executable()
