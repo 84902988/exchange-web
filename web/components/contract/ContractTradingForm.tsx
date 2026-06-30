@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   closeContractOrder,
   closeContractSummaryOrder,
+  isExpiredLastGoodBboQuote,
   openContractOrder,
   type ContractOrderType,
   type ContractPositionItem,
@@ -29,6 +30,7 @@ type FormFeedback = {
   type: 'success' | 'error' | 'info';
   message: string;
 };
+type QuoteUnavailableReason = 'EXPIRED_LAST_GOOD_BBO' | 'GENERIC_UNAVAILABLE' | null;
 type PendingContractOrder = {
   action: 'OPEN' | 'CLOSE';
   side: ContractPositionSide;
@@ -273,9 +275,22 @@ export default function ContractTradingForm({
   const normalizedQuoteMarketStatus = String(quote?.market_status || '').trim().toUpperCase();
   const isClosedMarketQuote = normalizedQuoteMarketStatus === 'CLOSED' || normalizedQuoteMarketStatus === 'HOLIDAY';
   const quoteUnavailable = quote?.executable === false;
+  const quoteUnavailableReason: QuoteUnavailableReason = isExpiredLastGoodBboQuote(quote)
+    ? 'EXPIRED_LAST_GOOD_BBO'
+    : quoteUnavailable
+      ? 'GENERIC_UNAVAILABLE'
+      : null;
+  const quoteUnavailableFeedback = quoteUnavailableReason === 'EXPIRED_LAST_GOOD_BBO'
+    ? t('lastGoodBboExpiredTradingHint', 'contracts')
+    : quoteUnavailableReason === 'GENERIC_UNAVAILABLE'
+      ? t('quoteUnavailableTradingHint', 'contracts')
+      : null;
+  const displayFeedback = quoteUnavailableFeedback
+    ? { type: 'error' as const, message: quoteUnavailableFeedback }
+    : feedback;
   const quoteStatusHint = quote
     ? quoteUnavailable
-      ? t('quoteUnavailableTradingHint', 'contracts')
+      ? null
       : isClosedMarketQuote
         ? t('marketClosedTradableHint', 'contracts')
         : t('marketRealtimeTradableHint', 'contracts')
@@ -497,7 +512,7 @@ export default function ContractTradingForm({
 
   function validateOpen(side: ContractPositionSide) {
     if (availableMarginNumber <= 0) return t('transferMarginFirst', 'contracts');
-    if (quoteUnavailable) return t('quoteUnavailableTradingHint', 'contracts');
+    if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
     if (!quantity.trim()) return t('enterQuantity', 'contracts');
     if (toNumber(quantity) <= 0) return t('enterValidOpenQuantity', 'contracts');
     if (leverage <= 0) return t('enterValidLeverage', 'contracts');
@@ -514,7 +529,7 @@ export default function ContractTradingForm({
 
   function validateClose(position: ContractPositionItem | null, maxQuantity: string) {
     if (!selectedCloseSummary && !position) return t('noClosablePosition', 'contracts');
-    if (quoteUnavailable) return t('quoteUnavailableTradingHint', 'contracts');
+    if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
     const qty = toNumber(closeQuantity || maxQuantity);
     if (qty <= 0) return t('enterValidCloseQuantity', 'contracts');
     if (qty > toNumber(maxQuantity)) return t('closeQuantityExceedsMax', 'contracts');
@@ -818,7 +833,7 @@ export default function ContractTradingForm({
           />
         )}
 
-        {feedback ? <FormFeedbackBox feedback={feedback} /> : null}
+        {displayFeedback ? <FormFeedbackBox feedback={displayFeedback} /> : null}
 
         {quoteStatusHint ? (
           <div className={`rounded-xl border px-2.5 py-1.5 text-[12px] leading-5 ${quoteStatusClassName}`}>
