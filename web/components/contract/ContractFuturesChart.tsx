@@ -538,9 +538,14 @@ function upsertRealtimeKline(
   nextVolumes.sort((a, b) => a.time - b.time);
 
   const normalized = normalizeKlinePairs(nextCandles, nextVolumes);
+  const limitedCandles = normalized.candles.slice(-CONTRACT_CHART_KLINE_LIMIT);
+  const earliestTime = limitedCandles[0]?.time ?? null;
+  const limitedVolumes = earliestTime === null
+    ? []
+    : normalized.volumes.filter((item) => item.time >= earliestTime);
   return {
-    nextCandles: normalized.candles,
-    nextVolumes: normalized.volumes,
+    nextCandles: limitedCandles,
+    nextVolumes: limitedVolumes,
   };
 }
 
