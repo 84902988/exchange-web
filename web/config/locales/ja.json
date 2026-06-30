@@ -2303,6 +2303,8 @@
     "marketRealtimeTradableHint": "リアルタイム相場で取引できます。",
     "marketClosedTradableHint": "外部市場は休場中です。現在はプラットフォーム参考Bid/Askで取引します。",
     "quoteUnavailableTradingHint": "相場が一時的に利用できません。しばらくしてから再度お試しください。",
+    "lastGoodBboExpiredTradingHint": "最終有効気配は期限切れです。市場データの更新をお待ちください。",
+    "lastGoodBboExpiredBadge": "期限切れ",
     "quoteUnavailableShort": "相場利用不可",
     "loginToTransferMarginAndTrade": "ログインして証拠金を振替し、契約注文を送信してください。",
     "confirmLimitOrderDesc": "注文内容を確認してください。送信後、未約定注文に入りマッチングを待ちます。",

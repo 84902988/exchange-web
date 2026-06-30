@@ -2437,6 +2437,8 @@
     "marketRealtimeTradableHint": "即時行情，可交易。",
     "marketClosedTradableHint": "外部市場休市，當前使用平台參考報價交易。",
     "quoteUnavailableTradingHint": "報價暫不可用，請稍後再試。",
+    "lastGoodBboExpiredTradingHint": "最後有效報價已過期，請等待行情更新",
+    "lastGoodBboExpiredBadge": "過期",
     "quoteUnavailableShort": "報價不可用",
     "loginToTransferMarginAndTrade": "請登入後劃轉保證金並提交合約訂單。",
     "confirmLimitOrderDesc": "請確認訂單詳情。提交後將進入目前委託等待撮合。",

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   getContractDepth,
+  isExpiredLastGoodBboQuote,
   type ContractDepthLevel,
 } from '@/lib/api/modules/contract';
 import { normalizeSide } from '@/components/spot/orderbook/orderbook.utils';
@@ -135,6 +136,12 @@ function extractRealtimeDepth(
     asks: normalizeSide(asks, 'asks', FUTURES_DEPTH_LIMIT),
     bids: normalizeSide(bids, 'bids', FUTURES_DEPTH_LIMIT),
     source: typeof payload.source === 'string' ? payload.source : null,
+    quoteSource: typeof payload.quote_source === 'string' ? payload.quote_source : null,
+    closedMarketExecutionMode: typeof payload.closed_market_execution_mode === 'string'
+      ? payload.closed_market_execution_mode
+      : null,
+    executable: typeof payload.executable === 'boolean' ? payload.executable : null,
+    marketStatus: typeof payload.market_status === 'string' ? payload.market_status : null,
   };
 }
 
@@ -176,6 +183,8 @@ export default function ContractFuturesOrderBook({
   const [source, setSource] = useState<string | null>(null);
   const [depthMarketStatus, setDepthMarketStatus] = useState<string | null>(null);
   const [depthExecutable, setDepthExecutable] = useState<boolean | null>(null);
+  const [depthQuoteSource, setDepthQuoteSource] = useState<string | null>(null);
+  const [depthClosedMarketExecutionMode, setDepthClosedMarketExecutionMode] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const initialDepthRef = useRef(initialDepth);
   const onDepthDataChangeRef = useRef(onDepthDataChange);
@@ -210,6 +219,8 @@ export default function ContractFuturesOrderBook({
         setSource(depth.source);
         setDepthMarketStatus(depth.market_status || null);
         setDepthExecutable(depth.executable ?? null);
+        setDepthQuoteSource(depth.quote_source || depth.source || null);
+        setDepthClosedMarketExecutionMode(depth.closed_market_execution_mode || null);
         onDepthDataChangeRef.current?.({
           asks: nextAsks,
           bids: nextBids,
@@ -232,6 +243,8 @@ export default function ContractFuturesOrderBook({
       setSource(cachedDepth?.source || null);
       setDepthMarketStatus(null);
       setDepthExecutable(null);
+      setDepthQuoteSource(null);
+      setDepthClosedMarketExecutionMode(null);
       setLoading(false);
     } else {
       setAsks([]);
@@ -239,6 +252,8 @@ export default function ContractFuturesOrderBook({
       setSource(null);
       setDepthMarketStatus(null);
       setDepthExecutable(null);
+      setDepthQuoteSource(null);
+      setDepthClosedMarketExecutionMode(null);
       setLoading(true);
     }
     void loadDepth();
@@ -267,8 +282,10 @@ export default function ContractFuturesOrderBook({
       setAsks(depth.asks);
       setBids(depth.bids);
       setSource(depth.source);
-      setDepthMarketStatus(null);
-      setDepthExecutable(null);
+      setDepthMarketStatus(depth.marketStatus);
+      setDepthExecutable(depth.executable);
+      setDepthQuoteSource(depth.quoteSource || depth.source);
+      setDepthClosedMarketExecutionMode(depth.closedMarketExecutionMode);
       setLoading(false);
       onDepthDataChangeRef.current?.(depth);
     };
@@ -328,24 +345,31 @@ export default function ContractFuturesOrderBook({
       : priceDirection === 'down'
         ? 'text-[#f6465d]'
         : 'text-white';
+  const isExpiredLastGoodBbo = isExpiredLastGoodBboQuote({
+    executable: depthExecutable ?? undefined,
+    market_status: depthMarketStatus || effectiveMarketStatus || undefined,
+    closed_market_execution_mode: depthClosedMarketExecutionMode || undefined,
+    quote_source: depthQuoteSource || undefined,
+    source,
+  });
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <div className="text-[13px] font-medium text-white/88">{t('orderBook', 'contracts')}</div>
+      <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-nowrap items-center gap-2">
+          <div className="shrink-0 whitespace-nowrap text-[13px] font-medium text-white/88">{t('orderBook', 'contracts')}</div>
           {effectiveMarketStatus === 'CLOSED' && depthExecutable !== false ? (
-            <div className="rounded-full border border-[#f0b90b]/20 bg-[#f0b90b]/10 px-2 py-0.5 text-[11px] font-semibold text-[#f0b90b]">
+            <div className="shrink-0 whitespace-nowrap rounded-full border border-[#f0b90b]/20 bg-[#f0b90b]/10 px-2 py-0.5 text-[10px] font-semibold text-[#f0b90b]">
               {t('platformQuote', 'contracts')}
             </div>
           ) : null}
           {depthExecutable === false ? (
-            <div className="rounded-full border border-[#f6465d]/20 bg-[#f6465d]/10 px-2 py-0.5 text-[11px] font-semibold text-[#f6465d]">
-              {t('quoteUnavailableShort', 'contracts')}
+            <div className="shrink-0 whitespace-nowrap rounded-full border border-[#f6465d]/20 bg-[#f6465d]/10 px-2 py-0.5 text-[10px] font-semibold text-[#f6465d]">
+              {t(isExpiredLastGoodBbo ? 'lastGoodBboExpiredBadge' : 'quoteUnavailableShort', 'contracts')}
             </div>
           ) : null}
         </div>
-        <div className="rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/42">
+        <div className="shrink-0 whitespace-nowrap rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/42">
           {displaySymbol(symbol)}
         </div>
       </div>

@@ -2437,6 +2437,8 @@
     "marketRealtimeTradableHint": "Live market quote. Trading available.",
     "marketClosedTradableHint": "External market is closed. Trading uses platform reference bid/ask quotes.",
     "quoteUnavailableTradingHint": "Quote is temporarily unavailable. Please try again later.",
+    "lastGoodBboExpiredTradingHint": "The last valid quote has expired. Please wait for market data to update.",
+    "lastGoodBboExpiredBadge": "Expired",
     "quoteUnavailableShort": "Quote unavailable",
     "loginToTransferMarginAndTrade": "Log in to transfer margin and submit futures orders.",
     "confirmLimitOrderDesc": "Confirm the order details. After submission, it will enter open orders and wait for matching.",

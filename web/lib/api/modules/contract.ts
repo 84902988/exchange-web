@@ -25,7 +25,50 @@ export type ContractTransferResponse = {
   account: ContractAccountSummary
 }
 
-export type ContractQuote = {
+export type ContractQuoteAvailability = {
+  market_status?: 'OPEN' | 'CLOSED' | 'UNKNOWN' | string
+  quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
+  quote_source?: 'LIVE' | 'LAST_GOOD_BBO' | 'LAST_VALID' | 'FALLBACK' | 'STALE' | 'INVALID' | string
+  closed_market_execution_mode?: 'DISABLED' | 'LAST_GOOD_BBO' | string
+  source?: string | null
+  executable?: boolean
+  bid?: string | number | null
+  ask?: string | number | null
+  bid_price?: string | number | null
+  ask_price?: string | number | null
+  best_bid?: string | number | null
+  best_ask?: string | number | null
+}
+
+function toPositiveQuoteNumber(value?: string | number | null): number {
+  if (value === undefined || value === null || value === '') return 0
+  const parsed = Number(typeof value === 'string' ? value.replace(/,/g, '').trim() : value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+}
+
+export function isExpiredLastGoodBboQuote(quote?: ContractQuoteAvailability | null): boolean {
+  if (!quote || quote.executable !== false) return false
+  const marketStatus = String(quote.market_status || '').trim().toUpperCase()
+  const mode = String(quote.closed_market_execution_mode || '').trim().toUpperCase()
+  if (mode === 'DISABLED') return false
+  if (marketStatus !== 'CLOSED' && marketStatus !== 'HOLIDAY') return false
+
+  const quoteSource = String(quote.quote_source || '').trim().toUpperCase()
+  const source = String(quote.source || '').trim().toUpperCase()
+  const freshness = String(quote.quote_freshness || '').trim().toUpperCase()
+  const bid = toPositiveQuoteNumber(quote.bid_price ?? quote.best_bid ?? quote.bid)
+  const ask = toPositiveQuoteNumber(quote.ask_price ?? quote.best_ask ?? quote.ask)
+  const hasValidBbo = bid > 0 && ask > 0 && ask >= bid
+
+  return (
+    mode === 'LAST_GOOD_BBO' ||
+    quoteSource === 'LAST_GOOD_BBO' ||
+    source === 'LAST_GOOD_BBO' ||
+    (freshness === 'LAST_VALID' && hasValidBbo)
+  )
+}
+
+export type ContractQuote = ContractQuoteAvailability & {
   symbol: string
   provider: string
   provider_symbol: string
@@ -38,6 +81,7 @@ export type ContractQuote = {
   market_session_type?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
   quote_source?: 'LIVE' | 'LAST_GOOD_BBO' | 'LAST_VALID' | 'FALLBACK' | 'STALE' | 'INVALID' | string
+  closed_market_execution_mode?: 'DISABLED' | 'LAST_GOOD_BBO' | string
   executable?: boolean
   is_realtime?: boolean
   last_good_at?: string | null
@@ -81,6 +125,7 @@ export type ContractDepth = {
   market_session_type?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
   quote_source?: 'LIVE' | 'LAST_GOOD_BBO' | 'LAST_VALID' | 'FALLBACK' | 'STALE' | 'INVALID' | string
+  closed_market_execution_mode?: 'DISABLED' | 'LAST_GOOD_BBO' | string
   executable?: boolean
   is_realtime?: boolean
   last_good_at?: string | null
