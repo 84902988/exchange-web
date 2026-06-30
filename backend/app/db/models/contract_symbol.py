@@ -16,6 +16,7 @@ AMOUNT = Numeric(36, 18)
 class ContractSymbolCategory(str, Enum):
     CRYPTO = "CRYPTO"
     STOCK = "STOCK"
+    CFD = "CFD"
     GOLD = "GOLD"
     FUTURES = "FUTURES"
 
