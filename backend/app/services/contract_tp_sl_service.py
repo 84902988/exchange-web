@@ -15,8 +15,8 @@ from app.db.models.contract_symbol import ContractSymbol
 from app.db.models.contract_trade import ContractTrade
 from app.schemas.contract_order import ContractCloseOrderRequest
 from app.services.contract_liquidation_service import _risk_from_mark_price
-from app.services.contract_market_guard import ContractQuoteNotLive, require_executable_contract_quote
-from app.services.contract_market_service import get_contract_quote
+from app.services.contract_market_guard import ContractQuoteNotLive
+from app.services.contract_market_service import get_executable_contract_quote
 from app.services.contract_order_service import (
     ContractOrderError,
     ContractPositionNotOpen,
@@ -288,13 +288,13 @@ def _normalize_position_side(value: Any) -> str:
 def _get_executable_tp_sl_quote(db: Session, position: ContractPosition) -> dict[str, Any]:
     quote: Optional[dict[str, Any]] = None
     try:
-        quote = get_contract_quote(db, str(position.symbol), log_context="tp_sl_scanner")
-        require_executable_contract_quote(
-            quote,
+        quote = get_executable_contract_quote(
+            db,
+            str(position.symbol),
             context="tp_sl_scanner",
-            symbol=str(position.symbol),
             position_id=getattr(position, "id", None),
             user_id=getattr(position, "user_id", None),
+            log_context="tp_sl_scanner",
         )
     except ContractQuoteNotLive as exc:
         logger.warning(

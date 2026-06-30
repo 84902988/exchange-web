@@ -16,8 +16,8 @@ from app.db.models.contract_position import ContractPosition
 from app.db.models.contract_symbol import ContractSymbol
 from app.db.models.contract_trade import ContractTrade
 from app.services.contract_balance_log_service import add_contract_balance_log, add_contract_margin_log
-from app.services.contract_market_guard import ContractQuoteNotLive, require_executable_contract_quote
-from app.services.contract_market_service import get_contract_quote
+from app.services.contract_market_guard import ContractQuoteNotLive
+from app.services.contract_market_service import get_contract_quote, get_executable_contract_quote
 from app.services.contract_private_ws import publish_contract_user_updates
 
 logger = logging.getLogger(__name__)
@@ -125,6 +125,7 @@ def _get_liquidation_threshold(db: Session, symbol: str) -> Decimal:
 
 
 def _get_mark_price(db: Session, position: ContractPosition) -> Decimal:
+    # Display/risk-preview fallback only. Execution paths must use _get_live_liquidation_mark_price().
     try:
         quote = get_contract_quote(db, str(position.symbol), log_context="liquidation_scanner")
         mark_price = _q18(quote.get("mark_price"))
@@ -147,7 +148,26 @@ def _is_position_in_liquidation_grace(position: ContractPosition, now: datetime)
 
 def _get_live_liquidation_mark_price(db: Session, position: ContractPosition) -> Decimal:
     try:
-        quote = get_contract_quote(db, str(position.symbol), log_context="liquidation_scanner")
+        quote = get_executable_contract_quote(
+            db,
+            str(position.symbol),
+            context="liquidation_scanner",
+            position_id=getattr(position, "id", None),
+            user_id=getattr(position, "user_id", None),
+            log_context="liquidation_scanner",
+        )
+    except ContractQuoteNotLive as exc:
+        logger.warning(
+            "liquidation_skip_non_live_quote position_id=%s symbol=%s user_id=%s source=%s "
+            "quote_freshness=%s reason=%s",
+            getattr(position, "id", None),
+            getattr(position, "symbol", None),
+            getattr(position, "user_id", None),
+            None,
+            None,
+            str(exc),
+        )
+        raise ContractLiquidationNotTriggered("LIQUIDATION_QUOTE_NOT_LIVE") from exc
     except Exception as exc:
         logger.warning(
             "liquidation_skip_quote_unavailable position_id=%s symbol=%s user_id=%s reason=%s error=%s",
@@ -158,26 +178,6 @@ def _get_live_liquidation_mark_price(db: Session, position: ContractPosition) ->
             exc,
         )
         raise ContractLiquidationNotTriggered("LIQUIDATION_QUOTE_UNAVAILABLE") from exc
-    try:
-        require_executable_contract_quote(
-            quote,
-            context="liquidation_scanner",
-            symbol=str(position.symbol),
-            position_id=getattr(position, "id", None),
-            user_id=getattr(position, "user_id", None),
-        )
-    except ContractQuoteNotLive as exc:
-        logger.warning(
-            "liquidation_skip_non_live_quote position_id=%s symbol=%s user_id=%s source=%s "
-            "quote_freshness=%s reason=%s",
-            getattr(position, "id", None),
-            getattr(position, "symbol", None),
-            getattr(position, "user_id", None),
-            quote.get("source"),
-            quote.get("quote_freshness"),
-            "LIQUIDATION_QUOTE_NOT_LIVE",
-        )
-        raise ContractLiquidationNotTriggered("LIQUIDATION_QUOTE_NOT_LIVE") from exc
 
     mark_price = _q18(quote.get("mark_price"))
     if mark_price <= 0:

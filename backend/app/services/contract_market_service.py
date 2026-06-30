@@ -33,6 +33,7 @@ from app.services.contract_market_provider_service import (
     request_contract_market_provider_json,
     resolve_contract_provider_symbol,
 )
+from app.services.contract_market_guard import require_executable_contract_quote
 
 
 logger = logging.getLogger(__name__)
@@ -432,15 +433,11 @@ def _payload_has_valid_bbo(payload: dict[str, Any]) -> bool:
 def _payload_quote_executable(payload: dict[str, Any]) -> bool:
     quote_source = _payload_quote_source(payload)
     market_status = str(payload.get("market_status") or "").strip().upper()
-    if (
-        quote_source == QUOTE_SOURCE_LAST_GOOD_BBO
-        and _is_closed_market_status_value(market_status)
-        and _payload_has_valid_bbo(payload)
-    ):
-        return True
+    if market_status in {"", "CLOSED", "HOLIDAY", "SUSPENDED", "UNKNOWN"}:
+        return False
     if payload.get("quote_freshness") != QUOTE_FRESHNESS_LIVE:
         return False
-    if any(token in quote_source for token in ("FALLBACK", "LAST_VALID", "STALE", "INVALID")):
+    if any(token in quote_source for token in ("FALLBACK", "LAST_VALID", "LAST_GOOD", "STALE", "INVALID", "CACHE_STALE")):
         return False
     return _payload_has_valid_bbo(payload)
 
@@ -3322,6 +3319,59 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
         if provider == "ITICK":
             raise ItickQuoteUnavailable("ITICK_QUOTE_UNAVAILABLE")
         raise
+
+
+def get_executable_contract_quote(
+    db: Session,
+    symbol: str,
+    *,
+    context: str | None = None,
+    order_id: Any = None,
+    position_id: Any = None,
+    user_id: Any = None,
+    log_context: str | None = None,
+) -> dict[str, Any]:
+    normalized_symbol = _normalize_symbol(symbol)
+    execution_context = context or "contract_execution"
+    quote = get_contract_quote(db, normalized_symbol, log_context=log_context or execution_context)
+    require_executable_contract_quote(
+        quote,
+        context=execution_context,
+        symbol=normalized_symbol,
+        order_id=order_id,
+        position_id=position_id,
+        user_id=user_id,
+    )
+    return quote
+
+
+def get_executable_contract_depth(
+    db: Session,
+    symbol: str,
+    *,
+    limit: int = 5,
+    context: str | None = None,
+    order_id: Any = None,
+    position_id: Any = None,
+    user_id: Any = None,
+) -> dict[str, Any]:
+    normalized_symbol = _normalize_symbol(symbol)
+    execution_context = context or "contract_execution_depth"
+    depth = get_contract_depth(db, normalized_symbol, limit=limit, allow_fallback=False)
+    require_executable_contract_quote(
+        depth,
+        context=execution_context,
+        symbol=normalized_symbol,
+        order_id=order_id,
+        position_id=position_id,
+        user_id=user_id,
+        require_mark_price=False,
+    )
+    best_bid = _to_decimal(depth.get("best_bid"))
+    best_ask = _to_decimal(depth.get("best_ask"))
+    if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0 or best_ask < best_bid:
+        raise ContractQuoteUnavailable("missing_executable_bbo")
+    return depth
 
 
 def _normalize_contract_interval(interval: str) -> str:
