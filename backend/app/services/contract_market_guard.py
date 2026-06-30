@@ -9,9 +9,8 @@ logger = logging.getLogger(__name__)
 
 CONTRACT_QUOTE_NOT_LIVE = "CONTRACT_QUOTE_NOT_LIVE"
 QUOTE_FRESHNESS_LIVE = "LIVE"
-QUOTE_SOURCE_LAST_GOOD_BBO = "LAST_GOOD_BBO"
-_EXECUTABLE_CLOSED_MARKET_STATUSES = {"CLOSED", "HOLIDAY"}
-_UNSAFE_EXECUTABLE_SOURCE_TOKENS = ("FALLBACK", "LAST_VALID", "STALE")
+_NON_EXECUTABLE_MARKET_STATUSES = {"CLOSED", "HOLIDAY", "SUSPENDED", "UNKNOWN"}
+_UNSAFE_EXECUTABLE_SOURCE_TOKENS = ("FALLBACK", "LAST_VALID", "LAST_GOOD", "STALE", "INVALID", "CACHE_STALE")
 _LAST_SKIP_LOG_AT: dict[str, float] = {}
 
 
@@ -23,15 +22,47 @@ def _normalized(value: Any) -> str:
     return str(value or "").strip().upper()
 
 
-def is_executable_contract_quote(quote: dict[str, Any]) -> bool:
+def executable_contract_quote_rejection_reason(
+    quote: dict[str, Any],
+    *,
+    require_mark_price: bool = True,
+) -> str | None:
+    if not isinstance(quote, dict):
+        return "quote_not_live"
+
     quote_freshness = _normalized(quote.get("quote_freshness") if isinstance(quote, dict) else None)
     source = _normalized((quote.get("quote_source") or quote.get("source")) if isinstance(quote, dict) else None)
     market_status = _normalized(quote.get("market_status") if isinstance(quote, dict) else None)
-    if source == QUOTE_SOURCE_LAST_GOOD_BBO and market_status in _EXECUTABLE_CLOSED_MARKET_STATUSES:
-        return True
+    if not market_status or market_status in _NON_EXECUTABLE_MARKET_STATUSES:
+        return "market_closed_not_executable"
     if quote_freshness != QUOTE_FRESHNESS_LIVE:
-        return False
-    return not any(token in source for token in _UNSAFE_EXECUTABLE_SOURCE_TOKENS)
+        return "quote_not_live"
+    if any(token in source for token in _UNSAFE_EXECUTABLE_SOURCE_TOKENS):
+        return "quote_source_not_executable"
+
+    bid = quote.get("bid_price") or quote.get("best_bid") or quote.get("bid")
+    ask = quote.get("ask_price") or quote.get("best_ask") or quote.get("ask")
+    try:
+        bid_value = float(bid)
+        ask_value = float(ask)
+    except Exception:
+        return "missing_executable_bbo"
+    if bid_value <= 0 or ask_value <= 0 or ask_value < bid_value:
+        return "missing_executable_bbo"
+
+    if require_mark_price:
+        try:
+            mark_value = float(quote.get("mark_price"))
+        except Exception:
+            return "missing_executable_mark_price"
+        if mark_value <= 0:
+            return "missing_executable_mark_price"
+
+    return None
+
+
+def is_executable_contract_quote(quote: dict[str, Any], *, require_mark_price: bool = True) -> bool:
+    return executable_contract_quote_rejection_reason(quote, require_mark_price=require_mark_price) is None
 
 
 def should_log_contract_quote_skip(key: str, interval_sec: int = 60) -> bool:
@@ -51,14 +82,16 @@ def require_executable_contract_quote(
     order_id: Any = None,
     position_id: Any = None,
     user_id: Any = None,
+    require_mark_price: bool = True,
 ) -> None:
-    if is_executable_contract_quote(quote):
+    reason = executable_contract_quote_rejection_reason(quote, require_mark_price=require_mark_price)
+    if reason is None:
         return
 
     quote_freshness = _normalized(quote.get("quote_freshness") if isinstance(quote, dict) else None)
     source = _normalized((quote.get("quote_source") or quote.get("source")) if isinstance(quote, dict) else None)
     market_status = _normalized(quote.get("market_status") if isinstance(quote, dict) else None)
-    log_key = f"executable_quote:{symbol}:{order_id}:{CONTRACT_QUOTE_NOT_LIVE}"
+    log_key = f"executable_quote:{symbol}:{order_id}:{reason}"
     if should_log_contract_quote_skip(log_key):
         logger.debug(
             "contract executable quote rejected symbol=%s context=%s market_status=%s freshness=%s source=%s "
@@ -68,9 +101,9 @@ def require_executable_contract_quote(
             market_status,
             quote_freshness,
             source,
-            CONTRACT_QUOTE_NOT_LIVE,
+            reason,
             order_id,
             position_id,
             user_id,
         )
-    raise ContractQuoteNotLive(CONTRACT_QUOTE_NOT_LIVE)
+    raise ContractQuoteNotLive(reason)
