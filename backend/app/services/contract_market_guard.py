@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -9,11 +10,14 @@ logger = logging.getLogger(__name__)
 
 CONTRACT_QUOTE_NOT_LIVE = "CONTRACT_QUOTE_NOT_LIVE"
 QUOTE_FRESHNESS_LIVE = "LIVE"
+QUOTE_FRESHNESS_LAST_VALID = "LAST_VALID"
 QUOTE_SOURCE_LAST_GOOD_BBO = "LAST_GOOD_BBO"
 CLOSED_MARKET_EXECUTION_DISABLED = "DISABLED"
 CLOSED_MARKET_EXECUTION_LAST_GOOD_BBO = "LAST_GOOD_BBO"
 _NON_EXECUTABLE_MARKET_STATUSES = {"CLOSED", "HOLIDAY", "SUSPENDED", "UNKNOWN"}
 _CLOSED_MARKET_LAST_GOOD_BBO_STATUSES = {"CLOSED", "HOLIDAY"}
+_CLOSED_MARKET_LAST_GOOD_BBO_FRESHNESSES = {QUOTE_FRESHNESS_LIVE, QUOTE_FRESHNESS_LAST_VALID}
+_CLOSED_MARKET_LAST_GOOD_BBO_MAX_AGE_SECONDS = 72 * 60 * 60
 _UNSAFE_EXECUTABLE_SOURCE_TOKENS = ("FALLBACK", "LAST_VALID", "LAST_GOOD", "STALE", "INVALID", "CACHE_STALE")
 _CRYPTO_OR_PERP_TOKENS = ("CRYPTO", "PERP", "SWAP")
 _LAST_SKIP_LOG_AT: dict[str, float] = {}
@@ -71,6 +75,52 @@ def _has_mark_or_derivable_mid(quote: dict[str, Any]) -> bool:
     return _valid_bbo(quote) is not None
 
 
+def _coerce_quote_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 1_000_000_000_000:
+            timestamp = timestamp / 1000
+        try:
+            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except Exception:
+            return None
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return _coerce_quote_timestamp(float(raw))
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _last_good_bbo_timestamp(quote: dict[str, Any]) -> datetime | None:
+    for key in ("last_good_at", "ts", "timestamp", "time"):
+        dt = _coerce_quote_timestamp(quote.get(key))
+        if dt is not None:
+            return dt
+    return None
+
+
+def _last_good_bbo_is_recent(quote: dict[str, Any]) -> bool:
+    dt = _last_good_bbo_timestamp(quote)
+    if dt is None:
+        return False
+    age_seconds = (datetime.now(timezone.utc) - dt).total_seconds()
+    # Conservative 72h cap: enough for a weekend closure, but rejects long-lived frozen BBO.
+    return 0 <= age_seconds <= _CLOSED_MARKET_LAST_GOOD_BBO_MAX_AGE_SECONDS
+
+
 def _allows_closed_market_last_good_bbo(quote: dict[str, Any], contract_symbol: Any = None) -> bool:
     # Product exception for tradfi CFD symbols explicitly configured by operations.
     # It does not make stale/fallback/last-valid quotes executable in normal error paths.
@@ -86,7 +136,8 @@ def _allows_closed_market_last_good_bbo(quote: dict[str, Any], contract_symbol: 
         mode == CLOSED_MARKET_EXECUTION_LAST_GOOD_BBO
         and market_status in _CLOSED_MARKET_LAST_GOOD_BBO_STATUSES
         and source == QUOTE_SOURCE_LAST_GOOD_BBO
-        and quote_freshness == QUOTE_FRESHNESS_LIVE
+        and quote_freshness in _CLOSED_MARKET_LAST_GOOD_BBO_FRESHNESSES
+        and _last_good_bbo_is_recent(quote)
         and _valid_bbo(quote) is not None
         and _has_mark_or_derivable_mid(quote)
         and not _is_crypto_or_perp_contract(quote, contract_symbol)
