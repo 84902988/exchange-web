@@ -4,9 +4,10 @@ import logging
 import hashlib
 import math
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date as date_cls, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from sqlalchemy import inspect, text
@@ -34,6 +35,7 @@ from app.services.contract_market_provider_service import (
     resolve_contract_provider_symbol,
 )
 from app.services.contract_market_guard import (
+    _CLOSED_MARKET_LAST_GOOD_BBO_MAX_AGE_SECONDS,
     executable_contract_quote_rejection_reason,
     require_executable_contract_quote,
 )
@@ -433,6 +435,134 @@ def _payload_has_valid_bbo(payload: dict[str, Any]) -> bool:
     return bid is not None and ask is not None and bid > 0 and ask > 0 and ask >= bid
 
 
+def _closed_market_last_good_bbo_timestamp(payload: dict[str, Any]) -> Optional[datetime]:
+    for key in ("last_good_at", "ts", "timestamp", "time"):
+        dt = _normalize_quote_ts(payload.get(key))
+        if dt is not None:
+            return dt
+    return None
+
+
+def _last_good_bbo_timezone(status: Optional[ItickMarketStatus]) -> ZoneInfo:
+    timezone_name = str(getattr(status, "market_timezone", None) or "").strip()
+    session_code = str(getattr(status, "market_session_code", None) or "").strip().upper()
+    if not timezone_name and session_code:
+        timezone_name = itick_holiday_service.SESSION_TIMEZONE_FALLBACKS.get(session_code, "")
+    try:
+        return ZoneInfo(timezone_name) if timezone_name else ZoneInfo("UTC")
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def _last_good_bbo_local_now(status: Optional[ItickMarketStatus], now: Optional[datetime]) -> datetime:
+    base = now or datetime.now(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    return base.astimezone(_last_good_bbo_timezone(status))
+
+
+def _last_good_bbo_local_date(payload: dict[str, Any], status: Optional[ItickMarketStatus]) -> Optional[date_cls]:
+    dt = _closed_market_last_good_bbo_timestamp(payload)
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_last_good_bbo_timezone(status)).date()
+
+
+def _holiday_rows_for_status(status: Optional[ItickMarketStatus]) -> Optional[list[dict[str, Any]]]:
+    session_code = str(getattr(status, "market_session_code", None) or "").strip().upper()
+    if not session_code:
+        return None
+    try:
+        rows = itick_holiday_service._get_holidays(session_code)
+    except Exception:
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def _is_holiday_date(rows: Optional[list[dict[str, Any]]], day: date_cls) -> bool:
+    if not rows:
+        return False
+    day_text = day.isoformat()
+    return any(itick_holiday_service._date_matches(row.get("d"), day_text) for row in rows if isinstance(row, dict))
+
+
+def _is_trading_day(day: date_cls, rows: Optional[list[dict[str, Any]]]) -> bool:
+    return day.weekday() < 5 and not _is_holiday_date(rows, day)
+
+
+def _first_trading_clock(trading_hours: Any) -> Optional[dt_time]:
+    candidates: list[dt_time] = []
+    for raw_segment in str(trading_hours or "").replace("|", ",").split(","):
+        segment = raw_segment.strip()
+        if "-" not in segment:
+            continue
+        start_raw = segment.split("-", 1)[0].strip()
+        start = itick_holiday_service._parse_clock_time(start_raw)
+        if start is not None:
+            candidates.append(start)
+    return min(candidates) if candidates else None
+
+
+def _previous_trading_day(day: date_cls, rows: Optional[list[dict[str, Any]]]) -> date_cls:
+    candidate = day - timedelta(days=1)
+    for _ in range(370):
+        if _is_trading_day(candidate, rows):
+            return candidate
+        candidate -= timedelta(days=1)
+    return day - timedelta(days=1)
+
+
+def _required_last_good_trading_day(
+    contract_symbol: Optional[ContractSymbol],
+    status: Optional[ItickMarketStatus],
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[date_cls]:
+    category = _contract_asset_category(contract_symbol) if contract_symbol is not None else ""
+    if category not in (_tradfi_cfd_categories | _holiday_contract_categories | _contract_24x5_categories):
+        return None
+
+    current = _last_good_bbo_local_now(status, now)
+    rows = _holiday_rows_for_status(status)
+    current_day = current.date()
+    if not _is_trading_day(current_day, rows):
+        return _previous_trading_day(current_day, rows)
+
+    session_type = str(getattr(status, "market_session_type", None) or "").strip().upper()
+    if session_type == "PRE_MARKET":
+        return _previous_trading_day(current_day, rows)
+    if session_type == "CLOSED":
+        first_clock = _first_trading_clock(getattr(status, "market_trading_hours", None))
+        if first_clock is not None and current.time() < first_clock:
+            return _previous_trading_day(current_day, rows)
+    return current_day
+
+
+def _closed_market_last_good_bbo_is_recent(
+    payload: Optional[dict[str, Any]],
+    contract_symbol: Optional[ContractSymbol] = None,
+    status: Optional[ItickMarketStatus] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if _payload_quote_source(payload) != QUOTE_SOURCE_LAST_GOOD_BBO:
+        return False
+    dt = _closed_market_last_good_bbo_timestamp(payload)
+    if dt is None:
+        return False
+    required_day = _required_last_good_trading_day(contract_symbol, status, now=now)
+    if required_day is not None:
+        last_good_day = _last_good_bbo_local_date(payload, status)
+        current_day = _last_good_bbo_local_now(status, now).date()
+        return last_good_day is not None and required_day <= last_good_day <= current_day
+    age_seconds = (datetime.utcnow() - dt).total_seconds()
+    return 0 <= age_seconds <= _CLOSED_MARKET_LAST_GOOD_BBO_MAX_AGE_SECONDS
+
+
 def _contract_closed_market_execution_mode(contract_symbol: Optional[ContractSymbol]) -> str:
     mode = str(getattr(contract_symbol, "closed_market_execution_mode", None) or "DISABLED").strip().upper()
     return mode if mode in {"DISABLED", "LAST_GOOD_BBO"} else "DISABLED"
@@ -447,6 +577,24 @@ def _attach_contract_symbol_execution_metadata(
         payload["category"] = _contract_asset_category(contract_symbol)
     else:
         payload.setdefault("category", "UNKNOWN")
+    return payload
+
+
+def _annotate_closed_market_last_good_bbo_validity(
+    payload: dict[str, Any],
+    contract_symbol: Optional[ContractSymbol],
+    status: ItickMarketStatus,
+) -> dict[str, Any]:
+    if _payload_quote_source(payload) == QUOTE_SOURCE_LAST_GOOD_BBO and _is_market_closed(status):
+        payload["last_good_bbo_valid"] = _closed_market_last_good_bbo_is_recent(
+            payload,
+            contract_symbol,
+            status,
+        )
+        if payload["last_good_bbo_valid"]:
+            payload["quote_freshness"] = QUOTE_FRESHNESS_LAST_VALID
+    else:
+        payload.pop("last_good_bbo_valid", None)
     return payload
 
 
@@ -662,15 +810,17 @@ def _freeze_depth_if_closed(
     status: ItickMarketStatus,
     *,
     limit: Optional[int] = None,
+    prefer_cached: bool = True,
 ) -> dict[str, Any]:
     if not _is_market_closed(status):
         return depth
-    cached = _get_closed_depth(str(depth.get("symbol") or ""), limit=limit)
-    if cached is not None:
-        return cached
-    last_valid = _get_cached_depth(str(depth.get("symbol") or ""), limit=limit or len(depth.get("bids") or []), source="LAST_VALID")
-    if last_valid is not None:
-        return _set_closed_depth(last_valid)
+    if prefer_cached:
+        cached = _get_closed_depth(str(depth.get("symbol") or ""), limit=limit)
+        if cached is not None:
+            return cached
+        last_valid = _get_cached_depth(str(depth.get("symbol") or ""), limit=limit or len(depth.get("bids") or []), source="LAST_VALID")
+        if last_valid is not None:
+            return _set_closed_depth(last_valid)
     return _set_closed_depth(depth)
 
 
@@ -698,24 +848,30 @@ def _set_closed_quote(quote: dict[str, Any]) -> dict[str, Any]:
     return _copy_closed_quote(frozen)
 
 
-def _freeze_quote_if_closed(quote: dict[str, Any], status: ItickMarketStatus) -> dict[str, Any]:
+def _freeze_quote_if_closed(
+    quote: dict[str, Any],
+    status: ItickMarketStatus,
+    *,
+    prefer_cached: bool = True,
+) -> dict[str, Any]:
     if not _is_market_closed(status):
         return quote
-    cached = _get_closed_quote(str(quote.get("symbol") or ""))
-    if cached is not None:
-        return cached
-    closed_depth = _get_closed_depth(str(quote.get("symbol") or ""), limit=5)
-    if closed_depth is not None:
-        try:
-            frozen_quote = _quote_from_depth(
-                _quote_contract_stub(quote),
-                closed_depth,
-                source=str(closed_depth.get("source") or "PLATFORM_BBO"),
-            )
-            frozen_quote["price_precision"] = quote.get("price_precision")
-            return _set_closed_quote(frozen_quote)
-        except Exception:
-            pass
+    if prefer_cached:
+        cached = _get_closed_quote(str(quote.get("symbol") or ""))
+        if cached is not None:
+            return cached
+        closed_depth = _get_closed_depth(str(quote.get("symbol") or ""), limit=5)
+        if closed_depth is not None:
+            try:
+                frozen_quote = _quote_from_depth(
+                    _quote_contract_stub(quote),
+                    closed_depth,
+                    source=str(closed_depth.get("source") or "PLATFORM_BBO"),
+                )
+                frozen_quote["price_precision"] = quote.get("price_precision")
+                return _set_closed_quote(frozen_quote)
+            except Exception:
+                pass
     return _set_closed_quote(quote)
 
 
@@ -1006,6 +1162,157 @@ def _quote_from_depth(contract_symbol: ContractSymbol, depth: dict[str, Any], *,
         source=source,
         ts=depth["ts"],
     )
+
+
+def _closed_bbo_payload_timestamp(payload: Optional[dict[str, Any]]) -> Optional[datetime]:
+    if not isinstance(payload, dict):
+        return None
+    return _closed_market_last_good_bbo_timestamp(payload)
+
+
+def _is_payload_newer(left: Optional[dict[str, Any]], right: Optional[dict[str, Any]]) -> bool:
+    left_ts = _closed_bbo_payload_timestamp(left)
+    right_ts = _closed_bbo_payload_timestamp(right)
+    if left_ts is None:
+        return False
+    if right_ts is None:
+        return True
+    return left_ts > right_ts
+
+
+def _set_closed_quote_from_depth(contract_symbol: ContractSymbol, depth: dict[str, Any]) -> Optional[dict[str, Any]]:
+    try:
+        quote = _quote_from_depth(
+            contract_symbol,
+            depth,
+            source=str(depth.get("source") or QUOTE_SOURCE_LAST_GOOD_BBO),
+        )
+        quote["price_precision"] = int(getattr(contract_symbol, "price_precision", quote.get("price_precision") or 8) or 8)
+        return _set_closed_quote(quote)
+    except Exception:
+        return None
+
+
+def _set_closed_depth_from_quote(
+    contract_symbol: ContractSymbol,
+    quote: dict[str, Any],
+    *,
+    limit: int,
+) -> Optional[dict[str, Any]]:
+    try:
+        depth = _depth_from_quote_payload(
+            quote,
+            limit=limit,
+            source=str(quote.get("source") or QUOTE_SOURCE_LAST_GOOD_BBO),
+        )
+        depth["price_precision"] = int(getattr(contract_symbol, "price_precision", depth.get("price_precision") or 8) or 8)
+        return _set_closed_depth(depth)
+    except Exception:
+        return None
+
+
+def _sync_closed_quote_with_newer_depth(
+    contract_symbol: ContractSymbol,
+    status: ItickMarketStatus,
+    quote: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    depth = _get_closed_depth(contract_symbol.symbol, limit=5)
+    if not _closed_market_last_good_bbo_is_recent(depth, contract_symbol, status):
+        return quote
+    if quote is None or _is_payload_newer(depth, quote):
+        synced = _set_closed_quote_from_depth(contract_symbol, depth or {})
+        if synced is not None:
+            return synced
+    return quote
+
+
+def _sync_closed_depth_with_newer_quote(
+    contract_symbol: ContractSymbol,
+    status: ItickMarketStatus,
+    depth: Optional[dict[str, Any]],
+    *,
+    limit: int,
+) -> Optional[dict[str, Any]]:
+    quote = _get_closed_quote(contract_symbol.symbol)
+    if not _closed_market_last_good_bbo_is_recent(quote, contract_symbol, status):
+        return depth
+    if depth is None or _is_payload_newer(quote, depth):
+        synced = _set_closed_depth_from_quote(contract_symbol, quote or {}, limit=limit)
+        if synced is not None:
+            return synced
+    return depth
+
+
+def _get_itick_depth_for_contract(
+    contract_symbol: ContractSymbol,
+    *,
+    limit: int,
+    log_context: str = "contract_quote",
+) -> dict[str, Any]:
+    if _is_tradfi_cfd_contract(contract_symbol):
+        return _get_itick_cfd_depth(contract_symbol, limit=limit)
+    provider_symbol = str(contract_symbol.provider_symbol or "").strip().upper() or None
+    return _get_stock_contract_depth(
+        contract_symbol.symbol,
+        provider_symbol,
+        limit=limit,
+        log_context=log_context,
+    )
+
+
+def _quote_from_open_market_depth_if_live(
+    contract_symbol: ContractSymbol,
+    quote: dict[str, Any],
+    *,
+    market_status: ItickMarketStatus,
+    log_context: str,
+) -> dict[str, Any]:
+    if _is_market_closed(market_status):
+        return quote
+    try:
+        depth = _get_itick_depth_for_contract(contract_symbol, limit=10, log_context=log_context)
+    except Exception:
+        return quote
+    if _quote_freshness_for_payload(depth) != QUOTE_FRESHNESS_LIVE:
+        return quote
+    try:
+        best_bid = _require_positive(depth.get("best_bid"), "bid_price")
+        best_ask = _require_positive(depth.get("best_ask"), "ask_price")
+    except Exception:
+        return quote
+    if best_ask < best_bid:
+        return quote
+    _cache_depth(depth)
+    derived = (
+        _quote_from_cfd_depth(contract_symbol, depth, source=str(depth.get("source") or "ITICK_DEPTH"))
+        if _is_tradfi_cfd_contract(contract_symbol)
+        else _quote_from_stock_depth(contract_symbol.symbol, depth, source=str(depth.get("source") or "ITICK_DEPTH"))
+    )
+    derived["price_precision"] = int(getattr(contract_symbol, "price_precision", quote.get("price_precision") or 8) or 8)
+    _cache_tradfi_quote(derived)
+    return derived
+
+
+def _depth_from_open_market_quote_if_live(
+    contract_symbol: ContractSymbol,
+    quote: dict[str, Any],
+    *,
+    limit: int,
+) -> Optional[dict[str, Any]]:
+    if _quote_freshness_for_payload(quote) != QUOTE_FRESHNESS_LIVE:
+        return None
+    try:
+        if not _payload_has_valid_bbo(quote):
+            return None
+        depth = _depth_from_quote_payload(
+            quote,
+            limit=limit,
+            source=str(quote.get("source") or "ITICK_QUOTE"),
+        )
+        depth["price_precision"] = int(getattr(contract_symbol, "price_precision", depth.get("price_precision") or 8) or 8)
+        return depth
+    except Exception:
+        return None
 
 
 def _recent_cached_quote(contract_symbol: ContractSymbol, *, max_age_seconds: float = 2.5) -> Optional[dict[str, Any]]:
@@ -2668,8 +2975,10 @@ def _contract_quote_with_status(
 ) -> dict[str, Any]:
     payload = _with_market_status(quote, status)
     _attach_contract_symbol_execution_metadata(payload, contract_symbol)
+    _annotate_closed_market_last_good_bbo_validity(payload, contract_symbol, status)
     _augment_contract_quote_payload(payload)
     payload = _apply_effective_spread_x_to_quote(payload, contract_symbol)
+    _annotate_closed_market_last_good_bbo_validity(payload, contract_symbol, status)
     return _augment_contract_quote_payload(payload)
 
 
@@ -2680,8 +2989,10 @@ def _contract_depth_with_status(
 ) -> dict[str, Any]:
     payload = _with_market_status(depth, status)
     _attach_contract_symbol_execution_metadata(payload, contract_symbol)
+    _annotate_closed_market_last_good_bbo_validity(payload, contract_symbol, status)
     _augment_contract_quote_payload(payload)
     payload = _apply_effective_spread_x_to_depth(payload, contract_symbol)
+    _annotate_closed_market_last_good_bbo_validity(payload, contract_symbol, status)
     return _augment_contract_quote_payload(payload)
 
 
@@ -2721,10 +3032,17 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
 
     provider = str(contract_symbol.provider or "").strip().upper()
     market_status = _market_status_for_contract_symbol(contract_symbol)
-    frozen_quote = _get_closed_quote(contract_symbol.symbol) if _is_market_closed(market_status) else None
-    if frozen_quote is None and _is_market_closed(market_status):
+    is_closed_market = _is_market_closed(market_status)
+    frozen_quote = _get_closed_quote(contract_symbol.symbol) if is_closed_market else None
+    if frozen_quote is None and is_closed_market:
         frozen_quote = _seed_closed_quote_from_last_good(db, contract_symbol)
-    if frozen_quote is not None:
+    if is_closed_market:
+        frozen_quote = _sync_closed_quote_with_newer_depth(contract_symbol, market_status, frozen_quote)
+    if frozen_quote is not None and _closed_market_last_good_bbo_is_recent(
+        frozen_quote,
+        contract_symbol,
+        market_status,
+    ):
         return _contract_quote_with_status(frozen_quote, market_status, contract_symbol)
 
     try:
@@ -2735,8 +3053,17 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
         else:
             raise ContractQuoteUnavailable(f"provider {provider} quote is unavailable")
 
+        if provider == "ITICK" and not is_closed_market:
+            quote = _quote_from_open_market_depth_if_live(
+                contract_symbol,
+                quote,
+                market_status=market_status,
+                log_context=log_context,
+            )
         quote["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
-        quote = _freeze_quote_if_closed(quote, market_status)
+        quote = _freeze_quote_if_closed(quote, market_status, prefer_cached=not is_closed_market)
+        if is_closed_market and _is_payload_newer(quote, _get_closed_depth(contract_symbol.symbol, limit=5)):
+            _set_closed_depth_from_quote(contract_symbol, quote, limit=5)
         quote_source = str(quote.get("source") or "LIVE")
         quote_freshness = _quote_freshness_for_payload(quote)
         if (
@@ -2790,6 +3117,8 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
         return _contract_quote_with_status(quote, market_status, contract_symbol)
     except Exception as exc:
         db.rollback()
+        if is_closed_market and frozen_quote is not None:
+            return _contract_quote_with_status(frozen_quote, market_status, contract_symbol)
         if provider == "BINANCE" and not contract_market_last_good_enabled(db):
             raise
         if provider == "ITICK" and _is_tradfi_cfd_contract(contract_symbol):
@@ -3259,10 +3588,22 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
 
     provider = str(contract_symbol.provider or "").strip().upper()
     market_status = _market_status_for_contract_symbol(contract_symbol)
-    frozen_depth = _get_closed_depth(contract_symbol.symbol, limit=safe_limit) if _is_market_closed(market_status) else None
-    if frozen_depth is None and _is_market_closed(market_status):
+    is_closed_market = _is_market_closed(market_status)
+    frozen_depth = _get_closed_depth(contract_symbol.symbol, limit=safe_limit) if is_closed_market else None
+    if frozen_depth is None and is_closed_market:
         frozen_depth = _seed_closed_depth_from_last_good(db, contract_symbol, limit=safe_limit)
-    if frozen_depth is not None:
+    if is_closed_market:
+        frozen_depth = _sync_closed_depth_with_newer_quote(
+            contract_symbol,
+            market_status,
+            frozen_depth,
+            limit=safe_limit,
+        )
+    if frozen_depth is not None and _closed_market_last_good_bbo_is_recent(
+        frozen_depth,
+        contract_symbol,
+        market_status,
+    ):
         return _contract_depth_with_status(frozen_depth, market_status, contract_symbol)
 
     try:
@@ -3278,7 +3619,20 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
             raise ContractQuoteUnavailable(f"provider {provider} depth is unavailable")
 
         depth["price_precision"] = int(getattr(contract_symbol, "price_precision", depth.get("price_precision") or 8) or 8)
-        depth = _freeze_depth_if_closed(depth, market_status, limit=safe_limit)
+        depth = _freeze_depth_if_closed(depth, market_status, limit=safe_limit, prefer_cached=not is_closed_market)
+        if provider == "ITICK" and not is_closed_market and _quote_freshness_for_payload(depth) != QUOTE_FRESHNESS_LIVE:
+            try:
+                quote_for_depth = _get_itick_live_quote(contract_symbol, log_context="contract_depth_quote_fallback")
+                quote_for_depth["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
+                derived_depth = _depth_from_open_market_quote_if_live(
+                    contract_symbol,
+                    quote_for_depth,
+                    limit=safe_limit,
+                )
+                if derived_depth is not None:
+                    depth = derived_depth
+            except Exception:
+                pass
         best_bid = _require_positive(depth.get("best_bid"), "bid_price")
         best_ask = _require_positive(depth.get("best_ask"), "ask_price")
         depth_mid_price = (best_bid + best_ask) / Decimal("2")
@@ -3314,6 +3668,8 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
                 args=(contract_symbol.symbol, contract_symbol.provider_symbol, provider, depth_source),
             )
         db.commit()
+        if is_closed_market:
+            _set_closed_quote_from_depth(contract_symbol, depth)
         return _contract_depth_with_status(depth, market_status, contract_symbol)
     except Exception as exc:
         db.rollback()
@@ -3321,6 +3677,73 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
             raise
         if provider == "BINANCE" and not contract_market_last_good_enabled(db):
             raise
+        if provider == "ITICK" and not is_closed_market:
+            try:
+                quote = _get_itick_live_quote(contract_symbol, log_context="contract_depth_quote_fallback")
+                quote["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
+                depth = _depth_from_open_market_quote_if_live(contract_symbol, quote, limit=safe_limit)
+                if depth is not None:
+                    best_bid = _require_positive(depth.get("best_bid"), "bid_price")
+                    best_ask = _require_positive(depth.get("best_ask"), "ask_price")
+                    last_price = _to_decimal(quote.get("last_price")) or (best_bid + best_ask) / Decimal("2")
+                    mark_price = _calculate_mark_price(bid_price=best_bid, ask_price=best_ask, last_price=last_price)
+                    depth_source = str(depth.get("source") or "ITICK_QUOTE")
+                    save_last_valid_contract_quote(
+                        db,
+                        symbol=contract_symbol.symbol,
+                        provider=depth["provider"],
+                        provider_symbol=depth["provider_symbol"],
+                        bid_price=best_bid,
+                        ask_price=best_ask,
+                        last_price=last_price,
+                        mark_price=mark_price,
+                        source=depth_source,
+                        ts=depth["ts"],
+                    )
+                    _cache_depth(depth)
+                    db.commit()
+                    return _contract_depth_with_status(depth, market_status, contract_symbol)
+            except Exception:
+                db.rollback()
+        if provider == "ITICK" and is_closed_market:
+            try:
+                quote = _get_itick_live_quote(contract_symbol, log_context="contract_depth")
+                quote["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
+                quote = _freeze_quote_if_closed(quote, market_status, prefer_cached=False)
+                depth = _depth_from_quote_payload(
+                    quote,
+                    limit=safe_limit,
+                    source=str(quote.get("source") or QUOTE_SOURCE_LAST_GOOD_BBO),
+                )
+                depth["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
+                depth = _freeze_depth_if_closed(depth, market_status, limit=safe_limit, prefer_cached=False)
+                best_bid = _require_positive(depth.get("best_bid"), "bid_price")
+                best_ask = _require_positive(depth.get("best_ask"), "ask_price")
+                last_price = _to_decimal(quote.get("last_price")) or (best_bid + best_ask) / Decimal("2")
+                mark_price = _calculate_mark_price(bid_price=best_bid, ask_price=best_ask, last_price=last_price)
+                depth_source = str(depth.get("source") or QUOTE_SOURCE_LAST_GOOD_BBO)
+                if _quote_freshness_for_payload(depth) == QUOTE_FRESHNESS_LIVE:
+                    save_last_valid_contract_quote(
+                        db,
+                        symbol=contract_symbol.symbol,
+                        provider=depth["provider"],
+                        provider_symbol=depth["provider_symbol"],
+                        bid_price=best_bid,
+                        ask_price=best_ask,
+                        last_price=last_price,
+                        mark_price=mark_price,
+                        source=depth_source,
+                        ts=depth["ts"],
+                    )
+                    _cache_depth(depth)
+                    db.commit()
+                return _contract_depth_with_status(depth, market_status, contract_symbol)
+            except Exception:
+                db.rollback()
+                if frozen_depth is not None:
+                    return _contract_depth_with_status(frozen_depth, market_status, contract_symbol)
+        if is_closed_market and frozen_depth is not None:
+            return _contract_depth_with_status(frozen_depth, market_status, contract_symbol)
         cached_depth = _get_cached_depth(contract_symbol.symbol, limit=safe_limit, source="LAST_VALID")
         if cached_depth is not None:
             logger.warning(

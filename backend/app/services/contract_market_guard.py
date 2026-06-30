@@ -113,6 +113,9 @@ def _last_good_bbo_timestamp(quote: dict[str, Any]) -> datetime | None:
 
 
 def _last_good_bbo_is_recent(quote: dict[str, Any]) -> bool:
+    calendar_valid = quote.get("last_good_bbo_valid")
+    if isinstance(calendar_valid, bool):
+        return calendar_valid
     dt = _last_good_bbo_timestamp(quote)
     if dt is None:
         return False
@@ -136,7 +139,10 @@ def _allows_closed_market_last_good_bbo(quote: dict[str, Any], contract_symbol: 
         mode == CLOSED_MARKET_EXECUTION_LAST_GOOD_BBO
         and market_status in _CLOSED_MARKET_LAST_GOOD_BBO_STATUSES
         and source == QUOTE_SOURCE_LAST_GOOD_BBO
-        and quote_freshness in _CLOSED_MARKET_LAST_GOOD_BBO_FRESHNESSES
+        and (
+            quote_freshness in _CLOSED_MARKET_LAST_GOOD_BBO_FRESHNESSES
+            or quote.get("last_good_bbo_valid") is True
+        )
         and _last_good_bbo_is_recent(quote)
         and _valid_bbo(quote) is not None
         and _has_mark_or_derivable_mid(quote)
