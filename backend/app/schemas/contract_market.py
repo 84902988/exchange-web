@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ContractQuoteResponse(BaseModel):
@@ -130,3 +130,28 @@ class ContractTickerItem(BaseModel):
 
 class ContractTickerListResponse(BaseModel):
     items: List[ContractTickerItem]
+
+
+class ContractMarketViewDetail(BaseModel):
+    symbol: str
+    display_symbol: str
+    market_type: str = "CONTRACT"
+    category: str = "INTERNAL"
+    market_status: str = "UNKNOWN"
+    display_state: str = "UNAVAILABLE"
+    display_price: Optional[str] = None
+    display_price_source: str = "NONE"
+    best_bid: Optional[str] = None
+    best_ask: Optional[str] = None
+    spread: Optional[str] = None
+    executable: bool = False
+    execution_bid: Optional[str] = None
+    execution_ask: Optional[str] = None
+    execution_mode: str = "DISABLED"
+    last_good_bbo_valid: bool = False
+    price_age_ms: Optional[int] = None
+    quote_time: Optional[datetime] = None
+    last_good_at: Optional[datetime] = None
+    reason_code: str = "UNAVAILABLE"
+    warnings: List[str] = Field(default_factory=list)
+    raw_source_summary: Dict[str, Any] = Field(default_factory=dict)
