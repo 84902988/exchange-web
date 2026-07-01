@@ -27,9 +27,11 @@ import { toNumber } from '@/components/contract/contractFormat';
 import { formatPrice } from '@/lib/marketPrecision';
 import {
   getContractQuoteDisplayStatus,
+  getContractMarketView,
   getContractSymbols,
   getContractTickers,
   isExpiredLastGoodBboQuote,
+  type ContractMarketViewDetail,
   type ContractQuoteDisplayStatus,
   type ContractTickerItem,
   type ContractPositionItem,
@@ -413,6 +415,42 @@ function getContractQuoteStatusTone(status: ContractQuoteDisplayStatus) {
   return 'last' as const;
 }
 
+function normalizeMarketViewDisplayState(value?: string | null) {
+  const normalized = String(value || '').trim().toUpperCase();
+  return normalized || null;
+}
+
+function marketViewStateToQuoteStatus(value?: string | null): ContractQuoteDisplayStatus | null {
+  const state = normalizeMarketViewDisplayState(value);
+  if (!state) return null;
+  if (state === 'LOADING') return 'LOADING';
+  if (state === 'LIVE_TRADABLE') return 'LIVE';
+  if (state === 'CLOSED_LAST_GOOD_TRADABLE' || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return 'LAST_QUOTE';
+  if (state === 'EXPIRED') return 'EXPIRED_LAST_QUOTE';
+  if (state === 'UNAVAILABLE') return 'UNAVAILABLE';
+  return null;
+}
+
+function getDisplayOnlyLastQuoteLabel(t: (key: string, namespace?: 'contracts') => string) {
+  const label = t('lastQuoteLabel', 'contracts');
+  if (label === '最后报价') return `${label}，仅供参考`;
+  if (label === '最後報價') return `${label}，僅供參考`;
+  if (label === '最終気配') return `${label}（参考のみ）`;
+  if (label === 'Last quote') return `${label}, display only`;
+  if (label) return label;
+  return 'Last quote, display only';
+}
+
+function getMarketViewStatusLabel(value: string, t: (key: string, namespace?: 'contracts') => string) {
+  const state = normalizeMarketViewDisplayState(value);
+  if (state === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
+  if (state === 'LIVE_TRADABLE') return t('realtimeQuoteLabel', 'contracts');
+  if (state === 'CLOSED_LAST_GOOD_TRADABLE') return t('lastQuoteLabel', 'contracts');
+  if (state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return getDisplayOnlyLastQuoteLabel(t);
+  if (state === 'EXPIRED') return t('lastQuoteExpiredLabel', 'contracts');
+  return t('quoteTemporarilyUnavailableLabel', 'contracts');
+}
+
 function isCryptoContractPair(pair: GlobalMarketSelectorPair | null | undefined) {
   if (!pair) return false;
   const categories = getContractPairCategories(pair);
@@ -585,7 +623,9 @@ function ContractPageContent() {
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
   const [contractDataScope, setContractDataScope] = useState<ContractDataScope>('current');
   const [selectedPrice, setSelectedPrice] = useState<string | null>(null);
-  const [latestKlineClose, setLatestKlineClose] = useState<string | null>(null);
+  const [, setLatestKlineClose] = useState<string | null>(null);
+  const [contractMarketView, setContractMarketView] = useState<ContractMarketViewDetail | null>(null);
+  const [contractMarketViewLoading, setContractMarketViewLoading] = useState(true);
   const [contractPairs, setContractPairs] = useState<GlobalMarketSelectorPair[]>(() => [
     getFallbackContractPair(DEFAULT_CONTRACT_SYMBOL, 1, t),
   ]);
@@ -639,14 +679,24 @@ function ContractPageContent() {
     symbolOptionPricePrecision: currentContractPair?.pricePrecision ?? symbolOption?.pricePrecision,
   });
   const isCryptoContract = isCryptoContractPair(currentContractPair) || (!!symbolOption && !currentContractPair);
+  const activeContractMarketView = normalizeContractSymbol(contractMarketView?.symbol) === contractSymbol
+    ? contractMarketView
+    : null;
   const contractMarketStatus = contractQuote?.market_status || contractTicker?.market_status || currentContractPair?.marketStatus || null;
   const contractMarketStatusText = contractQuote?.market_status_text || contractTicker?.market_status_text || currentContractPair?.marketStatusText || null;
   const contractQuoteFreshness = contractQuote?.quote_freshness || contractTicker?.quote_freshness || null;
   const contractMarketSessionType = contractQuote?.market_session_type || contractTicker?.market_session_type || currentContractPair?.marketSessionType || null;
   const quoteStatusLoading = contractQuoteLoading && (!contractQuote || contractQuote.executable === false);
   const contractQuoteDisplayStatus = getContractQuoteDisplayStatus(contractQuote, { loading: quoteStatusLoading });
-  const quoteStatusLabel = getContractQuoteStatusLabel(contractQuoteDisplayStatus, t);
-  const quoteStatusTone = getContractQuoteStatusTone(contractQuoteDisplayStatus);
+  const marketViewDisplayState = normalizeMarketViewDisplayState(
+    activeContractMarketView?.display_state || (contractMarketViewLoading ? 'LOADING' : null),
+  );
+  const marketViewQuoteDisplayStatus = marketViewStateToQuoteStatus(marketViewDisplayState);
+  const effectiveQuoteDisplayStatus = marketViewQuoteDisplayStatus || contractQuoteDisplayStatus;
+  const quoteStatusLabel = marketViewDisplayState
+    ? getMarketViewStatusLabel(marketViewDisplayState, t)
+    : getContractQuoteStatusLabel(contractQuoteDisplayStatus, t);
+  const quoteStatusTone = getContractQuoteStatusTone(effectiveQuoteDisplayStatus);
   const expiredLastGoodQuote = isExpiredLastGoodBboQuote(contractQuote);
   const contractQuoteIsStale = isContractQuoteStale(contractQuote, contractQuoteFreshness);
   const trustedContractDisplayPrice = buildTrustedContractDisplayPrice({
@@ -674,10 +724,14 @@ function ContractPageContent() {
   const chartPriceIsStale = !latestCandlePatchPrice
     || (contractQuoteIsStale && latestCandlePatchSource !== 'MID_PRICE');
   const displayLastPrice = displayContractPrice ? formatPrice(displayContractPrice, pricePrecision) : '--';
-  const displayKlinePrice = formatPrice(latestKlineClose, pricePrecision);
-  const headerDisplayPrice = expiredLastGoodQuote ? (latestKlineClose ? displayKlinePrice : '--') : displayLastPrice;
+  const marketViewDisplayPrice = getPositivePrice(activeContractMarketView?.display_price);
+  const formattedMarketViewDisplayPrice = marketViewDisplayPrice !== null
+    ? formatPrice(marketViewDisplayPrice, pricePrecision)
+    : null;
+  const headerDisplayPrice = formattedMarketViewDisplayPrice || displayLastPrice;
   const lastGoodQuotePrice = formatPrice(contractQuote?.last_price, pricePrecision);
-  const orderBookLastPrice = expiredLastGoodQuote ? lastGoodQuotePrice : displayLastPrice;
+  const orderBookLastPrice = formattedMarketViewDisplayPrice
+    || (expiredLastGoodQuote ? lastGoodQuotePrice : displayLastPrice);
   const latestCandlePatchTime = latestCandlePatchPrice
     ? latestCandlePatchSource === 'MID_PRICE'
       ? bestDepthTimestamp || getContractQuoteTimestamp(contractQuote)
@@ -869,6 +923,38 @@ function ContractPageContent() {
   }, [contractSymbol]);
 
   useEffect(() => {
+    let alive = true;
+    let polling = false;
+
+    async function refreshMarketView() {
+      if (polling) return;
+      polling = true;
+      try {
+        const view = await getContractMarketView(contractSymbol);
+        if (!alive) return;
+        setContractMarketView(view);
+      } catch {
+        if (alive) setContractMarketView(null);
+      } finally {
+        if (alive) setContractMarketViewLoading(false);
+        polling = false;
+      }
+    }
+
+    setContractMarketView(null);
+    setContractMarketViewLoading(true);
+    void refreshMarketView();
+    const timer = window.setInterval(() => {
+      void refreshMarketView();
+    }, 2000);
+
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [contractSymbol]);
+
+  useEffect(() => {
     if (!contractPairsLoaded) return;
     const availableSymbols = new Set(contractPairs.map((item) => item.symbol));
     const requestedSymbol = urlContractSymbol;
@@ -1040,6 +1126,7 @@ function ContractPageContent() {
                         pricePrecision={pricePrecision}
                         marketStatus={contractMarketStatus}
                         marketRealtimeStatus={marketRealtimeStatus}
+                        marketView={activeContractMarketView}
                         quote={contractQuote}
                         quoteLoading={quoteStatusLoading}
                         initialDepth={initialDepth}

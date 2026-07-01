@@ -47,6 +47,40 @@ export type ContractQuoteDisplayStatus =
   | 'EXPIRED_LAST_QUOTE'
   | 'UNAVAILABLE'
 
+export type ContractMarketViewDisplayState =
+  | 'LOADING'
+  | 'LIVE_TRADABLE'
+  | 'CLOSED_LAST_GOOD_TRADABLE'
+  | 'CLOSED_LAST_GOOD_DISPLAY_ONLY'
+  | 'EXPIRED'
+  | 'UNAVAILABLE'
+  | string
+
+export type ContractMarketViewDetail = {
+  symbol: string
+  display_symbol: string
+  market_type: string
+  category: string
+  market_status: string
+  display_state: ContractMarketViewDisplayState
+  display_price?: string | number | null
+  display_price_source: string
+  best_bid?: string | number | null
+  best_ask?: string | number | null
+  spread?: string | number | null
+  executable: boolean
+  execution_bid?: string | number | null
+  execution_ask?: string | number | null
+  execution_mode: string
+  last_good_bbo_valid: boolean
+  price_age_ms?: number | null
+  quote_time?: string | null
+  last_good_at?: string | null
+  reason_code: string
+  warnings: string[]
+  raw_source_summary: Record<string, unknown>
+}
+
 const LIVE_QUOTE_SOURCES = new Set(['LIVE_WS', 'LIVE'])
 const PROVIDER_NATIVE_LIVE_QUOTE_SOURCES = new Set(['ITICK_DEPTH', 'ITICK_QUOTE'])
 const UNSAFE_QUOTE_FRESHNESSES = new Set(['STALE', 'FALLBACK', 'LAST_VALID', 'INVALID', 'CACHE_STALE'])
@@ -504,6 +538,10 @@ export function transferOutContract(amount: string): Promise<ContractTransferRes
 
 export function getContractQuote(symbol: string): Promise<ContractQuote> {
   return request<ContractQuote>(withQuery('/contract/market/quote', { symbol }))
+}
+
+export function getContractMarketView(symbol: string): Promise<ContractMarketViewDetail> {
+  return request<ContractMarketViewDetail>(withQuery('/contract/market/view', { symbol }))
 }
 
 export function getContractSymbols(params: {

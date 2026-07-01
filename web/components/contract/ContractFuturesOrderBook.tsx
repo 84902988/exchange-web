@@ -5,6 +5,7 @@ import {
   getContractQuoteDisplayStatus,
   getContractDepth,
   isExpiredLastGoodBboQuote,
+  type ContractMarketViewDetail,
   type ContractQuoteDisplayStatus,
   type ContractQuoteAvailability,
   type ContractDepthLevel,
@@ -25,6 +26,7 @@ type ContractFuturesOrderBookProps = {
   pricePrecision: number;
   marketStatus?: string | null;
   marketRealtimeStatus?: ContractMarketRealtimeStatus;
+  marketView?: ContractMarketViewDetail | null;
   quote?: ContractQuoteAvailability | null;
   quoteLoading?: boolean;
   onPriceSelect?: (price: string) => void;
@@ -88,6 +90,48 @@ function quoteStatusBadgeClass(status: ContractQuoteDisplayStatus) {
     return 'border-[#f6465d]/20 bg-[#f6465d]/10 text-[#f6465d]';
   }
   return 'border-[#f0b90b]/20 bg-[#f0b90b]/10 text-[#f0b90b]';
+}
+
+function normalizeMarketViewDisplayState(value?: string | null) {
+  const normalized = String(value || '').trim().toUpperCase();
+  return normalized || null;
+}
+
+function marketViewStateToQuoteStatus(value?: string | null): ContractQuoteDisplayStatus | null {
+  const state = normalizeMarketViewDisplayState(value);
+  if (!state) return null;
+  if (state === 'LOADING') return 'LOADING';
+  if (state === 'LIVE_TRADABLE') return 'LIVE';
+  if (state === 'CLOSED_LAST_GOOD_TRADABLE' || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return 'LAST_QUOTE';
+  if (state === 'EXPIRED') return 'EXPIRED_LAST_QUOTE';
+  if (state === 'UNAVAILABLE') return 'UNAVAILABLE';
+  return null;
+}
+
+function getDisplayOnlyLastQuoteLabel(t: (key: string, namespace?: 'contracts') => string) {
+  const label = t('lastQuoteLabel', 'contracts');
+  if (label === '最后报价') return `${label}，仅供参考`;
+  if (label === '最後報價') return `${label}，僅供參考`;
+  if (label === '最終気配') return `${label}（参考のみ）`;
+  if (label === 'Last quote') return `${label}, display only`;
+  if (label) return label;
+  return 'Last quote, display only';
+}
+
+function getMarketViewStatusLabel(value: string, t: (key: string, namespace?: 'contracts') => string) {
+  const state = normalizeMarketViewDisplayState(value);
+  if (state === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
+  if (state === 'LIVE_TRADABLE') return t('realtimeQuoteLabel', 'contracts');
+  if (state === 'CLOSED_LAST_GOOD_TRADABLE') return t('lastQuoteLabel', 'contracts');
+  if (state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return getDisplayOnlyLastQuoteLabel(t);
+  if (state === 'EXPIRED') return t('lastQuoteExpiredLabel', 'contracts');
+  return t('quoteTemporarilyUnavailableLabel', 'contracts');
+}
+
+function toPositiveDisplayPrice(value?: string | number | null) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(typeof value === 'string' ? value.replace(/,/g, '').trim() : value);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 function toNumber(value?: string | number | null) {
@@ -226,6 +270,7 @@ export default function ContractFuturesOrderBook({
   pricePrecision,
   marketStatus,
   marketRealtimeStatus = 'idle',
+  marketView,
   quote,
   quoteLoading = false,
   onPriceSelect,
@@ -487,16 +532,35 @@ export default function ContractFuturesOrderBook({
   });
   const shouldUseQuoteFallbackStatus = !hasConfirmedDepthStatus
     && quoteFallbackDisplayStatus !== 'UNAVAILABLE';
-  const depthDisplayStatus = shouldUseQuoteFallbackStatus
+  const fallbackDepthDisplayStatus = shouldUseQuoteFallbackStatus
     ? quoteFallbackDisplayStatus
     : ownDepthDisplayStatus;
-  const hasDepthQuoteStatus = depthDisplayStatus === 'LOADING'
+  const marketViewDisplayState = normalizeMarketViewDisplayState(marketView?.display_state);
+  const marketViewDisplayStatus = marketViewStateToQuoteStatus(marketViewDisplayState);
+  const depthDisplayStatus = marketViewDisplayStatus || fallbackDepthDisplayStatus;
+  const hasDepthQuoteStatus = !!marketViewDisplayStatus || depthDisplayStatus === 'LOADING'
     || hasConfirmedDepthStatus
     || shouldUseQuoteFallbackStatus;
-  const depthStatusLabel = getQuoteStatusLabel(depthDisplayStatus, t);
+  const depthStatusLabel = marketViewDisplayState && marketViewDisplayStatus
+    ? getMarketViewStatusLabel(marketViewDisplayState, t)
+    : getQuoteStatusLabel(depthDisplayStatus, t);
   const titleLabel = depthDisplayStatus === 'LAST_QUOTE' || depthDisplayStatus === 'EXPIRED_LAST_QUOTE'
     ? t('lastQuoteLabel', 'contracts')
     : t('orderBook', 'contracts');
+  const centerDisplayPrice = marketView
+    ? (
+        toPositiveDisplayPrice(marketView.display_price) !== null
+          ? formatPrice(marketView.display_price, pricePrecision)
+          : '--'
+      )
+    : lastPrice;
+  const centerSelectPrice = marketView
+    ? (
+        toPositiveDisplayPrice(marketView.display_price) !== null
+          ? String(marketView.display_price).replace(/,/g, '')
+          : null
+      )
+    : String(lastPrice).replace(/,/g, '');
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
@@ -507,7 +571,7 @@ export default function ContractFuturesOrderBook({
           </div>
           {hasDepthQuoteStatus ? (
             <div className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${quoteStatusBadgeClass(depthDisplayStatus)}`}>
-              {isExpiredLastGoodBbo ? t('lastQuoteExpiredLabel', 'contracts') : depthStatusLabel}
+              {marketViewDisplayStatus ? depthStatusLabel : isExpiredLastGoodBbo ? t('lastQuoteExpiredLabel', 'contracts') : depthStatusLabel}
             </div>
           ) : null}
         </div>
@@ -540,11 +604,13 @@ export default function ContractFuturesOrderBook({
 
           <button
             type="button"
-            disabled={!onPriceSelect || lastPrice === '--'}
-            onClick={() => onPriceSelect?.(String(lastPrice).replace(/,/g, ''))}
+            disabled={!onPriceSelect || centerDisplayPrice === '--' || !centerSelectPrice}
+            onClick={() => {
+              if (centerSelectPrice) onPriceSelect?.(centerSelectPrice);
+            }}
             className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center text-[17px] font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${priceClass}`}
           >
-            {lastPrice}
+            {centerDisplayPrice}
           </button>
 
           <div className="grid min-h-0 grid-rows-9 gap-px overflow-hidden">
