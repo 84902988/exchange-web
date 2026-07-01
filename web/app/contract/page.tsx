@@ -1185,6 +1185,7 @@ function ContractPageContent() {
                 <ContractTradingForm
                   symbol={contractSymbol}
                   quote={contractQuote}
+                  marketView={activeContractMarketView}
                   positions={openPositionsForTrading}
                   positionSummaries={positionSummaries}
                   selectedPrice={selectedPrice}
@@ -1195,7 +1196,7 @@ function ContractPageContent() {
                   maxLeverage={maxLeverage}
                   availableMargin={account?.available_margin}
                   isLoggedIn={isLoggedIn && !authLoading}
-                  disabled={!!contractAvailabilityError || !contractQuote}
+                  disabled={!!contractAvailabilityError || (!contractQuote && !activeContractMarketView)}
                   quoteLoading={quoteStatusLoading}
                   onSuccess={refreshPrivateSilently}
                   tpSlTriggerPriceType={tpSlTriggerPriceType}
