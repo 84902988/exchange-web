@@ -47,6 +47,12 @@ export type ContractQuoteDisplayStatus =
   | 'EXPIRED_LAST_QUOTE'
   | 'UNAVAILABLE'
 
+export type ContractDepthMode =
+  | 'FULL_DEPTH'
+  | 'SYNTHETIC_FROM_BBO'
+  | 'BBO_ONLY'
+  | string
+
 export type ContractMarketViewDisplayState =
   | 'LOADING'
   | 'LIVE_TRADABLE'
@@ -203,6 +209,7 @@ export type ContractDepth = {
   market_session_type?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
   quote_source?: 'LIVE' | 'LAST_GOOD_BBO' | 'LAST_VALID' | 'FALLBACK' | 'STALE' | 'INVALID' | string
+  depth_mode?: ContractDepthMode
   closed_market_execution_mode?: 'DISABLED' | 'LAST_GOOD_BBO' | string
   executable?: boolean
   is_realtime?: boolean

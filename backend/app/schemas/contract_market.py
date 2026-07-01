@@ -58,6 +58,7 @@ class ContractDepthResponse(BaseModel):
     market_session_type: Optional[str] = None
     quote_freshness: str = "FALLBACK"
     quote_source: str = "UNKNOWN"
+    depth_mode: str = "FULL_DEPTH"
     closed_market_execution_mode: str = "DISABLED"
     executable: bool = False
     is_realtime: bool = False

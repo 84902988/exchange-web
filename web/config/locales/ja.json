@@ -2113,6 +2113,7 @@
     "amount": "数量",
     "total": "合計金額",
     "latestPrice": "最新取引価格",
+    "klineLatestPrice": "Kライン最新価格",
     "orderBook": "注文帳簿",
     "tradeHistory": "取引履歴",
     "takeProfitStopLoss": "利確/損切り",

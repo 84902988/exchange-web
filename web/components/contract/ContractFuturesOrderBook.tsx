@@ -8,6 +8,7 @@ import {
   type ContractMarketViewDetail,
   type ContractQuoteDisplayStatus,
   type ContractQuoteAvailability,
+  type ContractDepthMode,
   type ContractDepthLevel,
 } from '@/lib/api/modules/contract';
 import { normalizeSide } from '@/components/spot/orderbook/orderbook.utils';
@@ -21,11 +22,23 @@ import { useLocaleContext } from '@/contexts/LocaleContext';
 
 type ContractFuturesOrderBookProps = {
   symbol: string;
-  lastPrice?: string;
   priceDirection?: 'up' | 'down' | 'flat';
   pricePrecision: number;
   marketStatus?: string | null;
   marketRealtimeStatus?: ContractMarketRealtimeStatus;
+  refreshKey?: number;
+  currentPrice?: string | number | null;
+  currentPriceReady?: boolean;
+  currentPriceSource?: 'KLINE_CLOSE' | 'TRADE';
+  currentPriceLabel?: string | null;
+  marketUiState?: {
+    label: string;
+    isLoading: boolean;
+    isTradable: boolean;
+    isRealtime: boolean;
+    reason: string;
+    status: ContractQuoteDisplayStatus;
+  };
   marketView?: ContractMarketViewDetail | null;
   quote?: ContractQuoteAvailability | null;
   quoteLoading?: boolean;
@@ -34,6 +47,7 @@ type ContractFuturesOrderBookProps = {
     bestBid: string | null;
     bestAsk: string | null;
     source?: string | null;
+    depthMode?: ContractDepthMode | null;
     ts?: string | number | null;
     bidsCount?: number;
     asksCount?: number;
@@ -45,6 +59,7 @@ type ContractFuturesOrderBookProps = {
     source?: string | null;
     quote_freshness?: string | null;
     quote_source?: string | null;
+    depth_mode?: ContractDepthMode | null;
     market_status?: string | null;
     executable?: boolean | null;
     closed_market_execution_mode?: string | null;
@@ -57,6 +72,7 @@ type ContractFuturesOrderBookProps = {
     source?: string | null;
     quote_freshness?: string | null;
     quote_source?: string | null;
+    depth_mode?: ContractDepthMode | null;
     market_status?: string | null;
     executable?: boolean | null;
     closed_market_execution_mode?: string | null;
@@ -74,11 +90,30 @@ type Row = {
 
 const FUTURES_DEPTH_LIMIT = 20;
 const UI_DISPLAY_LIMIT = 9;
+const DEPTH_INITIAL_GRACE_MS = 1800;
+const DEPTH_FULL_DEGRADE_GRACE_MS = 3000;
+
+type DepthSnapshot = {
+  asks: ContractDepthLevel[];
+  bids: ContractDepthLevel[];
+};
 
 function getQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
   if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
   if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
   return t('quoteTemporarilyUnavailableLabel', 'contracts');
+}
+
+function getDepthModeLabel(mode?: string | null) {
+  const normalized = String(mode || '').trim().toUpperCase();
+  if (normalized === 'FULL_DEPTH') return null;
+  if (normalized === 'SYNTHETIC_FROM_BBO') return '\u6a21\u62df\u76d8\u53e3';
+  if (normalized === 'BBO_ONLY') return '\u4ec5\u6700\u4f73\u4e70\u5356\u4ef7';
+  return null;
+}
+
+function normalizeDepthMode(mode?: string | null) {
+  return String(mode || '').trim().toUpperCase();
 }
 
 function quoteStatusBadgeClass(status: ContractQuoteDisplayStatus) {
@@ -132,15 +167,16 @@ function getMarketViewStatusLabel(value: string, t: (key: string, namespace?: 'c
   return t('quoteTemporarilyUnavailableLabel', 'contracts');
 }
 
-function toPositiveDisplayPrice(value?: string | number | null) {
-  if (value === undefined || value === null || value === '') return null;
-  const n = Number(typeof value === 'string' ? value.replace(/,/g, '').trim() : value);
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-
 function toNumber(value?: string | number | null) {
   const n = Number(value);
   return Number.isFinite(n) ? n : 0;
+}
+
+function toPositivePrice(value?: string | number | null) {
+  if (value === undefined || value === null || value === '') return null;
+  const normalized = typeof value === 'string' ? value.replace(/,/g, '').trim() : value;
+  const price = Number(normalized);
+  return Number.isFinite(price) && price > 0 ? price : null;
 }
 
 function normalizeContractSymbol(value?: string | null) {
@@ -226,6 +262,11 @@ function extractRealtimeDepth(
     asks: normalizeSide(asks, 'asks', FUTURES_DEPTH_LIMIT),
     bids: normalizeSide(bids, 'bids', FUTURES_DEPTH_LIMIT),
     source: typeof payload.source === 'string' ? payload.source : null,
+    depthMode: typeof payload.depth_mode === 'string'
+      ? payload.depth_mode
+      : typeof payload.depthMode === 'string'
+        ? payload.depthMode
+        : null,
     quoteSource: typeof payload.quote_source === 'string' ? payload.quote_source : null,
     quoteFreshness: typeof payload.quote_freshness === 'string'
       ? payload.quote_freshness
@@ -269,11 +310,16 @@ function maxPrice(levels: ContractDepthLevel[]) {
 
 export default function ContractFuturesOrderBook({
   symbol,
-  lastPrice = '--',
   priceDirection = 'flat',
   pricePrecision,
   marketStatus,
   marketRealtimeStatus = 'idle',
+  refreshKey = 0,
+  currentPrice,
+  currentPriceReady = false,
+  currentPriceSource = 'KLINE_CLOSE',
+  currentPriceLabel,
+  marketUiState,
   marketView,
   quote,
   quoteLoading = false,
@@ -288,6 +334,7 @@ export default function ContractFuturesOrderBook({
   const [asks, setAsks] = useState<ContractDepthLevel[]>([]);
   const [bids, setBids] = useState<ContractDepthLevel[]>([]);
   const [source, setSource] = useState<string | null>(null);
+  const [depthMode, setDepthMode] = useState<ContractDepthMode | null>(null);
   const [depthMarketStatus, setDepthMarketStatus] = useState<string | null>(null);
   const [depthExecutable, setDepthExecutable] = useState<boolean | null>(null);
   const [depthQuoteSource, setDepthQuoteSource] = useState<string | null>(null);
@@ -295,6 +342,8 @@ export default function ContractFuturesOrderBook({
   const [depthTs, setDepthTs] = useState<string | number | null>(null);
   const [depthClosedMarketExecutionMode, setDepthClosedMarketExecutionMode] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [fallbackDepthAllowed, setFallbackDepthAllowed] = useState(false);
+  const [lastFullDepthSnapshot, setLastFullDepthSnapshot] = useState<DepthSnapshot | null>(null);
   const initialDepthRef = useRef(initialDepth);
   const onDepthDataChangeRef = useRef(onDepthDataChange);
   const depthBelongsToCurrentSymbol = depthSymbol === normalizedSymbol;
@@ -307,6 +356,7 @@ export default function ContractFuturesOrderBook({
     [bids, depthBelongsToCurrentSymbol],
   );
   const activeSource = depthBelongsToCurrentSymbol ? source : null;
+  const activeDepthMode = depthBelongsToCurrentSymbol ? depthMode : null;
   const activeDepthMarketStatus = depthBelongsToCurrentSymbol ? depthMarketStatus : null;
   const activeDepthExecutable = depthBelongsToCurrentSymbol ? depthExecutable : null;
   const activeDepthQuoteSource = depthBelongsToCurrentSymbol ? depthQuoteSource : null;
@@ -321,6 +371,7 @@ export default function ContractFuturesOrderBook({
   const effectiveMarketStatus = isClosedMarketStatus
     ? 'CLOSED'
     : marketStatus || activeDepthMarketStatus || null;
+  const normalizedActiveDepthMode = normalizeDepthMode(activeDepthMode);
 
   useEffect(() => {
     initialDepthRef.current = initialDepth;
@@ -329,6 +380,32 @@ export default function ContractFuturesOrderBook({
   useEffect(() => {
     onDepthDataChangeRef.current = onDepthDataChange;
   }, [onDepthDataChange]);
+
+  useEffect(() => {
+    setFallbackDepthAllowed(false);
+    setLastFullDepthSnapshot(null);
+    const timer = window.setTimeout(() => {
+      setFallbackDepthAllowed(true);
+    }, DEPTH_INITIAL_GRACE_MS);
+    return () => window.clearTimeout(timer);
+  }, [normalizedSymbol, refreshKey]);
+
+  useEffect(() => {
+    if (normalizedActiveDepthMode !== 'FULL_DEPTH') return;
+    if (!activeAsks.length || !activeBids.length) return;
+    setLastFullDepthSnapshot({
+      asks: activeAsks,
+      bids: activeBids,
+    });
+  }, [activeAsks, activeBids, normalizedActiveDepthMode]);
+
+  useEffect(() => {
+    if (normalizedActiveDepthMode === 'FULL_DEPTH' || !lastFullDepthSnapshot) return undefined;
+    const timer = window.setTimeout(() => {
+      setLastFullDepthSnapshot(null);
+    }, DEPTH_FULL_DEGRADE_GRACE_MS);
+    return () => window.clearTimeout(timer);
+  }, [lastFullDepthSnapshot, normalizedActiveDepthMode]);
 
   useEffect(() => {
     let alive = true;
@@ -346,6 +423,7 @@ export default function ContractFuturesOrderBook({
         setAsks(nextAsks);
         setBids(nextBids);
         setSource(depth.source);
+        setDepthMode(depth.depth_mode || null);
         setDepthMarketStatus(depth.market_status || null);
         setDepthExecutable(depth.executable ?? null);
         setDepthQuoteSource(depth.quote_source || depth.source || null);
@@ -357,6 +435,7 @@ export default function ContractFuturesOrderBook({
           asks: nextAsks,
           bids: nextBids,
           source: depth.source,
+          depth_mode: depth.depth_mode || null,
           quote_freshness: depth.quote_freshness || null,
           quote_source: depth.quote_source || depth.source || null,
           market_status: depth.market_status || null,
@@ -384,6 +463,7 @@ export default function ContractFuturesOrderBook({
       setAsks(cachedAsks);
       setBids(cachedBids);
       setSource(cachedDepth?.source || null);
+      setDepthMode(cachedDepth?.depth_mode || null);
       setDepthMarketStatus(cachedDepth?.market_status || null);
       setDepthExecutable(cachedDepth?.executable ?? null);
       setDepthQuoteSource(cachedDepth?.quote_source || cachedDepth?.source || null);
@@ -396,6 +476,7 @@ export default function ContractFuturesOrderBook({
       setAsks([]);
       setBids([]);
       setSource(null);
+      setDepthMode(null);
       setDepthMarketStatus(null);
       setDepthExecutable(null);
       setDepthQuoteSource(null);
@@ -418,7 +499,7 @@ export default function ContractFuturesOrderBook({
       alive = false;
       window.clearInterval(timer);
     };
-  }, [marketRealtimeStatus, normalizedSymbol, symbol]);
+  }, [marketRealtimeStatus, normalizedSymbol, refreshKey, symbol]);
 
   useEffect(() => {
     const handleDepthMessage = (message: ContractMarketRealtimeMessage) => {
@@ -431,6 +512,7 @@ export default function ContractFuturesOrderBook({
       setAsks(depth.asks);
       setBids(depth.bids);
       setSource(depth.source);
+      setDepthMode(depth.depthMode || null);
       setDepthMarketStatus(depth.marketStatus);
       setDepthExecutable(depth.executable);
       setDepthQuoteSource(depth.quoteSource || depth.source);
@@ -443,6 +525,7 @@ export default function ContractFuturesOrderBook({
         asks: depth.asks,
         bids: depth.bids,
         source: depth.source,
+        depth_mode: depth.depthMode || null,
         quote_freshness: depth.quoteFreshness,
         quote_source: depth.quoteSource || depth.source,
         market_status: depth.marketStatus,
@@ -462,16 +545,18 @@ export default function ContractFuturesOrderBook({
       bestBid: maxPrice(activeBids),
       source: activeSource,
       ts: activeDepthTs,
+      depthMode: activeDepthMode,
       bidsCount: activeBids.length,
       asksCount: activeAsks.length,
     }),
-    [activeAsks, activeBids, activeDepthTs, activeSource],
+    [activeAsks, activeBids, activeDepthMode, activeDepthTs, activeSource],
   );
   const lastBestPricesRef = useRef<{
     bestBid: string | null;
     bestAsk: string | null;
     source?: string | null;
     ts?: string | number | null;
+    depthMode?: ContractDepthMode | null;
     bidsCount?: number;
     asksCount?: number;
   }>({
@@ -479,6 +564,7 @@ export default function ContractFuturesOrderBook({
     bestAsk: null,
     source: null,
     ts: null,
+    depthMode: null,
     bidsCount: 0,
     asksCount: 0,
   });
@@ -490,6 +576,7 @@ export default function ContractFuturesOrderBook({
       previous.bestAsk === bestPrices.bestAsk &&
       previous.source === bestPrices.source &&
       previous.ts === bestPrices.ts &&
+      previous.depthMode === bestPrices.depthMode &&
       previous.bidsCount === bestPrices.bidsCount &&
       previous.asksCount === bestPrices.asksCount
     ) return;
@@ -497,14 +584,47 @@ export default function ContractFuturesOrderBook({
     onBestPricesChange?.(bestPrices);
   }, [bestPrices, onBestPricesChange]);
 
+  const hasRawDepthRows = activeAsks.length > 0 || activeBids.length > 0;
+  const hasFullDepth = normalizedActiveDepthMode === 'FULL_DEPTH';
+  const shouldHoldPreviousFullDepth = !hasFullDepth && !!lastFullDepthSnapshot;
+  const shouldDelayFallbackDepth = hasRawDepthRows
+    && !hasFullDepth
+    && !fallbackDepthAllowed
+    && !shouldHoldPreviousFullDepth;
+  const displayAsks = useMemo(() => {
+    if (hasFullDepth) return activeAsks;
+    if (shouldHoldPreviousFullDepth) return lastFullDepthSnapshot?.asks || [];
+    if (fallbackDepthAllowed) return activeAsks;
+    return [];
+  }, [activeAsks, fallbackDepthAllowed, hasFullDepth, lastFullDepthSnapshot, shouldHoldPreviousFullDepth]);
+  const displayBids = useMemo(() => {
+    if (hasFullDepth) return activeBids;
+    if (shouldHoldPreviousFullDepth) return lastFullDepthSnapshot?.bids || [];
+    if (fallbackDepthAllowed) return activeBids;
+    return [];
+  }, [activeBids, fallbackDepthAllowed, hasFullDepth, lastFullDepthSnapshot, shouldHoldPreviousFullDepth]);
+  const displayDepthMode = hasFullDepth
+    ? activeDepthMode
+    : shouldHoldPreviousFullDepth
+      ? 'FULL_DEPTH'
+      : fallbackDepthAllowed
+        ? activeDepthMode
+        : null;
+  const normalizedDisplayDepthMode = normalizeDepthMode(displayDepthMode);
+  const orderBookLoading = activeLoading || shouldDelayFallbackDepth;
+
   const askRows = useMemo(() => {
-    const visibleAsks = sortLevelsByPrice(activeAsks, 'asc').slice(0, UI_DISPLAY_LIMIT);
+    const limit = normalizedDisplayDepthMode === 'BBO_ONLY' ? 1 : UI_DISPLAY_LIMIT;
+    const visibleAsks = sortLevelsByPrice(displayAsks, 'asc').slice(0, limit);
     return buildRows(visibleAsks).reverse();
-  }, [activeAsks]);
+  }, [displayAsks, normalizedDisplayDepthMode]);
   const bidRows = useMemo(() => {
-    const visibleBids = sortLevelsByPrice(activeBids, 'desc').slice(0, UI_DISPLAY_LIMIT);
+    const limit = normalizedDisplayDepthMode === 'BBO_ONLY' ? 1 : UI_DISPLAY_LIMIT;
+    const visibleBids = sortLevelsByPrice(displayBids, 'desc').slice(0, limit);
     return buildRows(visibleBids);
-  }, [activeBids]);
+  }, [displayBids, normalizedDisplayDepthMode]);
+  const currentPriceNumber = toPositivePrice(currentPrice);
+  const hasCurrentPrice = currentPriceReady && currentPriceNumber !== null;
   const priceClass =
     priceDirection === 'up'
       ? 'text-[#00c087]'
@@ -541,28 +661,33 @@ export default function ContractFuturesOrderBook({
     : ownDepthDisplayStatus;
   const marketViewDisplayState = normalizeMarketViewDisplayState(marketView?.display_state);
   const marketViewDisplayStatus = marketViewStateToQuoteStatus(marketViewDisplayState);
-  const depthDisplayStatus = marketViewDisplayStatus || fallbackDepthDisplayStatus;
-  const hasDepthQuoteStatus = !!marketViewDisplayStatus || depthDisplayStatus === 'LOADING'
+  const depthDisplayStatus = marketUiState?.status || (
+    hasCurrentPrice
+      ? (marketViewDisplayStatus || fallbackDepthDisplayStatus)
+      : 'LOADING'
+  );
+  const hasDepthQuoteStatus = !!marketUiState || !hasCurrentPrice || !!marketViewDisplayStatus || depthDisplayStatus === 'LOADING'
     || hasConfirmedDepthStatus
     || shouldUseQuoteFallbackStatus;
-  const depthStatusLabel = marketViewDisplayState && marketViewDisplayStatus
+  const depthStatusLabel = marketUiState?.label || (!hasCurrentPrice
+    ? t('marketDataLoadingLabel', 'contracts')
+    : marketViewDisplayState && marketViewDisplayStatus
     ? getMarketViewStatusLabel(marketViewDisplayState, t)
-    : getQuoteStatusLabel(depthDisplayStatus, t);
+    : getQuoteStatusLabel(depthDisplayStatus, t));
   const titleLabel = t('orderBook', 'contracts');
-  const centerDisplayPrice = marketView
-    ? (
-        toPositiveDisplayPrice(marketView.display_price) !== null
-          ? formatPrice(marketView.display_price, pricePrecision)
-          : '--'
-      )
-    : lastPrice;
-  const centerSelectPrice = marketView
-    ? (
-        toPositiveDisplayPrice(marketView.display_price) !== null
-          ? String(marketView.display_price).replace(/,/g, '')
-          : null
-      )
-    : String(lastPrice).replace(/,/g, '');
+  const depthModeLabel = getDepthModeLabel(displayDepthMode);
+  const centerDisplayPrice = !hasCurrentPrice || currentPriceNumber === null
+    ? '--'
+    : formatPrice(currentPriceNumber, pricePrecision);
+  const centerSelectPrice = !hasCurrentPrice || currentPriceNumber === null
+    ? null
+    : String(currentPriceNumber);
+  const normalizedCurrentPriceSource = currentPriceSource === 'TRADE' ? 'TRADE' : 'KLINE_CLOSE';
+  const centerLabel = currentPriceLabel || (
+    normalizedCurrentPriceSource === 'TRADE'
+      ? t('latestPrice', 'contracts')
+      : t('klineLatestPrice', 'contracts')
+  );
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
@@ -574,6 +699,11 @@ export default function ContractFuturesOrderBook({
           {hasDepthQuoteStatus ? (
             <div className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${quoteStatusBadgeClass(depthDisplayStatus)}`}>
               {depthStatusLabel}
+            </div>
+          ) : null}
+          {depthModeLabel ? (
+            <div className="shrink-0 whitespace-nowrap rounded-full border border-[#f0b90b]/25 bg-[#f0b90b]/10 px-2 py-0.5 text-[10px] font-semibold text-[#f0b90b]">
+              {depthModeLabel}
             </div>
           ) : null}
         </div>
@@ -588,7 +718,7 @@ export default function ContractFuturesOrderBook({
         <div className="text-right">{t('total', 'contracts')}</div>
       </div>
 
-      {activeLoading && askRows.length === 0 && bidRows.length === 0 ? (
+      {orderBookLoading && askRows.length === 0 && bidRows.length === 0 ? (
         <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-white/40">
           {t('loading', 'common')}
         </div>
@@ -606,13 +736,17 @@ export default function ContractFuturesOrderBook({
 
           <button
             type="button"
+            aria-label={centerLabel}
+            title={centerLabel}
             disabled={!onPriceSelect || centerDisplayPrice === '--' || !centerSelectPrice}
             onClick={() => {
               if (centerSelectPrice) onPriceSelect?.(centerSelectPrice);
             }}
-            className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center text-[17px] font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${priceClass}`}
+            data-price-source={normalizedCurrentPriceSource}
+            className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${priceClass}`}
           >
-            {centerDisplayPrice}
+            <span className="mb-1 block text-[10px] font-medium leading-none text-white/42">{centerLabel}</span>
+            <span className="block text-[17px] leading-none">{centerDisplayPrice}</span>
           </button>
 
           <div className="grid min-h-0 grid-rows-9 gap-px overflow-hidden">

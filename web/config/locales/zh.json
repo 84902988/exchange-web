@@ -2247,6 +2247,7 @@
     "amount": "数量",
     "total": "总金额",
     "latestPrice": "最新成交价",
+    "klineLatestPrice": "K线最新价",
     "orderBook": "订单",
     "tradeHistory": "成交记录",
     "takeProfitStopLoss": "止盈止损",

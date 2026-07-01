@@ -2247,6 +2247,7 @@
     "amount": "Amount",
     "total": "Total",
     "latestPrice": "Latest Price",
+    "klineLatestPrice": "Kline Latest Price",
     "orderBook": "Order Book",
     "tradeHistory": "Trade History",
     "takeProfitStopLoss": "Take Profit/Stop Loss",
