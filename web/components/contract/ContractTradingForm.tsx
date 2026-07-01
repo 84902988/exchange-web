@@ -7,6 +7,7 @@ import {
   getContractQuoteDisplayStatus,
   isExpiredLastGoodBboQuote,
   openContractOrder,
+  type ContractMarketViewDetail,
   type ContractQuoteDisplayStatus,
   type ContractOrderType,
   type ContractPositionItem,
@@ -32,7 +33,13 @@ type FormFeedback = {
   type: 'success' | 'error' | 'info';
   message: string;
 };
-type QuoteUnavailableReason = 'EXPIRED_LAST_GOOD_BBO' | 'GENERIC_UNAVAILABLE' | null;
+type QuoteUnavailableReason =
+  | 'EXPIRED_LAST_GOOD_BBO'
+  | 'MARKET_VIEW_EXPIRED'
+  | 'MARKET_VIEW_DISPLAY_ONLY'
+  | 'MARKET_VIEW_UNAVAILABLE'
+  | 'GENERIC_UNAVAILABLE'
+  | null;
 type PendingContractOrder = {
   action: 'OPEN' | 'CLOSE';
   side: ContractPositionSide;
@@ -41,6 +48,7 @@ type PendingContractOrder = {
 type ContractTradingFormProps = {
   symbol: string;
   quote: ContractQuote | null;
+  marketView?: ContractMarketViewDetail | null;
   positions?: ContractPositionItem[];
   positionSummaries?: ContractPositionSummaryItem[];
   selectedPrice?: string | null;
@@ -140,6 +148,38 @@ function pickMarketReferencePrice(depthPrice: number, quotePrice: number, anchor
   return 0;
 }
 
+function normalizeMarketViewDisplayState(value?: string | null) {
+  const normalized = String(value || '').trim().toUpperCase();
+  return normalized || null;
+}
+
+function marketViewStateToQuoteStatus(value?: string | null): ContractQuoteDisplayStatus {
+  const state = normalizeMarketViewDisplayState(value);
+  if (state === 'LOADING') return 'LOADING';
+  if (state === 'LIVE_TRADABLE') return 'LIVE';
+  if (state === 'CLOSED_LAST_GOOD_TRADABLE' || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return 'LAST_QUOTE';
+  if (state === 'EXPIRED') return 'EXPIRED_LAST_QUOTE';
+  return 'UNAVAILABLE';
+}
+
+function getMarketViewUnavailableReason(marketView?: ContractMarketViewDetail | null): QuoteUnavailableReason {
+  if (!marketView || marketView.executable !== false) return null;
+  const state = normalizeMarketViewDisplayState(marketView.display_state);
+  if (state === 'EXPIRED') return 'MARKET_VIEW_EXPIRED';
+  if (state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return 'MARKET_VIEW_DISPLAY_ONLY';
+  return 'MARKET_VIEW_UNAVAILABLE';
+}
+
+function getMarketViewExecutionPrice(
+  marketView: ContractMarketViewDetail | null | undefined,
+  side: 'buy' | 'sell',
+) {
+  if (!marketView) return 0;
+  const value = side === 'buy' ? marketView.execution_ask : marketView.execution_bid;
+  const price = toNumber(value);
+  return price > 0 ? price : 0;
+}
+
 function sideText(side: ContractPositionSide, t: ContractTranslator) {
   return side === 'LONG' ? t('longPosition', 'contracts') : t('shortPosition', 'contracts');
 }
@@ -174,6 +214,7 @@ function getSummaryLiquidationPrice(summary: ContractPositionSummaryItem | null,
 export default function ContractTradingForm({
   symbol,
   quote,
+  marketView,
   positions = [],
   positionSummaries = [],
   selectedPrice,
@@ -286,27 +327,39 @@ export default function ContractTradingForm({
     : quoteMarkPrice || quoteLastPrice;
   const normalizedQuoteMarketStatus = String(quote?.market_status || '').trim().toUpperCase();
   const isClosedMarketQuote = normalizedQuoteMarketStatus === 'CLOSED' || normalizedQuoteMarketStatus === 'HOLIDAY';
-  const quoteUnavailable = quote?.executable === false;
-  const quoteStatusLoading = quoteLoading && (!quote || quoteUnavailable);
-  const quoteDisplayStatus = getContractQuoteDisplayStatus(quote, { loading: quoteStatusLoading });
-  const quoteUnavailableReason: QuoteUnavailableReason = isExpiredLastGoodBboQuote(quote)
-    ? 'EXPIRED_LAST_GOOD_BBO'
-    : quoteUnavailable && !quoteStatusLoading
-      ? 'GENERIC_UNAVAILABLE'
-      : null;
+  const hasMarketView = !!marketView;
+  const marketViewDisplayState = normalizeMarketViewDisplayState(marketView?.display_state);
+  const marketViewBidReferencePrice = getMarketViewExecutionPrice(marketView, 'sell');
+  const marketViewAskReferencePrice = getMarketViewExecutionPrice(marketView, 'buy');
+  const quoteUnavailable = hasMarketView ? marketView?.executable === false : quote?.executable === false;
+  const quoteStatusLoading = hasMarketView ? marketViewDisplayState === 'LOADING' : quoteLoading && (!quote || quoteUnavailable);
+  const quoteDisplayStatus = hasMarketView
+    ? marketViewStateToQuoteStatus(marketViewDisplayState)
+    : getContractQuoteDisplayStatus(quote, { loading: quoteStatusLoading });
+  const quoteUnavailableReason: QuoteUnavailableReason = hasMarketView
+    ? getMarketViewUnavailableReason(marketView)
+    : isExpiredLastGoodBboQuote(quote)
+      ? 'EXPIRED_LAST_GOOD_BBO'
+      : quoteUnavailable && !quoteStatusLoading
+        ? 'GENERIC_UNAVAILABLE'
+        : null;
   const quoteLoadingFeedback = quoteStatusLoading ? t('marketDataLoadingLabel', 'contracts') : null;
   const quoteUnavailableFeedback = quoteUnavailableReason === 'EXPIRED_LAST_GOOD_BBO'
     ? t('lastGoodBboExpiredTradingHint', 'contracts')
+    : quoteUnavailableReason === 'MARKET_VIEW_EXPIRED'
+      ? t('lastGoodBboExpiredTradingHint', 'contracts')
+    : quoteUnavailableReason === 'MARKET_VIEW_DISPLAY_ONLY'
+      ? `${t('lastQuoteLabel', 'contracts')} - ${t('quoteUnavailableTradingHint', 'contracts')}`
     : quoteUnavailableReason === 'GENERIC_UNAVAILABLE'
+      || quoteUnavailableReason === 'MARKET_VIEW_UNAVAILABLE'
       ? t('quoteUnavailableTradingHint', 'contracts')
       : null;
-  const displayFeedback = quoteLoadingFeedback
-    ? { type: 'info' as const, message: quoteLoadingFeedback }
-    : quoteUnavailableFeedback
-    ? { type: 'error' as const, message: quoteUnavailableFeedback }
-    : feedback;
   const quoteStatusHint = quoteStatusLoading
     ? getQuoteStatusLabel(quoteDisplayStatus, t)
+    : hasMarketView
+    ? quoteUnavailable
+      ? null
+      : getQuoteStatusLabel(quoteDisplayStatus, t)
     : quote
     ? quoteUnavailable
       ? null
@@ -323,12 +376,16 @@ export default function ContractTradingForm({
       : 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]';
 
   const bidReferencePrice = useMemo(() => (
-    pickMarketReferencePrice(toNumber(bestBid), quoteBidPrice, quoteAnchorPrice)
-  ), [bestBid, quoteAnchorPrice, quoteBidPrice]);
+    hasMarketView
+      ? marketViewBidReferencePrice
+      : pickMarketReferencePrice(toNumber(bestBid), quoteBidPrice, quoteAnchorPrice)
+  ), [bestBid, hasMarketView, marketViewBidReferencePrice, quoteAnchorPrice, quoteBidPrice]);
 
   const askReferencePrice = useMemo(() => (
-    pickMarketReferencePrice(toNumber(bestAsk), quoteAskPrice, quoteAnchorPrice)
-  ), [bestAsk, quoteAnchorPrice, quoteAskPrice]);
+    hasMarketView
+      ? marketViewAskReferencePrice
+      : pickMarketReferencePrice(toNumber(bestAsk), quoteAskPrice, quoteAnchorPrice)
+  ), [bestAsk, hasMarketView, marketViewAskReferencePrice, quoteAnchorPrice, quoteAskPrice]);
 
   const marketPrice = useMemo(() => {
     if (tradeTab === 'CLOSE') {
@@ -389,6 +446,17 @@ export default function ContractTradingForm({
     positionSide,
     tradeTab,
   ]);
+  const marketOrderExecutionPriceMissing = hasMarketView && orderType === 'MARKET' && marketPrice <= 0;
+  const marketOrderExecutionPriceFeedback = marketOrderExecutionPriceMissing
+    ? t('marketDataUnavailable', 'contracts')
+    : null;
+  const displayFeedback = quoteLoadingFeedback
+    ? { type: 'info' as const, message: quoteLoadingFeedback }
+    : quoteUnavailableFeedback
+    ? { type: 'error' as const, message: quoteUnavailableFeedback }
+    : marketOrderExecutionPriceFeedback
+    ? { type: 'error' as const, message: marketOrderExecutionPriceFeedback }
+    : feedback;
 
   const spreadHintText = t('spreadCostHelp', 'contracts');
   const normalizedTpSlTriggerPriceType = normalizeTpSlTriggerPriceType(tpSlTriggerPriceType);
@@ -431,7 +499,12 @@ export default function ContractTradingForm({
       : (entry - closePrice) * qty;
   }, [closeQuantity, closeSide, estimatedExecutionPrice, selectedCloseEntryPrice, selectedClosePosition, selectedCloseQuantity, selectedCloseSummary]);
 
-  const submitDisabled = disabled || submitting || !isLoggedIn || quoteStatusLoading || quoteUnavailable;
+  const submitDisabled = disabled
+    || submitting
+    || !isLoggedIn
+    || quoteStatusLoading
+    || quoteUnavailable
+    || marketOrderExecutionPriceMissing;
   const openSubmitDisabled = submitDisabled || availableMarginNumber <= 0;
   const closeDisabled = submitDisabled || (!selectedCloseSummary && !selectedClosePosition);
 
@@ -535,11 +608,15 @@ export default function ContractTradingForm({
     if (availableMarginNumber <= 0) return t('transferMarginFirst', 'contracts');
     if (quoteStatusLoading) return t('marketDataLoadingLabel', 'contracts');
     if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
+    if (orderType === 'MARKET') {
+      const executionPrice = side === 'LONG' ? askReferencePrice : bidReferencePrice;
+      if (executionPrice <= 0) return t('marketDataUnavailable', 'contracts');
+    }
     if (!quantity.trim()) return t('enterQuantity', 'contracts');
     if (toNumber(quantity) <= 0) return t('enterValidOpenQuantity', 'contracts');
     if (leverage <= 0) return t('enterValidLeverage', 'contracts');
     if (orderType === 'LIMIT' && toNumber(price) <= 0) return t('enterValidLimitPrice', 'contracts');
-    if (!quote && orderType === 'MARKET') return t('marketDataUnavailable', 'contracts');
+    if (!hasMarketView && !quote && orderType === 'MARKET') return t('marketDataUnavailable', 'contracts');
     if (leverage > effectiveMaxLeverage) {
       return `${t('maxLeverageSupportedPrefix', 'contracts')} ${effectiveMaxLeverage}x ${t('maxLeverageSupportedSuffix', 'contracts')}`;
     }
@@ -553,6 +630,10 @@ export default function ContractTradingForm({
     if (!selectedCloseSummary && !position) return t('noClosablePosition', 'contracts');
     if (quoteStatusLoading) return t('marketDataLoadingLabel', 'contracts');
     if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
+    if (orderType === 'MARKET') {
+      const executionPrice = closeSide === 'LONG' ? bidReferencePrice : askReferencePrice;
+      if (executionPrice <= 0) return t('marketDataUnavailable', 'contracts');
+    }
     const qty = toNumber(closeQuantity || maxQuantity);
     if (qty <= 0) return t('enterValidCloseQuantity', 'contracts');
     if (qty > toNumber(maxQuantity)) return t('closeQuantityExceedsMax', 'contracts');
