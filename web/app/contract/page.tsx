@@ -402,8 +402,6 @@ function getTickerChangePercent(ticker: ContractTickerItem | null) {
 function getContractQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
   if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
   if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
-  if (status === 'LAST_QUOTE') return t('lastQuoteLabel', 'contracts');
-  if (status === 'EXPIRED_LAST_QUOTE') return t('lastQuoteExpiredLabel', 'contracts');
   return t('quoteTemporarilyUnavailableLabel', 'contracts');
 }
 
@@ -425,29 +423,35 @@ function marketViewStateToQuoteStatus(value?: string | null): ContractQuoteDispl
   if (!state) return null;
   if (state === 'LOADING') return 'LOADING';
   if (state === 'LIVE_TRADABLE') return 'LIVE';
-  if (state === 'CLOSED_LAST_GOOD_TRADABLE' || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return 'LAST_QUOTE';
-  if (state === 'EXPIRED') return 'EXPIRED_LAST_QUOTE';
-  if (state === 'UNAVAILABLE') return 'UNAVAILABLE';
+  if (
+    state === 'PRE_MARKET'
+    || state === 'AFTER_HOURS'
+    || state === 'CLOSED'
+    || state === 'MARKET_CLOSED'
+    || state === 'HOLIDAY'
+    || state === 'CLOSED_LAST_GOOD_TRADABLE'
+    || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY'
+    || state === 'EXPIRED'
+    || state === 'UNAVAILABLE'
+  ) return 'UNAVAILABLE';
   return null;
 }
 
-function getDisplayOnlyLastQuoteLabel(t: (key: string, namespace?: 'contracts') => string) {
-  const label = t('lastQuoteLabel', 'contracts');
-  if (label === '最后报价') return `${label}，仅供参考`;
-  if (label === '最後報價') return `${label}，僅供參考`;
-  if (label === '最終気配') return `${label}（参考のみ）`;
-  if (label === 'Last quote') return `${label}, display only`;
-  if (label) return label;
-  return 'Last quote, display only';
+function getNonTradingMarketViewStatusLabel(value: string) {
+  const state = normalizeMarketViewDisplayState(value);
+  if (state === 'PRE_MARKET') return '盘前';
+  if (state === 'AFTER_HOURS') return '盘后';
+  if (state === 'CLOSED' || state === 'MARKET_CLOSED') return '闭市中';
+  if (state === 'HOLIDAY') return '休市中';
+  return null;
 }
 
 function getMarketViewStatusLabel(value: string, t: (key: string, namespace?: 'contracts') => string) {
   const state = normalizeMarketViewDisplayState(value);
   if (state === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
   if (state === 'LIVE_TRADABLE') return t('realtimeQuoteLabel', 'contracts');
-  if (state === 'CLOSED_LAST_GOOD_TRADABLE') return t('lastQuoteLabel', 'contracts');
-  if (state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return getDisplayOnlyLastQuoteLabel(t);
-  if (state === 'EXPIRED') return t('lastQuoteExpiredLabel', 'contracts');
+  const nonTradingLabel = getNonTradingMarketViewStatusLabel(value);
+  if (nonTradingLabel) return nonTradingLabel;
   return t('quoteTemporarilyUnavailableLabel', 'contracts');
 }
 
@@ -711,11 +715,13 @@ function ContractPageContent() {
   });
   const displayContractPrice = trustedContractDisplayPrice.price;
   const currentPriceLineSource = trustedContractDisplayPrice.source;
-  const canShowCurrentPriceLine = expiredLastGoodQuote
-    ? false
-    : isCryptoContract
-      ? !contractQuoteIsStale && contractQuote?.executable !== false
-      : contractQuoteDisplayStatus === 'LIVE';
+  const canShowCurrentPriceLine = marketViewDisplayState
+    ? marketViewDisplayState === 'LIVE_TRADABLE'
+    : expiredLastGoodQuote
+      ? false
+      : isCryptoContract
+        ? !contractQuoteIsStale && contractQuote?.executable !== false
+        : contractQuoteDisplayStatus === 'LIVE';
   const chartCurrentPrice = canShowCurrentPriceLine ? displayContractPrice : null;
   const latestCandlePatchPrice = isCryptoContract && canShowCurrentPriceLine
     ? displayContractPrice
@@ -728,10 +734,21 @@ function ContractPageContent() {
   const formattedMarketViewDisplayPrice = marketViewDisplayPrice !== null
     ? formatPrice(marketViewDisplayPrice, pricePrecision)
     : null;
-  const headerDisplayPrice = formattedMarketViewDisplayPrice || displayLastPrice;
+  const chartReferencePriceLineEnabled = marketViewDisplayState === 'LIVE_TRADABLE'
+    && activeContractMarketView?.display_price_source !== 'KLINE_CLOSE';
+  const chartReferencePriceLinePrice = chartReferencePriceLineEnabled
+    ? marketViewDisplayPrice
+    : null;
+  const chartReferencePriceLineLabel = chartReferencePriceLineEnabled && marketViewDisplayState
+    ? getMarketViewStatusLabel(marketViewDisplayState, t)
+    : null;
+  const headerDisplayPrice = activeContractMarketView
+    ? formattedMarketViewDisplayPrice || '--'
+    : displayLastPrice;
   const lastGoodQuotePrice = formatPrice(contractQuote?.last_price, pricePrecision);
-  const orderBookLastPrice = formattedMarketViewDisplayPrice
-    || (expiredLastGoodQuote ? lastGoodQuotePrice : displayLastPrice);
+  const orderBookLastPrice = activeContractMarketView
+    ? formattedMarketViewDisplayPrice || '--'
+    : (expiredLastGoodQuote ? lastGoodQuotePrice : displayLastPrice);
   const latestCandlePatchTime = latestCandlePatchPrice
     ? latestCandlePatchSource === 'MID_PRICE'
       ? bestDepthTimestamp || getContractQuoteTimestamp(contractQuote)
@@ -765,13 +782,13 @@ function ContractPageContent() {
       return [
         { label: t('latestPrice', 'contracts'), value: headerDisplayPrice },
         {
-          label: t('expiredLastGoodQuoteLabel', 'contracts'),
+          label: t('markLatest', 'contracts'),
           value: lastGoodQuotePrice,
           subValue: quoteStatusLabel,
         },
         { label: t('spread', 'contracts'), value: spread },
         {
-          label: t('lastQuoteLabel', 'contracts'),
+          label: t('bestBidAsk', 'contracts'),
           value: bidAsk,
           subValue: quoteStatusLabel,
         },
@@ -1070,6 +1087,9 @@ function ContractPageContent() {
                       marketStatus={contractMarketStatus}
                       pricePrecision={pricePrecision}
                       currentPriceLinePrice={chartCurrentPrice}
+                      referencePriceLineEnabled={chartReferencePriceLineEnabled}
+                      referencePriceLinePrice={chartReferencePriceLinePrice}
+                      referencePriceLineLabel={chartReferencePriceLineLabel}
                       latestCandlePatchPrice={latestCandlePatchPrice}
                       latestPriceTimestamp={latestCandlePatchTime}
                       allowLatestPriceCandlePatch={allowLatestPriceCandlePatch}

@@ -78,8 +78,6 @@ const UI_DISPLAY_LIMIT = 9;
 function getQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
   if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
   if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
-  if (status === 'LAST_QUOTE') return t('lastQuoteLabel', 'contracts');
-  if (status === 'EXPIRED_LAST_QUOTE') return t('lastQuoteExpiredLabel', 'contracts');
   return t('quoteTemporarilyUnavailableLabel', 'contracts');
 }
 
@@ -102,29 +100,35 @@ function marketViewStateToQuoteStatus(value?: string | null): ContractQuoteDispl
   if (!state) return null;
   if (state === 'LOADING') return 'LOADING';
   if (state === 'LIVE_TRADABLE') return 'LIVE';
-  if (state === 'CLOSED_LAST_GOOD_TRADABLE' || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return 'LAST_QUOTE';
-  if (state === 'EXPIRED') return 'EXPIRED_LAST_QUOTE';
-  if (state === 'UNAVAILABLE') return 'UNAVAILABLE';
+  if (
+    state === 'PRE_MARKET'
+    || state === 'AFTER_HOURS'
+    || state === 'CLOSED'
+    || state === 'MARKET_CLOSED'
+    || state === 'HOLIDAY'
+    || state === 'CLOSED_LAST_GOOD_TRADABLE'
+    || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY'
+    || state === 'EXPIRED'
+    || state === 'UNAVAILABLE'
+  ) return 'UNAVAILABLE';
   return null;
 }
 
-function getDisplayOnlyLastQuoteLabel(t: (key: string, namespace?: 'contracts') => string) {
-  const label = t('lastQuoteLabel', 'contracts');
-  if (label === '最后报价') return `${label}，仅供参考`;
-  if (label === '最後報價') return `${label}，僅供參考`;
-  if (label === '最終気配') return `${label}（参考のみ）`;
-  if (label === 'Last quote') return `${label}, display only`;
-  if (label) return label;
-  return 'Last quote, display only';
+function getNonTradingMarketViewStatusLabel(value: string) {
+  const state = normalizeMarketViewDisplayState(value);
+  if (state === 'PRE_MARKET') return '盘前';
+  if (state === 'AFTER_HOURS') return '盘后';
+  if (state === 'CLOSED' || state === 'MARKET_CLOSED') return '闭市中';
+  if (state === 'HOLIDAY') return '休市中';
+  return null;
 }
 
 function getMarketViewStatusLabel(value: string, t: (key: string, namespace?: 'contracts') => string) {
   const state = normalizeMarketViewDisplayState(value);
   if (state === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
   if (state === 'LIVE_TRADABLE') return t('realtimeQuoteLabel', 'contracts');
-  if (state === 'CLOSED_LAST_GOOD_TRADABLE') return t('lastQuoteLabel', 'contracts');
-  if (state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return getDisplayOnlyLastQuoteLabel(t);
-  if (state === 'EXPIRED') return t('lastQuoteExpiredLabel', 'contracts');
+  const nonTradingLabel = getNonTradingMarketViewStatusLabel(value);
+  if (nonTradingLabel) return nonTradingLabel;
   return t('quoteTemporarilyUnavailableLabel', 'contracts');
 }
 
@@ -544,9 +548,7 @@ export default function ContractFuturesOrderBook({
   const depthStatusLabel = marketViewDisplayState && marketViewDisplayStatus
     ? getMarketViewStatusLabel(marketViewDisplayState, t)
     : getQuoteStatusLabel(depthDisplayStatus, t);
-  const titleLabel = depthDisplayStatus === 'LAST_QUOTE' || depthDisplayStatus === 'EXPIRED_LAST_QUOTE'
-    ? t('lastQuoteLabel', 'contracts')
-    : t('orderBook', 'contracts');
+  const titleLabel = t('orderBook', 'contracts');
   const centerDisplayPrice = marketView
     ? (
         toPositiveDisplayPrice(marketView.display_price) !== null
@@ -571,7 +573,7 @@ export default function ContractFuturesOrderBook({
           </div>
           {hasDepthQuoteStatus ? (
             <div className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${quoteStatusBadgeClass(depthDisplayStatus)}`}>
-              {marketViewDisplayStatus ? depthStatusLabel : isExpiredLastGoodBbo ? t('lastQuoteExpiredLabel', 'contracts') : depthStatusLabel}
+              {depthStatusLabel}
             </div>
           ) : null}
         </div>
