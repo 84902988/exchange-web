@@ -10719,7 +10719,7 @@ def _admin_contract_symbol_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "tp_sl_trigger_price_type_label": "最新价格" if tp_sl_trigger_price_type == "LAST_PRICE" else "标记价格",
         "closed_market_execution_mode": closed_market_execution_mode,
         "closed_market_execution_mode_label": (
-            "按最后有效买卖价成交" if closed_market_execution_mode == "LAST_GOOD_BBO" else "闭市不可交易"
+            "最后有效买卖价（仅诊断）" if closed_market_execution_mode == "LAST_GOOD_BBO" else "闭市不可交易"
         ),
         "price_precision": int(row.get("price_precision") or 0),
         "quantity_precision": int(row.get("quantity_precision") or 0),
@@ -10750,25 +10750,7 @@ def _admin_contract_symbol_form_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
-_CLOSED_MARKET_DEFAULT_LAST_GOOD_CATEGORIES = {
-    "STOCK",
-    "CFD",
-    "INDEX",
-    "FOREX",
-    "METAL",
-    "GOLD",
-    "COMMODITY",
-    "FUTURES",
-}
-
-
 def _default_closed_market_execution_mode(category: str, provider: str) -> str:
-    normalized_category = str(category or "").strip().upper()
-    normalized_provider = str(provider or "").strip().upper()
-    if normalized_category == "CRYPTO":
-        return "DISABLED"
-    if normalized_category in _CLOSED_MARKET_DEFAULT_LAST_GOOD_CATEGORIES or normalized_provider == "ITICK":
-        return "LAST_GOOD_BBO"
     return "DISABLED"
 
 

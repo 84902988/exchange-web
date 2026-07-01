@@ -73,6 +73,19 @@ def _depth(**overrides):
     return payload
 
 
+def _kline(**overrides):
+    payload = {
+        "open_time": int((NOW - timedelta(minutes=1)).timestamp() * 1000),
+        "open": "9999",
+        "high": "9999",
+        "low": "9999",
+        "close": "9999",
+        "volume": "1",
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_live_tradable_crypto_requires_fresh_bbo():
     view = build_contract_market_view(
         "BTCUSDT_PERP",
@@ -138,30 +151,28 @@ def test_crypto_closed_valid_last_good_bbo_remains_not_tradable():
     assert view["reason_code"] == "CRYPTO_BBO_NOT_LIVE"
 
 
-def test_tradfi_closed_last_good_valid_allowed_is_tradable():
+def test_us_stock_regular_open_fresh_bbo_is_live_tradable():
     quote = _quote(
         symbol="AAPLUSDT_PERP",
         provider="ITICK",
         category="STOCK",
-        market_status="CLOSED",
-        quote_source="LAST_GOOD_BBO",
-        source="LAST_GOOD_BBO",
-        quote_freshness="LAST_VALID",
+        market_status="OPEN",
+        market_session_type="REGULAR_OPEN",
+        quote_source="ITICK_DEPTH",
+        source="ITICK_DEPTH",
+        quote_freshness="LIVE",
         closed_market_execution_mode="LAST_GOOD_BBO",
-        last_good_bbo_valid=True,
-        last_good_at=(NOW - timedelta(hours=1)).isoformat(),
     )
     depth = _depth(
         symbol="AAPLUSDT_PERP",
         provider="ITICK",
         category="STOCK",
-        market_status="CLOSED",
-        quote_source="LAST_GOOD_BBO",
-        source="LAST_GOOD_BBO",
-        quote_freshness="LAST_VALID",
+        market_status="OPEN",
+        market_session_type="REGULAR_OPEN",
+        quote_source="ITICK_DEPTH",
+        source="ITICK_DEPTH",
+        quote_freshness="LIVE",
         closed_market_execution_mode="LAST_GOOD_BBO",
-        last_good_bbo_valid=True,
-        last_good_at=(NOW - timedelta(hours=1)).isoformat(),
     )
 
     view = build_contract_market_view(
@@ -177,15 +188,78 @@ def test_tradfi_closed_last_good_valid_allowed_is_tradable():
         now=NOW,
     )
 
-    assert view["display_state"] == "CLOSED_LAST_GOOD_TRADABLE"
+    assert view["display_state"] == "LIVE_TRADABLE"
     assert view["display_price"] == "101"
+    assert view["display_price_source"] == "LIVE_MID"
     assert view["executable"] is True
     assert view["execution_bid"] == "100"
     assert view["execution_ask"] == "102"
-    assert view["last_good_bbo_valid"] is True
+    assert view["execution_mode"] == "LIVE_BBO"
 
 
-def test_tradfi_closed_last_good_valid_display_only_when_not_allowed():
+def test_us_stock_premarket_uses_kline_close_for_display_only():
+    last_good_at = NOW - timedelta(hours=2)
+    latest_kline_time = NOW - timedelta(hours=1)
+    quote = _quote(
+        symbol="AAPLUSDT_PERP",
+        provider="ITICK",
+        category="STOCK",
+        market_status="CLOSED",
+        market_session_type="PRE_MARKET",
+        quote_source="LAST_GOOD_BBO",
+        source="LAST_GOOD_BBO",
+        quote_freshness="LAST_VALID",
+        closed_market_execution_mode="LAST_GOOD_BBO",
+        last_good_bbo_valid=True,
+        last_good_at=last_good_at.isoformat(),
+    )
+    depth = _depth(
+        symbol="AAPLUSDT_PERP",
+        provider="ITICK",
+        category="STOCK",
+        market_status="CLOSED",
+        market_session_type="PRE_MARKET",
+        quote_source="LAST_GOOD_BBO",
+        source="LAST_GOOD_BBO",
+        quote_freshness="LAST_VALID",
+        closed_market_execution_mode="LAST_GOOD_BBO",
+        last_good_bbo_valid=True,
+        last_good_at=last_good_at.isoformat(),
+    )
+
+    view = build_contract_market_view(
+        "AAPLUSDT_PERP",
+        quote=quote,
+        depth=depth,
+        latest_kline=_kline(
+            open_time=int(latest_kline_time.timestamp() * 1000),
+            close="9999",
+        ),
+        contract_symbol=_contract(
+            symbol="AAPLUSDT_PERP",
+            category="STOCK",
+            provider="ITICK",
+            mode="LAST_GOOD_BBO",
+        ),
+        now=NOW,
+    )
+
+    assert view["display_state"] == "PRE_MARKET"
+    assert view["display_price"] == "9999"
+    assert view["display_price_source"] == "KLINE_CLOSE"
+    assert view["executable"] is False
+    assert view["execution_bid"] is None
+    assert view["execution_ask"] is None
+    assert view["execution_mode"] == "DISABLED"
+    assert view["last_good_bbo_valid"] is False
+    assert view["reason_code"] == "PRE_MARKET"
+    assert "non_trading_session" in view["warnings"]
+    assert "last_good_bbo_diagnostic_only" in view["warnings"]
+    assert view["raw_source_summary"]["latest_kline_open_time"] == latest_kline_time.isoformat()
+    assert view["raw_source_summary"]["last_good_bbo_valid_raw"] is True
+
+
+def test_us_stock_after_hours_is_display_only():
     view = build_contract_market_view(
         "AAPLUSDT_PERP",
         quote=_quote(
@@ -193,11 +267,11 @@ def test_tradfi_closed_last_good_valid_display_only_when_not_allowed():
             provider="ITICK",
             category="STOCK",
             market_status="CLOSED",
+            market_session_type="AFTER_HOURS",
             quote_source="LAST_GOOD_BBO",
             source="LAST_GOOD_BBO",
             quote_freshness="LAST_VALID",
-            closed_market_execution_mode="DISABLED",
-            executable=False,
+            closed_market_execution_mode="LAST_GOOD_BBO",
             last_good_bbo_valid=True,
         ),
         depth=_depth(
@@ -205,23 +279,105 @@ def test_tradfi_closed_last_good_valid_display_only_when_not_allowed():
             provider="ITICK",
             category="STOCK",
             market_status="CLOSED",
+            market_session_type="AFTER_HOURS",
             quote_source="LAST_GOOD_BBO",
             source="LAST_GOOD_BBO",
             quote_freshness="LAST_VALID",
-            closed_market_execution_mode="DISABLED",
-            executable=False,
+            closed_market_execution_mode="LAST_GOOD_BBO",
             last_good_bbo_valid=True,
         ),
-        contract_symbol=_contract(symbol="AAPLUSDT_PERP", category="STOCK", provider="ITICK", mode="DISABLED"),
+        latest_kline=_kline(close="288.88"),
+        contract_symbol=_contract(symbol="AAPLUSDT_PERP", category="STOCK", provider="ITICK", mode="LAST_GOOD_BBO"),
         now=NOW,
     )
 
-    assert view["display_state"] == "CLOSED_LAST_GOOD_DISPLAY_ONLY"
-    assert view["display_price"] == "101"
+    assert view["display_state"] == "AFTER_HOURS"
+    assert view["display_price"] == "288.88"
+    assert view["display_price_source"] == "KLINE_CLOSE"
     assert view["executable"] is False
     assert view["execution_bid"] is None
     assert view["execution_ask"] is None
-    assert view["execution_mode"] == "DISPLAY_ONLY"
+    assert view["reason_code"] == "AFTER_HOURS"
+
+
+def test_us_stock_closed_last_good_is_not_tradable_or_display_price():
+    view = build_contract_market_view(
+        "AAPLUSDT_PERP",
+        quote=_quote(
+            symbol="AAPLUSDT_PERP",
+            provider="ITICK",
+            category="STOCK",
+            market_status="CLOSED",
+            market_session_type="CLOSED",
+            quote_source="LAST_GOOD_BBO",
+            source="LAST_GOOD_BBO",
+            quote_freshness="LAST_VALID",
+            closed_market_execution_mode="LAST_GOOD_BBO",
+            last_good_bbo_valid=True,
+        ),
+        depth=_depth(
+            symbol="AAPLUSDT_PERP",
+            provider="ITICK",
+            category="STOCK",
+            market_status="CLOSED",
+            market_session_type="CLOSED",
+            quote_source="LAST_GOOD_BBO",
+            source="LAST_GOOD_BBO",
+            quote_freshness="LAST_VALID",
+            closed_market_execution_mode="LAST_GOOD_BBO",
+            last_good_bbo_valid=True,
+        ),
+        contract_symbol=_contract(symbol="AAPLUSDT_PERP", category="STOCK", provider="ITICK", mode="LAST_GOOD_BBO"),
+        now=NOW,
+    )
+
+    assert view["display_state"] == "CLOSED"
+    assert view["display_price"] is None
+    assert view["display_price_source"] == "NONE"
+    assert view["executable"] is False
+    assert view["execution_bid"] is None
+    assert view["execution_ask"] is None
+    assert view["execution_mode"] == "DISABLED"
+    assert view["reason_code"] == "MARKET_CLOSED"
+
+
+def test_us_stock_holiday_is_not_tradable():
+    view = build_contract_market_view(
+        "AAPLUSDT_PERP",
+        quote=_quote(
+            symbol="AAPLUSDT_PERP",
+            provider="ITICK",
+            category="STOCK",
+            market_status="HOLIDAY",
+            market_session_type="HOLIDAY",
+            quote_source="LAST_GOOD_BBO",
+            source="LAST_GOOD_BBO",
+            quote_freshness="LAST_VALID",
+            closed_market_execution_mode="LAST_GOOD_BBO",
+            last_good_bbo_valid=True,
+        ),
+        depth=_depth(
+            symbol="AAPLUSDT_PERP",
+            provider="ITICK",
+            category="STOCK",
+            market_status="HOLIDAY",
+            market_session_type="HOLIDAY",
+            quote_source="LAST_GOOD_BBO",
+            source="LAST_GOOD_BBO",
+            quote_freshness="LAST_VALID",
+            closed_market_execution_mode="LAST_GOOD_BBO",
+            last_good_bbo_valid=True,
+        ),
+        contract_symbol=_contract(symbol="AAPLUSDT_PERP", category="STOCK", provider="ITICK", mode="LAST_GOOD_BBO"),
+        now=NOW,
+    )
+
+    assert view["display_state"] == "HOLIDAY"
+    assert view["display_price"] is None
+    assert view["executable"] is False
+    assert view["execution_bid"] is None
+    assert view["execution_ask"] is None
+    assert view["reason_code"] == "HOLIDAY"
 
 
 def test_tradfi_explicit_last_good_valid_requires_last_good_source():
@@ -232,6 +388,7 @@ def test_tradfi_explicit_last_good_valid_requires_last_good_source():
             provider="ITICK",
             category="STOCK",
             market_status="CLOSED",
+            market_session_type="CLOSED",
             quote_source="LIVE",
             source="LIVE",
             quote_freshness="LAST_VALID",
@@ -243,6 +400,7 @@ def test_tradfi_explicit_last_good_valid_requires_last_good_source():
             provider="ITICK",
             category="STOCK",
             market_status="CLOSED",
+            market_session_type="CLOSED",
             quote_source="LIVE",
             source="LIVE",
             quote_freshness="LAST_VALID",
@@ -259,14 +417,15 @@ def test_tradfi_explicit_last_good_valid_requires_last_good_source():
     )
 
     assert view["display_state"] != "CLOSED_LAST_GOOD_TRADABLE"
-    assert view["display_state"] == "EXPIRED"
+    assert view["display_state"] == "CLOSED"
     assert view["last_good_bbo_valid"] is False
     assert view["executable"] is False
     assert view["execution_bid"] is None
     assert view["execution_ask"] is None
+    assert view["reason_code"] == "MARKET_CLOSED"
 
 
-def test_tradfi_expired_last_good_is_expired():
+def test_tradfi_expired_last_good_is_closed_not_tradable():
     view = build_contract_market_view(
         "AAPLUSDT_PERP",
         quote=_quote(
@@ -274,6 +433,7 @@ def test_tradfi_expired_last_good_is_expired():
             provider="ITICK",
             category="STOCK",
             market_status="CLOSED",
+            market_session_type="CLOSED",
             quote_source="LAST_GOOD_BBO",
             source="LAST_GOOD_BBO",
             quote_freshness="LAST_VALID",
@@ -285,6 +445,7 @@ def test_tradfi_expired_last_good_is_expired():
             provider="ITICK",
             category="STOCK",
             market_status="CLOSED",
+            market_session_type="CLOSED",
             quote_source="LAST_GOOD_BBO",
             source="LAST_GOOD_BBO",
             quote_freshness="LAST_VALID",
@@ -300,11 +461,11 @@ def test_tradfi_expired_last_good_is_expired():
         now=NOW,
     )
 
-    assert view["display_state"] == "EXPIRED"
+    assert view["display_state"] == "CLOSED"
     assert view["executable"] is False
     assert view["execution_bid"] is None
     assert view["execution_ask"] is None
-    assert view["reason_code"] == "LAST_GOOD_BBO_EXPIRED"
+    assert view["reason_code"] == "MARKET_CLOSED"
 
 
 def test_no_bbo_is_unavailable():
@@ -343,6 +504,7 @@ def test_kline_close_does_not_participate_in_execution_price():
         "BTCUSDT_PERP",
         quote=_quote(close="9999"),
         depth=_depth(best_bid="100", best_ask="102"),
+        latest_kline=_kline(close="9999"),
         contract_symbol=_contract(),
         now=NOW,
     )
