@@ -11,6 +11,7 @@ from app.db.models.contract_symbol import ContractSymbol
 from app.db.session import SessionLocal, get_db
 from app.schemas.contract_market import (
     ContractDepthResponse,
+    ContractMarketViewDetail,
     ContractQuoteResponse,
     ContractSymbolListResponse,
     ContractTickerListResponse,
@@ -33,6 +34,7 @@ from app.services.contract_market_service import (
     get_contract_tickers,
 )
 from app.services.contract_market_gateway import contract_market_gateway
+from app.services.contract_market_view import get_contract_market_view
 from app.services.contract_market_ws import (
     contract_market_ws_manager,
     normalize_contract_ws_interval,
@@ -253,6 +255,35 @@ def contract_market_symbols(
         return data.model_dump()
 
     return ok(data=cache_fetch_json(cache_key, 120, lambda: _load_with_short_session(load_data)), trace_id=trace_id)
+
+
+@router.get("/view")
+def contract_market_view(
+    request: Request,
+    symbol: str = Query(..., description="Contract symbol, e.g. AAPLUSDT_PERP"),
+):
+    trace_id = getattr(request.state, "trace_id", None)
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        raise HTTPException(status_code=400, detail={"code": "CONTRACT_SYMBOL_REQUIRED", "message": "symbol is required"})
+    try:
+        def load_data(db: Session) -> dict:
+            view_payload = get_contract_market_view(db, normalized_symbol)
+            return ContractMarketViewDetail(**view_payload).model_dump()
+
+        return ok(data=_load_with_short_session(load_data), trace_id=trace_id)
+    except ContractSymbolNotFound as exc:
+        raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)})
+    except ContractMarketError as exc:
+        raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)})
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("contract market view failed symbol=%s", normalized_symbol)
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "CONTRACT_MARKET_VIEW_UNAVAILABLE", "message": "contract market view unavailable"},
+        )
 
 
 @router.get("/quote")
