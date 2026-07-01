@@ -158,6 +158,7 @@ class ContractMarketGateway:
         self._last_full_refresh_at: dict[str, float] = {}
         self._last_depth_broadcast_at: dict[str, float] = {}
         self._last_depth_signature: dict[str, str] = {}
+        self._last_kline_broadcast_at: dict[tuple[str, str], float] = {}
         self._last_kline_signature: dict[tuple[str, str], str] = {}
         self._last_quote_signature: dict[str, str] = {}
         self._last_trade_ids: dict[str, set[str]] = {}
@@ -328,6 +329,8 @@ class ContractMarketGateway:
             self._last_depth_signature.pop(symbol, None)
             for key in [key for key in self._last_kline_signature if key[0] == symbol]:
                 self._last_kline_signature.pop(key, None)
+            for key in [key for key in self._last_kline_broadcast_at if key[0] == symbol]:
+                self._last_kline_broadcast_at.pop(key, None)
             self._last_quote_signature.pop(symbol, None)
             self._last_trade_ids.pop(symbol, None)
 
@@ -523,6 +526,10 @@ class ContractMarketGateway:
         try:
             normalized_intervals = sorted({normalize_contract_ws_interval(item) for item in intervals} or {"1m"})
             for interval in normalized_intervals:
+                key = (normalized_symbol, interval)
+                last_broadcast_at = self._last_kline_broadcast_at.get(key, 0.0)
+                if time.monotonic() - last_broadcast_at < self._provider_ws_kline_broadcast_interval_seconds():
+                    continue
                 payload = self._load_kline_payload(
                     db,
                     normalized_symbol,
@@ -535,11 +542,11 @@ class ContractMarketGateway:
                     continue
                 kline = _normalize_kline(payload, source=payload.get("source"))
                 signature = self._kline_signature(kline)
-                key = (normalized_symbol, interval)
                 if self._last_kline_signature.get(key) == signature:
                     continue
                 self._set_latest(CONTRACT_MARKET_CACHE_KLINE, normalized_symbol, kline, interval=interval)
                 self._last_kline_signature[key] = signature
+                self._last_kline_broadcast_at[key] = time.monotonic()
                 messages.append(self._kline_message(normalized_symbol, interval, kline))
         finally:
             db.close()
@@ -561,7 +568,6 @@ class ContractMarketGateway:
                 db,
                 symbol,
                 normalized_interval,
-                max_age_ms=int(getattr(settings, "CONTRACT_PROVIDER_WS_KLINE_MAX_AGE_MS", 1500) or 1500),
                 ensure_subscription=ensure_provider_ws,
             )
             if isinstance(payload, dict):
@@ -730,6 +736,10 @@ class ContractMarketGateway:
         interval_ms = int(getattr(settings, "CONTRACT_PROVIDER_WS_DEPTH_BROADCAST_INTERVAL_MS", 200) or 200)
         return max(0.1, min(interval_ms / 1000, 0.3))
 
+    def _provider_ws_kline_broadcast_interval_seconds(self) -> float:
+        interval_ms = int(getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_KLINE_BROADCAST_INTERVAL_MS", 1000) or 1000)
+        return max(0.2, min(interval_ms / 1000, 5.0))
+
     def _remember_depth_signature(self, symbol: str, depth: dict[str, Any]) -> None:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         self._last_depth_signature[normalized_symbol] = self._depth_signature(depth)
@@ -743,6 +753,7 @@ class ContractMarketGateway:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         normalized_interval = normalize_contract_ws_interval(interval)
         self._last_kline_signature[(normalized_symbol, normalized_interval)] = self._kline_signature(kline)
+        self._last_kline_broadcast_at[(normalized_symbol, normalized_interval)] = time.monotonic()
 
     def _remember_trade_ids(self, symbol: str, trades: list[dict[str, Any]]) -> None:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
