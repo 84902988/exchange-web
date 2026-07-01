@@ -62,6 +62,14 @@ type ContractTradingFormProps = {
   isLoggedIn: boolean;
   disabled?: boolean;
   quoteLoading?: boolean;
+  marketUiState?: {
+    label: string;
+    isLoading: boolean;
+    isTradable: boolean;
+    isRealtime: boolean;
+    reason: string;
+    status: ContractQuoteDisplayStatus;
+  };
   onSuccess: () => Promise<void> | void;
   tpSlTriggerPriceType?: ContractTpSlTriggerPriceType | string | null;
 };
@@ -234,6 +242,7 @@ export default function ContractTradingForm({
   isLoggedIn,
   disabled = false,
   quoteLoading = false,
+  marketUiState,
   onSuccess,
   tpSlTriggerPriceType,
 }: ContractTradingFormProps) {
@@ -363,7 +372,7 @@ export default function ContractTradingForm({
       || quoteUnavailableReason === 'MARKET_VIEW_UNAVAILABLE'
       ? t('quoteUnavailableTradingHint', 'contracts')
       : null;
-  const quoteStatusHint = quoteStatusLoading
+  const ownQuoteStatusHint = quoteStatusLoading
     ? getQuoteStatusLabel(quoteDisplayStatus, t)
     : hasMarketView
     ? quoteUnavailable
@@ -374,7 +383,14 @@ export default function ContractTradingForm({
       ? null
       : getQuoteStatusLabel(quoteDisplayStatus, t)
     : null;
-  const quoteStatusClassName = quoteStatusLoading
+  const quoteStatusHint = marketUiState?.label || ownQuoteStatusHint;
+  const quoteStatusClassName = marketUiState?.isLoading
+    ? 'border-white/10 bg-white/[0.05] text-white/58'
+    : marketUiState?.isRealtime
+    ? 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]'
+    : marketUiState && !marketUiState.isTradable
+    ? 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]'
+    : quoteStatusLoading
     ? 'border-white/10 bg-white/[0.05] text-white/58'
     : quoteUnavailable
     ? 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]'

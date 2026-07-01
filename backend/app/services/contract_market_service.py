@@ -52,6 +52,9 @@ QUOTE_FRESHNESS_STALE = "STALE"
 QUOTE_FRESHNESS_LAST_VALID = "LAST_VALID"
 QUOTE_FRESHNESS_FALLBACK = "FALLBACK"
 QUOTE_SOURCE_LAST_GOOD_BBO = "LAST_GOOD_BBO"
+DEPTH_MODE_FULL_DEPTH = "FULL_DEPTH"
+DEPTH_MODE_SYNTHETIC_FROM_BBO = "SYNTHETIC_FROM_BBO"
+DEPTH_MODE_BBO_ONLY = "BBO_ONLY"
 QUOTE_FRESHNESS_LIVE_SECONDS = 30
 QUOTE_FRESHNESS_LAST_VALID_SECONDS = 300
 
@@ -985,6 +988,7 @@ def _depth_payload(
     asks: list[list[Decimal]],
     source: str,
     ts: datetime,
+    depth_mode: str = DEPTH_MODE_FULL_DEPTH,
 ) -> dict[str, Any]:
     best_bid = _best_depth_price(bids, side="bid")
     best_ask = _best_depth_price(asks, side="ask")
@@ -997,6 +1001,7 @@ def _depth_payload(
         "best_bid": best_bid,
         "best_ask": best_ask,
         "source": source,
+        "depth_mode": depth_mode,
         "ts": ts,
     }
 
@@ -1081,6 +1086,7 @@ def _get_cached_depth(symbol: str, *, limit: int, source: str = "LAST_VALID") ->
         asks=_copy_depth_levels(cached["asks"], limit),
         source=source,
         ts=cached["ts"],
+        depth_mode=str(cached.get("depth_mode") or DEPTH_MODE_FULL_DEPTH),
     )
 
 
@@ -1095,6 +1101,7 @@ def _depth_from_quote_payload(quote: dict[str, Any], *, limit: int, source: str)
         asks=[_depth_level(ask, Decimal("1"))],
         source=source,
         ts=quote.get("ts") if isinstance(quote.get("ts"), datetime) else datetime.utcnow(),
+        depth_mode=DEPTH_MODE_BBO_ONLY,
     )
     depth["price_precision"] = int(quote.get("price_precision") or 8)
     return _copy_depth_payload(depth, limit=limit)
@@ -1770,6 +1777,7 @@ def _build_stock_depth_from_prices(
         asks=asks,
         source=source,
         ts=ts or datetime.utcnow(),
+        depth_mode=DEPTH_MODE_SYNTHETIC_FROM_BBO,
     )
     depth["price_precision"] = 2
     return depth
@@ -1827,6 +1835,18 @@ def _extract_itick_stock_depth_top(payload: Any) -> tuple[Optional[Decimal], Opt
     )
 
 
+def _extract_itick_stock_depth_levels(payload: Any) -> tuple[list[list[Decimal]], list[list[Decimal]], Optional[datetime]]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return [], [], None
+    raw_bids = data.get("b") or data.get("bids") or data.get("bid")
+    raw_asks = data.get("a") or data.get("asks") or data.get("ask")
+    bids = _normalize_stock_depth_levels(raw_bids, side="bid")
+    asks = _normalize_stock_depth_levels(raw_asks, side="ask")
+    depth_ts = _normalize_quote_ts(_pick_first_present(data, ["t", "timestamp", "time", "ts"]))
+    return bids, asks, depth_ts
+
+
 def _get_stock_contract_depth(
     symbol: str,
     provider_symbol: Optional[str] = None,
@@ -1848,6 +1868,20 @@ def _get_stock_contract_depth(
             code=normalized_provider_symbol,
             limit=safe_limit,
         )
+        bids, asks, depth_ts = _extract_itick_stock_depth_levels(depth_payload)
+        if bids and asks:
+            depth = _depth_payload(
+                symbol=normalized_symbol,
+                provider="ITICK",
+                provider_symbol=normalized_provider_symbol,
+                bids=bids[:safe_limit],
+                asks=asks[:safe_limit],
+                source="ITICK_DEPTH",
+                ts=depth_ts or datetime.utcnow(),
+                depth_mode=DEPTH_MODE_FULL_DEPTH,
+            )
+            depth["price_precision"] = 2
+            return depth
         bid, ask, depth_ts = _extract_itick_stock_depth_top(depth_payload)
         if bid is not None and ask is not None and bid > 0 and ask > bid:
             return _build_stock_depth_from_prices(
@@ -2151,6 +2185,7 @@ def _build_cfd_depth_from_price(
         ),
         source=source,
         ts=ts or datetime.utcnow(),
+        depth_mode=DEPTH_MODE_SYNTHETIC_FROM_BBO,
     )
     depth["price_precision"] = precision
     if price_field:
@@ -2268,6 +2303,7 @@ def _normalize_provider_depth(
         asks=asks[:limit],
         source="LIVE",
         ts=datetime.utcnow(),
+        depth_mode=DEPTH_MODE_FULL_DEPTH,
     )
 
 
@@ -2706,6 +2742,7 @@ def _get_binance_live_quote(contract_symbol: ContractSymbol) -> dict[str, Any]:
                 asks=asks,
                 source="LIVE",
                 ts=quote["ts"],
+                depth_mode=DEPTH_MODE_FULL_DEPTH,
             )
         )
     logger.debug(
@@ -2779,6 +2816,7 @@ def _get_binance_live_depth(contract_symbol: ContractSymbol, *, limit: int) -> d
         asks=asks,
         source="LIVE",
         ts=datetime.utcnow(),
+        depth_mode=DEPTH_MODE_FULL_DEPTH,
     )
     logger.info(
         "contract_depth_live_success symbol=%s provider_symbol=%s source=LIVE bids_count=%s asks_count=%s "
@@ -3784,6 +3822,7 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
                 asks=[_depth_level(ask, Decimal("1"))],
                 source="LAST_VALID",
                 ts=fallback["ts"],
+                depth_mode=DEPTH_MODE_BBO_ONLY,
             )
             depth["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
             depth = _freeze_depth_if_closed(depth, market_status, limit=safe_limit)
@@ -4368,6 +4407,7 @@ def contract_depth_to_response(depth: dict[str, Any]) -> dict[str, Any]:
         "market_session_type": depth.get("market_session_type"),
         "quote_freshness": quote_freshness,
         "quote_source": quote_source,
+        "depth_mode": depth.get("depth_mode") or DEPTH_MODE_FULL_DEPTH,
         "closed_market_execution_mode": depth.get("closed_market_execution_mode") or "DISABLED",
         "executable": bool(depth.get("executable") if depth.get("executable") is not None else _payload_quote_executable({**depth, "quote_freshness": quote_freshness})),
         "is_realtime": bool(depth.get("is_realtime") if depth.get("is_realtime") is not None else quote_freshness == QUOTE_FRESHNESS_LIVE),

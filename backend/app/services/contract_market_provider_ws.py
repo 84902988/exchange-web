@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 CONTRACT_PROVIDER_WS_SOURCE = "LIVE_WS"
 PROVIDER_ITICK = "ITICK"
-_SUPPORTED_DEPTH_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
+_SUPPORTED_DEPTH_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
 _SUPPORTED_TRADES_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
 _SUPPORTED_TICKER_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
 _SUPPORTED_KLINE_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
@@ -50,6 +50,8 @@ class ProviderDepthSubscription:
     provider: str
     provider_symbol: str
     depth_limit: int
+    ws_symbol: Optional[str] = None
+    ws_url: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +205,13 @@ def provider_ws_depth_enabled() -> bool:
     return bool(
         getattr(settings, "CONTRACT_PROVIDER_WS_ENABLED", False)
         and getattr(settings, "CONTRACT_PROVIDER_WS_DEPTH_ENABLED", False)
+    )
+
+
+def provider_ws_itick_depth_enabled() -> bool:
+    return bool(
+        provider_ws_depth_enabled()
+        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_ENABLED", False)
     )
 
 
@@ -488,6 +497,48 @@ class ContractMarketProviderWsService:
             ws_url=ws_url,
         )
 
+    def _itick_depth_subscription_for_symbol(
+        self,
+        db: Session,
+        symbol: str,
+    ) -> Optional[ProviderDepthSubscription]:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not normalized_symbol or not provider_ws_itick_depth_enabled():
+            return None
+        contract_symbol = (
+            db.query(ContractSymbol)
+            .filter(ContractSymbol.symbol == normalized_symbol)
+            .filter(ContractSymbol.status == 1)
+            .first()
+        )
+        if contract_symbol is None:
+            return None
+        provider_code = _normalize_symbol(getattr(contract_symbol, "provider", None))
+        category = _normalize_contract_category(getattr(contract_symbol, "category", None))
+        if provider_code != PROVIDER_ITICK or category != "STOCK":
+            return None
+        provider_symbol = _normalize_symbol(
+            getattr(contract_symbol, "provider_symbol", None)
+            or normalized_symbol.replace("_PERP", "")
+        )
+        if not provider_symbol:
+            return None
+        ws_symbol = _itick_quote_subscription_symbol(provider_symbol, category)
+        ws_url = _itick_ws_url_for_category(
+            getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_URL", ""),
+            category,
+        )
+        if not ws_symbol or not ws_url:
+            return None
+        return ProviderDepthSubscription(
+            local_symbol=normalized_symbol,
+            provider=PROVIDER_ITICK,
+            provider_symbol=provider_symbol,
+            depth_limit=_depth_limit(),
+            ws_symbol=ws_symbol,
+            ws_url=ws_url,
+        )
+
     def _itick_kline_subscription_for_symbol(
         self,
         db: Session,
@@ -549,6 +600,29 @@ class ContractMarketProviderWsService:
         if not provider_ws_depth_enabled():
             return None
         normalized_symbol = _normalize_symbol(symbol)
+        itick_subscription = self._itick_depth_subscription_for_symbol(db, normalized_symbol)
+        if itick_subscription is not None:
+            if is_contract_market_provider_in_cooldown(PROVIDER_ITICK):
+                logger.debug("contract_provider_ws_depth_skipped_cooldown provider=%s symbol=%s", PROVIDER_ITICK, normalized_symbol)
+                self.stop_depth_subscription(local_symbol=normalized_symbol, provider=PROVIDER_ITICK)
+            else:
+                if ensure_subscription:
+                    self.ensure_depth_subscription(
+                        local_symbol=itick_subscription.local_symbol,
+                        provider=itick_subscription.provider,
+                        provider_symbol=itick_subscription.provider_symbol,
+                        depth_limit=itick_subscription.depth_limit,
+                        ws_symbol=itick_subscription.ws_symbol,
+                        ws_url=itick_subscription.ws_url,
+                    )
+                depth = self.get_fresh_provider_ws_depth(
+                    normalized_symbol,
+                    PROVIDER_ITICK,
+                    max_age_ms=max_age_ms,
+                )
+                if depth is not None:
+                    return depth
+                return None
         for provider in enabled_contract_market_providers(db):
             provider_code = _normalize_symbol(provider.provider_code)
             if provider_code not in {PROVIDER_OKX_SWAP, PROVIDER_BITGET_USDT_FUTURES}:
@@ -777,6 +851,8 @@ class ContractMarketProviderWsService:
         provider: str,
         provider_symbol: str,
         depth_limit: int,
+        ws_symbol: Optional[str] = None,
+        ws_url: Optional[str] = None,
     ) -> None:
         if not provider_ws_depth_enabled():
             return
@@ -805,6 +881,8 @@ class ContractMarketProviderWsService:
                 provider=provider_code,
                 provider_symbol=normalized_provider_symbol,
                 depth_limit=max(5, min(int(depth_limit or 20), 100)),
+                ws_symbol=_normalize_symbol(ws_symbol or provider_symbol) if ws_symbol else None,
+                ws_url=str(ws_url or "").strip() or None,
             )
             thread = threading.Thread(
                 target=self._run_depth_subscription_thread,
@@ -1528,12 +1606,17 @@ class ContractMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        if subscription.provider != PROVIDER_OKX_SWAP:
+        if subscription.provider not in _SUPPORTED_DEPTH_WS_PROVIDERS:
             return
         reconnect_delay = 1.0
         while not stop_event.is_set() and provider_ws_depth_enabled():
             try:
-                await self._run_okx_depth_ws(subscription, stop_event, generation)
+                if subscription.provider == PROVIDER_ITICK:
+                    if not provider_ws_itick_depth_enabled():
+                        break
+                    await self._run_itick_depth_ws(subscription, stop_event, generation)
+                else:
+                    await self._run_okx_depth_ws(subscription, stop_event, generation)
                 reconnect_delay = 1.0
             except asyncio.CancelledError:
                 raise
@@ -1792,6 +1875,71 @@ class ContractMarketProviderWsService:
                     subscription.provider,
                     subscription.local_symbol,
                     subscription.provider_symbol,
+                )
+
+    async def _run_itick_depth_ws(
+        self,
+        subscription: ProviderDepthSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if stop_event.is_set() or not provider_ws_itick_depth_enabled():
+            return
+        url = str(subscription.ws_url or getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_URL", "") or "").strip()
+        if not url:
+            raise ValueError("CONTRACT_PROVIDER_WS_ITICK_URL is required")
+        ws_symbol = _normalize_symbol(subscription.ws_symbol or subscription.provider_symbol)
+        if not ws_symbol:
+            raise ValueError("iTick provider WS depth subscription symbol is required")
+        subscribe_payload = {
+            "ac": "subscribe",
+            "params": ws_symbol,
+            "types": "depth",
+        }
+        key = (subscription.provider, subscription.local_symbol)
+        connect_kwargs = {
+            "ping_interval": 20,
+            "ping_timeout": 10,
+            "close_timeout": 5,
+            **_websocket_header_kwargs(_itick_ws_headers()),
+        }
+        async with websockets.connect(url, **connect_kwargs) as websocket:
+            if stop_event.is_set() or not provider_ws_itick_depth_enabled():
+                await websocket.close()
+                return
+            loop = asyncio.get_running_loop()
+            with self._lock:
+                current_generation = self._depth_generations.get(key)
+                if current_generation != generation:
+                    stop_event.set()
+                    return
+                self._depth_connections[key] = (loop, websocket)
+            logger.info(
+                "contract_provider_ws_depth_subscription_started provider=%s symbol=%s provider_symbol=%s ws_symbol=%s",
+                subscription.provider,
+                subscription.local_symbol,
+                subscription.provider_symbol,
+                ws_symbol,
+            )
+            try:
+                await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                while not stop_event.is_set() and provider_ws_itick_depth_enabled():
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    self._handle_itick_depth_message(subscription, raw_message)
+            finally:
+                with self._lock:
+                    current = self._depth_connections.get(key)
+                    if current is not None and current[1] is websocket:
+                        self._depth_connections.pop(key, None)
+                logger.info(
+                    "contract_provider_ws_depth_subscription_stopped provider=%s symbol=%s provider_symbol=%s ws_symbol=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.provider_symbol,
+                    ws_symbol,
                 )
 
     async def _run_okx_ticker_ws(
@@ -2073,6 +2221,81 @@ class ContractMarketProviderWsService:
             checksum=row.get("checksum"),
             exchange_ts=row.get("ts"),
         )
+
+    def _handle_itick_depth_message(
+        self,
+        subscription: ProviderDepthSubscription,
+        raw_message: Any,
+    ) -> None:
+        try:
+            message = json.loads(raw_message)
+        except Exception:
+            logger.debug("contract_provider_ws_itick_depth_invalid_json symbol=%s", subscription.local_symbol)
+            return
+        for row in self._extract_itick_depth_rows(message):
+            bids = self._normalize_itick_depth_side(row.get("b") or row.get("bids") or row.get("bid"))
+            asks = self._normalize_itick_depth_side(row.get("a") or row.get("asks") or row.get("ask"))
+            if not bids or not asks:
+                continue
+            self._set_depth_cache(
+                subscription,
+                bids=bids,
+                asks=asks,
+                sequence=row.get("seq") or row.get("sequence"),
+                checksum=row.get("checksum"),
+                exchange_ts=row.get("t") or row.get("timestamp") or row.get("time") or row.get("ts"),
+            )
+
+    def _extract_itick_depth_rows(self, message: Any) -> list[dict[str, Any]]:
+        if isinstance(message, list):
+            rows: list[dict[str, Any]] = []
+            for item in message:
+                rows.extend(self._extract_itick_depth_rows(item))
+            return rows
+        if not isinstance(message, dict):
+            return []
+        if message.get("ac") or str(message.get("type") or message.get("types") or "").lower() in {"subscribe", "subscribed"}:
+            return []
+        data = message.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict) and self._looks_like_itick_depth(item)]
+        if isinstance(data, dict):
+            return [data] if self._looks_like_itick_depth(data) else []
+        tick = message.get("tick")
+        if isinstance(tick, dict) and self._looks_like_itick_depth(tick):
+            return [tick]
+        if self._looks_like_itick_depth(message):
+            return [message]
+        return []
+
+    def _looks_like_itick_depth(self, row: dict[str, Any]) -> bool:
+        row_type = str(row.get("type") or row.get("types") or "").strip().lower()
+        if row_type and row_type not in {"depth", "orderbook", "book"}:
+            return False
+        return (row.get("b") or row.get("bids") or row.get("bid")) is not None and (
+            row.get("a") or row.get("asks") or row.get("ask")
+        ) is not None
+
+    def _normalize_itick_depth_side(self, levels: Any) -> dict[str, Decimal]:
+        if isinstance(levels, dict):
+            levels = [levels]
+        if not isinstance(levels, list):
+            return {}
+        normalized: dict[str, Decimal] = {}
+        for item in levels:
+            price_raw: Any = None
+            quantity_raw: Any = None
+            if isinstance(item, dict):
+                price_raw = _pick_first_present(item, ["p", "price", "bid", "ask", "bp", "ap"])
+                quantity_raw = _pick_first_present(item, ["v", "volume", "amount", "quantity", "qty", "size"])
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                price_raw, quantity_raw = item[0], item[1]
+            price = _to_decimal(price_raw)
+            quantity = _to_decimal(quantity_raw)
+            if price is None or quantity is None or price <= 0 or quantity <= 0:
+                continue
+            normalized[format(price, "f")] = quantity
+        return normalized
 
     def _handle_okx_trades_message(
         self,
@@ -2559,6 +2782,7 @@ class ContractMarketProviderWsService:
             "best_bid": _best_depth_price(bid_levels, side="bids"),
             "best_ask": _best_depth_price(ask_levels, side="asks"),
             "source": CONTRACT_PROVIDER_WS_SOURCE,
+            "depth_mode": "FULL_DEPTH",
             "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_freshness": "LIVE",
             "is_realtime": True,

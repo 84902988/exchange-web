@@ -780,6 +780,7 @@ class ContractMarketGateway:
                 "bids": depth.get("bids") or [],
                 "asks": depth.get("asks") or [],
                 "source": depth.get("source"),
+                "depth_mode": depth.get("depth_mode"),
             }
         )
 

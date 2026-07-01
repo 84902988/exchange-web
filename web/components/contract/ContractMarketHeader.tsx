@@ -23,6 +23,8 @@ type ContractMarketHeaderProps = {
   quoteFreshness?: string | null;
   marketSessionType?: string | null;
   priceDirection?: PriceDirection;
+  priceSource?: 'KLINE_CLOSE' | 'TRADE';
+  priceSourceLabel?: string | null;
 };
 
 export default function ContractMarketHeader({
@@ -36,6 +38,8 @@ export default function ContractMarketHeader({
   quoteFreshness,
   marketSessionType,
   priceDirection = 'flat',
+  priceSource,
+  priceSourceLabel,
 }: ContractMarketHeaderProps) {
   const { t } = useLocaleContext();
   const priceColorClass =
@@ -68,6 +72,14 @@ export default function ContractMarketHeader({
             <div className={`inline-flex w-fit items-center rounded-lg px-2 py-0.5 text-[30px] font-semibold leading-none transition-all duration-200 ${priceColorClass}`}>
               {price}
             </div>
+            {priceSourceLabel ? (
+              <span
+                className="self-end pb-1 text-[11px] font-medium text-white/42"
+                data-price-source={priceSource}
+              >
+                {priceSourceLabel}
+              </span>
+            ) : null}
           </div>
         </div>
 

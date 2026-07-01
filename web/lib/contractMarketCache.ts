@@ -3,6 +3,7 @@
 import type { CandleItem, VolumeItem } from '@/components/spot/chart/chart.types';
 import type {
   ContractDepthLevel,
+  ContractDepthMode,
   ContractMarketTrade,
   ContractQuote,
 } from '@/lib/api/modules/contract';
@@ -18,6 +19,7 @@ export type ContractDepthCache = {
   source?: string | null;
   quote_freshness?: string | null;
   quote_source?: string | null;
+  depth_mode?: ContractDepthMode | null;
   market_status?: string | null;
   executable?: boolean | null;
   closed_market_execution_mode?: string | null;

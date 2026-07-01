@@ -7,6 +7,7 @@ import { formatPrice, getSymbolPricePrecision } from '@/lib/marketPrecision';
 import {
   getContractQuote,
   type ContractDepthLevel,
+  type ContractDepthMode,
   type ContractQuote,
 } from '@/lib/api/modules/contract';
 import {
@@ -30,6 +31,7 @@ type ContractDepthSnapshot = {
   source?: string | null;
   quote_freshness?: string | null;
   quote_source?: string | null;
+  depth_mode?: ContractDepthMode | null;
   market_status?: string | null;
   executable?: boolean | null;
   closed_market_execution_mode?: string | null;
