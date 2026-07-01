@@ -60,6 +60,9 @@ type ContractFuturesChartProps = {
   marketRealtimeStatus?: ContractMarketRealtimeStatus;
   pricePrecision?: number | null;
   currentPriceLinePrice?: string | number | null;
+  referencePriceLineEnabled?: boolean;
+  referencePriceLinePrice?: string | number | null;
+  referencePriceLineLabel?: string | null;
   latestCandlePatchPrice?: string | number | null;
   latestPriceTimestamp?: string | number | null;
   allowLatestPriceCandlePatch?: boolean;
@@ -644,6 +647,9 @@ export default function ContractFuturesChart({
   pricePrecision: explicitPricePrecision,
   marketRealtimeStatus = 'idle',
   currentPriceLinePrice,
+  referencePriceLineEnabled = false,
+  referencePriceLinePrice,
+  referencePriceLineLabel = null,
   latestCandlePatchPrice,
   latestPriceTimestamp,
   allowLatestPriceCandlePatch = true,
@@ -774,7 +780,9 @@ export default function ContractFuturesChart({
     if (!chart) return;
 
     const priceScale = chart.priceScale('right');
-    if (zoomLevel === 0) {
+    const referencePrice = firstValidPrice(referencePriceLinePrice);
+    const shouldUseManagedRange = referencePriceLineEnabled && referencePrice !== null;
+    if (zoomLevel === 0 && !shouldUseManagedRange) {
       priceScale.setAutoScale(true);
       priceScale.applyOptions({
         autoScale: true,
@@ -807,7 +815,9 @@ export default function ContractFuturesChart({
     });
 
     const latest = getLatestRealCandle(allCandles);
-    const currentPrice = firstValidPrice(currentPriceLinePrice, latestCandlePatchPrice, latest?.close);
+    const currentPrice = shouldUseManagedRange
+      ? referencePrice
+      : firstValidPrice(currentPriceLinePrice, latestCandlePatchPrice, latest?.close);
     if (currentPrice !== null) values.push(currentPrice);
 
     const finiteValues = values.filter((value) => Number.isFinite(value) && value > 0);
@@ -834,7 +844,13 @@ export default function ContractFuturesChart({
       from: rangeFrom,
       to: rangeTo,
     });
-  }, [currentPriceLinePrice, latestCandlePatchPrice, precision]);
+  }, [
+    currentPriceLinePrice,
+    latestCandlePatchPrice,
+    precision,
+    referencePriceLineEnabled,
+    referencePriceLinePrice,
+  ]);
 
   const applyTrustedLatestPricePatch = useCallback((
     sourceCandles: CandleItem[],
@@ -1261,7 +1277,10 @@ export default function ContractFuturesChart({
     volumeMa5SeriesRef.current?.setData(toLineData(volumeMa5));
     volumeMa10SeriesRef.current?.setData(toLineData(volumeMa10));
 
-    if (priceZoomLevel === 0) {
+    const referencePrice = firstValidPrice(referencePriceLinePrice);
+    const shouldUseManagedReferenceRange = referencePriceLineEnabled && referencePrice !== null;
+
+    if (priceZoomLevel === 0 && !shouldUseManagedReferenceRange) {
       candleSeriesRef.current.priceScale().applyOptions({
         autoScale: true,
         scaleMargins: SPOT_CHART_RIGHT_PRICE_SCALE_MARGINS,
@@ -1296,6 +1315,8 @@ export default function ContractFuturesChart({
     ma10,
     ma30,
     priceZoomLevel,
+    referencePriceLineEnabled,
+    referencePriceLinePrice,
     setVisibleLogicalRangeSilently,
     volumeMa5,
     volumeMa10,
@@ -1390,7 +1411,11 @@ export default function ContractFuturesChart({
     const series = candleSeriesRef.current;
     const latest = getLatestRealCandle(candles);
     const trustedPrice = firstValidPrice(currentPriceLinePrice, latestCandlePatchPrice);
-    const price = firstValidPrice(trustedPrice, latest?.close);
+    const referencePrice = firstValidPrice(referencePriceLinePrice);
+    const price = referencePriceLineEnabled
+      ? referencePrice
+      : firstValidPrice(trustedPrice, latest?.close);
+    const title = referencePriceLineEnabled ? referencePriceLineLabel || '' : '';
 
     if (!series) return;
     if (price === null) {
@@ -1419,7 +1444,7 @@ export default function ContractFuturesChart({
         lineWidth: 1,
         lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
-        title: '',
+        title,
       });
       return;
     }
@@ -1427,9 +1452,16 @@ export default function ContractFuturesChart({
     latestPriceLineRef.current.applyOptions({
       price,
       color,
-      title: '',
+      title,
     });
-  }, [candles, currentPriceLinePrice, latestCandlePatchPrice]);
+  }, [
+    candles,
+    currentPriceLinePrice,
+    latestCandlePatchPrice,
+    referencePriceLineEnabled,
+    referencePriceLineLabel,
+    referencePriceLinePrice,
+  ]);
 
   useEffect(() => {
     const series = candleSeriesRef.current;
@@ -1443,6 +1475,7 @@ export default function ContractFuturesChart({
         color: CONTRACT_CHART_RED,
         lineWidth: 1,
         lineStyle: LineStyle.Dashed,
+        lineVisible: false,
         axisLabelVisible: true,
         title: 'Liq',
       });
@@ -1467,6 +1500,7 @@ export default function ContractFuturesChart({
           color: '#22c55e',
           lineWidth: 1,
           lineStyle: LineStyle.Dashed,
+          lineVisible: false,
           axisLabelVisible: true,
           title: t('contractChartPositionLineTitle', 'contracts')
             .replace('{index}', String(position.index))
@@ -1493,6 +1527,7 @@ export default function ContractFuturesChart({
             color: CONTRACT_CHART_GREEN,
             lineWidth: 1,
             lineStyle: LineStyle.Dashed,
+            lineVisible: false,
             axisLabelVisible: true,
             title: t('contractChartPositionLineTitle', 'contracts')
               .replace('{index}', String(position.index))
@@ -1509,6 +1544,7 @@ export default function ContractFuturesChart({
             color: CONTRACT_CHART_RED,
             lineWidth: 1,
             lineStyle: LineStyle.Dashed,
+            lineVisible: false,
             axisLabelVisible: true,
             title: t('contractChartPositionLineTitle', 'contracts')
               .replace('{index}', String(position.index))

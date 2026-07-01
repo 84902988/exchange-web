@@ -38,6 +38,7 @@ type QuoteUnavailableReason =
   | 'MARKET_VIEW_EXPIRED'
   | 'MARKET_VIEW_DISPLAY_ONLY'
   | 'MARKET_VIEW_UNAVAILABLE'
+  | 'NON_TRADING_SESSION'
   | 'GENERIC_UNAVAILABLE'
   | null;
 type PendingContractOrder = {
@@ -68,8 +69,6 @@ type ContractTradingFormProps = {
 function getQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
   if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
   if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
-  if (status === 'LAST_QUOTE') return t('lastQuoteLabel', 'contracts');
-  if (status === 'EXPIRED_LAST_QUOTE') return t('lastQuoteExpiredLabel', 'contracts');
   return t('quoteTemporarilyUnavailableLabel', 'contracts');
 }
 
@@ -153,18 +152,26 @@ function normalizeMarketViewDisplayState(value?: string | null) {
   return normalized || null;
 }
 
+function isNonTradingMarketViewState(value?: string | null) {
+  const state = normalizeMarketViewDisplayState(value);
+  return state === 'PRE_MARKET'
+    || state === 'AFTER_HOURS'
+    || state === 'CLOSED'
+    || state === 'MARKET_CLOSED'
+    || state === 'HOLIDAY';
+}
+
 function marketViewStateToQuoteStatus(value?: string | null): ContractQuoteDisplayStatus {
   const state = normalizeMarketViewDisplayState(value);
   if (state === 'LOADING') return 'LOADING';
   if (state === 'LIVE_TRADABLE') return 'LIVE';
-  if (state === 'CLOSED_LAST_GOOD_TRADABLE' || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return 'LAST_QUOTE';
-  if (state === 'EXPIRED') return 'EXPIRED_LAST_QUOTE';
   return 'UNAVAILABLE';
 }
 
 function getMarketViewUnavailableReason(marketView?: ContractMarketViewDetail | null): QuoteUnavailableReason {
   if (!marketView || marketView.executable !== false) return null;
   const state = normalizeMarketViewDisplayState(marketView.display_state);
+  if (isNonTradingMarketViewState(state)) return 'NON_TRADING_SESSION';
   if (state === 'EXPIRED') return 'MARKET_VIEW_EXPIRED';
   if (state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return 'MARKET_VIEW_DISPLAY_ONLY';
   return 'MARKET_VIEW_UNAVAILABLE';
@@ -344,12 +351,14 @@ export default function ContractTradingForm({
         ? 'GENERIC_UNAVAILABLE'
         : null;
   const quoteLoadingFeedback = quoteStatusLoading ? t('marketDataLoadingLabel', 'contracts') : null;
-  const quoteUnavailableFeedback = quoteUnavailableReason === 'EXPIRED_LAST_GOOD_BBO'
-    ? t('lastGoodBboExpiredTradingHint', 'contracts')
+  const quoteUnavailableFeedback = quoteUnavailableReason === 'NON_TRADING_SESSION'
+    ? '当前非交易时段，暂不可下单'
+    : quoteUnavailableReason === 'EXPIRED_LAST_GOOD_BBO'
+      ? t('quoteUnavailableTradingHint', 'contracts')
     : quoteUnavailableReason === 'MARKET_VIEW_EXPIRED'
-      ? t('lastGoodBboExpiredTradingHint', 'contracts')
+      ? t('quoteUnavailableTradingHint', 'contracts')
     : quoteUnavailableReason === 'MARKET_VIEW_DISPLAY_ONLY'
-      ? `${t('lastQuoteLabel', 'contracts')} - ${t('quoteUnavailableTradingHint', 'contracts')}`
+      ? t('quoteUnavailableTradingHint', 'contracts')
     : quoteUnavailableReason === 'GENERIC_UNAVAILABLE'
       || quoteUnavailableReason === 'MARKET_VIEW_UNAVAILABLE'
       ? t('quoteUnavailableTradingHint', 'contracts')
