@@ -15,6 +15,8 @@ from typing import Any, Iterable
 from fastapi import WebSocket
 from pydantic import BaseModel
 from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.orm import Session
 
 from app.core.rq import get_redis_url
@@ -40,8 +42,17 @@ logger = logging.getLogger(__name__)
 CONTRACT_USER_EVENTS_CHANNEL = "contract:user_events"
 CONTRACT_USER_EVENT_SUBSCRIBER_SERVICE = "contract_user_event_subscriber"
 CONTRACT_USER_EVENT_PUBLISH_HEALTH_KEY = "service:health:contract_user_event_publisher"
+CONTRACT_USER_EVENT_REDIS_UNAVAILABLE_LOG_INTERVAL_SECONDS = 30.0
 _subscriber_task: asyncio.Task[None] | None = None
 _subscriber_stop_event: asyncio.Event | None = None
+
+_REDIS_UNAVAILABLE_ERRORS = (
+    RedisConnectionError,
+    RedisTimeoutError,
+    OSError,
+    ConnectionRefusedError,
+    asyncio.TimeoutError,
+)
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -525,6 +536,15 @@ async def _close_redis_resource(resource: Any) -> None:
         await result
 
 
+def _is_redis_unavailable_error(exc: BaseException) -> bool:
+    return isinstance(exc, _REDIS_UNAVAILABLE_ERRORS)
+
+
+def _redis_unavailable_error_text(exc: BaseException) -> str:
+    text = str(exc).strip()
+    return text or exc.__class__.__name__
+
+
 def _decode_event_data(data: Any) -> dict[str, Any] | None:
     if isinstance(data, (bytes, bytearray)):
         data = data.decode("utf-8")
@@ -543,6 +563,7 @@ async def _contract_user_event_subscriber_loop(stop_event: asyncio.Event) -> Non
         return
 
     retry_delay = 1.0
+    last_redis_unavailable_log_at = 0.0
     while not stop_event.is_set():
         redis = None
         pubsub = None
@@ -582,9 +603,23 @@ async def _contract_user_event_subscriber_loop(stop_event: asyncio.Event) -> Non
                     logger.warning("contract_private_ws_subscriber_dispatch_failed", exc_info=True)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            await asyncio.to_thread(_beat_contract_user_event_subscriber, "reconnecting")
-            logger.warning("contract_private_ws_subscriber_failed channel=%s", CONTRACT_USER_EVENTS_CHANNEL, exc_info=True)
+        except Exception as exc:
+            if _is_redis_unavailable_error(exc):
+                now = time.monotonic()
+                if (
+                    last_redis_unavailable_log_at <= 0
+                    or now - last_redis_unavailable_log_at >= CONTRACT_USER_EVENT_REDIS_UNAVAILABLE_LOG_INTERVAL_SECONDS
+                ):
+                    logger.warning(
+                        "contract_private_ws_redis_unavailable channel=%s retry_in=%ss error=%s",
+                        CONTRACT_USER_EVENTS_CHANNEL,
+                        int(retry_delay),
+                        _redis_unavailable_error_text(exc),
+                    )
+                    last_redis_unavailable_log_at = now
+            else:
+                await asyncio.to_thread(_beat_contract_user_event_subscriber, "reconnecting")
+                logger.warning("contract_private_ws_subscriber_failed channel=%s", CONTRACT_USER_EVENTS_CHANNEL, exc_info=True)
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 15.0)
         finally:
