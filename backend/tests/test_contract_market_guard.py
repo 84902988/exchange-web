@@ -11,7 +11,7 @@ BACKEND = ROOT / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from app.services.contract_market_guard import is_executable_contract_quote
+from app.services.contract_market_guard import executable_contract_quote_rejection_reason, is_executable_contract_quote
 
 
 def _quote(**overrides):
@@ -32,30 +32,67 @@ def _quote(**overrides):
     return payload
 
 
-def test_closed_last_good_bbo_last_valid_recent_is_executable():
-    assert is_executable_contract_quote(_quote()) is True
+def test_closed_last_good_bbo_last_valid_recent_is_not_executable():
+    assert is_executable_contract_quote(_quote(market_session_type="CLOSED")) is False
 
 
 def test_closed_last_good_bbo_last_valid_expired_is_not_executable():
-    quote = _quote(last_good_at=(datetime.now(timezone.utc) - timedelta(days=4)).isoformat())
+    quote = _quote(
+        market_session_type="CLOSED",
+        last_good_at=(datetime.now(timezone.utc) - timedelta(days=4)).isoformat(),
+    )
     assert is_executable_contract_quote(quote) is False
 
 
-def test_closed_last_good_bbo_uses_calendar_validity_annotation():
-    expired_quote = _quote(last_good_at=(datetime.now(timezone.utc) - timedelta(days=4)).isoformat())
-    assert is_executable_contract_quote({**expired_quote, "last_good_bbo_valid": True}) is True
+def test_closed_last_good_bbo_calendar_validity_does_not_override_session():
+    expired_quote = _quote(
+        market_session_type="CLOSED",
+        last_good_at=(datetime.now(timezone.utc) - timedelta(days=4)).isoformat(),
+    )
+    assert is_executable_contract_quote({**expired_quote, "last_good_bbo_valid": True}) is False
     assert is_executable_contract_quote({**expired_quote, "last_good_bbo_valid": False}) is False
 
 
-def test_closed_last_good_bbo_stale_requires_calendar_validity_annotation():
-    stale_quote = _quote(quote_freshness="STALE")
+def test_closed_last_good_bbo_stale_remains_not_executable():
+    stale_quote = _quote(market_session_type="CLOSED", quote_freshness="STALE")
     assert is_executable_contract_quote(stale_quote) is False
-    assert is_executable_contract_quote({**stale_quote, "last_good_bbo_valid": True}) is True
+    assert is_executable_contract_quote({**stale_quote, "last_good_bbo_valid": True}) is False
+
+
+def test_stock_premarket_last_good_bbo_is_not_executable():
+    quote = _quote(market_session_type="PRE_MARKET")
+    assert is_executable_contract_quote(quote) is False
+    assert executable_contract_quote_rejection_reason(quote) == "pre_market"
+
+
+def test_stock_after_hours_last_good_bbo_is_not_executable():
+    quote = _quote(symbol="AAPLUSDT_PERP", market_session_type="AFTER_HOURS")
+    assert is_executable_contract_quote(quote) is False
+    assert executable_contract_quote_rejection_reason(quote) == "after_hours"
+
+
+def test_stock_holiday_last_good_bbo_is_not_executable():
+    quote = _quote(symbol="AAPLUSDT_PERP", market_status="HOLIDAY", market_session_type="HOLIDAY")
+    assert is_executable_contract_quote(quote) is False
+    assert executable_contract_quote_rejection_reason(quote) == "holiday"
+
+
+def test_stock_regular_open_live_bbo_is_executable():
+    quote = _quote(
+        market_status="OPEN",
+        market_session_type="REGULAR_OPEN",
+        quote_source="LIVE",
+        source="LIVE",
+        quote_freshness="LIVE",
+        closed_market_execution_mode="LAST_GOOD_BBO",
+    )
+    assert is_executable_contract_quote(quote) is True
 
 
 def test_plain_stale_quote_remains_not_executable():
     quote = _quote(
         market_status="OPEN",
+        market_session_type="REGULAR_OPEN",
         quote_source="LIVE",
         source="LIVE",
         quote_freshness="STALE",
@@ -65,7 +102,7 @@ def test_plain_stale_quote_remains_not_executable():
 
 
 def test_closed_disabled_last_valid_bbo_is_not_executable():
-    quote = _quote(closed_market_execution_mode="DISABLED")
+    quote = _quote(market_session_type="CLOSED", closed_market_execution_mode="DISABLED")
     assert is_executable_contract_quote(quote) is False
 
 
@@ -81,10 +118,14 @@ def test_invalid_bbo_is_not_executable():
 
 
 if __name__ == "__main__":
-    test_closed_last_good_bbo_last_valid_recent_is_executable()
+    test_closed_last_good_bbo_last_valid_recent_is_not_executable()
     test_closed_last_good_bbo_last_valid_expired_is_not_executable()
-    test_closed_last_good_bbo_uses_calendar_validity_annotation()
-    test_closed_last_good_bbo_stale_requires_calendar_validity_annotation()
+    test_closed_last_good_bbo_calendar_validity_does_not_override_session()
+    test_closed_last_good_bbo_stale_remains_not_executable()
+    test_stock_premarket_last_good_bbo_is_not_executable()
+    test_stock_after_hours_last_good_bbo_is_not_executable()
+    test_stock_holiday_last_good_bbo_is_not_executable()
+    test_stock_regular_open_live_bbo_is_executable()
     test_plain_stale_quote_remains_not_executable()
     test_closed_disabled_last_valid_bbo_is_not_executable()
     test_crypto_closed_last_good_bbo_remains_not_executable()

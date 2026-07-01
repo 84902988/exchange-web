@@ -2,24 +2,19 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
 from typing import Any
+
+from app.services.contract_trading_session_resolver import resolve_contract_trading_session
 
 
 logger = logging.getLogger(__name__)
 
 CONTRACT_QUOTE_NOT_LIVE = "CONTRACT_QUOTE_NOT_LIVE"
 QUOTE_FRESHNESS_LIVE = "LIVE"
-QUOTE_FRESHNESS_LAST_VALID = "LAST_VALID"
 QUOTE_SOURCE_LAST_GOOD_BBO = "LAST_GOOD_BBO"
-CLOSED_MARKET_EXECUTION_DISABLED = "DISABLED"
-CLOSED_MARKET_EXECUTION_LAST_GOOD_BBO = "LAST_GOOD_BBO"
 _NON_EXECUTABLE_MARKET_STATUSES = {"CLOSED", "HOLIDAY", "SUSPENDED", "UNKNOWN"}
-_CLOSED_MARKET_LAST_GOOD_BBO_STATUSES = {"CLOSED", "HOLIDAY"}
-_CLOSED_MARKET_LAST_GOOD_BBO_FRESHNESSES = {QUOTE_FRESHNESS_LIVE, QUOTE_FRESHNESS_LAST_VALID}
 _CLOSED_MARKET_LAST_GOOD_BBO_MAX_AGE_SECONDS = 72 * 60 * 60
 _UNSAFE_EXECUTABLE_SOURCE_TOKENS = ("FALLBACK", "LAST_VALID", "LAST_GOOD", "STALE", "INVALID", "CACHE_STALE")
-_CRYPTO_OR_PERP_TOKENS = ("CRYPTO", "PERP", "SWAP")
 _LAST_SKIP_LOG_AT: dict[str, float] = {}
 
 
@@ -29,27 +24,6 @@ class ContractQuoteNotLive(ValueError):
 
 def _normalized(value: Any) -> str:
     return str(value or "").strip().upper()
-
-
-def _attr(source: Any, name: str) -> Any:
-    if source is None:
-        return None
-    if isinstance(source, dict):
-        return source.get(name)
-    return getattr(source, name, None)
-
-
-def _is_crypto_or_perp_contract(quote: dict[str, Any], contract_symbol: Any = None) -> bool:
-    category = _normalized(_attr(contract_symbol, "category") or quote.get("category"))
-    if category:
-        return category in _CRYPTO_OR_PERP_TOKENS
-
-    values = (_attr(contract_symbol, "provider_symbol"), quote.get("provider_symbol"), quote.get("symbol"))
-    for value in values:
-        normalized = _normalized(value)
-        if any(token in normalized for token in _CRYPTO_OR_PERP_TOKENS):
-            return True
-    return False
 
 
 def _valid_bbo(quote: dict[str, Any]) -> tuple[float, float] | None:
@@ -65,91 +39,6 @@ def _valid_bbo(quote: dict[str, Any]) -> tuple[float, float] | None:
     return bid_value, ask_value
 
 
-def _has_mark_or_derivable_mid(quote: dict[str, Any]) -> bool:
-    try:
-        mark_value = float(quote.get("mark_price"))
-    except Exception:
-        mark_value = 0
-    if mark_value > 0:
-        return True
-    return _valid_bbo(quote) is not None
-
-
-def _coerce_quote_timestamp(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        dt = value
-    elif isinstance(value, (int, float)):
-        timestamp = float(value)
-        if timestamp > 1_000_000_000_000:
-            timestamp = timestamp / 1000
-        try:
-            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        except Exception:
-            return None
-    else:
-        raw = str(value or "").strip()
-        if not raw:
-            return None
-        if raw.isdigit():
-            return _coerce_quote_timestamp(float(raw))
-        try:
-            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except Exception:
-            return None
-
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def _last_good_bbo_timestamp(quote: dict[str, Any]) -> datetime | None:
-    for key in ("last_good_at", "ts", "timestamp", "time"):
-        dt = _coerce_quote_timestamp(quote.get(key))
-        if dt is not None:
-            return dt
-    return None
-
-
-def _last_good_bbo_is_recent(quote: dict[str, Any]) -> bool:
-    calendar_valid = quote.get("last_good_bbo_valid")
-    if isinstance(calendar_valid, bool):
-        return calendar_valid
-    dt = _last_good_bbo_timestamp(quote)
-    if dt is None:
-        return False
-    age_seconds = (datetime.now(timezone.utc) - dt).total_seconds()
-    # Conservative 72h cap: enough for a weekend closure, but rejects long-lived frozen BBO.
-    return 0 <= age_seconds <= _CLOSED_MARKET_LAST_GOOD_BBO_MAX_AGE_SECONDS
-
-
-def _allows_closed_market_last_good_bbo(quote: dict[str, Any], contract_symbol: Any = None) -> bool:
-    # Product exception for tradfi CFD symbols explicitly configured by operations.
-    # It does not make stale/fallback/last-valid quotes executable in normal error paths.
-    market_status = _normalized(quote.get("market_status") if isinstance(quote, dict) else None)
-    source = _normalized((quote.get("quote_source") or quote.get("source")) if isinstance(quote, dict) else None)
-    quote_freshness = _normalized(quote.get("quote_freshness") if isinstance(quote, dict) else None)
-    mode = _normalized(
-        _attr(contract_symbol, "closed_market_execution_mode")
-        or quote.get("closed_market_execution_mode")
-        or CLOSED_MARKET_EXECUTION_DISABLED
-    )
-    return (
-        mode == CLOSED_MARKET_EXECUTION_LAST_GOOD_BBO
-        and market_status in _CLOSED_MARKET_LAST_GOOD_BBO_STATUSES
-        and source == QUOTE_SOURCE_LAST_GOOD_BBO
-        and (
-            quote_freshness in _CLOSED_MARKET_LAST_GOOD_BBO_FRESHNESSES
-            or quote.get("last_good_bbo_valid") is True
-        )
-        and _last_good_bbo_is_recent(quote)
-        and _valid_bbo(quote) is not None
-        and _has_mark_or_derivable_mid(quote)
-        and not _is_crypto_or_perp_contract(quote, contract_symbol)
-    )
-
-
 def executable_contract_quote_rejection_reason(
     quote: dict[str, Any],
     *,
@@ -162,8 +51,12 @@ def executable_contract_quote_rejection_reason(
     quote_freshness = _normalized(quote.get("quote_freshness") if isinstance(quote, dict) else None)
     source = _normalized((quote.get("quote_source") or quote.get("source")) if isinstance(quote, dict) else None)
     market_status = _normalized(quote.get("market_status") if isinstance(quote, dict) else None)
-    if _allows_closed_market_last_good_bbo(quote, contract_symbol):
-        return None
+    trading_session = resolve_contract_trading_session(
+        contract_symbol=contract_symbol,
+        quote=quote,
+    )
+    if not trading_session.trading_allowed:
+        return str(trading_session.reason_code or "non_trading_session").lower()
     if not market_status or market_status in _NON_EXECUTABLE_MARKET_STATUSES:
         return "market_closed_not_executable"
     if quote_freshness != QUOTE_FRESHNESS_LIVE:

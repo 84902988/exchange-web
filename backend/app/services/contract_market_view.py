@@ -8,36 +8,46 @@ from sqlalchemy.orm import Session
 
 from app.db.models.contract_symbol import ContractSymbol
 from app.services.contract_market_guard import (
-    CLOSED_MARKET_EXECUTION_LAST_GOOD_BBO,
     QUOTE_FRESHNESS_LIVE,
     QUOTE_SOURCE_LAST_GOOD_BBO,
 )
 from app.services.contract_market_service import (
     ContractSymbolNotFound,
     get_contract_depth,
+    get_contract_klines,
     get_contract_quote,
+)
+from app.services.contract_trading_session_resolver import (
+    SESSION_AFTER_HOURS,
+    SESSION_CLOSED,
+    SESSION_HOLIDAY,
+    SESSION_PRE_MARKET,
+    resolve_contract_trading_session,
 )
 
 
 DISPLAY_STATE_LOADING = "LOADING"
 DISPLAY_STATE_LIVE_TRADABLE = "LIVE_TRADABLE"
-DISPLAY_STATE_CLOSED_LAST_GOOD_TRADABLE = "CLOSED_LAST_GOOD_TRADABLE"
-DISPLAY_STATE_CLOSED_LAST_GOOD_DISPLAY_ONLY = "CLOSED_LAST_GOOD_DISPLAY_ONLY"
 DISPLAY_STATE_EXPIRED = "EXPIRED"
 DISPLAY_STATE_UNAVAILABLE = "UNAVAILABLE"
 
 DISPLAY_PRICE_SOURCE_LIVE_MID = "LIVE_MID"
-DISPLAY_PRICE_SOURCE_LAST_GOOD_BBO_MID = "LAST_GOOD_BBO_MID"
+DISPLAY_PRICE_SOURCE_KLINE_CLOSE = "KLINE_CLOSE"
 DISPLAY_PRICE_SOURCE_NONE = "NONE"
 
 EXECUTION_MODE_LIVE_BBO = "LIVE_BBO"
-EXECUTION_MODE_CLOSED_LAST_GOOD_BBO = "CLOSED_LAST_GOOD_BBO"
-EXECUTION_MODE_DISPLAY_ONLY = "DISPLAY_ONLY"
 EXECUTION_MODE_DISABLED = "DISABLED"
 
 MARKET_TYPE_CONTRACT = "CONTRACT"
 _CLOSED_MARKET_STATUSES = {"CLOSED", "HOLIDAY"}
+_NON_REALTIME_BBO_SESSION_TYPES = {"PRE_MARKET", "PREMARKET", "AFTER_HOURS", "POST_MARKET", "POSTMARKET", "CLOSED", "HOLIDAY"}
 _TRADFI_CATEGORIES = {"STOCK", "FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES", "INDEX", "CFD"}
+_NON_TRADING_DISPLAY_STATES = {
+    SESSION_PRE_MARKET,
+    SESSION_AFTER_HOURS,
+    SESSION_CLOSED,
+    SESSION_HOLIDAY,
+}
 _LAST_GOOD_BBO_MAX_AGE_MS = 72 * 60 * 60 * 1000
 
 
@@ -178,6 +188,28 @@ def _payload_time(payload: Optional[dict[str, Any]]) -> Optional[datetime]:
     )
 
 
+def _latest_kline_open_time(latest_kline: Optional[dict[str, Any]]) -> Optional[datetime]:
+    if not isinstance(latest_kline, dict):
+        return None
+    return (
+        _to_datetime(latest_kline.get("open_time_ms"))
+        or _to_datetime(latest_kline.get("open_time"))
+        or _to_datetime(latest_kline.get("time"))
+        or _to_datetime(latest_kline.get("t"))
+    )
+
+
+def _latest_kline_close(latest_kline: Optional[dict[str, Any]]) -> Optional[Decimal]:
+    if not isinstance(latest_kline, dict):
+        return None
+    return _first_decimal(
+        latest_kline.get("close"),
+        latest_kline.get("c"),
+        latest_kline.get("last"),
+        latest_kline.get("p"),
+    )
+
+
 def _last_good_time(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> Optional[datetime]:
     return (
         _to_datetime((quote or {}).get("last_good_at"))
@@ -189,6 +221,21 @@ def _last_good_time(quote: Optional[dict[str, Any]], depth: Optional[dict[str, A
 
 def _market_status(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> str:
     return _normalized((quote or {}).get("market_status") or (depth or {}).get("market_status") or "UNKNOWN")
+
+
+def _market_session_type(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> str:
+    return _normalized((quote or {}).get("market_session_type") or (depth or {}).get("market_session_type"))
+
+
+def _is_non_realtime_bbo_window(
+    *,
+    quote: Optional[dict[str, Any]],
+    depth: Optional[dict[str, Any]],
+    market_status: str,
+) -> bool:
+    if market_status in _CLOSED_MARKET_STATUSES:
+        return True
+    return _market_session_type(quote, depth) in _NON_REALTIME_BBO_SESSION_TYPES
 
 
 def _closed_market_execution_mode(contract_symbol: Any, quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> str:
@@ -208,6 +255,10 @@ def _explicit_last_good_valid(quote: Optional[dict[str, Any]], depth: Optional[d
     return None
 
 
+def _has_last_good_bbo_source(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> bool:
+    return _payload_source(quote) == QUOTE_SOURCE_LAST_GOOD_BBO or _payload_source(depth) == QUOTE_SOURCE_LAST_GOOD_BBO
+
+
 def _last_good_bbo_valid(
     *,
     quote: Optional[dict[str, Any]],
@@ -221,13 +272,29 @@ def _last_good_bbo_valid(
         return False
     if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
         return False
-    if _payload_source(quote) != QUOTE_SOURCE_LAST_GOOD_BBO and _payload_source(depth) != QUOTE_SOURCE_LAST_GOOD_BBO:
+    if not _has_last_good_bbo_source(quote, depth):
         return False
     explicit = _explicit_last_good_valid(quote, depth)
     if explicit is not None:
         return explicit
     age = _price_age_ms(_last_good_time(quote, depth), now)
     return age is not None and age <= _LAST_GOOD_BBO_MAX_AGE_MS
+
+
+def _last_good_bbo_older_than_latest_kline(
+    *,
+    quote: Optional[dict[str, Any]],
+    depth: Optional[dict[str, Any]],
+    market_status: str,
+    latest_kline: Optional[dict[str, Any]],
+) -> bool:
+    if not _has_last_good_bbo_source(quote, depth):
+        return False
+    if not _is_non_realtime_bbo_window(quote=quote, depth=depth, market_status=market_status):
+        return False
+    last_good_at = _last_good_time(quote, depth)
+    latest_kline_time = _latest_kline_open_time(latest_kline)
+    return last_good_at is not None and latest_kline_time is not None and latest_kline_time > last_good_at
 
 
 def _raw_executable(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> Optional[bool]:
@@ -244,14 +311,60 @@ def _raw_source_summary(
     depth: Optional[dict[str, Any]],
     executable: Optional[bool],
     market_status: str,
+    latest_kline: Optional[dict[str, Any]],
+    trading_session: Any,
+    last_good_bbo_valid_raw: bool,
 ) -> dict[str, Any]:
+    latest_kline_open_time = _latest_kline_open_time(latest_kline)
+    latest_kline_close = _latest_kline_close(latest_kline)
     return {
         "quote_source": (quote or {}).get("quote_source") or (quote or {}).get("source"),
         "depth_source": (depth or {}).get("quote_source") or (depth or {}).get("source"),
         "quote_freshness": (quote or {}).get("quote_freshness") or (depth or {}).get("quote_freshness"),
         "executable": executable,
         "market_status": market_status,
+        "market_session_type": getattr(trading_session, "session_type", None),
+        "trading_allowed": getattr(trading_session, "trading_allowed", None),
+        "trading_session_reason_code": getattr(trading_session, "reason_code", None),
+        "closed_market_execution_mode": _closed_market_execution_mode(contract_symbol=None, quote=quote, depth=depth),
+        "last_good_bbo_source": _has_last_good_bbo_source(quote, depth),
+        "last_good_bbo_valid_raw": last_good_bbo_valid_raw,
+        "latest_kline_open_time": latest_kline_open_time.isoformat() if latest_kline_open_time else None,
+        "latest_kline_close": _format_decimal(latest_kline_close),
     }
+
+
+def _append_warning_once(warnings: list[str], value: str) -> None:
+    if value not in warnings:
+        warnings.append(value)
+
+
+def _should_load_latest_kline_for_last_good_check(
+    *,
+    quote: Optional[dict[str, Any]],
+    depth: Optional[dict[str, Any]],
+    contract_symbol: Any,
+    now: Optional[datetime] = None,
+) -> bool:
+    category = _contract_category(contract_symbol, quote, depth)
+    market_status = _market_status(quote, depth)
+    trading_session = resolve_contract_trading_session(
+        contract_symbol=contract_symbol,
+        quote=quote,
+        depth=depth,
+        now=now,
+    )
+    return (
+        category in _TRADFI_CATEGORIES
+        and not _is_crypto_contract(contract_symbol, quote, depth)
+        and (
+            trading_session.session_type in {SESSION_PRE_MARKET, SESSION_AFTER_HOURS}
+            or (
+                _has_last_good_bbo_source(quote, depth)
+                and _is_non_realtime_bbo_window(quote=quote, depth=depth, market_status=market_status)
+            )
+        )
+    )
 
 
 def build_contract_market_view(
@@ -259,6 +372,7 @@ def build_contract_market_view(
     *,
     quote: Optional[dict[str, Any]] = None,
     depth: Optional[dict[str, Any]] = None,
+    latest_kline: Optional[dict[str, Any]] = None,
     contract_symbol: Any = None,
     warnings: Optional[list[str]] = None,
     now: Optional[datetime] = None,
@@ -273,15 +387,28 @@ def build_contract_market_view(
     category = _contract_category(contract_symbol, quote, depth)
     is_crypto = _is_crypto_contract(contract_symbol, quote, depth)
     market_status = _market_status(quote, depth)
+    trading_session = resolve_contract_trading_session(
+        contract_symbol=contract_symbol,
+        quote=quote,
+        depth=depth,
+        now=now_dt,
+    )
     bid, ask, bbo_payload = _bbo_from_payloads(quote, depth)
     spread = ask - bid if bid is not None and ask is not None else None
     mid = (bid + ask) / Decimal("2") if bid is not None and ask is not None else None
+    latest_kline_close = _latest_kline_close(latest_kline)
     bbo_freshness = _payload_freshness(bbo_payload)
     quote_freshness = _payload_freshness(quote)
     raw_executable = _raw_executable(quote, depth)
     has_bbo = bid is not None and ask is not None and ask >= bid
     is_closed = market_status in _CLOSED_MARKET_STATUSES
-    last_good_valid = _last_good_bbo_valid(
+    last_good_older_than_kline = _last_good_bbo_older_than_latest_kline(
+        quote=quote,
+        depth=depth,
+        market_status=market_status,
+        latest_kline=latest_kline,
+    )
+    last_good_valid_raw = _last_good_bbo_valid(
         quote=quote,
         depth=depth,
         market_status=market_status,
@@ -289,8 +416,7 @@ def build_contract_market_view(
         ask=ask,
         now=now_dt,
     )
-    execution_mode_config = _closed_market_execution_mode(contract_symbol, quote, depth)
-    last_good_allowed = execution_mode_config == CLOSED_MARKET_EXECUTION_LAST_GOOD_BBO
+    last_good_valid = last_good_valid_raw and not last_good_older_than_kline
 
     display_state = DISPLAY_STATE_UNAVAILABLE
     display_price_source = DISPLAY_PRICE_SOURCE_NONE
@@ -304,9 +430,6 @@ def build_contract_market_view(
     if not quote and not depth:
         display_state = DISPLAY_STATE_UNAVAILABLE
         reason_code = "NO_MARKET_DATA"
-    elif not has_bbo:
-        display_state = DISPLAY_STATE_UNAVAILABLE
-        reason_code = "BBO_UNAVAILABLE"
     elif is_crypto:
         if not is_closed and bbo_freshness == QUOTE_FRESHNESS_LIVE and raw_executable is not False:
             display_state = DISPLAY_STATE_LIVE_TRADABLE
@@ -322,7 +445,19 @@ def build_contract_market_view(
             reason_code = "CRYPTO_BBO_NOT_LIVE" if display_state == DISPLAY_STATE_EXPIRED else "CRYPTO_BBO_UNAVAILABLE"
             display_price = mid if display_state == DISPLAY_STATE_EXPIRED else None
             display_price_source = DISPLAY_PRICE_SOURCE_LIVE_MID if display_price is not None else DISPLAY_PRICE_SOURCE_NONE
-    elif not is_closed and bbo_freshness == QUOTE_FRESHNESS_LIVE and raw_executable is not False:
+    elif not trading_session.trading_allowed:
+        session_state = trading_session.session_type
+        display_state = session_state if session_state in _NON_TRADING_DISPLAY_STATES else DISPLAY_STATE_UNAVAILABLE
+        reason_code = trading_session.reason_code or "NON_TRADING_SESSION"
+        if session_state in {SESSION_PRE_MARKET, SESSION_AFTER_HOURS} and latest_kline_close is not None:
+            display_price = latest_kline_close
+            display_price_source = DISPLAY_PRICE_SOURCE_KLINE_CLOSE
+        elif display_state == DISPLAY_STATE_UNAVAILABLE:
+            reason_code = "NON_TRADING_SESSION"
+    elif not has_bbo:
+        display_state = DISPLAY_STATE_UNAVAILABLE
+        reason_code = "BBO_UNAVAILABLE"
+    elif bbo_freshness == QUOTE_FRESHNESS_LIVE and raw_executable is not False:
         display_state = DISPLAY_STATE_LIVE_TRADABLE
         display_price_source = DISPLAY_PRICE_SOURCE_LIVE_MID
         execution_mode = EXECUTION_MODE_LIVE_BBO
@@ -331,25 +466,9 @@ def build_contract_market_view(
         display_price = mid
         execution_bid = bid
         execution_ask = ask
-    elif is_closed and last_good_valid:
-        display_price = mid
-        display_price_source = DISPLAY_PRICE_SOURCE_LAST_GOOD_BBO_MID
-        if last_good_allowed and category in _TRADFI_CATEGORIES:
-            display_state = DISPLAY_STATE_CLOSED_LAST_GOOD_TRADABLE
-            execution_mode = EXECUTION_MODE_CLOSED_LAST_GOOD_BBO
-            executable = True
-            execution_bid = bid
-            execution_ask = ask
-            reason_code = "CLOSED_LAST_GOOD_BBO_ALLOWED"
-        else:
-            display_state = DISPLAY_STATE_CLOSED_LAST_GOOD_DISPLAY_ONLY
-            execution_mode = EXECUTION_MODE_DISPLAY_ONLY
-            reason_code = "CLOSED_LAST_GOOD_BBO_DISPLAY_ONLY"
-    elif is_closed and (_payload_source(quote) == QUOTE_SOURCE_LAST_GOOD_BBO or _payload_source(depth) == QUOTE_SOURCE_LAST_GOOD_BBO):
+    elif last_good_older_than_kline or (is_closed and _has_last_good_bbo_source(quote, depth)):
         display_state = DISPLAY_STATE_EXPIRED
-        display_price = mid
-        display_price_source = DISPLAY_PRICE_SOURCE_LAST_GOOD_BBO_MID
-        reason_code = "LAST_GOOD_BBO_EXPIRED"
+        reason_code = "LAST_GOOD_BBO_OLDER_THAN_KLINE" if last_good_older_than_kline else "LAST_GOOD_BBO_DIAGNOSTIC_ONLY"
     else:
         display_state = DISPLAY_STATE_EXPIRED if quote_freshness or bbo_freshness else DISPLAY_STATE_UNAVAILABLE
         display_price = mid if display_state == DISPLAY_STATE_EXPIRED else None
@@ -358,12 +477,17 @@ def build_contract_market_view(
 
     quote_time = _payload_time(bbo_payload) or _payload_time(quote) or _payload_time(depth)
     source_warnings = list(warnings or [])
-    if display_state == DISPLAY_STATE_CLOSED_LAST_GOOD_DISPLAY_ONLY:
-        source_warnings.append("last_good_bbo_display_only")
+    if last_good_older_than_kline:
+        _append_warning_once(source_warnings, "KLINE_QUOTE_SESSION_MISMATCH")
+        _append_warning_once(source_warnings, "LAST_GOOD_BBO_OLDER_THAN_KLINE")
+    if not trading_session.trading_allowed and display_state != DISPLAY_STATE_UNAVAILABLE:
+        _append_warning_once(source_warnings, "non_trading_session")
+    if _has_last_good_bbo_source(quote, depth):
+        _append_warning_once(source_warnings, "last_good_bbo_diagnostic_only")
     if display_state == DISPLAY_STATE_EXPIRED:
-        source_warnings.append("market_price_expired")
+        _append_warning_once(source_warnings, "market_price_expired")
     if not has_bbo:
-        source_warnings.append("missing_bbo")
+        _append_warning_once(source_warnings, "missing_bbo")
 
     return {
         "symbol": normalized_symbol,
@@ -381,7 +505,7 @@ def build_contract_market_view(
         "execution_bid": _format_decimal(execution_bid),
         "execution_ask": _format_decimal(execution_ask),
         "execution_mode": execution_mode,
-        "last_good_bbo_valid": last_good_valid,
+        "last_good_bbo_valid": False,
         "price_age_ms": _price_age_ms(quote_time, now_dt),
         "quote_time": quote_time,
         "last_good_at": _last_good_time(quote, depth),
@@ -392,6 +516,9 @@ def build_contract_market_view(
             depth=depth,
             executable=raw_executable,
             market_status=market_status,
+            latest_kline=latest_kline,
+            trading_session=trading_session,
+            last_good_bbo_valid_raw=last_good_valid_raw,
         ),
     }
 
@@ -405,6 +532,7 @@ def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
     )
     quote: Optional[dict[str, Any]] = None
     depth: Optional[dict[str, Any]] = None
+    latest_kline: Optional[dict[str, Any]] = None
     warnings: list[str] = []
 
     try:
@@ -425,10 +553,22 @@ def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
     except Exception as exc:
         warnings.append(f"depth_unavailable:{type(exc).__name__}")
 
+    if _should_load_latest_kline_for_last_good_check(
+        quote=quote,
+        depth=depth,
+        contract_symbol=contract_symbol,
+    ):
+        try:
+            rows = get_contract_klines(db, symbol=normalized_symbol, interval="1m", limit=1)
+            latest_kline = rows[-1] if rows else None
+        except Exception as exc:
+            warnings.append(f"kline_unavailable:{type(exc).__name__}")
+
     return build_contract_market_view(
         normalized_symbol,
         quote=quote,
         depth=depth,
+        latest_kline=latest_kline,
         contract_symbol=contract_symbol,
         warnings=warnings,
     )
