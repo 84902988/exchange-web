@@ -33,7 +33,7 @@ PROVIDER_ITICK = "ITICK"
 _SUPPORTED_DEPTH_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
 _SUPPORTED_TRADES_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
 _SUPPORTED_TICKER_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
-_SUPPORTED_KLINE_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
+_SUPPORTED_KLINE_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
 _OKX_KLINE_CHANNELS = {
     "1m": "candle1m",
     "5m": "candle5m",
@@ -76,6 +76,8 @@ class ProviderKlineSubscription:
     provider_symbol: str
     interval: str
     channel: str
+    ws_symbol: Optional[str] = None
+    ws_url: Optional[str] = None
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -88,6 +90,13 @@ def _normalize_interval(value: Any) -> str:
 
 def _okx_kline_channel(interval: Any) -> Optional[str]:
     return _OKX_KLINE_CHANNELS.get(_normalize_interval(interval))
+
+
+def _itick_kline_channel(interval: Any) -> Optional[str]:
+    normalized_interval = _normalize_interval(interval)
+    if normalized_interval == "1m":
+        return "kline@1"
+    return None
 
 
 def _normalize_contract_category(value: Any) -> str:
@@ -222,6 +231,14 @@ def provider_ws_itick_quote_enabled() -> bool:
     return bool(
         provider_ws_ticker_enabled()
         and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_ENABLED", False)
+    )
+
+
+def provider_ws_itick_kline_enabled() -> bool:
+    return bool(
+        provider_ws_kline_enabled()
+        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_ENABLED", False)
+        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_KLINE_ENABLED", False)
     )
 
 
@@ -471,6 +488,56 @@ class ContractMarketProviderWsService:
             ws_url=ws_url,
         )
 
+    def _itick_kline_subscription_for_symbol(
+        self,
+        db: Session,
+        symbol: str,
+        interval: str,
+    ) -> Optional[ProviderKlineSubscription]:
+        normalized_symbol = _normalize_symbol(symbol)
+        normalized_interval = _normalize_interval(interval)
+        channel = _itick_kline_channel(normalized_interval)
+        if not normalized_symbol or not channel or not provider_ws_itick_kline_enabled():
+            return None
+        contract_symbol = (
+            db.query(ContractSymbol)
+            .filter(ContractSymbol.symbol == normalized_symbol)
+            .filter(ContractSymbol.status == 1)
+            .first()
+        )
+        if contract_symbol is None:
+            return None
+        provider_code = _normalize_symbol(getattr(contract_symbol, "provider", None))
+        if provider_code != PROVIDER_ITICK:
+            return None
+        provider_symbol = _normalize_symbol(
+            getattr(contract_symbol, "provider_symbol", None)
+            or normalized_symbol.replace("_PERP", "")
+        )
+        if not provider_symbol:
+            return None
+        ws_symbol = _itick_quote_subscription_symbol(
+            provider_symbol,
+            getattr(contract_symbol, "category", None),
+        )
+        if not ws_symbol:
+            return None
+        ws_url = _itick_ws_url_for_category(
+            getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_URL", ""),
+            getattr(contract_symbol, "category", None),
+        )
+        if not ws_url:
+            return None
+        return ProviderKlineSubscription(
+            local_symbol=normalized_symbol,
+            provider=PROVIDER_ITICK,
+            provider_symbol=provider_symbol,
+            interval=normalized_interval,
+            channel=channel,
+            ws_symbol=ws_symbol,
+            ws_url=ws_url,
+        )
+
     def select_fresh_depth_for_enabled_providers(
         self,
         db: Session,
@@ -625,6 +692,42 @@ class ContractMarketProviderWsService:
             return None
         normalized_symbol = _normalize_symbol(symbol)
         normalized_interval = _normalize_interval(interval)
+        itick_subscription = self._itick_kline_subscription_for_symbol(db, normalized_symbol, normalized_interval)
+        if itick_subscription is not None:
+            if is_contract_market_provider_in_cooldown(PROVIDER_ITICK):
+                logger.debug(
+                    "contract_provider_ws_kline_skipped_cooldown provider=%s symbol=%s interval=%s",
+                    PROVIDER_ITICK,
+                    normalized_symbol,
+                    normalized_interval,
+                )
+                self.stop_kline_subscription(
+                    local_symbol=normalized_symbol,
+                    provider=PROVIDER_ITICK,
+                    interval=normalized_interval,
+                )
+            else:
+                if ensure_subscription:
+                    self.ensure_kline_subscription(
+                        local_symbol=itick_subscription.local_symbol,
+                        provider=itick_subscription.provider,
+                        provider_symbol=itick_subscription.provider_symbol,
+                        interval=itick_subscription.interval,
+                        ws_symbol=itick_subscription.ws_symbol,
+                        ws_url=itick_subscription.ws_url,
+                    )
+                kline = self.get_fresh_provider_ws_kline(
+                    normalized_symbol,
+                    normalized_interval,
+                    PROVIDER_ITICK,
+                    max_age_ms=int(
+                        getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_KLINE_MAX_AGE_MS", 90000)
+                        or 90000
+                    ),
+                )
+                if kline is not None:
+                    return kline
+                return None
         channel = _okx_kline_channel(normalized_interval)
         if not channel:
             return None
@@ -818,6 +921,8 @@ class ContractMarketProviderWsService:
         provider: str,
         provider_symbol: str,
         interval: str,
+        ws_symbol: Optional[str] = None,
+        ws_url: Optional[str] = None,
     ) -> None:
         if not provider_ws_kline_enabled():
             return
@@ -825,7 +930,10 @@ class ContractMarketProviderWsService:
         provider_code = _normalize_symbol(provider)
         normalized_provider_symbol = _normalize_symbol(provider_symbol)
         normalized_interval = _normalize_interval(interval)
-        channel = _okx_kline_channel(normalized_interval)
+        if provider_code == PROVIDER_ITICK and not provider_ws_itick_kline_enabled():
+            logger.debug("contract_provider_ws_kline_itick_disabled symbol=%s interval=%s", normalized_symbol, normalized_interval)
+            return
+        channel = _itick_kline_channel(normalized_interval) if provider_code == PROVIDER_ITICK else _okx_kline_channel(normalized_interval)
         if provider_code not in _SUPPORTED_KLINE_WS_PROVIDERS or not channel:
             logger.debug(
                 "contract_provider_ws_kline_unsupported provider=%s symbol=%s interval=%s",
@@ -855,6 +963,8 @@ class ContractMarketProviderWsService:
                 provider_symbol=normalized_provider_symbol,
                 interval=normalized_interval,
                 channel=channel,
+                ws_symbol=_normalize_symbol(ws_symbol or provider_symbol),
+                ws_url=str(ws_url or "").strip() or None,
             )
             thread = threading.Thread(
                 target=self._run_kline_subscription_thread,
@@ -1537,12 +1647,17 @@ class ContractMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        if subscription.provider != PROVIDER_OKX_SWAP:
+        if subscription.provider not in _SUPPORTED_KLINE_WS_PROVIDERS:
             return
         reconnect_delay = 1.0
         while not stop_event.is_set() and provider_ws_kline_enabled():
             try:
-                await self._run_okx_kline_ws(subscription, stop_event, generation)
+                if subscription.provider == PROVIDER_ITICK:
+                    if not provider_ws_itick_kline_enabled():
+                        break
+                    await self._run_itick_kline_ws(subscription, stop_event, generation)
+                else:
+                    await self._run_okx_kline_ws(subscription, stop_event, generation)
                 reconnect_delay = 1.0
             except asyncio.CancelledError:
                 raise
@@ -1853,6 +1968,74 @@ class ContractMarketProviderWsService:
                     subscription.interval,
                 )
 
+    async def _run_itick_kline_ws(
+        self,
+        subscription: ProviderKlineSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if stop_event.is_set() or not provider_ws_itick_kline_enabled():
+            return
+        url = str(subscription.ws_url or getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_URL", "") or "").strip()
+        if not url:
+            raise ValueError("CONTRACT_PROVIDER_WS_ITICK_URL is required")
+        ws_symbol = _normalize_symbol(subscription.ws_symbol or subscription.provider_symbol)
+        if not ws_symbol:
+            raise ValueError("iTick provider WS kline subscription symbol is required")
+        subscribe_payload = {
+            "ac": "subscribe",
+            "params": ws_symbol,
+            "types": subscription.channel,
+        }
+        key = (subscription.provider, subscription.local_symbol, subscription.interval)
+        connect_kwargs = {
+            "ping_interval": 20,
+            "ping_timeout": 10,
+            "close_timeout": 5,
+            **_websocket_header_kwargs(_itick_ws_headers()),
+        }
+        async with websockets.connect(url, **connect_kwargs) as websocket:
+            if stop_event.is_set() or not provider_ws_itick_kline_enabled():
+                await websocket.close()
+                return
+            loop = asyncio.get_running_loop()
+            with self._lock:
+                current_generation = self._kline_generations.get(key)
+                if current_generation != generation:
+                    stop_event.set()
+                    return
+                self._kline_connections[key] = (loop, websocket)
+            logger.info(
+                "contract_provider_ws_kline_subscription_started provider=%s symbol=%s provider_symbol=%s interval=%s channel=%s ws_symbol=%s",
+                subscription.provider,
+                subscription.local_symbol,
+                subscription.provider_symbol,
+                subscription.interval,
+                subscription.channel,
+                ws_symbol,
+            )
+            try:
+                await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                while not stop_event.is_set() and provider_ws_itick_kline_enabled():
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    self._handle_itick_kline_message(subscription, raw_message)
+            finally:
+                with self._lock:
+                    current = self._kline_connections.get(key)
+                    if current is not None and current[1] is websocket:
+                        self._kline_connections.pop(key, None)
+                logger.info(
+                    "contract_provider_ws_kline_subscription_stopped provider=%s symbol=%s provider_symbol=%s interval=%s ws_symbol=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.provider_symbol,
+                    subscription.interval,
+                    ws_symbol,
+                )
+
     def _handle_okx_depth_message(
         self,
         subscription: ProviderDepthSubscription,
@@ -1997,6 +2180,51 @@ class ContractMarketProviderWsService:
         payload = self._normalize_okx_kline(subscription, row)
         if payload is not None:
             self._set_kline_cache(subscription, payload)
+
+    def _handle_itick_kline_message(
+        self,
+        subscription: ProviderKlineSubscription,
+        raw_message: Any,
+    ) -> None:
+        try:
+            message = json.loads(raw_message)
+        except Exception:
+            logger.debug(
+                "contract_provider_ws_itick_kline_invalid_json symbol=%s interval=%s",
+                subscription.local_symbol,
+                subscription.interval,
+            )
+            return
+        for row in self._extract_itick_kline_rows(message):
+            payload = self._normalize_itick_kline(subscription, row)
+            if payload is not None:
+                self._set_kline_cache(subscription, payload)
+
+    def _extract_itick_kline_rows(self, message: Any) -> list[dict[str, Any]]:
+        if isinstance(message, list):
+            rows: list[dict[str, Any]] = []
+            for item in message:
+                rows.extend(self._extract_itick_kline_rows(item))
+            return rows
+        if not isinstance(message, dict):
+            return []
+        data = message.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict) and self._looks_like_itick_kline(item)]
+        if isinstance(data, dict):
+            return [data] if self._looks_like_itick_kline(data) else []
+        tick = message.get("tick")
+        if isinstance(tick, dict) and self._looks_like_itick_kline(tick):
+            return [tick]
+        if self._looks_like_itick_kline(message):
+            return [message]
+        return []
+
+    def _looks_like_itick_kline(self, row: dict[str, Any]) -> bool:
+        row_type = str(row.get("type") or row.get("types") or "").strip().lower()
+        if row_type and row_type != "kline@1":
+            return False
+        return all(key in row for key in ("o", "h", "l", "c", "t"))
 
     def _normalize_okx_trade(
         self,
@@ -2193,6 +2421,54 @@ class ContractMarketProviderWsService:
             "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_freshness": "LIVE",
             "exchange_ts": row[0],
+        }
+
+    def _normalize_itick_kline(
+        self,
+        subscription: ProviderKlineSubscription,
+        row: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        if str(row.get("type") or "").strip().lower() not in {"", "kline@1"}:
+            return None
+        open_time_ms = _timestamp_ms_from_value(row.get("t"))
+        open_price = _to_decimal(row.get("o"))
+        high_price = _to_decimal(row.get("h"))
+        low_price = _to_decimal(row.get("l"))
+        close_price = _to_decimal(row.get("c"))
+        if (
+            open_time_ms <= 0
+            or open_price is None
+            or high_price is None
+            or low_price is None
+            or close_price is None
+        ):
+            return None
+        volume = _to_decimal(row.get("v"))
+        quote_volume = _to_decimal(row.get("tu"))
+        return {
+            "symbol": subscription.local_symbol,
+            "provider": PROVIDER_ITICK,
+            "provider_symbol": subscription.provider_symbol,
+            "ws_symbol": subscription.ws_symbol or subscription.provider_symbol,
+            "interval": subscription.interval,
+            "open_time_ms": open_time_ms,
+            "open_time": open_time_ms,
+            "time": int(open_time_ms / 1000),
+            "open": format(open_price, "f"),
+            "high": format(high_price, "f"),
+            "low": format(low_price, "f"),
+            "close": format(close_price, "f"),
+            "volume": format(volume or Decimal("0"), "f"),
+            "quote_volume": format(quote_volume, "f") if quote_volume is not None else None,
+            "turnover": format(quote_volume, "f") if quote_volume is not None else None,
+            "is_closed": False,
+            "is_final": False,
+            "source": CONTRACT_PROVIDER_WS_SOURCE,
+            "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
+            "quote_freshness": "LIVE",
+            "exchange_ts": row.get("t"),
+            "exchange_symbol": row.get("s"),
+            "raw_type": row.get("type"),
         }
 
     def _set_trades_cache(
