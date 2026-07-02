@@ -29,7 +29,7 @@ type ContractFuturesOrderBookProps = {
   refreshKey?: number;
   currentPrice?: string | number | null;
   currentPriceReady?: boolean;
-  currentPriceSource?: 'KLINE_CLOSE' | 'TRADE';
+  currentPriceSource?: 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK';
   currentPriceLabel?: string | null;
   marketUiState?: {
     label: string;
@@ -51,6 +51,13 @@ type ContractFuturesOrderBookProps = {
     ts?: string | number | null;
     bidsCount?: number;
     asksCount?: number;
+  }) => void;
+  onLiveBboChange?: (payload: {
+    bid: number | null;
+    ask: number | null;
+    mid: number | null;
+    source: 'LIVE_MID' | null;
+    updatedAt: number;
   }) => void;
   initialDepth?: {
     symbol?: string | null;
@@ -114,6 +121,14 @@ function getDepthModeLabel(mode?: string | null) {
 
 function normalizeDepthMode(mode?: string | null) {
   return String(mode || '').trim().toUpperCase();
+}
+
+function normalizeCurrentPriceSource(value?: string | null) {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (normalized === 'TRADE_TICK') return 'TRADE_TICK';
+  if (normalized === 'LIVE_MID') return 'LIVE_MID';
+  if (normalized === 'KLINE_CLOSE') return 'KLINE_CLOSE';
+  return null;
 }
 
 function quoteStatusBadgeClass(status: ContractQuoteDisplayStatus) {
@@ -325,6 +340,7 @@ export default function ContractFuturesOrderBook({
   quoteLoading = false,
   onPriceSelect,
   onBestPricesChange,
+  onLiveBboChange,
   initialDepth,
   onDepthDataChange,
 }: ContractFuturesOrderBookProps) {
@@ -625,6 +641,45 @@ export default function ContractFuturesOrderBook({
   }, [displayBids, normalizedDisplayDepthMode]);
   const currentPriceNumber = toPositivePrice(currentPrice);
   const hasCurrentPrice = currentPriceReady && currentPriceNumber !== null;
+  const normalizedCurrentPriceSource = normalizeCurrentPriceSource(currentPriceSource) || 'KLINE_CLOSE';
+  const bestBidNumber = toPositivePrice(bestPrices.bestBid);
+  const bestAskNumber = toPositivePrice(bestPrices.bestAsk);
+  const bboMidPrice = bestBidNumber !== null && bestAskNumber !== null && bestAskNumber >= bestBidNumber
+    ? (bestBidNumber + bestAskNumber) / 2
+    : null;
+  useEffect(() => {
+    if (!onLiveBboChange) return;
+    if (bestBidNumber !== null && bestAskNumber !== null && bboMidPrice !== null) {
+      onLiveBboChange({
+        bid: bestBidNumber,
+        ask: bestAskNumber,
+        mid: bboMidPrice,
+        source: 'LIVE_MID',
+        updatedAt: Date.now(),
+      });
+      return;
+    }
+    onLiveBboChange({
+      bid: null,
+      ask: null,
+      mid: null,
+      source: null,
+      updatedAt: Date.now(),
+    });
+  }, [bestAskNumber, bestBidNumber, bboMidPrice, onLiveBboChange]);
+  const marketViewDisplayPrice = toPositivePrice(marketView?.display_price);
+  const marketViewDisplaySource = marketViewDisplayPrice !== null
+    ? normalizeCurrentPriceSource(marketView?.current_price_source || marketView?.display_price_source)
+    : null;
+  const centerPriceNumber = normalizedCurrentPriceSource === 'TRADE_TICK' && hasCurrentPrice
+    ? currentPriceNumber
+    : bboMidPrice ?? marketViewDisplayPrice ?? currentPriceNumber;
+  const normalizedCenterPriceSource = normalizedCurrentPriceSource === 'TRADE_TICK' && hasCurrentPrice
+    ? 'TRADE_TICK'
+    : bboMidPrice !== null
+      ? 'LIVE_MID'
+      : marketViewDisplaySource || normalizedCurrentPriceSource;
+  const hasCenterPrice = centerPriceNumber !== null;
   const priceClass =
     priceDirection === 'up'
       ? 'text-[#00c087]'
@@ -662,32 +717,31 @@ export default function ContractFuturesOrderBook({
   const marketViewDisplayState = normalizeMarketViewDisplayState(marketView?.display_state);
   const marketViewDisplayStatus = marketViewStateToQuoteStatus(marketViewDisplayState);
   const depthDisplayStatus = marketUiState?.status || (
-    hasCurrentPrice
+    hasCenterPrice
       ? (marketViewDisplayStatus || fallbackDepthDisplayStatus)
       : 'LOADING'
   );
-  const hasDepthQuoteStatus = !!marketUiState || !hasCurrentPrice || !!marketViewDisplayStatus || depthDisplayStatus === 'LOADING'
+  const hasDepthQuoteStatus = !!marketUiState || !hasCenterPrice || !!marketViewDisplayStatus || depthDisplayStatus === 'LOADING'
     || hasConfirmedDepthStatus
     || shouldUseQuoteFallbackStatus;
-  const depthStatusLabel = marketUiState?.label || (!hasCurrentPrice
+  const depthStatusLabel = marketUiState?.label || (!hasCenterPrice
     ? t('marketDataLoadingLabel', 'contracts')
     : marketViewDisplayState && marketViewDisplayStatus
     ? getMarketViewStatusLabel(marketViewDisplayState, t)
     : getQuoteStatusLabel(depthDisplayStatus, t));
   const titleLabel = t('orderBook', 'contracts');
   const depthModeLabel = getDepthModeLabel(displayDepthMode);
-  const centerDisplayPrice = !hasCurrentPrice || currentPriceNumber === null
+  const centerDisplayPrice = !hasCenterPrice || centerPriceNumber === null
     ? '--'
-    : formatPrice(currentPriceNumber, pricePrecision);
-  const centerSelectPrice = !hasCurrentPrice || currentPriceNumber === null
+    : formatPrice(centerPriceNumber, pricePrecision);
+  const centerSelectPrice = !hasCenterPrice || centerPriceNumber === null
     ? null
-    : String(currentPriceNumber);
-  const normalizedCurrentPriceSource = currentPriceSource === 'TRADE' ? 'TRADE' : 'KLINE_CLOSE';
-  const centerLabel = currentPriceLabel || (
-    normalizedCurrentPriceSource === 'TRADE'
-      ? t('latestPrice', 'contracts')
-      : t('klineLatestPrice', 'contracts')
-  );
+    : String(centerPriceNumber);
+  const centerLabel = normalizedCenterPriceSource === 'TRADE_TICK'
+    ? currentPriceLabel || t('latestPrice', 'contracts')
+    : normalizedCenterPriceSource === 'LIVE_MID'
+      ? t('midPrice', 'contracts')
+      : t('klineLatestPrice', 'contracts');
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
@@ -742,7 +796,7 @@ export default function ContractFuturesOrderBook({
             onClick={() => {
               if (centerSelectPrice) onPriceSelect?.(centerSelectPrice);
             }}
-            data-price-source={normalizedCurrentPriceSource}
+            data-price-source={normalizedCenterPriceSource}
             className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${priceClass}`}
           >
             <span className="mb-1 block text-[10px] font-medium leading-none text-white/42">{centerLabel}</span>

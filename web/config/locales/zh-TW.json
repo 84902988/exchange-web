@@ -2247,6 +2247,7 @@
     "amount": "數量",
     "total": "總金額",
     "latestPrice": "最新成交價",
+    "midPrice": "\u4e2d\u9593\u50f9",
     "klineLatestPrice": "K線最新價",
     "orderBook": "訂單",
     "tradeHistory": "成交記錄",

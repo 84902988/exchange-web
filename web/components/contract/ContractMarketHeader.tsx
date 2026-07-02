@@ -23,7 +23,7 @@ type ContractMarketHeaderProps = {
   quoteFreshness?: string | null;
   marketSessionType?: string | null;
   priceDirection?: PriceDirection;
-  priceSource?: 'KLINE_CLOSE' | 'TRADE';
+  priceSource?: 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK';
   priceSourceLabel?: string | null;
 };
 

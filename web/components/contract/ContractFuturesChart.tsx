@@ -47,6 +47,8 @@ import {
 } from '@/lib/realtime/contractMarketRealtime';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 
+export type ContractKlineMode = 'TRADE_DRIVEN' | 'QUOTE_DRIVEN' | 'PROVIDER_KLINE';
+
 type ContractFuturesChartProps = {
   symbol: string;
   interval: string;
@@ -61,6 +63,9 @@ type ContractFuturesChartProps = {
   referencePriceLineEnabled?: boolean;
   referencePriceLinePrice?: string | number | null;
   referencePriceLineLabel?: string | null;
+  currentPrice?: string | number | null;
+  currentPriceSource?: 'TRADE_TICK' | 'LIVE_MID' | 'KLINE_CLOSE';
+  klineMode?: ContractKlineMode;
   onLatestKlineCloseChange?: (price: string | null) => void;
   positionOverlay?: ContractPositionOverlay | null;
   positionEntryOverlays?: PositionEntryOverlay[];
@@ -88,6 +93,11 @@ export type PositionTpSlOverlay = {
 };
 
 type ContractPriceLine = ReturnType<ISeriesApi<'Candlestick'>['createPriceLine']>;
+type RealtimeTradeTick = {
+  price: number;
+  quantity: number | null;
+  timeMs: number;
+};
 
 const CHART_KEYBOARD_STEP = 3;
 const CHART_KEYBOARD_FAST_STEP = 10;
@@ -434,6 +444,57 @@ function normalizeMilliseconds(value: unknown) {
   return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
 }
 
+function intervalSeconds(interval: string) {
+  const normalized = String(interval || '1m').trim().toLowerCase();
+  if (normalized === '5m') return 5 * 60;
+  if (normalized === '15m') return 15 * 60;
+  if (normalized === '30m') return 30 * 60;
+  if (normalized === '1h') return 60 * 60;
+  if (normalized === '4h') return 4 * 60 * 60;
+  if (normalized === '1d') return 24 * 60 * 60;
+  return 60;
+}
+
+function tradeBucketTimeSeconds(timeMs: number, interval: string) {
+  const seconds = Math.floor(timeMs / 1000);
+  const bucketSize = intervalSeconds(interval);
+  return Math.floor(seconds / bucketSize) * bucketSize;
+}
+
+function getRealtimeTradePayloads(message: ContractMarketRealtimeMessage) {
+  if (Array.isArray(message.trades)) return message.trades;
+  if (isRecord(message.trade)) return [message.trade];
+  if (Array.isArray(message.data)) return message.data;
+  if (isRecord(message.data)) return [message.data];
+  return [message];
+}
+
+function extractRealtimeTradeTick(
+  message: ContractMarketRealtimeMessage,
+  currentSymbol: string,
+): RealtimeTradeTick | null {
+  for (const payload of getRealtimeTradePayloads(message)) {
+    if (!isRecord(payload)) continue;
+    const msgSymbol = String(message.symbol || payload.symbol || '').trim().toUpperCase();
+    if (msgSymbol && msgSymbol !== currentSymbol.toUpperCase()) continue;
+    const priceSource = String(payload.price_source || '').trim().toUpperCase();
+    if (priceSource !== 'TRADE_TICK') continue;
+    const price = parseChartPrice(payload.price as string | number | null | undefined)
+      ?? parseChartPrice(payload.last_price as string | number | null | undefined);
+    if (price === null) continue;
+    const qty = parseChartPrice(
+      (payload.qty ?? payload.amount ?? payload.quantity ?? payload.volume) as string | number | null | undefined,
+    );
+    const timeMs = normalizeMilliseconds(payload.time ?? payload.ts ?? payload.timestamp);
+    return {
+      price,
+      quantity: qty,
+      timeMs,
+    };
+  }
+  return null;
+}
+
 function extractRealtimeKline(
   message: ContractMarketRealtimeMessage,
   currentSymbol: string,
@@ -509,6 +570,94 @@ function upsertRealtimeKline(
   };
 }
 
+function upsertTradeTickCandle(
+  candles: CandleItem[],
+  volumes: VolumeItem[],
+  trade: RealtimeTradeTick,
+  interval: string,
+) {
+  const bucketTime = tradeBucketTimeSeconds(trade.timeMs, interval);
+  const latest = getLatestRealCandle(candles);
+  const existing = candles.find((item) => !item.isPlaceholder && item.time === bucketTime) || null;
+  if (!existing && latest && bucketTime < latest.time) return null;
+
+  const base = existing || {
+    time: bucketTime,
+    open: trade.price,
+    high: trade.price,
+    low: trade.price,
+    close: trade.price,
+    volume: 0,
+    isPlaceholder: false,
+  };
+  const nextVolume = trade.quantity !== null && trade.quantity > 0
+    ? base.volume + trade.quantity
+    : base.volume;
+  const candle: CandleItem = {
+    ...base,
+    high: Math.max(base.high, trade.price),
+    low: Math.min(base.low, trade.price),
+    close: trade.price,
+    volume: nextVolume,
+    isPlaceholder: false,
+  };
+  return upsertRealtimeKline(
+    candles,
+    volumes,
+    candle,
+    makeVolume(candle.time, candle.volume, candle.open, candle.close),
+  );
+}
+
+function upsertQuoteDrivenCandle(
+  candles: CandleItem[],
+  volumes: VolumeItem[],
+  price: number,
+  interval: string,
+  timeMs = Date.now(),
+) {
+  const bucketTime = tradeBucketTimeSeconds(timeMs, interval);
+  const latest = getLatestRealCandle(candles);
+  const existing = candles.find((item) => !item.isPlaceholder && item.time === bucketTime) || null;
+  if (latest && bucketTime < latest.time) return null;
+  if (latest && existing && existing.time < latest.time) return null;
+
+  const base = existing || {
+    time: bucketTime,
+    open: latest?.close ?? price,
+    high: price,
+    low: price,
+    close: price,
+    volume: 0,
+    isPlaceholder: false,
+  };
+  const nextHigh = Math.max(base.high, price);
+  const nextLow = Math.min(base.low, price);
+  if (
+    existing &&
+    existing.close === price &&
+    existing.high === nextHigh &&
+    existing.low === nextLow
+  ) {
+    return null;
+  }
+
+  const candle: CandleItem = {
+    ...base,
+    high: nextHigh,
+    low: nextLow,
+    close: price,
+    volume: base.volume,
+    isPlaceholder: false,
+  };
+  return upsertRealtimeKline(
+    candles,
+    volumes,
+    candle,
+    makeVolume(candle.time, candle.volume, candle.open, candle.close),
+  );
+}
+
 function mergeCandlesByTime(base: CandleItem[], incoming: CandleItem[]) {
   const byTime = new Map<number, CandleItem>();
   [...base, ...incoming].forEach((item) => {
@@ -540,6 +689,9 @@ export default function ContractFuturesChart({
   referencePriceLineEnabled = false,
   referencePriceLinePrice,
   referencePriceLineLabel = null,
+  currentPrice,
+  currentPriceSource = 'KLINE_CLOSE',
+  klineMode = 'PROVIDER_KLINE',
   onLatestKlineCloseChange,
   positionOverlay = null,
   positionEntryOverlays = [],
@@ -697,10 +849,13 @@ export default function ContractFuturesChart({
     });
 
     const latest = getLatestRealCandle(allCandles);
-    const currentPrice = shouldUseManagedRange
+    const sourcePrice = currentPriceSource === 'TRADE_TICK' || currentPriceSource === 'LIVE_MID' || currentPriceSource === 'KLINE_CLOSE'
+      ? currentPrice
+      : null;
+    const displayPrice = shouldUseManagedRange
       ? referencePrice
-      : firstValidPrice(latest?.close);
-    if (currentPrice !== null) values.push(currentPrice);
+      : firstValidPrice(sourcePrice, latest?.close);
+    if (displayPrice !== null) values.push(displayPrice);
 
     const finiteValues = values.filter((value) => Number.isFinite(value) && value > 0);
     if (!finiteValues.length) return;
@@ -728,6 +883,8 @@ export default function ContractFuturesChart({
     });
   }, [
     precision,
+    currentPrice,
+    currentPriceSource,
     referencePriceLineEnabled,
     referencePriceLinePrice,
   ]);
@@ -1139,12 +1296,70 @@ export default function ContractFuturesChart({
       });
     };
 
+    const applyRealtimeTradeTick = (message: ContractMarketRealtimeMessage) => {
+      if (marketStatus === 'CLOSED') return;
+
+      const trade = extractRealtimeTradeTick(message, symbol);
+      if (!trade) return;
+      const updated = upsertTradeTickCandle(
+        candlesRef.current,
+        volumesRef.current,
+        trade,
+        interval,
+      );
+      if (!updated) return;
+
+      const normalized = setKlinePairState(
+        { candlesRef, volumesRef, oldestTimeRef },
+        { setCandles, setVolumes },
+        updated.nextCandles,
+        updated.nextVolumes,
+      );
+      setLoading(false);
+      setError('');
+      writeContractKlineCache(symbol, interval, {
+        candles: normalized.candles,
+        volumes: normalized.volumes,
+      });
+    };
+
     const unsubscribeKline = contractMarketRealtime.subscribe('kline', applyRealtimeUpdate);
+    const unsubscribeTrade = contractMarketRealtime.subscribe('trade', applyRealtimeTradeTick);
 
     return () => {
       unsubscribeKline();
+      unsubscribeTrade();
     };
   }, [interval, marketStatus, symbol]);
+
+  useEffect(() => {
+    if (marketStatus === 'CLOSED') return;
+    if (klineMode !== 'QUOTE_DRIVEN' || currentPriceSource !== 'LIVE_MID') return;
+
+    const liveMidPrice = firstValidPrice(currentPrice);
+    if (liveMidPrice === null) return;
+
+    const updated = upsertQuoteDrivenCandle(
+      candlesRef.current,
+      volumesRef.current,
+      liveMidPrice,
+      interval,
+    );
+    if (!updated) return;
+
+    const normalized = setKlinePairState(
+      { candlesRef, volumesRef, oldestTimeRef },
+      { setCandles, setVolumes },
+      updated.nextCandles,
+      updated.nextVolumes,
+    );
+    setLoading(false);
+    setError('');
+    writeContractKlineCache(symbol, interval, {
+      candles: normalized.candles,
+      volumes: normalized.volumes,
+    });
+  }, [candles, currentPrice, currentPriceSource, interval, klineMode, marketStatus, symbol]);
 
   useEffect(() => {
     if (!candleSeriesRef.current || !volumeSeriesRef.current) return;
@@ -1251,9 +1466,12 @@ export default function ContractFuturesChart({
     const series = candleSeriesRef.current;
     const latest = getLatestRealCandle(candles);
     const referencePrice = firstValidPrice(referencePriceLinePrice);
+    const sourcePrice = currentPriceSource === 'TRADE_TICK' || currentPriceSource === 'LIVE_MID' || currentPriceSource === 'KLINE_CLOSE'
+      ? currentPrice
+      : null;
     const price = referencePriceLineEnabled
       ? referencePrice
-      : firstValidPrice(latest?.close);
+      : firstValidPrice(sourcePrice, latest?.close);
     const title = referencePriceLineEnabled ? referencePriceLineLabel || '' : '';
 
     if (!series) return;
@@ -1295,6 +1513,8 @@ export default function ContractFuturesChart({
     });
   }, [
     candles,
+    currentPrice,
+    currentPriceSource,
     referencePriceLineEnabled,
     referencePriceLineLabel,
     referencePriceLinePrice,
