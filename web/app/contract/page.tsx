@@ -4,6 +4,7 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { useRouter, useSearchParams } from 'next/navigation';
 import ContractAccountPanel from '@/components/contract/ContractAccountPanel';
 import ContractFuturesChart, {
+  type ContractKlineMode,
   type ContractPositionOverlay,
   type PositionEntryOverlay,
   type PositionTpSlOverlay,
@@ -37,6 +38,7 @@ import {
   type ContractMarketViewDetail,
   type ContractQuoteDisplayStatus,
   type ContractTickerItem,
+  type ContractMarketTrade,
   type ContractPositionItem,
   type ContractPositionSummaryItem,
   type ContractSymbolItem,
@@ -48,7 +50,24 @@ type RightPanelTab = 'orderbook' | 'trades';
 type ContractUrlCategory = 'usdt' | 'stock' | 'cfd' | '';
 type ContractDataScope = 'current' | 'all';
 type ContractTranslator = (key: string, namespace?: 'contracts' | 'markets') => string;
-type CurrentPriceSource = 'KLINE_CLOSE' | 'TRADE';
+type CurrentPriceSource = 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK';
+type ContractMarketState = {
+  symbol: string;
+  displayPrice: number | null;
+  displayPriceSource: CurrentPriceSource;
+  displayPriceLabel: string;
+  bestBid: number | null;
+  bestAsk: number | null;
+  executionBid: number | null;
+  executionAsk: number | null;
+  latestTradePrice: number | null;
+  latestTradePriceSource: 'TRADE_TICK' | null;
+  klineMode: ContractKlineMode;
+  quoteFreshness: string | null;
+  displayState: string | null;
+  executable: boolean | null;
+  updatedAt: number;
+};
 type MarketUiState = {
   label: string;
   isLoading: boolean;
@@ -57,9 +76,42 @@ type MarketUiState = {
   reason: string;
   status: ContractQuoteDisplayStatus;
 };
+type LiveDepthBbo = {
+  bid: number | null;
+  ask: number | null;
+  mid: number | null;
+  source: 'LIVE_MID' | null;
+  updatedAt: number;
+};
+
+function normalizeCurrentPriceSource(value?: string | null): CurrentPriceSource | null {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (normalized === 'TRADE_TICK') return 'TRADE_TICK';
+  if (normalized === 'LIVE_MID') return 'LIVE_MID';
+  if (normalized === 'KLINE_CLOSE') return 'KLINE_CLOSE';
+  return null;
+}
 
 const DEFAULT_CONTRACT_SYMBOL = 'BTCUSDT_PERP';
+const LIVE_DEPTH_BBO_TTL_MS = 5000;
 const CFD_CONTRACT_CATEGORIES = new Set(['GOLD', 'FUTURES', 'INDEX', 'FOREX', 'METAL', 'COMMODITY']);
+const CRYPTO_CONTRACT_BASES = new Set([
+  'BTC',
+  'ETH',
+  'BNB',
+  'SOL',
+  'XRP',
+  'DOGE',
+  'ADA',
+  'AVAX',
+  'MATIC',
+  'DOT',
+  'LTC',
+  'BCH',
+  'LINK',
+  'TRX',
+  'TON',
+]);
 
 const CONTRACT_SYMBOL_OPTIONS = [
   { contractSymbol: DEFAULT_CONTRACT_SYMBOL, marketSymbol: 'BTCUSDT', pricePrecision: 1 },
@@ -133,6 +185,12 @@ function getContractUrlForResolvedSymbol(category: ContractUrlCategory, symbol: 
 
 function contractSymbolToMarketSymbol(symbol: string) {
   return symbol.replace(/_PERP$/, '');
+}
+
+function isKnownCryptoContractSymbol(symbol: string) {
+  const marketSymbol = contractSymbolToMarketSymbol(symbol).toUpperCase();
+  const base = marketSymbol.replace(/(USDT|USDC|USD)$/, '');
+  return CRYPTO_CONTRACT_BASES.has(base);
 }
 
 function getContractDisplayLabel(item: ContractSymbolItem, t: ContractTranslator) {
@@ -483,7 +541,9 @@ function ContractPageContent() {
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
   const [contractDataScope, setContractDataScope] = useState<ContractDataScope>('current');
   const [selectedPrice, setSelectedPrice] = useState<string | null>(null);
-  const [currentPrice, setCurrentPrice] = useState<string | null>(null);
+  const [klineClosePrice, setKlineClosePrice] = useState<string | null>(null);
+  const [lastTradePrice, setLastTradePrice] = useState<string | null>(null);
+  const [liveDepthBbo, setLiveDepthBbo] = useState<LiveDepthBbo | null>(null);
   const [currentPriceDirection, setCurrentPriceDirection] = useState<PriceDirection>('flat');
   const [contractMarketView, setContractMarketView] = useState<ContractMarketViewDetail | null>(null);
   const [contractMarketViewLoading, setContractMarketViewLoading] = useState(true);
@@ -519,11 +579,8 @@ function ContractPageContent() {
   const {
     marketSymbol,
     quantityUnit,
-    priceDirection,
     bestBid,
     bestAsk,
-    bestBidFromDepth,
-    bestAskFromDepth,
     contractQuote,
     contractQuoteLoading,
     contractAvailabilityError,
@@ -531,7 +588,6 @@ function ContractPageContent() {
     quoteHint,
     marketRealtimeStatus,
     initialDepth,
-    applyLatestPrice,
     handleBestPricesChange,
     handleDepthDataChange,
   } = useContractMarketState({
@@ -540,10 +596,14 @@ function ContractPageContent() {
     symbolOptionMarketSymbol: symbolOption?.marketSymbol,
     symbolOptionPricePrecision: currentContractPair?.pricePrecision ?? symbolOption?.pricePrecision,
   });
-  const isCryptoContract = isCryptoContractPair(currentContractPair) || (!!symbolOption && !currentContractPair);
   const activeContractMarketView = normalizeContractSymbol(contractMarketView?.symbol) === contractSymbol
     ? contractMarketView
     : null;
+  const marketViewCategory = normalizeContractCategoryValue(activeContractMarketView?.category);
+  const isCryptoContract = isCryptoContractPair(currentContractPair)
+    || marketViewCategory === 'CRYPTO'
+    || isKnownCryptoContractSymbol(contractSymbol)
+    || (!!symbolOption && !currentContractPair);
   const contractMarketStatus = contractQuote?.market_status || contractTicker?.market_status || currentContractPair?.marketStatus || null;
   const contractMarketStatusText = contractQuote?.market_status_text || contractTicker?.market_status_text || currentContractPair?.marketStatusText || null;
   const contractQuoteFreshness = contractQuote?.quote_freshness || contractTicker?.quote_freshness || null;
@@ -556,7 +616,35 @@ function ContractPageContent() {
   );
   const marketViewQuoteDisplayStatus = marketViewStateToQuoteStatus(marketViewDisplayState);
   const effectiveQuoteDisplayStatus = marketViewQuoteDisplayStatus || contractQuoteDisplayStatus;
-  const currentPriceNumber = getPositivePrice(currentPrice);
+  const marketViewDisplayPrice = getPositivePrice(activeContractMarketView?.display_price);
+  const marketViewCurrentPriceSource = marketViewDisplayPrice !== null
+    ? normalizeCurrentPriceSource(
+      activeContractMarketView?.current_price_source || activeContractMarketView?.display_price_source,
+    ) || 'LIVE_MID'
+    : null;
+  const marketViewTradePrice = marketViewCurrentPriceSource === 'TRADE_TICK'
+    ? getPositivePrice(activeContractMarketView?.last_trade_price ?? activeContractMarketView?.display_price)
+    : null;
+  const tradeTickPrice = getPositivePrice(lastTradePrice) ?? marketViewTradePrice;
+  const liveDepthMidPrice = getPositivePrice(liveDepthBbo?.mid);
+  const liveDepthMidFresh = liveDepthBbo?.source === 'LIVE_MID'
+    && liveDepthMidPrice !== null
+    && Date.now() - liveDepthBbo.updatedAt <= LIVE_DEPTH_BBO_TTL_MS;
+  const klineClosePriceNumber = getPositivePrice(klineClosePrice);
+  const contractDisplayPriceSource: CurrentPriceSource = tradeTickPrice !== null
+    ? 'TRADE_TICK'
+    : liveDepthMidFresh
+      ? 'LIVE_MID'
+      : marketViewCurrentPriceSource || 'KLINE_CLOSE';
+  const contractDisplayPrice = tradeTickPrice !== null
+    ? tradeTickPrice
+    : liveDepthMidFresh
+      ? liveDepthMidPrice
+      : marketViewDisplayPrice !== null
+        ? marketViewDisplayPrice
+        : klineClosePriceNumber;
+  const currentPriceSource = contractDisplayPriceSource;
+  const currentPriceNumber = contractDisplayPrice;
   const currentPriceReady = currentPriceNumber !== null;
   const currentPriceDisplay = currentPriceReady
     ? formatPrice(currentPriceNumber, pricePrecision)
@@ -641,17 +729,112 @@ function ContractPageContent() {
   const chartReferencePriceLineEnabled = false;
   const chartReferencePriceLinePrice = null;
   const chartReferencePriceLineLabel = null;
-  const currentPriceSource: CurrentPriceSource = 'KLINE_CLOSE';
-  const currentPriceSourceLabel = t('klineLatestPrice', 'contracts');
+  const currentPriceSourceLabel = currentPriceSource === 'TRADE_TICK'
+    ? t('latestPrice', 'contracts')
+    : currentPriceSource === 'LIVE_MID'
+      ? t('midPrice', 'contracts')
+      : t('klineLatestPrice', 'contracts');
+  const contractKlineMode: ContractKlineMode = currentPriceSource === 'TRADE_TICK'
+    ? 'TRADE_DRIVEN'
+    : currentPriceSource === 'LIVE_MID' && !isCryptoContract && marketUiState.isTradable
+      ? 'QUOTE_DRIVEN'
+      : 'PROVIDER_KLINE';
+  const contractMarketState = useMemo<ContractMarketState>(() => {
+    const liveBid = liveDepthMidFresh ? getPositivePrice(liveDepthBbo?.bid) : null;
+    const liveAsk = liveDepthMidFresh ? getPositivePrice(liveDepthBbo?.ask) : null;
+    const marketViewBid = getPositivePrice(activeContractMarketView?.best_bid);
+    const marketViewAsk = getPositivePrice(activeContractMarketView?.best_ask);
+    const quoteBid = getPositivePrice(contractQuote?.best_bid ?? contractQuote?.bid_price ?? contractQuote?.bid);
+    const quoteAsk = getPositivePrice(contractQuote?.best_ask ?? contractQuote?.ask_price ?? contractQuote?.ask);
+    const quoteTime = activeContractMarketView?.quote_time
+      ? Date.parse(String(activeContractMarketView.quote_time))
+      : NaN;
+
+    return {
+      symbol: contractSymbol,
+      displayPrice: contractDisplayPrice,
+      displayPriceSource: contractDisplayPriceSource,
+      displayPriceLabel: currentPriceSourceLabel,
+      bestBid: liveBid ?? marketViewBid ?? getPositivePrice(bestBid) ?? quoteBid,
+      bestAsk: liveAsk ?? marketViewAsk ?? getPositivePrice(bestAsk) ?? quoteAsk,
+      executionBid: getPositivePrice(activeContractMarketView?.execution_bid),
+      executionAsk: getPositivePrice(activeContractMarketView?.execution_ask),
+      latestTradePrice: tradeTickPrice,
+      latestTradePriceSource: tradeTickPrice !== null ? 'TRADE_TICK' : null,
+      klineMode: contractKlineMode,
+      quoteFreshness: contractQuoteFreshness,
+      displayState: rawMarketViewDisplayState || contractMarketSessionType || contractMarketStatus || null,
+      executable: activeContractMarketView?.executable ?? contractQuote?.executable ?? null,
+      updatedAt: liveDepthMidFresh && liveDepthBbo
+        ? liveDepthBbo.updatedAt
+        : Number.isFinite(quoteTime)
+          ? quoteTime
+          : Date.now(),
+    };
+  }, [
+    activeContractMarketView,
+    bestAsk,
+    bestBid,
+    contractDisplayPrice,
+    contractDisplayPriceSource,
+    contractKlineMode,
+    contractMarketSessionType,
+    contractMarketStatus,
+    contractQuote,
+    contractQuoteFreshness,
+    contractSymbol,
+    currentPriceSourceLabel,
+    liveDepthBbo,
+    liveDepthMidFresh,
+    rawMarketViewDisplayState,
+    tradeTickPrice,
+  ]);
+  const marketStateBestBid = contractMarketState.bestBid === null ? null : String(contractMarketState.bestBid);
+  const marketStateBestAsk = contractMarketState.bestAsk === null ? null : String(contractMarketState.bestAsk);
   const headerDisplayPrice = currentPriceDisplay;
   const displayLastPrice = currentPriceDisplay;
   const lastGoodQuotePrice = formatPrice(contractQuote?.last_price, pricePrecision);
 
   const handleLatestKlineCloseChange = useCallback((value: string | null) => {
     const nextPrice = getPositivePrice(value);
+    setKlineClosePrice(nextPrice === null ? null : String(nextPrice));
+  }, []);
+
+  const handleLastTradePriceChange = useCallback((
+    value: string,
+    source?: string | null,
+    trade?: ContractMarketTrade,
+  ) => {
+    const normalizedSource = String(source || trade?.price_source || '').trim().toUpperCase();
+    const nextPrice = getPositivePrice(value);
+    if (normalizedSource !== 'TRADE_TICK' || nextPrice === null) {
+      setLastTradePrice(null);
+      return;
+    }
+    setLastTradePrice(String(nextPrice));
+  }, []);
+
+  const handleLiveBboChange = useCallback((payload: LiveDepthBbo) => {
+    const bid = getPositivePrice(payload.bid);
+    const ask = getPositivePrice(payload.ask);
+    const mid = getPositivePrice(payload.mid);
+    if (payload.source !== 'LIVE_MID' || bid === null || ask === null || mid === null || ask < bid) {
+      setLiveDepthBbo(null);
+      return;
+    }
+    setLiveDepthBbo({
+      bid,
+      ask,
+      mid,
+      source: 'LIVE_MID',
+      updatedAt: payload.updatedAt,
+    });
+  }, []);
+
+  useEffect(() => {
+    const nextPrice = currentPriceNumber;
     if (nextPrice === null) {
       currentPriceRef.current = null;
-      setCurrentPrice(null);
       setCurrentPriceDirection('flat');
       return;
     }
@@ -663,8 +846,30 @@ function ContractPageContent() {
       setCurrentPriceDirection(nextPrice > previousPrice ? 'up' : nextPrice < previousPrice ? 'down' : 'flat');
     }
     currentPriceRef.current = nextPrice;
-    setCurrentPrice(String(nextPrice));
-  }, []);
+  }, [currentPriceNumber]);
+
+  useEffect(() => {
+    const source = String(activeContractMarketView?.current_price_source || activeContractMarketView?.display_price_source || '').trim().toUpperCase();
+    const price = activeContractMarketView?.last_trade_price || null;
+    const nextPrice = getPositivePrice(price);
+    if (source === 'TRADE_TICK' && nextPrice !== null) {
+      setLastTradePrice(String(nextPrice));
+    } else {
+      setLastTradePrice(null);
+    }
+  }, [activeContractMarketView]);
+
+  useEffect(() => {
+    if (!liveDepthBbo || liveDepthBbo.mid === null) return undefined;
+    const age = Date.now() - liveDepthBbo.updatedAt;
+    const delay = Math.max(0, LIVE_DEPTH_BBO_TTL_MS - age) + 50;
+    const timer = window.setTimeout(() => {
+      setLiveDepthBbo((current) => (
+        current?.updatedAt === liveDepthBbo.updatedAt ? null : current
+      ));
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [liveDepthBbo]);
 
   useEffect(() => {
     const previousState = previousMarketViewDisplayStateRef.current;
@@ -680,8 +885,8 @@ function ContractPageContent() {
   }, [contractMarketSessionType, contractMarketStatus, rawMarketViewDisplayState]);
   const tpSlTriggerPriceType = normalizeTpSlTriggerPriceType(currentContractPair?.tpSlTriggerPriceType);
   const headerMetrics = useMemo<HeaderMetric[]>(() => {
-    const bidAsk = `${formatPrice(bestBid, pricePrecision)} / ${formatPrice(bestAsk, pricePrecision)}`;
-    const spread = formatHeaderSpread(bestBid, bestAsk, pricePrecision);
+    const bidAsk = `${formatPrice(marketStateBestBid, pricePrecision)} / ${formatPrice(marketStateBestAsk, pricePrecision)}`;
+    const spread = formatHeaderSpread(marketStateBestBid, marketStateBestAsk, pricePrecision);
     if (isCryptoContract) {
       return [
         { label: t('markPrice', 'contracts'), value: formatPrice(contractQuote?.mark_price, pricePrecision) },
@@ -719,8 +924,6 @@ function ContractPageContent() {
       { label: t('bestBidAsk', 'contracts'), value: bidAsk },
     ];
   }, [
-    bestAsk,
-    bestBid,
     contractQuote?.index_price,
     contractQuote?.mark_price,
     contractTicker,
@@ -730,6 +933,8 @@ function ContractPageContent() {
     headerDisplayPrice,
     isCryptoContract,
     lastGoodQuotePrice,
+    marketStateBestAsk,
+    marketStateBestBid,
     pricePrecision,
     quoteStatusLabel,
     t,
@@ -821,7 +1026,9 @@ function ContractPageContent() {
 
   useEffect(() => {
     currentPriceRef.current = null;
-    setCurrentPrice(null);
+    setKlineClosePrice(null);
+    setLastTradePrice(null);
+    setLiveDepthBbo(null);
     setCurrentPriceDirection('flat');
   }, [contractSymbol, interval]);
 
@@ -964,8 +1171,8 @@ function ContractPageContent() {
         quoteFreshness={contractQuoteFreshness}
         marketSessionType={contractMarketSessionType}
         priceDirection={currentPriceDirection}
-        priceSource={currentPriceSource}
-        priceSourceLabel={currentPriceSourceLabel}
+        priceSource={contractMarketState.displayPriceSource}
+        priceSourceLabel={contractMarketState.displayPriceLabel}
       />
 
       <div className="w-full px-2 py-2 xl:px-3 xl:py-2">
@@ -1009,6 +1216,9 @@ function ContractPageContent() {
                       referencePriceLineEnabled={chartReferencePriceLineEnabled}
                       referencePriceLinePrice={chartReferencePriceLinePrice}
                       referencePriceLineLabel={chartReferencePriceLineLabel}
+                      currentPrice={contractMarketState.displayPrice}
+                      currentPriceSource={contractMarketState.displayPriceSource}
+                      klineMode={contractMarketState.klineMode}
                       marketRealtimeStatus={marketRealtimeStatus}
                       marketSessionType={contractMarketSessionType}
                       quoteFreshness={contractQuoteFreshness}
@@ -1059,10 +1269,10 @@ function ContractPageContent() {
                         marketStatus={contractMarketStatus}
                         marketRealtimeStatus={marketRealtimeStatus}
                         refreshKey={marketSessionRefreshKey}
-                        currentPrice={currentPrice}
+                        currentPrice={contractMarketState.displayPrice}
                         currentPriceReady={currentPriceReady}
-                        currentPriceSource={currentPriceSource}
-                        currentPriceLabel={currentPriceSourceLabel}
+                        currentPriceSource={contractMarketState.displayPriceSource}
+                        currentPriceLabel={contractMarketState.displayPriceLabel}
                         marketUiState={marketUiState}
                         marketView={activeContractMarketView}
                         quote={contractQuote}
@@ -1070,6 +1280,7 @@ function ContractPageContent() {
                         initialDepth={initialDepth}
                         onPriceSelect={setSelectedPrice}
                         onBestPricesChange={handleBestPricesChange}
+                        onLiveBboChange={handleLiveBboChange}
                         onDepthDataChange={handleDepthDataChange}
                       />
                     </div>
@@ -1078,11 +1289,11 @@ function ContractPageContent() {
                       <ContractFuturesTrades
                         symbol={contractSymbol}
                         pricePrecision={pricePrecision}
-                        latestPriceDirection={priceDirection}
+                        latestPriceDirection={currentPriceDirection}
                         marketStatus={contractMarketStatus}
                         marketRealtimeStatus={marketRealtimeStatus}
                         onPriceSelect={setSelectedPrice}
-                        onLastPriceChange={applyLatestPrice}
+                        onLastPriceChange={handleLastTradePriceChange}
                       />
                     </div>
                   </div>
@@ -1127,8 +1338,8 @@ function ContractPageContent() {
                   positions={openPositionsForTrading}
                   positionSummaries={positionSummaries}
                   selectedPrice={selectedPrice}
-                  bestBid={bestBidFromDepth}
-                  bestAsk={bestAskFromDepth}
+                  bestBid={marketStateBestBid}
+                  bestAsk={marketStateBestAsk}
                   pricePrecision={pricePrecision}
                   quantityUnit={quantityUnit}
                   maxLeverage={maxLeverage}

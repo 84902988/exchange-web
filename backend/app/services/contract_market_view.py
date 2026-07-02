@@ -16,6 +16,7 @@ from app.services.contract_market_service import (
     get_contract_depth,
     get_contract_klines,
     get_contract_quote,
+    get_contract_recent_trades,
 )
 from app.services.contract_trading_session_resolver import (
     SESSION_AFTER_HOURS,
@@ -32,6 +33,7 @@ DISPLAY_STATE_EXPIRED = "EXPIRED"
 DISPLAY_STATE_UNAVAILABLE = "UNAVAILABLE"
 
 DISPLAY_PRICE_SOURCE_LIVE_MID = "LIVE_MID"
+DISPLAY_PRICE_SOURCE_TRADE_TICK = "TRADE_TICK"
 DISPLAY_PRICE_SOURCE_KLINE_CLOSE = "KLINE_CLOSE"
 DISPLAY_PRICE_SOURCE_NONE = "NONE"
 
@@ -210,6 +212,31 @@ def _latest_kline_close(latest_kline: Optional[dict[str, Any]]) -> Optional[Deci
     )
 
 
+def _latest_trade_price(latest_trade: Optional[dict[str, Any]]) -> Optional[Decimal]:
+    if not isinstance(latest_trade, dict):
+        return None
+    price_source = _normalized(latest_trade.get("price_source"))
+    if price_source != DISPLAY_PRICE_SOURCE_TRADE_TICK:
+        return None
+    return _first_decimal(
+        latest_trade.get("price"),
+        latest_trade.get("last_price"),
+    )
+
+
+def _latest_trade_time(latest_trade: Optional[dict[str, Any]]) -> Optional[datetime]:
+    if not isinstance(latest_trade, dict):
+        return None
+    price_source = _normalized(latest_trade.get("price_source"))
+    if price_source != DISPLAY_PRICE_SOURCE_TRADE_TICK:
+        return None
+    return (
+        _to_datetime(latest_trade.get("time"))
+        or _to_datetime(latest_trade.get("ts"))
+        or _to_datetime(latest_trade.get("timestamp"))
+    )
+
+
 def _last_good_time(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> Optional[datetime]:
     return (
         _to_datetime((quote or {}).get("last_good_at"))
@@ -312,14 +339,19 @@ def _raw_source_summary(
     executable: Optional[bool],
     market_status: str,
     latest_kline: Optional[dict[str, Any]],
+    latest_trade: Optional[dict[str, Any]],
     trading_session: Any,
     last_good_bbo_valid_raw: bool,
 ) -> dict[str, Any]:
     latest_kline_open_time = _latest_kline_open_time(latest_kline)
     latest_kline_close = _latest_kline_close(latest_kline)
+    latest_trade_time = _latest_trade_time(latest_trade)
+    latest_trade_price = _latest_trade_price(latest_trade)
     return {
         "quote_source": (quote or {}).get("quote_source") or (quote or {}).get("source"),
         "depth_source": (depth or {}).get("quote_source") or (depth or {}).get("source"),
+        "latest_trade_source": (latest_trade or {}).get("source"),
+        "latest_trade_price_source": (latest_trade or {}).get("price_source"),
         "quote_freshness": (quote or {}).get("quote_freshness") or (depth or {}).get("quote_freshness"),
         "executable": executable,
         "market_status": market_status,
@@ -331,6 +363,8 @@ def _raw_source_summary(
         "last_good_bbo_valid_raw": last_good_bbo_valid_raw,
         "latest_kline_open_time": latest_kline_open_time.isoformat() if latest_kline_open_time else None,
         "latest_kline_close": _format_decimal(latest_kline_close),
+        "latest_trade_time": latest_trade_time.isoformat() if latest_trade_time else None,
+        "latest_trade_price": _format_decimal(latest_trade_price),
     }
 
 
@@ -373,6 +407,7 @@ def build_contract_market_view(
     quote: Optional[dict[str, Any]] = None,
     depth: Optional[dict[str, Any]] = None,
     latest_kline: Optional[dict[str, Any]] = None,
+    latest_trade: Optional[dict[str, Any]] = None,
     contract_symbol: Any = None,
     warnings: Optional[list[str]] = None,
     now: Optional[datetime] = None,
@@ -397,6 +432,8 @@ def build_contract_market_view(
     spread = ask - bid if bid is not None and ask is not None else None
     mid = (bid + ask) / Decimal("2") if bid is not None and ask is not None else None
     latest_kline_close = _latest_kline_close(latest_kline)
+    latest_trade_price = _latest_trade_price(latest_trade)
+    latest_trade_time = _latest_trade_time(latest_trade)
     bbo_freshness = _payload_freshness(bbo_payload)
     quote_freshness = _payload_freshness(quote)
     raw_executable = _raw_executable(quote, depth)
@@ -476,6 +513,16 @@ def build_contract_market_view(
         reason_code = "QUOTE_STALE" if display_state == DISPLAY_STATE_EXPIRED else "BBO_UNAVAILABLE"
 
     quote_time = _payload_time(bbo_payload) or _payload_time(quote) or _payload_time(depth)
+    current_price_source = display_price_source
+    if not is_crypto and latest_trade_price is not None:
+        display_price = latest_trade_price
+        display_price_source = DISPLAY_PRICE_SOURCE_TRADE_TICK
+        current_price_source = DISPLAY_PRICE_SOURCE_TRADE_TICK
+    elif not is_crypto and latest_kline_close is not None and display_price is None:
+        display_price = latest_kline_close
+        display_price_source = DISPLAY_PRICE_SOURCE_KLINE_CLOSE
+        current_price_source = DISPLAY_PRICE_SOURCE_KLINE_CLOSE
+
     source_warnings = list(warnings or [])
     if last_good_older_than_kline:
         _append_warning_once(source_warnings, "KLINE_QUOTE_SESSION_MISMATCH")
@@ -498,6 +545,9 @@ def build_contract_market_view(
         "display_state": display_state,
         "display_price": _format_decimal(display_price),
         "display_price_source": display_price_source,
+        "current_price_source": current_price_source,
+        "last_trade_price": _format_decimal(latest_trade_price),
+        "last_trade_time": latest_trade_time,
         "best_bid": _format_decimal(bid),
         "best_ask": _format_decimal(ask),
         "spread": _format_decimal(spread),
@@ -517,6 +567,7 @@ def build_contract_market_view(
             executable=raw_executable,
             market_status=market_status,
             latest_kline=latest_kline,
+            latest_trade=latest_trade,
             trading_session=trading_session,
             last_good_bbo_valid_raw=last_good_valid_raw,
         ),
@@ -533,6 +584,7 @@ def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
     quote: Optional[dict[str, Any]] = None
     depth: Optional[dict[str, Any]] = None
     latest_kline: Optional[dict[str, Any]] = None
+    latest_trade: Optional[dict[str, Any]] = None
     warnings: list[str] = []
 
     try:
@@ -553,7 +605,19 @@ def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
     except Exception as exc:
         warnings.append(f"depth_unavailable:{type(exc).__name__}")
 
-    if _should_load_latest_kline_for_last_good_check(
+    try:
+        recent_trades = get_contract_recent_trades(db, normalized_symbol, limit=1)
+        first_trade = recent_trades[0] if recent_trades else None
+        if isinstance(first_trade, dict) and _normalized(first_trade.get("price_source")) == DISPLAY_PRICE_SOURCE_TRADE_TICK:
+            latest_trade = first_trade
+    except Exception as exc:
+        warnings.append(f"trade_tick_unavailable:{type(exc).__name__}")
+
+    should_load_current_kline = (
+        _contract_category(contract_symbol, quote, depth) in _TRADFI_CATEGORIES
+        and not _is_crypto_contract(contract_symbol, quote, depth)
+    )
+    if should_load_current_kline or _should_load_latest_kline_for_last_good_check(
         quote=quote,
         depth=depth,
         contract_symbol=contract_symbol,
@@ -569,6 +633,7 @@ def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
         quote=quote,
         depth=depth,
         latest_kline=latest_kline,
+        latest_trade=latest_trade,
         contract_symbol=contract_symbol,
         warnings=warnings,
     )

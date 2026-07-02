@@ -104,6 +104,43 @@ def test_live_tradable_crypto_requires_fresh_bbo():
     assert view["execution_mode"] == "LIVE_BBO"
 
 
+def test_live_tradfi_bbo_display_price_is_not_overwritten_by_kline_close():
+    view = build_contract_market_view(
+        "XAGUSDT_PERP",
+        quote=_quote(
+            symbol="XAGUSDT_PERP",
+            provider="ITICK",
+            category="METAL",
+            quote_source="ITICK_QUOTE",
+            source="ITICK_QUOTE",
+            bid_price="60.120",
+            ask_price="60.130",
+            last_price="60.125",
+            mark_price="60.125",
+        ),
+        depth=_depth(
+            symbol="XAGUSDT_PERP",
+            provider="ITICK",
+            category="METAL",
+            quote_source="ITICK_QUOTE",
+            source="ITICK_QUOTE",
+            best_bid="60.120",
+            best_ask="60.130",
+        ),
+        latest_kline=_kline(close="60.049"),
+        contract_symbol=_contract(symbol="XAGUSDT_PERP", category="METAL", provider="ITICK"),
+        now=NOW,
+    )
+
+    assert view["display_state"] == "LIVE_TRADABLE"
+    assert view["display_price"] == "60.125"
+    assert view["display_price_source"] == "LIVE_MID"
+    assert view["current_price_source"] == "LIVE_MID"
+    assert view["execution_bid"] == "60.120"
+    assert view["execution_ask"] == "60.130"
+    assert view["raw_source_summary"]["latest_kline_close"] == "60.049"
+
+
 def test_crypto_stale_becomes_expired_not_last_good_tradable():
     view = build_contract_market_view(
         "BTCUSDT_PERP",
