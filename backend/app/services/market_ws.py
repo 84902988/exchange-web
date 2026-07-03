@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections import defaultdict
 from decimal import Decimal
 from typing import Dict, Set, Any
@@ -11,7 +12,11 @@ from sqlalchemy.orm import Session
 from starlette.websockets import WebSocketState
 
 from app.services.market import get_market_depth
+from app.services.spot_kline_realtime import apply_spot_trade_to_klines
 from app.services.spot_market_view import get_spot_market_snapshot_payload
+
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -124,6 +129,37 @@ class MarketWsManager:
             },
         }
         await self._send_payload(symbol, payload)
+
+    async def send_kline_update(
+        self,
+        *,
+        db: Session,
+        symbol: str,
+        price: Any,
+        amount: Any,
+        ts: int,
+    ) -> None:
+        """
+        Incremental authoritative spot kline updates generated from completed trades.
+        """
+        symbol = _normalize_symbol(symbol)
+        if not symbol:
+            return
+
+        try:
+            payloads = apply_spot_trade_to_klines(
+                db,
+                symbol=symbol,
+                trade_price=price,
+                trade_amount=amount,
+                trade_ts_ms=ts,
+            )
+        except Exception as exc:
+            logger.warning("spot_kline_update_failed symbol=%s error=%s", symbol, exc)
+            return
+
+        for payload in payloads:
+            await self._send_payload(symbol, payload)
 
     async def send_depth_update(
         self,

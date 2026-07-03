@@ -45,6 +45,7 @@ from app.services.stock_dealer_depth_service import (
     get_stock_trade_context,
     is_stock_dealer_pair,
 )
+from app.services.spot_kline_realtime import SPOT_KLINE_SOURCE_INTERNAL_TRADE
 
 logger = logging.getLogger(__name__)
 
@@ -2517,13 +2518,30 @@ def get_klines(
             return {"symbol": pair.symbol, "interval": interval, "items": items}
         return {"symbol": pair.symbol, "interval": interval, "items": []}
 
-    return _get_internal_klines(
-        db=db,
-        pair=pair,
-        interval=interval,
-        limit=limit,
-        end_time_ms=end_time_ms,
-    )
+    def _fetch_internal_spot_klines(fetch_limit: int, fetch_end_time_ms: Optional[int]):
+        payload = _get_internal_klines(
+            db=db,
+            pair=pair,
+            interval=interval,
+            limit=fetch_limit,
+            end_time_ms=fetch_end_time_ms,
+        )
+        return payload.get("items", [])
+
+    return {
+        "symbol": pair.symbol,
+        "interval": interval,
+        "items": get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol=pair.symbol,
+            interval=interval,
+            limit=limit,
+            end_time_ms=end_time_ms,
+            source=SPOT_KLINE_SOURCE_INTERNAL_TRADE,
+            fetch_external=_fetch_internal_spot_klines,
+        ),
+    }
 
 
 def get_market_depth(db: Session, symbol: str, limit: int = 20):
