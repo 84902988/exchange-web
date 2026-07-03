@@ -259,12 +259,13 @@ export function createSpotTradingViewDatafeed(
   options: SpotTradingViewDatafeedOptions,
 ): SpotTradingViewDatafeed {
   const symbolInfo = buildSymbolInfo(options);
+  const apiSymbol = normalizeSpotSymbol(symbolInfo.ticker || symbolInfo.name);
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
   const unsubscribeByUid = new Map<string, () => void>();
 
   const getLatestBarKey = (resolution: TradingViewResolution | string) =>
-    `${symbolInfo.name}:${normalizeResolution(resolution)}`;
+    `${apiSymbol}:${normalizeResolution(resolution)}`;
 
   return {
     onReady(callback) {
@@ -281,7 +282,7 @@ export function createSpotTradingViewDatafeed(
 
     resolveSymbol(symbolName, onResolve, onError) {
       const requested = normalizeSpotSymbol(symbolName);
-      if (requested && requested !== symbolInfo.name) {
+      if (requested && requested !== apiSymbol) {
         window.setTimeout(() => onError('Unknown symbol'), 0);
         return;
       }
@@ -296,7 +297,7 @@ export function createSpotTradingViewDatafeed(
       const endTime = Number(periodParams.to) > 0 ? Number(periodParams.to) * 1000 : undefined;
 
       void getSpotKlines({
-        symbol: symbolInfo.name,
+        symbol: apiSymbol,
         interval,
         limit,
         endTime,
@@ -334,7 +335,7 @@ export function createSpotTradingViewDatafeed(
         if (message.type !== 'spot_kline_update') return;
 
         const msgSymbol = normalizeSpotSymbol(message.symbol || '');
-        if (msgSymbol !== symbolInfo.name) return;
+        if (msgSymbol !== apiSymbol) return;
 
         const msgInterval = String(message.interval || '').trim().toLowerCase();
         if (msgInterval !== interval) return;
@@ -349,7 +350,7 @@ export function createSpotTradingViewDatafeed(
         onRealtime(bar);
       };
 
-      spotMarketRealtime.setSymbol(symbolInfo.name);
+      spotMarketRealtime.setSymbol(apiSymbol);
       const unsubscribe = spotMarketRealtime.subscribe('kline', handleKline);
       unsubscribeByUid.set(subscriberUid, unsubscribe);
       latestBarKeyByUid.set(subscriberUid, latestBarKey);

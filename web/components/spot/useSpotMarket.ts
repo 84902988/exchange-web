@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   getSpotMarketView,
-  isPollingSpotDataSource,
   normalizeSpotSymbol,
   normalizeSpotTrades,
   type SpotDepthLevel,
@@ -126,6 +125,9 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   const priceDirectionRef = useRef<RealtimePriceDirection>('flat');
   const requestSeqRef = useRef(0);
   const activeSymbolRef = useRef(normalizedSymbol);
+  const refreshInFlightRef = useRef(false);
+  const refreshInFlightSeqRef = useRef(0);
+  const mountedRef = useRef(false);
 
   const applyView = useCallback((view: SpotMarketView) => {
     const nextDepth = normalizeDepth(view.depth);
@@ -156,9 +158,18 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     const requestSymbol = normalizedSymbol;
     if (!requestSymbol) return;
     if (activeSymbolRef.current !== requestSymbol) return;
+    if (
+      refreshInFlightRef.current &&
+      activeSymbolRef.current === requestSymbol
+    ) {
+      return;
+    }
 
     const requestSeq = ++requestSeqRef.current;
+    refreshInFlightRef.current = true;
+    refreshInFlightSeqRef.current = requestSeq;
     const isLatestRequest = () =>
+      mountedRef.current &&
       requestSeqRef.current === requestSeq &&
       activeSymbolRef.current === requestSymbol;
 
@@ -177,6 +188,11 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       const message = err instanceof Error ? err.message : 'Failed to load spot market view';
       setError(message);
     } finally {
+      if (refreshInFlightSeqRef.current === requestSeq) {
+        refreshInFlightRef.current = false;
+        refreshInFlightSeqRef.current = 0;
+      }
+
       if (isLatestRequest()) {
         setIsLoading(false);
       }
@@ -184,7 +200,17 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   }, [applyView, normalizedSymbol]);
 
   useEffect(() => {
+    mountedRef.current = true;
+
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
     requestSeqRef.current += 1;
+    refreshInFlightRef.current = false;
+    refreshInFlightSeqRef.current = 0;
     activeSymbolRef.current = normalizedSymbol;
     const cache = readSpotMarketCache(normalizedSymbol);
     setMarketView(cache?.marketView || null);
@@ -284,7 +310,7 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   }, [applyView, normalizedSymbol]);
 
   useEffect(() => {
-    if (!normalizedSymbol || !isPollingSpotDataSource(marketView?.data_source)) {
+    if (!normalizedSymbol) {
       return undefined;
     }
 
@@ -295,7 +321,7 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     return () => {
       window.clearInterval(timer);
     };
-  }, [marketView?.data_source, normalizedSymbol, refresh]);
+  }, [normalizedSymbol, refresh]);
 
   useEffect(() => {
     return () => {

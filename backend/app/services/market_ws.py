@@ -11,12 +11,19 @@ from fastapi import WebSocket
 from sqlalchemy.orm import Session
 from starlette.websockets import WebSocketState
 
+from app.db.session import SessionLocal
 from app.services.market import get_market_depth
 from app.services.spot_kline_realtime import apply_spot_trade_to_klines
-from app.services.spot_market_view import get_spot_market_snapshot_payload
+from app.services.spot_market_view import (
+    build_empty_spot_market_view,
+    build_spot_market_snapshot_payload,
+    get_spot_market_snapshot_payload,
+)
 
 
 logger = logging.getLogger(__name__)
+SPOT_SNAPSHOT_BUILD_TIMEOUT_SECONDS = 3.0
+SPOT_SNAPSHOT_VIEW_BUDGET_SECONDS = 2.2
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -29,6 +36,24 @@ def _to_str(v: Any) -> str:
     if isinstance(v, Decimal):
         return format(v, "f")
     return str(v)
+
+
+def _spot_snapshot_fallback_payload(symbol: str, reason: str) -> dict:
+    view = build_empty_spot_market_view(symbol=symbol, warnings=[reason])
+    return build_spot_market_snapshot_payload(view)
+
+
+def _build_spot_snapshot_payload(symbol: str) -> dict:
+    db = SessionLocal()
+    try:
+        return get_spot_market_snapshot_payload(
+            db=db,
+            symbol=symbol,
+            total_budget_seconds=SPOT_SNAPSHOT_VIEW_BUDGET_SECONDS,
+            fast_external=True,
+        )
+    finally:
+        db.close()
 
 
 class MarketWsManager:
@@ -99,7 +124,17 @@ class MarketWsManager:
         if not symbol:
             return
 
-        payload = get_spot_market_snapshot_payload(db=db, symbol=symbol)
+        try:
+            payload = await asyncio.wait_for(
+                asyncio.to_thread(_build_spot_snapshot_payload, symbol),
+                timeout=SPOT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("spot_market_snapshot_timeout symbol=%s", symbol)
+            payload = _spot_snapshot_fallback_payload(symbol, "snapshot_timeout")
+        except Exception as exc:
+            logger.warning("spot_market_snapshot_failed symbol=%s error=%s", symbol, exc)
+            payload = _spot_snapshot_fallback_payload(symbol, f"snapshot_unavailable:{exc}")
 
         await self._send_payload(symbol, payload)
 

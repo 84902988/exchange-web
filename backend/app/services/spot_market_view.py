@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Optional
@@ -8,6 +9,9 @@ from sqlalchemy.orm import Session
 
 from app.schemas.market import DepthResponse, TradesResponse
 from app.services.market import get_depth, get_market_tickers, get_trades
+
+
+SPOT_MARKET_VIEW_BUDGET_SECONDS = 2.8
 
 
 def _dump_model(value: Any) -> dict[str, Any]:
@@ -113,12 +117,61 @@ def _serialize_trades(trades: Optional[TradesResponse]) -> Optional[dict[str, An
     }
 
 
+def build_empty_spot_market_view(*, symbol: str, warnings: Optional[list[str]] = None) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    return {
+        "symbol": normalized_symbol,
+        "display_price": None,
+        "display_price_source": "missing",
+        "last_price": None,
+        "best_bid": None,
+        "best_ask": None,
+        "spread": None,
+        "price_direction": "flat",
+        "market_status": "UNKNOWN",
+        "data_source": "UNKNOWN",
+        "depth_status": "missing",
+        "trades_status": "missing",
+        "kline_status": "unknown",
+        "executable": False,
+        "updated_at": datetime.utcnow().isoformat(),
+        "warnings": list(warnings or []),
+        "raw_source_summary": {
+            "ticker_source": None,
+            "ticker_provider": None,
+            "ticker_stale": None,
+            "ticker_error": None,
+            "depth_source": None,
+            "depth_provider": None,
+            "depth_stale": None,
+            "trades_provider": None,
+            "trades_stale": None,
+        },
+        "ticker": None,
+        "depth": None,
+        "trades": None,
+    }
+
+
+def build_spot_market_snapshot_payload(view: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(view.get("symbol") or "").upper().strip()
+    return {
+        "type": "spot_market_snapshot",
+        "symbol": symbol,
+        "market_view": view,
+        "depth": view.get("depth") or {"symbol": symbol, "bids": [], "asks": []},
+        "trades": view.get("trades") or {"symbol": symbol, "items": []},
+    }
+
+
 def get_spot_market_view(
     db: Session,
     *,
     symbol: str,
     depth_limit: int = 20,
     trades_limit: int = 30,
+    total_budget_seconds: Optional[float] = SPOT_MARKET_VIEW_BUDGET_SECONDS,
+    fast_external: bool = True,
 ) -> dict[str, Any]:
     normalized_symbol = str(symbol or "").upper().strip()
     if not normalized_symbol:
@@ -131,27 +184,41 @@ def get_spot_market_view(
     depth_error: Optional[Exception] = None
     trades_error: Optional[Exception] = None
     ticker_error: Optional[Exception] = None
+    deadline = (
+        time.monotonic() + max(0.0, float(total_budget_seconds))
+        if total_budget_seconds is not None
+        else None
+    )
 
-    try:
-        depth = get_depth(db=db, symbol=normalized_symbol, limit=depth_limit)
-    except Exception as exc:
-        depth_error = exc
-        warnings.append(f"depth_unavailable:{exc}")
+    def budget_exhausted(stage: str) -> bool:
+        if deadline is None or time.monotonic() < deadline:
+            return False
+        warnings.append(f"{stage}_skipped:budget_exhausted")
+        return True
 
-    try:
-        trades = get_trades(db=db, symbol=normalized_symbol, limit=trades_limit)
-    except Exception as exc:
-        trades_error = exc
-        warnings.append(f"trades_unavailable:{exc}")
+    if not budget_exhausted("depth"):
+        try:
+            depth = get_depth(db=db, symbol=normalized_symbol, limit=depth_limit, fast=fast_external)
+        except Exception as exc:
+            depth_error = exc
+            warnings.append(f"depth_unavailable:{exc}")
 
-    try:
-        tickers = get_market_tickers(db=db, symbol=normalized_symbol)
-        ticker = tickers[0] if tickers else {}
-        if not ticker:
-            warnings.append("ticker_unavailable")
-    except Exception as exc:
-        ticker_error = exc
-        warnings.append(f"ticker_unavailable:{exc}")
+    if not budget_exhausted("trades"):
+        try:
+            trades = get_trades(db=db, symbol=normalized_symbol, limit=trades_limit, fast=fast_external)
+        except Exception as exc:
+            trades_error = exc
+            warnings.append(f"trades_unavailable:{exc}")
+
+    if not budget_exhausted("ticker"):
+        try:
+            tickers = get_market_tickers(db=db, symbol=normalized_symbol, spot_fast=fast_external)
+            ticker = tickers[0] if tickers else {}
+            if not ticker:
+                warnings.append("ticker_unavailable")
+        except Exception as exc:
+            ticker_error = exc
+            warnings.append(f"ticker_unavailable:{exc}")
 
     best_bid = _best_price(depth, "bids")
     best_ask = _best_price(depth, "asks")
@@ -213,17 +280,15 @@ def get_spot_market_snapshot_payload(
     symbol: str,
     depth_limit: int = 20,
     trades_limit: int = 30,
+    total_budget_seconds: Optional[float] = SPOT_MARKET_VIEW_BUDGET_SECONDS,
+    fast_external: bool = True,
 ) -> dict[str, Any]:
     view = get_spot_market_view(
         db,
         symbol=symbol,
         depth_limit=depth_limit,
         trades_limit=trades_limit,
+        total_budget_seconds=total_budget_seconds,
+        fast_external=fast_external,
     )
-    return {
-        "type": "spot_market_snapshot",
-        "symbol": view["symbol"],
-        "market_view": view,
-        "depth": view.get("depth") or {"symbol": view["symbol"], "bids": [], "asks": []},
-        "trades": view.get("trades") or {"symbol": view["symbol"], "items": []},
-    }
+    return build_spot_market_snapshot_payload(view)

@@ -1,5 +1,6 @@
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +34,9 @@ from app.services.contract_market_provider_service import (
     MarketDataProviderConfig,
     MarketDataProviderError,
     ProviderCooldownError,
+    PROVIDER_BINANCE_SPOT,
+    PROVIDER_BITGET_SPOT,
+    PROVIDER_OKX_SPOT,
     contract_market_last_good_enabled,
     enabled_spot_market_providers,
     mark_contract_market_provider_failure,
@@ -78,6 +82,14 @@ _SPOT_LAST_GOOD_TRADES: Dict[str, TradesResponse] = {}
 _SPOT_LAST_GOOD_KLINES: Dict[tuple[str, str], dict[str, Any]] = {}
 _SPOT_PROVIDER_LOG_THROTTLE: Dict[tuple[str, str, str, str], float] = {}
 _SPOT_PROVIDER_LOG_THROTTLE_SECONDS = 60
+_SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS = 2500
+_SPOT_PROVIDER_FAST_TIMEOUT_CAP_MS = 800
+_SPOT_KLINE_FAST_TIMEOUT_CAP_MS = 1200
+_BINANCE_SPOT_PROVIDER_PREFERENCE = (
+    PROVIDER_BINANCE_SPOT,
+    PROVIDER_BITGET_SPOT,
+    PROVIDER_OKX_SPOT,
+)
 
 _INTERVAL_SECONDS = {
     "1m": 60,
@@ -848,12 +860,12 @@ def _build_itick_fallback_depth(pair: TradingPair, limit: int = 20) -> DepthResp
     )
 
 
-def get_depth(db: Session, symbol: str, limit: int = 20) -> DepthResponse:
+def get_depth(db: Session, symbol: str, limit: int = 20, *, fast: bool = False) -> DepthResponse:
     pair = _get_active_pair(db, symbol)
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        return _get_external_spot_depth(db, pair, limit=limit)
+        return _get_external_spot_depth(db, pair, limit=limit, fast=fast)
 
     internal_depth = _get_internal_depth(db, pair, limit=limit)
 
@@ -947,6 +959,49 @@ def _spot_provider_symbol(db: Session, pair: TradingPair, provider: MarketDataPr
         local_symbol=pair.symbol,
         fallback_symbol=_external_symbol(pair),
     )
+
+
+def _enabled_spot_market_providers_for_pair(
+    db: Session,
+    pair: TradingPair,
+    *,
+    max_providers: Optional[int] = None,
+) -> tuple[MarketDataProviderConfig, ...]:
+    providers = tuple(enabled_spot_market_providers(db))
+    if _normalize_data_source(pair) != DATA_SOURCE_BINANCE:
+        ordered = providers
+    else:
+        preferred_order = {
+            provider_code: index
+            for index, provider_code in enumerate(_BINANCE_SPOT_PROVIDER_PREFERENCE)
+        }
+        ordered = tuple(
+            sorted(
+                providers,
+                key=lambda provider: (
+                    preferred_order.get(provider.provider_code, len(preferred_order)),
+                    int(provider.priority or 0),
+                ),
+            )
+        )
+
+    if max_providers is not None:
+        return ordered[: max(0, int(max_providers))]
+    return ordered
+
+
+def _spot_provider_request_config(
+    provider: MarketDataProviderConfig,
+    *,
+    timeout_cap_ms: int = _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS,
+) -> MarketDataProviderConfig:
+    timeout_ms = max(
+        300,
+        min(int(provider.timeout_ms or 3000), int(timeout_cap_ms or _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS)),
+    )
+    if timeout_ms == int(provider.timeout_ms or 0):
+        return provider
+    return replace(provider, timeout_ms=timeout_ms)
 
 
 def _spot_interval_value(provider_code: str, interval: str) -> str:
@@ -1215,12 +1270,19 @@ def _spot_provider_warning_allowed(
     return True
 
 
-def _get_external_spot_ticker(db: Session, pair: TradingPair) -> Optional[TickerItem]:
+def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = False) -> Optional[TickerItem]:
     last_error: Optional[Exception] = None
-    for provider in enabled_spot_market_providers(db):
+    providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
+    timeout_cap_ms = _SPOT_PROVIDER_FAST_TIMEOUT_CAP_MS if fast else _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS
+    for provider in providers:
         try:
             provider_symbol = _spot_provider_symbol(db, pair, provider)
-            payload = request_contract_market_provider_json(provider, "ticker", provider_symbol, limit=1)
+            payload = request_contract_market_provider_json(
+                _spot_provider_request_config(provider, timeout_cap_ms=timeout_cap_ms),
+                "ticker",
+                provider_symbol,
+                limit=1,
+            )
             ticker = _spot_ticker_from_provider(pair=pair, provider_code=provider.provider_code, payload=payload)
             _SPOT_LAST_GOOD_TICKERS[pair.symbol] = ticker
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
@@ -1251,12 +1313,19 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair) -> Optional[Ticker
     return None
 
 
-def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20) -> DepthResponse:
+def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20, *, fast: bool = False) -> DepthResponse:
     last_error: Optional[Exception] = None
-    for provider in enabled_spot_market_providers(db):
+    providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
+    timeout_cap_ms = _SPOT_PROVIDER_FAST_TIMEOUT_CAP_MS if fast else _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS
+    for provider in providers:
         try:
             provider_symbol = _spot_provider_symbol(db, pair, provider)
-            payload = request_contract_market_provider_json(provider, "depth", provider_symbol, limit=limit)
+            payload = request_contract_market_provider_json(
+                _spot_provider_request_config(provider, timeout_cap_ms=timeout_cap_ms),
+                "depth",
+                provider_symbol,
+                limit=limit,
+            )
             depth = _spot_depth_from_provider(pair=pair, provider_code=provider.provider_code, payload=payload, limit=limit)
             _SPOT_LAST_GOOD_DEPTHS[pair.symbol] = depth
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
@@ -1287,12 +1356,19 @@ def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20) ->
     raise ValueError(f"spot external depth unavailable: {last_error}")
 
 
-def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50) -> TradesResponse:
+def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *, fast: bool = False) -> TradesResponse:
     last_error: Optional[Exception] = None
-    for provider in enabled_spot_market_providers(db):
+    providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
+    timeout_cap_ms = _SPOT_PROVIDER_FAST_TIMEOUT_CAP_MS if fast else _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS
+    for provider in providers:
         try:
             provider_symbol = _spot_provider_symbol(db, pair, provider)
-            payload = request_contract_market_provider_json(provider, "trades", provider_symbol, limit=limit)
+            payload = request_contract_market_provider_json(
+                _spot_provider_request_config(provider, timeout_cap_ms=timeout_cap_ms),
+                "trades",
+                provider_symbol,
+                limit=limit,
+            )
             trades = _spot_trades_from_provider(pair=pair, provider_code=provider.provider_code, payload=payload, limit=limit)
             _SPOT_LAST_GOOD_TRADES[pair.symbol] = trades
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
@@ -1330,13 +1406,16 @@ def _fetch_external_spot_klines(
     interval: str,
     limit: int,
     end_time_ms: Optional[int],
+    fast: bool = False,
 ) -> list[dict[str, Any]]:
     last_error: Optional[Exception] = None
-    for provider in enabled_spot_market_providers(db):
+    providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
+    timeout_cap_ms = _SPOT_KLINE_FAST_TIMEOUT_CAP_MS if fast else _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS
+    for provider in providers:
         try:
             provider_symbol = _spot_provider_symbol(db, pair, provider)
             payload = request_contract_market_provider_json(
-                provider,
+                _spot_provider_request_config(provider, timeout_cap_ms=timeout_cap_ms),
                 "kline",
                 provider_symbol,
                 limit=limit,
@@ -1411,12 +1490,12 @@ def _build_itick_fallback_trades(pair: TradingPair, limit: int = 50) -> TradesRe
     return TradesResponse(symbol=pair.symbol, trades=trades)
 
 
-def get_trades(db: Session, symbol: str, limit: int = 50) -> TradesResponse:
+def get_trades(db: Session, symbol: str, limit: int = 50, *, fast: bool = False) -> TradesResponse:
     pair = _get_active_pair(db, symbol)
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        return _get_external_spot_trades(db, pair, limit=limit)
+        return _get_external_spot_trades(db, pair, limit=limit, fast=fast)
 
     if data_source == DATA_SOURCE_ITICK:
         trades = _get_internal_trades(db, pair, limit=limit)
@@ -1872,7 +1951,13 @@ def get_tickers(db: Session) -> TickerListResponse:
     return TickerListResponse(items=items)
 
 
-def get_market_tickers(db: Session, symbol: Optional[str] = None, symbols: Optional[str] = None):
+def get_market_tickers(
+    db: Session,
+    symbol: Optional[str] = None,
+    symbols: Optional[str] = None,
+    *,
+    spot_fast: bool = False,
+):
     query = db.query(TradingPair).filter(TradingPair.status == 1)
     normalized_symbol = str(symbol or "").upper().strip()
     normalized_symbols = [
@@ -1906,7 +1991,7 @@ def get_market_tickers(db: Session, symbol: Optional[str] = None, symbols: Optio
         data_source = _normalize_data_source(pair)
         ticker = None
         if data_source == DATA_SOURCE_BINANCE:
-            ticker = _get_external_spot_ticker(db, pair)
+            ticker = _get_external_spot_ticker(db, pair, fast=spot_fast)
         elif data_source == DATA_SOURCE_ITICK:
             quote_data = itick_quote_batch.get(pair.symbol)
             if _is_itick_stock_pair(pair) and not normalized_symbol and quote_data is None:
@@ -2449,6 +2534,7 @@ def get_klines(
                 interval=interval,
                 limit=fetch_limit,
                 end_time_ms=fetch_end_time_ms,
+                fast=True,
             )
 
         items = get_klines_cache_first(
@@ -2460,6 +2546,7 @@ def get_klines(
             end_time_ms=end_time_ms,
             source="EXTERNAL_SPOT",
             fetch_external=_fetch_external_spot,
+            external_budget_seconds=1.5,
         )
         cached_meta = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval), {})
         provider = str(cached_meta.get("provider") or "EXTERNAL_SPOT")
