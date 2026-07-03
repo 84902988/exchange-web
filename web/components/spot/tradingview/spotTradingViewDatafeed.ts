@@ -5,6 +5,11 @@ import {
   normalizeSpotSymbol,
   type SpotMarketKlineItem,
 } from '@/lib/api/modules/spot';
+import {
+  spotMarketRealtime,
+  type SpotMarketKlineMessage,
+  type SpotMarketRealtimeMessage,
+} from '@/services/marketRealtime';
 import { normalizeTimeToSeconds } from '../chart/chart.utils';
 import type { SpotChartProps } from '../chart/chart.types';
 
@@ -103,6 +108,7 @@ type SpotTradingViewDatafeed = {
     resolution: TradingViewResolution | string,
     onRealtime: DatafeedCallbacks['onRealtime'],
     subscriberUid: string,
+    onResetCacheNeeded?: () => void,
   ) => void;
   unsubscribeBars: (subscriberUid: string) => void;
   destroy: () => void;
@@ -206,6 +212,11 @@ function klineToBar(item: SpotMarketKlineItem): TradingViewBar | null {
   };
 }
 
+function klinePayloadToBar(payload: unknown): TradingViewBar | null {
+  if (!payload || typeof payload !== 'object') return null;
+  return klineToBar(payload as SpotMarketKlineItem);
+}
+
 function buildSymbolInfo(options: SpotTradingViewDatafeedOptions): TradingViewLibrarySymbolInfo {
   const symbol = normalizeSpotSymbol(options.symbol);
   const description = String(options.displaySymbol || '').trim() || symbol;
@@ -249,9 +260,11 @@ export function createSpotTradingViewDatafeed(
 ): SpotTradingViewDatafeed {
   const symbolInfo = buildSymbolInfo(options);
   const latestBars = new Map<string, TradingViewBar>();
+  const latestBarKeyByUid = new Map<string, string>();
   const unsubscribeByUid = new Map<string, () => void>();
 
-  const getSubscriberKey = (subscriberUid: string) => `${symbolInfo.name}:${subscriberUid}`;
+  const getLatestBarKey = (resolution: TradingViewResolution | string) =>
+    `${symbolInfo.name}:${normalizeResolution(resolution)}`;
 
   return {
     onReady(callback) {
@@ -296,7 +309,7 @@ export function createSpotTradingViewDatafeed(
 
           const latestBar = bars[bars.length - 1] || null;
           if (latestBar) {
-            latestBars.set(`${symbolInfo.name}:${requestResolution}`, latestBar);
+            latestBars.set(getLatestBarKey(requestResolution), latestBar);
           }
 
           onHistory(bars, { noData: bars.length === 0 });
@@ -306,15 +319,51 @@ export function createSpotTradingViewDatafeed(
         });
     },
 
-    subscribeBars(_symbolInfo, _resolution, _onRealtime, subscriberUid) {
-      unsubscribeByUid.set(subscriberUid, () => undefined);
+    subscribeBars(_symbolInfo, resolution, onRealtime, subscriberUid, _onResetCacheNeeded) {
+      void _onResetCacheNeeded;
+
+      const existingUnsubscribe = unsubscribeByUid.get(subscriberUid);
+      existingUnsubscribe?.();
+
+      const requestResolution = normalizeResolution(resolution);
+      const interval = tradingViewResolutionToSpotInterval(requestResolution);
+      const latestBarKey = getLatestBarKey(requestResolution);
+
+      const handleKline = (realtimeMessage: SpotMarketRealtimeMessage) => {
+        const message = realtimeMessage as SpotMarketKlineMessage;
+        if (message.type !== 'spot_kline_update') return;
+
+        const msgSymbol = normalizeSpotSymbol(message.symbol || '');
+        if (msgSymbol !== symbolInfo.name) return;
+
+        const msgInterval = String(message.interval || '').trim().toLowerCase();
+        if (msgInterval !== interval) return;
+
+        const bar = klinePayloadToBar(message.kline);
+        if (!bar) return;
+
+        const latestBar = latestBars.get(latestBarKey);
+        if (latestBar && bar.time < latestBar.time) return;
+
+        latestBars.set(latestBarKey, bar);
+        onRealtime(bar);
+      };
+
+      spotMarketRealtime.setSymbol(symbolInfo.name);
+      const unsubscribe = spotMarketRealtime.subscribe('kline', handleKline);
+      unsubscribeByUid.set(subscriberUid, unsubscribe);
+      latestBarKeyByUid.set(subscriberUid, latestBarKey);
     },
 
     unsubscribeBars(subscriberUid) {
       const unsubscribe = unsubscribeByUid.get(subscriberUid);
       unsubscribe?.();
       unsubscribeByUid.delete(subscriberUid);
-      latestBars.delete(getSubscriberKey(subscriberUid));
+      const latestBarKey = latestBarKeyByUid.get(subscriberUid);
+      if (latestBarKey) {
+        latestBars.delete(latestBarKey);
+      }
+      latestBarKeyByUid.delete(subscriberUid);
     },
 
     destroy() {
@@ -322,6 +371,7 @@ export function createSpotTradingViewDatafeed(
         unsubscribe();
       }
       unsubscribeByUid.clear();
+      latestBarKeyByUid.clear();
       latestBars.clear();
     },
   };

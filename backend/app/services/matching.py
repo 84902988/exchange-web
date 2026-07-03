@@ -697,16 +697,38 @@ def _push_trade_and_depth(
         )
 
         _fire_and_forget(
-            _push_depth_and_snapshot(symbol),
+            _push_depth_and_snapshot(
+                symbol=symbol,
+                price=price,
+                amount=amount,
+                ts=ts,
+            ),
             "public ws depth/snapshot push error",
         )
     except Exception as e:
         logger.exception("[public ws push error]")
 
 
-async def _push_depth_and_snapshot(symbol: str) -> None:
+async def _push_depth_and_snapshot(
+    *,
+    symbol: str,
+    price: Decimal,
+    amount: Decimal,
+    ts: int,
+) -> None:
     ws_db = SessionLocal()
     try:
+        try:
+            await market_ws_manager.send_kline_update(
+                db=ws_db,
+                symbol=symbol,
+                price=price,
+                amount=amount,
+                ts=ts,
+            )
+        except Exception:
+            logger.warning("public ws kline push error symbol=%s", symbol, exc_info=True)
+
         await market_ws_manager.send_depth_update(
             db=ws_db,
             symbol=symbol,
