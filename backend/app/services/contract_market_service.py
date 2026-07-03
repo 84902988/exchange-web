@@ -55,6 +55,9 @@ QUOTE_SOURCE_LAST_GOOD_BBO = "LAST_GOOD_BBO"
 DEPTH_MODE_FULL_DEPTH = "FULL_DEPTH"
 DEPTH_MODE_SYNTHETIC_FROM_BBO = "SYNTHETIC_FROM_BBO"
 DEPTH_MODE_BBO_ONLY = "BBO_ONLY"
+PRICE_SOURCE_TRADE_TICK = "TRADE_TICK"
+PRICE_SOURCE_KLINE_CLOSE = "KLINE_CLOSE"
+PRICE_SOURCE_SYNTHETIC_FROM_QUOTE = "SYNTHETIC_FROM_QUOTE"
 QUOTE_FRESHNESS_LIVE_SECONDS = 30
 QUOTE_FRESHNESS_LAST_VALID_SECONDS = 300
 
@@ -2676,6 +2679,141 @@ def _normalize_provider_trade_rows(provider_code: str, payload: Any, limit: int)
     return normalized
 
 
+def _normalize_itick_stock_tick_trade(
+    *,
+    symbol: str,
+    provider_symbol: str,
+    row: Dict[str, Any],
+    fallback_id: Any = None,
+    source: str = "ITICK_TICK",
+) -> Optional[dict[str, Any]]:
+    price = _pick_positive_decimal(row, ["ld", "last", "latest_price", "price"])
+    if price is None or price <= 0:
+        return None
+    qty = _pick_positive_decimal(row, ["v", "volume", "qty", "quantity", "amount"])
+    ts_value = _pick_first_present(row, ["t", "ts", "time", "timestamp"])
+    ts = _provider_timestamp_ms(ts_value)
+    direction = str(row.get("d") or row.get("direction") or "").strip()
+    side = None
+    is_buyer_maker = None
+    if direction == "1":
+        side = "SELL"
+        is_buyer_maker = True
+    elif direction == "2":
+        side = "BUY"
+        is_buyer_maker = False
+    amount = qty if qty is not None and qty > 0 else Decimal("0")
+    trade_id = (
+        row.get("id")
+        or row.get("trade_id")
+        or row.get("tradeId")
+        or fallback_id
+        or f"{provider_symbol}:{ts}:{_format_decimal(price)}:{direction or '0'}"
+    )
+    return {
+        "id": str(trade_id),
+        "symbol": _normalize_symbol(symbol),
+        "provider": "ITICK",
+        "provider_symbol": provider_symbol,
+        "price": _format_decimal(price),
+        "last_price": _format_decimal(price),
+        "qty": _format_decimal(amount),
+        "amount": _format_decimal(amount),
+        "volume": _format_decimal(amount),
+        "quoteQty": _format_decimal(price * amount) if amount > 0 else None,
+        "time": ts,
+        "ts": ts,
+        "side": side,
+        "direction": direction or None,
+        "trading_session": row.get("te"),
+        "isBuyerMaker": is_buyer_maker,
+        "source": source,
+        "quote_source": source,
+        "quote_freshness": QUOTE_FRESHNESS_LIVE,
+        "price_source": PRICE_SOURCE_TRADE_TICK,
+        "exchange_ts": ts_value,
+        "exchange_symbol": row.get("s"),
+        "exchange_region": row.get("r"),
+        "exchange": row.get("e"),
+    }
+
+
+def _get_provider_ws_stock_tick_trade(
+    db: Session,
+    contract_symbol: ContractSymbol,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    try:
+        from app.services.contract_market_provider_ws import (
+            CONTRACT_PROVIDER_WS_SOURCE,
+            provider_ws_trades_enabled,
+            select_fresh_provider_ws_trades,
+        )
+
+        if not provider_ws_trades_enabled():
+            return []
+        payload = select_fresh_provider_ws_trades(
+            db,
+            contract_symbol.symbol,
+            max_age_ms=int(getattr(settings, "CONTRACT_PROVIDER_WS_TRADES_MAX_AGE_MS", 1500) or 1500),
+            ensure_subscription=True,
+        )
+    except Exception:
+        logger.debug("contract_itick_provider_ws_tick_unavailable symbol=%s", contract_symbol.symbol, exc_info=True)
+        return []
+    if not isinstance(payload, dict):
+        return []
+    trades: list[dict[str, Any]] = []
+    for item in payload.get("trades") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("price_source") or "").upper() != PRICE_SOURCE_TRADE_TICK:
+            continue
+        trade = dict(item)
+        trade.setdefault("source", payload.get("source") or CONTRACT_PROVIDER_WS_SOURCE)
+        trade.setdefault("quote_source", payload.get("quote_source") or trade.get("source"))
+        trade.setdefault("quote_freshness", QUOTE_FRESHNESS_LIVE)
+        trades.append(trade)
+        if len(trades) >= limit:
+            break
+    return trades
+
+
+def _get_itick_stock_tick_trade(contract_symbol: ContractSymbol) -> list[dict[str, Any]]:
+    provider_symbol = _stock_provider_symbol_from_contract_symbol(
+        contract_symbol.symbol,
+        getattr(contract_symbol, "provider_symbol", None),
+    )
+    if not provider_symbol:
+        return []
+    try:
+        payload = itick_market_service.get_stock_tick(
+            region=_stock_contract_region,
+            code=provider_symbol,
+            timeout=2,
+        )
+    except ItickMarketServiceError as exc:
+        logger.debug(
+            "contract_itick_stock_tick_rest_unavailable symbol=%s provider_symbol=%s reason=%s",
+            contract_symbol.symbol,
+            provider_symbol,
+            exc,
+        )
+        return []
+    for index, item in enumerate(_extract_itick_data_candidates(payload)):
+        trade = _normalize_itick_stock_tick_trade(
+            symbol=contract_symbol.symbol,
+            provider_symbol=provider_symbol,
+            row=item,
+            fallback_id=index,
+            source="ITICK_TICK",
+        )
+        if trade is not None:
+            return [trade]
+    return []
+
+
 def _get_configured_contract_recent_trades(db: Session, contract_symbol: ContractSymbol, *, limit: int) -> list[dict[str, Any]]:
     last_error: Optional[Exception] = None
     for provider in enabled_contract_market_providers(db):
@@ -4150,6 +4288,28 @@ def get_contract_klines(
 
     provider = str(contract_symbol.provider or "").strip().upper()
     provider_symbol = _contract_provider_symbol(contract_symbol)
+    def _with_quote_driven_overlays(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if end_time_ms is not None:
+            return rows
+        try:
+            from app.services.contract_market_view import apply_quote_driven_kline_overlays
+
+            return apply_quote_driven_kline_overlays(
+                contract_symbol.symbol,
+                normalized_interval,
+                rows,
+                limit=safe_limit,
+                include_missing=True,
+            )
+        except Exception:
+            logger.debug(
+                "quote_driven_kline_overlay_merge_failed symbol=%s interval=%s",
+                contract_symbol.symbol,
+                normalized_interval,
+                exc_info=True,
+            )
+            return rows
+
     if provider == "BINANCE":
         def _fetch_configured_contract_klines(fetch_limit: int, _fetch_end_time_ms: Optional[int]):
             return _get_configured_contract_klines(
@@ -4192,7 +4352,7 @@ def get_contract_klines(
     category = _contract_asset_category(contract_symbol)
     if provider == "ITICK":
         if _is_stock_contract_config(contract_symbol):
-            return _get_stock_contract_klines_from_itick(
+            rows = _get_stock_contract_klines_from_itick(
                 db,
                 symbol=contract_symbol.symbol,
                 provider_symbol=provider_symbol,
@@ -4200,11 +4360,12 @@ def get_contract_klines(
                 limit=safe_limit,
                 end_time_ms=end_time_ms,
             )
+            return _with_quote_driven_overlays(rows)
 
         if category != "INDEX" and end_time_ms is None:
             cached_rows = _get_cached_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit)
             if cached_rows is not None:
-                return cached_rows
+                return _with_quote_driven_overlays(cached_rows)
         if normalized_interval not in _itick_contract_k_type:
             logger.info(
                 "tradfi_cfd_kline_interval_unsupported symbol=%s interval=%s",
@@ -4268,7 +4429,7 @@ def get_contract_klines(
                         items=rows,
                         source="ITICK",
                     )
-            return rows
+            return _with_quote_driven_overlays(rows)
         if _is_tradfi_cfd_contract(contract_symbol):
             logger.warning(
                 "tradfi_cfd_kline_empty symbol=%s provider_symbol=%s market=%s region=%s interval=%s kType=%s limit=%s",
@@ -4321,6 +4482,13 @@ def get_contract_recent_trades(db: Session, symbol: str, limit: int = 30) -> lis
                     raise
         if provider == "ITICK" and _is_market_closed(_market_status_for_contract_symbol(contract_symbol)):
             return []
+        if provider == "ITICK" and str(getattr(contract_symbol, "category", "") or "").strip().upper() == "STOCK":
+            provider_ws_trades = _get_provider_ws_stock_tick_trade(db, contract_symbol, limit=safe_limit)
+            if provider_ws_trades:
+                return provider_ws_trades
+            rest_tick_trades = _get_itick_stock_tick_trade(contract_symbol)
+            if rest_tick_trades:
+                return rest_tick_trades[:safe_limit]
         quote = get_contract_quote(db, normalized_symbol)
         price = quote["last_price"]
 
@@ -4341,6 +4509,10 @@ def get_contract_recent_trades(db: Session, symbol: str, limit: int = 30) -> lis
                 "quoteQty": _format_decimal(next_price),
                 "time": now_ms - index * 3000,
                 "isBuyerMaker": bool(index % 2),
+                "source": PRICE_SOURCE_SYNTHETIC_FROM_QUOTE,
+                "quote_source": PRICE_SOURCE_SYNTHETIC_FROM_QUOTE,
+                "price_source": PRICE_SOURCE_SYNTHETIC_FROM_QUOTE,
+                "synthetic": True,
             }
         )
     return trades

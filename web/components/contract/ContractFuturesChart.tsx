@@ -34,7 +34,10 @@ import {
   resizeSpotChart,
 } from '@/components/spot/chart/chart.setup';
 import type { CandleItem, VolumeItem } from '@/components/spot/chart/chart.types';
-import { getContractMarketKlines } from '@/lib/api/modules/contract';
+import {
+  getContractMarketKlines,
+  type ContractKlineCurrentCandle,
+} from '@/lib/api/modules/contract';
 import { getSymbolPricePrecision } from '@/lib/marketPrecision';
 import {
   readContractKlineCache,
@@ -66,6 +69,7 @@ type ContractFuturesChartProps = {
   currentPrice?: string | number | null;
   currentPriceSource?: 'TRADE_TICK' | 'LIVE_MID' | 'KLINE_CLOSE';
   klineMode?: ContractKlineMode;
+  klineCurrentCandle?: ContractKlineCurrentCandle | null;
   onLatestKlineCloseChange?: (price: string | null) => void;
   positionOverlay?: ContractPositionOverlay | null;
   positionEntryOverlays?: PositionEntryOverlay[];
@@ -609,55 +613,6 @@ function upsertTradeTickCandle(
   );
 }
 
-function upsertQuoteDrivenCandle(
-  candles: CandleItem[],
-  volumes: VolumeItem[],
-  price: number,
-  interval: string,
-  timeMs = Date.now(),
-) {
-  const bucketTime = tradeBucketTimeSeconds(timeMs, interval);
-  const latest = getLatestRealCandle(candles);
-  const existing = candles.find((item) => !item.isPlaceholder && item.time === bucketTime) || null;
-  if (latest && bucketTime < latest.time) return null;
-  if (latest && existing && existing.time < latest.time) return null;
-
-  const base = existing || {
-    time: bucketTime,
-    open: latest?.close ?? price,
-    high: price,
-    low: price,
-    close: price,
-    volume: 0,
-    isPlaceholder: false,
-  };
-  const nextHigh = Math.max(base.high, price);
-  const nextLow = Math.min(base.low, price);
-  if (
-    existing &&
-    existing.close === price &&
-    existing.high === nextHigh &&
-    existing.low === nextLow
-  ) {
-    return null;
-  }
-
-  const candle: CandleItem = {
-    ...base,
-    high: nextHigh,
-    low: nextLow,
-    close: price,
-    volume: base.volume,
-    isPlaceholder: false,
-  };
-  return upsertRealtimeKline(
-    candles,
-    volumes,
-    candle,
-    makeVolume(candle.time, candle.volume, candle.open, candle.close),
-  );
-}
-
 function mergeCandlesByTime(base: CandleItem[], incoming: CandleItem[]) {
   const byTime = new Map<number, CandleItem>();
   [...base, ...incoming].forEach((item) => {
@@ -676,6 +631,123 @@ function mergeVolumesByTime(base: VolumeItem[], incoming: VolumeItem[]) {
   return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
 }
 
+type QuoteDrivenCurrentCandlePair = {
+  candle: CandleItem;
+  volume: VolumeItem;
+};
+
+type QuoteDrivenProtectedCandles = Map<number, QuoteDrivenCurrentCandlePair>;
+
+function buildQuoteDrivenCurrentCandlePair(
+  klineMode: ContractKlineMode,
+  klineCurrentCandle: ContractKlineCurrentCandle | null | undefined,
+  interval: string,
+): QuoteDrivenCurrentCandlePair | null {
+  if (String(klineMode || '').trim().toUpperCase() !== 'QUOTE_DRIVEN') return null;
+  if (!klineCurrentCandle) return null;
+
+  const candleInterval = String(klineCurrentCandle.interval || interval).trim().toLowerCase();
+  if (candleInterval && candleInterval !== String(interval || '').trim().toLowerCase()) return null;
+
+  const adapted = adaptKlines([klineCurrentCandle]);
+  const candle = adapted.candles[0];
+  if (!candle) return null;
+
+  return {
+    candle,
+    volume: adapted.volumes[0] || makeVolume(candle.time, candle.volume, candle.open, candle.close),
+  };
+}
+
+function trimQuoteDrivenProtectedCandles(protectedCandles: QuoteDrivenProtectedCandles, limit = 2) {
+  const times = Array.from(protectedCandles.keys()).sort((a, b) => a - b);
+  times.slice(0, Math.max(times.length - limit, 0)).forEach((time) => {
+    protectedCandles.delete(time);
+  });
+}
+
+function mergeQuoteDrivenProtectedPair(
+  providerCandle: CandleItem,
+  providerVolume: VolumeItem | null,
+  protectedPair: QuoteDrivenCurrentCandlePair,
+): QuoteDrivenCurrentCandlePair {
+  const protectedCandle = protectedPair.candle;
+  const nextVolume = Math.max(
+    protectedPair.volume.value ?? protectedCandle.volume ?? 0,
+    providerVolume?.value ?? providerCandle.volume ?? 0,
+  );
+  const candle: CandleItem = {
+    ...protectedCandle,
+    volume: nextVolume,
+    isPlaceholder: false,
+  };
+  return {
+    candle,
+    volume: makeVolume(candle.time, nextVolume, candle.open, candle.close),
+  };
+}
+
+function protectProviderKlinesWithQuoteDrivenOverlay(
+  providerCandles: CandleItem[],
+  providerVolumes: VolumeItem[],
+  protectedCandles: QuoteDrivenProtectedCandles,
+  quoteDrivenCurrent: QuoteDrivenCurrentCandlePair | null,
+) {
+  if (!protectedCandles.size && !quoteDrivenCurrent) {
+    return {
+      candles: providerCandles,
+      volumes: providerVolumes,
+    };
+  }
+
+  const currentTime = quoteDrivenCurrent?.candle.time ?? null;
+  const volumeByTime = new Map(providerVolumes.map((item) => [item.time, item]));
+  const candles: CandleItem[] = [];
+  const volumes: VolumeItem[] = [];
+
+  providerCandles.forEach((providerCandle) => {
+    const protectedPair = protectedCandles.get(providerCandle.time);
+    if (protectedPair) {
+      const merged = mergeQuoteDrivenProtectedPair(
+        providerCandle,
+        volumeByTime.get(providerCandle.time) || null,
+        protectedPair,
+      );
+      protectedCandles.set(providerCandle.time, merged);
+      candles.push(merged.candle);
+      volumes.push(merged.volume);
+      return;
+    }
+    if (currentTime !== null && providerCandle.time > currentTime) return;
+    candles.push(providerCandle);
+    const providerVolume = volumeByTime.get(providerCandle.time);
+    if (providerVolume) volumes.push(providerVolume);
+  });
+
+  return { candles, volumes };
+}
+
+function applyQuoteDrivenCurrentCandle(
+  candles: CandleItem[],
+  volumes: VolumeItem[],
+  quoteDrivenCurrent: QuoteDrivenCurrentCandlePair | null,
+) {
+  if (!quoteDrivenCurrent) {
+    return {
+      nextCandles: candles,
+      nextVolumes: volumes,
+    };
+  }
+
+  const currentTime = quoteDrivenCurrent.candle.time;
+  return upsertRealtimeKline(
+    candles.filter((item) => item.time <= currentTime),
+    volumes.filter((item) => item.time <= currentTime),
+    quoteDrivenCurrent.candle,
+    quoteDrivenCurrent.volume,
+  );
+}
+
 export default function ContractFuturesChart({
   symbol,
   interval,
@@ -692,6 +764,7 @@ export default function ContractFuturesChart({
   currentPrice,
   currentPriceSource = 'KLINE_CLOSE',
   klineMode = 'PROVIDER_KLINE',
+  klineCurrentCandle = null,
   onLatestKlineCloseChange,
   positionOverlay = null,
   positionEntryOverlays = [],
@@ -723,6 +796,8 @@ export default function ContractFuturesChart({
   const isLoadingMoreRef = useRef(false);
   const isReconcilingKlinesRef = useRef(false);
   const shouldReconcileKlinesRef = useRef(false);
+  const quoteDrivenCurrentCandleRef = useRef<QuoteDrivenCurrentCandlePair | null>(null);
+  const quoteDrivenProtectedCandlesRef = useRef<QuoteDrivenProtectedCandles>(new Map());
   const hasMoreHistoryRef = useRef(true);
   const oldestTimeRef = useRef<number | null>(null);
   const requestedHistoryEndTimesRef = useRef<Set<number>>(new Set());
@@ -747,6 +822,10 @@ export default function ContractFuturesChart({
   const precision = useMemo(
     () => resolveChartPricePrecision(symbol, explicitPricePrecision),
     [explicitPricePrecision, symbol],
+  );
+  const quoteDrivenCurrentCandle = useMemo(
+    () => buildQuoteDrivenCurrentCandlePair(klineMode, klineCurrentCandle, interval),
+    [interval, klineCurrentCandle, klineMode],
   );
   const ma5 = useMemo(() => calculateMA(candles, 5), [candles]);
   const ma10 = useMemo(() => calculateMA(candles, 10), [candles]);
@@ -779,6 +858,25 @@ export default function ContractFuturesChart({
   useEffect(() => {
     shouldReconcileKlinesRef.current = shouldReconcileKlines;
   }, [shouldReconcileKlines]);
+
+  useEffect(() => {
+    quoteDrivenCurrentCandleRef.current = null;
+    quoteDrivenProtectedCandlesRef.current.clear();
+  }, [symbol, interval]);
+
+  useEffect(() => {
+    quoteDrivenCurrentCandleRef.current = quoteDrivenCurrentCandle;
+    if (quoteDrivenCurrentCandle) {
+      quoteDrivenProtectedCandlesRef.current.set(
+        quoteDrivenCurrentCandle.candle.time,
+        quoteDrivenCurrentCandle,
+      );
+      trimQuoteDrivenProtectedCandles(quoteDrivenProtectedCandlesRef.current);
+    } else {
+      quoteDrivenProtectedCandlesRef.current.clear();
+    }
+  }, [quoteDrivenCurrentCandle]);
+
   const emptyKlineMessage = isIndexContractSymbol(symbol)
     ? t('contractChartNoIndexKlineData', 'contracts')
     : t('contractChartNoKlineData', 'contracts');
@@ -1026,16 +1124,28 @@ export default function ContractFuturesChart({
       const adapted = adaptKlines(rows);
       if (!adapted.candles.length) return;
 
-      const mergedCandles = mergeCandlesByTime(candlesRef.current, adapted.candles)
+      const quoteDrivenCurrent = quoteDrivenCurrentCandleRef.current;
+      const protectedProvider = protectProviderKlinesWithQuoteDrivenOverlay(
+        adapted.candles,
+        adapted.volumes,
+        quoteDrivenProtectedCandlesRef.current,
+        quoteDrivenCurrent,
+      );
+      const mergedCandles = mergeCandlesByTime(candlesRef.current, protectedProvider.candles)
         .slice(-CONTRACT_CHART_KLINE_LIMIT);
       const earliestTime = mergedCandles[0]?.time ?? null;
-      const mergedVolumes = mergeVolumesByTime(volumesRef.current, adapted.volumes)
+      const mergedVolumes = mergeVolumesByTime(volumesRef.current, protectedProvider.volumes)
         .filter((item) => earliestTime === null || item.time >= earliestTime);
+      const protectedKlines = applyQuoteDrivenCurrentCandle(
+        mergedCandles,
+        mergedVolumes,
+        quoteDrivenCurrent,
+      );
       const normalized = setKlinePairState(
         { candlesRef, volumesRef, oldestTimeRef },
         { setCandles, setVolumes },
-        mergedCandles,
-        mergedVolumes,
+        protectedKlines.nextCandles,
+        protectedKlines.nextVolumes,
       );
       writeContractKlineCache(requestSymbol, requestInterval, {
         candles: normalized.candles,
@@ -1177,17 +1287,29 @@ export default function ContractFuturesChart({
         if (!alive) return;
         const adapted = adaptKlines(rows);
         const shouldReplaceKlines = isIndexContractSymbol(symbol);
+        const quoteDrivenCurrent = quoteDrivenCurrentCandleRef.current;
+        const protectedProvider = protectProviderKlinesWithQuoteDrivenOverlay(
+          adapted.candles,
+          adapted.volumes,
+          quoteDrivenProtectedCandlesRef.current,
+          quoteDrivenCurrent,
+        );
         const nextCandles = !shouldReplaceKlines && candlesRef.current.length
-          ? mergeCandlesByTime(candlesRef.current, adapted.candles)
-          : adapted.candles;
+          ? mergeCandlesByTime(candlesRef.current, protectedProvider.candles)
+          : protectedProvider.candles;
         const nextVolumes = !shouldReplaceKlines && volumesRef.current.length
-          ? mergeVolumesByTime(volumesRef.current, adapted.volumes)
-          : adapted.volumes;
+          ? mergeVolumesByTime(volumesRef.current, protectedProvider.volumes)
+          : protectedProvider.volumes;
+        const protectedKlines = applyQuoteDrivenCurrentCandle(
+          nextCandles,
+          nextVolumes,
+          quoteDrivenCurrent,
+        );
         const normalized = setKlinePairState(
           { candlesRef, volumesRef, oldestTimeRef },
           { setCandles, setVolumes },
-          nextCandles,
-          nextVolumes,
+          protectedKlines.nextCandles,
+          protectedKlines.nextVolumes,
         );
         writeContractKlineCache(symbol, interval, {
           candles: normalized.candles,
@@ -1271,12 +1393,25 @@ export default function ContractFuturesChart({
       if (marketStatus === 'CLOSED') return;
 
       const realtimeKline = extractRealtimeKline(message, symbol, interval);
-      const updated = realtimeKline
+      const quoteDrivenCurrent = quoteDrivenCurrentCandleRef.current;
+      const protectedPair = realtimeKline
+        ? quoteDrivenProtectedCandlesRef.current.get(realtimeKline.candle.time)
+        : null;
+      const protectedRealtimeKline = realtimeKline && protectedPair
+        ? mergeQuoteDrivenProtectedPair(realtimeKline.candle, realtimeKline.volume, protectedPair)
+        : null;
+      if (protectedRealtimeKline) {
+        quoteDrivenProtectedCandlesRef.current.set(protectedRealtimeKline.candle.time, protectedRealtimeKline);
+      } else if (realtimeKline && quoteDrivenCurrent && realtimeKline.candle.time > quoteDrivenCurrent.candle.time) {
+        return;
+      }
+      const nextRealtimeKline = protectedRealtimeKline || realtimeKline;
+      const updated = nextRealtimeKline
         ? upsertRealtimeKline(
           candlesRef.current,
           volumesRef.current,
-          realtimeKline.candle,
-          realtimeKline.volume,
+          nextRealtimeKline.candle,
+          nextRealtimeKline.volume,
         )
         : null;
 
@@ -1334,19 +1469,15 @@ export default function ContractFuturesChart({
 
   useEffect(() => {
     if (marketStatus === 'CLOSED') return;
-    if (klineMode !== 'QUOTE_DRIVEN' || currentPriceSource !== 'LIVE_MID') return;
+    const quoteDrivenCurrent = quoteDrivenCurrentCandle;
+    if (!quoteDrivenCurrent) return;
 
-    const liveMidPrice = firstValidPrice(currentPrice);
-    if (liveMidPrice === null) return;
-
-    const updated = upsertQuoteDrivenCandle(
+    const updated = upsertRealtimeKline(
       candlesRef.current,
       volumesRef.current,
-      liveMidPrice,
-      interval,
+      quoteDrivenCurrent.candle,
+      quoteDrivenCurrent.volume,
     );
-    if (!updated) return;
-
     const normalized = setKlinePairState(
       { candlesRef, volumesRef, oldestTimeRef },
       { setCandles, setVolumes },
@@ -1359,7 +1490,7 @@ export default function ContractFuturesChart({
       candles: normalized.candles,
       volumes: normalized.volumes,
     });
-  }, [candles, currentPrice, currentPriceSource, interval, klineMode, marketStatus, symbol]);
+  }, [interval, marketStatus, quoteDrivenCurrentCandle, symbol]);
 
   useEffect(() => {
     if (!candleSeriesRef.current || !volumeSeriesRef.current) return;

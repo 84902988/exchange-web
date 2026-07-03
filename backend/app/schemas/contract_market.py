@@ -133,6 +133,21 @@ class ContractTickerListResponse(BaseModel):
     items: List[ContractTickerItem]
 
 
+class ContractKlineCurrentCandle(BaseModel):
+    time: int
+    open_time: int
+    open: str
+    high: str
+    low: str
+    close: str
+    volume: str
+    interval: str
+    kline_mode: str = "PROVIDER_KLINE"
+    price_source: str = "KLINE_CLOSE"
+    volume_source: str = "PROVIDER_KLINE"
+    updated_at_ms: int
+
+
 class ContractMarketViewDetail(BaseModel):
     symbol: str
     display_symbol: str
@@ -142,6 +157,9 @@ class ContractMarketViewDetail(BaseModel):
     display_state: str = "UNAVAILABLE"
     display_price: Optional[str] = None
     display_price_source: str = "NONE"
+    current_price_source: str = "NONE"
+    last_trade_price: Optional[str] = None
+    last_trade_time: Optional[datetime] = None
     best_bid: Optional[str] = None
     best_ask: Optional[str] = None
     spread: Optional[str] = None
@@ -155,4 +173,5 @@ class ContractMarketViewDetail(BaseModel):
     last_good_at: Optional[datetime] = None
     reason_code: str = "UNAVAILABLE"
     warnings: List[str] = Field(default_factory=list)
+    kline_current_candle: Optional[ContractKlineCurrentCandle] = None
     raw_source_summary: Dict[str, Any] = Field(default_factory=dict)
