@@ -10,6 +10,7 @@ class DepthItem(BaseModel):
 class DepthResponse(BaseModel):
     symbol: str
     price_precision: int = 8
+    amount_precision: int = 8
     bids: List[DepthItem]
     asks: List[DepthItem]
     ts: int

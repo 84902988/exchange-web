@@ -64,9 +64,13 @@ export type SpotDepthLevel = {
 export type SpotDepthResponse = {
   symbol: string
   price_precision?: number
+  amount_precision?: number
   bids: SpotDepthLevel[]
   asks: SpotDepthLevel[]
   ts?: number
+  provider?: string | null
+  stale?: boolean
+  updated_at?: string | null
   last_price?: string | number
   mid_price?: string | number
   source?: string
@@ -92,6 +96,8 @@ export type SpotMarketView = {
   display_price?: string | number | null
   display_price_source?: string | null
   last_price?: string | number | null
+  price_precision?: number | string | null
+  amount_precision?: number | string | null
   best_bid?: string | number | null
   best_ask?: string | number | null
   spread?: string | number | null

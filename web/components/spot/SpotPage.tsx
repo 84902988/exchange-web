@@ -422,18 +422,30 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const [headerTicker, setHeaderTicker] = useState<SpotPairOption | null>(null);
   const selectedPairPrecision = useMemo(() => {
     const normalizedSymbol = normalizeSpotApiSymbol(symbol);
+    const viewPrecision = parseOptionalPrecision(spotMarket.marketView?.price_precision);
+    if (viewPrecision !== null) {
+      return viewPrecision;
+    }
     if (headerTicker && normalizeSpotApiSymbol(headerTicker.symbol) === normalizedSymbol) {
       return headerTicker.pricePrecision ?? null;
     }
     return findSpotPairBySymbol(pairOptions, normalizedSymbol)?.pricePrecision ?? null;
-  }, [headerTicker, pairOptions, symbol]);
+  }, [headerTicker, pairOptions, spotMarket.marketView?.price_precision, symbol]);
   const currentAmountPrecision = useMemo(() => {
     const normalizedSymbol = normalizeSpotApiSymbol(symbol);
+    const viewPrecision = parseOptionalPrecision(spotMarket.marketView?.amount_precision);
+    if (viewPrecision !== null) {
+      return viewPrecision;
+    }
+    const depthPrecision = parseOptionalPrecision(spotMarket.depth?.amount_precision);
+    if (depthPrecision !== null) {
+      return depthPrecision;
+    }
     if (headerTicker && normalizeSpotApiSymbol(headerTicker.symbol) === normalizedSymbol) {
       return headerTicker.amountPrecision ?? null;
     }
     return findSpotPairBySymbol(pairOptions, normalizedSymbol)?.amountPrecision ?? null;
-  }, [headerTicker, pairOptions, symbol]);
+  }, [headerTicker, pairOptions, spotMarket.depth?.amount_precision, spotMarket.marketView?.amount_precision, symbol]);
   const pricePrecision =
     resolveSpotPricePrecision(symbol, configuredPricePrecision, selectedPairPrecision);
 
@@ -497,11 +509,13 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   }, [symbol]);
 
   useEffect(() => {
-    const nextPricePrecision = spotMarket.depth?.price_precision;
-    if (Number.isInteger(nextPricePrecision) && Number(nextPricePrecision) >= 0) {
-      setConfiguredPricePrecision(Number(nextPricePrecision));
+    const nextPricePrecision =
+      parseOptionalPrecision(spotMarket.marketView?.price_precision) ??
+      parseOptionalPrecision(spotMarket.depth?.price_precision);
+    if (nextPricePrecision !== null) {
+      setConfiguredPricePrecision(nextPricePrecision);
     }
-  }, [spotMarket.depth?.price_precision]);
+  }, [spotMarket.depth?.price_precision, spotMarket.marketView?.price_precision]);
 
   useEffect(() => {
     const nextSymbol = normalizeSpotApiSymbol(initialSymbol);
@@ -902,6 +916,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                       latestTradeOrTickerPrice={null}
                       priceDirection={priceDirection}
                       pricePrecision={pricePrecision}
+                      amountPrecision={currentAmountPrecision}
                       showRwaReference={showRwaReference}
                     />
                   </div>

@@ -134,6 +134,13 @@ class Settings(BaseSettings):
     CONTRACT_PROVIDER_WS_ITICK_ENABLED: bool = False
     CONTRACT_PROVIDER_WS_ITICK_TRADES_ENABLED: bool = False
     CONTRACT_PROVIDER_WS_ITICK_URL: str = "wss://api.itick.org"
+    SPOT_PROVIDER_WS_ENABLED: bool = False
+    SPOT_PROVIDER_WS_DEPTH_ENABLED: bool = False
+    SPOT_PROVIDER_WS_DEPTH_MAX_AGE_MS: int = 1500
+    SPOT_PROVIDER_WS_DEPTH_BROADCAST_INTERVAL_MS: int = 200
+    SPOT_PROVIDER_WS_DEPTH_LIMIT: int = 20
+    SPOT_PROVIDER_WS_IDLE_STOP_SECONDS: int = 10
+    SPOT_PROVIDER_WS_BITGET_PUBLIC_URL: str = "wss://ws.bitget.com/v2/ws/public"
     ITICK_API_TOKEN: Optional[str] = None
     ITICK_API_KEY: Optional[str] = None  # legacy alias; prefer ITICK_API_TOKEN
     ITICK_BASE_URL: str = "https://api.itick.org"

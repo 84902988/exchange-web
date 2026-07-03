@@ -15,6 +15,7 @@ export interface SpotChartProps {
   latestTradeOrTickerPrice?: string | number | null;
   priceDirection?: RealtimePriceDirection;
   pricePrecision?: number | null;
+  amountPrecision?: number | null;
   showRwaReference?: boolean;
 }
 

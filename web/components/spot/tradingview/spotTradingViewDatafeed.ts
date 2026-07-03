@@ -116,7 +116,7 @@ type SpotTradingViewDatafeed = {
 
 type SpotTradingViewDatafeedOptions = Pick<
   SpotChartProps,
-  'symbol' | 'displaySymbol' | 'pricePrecision'
+  'symbol' | 'displaySymbol' | 'pricePrecision' | 'amountPrecision'
 >;
 
 const SPOT_EXCHANGE_NAME = 'EXCHANGE';
@@ -220,6 +220,7 @@ function klinePayloadToBar(payload: unknown): TradingViewBar | null {
 function buildSymbolInfo(options: SpotTradingViewDatafeedOptions): TradingViewLibrarySymbolInfo {
   const symbol = normalizeSpotSymbol(options.symbol);
   const description = String(options.displaySymbol || '').trim() || symbol;
+  const volumePrecision = Number(options.amountPrecision);
 
   return {
     name: symbol,
@@ -238,7 +239,9 @@ function buildSymbolInfo(options: SpotTradingViewDatafeedOptions): TradingViewLi
     supported_resolutions: SUPPORTED_RESOLUTIONS,
     intraday_multipliers: ['1', '5', '15', '60', '240'],
     daily_multipliers: ['1'],
-    volume_precision: 8,
+    volume_precision: Number.isInteger(volumePrecision) && volumePrecision >= 0 && volumePrecision <= 12
+      ? volumePrecision
+      : 8,
     data_status: 'streaming',
     format: 'price',
   };

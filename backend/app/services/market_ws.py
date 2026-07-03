@@ -27,7 +27,8 @@ SPOT_SNAPSHOT_VIEW_BUDGET_SECONDS = 2.2
 
 
 def _normalize_symbol(symbol: str) -> str:
-    return (symbol or "").upper().strip()
+    raw = str(symbol or "").upper().strip()
+    return "".join(ch for ch in raw if ch.isalnum())
 
 
 def _to_str(v: Any) -> str:
@@ -67,32 +68,46 @@ class MarketWsManager:
         symbol = _normalize_symbol(symbol)
         async with self._lock:
             self._symbol_rooms[symbol].add(websocket)
+        await self._ensure_spot_provider_depth(symbol)
 
     async def disconnect(self, symbol: str, websocket: WebSocket) -> None:
         symbol = _normalize_symbol(symbol)
+        should_release = False
         async with self._lock:
             conns = self._symbol_rooms.get(symbol, set())
             if websocket in conns:
                 conns.remove(websocket)
             if not conns and symbol in self._symbol_rooms:
                 self._symbol_rooms.pop(symbol, None)
+                should_release = True
+        if should_release:
+            await self._release_spot_provider_depth_if_idle(symbol)
 
     async def _get_connections(self, symbol: str):
         symbol = _normalize_symbol(symbol)
         async with self._lock:
             return list(self._symbol_rooms.get(symbol, set()))
 
+    async def subscriber_count(self, symbol: str) -> int:
+        symbol = _normalize_symbol(symbol)
+        async with self._lock:
+            return len(self._symbol_rooms.get(symbol, set()))
+
     async def _cleanup_dead(self, symbol: str, dead: list[WebSocket]) -> None:
         if not dead:
             return
 
         symbol = _normalize_symbol(symbol)
+        should_release = False
         async with self._lock:
             room = self._symbol_rooms.get(symbol, set())
             for ws in dead:
                 room.discard(ws)
             if not room and symbol in self._symbol_rooms:
                 self._symbol_rooms.pop(symbol, None)
+                should_release = True
+        if should_release:
+            await self._release_spot_provider_depth_if_idle(symbol)
 
     async def _send_payload(self, symbol: str, payload: dict) -> None:
         symbol = _normalize_symbol(symbol)
@@ -113,6 +128,58 @@ class MarketWsManager:
                 dead.append(ws)
 
         await self._cleanup_dead(symbol, dead)
+
+    async def _ensure_spot_provider_depth(self, symbol: str) -> None:
+        try:
+            from app.services.spot_market_gateway import spot_market_gateway
+
+            await spot_market_gateway.ensure_symbol(symbol)
+        except Exception:
+            logger.warning("spot_market_ws_provider_depth_ensure_failed symbol=%s", symbol, exc_info=True)
+
+    async def _release_spot_provider_depth_if_idle(self, symbol: str) -> None:
+        try:
+            from app.services.spot_market_gateway import spot_market_gateway
+
+            await spot_market_gateway.release_symbol_if_idle(symbol)
+        except Exception:
+            logger.warning("spot_market_ws_provider_depth_release_failed symbol=%s", symbol, exc_info=True)
+
+    def _depth_update_payload(self, symbol: str, depth: Any) -> dict:
+        depth_payload = {
+            "symbol": getattr(depth, "symbol", symbol),
+            "bids": [
+                item.model_dump() if hasattr(item, "model_dump") else item.dict()
+                for item in getattr(depth, "bids", [])
+            ],
+            "asks": [
+                item.model_dump() if hasattr(item, "model_dump") else item.dict()
+                for item in getattr(depth, "asks", [])
+            ],
+            "ts": getattr(depth, "ts", None),
+        }
+        for key in (
+            "price_precision",
+            "amount_precision",
+            "provider",
+            "stale",
+            "updated_at",
+            "last_price",
+            "mid_price",
+            "source",
+            "fetched_at",
+        ):
+            value = getattr(depth, key, None)
+            if value is not None:
+                depth_payload[key] = value
+        return {
+            "type": "spot_depth_update",
+            "symbol": _normalize_symbol(symbol),
+            "depth": depth_payload,
+        }
+
+    async def broadcast_depth_update(self, symbol: str, depth: Any) -> None:
+        await self._send_payload(symbol, self._depth_update_payload(symbol, depth))
 
     async def send_snapshot(self, db: Session, symbol: str) -> None:
         """
@@ -211,24 +278,7 @@ class MarketWsManager:
         symbol = _normalize_symbol(symbol)
         depth = get_market_depth(db=db, symbol=symbol, limit=limit)
 
-        payload = {
-            "type": "spot_depth_update",
-            "symbol": symbol,
-            "depth": {
-                "symbol": depth.symbol,
-                "bids": [
-                    item.model_dump() if hasattr(item, "model_dump") else item.dict()
-                    for item in depth.bids
-                ],
-                "asks": [
-                    item.model_dump() if hasattr(item, "model_dump") else item.dict()
-                    for item in depth.asks
-                ],
-                "ts": getattr(depth, "ts", None),
-            },
-        }
-
-        await self._send_payload(symbol, payload)
+        await self.broadcast_depth_update(symbol, depth)
 
 
 market_ws_manager = MarketWsManager()
