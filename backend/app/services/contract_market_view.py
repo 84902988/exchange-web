@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+import threading
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
@@ -37,10 +39,16 @@ DISPLAY_PRICE_SOURCE_TRADE_TICK = "TRADE_TICK"
 DISPLAY_PRICE_SOURCE_KLINE_CLOSE = "KLINE_CLOSE"
 DISPLAY_PRICE_SOURCE_NONE = "NONE"
 
+KLINE_MODE_TRADE_DRIVEN = "TRADE_DRIVEN"
+KLINE_MODE_QUOTE_DRIVEN = "QUOTE_DRIVEN"
+KLINE_MODE_PROVIDER_KLINE = "PROVIDER_KLINE"
+KLINE_VOLUME_SOURCE_PROVIDER = "PROVIDER_KLINE"
+
 EXECUTION_MODE_LIVE_BBO = "LIVE_BBO"
 EXECUTION_MODE_DISABLED = "DISABLED"
 
 MARKET_TYPE_CONTRACT = "CONTRACT"
+DEFAULT_KLINE_INTERVAL = "1m"
 _CLOSED_MARKET_STATUSES = {"CLOSED", "HOLIDAY"}
 _NON_REALTIME_BBO_SESSION_TYPES = {"PRE_MARKET", "PREMARKET", "AFTER_HOURS", "POST_MARKET", "POSTMARKET", "CLOSED", "HOLIDAY"}
 _TRADFI_CATEGORIES = {"STOCK", "FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES", "INDEX", "CFD"}
@@ -51,6 +59,16 @@ _NON_TRADING_DISPLAY_STATES = {
     SESSION_HOLIDAY,
 }
 _LAST_GOOD_BBO_MAX_AGE_MS = 72 * 60 * 60 * 1000
+_QUOTE_DRIVEN_OVERLAY_LIMIT = 3
+_QUOTE_DRIVEN_CANDLE_STATE: dict[tuple[str, str], OrderedDict[int, dict[str, Any]]] = {}
+_QUOTE_DRIVEN_OHLC_STATE: dict[tuple[str, str, int], dict[str, str]] = {}
+_QUOTE_DRIVEN_CANDLE_LOCK = threading.RLock()
+_QUOTE_DRIVEN_INITIALIZED_KEY = "_quote_initialized"
+_QUOTE_DRIVEN_FIRST_LIVE_MID_KEY = "_quote_first_live_mid"
+_QUOTE_DRIVEN_OPEN_KEY = "_quote_open"
+_QUOTE_DRIVEN_HIGH_KEY = "_quote_high"
+_QUOTE_DRIVEN_LOW_KEY = "_quote_low"
+_QUOTE_DRIVEN_CLOSE_KEY = "_quote_close"
 
 
 def _normalized(value: Any) -> str:
@@ -237,6 +255,493 @@ def _latest_trade_time(latest_trade: Optional[dict[str, Any]]) -> Optional[datet
     )
 
 
+def _normalize_interval(interval: Any) -> str:
+    normalized = str(interval or DEFAULT_KLINE_INTERVAL).strip().lower()
+    return normalized or DEFAULT_KLINE_INTERVAL
+
+
+def _interval_seconds(interval: str) -> int:
+    normalized = _normalize_interval(interval)
+    if normalized == "5m":
+        return 5 * 60
+    if normalized == "15m":
+        return 15 * 60
+    if normalized == "30m":
+        return 30 * 60
+    if normalized == "1h":
+        return 60 * 60
+    if normalized == "4h":
+        return 4 * 60 * 60
+    if normalized == "1d":
+        return 24 * 60 * 60
+    return 60
+
+
+def _server_bucket_time_ms(now: datetime, interval: str) -> int:
+    seconds = int(now.timestamp())
+    bucket = (seconds // _interval_seconds(interval)) * _interval_seconds(interval)
+    return bucket * 1000
+
+
+def _latest_kline_open_time_ms(latest_kline: Optional[dict[str, Any]]) -> Optional[int]:
+    dt = _latest_kline_open_time(latest_kline)
+    if dt is None:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def _kline_decimal(latest_kline: Optional[dict[str, Any]], *keys: str) -> Optional[Decimal]:
+    if not isinstance(latest_kline, dict):
+        return None
+    for key in keys:
+        parsed = _to_decimal(latest_kline.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _state_decimal(candle: Optional[dict[str, Any]], key: str) -> Optional[Decimal]:
+    if not isinstance(candle, dict):
+        return None
+    return _to_decimal(candle.get(key))
+
+
+def _quote_driven_state_key(symbol: str, interval: str) -> tuple[str, str]:
+    return (_normalized(symbol), _normalize_interval(interval))
+
+
+def _quote_driven_ohlc_key(symbol: str, interval: str, bucket_time_ms: int) -> tuple[str, str, int]:
+    normalized_symbol, normalized_interval = _quote_driven_state_key(symbol, interval)
+    return (normalized_symbol, normalized_interval, int(bucket_time_ms))
+
+
+def _quote_driven_bucket_ms(candle: Optional[dict[str, Any]]) -> Optional[int]:
+    if not isinstance(candle, dict):
+        return None
+    for key in ("open_time", "open_time_ms", "time", "t"):
+        value = candle.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = int(Decimal(str(value)))
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        if parsed <= 0:
+            continue
+        return parsed * 1000 if parsed < 1_000_000_000_000 else parsed
+    return None
+
+
+def _quote_driven_overlays_for_key(key: tuple[str, str]) -> OrderedDict[int, dict[str, Any]]:
+    overlays = _QUOTE_DRIVEN_CANDLE_STATE.get(key)
+    if overlays is None:
+        overlays = OrderedDict()
+        _QUOTE_DRIVEN_CANDLE_STATE[key] = overlays
+    return overlays
+
+
+def _trim_quote_driven_overlays(overlays: OrderedDict[int, dict[str, Any]]) -> None:
+    for bucket_time in sorted(overlays.keys())[:-_QUOTE_DRIVEN_OVERLAY_LIMIT]:
+        overlays.pop(bucket_time, None)
+
+
+def _trim_quote_driven_ohlc_state(symbol: str, interval: str, overlays: OrderedDict[int, dict[str, Any]]) -> None:
+    normalized_symbol, normalized_interval = _quote_driven_state_key(symbol, interval)
+    keep = set(overlays.keys())
+    for key in list(_QUOTE_DRIVEN_OHLC_STATE.keys()):
+        if key[0] == normalized_symbol and key[1] == normalized_interval and key[2] not in keep:
+            _QUOTE_DRIVEN_OHLC_STATE.pop(key, None)
+
+
+def _quote_driven_ohlc_state(symbol: str, interval: str, bucket_time_ms: int) -> Optional[dict[str, str]]:
+    return _QUOTE_DRIVEN_OHLC_STATE.get(_quote_driven_ohlc_key(symbol, interval, bucket_time_ms))
+
+
+def _set_quote_driven_ohlc_state(
+    symbol: str,
+    interval: str,
+    bucket_time_ms: int,
+    *,
+    first_live_mid: Decimal,
+    open_price: Decimal,
+    high_price: Decimal,
+    low_price: Decimal,
+    close_price: Decimal,
+) -> None:
+    _QUOTE_DRIVEN_OHLC_STATE[_quote_driven_ohlc_key(symbol, interval, bucket_time_ms)] = {
+        _QUOTE_DRIVEN_FIRST_LIVE_MID_KEY: _format_decimal(first_live_mid) or "0",
+        _QUOTE_DRIVEN_OPEN_KEY: _format_decimal(open_price) or "0",
+        _QUOTE_DRIVEN_HIGH_KEY: _format_decimal(high_price) or "0",
+        _QUOTE_DRIVEN_LOW_KEY: _format_decimal(low_price) or "0",
+        _QUOTE_DRIVEN_CLOSE_KEY: _format_decimal(close_price) or "0",
+    }
+
+
+def _is_quote_driven_initialized(candle: Optional[dict[str, Any]]) -> bool:
+    return isinstance(candle, dict) and candle.get(_QUOTE_DRIVEN_INITIALIZED_KEY) is True
+
+
+def _public_kline_candle(candle: dict[str, Any]) -> dict[str, Any]:
+    return {str(key): value for key, value in candle.items() if not str(key).startswith("_quote_")}
+
+
+def _quote_driven_state_from_public_candle(
+    candle: dict[str, Any],
+    *,
+    first_live_mid: Decimal,
+    open_price: Decimal,
+    high_price: Decimal,
+    low_price: Decimal,
+    close_price: Decimal,
+) -> dict[str, Any]:
+    state = dict(candle)
+    state[_QUOTE_DRIVEN_INITIALIZED_KEY] = True
+    state[_QUOTE_DRIVEN_FIRST_LIVE_MID_KEY] = _format_decimal(first_live_mid)
+    state[_QUOTE_DRIVEN_OPEN_KEY] = _format_decimal(open_price)
+    state[_QUOTE_DRIVEN_HIGH_KEY] = _format_decimal(high_price)
+    state[_QUOTE_DRIVEN_LOW_KEY] = _format_decimal(low_price)
+    state[_QUOTE_DRIVEN_CLOSE_KEY] = _format_decimal(close_price)
+    return state
+
+
+def _merge_provider_with_quote_driven_overlay(
+    provider: Optional[dict[str, Any]],
+    overlay: Optional[dict[str, Any]],
+    *,
+    symbol: str,
+    interval: str,
+    updated_at_ms: int,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(overlay, dict):
+        return provider
+    time_ms = _quote_driven_bucket_ms(overlay) or _quote_driven_bucket_ms(provider)
+    if time_ms is None:
+        return provider
+
+    provider_volume = _state_decimal(provider, "volume") or Decimal("0")
+    overlay_volume = _state_decimal(overlay, "volume") or Decimal("0")
+    quote_ohlc = _quote_driven_ohlc_state(symbol, interval, time_ms)
+
+    if isinstance(quote_ohlc, dict):
+        open_price = _state_decimal(quote_ohlc, _QUOTE_DRIVEN_OPEN_KEY)
+        high_price = _state_decimal(quote_ohlc, _QUOTE_DRIVEN_HIGH_KEY)
+        low_price = _state_decimal(quote_ohlc, _QUOTE_DRIVEN_LOW_KEY)
+        close_price = _state_decimal(quote_ohlc, _QUOTE_DRIVEN_CLOSE_KEY)
+    elif _is_quote_driven_initialized(overlay):
+        open_price = _state_decimal(overlay, _QUOTE_DRIVEN_OPEN_KEY) or _state_decimal(overlay, "open")
+        high_price = _state_decimal(overlay, _QUOTE_DRIVEN_HIGH_KEY) or _state_decimal(overlay, "high")
+        low_price = _state_decimal(overlay, _QUOTE_DRIVEN_LOW_KEY) or _state_decimal(overlay, "low")
+        close_price = _state_decimal(overlay, _QUOTE_DRIVEN_CLOSE_KEY) or _state_decimal(overlay, "close")
+    else:
+        # Pre-marker overlays may have been created by older provider-driven
+        # merge logic. Collapse them to the last quote close until LIVE_MID
+        # refreshes the bucket and writes quote-owned OHLC metadata.
+        close_price = _state_decimal(overlay, "close") or _state_decimal(overlay, "open")
+        open_price = close_price
+        high_price = close_price
+        low_price = close_price
+
+    if open_price is None or close_price is None:
+        return provider
+
+    high_price = high_price or max(open_price, close_price)
+    low_price = low_price or min(open_price, close_price)
+    volume = max(overlay_volume, provider_volume)
+
+    return _format_kline_candle(
+        time_ms=time_ms,
+        interval=interval,
+        open_price=open_price,
+        high_price=high_price,
+        low_price=low_price,
+        close_price=close_price,
+        volume=volume,
+        kline_mode=KLINE_MODE_QUOTE_DRIVEN,
+        price_source=DISPLAY_PRICE_SOURCE_LIVE_MID,
+        updated_at_ms=int(overlay.get("updated_at_ms") or updated_at_ms),
+    )
+
+
+def _copy_overlay_as_kline_row(row: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(row)
+    for key in (
+        "time",
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "interval",
+        "kline_mode",
+        "price_source",
+        "volume_source",
+        "updated_at_ms",
+    ):
+        if key in overlay:
+            merged[key] = overlay[key]
+    return merged
+
+
+def _format_kline_candle(
+    *,
+    time_ms: int,
+    interval: str,
+    open_price: Decimal,
+    high_price: Decimal,
+    low_price: Decimal,
+    close_price: Decimal,
+    volume: Decimal,
+    kline_mode: str,
+    price_source: str,
+    updated_at_ms: int,
+) -> dict[str, Any]:
+    return {
+        "time": int(time_ms / 1000),
+        "open_time": int(time_ms),
+        "open": _format_decimal(open_price),
+        "high": _format_decimal(high_price),
+        "low": _format_decimal(low_price),
+        "close": _format_decimal(close_price),
+        "volume": _format_decimal(volume) or "0",
+        "interval": _normalize_interval(interval),
+        "kline_mode": kline_mode,
+        "price_source": price_source,
+        "volume_source": KLINE_VOLUME_SOURCE_PROVIDER,
+        "updated_at_ms": updated_at_ms,
+    }
+
+
+def _provider_kline_candle(
+    latest_kline: Optional[dict[str, Any]],
+    *,
+    interval: str,
+    kline_mode: str = KLINE_MODE_PROVIDER_KLINE,
+    price_source: str = DISPLAY_PRICE_SOURCE_KLINE_CLOSE,
+    updated_at_ms: int,
+) -> Optional[dict[str, Any]]:
+    time_ms = _latest_kline_open_time_ms(latest_kline)
+    close_price = _kline_decimal(latest_kline, "close", "c", "last", "p")
+    if time_ms is None or close_price is None:
+        return None
+    open_price = _kline_decimal(latest_kline, "open", "o") or close_price
+    high_price = _kline_decimal(latest_kline, "high", "h") or max(open_price, close_price)
+    low_price = _kline_decimal(latest_kline, "low", "l") or min(open_price, close_price)
+    volume = _kline_decimal(latest_kline, "volume", "v", "qty", "amount") or Decimal("0")
+    return _format_kline_candle(
+        time_ms=time_ms,
+        interval=interval,
+        open_price=open_price,
+        high_price=high_price,
+        low_price=low_price,
+        close_price=close_price,
+        volume=volume,
+        kline_mode=kline_mode,
+        price_source=price_source,
+        updated_at_ms=updated_at_ms,
+    )
+
+
+def _build_quote_driven_current_candle(
+    *,
+    symbol: str,
+    interval: str,
+    latest_kline: Optional[dict[str, Any]],
+    live_mid: Decimal,
+    now: datetime,
+    mutate_state: bool,
+) -> dict[str, Any]:
+    normalized_symbol = _normalized(symbol)
+    normalized_interval = _normalize_interval(interval)
+    updated_at_ms = int(now.timestamp() * 1000)
+    provider = _provider_kline_candle(
+        latest_kline,
+        interval=normalized_interval,
+        kline_mode=KLINE_MODE_QUOTE_DRIVEN,
+        price_source=DISPLAY_PRICE_SOURCE_LIVE_MID,
+        updated_at_ms=updated_at_ms,
+    )
+    time_ms = int(provider["open_time"]) if provider else _server_bucket_time_ms(now, normalized_interval)
+    key = _quote_driven_state_key(normalized_symbol, normalized_interval)
+
+    with _QUOTE_DRIVEN_CANDLE_LOCK:
+        overlays = _quote_driven_overlays_for_key(key)
+        same_bucket = overlays.get(time_ms)
+
+        provider_volume = _state_decimal(provider, "volume") or Decimal("0")
+        quote_ohlc = _quote_driven_ohlc_state(normalized_symbol, normalized_interval, time_ms)
+
+        if isinstance(quote_ohlc, dict):
+            first_live_mid = _state_decimal(quote_ohlc, _QUOTE_DRIVEN_FIRST_LIVE_MID_KEY) or live_mid
+            open_price = _state_decimal(quote_ohlc, _QUOTE_DRIVEN_OPEN_KEY) or first_live_mid
+            high_candidates = [
+                _state_decimal(quote_ohlc, _QUOTE_DRIVEN_HIGH_KEY),
+                live_mid,
+                open_price,
+            ]
+            low_candidates = [
+                _state_decimal(quote_ohlc, _QUOTE_DRIVEN_LOW_KEY),
+                live_mid,
+                open_price,
+            ]
+        else:
+            first_live_mid = live_mid
+            open_price = live_mid
+            high_candidates = [live_mid]
+            low_candidates = [live_mid]
+        existing_volume = _state_decimal(same_bucket, "volume") or Decimal("0")
+        volume = max(existing_volume, provider_volume)
+        high_price = max(value for value in high_candidates if value is not None)
+        low_price = min(value for value in low_candidates if value is not None)
+        candle = _format_kline_candle(
+            time_ms=time_ms,
+            interval=normalized_interval,
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            close_price=live_mid,
+            volume=volume,
+            kline_mode=KLINE_MODE_QUOTE_DRIVEN,
+            price_source=DISPLAY_PRICE_SOURCE_LIVE_MID,
+            updated_at_ms=updated_at_ms,
+        )
+        if mutate_state:
+            overlays[time_ms] = _quote_driven_state_from_public_candle(
+                candle,
+                first_live_mid=first_live_mid,
+                open_price=open_price,
+                high_price=high_price,
+                low_price=low_price,
+                close_price=live_mid,
+            )
+            _set_quote_driven_ohlc_state(
+                normalized_symbol,
+                normalized_interval,
+                time_ms,
+                first_live_mid=first_live_mid,
+                open_price=open_price,
+                high_price=high_price,
+                low_price=low_price,
+                close_price=live_mid,
+            )
+            overlays.move_to_end(time_ms)
+            _trim_quote_driven_overlays(overlays)
+            _trim_quote_driven_ohlc_state(normalized_symbol, normalized_interval, overlays)
+        return dict(candle)
+
+
+def build_contract_kline_current_candle(
+    symbol: str,
+    *,
+    interval: str = DEFAULT_KLINE_INTERVAL,
+    latest_kline: Optional[dict[str, Any]] = None,
+    live_mid: Optional[Decimal] = None,
+    quote_driven: bool = False,
+    price_source: str = DISPLAY_PRICE_SOURCE_KLINE_CLOSE,
+    now: Optional[datetime] = None,
+    mutate_quote_driven_state: bool = True,
+) -> Optional[dict[str, Any]]:
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    else:
+        now_dt = now_dt.astimezone(timezone.utc)
+    normalized_interval = _normalize_interval(interval)
+    if quote_driven and live_mid is not None and live_mid > 0:
+        return _build_quote_driven_current_candle(
+            symbol=symbol,
+            interval=normalized_interval,
+            latest_kline=latest_kline,
+            live_mid=live_mid,
+            now=now_dt,
+            mutate_state=mutate_quote_driven_state,
+        )
+    return _provider_kline_candle(
+        latest_kline,
+        interval=normalized_interval,
+        kline_mode=KLINE_MODE_PROVIDER_KLINE,
+        price_source=price_source,
+        updated_at_ms=int(now_dt.timestamp() * 1000),
+    )
+
+
+def apply_quote_driven_kline_overlays(
+    symbol: str,
+    interval: str,
+    rows: list[dict[str, Any]],
+    *,
+    limit: Optional[int] = None,
+    include_missing: bool = True,
+    now: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
+    if not rows:
+        rows = []
+    normalized_interval = _normalize_interval(interval)
+    key = _quote_driven_state_key(symbol, normalized_interval)
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    else:
+        now_dt = now_dt.astimezone(timezone.utc)
+    updated_at_ms = int(now_dt.timestamp() * 1000)
+
+    with _QUOTE_DRIVEN_CANDLE_LOCK:
+        overlays = OrderedDict(
+            (bucket_time, dict(candle))
+            for bucket_time, candle in (_QUOTE_DRIVEN_CANDLE_STATE.get(key) or {}).items()
+        )
+
+    if not overlays:
+        return [dict(item) for item in rows if isinstance(item, dict)]
+
+    by_time: dict[int, dict[str, Any]] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        time_ms = _quote_driven_bucket_ms(row)
+        if time_ms is None:
+            continue
+        overlay = overlays.get(time_ms)
+        if overlay is not None:
+            provider = _provider_kline_candle(
+                row,
+                interval=normalized_interval,
+                kline_mode=KLINE_MODE_PROVIDER_KLINE,
+                price_source=DISPLAY_PRICE_SOURCE_KLINE_CLOSE,
+                updated_at_ms=updated_at_ms,
+            )
+            merged_overlay = _merge_provider_with_quote_driven_overlay(
+                provider,
+                overlay,
+                symbol=symbol,
+                interval=normalized_interval,
+                updated_at_ms=updated_at_ms,
+            )
+            if merged_overlay is not None:
+                row = _copy_overlay_as_kline_row(row, merged_overlay)
+        by_time[time_ms] = row
+
+    if include_missing:
+        for time_ms, overlay in overlays.items():
+            by_time.setdefault(time_ms, _public_kline_candle(overlay))
+
+    merged_rows = [by_time[time_ms] for time_ms in sorted(by_time)]
+    if limit is not None:
+        try:
+            safe_limit = max(1, int(limit))
+            merged_rows = merged_rows[-safe_limit:]
+        except (TypeError, ValueError):
+            pass
+    return merged_rows
+
+
+def reset_contract_kline_current_candle_state_for_tests() -> None:
+    with _QUOTE_DRIVEN_CANDLE_LOCK:
+        _QUOTE_DRIVEN_CANDLE_STATE.clear()
+        _QUOTE_DRIVEN_OHLC_STATE.clear()
+
+
 def _last_good_time(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> Optional[datetime]:
     return (
         _to_datetime((quote or {}).get("last_good_at"))
@@ -409,8 +914,10 @@ def build_contract_market_view(
     latest_kline: Optional[dict[str, Any]] = None,
     latest_trade: Optional[dict[str, Any]] = None,
     contract_symbol: Any = None,
+    interval: str = DEFAULT_KLINE_INTERVAL,
     warnings: Optional[list[str]] = None,
     now: Optional[datetime] = None,
+    mutate_quote_driven_state: bool = True,
 ) -> dict[str, Any]:
     normalized_symbol = _normalized(symbol)
     now_dt = now or datetime.now(timezone.utc)
@@ -523,6 +1030,27 @@ def build_contract_market_view(
         display_price_source = DISPLAY_PRICE_SOURCE_KLINE_CLOSE
         current_price_source = DISPLAY_PRICE_SOURCE_KLINE_CLOSE
 
+    quote_driven_kline = (
+        category in _TRADFI_CATEGORIES
+        and not is_crypto
+        and latest_trade_price is None
+        and display_state == DISPLAY_STATE_LIVE_TRADABLE
+        and executable is True
+        and bbo_freshness == QUOTE_FRESHNESS_LIVE
+        and has_bbo
+        and mid is not None
+    )
+    kline_current_candle = build_contract_kline_current_candle(
+        normalized_symbol,
+        interval=interval,
+        latest_kline=latest_kline,
+        live_mid=mid,
+        quote_driven=quote_driven_kline,
+        price_source=DISPLAY_PRICE_SOURCE_KLINE_CLOSE,
+        now=now_dt,
+        mutate_quote_driven_state=mutate_quote_driven_state,
+    )
+
     source_warnings = list(warnings or [])
     if last_good_older_than_kline:
         _append_warning_once(source_warnings, "KLINE_QUOTE_SESSION_MISMATCH")
@@ -561,6 +1089,7 @@ def build_contract_market_view(
         "last_good_at": _last_good_time(quote, depth),
         "reason_code": reason_code,
         "warnings": source_warnings,
+        "kline_current_candle": kline_current_candle,
         "raw_source_summary": _raw_source_summary(
             quote=quote,
             depth=depth,
@@ -635,5 +1164,7 @@ def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
         latest_kline=latest_kline,
         latest_trade=latest_trade,
         contract_symbol=contract_symbol,
+        interval=DEFAULT_KLINE_INTERVAL,
         warnings=warnings,
+        mutate_quote_driven_state=False,
     )

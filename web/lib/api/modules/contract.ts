@@ -62,6 +62,24 @@ export type ContractMarketViewDisplayState =
   | 'UNAVAILABLE'
   | string
 
+export type ContractKlineMode = 'TRADE_DRIVEN' | 'QUOTE_DRIVEN' | 'PROVIDER_KLINE' | string
+
+export type ContractKlineCurrentCandle = {
+  time?: number | string
+  open_time?: number | string
+  timestamp?: number | string
+  open: number | string
+  high: number | string
+  low: number | string
+  close: number | string
+  volume: number | string
+  interval?: string | null
+  kline_mode?: ContractKlineMode | null
+  price_source?: 'LIVE_MID' | 'TRADE_TICK' | 'KLINE_CLOSE' | string | null
+  volume_source?: 'PROVIDER_KLINE' | string | null
+  updated_at_ms?: number | string | null
+}
+
 export type ContractMarketViewDetail = {
   symbol: string
   display_symbol: string
@@ -71,6 +89,9 @@ export type ContractMarketViewDetail = {
   display_state: ContractMarketViewDisplayState
   display_price?: string | number | null
   display_price_source: string
+  current_price_source?: string | null
+  last_trade_price?: string | number | null
+  last_trade_time?: string | null
   best_bid?: string | number | null
   best_ask?: string | number | null
   spread?: string | number | null
@@ -84,6 +105,7 @@ export type ContractMarketViewDetail = {
   last_good_at?: string | null
   reason_code: string
   warnings: string[]
+  kline_current_candle?: ContractKlineCurrentCandle | null
   raw_source_summary: Record<string, unknown>
 }
 
@@ -304,9 +326,19 @@ export type ContractMarketKlineItem = {
 export type ContractMarketTrade = {
   id: number | string
   price: string
+  last_price?: string
   qty: string
+  amount?: string
+  volume?: string
   quoteQty?: string
   time: number
+  ts?: number
+  side?: string | null
+  source?: string | null
+  quote_source?: string | null
+  quote_freshness?: string | null
+  price_source?: 'TRADE_TICK' | 'KLINE_CLOSE' | 'SYNTHETIC_FROM_QUOTE' | string | null
+  synthetic?: boolean
   isBuyerMaker?: boolean
 }
 

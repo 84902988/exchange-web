@@ -22,8 +22,10 @@ def _load_provider_ws_module():
         CONTRACT_PROVIDER_WS_ENABLED = True
         CONTRACT_PROVIDER_WS_TICKER_ENABLED = True
         CONTRACT_PROVIDER_WS_KLINE_ENABLED = True
+        CONTRACT_PROVIDER_WS_TRADES_ENABLED = True
         CONTRACT_PROVIDER_WS_ITICK_ENABLED = True
         CONTRACT_PROVIDER_WS_ITICK_KLINE_ENABLED = True
+        CONTRACT_PROVIDER_WS_ITICK_TRADES_ENABLED = True
         CONTRACT_PROVIDER_WS_KLINE_MAX_AGE_MS = 1500
         CONTRACT_PROVIDER_WS_ITICK_KLINE_MAX_AGE_MS = 90000
         CONTRACT_PROVIDER_WS_ITICK_KLINE_BROADCAST_INTERVAL_MS = 1000
@@ -170,6 +172,66 @@ def test_itick_kline_subscription_resolver_uses_category_endpoint_and_kline_type
     assert subscription.ws_symbol == "XAUUSD$GB"
     assert subscription.ws_url == "wss://api.itick.org/forex"
     assert subscription.channel == "kline@1"
+
+
+def test_itick_trades_subscription_resolver_uses_stock_tick_endpoint():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+
+    class Contract:
+        symbol = "AAPLUSDT_PERP"
+        status = 1
+        provider = "ITICK"
+        provider_symbol = "AAPL"
+        category = "STOCK"
+
+    class Query:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return Contract()
+
+    class Db:
+        def query(self, _model):
+            return Query()
+
+    subscription = service._itick_trades_subscription_for_symbol(Db(), "AAPLUSDT_PERP")
+
+    assert subscription is not None
+    assert subscription.provider == module.PROVIDER_ITICK
+    assert subscription.provider_symbol == "AAPL"
+    assert subscription.ws_symbol == "AAPL$US"
+    assert subscription.ws_url == "wss://api.itick.org/stock"
+
+
+def test_itick_trade_normalizer_marks_live_trade_tick_source():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderTradesSubscription(
+        local_symbol="AAPLUSDT_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="AAPL",
+        trades_limit=30,
+        ws_symbol="AAPL$US",
+        ws_url="wss://api.itick.org/stock",
+    )
+
+    payload = service._normalize_itick_trade(
+        subscription,
+        {"ld": "213.55", "v": "100", "t": 1782889680000, "d": "2", "s": "AAPL", "r": "US"},
+    )
+
+    assert payload is not None
+    assert payload["provider"] == "ITICK"
+    assert payload["provider_symbol"] == "AAPL"
+    assert payload["ws_symbol"] == "AAPL$US"
+    assert payload["price"] == "213.55"
+    assert payload["qty"] == "100"
+    assert payload["source"] == "LIVE_WS"
+    assert payload["quote_source"] == "LIVE_WS"
+    assert payload["price_source"] == "TRADE_TICK"
+    assert payload["side"] == "BUY"
 
 
 def test_itick_kline_normalizer_maps_verified_payload_without_millisecond_double_multiply():
@@ -320,6 +382,7 @@ def _load_gateway_module(provider_payload):
 
     schemas_module = types.ModuleType("app.schemas.contract_market")
     schemas_module.ContractDepthResponse = object
+    schemas_module.ContractMarketViewDetail = object
     schemas_module.ContractQuoteResponse = object
     sys.modules["app.schemas.contract_market"] = schemas_module
 
@@ -430,6 +493,8 @@ if __name__ == "__main__":
     test_itick_ticker_normalizer_uses_quote_fields_and_live_source()
     test_itick_ticker_normalizer_synthesizes_bbo_from_last_price()
     test_itick_kline_subscription_resolver_uses_category_endpoint_and_kline_type()
+    test_itick_trades_subscription_resolver_uses_stock_tick_endpoint()
+    test_itick_trade_normalizer_marks_live_trade_tick_source()
     test_itick_kline_normalizer_maps_verified_payload_without_millisecond_double_multiply()
     test_itick_kline_handler_writes_existing_kline_cache_shape()
     test_itick_kline_freshness_uses_itick_max_age_in_provider_selection()

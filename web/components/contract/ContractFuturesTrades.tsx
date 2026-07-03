@@ -27,7 +27,7 @@ type ContractFuturesTradesProps = {
   marketStatus?: string | null;
   marketRealtimeStatus?: ContractMarketRealtimeStatus;
   onPriceSelect?: (price: string) => void;
-  onLastPriceChange?: (price: string) => void;
+  onLastPriceChange?: (price: string, source?: string | null, trade?: ContractMarketTrade) => void;
 };
 
 function toNumber(value?: string | number | null) {
@@ -81,18 +81,32 @@ function extractRealtimeTrades(
 
       const price = payload.price ?? payload.last_price;
       const qty = payload.qty ?? payload.amount ?? payload.quantity ?? payload.volume;
-      if (toNumber(price as string | number | null) <= 0 || toNumber(qty as string | number | null) <= 0) {
+      const priceSource = String(payload.price_source || '').trim().toUpperCase();
+      const normalizedQty = toNumber(qty as string | number | null);
+      if (
+        toNumber(price as string | number | null) <= 0
+        || (normalizedQty <= 0 && priceSource !== 'TRADE_TICK')
+      ) {
         return [];
       }
 
       const time = normalizeTradeTime(payload.time ?? payload.ts ?? payload.timestamp);
       const trade: ContractMarketTrade = {
-        id: payload.id ? String(payload.id) : `${time}-${price}-${qty}`,
+        id: payload.id ? String(payload.id) : `${time}-${price}-${normalizedQty}`,
         price: String(price),
-        qty: String(qty),
+        qty: String(normalizedQty > 0 ? normalizedQty : 0),
         time,
       };
+      if (payload.last_price) trade.last_price = String(payload.last_price);
       if (payload.quoteQty) trade.quoteQty = String(payload.quoteQty);
+      if (payload.amount) trade.amount = String(payload.amount);
+      if (payload.volume) trade.volume = String(payload.volume);
+      if (payload.source) trade.source = String(payload.source);
+      if (payload.quote_source) trade.quote_source = String(payload.quote_source);
+      if (payload.quote_freshness) trade.quote_freshness = String(payload.quote_freshness);
+      if (payload.price_source) trade.price_source = String(payload.price_source);
+      if (typeof payload.synthetic === 'boolean') trade.synthetic = payload.synthetic;
+      if (payload.side) trade.side = String(payload.side);
       if (typeof payload.isBuyerMaker === 'boolean') {
         trade.isBuyerMaker = payload.isBuyerMaker;
       } else if (typeof payload.is_buyer_maker === 'boolean') {
@@ -152,7 +166,8 @@ export default function ContractFuturesTrades({
     const cached = readContractTradesCache(symbol);
     if (cached?.trades?.length) {
       setRows(cached.trades.slice(0, limit));
-      if (cached.lastPrice) onLastPriceChangeRef.current?.(String(cached.lastPrice));
+      const latest = cached.trades[0];
+      if (cached.lastPrice) onLastPriceChangeRef.current?.(String(cached.lastPrice), latest?.price_source ?? null, latest);
       setLoading(false);
     } else {
       setRows([]);
@@ -198,8 +213,8 @@ export default function ContractFuturesTrades({
   }, [latestPriceDirection, rows]);
 
   useEffect(() => {
-    const latest = rows[0]?.price;
-    if (latest) onLastPriceChange?.(latest);
+    const latest = rows[0];
+    if (latest?.price) onLastPriceChange?.(latest.price, latest.price_source ?? null, latest);
   }, [onLastPriceChange, rows]);
 
   useEffect(() => {
@@ -227,7 +242,7 @@ export default function ContractFuturesTrades({
         return nextRows;
       });
       setLoading(false);
-      onLastPriceChangeRef.current?.(trades[0].price);
+      onLastPriceChangeRef.current?.(trades[0].price, trades[0].price_source ?? null, trades[0]);
     };
 
     return contractMarketRealtime.subscribe('trade', handleTradeMessage);

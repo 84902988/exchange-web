@@ -2,7 +2,7 @@
 
 import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl';
 
-export type ContractMarketRealtimeEventType = 'quote' | 'depth' | 'trade' | 'kline';
+export type ContractMarketRealtimeEventType = 'quote' | 'depth' | 'trade' | 'kline' | 'state';
 export type ContractMarketRealtimeStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 
 export type ContractMarketRealtimeMessage = {
@@ -14,6 +14,8 @@ export type ContractMarketRealtimeMessage = {
   trade?: unknown;
   trades?: unknown;
   kline?: unknown;
+  market_state?: unknown;
+  kline_current_candle?: unknown;
   data?: unknown;
 };
 
@@ -74,6 +76,7 @@ function getConfiguredWsUrl(symbol: string, interval?: string) {
 function getEventType(message: ContractMarketRealtimeMessage): ContractMarketRealtimeEventType | null {
   const type = String(message.type || '').toLowerCase();
 
+  if (type.includes('market_state')) return 'state';
   if (type.includes('quote')) return 'quote';
   if (type.includes('depth') || type.includes('orderbook')) return 'depth';
   if (type.includes('kline') || type.includes('candle')) return 'kline';
@@ -275,6 +278,17 @@ class ContractMarketRealtimeClient {
       : {};
     const symbol = message.symbol;
     const interval = message.interval;
+    const marketState = data.market_state;
+    if (marketState) {
+      this.emit('state', {
+        type: 'contract_market_state',
+        symbol,
+        interval,
+        data: marketState,
+        market_state: marketState,
+        kline_current_candle: (marketState as Record<string, unknown>).kline_current_candle,
+      });
+    }
     const quote = data.quote;
     if (quote) {
       this.emit('quote', { type: 'contract_quote', symbol, interval, data: quote, quote });

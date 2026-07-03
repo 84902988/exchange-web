@@ -29,9 +29,10 @@ from app.services.contract_market_provider_service import (
 logger = logging.getLogger(__name__)
 
 CONTRACT_PROVIDER_WS_SOURCE = "LIVE_WS"
+PRICE_SOURCE_TRADE_TICK = "TRADE_TICK"
 PROVIDER_ITICK = "ITICK"
 _SUPPORTED_DEPTH_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
-_SUPPORTED_TRADES_WS_PROVIDERS = {PROVIDER_OKX_SWAP}
+_SUPPORTED_TRADES_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
 _SUPPORTED_TICKER_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
 _SUPPORTED_KLINE_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
 _OKX_KLINE_CHANNELS = {
@@ -60,6 +61,8 @@ class ProviderTradesSubscription:
     provider: str
     provider_symbol: str
     trades_limit: int
+    ws_symbol: Optional[str] = None
+    ws_url: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -219,6 +222,14 @@ def provider_ws_trades_enabled() -> bool:
     return bool(
         getattr(settings, "CONTRACT_PROVIDER_WS_ENABLED", False)
         and getattr(settings, "CONTRACT_PROVIDER_WS_TRADES_ENABLED", False)
+    )
+
+
+def provider_ws_itick_trades_enabled() -> bool:
+    return bool(
+        provider_ws_trades_enabled()
+        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_ENABLED", False)
+        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_TRADES_ENABLED", False)
     )
 
 
@@ -539,6 +550,48 @@ class ContractMarketProviderWsService:
             ws_url=ws_url,
         )
 
+    def _itick_trades_subscription_for_symbol(
+        self,
+        db: Session,
+        symbol: str,
+    ) -> Optional[ProviderTradesSubscription]:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not normalized_symbol or not provider_ws_itick_trades_enabled():
+            return None
+        contract_symbol = (
+            db.query(ContractSymbol)
+            .filter(ContractSymbol.symbol == normalized_symbol)
+            .filter(ContractSymbol.status == 1)
+            .first()
+        )
+        if contract_symbol is None:
+            return None
+        provider_code = _normalize_symbol(getattr(contract_symbol, "provider", None))
+        category = _normalize_contract_category(getattr(contract_symbol, "category", None))
+        if provider_code != PROVIDER_ITICK or category != "STOCK":
+            return None
+        provider_symbol = _normalize_symbol(
+            getattr(contract_symbol, "provider_symbol", None)
+            or normalized_symbol.replace("_PERP", "")
+        )
+        if not provider_symbol:
+            return None
+        ws_symbol = _itick_quote_subscription_symbol(provider_symbol, category)
+        ws_url = _itick_ws_url_for_category(
+            getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_URL", ""),
+            category,
+        )
+        if not ws_symbol or not ws_url:
+            return None
+        return ProviderTradesSubscription(
+            local_symbol=normalized_symbol,
+            provider=PROVIDER_ITICK,
+            provider_symbol=provider_symbol,
+            trades_limit=_trades_limit(),
+            ws_symbol=ws_symbol,
+            ws_url=ws_url,
+        )
+
     def _itick_kline_subscription_for_symbol(
         self,
         db: Session,
@@ -663,6 +716,29 @@ class ContractMarketProviderWsService:
         if not provider_ws_trades_enabled():
             return None
         normalized_symbol = _normalize_symbol(symbol)
+        itick_subscription = self._itick_trades_subscription_for_symbol(db, normalized_symbol)
+        if itick_subscription is not None:
+            if is_contract_market_provider_in_cooldown(PROVIDER_ITICK):
+                logger.debug("contract_provider_ws_trades_skipped_cooldown provider=%s symbol=%s", PROVIDER_ITICK, normalized_symbol)
+                self.stop_trades_subscription(local_symbol=normalized_symbol, provider=PROVIDER_ITICK)
+            else:
+                if ensure_subscription:
+                    self.ensure_trades_subscription(
+                        local_symbol=itick_subscription.local_symbol,
+                        provider=itick_subscription.provider,
+                        provider_symbol=itick_subscription.provider_symbol,
+                        trades_limit=itick_subscription.trades_limit,
+                        ws_symbol=itick_subscription.ws_symbol,
+                        ws_url=itick_subscription.ws_url,
+                    )
+                trades = self.get_fresh_provider_ws_trades(
+                    normalized_symbol,
+                    PROVIDER_ITICK,
+                    max_age_ms=max_age_ms,
+                )
+                if trades is not None:
+                    return trades
+                return None
         for provider in enabled_contract_market_providers(db):
             provider_code = _normalize_symbol(provider.provider_code)
             if provider_code not in {PROVIDER_OKX_SWAP, PROVIDER_BITGET_USDT_FUTURES}:
@@ -901,14 +977,20 @@ class ContractMarketProviderWsService:
         provider: str,
         provider_symbol: str,
         trades_limit: int,
+        ws_symbol: Optional[str] = None,
+        ws_url: Optional[str] = None,
     ) -> None:
         if not provider_ws_trades_enabled():
             return
         normalized_symbol = _normalize_symbol(local_symbol)
         provider_code = _normalize_symbol(provider)
         normalized_provider_symbol = _normalize_symbol(provider_symbol)
+        normalized_ws_symbol = _normalize_symbol(ws_symbol or provider_symbol) if ws_symbol else None
         if provider_code not in _SUPPORTED_TRADES_WS_PROVIDERS:
             logger.debug("contract_provider_ws_trades_unsupported provider=%s symbol=%s", provider_code, normalized_symbol)
+            return
+        if provider_code == PROVIDER_ITICK and not provider_ws_itick_trades_enabled():
+            logger.debug("contract_provider_ws_trades_itick_disabled symbol=%s", normalized_symbol)
             return
         key = (provider_code, normalized_symbol)
         with self._lock:
@@ -929,6 +1011,8 @@ class ContractMarketProviderWsService:
                 provider=provider_code,
                 provider_symbol=normalized_provider_symbol,
                 trades_limit=max(1, min(int(trades_limit or 30), 100)),
+                ws_symbol=normalized_ws_symbol,
+                ws_url=str(ws_url or "").strip() or None,
             )
             thread = threading.Thread(
                 target=self._run_trades_subscription_thread,
@@ -1649,12 +1733,17 @@ class ContractMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        if subscription.provider != PROVIDER_OKX_SWAP:
+        if subscription.provider not in _SUPPORTED_TRADES_WS_PROVIDERS:
             return
         reconnect_delay = 1.0
         while not stop_event.is_set() and provider_ws_trades_enabled():
             try:
-                await self._run_okx_trades_ws(subscription, stop_event, generation)
+                if subscription.provider == PROVIDER_ITICK:
+                    if not provider_ws_itick_trades_enabled():
+                        break
+                    await self._run_itick_trades_ws(subscription, stop_event, generation)
+                else:
+                    await self._run_okx_trades_ws(subscription, stop_event, generation)
                 reconnect_delay = 1.0
             except asyncio.CancelledError:
                 raise
@@ -1875,6 +1964,71 @@ class ContractMarketProviderWsService:
                     subscription.provider,
                     subscription.local_symbol,
                     subscription.provider_symbol,
+                )
+
+    async def _run_itick_trades_ws(
+        self,
+        subscription: ProviderTradesSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if stop_event.is_set() or not provider_ws_itick_trades_enabled():
+            return
+        url = str(subscription.ws_url or getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_URL", "") or "").strip()
+        if not url:
+            raise ValueError("CONTRACT_PROVIDER_WS_ITICK_URL is required")
+        ws_symbol = _normalize_symbol(subscription.ws_symbol or subscription.provider_symbol)
+        if not ws_symbol:
+            raise ValueError("iTick provider WS trades subscription symbol is required")
+        subscribe_payload = {
+            "ac": "subscribe",
+            "params": ws_symbol,
+            "types": "tick",
+        }
+        key = (subscription.provider, subscription.local_symbol)
+        connect_kwargs = {
+            "ping_interval": 20,
+            "ping_timeout": 10,
+            "close_timeout": 5,
+            **_websocket_header_kwargs(_itick_ws_headers()),
+        }
+        async with websockets.connect(url, **connect_kwargs) as websocket:
+            if stop_event.is_set() or not provider_ws_itick_trades_enabled():
+                await websocket.close()
+                return
+            loop = asyncio.get_running_loop()
+            with self._lock:
+                current_generation = self._trades_generations.get(key)
+                if current_generation != generation:
+                    stop_event.set()
+                    return
+                self._trades_connections[key] = (loop, websocket)
+            logger.info(
+                "contract_provider_ws_trades_subscription_started provider=%s symbol=%s provider_symbol=%s ws_symbol=%s",
+                subscription.provider,
+                subscription.local_symbol,
+                subscription.provider_symbol,
+                ws_symbol,
+            )
+            try:
+                await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                while not stop_event.is_set() and provider_ws_itick_trades_enabled():
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    self._handle_itick_trades_message(subscription, raw_message)
+            finally:
+                with self._lock:
+                    current = self._trades_connections.get(key)
+                    if current is not None and current[1] is websocket:
+                        self._trades_connections.pop(key, None)
+                logger.info(
+                    "contract_provider_ws_trades_subscription_stopped provider=%s symbol=%s provider_symbol=%s ws_symbol=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.provider_symbol,
+                    ws_symbol,
                 )
 
     async def _run_itick_depth_ws(
@@ -2322,6 +2476,57 @@ class ContractMarketProviderWsService:
         if trades:
             self._set_trades_cache(subscription, trades)
 
+    def _handle_itick_trades_message(
+        self,
+        subscription: ProviderTradesSubscription,
+        raw_message: Any,
+    ) -> None:
+        try:
+            message = json.loads(raw_message)
+        except Exception:
+            logger.debug("contract_provider_ws_itick_trades_invalid_json symbol=%s", subscription.local_symbol)
+            return
+        trades: list[dict[str, Any]] = []
+        for row in self._extract_itick_trade_rows(message):
+            trade = self._normalize_itick_trade(subscription, row)
+            if trade is not None:
+                trades.append(trade)
+        if trades:
+            self._set_trades_cache(subscription, trades)
+
+    def _extract_itick_trade_rows(self, message: Any) -> list[dict[str, Any]]:
+        if isinstance(message, list):
+            rows: list[dict[str, Any]] = []
+            for item in message:
+                rows.extend(self._extract_itick_trade_rows(item))
+            return rows
+        if not isinstance(message, dict):
+            return []
+        if message.get("ac") or str(message.get("resAc") or "").strip().lower() in {"auth", "subscribe", "pong"}:
+            return []
+        row_type = str(message.get("type") or message.get("types") or "").strip().lower()
+        if row_type in {"subscribe", "subscribed"}:
+            return []
+        data = message.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict) and self._looks_like_itick_trade(item)]
+        if isinstance(data, dict):
+            return [data] if self._looks_like_itick_trade(data) else []
+        tick = message.get("tick")
+        if isinstance(tick, dict) and self._looks_like_itick_trade(tick):
+            return [tick]
+        if self._looks_like_itick_trade(message):
+            return [message]
+        return []
+
+    def _looks_like_itick_trade(self, row: dict[str, Any]) -> bool:
+        row_type = str(row.get("type") or row.get("types") or "").strip().lower()
+        if row_type and row_type != "tick":
+            return False
+        price = _pick_decimal(row, ["ld", "last", "latest_price", "price"])
+        ts_value = _pick_first_present(row, ["t", "ts", "time", "timestamp"])
+        return price is not None and price > 0 and ts_value not in (None, "")
+
     def _handle_okx_ticker_message(
         self,
         subscription: ProviderTickerSubscription,
@@ -2478,6 +2683,61 @@ class ContractMarketProviderWsService:
             "source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_freshness": "LIVE",
+        }
+
+    def _normalize_itick_trade(
+        self,
+        subscription: ProviderTradesSubscription,
+        row: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        price = _pick_decimal(row, ["ld", "last", "latest_price", "price"])
+        if price is None or price <= 0:
+            return None
+        qty = _pick_decimal(row, ["v", "volume", "qty", "quantity", "amount"])
+        ts_value = _pick_first_present(row, ["t", "ts", "time", "timestamp"])
+        ts = _timestamp_ms_from_value(ts_value)
+        direction = str(row.get("d") or row.get("direction") or "").strip()
+        side = None
+        is_buyer_maker = None
+        if direction == "1":
+            side = "SELL"
+            is_buyer_maker = True
+        elif direction == "2":
+            side = "BUY"
+            is_buyer_maker = False
+        trade_id = (
+            row.get("id")
+            or row.get("trade_id")
+            or row.get("tradeId")
+            or f"{subscription.provider_symbol}:{ts}:{format(price, 'f')}:{direction or '0'}"
+        )
+        amount = qty if qty is not None and qty > 0 else Decimal("0")
+        return {
+            "id": str(trade_id),
+            "symbol": subscription.local_symbol,
+            "provider": PROVIDER_ITICK,
+            "provider_symbol": subscription.provider_symbol,
+            "ws_symbol": subscription.ws_symbol or subscription.provider_symbol,
+            "price": format(price, "f"),
+            "last_price": format(price, "f"),
+            "qty": format(amount, "f"),
+            "amount": format(amount, "f"),
+            "volume": format(amount, "f"),
+            "quoteQty": format(price * amount, "f") if amount > 0 else None,
+            "time": ts,
+            "ts": ts,
+            "side": side,
+            "direction": direction or None,
+            "trading_session": row.get("te"),
+            "isBuyerMaker": is_buyer_maker,
+            "source": CONTRACT_PROVIDER_WS_SOURCE,
+            "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
+            "quote_freshness": "LIVE",
+            "price_source": PRICE_SOURCE_TRADE_TICK,
+            "exchange_ts": ts_value,
+            "exchange_symbol": row.get("s"),
+            "exchange_region": row.get("r"),
+            "exchange": row.get("e"),
         }
 
     def _normalize_okx_ticker(

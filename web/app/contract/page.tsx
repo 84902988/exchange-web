@@ -35,6 +35,7 @@ import {
   getContractSymbols,
   getContractTickers,
   isExpiredLastGoodBboQuote,
+  type ContractKlineCurrentCandle,
   type ContractMarketViewDetail,
   type ContractQuoteDisplayStatus,
   type ContractTickerItem,
@@ -43,6 +44,10 @@ import {
   type ContractPositionSummaryItem,
   type ContractSymbolItem,
 } from '@/lib/api/modules/contract';
+import {
+  contractMarketRealtime,
+  type ContractMarketRealtimeMessage,
+} from '@/lib/realtime/contractMarketRealtime';
 import type { SpotMarketPairItem } from '@/lib/api/modules/spot';
 import { isMockStockContractSymbol, toStockContractSymbol } from '@/lib/stockContracts';
 
@@ -63,6 +68,7 @@ type ContractMarketState = {
   latestTradePrice: number | null;
   latestTradePriceSource: 'TRADE_TICK' | null;
   klineMode: ContractKlineMode;
+  klineCurrentCandle: ContractKlineCurrentCandle | null;
   quoteFreshness: string | null;
   displayState: string | null;
   executable: boolean | null;
@@ -83,6 +89,17 @@ type LiveDepthBbo = {
   source: 'LIVE_MID' | null;
   updatedAt: number;
 };
+
+function extractContractMarketStateMessage(message: ContractMarketRealtimeMessage): ContractMarketViewDetail | null {
+  const source = message.market_state && typeof message.market_state === 'object'
+    ? message.market_state
+    : message.data && typeof message.data === 'object'
+      ? message.data
+      : null;
+  if (!source) return null;
+  const record = source as Partial<ContractMarketViewDetail>;
+  return record.symbol ? record as ContractMarketViewDetail : null;
+}
 
 function normalizeCurrentPriceSource(value?: string | null): CurrentPriceSource | null {
   const normalized = String(value || '').trim().toUpperCase();
@@ -546,6 +563,7 @@ function ContractPageContent() {
   const [liveDepthBbo, setLiveDepthBbo] = useState<LiveDepthBbo | null>(null);
   const [currentPriceDirection, setCurrentPriceDirection] = useState<PriceDirection>('flat');
   const [contractMarketView, setContractMarketView] = useState<ContractMarketViewDetail | null>(null);
+  const [realtimeContractMarketState, setRealtimeContractMarketState] = useState<ContractMarketViewDetail | null>(null);
   const [contractMarketViewLoading, setContractMarketViewLoading] = useState(true);
   const [marketSessionRefreshKey, setMarketSessionRefreshKey] = useState(0);
   const [contractPairs, setContractPairs] = useState<GlobalMarketSelectorPair[]>(() => [
@@ -596,9 +614,13 @@ function ContractPageContent() {
     symbolOptionMarketSymbol: symbolOption?.marketSymbol,
     symbolOptionPricePrecision: currentContractPair?.pricePrecision ?? symbolOption?.pricePrecision,
   });
-  const activeContractMarketView = normalizeContractSymbol(contractMarketView?.symbol) === contractSymbol
+  const activeRealtimeContractMarketState = normalizeContractSymbol(realtimeContractMarketState?.symbol) === contractSymbol
+    ? realtimeContractMarketState
+    : null;
+  const activeRestContractMarketView = normalizeContractSymbol(contractMarketView?.symbol) === contractSymbol
     ? contractMarketView
     : null;
+  const activeContractMarketView = activeRealtimeContractMarketState || activeRestContractMarketView;
   const marketViewCategory = normalizeContractCategoryValue(activeContractMarketView?.category);
   const isCryptoContract = isCryptoContractPair(currentContractPair)
     || marketViewCategory === 'CRYPTO'
@@ -734,11 +756,20 @@ function ContractPageContent() {
     : currentPriceSource === 'LIVE_MID'
       ? t('midPrice', 'contracts')
       : t('klineLatestPrice', 'contracts');
-  const contractKlineMode: ContractKlineMode = currentPriceSource === 'TRADE_TICK'
+  const backendKlineMode = String(activeContractMarketView?.kline_current_candle?.kline_mode || '').trim().toUpperCase();
+  const backendContractKlineMode: ContractKlineMode | null = backendKlineMode === 'QUOTE_DRIVEN'
+    ? 'QUOTE_DRIVEN'
+    : backendKlineMode === 'TRADE_DRIVEN'
+      ? 'TRADE_DRIVEN'
+      : backendKlineMode === 'PROVIDER_KLINE'
+        ? 'PROVIDER_KLINE'
+        : null;
+  const inferredContractKlineMode: ContractKlineMode = currentPriceSource === 'TRADE_TICK'
     ? 'TRADE_DRIVEN'
     : currentPriceSource === 'LIVE_MID' && !isCryptoContract && marketUiState.isTradable
       ? 'QUOTE_DRIVEN'
       : 'PROVIDER_KLINE';
+  const contractKlineMode: ContractKlineMode = backendContractKlineMode || inferredContractKlineMode;
   const contractMarketState = useMemo<ContractMarketState>(() => {
     const liveBid = liveDepthMidFresh ? getPositivePrice(liveDepthBbo?.bid) : null;
     const liveAsk = liveDepthMidFresh ? getPositivePrice(liveDepthBbo?.ask) : null;
@@ -762,6 +793,7 @@ function ContractPageContent() {
       latestTradePrice: tradeTickPrice,
       latestTradePriceSource: tradeTickPrice !== null ? 'TRADE_TICK' : null,
       klineMode: contractKlineMode,
+      klineCurrentCandle: activeContractMarketView?.kline_current_candle ?? null,
       quoteFreshness: contractQuoteFreshness,
       displayState: rawMarketViewDisplayState || contractMarketSessionType || contractMarketStatus || null,
       executable: activeContractMarketView?.executable ?? contractQuote?.executable ?? null,
@@ -870,6 +902,17 @@ function ContractPageContent() {
     }, delay);
     return () => window.clearTimeout(timer);
   }, [liveDepthBbo]);
+
+  useEffect(() => {
+    const handleMarketStateMessage = (message: ContractMarketRealtimeMessage) => {
+      const nextState = extractContractMarketStateMessage(message);
+      if (!nextState) return;
+      if (normalizeContractSymbol(nextState.symbol) !== contractSymbol) return;
+      setRealtimeContractMarketState(nextState);
+    };
+
+    return contractMarketRealtime.subscribe('state', handleMarketStateMessage);
+  }, [contractSymbol]);
 
   useEffect(() => {
     const previousState = previousMarketViewDisplayStateRef.current;
@@ -1029,6 +1072,7 @@ function ContractPageContent() {
     setKlineClosePrice(null);
     setLastTradePrice(null);
     setLiveDepthBbo(null);
+    setRealtimeContractMarketState(null);
     setCurrentPriceDirection('flat');
   }, [contractSymbol, interval]);
 
@@ -1219,6 +1263,7 @@ function ContractPageContent() {
                       currentPrice={contractMarketState.displayPrice}
                       currentPriceSource={contractMarketState.displayPriceSource}
                       klineMode={contractMarketState.klineMode}
+                      klineCurrentCandle={contractMarketState.klineCurrentCandle}
                       marketRealtimeStatus={marketRealtimeStatus}
                       marketSessionType={contractMarketSessionType}
                       quoteFreshness={contractQuoteFreshness}

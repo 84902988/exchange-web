@@ -229,6 +229,17 @@ class ItickMarketService:
             params,
         )
 
+    def get_stock_tick(self, region: str, code: str, timeout: Optional[int] = None) -> Any:
+        return self._request_json(
+            "/tick",
+            {
+                "region": self._normalize_region(region),
+                "code": self._normalize_code(code),
+            },
+            timeout=timeout,
+            use_cache=False,
+        )
+
     def get_market_quote(self, market: str, region: str, code: str, timeout: Optional[int] = None) -> Any:
         normalized_market = (market or "stock").strip().lower()
         normalized_region = self._normalize_region(region)

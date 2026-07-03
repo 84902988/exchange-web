@@ -357,6 +357,7 @@ export default function ContractFuturesOrderBook({
   const [depthQuoteFreshness, setDepthQuoteFreshness] = useState<string | null>(null);
   const [depthTs, setDepthTs] = useState<string | number | null>(null);
   const [depthClosedMarketExecutionMode, setDepthClosedMarketExecutionMode] = useState<string | null>(null);
+  const [depthUpdateVersion, setDepthUpdateVersion] = useState(0);
   const [loading, setLoading] = useState(true);
   const [fallbackDepthAllowed, setFallbackDepthAllowed] = useState(false);
   const [lastFullDepthSnapshot, setLastFullDepthSnapshot] = useState<DepthSnapshot | null>(null);
@@ -446,6 +447,7 @@ export default function ContractFuturesOrderBook({
         setDepthQuoteFreshness(depth.quote_freshness || null);
         setDepthTs(depth.ts || null);
         setDepthClosedMarketExecutionMode(depth.closed_market_execution_mode || null);
+        setDepthUpdateVersion((value) => value + 1);
         onDepthDataChangeRef.current?.({
           symbol: depth.symbol || normalizedSymbol,
           asks: nextAsks,
@@ -486,6 +488,7 @@ export default function ContractFuturesOrderBook({
       setDepthQuoteFreshness(cachedDepth?.quote_freshness || null);
       setDepthTs(cachedDepth?.ts || null);
       setDepthClosedMarketExecutionMode(cachedDepth?.closed_market_execution_mode || null);
+      setDepthUpdateVersion((value) => value + 1);
       setLoading(!cachedDepthHasConfirmedStatus);
     } else {
       setDepthSymbol(normalizedSymbol);
@@ -499,6 +502,7 @@ export default function ContractFuturesOrderBook({
       setDepthQuoteFreshness(null);
       setDepthTs(null);
       setDepthClosedMarketExecutionMode(null);
+      setDepthUpdateVersion((value) => value + 1);
       setLoading(true);
     }
     void loadDepth();
@@ -535,6 +539,7 @@ export default function ContractFuturesOrderBook({
       setDepthQuoteFreshness(depth.quoteFreshness);
       setDepthTs(depth.ts);
       setDepthClosedMarketExecutionMode(depth.closedMarketExecutionMode);
+      setDepthUpdateVersion((value) => value + 1);
       setLoading(false);
       onDepthDataChangeRef.current?.({
         symbol: depth.symbol || normalizedSymbol,
@@ -666,7 +671,7 @@ export default function ContractFuturesOrderBook({
       source: null,
       updatedAt: Date.now(),
     });
-  }, [bestAskNumber, bestBidNumber, bboMidPrice, onLiveBboChange]);
+  }, [bestAskNumber, bestBidNumber, bboMidPrice, depthUpdateVersion, onLiveBboChange]);
   const marketViewDisplayPrice = toPositivePrice(marketView?.display_price);
   const marketViewDisplaySource = marketViewDisplayPrice !== null
     ? normalizeCurrentPriceSource(marketView?.current_price_source || marketView?.display_price_source)
