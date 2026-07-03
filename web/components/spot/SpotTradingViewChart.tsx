@@ -49,6 +49,7 @@ export default function SpotTradingViewChart({
   interval,
   height = 520,
   pricePrecision,
+  amountPrecision,
 }: SpotChartProps) {
   const { locale, t } = useLocaleContext();
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -64,7 +65,7 @@ export default function SpotTradingViewChart({
 
   const normalizedSymbol = useMemo(() => normalizeTradingViewSymbol(symbol), [symbol]);
   const widgetInterval = useMemo(() => spotIntervalToTradingViewResolution(interval), [interval]);
-  const widgetKey = `${normalizedSymbol}:${widgetInterval}:${locale}:${pricePrecision ?? 'auto'}`;
+  const widgetKey = `${normalizedSymbol}:${widgetInterval}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}`;
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
 
@@ -99,6 +100,7 @@ export default function SpotTradingViewChart({
       symbol: normalizedSymbol,
       displaySymbol: displayName,
       pricePrecision,
+      amountPrecision,
     });
     datafeedRef.current = datafeed;
 
@@ -149,7 +151,7 @@ export default function SpotTradingViewChart({
       cancelled = true;
       cleanupWidget();
     };
-  }, [containerId, displayName, locale, normalizedSymbol, pricePrecision, scriptReady, widgetInterval, widgetKey]);
+  }, [amountPrecision, containerId, displayName, locale, normalizedSymbol, pricePrecision, scriptReady, widgetInterval, widgetKey]);
 
   return (
     <div className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]" style={{ minHeight: height }}>

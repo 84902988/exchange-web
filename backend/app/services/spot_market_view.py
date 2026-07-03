@@ -43,6 +43,16 @@ def _to_str(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        number = int(value)
+    except Exception:
+        return None
+    if 0 <= number <= 12:
+        return number
+    return None
+
+
 def _best_price(depth: Optional[DepthResponse], side: str) -> Optional[str]:
     levels = getattr(depth, side, None) or []
     if not levels:
@@ -124,6 +134,8 @@ def build_empty_spot_market_view(*, symbol: str, warnings: Optional[list[str]] =
         "display_price": None,
         "display_price_source": "missing",
         "last_price": None,
+        "price_precision": None,
+        "amount_precision": None,
         "best_bid": None,
         "best_ask": None,
         "spread": None,
@@ -146,6 +158,8 @@ def build_empty_spot_market_view(*, symbol: str, warnings: Optional[list[str]] =
             "depth_stale": None,
             "trades_provider": None,
             "trades_stale": None,
+            "price_precision": None,
+            "amount_precision": None,
         },
         "ticker": None,
         "depth": None,
@@ -225,6 +239,14 @@ def get_spot_market_view(
     latest_trade_price = _latest_trade_price(trades)
     ticker_price = _to_str(ticker.get("last_price"))
     depth_price = _to_str(getattr(depth, "last_price", None) or getattr(depth, "mid_price", None))
+    price_precision = (
+        _int_or_none(getattr(depth, "price_precision", None))
+        or _int_or_none(ticker.get("price_precision"))
+    )
+    amount_precision = (
+        _int_or_none(getattr(depth, "amount_precision", None))
+        or _int_or_none(ticker.get("amount_precision"))
+    )
     display_price = latest_trade_price or ticker_price or depth_price
     display_price_source = (
         "latest_trade"
@@ -245,6 +267,8 @@ def get_spot_market_view(
         "display_price": display_price,
         "display_price_source": display_price_source,
         "last_price": latest_trade_price or ticker_price,
+        "price_precision": price_precision,
+        "amount_precision": amount_precision,
         "best_bid": best_bid,
         "best_ask": best_ask,
         "spread": _spread(best_bid, best_ask),
@@ -267,6 +291,8 @@ def get_spot_market_view(
             "depth_stale": getattr(depth, "stale", None) if depth is not None else None,
             "trades_provider": getattr(trades, "provider", None),
             "trades_stale": getattr(trades, "stale", None) if trades is not None else None,
+            "price_precision": price_precision,
+            "amount_precision": amount_precision,
         },
         "ticker": ticker or None,
         "depth": _serialize_depth(depth),

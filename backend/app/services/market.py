@@ -50,6 +50,7 @@ from app.services.stock_dealer_depth_service import (
     is_stock_dealer_pair,
 )
 from app.services.spot_kline_realtime import SPOT_KLINE_SOURCE_INTERNAL_TRADE
+from app.services.spot_market_provider_ws import get_spot_provider_ws_depth
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +191,43 @@ def _format_price_for_pair(pair: TradingPair, value: Any) -> str:
 
 def _format_amount_for_pair(pair: TradingPair, value: Any) -> str:
     return _decimal_to_str(_round_amount(pair, _to_decimal(value)))
+
+
+def _format_depth_for_pair(pair: TradingPair, depth: DepthResponse, limit: Optional[int] = None) -> DepthResponse:
+    depth_limit = max(1, int(limit or max(len(depth.bids), len(depth.asks), 20)))
+
+    def adapt(levels: Any) -> list[DepthItem]:
+        items: list[DepthItem] = []
+        if not isinstance(levels, list):
+            return items
+        for item in levels[:depth_limit]:
+            price = _to_decimal(getattr(item, "price", None))
+            amount = _to_decimal(getattr(item, "amount", None))
+            if price <= 0 or amount <= 0:
+                continue
+            items.append(
+                DepthItem(
+                    price=_format_price_for_pair(pair, price),
+                    amount=_format_amount_for_pair(pair, amount),
+                )
+            )
+        return items
+
+    data = depth.model_dump() if hasattr(depth, "model_dump") else depth.dict()
+    data.update(
+        {
+            "symbol": pair.symbol,
+            "price_precision": int(getattr(pair, "price_precision", 8) or 8),
+            "amount_precision": int(getattr(pair, "amount_precision", 8) or 8),
+            "bids": adapt(getattr(depth, "bids", [])),
+            "asks": adapt(getattr(depth, "asks", [])),
+        }
+    )
+    if getattr(depth, "last_price", None) is not None:
+        data["last_price"] = _format_price_for_pair(pair, getattr(depth, "last_price"))
+    if getattr(depth, "mid_price", None) is not None:
+        data["mid_price"] = _format_price_for_pair(pair, getattr(depth, "mid_price"))
+    return DepthResponse(**data)
 
 
 def _default_itick_price(pair: TradingPair) -> Decimal:
@@ -780,12 +818,12 @@ def _get_internal_depth(db: Session, pair: TradingPair, limit: int = 20) -> Dept
     )
 
     bids = [
-        DepthItem(price=_decimal_to_str(row.price), amount=_decimal_to_str(row.amount))
+        DepthItem(price=_format_price_for_pair(pair, row.price), amount=_format_amount_for_pair(pair, row.amount))
         for row in bid_rows
         if row.amount is not None
     ]
     asks = [
-        DepthItem(price=_decimal_to_str(row.price), amount=_decimal_to_str(row.amount))
+        DepthItem(price=_format_price_for_pair(pair, row.price), amount=_format_amount_for_pair(pair, row.amount))
         for row in ask_rows
         if row.amount is not None
     ]
@@ -793,6 +831,7 @@ def _get_internal_depth(db: Session, pair: TradingPair, limit: int = 20) -> Dept
     return DepthResponse(
         symbol=pair.symbol,
         price_precision=int(pair.price_precision or 8),
+        amount_precision=int(pair.amount_precision or 8),
         bids=bids,
         asks=asks,
         ts=_now_ms(),
@@ -804,8 +843,15 @@ def _get_binance_depth(pair: TradingPair, limit: int = 20) -> DepthResponse:
     return DepthResponse(
         symbol=pair.symbol,
         price_precision=int(pair.price_precision or 8),
-        bids=[DepthItem(price=item.price, amount=item.amount) for item in payload.bids],
-        asks=[DepthItem(price=item.price, amount=item.amount) for item in payload.asks],
+        amount_precision=int(pair.amount_precision or 8),
+        bids=[
+            DepthItem(price=_format_price_for_pair(pair, item.price), amount=_format_amount_for_pair(pair, item.amount))
+            for item in payload.bids
+        ],
+        asks=[
+            DepthItem(price=_format_price_for_pair(pair, item.price), amount=_format_amount_for_pair(pair, item.amount))
+            for item in payload.asks
+        ],
         ts=payload.ts,
     )
 
@@ -850,6 +896,7 @@ def _build_itick_fallback_depth(pair: TradingPair, limit: int = 20) -> DepthResp
     return DepthResponse(
         symbol=pair.symbol,
         price_precision=int(getattr(pair, "price_precision", 2) or 2),
+        amount_precision=int(getattr(pair, "amount_precision", 6) or 6),
         bids=bids,
         asks=asks,
         ts=_now_ms(),
@@ -865,6 +912,9 @@ def get_depth(db: Session, symbol: str, limit: int = 20, *, fast: bool = False) 
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
+        live_depth = get_spot_provider_ws_depth(pair.symbol, limit=limit)
+        if live_depth is not None:
+            return _format_depth_for_pair(pair, live_depth, limit=limit)
         return _get_external_spot_depth(db, pair, limit=limit, fast=fast)
 
     internal_depth = _get_internal_depth(db, pair, limit=limit)
@@ -1148,6 +1198,7 @@ def _spot_depth_from_provider(
     return DepthResponse(
         symbol=pair.symbol,
         price_precision=int(pair.price_precision or 8),
+        amount_precision=int(pair.amount_precision or 8),
         bids=bids,
         asks=asks,
         ts=_now_ms(),
