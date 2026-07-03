@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Optional
@@ -363,6 +364,7 @@ def get_klines_cache_first(
     source: str,
     fetch_external: Callable[[int, Optional[int]], Iterable[Any]],
     end_time_ms: Optional[int] = None,
+    external_budget_seconds: Optional[float] = None,
 ) -> list[dict[str, Any]]:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
@@ -393,6 +395,21 @@ def get_klines_cache_first(
         )
         return cached[-normalized_limit:]
 
+    stale_cached = lambda: cached or _read_cached_klines(
+        db,
+        market_type=market_type,
+        symbol=normalized_symbol,
+        interval=normalized_interval,
+        limit=normalized_limit,
+        end_time_ms=end_time_ms,
+        allow_stale_open=True,
+    )
+
+    if external_budget_seconds is not None and external_budget_seconds <= 0:
+        return stale_cached()
+
+    started_at = time.monotonic()
+
     try:
         record_kline_external_fetch(
             source=source,
@@ -415,15 +432,20 @@ def get_klines_cache_first(
             normalized_interval,
             exc,
         )
-        return cached or _read_cached_klines(
-            db,
-            market_type=market_type,
-            symbol=normalized_symbol,
-            interval=normalized_interval,
-            limit=normalized_limit,
-            end_time_ms=end_time_ms,
-            allow_stale_open=True,
-        )
+        return stale_cached()
+
+    if external_budget_seconds is not None:
+        elapsed = time.monotonic() - started_at
+        if elapsed > external_budget_seconds:
+            logger.warning(
+                "kline_external_fetch_over_budget market_type=%s symbol=%s interval=%s elapsed=%.3fs budget=%.3fs",
+                market_type,
+                normalized_symbol,
+                normalized_interval,
+                elapsed,
+                external_budget_seconds,
+            )
+            return stale_cached()
 
     upsert_klines(
         db,
