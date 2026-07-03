@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import SpotHeader from './SpotHeader';
-import SpotChart from './SpotChart';
+import SpotTradingViewChart from './SpotTradingViewChart';
 import GlobalMarketSelector from './GlobalMarketSelector';
 import SpotOrderBook from './SpotOrderBook';
 import SpotTradesHistory from './SpotTradesHistory';
@@ -14,14 +14,10 @@ import SpotOrderTabs from './SpotOrderTabs';
 import { useAuth } from '@/lib/authContext';
 import {
   getSpotAccountBalances,
-  getSpotKlines,
   getSpotMarketPairs,
   getSpotMarketTickers,
-  isPollingSpotDataSource,
   normalizeSpotDataSource,
-  type SpotDepthLevel,
   type SpotAccountBalanceItem,
-  type SpotMarketKlineItem,
   type SpotMarketPairItem,
   type SpotMarketTickerItem,
 } from '@/lib/api/modules/spot';
@@ -31,13 +27,8 @@ import {
   formatRawPrice,
   getSpotSymbolPricePrecision,
 } from '@/lib/marketPrecision';
-import { readMarketCache, writeMarketCache } from '@/lib/marketCache';
-import { spotMarketRealtime } from '@/services/marketRealtime';
 import { formatSpotDisplaySymbol } from './spotFormat';
-import {
-  getRealtimePriceDirection,
-  type RealtimePriceDirection,
-} from './spotTickerColor';
+import { useSpotMarket } from './useSpotMarket';
 
 interface SpotHeaderMarketData {
   change: string;
@@ -98,12 +89,6 @@ function formatOrderInputPriceBySymbol(symbol: string, value: string, precision?
   return formatRawPrice(num, precision ?? getSpotSymbolPricePrecision(symbol) ?? DEFAULT_PRICE_PRECISION);
 }
 
-function getKlineTime(item: SpotMarketKlineItem): number {
-  const raw = item.open_time ?? item.time ?? item.timestamp ?? 0;
-  const time = Number(raw);
-  return Number.isFinite(time) ? time : 0;
-}
-
 function formatSignedPercent(value: number): string {
   if (!Number.isFinite(value)) return '--';
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
@@ -112,19 +97,6 @@ function formatSignedPercent(value: number): string {
 function formatSignedPrice(value: number, precision: number): string {
   if (!Number.isFinite(value)) return '--';
   return `${value >= 0 ? '+' : ''}${value.toFixed(precision)}`;
-}
-
-function formatMetricValue(value: number): string {
-  if (!Number.isFinite(value)) return '--';
-
-  const abs = Math.abs(value);
-  const maximumFractionDigits =
-    abs >= 1000 ? 2 : abs >= 1 ? 4 : 6;
-
-  return value.toLocaleString('en-US', {
-    minimumFractionDigits: 0,
-    maximumFractionDigits,
-  });
 }
 
 function formatCompactMetric(value: string | number | null | undefined): string {
@@ -165,52 +137,6 @@ function resolveSpotPricePrecision(
   }
 
   return getSpotSymbolPricePrecision(symbol) ?? DEFAULT_PRICE_PRECISION;
-}
-
-function buildMarketDataFromKlines(
-  symbol: string,
-  items: SpotMarketKlineItem[],
-  pricePrecision?: number | null,
-): SpotHeaderMarketData {
-  const resolvedPricePrecision =
-    pricePrecision ?? getSpotSymbolPricePrecision(symbol) ?? DEFAULT_PRICE_PRECISION;
-  const sorted = [...items]
-    .filter((item) => {
-      return (
-        Number.isFinite(Number(item.open)) &&
-        Number.isFinite(Number(item.close)) &&
-        Number.isFinite(Number(item.high)) &&
-        Number.isFinite(Number(item.low))
-      );
-    })
-    .sort((a, b) => getKlineTime(a) - getKlineTime(b));
-
-  if (!sorted.length) {
-    return EMPTY_MARKET_DATA;
-  }
-
-  const first = sorted[0];
-  const last = sorted[sorted.length - 1];
-
-  const openPrice = Number(first.open);
-  const closePrice = Number(last.close);
-  const highPrice = Math.max(...sorted.map((item) => Number(item.high)));
-  const lowPrice = Math.min(...sorted.map((item) => Number(item.low)));
-  const volume = sorted.reduce((sum, item) => sum + Number(item.volume || 0), 0);
-  const turnover = sorted.reduce((sum, item) => sum + Number(item.quote_volume || 0), 0);
-  const changeAmount = closePrice - openPrice;
-  const changePercent =
-    Number.isFinite(openPrice) && openPrice > 0
-      ? (changeAmount / openPrice) * 100
-      : 0;
-
-  return {
-    change: formatSignedPercent(changePercent),
-    changeAmount: formatSignedPrice(changeAmount, resolvedPricePrecision),
-    highLow: `${formatPriceBySymbol(symbol, String(highPrice), resolvedPricePrecision)} / ${formatPriceBySymbol(symbol, String(lowPrice), resolvedPricePrecision)}`,
-    volume: formatMetricValue(volume),
-    turnover: formatMetricValue(turnover),
-  };
 }
 
 type RightPanelTab = 'orderbook' | 'trades';
@@ -254,25 +180,6 @@ type SpotPairOption = {
   spotLogoUrl?: string | null;
 };
 
-type SpotDepthSnapshot = {
-  asks: SpotDepthLevel[];
-  bids: SpotDepthLevel[];
-  pricePrecision?: number;
-  lastPrice?: string | number;
-  midPrice?: string | number;
-  source?: string;
-  fetchedAt?: number;
-};
-
-type SpotMarketCache = {
-  symbol?: string;
-  lastPrice?: string | number | null;
-  header?: SpotHeaderMarketData;
-  ticker?: SpotPairOption | null;
-  depth?: SpotDepthSnapshot;
-  updatedAt?: number;
-};
-
 function normalizeSpotApiSymbol(value?: string | null): string {
   return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
 }
@@ -312,14 +219,6 @@ function resolveSpotAssetSymbols(
   }
 
   return { baseAsset: upperSymbol, quoteAsset: '' };
-}
-
-function readCurrentSpotMarketCache(symbol: string): SpotMarketCache | null {
-  const normalizedSymbol = normalizeSpotApiSymbol(symbol);
-  const cache = readMarketCache<SpotMarketCache>('spot', normalizedSymbol);
-  if (!cache) return null;
-  if (normalizeSpotApiSymbol(cache.symbol) !== normalizedSymbol) return null;
-  return cache;
 }
 
 function getTickerPrice(item: SpotMarketTickerItem): string | number | null {
@@ -493,28 +392,15 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const hasInitialSymbol = Boolean(String(initialSymbol || '').trim());
   const initialSpotSymbol = normalizeSpotApiSymbol(initialSymbol || DEFAULT_SPOT_SYMBOL) || DEFAULT_SPOT_SYMBOL;
   const [symbol, setSymbol] = useState(initialSpotSymbol);
+  const spotMarket = useSpotMarket(symbol);
   const symbolRef = useRef(symbol);
-  const latestPriceRef = useRef('--');
-  const latestPriceDirectionRef = useRef<RealtimePriceDirection>('flat');
   const appliedCategoryRef = useRef('');
   const [interval, setIntervalValue] = useState('1m');
-  const [latestPrice, setLatestPrice] = useState('--');
-  const [latestCandlePatchPrice, setLatestCandlePatchPrice] = useState<string | number | null>(null);
-  const [priceDirection, setPriceDirection] = useState<RealtimePriceDirection>('flat');
   const [orderPrice, setOrderPrice] = useState('');
   const [orderPriceSelectNonce, setOrderPriceSelectNonce] = useState(0);
-  const [marketHeaderData, setMarketHeaderData] = useState<SpotHeaderMarketData>(EMPTY_MARKET_DATA);
-  const [marketSyncing, setMarketSyncing] = useState(true);
 
   const [refreshKey, setRefreshKey] = useState(0);
   const [accountBalances, setAccountBalances] = useState<SpotAccountBalanceItem[]>([]);
-  const [orderBookDepth, setOrderBookDepth] = useState<{
-    asks: SpotDepthLevel[];
-    bids: SpotDepthLevel[];
-  }>({
-    asks: [],
-    bids: [],
-  });
   const [balancesLoading, setBalancesLoading] = useState(false);
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
@@ -598,22 +484,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   }, [symbol]);
 
   useEffect(() => {
-    return () => {
-      spotMarketRealtime.disconnect();
-    };
-  }, []);
-
-  useEffect(() => {
-    const normalizedSymbol = String(symbol || '').trim().toUpperCase();
-    if (!normalizedSymbol || isPollingSpotDataSource(marketFeedDataSource)) {
-      spotMarketRealtime.disconnect();
-      return;
-    }
-
-    spotMarketRealtime.setSymbol(normalizedSymbol);
-  }, [marketFeedDataSource, symbol]);
-
-  useEffect(() => {
     pairOptionsRef.current = pairOptions;
   }, [pairOptions]);
 
@@ -623,32 +493,15 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
   useEffect(() => {
     setOrderPrice('');
-    setPriceDirection('flat');
-    latestPriceDirectionRef.current = 'flat';
     setConfiguredPricePrecision(null);
-    const cache = readCurrentSpotMarketCache(symbol);
-    const cachedPrice = cache?.lastPrice ? String(cache.lastPrice) : '--';
-    const hasCachedMarketData = Boolean(
-      cache?.lastPrice ||
-      cache?.ticker ||
-      cache?.depth ||
-      (cache?.header && cache.header !== EMPTY_MARKET_DATA)
-    );
-    latestPriceRef.current = cachedPrice;
-    setLatestPrice(cachedPrice);
-    setLatestCandlePatchPrice(null);
-    setMarketHeaderData(cache?.header || EMPTY_MARKET_DATA);
-    setHeaderTicker(cache?.ticker || null);
-    setMarketSyncing(!hasCachedMarketData);
-    if (cache?.depth) {
-      setOrderBookDepth({ asks: cache.depth.asks || [], bids: cache.depth.bids || [] });
-      if (Number.isInteger(cache.depth.pricePrecision)) {
-        setConfiguredPricePrecision(Number(cache.depth.pricePrecision));
-      }
-    } else {
-      setOrderBookDepth({ asks: [], bids: [] });
-    }
   }, [symbol]);
+
+  useEffect(() => {
+    const nextPricePrecision = spotMarket.depth?.price_precision;
+    if (Number.isInteger(nextPricePrecision) && Number(nextPricePrecision) >= 0) {
+      setConfiguredPricePrecision(Number(nextPricePrecision));
+    }
+  }, [spotMarket.depth?.price_precision]);
 
   useEffect(() => {
     const nextSymbol = normalizeSpotApiSymbol(initialSymbol);
@@ -786,74 +639,31 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   }, [loadPairPage, pairQuery]);
 
   useEffect(() => {
-    let cancelled = false;
     const currentSymbol = normalizeSpotApiSymbol(symbol);
     if (!currentSymbol) {
+      setHeaderTicker(null);
       return;
     }
 
-    const cachedPair = pairOptionsRef.current.find((item) => item.symbol === currentSymbol);
-    if (cachedPair) {
-      setHeaderTicker(cachedPair);
+    const nextTicker = spotMarket.marketView?.ticker
+      ? buildSpotPairOption(spotMarket.marketView.ticker)
+      : null;
+
+    if (!nextTicker || nextTicker.symbol !== currentSymbol) {
+      const cachedPair = pairOptionsRef.current.find((item) => item.symbol === currentSymbol);
+      setHeaderTicker(cachedPair || null);
+      return;
     }
 
-    const loadCurrentTicker = async () => {
-      try {
-        const tickers = await getSpotMarketTickers(currentSymbol);
-        const nextTicker = tickers
-          .map(buildSpotPairOption)
-          .find((item): item is SpotPairOption => item !== null && item.symbol === currentSymbol);
-
-        if (cancelled || normalizeSpotApiSymbol(symbolRef.current) !== currentSymbol) {
-          return;
-        }
-
-        if (!nextTicker) {
-          latestPriceRef.current = '--';
-          latestPriceDirectionRef.current = 'flat';
-          setLatestPrice('--');
-          setLatestCandlePatchPrice(null);
-          setPriceDirection('flat');
-          setHeaderTicker(null);
-          setMarketHeaderData(EMPTY_MARKET_DATA);
-          setOrderBookDepth({ asks: [], bids: [] });
-          writeMarketCache<SpotMarketCache>('spot', currentSymbol, {
-            ticker: null,
-            lastPrice: null,
-            header: EMPTY_MARKET_DATA,
-            depth: { asks: [], bids: [] },
-          });
-          setMarketSyncing(false);
-          return;
-        }
-
-        setHeaderTicker(nextTicker);
-        writeMarketCache<SpotMarketCache>('spot', currentSymbol, {
-          ticker: nextTicker,
-          lastPrice: nextTicker.price ?? null,
-        });
-        setPairOptions((prev) => {
-          const map = new Map(prev.map((item) => [item.symbol, item]));
-          if (map.has(nextTicker.symbol)) {
-            map.set(nextTicker.symbol, nextTicker);
-          }
-          return Array.from(map.values());
-        });
-        setMarketSyncing(false);
-      } catch (error) {
-        if (!cancelled) {
-          console.error('SpotPage current ticker load error:', error);
-          setMarketSyncing(false);
-        }
+    setHeaderTicker(nextTicker);
+    setPairOptions((prev) => {
+      const map = new Map(prev.map((item) => [item.symbol, item]));
+      if (map.has(nextTicker.symbol)) {
+        map.set(nextTicker.symbol, { ...map.get(nextTicker.symbol), ...nextTicker });
       }
-    };
-
-    void loadCurrentTicker();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [symbol]);
+      return Array.from(map.values());
+    });
+  }, [spotMarket.marketView?.ticker, symbol]);
 
   useEffect(() => {
     const category = String(initialCategory || '').trim().toLowerCase();
@@ -880,26 +690,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     }
     router.replace(`/trade/spot?category=${encodeURIComponent(category)}&symbol=${encodeURIComponent(matchedPair.symbol)}`);
   }, [hasInitialSymbol, initialCategory, pairOptions, pairOptionsQueryKey, router, symbol]);
-
-  useEffect(() => {
-    const formatted = formatPriceBySymbol(
-      symbol,
-      String(selectedTicker?.price ?? ''),
-      pricePrecision,
-    );
-
-    if (!formatted) {
-      return;
-    }
-
-    latestPriceRef.current = formatted;
-    setLatestPrice(formatted);
-    setLatestCandlePatchPrice(formatted);
-    writeMarketCache<SpotMarketCache>('spot', symbol, {
-      lastPrice: formatted,
-      ticker: selectedTicker,
-    });
-  }, [pricePrecision, selectedTicker, symbol]);
 
   const loadAccountBalances = useCallback(async (options?: { silent?: boolean }) => {
     if (!isLoggedIn) {
@@ -929,60 +719,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   useEffect(() => {
     loadAccountBalances();
   }, [loadAccountBalances, refreshKey]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const run = async () => {
-      const tickerHeaderData = buildMarketDataFromTicker(symbol, selectedTicker, pricePrecision);
-      if (tickerHeaderData) {
-        setMarketHeaderData(tickerHeaderData);
-        writeMarketCache<SpotMarketCache>('spot', symbol, {
-          header: tickerHeaderData,
-          ticker: selectedTicker,
-          lastPrice: selectedTicker?.price ?? undefined,
-        });
-        setMarketSyncing(false);
-        return;
-      }
-
-      try {
-        const response = await getSpotKlines({
-          symbol,
-          interval: '1h',
-          limit: 24,
-        });
-
-        if (cancelled) {
-          return;
-        }
-
-        const nextHeader = buildMarketDataFromKlines(symbol, response.items || [], pricePrecision);
-        setMarketHeaderData(nextHeader);
-        writeMarketCache<SpotMarketCache>('spot', symbol, { header: nextHeader });
-        setMarketSyncing(false);
-      } catch (error) {
-        if (cancelled) {
-          return;
-        }
-
-        console.error('SpotPage market header load error:', error);
-        setMarketHeaderData(EMPTY_MARKET_DATA);
-        setMarketSyncing(false);
-      }
-    };
-
-    void run();
-
-    const timer = window.setInterval(() => {
-      void run();
-    }, 30000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [pricePrecision, selectedTicker, symbol]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1042,37 +778,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     void loadPairPage(pairQueryRef.current, pairPage + 1, true);
   }, [loadPairPage, pairOptions.length, pairOptionsLoading, pairOptionsLoadingMore, pairPage, pairTotal]);
 
-  const handleLastPriceChange = useCallback(
-    (price: string | number) => {
-      const formatted = formatPriceBySymbol(symbol, String(price), pricePrecision);
-
-    if (!formatted) {
-      const tickerPrice = formatPriceBySymbol(
-        symbol,
-        String(selectedTicker?.price ?? ''),
-        pricePrecision,
-      );
-      const fallbackPrice = tickerPrice || '--';
-      latestPriceRef.current = fallbackPrice;
-      setLatestPrice(fallbackPrice);
-      setLatestCandlePatchPrice(tickerPrice || null);
-      return;
-    }
-
-    const nextDirection = getRealtimePriceDirection(
-      formatted,
-      latestPriceRef.current,
-      latestPriceDirectionRef.current,
-    );
-    latestPriceRef.current = formatted;
-    latestPriceDirectionRef.current = nextDirection;
-    setLatestPrice(formatted);
-    setLatestCandlePatchPrice(formatted);
-    setPriceDirection(nextDirection);
-  },
-    [pricePrecision, selectedTicker?.price, symbol]
-  );
-
   const handleOrderSuccess = useCallback(() => {
     setRefreshKey((v) => v + 1);
     void loadAccountBalances({ silent: true });
@@ -1117,50 +822,26 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     });
   }, []);
 
-  const handleDepthDataChange = useCallback((depth: SpotDepthSnapshot) => {
-    const nextPricePrecision = depth.pricePrecision;
-    if (Number.isInteger(nextPricePrecision) && Number(nextPricePrecision) >= 0) {
-      setConfiguredPricePrecision(Number(nextPricePrecision));
-    }
-    setOrderBookDepth({ asks: depth.asks, bids: depth.bids });
-    writeMarketCache<SpotMarketCache>('spot', symbol, {
-      depth,
-      lastPrice: depth.lastPrice ?? depth.midPrice ?? undefined,
-    });
-
-    const contextPrice = depth.lastPrice ?? depth.midPrice;
-    const formatted = formatPriceBySymbol(
-      symbol,
-      String(contextPrice ?? ''),
-      Number.isInteger(nextPricePrecision) ? Number(nextPricePrecision) : pricePrecision,
-    );
-
-    if (formatted) {
-      const nextDirection = getRealtimePriceDirection(
-        formatted,
-        latestPriceRef.current,
-        latestPriceDirectionRef.current,
-      );
-      latestPriceRef.current = formatted;
-      latestPriceDirectionRef.current = nextDirection;
-      setLatestPrice(formatted);
-      setPriceDirection(nextDirection);
-      writeMarketCache<SpotMarketCache>('spot', symbol, {
-        lastPrice: formatted,
-        depth,
-      });
-    }
-  }, [pricePrecision, symbol]);
-
   const currentDisplaySymbol = useMemo(() => {
     return selectedTicker?.displaySymbol || selectedPair?.displaySymbol || selectedTicker?.label || formatSpotDisplaySymbol(symbol);
   }, [selectedPair?.displaySymbol, selectedTicker?.displaySymbol, selectedTicker?.label, symbol]);
-  const spotMarketStatus = selectedTicker?.marketStatus || selectedPair?.marketStatus || 'OPEN';
+  const spotLastPrice = formatPriceBySymbol(
+    symbol,
+    String(spotMarket.lastPrice ?? selectedTicker?.price ?? ''),
+    pricePrecision,
+  ) || '--';
+  const spotDepth = spotMarket.depth;
+  const spotDepthAsks = spotDepth?.asks || [];
+  const spotDepthBids = spotDepth?.bids || [];
+  const marketHeaderData = buildMarketDataFromTicker(symbol, selectedTicker, pricePrecision) || EMPTY_MARKET_DATA;
+  const priceDirection = spotMarket.priceDirection;
+  const spotMarketStatus = spotMarket.marketView?.market_status || selectedTicker?.marketStatus || selectedPair?.marketStatus || 'OPEN';
+  const spotMarketDataSource = spotMarket.marketView?.data_source || marketFeedDataSource;
   const spotQuoteFreshness = selectedTicker?.quoteFreshness || selectedPair?.quoteFreshness || 'LIVE';
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
   const marketSyncingText = t('loading', 'common');
-  const shouldShowMarketSyncing = marketSyncing && latestPrice === '--';
-  const displayLatestPrice = shouldShowMarketSyncing ? marketSyncingText : latestPrice;
+  const shouldShowMarketSyncing = spotMarket.isLoading && spotLastPrice === '--';
+  const displayLatestPrice = shouldShowMarketSyncing ? marketSyncingText : spotLastPrice;
   const displayMarketHeaderData = shouldShowMarketSyncing
     ? {
       change: marketSyncingText,
@@ -1212,13 +893,13 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     toolbarAddon={<SpotLogoCard symbol={symbol} pair={selectedTicker || selectedPair} />}
                   />
                   <div className="min-h-0 flex-1">
-                    <SpotChart
+                    <SpotTradingViewChart
                       symbol={symbol}
                       displaySymbol={currentDisplaySymbol}
                       interval={interval}
-                      dataSource={marketFeedDataSource}
-                      latestPrice={latestPrice}
-                      latestTradeOrTickerPrice={latestCandlePatchPrice}
+                      dataSource={spotMarketDataSource}
+                      latestPrice={spotLastPrice}
+                      latestTradeOrTickerPrice={null}
                       priceDirection={priceDirection}
                       pricePrecision={pricePrecision}
                       showRwaReference={showRwaReference}
@@ -1261,13 +942,15 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                       <SpotOrderBook
                         symbol={symbol}
                         displaySymbol={currentDisplaySymbol}
-                        lastPrice={latestPrice}
+                        lastPrice={spotLastPrice}
                         pricePrecision={pricePrecision}
                         priceDirection={priceDirection}
-                        dataSource={marketFeedDataSource}
-                        initialDepth={readCurrentSpotMarketCache(symbol)?.depth}
+                        asks={spotDepthAsks}
+                        bids={spotDepthBids}
+                        bestAsk={spotMarket.bestAsk}
+                        bestBid={spotMarket.bestBid}
+                        isLoading={spotMarket.isLoading}
                         onPriceClick={handleOrderBookPriceClick}
-                        onDepthDataChange={handleDepthDataChange}
                       />
                     </div>
 
@@ -1276,9 +959,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                         symbol={symbol}
                         displaySymbol={currentDisplaySymbol}
                         pricePrecision={pricePrecision}
-                        dataSource={marketFeedDataSource}
+                        trades={spotMarket.trades}
+                        isLoading={spotMarket.isLoading}
                         onPriceClick={handleOrderBookPriceClick}
-                        onLastPriceChange={handleLastPriceChange}
                       />
                     </div>
                   </div>
@@ -1305,14 +988,14 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     symbol={symbol}
                     baseAsset={spotAssetSymbols.baseAsset}
                     quoteAsset={spotAssetSymbols.quoteAsset}
-                    marketPrice={formatOrderInputPriceBySymbol(symbol, latestPrice, pricePrecision)}
+                    marketPrice={formatOrderInputPriceBySymbol(symbol, spotLastPrice, pricePrecision)}
                     selectedPrice={orderPrice}
                     priceSelectNonce={orderPriceSelectNonce}
                     pricePrecision={pricePrecision}
                     amountPrecision={currentAmountPrecision}
                     accountBalances={accountBalances}
-                    asks={orderBookDepth.asks}
-                    bids={orderBookDepth.bids}
+                    asks={spotDepthAsks}
+                    bids={spotDepthBids}
                     onPriceChange={setOrderPrice}
                     onOrderSuccess={handleOrderSuccess}
                     isLoggedIn={isLoggedIn}

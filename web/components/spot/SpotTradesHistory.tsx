@@ -1,66 +1,21 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo } from 'react'
 import { useLocaleContext } from '@/contexts/LocaleContext'
 import {
-  getSpotTrades,
-  isPollingSpotDataSource,
-  normalizeSpotTrades,
-  type SpotMarketDataSource,
+  type SpotMarketTradeItem,
 } from '@/lib/api/modules/spot'
 import { formatPrice as formatMarketPrice } from '@/lib/marketPrecision'
-import { readMarketCache, writeMarketCache } from '@/lib/marketCache'
-import {
-  spotMarketRealtime,
-  type SpotMarketRealtimeMessage,
-} from '@/services/marketRealtime'
 import { formatSpotDisplaySymbol } from './spotFormat'
-
-type TradeItem = {
-  price: string | number
-  amount: string | number
-  ts?: string | number
-  time?: string | number
-}
-
-type WsTradeMessage = {
-  type: 'spot_trade'
-  symbol: string
-  trade: {
-    id?: number | string
-    price: string | number
-    amount: string | number
-    side?: string
-    ts?: string | number
-  }
-}
-
-type WsSnapshotMessage = {
-  type: 'spot_market_snapshot'
-  symbol: string
-  trades?: {
-    symbol?: string
-    items?: TradeItem[]
-  }
-}
 
 type Props = {
   symbol: string
   displaySymbol?: string | null
   limit?: number
-  refreshNonce?: number
   pricePrecision: number
-  dataSource?: SpotMarketDataSource | string | null
+  trades?: SpotMarketTradeItem[]
+  isLoading?: boolean
   onPriceClick?: (price: string) => void
-  onLastPriceChange?: (price: string | number) => void
-  onTradesStateChange?: (hasTrades: boolean) => void
-}
-
-type SpotTradesCache = {
-  symbol?: string;
-  trades?: TradeItem[];
-  lastPrice?: string | number | null;
-  updatedAt?: number;
 }
 
 function toNumber(value: string | number | undefined | null): number {
@@ -95,7 +50,7 @@ function formatTime(value?: string | number) {
   })
 }
 
-function getTradeTime(item: TradeItem) {
+function getTradeTime(item: SpotMarketTradeItem) {
   return item.ts ?? item.time
 }
 
@@ -118,199 +73,17 @@ function splitSymbol(symbol: string) {
   }
 }
 
-const EXTERNAL_TRADES_POLL_MS = 1500
-
-function readCurrentTradesCache(symbol: string): SpotTradesCache | null {
-  const normalizedSymbol = String(symbol || '').trim().toUpperCase()
-  const cached = readMarketCache<SpotTradesCache>('spot', normalizedSymbol)
-  if (!cached) return null
-  if (String(cached.symbol || '').trim().toUpperCase() !== normalizedSymbol) return null
-  return cached
-}
-
 export default function SpotTradesHistory({
   symbol,
   displaySymbol,
   limit = 20,
-  refreshNonce = 0,
   pricePrecision,
-  dataSource,
+  trades = [],
+  isLoading = false,
   onPriceClick,
-  onLastPriceChange,
-  onTradesStateChange,
 }: Props) {
   const { t } = useLocaleContext()
-  const [rows, setRows] = useState<TradeItem[]>([])
-  const [loading, setLoading] = useState(true)
-
-  const currentSymbolRef = useRef('')
-  const pollTimerRef = useRef<number | null>(null)
-  const onLastPriceChangeRef = useRef(onLastPriceChange)
-  const onTradesStateChangeRef = useRef(onTradesStateChange)
-  useEffect(() => {
-    onLastPriceChangeRef.current = onLastPriceChange
-  }, [onLastPriceChange])
-
-  useEffect(() => {
-    onTradesStateChangeRef.current = onTradesStateChange
-  }, [onTradesStateChange])
-
-  useEffect(() => {
-    currentSymbolRef.current = String(symbol || '').toUpperCase()
-  }, [symbol])
-
-  useEffect(() => {
-    if (loading) return
-    onTradesStateChangeRef.current?.(rows.length > 0)
-  }, [rows, loading])
-
-  useEffect(() => {
-    if (loading) return
-
-    if (rows[0]?.price !== undefined && rows[0]?.price !== null) {
-      onLastPriceChangeRef.current?.(rows[0].price)
-    } else {
-      onLastPriceChangeRef.current?.('--')
-    }
-  }, [rows, loading])
-
-  useEffect(() => {
-    const normalizedSymbol = String(symbol || '').toUpperCase()
-
-    const cached = readCurrentTradesCache(normalizedSymbol)
-    if (cached?.trades?.length) {
-      setRows(cached.trades.slice(0, limit))
-    }
-    setLoading(!!normalizedSymbol)
-    onTradesStateChangeRef.current?.(!!cached?.trades?.length)
-    if (cached?.lastPrice) {
-      onLastPriceChangeRef.current?.(cached.lastPrice)
-    }
-
-    if (!normalizedSymbol) {
-      return
-    }
-
-    let alive = true
-
-    const clearPollTimer = () => {
-      if (pollTimerRef.current) {
-        window.clearInterval(pollTimerRef.current)
-        pollTimerRef.current = null
-      }
-    }
-
-    const applyTrades = (items: TradeItem[]) => {
-      const nextRows = items.slice(0, limit)
-      setRows(nextRows)
-      writeMarketCache<SpotTradesCache>('spot', normalizedSymbol, {
-        trades: nextRows,
-        lastPrice: nextRows[0]?.price ?? null,
-      })
-      setLoading(false)
-    }
-
-    let unsubscribeTrade: (() => void) | null = null
-    let unsubscribeSnapshot: (() => void) | null = null
-
-    const handleRealtimeMessage = (message: SpotMarketRealtimeMessage) => {
-      if (!alive) return
-
-      const data = message as WsTradeMessage | WsSnapshotMessage
-      const msgSymbol = String(data?.symbol || '').toUpperCase()
-      const currentSymbol = currentSymbolRef.current
-
-      if (!msgSymbol || msgSymbol !== currentSymbol) return
-
-      if (data.type === 'spot_trade') {
-        const trade: TradeItem = {
-          price: data.trade.price,
-          amount: data.trade.amount,
-          ts: data.trade.ts,
-        }
-
-        setRows((prev) => {
-          const nextRows = [trade, ...prev].slice(0, limit)
-          writeMarketCache<SpotTradesCache>('spot', normalizedSymbol, {
-            trades: nextRows,
-            lastPrice: trade.price,
-          })
-          return nextRows
-        })
-        setLoading(false)
-        return
-      }
-
-      if (data.type === 'spot_market_snapshot') {
-        const list = Array.isArray(data.trades?.items) ? data.trades.items : []
-        applyTrades(list)
-      }
-    }
-
-    const subscribeInternalRealtime = () => {
-      if (!alive) return
-
-      spotMarketRealtime.setSymbol(normalizedSymbol)
-      spotMarketRealtime.subscribe('trade', handleRealtimeMessage)
-      spotMarketRealtime.subscribe('snapshot', handleRealtimeMessage)
-      unsubscribeTrade = () => spotMarketRealtime.unsubscribe('trade', handleRealtimeMessage)
-      unsubscribeSnapshot = () => spotMarketRealtime.unsubscribe('snapshot', handleRealtimeMessage)
-    }
-
-    let polling = false
-
-    const loadTradesSnapshot = async () => {
-      if (!alive || polling) return
-
-      polling = true
-
-      try {
-        const payload = await getSpotTrades(normalizedSymbol, limit)
-
-        if (!alive) return
-
-        const list = normalizeSpotTrades(payload).map((item) => ({
-          price: item.price,
-          amount: item.amount,
-          ts: item.ts,
-          time: item.time,
-        }))
-
-        applyTrades(list)
-      } catch (err) {
-        if (!alive) return
-
-        setRows([])
-        writeMarketCache<SpotTradesCache>('spot', normalizedSymbol, {
-          trades: [],
-          lastPrice: null,
-        })
-        onTradesStateChangeRef.current?.(false)
-        console.warn('[SpotTradesHistory] trades load failed:', err)
-        setLoading(false)
-      } finally {
-        polling = false
-      }
-    }
-
-    if (isPollingSpotDataSource(dataSource)) {
-      void loadTradesSnapshot()
-      pollTimerRef.current = window.setInterval(() => {
-        void loadTradesSnapshot()
-      }, EXTERNAL_TRADES_POLL_MS)
-    } else {
-      clearPollTimer()
-      void loadTradesSnapshot()
-      subscribeInternalRealtime()
-    }
-
-    return () => {
-      alive = false
-      clearPollTimer()
-      unsubscribeTrade?.()
-      unsubscribeSnapshot?.()
-    }
-  }, [dataSource, symbol, limit, refreshNonce])
+  const rows = useMemo(() => trades.slice(0, limit), [limit, trades])
 
   const data = useMemo(() => {
     return rows.map((item, index) => {
@@ -344,9 +117,9 @@ export default function SpotTradesHistory({
       {!hasTrades ? (
         <div className="relative flex min-h-0 flex-1 items-center justify-center px-2.5 py-6 text-sm text-transparent">
           <span className="absolute inset-0 flex items-center justify-center px-3 text-center text-zinc-400">
-            {loading ? t('spotTradesLoading', 'asset') : t('spotNoTradeData', 'asset')}
+            {isLoading ? t('spotTradesLoading', 'asset') : t('spotNoTradeData', 'asset')}
           </span>
-          {loading ? t('spotTradesLoading', 'asset') : t('spotNoTradeData', 'asset')}
+          {isLoading ? t('spotTradesLoading', 'asset') : t('spotNoTradeData', 'asset')}
         </div>
       ) : (
         <>

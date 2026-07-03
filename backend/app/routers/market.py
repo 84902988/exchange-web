@@ -25,6 +25,7 @@ from app.services.market import (
 )
 from app.services.market_cache import cache_fetch_json, cache_get_json, market_cache_key
 from app.services.market_ws import market_ws_manager
+from app.services.spot_market_view import get_spot_market_view
 from app.services.reference_overlay_service import get_reference_overlay_for_symbol
 
 router = APIRouter(
@@ -118,6 +119,20 @@ def get_tickers(
     except Exception:
         logger.exception("get tickers failed")
         raise HTTPException(status_code=500, detail="get tickers failed")
+
+
+@router.get("/spot/view", summary="Get unified spot market view")
+def spot_view(
+    symbol: str = Query(..., description="Spot symbol, e.g. BTCUSDT"),
+    db: Session = Depends(get_db),
+):
+    try:
+        return get_spot_market_view(db=db, symbol=symbol)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("get spot market view failed symbol=%s", symbol)
+        raise HTTPException(status_code=500, detail=f"get spot market view failed: {str(e)}")
 
 
 @router.get("/pairs", summary="获取轻量交易对列表")

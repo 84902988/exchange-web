@@ -10,7 +10,8 @@ from fastapi import WebSocket
 from sqlalchemy.orm import Session
 from starlette.websockets import WebSocketState
 
-from app.services.market import get_market_depth, get_market_trades
+from app.services.market import get_market_depth
+from app.services.spot_market_view import get_spot_market_snapshot_payload
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -93,31 +94,7 @@ class MarketWsManager:
         if not symbol:
             return
 
-        depth = get_market_depth(db=db, symbol=symbol, limit=20)
-        trades = get_market_trades(db=db, symbol=symbol, limit=30)
-
-        payload = {
-            "type": "spot_market_snapshot",
-            "symbol": symbol,
-            "depth": {
-                "symbol": depth.symbol,
-                "bids": [
-                    item.model_dump() if hasattr(item, "model_dump") else item.dict()
-                    for item in depth.bids
-                ],
-                "asks": [
-                    item.model_dump() if hasattr(item, "model_dump") else item.dict()
-                    for item in depth.asks
-                ],
-            },
-            "trades": {
-                "symbol": trades.symbol,
-                "items": [
-                    item.model_dump() if hasattr(item, "model_dump") else item.dict()
-                    for item in trades.trades
-                ],
-            },
-        }
+        payload = get_spot_market_snapshot_payload(db=db, symbol=symbol)
 
         await self._send_payload(symbol, payload)
 
