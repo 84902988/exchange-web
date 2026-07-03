@@ -129,6 +129,8 @@ export default function SpotTradingViewChart({
         'paneProperties.vertGridProperties.color': 'rgba(255,255,255,0.04)',
         'paneProperties.horzGridProperties.color': 'rgba(255,255,255,0.04)',
         'scalesProperties.textColor': 'rgba(255,255,255,0.65)',
+        'scalesProperties.showStudyLastValue': false,
+        'scalesProperties.showStudyPlotLabels': false,
         'mainSeriesProperties.candleStyle.upColor': '#00c087',
         'mainSeriesProperties.candleStyle.downColor': '#f6465d',
         'mainSeriesProperties.candleStyle.borderUpColor': '#00c087',

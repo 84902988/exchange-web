@@ -205,6 +205,7 @@ class SpotMarketGateway:
                 "amount_precision": amount_precision,
                 "bids": adapt(list(depth.bids or [])),
                 "asks": adapt(list(depth.asks or [])),
+                "freshness": "LAST_GOOD" if getattr(depth, "stale", False) else "LIVE",
             }
         )
         return DepthResponse(**data)

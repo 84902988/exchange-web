@@ -16,7 +16,7 @@ import {
 type SpotOrderBookProps = {
   symbol: string;
   displaySymbol?: string | null;
-  lastPrice?: string;
+  referencePrice?: string;
   priceDirection?: PriceDirection;
   pricePrecision: number;
   asks?: SpotDepthLevel[];
@@ -74,7 +74,7 @@ function buildRows(levels: SpotDepthLevel[]): OrderRow[] {
 export default function SpotOrderBook({
   symbol,
   displaySymbol,
-  lastPrice = '--',
+  referencePrice = '--',
   priceDirection = 'flat',
   pricePrecision,
   asks: propAsks = [],
@@ -96,7 +96,7 @@ export default function SpotOrderBook({
   const bidRows = useMemo(() => buildRows(bids), [bids]);
 
   const hasDepth = askRows.length > 0 || bidRows.length > 0;
-  const lastPriceClass = getTickerDirectionTextClass(priceDirection);
+  const referencePriceClass = getTickerDirectionTextClass(priceDirection);
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
@@ -140,11 +140,13 @@ export default function SpotOrderBook({
 
           <button
             type="button"
-            disabled={!onPriceClick || lastPrice === '--'}
-            onClick={() => onPriceClick?.(String(lastPrice).replace(/,/g, ''))}
-            className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center text-[17px] font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${lastPriceClass}`}
+            disabled={!onPriceClick || referencePrice === '--'}
+            onClick={() => onPriceClick?.(String(referencePrice).replace(/,/g, ''))}
+            title="BBO Mid"
+            aria-label="BBO Mid"
+            className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center text-[17px] font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${referencePriceClass}`}
           >
-            {lastPrice}
+            {referencePrice}
           </button>
 
           <div className="grid min-h-0 grid-rows-9 gap-px overflow-hidden">

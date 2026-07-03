@@ -20,6 +20,7 @@ import {
   type SpotAccountBalanceItem,
   type SpotMarketPairItem,
   type SpotMarketTickerItem,
+  type SpotMarketView,
 } from '@/lib/api/modules/spot';
 import {
   DEFAULT_PRICE_PRECISION,
@@ -250,17 +251,23 @@ function getTickerChangePercent(item: SpotMarketTickerItem): string | number | n
   );
 }
 
-function buildMarketDataFromTicker(
+function buildMarketDataFromMarketView(
   symbol: string,
-  ticker: SpotPairOption | null,
+  view: SpotMarketView | null,
   pricePrecision: number,
 ): SpotHeaderMarketData | null {
-  if (!ticker) return null;
+  if (!view) return null;
 
-  const changePercent = Number(ticker.change24h);
-  const changeAmount = Number(ticker.priceChange24h);
-  const high = Number(ticker.high24h);
-  const low = Number(ticker.low24h);
+  const ticker = view.ticker;
+  const changePercent = Number(
+    view.ticker_24h_change_percent ??
+    ticker?.price_change_percent_24h ??
+    ticker?.price_change_percent ??
+    ticker?.change_24h,
+  );
+  const changeAmount = Number(view.ticker_24h_change ?? ticker?.price_change_24h);
+  const high = Number(view.ticker_24h_high ?? ticker?.high_24h);
+  const low = Number(view.ticker_24h_low ?? ticker?.low_24h);
 
   return {
     change: Number.isFinite(changePercent) ? formatSignedPercent(changePercent) : '--',
@@ -271,8 +278,8 @@ function buildMarketDataFromTicker(
       Number.isFinite(high) && Number.isFinite(low)
         ? `${formatPriceBySymbol(symbol, String(high), pricePrecision)} / ${formatPriceBySymbol(symbol, String(low), pricePrecision)}`
         : '-- / --',
-    volume: formatCompactMetric(ticker.baseVolume24h ?? ticker.volume24h),
-    turnover: formatCompactMetric(ticker.quoteVolume24h),
+    volume: formatCompactMetric(view.ticker_volume ?? ticker?.base_volume_24h ?? ticker?.volume_24h),
+    turnover: formatCompactMetric(view.ticker_quote_volume ?? ticker?.quote_volume_24h),
   };
 }
 
@@ -841,17 +848,27 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   }, [selectedPair?.displaySymbol, selectedTicker?.displaySymbol, selectedTicker?.label, symbol]);
   const spotLastPrice = formatPriceBySymbol(
     symbol,
-    String(spotMarket.lastPrice ?? selectedTicker?.price ?? ''),
+    String(spotMarket.displayPrice ?? ''),
     pricePrecision,
   ) || '--';
+  const orderbookReferencePrice = formatPriceBySymbol(
+    symbol,
+    String(spotMarket.orderbookMidPrice ?? spotMarket.displayPrice ?? ''),
+    pricePrecision,
+  ) || '--';
+  const formMarketPrice = formatOrderInputPriceBySymbol(
+    symbol,
+    String(spotMarket.orderbookMidPrice ?? spotMarket.bestAsk ?? spotMarket.bestBid ?? spotMarket.displayPrice ?? ''),
+    pricePrecision,
+  );
   const spotDepth = spotMarket.depth;
   const spotDepthAsks = spotDepth?.asks || [];
   const spotDepthBids = spotDepth?.bids || [];
-  const marketHeaderData = buildMarketDataFromTicker(symbol, selectedTicker, pricePrecision) || EMPTY_MARKET_DATA;
+  const marketHeaderData = buildMarketDataFromMarketView(symbol, spotMarket.marketView, pricePrecision) || EMPTY_MARKET_DATA;
   const priceDirection = spotMarket.priceDirection;
-  const spotMarketStatus = spotMarket.marketView?.market_status || selectedTicker?.marketStatus || selectedPair?.marketStatus || 'OPEN';
+  const spotMarketStatus = spotMarket.marketView?.market_status || selectedPair?.marketStatus || 'OPEN';
   const spotMarketDataSource = spotMarket.marketView?.data_source || marketFeedDataSource;
-  const spotQuoteFreshness = selectedTicker?.quoteFreshness || selectedPair?.quoteFreshness || 'LIVE';
+  const spotTickerFreshness = spotMarket.freshness.ticker;
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
   const marketSyncingText = t('loading', 'common');
   const shouldShowMarketSyncing = spotMarket.isLoading && spotLastPrice === '--';
@@ -879,7 +896,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         turnover={displayMarketHeaderData.turnover}
         priceDirection={priceDirection}
         marketStatus={spotMarketStatus}
-        quoteFreshness={spotQuoteFreshness}
+        quoteFreshness={null}
+        tickerFreshness={spotTickerFreshness}
         marketSessionType={spotMarketSessionType}
       />
 
@@ -957,7 +975,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                       <SpotOrderBook
                         symbol={symbol}
                         displaySymbol={currentDisplaySymbol}
-                        lastPrice={spotLastPrice}
+                        referencePrice={orderbookReferencePrice}
                         pricePrecision={pricePrecision}
                         priceDirection={priceDirection}
                         asks={spotDepthAsks}
@@ -1003,7 +1021,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     symbol={symbol}
                     baseAsset={spotAssetSymbols.baseAsset}
                     quoteAsset={spotAssetSymbols.quoteAsset}
-                    marketPrice={formatOrderInputPriceBySymbol(symbol, spotLastPrice, pricePrecision)}
+                    marketPrice={formMarketPrice}
                     selectedPrice={orderPrice}
                     priceSelectNonce={orderPriceSelectNonce}
                     pricePrecision={pricePrecision}
