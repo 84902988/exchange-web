@@ -74,6 +74,7 @@ export type SpotDepthResponse = {
   last_price?: string | number
   mid_price?: string | number
   source?: string
+  freshness?: string | null
   fetched_at?: number
 }
 
@@ -89,6 +90,11 @@ export type SpotMarketTradesResponse = {
   symbol: string
   items?: SpotMarketTradeItem[]
   trades?: SpotMarketTradeItem[]
+  provider?: string | null
+  stale?: boolean
+  updated_at?: string | null
+  source?: string | null
+  freshness?: string | null
 }
 
 export type SpotMarketView = {
@@ -96,6 +102,15 @@ export type SpotMarketView = {
   display_price?: string | number | null
   display_price_source?: string | null
   last_price?: string | number | null
+  last_trade_price?: string | number | null
+  orderbook_mid_price?: string | number | null
+  ticker_last_price?: string | number | null
+  ticker_24h_change?: string | number | null
+  ticker_24h_change_percent?: string | number | null
+  ticker_24h_high?: string | number | null
+  ticker_24h_low?: string | number | null
+  ticker_volume?: string | number | null
+  ticker_quote_volume?: string | number | null
   price_precision?: number | string | null
   amount_precision?: number | string | null
   best_bid?: string | number | null
@@ -107,6 +122,15 @@ export type SpotMarketView = {
   depth_status?: string | null
   trades_status?: string | null
   kline_status?: string | null
+  depth_source?: string | null
+  trades_source?: string | null
+  ticker_source?: string | null
+  kline_source?: string | null
+  depth_freshness?: string | null
+  trades_freshness?: string | null
+  ticker_freshness?: string | null
+  kline_freshness?: string | null
+  quote_freshness?: string | null
   executable?: boolean
   updated_at?: string | null
   warnings?: string[]

@@ -24,6 +24,7 @@ class DepthResponse(BaseModel):
     spread_bps: Optional[str] = None
     offset_bps: Optional[str] = None
     source: Optional[str] = None
+    freshness: Optional[str] = None
     fetched_at: Optional[int] = None
 
 
@@ -40,6 +41,8 @@ class TradesResponse(BaseModel):
     provider: Optional[str] = None
     stale: bool = False
     updated_at: Optional[str] = None
+    source: Optional[str] = None
+    freshness: Optional[str] = None
 
 
 
@@ -69,6 +72,8 @@ class KlineResponse(BaseModel):
     provider: Optional[str] = None
     stale: bool = False
     updated_at: Optional[str] = None
+    source: Optional[str] = None
+    freshness: Optional[str] = None
 
 
 class TickerItem(BaseModel):

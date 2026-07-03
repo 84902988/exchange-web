@@ -167,6 +167,7 @@ class MarketWsManager:
             "last_price",
             "mid_price",
             "source",
+            "freshness",
             "fetched_at",
         ):
             value = getattr(depth, key, None)

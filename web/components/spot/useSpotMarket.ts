@@ -8,6 +8,7 @@ import {
   type SpotDepthLevel,
   type SpotDepthResponse,
   type SpotMarketTradeItem,
+  type SpotMarketTickerItem,
   type SpotMarketView,
 } from '@/lib/api/modules/spot';
 import { readMarketCache, writeMarketCache } from '@/lib/marketCache';
@@ -54,15 +55,37 @@ type SpotDepthMessage = SpotMarketRealtimeMessage & {
   depth?: SpotDepthResponse;
 };
 
+type SpotMarketFreshnessMap = {
+  depth: string | null;
+  trades: string | null;
+  ticker: string | null;
+  kline: string | null;
+};
+
+type SpotMarketSourceMap = {
+  depth: string | null;
+  trades: string | null;
+  ticker: string | null;
+  kline: string | null;
+};
+
 export type UseSpotMarketResult = {
   symbol: string;
   marketView: SpotMarketView | null;
   depth: SpotDepthResponse | null;
   trades: SpotMarketTradeItem[];
+  ticker: SpotMarketTickerItem | null;
+  klineStatus: string | null;
+  displayPrice: string | number | null;
+  displayPriceSource: string | null;
+  lastTradePrice: string | number | null;
+  orderbookMidPrice: string | number | null;
   lastPrice: string | number | null;
   priceDirection: RealtimePriceDirection;
   bestBid: string | number | null;
   bestAsk: string | number | null;
+  freshness: SpotMarketFreshnessMap;
+  sources: SpotMarketSourceMap;
   isConnected: boolean;
   isLoading: boolean;
   error: string | null;
@@ -101,8 +124,58 @@ function firstPrice(levels?: SpotDepthLevel[] | null): string | number | null {
   return level?.price ?? null;
 }
 
-function getViewLastPrice(view?: SpotMarketView | null): string | number | null {
-  return view?.last_price ?? view?.display_price ?? view?.ticker?.last_price ?? null;
+function midpointPrice(
+  bid?: string | number | null,
+  ask?: string | number | null,
+): string | number | null {
+  const bidNumber = Number(bid);
+  const askNumber = Number(ask);
+  if (!Number.isFinite(bidNumber) || !Number.isFinite(askNumber) || bidNumber <= 0 || askNumber <= 0) {
+    return null;
+  }
+  return (bidNumber + askNumber) / 2;
+}
+
+function getDepthMidPrice(depth?: SpotDepthResponse | null): string | number | null {
+  return depth?.mid_price ?? midpointPrice(firstPrice(depth?.bids), firstPrice(depth?.asks));
+}
+
+function getViewDisplayPrice(view?: SpotMarketView | null): string | number | null {
+  return view?.display_price ?? view?.last_price ?? view?.ticker_last_price ?? view?.ticker?.last_price ?? null;
+}
+
+function getViewOrderbookMidPrice(
+  view?: SpotMarketView | null,
+  depth?: SpotDepthResponse | null,
+): string | number | null {
+  return view?.orderbook_mid_price ?? getDepthMidPrice(depth ?? view?.depth);
+}
+
+function normalizeDomainValue(value?: string | null): string | null {
+  const text = String(value || '').trim();
+  return text ? text.toUpperCase() : null;
+}
+
+function depthFreshness(depth?: SpotDepthResponse | null, fallback?: string | null): string | null {
+  const explicit = normalizeDomainValue(depth?.freshness);
+  if (explicit) return explicit;
+  if (!depth) return normalizeDomainValue(fallback);
+  if (depth.stale) return 'LAST_GOOD';
+  if (normalizeDomainValue(depth.source) === 'LIVE_WS') return 'LIVE';
+  return normalizeDomainValue(fallback) || 'RECENT';
+}
+
+function tradeFreshness(trades: SpotMarketTradeItem[], fallback?: string | null): string | null {
+  if (fallback) return normalizeDomainValue(fallback);
+  return trades.length > 0 ? 'RECENT' : 'MISSING';
+}
+
+function sourceFromDepth(depth?: SpotDepthResponse | null, fallback?: string | null): string | null {
+  return normalizeDomainValue(depth?.source) || normalizeDomainValue(fallback);
+}
+
+function getViewLastTradePrice(view?: SpotMarketView | null): string | number | null {
+  return view?.last_trade_price ?? null;
 }
 
 function getViewDirection(view?: SpotMarketView | null): RealtimePriceDirection {
@@ -132,7 +205,7 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   const applyView = useCallback((view: SpotMarketView) => {
     const nextDepth = normalizeDepth(view.depth);
     const nextTrades = normalizeTrades(view.trades);
-    const nextLastPrice = getViewLastPrice(view);
+    const nextLastPrice = getViewDisplayPrice(view);
     const nextDirection = getViewDirection(view);
 
     setMarketView(view);
@@ -261,13 +334,27 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       if (msgSymbol !== normalizedSymbol) return;
 
       const nextDepth = normalizeDepth(data.depth);
+      const nextBestBid = firstPrice(nextDepth?.bids);
+      const nextBestAsk = firstPrice(nextDepth?.asks);
+      const nextMidPrice = getDepthMidPrice(nextDepth);
+      const nextDepthFreshness = depthFreshness(nextDepth);
+      const nextDepthSource = sourceFromDepth(nextDepth);
       setDepth(nextDepth);
       setMarketView((prev) => prev ? {
         ...prev,
         depth: nextDepth,
-        best_bid: firstPrice(nextDepth?.bids),
-        best_ask: firstPrice(nextDepth?.asks),
+        best_bid: nextBestBid,
+        best_ask: nextBestAsk,
+        orderbook_mid_price: nextMidPrice,
         depth_status: nextDepth?.bids?.length || nextDepth?.asks?.length ? 'ok' : 'missing',
+        depth_source: nextDepthSource ?? prev.depth_source,
+        depth_freshness: nextDepthFreshness ?? prev.depth_freshness,
+        display_price: !prev.display_price || prev.display_price_source === 'orderbook_mid' || prev.display_price_source === 'missing'
+          ? nextMidPrice ?? prev.display_price
+          : prev.display_price,
+        display_price_source: !prev.display_price || prev.display_price_source === 'orderbook_mid' || prev.display_price_source === 'missing'
+          ? nextMidPrice ? 'orderbook_mid' : prev.display_price_source
+          : prev.display_price_source,
       } : prev);
     };
 
@@ -290,10 +377,13 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       setMarketView((prev) => prev ? {
         ...prev,
         display_price: trade.price,
-        display_price_source: 'latest_trade',
+        display_price_source: 'last_trade',
         last_price: trade.price,
+        last_trade_price: trade.price,
         price_direction: nextDirection,
         trades_status: 'ok',
+        trades_source: 'LIVE_WS',
+        trades_freshness: 'LIVE',
       } : prev);
     };
 
@@ -331,16 +421,40 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
 
   const bestBid = marketView?.best_bid ?? firstPrice(depth?.bids);
   const bestAsk = marketView?.best_ask ?? firstPrice(depth?.asks);
+  const orderbookMidPrice = getViewOrderbookMidPrice(marketView, depth);
+  const displayPrice = getViewDisplayPrice(marketView) ?? lastPrice;
+  const lastTradePrice = getViewLastTradePrice(marketView);
+  const ticker = marketView?.ticker ?? null;
+  const freshness: SpotMarketFreshnessMap = {
+    depth: normalizeDomainValue(marketView?.depth_freshness) || depthFreshness(depth),
+    trades: normalizeDomainValue(marketView?.trades_freshness) || tradeFreshness(trades),
+    ticker: normalizeDomainValue(marketView?.ticker_freshness || marketView?.quote_freshness),
+    kline: normalizeDomainValue(marketView?.kline_freshness),
+  };
+  const sources: SpotMarketSourceMap = {
+    depth: normalizeDomainValue(marketView?.depth_source) || sourceFromDepth(depth),
+    trades: normalizeDomainValue(marketView?.trades_source),
+    ticker: normalizeDomainValue(marketView?.ticker_source),
+    kline: normalizeDomainValue(marketView?.kline_source),
+  };
 
   return {
     symbol: normalizedSymbol,
     marketView,
     depth,
     trades,
+    ticker,
+    klineStatus: marketView?.kline_status ?? null,
+    displayPrice,
+    displayPriceSource: marketView?.display_price_source ?? null,
+    lastTradePrice,
+    orderbookMidPrice,
     lastPrice,
     priceDirection,
     bestBid,
     bestAsk,
+    freshness,
+    sources,
     isConnected,
     isLoading,
     error,

@@ -68,6 +68,84 @@ def _spread(best_bid: Optional[str], best_ask: Optional[str]) -> Optional[str]:
     return format(ask - bid, "f")
 
 
+def _format_price(value: Decimal, precision: Optional[int]) -> str:
+    if precision is None:
+        return format(value, "f")
+    return format(value.quantize(Decimal("1").scaleb(-precision)), "f")
+
+
+def _orderbook_mid_price(
+    best_bid: Optional[str],
+    best_ask: Optional[str],
+    precision: Optional[int],
+) -> Optional[str]:
+    bid = _decimal_or_none(best_bid)
+    ask = _decimal_or_none(best_ask)
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return None
+    return _format_price((bid + ask) / Decimal("2"), precision)
+
+
+def _is_stale(payload: Any) -> bool:
+    if payload is None:
+        return False
+    if isinstance(payload, dict):
+        return bool(payload.get("stale"))
+    return bool(getattr(payload, "stale", False))
+
+
+def _payload_value(payload: Any, key: str) -> Any:
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        return payload.get(key)
+    return getattr(payload, key, None)
+
+
+def _normalized_source(payload: Any, *, has_data: bool, default: str = "MISSING") -> str:
+    if not has_data or payload is None:
+        return "MISSING"
+    provider = str(_payload_value(payload, "provider") or "").upper()
+    raw_source = str(_payload_value(payload, "source") or "").upper()
+    if _is_stale(payload) or provider == "LAST_GOOD":
+        return "LAST_GOOD"
+    if raw_source == "LIVE_WS":
+        return "LIVE_WS"
+    if raw_source == "EXTERNAL":
+        return "REST"
+    if raw_source == "INTERNAL":
+        return "INTERNAL"
+    if raw_source:
+        return raw_source
+    if provider:
+        return "REST"
+    return default
+
+
+def _freshness_from_source(
+    source: str,
+    *,
+    has_data: bool,
+    quote_freshness: Optional[str] = None,
+) -> str:
+    if not has_data:
+        return "MISSING"
+    quote_value = str(quote_freshness or "").upper()
+    if quote_value in {"LAST_GOOD", "LAST_VALID", "FALLBACK"}:
+        return "LAST_GOOD"
+    if quote_value == "STALE":
+        return "STALE"
+    if quote_value == "LIVE":
+        return "LIVE"
+    if source == "LIVE_WS":
+        return "LIVE"
+    if source == "LAST_GOOD":
+        return "LAST_GOOD"
+    if source == "MISSING":
+        return "MISSING"
+    return "RECENT"
+
+
 def _latest_trade_price(trades: Optional[TradesResponse]) -> Optional[str]:
     items = getattr(trades, "trades", None) or []
     if not items:
@@ -134,6 +212,15 @@ def build_empty_spot_market_view(*, symbol: str, warnings: Optional[list[str]] =
         "display_price": None,
         "display_price_source": "missing",
         "last_price": None,
+        "last_trade_price": None,
+        "orderbook_mid_price": None,
+        "ticker_last_price": None,
+        "ticker_24h_change": None,
+        "ticker_24h_change_percent": None,
+        "ticker_24h_high": None,
+        "ticker_24h_low": None,
+        "ticker_volume": None,
+        "ticker_quote_volume": None,
         "price_precision": None,
         "amount_precision": None,
         "best_bid": None,
@@ -145,6 +232,15 @@ def build_empty_spot_market_view(*, symbol: str, warnings: Optional[list[str]] =
         "depth_status": "missing",
         "trades_status": "missing",
         "kline_status": "unknown",
+        "depth_source": "MISSING",
+        "trades_source": "MISSING",
+        "ticker_source": "MISSING",
+        "kline_source": "UNKNOWN",
+        "depth_freshness": "MISSING",
+        "trades_freshness": "MISSING",
+        "ticker_freshness": "MISSING",
+        "kline_freshness": "UNKNOWN",
+        "quote_freshness": "MISSING",
         "executable": False,
         "updated_at": datetime.utcnow().isoformat(),
         "warnings": list(warnings or []),
@@ -152,12 +248,18 @@ def build_empty_spot_market_view(*, symbol: str, warnings: Optional[list[str]] =
             "ticker_source": None,
             "ticker_provider": None,
             "ticker_stale": None,
+            "ticker_freshness": "MISSING",
             "ticker_error": None,
             "depth_source": None,
             "depth_provider": None,
             "depth_stale": None,
+            "depth_freshness": "MISSING",
             "trades_provider": None,
             "trades_stale": None,
+            "trades_source": None,
+            "trades_freshness": "MISSING",
+            "kline_source": "UNKNOWN",
+            "kline_freshness": "UNKNOWN",
             "price_precision": None,
             "amount_precision": None,
         },
@@ -236,9 +338,8 @@ def get_spot_market_view(
 
     best_bid = _best_price(depth, "bids")
     best_ask = _best_price(depth, "asks")
-    latest_trade_price = _latest_trade_price(trades)
-    ticker_price = _to_str(ticker.get("last_price"))
-    depth_price = _to_str(getattr(depth, "last_price", None) or getattr(depth, "mid_price", None))
+    last_trade_price = _latest_trade_price(trades)
+    ticker_last_price = _to_str(ticker.get("last_price"))
     price_precision = (
         _int_or_none(getattr(depth, "price_precision", None))
         or _int_or_none(ticker.get("price_precision"))
@@ -247,26 +348,59 @@ def get_spot_market_view(
         _int_or_none(getattr(depth, "amount_precision", None))
         or _int_or_none(ticker.get("amount_precision"))
     )
-    display_price = latest_trade_price or ticker_price or depth_price
-    display_price_source = (
-        "latest_trade"
-        if latest_trade_price
-        else "ticker"
-        if ticker_price
-        else "depth"
-        if depth_price
-        else "missing"
-    )
+    orderbook_mid_price = _orderbook_mid_price(best_bid, best_ask, price_precision)
     market_status = str(ticker.get("market_status") or "UNKNOWN").upper()
     has_depth = bool(best_bid and best_ask)
     has_trades = bool(getattr(trades, "trades", None))
     has_kline = "unknown"
+    has_ticker = bool(ticker_last_price)
+    depth_source = _normalized_source(depth, has_data=has_depth)
+    trades_source = _normalized_source(trades, has_data=has_trades, default="INTERNAL")
+    ticker_source = _normalized_source(ticker, has_data=has_ticker)
+    kline_source = "UNKNOWN"
+    depth_freshness = _freshness_from_source(depth_source, has_data=has_depth)
+    trades_freshness = _freshness_from_source(trades_source, has_data=has_trades)
+    ticker_freshness = _freshness_from_source(
+        ticker_source,
+        has_data=has_ticker,
+        quote_freshness=ticker.get("quote_freshness"),
+    )
+    kline_freshness = "UNKNOWN"
+    if last_trade_price:
+        display_price = last_trade_price
+        display_price_source = "last_trade"
+    elif ticker_last_price:
+        display_price = ticker_last_price
+        display_price_source = (
+            "last_good_ticker"
+            if ticker_freshness in {"LAST_GOOD", "STALE"}
+            else "ticker"
+        )
+    elif orderbook_mid_price:
+        display_price = orderbook_mid_price
+        display_price_source = "orderbook_mid"
+    else:
+        display_price = None
+        display_price_source = "missing"
 
     return {
         "symbol": normalized_symbol,
         "display_price": display_price,
         "display_price_source": display_price_source,
-        "last_price": latest_trade_price or ticker_price,
+        "last_price": last_trade_price or ticker_last_price,
+        "last_trade_price": last_trade_price,
+        "orderbook_mid_price": orderbook_mid_price,
+        "ticker_last_price": ticker_last_price,
+        "ticker_24h_change": ticker.get("price_change_24h"),
+        "ticker_24h_change_percent": (
+            ticker.get("price_change_percent_24h")
+            or ticker.get("price_change_percent")
+            or ticker.get("change_24h")
+        ),
+        "ticker_24h_high": ticker.get("high_24h"),
+        "ticker_24h_low": ticker.get("low_24h"),
+        "ticker_volume": ticker.get("base_volume_24h") or ticker.get("volume_24h"),
+        "ticker_quote_volume": ticker.get("quote_volume_24h"),
         "price_precision": price_precision,
         "amount_precision": amount_precision,
         "best_bid": best_bid,
@@ -278,6 +412,15 @@ def get_spot_market_view(
         "depth_status": _status(has_depth, depth_error),
         "trades_status": _status(has_trades, trades_error),
         "kline_status": has_kline,
+        "depth_source": depth_source,
+        "trades_source": trades_source,
+        "ticker_source": ticker_source,
+        "kline_source": kline_source,
+        "depth_freshness": depth_freshness,
+        "trades_freshness": trades_freshness,
+        "ticker_freshness": ticker_freshness,
+        "kline_freshness": kline_freshness,
+        "quote_freshness": ticker_freshness,
         "executable": market_status == "OPEN" and has_depth,
         "updated_at": datetime.utcnow().isoformat(),
         "warnings": warnings,
@@ -285,12 +428,18 @@ def get_spot_market_view(
             "ticker_source": ticker.get("source"),
             "ticker_provider": ticker.get("provider"),
             "ticker_stale": ticker.get("stale"),
+            "ticker_freshness": ticker_freshness,
             "ticker_error": str(ticker_error) if ticker_error else None,
             "depth_source": getattr(depth, "source", None),
             "depth_provider": getattr(depth, "provider", None),
             "depth_stale": getattr(depth, "stale", None) if depth is not None else None,
+            "depth_freshness": depth_freshness,
+            "trades_source": getattr(trades, "source", None),
             "trades_provider": getattr(trades, "provider", None),
             "trades_stale": getattr(trades, "stale", None) if trades is not None else None,
+            "trades_freshness": trades_freshness,
+            "kline_source": kline_source,
+            "kline_freshness": kline_freshness,
             "price_precision": price_precision,
             "amount_precision": amount_precision,
         },
