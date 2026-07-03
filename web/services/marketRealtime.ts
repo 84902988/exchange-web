@@ -22,11 +22,13 @@ type SpotMarketDepthMessage = {
 };
 
 export type SpotMarketRealtimeEventType = 'snapshot' | 'trade' | 'depth';
+export type SpotMarketConnectionStatus = 'connecting' | 'open' | 'closed';
 export type SpotMarketRealtimeMessage =
   | SpotMarketSnapshotMessage
   | SpotMarketTradeMessage
   | SpotMarketDepthMessage;
 export type SpotMarketRealtimeHandler = (message: SpotMarketRealtimeMessage) => void;
+export type SpotMarketRealtimeStatusHandler = (status: SpotMarketConnectionStatus) => void;
 
 function buildSpotWsUrl(symbol: string) {
   const apiBase = getRuntimeApiBaseUrl();
@@ -47,6 +49,8 @@ class SpotMarketRealtimeClient {
   private requestedSymbol = '';
   private closedByClient = false;
   private handlers = new Map<SpotMarketRealtimeEventType, Set<SpotMarketRealtimeHandler>>();
+  private statusHandlers = new Set<SpotMarketRealtimeStatusHandler>();
+  private status: SpotMarketConnectionStatus = 'closed';
 
   setSymbol(symbol: string) {
     const nextSymbol = normalizeSymbol(symbol);
@@ -92,12 +96,26 @@ class SpotMarketRealtimeClient {
     }
   }
 
+  subscribeStatus(handler: SpotMarketRealtimeStatusHandler) {
+    this.statusHandlers.add(handler);
+    handler(this.status);
+
+    return () => {
+      this.statusHandlers.delete(handler);
+    };
+  }
+
+  isConnected() {
+    return this.status === 'open';
+  }
+
   disconnect() {
     this.closedByClient = true;
     this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = '';
     this.requestedSymbol = '';
+    this.setStatus('closed');
 
     if (!this.ws) return;
 
@@ -127,11 +145,13 @@ class SpotMarketRealtimeClient {
     this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = symbol;
+    this.setStatus('connecting');
 
     const ws = new WebSocket(buildSpotWsUrl(symbol));
     this.ws = ws;
 
     ws.onopen = () => {
+      this.setStatus('open');
       const latestSymbol = this.requestedSymbol;
       if (latestSymbol && latestSymbol !== this.socketOpenedWithSymbol) {
         this.sendSubscribeIfOpen(latestSymbol);
@@ -157,6 +177,7 @@ class SpotMarketRealtimeClient {
       if (this.ws === ws) {
         this.ws = null;
       }
+      this.setStatus('closed');
 
       if (this.closedByClient || !this.requestedSymbol) return;
 
@@ -171,6 +192,7 @@ class SpotMarketRealtimeClient {
     this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = '';
+    this.setStatus('closed');
 
     if (!this.ws) return;
 
@@ -222,6 +244,14 @@ class SpotMarketRealtimeClient {
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+  }
+
+  private setStatus(status: SpotMarketConnectionStatus) {
+    if (this.status === status) return;
+    this.status = status;
+    for (const handler of Array.from(this.statusHandlers)) {
+      handler(status);
     }
   }
 

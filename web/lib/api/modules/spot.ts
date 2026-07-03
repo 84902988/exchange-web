@@ -87,6 +87,29 @@ export type SpotMarketTradesResponse = {
   trades?: SpotMarketTradeItem[]
 }
 
+export type SpotMarketView = {
+  symbol: string
+  display_price?: string | number | null
+  display_price_source?: string | null
+  last_price?: string | number | null
+  best_bid?: string | number | null
+  best_ask?: string | number | null
+  spread?: string | number | null
+  price_direction?: 'up' | 'down' | 'flat' | string | null
+  market_status?: string | null
+  data_source?: SpotMarketDataSource | string | null
+  depth_status?: string | null
+  trades_status?: string | null
+  kline_status?: string | null
+  executable?: boolean
+  updated_at?: string | null
+  warnings?: string[]
+  raw_source_summary?: Record<string, unknown>
+  ticker?: SpotMarketTickerItem | null
+  depth?: SpotDepthResponse | null
+  trades?: SpotMarketTradesResponse | null
+}
+
 export type SpotMarketKlineItem = {
   open_time?: number | string
   close_time?: number | string
@@ -293,6 +316,15 @@ export async function getSpotMarketPairs(
     page: Number(payload?.page || params.page || 1),
     page_size: Number(payload?.page_size || params.pageSize || 50),
   }
+}
+
+export async function getSpotMarketView(symbol: string): Promise<SpotMarketView> {
+  const normalizedSymbol = normalizeSpotSymbol(symbol)
+  const params = new URLSearchParams({
+    symbol: normalizedSymbol,
+  })
+
+  return request<SpotMarketView>(buildRelativeUrl('/market/spot/view', params))
 }
 
 export async function getSpotDepth(
