@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.services import spot_market_domain_cache as domain_cache
 from app.services import spot_market_provider_ws as provider_ws
 
 
@@ -25,6 +26,58 @@ def test_spot_provider_ws_has_no_enabled_switches() -> None:
         "spot_provider_ws_kline_enabled",
     ):
         assert not hasattr(provider_ws, name)
+
+
+def test_cache_metadata_helper_fresh_stale_missing_and_defaults() -> None:
+    now_ms = 10_000
+    record = {
+        "symbol": "BTCUSDT",
+        "provider": provider_ws.PROVIDER_BITGET_SPOT,
+        "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+        "freshness": "LIVE",
+        "updated_at_ms": now_ms - 100,
+    }
+
+    fresh = domain_cache.resolve_cache_metadata(record, max_age_ms=1000, now_ms=now_ms)
+    assert fresh.is_fresh is True
+    assert fresh.metadata.is_stale is False
+    assert fresh.metadata.fallback_reason == domain_cache.FALLBACK_REASON_FRESH
+    assert fresh.metadata.age_ms == 100
+    assert fresh.metadata.source == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert fresh.metadata.provider == provider_ws.PROVIDER_BITGET_SPOT
+    assert domain_cache.is_fresh_record(record, max_age_ms=1000, now_ms=now_ms) is True
+
+    stale = domain_cache.resolve_cache_metadata(record, max_age_ms=50, now_ms=now_ms)
+    assert stale.is_fresh is False
+    assert stale.metadata.is_stale is True
+    assert stale.metadata.fallback_reason == domain_cache.FALLBACK_REASON_STALE
+    assert stale.metadata.age_ms == 100
+    assert domain_cache.stale_reason_for(record, max_age_ms=50, now_ms=now_ms) == "stale"
+
+    missing = domain_cache.resolve_cache_metadata(None, max_age_ms=1000, now_ms=now_ms)
+    assert missing.is_fresh is False
+    assert missing.metadata.fallback_reason == domain_cache.FALLBACK_REASON_MISSING
+
+    missing_updated_at = domain_cache.resolve_cache_metadata(
+        {"symbol": "BTCUSDT", "source": provider_ws.SPOT_PROVIDER_WS_SOURCE},
+        max_age_ms=1000,
+        now_ms=now_ms,
+    )
+    assert missing_updated_at.is_fresh is False
+    assert missing_updated_at.metadata.fallback_reason == domain_cache.FALLBACK_REASON_MISSING_UPDATED_AT
+
+    empty_kline = domain_cache.resolve_cache_metadata(
+        {"symbol": "BTCUSDT", "items": [], "updated_at_ms": now_ms},
+        max_age_ms=1000,
+        now_ms=now_ms,
+    )
+    assert empty_kline.is_fresh is False
+    assert empty_kline.metadata.fallback_reason == domain_cache.FALLBACK_REASON_EMPTY
+
+    ticker_defaults = domain_cache.with_live_ws_defaults("ticker", {"symbol": "BTCUSDT"})
+    assert ticker_defaults["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert ticker_defaults["provider"] == provider_ws.PROVIDER_BITGET_SPOT
+    assert ticker_defaults["quote_freshness"] == "LIVE"
 
 
 def test_bitget_depth_message_normalize() -> None:
@@ -198,6 +251,7 @@ def test_depth_cache_fresh_and_stale() -> None:
     assert fresh.symbol == "BTCUSDT"
     assert fresh.provider == provider_ws.PROVIDER_BITGET_SPOT
     assert fresh.source == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert fresh.freshness is None
 
     service.set_depth_cache_for_tests(
         {
@@ -232,6 +286,8 @@ def test_ticker_cache_fresh_and_stale() -> None:
     assert fresh is not None
     assert fresh["symbol"] == "BTCUSDT"
     assert fresh["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert fresh["quote_freshness"] == "LIVE"
+    assert "freshness" not in fresh
 
     service.set_ticker_cache_for_tests(
         {
@@ -348,6 +404,50 @@ def test_kline_cache_fresh_and_stale() -> None:
         }
     )
     assert service.get_fresh_klines("btcusdt", "1m", max_age_ms=1000) is None
+
+
+def test_cache_getters_missing_records_return_none() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+
+    assert service.get_fresh_depth("BTCUSDT", max_age_ms=1000) is None
+    assert service.get_fresh_ticker("BTCUSDT", max_age_ms=1000) is None
+    assert service.get_fresh_trades("BTCUSDT", max_age_ms=1000) is None
+    assert service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000) is None
+
+
+def test_cache_getters_missing_updated_at_and_empty_kline_return_none() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    with service._lock:
+        service._ticker_cache[(provider_ws.PROVIDER_BITGET_SPOT, "BTCUSDT")] = {
+            "symbol": "BTCUSDT",
+            "provider": provider_ws.PROVIDER_BITGET_SPOT,
+            "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+            "quote_freshness": "LIVE",
+            "last_price": "102",
+            "open_24h": "100",
+            "ts": provider_ws._now_ms(),
+        }
+
+    assert service.get_fresh_ticker("BTCUSDT", max_age_ms=1000) is None
+
+    now_ms = provider_ws._now_ms()
+    empty_kline_record = {
+        "symbol": "BTCUSDT",
+        "interval": "1m",
+        "provider": provider_ws.PROVIDER_BITGET_SPOT,
+        "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+        "freshness": "LIVE",
+        "items": [],
+        "updated_at_ms": now_ms,
+        "ts": now_ms,
+    }
+    assert domain_cache.stale_reason_for(
+        empty_kline_record,
+        max_age_ms=1000,
+        now_ms=now_ms,
+    ) == domain_cache.FALLBACK_REASON_EMPTY
+    service.set_kline_cache_for_tests(empty_kline_record)
+    assert service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000) is None
 
 
 if __name__ == "__main__":

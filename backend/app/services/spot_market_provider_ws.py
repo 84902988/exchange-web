@@ -16,6 +16,7 @@ import websockets
 from app.core.config import settings
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT
+from app.services.spot_market_domain_cache import is_fresh_record
 
 
 logger = logging.getLogger(__name__)
@@ -513,8 +514,7 @@ class SpotMarketProviderWsService:
             ]
             candidates.sort(key=lambda item: int(item.get("updated_at_ms") or 0), reverse=True)
             for item in candidates:
-                updated_at_ms = int(item.get("updated_at_ms") or 0)
-                if updated_at_ms <= 0 or now_ms - updated_at_ms > allowed_age_ms:
+                if not is_fresh_record(item, allowed_age_ms, now_ms=now_ms):
                     continue
                 return _depth_response_from_record(deepcopy(item), limit=limit)
         return None
@@ -536,8 +536,7 @@ class SpotMarketProviderWsService:
             ]
             candidates.sort(key=lambda item: int(item.get("updated_at_ms") or 0), reverse=True)
             for item in candidates:
-                updated_at_ms = int(item.get("updated_at_ms") or 0)
-                if updated_at_ms <= 0 or now_ms - updated_at_ms > allowed_age_ms:
+                if not is_fresh_record(item, allowed_age_ms, now_ms=now_ms):
                     continue
                 return deepcopy(item)
         return None
@@ -560,8 +559,7 @@ class SpotMarketProviderWsService:
             ]
             candidates.sort(key=lambda item: int(item.get("updated_at_ms") or 0), reverse=True)
             for item in candidates:
-                updated_at_ms = int(item.get("updated_at_ms") or 0)
-                if updated_at_ms <= 0 or now_ms - updated_at_ms > allowed_age_ms:
+                if not is_fresh_record(item, allowed_age_ms, now_ms=now_ms):
                     continue
                 return _trades_response_from_record(deepcopy(item), limit=limit)
         return None
@@ -583,8 +581,7 @@ class SpotMarketProviderWsService:
             item = self._kline_cache.get(key)
             if item is None:
                 return None
-            updated_at_ms = int(item.get("updated_at_ms") or 0)
-            if updated_at_ms <= 0 or now_ms - updated_at_ms > allowed_age_ms:
+            if not is_fresh_record(item, allowed_age_ms, now_ms=now_ms):
                 return None
             response = _klines_response_from_record(deepcopy(item), limit=limit)
             if not response.get("items"):
