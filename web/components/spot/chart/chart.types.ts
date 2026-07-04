@@ -13,13 +13,9 @@ export interface SpotChartProps {
   dataSource?: string | null;
   latestPrice?: string | number | null;
   latestTradeOrTickerPrice?: string | number | null;
-  displayPriceRaw?: string | number | null;
-  displayPriceFormatted?: string | null;
   priceDirection?: RealtimePriceDirection;
   pricePrecision?: number | null;
   amountPrecision?: number | null;
-  tickerFreshness?: string | null;
-  klineFreshness?: string | null;
   showRwaReference?: boolean;
 }
 
