@@ -15,15 +15,20 @@ import websockets
 
 from app.core.config import settings
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
-from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT
+from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT
 from app.services.spot_market_domain_cache import is_fresh_record
 
 
 logger = logging.getLogger(__name__)
 
 SPOT_PROVIDER_WS_SOURCE = "LIVE_WS"
-SPOT_PROVIDER_WS_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
+SPOT_PROVIDER_WS_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
+SPOT_PROVIDER_WS_DEPTH_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
+SPOT_PROVIDER_WS_TICKER_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
+SPOT_PROVIDER_WS_TRADES_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
+SPOT_PROVIDER_WS_KLINE_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
 BITGET_SPOT_DEPTH_CHANNEL = "books15"
+OKX_SPOT_DEPTH_CHANNEL = "books5"
 BITGET_SPOT_TICKER_CHANNEL = "ticker"
 BITGET_SPOT_TRADES_CHANNEL = "trade"
 BITGET_SPOT_KLINE_CHANNELS = {
@@ -111,8 +116,25 @@ def normalize_spot_ws_provider(value: Any) -> str:
     return str(value or PROVIDER_BITGET_SPOT).strip().upper()
 
 
-def spot_provider_ws_supports_provider(provider: Any) -> bool:
-    return normalize_spot_ws_provider(provider) in SPOT_PROVIDER_WS_SUPPORTED_PROVIDERS
+def spot_provider_ws_supports_provider(provider: Any, *, domain: Optional[str] = None) -> bool:
+    provider_code = normalize_spot_ws_provider(provider)
+    normalized_domain = str(domain or "").strip().lower()
+    if normalized_domain == "depth":
+        return provider_code in SPOT_PROVIDER_WS_DEPTH_SUPPORTED_PROVIDERS
+    if normalized_domain == "ticker":
+        return provider_code in SPOT_PROVIDER_WS_TICKER_SUPPORTED_PROVIDERS
+    if normalized_domain in {"trade", "trades"}:
+        return provider_code in SPOT_PROVIDER_WS_TRADES_SUPPORTED_PROVIDERS
+    if normalized_domain == "kline":
+        return provider_code in SPOT_PROVIDER_WS_KLINE_SUPPORTED_PROVIDERS
+    return provider_code in SPOT_PROVIDER_WS_SUPPORTED_PROVIDERS
+
+
+def okx_spot_ws_symbol(value: Any) -> str:
+    normalized = normalize_spot_ws_symbol(value)
+    if normalized.endswith("USDT") and len(normalized) > 4:
+        return f"{normalized[:-4]}-USDT"
+    return normalized
 
 
 def _now_ms() -> int:
@@ -352,6 +374,50 @@ def normalize_bitget_depth_message(
     }
 
 
+def normalize_okx_depth_message(
+    message: dict[str, Any],
+    *,
+    local_symbol: str,
+    provider_symbol: str,
+    depth_limit: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(message, dict) or message.get("event"):
+        return None
+    data = message.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+    row = data[0]
+    if not isinstance(row, dict):
+        return None
+
+    limit = _depth_limit(depth_limit)
+    bids = _normalize_depth_side(row.get("bids"), reverse=True, limit=limit)
+    asks = _normalize_depth_side(row.get("asks"), reverse=False, limit=limit)
+    if not bids or not asks:
+        return None
+
+    now_ms = _now_ms()
+    exchange_ts = _spot_provider_ts(row.get("ts"))
+    return {
+        "symbol": normalize_spot_ws_symbol(local_symbol),
+        "provider": PROVIDER_OKX_SPOT,
+        "provider_symbol": str(provider_symbol or "").strip().upper(),
+        "source": SPOT_PROVIDER_WS_SOURCE,
+        "quote_source": SPOT_PROVIDER_WS_SOURCE,
+        "freshness": "LIVE",
+        "market_status": "OPEN",
+        "bids": bids,
+        "asks": asks,
+        "raw_bids": bids,
+        "raw_asks": asks,
+        "ts": exchange_ts,
+        "updated_at_ms": now_ms,
+        "updated_at": datetime.utcfromtimestamp(now_ms / 1000).isoformat(),
+        "price_precision": 8,
+        "amount_precision": 8,
+    }
+
+
 def normalize_bitget_kline_message(
     message: dict[str, Any],
     *,
@@ -577,7 +643,7 @@ class SpotMarketProviderWsService:
     ) -> Optional[DepthResponse]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         provider_code = normalize_spot_ws_provider(provider)
-        if not spot_provider_ws_supports_provider(provider_code):
+        if not spot_provider_ws_supports_provider(provider_code, domain="depth"):
             return None
         now_ms = _now_ms()
         allowed_age_ms = _max_age_ms(max_age_ms)
@@ -603,7 +669,7 @@ class SpotMarketProviderWsService:
     ) -> Optional[dict[str, Any]]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         provider_code = normalize_spot_ws_provider(provider)
-        if not spot_provider_ws_supports_provider(provider_code):
+        if not spot_provider_ws_supports_provider(provider_code, domain="ticker"):
             return None
         now_ms = _now_ms()
         allowed_age_ms = _ticker_max_age_ms(max_age_ms)
@@ -630,7 +696,7 @@ class SpotMarketProviderWsService:
     ) -> Optional[TradesResponse]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         provider_code = normalize_spot_ws_provider(provider)
-        if not spot_provider_ws_supports_provider(provider_code):
+        if not spot_provider_ws_supports_provider(provider_code, domain="trades"):
             return None
         now_ms = _now_ms()
         allowed_age_ms = _trades_max_age_ms(max_age_ms)
@@ -659,7 +725,7 @@ class SpotMarketProviderWsService:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         normalized_interval = normalize_spot_ws_kline_interval(interval)
         provider_code = normalize_spot_ws_provider(provider)
-        if not spot_provider_ws_supports_provider(provider_code):
+        if not spot_provider_ws_supports_provider(provider_code, domain="kline"):
             return None
         now_ms = _now_ms()
         allowed_age_ms = _kline_max_age_ms(max_age_ms)
@@ -681,13 +747,14 @@ class SpotMarketProviderWsService:
             return
         payload = deepcopy(record)
         payload["symbol"] = normalized_symbol
-        payload.setdefault("provider", PROVIDER_BITGET_SPOT)
+        provider_code = normalize_spot_ws_provider(payload.get("provider"))
+        payload.setdefault("provider", provider_code)
         payload.setdefault("source", SPOT_PROVIDER_WS_SOURCE)
         payload.setdefault("updated_at_ms", _now_ms())
         payload.setdefault("ts", payload["updated_at_ms"])
         payload.setdefault("updated_at", datetime.utcfromtimestamp(int(payload["updated_at_ms"]) / 1000).isoformat())
         with self._lock:
-            self._depth_cache[(PROVIDER_BITGET_SPOT, normalized_symbol)] = payload
+            self._depth_cache[(provider_code, normalized_symbol)] = payload
 
     def set_ticker_cache_for_tests(self, record: dict[str, Any]) -> None:
         normalized_symbol = normalize_spot_ws_symbol(record.get("symbol"))
@@ -768,21 +835,27 @@ class SpotMarketProviderWsService:
         provider_code = normalize_spot_ws_provider(provider)
         if not local_symbol or not spot_provider_ws_supports_provider(provider_code):
             return
-        self._ensure_depth_symbol(local_symbol)
-        self._ensure_ticker_symbol(local_symbol)
-        self._ensure_trades_symbol(local_symbol)
+        if spot_provider_ws_supports_provider(provider_code, domain="depth"):
+            self._ensure_depth_symbol(local_symbol, provider=provider_code)
+        if spot_provider_ws_supports_provider(provider_code, domain="ticker"):
+            self._ensure_ticker_symbol(local_symbol)
+        if spot_provider_ws_supports_provider(provider_code, domain="trades"):
+            self._ensure_trades_symbol(local_symbol)
 
     def ensure_kline(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
         local_symbol = normalize_spot_ws_symbol(symbol)
         normalized_interval = normalize_spot_ws_kline_interval(interval)
         provider_code = normalize_spot_ws_provider(provider)
-        if not local_symbol or not spot_provider_ws_supports_provider(provider_code):
+        if not local_symbol or not spot_provider_ws_supports_provider(provider_code, domain="kline"):
             return
         self._ensure_kline_symbol(local_symbol, normalized_interval)
 
-    def _ensure_depth_symbol(self, local_symbol: str) -> None:
-        provider_symbol = local_symbol
-        key = (PROVIDER_BITGET_SPOT, local_symbol)
+    def _ensure_depth_symbol(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
+        provider_code = normalize_spot_ws_provider(provider)
+        if not spot_provider_ws_supports_provider(provider_code, domain="depth"):
+            return
+        provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
+        key = (provider_code, local_symbol)
         with self._lock:
             task = self._depth_tasks.get(key)
             if task is not None and task.is_alive():
@@ -793,15 +866,25 @@ class SpotMarketProviderWsService:
             self._depth_stops[key] = stop_event
             subscription = SpotDepthSubscription(
                 local_symbol=local_symbol,
-                provider=PROVIDER_BITGET_SPOT,
+                provider=provider_code,
                 provider_symbol=provider_symbol,
                 depth_limit=_depth_limit(),
-                ws_url=str(getattr(settings, "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL", "") or "").strip(),
+                channel=OKX_SPOT_DEPTH_CHANNEL if provider_code == PROVIDER_OKX_SPOT else BITGET_SPOT_DEPTH_CHANNEL,
+                ws_url=str(
+                    getattr(
+                        settings,
+                        "SPOT_PROVIDER_WS_OKX_PUBLIC_URL"
+                        if provider_code == PROVIDER_OKX_SPOT
+                        else "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL",
+                        "",
+                    )
+                    or ""
+                ).strip(),
             )
             thread = threading.Thread(
                 target=self._run_depth_thread,
                 args=(subscription, stop_event, generation),
-                name=f"spot-depth-ws-{local_symbol}",
+                name=f"spot-depth-ws-{provider_code}-{local_symbol}",
                 daemon=True,
             )
             self._depth_tasks[key] = thread
@@ -895,20 +978,29 @@ class SpotMarketProviderWsService:
         provider_code = normalize_spot_ws_provider(provider)
         if not local_symbol or not spot_provider_ws_supports_provider(provider_code):
             return
-        self._stop_depth_subscription(local_symbol)
-        self._stop_ticker_subscription(local_symbol)
-        self._stop_trades_subscription(local_symbol)
-        self._stop_kline_subscriptions(local_symbol)
+        if spot_provider_ws_supports_provider(provider_code, domain="depth"):
+            self._stop_depth_subscription(local_symbol, provider=provider_code)
+        if spot_provider_ws_supports_provider(provider_code, domain="ticker"):
+            self._stop_ticker_subscription(local_symbol)
+        if spot_provider_ws_supports_provider(provider_code, domain="trades"):
+            self._stop_trades_subscription(local_symbol)
+        if spot_provider_ws_supports_provider(provider_code, domain="kline"):
+            self._stop_kline_subscriptions(local_symbol, provider=provider_code)
 
     def release_kline(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
         local_symbol = normalize_spot_ws_symbol(symbol)
         provider_code = normalize_spot_ws_provider(provider)
-        if not local_symbol or not spot_provider_ws_supports_provider(provider_code):
+        if not local_symbol or not spot_provider_ws_supports_provider(provider_code, domain="kline"):
             return
-        self._stop_kline_subscription(local_symbol, normalize_spot_ws_kline_interval(interval))
+        self._stop_kline_subscription(
+            local_symbol,
+            normalize_spot_ws_kline_interval(interval),
+            provider=provider_code,
+        )
 
-    def _stop_depth_subscription(self, local_symbol: str) -> None:
-        key = (PROVIDER_BITGET_SPOT, local_symbol)
+    def _stop_depth_subscription(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
+        provider_code = normalize_spot_ws_provider(provider)
+        key = (provider_code, local_symbol)
         with self._lock:
             stop_event = self._depth_stops.pop(key, None)
             task = self._depth_tasks.pop(key, None)
@@ -964,19 +1056,21 @@ class SpotMarketProviderWsService:
         if task is not None and task.is_alive() and task is not threading.current_thread():
             task.join(timeout=2.0)
 
-    def _stop_kline_subscriptions(self, local_symbol: str) -> None:
+    def _stop_kline_subscriptions(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
+        provider_code = normalize_spot_ws_provider(provider)
         with self._lock:
             intervals = [
                 interval
                 for provider, symbol, interval in self._kline_tasks.keys()
-                if provider == PROVIDER_BITGET_SPOT and symbol == local_symbol
+                if provider == provider_code and symbol == local_symbol
             ]
         for interval in intervals:
-            self._stop_kline_subscription(local_symbol, interval)
+            self._stop_kline_subscription(local_symbol, interval, provider=provider_code)
 
-    def _stop_kline_subscription(self, local_symbol: str, interval: str) -> None:
+    def _stop_kline_subscription(self, local_symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
         normalized_interval = normalize_spot_ws_kline_interval(interval)
-        key = (PROVIDER_BITGET_SPOT, local_symbol, normalized_interval)
+        provider_code = normalize_spot_ws_provider(provider)
+        key = (provider_code, local_symbol, normalized_interval)
         with self._lock:
             stop_event = self._kline_stops.pop(key, None)
             task = self._kline_tasks.pop(key, None)
@@ -1262,7 +1356,10 @@ class SpotMarketProviderWsService:
     ) -> None:
         while not stop_event.is_set():
             try:
-                await self._run_bitget_depth_ws(subscription, stop_event, generation)
+                if subscription.provider == PROVIDER_OKX_SPOT:
+                    await self._run_okx_depth_ws(subscription, stop_event, generation)
+                else:
+                    await self._run_bitget_depth_ws(subscription, stop_event, generation)
             except Exception as exc:
                 if _is_provider_ws_shutdown_noise(exc, stop_event):
                     return
@@ -1401,6 +1498,71 @@ class SpotMarketProviderWsService:
                     if raw_message == "pong":
                         continue
                     self._handle_bitget_depth_message(subscription, raw_message, generation)
+            finally:
+                with self._lock:
+                    current = self._depth_connections.get(key)
+                    if current is not None and current[1] is websocket:
+                        self._depth_connections.pop(key, None)
+                logger.info(
+                    "spot_provider_ws_depth_subscription_stopped provider=%s symbol=%s provider_symbol=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.provider_symbol,
+                )
+
+    async def _run_okx_depth_ws(
+        self,
+        subscription: SpotDepthSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if stop_event.is_set():
+            return
+        url = str(subscription.ws_url or "").strip()
+        if not url:
+            raise ValueError("SPOT_PROVIDER_WS_OKX_PUBLIC_URL is required")
+
+        subscribe_payload = {
+            "op": "subscribe",
+            "args": [
+                {
+                    "channel": subscription.channel,
+                    "instId": subscription.provider_symbol,
+                }
+            ],
+        }
+        key = (subscription.provider, subscription.local_symbol)
+        async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5) as websocket:
+            if stop_event.is_set():
+                await websocket.close()
+                return
+            loop = asyncio.get_running_loop()
+            with self._lock:
+                if self._depth_generations.get(key) != generation:
+                    stop_event.set()
+                    return
+                self._depth_connections[key] = (loop, websocket)
+            logger.info(
+                "spot_provider_ws_depth_subscription_started provider=%s symbol=%s provider_symbol=%s channel=%s",
+                subscription.provider,
+                subscription.local_symbol,
+                subscription.provider_symbol,
+                subscription.channel,
+            )
+            try:
+                await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                last_ping_at = time.monotonic()
+                while not stop_event.is_set():
+                    if time.monotonic() - last_ping_at >= 25:
+                        await websocket.send("ping")
+                        last_ping_at = time.monotonic()
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    if raw_message == "pong":
+                        continue
+                    self._handle_okx_depth_message(subscription, raw_message, generation)
             finally:
                 with self._lock:
                     current = self._depth_connections.get(key)
@@ -1638,6 +1800,31 @@ class SpotMarketProviderWsService:
                 return
             self._depth_cache[key] = record
 
+    def _handle_okx_depth_message(
+        self,
+        subscription: SpotDepthSubscription,
+        raw_message: Any,
+        generation: int,
+    ) -> None:
+        try:
+            message = json.loads(raw_message)
+        except Exception:
+            logger.debug("spot_provider_ws_okx_depth_invalid_json symbol=%s", subscription.local_symbol)
+            return
+        record = normalize_okx_depth_message(
+            message,
+            local_symbol=subscription.local_symbol,
+            provider_symbol=subscription.provider_symbol,
+            depth_limit=subscription.depth_limit,
+        )
+        if record is None:
+            return
+        key = (subscription.provider, subscription.local_symbol)
+        with self._lock:
+            if self._depth_generations.get(key) != generation:
+                return
+            self._depth_cache[key] = record
+
     def _handle_bitget_ticker_message(
         self,
         subscription: SpotTickerSubscription,
@@ -1776,11 +1963,13 @@ def get_spot_provider_ws_ticker(
 
 
 def ensure_spot_provider_ws_ticker(symbol: str, *, provider: Optional[str] = None) -> None:
-    spot_market_provider_ws.ensure_symbol(symbol, provider=provider)
+    if spot_provider_ws_supports_provider(provider, domain="ticker"):
+        spot_market_provider_ws.ensure_symbol(symbol, provider=provider)
 
 
 def release_spot_provider_ws_ticker(symbol: str, *, provider: Optional[str] = None) -> None:
-    spot_market_provider_ws.release_symbol(symbol, provider=provider)
+    if spot_provider_ws_supports_provider(provider, domain="ticker"):
+        spot_market_provider_ws.release_symbol(symbol, provider=provider)
 
 
 def get_spot_provider_ws_trades(
@@ -1799,11 +1988,13 @@ def get_spot_provider_ws_trades(
 
 
 def ensure_spot_provider_ws_trades(symbol: str, *, provider: Optional[str] = None) -> None:
-    spot_market_provider_ws.ensure_symbol(symbol, provider=provider)
+    if spot_provider_ws_supports_provider(provider, domain="trades"):
+        spot_market_provider_ws.ensure_symbol(symbol, provider=provider)
 
 
 def release_spot_provider_ws_trades(symbol: str, *, provider: Optional[str] = None) -> None:
-    spot_market_provider_ws.release_symbol(symbol, provider=provider)
+    if spot_provider_ws_supports_provider(provider, domain="trades"):
+        spot_market_provider_ws.release_symbol(symbol, provider=provider)
 
 
 def get_spot_provider_ws_klines(
@@ -1829,7 +2020,8 @@ def ensure_spot_provider_ws_kline(
     *,
     provider: Optional[str] = None,
 ) -> None:
-    spot_market_provider_ws.ensure_kline(symbol, interval, provider=provider)
+    if spot_provider_ws_supports_provider(provider, domain="kline"):
+        spot_market_provider_ws.ensure_kline(symbol, interval, provider=provider)
 
 
 def release_spot_provider_ws_kline(
@@ -1838,4 +2030,5 @@ def release_spot_provider_ws_kline(
     *,
     provider: Optional[str] = None,
 ) -> None:
-    spot_market_provider_ws.release_kline(symbol, interval, provider=provider)
+    if spot_provider_ws_supports_provider(provider, domain="kline"):
+        spot_market_provider_ws.release_kline(symbol, interval, provider=provider)

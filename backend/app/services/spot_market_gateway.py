@@ -412,6 +412,11 @@ class SpotMarketGateway:
         active_intervals = sorted({self._normalize_interval(interval) for interval in intervals or ["1m"]})
         ensured_intervals = set(self._ensured_kline_intervals.get(normalized_symbol, set()))
         provider_code = self._symbol_providers.get(normalized_symbol) or PROVIDER_BITGET_SPOT
+        if not spot_provider_ws_supports_provider(provider_code, domain="kline"):
+            for interval in ensured_intervals:
+                self._clear_kline_interval_state(normalized_symbol, interval, provider=provider_code)
+            self._ensured_kline_intervals.pop(normalized_symbol, None)
+            return []
 
         for interval in sorted(ensured_intervals - set(active_intervals)):
             try:
@@ -433,7 +438,7 @@ class SpotMarketGateway:
         ready_intervals: list[str] = []
         for interval in active_intervals:
             try:
-                self._ensure_kline_interval(normalized_symbol, interval)
+                self._ensure_kline_interval(normalized_symbol, interval, provider=provider_code)
             except Exception:
                 logger.warning(
                     "spot_market_gateway_ensure_kline_interval_failed symbol=%s interval=%s",
@@ -451,6 +456,8 @@ class SpotMarketGateway:
         if not normalized_symbol:
             return
         provider_code = str(provider or self._symbol_providers.get(normalized_symbol) or PROVIDER_BITGET_SPOT)
+        if not spot_provider_ws_supports_provider(provider_code, domain="kline"):
+            return
         if self._ensure_kline_accepts_provider:
             self._ensure_kline(normalized_symbol, normalized_interval, provider=provider_code)
         else:
@@ -609,7 +616,7 @@ class SpotMarketGateway:
                 return None
             primary_provider = providers[0]
             provider_code = str(getattr(primary_provider, "provider_code", "") or "").strip().upper()
-            if not spot_provider_ws_supports_provider(provider_code):
+            if not spot_provider_ws_supports_provider(provider_code, domain="depth"):
                 return None
             return provider_code
         except Exception:

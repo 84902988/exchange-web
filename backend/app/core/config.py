@@ -147,6 +147,7 @@ class Settings(BaseSettings):
     SPOT_PROVIDER_WS_DEPTH_LIMIT: int = 20
     SPOT_PROVIDER_WS_IDLE_STOP_SECONDS: int = 10
     SPOT_PROVIDER_WS_BITGET_PUBLIC_URL: str = "wss://ws.bitget.com/v2/ws/public"
+    SPOT_PROVIDER_WS_OKX_PUBLIC_URL: str = "wss://ws.okx.com:8443/ws/v5/public"
     ITICK_API_TOKEN: Optional[str] = None
     ITICK_API_KEY: Optional[str] = None  # legacy alias; prefer ITICK_API_TOKEN
     ITICK_BASE_URL: str = "https://api.itick.org"

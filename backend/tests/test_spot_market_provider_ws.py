@@ -55,7 +55,11 @@ def test_normalize_spot_ws_symbol() -> None:
 
 def test_spot_provider_ws_supported_provider_gate() -> None:
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_BITGET_SPOT)
-    assert not provider_ws.spot_provider_ws_supports_provider("OKX_SPOT")
+    assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT)
+    assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="depth")
+    assert not provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="ticker")
+    assert not provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="trades")
+    assert not provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="kline")
 
     service = provider_ws.SpotMarketProviderWsService()
     service.set_ticker_cache_for_tests(
@@ -73,15 +77,18 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
     )
 
     assert service.get_fresh_ticker("BTCUSDT", provider=provider_ws.PROVIDER_BITGET_SPOT) is not None
-    assert service.get_fresh_ticker("BTCUSDT", provider="OKX_SPOT") is None
+    assert service.get_fresh_ticker("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT) is None
 
-    service.ensure_symbol("BTCUSDT", provider="OKX_SPOT")
-    service.ensure_kline("BTCUSDT", "1m", provider="OKX_SPOT")
-    with service._lock:
-        assert service._depth_tasks == {}
-        assert service._ticker_tasks == {}
-        assert service._trades_tasks == {}
-        assert service._kline_tasks == {}
+    ensure_calls: list[tuple[str, str, str | None]] = []
+    service._ensure_depth_symbol = lambda symbol, provider=None: ensure_calls.append(("depth", symbol, provider))
+    service._ensure_ticker_symbol = lambda symbol: ensure_calls.append(("ticker", symbol, None))
+    service._ensure_trades_symbol = lambda symbol: ensure_calls.append(("trades", symbol, None))
+    service._ensure_kline_symbol = lambda symbol, interval: ensure_calls.append(("kline", symbol, interval))
+
+    service.ensure_symbol("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT)
+    service.ensure_kline("BTCUSDT", "1m", provider=provider_ws.PROVIDER_OKX_SPOT)
+
+    assert ensure_calls == [("depth", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT)]
 
 
 def test_spot_provider_ws_has_no_enabled_switches() -> None:
@@ -247,6 +254,51 @@ def test_bitget_depth_message_normalize() -> None:
         {"price": "2.5", "amount": "4"},
         {"price": "3", "amount": "2"},
     ]
+
+
+def test_okx_depth_message_normalize_and_cache() -> None:
+    record = provider_ws.normalize_okx_depth_message(
+        {
+            "arg": {"channel": "books5", "instId": "BTC-USDT"},
+            "action": "snapshot",
+            "data": [
+                {
+                    "bids": [["2", "1.5", "0", "1"], ["1", "3", "0", "1"], ["0.5", "9", "0", "1"]],
+                    "asks": [["3", "2", "0", "1"], ["2.5", "4", "0", "1"], ["4", "1", "0", "1"]],
+                    "ts": "1000",
+                }
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTC-USDT",
+        depth_limit=2,
+    )
+
+    assert record is not None
+    assert record["symbol"] == "BTCUSDT"
+    assert record["provider"] == provider_ws.PROVIDER_OKX_SPOT
+    assert record["provider_symbol"] == "BTC-USDT"
+    assert record["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert record["quote_source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert record["freshness"] == "LIVE"
+    assert record["market_status"] == "OPEN"
+    assert record["bids"] == [
+        {"price": "2", "amount": "1.5"},
+        {"price": "1", "amount": "3"},
+    ]
+    assert record["asks"] == [
+        {"price": "2.5", "amount": "4"},
+        {"price": "3", "amount": "2"},
+    ]
+
+    service = provider_ws.SpotMarketProviderWsService()
+    service.set_depth_cache_for_tests(record)
+    depth = service.get_fresh_depth("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT, limit=2)
+    assert depth is not None
+    assert depth.provider == provider_ws.PROVIDER_OKX_SPOT
+    assert depth.source == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert depth.bids[0].price == "2"
+    assert service.get_fresh_depth("BTCUSDT", provider=provider_ws.PROVIDER_BITGET_SPOT) is None
 
 
 def test_bitget_ticker_message_normalize() -> None:
