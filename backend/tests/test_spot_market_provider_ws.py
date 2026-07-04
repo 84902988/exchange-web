@@ -119,7 +119,9 @@ def test_bitget_ticker_message_normalize() -> None:
             "data": [
                 {
                     "lastPr": "102",
-                    "open24h": "100",
+                    "open": "100",
+                    "openUtc": "90",
+                    "change24h": "0.02",
                     "high24h": "105",
                     "low24h": "95",
                     "baseVolume": "10",
@@ -137,9 +139,93 @@ def test_bitget_ticker_message_normalize() -> None:
     assert record["provider"] == provider_ws.PROVIDER_BITGET_SPOT
     assert record["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
     assert record["last_price"] == "102"
+    assert record["open_24h"] == "100"
     assert record["price_change_24h"] == "2"
     assert record["price_change_percent"] == "2"
     assert record["quote_freshness"] == "LIVE"
+
+
+def test_bitget_ticker_message_normalize_negative_change24h() -> None:
+    record = provider_ws.normalize_bitget_ticker_message(
+        {
+            "arg": {"instType": "SP", "channel": "ticker", "instId": "BTCUSDT"},
+            "data": [
+                {
+                    "lastPr": "99",
+                    "open": "100",
+                    "openUtc": "120",
+                    "change24h": "-0.01",
+                    "high24h": "105",
+                    "low24h": "95",
+                    "baseVolume": "10",
+                    "quoteVolume": "1000",
+                    "ts": "1000",
+                }
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTCUSDT",
+    )
+
+    assert record is not None
+    assert record["open_24h"] == "100"
+    assert record["price_change_24h"] == "-1"
+    assert record["price_change_percent"] == "-1"
+
+
+def test_bitget_ticker_message_normalize_zero_change24h() -> None:
+    record = provider_ws.normalize_bitget_ticker_message(
+        {
+            "arg": {"instType": "SP", "channel": "ticker", "instId": "BTCUSDT"},
+            "data": [
+                {
+                    "lastPr": "102",
+                    "open": "100",
+                    "openUtc": "80",
+                    "change24h": "0",
+                    "high24h": "105",
+                    "low24h": "95",
+                    "baseVolume": "10",
+                    "quoteVolume": "1000",
+                    "ts": "1000",
+                }
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTCUSDT",
+    )
+
+    assert record is not None
+    assert record["open_24h"] == "100"
+    assert record["price_change_24h"] == "0"
+    assert record["price_change_percent"] == "0"
+
+
+def test_bitget_ticker_message_normalize_fallback_uses_open24h_not_open_utc() -> None:
+    record = provider_ws.normalize_bitget_ticker_message(
+        {
+            "arg": {"instType": "SP", "channel": "ticker", "instId": "BTCUSDT"},
+            "data": [
+                {
+                    "lastPr": "110",
+                    "open24h": "100",
+                    "openUtc": "50",
+                    "high24h": "115",
+                    "low24h": "95",
+                    "baseVolume": "10",
+                    "quoteVolume": "1000",
+                    "ts": "1000",
+                }
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTCUSDT",
+    )
+
+    assert record is not None
+    assert record["open_24h"] == "100"
+    assert record["price_change_24h"] == "10"
+    assert record["price_change_percent"] == "10"
 
 
 def test_bitget_trade_message_normalize() -> None:
