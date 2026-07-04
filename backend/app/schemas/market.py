@@ -89,7 +89,7 @@ class TickerItem(BaseModel):
     quote_volume_24h: str = "0"
     price_precision: int = 8
     amount_precision: int = 8
-    source: Literal["internal", "binance", "itick", "external"]
+    source: Literal["internal", "binance", "itick", "external", "LIVE_WS"]
     provider: Optional[str] = None
     stale: bool = False
     updated_at: Optional[str] = None

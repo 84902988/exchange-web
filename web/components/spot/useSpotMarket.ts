@@ -55,6 +55,15 @@ type SpotDepthMessage = SpotMarketRealtimeMessage & {
   depth?: SpotDepthResponse;
 };
 
+type SpotTickerMessage = SpotMarketRealtimeMessage & {
+  type: 'spot_ticker_update';
+  symbol?: string;
+  ticker?: SpotMarketTickerItem & {
+    source?: string | null;
+    freshness?: string | null;
+  };
+};
+
 type SpotMarketFreshnessMap = {
   depth: string | null;
   trades: string | null;
@@ -114,7 +123,12 @@ function normalizeDepth(depth?: SpotDepthResponse | null): SpotDepthResponse | n
 function normalizeTrades(
   trades?: SpotMarketSnapshotMessage['trades'] | null,
 ): SpotMarketTradeItem[] {
-  return normalizeSpotTrades(trades || undefined);
+  if (!trades) return [];
+  return normalizeSpotTrades({
+    symbol: trades.symbol || '',
+    items: trades.items,
+    trades: trades.trades,
+  });
 }
 
 function firstPrice(levels?: SpotDepthLevel[] | null): string | number | null {
@@ -182,6 +196,10 @@ function getViewDirection(view?: SpotMarketView | null): RealtimePriceDirection 
   const direction = String(view?.price_direction || '').toLowerCase();
   if (direction === 'up' || direction === 'down') return direction;
   return 'flat';
+}
+
+function getTickerLastPrice(ticker?: SpotMarketTickerItem | null): string | number | null {
+  return ticker?.last_price ?? ticker?.price ?? ticker?.last ?? ticker?.close ?? null;
 }
 
 export function useSpotMarket(symbol: string): UseSpotMarketResult {
@@ -387,14 +405,72 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       } : prev);
     };
 
+    const handleTicker = (message: SpotMarketRealtimeMessage) => {
+      const data = message as SpotTickerMessage;
+      const msgSymbol = normalizeSpotSymbol(data.symbol || data.ticker?.symbol || '');
+      if (msgSymbol !== normalizedSymbol || !data.ticker) return;
+
+      const ticker = data.ticker;
+      const tickerLastPrice = getTickerLastPrice(ticker);
+      const nextDirection = tickerLastPrice !== null
+        ? getRealtimePriceDirection(
+            tickerLastPrice,
+            lastPriceRef.current,
+            priceDirectionRef.current,
+          )
+        : priceDirectionRef.current;
+      if (tickerLastPrice !== null) {
+        lastPriceRef.current = tickerLastPrice;
+        priceDirectionRef.current = nextDirection;
+        setLastPrice(tickerLastPrice);
+        setPriceDirection(nextDirection);
+      }
+      const tickerSource = normalizeDomainValue(ticker.source) || 'LIVE_WS';
+      const tickerFreshness = normalizeDomainValue(ticker.freshness || ticker.quote_freshness) || 'LIVE';
+      setMarketView((prev) => prev ? {
+        ...prev,
+        ticker,
+        ticker_last_price: tickerLastPrice ?? prev.ticker_last_price,
+        ticker_24h_change: ticker.price_change_24h ?? prev.ticker_24h_change,
+        ticker_24h_change_percent: (
+          ticker.price_change_percent_24h ??
+          ticker.price_change_percent ??
+          ticker.change_24h ??
+          prev.ticker_24h_change_percent
+        ),
+        ticker_24h_high: ticker.high_24h ?? prev.ticker_24h_high,
+        ticker_24h_low: ticker.low_24h ?? prev.ticker_24h_low,
+        ticker_volume: ticker.base_volume_24h ?? ticker.volume_24h ?? prev.ticker_volume,
+        ticker_quote_volume: ticker.quote_volume_24h ?? prev.ticker_quote_volume,
+        display_price: tickerLastPrice ?? prev.display_price,
+        display_price_source: tickerLastPrice !== null ? 'ticker' : prev.display_price_source,
+        last_price: tickerLastPrice ?? prev.last_price,
+        price_direction: tickerLastPrice !== null ? nextDirection : prev.price_direction,
+        market_status: ticker.market_status ?? prev.market_status,
+        ticker_source: tickerSource,
+        ticker_freshness: tickerFreshness,
+        quote_freshness: tickerFreshness,
+        data_source: ticker.data_source ?? prev.data_source,
+        raw_source_summary: {
+          ...(prev.raw_source_summary || {}),
+          ticker_source: ticker.source ?? tickerSource,
+          ticker_provider: ticker.provider,
+          ticker_stale: ticker.stale,
+          ticker_freshness: tickerFreshness,
+        },
+      } : prev);
+    };
+
     const unsubscribeSnapshot = spotMarketRealtime.subscribe('snapshot', handleSnapshot);
     const unsubscribeDepth = spotMarketRealtime.subscribe('depth', handleDepth);
     const unsubscribeTrade = spotMarketRealtime.subscribe('trade', handleTrade);
+    const unsubscribeTicker = spotMarketRealtime.subscribe('ticker', handleTicker);
 
     return () => {
       unsubscribeSnapshot();
       unsubscribeDepth();
       unsubscribeTrade();
+      unsubscribeTicker();
       unsubscribeStatus();
     };
   }, [applyView, normalizedSymbol]);

@@ -50,7 +50,7 @@ from app.services.stock_dealer_depth_service import (
     is_stock_dealer_pair,
 )
 from app.services.spot_kline_realtime import SPOT_KLINE_SOURCE_INTERNAL_TRADE
-from app.services.spot_market_provider_ws import get_spot_provider_ws_depth
+from app.services.spot_market_provider_ws import get_spot_provider_ws_depth, get_spot_provider_ws_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -1300,6 +1300,48 @@ def _spot_last_good_ticker(pair: TradingPair) -> Optional[TickerItem]:
     return TickerItem(**data)
 
 
+def _spot_provider_ws_ticker_to_item(pair: TradingPair, record: dict[str, Any]) -> Optional[TickerItem]:
+    last_price = _to_decimal(record.get("last_price"))
+    if last_price <= 0:
+        return None
+    open_24h = _to_decimal(record.get("open_24h"), last_price)
+    if open_24h <= 0:
+        open_24h = last_price
+    high_24h = _to_decimal(record.get("high_24h"), last_price)
+    low_24h = _to_decimal(record.get("low_24h"), last_price)
+    base_volume = _to_decimal(record.get("base_volume_24h") or record.get("volume_24h"))
+    quote_volume = _to_decimal(record.get("quote_volume_24h"))
+    if quote_volume <= 0 and base_volume > 0:
+        quote_volume = base_volume * last_price
+    price_change_24h = _to_decimal(record.get("price_change_24h"), last_price - open_24h)
+    price_change_percent = _to_decimal(record.get("price_change_percent"))
+    if price_change_percent <= 0 and price_change_24h != 0 and open_24h > 0:
+        price_change_percent = (price_change_24h / open_24h) * Decimal("100")
+    updated_at = str(record.get("updated_at") or datetime.utcnow().isoformat())
+
+    return TickerItem(
+        symbol=pair.symbol,
+        last_price=_format_price_for_pair(pair, last_price),
+        open_24h=_format_price_for_pair(pair, open_24h),
+        price_change_24h=_format_price_for_pair(pair, price_change_24h),
+        price_change_percent=_format_percent(price_change_percent),
+        volume_24h=_format_amount_for_pair(pair, base_volume),
+        base_volume_24h=_format_amount_for_pair(pair, base_volume),
+        high_24h=_format_price_for_pair(pair, high_24h),
+        low_24h=_format_price_for_pair(pair, low_24h),
+        quote_volume_24h=_decimal_to_str(quote_volume),
+        price_precision=int(pair.price_precision or 8),
+        amount_precision=int(pair.amount_precision or 8),
+        source="LIVE_WS",
+        provider=str(record.get("provider") or PROVIDER_BITGET_SPOT),
+        stale=False,
+        updated_at=updated_at,
+        market_status=str(record.get("market_status") or "OPEN"),
+        quote_freshness="LIVE",
+        ts=updated_at,
+    )
+
+
 def _is_spot_provider_cooldown_skip(exc: Exception) -> bool:
     return isinstance(exc, ProviderCooldownError)
 
@@ -1323,6 +1365,16 @@ def _spot_provider_warning_allowed(
 
 def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = False) -> Optional[TickerItem]:
     last_error: Optional[Exception] = None
+    try:
+        live_record = get_spot_provider_ws_ticker(pair.symbol)
+        if live_record is not None:
+            live_ticker = _spot_provider_ws_ticker_to_item(pair, live_record)
+            if live_ticker is not None:
+                _SPOT_LAST_GOOD_TICKERS[pair.symbol] = live_ticker
+                return live_ticker
+    except Exception as exc:
+        logger.debug("spot_provider_ws_ticker_unavailable symbol=%s reason=%s", pair.symbol, exc)
+
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
     timeout_cap_ms = _SPOT_PROVIDER_FAST_TIMEOUT_CAP_MS if fast else _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS
     for provider in providers:

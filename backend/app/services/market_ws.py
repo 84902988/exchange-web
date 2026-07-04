@@ -179,8 +179,20 @@ class MarketWsManager:
             "depth": depth_payload,
         }
 
+    def _ticker_update_payload(self, symbol: str, ticker: dict[str, Any]) -> dict:
+        ticker_payload = dict(ticker or {})
+        ticker_payload["symbol"] = _normalize_symbol(ticker_payload.get("symbol") or symbol)
+        return {
+            "type": "spot_ticker_update",
+            "symbol": _normalize_symbol(symbol),
+            "ticker": ticker_payload,
+        }
+
     async def broadcast_depth_update(self, symbol: str, depth: Any) -> None:
         await self._send_payload(symbol, self._depth_update_payload(symbol, depth))
+
+    async def broadcast_ticker_update(self, symbol: str, ticker: dict[str, Any]) -> None:
+        await self._send_payload(symbol, self._ticker_update_payload(symbol, ticker))
 
     async def send_snapshot(self, db: Session, symbol: str) -> None:
         """
