@@ -934,13 +934,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                       dataSource={spotMarketDataSource}
                       latestPrice={spotLastPrice}
                       latestTradeOrTickerPrice={null}
-                      displayPriceRaw={spotMarket.displayPrice}
-                      displayPriceFormatted={spotLastPrice}
                       priceDirection={priceDirection}
                       pricePrecision={pricePrecision}
                       amountPrecision={currentAmountPrecision}
-                      tickerFreshness={spotTickerFreshness}
-                      klineFreshness={spotMarket.freshness.kline}
                       showRwaReference={showRwaReference}
                     />
                   </div>
