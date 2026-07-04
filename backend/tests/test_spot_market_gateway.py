@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from app.schemas.market import DepthItem, DepthResponse
+from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services import market
 from app.services.spot_market_gateway import SpotMarketGateway
 
@@ -12,6 +12,7 @@ class FakeWsManager:
         self.count = 0
         self.broadcasts: list[tuple[str, DepthResponse]] = []
         self.ticker_broadcasts: list[tuple[str, dict]] = []
+        self.trade_broadcasts: list[dict] = []
 
     async def subscriber_count(self, symbol: str) -> int:
         return self.count
@@ -21,6 +22,9 @@ class FakeWsManager:
 
     async def broadcast_ticker_update(self, symbol: str, ticker: dict) -> None:
         self.ticker_broadcasts.append((symbol, ticker))
+
+    async def send_trade(self, **kwargs) -> None:
+        self.trade_broadcasts.append(kwargs)
 
 
 class FakeProvider:
@@ -62,6 +66,23 @@ class FakeProvider:
             "quote_freshness": "LIVE",
             "ts": 1000,
         }
+
+    def get_trades(self, symbol: str, **kwargs) -> TradesResponse:
+        return TradesResponse(
+            symbol="BTCUSDT",
+            provider="BITGET_SPOT",
+            source="LIVE_WS",
+            freshness="LIVE",
+            trades=[
+                TradeItem(
+                    id="trade-1",
+                    price="2.1234",
+                    amount="1.2345",
+                    side="BUY",
+                    ts=1000,
+                )
+            ],
+        )
 
 
 def test_gateway_subscriber_count_and_idle_release() -> None:
@@ -120,6 +141,41 @@ def test_gateway_broadcasts_ticker_when_depth_disabled() -> None:
         assert ticker["source"] == "LIVE_WS"
         assert ticker["price_precision"] == 2
         assert ticker["amount_precision"] == 3
+
+        ws_manager.count = 0
+        await gateway.release_symbol_if_idle("btcusdt", idle_delay_seconds=0)
+        await asyncio.sleep(0.05)
+        assert provider.released == ["BTCUSDT"]
+
+    asyncio.run(run())
+
+
+def test_gateway_broadcasts_provider_trade_once() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = FakeProvider()
+        gateway = SpotMarketGateway(
+            provider_depth_enabled=lambda: False,
+            provider_ticker_enabled=lambda: False,
+            provider_trades_enabled=lambda: True,
+            ensure_depth=provider.ensure,
+            release_depth=provider.release,
+            get_trades=provider.get_trades,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+        )
+
+        ws_manager.count = 1
+        await gateway.ensure_symbol("BTC/USDT")
+        await asyncio.sleep(0.03)
+        assert provider.ensured == ["BTCUSDT"]
+        assert len(ws_manager.trade_broadcasts) == 1
+        assert ws_manager.trade_broadcasts[0]["symbol"] == "BTCUSDT"
+        assert ws_manager.trade_broadcasts[0]["trade_id"] == "trade-1"
+        assert ws_manager.trade_broadcasts[0]["price"] == "2.1234"
+
+        await asyncio.sleep(0.25)
+        assert len(ws_manager.trade_broadcasts) == 1
 
         ws_manager.count = 0
         await gateway.release_symbol_if_idle("btcusdt", idle_delay_seconds=0)
@@ -221,6 +277,121 @@ def test_external_spot_ticker_prefers_live_ws() -> None:
     finally:
         market.get_spot_provider_ws_ticker = original_get_ws_ticker
         market._enabled_spot_market_providers_for_pair = original_enabled_providers
+
+
+def test_get_trades_prefers_live_ws_and_falls_back_to_rest() -> None:
+    class Pair:
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+        def __init__(self, symbol: str = "BTCUSDT") -> None:
+            self.symbol = symbol
+
+    provider = market.MarketDataProviderConfig(
+        provider_code=market.PROVIDER_BITGET_SPOT,
+        provider_name="Bitget Spot",
+        market_type="SPOT",
+        enabled=True,
+        priority=1,
+        base_url="https://example.invalid",
+        timeout_ms=1000,
+        cooldown_seconds=0,
+    )
+    def live_trades_for(symbol: str) -> TradesResponse:
+        return TradesResponse(
+            symbol=symbol,
+            provider="BITGET_SPOT",
+            source="LIVE_WS",
+            freshness="LIVE",
+            trades=[
+                TradeItem(id=f"{symbol}-live-1", price="2.123", amount="1.2345", side="BUY", ts=1000),
+            ],
+        )
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_trades = market.get_spot_provider_ws_trades
+    original_spot_provider_symbol = market._spot_provider_symbol
+    original_request_json = market.request_contract_market_provider_json
+    original_mark_success = market.mark_contract_market_provider_success
+    try:
+        market._get_active_pair = lambda db, symbol: Pair(symbol)
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_provider_ws_trades = lambda symbol, **kwargs: live_trades_for(symbol)
+        market.request_contract_market_provider_json = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("REST provider should not be called when LIVE_WS trades are fresh")
+        )
+
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            result = market.get_trades(None, symbol, limit=30)
+            assert result.symbol == symbol
+            assert result.source == "LIVE_WS"
+            assert result.freshness == "LIVE"
+            assert result.provider == "BITGET_SPOT"
+            assert result.trades[0].id == f"{symbol}-live-1"
+            assert result.trades[0].price == "2.12"
+            assert result.trades[0].amount == "1.234"
+
+        market.get_spot_provider_ws_trades = lambda symbol, **kwargs: None
+        market._spot_provider_symbol = lambda *args, **kwargs: "BTCUSDT"
+        market.mark_contract_market_provider_success = lambda *args, **kwargs: None
+        market.request_contract_market_provider_json = lambda *args, **kwargs: {
+            "data": [
+                {
+                    "price": "3.456",
+                    "size": "2.3456",
+                    "side": "sell",
+                    "ts": "2000",
+                }
+            ]
+        }
+
+        fallback = market.get_trades(None, "BTCUSDT", limit=30)
+        assert fallback.provider == "BITGET_SPOT"
+        assert fallback.source is None
+        assert fallback.trades[0].price == "3.46"
+        assert fallback.trades[0].amount == "2.346"
+        assert fallback.trades[0].side == "SELL"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_trades = original_get_ws_trades
+        market._spot_provider_symbol = original_spot_provider_symbol
+        market.request_contract_market_provider_json = original_request_json
+        market.mark_contract_market_provider_success = original_mark_success
+
+
+def test_internal_pair_does_not_use_live_ws_trades() -> None:
+    class Pair:
+        symbol = "MFCUSDT"
+        data_source = market.DATA_SOURCE_INTERNAL
+        price_precision = 2
+        amount_precision = 3
+
+    internal_trades = TradesResponse(
+        symbol="MFCUSDT",
+        trades=[TradeItem(price="1.00", amount="1.000", side="BUY", ts=1000)],
+    )
+
+    original_get_active_pair = market._get_active_pair
+    original_get_ws_trades = market.get_spot_provider_ws_trades
+    original_get_internal_trades = market._get_internal_trades
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market.get_spot_provider_ws_trades = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("internal pair must not read Bitget LIVE_WS trades")
+        )
+        market._get_internal_trades = lambda *args, **kwargs: internal_trades
+
+        result = market.get_trades(None, "MFCUSDT", limit=30)
+        assert result.symbol == "MFCUSDT"
+        assert result.source is None
+        assert result.trades[0].price == "1.00"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market.get_spot_provider_ws_trades = original_get_ws_trades
+        market._get_internal_trades = original_get_internal_trades
 
 
 if __name__ == "__main__":

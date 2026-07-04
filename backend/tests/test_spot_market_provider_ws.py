@@ -70,6 +70,46 @@ def test_bitget_ticker_message_normalize() -> None:
     assert record["quote_freshness"] == "LIVE"
 
 
+def test_bitget_trade_message_normalize() -> None:
+    record = provider_ws.normalize_bitget_trade_message(
+        {
+            "arg": {"instType": "SPOT", "channel": "trade", "instId": "BTCUSDT"},
+            "action": "update",
+            "data": [
+                {
+                    "tradeId": "1000000000",
+                    "ts": "1695709835822",
+                    "price": "26293.4",
+                    "size": "0.0013",
+                    "side": "buy",
+                },
+                {
+                    "tradeId": "1000000001",
+                    "ts": "1695709835823",
+                    "price": "26294.1",
+                    "size": "0.002",
+                    "side": "sell",
+                },
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTCUSDT",
+        trades_limit=2,
+    )
+
+    assert record is not None
+    assert record["symbol"] == "BTCUSDT"
+    assert record["provider"] == provider_ws.PROVIDER_BITGET_SPOT
+    assert record["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert record["freshness"] == "LIVE"
+    assert record["trades"][0]["id"] == "1000000001"
+    assert record["trades"][0]["price"] == "26294.1"
+    assert record["trades"][0]["amount"] == "0.002"
+    assert record["trades"][0]["side"] == "SELL"
+    assert record["trades"][1]["id"] == "1000000000"
+    assert record["trades"][1]["side"] == "BUY"
+
+
 def test_depth_cache_fresh_and_stale() -> None:
     service = provider_ws.SpotMarketProviderWsService()
     now_ms = provider_ws._now_ms()
@@ -137,6 +177,59 @@ def test_ticker_cache_fresh_and_stale() -> None:
         }
     )
     assert service.get_fresh_ticker("btcusdt", max_age_ms=1000) is None
+
+
+def test_trades_cache_fresh_and_stale() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    now_ms = provider_ws._now_ms()
+    service.set_trades_cache_for_tests(
+        {
+            "symbol": "BTCUSDT",
+            "provider": provider_ws.PROVIDER_BITGET_SPOT,
+            "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+            "freshness": "LIVE",
+            "trades": [
+                {
+                    "id": "1000000000",
+                    "price": "26293.4",
+                    "amount": "0.0013",
+                    "side": "BUY",
+                    "ts": now_ms,
+                }
+            ],
+            "updated_at_ms": now_ms,
+            "ts": now_ms,
+        }
+    )
+
+    fresh = service.get_fresh_trades("BTC/USDT", max_age_ms=1000)
+    assert fresh is not None
+    assert fresh.symbol == "BTCUSDT"
+    assert fresh.provider == provider_ws.PROVIDER_BITGET_SPOT
+    assert fresh.source == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert fresh.freshness == "LIVE"
+    assert fresh.trades[0].id == "1000000000"
+
+    service.set_trades_cache_for_tests(
+        {
+            "symbol": "BTCUSDT",
+            "provider": provider_ws.PROVIDER_BITGET_SPOT,
+            "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+            "freshness": "LIVE",
+            "trades": [
+                {
+                    "id": "1000000000",
+                    "price": "26293.4",
+                    "amount": "0.0013",
+                    "side": "BUY",
+                    "ts": now_ms - 5000,
+                }
+            ],
+            "updated_at_ms": now_ms - 5000,
+            "ts": now_ms - 5000,
+        }
+    )
+    assert service.get_fresh_trades("btcusdt", max_age_ms=1000) is None
 
 
 if __name__ == "__main__":
