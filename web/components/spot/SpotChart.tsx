@@ -6,6 +6,7 @@ import { useLocaleContext } from '@/contexts/LocaleContext';
 import type {
   CandleItem,
   CandleSeriesPoint,
+  RawKlineItem,
   SpotChartProps,
   VolumeItem,
   WsTradeMessage,
@@ -42,6 +43,7 @@ import { getSpotSymbolPricePrecision } from '@/lib/marketPrecision';
 import { type RealtimePriceDirection } from './spotTickerColor';
 import {
   spotMarketRealtime,
+  type SpotMarketKlineMessage,
   type SpotMarketRealtimeMessage,
 } from '@/services/marketRealtime';
 import { getReferenceOverlay } from '@/lib/api/modules/market';
@@ -163,10 +165,23 @@ function createExternalSpotChartPollingConnection(params: {
   interval: string;
   destroyedRef: React.MutableRefObject<boolean>;
   onKlines: (candles: CandleItem[], volumes: VolumeItem[]) => void;
+  onProviderKline: (candles: CandleItem[], volumes: VolumeItem[]) => void;
 }): SpotChartRealtimeConnection {
   let closed = false;
   let polling = false;
   let pollTimer: number | null = null;
+
+  const handleKlineMessage = (message: SpotMarketRealtimeMessage) => {
+    if (closed || params.destroyedRef.current) return;
+    const data = message as SpotMarketKlineMessage;
+    if (data.type !== 'spot_kline_update') return;
+    const msgSymbol = String(data.symbol || '').trim().toUpperCase();
+    if (msgSymbol !== String(params.symbol || '').trim().toUpperCase()) return;
+    if (String(data.interval || '').trim() !== params.interval) return;
+    const result = adaptKlines(data.kline ? [data.kline as RawKlineItem] : []);
+    if (!result.candles.length) return;
+    params.onProviderKline(result.candles, result.volumes);
+  };
 
   const syncLatestKlines = async () => {
     if (closed || polling || params.destroyedRef.current) return;
@@ -193,6 +208,9 @@ function createExternalSpotChartPollingConnection(params: {
     }
   };
 
+  spotMarketRealtime.setSymbol(params.symbol, params.interval);
+  const unsubscribeKline = spotMarketRealtime.subscribe('kline', handleKlineMessage);
+
   void syncLatestKlines();
   pollTimer = window.setInterval(() => {
     void syncLatestKlines();
@@ -206,6 +224,7 @@ function createExternalSpotChartPollingConnection(params: {
         window.clearInterval(pollTimer);
         pollTimer = null;
       }
+      unsubscribeKline();
     },
   };
 }
@@ -1478,21 +1497,29 @@ export default function SpotChart({
       nextCandles: CandleItem[],
       nextVolumes: VolumeItem[]
     ) => {
-      const patchedCandles = patchLatestRealCandleClose(
-        nextCandles,
-        latestTradeOrTickerPriceRef.current,
-        interval,
-      ) || nextCandles;
-      if (patchedCandles !== nextCandles) {
-        suppressLatestPatchFlashRef.current = true;
-      }
-      candlesRef.current = patchedCandles;
+      candlesRef.current = nextCandles;
       volumesRef.current = nextVolumes;
-      setCandles(patchedCandles);
+      setCandles(nextCandles);
       setVolumes(nextVolumes);
       writeMarketCache<SpotChartCache>('spot', normalizedSymbol, {
-        candles: patchedCandles,
+        candles: nextCandles,
         volumes: nextVolumes,
+      });
+    };
+
+    const handleProviderKline = (
+      nextCandles: CandleItem[],
+      nextVolumes: VolumeItem[]
+    ) => {
+      const mergedCandles = mergeCandlesByTime(candlesRef.current, nextCandles);
+      const mergedVolumes = mergeVolumesByTime(volumesRef.current, nextVolumes);
+      candlesRef.current = mergedCandles;
+      volumesRef.current = mergedVolumes;
+      setCandles(mergedCandles);
+      setVolumes(mergedVolumes);
+      writeMarketCache<SpotChartCache>('spot', normalizedSymbol, {
+        candles: mergedCandles,
+        volumes: mergedVolumes,
       });
     };
 
@@ -1502,6 +1529,7 @@ export default function SpotChart({
         interval,
         destroyedRef,
         onKlines: handleExternalKlines,
+        onProviderKline: handleProviderKline,
       });
     } else {
       realtimeConnectionRef.current = createInternalSpotChartRealtimeConnection({

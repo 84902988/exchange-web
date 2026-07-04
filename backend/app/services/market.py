@@ -52,6 +52,7 @@ from app.services.stock_dealer_depth_service import (
 from app.services.spot_kline_realtime import SPOT_KLINE_SOURCE_INTERNAL_TRADE
 from app.services.spot_market_provider_ws import (
     get_spot_provider_ws_depth,
+    get_spot_provider_ws_klines,
     get_spot_provider_ws_ticker,
     get_spot_provider_ws_trades,
 )
@@ -1315,6 +1316,32 @@ def _spot_klines_from_provider(
         )
     items.sort(key=lambda item: int(item["open_time"]))
     return items[-limit:]
+
+
+def _merge_spot_live_ws_klines(
+    *,
+    history_items: list[dict[str, Any]],
+    live_items: list[dict[str, Any]],
+    limit: int,
+    end_time_ms: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    by_open_time: dict[int, dict[str, Any]] = {}
+    for item in list(history_items or []) + list(live_items or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            open_time = int(item.get("open_time") or 0)
+        except Exception:
+            continue
+        if open_time <= 0:
+            continue
+        if end_time_ms is not None and open_time >= int(end_time_ms):
+            continue
+        by_open_time[open_time] = dict(item)
+    return [
+        by_open_time[open_time]
+        for open_time in sorted(by_open_time.keys())[-max(1, int(limit or 200)):]
+    ]
 
 
 def _spot_last_good_ticker(pair: TradingPair) -> Optional[TickerItem]:
@@ -2665,6 +2692,20 @@ def get_klines(
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
+        live_ws_klines: Optional[dict[str, Any]] = None
+        if end_time_ms is None:
+            try:
+                providers = _enabled_spot_market_providers_for_pair(db, pair)
+                if any(getattr(provider, "provider_code", None) == PROVIDER_BITGET_SPOT for provider in providers):
+                    live_ws_klines = get_spot_provider_ws_klines(pair.symbol, interval, limit=limit)
+            except Exception as exc:
+                logger.debug(
+                    "spot_provider_ws_kline_unavailable symbol=%s interval=%s reason=%s",
+                    pair.symbol,
+                    interval,
+                    exc,
+                )
+
         def _fetch_external_spot(fetch_limit: int, fetch_end_time_ms: Optional[int]):
             return _fetch_external_spot_klines(
                 db,
@@ -2687,6 +2728,23 @@ def get_klines(
             external_budget_seconds=1.5,
         )
         cached_meta = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval), {})
+        if live_ws_klines and live_ws_klines.get("items"):
+            items = _merge_spot_live_ws_klines(
+                history_items=items,
+                live_items=list(live_ws_klines.get("items") or []),
+                limit=limit,
+                end_time_ms=end_time_ms,
+            )
+            return {
+                "symbol": pair.symbol,
+                "interval": interval,
+                "items": items,
+                "provider": live_ws_klines.get("provider") or PROVIDER_BITGET_SPOT,
+                "source": "LIVE_WS",
+                "freshness": live_ws_klines.get("freshness") or "LIVE",
+                "stale": False,
+                "updated_at": live_ws_klines.get("updated_at"),
+            }
         provider = str(cached_meta.get("provider") or "EXTERNAL_SPOT")
         return {
             "symbol": pair.symbol,

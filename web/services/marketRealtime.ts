@@ -47,15 +47,24 @@ export type SpotMarketRealtimeMessage =
 export type SpotMarketRealtimeHandler = (message: SpotMarketRealtimeMessage) => void;
 export type SpotMarketRealtimeStatusHandler = (status: SpotMarketConnectionStatus) => void;
 
-function buildSpotWsUrl(symbol: string) {
+function buildSpotWsUrl(symbol: string, interval = '1m') {
   const apiBase = getRuntimeApiBaseUrl();
   const url = new URL(apiBase);
   const protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${url.host}/market/ws/spot?symbol=${encodeURIComponent(symbol)}`;
+  const params = new URLSearchParams({
+    symbol,
+    interval,
+  });
+  return `${protocol}//${url.host}/market/ws/spot?${params.toString()}`;
 }
 
 function normalizeSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase();
+}
+
+function normalizeInterval(interval?: string | null) {
+  const normalized = String(interval || '1m').trim();
+  return ['1m', '5m', '15m', '1h', '4h', '1d'].includes(normalized) ? normalized : '1m';
 }
 
 class SpotMarketRealtimeClient {
@@ -63,18 +72,23 @@ class SpotMarketRealtimeClient {
   private connectTimer: number | null = null;
   private reconnectTimer: number | null = null;
   private socketOpenedWithSymbol = '';
+  private socketOpenedWithInterval = '1m';
   private requestedSymbol = '';
+  private requestedInterval = '1m';
   private closedByClient = false;
   private handlers = new Map<SpotMarketRealtimeEventType, Set<SpotMarketRealtimeHandler>>();
   private statusHandlers = new Set<SpotMarketRealtimeStatusHandler>();
   private status: SpotMarketConnectionStatus = 'closed';
 
-  setSymbol(symbol: string) {
+  setSymbol(symbol: string, interval = '1m') {
     const nextSymbol = normalizeSymbol(symbol);
     if (!nextSymbol) return;
+    const nextInterval = normalizeInterval(interval);
 
     const previousSymbol = this.requestedSymbol;
+    const previousInterval = this.requestedInterval;
     this.requestedSymbol = nextSymbol;
+    this.requestedInterval = nextInterval;
     this.closedByClient = false;
 
     if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
@@ -82,8 +96,11 @@ class SpotMarketRealtimeClient {
       return;
     }
 
-    if (previousSymbol !== nextSymbol) {
-      if (this.socketOpenedWithSymbol && this.socketOpenedWithSymbol !== nextSymbol) {
+    if (previousSymbol !== nextSymbol || previousInterval !== nextInterval) {
+      if (
+        this.socketOpenedWithSymbol &&
+        (this.socketOpenedWithSymbol !== nextSymbol || this.socketOpenedWithInterval !== nextInterval)
+      ) {
         this.closeCurrentSocketForReconnect();
         this.scheduleConnect(nextSymbol);
         return;
@@ -131,7 +148,9 @@ class SpotMarketRealtimeClient {
     this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = '';
+    this.socketOpenedWithInterval = '1m';
     this.requestedSymbol = '';
+    this.requestedInterval = '1m';
     this.setStatus('closed');
 
     if (!this.ws) return;
@@ -152,25 +171,35 @@ class SpotMarketRealtimeClient {
     this.connectTimer = window.setTimeout(() => {
       this.connectTimer = null;
       if (this.closedByClient || !this.requestedSymbol) return;
-      this.connect(this.requestedSymbol || symbol);
+      this.connect(this.requestedSymbol || symbol, this.requestedInterval);
     }, 100);
   }
 
-  private connect(symbol: string) {
+  private connect(symbol: string, interval = '1m') {
     if (typeof window === 'undefined') return;
 
     this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = symbol;
+    this.socketOpenedWithInterval = normalizeInterval(interval);
     this.setStatus('connecting');
 
-    const ws = new WebSocket(buildSpotWsUrl(symbol));
+    const ws = new WebSocket(buildSpotWsUrl(symbol, this.socketOpenedWithInterval));
     this.ws = ws;
 
     ws.onopen = () => {
       this.setStatus('open');
       const latestSymbol = this.requestedSymbol;
-      if (latestSymbol && latestSymbol !== this.socketOpenedWithSymbol) {
+      const latestInterval = this.requestedInterval;
+      if (
+        latestSymbol &&
+        (latestSymbol !== this.socketOpenedWithSymbol || latestInterval !== this.socketOpenedWithInterval)
+      ) {
+        if (latestInterval !== this.socketOpenedWithInterval) {
+          this.closeCurrentSocketForReconnect();
+          this.scheduleConnect(latestSymbol);
+          return;
+        }
         this.sendSubscribeIfOpen(latestSymbol);
       }
     };
@@ -200,7 +229,7 @@ class SpotMarketRealtimeClient {
 
       this.clearReconnectTimer();
       this.reconnectTimer = window.setTimeout(() => {
-        this.connect(this.requestedSymbol);
+        this.connect(this.requestedSymbol, this.requestedInterval);
       }, 1500);
     };
   }
@@ -209,6 +238,7 @@ class SpotMarketRealtimeClient {
     this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = '';
+    this.socketOpenedWithInterval = '1m';
     this.setStatus('closed');
 
     if (!this.ws) return;
