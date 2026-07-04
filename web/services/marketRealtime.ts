@@ -37,6 +37,7 @@ export type SpotMarketKlineMessage = {
 };
 
 export type SpotMarketRealtimeEventType = 'snapshot' | 'trade' | 'depth' | 'ticker' | 'kline';
+export type SpotMarketRealtimeDomain = 'snapshot' | 'depth' | 'trades' | 'ticker' | 'kline';
 export type SpotMarketConnectionStatus = 'connecting' | 'open' | 'closed';
 export type SpotMarketRealtimeMessage =
   | SpotMarketSnapshotMessage
@@ -46,6 +47,39 @@ export type SpotMarketRealtimeMessage =
   | SpotMarketKlineMessage;
 export type SpotMarketRealtimeHandler = (message: SpotMarketRealtimeMessage) => void;
 export type SpotMarketRealtimeStatusHandler = (status: SpotMarketConnectionStatus) => void;
+export type SpotMarketRealtimeSubscriptionOptions = {
+  symbol: string;
+  domains: SpotMarketRealtimeDomain[];
+  interval?: string | null;
+  owner?: string;
+};
+
+type SpotMarketRealtimeSubscriptionEntry = {
+  connectionKey: string;
+  domain: SpotMarketRealtimeDomain;
+};
+
+type SpotMarketRealtimeSubscription = {
+  id: string;
+  symbol: string;
+  interval: string;
+  owner?: string;
+  entries: SpotMarketRealtimeSubscriptionEntry[];
+};
+
+type SpotMarketRealtimeConnection = {
+  key: string;
+  symbol: string;
+  interval: string;
+  ws: WebSocket | null;
+  connectTimer: number | null;
+  reconnectTimer: number | null;
+  status: SpotMarketConnectionStatus;
+  closedByClient: boolean;
+  domains: Map<SpotMarketRealtimeDomain, Set<string>>;
+};
+
+const BASE_INTERVAL = '1m';
 
 function buildSpotWsUrl(symbol: string, interval = '1m') {
   const apiBase = getRuntimeApiBaseUrl();
@@ -67,47 +101,106 @@ function normalizeInterval(interval?: string | null) {
   return ['1m', '5m', '15m', '1h', '4h', '1d'].includes(normalized) ? normalized : '1m';
 }
 
+function normalizeDomain(domain: SpotMarketRealtimeDomain): SpotMarketRealtimeDomain {
+  if (domain === 'trades') return 'trades';
+  return domain;
+}
+
+function makeConnectionKey(symbol: string, interval: string) {
+  return `${symbol}:${interval}`;
+}
+
+function getMessageObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
 class SpotMarketRealtimeClient {
-  private ws: WebSocket | null = null;
-  private connectTimer: number | null = null;
-  private reconnectTimer: number | null = null;
-  private socketOpenedWithSymbol = '';
-  private socketOpenedWithInterval = '1m';
-  private requestedSymbol = '';
-  private requestedInterval = '1m';
-  private closedByClient = false;
+  private connections = new Map<string, SpotMarketRealtimeConnection>();
+  private subscriptions = new Map<string, SpotMarketRealtimeSubscription>();
+  private nextSubscriptionId = 1;
+  private legacySubscriptionId: string | null = null;
   private handlers = new Map<SpotMarketRealtimeEventType, Set<SpotMarketRealtimeHandler>>();
   private statusHandlers = new Set<SpotMarketRealtimeStatusHandler>();
   private status: SpotMarketConnectionStatus = 'closed';
 
   setSymbol(symbol: string, interval = '1m') {
-    const nextSymbol = normalizeSymbol(symbol);
-    if (!nextSymbol) return;
-    const nextInterval = normalizeInterval(interval);
-
-    const previousSymbol = this.requestedSymbol;
-    const previousInterval = this.requestedInterval;
-    this.requestedSymbol = nextSymbol;
-    this.requestedInterval = nextInterval;
-    this.closedByClient = false;
-
-    if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
-      this.scheduleConnect(nextSymbol);
-      return;
+    if (this.legacySubscriptionId) {
+      this.releaseSubscription(this.legacySubscriptionId);
     }
 
-    if (previousSymbol !== nextSymbol || previousInterval !== nextInterval) {
-      if (
-        this.socketOpenedWithSymbol &&
-        (this.socketOpenedWithSymbol !== nextSymbol || this.socketOpenedWithInterval !== nextInterval)
-      ) {
-        this.closeCurrentSocketForReconnect();
-        this.scheduleConnect(nextSymbol);
-        return;
+    this.legacySubscriptionId = this.acquireSubscription({
+      symbol,
+      interval,
+      domains: ['snapshot', 'depth', 'trades', 'ticker', 'kline'],
+      owner: 'legacy-setSymbol',
+    });
+  }
+
+  acquireSubscription(options: SpotMarketRealtimeSubscriptionOptions): string {
+    const symbol = normalizeSymbol(options.symbol);
+    if (!symbol) return '';
+
+    const interval = normalizeInterval(options.interval);
+    const domains = Array.from(new Set(options.domains.map(normalizeDomain)));
+    if (!domains.length) return '';
+
+    const id = `${options.owner || 'spot-market'}:${this.nextSubscriptionId++}`;
+    const entries: SpotMarketRealtimeSubscriptionEntry[] = [];
+
+    for (const domain of domains) {
+      const domainInterval = domain === 'kline' ? interval : BASE_INTERVAL;
+      const connection = this.ensureConnection(symbol, domainInterval);
+      const bucket = connection.domains.get(domain) ?? new Set<string>();
+      bucket.add(id);
+      connection.domains.set(domain, bucket);
+      entries.push({ connectionKey: connection.key, domain });
+    }
+
+    this.subscriptions.set(id, {
+      id,
+      symbol,
+      interval,
+      owner: options.owner,
+      entries,
+    });
+
+    for (const entry of entries) {
+      const connection = this.connections.get(entry.connectionKey);
+      if (connection) {
+        this.ensureConnectionOpen(connection);
+      }
+    }
+
+    return id;
+  }
+
+  releaseSubscription(subscriptionId: string) {
+    if (!subscriptionId) return;
+    const subscription = this.subscriptions.get(subscriptionId);
+    if (!subscription) return;
+
+    this.subscriptions.delete(subscriptionId);
+    if (this.legacySubscriptionId === subscriptionId) {
+      this.legacySubscriptionId = null;
+    }
+
+    for (const entry of subscription.entries) {
+      const connection = this.connections.get(entry.connectionKey);
+      if (!connection) continue;
+
+      const bucket = connection.domains.get(entry.domain);
+      bucket?.delete(subscriptionId);
+      if (bucket && bucket.size === 0) {
+        connection.domains.delete(entry.domain);
       }
 
-      this.sendSubscribeIfOpen(nextSymbol);
+      if (!this.hasActiveConnectionDomains(connection)) {
+        this.closeConnection(connection, 'subscription released');
+        this.connections.delete(connection.key);
+      }
     }
+
+    this.refreshAggregateStatus();
   }
 
   subscribe(type: SpotMarketRealtimeEventType, handler: SpotMarketRealtimeHandler) {
@@ -144,64 +237,71 @@ class SpotMarketRealtimeClient {
   }
 
   disconnect() {
-    this.closedByClient = true;
-    this.clearConnectTimer();
-    this.clearReconnectTimer();
-    this.socketOpenedWithSymbol = '';
-    this.socketOpenedWithInterval = '1m';
-    this.requestedSymbol = '';
-    this.requestedInterval = '1m';
+    for (const connection of Array.from(this.connections.values())) {
+      this.closeConnection(connection, 'client disconnect');
+    }
+    this.connections.clear();
+    this.subscriptions.clear();
+    this.legacySubscriptionId = null;
     this.setStatus('closed');
-
-    if (!this.ws) return;
-
-    const ws = this.ws;
-    this.ws = null;
-    ws.onopen = null;
-    ws.onmessage = null;
-    ws.onerror = null;
-    ws.onclose = null;
-    ws.close(1000, 'client disconnect');
   }
 
-  private scheduleConnect(symbol: string) {
-    if (typeof window === 'undefined') return;
+  private ensureConnection(symbol: string, interval: string) {
+    const key = makeConnectionKey(symbol, interval);
+    const existing = this.connections.get(key);
+    if (existing) return existing;
 
-    this.clearConnectTimer();
-    this.connectTimer = window.setTimeout(() => {
-      this.connectTimer = null;
-      if (this.closedByClient || !this.requestedSymbol) return;
-      this.connect(this.requestedSymbol || symbol, this.requestedInterval);
+    const connection: SpotMarketRealtimeConnection = {
+      key,
+      symbol,
+      interval,
+      ws: null,
+      connectTimer: null,
+      reconnectTimer: null,
+      status: 'closed',
+      closedByClient: false,
+      domains: new Map<SpotMarketRealtimeDomain, Set<string>>(),
+    };
+    this.connections.set(key, connection);
+    return connection;
+  }
+
+  private ensureConnectionOpen(connection: SpotMarketRealtimeConnection) {
+    if (typeof window === 'undefined') return;
+    connection.closedByClient = false;
+
+    if (
+      connection.ws &&
+      (connection.ws.readyState === WebSocket.OPEN || connection.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+
+    this.clearConnectionTimer(connection, 'reconnect');
+
+    if (connection.connectTimer !== null) return;
+
+    connection.connectTimer = window.setTimeout(() => {
+      connection.connectTimer = null;
+      if (connection.closedByClient || !this.hasActiveConnectionDomains(connection)) return;
+      this.connect(connection);
     }, 100);
   }
 
-  private connect(symbol: string, interval = '1m') {
+  private connect(connection: SpotMarketRealtimeConnection) {
     if (typeof window === 'undefined') return;
+    if (!this.hasActiveConnectionDomains(connection)) return;
 
-    this.clearConnectTimer();
-    this.clearReconnectTimer();
-    this.socketOpenedWithSymbol = symbol;
-    this.socketOpenedWithInterval = normalizeInterval(interval);
-    this.setStatus('connecting');
+    this.clearConnectionTimer(connection, 'connect');
+    this.clearConnectionTimer(connection, 'reconnect');
+    this.setConnectionStatus(connection, 'connecting');
 
-    const ws = new WebSocket(buildSpotWsUrl(symbol, this.socketOpenedWithInterval));
-    this.ws = ws;
+    const ws = new WebSocket(buildSpotWsUrl(connection.symbol, connection.interval));
+    connection.ws = ws;
 
     ws.onopen = () => {
-      this.setStatus('open');
-      const latestSymbol = this.requestedSymbol;
-      const latestInterval = this.requestedInterval;
-      if (
-        latestSymbol &&
-        (latestSymbol !== this.socketOpenedWithSymbol || latestInterval !== this.socketOpenedWithInterval)
-      ) {
-        if (latestInterval !== this.socketOpenedWithInterval) {
-          this.closeCurrentSocketForReconnect();
-          this.scheduleConnect(latestSymbol);
-          return;
-        }
-        this.sendSubscribeIfOpen(latestSymbol);
-      }
+      if (connection.ws !== ws) return;
+      this.setConnectionStatus(connection, 'open');
     };
 
     ws.onmessage = (event) => {
@@ -209,7 +309,7 @@ class SpotMarketRealtimeClient {
 
       try {
         const message = JSON.parse(event.data) as SpotMarketRealtimeMessage;
-        this.dispatch(message);
+        this.dispatch(message, connection);
       } catch (err) {
         console.warn('[marketRealtime] spot WS parse error:', err);
       }
@@ -220,72 +320,126 @@ class SpotMarketRealtimeClient {
     };
 
     ws.onclose = () => {
-      if (this.ws === ws) {
-        this.ws = null;
+      if (connection.ws === ws) {
+        connection.ws = null;
       }
-      this.setStatus('closed');
+      this.setConnectionStatus(connection, 'closed');
 
-      if (this.closedByClient || !this.requestedSymbol) return;
+      if (connection.closedByClient || !this.hasActiveConnectionDomains(connection)) return;
 
-      this.clearReconnectTimer();
-      this.reconnectTimer = window.setTimeout(() => {
-        this.connect(this.requestedSymbol, this.requestedInterval);
+      this.clearConnectionTimer(connection, 'reconnect');
+      connection.reconnectTimer = window.setTimeout(() => {
+        connection.reconnectTimer = null;
+        this.connect(connection);
       }, 1500);
     };
   }
 
-  private closeCurrentSocketForReconnect() {
-    this.clearConnectTimer();
-    this.clearReconnectTimer();
-    this.socketOpenedWithSymbol = '';
-    this.socketOpenedWithInterval = '1m';
-    this.setStatus('closed');
+  private closeConnection(connection: SpotMarketRealtimeConnection, reason: string) {
+    connection.closedByClient = true;
+    this.clearConnectionTimer(connection, 'connect');
+    this.clearConnectionTimer(connection, 'reconnect');
 
-    if (!this.ws) return;
+    if (!connection.ws) {
+      this.setConnectionStatus(connection, 'closed');
+      return;
+    }
 
-    const ws = this.ws;
-    this.ws = null;
+    const ws = connection.ws;
+    connection.ws = null;
     ws.onopen = null;
     ws.onmessage = null;
     ws.onerror = null;
     ws.onclose = null;
-    ws.close(1000, 'symbol changed');
+    ws.close(1000, reason);
+    this.setConnectionStatus(connection, 'closed');
   }
 
-  private sendSubscribeIfOpen(symbol: string) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-    try {
-      this.ws.send(`subscribe:${symbol}`);
-    } catch (err) {
-      console.warn('[marketRealtime] spot subscribe failed:', err);
-    }
-  }
-
-  private dispatch(message: SpotMarketRealtimeMessage) {
+  private dispatch(message: SpotMarketRealtimeMessage, connection: SpotMarketRealtimeConnection) {
     if (message.type === 'spot_market_snapshot') {
-      this.emit('snapshot', message);
+      if (this.shouldDispatch(message, connection, 'snapshot')) {
+        this.emit('snapshot', message);
+      }
       return;
     }
 
     if (message.type === 'spot_trade') {
-      this.emit('trade', message);
+      if (this.shouldDispatch(message, connection, 'trades')) {
+        this.emit('trade', message);
+      }
       return;
     }
 
     if (message.type === 'spot_depth_update') {
-      this.emit('depth', message);
+      if (this.shouldDispatch(message, connection, 'depth')) {
+        this.emit('depth', message);
+      }
       return;
     }
 
     if (message.type === 'spot_ticker_update') {
-      this.emit('ticker', message);
+      if (this.shouldDispatch(message, connection, 'ticker')) {
+        this.emit('ticker', message);
+      }
       return;
     }
 
     if (message.type === 'spot_kline_update') {
-      this.emit('kline', message);
+      if (this.shouldDispatch(message, connection, 'kline')) {
+        this.emit('kline', message);
+      }
     }
+  }
+
+  private shouldDispatch(
+    message: SpotMarketRealtimeMessage,
+    connection: SpotMarketRealtimeConnection,
+    domain: SpotMarketRealtimeDomain,
+  ) {
+    if (!connection.domains.get(domain)?.size) return false;
+
+    const messageSymbol = this.getMessageSymbol(message);
+    if (messageSymbol && messageSymbol !== connection.symbol) return false;
+
+    if (domain === 'kline') {
+      const messageInterval = normalizeInterval(this.getMessageInterval(message));
+      return messageInterval === connection.interval;
+    }
+
+    return true;
+  }
+
+  private getMessageSymbol(message: SpotMarketRealtimeMessage) {
+    if ('symbol' in message) {
+      const symbol = normalizeSymbol(message.symbol || '');
+      if (symbol) return symbol;
+    }
+
+    if (message.type === 'spot_depth_update') {
+      const depth = getMessageObject(message.depth);
+      return normalizeSymbol(String(depth?.symbol || ''));
+    }
+
+    if (message.type === 'spot_ticker_update') {
+      const ticker = getMessageObject(message.ticker);
+      return normalizeSymbol(String(ticker?.symbol || ''));
+    }
+
+    return '';
+  }
+
+  private getMessageInterval(message: SpotMarketRealtimeMessage) {
+    if (message.type !== 'spot_kline_update') return BASE_INTERVAL;
+    if (message.interval) return message.interval;
+    const kline = getMessageObject(message.kline);
+    return String(kline?.interval || BASE_INTERVAL);
+  }
+
+  private hasActiveConnectionDomains(connection: SpotMarketRealtimeConnection) {
+    for (const bucket of connection.domains.values()) {
+      if (bucket.size > 0) return true;
+    }
+    return false;
   }
 
   private emit(type: SpotMarketRealtimeEventType, message: SpotMarketRealtimeMessage) {
@@ -297,11 +451,41 @@ class SpotMarketRealtimeClient {
     }
   }
 
-  private clearReconnectTimer() {
-    if (this.reconnectTimer !== null) {
-      window.clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
+  private clearConnectionTimer(
+    connection: SpotMarketRealtimeConnection,
+    timer: 'connect' | 'reconnect',
+  ) {
+    const timerId = timer === 'connect' ? connection.connectTimer : connection.reconnectTimer;
+    if (timerId !== null) {
+      window.clearTimeout(timerId);
+      if (timer === 'connect') {
+        connection.connectTimer = null;
+      } else {
+        connection.reconnectTimer = null;
+      }
     }
+  }
+
+  private setConnectionStatus(
+    connection: SpotMarketRealtimeConnection,
+    status: SpotMarketConnectionStatus,
+  ) {
+    connection.status = status;
+    this.refreshAggregateStatus();
+  }
+
+  private refreshAggregateStatus() {
+    let nextStatus: SpotMarketConnectionStatus = 'closed';
+    for (const connection of this.connections.values()) {
+      if (connection.status === 'open') {
+        nextStatus = 'open';
+        break;
+      }
+      if (connection.status === 'connecting') {
+        nextStatus = 'connecting';
+      }
+    }
+    this.setStatus(nextStatus);
   }
 
   private setStatus(status: SpotMarketConnectionStatus) {
@@ -309,13 +493,6 @@ class SpotMarketRealtimeClient {
     this.status = status;
     for (const handler of Array.from(this.statusHandlers)) {
       handler(status);
-    }
-  }
-
-  private clearConnectTimer() {
-    if (this.connectTimer !== null) {
-      window.clearTimeout(this.connectTimer);
-      this.connectTimer = null;
     }
   }
 }

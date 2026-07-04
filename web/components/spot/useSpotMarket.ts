@@ -321,11 +321,15 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
 
   useEffect(() => {
     if (!normalizedSymbol) {
-      spotMarketRealtime.disconnect();
+      setIsConnected(false);
       return undefined;
     }
 
-    spotMarketRealtime.setSymbol(normalizedSymbol);
+    const subscriptionId = spotMarketRealtime.acquireSubscription({
+      symbol: normalizedSymbol,
+      domains: ['snapshot', 'depth', 'trades', 'ticker'],
+      owner: 'useSpotMarket',
+    });
     const unsubscribeStatus = spotMarketRealtime.subscribeStatus((status) => {
       setIsConnected(status === 'open');
     });
@@ -472,6 +476,7 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       unsubscribeTrade();
       unsubscribeTicker();
       unsubscribeStatus();
+      spotMarketRealtime.releaseSubscription(subscriptionId);
     };
   }, [applyView, normalizedSymbol]);
 
@@ -488,12 +493,6 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       window.clearInterval(timer);
     };
   }, [normalizedSymbol, refresh]);
-
-  useEffect(() => {
-    return () => {
-      spotMarketRealtime.disconnect();
-    };
-  }, []);
 
   const bestBid = marketView?.best_bid ?? firstPrice(depth?.bids);
   const bestAsk = marketView?.best_ask ?? firstPrice(depth?.asks);
