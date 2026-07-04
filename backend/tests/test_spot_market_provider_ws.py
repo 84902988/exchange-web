@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 
@@ -69,6 +70,68 @@ def test_spot_provider_ws_has_no_enabled_switches() -> None:
         "spot_provider_ws_kline_enabled",
     ):
         assert not hasattr(provider_ws, name)
+
+
+def test_provider_ws_shutdown_noise_detection() -> None:
+    assert provider_ws._is_provider_ws_shutdown_noise(
+        RuntimeError("cannot schedule new futures after shutdown")
+    )
+    assert provider_ws._is_provider_ws_shutdown_noise(RuntimeError("Event loop is closed"))
+    assert provider_ws._is_provider_ws_shutdown_noise(RuntimeError("executor shutdown"))
+    assert not provider_ws._is_provider_ws_shutdown_noise(RuntimeError("some provider error"))
+    assert not provider_ws._is_provider_ws_shutdown_noise(OSError("getaddrinfo failed"))
+
+    stop_event = threading.Event()
+    stop_event.set()
+    assert provider_ws._is_provider_ws_shutdown_noise(RuntimeError("some provider error"), stop_event)
+
+
+def test_provider_ws_loop_exits_on_shutdown_noise_without_retry() -> None:
+    async def run() -> None:
+        service = provider_ws.SpotMarketProviderWsService()
+        calls = 0
+
+        async def fail_with_shutdown(*args, **kwargs) -> None:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("cannot schedule new futures after shutdown")
+
+        service._run_bitget_ticker_ws = fail_with_shutdown
+        subscription = provider_ws.SpotTickerSubscription(
+            local_symbol="BTCUSDT",
+            provider=provider_ws.PROVIDER_BITGET_SPOT,
+            provider_symbol="BTCUSDT",
+        )
+
+        await service._ticker_loop(subscription, threading.Event(), 1)
+        assert calls == 1
+
+    asyncio.run(run())
+
+
+def test_provider_ws_loop_exits_without_connect_when_stop_event_is_set() -> None:
+    async def run() -> None:
+        service = provider_ws.SpotMarketProviderWsService()
+        calls = 0
+
+        async def fail_if_called(*args, **kwargs) -> None:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("provider ws should not reconnect after stop")
+
+        service._run_bitget_ticker_ws = fail_if_called
+        stop_event = threading.Event()
+        stop_event.set()
+        subscription = provider_ws.SpotTickerSubscription(
+            local_symbol="BTCUSDT",
+            provider=provider_ws.PROVIDER_BITGET_SPOT,
+            provider_symbol="BTCUSDT",
+        )
+
+        await service._ticker_loop(subscription, stop_event, 1)
+        assert calls == 0
+
+    asyncio.run(run())
 
 
 def test_cache_metadata_helper_fresh_stale_missing_and_defaults() -> None:
