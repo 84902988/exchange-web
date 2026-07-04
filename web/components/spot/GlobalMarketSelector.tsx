@@ -22,6 +22,7 @@ import { useLocaleContext } from '@/contexts/LocaleContext';
 
 type MarketLayerTab = 'favorites' | 'crypto' | 'stock' | 'cfd';
 type ToolbarPageType = 'spot' | 'contract';
+type SpotChartMode = 'time' | 'candle';
 type PairCategory = 'all' | 'spot' | 'contract' | 'platform' | 'rwa';
 type StockCategory = 'all' | 'stock_contract';
 type ContractCategory = 'all' | 'metal' | 'commodity' | 'index' | 'forex';
@@ -86,8 +87,10 @@ export interface GlobalMarketSelectorPair {
 interface GlobalMarketSelectorProps {
   symbol: string;
   interval: string;
+  chartMode?: SpotChartMode;
   onSymbolChange: (value: string) => void;
   onIntervalChange: (value: string) => void;
+  onChartModeChange?: (value: SpotChartMode) => void;
   symbols: string[];
   symbolLabels?: Record<string, string>;
   pairs?: GlobalMarketSelectorPair[];
@@ -872,8 +875,10 @@ async function fetchAllContractToolbarPairs(params: {
 export default function GlobalMarketSelector({
   symbol,
   interval,
+  chartMode = 'candle',
   onSymbolChange,
   onIntervalChange,
+  onChartModeChange,
   symbols,
   symbolLabels,
   pairs,
@@ -1015,6 +1020,7 @@ export default function GlobalMarketSelector({
     () => (currentPair && (isStockContractPair(currentPair) || isTradfiCfdPair(currentPair)) ? TRADFI_INTERVALS : intervals),
     [currentPair],
   );
+  const showTimeSharing = pageType === 'spot' && Boolean(onChartModeChange);
 
   useEffect(() => {
     if (intervalOptions.includes(interval)) return;
@@ -1932,13 +1938,29 @@ export default function GlobalMarketSelector({
       </div>
 
       <div className="flex shrink-0 items-center gap-2 overflow-x-auto">
+        {showTimeSharing ? (
+          <button
+            type="button"
+            onClick={() => onChartModeChange?.('time')}
+            className={`rounded-md px-3 py-1.5 text-sm transition-colors ${
+              chartMode === 'time'
+                ? 'bg-[#2b3139] text-white'
+                : 'text-gray-400 hover:bg-[#1a1f27] hover:text-white'
+            }`}
+          >
+            {t('timeSharing', 'contracts')}
+          </button>
+        ) : null}
         {intervalOptions.map((item) => {
-          const active = interval === item;
+          const active = chartMode !== 'time' && interval === item;
           return (
             <button
               key={item}
               type="button"
-              onClick={() => onIntervalChange(item)}
+              onClick={() => {
+                onChartModeChange?.('candle');
+                onIntervalChange(item);
+              }}
               className={`rounded-md px-3 py-1.5 text-sm transition-colors ${
                 active
                   ? 'bg-[#2b3139] text-white'
