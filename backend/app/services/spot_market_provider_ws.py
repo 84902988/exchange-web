@@ -24,12 +24,13 @@ logger = logging.getLogger(__name__)
 SPOT_PROVIDER_WS_SOURCE = "LIVE_WS"
 SPOT_PROVIDER_WS_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
 SPOT_PROVIDER_WS_DEPTH_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
-SPOT_PROVIDER_WS_TICKER_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
+SPOT_PROVIDER_WS_TICKER_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
 SPOT_PROVIDER_WS_TRADES_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
 SPOT_PROVIDER_WS_KLINE_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
 BITGET_SPOT_DEPTH_CHANNEL = "books15"
 OKX_SPOT_DEPTH_CHANNEL = "books5"
 BITGET_SPOT_TICKER_CHANNEL = "ticker"
+OKX_SPOT_TICKER_CHANNEL = "tickers"
 BITGET_SPOT_TRADES_CHANNEL = "trade"
 BITGET_SPOT_KLINE_CHANNELS = {
     "1m": "candle1m",
@@ -608,6 +609,86 @@ def normalize_bitget_ticker_message(
     }
 
 
+def normalize_okx_ticker_message(
+    message: dict[str, Any],
+    *,
+    local_symbol: str,
+    provider_symbol: str,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(message, dict) or message.get("event"):
+        return None
+    data = message.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+    row = data[0]
+    if not isinstance(row, dict):
+        return None
+
+    last_price = _to_decimal(row.get("last"))
+    if last_price is None or last_price <= 0:
+        return None
+    open_24h = _to_decimal(row.get("open24h")) or last_price
+    if open_24h <= 0:
+        open_24h = last_price
+    high_24h = _to_decimal(row.get("high24h")) or last_price
+    low_24h = _to_decimal(row.get("low24h")) or last_price
+    base_volume = _to_decimal(row.get("vol24h")) or Decimal("0")
+    quote_volume = _to_decimal(row.get("volCcy24h")) or Decimal("0")
+    if quote_volume <= 0 and base_volume > 0:
+        quote_volume = base_volume * last_price
+    price_change_24h = last_price - open_24h if open_24h > 0 else Decimal("0")
+    price_change_percent = (
+        (price_change_24h / open_24h) * Decimal("100")
+        if open_24h > 0
+        else Decimal("0")
+    )
+    bid_price = _to_decimal(row.get("bidPx"))
+    ask_price = _to_decimal(row.get("askPx"))
+    bid_amount = _to_decimal(row.get("bidSz"))
+    ask_amount = _to_decimal(row.get("askSz"))
+    last_amount = _to_decimal(row.get("lastSz"))
+
+    now_ms = _now_ms()
+    exchange_ts = _spot_provider_ts(row.get("ts"))
+    record = {
+        "symbol": normalize_spot_ws_symbol(local_symbol),
+        "provider": PROVIDER_OKX_SPOT,
+        "provider_symbol": str(provider_symbol or "").strip().upper(),
+        "source": SPOT_PROVIDER_WS_SOURCE,
+        "last_price": _decimal_to_str(last_price),
+        "price": _decimal_to_str(last_price),
+        "display_price": _decimal_to_str(last_price),
+        "open_24h": _decimal_to_str(open_24h),
+        "price_change_24h": _decimal_to_str(price_change_24h),
+        "price_change_percent": _decimal_to_str(price_change_percent),
+        "price_change_percent_24h": _decimal_to_str(price_change_percent),
+        "high_24h": _decimal_to_str(high_24h),
+        "low_24h": _decimal_to_str(low_24h),
+        "base_volume_24h": _decimal_to_str(base_volume),
+        "volume_24h": _decimal_to_str(base_volume),
+        "quote_volume_24h": _decimal_to_str(quote_volume),
+        "quote_source": SPOT_PROVIDER_WS_SOURCE,
+        "quote_freshness": "LIVE",
+        "freshness": "LIVE",
+        "stale": False,
+        "market_status": "OPEN",
+        "ts": exchange_ts,
+        "updated_at_ms": now_ms,
+        "updated_at": datetime.utcfromtimestamp(now_ms / 1000).isoformat(),
+    }
+    if bid_price is not None and bid_price > 0:
+        record["bid_price"] = _decimal_to_str(bid_price)
+    if ask_price is not None and ask_price > 0:
+        record["ask_price"] = _decimal_to_str(ask_price)
+    if bid_amount is not None and bid_amount >= 0:
+        record["bid_amount"] = _decimal_to_str(bid_amount)
+    if ask_amount is not None and ask_amount >= 0:
+        record["ask_amount"] = _decimal_to_str(ask_amount)
+    if last_amount is not None and last_amount >= 0:
+        record["last_amount"] = _decimal_to_str(last_amount)
+    return record
+
+
 class SpotMarketProviderWsService:
     def __init__(self) -> None:
         self._depth_cache: dict[tuple[str, str], dict[str, Any]] = {}
@@ -762,7 +843,8 @@ class SpotMarketProviderWsService:
             return
         payload = deepcopy(record)
         payload["symbol"] = normalized_symbol
-        payload.setdefault("provider", PROVIDER_BITGET_SPOT)
+        provider_code = normalize_spot_ws_provider(payload.get("provider"))
+        payload.setdefault("provider", provider_code)
         payload.setdefault("source", SPOT_PROVIDER_WS_SOURCE)
         payload.setdefault("quote_freshness", "LIVE")
         payload.setdefault("stale", False)
@@ -770,7 +852,7 @@ class SpotMarketProviderWsService:
         payload.setdefault("ts", payload["updated_at_ms"])
         payload.setdefault("updated_at", datetime.utcfromtimestamp(int(payload["updated_at_ms"]) / 1000).isoformat())
         with self._lock:
-            self._ticker_cache[(PROVIDER_BITGET_SPOT, normalized_symbol)] = payload
+            self._ticker_cache[(provider_code, normalized_symbol)] = payload
 
     def set_trades_cache_for_tests(self, record: dict[str, Any]) -> None:
         normalized_symbol = normalize_spot_ws_symbol(record.get("symbol"))
@@ -838,7 +920,7 @@ class SpotMarketProviderWsService:
         if spot_provider_ws_supports_provider(provider_code, domain="depth"):
             self._ensure_depth_symbol(local_symbol, provider=provider_code)
         if spot_provider_ws_supports_provider(provider_code, domain="ticker"):
-            self._ensure_ticker_symbol(local_symbol)
+            self._ensure_ticker_symbol(local_symbol, provider=provider_code)
         if spot_provider_ws_supports_provider(provider_code, domain="trades"):
             self._ensure_trades_symbol(local_symbol)
 
@@ -890,9 +972,12 @@ class SpotMarketProviderWsService:
             self._depth_tasks[key] = thread
             thread.start()
 
-    def _ensure_ticker_symbol(self, local_symbol: str) -> None:
-        provider_symbol = local_symbol
-        key = (PROVIDER_BITGET_SPOT, local_symbol)
+    def _ensure_ticker_symbol(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
+        provider_code = normalize_spot_ws_provider(provider)
+        if not spot_provider_ws_supports_provider(provider_code, domain="ticker"):
+            return
+        provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
+        key = (provider_code, local_symbol)
         with self._lock:
             task = self._ticker_tasks.get(key)
             if task is not None and task.is_alive():
@@ -903,14 +988,24 @@ class SpotMarketProviderWsService:
             self._ticker_stops[key] = stop_event
             subscription = SpotTickerSubscription(
                 local_symbol=local_symbol,
-                provider=PROVIDER_BITGET_SPOT,
+                provider=provider_code,
                 provider_symbol=provider_symbol,
-                ws_url=str(getattr(settings, "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL", "") or "").strip(),
+                channel=OKX_SPOT_TICKER_CHANNEL if provider_code == PROVIDER_OKX_SPOT else BITGET_SPOT_TICKER_CHANNEL,
+                ws_url=str(
+                    getattr(
+                        settings,
+                        "SPOT_PROVIDER_WS_OKX_PUBLIC_URL"
+                        if provider_code == PROVIDER_OKX_SPOT
+                        else "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL",
+                        "",
+                    )
+                    or ""
+                ).strip(),
             )
             thread = threading.Thread(
                 target=self._run_ticker_thread,
                 args=(subscription, stop_event, generation),
-                name=f"spot-ticker-ws-{local_symbol}",
+                name=f"spot-ticker-ws-{provider_code}-{local_symbol}",
                 daemon=True,
             )
             self._ticker_tasks[key] = thread
@@ -981,7 +1076,7 @@ class SpotMarketProviderWsService:
         if spot_provider_ws_supports_provider(provider_code, domain="depth"):
             self._stop_depth_subscription(local_symbol, provider=provider_code)
         if spot_provider_ws_supports_provider(provider_code, domain="ticker"):
-            self._stop_ticker_subscription(local_symbol)
+            self._stop_ticker_subscription(local_symbol, provider=provider_code)
         if spot_provider_ws_supports_provider(provider_code, domain="trades"):
             self._stop_trades_subscription(local_symbol)
         if spot_provider_ws_supports_provider(provider_code, domain="kline"):
@@ -1037,8 +1132,9 @@ class SpotMarketProviderWsService:
         if task is not None and task.is_alive() and task is not threading.current_thread():
             task.join(timeout=2.0)
 
-    def _stop_ticker_subscription(self, local_symbol: str) -> None:
-        key = (PROVIDER_BITGET_SPOT, local_symbol)
+    def _stop_ticker_subscription(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
+        provider_code = normalize_spot_ws_provider(provider)
+        key = (provider_code, local_symbol)
         with self._lock:
             stop_event = self._ticker_stops.pop(key, None)
             task = self._ticker_tasks.pop(key, None)
@@ -1382,7 +1478,10 @@ class SpotMarketProviderWsService:
     ) -> None:
         while not stop_event.is_set():
             try:
-                await self._run_bitget_ticker_ws(subscription, stop_event, generation)
+                if subscription.provider == PROVIDER_OKX_SPOT:
+                    await self._run_okx_ticker_ws(subscription, stop_event, generation)
+                else:
+                    await self._run_bitget_ticker_ws(subscription, stop_event, generation)
             except Exception as exc:
                 if _is_provider_ws_shutdown_noise(exc, stop_event):
                     return
@@ -1641,6 +1740,71 @@ class SpotMarketProviderWsService:
                     subscription.provider_symbol,
                 )
 
+    async def _run_okx_ticker_ws(
+        self,
+        subscription: SpotTickerSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if stop_event.is_set():
+            return
+        url = str(subscription.ws_url or "").strip()
+        if not url:
+            raise ValueError("SPOT_PROVIDER_WS_OKX_PUBLIC_URL is required")
+
+        subscribe_payload = {
+            "op": "subscribe",
+            "args": [
+                {
+                    "channel": subscription.channel,
+                    "instId": subscription.provider_symbol,
+                }
+            ],
+        }
+        key = (subscription.provider, subscription.local_symbol)
+        async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5) as websocket:
+            if stop_event.is_set():
+                await websocket.close()
+                return
+            loop = asyncio.get_running_loop()
+            with self._lock:
+                if self._ticker_generations.get(key) != generation:
+                    stop_event.set()
+                    return
+                self._ticker_connections[key] = (loop, websocket)
+            logger.info(
+                "spot_provider_ws_ticker_subscription_started provider=%s symbol=%s provider_symbol=%s channel=%s",
+                subscription.provider,
+                subscription.local_symbol,
+                subscription.provider_symbol,
+                subscription.channel,
+            )
+            try:
+                await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                last_ping_at = time.monotonic()
+                while not stop_event.is_set():
+                    if time.monotonic() - last_ping_at >= 25:
+                        await websocket.send("ping")
+                        last_ping_at = time.monotonic()
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    if raw_message == "pong":
+                        continue
+                    self._handle_okx_ticker_message(subscription, raw_message, generation)
+            finally:
+                with self._lock:
+                    current = self._ticker_connections.get(key)
+                    if current is not None and current[1] is websocket:
+                        self._ticker_connections.pop(key, None)
+                logger.info(
+                    "spot_provider_ws_ticker_subscription_stopped provider=%s symbol=%s provider_symbol=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.provider_symbol,
+                )
+
     async def _run_bitget_trades_ws(
         self,
         subscription: SpotTradesSubscription,
@@ -1837,6 +2001,30 @@ class SpotMarketProviderWsService:
             logger.debug("spot_provider_ws_bitget_ticker_invalid_json symbol=%s", subscription.local_symbol)
             return
         record = normalize_bitget_ticker_message(
+            message,
+            local_symbol=subscription.local_symbol,
+            provider_symbol=subscription.provider_symbol,
+        )
+        if record is None:
+            return
+        key = (subscription.provider, subscription.local_symbol)
+        with self._lock:
+            if self._ticker_generations.get(key) != generation:
+                return
+            self._ticker_cache[key] = record
+
+    def _handle_okx_ticker_message(
+        self,
+        subscription: SpotTickerSubscription,
+        raw_message: Any,
+        generation: int,
+    ) -> None:
+        try:
+            message = json.loads(raw_message)
+        except Exception:
+            logger.debug("spot_provider_ws_okx_ticker_invalid_json symbol=%s", subscription.local_symbol)
+            return
+        record = normalize_okx_ticker_message(
             message,
             local_symbol=subscription.local_symbol,
             provider_symbol=subscription.provider_symbol,

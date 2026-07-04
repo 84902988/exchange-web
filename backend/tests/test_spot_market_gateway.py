@@ -968,7 +968,7 @@ def test_external_spot_ticker_prefers_live_ws() -> None:
         market.request_contract_market_provider_json = original_request_json
 
 
-def test_primary_okx_spot_skips_bitget_live_ws_and_uses_rest_provider() -> None:
+def test_primary_okx_spot_uses_okx_ticker_live_ws() -> None:
     class Pair:
         symbol = "BTCUSDT"
         data_source = market.DATA_SOURCE_BINANCE
@@ -986,8 +986,66 @@ def test_primary_okx_spot_skips_bitget_live_ws_and_uses_rest_provider() -> None:
 
     try:
         market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (okx, bitget)
-        market.get_spot_provider_ws_ticker = lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("Bitget LIVE_WS must not be read when OKX_SPOT is primary")
+        market.get_spot_provider_ws_ticker = lambda symbol, **kwargs: (
+            {
+                "symbol": "BTCUSDT",
+                "provider": market.PROVIDER_OKX_SPOT,
+                "source": "LIVE_WS",
+                "last_price": "10",
+                "open_24h": "8",
+                "price_change_24h": "2",
+                "price_change_percent": "25",
+                "high_24h": "11",
+                "low_24h": "7",
+                "base_volume_24h": "2",
+                "quote_volume_24h": "20",
+                "updated_at": "2026-07-05T00:00:00",
+            }
+            if kwargs.get("provider") == market.PROVIDER_OKX_SPOT
+            else (_ for _ in ()).throw(AssertionError("ticker WS must use primary OKX_SPOT provider"))
+        )
+        market._spot_provider_symbol = lambda db, pair, provider: "BTC-USDT"
+        market.request_contract_market_provider_json = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("REST request should not be called when OKX ticker LIVE_WS is fresh")
+        )
+        market.mark_contract_market_provider_success = lambda *args, **kwargs: None
+
+        ticker = market._get_external_spot_ticker(None, Pair())
+        assert ticker is not None
+        assert ticker.provider == market.PROVIDER_OKX_SPOT
+        assert ticker.source == "LIVE_WS"
+        assert ticker.last_price == "10.00"
+        assert ticker.price_change_percent == "25.00"
+    finally:
+        market.get_spot_provider_ws_ticker = original_get_ws_ticker
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market._spot_provider_symbol = original_spot_provider_symbol
+        market.request_contract_market_provider_json = original_request_json
+        market.mark_contract_market_provider_success = original_mark_success
+
+
+def test_primary_okx_spot_ticker_live_ws_miss_falls_back_to_okx_rest() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    okx = _spot_provider(market.PROVIDER_OKX_SPOT, priority=1)
+    bitget = _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2)
+
+    original_get_ws_ticker = market.get_spot_provider_ws_ticker
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_spot_provider_symbol = market._spot_provider_symbol
+    original_request_json = market.request_contract_market_provider_json
+    original_mark_success = market.mark_contract_market_provider_success
+
+    try:
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (okx, bitget)
+        market.get_spot_provider_ws_ticker = lambda symbol, **kwargs: (
+            None
+            if kwargs.get("provider") == market.PROVIDER_OKX_SPOT
+            else (_ for _ in ()).throw(AssertionError("must not steal Bitget ticker LIVE_WS when OKX is primary"))
         )
         market._spot_provider_symbol = lambda db, pair, provider: "BTC-USDT"
 
