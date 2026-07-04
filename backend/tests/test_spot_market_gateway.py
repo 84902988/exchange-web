@@ -348,6 +348,77 @@ def test_gateway_okx_primary_ensures_depth_without_kline() -> None:
     asyncio.run(run())
 
 
+def test_gateway_okx_primary_broadcasts_depth_ticker_trades_without_kline() -> None:
+    class OkxProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.depth = DepthResponse(
+                symbol="BTCUSDT",
+                bids=[DepthItem(price="2", amount="1")],
+                asks=[DepthItem(price="3", amount="1")],
+                ts=1000,
+                provider=market.PROVIDER_OKX_SPOT,
+                source="LIVE_WS",
+                fetched_at=1000,
+            )
+
+        def get_ticker(self, symbol: str, **kwargs) -> dict:
+            ticker = super().get_ticker(symbol, **kwargs)
+            ticker["provider"] = market.PROVIDER_OKX_SPOT
+            return ticker
+
+        def get_trades(self, symbol: str, **kwargs) -> TradesResponse:
+            return TradesResponse(
+                symbol="BTCUSDT",
+                provider=market.PROVIDER_OKX_SPOT,
+                source="LIVE_WS",
+                freshness="LIVE",
+                trades=[
+                    TradeItem(
+                        id="okx-trade-1",
+                        price="2.1234",
+                        amount="1.2345",
+                        side="BUY",
+                        ts=1000,
+                    )
+                ],
+            )
+
+        def get_klines(self, symbol: str, interval: str, **kwargs) -> dict:
+            raise AssertionError("OKX kline WS must not be read")
+
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = OkxProvider()
+        ensured_klines: list[tuple[str, str]] = []
+        gateway = SpotMarketGateway(
+            ensure_depth=provider.ensure,
+            ensure_kline=lambda symbol, interval: ensured_klines.append((symbol, interval)),
+            release_depth=provider.release,
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+        )
+        gateway._select_provider_ws_code = lambda symbol: market.PROVIDER_OKX_SPOT
+        gateway._provider_symbol_allowed_async = lambda symbol: asyncio.sleep(0, result=True)
+
+        ws_manager.count = 1
+        await gateway.ensure_symbol("BTC/USDT", interval="1m")
+        await asyncio.sleep(0.05)
+
+        assert provider.ensured == ["BTCUSDT"]
+        assert ensured_klines == []
+        assert ws_manager.broadcasts[-1][1].provider == market.PROVIDER_OKX_SPOT
+        assert ws_manager.ticker_broadcasts[-1][1]["provider"] == market.PROVIDER_OKX_SPOT
+        assert ws_manager.trade_broadcasts[-1]["trade_id"] == "okx-trade-1"
+        assert ws_manager.kline_broadcasts == []
+
+    asyncio.run(run())
+
+
 def test_gateway_depth_broadcast_state_dedupes_and_isolates_symbols() -> None:
     async def run() -> None:
         gateway = _new_test_gateway()
@@ -1286,7 +1357,7 @@ def test_get_trades_prefers_live_ws_and_falls_back_to_rest() -> None:
         market.mark_contract_market_provider_success = original_mark_success
 
 
-def test_okx_primary_trades_skip_live_ws_and_use_rest_fallback() -> None:
+def test_okx_primary_trades_use_live_ws_without_bitget_cache() -> None:
     class Pair:
         symbol = "BTCUSDT"
         data_source = market.DATA_SOURCE_BINANCE
@@ -1305,21 +1376,86 @@ def test_okx_primary_trades_skip_live_ws_and_use_rest_fallback() -> None:
             _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
             _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
         )
-        market.get_spot_provider_ws_trades = lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("OKX_SPOT trades WS is not implemented and must not be read")
+        market.get_spot_provider_ws_trades = lambda symbol, **kwargs: (
+            TradesResponse(
+                symbol="BTCUSDT",
+                provider=market.PROVIDER_OKX_SPOT,
+                source="LIVE_WS",
+                freshness="LIVE",
+                trades=[
+                    TradeItem(id="okx-live-1", price="3.456", amount="2.3456", side="SELL", ts=2000),
+                ],
+            )
+            if kwargs.get("provider") == market.PROVIDER_OKX_SPOT
+            else (_ for _ in ()).throw(AssertionError("must not steal Bitget trades LIVE_WS when OKX is primary"))
         )
         market._spot_provider_symbol = lambda *args, **kwargs: "BTC-USDT"
         market.mark_contract_market_provider_success = lambda *args, **kwargs: None
-        market.request_contract_market_provider_json = lambda provider, endpoint_type, provider_symbol, **kwargs: {
-            "data": [
-                {
-                    "px": "3.456",
-                    "sz": "2.3456",
-                    "side": "sell",
-                    "ts": "2000",
-                }
-            ]
-        }
+        market.request_contract_market_provider_json = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("REST request should not be called when OKX trades LIVE_WS is fresh")
+        )
+
+        result = market.get_trades(None, "BTCUSDT", limit=30)
+        assert result.provider == market.PROVIDER_OKX_SPOT
+        assert result.source == "LIVE_WS"
+        assert result.freshness == "LIVE"
+        assert result.trades[0].id == "okx-live-1"
+        assert result.trades[0].price == "3.46"
+        assert result.trades[0].amount == "2.346"
+        assert result.trades[0].side == "SELL"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_trades = original_get_ws_trades
+        market._spot_provider_symbol = original_spot_provider_symbol
+        market.request_contract_market_provider_json = original_request_json
+        market.mark_contract_market_provider_success = original_mark_success
+
+
+def test_okx_primary_trades_live_ws_miss_falls_back_to_okx_rest() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_trades = market.get_spot_provider_ws_trades
+    original_spot_provider_symbol = market._spot_provider_symbol
+    original_request_json = market.request_contract_market_provider_json
+    original_mark_success = market.mark_contract_market_provider_success
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
+            _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
+            _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
+        )
+        market.get_spot_provider_ws_trades = lambda symbol, **kwargs: (
+            None
+            if kwargs.get("provider") == market.PROVIDER_OKX_SPOT
+            else (_ for _ in ()).throw(AssertionError("must not steal Bitget trades LIVE_WS when OKX is primary"))
+        )
+        market._spot_provider_symbol = lambda *args, **kwargs: "BTC-USDT"
+        market.mark_contract_market_provider_success = lambda *args, **kwargs: None
+
+        def request_json(provider, endpoint_type, provider_symbol, **kwargs):
+            assert provider.provider_code == market.PROVIDER_OKX_SPOT
+            assert endpoint_type == "trades"
+            assert provider_symbol == "BTC-USDT"
+            return {
+                "data": [
+                    {
+                        "tradeId": "okx-rest-1",
+                        "px": "3.456",
+                        "sz": "2.3456",
+                        "side": "sell",
+                        "ts": "2000",
+                    }
+                ]
+            }
+
+        market.request_contract_market_provider_json = request_json
 
         result = market.get_trades(None, "BTCUSDT", limit=30)
         assert result.provider == market.PROVIDER_OKX_SPOT

@@ -25,13 +25,14 @@ SPOT_PROVIDER_WS_SOURCE = "LIVE_WS"
 SPOT_PROVIDER_WS_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
 SPOT_PROVIDER_WS_DEPTH_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
 SPOT_PROVIDER_WS_TICKER_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
-SPOT_PROVIDER_WS_TRADES_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
+SPOT_PROVIDER_WS_TRADES_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
 SPOT_PROVIDER_WS_KLINE_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
 BITGET_SPOT_DEPTH_CHANNEL = "books15"
 OKX_SPOT_DEPTH_CHANNEL = "books5"
 BITGET_SPOT_TICKER_CHANNEL = "ticker"
 OKX_SPOT_TICKER_CHANNEL = "tickers"
 BITGET_SPOT_TRADES_CHANNEL = "trade"
+OKX_SPOT_TRADES_CHANNEL = "trades"
 BITGET_SPOT_KLINE_CHANNELS = {
     "1m": "candle1m",
     "5m": "candle5m",
@@ -548,6 +549,62 @@ def normalize_bitget_trade_message(
     }
 
 
+def normalize_okx_trade_message(
+    message: dict[str, Any],
+    *,
+    local_symbol: str,
+    provider_symbol: str,
+    trades_limit: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(message, dict) or message.get("event"):
+        return None
+    data = message.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+
+    trades: list[dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        price = _to_decimal(row.get("px"))
+        amount = _to_decimal(row.get("sz"))
+        if price is None or amount is None or price <= 0 or amount <= 0:
+            continue
+        side_text = str(row.get("side") or "").upper()
+        trade_id = str(row.get("tradeId") or "").strip()
+        ts = _spot_provider_ts(row.get("ts"))
+        trades.append(
+            {
+                "id": trade_id,
+                "trade_id": trade_id,
+                "provider_trade_id": trade_id,
+                "price": _decimal_to_str(price),
+                "amount": _decimal_to_str(amount),
+                "side": "SELL" if side_text == "SELL" else "BUY",
+                "ts": ts,
+                "created_at": datetime.utcfromtimestamp(ts / 1000).isoformat(),
+                "raw_trade": deepcopy(row),
+            }
+        )
+
+    if not trades:
+        return None
+    trade_limit = _trades_limit(trades_limit)
+    trades.sort(key=lambda item: int(item.get("ts") or 0), reverse=True)
+    now_ms = _now_ms()
+    return {
+        "symbol": normalize_spot_ws_symbol(local_symbol),
+        "provider": PROVIDER_OKX_SPOT,
+        "provider_symbol": str(provider_symbol or "").strip().upper(),
+        "source": SPOT_PROVIDER_WS_SOURCE,
+        "freshness": "LIVE",
+        "trades": trades[:trade_limit],
+        "ts": int(trades[0].get("ts") or now_ms),
+        "updated_at_ms": now_ms,
+        "updated_at": datetime.utcfromtimestamp(now_ms / 1000).isoformat(),
+    }
+
+
 def normalize_bitget_ticker_message(
     message: dict[str, Any],
     *,
@@ -860,7 +917,8 @@ class SpotMarketProviderWsService:
             return
         payload = deepcopy(record)
         payload["symbol"] = normalized_symbol
-        payload.setdefault("provider", PROVIDER_BITGET_SPOT)
+        provider_code = normalize_spot_ws_provider(payload.get("provider"))
+        payload.setdefault("provider", provider_code)
         payload.setdefault("source", SPOT_PROVIDER_WS_SOURCE)
         payload.setdefault("freshness", "LIVE")
         payload.setdefault("updated_at_ms", _now_ms())
@@ -868,7 +926,7 @@ class SpotMarketProviderWsService:
         payload.setdefault("updated_at", datetime.utcfromtimestamp(int(payload["updated_at_ms"]) / 1000).isoformat())
         payload["trades"] = list(payload.get("trades") or [])[:_trades_limit()]
         with self._lock:
-            self._trades_cache[(PROVIDER_BITGET_SPOT, normalized_symbol)] = payload
+            self._trades_cache[(provider_code, normalized_symbol)] = payload
 
     def set_kline_cache_for_tests(self, record: dict[str, Any]) -> None:
         normalized_symbol = normalize_spot_ws_symbol(record.get("symbol"))
@@ -922,7 +980,7 @@ class SpotMarketProviderWsService:
         if spot_provider_ws_supports_provider(provider_code, domain="ticker"):
             self._ensure_ticker_symbol(local_symbol, provider=provider_code)
         if spot_provider_ws_supports_provider(provider_code, domain="trades"):
-            self._ensure_trades_symbol(local_symbol)
+            self._ensure_trades_symbol(local_symbol, provider=provider_code)
 
     def ensure_kline(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
         local_symbol = normalize_spot_ws_symbol(symbol)
@@ -1011,9 +1069,12 @@ class SpotMarketProviderWsService:
             self._ticker_tasks[key] = thread
             thread.start()
 
-    def _ensure_trades_symbol(self, local_symbol: str) -> None:
-        provider_symbol = local_symbol
-        key = (PROVIDER_BITGET_SPOT, local_symbol)
+    def _ensure_trades_symbol(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
+        provider_code = normalize_spot_ws_provider(provider)
+        if not spot_provider_ws_supports_provider(provider_code, domain="trades"):
+            return
+        provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
+        key = (provider_code, local_symbol)
         with self._lock:
             task = self._trades_tasks.get(key)
             if task is not None and task.is_alive():
@@ -1024,15 +1085,25 @@ class SpotMarketProviderWsService:
             self._trades_stops[key] = stop_event
             subscription = SpotTradesSubscription(
                 local_symbol=local_symbol,
-                provider=PROVIDER_BITGET_SPOT,
+                provider=provider_code,
                 provider_symbol=provider_symbol,
                 trades_limit=_trades_limit(),
-                ws_url=str(getattr(settings, "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL", "") or "").strip(),
+                channel=OKX_SPOT_TRADES_CHANNEL if provider_code == PROVIDER_OKX_SPOT else BITGET_SPOT_TRADES_CHANNEL,
+                ws_url=str(
+                    getattr(
+                        settings,
+                        "SPOT_PROVIDER_WS_OKX_PUBLIC_URL"
+                        if provider_code == PROVIDER_OKX_SPOT
+                        else "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL",
+                        "",
+                    )
+                    or ""
+                ).strip(),
             )
             thread = threading.Thread(
                 target=self._run_trades_thread,
                 args=(subscription, stop_event, generation),
-                name=f"spot-trades-ws-{local_symbol}",
+                name=f"spot-trades-ws-{provider_code}-{local_symbol}",
                 daemon=True,
             )
             self._trades_tasks[key] = thread
@@ -1078,7 +1149,7 @@ class SpotMarketProviderWsService:
         if spot_provider_ws_supports_provider(provider_code, domain="ticker"):
             self._stop_ticker_subscription(local_symbol, provider=provider_code)
         if spot_provider_ws_supports_provider(provider_code, domain="trades"):
-            self._stop_trades_subscription(local_symbol)
+            self._stop_trades_subscription(local_symbol, provider=provider_code)
         if spot_provider_ws_supports_provider(provider_code, domain="kline"):
             self._stop_kline_subscriptions(local_symbol, provider=provider_code)
 
@@ -1113,8 +1184,9 @@ class SpotMarketProviderWsService:
         if task is not None and task.is_alive() and task is not threading.current_thread():
             task.join(timeout=2.0)
 
-    def _stop_trades_subscription(self, local_symbol: str) -> None:
-        key = (PROVIDER_BITGET_SPOT, local_symbol)
+    def _stop_trades_subscription(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
+        provider_code = normalize_spot_ws_provider(provider)
+        key = (provider_code, local_symbol)
         with self._lock:
             stop_event = self._trades_stops.pop(key, None)
             task = self._trades_tasks.pop(key, None)
@@ -1504,7 +1576,10 @@ class SpotMarketProviderWsService:
     ) -> None:
         while not stop_event.is_set():
             try:
-                await self._run_bitget_trades_ws(subscription, stop_event, generation)
+                if subscription.provider == PROVIDER_OKX_SPOT:
+                    await self._run_okx_trades_ws(subscription, stop_event, generation)
+                else:
+                    await self._run_bitget_trades_ws(subscription, stop_event, generation)
             except Exception as exc:
                 if _is_provider_ws_shutdown_noise(exc, stop_event):
                     return
@@ -1871,6 +1946,71 @@ class SpotMarketProviderWsService:
                     subscription.provider_symbol,
                 )
 
+    async def _run_okx_trades_ws(
+        self,
+        subscription: SpotTradesSubscription,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if stop_event.is_set():
+            return
+        url = str(subscription.ws_url or "").strip()
+        if not url:
+            raise ValueError("SPOT_PROVIDER_WS_OKX_PUBLIC_URL is required")
+
+        subscribe_payload = {
+            "op": "subscribe",
+            "args": [
+                {
+                    "channel": subscription.channel,
+                    "instId": subscription.provider_symbol,
+                }
+            ],
+        }
+        key = (subscription.provider, subscription.local_symbol)
+        async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5) as websocket:
+            if stop_event.is_set():
+                await websocket.close()
+                return
+            loop = asyncio.get_running_loop()
+            with self._lock:
+                if self._trades_generations.get(key) != generation:
+                    stop_event.set()
+                    return
+                self._trades_connections[key] = (loop, websocket)
+            logger.info(
+                "spot_provider_ws_trades_subscription_started provider=%s symbol=%s provider_symbol=%s channel=%s",
+                subscription.provider,
+                subscription.local_symbol,
+                subscription.provider_symbol,
+                subscription.channel,
+            )
+            try:
+                await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                last_ping_at = time.monotonic()
+                while not stop_event.is_set():
+                    if time.monotonic() - last_ping_at >= 25:
+                        await websocket.send("ping")
+                        last_ping_at = time.monotonic()
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    if raw_message == "pong":
+                        continue
+                    self._handle_okx_trades_message(subscription, raw_message, generation)
+            finally:
+                with self._lock:
+                    current = self._trades_connections.get(key)
+                    if current is not None and current[1] is websocket:
+                        self._trades_connections.pop(key, None)
+                logger.info(
+                    "spot_provider_ws_trades_subscription_stopped provider=%s symbol=%s provider_symbol=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.provider_symbol,
+                )
+
     async def _run_bitget_kline_ws(
         self,
         subscription: SpotKlineSubscription,
@@ -2037,6 +2177,38 @@ class SpotMarketProviderWsService:
                 return
             self._ticker_cache[key] = record
 
+    def _store_trades_record_locked(
+        self,
+        subscription: SpotTradesSubscription,
+        record: dict[str, Any],
+        generation: int,
+        *,
+        apply_to_active_klines: bool,
+    ) -> None:
+        key = (subscription.provider, subscription.local_symbol)
+        if self._trades_generations.get(key) != generation:
+            return
+        incoming_trades = list(record.get("trades") or [])
+        existing = self._trades_cache.get(key) or {}
+        combined = list(record.get("trades") or []) + list(existing.get("trades") or [])
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for trade in combined:
+            signature = _trade_signature(trade)
+            if not signature or signature in seen:
+                continue
+            seen.add(signature)
+            deduped.append(trade)
+            if len(deduped) >= subscription.trades_limit:
+                break
+        record["trades"] = deduped
+        self._trades_cache[key] = record
+        if apply_to_active_klines:
+            self._apply_provider_trades_to_active_klines_locked(
+                subscription,
+                incoming_trades,
+            )
+
     def _handle_bitget_trades_message(
         self,
         subscription: SpotTradesSubscription,
@@ -2056,29 +2228,30 @@ class SpotMarketProviderWsService:
         )
         if record is None:
             return
-        key = (subscription.provider, subscription.local_symbol)
         with self._lock:
-            if self._trades_generations.get(key) != generation:
-                return
-            incoming_trades = list(record.get("trades") or [])
-            existing = self._trades_cache.get(key) or {}
-            combined = list(record.get("trades") or []) + list(existing.get("trades") or [])
-            deduped: list[dict[str, Any]] = []
-            seen: set[str] = set()
-            for trade in combined:
-                signature = _trade_signature(trade)
-                if not signature or signature in seen:
-                    continue
-                seen.add(signature)
-                deduped.append(trade)
-                if len(deduped) >= subscription.trades_limit:
-                    break
-            record["trades"] = deduped
-            self._trades_cache[key] = record
-            self._apply_provider_trades_to_active_klines_locked(
-                subscription,
-                incoming_trades,
-            )
+            self._store_trades_record_locked(subscription, record, generation, apply_to_active_klines=True)
+
+    def _handle_okx_trades_message(
+        self,
+        subscription: SpotTradesSubscription,
+        raw_message: Any,
+        generation: int,
+    ) -> None:
+        try:
+            message = json.loads(raw_message)
+        except Exception:
+            logger.debug("spot_provider_ws_okx_trades_invalid_json symbol=%s", subscription.local_symbol)
+            return
+        record = normalize_okx_trade_message(
+            message,
+            local_symbol=subscription.local_symbol,
+            provider_symbol=subscription.provider_symbol,
+            trades_limit=subscription.trades_limit,
+        )
+        if record is None:
+            return
+        with self._lock:
+            self._store_trades_record_locked(subscription, record, generation, apply_to_active_klines=False)
 
     def _handle_bitget_kline_message(
         self,

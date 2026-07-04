@@ -8,9 +8,14 @@ from app.services import spot_market_domain_cache as domain_cache
 from app.services import spot_market_provider_ws as provider_ws
 
 
-def _activate_provider_trades(service: provider_ws.SpotMarketProviderWsService, symbol: str = "BTCUSDT") -> None:
+def _activate_provider_trades(
+    service: provider_ws.SpotMarketProviderWsService,
+    symbol: str = "BTCUSDT",
+    *,
+    provider: str = provider_ws.PROVIDER_BITGET_SPOT,
+) -> None:
     with service._lock:
-        service._trades_generations[(provider_ws.PROVIDER_BITGET_SPOT, symbol)] = 1
+        service._trades_generations[(provider, symbol)] = 1
 
 
 def _activate_provider_kline(
@@ -48,6 +53,32 @@ def _handle_trades(
     )
 
 
+def _handle_okx_trades(
+    service: provider_ws.SpotMarketProviderWsService,
+    trades: list[dict],
+    *,
+    symbol: str = "BTCUSDT",
+    provider_symbol: str = "BTC-USDT",
+) -> None:
+    subscription = provider_ws.SpotTradesSubscription(
+        local_symbol=symbol,
+        provider=provider_ws.PROVIDER_OKX_SPOT,
+        provider_symbol=provider_symbol,
+        trades_limit=30,
+        channel=provider_ws.OKX_SPOT_TRADES_CHANNEL,
+    )
+    service._handle_okx_trades_message(
+        subscription,
+        json.dumps(
+            {
+                "arg": {"channel": "trades", "instId": provider_symbol},
+                "data": trades,
+            }
+        ),
+        1,
+    )
+
+
 def test_normalize_spot_ws_symbol() -> None:
     assert provider_ws.normalize_spot_ws_symbol("BTC/USDT") == "BTCUSDT"
     assert provider_ws.normalize_spot_ws_symbol("btcusdt") == "BTCUSDT"
@@ -58,7 +89,7 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT)
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="depth")
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="ticker")
-    assert not provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="trades")
+    assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="trades")
     assert not provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="kline")
 
     service = provider_ws.SpotMarketProviderWsService()
@@ -82,7 +113,7 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
     ensure_calls: list[tuple[str, str, str | None]] = []
     service._ensure_depth_symbol = lambda symbol, provider=None: ensure_calls.append(("depth", symbol, provider))
     service._ensure_ticker_symbol = lambda symbol, provider=None: ensure_calls.append(("ticker", symbol, provider))
-    service._ensure_trades_symbol = lambda symbol: ensure_calls.append(("trades", symbol, None))
+    service._ensure_trades_symbol = lambda symbol, provider=None: ensure_calls.append(("trades", symbol, provider))
     service._ensure_kline_symbol = lambda symbol, interval: ensure_calls.append(("kline", symbol, interval))
 
     service.ensure_symbol("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT)
@@ -91,6 +122,7 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
     assert ensure_calls == [
         ("depth", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT),
         ("ticker", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT),
+        ("trades", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT),
     ]
 
 
@@ -513,6 +545,88 @@ def test_bitget_trade_message_normalize() -> None:
     assert record["trades"][0]["side"] == "SELL"
     assert record["trades"][1]["id"] == "1000000000"
     assert record["trades"][1]["side"] == "BUY"
+
+
+def test_okx_trade_message_normalize_cache_and_dedupe() -> None:
+    record = provider_ws.normalize_okx_trade_message(
+        {
+            "arg": {"channel": "trades", "instId": "BTC-USDT"},
+            "data": [
+                {
+                    "instId": "BTC-USDT",
+                    "tradeId": "1000000000",
+                    "px": "26293.4",
+                    "sz": "0.0013",
+                    "side": "buy",
+                    "ts": "1695709835822",
+                },
+                {
+                    "instId": "BTC-USDT",
+                    "tradeId": "1000000001",
+                    "px": "26294.1",
+                    "sz": "0.002",
+                    "side": "sell",
+                    "ts": "1695709835823",
+                },
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTC-USDT",
+        trades_limit=2,
+    )
+
+    assert record is not None
+    assert record["symbol"] == "BTCUSDT"
+    assert record["provider"] == provider_ws.PROVIDER_OKX_SPOT
+    assert record["provider_symbol"] == "BTC-USDT"
+    assert record["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert record["freshness"] == "LIVE"
+    assert record["trades"][0]["id"] == "1000000001"
+    assert record["trades"][0]["trade_id"] == "1000000001"
+    assert record["trades"][0]["provider_trade_id"] == "1000000001"
+    assert record["trades"][0]["price"] == "26294.1"
+    assert record["trades"][0]["amount"] == "0.002"
+    assert record["trades"][0]["side"] == "SELL"
+    assert record["trades"][1]["id"] == "1000000000"
+    assert record["trades"][1]["side"] == "BUY"
+    assert record["trades"][0]["raw_trade"]["instId"] == "BTC-USDT"
+
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_trades(service, provider=provider_ws.PROVIDER_OKX_SPOT)
+    _handle_okx_trades(
+        service,
+        [
+            {"tradeId": "t1", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+            {"tradeId": "t1", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+        ],
+    )
+
+    trades = service.get_fresh_trades("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT)
+    assert trades is not None
+    assert trades.provider == provider_ws.PROVIDER_OKX_SPOT
+    assert trades.source == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert trades.freshness == "LIVE"
+    assert len(trades.trades) == 1
+    assert trades.trades[0].id == "t1"
+    assert trades.trades[0].price == "100"
+    assert service.get_fresh_trades("BTCUSDT", provider=provider_ws.PROVIDER_BITGET_SPOT) is None
+
+
+def test_okx_trades_do_not_drive_provider_kline_cache() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_trades(service, provider=provider_ws.PROVIDER_OKX_SPOT)
+    service._apply_provider_trades_to_active_klines_locked = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("OKX provider trades must not update kline cache")
+    )
+
+    _handle_okx_trades(
+        service,
+        [{"tradeId": "t1", "px": "100", "sz": "1", "side": "buy", "ts": "1695709835822"}],
+    )
+
+    assert service.get_fresh_trades("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT) is not None
+    assert service.get_fresh_klines("BTCUSDT", "1m", provider=provider_ws.PROVIDER_OKX_SPOT) is None
+    assert service.get_fresh_klines("BTCUSDT", "1m", provider=provider_ws.PROVIDER_BITGET_SPOT) is None
 
 
 def test_bitget_kline_channel_mapping() -> None:
