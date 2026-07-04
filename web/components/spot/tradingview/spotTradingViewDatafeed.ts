@@ -135,6 +135,13 @@ type KlineGapState = {
   lastResetAt: number;
 };
 
+type KlineBackfillState = {
+  barTime: number;
+  latestBarTime: number;
+  requestedAt: number;
+  inFlight: boolean;
+};
+
 const SPOT_EXCHANGE_NAME = 'EXCHANGE';
 const SUPPORTED_RESOLUTIONS: TradingViewResolution[] = ['1', '5', '15', '60', '240', '1D'];
 const RESOLUTION_TO_SPOT_INTERVAL: Record<string, string> = {
@@ -164,6 +171,7 @@ const SPOT_INTERVAL_MS: Record<string, number> = {
   '1d': 24 * 60 * 60_000,
 };
 const KLINE_GAP_RESET_THROTTLE_MS = 3_000;
+const KLINE_GAP_BACKFILL_THROTTLE_MS = 3_000;
 
 const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
   supports_search: true,
@@ -295,10 +303,213 @@ export function createSpotTradingViewDatafeed(
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
   const gapStateByLatestBarKey = new Map<string, KlineGapState>();
+  const backfillStateByLatestBarKey = new Map<string, KlineBackfillState>();
   const unsubscribeByUid = new Map<string, () => void>();
 
   const getLatestBarKey = (resolution: TradingViewResolution | string) =>
     `${apiSymbol}:${normalizeResolution(resolution)}`;
+
+  const logKlineGapDebug = (payload: {
+    interval: string;
+    latestBarTime: number;
+    realtimeBarTime: number;
+    gapIntervals: number;
+    action: string;
+  }) => {
+    if (process.env.NODE_ENV === 'production') return;
+    console.debug('[SpotTradingViewDatafeed] kline gap', {
+      symbol: apiSymbol,
+      interval: payload.interval,
+      latestBarTime: payload.latestBarTime,
+      realtimeBarTime: payload.realtimeBarTime,
+      gapIntervals: payload.gapIntervals,
+      action: payload.action,
+    });
+  };
+
+  const resetKlineGap = (
+    latestBarKey: string,
+    interval: string,
+    intervalMs: number,
+    latestBar: TradingViewBar,
+    realtimeBar: TradingViewBar,
+    onResetCacheNeeded?: () => void,
+  ) => {
+    const now = Date.now();
+    const previousGap = gapStateByLatestBarKey.get(latestBarKey);
+    const shouldReset =
+      !previousGap ||
+      previousGap.barTime !== realtimeBar.time ||
+      previousGap.latestBarTime !== latestBar.time ||
+      now - previousGap.lastResetAt >= KLINE_GAP_RESET_THROTTLE_MS;
+
+    if (!shouldReset) return;
+
+    gapStateByLatestBarKey.set(latestBarKey, {
+      barTime: realtimeBar.time,
+      latestBarTime: latestBar.time,
+      lastResetAt: now,
+    });
+    const gapIntervals = Math.max(2, Math.round((realtimeBar.time - latestBar.time) / intervalMs));
+    onResetCacheNeeded?.();
+    options.onKlineGap?.({
+      symbol: apiSymbol,
+      interval,
+      barTime: realtimeBar.time,
+      latestBarTime: latestBar.time,
+      gapIntervals,
+    });
+    logKlineGapDebug({
+      interval,
+      latestBarTime: latestBar.time,
+      realtimeBarTime: realtimeBar.time,
+      gapIntervals,
+      action: 'reset',
+    });
+  };
+
+  const backfillKlineGap = (
+    latestBarKey: string,
+    interval: string,
+    intervalMs: number,
+    latestBar: TradingViewBar,
+    realtimeBar: TradingViewBar,
+    onRealtime: DatafeedCallbacks['onRealtime'],
+    onResetCacheNeeded?: () => void,
+  ) => {
+    const now = Date.now();
+    const gapIntervals = Math.max(2, Math.round((realtimeBar.time - latestBar.time) / intervalMs));
+    const previousBackfill = backfillStateByLatestBarKey.get(latestBarKey);
+    if (previousBackfill?.inFlight) return;
+    if (
+      previousBackfill &&
+      previousBackfill.barTime === realtimeBar.time &&
+      previousBackfill.latestBarTime === latestBar.time &&
+      now - previousBackfill.requestedAt < KLINE_GAP_BACKFILL_THROTTLE_MS
+    ) {
+      return;
+    }
+
+    backfillStateByLatestBarKey.set(latestBarKey, {
+      barTime: realtimeBar.time,
+      latestBarTime: latestBar.time,
+      requestedAt: now,
+      inFlight: true,
+    });
+    logKlineGapDebug({
+      interval,
+      latestBarTime: latestBar.time,
+      realtimeBarTime: realtimeBar.time,
+      gapIntervals,
+      action: 'backfill_start',
+    });
+
+    const reset = (latestForReset: TradingViewBar) => {
+      resetKlineGap(latestBarKey, interval, intervalMs, latestForReset, realtimeBar, onResetCacheNeeded);
+    };
+
+    void getSpotKlines({
+      symbol: apiSymbol,
+      interval,
+      limit: Math.min(Math.max(gapIntervals + 5, 20), 200),
+    })
+      .then((payload) => {
+        const state = backfillStateByLatestBarKey.get(latestBarKey);
+        if (
+          !state ||
+          state.barTime !== realtimeBar.time ||
+          state.latestBarTime !== latestBar.time
+        ) {
+          return;
+        }
+
+        const currentLatest = latestBars.get(latestBarKey);
+        if (currentLatest && currentLatest.time >= realtimeBar.time) {
+          gapStateByLatestBarKey.delete(latestBarKey);
+          backfillStateByLatestBarKey.delete(latestBarKey);
+          return;
+        }
+
+        let cursor =
+          currentLatest && currentLatest.time > latestBar.time
+            ? currentLatest
+            : latestBar;
+        const bars = (payload.items || [])
+          .map(klineToBar)
+          .filter((item): item is TradingViewBar => Boolean(item))
+          .filter((item) => item.time > cursor.time)
+          .sort((a, b) => a.time - b.time);
+
+        if (!bars.length || bars[0].time !== cursor.time + intervalMs) {
+          reset(cursor);
+          return;
+        }
+
+        for (const nextBar of bars) {
+          if (nextBar.time === cursor.time) {
+            latestBars.set(latestBarKey, nextBar);
+            onRealtime(nextBar);
+            cursor = nextBar;
+            continue;
+          }
+          if (nextBar.time !== cursor.time + intervalMs) {
+            reset(cursor);
+            return;
+          }
+          latestBars.set(latestBarKey, nextBar);
+          onRealtime(nextBar);
+          cursor = nextBar;
+        }
+
+        if (realtimeBar.time === cursor.time) {
+          latestBars.set(latestBarKey, realtimeBar);
+          onRealtime(realtimeBar);
+          cursor = realtimeBar;
+        } else if (realtimeBar.time === cursor.time + intervalMs) {
+          latestBars.set(latestBarKey, realtimeBar);
+          onRealtime(realtimeBar);
+          cursor = realtimeBar;
+        } else if (realtimeBar.time > cursor.time) {
+          reset(cursor);
+          return;
+        }
+
+        gapStateByLatestBarKey.delete(latestBarKey);
+        backfillStateByLatestBarKey.delete(latestBarKey);
+        logKlineGapDebug({
+          interval,
+          latestBarTime: latestBar.time,
+          realtimeBarTime: realtimeBar.time,
+          gapIntervals,
+          action: 'backfill_success',
+        });
+      })
+      .catch(() => {
+        const state = backfillStateByLatestBarKey.get(latestBarKey);
+        if (
+          !state ||
+          state.barTime !== realtimeBar.time ||
+          state.latestBarTime !== latestBar.time
+        ) {
+          return;
+        }
+
+        reset(latestBars.get(latestBarKey) || latestBar);
+      })
+      .finally(() => {
+        const state = backfillStateByLatestBarKey.get(latestBarKey);
+        if (
+          state &&
+          state.barTime === realtimeBar.time &&
+          state.latestBarTime === latestBar.time
+        ) {
+          backfillStateByLatestBarKey.set(latestBarKey, {
+            ...state,
+            inFlight: false,
+          });
+        }
+      });
+  };
 
   return {
     onReady(callback) {
@@ -347,12 +558,13 @@ export function createSpotTradingViewDatafeed(
             .filter((item): item is TradingViewBar => Boolean(item))
             .sort((a, b) => a.time - b.time);
 
+          const latestBarKey = getLatestBarKey(requestResolution);
           const latestBar = bars[bars.length - 1] || null;
           if (latestBar) {
-            const latestBarKey = getLatestBarKey(requestResolution);
             latestBars.set(latestBarKey, latestBar);
-            gapStateByLatestBarKey.delete(latestBarKey);
           }
+          gapStateByLatestBarKey.delete(latestBarKey);
+          backfillStateByLatestBarKey.delete(latestBarKey);
 
           onHistory(bars, { noData: bars.length === 0 });
         })
@@ -386,44 +598,21 @@ export function createSpotTradingViewDatafeed(
         const latestBar = latestBars.get(latestBarKey);
         if (latestBar && bar.time < latestBar.time) return;
         if (latestBar && bar.time > latestBar.time + intervalMs) {
-          const now = Date.now();
-          const previousGap = gapStateByLatestBarKey.get(latestBarKey);
-          const shouldReset =
-            !previousGap ||
-            previousGap.barTime !== bar.time ||
-            previousGap.latestBarTime !== latestBar.time ||
-            now - previousGap.lastResetAt >= KLINE_GAP_RESET_THROTTLE_MS;
-          if (shouldReset) {
-            gapStateByLatestBarKey.set(latestBarKey, {
-              barTime: bar.time,
-              latestBarTime: latestBar.time,
-              lastResetAt: now,
-            });
-            const gapIntervals = Math.max(2, Math.round((bar.time - latestBar.time) / intervalMs));
-            onResetCacheNeeded?.();
-            options.onKlineGap?.({
-              symbol: apiSymbol,
-              interval,
-              barTime: bar.time,
-              latestBarTime: latestBar.time,
-              gapIntervals,
-            });
-            if (process.env.NODE_ENV !== 'production') {
-              console.debug('[SpotTradingViewDatafeed] kline gap reset', {
-                symbol: apiSymbol,
-                interval,
-                barTime: bar.time,
-                latestBarTime: latestBar.time,
-                gapIntervals,
-                action: 'reset',
-              });
-            }
-          }
+          backfillKlineGap(
+            latestBarKey,
+            interval,
+            intervalMs,
+            latestBar,
+            bar,
+            onRealtime,
+            onResetCacheNeeded,
+          );
           return;
         }
 
         latestBars.set(latestBarKey, bar);
         gapStateByLatestBarKey.delete(latestBarKey);
+        backfillStateByLatestBarKey.delete(latestBarKey);
         onRealtime(bar);
       };
 
@@ -450,6 +639,7 @@ export function createSpotTradingViewDatafeed(
       if (latestBarKey) {
         latestBars.delete(latestBarKey);
         gapStateByLatestBarKey.delete(latestBarKey);
+        backfillStateByLatestBarKey.delete(latestBarKey);
       }
       latestBarKeyByUid.delete(subscriberUid);
     },
@@ -462,6 +652,7 @@ export function createSpotTradingViewDatafeed(
       latestBarKeyByUid.clear();
       latestBars.clear();
       gapStateByLatestBarKey.clear();
+      backfillStateByLatestBarKey.clear();
     },
   };
 }
