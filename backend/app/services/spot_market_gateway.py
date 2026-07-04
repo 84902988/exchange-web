@@ -234,6 +234,22 @@ class SpotMarketGateway:
                             side=getattr(trade, "side", ""),
                             ts=int(getattr(trade, "ts", 0) or 0),
                             trade_id=getattr(trade, "id", None),
+                            provider=getattr(trade, "provider", None) or getattr(trades, "provider", None),
+                            provider_symbol=(
+                                getattr(trade, "provider_symbol", None)
+                                or getattr(trades, "provider_symbol", None)
+                            ),
+                            provider_trade_id=(
+                                getattr(trade, "provider_trade_id", None)
+                                or getattr(trade, "trade_id", None)
+                                or getattr(trade, "id", None)
+                            ),
+                            source=getattr(trade, "source", None) or getattr(trades, "source", None),
+                            freshness=getattr(trade, "freshness", None) or getattr(trades, "freshness", None),
+                            updated_at_ms=(
+                                getattr(trade, "updated_at_ms", None)
+                                or getattr(trades, "updated_at_ms", None)
+                            ),
                         )
                     except Exception:
                         logger.warning("spot_market_gateway_trade_broadcast_failed symbol=%s", symbol, exc_info=True)

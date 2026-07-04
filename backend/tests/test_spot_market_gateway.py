@@ -86,15 +86,24 @@ class FakeProvider:
         return TradesResponse(
             symbol="BTCUSDT",
             provider="BITGET_SPOT",
+            provider_symbol="BTCUSDT",
             source="LIVE_WS",
             freshness="LIVE",
+            updated_at_ms=1234,
             trades=[
                 TradeItem(
                     id="trade-1",
+                    trade_id="trade-1",
+                    provider_trade_id="provider-trade-1",
                     price="2.1234",
                     amount="1.2345",
                     side="BUY",
                     ts=1000,
+                    provider="BITGET_SPOT",
+                    provider_symbol="BTCUSDT",
+                    source="LIVE_WS",
+                    freshness="LIVE",
+                    updated_at_ms=1234,
                 )
             ],
         )
@@ -821,6 +830,12 @@ def test_gateway_broadcasts_provider_trade_once() -> None:
         assert len(ws_manager.trade_broadcasts) == 1
         assert ws_manager.trade_broadcasts[0]["symbol"] == "BTCUSDT"
         assert ws_manager.trade_broadcasts[0]["trade_id"] == "trade-1"
+        assert ws_manager.trade_broadcasts[0]["provider_trade_id"] == "provider-trade-1"
+        assert ws_manager.trade_broadcasts[0]["provider"] == "BITGET_SPOT"
+        assert ws_manager.trade_broadcasts[0]["provider_symbol"] == "BTCUSDT"
+        assert ws_manager.trade_broadcasts[0]["source"] == "LIVE_WS"
+        assert ws_manager.trade_broadcasts[0]["freshness"] == "LIVE"
+        assert ws_manager.trade_broadcasts[0]["updated_at_ms"] == 1234
         assert ws_manager.trade_broadcasts[0]["price"] == "2.1234"
 
         await asyncio.sleep(0.25)
