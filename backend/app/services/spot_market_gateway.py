@@ -26,6 +26,8 @@ from app.services.spot_market_provider_ws import (
 
 logger = logging.getLogger(__name__)
 
+_MAX_KLINE_BROADCAST_INTERVAL_MS = 500
+
 
 class SpotMarketGateway:
     def __init__(
@@ -491,7 +493,7 @@ class SpotMarketGateway:
 
     def _kline_broadcast_interval_seconds(self) -> float:
         interval_ms = int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_BROADCAST_INTERVAL_MS", 1000) or 1000)
-        return max(0.1, interval_ms / 1000)
+        return max(0.1, min(interval_ms, _MAX_KLINE_BROADCAST_INTERVAL_MS) / 1000)
 
     def _kline_broadcast_interval_ms(self) -> int:
         return int(self._kline_broadcast_interval_seconds() * 1000)
