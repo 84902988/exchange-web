@@ -57,7 +57,7 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_BITGET_SPOT)
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT)
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="depth")
-    assert not provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="ticker")
+    assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="ticker")
     assert not provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="trades")
     assert not provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="kline")
 
@@ -81,14 +81,17 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
 
     ensure_calls: list[tuple[str, str, str | None]] = []
     service._ensure_depth_symbol = lambda symbol, provider=None: ensure_calls.append(("depth", symbol, provider))
-    service._ensure_ticker_symbol = lambda symbol: ensure_calls.append(("ticker", symbol, None))
+    service._ensure_ticker_symbol = lambda symbol, provider=None: ensure_calls.append(("ticker", symbol, provider))
     service._ensure_trades_symbol = lambda symbol: ensure_calls.append(("trades", symbol, None))
     service._ensure_kline_symbol = lambda symbol, interval: ensure_calls.append(("kline", symbol, interval))
 
     service.ensure_symbol("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT)
     service.ensure_kline("BTCUSDT", "1m", provider=provider_ws.PROVIDER_OKX_SPOT)
 
-    assert ensure_calls == [("depth", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT)]
+    assert ensure_calls == [
+        ("depth", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT),
+        ("ticker", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT),
+    ]
 
 
 def test_spot_provider_ws_has_no_enabled_switches() -> None:
@@ -299,6 +302,61 @@ def test_okx_depth_message_normalize_and_cache() -> None:
     assert depth.source == provider_ws.SPOT_PROVIDER_WS_SOURCE
     assert depth.bids[0].price == "2"
     assert service.get_fresh_depth("BTCUSDT", provider=provider_ws.PROVIDER_BITGET_SPOT) is None
+
+
+def test_okx_ticker_message_normalize_and_cache() -> None:
+    record = provider_ws.normalize_okx_ticker_message(
+        {
+            "arg": {"channel": "tickers", "instId": "BTC-USDT"},
+            "data": [
+                {
+                    "instId": "BTC-USDT",
+                    "last": "102",
+                    "lastSz": "0.5",
+                    "askPx": "102.1",
+                    "askSz": "1.2",
+                    "bidPx": "101.9",
+                    "bidSz": "1.1",
+                    "open24h": "100",
+                    "high24h": "105",
+                    "low24h": "95",
+                    "vol24h": "10",
+                    "volCcy24h": "1000",
+                    "ts": "1000",
+                }
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTC-USDT",
+    )
+
+    assert record is not None
+    assert record["symbol"] == "BTCUSDT"
+    assert record["provider"] == provider_ws.PROVIDER_OKX_SPOT
+    assert record["provider_symbol"] == "BTC-USDT"
+    assert record["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert record["quote_source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert record["freshness"] == "LIVE"
+    assert record["last_price"] == "102"
+    assert record["display_price"] == "102"
+    assert record["bid_price"] == "101.9"
+    assert record["ask_price"] == "102.1"
+    assert record["open_24h"] == "100"
+    assert record["price_change_24h"] == "2"
+    assert record["price_change_percent"] == "2"
+    assert record["price_change_percent_24h"] == "2"
+    assert record["base_volume_24h"] == "10"
+    assert record["quote_volume_24h"] == "1000"
+    assert record["quote_freshness"] == "LIVE"
+    assert record["market_status"] == "OPEN"
+
+    service = provider_ws.SpotMarketProviderWsService()
+    service.set_ticker_cache_for_tests(record)
+    ticker = service.get_fresh_ticker("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT)
+    assert ticker is not None
+    assert ticker["provider"] == provider_ws.PROVIDER_OKX_SPOT
+    assert ticker["last_price"] == "102"
+    assert service.get_fresh_ticker("BTCUSDT", provider=provider_ws.PROVIDER_BITGET_SPOT) is None
 
 
 def test_bitget_ticker_message_normalize() -> None:
