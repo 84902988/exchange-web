@@ -118,6 +118,228 @@ class FakeProvider:
         }
 
 
+def _new_test_gateway() -> SpotMarketGateway:
+    ws_manager = FakeWsManager()
+    provider = FakeProvider()
+    return SpotMarketGateway(
+        ensure_depth=provider.ensure,
+        ensure_kline=lambda symbol, interval: None,
+        release_depth=provider.release,
+        get_depth=provider.get_depth,
+        get_ticker=provider.get_ticker,
+        get_trades=provider.get_trades,
+        get_klines=provider.get_klines,
+        provider_symbol_allowed=lambda symbol: True,
+        precision_resolver=lambda symbol: (2, 3),
+        ws_manager=ws_manager,
+    )
+
+
+def _age_broadcast_state(gateway: SpotMarketGateway, domain_key, signature=None) -> None:
+    gateway._broadcast_state.remember_broadcast(
+        domain_key,
+        signature,
+        now_ms=gateway._broadcast_state.now_ms() - 10_000,
+    )
+
+
+def _depth_response(*, bid_amount: str = "1", ts: int = 1000) -> DepthResponse:
+    return DepthResponse(
+        symbol="BTCUSDT",
+        bids=[DepthItem(price="2", amount=bid_amount)],
+        asks=[DepthItem(price="3", amount="1")],
+        ts=ts,
+        provider="BITGET_SPOT",
+        source="LIVE_WS",
+        fetched_at=ts,
+    )
+
+
+def _ticker_payload(**overrides) -> dict:
+    payload = {
+        "symbol": "BTCUSDT",
+        "last_price": "2",
+        "open_24h": "1",
+        "price_change_24h": "1",
+        "price_change_percent": "100",
+        "high_24h": "3",
+        "low_24h": "1",
+        "base_volume_24h": "10",
+        "quote_volume_24h": "20",
+        "source": "LIVE_WS",
+        "provider": "BITGET_SPOT",
+        "quote_freshness": "LIVE",
+        "ts": 1000,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _trade_item(
+    trade_id: str | None,
+    *,
+    price: str = "2",
+    amount: str = "1",
+    side: str = "BUY",
+    ts: int = 1000,
+) -> TradeItem:
+    return TradeItem(id=trade_id, price=price, amount=amount, side=side, ts=ts)
+
+
+def _trades_response(items: list[TradeItem]) -> TradesResponse:
+    return TradesResponse(
+        symbol="BTCUSDT",
+        provider="BITGET_SPOT",
+        source="LIVE_WS",
+        freshness="LIVE",
+        trades=items,
+    )
+
+
+def _kline_payload(**overrides) -> dict:
+    payload = {
+        "open_time": 1000,
+        "close_time": 61000,
+        "open": "2",
+        "high": "3",
+        "low": "1",
+        "close": "2.5",
+        "volume": "10",
+        "quote_volume": "25",
+        "provider": "BITGET_SPOT",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_gateway_depth_broadcast_state_dedupes_and_isolates_symbols() -> None:
+    async def run() -> None:
+        gateway = _new_test_gateway()
+        depth = _depth_response()
+
+        assert gateway._should_broadcast_depth("BTCUSDT", depth) is True
+        assert gateway._should_broadcast_depth("BTCUSDT", depth) is False
+
+        key = gateway._domain_key("depth", "BTCUSDT", provider="BITGET_SPOT")
+        _age_broadcast_state(gateway, key, gateway._depth_signature(depth))
+        assert gateway._should_broadcast_depth("BTCUSDT", depth) is False
+
+        changed_depth = _depth_response(bid_amount="2")
+        _age_broadcast_state(gateway, key)
+        assert gateway._should_broadcast_depth("BTCUSDT", changed_depth) is True
+
+        assert gateway._should_broadcast_depth("ETHUSDT", depth) is True
+
+    asyncio.run(run())
+
+
+def test_gateway_ticker_broadcast_state_dedupes_and_detects_24h_changes() -> None:
+    async def run() -> None:
+        gateway = _new_test_gateway()
+        ticker = _ticker_payload()
+
+        assert gateway._should_broadcast_ticker("BTCUSDT", ticker) is True
+        assert gateway._should_broadcast_ticker("BTCUSDT", ticker) is False
+
+        key = gateway._domain_key("ticker", "BTCUSDT", provider="BITGET_SPOT")
+        _age_broadcast_state(gateway, key, gateway._ticker_signature(ticker))
+        assert gateway._should_broadcast_ticker("BTCUSDT", ticker) is False
+
+        changed_ticker = _ticker_payload(high_24h="4")
+        _age_broadcast_state(gateway, key)
+        assert gateway._should_broadcast_ticker("BTCUSDT", changed_ticker) is True
+
+    asyncio.run(run())
+
+
+def test_gateway_trade_broadcast_state_dedupes_ids_and_preserves_new_trade_order() -> None:
+    async def run() -> None:
+        gateway = _new_test_gateway()
+        trades = _trades_response(
+            [
+                _trade_item("trade-2", ts=2000),
+                _trade_item("trade-1", ts=1000),
+            ]
+        )
+
+        first_batch = gateway._new_trades_for_broadcast("BTCUSDT", trades)
+        assert [trade.id for trade in first_batch] == ["trade-1", "trade-2"]
+
+        key = gateway._domain_key("trades", "BTCUSDT", provider="BITGET_SPOT")
+        _age_broadcast_state(gateway, key)
+        assert gateway._new_trades_for_broadcast("BTCUSDT", trades) == []
+
+        next_trades = _trades_response(
+            [
+                _trade_item("trade-4", ts=4000),
+                _trade_item("trade-3", ts=3000),
+                _trade_item("trade-2", ts=2000),
+            ]
+        )
+        _age_broadcast_state(gateway, key)
+        next_batch = gateway._new_trades_for_broadcast("BTCUSDT", next_trades)
+        assert [trade.id for trade in next_batch] == ["trade-3", "trade-4"]
+
+    asyncio.run(run())
+
+
+def test_gateway_trade_broadcast_state_uses_fallback_signature_without_trade_id() -> None:
+    async def run() -> None:
+        gateway = _new_test_gateway()
+        trade = _trade_item(None, price="2", amount="1", side="BUY", ts=1000)
+        trades = _trades_response([trade])
+
+        first_batch = gateway._new_trades_for_broadcast("BTCUSDT", trades)
+        assert len(first_batch) == 1
+        assert first_batch[0].id is None
+
+        key = gateway._domain_key("trades", "BTCUSDT", provider="BITGET_SPOT")
+        _age_broadcast_state(gateway, key)
+        assert gateway._new_trades_for_broadcast("BTCUSDT", trades) == []
+
+        changed_trade = _trade_item(None, price="2", amount="1", side="BUY", ts=1001)
+        _age_broadcast_state(gateway, key)
+        changed_batch = gateway._new_trades_for_broadcast("BTCUSDT", _trades_response([changed_trade]))
+        assert len(changed_batch) == 1
+        assert changed_batch[0].ts == 1001
+
+    asyncio.run(run())
+
+
+def test_gateway_kline_broadcast_state_dedupes_detects_ohlcv_changes_and_isolates_intervals() -> None:
+    async def run() -> None:
+        gateway = _new_test_gateway()
+        kline = _kline_payload()
+
+        assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is True
+        assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is False
+
+        key = gateway._domain_key("kline", "BTCUSDT", provider="BITGET_SPOT", interval="1m")
+        _age_broadcast_state(gateway, key, gateway._kline_signature("BTCUSDT", "1m", kline))
+        assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is False
+
+        for field, value in (
+            ("close", "2.6"),
+            ("volume", "11"),
+            ("high", "3.5"),
+            ("low", "0.9"),
+            ("quote_volume", "26"),
+        ):
+            _age_broadcast_state(gateway, key)
+            assert gateway._should_broadcast_kline(
+                "BTCUSDT",
+                "1m",
+                _kline_payload(**{field: value}),
+                provider="BITGET_SPOT",
+            ) is True
+
+        other_interval_gateway = _new_test_gateway()
+        assert other_interval_gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is True
+        assert other_interval_gateway._should_broadcast_kline("BTCUSDT", "5m", kline, provider="BITGET_SPOT") is True
+
+    asyncio.run(run())
+
+
 def test_gateway_subscriber_count_and_idle_release() -> None:
     async def run() -> None:
         ws_manager = FakeWsManager()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from decimal import Decimal
 from typing import Any, Callable, Optional
 
@@ -10,6 +9,8 @@ from app.core.config import settings
 from app.db.models.trading_pair import TradingPair
 from app.db.session import SessionLocal
 from app.schemas.market import DepthItem, DepthResponse, TradesResponse
+from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT
+from app.services.spot_market_gateway_state import SpotGatewayBroadcastState, make_domain_key
 from app.services.spot_market_provider_ws import (
     ensure_spot_provider_ws_depth,
     ensure_spot_provider_ws_kline,
@@ -53,14 +54,7 @@ class SpotMarketGateway:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_lock = asyncio.Lock()
-        self._last_depth_broadcast_at: dict[str, float] = {}
-        self._last_depth_signature: dict[str, str] = {}
-        self._last_ticker_broadcast_at: dict[str, float] = {}
-        self._last_ticker_signature: dict[str, str] = {}
-        self._last_trade_broadcast_at: dict[str, float] = {}
-        self._seen_trade_signatures: dict[str, list[str]] = {}
-        self._last_kline_broadcast_at: dict[tuple[str, str], float] = {}
-        self._last_kline_signature: dict[tuple[str, str], str] = {}
+        self._broadcast_state = SpotGatewayBroadcastState()
         self._precision_cache: dict[str, tuple[int, int]] = {}
 
     async def ensure_symbol(self, symbol: str, *, interval: str = "1m") -> None:
@@ -124,16 +118,7 @@ class SpotMarketGateway:
                 if refresh_task is not None and not refresh_task.done():
                     refresh_task.cancel()
             await asyncio.to_thread(self._release_depth, symbol)
-            self._last_depth_broadcast_at.pop(symbol, None)
-            self._last_depth_signature.pop(symbol, None)
-            self._last_ticker_broadcast_at.pop(symbol, None)
-            self._last_ticker_signature.pop(symbol, None)
-            self._last_trade_broadcast_at.pop(symbol, None)
-            self._seen_trade_signatures.pop(symbol, None)
-            for key in [key for key in self._last_kline_broadcast_at if key[0] == symbol]:
-                self._last_kline_broadcast_at.pop(key, None)
-            for key in [key for key in self._last_kline_signature if key[0] == symbol]:
-                self._last_kline_signature.pop(key, None)
+            self._broadcast_state.clear_symbol(symbol)
             self._precision_cache.pop(symbol, None)
             logger.info("spot_market_gateway_release_provider_ws symbol=%s", symbol)
         except asyncio.CancelledError:
@@ -221,7 +206,12 @@ class SpotMarketGateway:
                         )
                         klines = None
                     kline = self._latest_kline_for_broadcast(klines)
-                    if kline is not None and self._should_broadcast_kline(symbol, interval, kline):
+                    if kline is not None and self._should_broadcast_kline(
+                        symbol,
+                        interval,
+                        kline,
+                        provider=(klines or {}).get("provider"),
+                    ):
                         try:
                             await self._market_ws_manager().broadcast_provider_kline_update(
                                 symbol,
@@ -248,16 +238,17 @@ class SpotMarketGateway:
                     self._tasks.pop(symbol, None)
 
     def _should_broadcast_depth(self, symbol: str, depth: DepthResponse) -> bool:
-        now = time.monotonic()
-        min_interval_seconds = self._broadcast_interval_seconds()
-        last_at = self._last_depth_broadcast_at.get(symbol, 0.0)
-        if now - last_at < min_interval_seconds:
-            return False
+        domain_key = self._domain_key("depth", symbol, provider=getattr(depth, "provider", None))
         signature = self._depth_signature(depth)
-        if self._last_depth_signature.get(symbol) == signature:
+        now_ms = self._broadcast_state.now_ms()
+        if not self._broadcast_state.should_broadcast_domain(
+            domain_key,
+            signature,
+            self._broadcast_interval_ms(),
+            now_ms=now_ms,
+        ):
             return False
-        self._last_depth_signature[symbol] = signature
-        self._last_depth_broadcast_at[symbol] = now
+        self._broadcast_state.remember_broadcast(domain_key, signature, now_ms=now_ms)
         return True
 
     def _depth_signature(self, depth: DepthResponse) -> str:
@@ -266,16 +257,17 @@ class SpotMarketGateway:
         return repr((bids, asks, getattr(depth, "ts", None)))
 
     def _should_broadcast_ticker(self, symbol: str, ticker: dict[str, Any]) -> bool:
-        now = time.monotonic()
-        min_interval_seconds = self._ticker_broadcast_interval_seconds()
-        last_at = self._last_ticker_broadcast_at.get(symbol, 0.0)
-        if now - last_at < min_interval_seconds:
-            return False
+        domain_key = self._domain_key("ticker", symbol, provider=ticker.get("provider"))
         signature = self._ticker_signature(ticker)
-        if self._last_ticker_signature.get(symbol) == signature:
+        now_ms = self._broadcast_state.now_ms()
+        if not self._broadcast_state.should_broadcast_domain(
+            domain_key,
+            signature,
+            self._ticker_broadcast_interval_ms(),
+            now_ms=now_ms,
+        ):
             return False
-        self._last_ticker_signature[symbol] = signature
-        self._last_ticker_broadcast_at[symbol] = now
+        self._broadcast_state.remember_broadcast(domain_key, signature, now_ms=now_ms)
         return True
 
     def _ticker_signature(self, ticker: dict[str, Any]) -> str:
@@ -294,25 +286,32 @@ class SpotMarketGateway:
     def _new_trades_for_broadcast(self, symbol: str, trades: Optional[TradesResponse]) -> list[Any]:
         if trades is None or not getattr(trades, "trades", None):
             return []
-        now = time.monotonic()
-        min_interval_seconds = self._trades_broadcast_interval_seconds()
-        last_at = self._last_trade_broadcast_at.get(symbol, 0.0)
-        if now - last_at < min_interval_seconds:
+        domain_key = self._domain_key("trades", symbol, provider=getattr(trades, "provider", None))
+        now_ms = self._broadcast_state.now_ms()
+        if not self._broadcast_state.should_broadcast_domain(
+            domain_key,
+            None,
+            self._trades_broadcast_interval_ms(),
+            now_ms=now_ms,
+        ):
             return []
-        seen = set(self._seen_trade_signatures.get(symbol, []))
+        batch_seen: set[str] = set()
         new_items: list[Any] = []
         new_signatures: list[str] = []
         for trade in reversed(list(trades.trades or [])):
             signature = self._trade_signature(trade)
-            if not signature or signature in seen:
+            if (
+                not signature
+                or signature in batch_seen
+                or self._broadcast_state.has_seen_trade_signature(domain_key, signature)
+            ):
                 continue
-            seen.add(signature)
+            batch_seen.add(signature)
             new_signatures.append(signature)
             new_items.append(trade)
         if new_signatures:
-            retained = (self._seen_trade_signatures.get(symbol, []) + new_signatures)[-200:]
-            self._seen_trade_signatures[symbol] = retained
-            self._last_trade_broadcast_at[symbol] = now
+            self._broadcast_state.remember_trade_signatures(domain_key, new_signatures, max_seen=200)
+            self._broadcast_state.remember_broadcast(domain_key, repr(new_signatures), now_ms=now_ms)
         return new_items
 
     def _trade_signature(self, trade: Any) -> str:
@@ -349,24 +348,57 @@ class SpotMarketGateway:
         valid_items.sort(key=lambda item: int(item.get("open_time") or 0))
         return valid_items[-1]
 
-    def _should_broadcast_kline(self, symbol: str, interval: str, kline: dict[str, Any]) -> bool:
+    def _should_broadcast_kline(
+        self,
+        symbol: str,
+        interval: str,
+        kline: dict[str, Any],
+        *,
+        provider: Any = None,
+    ) -> bool:
         normalized_interval = self._normalize_interval(interval)
-        key = (symbol, normalized_interval)
-        now = time.monotonic()
-        min_interval_seconds = self._kline_broadcast_interval_seconds()
-        last_at = self._last_kline_broadcast_at.get(key, 0.0)
-        if now - last_at < min_interval_seconds:
+        domain_key = self._domain_key(
+            "kline",
+            symbol,
+            provider=provider or kline.get("provider"),
+            interval=normalized_interval,
+        )
+        signature = self._kline_signature(symbol, normalized_interval, kline)
+        now_ms = self._broadcast_state.now_ms()
+        if not self._broadcast_state.should_broadcast_domain(
+            domain_key,
+            signature,
+            self._kline_broadcast_interval_ms(),
+            now_ms=now_ms,
+        ):
             return False
-        signature = self._kline_signature(kline)
-        if self._last_kline_signature.get(key) == signature:
-            return False
-        self._last_kline_signature[key] = signature
-        self._last_kline_broadcast_at[key] = now
+        self._broadcast_state.remember_broadcast(domain_key, signature, now_ms=now_ms)
         return True
 
-    def _kline_signature(self, kline: dict[str, Any]) -> str:
+    def _kline_signature(self, symbol: str, interval: str, kline: dict[str, Any]) -> str:
         keys = ("open_time", "open", "high", "low", "close", "volume", "quote_volume")
-        return repr(tuple(kline.get(key) for key in keys))
+        return repr(
+            (
+                normalize_spot_ws_symbol(symbol),
+                self._normalize_interval(interval),
+                tuple(kline.get(key) for key in keys),
+            )
+        )
+
+    def _domain_key(
+        self,
+        domain: str,
+        symbol: str,
+        *,
+        provider: Any = None,
+        interval: Optional[str] = None,
+    ):
+        return make_domain_key(
+            domain,
+            str(provider or PROVIDER_BITGET_SPOT),
+            normalize_spot_ws_symbol(symbol),
+            interval=self._normalize_interval(interval) if interval is not None else None,
+        )
 
     def _normalize_interval(self, interval: Any) -> str:
         normalized = str(interval or "1m").strip()
@@ -378,17 +410,29 @@ class SpotMarketGateway:
         interval_ms = int(getattr(settings, "SPOT_PROVIDER_WS_DEPTH_BROADCAST_INTERVAL_MS", 200) or 200)
         return max(0.05, interval_ms / 1000)
 
+    def _broadcast_interval_ms(self) -> int:
+        return int(self._broadcast_interval_seconds() * 1000)
+
     def _ticker_broadcast_interval_seconds(self) -> float:
         interval_ms = int(getattr(settings, "SPOT_PROVIDER_WS_TICKER_BROADCAST_INTERVAL_MS", 500) or 500)
         return max(0.1, interval_ms / 1000)
+
+    def _ticker_broadcast_interval_ms(self) -> int:
+        return int(self._ticker_broadcast_interval_seconds() * 1000)
 
     def _trades_broadcast_interval_seconds(self) -> float:
         interval_ms = int(getattr(settings, "SPOT_PROVIDER_WS_TRADES_BROADCAST_INTERVAL_MS", 200) or 200)
         return max(0.05, interval_ms / 1000)
 
+    def _trades_broadcast_interval_ms(self) -> int:
+        return int(self._trades_broadcast_interval_seconds() * 1000)
+
     def _kline_broadcast_interval_seconds(self) -> float:
         interval_ms = int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_BROADCAST_INTERVAL_MS", 1000) or 1000)
         return max(0.1, interval_ms / 1000)
+
+    def _kline_broadcast_interval_ms(self) -> int:
+        return int(self._kline_broadcast_interval_seconds() * 1000)
 
     def _loop_interval_seconds(self) -> float:
         return min(
