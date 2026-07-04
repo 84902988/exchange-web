@@ -21,6 +21,12 @@ type SpotMarketDepthMessage = {
   depth?: unknown;
 };
 
+type SpotMarketTickerMessage = {
+  type: 'spot_ticker_update';
+  symbol?: string;
+  ticker?: unknown;
+};
+
 export type SpotMarketKlineMessage = {
   type: 'spot_kline_update';
   symbol?: string;
@@ -30,12 +36,13 @@ export type SpotMarketKlineMessage = {
   updated_at?: string;
 };
 
-export type SpotMarketRealtimeEventType = 'snapshot' | 'trade' | 'depth' | 'kline';
+export type SpotMarketRealtimeEventType = 'snapshot' | 'trade' | 'depth' | 'ticker' | 'kline';
 export type SpotMarketConnectionStatus = 'connecting' | 'open' | 'closed';
 export type SpotMarketRealtimeMessage =
   | SpotMarketSnapshotMessage
   | SpotMarketTradeMessage
   | SpotMarketDepthMessage
+  | SpotMarketTickerMessage
   | SpotMarketKlineMessage;
 export type SpotMarketRealtimeHandler = (message: SpotMarketRealtimeMessage) => void;
 export type SpotMarketRealtimeStatusHandler = (status: SpotMarketConnectionStatus) => void;
@@ -238,6 +245,11 @@ class SpotMarketRealtimeClient {
 
     if (message.type === 'spot_depth_update') {
       this.emit('depth', message);
+      return;
+    }
+
+    if (message.type === 'spot_ticker_update') {
+      this.emit('ticker', message);
       return;
     }
 

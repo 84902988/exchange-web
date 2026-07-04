@@ -40,6 +40,36 @@ def test_bitget_depth_message_normalize() -> None:
     ]
 
 
+def test_bitget_ticker_message_normalize() -> None:
+    record = provider_ws.normalize_bitget_ticker_message(
+        {
+            "arg": {"instType": "SP", "channel": "ticker", "instId": "BTCUSDT"},
+            "data": [
+                {
+                    "lastPr": "102",
+                    "open24h": "100",
+                    "high24h": "105",
+                    "low24h": "95",
+                    "baseVolume": "10",
+                    "quoteVolume": "1000",
+                    "ts": "1000",
+                }
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTCUSDT",
+    )
+
+    assert record is not None
+    assert record["symbol"] == "BTCUSDT"
+    assert record["provider"] == provider_ws.PROVIDER_BITGET_SPOT
+    assert record["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert record["last_price"] == "102"
+    assert record["price_change_24h"] == "2"
+    assert record["price_change_percent"] == "2"
+    assert record["quote_freshness"] == "LIVE"
+
+
 def test_depth_cache_fresh_and_stale() -> None:
     service = provider_ws.SpotMarketProviderWsService()
     now_ms = provider_ws._now_ms()
@@ -73,6 +103,40 @@ def test_depth_cache_fresh_and_stale() -> None:
         }
     )
     assert service.get_fresh_depth("btcusdt", max_age_ms=1000) is None
+
+
+def test_ticker_cache_fresh_and_stale() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    now_ms = provider_ws._now_ms()
+    service.set_ticker_cache_for_tests(
+        {
+            "symbol": "BTCUSDT",
+            "provider": provider_ws.PROVIDER_BITGET_SPOT,
+            "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+            "last_price": "102",
+            "open_24h": "100",
+            "updated_at_ms": now_ms,
+            "ts": now_ms,
+        }
+    )
+
+    fresh = service.get_fresh_ticker("BTC/USDT", max_age_ms=1000)
+    assert fresh is not None
+    assert fresh["symbol"] == "BTCUSDT"
+    assert fresh["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+
+    service.set_ticker_cache_for_tests(
+        {
+            "symbol": "BTCUSDT",
+            "provider": provider_ws.PROVIDER_BITGET_SPOT,
+            "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+            "last_price": "102",
+            "open_24h": "100",
+            "updated_at_ms": now_ms - 5000,
+            "ts": now_ms - 5000,
+        }
+    )
+    assert service.get_fresh_ticker("btcusdt", max_age_ms=1000) is None
 
 
 if __name__ == "__main__":
