@@ -8,6 +8,25 @@ def test_normalize_spot_ws_symbol() -> None:
     assert provider_ws.normalize_spot_ws_symbol("btcusdt") == "BTCUSDT"
 
 
+def test_spot_provider_ws_has_no_enabled_switches() -> None:
+    for name in (
+        "SPOT_PROVIDER_WS_ENABLED",
+        "SPOT_PROVIDER_WS_DEPTH_ENABLED",
+        "SPOT_PROVIDER_WS_TICKER_ENABLED",
+        "SPOT_PROVIDER_WS_TRADES_ENABLED",
+        "SPOT_PROVIDER_WS_KLINE_ENABLED",
+    ):
+        assert not hasattr(provider_ws.settings, name)
+
+    for name in (
+        "spot_provider_ws_depth_enabled",
+        "spot_provider_ws_ticker_enabled",
+        "spot_provider_ws_trades_enabled",
+        "spot_provider_ws_kline_enabled",
+    ):
+        assert not hasattr(provider_ws, name)
+
+
 def test_bitget_depth_message_normalize() -> None:
     record = provider_ws.normalize_bitget_depth_message(
         {
