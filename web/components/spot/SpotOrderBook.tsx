@@ -142,8 +142,8 @@ export default function SpotOrderBook({
             type="button"
             disabled={!onPriceClick || referencePrice === '--'}
             onClick={() => onPriceClick?.(String(referencePrice).replace(/,/g, ''))}
-            title="BBO Mid"
-            aria-label="BBO Mid"
+            title="Latest Price"
+            aria-label="Latest Price"
             className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center text-[17px] font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${referencePriceClass}`}
           >
             {referencePrice}
