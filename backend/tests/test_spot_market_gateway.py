@@ -316,6 +316,23 @@ def test_gateway_kline_broadcast_state_dedupes_detects_ohlcv_changes_and_isolate
         assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is False
 
         key = gateway._domain_key("kline", "BTCUSDT", provider="BITGET_SPOT", interval="1m")
+        assert gateway._kline_broadcast_interval_ms() == 500
+        fixed_now = 1_000_000
+        gateway._broadcast_state.now_ms = lambda: fixed_now
+        changed_close = _kline_payload(close="2.6")
+        gateway._broadcast_state.remember_broadcast(
+            key,
+            gateway._kline_signature("BTCUSDT", "1m", kline),
+            now_ms=fixed_now - 400,
+        )
+        assert gateway._should_broadcast_kline("BTCUSDT", "1m", changed_close, provider="BITGET_SPOT") is False
+        gateway._broadcast_state.remember_broadcast(
+            key,
+            gateway._kline_signature("BTCUSDT", "1m", kline),
+            now_ms=fixed_now - 500,
+        )
+        assert gateway._should_broadcast_kline("BTCUSDT", "1m", changed_close, provider="BITGET_SPOT") is True
+
         _age_broadcast_state(gateway, key, gateway._kline_signature("BTCUSDT", "1m", kline))
         assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is False
 
