@@ -19,10 +19,6 @@ from app.services.spot_market_provider_ws import (
     get_spot_provider_ws_trades,
     normalize_spot_ws_symbol,
     release_spot_provider_ws_depth,
-    spot_provider_ws_depth_enabled,
-    spot_provider_ws_kline_enabled,
-    spot_provider_ws_ticker_enabled,
-    spot_provider_ws_trades_enabled,
 )
 
 
@@ -33,10 +29,6 @@ class SpotMarketGateway:
     def __init__(
         self,
         *,
-        provider_depth_enabled: Optional[Callable[[], bool]] = None,
-        provider_ticker_enabled: Optional[Callable[[], bool]] = None,
-        provider_trades_enabled: Optional[Callable[[], bool]] = None,
-        provider_kline_enabled: Optional[Callable[[], bool]] = None,
         ensure_depth: Optional[Callable[[str], None]] = None,
         ensure_kline: Optional[Callable[[str, str], None]] = None,
         release_depth: Optional[Callable[[str], None]] = None,
@@ -44,13 +36,10 @@ class SpotMarketGateway:
         get_ticker: Optional[Callable[..., Optional[dict[str, Any]]]] = None,
         get_trades: Optional[Callable[..., Optional[TradesResponse]]] = None,
         get_klines: Optional[Callable[..., Optional[dict[str, Any]]]] = None,
+        provider_symbol_allowed: Optional[Callable[[str], bool]] = None,
         precision_resolver: Optional[Callable[[str], tuple[int, int]]] = None,
         ws_manager: Any = None,
     ) -> None:
-        self._provider_depth_enabled = provider_depth_enabled or spot_provider_ws_depth_enabled
-        self._provider_ticker_enabled = provider_ticker_enabled or spot_provider_ws_ticker_enabled
-        self._provider_trades_enabled = provider_trades_enabled or spot_provider_ws_trades_enabled
-        self._provider_kline_enabled = provider_kline_enabled or spot_provider_ws_kline_enabled
         self._ensure_depth = ensure_depth or ensure_spot_provider_ws_depth
         self._ensure_kline = ensure_kline or ensure_spot_provider_ws_kline
         self._release_depth = release_depth or release_spot_provider_ws_depth
@@ -58,6 +47,7 @@ class SpotMarketGateway:
         self._get_ticker = get_ticker or get_spot_provider_ws_ticker
         self._get_trades = get_trades or get_spot_provider_ws_trades
         self._get_klines = get_klines or get_spot_provider_ws_klines
+        self._provider_symbol_allowed = provider_symbol_allowed or self._default_provider_symbol_allowed
         self._precision_resolver = precision_resolver or self._default_precision_resolver
         self._ws_manager = ws_manager
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -75,13 +65,14 @@ class SpotMarketGateway:
 
     async def ensure_symbol(self, symbol: str, *, interval: str = "1m") -> None:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
-        if not normalized_symbol or not self._provider_enabled():
+        if not normalized_symbol:
+            return
+        if not await asyncio.to_thread(self._provider_symbol_allowed, normalized_symbol):
             return
         await self._cancel_idle_release(normalized_symbol)
         try:
             self._ensure_depth(normalized_symbol)
-            if self._provider_kline_enabled():
-                self._ensure_kline(normalized_symbol, self._normalize_interval(interval))
+            self._ensure_kline(normalized_symbol, self._normalize_interval(interval))
         except Exception:
             logger.warning("spot_market_gateway_ensure_provider_ws_failed symbol=%s", normalized_symbol, exc_info=True)
         async with self._task_lock:
@@ -158,98 +149,94 @@ class SpotMarketGateway:
     async def _refresh_loop(self, symbol: str) -> None:
         current_task = asyncio.current_task()
         try:
-            while self._provider_enabled():
+            while True:
                 subscriber_count = await self._subscriber_count(symbol)
                 if subscriber_count <= 0:
                     await self.release_symbol_if_idle(symbol)
                     break
-                if self._provider_depth_enabled():
+                try:
+                    depth = self._get_depth(
+                        symbol,
+                        limit=int(getattr(settings, "SPOT_PROVIDER_WS_DEPTH_LIMIT", 20) or 20),
+                    )
+                except Exception:
+                    logger.warning("spot_market_gateway_get_depth_failed symbol=%s", symbol, exc_info=True)
+                    depth = None
+                if depth is not None:
+                    depth = self._format_depth_for_broadcast(symbol, depth)
+                if depth is not None and self._should_broadcast_depth(symbol, depth):
                     try:
-                        depth = self._get_depth(
-                            symbol,
-                            limit=int(getattr(settings, "SPOT_PROVIDER_WS_DEPTH_LIMIT", 20) or 20),
+                        await self._market_ws_manager().broadcast_depth_update(symbol, depth)
+                    except Exception:
+                        logger.warning("spot_market_gateway_depth_broadcast_failed symbol=%s", symbol, exc_info=True)
+
+                try:
+                    ticker = self._get_ticker(symbol)
+                except Exception:
+                    logger.warning("spot_market_gateway_get_ticker_failed symbol=%s", symbol, exc_info=True)
+                    ticker = None
+                if ticker is not None:
+                    ticker = self._format_ticker_for_broadcast(symbol, ticker)
+                if ticker is not None and self._should_broadcast_ticker(symbol, ticker):
+                    try:
+                        await self._market_ws_manager().broadcast_ticker_update(symbol, ticker)
+                    except Exception:
+                        logger.warning("spot_market_gateway_ticker_broadcast_failed symbol=%s", symbol, exc_info=True)
+
+                try:
+                    trades = self._get_trades(
+                        symbol,
+                        limit=int(getattr(settings, "SPOT_PROVIDER_WS_TRADES_LIMIT", 30) or 30),
+                    )
+                except Exception:
+                    logger.warning("spot_market_gateway_get_trades_failed symbol=%s", symbol, exc_info=True)
+                    trades = None
+                for trade in self._new_trades_for_broadcast(symbol, trades):
+                    try:
+                        await self._market_ws_manager().send_trade(
+                            symbol=symbol,
+                            price=getattr(trade, "price", None),
+                            amount=getattr(trade, "amount", None),
+                            side=getattr(trade, "side", ""),
+                            ts=int(getattr(trade, "ts", 0) or 0),
+                            trade_id=getattr(trade, "id", None),
                         )
                     except Exception:
-                        logger.warning("spot_market_gateway_get_depth_failed symbol=%s", symbol, exc_info=True)
-                        depth = None
-                    if depth is not None:
-                        depth = self._format_depth_for_broadcast(symbol, depth)
-                    if depth is not None and self._should_broadcast_depth(symbol, depth):
-                        try:
-                            await self._market_ws_manager().broadcast_depth_update(symbol, depth)
-                        except Exception:
-                            logger.warning("spot_market_gateway_depth_broadcast_failed symbol=%s", symbol, exc_info=True)
+                        logger.warning("spot_market_gateway_trade_broadcast_failed symbol=%s", symbol, exc_info=True)
 
-                if self._provider_ticker_enabled():
+                for interval in await self._active_kline_intervals(symbol):
                     try:
-                        ticker = self._get_ticker(symbol)
-                    except Exception:
-                        logger.warning("spot_market_gateway_get_ticker_failed symbol=%s", symbol, exc_info=True)
-                        ticker = None
-                    if ticker is not None:
-                        ticker = self._format_ticker_for_broadcast(symbol, ticker)
-                    if ticker is not None and self._should_broadcast_ticker(symbol, ticker):
-                        try:
-                            await self._market_ws_manager().broadcast_ticker_update(symbol, ticker)
-                        except Exception:
-                            logger.warning("spot_market_gateway_ticker_broadcast_failed symbol=%s", symbol, exc_info=True)
-
-                if self._provider_trades_enabled():
-                    try:
-                        trades = self._get_trades(
+                        self._ensure_kline(symbol, interval)
+                        klines = self._get_klines(
                             symbol,
-                            limit=int(getattr(settings, "SPOT_PROVIDER_WS_TRADES_LIMIT", 30) or 30),
+                            interval,
+                            limit=int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_LIMIT", 300) or 300),
                         )
                     except Exception:
-                        logger.warning("spot_market_gateway_get_trades_failed symbol=%s", symbol, exc_info=True)
-                        trades = None
-                    for trade in self._new_trades_for_broadcast(symbol, trades):
+                        logger.warning(
+                            "spot_market_gateway_get_kline_failed symbol=%s interval=%s",
+                            symbol,
+                            interval,
+                            exc_info=True,
+                        )
+                        klines = None
+                    kline = self._latest_kline_for_broadcast(klines)
+                    if kline is not None and self._should_broadcast_kline(symbol, interval, kline):
                         try:
-                            await self._market_ws_manager().send_trade(
-                                symbol=symbol,
-                                price=getattr(trade, "price", None),
-                                amount=getattr(trade, "amount", None),
-                                side=getattr(trade, "side", ""),
-                                ts=int(getattr(trade, "ts", 0) or 0),
-                                trade_id=getattr(trade, "id", None),
-                            )
-                        except Exception:
-                            logger.warning("spot_market_gateway_trade_broadcast_failed symbol=%s", symbol, exc_info=True)
-
-                if self._provider_kline_enabled():
-                    for interval in await self._active_kline_intervals(symbol):
-                        try:
-                            self._ensure_kline(symbol, interval)
-                            klines = self._get_klines(
+                            await self._market_ws_manager().broadcast_provider_kline_update(
                                 symbol,
                                 interval,
-                                limit=int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_LIMIT", 300) or 300),
+                                kline,
+                                source=str((klines or {}).get("source") or "LIVE_WS"),
+                                updated_at=(klines or {}).get("updated_at"),
                             )
                         except Exception:
                             logger.warning(
-                                "spot_market_gateway_get_kline_failed symbol=%s interval=%s",
+                                "spot_market_gateway_kline_broadcast_failed symbol=%s interval=%s",
                                 symbol,
                                 interval,
                                 exc_info=True,
                             )
-                            klines = None
-                        kline = self._latest_kline_for_broadcast(klines)
-                        if kline is not None and self._should_broadcast_kline(symbol, interval, kline):
-                            try:
-                                await self._market_ws_manager().broadcast_provider_kline_update(
-                                    symbol,
-                                    interval,
-                                    kline,
-                                    source=str((klines or {}).get("source") or "LIVE_WS"),
-                                    updated_at=(klines or {}).get("updated_at"),
-                                )
-                            except Exception:
-                                logger.warning(
-                                    "spot_market_gateway_kline_broadcast_failed symbol=%s interval=%s",
-                                    symbol,
-                                    interval,
-                                    exc_info=True,
-                                )
 
                 await asyncio.sleep(self._loop_interval_seconds())
         except asyncio.CancelledError:
@@ -404,23 +391,11 @@ class SpotMarketGateway:
         return max(0.1, interval_ms / 1000)
 
     def _loop_interval_seconds(self) -> float:
-        intervals: list[float] = []
-        if self._provider_depth_enabled():
-            intervals.append(self._broadcast_interval_seconds())
-        if self._provider_ticker_enabled():
-            intervals.append(self._ticker_broadcast_interval_seconds())
-        if self._provider_trades_enabled():
-            intervals.append(self._trades_broadcast_interval_seconds())
-        if self._provider_kline_enabled():
-            intervals.append(self._kline_broadcast_interval_seconds())
-        return min(intervals) if intervals else 1.0
-
-    def _provider_enabled(self) -> bool:
-        return bool(
-            self._provider_depth_enabled()
-            or self._provider_ticker_enabled()
-            or self._provider_trades_enabled()
-            or self._provider_kline_enabled()
+        return min(
+            self._broadcast_interval_seconds(),
+            self._ticker_broadcast_interval_seconds(),
+            self._trades_broadcast_interval_seconds(),
+            self._kline_broadcast_interval_seconds(),
         )
 
     async def _subscriber_count(self, symbol: str) -> int:
@@ -432,6 +407,26 @@ class SpotMarketGateway:
         from app.services.market_ws import market_ws_manager
 
         return market_ws_manager
+
+    def _default_provider_symbol_allowed(self, symbol: str) -> bool:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        if not normalized_symbol:
+            return False
+        db = SessionLocal()
+        try:
+            pair = (
+                db.query(TradingPair)
+                .filter(TradingPair.symbol == normalized_symbol, TradingPair.status == 1)
+                .first()
+            )
+            if pair is None:
+                return False
+            return str(getattr(pair, "data_source", "") or "").strip().upper() == "BINANCE"
+        except Exception:
+            logger.warning("spot_market_gateway_provider_symbol_check_failed symbol=%s", normalized_symbol, exc_info=True)
+            return False
+        finally:
+            db.close()
 
     def _format_depth_for_broadcast(self, symbol: str, depth: DepthResponse) -> DepthResponse:
         price_precision, amount_precision = self._precision_for_symbol(symbol)

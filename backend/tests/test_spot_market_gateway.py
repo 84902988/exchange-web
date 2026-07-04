@@ -123,10 +123,14 @@ def test_gateway_subscriber_count_and_idle_release() -> None:
         ws_manager = FakeWsManager()
         provider = FakeProvider()
         gateway = SpotMarketGateway(
-            provider_depth_enabled=lambda: True,
             ensure_depth=provider.ensure,
+            ensure_kline=lambda symbol, interval: None,
             release_depth=provider.release,
             get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
             precision_resolver=lambda symbol: (2, 3),
             ws_manager=ws_manager,
         )
@@ -150,16 +154,19 @@ def test_gateway_subscriber_count_and_idle_release() -> None:
     asyncio.run(run())
 
 
-def test_gateway_broadcasts_ticker_when_depth_disabled() -> None:
+def test_gateway_broadcasts_ticker_by_default() -> None:
     async def run() -> None:
         ws_manager = FakeWsManager()
         provider = FakeProvider()
         gateway = SpotMarketGateway(
-            provider_depth_enabled=lambda: False,
-            provider_ticker_enabled=lambda: True,
             ensure_depth=provider.ensure,
+            ensure_kline=lambda symbol, interval: None,
             release_depth=provider.release,
+            get_depth=provider.get_depth,
             get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
             precision_resolver=lambda symbol: (2, 3),
             ws_manager=ws_manager,
         )
@@ -188,12 +195,14 @@ def test_gateway_broadcasts_provider_trade_once() -> None:
         ws_manager = FakeWsManager()
         provider = FakeProvider()
         gateway = SpotMarketGateway(
-            provider_depth_enabled=lambda: False,
-            provider_ticker_enabled=lambda: False,
-            provider_trades_enabled=lambda: True,
             ensure_depth=provider.ensure,
+            ensure_kline=lambda symbol, interval: None,
             release_depth=provider.release,
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
             get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
             precision_resolver=lambda symbol: (2, 3),
             ws_manager=ws_manager,
         )
@@ -224,14 +233,14 @@ def test_gateway_broadcasts_provider_kline_once_without_trade_aggregation() -> N
         provider = FakeProvider()
         ensured_klines: list[tuple[str, str]] = []
         gateway = SpotMarketGateway(
-            provider_depth_enabled=lambda: False,
-            provider_ticker_enabled=lambda: False,
-            provider_trades_enabled=lambda: False,
-            provider_kline_enabled=lambda: True,
             ensure_depth=provider.ensure,
             release_depth=provider.release,
             ensure_kline=lambda symbol, interval: ensured_klines.append((symbol, interval)),
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
             get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
             precision_resolver=lambda symbol: (2, 3),
             ws_manager=ws_manager,
         )
@@ -254,6 +263,37 @@ def test_gateway_broadcasts_provider_kline_once_without_trade_aggregation() -> N
         await gateway.release_symbol_if_idle("btcusdt", idle_delay_seconds=0)
         await asyncio.sleep(0.05)
         assert provider.released == ["BTCUSDT"]
+
+    asyncio.run(run())
+
+
+def test_gateway_does_not_ensure_provider_ws_for_internal_symbol() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = FakeProvider()
+        gateway = SpotMarketGateway(
+            ensure_depth=provider.ensure,
+            ensure_kline=lambda symbol, interval: (_ for _ in ()).throw(
+                AssertionError("internal symbol must not ensure provider kline")
+            ),
+            release_depth=provider.release,
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: False,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+        )
+
+        ws_manager.count = 1
+        await gateway.ensure_symbol("MFCUSDT")
+        await asyncio.sleep(0.02)
+        assert provider.ensured == []
+        assert ws_manager.broadcasts == []
+        assert ws_manager.ticker_broadcasts == []
+        assert ws_manager.trade_broadcasts == []
+        assert ws_manager.kline_broadcasts == []
 
     asyncio.run(run())
 

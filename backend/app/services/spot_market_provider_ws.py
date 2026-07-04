@@ -87,34 +87,6 @@ def normalize_spot_ws_symbol(value: Any) -> str:
     return "".join(ch for ch in raw if ch.isalnum())
 
 
-def spot_provider_ws_depth_enabled() -> bool:
-    return bool(
-        getattr(settings, "SPOT_PROVIDER_WS_ENABLED", False)
-        and getattr(settings, "SPOT_PROVIDER_WS_DEPTH_ENABLED", False)
-    )
-
-
-def spot_provider_ws_ticker_enabled() -> bool:
-    return bool(
-        getattr(settings, "SPOT_PROVIDER_WS_ENABLED", False)
-        and getattr(settings, "SPOT_PROVIDER_WS_TICKER_ENABLED", False)
-    )
-
-
-def spot_provider_ws_trades_enabled() -> bool:
-    return bool(
-        getattr(settings, "SPOT_PROVIDER_WS_ENABLED", False)
-        and getattr(settings, "SPOT_PROVIDER_WS_TRADES_ENABLED", False)
-    )
-
-
-def spot_provider_ws_kline_enabled() -> bool:
-    return bool(
-        getattr(settings, "SPOT_PROVIDER_WS_ENABLED", False)
-        and getattr(settings, "SPOT_PROVIDER_WS_KLINE_ENABLED", False)
-    )
-
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -707,25 +679,14 @@ class SpotMarketProviderWsService:
             self._kline_generations.clear()
 
     def ensure_symbol(self, symbol: str) -> None:
-        if (
-            not spot_provider_ws_depth_enabled()
-            and not spot_provider_ws_ticker_enabled()
-            and not spot_provider_ws_trades_enabled()
-        ):
-            return
         local_symbol = normalize_spot_ws_symbol(symbol)
         if not local_symbol:
             return
-        if spot_provider_ws_depth_enabled():
-            self._ensure_depth_symbol(local_symbol)
-        if spot_provider_ws_ticker_enabled():
-            self._ensure_ticker_symbol(local_symbol)
-        if spot_provider_ws_trades_enabled():
-            self._ensure_trades_symbol(local_symbol)
+        self._ensure_depth_symbol(local_symbol)
+        self._ensure_ticker_symbol(local_symbol)
+        self._ensure_trades_symbol(local_symbol)
 
     def ensure_kline(self, symbol: str, interval: str) -> None:
-        if not spot_provider_ws_kline_enabled():
-            return
         local_symbol = normalize_spot_ws_symbol(symbol)
         normalized_interval = normalize_spot_ws_kline_interval(interval)
         if not local_symbol:
@@ -1020,7 +981,7 @@ class SpotMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        while not stop_event.is_set() and spot_provider_ws_depth_enabled():
+        while not stop_event.is_set():
             try:
                 await self._run_bitget_depth_ws(subscription, stop_event, generation)
             except Exception:
@@ -1039,7 +1000,7 @@ class SpotMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        while not stop_event.is_set() and spot_provider_ws_ticker_enabled():
+        while not stop_event.is_set():
             try:
                 await self._run_bitget_ticker_ws(subscription, stop_event, generation)
             except Exception:
@@ -1058,7 +1019,7 @@ class SpotMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        while not stop_event.is_set() and spot_provider_ws_trades_enabled():
+        while not stop_event.is_set():
             try:
                 await self._run_bitget_trades_ws(subscription, stop_event, generation)
             except Exception:
@@ -1077,7 +1038,7 @@ class SpotMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        while not stop_event.is_set() and spot_provider_ws_kline_enabled():
+        while not stop_event.is_set():
             try:
                 await self._run_bitget_kline_ws(subscription, stop_event, generation)
             except Exception:
@@ -1097,7 +1058,7 @@ class SpotMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        if stop_event.is_set() or not spot_provider_ws_depth_enabled():
+        if stop_event.is_set():
             return
         url = str(subscription.ws_url or "").strip()
         if not url:
@@ -1115,7 +1076,7 @@ class SpotMarketProviderWsService:
         }
         key = (subscription.provider, subscription.local_symbol)
         async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5) as websocket:
-            if stop_event.is_set() or not spot_provider_ws_depth_enabled():
+            if stop_event.is_set():
                 await websocket.close()
                 return
             loop = asyncio.get_running_loop()
@@ -1134,7 +1095,7 @@ class SpotMarketProviderWsService:
             try:
                 await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
                 last_ping_at = time.monotonic()
-                while not stop_event.is_set() and spot_provider_ws_depth_enabled():
+                while not stop_event.is_set():
                     if time.monotonic() - last_ping_at >= 25:
                         await websocket.send("ping")
                         last_ping_at = time.monotonic()
@@ -1163,7 +1124,7 @@ class SpotMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        if stop_event.is_set() or not spot_provider_ws_ticker_enabled():
+        if stop_event.is_set():
             return
         url = str(subscription.ws_url or "").strip()
         if not url:
@@ -1181,7 +1142,7 @@ class SpotMarketProviderWsService:
         }
         key = (subscription.provider, subscription.local_symbol)
         async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5) as websocket:
-            if stop_event.is_set() or not spot_provider_ws_ticker_enabled():
+            if stop_event.is_set():
                 await websocket.close()
                 return
             loop = asyncio.get_running_loop()
@@ -1200,7 +1161,7 @@ class SpotMarketProviderWsService:
             try:
                 await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
                 last_ping_at = time.monotonic()
-                while not stop_event.is_set() and spot_provider_ws_ticker_enabled():
+                while not stop_event.is_set():
                     if time.monotonic() - last_ping_at >= 25:
                         await websocket.send("ping")
                         last_ping_at = time.monotonic()
@@ -1229,7 +1190,7 @@ class SpotMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        if stop_event.is_set() or not spot_provider_ws_trades_enabled():
+        if stop_event.is_set():
             return
         url = str(subscription.ws_url or "").strip()
         if not url:
@@ -1247,7 +1208,7 @@ class SpotMarketProviderWsService:
         }
         key = (subscription.provider, subscription.local_symbol)
         async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5) as websocket:
-            if stop_event.is_set() or not spot_provider_ws_trades_enabled():
+            if stop_event.is_set():
                 await websocket.close()
                 return
             loop = asyncio.get_running_loop()
@@ -1266,7 +1227,7 @@ class SpotMarketProviderWsService:
             try:
                 await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
                 last_ping_at = time.monotonic()
-                while not stop_event.is_set() and spot_provider_ws_trades_enabled():
+                while not stop_event.is_set():
                     if time.monotonic() - last_ping_at >= 25:
                         await websocket.send("ping")
                         last_ping_at = time.monotonic()
@@ -1295,7 +1256,7 @@ class SpotMarketProviderWsService:
         stop_event: threading.Event,
         generation: int,
     ) -> None:
-        if stop_event.is_set() or not spot_provider_ws_kline_enabled():
+        if stop_event.is_set():
             return
         url = str(subscription.ws_url or "").strip()
         if not url:
@@ -1313,7 +1274,7 @@ class SpotMarketProviderWsService:
         }
         key = (subscription.provider, subscription.local_symbol, subscription.interval)
         async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5) as websocket:
-            if stop_event.is_set() or not spot_provider_ws_kline_enabled():
+            if stop_event.is_set():
                 await websocket.close()
                 return
             loop = asyncio.get_running_loop()
@@ -1333,7 +1294,7 @@ class SpotMarketProviderWsService:
             try:
                 await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
                 last_ping_at = time.monotonic()
-                while not stop_event.is_set() and spot_provider_ws_kline_enabled():
+                while not stop_event.is_set():
                     if time.monotonic() - last_ping_at >= 25:
                         await websocket.send("ping")
                         last_ping_at = time.monotonic()
@@ -1498,8 +1459,6 @@ def get_spot_provider_ws_depth(
     max_age_ms: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> Optional[DepthResponse]:
-    if not spot_provider_ws_depth_enabled():
-        return None
     return spot_market_provider_ws.get_fresh_depth(symbol, max_age_ms=max_age_ms, limit=limit)
 
 
@@ -1516,8 +1475,6 @@ def get_spot_provider_ws_ticker(
     *,
     max_age_ms: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
-    if not spot_provider_ws_ticker_enabled():
-        return None
     return spot_market_provider_ws.get_fresh_ticker(symbol, max_age_ms=max_age_ms)
 
 
@@ -1535,8 +1492,6 @@ def get_spot_provider_ws_trades(
     max_age_ms: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> Optional[TradesResponse]:
-    if not spot_provider_ws_trades_enabled():
-        return None
     return spot_market_provider_ws.get_fresh_trades(symbol, max_age_ms=max_age_ms, limit=limit)
 
 
@@ -1555,8 +1510,6 @@ def get_spot_provider_ws_klines(
     max_age_ms: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
-    if not spot_provider_ws_kline_enabled():
-        return None
     return spot_market_provider_ws.get_fresh_klines(
         symbol,
         interval,
