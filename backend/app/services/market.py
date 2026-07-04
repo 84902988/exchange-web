@@ -987,7 +987,7 @@ def get_depth(db: Session, symbol: str, limit: int = 20, *, fast: bool = False) 
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        ws_provider_code = _primary_spot_ws_provider_code(db, pair)
+        ws_provider_code = _primary_spot_ws_provider_code(db, pair, domain="depth")
         if ws_provider_code:
             live_depth = get_spot_provider_ws_depth(pair.symbol, provider=ws_provider_code, limit=limit)
             if live_depth is not None:
@@ -1112,12 +1112,14 @@ def _primary_spot_market_provider_for_pair(
 def _primary_spot_ws_provider_code(
     db: Session,
     pair: TradingPair,
+    *,
+    domain: str = "depth",
 ) -> Optional[str]:
     primary_provider = _primary_spot_market_provider_for_pair(db, pair)
     if primary_provider is None:
         return None
     provider_code = str(primary_provider.provider_code or "").strip().upper()
-    if spot_provider_ws_supports_provider(provider_code):
+    if spot_provider_ws_supports_provider(provider_code, domain=domain):
         return provider_code
     return None
 
@@ -1494,7 +1496,7 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = Fa
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
     primary_provider = providers[0] if providers else None
     try:
-        if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code):
+        if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code, domain="ticker"):
             live_record = get_spot_provider_ws_ticker(pair.symbol, provider=primary_provider.provider_code)
             if live_record is not None:
                 live_ticker = _spot_provider_ws_ticker_to_item(pair, live_record)
@@ -1591,7 +1593,7 @@ def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *
     last_error: Optional[Exception] = None
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
     primary_provider = providers[0] if providers else None
-    if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code):
+    if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code, domain="trades"):
         try:
             live_trades = get_spot_provider_ws_trades(
                 pair.symbol,
@@ -2777,7 +2779,7 @@ def get_klines(
             try:
                 providers = _enabled_spot_market_providers_for_pair(db, pair)
                 primary_provider = providers[0] if providers else None
-                if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code):
+                if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code, domain="kline"):
                     live_ws_klines = get_spot_provider_ws_klines(
                         pair.symbol,
                         interval,
