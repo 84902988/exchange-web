@@ -853,11 +853,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     String(spotMarket.displayPrice ?? ''),
     pricePrecision,
   ) || '--';
-  const orderbookReferencePrice = formatPriceBySymbol(
-    symbol,
-    String(spotMarket.orderbookMidPrice ?? spotMarket.displayPrice ?? ''),
-    pricePrecision,
-  ) || '--';
+  const orderbookReferencePrice = spotLastPrice;
   const formMarketPrice = formatOrderInputPriceBySymbol(
     symbol,
     String(spotMarket.orderbookMidPrice ?? spotMarket.bestAsk ?? spotMarket.bestBid ?? spotMarket.displayPrice ?? ''),
