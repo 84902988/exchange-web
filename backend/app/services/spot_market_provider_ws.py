@@ -155,6 +155,42 @@ def _decimal_to_str(value: Decimal) -> str:
     return format(value.normalize(), "f") if value == value.normalize() else format(value, "f")
 
 
+def _bitget_change_ratio(row: dict[str, Any]) -> Optional[Decimal]:
+    return _to_decimal(row.get("change24h"))
+
+
+def _bitget_open_24h(row: dict[str, Any], last_price: Decimal, change_ratio: Optional[Decimal]) -> Decimal:
+    open_24h = _to_decimal(row.get("open") or row.get("open24h"))
+    if open_24h is not None and open_24h > 0:
+        return open_24h
+    if change_ratio is not None and change_ratio != Decimal("-1"):
+        inferred_open = last_price / (Decimal("1") + change_ratio)
+        if inferred_open > 0:
+            return inferred_open
+    return last_price
+
+
+def _bitget_price_change_24h(
+    *,
+    last_price: Decimal,
+    open_24h: Decimal,
+    change_ratio: Optional[Decimal],
+) -> Decimal:
+    if change_ratio is not None and change_ratio != Decimal("-1"):
+        return last_price * change_ratio / (Decimal("1") + change_ratio)
+    if open_24h > 0:
+        return last_price - open_24h
+    return Decimal("0")
+
+
+def _bitget_price_change_percent(open_24h: Decimal, price_change_24h: Decimal, change_ratio: Optional[Decimal]) -> Decimal:
+    if change_ratio is not None:
+        return change_ratio * Decimal("100")
+    if open_24h > 0:
+        return (price_change_24h / open_24h) * Decimal("100")
+    return Decimal("0")
+
+
 def _normalize_depth_side(levels: Any, *, reverse: bool, limit: int) -> list[dict[str, str]]:
     normalized: list[tuple[Decimal, Decimal]] = []
     if not isinstance(levels, list):
@@ -432,7 +468,8 @@ def normalize_bitget_ticker_message(
     last_price = _to_decimal(row.get("lastPr") or row.get("last") or row.get("close"))
     if last_price is None or last_price <= 0:
         return None
-    open_24h = _to_decimal(row.get("open24h") or row.get("openUtc")) or last_price
+    change_ratio = _bitget_change_ratio(row)
+    open_24h = _bitget_open_24h(row, last_price, change_ratio)
     high_24h = _to_decimal(row.get("high24h")) or last_price
     low_24h = _to_decimal(row.get("low24h")) or last_price
     base_volume = _to_decimal(row.get("baseVolume") or row.get("baseVol")) or Decimal("0")
@@ -442,10 +479,12 @@ def normalize_bitget_ticker_message(
     )
     if quote_volume <= 0 and base_volume > 0:
         quote_volume = base_volume * last_price
-    price_change_24h = last_price - open_24h
-    price_change_percent = Decimal("0")
-    if open_24h > 0:
-        price_change_percent = (price_change_24h / open_24h) * Decimal("100")
+    price_change_24h = _bitget_price_change_24h(
+        last_price=last_price,
+        open_24h=open_24h,
+        change_ratio=change_ratio,
+    )
+    price_change_percent = _bitget_price_change_percent(open_24h, price_change_24h, change_ratio)
 
     now_ms = _now_ms()
     exchange_ts = _spot_provider_ts(row.get("ts"))

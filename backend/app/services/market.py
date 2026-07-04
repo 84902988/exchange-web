@@ -134,8 +134,61 @@ def _to_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
 
 
+def _to_optional_decimal(value: Any) -> Optional[Decimal]:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
 def _format_percent(v: Decimal) -> str:
     return format(v.quantize(Decimal("0.01")), "f")
+
+
+def _bitget_spot_change_ratio(row: Dict[str, Any]) -> Optional[Decimal]:
+    return _to_optional_decimal(row.get("change24h"))
+
+
+def _bitget_spot_open_24h(
+    row: Dict[str, Any],
+    last_price: Decimal,
+    change_ratio: Optional[Decimal],
+) -> Decimal:
+    open_24h = _to_optional_decimal(row.get("open") or row.get("open24h"))
+    if open_24h is not None and open_24h > 0:
+        return open_24h
+    if change_ratio is not None and change_ratio != Decimal("-1"):
+        inferred_open = last_price / (Decimal("1") + change_ratio)
+        if inferred_open > 0:
+            return inferred_open
+    return last_price
+
+
+def _bitget_spot_price_change_24h(
+    *,
+    last_price: Decimal,
+    open_24h: Decimal,
+    change_ratio: Optional[Decimal],
+) -> Decimal:
+    if change_ratio is not None and change_ratio != Decimal("-1"):
+        return last_price * change_ratio / (Decimal("1") + change_ratio)
+    if open_24h > 0:
+        return last_price - open_24h
+    return Decimal("0")
+
+
+def _bitget_spot_price_change_percent(
+    open_24h: Decimal,
+    price_change_24h: Decimal,
+    change_ratio: Optional[Decimal],
+) -> Decimal:
+    if change_ratio is not None:
+        return change_ratio * Decimal("100")
+    if open_24h > 0:
+        return (price_change_24h / open_24h) * Decimal("100")
+    return Decimal("0")
 
 
 def _normalize_data_source(pair: TradingPair) -> str:
@@ -1119,6 +1172,8 @@ def _spot_ticker_from_provider(
     provider_code: str,
     payload: Any,
 ) -> TickerItem:
+    price_change_24h_override: Optional[Decimal] = None
+    price_change_percent_override: Optional[Decimal] = None
     if provider_code == "OKX_SPOT":
         row = _spot_provider_first_row(payload)
         last_price = _to_decimal(row.get("last"))
@@ -1131,12 +1186,23 @@ def _spot_ticker_from_provider(
     elif provider_code == "BITGET_SPOT":
         row = _spot_provider_first_row(payload)
         last_price = _to_decimal(row.get("lastPr") or row.get("last") or row.get("close"))
-        open_24h = _to_decimal(row.get("open24h") or row.get("openUtc"))
+        change_ratio = _bitget_spot_change_ratio(row)
+        open_24h = _bitget_spot_open_24h(row, last_price, change_ratio)
         high_24h = _to_decimal(row.get("high24h"), last_price)
         low_24h = _to_decimal(row.get("low24h"), last_price)
         base_volume = _to_decimal(row.get("baseVolume") or row.get("baseVol"))
         quote_volume = _to_decimal(row.get("quoteVolume") or row.get("quoteVol") or row.get("usdtVolume"))
         ts_ms = _spot_provider_ts(row.get("ts"))
+        price_change_24h_override = _bitget_spot_price_change_24h(
+            last_price=last_price,
+            open_24h=open_24h,
+            change_ratio=change_ratio,
+        )
+        price_change_percent_override = _bitget_spot_price_change_percent(
+            open_24h,
+            price_change_24h_override,
+            change_ratio,
+        )
     elif provider_code == "BINANCE_SPOT" and isinstance(payload, dict):
         last_price = _to_decimal(payload.get("lastPrice"))
         price_change = _to_decimal(payload.get("priceChange"))
@@ -1160,9 +1226,9 @@ def _spot_ticker_from_provider(
     if quote_volume <= 0 and base_volume > 0:
         quote_volume = base_volume * last_price
 
-    price_change_24h = last_price - open_24h
-    price_change_percent = Decimal("0")
-    if open_24h > 0:
+    price_change_24h = price_change_24h_override if price_change_24h_override is not None else last_price - open_24h
+    price_change_percent = price_change_percent_override if price_change_percent_override is not None else Decimal("0")
+    if price_change_percent_override is None and open_24h > 0:
         price_change_percent = (price_change_24h / open_24h) * Decimal("100")
     updated_at = datetime.utcfromtimestamp(ts_ms / 1000).isoformat()
 
@@ -1367,9 +1433,14 @@ def _spot_provider_ws_ticker_to_item(pair: TradingPair, record: dict[str, Any]) 
     if quote_volume <= 0 and base_volume > 0:
         quote_volume = base_volume * last_price
     price_change_24h = _to_decimal(record.get("price_change_24h"), last_price - open_24h)
-    price_change_percent = _to_decimal(record.get("price_change_percent"))
-    if price_change_percent <= 0 and price_change_24h != 0 and open_24h > 0:
+    raw_change_percent = record.get("price_change_percent")
+    if raw_change_percent in (None, ""):
+        raw_change_percent = record.get("price_change_percent_24h")
+    price_change_percent = _to_optional_decimal(raw_change_percent)
+    if price_change_percent is None and price_change_24h != 0 and open_24h > 0:
         price_change_percent = (price_change_24h / open_24h) * Decimal("100")
+    if price_change_percent is None:
+        price_change_percent = Decimal("0")
     updated_at = str(record.get("updated_at") or datetime.utcnow().isoformat())
 
     return TickerItem(

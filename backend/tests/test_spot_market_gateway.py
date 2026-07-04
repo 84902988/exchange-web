@@ -754,6 +754,37 @@ def test_external_spot_ticker_prefers_live_ws() -> None:
         market._enabled_spot_market_providers_for_pair = original_enabled_providers
 
 
+def test_bitget_rest_ticker_uses_provider_change24h_ratio() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        price_precision = 2
+        amount_precision = 3
+
+    ticker = market._spot_ticker_from_provider(
+        pair=Pair(),
+        provider_code=market.PROVIDER_BITGET_SPOT,
+        payload={
+            "data": [
+                {
+                    "lastPr": "99",
+                    "open": "100",
+                    "openUtc": "120",
+                    "change24h": "-0.01",
+                    "high24h": "105",
+                    "low24h": "95",
+                    "baseVolume": "10",
+                    "quoteVolume": "1000",
+                    "ts": "1000",
+                }
+            ]
+        },
+    )
+
+    assert ticker.open_24h == "100.00"
+    assert ticker.price_change_24h == "-1.00"
+    assert ticker.price_change_percent == "-1.00"
+
+
 def test_get_trades_prefers_live_ws_and_falls_back_to_rest() -> None:
     class Pair:
         data_source = market.DATA_SOURCE_BINANCE
