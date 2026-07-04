@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
+from app.routers import market as market_router
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services import market
 from app.services import spot_market_gateway as gateway_module
@@ -326,7 +327,7 @@ def test_gateway_does_not_start_bitget_when_primary_provider_has_no_ws() -> None
     asyncio.run(run())
 
 
-def test_gateway_okx_primary_ensures_depth_without_kline() -> None:
+def test_gateway_okx_primary_ensures_depth_and_kline() -> None:
     async def run() -> None:
         ensure_calls: list[str] = []
         ensure_kline_calls: list[tuple[str, str]] = []
@@ -341,14 +342,14 @@ def test_gateway_okx_primary_ensures_depth_without_kline() -> None:
         await gateway.ensure_symbol("BTCUSDT")
 
         assert ensure_calls == ["BTCUSDT"]
-        assert ensure_kline_calls == []
+        assert ensure_kline_calls == [("BTCUSDT", "1m")]
         assert gateway._symbol_providers["BTCUSDT"] == market.PROVIDER_OKX_SPOT
-        assert gateway._ensured_kline_intervals.get("BTCUSDT") is None
+        assert gateway._ensured_kline_intervals.get("BTCUSDT") == {"1m"}
 
     asyncio.run(run())
 
 
-def test_gateway_okx_primary_broadcasts_depth_ticker_trades_without_kline() -> None:
+def test_gateway_okx_primary_broadcasts_all_supported_domains() -> None:
     class OkxProvider(FakeProvider):
         def __init__(self) -> None:
             super().__init__()
@@ -385,7 +386,26 @@ def test_gateway_okx_primary_broadcasts_depth_ticker_trades_without_kline() -> N
             )
 
         def get_klines(self, symbol: str, interval: str, **kwargs) -> dict:
-            raise AssertionError("OKX kline WS must not be read")
+            return {
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "provider": market.PROVIDER_OKX_SPOT,
+                "source": "LIVE_WS",
+                "freshness": "LIVE",
+                "items": [
+                    {
+                        "open_time": 1000,
+                        "close_time": 61000,
+                        "open": "2",
+                        "high": "3",
+                        "low": "1",
+                        "close": "2.5",
+                        "volume": "10",
+                        "quote_volume": "25",
+                        "provider": market.PROVIDER_OKX_SPOT,
+                    }
+                ],
+            }
 
     async def run() -> None:
         ws_manager = FakeWsManager()
@@ -410,11 +430,13 @@ def test_gateway_okx_primary_broadcasts_depth_ticker_trades_without_kline() -> N
         await asyncio.sleep(0.05)
 
         assert provider.ensured == ["BTCUSDT"]
-        assert ensured_klines == []
+        assert ("BTCUSDT", "1m") in ensured_klines
         assert ws_manager.broadcasts[-1][1].provider == market.PROVIDER_OKX_SPOT
         assert ws_manager.ticker_broadcasts[-1][1]["provider"] == market.PROVIDER_OKX_SPOT
         assert ws_manager.trade_broadcasts[-1]["trade_id"] == "okx-trade-1"
-        assert ws_manager.kline_broadcasts == []
+        assert len(ws_manager.kline_broadcasts) == 1
+        assert ws_manager.kline_broadcasts[0]["source"] == "LIVE_WS"
+        assert ws_manager.kline_broadcasts[0]["kline"]["provider"] == market.PROVIDER_OKX_SPOT
 
     asyncio.run(run())
 
@@ -1504,7 +1526,41 @@ def test_internal_pair_does_not_use_live_ws_trades() -> None:
         market._get_internal_trades = original_get_internal_trades
 
 
-def test_get_klines_prefers_live_ws_and_falls_back_to_rest() -> None:
+def test_market_kline_router_accepts_end_time_ms_alias() -> None:
+    original_get_klines = market_router.get_klines
+    calls: list[dict] = []
+
+    def fake_get_klines(**kwargs):
+        calls.append(dict(kwargs))
+        return {"symbol": kwargs["symbol"], "interval": kwargs["interval"], "items": []}
+
+    try:
+        market_router.get_klines = fake_get_klines
+
+        market_router.kline(
+            symbol="BTCUSDT",
+            interval="1m",
+            limit=500,
+            end_time=111,
+            end_time_ms=222,
+            db=None,
+        )
+        assert calls[-1]["end_time_ms"] == 222
+
+        market_router.kline(
+            symbol="BTCUSDT",
+            interval="1m",
+            limit=500,
+            end_time=333,
+            end_time_ms=None,
+            db=None,
+        )
+        assert calls[-1]["end_time_ms"] == 333
+    finally:
+        market_router.get_klines = original_get_klines
+
+
+def test_get_klines_uses_rest_history_with_live_ws_overlay() -> None:
     class Pair:
         data_source = market.DATA_SOURCE_BINANCE
         price_precision = 2
@@ -1555,18 +1611,25 @@ def test_get_klines_prefers_live_ws_and_falls_back_to_rest() -> None:
         market._get_active_pair = lambda db, symbol: Pair(symbol)
         market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
         market.get_spot_provider_ws_klines = lambda symbol, interval, **kwargs: live_klines_for(symbol)
-        market.get_klines_cache_first = lambda *args, **kwargs: [
-            {
-                "open_time": 60000,
-                "close_time": 120000,
-                "open": "1",
-                "high": "2",
-                "low": "1",
-                "close": "1.5",
-                "volume": "5",
-                "quote_volume": "7.5",
+        def cache_first(*args, **kwargs):
+            market._SPOT_LAST_GOOD_KLINES[(kwargs["symbol"], kwargs["interval"])] = {
+                "provider": market.PROVIDER_BITGET_SPOT,
+                "updated_at": "2026-07-04T00:00:00",
             }
-        ]
+            return [
+                {
+                    "open_time": 60000,
+                    "close_time": 120000,
+                    "open": "1",
+                    "high": "2",
+                    "low": "1",
+                    "close": "1.5",
+                    "volume": "5",
+                    "quote_volume": "7.5",
+                }
+            ]
+
+        market.get_klines_cache_first = cache_first
         market._fetch_external_spot_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("direct REST fetch should not be called in get_klines test")
         )
@@ -1574,8 +1637,7 @@ def test_get_klines_prefers_live_ws_and_falls_back_to_rest() -> None:
         for symbol in ("BTCUSDT", "ETHUSDT"):
             result = market.get_klines(None, symbol, "1m", limit=30)
             assert result["symbol"] == symbol
-            assert result["source"] == "LIVE_WS"
-            assert result["freshness"] == "LIVE"
+            assert result.get("source") is None
             assert result["provider"] == "BITGET_SPOT"
             assert result["items"][-1]["open_time"] == 120000
             assert result["items"][-1]["close"] == "2.5"
@@ -1583,7 +1645,7 @@ def test_get_klines_prefers_live_ws_and_falls_back_to_rest() -> None:
         market.get_spot_provider_ws_klines = lambda symbol, interval, **kwargs: None
         fallback = market.get_klines(None, "BTCUSDT", "1m", limit=30)
         assert fallback.get("source") is None
-        assert fallback["provider"] == "EXTERNAL_SPOT"
+        assert fallback["provider"] == "BITGET_SPOT"
         assert fallback["items"][-1]["close"] == "1.5"
     finally:
         market._get_active_pair = original_get_active_pair
@@ -1591,6 +1653,78 @@ def test_get_klines_prefers_live_ws_and_falls_back_to_rest() -> None:
         market.get_spot_provider_ws_klines = original_get_ws_klines
         market.get_klines_cache_first = original_get_klines_cache_first
         market._fetch_external_spot_klines = original_fetch_external
+
+
+def test_get_klines_limit_500_does_not_return_live_ws_cache_only() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    provider = _spot_provider(market.PROVIDER_OKX_SPOT)
+    history_items = [
+        {
+            "open_time": (index + 1) * 60000,
+            "close_time": (index + 2) * 60000,
+            "open": "1",
+            "high": "2",
+            "low": "1",
+            "close": "1.5",
+            "volume": "5",
+            "quote_volume": "7.5",
+        }
+        for index in range(500)
+    ]
+    live_item = {
+        "open_time": 501 * 60000,
+        "close_time": 502 * 60000,
+        "open": "2",
+        "high": "3",
+        "low": "1",
+        "close": "2.5",
+        "volume": "10",
+        "quote_volume": "25",
+    }
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_provider_ws_klines = lambda symbol, interval, **kwargs: {
+            "symbol": "BTCUSDT",
+            "interval": "1m",
+            "provider": market.PROVIDER_OKX_SPOT,
+            "source": "LIVE_WS",
+            "freshness": "LIVE",
+            "items": [live_item],
+        }
+
+        def cache_first(*args, **kwargs):
+            assert kwargs["limit"] == 500
+            assert kwargs.get("end_time_ms") is None
+            market._SPOT_LAST_GOOD_KLINES[(Pair.symbol, kwargs["interval"])] = {
+                "provider": market.PROVIDER_OKX_SPOT,
+                "updated_at": "2026-07-05T00:00:00",
+            }
+            return list(history_items)
+
+        market.get_klines_cache_first = cache_first
+
+        result = market.get_klines(None, "BTCUSDT", "1m", limit=500)
+        assert len(result["items"]) == 500
+        assert result.get("source") is None
+        assert result["provider"] == market.PROVIDER_OKX_SPOT
+        assert result["items"][-1]["open_time"] == live_item["open_time"]
+        assert result["items"][-1]["close"] == "2.5"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
 
 
 def test_kline_history_pagination_does_not_read_live_ws() -> None:
@@ -1635,7 +1769,7 @@ def test_kline_history_pagination_does_not_read_live_ws() -> None:
         market.get_klines_cache_first = original_get_klines_cache_first
 
 
-def test_okx_primary_klines_skip_live_ws_and_use_rest_fallback() -> None:
+def test_okx_primary_klines_use_okx_live_ws_without_bitget_cache() -> None:
     class Pair:
         symbol = "BTCUSDT"
         data_source = market.DATA_SOURCE_BINANCE
@@ -1652,31 +1786,188 @@ def test_okx_primary_klines_skip_live_ws_and_use_rest_fallback() -> None:
             _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
             _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
         )
-        market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("OKX_SPOT kline WS is not implemented and must not be read")
-        )
-        market.get_klines_cache_first = lambda *args, **kwargs: [
+        market.get_spot_provider_ws_klines = lambda symbol, interval, **kwargs: (
             {
-                "open_time": 60000,
-                "close_time": 120000,
-                "open": "1",
-                "high": "2",
-                "low": "1",
-                "close": "1.5",
-                "volume": "5",
-                "quote_volume": "7.5",
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "provider": market.PROVIDER_OKX_SPOT,
+                "source": "LIVE_WS",
+                "freshness": "LIVE",
+                "updated_at": "2026-07-05T00:00:00",
+                "items": [
+                    {
+                        "open_time": 120000,
+                        "close_time": 180000,
+                        "open": "2",
+                        "high": "3",
+                        "low": "1",
+                        "close": "2.5",
+                        "volume": "10",
+                        "quote_volume": "25",
+                    }
+                ],
             }
-        ]
+            if kwargs.get("provider") == market.PROVIDER_OKX_SPOT
+            else (_ for _ in ()).throw(AssertionError("must not steal Bitget kline LIVE_WS when OKX is primary"))
+        )
+        def cache_first(*args, **kwargs):
+            market._SPOT_LAST_GOOD_KLINES[(Pair.symbol, kwargs["interval"])] = {
+                "provider": market.PROVIDER_OKX_SPOT,
+                "updated_at": "2026-07-05T00:00:00",
+            }
+            return [
+                {
+                    "open_time": 60000,
+                    "close_time": 120000,
+                    "open": "1",
+                    "high": "2",
+                    "low": "1",
+                    "close": "1.5",
+                    "volume": "5",
+                    "quote_volume": "7.5",
+                }
+            ]
+
+        market.get_klines_cache_first = cache_first
 
         result = market.get_klines(None, "BTCUSDT", "1m", limit=30)
         assert result.get("source") is None
-        assert result["provider"] == "EXTERNAL_SPOT"
+        assert result["provider"] == market.PROVIDER_OKX_SPOT
+        assert result["items"][-1]["close"] == "2.5"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
+
+
+def test_okx_primary_kline_live_ws_miss_falls_back_to_okx_rest() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    original_spot_provider_symbol = market._spot_provider_symbol
+    original_request_json = market.request_contract_market_provider_json
+    original_mark_success = market.mark_contract_market_provider_success
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
+            _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
+            _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
+        )
+        market.get_spot_provider_ws_klines = lambda symbol, interval, **kwargs: (
+            None
+            if kwargs.get("provider") == market.PROVIDER_OKX_SPOT
+            else (_ for _ in ()).throw(AssertionError("must not steal Bitget kline LIVE_WS when OKX is primary"))
+        )
+        market.get_klines_cache_first = lambda *args, **kwargs: kwargs["fetch_external"](
+            kwargs["limit"],
+            kwargs.get("end_time_ms"),
+        )
+        market._spot_provider_symbol = lambda *args, **kwargs: "BTC-USDT"
+        market.mark_contract_market_provider_success = lambda *args, **kwargs: None
+
+        def request_json(provider, endpoint_type, provider_symbol, **kwargs):
+            assert provider.provider_code == market.PROVIDER_OKX_SPOT
+            assert endpoint_type == "kline"
+            assert provider_symbol == "BTC-USDT"
+            assert kwargs["extra_params"] == {"bar": "1m"}
+            return {
+                "data": [
+                    ["60000", "1", "2", "1", "1.5", "5", "7.5", "7.5", "1"],
+                ]
+            }
+
+        market.request_contract_market_provider_json = request_json
+
+        result = market.get_klines(None, "BTCUSDT", "1m", limit=30)
+        assert result.get("source") is None
+        assert result["provider"] == market.PROVIDER_OKX_SPOT
         assert result["items"][-1]["close"] == "1.5"
     finally:
         market._get_active_pair = original_get_active_pair
         market._enabled_spot_market_providers_for_pair = original_enabled_providers
         market.get_spot_provider_ws_klines = original_get_ws_klines
         market.get_klines_cache_first = original_get_klines_cache_first
+        market._spot_provider_symbol = original_spot_provider_symbol
+        market.request_contract_market_provider_json = original_request_json
+        market.mark_contract_market_provider_success = original_mark_success
+
+
+def test_okx_historical_klines_use_history_candles_after_pagination() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    calls: list[tuple[str, int, dict]] = []
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_spot_provider_symbol = market._spot_provider_symbol
+    original_request_json = market.request_contract_market_provider_json
+    original_mark_success = market.mark_contract_market_provider_success
+    try:
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
+            _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
+            _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
+        )
+        market._spot_provider_symbol = lambda *args, **kwargs: "BTC-USDT"
+        market.mark_contract_market_provider_success = lambda *args, **kwargs: None
+
+        def row(open_time: int) -> list[str]:
+            return [str(open_time), "1", "2", "1", "1.5", "5", "7.5", "7.5", "1"]
+
+        def request_json(provider, endpoint_type, provider_symbol, **kwargs):
+            assert provider.provider_code == market.PROVIDER_OKX_SPOT
+            assert provider_symbol == "BTC-USDT"
+            calls.append((endpoint_type, kwargs["limit"], dict(kwargs["extra_params"])))
+            if len(calls) == 1:
+                assert endpoint_type == "kline_history"
+                assert kwargs["extra_params"]["after"] == 20_000_000
+                return {"data": [row(19_999_000 - index * 60_000) for index in range(300)]}
+            if len(calls) == 2:
+                assert endpoint_type == "kline_history"
+                assert kwargs["extra_params"]["after"] < 20_000_000
+                duplicate_open_time = 19_999_000 - 301 * 60_000
+                return {
+                    "data": [row(duplicate_open_time)]
+                    + [row(19_999_000 - 300 * 60_000 - index * 60_000) for index in range(5)]
+                }
+            assert endpoint_type == "kline_history"
+            assert kwargs["extra_params"]["after"] < 20_000_000
+            return {"data": []}
+
+        market.request_contract_market_provider_json = request_json
+
+        items = market._fetch_external_spot_klines(
+            None,
+            Pair(),
+            interval="1m",
+            limit=306,
+            end_time_ms=20_000_000,
+            fast=True,
+        )
+        assert len(items) == 305
+        assert [item["open_time"] for item in items] == sorted(item["open_time"] for item in items)
+        assert len({item["open_time"] for item in items}) == len(items)
+        assert all(item["open_time"] < 20_000_000 for item in items)
+        assert calls[0][0] == "kline_history"
+        assert calls[0][1] == 300
+        assert calls[1][0] == "kline_history"
+        assert calls[1][1] == 6
+        assert calls[2][0] == "kline_history"
+        assert calls[2][1] == 1
+    finally:
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market._spot_provider_symbol = original_spot_provider_symbol
+        market.request_contract_market_provider_json = original_request_json
+        market.mark_contract_market_provider_success = original_mark_success
 
 
 def test_internal_pair_does_not_use_live_ws_klines() -> None:
@@ -1707,6 +1998,7 @@ def test_internal_pair_does_not_use_live_ws_klines() -> None:
     original_get_ws_klines = market.get_spot_provider_ws_klines
     original_get_internal_klines = market._get_internal_klines
     original_get_klines_cache_first = market.get_klines_cache_first
+    original_request_json = market.request_contract_market_provider_json
     try:
         market._get_active_pair = lambda db, symbol: Pair()
         market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -1717,6 +2009,9 @@ def test_internal_pair_does_not_use_live_ws_klines() -> None:
             kwargs["limit"],
             kwargs.get("end_time_ms"),
         )
+        market.request_contract_market_provider_json = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("internal pair must not request external OKX history-candles")
+        )
 
         result = market.get_klines(None, "MFCUSDT", "1m", limit=30)
         assert result["symbol"] == "MFCUSDT"
@@ -1726,6 +2021,7 @@ def test_internal_pair_does_not_use_live_ws_klines() -> None:
         market.get_spot_provider_ws_klines = original_get_ws_klines
         market._get_internal_klines = original_get_internal_klines
         market.get_klines_cache_first = original_get_klines_cache_first
+        market.request_contract_market_provider_json = original_request_json
 
 
 if __name__ == "__main__":

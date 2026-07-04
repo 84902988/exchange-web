@@ -1156,7 +1156,10 @@ def _spot_interval_value(provider_code: str, interval: str) -> str:
 
 def _spot_kline_extra_params(provider_code: str, interval: str, end_time_ms: Optional[int]) -> dict[str, Any]:
     if provider_code == "OKX_SPOT":
-        return {"bar": _spot_interval_value(provider_code, interval)}
+        params: dict[str, Any] = {"bar": _spot_interval_value(provider_code, interval)}
+        if end_time_ms:
+            params["after"] = int(end_time_ms)
+        return params
     if provider_code == "BITGET_SPOT":
         params: dict[str, Any] = {"granularity": _spot_interval_value(provider_code, interval)}
         if end_time_ms:
@@ -1168,6 +1171,12 @@ def _spot_kline_extra_params(provider_code: str, interval: str, end_time_ms: Opt
             params["endTime"] = max(int(end_time_ms) - 1, 1)
         return params
     return {}
+
+
+def _spot_kline_endpoint_type(provider_code: str, end_time_ms: Optional[int]) -> str:
+    if provider_code == "OKX_SPOT" and end_time_ms is not None:
+        return "kline_history"
+    return "kline"
 
 
 def _spot_ticker_from_provider(
@@ -1646,6 +1655,73 @@ def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *
     raise ValueError(f"spot external trades unavailable: {last_error}")
 
 
+def _fetch_okx_spot_klines(
+    provider: MarketDataProviderConfig,
+    provider_symbol: str,
+    *,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int],
+) -> list[dict[str, Any]]:
+    requested_limit = max(1, int(limit or 200))
+    max_pages = 10
+    by_open_time: dict[int, dict[str, Any]] = {}
+    cursor = int(end_time_ms) if end_time_ms is not None else None
+    use_history = end_time_ms is not None
+
+    for _page_index in range(max_pages):
+        remaining = requested_limit - len(by_open_time)
+        if remaining <= 0:
+            break
+        page_limit = min(max(remaining, 1), 300)
+        endpoint_type = "kline_history" if use_history else "kline"
+        extra_params = _spot_kline_extra_params(
+            provider.provider_code,
+            interval,
+            cursor if endpoint_type == "kline_history" else None,
+        )
+        payload = request_contract_market_provider_json(
+            provider,
+            endpoint_type,
+            provider_symbol,
+            limit=page_limit,
+            extra_params=extra_params,
+        )
+        page_items = _spot_klines_from_provider(
+            provider_code=provider.provider_code,
+            payload=payload,
+            interval=interval,
+            limit=page_limit,
+            end_time_ms=cursor if endpoint_type == "kline_history" else None,
+        )
+        if not page_items:
+            break
+
+        before_count = len(by_open_time)
+        for item in page_items:
+            try:
+                open_time = int(item.get("open_time") or 0)
+            except Exception:
+                continue
+            if open_time <= 0:
+                continue
+            if end_time_ms is not None and open_time >= int(end_time_ms):
+                continue
+            by_open_time[open_time] = item
+        if len(by_open_time) == before_count:
+            break
+
+        cursor = min(int(item["open_time"]) for item in page_items)
+        use_history = True
+        if len(page_items) < page_limit:
+            break
+
+    return [
+        by_open_time[open_time]
+        for open_time in sorted(by_open_time.keys())[-requested_limit:]
+    ]
+
+
 def _fetch_external_spot_klines(
     db: Session,
     pair: TradingPair,
@@ -1661,20 +1737,30 @@ def _fetch_external_spot_klines(
     for provider in providers:
         try:
             provider_symbol = _spot_provider_symbol(db, pair, provider)
-            payload = request_contract_market_provider_json(
-                _spot_provider_request_config(provider, timeout_cap_ms=timeout_cap_ms),
-                "kline",
-                provider_symbol,
-                limit=limit,
-                extra_params=_spot_kline_extra_params(provider.provider_code, interval, end_time_ms),
-            )
-            items = _spot_klines_from_provider(
-                provider_code=provider.provider_code,
-                payload=payload,
-                interval=interval,
-                limit=limit,
-                end_time_ms=end_time_ms,
-            )
+            request_provider = _spot_provider_request_config(provider, timeout_cap_ms=timeout_cap_ms)
+            if provider.provider_code == "OKX_SPOT":
+                items = _fetch_okx_spot_klines(
+                    request_provider,
+                    provider_symbol,
+                    interval=interval,
+                    limit=limit,
+                    end_time_ms=end_time_ms,
+                )
+            else:
+                payload = request_contract_market_provider_json(
+                    request_provider,
+                    _spot_kline_endpoint_type(provider.provider_code, end_time_ms),
+                    provider_symbol,
+                    limit=limit,
+                    extra_params=_spot_kline_extra_params(provider.provider_code, interval, end_time_ms),
+                )
+                items = _spot_klines_from_provider(
+                    provider_code=provider.provider_code,
+                    payload=payload,
+                    interval=interval,
+                    limit=limit,
+                    end_time_ms=end_time_ms,
+                )
             if not items:
                 raise ValueError("spot kline unavailable")
             _SPOT_LAST_GOOD_KLINES[(pair.symbol, interval)] = {
@@ -2801,7 +2887,7 @@ def get_klines(
                 interval=interval,
                 limit=fetch_limit,
                 end_time_ms=fetch_end_time_ms,
-                fast=True,
+                fast=False,
             )
 
         items = get_klines_cache_first(
@@ -2813,26 +2899,16 @@ def get_klines(
             end_time_ms=end_time_ms,
             source="EXTERNAL_SPOT",
             fetch_external=_fetch_external_spot,
-            external_budget_seconds=1.5,
+            external_budget_seconds=6.0,
         )
         cached_meta = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval), {})
-        if live_ws_klines and live_ws_klines.get("items"):
+        if items and live_ws_klines and live_ws_klines.get("items"):
             items = _merge_spot_live_ws_klines(
                 history_items=items,
                 live_items=list(live_ws_klines.get("items") or []),
                 limit=limit,
                 end_time_ms=end_time_ms,
             )
-            return {
-                "symbol": pair.symbol,
-                "interval": interval,
-                "items": items,
-                "provider": live_ws_klines.get("provider") or PROVIDER_BITGET_SPOT,
-                "source": "LIVE_WS",
-                "freshness": live_ws_klines.get("freshness") or "LIVE",
-                "stale": False,
-                "updated_at": live_ws_klines.get("updated_at"),
-            }
         provider = str(cached_meta.get("provider") or "EXTERNAL_SPOT")
         return {
             "symbol": pair.symbol,
