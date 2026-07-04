@@ -9,9 +9,14 @@ type SpotMarketSnapshotMessage = {
   trades?: unknown;
 };
 
-type SpotMarketTradeMessage = {
+export type SpotMarketTradeMessage = {
   type: 'spot_trade';
   symbol?: string;
+  provider?: string;
+  provider_symbol?: string;
+  source?: string;
+  freshness?: string;
+  updated_at_ms?: number | string;
   trade?: unknown;
 };
 

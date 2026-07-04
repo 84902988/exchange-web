@@ -294,10 +294,18 @@ def _format_trades_for_pair(pair: TradingPair, trades: TradesResponse, limit: Op
         items.append(
             TradeItem(
                 id=getattr(item, "id", None),
+                trade_id=getattr(item, "trade_id", None),
+                provider_trade_id=getattr(item, "provider_trade_id", None),
                 price=_format_price_for_pair(pair, price),
                 amount=_format_amount_for_pair(pair, amount),
                 side="SELL" if str(getattr(item, "side", "")).upper() == "SELL" else "BUY",
                 ts=int(getattr(item, "ts", 0) or 0),
+                provider=getattr(item, "provider", None) or getattr(trades, "provider", None),
+                provider_symbol=getattr(item, "provider_symbol", None) or getattr(trades, "provider_symbol", None),
+                source=getattr(item, "source", None) or getattr(trades, "source", None),
+                freshness=getattr(item, "freshness", None) or getattr(trades, "freshness", None),
+                updated_at_ms=getattr(item, "updated_at_ms", None) or getattr(trades, "updated_at_ms", None),
+                created_at=getattr(item, "created_at", None),
             )
         )
     data = trades.model_dump() if hasattr(trades, "model_dump") else trades.dict()

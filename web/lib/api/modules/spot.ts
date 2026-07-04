@@ -79,11 +79,20 @@ export type SpotDepthResponse = {
 }
 
 export type SpotMarketTradeItem = {
+  id?: string | number | null
+  trade_id?: string | number | null
+  provider_trade_id?: string | number | null
   price: string
   amount: string
   side: 'BUY' | 'SELL' | string
   ts?: string | number
   time?: string | number
+  provider?: string | null
+  provider_symbol?: string | null
+  source?: string | null
+  freshness?: string | null
+  updated_at_ms?: string | number | null
+  created_at?: string | null
 }
 
 export type SpotMarketTradesResponse = {
@@ -157,6 +166,9 @@ export type SpotMarketKlinesResponse = {
   symbol: string
   interval: string
   items: SpotMarketKlineItem[]
+  provider?: string | null
+  source?: string | null
+  freshness?: string | null
 }
 
 export type SpotMarketTickerItem = {

@@ -328,8 +328,10 @@ def _trades_response_from_record(record: dict[str, Any], *, limit: Optional[int]
         symbol=normalize_spot_ws_symbol(record.get("symbol")),
         trades=[TradeItem(**item) for item in list(record.get("trades") or [])[:trade_limit]],
         provider=str(record.get("provider") or PROVIDER_BITGET_SPOT),
+        provider_symbol=str(record.get("provider_symbol") or ""),
         stale=False,
         updated_at=record.get("updated_at"),
+        updated_at_ms=int(record.get("updated_at_ms") or _now_ms()),
         source=str(record.get("source") or SPOT_PROVIDER_WS_SOURCE),
         freshness=str(record.get("freshness") or "LIVE"),
     )
@@ -616,13 +618,18 @@ def normalize_bitget_trade_message(
         if price is None or amount is None or price <= 0 or amount <= 0:
             continue
         side_text = str(row.get("side") or "").upper()
+        ts = _spot_provider_ts(row.get("ts"))
         trades.append(
             {
                 "id": str(row.get("tradeId") or ""),
+                "trade_id": str(row.get("tradeId") or ""),
+                "provider_trade_id": str(row.get("tradeId") or ""),
                 "price": _decimal_to_str(price),
                 "amount": _decimal_to_str(amount),
                 "side": "SELL" if side_text == "SELL" else "BUY",
-                "ts": _spot_provider_ts(row.get("ts")),
+                "ts": ts,
+                "created_at": datetime.utcfromtimestamp(ts / 1000).isoformat(),
+                "raw_trade": deepcopy(row),
             }
         )
 

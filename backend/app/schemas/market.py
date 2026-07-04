@@ -30,18 +30,28 @@ class DepthResponse(BaseModel):
 
 class TradeItem(BaseModel):
     id: Optional[str] = None
+    trade_id: Optional[str] = None
+    provider_trade_id: Optional[str] = None
     price: str
     amount: str
     side: str
     ts: int
+    provider: Optional[str] = None
+    provider_symbol: Optional[str] = None
+    source: Optional[str] = None
+    freshness: Optional[str] = None
+    updated_at_ms: Optional[int] = None
+    created_at: Optional[str] = None
 
 
 class TradesResponse(BaseModel):
     symbol: str
     trades: List[TradeItem]
     provider: Optional[str] = None
+    provider_symbol: Optional[str] = None
     stale: bool = False
     updated_at: Optional[str] = None
+    updated_at_ms: Optional[int] = None
     source: Optional[str] = None
     freshness: Optional[str] = None
 

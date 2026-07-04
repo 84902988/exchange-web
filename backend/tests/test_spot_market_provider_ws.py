@@ -611,7 +611,10 @@ def test_okx_trade_message_normalize_cache_and_dedupe() -> None:
     assert trades.freshness == "LIVE"
     assert len(trades.trades) == 1
     assert trades.trades[0].id == "t1"
+    assert trades.trades[0].trade_id == "t1"
+    assert trades.trades[0].provider_trade_id == "t1"
     assert trades.trades[0].price == "100"
+    assert trades.provider_symbol == "BTC-USDT"
     assert service.get_fresh_trades("BTCUSDT", provider=provider_ws.PROVIDER_BITGET_SPOT) is None
 
 

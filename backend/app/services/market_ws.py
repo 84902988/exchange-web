@@ -277,22 +277,55 @@ class MarketWsManager:
         side: str,
         ts: int,
         trade_id: Any = None,
+        provider: Any = None,
+        provider_symbol: Any = None,
+        provider_trade_id: Any = None,
+        source: Any = None,
+        freshness: Any = None,
+        updated_at_ms: Any = None,
     ) -> None:
         """
         增量推送：单笔成交
         """
         symbol = _normalize_symbol(symbol)
+        trade_payload = {
+            "id": trade_id,
+            "trade_id": trade_id,
+            "provider_trade_id": provider_trade_id or trade_id,
+            "price": _to_str(price),
+            "amount": _to_str(amount),
+            "side": (side or "").upper(),
+            "ts": ts,
+        }
+        if provider is not None:
+            trade_payload["provider"] = str(provider)
+        if provider_symbol is not None:
+            trade_payload["provider_symbol"] = str(provider_symbol)
+        if source is not None:
+            trade_payload["source"] = str(source)
+        if freshness is not None:
+            trade_payload["freshness"] = str(freshness)
+        if updated_at_ms is not None:
+            trade_payload["updated_at_ms"] = updated_at_ms
+
         payload = {
             "type": "spot_trade",
             "symbol": symbol,
-            "trade": {
-                "id": trade_id,
-                "price": _to_str(price),
-                "amount": _to_str(amount),
-                "side": (side or "").upper(),
-                "ts": ts,
-            },
+            "trade_id": trade_id,
+            "provider_trade_id": provider_trade_id or trade_id,
+            "ts": ts,
+            "trade": trade_payload,
         }
+        if provider is not None:
+            payload["provider"] = str(provider)
+        if provider_symbol is not None:
+            payload["provider_symbol"] = str(provider_symbol)
+        if source is not None:
+            payload["source"] = str(source)
+        if freshness is not None:
+            payload["freshness"] = str(freshness)
+        if updated_at_ms is not None:
+            payload["updated_at_ms"] = updated_at_ms
         await self._send_payload(symbol, payload)
 
     async def send_kline_update(

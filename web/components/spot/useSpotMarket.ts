@@ -47,6 +47,10 @@ type SpotMarketSnapshotMessage = SpotMarketRealtimeMessage & {
 type SpotTradeMessage = SpotMarketRealtimeMessage & {
   type: 'spot_trade';
   symbol?: string;
+  provider?: string | null;
+  provider_symbol?: string | null;
+  source?: string | null;
+  freshness?: string | null;
   trade?: SpotMarketTradeItem & { id?: string | number };
 };
 
@@ -584,6 +588,9 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       priceDirectionRef.current = nextDirection;
       setLastPrice(trade.price);
       setPriceDirection(nextDirection);
+      const tradeSource = normalizeDomainValue(trade.source || data.source) || 'LIVE_WS';
+      const tradeFreshness = normalizeDomainValue(trade.freshness || data.freshness) || 'LIVE';
+      const tradeProvider = trade.provider || data.provider;
       setMarketView((prev) => prev ? {
         ...prev,
         display_price: trade.price,
@@ -592,8 +599,14 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
         last_trade_price: trade.price,
         price_direction: nextDirection,
         trades_status: 'ok',
-        trades_source: 'LIVE_WS',
-        trades_freshness: 'LIVE',
+        trades_source: tradeSource,
+        trades_freshness: tradeFreshness,
+        raw_source_summary: {
+          ...(prev.raw_source_summary || {}),
+          trades_source: tradeSource,
+          trades_provider: tradeProvider,
+          trades_freshness: tradeFreshness,
+        },
       } : prev);
     };
 
