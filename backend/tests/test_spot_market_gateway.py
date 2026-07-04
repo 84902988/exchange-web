@@ -629,6 +629,58 @@ def test_gateway_broadcasts_provider_kline_once_without_trade_aggregation() -> N
     asyncio.run(run())
 
 
+def test_gateway_broadcasts_trades_driven_provider_kline() -> None:
+    class TradesDrivenProvider(FakeProvider):
+        def get_klines(self, symbol: str, interval: str, **kwargs) -> dict:
+            return {
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "provider": "BITGET_SPOT",
+                "source": "LIVE_WS",
+                "freshness": "LIVE",
+                "items": [
+                    {
+                        "open_time": 1000,
+                        "close_time": 61000,
+                        "open": "100",
+                        "high": "121",
+                        "low": "95",
+                        "close": "120",
+                        "volume": "10",
+                        "quote_volume": "1000",
+                    }
+                ],
+            }
+
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = TradesDrivenProvider()
+        gateway = SpotMarketGateway(
+            ensure_depth=provider.ensure,
+            ensure_kline=lambda symbol, interval: None,
+            release_depth=provider.release,
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+        )
+
+        ws_manager.count = 1
+        await gateway.ensure_symbol("BTC/USDT", interval="1m")
+        await asyncio.sleep(0.05)
+
+        assert len(ws_manager.kline_broadcasts) == 1
+        assert ws_manager.kline_broadcasts[0]["symbol"] == "BTCUSDT"
+        assert ws_manager.kline_broadcasts[0]["interval"] == "1m"
+        assert ws_manager.kline_broadcasts[0]["source"] == "LIVE_WS"
+        assert ws_manager.kline_broadcasts[0]["kline"]["close"] == "120"
+
+    asyncio.run(run())
+
+
 def test_gateway_does_not_ensure_provider_ws_for_internal_symbol() -> None:
     async def run() -> None:
         ws_manager = FakeWsManager()

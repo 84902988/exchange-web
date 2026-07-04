@@ -1,7 +1,50 @@
 from __future__ import annotations
 
+import json
+import threading
+
 from app.services import spot_market_domain_cache as domain_cache
 from app.services import spot_market_provider_ws as provider_ws
+
+
+def _activate_provider_trades(service: provider_ws.SpotMarketProviderWsService, symbol: str = "BTCUSDT") -> None:
+    with service._lock:
+        service._trades_generations[(provider_ws.PROVIDER_BITGET_SPOT, symbol)] = 1
+
+
+def _activate_provider_kline(
+    service: provider_ws.SpotMarketProviderWsService,
+    symbol: str = "BTCUSDT",
+    interval: str = "1m",
+) -> None:
+    with service._lock:
+        service._kline_stops[(provider_ws.PROVIDER_BITGET_SPOT, symbol, interval)] = threading.Event()
+        service._kline_generations[(provider_ws.PROVIDER_BITGET_SPOT, symbol, interval)] = 1
+
+
+def _handle_trades(
+    service: provider_ws.SpotMarketProviderWsService,
+    trades: list[dict],
+    *,
+    symbol: str = "BTCUSDT",
+) -> None:
+    subscription = provider_ws.SpotTradesSubscription(
+        local_symbol=symbol,
+        provider=provider_ws.PROVIDER_BITGET_SPOT,
+        provider_symbol=symbol,
+        trades_limit=30,
+    )
+    service._handle_bitget_trades_message(
+        subscription,
+        json.dumps(
+            {
+                "arg": {"instType": "SPOT", "channel": "trade", "instId": symbol},
+                "action": "update",
+                "data": trades,
+            }
+        ),
+        1,
+    )
 
 
 def test_normalize_spot_ws_symbol() -> None:
@@ -490,6 +533,136 @@ def test_kline_cache_fresh_and_stale() -> None:
         }
     )
     assert service.get_fresh_klines("btcusdt", "1m", max_age_ms=1000) is None
+
+
+def test_provider_trades_drive_current_kline_bucket() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_trades(service)
+    _activate_provider_kline(service, interval="1m")
+    open_time = 1_695_709_800_000
+
+    _handle_trades(
+        service,
+        [
+            {"tradeId": "t2", "ts": str(open_time + 2_000), "price": "105", "size": "2", "side": "sell"},
+            {"tradeId": "t1", "ts": str(open_time + 1_000), "price": "100", "size": "1", "side": "buy"},
+            {"tradeId": "t3", "ts": str(open_time + 3_000), "price": "99", "size": "3", "side": "buy"},
+        ],
+    )
+
+    fresh = service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000)
+    assert fresh is not None
+    item = fresh["items"][-1]
+    assert item["open_time"] == open_time
+    assert item["close_time"] == open_time + 60_000
+    assert item["open"] == "100"
+    assert item["high"] == "105"
+    assert item["low"] == "99"
+    assert item["close"] == "99"
+    assert item["volume"] == "6"
+    assert item["quote_volume"] == "607"
+    assert item["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert item["freshness"] == "LIVE"
+    assert item["provider"] == provider_ws.PROVIDER_BITGET_SPOT
+    assert "_last_trade_ts_ms" not in item
+
+
+def test_provider_trade_kline_dedupe_prevents_duplicate_volume() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_trades(service)
+    _activate_provider_kline(service, interval="1m")
+    open_time = 1_695_709_800_000
+    trade = {"tradeId": "t1", "ts": str(open_time + 1_000), "price": "100", "size": "1", "side": "buy"}
+
+    _handle_trades(service, [trade])
+    _handle_trades(service, [trade])
+
+    fresh = service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000)
+    assert fresh is not None
+    item = fresh["items"][-1]
+    assert item["volume"] == "1"
+    assert item["quote_volume"] == "100"
+
+
+def test_provider_trade_kline_old_trade_does_not_overwrite_new_close() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_trades(service)
+    _activate_provider_kline(service, interval="1m")
+    open_time = 1_695_709_800_000
+
+    _handle_trades(
+        service,
+        [{"tradeId": "newer", "ts": str(open_time + 5_000), "price": "105", "size": "1", "side": "buy"}],
+    )
+    _handle_trades(
+        service,
+        [{"tradeId": "older", "ts": str(open_time + 1_000), "price": "100", "size": "1", "side": "sell"}],
+    )
+
+    fresh = service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000)
+    assert fresh is not None
+    item = fresh["items"][-1]
+    assert item["open"] == "100"
+    assert item["high"] == "105"
+    assert item["low"] == "100"
+    assert item["close"] == "105"
+    assert item["volume"] == "2"
+    assert item["quote_volume"] == "205"
+
+
+def test_provider_candle_does_not_overwrite_more_recent_trade_close() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_trades(service)
+    _activate_provider_kline(service, interval="1m")
+    open_time = 1_695_709_800_000
+
+    _handle_trades(
+        service,
+        [{"tradeId": "trade-close", "ts": str(open_time + 50_000), "price": "120", "size": "1", "side": "buy"}],
+    )
+
+    subscription = provider_ws.SpotKlineSubscription(
+        local_symbol="BTCUSDT",
+        provider=provider_ws.PROVIDER_BITGET_SPOT,
+        provider_symbol="BTCUSDT",
+        interval="1m",
+        channel=provider_ws.bitget_spot_kline_channel("1m"),
+        kline_limit=10,
+    )
+    service._handle_bitget_kline_message(
+        subscription,
+        json.dumps(
+            {
+                "arg": {"instType": "SPOT", "channel": "candle1m", "instId": "BTCUSDT"},
+                "action": "update",
+                "data": [[str(open_time), "100", "121", "95", "110", "10", "1000", "1000"]],
+            }
+        ),
+        1,
+    )
+
+    fresh = service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000)
+    assert fresh is not None
+    item = fresh["items"][-1]
+    assert item["open"] == "100"
+    assert item["high"] == "121"
+    assert item["low"] == "95"
+    assert item["close"] == "120"
+    assert item["volume"] == "10"
+    assert item["quote_volume"] == "1000"
+
+
+def test_provider_trades_do_not_build_kline_without_active_interval() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_trades(service)
+    open_time = 1_695_709_800_000
+
+    _handle_trades(
+        service,
+        [{"tradeId": "t1", "ts": str(open_time + 1_000), "price": "100", "size": "1", "side": "buy"}],
+    )
+
+    assert service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000) is None
 
 
 def test_cache_getters_missing_records_return_none() -> None:
