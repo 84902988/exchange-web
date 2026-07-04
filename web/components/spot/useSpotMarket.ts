@@ -41,6 +41,7 @@ type SpotMarketSnapshotMessage = SpotMarketRealtimeMessage & {
     items?: SpotMarketTradeItem[];
     trades?: SpotMarketTradeItem[];
   };
+  ticker?: SpotMarketTickerItem;
 };
 
 type SpotTradeMessage = SpotMarketRealtimeMessage & {
@@ -131,6 +132,39 @@ function normalizeTrades(
   });
 }
 
+function hasValue(value: unknown): boolean {
+  return value !== null && value !== undefined && String(value).trim() !== '';
+}
+
+function hasDepthLevels(depth?: SpotDepthResponse | null): boolean {
+  return Boolean(depth && ((depth.bids?.length || 0) > 0 || (depth.asks?.length || 0) > 0));
+}
+
+function hasTickerData(view?: SpotMarketView | null): boolean {
+  return Boolean(
+    view?.ticker ||
+    hasValue(view?.ticker_last_price) ||
+    hasValue(view?.ticker_24h_change) ||
+    hasValue(view?.ticker_24h_change_percent) ||
+    hasValue(view?.ticker_24h_high) ||
+    hasValue(view?.ticker_24h_low) ||
+    hasValue(view?.ticker_volume) ||
+    hasValue(view?.ticker_quote_volume),
+  );
+}
+
+function sameSymbol(value: unknown, symbol: string): boolean {
+  return normalizeSpotSymbol(String(value || '')) === symbol;
+}
+
+function buildTradesPayload(symbol: string, trades: SpotMarketTradeItem[]) {
+  return {
+    symbol,
+    items: trades,
+    trades,
+  };
+}
+
 function firstPrice(levels?: SpotDepthLevel[] | null): string | number | null {
   const level = Array.isArray(levels)
     ? levels.find((item) => Number(item.price) > 0)
@@ -202,6 +236,107 @@ function getTickerLastPrice(ticker?: SpotMarketTickerItem | null): string | numb
   return ticker?.last_price ?? ticker?.price ?? ticker?.last ?? ticker?.close ?? null;
 }
 
+function mergeViewWithLastGood(
+  incomingView: SpotMarketView,
+  lastGood: SpotMarketCache | null,
+  symbol: string,
+): SpotMarketView {
+  const previousView = lastGood?.marketView;
+  if (!previousView || !sameSymbol(previousView.symbol || lastGood?.symbol, symbol)) {
+    return incomingView;
+  }
+
+  const previousDepth = normalizeDepth(previousView.depth) || normalizeDepth(lastGood?.depth);
+  const incomingDepth = normalizeDepth(incomingView.depth);
+  const previousViewTrades = normalizeTrades(previousView.trades);
+  const previousTrades = previousViewTrades.length ? previousViewTrades : (lastGood?.trades || []);
+  const incomingTrades = normalizeTrades(incomingView.trades);
+  const previousDisplayPrice = getViewDisplayPrice(previousView) ?? lastGood?.lastPrice ?? null;
+  const incomingDisplayPrice = getViewDisplayPrice(incomingView);
+  const previousMarketStatus = String(previousView.market_status || '').toUpperCase();
+  const incomingMarketStatus = String(incomingView.market_status || '').toUpperCase();
+
+  let mergedView: SpotMarketView = { ...incomingView };
+
+  if (!hasValue(incomingDisplayPrice) && hasValue(previousDisplayPrice)) {
+    mergedView = {
+      ...mergedView,
+      display_price: previousView.display_price ?? previousDisplayPrice,
+      display_price_source: previousView.display_price_source ?? mergedView.display_price_source,
+      last_price: previousView.last_price ?? previousDisplayPrice,
+      last_trade_price: previousView.last_trade_price ?? mergedView.last_trade_price,
+      ticker_last_price: previousView.ticker_last_price ?? mergedView.ticker_last_price,
+      price_direction: previousView.price_direction ?? mergedView.price_direction,
+    };
+  }
+
+  if (incomingMarketStatus === 'UNKNOWN' && previousMarketStatus && previousMarketStatus !== 'UNKNOWN') {
+    mergedView = {
+      ...mergedView,
+      market_status: previousView.market_status,
+      executable: previousView.executable ?? mergedView.executable,
+    };
+  }
+
+  if (!hasDepthLevels(incomingDepth) && hasDepthLevels(previousDepth)) {
+    mergedView = {
+      ...mergedView,
+      depth: previousView.depth || previousDepth,
+      best_bid: previousView.best_bid ?? firstPrice(previousDepth?.bids),
+      best_ask: previousView.best_ask ?? firstPrice(previousDepth?.asks),
+      orderbook_mid_price: previousView.orderbook_mid_price ?? getDepthMidPrice(previousDepth),
+      spread: previousView.spread ?? mergedView.spread,
+      depth_status: previousView.depth_status ?? mergedView.depth_status,
+      depth_source: previousView.depth_source ?? mergedView.depth_source,
+      depth_freshness: previousView.depth_freshness ?? mergedView.depth_freshness,
+    };
+  }
+
+  if (!incomingTrades.length && previousTrades.length) {
+    mergedView = {
+      ...mergedView,
+      trades: previousView.trades || buildTradesPayload(symbol, previousTrades),
+      last_trade_price: previousView.last_trade_price ?? mergedView.last_trade_price,
+      trades_status: previousView.trades_status ?? mergedView.trades_status,
+      trades_source: previousView.trades_source ?? mergedView.trades_source,
+      trades_freshness: previousView.trades_freshness ?? mergedView.trades_freshness,
+    };
+  }
+
+  if (!hasTickerData(incomingView) && hasTickerData(previousView)) {
+    mergedView = {
+      ...mergedView,
+      ticker: previousView.ticker ?? mergedView.ticker,
+      ticker_last_price: previousView.ticker_last_price ?? mergedView.ticker_last_price,
+      ticker_24h_change: previousView.ticker_24h_change ?? mergedView.ticker_24h_change,
+      ticker_24h_change_percent: previousView.ticker_24h_change_percent ?? mergedView.ticker_24h_change_percent,
+      ticker_24h_high: previousView.ticker_24h_high ?? mergedView.ticker_24h_high,
+      ticker_24h_low: previousView.ticker_24h_low ?? mergedView.ticker_24h_low,
+      ticker_volume: previousView.ticker_volume ?? mergedView.ticker_volume,
+      ticker_quote_volume: previousView.ticker_quote_volume ?? mergedView.ticker_quote_volume,
+      ticker_source: previousView.ticker_source ?? mergedView.ticker_source,
+      ticker_freshness: previousView.ticker_freshness ?? mergedView.ticker_freshness,
+      quote_freshness: previousView.quote_freshness ?? mergedView.quote_freshness,
+      raw_source_summary: previousView.raw_source_summary ?? mergedView.raw_source_summary,
+    };
+  }
+
+  return mergedView;
+}
+
+function hasUsableMarketState(
+  view: SpotMarketView,
+  depth: SpotDepthResponse | null,
+  trades: SpotMarketTradeItem[],
+): boolean {
+  return Boolean(
+    hasValue(getViewDisplayPrice(view)) ||
+    hasDepthLevels(depth) ||
+    trades.length > 0 ||
+    hasTickerData(view),
+  );
+}
+
 export function useSpotMarket(symbol: string): UseSpotMarketResult {
   const normalizedSymbol = useMemo(() => normalizeSpotSymbol(symbol), [symbol]);
   const [marketView, setMarketView] = useState<SpotMarketView | null>(null);
@@ -219,14 +354,16 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   const refreshInFlightRef = useRef(false);
   const refreshInFlightSeqRef = useRef(0);
   const mountedRef = useRef(false);
+  const lastGoodRef = useRef<SpotMarketCache | null>(null);
 
   const applyView = useCallback((view: SpotMarketView) => {
-    const nextDepth = normalizeDepth(view.depth);
-    const nextTrades = normalizeTrades(view.trades);
-    const nextLastPrice = getViewDisplayPrice(view);
-    const nextDirection = getViewDirection(view);
+    const mergedView = mergeViewWithLastGood(view, lastGoodRef.current, normalizedSymbol);
+    const nextDepth = normalizeDepth(mergedView.depth);
+    const nextTrades = normalizeTrades(mergedView.trades);
+    const nextLastPrice = getViewDisplayPrice(mergedView);
+    const nextDirection = getViewDirection(mergedView);
 
-    setMarketView(view);
+    setMarketView(mergedView);
     setDepth(nextDepth);
     setTrades(nextTrades);
     setLastPrice(nextLastPrice);
@@ -234,15 +371,19 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     lastPriceRef.current = nextLastPrice;
     priceDirectionRef.current = nextDirection;
 
-    writeMarketCache<SpotMarketCache>('spot', normalizedSymbol, {
+    const nextCache = {
       symbol: normalizedSymbol,
-      marketView: view,
+      marketView: mergedView,
       depth: nextDepth,
       trades: nextTrades,
       lastPrice: nextLastPrice,
       priceDirection: nextDirection,
       updatedAt: Date.now(),
-    });
+    };
+    if (hasUsableMarketState(mergedView, nextDepth, nextTrades)) {
+      lastGoodRef.current = nextCache;
+      writeMarketCache<SpotMarketCache>('spot', normalizedSymbol, nextCache);
+    }
   }, [normalizedSymbol]);
 
   const refresh = useCallback(async () => {
@@ -304,6 +445,7 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     refreshInFlightSeqRef.current = 0;
     activeSymbolRef.current = normalizedSymbol;
     const cache = readSpotMarketCache(normalizedSymbol);
+    lastGoodRef.current = cache;
     setMarketView(cache?.marketView || null);
     setDepth(normalizeDepth(cache?.depth));
     setTrades(cache?.trades || []);
@@ -345,8 +487,54 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
         return;
       }
 
-      setDepth(normalizeDepth(snapshot.depth));
-      setTrades(normalizeTrades(snapshot.trades));
+      const hasDepthPayload = Object.prototype.hasOwnProperty.call(snapshot, 'depth');
+      const hasTradesPayload = Object.prototype.hasOwnProperty.call(snapshot, 'trades');
+      const hasTickerPayload = Object.prototype.hasOwnProperty.call(snapshot, 'ticker');
+
+      if (hasDepthPayload) {
+        const nextDepth = normalizeDepth(snapshot.depth);
+        if (hasDepthLevels(nextDepth) || !hasDepthLevels(lastGoodRef.current?.depth)) {
+          setDepth(nextDepth);
+          setMarketView((prev) => prev ? {
+            ...prev,
+            depth: nextDepth ?? prev.depth,
+            best_bid: firstPrice(nextDepth?.bids) ?? prev.best_bid,
+            best_ask: firstPrice(nextDepth?.asks) ?? prev.best_ask,
+            orderbook_mid_price: getDepthMidPrice(nextDepth) ?? prev.orderbook_mid_price,
+            depth_status: hasDepthLevels(nextDepth) ? 'ok' : prev.depth_status,
+            depth_source: sourceFromDepth(nextDepth) ?? prev.depth_source,
+            depth_freshness: depthFreshness(nextDepth) ?? prev.depth_freshness,
+          } : prev);
+        }
+      }
+
+      if (hasTradesPayload) {
+        const nextTrades = normalizeTrades(snapshot.trades);
+        if (nextTrades.length || !(lastGoodRef.current?.trades || []).length) {
+          setTrades(nextTrades);
+          setMarketView((prev) => prev ? {
+            ...prev,
+            trades: nextTrades.length ? buildTradesPayload(normalizedSymbol, nextTrades) : prev.trades,
+            trades_status: nextTrades.length ? 'ok' : prev.trades_status,
+          } : prev);
+        }
+      }
+
+      if (hasTickerPayload && snapshot.ticker) {
+        const tickerLastPrice = getTickerLastPrice(snapshot.ticker);
+        setMarketView((prev) => prev ? {
+          ...prev,
+          ticker: snapshot.ticker,
+          ticker_last_price: tickerLastPrice ?? prev.ticker_last_price,
+          display_price: tickerLastPrice ?? prev.display_price,
+          display_price_source: tickerLastPrice !== null ? 'ticker' : prev.display_price_source,
+          last_price: tickerLastPrice ?? prev.last_price,
+        } : prev);
+        if (tickerLastPrice !== null) {
+          setLastPrice(tickerLastPrice);
+          lastPriceRef.current = tickerLastPrice;
+        }
+      }
       setIsLoading(false);
     };
 
