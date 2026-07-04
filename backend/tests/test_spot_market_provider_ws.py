@@ -22,10 +22,12 @@ def _activate_provider_kline(
     service: provider_ws.SpotMarketProviderWsService,
     symbol: str = "BTCUSDT",
     interval: str = "1m",
+    *,
+    provider: str = provider_ws.PROVIDER_BITGET_SPOT,
 ) -> None:
     with service._lock:
-        service._kline_stops[(provider_ws.PROVIDER_BITGET_SPOT, symbol, interval)] = threading.Event()
-        service._kline_generations[(provider_ws.PROVIDER_BITGET_SPOT, symbol, interval)] = 1
+        service._kline_stops[(provider, symbol, interval)] = threading.Event()
+        service._kline_generations[(provider, symbol, interval)] = 1
 
 
 def _handle_trades(
@@ -90,7 +92,7 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="depth")
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="ticker")
     assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="trades")
-    assert not provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="kline")
+    assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_OKX_SPOT, domain="kline")
 
     service = provider_ws.SpotMarketProviderWsService()
     service.set_ticker_cache_for_tests(
@@ -114,7 +116,7 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
     service._ensure_depth_symbol = lambda symbol, provider=None: ensure_calls.append(("depth", symbol, provider))
     service._ensure_ticker_symbol = lambda symbol, provider=None: ensure_calls.append(("ticker", symbol, provider))
     service._ensure_trades_symbol = lambda symbol, provider=None: ensure_calls.append(("trades", symbol, provider))
-    service._ensure_kline_symbol = lambda symbol, interval: ensure_calls.append(("kline", symbol, interval))
+    service._ensure_kline_symbol = lambda symbol, interval, provider=None: ensure_calls.append(("kline", symbol, interval, provider))
 
     service.ensure_symbol("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT)
     service.ensure_kline("BTCUSDT", "1m", provider=provider_ws.PROVIDER_OKX_SPOT)
@@ -123,6 +125,7 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
         ("depth", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT),
         ("ticker", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT),
         ("trades", "BTCUSDT", provider_ws.PROVIDER_OKX_SPOT),
+        ("kline", "BTCUSDT", "1m", provider_ws.PROVIDER_OKX_SPOT),
     ]
 
 
@@ -638,6 +641,15 @@ def test_bitget_kline_channel_mapping() -> None:
     assert provider_ws.bitget_spot_kline_channel("1d") == "candle1D"
 
 
+def test_okx_kline_channel_mapping() -> None:
+    assert provider_ws.okx_spot_kline_channel("1m") == "candle1m"
+    assert provider_ws.okx_spot_kline_channel("5m") == "candle5m"
+    assert provider_ws.okx_spot_kline_channel("15m") == "candle15m"
+    assert provider_ws.okx_spot_kline_channel("1h") == "candle1H"
+    assert provider_ws.okx_spot_kline_channel("4h") == "candle4H"
+    assert provider_ws.okx_spot_kline_channel("1d") == "candle1D"
+
+
 def test_bitget_kline_message_normalize() -> None:
     record = provider_ws.normalize_bitget_kline_message(
         {
@@ -676,6 +688,76 @@ def test_bitget_kline_message_normalize() -> None:
     assert record["items"][0]["close"] == "26295"
     assert record["items"][0]["volume"] == "1.23"
     assert record["items"][0]["quote_volume"] == "32343.2"
+
+
+def test_okx_kline_message_normalize_and_cache() -> None:
+    record = provider_ws.normalize_okx_kline_message(
+        {
+            "arg": {"channel": "candle1m", "instId": "BTC-USDT"},
+            "data": [
+                [
+                    "1695709800000",
+                    "26290",
+                    "26300",
+                    "26280",
+                    "26295",
+                    "1.23",
+                    "32343.2",
+                    "32343.2",
+                    "1",
+                ]
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTC-USDT",
+        interval="1m",
+        kline_limit=10,
+    )
+
+    assert record is not None
+    assert record["symbol"] == "BTCUSDT"
+    assert record["provider"] == provider_ws.PROVIDER_OKX_SPOT
+    assert record["provider_symbol"] == "BTC-USDT"
+    assert record["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert record["freshness"] == "LIVE"
+    assert record["interval"] == "1m"
+    assert record["items"][0]["open_time"] == 1695709800000
+    assert record["items"][0]["open_time_ms"] == 1695709800000
+    assert record["items"][0]["close_time"] == 1695709860000
+    assert record["items"][0]["open"] == "26290"
+    assert record["items"][0]["high"] == "26300"
+    assert record["items"][0]["low"] == "26280"
+    assert record["items"][0]["close"] == "26295"
+    assert record["items"][0]["volume"] == "1.23"
+    assert record["items"][0]["quote_volume"] == "32343.2"
+    assert record["items"][0]["confirm"] == "1"
+    assert record["items"][0]["is_closed"] is True
+
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service, provider=provider_ws.PROVIDER_OKX_SPOT)
+    subscription = provider_ws.SpotKlineSubscription(
+        local_symbol="BTCUSDT",
+        provider=provider_ws.PROVIDER_OKX_SPOT,
+        provider_symbol="BTC-USDT",
+        interval="1m",
+        channel=provider_ws.okx_spot_kline_channel("1m"),
+        kline_limit=10,
+    )
+    service._handle_okx_kline_message(
+        subscription,
+        json.dumps(
+            {
+                "arg": {"channel": "candle1m", "instId": "BTC-USDT"},
+                "data": [[str(1695709800000), "26290", "26300", "26280", "26295", "1.23", "32343.2", "32343.2", "0"]],
+            }
+        ),
+        1,
+    )
+    fresh = service.get_fresh_klines("BTCUSDT", "1m", provider=provider_ws.PROVIDER_OKX_SPOT, max_age_ms=1000)
+    assert fresh is not None
+    assert fresh["provider"] == provider_ws.PROVIDER_OKX_SPOT
+    assert fresh["items"][-1]["close"] == "26295"
+    assert service.get_fresh_klines("BTCUSDT", "1m", provider=provider_ws.PROVIDER_BITGET_SPOT) is None
 
 
 def test_depth_cache_fresh_and_stale() -> None:

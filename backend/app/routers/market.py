@@ -392,15 +392,20 @@ def kline(
         None,
         description="历史翻页结束时间（毫秒时间戳）。不传则返回最近 limit 条；传入后返回 open_time < end_time 的更早K线。",
     ),
+    end_time_ms: Optional[int] = Query(
+        None,
+        description="Historical pagination cursor in ms. Takes priority over end_time.",
+    ),
     db: Session = Depends(get_db),
 ):
     try:
+        cursor_end_time_ms = end_time_ms if end_time_ms is not None else end_time
         return get_klines(
             db=db,
             symbol=symbol,
             interval=interval,
             limit=limit,
-            end_time_ms=end_time,
+            end_time_ms=cursor_end_time_ms,
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
