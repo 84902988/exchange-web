@@ -23,6 +23,10 @@ type TradingViewLoadError = {
   message: string;
 };
 
+type SpotTradingViewChartProps = SpotChartProps & {
+  chartMode?: 'time' | 'candle';
+};
+
 declare global {
   interface Window {
     TradingView?: TradingViewGlobal;
@@ -50,7 +54,8 @@ export default function SpotTradingViewChart({
   height = 520,
   pricePrecision,
   amountPrecision,
-}: SpotChartProps) {
+  chartMode = 'candle',
+}: SpotTradingViewChartProps) {
   const { locale, t } = useLocaleContext();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const widgetRef = useRef<TradingViewWidgetInstance | null>(null);
@@ -64,8 +69,10 @@ export default function SpotTradingViewChart({
   );
 
   const normalizedSymbol = useMemo(() => normalizeTradingViewSymbol(symbol), [symbol]);
-  const widgetInterval = useMemo(() => spotIntervalToTradingViewResolution(interval), [interval]);
-  const widgetKey = `${normalizedSymbol}:${widgetInterval}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}`;
+  const activeInterval = chartMode === 'time' ? '1m' : interval;
+  const widgetInterval = useMemo(() => spotIntervalToTradingViewResolution(activeInterval), [activeInterval]);
+  const widgetStyle = chartMode === 'time' ? '3' : '1';
+  const widgetKey = `${normalizedSymbol}:${chartMode}:${widgetInterval}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}`;
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
 
@@ -114,11 +121,12 @@ export default function SpotTradingViewChart({
       locale: resolveTradingViewLocale(locale),
       timezone: 'Etc/UTC',
       theme: 'dark',
-      style: '1',
+      style: widgetStyle,
       disabled_features: [
         'use_localstorage_for_settings',
         'header_symbol_search',
         'header_compare',
+        'header_resolutions',
         'symbol_search_hot_key',
         'display_market_status',
       ],
@@ -153,7 +161,7 @@ export default function SpotTradingViewChart({
       cancelled = true;
       cleanupWidget();
     };
-  }, [amountPrecision, containerId, displayName, locale, normalizedSymbol, pricePrecision, scriptReady, widgetInterval, widgetKey]);
+  }, [amountPrecision, containerId, displayName, locale, normalizedSymbol, pricePrecision, scriptReady, widgetInterval, widgetKey, widgetStyle]);
 
   return (
     <div className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]" style={{ minHeight: height }}>
@@ -172,7 +180,7 @@ export default function SpotTradingViewChart({
         id={containerId}
         ref={containerRef}
         className="min-h-0 flex-1"
-        aria-label={`${displayName || normalizedSymbol} ${interval}`}
+        aria-label={`${displayName || normalizedSymbol} ${chartMode === 'time' ? 'time' : activeInterval}`}
       />
       {activeLoadError ? (
         <div className="absolute inset-0 flex items-center justify-center bg-[#12161c] px-4 text-center text-sm text-[#f6465d]">

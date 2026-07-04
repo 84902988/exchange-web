@@ -141,6 +141,7 @@ function resolveSpotPricePrecision(
 }
 
 type RightPanelTab = 'orderbook' | 'trades';
+type SpotChartMode = 'time' | 'candle';
 
 type SpotPageProps = {
   initialSymbol?: string;
@@ -403,6 +404,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const symbolRef = useRef(symbol);
   const appliedCategoryRef = useRef('');
   const [interval, setIntervalValue] = useState('1m');
+  const [chartMode, setChartMode] = useState<SpotChartMode>('candle');
   const [orderPrice, setOrderPrice] = useState('');
   const [orderPriceSelectNonce, setOrderPriceSelectNonce] = useState(0);
 
@@ -870,6 +872,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const spotMarketDataSource = spotMarket.marketView?.data_source || marketFeedDataSource;
   const spotTickerFreshness = spotMarket.freshness.ticker;
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
+  const chartInterval = chartMode === 'time' ? '1m' : interval;
   const marketSyncingText = t('loading', 'common');
   const shouldShowMarketSyncing = spotMarket.isLoading && spotLastPrice === '--';
   const displayLatestPrice = shouldShowMarketSyncing ? marketSyncingText : spotLastPrice;
@@ -911,6 +914,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     key={`spot-toolbar-${initialCategory || 'default'}`}
                     symbol={symbol}
                     interval={interval}
+                    chartMode={chartMode}
                     symbols={toolbarSymbols}
                     symbolLabels={symbolLabels}
                     pairs={toolbarPairs}
@@ -922,13 +926,15 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     onLoadMorePairs={handleLoadMorePairs}
                     onSymbolChange={handleSymbolChange}
                     onIntervalChange={setIntervalValue}
+                    onChartModeChange={setChartMode}
                     toolbarAddon={<SpotLogoCard symbol={symbol} pair={selectedTicker || selectedPair} />}
                   />
                   <div className="min-h-0 flex-1">
                     <SpotTradingViewChart
                       symbol={symbol}
                       displaySymbol={currentDisplaySymbol}
-                      interval={interval}
+                      interval={chartInterval}
+                      chartMode={chartMode}
                       dataSource={spotMarketDataSource}
                       latestPrice={spotLastPrice}
                       latestTradeOrTickerPrice={null}

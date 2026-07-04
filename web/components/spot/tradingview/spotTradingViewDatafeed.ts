@@ -139,6 +139,14 @@ const SPOT_INTERVAL_TO_RESOLUTION: Record<string, TradingViewResolution> = {
   '4h': '240',
   '1d': '1D',
 };
+const SPOT_INTERVAL_MS: Record<string, number> = {
+  '1m': 60_000,
+  '5m': 5 * 60_000,
+  '15m': 15 * 60_000,
+  '1h': 60 * 60_000,
+  '4h': 4 * 60 * 60_000,
+  '1d': 24 * 60 * 60_000,
+};
 
 const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
   supports_search: true,
@@ -172,6 +180,10 @@ export function spotIntervalToTradingViewResolution(interval: string): TradingVi
 
 function tradingViewResolutionToSpotInterval(resolution: string): string {
   return RESOLUTION_TO_SPOT_INTERVAL[normalizeResolution(resolution)] || '1m';
+}
+
+function getSpotIntervalMs(interval: string): number {
+  return SPOT_INTERVAL_MS[String(interval || '').trim().toLowerCase()] || SPOT_INTERVAL_MS['1m'];
 }
 
 function getPriceScale(precision?: number | null): number {
@@ -265,6 +277,7 @@ export function createSpotTradingViewDatafeed(
   const apiSymbol = normalizeSpotSymbol(symbolInfo.ticker || symbolInfo.name);
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
+  const resetGapTimeByLatestBarKey = new Map<string, number>();
   const unsubscribeByUid = new Map<string, () => void>();
 
   const getLatestBarKey = (resolution: TradingViewResolution | string) =>
@@ -297,7 +310,13 @@ export function createSpotTradingViewDatafeed(
       const interval = tradingViewResolutionToSpotInterval(requestResolution);
       const countBack = Number(periodParams.countBack || 0);
       const limit = Math.min(Math.max(countBack || 300, 50), 1000);
-      const endTime = Number(periodParams.to) > 0 ? Number(periodParams.to) * 1000 : undefined;
+      const intervalMs = getSpotIntervalMs(interval);
+      const requestedEndTime = Number(periodParams.to) > 0 ? Number(periodParams.to) * 1000 : 0;
+      const isHistoricalPage =
+        periodParams.firstDataRequest === false &&
+        requestedEndTime > 0 &&
+        requestedEndTime < Date.now() - intervalMs;
+      const endTime = isHistoricalPage ? requestedEndTime : undefined;
 
       void getSpotKlines({
         symbol: apiSymbol,
@@ -313,7 +332,9 @@ export function createSpotTradingViewDatafeed(
 
           const latestBar = bars[bars.length - 1] || null;
           if (latestBar) {
-            latestBars.set(getLatestBarKey(requestResolution), latestBar);
+            const latestBarKey = getLatestBarKey(requestResolution);
+            latestBars.set(latestBarKey, latestBar);
+            resetGapTimeByLatestBarKey.delete(latestBarKey);
           }
 
           onHistory(bars, { noData: bars.length === 0 });
@@ -323,14 +344,13 @@ export function createSpotTradingViewDatafeed(
         });
     },
 
-    subscribeBars(_symbolInfo, resolution, onRealtime, subscriberUid, _onResetCacheNeeded) {
-      void _onResetCacheNeeded;
-
+    subscribeBars(_symbolInfo, resolution, onRealtime, subscriberUid, onResetCacheNeeded) {
       const existingUnsubscribe = unsubscribeByUid.get(subscriberUid);
       existingUnsubscribe?.();
 
       const requestResolution = normalizeResolution(resolution);
       const interval = tradingViewResolutionToSpotInterval(requestResolution);
+      const intervalMs = getSpotIntervalMs(interval);
       const latestBarKey = getLatestBarKey(requestResolution);
 
       const handleKline = (realtimeMessage: SpotMarketRealtimeMessage) => {
@@ -348,8 +368,16 @@ export function createSpotTradingViewDatafeed(
 
         const latestBar = latestBars.get(latestBarKey);
         if (latestBar && bar.time < latestBar.time) return;
+        if (latestBar && bar.time > latestBar.time + intervalMs) {
+          if (resetGapTimeByLatestBarKey.get(latestBarKey) !== bar.time) {
+            resetGapTimeByLatestBarKey.set(latestBarKey, bar.time);
+            onResetCacheNeeded?.();
+          }
+          return;
+        }
 
         latestBars.set(latestBarKey, bar);
+        resetGapTimeByLatestBarKey.delete(latestBarKey);
         onRealtime(bar);
       };
 
@@ -375,6 +403,7 @@ export function createSpotTradingViewDatafeed(
       const latestBarKey = latestBarKeyByUid.get(subscriberUid);
       if (latestBarKey) {
         latestBars.delete(latestBarKey);
+        resetGapTimeByLatestBarKey.delete(latestBarKey);
       }
       latestBarKeyByUid.delete(subscriberUid);
     },
@@ -386,6 +415,7 @@ export function createSpotTradingViewDatafeed(
       unsubscribeByUid.clear();
       latestBarKeyByUid.clear();
       latestBars.clear();
+      resetGapTimeByLatestBarKey.clear();
     },
   };
 }
