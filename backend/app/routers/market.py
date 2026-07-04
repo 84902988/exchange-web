@@ -421,6 +421,7 @@ async def spot_market_ws(websocket: WebSocket):
     3. 支持 subscribe:BTCUSDT 这种方式切换订阅交易对
     """
     symbol = (websocket.query_params.get("symbol") or "").upper().strip()
+    interval = (websocket.query_params.get("interval") or "1m").strip()
     if not symbol:
         await websocket.close(code=1008)
         return
@@ -430,7 +431,7 @@ async def spot_market_ws(websocket: WebSocket):
     manager_connected = False
 
     try:
-        await market_ws_manager.connect(connected_symbol, websocket)
+        await market_ws_manager.connect(connected_symbol, websocket, interval=interval)
         manager_connected = True
 
         await market_ws_manager.send_snapshot(db, connected_symbol)
@@ -458,7 +459,12 @@ async def spot_market_ws(websocket: WebSocket):
                                 await market_ws_manager.disconnect(connected_symbol, websocket)
 
                             connected_symbol = new_symbol
-                            await market_ws_manager.connect(connected_symbol, websocket, accepted=True)
+                            await market_ws_manager.connect(
+                                connected_symbol,
+                                websocket,
+                                accepted=True,
+                                interval=interval,
+                            )
                             manager_connected = True
 
                             await market_ws_manager.send_snapshot(db, connected_symbol)

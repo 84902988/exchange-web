@@ -353,7 +353,7 @@ export function createSpotTradingViewDatafeed(
         onRealtime(bar);
       };
 
-      spotMarketRealtime.setSymbol(apiSymbol);
+      spotMarketRealtime.setSymbol(apiSymbol, interval);
       const unsubscribe = spotMarketRealtime.subscribe('kline', handleKline);
       unsubscribeByUid.set(subscriberUid, unsubscribe);
       latestBarKeyByUid.set(subscriberUid, latestBarKey);

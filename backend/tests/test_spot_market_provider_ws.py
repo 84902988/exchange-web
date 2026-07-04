@@ -110,6 +110,55 @@ def test_bitget_trade_message_normalize() -> None:
     assert record["trades"][1]["side"] == "BUY"
 
 
+def test_bitget_kline_channel_mapping() -> None:
+    assert provider_ws.bitget_spot_kline_channel("1m") == "candle1m"
+    assert provider_ws.bitget_spot_kline_channel("5m") == "candle5m"
+    assert provider_ws.bitget_spot_kline_channel("15m") == "candle15"
+    assert provider_ws.bitget_spot_kline_channel("1h") == "candle1H"
+    assert provider_ws.bitget_spot_kline_channel("4h") == "candle4H"
+    assert provider_ws.bitget_spot_kline_channel("1d") == "candle1D"
+
+
+def test_bitget_kline_message_normalize() -> None:
+    record = provider_ws.normalize_bitget_kline_message(
+        {
+            "arg": {"instType": "SPOT", "channel": "candle1m", "instId": "BTCUSDT"},
+            "action": "update",
+            "data": [
+                [
+                    "1695709800000",
+                    "26290",
+                    "26300",
+                    "26280",
+                    "26295",
+                    "1.23",
+                    "32343.2",
+                    "32343.2",
+                ]
+            ],
+        },
+        local_symbol="btc/usdt",
+        provider_symbol="BTCUSDT",
+        interval="1m",
+        kline_limit=10,
+    )
+
+    assert record is not None
+    assert record["symbol"] == "BTCUSDT"
+    assert record["provider"] == provider_ws.PROVIDER_BITGET_SPOT
+    assert record["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert record["freshness"] == "LIVE"
+    assert record["interval"] == "1m"
+    assert record["items"][0]["open_time"] == 1695709800000
+    assert record["items"][0]["close_time"] == 1695709860000
+    assert record["items"][0]["open"] == "26290"
+    assert record["items"][0]["high"] == "26300"
+    assert record["items"][0]["low"] == "26280"
+    assert record["items"][0]["close"] == "26295"
+    assert record["items"][0]["volume"] == "1.23"
+    assert record["items"][0]["quote_volume"] == "32343.2"
+
+
 def test_depth_cache_fresh_and_stale() -> None:
     service = provider_ws.SpotMarketProviderWsService()
     now_ms = provider_ws._now_ms()
@@ -230,6 +279,56 @@ def test_trades_cache_fresh_and_stale() -> None:
         }
     )
     assert service.get_fresh_trades("btcusdt", max_age_ms=1000) is None
+
+
+def test_kline_cache_fresh_and_stale() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    now_ms = provider_ws._now_ms()
+    item = {
+        "open_time": now_ms - 60_000,
+        "close_time": now_ms,
+        "open": "2",
+        "high": "3",
+        "low": "1",
+        "close": "2.5",
+        "volume": "10",
+        "quote_volume": "25",
+    }
+    service.set_kline_cache_for_tests(
+        {
+            "symbol": "BTCUSDT",
+            "interval": "1m",
+            "provider": provider_ws.PROVIDER_BITGET_SPOT,
+            "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+            "freshness": "LIVE",
+            "items": [item],
+            "updated_at_ms": now_ms,
+            "ts": now_ms,
+        }
+    )
+
+    fresh = service.get_fresh_klines("BTC/USDT", "1m", max_age_ms=1000)
+    assert fresh is not None
+    assert fresh["symbol"] == "BTCUSDT"
+    assert fresh["interval"] == "1m"
+    assert fresh["provider"] == provider_ws.PROVIDER_BITGET_SPOT
+    assert fresh["source"] == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert fresh["freshness"] == "LIVE"
+    assert fresh["items"][0]["close"] == "2.5"
+
+    service.set_kline_cache_for_tests(
+        {
+            "symbol": "BTCUSDT",
+            "interval": "1m",
+            "provider": provider_ws.PROVIDER_BITGET_SPOT,
+            "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+            "freshness": "LIVE",
+            "items": [item],
+            "updated_at_ms": now_ms - 5000,
+            "ts": now_ms - 5000,
+        }
+    )
+    assert service.get_fresh_klines("btcusdt", "1m", max_age_ms=1000) is None
 
 
 if __name__ == "__main__":
