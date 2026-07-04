@@ -22,6 +22,7 @@ from app.services.spot_market_domain_cache import is_fresh_record
 logger = logging.getLogger(__name__)
 
 SPOT_PROVIDER_WS_SOURCE = "LIVE_WS"
+SPOT_PROVIDER_WS_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT}
 BITGET_SPOT_DEPTH_CHANNEL = "books15"
 BITGET_SPOT_TICKER_CHANNEL = "ticker"
 BITGET_SPOT_TRADES_CHANNEL = "trade"
@@ -104,6 +105,14 @@ class SpotKlineSubscription:
 def normalize_spot_ws_symbol(value: Any) -> str:
     raw = str(value or "").strip().upper()
     return "".join(ch for ch in raw if ch.isalnum())
+
+
+def normalize_spot_ws_provider(value: Any) -> str:
+    return str(value or PROVIDER_BITGET_SPOT).strip().upper()
+
+
+def spot_provider_ws_supports_provider(provider: Any) -> bool:
+    return normalize_spot_ws_provider(provider) in SPOT_PROVIDER_WS_SUPPORTED_PROVIDERS
 
 
 def _now_ms() -> int:
@@ -562,17 +571,21 @@ class SpotMarketProviderWsService:
         self,
         symbol: str,
         *,
+        provider: Optional[str] = None,
         max_age_ms: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> Optional[DepthResponse]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
+        provider_code = normalize_spot_ws_provider(provider)
+        if not spot_provider_ws_supports_provider(provider_code):
+            return None
         now_ms = _now_ms()
         allowed_age_ms = _max_age_ms(max_age_ms)
         with self._lock:
             candidates = [
                 item
                 for (provider, local_symbol), item in self._depth_cache.items()
-                if provider == PROVIDER_BITGET_SPOT and local_symbol == normalized_symbol
+                if provider == provider_code and local_symbol == normalized_symbol
             ]
             candidates.sort(key=lambda item: int(item.get("updated_at_ms") or 0), reverse=True)
             for item in candidates:
@@ -585,16 +598,20 @@ class SpotMarketProviderWsService:
         self,
         symbol: str,
         *,
+        provider: Optional[str] = None,
         max_age_ms: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
+        provider_code = normalize_spot_ws_provider(provider)
+        if not spot_provider_ws_supports_provider(provider_code):
+            return None
         now_ms = _now_ms()
         allowed_age_ms = _ticker_max_age_ms(max_age_ms)
         with self._lock:
             candidates = [
                 item
                 for (provider, local_symbol), item in self._ticker_cache.items()
-                if provider == PROVIDER_BITGET_SPOT and local_symbol == normalized_symbol
+                if provider == provider_code and local_symbol == normalized_symbol
             ]
             candidates.sort(key=lambda item: int(item.get("updated_at_ms") or 0), reverse=True)
             for item in candidates:
@@ -607,17 +624,21 @@ class SpotMarketProviderWsService:
         self,
         symbol: str,
         *,
+        provider: Optional[str] = None,
         max_age_ms: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> Optional[TradesResponse]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
+        provider_code = normalize_spot_ws_provider(provider)
+        if not spot_provider_ws_supports_provider(provider_code):
+            return None
         now_ms = _now_ms()
         allowed_age_ms = _trades_max_age_ms(max_age_ms)
         with self._lock:
             candidates = [
                 item
                 for (provider, local_symbol), item in self._trades_cache.items()
-                if provider == PROVIDER_BITGET_SPOT and local_symbol == normalized_symbol
+                if provider == provider_code and local_symbol == normalized_symbol
             ]
             candidates.sort(key=lambda item: int(item.get("updated_at_ms") or 0), reverse=True)
             for item in candidates:
@@ -631,14 +652,18 @@ class SpotMarketProviderWsService:
         symbol: str,
         interval: str,
         *,
+        provider: Optional[str] = None,
         max_age_ms: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         normalized_interval = normalize_spot_ws_kline_interval(interval)
+        provider_code = normalize_spot_ws_provider(provider)
+        if not spot_provider_ws_supports_provider(provider_code):
+            return None
         now_ms = _now_ms()
         allowed_age_ms = _kline_max_age_ms(max_age_ms)
-        key = (PROVIDER_BITGET_SPOT, normalized_symbol, normalized_interval)
+        key = (provider_code, normalized_symbol, normalized_interval)
         with self._lock:
             item = self._kline_cache.get(key)
             if item is None:
@@ -738,18 +763,20 @@ class SpotMarketProviderWsService:
             self._trades_generations.clear()
             self._kline_generations.clear()
 
-    def ensure_symbol(self, symbol: str) -> None:
+    def ensure_symbol(self, symbol: str, *, provider: Optional[str] = None) -> None:
         local_symbol = normalize_spot_ws_symbol(symbol)
-        if not local_symbol:
+        provider_code = normalize_spot_ws_provider(provider)
+        if not local_symbol or not spot_provider_ws_supports_provider(provider_code):
             return
         self._ensure_depth_symbol(local_symbol)
         self._ensure_ticker_symbol(local_symbol)
         self._ensure_trades_symbol(local_symbol)
 
-    def ensure_kline(self, symbol: str, interval: str) -> None:
+    def ensure_kline(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
         local_symbol = normalize_spot_ws_symbol(symbol)
         normalized_interval = normalize_spot_ws_kline_interval(interval)
-        if not local_symbol:
+        provider_code = normalize_spot_ws_provider(provider)
+        if not local_symbol or not spot_provider_ws_supports_provider(provider_code):
             return
         self._ensure_kline_symbol(local_symbol, normalized_interval)
 
@@ -863,18 +890,20 @@ class SpotMarketProviderWsService:
             self._kline_tasks[key] = thread
             thread.start()
 
-    def release_symbol(self, symbol: str) -> None:
+    def release_symbol(self, symbol: str, *, provider: Optional[str] = None) -> None:
         local_symbol = normalize_spot_ws_symbol(symbol)
-        if not local_symbol:
+        provider_code = normalize_spot_ws_provider(provider)
+        if not local_symbol or not spot_provider_ws_supports_provider(provider_code):
             return
         self._stop_depth_subscription(local_symbol)
         self._stop_ticker_subscription(local_symbol)
         self._stop_trades_subscription(local_symbol)
         self._stop_kline_subscriptions(local_symbol)
 
-    def release_kline(self, symbol: str, interval: str) -> None:
+    def release_kline(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
         local_symbol = normalize_spot_ws_symbol(symbol)
-        if not local_symbol:
+        provider_code = normalize_spot_ws_provider(provider)
+        if not local_symbol or not spot_provider_ws_supports_provider(provider_code):
             return
         self._stop_kline_subscription(local_symbol, normalize_spot_ws_kline_interval(interval))
 
@@ -1717,71 +1746,96 @@ spot_market_provider_ws = SpotMarketProviderWsService()
 def get_spot_provider_ws_depth(
     symbol: str,
     *,
+    provider: Optional[str] = None,
     max_age_ms: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> Optional[DepthResponse]:
-    return spot_market_provider_ws.get_fresh_depth(symbol, max_age_ms=max_age_ms, limit=limit)
+    return spot_market_provider_ws.get_fresh_depth(
+        symbol,
+        provider=provider,
+        max_age_ms=max_age_ms,
+        limit=limit,
+    )
 
 
-def ensure_spot_provider_ws_depth(symbol: str) -> None:
-    spot_market_provider_ws.ensure_symbol(symbol)
+def ensure_spot_provider_ws_depth(symbol: str, *, provider: Optional[str] = None) -> None:
+    spot_market_provider_ws.ensure_symbol(symbol, provider=provider)
 
 
-def release_spot_provider_ws_depth(symbol: str) -> None:
-    spot_market_provider_ws.release_symbol(symbol)
+def release_spot_provider_ws_depth(symbol: str, *, provider: Optional[str] = None) -> None:
+    spot_market_provider_ws.release_symbol(symbol, provider=provider)
 
 
 def get_spot_provider_ws_ticker(
     symbol: str,
     *,
+    provider: Optional[str] = None,
     max_age_ms: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
-    return spot_market_provider_ws.get_fresh_ticker(symbol, max_age_ms=max_age_ms)
+    return spot_market_provider_ws.get_fresh_ticker(symbol, provider=provider, max_age_ms=max_age_ms)
 
 
-def ensure_spot_provider_ws_ticker(symbol: str) -> None:
-    spot_market_provider_ws.ensure_symbol(symbol)
+def ensure_spot_provider_ws_ticker(symbol: str, *, provider: Optional[str] = None) -> None:
+    spot_market_provider_ws.ensure_symbol(symbol, provider=provider)
 
 
-def release_spot_provider_ws_ticker(symbol: str) -> None:
-    spot_market_provider_ws.release_symbol(symbol)
+def release_spot_provider_ws_ticker(symbol: str, *, provider: Optional[str] = None) -> None:
+    spot_market_provider_ws.release_symbol(symbol, provider=provider)
 
 
 def get_spot_provider_ws_trades(
     symbol: str,
     *,
+    provider: Optional[str] = None,
     max_age_ms: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> Optional[TradesResponse]:
-    return spot_market_provider_ws.get_fresh_trades(symbol, max_age_ms=max_age_ms, limit=limit)
+    return spot_market_provider_ws.get_fresh_trades(
+        symbol,
+        provider=provider,
+        max_age_ms=max_age_ms,
+        limit=limit,
+    )
 
 
-def ensure_spot_provider_ws_trades(symbol: str) -> None:
-    spot_market_provider_ws.ensure_symbol(symbol)
+def ensure_spot_provider_ws_trades(symbol: str, *, provider: Optional[str] = None) -> None:
+    spot_market_provider_ws.ensure_symbol(symbol, provider=provider)
 
 
-def release_spot_provider_ws_trades(symbol: str) -> None:
-    spot_market_provider_ws.release_symbol(symbol)
+def release_spot_provider_ws_trades(symbol: str, *, provider: Optional[str] = None) -> None:
+    spot_market_provider_ws.release_symbol(symbol, provider=provider)
 
 
 def get_spot_provider_ws_klines(
     symbol: str,
     interval: str,
     *,
+    provider: Optional[str] = None,
     max_age_ms: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     return spot_market_provider_ws.get_fresh_klines(
         symbol,
         interval,
+        provider=provider,
         max_age_ms=max_age_ms,
         limit=limit,
     )
 
 
-def ensure_spot_provider_ws_kline(symbol: str, interval: str = "1m") -> None:
-    spot_market_provider_ws.ensure_kline(symbol, interval)
+def ensure_spot_provider_ws_kline(
+    symbol: str,
+    interval: str = "1m",
+    *,
+    provider: Optional[str] = None,
+) -> None:
+    spot_market_provider_ws.ensure_kline(symbol, interval, provider=provider)
 
 
-def release_spot_provider_ws_kline(symbol: str, interval: str = "1m") -> None:
-    spot_market_provider_ws.release_kline(symbol, interval)
+def release_spot_provider_ws_kline(
+    symbol: str,
+    interval: str = "1m",
+    *,
+    provider: Optional[str] = None,
+) -> None:
+    spot_market_provider_ws.release_kline(symbol, interval, provider=provider)
