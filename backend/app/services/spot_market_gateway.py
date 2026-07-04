@@ -20,6 +20,7 @@ from app.services.spot_market_provider_ws import (
     get_spot_provider_ws_trades,
     normalize_spot_ws_symbol,
     release_spot_provider_ws_depth,
+    release_spot_provider_ws_kline,
 )
 
 
@@ -33,6 +34,7 @@ class SpotMarketGateway:
         ensure_depth: Optional[Callable[[str], None]] = None,
         ensure_kline: Optional[Callable[[str, str], None]] = None,
         release_depth: Optional[Callable[[str], None]] = None,
+        release_kline: Optional[Callable[[str, str], None]] = None,
         get_depth: Optional[Callable[..., Optional[DepthResponse]]] = None,
         get_ticker: Optional[Callable[..., Optional[dict[str, Any]]]] = None,
         get_trades: Optional[Callable[..., Optional[TradesResponse]]] = None,
@@ -44,6 +46,7 @@ class SpotMarketGateway:
         self._ensure_depth = ensure_depth or ensure_spot_provider_ws_depth
         self._ensure_kline = ensure_kline or ensure_spot_provider_ws_kline
         self._release_depth = release_depth or release_spot_provider_ws_depth
+        self._release_kline = release_kline or release_spot_provider_ws_kline
         self._get_depth = get_depth or get_spot_provider_ws_depth
         self._get_ticker = get_ticker or get_spot_provider_ws_ticker
         self._get_trades = get_trades or get_spot_provider_ws_trades
@@ -55,6 +58,7 @@ class SpotMarketGateway:
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_lock = asyncio.Lock()
         self._broadcast_state = SpotGatewayBroadcastState()
+        self._ensured_kline_intervals: dict[str, set[str]] = {}
         self._precision_cache: dict[str, tuple[int, int]] = {}
 
     async def ensure_symbol(self, symbol: str, *, interval: str = "1m") -> None:
@@ -66,7 +70,7 @@ class SpotMarketGateway:
         await self._cancel_idle_release(normalized_symbol)
         try:
             self._ensure_depth(normalized_symbol)
-            self._ensure_kline(normalized_symbol, self._normalize_interval(interval))
+            self._ensure_kline_interval(normalized_symbol, self._normalize_interval(interval))
         except Exception:
             logger.warning("spot_market_gateway_ensure_provider_ws_failed symbol=%s", normalized_symbol, exc_info=True)
         async with self._task_lock:
@@ -119,6 +123,7 @@ class SpotMarketGateway:
                     refresh_task.cancel()
             await asyncio.to_thread(self._release_depth, symbol)
             self._broadcast_state.clear_symbol(symbol)
+            self._ensured_kline_intervals.pop(symbol, None)
             self._precision_cache.pop(symbol, None)
             logger.info("spot_market_gateway_release_provider_ws symbol=%s", symbol)
         except asyncio.CancelledError:
@@ -189,9 +194,12 @@ class SpotMarketGateway:
                     except Exception:
                         logger.warning("spot_market_gateway_trade_broadcast_failed symbol=%s", symbol, exc_info=True)
 
-                for interval in await self._active_kline_intervals(symbol):
+                active_kline_intervals = await self._sync_kline_intervals(
+                    symbol,
+                    await self._active_kline_intervals(symbol),
+                )
+                for interval in active_kline_intervals:
                     try:
-                        self._ensure_kline(symbol, interval)
                         klines = self._get_klines(
                             symbol,
                             interval,
@@ -334,6 +342,60 @@ class SpotMarketGateway:
             intervals = ["1m"]
         normalized = sorted({self._normalize_interval(interval) for interval in intervals or ["1m"]})
         return normalized or ["1m"]
+
+    async def _sync_kline_intervals(self, symbol: str, intervals: list[str]) -> list[str]:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        if not normalized_symbol:
+            return []
+        active_intervals = sorted({self._normalize_interval(interval) for interval in intervals or ["1m"]})
+        ensured_intervals = set(self._ensured_kline_intervals.get(normalized_symbol, set()))
+
+        for interval in sorted(ensured_intervals - set(active_intervals)):
+            try:
+                await asyncio.to_thread(self._release_kline, normalized_symbol, interval)
+            except Exception:
+                logger.warning(
+                    "spot_market_gateway_release_kline_interval_failed symbol=%s interval=%s",
+                    normalized_symbol,
+                    interval,
+                    exc_info=True,
+                )
+                continue
+            self._ensured_kline_intervals.get(normalized_symbol, set()).discard(interval)
+            self._clear_kline_interval_state(normalized_symbol, interval)
+
+        ready_intervals: list[str] = []
+        for interval in active_intervals:
+            try:
+                self._ensure_kline_interval(normalized_symbol, interval)
+            except Exception:
+                logger.warning(
+                    "spot_market_gateway_ensure_kline_interval_failed symbol=%s interval=%s",
+                    normalized_symbol,
+                    interval,
+                    exc_info=True,
+                )
+                continue
+            ready_intervals.append(interval)
+        return ready_intervals
+
+    def _ensure_kline_interval(self, symbol: str, interval: str) -> None:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        normalized_interval = self._normalize_interval(interval)
+        if not normalized_symbol:
+            return
+        self._ensure_kline(normalized_symbol, normalized_interval)
+        self._ensured_kline_intervals.setdefault(normalized_symbol, set()).add(normalized_interval)
+
+    def _clear_kline_interval_state(self, symbol: str, interval: str) -> None:
+        self._broadcast_state.clear_domain_key(
+            self._domain_key(
+                "kline",
+                symbol,
+                provider=PROVIDER_BITGET_SPOT,
+                interval=interval,
+            )
+        )
 
     def _latest_kline_for_broadcast(self, klines: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
         items = list((klines or {}).get("items") or [])

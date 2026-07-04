@@ -86,6 +86,11 @@ class SpotGatewayBroadcastState:
             return False
         return signature in set(self._seen_trade_signatures.get(domain_key, []))
 
+    def clear_domain_key(self, domain_key: SpotGatewayDomainKey) -> None:
+        self._last_signatures.pop(domain_key, None)
+        self._last_broadcast_at_ms.pop(domain_key, None)
+        self._seen_trade_signatures.pop(domain_key, None)
+
     def clear_symbol(self, symbol: str) -> None:
         normalized_symbol = _normalize_symbol(symbol)
         if not normalized_symbol:

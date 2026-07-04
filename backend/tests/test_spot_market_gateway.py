@@ -15,6 +15,7 @@ class FakeWsManager:
         self.trade_broadcasts: list[dict] = []
         self.kline_broadcasts: list[dict] = []
         self.kline_call_count = 0
+        self.intervals = ["1m"]
 
     async def subscriber_count(self, symbol: str) -> int:
         return self.count
@@ -36,7 +37,7 @@ class FakeWsManager:
 
     async def kline_intervals(self, symbol: str) -> list[str]:
         self.kline_call_count += 1
-        return ["1m"]
+        return list(self.intervals)
 
 
 class FakeProvider:
@@ -336,6 +337,145 @@ def test_gateway_kline_broadcast_state_dedupes_detects_ohlcv_changes_and_isolate
         other_interval_gateway = _new_test_gateway()
         assert other_interval_gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is True
         assert other_interval_gateway._should_broadcast_kline("BTCUSDT", "5m", kline, provider="BITGET_SPOT") is True
+
+    asyncio.run(run())
+
+
+def test_gateway_sync_kline_intervals_releases_inactive_and_ensures_new_interval() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = FakeProvider()
+        ensured_klines: list[tuple[str, str]] = []
+        released_klines: list[tuple[str, str]] = []
+        gateway = SpotMarketGateway(
+            ensure_depth=provider.ensure,
+            release_depth=provider.release,
+            ensure_kline=lambda symbol, interval: ensured_klines.append((symbol, interval)),
+            release_kline=lambda symbol, interval: released_klines.append((symbol, interval)),
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+        )
+
+        gateway._ensured_kline_intervals["BTCUSDT"] = {"1m"}
+        kline = _kline_payload()
+        assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is True
+        assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is False
+
+        ready = await gateway._sync_kline_intervals("BTCUSDT", ["5m"])
+
+        assert ready == ["5m"]
+        assert released_klines == [("BTCUSDT", "1m")]
+        assert ("BTCUSDT", "5m") in ensured_klines
+        assert gateway._ensured_kline_intervals["BTCUSDT"] == {"5m"}
+        assert provider.released == []
+        assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is True
+
+    asyncio.run(run())
+
+
+def test_gateway_sync_kline_intervals_keeps_simultaneous_active_intervals() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = FakeProvider()
+        ensured_klines: list[tuple[str, str]] = []
+        released_klines: list[tuple[str, str]] = []
+        gateway = SpotMarketGateway(
+            ensure_depth=provider.ensure,
+            release_depth=provider.release,
+            ensure_kline=lambda symbol, interval: ensured_klines.append((symbol, interval)),
+            release_kline=lambda symbol, interval: released_klines.append((symbol, interval)),
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+        )
+
+        gateway._ensured_kline_intervals["BTCUSDT"] = {"1m", "5m"}
+        ready = await gateway._sync_kline_intervals("BTCUSDT", ["1m", "5m"])
+
+        assert ready == ["1m", "5m"]
+        assert released_klines == []
+        assert ("BTCUSDT", "1m") in ensured_klines
+        assert ("BTCUSDT", "5m") in ensured_klines
+        assert gateway._ensured_kline_intervals["BTCUSDT"] == {"1m", "5m"}
+        assert provider.released == []
+
+    asyncio.run(run())
+
+
+def test_gateway_sync_kline_intervals_does_not_affect_other_symbols() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = FakeProvider()
+        ensured_klines: list[tuple[str, str]] = []
+        released_klines: list[tuple[str, str]] = []
+        gateway = SpotMarketGateway(
+            ensure_depth=provider.ensure,
+            release_depth=provider.release,
+            ensure_kline=lambda symbol, interval: ensured_klines.append((symbol, interval)),
+            release_kline=lambda symbol, interval: released_klines.append((symbol, interval)),
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+        )
+
+        gateway._ensured_kline_intervals["BTCUSDT"] = {"1m"}
+        gateway._ensured_kline_intervals["ETHUSDT"] = {"1m"}
+
+        await gateway._sync_kline_intervals("BTCUSDT", ["5m"])
+
+        assert released_klines == [("BTCUSDT", "1m")]
+        assert ("BTCUSDT", "5m") in ensured_klines
+        assert gateway._ensured_kline_intervals["BTCUSDT"] == {"5m"}
+        assert gateway._ensured_kline_intervals["ETHUSDT"] == {"1m"}
+        assert provider.released == []
+
+    asyncio.run(run())
+
+
+def test_gateway_idle_release_clears_tracked_kline_intervals_without_per_interval_release() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = FakeProvider()
+        gateway = SpotMarketGateway(
+            ensure_depth=provider.ensure,
+            ensure_kline=lambda symbol, interval: None,
+            release_depth=provider.release,
+            release_kline=lambda symbol, interval: (_ for _ in ()).throw(
+                AssertionError("symbol idle release should use provider symbol release")
+            ),
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+        )
+
+        ws_manager.count = 1
+        await gateway.ensure_symbol("BTC/USDT", interval="1m")
+        await asyncio.sleep(0.01)
+        assert gateway._ensured_kline_intervals.get("BTCUSDT") == {"1m"}
+
+        ws_manager.count = 0
+        await gateway.release_symbol_if_idle("BTCUSDT", idle_delay_seconds=0)
+        await asyncio.sleep(0.05)
+
+        assert provider.released == ["BTCUSDT"]
+        assert "BTCUSDT" not in gateway._ensured_kline_intervals
 
     asyncio.run(run())
 
