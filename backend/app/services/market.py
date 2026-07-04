@@ -55,6 +55,7 @@ from app.services.spot_market_provider_ws import (
     get_spot_provider_ws_klines,
     get_spot_provider_ws_ticker,
     get_spot_provider_ws_trades,
+    spot_provider_ws_supports_provider,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,12 +92,6 @@ _SPOT_PROVIDER_LOG_THROTTLE_SECONDS = 60
 _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS = 2500
 _SPOT_PROVIDER_FAST_TIMEOUT_CAP_MS = 800
 _SPOT_KLINE_FAST_TIMEOUT_CAP_MS = 1200
-_BINANCE_SPOT_PROVIDER_PREFERENCE = (
-    PROVIDER_BINANCE_SPOT,
-    PROVIDER_BITGET_SPOT,
-    PROVIDER_OKX_SPOT,
-)
-
 _INTERVAL_SECONDS = {
     "1m": 60,
     "5m": 300,
@@ -992,9 +987,11 @@ def get_depth(db: Session, symbol: str, limit: int = 20, *, fast: bool = False) 
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        live_depth = get_spot_provider_ws_depth(pair.symbol, limit=limit)
-        if live_depth is not None:
-            return _format_depth_for_pair(pair, live_depth, limit=limit)
+        ws_provider_code = _primary_spot_ws_provider_code(db, pair)
+        if ws_provider_code:
+            live_depth = get_spot_provider_ws_depth(pair.symbol, provider=ws_provider_code, limit=limit)
+            if live_depth is not None:
+                return _format_depth_for_pair(pair, live_depth, limit=limit)
         return _get_external_spot_depth(db, pair, limit=limit, fast=fast)
 
     internal_depth = _get_internal_depth(db, pair, limit=limit)
@@ -1097,27 +1094,32 @@ def _enabled_spot_market_providers_for_pair(
     *,
     max_providers: Optional[int] = None,
 ) -> tuple[MarketDataProviderConfig, ...]:
-    providers = tuple(enabled_spot_market_providers(db))
-    if _normalize_data_source(pair) != DATA_SOURCE_BINANCE:
-        ordered = providers
-    else:
-        preferred_order = {
-            provider_code: index
-            for index, provider_code in enumerate(_BINANCE_SPOT_PROVIDER_PREFERENCE)
-        }
-        ordered = tuple(
-            sorted(
-                providers,
-                key=lambda provider: (
-                    preferred_order.get(provider.provider_code, len(preferred_order)),
-                    int(provider.priority or 0),
-                ),
-            )
-        )
+    ordered = tuple(enabled_spot_market_providers(db))
 
     if max_providers is not None:
         return ordered[: max(0, int(max_providers))]
     return ordered
+
+
+def _primary_spot_market_provider_for_pair(
+    db: Session,
+    pair: TradingPair,
+) -> Optional[MarketDataProviderConfig]:
+    providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1)
+    return providers[0] if providers else None
+
+
+def _primary_spot_ws_provider_code(
+    db: Session,
+    pair: TradingPair,
+) -> Optional[str]:
+    primary_provider = _primary_spot_market_provider_for_pair(db, pair)
+    if primary_provider is None:
+        return None
+    provider_code = str(primary_provider.provider_code or "").strip().upper()
+    if spot_provider_ws_supports_provider(provider_code):
+        return provider_code
+    return None
 
 
 def _spot_provider_request_config(
@@ -1489,17 +1491,19 @@ def _spot_provider_warning_allowed(
 
 def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = False) -> Optional[TickerItem]:
     last_error: Optional[Exception] = None
+    providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
+    primary_provider = providers[0] if providers else None
     try:
-        live_record = get_spot_provider_ws_ticker(pair.symbol)
-        if live_record is not None:
-            live_ticker = _spot_provider_ws_ticker_to_item(pair, live_record)
-            if live_ticker is not None:
-                _SPOT_LAST_GOOD_TICKERS[pair.symbol] = live_ticker
-                return live_ticker
+        if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code):
+            live_record = get_spot_provider_ws_ticker(pair.symbol, provider=primary_provider.provider_code)
+            if live_record is not None:
+                live_ticker = _spot_provider_ws_ticker_to_item(pair, live_record)
+                if live_ticker is not None:
+                    _SPOT_LAST_GOOD_TICKERS[pair.symbol] = live_ticker
+                    return live_ticker
     except Exception as exc:
         logger.debug("spot_provider_ws_ticker_unavailable symbol=%s reason=%s", pair.symbol, exc)
 
-    providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
     timeout_cap_ms = _SPOT_PROVIDER_FAST_TIMEOUT_CAP_MS if fast else _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS
     for provider in providers:
         try:
@@ -1586,9 +1590,14 @@ def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20, *,
 def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *, fast: bool = False) -> TradesResponse:
     last_error: Optional[Exception] = None
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
-    if any(getattr(provider, "provider_code", None) == PROVIDER_BITGET_SPOT for provider in providers):
+    primary_provider = providers[0] if providers else None
+    if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code):
         try:
-            live_trades = get_spot_provider_ws_trades(pair.symbol, limit=limit)
+            live_trades = get_spot_provider_ws_trades(
+                pair.symbol,
+                provider=primary_provider.provider_code,
+                limit=limit,
+            )
             if live_trades is not None and live_trades.trades:
                 formatted_live_trades = _format_trades_for_pair(pair, live_trades, limit=limit)
                 _SPOT_LAST_GOOD_TRADES[pair.symbol] = formatted_live_trades
@@ -2767,8 +2776,14 @@ def get_klines(
         if end_time_ms is None:
             try:
                 providers = _enabled_spot_market_providers_for_pair(db, pair)
-                if any(getattr(provider, "provider_code", None) == PROVIDER_BITGET_SPOT for provider in providers):
-                    live_ws_klines = get_spot_provider_ws_klines(pair.symbol, interval, limit=limit)
+                primary_provider = providers[0] if providers else None
+                if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code):
+                    live_ws_klines = get_spot_provider_ws_klines(
+                        pair.symbol,
+                        interval,
+                        provider=primary_provider.provider_code,
+                        limit=limit,
+                    )
             except Exception as exc:
                 logger.debug(
                     "spot_provider_ws_kline_unavailable symbol=%s interval=%s reason=%s",

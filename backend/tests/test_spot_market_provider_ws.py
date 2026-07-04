@@ -53,6 +53,37 @@ def test_normalize_spot_ws_symbol() -> None:
     assert provider_ws.normalize_spot_ws_symbol("btcusdt") == "BTCUSDT"
 
 
+def test_spot_provider_ws_supported_provider_gate() -> None:
+    assert provider_ws.spot_provider_ws_supports_provider(provider_ws.PROVIDER_BITGET_SPOT)
+    assert not provider_ws.spot_provider_ws_supports_provider("OKX_SPOT")
+
+    service = provider_ws.SpotMarketProviderWsService()
+    service.set_ticker_cache_for_tests(
+        {
+            "symbol": "BTCUSDT",
+            "last_price": "1",
+            "open_24h": "1",
+            "price_change_24h": "0",
+            "price_change_percent": "0",
+            "high_24h": "1",
+            "low_24h": "1",
+            "base_volume_24h": "1",
+            "quote_volume_24h": "1",
+        }
+    )
+
+    assert service.get_fresh_ticker("BTCUSDT", provider=provider_ws.PROVIDER_BITGET_SPOT) is not None
+    assert service.get_fresh_ticker("BTCUSDT", provider="OKX_SPOT") is None
+
+    service.ensure_symbol("BTCUSDT", provider="OKX_SPOT")
+    service.ensure_kline("BTCUSDT", "1m", provider="OKX_SPOT")
+    with service._lock:
+        assert service._depth_tasks == {}
+        assert service._ticker_tasks == {}
+        assert service._trades_tasks == {}
+        assert service._kline_tasks == {}
+
+
 def test_spot_provider_ws_has_no_enabled_switches() -> None:
     for name in (
         "SPOT_PROVIDER_WS_ENABLED",

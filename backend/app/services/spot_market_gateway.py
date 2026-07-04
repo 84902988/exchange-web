@@ -9,7 +9,7 @@ from app.core.config import settings
 from app.db.models.trading_pair import TradingPair
 from app.db.session import SessionLocal
 from app.schemas.market import DepthItem, DepthResponse, TradesResponse
-from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT
+from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT, enabled_spot_market_providers
 from app.services.spot_market_gateway_state import SpotGatewayBroadcastState, make_domain_key
 from app.services.spot_market_provider_ws import (
     ensure_spot_provider_ws_depth,
@@ -21,6 +21,7 @@ from app.services.spot_market_provider_ws import (
     normalize_spot_ws_symbol,
     release_spot_provider_ws_depth,
     release_spot_provider_ws_kline,
+    spot_provider_ws_supports_provider,
 )
 
 
@@ -46,14 +47,23 @@ class SpotMarketGateway:
         ws_manager: Any = None,
     ) -> None:
         self._ensure_depth = ensure_depth or ensure_spot_provider_ws_depth
+        self._ensure_depth_accepts_provider = ensure_depth is None
         self._ensure_kline = ensure_kline or ensure_spot_provider_ws_kline
+        self._ensure_kline_accepts_provider = ensure_kline is None
         self._release_depth = release_depth or release_spot_provider_ws_depth
+        self._release_depth_accepts_provider = release_depth is None
         self._release_kline = release_kline or release_spot_provider_ws_kline
+        self._release_kline_accepts_provider = release_kline is None
         self._get_depth = get_depth or get_spot_provider_ws_depth
+        self._get_depth_accepts_provider = get_depth is None
         self._get_ticker = get_ticker or get_spot_provider_ws_ticker
+        self._get_ticker_accepts_provider = get_ticker is None
         self._get_trades = get_trades or get_spot_provider_ws_trades
+        self._get_trades_accepts_provider = get_trades is None
         self._get_klines = get_klines or get_spot_provider_ws_klines
+        self._get_klines_accepts_provider = get_klines is None
         self._provider_symbol_allowed = provider_symbol_allowed or self._default_provider_symbol_allowed
+        self._provider_symbol_allowed_is_default = provider_symbol_allowed is None
         self._precision_resolver = precision_resolver or self._default_precision_resolver
         self._ws_manager = ws_manager
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -62,17 +72,26 @@ class SpotMarketGateway:
         self._broadcast_state = SpotGatewayBroadcastState()
         self._ensured_kline_intervals: dict[str, set[str]] = {}
         self._precision_cache: dict[str, tuple[int, int]] = {}
+        self._symbol_providers: dict[str, str] = {}
 
     async def ensure_symbol(self, symbol: str, *, interval: str = "1m") -> None:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         if not normalized_symbol:
             return
-        if not await asyncio.to_thread(self._provider_symbol_allowed, normalized_symbol):
+        if self._provider_symbol_allowed_is_default:
+            provider_code = await asyncio.to_thread(self._select_provider_ws_code, normalized_symbol)
+        else:
+            provider_code = PROVIDER_BITGET_SPOT
+        if not provider_code or not await self._provider_symbol_allowed_async(normalized_symbol):
             return
+        self._symbol_providers[normalized_symbol] = provider_code
         await self._cancel_idle_release(normalized_symbol)
         try:
-            self._ensure_depth(normalized_symbol)
-            self._ensure_kline_interval(normalized_symbol, self._normalize_interval(interval))
+            if self._ensure_depth_accepts_provider:
+                self._ensure_depth(normalized_symbol, provider=provider_code)
+            else:
+                self._ensure_depth(normalized_symbol)
+            self._ensure_kline_interval(normalized_symbol, self._normalize_interval(interval), provider=provider_code)
         except Exception:
             logger.warning("spot_market_gateway_ensure_provider_ws_failed symbol=%s", normalized_symbol, exc_info=True)
         async with self._task_lock:
@@ -123,10 +142,8 @@ class SpotMarketGateway:
                 refresh_task = self._tasks.pop(symbol, None)
                 if refresh_task is not None and not refresh_task.done():
                     refresh_task.cancel()
-            await asyncio.to_thread(self._release_depth, symbol)
-            self._broadcast_state.clear_symbol(symbol)
-            self._ensured_kline_intervals.pop(symbol, None)
-            self._precision_cache.pop(symbol, None)
+            provider_code = self._symbol_providers.get(symbol, PROVIDER_BITGET_SPOT)
+            await self._release_provider_symbol(symbol, provider_code)
             logger.info("spot_market_gateway_release_provider_ws symbol=%s", symbol)
         except asyncio.CancelledError:
             raise
@@ -146,11 +163,26 @@ class SpotMarketGateway:
                 if subscriber_count <= 0:
                     await self.release_symbol_if_idle(symbol)
                     break
+                provider_code = self._symbol_providers.get(symbol)
+                if not provider_code or not await self._provider_symbol_allowed_async(symbol):
+                    break
+                if self._provider_symbol_allowed_is_default:
+                    selected_provider_code = await asyncio.to_thread(self._select_provider_ws_code, symbol)
+                    if selected_provider_code != provider_code:
+                        await self._release_provider_symbol(symbol, provider_code)
+                        break
                 try:
-                    depth = self._get_depth(
-                        symbol,
-                        limit=int(getattr(settings, "SPOT_PROVIDER_WS_DEPTH_LIMIT", 20) or 20),
-                    )
+                    if self._get_depth_accepts_provider:
+                        depth = self._get_depth(
+                            symbol,
+                            provider=provider_code,
+                            limit=int(getattr(settings, "SPOT_PROVIDER_WS_DEPTH_LIMIT", 20) or 20),
+                        )
+                    else:
+                        depth = self._get_depth(
+                            symbol,
+                            limit=int(getattr(settings, "SPOT_PROVIDER_WS_DEPTH_LIMIT", 20) or 20),
+                        )
                 except Exception:
                     logger.warning("spot_market_gateway_get_depth_failed symbol=%s", symbol, exc_info=True)
                     depth = None
@@ -163,7 +195,10 @@ class SpotMarketGateway:
                         logger.warning("spot_market_gateway_depth_broadcast_failed symbol=%s", symbol, exc_info=True)
 
                 try:
-                    ticker = self._get_ticker(symbol)
+                    if self._get_ticker_accepts_provider:
+                        ticker = self._get_ticker(symbol, provider=provider_code)
+                    else:
+                        ticker = self._get_ticker(symbol)
                 except Exception:
                     logger.warning("spot_market_gateway_get_ticker_failed symbol=%s", symbol, exc_info=True)
                     ticker = None
@@ -176,10 +211,17 @@ class SpotMarketGateway:
                         logger.warning("spot_market_gateway_ticker_broadcast_failed symbol=%s", symbol, exc_info=True)
 
                 try:
-                    trades = self._get_trades(
-                        symbol,
-                        limit=int(getattr(settings, "SPOT_PROVIDER_WS_TRADES_LIMIT", 30) or 30),
-                    )
+                    if self._get_trades_accepts_provider:
+                        trades = self._get_trades(
+                            symbol,
+                            provider=provider_code,
+                            limit=int(getattr(settings, "SPOT_PROVIDER_WS_TRADES_LIMIT", 30) or 30),
+                        )
+                    else:
+                        trades = self._get_trades(
+                            symbol,
+                            limit=int(getattr(settings, "SPOT_PROVIDER_WS_TRADES_LIMIT", 30) or 30),
+                        )
                 except Exception:
                     logger.warning("spot_market_gateway_get_trades_failed symbol=%s", symbol, exc_info=True)
                     trades = None
@@ -202,11 +244,19 @@ class SpotMarketGateway:
                 )
                 for interval in active_kline_intervals:
                     try:
-                        klines = self._get_klines(
-                            symbol,
-                            interval,
-                            limit=int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_LIMIT", 300) or 300),
-                        )
+                        if self._get_klines_accepts_provider:
+                            klines = self._get_klines(
+                                symbol,
+                                interval,
+                                provider=provider_code,
+                                limit=int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_LIMIT", 300) or 300),
+                            )
+                        else:
+                            klines = self._get_klines(
+                                symbol,
+                                interval,
+                                limit=int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_LIMIT", 300) or 300),
+                            )
                     except Exception:
                         logger.warning(
                             "spot_market_gateway_get_kline_failed symbol=%s interval=%s",
@@ -246,6 +296,16 @@ class SpotMarketGateway:
                 task = self._tasks.get(symbol)
                 if task is current_task:
                     self._tasks.pop(symbol, None)
+
+    async def _release_provider_symbol(self, symbol: str, provider_code: str) -> None:
+        if self._release_depth_accepts_provider:
+            await asyncio.to_thread(self._release_depth, symbol, provider=provider_code)
+        else:
+            await asyncio.to_thread(self._release_depth, symbol)
+        self._broadcast_state.clear_symbol(symbol)
+        self._ensured_kline_intervals.pop(symbol, None)
+        self._precision_cache.pop(symbol, None)
+        self._symbol_providers.pop(symbol, None)
 
     def _should_broadcast_depth(self, symbol: str, depth: DepthResponse) -> bool:
         domain_key = self._domain_key("depth", symbol, provider=getattr(depth, "provider", None))
@@ -351,10 +411,14 @@ class SpotMarketGateway:
             return []
         active_intervals = sorted({self._normalize_interval(interval) for interval in intervals or ["1m"]})
         ensured_intervals = set(self._ensured_kline_intervals.get(normalized_symbol, set()))
+        provider_code = self._symbol_providers.get(normalized_symbol) or PROVIDER_BITGET_SPOT
 
         for interval in sorted(ensured_intervals - set(active_intervals)):
             try:
-                await asyncio.to_thread(self._release_kline, normalized_symbol, interval)
+                if self._release_kline_accepts_provider:
+                    await asyncio.to_thread(self._release_kline, normalized_symbol, interval, provider=provider_code)
+                else:
+                    await asyncio.to_thread(self._release_kline, normalized_symbol, interval)
             except Exception:
                 logger.warning(
                     "spot_market_gateway_release_kline_interval_failed symbol=%s interval=%s",
@@ -364,7 +428,7 @@ class SpotMarketGateway:
                 )
                 continue
             self._ensured_kline_intervals.get(normalized_symbol, set()).discard(interval)
-            self._clear_kline_interval_state(normalized_symbol, interval)
+            self._clear_kline_interval_state(normalized_symbol, interval, provider=provider_code)
 
         ready_intervals: list[str] = []
         for interval in active_intervals:
@@ -381,20 +445,24 @@ class SpotMarketGateway:
             ready_intervals.append(interval)
         return ready_intervals
 
-    def _ensure_kline_interval(self, symbol: str, interval: str) -> None:
+    def _ensure_kline_interval(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         normalized_interval = self._normalize_interval(interval)
         if not normalized_symbol:
             return
-        self._ensure_kline(normalized_symbol, normalized_interval)
+        provider_code = str(provider or self._symbol_providers.get(normalized_symbol) or PROVIDER_BITGET_SPOT)
+        if self._ensure_kline_accepts_provider:
+            self._ensure_kline(normalized_symbol, normalized_interval, provider=provider_code)
+        else:
+            self._ensure_kline(normalized_symbol, normalized_interval)
         self._ensured_kline_intervals.setdefault(normalized_symbol, set()).add(normalized_interval)
 
-    def _clear_kline_interval_state(self, symbol: str, interval: str) -> None:
+    def _clear_kline_interval_state(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
         self._broadcast_state.clear_domain_key(
             self._domain_key(
                 "kline",
                 symbol,
-                provider=PROVIDER_BITGET_SPOT,
+                provider=provider or self._symbol_providers.get(normalize_spot_ws_symbol(symbol)) or PROVIDER_BITGET_SPOT,
                 interval=interval,
             )
         )
@@ -509,12 +577,46 @@ class SpotMarketGateway:
     async def _subscriber_count(self, symbol: str) -> int:
         return await self._market_ws_manager().subscriber_count(symbol)
 
+    async def _provider_symbol_allowed_async(self, symbol: str) -> bool:
+        if self._provider_symbol_allowed_is_default:
+            return await asyncio.to_thread(self._provider_symbol_allowed, symbol)
+        return bool(self._provider_symbol_allowed(symbol))
+
     def _market_ws_manager(self) -> Any:
         if self._ws_manager is not None:
             return self._ws_manager
         from app.services.market_ws import market_ws_manager
 
         return market_ws_manager
+
+    def _select_provider_ws_code(self, symbol: str) -> Optional[str]:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        if not normalized_symbol:
+            return None
+        db = SessionLocal()
+        try:
+            pair = (
+                db.query(TradingPair)
+                .filter(TradingPair.symbol == normalized_symbol, TradingPair.status == 1)
+                .first()
+            )
+            if pair is None:
+                return None
+            if str(getattr(pair, "data_source", "") or "").strip().upper() != "BINANCE":
+                return None
+            providers = tuple(enabled_spot_market_providers(db))
+            if not providers:
+                return None
+            primary_provider = providers[0]
+            provider_code = str(getattr(primary_provider, "provider_code", "") or "").strip().upper()
+            if not spot_provider_ws_supports_provider(provider_code):
+                return None
+            return provider_code
+        except Exception:
+            logger.warning("spot_market_gateway_provider_select_failed symbol=%s", normalized_symbol, exc_info=True)
+            return None
+        finally:
+            db.close()
 
     def _default_provider_symbol_allowed(self, symbol: str) -> bool:
         normalized_symbol = normalize_spot_ws_symbol(symbol)

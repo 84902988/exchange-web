@@ -4,6 +4,7 @@ import asyncio
 
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services import market
+from app.services import spot_market_gateway as gateway_module
 from app.services.spot_market_gateway import SpotMarketGateway
 
 
@@ -211,6 +212,118 @@ def _kline_payload(**overrides) -> dict:
     }
     payload.update(overrides)
     return payload
+
+
+def _spot_provider(code: str, *, priority: int = 1, enabled: bool = True):
+    return market.MarketDataProviderConfig(
+        provider_code=code,
+        provider_name=code,
+        market_type="SPOT",
+        enabled=enabled,
+        priority=priority,
+        base_url="https://example.invalid",
+        timeout_ms=1000,
+        cooldown_seconds=0,
+    )
+
+
+class _GatewaySelectorDb:
+    def __init__(self, pair) -> None:
+        self.pair = pair
+        self.closed = False
+
+    def query(self, model):
+        return self
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def first(self):
+        return self.pair
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_gateway_ws_selector_uses_primary_provider_priority() -> None:
+    async def run() -> None:
+        class Pair:
+            symbol = "BTCUSDT"
+            data_source = market.DATA_SOURCE_BINANCE
+            status = 1
+
+        original_session_local = gateway_module.SessionLocal
+        original_enabled_providers = gateway_module.enabled_spot_market_providers
+        db = _GatewaySelectorDb(Pair())
+        gateway = SpotMarketGateway(ws_manager=FakeWsManager())
+
+        try:
+            gateway_module.SessionLocal = lambda: db
+            gateway_module.enabled_spot_market_providers = lambda db_arg: (
+                _spot_provider(market.PROVIDER_BITGET_SPOT, priority=1),
+            )
+            assert gateway._select_provider_ws_code("BTCUSDT") == market.PROVIDER_BITGET_SPOT
+
+            gateway_module.enabled_spot_market_providers = lambda db_arg: (
+                _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
+                _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
+            )
+            assert gateway._select_provider_ws_code("BTCUSDT") is None
+
+            gateway_module.enabled_spot_market_providers = lambda db_arg: (
+                _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
+            )
+            assert gateway._select_provider_ws_code("BTCUSDT") is None
+        finally:
+            gateway_module.SessionLocal = original_session_local
+            gateway_module.enabled_spot_market_providers = original_enabled_providers
+
+    asyncio.run(run())
+
+
+def test_gateway_ws_selector_skips_internal_pairs() -> None:
+    async def run() -> None:
+        class Pair:
+            symbol = "MFCUSDT"
+            data_source = market.DATA_SOURCE_INTERNAL
+            status = 1
+
+        original_session_local = gateway_module.SessionLocal
+        original_enabled_providers = gateway_module.enabled_spot_market_providers
+        db = _GatewaySelectorDb(Pair())
+        gateway = SpotMarketGateway(ws_manager=FakeWsManager())
+
+        try:
+            gateway_module.SessionLocal = lambda: db
+            gateway_module.enabled_spot_market_providers = lambda db_arg: (
+                _spot_provider(market.PROVIDER_BITGET_SPOT, priority=1),
+            )
+            assert gateway._select_provider_ws_code("MFCUSDT") is None
+        finally:
+            gateway_module.SessionLocal = original_session_local
+            gateway_module.enabled_spot_market_providers = original_enabled_providers
+
+    asyncio.run(run())
+
+
+def test_gateway_does_not_start_bitget_when_primary_provider_has_no_ws() -> None:
+    async def run() -> None:
+        ensure_calls: list[str] = []
+        ensure_kline_calls: list[tuple[str, str]] = []
+        gateway = SpotMarketGateway(
+            ensure_depth=lambda symbol: ensure_calls.append(symbol),
+            ensure_kline=lambda symbol, interval: ensure_kline_calls.append((symbol, interval)),
+            ws_manager=FakeWsManager(),
+        )
+        gateway._select_provider_ws_code = lambda symbol: None
+
+        await gateway.ensure_symbol("BTCUSDT")
+
+        assert ensure_calls == []
+        assert ensure_kline_calls == []
+        assert gateway._tasks == {}
+
+    asyncio.run(run())
 
 
 def test_gateway_depth_broadcast_state_dedupes_and_isolates_symbols() -> None:
@@ -756,10 +869,14 @@ def test_get_depth_prefers_live_ws_and_falls_back_to_rest() -> None:
     original_get_active_pair = market._get_active_pair
     original_get_ws_depth = market.get_spot_provider_ws_depth
     original_get_external_depth = market._get_external_spot_depth
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
     fallback_called = {"value": False}
 
     try:
         market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
+            _spot_provider(market.PROVIDER_BITGET_SPOT),
+        )
         market.get_spot_provider_ws_depth = lambda symbol, **kwargs: live_depth
         market._get_external_spot_depth = lambda *args, **kwargs: rest_depth
         live_result = market.get_depth(None, "BTCUSDT")
@@ -783,6 +900,7 @@ def test_get_depth_prefers_live_ws_and_falls_back_to_rest() -> None:
         market._get_active_pair = original_get_active_pair
         market.get_spot_provider_ws_depth = original_get_ws_depth
         market._get_external_spot_depth = original_get_external_depth
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
 
 
 def test_external_spot_ticker_prefers_live_ws() -> None:
@@ -794,6 +912,7 @@ def test_external_spot_ticker_prefers_live_ws() -> None:
 
     original_get_ws_ticker = market.get_spot_provider_ws_ticker
     original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_request_json = market.request_contract_market_provider_json
     try:
         market.get_spot_provider_ws_ticker = lambda symbol, **kwargs: {
             "symbol": "BTCUSDT",
@@ -809,8 +928,11 @@ def test_external_spot_ticker_prefers_live_ws() -> None:
             "quote_volume_24h": "21.5",
             "updated_at": "2026-07-04T00:00:00",
         }
-        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("REST provider should not be called")
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
+            _spot_provider(market.PROVIDER_BITGET_SPOT),
+        )
+        market.request_contract_market_provider_json = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("REST request should not be called")
         )
         ticker = market._get_external_spot_ticker(None, Pair())
         assert ticker is not None
@@ -820,6 +942,105 @@ def test_external_spot_ticker_prefers_live_ws() -> None:
         assert ticker.base_volume_24h == "10.123"
     finally:
         market.get_spot_provider_ws_ticker = original_get_ws_ticker
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.request_contract_market_provider_json = original_request_json
+
+
+def test_primary_okx_spot_skips_bitget_live_ws_and_uses_rest_provider() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    okx = _spot_provider(market.PROVIDER_OKX_SPOT, priority=1)
+    bitget = _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2)
+
+    original_get_ws_ticker = market.get_spot_provider_ws_ticker
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_spot_provider_symbol = market._spot_provider_symbol
+    original_request_json = market.request_contract_market_provider_json
+    original_mark_success = market.mark_contract_market_provider_success
+
+    try:
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (okx, bitget)
+        market.get_spot_provider_ws_ticker = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Bitget LIVE_WS must not be read when OKX_SPOT is primary")
+        )
+        market._spot_provider_symbol = lambda db, pair, provider: "BTC-USDT"
+
+        def request_json(provider, endpoint_type, provider_symbol, **kwargs):
+            assert provider.provider_code == market.PROVIDER_OKX_SPOT
+            assert endpoint_type == "ticker"
+            assert provider_symbol == "BTC-USDT"
+            return {
+                "data": [
+                    {
+                        "last": "10",
+                        "open24h": "8",
+                        "high24h": "11",
+                        "low24h": "7",
+                        "vol24h": "2",
+                        "volCcy24h": "20",
+                        "ts": "1000",
+                    }
+                ]
+            }
+
+        market.request_contract_market_provider_json = request_json
+        market.mark_contract_market_provider_success = lambda *args, **kwargs: None
+
+        ticker = market._get_external_spot_ticker(None, Pair())
+        assert ticker is not None
+        assert ticker.provider == market.PROVIDER_OKX_SPOT
+        assert ticker.source == "external"
+        assert ticker.last_price == "10.00"
+    finally:
+        market.get_spot_provider_ws_ticker = original_get_ws_ticker
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market._spot_provider_symbol = original_spot_provider_symbol
+        market.request_contract_market_provider_json = original_request_json
+        market.mark_contract_market_provider_success = original_mark_success
+
+
+def test_depth_skips_live_ws_when_bitget_is_not_primary() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    rest_depth = DepthResponse(
+        symbol="BTCUSDT",
+        bids=[DepthItem(price="9", amount="1")],
+        asks=[DepthItem(price="10", amount="1")],
+        ts=2000,
+        provider="OKX_SPOT",
+        source="external",
+    )
+
+    original_get_active_pair = market._get_active_pair
+    original_get_ws_depth = market.get_spot_provider_ws_depth
+    original_get_external_depth = market._get_external_spot_depth
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
+            _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
+            _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
+        )
+        market.get_spot_provider_ws_depth = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Bitget LIVE_WS depth must not be read when OKX_SPOT is primary")
+        )
+        market._get_external_spot_depth = lambda *args, **kwargs: rest_depth
+
+        result = market.get_depth(None, "BTCUSDT")
+        assert result.provider == "OKX_SPOT"
+        assert result.source == "external"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market.get_spot_provider_ws_depth = original_get_ws_depth
+        market._get_external_spot_depth = original_get_external_depth
         market._enabled_spot_market_providers_for_pair = original_enabled_providers
 
 
@@ -1056,6 +1277,48 @@ def test_get_klines_prefers_live_ws_and_falls_back_to_rest() -> None:
         market.get_spot_provider_ws_klines = original_get_ws_klines
         market.get_klines_cache_first = original_get_klines_cache_first
         market._fetch_external_spot_klines = original_fetch_external
+
+
+def test_kline_history_pagination_does_not_read_live_ws() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    provider = _spot_provider(market.PROVIDER_BITGET_SPOT)
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("historical pagination must not read LIVE_WS kline")
+        )
+        market.get_klines_cache_first = lambda *args, **kwargs: [
+            {
+                "open_time": 60000,
+                "close_time": 120000,
+                "open": "1",
+                "high": "2",
+                "low": "1",
+                "close": "1.5",
+                "volume": "5",
+                "quote_volume": "7.5",
+            }
+        ]
+
+        result = market.get_klines(None, "BTCUSDT", "1m", limit=30, end_time_ms=180000)
+        assert result.get("source") is None
+        assert result["items"][-1]["close"] == "1.5"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
 
 
 def test_internal_pair_does_not_use_live_ws_klines() -> None:
