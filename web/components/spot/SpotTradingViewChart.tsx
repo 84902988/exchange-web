@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import Script from 'next/script';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import type { SpotChartProps } from './chart/chart.types';
@@ -8,13 +8,19 @@ import { formatSpotDisplaySymbol } from './spotFormat';
 import {
   createSpotTradingViewDatafeed,
   spotIntervalToTradingViewResolution,
+  type SpotTradingViewKlineGapEvent,
 } from './tradingview/spotTradingViewDatafeed';
+
+type TradingViewActiveChartInstance = {
+  resetData?: () => void;
+};
 
 type TradingViewWidgetInstance = {
   remove: () => void;
+  activeChart?: () => TradingViewActiveChartInstance;
 };
 
-type TradingViewGlobal = {
+type SpotTradingViewGlobal = {
   widget: new (options: Record<string, unknown>) => TradingViewWidgetInstance;
 };
 
@@ -27,11 +33,9 @@ type SpotTradingViewChartProps = SpotChartProps & {
   chartMode?: 'time' | 'candle';
 };
 
-declare global {
-  interface Window {
-    TradingView?: TradingViewGlobal;
-  }
-}
+type SpotTradingViewWindow = Window & {
+  TradingView?: SpotTradingViewGlobal;
+};
 
 const TRADINGVIEW_LIBRARY_PATH = '/tradingview/charting_library/';
 const TRADINGVIEW_SCRIPT_SRC = `${TRADINGVIEW_LIBRARY_PATH}charting_library.js`;
@@ -75,6 +79,34 @@ export default function SpotTradingViewChart({
   const widgetKey = `${normalizedSymbol}:${chartMode}:${widgetInterval}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}`;
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
+  const handleKlineGap = useCallback((event: SpotTradingViewKlineGapEvent) => {
+    const activeChart = widgetRef.current?.activeChart?.();
+    if (activeChart && typeof activeChart.resetData === 'function') {
+      activeChart.resetData();
+      if (process.env.NODE_ENV !== 'production') {
+        console.debug('[SpotTradingViewChart] kline gap resetData', {
+          symbol: event.symbol,
+          interval: event.interval,
+          barTime: event.barTime,
+          latestBarTime: event.latestBarTime,
+          gapIntervals: event.gapIntervals,
+          action: 'resetData',
+        });
+      }
+      return;
+    }
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('[SpotTradingViewChart] resetData unavailable for kline gap', {
+        symbol: event.symbol,
+        interval: event.interval,
+        barTime: event.barTime,
+        latestBarTime: event.latestBarTime,
+        gapIntervals: event.gapIntervals,
+        action: 'onResetCacheNeeded',
+      });
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -92,7 +124,8 @@ export default function SpotTradingViewChart({
       return cleanupWidget;
     }
 
-    if (!window.TradingView?.widget) {
+    const tradingView = (window as SpotTradingViewWindow).TradingView;
+    if (!tradingView?.widget) {
       window.setTimeout(() => {
         if (cancelled) return;
         setLoadError({
@@ -108,10 +141,11 @@ export default function SpotTradingViewChart({
       displaySymbol: displayName,
       pricePrecision,
       amountPrecision,
+      onKlineGap: handleKlineGap,
     });
     datafeedRef.current = datafeed;
 
-    widgetRef.current = new window.TradingView.widget({
+    widgetRef.current = new tradingView.widget({
       autosize: true,
       symbol: normalizedSymbol,
       interval: widgetInterval,
@@ -161,7 +195,7 @@ export default function SpotTradingViewChart({
       cancelled = true;
       cleanupWidget();
     };
-  }, [amountPrecision, containerId, displayName, locale, normalizedSymbol, pricePrecision, scriptReady, widgetInterval, widgetKey, widgetStyle]);
+  }, [amountPrecision, containerId, displayName, handleKlineGap, locale, normalizedSymbol, pricePrecision, scriptReady, widgetInterval, widgetKey, widgetStyle]);
 
   return (
     <div className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]" style={{ minHeight: height }}>

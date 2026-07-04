@@ -24,6 +24,14 @@ type TradingViewBar = {
   volume?: number;
 };
 
+export type SpotTradingViewKlineGapEvent = {
+  symbol: string;
+  interval: string;
+  barTime: number;
+  latestBarTime: number;
+  gapIntervals: number;
+};
+
 type TradingViewLibrarySymbolInfo = {
   name: string;
   ticker: string;
@@ -117,7 +125,15 @@ type SpotTradingViewDatafeed = {
 type SpotTradingViewDatafeedOptions = Pick<
   SpotChartProps,
   'symbol' | 'displaySymbol' | 'pricePrecision' | 'amountPrecision'
->;
+> & {
+  onKlineGap?: (event: SpotTradingViewKlineGapEvent) => void;
+};
+
+type KlineGapState = {
+  barTime: number;
+  latestBarTime: number;
+  lastResetAt: number;
+};
 
 const SPOT_EXCHANGE_NAME = 'EXCHANGE';
 const SUPPORTED_RESOLUTIONS: TradingViewResolution[] = ['1', '5', '15', '60', '240', '1D'];
@@ -147,6 +163,7 @@ const SPOT_INTERVAL_MS: Record<string, number> = {
   '4h': 4 * 60 * 60_000,
   '1d': 24 * 60 * 60_000,
 };
+const KLINE_GAP_RESET_THROTTLE_MS = 3_000;
 
 const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
   supports_search: true,
@@ -277,7 +294,7 @@ export function createSpotTradingViewDatafeed(
   const apiSymbol = normalizeSpotSymbol(symbolInfo.ticker || symbolInfo.name);
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
-  const resetGapTimeByLatestBarKey = new Map<string, number>();
+  const gapStateByLatestBarKey = new Map<string, KlineGapState>();
   const unsubscribeByUid = new Map<string, () => void>();
 
   const getLatestBarKey = (resolution: TradingViewResolution | string) =>
@@ -334,7 +351,7 @@ export function createSpotTradingViewDatafeed(
           if (latestBar) {
             const latestBarKey = getLatestBarKey(requestResolution);
             latestBars.set(latestBarKey, latestBar);
-            resetGapTimeByLatestBarKey.delete(latestBarKey);
+            gapStateByLatestBarKey.delete(latestBarKey);
           }
 
           onHistory(bars, { noData: bars.length === 0 });
@@ -369,15 +386,44 @@ export function createSpotTradingViewDatafeed(
         const latestBar = latestBars.get(latestBarKey);
         if (latestBar && bar.time < latestBar.time) return;
         if (latestBar && bar.time > latestBar.time + intervalMs) {
-          if (resetGapTimeByLatestBarKey.get(latestBarKey) !== bar.time) {
-            resetGapTimeByLatestBarKey.set(latestBarKey, bar.time);
+          const now = Date.now();
+          const previousGap = gapStateByLatestBarKey.get(latestBarKey);
+          const shouldReset =
+            !previousGap ||
+            previousGap.barTime !== bar.time ||
+            previousGap.latestBarTime !== latestBar.time ||
+            now - previousGap.lastResetAt >= KLINE_GAP_RESET_THROTTLE_MS;
+          if (shouldReset) {
+            gapStateByLatestBarKey.set(latestBarKey, {
+              barTime: bar.time,
+              latestBarTime: latestBar.time,
+              lastResetAt: now,
+            });
+            const gapIntervals = Math.max(2, Math.round((bar.time - latestBar.time) / intervalMs));
             onResetCacheNeeded?.();
+            options.onKlineGap?.({
+              symbol: apiSymbol,
+              interval,
+              barTime: bar.time,
+              latestBarTime: latestBar.time,
+              gapIntervals,
+            });
+            if (process.env.NODE_ENV !== 'production') {
+              console.debug('[SpotTradingViewDatafeed] kline gap reset', {
+                symbol: apiSymbol,
+                interval,
+                barTime: bar.time,
+                latestBarTime: latestBar.time,
+                gapIntervals,
+                action: 'reset',
+              });
+            }
           }
           return;
         }
 
         latestBars.set(latestBarKey, bar);
-        resetGapTimeByLatestBarKey.delete(latestBarKey);
+        gapStateByLatestBarKey.delete(latestBarKey);
         onRealtime(bar);
       };
 
@@ -403,7 +449,7 @@ export function createSpotTradingViewDatafeed(
       const latestBarKey = latestBarKeyByUid.get(subscriberUid);
       if (latestBarKey) {
         latestBars.delete(latestBarKey);
-        resetGapTimeByLatestBarKey.delete(latestBarKey);
+        gapStateByLatestBarKey.delete(latestBarKey);
       }
       latestBarKeyByUid.delete(subscriberUid);
     },
@@ -415,7 +461,7 @@ export function createSpotTradingViewDatafeed(
       unsubscribeByUid.clear();
       latestBarKeyByUid.clear();
       latestBars.clear();
-      resetGapTimeByLatestBarKey.clear();
+      gapStateByLatestBarKey.clear();
     },
   };
 }
