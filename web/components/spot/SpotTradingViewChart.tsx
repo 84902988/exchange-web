@@ -51,13 +51,39 @@ function resolveTradingViewLocale(locale: string) {
   return 'en';
 }
 
+function parseDisplayPrice(value?: string | number | null): number | null {
+  const num = Number(String(value ?? '').replace(/,/g, '').trim());
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+function formatDisplayPriceFallback(value: number, precision?: number | null): string {
+  const precisionNumber = Number(precision);
+  const digits = Number.isInteger(precisionNumber) ? Math.min(Math.max(precisionNumber, 0), 12) : 2;
+  return value.toLocaleString('en-US', {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
+
+function getDisplayPriceOverlayColor(direction?: string | null): string {
+  if (direction === 'up') return '#00c087';
+  if (direction === 'down') return '#f6465d';
+  return '#f0b90b';
+}
+
 export default function SpotTradingViewChart({
   symbol,
   displaySymbol,
   interval,
   height = 520,
+  latestPrice,
+  displayPriceRaw,
+  displayPriceFormatted,
+  priceDirection = 'flat',
   pricePrecision,
   amountPrecision,
+  tickerFreshness,
+  klineFreshness,
   chartMode = 'candle',
 }: SpotTradingViewChartProps) {
   const { locale, t } = useLocaleContext();
@@ -79,6 +105,27 @@ export default function SpotTradingViewChart({
   const widgetKey = `${normalizedSymbol}:${chartMode}:${widgetInterval}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}`;
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
+  const displayPriceNumber = useMemo(
+    () => parseDisplayPrice(displayPriceRaw ?? displayPriceFormatted ?? latestPrice),
+    [displayPriceFormatted, displayPriceRaw, latestPrice],
+  );
+  const displayPriceLabel = useMemo(() => {
+    const label = String(displayPriceFormatted || '').trim();
+    if (label && label !== '--') return label;
+    return displayPriceNumber !== null
+      ? formatDisplayPriceFallback(displayPriceNumber, pricePrecision)
+      : '';
+  }, [displayPriceFormatted, displayPriceNumber, pricePrecision]);
+  const displayPriceOverlayColor = useMemo(
+    () => getDisplayPriceOverlayColor(priceDirection),
+    [priceDirection],
+  );
+  const displayPriceTooltip = useMemo(() => {
+    const parts = ['MarketView display price'];
+    if (tickerFreshness) parts.push(`ticker=${tickerFreshness}`);
+    if (klineFreshness) parts.push(`kline=${klineFreshness}`);
+    return parts.join(' | ');
+  }, [klineFreshness, tickerFreshness]);
   const handleKlineGap = useCallback((event: SpotTradingViewKlineGapEvent) => {
     const activeChart = widgetRef.current?.activeChart?.();
     if (activeChart && typeof activeChart.resetData === 'function') {
@@ -145,7 +192,7 @@ export default function SpotTradingViewChart({
     });
     datafeedRef.current = datafeed;
 
-    widgetRef.current = new tradingView.widget({
+    const widget = new tradingView.widget({
       autosize: true,
       symbol: normalizedSymbol,
       interval: widgetInterval,
@@ -189,7 +236,8 @@ export default function SpotTradingViewChart({
         backgroundColor: '#12161c',
         foregroundColor: '#f0b90b',
       },
-    });
+    }) as TradingViewWidgetInstance;
+    widgetRef.current = widget;
 
     return () => {
       cancelled = true;
@@ -216,6 +264,20 @@ export default function SpotTradingViewChart({
         className="min-h-0 flex-1"
         aria-label={`${displayName || normalizedSymbol} ${chartMode === 'time' ? 'time' : activeInterval}`}
       />
+      {displayPriceNumber !== null && displayPriceLabel ? (
+        <div
+          aria-hidden="true"
+          title={displayPriceTooltip}
+          className="pointer-events-none absolute right-3 top-14 z-10 rounded-l-md border px-2 py-1 text-[12px] font-semibold leading-none shadow-lg"
+          style={{
+            borderColor: displayPriceOverlayColor,
+            backgroundColor: `${displayPriceOverlayColor}22`,
+            color: displayPriceOverlayColor,
+          }}
+        >
+          {displayPriceLabel}
+        </div>
+      ) : null}
       {activeLoadError ? (
         <div className="absolute inset-0 flex items-center justify-center bg-[#12161c] px-4 text-center text-sm text-[#f6465d]">
           {t('spotChartLoadFailed', 'asset')}: {activeLoadError}
