@@ -29,6 +29,7 @@ class DepthResponse(BaseModel):
 
 
 class TradeItem(BaseModel):
+    id: Optional[str] = None
     price: str
     amount: str
     side: str

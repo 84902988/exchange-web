@@ -9,15 +9,17 @@ from typing import Any, Callable, Optional
 from app.core.config import settings
 from app.db.models.trading_pair import TradingPair
 from app.db.session import SessionLocal
-from app.schemas.market import DepthItem, DepthResponse
+from app.schemas.market import DepthItem, DepthResponse, TradesResponse
 from app.services.spot_market_provider_ws import (
     ensure_spot_provider_ws_depth,
     get_spot_provider_ws_depth,
     get_spot_provider_ws_ticker,
+    get_spot_provider_ws_trades,
     normalize_spot_ws_symbol,
     release_spot_provider_ws_depth,
     spot_provider_ws_depth_enabled,
     spot_provider_ws_ticker_enabled,
+    spot_provider_ws_trades_enabled,
 )
 
 
@@ -30,19 +32,23 @@ class SpotMarketGateway:
         *,
         provider_depth_enabled: Optional[Callable[[], bool]] = None,
         provider_ticker_enabled: Optional[Callable[[], bool]] = None,
+        provider_trades_enabled: Optional[Callable[[], bool]] = None,
         ensure_depth: Optional[Callable[[str], None]] = None,
         release_depth: Optional[Callable[[str], None]] = None,
         get_depth: Optional[Callable[..., Optional[DepthResponse]]] = None,
         get_ticker: Optional[Callable[..., Optional[dict[str, Any]]]] = None,
+        get_trades: Optional[Callable[..., Optional[TradesResponse]]] = None,
         precision_resolver: Optional[Callable[[str], tuple[int, int]]] = None,
         ws_manager: Any = None,
     ) -> None:
         self._provider_depth_enabled = provider_depth_enabled or spot_provider_ws_depth_enabled
         self._provider_ticker_enabled = provider_ticker_enabled or spot_provider_ws_ticker_enabled
+        self._provider_trades_enabled = provider_trades_enabled or spot_provider_ws_trades_enabled
         self._ensure_depth = ensure_depth or ensure_spot_provider_ws_depth
         self._release_depth = release_depth or release_spot_provider_ws_depth
         self._get_depth = get_depth or get_spot_provider_ws_depth
         self._get_ticker = get_ticker or get_spot_provider_ws_ticker
+        self._get_trades = get_trades or get_spot_provider_ws_trades
         self._precision_resolver = precision_resolver or self._default_precision_resolver
         self._ws_manager = ws_manager
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -52,6 +58,8 @@ class SpotMarketGateway:
         self._last_depth_signature: dict[str, str] = {}
         self._last_ticker_broadcast_at: dict[str, float] = {}
         self._last_ticker_signature: dict[str, str] = {}
+        self._last_trade_broadcast_at: dict[str, float] = {}
+        self._seen_trade_signatures: dict[str, list[str]] = {}
         self._precision_cache: dict[str, tuple[int, int]] = {}
 
     async def ensure_symbol(self, symbol: str) -> None:
@@ -116,6 +124,8 @@ class SpotMarketGateway:
             self._last_depth_signature.pop(symbol, None)
             self._last_ticker_broadcast_at.pop(symbol, None)
             self._last_ticker_signature.pop(symbol, None)
+            self._last_trade_broadcast_at.pop(symbol, None)
+            self._seen_trade_signatures.pop(symbol, None)
             self._precision_cache.pop(symbol, None)
             logger.info("spot_market_gateway_release_provider_ws symbol=%s", symbol)
         except asyncio.CancelledError:
@@ -166,6 +176,28 @@ class SpotMarketGateway:
                             await self._market_ws_manager().broadcast_ticker_update(symbol, ticker)
                         except Exception:
                             logger.warning("spot_market_gateway_ticker_broadcast_failed symbol=%s", symbol, exc_info=True)
+
+                if self._provider_trades_enabled():
+                    try:
+                        trades = self._get_trades(
+                            symbol,
+                            limit=int(getattr(settings, "SPOT_PROVIDER_WS_TRADES_LIMIT", 30) or 30),
+                        )
+                    except Exception:
+                        logger.warning("spot_market_gateway_get_trades_failed symbol=%s", symbol, exc_info=True)
+                        trades = None
+                    for trade in self._new_trades_for_broadcast(symbol, trades):
+                        try:
+                            await self._market_ws_manager().send_trade(
+                                symbol=symbol,
+                                price=getattr(trade, "price", None),
+                                amount=getattr(trade, "amount", None),
+                                side=getattr(trade, "side", ""),
+                                ts=int(getattr(trade, "ts", 0) or 0),
+                                trade_id=getattr(trade, "id", None),
+                            )
+                        except Exception:
+                            logger.warning("spot_market_gateway_trade_broadcast_failed symbol=%s", symbol, exc_info=True)
 
                 await asyncio.sleep(self._loop_interval_seconds())
         except asyncio.CancelledError:
@@ -220,6 +252,43 @@ class SpotMarketGateway:
         )
         return repr(tuple(ticker.get(key) for key in keys))
 
+    def _new_trades_for_broadcast(self, symbol: str, trades: Optional[TradesResponse]) -> list[Any]:
+        if trades is None or not getattr(trades, "trades", None):
+            return []
+        now = time.monotonic()
+        min_interval_seconds = self._trades_broadcast_interval_seconds()
+        last_at = self._last_trade_broadcast_at.get(symbol, 0.0)
+        if now - last_at < min_interval_seconds:
+            return []
+        seen = set(self._seen_trade_signatures.get(symbol, []))
+        new_items: list[Any] = []
+        new_signatures: list[str] = []
+        for trade in reversed(list(trades.trades or [])):
+            signature = self._trade_signature(trade)
+            if not signature or signature in seen:
+                continue
+            seen.add(signature)
+            new_signatures.append(signature)
+            new_items.append(trade)
+        if new_signatures:
+            retained = (self._seen_trade_signatures.get(symbol, []) + new_signatures)[-200:]
+            self._seen_trade_signatures[symbol] = retained
+            self._last_trade_broadcast_at[symbol] = now
+        return new_items
+
+    def _trade_signature(self, trade: Any) -> str:
+        trade_id = str(getattr(trade, "id", "") or "").strip()
+        if trade_id:
+            return f"id:{trade_id}"
+        return repr(
+            (
+                getattr(trade, "price", None),
+                getattr(trade, "amount", None),
+                str(getattr(trade, "side", "") or "").upper(),
+                int(getattr(trade, "ts", 0) or 0),
+            )
+        )
+
     def _broadcast_interval_seconds(self) -> float:
         interval_ms = int(getattr(settings, "SPOT_PROVIDER_WS_DEPTH_BROADCAST_INTERVAL_MS", 200) or 200)
         return max(0.05, interval_ms / 1000)
@@ -228,16 +297,26 @@ class SpotMarketGateway:
         interval_ms = int(getattr(settings, "SPOT_PROVIDER_WS_TICKER_BROADCAST_INTERVAL_MS", 500) or 500)
         return max(0.1, interval_ms / 1000)
 
+    def _trades_broadcast_interval_seconds(self) -> float:
+        interval_ms = int(getattr(settings, "SPOT_PROVIDER_WS_TRADES_BROADCAST_INTERVAL_MS", 200) or 200)
+        return max(0.05, interval_ms / 1000)
+
     def _loop_interval_seconds(self) -> float:
         intervals: list[float] = []
         if self._provider_depth_enabled():
             intervals.append(self._broadcast_interval_seconds())
         if self._provider_ticker_enabled():
             intervals.append(self._ticker_broadcast_interval_seconds())
+        if self._provider_trades_enabled():
+            intervals.append(self._trades_broadcast_interval_seconds())
         return min(intervals) if intervals else 1.0
 
     def _provider_enabled(self) -> bool:
-        return bool(self._provider_depth_enabled() or self._provider_ticker_enabled())
+        return bool(
+            self._provider_depth_enabled()
+            or self._provider_ticker_enabled()
+            or self._provider_trades_enabled()
+        )
 
     async def _subscriber_count(self, symbol: str) -> int:
         return await self._market_ws_manager().subscriber_count(symbol)

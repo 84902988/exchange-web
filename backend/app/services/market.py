@@ -50,7 +50,11 @@ from app.services.stock_dealer_depth_service import (
     is_stock_dealer_pair,
 )
 from app.services.spot_kline_realtime import SPOT_KLINE_SOURCE_INTERNAL_TRADE
-from app.services.spot_market_provider_ws import get_spot_provider_ws_depth, get_spot_provider_ws_ticker
+from app.services.spot_market_provider_ws import (
+    get_spot_provider_ws_depth,
+    get_spot_provider_ws_ticker,
+    get_spot_provider_ws_trades,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +232,28 @@ def _format_depth_for_pair(pair: TradingPair, depth: DepthResponse, limit: Optio
     if getattr(depth, "mid_price", None) is not None:
         data["mid_price"] = _format_price_for_pair(pair, getattr(depth, "mid_price"))
     return DepthResponse(**data)
+
+
+def _format_trades_for_pair(pair: TradingPair, trades: TradesResponse, limit: Optional[int] = None) -> TradesResponse:
+    trade_limit = max(1, int(limit or len(trades.trades) or 50))
+    items: list[TradeItem] = []
+    for item in list(getattr(trades, "trades", []) or [])[:trade_limit]:
+        price = _to_decimal(getattr(item, "price", None))
+        amount = _to_decimal(getattr(item, "amount", None))
+        if price <= 0 or amount <= 0:
+            continue
+        items.append(
+            TradeItem(
+                id=getattr(item, "id", None),
+                price=_format_price_for_pair(pair, price),
+                amount=_format_amount_for_pair(pair, amount),
+                side="SELL" if str(getattr(item, "side", "")).upper() == "SELL" else "BUY",
+                ts=int(getattr(item, "ts", 0) or 0),
+            )
+        )
+    data = trades.model_dump() if hasattr(trades, "model_dump") else trades.dict()
+    data.update({"symbol": pair.symbol, "trades": items[:trade_limit]})
+    return TradesResponse(**data)
 
 
 def _default_itick_price(pair: TradingPair) -> Decimal:
@@ -1462,6 +1488,15 @@ def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20, *,
 def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *, fast: bool = False) -> TradesResponse:
     last_error: Optional[Exception] = None
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
+    if any(getattr(provider, "provider_code", None) == PROVIDER_BITGET_SPOT for provider in providers):
+        try:
+            live_trades = get_spot_provider_ws_trades(pair.symbol, limit=limit)
+            if live_trades is not None and live_trades.trades:
+                formatted_live_trades = _format_trades_for_pair(pair, live_trades, limit=limit)
+                _SPOT_LAST_GOOD_TRADES[pair.symbol] = formatted_live_trades
+                return formatted_live_trades
+        except Exception as exc:
+            logger.debug("spot_provider_ws_trades_unavailable symbol=%s reason=%s", pair.symbol, exc)
     timeout_cap_ms = _SPOT_PROVIDER_FAST_TIMEOUT_CAP_MS if fast else _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS
     for provider in providers:
         try:
