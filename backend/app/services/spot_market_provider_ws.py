@@ -42,6 +42,23 @@ SPOT_KLINE_INTERVAL_MS = {
     "1d": 86_400_000,
 }
 _KLINE_TRADE_SIGNATURE_LIMIT = 2000
+_PROVIDER_WS_SHUTDOWN_NOISE_MESSAGES = (
+    "cannot schedule new futures after shutdown",
+    "event loop is closed",
+    "executor shutdown",
+)
+
+
+def _is_provider_ws_shutdown_noise(
+    exc: BaseException,
+    stop_event: Optional[threading.Event] = None,
+) -> bool:
+    if stop_event is not None and stop_event.is_set():
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc).strip().lower()
+    return any(fragment in message for fragment in _PROVIDER_WS_SHUTDOWN_NOISE_MESSAGES)
 
 
 @dataclass(frozen=True)
@@ -1217,7 +1234,9 @@ class SpotMarketProviderWsService:
         while not stop_event.is_set():
             try:
                 await self._run_bitget_depth_ws(subscription, stop_event, generation)
-            except Exception:
+            except Exception as exc:
+                if _is_provider_ws_shutdown_noise(exc, stop_event):
+                    return
                 logger.warning(
                     "spot_provider_ws_depth_disconnected provider=%s symbol=%s provider_symbol=%s",
                     subscription.provider,
@@ -1225,6 +1244,8 @@ class SpotMarketProviderWsService:
                     subscription.provider_symbol,
                     exc_info=True,
                 )
+                if stop_event.is_set():
+                    return
                 await asyncio.sleep(1.0)
 
     async def _ticker_loop(
@@ -1236,7 +1257,9 @@ class SpotMarketProviderWsService:
         while not stop_event.is_set():
             try:
                 await self._run_bitget_ticker_ws(subscription, stop_event, generation)
-            except Exception:
+            except Exception as exc:
+                if _is_provider_ws_shutdown_noise(exc, stop_event):
+                    return
                 logger.warning(
                     "spot_provider_ws_ticker_disconnected provider=%s symbol=%s provider_symbol=%s",
                     subscription.provider,
@@ -1244,6 +1267,8 @@ class SpotMarketProviderWsService:
                     subscription.provider_symbol,
                     exc_info=True,
                 )
+                if stop_event.is_set():
+                    return
                 await asyncio.sleep(1.0)
 
     async def _trades_loop(
@@ -1255,7 +1280,9 @@ class SpotMarketProviderWsService:
         while not stop_event.is_set():
             try:
                 await self._run_bitget_trades_ws(subscription, stop_event, generation)
-            except Exception:
+            except Exception as exc:
+                if _is_provider_ws_shutdown_noise(exc, stop_event):
+                    return
                 logger.warning(
                     "spot_provider_ws_trades_disconnected provider=%s symbol=%s provider_symbol=%s",
                     subscription.provider,
@@ -1263,6 +1290,8 @@ class SpotMarketProviderWsService:
                     subscription.provider_symbol,
                     exc_info=True,
                 )
+                if stop_event.is_set():
+                    return
                 await asyncio.sleep(1.0)
 
     async def _kline_loop(
@@ -1274,7 +1303,9 @@ class SpotMarketProviderWsService:
         while not stop_event.is_set():
             try:
                 await self._run_bitget_kline_ws(subscription, stop_event, generation)
-            except Exception:
+            except Exception as exc:
+                if _is_provider_ws_shutdown_noise(exc, stop_event):
+                    return
                 logger.warning(
                     "spot_provider_ws_kline_disconnected provider=%s symbol=%s provider_symbol=%s interval=%s",
                     subscription.provider,
@@ -1283,6 +1314,8 @@ class SpotMarketProviderWsService:
                     subscription.interval,
                     exc_info=True,
                 )
+                if stop_event.is_set():
+                    return
                 await asyncio.sleep(1.0)
 
     async def _run_bitget_depth_ws(
