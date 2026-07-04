@@ -41,6 +41,7 @@ SPOT_KLINE_INTERVAL_MS = {
     "4h": 14_400_000,
     "1d": 86_400_000,
 }
+_KLINE_TRADE_SIGNATURE_LIMIT = 2000
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,10 @@ def _trade_signature(trade: dict[str, Any]) -> str:
     )
 
 
+def _public_kline_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: deepcopy(value) for key, value in item.items() if not str(key).startswith("_")}
+
+
 def _depth_response_from_record(record: dict[str, Any], *, limit: Optional[int] = None) -> DepthResponse:
     depth_limit = _depth_limit(limit)
     return DepthResponse(
@@ -273,7 +278,7 @@ def _klines_response_from_record(record: dict[str, Any], *, limit: Optional[int]
     return {
         "symbol": normalize_spot_ws_symbol(record.get("symbol")),
         "interval": normalize_spot_ws_kline_interval(record.get("interval")),
-        "items": deepcopy(list(record.get("items") or [])[-kline_limit:]),
+        "items": [_public_kline_item(item) for item in list(record.get("items") or [])[-kline_limit:]],
         "provider": str(record.get("provider") or PROVIDER_BITGET_SPOT),
         "source": str(record.get("source") or SPOT_PROVIDER_WS_SOURCE),
         "freshness": str(record.get("freshness") or "LIVE"),
@@ -517,6 +522,7 @@ class SpotMarketProviderWsService:
         self._ticker_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._trades_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._kline_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._kline_trade_signatures: dict[tuple[str, str, str], list[str]] = {}
         self._depth_tasks: dict[tuple[str, str], threading.Thread] = {}
         self._ticker_tasks: dict[tuple[str, str], threading.Thread] = {}
         self._trades_tasks: dict[tuple[str, str], threading.Thread] = {}
@@ -697,6 +703,7 @@ class SpotMarketProviderWsService:
             self._ticker_cache.clear()
             self._trades_cache.clear()
             self._kline_cache.clear()
+            self._kline_trade_signatures.clear()
             self._depth_tasks.clear()
             self._ticker_tasks.clear()
             self._trades_tasks.clear()
@@ -928,6 +935,7 @@ class SpotMarketProviderWsService:
             stop_event = self._kline_stops.pop(key, None)
             task = self._kline_tasks.pop(key, None)
             connection = self._kline_connections.pop(key, None)
+            self._kline_trade_signatures.pop(key, None)
             self._kline_generations[key] = self._kline_generations.get(key, 0) + 1
         if stop_event is not None:
             stop_event.set()
@@ -945,6 +953,195 @@ class SpotMarketProviderWsService:
                     )
         if task is not None and task.is_alive() and task is not threading.current_thread():
             task.join(timeout=2.0)
+
+    def _active_kline_intervals_for_trades_locked(self, provider: str, local_symbol: str) -> list[str]:
+        intervals = {
+            interval
+            for (item_provider, item_symbol, interval), stop_event in self._kline_stops.items()
+            if item_provider == provider and item_symbol == local_symbol and not stop_event.is_set()
+        }
+        return sorted(intervals, key=lambda item: SPOT_KLINE_INTERVAL_MS.get(item, 0))
+
+    def _remember_kline_trade_signature_locked(self, key: tuple[str, str, str], signature: str) -> bool:
+        signatures = self._kline_trade_signatures.setdefault(key, [])
+        if signature in signatures:
+            return False
+        signatures.append(signature)
+        if len(signatures) > _KLINE_TRADE_SIGNATURE_LIMIT:
+            del signatures[: len(signatures) - _KLINE_TRADE_SIGNATURE_LIMIT]
+        return True
+
+    def _apply_provider_trades_to_active_klines_locked(
+        self,
+        subscription: SpotTradesSubscription,
+        trades: list[dict[str, Any]],
+    ) -> None:
+        active_intervals = self._active_kline_intervals_for_trades_locked(
+            subscription.provider,
+            subscription.local_symbol,
+        )
+        if not active_intervals:
+            return
+        ordered_trades = sorted(trades, key=lambda item: int(item.get("ts") or 0))
+        for interval in active_intervals:
+            key = (subscription.provider, subscription.local_symbol, interval)
+            for trade in ordered_trades:
+                signature = _trade_signature(trade)
+                if not signature or not self._remember_kline_trade_signature_locked(key, signature):
+                    continue
+                self._apply_provider_trade_to_kline_cache_locked(key, trade, interval)
+
+    def _apply_provider_trade_to_kline_cache_locked(
+        self,
+        key: tuple[str, str, str],
+        trade: dict[str, Any],
+        interval: str,
+    ) -> None:
+        price = _to_decimal(trade.get("price"))
+        amount = _to_decimal(trade.get("amount") or trade.get("size"))
+        trade_ts_ms = int(trade.get("ts") or 0)
+        if price is None or amount is None or price <= 0 or amount <= 0 or trade_ts_ms <= 0:
+            return
+        provider, local_symbol, normalized_interval = key
+        interval_ms = SPOT_KLINE_INTERVAL_MS[normalize_spot_ws_kline_interval(interval)]
+        open_time = trade_ts_ms - (trade_ts_ms % interval_ms)
+        close_time = open_time + interval_ms
+        quote_amount = price * amount
+        now_ms = _now_ms()
+        existing_record = deepcopy(self._kline_cache.get(key) or {})
+        by_open_time: dict[int, dict[str, Any]] = {}
+        for item in list(existing_record.get("items") or []):
+            try:
+                item_open_time = int(item.get("open_time") or 0)
+            except Exception:
+                continue
+            if item_open_time > 0:
+                by_open_time[item_open_time] = item
+
+        existing_item = by_open_time.get(open_time)
+        if existing_item:
+            updated_item = deepcopy(existing_item)
+            existing_high = _to_decimal(updated_item.get("high")) or price
+            existing_low = _to_decimal(updated_item.get("low")) or price
+            existing_volume = _to_decimal(updated_item.get("volume")) or Decimal("0")
+            existing_quote_volume = _to_decimal(updated_item.get("quote_volume")) or Decimal("0")
+            first_trade_ts_ms = int(updated_item.get("_first_trade_ts_ms") or updated_item.get("_last_trade_ts_ms") or 0)
+            last_trade_ts_ms = int(updated_item.get("_last_trade_ts_ms") or 0)
+            if first_trade_ts_ms <= 0 or trade_ts_ms <= first_trade_ts_ms:
+                updated_item["open"] = _decimal_to_str(price)
+                updated_item["_first_trade_ts_ms"] = trade_ts_ms
+            else:
+                updated_item["open"] = str(updated_item.get("open") or _decimal_to_str(price))
+            updated_item["high"] = _decimal_to_str(max(existing_high, price))
+            updated_item["low"] = _decimal_to_str(min(existing_low, price))
+            if trade_ts_ms >= last_trade_ts_ms:
+                updated_item["close"] = _decimal_to_str(price)
+                updated_item["_last_trade_ts_ms"] = trade_ts_ms
+            updated_item["volume"] = _decimal_to_str(existing_volume + amount)
+            updated_item["quote_volume"] = _decimal_to_str(existing_quote_volume + quote_amount)
+        else:
+            updated_item = {
+                "open_time": open_time,
+                "close_time": close_time,
+                "open": _decimal_to_str(price),
+                "high": _decimal_to_str(price),
+                "low": _decimal_to_str(price),
+                "close": _decimal_to_str(price),
+                "volume": _decimal_to_str(amount),
+                "quote_volume": _decimal_to_str(quote_amount),
+                "_first_trade_ts_ms": trade_ts_ms,
+                "_last_trade_ts_ms": trade_ts_ms,
+            }
+
+        updated_item["open_time"] = open_time
+        updated_item["close_time"] = close_time
+        updated_item["source"] = SPOT_PROVIDER_WS_SOURCE
+        updated_item["freshness"] = "LIVE"
+        updated_item["provider"] = provider
+        by_open_time[open_time] = updated_item
+
+        existing_record.update(
+            {
+                "symbol": local_symbol,
+                "provider": provider,
+                "provider_symbol": local_symbol,
+                "interval": normalized_interval,
+                "source": SPOT_PROVIDER_WS_SOURCE,
+                "freshness": "LIVE",
+                "ts": trade_ts_ms,
+                "updated_at_ms": now_ms,
+                "updated_at": datetime.utcfromtimestamp(now_ms / 1000).isoformat(),
+                "items": [
+                    by_open_time[item_open_time]
+                    for item_open_time in sorted(by_open_time.keys())[-_kline_limit():]
+                ],
+            }
+        )
+        self._kline_cache[key] = existing_record
+
+    def _merge_provider_kline_item(
+        self,
+        existing_item: Optional[dict[str, Any]],
+        provider_item: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not existing_item:
+            return deepcopy(provider_item)
+        merged = deepcopy(provider_item)
+        existing_high = _to_decimal(existing_item.get("high"))
+        existing_low = _to_decimal(existing_item.get("low"))
+        existing_volume = _to_decimal(existing_item.get("volume"))
+        existing_quote_volume = _to_decimal(existing_item.get("quote_volume"))
+        provider_high = _to_decimal(provider_item.get("high"))
+        provider_low = _to_decimal(provider_item.get("low"))
+        provider_volume = _to_decimal(provider_item.get("volume"))
+        provider_quote_volume = _to_decimal(provider_item.get("quote_volume"))
+
+        if existing_high is not None and provider_high is not None:
+            merged["high"] = _decimal_to_str(max(existing_high, provider_high))
+        if existing_low is not None and provider_low is not None:
+            merged["low"] = _decimal_to_str(min(existing_low, provider_low))
+        if existing_volume is not None and provider_volume is not None:
+            merged["volume"] = _decimal_to_str(max(existing_volume, provider_volume))
+        if existing_quote_volume is not None and provider_quote_volume is not None:
+            merged["quote_volume"] = _decimal_to_str(max(existing_quote_volume, provider_quote_volume))
+
+        last_trade_ts_ms = int(existing_item.get("_last_trade_ts_ms") or 0)
+        if last_trade_ts_ms > 0:
+            merged["close"] = existing_item.get("close")
+            first_trade_ts_ms = int(existing_item.get("_first_trade_ts_ms") or 0)
+            if first_trade_ts_ms > 0:
+                merged["_first_trade_ts_ms"] = first_trade_ts_ms
+            merged["_last_trade_ts_ms"] = last_trade_ts_ms
+        return merged
+
+    def _merge_provider_kline_record_locked(
+        self,
+        key: tuple[str, str, str],
+        record: dict[str, Any],
+        limit: int,
+    ) -> dict[str, Any]:
+        existing = self._kline_cache.get(key) or {}
+        by_open_time: dict[int, dict[str, Any]] = {}
+        for item in list(existing.get("items") or []):
+            try:
+                open_time = int(item.get("open_time") or 0)
+            except Exception:
+                continue
+            if open_time > 0:
+                by_open_time[open_time] = item
+        for item in list(record.get("items") or []):
+            try:
+                open_time = int(item.get("open_time") or 0)
+            except Exception:
+                continue
+            if open_time <= 0:
+                continue
+            by_open_time[open_time] = self._merge_provider_kline_item(by_open_time.get(open_time), item)
+        record["items"] = [
+            by_open_time[open_time]
+            for open_time in sorted(by_open_time.keys())[-limit:]
+        ]
+        return record
 
     def _run_depth_thread(
         self,
@@ -1426,6 +1623,7 @@ class SpotMarketProviderWsService:
         with self._lock:
             if self._trades_generations.get(key) != generation:
                 return
+            incoming_trades = list(record.get("trades") or [])
             existing = self._trades_cache.get(key) or {}
             combined = list(record.get("trades") or []) + list(existing.get("trades") or [])
             deduped: list[dict[str, Any]] = []
@@ -1440,6 +1638,10 @@ class SpotMarketProviderWsService:
                     break
             record["trades"] = deduped
             self._trades_cache[key] = record
+            self._apply_provider_trades_to_active_klines_locked(
+                subscription,
+                incoming_trades,
+            )
 
     def _handle_bitget_kline_message(
         self,
@@ -1469,21 +1671,11 @@ class SpotMarketProviderWsService:
         with self._lock:
             if self._kline_generations.get(key) != generation:
                 return
-            existing = self._kline_cache.get(key) or {}
-            by_open_time: dict[int, dict[str, Any]] = {}
-            for item in list(existing.get("items") or []) + list(record.get("items") or []):
-                try:
-                    open_time = int(item.get("open_time") or 0)
-                except Exception:
-                    continue
-                if open_time <= 0:
-                    continue
-                by_open_time[open_time] = item
-            record["items"] = [
-                by_open_time[open_time]
-                for open_time in sorted(by_open_time.keys())[-subscription.kline_limit:]
-            ]
-            self._kline_cache[key] = record
+            self._kline_cache[key] = self._merge_provider_kline_record_locked(
+                key,
+                record,
+                subscription.kline_limit,
+            )
 
 
 spot_market_provider_ws = SpotMarketProviderWsService()
