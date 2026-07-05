@@ -1652,14 +1652,16 @@ def test_get_klines_uses_rest_history_with_live_ws_overlay() -> None:
         for symbol in ("BTCUSDT", "ETHUSDT"):
             result = market.get_klines(None, symbol, "1m", limit=30)
             assert result["symbol"] == symbol
-            assert result.get("source") is None
+            assert result.get("source") == "LIVE_WS"
+            assert result.get("freshness") == "LIVE"
             assert result["provider"] == "BITGET_SPOT"
             assert result["items"][-1]["open_time"] == 120000
             assert result["items"][-1]["close"] == "2.5"
 
         market.get_spot_provider_ws_klines = lambda symbol, interval, **kwargs: None
         fallback = market.get_klines(None, "BTCUSDT", "1m", limit=30)
-        assert fallback.get("source") is None
+        assert fallback.get("source") == "REST_SNAPSHOT"
+        assert fallback.get("freshness") == "RECENT"
         assert fallback["provider"] == "BITGET_SPOT"
         assert fallback["items"][-1]["close"] == "1.5"
     finally:
@@ -1731,7 +1733,8 @@ def test_get_klines_limit_500_does_not_return_live_ws_cache_only() -> None:
 
         result = market.get_klines(None, "BTCUSDT", "1m", limit=500)
         assert len(result["items"]) == 500
-        assert result.get("source") is None
+        assert result.get("source") == "LIVE_WS"
+        assert result.get("freshness") == "LIVE"
         assert result["provider"] == market.PROVIDER_OKX_SPOT
         assert result["items"][-1]["open_time"] == live_item["open_time"]
         assert result["items"][-1]["close"] == "2.5"
@@ -1775,7 +1778,8 @@ def test_kline_history_pagination_does_not_read_live_ws() -> None:
         ]
 
         result = market.get_klines(None, "BTCUSDT", "1m", limit=30, end_time_ms=180000)
-        assert result.get("source") is None
+        assert result.get("source") == "REST_HISTORY"
+        assert result.get("freshness") == "RECENT"
         assert result["items"][-1]["close"] == "1.5"
     finally:
         market._get_active_pair = original_get_active_pair
@@ -1846,7 +1850,8 @@ def test_okx_primary_klines_use_okx_live_ws_without_bitget_cache() -> None:
         market.get_klines_cache_first = cache_first
 
         result = market.get_klines(None, "BTCUSDT", "1m", limit=30)
-        assert result.get("source") is None
+        assert result.get("source") == "LIVE_WS"
+        assert result.get("freshness") == "LIVE"
         assert result["provider"] == market.PROVIDER_OKX_SPOT
         assert result["items"][-1]["close"] == "2.5"
     finally:
@@ -1902,7 +1907,8 @@ def test_okx_primary_kline_live_ws_miss_falls_back_to_okx_rest() -> None:
         market.request_contract_market_provider_json = request_json
 
         result = market.get_klines(None, "BTCUSDT", "1m", limit=30)
-        assert result.get("source") is None
+        assert result.get("source") == "REST_SNAPSHOT"
+        assert result.get("freshness") == "RECENT"
         assert result["provider"] == market.PROVIDER_OKX_SPOT
         assert result["items"][-1]["close"] == "1.5"
     finally:
@@ -2030,6 +2036,8 @@ def test_internal_pair_does_not_use_live_ws_klines() -> None:
 
         result = market.get_klines(None, "MFCUSDT", "1m", limit=30)
         assert result["symbol"] == "MFCUSDT"
+        assert result["source"] == "INTERNAL"
+        assert result["freshness"] == "RECENT"
         assert result["items"][0]["close"] == "1"
     finally:
         market._get_active_pair = original_get_active_pair
