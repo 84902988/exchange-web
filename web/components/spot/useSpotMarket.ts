@@ -219,6 +219,13 @@ function getViewDisplayPrice(view?: SpotMarketView | null): string | number | nu
   return view?.display_price ?? view?.last_price ?? view?.ticker_last_price ?? view?.ticker?.last_price ?? null;
 }
 
+function toLastGoodPriceSource(source?: string | null): string {
+  const normalized = String(source || '').trim();
+  if (!normalized || normalized === 'missing') return 'last_good_price';
+  if (normalized.startsWith('last_good_')) return normalized;
+  return `last_good_${normalized}`;
+}
+
 function getViewOrderbookMidPrice(
   view?: SpotMarketView | null,
   depth?: SpotDepthResponse | null,
@@ -348,11 +355,14 @@ function mergeViewWithLastGood(
     mergedView = {
       ...mergedView,
       display_price: previousView.display_price ?? previousDisplayPrice,
-      display_price_source: previousView.display_price_source ?? mergedView.display_price_source,
+      display_price_source: toLastGoodPriceSource(previousView.display_price_source ?? mergedView.display_price_source),
       last_price: previousView.last_price ?? previousDisplayPrice,
       last_trade_price: previousView.last_trade_price ?? mergedView.last_trade_price,
       ticker_last_price: previousView.ticker_last_price ?? mergedView.ticker_last_price,
       price_direction: previousView.price_direction ?? mergedView.price_direction,
+      ticker_source: 'LAST_GOOD',
+      ticker_freshness: 'LAST_GOOD',
+      quote_freshness: 'LAST_GOOD',
     };
   }
 
@@ -373,8 +383,8 @@ function mergeViewWithLastGood(
       orderbook_mid_price: previousView.orderbook_mid_price ?? getDepthMidPrice(previousDepth),
       spread: previousView.spread ?? mergedView.spread,
       depth_status: previousView.depth_status ?? mergedView.depth_status,
-      depth_source: previousView.depth_source ?? mergedView.depth_source,
-      depth_freshness: previousView.depth_freshness ?? mergedView.depth_freshness,
+      depth_source: 'LAST_GOOD',
+      depth_freshness: 'LAST_GOOD',
     };
   }
 
@@ -384,8 +394,8 @@ function mergeViewWithLastGood(
       trades: previousView.trades || buildTradesPayload(symbol, previousTrades),
       last_trade_price: previousView.last_trade_price ?? mergedView.last_trade_price,
       trades_status: previousView.trades_status ?? mergedView.trades_status,
-      trades_source: previousView.trades_source ?? mergedView.trades_source,
-      trades_freshness: previousView.trades_freshness ?? mergedView.trades_freshness,
+      trades_source: 'LAST_GOOD',
+      trades_freshness: 'LAST_GOOD',
     };
   }
 
@@ -400,10 +410,16 @@ function mergeViewWithLastGood(
       ticker_24h_low: previousView.ticker_24h_low ?? mergedView.ticker_24h_low,
       ticker_volume: previousView.ticker_volume ?? mergedView.ticker_volume,
       ticker_quote_volume: previousView.ticker_quote_volume ?? mergedView.ticker_quote_volume,
-      ticker_source: previousView.ticker_source ?? mergedView.ticker_source,
-      ticker_freshness: previousView.ticker_freshness ?? mergedView.ticker_freshness,
-      quote_freshness: previousView.quote_freshness ?? mergedView.quote_freshness,
-      raw_source_summary: previousView.raw_source_summary ?? mergedView.raw_source_summary,
+      ticker_source: 'LAST_GOOD',
+      ticker_freshness: 'LAST_GOOD',
+      quote_freshness: 'LAST_GOOD',
+      raw_source_summary: {
+        ...(previousView.raw_source_summary || {}),
+        ...(mergedView.raw_source_summary || {}),
+        ticker_source: 'LAST_GOOD',
+        ticker_stale: true,
+        ticker_freshness: 'LAST_GOOD',
+      },
     };
   }
 
@@ -680,12 +696,6 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
         depth_status: nextDepth?.bids?.length || nextDepth?.asks?.length ? 'ok' : 'missing',
         depth_source: nextDepthSource ?? prev.depth_source,
         depth_freshness: nextDepthFreshness ?? prev.depth_freshness,
-        display_price: !prev.display_price || prev.display_price_source === 'orderbook_mid' || prev.display_price_source === 'missing'
-          ? nextMidPrice ?? prev.display_price
-          : prev.display_price,
-        display_price_source: !prev.display_price || prev.display_price_source === 'orderbook_mid' || prev.display_price_source === 'missing'
-          ? nextMidPrice ? 'orderbook_mid' : prev.display_price_source
-          : prev.display_price_source,
       } : prev);
     };
 

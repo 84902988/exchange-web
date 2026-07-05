@@ -3,19 +3,19 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import Script from 'next/script';
 import { useLocaleContext } from '@/contexts/LocaleContext';
-import type { SpotChartProps, SpotKlineLoadState } from './chart/chart.types';
+import type { SpotChartProps } from './chart/chart.types';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import {
   createSpotTradingViewDatafeed,
   spotIntervalToTradingViewResolution,
 } from './tradingview/spotTradingViewDatafeed';
-import {
-  resolveSpotKlineStatus,
-  spotMarketStatusBadgeClass,
-} from './spotMarketStatus';
-
 type TradingViewWidgetInstance = {
   remove: () => void;
+  headerReady: () => Promise<void>;
+  createButton: (options?: {
+    align?: 'left' | 'right';
+    useTradingViewStyle?: false;
+  }) => HTMLElement;
 };
 
 type SpotTradingViewGlobal = {
@@ -27,18 +27,10 @@ type TradingViewLoadError = {
   message: string;
 };
 
-type KlineLoadStateByKey = {
-  key: string;
-  state: SpotKlineLoadState;
-};
-
-type KlineRealtimeByKey = {
-  key: string;
-  updatedAtMs: number;
-};
-
 type SpotTradingViewChartProps = SpotChartProps & {
   chartMode?: 'time' | 'candle';
+  onIntervalChange?: (value: string) => void;
+  onChartModeChange?: (value: 'time' | 'candle') => void;
 };
 
 type SpotTradingViewWindow = Window & {
@@ -47,7 +39,12 @@ type SpotTradingViewWindow = Window & {
 
 const TRADINGVIEW_LIBRARY_PATH = '/tradingview/charting_library/';
 const TRADINGVIEW_SCRIPT_SRC = `${TRADINGVIEW_LIBRARY_PATH}charting_library.js`;
-const KLINE_REALTIME_STATUS_GRACE_MS = 30_000;
+const TRADINGVIEW_CHART_STYLE = {
+  candle: 1,
+  area: 3,
+} as const;
+const SPOT_INTERVAL_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1d'];
+const TIME_SHARING_LABEL = '\u5206\u65f6';
 
 function normalizeTradingViewSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
@@ -60,18 +57,24 @@ function resolveTradingViewLocale(locale: string) {
   return 'en';
 }
 
+function formatIntervalLabel(value: string) {
+  const normalized = String(value || '').trim();
+  if (normalized === '1h') return '1H';
+  if (normalized === '4h') return '4H';
+  if (normalized === '1d') return '1D';
+  return normalized;
+}
+
 export default function SpotTradingViewChart({
   symbol,
   displaySymbol,
   interval,
   height = 520,
-  dataSource,
-  klineSource,
-  klineFreshness,
-  isLoading = false,
   pricePrecision,
   amountPrecision,
   chartMode = 'candle',
+  onIntervalChange,
+  onChartModeChange,
 }: SpotTradingViewChartProps) {
   const { locale, t } = useLocaleContext();
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -79,9 +82,6 @@ export default function SpotTradingViewChart({
   const datafeedRef = useRef<ReturnType<typeof createSpotTradingViewDatafeed> | null>(null);
   const [loadError, setLoadError] = useState<TradingViewLoadError | null>(null);
   const [scriptReady, setScriptReady] = useState(false);
-  const [klineLoadStateByKey, setKlineLoadStateByKey] = useState<KlineLoadStateByKey | null>(null);
-  const [klineRealtimeByKey, setKlineRealtimeByKey] = useState<KlineRealtimeByKey | null>(null);
-  const [statusClockMs, setStatusClockMs] = useState(() => Date.now());
   const reactId = useId();
   const containerId = useMemo(
     () => `spot-tv-chart-${reactId.replace(/[^a-zA-Z0-9_-]/g, '')}`,
@@ -91,34 +91,10 @@ export default function SpotTradingViewChart({
   const normalizedSymbol = useMemo(() => normalizeTradingViewSymbol(symbol), [symbol]);
   const activeInterval = chartMode === 'time' ? '1m' : interval;
   const widgetInterval = useMemo(() => spotIntervalToTradingViewResolution(activeInterval), [activeInterval]);
-  const widgetStyle = chartMode === 'time' ? '3' : '1';
+  const widgetStyle = chartMode === 'time' ? TRADINGVIEW_CHART_STYLE.area : TRADINGVIEW_CHART_STYLE.candle;
   const widgetKey = `${normalizedSymbol}:${chartMode}:${widgetInterval}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}`;
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
-  const activeKlineLoadState = klineLoadStateByKey?.key === widgetKey
-    ? klineLoadStateByKey.state
-    : 'loading';
-  const activeKlineRealtimeAtMs = klineRealtimeByKey?.key === widgetKey
-    ? klineRealtimeByKey.updatedAtMs
-    : null;
-  const klineStatus = useMemo(
-    () => resolveSpotKlineStatus({
-      source: klineSource,
-      freshness: klineFreshness,
-      dataSource,
-      loadState: activeKlineLoadState,
-      isLoading,
-      realtimeUpdatedAtMs: activeKlineRealtimeAtMs,
-      realtimeGraceMs: KLINE_REALTIME_STATUS_GRACE_MS,
-      nowMs: statusClockMs,
-    }),
-    [activeKlineLoadState, activeKlineRealtimeAtMs, dataSource, isLoading, klineFreshness, klineSource, statusClockMs],
-  );
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setStatusClockMs(Date.now()), 5_000);
-    return () => window.clearInterval(timer);
-  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -153,16 +129,10 @@ export default function SpotTradingViewChart({
       displaySymbol: displayName,
       pricePrecision,
       amountPrecision,
-      onKlineLoadStateChange: (state) => setKlineLoadStateByKey({ key: widgetKey, state }),
-      onKlineRealtime: (event) => {
-        const now = event.updatedAtMs || Date.now();
-        setStatusClockMs(now);
-        setKlineRealtimeByKey({ key: widgetKey, updatedAtMs: now });
-      },
     });
     datafeedRef.current = datafeed;
 
-    widgetRef.current = new tradingView.widget({
+    const widget = new tradingView.widget({
       autosize: true,
       symbol: normalizedSymbol,
       interval: widgetInterval,
@@ -173,6 +143,7 @@ export default function SpotTradingViewChart({
       timezone: 'Etc/UTC',
       theme: 'dark',
       style: widgetStyle,
+      header_widget_buttons_mode: 'compact',
       disabled_features: [
         'use_localstorage_for_settings',
         'header_symbol_search',
@@ -180,6 +151,7 @@ export default function SpotTradingViewChart({
         'header_resolutions',
         'symbol_search_hot_key',
         'display_market_status',
+        'volume_force_overlay',
       ],
       enabled_features: ['iframe_loading_same_origin'],
       overrides: {
@@ -190,6 +162,12 @@ export default function SpotTradingViewChart({
         'scalesProperties.textColor': 'rgba(255,255,255,0.65)',
         'scalesProperties.showStudyLastValue': false,
         'scalesProperties.showStudyPlotLabels': false,
+        volumePaneSize: 'small',
+        'mainSeriesProperties.style': widgetStyle,
+        'mainSeriesProperties.areaStyle.color1': 'rgba(240,185,11,0.24)',
+        'mainSeriesProperties.areaStyle.color2': 'rgba(240,185,11,0.02)',
+        'mainSeriesProperties.areaStyle.linecolor': '#f0b90b',
+        'mainSeriesProperties.areaStyle.linewidth': 2,
         'mainSeriesProperties.candleStyle.upColor': '#00c087',
         'mainSeriesProperties.candleStyle.downColor': '#f6465d',
         'mainSeriesProperties.candleStyle.borderUpColor': '#00c087',
@@ -207,12 +185,77 @@ export default function SpotTradingViewChart({
         foregroundColor: '#f0b90b',
       },
     });
+    widgetRef.current = widget;
+
+    widget.headerReady().then(() => {
+      if (cancelled) return;
+      const toolbarSlot = widget.createButton({ align: 'left', useTradingViewStyle: false });
+      toolbarSlot.setAttribute('title', '');
+      toolbarSlot.style.display = 'inline-flex';
+      toolbarSlot.style.alignItems = 'center';
+      toolbarSlot.style.gap = '16px';
+      toolbarSlot.style.height = '100%';
+      toolbarSlot.style.padding = '0 8px';
+      toolbarSlot.style.margin = '0';
+      toolbarSlot.style.background = 'transparent';
+      toolbarSlot.style.border = '0';
+      toolbarSlot.style.cursor = 'default';
+
+      const makeButton = (label: string, active: boolean, onClick: () => void) => {
+        const button = toolbarSlot.ownerDocument.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.style.border = '0';
+        button.style.padding = '0';
+        button.style.margin = '0';
+        button.style.background = 'transparent';
+        button.style.color = active ? '#f0b90b' : 'rgba(255,255,255,0.58)';
+        button.style.font = '500 13px/1 Arial, sans-serif';
+        button.style.cursor = 'pointer';
+        button.style.whiteSpace = 'nowrap';
+        button.addEventListener('mouseenter', () => {
+          if (!active) button.style.color = 'rgba(255,255,255,0.86)';
+        });
+        button.addEventListener('mouseleave', () => {
+          if (!active) button.style.color = 'rgba(255,255,255,0.58)';
+        });
+        button.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onClick();
+        });
+        toolbarSlot.appendChild(button);
+      };
+
+      makeButton(TIME_SHARING_LABEL, chartMode === 'time', () => onChartModeChange?.('time'));
+      SPOT_INTERVAL_OPTIONS.forEach((item) => {
+        makeButton(formatIntervalLabel(item), chartMode !== 'time' && interval === item, () => {
+          onChartModeChange?.('candle');
+          onIntervalChange?.(item);
+        });
+      });
+    }).catch(() => undefined);
 
     return () => {
       cancelled = true;
       cleanupWidget();
     };
-  }, [amountPrecision, containerId, displayName, locale, normalizedSymbol, pricePrecision, scriptReady, widgetInterval, widgetKey, widgetStyle]);
+  }, [
+    amountPrecision,
+    chartMode,
+    containerId,
+    displayName,
+    interval,
+    locale,
+    normalizedSymbol,
+    onChartModeChange,
+    onIntervalChange,
+    pricePrecision,
+    scriptReady,
+    widgetInterval,
+    widgetKey,
+    widgetStyle,
+  ]);
 
   return (
     <div className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]" style={{ minHeight: height }}>
@@ -227,14 +270,6 @@ export default function SpotTradingViewChart({
           });
         }}
       />
-      <div className="pointer-events-none absolute left-3 top-3 z-10 flex flex-wrap items-center gap-1.5">
-        <span className="rounded-md border border-white/[0.08] bg-[#11161c]/92 px-2 py-1 text-[11px] font-medium text-white/72 shadow-lg shadow-black/20 backdrop-blur-sm">
-          {activeInterval}
-        </span>
-        <span className={`rounded-md border px-2 py-1 text-[11px] font-semibold shadow-lg shadow-black/20 backdrop-blur-sm ${spotMarketStatusBadgeClass(klineStatus.kind)}`}>
-          {klineStatus.label}
-        </span>
-      </div>
       <div
         id={containerId}
         ref={containerRef}

@@ -9,10 +9,6 @@ import {
   getTickerDirectionTextClass,
   type PriceDirection,
 } from './spotTickerColor';
-import {
-  resolveSpotMarketStatus,
-  spotMarketStatusBadgeClass,
-} from './spotMarketStatus';
 
 interface SpotHeaderProps {
   symbol: string;
@@ -45,10 +41,6 @@ export default function SpotHeader({
   priceDirection = 'flat',
   marketStatus,
   quoteFreshness,
-  tickerSource,
-  tickerFreshness,
-  dataSource,
-  isLoading = false,
   marketSessionType,
 }: SpotHeaderProps) {
   const { t } = useLocaleContext();
@@ -81,15 +73,6 @@ export default function SpotHeader({
     if (isChangeDown) return 'text-[#f6465d]';
     return 'text-white';
   }, [isChangeUp, isChangeDown]);
-  const tickerStatus = useMemo(
-    () => resolveSpotMarketStatus({
-      source: tickerSource,
-      freshness: tickerFreshness,
-      dataSource,
-      isLoading,
-    }),
-    [dataSource, isLoading, tickerFreshness, tickerSource],
-  );
 
   return (
     <div className="tabular-nums border-b border-white/[0.06] bg-[#11161d] px-3 py-2 shadow-[inset_0_-1px_0_rgba(255,255,255,0.02)]">
@@ -103,12 +86,6 @@ export default function SpotHeader({
               marketSessionType={marketSessionType}
               className="ml-2"
             />
-            <span
-              className={`ml-2 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${spotMarketStatusBadgeClass(tickerStatus.kind)}`}
-              title={`Ticker ${tickerStatus.label}`}
-            >
-              {tickerStatus.label}
-            </span>
           </div>
           <div
             className={`inline-flex w-fit items-center rounded-lg px-2 py-0.5 text-[30px] font-semibold leading-none transition-all duration-200 ${priceColorClass} ${priceFlashClass} ${
