@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import Script from 'next/script';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import type { SpotChartProps, SpotKlineLoadState } from './chart/chart.types';
@@ -8,20 +8,14 @@ import { formatSpotDisplaySymbol } from './spotFormat';
 import {
   createSpotTradingViewDatafeed,
   spotIntervalToTradingViewResolution,
-  type SpotTradingViewKlineGapEvent,
 } from './tradingview/spotTradingViewDatafeed';
 import {
   resolveSpotKlineStatus,
   spotMarketStatusBadgeClass,
 } from './spotMarketStatus';
 
-type TradingViewActiveChartInstance = {
-  resetData?: () => void;
-};
-
 type TradingViewWidgetInstance = {
   remove: () => void;
-  activeChart?: () => TradingViewActiveChartInstance;
 };
 
 type SpotTradingViewGlobal = {
@@ -38,6 +32,11 @@ type KlineLoadStateByKey = {
   state: SpotKlineLoadState;
 };
 
+type KlineRealtimeByKey = {
+  key: string;
+  updatedAtMs: number;
+};
+
 type SpotTradingViewChartProps = SpotChartProps & {
   chartMode?: 'time' | 'candle';
 };
@@ -48,6 +47,7 @@ type SpotTradingViewWindow = Window & {
 
 const TRADINGVIEW_LIBRARY_PATH = '/tradingview/charting_library/';
 const TRADINGVIEW_SCRIPT_SRC = `${TRADINGVIEW_LIBRARY_PATH}charting_library.js`;
+const KLINE_REALTIME_STATUS_GRACE_MS = 30_000;
 
 function normalizeTradingViewSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
@@ -80,6 +80,8 @@ export default function SpotTradingViewChart({
   const [loadError, setLoadError] = useState<TradingViewLoadError | null>(null);
   const [scriptReady, setScriptReady] = useState(false);
   const [klineLoadStateByKey, setKlineLoadStateByKey] = useState<KlineLoadStateByKey | null>(null);
+  const [klineRealtimeByKey, setKlineRealtimeByKey] = useState<KlineRealtimeByKey | null>(null);
+  const [statusClockMs, setStatusClockMs] = useState(() => Date.now());
   const reactId = useId();
   const containerId = useMemo(
     () => `spot-tv-chart-${reactId.replace(/[^a-zA-Z0-9_-]/g, '')}`,
@@ -96,6 +98,9 @@ export default function SpotTradingViewChart({
   const activeKlineLoadState = klineLoadStateByKey?.key === widgetKey
     ? klineLoadStateByKey.state
     : 'loading';
+  const activeKlineRealtimeAtMs = klineRealtimeByKey?.key === widgetKey
+    ? klineRealtimeByKey.updatedAtMs
+    : null;
   const klineStatus = useMemo(
     () => resolveSpotKlineStatus({
       source: klineSource,
@@ -103,36 +108,16 @@ export default function SpotTradingViewChart({
       dataSource,
       loadState: activeKlineLoadState,
       isLoading,
+      realtimeUpdatedAtMs: activeKlineRealtimeAtMs,
+      realtimeGraceMs: KLINE_REALTIME_STATUS_GRACE_MS,
+      nowMs: statusClockMs,
     }),
-    [activeKlineLoadState, dataSource, isLoading, klineFreshness, klineSource],
+    [activeKlineLoadState, activeKlineRealtimeAtMs, dataSource, isLoading, klineFreshness, klineSource, statusClockMs],
   );
-  const handleKlineGap = useCallback((event: SpotTradingViewKlineGapEvent) => {
-    const activeChart = widgetRef.current?.activeChart?.();
-    if (activeChart && typeof activeChart.resetData === 'function') {
-      activeChart.resetData();
-      if (process.env.NODE_ENV !== 'production') {
-        console.debug('[SpotTradingViewChart] kline gap resetData', {
-          symbol: event.symbol,
-          interval: event.interval,
-          barTime: event.barTime,
-          latestBarTime: event.latestBarTime,
-          gapIntervals: event.gapIntervals,
-          action: 'resetData',
-        });
-      }
-      return;
-    }
 
-    if (process.env.NODE_ENV !== 'production') {
-      console.warn('[SpotTradingViewChart] resetData unavailable for kline gap', {
-        symbol: event.symbol,
-        interval: event.interval,
-        barTime: event.barTime,
-        latestBarTime: event.latestBarTime,
-        gapIntervals: event.gapIntervals,
-        action: 'onResetCacheNeeded',
-      });
-    }
+  useEffect(() => {
+    const timer = window.setInterval(() => setStatusClockMs(Date.now()), 5_000);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -168,8 +153,12 @@ export default function SpotTradingViewChart({
       displaySymbol: displayName,
       pricePrecision,
       amountPrecision,
-      onKlineGap: handleKlineGap,
       onKlineLoadStateChange: (state) => setKlineLoadStateByKey({ key: widgetKey, state }),
+      onKlineRealtime: (event) => {
+        const now = event.updatedAtMs || Date.now();
+        setStatusClockMs(now);
+        setKlineRealtimeByKey({ key: widgetKey, updatedAtMs: now });
+      },
     });
     datafeedRef.current = datafeed;
 
@@ -223,7 +212,7 @@ export default function SpotTradingViewChart({
       cancelled = true;
       cleanupWidget();
     };
-  }, [amountPrecision, containerId, displayName, handleKlineGap, locale, normalizedSymbol, pricePrecision, scriptReady, widgetInterval, widgetKey, widgetStyle]);
+  }, [amountPrecision, containerId, displayName, locale, normalizedSymbol, pricePrecision, scriptReady, widgetInterval, widgetKey, widgetStyle]);
 
   return (
     <div className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]" style={{ minHeight: height }}>

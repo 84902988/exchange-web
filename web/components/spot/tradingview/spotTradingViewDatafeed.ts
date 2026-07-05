@@ -26,12 +26,12 @@ type TradingViewBar = {
   volume?: number;
 };
 
-export type SpotTradingViewKlineGapEvent = {
+type SpotTradingViewRealtimeEvent = {
   symbol: string;
   interval: string;
+  reason: 'kline' | 'trade';
   barTime: number;
-  latestBarTime: number;
-  gapIntervals: number;
+  updatedAtMs: number;
 };
 
 type TradingViewLibrarySymbolInfo = {
@@ -128,21 +128,8 @@ type SpotTradingViewDatafeedOptions = Pick<
   SpotChartProps,
   'symbol' | 'displaySymbol' | 'pricePrecision' | 'amountPrecision'
 > & {
-  onKlineGap?: (event: SpotTradingViewKlineGapEvent) => void;
   onKlineLoadStateChange?: (state: SpotKlineLoadState) => void;
-};
-
-type KlineGapState = {
-  barTime: number;
-  latestBarTime: number;
-  lastResetAt: number;
-};
-
-type KlineBackfillState = {
-  barTime: number;
-  latestBarTime: number;
-  requestedAt: number;
-  inFlight: boolean;
+  onKlineRealtime?: (event: SpotTradingViewRealtimeEvent) => void;
 };
 
 type TradeBucketState = {
@@ -179,8 +166,7 @@ const SPOT_INTERVAL_MS: Record<string, number> = {
   '4h': 4 * 60 * 60_000,
   '1d': 24 * 60 * 60_000,
 };
-const KLINE_GAP_RESET_THROTTLE_MS = 3_000;
-const KLINE_GAP_BACKFILL_THROTTLE_MS = 3_000;
+const realtimeHighWaterMarkByKey = new Map<string, number>();
 
 const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
   supports_search: true,
@@ -259,6 +245,18 @@ function tradingViewResolutionToSpotInterval(resolution: string): string {
 
 function getSpotIntervalMs(interval: string): number {
   return SPOT_INTERVAL_MS[String(interval || '').trim().toLowerCase()] || SPOT_INTERVAL_MS['1m'];
+}
+
+function getRealtimeHighWaterMark(latestBarKey: string): number {
+  return realtimeHighWaterMarkByKey.get(latestBarKey) || 0;
+}
+
+function rememberRealtimeHighWaterMark(latestBarKey: string, time: number) {
+  if (!Number.isFinite(time) || time <= 0) return;
+  const previous = getRealtimeHighWaterMark(latestBarKey);
+  if (time > previous) {
+    realtimeHighWaterMarkByKey.set(latestBarKey, time);
+  }
 }
 
 function getPriceScale(precision?: number | null): number {
@@ -362,8 +360,6 @@ export function createSpotTradingViewDatafeed(
   const apiSymbol = normalizeSpotSymbol(symbolInfo.ticker || symbolInfo.name);
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
-  const gapStateByLatestBarKey = new Map<string, KlineGapState>();
-  const backfillStateByLatestBarKey = new Map<string, KlineBackfillState>();
   const tradeBucketStateByKey = new Map<string, TradeBucketState>();
   const latestKlineProviderByKey = new Map<string, string>();
   const latestKlineSourceByKey = new Map<string, string>();
@@ -414,223 +410,6 @@ export function createSpotTradingViewDatafeed(
         tradeBucketStateByKey.delete(key);
       }
     }
-  };
-
-  const logKlineGapDebug = (payload: {
-    interval: string;
-    latestBarTime: number;
-    realtimeBarTime: number;
-    gapIntervals: number;
-    action: string;
-  }) => {
-    if (process.env.NODE_ENV === 'production') return;
-    console.debug('[SpotTradingViewDatafeed] kline gap', {
-      symbol: apiSymbol,
-      interval: payload.interval,
-      latestBarTime: payload.latestBarTime,
-      realtimeBarTime: payload.realtimeBarTime,
-      gapIntervals: payload.gapIntervals,
-      action: payload.action,
-    });
-  };
-
-  const resetKlineGap = (
-    latestBarKey: string,
-    interval: string,
-    intervalMs: number,
-    latestBar: TradingViewBar,
-    realtimeBar: TradingViewBar,
-    onResetCacheNeeded?: () => void,
-  ) => {
-    const now = Date.now();
-    const previousGap = gapStateByLatestBarKey.get(latestBarKey);
-    const shouldReset =
-      !previousGap ||
-      previousGap.barTime !== realtimeBar.time ||
-      previousGap.latestBarTime !== latestBar.time ||
-      now - previousGap.lastResetAt >= KLINE_GAP_RESET_THROTTLE_MS;
-
-    if (!shouldReset) return;
-
-    gapStateByLatestBarKey.set(latestBarKey, {
-      barTime: realtimeBar.time,
-      latestBarTime: latestBar.time,
-      lastResetAt: now,
-    });
-    const gapIntervals = Math.max(2, Math.round((realtimeBar.time - latestBar.time) / intervalMs));
-    onResetCacheNeeded?.();
-    options.onKlineGap?.({
-      symbol: apiSymbol,
-      interval,
-      barTime: realtimeBar.time,
-      latestBarTime: latestBar.time,
-      gapIntervals,
-    });
-    logKlineGapDebug({
-      interval,
-      latestBarTime: latestBar.time,
-      realtimeBarTime: realtimeBar.time,
-      gapIntervals,
-      action: 'reset',
-    });
-  };
-
-  const backfillKlineGap = (
-    latestBarKey: string,
-    interval: string,
-    intervalMs: number,
-    latestBar: TradingViewBar,
-    realtimeBar: TradingViewBar,
-    emitRealtimeBar: EmitRealtimeBar,
-    onResetCacheNeeded?: () => void,
-  ) => {
-    const now = Date.now();
-    const gapIntervals = Math.max(2, Math.round((realtimeBar.time - latestBar.time) / intervalMs));
-    const previousBackfill = backfillStateByLatestBarKey.get(latestBarKey);
-    if (previousBackfill?.inFlight) return;
-    if (
-      previousBackfill &&
-      previousBackfill.barTime === realtimeBar.time &&
-      previousBackfill.latestBarTime === latestBar.time &&
-      now - previousBackfill.requestedAt < KLINE_GAP_BACKFILL_THROTTLE_MS
-    ) {
-      return;
-    }
-
-    backfillStateByLatestBarKey.set(latestBarKey, {
-      barTime: realtimeBar.time,
-      latestBarTime: latestBar.time,
-      requestedAt: now,
-      inFlight: true,
-    });
-    logKlineGapDebug({
-      interval,
-      latestBarTime: latestBar.time,
-      realtimeBarTime: realtimeBar.time,
-      gapIntervals,
-      action: 'backfill_start',
-    });
-
-    const reset = (latestForReset: TradingViewBar) => {
-      resetKlineGap(latestBarKey, interval, intervalMs, latestForReset, realtimeBar, onResetCacheNeeded);
-    };
-
-    void getSpotKlines({
-      symbol: apiSymbol,
-      interval,
-      limit: Math.min(Math.max(gapIntervals + 5, 20), 200),
-    })
-      .then((payload) => {
-        const state = backfillStateByLatestBarKey.get(latestBarKey);
-        if (
-          !state ||
-          state.barTime !== realtimeBar.time ||
-          state.latestBarTime !== latestBar.time
-        ) {
-          return;
-        }
-
-        const currentLatest = latestBars.get(latestBarKey);
-        if (currentLatest && currentLatest.time >= realtimeBar.time) {
-          gapStateByLatestBarKey.delete(latestBarKey);
-          backfillStateByLatestBarKey.delete(latestBarKey);
-          return;
-        }
-
-        let cursor =
-          currentLatest && currentLatest.time > latestBar.time
-            ? currentLatest
-            : latestBar;
-        const bars = (payload.items || [])
-          .map(klineToBar)
-          .filter((item): item is TradingViewBar => Boolean(item))
-          .filter((item) => item.time > cursor.time)
-          .sort((a, b) => a.time - b.time);
-
-        if (!bars.length || bars[0].time !== cursor.time + intervalMs) {
-          reset(cursor);
-          return;
-        }
-
-        for (const nextBar of bars) {
-          if (nextBar.time < cursor.time) {
-            continue;
-          }
-          if (nextBar.time === cursor.time) {
-            if (!emitRealtimeBar(nextBar, 'backfill_update')) {
-              const currentLatestAfterDrop = latestBars.get(latestBarKey);
-              if (currentLatestAfterDrop && currentLatestAfterDrop.time >= nextBar.time) {
-                cursor = currentLatestAfterDrop;
-                continue;
-              }
-              return;
-            }
-            cursor = latestBars.get(latestBarKey) || nextBar;
-            continue;
-          }
-          if (nextBar.time !== cursor.time + intervalMs) {
-            reset(cursor);
-            return;
-          }
-          if (!emitRealtimeBar(nextBar, 'backfill_append')) {
-            const currentLatestAfterDrop = latestBars.get(latestBarKey);
-            if (currentLatestAfterDrop && currentLatestAfterDrop.time >= nextBar.time) {
-              cursor = currentLatestAfterDrop;
-              continue;
-            }
-            return;
-          }
-          cursor = latestBars.get(latestBarKey) || nextBar;
-        }
-
-        if (realtimeBar.time === cursor.time) {
-          if (emitRealtimeBar(realtimeBar, 'backfill_realtime_update')) {
-            cursor = latestBars.get(latestBarKey) || realtimeBar;
-          }
-        } else if (realtimeBar.time === cursor.time + intervalMs) {
-          if (emitRealtimeBar(realtimeBar, 'backfill_realtime_append')) {
-            cursor = latestBars.get(latestBarKey) || realtimeBar;
-          }
-        } else if (realtimeBar.time > cursor.time) {
-          reset(cursor);
-          return;
-        }
-
-        gapStateByLatestBarKey.delete(latestBarKey);
-        backfillStateByLatestBarKey.delete(latestBarKey);
-        logKlineGapDebug({
-          interval,
-          latestBarTime: latestBar.time,
-          realtimeBarTime: realtimeBar.time,
-          gapIntervals,
-          action: 'backfill_success',
-        });
-      })
-      .catch(() => {
-        const state = backfillStateByLatestBarKey.get(latestBarKey);
-        if (
-          !state ||
-          state.barTime !== realtimeBar.time ||
-          state.latestBarTime !== latestBar.time
-        ) {
-          return;
-        }
-
-        reset(latestBars.get(latestBarKey) || latestBar);
-      })
-      .finally(() => {
-        const state = backfillStateByLatestBarKey.get(latestBarKey);
-        if (
-          state &&
-          state.barTime === realtimeBar.time &&
-          state.latestBarTime === latestBar.time
-        ) {
-          backfillStateByLatestBarKey.set(latestBarKey, {
-            ...state,
-            inFlight: false,
-          });
-        }
-      });
   };
 
   return {
@@ -702,6 +481,7 @@ export function createSpotTradingViewDatafeed(
 
           if (latestBar) {
             latestBars.set(latestBarKey, latestBar);
+            rememberRealtimeHighWaterMark(latestBarKey, latestBar.time);
             syncLastEmittedAfterHistory(latestBarKey, latestBar.time);
           }
           const historyProvider = normalizeProvider(payload.provider);
@@ -712,8 +492,6 @@ export function createSpotTradingViewDatafeed(
           if (historySource) {
             latestKlineSourceByKey.set(latestBarKey, historySource);
           }
-          gapStateByLatestBarKey.delete(latestBarKey);
-          backfillStateByLatestBarKey.delete(latestBarKey);
           pruneTradeBucketState(latestBarKey, (latestBar?.time || 0) - intervalMs);
 
           options.onKlineLoadStateChange?.(bars.length > 0 ? 'loaded' : 'empty');
@@ -732,7 +510,7 @@ export function createSpotTradingViewDatafeed(
         });
     },
 
-    subscribeBars(_symbolInfo, resolution, onRealtime, subscriberUid, onResetCacheNeeded) {
+    subscribeBars(_symbolInfo, resolution, onRealtime, subscriberUid) {
       const existingUnsubscribe = unsubscribeByUid.get(subscriberUid);
       existingUnsubscribe?.();
 
@@ -749,7 +527,10 @@ export function createSpotTradingViewDatafeed(
         historyReadyByLatestBarKey.set(latestBarKey, false);
       }
       activeSubscriptionKeyByUid.set(subscriberUid, subscriptionKey);
-      lastEmittedBarTimeByUid.set(subscriberUid, latestBars.get(latestBarKey)?.time || 0);
+      lastEmittedBarTimeByUid.set(
+        subscriberUid,
+        Math.max(latestBars.get(latestBarKey)?.time || 0, getRealtimeHighWaterMark(latestBarKey)),
+      );
       latestBarKeyByUid.set(subscriberUid, latestBarKey);
 
       const emitRealtimeBar: EmitRealtimeBar = (bar, reason) => {
@@ -757,7 +538,11 @@ export function createSpotTradingViewDatafeed(
         if (historyReadyByLatestBarKey.get(latestBarKey) === false) return false;
         if (!Number.isFinite(bar.time) || bar.time <= 0) return false;
 
-        const lastEmittedTime = lastEmittedBarTimeByUid.get(subscriberUid) || 0;
+        const lastEmittedTime = Math.max(
+          lastEmittedBarTimeByUid.get(subscriberUid) || 0,
+          latestBars.get(latestBarKey)?.time || 0,
+          getRealtimeHighWaterMark(latestBarKey),
+        );
         if (bar.time < lastEmittedTime) {
           if (process.env.NODE_ENV !== 'production') {
             const dropKey = `${reason}:${bar.time}:${lastEmittedTime}`;
@@ -778,6 +563,7 @@ export function createSpotTradingViewDatafeed(
 
         const nextBar = { ...bar };
         latestBars.set(latestBarKey, nextBar);
+        rememberRealtimeHighWaterMark(latestBarKey, nextBar.time);
         lastEmittedBarTimeByUid.set(subscriberUid, nextBar.time);
         onRealtime(nextBar);
         return true;
@@ -800,18 +586,6 @@ export function createSpotTradingViewDatafeed(
 
         const latestBar = latestBars.get(latestBarKey);
         if (latestBar && bar.time < latestBar.time) return;
-        if (latestBar && bar.time > latestBar.time + intervalMs) {
-          backfillKlineGap(
-            latestBarKey,
-            interval,
-            intervalMs,
-            latestBar,
-            bar,
-            emitRealtimeBar,
-            onResetCacheNeeded,
-          );
-          return;
-        }
 
         const klinePayload = message.kline && typeof message.kline === 'object'
           ? message.kline as Record<string, unknown>
@@ -826,8 +600,13 @@ export function createSpotTradingViewDatafeed(
         }
         const didEmit = emitRealtimeBar(bar, 'kline');
         if (!didEmit) return;
-        gapStateByLatestBarKey.delete(latestBarKey);
-        backfillStateByLatestBarKey.delete(latestBarKey);
+        options.onKlineRealtime?.({
+          symbol: apiSymbol,
+          interval,
+          reason: 'kline',
+          barTime: bar.time,
+          updatedAtMs: Date.now(),
+        });
         pruneTradeBucketState(latestBarKey, bar.time - intervalMs);
       };
 
@@ -862,7 +641,6 @@ export function createSpotTradingViewDatafeed(
 
         const latestBar = latestBars.get(latestBarKey);
         if (!latestBar || bucketTime < latestBar.time) return;
-        if (bucketTime > latestBar.time + intervalMs) return;
         const lastEmittedTime = lastEmittedBarTimeByUid.get(subscriberUid) || 0;
         if (bucketTime < lastEmittedTime) return;
 
@@ -897,6 +675,13 @@ export function createSpotTradingViewDatafeed(
 
         const didEmit = emitRealtimeBar(nextBar, 'trade');
         if (!didEmit) return;
+        options.onKlineRealtime?.({
+          symbol: apiSymbol,
+          interval,
+          reason: 'trade',
+          barTime: nextBar.time,
+          updatedAtMs: Date.now(),
+        });
         pruneTradeBucketState(latestBarKey, bucketTime - intervalMs);
       };
 
@@ -923,8 +708,6 @@ export function createSpotTradingViewDatafeed(
       const latestBarKey = latestBarKeyByUid.get(subscriberUid);
       if (latestBarKey) {
         latestBars.delete(latestBarKey);
-        gapStateByLatestBarKey.delete(latestBarKey);
-        backfillStateByLatestBarKey.delete(latestBarKey);
         latestKlineProviderByKey.delete(latestBarKey);
         latestKlineSourceByKey.delete(latestBarKey);
         historyReadyByLatestBarKey.delete(latestBarKey);
@@ -944,8 +727,6 @@ export function createSpotTradingViewDatafeed(
       unsubscribeByUid.clear();
       latestBarKeyByUid.clear();
       latestBars.clear();
-      gapStateByLatestBarKey.clear();
-      backfillStateByLatestBarKey.clear();
       latestKlineProviderByKey.clear();
       latestKlineSourceByKey.clear();
       historyReadyByLatestBarKey.clear();

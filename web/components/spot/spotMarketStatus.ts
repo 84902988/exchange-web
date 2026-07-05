@@ -18,6 +18,9 @@ export type SpotKlineLoadState = 'loading' | 'loaded' | 'empty' | 'error';
 
 export type SpotKlineStatusInput = SpotMarketStatusInput & {
   loadState?: SpotKlineLoadState;
+  realtimeUpdatedAtMs?: number | null;
+  realtimeGraceMs?: number | null;
+  nowMs?: number | null;
 };
 
 export type SpotMarketStatus = {
@@ -127,30 +130,55 @@ export function resolveSpotKlineStatus(input: SpotKlineStatusInput): SpotMarketS
   const source = normalizeSpotMarketStatusValue(input.source);
   const freshness = normalizeSpotMarketStatusValue(input.freshness);
   const dataSource = normalizeSpotMarketStatusValue(input.dataSource);
+  const realtimeUpdatedAtMs = Number(input.realtimeUpdatedAtMs || 0);
+  const realtimeGraceMs = Number(input.realtimeGraceMs || 0);
+  const nowMs = Number(input.nowMs || Date.now());
+  const hasRecentRealtime =
+    realtimeUpdatedAtMs > 0 &&
+    nowMs >= realtimeUpdatedAtMs &&
+    nowMs - realtimeUpdatedAtMs <= (Number.isFinite(realtimeGraceMs) && realtimeGraceMs > 0 ? realtimeGraceMs : 30_000);
 
   if (INTERNAL_VALUES.has(source) || INTERNAL_VALUES.has(freshness) || INTERNAL_VALUES.has(dataSource)) {
     return resolveSpotMarketStatus(input);
   }
 
+  if (hasRecentRealtime) {
+    return {
+      kind: 'live',
+      label: STATUS_LABELS.live,
+      isAvailable: true,
+      isFresh: true,
+    };
+  }
+
+  if (input.loadState === 'loaded') {
+    return {
+      kind: 'snapshot',
+      label: STATUS_LABELS.snapshot,
+      isAvailable: true,
+      isFresh: true,
+    };
+  }
+
+  if (input.loadState === 'loading' || input.isLoading) {
+    return {
+      kind: 'loading',
+      label: STATUS_LABELS.loading,
+      isAvailable: false,
+      isFresh: false,
+    };
+  }
+
+  if (input.loadState === 'empty' || input.loadState === 'error') {
+    return {
+      kind: 'unavailable',
+      label: STATUS_LABELS.unavailable,
+      isAvailable: false,
+      isFresh: false,
+    };
+  }
+
   if (UNKNOWN_VALUES.has(source) && UNKNOWN_VALUES.has(freshness)) {
-    if (input.loadState === 'loaded') {
-      return {
-        kind: 'snapshot',
-        label: STATUS_LABELS.snapshot,
-        isAvailable: true,
-        isFresh: true,
-      };
-    }
-
-    if (input.loadState === 'loading' || input.isLoading) {
-      return {
-        kind: 'loading',
-        label: STATUS_LABELS.loading,
-        isAvailable: false,
-        isFresh: false,
-      };
-    }
-
     return {
       kind: 'unavailable',
       label: STATUS_LABELS.unavailable,

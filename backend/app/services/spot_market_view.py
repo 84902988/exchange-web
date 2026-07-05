@@ -8,10 +8,11 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from app.schemas.market import DepthResponse, TradesResponse
-from app.services.market import get_depth, get_market_tickers, get_trades
+from app.services.market import get_depth, get_klines, get_market_tickers, get_trades
 
 
 SPOT_MARKET_VIEW_BUDGET_SECONDS = 2.8
+SPOT_MARKET_VIEW_KLINE_INTERVAL = "1m"
 
 
 def _dump_model(value: Any) -> dict[str, Any]:
@@ -297,9 +298,11 @@ def get_spot_market_view(
     depth: Optional[DepthResponse] = None
     trades: Optional[TradesResponse] = None
     ticker: dict[str, Any] = {}
+    kline: dict[str, Any] = {}
     depth_error: Optional[Exception] = None
     trades_error: Optional[Exception] = None
     ticker_error: Optional[Exception] = None
+    kline_error: Optional[Exception] = None
     deadline = (
         time.monotonic() + max(0.0, float(total_budget_seconds))
         if total_budget_seconds is not None
@@ -336,6 +339,20 @@ def get_spot_market_view(
             ticker_error = exc
             warnings.append(f"ticker_unavailable:{exc}")
 
+    if not budget_exhausted("kline"):
+        try:
+            kline = get_klines(
+                db=db,
+                symbol=normalized_symbol,
+                interval=SPOT_MARKET_VIEW_KLINE_INTERVAL,
+                limit=1,
+            ) or {}
+            if not kline.get("items"):
+                warnings.append("kline_unavailable")
+        except Exception as exc:
+            kline_error = exc
+            warnings.append(f"kline_unavailable:{exc}")
+
     best_bid = _best_price(depth, "bids")
     best_ask = _best_price(depth, "asks")
     last_trade_price = _latest_trade_price(trades)
@@ -352,12 +369,12 @@ def get_spot_market_view(
     market_status = str(ticker.get("market_status") or "UNKNOWN").upper()
     has_depth = bool(best_bid and best_ask)
     has_trades = bool(getattr(trades, "trades", None))
-    has_kline = "unknown"
+    has_kline = bool(kline.get("items"))
     has_ticker = bool(ticker_last_price)
     depth_source = _normalized_source(depth, has_data=has_depth)
     trades_source = _normalized_source(trades, has_data=has_trades, default="INTERNAL")
     ticker_source = _normalized_source(ticker, has_data=has_ticker)
-    kline_source = "UNKNOWN"
+    kline_source = _normalized_source(kline, has_data=has_kline, default="UNKNOWN")
     depth_freshness = _freshness_from_source(depth_source, has_data=has_depth)
     trades_freshness = _freshness_from_source(trades_source, has_data=has_trades)
     ticker_freshness = _freshness_from_source(
@@ -365,7 +382,11 @@ def get_spot_market_view(
         has_data=has_ticker,
         quote_freshness=ticker.get("quote_freshness"),
     )
-    kline_freshness = "UNKNOWN"
+    kline_freshness = _freshness_from_source(
+        kline_source,
+        has_data=has_kline,
+        quote_freshness=kline.get("freshness"),
+    )
     if last_trade_price:
         display_price = last_trade_price
         display_price_source = "last_trade"
@@ -411,7 +432,7 @@ def get_spot_market_view(
         "data_source": ticker.get("data_source") or ticker.get("source") or "UNKNOWN",
         "depth_status": _status(has_depth, depth_error),
         "trades_status": _status(has_trades, trades_error),
-        "kline_status": has_kline,
+        "kline_status": _status(has_kline, kline_error),
         "depth_source": depth_source,
         "trades_source": trades_source,
         "ticker_source": ticker_source,
@@ -439,7 +460,11 @@ def get_spot_market_view(
             "trades_stale": getattr(trades, "stale", None) if trades is not None else None,
             "trades_freshness": trades_freshness,
             "kline_source": kline_source,
+            "kline_provider": kline.get("provider"),
+            "kline_stale": kline.get("stale"),
             "kline_freshness": kline_freshness,
+            "kline_interval": kline.get("interval") or SPOT_MARKET_VIEW_KLINE_INTERVAL,
+            "kline_error": str(kline_error) if kline_error else None,
             "price_precision": price_precision,
             "amount_precision": amount_precision,
         },
