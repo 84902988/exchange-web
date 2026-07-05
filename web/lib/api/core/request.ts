@@ -70,6 +70,7 @@ function readString(value: unknown): string | undefined {
 
 // ====== Refresh 并发控制：同一时间只发一次 refresh ======
 let refreshPromise: Promise<boolean> | null = null;
+let refreshSuppressedWithoutToken = false;
 
 type RefreshTokenPayload = {
   access_token?: string;
@@ -114,6 +115,7 @@ async function refreshSession(baseUrl: string): Promise<boolean> {
   // 常见：/auth/refresh 或 /auth/token/refresh
   const refreshUrl = joinUrl(baseUrl, "/auth/refresh");
   const refreshToken = getRefreshToken();
+  const hadCredentialHint = Boolean(refreshToken || getAccessToken());
 
   try {
     const resp = await fetch(refreshUrl, {
@@ -127,18 +129,36 @@ async function refreshSession(baseUrl: string): Promise<boolean> {
       cache: "no-store",
     });
 
-    if (!resp.ok) return false;
+    if (!resp.ok) {
+      if (!hadCredentialHint) {
+        refreshSuppressedWithoutToken = true;
+      }
+      return false;
+    }
 
     const data = (await resp.json()) as ApiResponse<RefreshTokenPayload> | RefreshTokenPayload;
     const tokens = extractRefreshTokenPayload(data);
     if (tokens) {
       setTokens(tokens);
+      refreshSuppressedWithoutToken = false;
     }
 
     return isRecord(data) && "ok" in data ? data.ok === true : Boolean(tokens);
   } catch {
+    if (!hadCredentialHint) {
+      refreshSuppressedWithoutToken = true;
+    }
     return false;
   }
+}
+
+function canAttemptRefreshAfter401(path: string): boolean {
+  if (["/auth/login", "/auth/refresh"].includes(path)) return false;
+  if (getAccessToken() || getRefreshToken()) {
+    refreshSuppressedWithoutToken = false;
+    return true;
+  }
+  return !refreshSuppressedWithoutToken;
 }
 
 function parseApiErrorFromResponsePayload(payload: unknown, httpStatus: number, httpStatusText: string) {
@@ -222,7 +242,7 @@ export const request = async <T>(
     });
 
     // ====== 关键：401 自动 refresh 再重放（大所 Web 常见） ======
-    const canRefreshAfter401 = !["/auth/login", "/auth/refresh"].includes(path);
+    const canRefreshAfter401 = canAttemptRefreshAfter401(path);
     if (response.status === 401 && canRefreshAfter401 && !_internal?.retriedAfterRefresh) {
       // 同一时间只发一次 refresh
       if (!refreshPromise) {
