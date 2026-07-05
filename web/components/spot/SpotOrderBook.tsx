@@ -43,6 +43,7 @@ type OrderRow = {
 };
 
 const ORDERBOOK_LEVEL_LIMIT = 9;
+type OrderRowSlot = OrderRow | null;
 
 function toNum(v: string | number | undefined | null): number {
   const n = Number(v);
@@ -78,6 +79,12 @@ function buildRows(levels: SpotDepthLevel[]): OrderRow[] {
   });
 }
 
+function padRows(rows: OrderRow[], align: 'top' | 'bottom'): OrderRowSlot[] {
+  const nextRows = rows.slice(0, ORDERBOOK_LEVEL_LIMIT);
+  const emptyRows = Array<OrderRowSlot>(Math.max(ORDERBOOK_LEVEL_LIMIT - nextRows.length, 0)).fill(null);
+  return align === 'bottom' ? [...emptyRows, ...nextRows] : [...nextRows, ...emptyRows];
+}
+
 export default function SpotOrderBook({
   symbol,
   displaySymbol,
@@ -104,6 +111,8 @@ export default function SpotOrderBook({
 
   const askRows = useMemo(() => buildRows(asks).reverse(), [asks]);
   const bidRows = useMemo(() => buildRows(bids), [bids]);
+  const askSlots = useMemo(() => padRows(askRows, 'bottom'), [askRows]);
+  const bidSlots = useMemo(() => padRows(bidRows, 'top'), [bidRows]);
 
   const hasDepth = askRows.length > 0 || bidRows.length > 0;
   const referencePriceClass = getTickerDirectionTextClass(priceDirection);
@@ -151,14 +160,18 @@ export default function SpotOrderBook({
       ) : (
         <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-1">
           <div className="grid min-h-0 grid-rows-9 gap-px overflow-hidden">
-            {askRows.map((row) => (
-              <BookRow
-                key={`ask-${row.rawPrice}`}
-                row={row}
-                side="ask"
-                pricePrecision={pricePrecision}
-                onPriceClick={onPriceClick}
-              />
+            {askSlots.map((row, index) => (
+              row ? (
+                <BookRow
+                  key={`ask-${row.rawPrice}`}
+                  row={row}
+                  side="ask"
+                  pricePrecision={pricePrecision}
+                  onPriceClick={onPriceClick}
+                />
+              ) : (
+                <EmptyBookRow key={`ask-empty-${index}`} />
+              )
             ))}
           </div>
 
@@ -174,18 +187,32 @@ export default function SpotOrderBook({
           </button>
 
           <div className="grid min-h-0 grid-rows-9 gap-px overflow-hidden">
-            {bidRows.map((row) => (
-              <BookRow
-                key={`bid-${row.rawPrice}`}
-                row={row}
-                side="bid"
-                pricePrecision={pricePrecision}
-                onPriceClick={onPriceClick}
-              />
+            {bidSlots.map((row, index) => (
+              row ? (
+                <BookRow
+                  key={`bid-${row.rawPrice}`}
+                  row={row}
+                  side="bid"
+                  pricePrecision={pricePrecision}
+                  onPriceClick={onPriceClick}
+                />
+              ) : (
+                <EmptyBookRow key={`bid-empty-${index}`} />
+              )
             ))}
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function EmptyBookRow() {
+  return (
+    <div className="grid h-full min-h-0 grid-cols-3 items-center rounded-[6px] px-1.5 text-[12px] leading-4">
+      <span className="px-0.5 text-left text-white/12">--</span>
+      <span className="px-0.5 text-center text-white/12">--</span>
+      <span className="text-right text-white/12">--</span>
     </div>
   );
 }

@@ -112,7 +112,6 @@ interface GlobalMarketSelectorProps {
 
 const intervals = ['1m', '5m', '15m', '1h', '4h', '1d'];
 const TRADFI_INTERVALS = intervals.filter((item) => item !== '4h');
-const SPOT_CHART_PRICE_SCALE_CONTROL_EVENT = 'spot-chart-price-scale-control';
 
 const MARKET_TABS: Array<{ key: MarketLayerTab; labelKey: string }> = [
   { key: 'favorites', labelKey: 'favorites' },
@@ -405,6 +404,14 @@ function formatPercent(value?: string | number | null): string {
   if (!Number.isFinite(num)) return '--';
   if (num === 0) return '0.00%';
   return `${num > 0 ? '+' : ''}${num.toFixed(2)}%`;
+}
+
+function formatIntervalLabel(value: string): string {
+  const normalized = String(value || '').trim();
+  if (normalized === '1h') return '1H';
+  if (normalized === '4h') return '4H';
+  if (normalized === '1d') return '1D';
+  return normalized;
 }
 
 function getPairChangeValue(pair: GlobalMarketSelectorPair): string | number | null | undefined {
@@ -1041,20 +1048,13 @@ export default function GlobalMarketSelector({
     () => (currentPair && (isStockContractPair(currentPair) || isTradfiCfdPair(currentPair)) ? TRADFI_INTERVALS : intervals),
     [currentPair],
   );
+  const showIntervalControls = pageType !== 'spot';
   const showTimeSharing = pageType === 'spot' && Boolean(onChartModeChange);
 
   useEffect(() => {
     if (intervalOptions.includes(interval)) return;
     onIntervalChange(intervalOptions.includes('1h') ? '1h' : intervalOptions[0]);
   }, [interval, intervalOptions, onIntervalChange]);
-
-  const handlePriceScaleControl = useCallback((action: 'zoom-in' | 'zoom-out' | 'reset') => {
-    window.dispatchEvent(
-      new CustomEvent(SPOT_CHART_PRICE_SCALE_CONTROL_EVENT, {
-        detail: { action },
-      })
-    );
-  }, []);
 
   useEffect(() => {
     if (!open) {
@@ -1930,7 +1930,7 @@ export default function GlobalMarketSelector({
                         }`}
                         aria-label={favoriteActive ? t('removeFavorite', 'markets') : t('addFavorite', 'markets')}
                       >
-                        {favoriteActive ? '★' : '☆'}
+                        {favoriteActive ? '\u2605' : '\u2606'}
                       </button>
                       <span className="min-w-0">
                         <span className="block truncate text-[13px] font-semibold text-white">{label}</span>
@@ -1958,70 +1958,43 @@ export default function GlobalMarketSelector({
         {toolbarAddon ? <div className="min-w-0 shrink">{toolbarAddon}</div> : null}
       </div>
 
-      <div className="flex shrink-0 items-center gap-2 overflow-x-auto">
-        {showTimeSharing ? (
-          <button
-            type="button"
-            onClick={() => onChartModeChange?.('time')}
-            className={`rounded-md px-3 py-1.5 text-sm transition-colors ${
-              chartMode === 'time'
-                ? 'bg-[#2b3139] text-white'
-                : 'text-gray-400 hover:bg-[#1a1f27] hover:text-white'
-            }`}
-          >
-            {t('timeSharing', 'contracts')}
-          </button>
-        ) : null}
-        {intervalOptions.map((item) => {
-          const active = chartMode !== 'time' && interval === item;
-          return (
+      {showIntervalControls ? (
+        <div className="flex shrink-0 items-center gap-2 overflow-x-auto">
+          {showTimeSharing ? (
             <button
-              key={item}
               type="button"
-              onClick={() => {
-                onChartModeChange?.('candle');
-                onIntervalChange(item);
-              }}
-              className={`rounded-md px-3 py-1.5 text-sm transition-colors ${
-                active
-                  ? 'bg-[#2b3139] text-white'
-                  : 'text-gray-400 hover:bg-[#1a1f27] hover:text-white'
+              onClick={() => onChartModeChange?.('time')}
+              className={`px-2.5 py-1 text-sm font-medium transition-colors ${
+                chartMode === 'time'
+                  ? 'text-[#f0b90b]'
+                  : 'text-gray-400 hover:text-white'
               }`}
             >
-              {item}
+              {'\u5206\u65f6'}
             </button>
-          );
-        })}
-        <div className="ml-1 flex items-center gap-1 border-l border-white/10 pl-2">
-          <button
-            type="button"
-            aria-label={t('zoomInPriceAxis', 'markets')}
-            title={t('zoomIn', 'markets')}
-            onClick={() => handlePriceScaleControl('zoom-in')}
-            className="rounded-md px-3 py-1.5 text-sm font-semibold text-gray-400 transition-colors hover:bg-[#1a1f27] hover:text-white"
-          >
-            +
-          </button>
-          <button
-            type="button"
-            aria-label={t('zoomOutPriceAxis', 'markets')}
-            title={t('zoomOut', 'markets')}
-            onClick={() => handlePriceScaleControl('zoom-out')}
-            className="rounded-md px-3 py-1.5 text-sm font-semibold text-gray-400 transition-colors hover:bg-[#1a1f27] hover:text-white"
-          >
-            -
-          </button>
-          <button
-            type="button"
-            aria-label={t('resetKlineView', 'markets')}
-            title={t('reset', 'markets')}
-            onClick={() => handlePriceScaleControl('reset')}
-            className="rounded-md px-3 py-1.5 text-sm font-semibold text-gray-400 transition-colors hover:bg-[#1a1f27] hover:text-white"
-          >
-            ↺
-          </button>
+          ) : null}
+          {intervalOptions.map((item) => {
+            const active = chartMode !== 'time' && interval === item;
+            return (
+              <button
+                key={item}
+                type="button"
+                onClick={() => {
+                  onChartModeChange?.('candle');
+                  onIntervalChange(item);
+                }}
+                className={`px-2.5 py-1 text-sm font-medium transition-colors ${
+                  active
+                    ? 'text-[#f0b90b]'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                {formatIntervalLabel(item)}
+              </button>
+            );
+          })}
         </div>
-      </div>
+      ) : null}
     </div>
   );
 }

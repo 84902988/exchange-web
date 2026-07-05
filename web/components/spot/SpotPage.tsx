@@ -411,7 +411,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const spotMarket = useSpotMarket(symbol);
   const symbolRef = useRef(symbol);
   const appliedCategoryRef = useRef('');
-  const [interval, setIntervalValue] = useState('1m');
+  const originalDocumentTitleRef = useRef<string | null>(null);
+  const titleUpdateTimerRef = useRef<number | null>(null);
+  const titleUpdatedAtRef = useRef(0);
+  const [interval, setIntervalValue] = useState('1d');
   const [chartMode, setChartMode] = useState<SpotChartMode>('candle');
   const [orderPrice, setOrderPrice] = useState('');
   const [orderPriceSelectNonce, setOrderPriceSelectNonce] = useState(0);
@@ -903,9 +906,15 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const spotMarketDataSource = spotMarket.marketView?.data_source || marketFeedDataSource;
   const spotSources = spotMarket.sources;
   const spotFreshness = spotMarket.freshness;
-  const spotTickerFreshness = spotMarket.freshness.ticker;
+  const normalizedDisplayPriceSource = String(spotMarket.displayPriceSource || '').toLowerCase();
+  const spotPriceStatusDomain = hasSpotTradePrice || normalizedDisplayPriceSource.includes('trade')
+    ? 'trades'
+    : normalizedDisplayPriceSource.includes('kline')
+      ? 'kline'
+      : 'ticker';
+  const spotPriceStatusSource = spotSources[spotPriceStatusDomain];
+  const spotPriceStatusFreshness = spotFreshness[spotPriceStatusDomain];
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
-  const chartInterval = chartMode === 'time' ? '1m' : interval;
   const marketSyncingText = t('loading', 'common');
   const shouldShowMarketSyncing = spotMarket.isLoading && spotLastPrice === '--';
   const displayLatestPrice = shouldShowMarketSyncing ? marketSyncingText : spotLastPrice;
@@ -918,6 +927,45 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       turnover: marketSyncingText,
     }
     : marketHeaderData;
+
+  useEffect(() => {
+    originalDocumentTitleRef.current = document.title || 'Royal Exchange';
+
+    return () => {
+      if (titleUpdateTimerRef.current !== null) {
+        window.clearTimeout(titleUpdateTimerRef.current);
+        titleUpdateTimerRef.current = null;
+      }
+      document.title = originalDocumentTitleRef.current || 'Royal Exchange';
+    };
+  }, []);
+
+  useEffect(() => {
+    const displaySymbol = formatSpotDisplaySymbol(symbol);
+    const titlePrice = !shouldShowMarketSyncing && spotLastPrice !== '--' ? spotLastPrice : '';
+    const nextTitle = titlePrice
+      ? `${titlePrice} ${displaySymbol} 现货交易 | Royal Exchange`
+      : `${displaySymbol} 现货交易 | Royal Exchange`;
+    const now = Date.now();
+    const remainingMs = Math.max(1000 - (now - titleUpdatedAtRef.current), 0);
+    const applyTitle = () => {
+      document.title = nextTitle;
+      titleUpdatedAtRef.current = Date.now();
+      titleUpdateTimerRef.current = null;
+    };
+
+    if (titleUpdateTimerRef.current !== null) {
+      window.clearTimeout(titleUpdateTimerRef.current);
+      titleUpdateTimerRef.current = null;
+    }
+
+    if (remainingMs === 0) {
+      applyTitle();
+      return;
+    }
+
+    titleUpdateTimerRef.current = window.setTimeout(applyTitle, remainingMs);
+  }, [shouldShowMarketSyncing, spotLastPrice, symbol]);
 
   return (
     <div className="flex flex-col overflow-x-hidden bg-[#0b0e11] text-white">
@@ -933,8 +981,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         priceDirection={priceDirection}
         marketStatus={spotMarketStatus}
         quoteFreshness={null}
-        tickerSource={spotSources.ticker}
-        tickerFreshness={spotTickerFreshness}
+        tickerSource={spotPriceStatusSource}
+        tickerFreshness={spotPriceStatusFreshness}
         dataSource={spotMarketDataSource}
         isLoading={spotMarket.isLoading}
         marketSessionType={spotMarketSessionType}
@@ -969,8 +1017,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     <SpotTradingViewChart
                       symbol={symbol}
                       displaySymbol={currentDisplaySymbol}
-                      interval={chartInterval}
+                      interval={interval}
                       chartMode={chartMode}
+                      onIntervalChange={setIntervalValue}
+                      onChartModeChange={setChartMode}
                       dataSource={spotMarketDataSource}
                       klineSource={spotSources.kline}
                       klineFreshness={spotFreshness.kline}
