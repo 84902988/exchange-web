@@ -18,6 +18,12 @@ import TradingConfirmModal from '@/components/common/TradingConfirmModal';
 import PercentageSlider from './form/PercentageSlider';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import { formatSpotDisplaySymbol } from './spotFormat';
+import {
+  getSpotBboAvailabilityLabel,
+  getSpotBboBasisLabel,
+  resolveSpotMarketStatus,
+  spotMarketStatusBadgeClass,
+} from './spotMarketStatus';
 
 interface SpotTradingFormProps {
   symbol: string;
@@ -30,6 +36,10 @@ interface SpotTradingFormProps {
   accountBalances?: SpotAccountBalanceItem[];
   asks?: SpotDepthLevel[];
   bids?: SpotDepthLevel[];
+  depthSource?: string | null;
+  depthFreshness?: string | null;
+  dataSource?: string | null;
+  marketDataLoading?: boolean;
   onPriceChange?: (price: string) => void;
   priceSelectNonce?: number;
   onOrderSuccess?: (order?: CreateSpotOrderResponse) => void;
@@ -700,6 +710,10 @@ export default function SpotTradingForm({
   accountBalances = [],
   asks = [],
   bids = [],
+  depthSource,
+  depthFreshness,
+  dataSource,
+  marketDataLoading = false,
   onPriceChange,
   priceSelectNonce = 0,
   onOrderSuccess,
@@ -1516,6 +1530,17 @@ export default function SpotTradingForm({
 
   const bboPrice = side === 'buy' ? bestAskPrice : bestBidPrice;
   const bboDisabled = !bboPrice;
+  const bboStatus = useMemo(
+    () => resolveSpotMarketStatus({
+      source: depthSource,
+      freshness: depthFreshness,
+      dataSource,
+      isLoading: marketDataLoading,
+    }),
+    [dataSource, depthFreshness, depthSource, marketDataLoading],
+  );
+  const bboBasisLabel = getSpotBboBasisLabel(side);
+  const bboAvailabilityLabel = getSpotBboAvailabilityLabel(bboStatus, Boolean(bboPrice));
 
   const handleSliderChange = (nextValue: number) => {
     const safeValue = clampPercentValue(nextValue);
@@ -1792,6 +1817,21 @@ export default function SpotTradingForm({
           >
             {copy.market}
           </button>
+        </div>
+
+        <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] px-2.5 py-2 text-[11px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
+          <div className="flex min-w-0 items-center justify-between gap-2">
+            <span className="min-w-0 truncate text-white/46">{bboBasisLabel}</span>
+            <span className={`shrink-0 rounded-full border px-2 py-0.5 font-semibold ${spotMarketStatusBadgeClass(bboStatus.kind)}`}>
+              {bboStatus.label}
+            </span>
+          </div>
+          <div className="mt-1 flex min-w-0 items-center justify-between gap-2 text-white/36">
+            <span className="min-w-0 truncate">{bboPrice || '--'}</span>
+            <span className={bboStatus.isFresh && bboPrice ? 'text-emerald-200/78' : 'text-white/34'}>
+              {bboAvailabilityLabel}
+            </span>
+          </div>
         </div>
 
         <div className="space-y-2.5 xl:space-y-3">

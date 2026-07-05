@@ -3,13 +3,17 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import Script from 'next/script';
 import { useLocaleContext } from '@/contexts/LocaleContext';
-import type { SpotChartProps } from './chart/chart.types';
+import type { SpotChartProps, SpotKlineLoadState } from './chart/chart.types';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import {
   createSpotTradingViewDatafeed,
   spotIntervalToTradingViewResolution,
   type SpotTradingViewKlineGapEvent,
 } from './tradingview/spotTradingViewDatafeed';
+import {
+  resolveSpotKlineStatus,
+  spotMarketStatusBadgeClass,
+} from './spotMarketStatus';
 
 type TradingViewActiveChartInstance = {
   resetData?: () => void;
@@ -27,6 +31,11 @@ type SpotTradingViewGlobal = {
 type TradingViewLoadError = {
   key: string;
   message: string;
+};
+
+type KlineLoadStateByKey = {
+  key: string;
+  state: SpotKlineLoadState;
 };
 
 type SpotTradingViewChartProps = SpotChartProps & {
@@ -56,6 +65,10 @@ export default function SpotTradingViewChart({
   displaySymbol,
   interval,
   height = 520,
+  dataSource,
+  klineSource,
+  klineFreshness,
+  isLoading = false,
   pricePrecision,
   amountPrecision,
   chartMode = 'candle',
@@ -66,6 +79,7 @@ export default function SpotTradingViewChart({
   const datafeedRef = useRef<ReturnType<typeof createSpotTradingViewDatafeed> | null>(null);
   const [loadError, setLoadError] = useState<TradingViewLoadError | null>(null);
   const [scriptReady, setScriptReady] = useState(false);
+  const [klineLoadStateByKey, setKlineLoadStateByKey] = useState<KlineLoadStateByKey | null>(null);
   const reactId = useId();
   const containerId = useMemo(
     () => `spot-tv-chart-${reactId.replace(/[^a-zA-Z0-9_-]/g, '')}`,
@@ -79,6 +93,19 @@ export default function SpotTradingViewChart({
   const widgetKey = `${normalizedSymbol}:${chartMode}:${widgetInterval}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}`;
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
+  const activeKlineLoadState = klineLoadStateByKey?.key === widgetKey
+    ? klineLoadStateByKey.state
+    : 'loading';
+  const klineStatus = useMemo(
+    () => resolveSpotKlineStatus({
+      source: klineSource,
+      freshness: klineFreshness,
+      dataSource,
+      loadState: activeKlineLoadState,
+      isLoading,
+    }),
+    [activeKlineLoadState, dataSource, isLoading, klineFreshness, klineSource],
+  );
   const handleKlineGap = useCallback((event: SpotTradingViewKlineGapEvent) => {
     const activeChart = widgetRef.current?.activeChart?.();
     if (activeChart && typeof activeChart.resetData === 'function') {
@@ -142,6 +169,7 @@ export default function SpotTradingViewChart({
       pricePrecision,
       amountPrecision,
       onKlineGap: handleKlineGap,
+      onKlineLoadStateChange: (state) => setKlineLoadStateByKey({ key: widgetKey, state }),
     });
     datafeedRef.current = datafeed;
 
@@ -210,6 +238,14 @@ export default function SpotTradingViewChart({
           });
         }}
       />
+      <div className="pointer-events-none absolute left-3 top-3 z-10 flex flex-wrap items-center gap-1.5">
+        <span className="rounded-md border border-white/[0.08] bg-[#11161c]/92 px-2 py-1 text-[11px] font-medium text-white/72 shadow-lg shadow-black/20 backdrop-blur-sm">
+          {activeInterval}
+        </span>
+        <span className={`rounded-md border px-2 py-1 text-[11px] font-semibold shadow-lg shadow-black/20 backdrop-blur-sm ${spotMarketStatusBadgeClass(klineStatus.kind)}`}>
+          {klineStatus.label}
+        </span>
+      </div>
       <div
         id={containerId}
         ref={containerRef}
