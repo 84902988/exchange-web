@@ -519,6 +519,8 @@ def _endpoint_request(provider_code: str, endpoint_type: str, provider_symbol: s
         if endpoint == "funding":
             return "/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1}
     if code == PROVIDER_OKX_SPOT:
+        if endpoint == "instrument":
+            return "/api/v5/public/instruments", {"instType": "SPOT", "instId": symbol}
         if endpoint == "ticker":
             return "/api/v5/market/ticker", {"instId": symbol}
         if endpoint == "depth":
@@ -530,6 +532,8 @@ def _endpoint_request(provider_code: str, endpoint_type: str, provider_symbol: s
         if endpoint == "trades":
             return "/api/v5/market/trades", {"instId": symbol, "limit": min(safe_limit, 500)}
     if code == PROVIDER_BITGET_SPOT:
+        if endpoint == "instrument":
+            return "/api/v2/spot/public/symbols", {"symbol": symbol}
         if endpoint == "ticker":
             return "/api/v2/spot/market/tickers", {"symbol": symbol}
         if endpoint == "depth":
@@ -539,6 +543,8 @@ def _endpoint_request(provider_code: str, endpoint_type: str, provider_symbol: s
         if endpoint == "trades":
             return "/api/v2/spot/market/fills", {"symbol": symbol, "limit": min(safe_limit, 100)}
     if code == PROVIDER_BINANCE_SPOT:
+        if endpoint == "instrument":
+            return "/api/v3/exchangeInfo", {"symbol": symbol}
         if endpoint == "ticker":
             return "/api/v3/ticker/24hr", {"symbol": symbol}
         if endpoint == "depth":

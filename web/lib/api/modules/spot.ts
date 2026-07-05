@@ -64,6 +64,11 @@ export type SpotDepthLevel = {
 export type SpotDepthResponse = {
   symbol: string
   price_precision?: number
+  price_tick_size?: string | number | null
+  tick_size?: string | number | null
+  display_price_precision?: number | string | null
+  price_precision_source?: string | null
+  price_precision_provider?: string | null
   amount_precision?: number
   bids: SpotDepthLevel[]
   asks: SpotDepthLevel[]
@@ -121,6 +126,11 @@ export type SpotMarketView = {
   ticker_volume?: string | number | null
   ticker_quote_volume?: string | number | null
   price_precision?: number | string | null
+  price_tick_size?: string | number | null
+  tick_size?: string | number | null
+  display_price_precision?: number | string | null
+  price_precision_source?: string | null
+  price_precision_provider?: string | null
   amount_precision?: number | string | null
   best_bid?: string | number | null
   best_ask?: string | number | null
@@ -198,6 +208,11 @@ export type SpotMarketTickerItem = {
   base_volume_24h?: string | number
   quote_volume_24h?: string | number
   price_precision?: number | string | null
+  price_tick_size?: string | number | null
+  tick_size?: string | number | null
+  display_price_precision?: number | string | null
+  price_precision_source?: string | null
+  price_precision_provider?: string | null
   amount_precision?: number | string | null
   asset_type?: string | null
   market_category?: string | null
@@ -243,6 +258,11 @@ export type SpotMarketPairItem = {
   market_session_type?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string | null
   price_precision?: number | string | null
+  price_tick_size?: string | number | null
+  tick_size?: string | number | null
+  display_price_precision?: number | string | null
+  price_precision_source?: string | null
+  price_precision_provider?: string | null
   amount_precision?: number | string | null
   status?: number | string | null
   [key: string]: unknown

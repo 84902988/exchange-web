@@ -54,6 +54,27 @@ def _int_or_none(value: Any) -> Optional[int]:
     return None
 
 
+def _precision_from_tick_size(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        tick = Decimal(str(value).strip())
+    except Exception:
+        return None
+    if tick <= 0:
+        return None
+    return min(max(0, -int(tick.normalize().as_tuple().exponent)), 12)
+
+
+def _tick_size_from_precision(precision: Optional[int]) -> Optional[str]:
+    normalized = _int_or_none(precision)
+    if normalized is None:
+        return None
+    if normalized <= 0:
+        return "1"
+    return "0." + ("0" * (normalized - 1)) + "1"
+
+
 def _best_price(depth: Optional[DepthResponse], side: str) -> Optional[str]:
     levels = getattr(depth, side, None) or []
     if not levels:
@@ -223,6 +244,10 @@ def build_empty_spot_market_view(*, symbol: str, warnings: Optional[list[str]] =
         "ticker_volume": None,
         "ticker_quote_volume": None,
         "price_precision": None,
+        "price_tick_size": None,
+        "display_price_precision": 2,
+        "price_precision_source": "FALLBACK",
+        "price_precision_provider": None,
         "amount_precision": None,
         "best_bid": None,
         "best_ask": None,
@@ -262,6 +287,10 @@ def build_empty_spot_market_view(*, symbol: str, warnings: Optional[list[str]] =
             "kline_source": "UNKNOWN",
             "kline_freshness": "UNKNOWN",
             "price_precision": None,
+            "price_tick_size": None,
+            "display_price_precision": 2,
+            "price_precision_source": "FALLBACK",
+            "price_precision_provider": None,
             "amount_precision": None,
         },
         "ticker": None,
@@ -365,7 +394,44 @@ def get_spot_market_view(
         _int_or_none(getattr(depth, "amount_precision", None))
         or _int_or_none(ticker.get("amount_precision"))
     )
-    orderbook_mid_price = _orderbook_mid_price(best_bid, best_ask, price_precision)
+    ticker_price_tick_size = ticker.get("price_tick_size") or ticker.get("tick_size")
+    depth_price_tick_size = getattr(depth, "price_tick_size", None) or getattr(depth, "tick_size", None)
+    ticker_display_precision = _int_or_none(ticker.get("display_price_precision"))
+    depth_display_precision = _int_or_none(getattr(depth, "display_price_precision", None))
+    display_price_precision = next(
+        (
+            item
+            for item in (
+                ticker_display_precision,
+                _precision_from_tick_size(ticker_price_tick_size),
+                depth_display_precision,
+                _precision_from_tick_size(depth_price_tick_size),
+                price_precision,
+                2,
+            )
+            if item is not None
+        ),
+        2,
+    )
+    price_tick_size_value = next(
+        (
+            item
+            for item in (ticker_price_tick_size, depth_price_tick_size, _tick_size_from_precision(display_price_precision))
+            if item not in (None, "")
+        ),
+        None,
+    )
+    price_tick_size = _to_str(price_tick_size_value)
+    price_precision_source = (
+        ticker.get("price_precision_source")
+        or getattr(depth, "price_precision_source", None)
+        or ("TRADING_PAIR" if price_precision is not None else "FALLBACK")
+    )
+    price_precision_provider = (
+        ticker.get("price_precision_provider")
+        or getattr(depth, "price_precision_provider", None)
+    )
+    orderbook_mid_price = _orderbook_mid_price(best_bid, best_ask, display_price_precision)
     market_status = str(ticker.get("market_status") or "UNKNOWN").upper()
     has_depth = bool(best_bid and best_ask)
     has_trades = bool(getattr(trades, "trades", None))
@@ -423,6 +489,10 @@ def get_spot_market_view(
         "ticker_volume": ticker.get("base_volume_24h") or ticker.get("volume_24h"),
         "ticker_quote_volume": ticker.get("quote_volume_24h"),
         "price_precision": price_precision,
+        "price_tick_size": price_tick_size,
+        "display_price_precision": display_price_precision,
+        "price_precision_source": price_precision_source,
+        "price_precision_provider": price_precision_provider,
         "amount_precision": amount_precision,
         "best_bid": best_bid,
         "best_ask": best_ask,
@@ -466,6 +536,10 @@ def get_spot_market_view(
             "kline_interval": kline.get("interval") or SPOT_MARKET_VIEW_KLINE_INTERVAL,
             "kline_error": str(kline_error) if kline_error else None,
             "price_precision": price_precision,
+            "price_tick_size": price_tick_size,
+            "display_price_precision": display_price_precision,
+            "price_precision_source": price_precision_source,
+            "price_precision_provider": price_precision_provider,
             "amount_precision": amount_precision,
         },
         "ticker": ticker or None,

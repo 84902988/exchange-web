@@ -19,6 +19,10 @@ import { readSharedMarketsRowsCache } from '@/lib/marketCache';
 import { readContractQuoteCache } from '@/lib/contractMarketCache';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import {
+  formatSpotPrice,
+  resolveSpotPricePrecision,
+} from './spotPricePrecision';
 
 type MarketLayerTab = 'favorites' | 'crypto' | 'stock' | 'cfd';
 type ToolbarPageType = 'spot' | 'contract';
@@ -79,7 +83,9 @@ export interface GlobalMarketSelectorPair {
   marketSessionType?: string | null;
   quoteFreshness?: string | null;
   tpSlTriggerPriceType?: 'MARK_PRICE' | 'LAST_PRICE' | string | null;
+  displayPricePrecision?: number | null;
   pricePrecision?: number | null;
+  priceTickSize?: string | number | null;
   amountPrecision?: number | null;
   maxLeverage?: number | null;
 }
@@ -405,12 +411,15 @@ function getPairChangeValue(pair: GlobalMarketSelectorPair): string | number | n
   return pair.change24h ?? pair.percentChange24h ?? pair.priceChangePercent;
 }
 
-function formatPrice(value?: string | number | null): string {
+function formatPrice(value?: string | number | null, pair?: GlobalMarketSelectorPair | null): string {
   const num = Number(value);
   if (!Number.isFinite(num) || num <= 0) return '--';
-  if (num >= 1000) return num.toLocaleString('en-US', { maximumFractionDigits: 2 });
-  if (num >= 1) return num.toLocaleString('en-US', { maximumFractionDigits: 4 });
-  return num.toLocaleString('en-US', { maximumFractionDigits: 8 });
+  const pricePrecision = resolveSpotPricePrecision({
+    displayPricePrecision: pair?.displayPricePrecision,
+    pricePrecision: pair?.pricePrecision,
+    priceTickSize: pair?.priceTickSize,
+  });
+  return formatSpotPrice(num, pricePrecision);
 }
 
 function hasValidTickerNumber(value?: string | number | null, options: { positiveOnly?: boolean } = {}): boolean {
@@ -499,6 +508,12 @@ function buildSharedMarketSelectorPair(
       (category === 'STOCK' && !isContract ? 'STOCK_QUOTE' : isContract && category === 'CRYPTO' ? 'CONTRACT' : category),
   );
   const displaySymbol = String(row.display_symbol || row.display_name || '').trim();
+  const rowPrecision = row as MarketTickerItem & {
+    price_tick_size?: string | number | null;
+    tick_size?: string | number | null;
+    display_price_precision?: string | number | null;
+    displayPricePrecision?: string | number | null;
+  };
   const tickerFields = options.includeTicker
     ? {
         price: optionalTickerValue(row.last_price ?? row.price),
@@ -529,7 +544,11 @@ function buildSharedMarketSelectorPair(
     displayCategory: typeof row.display_category === 'string' ? row.display_category : null,
     displayGroup: typeof row.display_group === 'string' ? row.display_group : null,
     sourceSymbol: getMarketRowTickerSymbol(row) || symbol,
+    displayPricePrecision: parseOptionalPrecision(
+      rowPrecision.display_price_precision ?? rowPrecision.displayPricePrecision,
+    ),
     pricePrecision: parseOptionalPrecision(row.price_precision),
+    priceTickSize: rowPrecision.price_tick_size ?? rowPrecision.tick_size ?? null,
     amountPrecision: parseOptionalPrecision(row.amount_precision),
     ...tickerFields,
   };
@@ -597,7 +616,9 @@ function buildGlobalMarketSelectorPair(
     marketTradingHours: item.market_trading_hours,
     marketSessionType: item.market_session_type,
     quoteFreshness: item.quote_freshness,
+    displayPricePrecision: parseOptionalPrecision(item.display_price_precision),
     pricePrecision: parseOptionalPrecision(item.price_precision),
+    priceTickSize: item.price_tick_size ?? item.tick_size ?? null,
     amountPrecision: parseOptionalPrecision(item.amount_precision),
   };
 }
@@ -1877,7 +1898,7 @@ export default function GlobalMarketSelector({
                   const priceText =
                     contractTickerLoading && !hasValidTickerNumber(pair.price, { positiveOnly: true })
                       ? t('loading', 'markets')
-                      : formatPrice(pair.price);
+                      : formatPrice(pair.price, pair);
                   const changeText =
                     contractTickerLoading && !hasValidTickerNumber(changeValue)
                       ? t('loading', 'markets')

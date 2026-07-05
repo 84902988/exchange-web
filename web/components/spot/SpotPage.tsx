@@ -22,14 +22,14 @@ import {
   type SpotMarketTickerItem,
   type SpotMarketView,
 } from '@/lib/api/modules/spot';
-import {
-  DEFAULT_PRICE_PRECISION,
-  formatPrice,
-  formatRawPrice,
-  getSpotSymbolPricePrecision,
-} from '@/lib/marketPrecision';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import { useSpotMarket } from './useSpotMarket';
+import {
+  formatSpotPrice,
+  normalizeSpotPriceInput,
+  normalizeSpotPricePrecision,
+  resolveSpotPricePrecision,
+} from './spotPricePrecision';
 
 interface SpotHeaderMarketData {
   change: string;
@@ -76,18 +76,21 @@ function getPairQueryKey(query: SpotPairQuery): string {
 }
 
 function formatPriceBySymbol(symbol: string, value: string, precision?: number | null): string {
+  void symbol;
   if (!value || value === '--') return '';
   const num = Number(value);
   if (!Number.isFinite(num)) return '';
-  return formatPrice(num, precision ?? getSpotSymbolPricePrecision(symbol) ?? DEFAULT_PRICE_PRECISION);
+  const formatted = formatSpotPrice(num, precision ?? undefined);
+  return formatted === '--' ? '' : formatted;
 }
 
 function formatOrderInputPriceBySymbol(symbol: string, value: string, precision?: number | null): string {
+  void symbol;
   if (!value || value === '--') return '';
   const normalizedValue = String(value).replace(/,/g, '');
   const num = Number(normalizedValue);
   if (!Number.isFinite(num)) return '';
-  return formatRawPrice(num, precision ?? getSpotSymbolPricePrecision(symbol) ?? DEFAULT_PRICE_PRECISION);
+  return normalizeSpotPriceInput(num, precision ?? undefined);
 }
 
 function formatSignedPercent(value: number): string {
@@ -115,29 +118,7 @@ function formatCompactMetric(value: string | number | null | undefined): string 
 }
 
 function parseOptionalPrecision(value: unknown): number | null {
-  const nextValue = Number(value);
-  if (Number.isInteger(nextValue) && nextValue >= 0 && nextValue <= 12) {
-    return nextValue;
-  }
-  return null;
-}
-
-function resolveSpotPricePrecision(
-  symbol: string,
-  configuredPrecision?: number | null,
-  pairPrecision?: number | null,
-): number {
-  const configured = parseOptionalPrecision(configuredPrecision);
-  if (configured !== null) {
-    return configured;
-  }
-
-  const pair = parseOptionalPrecision(pairPrecision);
-  if (pair !== null) {
-    return pair;
-  }
-
-  return getSpotSymbolPricePrecision(symbol) ?? DEFAULT_PRICE_PRECISION;
+  return normalizeSpotPricePrecision(value);
 }
 
 type RightPanelTab = 'orderbook' | 'trades';
@@ -172,7 +153,9 @@ type SpotPairOption = {
   volume24h?: string | number | null;
   baseVolume24h?: string | number | null;
   quoteVolume24h?: string | number | null;
+  displayPricePrecision?: number | null;
   pricePrecision?: number | null;
+  priceTickSize?: string | number | null;
   amountPrecision?: number | null;
   marketStatus?: string | null;
   marketStatusText?: string | null;
@@ -197,6 +180,25 @@ function findSpotPairBySymbol(pairs: SpotPairOption[], value?: string | null): S
   if (exact) return exact;
   const symbolKey = normalizeSpotSymbolKey(symbolValue);
   return pairs.find((item) => normalizeSpotSymbolKey(item.symbol) === symbolKey) || null;
+}
+
+function getSpotTickSizeValue(
+  value?: {
+    price_tick_size?: string | number | null;
+    tick_size?: string | number | null;
+    priceTickSize?: string | number | null;
+  } | null,
+): string | number | null {
+  return value?.price_tick_size ?? value?.priceTickSize ?? value?.tick_size ?? null;
+}
+
+function getSpotDisplayPricePrecision(
+  value?: {
+    display_price_precision?: unknown;
+    displayPricePrecision?: unknown;
+  } | null,
+): number | null {
+  return parseOptionalPrecision(value?.display_price_precision ?? value?.displayPricePrecision);
 }
 
 function resolveSpotAssetSymbols(
@@ -313,7 +315,13 @@ function buildSpotPairOption(item: SpotMarketTickerItem | SpotMarketPairItem): S
     volume24h: (item as SpotMarketTickerItem).volume_24h,
     baseVolume24h: (item as SpotMarketTickerItem).base_volume_24h ?? (item as SpotMarketTickerItem).volume_24h,
     quoteVolume24h: (item as SpotMarketTickerItem).quote_volume_24h,
+    displayPricePrecision: parseOptionalPrecision(
+      (item as SpotMarketTickerItem | SpotMarketPairItem).display_price_precision,
+    ),
     pricePrecision: parseOptionalPrecision(item.price_precision),
+    priceTickSize: (item as SpotMarketTickerItem | SpotMarketPairItem).price_tick_size ??
+      (item as SpotMarketTickerItem | SpotMarketPairItem).tick_size ??
+      null,
     amountPrecision: parseOptionalPrecision(item.amount_precision),
     marketStatus: (item as SpotMarketTickerItem).market_status,
     marketStatusText: (item as SpotMarketTickerItem).market_status_text,
@@ -414,7 +422,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
   const accountBalancesLoadedRef = useRef(false);
-  const [configuredPricePrecision, setConfiguredPricePrecision] = useState<number | null>(null);
   const [pairQuery, setPairQuery] = useState<SpotPairQuery>(() => getInitialPairQuery(initialCategory));
   const initialPairCache = cachedSpotPairPages.get(getPairQueryKey(getInitialPairQuery(initialCategory)));
   const [pairOptions, setPairOptions] = useState<SpotPairOption[]>(initialPairCache?.items || []);
@@ -429,6 +436,35 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const pairQueryRef = useRef(pairQuery);
   const pairRequestIdRef = useRef(0);
   const [headerTicker, setHeaderTicker] = useState<SpotPairOption | null>(null);
+  const selectedPair = useMemo(() => findSpotPairBySymbol(pairOptions, symbol), [pairOptions, symbol]);
+  const selectedTicker = useMemo(() => {
+    const normalizedSymbol = normalizeSpotApiSymbol(symbol);
+    if (normalizeSpotApiSymbol(headerTicker?.symbol) === normalizedSymbol) {
+      return headerTicker;
+    }
+    return selectedPair;
+  }, [headerTicker, selectedPair, symbol]);
+  const selectedDisplayPricePrecision = useMemo(() => {
+    const normalizedSymbol = normalizeSpotApiSymbol(symbol);
+    const viewPrecision = getSpotDisplayPricePrecision(spotMarket.marketView);
+    if (viewPrecision !== null) {
+      return viewPrecision;
+    }
+    const depthPrecision = getSpotDisplayPricePrecision(spotMarket.depth);
+    if (depthPrecision !== null) {
+      return depthPrecision;
+    }
+    if (headerTicker && normalizeSpotApiSymbol(headerTicker.symbol) === normalizedSymbol) {
+      return headerTicker.displayPricePrecision ?? null;
+    }
+    return findSpotPairBySymbol(pairOptions, normalizedSymbol)?.displayPricePrecision ?? null;
+  }, [
+    headerTicker,
+    pairOptions,
+    spotMarket.depth,
+    spotMarket.marketView,
+    symbol,
+  ]);
   const selectedPairPrecision = useMemo(() => {
     const normalizedSymbol = normalizeSpotApiSymbol(symbol);
     const viewPrecision = parseOptionalPrecision(spotMarket.marketView?.price_precision);
@@ -455,8 +491,18 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     }
     return findSpotPairBySymbol(pairOptions, normalizedSymbol)?.amountPrecision ?? null;
   }, [headerTicker, pairOptions, spotMarket.depth?.amount_precision, spotMarket.marketView?.amount_precision, symbol]);
-  const pricePrecision =
-    resolveSpotPricePrecision(symbol, configuredPricePrecision, selectedPairPrecision);
+  const selectedPriceTickSize = useMemo(() => (
+    getSpotTickSizeValue(spotMarket.marketView) ??
+    getSpotTickSizeValue(spotMarket.depth) ??
+    getSpotTickSizeValue(selectedTicker) ??
+    getSpotTickSizeValue(selectedPair)
+  ), [selectedPair, selectedTicker, spotMarket.depth, spotMarket.marketView]);
+  const pricePrecision = resolveSpotPricePrecision({
+    displayPricePrecision: selectedDisplayPricePrecision,
+    priceTickSize: selectedPriceTickSize,
+    pricePrecision: selectedPairPrecision,
+    fallbackPrecision: selectedPairPrecision,
+  });
 
   const toolbarPairs = useMemo(() => pairOptions, [pairOptions]);
   const toolbarSymbols = useMemo(
@@ -470,14 +516,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       ) as Record<string, string>,
     [toolbarPairs],
   );
-  const selectedPair = useMemo(() => findSpotPairBySymbol(pairOptions, symbol), [pairOptions, symbol]);
-  const selectedTicker = useMemo(() => {
-    const normalizedSymbol = normalizeSpotApiSymbol(symbol);
-    if (normalizeSpotApiSymbol(headerTicker?.symbol) === normalizedSymbol) {
-      return headerTicker;
-    }
-    return selectedPair;
-  }, [headerTicker, selectedPair, symbol]);
   const spotAssetSymbols = useMemo(
     () => resolveSpotAssetSymbols(symbol, selectedTicker || selectedPair),
     [selectedPair, selectedTicker, symbol],
@@ -514,17 +552,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
   useEffect(() => {
     setOrderPrice('');
-    setConfiguredPricePrecision(null);
   }, [symbol]);
-
-  useEffect(() => {
-    const nextPricePrecision =
-      parseOptionalPrecision(spotMarket.marketView?.price_precision) ??
-      parseOptionalPrecision(spotMarket.depth?.price_precision);
-    if (nextPricePrecision !== null) {
-      setConfiguredPricePrecision(nextPricePrecision);
-    }
-  }, [spotMarket.depth?.price_precision, spotMarket.marketView?.price_precision]);
 
   useEffect(() => {
     const nextSymbol = normalizeSpotApiSymbol(initialSymbol);

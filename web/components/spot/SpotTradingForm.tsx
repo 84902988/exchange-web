@@ -24,6 +24,10 @@ import {
   resolveSpotMarketStatus,
   spotMarketStatusBadgeClass,
 } from './spotMarketStatus';
+import {
+  getSpotPriceStep,
+  normalizeSpotPriceInput,
+} from './spotPricePrecision';
 
 interface SpotTradingFormProps {
   symbol: string;
@@ -293,10 +297,6 @@ function writeSpotConfirmHiddenForUser(userId: number | string | null | undefine
   writeLocalStorageFlag(key, value);
 }
 
-function getPriceStep(precision: number): number {
-  return 1 / Math.pow(10, precision);
-}
-
 function normalizeDecimalInput(value: string): string | null {
   if (!/^\d*\.?\d*$/.test(value)) {
     return null;
@@ -336,7 +336,7 @@ function formatDecimal(value: string | number, precision: number): string {
 }
 
 function formatPrice(value: string | number, precision: number): string {
-  return formatDecimal(value, precision);
+  return normalizeSpotPriceInput(value, precision);
 }
 
 function formatLatestTradeTime(value?: number | null): string {
@@ -1236,18 +1236,26 @@ export default function SpotTradingForm({
   };
 
   const handlePriceStep = (direction: 'up' | 'down') => {
-    const step = getPriceStep(pricePrecision);
+    const step = Number(getSpotPriceStep(pricePrecision));
     const current = Number(price || marketPrice || 0);
     const safeCurrent = Number.isFinite(current) ? current : 0;
 
     const next =
       direction === 'up' ? safeCurrent + step : Math.max(safeCurrent - step, 0);
 
-    const formatted = next.toFixed(pricePrecision);
+    const formatted = normalizeSpotPriceInput(next, pricePrecision);
     setPrice(formatted);
     syncPriceToParent(formatted);
     setSelectedPercent(null);
     setPriceError('');
+  };
+
+  const handlePriceStepPointerDown = (
+    event: React.PointerEvent<HTMLButtonElement>,
+    direction: 'up' | 'down',
+  ) => {
+    event.preventDefault();
+    handlePriceStep(direction);
   };
 
   const handleAmountChange = (value: string) => {
@@ -1785,7 +1793,7 @@ export default function SpotTradingForm({
     <div className="tabular-nums space-y-1 xl:space-y-1.5">
       <div
         className={
-          isLoggedIn || isAuthChecking ? '' : 'pointer-events-none cursor-not-allowed opacity-50'
+          isLoggedIn || isAuthChecking ? '' : 'opacity-50'
         }
       >
         <div className="grid grid-cols-2 rounded-xl border border-white/[0.06] bg-[#0b1016] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] xl:p-1">
@@ -1883,16 +1891,20 @@ export default function SpotTradingForm({
                 <div className="absolute right-2 top-1/2 flex -translate-y-1/2 flex-col">
                   <button
                     type="button"
-                    onClick={() => handlePriceStep('up')}
-                    className="flex h-4 w-6 items-center justify-center rounded text-[10px] text-white/42 transition-colors hover:bg-white/[0.06] hover:text-white"
+                    onPointerDown={(event) => handlePriceStepPointerDown(event, 'up')}
+                    onClick={(event) => event.preventDefault()}
+                    aria-label={copy.increasePrice}
+                    className="relative z-10 flex h-4 w-6 items-center justify-center rounded text-[10px] text-white/42 transition-colors hover:bg-white/[0.06] hover:text-white"
                     title={copy.increasePrice}
                   >
                     +
                   </button>
                   <button
                     type="button"
-                    onClick={() => handlePriceStep('down')}
-                    className="mt-0.5 flex h-4 w-6 items-center justify-center rounded text-[10px] text-white/42 transition-colors hover:bg-white/[0.06] hover:text-white"
+                    onPointerDown={(event) => handlePriceStepPointerDown(event, 'down')}
+                    onClick={(event) => event.preventDefault()}
+                    aria-label={copy.decreasePrice}
+                    className="relative z-10 mt-0.5 flex h-4 w-6 items-center justify-center rounded text-[10px] text-white/42 transition-colors hover:bg-white/[0.06] hover:text-white"
                     title={copy.decreasePrice}
                   >
                     -

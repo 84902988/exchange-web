@@ -2047,6 +2047,32 @@ def test_internal_pair_does_not_use_live_ws_klines() -> None:
         market.request_contract_market_provider_json = original_request_json
 
 
+def test_okx_spot_precision_metadata_uses_tick_size() -> None:
+    metadata = market._spot_provider_precision_metadata_from_payload(
+        "OKX_SPOT",
+        {"data": [{"instId": "BTC-USDT", "tickSz": "0.1"}]},
+    )
+
+    assert metadata is not None
+    assert metadata["price_tick_size"] == "0.1"
+    assert metadata["display_price_precision"] == 1
+    assert metadata["price_precision_source"] == "PROVIDER_TICK_SIZE"
+    assert metadata["price_precision_provider"] == "OKX_SPOT"
+
+
+def test_bitget_spot_precision_metadata_uses_price_precision() -> None:
+    metadata = market._spot_provider_precision_metadata_from_payload(
+        "BITGET_SPOT",
+        {"data": [{"symbol": "BTCUSDT", "pricePrecision": "2"}]},
+    )
+
+    assert metadata is not None
+    assert metadata["price_tick_size"] == "0.01"
+    assert metadata["display_price_precision"] == 2
+    assert metadata["price_precision_source"] == "PROVIDER_TICK_SIZE"
+    assert metadata["price_precision_provider"] == "BITGET_SPOT"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
