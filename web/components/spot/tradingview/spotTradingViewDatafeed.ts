@@ -304,6 +304,16 @@ function klinePayloadToBar(payload: unknown): TradingViewBar | null {
   return klineToBar(payload as SpotMarketKlineItem);
 }
 
+function normalizeHistoryBars(items: SpotMarketKlineItem[] | undefined): TradingViewBar[] {
+  const byTime = new Map<number, TradingViewBar>();
+  for (const item of items || []) {
+    const bar = klineToBar(item);
+    if (!bar) continue;
+    byTime.set(bar.time, bar);
+  }
+  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+}
+
 function buildSymbolInfo(options: SpotTradingViewDatafeedOptions): TradingViewLibrarySymbolInfo {
   const symbol = normalizeSpotSymbol(options.symbol);
   const description = String(options.displaySymbol || '').trim() || symbol;
@@ -359,13 +369,32 @@ export function createSpotTradingViewDatafeed(
   const latestKlineSourceByKey = new Map<string, string>();
   const lastEmittedBarTimeByUid = new Map<string, number>();
   const lastDroppedRealtimeBarByUid = new Map<string, string>();
+  const activeSubscriptionKeyByUid = new Map<string, string>();
+  const historyReadyByLatestBarKey = new Map<string, boolean>();
+  const historyRequestSeqByLatestBarKey = new Map<string, number>();
   const unsubscribeByUid = new Map<string, () => void>();
 
   const getLatestBarKey = (resolution: TradingViewResolution | string) =>
     `${apiSymbol}:${normalizeResolution(resolution)}`;
 
+  const getSubscriptionKey = (interval: string, subscriberUid: string) =>
+    `${apiSymbol}:${interval}:${subscriberUid}`;
+
   const getTradeBucketKey = (latestBarKey: string, bucketTime: number) =>
     `${latestBarKey}:${bucketTime}`;
+
+  const syncLastEmittedAfterHistory = (latestBarKey: string, latestBarTime: number) => {
+    if (!latestBarTime) return;
+
+    for (const [subscriberUid, subscriberLatestBarKey] of Array.from(latestBarKeyByUid.entries())) {
+      if (subscriberLatestBarKey !== latestBarKey) continue;
+
+      const previous = lastEmittedBarTimeByUid.get(subscriberUid) || 0;
+      if (latestBarTime > previous) {
+        lastEmittedBarTimeByUid.set(subscriberUid, latestBarTime);
+      }
+    }
+  };
 
   const clearTradeBucketState = (latestBarKey: string) => {
     const prefix = `${latestBarKey}:`;
@@ -638,6 +667,12 @@ export function createSpotTradingViewDatafeed(
         requestedEndTime > 0 &&
         requestedEndTime < Date.now() - intervalMs;
       const endTime = isHistoricalPage ? requestedEndTime : undefined;
+      const latestBarKey = getLatestBarKey(requestResolution);
+      const historyRequestSeq = (historyRequestSeqByLatestBarKey.get(latestBarKey) || 0) + 1;
+      historyRequestSeqByLatestBarKey.set(latestBarKey, historyRequestSeq);
+      if (periodParams.firstDataRequest !== false) {
+        historyReadyByLatestBarKey.set(latestBarKey, false);
+      }
 
       void getSpotKlines({
         symbol: apiSymbol,
@@ -646,15 +681,28 @@ export function createSpotTradingViewDatafeed(
         endTime,
       })
         .then((payload) => {
-          const bars = (payload.items || [])
-            .map(klineToBar)
-            .filter((item): item is TradingViewBar => Boolean(item))
-            .sort((a, b) => a.time - b.time);
+          if (historyRequestSeqByLatestBarKey.get(latestBarKey) !== historyRequestSeq) {
+            onHistory([], { noData: true });
+            return;
+          }
 
-          const latestBarKey = getLatestBarKey(requestResolution);
+          const bars = normalizeHistoryBars(payload.items);
           const latestBar = bars[bars.length - 1] || null;
+          const currentLatestBeforeHistory = latestBars.get(latestBarKey);
+          if (
+            periodParams.firstDataRequest !== false &&
+            latestBar &&
+            currentLatestBeforeHistory &&
+            latestBar.time <= currentLatestBeforeHistory.time
+          ) {
+            historyReadyByLatestBarKey.set(latestBarKey, true);
+            onHistory([], { noData: true });
+            return;
+          }
+
           if (latestBar) {
             latestBars.set(latestBarKey, latestBar);
+            syncLastEmittedAfterHistory(latestBarKey, latestBar.time);
           }
           const historyProvider = normalizeProvider(payload.provider);
           const historySource = normalizeSource(payload.source);
@@ -669,10 +717,17 @@ export function createSpotTradingViewDatafeed(
           pruneTradeBucketState(latestBarKey, (latestBar?.time || 0) - intervalMs);
 
           options.onKlineLoadStateChange?.(bars.length > 0 ? 'loaded' : 'empty');
+          historyReadyByLatestBarKey.set(latestBarKey, true);
           onHistory(bars, { noData: bars.length === 0 });
         })
         .catch((err: unknown) => {
+          if (historyRequestSeqByLatestBarKey.get(latestBarKey) !== historyRequestSeq) {
+            onHistory([], { noData: true });
+            return;
+          }
+
           options.onKlineLoadStateChange?.('error');
+          historyReadyByLatestBarKey.set(latestBarKey, true);
           onError(err instanceof Error ? err.message : 'Failed to load spot history');
         });
     },
@@ -685,11 +740,22 @@ export function createSpotTradingViewDatafeed(
       const interval = tradingViewResolutionToSpotInterval(requestResolution);
       const intervalMs = getSpotIntervalMs(interval);
       const latestBarKey = getLatestBarKey(requestResolution);
+      const subscriptionKey = getSubscriptionKey(interval, subscriberUid);
+      const isCurrentSubscription = () =>
+        activeSubscriptionKeyByUid.get(subscriberUid) === subscriptionKey &&
+        latestBarKeyByUid.get(subscriberUid) === latestBarKey;
+
+      if (!historyReadyByLatestBarKey.has(latestBarKey)) {
+        historyReadyByLatestBarKey.set(latestBarKey, false);
+      }
+      activeSubscriptionKeyByUid.set(subscriberUid, subscriptionKey);
       lastEmittedBarTimeByUid.set(subscriberUid, latestBars.get(latestBarKey)?.time || 0);
       latestBarKeyByUid.set(subscriberUid, latestBarKey);
 
       const emitRealtimeBar: EmitRealtimeBar = (bar, reason) => {
-        if (latestBarKeyByUid.get(subscriberUid) !== latestBarKey) return false;
+        if (!isCurrentSubscription()) return false;
+        if (historyReadyByLatestBarKey.get(latestBarKey) === false) return false;
+        if (!Number.isFinite(bar.time) || bar.time <= 0) return false;
 
         const lastEmittedTime = lastEmittedBarTimeByUid.get(subscriberUid) || 0;
         if (bar.time < lastEmittedTime) {
@@ -718,6 +784,8 @@ export function createSpotTradingViewDatafeed(
       };
 
       const handleKline = (realtimeMessage: SpotMarketRealtimeMessage) => {
+        if (!isCurrentSubscription()) return;
+
         const message = realtimeMessage as SpotMarketKlineMessage;
         if (message.type !== 'spot_kline_update') return;
 
@@ -764,6 +832,8 @@ export function createSpotTradingViewDatafeed(
       };
 
       const handleTrade = (realtimeMessage: SpotMarketRealtimeMessage) => {
+        if (!isCurrentSubscription()) return;
+
         const message = realtimeMessage as SpotMarketTradeMessage;
         if (message.type !== 'spot_trade') return;
 
@@ -792,6 +862,7 @@ export function createSpotTradingViewDatafeed(
 
         const latestBar = latestBars.get(latestBarKey);
         if (!latestBar || bucketTime < latestBar.time) return;
+        if (bucketTime > latestBar.time + intervalMs) return;
         const lastEmittedTime = lastEmittedBarTimeByUid.get(subscriberUid) || 0;
         if (bucketTime < lastEmittedTime) return;
 
@@ -856,11 +927,14 @@ export function createSpotTradingViewDatafeed(
         backfillStateByLatestBarKey.delete(latestBarKey);
         latestKlineProviderByKey.delete(latestBarKey);
         latestKlineSourceByKey.delete(latestBarKey);
+        historyReadyByLatestBarKey.delete(latestBarKey);
+        historyRequestSeqByLatestBarKey.delete(latestBarKey);
         clearTradeBucketState(latestBarKey);
       }
       lastEmittedBarTimeByUid.delete(subscriberUid);
       lastDroppedRealtimeBarByUid.delete(subscriberUid);
       latestBarKeyByUid.delete(subscriberUid);
+      activeSubscriptionKeyByUid.delete(subscriberUid);
     },
 
     destroy() {
@@ -874,8 +948,11 @@ export function createSpotTradingViewDatafeed(
       backfillStateByLatestBarKey.clear();
       latestKlineProviderByKey.clear();
       latestKlineSourceByKey.clear();
+      historyReadyByLatestBarKey.clear();
+      historyRequestSeqByLatestBarKey.clear();
       lastEmittedBarTimeByUid.clear();
       lastDroppedRealtimeBarByUid.clear();
+      activeSubscriptionKeyByUid.clear();
       tradeBucketStateByKey.clear();
     },
   };

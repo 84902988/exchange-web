@@ -57,22 +57,38 @@ export function resolveSpotMarketStatus(input: SpotMarketStatusInput): SpotMarke
 
   if (input.isLoading && !source && !freshness) {
     kind = 'loading';
-  } else if (LOADING_VALUES.has(source) || LOADING_VALUES.has(freshness)) {
-    kind = 'loading';
-  } else if (UNAVAILABLE_VALUES.has(source) || UNAVAILABLE_VALUES.has(freshness)) {
-    kind = 'unavailable';
-  } else if (source === 'STALE' || freshness === 'STALE') {
-    kind = 'stale';
-  } else if (INTERNAL_VALUES.has(source) || INTERNAL_VALUES.has(freshness) || INTERNAL_VALUES.has(dataSource)) {
+  } else if (source && !UNKNOWN_VALUES.has(source)) {
+    if (LOADING_VALUES.has(source)) {
+      kind = 'loading';
+    } else if (UNAVAILABLE_VALUES.has(source)) {
+      kind = 'unavailable';
+    } else if (source === 'STALE') {
+      kind = 'stale';
+    } else if (INTERNAL_VALUES.has(source)) {
+      kind = 'internal';
+    } else if (FALLBACK_VALUES.has(source)) {
+      kind = 'fallback';
+    } else if (source === 'LIVE_WS') {
+      kind = 'live';
+    } else if (SNAPSHOT_VALUES.has(source)) {
+      kind = 'snapshot';
+    }
+  } else if (INTERNAL_VALUES.has(dataSource)) {
     kind = 'internal';
-  } else if (FALLBACK_VALUES.has(source) || FALLBACK_VALUES.has(freshness)) {
-    kind = 'fallback';
-  } else if (source === 'LIVE_WS' && (!freshness || freshness === 'LIVE')) {
-    kind = 'live';
-  } else if (SNAPSHOT_VALUES.has(source) || SNAPSHOT_VALUES.has(freshness)) {
-    kind = 'snapshot';
-  } else if (freshness === 'LIVE') {
-    kind = 'live';
+  } else if (freshness && !UNKNOWN_VALUES.has(freshness)) {
+    if (LOADING_VALUES.has(freshness)) {
+      kind = 'loading';
+    } else if (UNAVAILABLE_VALUES.has(freshness)) {
+      kind = 'unavailable';
+    } else if (freshness === 'STALE') {
+      kind = 'stale';
+    } else if (INTERNAL_VALUES.has(freshness)) {
+      kind = 'internal';
+    } else if (FALLBACK_VALUES.has(freshness)) {
+      kind = 'fallback';
+    } else if (SNAPSHOT_VALUES.has(freshness) || freshness === 'LIVE' || freshness === 'RECENT') {
+      kind = 'snapshot';
+    }
   }
 
   return {
