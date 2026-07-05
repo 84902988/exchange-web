@@ -7,6 +7,10 @@ import {
 } from '@/lib/api/modules/spot'
 import { formatPrice as formatMarketPrice } from '@/lib/marketPrecision'
 import { formatSpotDisplaySymbol } from './spotFormat'
+import {
+  resolveSpotMarketStatus,
+  spotMarketStatusBadgeClass,
+} from './spotMarketStatus'
 
 type Props = {
   symbol: string
@@ -14,6 +18,9 @@ type Props = {
   limit?: number
   pricePrecision: number
   trades?: SpotMarketTradeItem[]
+  tradesSource?: string | null
+  tradesFreshness?: string | null
+  dataSource?: string | null
   isLoading?: boolean
   onPriceClick?: (price: string) => void
 }
@@ -79,6 +86,9 @@ export default function SpotTradesHistory({
   limit = 20,
   pricePrecision,
   trades = [],
+  tradesSource,
+  tradesFreshness,
+  dataSource,
   isLoading = false,
   onPriceClick,
 }: Props) {
@@ -104,13 +114,27 @@ export default function SpotTradesHistory({
 
   const { base, quote } = splitSymbol(symbol)
   const hasTrades = data.length > 0
+  const tradesStatus = useMemo(
+    () => resolveSpotMarketStatus({
+      source: tradesSource,
+      freshness: tradesFreshness,
+      dataSource,
+      isLoading,
+    }),
+    [dataSource, isLoading, tradesFreshness, tradesSource],
+  )
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d]">
-      <div className="flex items-center justify-between border-b border-white/[0.06] bg-[#10151b]/70 px-2.5 py-2">
-        <div className="text-[13px] font-medium text-white/88">{t('spotMarketTrades', 'asset')}</div>
-        <div className="rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/40">
-          {displaySymbol || formatSpotDisplaySymbol(symbol)}
+      <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] bg-[#10151b]/70 px-2.5 py-2">
+        <div className="min-w-0 text-[13px] font-medium text-white/88">{t('spotMarketTrades', 'asset')}</div>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${spotMarketStatusBadgeClass(tradesStatus.kind)}`}>
+            {tradesStatus.label}
+          </span>
+          <span className="rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/40">
+            {displaySymbol || formatSpotDisplaySymbol(symbol)}
+          </span>
         </div>
       </div>
 

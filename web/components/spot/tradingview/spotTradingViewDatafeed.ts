@@ -13,7 +13,7 @@ import {
   type SpotMarketTradeMessage,
 } from '@/services/marketRealtime';
 import { normalizeTimeToSeconds } from '../chart/chart.utils';
-import type { SpotChartProps } from '../chart/chart.types';
+import type { SpotChartProps, SpotKlineLoadState } from '../chart/chart.types';
 
 type TradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D';
 
@@ -129,6 +129,7 @@ type SpotTradingViewDatafeedOptions = Pick<
   'symbol' | 'displaySymbol' | 'pricePrecision' | 'amountPrecision'
 > & {
   onKlineGap?: (event: SpotTradingViewKlineGapEvent) => void;
+  onKlineLoadStateChange?: (state: SpotKlineLoadState) => void;
 };
 
 type KlineGapState = {
@@ -667,9 +668,11 @@ export function createSpotTradingViewDatafeed(
           backfillStateByLatestBarKey.delete(latestBarKey);
           pruneTradeBucketState(latestBarKey, (latestBar?.time || 0) - intervalMs);
 
+          options.onKlineLoadStateChange?.(bars.length > 0 ? 'loaded' : 'empty');
           onHistory(bars, { noData: bars.length === 0 });
         })
         .catch((err: unknown) => {
+          options.onKlineLoadStateChange?.('error');
           onError(err instanceof Error ? err.message : 'Failed to load spot history');
         });
     },

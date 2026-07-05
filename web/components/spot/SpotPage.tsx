@@ -866,6 +866,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const priceDirection = spotMarket.priceDirection;
   const spotMarketStatus = spotMarket.marketView?.market_status || selectedPair?.marketStatus || 'OPEN';
   const spotMarketDataSource = spotMarket.marketView?.data_source || marketFeedDataSource;
+  const spotSources = spotMarket.sources;
+  const spotFreshness = spotMarket.freshness;
   const spotTickerFreshness = spotMarket.freshness.ticker;
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
   const chartInterval = chartMode === 'time' ? '1m' : interval;
@@ -896,7 +898,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         priceDirection={priceDirection}
         marketStatus={spotMarketStatus}
         quoteFreshness={null}
+        tickerSource={spotSources.ticker}
         tickerFreshness={spotTickerFreshness}
+        dataSource={spotMarketDataSource}
+        isLoading={spotMarket.isLoading}
         marketSessionType={spotMarketSessionType}
       />
 
@@ -932,6 +937,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                       interval={chartInterval}
                       chartMode={chartMode}
                       dataSource={spotMarketDataSource}
+                      klineSource={spotSources.kline}
+                      klineFreshness={spotFreshness.kline}
+                      isLoading={spotMarket.isLoading}
                       latestPrice={spotLastPrice}
                       latestTradeOrTickerPrice={null}
                       priceDirection={priceDirection}
@@ -984,6 +992,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                         bids={spotDepthBids}
                         bestAsk={spotMarket.bestAsk}
                         bestBid={spotMarket.bestBid}
+                        depthSource={spotSources.depth}
+                        depthFreshness={spotFreshness.depth}
+                        dataSource={spotMarketDataSource}
                         isLoading={spotMarket.isLoading}
                         onPriceClick={handleOrderBookPriceClick}
                       />
@@ -995,6 +1006,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                         displaySymbol={currentDisplaySymbol}
                         pricePrecision={pricePrecision}
                         trades={spotMarket.trades}
+                        tradesSource={spotSources.trades}
+                        tradesFreshness={spotFreshness.trades}
+                        dataSource={spotMarketDataSource}
                         isLoading={spotMarket.isLoading}
                         onPriceClick={handleOrderBookPriceClick}
                       />
@@ -1031,6 +1045,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     accountBalances={accountBalances}
                     asks={spotDepthAsks}
                     bids={spotDepthBids}
+                    depthSource={spotSources.depth}
+                    depthFreshness={spotFreshness.depth}
+                    dataSource={spotMarketDataSource}
+                    marketDataLoading={spotMarket.isLoading}
                     onPriceChange={setOrderPrice}
                     onOrderSuccess={handleOrderSuccess}
                     isLoggedIn={isLoggedIn}

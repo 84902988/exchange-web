@@ -5,12 +5,17 @@ import type {
 } from 'lightweight-charts';
 import type { RealtimePriceDirection } from '../spotTickerColor';
 
+export type SpotKlineLoadState = 'loading' | 'loaded' | 'empty' | 'error';
+
 export interface SpotChartProps {
   symbol: string;
   displaySymbol?: string | null;
   interval: string;
   height?: number;
   dataSource?: string | null;
+  klineSource?: string | null;
+  klineFreshness?: string | null;
+  isLoading?: boolean;
   latestPrice?: string | number | null;
   latestTradeOrTickerPrice?: string | number | null;
   priceDirection?: RealtimePriceDirection;

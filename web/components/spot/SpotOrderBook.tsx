@@ -12,6 +12,10 @@ import {
   getTickerDirectionTextClass,
   type PriceDirection,
 } from './spotTickerColor';
+import {
+  resolveSpotMarketStatus,
+  spotMarketStatusBadgeClass,
+} from './spotMarketStatus';
 
 type SpotOrderBookProps = {
   symbol: string;
@@ -23,6 +27,9 @@ type SpotOrderBookProps = {
   bids?: SpotDepthLevel[];
   bestAsk?: string | number | null;
   bestBid?: string | number | null;
+  depthSource?: string | null;
+  depthFreshness?: string | null;
+  dataSource?: string | null;
   isLoading?: boolean;
   onPriceClick?: (price: string) => void;
 };
@@ -79,6 +86,9 @@ export default function SpotOrderBook({
   pricePrecision,
   asks: propAsks = [],
   bids: propBids = [],
+  depthSource,
+  depthFreshness,
+  dataSource,
   isLoading = false,
   onPriceClick,
 }: SpotOrderBookProps) {
@@ -97,13 +107,27 @@ export default function SpotOrderBook({
 
   const hasDepth = askRows.length > 0 || bidRows.length > 0;
   const referencePriceClass = getTickerDirectionTextClass(priceDirection);
+  const depthStatus = useMemo(
+    () => resolveSpotMarketStatus({
+      source: depthSource,
+      freshness: depthFreshness,
+      dataSource,
+      isLoading,
+    }),
+    [dataSource, depthFreshness, depthSource, isLoading],
+  );
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="text-[13px] font-medium text-white/88">{t('spotOrderBook', 'asset')}</div>
-        <div className="rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/42">
-          {displaySymbol || formatSpotDisplaySymbol(symbol)}
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="min-w-0 text-[13px] font-medium text-white/88">{t('spotOrderBook', 'asset')}</div>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${spotMarketStatusBadgeClass(depthStatus.kind)}`}>
+            {depthStatus.label}
+          </span>
+          <span className="rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/42">
+            {displaySymbol || formatSpotDisplaySymbol(symbol)}
+          </span>
         </div>
       </div>
 

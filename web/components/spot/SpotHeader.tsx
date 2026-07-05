@@ -9,6 +9,10 @@ import {
   getTickerDirectionTextClass,
   type PriceDirection,
 } from './spotTickerColor';
+import {
+  resolveSpotMarketStatus,
+  spotMarketStatusBadgeClass,
+} from './spotMarketStatus';
 
 interface SpotHeaderProps {
   symbol: string;
@@ -22,7 +26,10 @@ interface SpotHeaderProps {
   priceDirection?: PriceDirection;
   marketStatus?: string | null;
   quoteFreshness?: string | null;
+  tickerSource?: string | null;
   tickerFreshness?: string | null;
+  dataSource?: string | null;
+  isLoading?: boolean;
   marketSessionType?: string | null;
 }
 
@@ -38,7 +45,10 @@ export default function SpotHeader({
   priceDirection = 'flat',
   marketStatus,
   quoteFreshness,
+  tickerSource,
   tickerFreshness,
+  dataSource,
+  isLoading = false,
   marketSessionType,
 }: SpotHeaderProps) {
   const { t } = useLocaleContext();
@@ -71,16 +81,15 @@ export default function SpotHeader({
     if (isChangeDown) return 'text-[#f6465d]';
     return 'text-white';
   }, [isChangeUp, isChangeDown]);
-  const tickerFreshnessLabel = useMemo(() => {
-    const freshness = String(tickerFreshness || '').toUpperCase();
-    if (freshness === 'LAST_GOOD' || freshness === 'LAST_VALID' || freshness === 'FALLBACK') {
-      return t('market.session.cachedQuote', 'markets');
-    }
-    if (freshness === 'STALE') {
-      return t('market.session.delayedQuote', 'markets');
-    }
-    return '';
-  }, [t, tickerFreshness]);
+  const tickerStatus = useMemo(
+    () => resolveSpotMarketStatus({
+      source: tickerSource,
+      freshness: tickerFreshness,
+      dataSource,
+      isLoading,
+    }),
+    [dataSource, isLoading, tickerFreshness, tickerSource],
+  );
 
   return (
     <div className="tabular-nums border-b border-white/[0.06] bg-[#11161d] px-3 py-2 shadow-[inset_0_-1px_0_rgba(255,255,255,0.02)]">
@@ -94,14 +103,12 @@ export default function SpotHeader({
               marketSessionType={marketSessionType}
               className="ml-2"
             />
-            {tickerFreshnessLabel ? (
-              <span
-                className="ml-2 rounded-full border border-white/10 bg-white/[0.03] px-2 py-0.5 text-[11px] font-semibold text-white/45"
-                title={tickerFreshnessLabel}
-              >
-                {tickerFreshnessLabel}
-              </span>
-            ) : null}
+            <span
+              className={`ml-2 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${spotMarketStatusBadgeClass(tickerStatus.kind)}`}
+              title={`Ticker ${tickerStatus.label}`}
+            >
+              {tickerStatus.label}
+            </span>
           </div>
           <div
             className={`inline-flex w-fit items-center rounded-lg px-2 py-0.5 text-[30px] font-semibold leading-none transition-all duration-200 ${priceColorClass} ${priceFlashClass} ${
