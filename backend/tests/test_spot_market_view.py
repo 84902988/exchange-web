@@ -6,9 +6,15 @@ from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesRespon
 from app.services import spot_market_view
 
 
-def _depth(source: str = "LIVE_WS", provider: str | None = "OKX_SPOT") -> DepthResponse:
+def _depth(
+    source: str = "LIVE_WS",
+    provider: str | None = "OKX_SPOT",
+    *,
+    price_precision: int = 2,
+) -> DepthResponse:
     return DepthResponse(
         symbol="BTCUSDT",
+        price_precision=price_precision,
         bids=[DepthItem(price="2", amount="1")],
         asks=[DepthItem(price="3", amount="1")],
         ts=1000,
@@ -50,6 +56,11 @@ def _ticker(
     *,
     source: str = "LIVE_WS",
     provider: str | None = "OKX_SPOT",
+    price_precision: int | None = 2,
+    price_tick_size: str | None = None,
+    display_price_precision: int | None = None,
+    price_precision_source: str | None = None,
+    price_precision_provider: str | None = None,
 ) -> list[dict[str, Any]]:
     return [
         {
@@ -62,7 +73,11 @@ def _ticker(
             "low_24h": "2",
             "base_volume_24h": "10",
             "quote_volume_24h": "25",
-            "price_precision": 2,
+            "price_precision": price_precision,
+            "price_tick_size": price_tick_size,
+            "display_price_precision": display_price_precision,
+            "price_precision_source": price_precision_source,
+            "price_precision_provider": price_precision_provider,
             "amount_precision": 3,
             "source": source,
             "provider": provider,
@@ -172,6 +187,72 @@ def test_spot_market_view_trades_fresh_ws_stays_live_ws() -> None:
     assert view["trades_source"] == "LIVE_WS"
     assert view["trades_freshness"] == "LIVE"
     assert view["raw_source_summary"]["trades_source"] == "LIVE_WS"
+
+
+def test_spot_market_view_exposes_okx_price_tick_size_metadata() -> None:
+    view = _run_view(
+        tickers=_ticker(
+            price_tick_size="0.1",
+            display_price_precision=1,
+            price_precision_source="PROVIDER_TICK_SIZE",
+            price_precision_provider="OKX_SPOT",
+        )
+    )
+
+    assert view["price_tick_size"] == "0.1"
+    assert view["display_price_precision"] == 1
+    assert view["price_precision_source"] == "PROVIDER_TICK_SIZE"
+    assert view["price_precision_provider"] == "OKX_SPOT"
+    assert view["raw_source_summary"]["display_price_precision"] == 1
+
+
+def test_spot_market_view_exposes_bitget_price_precision_metadata() -> None:
+    view = _run_view(
+        tickers=_ticker(
+            provider="BITGET_SPOT",
+            price_tick_size="0.01",
+            display_price_precision=2,
+            price_precision_source="PROVIDER_TICK_SIZE",
+            price_precision_provider="BITGET_SPOT",
+        )
+    )
+
+    assert view["price_tick_size"] == "0.01"
+    assert view["display_price_precision"] == 2
+    assert view["price_precision_source"] == "PROVIDER_TICK_SIZE"
+    assert view["price_precision_provider"] == "BITGET_SPOT"
+
+
+def test_spot_market_view_internal_price_precision_uses_trading_pair_metadata() -> None:
+    view = _run_view(
+        symbol="MFCUSDT",
+        depth=_depth(source="INTERNAL", provider=None),
+        trades=_trades("MFCUSDT", source=None, freshness=None, provider=None),
+        tickers=_ticker(
+            "MFCUSDT",
+            source="INTERNAL",
+            provider=None,
+            price_precision=3,
+            price_tick_size="0.001",
+            display_price_precision=3,
+            price_precision_source="TRADING_PAIR",
+            price_precision_provider="INTERNAL",
+        ),
+        kline=_kline("MFCUSDT", source="INTERNAL", freshness="RECENT", provider=None),
+    )
+
+    assert view["display_price_precision"] == 3
+    assert view["price_tick_size"] == "0.001"
+    assert view["price_precision_source"] == "TRADING_PAIR"
+    assert view["price_precision_provider"] == "INTERNAL"
+
+
+def test_spot_market_view_precision_missing_falls_back_to_price_precision() -> None:
+    view = _run_view(depth=_depth(price_precision=4), tickers=_ticker(price_precision=4))
+
+    assert view["display_price_precision"] == 4
+    assert view["price_tick_size"] == "0.0001"
+    assert view["price_precision_source"] == "TRADING_PAIR"
 
 
 def test_spot_market_view_requests_default_kline_interval_without_cursor() -> None:

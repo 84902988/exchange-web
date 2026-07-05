@@ -92,6 +92,18 @@ _SPOT_PROVIDER_LOG_THROTTLE_SECONDS = 60
 _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS = 2500
 _SPOT_PROVIDER_FAST_TIMEOUT_CAP_MS = 800
 _SPOT_KLINE_FAST_TIMEOUT_CAP_MS = 1200
+_SPOT_PRICE_PRECISION_METADATA_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+_SPOT_PRICE_PRECISION_METADATA_MISS_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+_SPOT_PRICE_PRECISION_METADATA_TTL_SECONDS = 1800
+_SPOT_PRICE_PRECISION_METADATA_MISS_TTL_SECONDS = 60
+_SPOT_DISPLAY_PRICE_PRECISION_FALLBACK = 2
+_SPOT_DISPLAY_PRICE_PRECISION_MAX = 12
+_SPOT_PRICE_PRECISION_PAYLOAD_KEYS = {
+    "price_tick_size",
+    "display_price_precision",
+    "price_precision_source",
+    "price_precision_provider",
+}
 _INTERVAL_SECONDS = {
     "1m": 60,
     "5m": 300,
@@ -271,6 +283,7 @@ def _format_depth_for_pair(pair: TradingPair, depth: DepthResponse, limit: Optio
         {
             "symbol": pair.symbol,
             "price_precision": int(getattr(pair, "price_precision", 8) or 8),
+            **_spot_pair_price_precision_metadata(pair),
             "amount_precision": int(getattr(pair, "amount_precision", 8) or 8),
             "bids": adapt(getattr(depth, "bids", [])),
             "asks": adapt(getattr(depth, "asks", [])),
@@ -615,11 +628,13 @@ def _is_hot(pair: TradingPair) -> bool:
 
 
 def _ticker_metadata(pair: TradingPair) -> Dict[str, Any]:
+    price_precision_metadata = _spot_pair_price_precision_metadata(pair)
     return {
         "display_symbol": _display_symbol(pair),
         "base_asset": _asset_symbol(getattr(pair, "base_asset", None)),
         "quote_asset": _asset_symbol(getattr(pair, "quote_asset", None)),
         "price_precision": int(getattr(pair, "price_precision", 8) or 8),
+        **price_precision_metadata,
         "amount_precision": int(getattr(pair, "amount_precision", 8) or 8),
         "asset_type": _normalize_asset_type(pair),
         "data_source": _normalize_data_source(pair),
@@ -645,7 +660,11 @@ def _ticker_to_dict(ticker: TickerItem) -> Dict[str, Any]:
 
 
 def _with_pair_metadata(ticker: TickerItem, pair: TradingPair) -> TickerItem:
-    data = {**_ticker_to_dict(ticker), **_ticker_metadata(pair)}
+    ticker_data = _ticker_to_dict(ticker)
+    data = {**ticker_data, **_ticker_metadata(pair)}
+    for key in _SPOT_PRICE_PRECISION_PAYLOAD_KEYS:
+        if ticker_data.get(key) not in (None, ""):
+            data[key] = ticker_data.get(key)
     data.update(_market_status_payload_for_pair(pair))
     data["quote_freshness"] = data.get("quote_freshness") or _quote_freshness(
         str(data.get("source") or ""),
@@ -995,11 +1014,20 @@ def get_depth(db: Session, symbol: str, limit: int = 20, *, fast: bool = False) 
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        ws_provider_code = _primary_spot_ws_provider_code(db, pair, domain="depth")
-        if ws_provider_code:
+        ws_provider = _primary_spot_market_provider_for_pair(db, pair)
+        ws_provider_code = (
+            str(ws_provider.provider_code or "").strip().upper()
+            if ws_provider is not None
+            else None
+        )
+        if ws_provider_code and spot_provider_ws_supports_provider(ws_provider_code, domain="depth"):
             live_depth = get_spot_provider_ws_depth(pair.symbol, provider=ws_provider_code, limit=limit)
             if live_depth is not None:
-                return _format_depth_for_pair(pair, live_depth, limit=limit)
+                formatted_depth = _format_depth_for_pair(pair, live_depth, limit=limit)
+                return _apply_spot_depth_price_precision_metadata(
+                    formatted_depth,
+                    _spot_provider_price_precision_metadata(db, pair, ws_provider),
+                )
         return _get_external_spot_depth(db, pair, limit=limit, fast=fast)
 
     internal_depth = _get_internal_depth(db, pair, limit=limit)
@@ -1144,6 +1172,166 @@ def _spot_provider_request_config(
     if timeout_ms == int(provider.timeout_ms or 0):
         return provider
     return replace(provider, timeout_ms=timeout_ms)
+
+
+def _normalize_spot_price_precision(value: Any) -> Optional[int]:
+    try:
+        precision = int(value)
+    except Exception:
+        return None
+    if 0 <= precision <= _SPOT_DISPLAY_PRICE_PRECISION_MAX:
+        return precision
+    return None
+
+
+def _precision_from_tick_size(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        tick = Decimal(str(value).strip())
+    except Exception:
+        return None
+    if tick <= 0:
+        return None
+    exponent = tick.normalize().as_tuple().exponent
+    precision = max(0, -int(exponent))
+    return min(precision, _SPOT_DISPLAY_PRICE_PRECISION_MAX)
+
+
+def _tick_size_from_precision(precision: Optional[int]) -> Optional[str]:
+    normalized = _normalize_spot_price_precision(precision)
+    if normalized is None:
+        return None
+    if normalized <= 0:
+        return "1"
+    return "0." + ("0" * (normalized - 1)) + "1"
+
+
+def _spot_pair_price_precision_metadata(pair: TradingPair) -> Dict[str, Any]:
+    precision = _normalize_spot_price_precision(getattr(pair, "price_precision", None))
+    source = "TRADING_PAIR"
+    if precision is None:
+        precision = _SPOT_DISPLAY_PRICE_PRECISION_FALLBACK
+        source = "FALLBACK"
+    provider = "INTERNAL" if _normalize_data_source(pair) == DATA_SOURCE_INTERNAL else None
+    return {
+        "price_tick_size": _tick_size_from_precision(precision),
+        "display_price_precision": precision,
+        "price_precision_source": source,
+        "price_precision_provider": provider,
+    }
+
+
+def _spot_provider_precision_metadata_from_payload(
+    provider_code: str,
+    payload: Any,
+) -> Optional[Dict[str, Any]]:
+    code = str(provider_code or "").strip().upper()
+    tick_size: Any = None
+    precision: Optional[int] = None
+
+    if code == PROVIDER_OKX_SPOT:
+        row = _spot_provider_first_row(payload)
+        tick_size = row.get("tickSz")
+    elif code == PROVIDER_BITGET_SPOT:
+        row = _spot_provider_first_row(payload)
+        tick_size = row.get("tickSize") or row.get("priceTick") or row.get("priceStep")
+        precision = _normalize_spot_price_precision(row.get("pricePrecision"))
+    elif code == PROVIDER_BINANCE_SPOT and isinstance(payload, dict):
+        filters = payload.get("filters")
+        if isinstance(filters, list):
+            price_filter = next(
+                (
+                    item
+                    for item in filters
+                    if isinstance(item, dict) and item.get("filterType") == "PRICE_FILTER"
+                ),
+                None,
+            )
+            if isinstance(price_filter, dict):
+                tick_size = price_filter.get("tickSize")
+
+    tick_precision = _precision_from_tick_size(tick_size)
+    display_precision = tick_precision if tick_precision is not None else precision
+    if display_precision is None:
+        return None
+
+    return {
+        "price_tick_size": str(tick_size) if tick_size not in (None, "") else _tick_size_from_precision(display_precision),
+        "display_price_precision": display_precision,
+        "price_precision_source": "PROVIDER_TICK_SIZE",
+        "price_precision_provider": code,
+    }
+
+
+def _spot_provider_price_precision_metadata(
+    db: Session,
+    pair: TradingPair,
+    provider: Optional[MarketDataProviderConfig],
+) -> Dict[str, Any]:
+    fallback = _spot_pair_price_precision_metadata(pair)
+    if provider is None:
+        return fallback
+
+    provider_code = str(getattr(provider, "provider_code", "") or "").strip().upper()
+    if provider_code not in {PROVIDER_OKX_SPOT, PROVIDER_BITGET_SPOT, PROVIDER_BINANCE_SPOT}:
+        return fallback
+
+    try:
+        provider_symbol = _spot_provider_symbol(db, pair, provider)
+    except Exception:
+        provider_symbol = _external_symbol(pair)
+    cache_key = (provider_code, str(provider_symbol or "").strip().upper())
+    now = time.monotonic()
+    cached = _SPOT_PRICE_PRECISION_METADATA_CACHE.get(cache_key)
+    if cached and now - cached[0] <= _SPOT_PRICE_PRECISION_METADATA_TTL_SECONDS:
+        return dict(cached[1])
+    miss_cached = _SPOT_PRICE_PRECISION_METADATA_MISS_CACHE.get(cache_key)
+    if miss_cached and now - miss_cached[0] <= _SPOT_PRICE_PRECISION_METADATA_MISS_TTL_SECONDS:
+        return dict(miss_cached[1])
+
+    metadata = fallback
+    try:
+        payload = request_contract_market_provider_json(
+            _spot_provider_request_config(provider, timeout_cap_ms=_SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS),
+            "instrument",
+            provider_symbol,
+            limit=1,
+        )
+        parsed = _spot_provider_precision_metadata_from_payload(provider_code, payload)
+        if parsed is not None:
+            metadata = parsed
+            _SPOT_PRICE_PRECISION_METADATA_CACHE[cache_key] = (now, dict(metadata))
+            _SPOT_PRICE_PRECISION_METADATA_MISS_CACHE.pop(cache_key, None)
+            return dict(metadata)
+    except Exception as exc:
+        logger.debug(
+            "spot_provider_precision_metadata_unavailable symbol=%s provider=%s reason=%s",
+            getattr(pair, "symbol", None),
+            provider_code,
+            exc,
+        )
+
+    _SPOT_PRICE_PRECISION_METADATA_MISS_CACHE[cache_key] = (now, dict(metadata))
+    return dict(metadata)
+
+
+def _apply_spot_price_precision_metadata(
+    ticker: TickerItem,
+    metadata: Dict[str, Any],
+) -> TickerItem:
+    data = _ticker_to_dict(ticker)
+    data.update({key: metadata.get(key) for key in _SPOT_PRICE_PRECISION_PAYLOAD_KEYS})
+    return TickerItem(**data)
+
+
+def _apply_spot_depth_price_precision_metadata(
+    depth: DepthResponse,
+    metadata: Dict[str, Any],
+) -> DepthResponse:
+    data = depth.model_dump() if hasattr(depth, "model_dump") else depth.dict()
+    data.update({key: metadata.get(key) for key in _SPOT_PRICE_PRECISION_PAYLOAD_KEYS})
+    return DepthResponse(**data)
 
 
 def _spot_interval_value(provider_code: str, interval: str) -> str:
@@ -1518,6 +1706,10 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = Fa
             if live_record is not None:
                 live_ticker = _spot_provider_ws_ticker_to_item(pair, live_record)
                 if live_ticker is not None:
+                    live_ticker = _apply_spot_price_precision_metadata(
+                        live_ticker,
+                        _spot_provider_price_precision_metadata(db, pair, primary_provider),
+                    )
                     _SPOT_LAST_GOOD_TICKERS[pair.symbol] = live_ticker
                     return live_ticker
     except Exception as exc:
@@ -1534,6 +1726,10 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = Fa
                 limit=1,
             )
             ticker = _spot_ticker_from_provider(pair=pair, provider_code=provider.provider_code, payload=payload)
+            ticker = _apply_spot_price_precision_metadata(
+                ticker,
+                _spot_provider_price_precision_metadata(db, pair, provider),
+            )
             _SPOT_LAST_GOOD_TICKERS[pair.symbol] = ticker
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
             return ticker
@@ -1577,6 +1773,10 @@ def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20, *,
                 limit=limit,
             )
             depth = _spot_depth_from_provider(pair=pair, provider_code=provider.provider_code, payload=payload, limit=limit)
+            depth = _apply_spot_depth_price_precision_metadata(
+                depth,
+                _spot_provider_price_precision_metadata(db, pair, provider),
+            )
             _SPOT_LAST_GOOD_DEPTHS[pair.symbol] = depth
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
             return depth
@@ -2352,6 +2552,7 @@ def get_market_tickers(
         if ticker is None:
             ticker = _get_internal_ticker(db, pair, internal_stats)
 
+        ticker_data = _ticker_to_dict(ticker)
         item = {
             "symbol": pair.symbol,
             "last_price": ticker.last_price,
@@ -2371,6 +2572,9 @@ def get_market_tickers(
             "ts": ticker.ts,
             **_ticker_metadata(pair),
         }
+        for key in _SPOT_PRICE_PRECISION_PAYLOAD_KEYS:
+            if ticker_data.get(key) not in (None, ""):
+                item[key] = ticker_data.get(key)
         item.update(_market_status_payload_for_pair(pair))
         item["quote_freshness"] = item.get("quote_freshness") or _quote_freshness(
             str(item.get("source") or ""),

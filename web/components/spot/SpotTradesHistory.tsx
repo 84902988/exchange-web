@@ -5,8 +5,8 @@ import { useLocaleContext } from '@/contexts/LocaleContext'
 import {
   type SpotMarketTradeItem,
 } from '@/lib/api/modules/spot'
-import { formatPrice as formatMarketPrice } from '@/lib/marketPrecision'
 import { formatSpotDisplaySymbol } from './spotFormat'
+import { formatSpotPrice } from './spotPricePrecision'
 import {
   resolveSpotMarketStatus,
   spotMarketStatusBadgeClass,
@@ -33,7 +33,7 @@ function toNumber(value: string | number | undefined | null): number {
 function formatPrice(value: string | number | undefined | null, precision: number) {
   const n = Number(value)
   if (!Number.isFinite(n)) return '--'
-  return formatMarketPrice(n, precision)
+  return formatSpotPrice(n, precision)
 }
 
 function formatAmount(value: string | number | undefined | null) {

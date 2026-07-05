@@ -10,6 +10,10 @@ class DepthItem(BaseModel):
 class DepthResponse(BaseModel):
     symbol: str
     price_precision: int = 8
+    price_tick_size: Optional[str] = None
+    display_price_precision: Optional[int] = None
+    price_precision_source: Optional[str] = None
+    price_precision_provider: Optional[str] = None
     amount_precision: int = 8
     bids: List[DepthItem]
     asks: List[DepthItem]
@@ -99,6 +103,10 @@ class TickerItem(BaseModel):
     low_24h: str = "0"
     quote_volume_24h: str = "0"
     price_precision: int = 8
+    price_tick_size: Optional[str] = None
+    display_price_precision: Optional[int] = None
+    price_precision_source: Optional[str] = None
+    price_precision_provider: Optional[str] = None
     amount_precision: int = 8
     source: Literal["internal", "binance", "itick", "external", "LIVE_WS"]
     provider: Optional[str] = None

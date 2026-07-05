@@ -6,8 +6,8 @@ import {
   type SpotDepthLevel,
 } from '@/lib/api/modules/spot';
 import { normalizeSide } from './orderbook/orderbook.utils';
-import { formatPrice } from '@/lib/marketPrecision';
 import { formatSpotDisplaySymbol } from './spotFormat';
+import { formatSpotPrice } from './spotPricePrecision';
 import {
   getTickerDirectionTextClass,
   type PriceDirection,
@@ -215,7 +215,7 @@ function BookRow({
         style={{ width: `${row.widthPercent}%` }}
       />
       <div className={`relative truncate px-0.5 text-left font-medium ${colorClass}`}>
-        {formatPrice(row.price, pricePrecision)}
+        {formatSpotPrice(row.price, pricePrecision)}
       </div>
       <div className="relative truncate px-0.5 text-center text-white/86">
         {formatBookAmount(row.amount)}
