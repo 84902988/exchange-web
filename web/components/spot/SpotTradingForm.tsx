@@ -39,6 +39,8 @@ interface SpotTradingFormProps {
   depthSource?: string | null;
   depthFreshness?: string | null;
   dataSource?: string | null;
+  latestTradePrice?: string | number | null;
+  latestTradeAt?: number | null;
   marketDataLoading?: boolean;
   onPriceChange?: (price: string) => void;
   priceSelectNonce?: number;
@@ -82,6 +84,7 @@ const SUMMARY_TINY_AMOUNT = 0.000001;
 const PERCENT_TICKS = new Set([0, 25, 50, 75, 100]);
 const SUCCESS_MESSAGE_DURATION_MS = 4000;
 const MIN_SUBMIT_LOADING_MS = 600;
+const LATEST_TRADE_LABEL = String.fromCharCode(26368, 26032, 25104, 20132);
 
 type SpotFormCopy = {
   buy: string
@@ -334,6 +337,15 @@ function formatDecimal(value: string | number, precision: number): string {
 
 function formatPrice(value: string | number, precision: number): string {
   return formatDecimal(value, precision);
+}
+
+function formatLatestTradeTime(value?: number | null): string {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return '';
+
+  return new Date(num).toLocaleTimeString('zh-CN', {
+    hour12: false,
+  });
 }
 
 function normalizePrecision(value: unknown, fallback: number): number {
@@ -713,6 +725,8 @@ export default function SpotTradingForm({
   depthSource,
   depthFreshness,
   dataSource,
+  latestTradePrice = null,
+  latestTradeAt = null,
   marketDataLoading = false,
   onPriceChange,
   priceSelectNonce = 0,
@@ -1541,6 +1555,11 @@ export default function SpotTradingForm({
   );
   const bboBasisLabel = getSpotBboBasisLabel(side);
   const bboAvailabilityLabel = getSpotBboAvailabilityLabel(bboStatus, Boolean(bboPrice));
+  const latestTradePriceDisplay =
+    latestTradePrice !== null && latestTradePrice !== undefined && String(latestTradePrice).trim() !== ''
+      ? String(latestTradePrice)
+      : '--';
+  const latestTradeTimeDisplay = formatLatestTradeTime(latestTradeAt);
 
   const handleSliderChange = (nextValue: number) => {
     const safeValue = clampPercentValue(nextValue);
@@ -1830,6 +1849,15 @@ export default function SpotTradingForm({
             <span className="min-w-0 truncate">{bboPrice || '--'}</span>
             <span className={bboStatus.isFresh && bboPrice ? 'text-emerald-200/78' : 'text-white/34'}>
               {bboAvailabilityLabel}
+            </span>
+          </div>
+          <div className="mt-1 flex min-w-0 items-center justify-between gap-2 text-white/36">
+            <span className="min-w-0 truncate">{LATEST_TRADE_LABEL}</span>
+            <span className="min-w-0 truncate text-right text-white/62">
+              {latestTradePriceDisplay}
+              {latestTradeTimeDisplay ? (
+                <span className="ml-1 text-white/34">{latestTradeTimeDisplay}</span>
+              ) : null}
             </span>
           </div>
         </div>
