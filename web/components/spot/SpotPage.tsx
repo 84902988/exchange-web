@@ -342,46 +342,6 @@ function parseBooleanFlag(value: unknown): boolean {
   return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
 }
 
-function isSpotLogoEligiblePair(pair: SpotPairOption | null | undefined): boolean {
-  if (!pair?.showSpotLogo || !pair.spotLogoUrl) return false;
-
-  const eligibleValues = new Set(['STOCK', 'RWA', 'STOCK_TOKEN']);
-  return [
-    pair.assetType,
-    pair.marketCategory,
-    pair.marketSubCategory,
-    pair.displayCategory,
-  ].some((value) => eligibleValues.has(normalizePairValue(value)));
-}
-
-function SpotLogoCard({
-  symbol,
-  pair,
-}: {
-  symbol: string;
-  pair: SpotPairOption | null;
-}) {
-  const logoUrl = String(pair?.spotLogoUrl || '').trim();
-  const [failedUrl, setFailedUrl] = useState('');
-  const shouldShow = isSpotLogoEligiblePair(pair) && logoUrl && failedUrl !== logoUrl;
-
-  if (!shouldShow) {
-    return null;
-  }
-
-  return (
-    <div className="spot-pair-logo-inline relative ml-3 hidden h-10 min-w-0 w-[clamp(120px,18vw,360px)] flex-[0_1_auto] items-center justify-start overflow-visible lg:flex">
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
-        src={logoUrl}
-        alt={symbol}
-        className="absolute left-0 top-1/2 block h-[clamp(40px,4.6vw,72px)] w-full -translate-y-1/2 object-contain object-left"
-        onError={() => setFailedUrl(logoUrl)}
-      />
-    </div>
-  );
-}
-
 function pairMatchesInitialCategory(pair: SpotPairOption, category?: string): boolean {
   const normalizedCategory = String(category || '').trim().toLowerCase();
   if (normalizedCategory === 'stock') {
@@ -969,195 +929,191 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
   return (
     <div className="flex flex-col overflow-x-hidden bg-[#0b0e11] text-white">
-      <SpotHeader
-        symbol={symbol}
-        displaySymbol={currentDisplaySymbol}
-        price={displayLatestPrice}
-        change={displayMarketHeaderData.change}
-        changeAmount={displayMarketHeaderData.changeAmount}
-        highLow={displayMarketHeaderData.highLow}
-        volume={displayMarketHeaderData.volume}
-        turnover={displayMarketHeaderData.turnover}
-        priceDirection={priceDirection}
-        marketStatus={spotMarketStatus}
-        quoteFreshness={null}
-        tickerSource={spotPriceStatusSource}
-        tickerFreshness={spotPriceStatusFreshness}
-        dataSource={spotMarketDataSource}
-        isLoading={spotMarket.isLoading}
-        marketSessionType={spotMarketSessionType}
-      />
-
       <div className="w-full px-2 py-2 xl:px-3 xl:py-2">
-        <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,10.55fr)_minmax(260px,1.85fr)] xl:items-start">
-          <div className="min-w-0">
-            <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,8.6fr)_minmax(240px,1.95fr)] xl:grid-rows-[minmax(540px,62vh)_auto]">
-              <div className="min-w-0 min-h-0 xl:col-start-1 xl:row-start-1">
-                <div className="flex h-full min-h-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
-                  <GlobalMarketSelector
-                    key={`spot-toolbar-${initialCategory || 'default'}`}
-                    symbol={symbol}
-                    interval={interval}
-                    chartMode={chartMode}
-                    symbols={toolbarSymbols}
-                    symbolLabels={symbolLabels}
-                    pairs={toolbarPairs}
-                    pairsLoading={pairOptionsLoading}
-                    pairsLoadingMore={pairOptionsLoadingMore}
-                    hasMorePairs={pairOptions.length < pairTotal}
-                    initialCategory={getToolbarInitialCategory(initialCategory)}
-                    onPairQueryChange={handlePairQueryChange}
-                    onLoadMorePairs={handleLoadMorePairs}
-                    onSymbolChange={handleSymbolChange}
-                    onIntervalChange={setIntervalValue}
-                    onChartModeChange={setChartMode}
-                    toolbarAddon={<SpotLogoCard symbol={symbol} pair={selectedTicker || selectedPair} />}
-                  />
-                  <div className="min-h-0 flex-1">
-                    <SpotTradingViewChart
-                      symbol={symbol}
-                      displaySymbol={currentDisplaySymbol}
-                      interval={interval}
-                      chartMode={chartMode}
-                      onIntervalChange={setIntervalValue}
-                      onChartModeChange={setChartMode}
-                      dataSource={spotMarketDataSource}
-                      klineSource={spotSources.kline}
-                      klineFreshness={spotFreshness.kline}
-                      isLoading={spotMarket.isLoading}
-                      latestPrice={spotLastPrice}
-                      latestTradeOrTickerPrice={null}
-                      priceDirection={priceDirection}
-                      pricePrecision={pricePrecision}
-                      amountPrecision={currentAmountPrecision}
-                      showRwaReference={showRwaReference}
-                    />
-                  </div>
-                </div>
-              </div>
+        <SpotHeader
+          symbol={symbol}
+          displaySymbol={currentDisplaySymbol}
+          price={displayLatestPrice}
+          change={displayMarketHeaderData.change}
+          changeAmount={displayMarketHeaderData.changeAmount}
+          highLow={displayMarketHeaderData.highLow}
+          volume={displayMarketHeaderData.volume}
+          turnover={displayMarketHeaderData.turnover}
+          priceDirection={priceDirection}
+          marketStatus={spotMarketStatus}
+          quoteFreshness={null}
+          tickerSource={spotPriceStatusSource}
+          tickerFreshness={spotPriceStatusFreshness}
+          dataSource={spotMarketDataSource}
+          isLoading={spotMarket.isLoading}
+          marketSessionType={spotMarketSessionType}
+          symbolSelector={
+            <GlobalMarketSelector
+              key={`spot-header-selector-${initialCategory || 'default'}`}
+              symbol={symbol}
+              interval={interval}
+              chartMode={chartMode}
+              symbols={toolbarSymbols}
+              symbolLabels={symbolLabels}
+              pairs={toolbarPairs}
+              pairsLoading={pairOptionsLoading}
+              pairsLoadingMore={pairOptionsLoadingMore}
+              hasMorePairs={pairOptions.length < pairTotal}
+              initialCategory={getToolbarInitialCategory(initialCategory)}
+              onPairQueryChange={handlePairQueryChange}
+              onLoadMorePairs={handleLoadMorePairs}
+              onSymbolChange={handleSymbolChange}
+              onIntervalChange={setIntervalValue}
+              onChartModeChange={setChartMode}
+              placement="header"
+            />
+          }
+        />
 
-              <div className="min-w-0 min-h-0 xl:col-start-2 xl:row-start-1">
-                <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
-                  <div className="shrink-0 border-b border-white/10 px-2.5 py-2">
-                    <div className="inline-flex rounded-md bg-[#0b0e11] p-1">
-                      <button
-                        type="button"
-                        onClick={() => setRightPanelTab('orderbook')}
-                        className={`rounded px-3 py-1.5 text-sm transition-colors ${
-                          rightPanelTab === 'orderbook'
-                            ? 'bg-white text-black'
-                            : 'text-white/65 hover:text-white'
-                        }`}
-                      >
-                        {t('spotOrderBook', 'asset')}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setRightPanelTab('trades')}
-                        className={`rounded px-3 py-1.5 text-sm transition-colors ${
-                          rightPanelTab === 'trades'
-                            ? 'bg-white text-black'
-                            : 'text-white/65 hover:text-white'
-                        }`}
-                      >
-                        {t('spotTrades', 'asset')}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="relative flex-1 min-h-0 min-w-0 overflow-hidden">
-                    <div className={rightPanelTab === 'orderbook' ? 'block h-full min-h-0 min-w-0' : 'hidden h-full min-h-0 min-w-0'}>
-                      <SpotOrderBook
-                        symbol={symbol}
-                        displaySymbol={currentDisplaySymbol}
-                        referencePrice={orderbookReferencePrice}
-                        pricePrecision={pricePrecision}
-                        priceDirection={priceDirection}
-                        asks={spotDepthAsks}
-                        bids={spotDepthBids}
-                        bestAsk={spotMarket.bestAsk}
-                        bestBid={spotMarket.bestBid}
-                        depthSource={spotSources.depth}
-                        depthFreshness={spotFreshness.depth}
-                        dataSource={spotMarketDataSource}
-                        isLoading={spotMarket.isLoading}
-                        onPriceClick={handleOrderBookPriceClick}
-                      />
-                    </div>
-
-                    <div className={rightPanelTab === 'trades' ? 'block h-full min-h-0 min-w-0' : 'hidden h-full min-h-0 min-w-0'}>
-                      <SpotTradesHistory
-                        symbol={symbol}
-                        displaySymbol={currentDisplaySymbol}
-                        pricePrecision={pricePrecision}
-                        trades={spotMarket.trades}
-                        tradesSource={spotSources.trades}
-                        tradesFreshness={spotFreshness.trades}
-                        dataSource={spotMarketDataSource}
-                        isLoading={spotMarket.isLoading}
-                        onPriceClick={handleOrderBookPriceClick}
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className="min-w-0 min-h-0 overflow-visible border border-white/10 bg-[#12161c] xl:col-span-2 xl:col-start-1 xl:row-start-2">
-                <SpotOrderTabs
+        <div className="mt-2 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,8.6fr)_minmax(240px,1.95fr)_minmax(260px,1.85fr)] xl:grid-rows-[minmax(540px,62vh)_minmax(170px,auto)] xl:items-stretch">
+          <div className="min-h-[420px] min-w-0 xl:col-start-1 xl:row-start-1 xl:min-h-0">
+            <div className="flex h-full min-h-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
+              <div className="min-h-0 flex-1">
+                <SpotTradingViewChart
                   symbol={symbol}
-                  refreshKey={refreshKey}
-                  onOrdersChanged={handleOrdersChanged}
-                  onLoadingChange={setOrdersLoading}
-                  onBalanceUpdate={handleAccountBalanceUpdate}
+                  displaySymbol={currentDisplaySymbol}
+                  interval={interval}
+                  chartMode={chartMode}
+                  onIntervalChange={setIntervalValue}
+                  onChartModeChange={setChartMode}
+                  dataSource={spotMarketDataSource}
+                  klineSource={spotSources.kline}
+                  klineFreshness={spotFreshness.kline}
+                  isLoading={spotMarket.isLoading}
+                  latestPrice={spotLastPrice}
+                  latestTradeOrTickerPrice={null}
+                  priceDirection={priceDirection}
+                  pricePrecision={pricePrecision}
+                  amountPrecision={currentAmountPrecision}
+                  showRwaReference={showRwaReference}
                 />
               </div>
             </div>
           </div>
 
-          <div className="min-w-0 xl:self-start">
-            <div className="flex flex-col gap-2 overflow-visible">
-              <div className="relative shrink-0 border border-white/10 bg-[#12161c] p-1.5 xl:p-2">
-                <div>
-                  <SpotTradingForm
-                    symbol={symbol}
-                    baseAsset={spotAssetSymbols.baseAsset}
-                    quoteAsset={spotAssetSymbols.quoteAsset}
-                    marketPrice={formMarketPrice}
-                    latestTradePrice={latestTradePriceText || null}
-                    latestTradeAt={spotMarket.lastTradeAt}
-                    selectedPrice={orderPrice}
-                    priceSelectNonce={orderPriceSelectNonce}
-                    pricePrecision={pricePrecision}
-                    amountPrecision={currentAmountPrecision}
-                    accountBalances={accountBalances}
-                    asks={spotDepthAsks}
-                    bids={spotDepthBids}
-                    depthSource={spotSources.depth}
-                    depthFreshness={spotFreshness.depth}
-                    dataSource={spotMarketDataSource}
-                    marketDataLoading={spotMarket.isLoading}
-                    onPriceChange={setOrderPrice}
-                    onOrderSuccess={handleOrderSuccess}
-                    isLoggedIn={isLoggedIn}
-                    authLoading={authLoading}
-                    authChecked={authChecked}
-                    userId={user?.id ?? null}
-                  />
+          <div className="min-w-0 min-h-0 xl:col-start-2 xl:row-start-1">
+            <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
+              <div className="shrink-0 border-b border-white/10 px-2.5 py-2">
+                <div className="inline-flex rounded-md bg-[#0b0e11] p-1">
+                  <button
+                    type="button"
+                    onClick={() => setRightPanelTab('orderbook')}
+                    className={`rounded px-3 py-1.5 text-sm transition-colors ${
+                      rightPanelTab === 'orderbook'
+                        ? 'bg-white text-black'
+                        : 'text-white/65 hover:text-white'
+                    }`}
+                  >
+                    {t('spotOrderBook', 'asset')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRightPanelTab('trades')}
+                    className={`rounded px-3 py-1.5 text-sm transition-colors ${
+                      rightPanelTab === 'trades'
+                        ? 'bg-white text-black'
+                        : 'text-white/65 hover:text-white'
+                    }`}
+                  >
+                    {t('spotTrades', 'asset')}
+                  </button>
                 </div>
               </div>
 
-              <div className="shrink-0 overflow-visible border border-white/10 bg-[#12161c]">
-                <SpotAssetInfo
-                  symbol={symbol}
-                  baseAsset={spotAssetSymbols.baseAsset}
-                  quoteAsset={spotAssetSymbols.quoteAsset}
-                  refreshKey={refreshKey}
-                  accountBalances={accountBalances}
-                  loading={balancesLoading}
-                  isLoggedIn={isLoggedIn}
-                  onTransferSuccess={handleOrderSuccess}
-                />
+              <div className="relative flex-1 min-h-0 min-w-0 overflow-hidden">
+                <div className={rightPanelTab === 'orderbook' ? 'block h-full min-h-0 min-w-0' : 'hidden h-full min-h-0 min-w-0'}>
+                  <SpotOrderBook
+                    symbol={symbol}
+                    displaySymbol={currentDisplaySymbol}
+                    referencePrice={orderbookReferencePrice}
+                    pricePrecision={pricePrecision}
+                    priceDirection={priceDirection}
+                    asks={spotDepthAsks}
+                    bids={spotDepthBids}
+                    bestAsk={spotMarket.bestAsk}
+                    bestBid={spotMarket.bestBid}
+                    depthSource={spotSources.depth}
+                    depthFreshness={spotFreshness.depth}
+                    dataSource={spotMarketDataSource}
+                    isLoading={spotMarket.isLoading}
+                    onPriceClick={handleOrderBookPriceClick}
+                  />
+                </div>
+
+                <div className={rightPanelTab === 'trades' ? 'block h-full min-h-0 min-w-0' : 'hidden h-full min-h-0 min-w-0'}>
+                  <SpotTradesHistory
+                    symbol={symbol}
+                    displaySymbol={currentDisplaySymbol}
+                    pricePrecision={pricePrecision}
+                    trades={spotMarket.trades}
+                    tradesSource={spotSources.trades}
+                    tradesFreshness={spotFreshness.trades}
+                    dataSource={spotMarketDataSource}
+                    isLoading={spotMarket.isLoading}
+                    onPriceClick={handleOrderBookPriceClick}
+                  />
+                </div>
               </div>
+            </div>
+          </div>
+
+          <div className="flex min-h-[150px] min-w-0 flex-col overflow-visible border border-white/10 bg-[#12161c] xl:col-span-2 xl:col-start-1 xl:row-start-2 xl:min-h-0">
+            <SpotOrderTabs
+              symbol={symbol}
+              refreshKey={refreshKey}
+              onOrdersChanged={handleOrdersChanged}
+              onLoadingChange={setOrdersLoading}
+              onBalanceUpdate={handleAccountBalanceUpdate}
+            />
+          </div>
+
+          <div className="min-h-[420px] min-w-0 xl:col-start-3 xl:row-start-1 xl:min-h-0">
+            <div className="relative flex h-full min-h-0 flex-col overflow-y-auto border border-white/10 bg-[#12161c] p-1.5 xl:p-2">
+              <SpotTradingForm
+                symbol={symbol}
+                baseAsset={spotAssetSymbols.baseAsset}
+                quoteAsset={spotAssetSymbols.quoteAsset}
+                marketPrice={formMarketPrice}
+                latestTradePrice={latestTradePriceText || null}
+                latestTradeAt={spotMarket.lastTradeAt}
+                selectedPrice={orderPrice}
+                priceSelectNonce={orderPriceSelectNonce}
+                pricePrecision={pricePrecision}
+                amountPrecision={currentAmountPrecision}
+                accountBalances={accountBalances}
+                asks={spotDepthAsks}
+                bids={spotDepthBids}
+                depthSource={spotSources.depth}
+                depthFreshness={spotFreshness.depth}
+                dataSource={spotMarketDataSource}
+                marketDataLoading={spotMarket.isLoading}
+                onPriceChange={setOrderPrice}
+                onOrderSuccess={handleOrderSuccess}
+                isLoggedIn={isLoggedIn}
+                authLoading={authLoading}
+                authChecked={authChecked}
+                userId={user?.id ?? null}
+              />
+            </div>
+          </div>
+
+          <div className="min-h-[150px] min-w-0 xl:col-start-3 xl:row-start-2 xl:min-h-0">
+            <div className="flex h-full min-h-0 flex-col overflow-y-auto border border-white/10 bg-[#12161c]">
+              <SpotAssetInfo
+                symbol={symbol}
+                baseAsset={spotAssetSymbols.baseAsset}
+                quoteAsset={spotAssetSymbols.quoteAsset}
+                refreshKey={refreshKey}
+                accountBalances={accountBalances}
+                loading={balancesLoading}
+                isLoggedIn={isLoggedIn}
+                onTransferSuccess={handleOrderSuccess}
+              />
             </div>
           </div>
         </div>

@@ -1262,7 +1262,7 @@ export default function SpotOrderTabs({
   }
 
   return (
-    <div className="tabular-nums min-w-0 bg-[#12171f] px-2 py-1.5">
+    <div className="tabular-nums flex h-full min-w-0 flex-col bg-[#12171f] px-2 py-1.5">
       <div className="mb-1 flex items-center justify-between gap-2">
         <div className="flex gap-2">
           <button

@@ -88,6 +88,9 @@ export interface GlobalMarketSelectorPair {
   priceTickSize?: string | number | null;
   amountPrecision?: number | null;
   maxLeverage?: number | null;
+  showSpotLogo?: boolean | null;
+  spotLogoUrl?: string | null;
+  spotLogoAlt?: string | null;
 }
 
 interface GlobalMarketSelectorProps {
@@ -104,10 +107,10 @@ interface GlobalMarketSelectorProps {
   pairsLoadingMore?: boolean;
   hasMorePairs?: boolean;
   pageType?: ToolbarPageType;
+  placement?: 'toolbar' | 'header';
   initialCategory?: PairCategory;
   onPairQueryChange?: (query: PairQueryUpdate) => void;
   onLoadMorePairs?: () => void;
-  toolbarAddon?: React.ReactNode;
 }
 
 const intervals = ['1m', '5m', '15m', '1h', '4h', '1d'];
@@ -266,6 +269,42 @@ function mergeUniquePairs(...groups: GlobalMarketSelectorPair[][]): GlobalMarket
 
 function getFavoriteKey(symbol: string, market: FavoriteMarket): string {
   return `${market}:${normalize(symbol)}`;
+}
+
+function getFavoriteTarget(pair: GlobalMarketSelectorPair): FavoriteSymbolItem & { key: string } {
+  const market = getPairMarket(pair);
+  const symbol = market === 'spot' ? normalizeSpotApiSymbol(pair.symbol) : normalize(pair.symbol);
+  return {
+    symbol,
+    market,
+    key: getFavoriteKey(symbol, market),
+  };
+}
+
+function parseBooleanFlag(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value === 1;
+  return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+function getPairLogoUrl(pair?: GlobalMarketSelectorPair | null): string {
+  return String(pair?.spotLogoUrl || '').trim();
+}
+
+function getCoinLogoText(baseAsset: string): string {
+  const normalized = normalize(baseAsset);
+  if (normalized === 'BTC') return '\u20bf';
+  if (normalized === 'ETH') return '\u25c7';
+  if (normalized === 'USDT') return 'T';
+  return normalized.slice(0, 2) || '?';
+}
+
+function getCoinLogoClass(baseAsset: string): string {
+  const normalized = normalize(baseAsset);
+  if (normalized === 'BTC') return 'bg-[#f7931a] text-white';
+  if (normalized === 'ETH') return 'bg-[#627eea] text-white';
+  if (normalized === 'USDT') return 'bg-[#26a17b] text-white';
+  return 'bg-[#1f2937] text-white/85';
 }
 
 function readFavoriteSymbols(): FavoriteSymbolItem[] {
@@ -520,6 +559,9 @@ function buildSharedMarketSelectorPair(
     tick_size?: string | number | null;
     display_price_precision?: string | number | null;
     displayPricePrecision?: string | number | null;
+    show_spot_logo?: boolean | number | string | null;
+    spot_logo_url?: string | null;
+    spot_logo_alt?: string | null;
   };
   const tickerFields = options.includeTicker
     ? {
@@ -557,6 +599,9 @@ function buildSharedMarketSelectorPair(
     pricePrecision: parseOptionalPrecision(row.price_precision),
     priceTickSize: rowPrecision.price_tick_size ?? rowPrecision.tick_size ?? null,
     amountPrecision: parseOptionalPrecision(row.amount_precision),
+    showSpotLogo: parseBooleanFlag(rowPrecision.show_spot_logo),
+    spotLogoUrl: String(rowPrecision.spot_logo_url || '').trim() || null,
+    spotLogoAlt: String(rowPrecision.spot_logo_alt || '').trim() || null,
     ...tickerFields,
   };
 }
@@ -627,6 +672,9 @@ function buildGlobalMarketSelectorPair(
     pricePrecision: parseOptionalPrecision(item.price_precision),
     priceTickSize: item.price_tick_size ?? item.tick_size ?? null,
     amountPrecision: parseOptionalPrecision(item.amount_precision),
+    showSpotLogo: parseBooleanFlag(item.show_spot_logo),
+    spotLogoUrl: String(item.spot_logo_url || '').trim() || null,
+    spotLogoAlt: String(item.spot_logo_alt || '').trim() || null,
   };
 }
 
@@ -914,10 +962,10 @@ export default function GlobalMarketSelector({
   pairsLoadingMore = false,
   hasMorePairs = false,
   pageType = 'spot',
+  placement = 'toolbar',
   initialCategory,
   onPairQueryChange,
   onLoadMorePairs,
-  toolbarAddon,
 }: GlobalMarketSelectorProps) {
   const router = useRouter();
   const { t } = useLocaleContext();
@@ -936,7 +984,7 @@ export default function GlobalMarketSelector({
   const [stockCategory, setStockCategory] = useState<StockCategory>('all');
   const [contractCategory, setContractCategory] = useState<ContractCategory>('all');
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const buttonRef = useRef<HTMLDivElement | null>(null);
   const [menuPosition, setMenuPosition] = useState({ left: 0, top: 0 });
   const [internalSpotPairs, setInternalSpotPairs] = useState<GlobalMarketSelectorPair[]>([]);
   const [internalContractPairs, setInternalContractPairs] = useState<GlobalMarketSelectorPair[]>([]);
@@ -949,6 +997,7 @@ export default function GlobalMarketSelector({
   const [contractTickerHydratingVersion, setContractTickerHydratingVersion] = useState(0);
   const [visibleTickerLimit, setVisibleTickerLimit] = useState(SPOT_TICKER_BATCH_SIZE);
   const [favoriteSymbols, setFavoriteSymbols] = useState<FavoriteSymbolItem[]>([]);
+  const [failedLogoUrls, setFailedLogoUrls] = useState<string[]>([]);
   const [stablePairRows, setStablePairRows] = useState<GlobalMarketSelectorPair[]>([]);
   const spotPairsCacheRef = useRef<Map<string, GlobalMarketSelectorPair[]>>(spotPairsCacheStore);
   const contractPairsCacheRef = useRef<Map<string, GlobalMarketSelectorPair[]>>(contractPairsCacheStore);
@@ -1044,12 +1093,29 @@ export default function GlobalMarketSelector({
     return currentPair?.displaySymbol || currentPair?.label || symbolLabels?.[symbol] || formatSpotDisplaySymbol(symbol);
   }, [currentPair, marketDisplayLabels, symbol, symbolLabels]);
 
+  const currentHeaderPair = useMemo<GlobalMarketSelectorPair>(
+    () => currentPair || {
+      symbol,
+      label: currentLabel,
+      displaySymbol: currentLabel,
+    },
+    [currentLabel, currentPair, symbol],
+  );
+
+  const currentBaseAsset = useMemo(() => inferBaseQuote(currentHeaderPair).base || normalize(symbol), [currentHeaderPair, symbol]);
+  const currentLogoUrl = getPairLogoUrl(currentHeaderPair);
+  const failedLogoUrlSet = useMemo(() => new Set(failedLogoUrls), [failedLogoUrls]);
+  const activeLogoUrl = currentLogoUrl && !failedLogoUrlSet.has(currentLogoUrl) ? currentLogoUrl : '';
+  const coinLogoText = getCoinLogoText(currentBaseAsset);
+  const coinLogoClass = getCoinLogoClass(currentBaseAsset);
+
   const intervalOptions = useMemo(
     () => (currentPair && (isStockContractPair(currentPair) || isTradfiCfdPair(currentPair)) ? TRADFI_INTERVALS : intervals),
     [currentPair],
   );
   const showIntervalControls = pageType !== 'spot';
   const showTimeSharing = pageType === 'spot' && Boolean(onChartModeChange);
+  const isHeaderPlacement = placement === 'header';
 
   useEffect(() => {
     if (intervalOptions.includes(interval)) return;
@@ -1199,6 +1265,8 @@ export default function GlobalMarketSelector({
     () => new Set(favoriteSymbols.map((item) => getFavoriteKey(item.symbol, item.market))),
     [favoriteSymbols],
   );
+  const currentFavoriteTarget = useMemo(() => getFavoriteTarget(currentHeaderPair), [currentHeaderPair]);
+  const currentFavoriteActive = favoriteKeySet.has(currentFavoriteTarget.key);
 
   const favoritePairs = useMemo<GlobalMarketSelectorPair[]>(() => {
     void tickerCacheVersion;
@@ -1673,20 +1741,25 @@ export default function GlobalMarketSelector({
     event.preventDefault();
     event.stopPropagation();
 
-    const nextMarket = getPairMarket(pair);
-    const nextSymbol = nextMarket === 'spot' ? normalizeSpotApiSymbol(pair.symbol) : normalize(pair.symbol);
-    const nextKey = getFavoriteKey(nextSymbol, nextMarket);
+    const nextFavorite = getFavoriteTarget(pair);
 
     setFavoriteSymbols((previous) => {
-      const exists = previous.some((item) => getFavoriteKey(item.symbol, item.market) === nextKey);
+      const exists = previous.some((item) => getFavoriteKey(item.symbol, item.market) === nextFavorite.key);
       const nextFavorites = exists
-        ? previous.filter((item) => getFavoriteKey(item.symbol, item.market) !== nextKey)
-        : [...previous, { symbol: nextSymbol, market: nextMarket }];
+        ? previous.filter((item) => getFavoriteKey(item.symbol, item.market) !== nextFavorite.key)
+        : [...previous, { symbol: nextFavorite.symbol, market: nextFavorite.market }];
 
       writeFavoriteSymbols(nextFavorites);
       return nextFavorites;
     });
   };
+
+  const markLogoFailed = useCallback((url: string) => {
+    setFailedLogoUrls((previous) => {
+      if (previous.includes(url)) return previous;
+      return [...previous, url];
+    });
+  }, []);
 
   const handleMarketTabChange = (nextTab: MarketLayerTab) => {
     setMarketTab(nextTab);
@@ -1742,17 +1815,75 @@ export default function GlobalMarketSelector({
   };
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-3 py-2">
+    <div
+      className={
+        isHeaderPlacement
+          ? 'inline-flex min-w-0 items-center'
+          : 'flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-3 py-2'
+      }
+    >
       <div className="flex min-w-0 flex-1 items-center">
-        <div ref={menuRef} className="relative min-w-[220px] shrink-0">
+        <div
+          ref={buttonRef}
+          className={`relative flex max-w-full shrink-0 items-center ${
+            isHeaderPlacement
+              ? 'h-11 min-w-0 max-w-[210px] gap-0 overflow-visible rounded-lg'
+              : 'h-10 min-w-[190px] overflow-hidden rounded-md border border-white/10 bg-[#0b0e11] transition-colors hover:border-white/20 hover:bg-[#11161d]'
+          }`}
+        >
           <button
-            ref={buttonRef}
             type="button"
             onClick={() => setOpen((value) => !value)}
-            className="flex w-full items-center justify-between rounded-md border border-white/10 bg-[#0b0e11] px-3 py-2 text-left text-sm text-white outline-none transition-colors hover:border-white/20 hover:bg-[#11161d]"
+            className={`flex h-full min-w-0 flex-1 items-center text-left text-white outline-none transition-colors focus-visible:bg-white/[0.04] ${
+              isHeaderPlacement
+                ? 'gap-2 rounded-lg pl-0 pr-0.5 hover:bg-white/[0.04]'
+                : 'gap-2 px-3 text-sm'
+            }`}
+            aria-label={`${currentLabel} ${t('select', 'markets')}`}
           >
-            <span className="font-semibold">{currentLabel}</span>
-            <span className="text-xs text-white/40">{open ? t('collapse', 'markets') : t('select', 'markets')}</span>
+            <span
+              className={`relative flex shrink-0 items-center justify-center overflow-hidden rounded-full font-bold leading-none ${coinLogoClass} ${
+                isHeaderPlacement ? 'h-[30px] w-[30px] text-[13px]' : 'h-6 w-6 text-[11px]'
+              }`}
+            >
+              {activeLogoUrl ? (
+                <>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={activeLogoUrl}
+                    alt={currentHeaderPair.spotLogoAlt || currentBaseAsset}
+                    className="absolute inset-0 h-full w-full rounded-full object-cover"
+                    onError={() => markLogoFailed(activeLogoUrl)}
+                  />
+                  <span className="sr-only">{currentBaseAsset}</span>
+                </>
+              ) : (
+                coinLogoText
+              )}
+            </span>
+            <span className={`min-w-0 truncate font-semibold leading-none ${isHeaderPlacement ? 'text-[17px]' : 'text-[15px]'}`}>{currentLabel}</span>
+            <span
+              aria-hidden="true"
+              className={`relative h-3 w-3 shrink-0 transition-transform duration-150 ${open ? 'rotate-180' : ''}`}
+            >
+              <span
+                className={`absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-[72%] rotate-45 border-b-2 border-r-2 ${
+                  isHeaderPlacement ? 'border-white/65' : 'border-white/40'
+                }`}
+              />
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={(event) => toggleFavorite(currentHeaderPair, event)}
+            className={`flex shrink-0 items-center justify-center transition-colors ${
+              currentFavoriteActive
+                ? 'text-[#f0b90b] hover:bg-[#f0b90b]/10'
+                : 'text-white/58 hover:bg-white/[0.06] hover:text-[#f0b90b]'
+            } ${isHeaderPlacement ? 'h-7 w-7 rounded-full text-[20px] font-semibold' : 'mr-1.5 h-7 w-7 rounded text-[15px]'}`}
+            aria-label={currentFavoriteActive ? t('removeFavorite', 'markets') : t('addFavorite', 'markets')}
+          >
+            {currentFavoriteActive ? '\u2605' : '\u2606'}
           </button>
 
           {open ? (
@@ -1916,10 +2047,10 @@ export default function GlobalMarketSelector({
                           handleSelect(pair);
                         }
                       }}
-                      className={`grid h-[58px] w-full cursor-pointer grid-cols-[24px_minmax(120px,1fr)_100px_72px] items-center gap-2 px-3 text-left transition-colors hover:bg-white/[0.05] ${
-                        active ? 'bg-[#10201d]' : ''
-                      }`}
-                    >
+                    className={`grid h-[58px] w-full cursor-pointer grid-cols-[24px_28px_minmax(120px,1fr)_100px_72px] items-center gap-2 px-3 text-left transition-colors hover:bg-white/[0.05] ${
+                      active ? 'bg-[#10201d]' : ''
+                    }`}
+                  >
                       <button
                         type="button"
                         onClick={(event) => toggleFavorite(pair, event)}
@@ -1932,6 +2063,32 @@ export default function GlobalMarketSelector({
                       >
                         {favoriteActive ? '\u2605' : '\u2606'}
                       </button>
+                      {(() => {
+                        const rowBaseAsset = inferBaseQuote(pair).base || normalize(pair.symbol);
+                        const rowLogoUrl = getPairLogoUrl(pair);
+                        const rowActiveLogoUrl = rowLogoUrl && !failedLogoUrlSet.has(rowLogoUrl) ? rowLogoUrl : '';
+
+                        return (
+                          <span
+                            className={`relative flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-full text-[11px] font-bold leading-none ${getCoinLogoClass(rowBaseAsset)}`}
+                          >
+                            {rowActiveLogoUrl ? (
+                              <>
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src={rowActiveLogoUrl}
+                                  alt={pair.spotLogoAlt || rowBaseAsset}
+                                  className="absolute inset-0 h-full w-full rounded-full object-cover"
+                                  onError={() => markLogoFailed(rowActiveLogoUrl)}
+                                />
+                                <span className="sr-only">{rowBaseAsset}</span>
+                              </>
+                            ) : (
+                              getCoinLogoText(rowBaseAsset)
+                            )}
+                          </span>
+                        );
+                      })()}
                       <span className="min-w-0">
                         <span className="block truncate text-[13px] font-semibold text-white">{label}</span>
                         <span className="mt-0.5 block text-[11px] text-white/38">
@@ -1955,7 +2112,6 @@ export default function GlobalMarketSelector({
           </div>
           ) : null}
         </div>
-        {toolbarAddon ? <div className="min-w-0 shrink">{toolbarAddon}</div> : null}
       </div>
 
       {showIntervalControls ? (

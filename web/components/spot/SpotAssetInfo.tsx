@@ -114,7 +114,7 @@ export default function SpotAssetInfo({
   const transferCoin = quoteAsset || 'USDT'
 
   return (
-    <div className="tabular-nums rounded-xl border border-white/10 bg-[#12171f] p-1 overflow-visible xl:p-1.5">
+    <div className="tabular-nums flex h-full flex-col overflow-visible rounded-xl border border-white/10 bg-[#12171f] p-1 xl:p-1.5">
       <div className="mb-1 flex items-center justify-between xl:mb-1.5">
         <div className="text-[14px] font-semibold text-white">{copy.title}</div>
         <div className="text-[12px] text-gray-400">
@@ -123,11 +123,11 @@ export default function SpotAssetInfo({
       </div>
 
       {!isLoggedIn ? (
-        <div className="rounded-lg bg-white/[0.03] px-3 py-8 text-center text-sm text-white/50">
+        <div className="flex min-h-[118px] flex-1 items-center justify-center rounded-lg bg-white/[0.03] px-3 py-8 text-center text-sm text-white/50">
           {copy.login}
         </div>
       ) : !loading && !hasAssetMeta && !hasAssetData ? (
-        <div className="rounded-lg bg-white/[0.03] px-3 py-8 text-center text-sm text-white/40">
+        <div className="flex min-h-[118px] flex-1 items-center justify-center rounded-lg bg-white/[0.03] px-3 py-8 text-center text-sm text-white/40">
           {copy.noData}
         </div>
       ) : (
