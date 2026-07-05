@@ -175,6 +175,16 @@ def _latest_trade_price(trades: Optional[TradesResponse]) -> Optional[str]:
     return _to_str(getattr(items[0], "price", None))
 
 
+def _latest_kline_close(kline: dict[str, Any]) -> Optional[str]:
+    items = list((kline or {}).get("items") or [])
+    if not items:
+        return None
+    latest_item = items[-1]
+    if not isinstance(latest_item, dict):
+        return None
+    return _to_str(latest_item.get("close"))
+
+
 def _price_direction(trades: Optional[TradesResponse], ticker: dict[str, Any]) -> str:
     items = getattr(trades, "trades", None) or []
     if len(items) >= 2:
@@ -437,6 +447,7 @@ def get_spot_market_view(
     has_trades = bool(getattr(trades, "trades", None))
     has_kline = bool(kline.get("items"))
     has_ticker = bool(ticker_last_price)
+    kline_last_price = _latest_kline_close(kline)
     depth_source = _normalized_source(depth, has_data=has_depth)
     trades_source = _normalized_source(trades, has_data=has_trades, default="INTERNAL")
     ticker_source = _normalized_source(ticker, has_data=has_ticker)
@@ -455,7 +466,11 @@ def get_spot_market_view(
     )
     if last_trade_price:
         display_price = last_trade_price
-        display_price_source = "last_trade"
+        display_price_source = (
+            "last_good_trade"
+            if trades_freshness in {"LAST_GOOD", "STALE"}
+            else "last_trade"
+        )
     elif ticker_last_price:
         display_price = ticker_last_price
         display_price_source = (
@@ -463,9 +478,13 @@ def get_spot_market_view(
             if ticker_freshness in {"LAST_GOOD", "STALE"}
             else "ticker"
         )
-    elif orderbook_mid_price:
-        display_price = orderbook_mid_price
-        display_price_source = "orderbook_mid"
+    elif kline_last_price:
+        display_price = kline_last_price
+        display_price_source = (
+            "last_good_kline"
+            if kline_freshness in {"LAST_GOOD", "STALE"}
+            else "kline_close"
+        )
     else:
         display_price = None
         display_price_source = "missing"
@@ -474,7 +493,7 @@ def get_spot_market_view(
         "symbol": normalized_symbol,
         "display_price": display_price,
         "display_price_source": display_price_source,
-        "last_price": last_trade_price or ticker_last_price,
+        "last_price": last_trade_price or ticker_last_price or kline_last_price,
         "last_trade_price": last_trade_price,
         "orderbook_mid_price": orderbook_mid_price,
         "ticker_last_price": ticker_last_price,

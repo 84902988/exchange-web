@@ -734,6 +734,24 @@ def test_gateway_idle_release_clears_tracked_kline_intervals_without_per_interva
     asyncio.run(run())
 
 
+def test_gateway_refresh_loop_exits_quietly_on_executor_shutdown() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        ws_manager.count = 1
+        gateway = _new_test_gateway()
+        gateway._ws_manager = ws_manager
+        gateway._symbol_providers["BTCUSDT"] = market.PROVIDER_BITGET_SPOT
+
+        async def fail_provider_allowed(symbol: str) -> bool:
+            raise RuntimeError("Executor shutdown has been called")
+
+        gateway._provider_symbol_allowed_async = fail_provider_allowed
+
+        await gateway._refresh_loop("BTCUSDT")
+
+    asyncio.run(run())
+
+
 def test_gateway_subscriber_count_and_idle_release() -> None:
     async def run() -> None:
         ws_manager = FakeWsManager()

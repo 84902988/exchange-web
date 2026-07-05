@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import threading
@@ -28,7 +29,7 @@ SPOT_PROVIDER_WS_TICKER_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OK
 SPOT_PROVIDER_WS_TRADES_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
 SPOT_PROVIDER_WS_KLINE_SUPPORTED_PROVIDERS = {PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT}
 BITGET_SPOT_DEPTH_CHANNEL = "books15"
-OKX_SPOT_DEPTH_CHANNEL = "books5"
+OKX_SPOT_DEPTH_CHANNEL = "books"
 BITGET_SPOT_TICKER_CHANNEL = "ticker"
 OKX_SPOT_TICKER_CHANNEL = "tickers"
 BITGET_SPOT_TRADES_CHANNEL = "trade"
@@ -63,6 +64,32 @@ _PROVIDER_WS_SHUTDOWN_NOISE_MESSAGES = (
     "event loop is closed",
     "executor shutdown",
 )
+_PROVIDER_WS_DISCONNECT_LOG_THROTTLE_SECONDS = 30.0
+_PROVIDER_WS_DISCONNECT_LOG_LAST_AT: dict[tuple[str, str, str, str, str], float] = {}
+
+
+def _websocket_connection_closed_types() -> tuple[type[BaseException], ...]:
+    exceptions: list[type[BaseException]] = []
+    try:
+        websocket_exceptions = importlib.import_module("websockets.exceptions")
+    except (AttributeError, ImportError, ModuleNotFoundError):
+        websocket_exceptions = None
+    if websocket_exceptions is None:
+        return ()
+    for name in ("ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK"):
+        exc_type = getattr(websocket_exceptions, name, None)
+        if isinstance(exc_type, type):
+            exceptions.append(exc_type)
+    return tuple(exceptions)
+
+
+_PROVIDER_WS_RECOVERABLE_EXCEPTIONS = (
+    ConnectionResetError,
+    TimeoutError,
+    OSError,
+    asyncio.TimeoutError,
+    *_websocket_connection_closed_types(),
+)
 
 
 def _is_provider_ws_shutdown_noise(
@@ -75,6 +102,48 @@ def _is_provider_ws_shutdown_noise(
         return False
     message = str(exc).strip().lower()
     return any(fragment in message for fragment in _PROVIDER_WS_SHUTDOWN_NOISE_MESSAGES)
+
+
+def _is_provider_ws_recoverable_disconnect(exc: BaseException) -> bool:
+    return isinstance(exc, _PROVIDER_WS_RECOVERABLE_EXCEPTIONS)
+
+
+def _log_provider_ws_disconnected(
+    domain: str,
+    subscription: Any,
+    exc: BaseException,
+    *,
+    retry_in: float,
+) -> None:
+    reason = type(exc).__name__
+    interval = getattr(subscription, "interval", "")
+    key = (str(domain), subscription.provider, subscription.local_symbol, str(interval), reason)
+    now = time.monotonic()
+    last_at = _PROVIDER_WS_DISCONNECT_LOG_LAST_AT.get(key)
+    if last_at is not None and now - last_at < _PROVIDER_WS_DISCONNECT_LOG_THROTTLE_SECONDS:
+        return
+    _PROVIDER_WS_DISCONNECT_LOG_LAST_AT[key] = now
+    if interval:
+        logger.warning(
+            "spot_provider_ws_%s_disconnected provider=%s symbol=%s provider_symbol=%s interval=%s reason=%s retry_in=%.1fs",
+            domain,
+            subscription.provider,
+            subscription.local_symbol,
+            subscription.provider_symbol,
+            interval,
+            reason,
+            retry_in,
+        )
+        return
+    logger.warning(
+        "spot_provider_ws_%s_disconnected provider=%s symbol=%s provider_symbol=%s reason=%s retry_in=%.1fs",
+        domain,
+        subscription.provider,
+        subscription.local_symbol,
+        subscription.provider_symbol,
+        reason,
+        retry_in,
+    )
 
 
 @dataclass(frozen=True)
@@ -279,6 +348,64 @@ def _normalize_depth_side(levels: Any, *, reverse: bool, limit: int) -> list[dic
     ]
 
 
+def _normalize_depth_delta_side(levels: Any) -> list[tuple[Decimal, Decimal]]:
+    normalized: list[tuple[Decimal, Decimal]] = []
+    if not isinstance(levels, list):
+        return normalized
+    for row in levels:
+        price_value: Any = None
+        amount_value: Any = None
+        if isinstance(row, list) and len(row) >= 2:
+            price_value = row[0]
+            amount_value = row[1]
+        elif isinstance(row, dict):
+            price_value = row.get("price") or row.get("px")
+            amount_value = row.get("amount") or row.get("size") or row.get("qty") or row.get("quantity")
+        price = _to_decimal(price_value)
+        amount = _to_decimal(amount_value)
+        if price is None or amount is None or price <= 0 or amount < 0:
+            continue
+        normalized.append((price, amount))
+    return normalized
+
+
+def _depth_record_side_to_book(levels: Any) -> dict[Decimal, Decimal]:
+    book: dict[Decimal, Decimal] = {}
+    if not isinstance(levels, list):
+        return book
+    for row in levels:
+        if not isinstance(row, dict):
+            continue
+        price = _to_decimal(row.get("price"))
+        amount = _to_decimal(row.get("amount"))
+        if price is None or amount is None or price <= 0 or amount <= 0:
+            continue
+        book[price] = amount
+    return book
+
+
+def _depth_book_to_side(book: dict[Decimal, Decimal], *, reverse: bool, limit: int) -> list[dict[str, str]]:
+    items = sorted(
+        ((price, amount) for price, amount in book.items() if price > 0 and amount > 0),
+        key=lambda item: item[0],
+        reverse=reverse,
+    )
+    return [
+        {"price": _decimal_to_str(price), "amount": _decimal_to_str(amount)}
+        for price, amount in items[:limit]
+    ]
+
+
+def _merge_depth_side(existing_levels: Any, delta_levels: Any, *, reverse: bool, limit: int) -> list[dict[str, str]]:
+    book = _depth_record_side_to_book(existing_levels)
+    for price, amount in _normalize_depth_delta_side(delta_levels):
+        if amount <= 0:
+            book.pop(price, None)
+        else:
+            book[price] = amount
+    return _depth_book_to_side(book, reverse=reverse, limit=limit)
+
+
 def _spot_provider_ts(value: Any) -> int:
     try:
         timestamp = int(value or 0)
@@ -396,6 +523,7 @@ def normalize_okx_depth_message(
     local_symbol: str,
     provider_symbol: str,
     depth_limit: Optional[int] = None,
+    previous_record: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     if not isinstance(message, dict) or message.get("event"):
         return None
@@ -407,8 +535,23 @@ def normalize_okx_depth_message(
         return None
 
     limit = _depth_limit(depth_limit)
-    bids = _normalize_depth_side(row.get("bids"), reverse=True, limit=limit)
-    asks = _normalize_depth_side(row.get("asks"), reverse=False, limit=limit)
+    action = str(message.get("action") or "snapshot").strip().lower()
+    if action == "update" and previous_record:
+        bids = _merge_depth_side(
+            previous_record.get("raw_bids") or previous_record.get("bids"),
+            row.get("bids"),
+            reverse=True,
+            limit=limit,
+        )
+        asks = _merge_depth_side(
+            previous_record.get("raw_asks") or previous_record.get("asks"),
+            row.get("asks"),
+            reverse=False,
+            limit=limit,
+        )
+    else:
+        bids = _normalize_depth_side(row.get("bids"), reverse=True, limit=limit)
+        asks = _normalize_depth_side(row.get("asks"), reverse=False, limit=limit)
     if not bids or not asks:
         return None
 
@@ -1648,16 +1791,20 @@ class SpotMarketProviderWsService:
             except Exception as exc:
                 if _is_provider_ws_shutdown_noise(exc, stop_event):
                     return
-                logger.warning(
-                    "spot_provider_ws_depth_disconnected provider=%s symbol=%s provider_symbol=%s",
-                    subscription.provider,
-                    subscription.local_symbol,
-                    subscription.provider_symbol,
-                    exc_info=True,
-                )
                 if stop_event.is_set():
                     return
-                await asyncio.sleep(1.0)
+                retry_in = 1.0
+                if _is_provider_ws_recoverable_disconnect(exc):
+                    _log_provider_ws_disconnected("depth", subscription, exc, retry_in=retry_in)
+                else:
+                    logger.warning(
+                        "spot_provider_ws_depth_failed provider=%s symbol=%s provider_symbol=%s",
+                        subscription.provider,
+                        subscription.local_symbol,
+                        subscription.provider_symbol,
+                        exc_info=True,
+                    )
+                await asyncio.sleep(retry_in)
 
     async def _ticker_loop(
         self,
@@ -1674,16 +1821,20 @@ class SpotMarketProviderWsService:
             except Exception as exc:
                 if _is_provider_ws_shutdown_noise(exc, stop_event):
                     return
-                logger.warning(
-                    "spot_provider_ws_ticker_disconnected provider=%s symbol=%s provider_symbol=%s",
-                    subscription.provider,
-                    subscription.local_symbol,
-                    subscription.provider_symbol,
-                    exc_info=True,
-                )
                 if stop_event.is_set():
                     return
-                await asyncio.sleep(1.0)
+                retry_in = 1.0
+                if _is_provider_ws_recoverable_disconnect(exc):
+                    _log_provider_ws_disconnected("ticker", subscription, exc, retry_in=retry_in)
+                else:
+                    logger.warning(
+                        "spot_provider_ws_ticker_failed provider=%s symbol=%s provider_symbol=%s",
+                        subscription.provider,
+                        subscription.local_symbol,
+                        subscription.provider_symbol,
+                        exc_info=True,
+                    )
+                await asyncio.sleep(retry_in)
 
     async def _trades_loop(
         self,
@@ -1700,16 +1851,20 @@ class SpotMarketProviderWsService:
             except Exception as exc:
                 if _is_provider_ws_shutdown_noise(exc, stop_event):
                     return
-                logger.warning(
-                    "spot_provider_ws_trades_disconnected provider=%s symbol=%s provider_symbol=%s",
-                    subscription.provider,
-                    subscription.local_symbol,
-                    subscription.provider_symbol,
-                    exc_info=True,
-                )
                 if stop_event.is_set():
                     return
-                await asyncio.sleep(1.0)
+                retry_in = 1.0
+                if _is_provider_ws_recoverable_disconnect(exc):
+                    _log_provider_ws_disconnected("trades", subscription, exc, retry_in=retry_in)
+                else:
+                    logger.warning(
+                        "spot_provider_ws_trades_failed provider=%s symbol=%s provider_symbol=%s",
+                        subscription.provider,
+                        subscription.local_symbol,
+                        subscription.provider_symbol,
+                        exc_info=True,
+                    )
+                await asyncio.sleep(retry_in)
 
     async def _kline_loop(
         self,
@@ -1726,17 +1881,21 @@ class SpotMarketProviderWsService:
             except Exception as exc:
                 if _is_provider_ws_shutdown_noise(exc, stop_event):
                     return
-                logger.warning(
-                    "spot_provider_ws_kline_disconnected provider=%s symbol=%s provider_symbol=%s interval=%s",
-                    subscription.provider,
-                    subscription.local_symbol,
-                    subscription.provider_symbol,
-                    subscription.interval,
-                    exc_info=True,
-                )
                 if stop_event.is_set():
                     return
-                await asyncio.sleep(1.0)
+                retry_in = 1.0
+                if _is_provider_ws_recoverable_disconnect(exc):
+                    _log_provider_ws_disconnected("kline", subscription, exc, retry_in=retry_in)
+                else:
+                    logger.warning(
+                        "spot_provider_ws_kline_failed provider=%s symbol=%s provider_symbol=%s interval=%s",
+                        subscription.provider,
+                        subscription.local_symbol,
+                        subscription.provider_symbol,
+                        subscription.interval,
+                        exc_info=True,
+                    )
+                await asyncio.sleep(retry_in)
 
     async def _run_bitget_depth_ws(
         self,
@@ -2302,15 +2461,20 @@ class SpotMarketProviderWsService:
         except Exception:
             logger.debug("spot_provider_ws_okx_depth_invalid_json symbol=%s", subscription.local_symbol)
             return
+        key = (subscription.provider, subscription.local_symbol)
+        with self._lock:
+            if self._depth_generations.get(key) != generation:
+                return
+            previous_record = deepcopy(self._depth_cache.get(key) or {})
         record = normalize_okx_depth_message(
             message,
             local_symbol=subscription.local_symbol,
             provider_symbol=subscription.provider_symbol,
             depth_limit=subscription.depth_limit,
+            previous_record=previous_record,
         )
         if record is None:
             return
-        key = (subscription.provider, subscription.local_symbol)
         with self._lock:
             if self._depth_generations.get(key) != generation:
                 return
