@@ -848,22 +848,33 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const currentDisplaySymbol = useMemo(() => {
     return selectedTicker?.displaySymbol || selectedPair?.displaySymbol || selectedTicker?.label || formatSpotDisplaySymbol(symbol);
   }, [selectedPair?.displaySymbol, selectedTicker?.displaySymbol, selectedTicker?.label, symbol]);
+  const hasSpotTradePrice = spotMarket.lastTradePrice !== null && spotMarket.lastTradePrice !== undefined && String(spotMarket.lastTradePrice).trim() !== '';
+  const headerPriceValue = hasSpotTradePrice ? spotMarket.lastTradePrice : spotMarket.displayPrice;
   const spotLastPrice = formatPriceBySymbol(
     symbol,
-    String(spotMarket.displayPrice ?? ''),
+    String(headerPriceValue ?? ''),
     pricePrecision,
   ) || '--';
-  const orderbookReferencePrice = spotLastPrice;
+  const orderbookReferencePrice = formatPriceBySymbol(
+    symbol,
+    String(spotMarket.orderbookMidPrice ?? spotMarket.bestAsk ?? spotMarket.bestBid ?? ''),
+    pricePrecision,
+  ) || '--';
   const formMarketPrice = formatOrderInputPriceBySymbol(
     symbol,
-    String(spotMarket.orderbookMidPrice ?? spotMarket.bestAsk ?? spotMarket.bestBid ?? spotMarket.displayPrice ?? ''),
+    String(spotMarket.orderbookMidPrice ?? spotMarket.bestAsk ?? spotMarket.bestBid ?? ''),
+    pricePrecision,
+  );
+  const latestTradePriceText = formatOrderInputPriceBySymbol(
+    symbol,
+    String(spotMarket.lastTradePrice ?? ''),
     pricePrecision,
   );
   const spotDepth = spotMarket.depth;
   const spotDepthAsks = spotDepth?.asks || [];
   const spotDepthBids = spotDepth?.bids || [];
   const marketHeaderData = buildMarketDataFromMarketView(symbol, spotMarket.marketView, pricePrecision) || EMPTY_MARKET_DATA;
-  const priceDirection = spotMarket.priceDirection;
+  const priceDirection = hasSpotTradePrice ? spotMarket.lastTradeDirection : spotMarket.priceDirection;
   const spotMarketStatus = spotMarket.marketView?.market_status || selectedPair?.marketStatus || 'OPEN';
   const spotMarketDataSource = spotMarket.marketView?.data_source || marketFeedDataSource;
   const spotSources = spotMarket.sources;
@@ -1038,6 +1049,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     baseAsset={spotAssetSymbols.baseAsset}
                     quoteAsset={spotAssetSymbols.quoteAsset}
                     marketPrice={formMarketPrice}
+                    latestTradePrice={latestTradePriceText || null}
+                    latestTradeAt={spotMarket.lastTradeAt}
                     selectedPrice={orderPrice}
                     priceSelectNonce={orderPriceSelectNonce}
                     pricePrecision={pricePrecision}
