@@ -210,6 +210,42 @@ def test_provider_ws_loop_exits_without_connect_when_stop_event_is_set() -> None
     asyncio.run(run())
 
 
+def test_provider_ws_recoverable_disconnect_logs_without_traceback(caplog) -> None:
+    async def run() -> None:
+        service = provider_ws.SpotMarketProviderWsService()
+        stop_event = threading.Event()
+        calls = 0
+
+        async def fail_then_stop(*args, **kwargs) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ConnectionResetError("peer reset")
+            stop_event.set()
+
+        service._run_bitget_ticker_ws = fail_then_stop
+        subscription = provider_ws.SpotTickerSubscription(
+            local_symbol="LOGTESTUSDT",
+            provider=provider_ws.PROVIDER_BITGET_SPOT,
+            provider_symbol="LOGTESTUSDT",
+        )
+
+        await service._ticker_loop(subscription, stop_event, 1)
+        assert calls == 2
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(run())
+
+    records = [
+        record
+        for record in caplog.records
+        if "spot_provider_ws_ticker_disconnected" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert "reason=ConnectionResetError" in records[0].getMessage()
+    assert records[0].exc_info is None
+
+
 def test_cache_metadata_helper_fresh_stale_missing_and_defaults() -> None:
     now_ms = 10_000
     record = {

@@ -28,6 +28,18 @@ from app.services.spot_market_provider_ws import (
 logger = logging.getLogger(__name__)
 
 _MAX_KLINE_BROADCAST_INTERVAL_MS = 500
+_EXECUTOR_SHUTDOWN_MESSAGES = (
+    "executor shutdown has been called",
+    "cannot schedule new futures after shutdown",
+    "executor shutdown",
+)
+
+
+def _is_executor_shutdown(exc: BaseException) -> bool:
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc).strip().lower()
+    return any(fragment in message for fragment in _EXECUTOR_SHUTDOWN_MESSAGES)
 
 
 class SpotMarketGateway:
@@ -98,7 +110,9 @@ class SpotMarketGateway:
             task = self._tasks.get(normalized_symbol)
             if task is not None and not task.done():
                 return
-            self._tasks[normalized_symbol] = asyncio.create_task(self._refresh_loop(normalized_symbol))
+            task = asyncio.create_task(self._refresh_loop(normalized_symbol))
+            task.add_done_callback(self._consume_task_result)
+            self._tasks[normalized_symbol] = task
 
     async def release_symbol_if_idle(
         self,
@@ -121,9 +135,22 @@ class SpotMarketGateway:
                 if idle_delay_seconds is not None
                 else max(0.0, float(getattr(settings, "SPOT_PROVIDER_WS_IDLE_STOP_SECONDS", 10) or 10))
             )
-            self._idle_tasks[normalized_symbol] = asyncio.create_task(
-                self._idle_release_after_delay(normalized_symbol, delay)
-            )
+            task = asyncio.create_task(self._idle_release_after_delay(normalized_symbol, delay))
+            task.add_done_callback(self._consume_task_result)
+            self._idle_tasks[normalized_symbol] = task
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except RuntimeError as exc:
+            if _is_executor_shutdown(exc):
+                return
+            logger.warning("spot_market_gateway_task_failed", exc_info=True)
+        except Exception:
+            logger.warning("spot_market_gateway_task_failed", exc_info=True)
 
     async def _cancel_idle_release(self, symbol: str) -> None:
         async with self._task_lock:
@@ -147,6 +174,10 @@ class SpotMarketGateway:
             logger.info("spot_market_gateway_release_provider_ws symbol=%s", symbol)
         except asyncio.CancelledError:
             raise
+        except RuntimeError as exc:
+            if _is_executor_shutdown(exc):
+                return
+            logger.warning("spot_market_gateway_release_failed symbol=%s", symbol, exc_info=True)
         except Exception:
             logger.warning("spot_market_gateway_release_failed symbol=%s", symbol, exc_info=True)
         finally:
@@ -306,7 +337,13 @@ class SpotMarketGateway:
 
                 await asyncio.sleep(self._loop_interval_seconds())
         except asyncio.CancelledError:
-            raise
+            return
+        except RuntimeError as exc:
+            if _is_executor_shutdown(exc):
+                return
+            logger.warning("spot_market_gateway_refresh_loop_failed symbol=%s", symbol, exc_info=True)
+        except Exception:
+            logger.warning("spot_market_gateway_refresh_loop_failed symbol=%s", symbol, exc_info=True)
         finally:
             async with self._task_lock:
                 task = self._tasks.get(symbol)

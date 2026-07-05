@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import defaultdict
 from decimal import Decimal
 from typing import Dict, Set, Any
@@ -24,6 +25,8 @@ from app.services.spot_market_view import (
 logger = logging.getLogger(__name__)
 SPOT_SNAPSHOT_BUILD_TIMEOUT_SECONDS = 3.0
 SPOT_SNAPSHOT_VIEW_BUDGET_SECONDS = 2.2
+SPOT_SNAPSHOT_TIMEOUT_LOG_THROTTLE_SECONDS = 30.0
+_SPOT_SNAPSHOT_TIMEOUT_LOG_LAST_AT: dict[str, float] = {}
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -49,6 +52,15 @@ def _to_str(v: Any) -> str:
 def _spot_snapshot_fallback_payload(symbol: str, reason: str) -> dict:
     view = build_empty_spot_market_view(symbol=symbol, warnings=[reason])
     return build_spot_market_snapshot_payload(view)
+
+
+def _log_spot_snapshot_timeout(symbol: str) -> None:
+    now = time.monotonic()
+    last_at = _SPOT_SNAPSHOT_TIMEOUT_LOG_LAST_AT.get(symbol)
+    if last_at is not None and now - last_at < SPOT_SNAPSHOT_TIMEOUT_LOG_THROTTLE_SECONDS:
+        return
+    _SPOT_SNAPSHOT_TIMEOUT_LOG_LAST_AT[symbol] = now
+    logger.warning("spot_market_snapshot_timeout symbol=%s", symbol)
 
 
 def _build_spot_snapshot_payload(symbol: str) -> dict:
@@ -260,7 +272,7 @@ class MarketWsManager:
                 timeout=SPOT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            logger.warning("spot_market_snapshot_timeout symbol=%s", symbol)
+            _log_spot_snapshot_timeout(symbol)
             payload = _spot_snapshot_fallback_payload(symbol, "snapshot_timeout")
         except Exception as exc:
             logger.warning("spot_market_snapshot_failed symbol=%s error=%s", symbol, exc)
