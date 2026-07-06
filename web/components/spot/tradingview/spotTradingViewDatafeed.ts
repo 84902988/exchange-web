@@ -454,6 +454,8 @@ function shouldUseOkxDwmTradingViewTime(
     normalizedProvider === 'OKX_SPOT' ||
     normalizedProvider === 'EXTERNAL_SPOT' ||
     normalizedSource === 'EXTERNAL_SPOT' ||
+    normalizedSource === 'DB_CACHE' ||
+    normalizedSource === 'STALE_CACHE' ||
     normalizedSource === 'REST_SNAPSHOT' ||
     normalizedSource === 'REST_HISTORY' ||
     normalizedSource === 'LIVE_WS'

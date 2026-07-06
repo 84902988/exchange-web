@@ -24,6 +24,99 @@ logger = logging.getLogger(__name__)
 
 OpenTimeValidator = Callable[[int], bool]
 
+KLINE_CACHE_ORIGIN_DB_CACHE = "DB_CACHE"
+KLINE_CACHE_ORIGIN_REST_FETCH = "REST_FETCH"
+KLINE_CACHE_ORIGIN_STALE_CACHE = "STALE_CACHE"
+KLINE_CACHE_ORIGIN_EMPTY = "EMPTY"
+
+KLINE_CACHE_STATUS_HIT = "HIT"
+KLINE_CACHE_STATUS_MISS = "MISS"
+KLINE_CACHE_STATUS_SHORT = "SHORT"
+KLINE_CACHE_STATUS_CONTINUITY_INVALID = "CONTINUITY_INVALID"
+KLINE_CACHE_STATUS_STALE_OPEN = "STALE_OPEN"
+KLINE_CACHE_STATUS_PROVIDER_EMPTY = "PROVIDER_EMPTY"
+
+KLINE_PROVIDER_ERROR_TIMEOUT = "TIMEOUT"
+KLINE_PROVIDER_ERROR_COOLDOWN = "COOLDOWN"
+KLINE_PROVIDER_ERROR_HTTP = "HTTP_ERROR"
+KLINE_PROVIDER_ERROR_EMPTY = "EMPTY"
+KLINE_PROVIDER_ERROR_UNKNOWN = "UNKNOWN"
+_KLINE_PROVIDER_ERROR_CODES = {
+    KLINE_PROVIDER_ERROR_TIMEOUT,
+    KLINE_PROVIDER_ERROR_COOLDOWN,
+    KLINE_PROVIDER_ERROR_HTTP,
+    KLINE_PROVIDER_ERROR_EMPTY,
+    KLINE_PROVIDER_ERROR_UNKNOWN,
+}
+
+
+class KlineProviderFetchError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_error_code: str = KLINE_PROVIDER_ERROR_UNKNOWN,
+        provider_error_provider: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider_error_code = _normalize_provider_error_code(provider_error_code)
+        self.provider_error_provider = _sanitize_provider_error_provider(provider_error_provider)
+
+
+class KlineCacheResult(list):
+    def __init__(
+        self,
+        items: Iterable[Any] = (),
+        *,
+        origin: str,
+        cache_status: str,
+        provider_error_code: Optional[str] = None,
+        provider_error_provider: Optional[str] = None,
+        history_incomplete: bool = False,
+    ) -> None:
+        super().__init__(items)
+        self.origin = origin
+        self.cache_status = cache_status
+        self.provider_error_code = _normalize_provider_error_code(provider_error_code) if provider_error_code else None
+        self.provider_error_provider = _sanitize_provider_error_provider(provider_error_provider)
+        self.history_incomplete = bool(history_incomplete)
+
+    @property
+    def items(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self if isinstance(item, dict)]
+
+
+def _normalize_provider_error_code(value: Optional[str]) -> str:
+    normalized = str(value or "").strip().upper()
+    return normalized if normalized in _KLINE_PROVIDER_ERROR_CODES else KLINE_PROVIDER_ERROR_UNKNOWN
+
+
+def _sanitize_provider_error_provider(value: Optional[str]) -> Optional[str]:
+    normalized = str(value or "").strip().upper()
+    if not normalized:
+        return None
+    return "".join(char for char in normalized if char.isalnum() or char == "_")[:64] or None
+
+
+def _classify_provider_error(exc: Exception) -> tuple[str, Optional[str]]:
+    code = getattr(exc, "provider_error_code", None)
+    provider = getattr(exc, "provider_error_provider", None)
+    if code:
+        return _normalize_provider_error_code(str(code)), _sanitize_provider_error_provider(provider)
+
+    lowered = str(exc or "").lower()
+    if "timeout" in lowered or "timed out" in lowered or "over_budget" in lowered:
+        code = KLINE_PROVIDER_ERROR_TIMEOUT
+    elif "cooldown" in lowered:
+        code = KLINE_PROVIDER_ERROR_COOLDOWN
+    elif "http " in lowered or "status_code" in lowered:
+        code = KLINE_PROVIDER_ERROR_HTTP
+    elif "empty" in lowered or "unavailable" in lowered or "no data" in lowered:
+        code = KLINE_PROVIDER_ERROR_EMPTY
+    else:
+        code = KLINE_PROVIDER_ERROR_UNKNOWN
+    return code, _sanitize_provider_error_provider(provider)
+
 SUPPORTED_KLINE_INTERVAL_SECONDS = {
     "1m": 60,
     "5m": 5 * 60,
@@ -521,7 +614,7 @@ def get_klines_cache_first(
     end_time_ms: Optional[int] = None,
     external_budget_seconds: Optional[float] = None,
     open_time_validator: Optional[OpenTimeValidator] = None,
-) -> list[dict[str, Any]]:
+) -> KlineCacheResult:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
     normalized_limit = normalize_kline_limit(limit)
@@ -536,25 +629,31 @@ def get_klines_cache_first(
         open_time_validator=open_time_validator,
     )
     cached_continuous = _validate_cached_klines_continuity(cached, normalized_interval)
-    if len(cached) >= normalized_limit and cached_continuous and (
-        end_time_ms
-        or _latest_cache_is_fresh(
+    latest_cache_fresh = True
+    if end_time_ms is None and len(cached) >= normalized_limit and cached_continuous:
+        latest_cache_fresh = _latest_cache_is_fresh(
             db,
             market_type=market_type,
             symbol=normalized_symbol,
             interval=normalized_interval,
             open_time_validator=open_time_validator,
         )
-    ):
+    if len(cached) >= normalized_limit and cached_continuous and (end_time_ms or latest_cache_fresh):
         record_kline_db_hit(
             market_type=market_type,
             symbol=normalized_symbol,
             interval=normalized_interval,
             count=len(cached),
         )
-        return cached[-normalized_limit:]
+        return KlineCacheResult(
+            cached[-normalized_limit:],
+            origin=KLINE_CACHE_ORIGIN_DB_CACHE,
+            cache_status=KLINE_CACHE_STATUS_HIT,
+        )
 
+    cache_status = KLINE_CACHE_STATUS_MISS
     if cached and not cached_continuous:
+        cache_status = KLINE_CACHE_STATUS_CONTINUITY_INVALID
         logger.debug(
             "kline_db_cache_continuity_failed market_type=%s symbol=%s interval=%s count=%s",
             market_type,
@@ -562,8 +661,18 @@ def get_klines_cache_first(
             normalized_interval,
             len(cached),
         )
+    elif cached and len(cached) < normalized_limit:
+        cache_status = KLINE_CACHE_STATUS_SHORT
+    elif cached and not latest_cache_fresh:
+        cache_status = KLINE_CACHE_STATUS_STALE_OPEN
 
-    def stale_cached() -> list[dict[str, Any]]:
+    def stale_cached(
+        *,
+        cache_status_override: Optional[str] = None,
+        provider_error_code: Optional[str] = None,
+        provider_error_provider: Optional[str] = None,
+    ) -> KlineCacheResult:
+        result_cache_status = cache_status_override or cache_status
         rows = cached or _read_cached_klines(
             db,
             market_type=market_type,
@@ -574,8 +683,24 @@ def get_klines_cache_first(
             allow_stale_open=True,
             open_time_validator=open_time_validator,
         )
-        if not rows or _validate_cached_klines_continuity(rows, normalized_interval):
-            return rows
+        if rows and _validate_cached_klines_continuity(rows, normalized_interval):
+            return KlineCacheResult(
+                rows,
+                origin=KLINE_CACHE_ORIGIN_STALE_CACHE,
+                cache_status=result_cache_status,
+                provider_error_code=provider_error_code,
+                provider_error_provider=provider_error_provider,
+                history_incomplete=bool(end_time_ms is not None and len(rows) < normalized_limit),
+            )
+        if not rows:
+            return KlineCacheResult(
+                [],
+                origin=KLINE_CACHE_ORIGIN_EMPTY,
+                cache_status=result_cache_status,
+                provider_error_code=provider_error_code,
+                provider_error_provider=provider_error_provider,
+                history_incomplete=bool(end_time_ms is not None),
+            )
         logger.debug(
             "kline_db_stale_cache_continuity_failed market_type=%s symbol=%s interval=%s count=%s",
             market_type,
@@ -583,7 +708,14 @@ def get_klines_cache_first(
             normalized_interval,
             len(rows),
         )
-        return []
+        return KlineCacheResult(
+            [],
+            origin=KLINE_CACHE_ORIGIN_EMPTY,
+            cache_status=KLINE_CACHE_STATUS_CONTINUITY_INVALID,
+            provider_error_code=provider_error_code,
+            provider_error_provider=provider_error_provider,
+            history_incomplete=bool(end_time_ms is not None),
+        )
 
     if external_budget_seconds is not None and external_budget_seconds <= 0:
         return stale_cached()
@@ -605,6 +737,7 @@ def get_klines_cache_first(
             end_time_ms,
         )
     except Exception as exc:
+        provider_error_code, provider_error_provider = _classify_provider_error(exc)
         record_error(
             provider=source,
             symbol=normalized_symbol,
@@ -618,7 +751,10 @@ def get_klines_cache_first(
             normalized_interval,
             exc,
         )
-        return stale_cached()
+        return stale_cached(
+            provider_error_code=provider_error_code,
+            provider_error_provider=provider_error_provider,
+        )
 
     if external_budget_seconds is not None:
         elapsed = time.monotonic() - started_at
@@ -631,7 +767,13 @@ def get_klines_cache_first(
                 elapsed,
                 external_budget_seconds,
             )
-            return stale_cached()
+            return stale_cached(provider_error_code=KLINE_PROVIDER_ERROR_TIMEOUT)
+
+    if not external_items:
+        return stale_cached(
+            cache_status_override=KLINE_CACHE_STATUS_PROVIDER_EMPTY,
+            provider_error_code=KLINE_PROVIDER_ERROR_EMPTY,
+        )
 
     upsert_klines(
         db,
@@ -660,13 +802,23 @@ def get_klines_cache_first(
             normalized_interval,
             len(refreshed),
         )
-    if refreshed and refreshed_continuous and (len(refreshed) >= normalized_limit or not external_items):
-        return refreshed[-normalized_limit:]
+    if refreshed and refreshed_continuous and len(refreshed) >= normalized_limit:
+        return KlineCacheResult(
+            refreshed[-normalized_limit:],
+            origin=KLINE_CACHE_ORIGIN_REST_FETCH,
+            cache_status=cache_status,
+            history_incomplete=False,
+        )
 
-    return [
+    return KlineCacheResult(
+        [
         serialize_kline_item(item, normalized_interval)
         for item in (
             _normalize_item(raw_item, normalized_interval) for raw_item in external_items
         )
         if item is not None
-    ][-normalized_limit:]
+        ][-normalized_limit:],
+        origin=KLINE_CACHE_ORIGIN_REST_FETCH,
+        cache_status=cache_status,
+        history_incomplete=False,
+    )
