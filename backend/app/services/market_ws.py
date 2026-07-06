@@ -37,7 +37,7 @@ def _normalize_symbol(symbol: str) -> str:
 
 def _normalize_interval(interval: str | None) -> str:
     normalized = normalize_spot_kline_bucket_interval(interval)
-    if normalized in {"1m", "5m", "15m", "1h", "4h", "1d", "1w", "1M"}:
+    if normalized in {"1m", "5m", "15m", "1h", "4h", "1d", "1Dutc", "1w", "1Wutc", "1M", "1Mutc"}:
         return normalized
     return "1m"
 

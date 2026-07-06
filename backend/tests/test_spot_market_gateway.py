@@ -600,6 +600,51 @@ def test_gateway_kline_broadcast_state_dedupes_detects_ohlcv_changes_and_isolate
     asyncio.run(run())
 
 
+def test_gateway_kline_interval_lifecycle_preserves_utc_intervals() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        ws_manager.intervals = ["1dutc", "1Wutc", "1mutc"]
+        ensured_klines: list[tuple[str, str]] = []
+        released_klines: list[tuple[str, str]] = []
+        gateway = SpotMarketGateway(
+            ensure_kline=lambda symbol, interval: ensured_klines.append((symbol, interval)),
+            release_kline=lambda symbol, interval: released_klines.append((symbol, interval)),
+            provider_symbol_allowed=lambda symbol: True,
+            ws_manager=ws_manager,
+        )
+        gateway._symbol_providers["BTCUSDT"] = market.PROVIDER_OKX_SPOT
+
+        active = await gateway._active_kline_intervals("BTCUSDT")
+        assert active == ["1Dutc", "1Mutc", "1Wutc"]
+
+        ready = await gateway._sync_kline_intervals("BTCUSDT", active)
+        assert ready == ["1Dutc", "1Mutc", "1Wutc"]
+        assert set(ensured_klines) == {
+            ("BTCUSDT", "1Dutc"),
+            ("BTCUSDT", "1Wutc"),
+            ("BTCUSDT", "1Mutc"),
+        }
+        assert gateway._ensured_kline_intervals["BTCUSDT"] == {"1Dutc", "1Wutc", "1Mutc"}
+
+        ready = await gateway._sync_kline_intervals("BTCUSDT", ["1Dutc"])
+        assert ready == ["1Dutc"]
+        assert set(released_klines) == {("BTCUSDT", "1Wutc"), ("BTCUSDT", "1Mutc")}
+        assert gateway._ensured_kline_intervals["BTCUSDT"] == {"1Dutc"}
+        assert gateway._domain_key(
+            "kline",
+            "BTCUSDT",
+            provider=market.PROVIDER_OKX_SPOT,
+            interval="1dutc",
+        ) == gateway._domain_key(
+            "kline",
+            "BTCUSDT",
+            provider=market.PROVIDER_OKX_SPOT,
+            interval="1Dutc",
+        )
+
+    asyncio.run(run())
+
+
 def test_gateway_sync_kline_intervals_releases_inactive_and_ensures_new_interval() -> None:
     async def run() -> None:
         ws_manager = FakeWsManager()
