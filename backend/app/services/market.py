@@ -119,8 +119,11 @@ _INTERVAL_SECONDS = {
     "1h": 3600,
     "4h": 4 * 3600,
     "1d": 86400,
+    "1Dutc": 86400,
     "1w": 7 * 86400,
+    "1Wutc": 7 * 86400,
     "1M": 30 * 86400,
+    "1Mutc": 30 * 86400,
 }
 _INTERNAL_SPOT_KLINE_SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
 
@@ -1335,8 +1338,11 @@ def _spot_interval_value(provider_code: str, interval: str) -> str:
             "1h": "1H",
             "4h": "4H",
             "1d": "1D",
+            "1Dutc": "1Dutc",
             "1w": "1W",
+            "1Wutc": "1Wutc",
             "1M": "1M",
+            "1Mutc": "1Mutc",
         }.get(normalized, normalized)
     if provider_code == "BITGET_SPOT":
         return {
@@ -3171,6 +3177,7 @@ def get_klines(
     interval: str,
     limit: int = 200,
     end_time_ms: Optional[int] = None,
+    force_rest: bool = False,
 ):
     symbol = symbol.upper().strip()
     interval = normalize_spot_kline_bucket_interval(interval)
@@ -3189,7 +3196,7 @@ def get_klines(
             providers = _enabled_spot_market_providers_for_pair(db, pair)
             primary_provider = providers[0] if providers else None
             primary_provider_code = str(primary_provider.provider_code) if primary_provider is not None else None
-            if end_time_ms is None:
+            if end_time_ms is None and not force_rest:
                 if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code, domain="kline"):
                     live_ws_klines = get_spot_provider_ws_klines(
                         pair.symbol,

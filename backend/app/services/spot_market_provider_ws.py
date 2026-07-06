@@ -55,8 +55,11 @@ OKX_SPOT_KLINE_CHANNELS = {
     "1h": "candle1H",
     "4h": "candle4H",
     "1d": "candle1D",
+    "1Dutc": "candle1Dutc",
     "1w": "candle1W",
+    "1Wutc": "candle1Wutc",
     "1M": "candle1M",
+    "1Mutc": "candle1Mutc",
 }
 SPOT_KLINE_INTERVAL_MS = {
     "1m": 60_000,
@@ -65,8 +68,11 @@ SPOT_KLINE_INTERVAL_MS = {
     "1h": 3_600_000,
     "4h": 14_400_000,
     "1d": 86_400_000,
+    "1Dutc": 86_400_000,
     "1w": 7 * 86_400_000,
+    "1Wutc": 7 * 86_400_000,
     "1M": 30 * 86_400_000,
+    "1Mutc": 30 * 86_400_000,
 }
 _KLINE_TRADE_SIGNATURE_LIMIT = 2000
 _PROVIDER_WS_SHUTDOWN_NOISE_MESSAGES = (
@@ -1579,7 +1585,7 @@ class SpotMarketProviderWsService:
         if price is None or amount is None or price <= 0 or amount <= 0 or trade_ts_ms <= 0:
             return
         provider, local_symbol, normalized_interval = key
-        if provider == PROVIDER_OKX_SPOT and normalized_interval in {"1d", "1w", "1M"}:
+        if provider == PROVIDER_OKX_SPOT and normalized_interval in {"1d", "1Dutc", "1w", "1Wutc", "1M", "1Mutc"}:
             return
         interval_ms = SPOT_KLINE_INTERVAL_MS[normalize_spot_ws_kline_interval(interval)]
         open_time = spot_kline_bucket_start_ms(
