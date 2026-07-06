@@ -9,6 +9,7 @@ import {
   createSpotTradingViewDatafeed,
   preloadSpotTradingViewKlineCache,
   spotIntervalToTradingViewResolution,
+  type SpotTradingViewHistoryBarsEvent,
 } from './tradingview/spotTradingViewDatafeed';
 
 type TradingViewVisibleRange = {
@@ -61,6 +62,15 @@ type SpotTradingViewChartProps = SpotChartProps & {
 
 type SpotTradingViewWindow = Window & {
   TradingView?: SpotTradingViewGlobal;
+  __SPOT_TV_DEBUG_EVENTS__?: SpotTvDebugEvent[];
+  __dumpSpotTvDebug?: () => SpotTvDebugEvent[];
+};
+
+type SpotTvDebugEvent = {
+  event: string;
+  timestamp: number;
+  time: string;
+  [key: string]: unknown;
 };
 
 const TRADINGVIEW_LIBRARY_PATH = '/tradingview/charting_library/';
@@ -83,14 +93,28 @@ const SPOT_PRELOAD_INTERVAL_OPTIONS: Record<string, string[]> = {
 };
 const TIME_SHARING_LABEL = '\u5206\u65f6';
 const TIME_SHARING_KEY = 'time';
-const VISIBLE_RANGE_LOOKBACK_SECONDS: Record<string, number> = {
-  '1m': 120 * 60,
-  '5m': 100 * 5 * 60,
-  '15m': 96 * 15 * 60,
-  '1h': 100 * 60 * 60,
-  '4h': 90 * 4 * 60 * 60,
-  '1d': 90 * 24 * 60 * 60,
-  '1w': 60 * 7 * 24 * 60 * 60,
+const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
+const SPOT_TV_INITIAL_RIGHT_PADDING_BARS = 4;
+const SPOT_TV_INITIAL_VISIBLE_RANGE_DELAY_MS = 80;
+const SPOT_TV_INITIAL_VISIBLE_BARS: Record<string, number> = {
+  '1m': 160,
+  '5m': 140,
+  '15m': 120,
+  '1h': 110,
+  '4h': 90,
+  '1d': 75,
+  '1w': 70,
+  '1M': 48,
+};
+const SPOT_TV_INTERVAL_SECONDS: Record<string, number> = {
+  '1m': 60,
+  '5m': 5 * 60,
+  '15m': 15 * 60,
+  '1h': 60 * 60,
+  '4h': 4 * 60 * 60,
+  '1d': 24 * 60 * 60,
+  '1w': 7 * 24 * 60 * 60,
+  '1M': 30 * 24 * 60 * 60,
 };
 
 function normalizeTradingViewSymbol(symbol: string) {
@@ -108,9 +132,55 @@ function isSpotTradingViewDebugEnabled() {
   if (typeof window === 'undefined') return false;
 
   try {
+    if (new URLSearchParams(window.location.search || '').get('tvdebug') === '1') return true;
+    if (/[?&]tvdebug=1(?:&|$)/.test(window.location.href || '')) return true;
+  } catch {
+    // URL access is best-effort only for diagnostics.
+  }
+
+  try {
     return window.localStorage?.getItem('SPOT_TV_DEBUG') === '1';
   } catch {
     return false;
+  }
+}
+
+function ensureSpotTradingViewDebugBuffer() {
+  if (typeof window === 'undefined') return null;
+  const debugWindow = window as SpotTradingViewWindow;
+  try {
+    debugWindow.__SPOT_TV_DEBUG_EVENTS__ = debugWindow.__SPOT_TV_DEBUG_EVENTS__ || [];
+    debugWindow.__dumpSpotTvDebug = () => (debugWindow.__SPOT_TV_DEBUG_EVENTS__ || []).slice(-100);
+    return debugWindow;
+  } catch {
+    return null;
+  }
+}
+
+function spotTradingViewChartDebug(event: string, payload: Record<string, unknown>) {
+  if (!isSpotTradingViewDebugEnabled()) return;
+  const debugWindow = ensureSpotTradingViewDebugBuffer();
+  if (!debugWindow) return;
+
+  const timestamp = Date.now();
+  const entry: SpotTvDebugEvent = {
+    event,
+    timestamp,
+    time: new Date(timestamp).toISOString(),
+    ...payload,
+  };
+
+  try {
+    const events = debugWindow.__SPOT_TV_DEBUG_EVENTS__ || [];
+    events.push(entry);
+    if (events.length > SPOT_TV_DEBUG_EVENT_LIMIT) {
+      events.splice(0, events.length - SPOT_TV_DEBUG_EVENT_LIMIT);
+    }
+    debugWindow.__SPOT_TV_DEBUG_EVENTS__ = events;
+    debugWindow.__dumpSpotTvDebug = () => (debugWindow.__SPOT_TV_DEBUG_EVENTS__ || []).slice(-100);
+    console.info(`[SpotTradingViewChart] ${event} ${JSON.stringify(entry)}`);
+  } catch {
+    // Debug telemetry is best-effort only.
   }
 }
 
@@ -124,42 +194,26 @@ function formatIntervalLabel(value: string) {
   return normalized;
 }
 
-function resolveInitialTimeframe(interval: string) {
-  if (interval === '1M') return resolveMonthlyInitialVisibleRange();
-  if (interval === '1w') return resolveVisibleRangeForInterval(interval);
-  return undefined;
-}
-
-function resolveMonthlyInitialVisibleRange(nowMs = Date.now()) {
-  const now = new Date(nowMs);
-  const from = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 35, 1) / 1000;
-  const to = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 2, 1) / 1000;
-  return { from, to };
-}
-
-function resolveVisibleRangeForInterval(interval: string, nowMs = Date.now()): TradingViewVisibleRange {
-  if (interval === '1M') {
-    return resolveMonthlyInitialVisibleRange(nowMs);
-  }
-
-  const lookbackSeconds = VISIBLE_RANGE_LOOKBACK_SECONDS[interval] ?? VISIBLE_RANGE_LOOKBACK_SECONDS['1d'];
-  return { from: Math.floor(nowMs / 1000) - lookbackSeconds };
-}
-
 function getSpotPreloadIntervals(interval: string) {
   return SPOT_PRELOAD_INTERVAL_OPTIONS[interval] || [];
 }
 
-function applyVisibleRangeForInterval(chart: TradingViewChartApi, interval: string) {
-  if (typeof chart.setVisibleRange !== 'function') return;
+function resolveInitialVisibleRangeFromLatestBar(interval: string, latestBarTimeMs: number) {
+  const targetVisibleBars = SPOT_TV_INITIAL_VISIBLE_BARS[interval] ?? SPOT_TV_INITIAL_VISIBLE_BARS['1d'];
+  const intervalSeconds = SPOT_TV_INTERVAL_SECONDS[interval] ?? SPOT_TV_INTERVAL_SECONDS['1d'];
+  const latestBarTime = Math.floor(latestBarTimeMs / 1000);
+  if (!Number.isFinite(latestBarTime) || latestBarTime <= 0) return null;
 
-  const maybePromise = chart.setVisibleRange(resolveVisibleRangeForInterval(interval), {
-    percentRightMargin: 8,
-    rejectByTimeout: 1500,
-  });
-  if (maybePromise && typeof maybePromise.catch === 'function') {
-    void maybePromise.catch(() => undefined);
-  }
+  return {
+    range: {
+      from: latestBarTime - intervalSeconds * targetVisibleBars,
+      to: latestBarTime + intervalSeconds * SPOT_TV_INITIAL_RIGHT_PADDING_BARS,
+    },
+    intervalSeconds,
+    latestBarTime,
+    rightPaddingBars: SPOT_TV_INITIAL_RIGHT_PADDING_BARS,
+    targetVisibleBars,
+  };
 }
 
 function styleToolbarButton(button: HTMLButtonElement, active: boolean) {
@@ -199,7 +253,11 @@ export default function SpotTradingViewChart({
   const resolutionFallbackKeyRef = useRef('');
   const warnedResolutionFallbackRef = useRef(false);
   const activeIntervalRef = useRef('');
+  const normalizedSymbolRef = useRef('');
   const widgetIntervalRef = useRef('');
+  const initialVisibleRangeAppliedKeyRef = useRef('');
+  const initialVisibleRangeApplySeqRef = useRef(0);
+  const pendingInitialVisibleRangeRef = useRef<SpotTradingViewHistoryBarsEvent | null>(null);
   const toolbarButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const [loadError, setLoadError] = useState<TradingViewLoadError | null>(null);
   const [scriptReady, setScriptReady] = useState(false);
@@ -237,8 +295,123 @@ export default function SpotTradingViewChart({
     [widgetKey],
   );
 
+  const applyInitialVisibleRangeFromHistory = useCallback(
+    (event: SpotTradingViewHistoryBarsEvent, triggerReason = 'history-callback') => {
+      const activeSymbol = normalizedSymbolRef.current;
+      const activeIntervalValue = activeIntervalRef.current || '1m';
+      const activeResolution = widgetIntervalRef.current || spotIntervalToTradingViewResolution(activeIntervalValue);
+      const eventSymbol = normalizeTradingViewSymbol(event.symbol);
+      const applyKey = `${activeSymbol}:${activeResolution}:${activeIntervalValue}`;
+      const latestBarTimeMs = Number(event.lastBarTime || 0);
+      const rangeInfo = resolveInitialVisibleRangeFromLatestBar(activeIntervalValue, latestBarTimeMs);
+      const baseDebugPayload = {
+        phase: 'initial-visible-range',
+        symbol: event.symbol,
+        activeSymbol,
+        resolution: event.resolution,
+        activeResolution,
+        interval: event.interval,
+        activeInterval: activeIntervalValue,
+        requestSeq: event.requestSeq,
+        barCount: event.barCount,
+        requiredBars: event.requiredBars,
+        latestBarTime: latestBarTimeMs || null,
+        latestBarTimeIso: latestBarTimeMs ? new Date(latestBarTimeMs).toISOString() : null,
+        targetVisibleBars: rangeInfo?.targetVisibleBars ?? null,
+        from: rangeInfo?.range.from ?? null,
+        to: rangeInfo?.range.to ?? null,
+      };
+
+      if (event.isHistoryRequest || event.phase !== 'current') {
+        spotTradingViewChartDebug('initial-visible-range', {
+          ...baseDebugPayload,
+          applied: false,
+          reason: 'skip non-current getBars callback',
+        });
+        return;
+      }
+      if (!event.barCount || !rangeInfo) {
+        spotTradingViewChartDebug('initial-visible-range', {
+          ...baseDebugPayload,
+          applied: false,
+          reason: 'skip empty bars',
+        });
+        return;
+      }
+      if (!activeSymbol || eventSymbol !== activeSymbol || event.resolution !== activeResolution) {
+        spotTradingViewChartDebug('initial-visible-range', {
+          ...baseDebugPayload,
+          applied: false,
+          reason: 'skip stale symbol or resolution',
+        });
+        return;
+      }
+      if (initialVisibleRangeAppliedKeyRef.current === applyKey) {
+        spotTradingViewChartDebug('initial-visible-range', {
+          ...baseDebugPayload,
+          applied: false,
+          reason: 'already applied',
+        });
+        return;
+      }
+
+      const widget = widgetRef.current;
+      const chart = widget?.activeChart?.();
+      if (!widget || !chartReadyRef.current || !chart || typeof chart.setVisibleRange !== 'function') {
+        pendingInitialVisibleRangeRef.current = event;
+        spotTradingViewChartDebug('initial-visible-range', {
+          ...baseDebugPayload,
+          applied: false,
+          reason: !widget ? 'widget not ready' : 'chart not ready',
+        });
+        return;
+      }
+
+      initialVisibleRangeAppliedKeyRef.current = applyKey;
+      pendingInitialVisibleRangeRef.current = null;
+      const applySeq = ++initialVisibleRangeApplySeqRef.current;
+      window.setTimeout(() => {
+        if (initialVisibleRangeApplySeqRef.current !== applySeq) return;
+        if (widgetRef.current !== widget) return;
+        if (normalizedSymbolRef.current !== activeSymbol) return;
+        if (widgetIntervalRef.current !== activeResolution) return;
+
+        const maybePromise = chart.setVisibleRange?.(rangeInfo.range, {
+          applyDefaultRightMargin: false,
+          percentRightMargin: 0,
+          rejectByTimeout: 1500,
+        });
+        const debugPayload = {
+          ...baseDebugPayload,
+          rightPaddingBars: rangeInfo.rightPaddingBars,
+          intervalSeconds: rangeInfo.intervalSeconds,
+          applied: true,
+          reason: triggerReason,
+        };
+        if (maybePromise && typeof maybePromise.catch === 'function') {
+          void maybePromise
+            .then(() => {
+              spotTradingViewChartDebug('initial-visible-range', debugPayload);
+            })
+            .catch((error: unknown) => {
+              initialVisibleRangeAppliedKeyRef.current = '';
+              spotTradingViewChartDebug('initial-visible-range', {
+                ...debugPayload,
+                applied: false,
+                reason: 'setVisibleRange rejected',
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          return;
+        }
+        spotTradingViewChartDebug('initial-visible-range', debugPayload);
+      }, SPOT_TV_INITIAL_VISIBLE_RANGE_DELAY_MS);
+    },
+    [],
+  );
+
   const applyWidgetResolution = useCallback(
-    (nextResolution: string, nextInterval = activeIntervalRef.current) => {
+    (nextResolution: string) => {
       if (!nextResolution) return;
 
       const widget = widgetRef.current;
@@ -264,19 +437,15 @@ export default function SpotTradingViewChart({
       pendingResolutionRef.current = nextResolution;
       let finished = false;
 
-      const scheduleVisibleRangeApply = (delayMs: number) => {
-        window.setTimeout(() => {
-          if (resolutionRequestSeqRef.current !== requestSeq || widgetRef.current !== widget) return;
-          applyVisibleRangeForInterval(chart, nextInterval);
-        }, delayMs);
-      };
-
       const finishResolutionChange = () => {
         if (finished || resolutionRequestSeqRef.current !== requestSeq || widgetRef.current !== widget) return;
         finished = true;
         currentResolutionRef.current = nextResolution;
         pendingResolutionRef.current = '';
-        applyVisibleRangeForInterval(chart, nextInterval);
+        const pendingInitialRange = pendingInitialVisibleRangeRef.current;
+        if (pendingInitialRange) {
+          applyInitialVisibleRangeFromHistory(pendingInitialRange, 'resolution-data-ready');
+        }
       };
 
       try {
@@ -296,19 +465,19 @@ export default function SpotTradingViewChart({
           });
         }
         currentResolutionRef.current = nextResolution;
-        scheduleVisibleRangeApply(50);
       } catch (error) {
         pendingResolutionRef.current = nextResolution;
         requestResolutionFallbackRebuild(nextResolution, 'setResolution threw', error);
       }
     },
-    [requestResolutionFallbackRebuild],
+    [applyInitialVisibleRangeFromHistory, requestResolutionFallbackRebuild],
   );
 
   useEffect(() => {
+    normalizedSymbolRef.current = normalizedSymbol;
     activeIntervalRef.current = activeInterval;
     widgetIntervalRef.current = widgetInterval;
-  }, [activeInterval, widgetInterval]);
+  }, [activeInterval, normalizedSymbol, widgetInterval]);
 
   useEffect(() => {
     if (!normalizedSymbol) return undefined;
@@ -345,6 +514,9 @@ export default function SpotTradingViewChart({
       chartReadyRef.current = false;
       currentResolutionRef.current = '';
       pendingResolutionRef.current = '';
+      initialVisibleRangeApplySeqRef.current += 1;
+      initialVisibleRangeAppliedKeyRef.current = '';
+      pendingInitialVisibleRangeRef.current = null;
       toolbarButtonRefs.current.clear();
       widgetRef.current?.remove();
       widgetRef.current = null;
@@ -383,6 +555,7 @@ export default function SpotTradingViewChart({
       displaySymbol: displayName,
       pricePrecision,
       amountPrecision,
+      onHistoryBars: applyInitialVisibleRangeFromHistory,
       debugEnabled: isSpotTradingViewDebugEnabled(),
     });
     datafeedRef.current = datafeed;
@@ -391,7 +564,6 @@ export default function SpotTradingViewChart({
       autosize: true,
       symbol: normalizedSymbol,
       interval: initialResolution,
-      timeframe: resolveInitialTimeframe(initialInterval),
       container: containerId,
       datafeed,
       library_path: TRADINGVIEW_LIBRARY_PATH,
@@ -448,9 +620,13 @@ export default function SpotTradingViewChart({
       chartReadyRef.current = true;
       const pendingResolution = pendingResolutionRef.current;
       if (pendingResolution && pendingResolution !== currentResolutionRef.current) {
-        applyWidgetResolution(pendingResolution, activeIntervalRef.current);
+        applyWidgetResolution(pendingResolution);
       } else {
         pendingResolutionRef.current = '';
+      }
+      const pendingInitialRange = pendingInitialVisibleRangeRef.current;
+      if (pendingInitialRange) {
+        applyInitialVisibleRangeFromHistory(pendingInitialRange, 'chart-ready');
       }
     };
 
@@ -517,6 +693,7 @@ export default function SpotTradingViewChart({
     };
   }, [
     applyWidgetResolution,
+    applyInitialVisibleRangeFromHistory,
     amountPrecision,
     chartMode,
     containerId,
@@ -536,7 +713,7 @@ export default function SpotTradingViewChart({
     updateToolbarButtons(toolbarButtonRefs.current, chartMode, activeInterval);
 
     const timer = window.setTimeout(() => {
-      if (!cancelled) applyWidgetResolution(widgetInterval, activeInterval);
+      if (!cancelled) applyWidgetResolution(widgetInterval);
     }, 0);
 
     return () => {
