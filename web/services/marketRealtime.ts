@@ -85,6 +85,20 @@ type SpotMarketRealtimeConnection = {
 };
 
 const BASE_INTERVAL = '1m';
+const SPOT_KLINE_INTERVAL_ALIASES: Record<string, string> = {
+  '1m': '1m',
+  '5m': '5m',
+  '15m': '15m',
+  '1h': '1h',
+  '4h': '4h',
+  '1d': '1d',
+  '1dutc': '1Dutc',
+  '1w': '1w',
+  '1wutc': '1Wutc',
+  '1M': '1M',
+  '1mutc': '1Mutc',
+};
+const SPOT_KLINE_INTERVALS = new Set(Object.values(SPOT_KLINE_INTERVAL_ALIASES));
 
 function buildSpotWsUrl(symbol: string, interval = '1m') {
   const apiBase = getRuntimeApiBaseUrl();
@@ -101,10 +115,11 @@ function normalizeSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase();
 }
 
-function normalizeInterval(interval?: string | null) {
+function normalizeSpotRealtimeInterval(interval?: string | null) {
   const raw = String(interval || '1m').trim();
-  const normalized = raw === '1M' ? raw : raw.toLowerCase();
-  return ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'].includes(normalized) ? normalized : '1m';
+  const key = raw === '1M' ? raw : raw.toLowerCase();
+  const normalized = SPOT_KLINE_INTERVAL_ALIASES[key] || raw;
+  return SPOT_KLINE_INTERVALS.has(normalized) ? normalized : BASE_INTERVAL;
 }
 
 function normalizeDomain(domain: SpotMarketRealtimeDomain): SpotMarketRealtimeDomain {
@@ -146,7 +161,7 @@ class SpotMarketRealtimeClient {
     const symbol = normalizeSymbol(options.symbol);
     if (!symbol) return '';
 
-    const interval = normalizeInterval(options.interval);
+    const interval = normalizeSpotRealtimeInterval(options.interval);
     const domains = Array.from(new Set(options.domains.map(normalizeDomain)));
     if (!domains.length) return '';
 
@@ -408,7 +423,7 @@ class SpotMarketRealtimeClient {
     if (messageSymbol && messageSymbol !== connection.symbol) return false;
 
     if (domain === 'kline') {
-      const messageInterval = normalizeInterval(this.getMessageInterval(message));
+      const messageInterval = normalizeSpotRealtimeInterval(this.getMessageInterval(message));
       return messageInterval === connection.interval;
     }
 

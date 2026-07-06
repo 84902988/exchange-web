@@ -130,6 +130,34 @@ def test_spot_provider_ws_supported_provider_gate() -> None:
     ]
 
 
+def test_okx_spot_kline_utc_channels_are_mapped() -> None:
+    assert provider_ws.normalize_spot_ws_kline_interval("1Dutc") == "1Dutc"
+    assert provider_ws.normalize_spot_ws_kline_interval("1dutc") == "1Dutc"
+    assert provider_ws.normalize_spot_ws_kline_interval("1Wutc") == "1Wutc"
+    assert provider_ws.normalize_spot_ws_kline_interval("1wutc") == "1Wutc"
+    assert provider_ws.normalize_spot_ws_kline_interval("1Mutc") == "1Mutc"
+    assert provider_ws.normalize_spot_ws_kline_interval("1mutc") == "1Mutc"
+    assert provider_ws.okx_spot_kline_channel("1Dutc") == "candle1Dutc"
+    assert provider_ws.okx_spot_kline_channel("1Wutc") == "candle1Wutc"
+    assert provider_ws.okx_spot_kline_channel("1Mutc") == "candle1Mutc"
+
+    service = provider_ws.SpotMarketProviderWsService()
+    ensure_calls: list[tuple[str, str, str | None]] = []
+    service._ensure_kline_symbol = lambda symbol, interval, provider=None: ensure_calls.append(
+        (symbol, interval, provider)
+    )
+
+    service.ensure_kline("BTCUSDT", "1Dutc", provider=provider_ws.PROVIDER_OKX_SPOT)
+    service.ensure_kline("BTCUSDT", "1wutc", provider=provider_ws.PROVIDER_OKX_SPOT)
+    service.ensure_kline("BTCUSDT", "1mutc", provider=provider_ws.PROVIDER_OKX_SPOT)
+
+    assert ensure_calls == [
+        ("BTCUSDT", "1Dutc", provider_ws.PROVIDER_OKX_SPOT),
+        ("BTCUSDT", "1Wutc", provider_ws.PROVIDER_OKX_SPOT),
+        ("BTCUSDT", "1Mutc", provider_ws.PROVIDER_OKX_SPOT),
+    ]
+
+
 def test_spot_provider_ws_has_no_enabled_switches() -> None:
     for name in (
         "SPOT_PROVIDER_WS_ENABLED",
