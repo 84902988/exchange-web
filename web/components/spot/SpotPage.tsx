@@ -48,6 +48,7 @@ const EMPTY_MARKET_DATA: SpotHeaderMarketData = {
 };
 const DEFAULT_SPOT_SYMBOL = 'BTCUSDT';
 const SPOT_PAIR_PAGE_SIZE = 6;
+const SPOT_INTERVAL_CHANGE_DEBOUNCE_MS = 350;
 type SpotPairQuery = {
   marketType: 'spot' | 'contract' | 'all';
   category: string;
@@ -55,6 +56,64 @@ type SpotPairQuery = {
   keyword: string;
 };
 const cachedSpotPairPages = new Map<string, { items: SpotPairOption[]; total: number }>();
+
+function normalizeSpotPageInterval(value: string): string {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (raw === '1M') return '1M';
+
+  const normalized = raw.toLowerCase();
+  if (normalized === '1h') return '1h';
+  if (normalized === '4h') return '4h';
+  if (normalized === '1d') return '1d';
+  if (normalized === '1w') return '1w';
+  return normalized;
+}
+
+function isSpotPageTvDebugEnabled() {
+  if (typeof window === 'undefined') return false;
+
+  try {
+    if (new URLSearchParams(window.location.search || '').get('tvdebug') === '1') return true;
+    if (/[?&]tvdebug=1(?:&|$)/.test(window.location.href || '')) return true;
+  } catch {
+    // Diagnostics only.
+  }
+
+  try {
+    return window.localStorage?.getItem('SPOT_TV_DEBUG') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function spotPageIntervalDebug(event: string, payload: Record<string, unknown>) {
+  if (!isSpotPageTvDebugEnabled()) return;
+
+  try {
+    const debugWindow = window as typeof window & {
+      __SPOT_TV_DEBUG_EVENTS__?: Array<Record<string, unknown>>;
+      __dumpSpotTvDebug?: () => Array<Record<string, unknown>>;
+    };
+    const timestamp = Date.now();
+    const entry = {
+      event,
+      timestamp,
+      time: new Date(timestamp).toISOString(),
+      ...payload,
+    };
+    const events = debugWindow.__SPOT_TV_DEBUG_EVENTS__ || [];
+    events.push(entry);
+    if (events.length > 500) {
+      events.splice(0, events.length - 500);
+    }
+    debugWindow.__SPOT_TV_DEBUG_EVENTS__ = events;
+    debugWindow.__dumpSpotTvDebug = () => (debugWindow.__SPOT_TV_DEBUG_EVENTS__ || []).slice(-100);
+    console.info(`[SpotPage] ${event} ${JSON.stringify(entry)}`);
+  } catch {
+    // Debug telemetry is best-effort only.
+  }
+}
 
 function getInitialPairQuery(category?: string): SpotPairQuery {
   const normalizedCategory = String(category || '').trim().toLowerCase();
@@ -375,6 +434,14 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const titleUpdateTimerRef = useRef<number | null>(null);
   const titleUpdatedAtRef = useRef(0);
   const [interval, setIntervalValue] = useState('1d');
+  const activeIntervalRef = useRef('1d');
+  const intervalChangeTimerRef = useRef<number | null>(null);
+  const intervalChangeSeqRef = useRef(0);
+  const pendingIntervalChangeRef = useRef<{
+    interval: string;
+    source: string;
+    seq: number;
+  } | null>(null);
   const [chartMode, setChartMode] = useState<SpotChartMode>('candle');
   const [orderPrice, setOrderPrice] = useState('');
   const [orderPriceSelectNonce, setOrderPriceSelectNonce] = useState(0);
@@ -504,6 +571,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   useEffect(() => {
     symbolRef.current = symbol;
   }, [symbol]);
+
+  useEffect(() => {
+    activeIntervalRef.current = interval;
+  }, [interval]);
 
   useEffect(() => {
     pairOptionsRef.current = pairOptions;
@@ -760,9 +831,111 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     [pricePrecision, symbol]
   );
 
+  const clearPendingIntervalChange = useCallback((reason: string) => {
+    const pending = pendingIntervalChangeRef.current;
+    if (intervalChangeTimerRef.current !== null) {
+      window.clearTimeout(intervalChangeTimerRef.current);
+      intervalChangeTimerRef.current = null;
+    }
+    pendingIntervalChangeRef.current = null;
+
+    if (pending) {
+      spotPageIntervalDebug('interval-change-cancelled', {
+        interval: pending.interval,
+        source: pending.source,
+        reason,
+        debounceMs: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+      });
+    }
+  }, []);
+
+  const scheduleIntervalChange = useCallback(
+    (nextInterval: string, source = 'spot-page') => {
+      const requestedInterval = normalizeSpotPageInterval(nextInterval);
+      if (!requestedInterval) return;
+
+      const activeInterval = activeIntervalRef.current;
+      if (requestedInterval === activeInterval) {
+        clearPendingIntervalChange('already active');
+        spotPageIntervalDebug('interval-change-requested', {
+          interval: requestedInterval,
+          source,
+          skipped: true,
+          reason: 'already active',
+          debounceMs: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+        });
+        return;
+      }
+
+      const pending = pendingIntervalChangeRef.current;
+      if (pending?.interval === requestedInterval) {
+        spotPageIntervalDebug('interval-change-requested', {
+          interval: requestedInterval,
+          source,
+          skipped: true,
+          reason: 'already pending',
+          debounceMs: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+        });
+        return;
+      }
+
+      if (pending) {
+        clearPendingIntervalChange('superseded by latest intent');
+      }
+
+      const requestSeq = ++intervalChangeSeqRef.current;
+      pendingIntervalChangeRef.current = {
+        interval: requestedInterval,
+        source,
+        seq: requestSeq,
+      };
+
+      spotPageIntervalDebug('interval-change-requested', {
+        requestSeq,
+        interval: requestedInterval,
+        activeInterval,
+        source,
+        debounceMs: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+      });
+
+      intervalChangeTimerRef.current = window.setTimeout(() => {
+        const latestPending = pendingIntervalChangeRef.current;
+        if (!latestPending || latestPending.seq !== requestSeq) return;
+
+        intervalChangeTimerRef.current = null;
+        pendingIntervalChangeRef.current = null;
+
+        if (activeIntervalRef.current === requestedInterval) {
+          spotPageIntervalDebug('interval-change-committed', {
+            requestSeq,
+            interval: requestedInterval,
+            source,
+            skipped: true,
+            reason: 'already active at commit',
+            debounceMs: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+          });
+          return;
+        }
+
+        setIntervalValue(requestedInterval);
+        spotPageIntervalDebug('interval-change-committed', {
+          requestSeq,
+          interval: requestedInterval,
+          source,
+          debounceMs: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+        });
+      }, SPOT_INTERVAL_CHANGE_DEBOUNCE_MS);
+    },
+    [clearPendingIntervalChange],
+  );
+
+  useEffect(() => () => {
+    clearPendingIntervalChange('component unmount');
+  }, [clearPendingIntervalChange]);
+
   const handleSymbolChange = useCallback(
     (value: string) => {
-    const nextSymbol = normalizeSpotApiSymbol(value);
+      const nextSymbol = normalizeSpotApiSymbol(value);
       if (!nextSymbol || nextSymbol === symbol) {
         return;
       }
@@ -771,6 +944,30 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       router.push(`/trade/spot?symbol=${encodeURIComponent(nextSymbol)}`);
     },
     [router, symbol],
+  );
+
+  const handleHeaderIntervalChange = useCallback(
+    (value: string) => {
+      scheduleIntervalChange(value, 'header-selector');
+    },
+    [scheduleIntervalChange],
+  );
+
+  const handleChartIntervalChange = useCallback(
+    (value: string) => {
+      scheduleIntervalChange(value, 'tradingview-toolbar');
+    },
+    [scheduleIntervalChange],
+  );
+
+  const handleChartModeChange = useCallback(
+    (value: SpotChartMode) => {
+      if (value === 'time') {
+        clearPendingIntervalChange('chart mode changed to time sharing');
+      }
+      setChartMode(value);
+    },
+    [clearPendingIntervalChange],
   );
 
   const handlePairQueryChange = useCallback((nextQuery: SpotPairQuery) => {
@@ -963,8 +1160,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
               onPairQueryChange={handlePairQueryChange}
               onLoadMorePairs={handleLoadMorePairs}
               onSymbolChange={handleSymbolChange}
-              onIntervalChange={setIntervalValue}
-              onChartModeChange={setChartMode}
+              onIntervalChange={handleHeaderIntervalChange}
+              onChartModeChange={handleChartModeChange}
               placement="header"
             />
           }
@@ -979,8 +1176,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                   displaySymbol={currentDisplaySymbol}
                   interval={interval}
                   chartMode={chartMode}
-                  onIntervalChange={setIntervalValue}
-                  onChartModeChange={setChartMode}
+                  onIntervalChange={handleChartIntervalChange}
+                  onChartModeChange={handleChartModeChange}
                   dataSource={spotMarketDataSource}
                   klineSource={spotSources.kline}
                   klineFreshness={spotFreshness.kline}
