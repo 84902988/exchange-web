@@ -57,6 +57,7 @@ from app.services.spot_market_provider_ws import (
     get_spot_provider_ws_trades,
     spot_provider_ws_supports_provider,
 )
+from app.services.spot_ticker_shared_cache import get_spot_ticker_with_shared_cache
 
 logger = logging.getLogger(__name__)
 
@@ -1759,6 +1760,21 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = Fa
     return None
 
 
+def _get_external_spot_ticker_cached(db: Session, pair: TradingPair, *, fast: bool = False) -> Optional[TickerItem]:
+    def load_ticker() -> Optional[Dict[str, Any]]:
+        ticker = _get_external_spot_ticker(db, pair, fast=fast)
+        return _ticker_to_dict(ticker) if ticker is not None else None
+
+    payload = get_spot_ticker_with_shared_cache(
+        symbol=pair.symbol,
+        data_source=_normalize_data_source(pair),
+        loader=load_ticker,
+    )
+    if not isinstance(payload, dict):
+        return None
+    return TickerItem(**payload)
+
+
 def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20, *, fast: bool = False) -> DepthResponse:
     last_error: Optional[Exception] = None
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
@@ -2483,7 +2499,7 @@ def get_tickers(db: Session) -> TickerListResponse:
         data_source = _normalize_data_source(pair)
         ticker = None
         if data_source == DATA_SOURCE_BINANCE:
-            ticker = _get_external_spot_ticker(db, pair)
+            ticker = _get_external_spot_ticker_cached(db, pair)
         elif data_source == DATA_SOURCE_ITICK:
             ticker = _get_itick_ticker(pair, allow_upstream=False)
 
@@ -2532,7 +2548,7 @@ def get_market_tickers(
         data_source = _normalize_data_source(pair)
         ticker = None
         if data_source == DATA_SOURCE_BINANCE:
-            ticker = _get_external_spot_ticker(db, pair, fast=spot_fast)
+            ticker = _get_external_spot_ticker_cached(db, pair, fast=spot_fast)
         elif data_source == DATA_SOURCE_ITICK:
             quote_data = itick_quote_batch.get(pair.symbol)
             if _is_itick_stock_pair(pair) and not normalized_symbol and quote_data is None:
