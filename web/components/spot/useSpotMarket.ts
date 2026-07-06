@@ -92,6 +92,10 @@ type SpotMarketSourceMap = {
   kline: string | null;
 };
 
+type SpotMarketRefreshOptions = {
+  force?: boolean;
+};
+
 export type UseSpotMarketResult = {
   symbol: string;
   marketView: SpotMarketView | null;
@@ -120,7 +124,9 @@ export type UseSpotMarketResult = {
   refresh: () => Promise<void>;
 };
 
-const SPOT_VIEW_POLL_MS = 1500;
+const SPOT_VIEW_FOREGROUND_POLL_MS = 10000;
+const SPOT_VIEW_HIDDEN_POLL_MS = 30000;
+const SPOT_VIEW_MIN_REFRESH_INTERVAL_MS = 2000;
 const MAX_SEEN_TRADE_KEYS = 240;
 const EMPTY_LAST_TRADE_STATE: SpotLastTradeState = {
   price: null,
@@ -459,6 +465,8 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   const activeSymbolRef = useRef(normalizedSymbol);
   const refreshInFlightRef = useRef(false);
   const refreshInFlightSeqRef = useRef(0);
+  const refreshInFlightSymbolRef = useRef<string | null>(null);
+  const lastRefreshStartedAtBySymbolRef = useRef<Record<string, number>>({});
   const mountedRef = useRef(false);
   const lastGoodRef = useRef<SpotMarketCache | null>(null);
 
@@ -519,13 +527,23 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     }
   }, [normalizedSymbol]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options?: SpotMarketRefreshOptions) => {
     const requestSymbol = normalizedSymbol;
     if (!requestSymbol) return;
     if (activeSymbolRef.current !== requestSymbol) return;
+    const forceRefresh = Boolean(options?.force);
     if (
       refreshInFlightRef.current &&
-      activeSymbolRef.current === requestSymbol
+      refreshInFlightSymbolRef.current === requestSymbol
+    ) {
+      return;
+    }
+    const now = Date.now();
+    const lastRefreshStartedAt = lastRefreshStartedAtBySymbolRef.current[requestSymbol] || 0;
+    if (
+      !forceRefresh &&
+      lastRefreshStartedAt > 0 &&
+      now - lastRefreshStartedAt < SPOT_VIEW_MIN_REFRESH_INTERVAL_MS
     ) {
       return;
     }
@@ -533,6 +551,8 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     const requestSeq = ++requestSeqRef.current;
     refreshInFlightRef.current = true;
     refreshInFlightSeqRef.current = requestSeq;
+    refreshInFlightSymbolRef.current = requestSymbol;
+    lastRefreshStartedAtBySymbolRef.current[requestSymbol] = now;
     const isLatestRequest = () =>
       mountedRef.current &&
       requestSeqRef.current === requestSeq &&
@@ -556,6 +576,7 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       if (refreshInFlightSeqRef.current === requestSeq) {
         refreshInFlightRef.current = false;
         refreshInFlightSeqRef.current = 0;
+        refreshInFlightSymbolRef.current = null;
       }
 
       if (isLatestRequest()) {
@@ -576,6 +597,7 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     requestSeqRef.current += 1;
     refreshInFlightRef.current = false;
     refreshInFlightSeqRef.current = 0;
+    refreshInFlightSymbolRef.current = null;
     activeSymbolRef.current = normalizedSymbol;
     const cache = readSpotMarketCache(normalizedSymbol);
     lastGoodRef.current = cache;
@@ -594,7 +616,7 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   }, [normalizedSymbol, updateLastTradeState]);
 
   useEffect(() => {
-    void refresh();
+    void refresh({ force: true });
   }, [refresh]);
 
   useEffect(() => {
@@ -835,12 +857,48 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       return undefined;
     }
 
-    const timer = window.setInterval(() => {
-      void refresh();
-    }, SPOT_VIEW_POLL_MS);
+    let stopped = false;
+    let timer: number | null = null;
+
+    const getPollDelayMs = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return SPOT_VIEW_HIDDEN_POLL_MS;
+      }
+      return SPOT_VIEW_FOREGROUND_POLL_MS;
+    };
+
+    const clearTimer = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const scheduleNextRefresh = () => {
+      clearTimer();
+      timer = window.setTimeout(() => {
+        if (stopped) return;
+        void refresh();
+        scheduleNextRefresh();
+      }, getPollDelayMs());
+    };
+
+    const handleVisibilityChange = () => {
+      if (stopped) return;
+      clearTimer();
+      if (document.visibilityState === 'visible') {
+        void refresh({ force: true });
+      }
+      scheduleNextRefresh();
+    };
+
+    scheduleNextRefresh();
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
-      window.clearInterval(timer);
+      stopped = true;
+      clearTimer();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [normalizedSymbol, refresh]);
 
