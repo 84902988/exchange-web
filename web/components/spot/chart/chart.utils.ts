@@ -56,6 +56,10 @@ export function getIntervalSeconds(interval: string): number {
       return 4 * 60 * 60;
     case '1d':
       return 24 * 60 * 60;
+    case '1w':
+      return 7 * 24 * 60 * 60;
+    case '1M':
+      return 30 * 24 * 60 * 60;
     default:
       return 60;
   }

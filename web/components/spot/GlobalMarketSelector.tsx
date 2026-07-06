@@ -113,7 +113,7 @@ interface GlobalMarketSelectorProps {
   onLoadMorePairs?: () => void;
 }
 
-const intervals = ['1m', '5m', '15m', '1h', '4h', '1d'];
+const intervals = ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'];
 const TRADFI_INTERVALS = intervals.filter((item) => item !== '4h');
 
 const MARKET_TABS: Array<{ key: MarketLayerTab; labelKey: string }> = [
@@ -450,6 +450,8 @@ function formatIntervalLabel(value: string): string {
   if (normalized === '1h') return '1H';
   if (normalized === '4h') return '4H';
   if (normalized === '1d') return '1D';
+  if (normalized === '1w') return '1W';
+  if (normalized === '1M') return '1M';
   return normalized;
 }
 

@@ -21,6 +21,10 @@ from app.services.spot_kline_bucket import (  # noqa: E402
     DAY_MS,
     HOUR_MS,
     is_okx_spot_1d_open_time,
+    is_okx_spot_1M_open_time,
+    is_okx_spot_1w_open_time,
+    normalize_spot_kline_bucket_interval,
+    okx_spot_open_time_validator,
     spot_kline_bucket_start_ms,
 )
 
@@ -35,14 +39,20 @@ def _session():
     return sessionmaker(bind=engine)()
 
 
-def _kline_row(row_id: int, open_time: int, *, updated_at: datetime) -> MarketKline:
+def _kline_row(
+    row_id: int,
+    open_time: int,
+    *,
+    updated_at: datetime,
+    interval: str = "1d",
+) -> MarketKline:
     return MarketKline(
         id=row_id,
         market_type="spot",
         symbol="BTCUSDT",
-        interval="1d",
+        interval=interval,
         open_time=open_time,
-        close_time=open_time + DAY_MS,
+        close_time=open_time + market_kline_cache.interval_ms(interval),
         open=Decimal("1"),
         high=Decimal("2"),
         low=Decimal("1"),
@@ -71,6 +81,49 @@ def test_okx_spot_1d_bucket_uses_utc_plus_8_anchor() -> None:
         assert open_time % DAY_MS == 16 * HOUR_MS
 
     assert not is_okx_spot_1d_open_time(_ms(2026, 2, 5, 0))
+
+
+def test_spot_kline_interval_normalization_preserves_month_case() -> None:
+    assert normalize_spot_kline_bucket_interval("1W") == "1w"
+    assert normalize_spot_kline_bucket_interval("1w") == "1w"
+    assert normalize_spot_kline_bucket_interval("1M") == "1M"
+    assert normalize_spot_kline_bucket_interval("1m") == "1m"
+
+    assert market_kline_cache.normalize_kline_interval("1W") == "1w"
+    assert market_kline_cache.normalize_kline_interval("1M") == "1M"
+    assert market_kline_cache.normalize_kline_interval("1m") == "1m"
+
+
+def test_okx_spot_1w_bucket_uses_utc_plus_8_week_anchor() -> None:
+    samples = [
+        (_ms(2026, 2, 3, 12), _ms(2026, 2, 1, 16)),
+        (_ms(2026, 2, 8, 15, 59), _ms(2026, 2, 1, 16)),
+        (_ms(2026, 2, 8, 16), _ms(2026, 2, 8, 16)),
+    ]
+
+    for trade_ts_ms, expected_open_time in samples:
+        open_time = spot_kline_bucket_start_ms(trade_ts_ms, "1w", provider="OKX_SPOT")
+        assert open_time == expected_open_time
+        assert is_okx_spot_1w_open_time(open_time)
+        assert open_time % DAY_MS == 16 * HOUR_MS
+
+    assert not is_okx_spot_1w_open_time(_ms(2026, 2, 2, 0))
+
+
+def test_okx_spot_1M_bucket_uses_utc_plus_8_month_anchor() -> None:
+    samples = [
+        (_ms(2026, 2, 5, 12), _ms(2026, 1, 31, 16)),
+        (_ms(2026, 2, 28, 15, 59), _ms(2026, 1, 31, 16)),
+        (_ms(2026, 2, 28, 16), _ms(2026, 2, 28, 16)),
+    ]
+
+    for trade_ts_ms, expected_open_time in samples:
+        open_time = spot_kline_bucket_start_ms(trade_ts_ms, "1M", provider="OKX_SPOT")
+        assert open_time == expected_open_time
+        assert is_okx_spot_1M_open_time(open_time)
+        assert open_time % DAY_MS == 16 * HOUR_MS
+
+    assert not is_okx_spot_1M_open_time(_ms(2026, 2, 1, 0))
 
 
 def test_intraday_bucket_floor_is_unchanged_for_okx_spot() -> None:
@@ -116,6 +169,58 @@ def test_market_kline_cache_filters_mixed_okx_spot_1d_rows() -> None:
 
     assert [row["open_time"] for row in rows] == [valid_1, valid_2]
     assert all(is_okx_spot_1d_open_time(row["open_time"]) for row in rows)
+
+
+def test_market_kline_cache_filters_mixed_okx_spot_weekly_and_monthly_rows() -> None:
+    db = _session()
+    now = datetime.utcnow()
+    valid_week_1 = _ms(2026, 2, 1, 16)
+    valid_week_2 = _ms(2026, 2, 8, 16)
+    invalid_week = _ms(2026, 2, 9, 0)
+    valid_month_1 = _ms(2026, 1, 31, 16)
+    valid_month_2 = _ms(2026, 2, 28, 16)
+    invalid_month = _ms(2026, 2, 1, 0)
+    db.add_all(
+        [
+            _kline_row(10, valid_week_1, updated_at=now, interval="1w"),
+            _kline_row(11, invalid_week, updated_at=now, interval="1w"),
+            _kline_row(12, valid_week_2, updated_at=now, interval="1w"),
+            _kline_row(20, valid_month_1, updated_at=now, interval="1M"),
+            _kline_row(21, invalid_month, updated_at=now, interval="1M"),
+            _kline_row(22, valid_month_2, updated_at=now, interval="1M"),
+        ]
+    )
+    db.commit()
+
+    weekly_rows = market_kline_cache.get_klines_cache_first(
+        db,
+        market_type="spot",
+        symbol="BTCUSDT",
+        interval="1w",
+        limit=2,
+        source="EXTERNAL_SPOT",
+        fetch_external=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fresh valid weekly cache should avoid external fetch")
+        ),
+        open_time_validator=okx_spot_open_time_validator("1w"),
+    )
+    monthly_rows = market_kline_cache.get_klines_cache_first(
+        db,
+        market_type="spot",
+        symbol="BTCUSDT",
+        interval="1M",
+        limit=2,
+        source="EXTERNAL_SPOT",
+        fetch_external=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fresh valid monthly cache should avoid external fetch")
+        ),
+        open_time_validator=okx_spot_open_time_validator("1M"),
+    )
+
+    assert [row["open_time"] for row in weekly_rows] == [valid_week_1, valid_week_2]
+    assert all(is_okx_spot_1w_open_time(row["open_time"]) for row in weekly_rows)
+    assert [row["open_time"] for row in monthly_rows] == [valid_month_1, valid_month_2]
+    assert all(is_okx_spot_1M_open_time(row["open_time"]) for row in monthly_rows)
 
 
 def test_market_kline_cache_falls_back_when_filter_leaves_too_few_rows() -> None:
@@ -178,6 +283,49 @@ def test_market_kline_cache_falls_back_when_filter_leaves_too_few_rows() -> None
     assert fetch_calls == [(2, None)]
     assert [row["open_time"] for row in rows] == [valid_1, valid_2]
     assert all(is_okx_spot_1d_open_time(row["open_time"]) for row in rows)
+
+
+def test_market_kline_cache_filters_external_rows_after_history_end_time() -> None:
+    db = _session()
+    end_time_ms = _ms(2020, 1, 1, 0)
+    current_open_time = _ms(2026, 5, 31, 16)
+    fetch_calls: list[tuple[int, int | None]] = []
+
+    original_upsert = market_kline_cache.upsert_klines
+
+    def fetch_external(limit: int, fetch_end_time_ms: int | None):
+        fetch_calls.append((limit, fetch_end_time_ms))
+        return [
+            {
+                "open_time": current_open_time,
+                "close_time": current_open_time + market_kline_cache.interval_ms("1M"),
+                "open": "60000",
+                "high": "70000",
+                "low": "50000",
+                "close": "65000",
+                "volume": "10",
+                "quote_volume": "650000",
+            }
+        ]
+
+    try:
+        market_kline_cache.upsert_klines = lambda *args, **kwargs: 0
+        rows = market_kline_cache.get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol="BTCUSDT",
+            interval="1M",
+            limit=100,
+            source="EXTERNAL_SPOT",
+            fetch_external=fetch_external,
+            end_time_ms=end_time_ms,
+            open_time_validator=okx_spot_open_time_validator("1M"),
+        )
+    finally:
+        market_kline_cache.upsert_klines = original_upsert
+
+    assert fetch_calls == [(100, end_time_ms)]
+    assert rows == []
 
 
 if __name__ == "__main__":
