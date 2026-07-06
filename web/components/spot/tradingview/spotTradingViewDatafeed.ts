@@ -615,6 +615,7 @@ export function createSpotTradingViewDatafeed(
 
         const message = realtimeMessage as SpotMarketTradeMessage;
         if (message.type !== 'spot_trade') return;
+        if (interval === '1d') return;
 
         const trade = message.trade && typeof message.trade === 'object'
           ? message.trade as SpotMarketTradeItem

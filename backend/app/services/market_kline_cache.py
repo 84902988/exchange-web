@@ -20,6 +20,8 @@ from app.services.market_cache_metrics import (
 
 logger = logging.getLogger(__name__)
 
+OpenTimeValidator = Callable[[int], bool]
+
 SUPPORTED_KLINE_INTERVAL_SECONDS = {
     "1m": 60,
     "5m": 5 * 60,
@@ -143,6 +145,32 @@ def _normalize_item(item: Any, interval: str) -> Optional[dict[str, Any]]:
     }
 
 
+def _item_matches_open_time_validator(
+    item: Any,
+    open_time_validator: Optional[OpenTimeValidator],
+) -> bool:
+    if open_time_validator is None:
+        return True
+    try:
+        open_time = int(_get_item_value(item, "open_time", _get_item_value(item, "time", 0)) or 0)
+    except Exception:
+        return False
+    return open_time_validator(open_time)
+
+
+def _filter_items_by_open_time(
+    items: Iterable[Any],
+    open_time_validator: Optional[OpenTimeValidator],
+) -> list[Any]:
+    if open_time_validator is None:
+        return list(items)
+    return [
+        item
+        for item in items
+        if _item_matches_open_time_validator(item, open_time_validator)
+    ]
+
+
 def _is_missing_table_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "market_klines" in message and (
@@ -174,6 +202,7 @@ def _read_cached_klines(
     limit: int,
     end_time_ms: Optional[int] = None,
     allow_stale_open: bool = False,
+    open_time_validator: Optional[OpenTimeValidator] = None,
 ) -> list[dict[str, Any]]:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
@@ -192,9 +221,13 @@ def _read_cached_klines(
         if end_time_ms:
             query = query.filter(MarketKline.open_time < int(end_time_ms))
 
+        query_limit = normalized_limit
+        if open_time_validator is not None:
+            query_limit = min(max(normalized_limit * 3, normalized_limit), 3000)
+
         rows = (
             query.order_by(MarketKline.open_time.desc())
-            .limit(normalized_limit)
+            .limit(query_limit)
             .all()
         )
     except (ProgrammingError, OperationalError) as exc:
@@ -214,6 +247,8 @@ def _read_cached_klines(
 
     items: list[dict[str, Any]] = []
     for row in reversed(rows):
+        if not _item_matches_open_time_validator(row, open_time_validator):
+            continue
         if (
             not allow_stale_open
             and not bool(row.is_closed)
@@ -222,7 +257,7 @@ def _read_cached_klines(
         ):
             continue
         items.append(serialize_kline_item(row, normalized_interval))
-    return items
+    return items[-normalized_limit:]
 
 
 def _latest_cache_is_fresh(
@@ -231,13 +266,14 @@ def _latest_cache_is_fresh(
     market_type: str,
     symbol: str,
     interval: str,
+    open_time_validator: Optional[OpenTimeValidator] = None,
 ) -> bool:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
     ttl_seconds = LATEST_KLINE_REFRESH_TTL_SECONDS.get(normalized_interval, 30)
 
     try:
-        latest = (
+        query = (
             db.query(MarketKline)
             .filter(
                 MarketKline.market_type == market_type,
@@ -245,8 +281,15 @@ def _latest_cache_is_fresh(
                 MarketKline.interval == normalized_interval,
             )
             .order_by(MarketKline.open_time.desc())
-            .first()
         )
+        if open_time_validator is None:
+            latest = query.first()
+        else:
+            latest = None
+            for row in query.limit(100).all():
+                if _item_matches_open_time_validator(row, open_time_validator):
+                    latest = row
+                    break
     except (ProgrammingError, OperationalError) as exc:
         db.rollback()
         if _is_missing_table_error(exc):
@@ -365,6 +408,7 @@ def get_klines_cache_first(
     fetch_external: Callable[[int, Optional[int]], Iterable[Any]],
     end_time_ms: Optional[int] = None,
     external_budget_seconds: Optional[float] = None,
+    open_time_validator: Optional[OpenTimeValidator] = None,
 ) -> list[dict[str, Any]]:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
@@ -377,6 +421,7 @@ def get_klines_cache_first(
         interval=normalized_interval,
         limit=normalized_limit,
         end_time_ms=end_time_ms,
+        open_time_validator=open_time_validator,
     )
     if len(cached) >= normalized_limit and (
         end_time_ms
@@ -385,6 +430,7 @@ def get_klines_cache_first(
             market_type=market_type,
             symbol=normalized_symbol,
             interval=normalized_interval,
+            open_time_validator=open_time_validator,
         )
     ):
         record_kline_db_hit(
@@ -403,6 +449,7 @@ def get_klines_cache_first(
         limit=normalized_limit,
         end_time_ms=end_time_ms,
         allow_stale_open=True,
+        open_time_validator=open_time_validator,
     )
 
     if external_budget_seconds is not None and external_budget_seconds <= 0:
@@ -417,7 +464,10 @@ def get_klines_cache_first(
             symbol=normalized_symbol,
             interval=normalized_interval,
         )
-        external_items = list(fetch_external(normalized_limit, end_time_ms) or [])
+        external_items = _filter_items_by_open_time(
+            fetch_external(normalized_limit, end_time_ms) or [],
+            open_time_validator,
+        )
     except Exception as exc:
         record_error(
             provider=source,
@@ -463,8 +513,9 @@ def get_klines_cache_first(
         interval=normalized_interval,
         limit=normalized_limit,
         end_time_ms=end_time_ms,
+        open_time_validator=open_time_validator,
     )
-    if refreshed:
+    if refreshed and (len(refreshed) >= normalized_limit or not external_items):
         return refreshed[-normalized_limit:]
 
     return [

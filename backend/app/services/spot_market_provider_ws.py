@@ -17,6 +17,7 @@ import websockets
 from app.core.config import settings
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT
+from app.services.spot_kline_bucket import spot_kline_bucket_start_ms
 from app.services.spot_market_domain_cache import is_fresh_record
 
 
@@ -1571,8 +1572,14 @@ class SpotMarketProviderWsService:
         if price is None or amount is None or price <= 0 or amount <= 0 or trade_ts_ms <= 0:
             return
         provider, local_symbol, normalized_interval = key
+        if provider == PROVIDER_OKX_SPOT and normalized_interval == "1d":
+            return
         interval_ms = SPOT_KLINE_INTERVAL_MS[normalize_spot_ws_kline_interval(interval)]
-        open_time = trade_ts_ms - (trade_ts_ms % interval_ms)
+        open_time = spot_kline_bucket_start_ms(
+            trade_ts_ms,
+            normalized_interval,
+            provider=provider,
+        )
         close_time = open_time + interval_ms
         quote_amount = price * amount
         now_ms = _now_ms()
