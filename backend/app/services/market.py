@@ -29,7 +29,20 @@ from app.services.itick_market_service import (
     itick_market_service,
 )
 from app.services.itick_holiday_service import itick_holiday_service
-from app.services.market_kline_cache import get_klines_cache_first
+from app.services.market_kline_cache import (
+    KLINE_CACHE_ORIGIN_DB_CACHE,
+    KLINE_CACHE_ORIGIN_EMPTY,
+    KLINE_CACHE_ORIGIN_REST_FETCH,
+    KLINE_CACHE_ORIGIN_STALE_CACHE,
+    KLINE_PROVIDER_ERROR_COOLDOWN,
+    KLINE_PROVIDER_ERROR_EMPTY,
+    KLINE_PROVIDER_ERROR_HTTP,
+    KLINE_PROVIDER_ERROR_TIMEOUT,
+    KLINE_PROVIDER_ERROR_UNKNOWN,
+    KlineCacheResult,
+    KlineProviderFetchError,
+    get_klines_cache_first,
+)
 from app.services.spot_kline_bucket import (
     normalize_spot_kline_bucket_interval,
     okx_spot_open_time_validator,
@@ -1630,6 +1643,68 @@ def _merge_spot_live_ws_klines(
     ]
 
 
+def _spot_kline_provider_error_code(error: Optional[Exception]) -> str:
+    lowered = str(error or "").lower()
+    if not lowered:
+        return KLINE_PROVIDER_ERROR_UNKNOWN
+    if "timeout" in lowered or "timed out" in lowered:
+        return KLINE_PROVIDER_ERROR_TIMEOUT
+    if "cooldown" in lowered:
+        return KLINE_PROVIDER_ERROR_COOLDOWN
+    if "http " in lowered or "status_code" in lowered:
+        return KLINE_PROVIDER_ERROR_HTTP
+    if "empty" in lowered or "unavailable" in lowered:
+        return KLINE_PROVIDER_ERROR_EMPTY
+    return KLINE_PROVIDER_ERROR_UNKNOWN
+
+
+def _coerce_kline_cache_result(items: Any, *, end_time_ms: Optional[int]) -> KlineCacheResult:
+    if isinstance(items, KlineCacheResult):
+        return items
+    rows = list(items or []) if isinstance(items, list) else []
+    return KlineCacheResult(
+        rows,
+        origin=KLINE_CACHE_ORIGIN_REST_FETCH if rows else KLINE_CACHE_ORIGIN_EMPTY,
+        cache_status="LEGACY",
+        history_incomplete=bool(end_time_ms is not None and not rows),
+    )
+
+
+def _spot_kline_result_metadata(
+    result: KlineCacheResult,
+    *,
+    end_time_ms: Optional[int],
+    rest_snapshot_source: str = "REST_SNAPSHOT",
+    rest_history_source: str = "REST_HISTORY",
+) -> dict[str, Any]:
+    if result.origin == KLINE_CACHE_ORIGIN_DB_CACHE:
+        source = "DB_CACHE"
+        freshness = "CACHED"
+        stale = False
+    elif result.origin == KLINE_CACHE_ORIGIN_STALE_CACHE:
+        source = "STALE_CACHE"
+        freshness = "STALE"
+        stale = True
+    elif result.origin == KLINE_CACHE_ORIGIN_EMPTY:
+        source = "EMPTY"
+        freshness = "MISSING"
+        stale = False
+    else:
+        source = rest_history_source if end_time_ms is not None else rest_snapshot_source
+        freshness = "RECENT"
+        stale = False
+
+    return {
+        "source": source,
+        "freshness": freshness,
+        "stale": stale,
+        "cache_status": result.cache_status,
+        "history_incomplete": bool(result.history_incomplete),
+        "provider_error_code": result.provider_error_code,
+        "provider_error_provider": result.provider_error_provider,
+    }
+
+
 def _kline_item_matches_open_time_validator(
     item: Any,
     open_time_validator: Optional[Callable[[int], bool]],
@@ -2056,10 +2131,12 @@ def _fetch_external_spot_klines(
     fast: bool = False,
 ) -> list[dict[str, Any]]:
     last_error: Optional[Exception] = None
+    last_provider_code: Optional[str] = None
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
     timeout_cap_ms = _SPOT_KLINE_FAST_TIMEOUT_CAP_MS if fast else _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS
     for provider in providers:
         try:
+            last_provider_code = provider.provider_code
             provider_symbol = _spot_provider_symbol(db, pair, provider)
             request_provider = _spot_provider_request_config(provider, timeout_cap_ms=timeout_cap_ms)
             if provider.provider_code == "OKX_SPOT":
@@ -2117,7 +2194,11 @@ def _fetch_external_spot_klines(
         cached = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval))
         if cached and cached.get("items"):
             return list(cached["items"])[-limit:]
-    raise ValueError(f"spot external kline unavailable: {last_error}")
+    raise KlineProviderFetchError(
+        "spot external kline unavailable",
+        provider_error_code=_spot_kline_provider_error_code(last_error),
+        provider_error_provider=last_provider_code,
+    )
 
 
 def _build_itick_fallback_trades(pair: TradingPair, limit: int = 50) -> TradesResponse:
@@ -3227,17 +3308,25 @@ def get_klines(
                 fast=False,
             )
 
-        items = get_klines_cache_first(
-            db,
-            market_type="spot",
-            symbol=pair.symbol,
-            interval=interval,
-            limit=limit,
+        cache_result = _coerce_kline_cache_result(
+            get_klines_cache_first(
+                db,
+                market_type="spot",
+                symbol=pair.symbol,
+                interval=interval,
+                limit=limit,
+                end_time_ms=end_time_ms,
+                source="EXTERNAL_SPOT",
+                fetch_external=_fetch_external_spot,
+                external_budget_seconds=6.0,
+                open_time_validator=cache_open_time_validator,
+            ),
             end_time_ms=end_time_ms,
-            source="EXTERNAL_SPOT",
-            fetch_external=_fetch_external_spot,
-            external_budget_seconds=6.0,
-            open_time_validator=cache_open_time_validator,
+        )
+        items = cache_result.items
+        result_metadata = _spot_kline_result_metadata(
+            cache_result,
+            end_time_ms=end_time_ms,
         )
         cached_meta = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval), {})
         live_ws_items = list(live_ws_klines.get("items") or []) if live_ws_klines else []
@@ -3260,21 +3349,32 @@ def get_klines(
             provider = str(live_ws_klines.get("provider") or cached_meta.get("provider") or "EXTERNAL_SPOT")
             source = str(live_ws_klines.get("source") or "LIVE_WS")
             freshness = str(live_ws_klines.get("freshness") or "LIVE")
+            stale = False
             updated_at = live_ws_klines.get("updated_at") or cached_meta.get("updated_at")
         else:
             provider = str(cached_meta.get("provider") or primary_provider_code or "EXTERNAL_SPOT")
-            source = "LAST_GOOD" if provider == "LAST_GOOD" else ("REST_HISTORY" if end_time_ms is not None else "REST_SNAPSHOT")
-            freshness = "LAST_GOOD" if provider == "LAST_GOOD" else "RECENT"
+            if provider == "LAST_GOOD":
+                source = "LAST_GOOD"
+                freshness = "LAST_GOOD"
+                stale = True
+            else:
+                source = str(result_metadata["source"])
+                freshness = str(result_metadata["freshness"])
+                stale = bool(result_metadata["stale"])
             updated_at = cached_meta.get("updated_at")
         return {
             "symbol": pair.symbol,
             "interval": interval,
             "items": items,
             "provider": provider,
-            "stale": provider == "LAST_GOOD",
+            "stale": stale,
             "updated_at": updated_at,
             "source": source,
             "freshness": freshness,
+            "cache_status": result_metadata.get("cache_status"),
+            "history_incomplete": result_metadata.get("history_incomplete"),
+            "provider_error_code": result_metadata.get("provider_error_code"),
+            "provider_error_provider": result_metadata.get("provider_error_provider"),
         }
 
     if _is_itick_stock_pair(pair):
@@ -3289,22 +3389,37 @@ def get_klines(
             payload = _get_itick_klines(pair=pair, interval=interval, limit=fetch_limit)
             return payload.get("items", [])
 
-        items = get_klines_cache_first(
-            db,
-            market_type="spot",
-            symbol=pair.symbol,
-            interval=interval,
-            limit=limit,
+        cache_result = _coerce_kline_cache_result(
+            get_klines_cache_first(
+                db,
+                market_type="spot",
+                symbol=pair.symbol,
+                interval=interval,
+                limit=limit,
+                end_time_ms=end_time_ms,
+                source=DATA_SOURCE_ITICK,
+                fetch_external=_fetch_stock_itick_klines,
+            ),
             end_time_ms=end_time_ms,
-            source=DATA_SOURCE_ITICK,
-            fetch_external=_fetch_stock_itick_klines,
+        )
+        items = cache_result.items
+        result_metadata = _spot_kline_result_metadata(
+            cache_result,
+            end_time_ms=end_time_ms,
+            rest_snapshot_source=DATA_SOURCE_ITICK,
+            rest_history_source=DATA_SOURCE_ITICK,
         )
         return {
             "symbol": pair.symbol,
             "interval": interval,
             "items": items,
-            "source": DATA_SOURCE_ITICK,
-            "freshness": "RECENT" if items else "MISSING",
+            "source": result_metadata["source"],
+            "freshness": result_metadata["freshness"],
+            "stale": result_metadata["stale"],
+            "cache_status": result_metadata.get("cache_status"),
+            "history_incomplete": result_metadata.get("history_incomplete"),
+            "provider_error_code": result_metadata.get("provider_error_code"),
+            "provider_error_provider": result_metadata.get("provider_error_provider"),
         }
 
     if data_source == DATA_SOURCE_ITICK:
@@ -3312,30 +3427,37 @@ def get_klines(
             payload = _get_itick_klines(pair=pair, interval=interval, limit=fetch_limit)
             return payload.get("items", [])
 
-        items = get_klines_cache_first(
-            db,
-            market_type="spot",
-            symbol=pair.symbol,
-            interval=interval,
-            limit=limit,
+        cache_result = _coerce_kline_cache_result(
+            get_klines_cache_first(
+                db,
+                market_type="spot",
+                symbol=pair.symbol,
+                interval=interval,
+                limit=limit,
+                end_time_ms=end_time_ms,
+                source=DATA_SOURCE_ITICK,
+                fetch_external=_fetch_itick_klines,
+            ),
             end_time_ms=end_time_ms,
-            source=DATA_SOURCE_ITICK,
-            fetch_external=_fetch_itick_klines,
         )
-        if items:
-            return {
-                "symbol": pair.symbol,
-                "interval": interval,
-                "items": items,
-                "source": DATA_SOURCE_ITICK,
-                "freshness": "RECENT",
-            }
+        items = cache_result.items
+        result_metadata = _spot_kline_result_metadata(
+            cache_result,
+            end_time_ms=end_time_ms,
+            rest_snapshot_source=DATA_SOURCE_ITICK,
+            rest_history_source=DATA_SOURCE_ITICK,
+        )
         return {
             "symbol": pair.symbol,
             "interval": interval,
-            "items": [],
-            "source": DATA_SOURCE_ITICK,
-            "freshness": "MISSING",
+            "items": items,
+            "source": result_metadata["source"],
+            "freshness": result_metadata["freshness"],
+            "stale": result_metadata["stale"],
+            "cache_status": result_metadata.get("cache_status"),
+            "history_incomplete": result_metadata.get("history_incomplete"),
+            "provider_error_code": result_metadata.get("provider_error_code"),
+            "provider_error_provider": result_metadata.get("provider_error_provider"),
         }
 
     if interval not in _INTERNAL_SPOT_KLINE_SUPPORTED_INTERVALS:
@@ -3357,22 +3479,37 @@ def get_klines(
         )
         return payload.get("items", [])
 
-    items = get_klines_cache_first(
-        db,
-        market_type="spot",
-        symbol=pair.symbol,
-        interval=interval,
-        limit=limit,
+    cache_result = _coerce_kline_cache_result(
+        get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol=pair.symbol,
+            interval=interval,
+            limit=limit,
+            end_time_ms=end_time_ms,
+            source=SPOT_KLINE_SOURCE_INTERNAL_TRADE,
+            fetch_external=_fetch_internal_spot_klines,
+        ),
         end_time_ms=end_time_ms,
-        source=SPOT_KLINE_SOURCE_INTERNAL_TRADE,
-        fetch_external=_fetch_internal_spot_klines,
+    )
+    items = cache_result.items
+    result_metadata = _spot_kline_result_metadata(
+        cache_result,
+        end_time_ms=end_time_ms,
+        rest_snapshot_source="INTERNAL",
+        rest_history_source="INTERNAL",
     )
     return {
         "symbol": pair.symbol,
         "interval": interval,
         "items": items,
-        "source": "INTERNAL",
-        "freshness": "RECENT" if items else "MISSING",
+        "source": result_metadata["source"],
+        "freshness": result_metadata["freshness"],
+        "stale": result_metadata["stale"],
+        "cache_status": result_metadata.get("cache_status"),
+        "history_incomplete": result_metadata.get("history_incomplete"),
+        "provider_error_code": result_metadata.get("provider_error_code"),
+        "provider_error_provider": result_metadata.get("provider_error_provider"),
     }
 
 

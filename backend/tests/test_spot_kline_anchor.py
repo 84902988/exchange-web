@@ -187,6 +187,8 @@ def test_market_kline_cache_filters_mixed_okx_spot_1d_rows() -> None:
 
     assert [row["open_time"] for row in rows] == [valid_1, valid_2]
     assert all(is_okx_spot_1d_open_time(row["open_time"]) for row in rows)
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HIT
 
 
 def test_market_kline_cache_filters_mixed_okx_spot_weekly_and_monthly_rows() -> None:
@@ -239,6 +241,10 @@ def test_market_kline_cache_filters_mixed_okx_spot_weekly_and_monthly_rows() -> 
     assert all(is_okx_spot_1w_open_time(row["open_time"]) for row in weekly_rows)
     assert [row["open_time"] for row in monthly_rows] == [valid_month_1, valid_month_2]
     assert all(is_okx_spot_1M_open_time(row["open_time"]) for row in monthly_rows)
+    assert weekly_rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE
+    assert weekly_rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HIT
+    assert monthly_rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE
+    assert monthly_rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HIT
 
 
 def test_market_kline_cache_falls_back_when_filter_leaves_too_few_rows() -> None:
@@ -301,6 +307,9 @@ def test_market_kline_cache_falls_back_when_filter_leaves_too_few_rows() -> None
     assert fetch_calls == [(2, None)]
     assert [row["open_time"] for row in rows] == [valid_1, valid_2]
     assert all(is_okx_spot_1d_open_time(row["open_time"]) for row in rows)
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_REST_FETCH
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_SHORT
+    assert rows.history_incomplete is False
 
 
 def test_market_kline_cache_filters_external_rows_after_history_end_time() -> None:
@@ -344,6 +353,10 @@ def test_market_kline_cache_filters_external_rows_after_history_end_time() -> No
 
     assert fetch_calls == [(100, end_time_ms)]
     assert rows == []
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_EMPTY
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_PROVIDER_EMPTY
+    assert rows.provider_error_code == market_kline_cache.KLINE_PROVIDER_ERROR_EMPTY
+    assert rows.history_incomplete is True
 
 
 def test_market_kline_cache_gap_falls_back_for_fixed_interval_history() -> None:
@@ -396,6 +409,9 @@ def test_market_kline_cache_gap_falls_back_for_fixed_interval_history() -> None:
     assert fetch_calls == [(4, end_time_ms)]
     assert _open_times(rows) == provider_times
     assert market_kline_cache._validate_cached_klines_continuity(rows, interval)
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_REST_FETCH
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_CONTINUITY_INVALID
+    assert rows.history_incomplete is False
 
 
 def test_market_kline_cache_current_gap_falls_back_for_fixed_interval() -> None:
@@ -446,6 +462,8 @@ def test_market_kline_cache_current_gap_falls_back_for_fixed_interval() -> None:
     assert fetch_calls == [(4, None)]
     assert _open_times(rows) == provider_times
     assert market_kline_cache._validate_cached_klines_continuity(rows, interval)
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_REST_FETCH
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_CONTINUITY_INVALID
 
 
 def test_market_kline_cache_continuous_fixed_interval_db_hit() -> None:
@@ -479,6 +497,8 @@ def test_market_kline_cache_continuous_fixed_interval_db_hit() -> None:
     )
 
     assert _open_times(rows) == cached_times
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HIT
 
 
 def test_market_kline_cache_duplicate_open_time_falls_back() -> None:
@@ -531,6 +551,8 @@ def test_market_kline_cache_duplicate_open_time_falls_back() -> None:
 
     assert fetch_calls == [(3, _ms(2026, 5, 2, 0))]
     assert _open_times(rows) == provider_times
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_REST_FETCH
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_CONTINUITY_INVALID
 
 
 def test_market_kline_cache_monthly_continuity_accepts_calendar_months_and_cross_year() -> None:
@@ -570,6 +592,8 @@ def test_market_kline_cache_monthly_continuity_accepts_calendar_months_and_cross
         )
 
         assert _open_times(rows) == cached_times
+        assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE
+        assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HIT
 
 
 def test_market_kline_cache_monthly_gap_falls_back() -> None:
@@ -610,6 +634,76 @@ def test_market_kline_cache_monthly_gap_falls_back() -> None:
 
     assert fetch_calls == [(2, end_time_ms)]
     assert _open_times(rows) == provider_times
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_REST_FETCH
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_CONTINUITY_INVALID
+
+
+def test_market_kline_cache_provider_error_returns_stale_short_history_metadata() -> None:
+    db = _session()
+    now = datetime.utcnow()
+    interval = "4h"
+    cached_times = [_ms(2026, 6, 1, 0), _ms(2026, 6, 1, 4)]
+    end_time_ms = _ms(2026, 6, 2, 0)
+    db.add_all(
+        [
+            _kline_row(index + 400, open_time, updated_at=now, interval=interval, symbol="ETHUSDT")
+            for index, open_time in enumerate(cached_times)
+        ]
+    )
+    db.commit()
+
+    def fetch_external(_limit: int, _fetch_end_time_ms: int | None):
+        raise market_kline_cache.KlineProviderFetchError(
+            "provider timed out",
+            provider_error_code=market_kline_cache.KLINE_PROVIDER_ERROR_TIMEOUT,
+            provider_error_provider="OKX_SPOT",
+        )
+
+    rows = market_kline_cache.get_klines_cache_first(
+        db,
+        market_type="spot",
+        symbol="ETHUSDT",
+        interval=interval,
+        limit=4,
+        source="EXTERNAL_SPOT",
+        fetch_external=fetch_external,
+        end_time_ms=end_time_ms,
+    )
+
+    assert _open_times(rows) == cached_times
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_STALE_CACHE
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_SHORT
+    assert rows.provider_error_code == market_kline_cache.KLINE_PROVIDER_ERROR_TIMEOUT
+    assert rows.provider_error_provider == "OKX_SPOT"
+    assert rows.history_incomplete is True
+
+
+def test_market_kline_cache_provider_empty_without_stale_returns_empty_metadata() -> None:
+    db = _session()
+    fetch_calls: list[tuple[int, int | None]] = []
+    end_time_ms = _ms(2026, 6, 2, 0)
+
+    def fetch_external(limit: int, fetch_end_time_ms: int | None):
+        fetch_calls.append((limit, fetch_end_time_ms))
+        return []
+
+    rows = market_kline_cache.get_klines_cache_first(
+        db,
+        market_type="spot",
+        symbol="ETHUSDT",
+        interval="4h",
+        limit=4,
+        source="EXTERNAL_SPOT",
+        fetch_external=fetch_external,
+        end_time_ms=end_time_ms,
+    )
+
+    assert fetch_calls == [(4, end_time_ms)]
+    assert rows == []
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_EMPTY
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_PROVIDER_EMPTY
+    assert rows.provider_error_code == market_kline_cache.KLINE_PROVIDER_ERROR_EMPTY
+    assert rows.history_incomplete is True
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from app.routers import market as market_router
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services import market
+from app.services import market_kline_cache
 from app.services import spot_market_gateway as gateway_module
 from app.services.spot_market_gateway import SpotMarketGateway
 
@@ -239,6 +240,25 @@ def _spot_provider(code: str, *, priority: int = 1, enabled: bool = True):
         base_url="https://example.invalid",
         timeout_ms=1000,
         cooldown_seconds=0,
+    )
+
+
+def _kline_cache_result(
+    items: list[dict],
+    *,
+    origin: str = market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE,
+    cache_status: str = market_kline_cache.KLINE_CACHE_STATUS_HIT,
+    history_incomplete: bool = False,
+    provider_error_code: str | None = None,
+    provider_error_provider: str | None = None,
+) -> market_kline_cache.KlineCacheResult:
+    return market_kline_cache.KlineCacheResult(
+        items,
+        origin=origin,
+        cache_status=cache_status,
+        history_incomplete=history_incomplete,
+        provider_error_code=provider_error_code,
+        provider_error_provider=provider_error_provider,
     )
 
 
@@ -1714,18 +1734,22 @@ def test_get_klines_uses_rest_history_with_live_ws_overlay() -> None:
                 "provider": market.PROVIDER_BITGET_SPOT,
                 "updated_at": "2026-07-04T00:00:00",
             }
-            return [
-                {
-                    "open_time": 60000,
-                    "close_time": 120000,
-                    "open": "1",
-                    "high": "2",
-                    "low": "1",
-                    "close": "1.5",
-                    "volume": "5",
-                    "quote_volume": "7.5",
-                }
-            ]
+            return _kline_cache_result(
+                [
+                    {
+                        "open_time": 60000,
+                        "close_time": 120000,
+                        "open": "1",
+                        "high": "2",
+                        "low": "1",
+                        "close": "1.5",
+                        "volume": "5",
+                        "quote_volume": "7.5",
+                    }
+                ],
+                origin=market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE,
+                cache_status=market_kline_cache.KLINE_CACHE_STATUS_HIT,
+            )
 
         market.get_klines_cache_first = cache_first
         market._fetch_external_spot_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -1743,8 +1767,10 @@ def test_get_klines_uses_rest_history_with_live_ws_overlay() -> None:
 
         market.get_spot_provider_ws_klines = lambda symbol, interval, **kwargs: None
         fallback = market.get_klines(None, "BTCUSDT", "1m", limit=30)
-        assert fallback.get("source") == "REST_SNAPSHOT"
-        assert fallback.get("freshness") == "RECENT"
+        assert fallback.get("source") == "DB_CACHE"
+        assert fallback.get("freshness") == "CACHED"
+        assert fallback.get("stale") is False
+        assert fallback.get("cache_status") == market_kline_cache.KLINE_CACHE_STATUS_HIT
         assert fallback["provider"] == "BITGET_SPOT"
         assert fallback["items"][-1]["close"] == "1.5"
     finally:
@@ -1847,23 +1873,239 @@ def test_kline_history_pagination_does_not_read_live_ws() -> None:
         market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("historical pagination must not read LIVE_WS kline")
         )
-        market.get_klines_cache_first = lambda *args, **kwargs: [
-            {
-                "open_time": 60000,
-                "close_time": 120000,
-                "open": "1",
-                "high": "2",
-                "low": "1",
-                "close": "1.5",
-                "volume": "5",
-                "quote_volume": "7.5",
-            }
-        ]
+        market.get_klines_cache_first = lambda *args, **kwargs: _kline_cache_result(
+            [
+                {
+                    "open_time": 60000,
+                    "close_time": 120000,
+                    "open": "1",
+                    "high": "2",
+                    "low": "1",
+                    "close": "1.5",
+                    "volume": "5",
+                    "quote_volume": "7.5",
+                }
+            ],
+            origin=market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE,
+            cache_status=market_kline_cache.KLINE_CACHE_STATUS_HIT,
+        )
 
         result = market.get_klines(None, "BTCUSDT", "1m", limit=30, end_time_ms=180000)
+        assert result.get("source") == "DB_CACHE"
+        assert result.get("freshness") == "CACHED"
+        assert result.get("stale") is False
+        assert result.get("cache_status") == market_kline_cache.KLINE_CACHE_STATUS_HIT
+        assert result.get("history_incomplete") is False
+        assert result["items"][-1]["close"] == "1.5"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
+
+
+def test_kline_history_rest_fetch_reports_continuity_invalid_metadata() -> None:
+    class Pair:
+        symbol = "ETHUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    provider = _spot_provider(market.PROVIDER_OKX_SPOT)
+    end_time_ms = 180000
+    item = {
+        "open_time": 60000,
+        "close_time": 120000,
+        "open": "1",
+        "high": "2",
+        "low": "1",
+        "close": "1.5",
+        "volume": "5",
+        "quote_volume": "7.5",
+    }
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("historical pagination must not read LIVE_WS kline")
+        )
+        market.get_klines_cache_first = lambda *args, **kwargs: _kline_cache_result(
+            [item],
+            origin=market_kline_cache.KLINE_CACHE_ORIGIN_REST_FETCH,
+            cache_status=market_kline_cache.KLINE_CACHE_STATUS_CONTINUITY_INVALID,
+            history_incomplete=False,
+        )
+
+        result = market.get_klines(None, "ETHUSDT", "4h", limit=30, end_time_ms=end_time_ms)
+
         assert result.get("source") == "REST_HISTORY"
         assert result.get("freshness") == "RECENT"
+        assert result.get("stale") is False
+        assert result.get("cache_status") == market_kline_cache.KLINE_CACHE_STATUS_CONTINUITY_INVALID
+        assert result.get("history_incomplete") is False
+        assert result["provider"] == market.PROVIDER_OKX_SPOT
         assert result["items"][-1]["close"] == "1.5"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
+
+
+def test_kline_history_stale_short_cache_reports_provider_error_metadata() -> None:
+    class Pair:
+        symbol = "ETHUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    provider = _spot_provider(market.PROVIDER_OKX_SPOT)
+    end_time_ms = 180000
+    item = {
+        "open_time": 60000,
+        "close_time": 120000,
+        "open": "1",
+        "high": "2",
+        "low": "1",
+        "close": "1.5",
+        "volume": "5",
+        "quote_volume": "7.5",
+    }
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("historical pagination must not read LIVE_WS kline")
+        )
+        market.get_klines_cache_first = lambda *args, **kwargs: _kline_cache_result(
+            [item],
+            origin=market_kline_cache.KLINE_CACHE_ORIGIN_STALE_CACHE,
+            cache_status=market_kline_cache.KLINE_CACHE_STATUS_SHORT,
+            history_incomplete=True,
+            provider_error_code=market_kline_cache.KLINE_PROVIDER_ERROR_TIMEOUT,
+            provider_error_provider=market.PROVIDER_OKX_SPOT,
+        )
+
+        result = market.get_klines(None, "ETHUSDT", "4h", limit=30, end_time_ms=end_time_ms)
+
+        assert result.get("source") == "STALE_CACHE"
+        assert result.get("freshness") == "STALE"
+        assert result.get("stale") is True
+        assert result.get("cache_status") == market_kline_cache.KLINE_CACHE_STATUS_SHORT
+        assert result.get("history_incomplete") is True
+        assert result.get("provider_error_code") == market_kline_cache.KLINE_PROVIDER_ERROR_TIMEOUT
+        assert result.get("provider_error_provider") == market.PROVIDER_OKX_SPOT
+        assert result["items"][-1]["close"] == "1.5"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
+
+
+def test_kline_history_provider_empty_reports_missing_metadata() -> None:
+    class Pair:
+        symbol = "ETHUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    provider = _spot_provider(market.PROVIDER_OKX_SPOT)
+    end_time_ms = 180000
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("historical pagination must not read LIVE_WS kline")
+        )
+        market.get_klines_cache_first = lambda *args, **kwargs: _kline_cache_result(
+            [],
+            origin=market_kline_cache.KLINE_CACHE_ORIGIN_EMPTY,
+            cache_status=market_kline_cache.KLINE_CACHE_STATUS_PROVIDER_EMPTY,
+            history_incomplete=True,
+            provider_error_code=market_kline_cache.KLINE_PROVIDER_ERROR_EMPTY,
+            provider_error_provider=market.PROVIDER_OKX_SPOT,
+        )
+
+        result = market.get_klines(None, "ETHUSDT", "4h", limit=30, end_time_ms=end_time_ms)
+
+        assert result.get("source") == "EMPTY"
+        assert result.get("freshness") == "MISSING"
+        assert result.get("stale") is False
+        assert result.get("cache_status") == market_kline_cache.KLINE_CACHE_STATUS_PROVIDER_EMPTY
+        assert result.get("history_incomplete") is True
+        assert result.get("provider_error_code") == market_kline_cache.KLINE_PROVIDER_ERROR_EMPTY
+        assert result["items"] == []
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
+
+
+def test_kline_monthly_history_db_cache_keeps_monthly_metadata() -> None:
+    class Pair:
+        symbol = "ETHUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    provider = _spot_provider(market.PROVIDER_OKX_SPOT)
+    end_time_ms = _ms(2026, 4, 1, 0)
+    items = [
+        {
+            "open_time": _ms(2026, month, 1, 0),
+            "close_time": _ms(2026, month + 1, 1, 0),
+            "open": "1",
+            "high": "2",
+            "low": "1",
+            "close": "1.5",
+            "volume": "5",
+            "quote_volume": "7.5",
+        }
+        for month in (1, 2, 3)
+    ]
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("historical pagination must not read LIVE_WS kline")
+        )
+        market.get_klines_cache_first = lambda *args, **kwargs: _kline_cache_result(
+            items,
+            origin=market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE,
+            cache_status=market_kline_cache.KLINE_CACHE_STATUS_HIT,
+            history_incomplete=False,
+        )
+
+        result = market.get_klines(None, "ETHUSDT", "1Mutc", limit=60, end_time_ms=end_time_ms)
+
+        assert result.get("source") == "DB_CACHE"
+        assert result.get("freshness") == "CACHED"
+        assert result.get("cache_status") == market_kline_cache.KLINE_CACHE_STATUS_HIT
+        assert result.get("history_incomplete") is False
+        assert result["interval"] == "1Mutc"
+        assert [item["open_time"] for item in result["items"]] == [item["open_time"] for item in items]
     finally:
         market._get_active_pair = original_get_active_pair
         market._enabled_spot_market_providers_for_pair = original_enabled_providers

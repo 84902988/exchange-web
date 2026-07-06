@@ -89,6 +89,10 @@ class KlineResponse(BaseModel):
     updated_at: Optional[str] = None
     source: Optional[str] = None
     freshness: Optional[str] = None
+    cache_status: Optional[str] = None
+    history_incomplete: bool = False
+    provider_error_code: Optional[str] = None
+    provider_error_provider: Optional[str] = None
 
 
 class TickerItem(BaseModel):

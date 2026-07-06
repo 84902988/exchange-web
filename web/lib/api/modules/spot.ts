@@ -177,8 +177,13 @@ export type SpotMarketKlinesResponse = {
   interval: string
   items: SpotMarketKlineItem[]
   provider?: string | null
+  stale?: boolean | null
   source?: string | null
   freshness?: string | null
+  cache_status?: string | null
+  history_incomplete?: boolean | null
+  provider_error_code?: string | null
+  provider_error_provider?: string | null
 }
 
 export type SpotMarketTickerItem = {
