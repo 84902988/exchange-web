@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import calendar
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Optional
 
@@ -70,6 +71,87 @@ def normalize_kline_limit(limit: int) -> int:
 
 def interval_ms(interval: str) -> int:
     return SUPPORTED_KLINE_INTERVAL_SECONDS[normalize_kline_interval(interval)] * 1000
+
+
+def _item_open_time_ms(item: Any) -> Optional[int]:
+    for key in ("open_time", "open_time_ms", "time"):
+        value = _get_item_value(item, key, None)
+        if value in (None, ""):
+            continue
+        try:
+            open_time = int(value)
+        except Exception:
+            return None
+        return open_time if open_time > 0 else None
+    return None
+
+
+def _add_one_calendar_month(value: datetime) -> datetime:
+    month = value.month + 1
+    year = value.year
+    if month > 12:
+        month = 1
+        year += 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _next_month_open_time_ms(open_time_ms: int) -> int:
+    value = datetime.fromtimestamp(int(open_time_ms) / 1000, tz=timezone.utc)
+    if (
+        value.day == 1
+        and value.hour == 0
+        and value.minute == 0
+        and value.second == 0
+        and value.microsecond == 0
+    ):
+        return int(_add_one_calendar_month(value).timestamp() * 1000)
+
+    local_value = value + timedelta(hours=8)
+    if (
+        local_value.day == 1
+        and local_value.hour == 0
+        and local_value.minute == 0
+        and local_value.second == 0
+        and local_value.microsecond == 0
+    ):
+        return int((_add_one_calendar_month(local_value) - timedelta(hours=8)).timestamp() * 1000)
+
+    return int(_add_one_calendar_month(value).timestamp() * 1000)
+
+
+def _validate_cached_klines_continuity(items: Iterable[Any], interval: str) -> bool:
+    normalized_interval = normalize_kline_interval(interval)
+    open_times: list[int] = []
+    previous_open_time: Optional[int] = None
+    seen_open_times: set[int] = set()
+
+    for item in items:
+        open_time = _item_open_time_ms(item)
+        if open_time is None:
+            return False
+        if open_time in seen_open_times:
+            return False
+        if previous_open_time is not None and open_time <= previous_open_time:
+            return False
+        seen_open_times.add(open_time)
+        open_times.append(open_time)
+        previous_open_time = open_time
+
+    if len(open_times) <= 1:
+        return True
+
+    if normalized_interval in {"1M", "1Mutc"}:
+        for previous, current in zip(open_times, open_times[1:]):
+            if current != _next_month_open_time_ms(previous):
+                return False
+        return True
+
+    expected_delta = interval_ms(normalized_interval)
+    for previous, current in zip(open_times, open_times[1:]):
+        if current - previous != expected_delta:
+            return False
+    return True
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -453,7 +535,8 @@ def get_klines_cache_first(
         end_time_ms=end_time_ms,
         open_time_validator=open_time_validator,
     )
-    if len(cached) >= normalized_limit and (
+    cached_continuous = _validate_cached_klines_continuity(cached, normalized_interval)
+    if len(cached) >= normalized_limit and cached_continuous and (
         end_time_ms
         or _latest_cache_is_fresh(
             db,
@@ -471,16 +554,36 @@ def get_klines_cache_first(
         )
         return cached[-normalized_limit:]
 
-    stale_cached = lambda: cached or _read_cached_klines(
-        db,
-        market_type=market_type,
-        symbol=normalized_symbol,
-        interval=normalized_interval,
-        limit=normalized_limit,
-        end_time_ms=end_time_ms,
-        allow_stale_open=True,
-        open_time_validator=open_time_validator,
-    )
+    if cached and not cached_continuous:
+        logger.debug(
+            "kline_db_cache_continuity_failed market_type=%s symbol=%s interval=%s count=%s",
+            market_type,
+            normalized_symbol,
+            normalized_interval,
+            len(cached),
+        )
+
+    def stale_cached() -> list[dict[str, Any]]:
+        rows = cached or _read_cached_klines(
+            db,
+            market_type=market_type,
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+            limit=normalized_limit,
+            end_time_ms=end_time_ms,
+            allow_stale_open=True,
+            open_time_validator=open_time_validator,
+        )
+        if not rows or _validate_cached_klines_continuity(rows, normalized_interval):
+            return rows
+        logger.debug(
+            "kline_db_stale_cache_continuity_failed market_type=%s symbol=%s interval=%s count=%s",
+            market_type,
+            normalized_symbol,
+            normalized_interval,
+            len(rows),
+        )
+        return []
 
     if external_budget_seconds is not None and external_budget_seconds <= 0:
         return stale_cached()
@@ -548,7 +651,16 @@ def get_klines_cache_first(
         end_time_ms=end_time_ms,
         open_time_validator=open_time_validator,
     )
-    if refreshed and (len(refreshed) >= normalized_limit or not external_items):
+    refreshed_continuous = _validate_cached_klines_continuity(refreshed, normalized_interval)
+    if refreshed and not refreshed_continuous:
+        logger.debug(
+            "kline_db_refreshed_cache_continuity_failed market_type=%s symbol=%s interval=%s count=%s",
+            market_type,
+            normalized_symbol,
+            normalized_interval,
+            len(refreshed),
+        )
+    if refreshed and refreshed_continuous and (len(refreshed) >= normalized_limit or not external_items):
         return refreshed[-normalized_limit:]
 
     return [

@@ -45,11 +45,12 @@ def _kline_row(
     *,
     updated_at: datetime,
     interval: str = "1d",
+    symbol: str = "BTCUSDT",
 ) -> MarketKline:
     return MarketKline(
         id=row_id,
         market_type="spot",
-        symbol="BTCUSDT",
+        symbol=symbol,
         interval=interval,
         open_time=open_time,
         close_time=open_time + market_kline_cache.interval_ms(interval),
@@ -65,6 +66,23 @@ def _kline_row(
         created_at=updated_at,
         updated_at=updated_at,
     )
+
+
+def _kline_payload(open_time: int, interval: str = "4h") -> dict:
+    return {
+        "open_time": open_time,
+        "close_time": open_time + market_kline_cache.interval_ms(interval),
+        "open": "1",
+        "high": "2",
+        "low": "1",
+        "close": "1.5",
+        "volume": "5",
+        "quote_volume": "7.5",
+    }
+
+
+def _open_times(rows: list[dict]) -> list[int]:
+    return [int(row["open_time"]) for row in rows]
 
 
 def test_okx_spot_1d_bucket_uses_utc_plus_8_anchor() -> None:
@@ -326,6 +344,272 @@ def test_market_kline_cache_filters_external_rows_after_history_end_time() -> No
 
     assert fetch_calls == [(100, end_time_ms)]
     assert rows == []
+
+
+def test_market_kline_cache_gap_falls_back_for_fixed_interval_history() -> None:
+    db = _session()
+    now = datetime.utcnow()
+    interval = "4h"
+    end_time_ms = _ms(2026, 4, 15, 0)
+    cached_times = [
+        _ms(2026, 2, 21, 8),
+        _ms(2026, 2, 21, 12),
+        _ms(2026, 4, 14, 0),
+        _ms(2026, 4, 14, 4),
+    ]
+    provider_times = [
+        _ms(2026, 4, 13, 16),
+        _ms(2026, 4, 13, 20),
+        _ms(2026, 4, 14, 0),
+        _ms(2026, 4, 14, 4),
+    ]
+    db.add_all(
+        [
+            _kline_row(index + 1, open_time, updated_at=now, interval=interval, symbol="ETHUSDT")
+            for index, open_time in enumerate(cached_times)
+        ]
+    )
+    db.commit()
+
+    original_upsert = market_kline_cache.upsert_klines
+    fetch_calls: list[tuple[int, int | None]] = []
+
+    def fetch_external(limit: int, fetch_end_time_ms: int | None):
+        fetch_calls.append((limit, fetch_end_time_ms))
+        return [_kline_payload(open_time, interval) for open_time in provider_times]
+
+    try:
+        market_kline_cache.upsert_klines = lambda *args, **kwargs: 0
+        rows = market_kline_cache.get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol="ETHUSDT",
+            interval=interval,
+            limit=4,
+            source="EXTERNAL_SPOT",
+            fetch_external=fetch_external,
+            end_time_ms=end_time_ms,
+        )
+    finally:
+        market_kline_cache.upsert_klines = original_upsert
+
+    assert fetch_calls == [(4, end_time_ms)]
+    assert _open_times(rows) == provider_times
+    assert market_kline_cache._validate_cached_klines_continuity(rows, interval)
+
+
+def test_market_kline_cache_current_gap_falls_back_for_fixed_interval() -> None:
+    db = _session()
+    now = datetime.utcnow()
+    interval = "4h"
+    cached_times = [
+        _ms(2026, 6, 1, 0),
+        _ms(2026, 6, 1, 4),
+        _ms(2026, 6, 3, 0),
+        _ms(2026, 6, 3, 4),
+    ]
+    provider_times = [
+        _ms(2026, 6, 2, 16),
+        _ms(2026, 6, 2, 20),
+        _ms(2026, 6, 3, 0),
+        _ms(2026, 6, 3, 4),
+    ]
+    db.add_all(
+        [
+            _kline_row(index + 20, open_time, updated_at=now, interval=interval)
+            for index, open_time in enumerate(cached_times)
+        ]
+    )
+    db.commit()
+
+    original_upsert = market_kline_cache.upsert_klines
+    fetch_calls: list[tuple[int, int | None]] = []
+
+    def fetch_external(limit: int, fetch_end_time_ms: int | None):
+        fetch_calls.append((limit, fetch_end_time_ms))
+        return [_kline_payload(open_time, interval) for open_time in provider_times]
+
+    try:
+        market_kline_cache.upsert_klines = lambda *args, **kwargs: 0
+        rows = market_kline_cache.get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol="BTCUSDT",
+            interval=interval,
+            limit=4,
+            source="EXTERNAL_SPOT",
+            fetch_external=fetch_external,
+        )
+    finally:
+        market_kline_cache.upsert_klines = original_upsert
+
+    assert fetch_calls == [(4, None)]
+    assert _open_times(rows) == provider_times
+    assert market_kline_cache._validate_cached_klines_continuity(rows, interval)
+
+
+def test_market_kline_cache_continuous_fixed_interval_db_hit() -> None:
+    db = _session()
+    now = datetime.utcnow()
+    interval = "4h"
+    cached_times = [
+        _ms(2026, 6, 1, 0),
+        _ms(2026, 6, 1, 4),
+        _ms(2026, 6, 1, 8),
+        _ms(2026, 6, 1, 12),
+    ]
+    db.add_all(
+        [
+            _kline_row(index + 40, open_time, updated_at=now, interval=interval)
+            for index, open_time in enumerate(cached_times)
+        ]
+    )
+    db.commit()
+
+    rows = market_kline_cache.get_klines_cache_first(
+        db,
+        market_type="spot",
+        symbol="BTCUSDT",
+        interval=interval,
+        limit=4,
+        source="EXTERNAL_SPOT",
+        fetch_external=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("continuous fresh cache should avoid external fetch")
+        ),
+    )
+
+    assert _open_times(rows) == cached_times
+
+
+def test_market_kline_cache_duplicate_open_time_falls_back() -> None:
+    interval = "4h"
+    duplicate_time = _ms(2026, 5, 1, 0)
+    duplicate_rows = [
+        _kline_payload(duplicate_time, interval),
+        _kline_payload(duplicate_time, interval),
+        _kline_payload(duplicate_time + 4 * HOUR_MS, interval),
+    ]
+    provider_times = [
+        _ms(2026, 5, 1, 0),
+        _ms(2026, 5, 1, 4),
+        _ms(2026, 5, 1, 8),
+    ]
+    provider_rows = [_kline_payload(open_time, interval) for open_time in provider_times]
+    fetch_calls: list[tuple[int, int | None]] = []
+
+    original_read = market_kline_cache._read_cached_klines
+    original_upsert = market_kline_cache.upsert_klines
+    read_calls = 0
+
+    def read_cached(*_args, **_kwargs):
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == 1:
+            return list(duplicate_rows)
+        return list(provider_rows)
+
+    def fetch_external(limit: int, fetch_end_time_ms: int | None):
+        fetch_calls.append((limit, fetch_end_time_ms))
+        return list(provider_rows)
+
+    try:
+        market_kline_cache._read_cached_klines = read_cached
+        market_kline_cache.upsert_klines = lambda *args, **kwargs: 0
+        rows = market_kline_cache.get_klines_cache_first(
+            object(),
+            market_type="spot",
+            symbol="ETHUSDT",
+            interval=interval,
+            limit=3,
+            source="EXTERNAL_SPOT",
+            fetch_external=fetch_external,
+            end_time_ms=_ms(2026, 5, 2, 0),
+        )
+    finally:
+        market_kline_cache._read_cached_klines = original_read
+        market_kline_cache.upsert_klines = original_upsert
+
+    assert fetch_calls == [(3, _ms(2026, 5, 2, 0))]
+    assert _open_times(rows) == provider_times
+
+
+def test_market_kline_cache_monthly_continuity_accepts_calendar_months_and_cross_year() -> None:
+    for start_id, cached_times, end_time_ms in [
+        (
+            100,
+            [_ms(2026, 1, 1, 0), _ms(2026, 2, 1, 0), _ms(2026, 3, 1, 0)],
+            _ms(2026, 4, 1, 0),
+        ),
+        (
+            200,
+            [_ms(2026, 12, 1, 0), _ms(2027, 1, 1, 0)],
+            _ms(2027, 2, 1, 0),
+        ),
+    ]:
+        db = _session()
+        now = datetime.utcnow()
+        db.add_all(
+            [
+                _kline_row(start_id + index, open_time, updated_at=now, interval="1Mutc")
+                for index, open_time in enumerate(cached_times)
+            ]
+        )
+        db.commit()
+
+        rows = market_kline_cache.get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol="BTCUSDT",
+            interval="1Mutc",
+            limit=len(cached_times),
+            source="EXTERNAL_SPOT",
+            fetch_external=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("continuous monthly cache should avoid external fetch")
+            ),
+            end_time_ms=end_time_ms,
+        )
+
+        assert _open_times(rows) == cached_times
+
+
+def test_market_kline_cache_monthly_gap_falls_back() -> None:
+    db = _session()
+    now = datetime.utcnow()
+    cached_times = [_ms(2026, 1, 1, 0), _ms(2026, 3, 1, 0)]
+    provider_times = [_ms(2026, 2, 1, 0), _ms(2026, 3, 1, 0)]
+    end_time_ms = _ms(2026, 4, 1, 0)
+    db.add_all(
+        [
+            _kline_row(index + 300, open_time, updated_at=now, interval="1Mutc")
+            for index, open_time in enumerate(cached_times)
+        ]
+    )
+    db.commit()
+
+    original_upsert = market_kline_cache.upsert_klines
+    fetch_calls: list[tuple[int, int | None]] = []
+
+    def fetch_external(limit: int, fetch_end_time_ms: int | None):
+        fetch_calls.append((limit, fetch_end_time_ms))
+        return [_kline_payload(open_time, "1Mutc") for open_time in provider_times]
+
+    try:
+        market_kline_cache.upsert_klines = lambda *args, **kwargs: 0
+        rows = market_kline_cache.get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol="BTCUSDT",
+            interval="1Mutc",
+            limit=2,
+            source="EXTERNAL_SPOT",
+            fetch_external=fetch_external,
+            end_time_ms=end_time_ms,
+        )
+    finally:
+        market_kline_cache.upsert_klines = original_upsert
+
+    assert fetch_calls == [(2, end_time_ms)]
+    assert _open_times(rows) == provider_times
 
 
 if __name__ == "__main__":
