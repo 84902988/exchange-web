@@ -15,7 +15,7 @@ import {
 import { normalizeTimeToSeconds } from '../chart/chart.utils';
 import type { SpotChartProps, SpotKlineLoadState } from '../chart/chart.types';
 
-type TradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D';
+type TradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
 
 type TradingViewBar = {
   time: number;
@@ -51,6 +51,8 @@ type TradingViewLibrarySymbolInfo = {
   supported_resolutions: TradingViewResolution[];
   intraday_multipliers: string[];
   daily_multipliers: string[];
+  weekly_multipliers: string[];
+  monthly_multipliers: string[];
   volume_precision: number;
   data_status: string;
   format: string;
@@ -139,7 +141,7 @@ type TradeBucketState = {
 type EmitRealtimeBar = (bar: TradingViewBar, reason: string) => boolean;
 
 const SPOT_EXCHANGE_NAME = 'EXCHANGE';
-const SUPPORTED_RESOLUTIONS: TradingViewResolution[] = ['1', '5', '15', '60', '240', '1D'];
+const SUPPORTED_RESOLUTIONS: TradingViewResolution[] = ['1', '5', '15', '60', '240', '1D', '1W', '1M'];
 const RESOLUTION_TO_SPOT_INTERVAL: Record<string, string> = {
   '1': '1m',
   '5': '5m',
@@ -148,6 +150,9 @@ const RESOLUTION_TO_SPOT_INTERVAL: Record<string, string> = {
   '240': '4h',
   D: '1d',
   '1D': '1d',
+  W: '1w',
+  '1W': '1w',
+  '1M': '1M',
 };
 
 const SPOT_INTERVAL_TO_RESOLUTION: Record<string, TradingViewResolution> = {
@@ -157,6 +162,8 @@ const SPOT_INTERVAL_TO_RESOLUTION: Record<string, TradingViewResolution> = {
   '1h': '60',
   '4h': '240',
   '1d': '1D',
+  '1w': '1W',
+  '1M': '1M',
 };
 const SPOT_INTERVAL_MS: Record<string, number> = {
   '1m': 60_000,
@@ -165,7 +172,10 @@ const SPOT_INTERVAL_MS: Record<string, number> = {
   '1h': 60 * 60_000,
   '4h': 4 * 60 * 60_000,
   '1d': 24 * 60 * 60_000,
+  '1w': 7 * 24 * 60 * 60_000,
+  '1M': 30 * 24 * 60 * 60_000,
 };
+const OKX_SPOT_DWM_TRADING_VIEW_OFFSET_MS = 8 * 60 * 60_000;
 const realtimeHighWaterMarkByKey = new Map<string, number>();
 
 const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
@@ -228,14 +238,21 @@ function getTradeBucketTimeMs(tradeTimeMs: number, intervalMs: number): number {
 function normalizeResolution(resolution: string): TradingViewResolution {
   const normalized = String(resolution || '').trim().toUpperCase();
   if (normalized === 'D') return '1D';
+  if (normalized === 'W') return '1W';
+  if (normalized === '1M' || normalized === 'M') return '1M';
   if (SUPPORTED_RESOLUTIONS.includes(normalized as TradingViewResolution)) {
     return normalized as TradingViewResolution;
   }
   return '1';
 }
 
+function normalizeSpotInterval(interval: string): string {
+  const raw = String(interval || '').trim();
+  return raw === '1M' ? raw : raw.toLowerCase();
+}
+
 export function spotIntervalToTradingViewResolution(interval: string): TradingViewResolution {
-  const normalized = String(interval || '').trim().toLowerCase();
+  const normalized = normalizeSpotInterval(interval);
   return SPOT_INTERVAL_TO_RESOLUTION[normalized] || '1';
 }
 
@@ -244,7 +261,41 @@ function tradingViewResolutionToSpotInterval(resolution: string): string {
 }
 
 function getSpotIntervalMs(interval: string): number {
-  return SPOT_INTERVAL_MS[String(interval || '').trim().toLowerCase()] || SPOT_INTERVAL_MS['1m'];
+  return SPOT_INTERVAL_MS[normalizeSpotInterval(interval)] || SPOT_INTERVAL_MS['1m'];
+}
+
+function isProviderCandleOnlyInterval(interval: string): boolean {
+  return ['1d', '1w', '1M'].includes(normalizeSpotInterval(interval));
+}
+
+function shouldUseOkxDwmTradingViewTime(
+  interval: string,
+  provider?: unknown,
+  source?: unknown,
+): boolean {
+  if (!isProviderCandleOnlyInterval(interval)) return false;
+
+  const normalizedProvider = normalizeProvider(provider);
+  const normalizedSource = normalizeSource(source);
+  return (
+    normalizedProvider === 'OKX_SPOT' ||
+    normalizedProvider === 'EXTERNAL_SPOT' ||
+    normalizedSource === 'EXTERNAL_SPOT' ||
+    normalizedSource === 'REST_SNAPSHOT' ||
+    normalizedSource === 'REST_HISTORY' ||
+    normalizedSource === 'LIVE_WS'
+  );
+}
+
+function providerOpenTimeToTradingViewTimeMs(
+  timeMs: number,
+  interval: string,
+  provider?: unknown,
+  source?: unknown,
+): number {
+  if (!timeMs) return 0;
+  if (!shouldUseOkxDwmTradingViewTime(interval, provider, source)) return timeMs;
+  return timeMs + OKX_SPOT_DWM_TRADING_VIEW_OFFSET_MS;
 }
 
 function getRealtimeHighWaterMark(latestBarKey: string): number {
@@ -275,8 +326,18 @@ function normalizeKlineTimeMs(item: SpotMarketKlineItem): number {
   return seconds > 0 ? seconds * 1000 : 0;
 }
 
-function klineToBar(item: SpotMarketKlineItem): TradingViewBar | null {
-  const time = normalizeKlineTimeMs(item);
+function klineToBar(
+  item: SpotMarketKlineItem,
+  interval: string,
+  provider?: unknown,
+  source?: unknown,
+): TradingViewBar | null {
+  const time = providerOpenTimeToTradingViewTimeMs(
+    normalizeKlineTimeMs(item),
+    interval,
+    provider,
+    source,
+  );
   const open = toPositiveNumber(item.open);
   const high = toPositiveNumber(item.high);
   const low = toPositiveNumber(item.low);
@@ -297,15 +358,25 @@ function klineToBar(item: SpotMarketKlineItem): TradingViewBar | null {
   };
 }
 
-function klinePayloadToBar(payload: unknown): TradingViewBar | null {
+function klinePayloadToBar(
+  payload: unknown,
+  interval: string,
+  provider?: unknown,
+  source?: unknown,
+): TradingViewBar | null {
   if (!payload || typeof payload !== 'object') return null;
-  return klineToBar(payload as SpotMarketKlineItem);
+  return klineToBar(payload as SpotMarketKlineItem, interval, provider, source);
 }
 
-function normalizeHistoryBars(items: SpotMarketKlineItem[] | undefined): TradingViewBar[] {
+function normalizeHistoryBars(
+  items: SpotMarketKlineItem[] | undefined,
+  interval: string,
+  provider?: unknown,
+  source?: unknown,
+): TradingViewBar[] {
   const byTime = new Map<number, TradingViewBar>();
   for (const item of items || []) {
-    const bar = klineToBar(item);
+    const bar = klineToBar(item, interval, provider, source);
     if (!bar) continue;
     byTime.set(bar.time, bar);
   }
@@ -330,10 +401,12 @@ function buildSymbolInfo(options: SpotTradingViewDatafeedOptions): TradingViewLi
     pricescale: getPriceScale(options.pricePrecision),
     has_intraday: true,
     has_daily: true,
-    has_weekly_and_monthly: false,
+    has_weekly_and_monthly: true,
     supported_resolutions: SUPPORTED_RESOLUTIONS,
     intraday_multipliers: ['1', '5', '15', '60', '240'],
     daily_multipliers: ['1'],
+    weekly_multipliers: ['1'],
+    monthly_multipliers: ['1'],
     volume_precision: Number.isInteger(volumePrecision) && volumePrecision >= 0 && volumePrecision <= 12
       ? volumePrecision
       : 8,
@@ -438,7 +511,8 @@ export function createSpotTradingViewDatafeed(
       const requestResolution = normalizeResolution(resolution);
       const interval = tradingViewResolutionToSpotInterval(requestResolution);
       const countBack = Number(periodParams.countBack || 0);
-      const limit = Math.min(Math.max(countBack || 300, 50), 1000);
+      const requestedLimit = Math.min(Math.max(countBack || 300, 50), 1000);
+      const limit = interval === '1M' ? Math.min(requestedLimit, 100) : requestedLimit;
       const intervalMs = getSpotIntervalMs(interval);
       const requestedEndTime = Number(periodParams.to) > 0 ? Number(periodParams.to) * 1000 : 0;
       const isHistoricalPage =
@@ -452,6 +526,11 @@ export function createSpotTradingViewDatafeed(
       if (periodParams.firstDataRequest !== false) {
         historyReadyByLatestBarKey.set(latestBarKey, false);
       }
+      if (periodParams.firstDataRequest === false && Number(periodParams.to || 0) <= 0) {
+        historyReadyByLatestBarKey.set(latestBarKey, true);
+        onHistory([], { noData: true });
+        return;
+      }
 
       void getSpotKlines({
         symbol: apiSymbol,
@@ -460,12 +539,7 @@ export function createSpotTradingViewDatafeed(
         endTime,
       })
         .then((payload) => {
-          if (historyRequestSeqByLatestBarKey.get(latestBarKey) !== historyRequestSeq) {
-            onHistory([], { noData: true });
-            return;
-          }
-
-          const bars = normalizeHistoryBars(payload.items);
+          const bars = normalizeHistoryBars(payload.items, interval, payload.provider, payload.source);
           const latestBar = bars[bars.length - 1] || null;
           const currentLatestBeforeHistory = latestBars.get(latestBarKey);
           if (
@@ -499,11 +573,6 @@ export function createSpotTradingViewDatafeed(
           onHistory(bars, { noData: bars.length === 0 });
         })
         .catch((err: unknown) => {
-          if (historyRequestSeqByLatestBarKey.get(latestBarKey) !== historyRequestSeq) {
-            onHistory([], { noData: true });
-            return;
-          }
-
           options.onKlineLoadStateChange?.('error');
           historyReadyByLatestBarKey.set(latestBarKey, true);
           onError(err instanceof Error ? err.message : 'Failed to load spot history');
@@ -578,20 +647,20 @@ export function createSpotTradingViewDatafeed(
         const msgSymbol = normalizeSpotSymbol(message.symbol || '');
         if (msgSymbol !== apiSymbol) return;
 
-        const msgInterval = String(message.interval || '').trim().toLowerCase();
+        const msgInterval = normalizeSpotInterval(String(message.interval || ''));
         if (msgInterval !== interval) return;
-
-        const bar = klinePayloadToBar(message.kline);
-        if (!bar) return;
-
-        const latestBar = latestBars.get(latestBarKey);
-        if (latestBar && bar.time < latestBar.time) return;
 
         const klinePayload = message.kline && typeof message.kline === 'object'
           ? message.kline as Record<string, unknown>
           : null;
         const klineProvider = normalizeProvider(klinePayload?.provider || (message as { provider?: unknown }).provider);
         const klineSource = normalizeSource(klinePayload?.source || message.source);
+        const bar = klinePayloadToBar(message.kline, interval, klineProvider, klineSource);
+        if (!bar) return;
+
+        const latestBar = latestBars.get(latestBarKey);
+        if (latestBar && bar.time < latestBar.time) return;
+
         if (klineProvider) {
           latestKlineProviderByKey.set(latestBarKey, klineProvider);
         }
@@ -615,7 +684,7 @@ export function createSpotTradingViewDatafeed(
 
         const message = realtimeMessage as SpotMarketTradeMessage;
         if (message.type !== 'spot_trade') return;
-        if (interval === '1d') return;
+        if (isProviderCandleOnlyInterval(interval)) return;
 
         const trade = message.trade && typeof message.trade === 'object'
           ? message.trade as SpotMarketTradeItem

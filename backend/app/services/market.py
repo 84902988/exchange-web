@@ -30,7 +30,10 @@ from app.services.itick_market_service import (
 )
 from app.services.itick_holiday_service import itick_holiday_service
 from app.services.market_kline_cache import get_klines_cache_first
-from app.services.spot_kline_bucket import is_okx_spot_1d_open_time
+from app.services.spot_kline_bucket import (
+    normalize_spot_kline_bucket_interval,
+    okx_spot_open_time_validator,
+)
 from app.services.contract_market_provider_service import (
     MarketDataProviderConfig,
     MarketDataProviderError,
@@ -119,6 +122,7 @@ _INTERVAL_SECONDS = {
     "1w": 7 * 86400,
     "1M": 30 * 86400,
 }
+_INTERNAL_SPOT_KLINE_SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
 
 MAINSTREAM_PAIR_BASES = {"BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX"}
 PLATFORM_PAIR_BASES = {"MFC", "RCB"}
@@ -1325,9 +1329,15 @@ def _apply_spot_depth_price_precision_metadata(
 
 
 def _spot_interval_value(provider_code: str, interval: str) -> str:
-    normalized = str(interval or "1m").strip()
+    normalized = normalize_spot_kline_bucket_interval(interval)
     if provider_code == "OKX_SPOT":
-        return {"1h": "1H", "4h": "4H", "1d": "1D"}.get(normalized, normalized)
+        return {
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D",
+            "1w": "1W",
+            "1M": "1M",
+        }.get(normalized, normalized)
     if provider_code == "BITGET_SPOT":
         return {
             "1m": "1min",
@@ -1336,7 +1346,9 @@ def _spot_interval_value(provider_code: str, interval: str) -> str:
             "1h": "1h",
             "4h": "4h",
             "1d": "1day",
-        }.get(normalized, "1min")
+            "1w": "1week",
+            "1M": "1M",
+        }.get(normalized, normalized)
     return normalized
 
 
@@ -1631,8 +1643,8 @@ def _spot_external_kline_cache_open_time_validator(
     provider_code: Optional[str],
     interval: str,
 ) -> Optional[Callable[[int], bool]]:
-    if str(provider_code or "").strip().upper() == PROVIDER_OKX_SPOT and interval == "1d":
-        return is_okx_spot_1d_open_time
+    if str(provider_code or "").strip().upper() == PROVIDER_OKX_SPOT:
+        return okx_spot_open_time_validator(interval)
     return None
 
 
@@ -3161,6 +3173,7 @@ def get_klines(
     end_time_ms: Optional[int] = None,
 ):
     symbol = symbol.upper().strip()
+    interval = normalize_spot_kline_bucket_interval(interval)
     limit = _normalize_limit(limit)
 
     if interval not in _INTERVAL_SECONDS:
@@ -3242,7 +3255,7 @@ def get_klines(
             freshness = str(live_ws_klines.get("freshness") or "LIVE")
             updated_at = live_ws_klines.get("updated_at") or cached_meta.get("updated_at")
         else:
-            provider = str(cached_meta.get("provider") or "EXTERNAL_SPOT")
+            provider = str(cached_meta.get("provider") or primary_provider_code or "EXTERNAL_SPOT")
             source = "LAST_GOOD" if provider == "LAST_GOOD" else ("REST_HISTORY" if end_time_ms is not None else "REST_SNAPSHOT")
             freshness = "LAST_GOOD" if provider == "LAST_GOOD" else "RECENT"
             updated_at = cached_meta.get("updated_at")
@@ -3315,6 +3328,15 @@ def get_klines(
             "interval": interval,
             "items": [],
             "source": DATA_SOURCE_ITICK,
+            "freshness": "MISSING",
+        }
+
+    if interval not in _INTERNAL_SPOT_KLINE_SUPPORTED_INTERVALS:
+        return {
+            "symbol": pair.symbol,
+            "interval": interval,
+            "items": [],
+            "source": "INTERNAL",
             "freshness": "MISSING",
         }
 

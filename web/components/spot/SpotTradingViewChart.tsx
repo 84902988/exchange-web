@@ -43,7 +43,7 @@ const TRADINGVIEW_CHART_STYLE = {
   candle: 1,
   area: 3,
 } as const;
-const SPOT_INTERVAL_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1d'];
+const SPOT_INTERVAL_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'];
 const TIME_SHARING_LABEL = '\u5206\u65f6';
 
 function normalizeTradingViewSymbol(symbol: string) {
@@ -62,7 +62,22 @@ function formatIntervalLabel(value: string) {
   if (normalized === '1h') return '1H';
   if (normalized === '4h') return '4H';
   if (normalized === '1d') return '1D';
+  if (normalized === '1w') return '1W';
+  if (normalized === '1M') return '1M';
   return normalized;
+}
+
+function resolveInitialTimeframe(interval: string) {
+  if (interval === '1M') return resolveMonthlyInitialVisibleRange();
+  if (interval === '1w') return '12M';
+  return undefined;
+}
+
+function resolveMonthlyInitialVisibleRange(nowMs = Date.now()) {
+  const now = new Date(nowMs);
+  const from = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1) / 1000;
+  const to = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 2, 1) / 1000;
+  return { from, to };
 }
 
 export default function SpotTradingViewChart({
@@ -136,6 +151,7 @@ export default function SpotTradingViewChart({
       autosize: true,
       symbol: normalizedSymbol,
       interval: widgetInterval,
+      timeframe: resolveInitialTimeframe(activeInterval),
       container: containerId,
       datafeed,
       library_path: TRADINGVIEW_LIBRARY_PATH,
@@ -153,7 +169,7 @@ export default function SpotTradingViewChart({
         'display_market_status',
         'volume_force_overlay',
       ],
-      enabled_features: ['iframe_loading_same_origin'],
+      enabled_features: ['iframe_loading_same_origin', 'custom_resolutions'],
       overrides: {
         'paneProperties.background': '#12161c',
         'paneProperties.backgroundType': 'solid',
@@ -241,6 +257,7 @@ export default function SpotTradingViewChart({
       cleanupWidget();
     };
   }, [
+    activeInterval,
     amountPrecision,
     chartMode,
     containerId,

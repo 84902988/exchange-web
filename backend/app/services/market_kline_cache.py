@@ -16,6 +16,7 @@ from app.services.market_cache_metrics import (
     record_kline_db_hit,
     record_kline_external_fetch,
 )
+from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,8 @@ SUPPORTED_KLINE_INTERVAL_SECONDS = {
     "1h": 60 * 60,
     "4h": 4 * 60 * 60,
     "1d": 24 * 60 * 60,
+    "1w": 7 * 24 * 60 * 60,
+    "1M": 30 * 24 * 60 * 60,
 }
 
 OPEN_KLINE_TTL_SECONDS = 10
@@ -39,11 +42,13 @@ LATEST_KLINE_REFRESH_TTL_SECONDS = {
     "1h": 60,
     "4h": 120,
     "1d": 300,
+    "1w": 900,
+    "1M": 1800,
 }
 
 
 def normalize_kline_interval(interval: str) -> str:
-    normalized = str(interval or "1m").strip()
+    normalized = normalize_spot_kline_bucket_interval(interval)
     if normalized not in SUPPORTED_KLINE_INTERVAL_SECONDS:
         raise ValueError("invalid interval")
     return normalized
@@ -169,6 +174,25 @@ def _filter_items_by_open_time(
         for item in items
         if _item_matches_open_time_validator(item, open_time_validator)
     ]
+
+
+def _item_before_end_time(item: Any, end_time_ms: Optional[int]) -> bool:
+    if end_time_ms is None:
+        return True
+    try:
+        open_time = int(_get_item_value(item, "open_time", _get_item_value(item, "time", 0)) or 0)
+    except Exception:
+        return False
+    return open_time > 0 and open_time < int(end_time_ms)
+
+
+def _filter_items_before_end_time(
+    items: Iterable[Any],
+    end_time_ms: Optional[int],
+) -> list[Any]:
+    if end_time_ms is None:
+        return list(items)
+    return [item for item in items if _item_before_end_time(item, end_time_ms)]
 
 
 def _is_missing_table_error(exc: Exception) -> bool:
@@ -464,9 +488,12 @@ def get_klines_cache_first(
             symbol=normalized_symbol,
             interval=normalized_interval,
         )
-        external_items = _filter_items_by_open_time(
-            fetch_external(normalized_limit, end_time_ms) or [],
-            open_time_validator,
+        external_items = _filter_items_before_end_time(
+            _filter_items_by_open_time(
+                fetch_external(normalized_limit, end_time_ms) or [],
+                open_time_validator,
+            ),
+            end_time_ms,
         )
     except Exception as exc:
         record_error(

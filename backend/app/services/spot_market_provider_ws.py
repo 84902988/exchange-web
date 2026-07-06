@@ -17,7 +17,10 @@ import websockets
 from app.core.config import settings
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT
-from app.services.spot_kline_bucket import spot_kline_bucket_start_ms
+from app.services.spot_kline_bucket import (
+    normalize_spot_kline_bucket_interval,
+    spot_kline_bucket_start_ms,
+)
 from app.services.spot_market_domain_cache import is_fresh_record
 
 
@@ -42,6 +45,8 @@ BITGET_SPOT_KLINE_CHANNELS = {
     "1h": "candle1H",
     "4h": "candle4H",
     "1d": "candle1D",
+    "1w": "candle1W",
+    "1M": "candle1M",
 }
 OKX_SPOT_KLINE_CHANNELS = {
     "1m": "candle1m",
@@ -50,6 +55,8 @@ OKX_SPOT_KLINE_CHANNELS = {
     "1h": "candle1H",
     "4h": "candle4H",
     "1d": "candle1D",
+    "1w": "candle1W",
+    "1M": "candle1M",
 }
 SPOT_KLINE_INTERVAL_MS = {
     "1m": 60_000,
@@ -58,6 +65,8 @@ SPOT_KLINE_INTERVAL_MS = {
     "1h": 3_600_000,
     "4h": 14_400_000,
     "1d": 86_400_000,
+    "1w": 7 * 86_400_000,
+    "1M": 30 * 86_400_000,
 }
 _KLINE_TRADE_SIGNATURE_LIMIT = 2000
 _PROVIDER_WS_SHUTDOWN_NOISE_MESSAGES = (
@@ -247,11 +256,9 @@ def _trades_limit(value: Optional[int] = None) -> int:
 
 
 def normalize_spot_ws_kline_interval(interval: Any) -> str:
-    normalized = str(interval or "1m").strip()
+    normalized = normalize_spot_kline_bucket_interval(interval)
     if normalized == "15":
         normalized = "15m"
-    if normalized.upper() in {"1H", "4H", "1D"}:
-        normalized = normalized.lower()
     if normalized not in SPOT_KLINE_INTERVAL_MS:
         normalized = "1m"
     return normalized
@@ -1572,7 +1579,7 @@ class SpotMarketProviderWsService:
         if price is None or amount is None or price <= 0 or amount <= 0 or trade_ts_ms <= 0:
             return
         provider, local_symbol, normalized_interval = key
-        if provider == PROVIDER_OKX_SPOT and normalized_interval == "1d":
+        if provider == PROVIDER_OKX_SPOT and normalized_interval in {"1d", "1w", "1M"}:
             return
         interval_ms = SPOT_KLINE_INTERVAL_MS[normalize_spot_ws_kline_interval(interval)]
         open_time = spot_kline_bucket_start_ms(

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 from app.routers import market as market_router
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services import market
 from app.services import spot_market_gateway as gateway_module
 from app.services.spot_market_gateway import SpotMarketGateway
+
+
+def _ms(year: int, month: int, day: int, hour: int, minute: int = 0) -> int:
+    return int(datetime(year, month, day, hour, minute, tzinfo=timezone.utc).timestamp() * 1000)
 
 
 class FakeWsManager:
@@ -1868,9 +1873,93 @@ def test_okx_1d_history_pagination_uses_anchor_validator_without_live_ws() -> No
         result = market.get_klines(None, "BTCUSDT", "1d", limit=30, end_time_ms=end_time_ms)
         assert result.get("source") == "REST_HISTORY"
         assert result.get("freshness") == "RECENT"
-        assert result["provider"] == "EXTERNAL_SPOT"
+        assert result["provider"] == market.PROVIDER_OKX_SPOT
         assert all(item["open_time"] < end_time_ms for item in result["items"])
         assert result["items"][-1]["open_time"] == valid_open_time
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
+
+
+def test_okx_weekly_monthly_kline_mapping_uses_provider_candles() -> None:
+    assert market._spot_interval_value(market.PROVIDER_OKX_SPOT, "1w") == "1W"
+    assert market._spot_interval_value(market.PROVIDER_OKX_SPOT, "1W") == "1W"
+    assert market._spot_interval_value(market.PROVIDER_OKX_SPOT, "1M") == "1M"
+    assert market._spot_interval_value(market.PROVIDER_OKX_SPOT, "1m") == "1m"
+
+    assert market._spot_kline_extra_params(market.PROVIDER_OKX_SPOT, "1w", None) == {"bar": "1W"}
+    assert market._spot_kline_extra_params(market.PROVIDER_OKX_SPOT, "1M", None) == {"bar": "1M"}
+    assert market._spot_kline_extra_params(market.PROVIDER_OKX_SPOT, "1w", 12345) == {
+        "bar": "1W",
+        "after": 12345,
+    }
+    assert market._spot_kline_extra_params(market.PROVIDER_OKX_SPOT, "1M", 12345) == {
+        "bar": "1M",
+        "after": 12345,
+    }
+
+
+def test_okx_weekly_monthly_history_pagination_uses_anchor_validator_without_live_ws() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    provider = _spot_provider(market.PROVIDER_OKX_SPOT)
+    cases = [
+        ("1W", "1w", _ms(2026, 2, 15, 16), _ms(2026, 2, 8, 16), _ms(2026, 2, 9, 0)),
+        ("1M", "1M", _ms(2026, 3, 31, 16), _ms(2026, 2, 28, 16), _ms(2026, 3, 1, 0)),
+    ]
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("historical pagination must not read LIVE_WS kline")
+        )
+
+        for requested_interval, normalized_interval, end_time_ms, valid_open_time, invalid_open_time in cases:
+            def cache_first(*args, **kwargs):
+                validator = kwargs.get("open_time_validator")
+                assert validator is not None
+                assert validator(valid_open_time)
+                assert not validator(invalid_open_time)
+                assert kwargs["interval"] == normalized_interval
+                assert kwargs["end_time_ms"] == end_time_ms
+                return [
+                    {
+                        "open_time": valid_open_time,
+                        "close_time": end_time_ms,
+                        "open": "1",
+                        "high": "2",
+                        "low": "1",
+                        "close": "1.5",
+                        "volume": "5",
+                        "quote_volume": "7.5",
+                    }
+                ]
+
+            market.get_klines_cache_first = cache_first
+
+            result = market.get_klines(
+                None,
+                "BTCUSDT",
+                requested_interval,
+                limit=30,
+                end_time_ms=end_time_ms,
+            )
+            assert result.get("source") == "REST_HISTORY"
+            assert result.get("freshness") == "RECENT"
+            assert result["interval"] == normalized_interval
+            assert all(item["open_time"] < end_time_ms for item in result["items"])
+            assert result["items"][-1]["open_time"] == valid_open_time
     finally:
         market._get_active_pair = original_get_active_pair
         market._enabled_spot_market_providers_for_pair = original_enabled_providers
@@ -2129,6 +2218,48 @@ def test_internal_pair_does_not_use_live_ws_klines() -> None:
         assert result["source"] == "INTERNAL"
         assert result["freshness"] == "RECENT"
         assert result["items"][0]["close"] == "1"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market._get_internal_klines = original_get_internal_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
+        market.request_contract_market_provider_json = original_request_json
+
+
+def test_internal_weekly_monthly_klines_return_safe_empty_state() -> None:
+    class Pair:
+        symbol = "MFCUSDT"
+        data_source = market.DATA_SOURCE_INTERNAL
+        price_precision = 2
+        amount_precision = 3
+
+    original_get_active_pair = market._get_active_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_internal_klines = market._get_internal_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    original_request_json = market.request_contract_market_provider_json
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("internal pair must not read external LIVE_WS klines")
+        )
+        market.request_contract_market_provider_json = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("internal pair must not request external provider klines")
+        )
+        market._get_internal_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("internal weekly/monthly klines should stay empty until aggregation is supported")
+        )
+        market.get_klines_cache_first = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("internal weekly/monthly klines must not read stale market_klines cache")
+        )
+
+        for interval in ("1w", "1M"):
+            result = market.get_klines(None, "MFCUSDT", interval, limit=30)
+            assert result["symbol"] == "MFCUSDT"
+            assert result["interval"] == interval
+            assert result["source"] == "INTERNAL"
+            assert result["freshness"] == "MISSING"
+            assert result["items"] == []
     finally:
         market._get_active_pair = original_get_active_pair
         market.get_spot_provider_ws_klines = original_get_ws_klines

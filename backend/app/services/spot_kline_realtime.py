@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 SPOT_KLINE_MARKET_TYPE = "spot"
 SPOT_KLINE_SOURCE_INTERNAL_TRADE = "INTERNAL_TRADE"
-SUPPORTED_SPOT_KLINE_INTERVALS = tuple(SUPPORTED_KLINE_INTERVAL_SECONDS.keys())
+SUPPORTED_SPOT_KLINE_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
 
 
 def _normalize_symbol(symbol: str) -> str:

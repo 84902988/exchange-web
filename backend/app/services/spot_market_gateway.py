@@ -23,6 +23,7 @@ from app.services.spot_market_provider_ws import (
     release_spot_provider_ws_kline,
     spot_provider_ws_supports_provider,
 )
+from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
 
 
 logger = logging.getLogger(__name__)
@@ -593,8 +594,8 @@ class SpotMarketGateway:
         )
 
     def _normalize_interval(self, interval: Any) -> str:
-        normalized = str(interval or "1m").strip()
-        if normalized in {"1m", "5m", "15m", "1h", "4h", "1d"}:
+        normalized = normalize_spot_kline_bucket_interval(interval)
+        if normalized in {"1m", "5m", "15m", "1h", "4h", "1d", "1w", "1M"}:
             return normalized
         return "1m"
 

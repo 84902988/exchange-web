@@ -14,6 +14,7 @@ from starlette.websockets import WebSocketState
 
 from app.db.session import SessionLocal
 from app.services.market import get_market_depth
+from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
 from app.services.spot_kline_realtime import apply_spot_trade_to_klines
 from app.services.spot_market_view import (
     build_empty_spot_market_view,
@@ -35,8 +36,8 @@ def _normalize_symbol(symbol: str) -> str:
 
 
 def _normalize_interval(interval: str | None) -> str:
-    normalized = str(interval or "1m").strip()
-    if normalized in {"1m", "5m", "15m", "1h", "4h", "1d"}:
+    normalized = normalize_spot_kline_bucket_interval(interval)
+    if normalized in {"1m", "5m", "15m", "1h", "4h", "1d", "1w", "1M"}:
         return normalized
     return "1m"
 
@@ -249,7 +250,7 @@ class MarketWsManager:
             {
                 "type": "spot_kline_update",
                 "symbol": _normalize_symbol(symbol),
-                "interval": str(interval or "1m").strip().lower() or "1m",
+                "interval": _normalize_interval(str(interval or "1m")),
                 "kline": kline_payload,
                 "source": source,
                 "updated_at": updated_at,

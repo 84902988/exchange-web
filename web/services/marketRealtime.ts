@@ -102,8 +102,9 @@ function normalizeSymbol(symbol: string) {
 }
 
 function normalizeInterval(interval?: string | null) {
-  const normalized = String(interval || '1m').trim();
-  return ['1m', '5m', '15m', '1h', '4h', '1d'].includes(normalized) ? normalized : '1m';
+  const raw = String(interval || '1m').trim();
+  const normalized = raw === '1M' ? raw : raw.toLowerCase();
+  return ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'].includes(normalized) ? normalized : '1m';
 }
 
 function normalizeDomain(domain: SpotMarketRealtimeDomain): SpotMarketRealtimeDomain {
