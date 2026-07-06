@@ -167,6 +167,21 @@ type HistoryKlineRequestResult = {
   bars: TradingViewBar[];
   provider?: unknown;
   source?: unknown;
+  freshness?: unknown;
+  stale?: unknown;
+  cache_status?: unknown;
+  history_incomplete?: unknown;
+  provider_error_code?: unknown;
+  provider_error_provider?: unknown;
+};
+
+type HistoryNoDataPolicy = {
+  noData: boolean;
+  shouldError: boolean;
+  reason: string;
+  hasMetadata: boolean;
+  terminalEmpty: boolean;
+  transientEmpty: boolean;
 };
 
 const SPOT_EXCHANGE_NAME = 'EXCHANGE';
@@ -383,6 +398,113 @@ function normalizeSource(value: unknown): string {
 
 function isLiveWsKlineSource(source: unknown) {
   return normalizeSource(source) === 'LIVE_WS';
+}
+
+function normalizeKlineMetaValue(value: unknown): string {
+  return String(value || '').trim().toUpperCase();
+}
+
+function isTruthyKlineMeta(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === 'number') return value === 1;
+  if (typeof value === 'string') return value.trim().toLowerCase() === 'true';
+  return false;
+}
+
+function hasKlineHistoryMetadata(result: HistoryKlineRequestResult): boolean {
+  return (
+    result.freshness !== undefined ||
+    result.stale !== undefined ||
+    result.cache_status !== undefined ||
+    result.history_incomplete !== undefined ||
+    result.provider_error_code !== undefined ||
+    result.provider_error_provider !== undefined
+  );
+}
+
+function resolveHistoryNoDataPolicy(params: {
+  isHistoryRequest: boolean;
+  result: HistoryKlineRequestResult;
+}): HistoryNoDataPolicy {
+  const { isHistoryRequest, result } = params;
+  if (!isHistoryRequest) {
+    return {
+      noData: false,
+      shouldError: false,
+      reason: 'current request',
+      hasMetadata: hasKlineHistoryMetadata(result),
+      terminalEmpty: false,
+      transientEmpty: false,
+    };
+  }
+
+  if (result.bars.length > 0) {
+    return {
+      noData: false,
+      shouldError: false,
+      reason: 'history bars returned',
+      hasMetadata: hasKlineHistoryMetadata(result),
+      terminalEmpty: false,
+      transientEmpty: false,
+    };
+  }
+
+  const hasMetadata = hasKlineHistoryMetadata(result);
+  if (!hasMetadata) {
+    return {
+      noData: true,
+      shouldError: false,
+      reason: 'legacy empty history',
+      hasMetadata,
+      terminalEmpty: true,
+      transientEmpty: false,
+    };
+  }
+
+  const source = normalizeSource(result.source);
+  const freshness = normalizeKlineMetaValue(result.freshness);
+  const providerErrorCode = normalizeKlineMetaValue(result.provider_error_code);
+  const stale = isTruthyKlineMeta(result.stale);
+  const historyIncomplete = isTruthyKlineMeta(result.history_incomplete);
+  const terminalEmpty = (
+    source === 'EMPTY' &&
+    freshness === 'MISSING' &&
+    providerErrorCode === 'EMPTY'
+  );
+
+  if (terminalEmpty) {
+    return {
+      noData: true,
+      shouldError: false,
+      reason: 'terminal empty history',
+      hasMetadata,
+      terminalEmpty: true,
+      transientEmpty: false,
+    };
+  }
+
+  const transientProviderEmpty = (
+    providerErrorCode === 'TIMEOUT' ||
+    providerErrorCode === 'HTTP_ERROR' ||
+    providerErrorCode === 'COOLDOWN' ||
+    providerErrorCode === 'UNKNOWN'
+  );
+  const transientEmpty = (
+    transientProviderEmpty ||
+    (historyIncomplete && providerErrorCode !== 'EMPTY') ||
+    stale ||
+    freshness === 'STALE' ||
+    source === 'STALE_CACHE'
+  );
+
+  return {
+    noData: false,
+    shouldError: true,
+    reason: transientEmpty ? 'transient empty history' : 'non-terminal empty history',
+    hasMetadata,
+    terminalEmpty: false,
+    transientEmpty,
+  };
 }
 
 function normalizeResolution(resolution: string): TradingViewResolution {
@@ -767,6 +889,12 @@ async function fetchKlineRequestBars(params: {
     interval: normalizeSpotInterval(params.interval),
     provider: payload.provider,
     source: payload.source,
+    freshness: payload.freshness,
+    stale: payload.stale,
+    cache_status: payload.cache_status,
+    history_incomplete: payload.history_incomplete,
+    provider_error_code: payload.provider_error_code,
+    provider_error_provider: payload.provider_error_provider,
     endTime: params.endTime || null,
     rows: buildKlineItemDebugRows(payload.items, params.interval, payload.provider, payload.source),
   });
@@ -775,6 +903,12 @@ async function fetchKlineRequestBars(params: {
     bars,
     provider: payload.provider,
     source: payload.source,
+    freshness: payload.freshness,
+    stale: payload.stale,
+    cache_status: payload.cache_status,
+    history_incomplete: payload.history_incomplete,
+    provider_error_code: payload.provider_error_code,
+    provider_error_provider: payload.provider_error_provider,
   };
 }
 
@@ -1122,7 +1256,8 @@ export function createSpotTradingViewDatafeed(
         });
 
       void request
-        .then(({ bars, provider, source }) => {
+        .then((result) => {
+          const { bars, provider, source } = result;
           if (!isHistoryRequest && bars.length) {
             writeCurrentKlineCache({
               symbol: apiSymbol,
@@ -1134,7 +1269,7 @@ export function createSpotTradingViewDatafeed(
             });
           }
 
-          const noData = isHistoryRequest && bars.length === 0;
+          const noDataPolicy = resolveHistoryNoDataPolicy({ isHistoryRequest, result });
           const responseDebugPayload = {
             symbol: apiSymbol,
             interval,
@@ -1143,7 +1278,17 @@ export function createSpotTradingViewDatafeed(
             requestKind,
             provider,
             source,
-            noData,
+            freshness: result.freshness,
+            stale: result.stale,
+            cache_status: result.cache_status,
+            history_incomplete: result.history_incomplete,
+            provider_error_code: result.provider_error_code,
+            provider_error_provider: result.provider_error_provider,
+            noData: noDataPolicy.noData,
+            noDataDecision: noDataPolicy.reason,
+            terminalEmpty: noDataPolicy.terminalEmpty,
+            transientEmpty: noDataPolicy.transientEmpty,
+            metadataPresent: noDataPolicy.hasMetadata,
             ...getBarsDebugStats(bars, interval),
             lastBars: buildBarDebugRows(bars),
           };
@@ -1155,10 +1300,14 @@ export function createSpotTradingViewDatafeed(
             options.onKlineLoadStateChange?.(bars.length > 0 ? 'loaded' : 'empty');
             historyReadyByLatestBarKey.set(latestBarKey, true);
           }
+          if (noDataPolicy.shouldError) {
+            safeErrorCallback('Kline history temporarily unavailable');
+            return;
+          }
           safeHistoryCallback(
             bars,
-            { noData },
-            bars.length ? undefined : (isHistoryRequest ? 'backend returned empty history' : 'backend returned empty current'),
+            { noData: noDataPolicy.noData },
+            bars.length ? undefined : noDataPolicy.reason,
           );
         })
         .catch((err: unknown) => {
