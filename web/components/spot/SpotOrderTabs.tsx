@@ -1,6 +1,6 @@
 ﻿'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAuth } from '@/lib/authContext'
 import { useLocaleContext } from '@/contexts/LocaleContext'
 import {
@@ -764,12 +764,18 @@ export default function SpotOrderTabs({
   const revalidateTimerRef = useRef<number | null>(null)
   const optimisticCleanupTimerRef = useRef<number | null>(null)
   const currentSymbolRef = useRef('')
+  const activeTabRef = useRef<TabKey>('current')
   const restTradesRef = useRef<TradeRowItem[]>([])
   const loadingCounterRef = useRef(0)
-  const historyReloadingRef = useRef(false)
-  const historyReloadPendingRef = useRef(false)
+  const currentOrdersInFlightKeyRef = useRef<string | null>(null)
+  const historyOrdersInFlightKeyRef = useRef<string | null>(null)
+  const tradesInFlightKeyRef = useRef<string | null>(null)
+  const currentOrdersRequestSeqRef = useRef(0)
+  const historyOrdersRequestSeqRef = useRef(0)
+  const tradesRequestSeqRef = useRef(0)
   const currentOrdersLoadedRef = useRef(false)
-  const historyAndTradesLoadedRef = useRef(false)
+  const historyOrdersLoadedRef = useRef(false)
+  const tradesLoadedRef = useRef(false)
   const currentUserIdRef = useRef<string>('')
   const onBalanceUpdateRef = useRef(onBalanceUpdate)
 
@@ -784,7 +790,14 @@ export default function SpotOrderTabs({
   useEffect(() => {
     if (!isLoggedIn) {
       currentOrdersLoadedRef.current = false
-      historyAndTradesLoadedRef.current = false
+      historyOrdersLoadedRef.current = false
+      tradesLoadedRef.current = false
+      currentOrdersInFlightKeyRef.current = null
+      historyOrdersInFlightKeyRef.current = null
+      tradesInFlightKeyRef.current = null
+      currentOrdersRequestSeqRef.current += 1
+      historyOrdersRequestSeqRef.current += 1
+      tradesRequestSeqRef.current += 1
       setCurrentOrders([])
       setHistoryOrders([])
       setMyTrades([])
@@ -793,15 +806,15 @@ export default function SpotOrderTabs({
     }
   }, [isLoggedIn])
 
-  const beginLoading = () => {
+  const beginLoading = useCallback(() => {
     loadingCounterRef.current += 1
     setLoading(true)
-  }
+  }, [])
 
-  const endLoading = () => {
+  const endLoading = useCallback(() => {
     loadingCounterRef.current = Math.max(loadingCounterRef.current - 1, 0)
     setLoading(loadingCounterRef.current > 0)
-  }
+  }, [])
 
   useEffect(() => {
     onLoadingChange?.(loading)
@@ -809,13 +822,22 @@ export default function SpotOrderTabs({
 
   useEffect(() => {
     currentSymbolRef.current = normalizeSymbol(symbol)
-    historyReloadPendingRef.current = false
     if (revalidateTimerRef.current !== null) {
       window.clearTimeout(revalidateTimerRef.current)
       revalidateTimerRef.current = null
     }
     currentOrdersLoadedRef.current = false
-    historyAndTradesLoadedRef.current = false
+    historyOrdersLoadedRef.current = false
+    tradesLoadedRef.current = false
+    currentOrdersInFlightKeyRef.current = null
+    historyOrdersInFlightKeyRef.current = null
+    tradesInFlightKeyRef.current = null
+    currentOrdersRequestSeqRef.current += 1
+    historyOrdersRequestSeqRef.current += 1
+    tradesRequestSeqRef.current += 1
+    setCurrentOrders([])
+    setHistoryOrders([])
+    setMyTrades([])
     setPages({
       current: 1,
       history: 1,
@@ -828,12 +850,8 @@ export default function SpotOrderTabs({
   }, [symbol])
 
   useEffect(() => {
-    setPages({
-      current: 1,
-      history: 1,
-      trades: 1,
-    })
-  }, [refreshKey])
+    activeTabRef.current = tab
+  }, [tab])
 
   useEffect(() => {
     if (!actionSuccess) {
@@ -880,7 +898,9 @@ export default function SpotOrderTabs({
 
     optimisticCleanupTimerRef.current = window.setTimeout(() => {
       setOptimisticTrades((prev) => reconcileOptimisticTrades(prev, restTradesRef.current, currentSymbolRef.current))
-      void scheduleHistoryAndTradesReload('optimistic-expired', 0)
+      if (activeTabRef.current === 'trades') {
+        scheduleHistoryAndTradesReload('optimistic-expired', 0, 'trades')
+      }
     }, Math.max(nextExpiry - now, 0))
 
     return () => {
@@ -1002,7 +1022,10 @@ export default function SpotOrderTabs({
             }
 
             if (['FILLED', 'PARTIALLY_FILLED', 'CANCELED', 'REJECTED'].includes(status)) {
-              void scheduleHistoryAndTradesReload(`ws-${status.toLowerCase()}`)
+              const activeTab = activeTabRef.current
+              if (activeTab === 'history' || activeTab === 'trades') {
+                scheduleHistoryAndTradesReload(`ws-${status.toLowerCase()}`, REST_REVALIDATE_DEBOUNCE_MS, activeTab)
+              }
             }
           }
         } catch (err) {
@@ -1044,121 +1067,161 @@ export default function SpotOrderTabs({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, isLoggedIn])
 
-  useEffect(() => {
-    let dead = false
-
-    const normalizedSymbol = normalizeSymbol(symbol)
-    currentSymbolRef.current = normalizedSymbol
-
-    if (!normalizedSymbol || !isLoggedIn) {
+  const loadCurrentOrders = useCallback(async (reason = 'manual') => {
+    void reason
+    if (!isLoggedIn) {
       currentOrdersLoadedRef.current = false
       setCurrentOrders([])
-      return () => {
-        dead = true
-      }
+      return
     }
 
-    const loadCurrentOrders = async () => {
-      const shouldShowLoading = !currentOrdersLoadedRef.current
-      try {
-        if (shouldShowLoading) beginLoading()
-        const currentRes = await getSpotCurrentOrders(normalizedSymbol, 50)
-        if (dead) return
-        setCurrentOrders(filterBySymbol(currentRes.items || [], normalizedSymbol))
-      } catch (err) {
-        if (dead) return
+    const requestSymbol = currentSymbolRef.current || normalizeSymbol(symbol)
+    if (!requestSymbol) return
+
+    const requestKey = `${requestSymbol}:current`
+    if (currentOrdersInFlightKeyRef.current === requestKey) {
+      return
+    }
+
+    const requestSeq = ++currentOrdersRequestSeqRef.current
+    currentOrdersInFlightKeyRef.current = requestKey
+    const shouldShowLoading = activeTabRef.current === 'current' && !currentOrdersLoadedRef.current
+
+    try {
+      if (shouldShowLoading) beginLoading()
+      const currentRes = await getSpotCurrentOrders(requestSymbol, 50)
+      if (
+        currentOrdersRequestSeqRef.current !== requestSeq ||
+        requestSymbol !== currentSymbolRef.current
+      ) {
+        return
+      }
+      setCurrentOrders(filterBySymbol(currentRes.items || [], requestSymbol))
+      currentOrdersLoadedRef.current = true
+    } catch (err) {
+      if (currentOrdersRequestSeqRef.current === requestSeq) {
         console.error('SpotOrderTabs current orders load error:', err)
-      } finally {
-        if (!dead) {
-          currentOrdersLoadedRef.current = true
-          if (shouldShowLoading) endLoading()
-        }
+      }
+    } finally {
+      if (currentOrdersRequestSeqRef.current === requestSeq) {
+        currentOrdersInFlightKeyRef.current = null
+        if (shouldShowLoading) endLoading()
       }
     }
+  }, [beginLoading, endLoading, isLoggedIn, symbol])
 
-    void loadCurrentOrders()
+  useEffect(() => {
+    if (tab !== 'current') return
+    void loadCurrentOrders('active-tab')
+  }, [loadCurrentOrders, refreshKey, tab])
 
-    return () => {
-      dead = true
-    }
-  }, [symbol, refreshKey, isLoggedIn])
-
-  const runHistoryAndTradesReload = async (reason = 'manual') => {
+  const loadHistoryOrders = useCallback(async (reason = 'manual') => {
     void reason
     if (!isLoggedIn) return
     const requestSymbol = currentSymbolRef.current || normalizeSymbol(symbol)
     if (!requestSymbol) return
 
-    historyReloadingRef.current = true
-    const shouldShowLoading = !historyAndTradesLoadedRef.current
-
-    try {
-      if (shouldShowLoading) beginLoading()
-      const [currentRes, historyRes, tradesRes] = await Promise.all([
-        getSpotCurrentOrders(requestSymbol, 50),
-        getSpotHistoryOrders(requestSymbol, 100),
-        getSpotMyTrades(requestSymbol, 100),
-      ])
-
-      if (requestSymbol !== currentSymbolRef.current) {
-        return
-      }
-
-      const restTrades = filterBySymbol(tradesRes.items || [], requestSymbol) as TradeRowItem[]
-      if (process.env.NODE_ENV !== 'production') {
-        console.log('[SpotOrderTabs REST request]', {
-          userId: user?.id,
-          rawSymbol: symbol,
-          requestSymbol,
-          url: `/spot/trades?symbol=${encodeURIComponent(requestSymbol)}&limit=100`,
-        })
-        console.log('[SpotOrderTabs REST trades]', restTrades.slice(0, 5))
-      }
-      restTradesRef.current = restTrades
-      setCurrentOrders(filterBySymbol(currentRes.items || [], requestSymbol))
-      setHistoryOrders(filterBySymbol(historyRes.items || [], requestSymbol))
-      setMyTrades(restTrades)
-      setOptimisticTrades((prev) => reconcileOptimisticTrades(prev, restTrades, requestSymbol))
-    } catch (err) {
-      console.error('SpotOrderTabs refetch error:', err)
-    } finally {
-      historyReloadingRef.current = false
-      historyAndTradesLoadedRef.current = true
-      if (shouldShowLoading) endLoading()
-
-      if (historyReloadPendingRef.current) {
-        historyReloadPendingRef.current = false
-        void runHistoryAndTradesReload('pending')
-      }
-    }
-  }
-
-  const scheduleHistoryAndTradesReload = async (reason = 'manual', delayMs = REST_REVALIDATE_DEBOUNCE_MS) => {
-    void reason
-    if (!isLoggedIn) return
-    const normalizedSymbol = currentSymbolRef.current || normalizeSymbol(symbol)
-    if (!normalizedSymbol) return
-
-    if (revalidateTimerRef.current !== null) {
-      window.clearTimeout(revalidateTimerRef.current)
-      revalidateTimerRef.current = null
-    }
-
-    if (historyReloadingRef.current) {
-      historyReloadPendingRef.current = true
+    const requestKey = `${requestSymbol}:history`
+    if (historyOrdersInFlightKeyRef.current === requestKey) {
       return
     }
 
-    revalidateTimerRef.current = window.setTimeout(() => {
-      revalidateTimerRef.current = null
-      void runHistoryAndTradesReload(reason)
-    }, Math.max(delayMs, 0))
-  }
+    const requestSeq = ++historyOrdersRequestSeqRef.current
+    historyOrdersInFlightKeyRef.current = requestKey
+    const shouldShowLoading = activeTabRef.current === 'history' && !historyOrdersLoadedRef.current
+
+    try {
+      if (shouldShowLoading) beginLoading()
+      const historyRes = await getSpotHistoryOrders(requestSymbol, 100)
+      if (
+        historyOrdersRequestSeqRef.current !== requestSeq ||
+        requestSymbol !== currentSymbolRef.current
+      ) {
+        return
+      }
+      setHistoryOrders(filterBySymbol(historyRes.items || [], requestSymbol))
+      historyOrdersLoadedRef.current = true
+    } catch (err) {
+      if (historyOrdersRequestSeqRef.current === requestSeq) {
+        console.error('SpotOrderTabs history orders load error:', err)
+      }
+    } finally {
+      if (historyOrdersRequestSeqRef.current === requestSeq) {
+        historyOrdersInFlightKeyRef.current = null
+        if (shouldShowLoading) endLoading()
+      }
+    }
+  }, [beginLoading, endLoading, isLoggedIn, symbol])
+
+  const loadMyTrades = useCallback(async (reason = 'manual') => {
+    void reason
+    if (!isLoggedIn) return
+    const requestSymbol = currentSymbolRef.current || normalizeSymbol(symbol)
+    if (!requestSymbol) return
+
+    const requestKey = `${requestSymbol}:trades`
+    if (tradesInFlightKeyRef.current === requestKey) {
+      return
+    }
+
+    const requestSeq = ++tradesRequestSeqRef.current
+    tradesInFlightKeyRef.current = requestKey
+    const shouldShowLoading = activeTabRef.current === 'trades' && !tradesLoadedRef.current
+
+    try {
+      if (shouldShowLoading) beginLoading()
+      const tradesRes = await getSpotMyTrades(requestSymbol, 100)
+      if (
+        tradesRequestSeqRef.current !== requestSeq ||
+        requestSymbol !== currentSymbolRef.current
+      ) {
+        return
+      }
+      const restTrades = filterBySymbol(tradesRes.items || [], requestSymbol) as TradeRowItem[]
+      restTradesRef.current = restTrades
+      setMyTrades(restTrades)
+      setOptimisticTrades((prev) => reconcileOptimisticTrades(prev, restTrades, requestSymbol))
+      tradesLoadedRef.current = true
+    } catch (err) {
+      if (tradesRequestSeqRef.current === requestSeq) {
+        console.error('SpotOrderTabs trades load error:', err)
+      }
+    } finally {
+      if (tradesRequestSeqRef.current === requestSeq) {
+        tradesInFlightKeyRef.current = null
+        if (shouldShowLoading) endLoading()
+      }
+    }
+  }, [beginLoading, endLoading, isLoggedIn, symbol])
+
+  const scheduleHistoryAndTradesReload = useCallback(
+    (reason = 'manual', delayMs = REST_REVALIDATE_DEBOUNCE_MS, targetTab: TabKey = activeTabRef.current) => {
+      if (!isLoggedIn) return
+      const normalizedSymbol = currentSymbolRef.current || normalizeSymbol(symbol)
+      if (!normalizedSymbol) return
+      if (targetTab !== 'history' && targetTab !== 'trades') return
+
+      if (revalidateTimerRef.current !== null) {
+        window.clearTimeout(revalidateTimerRef.current)
+        revalidateTimerRef.current = null
+      }
+
+      revalidateTimerRef.current = window.setTimeout(() => {
+        revalidateTimerRef.current = null
+        if (targetTab === 'history') {
+          void loadHistoryOrders(reason)
+          return
+        }
+        void loadMyTrades(reason)
+      }, Math.max(delayMs, 0))
+    },
+    [isLoggedIn, loadHistoryOrders, loadMyTrades, symbol],
+  )
 
   useEffect(() => {
-    void scheduleHistoryAndTradesReload()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, refreshKey, isLoggedIn])
+    if (tab !== 'history' && tab !== 'trades') return
+    scheduleHistoryAndTradesReload('active-tab', 0, tab)
+  }, [refreshKey, scheduleHistoryAndTradesReload, symbol, tab])
 
   const userOrderSideMap = useMemo(() => {
     const map = new Map<string, TradeDirection>()
@@ -1234,9 +1297,6 @@ export default function SpotOrderTabs({
     setTab(nextTab)
     setActionError('')
     setActionSuccess('')
-    if (nextTab === 'history' || nextTab === 'trades') {
-      void scheduleHistoryAndTradesReload(`tab-${nextTab}`, 0)
-    }
   }
 
   const handleCancelOrder = async (order: SpotOrderItem) => {
@@ -1252,7 +1312,9 @@ export default function SpotOrderTabs({
       setCurrentOrders((prev) => prev.filter((item) => item.id !== order.id))
       setActionSuccess(t('spotOrderCancelSuccess', 'asset'))
       onOrdersChanged?.()
-      void scheduleHistoryAndTradesReload()
+      if (activeTabRef.current === 'history' || activeTabRef.current === 'trades') {
+        scheduleHistoryAndTradesReload('cancel', 0, activeTabRef.current)
+      }
     } catch (err) {
       console.error('SpotOrderTabs cancel order error:', err)
       setActionError(normalizeActionError(err, t))

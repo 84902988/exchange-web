@@ -49,6 +49,9 @@ const EMPTY_MARKET_DATA: SpotHeaderMarketData = {
 const DEFAULT_SPOT_SYMBOL = 'BTCUSDT';
 const SPOT_PAIR_PAGE_SIZE = 6;
 const SPOT_INTERVAL_CHANGE_DEBOUNCE_MS = 350;
+const SPOT_PRIVATE_FOREGROUND_REFRESH_MS = 10000;
+const SPOT_PRIVATE_HIDDEN_REFRESH_MS = 30000;
+const SPOT_PRIVATE_MIN_REFRESH_INTERVAL_MS = 2000;
 type SpotPairQuery = {
   marketType: 'spot' | 'contract' | 'all';
   category: string;
@@ -449,9 +452,12 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const [refreshKey, setRefreshKey] = useState(0);
   const [accountBalances, setAccountBalances] = useState<SpotAccountBalanceItem[]>([]);
   const [balancesLoading, setBalancesLoading] = useState(false);
-  const [ordersLoading, setOrdersLoading] = useState(false);
+  const [, setOrdersLoading] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
   const accountBalancesLoadedRef = useRef(false);
+  const accountBalancesInFlightRef = useRef(false);
+  const accountBalancesRequestSeqRef = useRef(0);
+  const lastAccountBalancesStartedAtRef = useRef(0);
   const [pairQuery, setPairQuery] = useState<SpotPairQuery>(() => getInitialPairQuery(initialCategory));
   const initialPairCache = cachedSpotPairPages.get(getPairQueryKey(getInitialPairQuery(initialCategory)));
   const [pairOptions, setPairOptions] = useState<SpotPairOption[]>(initialPairCache?.items || []);
@@ -776,25 +782,47 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     router.replace(`/trade/spot?category=${encodeURIComponent(category)}&symbol=${encodeURIComponent(matchedPair.symbol)}`);
   }, [hasInitialSymbol, initialCategory, pairOptions, pairOptionsQueryKey, router, symbol]);
 
-  const loadAccountBalances = useCallback(async (options?: { silent?: boolean }) => {
+  const loadAccountBalances = useCallback(async (options?: { force?: boolean; silent?: boolean }) => {
     if (!isLoggedIn) {
       accountBalancesLoadedRef.current = false;
+      accountBalancesInFlightRef.current = false;
       setAccountBalances([]);
       return;
     }
 
+    const now = Date.now();
+    if (accountBalancesInFlightRef.current) {
+      return;
+    }
+    if (
+      !options?.force &&
+      lastAccountBalancesStartedAtRef.current > 0 &&
+      now - lastAccountBalancesStartedAtRef.current < SPOT_PRIVATE_MIN_REFRESH_INTERVAL_MS
+    ) {
+      return;
+    }
+
     const shouldShowLoading = !options?.silent && !accountBalancesLoadedRef.current;
+    const requestSeq = ++accountBalancesRequestSeqRef.current;
+    accountBalancesInFlightRef.current = true;
+    lastAccountBalancesStartedAtRef.current = now;
 
     try {
       if (shouldShowLoading) {
         setBalancesLoading(true);
       }
       const data = await getSpotAccountBalances();
+      if (accountBalancesRequestSeqRef.current !== requestSeq) {
+        return;
+      }
       setAccountBalances(data);
       accountBalancesLoadedRef.current = true;
     } catch (error) {
       console.error('SpotPage account balances load error:', error);
     } finally {
+      if (accountBalancesRequestSeqRef.current === requestSeq) {
+        accountBalancesInFlightRef.current = false;
+      }
       if (shouldShowLoading) {
         setBalancesLoading(false);
       }
@@ -802,22 +830,72 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   }, [isLoggedIn]);
 
   useEffect(() => {
-    loadAccountBalances();
+    void loadAccountBalances({
+      force: refreshKey === 0 || !accountBalancesLoadedRef.current,
+      silent: refreshKey > 0,
+    });
   }, [loadAccountBalances, refreshKey]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (balancesLoading || ordersLoading) {
-        return;
-      }
+    if (!isLoggedIn) {
+      return undefined;
+    }
 
-      setRefreshKey((v) => v + 1);
-    }, 3000);
+    let stopped = false;
+    let timer: number | null = null;
+
+    const getRefreshDelayMs = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return SPOT_PRIVATE_HIDDEN_REFRESH_MS;
+      }
+      return SPOT_PRIVATE_FOREGROUND_REFRESH_MS;
+    };
+
+    const clearTimer = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const scheduleNextRefresh = () => {
+      clearTimer();
+      timer = window.setTimeout(() => {
+        if (stopped) return;
+        setRefreshKey((v) => v + 1);
+        scheduleNextRefresh();
+      }, getRefreshDelayMs());
+    };
+
+    const handleVisibilityChange = () => {
+      if (stopped) return;
+      clearTimer();
+      if (document.visibilityState === 'visible') {
+        setRefreshKey((v) => v + 1);
+      }
+      scheduleNextRefresh();
+    };
+
+    scheduleNextRefresh();
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
-      window.clearInterval(timer);
+      stopped = true;
+      clearTimer();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [balancesLoading, ordersLoading]);
+  }, [isLoggedIn]);
+
+  useEffect(() => {
+    if (!isLoggedIn) {
+      accountBalancesLoadedRef.current = false;
+      accountBalancesInFlightRef.current = false;
+      accountBalancesRequestSeqRef.current += 1;
+      lastAccountBalancesStartedAtRef.current = 0;
+      setBalancesLoading(false);
+      setAccountBalances([]);
+    }
+  }, [isLoggedIn]);
 
   const handleOrderBookPriceClick = useCallback(
     (price: string) => {
@@ -991,12 +1069,12 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
   const handleOrderSuccess = useCallback(() => {
     setRefreshKey((v) => v + 1);
-    void loadAccountBalances({ silent: true });
+    void loadAccountBalances({ force: true, silent: true });
   }, [loadAccountBalances]);
 
   const handleOrdersChanged = useCallback(() => {
     setRefreshKey((v) => v + 1);
-    void loadAccountBalances({ silent: true });
+    void loadAccountBalances({ force: true, silent: true });
   }, [loadAccountBalances]);
 
   const handleAccountBalanceUpdate = useCallback((items: SpotAccountBalanceItem[]) => {
