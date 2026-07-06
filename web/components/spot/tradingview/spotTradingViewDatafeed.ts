@@ -131,6 +131,23 @@ type SpotTradingViewDatafeedOptions = Pick<
   debugEnabled?: boolean;
   onKlineLoadStateChange?: (state: SpotKlineLoadState) => void;
   onKlineRealtime?: (event: SpotTradingViewRealtimeEvent) => void;
+  onHistoryBars?: (event: SpotTradingViewHistoryBarsEvent) => void;
+};
+
+export type SpotTradingViewHistoryBarsEvent = {
+  requestSeq: number;
+  phase: 'current' | 'history';
+  isHistoryRequest: boolean;
+  symbol: string;
+  resolution: string;
+  interval: string;
+  chartInterval: string;
+  backendInterval: string;
+  requiredBars: number;
+  barCount: number;
+  firstBarTime: number | null;
+  lastBarTime: number | null;
+  noData: boolean;
 };
 
 type EmitRealtimeBar = (bar: TradingViewBar, reason: string) => boolean;
@@ -1540,6 +1557,33 @@ export function createSpotTradingViewDatafeed(
           barsSummary: buildSpotTvDebugBarsSummary(bars),
         });
         onHistory(bars, meta);
+        try {
+          const firstBar = bars[0] || null;
+          const lastBar = bars[bars.length - 1] || null;
+          options.onHistoryBars?.({
+            requestSeq,
+            phase: requestKind,
+            isHistoryRequest,
+            symbol: apiSymbol,
+            resolution: requestResolution,
+            interval,
+            chartInterval,
+            backendInterval: interval,
+            requiredBars,
+            barCount: bars.length,
+            firstBarTime: firstBar?.time ?? null,
+            lastBarTime: lastBar?.time ?? null,
+            noData: meta.noData,
+          });
+        } catch (error) {
+          if (process.env.NODE_ENV !== 'production') {
+            console.debug('[SpotTradingViewDatafeed] onHistoryBars callback failed', {
+              symbol: apiSymbol,
+              resolution: requestResolution,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
       };
       const safeErrorCallback = (reason: string) => {
         if (destroyed || didCompleteHistory) {
