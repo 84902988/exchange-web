@@ -59,6 +59,7 @@ from app.services.spot_market_provider_ws import (
 )
 from app.services.spot_depth_shared_cache import get_spot_depth_with_shared_cache
 from app.services.spot_ticker_shared_cache import get_spot_ticker_with_shared_cache
+from app.services.spot_trades_shared_cache import get_spot_trades_with_shared_cache
 
 logger = logging.getLogger(__name__)
 
@@ -1911,6 +1912,27 @@ def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *
     raise ValueError(f"spot external trades unavailable: {last_error}")
 
 
+def _get_external_spot_trades_cached(
+    db: Session,
+    pair: TradingPair,
+    limit: int = 50,
+    *,
+    fast: bool = False,
+) -> TradesResponse:
+    def load_trades() -> Optional[Dict[str, Any]]:
+        trades = _get_external_spot_trades(db, pair, limit=limit, fast=fast)
+        return trades.model_dump() if hasattr(trades, "model_dump") else trades.dict()
+
+    payload = get_spot_trades_with_shared_cache(
+        symbol=pair.symbol,
+        data_source=_normalize_data_source(pair),
+        loader=load_trades,
+    )
+    if not isinstance(payload, dict):
+        raise ValueError("spot external trades unavailable")
+    return TradesResponse(**payload)
+
+
 def _fetch_okx_spot_klines(
     provider: MarketDataProviderConfig,
     provider_symbol: str,
@@ -2084,7 +2106,7 @@ def get_trades(db: Session, symbol: str, limit: int = 50, *, fast: bool = False)
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        return _get_external_spot_trades(db, pair, limit=limit, fast=fast)
+        return _get_external_spot_trades_cached(db, pair, limit=limit, fast=fast)
 
     if data_source == DATA_SOURCE_ITICK:
         trades = _get_internal_trades(db, pair, limit=limit)
