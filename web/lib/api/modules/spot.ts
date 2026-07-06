@@ -434,8 +434,9 @@ export async function getSpotKlines(params: {
   interval: string
   limit?: number
   endTime?: number
+  forceRest?: boolean
 }): Promise<SpotMarketKlinesResponse> {
-  const { symbol, interval, limit = 200, endTime } = params
+  const { symbol, interval, limit = 200, endTime, forceRest } = params
   const normalizedSymbol = normalizeSpotSymbol(symbol)
   const query = new URLSearchParams({
     symbol: normalizedSymbol,
@@ -445,6 +446,9 @@ export async function getSpotKlines(params: {
 
   if (typeof endTime === 'number' && Number.isFinite(endTime) && endTime > 0) {
     query.set('end_time', String(endTime))
+  }
+  if (forceRest) {
+    query.set('force_rest', '1')
   }
 
   return request<SpotMarketKlinesResponse>(buildRelativeUrl('/market/kline', query))

@@ -396,6 +396,10 @@ def kline(
         None,
         description="Historical pagination cursor in ms. Takes priority over end_time.",
     ),
+    force_rest: bool = Query(
+        False,
+        description="Force REST/DB snapshot backfill and skip LIVE_WS kline overlay.",
+    ),
     db: Session = Depends(get_db),
 ):
     try:
@@ -406,6 +410,7 @@ def kline(
             interval=interval,
             limit=limit,
             end_time_ms=cursor_end_time_ms,
+            force_rest=force_rest,
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

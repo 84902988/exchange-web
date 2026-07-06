@@ -66,7 +66,7 @@ class TradesResponse(BaseModel):
 # K线
 # =========================
 
-KlineInterval = Literal["1m", "5m", "15m", "1h", "4h", "1d", "1w", "1M"]
+KlineInterval = Literal["1m", "5m", "15m", "1h", "4h", "1d", "1Dutc", "1w", "1Wutc", "1M", "1Mutc"]
 
 
 class KlineItem(BaseModel):

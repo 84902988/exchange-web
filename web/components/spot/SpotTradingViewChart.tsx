@@ -65,22 +65,32 @@ type SpotTradingViewWindow = Window & {
 
 const TRADINGVIEW_LIBRARY_PATH = '/tradingview/charting_library/';
 const TRADINGVIEW_SCRIPT_SRC = `${TRADINGVIEW_LIBRARY_PATH}charting_library.js`;
+const TRADINGVIEW_TIMEZONE = 'Asia/Shanghai';
 const TRADINGVIEW_CHART_STYLE = {
   candle: 1,
   area: 3,
 } as const;
 const SPOT_INTERVAL_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'];
-const SPOT_PRELOAD_INTERVAL_OPTIONS = ['1m', '1M', '5m', '15m', '1w', '1h', '4h', '1d'];
+const SPOT_PRELOAD_INTERVAL_OPTIONS: Record<string, string[]> = {
+  '1m': ['5m', '15m'],
+  '5m': ['1m', '15m'],
+  '15m': ['5m', '1h'],
+  '1h': ['15m', '4h'],
+  '4h': ['1h', '1d'],
+  '1d': ['4h', '1w'],
+  '1w': ['1d', '1M'],
+  '1M': ['1w'],
+};
 const TIME_SHARING_LABEL = '\u5206\u65f6';
 const TIME_SHARING_KEY = 'time';
 const VISIBLE_RANGE_LOOKBACK_SECONDS: Record<string, number> = {
-  '1m': 6 * 60 * 60,
-  '5m': 24 * 60 * 60,
-  '15m': 3 * 24 * 60 * 60,
-  '1h': 14 * 24 * 60 * 60,
-  '4h': 60 * 24 * 60 * 60,
-  '1d': 120 * 24 * 60 * 60,
-  '1w': 2 * 365 * 24 * 60 * 60,
+  '1m': 120 * 60,
+  '5m': 100 * 5 * 60,
+  '15m': 96 * 15 * 60,
+  '1h': 100 * 60 * 60,
+  '4h': 90 * 4 * 60 * 60,
+  '1d': 90 * 24 * 60 * 60,
+  '1w': 60 * 7 * 24 * 60 * 60,
 };
 
 function normalizeTradingViewSymbol(symbol: string) {
@@ -92,6 +102,16 @@ function resolveTradingViewLocale(locale: string) {
   if (locale === 'zh') return 'zh';
   if (locale === 'ja') return 'ja';
   return 'en';
+}
+
+function isSpotTradingViewDebugEnabled() {
+  if (typeof window === 'undefined') return false;
+
+  try {
+    return window.localStorage?.getItem('SPOT_TV_DEBUG') === '1';
+  } catch {
+    return false;
+  }
 }
 
 function formatIntervalLabel(value: string) {
@@ -106,25 +126,28 @@ function formatIntervalLabel(value: string) {
 
 function resolveInitialTimeframe(interval: string) {
   if (interval === '1M') return resolveMonthlyInitialVisibleRange();
-  if (interval === '1w') return '12M';
+  if (interval === '1w') return resolveVisibleRangeForInterval(interval);
   return undefined;
 }
 
 function resolveMonthlyInitialVisibleRange(nowMs = Date.now()) {
   const now = new Date(nowMs);
-  const from = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1) / 1000;
+  const from = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 35, 1) / 1000;
   const to = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 2, 1) / 1000;
   return { from, to };
 }
 
 function resolveVisibleRangeForInterval(interval: string, nowMs = Date.now()): TradingViewVisibleRange {
   if (interval === '1M') {
-    const now = new Date(nowMs);
-    return { from: Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 13, 1) / 1000 };
+    return resolveMonthlyInitialVisibleRange(nowMs);
   }
 
   const lookbackSeconds = VISIBLE_RANGE_LOOKBACK_SECONDS[interval] ?? VISIBLE_RANGE_LOOKBACK_SECONDS['1d'];
   return { from: Math.floor(nowMs / 1000) - lookbackSeconds };
+}
+
+function getSpotPreloadIntervals(interval: string) {
+  return SPOT_PRELOAD_INTERVAL_OPTIONS[interval] || [];
 }
 
 function applyVisibleRangeForInterval(chart: TradingViewChartApi, interval: string) {
@@ -294,9 +317,9 @@ export default function SpotTradingViewChart({
     const timer = window.setTimeout(() => {
       void preloadSpotTradingViewKlineCache({
         symbol: normalizedSymbol,
-        intervals: SPOT_PRELOAD_INTERVAL_OPTIONS,
+        intervals: getSpotPreloadIntervals(activeInterval),
         skipInterval: activeInterval,
-        concurrency: 2,
+        concurrency: 1,
         shouldContinue: () => !cancelled,
       }).catch((err: unknown) => {
         if (!cancelled && process.env.NODE_ENV !== 'production') {
@@ -360,6 +383,7 @@ export default function SpotTradingViewChart({
       displaySymbol: displayName,
       pricePrecision,
       amountPrecision,
+      debugEnabled: isSpotTradingViewDebugEnabled(),
     });
     datafeedRef.current = datafeed;
 
@@ -372,7 +396,7 @@ export default function SpotTradingViewChart({
       datafeed,
       library_path: TRADINGVIEW_LIBRARY_PATH,
       locale: resolveTradingViewLocale(locale),
-      timezone: 'Etc/UTC',
+      timezone: TRADINGVIEW_TIMEZONE,
       theme: 'dark',
       style: widgetStyle,
       header_widget_buttons_mode: 'compact',

@@ -30,8 +30,11 @@ SUPPORTED_KLINE_INTERVAL_SECONDS = {
     "1h": 60 * 60,
     "4h": 4 * 60 * 60,
     "1d": 24 * 60 * 60,
+    "1Dutc": 24 * 60 * 60,
     "1w": 7 * 24 * 60 * 60,
+    "1Wutc": 7 * 24 * 60 * 60,
     "1M": 30 * 24 * 60 * 60,
+    "1Mutc": 30 * 24 * 60 * 60,
 }
 
 OPEN_KLINE_TTL_SECONDS = 10
@@ -42,8 +45,11 @@ LATEST_KLINE_REFRESH_TTL_SECONDS = {
     "1h": 60,
     "4h": 120,
     "1d": 300,
+    "1Dutc": 300,
     "1w": 900,
+    "1Wutc": 900,
     "1M": 1800,
+    "1Mutc": 1800,
 }
 
 

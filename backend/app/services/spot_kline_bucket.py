@@ -17,13 +17,23 @@ SPOT_KLINE_INTERVAL_MS = {
     "1h": HOUR_MS,
     "4h": 4 * HOUR_MS,
     "1d": DAY_MS,
+    "1Dutc": DAY_MS,
     "1w": WEEK_MS,
+    "1Wutc": WEEK_MS,
     "1M": 30 * DAY_MS,
+    "1Mutc": 30 * DAY_MS,
 }
 
 
 def normalize_spot_kline_bucket_interval(interval: Any) -> str:
     normalized = str(interval or "1m").strip()
+    utc_interval = {
+        "1dutc": "1Dutc",
+        "1wutc": "1Wutc",
+        "1mutc": "1Mutc",
+    }.get(normalized.lower())
+    if utc_interval:
+        return utc_interval
     if normalized == "1M":
         return normalized
     if normalized.upper() in {"1H", "4H", "1D", "1W"}:
@@ -69,6 +79,23 @@ def okx_spot_1M_bucket_start_ms(ts_ms: Any) -> int:
     return _ms_from_datetime_utc(local_start - timedelta(hours=8))
 
 
+def okx_spot_1wutc_bucket_start_ms(ts_ms: Any) -> int:
+    utc_dt = _datetime_utc_from_ms(ts_ms)
+    utc_start = (utc_dt - timedelta(days=utc_dt.weekday())).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return _ms_from_datetime_utc(utc_start)
+
+
+def okx_spot_1Mutc_bucket_start_ms(ts_ms: Any) -> int:
+    utc_dt = _datetime_utc_from_ms(ts_ms)
+    utc_start = utc_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return _ms_from_datetime_utc(utc_start)
+
+
 def spot_kline_bucket_start_ms(
     ts_ms: Any,
     interval: Any,
@@ -80,10 +107,16 @@ def spot_kline_bucket_start_ms(
     if str(provider or "").strip().upper() == "OKX_SPOT":
         if normalized_interval == "1d":
             return okx_spot_1d_bucket_start_ms(ts)
+        if normalized_interval == "1Dutc":
+            return (ts // DAY_MS) * DAY_MS
         if normalized_interval == "1w":
             return okx_spot_1w_bucket_start_ms(ts)
+        if normalized_interval == "1Wutc":
+            return okx_spot_1wutc_bucket_start_ms(ts)
         if normalized_interval == "1M":
             return okx_spot_1M_bucket_start_ms(ts)
+        if normalized_interval == "1Mutc":
+            return okx_spot_1Mutc_bucket_start_ms(ts)
     step_ms = spot_kline_interval_ms(normalized_interval)
     return (ts // step_ms) * step_ms
 
@@ -118,12 +151,48 @@ def is_okx_spot_1M_open_time(open_time_ms: Any) -> bool:
     return okx_spot_1M_bucket_start_ms(open_time) == open_time
 
 
+def is_okx_spot_1Dutc_open_time(open_time_ms: Any) -> bool:
+    try:
+        open_time = int(open_time_ms)
+    except Exception:
+        return False
+    if open_time <= 0:
+        return False
+    return open_time % DAY_MS == 0
+
+
+def is_okx_spot_1Wutc_open_time(open_time_ms: Any) -> bool:
+    try:
+        open_time = int(open_time_ms)
+    except Exception:
+        return False
+    if open_time <= 0:
+        return False
+    return okx_spot_1wutc_bucket_start_ms(open_time) == open_time
+
+
+def is_okx_spot_1Mutc_open_time(open_time_ms: Any) -> bool:
+    try:
+        open_time = int(open_time_ms)
+    except Exception:
+        return False
+    if open_time <= 0:
+        return False
+    return okx_spot_1Mutc_bucket_start_ms(open_time) == open_time
+
+
 def okx_spot_open_time_validator(interval: Any):
     normalized = normalize_spot_kline_bucket_interval(interval)
     if normalized == "1d":
         return is_okx_spot_1d_open_time
+    if normalized == "1Dutc":
+        return is_okx_spot_1Dutc_open_time
     if normalized == "1w":
         return is_okx_spot_1w_open_time
+    if normalized == "1Wutc":
+        return is_okx_spot_1Wutc_open_time
     if normalized == "1M":
         return is_okx_spot_1M_open_time
+    if normalized == "1Mutc":
+        return is_okx_spot_1Mutc_open_time
     return None
