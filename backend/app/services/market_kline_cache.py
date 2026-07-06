@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 OpenTimeValidator = Callable[[int], bool]
 
+_KLINE_EXTERNAL_FETCH_WARNING_COOLDOWN_SECONDS = 60.0
+_KLINE_EXTERNAL_FETCH_WARNING_MAX_KEYS = 512
+_KLINE_EXTERNAL_FETCH_WARNING_LAST_AT: dict[tuple[str, str, str, str], float] = {}
+
 KLINE_CACHE_ORIGIN_DB_CACHE = "DB_CACHE"
 KLINE_CACHE_ORIGIN_REST_FETCH = "REST_FETCH"
 KLINE_CACHE_ORIGIN_STALE_CACHE = "STALE_CACHE"
@@ -116,6 +120,56 @@ def _classify_provider_error(exc: Exception) -> tuple[str, Optional[str]]:
     else:
         code = KLINE_PROVIDER_ERROR_UNKNOWN
     return code, _sanitize_provider_error_provider(provider)
+
+
+def _kline_external_fetch_warning_reason(exc: Exception) -> str:
+    message = " ".join(str(exc or "").split())
+    if message:
+        return f"{type(exc).__name__}:{message[:120]}"
+    return type(exc).__name__
+
+
+def _kline_external_fetch_warning_allowed(
+    *,
+    market_type: str,
+    symbol: str,
+    interval: str,
+    reason: Exception,
+) -> bool:
+    now = time.monotonic()
+    key = (
+        str(market_type or ""),
+        str(symbol or ""),
+        str(interval or ""),
+        _kline_external_fetch_warning_reason(reason),
+    )
+
+    if (
+        key not in _KLINE_EXTERNAL_FETCH_WARNING_LAST_AT
+        and len(_KLINE_EXTERNAL_FETCH_WARNING_LAST_AT) >= _KLINE_EXTERNAL_FETCH_WARNING_MAX_KEYS
+    ):
+        expired_keys = [
+            cached_key
+            for cached_key, logged_at in _KLINE_EXTERNAL_FETCH_WARNING_LAST_AT.items()
+            if now - logged_at >= _KLINE_EXTERNAL_FETCH_WARNING_COOLDOWN_SECONDS
+        ]
+        for cached_key in expired_keys:
+            _KLINE_EXTERNAL_FETCH_WARNING_LAST_AT.pop(cached_key, None)
+        if len(_KLINE_EXTERNAL_FETCH_WARNING_LAST_AT) >= _KLINE_EXTERNAL_FETCH_WARNING_MAX_KEYS:
+            overflow = len(_KLINE_EXTERNAL_FETCH_WARNING_LAST_AT) - _KLINE_EXTERNAL_FETCH_WARNING_MAX_KEYS + 1
+            oldest_keys = sorted(
+                _KLINE_EXTERNAL_FETCH_WARNING_LAST_AT.items(),
+                key=lambda item: item[1],
+            )[:overflow]
+            for cached_key, _logged_at in oldest_keys:
+                _KLINE_EXTERNAL_FETCH_WARNING_LAST_AT.pop(cached_key, None)
+
+    last_logged_at = _KLINE_EXTERNAL_FETCH_WARNING_LAST_AT.get(key)
+    if last_logged_at is not None and now - last_logged_at < _KLINE_EXTERNAL_FETCH_WARNING_COOLDOWN_SECONDS:
+        return False
+    _KLINE_EXTERNAL_FETCH_WARNING_LAST_AT[key] = now
+    return True
+
 
 SUPPORTED_KLINE_INTERVAL_SECONDS = {
     "1m": 60,
@@ -744,13 +798,19 @@ def get_klines_cache_first(
             endpoint=f"kline:{normalized_interval}",
             error=exc,
         )
-        logger.warning(
-            "kline_external_fetch_failed market_type=%s symbol=%s interval=%s reason=%s",
-            market_type,
-            normalized_symbol,
-            normalized_interval,
-            exc,
-        )
+        if _kline_external_fetch_warning_allowed(
+            market_type=market_type,
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+            reason=exc,
+        ):
+            logger.warning(
+                "kline_external_fetch_failed market_type=%s symbol=%s interval=%s reason=%s",
+                market_type,
+                normalized_symbol,
+                normalized_interval,
+                exc,
+            )
         return stale_cached(
             provider_error_code=provider_error_code,
             provider_error_provider=provider_error_provider,
