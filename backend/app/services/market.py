@@ -57,6 +57,7 @@ from app.services.spot_market_provider_ws import (
     get_spot_provider_ws_trades,
     spot_provider_ws_supports_provider,
 )
+from app.services.spot_depth_shared_cache import get_spot_depth_with_shared_cache
 from app.services.spot_ticker_shared_cache import get_spot_ticker_with_shared_cache
 
 logger = logging.getLogger(__name__)
@@ -1015,21 +1016,7 @@ def get_depth(db: Session, symbol: str, limit: int = 20, *, fast: bool = False) 
     data_source = _normalize_data_source(pair)
 
     if data_source == DATA_SOURCE_BINANCE:
-        ws_provider = _primary_spot_market_provider_for_pair(db, pair)
-        ws_provider_code = (
-            str(ws_provider.provider_code or "").strip().upper()
-            if ws_provider is not None
-            else None
-        )
-        if ws_provider_code and spot_provider_ws_supports_provider(ws_provider_code, domain="depth"):
-            live_depth = get_spot_provider_ws_depth(pair.symbol, provider=ws_provider_code, limit=limit)
-            if live_depth is not None:
-                formatted_depth = _format_depth_for_pair(pair, live_depth, limit=limit)
-                return _apply_spot_depth_price_precision_metadata(
-                    formatted_depth,
-                    _spot_provider_price_precision_metadata(db, pair, ws_provider),
-                )
-        return _get_external_spot_depth(db, pair, limit=limit, fast=fast)
+        return _get_external_spot_depth_cached(db, pair, limit=limit, fast=fast)
 
     internal_depth = _get_internal_depth(db, pair, limit=limit)
 
@@ -1773,6 +1760,51 @@ def _get_external_spot_ticker_cached(db: Session, pair: TradingPair, *, fast: bo
     if not isinstance(payload, dict):
         return None
     return TickerItem(**payload)
+
+
+def _get_external_spot_depth_live_or_rest(
+    db: Session,
+    pair: TradingPair,
+    limit: int = 20,
+    *,
+    fast: bool = False,
+) -> DepthResponse:
+    ws_provider = _primary_spot_market_provider_for_pair(db, pair)
+    ws_provider_code = (
+        str(ws_provider.provider_code or "").strip().upper()
+        if ws_provider is not None
+        else None
+    )
+    if ws_provider_code and spot_provider_ws_supports_provider(ws_provider_code, domain="depth"):
+        live_depth = get_spot_provider_ws_depth(pair.symbol, provider=ws_provider_code, limit=limit)
+        if live_depth is not None:
+            formatted_depth = _format_depth_for_pair(pair, live_depth, limit=limit)
+            return _apply_spot_depth_price_precision_metadata(
+                formatted_depth,
+                _spot_provider_price_precision_metadata(db, pair, ws_provider),
+            )
+    return _get_external_spot_depth(db, pair, limit=limit, fast=fast)
+
+
+def _get_external_spot_depth_cached(
+    db: Session,
+    pair: TradingPair,
+    limit: int = 20,
+    *,
+    fast: bool = False,
+) -> DepthResponse:
+    def load_depth() -> Optional[Dict[str, Any]]:
+        depth = _get_external_spot_depth_live_or_rest(db, pair, limit=limit, fast=fast)
+        return depth.model_dump() if hasattr(depth, "model_dump") else depth.dict()
+
+    payload = get_spot_depth_with_shared_cache(
+        symbol=pair.symbol,
+        data_source=_normalize_data_source(pair),
+        loader=load_depth,
+    )
+    if not isinstance(payload, dict):
+        raise ValueError("spot external depth unavailable")
+    return DepthResponse(**payload)
 
 
 def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20, *, fast: bool = False) -> DepthResponse:
