@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import threading
 
@@ -1006,6 +1007,24 @@ def test_provider_trades_drive_current_kline_bucket() -> None:
     assert "_last_trade_ts_ms" not in item
 
 
+def test_okx_provider_trade_patch_skips_1d_provisional_bucket() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    trade_ts_ms = 1_770_291_234_000
+
+    service._apply_provider_trade_to_kline_cache_locked(
+        (provider_ws.PROVIDER_OKX_SPOT, "BTCUSDT", "1d"),
+        {
+            "tradeId": "okx-1d-trade",
+            "ts": str(trade_ts_ms),
+            "price": "100",
+            "size": "1",
+        },
+        "1d",
+    )
+
+    assert service.get_fresh_klines("BTCUSDT", "1d", provider=provider_ws.PROVIDER_OKX_SPOT) is None
+
+
 def test_provider_trade_kline_dedupe_prevents_duplicate_volume() -> None:
     service = provider_ws.SpotMarketProviderWsService()
     _activate_provider_trades(service)
@@ -1151,5 +1170,7 @@ def test_cache_getters_missing_updated_at_and_empty_kline_return_none() -> None:
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
+            if inspect.signature(fn).parameters:
+                continue
             fn()
     print("spot_market_provider_ws tests passed")

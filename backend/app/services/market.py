@@ -3,7 +3,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -30,6 +30,7 @@ from app.services.itick_market_service import (
 )
 from app.services.itick_holiday_service import itick_holiday_service
 from app.services.market_kline_cache import get_klines_cache_first
+from app.services.spot_kline_bucket import is_okx_spot_1d_open_time
 from app.services.contract_market_provider_service import (
     MarketDataProviderConfig,
     MarketDataProviderError,
@@ -1588,6 +1589,7 @@ def _merge_spot_live_ws_klines(
     live_items: list[dict[str, Any]],
     limit: int,
     end_time_ms: Optional[int] = None,
+    open_time_validator: Optional[Callable[[int], bool]] = None,
 ) -> list[dict[str, Any]]:
     by_open_time: dict[int, dict[str, Any]] = {}
     for item in list(history_items or []) + list(live_items or []):
@@ -1599,6 +1601,8 @@ def _merge_spot_live_ws_klines(
             continue
         if open_time <= 0:
             continue
+        if open_time_validator is not None and not open_time_validator(open_time):
+            continue
         if end_time_ms is not None and open_time >= int(end_time_ms):
             continue
         by_open_time[open_time] = dict(item)
@@ -1606,6 +1610,30 @@ def _merge_spot_live_ws_klines(
         by_open_time[open_time]
         for open_time in sorted(by_open_time.keys())[-max(1, int(limit or 200)):]
     ]
+
+
+def _kline_item_matches_open_time_validator(
+    item: Any,
+    open_time_validator: Optional[Callable[[int], bool]],
+) -> bool:
+    if open_time_validator is None:
+        return True
+    if not isinstance(item, dict):
+        return False
+    try:
+        open_time = int(item.get("open_time") or item.get("time") or 0)
+    except Exception:
+        return False
+    return open_time_validator(open_time)
+
+
+def _spot_external_kline_cache_open_time_validator(
+    provider_code: Optional[str],
+    interval: str,
+) -> Optional[Callable[[int], bool]]:
+    if str(provider_code or "").strip().upper() == PROVIDER_OKX_SPOT and interval == "1d":
+        return is_okx_spot_1d_open_time
+    return None
 
 
 def _spot_last_good_ticker(pair: TradingPair) -> Optional[TickerItem]:
@@ -3143,10 +3171,12 @@ def get_klines(
 
     if data_source == DATA_SOURCE_BINANCE:
         live_ws_klines: Optional[dict[str, Any]] = None
-        if end_time_ms is None:
-            try:
-                providers = _enabled_spot_market_providers_for_pair(db, pair)
-                primary_provider = providers[0] if providers else None
+        primary_provider_code: Optional[str] = None
+        try:
+            providers = _enabled_spot_market_providers_for_pair(db, pair)
+            primary_provider = providers[0] if providers else None
+            primary_provider_code = str(primary_provider.provider_code) if primary_provider is not None else None
+            if end_time_ms is None:
                 if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code, domain="kline"):
                     live_ws_klines = get_spot_provider_ws_klines(
                         pair.symbol,
@@ -3154,13 +3184,18 @@ def get_klines(
                         provider=primary_provider.provider_code,
                         limit=limit,
                     )
-            except Exception as exc:
-                logger.debug(
-                    "spot_provider_ws_kline_unavailable symbol=%s interval=%s reason=%s",
-                    pair.symbol,
-                    interval,
-                    exc,
-                )
+        except Exception as exc:
+            logger.debug(
+                "spot_provider_ws_kline_unavailable symbol=%s interval=%s reason=%s",
+                pair.symbol,
+                interval,
+                exc,
+            )
+
+        cache_open_time_validator = _spot_external_kline_cache_open_time_validator(
+            primary_provider_code,
+            interval,
+        )
 
         def _fetch_external_spot(fetch_limit: int, fetch_end_time_ms: Optional[int]):
             return _fetch_external_spot_klines(
@@ -3182,15 +3217,24 @@ def get_klines(
             source="EXTERNAL_SPOT",
             fetch_external=_fetch_external_spot,
             external_budget_seconds=6.0,
+            open_time_validator=cache_open_time_validator,
         )
         cached_meta = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval), {})
-        has_live_ws_overlay = bool(items and live_ws_klines and live_ws_klines.get("items"))
+        live_ws_items = list(live_ws_klines.get("items") or []) if live_ws_klines else []
+        if cache_open_time_validator is not None:
+            live_ws_items = [
+                item
+                for item in live_ws_items
+                if _kline_item_matches_open_time_validator(item, cache_open_time_validator)
+            ]
+        has_live_ws_overlay = bool(items and live_ws_items)
         if has_live_ws_overlay:
             items = _merge_spot_live_ws_klines(
                 history_items=items,
-                live_items=list(live_ws_klines.get("items") or []),
+                live_items=live_ws_items,
                 limit=limit,
                 end_time_ms=end_time_ms,
+                open_time_validator=cache_open_time_validator,
             )
         if has_live_ws_overlay:
             provider = str(live_ws_klines.get("provider") or cached_meta.get("provider") or "EXTERNAL_SPOT")

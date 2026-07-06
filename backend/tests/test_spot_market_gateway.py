@@ -1018,6 +1018,7 @@ def test_get_depth_prefers_live_ws_and_falls_back_to_rest() -> None:
     original_get_ws_depth = market.get_spot_provider_ws_depth
     original_get_external_depth = market._get_external_spot_depth
     original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_shared_depth_cache = market.get_spot_depth_with_shared_cache
     fallback_called = {"value": False}
 
     try:
@@ -1025,6 +1026,7 @@ def test_get_depth_prefers_live_ws_and_falls_back_to_rest() -> None:
         market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
             _spot_provider(market.PROVIDER_BITGET_SPOT),
         )
+        market.get_spot_depth_with_shared_cache = lambda **kwargs: kwargs["loader"]()
         market.get_spot_provider_ws_depth = lambda symbol, **kwargs: live_depth
         market._get_external_spot_depth = lambda *args, **kwargs: rest_depth
         live_result = market.get_depth(None, "BTCUSDT")
@@ -1049,6 +1051,7 @@ def test_get_depth_prefers_live_ws_and_falls_back_to_rest() -> None:
         market.get_spot_provider_ws_depth = original_get_ws_depth
         market._get_external_spot_depth = original_get_external_depth
         market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_depth_with_shared_cache = original_shared_depth_cache
 
 
 def test_external_spot_ticker_prefers_live_ws() -> None:
@@ -1274,12 +1277,14 @@ def test_okx_depth_live_ws_miss_falls_back_to_okx_rest_without_bitget_ws() -> No
     original_get_ws_depth = market.get_spot_provider_ws_depth
     original_get_external_depth = market._get_external_spot_depth
     original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_shared_depth_cache = market.get_spot_depth_with_shared_cache
     try:
         market._get_active_pair = lambda db, symbol: Pair()
         market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
             _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
             _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
         )
+        market.get_spot_depth_with_shared_cache = lambda **kwargs: kwargs["loader"]()
 
         def get_ws_depth(symbol, **kwargs):
             assert kwargs.get("provider") == market.PROVIDER_OKX_SPOT
@@ -1296,6 +1301,7 @@ def test_okx_depth_live_ws_miss_falls_back_to_okx_rest_without_bitget_ws() -> No
         market.get_spot_provider_ws_depth = original_get_ws_depth
         market._get_external_spot_depth = original_get_external_depth
         market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_depth_with_shared_cache = original_shared_depth_cache
 
 
 def test_bitget_rest_ticker_uses_provider_change24h_ratio() -> None:
@@ -1365,9 +1371,11 @@ def test_get_trades_prefers_live_ws_and_falls_back_to_rest() -> None:
     original_spot_provider_symbol = market._spot_provider_symbol
     original_request_json = market.request_contract_market_provider_json
     original_mark_success = market.mark_contract_market_provider_success
+    original_shared_trades_cache = market.get_spot_trades_with_shared_cache
     try:
         market._get_active_pair = lambda db, symbol: Pair(symbol)
         market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_trades_with_shared_cache = lambda **kwargs: kwargs["loader"]()
         market.get_spot_provider_ws_trades = lambda symbol, **kwargs: live_trades_for(symbol)
         market.request_contract_market_provider_json = lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("REST provider should not be called when LIVE_WS trades are fresh")
@@ -1410,6 +1418,7 @@ def test_get_trades_prefers_live_ws_and_falls_back_to_rest() -> None:
         market._spot_provider_symbol = original_spot_provider_symbol
         market.request_contract_market_provider_json = original_request_json
         market.mark_contract_market_provider_success = original_mark_success
+        market.get_spot_trades_with_shared_cache = original_shared_trades_cache
 
 
 def test_okx_primary_trades_use_live_ws_without_bitget_cache() -> None:
@@ -1425,12 +1434,14 @@ def test_okx_primary_trades_use_live_ws_without_bitget_cache() -> None:
     original_spot_provider_symbol = market._spot_provider_symbol
     original_request_json = market.request_contract_market_provider_json
     original_mark_success = market.mark_contract_market_provider_success
+    original_shared_trades_cache = market.get_spot_trades_with_shared_cache
     try:
         market._get_active_pair = lambda db, symbol: Pair()
         market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
             _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
             _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
         )
+        market.get_spot_trades_with_shared_cache = lambda **kwargs: kwargs["loader"]()
         market.get_spot_provider_ws_trades = lambda symbol, **kwargs: (
             TradesResponse(
                 symbol="BTCUSDT",
@@ -1465,6 +1476,7 @@ def test_okx_primary_trades_use_live_ws_without_bitget_cache() -> None:
         market._spot_provider_symbol = original_spot_provider_symbol
         market.request_contract_market_provider_json = original_request_json
         market.mark_contract_market_provider_success = original_mark_success
+        market.get_spot_trades_with_shared_cache = original_shared_trades_cache
 
 
 def test_okx_primary_trades_live_ws_miss_falls_back_to_okx_rest() -> None:
@@ -1480,12 +1492,14 @@ def test_okx_primary_trades_live_ws_miss_falls_back_to_okx_rest() -> None:
     original_spot_provider_symbol = market._spot_provider_symbol
     original_request_json = market.request_contract_market_provider_json
     original_mark_success = market.mark_contract_market_provider_success
+    original_shared_trades_cache = market.get_spot_trades_with_shared_cache
     try:
         market._get_active_pair = lambda db, symbol: Pair()
         market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (
             _spot_provider(market.PROVIDER_OKX_SPOT, priority=1),
             _spot_provider(market.PROVIDER_BITGET_SPOT, priority=2),
         )
+        market.get_spot_trades_with_shared_cache = lambda **kwargs: kwargs["loader"]()
         market.get_spot_provider_ws_trades = lambda symbol, **kwargs: (
             None
             if kwargs.get("provider") == market.PROVIDER_OKX_SPOT
@@ -1525,6 +1539,7 @@ def test_okx_primary_trades_live_ws_miss_falls_back_to_okx_rest() -> None:
         market._spot_provider_symbol = original_spot_provider_symbol
         market.request_contract_market_provider_json = original_request_json
         market.mark_contract_market_provider_success = original_mark_success
+        market.get_spot_trades_with_shared_cache = original_shared_trades_cache
 
 
 def test_internal_pair_does_not_use_live_ws_trades() -> None:
@@ -1799,6 +1814,63 @@ def test_kline_history_pagination_does_not_read_live_ws() -> None:
         assert result.get("source") == "REST_HISTORY"
         assert result.get("freshness") == "RECENT"
         assert result["items"][-1]["close"] == "1.5"
+    finally:
+        market._get_active_pair = original_get_active_pair
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market.get_spot_provider_ws_klines = original_get_ws_klines
+        market.get_klines_cache_first = original_get_klines_cache_first
+
+
+def test_okx_1d_history_pagination_uses_anchor_validator_without_live_ws() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    provider = _spot_provider(market.PROVIDER_OKX_SPOT)
+    end_time_ms = 1_759_680_000_000
+    valid_open_time = end_time_ms - 86_400_000
+
+    original_get_active_pair = market._get_active_pair
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_get_ws_klines = market.get_spot_provider_ws_klines
+    original_get_klines_cache_first = market.get_klines_cache_first
+    try:
+        market._get_active_pair = lambda db, symbol: Pair()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market.get_spot_provider_ws_klines = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("historical pagination must not read LIVE_WS kline")
+        )
+
+        def cache_first(*args, **kwargs):
+            validator = kwargs.get("open_time_validator")
+            assert validator is not None
+            assert validator(valid_open_time)
+            assert not validator(1_759_708_800_000)
+            assert kwargs["interval"] == "1d"
+            assert kwargs["end_time_ms"] == end_time_ms
+            return [
+                {
+                    "open_time": valid_open_time,
+                    "close_time": end_time_ms,
+                    "open": "1",
+                    "high": "2",
+                    "low": "1",
+                    "close": "1.5",
+                    "volume": "5",
+                    "quote_volume": "7.5",
+                }
+            ]
+
+        market.get_klines_cache_first = cache_first
+
+        result = market.get_klines(None, "BTCUSDT", "1d", limit=30, end_time_ms=end_time_ms)
+        assert result.get("source") == "REST_HISTORY"
+        assert result.get("freshness") == "RECENT"
+        assert result["provider"] == "EXTERNAL_SPOT"
+        assert all(item["open_time"] < end_time_ms for item in result["items"])
+        assert result["items"][-1]["open_time"] == valid_open_time
     finally:
         market._get_active_pair = original_get_active_pair
         market._enabled_spot_market_providers_for_pair = original_enabled_providers
