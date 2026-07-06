@@ -173,6 +173,23 @@ type HistoryKlineRequestResult = {
   history_incomplete?: unknown;
   provider_error_code?: unknown;
   provider_error_provider?: unknown;
+  pageCount?: number;
+  requestedBars?: number;
+  reachedRequiredBars?: boolean;
+  terminalNoData?: boolean;
+  pages?: Array<{
+    page: number;
+    limit: number;
+    endTime?: number;
+    count: number;
+    firstTime?: number | null;
+    lastTime?: number | null;
+    source?: unknown;
+    freshness?: unknown;
+    cache_status?: unknown;
+    provider_error_code?: unknown;
+    terminalEmpty?: boolean;
+  }>;
 };
 
 type HistoryNoDataPolicy = {
@@ -182,6 +199,18 @@ type HistoryNoDataPolicy = {
   hasMetadata: boolean;
   terminalEmpty: boolean;
   transientEmpty: boolean;
+};
+
+type SpotTvDebugEvent = {
+  event: string;
+  timestamp: number;
+  time: string;
+  [key: string]: unknown;
+};
+
+type SpotTvDebugWindow = Window & {
+  __SPOT_TV_DEBUG_EVENTS__?: SpotTvDebugEvent[];
+  __dumpSpotTvDebug?: () => SpotTvDebugEvent[];
 };
 
 const SPOT_EXCHANGE_NAME = 'EXCHANGE';
@@ -231,6 +260,11 @@ const realtimeHighWaterMarkByKey = new Map<string, number>();
 const currentKlineCache = new Map<string, KlineCacheEntry>();
 const historyKlineRequestInFlightByKey = new Map<string, Promise<HistoryKlineRequestResult>>();
 let forcedSpotTradingViewDebugEnabled = false;
+let spotTradingViewGetBarsRequestSeq = 0;
+const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
+const SPOT_TV_GETBARS_API_PAGE_LIMIT = 500;
+const SPOT_TV_GETBARS_MAX_INTERNAL_BARS = 1000;
+const SPOT_TV_GETBARS_MAX_INTERNAL_PAGES = 3;
 const CURRENT_KLINE_CACHE_MAX_KEYS = 64;
 const CURRENT_KLINE_CACHE_TTL_MS: Record<string, number> = {
   '1m': 10_000,
@@ -270,13 +304,13 @@ const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
   supported_resolutions: SUPPORTED_RESOLUTIONS,
 };
 
-function getSpotTvDebugWindows() {
+function getSpotTvDebugWindows(): SpotTvDebugWindow[] {
   if (typeof window === 'undefined') return [];
-  const candidates: Window[] = [window];
+  const candidates: SpotTvDebugWindow[] = [window as SpotTvDebugWindow];
 
   try {
     if (window.parent && !candidates.includes(window.parent)) {
-      candidates.push(window.parent);
+      candidates.push(window.parent as SpotTvDebugWindow);
     }
   } catch {
     // Parent access is best-effort only for diagnostics.
@@ -284,7 +318,7 @@ function getSpotTvDebugWindows() {
 
   try {
     if (window.top && !candidates.includes(window.top)) {
-      candidates.push(window.top);
+      candidates.push(window.top as SpotTvDebugWindow);
     }
   } catch {
     // Top access is best-effort only for diagnostics.
@@ -293,12 +327,54 @@ function getSpotTvDebugWindows() {
   return candidates;
 }
 
+function hasSpotTvDebugQuery(candidate: Window) {
+  try {
+    const search = candidate.location?.search || '';
+    const href = candidate.location?.href || '';
+    if (new URLSearchParams(search).get('tvdebug') === '1') return true;
+    if (/[?&]tvdebug=1(?:&|$)/.test(href)) return true;
+    const referrer = candidate.document?.referrer || '';
+    if (referrer) {
+      if (/[?&]tvdebug=1(?:&|$)/.test(referrer)) return true;
+      return new URL(referrer, href || undefined).searchParams.get('tvdebug') === '1';
+    }
+  } catch {
+    // Location access is best-effort only for diagnostics.
+  }
+  return false;
+}
+
+function hasSpotTvDebugUrlFlag() {
+  for (const candidate of getSpotTvDebugWindows()) {
+    if (hasSpotTvDebugQuery(candidate)) return true;
+  }
+  return false;
+}
+
+function ensureSpotTradingViewDebugBuffer() {
+  for (const candidate of getSpotTvDebugWindows()) {
+    try {
+      candidate.__SPOT_TV_DEBUG_EVENTS__ = candidate.__SPOT_TV_DEBUG_EVENTS__ || [];
+      candidate.__dumpSpotTvDebug = () => (candidate.__SPOT_TV_DEBUG_EVENTS__ || []).slice(-100);
+    } catch {
+      // Debug buffer is best-effort only.
+    }
+  }
+}
+
 function isSpotTradingViewDebugEnabled() {
   if (forcedSpotTradingViewDebugEnabled) return true;
 
   for (const candidate of getSpotTvDebugWindows()) {
+    if (hasSpotTvDebugQuery(candidate)) {
+      ensureSpotTradingViewDebugBuffer();
+      return true;
+    }
     try {
-      if (candidate.localStorage?.getItem('SPOT_TV_DEBUG') === '1') return true;
+      if (candidate.localStorage?.getItem('SPOT_TV_DEBUG') === '1') {
+        ensureSpotTradingViewDebugBuffer();
+        return true;
+      }
     } catch {
       // Storage access is best-effort only for diagnostics.
     }
@@ -306,10 +382,45 @@ function isSpotTradingViewDebugEnabled() {
   return false;
 }
 
+function appendSpotTradingViewDebugEvent(entry: SpotTvDebugEvent) {
+  for (const candidate of getSpotTvDebugWindows()) {
+    try {
+      const events = candidate.__SPOT_TV_DEBUG_EVENTS__ || [];
+      events.push(entry);
+      if (events.length > SPOT_TV_DEBUG_EVENT_LIMIT) {
+        events.splice(0, events.length - SPOT_TV_DEBUG_EVENT_LIMIT);
+      }
+      candidate.__SPOT_TV_DEBUG_EVENTS__ = events;
+      candidate.__dumpSpotTvDebug = () => (candidate.__SPOT_TV_DEBUG_EVENTS__ || []).slice(-100);
+    } catch {
+      // Debug buffer is best-effort only.
+    }
+  }
+}
+
 function spotTradingViewDebug(event: string, payload: Record<string, unknown>) {
   if (!isSpotTradingViewDebugEnabled()) return;
-  console.debug(`[SpotTradingViewDatafeed] ${event}`, payload);
+  ensureSpotTradingViewDebugBuffer();
+  const timestamp = Date.now();
+  const entry: SpotTvDebugEvent = {
+    event,
+    timestamp,
+    time: new Date(timestamp).toISOString(),
+    ...payload,
+  };
+  appendSpotTradingViewDebugEvent(entry);
+  console.info(`[SpotTradingViewDatafeed] ${event}`, entry);
 }
+
+function initializeSpotTvDebugTelemetry() {
+  if (!hasSpotTvDebugUrlFlag()) return;
+  forcedSpotTradingViewDebugEnabled = true;
+  spotTradingViewDebug('datafeed module loaded', {
+    href: typeof window !== 'undefined' ? window.location.href : null,
+  });
+}
+
+initializeSpotTvDebugTelemetry();
 
 function getTradingDateFromNormalizedTime(normalizedTime: number) {
   if (!Number.isFinite(normalizedTime) || normalizedTime <= 0) return '';
@@ -354,12 +465,37 @@ function buildBarDebugRows(bars: TradingViewBar[]) {
   return bars.slice(-5).map((bar) => ({
     originalTime: null,
     normalizedTime: bar.time,
+    timeIso: bar.time ? new Date(bar.time).toISOString() : null,
     open: bar.open,
     high: bar.high,
     low: bar.low,
     close: bar.close,
     volume: bar.volume || 0,
   }));
+}
+
+function buildSpotTvDebugBarRow(bar: TradingViewBar) {
+  return {
+    time: bar.time,
+    timeIso: bar.time ? new Date(bar.time).toISOString() : null,
+    open: bar.open,
+    high: bar.high,
+    low: bar.low,
+    close: bar.close,
+    volume: bar.volume || 0,
+  };
+}
+
+function buildSpotTvDebugBarsSummary(bars: TradingViewBar[]) {
+  return {
+    count: bars.length,
+    firstTime: bars[0]?.time || null,
+    firstTimeIso: bars[0]?.time ? new Date(bars[0].time).toISOString() : null,
+    lastTime: bars[bars.length - 1]?.time || null,
+    lastTimeIso: bars[bars.length - 1]?.time ? new Date(bars[bars.length - 1].time).toISOString() : null,
+    firstBars: bars.slice(0, 3).map(buildSpotTvDebugBarRow),
+    lastBars: bars.slice(-3).map(buildSpotTvDebugBarRow),
+  };
 }
 
 function buildKlineItemDebugRows(
@@ -370,10 +506,13 @@ function buildKlineItemDebugRows(
 ) {
   return (items || []).slice(-5).map((item) => {
     const originalTime = normalizeKlineTimeMs(item);
+    const normalizedTime = providerOpenTimeToTradingViewTimeMs(originalTime, interval, provider, source);
     return {
       interval: normalizeSpotInterval(interval),
       originalTime,
-      normalizedTime: providerOpenTimeToTradingViewTimeMs(originalTime, interval, provider, source),
+      originalTimeIso: originalTime ? new Date(originalTime).toISOString() : null,
+      normalizedTime,
+      normalizedTimeIso: normalizedTime ? new Date(normalizedTime).toISOString() : null,
       open: item.open,
       high: item.high,
       low: item.low,
@@ -422,6 +561,15 @@ function hasKlineHistoryMetadata(result: HistoryKlineRequestResult): boolean {
   );
 }
 
+function isTerminalEmptyKlineResult(result: HistoryKlineRequestResult): boolean {
+  return (
+    result.bars.length === 0 &&
+    normalizeSource(result.source) === 'EMPTY' &&
+    normalizeKlineMetaValue(result.freshness) === 'MISSING' &&
+    normalizeKlineMetaValue(result.provider_error_code) === 'EMPTY'
+  );
+}
+
 function resolveHistoryNoDataPolicy(params: {
   isHistoryRequest: boolean;
   result: HistoryKlineRequestResult;
@@ -466,11 +614,7 @@ function resolveHistoryNoDataPolicy(params: {
   const providerErrorCode = normalizeKlineMetaValue(result.provider_error_code);
   const stale = isTruthyKlineMeta(result.stale);
   const historyIncomplete = isTruthyKlineMeta(result.history_incomplete);
-  const terminalEmpty = (
-    source === 'EMPTY' &&
-    freshness === 'MISSING' &&
-    providerErrorCode === 'EMPTY'
-  );
+  const terminalEmpty = isTerminalEmptyKlineResult(result);
 
   if (terminalEmpty) {
     return {
@@ -706,6 +850,52 @@ function normalizeHistoryBars(
   return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
 }
 
+function mergeTradingViewBars(bars: TradingViewBar[]): TradingViewBar[] {
+  const byTime = new Map<number, TradingViewBar>();
+  for (const bar of bars) {
+    if (!Number.isFinite(bar.time) || bar.time <= 0) continue;
+    byTime.set(bar.time, { ...bar });
+  }
+  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+}
+
+function getNextMonthlyBarTimeMs(timeMs: number) {
+  const date = new Date(timeMs);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1);
+}
+
+function getExpectedNextBarTimeMs(interval: string, timeMs: number) {
+  const normalizedInterval = normalizeSpotInterval(interval);
+  if (normalizedInterval === '1M' || normalizedInterval === '1Mutc') {
+    return getNextMonthlyBarTimeMs(timeMs);
+  }
+  return timeMs + getSpotIntervalMs(normalizedInterval);
+}
+
+function getBarsContinuityStats(bars: TradingViewBar[], interval: string) {
+  const sorted = mergeTradingViewBars(bars);
+  const duplicateCount = Math.max(0, bars.length - sorted.length);
+  let gapCount = 0;
+  let maxGap = 0;
+
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1];
+    const current = sorted[index];
+    const expected = getExpectedNextBarTimeMs(interval, previous.time);
+    const delta = current.time - previous.time;
+    if (current.time !== expected) {
+      gapCount += 1;
+      maxGap = Math.max(maxGap, Math.abs(delta));
+    }
+  }
+
+  return {
+    duplicateCount,
+    gapCount,
+    maxGap,
+  };
+}
+
 function cloneBars(bars: TradingViewBar[]) {
   return bars.map((bar) => ({ ...bar }));
 }
@@ -718,14 +908,14 @@ function getSpotKlineLoadPolicy(interval: string): SpotKlineLoadPolicy {
   return SPOT_KLINE_LOAD_POLICY[normalizeSpotInterval(interval)] || SPOT_KLINE_LOAD_POLICY['1m'];
 }
 
-function normalizeRequestedKlineLimit(countBack: number, fallback: number) {
+function normalizeRequiredKlineBars(countBack: number, fallback: number) {
   const requested = Number(countBack);
   if (!Number.isFinite(requested) || requested <= 0) return fallback;
-  return Math.max(50, Math.floor(requested));
+  return Math.min(SPOT_TV_GETBARS_MAX_INTERNAL_BARS, Math.max(1, Math.floor(requested)));
 }
 
-function getCurrentKlineLimit(interval: string) {
-  return getSpotKlineLoadPolicy(interval).current;
+function getCurrentKlineLimit(interval: string, countBack?: number) {
+  return normalizeRequiredKlineBars(Number(countBack || 0), getSpotKlineLoadPolicy(interval).current);
 }
 
 function getPreloadKlineLimit(interval: string) {
@@ -734,8 +924,13 @@ function getPreloadKlineLimit(interval: string) {
 
 function getHistoryKlineLimit(interval: string, countBack: number) {
   const policy = getSpotKlineLoadPolicy(interval);
-  const requested = normalizeRequestedKlineLimit(countBack, policy.history);
-  return Math.min(requested, policy.history);
+  return normalizeRequiredKlineBars(countBack, policy.history);
+}
+
+function getKlineRequestPageLimit(requiredBars: number, loadedBars = 0) {
+  const remaining = Math.max(1, requiredBars - loadedBars);
+  const remainingInternalCapacity = Math.max(1, SPOT_TV_GETBARS_MAX_INTERNAL_BARS - loadedBars);
+  return Math.min(remaining, remainingInternalCapacity, SPOT_TV_GETBARS_API_PAGE_LIMIT);
 }
 
 function buildCurrentKlineCacheKey(symbol: string, interval: string, limit: number) {
@@ -954,6 +1149,125 @@ function getHistoryKlineRequestPromise(params: {
   return request;
 }
 
+async function fetchCountBackKlineRequestBars(params: {
+  symbol: string;
+  interval: string;
+  requiredBars: number;
+  initialLimit: number;
+  endTime?: number;
+  isHistoryRequest: boolean;
+  periodParams: TradingViewPeriodParams;
+  requestSeq: number;
+  phase: string;
+}): Promise<HistoryKlineRequestResult> {
+  const pages: NonNullable<HistoryKlineRequestResult['pages']> = [];
+  let combinedBars: TradingViewBar[] = [];
+  let firstResult: HistoryKlineRequestResult | null = null;
+  let cursorEndTime = params.endTime;
+  let terminalNoData = false;
+
+  for (let page = 1; page <= SPOT_TV_GETBARS_MAX_INTERNAL_PAGES; page += 1) {
+    const loadedBars = combinedBars.length;
+    const limit = page === 1
+      ? params.initialLimit
+      : getKlineRequestPageLimit(params.requiredBars, loadedBars);
+    const key = params.isHistoryRequest && cursorEndTime
+      ? buildHistoryKlineInFlightKey(params.symbol, params.interval, params.periodParams, limit, cursorEndTime)
+      : '';
+    const result = key
+      ? await getHistoryKlineRequestPromise({
+        key,
+        symbol: params.symbol,
+        interval: params.interval,
+        limit,
+        endTime: cursorEndTime,
+      })
+      : await fetchKlineRequestBars({
+        symbol: params.symbol,
+        interval: params.interval,
+        limit,
+        endTime: cursorEndTime,
+        forceRest: true,
+      });
+
+    if (!firstResult) firstResult = result;
+
+    const terminalEmpty = isTerminalEmptyKlineResult(result);
+    pages.push({
+      page,
+      limit,
+      endTime: cursorEndTime,
+      count: result.bars.length,
+      firstTime: result.bars[0]?.time || null,
+      lastTime: result.bars[result.bars.length - 1]?.time || null,
+      source: result.source,
+      freshness: result.freshness,
+      cache_status: result.cache_status,
+      provider_error_code: result.provider_error_code,
+      terminalEmpty,
+    });
+    spotTradingViewDebug('getBars backfill page', {
+      requestSeq: params.requestSeq,
+      phase: params.phase,
+      symbol: params.symbol,
+      interval: normalizeSpotInterval(params.interval),
+      page,
+      limit,
+      end_time: cursorEndTime || null,
+      end_time_ms: cursorEndTime || null,
+      requiredBars: params.requiredBars,
+      terminalEmpty,
+      source: result.source,
+      freshness: result.freshness,
+      cache_status: result.cache_status,
+      provider_error_code: result.provider_error_code,
+      ...getBarsDebugStats(result.bars, params.interval),
+      barsSummary: buildSpotTvDebugBarsSummary(result.bars),
+    });
+
+    if (!result.bars.length) {
+      terminalNoData = terminalEmpty;
+      if (terminalEmpty) break;
+      return {
+        ...result,
+        bars: [],
+        pageCount: pages.length,
+        requestedBars: params.requiredBars,
+        reachedRequiredBars: false,
+        terminalNoData,
+        pages,
+      };
+    }
+
+    const beforeCount = combinedBars.length;
+    combinedBars = mergeTradingViewBars([...combinedBars, ...result.bars]);
+    const earliestBar = combinedBars[0];
+
+    if (combinedBars.length >= params.requiredBars || !earliestBar) break;
+    if (combinedBars.length <= beforeCount) {
+      break;
+    }
+    cursorEndTime = earliestBar.time;
+  }
+
+  const finalBars = mergeTradingViewBars(combinedBars)
+    .slice(-Math.min(params.requiredBars, SPOT_TV_GETBARS_MAX_INTERNAL_BARS));
+  const reachedRequiredBars = finalBars.length >= params.requiredBars;
+  const baseResult = firstResult || {
+    bars: [],
+  };
+
+  return {
+    ...baseResult,
+    bars: finalBars,
+    pageCount: pages.length,
+    requestedBars: params.requiredBars,
+    reachedRequiredBars,
+    terminalNoData,
+    pages,
+  };
+}
+
 export function hasFreshSpotTradingViewKlineCache(symbol: string, interval: string, limit?: number) {
   const backendInterval = getBackendKlineIntervalForSpotInterval(interval);
   return Boolean(readCurrentKlineCache(symbol, backendInterval, limit || getPreloadKlineLimit(backendInterval)));
@@ -1053,9 +1367,18 @@ function buildSearchResult(symbolInfo: TradingViewLibrarySymbolInfo): TradingVie
 export function createSpotTradingViewDatafeed(
   options: SpotTradingViewDatafeedOptions,
 ): SpotTradingViewDatafeed {
-  forcedSpotTradingViewDebugEnabled = Boolean(options.debugEnabled);
+  forcedSpotTradingViewDebugEnabled = (
+    Boolean(options.debugEnabled) ||
+    hasSpotTvDebugUrlFlag() ||
+    (typeof window !== 'undefined' && /[?&]tvdebug=1(?:&|$)/.test(window.location.href))
+  );
   const symbolInfo = buildSymbolInfo(options);
   const apiSymbol = normalizeSpotSymbol(symbolInfo.ticker || symbolInfo.name);
+  spotTradingViewDebug('datafeed created', {
+    symbol: apiSymbol,
+    symbolInfoName: symbolInfo.name,
+    supportedResolutions: SUPPORTED_RESOLUTIONS,
+  });
   let destroyed = false;
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
@@ -1108,32 +1431,50 @@ export function createSpotTradingViewDatafeed(
     },
 
     getBars(_symbolInfo, resolution, periodParams, onHistory, onError) {
+      const requestSeq = spotTradingViewGetBarsRequestSeq + 1;
+      spotTradingViewGetBarsRequestSeq = requestSeq;
       const requestResolution = normalizeResolution(resolution);
       const chartInterval = tradingViewResolutionToSpotInterval(requestResolution);
       const interval = getBackendKlineIntervalForTradingView(requestResolution);
       const countBack = Number(periodParams.countBack || 0);
       const { isHistoryRequest, requestedEndTime } = classifyKlineRequest(periodParams);
-      const limit = isHistoryRequest
+      const requiredBars = isHistoryRequest
         ? getHistoryKlineLimit(interval, countBack)
-        : getCurrentKlineLimit(interval);
+        : getCurrentKlineLimit(interval, countBack);
+      const limit = getKlineRequestPageLimit(requiredBars);
       const endTime = isHistoryRequest && requestedEndTime > 0 ? requestedEndTime : undefined;
       const requestKind = isHistoryRequest ? 'history' : 'current';
       const latestBarKey = getLatestBarKey(requestResolution);
       const historyRequestSeq = (historyRequestSeqByLatestBarKey.get(latestBarKey) || 0) + 1;
       historyRequestSeqByLatestBarKey.set(latestBarKey, historyRequestSeq);
+      const periodDebugPayload = {
+        from: periodParams.from,
+        to: periodParams.to,
+        countBack,
+        firstDataRequest: periodParams.firstDataRequest !== false,
+      };
       const requestDebugPayload = {
+        requestSeq,
+        phase: requestKind,
         symbol: apiSymbol,
+        symbolInfoName: _symbolInfo.name,
         interval,
         chartInterval,
         backendInterval: interval,
         resolution: requestResolution,
+        periodParams: periodDebugPayload,
         firstDataRequest: periodParams.firstDataRequest !== false,
         from: periodParams.from,
         to: periodParams.to,
         countBack,
+        requiredBars,
+        apiLimit: limit,
         limit,
         requestKind,
         endTime: endTime || null,
+        end_time: endTime || null,
+        end_time_ms: endTime || null,
+        forceRest: true,
       };
       spotTradingViewDebug('getBars request', requestDebugPayload);
       const canUpdateActiveHistoryState = () => (
@@ -1146,11 +1487,30 @@ export function createSpotTradingViewDatafeed(
         meta: { noData: boolean },
         emptyReason?: string,
       ) => {
-        if (destroyed || didCompleteHistory) return;
+        if (destroyed || didCompleteHistory) {
+          spotTradingViewDebug('getBars callback skipped', {
+            requestSeq,
+            phase: requestKind,
+            symbol: apiSymbol,
+            symbolInfoName: _symbolInfo.name,
+            resolution: requestResolution,
+            backendInterval: interval,
+            destroyed,
+            didCompleteHistory,
+            noData: meta.noData,
+            emptyReason: emptyReason || null,
+            barsSummary: buildSpotTvDebugBarsSummary(bars),
+          });
+          return;
+        }
         didCompleteHistory = true;
         if (!bars.length) {
           spotTradingViewDebug('callback empty reason', {
+            requestSeq,
+            phase: requestKind,
             symbol: apiSymbol,
+            symbolInfoName: _symbolInfo.name,
+            resolution: requestResolution,
             interval,
             chartInterval,
             backendInterval: interval,
@@ -1159,11 +1519,62 @@ export function createSpotTradingViewDatafeed(
             reason: emptyReason || 'empty bars',
           });
         }
+        spotTradingViewDebug('getBars callback', {
+          requestSeq,
+          phase: requestKind,
+          symbol: apiSymbol,
+          symbolInfoName: _symbolInfo.name,
+          resolution: requestResolution,
+          backendInterval: interval,
+          periodParams: periodDebugPayload,
+          apiLimit: limit,
+          limit,
+          requiredBars,
+          end_time: endTime || null,
+          end_time_ms: endTime || null,
+          forceRest: true,
+          noData: meta.noData,
+          emptyReason: emptyReason || null,
+          callbackTime: Date.now(),
+          callbackTimeIso: new Date().toISOString(),
+          barsSummary: buildSpotTvDebugBarsSummary(bars),
+        });
         onHistory(bars, meta);
       };
       const safeErrorCallback = (reason: string) => {
-        if (destroyed || didCompleteHistory) return;
+        if (destroyed || didCompleteHistory) {
+          spotTradingViewDebug('getBars error callback skipped', {
+            requestSeq,
+            phase: requestKind,
+            symbol: apiSymbol,
+            symbolInfoName: _symbolInfo.name,
+            resolution: requestResolution,
+            backendInterval: interval,
+            destroyed,
+            didCompleteHistory,
+            reason,
+          });
+          return;
+        }
         didCompleteHistory = true;
+        spotTradingViewDebug('getBars error callback', {
+          requestSeq,
+          phase: requestKind,
+          symbol: apiSymbol,
+          symbolInfoName: _symbolInfo.name,
+          resolution: requestResolution,
+          backendInterval: interval,
+          periodParams: periodDebugPayload,
+          apiLimit: limit,
+          limit,
+          requiredBars,
+          end_time: endTime || null,
+          end_time_ms: endTime || null,
+          forceRest: true,
+          reason,
+          callbackTime: Date.now(),
+          callbackTimeIso: new Date().toISOString(),
+        });
         onError(reason);
       };
       const rememberHistoryBars = (bars: TradingViewBar[]) => {
@@ -1180,42 +1591,70 @@ export function createSpotTradingViewDatafeed(
       if (periodParams.firstDataRequest === false && Number(periodParams.to || 0) <= 0) {
         historyReadyByLatestBarKey.set(latestBarKey, true);
         spotTradingViewDebug('getBars response', {
+          requestSeq,
+          phase: requestKind,
           symbol: apiSymbol,
+          symbolInfoName: _symbolInfo.name,
           interval,
           chartInterval,
           backendInterval: interval,
+          resolution: requestResolution,
+          periodParams: periodDebugPayload,
+          apiLimit: limit,
+          requiredBars,
           requestKind,
+          end_time: endTime || null,
+          end_time_ms: endTime || null,
+          forceRest: true,
           noData: false,
           emptyReason: 'history request missing positive to cursor',
           ...getBarsDebugStats([], interval),
+          barsSummary: buildSpotTvDebugBarsSummary([]),
         });
         safeHistoryCallback([], { noData: false }, 'history request missing positive to cursor');
         return;
       }
 
-      const historyInFlightKey = isHistoryRequest && endTime
-        ? buildHistoryKlineInFlightKey(apiSymbol, interval, periodParams, limit, endTime)
-        : '';
-
       if (!isHistoryRequest) {
-        const cached = readCurrentKlineCache(apiSymbol, interval, limit);
-        if (cached?.bars.length) {
+        const cached = readCurrentKlineCache(apiSymbol, interval, requiredBars);
+        const cachedContinuityStats = cached ? getBarsContinuityStats(cached.bars, interval) : null;
+        if (
+          cached?.bars.length &&
+          cached.bars.length >= requiredBars &&
+          cachedContinuityStats?.gapCount === 0 &&
+          cachedContinuityStats.duplicateCount === 0
+        ) {
           if (canUpdateActiveHistoryState()) {
             rememberHistoryBars(cached.bars);
             options.onKlineLoadStateChange?.('loaded');
             historyReadyByLatestBarKey.set(latestBarKey, true);
           }
           const responseDebugPayload = {
+            requestSeq,
+            phase: requestKind,
             symbol: apiSymbol,
+            symbolInfoName: _symbolInfo.name,
             interval,
             chartInterval,
             backendInterval: interval,
+            resolution: requestResolution,
+            periodParams: periodDebugPayload,
+            apiLimit: limit,
+            limit,
+            requiredBars,
+            end_time: endTime || null,
+            end_time_ms: endTime || null,
+            forceRest: false,
             requestKind,
             provider: cached.provider,
             source: cached.source,
             cacheHit: true,
             noData: false,
             ...getBarsDebugStats(cached.bars, interval),
+            continuityGapCount: cachedContinuityStats.gapCount,
+            continuityDuplicateCount: cachedContinuityStats.duplicateCount,
+            continuityMaxGap: cachedContinuityStats.maxGap,
+            barsSummary: buildSpotTvDebugBarsSummary(cached.bars),
             lastBars: buildBarDebugRows(cached.bars),
           };
           spotTradingViewDebug('getBars response', responseDebugPayload);
@@ -1224,7 +1663,7 @@ export function createSpotTradingViewDatafeed(
           void fetchAndCacheCurrentKlineBars({
             symbol: apiSymbol,
             interval,
-            limit,
+            limit: requiredBars,
           }).catch((err: unknown) => {
             if (process.env.NODE_ENV !== 'production') {
               console.debug('[SpotTradingViewDatafeed] refresh kline cache failed', {
@@ -1237,23 +1676,36 @@ export function createSpotTradingViewDatafeed(
           });
           return;
         }
+        if (cached?.bars.length) {
+          spotTradingViewDebug('getBars cache skipped', {
+            requestSeq,
+            phase: requestKind,
+            symbol: apiSymbol,
+            symbolInfoName: _symbolInfo.name,
+            interval,
+            chartInterval,
+            backendInterval: interval,
+            resolution: requestResolution,
+            cacheCount: cached.bars.length,
+            requiredBars,
+            continuityGapCount: cachedContinuityStats?.gapCount ?? null,
+            continuityDuplicateCount: cachedContinuityStats?.duplicateCount ?? null,
+            continuityMaxGap: cachedContinuityStats?.maxGap ?? null,
+          });
+        }
       }
 
-      const request = historyInFlightKey
-        ? getHistoryKlineRequestPromise({
-          key: historyInFlightKey,
-          symbol: apiSymbol,
-          interval,
-          limit,
-          endTime,
-        })
-        : fetchKlineRequestBars({
-          symbol: apiSymbol,
-          interval,
-          limit,
-          endTime,
-          forceRest: true,
-        });
+      const request = fetchCountBackKlineRequestBars({
+        symbol: apiSymbol,
+        interval,
+        requiredBars,
+        initialLimit: limit,
+        endTime,
+        isHistoryRequest,
+        periodParams,
+        requestSeq,
+        phase: requestKind,
+      });
 
       void request
         .then((result) => {
@@ -1262,7 +1714,7 @@ export function createSpotTradingViewDatafeed(
             writeCurrentKlineCache({
               symbol: apiSymbol,
               interval,
-              limit,
+              limit: Math.max(requiredBars, bars.length),
               bars,
               provider,
               source,
@@ -1270,12 +1722,31 @@ export function createSpotTradingViewDatafeed(
           }
 
           const noDataPolicy = resolveHistoryNoDataPolicy({ isHistoryRequest, result });
+          const continuityStats = getBarsContinuityStats(bars, interval);
+          const terminalNoData = Boolean(result.terminalNoData || isTerminalEmptyKlineResult(result));
+          const reachedRequiredBars = result.reachedRequiredBars ?? bars.length >= requiredBars;
           const responseDebugPayload = {
+            requestSeq,
+            phase: requestKind,
             symbol: apiSymbol,
+            symbolInfoName: _symbolInfo.name,
             interval,
             chartInterval,
             backendInterval: interval,
+            resolution: requestResolution,
+            periodParams: periodDebugPayload,
+            apiLimit: limit,
+            limit,
+            requiredBars,
+            end_time: endTime || null,
+            end_time_ms: endTime || null,
+            forceRest: true,
             requestKind,
+            pageCount: result.pageCount,
+            pages: result.pages,
+            requestedBars: result.requestedBars,
+            reachedRequiredBars,
+            terminalNoData,
             provider,
             source,
             freshness: result.freshness,
@@ -1290,6 +1761,10 @@ export function createSpotTradingViewDatafeed(
             transientEmpty: noDataPolicy.transientEmpty,
             metadataPresent: noDataPolicy.hasMetadata,
             ...getBarsDebugStats(bars, interval),
+            continuityGapCount: continuityStats.gapCount,
+            continuityDuplicateCount: continuityStats.duplicateCount,
+            continuityMaxGap: continuityStats.maxGap,
+            barsSummary: buildSpotTvDebugBarsSummary(bars),
             lastBars: buildBarDebugRows(bars),
           };
           spotTradingViewDebug('getBars response', responseDebugPayload);
@@ -1304,6 +1779,14 @@ export function createSpotTradingViewDatafeed(
             safeErrorCallback('Kline history temporarily unavailable');
             return;
           }
+          if (bars.length && (continuityStats.gapCount > 0 || continuityStats.duplicateCount > 0)) {
+            safeErrorCallback('Kline history temporarily unavailable');
+            return;
+          }
+          if (bars.length < requiredBars && !terminalNoData) {
+            safeErrorCallback('Kline history temporarily unavailable');
+            return;
+          }
           safeHistoryCallback(
             bars,
             { noData: noDataPolicy.noData },
@@ -1312,8 +1795,14 @@ export function createSpotTradingViewDatafeed(
         })
         .catch((err: unknown) => {
           if (!isHistoryRequest) {
-            const cached = readCurrentKlineCache(apiSymbol, interval, limit, { allowStale: true });
-            if (cached?.bars.length) {
+            const cached = readCurrentKlineCache(apiSymbol, interval, requiredBars, { allowStale: true });
+            const cachedContinuityStats = cached ? getBarsContinuityStats(cached.bars, interval) : null;
+            if (
+              cached?.bars.length &&
+              cached.bars.length >= requiredBars &&
+              cachedContinuityStats?.gapCount === 0 &&
+              cachedContinuityStats.duplicateCount === 0
+            ) {
               if (canUpdateActiveHistoryState()) {
                 console.warn('[SpotTradingViewDatafeed] using cached kline bars after request failed', {
                   symbol: apiSymbol,
@@ -1326,10 +1815,21 @@ export function createSpotTradingViewDatafeed(
                 historyReadyByLatestBarKey.set(latestBarKey, true);
               }
               spotTradingViewDebug('getBars response', {
+                requestSeq,
+                phase: requestKind,
                 symbol: apiSymbol,
+                symbolInfoName: _symbolInfo.name,
                 interval,
                 chartInterval,
                 backendInterval: interval,
+                resolution: requestResolution,
+                periodParams: periodDebugPayload,
+                apiLimit: limit,
+                limit,
+                requiredBars,
+                end_time: endTime || null,
+                end_time_ms: endTime || null,
+                forceRest: false,
                 requestKind,
                 provider: cached.provider,
                 source: cached.source,
@@ -1337,6 +1837,10 @@ export function createSpotTradingViewDatafeed(
                 staleFallback: true,
                 noData: false,
                 ...getBarsDebugStats(cached.bars, interval),
+                continuityGapCount: cachedContinuityStats.gapCount,
+                continuityDuplicateCount: cachedContinuityStats.duplicateCount,
+                continuityMaxGap: cachedContinuityStats.maxGap,
+                barsSummary: buildSpotTvDebugBarsSummary(cached.bars),
                 lastBars: buildBarDebugRows(cached.bars),
               });
               safeHistoryCallback(cloneBars(cached.bars), { noData: false });
@@ -1438,6 +1942,8 @@ export function createSpotTradingViewDatafeed(
           : 0;
         const realtimeDebugPayload = {
           eventType: message.type,
+          symbol: apiSymbol,
+          msgSymbol,
           interval,
           chartInterval,
           backendInterval: interval,
