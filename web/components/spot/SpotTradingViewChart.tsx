@@ -101,7 +101,6 @@ const SPOT_PRELOAD_INTERVAL_OPTIONS: Record<string, string[]> = {
 const TIME_SHARING_LABEL = '\u5206\u65f6';
 const TIME_SHARING_KEY = 'time';
 const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
-const SPOT_TV_INTERVAL_CHANGE_DEBOUNCE_MS = 150;
 const SPOT_TV_INITIAL_RIGHT_PADDING_BARS = 4;
 const SPOT_TV_INITIAL_VISIBLE_RANGE_DELAY_MS = 80;
 const SPOT_TV_INITIAL_VISIBLE_BARS: Record<string, number> = {
@@ -287,9 +286,6 @@ export default function SpotTradingViewChart({
   const initialVisibleRangeAppliedKeyRef = useRef('');
   const initialVisibleRangeApplySeqRef = useRef(0);
   const pendingInitialVisibleRangeRef = useRef<SpotTradingViewHistoryBarsEvent | null>(null);
-  const intervalChangeTimerRef = useRef<number | null>(null);
-  const intervalChangeIntentSeqRef = useRef(0);
-  const pendingIntervalIntentRef = useRef<string | null>(null);
   const toolbarButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const [loadError, setLoadError] = useState<TradingViewLoadError | null>(null);
   const [scriptReady, setScriptReady] = useState(false);
@@ -325,79 +321,6 @@ export default function SpotTradingViewChart({
       setResolutionFallbackNonce((value) => value + 1);
     },
     [widgetKey],
-  );
-
-  const clearPendingIntervalChange = useCallback((reason: string) => {
-    const pendingInterval = pendingIntervalIntentRef.current;
-    if (intervalChangeTimerRef.current !== null) {
-      window.clearTimeout(intervalChangeTimerRef.current);
-      intervalChangeTimerRef.current = null;
-    }
-    pendingIntervalIntentRef.current = null;
-    if (pendingInterval) {
-      spotTradingViewChartDebug('interval-change-cancelled', {
-        interval: pendingInterval,
-        reason,
-      });
-    }
-  }, []);
-
-  const requestDebouncedIntervalChange = useCallback(
-    (nextInterval: string) => {
-      const requestedInterval = String(nextInterval || '').trim();
-      if (!requestedInterval) return;
-
-      const previousPendingInterval = pendingIntervalIntentRef.current;
-      if (intervalChangeTimerRef.current !== null) {
-        window.clearTimeout(intervalChangeTimerRef.current);
-        intervalChangeTimerRef.current = null;
-      }
-      if (previousPendingInterval && previousPendingInterval !== requestedInterval) {
-        spotTradingViewChartDebug('interval-change-cancelled', {
-          interval: previousPendingInterval,
-          nextInterval: requestedInterval,
-          reason: 'superseded by latest intent',
-        });
-      }
-
-      pendingIntervalIntentRef.current = requestedInterval;
-      const requestSeq = ++intervalChangeIntentSeqRef.current;
-      updateToolbarButtons(toolbarButtonRefs.current, 'candle', requestedInterval);
-      spotTradingViewChartDebug('interval-change-requested', {
-        requestSeq,
-        interval: requestedInterval,
-        activeInterval: activeIntervalRef.current,
-        debounceMs: SPOT_TV_INTERVAL_CHANGE_DEBOUNCE_MS,
-      });
-
-      if (chartModeRef.current !== 'candle') {
-        onChartModeChange?.('candle');
-      }
-
-      intervalChangeTimerRef.current = window.setTimeout(() => {
-        if (intervalChangeIntentSeqRef.current !== requestSeq) return;
-        intervalChangeTimerRef.current = null;
-        pendingIntervalIntentRef.current = null;
-
-        if (chartModeRef.current === 'candle' && activeIntervalRef.current === requestedInterval) {
-          spotTradingViewChartDebug('interval-change-applied', {
-            requestSeq,
-            interval: requestedInterval,
-            skipped: true,
-            reason: 'already active',
-          });
-          return;
-        }
-
-        onIntervalChange?.(requestedInterval);
-        spotTradingViewChartDebug('interval-change-applied', {
-          requestSeq,
-          interval: requestedInterval,
-          debounceMs: SPOT_TV_INTERVAL_CHANGE_DEBOUNCE_MS,
-        });
-      }, SPOT_TV_INTERVAL_CHANGE_DEBOUNCE_MS);
-    },
-    [onChartModeChange, onIntervalChange],
   );
 
   const applyInitialVisibleRangeFromHistory = useCallback(
@@ -666,10 +589,6 @@ export default function SpotTradingViewChart({
     widgetIntervalRef.current = widgetInterval;
   }, [activeInterval, chartMode, normalizedSymbol, widgetInterval]);
 
-  useEffect(() => () => {
-    clearPendingIntervalChange('component unmount');
-  }, [clearPendingIntervalChange]);
-
   useEffect(() => {
     if (!normalizedSymbol) return undefined;
 
@@ -869,19 +788,23 @@ export default function SpotTradingViewChart({
       };
 
       makeButton(TIME_SHARING_KEY, TIME_SHARING_LABEL, () => {
-        clearPendingIntervalChange('time sharing selected');
         onChartModeChange?.('time');
       });
       SPOT_INTERVAL_OPTIONS.forEach((item) => {
         makeButton(item, formatIntervalLabel(item), () => {
-          requestDebouncedIntervalChange(item);
+          if (chartModeRef.current !== 'candle') {
+            onChartModeChange?.('candle');
+          }
+          updateToolbarButtons(toolbarButtonRefs.current, 'candle', item);
+          spotTradingViewChartDebug('interval-change-requested', {
+            interval: item,
+            activeInterval: activeIntervalRef.current,
+            source: 'tradingview-toolbar',
+          });
+          onIntervalChange?.(item);
         });
       });
-      updateToolbarButtons(
-        toolbarButtonRefs.current,
-        chartMode,
-        pendingIntervalIntentRef.current || activeIntervalRef.current,
-      );
+      updateToolbarButtons(toolbarButtonRefs.current, chartMode, activeIntervalRef.current);
     }).catch(() => undefined);
 
     return () => {
@@ -893,14 +816,13 @@ export default function SpotTradingViewChart({
     applyInitialVisibleRangeFromHistory,
     amountPrecision,
     chartMode,
-    clearPendingIntervalChange,
     containerId,
     displayName,
     locale,
     normalizedSymbol,
     onChartModeChange,
+    onIntervalChange,
     pricePrecision,
-    requestDebouncedIntervalChange,
     scriptReady,
     widgetKey,
     widgetStyle,
@@ -908,7 +830,7 @@ export default function SpotTradingViewChart({
 
   useEffect(() => {
     let cancelled = false;
-    updateToolbarButtons(toolbarButtonRefs.current, chartMode, pendingIntervalIntentRef.current || activeInterval);
+    updateToolbarButtons(toolbarButtonRefs.current, chartMode, activeInterval);
 
     const timer = window.setTimeout(() => {
       if (!cancelled) applyWidgetResolution(widgetInterval);
