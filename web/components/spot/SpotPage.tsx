@@ -518,6 +518,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const [symbol, setSymbol] = useState(initialSpotSymbol);
   const spotMarket = useSpotMarket(symbol);
   const symbolRef = useRef(symbol);
+  const previousSymbolRef = useRef(symbol);
   const appliedCategoryRef = useRef('');
   const originalDocumentTitleRef = useRef<string | null>(null);
   const titleUpdateTimerRef = useRef<number | null>(null);
@@ -526,6 +527,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const activeIntervalRef = useRef('1d');
   const intervalChangeTimerRef = useRef<number | null>(null);
   const intervalChangeSeqRef = useRef(0);
+  const chartIntervalSwitchStartedAtRef = useRef(0);
+  const chartIntervalSwitchClearTimerRef = useRef<number | null>(null);
   const pendingIntervalChangeRef = useRef<{
     interval: string;
     source: string;
@@ -534,6 +537,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     scheduledAt: number;
   } | null>(null);
   const [chartMode, setChartMode] = useState<SpotChartMode>('candle');
+  const [chartIntervalSwitching, setChartIntervalSwitching] = useState(false);
   const [orderPrice, setOrderPrice] = useState('');
   const [orderPriceSelectNonce, setOrderPriceSelectNonce] = useState(0);
 
@@ -663,6 +667,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   }, [router, selectedPair?.symbol, symbol]);
 
   useEffect(() => {
+    previousSymbolRef.current = symbolRef.current;
     symbolRef.current = symbol;
   }, [symbol]);
 
@@ -677,10 +682,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   useEffect(() => {
     pairQueryRef.current = pairQuery;
   }, [pairQuery]);
-
-  useEffect(() => {
-    setOrderPrice('');
-  }, [symbol]);
 
   useEffect(() => {
     const nextSymbol = normalizeSpotApiSymbol(initialSymbol);
@@ -981,6 +982,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
   const handleOrderBookPriceClick = useCallback(
     (price: string) => {
+      if (spotMarket.isLoading) {
+        return;
+      }
       const orderInputPrice = formatOrderInputPriceBySymbol(symbol, price, pricePrecision);
       if (!orderInputPrice) {
         return;
@@ -988,8 +992,43 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       setOrderPrice(orderInputPrice);
       setOrderPriceSelectNonce((value) => value + 1);
     },
-    [pricePrecision, symbol]
+    [pricePrecision, spotMarket.isLoading, symbol]
   );
+
+  const clearChartIntervalSwitching = useCallback((immediate = false) => {
+    if (chartIntervalSwitchClearTimerRef.current !== null) {
+      window.clearTimeout(chartIntervalSwitchClearTimerRef.current);
+      chartIntervalSwitchClearTimerRef.current = null;
+    }
+
+    const elapsedMs = Math.max(0, getSpotPagePerfNow() - chartIntervalSwitchStartedAtRef.current);
+    const delayMs = immediate ? 0 : Math.max(0, 260 - elapsedMs);
+    chartIntervalSwitchClearTimerRef.current = window.setTimeout(() => {
+      chartIntervalSwitchClearTimerRef.current = null;
+      setChartIntervalSwitching(false);
+    }, delayMs);
+  }, []);
+
+  const startChartIntervalSwitching = useCallback(() => {
+    if (chartIntervalSwitchClearTimerRef.current !== null) {
+      window.clearTimeout(chartIntervalSwitchClearTimerRef.current);
+      chartIntervalSwitchClearTimerRef.current = null;
+    }
+    chartIntervalSwitchStartedAtRef.current = getSpotPagePerfNow();
+    setChartIntervalSwitching(true);
+  }, []);
+
+  useEffect(() => {
+    setOrderPrice('');
+    clearChartIntervalSwitching(true);
+  }, [clearChartIntervalSwitching, symbol]);
+
+  useEffect(() => () => {
+    if (chartIntervalSwitchClearTimerRef.current !== null) {
+      window.clearTimeout(chartIntervalSwitchClearTimerRef.current);
+      chartIntervalSwitchClearTimerRef.current = null;
+    }
+  }, []);
 
   const clearPendingIntervalChange = useCallback((reason: string) => {
     const pending = pendingIntervalChangeRef.current;
@@ -998,6 +1037,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       intervalChangeTimerRef.current = null;
     }
     pendingIntervalChangeRef.current = null;
+    clearChartIntervalSwitching(true);
 
     if (pending) {
       spotPageIntervalDebug('interval-change-cancelled', {
@@ -1007,7 +1047,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         debounceMs: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
       });
     }
-  }, []);
+  }, [clearChartIntervalSwitching]);
 
   const scheduleIntervalChange = useCallback(
     (nextInterval: string, source = 'spot-page', requestedSwitchId?: string) => {
@@ -1066,6 +1106,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       }
 
       const requestSeq = ++intervalChangeSeqRef.current;
+      startChartIntervalSwitching();
       pendingIntervalChangeRef.current = {
         interval: requestedInterval,
         source,
@@ -1121,6 +1162,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
             reason: 'already active at commit',
             debounceMs: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
           });
+          clearChartIntervalSwitching(true);
           return;
         }
 
@@ -1144,7 +1186,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         });
       }, SPOT_INTERVAL_CHANGE_DEBOUNCE_MS);
     },
-    [clearPendingIntervalChange],
+    [clearChartIntervalSwitching, clearPendingIntervalChange, startChartIntervalSwitching],
   );
 
   useEffect(() => () => {
@@ -1203,10 +1245,17 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       if (value === 'time') {
         clearPendingIntervalChange('chart mode changed to time sharing');
       }
+      if (value !== chartMode) {
+        startChartIntervalSwitching();
+      }
       setChartMode(value);
     },
-    [clearPendingIntervalChange],
+    [chartMode, clearPendingIntervalChange, startChartIntervalSwitching],
   );
+
+  const handleChartIntervalLoaded = useCallback(() => {
+    clearChartIntervalSwitching(false);
+  }, [clearChartIntervalSwitching]);
 
   const handlePairQueryChange = useCallback((nextQuery: SpotPairQuery) => {
     setPairQuery((prev) => {
@@ -1274,33 +1323,54 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const currentDisplaySymbol = useMemo(() => {
     return selectedTicker?.displaySymbol || selectedPair?.displaySymbol || selectedTicker?.label || formatSpotDisplaySymbol(symbol);
   }, [selectedPair?.displaySymbol, selectedTicker?.displaySymbol, selectedTicker?.label, symbol]);
-  const hasSpotTradePrice = spotMarket.lastTradePrice !== null && spotMarket.lastTradePrice !== undefined && String(spotMarket.lastTradePrice).trim() !== '';
-  const headerPriceValue = hasSpotTradePrice ? spotMarket.lastTradePrice : spotMarket.displayPrice;
+  const isSwitchingSymbol = spotMarket.isLoading && previousSymbolRef.current !== symbol;
+  const hasCurrentSpotMarketView = !spotMarket.marketView || normalizeSpotApiSymbol(spotMarket.marketView.symbol) === normalizeSpotApiSymbol(symbol);
+  const hasSpotTradePrice = !isSwitchingSymbol && spotMarket.lastTradePrice !== null && spotMarket.lastTradePrice !== undefined && String(spotMarket.lastTradePrice).trim() !== '';
+  const headerPriceValue = !isSwitchingSymbol && hasCurrentSpotMarketView
+    ? (hasSpotTradePrice ? spotMarket.lastTradePrice : spotMarket.displayPrice)
+    : null;
   const spotLastPrice = formatPriceBySymbol(
     symbol,
     String(headerPriceValue ?? ''),
     pricePrecision,
   ) || '--';
   const orderbookReferencePrice = spotLastPrice;
+  const safeSpotDepth = !isSwitchingSymbol ? spotMarket.depth : null;
+  const safeSpotTrades = !isSwitchingSymbol ? spotMarket.trades : [];
+  const safeBestAsk = !isSwitchingSymbol ? spotMarket.bestAsk : null;
+  const safeBestBid = !isSwitchingSymbol ? spotMarket.bestBid : null;
+  const safeOrderbookMidPrice = !isSwitchingSymbol ? spotMarket.orderbookMidPrice : null;
+  const safeLastTradePrice = !isSwitchingSymbol ? spotMarket.lastTradePrice : null;
+  const safeLastTradeAt = !isSwitchingSymbol ? spotMarket.lastTradeAt : null;
   const formMarketPrice = formatOrderInputPriceBySymbol(
     symbol,
-    String(spotMarket.orderbookMidPrice ?? spotMarket.bestAsk ?? spotMarket.bestBid ?? ''),
+    String(safeOrderbookMidPrice ?? safeBestAsk ?? safeBestBid ?? ''),
     pricePrecision,
   );
   const latestTradePriceText = formatOrderInputPriceBySymbol(
     symbol,
-    String(spotMarket.lastTradePrice ?? ''),
+    String(safeLastTradePrice ?? ''),
     pricePrecision,
   );
-  const spotDepth = spotMarket.depth;
+  const spotDepth = safeSpotDepth;
   const spotDepthAsks = spotDepth?.asks || [];
   const spotDepthBids = spotDepth?.bids || [];
-  const marketHeaderData = buildMarketDataFromMarketView(symbol, spotMarket.marketView, pricePrecision) || EMPTY_MARKET_DATA;
-  const priceDirection = hasSpotTradePrice ? spotMarket.lastTradeDirection : spotMarket.priceDirection;
-  const spotMarketStatus = spotMarket.marketView?.market_status || selectedPair?.marketStatus || 'OPEN';
-  const spotMarketDataSource = spotMarket.marketView?.data_source || marketFeedDataSource;
-  const spotSources = spotMarket.sources;
-  const spotFreshness = spotMarket.freshness;
+  const marketHeaderData = !isSwitchingSymbol && hasCurrentSpotMarketView
+    ? buildMarketDataFromMarketView(symbol, spotMarket.marketView, pricePrecision) || EMPTY_MARKET_DATA
+    : EMPTY_MARKET_DATA;
+  const priceDirection = !isSwitchingSymbol && hasSpotTradePrice
+    ? spotMarket.lastTradeDirection
+    : !isSwitchingSymbol
+      ? spotMarket.priceDirection
+      : 'flat';
+  const spotMarketStatus = !isSwitchingSymbol && hasCurrentSpotMarketView
+    ? spotMarket.marketView?.market_status || selectedPair?.marketStatus || 'OPEN'
+    : selectedPair?.marketStatus || 'OPEN';
+  const spotMarketDataSource = !isSwitchingSymbol && hasCurrentSpotMarketView
+    ? spotMarket.marketView?.data_source || marketFeedDataSource
+    : marketFeedDataSource;
+  const spotSources = !isSwitchingSymbol ? spotMarket.sources : { depth: null, trades: null, ticker: null, kline: null };
+  const spotFreshness = !isSwitchingSymbol ? spotMarket.freshness : { depth: null, trades: null, ticker: null, kline: null };
   const normalizedDisplayPriceSource = String(spotMarket.displayPriceSource || '').toLowerCase();
   const spotPriceStatusDomain = hasSpotTradePrice || normalizedDisplayPriceSource.includes('trade')
     ? 'trades'
@@ -1312,14 +1382,14 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
   const marketSyncingText = t('loading', 'common');
   const shouldShowMarketSyncing = spotMarket.isLoading && spotLastPrice === '--';
-  const displayLatestPrice = shouldShowMarketSyncing ? marketSyncingText : spotLastPrice;
+  const displayLatestPrice = isSwitchingSymbol ? '--' : shouldShowMarketSyncing ? marketSyncingText : spotLastPrice;
   const displayMarketHeaderData = shouldShowMarketSyncing
     ? {
-      change: marketSyncingText,
-      changeAmount: marketSyncingText,
-      highLow: marketSyncingText,
-      volume: marketSyncingText,
-      turnover: marketSyncingText,
+      change: isSwitchingSymbol ? '--' : marketSyncingText,
+      changeAmount: isSwitchingSymbol ? '--' : marketSyncingText,
+      highLow: isSwitchingSymbol ? '-- / --' : marketSyncingText,
+      volume: isSwitchingSymbol ? '--' : marketSyncingText,
+      turnover: isSwitchingSymbol ? '--' : marketSyncingText,
     }
     : marketHeaderData;
 
@@ -1414,8 +1484,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                   displaySymbol={currentDisplaySymbol}
                   interval={interval}
                   chartMode={chartMode}
+                  intervalSwitchLoading={chartIntervalSwitching}
                   onIntervalChange={handleChartIntervalChange}
                   onChartModeChange={handleChartModeChange}
+                  onIntervalSwitchLoadComplete={handleChartIntervalLoaded}
                   dataSource={spotMarketDataSource}
                   klineSource={spotSources.kline}
                   klineFreshness={spotFreshness.kline}
@@ -1470,12 +1542,12 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     priceDirection={priceDirection}
                     asks={spotDepthAsks}
                     bids={spotDepthBids}
-                    bestAsk={spotMarket.bestAsk}
-                    bestBid={spotMarket.bestBid}
+                    bestAsk={safeBestAsk}
+                    bestBid={safeBestBid}
                     depthSource={spotSources.depth}
                     depthFreshness={spotFreshness.depth}
                     dataSource={spotMarketDataSource}
-                    isLoading={spotMarket.isLoading}
+                    isLoading={spotMarket.isLoading || isSwitchingSymbol}
                     onPriceClick={handleOrderBookPriceClick}
                   />
                 </div>
@@ -1485,11 +1557,11 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     symbol={symbol}
                     displaySymbol={currentDisplaySymbol}
                     pricePrecision={pricePrecision}
-                    trades={spotMarket.trades}
+                    trades={safeSpotTrades}
                     tradesSource={spotSources.trades}
                     tradesFreshness={spotFreshness.trades}
                     dataSource={spotMarketDataSource}
-                    isLoading={spotMarket.isLoading}
+                    isLoading={spotMarket.isLoading || isSwitchingSymbol}
                     onPriceClick={handleOrderBookPriceClick}
                   />
                 </div>
@@ -1515,7 +1587,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                 quoteAsset={spotAssetSymbols.quoteAsset}
                 marketPrice={formMarketPrice}
                 latestTradePrice={latestTradePriceText || null}
-                latestTradeAt={spotMarket.lastTradeAt}
+                latestTradeAt={safeLastTradeAt}
                 selectedPrice={orderPrice}
                 priceSelectNonce={orderPriceSelectNonce}
                 pricePrecision={pricePrecision}
@@ -1526,7 +1598,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                 depthSource={spotSources.depth}
                 depthFreshness={spotFreshness.depth}
                 dataSource={spotMarketDataSource}
-                marketDataLoading={spotMarket.isLoading}
+                marketDataLoading={spotMarket.isLoading || isSwitchingSymbol}
                 onPriceChange={setOrderPrice}
                 onOrderSuccess={handleOrderSuccess}
                 isLoggedIn={isLoggedIn}

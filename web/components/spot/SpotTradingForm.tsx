@@ -1021,9 +1021,12 @@ export default function SpotTradingForm({
   const rcbFeeDiscountPercentText = formatFeeRatioPercent(rcbFeeDiscountRate);
 
   const currentPriceNumber = useMemo(() => {
+    if (marketDataLoading) {
+      return 0;
+    }
     const num = Number(marketPrice || price || 0);
     return Number.isFinite(num) ? num : 0;
-  }, [marketPrice, price]);
+  }, [marketDataLoading, marketPrice, price]);
 
   const askLiquidityQuoteAmount = useMemo(() => getAskLiquidityQuoteAmount(asks), [asks]);
   const bidLiquidityAmount = useMemo(() => getBidLiquidityAmount(bids), [bids]);
@@ -1265,6 +1268,9 @@ export default function SpotTradingForm({
   };
 
   const handlePriceStep = (direction: 'up' | 'down') => {
+    if (marketDataLoading && !price) {
+      return;
+    }
     const step = Number(getSpotPriceStep(pricePrecision));
     const current = Number(price || marketPrice || 0);
     const safeCurrent = Number.isFinite(current) ? current : 0;
@@ -1386,6 +1392,10 @@ export default function SpotTradingForm({
 
     if (authLoading || !authChecked) {
       setSubmitError(copy.checkingLogin);
+      return;
+    }
+
+    if (marketDataLoading) {
       return;
     }
 
@@ -1551,7 +1561,7 @@ export default function SpotTradingForm({
   const showAmountInput = isLimitOrder || side === 'sell';
   const showQuoteAmountInput = isMarketBuy;
   const isAuthChecking = authLoading || !authChecked;
-  const submitDisabled = loading || Boolean(liquidityError) || isAuthChecking;
+  const submitDisabled = loading || marketDataLoading || Boolean(liquidityError) || isAuthChecking;
   const submitButtonText = isAuthChecking
     ? copy.checkingLogin
     : loading
@@ -1579,8 +1589,8 @@ export default function SpotTradingForm({
     return formatPrice(nextBid.price, pricePrecision);
   }, [bids, pricePrecision]);
 
-  const bboPrice = side === 'buy' ? bestAskPrice : bestBidPrice;
-  const bboDisabled = !bboPrice;
+  const bboPrice = marketDataLoading ? '' : side === 'buy' ? bestAskPrice : bestBidPrice;
+  const bboDisabled = marketDataLoading || !bboPrice;
   const bboStatus = useMemo(
     () => resolveSpotMarketStatus({
       source: depthSource,
@@ -1637,7 +1647,7 @@ export default function SpotTradingForm({
   };
 
   const handleBboClick = () => {
-    if (!bboPrice) {
+    if (marketDataLoading || !bboPrice) {
       return;
     }
 
