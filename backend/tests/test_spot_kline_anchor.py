@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 
@@ -85,6 +86,50 @@ def _open_times(rows: list[dict]) -> list[int]:
     return [int(row["open_time"]) for row in rows]
 
 
+class _DbOrig:
+    def __init__(self, *args) -> None:
+        self.args = args
+
+
+class _FakeUpsertDb:
+    def __init__(self, execute_errors: list[Exception]) -> None:
+        self.execute_errors = list(execute_errors)
+        self.execute_calls = 0
+        self.commit_calls = 0
+        self.rollback_calls = 0
+
+    def execute(self, stmt) -> None:
+        self.execute_calls += 1
+        if self.execute_errors:
+            raise self.execute_errors.pop(0)
+
+    def commit(self) -> None:
+        self.commit_calls += 1
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+
+
+class _CaptureLogger:
+    def __init__(self) -> None:
+        self.warning_calls: list[tuple[str, tuple]] = []
+        self.debug_calls: list[tuple[str, tuple]] = []
+
+    def warning(self, message: str, *args, **kwargs) -> None:
+        self.warning_calls.append((message, args))
+
+    def debug(self, message: str, *args, **kwargs) -> None:
+        self.debug_calls.append((message, args))
+
+
+def _upsert_operational_error(code: int, message: str) -> OperationalError:
+    return OperationalError(
+        "INSERT INTO market_klines " + ("x" * 1000),
+        {"rows": ["p" * 1000]},
+        _DbOrig(code, message),
+    )
+
+
 def test_okx_spot_1d_bucket_uses_utc_plus_8_anchor() -> None:
     samples = [
         (_ms(2026, 2, 5, 0, 30), _ms(2026, 2, 4, 16)),
@@ -110,6 +155,125 @@ def test_spot_kline_interval_normalization_preserves_month_case() -> None:
     assert market_kline_cache.normalize_kline_interval("1W") == "1w"
     assert market_kline_cache.normalize_kline_interval("1M") == "1M"
     assert market_kline_cache.normalize_kline_interval("1m") == "1m"
+
+
+def test_market_kline_upsert_retries_deadlock_once_then_succeeds() -> None:
+    db = _FakeUpsertDb([_upsert_operational_error(1213, "Deadlock found when trying to get lock")])
+    logger = _CaptureLogger()
+    sleeps: list[float] = []
+
+    original_logger = market_kline_cache.logger
+    original_record_error = market_kline_cache.record_error
+    original_sleep = market_kline_cache.time.sleep
+    try:
+        market_kline_cache.logger = logger
+        market_kline_cache.record_error = lambda *args, **kwargs: None
+        market_kline_cache.time.sleep = lambda seconds: sleeps.append(seconds)
+
+        result = market_kline_cache.upsert_klines(
+            db,
+            market_type="spot",
+            symbol="BTCUSDT",
+            interval="1m",
+            items=[_kline_payload(_ms(2026, 2, 5, 12), "1m")],
+            source="EXTERNAL_SPOT",
+        )
+
+        assert result == 1
+        assert db.execute_calls == 2
+        assert db.rollback_calls == 1
+        assert db.commit_calls == 1
+        assert sleeps == [0.05]
+        assert logger.warning_calls == []
+        assert len(logger.debug_calls) == 1
+        assert logger.debug_calls[0][0].startswith("market_klines_upsert_retry_succeeded")
+    finally:
+        market_kline_cache.logger = original_logger
+        market_kline_cache.record_error = original_record_error
+        market_kline_cache.time.sleep = original_sleep
+
+
+def test_market_kline_upsert_deadlock_exhaustion_logs_short_warning() -> None:
+    db = _FakeUpsertDb([
+        _upsert_operational_error(1213, "Deadlock found when trying to get lock"),
+        _upsert_operational_error(1213, "Deadlock found when trying to get lock"),
+        _upsert_operational_error(1213, "Deadlock found when trying to get lock"),
+        _upsert_operational_error(1213, "Deadlock found when trying to get lock"),
+    ])
+    logger = _CaptureLogger()
+    sleeps: list[float] = []
+
+    original_logger = market_kline_cache.logger
+    original_record_error = market_kline_cache.record_error
+    original_sleep = market_kline_cache.time.sleep
+    try:
+        market_kline_cache.logger = logger
+        market_kline_cache.record_error = lambda *args, **kwargs: None
+        market_kline_cache.time.sleep = lambda seconds: sleeps.append(seconds)
+
+        result = market_kline_cache.upsert_klines(
+            db,
+            market_type="spot",
+            symbol="BTCUSDT",
+            interval="1m",
+            items=[_kline_payload(_ms(2026, 2, 5, 12), "1m")],
+            source="EXTERNAL_SPOT",
+        )
+
+        assert result == 0
+        assert db.execute_calls == 4
+        assert db.rollback_calls == 4
+        assert db.commit_calls == 0
+        assert sleeps == [0.05, 0.15, 0.3]
+        assert len(logger.warning_calls) == 1
+        message, args = logger.warning_calls[0]
+        assert message.startswith("market_klines_upsert_failed")
+        assert "deadlock" in [str(arg) for arg in args]
+        assert "3" in [str(arg) for arg in args]
+        assert "INSERT INTO" not in (message + " " + " ".join(str(arg) for arg in args))
+    finally:
+        market_kline_cache.logger = original_logger
+        market_kline_cache.record_error = original_record_error
+        market_kline_cache.time.sleep = original_sleep
+
+
+def test_market_kline_upsert_non_deadlock_error_logs_short_reason() -> None:
+    db = _FakeUpsertDb([_upsert_operational_error(1205, "Lock wait timeout exceeded")])
+    logger = _CaptureLogger()
+    sleeps: list[float] = []
+
+    original_logger = market_kline_cache.logger
+    original_record_error = market_kline_cache.record_error
+    original_sleep = market_kline_cache.time.sleep
+    try:
+        market_kline_cache.logger = logger
+        market_kline_cache.record_error = lambda *args, **kwargs: None
+        market_kline_cache.time.sleep = lambda seconds: sleeps.append(seconds)
+
+        result = market_kline_cache.upsert_klines(
+            db,
+            market_type="spot",
+            symbol="BTCUSDT",
+            interval="1m",
+            items=[_kline_payload(_ms(2026, 2, 5, 12), "1m")],
+            source="EXTERNAL_SPOT",
+        )
+
+        assert result == 0
+        assert db.execute_calls == 1
+        assert db.rollback_calls == 1
+        assert db.commit_calls == 0
+        assert sleeps == []
+        assert len(logger.warning_calls) == 1
+        message, args = logger.warning_calls[0]
+        rendered = message + " " + " ".join(str(arg) for arg in args)
+        assert "OperationalError:1205" in rendered
+        assert "INSERT INTO" not in rendered
+        assert "p" * 100 not in rendered
+    finally:
+        market_kline_cache.logger = original_logger
+        market_kline_cache.record_error = original_record_error
+        market_kline_cache.time.sleep = original_sleep
 
 
 def test_okx_spot_1w_bucket_uses_utc_plus_8_week_anchor() -> None:
