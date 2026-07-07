@@ -52,6 +52,8 @@ const EMPTY_MARKET_DATA: SpotHeaderMarketData = {
 };
 const DEFAULT_SPOT_SYMBOL = 'BTCUSDT';
 const SPOT_PAIR_PAGE_SIZE = 6;
+const SPOT_PAIR_PAGE_CACHE_TTL_MS = 60_000;
+const SPOT_PAIR_TICKER_BATCH_TTL_MS = 30_000;
 const SPOT_INTERVAL_CHANGE_DEBOUNCE_MS = 150;
 const SPOT_PRIVATE_FOREGROUND_REFRESH_MS = 10000;
 const SPOT_PRIVATE_HIDDEN_REFRESH_MS = 30000;
@@ -62,7 +64,11 @@ type SpotPairQuery = {
   quote: string;
   keyword: string;
 };
-const cachedSpotPairPages = new Map<string, { items: SpotPairOption[]; total: number }>();
+type SpotPairPageResponse = Awaited<ReturnType<typeof getSpotMarketPairs>>;
+const cachedSpotPairPages = new Map<string, { items: SpotPairOption[]; total: number; fetchedAt: number }>();
+const spotPairPageRequests = new Map<string, Promise<SpotPairPageResponse>>();
+const cachedSpotPairTickerBatches = new Map<string, { items: SpotPairOption[]; fetchedAt: number }>();
+const spotPairTickerBatchRequests = new Map<string, Promise<SpotPairOption[]>>();
 
 function normalizeSpotPageInterval(value: string): string {
   const raw = String(value || '').trim();
@@ -127,6 +133,75 @@ function getSpotPagePerfNow() {
     return performance.now();
   }
   return Date.now();
+}
+
+function isFreshTimestamp(fetchedAt: number | undefined, ttlMs: number): boolean {
+  return Boolean(fetchedAt && Date.now() - fetchedAt < ttlMs);
+}
+
+function getSpotPairTickerBatchKey(symbols: string[]): { key: string; symbols: string[] } {
+  const normalizedSymbols = Array.from(
+    new Set(symbols.map((item) => normalizeSpotApiSymbol(item)).filter(Boolean)),
+  ).sort();
+  return {
+    key: normalizedSymbols.join(','),
+    symbols: normalizedSymbols,
+  };
+}
+
+async function loadSpotPairTickerBatch(symbols: string[]): Promise<SpotPairOption[]> {
+  const batch = getSpotPairTickerBatchKey(symbols);
+  if (!batch.key || batch.symbols.length === 0) return [];
+
+  const cached = cachedSpotPairTickerBatches.get(batch.key);
+  if (cached && isFreshTimestamp(cached.fetchedAt, SPOT_PAIR_TICKER_BATCH_TTL_MS)) {
+    return cached.items;
+  }
+
+  const inFlight = spotPairTickerBatchRequests.get(batch.key);
+  if (inFlight) return inFlight;
+
+  const request = getSpotMarketTickers(batch.symbols)
+    .then((tickers) => {
+      const nextItems = tickers
+        .map(buildSpotPairOption)
+        .filter((item): item is SpotPairOption => Boolean(item));
+      cachedSpotPairTickerBatches.set(batch.key, {
+        items: nextItems,
+        fetchedAt: Date.now(),
+      });
+      return nextItems;
+    })
+    .finally(() => {
+      spotPairTickerBatchRequests.delete(batch.key);
+    });
+
+  spotPairTickerBatchRequests.set(batch.key, request);
+  return request;
+}
+
+function getSpotPairPageRequestKey(query: SpotPairQuery, page: number): string {
+  return `${getPairQueryKey(query)}|${page}`;
+}
+
+function loadSpotPairPage(query: SpotPairQuery, page: number): Promise<SpotPairPageResponse> {
+  const requestKey = getSpotPairPageRequestKey(query, page);
+  const inFlight = spotPairPageRequests.get(requestKey);
+  if (inFlight) return inFlight;
+
+  const request = getSpotMarketPairs({
+    marketType: query.marketType,
+    category: query.category,
+    quote: query.quote,
+    keyword: query.keyword,
+    page,
+    pageSize: SPOT_PAIR_PAGE_SIZE,
+  }).finally(() => {
+    spotPairPageRequests.delete(requestKey);
+  });
+
+  spotPairPageRequests.set(requestKey, request);
+  return request;
 }
 
 function getInitialPairQuery(category?: string): SpotPairQuery {
@@ -627,13 +702,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     if (!symbols.length) return;
 
     try {
-      const tickers = await getSpotMarketTickers(symbols);
+      const tickerOptions = await loadSpotPairTickerBatch(symbols);
       const tickerMap = new Map<string, SpotPairOption>();
-      for (const ticker of tickers) {
-        const option = buildSpotPairOption(ticker);
-        if (option) {
-          tickerMap.set(option.symbol, option);
-        }
+      for (const option of tickerOptions) {
+        tickerMap.set(option.symbol, option);
       }
 
       if (getPairQueryKey(pairQueryRef.current) !== queryKey) {
@@ -664,7 +736,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           setPairTotal(cachedPage.total);
           setPairPage(1);
           setPairOptionsLoading(false);
-          void hydratePairTickers(cachedPage.items, queryKey);
+          if (isFreshTimestamp(cachedPage.fetchedAt, SPOT_PAIR_PAGE_CACHE_TTL_MS)) {
+            void hydratePairTickers(cachedPage.items, queryKey);
+            return;
+          }
         } else {
           setPairOptions([]);
           setPairOptionsQueryKey('');
@@ -677,14 +752,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       }
 
       try {
-        const response = await getSpotMarketPairs({
-          marketType: query.marketType,
-          category: query.category,
-          quote: query.quote,
-          keyword: query.keyword,
-          page,
-          pageSize: SPOT_PAIR_PAGE_SIZE,
-        });
+        const response = await loadSpotPairPage(query, page);
 
         if (requestId !== pairRequestIdRef.current || getPairQueryKey(pairQueryRef.current) !== queryKey) {
           return;
@@ -711,6 +779,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           cachedSpotPairPages.set(queryKey, {
             items: mergedPairs,
             total: response.total,
+            fetchedAt: Date.now(),
           });
         }
 
