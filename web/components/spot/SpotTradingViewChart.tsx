@@ -382,6 +382,18 @@ export default function SpotTradingViewChart({
         });
         return;
       }
+      if (
+        pendingResolutionRef.current === event.resolution &&
+        currentResolutionRef.current !== event.resolution
+      ) {
+        pendingInitialVisibleRangeRef.current = event;
+        spotTradingViewChartDebug('initial-visible-range', {
+          ...baseDebugPayload,
+          applied: false,
+          reason: 'wait for resolution dataReady',
+        });
+        return;
+      }
 
       const widget = widgetRef.current;
       const chart = widget?.activeChart?.();
@@ -519,6 +531,12 @@ export default function SpotTradingViewChart({
     [],
   );
 
+  const resetInitialVisibleRangeIntent = useCallback(() => {
+    pendingInitialVisibleRangeRef.current = null;
+    initialVisibleRangeAppliedKeyRef.current = '';
+    initialVisibleRangeApplySeqRef.current += 1;
+  }, []);
+
   const applyWidgetResolution = useCallback(
     (nextResolution: string) => {
       if (!nextResolution) return;
@@ -531,6 +549,7 @@ export default function SpotTradingViewChart({
 
       if (currentResolutionRef.current === nextResolution) {
         pendingResolutionRef.current = '';
+        updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, activeIntervalRef.current);
         return;
       }
 
@@ -544,6 +563,7 @@ export default function SpotTradingViewChart({
 
       const requestSeq = ++resolutionRequestSeqRef.current;
       pendingResolutionRef.current = nextResolution;
+      resetInitialVisibleRangeIntent();
       let finished = false;
 
       const finishResolutionChange = () => {
@@ -551,6 +571,7 @@ export default function SpotTradingViewChart({
         finished = true;
         currentResolutionRef.current = nextResolution;
         pendingResolutionRef.current = '';
+        updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, activeIntervalRef.current);
         const pendingInitialRange = pendingInitialVisibleRangeRef.current;
         if (pendingInitialRange) {
           applyInitialVisibleRangeFromHistory(pendingInitialRange, 'resolution-data-ready');
@@ -573,13 +594,12 @@ export default function SpotTradingViewChart({
             requestResolutionFallbackRebuild(nextResolution, 'setResolution rejected', error);
           });
         }
-        currentResolutionRef.current = nextResolution;
       } catch (error) {
         pendingResolutionRef.current = nextResolution;
         requestResolutionFallbackRebuild(nextResolution, 'setResolution threw', error);
       }
     },
-    [applyInitialVisibleRangeFromHistory, requestResolutionFallbackRebuild],
+    [applyInitialVisibleRangeFromHistory, requestResolutionFallbackRebuild, resetInitialVisibleRangeIntent],
   );
 
   useEffect(() => {
@@ -795,7 +815,6 @@ export default function SpotTradingViewChart({
           if (chartModeRef.current !== 'candle') {
             onChartModeChange?.('candle');
           }
-          updateToolbarButtons(toolbarButtonRefs.current, 'candle', item);
           spotTradingViewChartDebug('interval-change-requested', {
             interval: item,
             activeInterval: activeIntervalRef.current,
@@ -830,7 +849,6 @@ export default function SpotTradingViewChart({
 
   useEffect(() => {
     let cancelled = false;
-    updateToolbarButtons(toolbarButtonRefs.current, chartMode, activeInterval);
 
     const timer = window.setTimeout(() => {
       if (!cancelled) applyWidgetResolution(widgetInterval);

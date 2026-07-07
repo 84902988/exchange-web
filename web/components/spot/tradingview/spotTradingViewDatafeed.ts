@@ -278,6 +278,7 @@ const currentKlineCache = new Map<string, KlineCacheEntry>();
 const historyKlineRequestInFlightByKey = new Map<string, Promise<HistoryKlineRequestResult>>();
 let forcedSpotTradingViewDebugEnabled = false;
 let spotTradingViewGetBarsRequestSeq = 0;
+let spotTradingViewDatafeedInstanceSeq = 0;
 const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
 const SPOT_TV_GETBARS_API_PAGE_LIMIT = 500;
 const SPOT_TV_GETBARS_MAX_INTERNAL_BARS = 1000;
@@ -302,12 +303,12 @@ const SPOT_KLINE_LOAD_POLICY: Record<string, SpotKlineLoadPolicy> = {
   '15m': { current: 130, preload: 130, history: 180 },
   '1h': { current: 150, preload: 150, history: 180 },
   '4h': { current: 130, preload: 130, history: 160 },
-  '1d': { current: 110, preload: 110, history: 120 },
-  '1Dutc': { current: 110, preload: 110, history: 120 },
+  '1d': { current: 120, preload: 110, history: 120 },
+  '1Dutc': { current: 120, preload: 110, history: 120 },
   '1w': { current: 80, preload: 80, history: 100 },
   '1Wutc': { current: 80, preload: 80, history: 100 },
-  '1M': { current: 48, preload: 48, history: 60 },
-  '1Mutc': { current: 48, preload: 48, history: 60 },
+  '1M': { current: 60, preload: 48, history: 60 },
+  '1Mutc': { current: 60, preload: 48, history: 60 },
 };
 
 const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
@@ -560,11 +561,61 @@ function normalizeKlineMetaValue(value: unknown): string {
   return String(value || '').trim().toUpperCase();
 }
 
+function getKlineErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error || '');
+}
+
+function getKlineErrorCode(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  return normalizeKlineMetaValue(code);
+}
+
+function isInvalidKlineRequestError(error: unknown): boolean {
+  const code = getKlineErrorCode(error);
+  if (code === 'INVALID_SYMBOL' || code === 'INVALID_INTERVAL' || code === 'SYMBOL_NOT_FOUND') {
+    return true;
+  }
+
+  const message = getKlineErrorMessage(error).toLowerCase();
+  return (
+    message.includes('invalid symbol') ||
+    message.includes('unknown symbol') ||
+    message.includes('symbol not found') ||
+    message.includes('trading pair not found') ||
+    message.includes('pair not found') ||
+    message.includes('invalid interval')
+  );
+}
+
+function isUnparseableKlineResponseError(error: unknown): boolean {
+  if (error instanceof SyntaxError) return true;
+  const message = getKlineErrorMessage(error).toLowerCase();
+  return (
+    message.includes('unexpected token') ||
+    message.includes('unexpected end of json') ||
+    message.includes('failed to parse') ||
+    message.includes('invalid json')
+  );
+}
+
 function isTruthyKlineMeta(value: unknown): boolean {
   if (value === true) return true;
   if (typeof value === 'number') return value === 1;
   if (typeof value === 'string') return value.trim().toLowerCase() === 'true';
   return false;
+}
+
+function isTransientKlineProviderErrorCode(value: unknown): boolean {
+  const providerErrorCode = normalizeKlineMetaValue(value);
+  return (
+    providerErrorCode === 'TIMEOUT' ||
+    providerErrorCode === 'HTTP_ERROR' ||
+    providerErrorCode === 'COOLDOWN' ||
+    providerErrorCode === 'PROVIDER_UNAVAILABLE' ||
+    providerErrorCode === 'TRANSIENT' ||
+    providerErrorCode === 'UNKNOWN'
+  );
 }
 
 function hasKlineHistoryMetadata(result: HistoryKlineRequestResult): boolean {
@@ -644,12 +695,7 @@ function resolveHistoryNoDataPolicy(params: {
     };
   }
 
-  const transientProviderEmpty = (
-    providerErrorCode === 'TIMEOUT' ||
-    providerErrorCode === 'HTTP_ERROR' ||
-    providerErrorCode === 'COOLDOWN' ||
-    providerErrorCode === 'UNKNOWN'
-  );
+  const transientProviderEmpty = isTransientKlineProviderErrorCode(providerErrorCode);
   const transientEmpty = (
     transientProviderEmpty ||
     (historyIncomplete && providerErrorCode !== 'EMPTY') ||
@@ -660,12 +706,27 @@ function resolveHistoryNoDataPolicy(params: {
 
   return {
     noData: false,
-    shouldError: true,
+    shouldError: false,
     reason: transientEmpty ? 'transient empty history' : 'non-terminal empty history',
     hasMetadata,
     terminalEmpty: false,
     transientEmpty,
   };
+}
+
+function shouldStopInitialOlderProviderHistory(params: {
+  interval: string;
+  isHistoryRequest: boolean;
+  isFirstDataRequest: boolean;
+  bars: TradingViewBar[];
+}) {
+  const { interval, isHistoryRequest, isFirstDataRequest, bars } = params;
+  return (
+    !isHistoryRequest &&
+    isFirstDataRequest &&
+    bars.length > 0 &&
+    normalizeSpotInterval(interval) === '1Mutc'
+  );
 }
 
 function normalizeResolution(resolution: string): TradingViewResolution {
@@ -932,7 +993,12 @@ function normalizeRequiredKlineBars(countBack: number, fallback: number) {
 }
 
 function getCurrentKlineLimit(interval: string, countBack?: number) {
-  return normalizeRequiredKlineBars(Number(countBack || 0), getSpotKlineLoadPolicy(interval).current);
+  const policy = getSpotKlineLoadPolicy(interval);
+  const requestedBars = normalizeRequiredKlineBars(Number(countBack || 0), policy.current);
+  if (isProviderCandleOnlyInterval(interval)) {
+    return Math.min(requestedBars, policy.current);
+  }
+  return requestedBars;
 }
 
 function getPreloadKlineLimit(interval: string) {
@@ -1397,6 +1463,8 @@ export function createSpotTradingViewDatafeed(
     supportedResolutions: SUPPORTED_RESOLUTIONS,
   });
   let destroyed = false;
+  let activeGetBarsLatestBarKey = '';
+  const realtimeOwner = `tradingview:${apiSymbol}:${++spotTradingViewDatafeedInstanceSeq}`;
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
   const lastEmittedBarTimeByUid = new Map<string, number>();
@@ -1464,11 +1532,13 @@ export function createSpotTradingViewDatafeed(
       const latestBarKey = getLatestBarKey(requestResolution);
       const historyRequestSeq = (historyRequestSeqByLatestBarKey.get(latestBarKey) || 0) + 1;
       historyRequestSeqByLatestBarKey.set(latestBarKey, historyRequestSeq);
+      activeGetBarsLatestBarKey = latestBarKey;
+      const isFirstDataRequest = periodParams.firstDataRequest !== false;
       const periodDebugPayload = {
         from: periodParams.from,
         to: periodParams.to,
         countBack,
-        firstDataRequest: periodParams.firstDataRequest !== false,
+        firstDataRequest: isFirstDataRequest,
       };
       const requestDebugPayload = {
         requestSeq,
@@ -1480,7 +1550,7 @@ export function createSpotTradingViewDatafeed(
         backendInterval: interval,
         resolution: requestResolution,
         periodParams: periodDebugPayload,
-        firstDataRequest: periodParams.firstDataRequest !== false,
+        firstDataRequest: isFirstDataRequest,
         from: periodParams.from,
         to: periodParams.to,
         countBack,
@@ -1494,17 +1564,34 @@ export function createSpotTradingViewDatafeed(
         forceRest: true,
       };
       spotTradingViewDebug('getBars request', requestDebugPayload);
-      const canUpdateActiveHistoryState = () => (
-        !destroyed &&
-        historyRequestSeqByLatestBarKey.get(latestBarKey) === historyRequestSeq
-      );
+      const getHistoryCallbackGuardState = () => {
+        const isLatestRequest = historyRequestSeqByLatestBarKey.get(latestBarKey) === historyRequestSeq;
+        const activeSubscriptionCount = latestBarKeyByUid.size;
+        const hasMatchingActiveSubscription = Array.from(latestBarKeyByUid.values()).some((subscriberLatestBarKey) => (
+          subscriberLatestBarKey === latestBarKey
+        ));
+        const isActiveRequestResolution = activeGetBarsLatestBarKey === latestBarKey;
+        const hasActiveSubscription = hasMatchingActiveSubscription || isActiveRequestResolution;
+
+        return {
+          destroyed,
+          isLatestRequest,
+          activeSubscriptionCount,
+          hasMatchingActiveSubscription,
+          isActiveRequestResolution,
+          hasActiveSubscription,
+          canUse: !destroyed && isLatestRequest && hasActiveSubscription,
+        };
+      };
+      const canUpdateActiveHistoryState = () => getHistoryCallbackGuardState().canUse;
       let didCompleteHistory = false;
       const safeHistoryCallback = (
         bars: TradingViewBar[],
         meta: { noData: boolean },
         emptyReason?: string,
       ) => {
-        if (destroyed || didCompleteHistory) {
+        const guardState = getHistoryCallbackGuardState();
+        if (didCompleteHistory || !guardState.canUse) {
           spotTradingViewDebug('getBars callback skipped', {
             requestSeq,
             phase: requestKind,
@@ -1512,8 +1599,8 @@ export function createSpotTradingViewDatafeed(
             symbolInfoName: _symbolInfo.name,
             resolution: requestResolution,
             backendInterval: interval,
-            destroyed,
             didCompleteHistory,
+            ...guardState,
             noData: meta.noData,
             emptyReason: emptyReason || null,
             barsSummary: buildSpotTvDebugBarsSummary(bars),
@@ -1586,7 +1673,8 @@ export function createSpotTradingViewDatafeed(
         }
       };
       const safeErrorCallback = (reason: string) => {
-        if (destroyed || didCompleteHistory) {
+        const guardState = getHistoryCallbackGuardState();
+        if (didCompleteHistory || !guardState.canUse) {
           spotTradingViewDebug('getBars error callback skipped', {
             requestSeq,
             phase: requestKind,
@@ -1594,8 +1682,8 @@ export function createSpotTradingViewDatafeed(
             symbolInfoName: _symbolInfo.name,
             resolution: requestResolution,
             backendInterval: interval,
-            destroyed,
             didCompleteHistory,
+            ...guardState,
             reason,
           });
           return;
@@ -1668,6 +1756,12 @@ export function createSpotTradingViewDatafeed(
           cachedContinuityStats?.gapCount === 0 &&
           cachedContinuityStats.duplicateCount === 0
         ) {
+          const stopInitialOlderHistory = shouldStopInitialOlderProviderHistory({
+            interval,
+            isHistoryRequest,
+            isFirstDataRequest,
+            bars: cached.bars,
+          });
           if (canUpdateActiveHistoryState()) {
             rememberHistoryBars(cached.bars);
             options.onKlineLoadStateChange?.('loaded');
@@ -1693,7 +1787,8 @@ export function createSpotTradingViewDatafeed(
             provider: cached.provider,
             source: cached.source,
             cacheHit: true,
-            noData: false,
+            noData: stopInitialOlderHistory,
+            noDataDecision: stopInitialOlderHistory ? 'current provider visible window complete' : 'current cache hit',
             ...getBarsDebugStats(cached.bars, interval),
             continuityGapCount: cachedContinuityStats.gapCount,
             continuityDuplicateCount: cachedContinuityStats.duplicateCount,
@@ -1702,7 +1797,7 @@ export function createSpotTradingViewDatafeed(
             lastBars: buildBarDebugRows(cached.bars),
           };
           spotTradingViewDebug('getBars response', responseDebugPayload);
-          safeHistoryCallback(cloneBars(cached.bars), { noData: false });
+          safeHistoryCallback(cloneBars(cached.bars), { noData: stopInitialOlderHistory });
 
           void fetchAndCacheCurrentKlineBars({
             symbol: apiSymbol,
@@ -1766,6 +1861,16 @@ export function createSpotTradingViewDatafeed(
           }
 
           const noDataPolicy = resolveHistoryNoDataPolicy({ isHistoryRequest, result });
+          const stopInitialOlderHistory = shouldStopInitialOlderProviderHistory({
+            interval,
+            isHistoryRequest,
+            isFirstDataRequest,
+            bars,
+          });
+          const callbackNoData = stopInitialOlderHistory ? true : noDataPolicy.noData;
+          const noDataDecision = stopInitialOlderHistory
+            ? 'current provider visible window complete'
+            : noDataPolicy.reason;
           const continuityStats = getBarsContinuityStats(bars, interval);
           const terminalNoData = Boolean(result.terminalNoData || isTerminalEmptyKlineResult(result));
           const reachedRequiredBars = result.reachedRequiredBars ?? bars.length >= requiredBars;
@@ -1799,8 +1904,8 @@ export function createSpotTradingViewDatafeed(
             history_incomplete: result.history_incomplete,
             provider_error_code: result.provider_error_code,
             provider_error_provider: result.provider_error_provider,
-            noData: noDataPolicy.noData,
-            noDataDecision: noDataPolicy.reason,
+            noData: callbackNoData,
+            noDataDecision,
             terminalEmpty: noDataPolicy.terminalEmpty,
             transientEmpty: noDataPolicy.transientEmpty,
             metadataPresent: noDataPolicy.hasMetadata,
@@ -1820,21 +1925,19 @@ export function createSpotTradingViewDatafeed(
             historyReadyByLatestBarKey.set(latestBarKey, true);
           }
           if (noDataPolicy.shouldError) {
-            safeErrorCallback('Kline history temporarily unavailable');
+            safeHistoryCallback([], { noData: callbackNoData }, noDataDecision);
             return;
           }
           if (bars.length && (continuityStats.gapCount > 0 || continuityStats.duplicateCount > 0)) {
             safeErrorCallback('Kline history temporarily unavailable');
             return;
           }
-          if (bars.length < requiredBars && !terminalNoData) {
-            safeErrorCallback('Kline history temporarily unavailable');
-            return;
-          }
           safeHistoryCallback(
             bars,
-            { noData: noDataPolicy.noData },
-            bars.length ? undefined : noDataPolicy.reason,
+            { noData: callbackNoData },
+            bars.length
+              ? (stopInitialOlderHistory ? noDataDecision : (reachedRequiredBars ? undefined : 'partial bars returned'))
+              : noDataDecision,
           );
         })
         .catch((err: unknown) => {
@@ -1843,7 +1946,6 @@ export function createSpotTradingViewDatafeed(
             const cachedContinuityStats = cached ? getBarsContinuityStats(cached.bars, interval) : null;
             if (
               cached?.bars.length &&
-              cached.bars.length >= requiredBars &&
               cachedContinuityStats?.gapCount === 0 &&
               cachedContinuityStats.duplicateCount === 0
             ) {
@@ -1891,11 +1993,35 @@ export function createSpotTradingViewDatafeed(
               return;
             }
           }
+          const shouldEmitFatalError = isInvalidKlineRequestError(err) || isUnparseableKlineResponseError(err);
           if (!isHistoryRequest && canUpdateActiveHistoryState()) {
-            options.onKlineLoadStateChange?.('error');
+            options.onKlineLoadStateChange?.(shouldEmitFatalError ? 'error' : 'empty');
             historyReadyByLatestBarKey.set(latestBarKey, true);
           }
-          safeErrorCallback(err instanceof Error ? err.message : 'Failed to load spot history');
+          if (shouldEmitFatalError) {
+            safeErrorCallback(getKlineErrorMessage(err) || 'Failed to load spot history');
+            return;
+          }
+          spotTradingViewDebug('getBars request soft empty after transient error', {
+            requestSeq,
+            phase: requestKind,
+            symbol: apiSymbol,
+            symbolInfoName: _symbolInfo.name,
+            interval,
+            chartInterval,
+            backendInterval: interval,
+            resolution: requestResolution,
+            periodParams: periodDebugPayload,
+            apiLimit: limit,
+            limit,
+            requiredBars,
+            end_time: endTime || null,
+            end_time_ms: endTime || null,
+            forceRest: true,
+            requestKind,
+            reason: getKlineErrorMessage(err) || 'Failed to load spot history',
+          });
+          safeHistoryCallback([], { noData: false }, 'transient kline request failed');
         });
     },
 
@@ -2023,7 +2149,7 @@ export function createSpotTradingViewDatafeed(
         symbol: apiSymbol,
         interval,
         domains: ['kline'],
-        owner: `tradingview:${subscriberUid}`,
+        owner: realtimeOwner,
       });
       const unsubscribeKline = spotMarketRealtime.subscribe('kline', handleKline);
       const unsubscribe = () => {
