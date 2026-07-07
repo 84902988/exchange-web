@@ -27,6 +27,7 @@ OpenTimeValidator = Callable[[int], bool]
 _KLINE_EXTERNAL_FETCH_WARNING_COOLDOWN_SECONDS = 60.0
 _KLINE_EXTERNAL_FETCH_WARNING_MAX_KEYS = 512
 _KLINE_EXTERNAL_FETCH_WARNING_LAST_AT: dict[tuple[str, str, str, str], float] = {}
+_KLINE_DB_UPSERT_DEADLOCK_BACKOFF_SECONDS = (0.05, 0.15, 0.3)
 
 KLINE_CACHE_ORIGIN_DB_CACHE = "DB_CACHE"
 KLINE_CACHE_ORIGIN_REST_FETCH = "REST_FETCH"
@@ -452,6 +453,77 @@ def _is_duplicate_entry_error(exc: Exception) -> bool:
     return "1062" in message and "duplicate" in message
 
 
+def _db_error_code(exc: Exception) -> Optional[int]:
+    orig = getattr(exc, "orig", None)
+    args = getattr(orig, "args", None)
+    if not args and not getattr(exc, "statement", None):
+        args = getattr(exc, "args", None)
+    for value in args or ():
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _db_orig_message(exc: Exception) -> str:
+    orig = getattr(exc, "orig", None)
+    args = getattr(orig, "args", ())
+    if len(args) > 1:
+        return " ".join(str(value) for value in args[1:])
+    if args:
+        return str(args[0])
+    if orig is not None:
+        return str(orig)
+    return ""
+
+
+def _is_mysql_deadlock_error(exc: Exception) -> bool:
+    code = _db_error_code(exc)
+    if code == 1213:
+        return True
+    message = _db_orig_message(exc).lower()
+    return "deadlock" in message and "lock" in message
+
+
+def _db_error_reason(exc: Exception) -> str:
+    if _is_mysql_deadlock_error(exc):
+        return "deadlock"
+    code = _db_error_code(exc)
+    if code is not None:
+        return f"{type(exc).__name__}:{code}"
+    return type(exc).__name__
+
+
+def _log_market_klines_upsert_failed(
+    *,
+    symbol: str,
+    interval: str,
+    rows: int,
+    reason: str,
+    retry_count: int = 0,
+    integrity: bool = False,
+) -> None:
+    if integrity:
+        logger.warning(
+            "market_klines_upsert_integrity_failed symbol=%s interval=%s rows=%s reason=%s retry_count=%s",
+            symbol,
+            interval,
+            rows,
+            reason,
+            retry_count,
+        )
+        return
+    logger.warning(
+        "market_klines_upsert_failed symbol=%s interval=%s rows=%s reason=%s retry_count=%s",
+        symbol,
+        interval,
+        rows,
+        reason,
+        retry_count,
+    )
+
+
 def _read_cached_klines(
     db: Session,
     *,
@@ -587,73 +659,122 @@ def upsert_klines(
     if not normalized_items:
         return 0
 
-    try:
-        rows = []
-        for item in normalized_items:
-            open_time = int(item["open_time"])
-            rows.append(
-                {
-                    "market_type": market_type,
-                    "symbol": normalized_symbol,
-                    "interval": normalized_interval,
-                    "open_time": open_time,
-                    "close_time": int(item["close_time"]),
-                    "open": item["open"],
-                    "high": item["high"],
-                    "low": item["low"],
-                    "close": item["close"],
-                    "volume": item["volume"],
-                    "quote_volume": item["quote_volume"],
-                    "source": source,
-                    "is_closed": _is_closed(open_time, normalized_interval, now_ms),
-                    "fetched_at": now,
-                    "created_at": now,
-                    "updated_at": now,
-                }
-            )
-
-        stmt = mysql_insert(MarketKline).values(rows)
-        stmt = stmt.on_duplicate_key_update(
-            close_time=stmt.inserted.close_time,
-            open=stmt.inserted.open,
-            high=stmt.inserted.high,
-            low=stmt.inserted.low,
-            close=stmt.inserted.close,
-            volume=stmt.inserted.volume,
-            quote_volume=stmt.inserted.quote_volume,
-            source=stmt.inserted.source,
-            is_closed=stmt.inserted.is_closed,
-            fetched_at=stmt.inserted.fetched_at,
-            updated_at=stmt.inserted.updated_at,
+    rows = []
+    for item in normalized_items:
+        open_time = int(item["open_time"])
+        rows.append(
+            {
+                "market_type": market_type,
+                "symbol": normalized_symbol,
+                "interval": normalized_interval,
+                "open_time": open_time,
+                "close_time": int(item["close_time"]),
+                "open": item["open"],
+                "high": item["high"],
+                "low": item["low"],
+                "close": item["close"],
+                "volume": item["volume"],
+                "quote_volume": item["quote_volume"],
+                "source": source,
+                "is_closed": _is_closed(open_time, normalized_interval, now_ms),
+                "fetched_at": now,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
-        db.execute(stmt)
-        db.commit()
-        return len(normalized_items)
-    except IntegrityError as exc:
-        db.rollback()
-        if _is_duplicate_entry_error(exc):
-            logger.debug(
-                "market_klines duplicate key ignored after upsert symbol=%s interval=%s",
-                normalized_symbol,
-                normalized_interval,
+
+    stmt = mysql_insert(MarketKline).values(rows)
+    stmt = stmt.on_duplicate_key_update(
+        close_time=stmt.inserted.close_time,
+        open=stmt.inserted.open,
+        high=stmt.inserted.high,
+        low=stmt.inserted.low,
+        close=stmt.inserted.close,
+        volume=stmt.inserted.volume,
+        quote_volume=stmt.inserted.quote_volume,
+        source=stmt.inserted.source,
+        is_closed=stmt.inserted.is_closed,
+        fetched_at=stmt.inserted.fetched_at,
+        updated_at=stmt.inserted.updated_at,
+    )
+
+    retry_count = 0
+    while True:
+        try:
+            db.execute(stmt)
+            db.commit()
+            if retry_count:
+                logger.debug(
+                    "market_klines_upsert_retry_succeeded symbol=%s interval=%s rows=%s retry_count=%s",
+                    normalized_symbol,
+                    normalized_interval,
+                    len(normalized_items),
+                    retry_count,
+                )
+            return len(normalized_items)
+        except IntegrityError as exc:
+            db.rollback()
+            if _is_duplicate_entry_error(exc):
+                logger.debug(
+                    "market_klines duplicate key ignored after upsert symbol=%s interval=%s",
+                    normalized_symbol,
+                    normalized_interval,
+                )
+                return 0
+            _log_market_klines_upsert_failed(
+                symbol=normalized_symbol,
+                interval=normalized_interval,
+                rows=len(normalized_items),
+                reason=_db_error_reason(exc),
+                integrity=True,
             )
             return 0
-        logger.warning("market_klines upsert integrity failed symbol=%s interval=%s error=%s", normalized_symbol, normalized_interval, exc)
-        return 0
-    except (ProgrammingError, OperationalError) as exc:
-        db.rollback()
-        if _is_missing_table_error(exc):
+        except OperationalError as exc:
+            db.rollback()
+            if _is_missing_table_error(exc):
+                record_error(provider="DB", symbol=normalized_symbol, endpoint="kline_db_upsert", error=exc)
+                logger.warning("market_klines table missing, skip kline db upsert")
+                return 0
+            if _is_mysql_deadlock_error(exc) and retry_count < len(_KLINE_DB_UPSERT_DEADLOCK_BACKOFF_SECONDS):
+                backoff_seconds = _KLINE_DB_UPSERT_DEADLOCK_BACKOFF_SECONDS[retry_count]
+                retry_count += 1
+                time.sleep(backoff_seconds)
+                continue
             record_error(provider="DB", symbol=normalized_symbol, endpoint="kline_db_upsert", error=exc)
-            logger.warning("market_klines table missing, skip kline db upsert")
+            _log_market_klines_upsert_failed(
+                symbol=normalized_symbol,
+                interval=normalized_interval,
+                rows=len(normalized_items),
+                reason=_db_error_reason(exc),
+                retry_count=retry_count,
+            )
             return 0
-        record_error(provider="DB", symbol=normalized_symbol, endpoint="kline_db_upsert", error=exc)
-        logger.warning("market_klines upsert failed symbol=%s interval=%s error=%s", normalized_symbol, normalized_interval, exc)
-        return 0
-    except SQLAlchemyError as exc:
-        db.rollback()
-        record_error(provider="DB", symbol=normalized_symbol, endpoint="kline_db_upsert", error=exc)
-        logger.warning("market_klines upsert failed symbol=%s interval=%s error=%s", normalized_symbol, normalized_interval, exc)
-        return 0
+        except ProgrammingError as exc:
+            db.rollback()
+            if _is_missing_table_error(exc):
+                record_error(provider="DB", symbol=normalized_symbol, endpoint="kline_db_upsert", error=exc)
+                logger.warning("market_klines table missing, skip kline db upsert")
+                return 0
+            record_error(provider="DB", symbol=normalized_symbol, endpoint="kline_db_upsert", error=exc)
+            _log_market_klines_upsert_failed(
+                symbol=normalized_symbol,
+                interval=normalized_interval,
+                rows=len(normalized_items),
+                reason=_db_error_reason(exc),
+                retry_count=retry_count,
+            )
+            return 0
+        except SQLAlchemyError as exc:
+            db.rollback()
+            record_error(provider="DB", symbol=normalized_symbol, endpoint="kline_db_upsert", error=exc)
+            _log_market_klines_upsert_failed(
+                symbol=normalized_symbol,
+                interval=normalized_interval,
+                rows=len(normalized_items),
+                reason=_db_error_reason(exc),
+                retry_count=retry_count,
+            )
+            return 0
 
 
 def get_klines_cache_first(
