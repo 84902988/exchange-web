@@ -103,7 +103,7 @@ const TRADINGVIEW_CHART_STYLE = {
   line: 2,
 } as const;
 const SPOT_INTERVAL_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'];
-const TIME_SHARING_LABEL = '\u5206\u65f6';
+const TIME_SHARING_LABEL = 'Time';
 const TIME_SHARING_KEY = 'time';
 const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
 const SPOT_TV_INITIAL_RIGHT_PADDING_BARS = 4;

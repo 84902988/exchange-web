@@ -9,7 +9,7 @@ import { formatSpotDisplaySymbol } from './spotFormat'
 import { formatSpotPrice } from './spotPricePrecision'
 import {
   resolveSpotMarketStatus,
-  spotMarketStatusBadgeClass,
+  spotMarketStatusDotClass,
 } from './spotMarketStatus'
 
 type Props = {
@@ -114,14 +114,14 @@ export default function SpotTradesHistory({
 
   const { base, quote } = splitSymbol(symbol)
   const hasTrades = data.length > 0
-  const tradesStatus = useMemo(
-    () => resolveSpotMarketStatus({
+  const tradesStatus = resolveSpotMarketStatus(
+    {
       source: tradesSource,
       freshness: tradesFreshness,
       dataSource,
       isLoading,
-    }),
-    [dataSource, isLoading, tradesFreshness, tradesSource],
+    },
+    t,
   )
 
   return (
@@ -129,8 +129,13 @@ export default function SpotTradesHistory({
       <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] bg-[#10151b]/70 px-2.5 py-2">
         <div className="min-w-0 text-[13px] font-medium text-white/88">{t('spotMarketTrades', 'asset')}</div>
         <div className="flex min-w-0 items-center gap-1.5">
-          <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${spotMarketStatusBadgeClass(tradesStatus.kind)}`}>
-            {tradesStatus.label}
+          <span
+            className="inline-flex h-5 max-w-[4.25rem] shrink-0 items-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.025] px-1.5 text-[10px] font-semibold text-white/56"
+            title={tradesStatus.fullLabel}
+            aria-label={tradesStatus.fullLabel}
+          >
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${spotMarketStatusDotClass(tradesStatus.kind)}`} />
+            <span className="min-w-0 truncate">{tradesStatus.compactLabel}</span>
           </span>
           <span className="rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/40">
             {displaySymbol || formatSpotDisplaySymbol(symbol)}

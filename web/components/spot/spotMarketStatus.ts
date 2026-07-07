@@ -7,6 +7,20 @@ export type SpotMarketStatusKind =
   | 'unavailable'
   | 'loading';
 
+export type SpotMarketStatusKey =
+  | 'live'
+  | 'snapshot'
+  | 'fallback'
+  | 'internal'
+  | 'delayed'
+  | 'unavailable'
+  | 'loading';
+
+export type SpotMarketStatusTranslator = (
+  key: string,
+  namespace?: 'asset',
+) => string;
+
 export type SpotMarketStatusInput = {
   source?: string | null;
   freshness?: string | null;
@@ -25,19 +39,73 @@ export type SpotKlineStatusInput = SpotMarketStatusInput & {
 
 export type SpotMarketStatus = {
   kind: SpotMarketStatusKind;
+  statusKey: SpotMarketStatusKey;
   label: string;
+  fullLabel: string;
+  compactLabel: string;
   isAvailable: boolean;
   isFresh: boolean;
 };
 
-const STATUS_LABELS: Record<SpotMarketStatusKind, string> = {
-  live: '实时',
-  snapshot: '快照',
-  fallback: '兜底',
-  internal: '内盘',
-  stale: '延迟',
-  unavailable: '暂不可用',
-  loading: '加载中',
+const STATUS_KEY_BY_KIND: Record<SpotMarketStatusKind, SpotMarketStatusKey> = {
+  live: 'live',
+  snapshot: 'snapshot',
+  fallback: 'fallback',
+  internal: 'internal',
+  stale: 'delayed',
+  unavailable: 'unavailable',
+  loading: 'loading',
+};
+
+const STATUS_LABEL_KEYS: Record<SpotMarketStatusKey, { full: string; compact: string }> = {
+  live: {
+    full: 'spotMarketStatusLive',
+    compact: 'spotMarketStatusLiveCompact',
+  },
+  snapshot: {
+    full: 'spotMarketStatusSnapshot',
+    compact: 'spotMarketStatusSnapshotCompact',
+  },
+  fallback: {
+    full: 'spotMarketStatusFallback',
+    compact: 'spotMarketStatusFallbackCompact',
+  },
+  internal: {
+    full: 'spotMarketStatusInternal',
+    compact: 'spotMarketStatusInternalCompact',
+  },
+  delayed: {
+    full: 'spotMarketStatusDelayed',
+    compact: 'spotMarketStatusDelayedCompact',
+  },
+  unavailable: {
+    full: 'spotMarketStatusUnavailable',
+    compact: 'spotMarketStatusUnavailableCompact',
+  },
+  loading: {
+    full: 'spotMarketStatusLoading',
+    compact: 'spotMarketStatusLoadingCompact',
+  },
+};
+
+const STATUS_FALLBACK_FULL: Record<SpotMarketStatusKey, string> = {
+  live: 'Live',
+  snapshot: 'Snapshot',
+  fallback: 'Fallback',
+  internal: 'Internal',
+  delayed: 'Delayed',
+  unavailable: 'Unavailable',
+  loading: 'Loading',
+};
+
+const STATUS_FALLBACK_COMPACT: Record<SpotMarketStatusKey, string> = {
+  live: 'Live',
+  snapshot: 'Snap',
+  fallback: 'FB',
+  internal: 'INT',
+  delayed: 'Delay',
+  unavailable: 'N/A',
+  loading: 'Load',
 };
 
 const UNAVAILABLE_VALUES = new Set(['MISSING', 'UNAVAILABLE', 'ERROR', 'FAILED', 'NONE', 'NULL']);
@@ -47,11 +115,40 @@ const FALLBACK_VALUES = new Set(['FALLBACK', 'LAST_GOOD', 'LAST_VALID']);
 const SNAPSHOT_VALUES = new Set(['REST', 'REST_SNAPSHOT', 'SNAPSHOT', 'REST_HISTORY', 'HISTORY']);
 const UNKNOWN_VALUES = new Set(['', 'UNKNOWN']);
 
+function translateAssetLabel(
+  translate: SpotMarketStatusTranslator | undefined,
+  key: string,
+  fallback: string,
+): string {
+  const value = translate?.(key, 'asset');
+  return value && value !== key ? value : fallback;
+}
+
+function buildSpotMarketStatus(kind: SpotMarketStatusKind, translate?: SpotMarketStatusTranslator): SpotMarketStatus {
+  const statusKey = STATUS_KEY_BY_KIND[kind];
+  const labelKeys = STATUS_LABEL_KEYS[statusKey];
+  const fullLabel = translateAssetLabel(translate, labelKeys.full, STATUS_FALLBACK_FULL[statusKey]);
+  const compactLabel = translateAssetLabel(translate, labelKeys.compact, STATUS_FALLBACK_COMPACT[statusKey]);
+
+  return {
+    kind,
+    statusKey,
+    label: fullLabel,
+    fullLabel,
+    compactLabel,
+    isAvailable: kind !== 'unavailable' && kind !== 'loading',
+    isFresh: kind === 'live' || kind === 'snapshot' || kind === 'internal',
+  };
+}
+
 export function normalizeSpotMarketStatusValue(value?: string | null): string {
   return String(value || '').trim().toUpperCase();
 }
 
-export function resolveSpotMarketStatus(input: SpotMarketStatusInput): SpotMarketStatus {
+export function resolveSpotMarketStatus(
+  input: SpotMarketStatusInput,
+  translate?: SpotMarketStatusTranslator,
+): SpotMarketStatus {
   const source = normalizeSpotMarketStatusValue(input.source);
   const freshness = normalizeSpotMarketStatusValue(input.freshness);
   const dataSource = normalizeSpotMarketStatusValue(input.dataSource);
@@ -94,12 +191,7 @@ export function resolveSpotMarketStatus(input: SpotMarketStatusInput): SpotMarke
     }
   }
 
-  return {
-    kind,
-    label: STATUS_LABELS[kind],
-    isAvailable: kind !== 'unavailable' && kind !== 'loading',
-    isFresh: kind === 'live' || kind === 'snapshot' || kind === 'internal',
-  };
+  return buildSpotMarketStatus(kind, translate);
 }
 
 export function spotMarketStatusBadgeClass(kind: SpotMarketStatusKind): string {
@@ -122,11 +214,37 @@ export function spotMarketStatusBadgeClass(kind: SpotMarketStatusKind): string {
   }
 }
 
-export function formatSpotStatusBadgeText(input: SpotMarketStatusInput): string {
-  return resolveSpotMarketStatus(input).label;
+export function spotMarketStatusDotClass(kind: SpotMarketStatusKind): string {
+  switch (kind) {
+    case 'live':
+      return 'bg-emerald-300 shadow-[0_0_8px_rgba(110,231,183,0.38)]';
+    case 'snapshot':
+      return 'bg-sky-300';
+    case 'fallback':
+      return 'bg-amber-300';
+    case 'internal':
+      return 'bg-[#f0b90b]';
+    case 'stale':
+      return 'bg-orange-300';
+    case 'loading':
+      return 'bg-white/36';
+    case 'unavailable':
+    default:
+      return 'bg-white/22';
+  }
 }
 
-export function resolveSpotKlineStatus(input: SpotKlineStatusInput): SpotMarketStatus {
+export function formatSpotStatusBadgeText(
+  input: SpotMarketStatusInput,
+  translate?: SpotMarketStatusTranslator,
+): string {
+  return resolveSpotMarketStatus(input, translate).compactLabel;
+}
+
+export function resolveSpotKlineStatus(
+  input: SpotKlineStatusInput,
+  translate?: SpotMarketStatusTranslator,
+): SpotMarketStatus {
   const source = normalizeSpotMarketStatusValue(input.source);
   const freshness = normalizeSpotMarketStatusValue(input.freshness);
   const dataSource = normalizeSpotMarketStatusValue(input.dataSource);
@@ -139,61 +257,47 @@ export function resolveSpotKlineStatus(input: SpotKlineStatusInput): SpotMarketS
     nowMs - realtimeUpdatedAtMs <= (Number.isFinite(realtimeGraceMs) && realtimeGraceMs > 0 ? realtimeGraceMs : 30_000);
 
   if (INTERNAL_VALUES.has(source) || INTERNAL_VALUES.has(freshness) || INTERNAL_VALUES.has(dataSource)) {
-    return resolveSpotMarketStatus(input);
+    return resolveSpotMarketStatus(input, translate);
   }
 
   if (hasRecentRealtime) {
-    return {
-      kind: 'live',
-      label: STATUS_LABELS.live,
-      isAvailable: true,
-      isFresh: true,
-    };
+    return buildSpotMarketStatus('live', translate);
   }
 
   if (input.loadState === 'loaded') {
-    return {
-      kind: 'snapshot',
-      label: STATUS_LABELS.snapshot,
-      isAvailable: true,
-      isFresh: true,
-    };
+    return buildSpotMarketStatus('snapshot', translate);
   }
 
   if (input.loadState === 'loading' || input.isLoading) {
-    return {
-      kind: 'loading',
-      label: STATUS_LABELS.loading,
-      isAvailable: false,
-      isFresh: false,
-    };
+    return buildSpotMarketStatus('loading', translate);
   }
 
   if (input.loadState === 'empty' || input.loadState === 'error') {
-    return {
-      kind: 'unavailable',
-      label: STATUS_LABELS.unavailable,
-      isAvailable: false,
-      isFresh: false,
-    };
+    return buildSpotMarketStatus('unavailable', translate);
   }
 
   if (UNKNOWN_VALUES.has(source) && UNKNOWN_VALUES.has(freshness)) {
-    return {
-      kind: 'unavailable',
-      label: STATUS_LABELS.unavailable,
-      isAvailable: false,
-      isFresh: false,
-    };
+    return buildSpotMarketStatus('unavailable', translate);
   }
 
-  return resolveSpotMarketStatus(input);
+  return resolveSpotMarketStatus(input, translate);
 }
 
-export function getSpotBboBasisLabel(side: 'buy' | 'sell'): string {
-  return side === 'buy' ? '价格依据：盘口卖一' : '价格依据：盘口买一';
+export function getSpotBboBasisLabel(
+  side: 'buy' | 'sell',
+  translate?: SpotMarketStatusTranslator,
+): string {
+  return side === 'buy'
+    ? translateAssetLabel(translate, 'spotBboBasisBuy', 'Price basis: best ask')
+    : translateAssetLabel(translate, 'spotBboBasisSell', 'Price basis: best bid');
 }
 
-export function getSpotBboAvailabilityLabel(status: SpotMarketStatus, hasBboPrice: boolean): string {
-  return status.isFresh && hasBboPrice ? '可用' : '暂不可用';
+export function getSpotBboAvailabilityLabel(
+  status: SpotMarketStatus,
+  hasBboPrice: boolean,
+  translate?: SpotMarketStatusTranslator,
+): string {
+  return status.isFresh && hasBboPrice
+    ? translateAssetLabel(translate, 'spotBboAvailable', 'Available')
+    : translateAssetLabel(translate, 'spotBboUnavailable', 'Unavailable');
 }
