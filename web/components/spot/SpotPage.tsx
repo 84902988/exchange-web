@@ -1475,7 +1475,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           }
         />
 
-        <div className="mt-2 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,8.6fr)_minmax(240px,1.95fr)_minmax(260px,1.85fr)] xl:grid-rows-[minmax(540px,62vh)_minmax(170px,auto)] xl:items-stretch">
+        <div className="mt-2 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,8.6fr)_minmax(240px,1.95fr)_minmax(260px,1.85fr)] xl:grid-rows-[minmax(max(540px,62vh),auto)_minmax(170px,auto)] xl:items-stretch">
           <div className="min-h-[420px] min-w-0 xl:col-start-1 xl:row-start-1 xl:min-h-0">
             <div className="flex h-full min-h-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
               <div className="min-h-0 flex-1">
@@ -1580,7 +1580,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           </div>
 
           <div className="min-h-[420px] min-w-0 xl:col-start-3 xl:row-start-1 xl:min-h-0">
-            <div className="relative flex h-full min-h-0 flex-col overflow-y-auto border border-white/10 bg-[#12161c] p-1.5 xl:p-2">
+            <div className="relative flex min-h-[420px] flex-col overflow-visible border border-white/10 bg-[#12161c] p-1.5 xl:min-h-[max(540px,62vh)] xl:p-2 [@media(max-height:850px)]:xl:min-h-0 [@media(max-height:850px)]:xl:p-1.5">
               <SpotTradingForm
                 symbol={symbol}
                 baseAsset={spotAssetSymbols.baseAsset}

@@ -22,7 +22,7 @@ import {
   getSpotBboAvailabilityLabel,
   getSpotBboBasisLabel,
   resolveSpotMarketStatus,
-  spotMarketStatusBadgeClass,
+  spotMarketStatusDotClass,
 } from './spotMarketStatus';
 import {
   getSpotPriceStep,
@@ -1591,17 +1591,17 @@ export default function SpotTradingForm({
 
   const bboPrice = marketDataLoading ? '' : side === 'buy' ? bestAskPrice : bestBidPrice;
   const bboDisabled = marketDataLoading || !bboPrice;
-  const bboStatus = useMemo(
-    () => resolveSpotMarketStatus({
+  const bboStatus = resolveSpotMarketStatus(
+    {
       source: depthSource,
       freshness: depthFreshness,
       dataSource,
       isLoading: marketDataLoading,
-    }),
-    [dataSource, depthFreshness, depthSource, marketDataLoading],
+    },
+    localeT,
   );
-  const bboBasisLabel = getSpotBboBasisLabel(side);
-  const bboAvailabilityLabel = getSpotBboAvailabilityLabel(bboStatus, Boolean(bboPrice));
+  const bboBasisLabel = getSpotBboBasisLabel(side, localeT);
+  const bboAvailabilityLabel = getSpotBboAvailabilityLabel(bboStatus, Boolean(bboPrice), localeT);
   const latestTradePriceDisplay =
     latestTradePrice !== null && latestTradePrice !== undefined && String(latestTradePrice).trim() !== ''
       ? String(latestTradePrice)
@@ -1829,17 +1829,15 @@ export default function SpotTradingForm({
   }
 
   return (
-    <div className="tabular-nums space-y-1 xl:space-y-1.5">
+    <div className="tabular-nums space-y-2.5 xl:space-y-3 [@media(max-height:850px)]:space-y-1.5">
       <div
-        className={
-          isLoggedIn || isAuthChecking ? '' : 'opacity-50'
-        }
+        className={`${isLoggedIn || isAuthChecking ? '' : 'opacity-50'} space-y-2.5 xl:space-y-3 [@media(max-height:850px)]:space-y-1.5`}
       >
-        <div className="grid grid-cols-2 rounded-xl border border-white/[0.06] bg-[#0b1016] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] xl:p-1">
+        <div className="grid grid-cols-2 rounded-xl border border-white/[0.06] bg-[#0b1016] p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] [@media(max-height:850px)]:p-0.5">
         <button
           type="button"
           onClick={() => setSide('buy')}
-          className={`rounded-lg py-1 text-[14px] font-semibold transition-all xl:py-1.5 ${
+          className={`rounded-lg py-1.5 text-[14px] font-semibold transition-all xl:py-2 [@media(max-height:850px)]:py-1.5 ${
             side === 'buy'
               ? 'bg-[#16a34a] text-white shadow-[0_10px_24px_rgba(22,163,74,0.22)]'
               : 'text-white/46 hover:text-white/78'
@@ -1850,7 +1848,7 @@ export default function SpotTradingForm({
         <button
           type="button"
           onClick={() => setSide('sell')}
-          className={`rounded-lg py-1 text-[14px] font-semibold transition-all xl:py-1.5 ${
+          className={`rounded-lg py-1.5 text-[14px] font-semibold transition-all xl:py-2 [@media(max-height:850px)]:py-1.5 ${
             side === 'sell'
               ? 'bg-[#dc2626] text-white shadow-[0_10px_24px_rgba(220,38,38,0.22)]'
               : 'text-white/46 hover:text-white/78'
@@ -1860,11 +1858,11 @@ export default function SpotTradingForm({
         </button>
         </div>
 
-        <div className="inline-flex rounded-lg border border-white/[0.05] bg-white/[0.03] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
+        <div className="inline-flex rounded-lg border border-white/[0.05] bg-white/[0.03] p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] [@media(max-height:850px)]:p-0.5">
           <button
             type="button"
             onClick={() => setOrderType('limit')}
-            className={`rounded-md px-2.5 py-0.5 text-[12px] font-medium transition-colors xl:px-3 xl:py-1 ${
+            className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors xl:px-3.5 xl:py-1.5 [@media(max-height:850px)]:px-2.5 [@media(max-height:850px)]:py-0.5 ${
               orderType === 'limit'
                 ? 'bg-white/[0.08] text-white'
                 : 'text-white/44 hover:text-white/72'
@@ -1875,7 +1873,7 @@ export default function SpotTradingForm({
           <button
             type="button"
             onClick={() => setOrderType('market')}
-            className={`rounded-md px-2.5 py-0.5 text-[12px] font-medium transition-colors xl:px-3 xl:py-1 ${
+            className={`rounded-md px-3 py-1 text-[12px] font-medium transition-colors xl:px-3.5 xl:py-1.5 [@media(max-height:850px)]:px-2.5 [@media(max-height:850px)]:py-0.5 ${
               orderType === 'market'
                 ? 'bg-white/[0.08] text-white'
                 : 'text-white/44 hover:text-white/72'
@@ -1885,20 +1883,25 @@ export default function SpotTradingForm({
           </button>
         </div>
 
-        <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] px-2.5 py-2 text-[11px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
+        <div className="rounded-lg border border-white/[0.06] bg-[#0b1016] px-3 py-2.5 text-[11px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] [@media(max-height:850px)]:px-2.5 [@media(max-height:850px)]:py-1.5">
           <div className="flex min-w-0 items-center justify-between gap-2">
             <span className="min-w-0 truncate text-white/46">{bboBasisLabel}</span>
-            <span className={`shrink-0 rounded-full border px-2 py-0.5 font-semibold ${spotMarketStatusBadgeClass(bboStatus.kind)}`}>
-              {bboStatus.label}
+            <span
+              className="inline-flex h-5 max-w-[4.25rem] shrink-0 items-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.025] px-1.5 text-[10px] font-semibold text-white/56"
+              title={bboStatus.fullLabel}
+              aria-label={bboStatus.fullLabel}
+            >
+              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${spotMarketStatusDotClass(bboStatus.kind)}`} />
+              <span className="min-w-0 truncate">{bboStatus.compactLabel}</span>
             </span>
           </div>
-          <div className="mt-1 flex min-w-0 items-center justify-between gap-2 text-white/36">
+          <div className="mt-1 flex min-w-0 items-center justify-between gap-2 text-white/36 [@media(max-height:850px)]:mt-0.5">
             <span className="min-w-0 truncate">{bboPrice || '--'}</span>
             <span className={bboStatus.isFresh && bboPrice ? 'text-emerald-200/78' : 'text-white/34'}>
               {bboAvailabilityLabel}
             </span>
           </div>
-          <div className="mt-1 flex min-w-0 items-center justify-between gap-2 text-white/36">
+          <div className="mt-1 flex min-w-0 items-center justify-between gap-2 text-white/36 [@media(max-height:850px)]:mt-0.5">
             <span className="min-w-0 truncate">{LATEST_TRADE_LABEL}</span>
             <span className="min-w-0 truncate text-right text-white/62">
               {latestTradePriceDisplay}
@@ -1909,10 +1912,10 @@ export default function SpotTradingForm({
           </div>
         </div>
 
-        <div className="space-y-2.5 xl:space-y-3">
+        <div className="space-y-3 xl:space-y-3.5 [@media(max-height:850px)]:space-y-1.5">
           {showPriceInput ? (
             <div>
-              <div className="mb-1 text-[11px] text-gray-400 xl:mb-1.5">
+              <div className="mb-1 text-[11px] text-gray-400">
                 {copy.price} ({quoteAsset || 'USDT'})
               </div>
 
@@ -1923,7 +1926,7 @@ export default function SpotTradingForm({
                   onChange={(e) => handlePriceInputChange(e.target.value)}
                   onBlur={handlePriceBlur}
                   inputMode="decimal"
-                  className="w-full rounded-xl border border-white/[0.08] bg-[#0d1218] px-3 py-1.5 pr-10 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2"
+                  className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 pr-10 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2.5 [@media(max-height:850px)]:py-1.5"
                   placeholder={side === 'buy' ? copy.enterBuyPrice : copy.enterSellPrice}
                 />
 
@@ -1956,7 +1959,7 @@ export default function SpotTradingForm({
                 onClick={handleBboClick}
                 disabled={bboDisabled}
                 title={copy.bboTooltip}
-                className={`shrink-0 rounded-xl border px-3 text-[11px] font-semibold shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] transition-colors ${
+                className={`shrink-0 rounded-lg border px-3 text-[11px] font-semibold shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] transition-colors ${
                   bboDisabled
                     ? 'cursor-not-allowed border-white/[0.06] bg-white/[0.02] text-white/24'
                     : 'border-white/[0.08] bg-[#0d1218] text-white/70 hover:border-white/[0.16] hover:bg-[#121922] hover:text-white'
@@ -1972,10 +1975,10 @@ export default function SpotTradingForm({
           </div>
         ) : (
           <div>
-            <div className="mb-1 text-[11px] text-gray-400 xl:mb-1.5">
+            <div className="mb-1 text-[11px] text-gray-400">
               {copy.price} ({quoteAsset || 'USDT'})
             </div>
-            <div className="w-full rounded-xl border border-white/[0.08] bg-[#0d1218] px-3 py-1.5 text-[12px] text-white/34 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] xl:py-2">
+            <div className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 text-[12px] text-white/34 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] xl:py-2.5 [@media(max-height:850px)]:py-1.5">
               {copy.marketByBook}
             </div>
           </div>
@@ -1983,7 +1986,7 @@ export default function SpotTradingForm({
 
         {showAmountInput ? (
           <div>
-            <div className="mb-1 text-[11px] text-gray-400 xl:mb-1.5">
+            <div className="mb-1 text-[11px] text-gray-400">
               {amountInputLabel} ({amountInputUnit})
             </div>
             <input
@@ -1991,7 +1994,7 @@ export default function SpotTradingForm({
               onChange={(e) => handleAmountChange(e.target.value)}
               onBlur={handleAmountBlur}
               inputMode="decimal"
-              className="w-full rounded-xl border border-white/[0.08] bg-[#0d1218] px-3 py-1.5 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2"
+              className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2.5 [@media(max-height:850px)]:py-1.5"
               placeholder={formatCopy(copy.enterAmountWithAsset, { asset: amountInputUnit })}
             />
             {amountError ? (
@@ -2002,7 +2005,7 @@ export default function SpotTradingForm({
 
         {showQuoteAmountInput ? (
           <div>
-            <div className="mb-1 text-[11px] text-gray-400 xl:mb-1.5">
+            <div className="mb-1 text-[11px] text-gray-400">
               {copy.buyAmount} ({quoteAmountInputUnit})
             </div>
             <input
@@ -2010,7 +2013,7 @@ export default function SpotTradingForm({
               onChange={(e) => handleQuoteAmountChange(e.target.value)}
               onBlur={handleQuoteAmountBlur}
               inputMode="decimal"
-              className="w-full rounded-xl border border-white/[0.08] bg-[#0d1218] px-3 py-1.5 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2"
+              className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2.5 [@media(max-height:850px)]:py-1.5"
               placeholder={formatCopy(copy.enterBuyAmountWithAsset, { asset: quoteAmountInputUnit })}
             />
             {quoteAmountError ? (
@@ -2019,20 +2022,22 @@ export default function SpotTradingForm({
           </div>
         ) : null}
 
-        <PercentageSlider
-          value={sliderValue}
-          side={side}
-          onChange={handleSliderChange}
-        />
+        <div className="py-0.5 xl:py-1 [@media(max-height:850px)]:py-0">
+          <PercentageSlider
+            value={sliderValue}
+            side={side}
+            onChange={handleSliderChange}
+          />
+        </div>
 
-        <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] p-2 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] xl:p-2.5">
+        <div className="rounded-lg border border-white/[0.06] bg-[#0b1016] p-3 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] [@media(max-height:850px)]:p-2">
           {summaryRows.map((row, index) => (
             <div
               key={row.key}
               className={`${
                 index === summaryRows.length - 1
                   ? 'flex items-center justify-between gap-2'
-                  : 'mb-1 flex items-center justify-between gap-2'
+                  : 'mb-2 flex items-center justify-between gap-2 [@media(max-height:850px)]:mb-1'
               }`}
             >
               <span className="min-w-0 shrink-0 text-white/42">{row.label}</span>
@@ -2040,7 +2045,7 @@ export default function SpotTradingForm({
             </div>
           ))}
           <div
-            className={`mt-2 rounded-lg border px-2.5 py-2 text-[11px] leading-snug ${
+            className={`mt-2 rounded-lg border px-2.5 py-2 text-[11px] leading-snug [@media(max-height:850px)]:mt-1.5 [@media(max-height:850px)]:px-2 [@media(max-height:850px)]:py-1.5 [@media(max-height:850px)]:text-[10px] [@media(max-height:850px)]:leading-tight ${
               displayedFeeHintTone === 'success'
                 ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-100'
                 : displayedFeeHintTone === 'warning'
@@ -2076,7 +2081,7 @@ export default function SpotTradingForm({
             </div>
             {displayedFeeHintDetails.length > 0 ? (
               <div
-                className={`mt-2 space-y-0.5 whitespace-normal break-words ${
+                className={`mt-2 space-y-1 whitespace-normal break-words [@media(max-height:850px)]:hidden ${
                   displayedFeeHintTone === 'success'
                     ? 'text-emerald-200/70'
                     : displayedFeeHintTone === 'warning'
@@ -2095,19 +2100,19 @@ export default function SpotTradingForm({
           {isLoggedIn || isAuthChecking ? (
             <>
               {submitError ? (
-                <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-2 py-1 text-[12px] text-red-400 xl:px-2.5 xl:py-1.5">
+                <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-2 py-1 text-[12px] text-red-400">
                   {submitError}
                 </div>
               ) : null}
 
               {!submitError && liquidityError ? (
-                <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-2 py-1 text-[12px] text-red-400 xl:px-2.5 xl:py-1.5">
+                <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-2 py-1 text-[12px] text-red-400">
                   {liquidityError}
                 </div>
               ) : null}
 
               {successMessage ? (
-                <div className="rounded-xl border border-green-500/20 bg-green-500/10 px-2 py-1 text-[12px] text-green-400 xl:px-2.5 xl:py-1.5">
+                <div className="rounded-lg border border-green-500/20 bg-green-500/10 px-2 py-1 text-[12px] text-green-400">
                   {successMessage}
                 </div>
               ) : null}
@@ -2116,7 +2121,7 @@ export default function SpotTradingForm({
                 type="button"
                 disabled={submitDisabled}
                 onClick={handleSubmit}
-                className={`w-full rounded-xl py-2.5 text-[14px] font-semibold tracking-wide text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-all xl:py-3 ${
+                className={`w-full rounded-lg py-2.5 text-[14px] font-semibold tracking-wide text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-all xl:py-3 [@media(max-height:850px)]:py-2 ${
                   side === 'buy'
                     ? 'bg-gradient-to-b from-[#22c55e] to-[#16a34a] hover:from-[#22c55e] hover:to-[#15803d]'
                     : 'bg-gradient-to-b from-[#ef4444] to-[#dc2626] hover:from-[#ef4444] hover:to-[#b91c1c]'
@@ -2130,16 +2135,16 @@ export default function SpotTradingForm({
       </div>
 
       {!isLoggedIn && !isAuthChecking ? (
-        <div className="mt-2 flex flex-col gap-2">
+        <div className="mt-3 flex flex-col gap-2.5 [@media(max-height:850px)]:mt-1.5 [@media(max-height:850px)]:gap-1.5">
           <Link
             href="/login?redirect=/trade/spot"
-            className="w-full rounded-xl border border-white/10 bg-white/5 py-2 text-center text-[13px] font-semibold text-white hover:bg-white/10 transition-colors"
+            className="w-full rounded-lg border border-white/10 bg-white/5 py-2.5 text-center text-[13px] font-semibold text-white hover:bg-white/10 transition-colors [@media(max-height:850px)]:py-1.5"
           >
             {copy.login}
           </Link>
           <Link
             href="/register?redirect=/trade/spot"
-            className="w-full rounded-xl bg-white text-center text-[13px] font-semibold text-black py-2 hover:bg-white/90 transition-colors"
+            className="w-full rounded-lg bg-white text-center text-[13px] font-semibold text-black py-2.5 hover:bg-white/90 transition-colors [@media(max-height:850px)]:py-1.5"
           >
             {copy.register}
           </Link>

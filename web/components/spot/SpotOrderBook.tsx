@@ -14,7 +14,7 @@ import {
 } from './spotTickerColor';
 import {
   resolveSpotMarketStatus,
-  spotMarketStatusBadgeClass,
+  spotMarketStatusDotClass,
 } from './spotMarketStatus';
 
 type SpotOrderBookProps = {
@@ -116,14 +116,14 @@ export default function SpotOrderBook({
 
   const hasDepth = askRows.length > 0 || bidRows.length > 0;
   const referencePriceClass = getTickerDirectionTextClass(priceDirection);
-  const depthStatus = useMemo(
-    () => resolveSpotMarketStatus({
+  const depthStatus = resolveSpotMarketStatus(
+    {
       source: depthSource,
       freshness: depthFreshness,
       dataSource,
       isLoading,
-    }),
-    [dataSource, depthFreshness, depthSource, isLoading],
+    },
+    t,
   );
 
   return (
@@ -131,8 +131,13 @@ export default function SpotOrderBook({
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="min-w-0 text-[13px] font-medium text-white/88">{t('spotOrderBook', 'asset')}</div>
         <div className="flex min-w-0 items-center gap-1.5">
-          <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${spotMarketStatusBadgeClass(depthStatus.kind)}`}>
-            {depthStatus.label}
+          <span
+            className="inline-flex h-5 max-w-[4.25rem] shrink-0 items-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.025] px-1.5 text-[10px] font-semibold text-white/56"
+            title={depthStatus.fullLabel}
+            aria-label={depthStatus.fullLabel}
+          >
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${spotMarketStatusDotClass(depthStatus.kind)}`} />
+            <span className="min-w-0 truncate">{depthStatus.compactLabel}</span>
           </span>
           <span className="rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/42">
             {displaySymbol || formatSpotDisplaySymbol(symbol)}
