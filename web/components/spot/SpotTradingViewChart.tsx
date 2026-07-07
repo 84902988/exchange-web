@@ -72,8 +72,10 @@ type TradingViewLoadError = {
 
 type SpotTradingViewChartProps = SpotChartProps & {
   chartMode?: 'time' | 'candle';
+  intervalSwitchLoading?: boolean;
   onIntervalChange?: (value: string) => void;
   onChartModeChange?: (value: 'time' | 'candle') => void;
+  onIntervalSwitchLoadComplete?: () => void;
 };
 
 type SpotTradingViewWindow = Window & {
@@ -106,6 +108,7 @@ const TIME_SHARING_KEY = 'time';
 const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
 const SPOT_TV_INITIAL_RIGHT_PADDING_BARS = 4;
 const SPOT_TV_INITIAL_VISIBLE_RANGE_DELAY_MS = 80;
+const SPOT_TV_LOADING_MIN_VISIBLE_MS = 220;
 const SPOT_TV_RESOLUTION_KLINE_OWNER_PREFIX = 'spot-tradingview-chart-resolution';
 const SPOT_TV_INITIAL_VISIBLE_BARS: Record<string, number> = {
   '1m': 75,
@@ -276,9 +279,12 @@ export default function SpotTradingViewChart({
   height = 520,
   pricePrecision,
   amountPrecision,
+  isLoading: marketDataLoading = false,
   chartMode = 'candle',
+  intervalSwitchLoading = false,
   onIntervalChange,
   onChartModeChange,
+  onIntervalSwitchLoadComplete,
 }: SpotTradingViewChartProps) {
   const { locale, t } = useLocaleContext();
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -300,9 +306,12 @@ export default function SpotTradingViewChart({
   const recentVisibleRangeEventsRef = useRef<Map<string, SpotRecentVisibleRangeEvent>>(new Map());
   const preloadManagerRef = useRef<SpotKlinePreloadManager | null>(null);
   const toolbarButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const chartLoadingSeqRef = useRef(0);
+  const chartLoadingStartedAtRef = useRef(0);
   const [loadError, setLoadError] = useState<TradingViewLoadError | null>(null);
   const [scriptReady, setScriptReady] = useState(false);
   const [resolutionFallbackNonce, setResolutionFallbackNonce] = useState(0);
+  const [chartLoadingReason, setChartLoadingReason] = useState<string>('initial');
   const reactId = useId();
   const containerId = useMemo(
     () => `spot-tv-chart-${reactId.replace(/[^a-zA-Z0-9_-]/g, '')}`,
@@ -320,6 +329,35 @@ export default function SpotTradingViewChart({
   const widgetKey = `${normalizedSymbol}:${chartMode}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}:${resolutionFallbackNonce}`;
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
+  const showChartLoading = Boolean(chartLoadingReason || marketDataLoading || intervalSwitchLoading) && !activeLoadError;
+
+  const startChartLoading = useCallback((reason: string) => {
+    chartLoadingSeqRef.current += 1;
+    chartLoadingStartedAtRef.current = getSpotChartPerfNow();
+    setChartLoadingReason(reason);
+  }, []);
+
+  const finishChartLoading = useCallback((reason: string) => {
+    const loadingSeq = chartLoadingSeqRef.current;
+    const elapsedMs = Math.max(0, getSpotChartPerfNow() - chartLoadingStartedAtRef.current);
+    const finishDelayMs = Math.max(0, SPOT_TV_LOADING_MIN_VISIBLE_MS - elapsedMs);
+    markSpotKlinePerf('chart_loading_end', {
+      symbol: normalizedSymbolRef.current,
+      interval: activeIntervalRef.current,
+      resolution: widgetIntervalRef.current,
+      reason,
+      duration_ms: elapsedMs,
+      finish_delay_ms: finishDelayMs,
+    });
+    window.setTimeout(() => window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (chartLoadingSeqRef.current === loadingSeq) {
+          setChartLoadingReason('');
+          onIntervalSwitchLoadComplete?.();
+        }
+      });
+    }), finishDelayMs);
+  }, [onIntervalSwitchLoadComplete]);
 
   const getPreloadManager = useCallback(() => {
     if (!preloadManagerRef.current) {
@@ -510,6 +548,7 @@ export default function SpotTradingViewChart({
         backendInterval,
         updatedAt: Date.now(),
       };
+      finishChartLoading('history-bars');
       recentVisibleRangeEventsRef.current.set(
         buildVisibleRangeSnapshotKey(activeSymbol, backendInterval),
         recentVisibleRangeEvent,
@@ -752,7 +791,7 @@ export default function SpotTradingViewChart({
         });
       }, SPOT_TV_INITIAL_VISIBLE_RANGE_DELAY_MS);
     },
-    [scheduleKlinePreload],
+    [finishChartLoading, scheduleKlinePreload],
   );
 
   const resetInitialVisibleRangeIntent = useCallback(() => {
@@ -819,6 +858,7 @@ export default function SpotTradingViewChart({
       if (!nextResolution) return;
 
       const activeIntervalValue = activeIntervalRef.current;
+      startChartLoading('resolution-change');
       markSpotKlinePerf('apply_resolution_start', {
         symbol: normalizedSymbolRef.current,
         interval: activeIntervalValue,
@@ -844,6 +884,7 @@ export default function SpotTradingViewChart({
         updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, activeIntervalRef.current);
         syncKlineIntervalAfterResolutionCommit('already_current_resolution');
         applyRecentVisibleRangeAfterResolutionCommit('already_current_resolution');
+        finishChartLoading('already-current-resolution');
         markSpotKlinePerf('set_resolution_data_ready', {
           symbol: normalizedSymbolRef.current,
           interval: activeIntervalValue,
@@ -891,6 +932,7 @@ export default function SpotTradingViewChart({
           resolutionRequestId,
           duration_ms: durationMs,
         });
+        finishChartLoading('resolution-data-ready');
         syncKlineIntervalAfterResolutionCommit('resolution_commit');
         const pendingInitialRange = pendingInitialVisibleRangeRef.current;
         if (pendingInitialRange) {
@@ -959,8 +1001,10 @@ export default function SpotTradingViewChart({
     [
       applyInitialVisibleRangeFromHistory,
       applyRecentVisibleRangeAfterResolutionCommit,
+      finishChartLoading,
       requestResolutionFallbackRebuild,
       resetInitialVisibleRangeIntent,
+      startChartLoading,
       syncKlineIntervalAfterResolutionCommit,
     ],
   );
@@ -1033,6 +1077,11 @@ export default function SpotTradingViewChart({
       debugEnabled: isSpotTradingViewDebugEnabled(),
     });
     datafeedRef.current = datafeed;
+    const widgetBuildLoadingTimer = window.setTimeout(() => {
+      if (!cancelled) {
+        startChartLoading('widget-build');
+      }
+    }, 0);
 
     const widget = new tradingView.widget({
       autosize: true,
@@ -1152,10 +1201,16 @@ export default function SpotTradingViewChart({
       };
 
       makeButton(TIME_SHARING_KEY, TIME_SHARING_LABEL, () => {
+        if (chartModeRef.current !== 'time') {
+          startChartLoading('toolbar-mode-change');
+        }
         onChartModeChange?.('time');
       });
       SPOT_INTERVAL_OPTIONS.forEach((item) => {
         makeButton(item, formatIntervalLabel(item), () => {
+          if (chartModeRef.current !== 'candle' || activeIntervalRef.current !== item) {
+            startChartLoading('toolbar-interval-click');
+          }
           if (chartModeRef.current !== 'candle') {
             onChartModeChange?.('candle');
           }
@@ -1172,6 +1227,7 @@ export default function SpotTradingViewChart({
 
     return () => {
       cancelled = true;
+      window.clearTimeout(widgetBuildLoadingTimer);
       cleanupWidget();
     };
   }, [
@@ -1189,6 +1245,7 @@ export default function SpotTradingViewChart({
     pricePrecision,
     releaseResolutionKlineInterval,
     scriptReady,
+    startChartLoading,
     widgetKey,
     widgetStyle,
   ]);
@@ -1205,6 +1262,16 @@ export default function SpotTradingViewChart({
       window.clearTimeout(timer);
     };
   }, [activeInterval, applyWidgetResolution, chartMode, widgetInterval]);
+
+  useEffect(() => {
+    if (!chartLoadingReason) return undefined;
+
+    const timer = window.setTimeout(() => {
+      finishChartLoading('safety-timeout');
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, [chartLoadingReason, finishChartLoading]);
 
   return (
     <div className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]" style={{ minHeight: height }}>
@@ -1228,6 +1295,27 @@ export default function SpotTradingViewChart({
       {activeLoadError ? (
         <div className="absolute inset-0 flex items-center justify-center bg-[#12161c] px-4 text-center text-sm text-[#f6465d]">
           {t('spotChartLoadFailed', 'asset')}: {activeLoadError}
+        </div>
+      ) : null}
+      {showChartLoading ? (
+        <div
+          className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-[#12161c]/75"
+          style={{
+            backgroundImage:
+              'linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px)',
+            backgroundSize: '80px 58px',
+          }}
+          aria-hidden="true"
+        >
+          <div className="flex items-center gap-2 rounded-full border border-white/[0.06] bg-[#0b0e11]/55 px-4 py-3 shadow-[0_18px_50px_rgba(0,0,0,0.36)]">
+            {[0, 1, 2, 3].map((item) => (
+              <span
+                key={item}
+                className="h-2 w-2 animate-bounce rounded-full bg-[#f0b90b] shadow-[0_0_14px_rgba(240,185,11,0.72)]"
+                style={{ animationDelay: `${item * 110}ms` }}
+              />
+            ))}
+          </div>
         </div>
       ) : null}
     </div>
