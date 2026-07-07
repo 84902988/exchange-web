@@ -136,6 +136,13 @@ type SpotTradingViewDatafeed = {
     onResetCacheNeeded?: () => void,
   ) => void;
   unsubscribeBars: (subscriberUid: string) => void;
+  getActiveRealtimeIntervals: () => string[];
+  syncRealtimeKlineSubscription: (interval: string, reason?: string) => {
+    previousIntervals: string[];
+    activeIntervals: string[];
+    droppedIntervals: string[];
+    changed: boolean;
+  };
   destroy: () => void;
 };
 
@@ -1167,6 +1174,7 @@ export function createSpotTradingViewDatafeed(
   const realtimeOwner = `tradingview:${apiSymbol}:${++spotTradingViewDatafeedInstanceSeq}`;
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
+  const activeRealtimeIntervalByUid = new Map<string, string>();
   const lastEmittedBarTimeByUid = new Map<string, number>();
   const lastDroppedRealtimeBarByUid = new Map<string, string>();
   const activeSubscriptionKeyByUid = new Map<string, string>();
@@ -1179,6 +1187,20 @@ export function createSpotTradingViewDatafeed(
 
   const getSubscriptionKey = (interval: string, subscriberUid: string) =>
     `${apiSymbol}:${interval}:${subscriberUid}`;
+
+  const clearRealtimeSubscriberState = (subscriberUid: string) => {
+    const latestBarKey = latestBarKeyByUid.get(subscriberUid);
+    if (latestBarKey) {
+      latestBars.delete(latestBarKey);
+      historyReadyByLatestBarKey.delete(latestBarKey);
+      historyRequestSeqByLatestBarKey.delete(latestBarKey);
+    }
+    lastEmittedBarTimeByUid.delete(subscriberUid);
+    lastDroppedRealtimeBarByUid.delete(subscriberUid);
+    latestBarKeyByUid.delete(subscriberUid);
+    activeRealtimeIntervalByUid.delete(subscriberUid);
+    activeSubscriptionKeyByUid.delete(subscriberUid);
+  };
 
   const syncLastEmittedAfterHistory = (latestBarKey: string, latestBarTime: number) => {
     if (!latestBarTime) return;
@@ -1896,6 +1918,7 @@ export function createSpotTradingViewDatafeed(
         historyReadyByLatestBarKey.set(latestBarKey, false);
       }
       activeSubscriptionKeyByUid.set(subscriberUid, subscriptionKey);
+      activeRealtimeIntervalByUid.set(subscriberUid, interval);
       lastEmittedBarTimeByUid.set(
         subscriberUid,
         Math.max(latestBars.get(latestBarKey)?.time || 0, getRealtimeHighWaterMark(latestBarKey)),
@@ -2017,16 +2040,61 @@ export function createSpotTradingViewDatafeed(
       const unsubscribe = unsubscribeByUid.get(subscriberUid);
       unsubscribe?.();
       unsubscribeByUid.delete(subscriberUid);
-      const latestBarKey = latestBarKeyByUid.get(subscriberUid);
-      if (latestBarKey) {
-        latestBars.delete(latestBarKey);
-        historyReadyByLatestBarKey.delete(latestBarKey);
-        historyRequestSeqByLatestBarKey.delete(latestBarKey);
+      clearRealtimeSubscriberState(subscriberUid);
+    },
+
+    getActiveRealtimeIntervals() {
+      return Array.from(new Set(activeRealtimeIntervalByUid.values()));
+    },
+
+    syncRealtimeKlineSubscription(interval, reason = 'external realtime owner sync') {
+      const normalizedInterval = normalizeSpotInterval(interval);
+      const previousIntervals = Array.from(new Set(activeRealtimeIntervalByUid.values()));
+      const droppedIntervals: string[] = [];
+
+      for (const [subscriberUid, activeInterval] of Array.from(activeRealtimeIntervalByUid.entries())) {
+        if (activeInterval === normalizedInterval) continue;
+
+        const unsubscribe = unsubscribeByUid.get(subscriberUid);
+        unsubscribe?.();
+        unsubscribeByUid.delete(subscriberUid);
+        clearRealtimeSubscriberState(subscriberUid);
+        if (!droppedIntervals.includes(activeInterval)) {
+          droppedIntervals.push(activeInterval);
+        }
       }
-      lastEmittedBarTimeByUid.delete(subscriberUid);
-      lastDroppedRealtimeBarByUid.delete(subscriberUid);
-      latestBarKeyByUid.delete(subscriberUid);
-      activeSubscriptionKeyByUid.delete(subscriberUid);
+
+      const activeIntervals = Array.from(new Set(activeRealtimeIntervalByUid.values()));
+      if (activeIntervals.includes(normalizedInterval)) {
+        spotMarketRealtime.syncKlineInterval({
+          symbol: apiSymbol,
+          interval: normalizedInterval,
+          owner: realtimeOwner,
+        });
+      } else {
+        spotMarketRealtime.releaseKlineIntervalOwner({
+          symbol: apiSymbol,
+          owner: realtimeOwner,
+        });
+      }
+
+      markSpotKlinePerf('kline_interval_datafeed_owner_sync', {
+        symbol: apiSymbol,
+        interval: normalizedInterval,
+        previousIntervals,
+        activeIntervals,
+        droppedIntervals,
+        changed: droppedIntervals.length > 0,
+        owner: realtimeOwner,
+        source: 'spotTradingViewDatafeed',
+        reason,
+      });
+      return {
+        previousIntervals,
+        activeIntervals,
+        droppedIntervals,
+        changed: droppedIntervals.length > 0,
+      };
     },
 
     destroy() {
@@ -2041,6 +2109,7 @@ export function createSpotTradingViewDatafeed(
       historyRequestSeqByLatestBarKey.clear();
       lastEmittedBarTimeByUid.clear();
       lastDroppedRealtimeBarByUid.clear();
+      activeRealtimeIntervalByUid.clear();
       activeSubscriptionKeyByUid.clear();
     },
   };

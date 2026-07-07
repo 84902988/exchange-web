@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import Script from 'next/script';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import { spotMarketRealtime } from '@/services/marketRealtime';
 import type { SpotChartProps } from './chart/chart.types';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import {
@@ -10,6 +11,7 @@ import {
   spotIntervalToTradingViewResolution,
   type SpotTradingViewHistoryBarsEvent,
 } from './tradingview/spotTradingViewDatafeed';
+import { getBackendKlineIntervalForSpotInterval } from './tradingview/spotKlineClientCache';
 import {
   createSpotKlinePreloadManager,
   type SpotKlinePreloadManager,
@@ -100,6 +102,7 @@ const TIME_SHARING_KEY = 'time';
 const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
 const SPOT_TV_INITIAL_RIGHT_PADDING_BARS = 4;
 const SPOT_TV_INITIAL_VISIBLE_RANGE_DELAY_MS = 80;
+const SPOT_TV_RESOLUTION_KLINE_OWNER_PREFIX = 'spot-tradingview-chart-resolution';
 const SPOT_TV_INITIAL_VISIBLE_BARS: Record<string, number> = {
   '1m': 160,
   '5m': 140,
@@ -296,6 +299,10 @@ export default function SpotTradingViewChart({
     () => `spot-tv-chart-${reactId.replace(/[^a-zA-Z0-9_-]/g, '')}`,
     [reactId],
   );
+  const resolutionKlineOwner = useMemo(
+    () => `${SPOT_TV_RESOLUTION_KLINE_OWNER_PREFIX}:${containerId}`,
+    [containerId],
+  );
 
   const normalizedSymbol = useMemo(() => normalizeTradingViewSymbol(symbol), [symbol]);
   const activeInterval = chartMode === 'time' ? '1m' : interval;
@@ -355,6 +362,72 @@ export default function SpotTradingViewChart({
   const scheduleKlinePreload = useCallback((event: SpotTradingViewHistoryBarsEvent, reason: string) => {
     getPreloadManager().schedule(event, reason);
   }, [getPreloadManager]);
+
+  const releaseResolutionKlineInterval = useCallback(
+    (reason: string, symbolOverride?: string) => {
+      const activeSymbol = normalizeTradingViewSymbol(symbolOverride || normalizedSymbolRef.current);
+      if (!activeSymbol) return;
+
+      const result = spotMarketRealtime.releaseKlineIntervalOwner({
+        symbol: activeSymbol,
+        owner: resolutionKlineOwner,
+      });
+      markSpotKlinePerf('kline_interval_sync_release', {
+        symbol: activeSymbol,
+        previousInterval: result?.previousInterval ?? null,
+        owner: resolutionKlineOwner,
+        released: result?.released ?? false,
+        reason,
+        source: 'SpotTradingViewChart',
+      });
+    },
+    [resolutionKlineOwner],
+  );
+
+  const syncKlineIntervalAfterResolutionCommit = useCallback(
+    (reason: string) => {
+      const activeSymbol = normalizedSymbolRef.current;
+      if (!activeSymbol) return;
+
+      const uiInterval = activeIntervalRef.current || '1m';
+      const backendInterval = getBackendKlineIntervalForSpotInterval(uiInterval);
+      const datafeedRealtimeIntervals = datafeedRef.current?.getActiveRealtimeIntervals() ?? [];
+      const datafeedRealtimeMatched =
+        datafeedRealtimeIntervals.length > 0 &&
+        datafeedRealtimeIntervals.every((activeInterval) => activeInterval === backendInterval);
+      const syncResult = spotMarketRealtime.syncKlineInterval({
+        symbol: activeSymbol,
+        interval: backendInterval,
+        owner: resolutionKlineOwner,
+      });
+      const datafeedSyncResult = datafeedRealtimeMatched
+        ? null
+        : datafeedRef.current?.syncRealtimeKlineSubscription(
+          backendInterval,
+          'resolution_commit_interval_mismatch',
+        );
+
+      markSpotKlinePerf('kline_interval_sync_after_resolution_commit', {
+        symbol: activeSymbol,
+        uiInterval,
+        interval: backendInterval,
+        backendInterval,
+        previousInterval: syncResult?.previousInterval ?? null,
+        owner: resolutionKlineOwner,
+        subscriptionId: syncResult?.subscriptionId ?? null,
+        changed: syncResult?.changed ?? false,
+        datafeedRealtimeIntervals,
+        datafeedRealtimeMatched,
+        syncedDatafeedOwner: Boolean(datafeedSyncResult),
+        datafeedSyncChanged: datafeedSyncResult?.changed ?? false,
+        datafeedActiveIntervalsAfterSync: datafeedSyncResult?.activeIntervals ?? datafeedRealtimeIntervals,
+        datafeedDroppedIntervals: datafeedSyncResult?.droppedIntervals ?? [],
+        reason,
+        source: 'SpotTradingViewChart',
+      });
+    },
+    [resolutionKlineOwner],
+  );
 
   const applyInitialVisibleRangeFromHistory = useCallback(
     (event: SpotTradingViewHistoryBarsEvent, triggerReason = 'history-callback') => {
@@ -651,6 +724,7 @@ export default function SpotTradingViewChart({
       if (currentResolutionRef.current === nextResolution) {
         pendingResolutionRef.current = '';
         updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, activeIntervalRef.current);
+        syncKlineIntervalAfterResolutionCommit('already_current_resolution');
         markSpotKlinePerf('set_resolution_data_ready', {
           symbol: normalizedSymbolRef.current,
           interval: activeIntervalValue,
@@ -698,6 +772,7 @@ export default function SpotTradingViewChart({
           resolutionRequestId,
           duration_ms: durationMs,
         });
+        syncKlineIntervalAfterResolutionCommit('resolution_commit');
         const pendingInitialRange = pendingInitialVisibleRangeRef.current;
         if (pendingInitialRange) {
           applyInitialVisibleRangeFromHistory(pendingInitialRange, 'resolution-data-ready');
@@ -760,7 +835,12 @@ export default function SpotTradingViewChart({
         requestResolutionFallbackRebuild(nextResolution, 'setResolution threw', error);
       }
     },
-    [applyInitialVisibleRangeFromHistory, requestResolutionFallbackRebuild, resetInitialVisibleRangeIntent],
+    [
+      applyInitialVisibleRangeFromHistory,
+      requestResolutionFallbackRebuild,
+      resetInitialVisibleRangeIntent,
+      syncKlineIntervalAfterResolutionCommit,
+    ],
   );
 
   useEffect(() => {
@@ -772,13 +852,15 @@ export default function SpotTradingViewChart({
 
   useEffect(() => () => {
     clearScheduledKlinePreload('symbol changed or component unmounted');
-  }, [clearScheduledKlinePreload, normalizedSymbol]);
+    releaseResolutionKlineInterval('symbol changed or component unmounted', normalizedSymbol);
+  }, [clearScheduledKlinePreload, normalizedSymbol, releaseResolutionKlineInterval]);
 
   useEffect(() => {
     let cancelled = false;
 
     const cleanupWidget = () => {
       clearScheduledKlinePreload('widget cleanup');
+      releaseResolutionKlineInterval('widget cleanup', normalizedSymbol);
       resolutionRequestSeqRef.current += 1;
       chartReadyRef.current = false;
       currentResolutionRef.current = '';
@@ -982,6 +1064,7 @@ export default function SpotTradingViewChart({
     onChartModeChange,
     onIntervalChange,
     pricePrecision,
+    releaseResolutionKlineInterval,
     scriptReady,
     widgetKey,
     widgetStyle,
