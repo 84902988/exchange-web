@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from decimal import Decimal
 from typing import Any, Callable, Optional
 
@@ -29,6 +30,7 @@ from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
 logger = logging.getLogger(__name__)
 
 _MAX_KLINE_BROADCAST_INTERVAL_MS = 500
+_KLINE_INTERVAL_RELEASE_GRACE_SECONDS = 3.0
 _EXECUTOR_SHUTDOWN_MESSAGES = (
     "executor shutdown has been called",
     "cannot schedule new futures after shutdown",
@@ -58,6 +60,7 @@ class SpotMarketGateway:
         provider_symbol_allowed: Optional[Callable[[str], bool]] = None,
         precision_resolver: Optional[Callable[[str], tuple[int, int]]] = None,
         ws_manager: Any = None,
+        kline_release_grace_seconds: float = _KLINE_INTERVAL_RELEASE_GRACE_SECONDS,
     ) -> None:
         self._ensure_depth = ensure_depth or ensure_spot_provider_ws_depth
         self._ensure_depth_accepts_provider = ensure_depth is None
@@ -84,6 +87,8 @@ class SpotMarketGateway:
         self._task_lock = asyncio.Lock()
         self._broadcast_state = SpotGatewayBroadcastState()
         self._ensured_kline_intervals: dict[str, set[str]] = {}
+        self._pending_kline_releases: dict[str, dict[str, float]] = {}
+        self._kline_release_grace_seconds = max(0.0, float(kline_release_grace_seconds))
         self._precision_cache: dict[str, tuple[int, int]] = {}
         self._symbol_providers: dict[str, str] = {}
 
@@ -104,7 +109,12 @@ class SpotMarketGateway:
                 self._ensure_depth(normalized_symbol, provider=provider_code)
             else:
                 self._ensure_depth(normalized_symbol)
-            self._ensure_kline_interval(normalized_symbol, self._normalize_interval(interval), provider=provider_code)
+            if interval is not None:
+                self._ensure_kline_interval(
+                    normalized_symbol,
+                    self._normalize_interval(interval),
+                    provider=provider_code,
+                )
         except Exception:
             logger.warning("spot_market_gateway_ensure_provider_ws_failed symbol=%s", normalized_symbol, exc_info=True)
         async with self._task_lock:
@@ -358,6 +368,7 @@ class SpotMarketGateway:
             await asyncio.to_thread(self._release_depth, symbol)
         self._broadcast_state.clear_symbol(symbol)
         self._ensured_kline_intervals.pop(symbol, None)
+        self._pending_kline_releases.pop(symbol, None)
         self._precision_cache.pop(symbol, None)
         self._symbol_providers.pop(symbol, None)
 
@@ -452,27 +463,36 @@ class SpotMarketGateway:
         )
 
     async def _active_kline_intervals(self, symbol: str) -> list[str]:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
         try:
-            intervals = await self._market_ws_manager().kline_intervals(symbol)
+            intervals = await self._market_ws_manager().kline_intervals(normalized_symbol)
         except Exception:
-            intervals = ["1m"]
-        normalized = sorted({self._normalize_interval(interval) for interval in intervals or ["1m"]})
-        return normalized or ["1m"]
+            intervals = list(self._ensured_kline_intervals.get(normalized_symbol, set()))
+        return sorted({self._normalize_interval(interval) for interval in intervals or []})
 
     async def _sync_kline_intervals(self, symbol: str, intervals: list[str]) -> list[str]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         if not normalized_symbol:
             return []
-        active_intervals = sorted({self._normalize_interval(interval) for interval in intervals or ["1m"]})
+        active_intervals = sorted({self._normalize_interval(interval) for interval in intervals or []})
         ensured_intervals = set(self._ensured_kline_intervals.get(normalized_symbol, set()))
         provider_code = self._symbol_providers.get(normalized_symbol) or PROVIDER_BITGET_SPOT
         if not spot_provider_ws_supports_provider(provider_code, domain="kline"):
             for interval in ensured_intervals:
                 self._clear_kline_interval_state(normalized_symbol, interval, provider=provider_code)
             self._ensured_kline_intervals.pop(normalized_symbol, None)
+            self._pending_kline_releases.pop(normalized_symbol, None)
             return []
 
+        now = time.monotonic()
+        pending_releases = self._pending_kline_releases.setdefault(normalized_symbol, {})
         for interval in sorted(ensured_intervals - set(active_intervals)):
+            release_at = pending_releases.get(interval)
+            if release_at is None:
+                release_at = now + self._kline_release_grace_seconds
+                pending_releases[interval] = release_at
+            if release_at > now:
+                continue
             try:
                 if self._release_kline_accepts_provider:
                     await asyncio.to_thread(self._release_kline, normalized_symbol, interval, provider=provider_code)
@@ -486,11 +506,13 @@ class SpotMarketGateway:
                     exc_info=True,
                 )
                 continue
+            pending_releases.pop(interval, None)
             self._ensured_kline_intervals.get(normalized_symbol, set()).discard(interval)
             self._clear_kline_interval_state(normalized_symbol, interval, provider=provider_code)
 
         ready_intervals: list[str] = []
         for interval in active_intervals:
+            pending_releases.pop(interval, None)
             try:
                 self._ensure_kline_interval(normalized_symbol, interval, provider=provider_code)
             except Exception:
@@ -502,6 +524,8 @@ class SpotMarketGateway:
                 )
                 continue
             ready_intervals.append(interval)
+        if not pending_releases:
+            self._pending_kline_releases.pop(normalized_symbol, None)
         return ready_intervals
 
     def _ensure_kline_interval(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
@@ -512,6 +536,7 @@ class SpotMarketGateway:
         provider_code = str(provider or self._symbol_providers.get(normalized_symbol) or PROVIDER_BITGET_SPOT)
         if not spot_provider_ws_supports_provider(provider_code, domain="kline"):
             return
+        self._pending_kline_releases.get(normalized_symbol, {}).pop(normalized_interval, None)
         if self._ensure_kline_accepts_provider:
             self._ensure_kline(normalized_symbol, normalized_interval, provider=provider_code)
         else:

@@ -62,6 +62,7 @@ export type SpotMarketRealtimeSubscriptionOptions = {
 type SpotMarketRealtimeSubscriptionEntry = {
   connectionKey: string;
   domain: SpotMarketRealtimeDomain;
+  interval?: string;
 };
 
 type SpotMarketRealtimeSubscription = {
@@ -75,13 +76,13 @@ type SpotMarketRealtimeSubscription = {
 type SpotMarketRealtimeConnection = {
   key: string;
   symbol: string;
-  interval: string;
   ws: WebSocket | null;
   connectTimer: number | null;
   reconnectTimer: number | null;
   status: SpotMarketConnectionStatus;
   closedByClient: boolean;
   domains: Map<SpotMarketRealtimeDomain, Set<string>>;
+  klineIntervals: Map<string, Set<string>>;
 };
 
 const BASE_INTERVAL = '1m';
@@ -100,13 +101,12 @@ const SPOT_KLINE_INTERVAL_ALIASES: Record<string, string> = {
 };
 const SPOT_KLINE_INTERVALS = new Set(Object.values(SPOT_KLINE_INTERVAL_ALIASES));
 
-function buildSpotWsUrl(symbol: string, interval = '1m') {
+function buildSpotWsUrl(symbol: string) {
   const apiBase = getRuntimeApiBaseUrl();
   const url = new URL(apiBase);
   const protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   const params = new URLSearchParams({
     symbol,
-    interval,
   });
   return `${protocol}//${url.host}/market/ws/spot?${params.toString()}`;
 }
@@ -127,8 +127,8 @@ function normalizeDomain(domain: SpotMarketRealtimeDomain): SpotMarketRealtimeDo
   return domain;
 }
 
-function makeConnectionKey(symbol: string, interval: string) {
-  return `${symbol}:${interval}`;
+function makeConnectionKey(symbol: string) {
+  return symbol;
 }
 
 function getMessageObject(value: unknown): Record<string, unknown> | null {
@@ -167,10 +167,24 @@ class SpotMarketRealtimeClient {
 
     const id = `${options.owner || 'spot-market'}:${this.nextSubscriptionId++}`;
     const entries: SpotMarketRealtimeSubscriptionEntry[] = [];
+    const touchedConnections = new Set<string>();
 
     for (const domain of domains) {
-      const domainInterval = domain === 'kline' ? interval : BASE_INTERVAL;
-      const connection = this.ensureConnection(symbol, domainInterval);
+      const connection = this.ensureConnection(symbol);
+      touchedConnections.add(connection.key);
+
+      if (domain === 'kline') {
+        const bucket = connection.klineIntervals.get(interval) ?? new Set<string>();
+        const wasEmpty = bucket.size === 0;
+        bucket.add(id);
+        connection.klineIntervals.set(interval, bucket);
+        entries.push({ connectionKey: connection.key, domain, interval });
+        if (wasEmpty) {
+          this.sendKlineSubscription(connection, 'subscribe', interval);
+        }
+        continue;
+      }
+
       const bucket = connection.domains.get(domain) ?? new Set<string>();
       bucket.add(id);
       connection.domains.set(domain, bucket);
@@ -185,8 +199,8 @@ class SpotMarketRealtimeClient {
       entries,
     });
 
-    for (const entry of entries) {
-      const connection = this.connections.get(entry.connectionKey);
+    for (const connectionKey of touchedConnections) {
+      const connection = this.connections.get(connectionKey);
       if (connection) {
         this.ensureConnectionOpen(connection);
       }
@@ -209,10 +223,20 @@ class SpotMarketRealtimeClient {
       const connection = this.connections.get(entry.connectionKey);
       if (!connection) continue;
 
-      const bucket = connection.domains.get(entry.domain);
-      bucket?.delete(subscriptionId);
-      if (bucket && bucket.size === 0) {
-        connection.domains.delete(entry.domain);
+      if (entry.domain === 'kline') {
+        const interval = entry.interval || subscription.interval;
+        const bucket = connection.klineIntervals.get(interval);
+        bucket?.delete(subscriptionId);
+        if (bucket && bucket.size === 0) {
+          connection.klineIntervals.delete(interval);
+          this.sendKlineSubscription(connection, 'unsubscribe', interval);
+        }
+      } else {
+        const bucket = connection.domains.get(entry.domain);
+        bucket?.delete(subscriptionId);
+        if (bucket && bucket.size === 0) {
+          connection.domains.delete(entry.domain);
+        }
       }
 
       if (!this.hasActiveConnectionDomains(connection)) {
@@ -267,21 +291,21 @@ class SpotMarketRealtimeClient {
     this.setStatus('closed');
   }
 
-  private ensureConnection(symbol: string, interval: string) {
-    const key = makeConnectionKey(symbol, interval);
+  private ensureConnection(symbol: string) {
+    const key = makeConnectionKey(symbol);
     const existing = this.connections.get(key);
     if (existing) return existing;
 
     const connection: SpotMarketRealtimeConnection = {
       key,
       symbol,
-      interval,
       ws: null,
       connectTimer: null,
       reconnectTimer: null,
       status: 'closed',
       closedByClient: false,
       domains: new Map<SpotMarketRealtimeDomain, Set<string>>(),
+      klineIntervals: new Map<string, Set<string>>(),
     };
     this.connections.set(key, connection);
     return connection;
@@ -317,12 +341,13 @@ class SpotMarketRealtimeClient {
     this.clearConnectionTimer(connection, 'reconnect');
     this.setConnectionStatus(connection, 'connecting');
 
-    const ws = new WebSocket(buildSpotWsUrl(connection.symbol, connection.interval));
+    const ws = new WebSocket(buildSpotWsUrl(connection.symbol));
     connection.ws = ws;
 
     ws.onopen = () => {
       if (connection.ws !== ws) return;
       this.setConnectionStatus(connection, 'open');
+      this.sendActiveKlineSubscriptions(connection);
     };
 
     ws.onmessage = (event) => {
@@ -417,15 +442,15 @@ class SpotMarketRealtimeClient {
     connection: SpotMarketRealtimeConnection,
     domain: SpotMarketRealtimeDomain,
   ) {
-    if (!connection.domains.get(domain)?.size) return false;
-
     const messageSymbol = this.getMessageSymbol(message);
     if (messageSymbol && messageSymbol !== connection.symbol) return false;
 
     if (domain === 'kline') {
       const messageInterval = normalizeSpotRealtimeInterval(this.getMessageInterval(message));
-      return messageInterval === connection.interval;
+      return Boolean(connection.klineIntervals.get(messageInterval)?.size);
     }
+
+    if (!connection.domains.get(domain)?.size) return false;
 
     return true;
   }
@@ -460,7 +485,37 @@ class SpotMarketRealtimeClient {
     for (const bucket of connection.domains.values()) {
       if (bucket.size > 0) return true;
     }
+    for (const bucket of connection.klineIntervals.values()) {
+      if (bucket.size > 0) return true;
+    }
     return false;
+  }
+
+  private sendActiveKlineSubscriptions(connection: SpotMarketRealtimeConnection) {
+    for (const interval of connection.klineIntervals.keys()) {
+      this.sendKlineSubscription(connection, 'subscribe', interval);
+    }
+  }
+
+  private sendKlineSubscription(
+    connection: SpotMarketRealtimeConnection,
+    op: 'subscribe' | 'unsubscribe',
+    interval: string,
+  ) {
+    const ws = connection.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      ws.send(JSON.stringify({
+        op,
+        domain: 'kline',
+        interval: normalizeSpotRealtimeInterval(interval),
+      }));
+    } catch (err) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.warn('[marketRealtime] spot WS subscription send failed:', err);
+      }
+    }
   }
 
   private emit(type: SpotMarketRealtimeEventType, message: SpotMarketRealtimeMessage) {

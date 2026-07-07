@@ -1806,6 +1806,39 @@ def _spot_provider_warning_allowed(
     return True
 
 
+def _is_spot_kline_history_unavailable(end_time_ms: Optional[int], exc: Exception) -> bool:
+    return end_time_ms is not None and _spot_kline_provider_error_code(exc) == KLINE_PROVIDER_ERROR_EMPTY
+
+
+def _log_spot_provider_kline_failure(
+    *,
+    symbol: str,
+    provider: str,
+    interval: str,
+    end_time_ms: Optional[int],
+    reason: Exception,
+) -> None:
+    if _is_spot_kline_history_unavailable(end_time_ms, reason):
+        if _spot_provider_warning_allowed(
+            endpoint=f"kline_history_unavailable:{interval}",
+            symbol=symbol,
+            provider=provider,
+            reason=reason,
+        ):
+            logger.debug(
+                "spot_provider_kline_history_unavailable symbol=%s provider=%s interval=%s end_time_ms=%s reason=%s",
+                symbol,
+                provider,
+                interval,
+                end_time_ms,
+                reason,
+            )
+        return
+
+    if _spot_provider_warning_allowed(endpoint=f"kline:{interval}", symbol=symbol, provider=provider, reason=reason):
+        logger.warning("spot_provider_kline_failed symbol=%s provider=%s interval=%s reason=%s", symbol, provider, interval, reason)
+
+
 def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = False) -> Optional[TickerItem]:
     last_error: Optional[Exception] = None
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
@@ -2183,13 +2216,23 @@ def _fetch_external_spot_klines(
                 continue
             last_error = exc
             mark_contract_market_provider_failure(db, provider.provider_code, exc, cooldown_seconds=provider.cooldown_seconds, market_type="SPOT")
-            if _spot_provider_warning_allowed(endpoint=f"kline:{interval}", symbol=pair.symbol, provider=provider.provider_code, reason=exc):
-                logger.warning("spot_provider_kline_failed symbol=%s provider=%s interval=%s reason=%s", pair.symbol, provider.provider_code, interval, exc)
+            _log_spot_provider_kline_failure(
+                symbol=pair.symbol,
+                provider=provider.provider_code,
+                interval=interval,
+                end_time_ms=end_time_ms,
+                reason=exc,
+            )
         except Exception as exc:
             last_error = exc
             mark_contract_market_provider_failure(db, provider.provider_code, exc, cooldown_seconds=provider.cooldown_seconds, market_type="SPOT")
-            if _spot_provider_warning_allowed(endpoint=f"kline:{interval}", symbol=pair.symbol, provider=provider.provider_code, reason=exc):
-                logger.warning("spot_provider_kline_failed symbol=%s provider=%s interval=%s reason=%s", pair.symbol, provider.provider_code, interval, exc)
+            _log_spot_provider_kline_failure(
+                symbol=pair.symbol,
+                provider=provider.provider_code,
+                interval=interval,
+                end_time_ms=end_time_ms,
+                reason=exc,
+            )
     if contract_market_last_good_enabled(db):
         cached = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval))
         if cached and cached.get("items"):

@@ -631,6 +631,7 @@ def test_gateway_kline_interval_lifecycle_preserves_utc_intervals() -> None:
             release_kline=lambda symbol, interval: released_klines.append((symbol, interval)),
             provider_symbol_allowed=lambda symbol: True,
             ws_manager=ws_manager,
+            kline_release_grace_seconds=0,
         )
         gateway._symbol_providers["BTCUSDT"] = market.PROVIDER_OKX_SPOT
 
@@ -683,6 +684,7 @@ def test_gateway_sync_kline_intervals_releases_inactive_and_ensures_new_interval
             provider_symbol_allowed=lambda symbol: True,
             precision_resolver=lambda symbol: (2, 3),
             ws_manager=ws_manager,
+            kline_release_grace_seconds=0,
         )
 
         gateway._ensured_kline_intervals["BTCUSDT"] = {"1m"}
@@ -698,6 +700,43 @@ def test_gateway_sync_kline_intervals_releases_inactive_and_ensures_new_interval
         assert gateway._ensured_kline_intervals["BTCUSDT"] == {"5m"}
         assert provider.released == []
         assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is True
+
+    asyncio.run(run())
+
+
+def test_gateway_sync_kline_intervals_graces_inactive_interval_release() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = FakeProvider()
+        released_klines: list[tuple[str, str]] = []
+        gateway = SpotMarketGateway(
+            ensure_depth=provider.ensure,
+            release_depth=provider.release,
+            ensure_kline=lambda symbol, interval: None,
+            release_kline=lambda symbol, interval: released_klines.append((symbol, interval)),
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_klines=provider.get_klines,
+            provider_symbol_allowed=lambda symbol: True,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+            kline_release_grace_seconds=0.02,
+        )
+
+        gateway._ensured_kline_intervals["BTCUSDT"] = {"1m"}
+
+        ready = await gateway._sync_kline_intervals("BTCUSDT", ["5m"])
+        assert ready == ["5m"]
+        assert released_klines == []
+        assert gateway._ensured_kline_intervals["BTCUSDT"] == {"1m", "5m"}
+
+        await asyncio.sleep(0.03)
+        ready = await gateway._sync_kline_intervals("BTCUSDT", ["5m"])
+
+        assert ready == ["5m"]
+        assert released_klines == [("BTCUSDT", "1m")]
+        assert gateway._ensured_kline_intervals["BTCUSDT"] == {"5m"}
 
     asyncio.run(run())
 
@@ -720,6 +759,7 @@ def test_gateway_sync_kline_intervals_keeps_simultaneous_active_intervals() -> N
             provider_symbol_allowed=lambda symbol: True,
             precision_resolver=lambda symbol: (2, 3),
             ws_manager=ws_manager,
+            kline_release_grace_seconds=0,
         )
 
         gateway._ensured_kline_intervals["BTCUSDT"] = {"1m", "5m"}
@@ -753,6 +793,7 @@ def test_gateway_sync_kline_intervals_does_not_affect_other_symbols() -> None:
             provider_symbol_allowed=lambda symbol: True,
             precision_resolver=lambda symbol: (2, 3),
             ws_manager=ws_manager,
+            kline_release_grace_seconds=0,
         )
 
         gateway._ensured_kline_intervals["BTCUSDT"] = {"1m"}
@@ -2056,6 +2097,138 @@ def test_kline_history_provider_empty_reports_missing_metadata() -> None:
         market._enabled_spot_market_providers_for_pair = original_enabled_providers
         market.get_spot_provider_ws_klines = original_get_ws_klines
         market.get_klines_cache_first = original_get_klines_cache_first
+
+
+def test_kline_history_provider_unavailable_downgrades_repeated_warning() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    class CaptureLogger:
+        def __init__(self) -> None:
+            self.warning_calls: list[tuple[str, tuple]] = []
+            self.debug_calls: list[tuple[str, tuple]] = []
+
+        def warning(self, message: str, *args, **kwargs) -> None:
+            self.warning_calls.append((message, args))
+
+        def debug(self, message: str, *args, **kwargs) -> None:
+            self.debug_calls.append((message, args))
+
+    provider = _spot_provider(market.PROVIDER_OKX_SPOT)
+    capture_logger = CaptureLogger()
+
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_provider_symbol = market._spot_provider_symbol
+    original_request_config = market._spot_provider_request_config
+    original_fetch_okx_klines = market._fetch_okx_spot_klines
+    original_mark_failure = market.mark_contract_market_provider_failure
+    original_last_good_enabled = market.contract_market_last_good_enabled
+    original_logger = market.logger
+    original_throttle = dict(market._SPOT_PROVIDER_LOG_THROTTLE)
+    try:
+        market._SPOT_PROVIDER_LOG_THROTTLE.clear()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market._spot_provider_symbol = lambda *args, **kwargs: "BTCUSDT"
+        market._spot_provider_request_config = lambda provider_config, **kwargs: provider_config
+        market._fetch_okx_spot_klines = lambda *args, **kwargs: []
+        market.mark_contract_market_provider_failure = lambda *args, **kwargs: None
+        market.contract_market_last_good_enabled = lambda db: False
+        market.logger = capture_logger
+
+        for _ in range(2):
+            try:
+                market._fetch_external_spot_klines(
+                    None,
+                    Pair(),
+                    interval="1Mutc",
+                    limit=30,
+                    end_time_ms=1514764800000,
+                )
+            except market.KlineProviderFetchError:
+                pass
+
+        assert capture_logger.warning_calls == []
+        assert len(capture_logger.debug_calls) == 1
+        assert capture_logger.debug_calls[0][0].startswith("spot_provider_kline_history_unavailable")
+    finally:
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market._spot_provider_symbol = original_provider_symbol
+        market._spot_provider_request_config = original_request_config
+        market._fetch_okx_spot_klines = original_fetch_okx_klines
+        market.mark_contract_market_provider_failure = original_mark_failure
+        market.contract_market_last_good_enabled = original_last_good_enabled
+        market.logger = original_logger
+        market._SPOT_PROVIDER_LOG_THROTTLE.clear()
+        market._SPOT_PROVIDER_LOG_THROTTLE.update(original_throttle)
+
+
+def test_kline_current_provider_unavailable_keeps_warning() -> None:
+    class Pair:
+        symbol = "BTCUSDT"
+        data_source = market.DATA_SOURCE_BINANCE
+        price_precision = 2
+        amount_precision = 3
+
+    class CaptureLogger:
+        def __init__(self) -> None:
+            self.warning_calls: list[tuple[str, tuple]] = []
+            self.debug_calls: list[tuple[str, tuple]] = []
+
+        def warning(self, message: str, *args, **kwargs) -> None:
+            self.warning_calls.append((message, args))
+
+        def debug(self, message: str, *args, **kwargs) -> None:
+            self.debug_calls.append((message, args))
+
+    provider = _spot_provider(market.PROVIDER_OKX_SPOT)
+    capture_logger = CaptureLogger()
+
+    original_enabled_providers = market._enabled_spot_market_providers_for_pair
+    original_provider_symbol = market._spot_provider_symbol
+    original_request_config = market._spot_provider_request_config
+    original_fetch_okx_klines = market._fetch_okx_spot_klines
+    original_mark_failure = market.mark_contract_market_provider_failure
+    original_last_good_enabled = market.contract_market_last_good_enabled
+    original_logger = market.logger
+    original_throttle = dict(market._SPOT_PROVIDER_LOG_THROTTLE)
+    try:
+        market._SPOT_PROVIDER_LOG_THROTTLE.clear()
+        market._enabled_spot_market_providers_for_pair = lambda *args, **kwargs: (provider,)
+        market._spot_provider_symbol = lambda *args, **kwargs: "BTCUSDT"
+        market._spot_provider_request_config = lambda provider_config, **kwargs: provider_config
+        market._fetch_okx_spot_klines = lambda *args, **kwargs: []
+        market.mark_contract_market_provider_failure = lambda *args, **kwargs: None
+        market.contract_market_last_good_enabled = lambda db: False
+        market.logger = capture_logger
+
+        for _ in range(2):
+            try:
+                market._fetch_external_spot_klines(
+                    None,
+                    Pair(),
+                    interval="1Mutc",
+                    limit=30,
+                    end_time_ms=None,
+                )
+            except market.KlineProviderFetchError:
+                pass
+
+        assert len(capture_logger.warning_calls) == 1
+        assert capture_logger.warning_calls[0][0].startswith("spot_provider_kline_failed")
+        assert capture_logger.debug_calls == []
+    finally:
+        market._enabled_spot_market_providers_for_pair = original_enabled_providers
+        market._spot_provider_symbol = original_provider_symbol
+        market._spot_provider_request_config = original_request_config
+        market._fetch_okx_spot_klines = original_fetch_okx_klines
+        market.mark_contract_market_provider_failure = original_mark_failure
+        market.contract_market_last_good_enabled = original_last_good_enabled
+        market.logger = original_logger
+        market._SPOT_PROVIDER_LOG_THROTTLE.clear()
+        market._SPOT_PROVIDER_LOG_THROTTLE.update(original_throttle)
 
 
 def test_kline_monthly_history_db_cache_keeps_monthly_metadata() -> None:
