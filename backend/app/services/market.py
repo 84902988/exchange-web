@@ -653,10 +653,12 @@ def _is_hot(pair: TradingPair) -> bool:
 
 def _ticker_metadata(pair: TradingPair) -> Dict[str, Any]:
     price_precision_metadata = _spot_pair_price_precision_metadata(pair)
+    base_asset = getattr(pair, "base_asset", None)
     return {
         "display_symbol": _display_symbol(pair),
-        "base_asset": _asset_symbol(getattr(pair, "base_asset", None)),
+        "base_asset": _asset_symbol(base_asset),
         "quote_asset": _asset_symbol(getattr(pair, "quote_asset", None)),
+        "base_asset_logo_url": str(getattr(base_asset, "icon_url", None) or "").strip() or None,
         "price_precision": int(getattr(pair, "price_precision", 8) or 8),
         **price_precision_metadata,
         "amount_precision": int(getattr(pair, "amount_precision", 8) or 8),

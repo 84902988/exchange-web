@@ -191,6 +191,7 @@ export type SpotMarketTickerItem = {
   display_symbol?: string | null
   base_asset?: string | null
   quote_asset?: string | null
+  base_asset_logo_url?: string | null
   last_price?: string | number
   price?: string | number
   last?: string | number
@@ -245,6 +246,7 @@ export type SpotMarketPairItem = {
   display_symbol?: string | null
   base_asset?: string | null
   quote_asset?: string | null
+  base_asset_logo_url?: string | null
   asset_type?: string | null
   market_category?: string | null
   market_sub_category?: string | null

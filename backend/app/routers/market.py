@@ -153,7 +153,7 @@ def get_pairs(
     normalized_page = max(int(page or 1), 1)
     normalized_page_size = max(1, min(int(page_size or 50), 100))
     cache_key = market_cache_key(
-        "global_selector:pairs:v3",
+        "global_selector:pairs:v4",
         {
             "market_type": normalized_market_type,
             "category": normalized_category,

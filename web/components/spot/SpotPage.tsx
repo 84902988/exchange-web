@@ -149,12 +149,12 @@ function getSpotPairTickerBatchKey(symbols: string[]): { key: string; symbols: s
   };
 }
 
-async function loadSpotPairTickerBatch(symbols: string[]): Promise<SpotPairOption[]> {
+async function loadSpotPairTickerBatch(symbols: string[], options?: { force?: boolean }): Promise<SpotPairOption[]> {
   const batch = getSpotPairTickerBatchKey(symbols);
   if (!batch.key || batch.symbols.length === 0) return [];
 
   const cached = cachedSpotPairTickerBatches.get(batch.key);
-  if (cached && isFreshTimestamp(cached.fetchedAt, SPOT_PAIR_TICKER_BATCH_TTL_MS)) {
+  if (!options?.force && cached && isFreshTimestamp(cached.fetchedAt, SPOT_PAIR_TICKER_BATCH_TTL_MS)) {
     return cached.items;
   }
 
@@ -178,6 +178,67 @@ async function loadSpotPairTickerBatch(symbols: string[]): Promise<SpotPairOptio
 
   spotPairTickerBatchRequests.set(batch.key, request);
   return request;
+}
+
+function hasOwnSpotPairField<K extends keyof SpotPairOption>(item: SpotPairOption, field: K): boolean {
+  return Object.prototype.hasOwnProperty.call(item, field);
+}
+
+function hasOwnMarketPayloadField(item: SpotMarketTickerItem | SpotMarketPairItem, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(item, field);
+}
+
+function preserveSpotPairValue<T>(existingValue: T | null | undefined, incomingValue: T | null | undefined): T | null | undefined {
+  return incomingValue ?? existingValue;
+}
+
+function mergeSpotPairOption(existing: SpotPairOption, incoming: SpotPairOption): SpotPairOption {
+  const incomingHasLogo = hasOwnSpotPairField(incoming, 'baseAssetLogoUrl');
+
+  return {
+    symbol: incoming.symbol || existing.symbol,
+    label: incoming.label || existing.label,
+    displaySymbol: preserveSpotPairValue(existing.displaySymbol, incoming.displaySymbol),
+    baseAsset: preserveSpotPairValue(existing.baseAsset, incoming.baseAsset),
+    quoteAsset: preserveSpotPairValue(existing.quoteAsset, incoming.quoteAsset),
+    baseAssetLogoUrl: incomingHasLogo ? incoming.baseAssetLogoUrl ?? null : existing.baseAssetLogoUrl ?? null,
+    assetType: preserveSpotPairValue(existing.assetType, incoming.assetType),
+    dataSource: preserveSpotPairValue(existing.dataSource, incoming.dataSource),
+    marketMode: preserveSpotPairValue(existing.marketMode, incoming.marketMode),
+    marketCategory: preserveSpotPairValue(existing.marketCategory, incoming.marketCategory),
+    marketSubCategory: preserveSpotPairValue(existing.marketSubCategory, incoming.marketSubCategory),
+    displayCategory: preserveSpotPairValue(existing.displayCategory, incoming.displayCategory),
+    displayGroup: preserveSpotPairValue(existing.displayGroup, incoming.displayGroup),
+    price: preserveSpotPairValue(existing.price, incoming.price),
+    change24h: preserveSpotPairValue(existing.change24h, incoming.change24h),
+    percentChange24h: preserveSpotPairValue(existing.percentChange24h, incoming.percentChange24h),
+    priceChangePercent: preserveSpotPairValue(existing.priceChangePercent, incoming.priceChangePercent),
+    priceChange24h: preserveSpotPairValue(existing.priceChange24h, incoming.priceChange24h),
+    open24h: preserveSpotPairValue(existing.open24h, incoming.open24h),
+    high24h: preserveSpotPairValue(existing.high24h, incoming.high24h),
+    low24h: preserveSpotPairValue(existing.low24h, incoming.low24h),
+    volume24h: preserveSpotPairValue(existing.volume24h, incoming.volume24h),
+    baseVolume24h: preserveSpotPairValue(existing.baseVolume24h, incoming.baseVolume24h),
+    quoteVolume24h: preserveSpotPairValue(existing.quoteVolume24h, incoming.quoteVolume24h),
+    displayPricePrecision: preserveSpotPairValue(existing.displayPricePrecision, incoming.displayPricePrecision),
+    pricePrecision: preserveSpotPairValue(existing.pricePrecision, incoming.pricePrecision),
+    priceTickSize: preserveSpotPairValue(existing.priceTickSize, incoming.priceTickSize),
+    amountPrecision: preserveSpotPairValue(existing.amountPrecision, incoming.amountPrecision),
+    marketStatus: preserveSpotPairValue(existing.marketStatus, incoming.marketStatus),
+    marketStatusText: preserveSpotPairValue(existing.marketStatusText, incoming.marketStatusText),
+    marketSessionType: preserveSpotPairValue(existing.marketSessionType, incoming.marketSessionType),
+    quoteFreshness: preserveSpotPairValue(existing.quoteFreshness, incoming.quoteFreshness),
+    showSpotLogo: preserveSpotPairValue(existing.showSpotLogo, incoming.showSpotLogo) ?? false,
+    spotLogoUrl: preserveSpotPairValue(existing.spotLogoUrl, incoming.spotLogoUrl),
+  };
+}
+
+function mergeSpotPairOptionPreservingLogo(existing: SpotPairOption, incoming: SpotPairOption): SpotPairOption {
+  const merged = mergeSpotPairOption(existing, incoming);
+  return {
+    ...merged,
+    baseAssetLogoUrl: incoming.baseAssetLogoUrl || existing.baseAssetLogoUrl || null,
+  };
 }
 
 function getSpotPairPageRequestKey(query: SpotPairQuery, page: number): string {
@@ -289,6 +350,7 @@ type SpotPairOption = {
   displayGroup?: string | null;
   baseAsset?: string | null;
   quoteAsset?: string | null;
+  baseAssetLogoUrl?: string | null;
   displaySymbol?: string | null;
   price?: string | number | null;
   change24h?: string | number | null;
@@ -437,6 +499,9 @@ function buildMarketDataFromMarketView(
 function buildSpotPairOption(item: SpotMarketTickerItem | SpotMarketPairItem): SpotPairOption | null {
   const symbol = String(item.symbol || '').trim().toUpperCase();
   if (!symbol) return null;
+  const hasBaseAssetLogoUrl = hasOwnMarketPayloadField(item, 'base_asset_logo_url');
+  const hasShowSpotLogo = hasOwnMarketPayloadField(item, 'show_spot_logo');
+  const hasSpotLogoUrl = hasOwnMarketPayloadField(item, 'spot_logo_url');
 
   return {
     symbol,
@@ -444,6 +509,9 @@ function buildSpotPairOption(item: SpotMarketTickerItem | SpotMarketPairItem): S
     displaySymbol: item.display_symbol,
     baseAsset: item.base_asset,
     quoteAsset: item.quote_asset,
+    ...(hasBaseAssetLogoUrl
+      ? { baseAssetLogoUrl: String((item as SpotMarketTickerItem | SpotMarketPairItem).base_asset_logo_url || '').trim() || null }
+      : {}),
     assetType: item.asset_type,
     dataSource: item.data_source,
     marketMode: item.market_mode,
@@ -475,8 +543,12 @@ function buildSpotPairOption(item: SpotMarketTickerItem | SpotMarketPairItem): S
     marketStatusText: (item as SpotMarketTickerItem).market_status_text,
     marketSessionType: (item as SpotMarketTickerItem).market_session_type,
     quoteFreshness: (item as SpotMarketTickerItem).quote_freshness,
-    showSpotLogo: parseBooleanFlag((item as SpotMarketTickerItem | SpotMarketPairItem).show_spot_logo),
-    spotLogoUrl: String((item as SpotMarketTickerItem | SpotMarketPairItem).spot_logo_url || '').trim() || null,
+    ...(hasShowSpotLogo
+      ? { showSpotLogo: parseBooleanFlag((item as SpotMarketTickerItem | SpotMarketPairItem).show_spot_logo) }
+      : {}),
+    ...(hasSpotLogoUrl
+      ? { spotLogoUrl: String((item as SpotMarketTickerItem | SpotMarketPairItem).spot_logo_url || '').trim() || null }
+      : {}),
   };
 }
 
@@ -716,7 +788,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       setPairOptions((prev) =>
         prev.map((pair) => {
           const ticker = tickerMap.get(pair.symbol);
-          return ticker ? { ...pair, ...ticker } : pair;
+          return ticker ? mergeSpotPairOption(pair, ticker) : pair;
         }),
       );
     } catch (error) {
@@ -784,10 +856,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           });
         }
 
-      const currentSymbol = normalizeSpotApiSymbol(symbolRef.current);
+        const currentSymbol = normalizeSpotApiSymbol(symbolRef.current);
         const currentPair = mergedPairs.find((item) => item.symbol === currentSymbol);
         if (currentPair) {
-          setHeaderTicker((prev) => (prev?.symbol === currentSymbol ? { ...currentPair, ...prev } : currentPair));
+          setHeaderTicker((prev) => (prev?.symbol === currentSymbol ? mergeSpotPairOption(prev, currentPair) : currentPair));
         }
 
         void hydratePairTickers(nextPairs, queryKey);
@@ -833,11 +905,53 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     setPairOptions((prev) => {
       const map = new Map(prev.map((item) => [item.symbol, item]));
       if (map.has(nextTicker.symbol)) {
-        map.set(nextTicker.symbol, { ...map.get(nextTicker.symbol), ...nextTicker });
+        map.set(nextTicker.symbol, mergeSpotPairOptionPreservingLogo(map.get(nextTicker.symbol)!, nextTicker));
       }
       return Array.from(map.values());
     });
   }, [spotMarket.marketView?.ticker, symbol]);
+
+  useEffect(() => {
+    const currentSymbol = normalizeSpotApiSymbol(symbol);
+    if (!currentSymbol) return;
+
+    let cancelled = false;
+
+    const refreshCurrentPairMetadata = async () => {
+      try {
+        const [nextTicker] = await loadSpotPairTickerBatch([currentSymbol], { force: true });
+        if (cancelled || !nextTicker || nextTicker.symbol !== currentSymbol) return;
+
+        setHeaderTicker((prev) => (prev?.symbol === currentSymbol ? mergeSpotPairOption(prev, nextTicker) : nextTicker));
+        setPairOptions((prev) => {
+          const map = new Map(prev.map((item) => [item.symbol, item]));
+          const previous = map.get(currentSymbol);
+          map.set(currentSymbol, previous ? mergeSpotPairOption(previous, nextTicker) : nextTicker);
+          const nextItems = Array.from(map.values());
+          const queryKey = getPairQueryKey(pairQueryRef.current);
+          const cachedPage = cachedSpotPairPages.get(queryKey);
+          if (cachedPage?.items.some((item) => item.symbol === currentSymbol)) {
+            cachedSpotPairPages.set(queryKey, {
+              ...cachedPage,
+              items: cachedPage.items.map((item) =>
+                item.symbol === currentSymbol ? mergeSpotPairOption(item, nextTicker) : item,
+              ),
+              fetchedAt: Date.now(),
+            });
+          }
+          return nextItems;
+        });
+      } catch (error) {
+        console.warn('SpotPage current pair metadata refresh warning:', error);
+      }
+    };
+
+    void refreshCurrentPairMetadata();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [symbol]);
 
   useEffect(() => {
     const category = String(initialCategory || '').trim().toLowerCase();
