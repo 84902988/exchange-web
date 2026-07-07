@@ -950,6 +950,17 @@ async function fetchAllContractToolbarPairs(params: {
   return mergeUniquePairs(collected);
 }
 
+function getContractPairCategoryForSelectorView(
+  marketTab: MarketLayerTab,
+  spotCategory: PairCategory,
+  contractCategory: ContractCategory,
+): string {
+  if (marketTab === 'stock') return 'stock';
+  if (marketTab === 'cfd') return contractCategory === 'all' ? 'all' : contractCategory;
+  if (marketTab === 'crypto' && (spotCategory === 'all' || spotCategory === 'contract')) return 'crypto';
+  return 'all';
+}
+
 export default function GlobalMarketSelector({
   symbol,
   interval,
@@ -1011,6 +1022,8 @@ export default function GlobalMarketSelector({
   const contractTickerBatchHydratingRef = useRef<Set<string>>(contractTickerBatchHydratingStore);
   const visibleTickerDebounceRef = useRef<number | null>(null);
   const preloadStartedRef = useRef(false);
+  const loadedSpotPairKeysRef = useRef<Set<string>>(new Set());
+  const loadedContractPairKeysRef = useRef<Set<string>>(new Set());
   const sharedRowsCacheSeededRef = useRef(false);
   const wasOpenRef = useRef(false);
   const spotRequestIdRef = useRef(0);
@@ -1021,7 +1034,8 @@ export default function GlobalMarketSelector({
   const pairKeyword = search.trim();
   const spotPairsCacheKey = `spot:${MARKET_SELECTOR_CACHE_VERSION}:${spotPairCategory}:${spotPairQuote}:${pairKeyword}`;
   const contractPairQuote = 'all';
-  const contractPairsCacheKey = `contract:${MARKET_SELECTOR_CACHE_VERSION}:all:${contractPairQuote}:${pairKeyword}`;
+  const contractPairCategory = getContractPairCategoryForSelectorView(marketTab, spotCategory, contractCategory);
+  const contractPairsCacheKey = `contract:${MARKET_SELECTOR_CACHE_VERSION}:${contractPairCategory}:${contractPairQuote}:${pairKeyword}`;
   const externalPairItems = useMemo<GlobalMarketSelectorPair[]>(() => {
     if (pairs?.length) return pairs;
     return symbols.map((item) => ({
@@ -1118,6 +1132,16 @@ export default function GlobalMarketSelector({
   const showIntervalControls = pageType !== 'spot';
   const showTimeSharing = pageType === 'spot' && Boolean(onChartModeChange);
   const isHeaderPlacement = placement === 'header';
+  const needsSpotRows =
+    marketTab === 'crypto' &&
+    spotCategory !== 'contract';
+  const needsContractRows =
+    marketTab === 'stock' ||
+    marketTab === 'cfd' ||
+    (marketTab === 'crypto' && (spotCategory === 'all' || spotCategory === 'contract'));
+  const activePairsRefreshing =
+    (needsSpotRows && spotPairsLoading) ||
+    (needsContractRows && contractPairsLoading);
 
   useEffect(() => {
     if (intervalOptions.includes(interval)) return;
@@ -1354,10 +1378,12 @@ export default function GlobalMarketSelector({
     if (cachedSpotPairs?.length && spotPairsCacheKey === DEFAULT_SPOT_PAIRS_CACHE_KEY) {
       setInternalSpotPairs(cachedSpotPairs);
       setInternalSpotPairsKey(DEFAULT_SPOT_PAIRS_CACHE_KEY);
+      loadedSpotPairKeysRef.current.add(DEFAULT_SPOT_PAIRS_CACHE_KEY);
     }
     if (cachedContractPairs?.length && contractPairsCacheKey === DEFAULT_CONTRACT_PAIRS_CACHE_KEY) {
       setInternalContractPairs(cachedContractPairs);
       setInternalContractPairsKey(DEFAULT_CONTRACT_PAIRS_CACHE_KEY);
+      loadedContractPairKeysRef.current.add(DEFAULT_CONTRACT_PAIRS_CACHE_KEY);
     }
     if (seeded.tickerChanged) {
       setTickerCacheVersion((value) => value + 1);
@@ -1375,10 +1401,16 @@ export default function GlobalMarketSelector({
       try {
         const hasDefaultSpotPairs = !!spotPairsCacheRef.current.get(DEFAULT_SPOT_PAIRS_CACHE_KEY)?.length;
         const hasDefaultContractPairs = !!contractPairsCacheRef.current.get(DEFAULT_CONTRACT_PAIRS_CACHE_KEY)?.length;
-        if (hasDefaultSpotPairs && hasDefaultContractPairs) return;
+        const shouldPreloadSpotPairs = pageType === 'spot';
+        const shouldPreloadContractPairs = pageType === 'contract';
+        if (!shouldPreloadSpotPairs && !shouldPreloadContractPairs) return;
+        if (
+          (!shouldPreloadSpotPairs || hasDefaultSpotPairs) &&
+          (!shouldPreloadContractPairs || hasDefaultContractPairs)
+        ) return;
 
         const [spotResult, contractResult] = await Promise.allSettled([
-          hasDefaultSpotPairs
+          !shouldPreloadSpotPairs || hasDefaultSpotPairs
             ? Promise.resolve<GlobalMarketSelectorPair[]>([])
             : fetchAllGlobalMarketSelectorPairs({
                 marketType: 'spot',
@@ -1386,7 +1418,7 @@ export default function GlobalMarketSelector({
                 quote: 'all',
                 labels: marketDisplayLabels,
               }),
-          hasDefaultContractPairs
+          !shouldPreloadContractPairs || hasDefaultContractPairs
             ? Promise.resolve<GlobalMarketSelectorPair[]>([])
             : fetchAllContractToolbarPairs({
                 category: 'all',
@@ -1399,6 +1431,7 @@ export default function GlobalMarketSelector({
         if (spotResult.status === 'fulfilled' && spotResult.value.length) {
           const nextSpotPairs = spotResult.value;
           spotPairsCacheRef.current.set(DEFAULT_SPOT_PAIRS_CACHE_KEY, nextSpotPairs);
+          loadedSpotPairKeysRef.current.add(DEFAULT_SPOT_PAIRS_CACHE_KEY);
           if (spotPairsCacheKey === DEFAULT_SPOT_PAIRS_CACHE_KEY) {
             setInternalSpotPairs(nextSpotPairs);
             setInternalSpotPairsKey(DEFAULT_SPOT_PAIRS_CACHE_KEY);
@@ -1416,6 +1449,7 @@ export default function GlobalMarketSelector({
             externalPairItems.filter(isContractMarketPair),
           );
           contractPairsCacheRef.current.set(DEFAULT_CONTRACT_PAIRS_CACHE_KEY, nextContractPairs);
+          loadedContractPairKeysRef.current.add(DEFAULT_CONTRACT_PAIRS_CACHE_KEY);
           if (contractPairsCacheKey === DEFAULT_CONTRACT_PAIRS_CACHE_KEY) {
             setInternalContractPairs(nextContractPairs);
             setInternalContractPairsKey(DEFAULT_CONTRACT_PAIRS_CACHE_KEY);
@@ -1431,7 +1465,7 @@ export default function GlobalMarketSelector({
     return () => {
       cancelled = true;
     };
-  }, [contractPairsCacheKey, externalPairItems, hydrateTickerSymbols, marketDisplayLabels, spotPairsCacheKey]);
+  }, [contractPairsCacheKey, externalPairItems, hydrateTickerSymbols, marketDisplayLabels, pageType, spotPairsCacheKey]);
 
   useEffect(() => {
     if (marketTab === 'favorites') return;
@@ -1453,9 +1487,12 @@ export default function GlobalMarketSelector({
     if (cachedPairs) {
       setInternalSpotPairs(cachedPairs);
       setInternalSpotPairsKey(spotPairsCacheKey);
+      loadedSpotPairKeysRef.current.add(spotPairsCacheKey);
     }
-    // Keep the instant cached render, but always revalidate while the selector is open.
-    // Trading-pair display categories are changed from admin and must not stay sticky.
+    if (loadedSpotPairKeysRef.current.has(spotPairsCacheKey) || cachedPairs) {
+      setSpotPairsLoading(false);
+      return;
+    }
     setSpotPairsLoading(!cachedPairs);
 
     const loadSpotPairs = async () => {
@@ -1470,6 +1507,7 @@ export default function GlobalMarketSelector({
 
         if (requestId !== spotRequestIdRef.current) return;
         spotPairsCacheRef.current.set(spotPairsCacheKey, nextPairs);
+        loadedSpotPairKeysRef.current.add(spotPairsCacheKey);
         setInternalSpotPairs(nextPairs);
         setInternalSpotPairsKey(spotPairsCacheKey);
         hydrateTickerSymbols(
@@ -1492,22 +1530,27 @@ export default function GlobalMarketSelector({
   }, [hydrateTickerSymbols, marketDisplayLabels, marketTab, open, pairKeyword, spotCategory, spotPairCategory, spotPairQuote, spotPairsCacheKey]);
 
   useEffect(() => {
-    if (!open || !['crypto', 'stock', 'cfd'].includes(marketTab)) return;
-    if (marketTab === 'crypto' && spotCategory !== 'all' && spotCategory !== 'contract') return;
+    if (!open || !needsContractRows) return;
 
     const requestId = ++contractRequestIdRef.current;
-    const cachedPairs = contractPairsCacheRef.current.get(contractPairsCacheKey);
+    const cachedPairs =
+      contractPairsCacheRef.current.get(contractPairsCacheKey) ||
+      (!pairKeyword ? contractPairsCacheRef.current.get(DEFAULT_CONTRACT_PAIRS_CACHE_KEY) : undefined);
     if (cachedPairs) {
       setInternalContractPairs(cachedPairs);
       setInternalContractPairsKey(contractPairsCacheKey);
+      loadedContractPairKeysRef.current.add(contractPairsCacheKey);
     }
-    // Same revalidation rule as spot pairs: cached rows are only a warm start.
+    if (loadedContractPairKeysRef.current.has(contractPairsCacheKey) || cachedPairs) {
+      setContractPairsLoading(false);
+      return;
+    }
     setContractPairsLoading(!cachedPairs);
 
     const loadContractPairs = async () => {
       try {
         const contractResponsePromise = fetchAllContractToolbarPairs({
-          category: 'all',
+          category: contractPairCategory,
           quote: contractPairQuote,
           keyword: pairKeyword,
           labels: marketDisplayLabels,
@@ -1520,6 +1563,7 @@ export default function GlobalMarketSelector({
           externalPairItems.filter(isContractMarketPair),
         );
         contractPairsCacheRef.current.set(contractPairsCacheKey, nextPairs);
+        loadedContractPairKeysRef.current.add(contractPairsCacheKey);
         setInternalContractPairs(nextPairs);
         setInternalContractPairsKey(contractPairsCacheKey);
       } catch (error) {
@@ -1534,18 +1578,7 @@ export default function GlobalMarketSelector({
     };
 
     void loadContractPairs();
-  }, [contractPairQuote, contractPairsCacheKey, externalPairItems, marketDisplayLabels, marketTab, open, pageType, pairKeyword, spotCategory]);
-
-  const needsSpotRows =
-    marketTab === 'crypto' &&
-    spotCategory !== 'contract';
-  const needsContractRows =
-    marketTab === 'stock' ||
-    marketTab === 'cfd' ||
-    (marketTab === 'crypto' && (spotCategory === 'all' || spotCategory === 'contract'));
-  const activePairsRefreshing =
-    (needsSpotRows && spotPairsLoading) ||
-    (needsContractRows && contractPairsLoading);
+  }, [contractPairCategory, contractPairQuote, contractPairsCacheKey, externalPairItems, marketDisplayLabels, needsContractRows, open, pairKeyword]);
 
   const pairMatchesSearch = useCallback((pair: GlobalMarketSelectorPair, query: string) => {
     if (!query) return true;
