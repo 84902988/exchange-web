@@ -28,6 +28,9 @@ export type SpotKlineCacheEntry = {
   symbol: string;
   interval: string;
   limit: number;
+  requestedLimit: number;
+  returnedCount: number;
+  terminalComplete: boolean;
   bars: SpotTradingViewBar[];
   provider?: unknown;
   source?: unknown;
@@ -105,6 +108,7 @@ const SPOT_KLINE_LOAD_POLICY: Record<string, SpotKlineLoadPolicy> = {
   '1M': { current: 60, preload: 48, history: 60 },
   '1Mutc': { current: 60, preload: 48, history: 60 },
 };
+const SPOT_KLINE_CONTRACT_PRELOAD_LIMIT = 360;
 
 const currentKlineCache = new Map<string, SpotKlineCacheEntry>();
 
@@ -157,7 +161,7 @@ export function getSpotKlineLoadPolicy(interval: string): SpotKlineLoadPolicy {
 }
 
 export function getPreloadKlineLimit(interval: string) {
-  return getSpotKlineLoadPolicy(interval).current;
+  return Math.max(getSpotKlineLoadPolicy(interval).current, SPOT_KLINE_CONTRACT_PRELOAD_LIMIT);
 }
 
 export function getL1CurrentKlineCacheMinBars(interval: string, requiredBars: number) {
@@ -235,6 +239,18 @@ function isFreshKlineCacheEntry(entry: SpotKlineCacheEntry, now = Date.now()) {
   return now - entry.updatedAt <= getCurrentKlineCacheTtlMs(entry.interval);
 }
 
+function isTerminalCompleteKlineCacheEntry(interval: string, requestedLimit: number, returnedCount: number) {
+  const normalizedInterval = normalizeSpotInterval(interval);
+  return normalizedInterval === '1Mutc' && returnedCount > 0 && returnedCount < requestedLimit;
+}
+
+function doesEntryCoverRequestedLimit(entry: SpotKlineCacheEntry, requestedLimit: number) {
+  return (
+    entry.bars.length >= requestedLimit ||
+    (entry.terminalComplete && entry.requestedLimit >= requestedLimit)
+  );
+}
+
 export function buildKlineCachePerfPayload(
   entry: SpotKlineCacheEntry | null | undefined,
   fallback: {
@@ -249,6 +265,9 @@ export function buildKlineCachePerfPayload(
     interval: entry?.interval || normalizeSpotInterval(fallback.interval),
     backendInterval: entry?.interval || normalizeSpotInterval(fallback.interval),
     limit: entry?.limit || Math.max(1, fallback.limit),
+    requestedLimit: entry?.requestedLimit || Math.max(1, fallback.limit),
+    returnedCount: entry?.returnedCount || 0,
+    terminalComplete: Boolean(entry?.terminalComplete),
     bars_count: entry?.bars.length || 0,
     cache_age_ms: entry ? Math.max(0, now - entry.updatedAt) : null,
     cached_at: entry?.cachedAt || null,
@@ -273,8 +292,8 @@ export function inspectCurrentKlineCache(
   const candidates = Array.from(currentKlineCache.values())
     .filter((entry) => entry.symbol === normalizedSymbol && entry.interval === normalizedInterval)
     .sort((a, b) => {
-      const aCoversRequest = a.bars.length >= requestedLimit ? 0 : 1;
-      const bCoversRequest = b.bars.length >= requestedLimit ? 0 : 1;
+      const aCoversRequest = doesEntryCoverRequestedLimit(a, requestedLimit) ? 0 : 1;
+      const bCoversRequest = doesEntryCoverRequestedLimit(b, requestedLimit) ? 0 : 1;
       return aCoversRequest - bCoversRequest || b.bars.length - a.bars.length || b.updatedAt - a.updatedAt;
     });
 
@@ -304,7 +323,7 @@ export function inspectCurrentKlineCache(
       firstRejected = firstRejected || { ...baseResult, reason: 'expired', continuityStats: null };
       continue;
     }
-    if (entry.bars.length < minBars) {
+    if (entry.bars.length < minBars && !doesEntryCoverRequestedLimit(entry, requestedLimit)) {
       firstRejected = firstRejected || { ...baseResult, reason: 'insufficient_bars', continuityStats: null };
       continue;
     }
@@ -354,12 +373,20 @@ export function writeCurrentKlineCache(params: {
   const normalizedLimit = Math.max(1, params.limit);
   const key = buildCurrentKlineCacheKey(normalizedSymbol, normalizedInterval, normalizedLimit);
   const storedBars = cloneBars(params.bars.slice(-normalizedLimit));
+  const terminalComplete = isTerminalCompleteKlineCacheEntry(
+    normalizedInterval,
+    normalizedLimit,
+    storedBars.length,
+  );
   const cachedAt = Date.now();
   const entry: SpotKlineCacheEntry = {
     key,
     symbol: normalizedSymbol,
     interval: normalizedInterval,
     limit: normalizedLimit,
+    requestedLimit: normalizedLimit,
+    returnedCount: storedBars.length,
+    terminalComplete,
     bars: storedBars,
     provider: params.provider,
     source: params.source,
@@ -377,6 +404,16 @@ export function writeCurrentKlineCache(params: {
     }),
     reason: 'store current kline bars',
   });
+  if (terminalComplete) {
+    markSpotKlinePerf('kline_l1_cache_terminal_complete', {
+      ...buildKlineCachePerfPayload(entry, {
+        symbol: normalizedSymbol,
+        interval: normalizedInterval,
+        limit: normalizedLimit,
+      }),
+      reason: 'current response returned complete available monthly history',
+    });
+  }
 
   if (currentKlineCache.size > CURRENT_KLINE_CACHE_MAX_KEYS) {
     const overflow = currentKlineCache.size - CURRENT_KLINE_CACHE_MAX_KEYS;

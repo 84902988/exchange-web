@@ -12,9 +12,16 @@ import {
 import { markSpotKlinePerf } from './spotKlinePerf';
 
 export const SPOT_KLINE_PRELOAD_COMMON_INTERVALS = ['4h', '1h', '15m', '5m', '1m'];
+export const SPOT_KLINE_PRELOAD_COARSE_INTERVALS = ['1d', '1w', '1M'];
 export const SPOT_KLINE_PRELOAD_DELAY_MS = 1800;
 
-const SPOT_PRELOAD_ALLOWED_INTERVALS = new Set(SPOT_KLINE_PRELOAD_COMMON_INTERVALS);
+const SPOT_PRELOAD_ALLOWED_INTERVALS = new Set([
+  ...SPOT_KLINE_PRELOAD_COMMON_INTERVALS,
+  ...SPOT_KLINE_PRELOAD_COARSE_INTERVALS,
+  '1Mutc',
+  '1Wutc',
+  '1Dutc',
+]);
 const SPOT_KLINE_PRELOAD_GAP_MS = 300;
 
 type SpotKlinePreloadIdleHandle = {
@@ -47,9 +54,7 @@ export type SpotKlinePreloadManager = {
 type PreloadSpotTradingViewKlineCacheOptions = {
   symbol: string;
   intervals: string[];
-  skipInterval?: string;
   concurrency?: number;
-  getSkipInterval?: () => string | null | undefined;
   shouldContinue?: () => boolean;
 };
 
@@ -94,23 +99,44 @@ function isSpotPreloadAllowedInterval(interval: string) {
   return SPOT_PRELOAD_ALLOWED_INTERVALS.has(normalizeSpotInterval(interval));
 }
 
-export function getSpotPreloadIntervals(interval: string) {
-  const normalizedInterval = normalizeSpotInterval(interval);
-  return SPOT_KLINE_PRELOAD_COMMON_INTERVALS.filter((item) => item !== normalizedInterval);
+function markSpotKlinePreloadSkipCached(params: {
+  symbol: string;
+  interval: string;
+  limit: number;
+  cacheLookup: ReturnType<typeof inspectCurrentKlineCache>;
+  reason: string;
+}) {
+  const cached = params.cacheLookup.hit;
+  if (!cached) return;
+  markSpotKlinePerf(cached.terminalComplete
+    ? 'kline_preload_skip_terminal_complete'
+    : 'kline_preload_skip_cached', {
+    ...buildKlineCachePerfPayload(cached, {
+      symbol: params.symbol,
+      interval: params.interval,
+      limit: params.limit,
+    }),
+    reason: params.reason,
+    cache_age_ms: params.cacheLookup.cacheAgeMs ?? null,
+  });
+}
+
+export function getSpotPreloadIntervals() {
+  return [
+    ...SPOT_KLINE_PRELOAD_COMMON_INTERVALS,
+    ...SPOT_KLINE_PRELOAD_COARSE_INTERVALS,
+  ];
 }
 
 export async function preloadSpotTradingViewKlineCache({
   symbol,
   intervals,
-  skipInterval,
   concurrency = 1,
-  getSkipInterval,
   shouldContinue,
 }: PreloadSpotTradingViewKlineCacheOptions) {
   const normalizedSymbol = normalizeSpotSymbol(symbol);
   if (!normalizedSymbol) return;
 
-  const normalizedSkipInterval = skipInterval ? getBackendKlineIntervalForSpotInterval(skipInterval) : '';
   const queue: Array<{ interval: string; limit: number }> = [];
   const seenIntervals = new Set<string>();
 
@@ -129,23 +155,14 @@ export async function preloadSpotTradingViewKlineCache({
       });
       continue;
     }
-    if (interval === normalizedSkipInterval) {
-      markSpotKlinePerf('kline_preload_cancel', {
-        symbol: normalizedSymbol,
-        interval,
-        backendInterval: interval,
-        limit,
-        reason: 'skip active interval',
-      });
-      continue;
-    }
-
     const cacheLookup = inspectCurrentKlineCache(normalizedSymbol, interval, limit, { minBars: limit });
     if (cacheLookup.hit) {
-      markSpotKlinePerf('kline_preload_skip_cached', {
-        ...buildKlineCachePerfPayload(cacheLookup.hit, { symbol: normalizedSymbol, interval, limit }),
+      markSpotKlinePreloadSkipCached({
+        symbol: normalizedSymbol,
+        interval,
+        limit,
+        cacheLookup,
         reason: 'fresh cache already available',
-        cache_age_ms: cacheLookup.cacheAgeMs ?? null,
       });
       continue;
     }
@@ -157,11 +174,6 @@ export async function preloadSpotTradingViewKlineCache({
   const workerCount = Math.max(1, Math.min(Math.floor(concurrency || 1), 1, queue.length));
   let cursor = 0;
   const shouldRun = () => !shouldContinue || shouldContinue();
-  const getCurrentSkipInterval = () => (
-    getSkipInterval
-      ? getBackendKlineIntervalForSpotInterval(getSkipInterval() || '')
-      : normalizedSkipInterval
-  );
 
   await Promise.all(Array.from({ length: workerCount }, async () => {
     while (shouldRun()) {
@@ -169,30 +181,16 @@ export async function preloadSpotTradingViewKlineCache({
       if (!item) return;
       const startedAt = getSpotKlinePreloadPerfNow();
       try {
-        const activeSkipInterval = getCurrentSkipInterval();
-        if (item.interval === activeSkipInterval) {
-          markSpotKlinePerf('kline_preload_cancel', {
-            symbol: normalizedSymbol,
-            interval: item.interval,
-            backendInterval: item.interval,
-            limit: item.limit,
-            reason: 'skip current active interval',
-          });
-          await waitForSpotKlinePreloadGap(shouldContinue);
-          continue;
-        }
         const cacheLookup = inspectCurrentKlineCache(normalizedSymbol, item.interval, item.limit, {
           minBars: item.limit,
         });
         if (cacheLookup.hit) {
-          markSpotKlinePerf('kline_preload_skip_cached', {
-            ...buildKlineCachePerfPayload(cacheLookup.hit, {
-              symbol: normalizedSymbol,
-              interval: item.interval,
-              limit: item.limit,
-            }),
+          markSpotKlinePreloadSkipCached({
+            symbol: normalizedSymbol,
+            interval: item.interval,
+            limit: item.limit,
+            cacheLookup,
             reason: 'fresh cache already available before preload',
-            cache_age_ms: cacheLookup.cacheAgeMs ?? null,
           });
           await waitForSpotKlinePreloadGap(shouldContinue);
           continue;
@@ -305,12 +303,14 @@ export function createSpotKlinePreloadManager(params: {
 
     const state = params.getState();
     const activeSymbol = normalizeSpotSymbol(state.symbol);
-    const activeInterval = state.interval || '1m';
+    const activeInterval = state.interval || event.interval || '1m';
     const activeResolution = state.resolution;
     const eventSymbol = normalizeSpotSymbol(event.symbol);
     if (!activeSymbol || eventSymbol !== activeSymbol || event.resolution !== activeResolution) return;
 
-    const intervals = getSpotPreloadIntervals(activeInterval);
+    const eventInterval = event.interval || activeInterval;
+    const eventBackendInterval = event.backendInterval || getBackendKlineIntervalForSpotInterval(eventInterval);
+    const intervals = getSpotPreloadIntervals();
     if (!intervals.length) return;
 
     if (preloadOwnerSymbol && preloadOwnerSymbol !== activeSymbol) {
@@ -327,8 +327,8 @@ export function createSpotKlinePreloadManager(params: {
     preloadOwnerSymbol = activeSymbol;
     markSpotKlinePerf('kline_preload_schedule', {
       symbol: activeSymbol,
-      interval: activeInterval,
-      backendInterval: event.backendInterval,
+      interval: eventInterval,
+      backendInterval: eventBackendInterval,
       bars_count: event.barCount,
       limit: event.requiredBars,
       intervals,
@@ -345,9 +345,7 @@ export function createSpotKlinePreloadManager(params: {
         void preloadSpotTradingViewKlineCache({
           symbol: activeSymbol,
           intervals,
-          skipInterval: activeInterval,
           concurrency: 1,
-          getSkipInterval: () => params.getState().interval,
           shouldContinue: () => (
             preloadSeq === scheduleSeq &&
             normalizeSpotSymbol(params.getState().symbol) === activeSymbol
