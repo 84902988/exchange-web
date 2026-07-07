@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Optional
 
@@ -431,7 +432,8 @@ async def spot_market_ws(websocket: WebSocket):
     3. 支持 subscribe:BTCUSDT 这种方式切换订阅交易对
     """
     symbol = (websocket.query_params.get("symbol") or "").upper().strip()
-    interval = (websocket.query_params.get("interval") or "1m").strip()
+    interval_param = websocket.query_params.get("interval")
+    interval = interval_param.strip() if interval_param is not None else None
     if not symbol:
         await websocket.close(code=1008)
         return
@@ -461,6 +463,22 @@ async def spot_market_ws(websocket: WebSocket):
                     if text == "ping":
                         await websocket.send_text("pong")
                         continue
+
+                    try:
+                        payload = json.loads(text)
+                    except (TypeError, ValueError):
+                        payload = None
+                    if isinstance(payload, dict):
+                        op = str(payload.get("op") or "").lower().strip()
+                        domain = str(payload.get("domain") or "").lower().strip()
+                        if op in {"subscribe", "unsubscribe"} and domain == "kline":
+                            await market_ws_manager.set_kline_subscription(
+                                connected_symbol,
+                                websocket,
+                                str(payload.get("interval") or ""),
+                                subscribed=op == "subscribe",
+                            )
+                            continue
 
                     if text.startswith("subscribe:"):
                         new_symbol = text.split(":", 1)[1].upper().strip()

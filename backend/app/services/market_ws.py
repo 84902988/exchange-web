@@ -80,7 +80,7 @@ def _build_spot_snapshot_payload(symbol: str) -> dict:
 class MarketWsManager:
     def __init__(self) -> None:
         self._symbol_rooms: Dict[str, Set[WebSocket]] = defaultdict(set)
-        self._connection_intervals: Dict[WebSocket, str] = {}
+        self._connection_kline_intervals: Dict[WebSocket, Set[str]] = {}
         self._lock = asyncio.Lock()
 
     async def connect(
@@ -94,10 +94,12 @@ class MarketWsManager:
         if not accepted and websocket.application_state == WebSocketState.CONNECTING:
             await websocket.accept()
         symbol = _normalize_symbol(symbol)
-        normalized_interval = _normalize_interval(interval)
+        normalized_interval = _normalize_interval(interval) if interval else None
         async with self._lock:
             self._symbol_rooms[symbol].add(websocket)
-            self._connection_intervals[websocket] = normalized_interval
+            intervals = self._connection_kline_intervals.setdefault(websocket, set())
+            if normalized_interval:
+                intervals.add(normalized_interval)
         await self._ensure_spot_provider_depth(symbol, normalized_interval)
 
     async def disconnect(self, symbol: str, websocket: WebSocket) -> None:
@@ -107,7 +109,7 @@ class MarketWsManager:
             conns = self._symbol_rooms.get(symbol, set())
             if websocket in conns:
                 conns.remove(websocket)
-            self._connection_intervals.pop(websocket, None)
+            self._connection_kline_intervals.pop(websocket, None)
             if not conns and symbol in self._symbol_rooms:
                 self._symbol_rooms.pop(symbol, None)
                 should_release = True
@@ -128,10 +130,39 @@ class MarketWsManager:
         symbol = _normalize_symbol(symbol)
         async with self._lock:
             intervals = {
-                self._connection_intervals.get(ws, "1m")
+                interval
                 for ws in self._symbol_rooms.get(symbol, set())
+                for interval in self._connection_kline_intervals.get(ws, set())
             }
         return sorted(interval for interval in intervals if interval)
+
+    async def set_kline_subscription(
+        self,
+        symbol: str,
+        websocket: WebSocket,
+        interval: str | None,
+        *,
+        subscribed: bool,
+    ) -> None:
+        symbol = _normalize_symbol(symbol)
+        normalized_interval = _normalize_interval(interval)
+        if not symbol:
+            return
+
+        should_ensure = False
+        async with self._lock:
+            if websocket not in self._symbol_rooms.get(symbol, set()):
+                return
+            intervals = self._connection_kline_intervals.setdefault(websocket, set())
+            if subscribed:
+                if normalized_interval not in intervals:
+                    intervals.add(normalized_interval)
+                    should_ensure = True
+            else:
+                intervals.discard(normalized_interval)
+
+        if subscribed and should_ensure:
+            await self._ensure_spot_provider_depth(symbol, normalized_interval)
 
     async def _cleanup_dead(self, symbol: str, dead: list[WebSocket]) -> None:
         if not dead:
@@ -143,7 +174,7 @@ class MarketWsManager:
             room = self._symbol_rooms.get(symbol, set())
             for ws in dead:
                 room.discard(ws)
-                self._connection_intervals.pop(ws, None)
+                self._connection_kline_intervals.pop(ws, None)
             if not room and symbol in self._symbol_rooms:
                 self._symbol_rooms.pop(symbol, None)
                 should_release = True
@@ -155,7 +186,7 @@ class MarketWsManager:
         if not symbol:
             return
 
-        conns = await self._get_connections(symbol)
+        conns = await self._get_payload_recipients(symbol, payload)
         if not conns:
             return
 
@@ -170,11 +201,28 @@ class MarketWsManager:
 
         await self._cleanup_dead(symbol, dead)
 
+    async def _get_payload_recipients(self, symbol: str, payload: dict) -> list[WebSocket]:
+        symbol = _normalize_symbol(symbol)
+        payload_type = str(payload.get("type") or "")
+        if payload_type != "spot_kline_update":
+            return await self._get_connections(symbol)
+
+        interval = _normalize_interval(str(payload.get("interval") or "1m"))
+        async with self._lock:
+            return [
+                ws
+                for ws in self._symbol_rooms.get(symbol, set())
+                if interval in self._connection_kline_intervals.get(ws, set())
+            ]
+
     async def _ensure_spot_provider_depth(self, symbol: str, interval: str | None = None) -> None:
         try:
             from app.services.spot_market_gateway import spot_market_gateway
 
-            await spot_market_gateway.ensure_symbol(symbol, interval=_normalize_interval(interval))
+            await spot_market_gateway.ensure_symbol(
+                symbol,
+                interval=_normalize_interval(interval) if interval else None,
+            )
         except Exception:
             logger.warning("spot_market_ws_provider_depth_ensure_failed symbol=%s", symbol, exc_info=True)
 
