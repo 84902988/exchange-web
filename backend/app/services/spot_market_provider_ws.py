@@ -1028,6 +1028,11 @@ class SpotMarketProviderWsService:
         self._ticker_generations: dict[tuple[str, str], int] = {}
         self._trades_generations: dict[tuple[str, str], int] = {}
         self._kline_generations: dict[tuple[str, str, str], int] = {}
+        self._task_started_at_ms: dict[tuple[str, str, str, str], int] = {}
+        self._task_stopped_at_ms: dict[tuple[str, str, str, str], int] = {}
+        self._task_start_counts: dict[tuple[str, str, str, str], int] = {}
+        self._task_stop_counts: dict[tuple[str, str, str, str], int] = {}
+        self._task_reconnect_counts: dict[tuple[str, str, str, str], int] = {}
         self._lock = threading.RLock()
 
     def get_fresh_depth(
@@ -1229,6 +1234,198 @@ class SpotMarketProviderWsService:
             self._ticker_generations.clear()
             self._trades_generations.clear()
             self._kline_generations.clear()
+            self._task_started_at_ms.clear()
+            self._task_stopped_at_ms.clear()
+            self._task_start_counts.clear()
+            self._task_stop_counts.clear()
+            self._task_reconnect_counts.clear()
+
+    def get_metrics_snapshot(self) -> dict[str, Any]:
+        now_ms = _now_ms()
+        with self._lock:
+            active_provider_tasks = []
+            for key, task in self._depth_tasks.items():
+                provider, symbol = key
+                active_provider_tasks.append(
+                    self._provider_task_snapshot_locked(
+                        domain="depth",
+                        provider=provider,
+                        symbol=symbol,
+                        interval=None,
+                        task=task,
+                        stop_event=self._depth_stops.get(key),
+                        connected=key in self._depth_connections,
+                    )
+                )
+            for key, task in self._ticker_tasks.items():
+                provider, symbol = key
+                active_provider_tasks.append(
+                    self._provider_task_snapshot_locked(
+                        domain="ticker",
+                        provider=provider,
+                        symbol=symbol,
+                        interval=None,
+                        task=task,
+                        stop_event=self._ticker_stops.get(key),
+                        connected=key in self._ticker_connections,
+                    )
+                )
+            for key, task in self._trades_tasks.items():
+                provider, symbol = key
+                active_provider_tasks.append(
+                    self._provider_task_snapshot_locked(
+                        domain="trades",
+                        provider=provider,
+                        symbol=symbol,
+                        interval=None,
+                        task=task,
+                        stop_event=self._trades_stops.get(key),
+                        connected=key in self._trades_connections,
+                    )
+                )
+            for key, task in self._kline_tasks.items():
+                provider, symbol, interval = key
+                active_provider_tasks.append(
+                    self._provider_task_snapshot_locked(
+                        domain="kline",
+                        provider=provider,
+                        symbol=symbol,
+                        interval=interval,
+                        task=task,
+                        stop_event=self._kline_stops.get(key),
+                        connected=key in self._kline_connections,
+                    )
+                )
+
+            active_kline_intervals = [
+                {
+                    "provider": provider,
+                    "symbol": symbol,
+                    "interval": interval,
+                }
+                for provider, symbol, interval in sorted(self._kline_tasks.keys())
+            ]
+            cache_records = {
+                "depth": [
+                    self._cache_record_snapshot_locked("depth", key, record, now_ms)
+                    for key, record in sorted(self._depth_cache.items())
+                ],
+                "ticker": [
+                    self._cache_record_snapshot_locked("ticker", key, record, now_ms)
+                    for key, record in sorted(self._ticker_cache.items())
+                ],
+                "trades": [
+                    self._cache_record_snapshot_locked("trades", key, record, now_ms)
+                    for key, record in sorted(self._trades_cache.items())
+                ],
+                "kline": [
+                    self._cache_record_snapshot_locked("kline", key, record, now_ms)
+                    for key, record in sorted(self._kline_cache.items())
+                ],
+            }
+
+        return {
+            "active_provider_task_count": len(active_provider_tasks),
+            "active_provider_tasks": active_provider_tasks,
+            "active_kline_intervals": active_kline_intervals,
+            "cache_records": cache_records,
+        }
+
+    def _provider_metric_key(
+        self,
+        domain: str,
+        provider: str,
+        symbol: str,
+        interval: Optional[str] = None,
+    ) -> tuple[str, str, str, str]:
+        return (domain, provider, symbol, interval or "")
+
+    def _remember_provider_task_started_locked(
+        self,
+        domain: str,
+        provider: str,
+        symbol: str,
+        interval: Optional[str] = None,
+    ) -> None:
+        metric_key = self._provider_metric_key(domain, provider, symbol, interval)
+        self._task_started_at_ms[metric_key] = _now_ms()
+        self._task_start_counts[metric_key] = int(self._task_start_counts.get(metric_key) or 0) + 1
+
+    def _remember_provider_task_stopped_locked(
+        self,
+        domain: str,
+        provider: str,
+        symbol: str,
+        interval: Optional[str] = None,
+    ) -> None:
+        metric_key = self._provider_metric_key(domain, provider, symbol, interval)
+        self._task_stopped_at_ms[metric_key] = _now_ms()
+        self._task_stop_counts[metric_key] = int(self._task_stop_counts.get(metric_key) or 0) + 1
+
+    def _remember_provider_task_reconnect(
+        self,
+        domain: str,
+        provider: str,
+        symbol: str,
+        interval: Optional[str] = None,
+    ) -> None:
+        metric_key = self._provider_metric_key(domain, provider, symbol, interval)
+        with self._lock:
+            self._task_reconnect_counts[metric_key] = int(self._task_reconnect_counts.get(metric_key) or 0) + 1
+
+    def _provider_task_snapshot_locked(
+        self,
+        *,
+        domain: str,
+        provider: str,
+        symbol: str,
+        interval: Optional[str],
+        task: threading.Thread,
+        stop_event: Optional[threading.Event],
+        connected: bool,
+    ) -> dict[str, Any]:
+        metric_key = self._provider_metric_key(domain, provider, symbol, interval)
+        return {
+            "domain": domain,
+            "provider": provider,
+            "symbol": symbol,
+            "interval": interval,
+            "thread_alive": task.is_alive(),
+            "stop_requested": bool(stop_event.is_set()) if stop_event is not None else True,
+            "connected": connected,
+            "last_start_at_ms": self._task_started_at_ms.get(metric_key),
+            "last_stop_at_ms": self._task_stopped_at_ms.get(metric_key),
+            "start_count": int(self._task_start_counts.get(metric_key) or 0),
+            "stop_count": int(self._task_stop_counts.get(metric_key) or 0),
+            "reconnect_count": int(self._task_reconnect_counts.get(metric_key) or 0),
+        }
+
+    def _cache_record_snapshot_locked(
+        self,
+        domain: str,
+        key: tuple[str, ...],
+        record: dict[str, Any],
+        now_ms: int,
+    ) -> dict[str, Any]:
+        updated_at_ms = int(record.get("updated_at_ms") or record.get("ts") or 0)
+        payload: dict[str, Any] = {
+            "domain": domain,
+            "provider": key[0] if len(key) > 0 else None,
+            "symbol": key[1] if len(key) > 1 else None,
+            "interval": key[2] if len(key) > 2 else None,
+            "updated_at_ms": updated_at_ms or None,
+            "age_ms": max(0, now_ms - updated_at_ms) if updated_at_ms > 0 else None,
+            "freshness": record.get("freshness") or record.get("quote_freshness"),
+            "source": record.get("source"),
+        }
+        if domain == "depth":
+            payload["bid_count"] = len(record.get("bids") or [])
+            payload["ask_count"] = len(record.get("asks") or [])
+        elif domain == "trades":
+            payload["trade_count"] = len(record.get("trades") or [])
+        elif domain == "kline":
+            payload["bars_count"] = len(record.get("items") or [])
+        return payload
 
     def ensure_symbol(self, symbol: str, *, provider: Optional[str] = None) -> None:
         local_symbol = normalize_spot_ws_symbol(symbol)
@@ -1288,6 +1485,7 @@ class SpotMarketProviderWsService:
                 daemon=True,
             )
             self._depth_tasks[key] = thread
+            self._remember_provider_task_started_locked("depth", provider_code, local_symbol)
             thread.start()
 
     def _ensure_ticker_symbol(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
@@ -1327,6 +1525,7 @@ class SpotMarketProviderWsService:
                 daemon=True,
             )
             self._ticker_tasks[key] = thread
+            self._remember_provider_task_started_locked("ticker", provider_code, local_symbol)
             thread.start()
 
     def _ensure_trades_symbol(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
@@ -1367,6 +1566,7 @@ class SpotMarketProviderWsService:
                 daemon=True,
             )
             self._trades_tasks[key] = thread
+            self._remember_provider_task_started_locked("trades", provider_code, local_symbol)
             thread.start()
 
     def _ensure_kline_symbol(self, local_symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
@@ -1411,6 +1611,12 @@ class SpotMarketProviderWsService:
                 daemon=True,
             )
             self._kline_tasks[key] = thread
+            self._remember_provider_task_started_locked(
+                "kline",
+                provider_code,
+                local_symbol,
+                normalized_interval,
+            )
             thread.start()
 
     def release_symbol(self, symbol: str, *, provider: Optional[str] = None) -> None:
@@ -1446,6 +1652,8 @@ class SpotMarketProviderWsService:
             task = self._depth_tasks.pop(key, None)
             connection = self._depth_connections.pop(key, None)
             self._depth_generations[key] = self._depth_generations.get(key, 0) + 1
+            if stop_event is not None or task is not None or connection is not None:
+                self._remember_provider_task_stopped_locked("depth", provider_code, local_symbol)
         if stop_event is not None:
             stop_event.set()
         if connection is not None:
@@ -1466,6 +1674,8 @@ class SpotMarketProviderWsService:
             task = self._trades_tasks.pop(key, None)
             connection = self._trades_connections.pop(key, None)
             self._trades_generations[key] = self._trades_generations.get(key, 0) + 1
+            if stop_event is not None or task is not None or connection is not None:
+                self._remember_provider_task_stopped_locked("trades", provider_code, local_symbol)
         if stop_event is not None:
             stop_event.set()
         if connection is not None:
@@ -1486,6 +1696,8 @@ class SpotMarketProviderWsService:
             task = self._ticker_tasks.pop(key, None)
             connection = self._ticker_connections.pop(key, None)
             self._ticker_generations[key] = self._ticker_generations.get(key, 0) + 1
+            if stop_event is not None or task is not None or connection is not None:
+                self._remember_provider_task_stopped_locked("ticker", provider_code, local_symbol)
         if stop_event is not None:
             stop_event.set()
         if connection is not None:
@@ -1519,6 +1731,13 @@ class SpotMarketProviderWsService:
             connection = self._kline_connections.pop(key, None)
             self._kline_trade_signatures.pop(key, None)
             self._kline_generations[key] = self._kline_generations.get(key, 0) + 1
+            if stop_event is not None or task is not None or connection is not None:
+                self._remember_provider_task_stopped_locked(
+                    "kline",
+                    provider_code,
+                    local_symbol,
+                    normalized_interval,
+                )
         if stop_event is not None:
             stop_event.set()
         if connection is not None:
@@ -1813,6 +2032,7 @@ class SpotMarketProviderWsService:
                     return
                 if stop_event.is_set():
                     return
+                self._remember_provider_task_reconnect("depth", subscription.provider, subscription.local_symbol)
                 retry_in = 1.0
                 if _is_provider_ws_recoverable_disconnect(exc):
                     _log_provider_ws_disconnected("depth", subscription, exc, retry_in=retry_in)
@@ -1843,6 +2063,7 @@ class SpotMarketProviderWsService:
                     return
                 if stop_event.is_set():
                     return
+                self._remember_provider_task_reconnect("ticker", subscription.provider, subscription.local_symbol)
                 retry_in = 1.0
                 if _is_provider_ws_recoverable_disconnect(exc):
                     _log_provider_ws_disconnected("ticker", subscription, exc, retry_in=retry_in)
@@ -1873,6 +2094,7 @@ class SpotMarketProviderWsService:
                     return
                 if stop_event.is_set():
                     return
+                self._remember_provider_task_reconnect("trades", subscription.provider, subscription.local_symbol)
                 retry_in = 1.0
                 if _is_provider_ws_recoverable_disconnect(exc):
                     _log_provider_ws_disconnected("trades", subscription, exc, retry_in=retry_in)
@@ -1903,6 +2125,12 @@ class SpotMarketProviderWsService:
                     return
                 if stop_event.is_set():
                     return
+                self._remember_provider_task_reconnect(
+                    "kline",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.interval,
+                )
                 retry_in = 1.0
                 if _is_provider_ws_recoverable_disconnect(exc):
                     _log_provider_ws_disconnected("kline", subscription, exc, retry_in=retry_in)

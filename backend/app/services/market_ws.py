@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 SPOT_SNAPSHOT_BUILD_TIMEOUT_SECONDS = 3.0
 SPOT_SNAPSHOT_VIEW_BUDGET_SECONDS = 2.2
 SPOT_SNAPSHOT_TIMEOUT_LOG_THROTTLE_SECONDS = 30.0
+SPOT_WS_SLOW_SEND_THRESHOLD_MS = 500.0
+SPOT_WS_FANOUT_SLOW_LOG_THROTTLE_SECONDS = 30.0
 _SPOT_SNAPSHOT_TIMEOUT_LOG_LAST_AT: dict[str, float] = {}
 
 
@@ -82,6 +84,11 @@ class MarketWsManager:
         self._symbol_rooms: Dict[str, Set[WebSocket]] = defaultdict(set)
         self._connection_kline_intervals: Dict[WebSocket, Set[str]] = {}
         self._lock = asyncio.Lock()
+        self._dead_cleanup_count = 0
+        self._last_connect_at: dict[str, float] = {}
+        self._last_disconnect_at: dict[str, float] = {}
+        self._fanout_metrics: dict[str, dict[str, Any]] = {}
+        self._last_slow_fanout_log_at: dict[str, float] = {}
 
     async def connect(
         self,
@@ -100,6 +107,15 @@ class MarketWsManager:
             intervals = self._connection_kline_intervals.setdefault(websocket, set())
             if normalized_interval:
                 intervals.add(normalized_interval)
+            self._last_connect_at[symbol] = time.time()
+            subscriber_count = len(self._symbol_rooms.get(symbol, set()))
+            total_connections = self._total_connection_count_locked()
+        logger.info(
+            "spot_ws_connect symbol=%s subscriber_count=%s total_connections=%s",
+            symbol,
+            subscriber_count,
+            total_connections,
+        )
         await self._ensure_spot_provider_depth(symbol, normalized_interval)
 
     async def disconnect(self, symbol: str, websocket: WebSocket) -> None:
@@ -113,6 +129,15 @@ class MarketWsManager:
             if not conns and symbol in self._symbol_rooms:
                 self._symbol_rooms.pop(symbol, None)
                 should_release = True
+            self._last_disconnect_at[symbol] = time.time()
+            subscriber_count = len(self._symbol_rooms.get(symbol, set()))
+            total_connections = self._total_connection_count_locked()
+        logger.info(
+            "spot_ws_disconnect symbol=%s subscriber_count=%s total_connections=%s",
+            symbol,
+            subscriber_count,
+            total_connections,
+        )
         if should_release:
             await self._release_spot_provider_depth_if_idle(symbol)
 
@@ -135,6 +160,30 @@ class MarketWsManager:
                 for interval in self._connection_kline_intervals.get(ws, set())
             }
         return sorted(interval for interval in intervals if interval)
+
+    async def get_metrics_snapshot(self) -> dict[str, Any]:
+        async with self._lock:
+            symbols = sorted(self._symbol_rooms.keys())
+            per_symbol = {}
+            for symbol in symbols:
+                room = self._symbol_rooms.get(symbol, set())
+                interval_counts: dict[str, int] = defaultdict(int)
+                for ws in room:
+                    for interval in self._connection_kline_intervals.get(ws, set()):
+                        interval_counts[interval] += 1
+                per_symbol[symbol] = {
+                    "subscriber_count": len(room),
+                    "kline_interval_subscriber_count": dict(sorted(interval_counts.items())),
+                    "last_connect_at": self._last_connect_at.get(symbol),
+                    "last_disconnect_at": self._last_disconnect_at.get(symbol),
+                }
+            return {
+                "total_active_connections": self._total_connection_count_locked(),
+                "active_rooms": len(self._symbol_rooms),
+                "symbols": per_symbol,
+                "dead_websocket_cleanup_count": self._dead_cleanup_count,
+                "fanout": dict(self._fanout_metrics),
+            }
 
     async def set_kline_subscription(
         self,
@@ -175,6 +224,7 @@ class MarketWsManager:
             for ws in dead:
                 room.discard(ws)
                 self._connection_kline_intervals.pop(ws, None)
+            self._dead_cleanup_count += len(dead)
             if not room and symbol in self._symbol_rooms:
                 self._symbol_rooms.pop(symbol, None)
                 should_release = True
@@ -191,15 +241,45 @@ class MarketWsManager:
             return
 
         text = json.dumps(payload, ensure_ascii=False)
+        event_type = str(payload.get("type") or "unknown")
+        fanout_started_at = time.perf_counter()
 
         dead: list[WebSocket] = []
+        slow_send_count = 0
+        max_send_duration_ms = 0.0
         for ws in conns:
+            send_started_at = time.perf_counter()
             try:
                 await ws.send_text(text)
             except Exception:
                 dead.append(ws)
+            finally:
+                send_duration_ms = (time.perf_counter() - send_started_at) * 1000
+                max_send_duration_ms = max(max_send_duration_ms, send_duration_ms)
+                if send_duration_ms >= SPOT_WS_SLOW_SEND_THRESHOLD_MS:
+                    slow_send_count += 1
 
         await self._cleanup_dead(symbol, dead)
+        fanout_duration_ms = (time.perf_counter() - fanout_started_at) * 1000
+        self._remember_fanout_metric(
+            symbol=symbol,
+            event_type=event_type,
+            subscriber_count=len(conns),
+            fanout_duration_ms=fanout_duration_ms,
+            slow_send_count=slow_send_count,
+            failed_send_count=len(dead),
+            cleaned_dead_ws_count=len(dead),
+            max_send_duration_ms=max_send_duration_ms,
+        )
+        self._log_slow_fanout_if_needed(
+            symbol=symbol,
+            event_type=event_type,
+            subscriber_count=len(conns),
+            fanout_duration_ms=fanout_duration_ms,
+            slow_send_count=slow_send_count,
+            failed_send_count=len(dead),
+            cleaned_dead_ws_count=len(dead),
+        )
 
     async def _get_payload_recipients(self, symbol: str, payload: dict) -> list[WebSocket]:
         symbol = _normalize_symbol(symbol)
@@ -233,6 +313,71 @@ class MarketWsManager:
             await spot_market_gateway.release_symbol_if_idle(symbol)
         except Exception:
             logger.warning("spot_market_ws_provider_depth_release_failed symbol=%s", symbol, exc_info=True)
+
+    def _total_connection_count_locked(self) -> int:
+        return sum(len(room) for room in self._symbol_rooms.values())
+
+    def _remember_fanout_metric(
+        self,
+        *,
+        symbol: str,
+        event_type: str,
+        subscriber_count: int,
+        fanout_duration_ms: float,
+        slow_send_count: int,
+        failed_send_count: int,
+        cleaned_dead_ws_count: int,
+        max_send_duration_ms: float,
+    ) -> None:
+        metric_key = f"{symbol}:{event_type}"
+        existing = self._fanout_metrics.get(metric_key, {})
+        self._fanout_metrics[metric_key] = {
+            "symbol": symbol,
+            "event_type": event_type,
+            "subscriber_count": subscriber_count,
+            "fanout_count": int(existing.get("fanout_count") or 0) + 1,
+            "last_fanout_at": time.time(),
+            "last_fanout_duration_ms": round(fanout_duration_ms, 3),
+            "max_fanout_duration_ms": round(
+                max(float(existing.get("max_fanout_duration_ms") or 0.0), fanout_duration_ms),
+                3,
+            ),
+            "last_max_send_duration_ms": round(max_send_duration_ms, 3),
+            "slow_send_count": int(existing.get("slow_send_count") or 0) + slow_send_count,
+            "failed_send_count": int(existing.get("failed_send_count") or 0) + failed_send_count,
+            "cleaned_dead_ws_count": int(existing.get("cleaned_dead_ws_count") or 0) + cleaned_dead_ws_count,
+        }
+
+    def _log_slow_fanout_if_needed(
+        self,
+        *,
+        symbol: str,
+        event_type: str,
+        subscriber_count: int,
+        fanout_duration_ms: float,
+        slow_send_count: int,
+        failed_send_count: int,
+        cleaned_dead_ws_count: int,
+    ) -> None:
+        if slow_send_count <= 0 and fanout_duration_ms < SPOT_WS_SLOW_SEND_THRESHOLD_MS:
+            return
+        metric_key = f"{symbol}:{event_type}"
+        now = time.monotonic()
+        last_at = self._last_slow_fanout_log_at.get(metric_key)
+        if last_at is not None and now - last_at < SPOT_WS_FANOUT_SLOW_LOG_THROTTLE_SECONDS:
+            return
+        self._last_slow_fanout_log_at[metric_key] = now
+        logger.warning(
+            "spot_ws_fanout_slow symbol=%s event_type=%s duration_ms=%.1f subscribers=%s "
+            "slow_send_count=%s failed_send_count=%s cleaned_dead_ws_count=%s",
+            symbol,
+            event_type,
+            fanout_duration_ms,
+            subscriber_count,
+            slow_send_count,
+            failed_send_count,
+            cleaned_dead_ws_count,
+        )
 
     def _depth_update_payload(self, symbol: str, depth: Any) -> dict:
         depth_payload = {
