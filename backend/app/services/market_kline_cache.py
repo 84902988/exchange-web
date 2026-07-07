@@ -38,6 +38,7 @@ KLINE_CACHE_STATUS_HIT = "HIT"
 KLINE_CACHE_STATUS_MISS = "MISS"
 KLINE_CACHE_STATUS_SHORT = "SHORT"
 KLINE_CACHE_STATUS_CONTINUITY_INVALID = "CONTINUITY_INVALID"
+KLINE_CACHE_STATUS_COVERAGE_INVALID = "COVERAGE_INVALID"
 KLINE_CACHE_STATUS_STALE_OPEN = "STALE_OPEN"
 KLINE_CACHE_STATUS_PROVIDER_EMPTY = "PROVIDER_EMPTY"
 
@@ -266,6 +267,92 @@ def _next_month_open_time_ms(open_time_ms: int) -> int:
         return int((_add_one_calendar_month(local_value) - timedelta(hours=8)).timestamp() * 1000)
 
     return int(_add_one_calendar_month(value).timestamp() * 1000)
+
+
+def _floor_utc_day_open_time_ms(value_ms: int) -> int:
+    value = datetime.fromtimestamp(int(value_ms) / 1000, tz=timezone.utc)
+    start = value.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp() * 1000)
+
+
+def _floor_local_day_open_time_ms(value_ms: int, offset_hours: int = 8) -> int:
+    value = datetime.fromtimestamp(int(value_ms) / 1000, tz=timezone.utc) + timedelta(hours=offset_hours)
+    start = value.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((start - timedelta(hours=offset_hours)).timestamp() * 1000)
+
+
+def _floor_utc_week_open_time_ms(value_ms: int) -> int:
+    value = datetime.fromtimestamp(int(value_ms) / 1000, tz=timezone.utc)
+    start = (value - timedelta(days=value.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp() * 1000)
+
+
+def _floor_local_week_open_time_ms(value_ms: int, offset_hours: int = 8) -> int:
+    value = datetime.fromtimestamp(int(value_ms) / 1000, tz=timezone.utc) + timedelta(hours=offset_hours)
+    start = (value - timedelta(days=value.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((start - timedelta(hours=offset_hours)).timestamp() * 1000)
+
+
+def _floor_utc_month_open_time_ms(value_ms: int) -> int:
+    value = datetime.fromtimestamp(int(value_ms) / 1000, tz=timezone.utc)
+    start = value.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp() * 1000)
+
+
+def _floor_local_month_open_time_ms(value_ms: int, offset_hours: int = 8) -> int:
+    value = datetime.fromtimestamp(int(value_ms) / 1000, tz=timezone.utc) + timedelta(hours=offset_hours)
+    start = value.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return int((start - timedelta(hours=offset_hours)).timestamp() * 1000)
+
+
+def _expected_history_last_open_time_ms(interval: str, end_time_ms: Optional[int]) -> Optional[int]:
+    if end_time_ms in (None, "", 0):
+        return None
+    try:
+        cursor = int(end_time_ms)
+    except Exception:
+        return None
+    if cursor <= 0:
+        return None
+
+    normalized_interval = normalize_kline_interval(interval)
+    bucket_cursor = max(1, cursor - 1)
+    if normalized_interval == "1Dutc":
+        return _floor_utc_day_open_time_ms(bucket_cursor)
+    if normalized_interval == "1d":
+        return _floor_local_day_open_time_ms(bucket_cursor)
+    if normalized_interval == "1Wutc":
+        return _floor_utc_week_open_time_ms(bucket_cursor)
+    if normalized_interval == "1w":
+        return _floor_local_week_open_time_ms(bucket_cursor)
+    if normalized_interval == "1Mutc":
+        return _floor_utc_month_open_time_ms(bucket_cursor)
+    if normalized_interval == "1M":
+        return _floor_local_month_open_time_ms(bucket_cursor)
+
+    step_ms = interval_ms(normalized_interval)
+    return (bucket_cursor // step_ms) * step_ms
+
+
+def _validate_cached_klines_history_coverage(
+    items: Iterable[Any],
+    interval: str,
+    end_time_ms: Optional[int],
+) -> bool:
+    expected_last_open_time = _expected_history_last_open_time_ms(interval, end_time_ms)
+    if expected_last_open_time is None:
+        return True
+
+    rows = list(items)
+    if not rows:
+        return False
+    last_open_time = _item_open_time_ms(rows[-1])
+    if last_open_time is None:
+        return False
+    if last_open_time >= int(end_time_ms or 0):
+        return False
+
+    return last_open_time == expected_last_open_time
 
 
 def _validate_cached_klines_continuity(items: Iterable[Any], interval: str) -> bool:
@@ -804,6 +891,7 @@ def get_klines_cache_first(
         open_time_validator=open_time_validator,
     )
     cached_continuous = _validate_cached_klines_continuity(cached, normalized_interval)
+    cached_coverage_valid = _validate_cached_klines_history_coverage(cached, normalized_interval, end_time_ms)
     latest_cache_fresh = True
     if end_time_ms is None and len(cached) >= normalized_limit and cached_continuous:
         latest_cache_fresh = _latest_cache_is_fresh(
@@ -813,7 +901,12 @@ def get_klines_cache_first(
             interval=normalized_interval,
             open_time_validator=open_time_validator,
         )
-    if len(cached) >= normalized_limit and cached_continuous and (end_time_ms or latest_cache_fresh):
+    if (
+        len(cached) >= normalized_limit
+        and cached_continuous
+        and cached_coverage_valid
+        and (end_time_ms or latest_cache_fresh)
+    ):
         record_kline_db_hit(
             market_type=market_type,
             symbol=normalized_symbol,
@@ -835,6 +928,20 @@ def get_klines_cache_first(
             normalized_symbol,
             normalized_interval,
             len(cached),
+        )
+    elif cached and not cached_coverage_valid:
+        cache_status = KLINE_CACHE_STATUS_COVERAGE_INVALID
+        expected_last_open_time = _expected_history_last_open_time_ms(normalized_interval, end_time_ms)
+        last_open_time = _item_open_time_ms(cached[-1]) if cached else None
+        logger.debug(
+            "kline_db_cache_coverage_failed market_type=%s symbol=%s interval=%s count=%s end_time_ms=%s expected_last_open_time=%s last_open_time=%s",
+            market_type,
+            normalized_symbol,
+            normalized_interval,
+            len(cached),
+            end_time_ms,
+            expected_last_open_time,
+            last_open_time,
         )
     elif cached and len(cached) < normalized_limit:
         cache_status = KLINE_CACHE_STATUS_SHORT
@@ -858,7 +965,9 @@ def get_klines_cache_first(
             allow_stale_open=True,
             open_time_validator=open_time_validator,
         )
-        if rows and _validate_cached_klines_continuity(rows, normalized_interval):
+        rows_continuous = _validate_cached_klines_continuity(rows, normalized_interval)
+        rows_coverage_valid = _validate_cached_klines_history_coverage(rows, normalized_interval, end_time_ms)
+        if rows and rows_continuous and rows_coverage_valid:
             return KlineCacheResult(
                 rows,
                 origin=KLINE_CACHE_ORIGIN_STALE_CACHE,
@@ -866,6 +975,27 @@ def get_klines_cache_first(
                 provider_error_code=provider_error_code,
                 provider_error_provider=provider_error_provider,
                 history_incomplete=bool(end_time_ms is not None and len(rows) < normalized_limit),
+            )
+        if rows and not rows_coverage_valid:
+            expected_last_open_time = _expected_history_last_open_time_ms(normalized_interval, end_time_ms)
+            last_open_time = _item_open_time_ms(rows[-1]) if rows else None
+            logger.debug(
+                "kline_db_stale_cache_coverage_failed market_type=%s symbol=%s interval=%s count=%s end_time_ms=%s expected_last_open_time=%s last_open_time=%s",
+                market_type,
+                normalized_symbol,
+                normalized_interval,
+                len(rows),
+                end_time_ms,
+                expected_last_open_time,
+                last_open_time,
+            )
+            return KlineCacheResult(
+                [],
+                origin=KLINE_CACHE_ORIGIN_EMPTY,
+                cache_status=KLINE_CACHE_STATUS_COVERAGE_INVALID,
+                provider_error_code=provider_error_code,
+                provider_error_provider=provider_error_provider,
+                history_incomplete=bool(end_time_ms is not None),
             )
         if not rows:
             return KlineCacheResult(
@@ -975,6 +1105,7 @@ def get_klines_cache_first(
         open_time_validator=open_time_validator,
     )
     refreshed_continuous = _validate_cached_klines_continuity(refreshed, normalized_interval)
+    refreshed_coverage_valid = _validate_cached_klines_history_coverage(refreshed, normalized_interval, end_time_ms)
     if refreshed and not refreshed_continuous:
         logger.debug(
             "kline_db_refreshed_cache_continuity_failed market_type=%s symbol=%s interval=%s count=%s",
@@ -983,7 +1114,20 @@ def get_klines_cache_first(
             normalized_interval,
             len(refreshed),
         )
-    if refreshed and refreshed_continuous and len(refreshed) >= normalized_limit:
+    if refreshed and not refreshed_coverage_valid:
+        expected_last_open_time = _expected_history_last_open_time_ms(normalized_interval, end_time_ms)
+        last_open_time = _item_open_time_ms(refreshed[-1]) if refreshed else None
+        logger.debug(
+            "kline_db_refreshed_cache_coverage_failed market_type=%s symbol=%s interval=%s count=%s end_time_ms=%s expected_last_open_time=%s last_open_time=%s",
+            market_type,
+            normalized_symbol,
+            normalized_interval,
+            len(refreshed),
+            end_time_ms,
+            expected_last_open_time,
+            last_open_time,
+        )
+    if refreshed and refreshed_continuous and refreshed_coverage_valid and len(refreshed) >= normalized_limit:
         return KlineCacheResult(
             refreshed[-normalized_limit:],
             origin=KLINE_CACHE_ORIGIN_REST_FETCH,
