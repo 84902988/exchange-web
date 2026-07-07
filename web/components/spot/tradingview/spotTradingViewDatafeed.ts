@@ -859,18 +859,23 @@ function normalizeRequiredKlineBars(countBack: number, fallback: number) {
   return Math.min(SPOT_TV_GETBARS_MAX_INTERNAL_BARS, Math.max(1, Math.floor(requested)));
 }
 
-function getCurrentKlineLimit(interval: string, countBack?: number) {
+function getCurrentKlineRequiredBars(interval: string, countBack?: number) {
   const policy = getSpotKlineLoadPolicy(interval);
-  const requestedBars = normalizeRequiredKlineBars(Number(countBack || 0), policy.current);
-  if (isProviderCandleOnlyInterval(interval)) {
-    return Math.min(requestedBars, policy.current);
-  }
-  return requestedBars;
+  return normalizeRequiredKlineBars(Number(countBack || 0), policy.current);
 }
 
 function getHistoryKlineLimit(interval: string, countBack: number) {
   const policy = getSpotKlineLoadPolicy(interval);
   return normalizeRequiredKlineBars(countBack, policy.history);
+}
+
+function getCurrentKlineInitialLimit(interval: string, requiredBars: number) {
+  const policy = getSpotKlineLoadPolicy(interval);
+  const normalizedRequiredBars = Math.max(1, Math.floor(requiredBars || policy.current));
+  if (isProviderCandleOnlyInterval(interval)) {
+    return Math.min(normalizedRequiredBars, policy.current);
+  }
+  return getKlineRequestPageLimit(normalizedRequiredBars);
 }
 
 function getKlineRequestPageLimit(requiredBars: number, loadedBars = 0) {
@@ -1247,8 +1252,10 @@ export function createSpotTradingViewDatafeed(
       const { isHistoryRequest, requestedEndTime } = classifyKlineRequest(periodParams);
       const requiredBars = isHistoryRequest
         ? getHistoryKlineLimit(interval, countBack)
-        : getCurrentKlineLimit(interval, countBack);
-      const limit = getKlineRequestPageLimit(requiredBars);
+        : getCurrentKlineRequiredBars(interval, countBack);
+      const limit = isHistoryRequest
+        ? getKlineRequestPageLimit(requiredBars)
+        : getCurrentKlineInitialLimit(interval, requiredBars);
       const endTime = isHistoryRequest && requestedEndTime > 0 ? requestedEndTime : undefined;
       const requestKind = isHistoryRequest ? 'history' : 'current';
       const latestBarKey = getLatestBarKey(requestResolution);
@@ -1552,6 +1559,7 @@ export function createSpotTradingViewDatafeed(
         };
         if (
           cached?.bars.length &&
+          cached.bars.length >= requiredBars &&
           cached.bars.length >= l1MinBars &&
           cachedContinuityStats?.gapCount === 0 &&
           cachedContinuityStats.duplicateCount === 0
@@ -1631,15 +1639,17 @@ export function createSpotTradingViewDatafeed(
           });
           return;
         }
-        const l1Event = cacheLookup.reason === 'expired'
+        const cacheInsufficientForCountBack = Boolean(cached?.bars.length && cached.bars.length < requiredBars);
+        const l1Reason = cacheInsufficientForCountBack ? 'insufficient_bars_for_countBack' : cacheLookup.reason;
+        const l1Event = l1Reason === 'expired'
           ? 'kline_l1_cache_expired'
-          : cacheLookup.reason === 'reject_continuity'
+          : l1Reason === 'reject_continuity'
             ? 'kline_l1_cache_reject_continuity'
             : 'kline_l1_cache_miss';
         markSpotKlinePerf(l1Event, {
           ...cachePerfPayload,
           duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
-          reason: cacheLookup.reason,
+          reason: l1Reason,
         });
         if (cached?.bars.length) {
           spotTradingViewDebug('getBars cache skipped', {

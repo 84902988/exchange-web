@@ -665,6 +665,59 @@ def test_market_kline_cache_continuous_fixed_interval_db_hit() -> None:
     assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HIT
 
 
+def test_market_kline_cache_history_cursor_coverage_invalid_falls_back() -> None:
+    db = _session()
+    now = datetime.utcnow()
+    interval = "1h"
+    end_time_ms = _ms(2026, 3, 10, 0)
+    cached_times = [
+        _ms(2025, 6, 2, 4),
+        _ms(2025, 6, 2, 5),
+        _ms(2025, 6, 2, 6),
+        _ms(2025, 6, 2, 7),
+    ]
+    provider_times = [
+        _ms(2026, 3, 9, 20),
+        _ms(2026, 3, 9, 21),
+        _ms(2026, 3, 9, 22),
+        _ms(2026, 3, 9, 23),
+    ]
+    db.add_all(
+        [
+            _kline_row(index + 50, open_time, updated_at=now, interval=interval)
+            for index, open_time in enumerate(cached_times)
+        ]
+    )
+    db.commit()
+    fetch_calls: list[tuple[int, int | None]] = []
+
+    def fetch_external(limit: int, cursor_end_time_ms: int | None):
+        fetch_calls.append((limit, cursor_end_time_ms))
+        return [_kline_payload(open_time, interval) for open_time in provider_times]
+
+    original_upsert = market_kline_cache.upsert_klines
+    try:
+        market_kline_cache.upsert_klines = lambda *args, **kwargs: 0
+        rows = market_kline_cache.get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol="BTCUSDT",
+            interval=interval,
+            limit=4,
+            source="EXTERNAL_SPOT",
+            fetch_external=fetch_external,
+            end_time_ms=end_time_ms,
+        )
+    finally:
+        market_kline_cache.upsert_klines = original_upsert
+
+    assert fetch_calls == [(4, end_time_ms)]
+    assert _open_times(rows) == provider_times
+    assert market_kline_cache._validate_cached_klines_continuity(rows, interval)
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_REST_FETCH
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_COVERAGE_INVALID
+
+
 def test_market_kline_cache_duplicate_open_time_falls_back() -> None:
     interval = "4h"
     duplicate_time = _ms(2026, 5, 1, 0)
