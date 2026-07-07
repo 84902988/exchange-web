@@ -127,6 +127,7 @@ class TickerItem(BaseModel):
     display_symbol: Optional[str] = None
     base_asset: Optional[str] = None
     quote_asset: Optional[str] = None
+    base_asset_logo_url: Optional[str] = None
     asset_type: Optional[str] = None
     data_source: Optional[str] = None
     market_mode: Optional[str] = None

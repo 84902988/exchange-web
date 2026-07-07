@@ -56,6 +56,13 @@
       font-size: 12px;
       line-height: 1.5;
     }
+    .pair-logo-section-desc a {
+      color: #f0b90b;
+      text-decoration: none;
+    }
+    .pair-logo-section-desc a:hover {
+      text-decoration: underline;
+    }
     .pair-logo-toggle {
       display: inline-flex;
       width: fit-content;
@@ -280,12 +287,17 @@
           <input id="min_notional" type="text" name="min_notional" value="{{ form.min_notional or '0' }}" placeholder="例如 1" />
         </div>
         <div class="pair-logo-section">
-          <div class="pair-logo-section-title">现货页 LOGO 设置</div>
-          <p class="pair-logo-section-desc">仅 RWA / 股票代币类交易对生效。</p>
+          <div class="pair-logo-section-title">现货页头部展示 LOGO</div>
+          <p class="pair-logo-section-desc">
+            仅用于 RWA / 股票代币等特殊交易对在现货页头部价格区域展示；不作为交易对选择器或普通币种图标。
+            普通 BTC / ETH / USDC 的币种 LOGO 请到
+            <a href="/admin/asset-configs?tab=assets" target="_blank" rel="noopener">资产配置的币种 LOGO</a>
+            中维护。
+          </p>
           <input id="show_spot_logo" type="hidden" name="show_spot_logo" value="{{ '1' if form.show_spot_logo|string == '1' else '0' }}" />
           <label class="pair-logo-toggle" for="show_spot_logo_toggle">
             <input id="show_spot_logo_toggle" type="checkbox" value="1" {% if form.show_spot_logo|string == '1' %}checked{% endif %} />
-            在现货页显示 LOGO
+            启用现货页头部展示 LOGO
           </label>
           <input id="spot_logo_url" type="hidden" name="spot_logo_url" value="{{ form.spot_logo_url or '' }}" />
           <input id="spot_logo_file" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden />
@@ -298,9 +310,9 @@
           <div class="pair-logo-current">
             <p class="pair-logo-current-title">当前预览：</p>
             <div id="spot_logo_preview_card" class="pair-logo-preview-card">
-              <img id="spot_logo_preview_img" {% if form.spot_logo_url %}src="{{ form.spot_logo_url }}"{% endif %} alt="当前已配置LOGO" />
+              <img id="spot_logo_preview_img" {% if form.spot_logo_url %}src="{{ form.spot_logo_url }}"{% endif %} alt="当前已配置现货页头部展示 LOGO" />
             </div>
-            <p id="spot_logo_empty" class="pair-logo-empty">暂未上传 LOGO</p>
+            <p id="spot_logo_empty" class="pair-logo-empty">暂未上传现货页头部展示 LOGO</p>
           </div>
         </div>
         <div class="filter-actions">
@@ -342,7 +354,7 @@
           return;
         }
         saveButton.disabled = blocked;
-        saveButton.title = blocked ? "当前 LOGO 图片仅本地预览，尚未上传。" : "";
+        saveButton.title = blocked ? "当前现货页头部展示 LOGO 图片仅本地预览，尚未上传。" : "";
         saveButton.textContent = blocked ? "请先上传LOGO" : originalSaveText;
       }
 
@@ -425,7 +437,7 @@
         chooseButton.disabled = true;
         uploadButton.disabled = true;
         uploadButton.textContent = "上传中";
-        setStatus("LOGO 上传中...", "info");
+        setStatus("现货页头部展示 LOGO 上传中...", "info");
         setSaveBlocked(true);
 
         try {
@@ -443,7 +455,7 @@
           logoInput.value = data.url || "";
           clearLocalPreview();
           fileInput.value = "";
-          setStatus("✓ LOGO 上传成功\n已上传，可保存交易对配置。", "success");
+          setStatus("✓ 现货页头部展示 LOGO 上传成功\n已上传，可保存交易对配置。", "success");
           setSaveBlocked(false);
           updatePreview();
         } catch (error) {

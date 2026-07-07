@@ -104,6 +104,7 @@ export type MarketTickerItem = {
   display_symbol?: string | null
   base_asset?: string | null
   quote_asset?: string | null
+  base_asset_logo_url?: string | null
   last_price?: string | number
   open_24h?: string | number
   change_24h?: string | number

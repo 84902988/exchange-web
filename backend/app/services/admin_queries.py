@@ -1872,6 +1872,7 @@ def admin_create_asset_config(db: Session, payload: Dict[str, Any]) -> Dict[str,
             },
         )
         db.commit()
+        clear_market_metadata_cache()
         return {"ok": True}
     except IntegrityError:
         db.rollback()
@@ -1935,6 +1936,7 @@ def admin_update_asset_config(db: Session, asset_id: int, payload: Dict[str, Any
             db.rollback()
             return {"ok": False, "errors": [f"币种配置 {asset_id} 不存在"]}
         db.commit()
+        clear_market_metadata_cache()
         return {"ok": True}
     except Exception as exc:
         db.rollback()
@@ -2686,6 +2688,7 @@ def admin_update_asset_chain_config(db: Session, asset_chain_id: int, payload: D
 def admin_delete_asset_config(db: Session, asset_id: int) -> Dict[str, Any]:
     db.execute(text("UPDATE assets SET enabled=0, updated_at=UTC_TIMESTAMP() WHERE id=:id"), {"id": int(asset_id)})
     db.commit()
+    clear_market_metadata_cache()
     return {"ok": True}
 
 

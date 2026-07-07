@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl';
 import {
   getSpotMarketPairs,
   getSpotMarketTickers,
@@ -57,6 +58,7 @@ export interface GlobalMarketSelectorPair {
   externalSymbol?: string | null;
   baseAsset?: string | null;
   quoteAsset?: string | null;
+  baseAssetLogoUrl?: string | null;
   assetType?: string | null;
   dataSource?: string | null;
   marketMode?: string | null;
@@ -153,12 +155,15 @@ const STOCK_CONTRACT_TICKER_BATCH_SIZE = 12;
 const CONTRACT_TICKER_REFRESH_TTL_MS = 25_000;
 const STOCK_CONTRACT_TICKER_REFRESH_TTL_MS = 60_000;
 const VISIBLE_TICKER_LOAD_DEBOUNCE_MS = 350;
+const PAIR_SELECTOR_METADATA_CACHE_TTL_MS = 30_000;
 const MARKET_SELECTOR_CACHE_VERSION = 'v2';
 const FAVORITE_SYMBOLS_STORAGE_KEY = 'royal_exchange_favorite_symbols_v1';
 const DEFAULT_SPOT_PAIRS_CACHE_KEY = `spot:${MARKET_SELECTOR_CACHE_VERSION}:all:all:`;
 const DEFAULT_CONTRACT_PAIRS_CACHE_KEY = `contract:${MARKET_SELECTOR_CACHE_VERSION}:all:all:`;
 const spotPairsCacheStore = new Map<string, GlobalMarketSelectorPair[]>();
 const contractPairsCacheStore = new Map<string, GlobalMarketSelectorPair[]>();
+const spotPairsCacheFetchedAtStore = new Map<string, number>();
+const contractPairsCacheFetchedAtStore = new Map<string, number>();
 const tickerCacheStore = new Map<string, GlobalMarketSelectorPair>();
 const tickerHydratingStore = new Set<string>();
 const contractTickerCacheStore = new Map<string, GlobalMarketSelectorPair>();
@@ -267,6 +272,32 @@ function mergeUniquePairs(...groups: GlobalMarketSelectorPair[][]): GlobalMarket
   return Array.from(map.values());
 }
 
+function readFreshPairCache(
+  cache: Map<string, GlobalMarketSelectorPair[]>,
+  fetchedAt: Map<string, number>,
+  key: string,
+): GlobalMarketSelectorPair[] | undefined {
+  const rows = cache.get(key);
+  if (!rows) return undefined;
+  const updatedAt = fetchedAt.get(key) || 0;
+  if (updatedAt && Date.now() - updatedAt <= PAIR_SELECTOR_METADATA_CACHE_TTL_MS) {
+    return rows;
+  }
+  cache.delete(key);
+  fetchedAt.delete(key);
+  return undefined;
+}
+
+function writePairCache(
+  cache: Map<string, GlobalMarketSelectorPair[]>,
+  fetchedAt: Map<string, number>,
+  key: string,
+  rows: GlobalMarketSelectorPair[],
+) {
+  cache.set(key, rows);
+  fetchedAt.set(key, Date.now());
+}
+
 function getFavoriteKey(symbol: string, market: FavoriteMarket): string {
   return `${market}:${normalize(symbol)}`;
 }
@@ -287,23 +318,28 @@ function parseBooleanFlag(value: unknown): boolean {
   return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
 }
 
+function resolveSpotAssetImageUrl(url?: string | null): string {
+  const value = String(url || '').trim();
+  if (!value) return '';
+  if (/^(https?:)?\/\//i.test(value) || value.startsWith('data:') || value.startsWith('blob:')) {
+    return value;
+  }
+  if (value.startsWith('/static/')) {
+    return `${getRuntimeApiBaseUrl().replace(/\/+$/, '')}${value}`;
+  }
+  return value;
+}
+
 function getPairLogoUrl(pair?: GlobalMarketSelectorPair | null): string {
-  return String(pair?.spotLogoUrl || '').trim();
+  return resolveSpotAssetImageUrl(pair?.baseAssetLogoUrl);
 }
 
 function getCoinLogoText(baseAsset: string): string {
   const normalized = normalize(baseAsset);
-  if (normalized === 'BTC') return '\u20bf';
-  if (normalized === 'ETH') return '\u25c7';
-  if (normalized === 'USDT') return 'T';
   return normalized.slice(0, 2) || '?';
 }
 
-function getCoinLogoClass(baseAsset: string): string {
-  const normalized = normalize(baseAsset);
-  if (normalized === 'BTC') return 'bg-[#f7931a] text-white';
-  if (normalized === 'ETH') return 'bg-[#627eea] text-white';
-  if (normalized === 'USDT') return 'bg-[#26a17b] text-white';
+function getCoinLogoClass(): string {
   return 'bg-[#1f2937] text-white/85';
 }
 
@@ -564,7 +600,9 @@ function buildSharedMarketSelectorPair(
     show_spot_logo?: boolean | number | string | null;
     spot_logo_url?: string | null;
     spot_logo_alt?: string | null;
+    base_asset_logo_url?: string | null;
   };
+  const hasBaseAssetLogoUrl = Object.prototype.hasOwnProperty.call(rowPrecision, 'base_asset_logo_url');
   const tickerFields = options.includeTicker
     ? {
         price: optionalTickerValue(row.last_price ?? row.price),
@@ -587,6 +625,9 @@ function buildSharedMarketSelectorPair(
     externalSymbol: normalize(row.external_symbol),
     baseAsset: typeof row.base_asset === 'string' ? row.base_asset : null,
     quoteAsset: typeof row.quote_asset === 'string' ? row.quote_asset : null,
+    ...(hasBaseAssetLogoUrl
+      ? { baseAssetLogoUrl: String(rowPrecision.base_asset_logo_url || '').trim() || null }
+      : {}),
     assetType: category,
     dataSource: typeof row.data_source === 'string' ? row.data_source : null,
     marketMode: typeof row.market_mode === 'string' ? row.market_mode : null,
@@ -631,6 +672,7 @@ function buildGlobalMarketSelectorPair(
   });
   const stockCode = normalize(externalSymbol || base).replace(/USDT$/, '').replace(/ON$/, '');
   const isStockQuote = category === 'STOCK';
+  const hasBaseAssetLogoUrl = Object.prototype.hasOwnProperty.call(item, 'base_asset_logo_url');
 
   return {
     symbol,
@@ -641,6 +683,9 @@ function buildGlobalMarketSelectorPair(
     externalSymbol,
     baseAsset: item.base_asset,
     quoteAsset: item.quote_asset,
+    ...(hasBaseAssetLogoUrl
+      ? { baseAssetLogoUrl: String(item.base_asset_logo_url || '').trim() || null }
+      : {}),
     assetType: category,
     dataSource: item.data_source,
     marketMode: item.market_mode,
@@ -756,9 +801,19 @@ function buildContractTickerPair(item: ContractTickerItem): GlobalMarketSelector
   };
 }
 
+function hasOwnSelectorPairField<K extends keyof GlobalMarketSelectorPair>(
+  pair: GlobalMarketSelectorPair,
+  field: K,
+): boolean {
+  return Object.prototype.hasOwnProperty.call(pair, field);
+}
+
 function mergePairMarketData(pair: GlobalMarketSelectorPair, ticker: GlobalMarketSelectorPair): GlobalMarketSelectorPair {
+  const tickerHasLogo = hasOwnSelectorPairField(ticker, 'baseAssetLogoUrl');
+
   return {
     ...pair,
+    baseAssetLogoUrl: tickerHasLogo ? ticker.baseAssetLogoUrl ?? null : pair.baseAssetLogoUrl ?? null,
     price: ticker.price ?? pair.price,
     change24h: ticker.change24h ?? pair.change24h,
     percentChange24h: ticker.percentChange24h ?? pair.percentChange24h,
@@ -842,6 +897,8 @@ function seedSelectorCachesFromSharedRows(params: {
   includeTicker: boolean;
   spotPairsCache: Map<string, GlobalMarketSelectorPair[]>;
   contractPairsCache: Map<string, GlobalMarketSelectorPair[]>;
+  spotPairsCacheFetchedAt: Map<string, number>;
+  contractPairsCacheFetchedAt: Map<string, number>;
   tickerCache: Map<string, GlobalMarketSelectorPair>;
   contractTickerCache: Map<string, GlobalMarketSelectorPair>;
   contractTickerFetchedAt: Map<string, number>;
@@ -855,14 +912,18 @@ function seedSelectorCachesFromSharedRows(params: {
   let tickerChanged = false;
 
   if (spotPairs.length) {
-    params.spotPairsCache.set(
+    writePairCache(
+      params.spotPairsCache,
+      params.spotPairsCacheFetchedAt,
       DEFAULT_SPOT_PAIRS_CACHE_KEY,
       mergeUniquePairs(params.spotPairsCache.get(DEFAULT_SPOT_PAIRS_CACHE_KEY) || [], spotPairs),
     );
   }
 
   if (contractPairs.length) {
-    params.contractPairsCache.set(
+    writePairCache(
+      params.contractPairsCache,
+      params.contractPairsCacheFetchedAt,
       DEFAULT_CONTRACT_PAIRS_CACHE_KEY,
       mergeUniquePairs(params.contractPairsCache.get(DEFAULT_CONTRACT_PAIRS_CACHE_KEY) || [], contractPairs),
     );
@@ -1016,6 +1077,8 @@ export default function GlobalMarketSelector({
   const [stablePairRows, setStablePairRows] = useState<GlobalMarketSelectorPair[]>([]);
   const spotPairsCacheRef = useRef<Map<string, GlobalMarketSelectorPair[]>>(spotPairsCacheStore);
   const contractPairsCacheRef = useRef<Map<string, GlobalMarketSelectorPair[]>>(contractPairsCacheStore);
+  const spotPairsCacheFetchedAtRef = useRef<Map<string, number>>(spotPairsCacheFetchedAtStore);
+  const contractPairsCacheFetchedAtRef = useRef<Map<string, number>>(contractPairsCacheFetchedAtStore);
   const tickerCacheRef = useRef<Map<string, GlobalMarketSelectorPair>>(tickerCacheStore);
   const tickerHydratingRef = useRef<Set<string>>(tickerHydratingStore);
   const contractTickerCacheRef = useRef<Map<string, GlobalMarketSelectorPair>>(contractTickerCacheStore);
@@ -1054,20 +1117,24 @@ export default function GlobalMarketSelector({
 
     const externalSpotPairs = externalPairItems.filter(isSpotMarketPair);
     const cachedSpotPairs =
-      spotPairsCacheRef.current.get(spotPairsCacheKey) ||
-      (!pairKeyword ? spotPairsCacheRef.current.get(DEFAULT_SPOT_PAIRS_CACHE_KEY) : undefined);
+      readFreshPairCache(spotPairsCacheRef.current, spotPairsCacheFetchedAtRef.current, spotPairsCacheKey) ||
+      (!pairKeyword
+        ? readFreshPairCache(spotPairsCacheRef.current, spotPairsCacheFetchedAtRef.current, DEFAULT_SPOT_PAIRS_CACHE_KEY)
+        : undefined);
     const internalSpotSource = internalSpotPairs.length && internalSpotPairsKey === spotPairsCacheKey
       ? internalSpotPairs
       : [];
     const spotSource = mergeUniquePairs(
-      cachedSpotPairs || [],
-      internalSpotSource,
       externalSpotPairs,
+      internalSpotSource,
+      cachedSpotPairs || [],
     );
 
     const cachedContractPairs =
-      contractPairsCacheRef.current.get(contractPairsCacheKey) ||
-      (!pairKeyword ? contractPairsCacheRef.current.get(DEFAULT_CONTRACT_PAIRS_CACHE_KEY) : undefined);
+      readFreshPairCache(contractPairsCacheRef.current, contractPairsCacheFetchedAtRef.current, contractPairsCacheKey) ||
+      (!pairKeyword
+        ? readFreshPairCache(contractPairsCacheRef.current, contractPairsCacheFetchedAtRef.current, DEFAULT_CONTRACT_PAIRS_CACHE_KEY)
+        : undefined);
     const contractSource = cachedContractPairs?.length
       ? cachedContractPairs
       : internalContractPairs.length && internalContractPairsKey === contractPairsCacheKey
@@ -1095,7 +1162,7 @@ export default function GlobalMarketSelector({
   void contractTickerHydratingVersion;
 
   const allKnownPairs = useMemo(
-    () => [...internalSpotPairs, ...internalContractPairs, ...externalPairItems],
+    () => [...externalPairItems, ...internalSpotPairs, ...internalContractPairs],
     [externalPairItems, internalContractPairs, internalSpotPairs],
   );
 
@@ -1125,7 +1192,7 @@ export default function GlobalMarketSelector({
   const failedLogoUrlSet = useMemo(() => new Set(failedLogoUrls), [failedLogoUrls]);
   const activeLogoUrl = currentLogoUrl && !failedLogoUrlSet.has(currentLogoUrl) ? currentLogoUrl : '';
   const coinLogoText = getCoinLogoText(currentBaseAsset);
-  const coinLogoClass = getCoinLogoClass(currentBaseAsset);
+  const coinLogoClass = getCoinLogoClass();
 
   const intervalOptions = useMemo(
     () => (currentPair && (isStockContractPair(currentPair) || isTradfiCfdPair(currentPair)) ? TRADFI_INTERVALS : intervals),
@@ -1373,6 +1440,8 @@ export default function GlobalMarketSelector({
       includeTicker: !cached.stale,
       spotPairsCache: spotPairsCacheRef.current,
       contractPairsCache: contractPairsCacheRef.current,
+      spotPairsCacheFetchedAt: spotPairsCacheFetchedAtRef.current,
+      contractPairsCacheFetchedAt: contractPairsCacheFetchedAtRef.current,
       tickerCache: tickerCacheRef.current,
       contractTickerCache: contractTickerCacheRef.current,
       contractTickerFetchedAt: contractTickerFetchedAtRef.current,
@@ -1380,8 +1449,16 @@ export default function GlobalMarketSelector({
     if (seeded.spotPairs.length === 0 && seeded.contractPairs.length === 0) return;
 
     sharedRowsCacheSeededRef.current = true;
-    const cachedSpotPairs = spotPairsCacheRef.current.get(DEFAULT_SPOT_PAIRS_CACHE_KEY);
-    const cachedContractPairs = contractPairsCacheRef.current.get(DEFAULT_CONTRACT_PAIRS_CACHE_KEY);
+    const cachedSpotPairs = readFreshPairCache(
+      spotPairsCacheRef.current,
+      spotPairsCacheFetchedAtRef.current,
+      DEFAULT_SPOT_PAIRS_CACHE_KEY,
+    );
+    const cachedContractPairs = readFreshPairCache(
+      contractPairsCacheRef.current,
+      contractPairsCacheFetchedAtRef.current,
+      DEFAULT_CONTRACT_PAIRS_CACHE_KEY,
+    );
     if (cachedSpotPairs?.length && spotPairsCacheKey === DEFAULT_SPOT_PAIRS_CACHE_KEY) {
       setInternalSpotPairs(cachedSpotPairs);
       setInternalSpotPairsKey(DEFAULT_SPOT_PAIRS_CACHE_KEY);
@@ -1406,8 +1483,16 @@ export default function GlobalMarketSelector({
 
     const preloadPairs = async () => {
       try {
-        const hasDefaultSpotPairs = !!spotPairsCacheRef.current.get(DEFAULT_SPOT_PAIRS_CACHE_KEY)?.length;
-        const hasDefaultContractPairs = !!contractPairsCacheRef.current.get(DEFAULT_CONTRACT_PAIRS_CACHE_KEY)?.length;
+        const hasDefaultSpotPairs = !!readFreshPairCache(
+          spotPairsCacheRef.current,
+          spotPairsCacheFetchedAtRef.current,
+          DEFAULT_SPOT_PAIRS_CACHE_KEY,
+        )?.length;
+        const hasDefaultContractPairs = !!readFreshPairCache(
+          contractPairsCacheRef.current,
+          contractPairsCacheFetchedAtRef.current,
+          DEFAULT_CONTRACT_PAIRS_CACHE_KEY,
+        )?.length;
         const shouldPreloadSpotPairs = pageType === 'spot';
         const shouldPreloadContractPairs = pageType === 'contract';
         if (!shouldPreloadSpotPairs && !shouldPreloadContractPairs) return;
@@ -1437,7 +1522,12 @@ export default function GlobalMarketSelector({
 
         if (spotResult.status === 'fulfilled' && spotResult.value.length) {
           const nextSpotPairs = spotResult.value;
-          spotPairsCacheRef.current.set(DEFAULT_SPOT_PAIRS_CACHE_KEY, nextSpotPairs);
+          writePairCache(
+            spotPairsCacheRef.current,
+            spotPairsCacheFetchedAtRef.current,
+            DEFAULT_SPOT_PAIRS_CACHE_KEY,
+            nextSpotPairs,
+          );
           loadedSpotPairKeysRef.current.add(DEFAULT_SPOT_PAIRS_CACHE_KEY);
           if (spotPairsCacheKey === DEFAULT_SPOT_PAIRS_CACHE_KEY) {
             setInternalSpotPairs(nextSpotPairs);
@@ -1455,7 +1545,12 @@ export default function GlobalMarketSelector({
             contractResult.value,
             externalPairItems.filter(isContractMarketPair),
           );
-          contractPairsCacheRef.current.set(DEFAULT_CONTRACT_PAIRS_CACHE_KEY, nextContractPairs);
+          writePairCache(
+            contractPairsCacheRef.current,
+            contractPairsCacheFetchedAtRef.current,
+            DEFAULT_CONTRACT_PAIRS_CACHE_KEY,
+            nextContractPairs,
+          );
           loadedContractPairKeysRef.current.add(DEFAULT_CONTRACT_PAIRS_CACHE_KEY);
           if (contractPairsCacheKey === DEFAULT_CONTRACT_PAIRS_CACHE_KEY) {
             setInternalContractPairs(nextContractPairs);
@@ -1491,11 +1586,17 @@ export default function GlobalMarketSelector({
     if (!open || marketTab !== 'crypto' || spotCategory === 'contract') return;
 
     const requestId = ++spotRequestIdRef.current;
-    const cachedPairs = spotPairsCacheRef.current.get(spotPairsCacheKey);
+    const cachedPairs = readFreshPairCache(
+      spotPairsCacheRef.current,
+      spotPairsCacheFetchedAtRef.current,
+      spotPairsCacheKey,
+    );
     if (cachedPairs) {
       setInternalSpotPairs(cachedPairs);
       setInternalSpotPairsKey(spotPairsCacheKey);
       loadedSpotPairKeysRef.current.add(spotPairsCacheKey);
+    } else {
+      loadedSpotPairKeysRef.current.delete(spotPairsCacheKey);
     }
     if (loadedSpotPairKeysRef.current.has(spotPairsCacheKey) || cachedPairs) {
       setSpotPairsLoading(false);
@@ -1514,7 +1615,12 @@ export default function GlobalMarketSelector({
         });
 
         if (requestId !== spotRequestIdRef.current) return;
-        spotPairsCacheRef.current.set(spotPairsCacheKey, nextPairs);
+        writePairCache(
+          spotPairsCacheRef.current,
+          spotPairsCacheFetchedAtRef.current,
+          spotPairsCacheKey,
+          nextPairs,
+        );
         loadedSpotPairKeysRef.current.add(spotPairsCacheKey);
         setInternalSpotPairs(nextPairs);
         setInternalSpotPairsKey(spotPairsCacheKey);
@@ -1542,12 +1648,20 @@ export default function GlobalMarketSelector({
 
     const requestId = ++contractRequestIdRef.current;
     const cachedPairs =
-      contractPairsCacheRef.current.get(contractPairsCacheKey) ||
-      (!pairKeyword ? contractPairsCacheRef.current.get(DEFAULT_CONTRACT_PAIRS_CACHE_KEY) : undefined);
+      readFreshPairCache(contractPairsCacheRef.current, contractPairsCacheFetchedAtRef.current, contractPairsCacheKey) ||
+      (!pairKeyword
+        ? readFreshPairCache(
+            contractPairsCacheRef.current,
+            contractPairsCacheFetchedAtRef.current,
+            DEFAULT_CONTRACT_PAIRS_CACHE_KEY,
+          )
+        : undefined);
     if (cachedPairs) {
       setInternalContractPairs(cachedPairs);
       setInternalContractPairsKey(contractPairsCacheKey);
       loadedContractPairKeysRef.current.add(contractPairsCacheKey);
+    } else {
+      loadedContractPairKeysRef.current.delete(contractPairsCacheKey);
     }
     if (loadedContractPairKeysRef.current.has(contractPairsCacheKey) || cachedPairs) {
       setContractPairsLoading(false);
@@ -1570,7 +1684,12 @@ export default function GlobalMarketSelector({
           contractResponse,
           externalPairItems.filter(isContractMarketPair),
         );
-        contractPairsCacheRef.current.set(contractPairsCacheKey, nextPairs);
+        writePairCache(
+          contractPairsCacheRef.current,
+          contractPairsCacheFetchedAtRef.current,
+          contractPairsCacheKey,
+          nextPairs,
+        );
         loadedContractPairKeysRef.current.add(contractPairsCacheKey);
         setInternalContractPairs(nextPairs);
         setInternalContractPairsKey(contractPairsCacheKey);
@@ -1894,7 +2013,7 @@ export default function GlobalMarketSelector({
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src={activeLogoUrl}
-                    alt={currentHeaderPair.spotLogoAlt || currentBaseAsset}
+                    alt={currentBaseAsset}
                     className="absolute inset-0 h-full w-full rounded-full object-cover"
                     onError={() => markLogoFailed(activeLogoUrl)}
                   />
@@ -2113,14 +2232,14 @@ export default function GlobalMarketSelector({
 
                         return (
                           <span
-                            className={`relative flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-full text-[11px] font-bold leading-none ${getCoinLogoClass(rowBaseAsset)}`}
+                            className={`relative flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-full text-[11px] font-bold leading-none ${getCoinLogoClass()}`}
                           >
                             {rowActiveLogoUrl ? (
                               <>
                                 {/* eslint-disable-next-line @next/next/no-img-element */}
                                 <img
                                   src={rowActiveLogoUrl}
-                                  alt={pair.spotLogoAlt || rowBaseAsset}
+                                  alt={rowBaseAsset}
                                   className="absolute inset-0 h-full w-full rounded-full object-cover"
                                   onError={() => markLogoFailed(rowActiveLogoUrl)}
                                 />
