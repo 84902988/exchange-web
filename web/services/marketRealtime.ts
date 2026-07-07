@@ -60,6 +60,33 @@ export type SpotMarketRealtimeSubscriptionOptions = {
   owner?: string;
 };
 
+export type SpotMarketRealtimeKlineIntervalSyncOptions = {
+  symbol: string;
+  interval: string;
+  owner: string;
+};
+
+export type SpotMarketRealtimeKlineIntervalSyncResult = {
+  symbol: string;
+  interval: string;
+  owner: string;
+  previousInterval: string | null;
+  subscriptionId: string;
+  changed: boolean;
+};
+
+export type SpotMarketRealtimeKlineIntervalReleaseOptions = {
+  symbol: string;
+  owner: string;
+};
+
+export type SpotMarketRealtimeKlineIntervalReleaseResult = {
+  symbol: string;
+  owner: string;
+  previousInterval: string | null;
+  released: boolean;
+};
+
 type SpotMarketRealtimeSubscriptionEntry = {
   connectionKey: string;
   domain: SpotMarketRealtimeDomain;
@@ -221,7 +248,96 @@ class SpotMarketRealtimeClient {
     return id;
   }
 
-  private releaseOwnerKlineEntries(symbol: string, owner: string) {
+  syncKlineInterval(
+    options: SpotMarketRealtimeKlineIntervalSyncOptions,
+  ): SpotMarketRealtimeKlineIntervalSyncResult | null {
+    const symbol = normalizeSymbol(options.symbol);
+    const owner = String(options.owner || '').trim();
+    if (!symbol || !owner) return null;
+
+    const interval = normalizeSpotRealtimeInterval(options.interval);
+    const currentState = this.getOwnerKlineState(symbol, owner);
+    if (
+      currentState.intervals.length === 1 &&
+      currentState.intervals[0] === interval &&
+      currentState.subscriptionId
+    ) {
+      return {
+        symbol,
+        interval,
+        owner,
+        previousInterval: interval,
+        subscriptionId: currentState.subscriptionId,
+        changed: false,
+      };
+    }
+
+    const previousInterval = currentState.intervals[0] ?? null;
+    const subscriptionId = this.acquireSubscription({
+      symbol,
+      interval,
+      domains: ['kline'],
+      owner,
+    });
+    if (!subscriptionId) return null;
+
+    return {
+      symbol,
+      interval,
+      owner,
+      previousInterval,
+      subscriptionId,
+      changed: true,
+    };
+  }
+
+  releaseKlineIntervalOwner(
+    options: SpotMarketRealtimeKlineIntervalReleaseOptions,
+  ): SpotMarketRealtimeKlineIntervalReleaseResult | null {
+    const symbol = normalizeSymbol(options.symbol);
+    const owner = String(options.owner || '').trim();
+    if (!symbol || !owner) return null;
+
+    const currentState = this.getOwnerKlineState(symbol, owner);
+    const releasedIntervals = this.releaseOwnerKlineEntries(symbol, owner, true);
+    return {
+      symbol,
+      owner,
+      previousInterval: currentState.intervals[0] ?? releasedIntervals[0] ?? null,
+      released: releasedIntervals.length > 0,
+    };
+  }
+
+  private getOwnerKlineState(symbol: string, owner: string) {
+    const intervals: string[] = [];
+    let subscriptionId = '';
+
+    for (const subscription of this.subscriptions.values()) {
+      if (subscription.symbol !== symbol || subscription.owner !== owner) continue;
+
+      for (const entry of subscription.entries) {
+        if (entry.domain !== 'kline') continue;
+        const interval = normalizeSpotRealtimeInterval(entry.interval || subscription.interval);
+        if (!intervals.includes(interval)) {
+          intervals.push(interval);
+        }
+        if (!subscriptionId) {
+          subscriptionId = subscription.id;
+        }
+      }
+    }
+
+    return { intervals, subscriptionId };
+  }
+
+  private releaseOwnerKlineEntries(
+    symbol: string,
+    owner: string,
+    closeIdleConnections = false,
+  ) {
+    const releasedIntervals: string[] = [];
+    const touchedConnections = new Set<string>();
+
     for (const subscription of Array.from(this.subscriptions.values())) {
       if (subscription.symbol !== symbol || subscription.owner !== owner) continue;
 
@@ -235,7 +351,11 @@ class SpotMarketRealtimeClient {
         const connection = this.connections.get(entry.connectionKey);
         if (!connection) continue;
 
-        const interval = entry.interval || subscription.interval;
+        const interval = normalizeSpotRealtimeInterval(entry.interval || subscription.interval);
+        touchedConnections.add(entry.connectionKey);
+        if (!releasedIntervals.includes(interval)) {
+          releasedIntervals.push(interval);
+        }
         const bucket = connection.klineIntervals.get(interval);
         bucket?.delete(subscription.id);
         if (bucket && bucket.size === 0) {
@@ -249,6 +369,19 @@ class SpotMarketRealtimeClient {
         this.subscriptions.delete(subscription.id);
       }
     }
+
+    if (closeIdleConnections) {
+      for (const connectionKey of touchedConnections) {
+        const connection = this.connections.get(connectionKey);
+        if (connection && !this.hasActiveConnectionDomains(connection)) {
+          this.closeConnection(connection, 'subscription released');
+          this.connections.delete(connection.key);
+        }
+      }
+      this.refreshAggregateStatus();
+    }
+
+    return releasedIntervals;
   }
 
   releaseSubscription(subscriptionId: string) {
