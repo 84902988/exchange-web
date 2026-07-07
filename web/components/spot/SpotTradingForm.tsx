@@ -88,7 +88,36 @@ const SUMMARY_TINY_AMOUNT = 0.000001;
 const PERCENT_TICKS = new Set([0, 25, 50, 75, 100]);
 const SUCCESS_MESSAGE_DURATION_MS = 4000;
 const MIN_SUBMIT_LOADING_MS = 600;
+const SPOT_FEE_SETTINGS_CACHE_TTL_MS = 120_000;
 const LATEST_TRADE_LABEL = String.fromCharCode(26368, 26032, 25104, 20132);
+
+let cachedSpotFeeSettings: { settings: SpotFeeSettings; fetchedAt: number } | null = null;
+let spotFeeSettingsRequest: Promise<SpotFeeSettings> | null = null;
+
+function loadSpotFeeSettingsCached(): Promise<SpotFeeSettings> {
+  const now = Date.now();
+  if (cachedSpotFeeSettings && now - cachedSpotFeeSettings.fetchedAt < SPOT_FEE_SETTINGS_CACHE_TTL_MS) {
+    return Promise.resolve(cachedSpotFeeSettings.settings);
+  }
+
+  if (spotFeeSettingsRequest) {
+    return spotFeeSettingsRequest;
+  }
+
+  spotFeeSettingsRequest = getSpotFeeSettings()
+    .then((settings) => {
+      cachedSpotFeeSettings = {
+        settings,
+        fetchedAt: Date.now(),
+      };
+      return settings;
+    })
+    .finally(() => {
+      spotFeeSettingsRequest = null;
+    });
+
+  return spotFeeSettingsRequest;
+}
 
 type SpotFormCopy = {
   buy: string
@@ -847,7 +876,7 @@ export default function SpotTradingForm({
 
     const run = async () => {
       try {
-        const settings = await getSpotFeeSettings();
+        const settings = await loadSpotFeeSettingsCached();
         if (!alive) return;
         setSpotFeeSettings(settings);
       } catch (error) {

@@ -993,7 +993,9 @@ export default function GlobalMarketSelector({
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [marketTab, setMarketTab] = useState<MarketLayerTab>('crypto');
-  const [spotCategory, setSpotCategory] = useState<PairCategory>(initialCategory || 'all');
+  const [spotCategory, setSpotCategory] = useState<PairCategory>(
+    initialCategory || (pageType === 'spot' ? 'spot' : pageType === 'contract' ? 'contract' : 'all'),
+  );
   const [stockCategory, setStockCategory] = useState<StockCategory>('all');
   const [contractCategory, setContractCategory] = useState<ContractCategory>('all');
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -1136,6 +1138,11 @@ export default function GlobalMarketSelector({
     marketTab === 'crypto' &&
     spotCategory !== 'contract';
   const needsContractRows =
+    marketTab === 'stock' ||
+    marketTab === 'cfd' ||
+    (marketTab === 'crypto' && (spotCategory === 'all' || spotCategory === 'contract'));
+  const shouldHydrateContractTickerRows =
+    marketTab === 'favorites' ||
     marketTab === 'stock' ||
     marketTab === 'cfd' ||
     (marketTab === 'crypto' && (spotCategory === 'all' || spotCategory === 'contract'));
@@ -1468,6 +1475,7 @@ export default function GlobalMarketSelector({
   }, [contractPairsCacheKey, externalPairItems, hydrateTickerSymbols, marketDisplayLabels, pageType, spotPairsCacheKey]);
 
   useEffect(() => {
+    if (!open) return;
     if (marketTab === 'favorites') return;
     if (marketTab !== 'crypto' || spotCategory === 'contract') return;
 
@@ -1477,7 +1485,7 @@ export default function GlobalMarketSelector({
       quote: 'all',
       keyword: pairKeyword,
     });
-  }, [marketTab, onPairQueryChange, pairKeyword, spotCategory]);
+  }, [marketTab, onPairQueryChange, open, pairKeyword, spotCategory]);
 
   useEffect(() => {
     if (!open || marketTab !== 'crypto' || spotCategory === 'contract') return;
@@ -1663,7 +1671,7 @@ export default function GlobalMarketSelector({
   }, [displayPairs, hydrateTickerSymbols, marketTab, open, visibleTickerLimit]);
 
   useEffect(() => {
-    if (!open || !['crypto', 'stock', 'cfd', 'favorites'].includes(marketTab) || displayPairs.length === 0) return;
+    if (!open || !shouldHydrateContractTickerRows || displayPairs.length === 0) return;
 
     if (marketTab === 'stock') return;
 
@@ -1675,10 +1683,10 @@ export default function GlobalMarketSelector({
       CONTRACT_TICKER_BATCH_SIZE,
       { ttlMs: CONTRACT_TICKER_REFRESH_TTL_MS },
     );
-  }, [displayPairs, hydrateContractTickerSymbols, marketTab, open, visibleTickerLimit]);
+  }, [displayPairs, hydrateContractTickerSymbols, marketTab, open, shouldHydrateContractTickerRows, visibleTickerLimit]);
 
   useEffect(() => {
-    if (!open || marketTab !== 'stock' || displayPairs.length === 0) return;
+    if (!open || !shouldHydrateContractTickerRows || marketTab !== 'stock' || displayPairs.length === 0) return;
 
     const visibleStockContractSymbols = displayPairs
       .filter((item) => getPairMarket(item) === 'contract' && !isMockStockContractPair(item))
@@ -1690,7 +1698,7 @@ export default function GlobalMarketSelector({
       STOCK_CONTRACT_TICKER_BATCH_SIZE,
       { ttlMs: STOCK_CONTRACT_TICKER_REFRESH_TTL_MS },
     );
-  }, [displayPairs, hydrateContractTickerSymbols, marketTab, open, visibleTickerLimit]);
+  }, [displayPairs, hydrateContractTickerSymbols, marketTab, open, shouldHydrateContractTickerRows, visibleTickerLimit]);
 
   useEffect(() => {
     if (!open) return;
