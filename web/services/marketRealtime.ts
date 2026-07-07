@@ -165,6 +165,10 @@ class SpotMarketRealtimeClient {
     const domains = Array.from(new Set(options.domains.map(normalizeDomain)));
     if (!domains.length) return '';
 
+    if (options.owner && domains.includes('kline')) {
+      this.releaseOwnerKlineEntries(symbol, options.owner);
+    }
+
     const id = `${options.owner || 'spot-market'}:${this.nextSubscriptionId++}`;
     const entries: SpotMarketRealtimeSubscriptionEntry[] = [];
     const touchedConnections = new Set<string>();
@@ -207,6 +211,36 @@ class SpotMarketRealtimeClient {
     }
 
     return id;
+  }
+
+  private releaseOwnerKlineEntries(symbol: string, owner: string) {
+    for (const subscription of Array.from(this.subscriptions.values())) {
+      if (subscription.symbol !== symbol || subscription.owner !== owner) continue;
+
+      const remainingEntries: SpotMarketRealtimeSubscriptionEntry[] = [];
+      for (const entry of subscription.entries) {
+        if (entry.domain !== 'kline') {
+          remainingEntries.push(entry);
+          continue;
+        }
+
+        const connection = this.connections.get(entry.connectionKey);
+        if (!connection) continue;
+
+        const interval = entry.interval || subscription.interval;
+        const bucket = connection.klineIntervals.get(interval);
+        bucket?.delete(subscription.id);
+        if (bucket && bucket.size === 0) {
+          connection.klineIntervals.delete(interval);
+          this.sendKlineSubscription(connection, 'unsubscribe', interval);
+        }
+      }
+
+      subscription.entries = remainingEntries;
+      if (!subscription.entries.length) {
+        this.subscriptions.delete(subscription.id);
+      }
+    }
   }
 
   releaseSubscription(subscriptionId: string) {
