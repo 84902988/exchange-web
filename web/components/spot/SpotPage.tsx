@@ -30,6 +30,10 @@ import {
   normalizeSpotPricePrecision,
   resolveSpotPricePrecision,
 } from './spotPricePrecision';
+import {
+  createSpotKlinePerfId,
+  markSpotKlinePerf,
+} from './tradingview/spotKlinePerf';
 
 interface SpotHeaderMarketData {
   change: string;
@@ -48,7 +52,7 @@ const EMPTY_MARKET_DATA: SpotHeaderMarketData = {
 };
 const DEFAULT_SPOT_SYMBOL = 'BTCUSDT';
 const SPOT_PAIR_PAGE_SIZE = 6;
-const SPOT_INTERVAL_CHANGE_DEBOUNCE_MS = 350;
+const SPOT_INTERVAL_CHANGE_DEBOUNCE_MS = 150;
 const SPOT_PRIVATE_FOREGROUND_REFRESH_MS = 10000;
 const SPOT_PRIVATE_HIDDEN_REFRESH_MS = 30000;
 const SPOT_PRIVATE_MIN_REFRESH_INTERVAL_MS = 2000;
@@ -116,6 +120,13 @@ function spotPageIntervalDebug(event: string, payload: Record<string, unknown>) 
   } catch {
     // Debug telemetry is best-effort only.
   }
+}
+
+function getSpotPagePerfNow() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
 }
 
 function getInitialPairQuery(category?: string): SpotPairQuery {
@@ -444,6 +455,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     interval: string;
     source: string;
     seq: number;
+    switchId: string;
+    scheduledAt: number;
   } | null>(null);
   const [chartMode, setChartMode] = useState<SpotChartMode>('candle');
   const [orderPrice, setOrderPrice] = useState('');
@@ -928,13 +941,25 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   }, []);
 
   const scheduleIntervalChange = useCallback(
-    (nextInterval: string, source = 'spot-page') => {
+    (nextInterval: string, source = 'spot-page', requestedSwitchId?: string) => {
       const requestedInterval = normalizeSpotPageInterval(nextInterval);
       if (!requestedInterval) return;
 
       const activeInterval = activeIntervalRef.current;
+      const switchId = requestedSwitchId || createSpotKlinePerfId('spot-interval-switch');
+      const scheduledAt = getSpotPagePerfNow();
       if (requestedInterval === activeInterval) {
         clearPendingIntervalChange('already active');
+        markSpotKlinePerf('interval_change_schedule', {
+          symbol: symbolRef.current,
+          switchId,
+          interval: requestedInterval,
+          previous_interval: activeInterval,
+          next_interval: requestedInterval,
+          source,
+          debounce_ms: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+          note: 'already active',
+        });
         spotPageIntervalDebug('interval-change-requested', {
           interval: requestedInterval,
           source,
@@ -947,6 +972,16 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
       const pending = pendingIntervalChangeRef.current;
       if (pending?.interval === requestedInterval) {
+        markSpotKlinePerf('interval_change_schedule', {
+          symbol: symbolRef.current,
+          switchId: pending.switchId,
+          interval: requestedInterval,
+          previous_interval: activeInterval,
+          next_interval: requestedInterval,
+          source,
+          debounce_ms: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+          note: 'already pending',
+        });
         spotPageIntervalDebug('interval-change-requested', {
           interval: requestedInterval,
           source,
@@ -966,7 +1001,19 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         interval: requestedInterval,
         source,
         seq: requestSeq,
+        switchId,
+        scheduledAt,
       };
+      markSpotKlinePerf('interval_change_schedule', {
+        symbol: symbolRef.current,
+        switchId,
+        interval: requestedInterval,
+        previous_interval: activeInterval,
+        next_interval: requestedInterval,
+        source,
+        requestSeq,
+        debounce_ms: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+      });
 
       spotPageIntervalDebug('interval-change-requested', {
         requestSeq,
@@ -982,8 +1029,21 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
         intervalChangeTimerRef.current = null;
         pendingIntervalChangeRef.current = null;
+        const waitDurationMs = Math.max(0, getSpotPagePerfNow() - latestPending.scheduledAt);
 
         if (activeIntervalRef.current === requestedInterval) {
+          markSpotKlinePerf('interval_change_debounce_commit', {
+            symbol: symbolRef.current,
+            switchId: latestPending.switchId,
+            interval: requestedInterval,
+            previous_interval: activeInterval,
+            next_interval: requestedInterval,
+            source: latestPending.source,
+            requestSeq,
+            debounce_ms: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+            duration_ms: waitDurationMs,
+            note: 'already active at commit',
+          });
           spotPageIntervalDebug('interval-change-committed', {
             requestSeq,
             interval: requestedInterval,
@@ -996,6 +1056,17 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         }
 
         setIntervalValue(requestedInterval);
+        markSpotKlinePerf('interval_change_debounce_commit', {
+          symbol: symbolRef.current,
+          switchId: latestPending.switchId,
+          interval: requestedInterval,
+          previous_interval: activeInterval,
+          next_interval: requestedInterval,
+          source: latestPending.source,
+          requestSeq,
+          debounce_ms: SPOT_INTERVAL_CHANGE_DEBOUNCE_MS,
+          duration_ms: waitDurationMs,
+        });
         spotPageIntervalDebug('interval-change-committed', {
           requestSeq,
           interval: requestedInterval,
@@ -1026,14 +1097,34 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
   const handleHeaderIntervalChange = useCallback(
     (value: string) => {
-      scheduleIntervalChange(value, 'header-selector');
+      const requestedInterval = normalizeSpotPageInterval(value);
+      const switchId = createSpotKlinePerfId('spot-interval-switch');
+      markSpotKlinePerf('interval_change_click', {
+        symbol: symbolRef.current,
+        switchId,
+        interval: requestedInterval,
+        previous_interval: activeIntervalRef.current,
+        next_interval: requestedInterval,
+        source: 'header-selector',
+      });
+      scheduleIntervalChange(value, 'header-selector', switchId);
     },
     [scheduleIntervalChange],
   );
 
   const handleChartIntervalChange = useCallback(
     (value: string) => {
-      scheduleIntervalChange(value, 'tradingview-toolbar');
+      const requestedInterval = normalizeSpotPageInterval(value);
+      const switchId = createSpotKlinePerfId('spot-interval-switch');
+      markSpotKlinePerf('interval_change_click', {
+        symbol: symbolRef.current,
+        switchId,
+        interval: requestedInterval,
+        previous_interval: activeIntervalRef.current,
+        next_interval: requestedInterval,
+        source: 'tradingview-toolbar',
+      });
+      scheduleIntervalChange(value, 'tradingview-toolbar', switchId);
     },
     [scheduleIntervalChange],
   );

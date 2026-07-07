@@ -12,17 +12,32 @@ import {
 } from '@/services/marketRealtime';
 import { normalizeTimeToSeconds } from '../chart/chart.utils';
 import type { SpotChartProps, SpotKlineLoadState } from '../chart/chart.types';
+import {
+  createSpotKlinePerfId,
+  markSpotKlinePerf,
+} from './spotKlinePerf';
+import {
+  buildKlineCachePerfPayload,
+  cloneBars,
+  fetchAndCacheCurrentKlineBars,
+  getBackendKlineIntervalForSpotInterval,
+  getBarsContinuityStats,
+  getL1CurrentKlineCacheMinBars,
+  getSpotIntervalMs,
+  getSpotKlineLoadPolicy,
+  inspectCurrentKlineCache,
+  isProviderCandleOnlyInterval,
+  isUtcProviderCandleInterval,
+  mergeTradingViewBars,
+  normalizeSpotInterval,
+  readCurrentKlineCache,
+  writeCurrentKlineCache,
+  type SpotTradingViewBar,
+} from './spotKlineClientCache';
 
 type TradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
 
-type TradingViewBar = {
-  time: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume?: number;
-};
+type TradingViewBar = SpotTradingViewBar;
 
 type SpotTradingViewRealtimeEvent = {
   symbol: string;
@@ -151,34 +166,6 @@ export type SpotTradingViewHistoryBarsEvent = {
 };
 
 type EmitRealtimeBar = (bar: TradingViewBar, reason: string) => boolean;
-type KlineCacheEntry = {
-  key: string;
-  symbol: string;
-  interval: string;
-  limit: number;
-  bars: TradingViewBar[];
-  provider?: unknown;
-  source?: unknown;
-  updatedAt: number;
-};
-
-type KlineCacheLookup = KlineCacheEntry & {
-  bars: TradingViewBar[];
-};
-
-type PreloadSpotTradingViewKlineCacheOptions = {
-  symbol: string;
-  intervals: string[];
-  skipInterval?: string;
-  concurrency?: number;
-  shouldContinue?: () => boolean;
-};
-
-type SpotKlineLoadPolicy = {
-  current: number;
-  preload: number;
-  history: number;
-};
 
 type HistoryKlineRequestResult = {
   bars: TradingViewBar[];
@@ -258,23 +245,9 @@ const SPOT_INTERVAL_TO_RESOLUTION: Record<string, TradingViewResolution> = {
   '1M': '1M',
   '1Mutc': '1M',
 };
-const SPOT_INTERVAL_MS: Record<string, number> = {
-  '1m': 60_000,
-  '5m': 5 * 60_000,
-  '15m': 15 * 60_000,
-  '1h': 60 * 60_000,
-  '4h': 4 * 60 * 60_000,
-  '1d': 24 * 60 * 60_000,
-  '1Dutc': 24 * 60 * 60_000,
-  '1w': 7 * 24 * 60 * 60_000,
-  '1Wutc': 7 * 24 * 60 * 60_000,
-  '1M': 30 * 24 * 60 * 60_000,
-  '1Mutc': 30 * 24 * 60 * 60_000,
-};
 const ASIA_SHANGHAI_OFFSET_MS = 8 * 60 * 60_000;
 const TRADINGVIEW_TIMEZONE = 'Asia/Shanghai';
 const realtimeHighWaterMarkByKey = new Map<string, number>();
-const currentKlineCache = new Map<string, KlineCacheEntry>();
 const historyKlineRequestInFlightByKey = new Map<string, Promise<HistoryKlineRequestResult>>();
 let forcedSpotTradingViewDebugEnabled = false;
 let spotTradingViewGetBarsRequestSeq = 0;
@@ -283,33 +256,6 @@ const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
 const SPOT_TV_GETBARS_API_PAGE_LIMIT = 500;
 const SPOT_TV_GETBARS_MAX_INTERNAL_BARS = 1000;
 const SPOT_TV_GETBARS_MAX_INTERNAL_PAGES = 3;
-const CURRENT_KLINE_CACHE_MAX_KEYS = 64;
-const CURRENT_KLINE_CACHE_TTL_MS: Record<string, number> = {
-  '1m': 10_000,
-  '5m': 20_000,
-  '15m': 20_000,
-  '1h': 60_000,
-  '4h': 60_000,
-  '1d': 180_000,
-  '1Dutc': 180_000,
-  '1w': 300_000,
-  '1Wutc': 300_000,
-  '1M': 300_000,
-  '1Mutc': 300_000,
-};
-const SPOT_KLINE_LOAD_POLICY: Record<string, SpotKlineLoadPolicy> = {
-  '1m': { current: 150, preload: 150, history: 200 },
-  '5m': { current: 140, preload: 140, history: 200 },
-  '15m': { current: 130, preload: 130, history: 180 },
-  '1h': { current: 150, preload: 150, history: 180 },
-  '4h': { current: 130, preload: 130, history: 160 },
-  '1d': { current: 120, preload: 110, history: 120 },
-  '1Dutc': { current: 120, preload: 110, history: 120 },
-  '1w': { current: 80, preload: 80, history: 100 },
-  '1Wutc': { current: 80, preload: 80, history: 100 },
-  '1M': { current: 60, preload: 48, history: 60 },
-  '1Mutc': { current: 60, preload: 48, history: 60 },
-};
 
 const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
   supports_search: true,
@@ -428,6 +374,13 @@ function spotTradingViewDebug(event: string, payload: Record<string, unknown>) {
   };
   appendSpotTradingViewDebugEvent(entry);
   console.info(`[SpotTradingViewDatafeed] ${event}`, entry);
+}
+
+function getSpotDatafeedPerfNow() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
 }
 
 function initializeSpotTvDebugTelemetry() {
@@ -551,10 +504,6 @@ function normalizeProvider(value: unknown): string {
 
 function normalizeSource(value: unknown): string {
   return String(value || '').trim().toUpperCase();
-}
-
-function isLiveWsKlineSource(source: unknown) {
-  return normalizeSource(source) === 'LIVE_WS';
 }
 
 function normalizeKlineMetaValue(value: unknown): string {
@@ -740,17 +689,6 @@ function normalizeResolution(resolution: string): TradingViewResolution {
   return '1';
 }
 
-function normalizeSpotInterval(interval: string): string {
-  const raw = String(interval || '').trim();
-  const utcInterval = ({
-    '1dutc': '1Dutc',
-    '1wutc': '1Wutc',
-    '1mutc': '1Mutc',
-  } as Record<string, string>)[raw.toLowerCase()];
-  if (utcInterval) return utcInterval;
-  return raw === '1M' ? raw : raw.toLowerCase();
-}
-
 export function spotIntervalToTradingViewResolution(interval: string): TradingViewResolution {
   const normalized = normalizeSpotInterval(interval);
   return SPOT_INTERVAL_TO_RESOLUTION[normalized] || '1';
@@ -760,28 +698,8 @@ function tradingViewResolutionToSpotInterval(resolution: string): string {
   return RESOLUTION_TO_SPOT_INTERVAL[normalizeResolution(resolution)] || '1m';
 }
 
-function getBackendKlineIntervalForSpotInterval(interval: string): string {
-  const normalized = normalizeSpotInterval(interval);
-  if (normalized === '1d') return '1Dutc';
-  if (normalized === '1w') return '1Wutc';
-  if (normalized === '1M') return '1Mutc';
-  return normalized;
-}
-
 function getBackendKlineIntervalForTradingView(resolution: string): string {
   return getBackendKlineIntervalForSpotInterval(tradingViewResolutionToSpotInterval(resolution));
-}
-
-function getSpotIntervalMs(interval: string): number {
-  return SPOT_INTERVAL_MS[normalizeSpotInterval(interval)] || SPOT_INTERVAL_MS['1m'];
-}
-
-function isProviderCandleOnlyInterval(interval: string): boolean {
-  return ['1d', '1Dutc', '1w', '1Wutc', '1M', '1Mutc'].includes(normalizeSpotInterval(interval));
-}
-
-function isUtcProviderCandleInterval(interval: string): boolean {
-  return ['1Dutc', '1Wutc', '1Mutc'].includes(normalizeSpotInterval(interval));
 }
 
 function shouldUseOkxDwmTradingViewTime(
@@ -928,64 +846,6 @@ function normalizeHistoryBars(
   return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
 }
 
-function mergeTradingViewBars(bars: TradingViewBar[]): TradingViewBar[] {
-  const byTime = new Map<number, TradingViewBar>();
-  for (const bar of bars) {
-    if (!Number.isFinite(bar.time) || bar.time <= 0) continue;
-    byTime.set(bar.time, { ...bar });
-  }
-  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
-}
-
-function getNextMonthlyBarTimeMs(timeMs: number) {
-  const date = new Date(timeMs);
-  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1);
-}
-
-function getExpectedNextBarTimeMs(interval: string, timeMs: number) {
-  const normalizedInterval = normalizeSpotInterval(interval);
-  if (normalizedInterval === '1M' || normalizedInterval === '1Mutc') {
-    return getNextMonthlyBarTimeMs(timeMs);
-  }
-  return timeMs + getSpotIntervalMs(normalizedInterval);
-}
-
-function getBarsContinuityStats(bars: TradingViewBar[], interval: string) {
-  const sorted = mergeTradingViewBars(bars);
-  const duplicateCount = Math.max(0, bars.length - sorted.length);
-  let gapCount = 0;
-  let maxGap = 0;
-
-  for (let index = 1; index < sorted.length; index += 1) {
-    const previous = sorted[index - 1];
-    const current = sorted[index];
-    const expected = getExpectedNextBarTimeMs(interval, previous.time);
-    const delta = current.time - previous.time;
-    if (current.time !== expected) {
-      gapCount += 1;
-      maxGap = Math.max(maxGap, Math.abs(delta));
-    }
-  }
-
-  return {
-    duplicateCount,
-    gapCount,
-    maxGap,
-  };
-}
-
-function cloneBars(bars: TradingViewBar[]) {
-  return bars.map((bar) => ({ ...bar }));
-}
-
-function getCurrentKlineCacheTtlMs(interval: string) {
-  return CURRENT_KLINE_CACHE_TTL_MS[normalizeSpotInterval(interval)] || 30_000;
-}
-
-function getSpotKlineLoadPolicy(interval: string): SpotKlineLoadPolicy {
-  return SPOT_KLINE_LOAD_POLICY[normalizeSpotInterval(interval)] || SPOT_KLINE_LOAD_POLICY['1m'];
-}
-
 function normalizeRequiredKlineBars(countBack: number, fallback: number) {
   const requested = Number(countBack);
   if (!Number.isFinite(requested) || requested <= 0) return fallback;
@@ -1001,10 +861,6 @@ function getCurrentKlineLimit(interval: string, countBack?: number) {
   return requestedBars;
 }
 
-function getPreloadKlineLimit(interval: string) {
-  return getSpotKlineLoadPolicy(interval).preload;
-}
-
 function getHistoryKlineLimit(interval: string, countBack: number) {
   const policy = getSpotKlineLoadPolicy(interval);
   return normalizeRequiredKlineBars(countBack, policy.history);
@@ -1014,10 +870,6 @@ function getKlineRequestPageLimit(requiredBars: number, loadedBars = 0) {
   const remaining = Math.max(1, requiredBars - loadedBars);
   const remainingInternalCapacity = Math.max(1, SPOT_TV_GETBARS_MAX_INTERNAL_BARS - loadedBars);
   return Math.min(remaining, remainingInternalCapacity, SPOT_TV_GETBARS_API_PAGE_LIMIT);
-}
-
-function buildCurrentKlineCacheKey(symbol: string, interval: string, limit: number) {
-  return `${normalizeSpotSymbol(symbol)}:${normalizeSpotInterval(interval)}:${Math.max(1, limit)}:current`;
 }
 
 function buildHistoryKlineInFlightKey(
@@ -1047,105 +899,6 @@ function classifyKlineRequest(periodParams: TradingViewPeriodParams) {
     requestedEndTime,
     isHistoryRequest,
   };
-}
-
-function isFreshKlineCacheEntry(entry: KlineCacheEntry, now = Date.now()) {
-  return now - entry.updatedAt <= getCurrentKlineCacheTtlMs(entry.interval);
-}
-
-function readCurrentKlineCache(
-  symbol: string,
-  interval: string,
-  limit: number,
-  options: { allowStale?: boolean } = {},
-): KlineCacheLookup | null {
-  const normalizedSymbol = normalizeSpotSymbol(symbol);
-  const normalizedInterval = normalizeSpotInterval(interval);
-  const normalizedLimit = Math.max(1, limit);
-  const exact = currentKlineCache.get(buildCurrentKlineCacheKey(normalizedSymbol, normalizedInterval, normalizedLimit));
-  const now = Date.now();
-  const allowStale = Boolean(options.allowStale);
-
-  const canUse = (entry: KlineCacheEntry) =>
-    entry.bars.length > 0 &&
-    !isLiveWsKlineSource(entry.source) &&
-    (allowStale || isFreshKlineCacheEntry(entry, now));
-
-  if (exact && canUse(exact)) {
-    return { ...exact, bars: cloneBars(exact.bars.slice(-normalizedLimit)) };
-  }
-
-  const compatible = Array.from(currentKlineCache.values())
-    .filter((entry) => (
-      entry.symbol === normalizedSymbol &&
-      entry.interval === normalizedInterval &&
-      entry.limit >= normalizedLimit &&
-      canUse(entry)
-    ))
-    .sort((a, b) => a.limit - b.limit || b.updatedAt - a.updatedAt)[0];
-
-  return compatible ? { ...compatible, bars: cloneBars(compatible.bars.slice(-normalizedLimit)) } : null;
-}
-
-function writeCurrentKlineCache(params: {
-  symbol: string;
-  interval: string;
-  limit: number;
-  bars: TradingViewBar[];
-  provider?: unknown;
-  source?: unknown;
-}) {
-  if (!params.bars.length) return null;
-
-  const normalizedSymbol = normalizeSpotSymbol(params.symbol);
-  const normalizedInterval = normalizeSpotInterval(params.interval);
-  const normalizedLimit = Math.max(1, params.limit);
-  const key = buildCurrentKlineCacheKey(normalizedSymbol, normalizedInterval, normalizedLimit);
-  const entry: KlineCacheEntry = {
-    key,
-    symbol: normalizedSymbol,
-    interval: normalizedInterval,
-    limit: normalizedLimit,
-    bars: cloneBars(params.bars.slice(-normalizedLimit)),
-    provider: params.provider,
-    source: params.source,
-    updatedAt: Date.now(),
-  };
-  currentKlineCache.set(key, entry);
-
-  if (currentKlineCache.size > CURRENT_KLINE_CACHE_MAX_KEYS) {
-    const overflow = currentKlineCache.size - CURRENT_KLINE_CACHE_MAX_KEYS;
-    Array.from(currentKlineCache.values())
-      .sort((a, b) => a.updatedAt - b.updatedAt)
-      .slice(0, overflow)
-      .forEach((item) => currentKlineCache.delete(item.key));
-  }
-
-  return { ...entry, bars: cloneBars(entry.bars) };
-}
-
-async function fetchAndCacheCurrentKlineBars(params: {
-  symbol: string;
-  interval: string;
-  limit: number;
-  shouldStore?: () => boolean;
-}) {
-  const payload = await getSpotKlines({
-    symbol: params.symbol,
-    interval: params.interval,
-    limit: params.limit,
-    forceRest: true,
-  });
-  const bars = normalizeHistoryBars(payload.items, params.interval, payload.provider, payload.source);
-  if (!bars.length || (params.shouldStore && !params.shouldStore())) return null;
-  return writeCurrentKlineCache({
-    symbol: params.symbol,
-    interval: params.interval,
-    limit: params.limit,
-    bars,
-    provider: payload.provider,
-    source: payload.source,
-  });
 }
 
 async function fetchKlineRequestBars(params: {
@@ -1351,59 +1104,6 @@ async function fetchCountBackKlineRequestBars(params: {
   };
 }
 
-export function hasFreshSpotTradingViewKlineCache(symbol: string, interval: string, limit?: number) {
-  const backendInterval = getBackendKlineIntervalForSpotInterval(interval);
-  return Boolean(readCurrentKlineCache(symbol, backendInterval, limit || getPreloadKlineLimit(backendInterval)));
-}
-
-export async function preloadSpotTradingViewKlineCache({
-  symbol,
-  intervals,
-  skipInterval,
-  concurrency = 2,
-  shouldContinue,
-}: PreloadSpotTradingViewKlineCacheOptions) {
-  const normalizedSymbol = normalizeSpotSymbol(symbol);
-  if (!normalizedSymbol) return;
-
-  const normalizedSkipInterval = skipInterval ? getBackendKlineIntervalForSpotInterval(skipInterval) : '';
-  const queue = Array.from(new Set(intervals.map((interval) => (
-    getBackendKlineIntervalForSpotInterval(normalizeSpotInterval(interval))
-  ))))
-    .filter((interval) => interval && interval !== normalizedSkipInterval)
-    .map((interval) => ({ interval, limit: getPreloadKlineLimit(interval) }))
-    .filter(({ interval, limit }) => !hasFreshSpotTradingViewKlineCache(normalizedSymbol, interval, limit));
-
-  if (!queue.length) return;
-
-  const workerCount = Math.max(1, Math.min(Math.floor(concurrency || 1), 1, queue.length));
-  let cursor = 0;
-  const shouldRun = () => !shouldContinue || shouldContinue();
-
-  await Promise.all(Array.from({ length: workerCount }, async () => {
-    while (shouldRun()) {
-      const item = queue[cursor++];
-      if (!item) return;
-      try {
-        await fetchAndCacheCurrentKlineBars({
-          symbol: normalizedSymbol,
-          interval: item.interval,
-          limit: item.limit,
-          shouldStore: shouldRun,
-        });
-      } catch (err) {
-        if (process.env.NODE_ENV !== 'production') {
-          console.debug('[SpotTradingViewDatafeed] preload kline cache failed', {
-            symbol: normalizedSymbol,
-            interval: item.interval,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-    }
-  }));
-}
-
 function buildSymbolInfo(options: SpotTradingViewDatafeedOptions): TradingViewLibrarySymbolInfo {
   const symbol = normalizeSpotSymbol(options.symbol);
   const description = String(options.displaySymbol || '').trim() || symbol;
@@ -1563,6 +1263,30 @@ export function createSpotTradingViewDatafeed(
         end_time_ms: endTime || null,
         forceRest: true,
       };
+      const getBarsRequestId = createSpotKlinePerfId('getBars');
+      const getBarsStartedAt = getSpotDatafeedPerfNow();
+      const getBarsPerfPayload = {
+        requestId: getBarsRequestId,
+        requestSeq,
+        phase: requestKind,
+        symbol: apiSymbol,
+        symbolInfoName: _symbolInfo.name,
+        interval,
+        chartInterval,
+        backendInterval: interval,
+        resolution: requestResolution,
+        countBack,
+        from: periodParams.from,
+        to: periodParams.to,
+        limit,
+        apiLimit: limit,
+        requiredBars,
+        force_rest: true,
+        firstDataRequest: isFirstDataRequest,
+        end_time: endTime || null,
+        end_time_ms: endTime || null,
+      };
+      markSpotKlinePerf('getBars_start', getBarsPerfPayload);
       spotTradingViewDebug('getBars request', requestDebugPayload);
       const getHistoryCallbackGuardState = () => {
         const isLatestRequest = historyRequestSeqByLatestBarKey.get(latestBarKey) === historyRequestSeq;
@@ -1592,6 +1316,15 @@ export function createSpotTradingViewDatafeed(
       ) => {
         const guardState = getHistoryCallbackGuardState();
         if (didCompleteHistory || !guardState.canUse) {
+          markSpotKlinePerf('getBars_guard_drop', {
+            ...getBarsPerfPayload,
+            duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+            bars_count: bars.length,
+            noData: meta.noData,
+            note: emptyReason || 'history callback guard blocked',
+            didCompleteHistory,
+            ...guardState,
+          });
           spotTradingViewDebug('getBars callback skipped', {
             requestSeq,
             phase: requestKind,
@@ -1623,6 +1356,15 @@ export function createSpotTradingViewDatafeed(
             reason: emptyReason || 'empty bars',
           });
         }
+        if (meta.noData || bars.length === 0) {
+          markSpotKlinePerf('getBars_noData', {
+            ...getBarsPerfPayload,
+            duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+            bars_count: bars.length,
+            noData: meta.noData,
+            note: emptyReason || (meta.noData ? 'noData callback' : 'empty bars callback'),
+          });
+        }
         spotTradingViewDebug('getBars callback', {
           requestSeq,
           phase: requestKind,
@@ -1642,6 +1384,13 @@ export function createSpotTradingViewDatafeed(
           callbackTime: Date.now(),
           callbackTimeIso: new Date().toISOString(),
           barsSummary: buildSpotTvDebugBarsSummary(bars),
+        });
+        markSpotKlinePerf('getBars_onHistory', {
+          ...getBarsPerfPayload,
+          duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+          bars_count: bars.length,
+          noData: meta.noData,
+          note: emptyReason,
         });
         onHistory(bars, meta);
         try {
@@ -1675,6 +1424,13 @@ export function createSpotTradingViewDatafeed(
       const safeErrorCallback = (reason: string) => {
         const guardState = getHistoryCallbackGuardState();
         if (didCompleteHistory || !guardState.canUse) {
+          markSpotKlinePerf('getBars_guard_drop', {
+            ...getBarsPerfPayload,
+            duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+            note: reason,
+            didCompleteHistory,
+            ...guardState,
+          });
           spotTradingViewDebug('getBars error callback skipped', {
             requestSeq,
             phase: requestKind,
@@ -1689,6 +1445,11 @@ export function createSpotTradingViewDatafeed(
           return;
         }
         didCompleteHistory = true;
+        markSpotKlinePerf('getBars_error', {
+          ...getBarsPerfPayload,
+          duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+          error: reason,
+        });
         spotTradingViewDebug('getBars error callback', {
           requestSeq,
           phase: requestKind,
@@ -1747,12 +1508,29 @@ export function createSpotTradingViewDatafeed(
         return;
       }
 
-      if (!isHistoryRequest) {
-        const cached = readCurrentKlineCache(apiSymbol, interval, requiredBars);
+      if (!isHistoryRequest && !endTime) {
+        const l1MinBars = getL1CurrentKlineCacheMinBars(interval, requiredBars);
+        const cacheLookup = inspectCurrentKlineCache(apiSymbol, interval, requiredBars, { minBars: l1MinBars });
+        const cached = cacheLookup.hit;
         const cachedContinuityStats = cached ? getBarsContinuityStats(cached.bars, interval) : null;
+        const cachePerfPayload = {
+          ...getBarsPerfPayload,
+          ...buildKlineCachePerfPayload(cacheLookup.candidate || cached, {
+            symbol: apiSymbol,
+            interval,
+            limit: requiredBars,
+          }),
+          minBars: cacheLookup.minBars,
+          requestedLimit: cacheLookup.requestedLimit,
+          cache_age_ms: cacheLookup.cacheAgeMs ?? null,
+          continuityGapCount: cacheLookup.continuityStats?.gapCount ?? cachedContinuityStats?.gapCount ?? null,
+          continuityDuplicateCount:
+            cacheLookup.continuityStats?.duplicateCount ?? cachedContinuityStats?.duplicateCount ?? null,
+          continuityMaxGap: cacheLookup.continuityStats?.maxGap ?? cachedContinuityStats?.maxGap ?? null,
+        };
         if (
           cached?.bars.length &&
-          cached.bars.length >= requiredBars &&
+          cached.bars.length >= l1MinBars &&
           cachedContinuityStats?.gapCount === 0 &&
           cachedContinuityStats.duplicateCount === 0
         ) {
@@ -1797,12 +1575,28 @@ export function createSpotTradingViewDatafeed(
             lastBars: buildBarDebugRows(cached.bars),
           };
           spotTradingViewDebug('getBars response', responseDebugPayload);
+          markSpotKlinePerf('kline_l1_cache_hit', {
+            ...cachePerfPayload,
+            duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+            bars_count: cached.bars.length,
+            reason: cached.bars.length >= requiredBars ? 'full current cache hit' : 'partial current cache hit',
+          });
+          markSpotKlinePerf('getBars_cache_hit', {
+            ...getBarsPerfPayload,
+            duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+            force_rest: false,
+            bars_count: cached.bars.length,
+            source: cached.source,
+            provider: cached.provider,
+            noData: stopInitialOlderHistory,
+            note: stopInitialOlderHistory ? 'current provider visible window complete' : 'current cache hit',
+          });
           safeHistoryCallback(cloneBars(cached.bars), { noData: stopInitialOlderHistory });
 
           void fetchAndCacheCurrentKlineBars({
             symbol: apiSymbol,
             interval,
-            limit: requiredBars,
+            limit: l1MinBars,
           }).catch((err: unknown) => {
             if (process.env.NODE_ENV !== 'production') {
               console.debug('[SpotTradingViewDatafeed] refresh kline cache failed', {
@@ -1815,6 +1609,16 @@ export function createSpotTradingViewDatafeed(
           });
           return;
         }
+        const l1Event = cacheLookup.reason === 'expired'
+          ? 'kline_l1_cache_expired'
+          : cacheLookup.reason === 'reject_continuity'
+            ? 'kline_l1_cache_reject_continuity'
+            : 'kline_l1_cache_miss';
+        markSpotKlinePerf(l1Event, {
+          ...cachePerfPayload,
+          duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+          reason: cacheLookup.reason,
+        });
         if (cached?.bars.length) {
           spotTradingViewDebug('getBars cache skipped', {
             requestSeq,
@@ -1832,8 +1636,21 @@ export function createSpotTradingViewDatafeed(
             continuityMaxGap: cachedContinuityStats?.maxGap ?? null,
           });
         }
+        markSpotKlinePerf('getBars_cache_miss', {
+          ...getBarsPerfPayload,
+          duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+          cached_bars_count: cached?.bars.length || 0,
+          continuityGapCount: cachedContinuityStats?.gapCount ?? null,
+          continuityDuplicateCount: cachedContinuityStats?.duplicateCount ?? null,
+          note: cached?.bars.length ? 'current cache insufficient or discontinuous' : 'current cache empty',
+        });
       }
 
+      const restRequestStartedAt = getSpotDatafeedPerfNow();
+      markSpotKlinePerf('getBars_request_start', {
+        ...getBarsPerfPayload,
+        duration_ms: Math.max(0, restRequestStartedAt - getBarsStartedAt),
+      });
       const request = fetchCountBackKlineRequestBars({
         symbol: apiSymbol,
         interval,
@@ -1849,6 +1666,21 @@ export function createSpotTradingViewDatafeed(
       void request
         .then((result) => {
           const { bars, provider, source } = result;
+          markSpotKlinePerf('getBars_request_end', {
+            ...getBarsPerfPayload,
+            duration_ms: Math.max(0, getSpotDatafeedPerfNow() - restRequestStartedAt),
+            bars_count: bars.length,
+            source,
+            provider,
+            freshness: result.freshness,
+            cache_status: result.cache_status,
+            pageCount: result.pageCount,
+            requestedBars: result.requestedBars,
+            reachedRequiredBars: result.reachedRequiredBars,
+            history_incomplete: result.history_incomplete,
+            provider_error_code: result.provider_error_code,
+            provider_error_provider: result.provider_error_provider,
+          });
           if (!isHistoryRequest && bars.length) {
             writeCurrentKlineCache({
               symbol: apiSymbol,
@@ -1941,6 +1773,12 @@ export function createSpotTradingViewDatafeed(
           );
         })
         .catch((err: unknown) => {
+          markSpotKlinePerf('getBars_request_end', {
+            ...getBarsPerfPayload,
+            duration_ms: Math.max(0, getSpotDatafeedPerfNow() - restRequestStartedAt),
+            bars_count: 0,
+            error: err instanceof Error ? err.message : String(err),
+          });
           if (!isHistoryRequest) {
             const cached = readCurrentKlineCache(apiSymbol, interval, requiredBars, { allowStale: true });
             const cachedContinuityStats = cached ? getBarsContinuityStats(cached.bars, interval) : null;
@@ -1989,11 +1827,27 @@ export function createSpotTradingViewDatafeed(
                 barsSummary: buildSpotTvDebugBarsSummary(cached.bars),
                 lastBars: buildBarDebugRows(cached.bars),
               });
+              markSpotKlinePerf('getBars_cache_hit', {
+                ...getBarsPerfPayload,
+                duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+                force_rest: false,
+                bars_count: cached.bars.length,
+                source: cached.source,
+                provider: cached.provider,
+                note: 'stale fallback after request failed',
+                error: err instanceof Error ? err.message : String(err),
+              });
               safeHistoryCallback(cloneBars(cached.bars), { noData: false });
               return;
             }
           }
           const shouldEmitFatalError = isInvalidKlineRequestError(err) || isUnparseableKlineResponseError(err);
+          markSpotKlinePerf('getBars_error', {
+            ...getBarsPerfPayload,
+            duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+            fatal: shouldEmitFatalError,
+            error: getKlineErrorMessage(err) || 'Failed to load spot history',
+          });
           if (!isHistoryRequest && canUpdateActiveHistoryState()) {
             options.onKlineLoadStateChange?.(shouldEmitFatalError ? 'error' : 'empty');
             historyReadyByLatestBarKey.set(latestBarKey, true);

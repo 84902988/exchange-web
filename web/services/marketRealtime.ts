@@ -1,6 +1,7 @@
 'use client';
 
 import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl';
+import { markSpotKlinePerf } from '@/components/spot/tradingview/spotKlinePerf';
 
 type SpotMarketSnapshotMessage = {
   type: 'spot_market_snapshot';
@@ -133,6 +134,13 @@ function makeConnectionKey(symbol: string) {
 
 function getMessageObject(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function getMarketRealtimePerfNow() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
 }
 
 class SpotMarketRealtimeClient {
@@ -375,12 +383,24 @@ class SpotMarketRealtimeClient {
     this.clearConnectionTimer(connection, 'reconnect');
     this.setConnectionStatus(connection, 'connecting');
 
+    const connectStartedAt = getMarketRealtimePerfNow();
+    markSpotKlinePerf('ws_connect_start', {
+      symbol: connection.symbol,
+      source: 'marketRealtime',
+      activeKlineIntervals: Array.from(connection.klineIntervals.keys()),
+    });
     const ws = new WebSocket(buildSpotWsUrl(connection.symbol));
     connection.ws = ws;
 
     ws.onopen = () => {
       if (connection.ws !== ws) return;
       this.setConnectionStatus(connection, 'open');
+      markSpotKlinePerf('ws_open', {
+        symbol: connection.symbol,
+        source: 'marketRealtime',
+        duration_ms: Math.max(0, getMarketRealtimePerfNow() - connectStartedAt),
+        activeKlineIntervals: Array.from(connection.klineIntervals.keys()),
+      });
       this.sendActiveKlineSubscriptions(connection);
     };
 
@@ -404,6 +424,13 @@ class SpotMarketRealtimeClient {
         connection.ws = null;
       }
       this.setConnectionStatus(connection, 'closed');
+      markSpotKlinePerf('ws_close', {
+        symbol: connection.symbol,
+        source: 'marketRealtime',
+        duration_ms: Math.max(0, getMarketRealtimePerfNow() - connectStartedAt),
+        closedByClient: connection.closedByClient,
+        activeKlineIntervals: Array.from(connection.klineIntervals.keys()),
+      });
 
       if (connection.closedByClient || !this.hasActiveConnectionDomains(connection)) return;
 
@@ -465,8 +492,26 @@ class SpotMarketRealtimeClient {
     }
 
     if (message.type === 'spot_kline_update') {
+      const messageInterval = normalizeSpotRealtimeInterval(this.getMessageInterval(message));
+      const messageSymbol = this.getMessageSymbol(message) || connection.symbol;
+      markSpotKlinePerf('kline_message_received', {
+        symbol: messageSymbol,
+        interval: messageInterval,
+        source: 'marketRealtime',
+        connectionSymbol: connection.symbol,
+        activeKlineIntervals: Array.from(connection.klineIntervals.keys()),
+      });
       if (this.shouldDispatch(message, connection, 'kline')) {
         this.emit('kline', message);
+      } else if (messageSymbol === connection.symbol) {
+        markSpotKlinePerf('ignored_kline_interval', {
+          symbol: messageSymbol,
+          interval: messageInterval,
+          source: 'marketRealtime',
+          connectionSymbol: connection.symbol,
+          activeKlineIntervals: Array.from(connection.klineIntervals.keys()),
+          note: 'no active subscriber for kline interval',
+        });
       }
     }
   }
@@ -537,14 +582,30 @@ class SpotMarketRealtimeClient {
     interval: string,
   ) {
     const ws = connection.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const normalizedInterval = normalizeSpotRealtimeInterval(interval);
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      markSpotKlinePerf(op === 'subscribe' ? 'kline_subscribe' : 'kline_unsubscribe', {
+        symbol: connection.symbol,
+        interval: normalizedInterval,
+        source: 'marketRealtime',
+        note: 'ws not open',
+        wsReadyState: ws?.readyState ?? null,
+      });
+      return;
+    }
 
     try {
       ws.send(JSON.stringify({
         op,
         domain: 'kline',
-        interval: normalizeSpotRealtimeInterval(interval),
+        interval: normalizedInterval,
       }));
+      markSpotKlinePerf(op === 'subscribe' ? 'kline_subscribe' : 'kline_unsubscribe', {
+        symbol: connection.symbol,
+        interval: normalizedInterval,
+        source: 'marketRealtime',
+        wsReadyState: ws.readyState,
+      });
     } catch (err) {
       if (process.env.NODE_ENV !== 'production') {
         console.warn('[marketRealtime] spot WS subscription send failed:', err);
