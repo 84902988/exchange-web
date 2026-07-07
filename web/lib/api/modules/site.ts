@@ -1,8 +1,34 @@
 import { request } from "@/lib/api/core/request";
-import { withContentLanguage } from "@/lib/api/core/locale";
+import { getContentApiLanguage, withContentLanguage } from "@/lib/api/core/locale";
 import type { Language } from "@/utils/language";
 
 type LocalizedText = Partial<Record<Language, string>>;
+
+const SITE_CONFIG_CACHE_TTL_MS = 120 * 1000;
+
+type SiteConfigCacheEntry = {
+  promise?: Promise<SiteConfig>;
+  result?: SiteConfig;
+  fetchedAt?: number;
+};
+
+const siteConfigCache = new Map<string, SiteConfigCacheEntry>();
+
+function getSiteConfigCacheKey(language?: string): string {
+  const key = (language ?? getContentApiLanguage()).trim();
+  return key || "default";
+}
+
+function hasFreshSiteConfig(entry: SiteConfigCacheEntry | undefined, now: number): entry is SiteConfigCacheEntry & {
+  result: SiteConfig;
+  fetchedAt: number;
+} {
+  return Boolean(
+    entry?.result &&
+      typeof entry.fetchedAt === "number" &&
+      now - entry.fetchedAt < SITE_CONFIG_CACHE_TTL_MS
+  );
+}
 
 export type SiteConfig = {
   id?: number;
@@ -117,7 +143,46 @@ export const fallbackSiteConfig: SiteConfig = {
 };
 
 export async function getSiteConfig(language?: string): Promise<SiteConfig> {
-  return request<SiteConfig>(withContentLanguage("/site/config", language));
+  const cacheKey = getSiteConfigCacheKey(language);
+  const cached = siteConfigCache.get(cacheKey);
+  const now = Date.now();
+
+  if (hasFreshSiteConfig(cached, now)) {
+    return cached.result;
+  }
+
+  if (cached?.promise) {
+    return cached.promise;
+  }
+
+  // Collapse concurrent Header/Footer/title requests for the same language.
+  const requestPromise = request<SiteConfig>(withContentLanguage("/site/config", cacheKey))
+    .then((config) => {
+      siteConfigCache.set(cacheKey, {
+        result: config,
+        fetchedAt: Date.now(),
+      });
+      return config;
+    })
+    .catch((error) => {
+      if (cached?.result && typeof cached.fetchedAt === "number") {
+        siteConfigCache.set(cacheKey, {
+          result: cached.result,
+          fetchedAt: cached.fetchedAt,
+        });
+      } else {
+        siteConfigCache.delete(cacheKey);
+      }
+      throw error;
+    });
+
+  siteConfigCache.set(cacheKey, {
+    result: cached?.result,
+    fetchedAt: cached?.fetchedAt,
+    promise: requestPromise,
+  });
+
+  return requestPromise;
 }
 
 export async function getHomeBanners(language?: string): Promise<{ items: HomeBanner[] }> {
