@@ -1557,19 +1557,28 @@ export function createSpotTradingViewDatafeed(
             cacheLookup.continuityStats?.duplicateCount ?? cachedContinuityStats?.duplicateCount ?? null,
           continuityMaxGap: cacheLookup.continuityStats?.maxGap ?? cachedContinuityStats?.maxGap ?? null,
         };
+        const cachedStopsInitialOlderHistory = cached ? shouldStopInitialOlderProviderHistory({
+          interval,
+          isHistoryRequest,
+          isFirstDataRequest,
+          bars: cached.bars,
+        }) : false;
+        const cachedCoversRequestedBars = Boolean(cached?.bars.length && cached.bars.length >= requiredBars);
+        const cachedCoversTerminalInitialHistory = Boolean(
+          cached?.bars.length &&
+          cachedStopsInitialOlderHistory &&
+          cached.terminalComplete &&
+          cached.requestedLimit >= requiredBars &&
+          cached.bars.length >= l1MinBars,
+        );
         if (
           cached?.bars.length &&
-          cached.bars.length >= requiredBars &&
+          (cachedCoversRequestedBars || cachedCoversTerminalInitialHistory) &&
           cached.bars.length >= l1MinBars &&
           cachedContinuityStats?.gapCount === 0 &&
           cachedContinuityStats.duplicateCount === 0
         ) {
-          const stopInitialOlderHistory = shouldStopInitialOlderProviderHistory({
-            interval,
-            isHistoryRequest,
-            isFirstDataRequest,
-            bars: cached.bars,
-          });
+          const stopInitialOlderHistory = cachedStopsInitialOlderHistory;
           if (canUpdateActiveHistoryState()) {
             rememberHistoryBars(cached.bars);
             options.onKlineLoadStateChange?.('loaded');
@@ -1609,7 +1618,7 @@ export function createSpotTradingViewDatafeed(
             ...cachePerfPayload,
             duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
             bars_count: cached.bars.length,
-            reason: cached.bars.length >= requiredBars ? 'full current cache hit' : 'partial current cache hit',
+            reason: cachedCoversRequestedBars ? 'full current cache hit' : 'terminal current cache hit',
           });
           markSpotKlinePerf('getBars_cache_hit', {
             ...getBarsPerfPayload,
@@ -1623,20 +1632,22 @@ export function createSpotTradingViewDatafeed(
           });
           safeHistoryCallback(cloneBars(cached.bars), { noData: stopInitialOlderHistory });
 
-          void fetchAndCacheCurrentKlineBars({
-            symbol: apiSymbol,
-            interval,
-            limit: l1MinBars,
-          }).catch((err: unknown) => {
-            if (process.env.NODE_ENV !== 'production') {
-              console.debug('[SpotTradingViewDatafeed] refresh kline cache failed', {
-                symbol: apiSymbol,
-                interval,
-                chartInterval,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          });
+          if (!cached.terminalComplete) {
+            void fetchAndCacheCurrentKlineBars({
+              symbol: apiSymbol,
+              interval,
+              limit: Math.max(l1MinBars, Math.min(requiredBars, cached.limit || requiredBars)),
+            }).catch((err: unknown) => {
+              if (process.env.NODE_ENV !== 'production') {
+                console.debug('[SpotTradingViewDatafeed] refresh kline cache failed', {
+                  symbol: apiSymbol,
+                  interval,
+                  chartInterval,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            });
+          }
           return;
         }
         const cacheInsufficientForCountBack = Boolean(cached?.bars.length && cached.bars.length < requiredBars);
