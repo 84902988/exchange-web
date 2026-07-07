@@ -91,6 +91,15 @@ class SpotMarketGateway:
         self._kline_release_grace_seconds = max(0.0, float(kline_release_grace_seconds))
         self._precision_cache: dict[str, tuple[int, int]] = {}
         self._symbol_providers: dict[str, str] = {}
+        self._broadcast_counters: dict[str, int] = {
+            "depth": 0,
+            "ticker": 0,
+            "trades": 0,
+            "kline": 0,
+        }
+        self._last_broadcast_at: dict[str, float] = {}
+        self._last_broadcast_type: dict[str, str] = {}
+        self._idle_stop_count = 0
 
     async def ensure_symbol(self, symbol: str, *, interval: str = "1m") -> None:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
@@ -150,6 +159,66 @@ class SpotMarketGateway:
             task.add_done_callback(self._consume_task_result)
             self._idle_tasks[normalized_symbol] = task
 
+    async def get_metrics_snapshot(self) -> dict[str, Any]:
+        async with self._task_lock:
+            now = time.monotonic()
+            active_symbols = sorted(
+                set(self._tasks.keys())
+                | set(self._idle_tasks.keys())
+                | set(self._symbol_providers.keys())
+                | set(self._ensured_kline_intervals.keys())
+            )
+            task_active = {
+                symbol: task is not None and not task.done()
+                for symbol, task in self._tasks.items()
+            }
+            idle_release_pending = {
+                symbol: task is not None and not task.done()
+                for symbol, task in self._idle_tasks.items()
+            }
+            ensured_kline_intervals = {
+                symbol: sorted(intervals)
+                for symbol, intervals in self._ensured_kline_intervals.items()
+            }
+            pending_kline_releases = {
+                symbol: {
+                    interval: max(0.0, release_at - now)
+                    for interval, release_at in releases.items()
+                }
+                for symbol, releases in self._pending_kline_releases.items()
+            }
+            symbol_providers = dict(self._symbol_providers)
+            broadcast_counters = dict(self._broadcast_counters)
+            last_broadcast_at = dict(self._last_broadcast_at)
+            last_broadcast_type = dict(self._last_broadcast_type)
+            idle_stop_count = self._idle_stop_count
+
+        subscriber_counts = {}
+        for symbol in active_symbols:
+            try:
+                subscriber_counts[symbol] = await self._subscriber_count(symbol)
+            except Exception:
+                subscriber_counts[symbol] = None
+
+        return {
+            "active_symbols": active_symbols,
+            "symbols": {
+                symbol: {
+                    "gateway_loop_active": bool(task_active.get(symbol)),
+                    "subscriber_count": subscriber_counts.get(symbol),
+                    "provider": symbol_providers.get(symbol),
+                    "ensured_kline_intervals": ensured_kline_intervals.get(symbol, []),
+                    "idle_release_pending": bool(idle_release_pending.get(symbol)),
+                    "pending_kline_release_in_seconds": pending_kline_releases.get(symbol, {}),
+                    "last_broadcast_at": last_broadcast_at.get(symbol),
+                    "last_broadcast_type": last_broadcast_type.get(symbol),
+                }
+                for symbol in active_symbols
+            },
+            "broadcast_counters": broadcast_counters,
+            "idle_stop_count": idle_stop_count,
+        }
+
     @staticmethod
     def _consume_task_result(task: asyncio.Task[None]) -> None:
         try:
@@ -182,7 +251,14 @@ class SpotMarketGateway:
                     refresh_task.cancel()
             provider_code = self._symbol_providers.get(symbol, PROVIDER_BITGET_SPOT)
             await self._release_provider_symbol(symbol, provider_code)
+            self._idle_stop_count += 1
             logger.info("spot_market_gateway_release_provider_ws symbol=%s", symbol)
+            logger.info(
+                "spot_ws_idle_stop symbol=%s provider=%s idle_stop_count=%s",
+                symbol,
+                provider_code,
+                self._idle_stop_count,
+            )
         except asyncio.CancelledError:
             raise
         except RuntimeError as exc:
@@ -233,6 +309,7 @@ class SpotMarketGateway:
                 if depth is not None and self._should_broadcast_depth(symbol, depth):
                     try:
                         await self._market_ws_manager().broadcast_depth_update(symbol, depth)
+                        self._remember_broadcast_metric(symbol, "depth")
                     except Exception:
                         logger.warning("spot_market_gateway_depth_broadcast_failed symbol=%s", symbol, exc_info=True)
 
@@ -249,6 +326,7 @@ class SpotMarketGateway:
                 if ticker is not None and self._should_broadcast_ticker(symbol, ticker):
                     try:
                         await self._market_ws_manager().broadcast_ticker_update(symbol, ticker)
+                        self._remember_broadcast_metric(symbol, "ticker")
                     except Exception:
                         logger.warning("spot_market_gateway_ticker_broadcast_failed symbol=%s", symbol, exc_info=True)
 
@@ -293,6 +371,7 @@ class SpotMarketGateway:
                                 or getattr(trades, "updated_at_ms", None)
                             ),
                         )
+                        self._remember_broadcast_metric(symbol, "trades")
                     except Exception:
                         logger.warning("spot_market_gateway_trade_broadcast_failed symbol=%s", symbol, exc_info=True)
 
@@ -338,6 +417,7 @@ class SpotMarketGateway:
                                 source=str((klines or {}).get("source") or "LIVE_WS"),
                                 updated_at=(klines or {}).get("updated_at"),
                             )
+                            self._remember_broadcast_metric(symbol, "kline")
                         except Exception:
                             logger.warning(
                                 "spot_market_gateway_kline_broadcast_failed symbol=%s interval=%s",
@@ -602,6 +682,14 @@ class SpotMarketGateway:
                 tuple(kline.get(key) for key in keys),
             )
         )
+
+    def _remember_broadcast_metric(self, symbol: str, domain: str) -> None:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        if not normalized_symbol:
+            return
+        self._broadcast_counters[domain] = int(self._broadcast_counters.get(domain) or 0) + 1
+        self._last_broadcast_at[normalized_symbol] = time.time()
+        self._last_broadcast_type[normalized_symbol] = domain
 
     def _domain_key(
         self,
