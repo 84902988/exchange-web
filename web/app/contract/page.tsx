@@ -3,9 +3,6 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import ContractAccountPanel from '@/components/contract/ContractAccountPanel';
-import {
-  type ContractKlineMode,
-} from '@/components/contract/ContractFuturesChart';
 import ContractFuturesOrderBook from '@/components/contract/ContractFuturesOrderBook';
 import ContractFuturesTrades from '@/components/contract/ContractFuturesTrades';
 import ContractMarketHeader, {
@@ -34,6 +31,7 @@ import {
   getContractTickers,
   isExpiredLastGoodBboQuote,
   type ContractKlineCurrentCandle,
+  type ContractKlineMode,
   type ContractMarketViewDetail,
   type ContractQuoteDisplayStatus,
   type ContractTickerItem,
@@ -711,20 +709,7 @@ function ContractPageContent() {
     : currentPriceSource === 'LIVE_MID'
       ? t('midPrice', 'contracts')
       : t('klineLatestPrice', 'contracts');
-  const backendKlineMode = String(activeContractMarketView?.kline_current_candle?.kline_mode || '').trim().toUpperCase();
-  const backendContractKlineMode: ContractKlineMode | null = backendKlineMode === 'QUOTE_DRIVEN'
-    ? 'QUOTE_DRIVEN'
-    : backendKlineMode === 'TRADE_DRIVEN'
-      ? 'TRADE_DRIVEN'
-      : backendKlineMode === 'PROVIDER_KLINE'
-        ? 'PROVIDER_KLINE'
-        : null;
-  const inferredContractKlineMode: ContractKlineMode = currentPriceSource === 'TRADE_TICK'
-    ? 'TRADE_DRIVEN'
-    : currentPriceSource === 'LIVE_MID' && !isCryptoContract && marketUiState.isTradable
-      ? 'QUOTE_DRIVEN'
-      : 'PROVIDER_KLINE';
-  const contractKlineMode: ContractKlineMode = backendContractKlineMode || inferredContractKlineMode;
+  const contractKlineMode: ContractKlineMode = 'PROVIDER_KLINE';
   const contractMarketState = useMemo<ContractMarketState>(() => {
     const liveBid = liveDepthMidFresh ? getPositivePrice(liveDepthBbo?.bid) : null;
     const liveAsk = liveDepthMidFresh ? getPositivePrice(liveDepthBbo?.ask) : null;
