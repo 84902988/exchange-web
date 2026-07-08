@@ -62,10 +62,15 @@ def _open_status() -> service.ItickMarketStatus:
     )
 
 
-def _contract(symbol: str = "AAPLUSDT_PERP", provider_symbol: str = "AAPL", category: str = "STOCK"):
+def _contract(
+    symbol: str = "AAPLUSDT_PERP",
+    provider_symbol: str = "AAPL",
+    category: str = "STOCK",
+    provider: str = "ITICK",
+):
     return SimpleNamespace(
         symbol=symbol,
-        provider="ITICK",
+        provider=provider,
         provider_symbol=provider_symbol,
         category=category,
         price_precision=2,
@@ -457,6 +462,27 @@ def test_stock_kline_path_still_uses_itick_kline_fetcher():
     fetch.assert_called_once()
 
 
+def test_binance_kline_failure_returns_empty_without_last_good_synthetic():
+    contract = _contract(
+        symbol="BTCUSDT_PERP",
+        provider_symbol="BTCUSDT",
+        category="CRYPTO",
+        provider="BINANCE",
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(service, "_load_contract_symbol", return_value=contract))
+        stack.enter_context(patch.object(service, "get_klines_cache_first", side_effect=RuntimeError("boom")))
+        stack.enter_context(patch.object(service, "contract_market_last_good_enabled", return_value=True))
+        last_good = stack.enter_context(patch.object(service, "get_last_valid_contract_quote", return_value={
+            "last_price": Decimal("62100"),
+        }))
+        rows = service.get_contract_klines(DummyDb(), contract.symbol, interval="1m", limit=5)
+
+    assert rows == []
+    last_good.assert_not_called()
+
+
 if __name__ == "__main__":
     test_closed_market_fresh_last_good_quote_returns_without_itick_refresh()
     test_weekend_accepts_previous_friday_last_good_bbo()
@@ -473,3 +499,4 @@ if __name__ == "__main__":
     test_open_market_plain_stale_without_live_depth_remains_not_executable()
     test_open_market_live_quote_and_depth_prefers_depth_bbo_for_quote()
     test_stock_kline_path_still_uses_itick_kline_fetcher()
+    test_binance_kline_failure_returns_empty_without_last_good_synthetic()

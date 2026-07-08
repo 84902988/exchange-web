@@ -155,6 +155,15 @@ const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
   symbols_types: [{ name: 'Futures', value: 'futures' }],
   supported_resolutions: SUPPORTED_RESOLUTIONS,
 };
+const NON_PROVIDER_KLINE_SOURCE_TOKENS = new Set([
+  'BBO',
+  'DEPTH',
+  'DISPLAY_PRICE',
+  'LIVE_MID',
+  'QUOTE_DRIVEN',
+  'SYNTHETIC_FROM_QUOTE',
+  'TRADE_TICK',
+]);
 
 function normalizeContractSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
@@ -216,7 +225,21 @@ function toRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function isProviderKlinePayload(value: unknown) {
+  const record = toRecord(value);
+  if (!record) return false;
+
+  return ['kline_mode', 'price_source', 'source', 'quote_source'].every((key) => {
+    const rawValue = record[key];
+    if (rawValue === undefined || rawValue === null || rawValue === '') return true;
+    const normalized = String(rawValue).trim().toUpperCase();
+    return !NON_PROVIDER_KLINE_SOURCE_TOKENS.has(normalized) && !normalized.includes('QUOTE');
+  });
+}
+
 function klineToBar(item: ContractMarketKlineItem): ContractTradingViewBar | null {
+  if (!isProviderKlinePayload(item)) return null;
+
   const time = normalizeTimeMs(item.open_time ?? item.time ?? item.timestamp);
   const open = normalizeNumber(item.open);
   const high = normalizeNumber(item.high);
@@ -235,7 +258,7 @@ function realtimeMessageToBar(
   expectedInterval: string,
 ): ContractTradingViewBar | null {
   const type = String(message.type || '').toLowerCase();
-  if (type && !type.includes('kline') && !type.includes('candle')) return null;
+  if (type !== 'contract_kline_update') return null;
 
   const payload = toRecord(message.kline) || toRecord(message.data);
   if (!payload) return null;

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +13,6 @@ BACKEND = ROOT / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from app.services import contract_market_view as market_view_module
 from app.services.contract_market_view import (
     apply_quote_driven_kline_overlays,
     build_contract_market_view,
@@ -156,7 +154,7 @@ def test_live_tradfi_bbo_display_price_is_not_overwritten_by_kline_close():
     assert view["raw_source_summary"]["latest_kline_close"] == "60.049"
 
 
-def test_tradfi_quote_driven_current_candle_uses_provider_bucket_not_server_now():
+def test_tradfi_current_candle_uses_provider_bucket_not_server_now():
     provider_bucket = NOW + timedelta(minutes=1)
     view = build_contract_market_view(
         "XAGUSDT_PERP",
@@ -194,17 +192,17 @@ def test_tradfi_quote_driven_current_candle_uses_provider_bucket_not_server_now(
 
     candle = view["kline_current_candle"]
     assert candle["open_time"] == int(provider_bucket.timestamp() * 1000)
-    assert candle["kline_mode"] == "QUOTE_DRIVEN"
-    assert candle["price_source"] == "LIVE_MID"
+    assert candle["kline_mode"] == "PROVIDER_KLINE"
+    assert candle["price_source"] == "KLINE_CLOSE"
     assert candle["volume_source"] == "PROVIDER_KLINE"
-    assert candle["open"] == "60.125"
-    assert candle["high"] == "60.125"
-    assert candle["low"] == "60.125"
-    assert candle["close"] == "60.125"
+    assert candle["open"] == "60.000"
+    assert candle["high"] == "60.050"
+    assert candle["low"] == "59.950"
+    assert candle["close"] == "60.010"
     assert candle["volume"] == "100"
 
 
-def test_tradfi_quote_driven_current_candle_high_does_not_regress_on_provider_revision():
+def test_tradfi_current_candle_uses_provider_ohlc_revision():
     provider_bucket_ms = int(NOW.timestamp() * 1000)
     common = {
         "quote": _quote(
@@ -242,10 +240,10 @@ def test_tradfi_quote_driven_current_candle_high_does_not_regress_on_provider_re
         ),
         **common,
     )
-    assert first["kline_current_candle"]["open"] == "61.000"
-    assert first["kline_current_candle"]["high"] == "61.000"
-    assert first["kline_current_candle"]["low"] == "61.000"
-    assert first["kline_current_candle"]["close"] == "61.000"
+    assert first["kline_current_candle"]["open"] == "60.000"
+    assert first["kline_current_candle"]["high"] == "60.300"
+    assert first["kline_current_candle"]["low"] == "59.900"
+    assert first["kline_current_candle"]["close"] == "60.100"
 
     second = build_contract_market_view(
         "XAGUSDT_PERP",
@@ -259,14 +257,14 @@ def test_tradfi_quote_driven_current_candle_high_does_not_regress_on_provider_re
         ),
         **common,
     )
-    assert second["kline_current_candle"]["open"] == "61.000"
-    assert second["kline_current_candle"]["high"] == "61.000"
-    assert second["kline_current_candle"]["low"] == "61.000"
-    assert second["kline_current_candle"]["close"] == "61.000"
+    assert second["kline_current_candle"]["open"] == "60.000"
+    assert second["kline_current_candle"]["high"] == "62.250"
+    assert second["kline_current_candle"]["low"] == "59.920"
+    assert second["kline_current_candle"]["close"] == "60.100"
     assert second["kline_current_candle"]["volume"] == "120"
 
 
-def test_provider_ohlc_after_live_mid_does_not_pollute_current_quote_driven_candle():
+def test_live_mid_does_not_pollute_provider_current_candle():
     provider_bucket_ms = int(NOW.timestamp() * 1000)
     contract_symbol = _contract(symbol="XAGUSDT_PERP", category="METAL", provider="ITICK")
     first_quote = _quote(
@@ -322,34 +320,15 @@ def test_provider_ohlc_after_live_mid_does_not_pollute_current_quote_driven_cand
     )
 
     candle = view["kline_current_candle"]
-    assert candle["open"] == "60.065"
-    assert candle["high"] == "60.065"
-    assert candle["low"] == "60.055"
-    assert candle["close"] == "60.055"
+    assert candle["open"] == "59.94498"
+    assert candle["high"] == "61.500"
+    assert candle["low"] == "59.9495"
+    assert candle["close"] == "59.94098"
     assert candle["volume"] == "230.1"
 
 
-def test_unmarked_polluted_quote_driven_overlay_is_reinitialized_from_live_mid():
+def test_stale_quote_driven_overlay_state_is_ignored():
     provider_bucket_ms = int(NOW.timestamp() * 1000)
-    market_view_module._QUOTE_DRIVEN_CANDLE_STATE[("XAGUSDT_PERP", "1m")] = OrderedDict([
-        (
-            provider_bucket_ms,
-            {
-                "time": int(provider_bucket_ms / 1000),
-                "open_time": provider_bucket_ms,
-                "open": "60.065",
-                "high": "60.065",
-                "low": "59.9495",
-                "close": "60.055",
-                "volume": "500",
-                "interval": "1m",
-                "kline_mode": "QUOTE_DRIVEN",
-                "price_source": "LIVE_MID",
-                "volume_source": "PROVIDER_KLINE",
-                "updated_at_ms": provider_bucket_ms + 1000,
-            },
-        )
-    ])
 
     quote = _quote(
         symbol="XAGUSDT_PERP",
@@ -386,14 +365,14 @@ def test_unmarked_polluted_quote_driven_overlay_is_reinitialized_from_live_mid()
     )
 
     candle = view["kline_current_candle"]
-    assert candle["open"] == "60.055"
-    assert candle["high"] == "60.055"
-    assert candle["low"] == "60.055"
-    assert candle["close"] == "60.055"
-    assert candle["volume"] == "500"
+    assert candle["open"] == "59.94498"
+    assert candle["high"] == "61.500"
+    assert candle["low"] == "59.9495"
+    assert candle["close"] == "59.94098"
+    assert candle["volume"] == "300"
 
 
-def test_readonly_quote_driven_view_does_not_mutate_overlay_ohlc():
+def test_readonly_view_uses_provider_ohlc_without_quote_overlay():
     provider_bucket_ms = int(NOW.timestamp() * 1000)
     contract_symbol = _contract(symbol="XAGUSDT_PERP", category="METAL", provider="ITICK")
 
@@ -461,7 +440,7 @@ def test_readonly_quote_driven_view_does_not_mutate_overlay_ohlc():
         now=NOW + timedelta(seconds=1),
         mutate_quote_driven_state=False,
     )
-    assert readonly["kline_current_candle"]["low"] == "60.055"
+    assert readonly["kline_current_candle"]["low"] == "59.700"
 
     view = build_contract_market_view(
         "XAGUSDT_PERP",
@@ -496,14 +475,14 @@ def test_readonly_quote_driven_view_does_not_mutate_overlay_ohlc():
     )
 
     candle = view["kline_current_candle"]
-    assert candle["open"] == "60.065"
-    assert candle["high"] == "60.065"
-    assert candle["low"] == "60.065"
-    assert candle["close"] == "60.065"
+    assert candle["open"] == "59.94498"
+    assert candle["high"] == "61.500"
+    assert candle["low"] == "59.700"
+    assert candle["close"] == "59.94098"
     assert candle["volume"] == "240.1"
 
 
-def test_tradfi_quote_driven_current_candle_volume_does_not_regress():
+def test_tradfi_current_candle_volume_uses_provider_value():
     provider_bucket_ms = int(NOW.timestamp() * 1000)
     common = {
         "quote": _quote(
@@ -538,10 +517,10 @@ def test_tradfi_quote_driven_current_candle_volume_does_not_regress():
         **common,
     )
 
-    assert view["kline_current_candle"]["volume"] == "500"
+    assert view["kline_current_candle"]["volume"] == "300"
 
 
-def test_quote_driven_overlay_protects_closed_previous_bucket_from_provider_regression():
+def test_quote_driven_overlay_helper_returns_provider_rows_unchanged():
     first_bucket_ms = int(NOW.timestamp() * 1000)
     second_bucket_ms = int((NOW + timedelta(minutes=1)).timestamp() * 1000)
     quote = _quote(
@@ -579,10 +558,10 @@ def test_quote_driven_overlay_protects_closed_previous_bucket_from_provider_regr
         contract_symbol=contract_symbol,
         now=NOW,
     )
-    assert first["kline_current_candle"]["open"] == "59.945"
-    assert first["kline_current_candle"]["high"] == "59.945"
-    assert first["kline_current_candle"]["low"] == "59.945"
-    assert first["kline_current_candle"]["close"] == "59.945"
+    assert first["kline_current_candle"]["open"] == "59.87002"
+    assert first["kline_current_candle"]["high"] == "59.87502"
+    assert first["kline_current_candle"]["low"] == "59.8265"
+    assert first["kline_current_candle"]["close"] == "59.82052"
 
     next_quote = dict(quote, bid_price="59.910", ask_price="59.920")
     next_depth = dict(depth, best_bid="59.910", best_ask="59.920")
@@ -627,14 +606,14 @@ def test_quote_driven_overlay_protects_closed_previous_bucket_from_provider_regr
     )
 
     protected = rows[0]
-    assert protected["open"] == "59.945"
-    assert protected["high"] == "59.945"
-    assert protected["low"] == "59.945"
-    assert protected["close"] == "59.945"
-    assert protected["volume"] == "500"
+    assert protected["open"] == "59.87002"
+    assert protected["high"] == "59.87502"
+    assert protected["low"] == "59.81748"
+    assert protected["close"] == "59.82052"
+    assert protected["volume"] == "383.6"
 
 
-def test_quote_driven_overlay_drops_old_bucket_outside_protection_window():
+def test_quote_driven_overlay_helper_does_not_add_missing_buckets():
     contract_symbol = _contract(symbol="XAGUSDT_PERP", category="METAL", provider="ITICK")
     for index, mid in enumerate(["60.100", "60.200", "60.300", "60.400"]):
         bucket = NOW + timedelta(minutes=index)
@@ -732,6 +711,31 @@ def test_crypto_current_candle_does_not_enter_quote_driven_mode():
     assert candle["price_source"] == "KLINE_CLOSE"
     assert candle["close"] == "92"
     assert candle["volume"] == "12"
+
+
+def test_kline_current_candle_rejects_non_provider_kline_source():
+    view = build_contract_market_view(
+        "XAGUSDT_PERP",
+        quote=_quote(
+            symbol="XAGUSDT_PERP",
+            provider="ITICK",
+            category="METAL",
+            bid_price="60.120",
+            ask_price="60.130",
+        ),
+        depth=_depth(
+            symbol="XAGUSDT_PERP",
+            provider="ITICK",
+            category="METAL",
+            best_bid="60.120",
+            best_ask="60.130",
+        ),
+        latest_kline=_kline(open="60", high="61", low="59", close="60.5", volume="12", price_source="LIVE_MID"),
+        contract_symbol=_contract(symbol="XAGUSDT_PERP", category="METAL", provider="ITICK"),
+        now=NOW,
+    )
+
+    assert view["kline_current_candle"] is None
 
 
 def test_crypto_stale_becomes_expired_not_last_good_tradable():

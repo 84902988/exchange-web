@@ -34,7 +34,7 @@ from app.services.contract_market_ws import (
     normalize_contract_ws_interval,
     normalize_contract_ws_symbol,
 )
-from app.services.contract_market_view import apply_quote_driven_kline_overlays, build_contract_market_view
+from app.services.contract_market_view import build_contract_market_view
 from app.services.contract_market_provider_ws import (
     force_stop_provider_ws_subscriptions_for_symbol,
     provider_ws_depth_enabled,
@@ -252,11 +252,7 @@ class ContractMarketGateway:
                 "depth": self._get_latest(CONTRACT_MARKET_CACHE_DEPTH, normalized_symbol),
                 "trades": self._get_latest(CONTRACT_MARKET_CACHE_TRADES, normalized_symbol) or [],
                 "klines": {
-                    normalized_interval: self._kline_with_quote_driven_overlay(
-                        normalized_symbol,
-                        normalized_interval,
-                        latest_kline,
-                    )
+                    normalized_interval: dict(latest_kline) if isinstance(latest_kline, dict) else None
                 },
                 "market_state": self._get_latest(
                     CONTRACT_MARKET_CACHE_STATE,
@@ -432,11 +428,10 @@ class ContractMarketGateway:
                 ensure_provider_ws=ensure_provider_ws,
             )
             if isinstance(latest_row, dict):
-                kline = _normalize_kline(latest_row, source=quote.get("source"))
-                broadcast_kline = self._kline_with_quote_driven_overlay(symbol, interval, kline) or kline
+                kline = _normalize_kline(latest_row, source=latest_row.get("source"))
                 self._set_latest(CONTRACT_MARKET_CACHE_KLINE, symbol, kline, interval=interval)
-                self._remember_kline_signature(symbol, interval, broadcast_kline)
-                messages.append(self._kline_message(symbol, interval, broadcast_kline))
+                self._remember_kline_signature(symbol, interval, kline)
+                messages.append(self._kline_message(symbol, interval, kline))
             state_message = self._state_message_from_latest(
                 symbol,
                 interval,
@@ -655,14 +650,13 @@ class ContractMarketGateway:
                 if not isinstance(payload, dict):
                     continue
                 kline = _normalize_kline(payload, source=payload.get("source"))
-                broadcast_kline = self._kline_with_quote_driven_overlay(normalized_symbol, interval, kline) or kline
-                signature = self._kline_signature(broadcast_kline)
+                signature = self._kline_signature(kline)
                 if self._last_kline_signature.get(key) == signature:
                     continue
                 self._set_latest(CONTRACT_MARKET_CACHE_KLINE, normalized_symbol, kline, interval=interval)
                 self._last_kline_signature[key] = signature
                 self._last_kline_broadcast_at[key] = time.monotonic()
-                messages.append(self._kline_message(normalized_symbol, interval, broadcast_kline))
+                messages.append(self._kline_message(normalized_symbol, interval, kline))
         finally:
             db.close()
         return messages
@@ -697,25 +691,6 @@ class ContractMarketGateway:
         )
         latest_row = rows[-1] if rows else None
         return latest_row if isinstance(latest_row, dict) else None
-
-    def _kline_with_quote_driven_overlay(
-        self,
-        symbol: str,
-        interval: str,
-        kline: Any,
-    ) -> dict[str, Any] | None:
-        if not isinstance(kline, dict):
-            return None
-        normalized_symbol = normalize_contract_ws_symbol(symbol)
-        normalized_interval = normalize_contract_ws_interval(interval)
-        rows = apply_quote_driven_kline_overlays(
-            normalized_symbol,
-            normalized_interval,
-            [kline],
-            limit=1,
-            include_missing=False,
-        )
-        return rows[0] if rows else dict(kline)
 
     def _load_depth_payload(
         self,

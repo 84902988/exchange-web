@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import hashlib
-import math
 import time
 from datetime import date as date_cls, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
@@ -58,6 +57,15 @@ DEPTH_MODE_BBO_ONLY = "BBO_ONLY"
 PRICE_SOURCE_TRADE_TICK = "TRADE_TICK"
 PRICE_SOURCE_KLINE_CLOSE = "KLINE_CLOSE"
 PRICE_SOURCE_SYNTHETIC_FROM_QUOTE = "SYNTHETIC_FROM_QUOTE"
+_NON_PROVIDER_KLINE_SOURCE_TOKENS = {
+    "BBO",
+    "DEPTH",
+    "DISPLAY_PRICE",
+    "LIVE_MID",
+    "QUOTE_DRIVEN",
+    "SYNTHETIC_FROM_QUOTE",
+    "TRADE_TICK",
+}
 QUOTE_FRESHNESS_LIVE_SECONDS = 30
 QUOTE_FRESHNESS_LAST_VALID_SECONDS = 300
 
@@ -4153,47 +4161,27 @@ def _extract_itick_kline_rows(payload: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _fallback_contract_klines(
-    *,
-    symbol: str,
-    provider_symbol: str,
-    category: str,
-    interval: str,
-    limit: int,
-    reference_price: Decimal,
-    precision: int,
-    end_time_ms: Optional[int] = None,
-) -> list[dict[str, Any]]:
-    seconds = _contract_interval_seconds[_normalize_contract_interval(interval)]
+def _is_provider_contract_kline_row(row: dict[str, Any]) -> bool:
+    for key in ("kline_mode", "price_source", "source", "quote_source"):
+        raw_value = row.get(key)
+        if raw_value is None or raw_value == "":
+            continue
+        normalized = str(raw_value).strip().upper()
+        if normalized in _NON_PROVIDER_KLINE_SOURCE_TOKENS or "QUOTE" in normalized:
+            return False
+    return True
+
+
+def _provider_contract_kline_rows(rows: list[dict[str, Any]], *, limit: Optional[int] = None) -> list[dict[str, Any]]:
+    clean_rows = [
+        dict(row)
+        for row in (rows or [])
+        if isinstance(row, dict) and _is_provider_contract_kline_row(row)
+    ]
+    if limit is None:
+        return clean_rows
     safe_limit = _normalize_kline_limit(limit)
-    now = int(((int(end_time_ms) - 1) // 1000) if end_time_ms else datetime.utcnow().timestamp())
-    aligned_now = now - (now % seconds)
-    digest = hashlib.sha256(f"{symbol}:{provider_symbol}:{interval}".encode("utf-8")).hexdigest()
-    seed = int(digest[:8], 16)
-    amplitude = max(reference_price * Decimal("0.003"), _price_quant(precision) * Decimal("5"))
-    rows: list[dict[str, Any]] = []
-    previous_close = reference_price
-    for index in range(safe_limit):
-        point_index = index - safe_limit + 1
-        open_time = (aligned_now + point_index * seconds) * 1000
-        wave = Decimal(str(math.sin((seed % 37 + index) / 4))) * amplitude
-        close_price = max(reference_price + wave, _price_quant(precision))
-        open_price = previous_close
-        high_price = max(open_price, close_price) + amplitude * Decimal("0.35")
-        low_price = max(min(open_price, close_price) - amplitude * Decimal("0.35"), _price_quant(precision))
-        volume = Decimal(100 + ((seed + index * 17) % 500))
-        rows.append(
-            {
-                "open_time": open_time,
-                "open": _format_decimal(_round_price(open_price, precision)),
-                "high": _format_decimal(_round_price(high_price, precision)),
-                "low": _format_decimal(_round_price(low_price, precision)),
-                "close": _format_decimal(_round_price(close_price, precision)),
-                "volume": _format_decimal(volume),
-            }
-        )
-        previous_close = close_price
-    return rows
+    return clean_rows[-safe_limit:]
 
 
 def _get_stock_contract_klines_from_itick(
@@ -4211,7 +4199,7 @@ def _get_stock_contract_klines_from_itick(
     if end_time_ms is None:
         cached_rows = _get_cached_contract_klines(normalized_symbol, normalized_interval, safe_limit)
         if cached_rows is not None:
-            return cached_rows
+            return _provider_contract_kline_rows(cached_rows, limit=safe_limit)
 
     if normalized_interval not in _itick_contract_k_type:
         logger.info(
@@ -4246,6 +4234,7 @@ def _get_stock_contract_klines_from_itick(
         source="ITICK",
         fetch_external=_fetch_stock_contract_klines,
     )
+    rows = _provider_contract_kline_rows(rows, limit=safe_limit)
     if end_time_ms is None:
         _cache_contract_klines(normalized_symbol, normalized_interval, safe_limit, rows)
     if not rows:
@@ -4288,27 +4277,6 @@ def get_contract_klines(
 
     provider = str(contract_symbol.provider or "").strip().upper()
     provider_symbol = _contract_provider_symbol(contract_symbol)
-    def _with_quote_driven_overlays(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if end_time_ms is not None:
-            return rows
-        try:
-            from app.services.contract_market_view import apply_quote_driven_kline_overlays
-
-            return apply_quote_driven_kline_overlays(
-                contract_symbol.symbol,
-                normalized_interval,
-                rows,
-                limit=safe_limit,
-                include_missing=True,
-            )
-        except Exception:
-            logger.debug(
-                "quote_driven_kline_overlay_merge_failed symbol=%s interval=%s",
-                contract_symbol.symbol,
-                normalized_interval,
-                exc_info=True,
-            )
-            return rows
 
     if provider == "BINANCE":
         def _fetch_configured_contract_klines(fetch_limit: int, _fetch_end_time_ms: Optional[int]):
@@ -4321,7 +4289,7 @@ def get_contract_klines(
             )
 
         try:
-            return get_klines_cache_first(
+            rows = get_klines_cache_first(
                 db,
                 market_type="contract",
                 symbol=contract_symbol.symbol,
@@ -4331,24 +4299,18 @@ def get_contract_klines(
                 source="CONFIGURED",
                 fetch_external=_fetch_configured_contract_klines,
             )
+            return _provider_contract_kline_rows(rows, limit=safe_limit)
         except Exception:
             if not contract_market_last_good_enabled(db):
                 raise
-            fallback_quote = get_last_valid_contract_quote(db, contract_symbol.symbol)
-            fallback_price = _to_decimal(fallback_quote.get("last_price")) if fallback_quote else None
-            if fallback_price is not None and fallback_price > 0:
-                return _fallback_contract_klines(
-                    symbol=contract_symbol.symbol,
-                    provider_symbol=provider_symbol,
-                    category=_contract_asset_category(contract_symbol),
-                    interval=normalized_interval,
-                    limit=safe_limit,
-                    reference_price=fallback_price,
-                    precision=int(getattr(contract_symbol, "price_precision", 2) or 2),
-                    end_time_ms=end_time_ms,
-                )
+            logger.warning(
+                "contract_kline_provider_unavailable_no_synthetic_fallback symbol=%s interval=%s limit=%s",
+                contract_symbol.symbol,
+                normalized_interval,
+                safe_limit,
+            )
+            return []
 
-    precision = int(getattr(contract_symbol, "price_precision", 2) or 2)
     category = _contract_asset_category(contract_symbol)
     if provider == "ITICK":
         if _is_stock_contract_config(contract_symbol):
@@ -4360,12 +4322,12 @@ def get_contract_klines(
                 limit=safe_limit,
                 end_time_ms=end_time_ms,
             )
-            return _with_quote_driven_overlays(rows)
+            return rows
 
         if category != "INDEX" and end_time_ms is None:
             cached_rows = _get_cached_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit)
             if cached_rows is not None:
-                return _with_quote_driven_overlays(cached_rows)
+                return _provider_contract_kline_rows(cached_rows, limit=safe_limit)
         if normalized_interval not in _itick_contract_k_type:
             logger.info(
                 "tradfi_cfd_kline_interval_unsupported symbol=%s interval=%s",
@@ -4417,6 +4379,7 @@ def get_contract_klines(
                 source="ITICK",
                 fetch_external=_fetch_itick_contract_klines,
             )
+        rows = _provider_contract_kline_rows(rows, limit=safe_limit)
         if rows:
             if end_time_ms is None:
                 _cache_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit, rows)
@@ -4429,7 +4392,7 @@ def get_contract_klines(
                         items=rows,
                         source="ITICK",
                     )
-            return _with_quote_driven_overlays(rows)
+            return rows
         if _is_tradfi_cfd_contract(contract_symbol):
             logger.warning(
                 "tradfi_cfd_kline_empty symbol=%s provider_symbol=%s market=%s region=%s interval=%s kType=%s limit=%s",
@@ -4447,17 +4410,15 @@ def get_contract_klines(
                 _cache_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit, [])
             return []
 
-    reference_price, _source, _price_field, _quote_ts = _get_itick_cfd_reference_price(contract_symbol)
-    return _fallback_contract_klines(
-        symbol=contract_symbol.symbol,
-        provider_symbol=provider_symbol,
-        category=category,
-        interval=normalized_interval,
-        limit=safe_limit,
-        reference_price=reference_price,
-        precision=precision,
-        end_time_ms=end_time_ms,
+    logger.warning(
+        "contract_kline_provider_missing_no_synthetic_fallback symbol=%s provider=%s category=%s interval=%s limit=%s",
+        contract_symbol.symbol,
+        provider,
+        category,
+        normalized_interval,
+        safe_limit,
     )
+    return []
 
 
 def get_contract_recent_trades(db: Session, symbol: str, limit: int = 30) -> list[dict[str, Any]]:
