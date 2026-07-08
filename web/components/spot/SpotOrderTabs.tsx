@@ -14,6 +14,7 @@ import {
 } from '@/lib/api/modules/spot'
 import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl'
 import { formatSpotDisplaySymbol } from './spotFormat'
+import { parseSpotPrivateWsMessage } from './spotPrivateWs'
 
 type Props = {
   symbol: string
@@ -967,12 +968,26 @@ export default function SpotOrderTabs({
         if (dead) return
 
         try {
-          const data = JSON.parse(
-            event.data,
-          ) as
+          const data = parseSpotPrivateWsMessage(event.data, {
+            sendPong: () => {
+              try {
+                ws.send('pong')
+              } catch {
+                // Heartbeat replies are best-effort.
+              }
+            },
+            onIgnoredText: (message) => {
+              console.debug('SpotOrderTabs private ws text heartbeat ignored:', message)
+            },
+          }) as
             | PrivateOrdersSnapshotMessage
             | PrivateOrderUpdateMessage
             | PrivateBalanceUpdateMessage
+            | null
+
+          if (!data) {
+            return
+          }
 
           if (data.type === 'spot_user_balance_update') {
             const items = normalizeBalanceUpdateItems(data)

@@ -380,28 +380,31 @@ class MarketWsManager:
         )
 
     def _depth_update_payload(self, symbol: str, depth: Any) -> dict:
+        bids = [
+            item.model_dump() if hasattr(item, "model_dump") else item.dict()
+            for item in getattr(depth, "bids", [])
+        ]
+        asks = [
+            item.model_dump() if hasattr(item, "model_dump") else item.dict()
+            for item in getattr(depth, "asks", [])
+        ]
+        has_depth_levels = bool(bids or asks)
         depth_payload = {
             "symbol": getattr(depth, "symbol", symbol),
-            "bids": [
-                item.model_dump() if hasattr(item, "model_dump") else item.dict()
-                for item in getattr(depth, "bids", [])
-            ],
-            "asks": [
-                item.model_dump() if hasattr(item, "model_dump") else item.dict()
-                for item in getattr(depth, "asks", [])
-            ],
+            "bids": bids,
+            "asks": asks,
             "ts": getattr(depth, "ts", None),
+            "source": (getattr(depth, "source", None) or "INTERNAL") if has_depth_levels else "MISSING",
+            "freshness": (getattr(depth, "freshness", None) or "RECENT") if has_depth_levels else "MISSING",
+            "stale": bool(getattr(depth, "stale", False)) if has_depth_levels else False,
         }
         for key in (
             "price_precision",
             "amount_precision",
             "provider",
-            "stale",
             "updated_at",
             "last_price",
             "mid_price",
-            "source",
-            "freshness",
             "fetched_at",
         ):
             value = getattr(depth, key, None)

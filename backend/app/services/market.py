@@ -806,8 +806,12 @@ def _pair_base_quote(pair: TradingPair) -> Tuple[str, str]:
     )
 
 
+def _normalize_pair_search_text(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+
 def _pair_matches_keyword(pair: TradingPair, keyword: str) -> bool:
-    normalized_keyword = str(keyword or "").strip().upper()
+    normalized_keyword = _normalize_pair_search_text(keyword)
     if not normalized_keyword:
         return True
     base, quote = _pair_base_quote(pair)
@@ -823,7 +827,7 @@ def _pair_matches_keyword(pair: TradingPair, keyword: str) -> bool:
         getattr(pair, "display_category", None),
         getattr(pair, "display_group", None),
     ]
-    return any(normalized_keyword in str(value or "").upper().replace("/", "") for value in values)
+    return any(normalized_keyword in _normalize_pair_search_text(value) for value in values)
 
 
 def _pair_matches_rwa(pair: TradingPair) -> bool:
@@ -845,9 +849,11 @@ def _pair_matches_category(pair: TradingPair, category: str) -> bool:
     if normalized_category in ("", "all"):
         return True
 
+    if normalized_category == "spot":
+        return not _is_contract_pair(pair)
+
     display_category = _normalize_display_category(pair)
     display_category_map = {
-        "spot": "MAINSTREAM",
         "mainstream": "MAINSTREAM",
         "stock": "STOCK",
         "platform": "PLATFORM",
@@ -860,9 +866,8 @@ def _pair_matches_category(pair: TradingPair, category: str) -> bool:
     }
     expected_display_category = display_category_map.get(normalized_category)
     if expected_display_category:
-        if not display_category:
-            return False
-        return display_category == expected_display_category
+        if display_category == expected_display_category:
+            return True
 
     base, _ = _pair_base_quote(pair)
     asset_type = _normalize_asset_type(pair)
@@ -963,6 +968,10 @@ def _get_internal_depth(db: Session, pair: TradingPair, limit: int = 20) -> Dept
         bids=bids,
         asks=asks,
         ts=_now_ms(),
+        provider=None,
+        stale=False,
+        source="INTERNAL" if bids or asks else "MISSING",
+        freshness="RECENT" if bids or asks else "MISSING",
     )
 
 
@@ -2882,6 +2891,7 @@ def get_market_pairs(
     items = []
     for pair in page_pairs:
         status_payload = _market_status_payload_for_pair(pair)
+        is_contract = _is_contract_pair(pair)
         items.append(
             {
                 "symbol": pair.symbol,
@@ -2889,6 +2899,8 @@ def get_market_pairs(
                 **status_payload,
                 "quote_freshness": "FALLBACK" if _is_itick_stock_pair(pair) else "LIVE",
                 "status": int(getattr(pair, "status", 0) or 0),
+                "enabled": int(getattr(pair, "status", 0) or 0) == 1,
+                "market_type": "contract" if is_contract else "spot",
             }
         )
 

@@ -82,6 +82,12 @@ def _best_price(depth: Optional[DepthResponse], side: str) -> Optional[str]:
     return _to_str(getattr(levels[0], "price", None))
 
 
+def _has_depth_levels(depth: Optional[DepthResponse]) -> bool:
+    if depth is None:
+        return False
+    return bool(getattr(depth, "bids", None) or getattr(depth, "asks", None))
+
+
 def _spread(best_bid: Optional[str], best_ask: Optional[str]) -> Optional[str]:
     bid = _decimal_or_none(best_bid)
     ask = _decimal_or_none(best_ask)
@@ -443,7 +449,7 @@ def get_spot_market_view(
     )
     orderbook_mid_price = _orderbook_mid_price(best_bid, best_ask, display_price_precision)
     market_status = str(ticker.get("market_status") or "UNKNOWN").upper()
-    has_depth = bool(best_bid and best_ask)
+    has_depth = _has_depth_levels(depth)
     has_trades = bool(getattr(trades, "trades", None))
     has_kline = bool(kline.get("items"))
     has_ticker = bool(ticker_last_price)
