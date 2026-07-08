@@ -976,9 +976,6 @@ export default function SpotOrderTabs({
                 // Heartbeat replies are best-effort.
               }
             },
-            onIgnoredText: (message) => {
-              console.debug('SpotOrderTabs private ws text heartbeat ignored:', message)
-            },
           }) as
             | PrivateOrdersSnapshotMessage
             | PrivateOrderUpdateMessage
