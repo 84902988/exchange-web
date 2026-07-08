@@ -25,12 +25,14 @@ import {
   getL1CurrentKlineCacheMinBars,
   getSpotIntervalMs,
   getSpotKlineLoadPolicy,
+  isSparseRealKlineSeries,
   inspectCurrentKlineCache,
   isProviderCandleOnlyInterval,
   isUtcProviderCandleInterval,
   mergeTradingViewBars,
   normalizeSpotInterval,
   readCurrentKlineCache,
+  shouldRejectKlineContinuity,
   writeCurrentKlineCache,
   type SpotTradingViewBar,
 } from './spotKlineClientCache';
@@ -1542,6 +1544,18 @@ export function createSpotTradingViewDatafeed(
         const cacheLookup = inspectCurrentKlineCache(apiSymbol, interval, requiredBars, { minBars: l1MinBars });
         const cached = cacheLookup.hit;
         const cachedContinuityStats = cached ? getBarsContinuityStats(cached.bars, interval) : null;
+        const cachedSparseRealBars = Boolean(cached?.bars.length && isSparseRealKlineSeries({
+          interval,
+          source: cached.source,
+          bars: cached.bars,
+          continuityStats: cachedContinuityStats,
+        }));
+        const cachedContinuityRejected = Boolean(cached?.bars.length && cachedContinuityStats && shouldRejectKlineContinuity({
+          interval,
+          source: cached.source,
+          bars: cached.bars,
+          continuityStats: cachedContinuityStats,
+        }));
         const cachePerfPayload = {
           ...getBarsPerfPayload,
           ...buildKlineCachePerfPayload(cacheLookup.candidate || cached, {
@@ -1556,6 +1570,11 @@ export function createSpotTradingViewDatafeed(
           continuityDuplicateCount:
             cacheLookup.continuityStats?.duplicateCount ?? cachedContinuityStats?.duplicateCount ?? null,
           continuityMaxGap: cacheLookup.continuityStats?.maxGap ?? cachedContinuityStats?.maxGap ?? null,
+          continuityOutOfOrderCount:
+            cacheLookup.continuityStats?.outOfOrderCount ?? cachedContinuityStats?.outOfOrderCount ?? null,
+          continuityInvalidOhlcCount:
+            cacheLookup.continuityStats?.invalidOhlcCount ?? cachedContinuityStats?.invalidOhlcCount ?? null,
+          sparseRealBars: cachedSparseRealBars,
         };
         const cachedStopsInitialOlderHistory = cached ? shouldStopInitialOlderProviderHistory({
           interval,
@@ -1575,8 +1594,8 @@ export function createSpotTradingViewDatafeed(
           cached?.bars.length &&
           (cachedCoversRequestedBars || cachedCoversTerminalInitialHistory) &&
           cached.bars.length >= l1MinBars &&
-          cachedContinuityStats?.gapCount === 0 &&
-          cachedContinuityStats.duplicateCount === 0
+          cachedContinuityStats &&
+          !cachedContinuityRejected
         ) {
           const stopInitialOlderHistory = cachedStopsInitialOlderHistory;
           if (canUpdateActiveHistoryState()) {
@@ -1610,6 +1629,9 @@ export function createSpotTradingViewDatafeed(
             continuityGapCount: cachedContinuityStats.gapCount,
             continuityDuplicateCount: cachedContinuityStats.duplicateCount,
             continuityMaxGap: cachedContinuityStats.maxGap,
+            continuityOutOfOrderCount: cachedContinuityStats.outOfOrderCount,
+            continuityInvalidOhlcCount: cachedContinuityStats.invalidOhlcCount,
+            sparseRealBars: cachedSparseRealBars,
             barsSummary: buildSpotTvDebugBarsSummary(cached.bars),
             lastBars: buildBarDebugRows(cached.bars),
           };
@@ -1677,6 +1699,9 @@ export function createSpotTradingViewDatafeed(
             continuityGapCount: cachedContinuityStats?.gapCount ?? null,
             continuityDuplicateCount: cachedContinuityStats?.duplicateCount ?? null,
             continuityMaxGap: cachedContinuityStats?.maxGap ?? null,
+            continuityOutOfOrderCount: cachedContinuityStats?.outOfOrderCount ?? null,
+            continuityInvalidOhlcCount: cachedContinuityStats?.invalidOhlcCount ?? null,
+            sparseRealBars: cachedSparseRealBars,
           });
         }
         markSpotKlinePerf('getBars_cache_miss', {
@@ -1685,6 +1710,9 @@ export function createSpotTradingViewDatafeed(
           cached_bars_count: cached?.bars.length || 0,
           continuityGapCount: cachedContinuityStats?.gapCount ?? null,
           continuityDuplicateCount: cachedContinuityStats?.duplicateCount ?? null,
+          continuityOutOfOrderCount: cachedContinuityStats?.outOfOrderCount ?? null,
+          continuityInvalidOhlcCount: cachedContinuityStats?.invalidOhlcCount ?? null,
+          sparseRealBars: cachedSparseRealBars,
           note: cached?.bars.length ? 'current cache insufficient or discontinuous' : 'current cache empty',
         });
       }
@@ -1747,6 +1775,18 @@ export function createSpotTradingViewDatafeed(
             ? 'current provider visible window complete'
             : noDataPolicy.reason;
           const continuityStats = getBarsContinuityStats(bars, interval);
+          const sparseRealBars = isSparseRealKlineSeries({
+            interval,
+            source,
+            bars,
+            continuityStats,
+          });
+          const continuityRejected = shouldRejectKlineContinuity({
+            interval,
+            source,
+            bars,
+            continuityStats,
+          });
           const terminalNoData = Boolean(result.terminalNoData || isTerminalEmptyKlineResult(result));
           const reachedRequiredBars = result.reachedRequiredBars ?? bars.length >= requiredBars;
           const responseDebugPayload = {
@@ -1788,6 +1828,9 @@ export function createSpotTradingViewDatafeed(
             continuityGapCount: continuityStats.gapCount,
             continuityDuplicateCount: continuityStats.duplicateCount,
             continuityMaxGap: continuityStats.maxGap,
+            continuityOutOfOrderCount: continuityStats.outOfOrderCount,
+            continuityInvalidOhlcCount: continuityStats.invalidOhlcCount,
+            sparseRealBars,
             barsSummary: buildSpotTvDebugBarsSummary(bars),
             lastBars: buildBarDebugRows(bars),
           };
@@ -1803,7 +1846,7 @@ export function createSpotTradingViewDatafeed(
             safeHistoryCallback([], { noData: callbackNoData }, noDataDecision);
             return;
           }
-          if (bars.length && (continuityStats.gapCount > 0 || continuityStats.duplicateCount > 0)) {
+          if (continuityRejected) {
             safeErrorCallback('Kline history temporarily unavailable');
             return;
           }
