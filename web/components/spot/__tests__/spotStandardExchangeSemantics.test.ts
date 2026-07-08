@@ -10,34 +10,51 @@ import {
 } from '../GlobalMarketSelector'
 
 describe('spot standard exchange semantics', () => {
-  const internalSpotPair: GlobalMarketSelectorPair = {
+  const internalCryptoSpotPair: GlobalMarketSelectorPair = {
     symbol: 'MFCUSDT',
     displaySymbol: 'MFC/USDT',
     baseAsset: 'MFC',
     quoteAsset: 'USDT',
-    assetType: 'RWA',
+    assetType: 'CRYPTO',
+    dataSource: 'INTERNAL',
+    marketCategory: 'CRYPTO',
+    displayCategory: null,
+  }
+
+  const rwaSpotPair: GlobalMarketSelectorPair = {
+    symbol: 'BON-2USDT',
+    displaySymbol: 'BON-2/USDT',
+    baseAsset: 'BON-2',
+    quoteAsset: 'USDT',
+    assetType: 'CRYPTO',
     dataSource: 'INTERNAL',
     marketCategory: 'CRYPTO',
     displayCategory: 'RWA',
   }
 
-  it('keeps enabled internal spot pairs visible in the spot selector category', () => {
-    expect(pairMatchesSpotSelectorCategory(internalSpotPair, 'spot')).toBe(true)
-    expect(pairMatchesSpotSelectorCategory(internalSpotPair, 'rwa')).toBe(true)
+  it('keeps RWA spot pairs isolated from the regular spot selector category', () => {
+    expect(pairMatchesSpotSelectorCategory(rwaSpotPair, 'spot')).toBe(false)
+    expect(pairMatchesSpotSelectorCategory(rwaSpotPair, 'rwa')).toBe(true)
     expect(pairMatchesSpotSelectorCategory(
       {
-        ...internalSpotPair,
+        ...rwaSpotPair,
+        assetType: 'RWA',
         displayCategory: null,
       },
       'rwa',
     )).toBe(true)
   })
 
+  it('keeps enabled internal crypto spot pairs visible in the regular spot selector category', () => {
+    expect(pairMatchesSpotSelectorCategory(internalCryptoSpotPair, 'spot')).toBe(true)
+  })
+
   it('searches spot selector pairs by compact and slash display symbols', () => {
-    expect(pairMatchesSpotSelectorSearch(internalSpotPair, 'MFCUSDT')).toBe(true)
-    expect(pairMatchesSpotSelectorSearch(internalSpotPair, 'MFC/USDT')).toBe(true)
-    expect(pairMatchesSpotSelectorSearch(internalSpotPair, 'mfc')).toBe(true)
-    expect(pairMatchesSpotSelectorSearch(internalSpotPair, 'usdt')).toBe(true)
+    expect(pairMatchesSpotSelectorSearch(internalCryptoSpotPair, 'MFCUSDT')).toBe(true)
+    expect(pairMatchesSpotSelectorSearch(internalCryptoSpotPair, 'MFC/USDT')).toBe(true)
+    expect(pairMatchesSpotSelectorSearch(internalCryptoSpotPair, 'mfc')).toBe(true)
+    expect(pairMatchesSpotSelectorSearch(internalCryptoSpotPair, 'usdt')).toBe(true)
+    expect(pairMatchesSpotSelectorSearch(rwaSpotPair, 'BON')).toBe(true)
   })
 
   it('clears old depth levels when backend marks depth missing', () => {

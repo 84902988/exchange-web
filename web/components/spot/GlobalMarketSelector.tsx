@@ -419,7 +419,13 @@ function isCryptoContractPair(pair: GlobalMarketSelectorPair): boolean {
 }
 
 function isCryptoSpotPair(pair: GlobalMarketSelectorPair): boolean {
-  return isSpotMarketPair(pair) && !isStockMarketPair(pair) && !isTradfiCfdPair(pair);
+  return (
+    isSpotMarketPair(pair) &&
+    !isStockMarketPair(pair) &&
+    !isTradfiCfdPair(pair) &&
+    !isPlatformPair(pair) &&
+    !isRwaPair(pair)
+  );
 }
 
 function getContractCategory(pair: GlobalMarketSelectorPair): ContractCategory {
