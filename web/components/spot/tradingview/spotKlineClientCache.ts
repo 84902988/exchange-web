@@ -21,6 +21,8 @@ export type SpotKlineContinuityStats = {
   duplicateCount: number;
   gapCount: number;
   maxGap: number;
+  outOfOrderCount: number;
+  invalidOhlcCount: number;
 };
 
 export type SpotKlineCacheEntry = {
@@ -156,6 +158,10 @@ export function isUtcProviderCandleInterval(interval: string): boolean {
   return ['1Dutc', '1Wutc', '1Mutc'].includes(normalizeSpotInterval(interval));
 }
 
+export function isInternalSparseKlineInterval(interval: string): boolean {
+  return ['1Dutc', '1Wutc', '1Mutc'].includes(normalizeSpotInterval(interval));
+}
+
 export function getSpotKlineLoadPolicy(interval: string): SpotKlineLoadPolicy {
   return SPOT_KLINE_LOAD_POLICY[normalizeSpotInterval(interval)] || SPOT_KLINE_LOAD_POLICY['1m'];
 }
@@ -200,14 +206,48 @@ function getExpectedNextBarTimeMs(interval: string, timeMs: number) {
   return timeMs + getSpotIntervalMs(normalizedInterval);
 }
 
+function isValidOhlcBar(bar: SpotTradingViewBar): boolean {
+  return (
+    Number.isFinite(bar.open) &&
+    Number.isFinite(bar.high) &&
+    Number.isFinite(bar.low) &&
+    Number.isFinite(bar.close) &&
+    bar.high >= bar.open &&
+    bar.high >= bar.close &&
+    bar.low <= bar.open &&
+    bar.low <= bar.close &&
+    bar.high >= bar.low
+  );
+}
+
 export function getBarsContinuityStats(
   bars: SpotTradingViewBar[],
   interval: string,
 ): SpotKlineContinuityStats {
   const sorted = mergeTradingViewBars(bars);
-  const duplicateCount = Math.max(0, bars.length - sorted.length);
+  const seenTimes = new Set<number>();
+  let duplicateCount = 0;
+  let outOfOrderCount = 0;
+  let invalidOhlcCount = 0;
   let gapCount = 0;
   let maxGap = 0;
+
+  for (let index = 0; index < bars.length; index += 1) {
+    const bar = bars[index];
+    if (!isValidOhlcBar(bar)) {
+      invalidOhlcCount += 1;
+    }
+    if (Number.isFinite(bar.time) && bar.time > 0) {
+      if (seenTimes.has(bar.time)) {
+        duplicateCount += 1;
+      } else {
+        seenTimes.add(bar.time);
+      }
+    }
+    if (index > 0 && bar.time <= bars[index - 1].time) {
+      outOfOrderCount += 1;
+    }
+  }
 
   for (let index = 1; index < sorted.length; index += 1) {
     const previous = sorted[index - 1];
@@ -224,7 +264,43 @@ export function getBarsContinuityStats(
     duplicateCount,
     gapCount,
     maxGap,
+    outOfOrderCount,
+    invalidOhlcCount,
   };
+}
+
+export function hasHardKlineContinuityViolation(stats: SpotKlineContinuityStats): boolean {
+  return stats.duplicateCount > 0 || stats.outOfOrderCount > 0 || stats.invalidOhlcCount > 0;
+}
+
+export function isSparseRealKlineSeries(params: {
+  interval: string;
+  source?: unknown;
+  bars?: SpotTradingViewBar[];
+  continuityStats?: SpotKlineContinuityStats | null;
+}): boolean {
+  if (!isInternalSparseKlineInterval(params.interval)) return false;
+  if (normalizeSource(params.source) !== 'INTERNAL') return false;
+  if (params.bars && !params.bars.length) return false;
+  if (params.continuityStats && hasHardKlineContinuityViolation(params.continuityStats)) {
+    return false;
+  }
+  return true;
+}
+
+export function shouldRejectKlineContinuity(params: {
+  interval: string;
+  source?: unknown;
+  bars: SpotTradingViewBar[];
+  continuityStats?: SpotKlineContinuityStats | null;
+}): boolean {
+  if (!params.bars.length) return false;
+  const stats = params.continuityStats || getBarsContinuityStats(params.bars, params.interval);
+  if (hasHardKlineContinuityViolation(stats)) return true;
+  if (stats.gapCount > 0 && !isSparseRealKlineSeries({ ...params, continuityStats: stats })) {
+    return true;
+  }
+  return false;
 }
 
 function getCurrentKlineCacheTtlMs(interval: string) {
@@ -329,7 +405,12 @@ export function inspectCurrentKlineCache(
     }
 
     const continuityStats = getBarsContinuityStats(entry.bars, normalizedInterval);
-    if (continuityStats.gapCount > 0 || continuityStats.duplicateCount > 0) {
+    if (shouldRejectKlineContinuity({
+      interval: normalizedInterval,
+      source: entry.source,
+      bars: entry.bars,
+      continuityStats,
+    })) {
       firstRejected = firstRejected || { ...baseResult, reason: 'reject_continuity', continuityStats };
       continue;
     }
@@ -373,6 +454,13 @@ export function writeCurrentKlineCache(params: {
   const normalizedLimit = Math.max(1, params.limit);
   const key = buildCurrentKlineCacheKey(normalizedSymbol, normalizedInterval, normalizedLimit);
   const storedBars = cloneBars(params.bars.slice(-normalizedLimit));
+  if (shouldRejectKlineContinuity({
+    interval: normalizedInterval,
+    source: params.source,
+    bars: storedBars,
+  })) {
+    return null;
+  }
   const terminalComplete = isTerminalCompleteKlineCacheEntry(
     normalizedInterval,
     normalizedLimit,
