@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.db.models.market_kline import MarketKline
 from app.db.models.order import Order
 from app.db.models.trade import Trade
 from app.db.models.trading_pair import TradingPair
@@ -138,7 +139,19 @@ _INTERVAL_SECONDS = {
     "1M": 30 * 86400,
     "1Mutc": 30 * 86400,
 }
-_INTERNAL_SPOT_KLINE_SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
+_INTERNAL_SPOT_KLINE_UTC_AGGREGATE_INTERVALS = {"1Dutc", "1Wutc", "1Mutc"}
+_INTERNAL_SPOT_KLINE_SUPPORTED_INTERVALS = {
+    "1m",
+    "5m",
+    "15m",
+    "1h",
+    "4h",
+    "1d",
+    *_INTERNAL_SPOT_KLINE_UTC_AGGREGATE_INTERVALS,
+}
+_INTERNAL_SPOT_KLINE_AGGREGATE_SOURCE_INTERVALS = ("1m", "5m", "15m", "1h", "4h")
+_INTERNAL_SPOT_KLINE_AGGREGATE_SOURCE_ROW_LIMIT = 50_000
+_INTERNAL_SPOT_KLINE_AGGREGATE_SOURCES = {SPOT_KLINE_SOURCE_INTERNAL_TRADE, "INTERNAL"}
 
 MAINSTREAM_PAIR_BASES = {"BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX"}
 PLATFORM_PAIR_BASES = {"MFC", "RCB"}
@@ -3097,6 +3110,308 @@ def _parse_end_time_ms(end_time_ms: Optional[int]) -> Optional[datetime]:
     return datetime.fromtimestamp(ms / 1000)
 
 
+def _parse_end_time_ms_int(end_time_ms: Optional[int]) -> Optional[int]:
+    if end_time_ms in (None, "", 0):
+        return None
+
+    try:
+        ms = int(end_time_ms)
+    except Exception:
+        raise ValueError("invalid end_time")
+
+    if ms <= 0:
+        raise ValueError("invalid end_time")
+
+    return ms
+
+
+def _utc_naive_from_ms(ms: int) -> datetime:
+    return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).replace(tzinfo=None)
+
+
+def _datetime_to_utc_ms(value: datetime) -> int:
+    dt = value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _add_one_utc_month(value: datetime) -> datetime:
+    month = value.month + 1
+    year = value.year
+    if month > 12:
+        month = 1
+        year += 1
+    return value.replace(year=year, month=month)
+
+
+def _internal_utc_bucket_open_ms(value_ms: int, interval: str) -> int:
+    value = datetime.fromtimestamp(int(value_ms) / 1000, tz=timezone.utc)
+    if interval == "1Dutc":
+        start = value.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif interval == "1Wutc":
+        start = (value - timedelta(days=value.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif interval == "1Mutc":
+        start = value.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        raise ValueError("invalid interval")
+    return int(start.timestamp() * 1000)
+
+
+def _internal_utc_bucket_close_ms(open_time_ms: int, interval: str) -> int:
+    if interval == "1Mutc":
+        start = datetime.fromtimestamp(int(open_time_ms) / 1000, tz=timezone.utc)
+        return int(_add_one_utc_month(start).timestamp() * 1000)
+    return int(open_time_ms) + _INTERVAL_SECONDS[interval] * 1000
+
+
+def _append_internal_utc_bucket(
+    buckets: Dict[int, Dict[str, Decimal]],
+    *,
+    bucket_open_ms: int,
+    open_price: Decimal,
+    high_price: Decimal,
+    low_price: Decimal,
+    close_price: Decimal,
+    volume: Decimal,
+    quote_volume: Decimal,
+) -> None:
+    if volume <= 0 and quote_volume <= 0:
+        return
+
+    if bucket_open_ms not in buckets:
+        buckets[bucket_open_ms] = {
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "volume": volume,
+            "quote_volume": quote_volume,
+        }
+        return
+
+    item = buckets[bucket_open_ms]
+    item["high"] = max(item["high"], high_price)
+    item["low"] = min(item["low"], low_price)
+    item["close"] = close_price
+    item["volume"] += volume
+    item["quote_volume"] += quote_volume
+
+
+def _serialize_internal_utc_buckets(
+    buckets: Dict[int, Dict[str, Decimal]],
+    *,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int],
+) -> List[dict[str, Any]]:
+    rows = [
+        (open_time_ms, item)
+        for open_time_ms, item in sorted(buckets.items(), key=lambda row: row[0])
+        if end_time_ms is None or open_time_ms < end_time_ms
+    ]
+    rows = rows[-limit:]
+
+    return [
+        {
+            "open_time": open_time_ms,
+            "close_time": _internal_utc_bucket_close_ms(open_time_ms, interval),
+            "open": _decimal_to_str(item["open"]),
+            "high": _decimal_to_str(item["high"]),
+            "low": _decimal_to_str(item["low"]),
+            "close": _decimal_to_str(item["close"]),
+            "volume": _decimal_to_str(item["volume"]),
+            "quote_volume": _decimal_to_str(item["quote_volume"]),
+        }
+        for open_time_ms, item in rows
+    ]
+
+
+def _aggregate_internal_utc_market_kline_rows(
+    rows: List[MarketKline],
+    *,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int],
+) -> List[dict[str, Any]]:
+    buckets: Dict[int, Dict[str, Decimal]] = {}
+    for row in rows:
+        try:
+            source_open_time_ms = int(row.open_time)
+        except Exception:
+            continue
+        if end_time_ms is not None and source_open_time_ms >= end_time_ms:
+            continue
+
+        volume = _to_decimal(row.volume)
+        quote_volume = _to_decimal(getattr(row, "quote_volume", None))
+        if volume <= 0 and quote_volume <= 0:
+            continue
+
+        bucket_open_ms = _internal_utc_bucket_open_ms(source_open_time_ms, interval)
+        _append_internal_utc_bucket(
+            buckets,
+            bucket_open_ms=bucket_open_ms,
+            open_price=_to_decimal(row.open),
+            high_price=_to_decimal(row.high),
+            low_price=_to_decimal(row.low),
+            close_price=_to_decimal(row.close),
+            volume=volume,
+            quote_volume=quote_volume,
+        )
+
+    return _serialize_internal_utc_buckets(
+        buckets,
+        interval=interval,
+        limit=limit,
+        end_time_ms=end_time_ms,
+    )
+
+
+def _aggregate_internal_utc_trade_rows(
+    rows: List[Trade],
+    *,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int],
+) -> List[dict[str, Any]]:
+    buckets: Dict[int, Dict[str, Decimal]] = {}
+    for row in rows:
+        created_at = getattr(row, "created_at", None)
+        if created_at is None:
+            continue
+        trade_time_ms = _datetime_to_utc_ms(created_at)
+        if end_time_ms is not None and trade_time_ms >= end_time_ms:
+            continue
+
+        price = _to_decimal(row.price)
+        amount = _to_decimal(row.amount)
+        if price <= 0 or amount <= 0:
+            continue
+        quote_amount = (
+            _to_decimal(row.quote_amount)
+            if getattr(row, "quote_amount", None) is not None
+            else price * amount
+        )
+
+        bucket_open_ms = _internal_utc_bucket_open_ms(trade_time_ms, interval)
+        _append_internal_utc_bucket(
+            buckets,
+            bucket_open_ms=bucket_open_ms,
+            open_price=price,
+            high_price=price,
+            low_price=price,
+            close_price=price,
+            volume=amount,
+            quote_volume=quote_amount,
+        )
+
+    return _serialize_internal_utc_buckets(
+        buckets,
+        interval=interval,
+        limit=limit,
+        end_time_ms=end_time_ms,
+    )
+
+
+def _get_internal_utc_klines_from_market_klines(
+    db: Session,
+    pair: TradingPair,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int],
+) -> List[dict[str, Any]]:
+    source_limit = min(
+        max(limit * 500, 1000),
+        _INTERNAL_SPOT_KLINE_AGGREGATE_SOURCE_ROW_LIMIT,
+    )
+
+    for source_interval in _INTERNAL_SPOT_KLINE_AGGREGATE_SOURCE_INTERVALS:
+        query = db.query(MarketKline).filter(
+            MarketKline.market_type == "spot",
+            MarketKline.symbol == pair.symbol,
+            MarketKline.interval == source_interval,
+            MarketKline.source.in_(_INTERNAL_SPOT_KLINE_AGGREGATE_SOURCES),
+        )
+        if end_time_ms is not None:
+            query = query.filter(MarketKline.open_time < end_time_ms)
+
+        rows = (
+            query.order_by(MarketKline.open_time.desc())
+            .limit(source_limit)
+            .all()
+        )
+        if not rows:
+            continue
+
+        items = _aggregate_internal_utc_market_kline_rows(
+            list(reversed(rows)),
+            interval=interval,
+            limit=limit,
+            end_time_ms=end_time_ms,
+        )
+        if items:
+            return items
+
+    return []
+
+
+def _get_internal_utc_klines_from_trades(
+    db: Session,
+    pair: TradingPair,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int],
+) -> List[dict[str, Any]]:
+    query = db.query(Trade).filter(Trade.trading_pair_id == pair.id)
+    if end_time_ms is not None:
+        query = query.filter(Trade.created_at < _utc_naive_from_ms(end_time_ms))
+
+    rows = query.order_by(Trade.created_at.asc(), Trade.id.asc()).all()
+    if not rows:
+        return []
+
+    return _aggregate_internal_utc_trade_rows(
+        rows,
+        interval=interval,
+        limit=limit,
+        end_time_ms=end_time_ms,
+    )
+
+
+def _get_internal_utc_aggregate_klines(
+    db: Session,
+    pair: TradingPair,
+    interval: str,
+    limit: int,
+    end_time_ms: Optional[int],
+) -> dict[str, Any]:
+    parsed_end_time_ms = _parse_end_time_ms_int(end_time_ms)
+    market_kline_items = _get_internal_utc_klines_from_market_klines(
+        db=db,
+        pair=pair,
+        interval=interval,
+        limit=limit,
+        end_time_ms=parsed_end_time_ms,
+    )
+    if len(market_kline_items) >= limit:
+        return {"symbol": pair.symbol, "interval": interval, "items": market_kline_items}
+
+    trade_items = _get_internal_utc_klines_from_trades(
+        db=db,
+        pair=pair,
+        interval=interval,
+        limit=limit,
+        end_time_ms=parsed_end_time_ms,
+    )
+    if len(trade_items) > len(market_kline_items):
+        return {"symbol": pair.symbol, "interval": interval, "items": trade_items}
+
+    return {"symbol": pair.symbol, "interval": interval, "items": market_kline_items}
+
+
 def _itick_number(value: Any) -> str:
     if value in (None, ""):
         return "0"
@@ -3527,13 +3842,22 @@ def get_klines(
         }
 
     def _fetch_internal_spot_klines(fetch_limit: int, fetch_end_time_ms: Optional[int]):
-        payload = _get_internal_klines(
-            db=db,
-            pair=pair,
-            interval=interval,
-            limit=fetch_limit,
-            end_time_ms=fetch_end_time_ms,
-        )
+        if interval in _INTERNAL_SPOT_KLINE_UTC_AGGREGATE_INTERVALS:
+            payload = _get_internal_utc_aggregate_klines(
+                db=db,
+                pair=pair,
+                interval=interval,
+                limit=fetch_limit,
+                end_time_ms=fetch_end_time_ms,
+            )
+        else:
+            payload = _get_internal_klines(
+                db=db,
+                pair=pair,
+                interval=interval,
+                limit=fetch_limit,
+                end_time_ms=fetch_end_time_ms,
+            )
         return payload.get("items", [])
 
     cache_result = _coerce_kline_cache_result(
