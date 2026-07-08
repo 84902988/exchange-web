@@ -1,0 +1,421 @@
+'use client';
+
+import {
+  getContractMarketKlines,
+  type ContractMarketKlineItem,
+} from '@/lib/api/modules/contract';
+import {
+  contractMarketRealtime,
+  type ContractMarketRealtimeMessage,
+} from '@/lib/realtime/contractMarketRealtime';
+
+export type ContractTradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
+
+export type ContractTradingViewBar = {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume?: number;
+};
+
+type TradingViewLibrarySymbolInfo = {
+  name: string;
+  ticker: string;
+  description: string;
+  type: string;
+  session: string;
+  timezone: string;
+  exchange: string;
+  listed_exchange: string;
+  minmov: number;
+  pricescale: number;
+  has_intraday: boolean;
+  has_daily: boolean;
+  has_weekly_and_monthly: boolean;
+  supported_resolutions: ContractTradingViewResolution[];
+  intraday_multipliers: string[];
+  daily_multipliers: string[];
+  weekly_multipliers: string[];
+  monthly_multipliers: string[];
+  volume_precision: number;
+  data_status: string;
+  format: string;
+};
+
+type TradingViewSearchSymbolResult = {
+  symbol: string;
+  full_name: string;
+  description: string;
+  exchange: string;
+  ticker: string;
+  type: string;
+};
+
+type TradingViewPeriodParams = {
+  from: number;
+  to: number;
+  firstDataRequest?: boolean;
+  countBack?: number;
+};
+
+type TradingViewDatafeedConfiguration = {
+  supports_search: boolean;
+  supports_group_request: boolean;
+  supports_marks: boolean;
+  supports_timescale_marks: boolean;
+  supports_time: boolean;
+  exchanges: Array<{ value: string; name: string; desc: string }>;
+  symbols_types: Array<{ name: string; value: string }>;
+  supported_resolutions: ContractTradingViewResolution[];
+};
+
+type DatafeedCallbacks = {
+  onReady: (configuration: TradingViewDatafeedConfiguration) => void;
+  onSearchReady: (items: TradingViewSearchSymbolResult[]) => void;
+  onSymbolResolved: (symbolInfo: TradingViewLibrarySymbolInfo) => void;
+  onResolveError: (reason: string) => void;
+  onHistory: (bars: ContractTradingViewBar[], meta: { noData?: boolean }) => void;
+  onHistoryError: (reason: string) => void;
+  onRealtime: (bar: ContractTradingViewBar) => void;
+};
+
+export type ContractTradingViewDatafeed = {
+  onReady: (callback: DatafeedCallbacks['onReady']) => void;
+  searchSymbols: (
+    userInput: string,
+    exchange: string,
+    symbolType: string,
+    callback: DatafeedCallbacks['onSearchReady'],
+  ) => void;
+  resolveSymbol: (
+    symbolName: string,
+    onResolve: DatafeedCallbacks['onSymbolResolved'],
+    onError: DatafeedCallbacks['onResolveError'],
+  ) => void;
+  getBars: (
+    symbolInfo: TradingViewLibrarySymbolInfo,
+    resolution: string,
+    periodParams: TradingViewPeriodParams,
+    onHistory: DatafeedCallbacks['onHistory'],
+    onError: DatafeedCallbacks['onHistoryError'],
+  ) => void;
+  subscribeBars: (
+    symbolInfo: TradingViewLibrarySymbolInfo,
+    resolution: string,
+    onRealtime: DatafeedCallbacks['onRealtime'],
+    subscriberUid: string,
+  ) => void;
+  unsubscribeBars: (subscriberUid: string) => void;
+  destroy: () => void;
+};
+
+type CreateContractTradingViewDatafeedOptions = {
+  symbol: string;
+  displaySymbol?: string | null;
+  pricePrecision?: number | null;
+  amountPrecision?: number | null;
+  onLatestBar?: (close: string | null) => void;
+};
+
+type SubscriptionEntry = {
+  latestBarKey: string;
+  unsubscribe: () => void;
+};
+
+const SUPPORTED_RESOLUTIONS: ContractTradingViewResolution[] = ['1', '5', '15', '60', '240', '1D', '1W', '1M'];
+const RESOLUTION_TO_CONTRACT_INTERVAL: Record<ContractTradingViewResolution, string> = {
+  '1': '1m',
+  '5': '5m',
+  '15': '15m',
+  '60': '1h',
+  '240': '4h',
+  '1D': '1d',
+  '1W': '1w',
+  '1M': '1M',
+};
+const CONTRACT_INTERVAL_TO_RESOLUTION: Record<string, ContractTradingViewResolution> = {
+  '1m': '1',
+  '5m': '5',
+  '15m': '15',
+  '1h': '60',
+  '4h': '240',
+  '1d': '1D',
+  '1w': '1W',
+  '1M': '1M',
+};
+const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
+  supports_search: true,
+  supports_group_request: false,
+  supports_marks: false,
+  supports_timescale_marks: false,
+  supports_time: true,
+  exchanges: [{ value: 'CONTRACT', name: 'Contract', desc: 'Contract market' }],
+  symbols_types: [{ name: 'Futures', value: 'futures' }],
+  supported_resolutions: SUPPORTED_RESOLUTIONS,
+};
+
+function normalizeContractSymbol(symbol: string) {
+  return String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+}
+
+function normalizeContractInterval(interval: string) {
+  const normalized = String(interval || '').trim();
+  if (normalized === '1M') return '1M';
+  return normalized.toLowerCase();
+}
+
+function normalizeResolution(resolution: string): ContractTradingViewResolution {
+  const normalized = String(resolution || '').trim().toUpperCase();
+  if (normalized === 'D') return '1D';
+  if (normalized === 'W') return '1W';
+  if (normalized === 'M') return '1M';
+  if (SUPPORTED_RESOLUTIONS.includes(normalized as ContractTradingViewResolution)) {
+    return normalized as ContractTradingViewResolution;
+  }
+  return '1';
+}
+
+export function contractIntervalToTradingViewResolution(interval: string): ContractTradingViewResolution {
+  return CONTRACT_INTERVAL_TO_RESOLUTION[normalizeContractInterval(interval)] || '1';
+}
+
+function tradingViewResolutionToContractInterval(resolution: string) {
+  return RESOLUTION_TO_CONTRACT_INTERVAL[normalizeResolution(resolution)] || '1m';
+}
+
+function getPriceScale(precision?: number | null) {
+  const nextPrecision = Number(precision);
+  if (!Number.isInteger(nextPrecision) || nextPrecision < 0 || nextPrecision > 12) {
+    return 100;
+  }
+  return Math.max(1, 10 ** nextPrecision);
+}
+
+function clampKlineLimit(value: unknown) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 300;
+  return Math.min(1000, Math.max(50, Math.ceil(numeric)));
+}
+
+function normalizeTimeMs(value: unknown) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return numeric < 1_000_000_000_000 ? Math.floor(numeric * 1000) : Math.floor(numeric);
+}
+
+function normalizeNumber(value: unknown) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function toRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function klineToBar(item: ContractMarketKlineItem): ContractTradingViewBar | null {
+  const time = normalizeTimeMs(item.open_time ?? item.time ?? item.timestamp);
+  const open = normalizeNumber(item.open);
+  const high = normalizeNumber(item.high);
+  const low = normalizeNumber(item.low);
+  const close = normalizeNumber(item.close);
+  const volume = normalizeNumber(item.volume) ?? 0;
+
+  if (!time || open === null || high === null || low === null || close === null) return null;
+
+  return { time, open, high, low, close, volume };
+}
+
+function realtimeMessageToBar(
+  message: ContractMarketRealtimeMessage,
+  expectedSymbol: string,
+  expectedInterval: string,
+): ContractTradingViewBar | null {
+  const type = String(message.type || '').toLowerCase();
+  if (type && !type.includes('kline') && !type.includes('candle')) return null;
+
+  const payload = toRecord(message.kline) || toRecord(message.data);
+  if (!payload) return null;
+
+  const symbol = normalizeContractSymbol(String(message.symbol || payload.symbol || ''));
+  if (symbol && symbol !== expectedSymbol) return null;
+
+  const interval = normalizeContractInterval(String(message.interval || payload.interval || ''));
+  if (interval && interval !== normalizeContractInterval(expectedInterval)) return null;
+
+  return klineToBar({
+    open_time: payload.open_time ?? payload.time ?? payload.timestamp,
+    open: payload.open as string | number,
+    high: payload.high as string | number,
+    low: payload.low as string | number,
+    close: payload.close as string | number,
+    volume: (payload.volume ?? 0) as string | number,
+  });
+}
+
+function sortAndDedupeBars(bars: ContractTradingViewBar[]) {
+  const byTime = new Map<number, ContractTradingViewBar>();
+  bars.forEach((bar) => {
+    if (Number.isFinite(bar.time) && bar.time > 0) {
+      byTime.set(bar.time, bar);
+    }
+  });
+  return Array.from(byTime.values()).sort((left, right) => left.time - right.time);
+}
+
+function buildLatestBarKey(symbol: string, interval: string) {
+  return `${normalizeContractSymbol(symbol)}:${normalizeContractInterval(interval)}`;
+}
+
+function buildSymbolInfo(params: {
+  symbol: string;
+  displaySymbol: string;
+  pricePrecision?: number | null;
+  amountPrecision?: number | null;
+}): TradingViewLibrarySymbolInfo {
+  return {
+    name: params.displaySymbol || params.symbol,
+    ticker: params.symbol,
+    description: params.displaySymbol || params.symbol,
+    type: 'futures',
+    session: '24x7',
+    timezone: 'Asia/Shanghai',
+    exchange: 'CONTRACT',
+    listed_exchange: 'CONTRACT',
+    minmov: 1,
+    pricescale: getPriceScale(params.pricePrecision),
+    has_intraday: true,
+    has_daily: true,
+    has_weekly_and_monthly: true,
+    supported_resolutions: SUPPORTED_RESOLUTIONS,
+    intraday_multipliers: ['1', '5', '15', '60', '240'],
+    daily_multipliers: ['1'],
+    weekly_multipliers: ['1'],
+    monthly_multipliers: ['1'],
+    volume_precision: params.amountPrecision ?? 4,
+    data_status: 'streaming',
+    format: 'price',
+  };
+}
+
+export function createContractTradingViewDatafeed({
+  symbol,
+  displaySymbol,
+  pricePrecision,
+  amountPrecision,
+  onLatestBar,
+}: CreateContractTradingViewDatafeedOptions): ContractTradingViewDatafeed {
+  const apiSymbol = normalizeContractSymbol(symbol);
+  const displayName = displaySymbol || apiSymbol;
+  const latestBars = new Map<string, ContractTradingViewBar>();
+  const subscriptions = new Map<string, SubscriptionEntry>();
+
+  const notifyLatestBar = (bar: ContractTradingViewBar | null) => {
+    onLatestBar?.(bar ? String(bar.close) : null);
+  };
+
+  return {
+    onReady(callback) {
+      window.setTimeout(() => callback(DATAFEED_CONFIGURATION), 0);
+    },
+
+    searchSymbols(userInput, _exchange, _symbolType, callback) {
+      const query = String(userInput || '').trim().toUpperCase();
+      if (!query || apiSymbol.includes(query) || displayName.toUpperCase().includes(query)) {
+        callback([{
+          symbol: apiSymbol,
+          full_name: apiSymbol,
+          description: displayName,
+          exchange: 'CONTRACT',
+          ticker: apiSymbol,
+          type: 'futures',
+        }]);
+        return;
+      }
+      callback([]);
+    },
+
+    resolveSymbol(_symbolName, onResolve, onError) {
+      if (!apiSymbol) {
+        onError('Invalid contract symbol');
+        return;
+      }
+
+      onResolve(buildSymbolInfo({
+        symbol: apiSymbol,
+        displaySymbol: displayName,
+        pricePrecision,
+        amountPrecision,
+      }));
+    },
+
+    async getBars(_symbolInfo, resolution, periodParams, onHistory, onError) {
+      const interval = tradingViewResolutionToContractInterval(resolution);
+      const latestBarKey = buildLatestBarKey(apiSymbol, interval);
+      const limit = clampKlineLimit(periodParams.countBack);
+      const endTimeMs = periodParams.to ? Math.floor(periodParams.to * 1000) : undefined;
+
+      try {
+        const response = await getContractMarketKlines({
+          symbol: apiSymbol,
+          interval,
+          limit,
+          endTimeMs,
+        });
+        const allBars = sortAndDedupeBars(response.map(klineToBar).filter((bar): bar is ContractTradingViewBar => Boolean(bar)));
+        const fromMs = Number.isFinite(periodParams.from) ? Math.floor(periodParams.from * 1000) : 0;
+        const toMs = Number.isFinite(periodParams.to) ? Math.floor(periodParams.to * 1000) : Number.MAX_SAFE_INTEGER;
+        let bars = allBars.filter((bar) => bar.time >= fromMs && bar.time <= toMs);
+
+        if (periodParams.firstDataRequest && bars.length === 0 && allBars.length > 0) {
+          bars = allBars.slice(-limit);
+        }
+
+        const latestBar = bars[bars.length - 1] || allBars[allBars.length - 1] || null;
+        if (latestBar) {
+          latestBars.set(latestBarKey, latestBar);
+        }
+        notifyLatestBar(latestBar);
+        onHistory(bars, { noData: bars.length === 0 });
+      } catch {
+        onError('Failed to load contract kline');
+      }
+    },
+
+    subscribeBars(_symbolInfo, resolution, onRealtime, subscriberUid) {
+      const interval = tradingViewResolutionToContractInterval(resolution);
+      const latestBarKey = buildLatestBarKey(apiSymbol, interval);
+      contractMarketRealtime.setSession({ symbol: apiSymbol, interval });
+
+      const unsubscribe = contractMarketRealtime.subscribe('kline', (message) => {
+        const nextBar = realtimeMessageToBar(message, apiSymbol, interval);
+        if (!nextBar) return;
+
+        const previousBar = latestBars.get(latestBarKey);
+        if (previousBar && nextBar.time < previousBar.time) return;
+
+        latestBars.set(latestBarKey, nextBar);
+        notifyLatestBar(nextBar);
+        onRealtime(nextBar);
+      });
+
+      subscriptions.set(subscriberUid, { latestBarKey, unsubscribe });
+    },
+
+    unsubscribeBars(subscriberUid) {
+      const entry = subscriptions.get(subscriberUid);
+      if (!entry) return;
+      entry.unsubscribe();
+      subscriptions.delete(subscriberUid);
+    },
+
+    destroy() {
+      subscriptions.forEach((entry) => entry.unsubscribe());
+      subscriptions.clear();
+      latestBars.clear();
+    },
+  };
+}

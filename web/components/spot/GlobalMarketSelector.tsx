@@ -761,8 +761,12 @@ function contractSymbolToMarketSymbol(symbol: string): string {
   return String(symbol || '').trim().toUpperCase().replace(/_PERP$/, '');
 }
 
+function formatContractDisplaySymbol(symbol: string): string {
+  return formatSpotDisplaySymbol(contractSymbolToMarketSymbol(symbol));
+}
+
 function getContractDisplayLabel(symbol: string, labels: MarketDisplayLabels): string {
-  return appendMarketSuffix(contractSymbolToMarketSymbol(symbol), labels.perpetualSuffix);
+  return appendMarketSuffix(formatContractDisplaySymbol(symbol), labels.perpetualSuffix);
 }
 
 function buildContractToolbarPair(item: ContractSymbolItem, labels: MarketDisplayLabels): GlobalMarketSelectorPair {
@@ -1202,13 +1206,17 @@ export default function GlobalMarketSelector({
     () => allKnownPairs.find((item) => normalize(item.symbol) === normalize(symbol)),
     [allKnownPairs, symbol],
   );
+  const isHeaderPlacement = placement === 'header';
 
   const currentLabel = useMemo(() => {
     if (currentPair && getPairMarket(currentPair) === 'contract') {
+      if (pageType === 'contract' && isHeaderPlacement) {
+        return formatContractDisplaySymbol(currentPair.symbol);
+      }
       return getContractDisplayLabel(currentPair.symbol, marketDisplayLabels);
     }
     return currentPair?.displaySymbol || currentPair?.label || symbolLabels?.[symbol] || formatSpotDisplaySymbol(symbol);
-  }, [currentPair, marketDisplayLabels, symbol, symbolLabels]);
+  }, [currentPair, isHeaderPlacement, marketDisplayLabels, pageType, symbol, symbolLabels]);
 
   const currentHeaderPair = useMemo<GlobalMarketSelectorPair>(
     () => currentPair || {
@@ -1230,9 +1238,8 @@ export default function GlobalMarketSelector({
     () => (currentPair && (isStockContractPair(currentPair) || isTradfiCfdPair(currentPair)) ? TRADFI_INTERVALS : intervals),
     [currentPair],
   );
-  const showIntervalControls = pageType !== 'spot';
+  const showIntervalControls = pageType !== 'spot' && !isHeaderPlacement;
   const showTimeSharing = pageType === 'spot' && Boolean(onChartModeChange);
-  const isHeaderPlacement = placement === 'header';
   const needsSpotRows =
     marketTab === 'crypto' &&
     spotCategory !== 'contract';

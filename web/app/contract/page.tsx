@@ -3,11 +3,8 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import ContractAccountPanel from '@/components/contract/ContractAccountPanel';
-import ContractFuturesChart, {
+import {
   type ContractKlineMode,
-  type ContractPositionOverlay,
-  type PositionEntryOverlay,
-  type PositionTpSlOverlay,
 } from '@/components/contract/ContractFuturesChart';
 import ContractFuturesOrderBook from '@/components/contract/ContractFuturesOrderBook';
 import ContractFuturesTrades from '@/components/contract/ContractFuturesTrades';
@@ -16,6 +13,7 @@ import ContractMarketHeader, {
 } from '@/components/contract/ContractMarketHeader';
 import ContractPositionTabs from '@/components/contract/ContractPositionTabs';
 import ContractTradingForm from '@/components/contract/ContractTradingForm';
+import ContractTradingViewChart from '@/components/contract/ContractTradingViewChart';
 import {
   useContractMarketState,
   type PriceDirection,
@@ -40,8 +38,6 @@ import {
   type ContractQuoteDisplayStatus,
   type ContractTickerItem,
   type ContractMarketTrade,
-  type ContractPositionItem,
-  type ContractPositionSummaryItem,
   type ContractSymbolItem,
 } from '@/lib/api/modules/contract';
 import {
@@ -111,6 +107,8 @@ function normalizeCurrentPriceSource(value?: string | null): CurrentPriceSource 
 
 const DEFAULT_CONTRACT_SYMBOL = 'BTCUSDT_PERP';
 const LIVE_DEPTH_BBO_TTL_MS = 5000;
+const CONTRACT_INTERVAL_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'];
+const CONTRACT_TRADFI_INTERVAL_OPTIONS = CONTRACT_INTERVAL_OPTIONS.filter((item) => item !== '4h');
 const CFD_CONTRACT_CATEGORIES = new Set(['GOLD', 'FUTURES', 'INDEX', 'FOREX', 'METAL', 'COMMODITY']);
 const CRYPTO_CONTRACT_BASES = new Set([
   'BTC',
@@ -204,6 +202,22 @@ function contractSymbolToMarketSymbol(symbol: string) {
   return symbol.replace(/_PERP$/, '');
 }
 
+function formatContractMarketDisplaySymbol(symbol: string, quoteAsset?: string | null) {
+  const normalized = String(symbol || '').trim().toUpperCase().replace(/_PERP$/, '');
+  const quote = String(quoteAsset || '').trim().toUpperCase();
+  if (!normalized) return '';
+  if (normalized.includes('/')) return normalized;
+  if (quote && normalized.endsWith(quote) && normalized.length > quote.length) {
+    return `${normalized.slice(0, -quote.length)}/${quote}`;
+  }
+  for (const fallbackQuote of ['USDT', 'USDC', 'USD']) {
+    if (normalized.endsWith(fallbackQuote) && normalized.length > fallbackQuote.length) {
+      return `${normalized.slice(0, -fallbackQuote.length)}/${fallbackQuote}`;
+    }
+  }
+  return normalized;
+}
+
 function isKnownCryptoContractSymbol(symbol: string) {
   const marketSymbol = contractSymbolToMarketSymbol(symbol).toUpperCase();
   const base = marketSymbol.replace(/(USDT|USDC|USD)$/, '');
@@ -212,14 +226,17 @@ function isKnownCryptoContractSymbol(symbol: string) {
 
 function getContractDisplayLabel(item: ContractSymbolItem, t: ContractTranslator) {
   const displayName = String(item.display_name || '').trim();
-  if (displayName) return displayName;
-  return `${contractSymbolToMarketSymbol(item.symbol)} ${t('perpetual', 'contracts')}`;
+  const marketDisplaySymbol = formatContractMarketDisplaySymbol(item.symbol, item.quote_asset);
+  if (displayName && displayName.toUpperCase() !== contractSymbolToMarketSymbol(item.symbol).toUpperCase()) {
+    return displayName;
+  }
+  return `${marketDisplaySymbol} ${t('perpetual', 'contracts')}`;
 }
 
 function getFallbackContractPair(contractSymbol: string, pricePrecision: number, t: ContractTranslator): GlobalMarketSelectorPair {
   const option = CONTRACT_SYMBOL_OPTIONS.find((item) => item.contractSymbol === contractSymbol);
   const marketSymbol = option?.marketSymbol || contractSymbolToMarketSymbol(contractSymbol);
-  const label = `${marketSymbol} ${t('perpetual', 'contracts')}`;
+  const label = `${formatContractMarketDisplaySymbol(marketSymbol, 'USDT')} ${t('perpetual', 'contracts')}`;
   return {
     symbol: contractSymbol,
     label,
@@ -279,15 +296,14 @@ function parseOptionalPrecision(value: unknown): number | null {
   return null;
 }
 
-function parsePositionOverlayPrice(value: unknown): number | null {
-  const price = Number(value);
-  return Number.isFinite(price) && price > 0 ? price : null;
-}
-
-function formatPercent(value: unknown) {
-  const percent = Number(value);
-  if (!Number.isFinite(percent)) return '--';
-  return `${percent.toFixed(2)}%`;
+function formatCompactAmount(value: unknown, precision = 2) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return '--';
+  const abs = Math.abs(amount);
+  if (abs >= 1_000_000_000) return `${(amount / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${(amount / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000) return `${(amount / 1_000).toFixed(2)}K`;
+  return amount.toFixed(precision);
 }
 
 function formatHeaderSpread(bestBid: string | null, bestAsk: string | null, pricePrecision: number) {
@@ -302,8 +318,34 @@ function getPositivePrice(value?: string | number | null) {
   return price > 0 ? price : null;
 }
 
+function formatSignedPercent(value: unknown) {
+  const percent = Number(value);
+  if (!Number.isFinite(percent)) return '--';
+  if (percent === 0) return '0.00%';
+  return `${percent > 0 ? '+' : ''}${percent.toFixed(2)}%`;
+}
+
+function formatSignedPriceChange(value: unknown, pricePrecision: number) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return '--';
+  if (amount === 0) return formatPrice(0, pricePrecision);
+  return `${amount > 0 ? '+' : ''}${amount.toFixed(pricePrecision)}`;
+}
+
+function formatHeaderChange(changeAmount: unknown, changePercent: unknown, pricePrecision: number) {
+  const amount = formatSignedPriceChange(changeAmount, pricePrecision);
+  const percent = formatSignedPercent(changePercent);
+  if (amount !== '--' && percent !== '--') return `${amount} / ${percent}`;
+  if (amount !== '--') return amount;
+  return percent;
+}
+
 function getTickerChangePercent(ticker: ContractTickerItem | null) {
   return ticker?.price_change_percent_24h ?? ticker?.priceChangePercent ?? null;
+}
+
+function getTickerChangeAmount(ticker: ContractTickerItem | null) {
+  return ticker?.price_change_24h ?? ticker?.change_24h ?? null;
 }
 
 function getContractQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
@@ -396,98 +438,10 @@ function isCryptoContractPair(pair: GlobalMarketSelectorPair | null | undefined)
   );
 }
 
-function buildPositionOverlay(
-  positionSummaries: ContractPositionSummaryItem[],
-  contractSymbol: string,
-): ContractPositionOverlay | null {
-  const normalizedSymbol = String(contractSymbol || '').trim().toUpperCase();
-  const summary = positionSummaries.find((item) => {
-    const itemSymbol = String(item.symbol || '').trim().toUpperCase();
-    return (
-      (!itemSymbol || itemSymbol === normalizedSymbol) &&
-      toNumber(item.quantity) > 0
-    );
-  });
-
-  if (!summary) return null;
-
-  const side = String(summary.side || '').trim().toUpperCase();
-  if (side !== 'LONG' && side !== 'SHORT') return null;
-
-  const record = summary as ContractPositionSummaryItem & {
-    liq_price?: string | number | null;
-  };
-
-  return {
-    side,
-    liquidationPrice: parsePositionOverlayPrice(record.liquidation_price ?? record.liq_price),
-  };
-}
-
-function buildPositionEntryOverlays(
-  positions: ContractPositionItem[],
-  contractSymbol: string,
-): PositionEntryOverlay[] {
-  const normalizedSymbol = String(contractSymbol || '').trim().toUpperCase();
-
-  return positions
-    .filter((position) => (
-      position.status === 'OPEN' &&
-      String(position.symbol || '').trim().toUpperCase() === normalizedSymbol
-    ))
-    .map((position, index): PositionEntryOverlay | null => {
-      const record = position as ContractPositionItem & {
-        open_price?: string | number | null;
-      };
-      const side = String(position.side || '').trim().toUpperCase();
-      if (side !== 'LONG' && side !== 'SHORT') return null;
-      const entryPrice = record.entry_price ?? record.open_price ?? null;
-
-      return {
-        id: position.id,
-        index: index + 1,
-        side,
-        entryPrice: entryPrice === null ? null : String(entryPrice),
-      };
-    })
-    .filter((position): position is PositionEntryOverlay => (
-      !!position && toNumber(position.entryPrice) > 0
-    ));
-}
-
-function buildPositionTpSlOverlays(
-  positions: ContractPositionItem[],
-  contractSymbol: string,
-): PositionTpSlOverlay[] {
-  const normalizedSymbol = String(contractSymbol || '').trim().toUpperCase();
-
-  return positions
-    .filter((position) => (
-      position.status === 'OPEN' &&
-      String(position.symbol || '').trim().toUpperCase() === normalizedSymbol
-    ))
-    .map((position, index): PositionTpSlOverlay | null => {
-      const record = position as ContractPositionItem & {
-        tp_price?: string | number | null;
-        sl_price?: string | number | null;
-      };
-      const side = String(position.side || '').trim().toUpperCase();
-      if (side !== 'LONG' && side !== 'SHORT') return null;
-      const tpPrice = record.take_profit_price ?? record.tp_price ?? null;
-      const slPrice = record.stop_loss_price ?? record.sl_price ?? null;
-
-      return {
-        id: position.id,
-        index: index + 1,
-        side,
-        tpPrice: tpPrice === null ? null : String(tpPrice),
-        slPrice: slPrice === null ? null : String(slPrice),
-      };
-    })
-    .filter((position): position is PositionTpSlOverlay => (
-      !!position &&
-      (toNumber(position.tpPrice) > 0 || toNumber(position.slPrice) > 0)
-    ));
+function isTradfiContractPair(pair: GlobalMarketSelectorPair | null | undefined) {
+  if (!pair) return false;
+  const categories = getContractPairCategories(pair);
+  return categories.includes('STOCK') || categories.some((item) => CFD_CONTRACT_CATEGORIES.has(item));
 }
 
 // Kept for future cross-market toolbar support; contract page no longer calls spot pair APIs on first paint.
@@ -525,8 +479,8 @@ function buildMockStockContractPairOption(item: SpotMarketPairItem, t: ContractT
 
   return {
     symbol,
-    label: `${base}USDT ${t('perpetual', 'contracts')}`,
-    displaySymbol: `${base}USDT ${t('perpetual', 'contracts')}`,
+    label: `${formatContractMarketDisplaySymbol(`${base}USDT`, 'USDT')} ${t('perpetual', 'contracts')}`,
+    displaySymbol: `${formatContractMarketDisplaySymbol(`${base}USDT`, 'USDT')} ${t('perpetual', 'contracts')}`,
     baseAsset: base,
     quoteAsset: 'USDT',
     assetType: 'STOCK',
@@ -592,6 +546,10 @@ function ContractPageContent() {
   const currentContractPair = useMemo(
     () => contractPairs.find((item) => item.symbol === contractSymbol) || null,
     [contractPairs, contractSymbol],
+  );
+  const contractChartIntervalOptions = useMemo(
+    () => (isTradfiContractPair(currentContractPair) ? CONTRACT_TRADFI_INTERVAL_OPTIONS : CONTRACT_INTERVAL_OPTIONS),
+    [currentContractPair],
   );
   const maxLeverage = currentContractPair?.maxLeverage || 200;
   const {
@@ -748,9 +706,6 @@ function ContractPageContent() {
   const quoteStatusLabel = marketUiState.label;
   const quoteStatusTone = getContractQuoteStatusTone(marketUiState.status);
   const expiredLastGoodQuote = isExpiredLastGoodBboQuote(contractQuote);
-  const chartReferencePriceLineEnabled = false;
-  const chartReferencePriceLinePrice = null;
-  const chartReferencePriceLineLabel = null;
   const currentPriceSourceLabel = currentPriceSource === 'TRADE_TICK'
     ? t('latestPrice', 'contracts')
     : currentPriceSource === 'LIVE_MID'
@@ -824,6 +779,9 @@ function ContractPageContent() {
   const marketStateBestBid = contractMarketState.bestBid === null ? null : String(contractMarketState.bestBid);
   const marketStateBestAsk = contractMarketState.bestAsk === null ? null : String(contractMarketState.bestAsk);
   const headerDisplayPrice = currentPriceDisplay;
+  const headerMainPrice = currentPriceReady
+    ? formatPrice(currentPriceNumber, 3)
+    : '--';
   const displayLastPrice = currentPriceDisplay;
   const lastGoodQuotePrice = formatPrice(contractQuote?.last_price, pricePrecision);
 
@@ -928,48 +886,51 @@ function ContractPageContent() {
   }, [contractMarketSessionType, contractMarketStatus, rawMarketViewDisplayState]);
   const tpSlTriggerPriceType = normalizeTpSlTriggerPriceType(currentContractPair?.tpSlTriggerPriceType);
   const headerMetrics = useMemo<HeaderMetric[]>(() => {
-    const bidAsk = `${formatPrice(marketStateBestBid, pricePrecision)} / ${formatPrice(marketStateBestAsk, pricePrecision)}`;
+    const bid = formatPrice(marketStateBestBid, pricePrecision);
+    const ask = formatPrice(marketStateBestAsk, pricePrecision);
     const spread = formatHeaderSpread(marketStateBestBid, marketStateBestAsk, pricePrecision);
+    const highLow = `${formatPrice(contractTicker?.high_24h, pricePrecision)} / ${formatPrice(contractTicker?.low_24h, pricePrecision)}`;
+    const volumeTurnover = `${formatCompactAmount(contractTicker?.base_volume_24h)} / ${formatCompactAmount(contractTicker?.quote_volume_24h)}`;
+    const bidAskSpread = `${bid} / ${ask} / ${spread}`;
     if (isCryptoContract) {
       return [
-        { label: t('markPrice', 'contracts'), value: formatPrice(contractQuote?.mark_price, pricePrecision) },
-        { label: t('indexPrice', 'contracts'), value: formatPrice(contractQuote?.index_price, pricePrecision) },
-        { label: t('spread', 'contracts'), value: spread },
-        { label: t('bestBidAsk', 'contracts'), value: bidAsk },
+        {
+          label: `${t('markPrice', 'contracts')} / ${t('indexPrice', 'contracts')}`,
+          value: `${formatPrice(contractQuote?.mark_price, pricePrecision)} / ${formatPrice(contractQuote?.index_price, pricePrecision)}`,
+        },
+        { label: '24h高 / 低', value: highLow },
+        { label: '24h量 / 额', value: volumeTurnover },
+        { label: '买 / 卖 / 差', value: bidAskSpread },
       ];
     }
 
     if (expiredLastGoodQuote) {
       return [
-        { label: currentPriceSourceLabel, value: headerDisplayPrice },
         {
-          label: t('markLatest', 'contracts'),
-          value: lastGoodQuotePrice,
+          label: `${currentPriceSourceLabel} / ${t('markLatest', 'contracts')}`,
+          value: `${headerDisplayPrice} / ${lastGoodQuotePrice}`,
           subValue: quoteStatusLabel,
         },
-        { label: t('spread', 'contracts'), value: spread },
-        {
-          label: t('bestBidAsk', 'contracts'),
-          value: bidAsk,
-          subValue: quoteStatusLabel,
-        },
+        { label: '买 / 卖 / 差', value: bidAskSpread },
+        { label: '24h高 / 低', value: highLow },
       ];
     }
 
     return [
       {
-        label: t('markLatest', 'contracts'),
-        value: formatPrice(contractQuote?.mark_price, pricePrecision),
-        subValue: displayLastPrice,
+        label: `${t('markLatest', 'contracts')} / ${currentPriceSourceLabel}`,
+        value: `${formatPrice(contractQuote?.mark_price, pricePrecision)} / ${displayLastPrice}`,
       },
-      { label: t('spread', 'contracts'), value: spread },
-      { label: t('todayChange', 'contracts'), value: formatPercent(getTickerChangePercent(contractTicker)) },
-      { label: t('bestBidAsk', 'contracts'), value: bidAsk },
+      { label: '买 / 卖 / 差', value: bidAskSpread },
+      { label: '24h高 / 低', value: highLow },
     ];
   }, [
+    contractTicker?.base_volume_24h,
     contractQuote?.index_price,
     contractQuote?.mark_price,
-    contractTicker,
+    contractTicker?.high_24h,
+    contractTicker?.low_24h,
+    contractTicker?.quote_volume_24h,
     currentPriceSourceLabel,
     displayLastPrice,
     expiredLastGoodQuote,
@@ -982,6 +943,11 @@ function ContractPageContent() {
     quoteStatusLabel,
     t,
   ]);
+  const headerChange = formatHeaderChange(
+    getTickerChangeAmount(contractTicker),
+    getTickerChangePercent(contractTicker),
+    pricePrecision,
+  );
 
   const {
     account,
@@ -1005,18 +971,6 @@ function ContractPageContent() {
     isLoggedIn,
     onErrorChange: setError,
   });
-  const positionOverlay = useMemo(
-    () => buildPositionOverlay(positionSummaries, contractSymbol),
-    [contractSymbol, positionSummaries],
-  );
-  const positionEntryOverlays = useMemo(
-    () => buildPositionEntryOverlays(positions, contractSymbol),
-    [contractSymbol, positions],
-  );
-  const positionTpSlOverlays = useMemo(
-    () => buildPositionTpSlOverlays(positions, contractSymbol),
-    [contractSymbol, positions],
-  );
   const contractPairSymbols = useMemo(
     () => contractPairs.map((item) => item.symbol),
     [contractPairs],
@@ -1079,6 +1033,11 @@ function ContractPageContent() {
   useEffect(() => {
     void refreshContractPairs();
   }, [refreshContractPairs]);
+
+  useEffect(() => {
+    if (contractChartIntervalOptions.includes(interval)) return;
+    setIntervalValue(contractChartIntervalOptions.includes('1h') ? '1h' : contractChartIntervalOptions[0] || '1m');
+  }, [contractChartIntervalOptions, interval]);
 
   useEffect(() => {
     let alive = true;
@@ -1151,10 +1110,11 @@ function ContractPageContent() {
     }
 
     if (requestedSymbol && isMockStockContractSymbol(requestedSymbol)) {
+      const requestedDisplaySymbol = formatContractMarketDisplaySymbol(requestedSymbol, 'USDT');
       const mockPair: GlobalMarketSelectorPair = {
         symbol: requestedSymbol,
-        label: `${contractSymbolToMarketSymbol(requestedSymbol)} ${t('perpetual', 'contracts')}`,
-        displaySymbol: `${contractSymbolToMarketSymbol(requestedSymbol)} ${t('perpetual', 'contracts')}`,
+        label: `${requestedDisplaySymbol} ${t('perpetual', 'contracts')}`,
+        displaySymbol: `${requestedDisplaySymbol} ${t('perpetual', 'contracts')}`,
         baseAsset: contractSymbolToMarketSymbol(requestedSymbol).replace(/USDT$/, ''),
         quoteAsset: 'USDT',
         assetType: 'STOCK',
@@ -1203,21 +1163,38 @@ function ContractPageContent() {
 
   return (
     <div className="flex min-h-screen flex-col overflow-y-auto overflow-x-hidden bg-[#0b0e11] text-white">
-      <ContractMarketHeader
-        marketSymbol={marketSymbol}
-        price={headerDisplayPrice}
-        quoteStatusLabel={quoteStatusLabel}
-        quoteStatusTone={quoteStatusTone}
-        metrics={headerMetrics}
-        hint={quoteHint}
-        marketStatus={contractMarketStatus}
-        marketStatusText={contractMarketStatusText}
-        quoteFreshness={contractQuoteFreshness}
-        marketSessionType={contractMarketSessionType}
-        priceDirection={currentPriceDirection}
-        priceSource={contractMarketState.displayPriceSource}
-        priceSourceLabel={contractMarketState.displayPriceLabel}
-      />
+      <div className="w-full px-2 xl:px-3">
+        <ContractMarketHeader
+          marketSymbol={marketSymbol}
+          price={headerMainPrice}
+          change={headerChange}
+          quoteStatusLabel={quoteStatusLabel}
+          quoteStatusTone={quoteStatusTone}
+          metrics={headerMetrics}
+          hint={quoteHint}
+          marketStatus={contractMarketStatus}
+          marketStatusText={contractMarketStatusText}
+          quoteFreshness={contractQuoteFreshness}
+          marketSessionType={contractMarketSessionType}
+          priceDirection={currentPriceDirection}
+          priceSource={contractMarketState.displayPriceSource}
+          symbolSelector={(
+            <GlobalMarketSelector
+              pageType="contract"
+              placement="header"
+              symbol={contractSymbol}
+              interval={interval}
+              symbols={toolbarPairSymbols.length ? toolbarPairSymbols : contractPairSymbols}
+              symbolLabels={toolbarPairLabels}
+              pairs={toolbarPairs}
+              pairsLoading={contractPairsLoading}
+              onPairQueryChange={handleToolbarPairQueryChange}
+              onSymbolChange={(nextSymbol) => selectContractSymbol(nextSymbol)}
+              onIntervalChange={setIntervalValue}
+            />
+          )}
+        />
+      </div>
 
       <div className="w-full px-2 py-2 xl:px-3 xl:py-2">
         {(notice || error) ? (
@@ -1237,40 +1214,16 @@ function ContractPageContent() {
             <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,8.6fr)_minmax(240px,1.95fr)] xl:grid-rows-[minmax(540px,62vh)_auto]">
               <div className="min-w-0 min-h-0 xl:col-start-1 xl:row-start-1">
                 <div className="flex h-full min-h-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
-                  <GlobalMarketSelector
-                    pageType="contract"
-                    symbol={contractSymbol}
-                    interval={interval}
-                    symbols={toolbarPairSymbols.length ? toolbarPairSymbols : contractPairSymbols}
-                    symbolLabels={toolbarPairLabels}
-                    pairs={toolbarPairs}
-                    pairsLoading={contractPairsLoading}
-                    onPairQueryChange={handleToolbarPairQueryChange}
-                    onSymbolChange={(nextSymbol) => selectContractSymbol(nextSymbol)}
-                    onIntervalChange={setIntervalValue}
-                  />
                   <div className="min-h-0 flex-1">
-                    <ContractFuturesChart
+                    <ContractTradingViewChart
                       symbol={contractSymbol}
+                      displaySymbol={currentContractPair?.displaySymbol || marketSymbol}
                       interval={interval}
-                      marketStatus={contractMarketStatus}
-                      marketDisplayState={marketViewDisplayState}
+                      intervalOptions={contractChartIntervalOptions}
+                      onIntervalChange={setIntervalValue}
                       pricePrecision={pricePrecision}
-                      refreshKey={marketSessionRefreshKey}
-                      referencePriceLineEnabled={chartReferencePriceLineEnabled}
-                      referencePriceLinePrice={chartReferencePriceLinePrice}
-                      referencePriceLineLabel={chartReferencePriceLineLabel}
-                      currentPrice={contractMarketState.displayPrice}
-                      currentPriceSource={contractMarketState.displayPriceSource}
-                      klineMode={contractMarketState.klineMode}
-                      klineCurrentCandle={contractMarketState.klineCurrentCandle}
-                      marketRealtimeStatus={marketRealtimeStatus}
-                      marketSessionType={contractMarketSessionType}
-                      quoteFreshness={contractQuoteFreshness}
+                      amountPrecision={currentContractPair?.amountPrecision}
                       onLatestKlineCloseChange={handleLatestKlineCloseChange}
-                      positionOverlay={positionOverlay}
-                      positionEntryOverlays={positionEntryOverlays}
-                      positionTpSlOverlays={positionTpSlOverlays}
                     />
                   </div>
                 </div>

@@ -804,7 +804,6 @@ export default function ContractFuturesOrderBook({
             data-price-source={normalizedCenterPriceSource}
             className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${priceClass}`}
           >
-            <span className="mb-1 block text-[10px] font-medium leading-none text-white/42">{centerLabel}</span>
             <span className="block text-[17px] leading-none">{centerDisplayPrice}</span>
           </button>
 
