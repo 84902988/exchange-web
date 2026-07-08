@@ -28,15 +28,9 @@ from app.services.contract_balance_log_service import add_contract_balance_log, 
 from app.services.contract_market_guard import (
     CONTRACT_QUOTE_NOT_LIVE,
     ContractQuoteNotLive,
-    is_executable_contract_quote,
-    require_executable_contract_quote,
     should_log_contract_quote_skip,
 )
-from app.services.contract_market_service import (
-    get_contract_quote,
-    get_executable_contract_depth,
-    get_executable_contract_quote,
-)
+from app.services.contract_market_view import get_contract_execution_view
 from app.services.contract_private_ws import publish_contract_user_updates
 
 
@@ -124,6 +118,114 @@ def _quote_spread_x(quote: dict[str, Any], fallback: Any = None) -> Decimal:
     if single_side_price < Decimal("0"):
         return Decimal("0")
     return single_side_price
+
+
+def _execution_view_has_market_reference(view: dict[str, Any]) -> bool:
+    bid = _q18(view.get("execution_bid"))
+    ask = _q18(view.get("execution_ask"))
+    if bid > Decimal("0") and ask > Decimal("0") and ask >= bid:
+        return True
+    raw_source_summary = view.get("raw_source_summary") if isinstance(view.get("raw_source_summary"), dict) else {}
+    return bool(raw_source_summary.get("quote_source") or raw_source_summary.get("depth_source"))
+
+
+def _execution_quote_from_view(view: dict[str, Any]) -> dict[str, Any]:
+    bid_price = _q18(view.get("execution_bid"))
+    ask_price = _q18(view.get("execution_ask"))
+    if bid_price > Decimal("0") and ask_price > Decimal("0") and ask_price >= bid_price:
+        mark_price = (bid_price + ask_price) / Decimal("2")
+    else:
+        mark_price = Decimal("0")
+    raw_source_summary = view.get("raw_source_summary") if isinstance(view.get("raw_source_summary"), dict) else {}
+    return {
+        "symbol": view.get("symbol"),
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+        "last_price": mark_price,
+        "mark_price": mark_price,
+        "spread_x": _q18(view.get("spread_x")),
+        "manual_spread_x": _q18(view.get("manual_spread_x")),
+        "effective_total_spread": _q18(view.get("effective_total_spread")),
+        "single_side_spread_fee_price": _q18(view.get("single_side_spread_fee_price")),
+        "source": view.get("execution_mode") or "EXECUTION_VIEW",
+        "quote_source": view.get("execution_mode") or "EXECUTION_VIEW",
+        "depth_source": view.get("execution_mode") or "EXECUTION_VIEW",
+        "quote_freshness": raw_source_summary.get("quote_freshness"),
+        "market_status": raw_source_summary.get("market_status"),
+        "market_session_type": raw_source_summary.get("market_session_type"),
+        "closed_market_execution_mode": raw_source_summary.get("closed_market_execution_mode"),
+        "executable": bool(view.get("executable")),
+        "execution_mode": view.get("execution_mode"),
+        "reason_code": view.get("reason_code"),
+        "warnings": list(view.get("warnings") or []),
+        "raw_source_summary": raw_source_summary,
+        "display_state": view.get("display_state"),
+        "ts": view.get("quote_time"),
+        "price_age_ms": view.get("price_age_ms"),
+        "last_good_at": view.get("last_good_at"),
+    }
+
+
+def _execution_quote_is_executable(quote: dict[str, Any]) -> bool:
+    bid_price = _q18(quote.get("bid_price"))
+    ask_price = _q18(quote.get("ask_price"))
+    return bool(quote.get("executable")) and bid_price > Decimal("0") and ask_price > Decimal("0") and ask_price >= bid_price
+
+
+def _require_execution_quote(
+    quote: dict[str, Any],
+    *,
+    context: str,
+    symbol: str,
+    order_id: Any = None,
+    position_id: Any = None,
+    user_id: Any = None,
+) -> None:
+    if _execution_quote_is_executable(quote):
+        return
+    reason = str(quote.get("reason_code") or "CONTRACT_EXECUTION_UNAVAILABLE")
+    log_key = f"execution_view:{symbol}:{order_id}:{reason}"
+    if should_log_contract_quote_skip(log_key):
+        logger.debug(
+            "contract execution view rejected symbol=%s context=%s reason=%s execution_mode=%s "
+            "display_state=%s order_id=%s position_id=%s user_id=%s",
+            symbol,
+            context,
+            reason,
+            quote.get("execution_mode"),
+            quote.get("display_state"),
+            order_id,
+            position_id,
+            user_id,
+        )
+    raise ContractQuoteNotLive(reason)
+
+
+def _load_contract_execution_quote(
+    db: Session,
+    symbol: str,
+    *,
+    context: str,
+    require_executable: bool,
+    require_market_reference: bool = True,
+    order_id: Any = None,
+    position_id: Any = None,
+    user_id: Any = None,
+) -> dict[str, Any]:
+    view = get_contract_execution_view(db, symbol)
+    if require_market_reference and not _execution_view_has_market_reference(view):
+        raise ContractOrderQuoteUnavailable("CONTRACT_MARKET_REFERENCE_UNAVAILABLE")
+    quote = _execution_quote_from_view(view)
+    if require_executable:
+        _require_execution_quote(
+            quote,
+            context=context,
+            symbol=symbol,
+            order_id=order_id,
+            position_id=position_id,
+            user_id=user_id,
+        )
+    return quote
 
 
 def _contract_spread_fee(*, spread_x: Decimal, quantity: Decimal) -> Decimal:
@@ -377,10 +479,13 @@ def create_contract_open_order(
     )
 
     try:
-        if order_type == "MARKET":
-            quote = get_executable_contract_quote(db, symbol, context="market_open", user_id=user_id)
-        else:
-            quote = get_contract_quote(db, symbol)
+        quote = _load_contract_execution_quote(
+            db,
+            symbol,
+            context="market_open" if order_type == "MARKET" else "limit_open_reference",
+            require_executable=order_type == "MARKET",
+            user_id=user_id,
+        )
     except ContractQuoteNotLive as exc:
         _raise_open_quote_not_live(exc)
     except Exception as exc:
@@ -389,34 +494,11 @@ def create_contract_open_order(
     bid_price = _q18(quote["bid_price"])
     ask_price = _q18(quote["ask_price"])
     mark_price = _q18(quote["mark_price"])
-    if bid_price <= 0 or ask_price <= 0:
+    if order_type == "MARKET" and (bid_price <= 0 or ask_price <= 0):
         raise ContractOrderQuoteUnavailable("CONTRACT_QUOTE_UNAVAILABLE")
 
-    quote_is_executable = is_executable_contract_quote(quote)
+    quote_is_executable = _execution_quote_is_executable(quote)
     execution_quote = quote
-    if order_type == "LIMIT":
-        try:
-            execution_quote = get_executable_contract_depth(
-                db,
-                symbol,
-                limit=5,
-                context="limit_open_immediate",
-                user_id=user_id,
-            )
-            bid_price = _q18(execution_quote["best_bid"])
-            ask_price = _q18(execution_quote["best_ask"])
-            mark_price = (bid_price + ask_price) / Decimal("2")
-            quote_is_executable = True
-        except Exception as exc:
-            quote_is_executable = False
-            if should_log_contract_quote_skip(f"limit_open_immediate:{symbol}:{user_id}:{getattr(exc, 'code', None) or exc}"):
-                logger.debug(
-                    "contract_limit_open_immediate_depth_skipped symbol=%s user_id=%s reason=%s error=%s",
-                    symbol,
-                    user_id,
-                    getattr(exc, "code", None) or str(exc),
-                    exc,
-                )
 
     if order_type == "LIMIT" and not quote_is_executable:
         should_fill = False
@@ -432,7 +514,7 @@ def create_contract_open_order(
     if order_type == "LIMIT":
         logger.info(
             "contract_limit_open_decision symbol=%s provider_symbol=%s action=OPEN direction=%s "
-            "order_type=%s limit_price=%s best_bid=%s best_ask=%s quote_source=%s should_fill=%s fill_price=%s",
+            "order_type=%s limit_price=%s execution_bid=%s execution_ask=%s quote_source=%s should_fill=%s fill_price=%s",
             symbol,
             quote.get("provider_symbol"),
             position_side,
@@ -833,24 +915,7 @@ def _limit_fill_price(*, action: str, position_side: str, bid_price: Decimal, as
     raise ContractOrderBadRequest("INVALID_LIMIT_ORDER_SIDE")
 
 
-def _best_depth_price(levels: Any, *, side: str) -> Decimal:
-    prices: list[Decimal] = []
-    if isinstance(levels, list):
-        for level in levels:
-            raw_price = None
-            if isinstance(level, list) and level:
-                raw_price = level[0]
-            elif isinstance(level, dict):
-                raw_price = level.get("price")
-            price = _q18(raw_price)
-            if price > Decimal("0"):
-                prices.append(price)
-    if not prices:
-        return Decimal("0")
-    return max(prices) if side == "bid" else min(prices)
-
-
-def _fresh_depth_quote_for_limit_scan(
+def _fresh_execution_quote_for_limit_scan(
     db: Session,
     symbol: str,
     *,
@@ -858,38 +923,16 @@ def _fresh_depth_quote_for_limit_scan(
     position_id: Any = None,
     user_id: Any = None,
 ) -> dict[str, Any]:
-    depth = get_executable_contract_depth(
+    return _load_contract_execution_quote(
         db,
         symbol,
-        limit=5,
-        context="limit_order_scan_depth",
+        context="limit_order_scan",
+        require_executable=True,
+        require_market_reference=True,
         order_id=order_id,
         position_id=position_id,
         user_id=user_id,
     )
-    bid_price = _q18(depth.get("best_bid")) if depth.get("best_bid") is not None else _best_depth_price(depth.get("bids"), side="bid")
-    ask_price = _q18(depth.get("best_ask")) if depth.get("best_ask") is not None else _best_depth_price(depth.get("asks"), side="ask")
-    if bid_price <= Decimal("0") or ask_price <= Decimal("0"):
-        raise ContractOrderQuoteUnavailable("CONTRACT_FRESH_DEPTH_UNAVAILABLE")
-    mark_price = (bid_price + ask_price) / Decimal("2")
-    return {
-        "symbol": symbol,
-        "provider": depth.get("provider"),
-        "provider_symbol": depth.get("provider_symbol"),
-        "bid_price": bid_price,
-        "ask_price": ask_price,
-        "last_price": mark_price,
-        "mark_price": mark_price,
-        "spread_x": _q18(depth.get("spread_x")),
-        "manual_spread_x": _q18(depth.get("manual_spread_x")),
-        "effective_total_spread": _q18(depth.get("effective_total_spread")),
-        "single_side_spread_fee_price": _q18(depth.get("single_side_spread_fee_price")),
-        "source": depth.get("source") or "FRESH_DEPTH",
-        "depth_source": depth.get("source") or "LIVE",
-        "quote_freshness": depth.get("quote_freshness"),
-        "ts": depth.get("ts") or datetime.utcnow(),
-        "price_precision": depth.get("price_precision"),
-    }
 
 
 def _is_expected_limit_scan_quote_skip(reason: Any, error: Any) -> bool:
@@ -901,7 +944,8 @@ def _is_expected_limit_scan_quote_skip(reason: Any, error: Any) -> bool:
         "ITICK_QUOTE_UNAVAILABLE",
         "ITICK_STOCK_QUOTE_UNAVAILABLE",
         "ITICK_COOLDOWN_ACTIVE",
-        "CONTRACT_FRESH_DEPTH_UNAVAILABLE",
+        "CONTRACT_EXECUTION_UNAVAILABLE",
+        "CONTRACT_MARKET_REFERENCE_UNAVAILABLE",
     }
     if normalized_reason in expected_reasons:
         return True
@@ -924,7 +968,7 @@ def _log_limit_scan_decision(
 ) -> None:
     logger.debug(
         "contract_limit_order_scan_decision order_id=%s symbol=%s action=%s side=%s position_side=%s "
-        "limit_price=%s best_bid=%s best_ask=%s triggered=%s price_source=%s depth_ts=%s",
+        "limit_price=%s execution_bid=%s execution_ask=%s triggered=%s price_source=%s depth_ts=%s",
         order_id,
         symbol,
         action,
@@ -956,7 +1000,7 @@ def _fill_open_order_locked(
         raise ContractOrderBadRequest("INVALID_POSITION_SIDE")
 
     limit_price = _normalize_price(order.price, required=True)
-    require_executable_contract_quote(
+    _require_execution_quote(
         quote,
         context="limit_open_fill",
         symbol=symbol,
@@ -1125,7 +1169,7 @@ def _fill_close_order_locked(
     if position_side not in {"LONG", "SHORT"}:
         raise ContractOrderBadRequest("INVALID_POSITION_SIDE")
 
-    require_executable_contract_quote(
+    _require_execution_quote(
         quote,
         context="close_fill",
         symbol=_normalize_symbol(order.symbol),
@@ -1341,16 +1385,14 @@ def close_contract_position(
 
     if quote_override is None:
         try:
-            if order_type == "MARKET":
-                quote = get_executable_contract_quote(
-                    db,
-                    symbol,
-                    context="market_close",
-                    position_id=request.position_id,
-                    user_id=user_id,
-                )
-            else:
-                quote = get_contract_quote(db, symbol)
+            quote = _load_contract_execution_quote(
+                db,
+                symbol,
+                context="market_close" if order_type == "MARKET" else "limit_close_reference",
+                require_executable=order_type == "MARKET",
+                position_id=request.position_id,
+                user_id=user_id,
+            )
         except ContractQuoteNotLive as exc:
             _raise_close_quote_not_live(exc)
         except Exception as exc:
@@ -1361,14 +1403,14 @@ def close_contract_position(
     bid_price = _q18(quote["bid_price"])
     ask_price = _q18(quote["ask_price"])
     mark_price = _q18(quote["mark_price"])
-    if bid_price <= 0 or ask_price <= 0:
+    if order_type == "MARKET" and (bid_price <= 0 or ask_price <= 0):
         raise ContractOrderQuoteUnavailable("CONTRACT_QUOTE_UNAVAILABLE")
 
-    quote_is_executable = is_executable_contract_quote(quote)
+    quote_is_executable = _execution_quote_is_executable(quote)
     execution_quote = quote
     if order_type == "MARKET":
         try:
-            require_executable_contract_quote(
+            _require_execution_quote(
                 quote,
                 context="market_close",
                 symbol=symbol,
@@ -1377,33 +1419,6 @@ def close_contract_position(
             )
         except ContractQuoteNotLive as exc:
             _raise_close_quote_not_live(exc)
-    elif quote_override is None:
-        try:
-            execution_quote = get_executable_contract_depth(
-                db,
-                symbol,
-                limit=5,
-                context="limit_close_immediate",
-                position_id=request.position_id,
-                user_id=user_id,
-            )
-            bid_price = _q18(execution_quote["best_bid"])
-            ask_price = _q18(execution_quote["best_ask"])
-            mark_price = (bid_price + ask_price) / Decimal("2")
-            quote_is_executable = True
-        except Exception as exc:
-            quote_is_executable = False
-            if should_log_contract_quote_skip(
-                f"limit_close_immediate:{symbol}:{request.position_id}:{getattr(exc, 'code', None) or exc}"
-            ):
-                logger.debug(
-                    "contract_limit_close_immediate_depth_skipped symbol=%s position_id=%s user_id=%s reason=%s error=%s",
-                    symbol,
-                    request.position_id,
-                    user_id,
-                    getattr(exc, "code", None) or str(exc),
-                    exc,
-                )
 
     # Re-lock after quote so stale requests cannot close an already closed or depleted position.
     position = _load_open_position(db, user_id=int(user_id), position_id=int(request.position_id), lock=True)
@@ -1528,7 +1543,13 @@ def close_contract_position_summary(
     quote: Optional[dict[str, Any]] = None
     if order_type == "MARKET":
         try:
-            quote = get_executable_contract_quote(db, symbol, context="market_close_summary", user_id=user_id)
+            quote = _load_contract_execution_quote(
+                db,
+                symbol,
+                context="market_close_summary",
+                require_executable=True,
+                user_id=user_id,
+            )
         except ContractQuoteNotLive as exc:
             _raise_close_quote_not_live(exc)
         except Exception as exc:
@@ -1671,7 +1692,7 @@ def scan_and_execute_contract_limit_orders(db: Session, limit: int = 100) -> lis
             order_side = str(candidate.side or "").upper()
             symbol = _normalize_symbol(candidate.symbol)
             try:
-                quote = _fresh_depth_quote_for_limit_scan(
+                quote = _fresh_execution_quote_for_limit_scan(
                     db,
                     symbol,
                     order_id=order_id,
@@ -1686,8 +1707,8 @@ def scan_and_execute_contract_limit_orders(db: Session, limit: int = 100) -> lis
                 should_log = should_log_contract_quote_skip(log_key)
                 if should_log:
                     log_method(
-                        "contract_limit_order_scan_depth_skipped order_id=%s symbol=%s action=%s side=%s position_side=%s "
-                        "limit_price=%s price_source=skipped_no_depth reason=%s error=%s user_id=%s position_id=%s",
+                        "contract_limit_order_scan_execution_skipped order_id=%s symbol=%s action=%s side=%s position_side=%s "
+                        "limit_price=%s price_source=skipped_no_execution reason=%s error=%s user_id=%s position_id=%s",
                         order_id,
                         symbol,
                         action,
@@ -1721,7 +1742,7 @@ def scan_and_execute_contract_limit_orders(db: Session, limit: int = 100) -> lis
                 bid_price=bid_price,
                 ask_price=ask_price,
                 triggered=triggered,
-                price_source="fresh_depth",
+                price_source="execution_view",
                 depth_ts=quote.get("ts"),
             )
             if not triggered:
@@ -1762,7 +1783,7 @@ def scan_and_execute_contract_limit_orders(db: Session, limit: int = 100) -> lis
                 bid_price=bid_price,
                 ask_price=ask_price,
                 triggered=triggered,
-                price_source="fresh_depth",
+                price_source="execution_view",
                 depth_ts=quote.get("ts"),
             )
             if not triggered:

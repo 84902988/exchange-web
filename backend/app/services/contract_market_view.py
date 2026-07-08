@@ -89,6 +89,16 @@ def _format_decimal(value: Optional[Decimal]) -> Optional[str]:
     return format(value, "f")
 
 
+def _first_payload_decimal(*payloads: Optional[dict[str, Any]], key: str) -> Optional[Decimal]:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        value = _to_decimal(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
 def _to_datetime(value: Any) -> Optional[datetime]:
     if value is None or value == "":
         return None
@@ -712,6 +722,14 @@ def build_contract_market_view(
     if not has_bbo:
         _append_warning_once(source_warnings, "missing_bbo")
 
+    spread_x = _first_payload_decimal(bbo_payload, quote, depth, key="spread_x") or Decimal("0")
+    manual_spread_x = _first_payload_decimal(bbo_payload, quote, depth, key="manual_spread_x") or Decimal("0")
+    effective_total_spread = _first_payload_decimal(bbo_payload, quote, depth, key="effective_total_spread") or spread_x
+    single_side_spread_fee_price = (
+        _first_payload_decimal(bbo_payload, quote, depth, key="single_side_spread_fee_price")
+        or (effective_total_spread / Decimal("2") if effective_total_spread is not None else Decimal("0"))
+    )
+
     return {
         "symbol": normalized_symbol,
         "display_symbol": _display_symbol(normalized_symbol, contract_symbol),
@@ -727,6 +745,10 @@ def build_contract_market_view(
         "best_bid": _format_decimal(bid),
         "best_ask": _format_decimal(ask),
         "spread": _format_decimal(spread),
+        "spread_x": _format_decimal(spread_x),
+        "manual_spread_x": _format_decimal(manual_spread_x),
+        "effective_total_spread": _format_decimal(effective_total_spread),
+        "single_side_spread_fee_price": _format_decimal(single_side_spread_fee_price),
         "executable": executable,
         "execution_bid": _format_decimal(execution_bid),
         "execution_ask": _format_decimal(execution_ask),
@@ -816,3 +838,28 @@ def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
         warnings=warnings,
         mutate_quote_driven_state=False,
     )
+
+
+def get_contract_execution_view(db: Session, symbol: str) -> dict[str, Any]:
+    view = get_contract_market_view(db, symbol)
+    keys = (
+        "symbol",
+        "executable",
+        "execution_bid",
+        "execution_ask",
+        "display_price",
+        "display_state",
+        "execution_mode",
+        "reason_code",
+        "warnings",
+        "raw_source_summary",
+        "spread",
+        "spread_x",
+        "manual_spread_x",
+        "effective_total_spread",
+        "single_side_spread_fee_price",
+        "price_age_ms",
+        "quote_time",
+        "last_good_at",
+    )
+    return {key: view.get(key) for key in keys}
