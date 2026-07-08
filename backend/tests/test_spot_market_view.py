@@ -178,6 +178,96 @@ def test_spot_market_view_internal_symbol_uses_internal_kline_metadata() -> None
     assert view["raw_source_summary"]["kline_provider"] is None
 
 
+def test_spot_market_view_internal_ask_only_depth_is_displayable() -> None:
+    view = _run_view(
+        symbol="MFCUSDT",
+        depth=DepthResponse(
+            symbol="MFCUSDT",
+            price_precision=3,
+            amount_precision=4,
+            bids=[],
+            asks=[DepthItem(price="10.000", amount="2.0000")],
+            ts=1000,
+            provider=None,
+            source="INTERNAL",
+            freshness="RECENT",
+        ),
+        trades=_trades("MFCUSDT", source=None, freshness=None, provider=None),
+        tickers=_ticker("MFCUSDT", source="INTERNAL", provider=None),
+        kline=_kline("MFCUSDT", source="INTERNAL", freshness="RECENT", provider=None),
+    )
+
+    assert view["depth"]["bids"] == []
+    assert view["depth"]["asks"] == [{"price": "10.000", "amount": "2.0000"}]
+    assert view["best_bid"] is None
+    assert view["best_ask"] == "10.000"
+    assert view["orderbook_mid_price"] is None
+    assert view["depth_status"] == "ok"
+    assert view["depth_source"] == "INTERNAL"
+    assert view["depth_freshness"] == "RECENT"
+    assert view["executable"] is True
+
+
+def test_spot_market_view_internal_bid_only_depth_is_displayable() -> None:
+    view = _run_view(
+        symbol="MFCUSDT",
+        depth=DepthResponse(
+            symbol="MFCUSDT",
+            price_precision=3,
+            amount_precision=4,
+            bids=[DepthItem(price="9.000", amount="3.0000")],
+            asks=[],
+            ts=1000,
+            provider=None,
+            source="INTERNAL",
+            freshness="RECENT",
+        ),
+        trades=_trades("MFCUSDT", source=None, freshness=None, provider=None),
+        tickers=_ticker("MFCUSDT", source="INTERNAL", provider=None),
+        kline=_kline("MFCUSDT", source="INTERNAL", freshness="RECENT", provider=None),
+    )
+
+    assert view["depth"]["bids"] == [{"price": "9.000", "amount": "3.0000"}]
+    assert view["depth"]["asks"] == []
+    assert view["best_bid"] == "9.000"
+    assert view["best_ask"] is None
+    assert view["orderbook_mid_price"] is None
+    assert view["depth_status"] == "ok"
+    assert view["depth_source"] == "INTERNAL"
+    assert view["depth_freshness"] == "RECENT"
+    assert view["executable"] is True
+
+
+def test_spot_market_view_empty_internal_depth_is_missing_without_bbo() -> None:
+    view = _run_view(
+        symbol="MFCUSDT",
+        depth=DepthResponse(
+            symbol="MFCUSDT",
+            price_precision=3,
+            amount_precision=3,
+            bids=[],
+            asks=[],
+            ts=1000,
+            provider=None,
+            source="MISSING",
+            freshness="MISSING",
+        ),
+        trades=_trades("MFCUSDT", source=None, freshness=None, provider=None),
+        tickers=_ticker("MFCUSDT", source="INTERNAL", provider=None),
+        kline=_kline("MFCUSDT", source="INTERNAL", freshness="RECENT", provider=None),
+    )
+
+    assert view["depth"]["bids"] == []
+    assert view["depth"]["asks"] == []
+    assert view["best_bid"] is None
+    assert view["best_ask"] is None
+    assert view["orderbook_mid_price"] is None
+    assert view["depth_status"] == "missing"
+    assert view["depth_source"] == "MISSING"
+    assert view["depth_freshness"] == "MISSING"
+    assert view["executable"] is False
+
+
 def test_spot_market_view_trades_fresh_ws_stays_live_ws() -> None:
     view = _run_view(
         trades=_trades(source="LIVE_WS", freshness="LIVE", provider="OKX_SPOT"),

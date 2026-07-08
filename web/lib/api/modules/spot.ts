@@ -272,6 +272,8 @@ export type SpotMarketPairItem = {
   price_precision_provider?: string | null
   amount_precision?: number | string | null
   status?: number | string | null
+  enabled?: boolean | null
+  market_type?: 'spot' | 'contract' | string | null
   [key: string]: unknown
 }
 

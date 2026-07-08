@@ -11,7 +11,7 @@ import {
   type SpotMarketTickerItem,
   type SpotMarketView,
 } from '@/lib/api/modules/spot';
-import { readMarketCache, writeMarketCache } from '@/lib/marketCache';
+import { writeMarketCache } from '@/lib/marketCache';
 import {
   spotMarketRealtime,
   type SpotMarketRealtimeMessage,
@@ -137,14 +137,6 @@ const EMPTY_LAST_TRADE_STATE: SpotLastTradeState = {
   providerTradeId: null,
 };
 
-function readSpotMarketCache(symbol: string): SpotMarketCache | null {
-  const normalizedSymbol = normalizeSpotSymbol(symbol);
-  const cache = readMarketCache<SpotMarketCache>('spot', normalizedSymbol);
-  if (!cache) return null;
-  if (normalizeSpotSymbol(cache.symbol || '') !== normalizedSymbol) return null;
-  return cache;
-}
-
 function normalizeDepth(depth?: SpotDepthResponse | null): SpotDepthResponse | null {
   if (!depth) return null;
   return {
@@ -171,6 +163,66 @@ function hasValue(value: unknown): boolean {
 
 function hasDepthLevels(depth?: SpotDepthResponse | null): boolean {
   return Boolean(depth && ((depth.bids?.length || 0) > 0 || (depth.asks?.length || 0) > 0));
+}
+
+function isUnavailableDomainValue(value?: string | null): boolean {
+  const normalized = normalizeDomainValue(value);
+  return (
+    normalized === 'MISSING' ||
+    normalized === 'EMPTY' ||
+    normalized === 'STALE' ||
+    normalized === 'LAST_GOOD' ||
+    normalized === 'LAST_VALID'
+  );
+}
+
+function isDepthDomainUnavailable(
+  depth?: SpotDepthResponse | null,
+  fallback?: {
+    source?: string | null;
+    freshness?: string | null;
+    status?: string | null;
+  },
+): boolean {
+  return Boolean(
+    depth?.stale ||
+    isUnavailableDomainValue(depth?.source) ||
+    isUnavailableDomainValue(depth?.freshness) ||
+    isUnavailableDomainValue(fallback?.source) ||
+    isUnavailableDomainValue(fallback?.freshness) ||
+    isUnavailableDomainValue(fallback?.status),
+  );
+}
+
+export function normalizeDepthForDisplay(
+  depth?: SpotDepthResponse | null,
+  fallback?: {
+    source?: string | null;
+    freshness?: string | null;
+    status?: string | null;
+  },
+): SpotDepthResponse | null {
+  const normalizedDepth = normalizeDepth(depth);
+  if (!normalizedDepth) return null;
+
+  const hasLevels = hasDepthLevels(normalizedDepth);
+  const shouldClear = !hasLevels || isDepthDomainUnavailable(normalizedDepth, fallback);
+  if (!shouldClear) {
+    return normalizedDepth;
+  }
+
+  return {
+    ...normalizedDepth,
+    bids: [],
+    asks: [],
+    source: !hasLevels
+      ? 'MISSING'
+      : normalizeDomainValue(normalizedDepth.source || fallback?.source) || (normalizedDepth.stale ? 'STALE' : 'MISSING'),
+    freshness: !hasLevels
+      ? 'MISSING'
+      : normalizeDomainValue(normalizedDepth.freshness || fallback?.freshness) || (normalizedDepth.stale ? 'STALE' : 'MISSING'),
+    stale: Boolean(normalizedDepth.stale),
+  };
 }
 
 function hasTickerData(view?: SpotMarketView | null): boolean {
@@ -223,13 +275,6 @@ function getDepthMidPrice(depth?: SpotDepthResponse | null): string | number | n
 
 function getViewDisplayPrice(view?: SpotMarketView | null): string | number | null {
   return view?.display_price ?? view?.last_price ?? view?.ticker_last_price ?? view?.ticker?.last_price ?? null;
-}
-
-function toLastGoodPriceSource(source?: string | null): string {
-  const normalized = String(source || '').trim();
-  if (!normalized || normalized === 'missing') return 'last_good_price';
-  if (normalized.startsWith('last_good_')) return normalized;
-  return `last_good_${normalized}`;
 }
 
 function getViewOrderbookMidPrice(
@@ -335,101 +380,29 @@ function isActiveLastTrade(state: SpotLastTradeState, symbol: string): boolean {
   return sameSymbol(state.symbol, symbol) && hasValue(state.price);
 }
 
-function mergeViewWithLastGood(
-  incomingView: SpotMarketView,
-  lastGood: SpotMarketCache | null,
-  symbol: string,
-): SpotMarketView {
-  const previousView = lastGood?.marketView;
-  if (!previousView || !sameSymbol(previousView.symbol || lastGood?.symbol, symbol)) {
-    return incomingView;
-  }
+export function normalizeSpotMarketViewDepthDomain(view: SpotMarketView): SpotMarketView {
+  const nextDepth = normalizeDepthForDisplay(view.depth, {
+    source: view.depth_source,
+    freshness: view.depth_freshness,
+    status: view.depth_status,
+  });
+  const hasUsableDepth = hasDepthLevels(nextDepth) && !isDepthDomainUnavailable(nextDepth, {
+    source: view.depth_source,
+    freshness: view.depth_freshness,
+    status: view.depth_status,
+  });
 
-  const previousDepth = normalizeDepth(previousView.depth) || normalizeDepth(lastGood?.depth);
-  const incomingDepth = normalizeDepth(incomingView.depth);
-  const previousViewTrades = normalizeTrades(previousView.trades);
-  const previousTrades = previousViewTrades.length ? previousViewTrades : (lastGood?.trades || []);
-  const incomingTrades = normalizeTrades(incomingView.trades);
-  const previousDisplayPrice = getViewDisplayPrice(previousView) ?? lastGood?.lastPrice ?? null;
-  const incomingDisplayPrice = getViewDisplayPrice(incomingView);
-  const previousMarketStatus = String(previousView.market_status || '').toUpperCase();
-  const incomingMarketStatus = String(incomingView.market_status || '').toUpperCase();
-
-  let mergedView: SpotMarketView = { ...incomingView };
-
-  if (!hasValue(incomingDisplayPrice) && hasValue(previousDisplayPrice)) {
-    mergedView = {
-      ...mergedView,
-      display_price: previousView.display_price ?? previousDisplayPrice,
-      display_price_source: toLastGoodPriceSource(previousView.display_price_source ?? mergedView.display_price_source),
-      last_price: previousView.last_price ?? previousDisplayPrice,
-      last_trade_price: previousView.last_trade_price ?? mergedView.last_trade_price,
-      ticker_last_price: previousView.ticker_last_price ?? mergedView.ticker_last_price,
-      price_direction: previousView.price_direction ?? mergedView.price_direction,
-      ticker_source: 'LAST_GOOD',
-      ticker_freshness: 'LAST_GOOD',
-      quote_freshness: 'LAST_GOOD',
-    };
-  }
-
-  if (incomingMarketStatus === 'UNKNOWN' && previousMarketStatus && previousMarketStatus !== 'UNKNOWN') {
-    mergedView = {
-      ...mergedView,
-      market_status: previousView.market_status,
-      executable: previousView.executable ?? mergedView.executable,
-    };
-  }
-
-  if (!hasDepthLevels(incomingDepth) && hasDepthLevels(previousDepth)) {
-    mergedView = {
-      ...mergedView,
-      depth: previousView.depth || previousDepth,
-      best_bid: previousView.best_bid ?? firstPrice(previousDepth?.bids),
-      best_ask: previousView.best_ask ?? firstPrice(previousDepth?.asks),
-      orderbook_mid_price: previousView.orderbook_mid_price ?? getDepthMidPrice(previousDepth),
-      spread: previousView.spread ?? mergedView.spread,
-      depth_status: previousView.depth_status ?? mergedView.depth_status,
-      depth_source: 'LAST_GOOD',
-      depth_freshness: 'LAST_GOOD',
-    };
-  }
-
-  if (!incomingTrades.length && previousTrades.length) {
-    mergedView = {
-      ...mergedView,
-      trades: previousView.trades || buildTradesPayload(symbol, previousTrades),
-      last_trade_price: previousView.last_trade_price ?? mergedView.last_trade_price,
-      trades_status: previousView.trades_status ?? mergedView.trades_status,
-      trades_source: 'LAST_GOOD',
-      trades_freshness: 'LAST_GOOD',
-    };
-  }
-
-  if (!hasTickerData(incomingView) && hasTickerData(previousView)) {
-    mergedView = {
-      ...mergedView,
-      ticker: previousView.ticker ?? mergedView.ticker,
-      ticker_last_price: previousView.ticker_last_price ?? mergedView.ticker_last_price,
-      ticker_24h_change: previousView.ticker_24h_change ?? mergedView.ticker_24h_change,
-      ticker_24h_change_percent: previousView.ticker_24h_change_percent ?? mergedView.ticker_24h_change_percent,
-      ticker_24h_high: previousView.ticker_24h_high ?? mergedView.ticker_24h_high,
-      ticker_24h_low: previousView.ticker_24h_low ?? mergedView.ticker_24h_low,
-      ticker_volume: previousView.ticker_volume ?? mergedView.ticker_volume,
-      ticker_quote_volume: previousView.ticker_quote_volume ?? mergedView.ticker_quote_volume,
-      ticker_source: 'LAST_GOOD',
-      ticker_freshness: 'LAST_GOOD',
-      quote_freshness: 'LAST_GOOD',
-      raw_source_summary: {
-        ...(previousView.raw_source_summary || {}),
-        ...(mergedView.raw_source_summary || {}),
-        ticker_source: 'LAST_GOOD',
-        ticker_stale: true,
-        ticker_freshness: 'LAST_GOOD',
-      },
-    };
-  }
-
-  return mergedView;
+  return {
+    ...view,
+    depth: nextDepth,
+    best_bid: hasUsableDepth ? view.best_bid ?? firstPrice(nextDepth?.bids) : null,
+    best_ask: hasUsableDepth ? view.best_ask ?? firstPrice(nextDepth?.asks) : null,
+    orderbook_mid_price: hasUsableDepth ? view.orderbook_mid_price ?? getDepthMidPrice(nextDepth) : null,
+    spread: hasUsableDepth ? view.spread : null,
+    depth_status: hasUsableDepth ? 'ok' : 'missing',
+    depth_source: sourceFromDepth(nextDepth, view.depth_source) || (hasUsableDepth ? view.depth_source : 'MISSING'),
+    depth_freshness: depthFreshness(nextDepth, view.depth_freshness) || (hasUsableDepth ? view.depth_freshness : 'MISSING'),
+  };
 }
 
 function hasUsableMarketState(
@@ -468,7 +441,6 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   const refreshInFlightSymbolRef = useRef<string | null>(null);
   const lastRefreshStartedAtBySymbolRef = useRef<Record<string, number>>({});
   const mountedRef = useRef(false);
-  const lastGoodRef = useRef<SpotMarketCache | null>(null);
 
   const updateLastTradeState = useCallback((nextState: SpotLastTradeState) => {
     lastTradeStateRef.current = nextState;
@@ -492,8 +464,12 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   }, []);
 
   const applyView = useCallback((view: SpotMarketView) => {
-    const mergedView = mergeViewWithLastGood(view, lastGoodRef.current, normalizedSymbol);
-    const nextDepth = normalizeDepth(mergedView.depth);
+    const mergedView = normalizeSpotMarketViewDepthDomain(view);
+    const nextDepth = normalizeDepthForDisplay(mergedView.depth, {
+      source: mergedView.depth_source,
+      freshness: mergedView.depth_freshness,
+      status: mergedView.depth_status,
+    });
     const nextTrades = normalizeTrades(mergedView.trades);
     const activeLastTrade = lastTradeStateRef.current;
     const hasActiveTrade = isActiveLastTrade(activeLastTrade, normalizedSymbol);
@@ -522,7 +498,6 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       updatedAt: Date.now(),
     };
     if (hasUsableMarketState(mergedView, nextDepth, nextTrades)) {
-      lastGoodRef.current = nextCache;
       writeMarketCache<SpotMarketCache>('spot', normalizedSymbol, nextCache);
     }
   }, [normalizedSymbol]);
@@ -599,20 +574,18 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     refreshInFlightSeqRef.current = 0;
     refreshInFlightSymbolRef.current = null;
     activeSymbolRef.current = normalizedSymbol;
-    const cache = readSpotMarketCache(normalizedSymbol);
-    lastGoodRef.current = cache;
-    setMarketView(cache?.marketView || null);
-    setDepth(normalizeDepth(cache?.depth));
-    setTrades(cache?.trades || []);
-    setLastPrice(cache?.lastPrice ?? null);
-    setPriceDirection(cache?.priceDirection || 'flat');
+    setMarketView(null);
+    setDepth(null);
+    setTrades([]);
+    setLastPrice(null);
+    setPriceDirection('flat');
     updateLastTradeState(EMPTY_LAST_TRADE_STATE);
     seenTradeKeysRef.current.clear();
     seenTradeKeyQueueRef.current = [];
-    lastPriceRef.current = cache?.lastPrice ?? null;
-    priceDirectionRef.current = cache?.priceDirection || 'flat';
+    lastPriceRef.current = null;
+    priceDirectionRef.current = 'flat';
     setError(null);
-    setIsLoading(!cache);
+    setIsLoading(true);
   }, [normalizedSymbol, updateLastTradeState]);
 
   useEffect(() => {
@@ -650,32 +623,32 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       const hasTickerPayload = Object.prototype.hasOwnProperty.call(snapshot, 'ticker');
 
       if (hasDepthPayload) {
-        const nextDepth = normalizeDepth(snapshot.depth);
-        if (hasDepthLevels(nextDepth) || !hasDepthLevels(lastGoodRef.current?.depth)) {
-          setDepth(nextDepth);
-          setMarketView((prev) => prev ? {
+        const nextDepth = normalizeDepthForDisplay(snapshot.depth);
+        const nextHasDepth = hasDepthLevels(nextDepth);
+        const nextDepthSource = sourceFromDepth(nextDepth) ?? (nextHasDepth ? null : 'MISSING');
+        const nextDepthFreshness = depthFreshness(nextDepth) ?? (nextHasDepth ? null : 'MISSING');
+        setDepth(nextDepth);
+        setMarketView((prev) => prev ? normalizeSpotMarketViewDepthDomain({
             ...prev,
-            depth: nextDepth ?? prev.depth,
-            best_bid: firstPrice(nextDepth?.bids) ?? prev.best_bid,
-            best_ask: firstPrice(nextDepth?.asks) ?? prev.best_ask,
-            orderbook_mid_price: getDepthMidPrice(nextDepth) ?? prev.orderbook_mid_price,
-            depth_status: hasDepthLevels(nextDepth) ? 'ok' : prev.depth_status,
-            depth_source: sourceFromDepth(nextDepth) ?? prev.depth_source,
-            depth_freshness: depthFreshness(nextDepth) ?? prev.depth_freshness,
-          } : prev);
-        }
+            depth: nextDepth,
+            best_bid: nextHasDepth ? firstPrice(nextDepth?.bids) : null,
+            best_ask: nextHasDepth ? firstPrice(nextDepth?.asks) : null,
+            orderbook_mid_price: nextHasDepth ? getDepthMidPrice(nextDepth) : null,
+            spread: nextHasDepth ? prev.spread : null,
+            depth_status: nextHasDepth ? 'ok' : 'missing',
+            depth_source: nextDepthSource,
+            depth_freshness: nextDepthFreshness,
+          }) : prev);
       }
 
       if (hasTradesPayload) {
         const nextTrades = normalizeTrades(snapshot.trades);
-        if (nextTrades.length || !(lastGoodRef.current?.trades || []).length) {
-          setTrades(nextTrades);
-          setMarketView((prev) => prev ? {
+        setTrades(nextTrades);
+        setMarketView((prev) => prev ? {
             ...prev,
-            trades: nextTrades.length ? buildTradesPayload(normalizedSymbol, nextTrades) : prev.trades,
-            trades_status: nextTrades.length ? 'ok' : prev.trades_status,
+            trades: buildTradesPayload(normalizedSymbol, nextTrades),
+            trades_status: nextTrades.length ? 'ok' : 'missing',
           } : prev);
-        }
       }
 
       if (hasTickerPayload && snapshot.ticker) {
@@ -702,23 +675,25 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
       const msgSymbol = normalizeSpotSymbol(data.symbol || data.depth?.symbol || '');
       if (msgSymbol !== normalizedSymbol) return;
 
-      const nextDepth = normalizeDepth(data.depth);
+      const nextDepth = normalizeDepthForDisplay(data.depth);
+      const nextHasDepth = hasDepthLevels(nextDepth);
       const nextBestBid = firstPrice(nextDepth?.bids);
       const nextBestAsk = firstPrice(nextDepth?.asks);
       const nextMidPrice = getDepthMidPrice(nextDepth);
       const nextDepthFreshness = depthFreshness(nextDepth);
       const nextDepthSource = sourceFromDepth(nextDepth);
       setDepth(nextDepth);
-      setMarketView((prev) => prev ? {
+      setMarketView((prev) => prev ? normalizeSpotMarketViewDepthDomain({
         ...prev,
         depth: nextDepth,
-        best_bid: nextBestBid,
-        best_ask: nextBestAsk,
-        orderbook_mid_price: nextMidPrice,
-        depth_status: nextDepth?.bids?.length || nextDepth?.asks?.length ? 'ok' : 'missing',
-        depth_source: nextDepthSource ?? prev.depth_source,
-        depth_freshness: nextDepthFreshness ?? prev.depth_freshness,
-      } : prev);
+        best_bid: nextHasDepth ? nextBestBid : null,
+        best_ask: nextHasDepth ? nextBestAsk : null,
+        orderbook_mid_price: nextHasDepth ? nextMidPrice : null,
+        spread: nextHasDepth ? prev.spread : null,
+        depth_status: nextHasDepth ? 'ok' : 'missing',
+        depth_source: nextDepthSource ?? (nextHasDepth ? prev.depth_source : 'MISSING'),
+        depth_freshness: nextDepthFreshness ?? (nextHasDepth ? prev.depth_freshness : 'MISSING'),
+      }) : prev);
     };
 
     const handleTrade = (message: SpotMarketRealtimeMessage) => {
@@ -902,9 +877,14 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     };
   }, [normalizedSymbol, refresh]);
 
-  const bestBid = marketView?.best_bid ?? firstPrice(depth?.bids);
-  const bestAsk = marketView?.best_ask ?? firstPrice(depth?.asks);
-  const orderbookMidPrice = getViewOrderbookMidPrice(marketView, depth);
+  const hasUsableDepth = hasDepthLevels(depth) && !isDepthDomainUnavailable(depth, {
+    source: marketView?.depth_source,
+    freshness: marketView?.depth_freshness,
+    status: marketView?.depth_status,
+  });
+  const bestBid = hasUsableDepth ? marketView?.best_bid ?? firstPrice(depth?.bids) : null;
+  const bestAsk = hasUsableDepth ? marketView?.best_ask ?? firstPrice(depth?.asks) : null;
+  const orderbookMidPrice = hasUsableDepth ? getViewOrderbookMidPrice(marketView, depth) : null;
   const hasActiveTrade = isActiveLastTrade(lastTradeState, normalizedSymbol);
   const viewLastTradePrice = getViewLastTradePrice(marketView);
   const displayPrice = hasActiveTrade

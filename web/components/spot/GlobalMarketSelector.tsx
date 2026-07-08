@@ -28,7 +28,7 @@ import {
 type MarketLayerTab = 'favorites' | 'crypto' | 'stock' | 'cfd';
 type ToolbarPageType = 'spot' | 'contract';
 type SpotChartMode = 'time' | 'candle';
-type PairCategory = 'all' | 'spot' | 'contract' | 'platform' | 'rwa';
+export type PairCategory = 'all' | 'spot' | 'contract' | 'platform' | 'rwa';
 type StockCategory = 'all' | 'stock_contract';
 type ContractCategory = 'all' | 'metal' | 'commodity' | 'index' | 'forex';
 type FavoriteMarket = 'spot' | 'contract';
@@ -156,7 +156,7 @@ const CONTRACT_TICKER_REFRESH_TTL_MS = 25_000;
 const STOCK_CONTRACT_TICKER_REFRESH_TTL_MS = 60_000;
 const VISIBLE_TICKER_LOAD_DEBOUNCE_MS = 350;
 const PAIR_SELECTOR_METADATA_CACHE_TTL_MS = 30_000;
-const MARKET_SELECTOR_CACHE_VERSION = 'v2';
+const MARKET_SELECTOR_CACHE_VERSION = 'v3';
 const FAVORITE_SYMBOLS_STORAGE_KEY = 'royal_exchange_favorite_symbols_v1';
 const DEFAULT_SPOT_PAIRS_CACHE_KEY = `spot:${MARKET_SELECTOR_CACHE_VERSION}:all:all:`;
 const DEFAULT_CONTRACT_PAIRS_CACHE_KEY = `contract:${MARKET_SELECTOR_CACHE_VERSION}:all:all:`;
@@ -178,6 +178,10 @@ function appendMarketSuffix(value: string, suffix: string): string {
 
 function normalize(value?: string | number | null): string {
   return String(value ?? '').trim().toUpperCase();
+}
+
+function normalizePairSearchText(value?: string | number | null): string {
+  return normalize(value).replace(/[^A-Z0-9-]/g, '');
 }
 
 function normalizeSpotApiSymbol(value?: string | number | null): string {
@@ -381,11 +385,11 @@ function normalizeAssetClass(pair: GlobalMarketSelectorPair): string {
 }
 
 function isPlatformPair(pair: GlobalMarketSelectorPair): boolean {
-  return normalize(pair.displayCategory) === 'PLATFORM';
+  return normalize(pair.displayCategory) === 'PLATFORM' || normalizeAssetClass(pair) === 'PLATFORM';
 }
 
 function isRwaPair(pair: GlobalMarketSelectorPair): boolean {
-  return normalize(pair.displayCategory) === 'RWA';
+  return normalize(pair.displayCategory) === 'RWA' || normalizeAssetClass(pair) === 'RWA';
 }
 
 function isStockQuotePair(pair: GlobalMarketSelectorPair): boolean {
@@ -415,11 +419,7 @@ function isCryptoContractPair(pair: GlobalMarketSelectorPair): boolean {
 }
 
 function isCryptoSpotPair(pair: GlobalMarketSelectorPair): boolean {
-  const displayCategory = normalize(pair.displayCategory);
-  const isPlainCryptoSpot = isSpotMarketPair(pair) && !isStockMarketPair(pair) && !isTradfiCfdPair(pair);
-  if (!isPlainCryptoSpot) return false;
-  if (displayCategory) return displayCategory === 'MAINSTREAM';
-  return !isPlatformPair(pair) && !isRwaPair(pair) && normalizeAssetClass(pair) === 'CRYPTO';
+  return isSpotMarketPair(pair) && !isStockMarketPair(pair) && !isTradfiCfdPair(pair);
 }
 
 function getContractCategory(pair: GlobalMarketSelectorPair): ContractCategory {
@@ -454,6 +454,32 @@ function pairMatchesCryptoCategory(pair: GlobalMarketSelectorPair, category: Pai
   if (category === 'platform') return isSpotMarketPair(pair) && isPlatformPair(pair);
   if (category === 'rwa') return isRwaPair(pair);
   return false;
+}
+
+export function pairMatchesSpotSelectorSearch(pair: GlobalMarketSelectorPair, query: string): boolean {
+  const normalizedQuery = normalizePairSearchText(query);
+  if (!normalizedQuery) return true;
+
+  const { base, quote: pairQuote } = inferBaseQuote(pair);
+  const values = [
+    pair.symbol,
+    pair.displaySymbol,
+    pair.label,
+    pair.externalSymbol,
+    base,
+    pairQuote,
+    pair.assetType,
+    pair.marketCategory,
+    pair.marketSubCategory,
+    pair.displayCategory,
+    pair.displayGroup,
+    formatSpotDisplaySymbol(pair.symbol),
+  ];
+  return values.some((value) => normalizePairSearchText(value).includes(normalizedQuery));
+}
+
+export function pairMatchesSpotSelectorCategory(pair: GlobalMarketSelectorPair, category: PairCategory): boolean {
+  return pairMatchesCryptoCategory(pair, category);
 }
 
 function pairMatchesStockCategory(pair: GlobalMarketSelectorPair, category: StockCategory): boolean {
@@ -1708,15 +1734,7 @@ export default function GlobalMarketSelector({
   }, [contractPairCategory, contractPairQuote, contractPairsCacheKey, externalPairItems, marketDisplayLabels, needsContractRows, open, pairKeyword]);
 
   const pairMatchesSearch = useCallback((pair: GlobalMarketSelectorPair, query: string) => {
-    if (!query) return true;
-    const { base, quote: pairQuote } = inferBaseQuote(pair);
-    const displaySymbol = normalize(pair.displaySymbol || pair.label || formatSpotDisplaySymbol(pair.symbol));
-    return (
-      normalize(pair.symbol).includes(query) ||
-      base.includes(query) ||
-      pairQuote.includes(query) ||
-      displaySymbol.replace('/', '').includes(query)
-    );
+    return pairMatchesSpotSelectorSearch(pair, query);
   }, []);
 
   const filteredPairs = useMemo(() => {
