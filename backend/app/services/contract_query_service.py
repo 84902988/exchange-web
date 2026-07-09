@@ -19,6 +19,7 @@ from app.schemas.contract_order import (
 from app.schemas.contract_position import (
     ContractPositionItem,
     ContractPositionListResponse,
+    ContractPositionPageResponse,
     ContractPositionSummaryItem,
     ContractPositionSummaryListResponse,
 )
@@ -263,6 +264,101 @@ def get_user_contract_positions(
         )
 
     return ContractPositionListResponse(items=items)
+
+
+def get_user_contract_positions_page(
+    db: Session,
+    user_id: int,
+    symbol: Optional[str] = None,
+    status: Optional[str] = "OPEN",
+    side: Optional[str] = None,
+    position_side: Optional[str] = None,
+    created_from: Optional[str] = None,
+    created_to: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> ContractPositionPageResponse:
+    normalized_page = _normalize_page(page)
+    normalized_page_size = _normalize_page_size(page_size)
+    query = db.query(ContractPosition).filter(ContractPosition.user_id == int(user_id))
+
+    normalized_symbol = _normalize_symbol(symbol)
+    if normalized_symbol:
+        query = query.filter(ContractPosition.symbol == normalized_symbol)
+
+    normalized_status = _normalize_status(status)
+    if normalized_status and normalized_status != "ALL":
+        query = query.filter(ContractPosition.status == normalized_status)
+
+    normalized_side = _normalize_status(position_side) or _normalize_status(side)
+    if normalized_side:
+        if normalized_side not in {"LONG", "SHORT"}:
+            return ContractPositionPageResponse(items=[], total=0, page=normalized_page, page_size=normalized_page_size)
+        query = query.filter(ContractPosition.side == normalized_side)
+
+    created_from_dt = _parse_datetime_filter(created_from)
+    if created_from_dt:
+        query = query.filter(ContractPosition.created_at >= created_from_dt)
+
+    created_to_dt = _parse_datetime_filter(created_to)
+    if created_to_dt:
+        query = query.filter(ContractPosition.created_at <= created_to_dt)
+
+    total = int(query.count())
+    rows = (
+        query.order_by(ContractPosition.updated_at.desc(), ContractPosition.id.desc())
+        .offset((normalized_page - 1) * normalized_page_size)
+        .limit(normalized_page_size)
+        .all()
+    )
+
+    trade_summaries = _position_trade_summaries(db, int(user_id), [int(position.id) for position in rows])
+    items: list[ContractPositionItem] = []
+    for position in rows:
+        mark_price, unrealized_pnl = _position_mark_and_pnl(db, position)
+        trade_summary = trade_summaries.get(int(position.id), {})
+        closed_quantity = _d(trade_summary.get("closed_quantity"))
+        close_avg_price = (
+            _d(trade_summary.get("close_notional")) / closed_quantity
+            if closed_quantity > 0
+            else Decimal("0")
+        )
+        aggregated_closed_at = trade_summary.get("closed_at")
+        items.append(
+            ContractPositionItem(
+                id=int(position.id),
+                symbol=position.symbol,
+                side=position.side,
+                leverage=int(position.leverage),
+                quantity=_fmt_decimal(position.quantity),
+                entry_price=_fmt_decimal(position.entry_price),
+                mark_price=_fmt_decimal(mark_price),
+                margin_amount=_fmt_decimal(position.margin_amount),
+                open_fee=_fmt_decimal(position.open_fee),
+                unrealized_pnl=_fmt_decimal(unrealized_pnl),
+                realized_pnl=_fmt_decimal(position.realized_pnl),
+                liquidation_price=_fmt_decimal(position.liquidation_price),
+                warning_price=_fmt_decimal(position.warning_price),
+                take_profit_price=_fmt_decimal(position.take_profit_price) if position.take_profit_price is not None else None,
+                stop_loss_price=_fmt_decimal(position.stop_loss_price) if position.stop_loss_price is not None else None,
+                close_reason=position.close_reason,
+                opened_quantity=_fmt_decimal(trade_summary.get("opened_quantity", Decimal("0"))),
+                closed_quantity=_fmt_decimal(closed_quantity),
+                opened_margin_amount=_fmt_decimal(trade_summary.get("opened_margin_amount", Decimal("0"))),
+                released_margin_amount=_fmt_decimal(trade_summary.get("released_margin_amount", Decimal("0"))),
+                close_avg_price=_fmt_decimal(close_avg_price) if close_avg_price > 0 else None,
+                status=position.status,
+                opened_at=_fmt_datetime(position.opened_at),
+                closed_at=_fmt_datetime(position.closed_at or aggregated_closed_at),
+            )
+        )
+
+    return ContractPositionPageResponse(
+        items=items,
+        total=total,
+        page=normalized_page,
+        page_size=normalized_page_size,
+    )
 
 
 def get_user_contract_position_summaries(
