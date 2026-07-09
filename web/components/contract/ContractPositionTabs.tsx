@@ -331,8 +331,8 @@ export default function ContractPositionTabs({
     [allOpenPositions, openPositionSummaries],
   );
   const pagedOpenPositionSummaryRows = useMemo(
-    () => buildAggregatedPositionRows(pagedOpenPositions),
-    [pagedOpenPositions],
+    () => buildAggregatedPositionRows(pagedOpenPositions, openPositionSummaries),
+    [openPositionSummaries, pagedOpenPositions],
   );
   const openPositionSummaryRows = positionsPagination ? pagedOpenPositionSummaryRows : legacyOpenPositionSummaryRows;
   const historyPositions = useMemo(
@@ -1073,7 +1073,10 @@ function resolveSharedTpSlMode(
   return values.every((value) => value === first) ? first : null;
 }
 
-function buildAggregatedPositionRows(positions: ContractPositionItem[]): AggregatedPositionRow[] {
+function buildAggregatedPositionRows(
+  positions: ContractPositionItem[],
+  summaries: ContractPositionSummaryItem[] = [],
+): AggregatedPositionRow[] {
   const grouped = new Map<string, ContractPositionItem[]>();
   positions.forEach((position) => {
     const side = getPositionRecordSide(position);
@@ -1086,6 +1089,10 @@ function buildAggregatedPositionRows(positions: ContractPositionItem[]): Aggrega
 
   return Array.from(grouped.entries()).map(([key, rows]) => {
     const [symbol, side] = key.split(':') as [string, ContractPositionSide];
+    const authoritativeSummary = summaries.find((summary) => (
+      normalizeContractSymbol(summary.symbol) === symbol &&
+      getPositionRecordSide(summary) === side
+    ));
     const quantity = rows.reduce((sum, row) => sum + getPositionAmount(row), 0);
     const entryNotional = rows.reduce((sum, row) => sum + (getPositionAmount(row) * toNumber(row.entry_price)), 0);
     const avgEntryPrice = quantity > 0 ? entryNotional / quantity : 0;
@@ -1093,12 +1100,15 @@ function buildAggregatedPositionRows(positions: ContractPositionItem[]): Aggrega
     const markPrice = quantity > 0 ? weightedMarkNotional / quantity : 0;
     const marginAmount = rows.reduce((sum, row) => sum + toNumber(row.margin_amount), 0);
     const unrealizedPnl = rows.reduce((sum, row) => sum + toNumber(row.unrealized_pnl), 0);
-    const liquidationPrice = rows.length === 1 ? rows[0].liquidation_price : resolveSharedRiskField(rows, 'liquidation_price');
+    const liquidationPrice = authoritativeSummary?.liquidation_price
+      ?? (rows.length === 1 ? rows[0].liquidation_price : resolveSharedRiskField(rows, 'liquidation_price'));
     const aggregatedRoe = calcUnrealizedPnlPercent(unrealizedPnl, marginAmount);
     const roe = rows.length === 1 ? rows[0].roe : aggregatedRoe === null ? null : formatAggregatedDecimal(aggregatedRoe, 8);
     const marginRatio = rows.length === 1 ? rows[0].margin_ratio : calculateMarginRatio(marginAmount, markPrice, quantity);
-    const liquidationDistance = rows.length === 1 ? rows[0].liquidation_distance : resolveSharedRiskField(rows, 'liquidation_distance');
-    const liquidationDistanceRate = rows.length === 1 ? rows[0].liquidation_distance_rate : resolveSharedRiskField(rows, 'liquidation_distance_rate');
+    const liquidationDistance = authoritativeSummary?.liquidation_distance
+      ?? (rows.length === 1 ? rows[0].liquidation_distance : resolveSharedRiskField(rows, 'liquidation_distance'));
+    const liquidationDistanceRate = authoritativeSummary?.liquidation_distance_rate
+      ?? (rows.length === 1 ? rows[0].liquidation_distance_rate : resolveSharedRiskField(rows, 'liquidation_distance_rate'));
     const leverage = resolveSharedLeverage(rows);
     const takeProfitPrice = resolveSharedTpSlMode(rows, 'take_profit_price');
     const stopLossPrice = resolveSharedTpSlMode(rows, 'stop_loss_price');

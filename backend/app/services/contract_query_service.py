@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, load_only
 
 from app.db.models.contract_order import ContractOrder
 from app.db.models.contract_position import ContractPosition
+from app.db.models.contract_symbol import ContractSymbol
 from app.db.models.contract_trade import ContractTrade
 from app.schemas.contract_order import (
     ContractOrderListItem,
@@ -149,27 +150,72 @@ def _summary_tp_sl(rows: list[ContractPosition]) -> tuple[str, Optional[str], Op
     return "MIXED", None, None
 
 
-def _summary_liquidation_price(side: str, avg_entry_price: Decimal, margin_amount: Decimal, quantity: Decimal) -> Decimal:
-    if avg_entry_price <= 0 or margin_amount <= 0 or quantity <= 0:
+def _display_liquidation_price_from_margin(
+    *,
+    side: str,
+    entry_price: Decimal,
+    margin_amount: Decimal,
+    quantity: Decimal,
+    liquidation_threshold: Decimal,
+) -> Decimal:
+    abs_quantity = abs(quantity)
+    if entry_price <= 0 or margin_amount <= 0 or abs_quantity <= 0:
         return Decimal("0")
-    distance = margin_amount / quantity
-    if side == "LONG":
-        liquidation_price = avg_entry_price - distance
-    elif side == "SHORT":
-        liquidation_price = avg_entry_price + distance
+    distance = margin_amount * (Decimal("1") - liquidation_threshold) / abs_quantity
+    if distance <= 0:
+        return Decimal("0")
+    normalized_side = _normalize_status(side)
+    if normalized_side == "LONG":
+        liquidation_price = entry_price - distance
+    elif normalized_side == "SHORT":
+        liquidation_price = entry_price + distance
     else:
         liquidation_price = Decimal("0")
     return liquidation_price if liquidation_price > 0 else Decimal("0")
 
 
-def _position_display_liquidation_price(position: ContractPosition) -> Optional[Decimal]:
+def _symbol_liquidation_thresholds(db: Session, positions: list[ContractPosition]) -> dict[str, Decimal]:
+    symbols = sorted({_normalize_symbol(position.symbol) for position in positions if _normalize_symbol(position.symbol)})
+    if not symbols:
+        return {}
+    rows = (
+        db.query(ContractSymbol.symbol, ContractSymbol.liquidation_threshold)
+        .filter(ContractSymbol.symbol.in_(symbols))
+        .all()
+    )
+    return {_normalize_symbol(symbol): _d(liquidation_threshold) for symbol, liquidation_threshold in rows}
+
+
+def _liquidation_threshold_for_position(
+    liquidation_thresholds: dict[str, Decimal],
+    position: ContractPosition,
+) -> Decimal:
+    return liquidation_thresholds.get(_normalize_symbol(position.symbol), Decimal("0"))
+
+
+def _position_display_liquidation_price(
+    position: ContractPosition,
+    liquidation_threshold: Decimal = Decimal("0"),
+) -> Optional[Decimal]:
     stored_liquidation_price = _d(position.liquidation_price)
     if stored_liquidation_price > 0:
         return stored_liquidation_price
-    return None
+    derived_liquidation_price = _display_liquidation_price_from_margin(
+        side=position.side,
+        entry_price=_d(position.entry_price),
+        margin_amount=_d(position.margin_amount),
+        quantity=_d(position.quantity),
+        liquidation_threshold=liquidation_threshold,
+    )
+    return derived_liquidation_price if derived_liquidation_price > 0 else None
 
 
-def _summary_display_liquidation_price(positions: list[ContractPosition]) -> Optional[Decimal]:
+def _summary_display_liquidation_price(
+    positions: list[ContractPosition],
+    liquidation_thresholds: dict[str, Decimal],
+) -> Optional[Decimal]:
+    if not positions:
+        return None
     values = {
         _d(position.liquidation_price)
         for position in positions
@@ -177,7 +223,36 @@ def _summary_display_liquidation_price(positions: list[ContractPosition]) -> Opt
     }
     if len(values) == 1:
         return next(iter(values))
-    return None
+    if len(positions) == 1:
+        position = positions[0]
+        return _position_display_liquidation_price(
+            position,
+            _liquidation_threshold_for_position(liquidation_thresholds, position),
+        )
+
+    side_values = {_normalize_status(position.side) for position in positions}
+    symbol_values = {_normalize_symbol(position.symbol) for position in positions}
+    if len(side_values) != 1 or len(symbol_values) != 1:
+        return None
+
+    total_quantity = sum((_d(position.quantity) for position in positions), Decimal("0"))
+    if total_quantity <= 0:
+        return None
+    weighted_entry_notional = sum(
+        (_d(position.entry_price) * _d(position.quantity) for position in positions),
+        Decimal("0"),
+    )
+    avg_entry_price = weighted_entry_notional / total_quantity
+    margin_amount = sum((_d(position.margin_amount) for position in positions), Decimal("0"))
+    position = positions[0]
+    derived_liquidation_price = _display_liquidation_price_from_margin(
+        side=position.side,
+        entry_price=avg_entry_price,
+        margin_amount=margin_amount,
+        quantity=total_quantity,
+        liquidation_threshold=_liquidation_threshold_for_position(liquidation_thresholds, position),
+    )
+    return derived_liquidation_price if derived_liquidation_price > 0 else None
 
 
 def _position_risk_metrics(
@@ -279,11 +354,15 @@ def get_user_contract_positions(
         query = query.filter(ContractPosition.status == normalized_status)
 
     rows = query.order_by(ContractPosition.opened_at.desc(), ContractPosition.id.desc()).all()
+    liquidation_thresholds = _symbol_liquidation_thresholds(db, rows)
     trade_summaries = _position_trade_summaries(db, int(user_id), [int(position.id) for position in rows])
     items: list[ContractPositionItem] = []
     for position in rows:
         mark_price, unrealized_pnl = _position_mark_and_pnl(db, position)
-        liquidation_price = _position_display_liquidation_price(position)
+        liquidation_price = _position_display_liquidation_price(
+            position,
+            _liquidation_threshold_for_position(liquidation_thresholds, position),
+        )
         risk_metrics = _position_risk_metrics(
             side=position.side,
             quantity=_d(position.quantity),
@@ -383,10 +462,14 @@ def get_user_contract_positions_page(
     )
 
     trade_summaries = _position_trade_summaries(db, int(user_id), [int(position.id) for position in rows])
+    liquidation_thresholds = _symbol_liquidation_thresholds(db, rows)
     items: list[ContractPositionItem] = []
     for position in rows:
         mark_price, unrealized_pnl = _position_mark_and_pnl(db, position)
-        liquidation_price = _position_display_liquidation_price(position)
+        liquidation_price = _position_display_liquidation_price(
+            position,
+            _liquidation_threshold_for_position(liquidation_thresholds, position),
+        )
         risk_metrics = _position_risk_metrics(
             side=position.side,
             quantity=_d(position.quantity),
@@ -468,6 +551,7 @@ def get_user_contract_position_summaries(
         query = query.filter(ContractPosition.side == normalized_side)
 
     rows = query.order_by(ContractPosition.symbol.asc(), ContractPosition.side.asc(), ContractPosition.id.asc()).all()
+    liquidation_thresholds = _symbol_liquidation_thresholds(db, rows)
     grouped: dict[tuple[str, str], list[ContractPosition]] = {}
     for position in rows:
         quantity = _d(position.quantity)
@@ -500,7 +584,7 @@ def get_user_contract_position_summaries(
         display_leverage = next(iter(leverage_values)) if len(leverage_values) == 1 else None
 
         tp_sl_mode, take_profit_price, stop_loss_price = _summary_tp_sl(group_rows)
-        liquidation_price = _summary_display_liquidation_price(group_rows)
+        liquidation_price = _summary_display_liquidation_price(group_rows, liquidation_thresholds)
         risk_metrics = _position_risk_metrics(
             side=group_side,
             quantity=total_quantity,
