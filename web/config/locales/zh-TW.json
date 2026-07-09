@@ -2587,6 +2587,7 @@
     "pageIndicator": "第 {page} / {totalPages} 頁",
     "nextPage": "下一頁",
     "currentSymbolScope": "目前合約",
+    "allContractsScope": "全部合約",
     "allPositionsScope": "全部持倉",
     "positionsLoadingAllDesc": "正在同步全部合約持倉。",
     "positionsRefreshing": "正在重新整理持倉",

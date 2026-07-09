@@ -2587,6 +2587,7 @@
     "pageIndicator": "第 {page} / {totalPages} 页",
     "nextPage": "下一页",
     "currentSymbolScope": "当前合约",
+    "allContractsScope": "全部合约",
     "allPositionsScope": "全部持仓",
     "positionsLoadingAllDesc": "正在同步全部合约持仓。",
     "positionsRefreshing": "正在刷新持仓",

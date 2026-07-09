@@ -2453,6 +2453,7 @@
     "pageIndicator": "ページ {page} / {totalPages}",
     "nextPage": "次へ",
     "currentSymbolScope": "現在の契約",
+    "allContractsScope": "すべての契約",
     "allPositionsScope": "すべてのポジション",
     "positionsLoadingAllDesc": "すべての契約ポジションを同期しています。",
     "positionsRefreshing": "ポジションを更新中",

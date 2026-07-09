@@ -2587,6 +2587,7 @@
     "pageIndicator": "Page {page} / {totalPages}",
     "nextPage": "Next",
     "currentSymbolScope": "Current futures market",
+    "allContractsScope": "All futures",
     "allPositionsScope": "All positions",
     "positionsLoadingAllDesc": "Synchronizing all futures positions.",
     "positionsRefreshing": "Refreshing positions",
