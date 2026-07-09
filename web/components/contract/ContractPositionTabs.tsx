@@ -2161,8 +2161,8 @@ function TradesTable({
 
 function sideLabel(value: string, t?: ContractTranslator) {
   const side = normalizePositionSide(value);
-  if (side === 'LONG') return t ? t('positionSideLong', 'contracts') : 'Long';
-  if (side === 'SHORT') return t ? t('positionSideShort', 'contracts') : 'Short';
+  if (side === 'LONG') return t ? t('positionSideLong', 'contracts') : '多头';
+  if (side === 'SHORT') return t ? t('positionSideShort', 'contracts') : '空头';
   return value || '--';
 }
 
@@ -2263,15 +2263,15 @@ function calculatePositionUnrealizedPnl(position: ContractPositionItem, markPric
 }
 
 function statusLabel(value: string, closeReason?: string | null, t?: ContractTranslator) {
-  if (closeReason === 'TAKE_PROFIT') return t ? t('statusTakeProfitClosed', 'contracts') : closeReason;
-  if (closeReason === 'STOP_LOSS') return t ? t('statusStopLossClosed', 'contracts') : closeReason;
-  if (value === 'OPEN') return t ? t('statusOpen', 'contracts') : value;
-  if (value === 'CLOSED') return t ? t('statusClosed', 'contracts') : value;
-  if (value === 'LIQUIDATED') return t ? t('statusLiquidated', 'contracts') : value;
-  if (value === 'FILLED') return t ? t('statusFilled', 'contracts') : value;
-  if (value === 'NEW') return t ? t('statusNew', 'contracts') : value;
-  if (value === 'CANCELED') return t ? t('statusCanceled', 'contracts') : value;
-  if (value === 'FAILED') return t ? t('statusFailed', 'contracts') : value;
+  if (closeReason === 'TAKE_PROFIT') return t ? t('statusTakeProfitClosed', 'contracts') : '止盈平仓';
+  if (closeReason === 'STOP_LOSS') return t ? t('statusStopLossClosed', 'contracts') : '止损平仓';
+  if (value === 'OPEN') return t ? t('statusOpen', 'contracts') : '持仓中';
+  if (value === 'CLOSED') return t ? t('statusClosed', 'contracts') : '已平仓';
+  if (value === 'LIQUIDATED') return t ? t('statusLiquidated', 'contracts') : '已强平';
+  if (value === 'FILLED') return t ? t('statusFilled', 'contracts') : '已成交';
+  if (value === 'NEW') return t ? t('statusNew', 'contracts') : '新委托';
+  if (value === 'CANCELED') return t ? t('statusCanceled', 'contracts') : '已取消';
+  if (value === 'FAILED') return t ? t('statusFailed', 'contracts') : '失败';
   return value || '--';
 }
 

@@ -2568,7 +2568,7 @@
     "confirmMarketCloseTitle": "确认市价平仓",
     "confirmMarketCloseDesc": "将按最新市场价格提交市价平仓订单，最终价格以成交结果为准。",
     "confirmClosePosition": "确认平仓",
-    "symbol": "合约",
+    "symbol": "交易对",
     "entryPrice": "开仓价格",
     "previousPage": "上一页",
     "pageIndicator": "第 {page} / {totalPages} 页",

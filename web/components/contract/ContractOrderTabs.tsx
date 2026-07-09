@@ -117,10 +117,10 @@ function displaySymbol(symbol: string) {
 
 export function formatContractOrderAction(item: Pick<ContractOrderListItem, 'action' | 'position_side'>, t?: ContractTranslator) {
   const isOpen = item.action === 'OPEN';
-  if (isOpen && item.position_side === 'LONG') return t ? t('openLong', 'contracts') : item.position_side;
-  if (isOpen && item.position_side === 'SHORT') return t ? t('openShort', 'contracts') : item.position_side;
-  if (!isOpen && item.position_side === 'LONG') return t ? t('closeLong', 'contracts') : item.position_side;
-  if (!isOpen && item.position_side === 'SHORT') return t ? t('closeShort', 'contracts') : item.position_side;
+  if (isOpen && item.position_side === 'LONG') return t ? t('openLong', 'contracts') : '开多';
+  if (isOpen && item.position_side === 'SHORT') return t ? t('openShort', 'contracts') : '开空';
+  if (!isOpen && item.position_side === 'LONG') return t ? t('closeLong', 'contracts') : '平多';
+  if (!isOpen && item.position_side === 'SHORT') return t ? t('closeShort', 'contracts') : '平空';
   return item.position_side || '--';
 }
 
@@ -133,20 +133,20 @@ export function contractOrderActionTone(item: Pick<ContractOrderListItem, 'actio
 }
 
 export function formatOrderType(value: string, t?: ContractTranslator) {
-  if (value === 'MARKET') return t ? t('market', 'contracts') : value;
-  if (value === 'LIMIT') return t ? t('limit', 'contracts') : value;
+  if (value === 'MARKET') return t ? t('market', 'contracts') : '市价';
+  if (value === 'LIMIT') return t ? t('limit', 'contracts') : '限价';
   return value || '--';
 }
 
 export function formatContractOrderStatus(status: string, filledQuantity = 0, t?: ContractTranslator) {
-  if (status === 'OPEN' || status === 'NEW' || status === 'PENDING') return t ? t('orderStatusPendingFill', 'contracts') : status;
-  if (status === 'PARTIALLY_FILLED') return t ? t('orderStatusPartiallyFilled', 'contracts') : status;
-  if (status === 'FILLED') return t ? t('orderStatusFilled', 'contracts') : status;
+  if (status === 'OPEN' || status === 'NEW' || status === 'PENDING') return t ? t('orderStatusPendingFill', 'contracts') : '等待成交';
+  if (status === 'PARTIALLY_FILLED') return t ? t('orderStatusPartiallyFilled', 'contracts') : '部分成交';
+  if (status === 'FILLED') return t ? t('orderStatusFilled', 'contracts') : '已完成';
   if (status === 'CANCELED' || status === 'CANCELLED') {
-    if (filledQuantity > 0) return t ? t('orderStatusCanceledAfterPartial', 'contracts') : status;
-    return t ? t('orderStatusCanceled', 'contracts') : status;
+    if (filledQuantity > 0) return t ? t('orderStatusCanceledAfterPartial', 'contracts') : '部分成交后撤销';
+    return t ? t('orderStatusCanceled', 'contracts') : '已撤销';
   }
-  if (status === 'FAILED') return t ? t('orderStatusFailed', 'contracts') : status;
+  if (status === 'FAILED') return t ? t('orderStatusFailed', 'contracts') : '失败';
   return status || '--';
 }
 

@@ -2568,7 +2568,7 @@
     "confirmMarketCloseTitle": "確認市價平倉",
     "confirmMarketCloseDesc": "將按最新市場價格提交市價平倉訂單，最終價格以成交結果為準。",
     "confirmClosePosition": "確認平倉",
-    "symbol": "合約",
+    "symbol": "交易對",
     "entryPrice": "開倉價格",
     "previousPage": "上一頁",
     "pageIndicator": "第 {page} / {totalPages} 頁",
