@@ -9,6 +9,12 @@ import {
 } from '@/lib/api/modules/contract';
 import { formatPrice } from '@/lib/marketPrecision';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import {
+  getContractDomainStatusLabel,
+  getContractMarketSourceLabel,
+  getContractMarketSourceTone,
+  getContractMarketSourceToneClass,
+} from './contractMarketSourceStatus';
 
 type ContractFuturesOrderBookProps = {
   symbol: string;
@@ -143,6 +149,9 @@ export default function ContractFuturesOrderBook({
   centerPriceSource = 'KLINE_CLOSE',
   centerPriceLabel,
   depthMode,
+  marketView,
+  depthSource,
+  depthFreshness,
   loading = false,
   error,
   onPriceClick,
@@ -153,7 +162,23 @@ export default function ContractFuturesOrderBook({
   const normalizedDisplayDepthMode = normalizeDepthMode(depthMode);
   const displayStatus = status || (loading ? 'LOADING' : error ? 'UNAVAILABLE' : null);
   const depthStatusLabel = statusLabel || (displayStatus ? getQuoteStatusLabel(displayStatus, t) : null);
-  const hasDepthQuoteStatus = !!displayStatus || !!depthStatusLabel;
+  const depthSourceValue = depthSource ?? marketView?.depth_source ?? null;
+  const depthFreshnessValue = depthFreshness ?? marketView?.depth_freshness ?? null;
+  const hasDepthSourceStatus = !!depthSourceValue || !!depthFreshnessValue;
+  const depthSourceTone = getContractMarketSourceTone(depthSourceValue, depthFreshnessValue);
+  const depthSourceStatusLabel = hasDepthSourceStatus
+    ? getContractMarketSourceLabel(depthSourceValue, depthFreshnessValue, t)
+    : null;
+  const depthSourceStatusTitle = hasDepthSourceStatus
+    ? getContractDomainStatusLabel('depth', depthSourceValue, depthFreshnessValue, t)
+    : null;
+  const displayDepthStatusLabel = depthSourceStatusLabel || depthStatusLabel;
+  const displayDepthStatusClass = depthSourceStatusLabel
+    ? getContractMarketSourceToneClass(depthSourceTone)
+    : displayStatus
+      ? quoteStatusBadgeClass(displayStatus)
+      : 'border-white/10 bg-white/[0.05] text-white/58';
+  const hasDepthQuoteStatus = !!displayDepthStatusLabel && (hasDepthSourceStatus || !!displayStatus);
 
   const askRows = useMemo(() => {
     const limit = normalizedDisplayDepthMode === 'BBO_ONLY' ? 1 : UI_DISPLAY_LIMIT;
@@ -196,9 +221,12 @@ export default function ContractFuturesOrderBook({
           <div className="shrink-0 whitespace-nowrap text-[13px] font-medium text-white/88">
             {titleLabel}
           </div>
-          {hasDepthQuoteStatus && displayStatus ? (
-            <div className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${quoteStatusBadgeClass(displayStatus)}`}>
-              {depthStatusLabel}
+          {hasDepthQuoteStatus ? (
+            <div
+              className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${displayDepthStatusClass}`}
+              title={depthSourceStatusTitle || undefined}
+            >
+              {displayDepthStatusLabel}
             </div>
           ) : null}
           {depthModeLabel ? (
