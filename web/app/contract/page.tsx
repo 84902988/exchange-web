@@ -521,6 +521,7 @@ function ContractPageContent() {
   const {
     account,
     positions,
+    positionsPageItems,
     positionSummaries,
     activeOrders,
     orders,
@@ -537,6 +538,7 @@ function ContractPageContent() {
     realtimeStatus,
     openPositionsForTrading,
     refreshPrivateSilently,
+    positionsPagination,
     activeOrdersPagination,
     orderHistoryPagination,
     tradeHistoryPagination,
@@ -848,6 +850,7 @@ function ContractPageContent() {
                   currentSymbol={contractSymbol}
                   scope={contractDataScope}
                   positions={positions}
+                  positionsPageItems={positionsPageItems}
                   positionSummaries={positionSummaries}
                   activeOrders={activeOrders}
                   orders={orders}
@@ -862,6 +865,7 @@ function ContractPageContent() {
                   isOrdersLoading={isOrdersLoading}
                   isTradesLoading={isTradesLoading}
                   realtimeStatus={realtimeStatus}
+                  positionsPagination={positionsPagination}
                   activeOrdersPagination={activeOrdersPagination}
                   orderHistoryPagination={orderHistoryPagination}
                   tradeHistoryPagination={tradeHistoryPagination}
