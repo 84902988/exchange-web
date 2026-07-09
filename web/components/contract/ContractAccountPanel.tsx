@@ -27,6 +27,8 @@ export default function ContractAccountPanel({
 }: ContractAccountPanelProps) {
   const { t } = useLocaleContext();
   const [transferOpen, setTransferOpen] = useState(false);
+  const accountUnrealizedPnl = account?.unrealized_pnl
+    ?? (account as (ContractAccountSummary & { unrealizedPnl?: string | null }) | null)?.unrealizedPnl;
 
   return (
     <div className="tabular-nums text-sm text-white">
@@ -54,6 +56,7 @@ export default function ContractAccountPanel({
             <AccountRow label={t('positionMargin', 'contracts')} value={account?.used_margin || account?.position_margin} />
             <AccountRow label={t('frozenMargin', 'contracts')} value={account?.frozen_margin} />
             <AccountRow label={t('accountEquity', 'contracts')} value={account?.equity} strong />
+            <AccountRow label={t('unrealizedPnl', 'contracts')} value={accountUnrealizedPnl} colored />
             <AccountRow label={t('realizedPnl', 'contracts')} value={account?.realized_pnl} colored />
           </div>
 
