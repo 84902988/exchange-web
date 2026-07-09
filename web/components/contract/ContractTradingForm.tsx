@@ -833,7 +833,7 @@ export default function ContractTradingForm({
       : toNumber(selectedCloseSummary?.margin_amount || selectedClosePosition?.margin_amount || null);
     const confirmSpreadCost = isOpen ? spreadCostHint : closeSpreadCostHint;
     const liquidationPrice = isOpen
-      ? t('generatedAfterOpen', 'contracts')
+      ? '--'
       : selectedCloseSummary
         ? getSummaryLiquidationPrice(selectedCloseSummary, pricePrecision)
         : getPositionLiquidationPrice(selectedClosePosition, pricePrecision);
@@ -1220,11 +1220,12 @@ function OpenPanel({
 
       <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] p-1.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
         <SummaryRow label={t('estimatedExecutionPrice', 'contracts')} value={estimatedExecutionPrice === null ? '--' : `${formatDisplayPrice(estimatedExecutionPrice, pricePrecision)} USDT`} />
-        <SummaryDualRow label={t('notionalValue', 'contracts')} longValue={displayMoney(longNotional, 4)} shortValue={displayMoney(shortNotional, 4)} activeSide={positionSide} />
-        <SummaryDualRow label={t('cost', 'contracts')} longValue={displayMoney(longMargin, 6)} shortValue={displayMoney(shortMargin, 6)} activeSide={positionSide} />
-        <SummaryDualRow label={t('estimatedLiquidationPrice', 'contracts')} longValue={t('generatedAfterOpen', 'contracts')} shortValue={t('generatedAfterOpen', 'contracts')} activeSide={positionSide} muted />
+        <SummaryDualRow label={t('estimatedOpenValue', 'contracts')} longValue={displayMoney(longNotional, 4)} shortValue={displayMoney(shortNotional, 4)} activeSide={positionSide} />
+        <SummaryDualRow label={t('estimatedMargin', 'contracts')} longValue={displayMoney(longMargin, 6)} shortValue={displayMoney(shortMargin, 6)} activeSide={positionSide} />
+        <SummaryDualRow label={t('estimatedLiquidationPrice', 'contracts')} longValue="--" shortValue="--" activeSide={positionSide} muted />
         <SummaryRow label={t('spreadCost', 'contracts')} value={spreadCostHint === null ? '--' : `${formatPrice(spreadCostHint, 2)} USDT`} muted title={spreadHintText} />
         <SummaryRow label={t('currentLeverage', 'contracts')} value={`${leverage}x`} />
+        <SummaryRow label={t('riskNotice', 'contracts')} value={t('riskDataUnavailable', 'contracts')} muted />
       </div>
 
       <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] p-1.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
