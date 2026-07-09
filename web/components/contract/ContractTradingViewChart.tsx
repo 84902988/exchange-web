@@ -191,7 +191,7 @@ export default function ContractTradingViewChart({
         if (cancelled) return;
         setLoadError({
           key: widgetKey,
-          message: 'TradingView widget is unavailable',
+          message: '图表组件暂不可用',
         });
       }, 0);
       return cleanupWidget;
@@ -328,7 +328,7 @@ export default function ContractTradingViewChart({
         onError={() => {
           setLoadError({
             key: widgetKey,
-            message: 'Failed to load TradingView library',
+            message: '图表组件加载失败',
           });
         }}
       />
