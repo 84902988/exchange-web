@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -36,6 +37,21 @@ def _normalize_symbol(symbol: Optional[str]) -> str:
 
 def _normalize_status(status: Optional[str]) -> str:
     return str(status or "").strip().upper()
+
+
+def _parse_datetime_filter(value: Optional[str]) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 def _normalize_page(value: Any) -> int:
@@ -332,6 +348,13 @@ def get_user_contract_orders(
     user_id: int,
     symbol: Optional[str] = None,
     status: Optional[str] = None,
+    status_group: Optional[str] = None,
+    side: Optional[str] = None,
+    position_side: Optional[str] = None,
+    order_type: Optional[str] = None,
+    action: Optional[str] = None,
+    created_from: Optional[str] = None,
+    created_to: Optional[str] = None,
     page: int = 1,
     page_size: int = 20,
 ) -> ContractOrderListResponse:
@@ -344,10 +367,41 @@ def get_user_contract_orders(
         query = query.filter(ContractOrder.symbol == normalized_symbol)
 
     normalized_status = _normalize_status(status)
-    if normalized_status == "ACTIVE":
-        query = query.filter(ContractOrder.status.in_(ACTIVE_ORDER_STATUSES))
-    elif normalized_status and normalized_status != "ALL":
-        query = query.filter(ContractOrder.status == normalized_status)
+    if normalized_status:
+        if normalized_status == "ACTIVE":
+            query = query.filter(ContractOrder.status.in_(ACTIVE_ORDER_STATUSES))
+        elif normalized_status != "ALL":
+            query = query.filter(ContractOrder.status == normalized_status)
+    else:
+        normalized_status_group = _normalize_status(status_group)
+        if normalized_status_group == "ACTIVE":
+            query = query.filter(ContractOrder.status.in_(ACTIVE_ORDER_STATUSES))
+        elif normalized_status_group == "HISTORY":
+            query = query.filter(~ContractOrder.status.in_(ACTIVE_ORDER_STATUSES))
+
+    normalized_side = _normalize_status(side)
+    if normalized_side:
+        query = query.filter(ContractOrder.side == normalized_side)
+
+    normalized_position_side = _normalize_status(position_side)
+    if normalized_position_side:
+        query = query.filter(ContractOrder.position_side == normalized_position_side)
+
+    normalized_order_type = _normalize_status(order_type)
+    if normalized_order_type:
+        query = query.filter(ContractOrder.order_type == normalized_order_type)
+
+    normalized_action = _normalize_status(action)
+    if normalized_action:
+        query = query.filter(ContractOrder.action == normalized_action)
+
+    created_from_dt = _parse_datetime_filter(created_from)
+    if created_from_dt:
+        query = query.filter(ContractOrder.created_at >= created_from_dt)
+
+    created_to_dt = _parse_datetime_filter(created_to)
+    if created_to_dt:
+        query = query.filter(ContractOrder.created_at <= created_to_dt)
 
     has_fee_amount = _table_has_column(db, "contract_orders", "fee_amount")
     total = int(query.count())
@@ -420,6 +474,11 @@ def get_user_contract_trades(
     db: Session,
     user_id: int,
     symbol: Optional[str] = None,
+    side: Optional[str] = None,
+    position_side: Optional[str] = None,
+    action: Optional[str] = None,
+    created_from: Optional[str] = None,
+    created_to: Optional[str] = None,
     page: int = 1,
     page_size: int = 20,
 ) -> ContractTradeListResponse:
@@ -430,6 +489,26 @@ def get_user_contract_trades(
     normalized_symbol = _normalize_symbol(symbol)
     if normalized_symbol:
         query = query.filter(ContractTrade.symbol == normalized_symbol)
+
+    normalized_side = _normalize_status(side)
+    if normalized_side:
+        query = query.filter(ContractTrade.side == normalized_side)
+
+    normalized_position_side = _normalize_status(position_side)
+    if normalized_position_side:
+        query = query.filter(ContractTrade.position_side == normalized_position_side)
+
+    normalized_action = _normalize_status(action)
+    if normalized_action:
+        query = query.filter(ContractTrade.action == normalized_action)
+
+    created_from_dt = _parse_datetime_filter(created_from)
+    if created_from_dt:
+        query = query.filter(ContractTrade.created_at >= created_from_dt)
+
+    created_to_dt = _parse_datetime_filter(created_to)
+    if created_to_dt:
+        query = query.filter(ContractTrade.created_at <= created_to_dt)
 
     has_fee_amount = _table_has_column(db, "contract_trades", "fee_amount")
     total = int(query.count())

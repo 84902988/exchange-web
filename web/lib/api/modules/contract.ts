@@ -704,6 +704,13 @@ export function getContractPositionSummaries(params: {
 export function getContractOrders(params: {
   symbol?: string
   status?: string
+  status_group?: 'ACTIVE' | 'HISTORY' | string
+  side?: string
+  position_side?: string
+  order_type?: string
+  action?: string
+  created_from?: string
+  created_to?: string
   page?: number
   page_size?: number
 } = {}): Promise<ContractOrderListResponse> {
@@ -712,6 +719,11 @@ export function getContractOrders(params: {
 
 export function getContractTrades(params: {
   symbol?: string
+  side?: string
+  position_side?: string
+  action?: string
+  created_from?: string
+  created_to?: string
   page?: number
   page_size?: number
 } = {}): Promise<ContractTradeListResponse> {
