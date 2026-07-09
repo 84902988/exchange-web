@@ -24,6 +24,17 @@ import {
 
 export type ContractUserDataTab = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
 
+export type ContractOrderFilterState = {
+  position_side?: 'LONG' | 'SHORT' | string;
+  order_type?: 'LIMIT' | 'MARKET' | string;
+  action?: 'OPEN' | 'CLOSE' | string;
+};
+
+export type ContractTradeFilterState = {
+  position_side?: 'LONG' | 'SHORT' | string;
+  action?: 'OPEN' | 'CLOSE' | string;
+};
+
 type UseContractUserStateParams = {
   contractSymbol: string;
   dataScope?: 'current' | 'all';
@@ -71,16 +82,45 @@ function getListCacheSymbol(scope: ContractDataScope, symbol: string) {
   return getScopedSymbol(scope, symbol) || 'all';
 }
 
-function getOrdersCacheKey(scope: ContractDataScope, symbol: string, page = 1) {
-  return `orders:${getListCacheSymbol(scope, symbol)}:${page}`;
+function normalizeFilterValue(value: string | null | undefined) {
+  const normalized = String(value || '').trim().toUpperCase();
+  return normalized || undefined;
 }
 
-function getActiveOrdersCacheKey(scope: ContractDataScope, symbol: string, page = 1) {
-  return `active-orders:${getListCacheSymbol(scope, symbol)}:${page}`;
+function normalizeOrderFilters(filters: ContractOrderFilterState): ContractOrderFilterState {
+  return {
+    position_side: normalizeFilterValue(filters.position_side),
+    order_type: normalizeFilterValue(filters.order_type),
+    action: normalizeFilterValue(filters.action),
+  };
 }
 
-function getTradesCacheKey(scope: ContractDataScope, symbol: string, page = 1) {
-  return `trades:${getListCacheSymbol(scope, symbol)}:${page}`;
+function normalizeTradeFilters(filters: ContractTradeFilterState): ContractTradeFilterState {
+  return {
+    position_side: normalizeFilterValue(filters.position_side),
+    action: normalizeFilterValue(filters.action),
+  };
+}
+
+function getFilterCachePart(filters: Record<string, string | null | undefined>) {
+  const entries = Object.entries(filters)
+    .map(([key, value]) => [key, normalizeFilterValue(value)] as const)
+    .filter((entry): entry is readonly [string, string] => !!entry[1])
+    .sort(([left], [right]) => left.localeCompare(right));
+  if (entries.length === 0) return 'none';
+  return entries.map(([key, value]) => `${key}:${value}`).join('|');
+}
+
+function getOrdersCacheKey(scope: ContractDataScope, symbol: string, page = 1, filters: ContractOrderFilterState = {}) {
+  return `orders:${getListCacheSymbol(scope, symbol)}:${page}:${getFilterCachePart(filters)}`;
+}
+
+function getActiveOrdersCacheKey(scope: ContractDataScope, symbol: string, page = 1, filters: ContractOrderFilterState = {}) {
+  return `active-orders:${getListCacheSymbol(scope, symbol)}:${page}:${getFilterCachePart(filters)}`;
+}
+
+function getTradesCacheKey(scope: ContractDataScope, symbol: string, page = 1, filters: ContractTradeFilterState = {}) {
+  return `trades:${getListCacheSymbol(scope, symbol)}:${page}:${getFilterCachePart(filters)}`;
 }
 
 function getSafePage(page: number) {
@@ -369,6 +409,9 @@ export function useContractUserState({
   const [activeOrdersPage, setActiveOrdersPage] = useState(1);
   const [orderHistoryPage, setOrderHistoryPage] = useState(1);
   const [tradeHistoryPage, setTradeHistoryPage] = useState(1);
+  const [activeOrdersFilters, setActiveOrdersFilters] = useState<ContractOrderFilterState>({});
+  const [orderHistoryFilters, setOrderHistoryFilters] = useState<ContractOrderFilterState>({});
+  const [tradeHistoryFilters, setTradeHistoryFilters] = useState<ContractTradeFilterState>({});
   const [activeOrdersPaginationMeta, setActiveOrdersPaginationMeta] = useState<ListPaginationMeta>(() => ({
     total: 0,
     pageSize: CONTRACT_ORDER_TRADE_PAGE_SIZE,
@@ -401,16 +444,16 @@ export function useContractUserState({
     [contractSymbol, dataScope],
   );
   const activeOrdersScopeKey = useMemo(
-    () => getActiveOrdersCacheKey(dataScope, contractSymbol, activeOrdersPage),
-    [activeOrdersPage, contractSymbol, dataScope],
+    () => getActiveOrdersCacheKey(dataScope, contractSymbol, activeOrdersPage, activeOrdersFilters),
+    [activeOrdersFilters, activeOrdersPage, contractSymbol, dataScope],
   );
   const activeOrdersCacheKey = useMemo(
-    () => getOrdersCacheKey(dataScope, contractSymbol, orderHistoryPage),
-    [contractSymbol, dataScope, orderHistoryPage],
+    () => getOrdersCacheKey(dataScope, contractSymbol, orderHistoryPage, orderHistoryFilters),
+    [contractSymbol, dataScope, orderHistoryFilters, orderHistoryPage],
   );
   const activeTradesCacheKey = useMemo(
-    () => getTradesCacheKey(dataScope, contractSymbol, tradeHistoryPage),
-    [contractSymbol, dataScope, tradeHistoryPage],
+    () => getTradesCacheKey(dataScope, contractSymbol, tradeHistoryPage, tradeHistoryFilters),
+    [contractSymbol, dataScope, tradeHistoryFilters, tradeHistoryPage],
   );
   const activePositionScopeKeyRef = useRef(activePositionScopeKey);
   const activeOrdersScopeKeyRef = useRef(activeOrdersScopeKey);
@@ -567,9 +610,27 @@ export function useContractUserState({
     const requestedActiveOrdersPage = getSafePage(activeOrdersPage);
     const requestedOrderHistoryPage = getSafePage(orderHistoryPage);
     const requestedTradeHistoryPage = getSafePage(tradeHistoryPage);
-    const activeOrdersScopeKey = getActiveOrdersCacheKey(requestedScope, contractSymbol, requestedActiveOrdersPage);
-    const ordersCacheKey = getOrdersCacheKey(requestedScope, contractSymbol, requestedOrderHistoryPage);
-    const tradesCacheKey = getTradesCacheKey(requestedScope, contractSymbol, requestedTradeHistoryPage);
+    const requestedActiveOrdersFilters = activeOrdersFilters;
+    const requestedOrderHistoryFilters = orderHistoryFilters;
+    const requestedTradeHistoryFilters = tradeHistoryFilters;
+    const activeOrdersScopeKey = getActiveOrdersCacheKey(
+      requestedScope,
+      contractSymbol,
+      requestedActiveOrdersPage,
+      requestedActiveOrdersFilters,
+    );
+    const ordersCacheKey = getOrdersCacheKey(
+      requestedScope,
+      contractSymbol,
+      requestedOrderHistoryPage,
+      requestedOrderHistoryFilters,
+    );
+    const tradesCacheKey = getTradesCacheKey(
+      requestedScope,
+      contractSymbol,
+      requestedTradeHistoryPage,
+      requestedTradeHistoryFilters,
+    );
     const shouldRequestActiveOrders = requestedActiveTab === 'openOrders';
     const shouldRequestOrderHistory = requestedActiveTab === 'historyOrders';
     const shouldRequestTrades = requestedActiveTab === 'trades';
@@ -610,6 +671,9 @@ export function useContractUserState({
           ? getContractOrders({
               symbol: scopedSymbol,
               status: 'ACTIVE',
+              position_side: requestedActiveOrdersFilters.position_side,
+              order_type: requestedActiveOrdersFilters.order_type,
+              action: requestedActiveOrdersFilters.action,
               page: requestedActiveOrdersPage,
               page_size: CONTRACT_ORDER_TRADE_PAGE_SIZE,
             })
@@ -617,6 +681,10 @@ export function useContractUserState({
         shouldRequestOrderHistory
           ? getContractOrders({
               symbol: scopedSymbol,
+              status_group: 'HISTORY',
+              position_side: requestedOrderHistoryFilters.position_side,
+              order_type: requestedOrderHistoryFilters.order_type,
+              action: requestedOrderHistoryFilters.action,
               page: requestedOrderHistoryPage,
               page_size: CONTRACT_ORDER_TRADE_PAGE_SIZE,
             })
@@ -624,6 +692,8 @@ export function useContractUserState({
         shouldRequestTrades
           ? getContractTrades({
               symbol: scopedSymbol,
+              position_side: requestedTradeHistoryFilters.position_side,
+              action: requestedTradeHistoryFilters.action,
               page: requestedTradeHistoryPage,
               page_size: CONTRACT_ORDER_TRADE_PAGE_SIZE,
             })
@@ -745,6 +815,7 @@ export function useContractUserState({
     }
   }, [
     activeOrdersPage,
+    activeOrdersFilters,
     activeTab,
     applyActiveOrdersCache,
     applyOrdersCache,
@@ -753,9 +824,11 @@ export function useContractUserState({
     dataScope,
     isLoggedIn,
     onErrorChange,
+    orderHistoryFilters,
     orderHistoryPage,
     prefetchAllPositionScope,
     t,
+    tradeHistoryFilters,
     tradeHistoryPage,
   ]);
 
@@ -1068,6 +1141,21 @@ export function useContractUserState({
     setTradeHistoryPage(getSafePage(page));
   }, []);
 
+  const handleActiveOrdersFiltersChange = useCallback((filters: ContractOrderFilterState) => {
+    setActiveOrdersFilters(normalizeOrderFilters(filters));
+    setActiveOrdersPage(1);
+  }, []);
+
+  const handleOrderHistoryFiltersChange = useCallback((filters: ContractOrderFilterState) => {
+    setOrderHistoryFilters(normalizeOrderFilters(filters));
+    setOrderHistoryPage(1);
+  }, []);
+
+  const handleTradeHistoryFiltersChange = useCallback((filters: ContractTradeFilterState) => {
+    setTradeHistoryFilters(normalizeTradeFilters(filters));
+    setTradeHistoryPage(1);
+  }, []);
+
   const openPositionsForTrading = useMemo(
     () => positions.filter((item) => (
       item.status === 'OPEN' &&
@@ -1084,6 +1172,9 @@ export function useContractUserState({
     activeOrders,
     orders,
     trades,
+    activeOrdersFilters,
+    orderHistoryFilters,
+    tradeHistoryFilters,
     privateLoading,
     isScopeSwitching,
     isAllPositionsLoading,
@@ -1111,5 +1202,8 @@ export function useContractUserState({
       pageSize: tradeHistoryPaginationMeta.pageSize,
       onPageChange: handleTradeHistoryPageChange,
     },
+    onActiveOrdersFiltersChange: handleActiveOrdersFiltersChange,
+    onOrderHistoryFiltersChange: handleOrderHistoryFiltersChange,
+    onTradeHistoryFiltersChange: handleTradeHistoryFiltersChange,
   };
 }

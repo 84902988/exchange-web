@@ -525,6 +525,9 @@ function ContractPageContent() {
     activeOrders,
     orders,
     trades,
+    activeOrdersFilters,
+    orderHistoryFilters,
+    tradeHistoryFilters,
     privateLoading,
     isScopeSwitching,
     isAllPositionsLoading,
@@ -537,6 +540,9 @@ function ContractPageContent() {
     activeOrdersPagination,
     orderHistoryPagination,
     tradeHistoryPagination,
+    onActiveOrdersFiltersChange,
+    onOrderHistoryFiltersChange,
+    onTradeHistoryFiltersChange,
   } = useContractUserState({
     contractSymbol,
     dataScope: contractDataScope,
@@ -859,6 +865,12 @@ function ContractPageContent() {
                   activeOrdersPagination={activeOrdersPagination}
                   orderHistoryPagination={orderHistoryPagination}
                   tradeHistoryPagination={tradeHistoryPagination}
+                  activeOrdersFilters={activeOrdersFilters}
+                  orderHistoryFilters={orderHistoryFilters}
+                  tradeHistoryFilters={tradeHistoryFilters}
+                  onActiveOrdersFiltersChange={onActiveOrdersFiltersChange}
+                  onOrderHistoryFiltersChange={onOrderHistoryFiltersChange}
+                  onTradeHistoryFiltersChange={onTradeHistoryFiltersChange}
                   onActiveTabChange={setContractUserTab}
                   onSymbolSelect={(symbol) => selectContractSymbol(symbol)}
                   onScopeChange={setContractDataScope}

@@ -28,6 +28,7 @@ import ContractOrderTabs, {
 } from './ContractOrderTabs';
 import { formatPrice as formatMarketPrice, formatRawPrice as formatRawMarketPrice } from '@/lib/marketPrecision';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import type { ContractOrderFilterState, ContractTradeFilterState } from './hooks/useContractUserState';
 
 export type ContractPositionTabKey = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
 type TabKey = ContractPositionTabKey;
@@ -39,6 +40,15 @@ type ServerPaginationState = {
   total: number;
   pageSize: number;
   onPageChange: (page: number) => void;
+};
+type FilterOption = {
+  value: string;
+  label: string;
+};
+type FilterGroup<T extends string> = {
+  key: T;
+  label: string;
+  options: FilterOption[];
 };
 type OrderFeedback = {
   type: 'success' | 'error';
@@ -83,6 +93,12 @@ type ContractPositionTabsProps = {
   activeOrdersPagination?: ServerPaginationState;
   orderHistoryPagination?: ServerPaginationState;
   tradeHistoryPagination?: ServerPaginationState;
+  activeOrdersFilters?: ContractOrderFilterState;
+  orderHistoryFilters?: ContractOrderFilterState;
+  tradeHistoryFilters?: ContractTradeFilterState;
+  onActiveOrdersFiltersChange?: (filters: ContractOrderFilterState) => void;
+  onOrderHistoryFiltersChange?: (filters: ContractOrderFilterState) => void;
+  onTradeHistoryFiltersChange?: (filters: ContractTradeFilterState) => void;
   onActiveTabChange?: (tab: ContractPositionTabKey) => void;
   onSymbolSelect?: (symbol: string) => void;
   onScopeChange?: (scope: PositionScope) => void;
@@ -170,6 +186,12 @@ export default function ContractPositionTabs({
   activeOrdersPagination,
   orderHistoryPagination,
   tradeHistoryPagination,
+  activeOrdersFilters,
+  orderHistoryFilters,
+  tradeHistoryFilters,
+  onActiveOrdersFiltersChange,
+  onOrderHistoryFiltersChange,
+  onTradeHistoryFiltersChange,
   onActiveTabChange,
   onSymbolSelect,
   onScopeChange,
@@ -212,11 +234,35 @@ export default function ContractPositionTabs({
     () => activeOrders ?? orders.filter((item) => item.status === 'OPEN' || item.status === 'NEW' || item.status === 'PENDING' || item.status === 'PARTIALLY_FILLED'),
     [activeOrders, orders],
   );
-  // TODO(P1-4-B): replace with backend history status filter
+  // Backend history filtering is driven by status_group=HISTORY; keep this guard for older responses.
   const historyOrders = useMemo(
     () => orders.filter((item) => item.status !== 'OPEN' && item.status !== 'NEW' && item.status !== 'PENDING' && item.status !== 'PARTIALLY_FILLED'),
     [orders],
   );
+  const directionFilterOptions = useMemo(() => [
+    { value: '', label: t('filterAll', 'contracts') },
+    { value: 'LONG', label: t('long', 'contracts') },
+    { value: 'SHORT', label: t('short', 'contracts') },
+  ], [t]);
+  const orderTypeFilterOptions = useMemo(() => [
+    { value: '', label: t('filterAll', 'contracts') },
+    { value: 'LIMIT', label: t('limit', 'contracts') },
+    { value: 'MARKET', label: t('market', 'contracts') },
+  ], [t]);
+  const actionFilterOptions = useMemo(() => [
+    { value: '', label: t('filterAll', 'contracts') },
+    { value: 'OPEN', label: t('openPosition', 'contracts') },
+    { value: 'CLOSE', label: t('closePosition', 'contracts') },
+  ], [t]);
+  const orderFilterGroups = useMemo<Array<FilterGroup<keyof ContractOrderFilterState>>>(() => [
+    { key: 'position_side', label: t('direction', 'contracts'), options: directionFilterOptions },
+    { key: 'order_type', label: t('filterOrderType', 'contracts'), options: orderTypeFilterOptions },
+    { key: 'action', label: t('filterAction', 'contracts'), options: actionFilterOptions },
+  ], [actionFilterOptions, directionFilterOptions, orderTypeFilterOptions, t]);
+  const tradeFilterGroups = useMemo<Array<FilterGroup<keyof ContractTradeFilterState>>>(() => [
+    { key: 'position_side', label: t('direction', 'contracts'), options: directionFilterOptions },
+    { key: 'action', label: t('filterAction', 'contracts'), options: actionFilterOptions },
+  ], [actionFilterOptions, directionFilterOptions, t]);
   const normalizedCurrentSymbol = useMemo(() => normalizeContractSymbol(currentSymbol), [currentSymbol]);
   const allOpenPositions = useMemo(
     () => positions.filter((item) => item.status === 'OPEN' && getPositionAmount(item) > 0),
@@ -793,6 +839,11 @@ export default function ContractPositionTabs({
         {activeTab === 'openOrders' ? (
           <>
             {orderFeedback ? <OrderFeedbackBox feedback={orderFeedback} /> : null}
+            <OrderTradeFilterBar
+              groups={orderFilterGroups}
+              values={activeOrdersFilters}
+              onChange={(key, value) => setOrderFilterValue(activeOrdersFilters, onActiveOrdersFiltersChange, key, value)}
+            />
             <ContractOrderTabs
               rows={pagedOpenOrders}
               emptyText={t('emptyOpenOrders', 'contracts')}
@@ -812,6 +863,11 @@ export default function ContractPositionTabs({
         ) : null}
         {activeTab === 'historyOrders' ? (
           <>
+            <OrderTradeFilterBar
+              groups={orderFilterGroups}
+              values={orderHistoryFilters}
+              onChange={(key, value) => setOrderFilterValue(orderHistoryFilters, onOrderHistoryFiltersChange, key, value)}
+            />
             <ContractOrderTabs
               rows={pagedHistoryOrders}
               emptyText={t('emptyHistoryOrders', 'contracts')}
@@ -831,6 +887,11 @@ export default function ContractPositionTabs({
         ) : null}
         {activeTab === 'trades' ? (
           <>
+            <OrderTradeFilterBar
+              groups={tradeFilterGroups}
+              values={tradeHistoryFilters}
+              onChange={(key, value) => setTradeFilterValue(tradeHistoryFilters, onTradeHistoryFiltersChange, key, value)}
+            />
             <TradesTable rows={pagedTrades} pricePrecision={pricePrecision} loading={isTradesTabLoading} />
             <PaginationControls
               page={tradeHistoryPagination?.page ?? pages.trades}
@@ -928,6 +989,77 @@ function filterRowsByScope<T extends { symbol?: string | null }>(
 
 function getTotalPages(totalItems: number, size: number) {
   return Math.max(1, Math.ceil(totalItems / size));
+}
+
+function setOrderFilterValue(
+  filters: ContractOrderFilterState | undefined,
+  onChange: ((filters: ContractOrderFilterState) => void) | undefined,
+  key: keyof ContractOrderFilterState,
+  value: string,
+) {
+  if (!onChange) return;
+  const next = { ...(filters || {}) };
+  if (value) {
+    next[key] = value;
+  } else {
+    delete next[key];
+  }
+  onChange(next);
+}
+
+function setTradeFilterValue(
+  filters: ContractTradeFilterState | undefined,
+  onChange: ((filters: ContractTradeFilterState) => void) | undefined,
+  key: keyof ContractTradeFilterState,
+  value: string,
+) {
+  if (!onChange) return;
+  const next = { ...(filters || {}) };
+  if (value) {
+    next[key] = value;
+  } else {
+    delete next[key];
+  }
+  onChange(next);
+}
+
+function OrderTradeFilterBar<T extends string>({
+  groups,
+  values,
+  onChange,
+}: {
+  groups: Array<FilterGroup<T>>;
+  values?: Partial<Record<T, string | undefined>>;
+  onChange: (key: T, value: string) => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-b border-white/5 px-3 py-2 text-[12px] text-white/55">
+      {groups.map((group) => (
+        <div key={group.key} className="flex items-center gap-1.5">
+          <span className="shrink-0 text-white/40">{group.label}</span>
+          <div className="flex items-center gap-1">
+            {group.options.map((option) => {
+              const active = (values?.[group.key] || '') === option.value;
+              return (
+                <button
+                  key={option.value || 'all'}
+                  type="button"
+                  onClick={() => onChange(group.key, option.value)}
+                  className={`h-6 rounded-md px-2 text-[12px] transition-colors ${
+                    active
+                      ? 'bg-white text-black'
+                      : 'bg-white/[0.04] text-white/60 hover:bg-white/[0.08] hover:text-white'
+                  }`}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function PaginationControls({
