@@ -33,9 +33,9 @@ export function buildMarketStatusBadgeText({
   const sessionType = String(marketSessionType || '').toUpperCase();
 
   const unknownText = marketText(t, 'market.session.unknown', 'Status unknown');
-  const lastQuoteText = marketText(t, 'market.session.lastQuote', 'Last quote');
-  const cachedQuoteText = marketText(t, 'market.session.cachedQuote', 'Cached quote');
-  const delayedQuoteText = marketText(t, 'market.session.delayedQuote', 'Delayed quote');
+  const lastQuoteText = marketText(t, 'market.session.lastQuote', '最后报价');
+  const cachedQuoteText = marketText(t, 'market.session.cachedQuote', '缓存报价');
+  const delayedQuoteText = marketText(t, 'market.session.delayedQuote', '行情延迟');
 
   if (status === 'UNKNOWN' || !status) return unknownText;
   if (status === 'HOLIDAY' || sessionType === 'HOLIDAY') {
@@ -49,7 +49,7 @@ export function buildMarketStatusBadgeText({
   }
 
   if (status === 'OPEN') {
-    const openText = marketText(t, 'market.session.open', 'Trading');
+    const openText = marketText(t, 'market.session.open', '交易中');
     if (freshness === 'STALE') return withMarketDetail(openText, delayedQuoteText);
     if (freshness === 'LAST_VALID') return withMarketDetail(openText, cachedQuoteText);
     if (freshness === 'FALLBACK') return withMarketDetail(openText, cachedQuoteText);
@@ -57,7 +57,7 @@ export function buildMarketStatusBadgeText({
   }
 
   if (status === 'CLOSED') {
-    const closedText = marketText(t, 'market.session.closed', 'Closed');
+    const closedText = marketText(t, 'market.session.closed', '已休市');
     if (freshness === 'FALLBACK') return withMarketDetail(closedText, cachedQuoteText);
     return withMarketDetail(closedText, lastQuoteText);
   }
