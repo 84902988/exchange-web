@@ -8,7 +8,9 @@ import ContractFuturesTrades from '@/components/contract/ContractFuturesTrades';
 import ContractMarketHeader, {
   type HeaderMetric,
 } from '@/components/contract/ContractMarketHeader';
-import ContractPositionTabs from '@/components/contract/ContractPositionTabs';
+import ContractPositionTabs, {
+  type ContractPositionTabKey,
+} from '@/components/contract/ContractPositionTabs';
 import ContractTradingForm from '@/components/contract/ContractTradingForm';
 import ContractTradingViewChart from '@/components/contract/ContractTradingViewChart';
 import { useContractMarketView } from '@/components/contract/hooks/useContractMarketView';
@@ -347,6 +349,7 @@ function ContractPageContent() {
   const [interval, setIntervalValue] = useState('1m');
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
   const [contractDataScope, setContractDataScope] = useState<ContractDataScope>('current');
+  const [contractUserTab, setContractUserTab] = useState<ContractPositionTabKey>('positions');
   const [selectedPrice, setSelectedPrice] = useState<string | null>(null);
   const [contractPairs, setContractPairs] = useState<GlobalMarketSelectorPair[]>(() => [
     getFallbackContractPair(DEFAULT_CONTRACT_SYMBOL, 1, t),
@@ -531,9 +534,13 @@ function ContractPageContent() {
     realtimeStatus,
     openPositionsForTrading,
     refreshPrivateSilently,
+    activeOrdersPagination,
+    orderHistoryPagination,
+    tradeHistoryPagination,
   } = useContractUserState({
     contractSymbol,
     dataScope: contractDataScope,
+    activeTab: contractUserTab,
     isLoggedIn,
     onErrorChange: setError,
   });
@@ -849,6 +856,10 @@ function ContractPageContent() {
                   isOrdersLoading={isOrdersLoading}
                   isTradesLoading={isTradesLoading}
                   realtimeStatus={realtimeStatus}
+                  activeOrdersPagination={activeOrdersPagination}
+                  orderHistoryPagination={orderHistoryPagination}
+                  tradeHistoryPagination={tradeHistoryPagination}
+                  onActiveTabChange={setContractUserTab}
                   onSymbolSelect={(symbol) => selectContractSymbol(symbol)}
                   onScopeChange={setContractDataScope}
                   onSuccess={refreshPrivateSilently}

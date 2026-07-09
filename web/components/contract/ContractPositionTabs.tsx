@@ -29,10 +29,17 @@ import ContractOrderTabs, {
 import { formatPrice as formatMarketPrice, formatRawPrice as formatRawMarketPrice } from '@/lib/marketPrecision';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 
-type TabKey = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
+export type ContractPositionTabKey = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
+type TabKey = ContractPositionTabKey;
 type PositionScope = 'current' | 'all';
 type ContractRealtimeStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 type ContractTranslator = (key: string, namespace?: 'contracts') => string;
+type ServerPaginationState = {
+  page: number;
+  total: number;
+  pageSize: number;
+  onPageChange: (page: number) => void;
+};
 type OrderFeedback = {
   type: 'success' | 'error';
   message: string;
@@ -73,6 +80,10 @@ type ContractPositionTabsProps = {
   isOrdersLoading?: boolean;
   isTradesLoading?: boolean;
   realtimeStatus?: ContractRealtimeStatus;
+  activeOrdersPagination?: ServerPaginationState;
+  orderHistoryPagination?: ServerPaginationState;
+  tradeHistoryPagination?: ServerPaginationState;
+  onActiveTabChange?: (tab: ContractPositionTabKey) => void;
   onSymbolSelect?: (symbol: string) => void;
   onScopeChange?: (scope: PositionScope) => void;
   onSuccess: () => Promise<void> | void;
@@ -156,6 +167,10 @@ export default function ContractPositionTabs({
   isOrdersLoading = false,
   isTradesLoading = false,
   realtimeStatus = 'idle',
+  activeOrdersPagination,
+  orderHistoryPagination,
+  tradeHistoryPagination,
+  onActiveTabChange,
   onSymbolSelect,
   onScopeChange,
   onSuccess,
@@ -197,6 +212,7 @@ export default function ContractPositionTabs({
     () => activeOrders ?? orders.filter((item) => item.status === 'OPEN' || item.status === 'NEW' || item.status === 'PENDING' || item.status === 'PARTIALLY_FILLED'),
     [activeOrders, orders],
   );
+  // TODO(P1-4-B): replace with backend history status filter
   const historyOrders = useMemo(
     () => orders.filter((item) => item.status !== 'OPEN' && item.status !== 'NEW' && item.status !== 'PENDING' && item.status !== 'PARTIALLY_FILLED'),
     [orders],
@@ -259,25 +275,28 @@ export default function ContractPositionTabs({
     [pages.historyPositions, scopedHistoryPositions],
   );
   const pagedOpenOrders = useMemo(
-    () => paginateItems(scopedOpenOrders, pages.openOrders, pageSize),
-    [pages.openOrders, scopedOpenOrders],
+    () => activeOrdersPagination ? scopedOpenOrders : paginateItems(scopedOpenOrders, pages.openOrders, pageSize),
+    [activeOrdersPagination, pages.openOrders, scopedOpenOrders],
   );
   const pagedHistoryOrders = useMemo(
-    () => paginateItems(scopedHistoryOrders, pages.historyOrders, pageSize),
-    [pages.historyOrders, scopedHistoryOrders],
+    () => orderHistoryPagination ? scopedHistoryOrders : paginateItems(scopedHistoryOrders, pages.historyOrders, pageSize),
+    [orderHistoryPagination, pages.historyOrders, scopedHistoryOrders],
   );
   const pagedTrades = useMemo(
-    () => paginateItems(scopedTrades, pages.trades, pageSize),
-    [pages.trades, scopedTrades],
+    () => tradeHistoryPagination ? scopedTrades : paginateItems(scopedTrades, pages.trades, pageSize),
+    [pages.trades, scopedTrades, tradeHistoryPagination],
   );
   const isPositionsScopeLoading = activeTab === 'positions' && isScopeSwitching;
   const isAllScopeRefreshing = scope === 'all' && isAllPositionsLoading && !isScopeSwitching;
+  const isOpenOrdersTabLoading = activeTab === 'openOrders' && isOrdersLoading;
   const isHistoryOrdersTabLoading = activeTab === 'historyOrders' && isOrdersLoading;
   const isTradesTabLoading = activeTab === 'trades' && isTradesLoading;
   const statusText = isPositionsScopeLoading
     ? scope === 'all'
       ? t('positionsLoadingAll', 'contracts')
       : t('positionsLoadingCurrent', 'contracts')
+    : isOpenOrdersTabLoading
+      ? t('ordersUpdating', 'contracts')
     : isHistoryOrdersTabLoading
       ? scopedHistoryOrders.length > 0
         ? t('ordersUpdating', 'contracts')
@@ -344,7 +363,8 @@ export default function ContractPositionTabs({
 
   function selectTab(tab: TabKey) {
     setActiveTab(tab);
-    setPages((previous) => ({ ...previous, [tab]: 1 }));
+    onActiveTabChange?.(tab);
+    setTabPage(tab, 1);
   }
 
   function changeScope(nextScope: PositionScope) {
@@ -353,9 +373,21 @@ export default function ContractPositionTabs({
   }
 
   function setTabPage(tab: TabKey, page: number) {
+    const safePage = Math.max(1, page);
+    const serverPagination = tab === 'openOrders'
+      ? activeOrdersPagination
+      : tab === 'historyOrders'
+        ? orderHistoryPagination
+        : tab === 'trades'
+          ? tradeHistoryPagination
+          : null;
+    if (serverPagination) {
+      serverPagination.onPageChange(safePage);
+      return;
+    }
     setPages((previous) => ({
       ...previous,
-      [tab]: Math.max(1, page),
+      [tab]: safePage,
     }));
   }
 
@@ -765,15 +797,15 @@ export default function ContractPositionTabs({
               rows={pagedOpenOrders}
               emptyText={t('emptyOpenOrders', 'contracts')}
               pricePrecision={pricePrecision}
-              loading={loading}
+              loading={isOpenOrdersTabLoading}
               showOperation
               cancelingOrderId={cancelingOrderId}
               onCancel={cancelOrder}
             />
             <PaginationControls
-              page={pages.openOrders}
-              totalItems={scopedOpenOrders.length}
-              pageSize={pageSize}
+              page={activeOrdersPagination?.page ?? pages.openOrders}
+              totalItems={activeOrdersPagination?.total ?? scopedOpenOrders.length}
+              pageSize={activeOrdersPagination?.pageSize ?? pageSize}
               onPageChange={(page) => setTabPage('openOrders', page)}
             />
           </>
@@ -790,9 +822,9 @@ export default function ContractPositionTabs({
               positions={positions}
             />
             <PaginationControls
-              page={pages.historyOrders}
-              totalItems={scopedHistoryOrders.length}
-              pageSize={pageSize}
+              page={orderHistoryPagination?.page ?? pages.historyOrders}
+              totalItems={orderHistoryPagination?.total ?? scopedHistoryOrders.length}
+              pageSize={orderHistoryPagination?.pageSize ?? pageSize}
               onPageChange={(page) => setTabPage('historyOrders', page)}
             />
           </>
@@ -801,9 +833,9 @@ export default function ContractPositionTabs({
           <>
             <TradesTable rows={pagedTrades} pricePrecision={pricePrecision} loading={isTradesTabLoading} />
             <PaginationControls
-              page={pages.trades}
-              totalItems={scopedTrades.length}
-              pageSize={pageSize}
+              page={tradeHistoryPagination?.page ?? pages.trades}
+              totalItems={tradeHistoryPagination?.total ?? scopedTrades.length}
+              pageSize={tradeHistoryPagination?.pageSize ?? pageSize}
               onPageChange={(page) => setTabPage('trades', page)}
             />
           </>
