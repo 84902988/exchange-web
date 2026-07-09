@@ -435,7 +435,11 @@ export type ContractPositionItem = {
   open_fee: string
   unrealized_pnl: string
   realized_pnl: string
-  liquidation_price: string
+  liquidation_price?: string | null
+  roe?: string | null
+  margin_ratio?: string | null
+  liquidation_distance?: string | null
+  liquidation_distance_rate?: string | null
   warning_price: string
   take_profit_price?: string | null
   stop_loss_price?: string | null
@@ -467,11 +471,17 @@ export type ContractPositionTpSlMode = 'NONE' | 'SINGLE' | 'MIXED'
 export type ContractPositionSummaryItem = {
   symbol: string
   side: string
+  leverage?: number | null
   quantity: string
   avg_entry_price: string
+  mark_price?: string | null
   margin_amount: string
   unrealized_pnl: string
-  liquidation_price: string
+  liquidation_price?: string | null
+  roe?: string | null
+  margin_ratio?: string | null
+  liquidation_distance?: string | null
+  liquidation_distance_rate?: string | null
   position_ids: number[]
   count: number
   take_profit_price?: string | null

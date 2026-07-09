@@ -83,6 +83,12 @@ def _fmt_decimal(value: Any) -> str:
     return format(_d(value), "f")
 
 
+def _fmt_optional_decimal(value: Optional[Decimal]) -> Optional[str]:
+    if value is None:
+        return None
+    return _fmt_decimal(value)
+
+
 def _fmt_compact_decimal(value: Any) -> str:
     text = format(_d(value), "f")
     if "." not in text:
@@ -156,6 +162,57 @@ def _summary_liquidation_price(side: str, avg_entry_price: Decimal, margin_amoun
     return liquidation_price if liquidation_price > 0 else Decimal("0")
 
 
+def _position_display_liquidation_price(position: ContractPosition) -> Optional[Decimal]:
+    stored_liquidation_price = _d(position.liquidation_price)
+    if stored_liquidation_price > 0:
+        return stored_liquidation_price
+    return None
+
+
+def _summary_display_liquidation_price(positions: list[ContractPosition]) -> Optional[Decimal]:
+    values = {
+        _d(position.liquidation_price)
+        for position in positions
+        if _d(position.liquidation_price) > 0
+    }
+    if len(values) == 1:
+        return next(iter(values))
+    return None
+
+
+def _position_risk_metrics(
+    *,
+    side: str,
+    quantity: Decimal,
+    mark_price: Decimal,
+    margin_amount: Decimal,
+    unrealized_pnl: Decimal,
+    liquidation_price: Optional[Decimal],
+) -> dict[str, Optional[Decimal]]:
+    abs_quantity = abs(quantity)
+    roe = unrealized_pnl / margin_amount * Decimal("100") if margin_amount > 0 else None
+    notional = mark_price * abs_quantity
+    margin_ratio = margin_amount / notional * Decimal("100") if notional > 0 else None
+
+    liquidation_distance: Optional[Decimal] = None
+    liquidation_distance_rate: Optional[Decimal] = None
+    normalized_side = _normalize_status(side)
+    if liquidation_price is not None and mark_price > 0 and liquidation_price > 0:
+        if normalized_side == "LONG":
+            liquidation_distance = mark_price - liquidation_price
+        elif normalized_side == "SHORT":
+            liquidation_distance = liquidation_price - mark_price
+        if liquidation_distance is not None:
+            liquidation_distance_rate = liquidation_distance / mark_price * Decimal("100")
+
+    return {
+        "roe": roe,
+        "margin_ratio": margin_ratio,
+        "liquidation_distance": liquidation_distance,
+        "liquidation_distance_rate": liquidation_distance_rate,
+    }
+
+
 def _position_trade_summaries(
     db: Session,
     user_id: int,
@@ -226,6 +283,15 @@ def get_user_contract_positions(
     items: list[ContractPositionItem] = []
     for position in rows:
         mark_price, unrealized_pnl = _position_mark_and_pnl(db, position)
+        liquidation_price = _position_display_liquidation_price(position)
+        risk_metrics = _position_risk_metrics(
+            side=position.side,
+            quantity=_d(position.quantity),
+            mark_price=mark_price,
+            margin_amount=_d(position.margin_amount),
+            unrealized_pnl=unrealized_pnl,
+            liquidation_price=liquidation_price,
+        )
         trade_summary = trade_summaries.get(int(position.id), {})
         closed_quantity = _d(trade_summary.get("closed_quantity"))
         close_avg_price = (
@@ -247,7 +313,11 @@ def get_user_contract_positions(
                 open_fee=_fmt_decimal(position.open_fee),
                 unrealized_pnl=_fmt_decimal(unrealized_pnl),
                 realized_pnl=_fmt_decimal(position.realized_pnl),
-                liquidation_price=_fmt_decimal(position.liquidation_price),
+                liquidation_price=_fmt_optional_decimal(liquidation_price),
+                roe=_fmt_optional_decimal(risk_metrics["roe"]),
+                margin_ratio=_fmt_optional_decimal(risk_metrics["margin_ratio"]),
+                liquidation_distance=_fmt_optional_decimal(risk_metrics["liquidation_distance"]),
+                liquidation_distance_rate=_fmt_optional_decimal(risk_metrics["liquidation_distance_rate"]),
                 warning_price=_fmt_decimal(position.warning_price),
                 take_profit_price=_fmt_decimal(position.take_profit_price) if position.take_profit_price is not None else None,
                 stop_loss_price=_fmt_decimal(position.stop_loss_price) if position.stop_loss_price is not None else None,
@@ -316,6 +386,15 @@ def get_user_contract_positions_page(
     items: list[ContractPositionItem] = []
     for position in rows:
         mark_price, unrealized_pnl = _position_mark_and_pnl(db, position)
+        liquidation_price = _position_display_liquidation_price(position)
+        risk_metrics = _position_risk_metrics(
+            side=position.side,
+            quantity=_d(position.quantity),
+            mark_price=mark_price,
+            margin_amount=_d(position.margin_amount),
+            unrealized_pnl=unrealized_pnl,
+            liquidation_price=liquidation_price,
+        )
         trade_summary = trade_summaries.get(int(position.id), {})
         closed_quantity = _d(trade_summary.get("closed_quantity"))
         close_avg_price = (
@@ -337,7 +416,11 @@ def get_user_contract_positions_page(
                 open_fee=_fmt_decimal(position.open_fee),
                 unrealized_pnl=_fmt_decimal(unrealized_pnl),
                 realized_pnl=_fmt_decimal(position.realized_pnl),
-                liquidation_price=_fmt_decimal(position.liquidation_price),
+                liquidation_price=_fmt_optional_decimal(liquidation_price),
+                roe=_fmt_optional_decimal(risk_metrics["roe"]),
+                margin_ratio=_fmt_optional_decimal(risk_metrics["margin_ratio"]),
+                liquidation_distance=_fmt_optional_decimal(risk_metrics["liquidation_distance"]),
+                liquidation_distance_rate=_fmt_optional_decimal(risk_metrics["liquidation_distance_rate"]),
                 warning_price=_fmt_decimal(position.warning_price),
                 take_profit_price=_fmt_decimal(position.take_profit_price) if position.take_profit_price is not None else None,
                 stop_loss_price=_fmt_decimal(position.stop_loss_price) if position.stop_loss_price is not None else None,
@@ -407,27 +490,41 @@ def get_user_contract_position_summaries(
         avg_entry_price = weighted_entry_notional / total_quantity
         margin_amount = sum((_d(position.margin_amount) for position in group_rows), Decimal("0"))
         unrealized_pnl = Decimal("0")
+        weighted_mark_notional = Decimal("0")
         for position in group_rows:
-            _, position_unrealized_pnl = _position_mark_and_pnl(db, position)
+            position_mark_price, position_unrealized_pnl = _position_mark_and_pnl(db, position)
             unrealized_pnl += position_unrealized_pnl
+            weighted_mark_notional += position_mark_price * _d(position.quantity)
+        mark_price = weighted_mark_notional / total_quantity if total_quantity > 0 else Decimal("0")
+        leverage_values = {int(position.leverage) for position in group_rows}
+        display_leverage = next(iter(leverage_values)) if len(leverage_values) == 1 else None
 
         tp_sl_mode, take_profit_price, stop_loss_price = _summary_tp_sl(group_rows)
-        liquidation_price = _summary_liquidation_price(
-            group_side,
-            avg_entry_price,
-            margin_amount,
-            total_quantity,
+        liquidation_price = _summary_display_liquidation_price(group_rows)
+        risk_metrics = _position_risk_metrics(
+            side=group_side,
+            quantity=total_quantity,
+            mark_price=mark_price,
+            margin_amount=margin_amount,
+            unrealized_pnl=unrealized_pnl,
+            liquidation_price=liquidation_price,
         )
 
         items.append(
             ContractPositionSummaryItem(
                 symbol=group_symbol,
                 side=group_side,
+                leverage=display_leverage,
                 quantity=_fmt_compact_decimal(total_quantity),
                 avg_entry_price=_fmt_compact_decimal(avg_entry_price),
+                mark_price=_fmt_compact_decimal(mark_price),
                 margin_amount=_fmt_compact_decimal(margin_amount),
                 unrealized_pnl=_fmt_compact_decimal(unrealized_pnl),
-                liquidation_price=_fmt_compact_decimal(liquidation_price),
+                liquidation_price=_fmt_optional_decimal(liquidation_price),
+                roe=_fmt_optional_decimal(risk_metrics["roe"]),
+                margin_ratio=_fmt_optional_decimal(risk_metrics["margin_ratio"]),
+                liquidation_distance=_fmt_optional_decimal(risk_metrics["liquidation_distance"]),
+                liquidation_distance_rate=_fmt_optional_decimal(risk_metrics["liquidation_distance_rate"]),
                 position_ids=[int(position.id) for position in group_rows],
                 count=len(group_rows),
                 take_profit_price=take_profit_price,

@@ -17,7 +17,11 @@ class ContractPositionItem(BaseModel):
     open_fee: str
     unrealized_pnl: str
     realized_pnl: str
-    liquidation_price: str
+    liquidation_price: Optional[str] = None
+    roe: Optional[str] = None
+    margin_ratio: Optional[str] = None
+    liquidation_distance: Optional[str] = None
+    liquidation_distance_rate: Optional[str] = None
     warning_price: str
     take_profit_price: Optional[str] = None
     stop_loss_price: Optional[str] = None
@@ -46,11 +50,17 @@ class ContractPositionPageResponse(BaseModel):
 class ContractPositionSummaryItem(BaseModel):
     symbol: str
     side: str
+    leverage: Optional[int] = None
     quantity: str
     avg_entry_price: str
+    mark_price: Optional[str] = None
     margin_amount: str
     unrealized_pnl: str
-    liquidation_price: str
+    liquidation_price: Optional[str] = None
+    roe: Optional[str] = None
+    margin_ratio: Optional[str] = None
+    liquidation_distance: Optional[str] = None
+    liquidation_distance_rate: Optional[str] = None
     position_ids: List[int]
     count: int
     take_profit_price: Optional[str] = None

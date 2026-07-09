@@ -1089,9 +1089,17 @@ function buildAggregatedPositionRows(positions: ContractPositionItem[]): Aggrega
     const quantity = rows.reduce((sum, row) => sum + getPositionAmount(row), 0);
     const entryNotional = rows.reduce((sum, row) => sum + (getPositionAmount(row) * toNumber(row.entry_price)), 0);
     const avgEntryPrice = quantity > 0 ? entryNotional / quantity : 0;
+    const weightedMarkNotional = rows.reduce((sum, row) => sum + (getPositionAmount(row) * toNumber(row.mark_price)), 0);
+    const markPrice = quantity > 0 ? weightedMarkNotional / quantity : 0;
     const marginAmount = rows.reduce((sum, row) => sum + toNumber(row.margin_amount), 0);
     const unrealizedPnl = rows.reduce((sum, row) => sum + toNumber(row.unrealized_pnl), 0);
-    const liquidationPrice = rows.find((row) => toNumber(row.liquidation_price) > 0)?.liquidation_price || '0';
+    const liquidationPrice = rows.length === 1 ? rows[0].liquidation_price : resolveSharedRiskField(rows, 'liquidation_price');
+    const aggregatedRoe = calcUnrealizedPnlPercent(unrealizedPnl, marginAmount);
+    const roe = rows.length === 1 ? rows[0].roe : aggregatedRoe === null ? null : formatAggregatedDecimal(aggregatedRoe, 8);
+    const marginRatio = rows.length === 1 ? rows[0].margin_ratio : calculateMarginRatio(marginAmount, markPrice, quantity);
+    const liquidationDistance = rows.length === 1 ? rows[0].liquidation_distance : resolveSharedRiskField(rows, 'liquidation_distance');
+    const liquidationDistanceRate = rows.length === 1 ? rows[0].liquidation_distance_rate : resolveSharedRiskField(rows, 'liquidation_distance_rate');
+    const leverage = resolveSharedLeverage(rows);
     const takeProfitPrice = resolveSharedTpSlMode(rows, 'take_profit_price');
     const stopLossPrice = resolveSharedTpSlMode(rows, 'stop_loss_price');
     const tpSlMode: ContractPositionSummaryItem['tp_sl_mode'] = takeProfitPrice || stopLossPrice
@@ -1101,11 +1109,17 @@ function buildAggregatedPositionRows(positions: ContractPositionItem[]): Aggrega
     return {
       symbol,
       side,
+      leverage,
       quantity: formatAggregatedDecimal(quantity),
       avg_entry_price: formatAggregatedDecimal(avgEntryPrice),
+      mark_price: formatAggregatedDecimal(markPrice),
       margin_amount: formatAggregatedDecimal(marginAmount),
       unrealized_pnl: formatAggregatedDecimal(unrealizedPnl),
-      liquidation_price: liquidationPrice,
+      liquidation_price: liquidationPrice ?? null,
+      roe,
+      margin_ratio: marginRatio,
+      liquidation_distance: liquidationDistance,
+      liquidation_distance_rate: liquidationDistanceRate,
       position_ids: rows.map((row) => row.id),
       count: rows.length,
       take_profit_price: takeProfitPrice,
@@ -1118,6 +1132,30 @@ function buildAggregatedPositionRows(positions: ContractPositionItem[]): Aggrega
     if (symbolCompare !== 0) return symbolCompare;
     return String(left.side).localeCompare(String(right.side));
   });
+}
+
+function resolveSharedRiskField(
+  rows: ContractPositionItem[],
+  field: 'liquidation_price' | 'liquidation_distance' | 'liquidation_distance_rate',
+) {
+  const values = rows
+    .map((row) => row[field])
+    .filter((value): value is string => !!value && Number.isFinite(toNumber(value)));
+  if (values.length === 0) return null;
+  const first = values[0];
+  return values.every((value) => value === first) ? first : null;
+}
+
+function resolveSharedLeverage(rows: ContractPositionItem[]) {
+  const values = new Set(rows.map((row) => Number(row.leverage)).filter((value) => Number.isFinite(value) && value > 0));
+  if (values.size !== 1) return null;
+  return Array.from(values)[0];
+}
+
+function calculateMarginRatio(marginAmount: number, markPrice: number, quantity: number) {
+  const notional = markPrice * Math.abs(quantity);
+  if (!Number.isFinite(marginAmount) || !Number.isFinite(notional) || marginAmount <= 0 || notional <= 0) return null;
+  return formatAggregatedDecimal((marginAmount / notional) * 100, 8);
 }
 
 function filterRowsByScope<T extends { symbol?: string | null }>(
@@ -1548,19 +1586,18 @@ function SummaryPositionsCards({
         const side = normalizePositionSide(item.side);
         const itemSymbol = normalizeContractSymbol(item.symbol);
         const isCurrent = itemSymbol === currentSymbol;
-        const markPrice: string | number | null = isCurrent && toNumber(quote?.mark_price) > 0
-          ? quote?.mark_price ?? null
+        const markPrice: string | number | null = toNumber(item.mark_price) > 0
+          ? item.mark_price ?? null
           : item.positions.find((position) => toNumber(position.mark_price) > 0)?.mark_price ?? null;
         const tpSlReferencePrice = isCurrent
           ? getTpSlReferencePrice(quote, tpSlTriggerPriceType, markPrice)
           : markPrice;
-        const liquidationPrice = toNumber(item.liquidation_price);
-        const realtimeUnrealized = item.positions.reduce(
-          (sum, position) => sum + calculatePositionUnrealizedPnl(position, markPrice),
-          0,
-        );
-        const unrealized = item.positions.length > 0 ? realtimeUnrealized : toNumber(item.unrealized_pnl);
-        const pnlPercent = calcUnrealizedPnlPercent(unrealized, item.margin_amount);
+        const liquidationPrice = getAuthoritativeLiquidationPrice(item);
+        const unrealized = toNumber(item.unrealized_pnl);
+        const roe = getPositionRoe(item);
+        const marginRatio = formatPlainPercent(item.margin_ratio);
+        const liquidationDistance = formatLiquidationDistance(item.liquidation_distance, pricePrecision);
+        const liquidationRisk = getLiquidationRisk(item);
         const displayUnit = scope === 'current' ? quantityUnit : inferPositionQuantityUnit(item.symbol, quantityUnit);
         const closing = closingSummaryKey === summaryKey;
         const detailsExpanded = expandedDetailKeys.has(summaryKey);
@@ -1585,6 +1622,9 @@ function SummaryPositionsCards({
                   </span>
                   {isCurrent ? (
                     <span className="rounded bg-[#f0b90b]/12 px-1.5 py-0.5 text-[10px] font-semibold text-[#f0b90b]">{t('current', 'contracts')}</span>
+                  ) : null}
+                  {item.leverage ? (
+                    <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[11px] text-white/65">{item.leverage}x</span>
                   ) : null}
                   <StatusBadge status="OPEN" />
                 </div>
@@ -1615,7 +1655,7 @@ function SummaryPositionsCards({
               </div>
             </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-8">
+            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-10">
               <PositionMetric label={t('quantity', 'contracts')} value={`${formatNumber(item.quantity, 6)} ${displayUnit}`} />
               <PositionMetric
                 label={t('entryPrice', 'contracts')}
@@ -1629,7 +1669,7 @@ function SummaryPositionsCards({
               />
               <PositionMetric
                 label={t('liquidationPrice', 'contracts')}
-                value={liquidationPrice > 0 ? `${formatDisplayPrice(item.liquidation_price, pricePrecision)} USDT` : '--'}
+                value={liquidationPrice ? `${formatDisplayPrice(liquidationPrice, pricePrecision)} USDT` : '--'}
               />
               <PositionMetric label={t('margin', 'contracts')} value={`${formatNumber(item.margin_amount, 4)} USDT`} />
               <PositionMetric
@@ -1638,12 +1678,19 @@ function SummaryPositionsCards({
                 valueClassName={unrealized > 0 ? 'text-[#00c087]' : unrealized < 0 ? 'text-[#f6465d]' : 'text-white/55'}
               />
               <PositionMetric
-                label={t('pnlRatio', 'contracts')}
-                value={formatPnlPercent(pnlPercent)}
-                valueClassName={pnlPercent === null ? 'text-white/55' : pnlPercent > 0 ? 'text-[#00c087]' : pnlPercent < 0 ? 'text-[#f6465d]' : 'text-white/55'}
+                label={t('roe', 'contracts')}
+                value={formatPnlPercent(roe)}
+                valueClassName={roe === null ? 'text-white/55' : roe > 0 ? 'text-[#00c087]' : roe < 0 ? 'text-[#f6465d]' : 'text-white/55'}
+              />
+              <PositionMetric label={t('marginRatio', 'contracts')} value={marginRatio} />
+              <PositionMetric
+                label={t('liquidationDistance', 'contracts')}
+                value={liquidationDistance}
+                valueClassName={liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}
               />
               <PositionMetric label={t('status', 'contracts')} value={statusLabel('OPEN', null, t)} />
             </div>
+            <RiskBar risk={liquidationRisk} />
 
             <details
               open={detailsExpanded}
@@ -1726,13 +1773,15 @@ function PositionsTable({
   return (
     <div className="space-y-2 p-3">
       {rows.map((item) => {
-        const markPrice = toNumber(quote?.mark_price) > 0 ? quote?.mark_price : null;
-        const liquidationPrice = calcContractLiquidationPrice(item);
-        const nearLiquidation = isNearLiquidation(item.side, toNumber(markPrice), liquidationPrice);
-        const unrealized = markPrice ? calculateUnrealizedPnl(item, toNumber(markPrice)) : null;
-        const unrealizedText = unrealized === null ? '--' : `${formatSignedPnl(unrealized, 4)} USDT`;
-        const pnlPercent = calcUnrealizedPnlPercent(unrealized, item.margin_amount);
-        const liquidationRisk = getLiquidationRisk(item.side, toNumber(markPrice), liquidationPrice);
+        const markPrice = toNumber(item.mark_price) > 0 ? item.mark_price : toNumber(quote?.mark_price) > 0 ? quote?.mark_price : null;
+        const liquidationPrice = getAuthoritativeLiquidationPrice(item);
+        const nearLiquidation = isNearLiquidation(item);
+        const unrealized = getPositionUnrealizedPnl(item);
+        const unrealizedText = `${formatSignedPnl(unrealized, 4)} USDT`;
+        const roe = getPositionRoe(item);
+        const marginRatio = formatPlainPercent(item.margin_ratio);
+        const liquidationDistance = formatLiquidationDistance(item.liquidation_distance, pricePrecision);
+        const liquidationRisk = getLiquidationRisk(item);
         const isOpen = item.status === 'OPEN';
         const isLiquidated = item.status === 'LIQUIDATED';
         const hasTpSl = hasPositionTpSl(item);
@@ -1790,7 +1839,7 @@ function PositionsTable({
               </div>
             </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-8">
+            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-10">
               <PositionMetric label={t('quantity', 'contracts')} value={`${formatNumber(item.quantity, 6)} ${quantityUnit}`} />
               <PositionMetric
                 label={t('entryPrice', 'contracts')}
@@ -1814,9 +1863,15 @@ function PositionsTable({
                 valueClassName={unrealized === null ? 'text-white/55' : unrealized > 0 ? 'text-[#00c087]' : unrealized < 0 ? 'text-[#f6465d]' : 'text-white/55'}
               />
               <PositionMetric
-                label={t('pnlRatio', 'contracts')}
-                value={formatPnlPercent(pnlPercent)}
-                valueClassName={pnlPercent === null ? 'text-white/55' : pnlPercent > 0 ? 'text-[#00c087]' : pnlPercent < 0 ? 'text-[#f6465d]' : 'text-white/55'}
+                label={t('roe', 'contracts')}
+                value={formatPnlPercent(roe)}
+                valueClassName={roe === null ? 'text-white/55' : roe > 0 ? 'text-[#00c087]' : roe < 0 ? 'text-[#f6465d]' : 'text-white/55'}
+              />
+              <PositionMetric label={t('marginRatio', 'contracts')} value={marginRatio} />
+              <PositionMetric
+                label={t('liquidationDistance', 'contracts')}
+                value={liquidationDistance}
+                valueClassName={liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}
               />
               <PositionMetric label={t('status', 'contracts')} value={statusLabel(item.status, item.close_reason, t)} />
             </div>
@@ -1862,10 +1917,10 @@ function AllPositionsTable({
 
   return (
     <div className="overflow-x-auto p-3">
-      <table className="min-w-[1120px] w-full table-fixed text-left text-[12px]">
+      <table className="w-full min-w-[1320px] table-fixed text-left text-[12px]">
         <thead className="bg-[#0b0e11] text-white/40">
           <tr>
-            {[t('symbol', 'contracts'), t('direction', 'contracts'), t('leverage', 'contracts'), t('quantity', 'contracts'), t('entryPrice', 'contracts'), t('markPrice', 'contracts'), t('margin', 'contracts'), t('unrealizedPnl', 'contracts'), t('pnlRatio', 'contracts'), t('liquidationPrice', 'contracts'), t('risk', 'contracts'), t('status', 'contracts'), t('operation', 'contracts')].map((head) => (
+            {[t('symbol', 'contracts'), t('direction', 'contracts'), t('leverage', 'contracts'), t('quantity', 'contracts'), t('entryPrice', 'contracts'), t('markPrice', 'contracts'), t('margin', 'contracts'), t('unrealizedPnl', 'contracts'), t('roe', 'contracts'), t('marginRatio', 'contracts'), t('liquidationPrice', 'contracts'), t('liquidationDistance', 'contracts'), t('risk', 'contracts'), t('status', 'contracts'), t('operation', 'contracts')].map((head) => (
               <th key={head} className="whitespace-nowrap px-2 py-2 font-medium">{head}</th>
             ))}
           </tr>
@@ -1875,22 +1930,22 @@ function AllPositionsTable({
             const itemSymbol = normalizeContractSymbol(item.symbol);
             const isCurrent = itemSymbol === currentSymbol;
             const markPrice = toNumber(item.mark_price);
-            const liquidationPrice = calcContractLiquidationPrice(item);
-            const unrealized = markPrice > 0 ? calculateUnrealizedPnl(item, markPrice) : null;
-            const pnlPercent = calcUnrealizedPnlPercent(unrealized, item.margin_amount);
-            const liquidationRisk = getLiquidationRisk(item.side, markPrice, liquidationPrice);
-            const unrealizedClassName = unrealized === null
+            const liquidationPrice = getAuthoritativeLiquidationPrice(item);
+            const unrealized = getPositionUnrealizedPnl(item);
+            const roe = getPositionRoe(item);
+            const marginRatio = formatPlainPercent(item.margin_ratio);
+            const liquidationDistance = formatLiquidationDistance(item.liquidation_distance, pricePrecision);
+            const liquidationRisk = getLiquidationRisk(item);
+            const unrealizedClassName = unrealized > 0
+              ? 'text-[#00c087]'
+              : unrealized < 0
+                ? 'text-[#f6465d]'
+                : 'text-white/55';
+            const pnlClassName = roe === null
               ? 'text-white/55'
-              : unrealized > 0
+              : roe > 0
                 ? 'text-[#00c087]'
-                : unrealized < 0
-                  ? 'text-[#f6465d]'
-                  : 'text-white/55';
-            const pnlClassName = pnlPercent === null
-              ? 'text-white/55'
-              : pnlPercent > 0
-                ? 'text-[#00c087]'
-                : pnlPercent < 0
+                : roe < 0
                   ? 'text-[#f6465d]'
                   : 'text-white/55';
 
@@ -1915,12 +1970,16 @@ function AllPositionsTable({
                 <Td>{markPrice > 0 ? formatDisplayPrice(markPrice, pricePrecision) : '--'}</Td>
                 <Td>{formatNumber(item.margin_amount, 2)}</Td>
                 <td className={`whitespace-nowrap px-2 py-2.5 font-mono tabular-nums ${unrealizedClassName}`}>
-                  {unrealized === null ? '--' : formatSignedPnl(unrealized, 4)}
+                  {formatSignedPnl(unrealized, 4)}
                 </td>
                 <td className={`whitespace-nowrap px-2 py-2.5 font-mono tabular-nums ${pnlClassName}`}>
-                  {formatPnlPercent(pnlPercent)}
+                  {formatPnlPercent(roe)}
                 </td>
+                <Td>{marginRatio}</Td>
                 <Td>{liquidationPrice ? formatDisplayPrice(liquidationPrice, pricePrecision) : '--'}</Td>
+                <td className={`whitespace-nowrap px-2 py-2.5 font-mono tabular-nums ${liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}`}>
+                  {liquidationDistance}
+                </td>
                 <td className={`whitespace-nowrap px-2 py-2.5 font-mono tabular-nums ${liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}`}>
                   {liquidationRisk ? t(liquidationRisk.labelKey, 'contracts') : '--'}
                 </td>
@@ -2238,7 +2297,12 @@ function PositionDetailCard({
 }) {
   const { t } = useLocaleContext();
   const detailMarkPrice = toNumber(markPrice) > 0 ? markPrice : position.mark_price;
-  const unrealized = calculatePositionUnrealizedPnl(position, markPrice);
+  const unrealized = getPositionUnrealizedPnl(position);
+  const liquidationPrice = getAuthoritativeLiquidationPrice(position);
+  const roe = getPositionRoe(position);
+  const marginRatio = formatPlainPercent(position.margin_ratio);
+  const liquidationDistance = formatLiquidationDistance(position.liquidation_distance, pricePrecision);
+  const liquidationRisk = getLiquidationRisk(position);
   const takeProfitBadge = formatOptionalTpSlBadge(position.take_profit_price, pricePrecision);
   const stopLossBadge = formatOptionalTpSlBadge(position.stop_loss_price, pricePrecision);
   const isOpen = position.status === 'OPEN';
@@ -2275,9 +2339,11 @@ function PositionDetailCard({
         ) : null}
       </div>
 
-      <div className="grid grid-cols-2 gap-x-6 gap-y-2 md:grid-cols-3 xl:grid-cols-7">
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2 md:grid-cols-3 xl:grid-cols-10">
         <DetailMetric label={t('quantity', 'contracts')} value={formatNumber(position.quantity, 6)} />
         <DetailMetric label={t('entryPrice', 'contracts')} value={formatDisplayPrice(position.entry_price, pricePrecision)} />
+        <DetailMetric label={t('markPrice', 'contracts')} value={toNumber(detailMarkPrice) > 0 ? formatDisplayPrice(detailMarkPrice, pricePrecision) : '--'} />
+        <DetailMetric label={t('liquidationPrice', 'contracts')} value={liquidationPrice ? formatDisplayPrice(liquidationPrice, pricePrecision) : '--'} />
         <DetailMetric label={t('margin', 'contracts')} value={`${formatNumber(position.margin_amount, 4)} USDT`} />
         <DetailMetric label={t('openedAt', 'contracts')} value={formatHistoryTime(position.opened_at)} />
         <DetailMetric label={t('takeProfit', 'contracts')} value={takeProfitBadge ?? '--'} />
@@ -2286,6 +2352,17 @@ function PositionDetailCard({
           label={t('unrealizedPnl', 'contracts')}
           value={`${formatSignedPnl(unrealized, 4)} USDT`}
           valueClassName={unrealized > 0 ? 'text-[#00c087]' : unrealized < 0 ? 'text-[#f6465d]' : 'text-white/80'}
+        />
+        <DetailMetric
+          label={t('roe', 'contracts')}
+          value={formatPnlPercent(roe)}
+          valueClassName={roe === null ? 'text-white/55' : roe > 0 ? 'text-[#00c087]' : roe < 0 ? 'text-[#f6465d]' : 'text-white/80'}
+        />
+        <DetailMetric label={t('marginRatio', 'contracts')} value={marginRatio} />
+        <DetailMetric
+          label={t('liquidationDistance', 'contracts')}
+          value={liquidationDistance}
+          valueClassName={liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}
         />
       </div>
     </div>
@@ -2684,30 +2761,19 @@ function getPositionAmount(item: ContractPositionItem) {
   return toNumber(record.quantity ?? record.amount ?? record.size);
 }
 
-function calcContractLiquidationPrice(item: ContractPositionItem) {
-  const entryPrice = toNumber(item.entry_price);
-  const margin = toNumber(item.margin_amount);
-  const quantity = Math.abs(getPositionAmount(item));
-
-  if (!Number.isFinite(entryPrice) || !Number.isFinite(margin) || !Number.isFinite(quantity)) return null;
-  if (entryPrice <= 0 || margin <= 0 || quantity <= 0) return null;
-
-  const distance = margin / quantity;
-  const liquidationPrice = item.side === 'LONG'
-    ? entryPrice - distance
-    : item.side === 'SHORT'
-      ? entryPrice + distance
-      : NaN;
-
-  if (!Number.isFinite(liquidationPrice) || liquidationPrice <= 0) return null;
-  return liquidationPrice;
+function getAuthoritativeLiquidationPrice(record: Partial<ContractPositionItem & ContractPositionSummaryItem> | null | undefined) {
+  const liquidationPrice = toNumber(record?.liquidation_price);
+  return Number.isFinite(liquidationPrice) && liquidationPrice > 0 ? liquidationPrice : null;
 }
 
-function isNearLiquidation(side: string, markPrice: number, liquidationPrice: number | null) {
-  if (!liquidationPrice || !Number.isFinite(markPrice) || markPrice <= 0) return false;
-  if (side === 'LONG') return markPrice <= liquidationPrice * 1.02;
-  if (side === 'SHORT') return markPrice >= liquidationPrice * 0.98;
-  return false;
+function hasRiskValue(value: string | number | null | undefined) {
+  return value !== null && value !== undefined && String(value).trim() !== '';
+}
+
+function isNearLiquidation(record: Partial<ContractPositionItem & ContractPositionSummaryItem> | null | undefined) {
+  if (!hasRiskValue(record?.liquidation_distance_rate)) return false;
+  const distanceRate = toNumber(record?.liquidation_distance_rate);
+  return Number.isFinite(distanceRate) && distanceRate <= 2;
 }
 
 function calcUnrealizedPnlPercent(unrealizedPnl: number | null, marginAmount: string | number | null | undefined) {
@@ -2724,21 +2790,38 @@ function formatPnlPercent(value: number | null) {
   return `${value > 0 ? '+' : ''}${value.toFixed(2)}%`;
 }
 
-function getLiquidationRisk(side: string, markPrice: number, liquidationPrice: number | null): LiquidationRisk | null {
-  if (!liquidationPrice || !Number.isFinite(markPrice) || markPrice <= 0) return null;
+function formatPlainPercent(value: string | number | null | undefined) {
+  if (!hasRiskValue(value)) return '--';
+  const num = toNumber(value);
+  if (!Number.isFinite(num)) return '--';
+  if (Math.abs(num) < 0.005) return '0.00%';
+  return `${num.toFixed(2)}%`;
+}
 
-  const distanceRatio = side === 'LONG'
-    ? (markPrice - liquidationPrice) / liquidationPrice
-    : side === 'SHORT'
-      ? (liquidationPrice - markPrice) / liquidationPrice
-      : NaN;
+function formatLiquidationDistance(value: string | number | null | undefined, precision: number) {
+  if (!hasRiskValue(value)) return '--';
+  const num = toNumber(value);
+  if (!Number.isFinite(num)) return '--';
+  return `${formatDisplayPrice(num, precision)} USDT`;
+}
 
-  if (!Number.isFinite(distanceRatio)) return null;
+function getPositionRoe(record: Partial<ContractPositionItem & ContractPositionSummaryItem> | null | undefined) {
+  if (hasRiskValue(record?.roe)) {
+    const roe = toNumber(record?.roe);
+    if (Number.isFinite(roe)) return roe;
+  }
+  return calcUnrealizedPnlPercent(toNumber(record?.unrealized_pnl), record?.margin_amount);
+}
 
-  const percent = clamp(100 - distanceRatio * 1000, 0, 100);
-  if (distanceRatio <= 0) return { labelKey: 'riskExtreme', percent, tone: 'extreme' };
-  if (distanceRatio <= 0.02) return { labelKey: 'riskHigh', percent, tone: 'high' };
-  if (distanceRatio <= 0.05) return { labelKey: 'riskMedium', percent, tone: 'medium' };
+function getLiquidationRisk(record: Partial<ContractPositionItem & ContractPositionSummaryItem> | null | undefined): LiquidationRisk | null {
+  if (!hasRiskValue(record?.liquidation_distance_rate)) return null;
+  const distanceRate = toNumber(record?.liquidation_distance_rate);
+  if (!Number.isFinite(distanceRate)) return null;
+
+  const percent = clamp(100 - distanceRate * 10, 0, 100);
+  if (distanceRate <= 0) return { labelKey: 'riskExtreme', percent, tone: 'extreme' };
+  if (distanceRate <= 2) return { labelKey: 'riskHigh', percent, tone: 'high' };
+  if (distanceRate <= 5) return { labelKey: 'riskMedium', percent, tone: 'medium' };
   return { labelKey: 'riskLow', percent, tone: 'low' };
 }
 
@@ -2757,19 +2840,9 @@ function formatSignedPnl(value?: string | number | null, digits = 4) {
   return num > 0 ? `+${formatted}` : formatted;
 }
 
-function calculateUnrealizedPnl(item: ContractPositionItem, markPrice: number) {
-  const quantity = getPositionAmount(item);
-  const entryPrice = toNumber(item.entry_price);
-  if (!quantity || !entryPrice || !markPrice) return 0;
-  return item.side === 'LONG'
-    ? (markPrice - entryPrice) * quantity
-    : (entryPrice - markPrice) * quantity;
-}
-
-function calculatePositionUnrealizedPnl(position: ContractPositionItem, markPrice: string | number | null) {
-  const detailMarkPrice = toNumber(markPrice) > 0 ? markPrice : position.mark_price;
-  const markNumber = toNumber(detailMarkPrice);
-  return markNumber > 0 ? calculateUnrealizedPnl(position, markNumber) : toNumber(position.unrealized_pnl);
+function getPositionUnrealizedPnl(position: ContractPositionItem) {
+  const unrealized = toNumber(position.unrealized_pnl);
+  return Number.isFinite(unrealized) ? unrealized : 0;
 }
 
 function statusLabel(value: string, closeReason?: string | null, t?: ContractTranslator) {
