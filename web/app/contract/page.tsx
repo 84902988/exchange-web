@@ -385,7 +385,6 @@ function ContractPageContent() {
     contractAvailabilityError,
     pricePrecision,
     quoteHint,
-    marketRealtimeStatus,
     marketView: activeContractMarketView,
     displayPrice: currentPriceNumber,
     displayPriceSource: currentPriceSource,
@@ -400,6 +399,12 @@ function ContractPageContent() {
     depthMode,
     depthStatus,
     depthStatusLabel,
+    recentTrades,
+    tradesLoading,
+    tradesError,
+    tradesSource,
+    tradesFreshness,
+    latestTradeDirection,
     bestBid: hookBestBid,
     bestAsk: hookBestAsk,
     spread: hookSpread,
@@ -420,7 +425,6 @@ function ContractPageContent() {
     priceDirection: currentPriceDirection,
     expiredLastGoodQuote,
     handleLatestKlineCloseChange,
-    handleLastTradePriceChange,
   } = useContractMarketView({
     contractSymbol,
     interval,
@@ -811,12 +815,15 @@ function ContractPageContent() {
                     <div className={rightPanelTab === 'trades' ? 'block h-full min-h-0 min-w-0' : 'hidden h-full min-h-0 min-w-0'}>
                       <ContractFuturesTrades
                         symbol={contractSymbol}
+                        trades={recentTrades}
+                        loading={tradesLoading}
+                        error={tradesError}
+                        status={contractMarketStatus}
+                        source={tradesSource}
+                        freshness={tradesFreshness}
                         pricePrecision={pricePrecision}
-                        latestPriceDirection={currentPriceDirection}
-                        marketStatus={contractMarketStatus}
-                        marketRealtimeStatus={marketRealtimeStatus}
-                        onPriceSelect={setSelectedPrice}
-                        onLastPriceChange={handleLastTradePriceChange}
+                        latestPriceDirection={latestTradeDirection}
+                        onPriceClick={setSelectedPrice}
                       />
                     </div>
                   </div>

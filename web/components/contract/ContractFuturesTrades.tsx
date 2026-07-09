@@ -1,33 +1,26 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo } from 'react';
 import {
-  getContractMarketTrades,
   type ContractMarketTrade,
 } from '@/lib/api/modules/contract';
 import { formatPrice as formatMarketPrice } from '@/lib/marketPrecision';
-import {
-  readContractTradesCache,
-  writeContractTradesCache,
-} from '@/lib/contractMarketCache';
-import {
-  contractMarketRealtime,
-  type ContractMarketRealtimeMessage,
-  type ContractMarketRealtimeStatus,
-} from '@/lib/realtime/contractMarketRealtime';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 
 type PriceDirection = 'up' | 'down' | 'flat';
 
 type ContractFuturesTradesProps = {
   symbol: string;
-  limit?: number;
+  trades?: ContractMarketTrade[];
+  loading?: boolean;
+  error?: string | null;
+  status?: string | null;
+  source?: string | null;
+  freshness?: string | null;
   pricePrecision: number;
   latestPriceDirection?: PriceDirection;
-  marketStatus?: string | null;
-  marketRealtimeStatus?: ContractMarketRealtimeStatus;
+  onPriceClick?: (price: string) => void;
   onPriceSelect?: (price: string) => void;
-  onLastPriceChange?: (price: string, source?: string | null, trade?: ContractMarketTrade) => void;
 };
 
 function toNumber(value?: string | number | null) {
@@ -51,152 +44,23 @@ function formatTime(value: number) {
   return date.toLocaleTimeString('zh-CN', { hour12: false });
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function normalizeTradeTime(value: unknown) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return Date.now();
-  return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
-}
-
-function getTradePayloads(message: ContractMarketRealtimeMessage) {
-  if (Array.isArray(message.trades)) return message.trades;
-  if (isRecord(message.trade)) return [message.trade];
-  if (Array.isArray(message.data)) return message.data;
-  if (isRecord(message.data)) return [message.data];
-  return [message];
-}
-
-function extractRealtimeTrades(
-  message: ContractMarketRealtimeMessage,
-  currentSymbol: string,
-): ContractMarketTrade[] {
-  return getTradePayloads(message)
-    .flatMap((payload) => {
-      if (!isRecord(payload)) return [];
-      const msgSymbol = String(message.symbol || payload.symbol || '').trim().toUpperCase();
-      if (msgSymbol && msgSymbol !== currentSymbol.toUpperCase()) return [];
-
-      const price = payload.price ?? payload.last_price;
-      const qty = payload.qty ?? payload.amount ?? payload.quantity ?? payload.volume;
-      const priceSource = String(payload.price_source || '').trim().toUpperCase();
-      const normalizedQty = toNumber(qty as string | number | null);
-      if (
-        toNumber(price as string | number | null) <= 0
-        || (normalizedQty <= 0 && priceSource !== 'TRADE_TICK')
-      ) {
-        return [];
-      }
-
-      const time = normalizeTradeTime(payload.time ?? payload.ts ?? payload.timestamp);
-      const trade: ContractMarketTrade = {
-        id: payload.id ? String(payload.id) : `${time}-${price}-${normalizedQty}`,
-        price: String(price),
-        qty: String(normalizedQty > 0 ? normalizedQty : 0),
-        time,
-      };
-      if (payload.last_price) trade.last_price = String(payload.last_price);
-      if (payload.quoteQty) trade.quoteQty = String(payload.quoteQty);
-      if (payload.amount) trade.amount = String(payload.amount);
-      if (payload.volume) trade.volume = String(payload.volume);
-      if (payload.source) trade.source = String(payload.source);
-      if (payload.quote_source) trade.quote_source = String(payload.quote_source);
-      if (payload.quote_freshness) trade.quote_freshness = String(payload.quote_freshness);
-      if (payload.price_source) trade.price_source = String(payload.price_source);
-      if (typeof payload.synthetic === 'boolean') trade.synthetic = payload.synthetic;
-      if (payload.side) trade.side = String(payload.side);
-      if (typeof payload.isBuyerMaker === 'boolean') {
-        trade.isBuyerMaker = payload.isBuyerMaker;
-      } else if (typeof payload.is_buyer_maker === 'boolean') {
-        trade.isBuyerMaker = payload.is_buyer_maker;
-      }
-      return [trade];
-    });
-}
-
 export default function ContractFuturesTrades({
   symbol,
-  limit = 30,
+  trades = [],
+  loading = false,
+  status,
   pricePrecision,
   latestPriceDirection,
-  marketStatus,
-  marketRealtimeStatus = 'idle',
+  onPriceClick,
   onPriceSelect,
-  onLastPriceChange,
 }: ContractFuturesTradesProps) {
   const { t } = useLocaleContext();
-  const [rows, setRows] = useState<ContractMarketTrade[]>([]);
-  const [loading, setLoading] = useState(true);
-  const onLastPriceChangeRef = useRef(onLastPriceChange);
-
-  useEffect(() => {
-    onLastPriceChangeRef.current = onLastPriceChange;
-  }, [onLastPriceChange]);
-
-  useEffect(() => {
-    let alive = true;
-    let polling = false;
-
-    async function loadTrades() {
-      if (polling) return;
-      if (marketStatus === 'CLOSED') {
-        setLoading(false);
-        return;
-      }
-      polling = true;
-      try {
-        const trades = await getContractMarketTrades(symbol, limit);
-        if (!alive) return;
-        const nextRows = [...trades].reverse();
-        setRows(nextRows);
-        writeContractTradesCache(symbol, {
-          trades: nextRows,
-          lastPrice: nextRows[0]?.price ?? null,
-        });
-      } catch {
-        if (!alive) return;
-      } finally {
-        if (alive) setLoading(false);
-        polling = false;
-      }
-    }
-
-    const cached = readContractTradesCache(symbol);
-    if (cached?.trades?.length) {
-      setRows(cached.trades.slice(0, limit));
-      const latest = cached.trades[0];
-      if (cached.lastPrice) onLastPriceChangeRef.current?.(String(cached.lastPrice), latest?.price_source ?? null, latest);
-      setLoading(false);
-    } else {
-      setRows([]);
-      setLoading(true);
-    }
-    void loadTrades();
-    if (marketStatus === 'CLOSED') {
-      return () => {
-        alive = false;
-      };
-    }
-    if (marketRealtimeStatus === 'connected') {
-      return () => {
-        alive = false;
-      };
-    }
-    const timer = window.setInterval(() => {
-      void loadTrades();
-    }, 1500);
-
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-    };
-  }, [symbol, limit, marketStatus, marketRealtimeStatus]);
+  const handlePriceSelect = onPriceClick || onPriceSelect;
+  const normalizedStatus = String(status || '').trim().toUpperCase();
 
   const data = useMemo(() => {
-    return rows.map((item, index) => {
-      const next = rows[index + 1];
+    return trades.map((item, index) => {
+      const next = trades[index + 1];
       const currentPrice = toNumber(item.price);
       const prevPrice = next ? toNumber(next.price) : currentPrice;
       return {
@@ -210,50 +74,14 @@ export default function ContractFuturesTrades({
               : 'flat',
       };
     });
-  }, [latestPriceDirection, rows]);
-
-  useEffect(() => {
-    const latest = rows[0];
-    if (latest?.price) onLastPriceChange?.(latest.price, latest.price_source ?? null, latest);
-  }, [onLastPriceChange, rows]);
-
-  useEffect(() => {
-    const handleTradeMessage = (message: ContractMarketRealtimeMessage) => {
-      if (marketStatus === 'CLOSED') return;
-
-      const trades = extractRealtimeTrades(message, symbol);
-      if (trades.length === 0) return;
-
-      setRows((previous) => {
-        const seen = new Set<string>();
-        const nextRows = [...trades, ...previous]
-          .filter((item) => {
-            const key = String(item.id);
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          })
-          .slice(0, limit);
-
-        writeContractTradesCache(symbol, {
-          trades: nextRows,
-          lastPrice: nextRows[0]?.price ?? null,
-        });
-        return nextRows;
-      });
-      setLoading(false);
-      onLastPriceChangeRef.current?.(trades[0].price, trades[0].price_source ?? null, trades[0]);
-    };
-
-    return contractMarketRealtime.subscribe('trade', handleTradeMessage);
-  }, [limit, marketStatus, symbol]);
+  }, [latestPriceDirection, trades]);
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div className="text-[13px] font-medium text-white/88">{t('marketTrades', 'contracts')}</div>
-          {marketStatus === 'CLOSED' ? (
+          {normalizedStatus === 'CLOSED' ? (
             <div className="rounded-full border border-[#f0b90b]/20 bg-[#f0b90b]/10 px-2 py-0.5 text-[11px] font-semibold text-[#f0b90b]">
               {t('closedNoRealtimeTrades', 'contracts')}
             </div>
@@ -293,7 +121,7 @@ export default function ContractFuturesTrades({
                 <button
                   key={item.id}
                   type="button"
-                  onClick={() => onPriceSelect?.(item.price)}
+                  onClick={() => handlePriceSelect?.(item.price)}
                   className="grid w-full grid-cols-[minmax(0,1.18fr)_minmax(0,0.92fr)_60px] items-center gap-x-2 rounded-[6px] px-1.5 py-1 text-[12px] transition-colors hover:bg-white/[0.035]"
                 >
                   <div className={`overflow-hidden text-ellipsis whitespace-nowrap text-left font-medium ${priceClass}`}>
