@@ -92,7 +92,7 @@ export default function ContractMarketHeader({
 
         <Metric
           className="w-[138px] shrink-0 flex-none"
-          label={t('spotHeaderTradeStatus', 'asset')}
+          label={t('tradeStatus', 'contracts')}
           value={quoteStatusLabel ? (
             <span className={`block max-w-full truncate text-[13px] font-semibold leading-tight ${quoteStatusTextClass(quoteStatusTone)}`}>
               {quoteStatusLabel}

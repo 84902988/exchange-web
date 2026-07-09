@@ -94,7 +94,7 @@ export default function ContractFuturesTrades({
 
       {loading && data.length === 0 ? (
         <div className="flex min-h-0 flex-1 items-center justify-center px-2.5 py-6 text-sm text-zinc-400">
-          {t('loading', 'common')}
+          {t('loading', 'contracts')}
         </div>
       ) : data.length === 0 ? (
         <div className="flex min-h-0 flex-1 items-center justify-center px-2.5 py-6 text-sm text-zinc-400">
