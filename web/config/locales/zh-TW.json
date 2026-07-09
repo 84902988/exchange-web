@@ -2482,6 +2482,8 @@
     "tradesSourceStatus": "成交來源",
     "klineSourceStatus": "K線來源",
     "quoteUnavailableShort": "報價不可用",
+    "loginToTradeContracts": "登入後進行合約交易",
+    "loginToTradeContractsDesc": "登入後即可使用合約交易功能。",
     "loginToTransferMarginAndTrade": "請登入後劃轉保證金並提交合約訂單。",
     "confirmLimitOrderDesc": "請確認訂單詳情。提交後將進入目前委託等待撮合。",
     "enterValidOpenQuantity": "請輸入有效的開倉數量",

@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   closeContractOrder,
@@ -661,6 +662,7 @@ export default function ContractTradingForm({
   }
 
   function validateOpen(side: ContractPositionSide) {
+    if (!isLoggedIn) return t('loginToTradeContracts', 'contracts');
     if (availableMarginNumber <= 0) return t('transferMarginFirst', 'contracts');
     if (quoteStatusLoading) return t('marketDataLoadingLabel', 'contracts');
     if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
@@ -680,6 +682,7 @@ export default function ContractTradingForm({
   }
 
   function validateClose(side: ContractPositionSide, position: ContractPositionItem | null, maxQuantity: string) {
+    if (!isLoggedIn) return t('loginToTradeContracts', 'contracts');
     if (!selectedCloseSummary && !position) return t('noClosablePosition', 'contracts');
     if (quoteStatusLoading) return t('marketDataLoadingLabel', 'contracts');
     if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
@@ -882,6 +885,10 @@ export default function ContractTradingForm({
     writeLocalStorageFlag(CONTRACT_TRADE_CONFIRM_HIDDEN_KEY, checked);
   }
 
+  const contractRedirect = `/contract?symbol=${symbol}`;
+  const contractLoginHref = `/login?redirect=${encodeURIComponent(contractRedirect)}`;
+  const contractRegisterHref = `/register?redirect=${encodeURIComponent(contractRedirect)}`;
+
   return (
     <div className="tabular-nums space-y-1 text-sm text-white">
       <div className="space-y-1 overflow-visible">
@@ -956,6 +963,9 @@ export default function ContractTradingForm({
             submitting={submitting}
             submitOpen={submitOpen}
             tpSlTriggerPriceTypeHint={tpSlTriggerPriceTypeHint}
+            isLoggedIn={isLoggedIn}
+            loginHref={contractLoginHref}
+            registerHref={contractRegisterHref}
           />
         ) : (
           <ClosePanel
@@ -985,6 +995,9 @@ export default function ContractTradingForm({
             onPercentChange={handleClosePercentChange}
             submitting={submitting}
             submitClose={submitClose}
+            isLoggedIn={isLoggedIn}
+            loginHref={contractLoginHref}
+            registerHref={contractRegisterHref}
           />
         )}
 
@@ -996,11 +1009,6 @@ export default function ContractTradingForm({
           </div>
         ) : null}
 
-        {!isLoggedIn ? (
-          <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/10 px-2.5 py-1.5 text-[12px] text-yellow-300">
-            {t('loginToTransferMarginAndTrade', 'contracts')}
-          </div>
-        ) : null}
       </div>
 
       {leverageOpen ? (
@@ -1067,6 +1075,32 @@ function FormFeedbackBox({ feedback }: { feedback: FormFeedback }) {
   );
 }
 
+function ContractLoginActions({
+  loginHref,
+  registerHref,
+}: {
+  loginHref: string;
+  registerHref: string;
+}) {
+  const { t } = useLocaleContext();
+  return (
+    <div className="flex flex-col gap-2.5">
+      <Link
+        href={loginHref}
+        className="w-full rounded-lg border border-white/10 bg-white/5 py-2.5 text-center text-[13px] font-semibold text-white transition-colors hover:bg-white/10"
+      >
+        {t('login', 'common')}
+      </Link>
+      <Link
+        href={registerHref}
+        className="w-full rounded-lg bg-white py-2.5 text-center text-[13px] font-semibold text-black transition-colors hover:bg-white/90"
+      >
+        {t('register', 'common')}
+      </Link>
+    </div>
+  );
+}
+
 function OpenPanel({
   orderType,
   price,
@@ -1103,6 +1137,9 @@ function OpenPanel({
   submitting,
   submitOpen,
   tpSlTriggerPriceTypeHint,
+  isLoggedIn,
+  loginHref,
+  registerHref,
 }: {
   orderType: ContractOrderType;
   price: string;
@@ -1139,6 +1176,9 @@ function OpenPanel({
   submitting: boolean;
   submitOpen: (side: ContractPositionSide) => Promise<void>;
   tpSlTriggerPriceTypeHint: string;
+  isLoggedIn: boolean;
+  loginHref: string;
+  registerHref: string;
 }) {
   const { t } = useLocaleContext();
   const isLong = positionSide === 'LONG';
@@ -1151,8 +1191,8 @@ function OpenPanel({
 
       <div className="flex items-center justify-between text-[11px] text-white/45">
         <span>{t('availableShort', 'contracts')}</span>
-        <span className={availableMargin > 0 ? 'text-white/72' : 'text-[#f6465d]'}>
-          {formatNumber(availableMargin, 2)} USDT
+        <span className={!isLoggedIn ? 'text-white/45' : availableMargin > 0 ? 'text-white/72' : 'text-[#f6465d]'}>
+          {isLoggedIn ? `${formatNumber(availableMargin, 2)} USDT` : '--'}
         </span>
       </div>
 
@@ -1175,7 +1215,7 @@ function OpenPanel({
         value={percentValue}
         side={isLong ? 'buy' : 'sell'}
         onChange={onPercentChange}
-        disabled={availableMargin <= 0}
+        disabled={!isLoggedIn || availableMargin <= 0}
       />
 
       <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] p-1.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
@@ -1218,16 +1258,20 @@ function OpenPanel({
         ) : null}
       </div>
 
-      {availableMargin <= 0 ? (
+      {isLoggedIn && availableMargin <= 0 ? (
         <div className="rounded-xl border border-[#f6465d]/20 bg-[#f6465d]/10 px-2 py-1 text-[12px] text-[#f6465d]">
           {t('transferMarginFirst', 'contracts')}
         </div>
       ) : null}
 
       <div>
-        <button type="button" disabled={submitDisabled} onClick={() => submitOpen(positionSide)} className={`w-full rounded-xl ${buttonToneClass} py-2 text-[14px] font-semibold text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-opacity disabled:cursor-not-allowed disabled:opacity-45`}>
-          {submitting ? t('openSubmitting', 'contracts') : buttonText}
-        </button>
+        {isLoggedIn ? (
+          <button type="button" disabled={submitDisabled} onClick={() => submitOpen(positionSide)} className={`w-full rounded-xl ${buttonToneClass} py-2 text-[14px] font-semibold text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-opacity disabled:cursor-not-allowed disabled:opacity-45`}>
+            {submitting ? t('openSubmitting', 'contracts') : buttonText}
+          </button>
+        ) : (
+          <ContractLoginActions loginHref={loginHref} registerHref={registerHref} />
+        )}
       </div>
     </div>
   );
@@ -1257,6 +1301,9 @@ function ClosePanel({
   onPercentChange,
   submitting,
   submitClose,
+  isLoggedIn,
+  loginHref,
+  registerHref,
 }: {
   orderType: ContractOrderType;
   price: string;
@@ -1281,6 +1328,9 @@ function ClosePanel({
   onPercentChange: (percent: number) => void;
   submitting: boolean;
   submitClose: (side: ContractPositionSide) => Promise<void>;
+  isLoggedIn: boolean;
+  loginHref: string;
+  registerHref: string;
 }) {
   const { t } = useLocaleContext();
   const isLong = closeSide === 'LONG';
@@ -1311,7 +1361,7 @@ function ClosePanel({
         value={percentValue}
         side={isLong ? 'sell' : 'buy'}
         onChange={onPercentChange}
-        disabled={!selectedSummary && !selectedPosition}
+        disabled={!isLoggedIn || (!selectedSummary && !selectedPosition)}
       />
 
       <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] p-1.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
@@ -1326,16 +1376,20 @@ function ClosePanel({
         />
       </div>
 
-      {!selectedPosition ? (
+      {isLoggedIn && !selectedPosition ? (
         <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] px-2 py-1 text-[12px] text-white/50">
           {t('noClosablePosition', 'contracts')}
         </div>
       ) : null}
 
       <div>
-        <button type="button" disabled={closeDisabled} onClick={() => submitClose(closeSide)} className={`w-full rounded-xl ${buttonToneClass} py-2 text-[14px] font-semibold text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-opacity disabled:cursor-not-allowed disabled:opacity-45`}>
-          {submitting ? t('closeSubmitting', 'contracts') : buttonText}
-        </button>
+        {isLoggedIn ? (
+          <button type="button" disabled={closeDisabled} onClick={() => submitClose(closeSide)} className={`w-full rounded-xl ${buttonToneClass} py-2 text-[14px] font-semibold text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-opacity disabled:cursor-not-allowed disabled:opacity-45`}>
+            {submitting ? t('closeSubmitting', 'contracts') : buttonText}
+          </button>
+        ) : (
+          <ContractLoginActions loginHref={loginHref} registerHref={registerHref} />
+        )}
       </div>
     </div>
   );

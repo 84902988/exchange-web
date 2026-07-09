@@ -2482,6 +2482,8 @@
     "tradesSourceStatus": "成交来源",
     "klineSourceStatus": "K线来源",
     "quoteUnavailableShort": "报价不可用",
+    "loginToTradeContracts": "登录后进行合约交易",
+    "loginToTradeContractsDesc": "登录后即可使用合约交易功能。",
     "loginToTransferMarginAndTrade": "请登录后划转保证金并提交合约订单。",
     "confirmLimitOrderDesc": "请确认订单详情。提交后将进入当前委托等待撮合。",
     "enterValidOpenQuantity": "请输入有效的开仓数量",

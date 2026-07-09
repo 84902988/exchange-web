@@ -2482,6 +2482,8 @@
     "tradesSourceStatus": "Trades source",
     "klineSourceStatus": "Kline source",
     "quoteUnavailableShort": "Quote unavailable",
+    "loginToTradeContracts": "Log in to trade contracts",
+    "loginToTradeContractsDesc": "Access futures trading after signing in.",
     "loginToTransferMarginAndTrade": "Log in to transfer margin and submit futures orders.",
     "confirmLimitOrderDesc": "Confirm the order details. After submission, it will enter open orders and wait for matching.",
     "enterValidOpenQuantity": "Enter a valid open quantity",

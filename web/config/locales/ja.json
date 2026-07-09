@@ -2348,6 +2348,8 @@
     "tradesSourceStatus": "約定ソース",
     "klineSourceStatus": "K線ソース",
     "quoteUnavailableShort": "相場利用不可",
+    "loginToTradeContracts": "ログインして契約取引を行う",
+    "loginToTradeContractsDesc": "ログイン後、契約取引機能を利用できます。",
     "loginToTransferMarginAndTrade": "ログインして証拠金を振替し、契約注文を送信してください。",
     "confirmLimitOrderDesc": "注文内容を確認してください。送信後、未約定注文に入りマッチングを待ちます。",
     "enterValidOpenQuantity": "有効な建玉数量を入力してください",
