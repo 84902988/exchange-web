@@ -154,6 +154,16 @@ function isKnownCryptoContractSymbol(symbol: string) {
   return CRYPTO_CONTRACT_BASES.has(base);
 }
 
+function isStaticFallbackContractSymbol(symbol: string) {
+  return CONTRACT_SYMBOL_OPTIONS.some((item) => item.contractSymbol === symbol);
+}
+
+function shouldUseInitialContractSymbol(symbol: string) {
+  if (!symbol) return false;
+  if (isStaticFallbackContractSymbol(symbol)) return true;
+  return !isKnownCryptoContractSymbol(symbol);
+}
+
 function getContractDisplayLabel(item: ContractSymbolItem, t: ContractTranslator) {
   const displayName = String(item.display_name || '').trim();
   const marketDisplaySymbol = formatContractMarketDisplaySymbol(item.symbol, item.quote_asset);
@@ -343,7 +353,9 @@ function ContractPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const initialUrlContractSymbol = normalizeContractSymbol(searchParams.get('symbol'));
-  const initialContractSymbol = initialUrlContractSymbol || DEFAULT_CONTRACT_SYMBOL;
+  const initialContractSymbol = shouldUseInitialContractSymbol(initialUrlContractSymbol)
+    ? initialUrlContractSymbol
+    : DEFAULT_CONTRACT_SYMBOL;
   const { isLoggedIn, loading: authLoading } = useAuth();
   const [contractSymbol, setContractSymbol] = useState(() => initialContractSymbol);
   const [interval, setIntervalValue] = useState('1m');

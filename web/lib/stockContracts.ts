@@ -1,5 +1,23 @@
 export const DEFAULT_STOCK_CONTRACT_SYMBOL = 'NVDAUSDT_PERP'
 
+const CRYPTO_CONTRACT_BASES = new Set([
+  'BTC',
+  'ETH',
+  'BNB',
+  'SOL',
+  'XRP',
+  'DOGE',
+  'ADA',
+  'AVAX',
+  'MATIC',
+  'DOT',
+  'LTC',
+  'BCH',
+  'LINK',
+  'TRX',
+  'TON',
+])
+
 export function normalizeStockBaseSymbol(value?: string | null): string {
   return String(value || '')
     .trim()
@@ -19,6 +37,7 @@ export function stockContractToMarketSymbol(symbol: string): string {
 
 export function isMockStockContractSymbol(symbol?: string | null): boolean {
   const normalized = String(symbol || '').trim().toUpperCase()
-  return normalized.endsWith('USDT_PERP') && normalized !== 'BTCUSDT_PERP'
+  if (!normalized.endsWith('USDT_PERP')) return false
+  const base = normalized.replace(/USDT_PERP$/, '')
+  return !CRYPTO_CONTRACT_BASES.has(base)
 }
-
