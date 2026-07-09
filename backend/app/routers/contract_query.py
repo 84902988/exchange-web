@@ -100,6 +100,13 @@ def contract_orders(
     request: Request,
     symbol: str = Query("", description="Optional contract symbol"),
     status: str = Query("", description="Optional order status"),
+    status_group: str = Query("", description="Optional order status group: ACTIVE or HISTORY"),
+    side: str = Query("", description="Optional order side: BUY or SELL"),
+    position_side: str = Query("", description="Optional position side: LONG or SHORT"),
+    order_type: str = Query("", description="Optional order type: MARKET or LIMIT"),
+    action: str = Query("", description="Optional order action: OPEN or CLOSE"),
+    created_from: str = Query("", description="Optional created_at lower bound"),
+    created_to: str = Query("", description="Optional created_at upper bound"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -112,6 +119,13 @@ def contract_orders(
             int(user_id),
             symbol=symbol,
             status=status,
+            status_group=status_group,
+            side=side,
+            position_side=position_side,
+            order_type=order_type,
+            action=action,
+            created_from=created_from,
+            created_to=created_to,
             page=page,
             page_size=page_size,
         )
@@ -129,6 +143,11 @@ def contract_orders(
 def contract_trades(
     request: Request,
     symbol: str = Query("", description="Optional contract symbol"),
+    side: str = Query("", description="Optional trade side: BUY or SELL"),
+    position_side: str = Query("", description="Optional position side: LONG or SHORT"),
+    action: str = Query("", description="Optional trade action: OPEN or CLOSE"),
+    created_from: str = Query("", description="Optional created_at lower bound"),
+    created_to: str = Query("", description="Optional created_at upper bound"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -136,7 +155,18 @@ def contract_trades(
 ):
     trace_id = getattr(request.state, "trace_id", None)
     try:
-        data = get_user_contract_trades(db, int(user_id), symbol=symbol, page=page, page_size=page_size)
+        data = get_user_contract_trades(
+            db,
+            int(user_id),
+            symbol=symbol,
+            side=side,
+            position_side=position_side,
+            action=action,
+            created_from=created_from,
+            created_to=created_to,
+            page=page,
+            page_size=page_size,
+        )
         return ok(data=data.model_dump(), trace_id=trace_id)
     except HTTPException:
         raise
