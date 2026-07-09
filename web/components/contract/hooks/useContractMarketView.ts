@@ -1363,6 +1363,14 @@ export function useContractMarketView({
   const quoteStatusLabel = marketUiState.label;
   const quoteStatusTone = getContractQuoteStatusTone(marketUiState.status);
   const expiredLastGoodQuote = isExpiredLastGoodBboQuote(quote);
+  const tickerSource = marketView?.ticker_source ?? quote?.quote_source ?? quote?.source ?? null;
+  const tickerFreshness = marketView?.ticker_freshness ?? quoteFreshness;
+  const marketViewDepthSource = marketView?.depth_source ?? null;
+  const marketViewDepthFreshness = marketView?.depth_freshness ?? null;
+  const marketViewTradesSource = marketView?.trades_source ?? null;
+  const marketViewTradesFreshness = marketView?.trades_freshness ?? null;
+  const klineSource = marketView?.kline_source ?? marketView?.kline_current_candle?.kline_mode ?? null;
+  const klineFreshness = marketView?.kline_freshness ?? null;
 
   return {
     ...quoteState,
@@ -1377,8 +1385,12 @@ export function useContractMarketView({
     depthAsks,
     depthLoading,
     depthError: depthBelongsToCurrentSymbol ? depthState.error : null,
+    tickerSource,
+    tickerFreshness,
     depthSource: activeDepthSource,
     depthFreshness: activeDepthQuoteFreshness,
+    marketViewDepthSource,
+    marketViewDepthFreshness,
     depthUpdatedAt: activeDepthUpdatedAt,
     depthMode,
     depthStatus,
@@ -1389,6 +1401,10 @@ export function useContractMarketView({
     tradesError: tradesBelongToCurrentSymbol ? tradesState.error : null,
     tradesSource: tradesBelongToCurrentSymbol ? tradesState.source : null,
     tradesFreshness: tradesBelongToCurrentSymbol ? tradesState.freshness : null,
+    marketViewTradesSource,
+    marketViewTradesFreshness,
+    klineSource,
+    klineFreshness,
     latestTradePrice: latestTradeTickPrice,
     latestTradeDirection,
     latestTradeSource,

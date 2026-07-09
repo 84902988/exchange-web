@@ -158,6 +158,14 @@ class ContractMarketViewDetail(BaseModel):
     display_price: Optional[str] = None
     display_price_source: str = "NONE"
     current_price_source: str = "NONE"
+    ticker_source: Optional[str] = None
+    ticker_freshness: Optional[str] = None
+    depth_source: Optional[str] = None
+    depth_freshness: Optional[str] = None
+    trades_source: Optional[str] = None
+    trades_freshness: Optional[str] = None
+    kline_source: Optional[str] = None
+    kline_freshness: Optional[str] = None
     last_trade_price: Optional[str] = None
     last_trade_time: Optional[datetime] = None
     best_bid: Optional[str] = None

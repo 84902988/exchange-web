@@ -90,6 +90,14 @@ export type ContractMarketViewDetail = {
   display_price?: string | number | null
   display_price_source: string
   current_price_source?: string | null
+  ticker_source?: string | null
+  ticker_freshness?: string | null
+  depth_source?: string | null
+  depth_freshness?: string | null
+  trades_source?: string | null
+  trades_freshness?: string | null
+  kline_source?: string | null
+  kline_freshness?: string | null
   last_trade_price?: string | number | null
   last_trade_time?: string | null
   best_bid?: string | number | null

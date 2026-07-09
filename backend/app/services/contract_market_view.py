@@ -204,6 +204,23 @@ def _payload_freshness(payload: Optional[dict[str, Any]]) -> str:
     return _normalized((payload or {}).get("quote_freshness"))
 
 
+def _optional_normalized(value: Any) -> Optional[str]:
+    normalized = _normalized(value)
+    return normalized or None
+
+
+def _payload_source_or_none(payload: Optional[dict[str, Any]]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    return _optional_normalized(payload.get("quote_source") or payload.get("source"))
+
+
+def _payload_freshness_or_none(payload: Optional[dict[str, Any]]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    return _optional_normalized(payload.get("quote_freshness") or payload.get("freshness"))
+
+
 def _payload_time(payload: Optional[dict[str, Any]]) -> Optional[datetime]:
     if not isinstance(payload, dict):
         return None
@@ -259,6 +276,22 @@ def _latest_trade_time(latest_trade: Optional[dict[str, Any]]) -> Optional[datet
         or _to_datetime(latest_trade.get("ts"))
         or _to_datetime(latest_trade.get("timestamp"))
     )
+
+
+def _latest_trade_source(latest_trade: Optional[dict[str, Any]]) -> Optional[str]:
+    if not isinstance(latest_trade, dict):
+        return None
+    return _optional_normalized(
+        latest_trade.get("source")
+        or latest_trade.get("quote_source")
+        or latest_trade.get("price_source")
+    )
+
+
+def _latest_trade_freshness(latest_trade: Optional[dict[str, Any]]) -> Optional[str]:
+    if not isinstance(latest_trade, dict):
+        return None
+    return _optional_normalized(latest_trade.get("quote_freshness") or latest_trade.get("freshness"))
 
 
 def _normalize_interval(interval: Any) -> str:
@@ -381,6 +414,26 @@ def build_contract_kline_current_candle(
         price_source=price_source,
         updated_at_ms=int(now_dt.timestamp() * 1000),
     )
+
+
+def _kline_source(
+    latest_kline: Optional[dict[str, Any]],
+    kline_current_candle: Optional[dict[str, Any]],
+) -> Optional[str]:
+    if not isinstance(kline_current_candle, dict):
+        return None
+    if isinstance(latest_kline, dict):
+        raw_source = latest_kline.get("kline_mode") or latest_kline.get("source") or latest_kline.get("quote_source")
+        source = _optional_normalized(raw_source)
+        if source:
+            return source
+    return _optional_normalized(kline_current_candle.get("kline_mode") or kline_current_candle.get("price_source"))
+
+
+def _kline_freshness(latest_kline: Optional[dict[str, Any]]) -> Optional[str]:
+    if not isinstance(latest_kline, dict):
+        return None
+    return _optional_normalized(latest_kline.get("freshness") or latest_kline.get("quote_freshness"))
 
 
 def apply_quote_driven_kline_overlays(
@@ -520,11 +573,13 @@ def _raw_source_summary(
     latest_kline_close = _latest_kline_close(latest_kline)
     latest_trade_time = _latest_trade_time(latest_trade)
     latest_trade_price = _latest_trade_price(latest_trade)
+    latest_trade_freshness = _latest_trade_freshness(latest_trade)
     return {
         "quote_source": (quote or {}).get("quote_source") or (quote or {}).get("source"),
         "depth_source": (depth or {}).get("quote_source") or (depth or {}).get("source"),
         "latest_trade_source": (latest_trade or {}).get("source"),
         "latest_trade_price_source": (latest_trade or {}).get("price_source"),
+        "latest_trade_freshness": latest_trade_freshness,
         "quote_freshness": (quote or {}).get("quote_freshness") or (depth or {}).get("quote_freshness"),
         "executable": executable,
         "market_status": market_status,
@@ -536,6 +591,8 @@ def _raw_source_summary(
         "last_good_bbo_valid_raw": last_good_bbo_valid_raw,
         "latest_kline_open_time": latest_kline_open_time.isoformat() if latest_kline_open_time else None,
         "latest_kline_close": _format_decimal(latest_kline_close),
+        "kline_source": (latest_kline or {}).get("kline_mode") or (latest_kline or {}).get("source"),
+        "kline_freshness": _kline_freshness(latest_kline),
         "latest_trade_time": latest_trade_time.isoformat() if latest_trade_time else None,
         "latest_trade_price": _format_decimal(latest_trade_price),
     }
@@ -708,6 +765,14 @@ def build_contract_market_view(
         now=now_dt,
         mutate_quote_driven_state=mutate_quote_driven_state,
     )
+    ticker_source = _payload_source_or_none(quote)
+    ticker_freshness = _payload_freshness_or_none(quote)
+    depth_source = _payload_source_or_none(depth)
+    depth_freshness = _payload_freshness_or_none(depth)
+    trades_source = _latest_trade_source(latest_trade)
+    trades_freshness = _latest_trade_freshness(latest_trade)
+    kline_source = _kline_source(latest_kline, kline_current_candle)
+    kline_freshness = _kline_freshness(latest_kline)
 
     source_warnings = list(warnings or [])
     if last_good_older_than_kline:
@@ -740,6 +805,14 @@ def build_contract_market_view(
         "display_price": _format_decimal(display_price),
         "display_price_source": display_price_source,
         "current_price_source": current_price_source,
+        "ticker_source": ticker_source,
+        "ticker_freshness": ticker_freshness,
+        "depth_source": depth_source,
+        "depth_freshness": depth_freshness,
+        "trades_source": trades_source,
+        "trades_freshness": trades_freshness,
+        "kline_source": kline_source,
+        "kline_freshness": kline_freshness,
         "last_trade_price": _format_decimal(latest_trade_price),
         "last_trade_time": latest_trade_time,
         "best_bid": _format_decimal(bid),
