@@ -2,11 +2,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toNumber } from '@/components/contract/contractFormat';
+import { normalizeSide } from '@/components/spot/orderbook/orderbook.utils';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
+  getContractDepth,
   getContractMarketView,
   getContractQuoteDisplayStatus,
   isExpiredLastGoodBboQuote,
+  type ContractDepthLevel,
+  type ContractDepthMode,
   type ContractKlineCurrentCandle,
   type ContractKlineMode,
   type ContractMarketTrade,
@@ -74,6 +78,30 @@ type UseContractMarketViewParams = {
 };
 
 const LIVE_DEPTH_BBO_TTL_MS = 5000;
+const FUTURES_DEPTH_LIMIT = 20;
+const DEPTH_INITIAL_GRACE_MS = 1800;
+const DEPTH_FULL_DEGRADE_GRACE_MS = 3000;
+
+type ContractDepthSnapshot = {
+  symbol?: string | null;
+  asks: ContractDepthLevel[];
+  bids: ContractDepthLevel[];
+  source?: string | null;
+  quote_freshness?: string | null;
+  quote_source?: string | null;
+  depth_mode?: ContractDepthMode | null;
+  market_status?: string | null;
+  executable?: boolean | null;
+  closed_market_execution_mode?: string | null;
+  ts?: string | number | null;
+};
+
+type ContractDepthState = ContractDepthSnapshot & {
+  symbol: string;
+  loading: boolean;
+  error: string | null;
+  updatedAt: number | null;
+};
 
 function normalizeContractSymbol(value?: string | null) {
   return String(value || '').trim().toUpperCase();
@@ -187,6 +215,117 @@ function extractContractMarketStateMessage(message: ContractMarketRealtimeMessag
   return record.symbol ? record as ContractMarketViewDetail : null;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getMessagePayload(message: ContractMarketRealtimeMessage) {
+  if (isRecord(message.depth)) return message.depth;
+  if (isRecord(message.data)) return message.data;
+  return message as Record<string, unknown>;
+}
+
+function normalizeRealtimeLevels(value: unknown): ContractDepthLevel[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((level) => {
+      if (Array.isArray(level)) {
+        return {
+          price: String(level[0] ?? ''),
+          amount: String(level[1] ?? ''),
+        };
+      }
+      if (isRecord(level)) {
+        return {
+          price: String(level.price ?? ''),
+          amount: String(level.amount ?? level.qty ?? level.quantity ?? ''),
+        };
+      }
+      return null;
+    })
+    .filter((level): level is ContractDepthLevel => (
+      !!level && toNumber(level.price) > 0 && toNumber(level.amount) > 0
+    ));
+}
+
+function extractRealtimeDepth(
+  message: ContractMarketRealtimeMessage,
+  currentSymbol: string,
+): ContractDepthSnapshot | null {
+  const payload = getMessagePayload(message);
+  const msgSymbol = String(message.symbol || payload.symbol || '').trim().toUpperCase();
+  const normalizedCurrentSymbol = normalizeContractSymbol(currentSymbol);
+  if (msgSymbol && msgSymbol !== normalizedCurrentSymbol) return null;
+
+  const asks = normalizeRealtimeLevels(payload.asks);
+  const bids = normalizeRealtimeLevels(payload.bids);
+  if (asks.length === 0 && bids.length === 0) return null;
+
+  return {
+    symbol: msgSymbol || normalizedCurrentSymbol,
+    asks: normalizeSide(asks, 'asks', FUTURES_DEPTH_LIMIT),
+    bids: normalizeSide(bids, 'bids', FUTURES_DEPTH_LIMIT),
+    source: typeof payload.source === 'string' ? payload.source : null,
+    depth_mode: typeof payload.depth_mode === 'string'
+      ? payload.depth_mode as ContractDepthMode
+      : typeof payload.depthMode === 'string'
+        ? payload.depthMode as ContractDepthMode
+        : null,
+    quote_source: typeof payload.quote_source === 'string' ? payload.quote_source : null,
+    quote_freshness: typeof payload.quote_freshness === 'string'
+      ? payload.quote_freshness
+      : typeof payload.quoteFreshness === 'string'
+        ? payload.quoteFreshness
+        : null,
+    ts: typeof payload.ts === 'string' || typeof payload.ts === 'number'
+      ? payload.ts
+      : typeof payload.time === 'string' || typeof payload.time === 'number'
+        ? payload.time
+        : typeof payload.timestamp === 'string' || typeof payload.timestamp === 'number'
+          ? payload.timestamp
+          : null,
+    closed_market_execution_mode: typeof payload.closed_market_execution_mode === 'string'
+      ? payload.closed_market_execution_mode
+      : null,
+    executable: typeof payload.executable === 'boolean' ? payload.executable : null,
+    market_status: typeof payload.market_status === 'string' ? payload.market_status : null,
+  };
+}
+
+function minPrice(levels: ContractDepthLevel[]) {
+  let best: ContractDepthLevel | null = null;
+  for (const level of levels) {
+    const price = toNumber(level.price);
+    if (price <= 0) continue;
+    if (!best || price < toNumber(best.price)) best = level;
+  }
+  return best?.price ? String(best.price) : null;
+}
+
+function maxPrice(levels: ContractDepthLevel[]) {
+  let best: ContractDepthLevel | null = null;
+  for (const level of levels) {
+    const price = toNumber(level.price);
+    if (price <= 0) continue;
+    if (!best || price > toNumber(best.price)) best = level;
+  }
+  return best?.price ? String(best.price) : null;
+}
+
+function getTimestampMillis(value?: string | number | null) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 1_000_000_000_000 ? value : value * 1000;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Date.now();
+}
+
 export function useContractMarketView({
   contractSymbol,
   interval = '1m',
@@ -206,10 +345,33 @@ export function useContractMarketView({
   const [localChartLastClose, setLocalChartLastClose] = useState<string | null>(null);
   const [lastTradePrice, setLastTradePrice] = useState<string | null>(null);
   const [liveDepthBbo, setLiveDepthBbo] = useState<LiveDepthBbo | null>(null);
+  const [depthState, setDepthState] = useState<ContractDepthState>(() => ({
+    symbol: normalizeContractSymbol(contractSymbol),
+    asks: [],
+    bids: [],
+    source: null,
+    quote_freshness: null,
+    quote_source: null,
+    depth_mode: null,
+    market_status: null,
+    executable: null,
+    closed_market_execution_mode: null,
+    ts: null,
+    loading: true,
+    error: null,
+    updatedAt: null,
+  }));
+  const [fallbackDepthAllowed, setFallbackDepthAllowed] = useState(false);
+  const [lastFullDepthSnapshot, setLastFullDepthSnapshot] = useState<{
+    asks: ContractDepthLevel[];
+    bids: ContractDepthLevel[];
+  } | null>(null);
   const [priceDirection, setPriceDirection] = useState<PriceDirection>('flat');
   const [marketSessionRefreshKey, setMarketSessionRefreshKey] = useState(0);
   const requestSeqRef = useRef(0);
   const inFlightSymbolRef = useRef<string | null>(null);
+  const depthRequestSeqRef = useRef(0);
+  const depthInFlightSymbolRef = useRef<string | null>(null);
   const mountedRef = useRef(false);
   const currentPriceRef = useRef<number | null>(null);
   const previousMarketViewDisplayStateRef = useRef<string | null>(null);
@@ -220,6 +382,17 @@ export function useContractMarketView({
     symbolOptionMarketSymbol,
     symbolOptionPricePrecision,
   });
+  const {
+    initialDepth,
+    marketRealtimeStatus: quoteMarketRealtimeStatus,
+    handleBestPricesChange: handleDepthBestPricesChange,
+    handleDepthDataChange: handleDepthSnapshotChange,
+  } = quoteState;
+  const initialDepthRef = useRef<ContractDepthSnapshot | undefined>(initialDepth);
+
+  useEffect(() => {
+    initialDepthRef.current = initialDepth;
+  }, [initialDepth]);
 
   const refreshMarketView = useCallback(async () => {
     const requestSymbol = normalizeContractSymbol(contractSymbol);
@@ -266,6 +439,8 @@ export function useContractMarketView({
   useEffect(() => {
     requestSeqRef.current += 1;
     inFlightSymbolRef.current = null;
+    depthRequestSeqRef.current += 1;
+    depthInFlightSymbolRef.current = null;
     currentPriceRef.current = null;
     previousMarketViewDisplayStateRef.current = null;
     setRestMarketView(null);
@@ -275,6 +450,24 @@ export function useContractMarketView({
     setLocalChartLastClose(null);
     setLastTradePrice(null);
     setLiveDepthBbo(null);
+    setDepthState({
+      symbol: normalizeContractSymbol(contractSymbol),
+      asks: [],
+      bids: [],
+      source: null,
+      quote_freshness: null,
+      quote_source: null,
+      depth_mode: null,
+      market_status: null,
+      executable: null,
+      closed_market_execution_mode: null,
+      ts: null,
+      loading: true,
+      error: null,
+      updatedAt: null,
+    });
+    setFallbackDepthAllowed(false);
+    setLastFullDepthSnapshot(null);
     setPriceDirection('flat');
 
     void refreshMarketView();
@@ -320,6 +513,192 @@ export function useContractMarketView({
   );
   const marketViewQuoteDisplayStatus = marketViewStateToQuoteStatus(marketViewDisplayState);
   const effectiveQuoteDisplayStatus = marketViewQuoteDisplayStatus || quoteDisplayStatus;
+  const depthBelongsToCurrentSymbol = normalizeContractSymbol(depthState.symbol) === normalizeContractSymbol(contractSymbol);
+  const activeDepthAsks = useMemo(
+    () => (depthBelongsToCurrentSymbol ? depthState.asks : []),
+    [depthBelongsToCurrentSymbol, depthState.asks],
+  );
+  const activeDepthBids = useMemo(
+    () => (depthBelongsToCurrentSymbol ? depthState.bids : []),
+    [depthBelongsToCurrentSymbol, depthState.bids],
+  );
+  const activeDepthSource = depthBelongsToCurrentSymbol ? depthState.source ?? null : null;
+  const activeDepthMode = depthBelongsToCurrentSymbol ? depthState.depth_mode ?? null : null;
+  const activeDepthMarketStatus = depthBelongsToCurrentSymbol ? depthState.market_status ?? null : null;
+  const activeDepthExecutable = depthBelongsToCurrentSymbol ? depthState.executable ?? null : null;
+  const activeDepthQuoteSource = depthBelongsToCurrentSymbol ? depthState.quote_source ?? null : null;
+  const activeDepthQuoteFreshness = depthBelongsToCurrentSymbol ? depthState.quote_freshness ?? null : null;
+  const activeDepthTs = depthBelongsToCurrentSymbol ? depthState.ts ?? null : null;
+  const activeDepthClosedMarketExecutionMode = depthBelongsToCurrentSymbol
+    ? depthState.closed_market_execution_mode ?? null
+    : null;
+  const activeDepthUpdatedAt = depthBelongsToCurrentSymbol ? depthState.updatedAt : null;
+  const activeDepthLoading = depthState.loading || !depthBelongsToCurrentSymbol;
+  const effectiveMarketStatus = marketStatus === 'CLOSED'
+    || marketStatus === 'HOLIDAY'
+    || activeDepthMarketStatus === 'CLOSED'
+    || activeDepthMarketStatus === 'HOLIDAY'
+    ? 'CLOSED'
+    : marketStatus || activeDepthMarketStatus || null;
+
+  const applyDepthSnapshot = useCallback((depth: ContractDepthSnapshot, options: { loading?: boolean; error?: string | null } = {}) => {
+    const requestSymbol = normalizeContractSymbol(contractSymbol);
+    const nextSymbol = normalizeContractSymbol(depth.symbol) || requestSymbol;
+    if (nextSymbol !== requestSymbol) return;
+
+    setDepthState({
+      symbol: requestSymbol,
+      asks: normalizeSide(depth.asks || [], 'asks', FUTURES_DEPTH_LIMIT),
+      bids: normalizeSide(depth.bids || [], 'bids', FUTURES_DEPTH_LIMIT),
+      source: depth.source || null,
+      quote_freshness: depth.quote_freshness || null,
+      quote_source: depth.quote_source || depth.source || null,
+      depth_mode: depth.depth_mode || null,
+      market_status: depth.market_status || null,
+      executable: depth.executable ?? null,
+      closed_market_execution_mode: depth.closed_market_execution_mode || null,
+      ts: depth.ts || null,
+      loading: options.loading ?? false,
+      error: options.error ?? null,
+      updatedAt: getTimestampMillis(depth.ts),
+    });
+  }, [contractSymbol]);
+
+  const refreshDepth = useCallback(async () => {
+    const requestSymbol = normalizeContractSymbol(contractSymbol);
+    if (!requestSymbol) return;
+    if (depthInFlightSymbolRef.current === requestSymbol) return;
+
+    const requestSeq = depthRequestSeqRef.current + 1;
+    depthRequestSeqRef.current = requestSeq;
+    depthInFlightSymbolRef.current = requestSymbol;
+
+    try {
+      const depth = await getContractDepth(requestSymbol, FUTURES_DEPTH_LIMIT);
+      if (
+        !mountedRef.current
+        || depthRequestSeqRef.current !== requestSeq
+        || normalizeContractSymbol(depth.symbol) !== requestSymbol
+      ) {
+        return;
+      }
+      applyDepthSnapshot({
+        symbol: depth.symbol || requestSymbol,
+        asks: depth.asks,
+        bids: depth.bids,
+        source: depth.source,
+        depth_mode: depth.depth_mode || null,
+        quote_freshness: depth.quote_freshness || null,
+        quote_source: depth.quote_source || depth.source || null,
+        market_status: depth.market_status || null,
+        executable: depth.executable ?? null,
+        closed_market_execution_mode: depth.closed_market_execution_mode || null,
+        ts: depth.ts || null,
+      });
+    } catch (error) {
+      if (!mountedRef.current || depthRequestSeqRef.current !== requestSeq) return;
+      setDepthState((current) => ({
+        ...current,
+        symbol: requestSymbol,
+        loading: false,
+        error: getErrorMessage(error),
+      }));
+    } finally {
+      if (depthInFlightSymbolRef.current === requestSymbol) {
+        depthInFlightSymbolRef.current = null;
+      }
+    }
+  }, [applyDepthSnapshot, contractSymbol]);
+
+  useEffect(() => {
+    const requestSymbol = normalizeContractSymbol(contractSymbol);
+    const cachedDepth = initialDepthRef.current;
+    const cachedDepthSymbol = normalizeContractSymbol(cachedDepth?.symbol) || requestSymbol;
+    const cachedDepthBelongsToCurrentSymbol = cachedDepthSymbol === requestSymbol;
+    const cachedAsks = cachedDepthBelongsToCurrentSymbol ? cachedDepth?.asks || [] : [];
+    const cachedBids = cachedDepthBelongsToCurrentSymbol ? cachedDepth?.bids || [] : [];
+
+    setFallbackDepthAllowed(false);
+    setLastFullDepthSnapshot(null);
+
+    if (cachedAsks.length > 0 || cachedBids.length > 0) {
+      const cachedDepthHasConfirmedStatus = cachedDepth?.executable !== undefined
+        && cachedDepth?.executable !== null;
+      applyDepthSnapshot({
+        symbol: requestSymbol,
+        asks: cachedAsks,
+        bids: cachedBids,
+        source: cachedDepth?.source || null,
+        depth_mode: cachedDepth?.depth_mode || null,
+        quote_freshness: cachedDepth?.quote_freshness || null,
+        quote_source: cachedDepth?.quote_source || cachedDepth?.source || null,
+        market_status: cachedDepth?.market_status || null,
+        executable: cachedDepth?.executable ?? null,
+        closed_market_execution_mode: cachedDepth?.closed_market_execution_mode || null,
+        ts: cachedDepth?.ts || null,
+      }, {
+        loading: !cachedDepthHasConfirmedStatus,
+      });
+    } else {
+      setDepthState({
+        symbol: requestSymbol,
+        asks: [],
+        bids: [],
+        source: null,
+        quote_freshness: null,
+        quote_source: null,
+        depth_mode: null,
+        market_status: null,
+        executable: null,
+        closed_market_execution_mode: null,
+        ts: null,
+        loading: true,
+        error: null,
+        updatedAt: null,
+      });
+    }
+
+    const fallbackTimer = window.setTimeout(() => {
+      setFallbackDepthAllowed(true);
+    }, DEPTH_INITIAL_GRACE_MS);
+
+    void refreshDepth();
+    if (quoteMarketRealtimeStatus === 'connected') {
+      return () => {
+        depthRequestSeqRef.current += 1;
+        window.clearTimeout(fallbackTimer);
+      };
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshDepth();
+    }, 1500);
+
+    return () => {
+      depthRequestSeqRef.current += 1;
+      window.clearTimeout(fallbackTimer);
+      window.clearInterval(timer);
+    };
+  }, [
+    applyDepthSnapshot,
+    contractSymbol,
+    marketSessionRefreshKey,
+    quoteMarketRealtimeStatus,
+    refreshDepth,
+  ]);
+
+  useEffect(() => {
+    const handleDepthMessage = (message: ContractMarketRealtimeMessage) => {
+      if (effectiveMarketStatus === 'CLOSED') return;
+
+      const depth = extractRealtimeDepth(message, contractSymbol);
+      if (!depth) return;
+      applyDepthSnapshot(depth);
+    };
+
+    return contractMarketRealtime.subscribe('depth', handleDepthMessage);
+  }, [applyDepthSnapshot, contractSymbol, effectiveMarketStatus]);
+
   const marketViewDisplayPrice = getPositivePrice(marketView?.display_price);
   const marketViewCurrentPriceSource = marketViewDisplayPrice !== null
     ? normalizeCurrentPriceSource(marketView?.current_price_source || marketView?.display_price_source) || 'LIVE_MID'
@@ -426,6 +805,152 @@ export function useContractMarketView({
     rawMarketViewDisplayState,
     t,
   ]);
+
+  const normalizedActiveDepthMode = String(activeDepthMode || '').trim().toUpperCase();
+  useEffect(() => {
+    if (normalizedActiveDepthMode !== 'FULL_DEPTH') return;
+    if (!activeDepthAsks.length || !activeDepthBids.length) return;
+    setLastFullDepthSnapshot({
+      asks: activeDepthAsks,
+      bids: activeDepthBids,
+    });
+  }, [activeDepthAsks, activeDepthBids, normalizedActiveDepthMode]);
+
+  useEffect(() => {
+    if (normalizedActiveDepthMode === 'FULL_DEPTH' || !lastFullDepthSnapshot) return undefined;
+    const timer = window.setTimeout(() => {
+      setLastFullDepthSnapshot(null);
+    }, DEPTH_FULL_DEGRADE_GRACE_MS);
+    return () => window.clearTimeout(timer);
+  }, [lastFullDepthSnapshot, normalizedActiveDepthMode]);
+
+  const hasRawDepthRows = activeDepthAsks.length > 0 || activeDepthBids.length > 0;
+  const hasFullDepth = normalizedActiveDepthMode === 'FULL_DEPTH';
+  const shouldHoldPreviousFullDepth = !hasFullDepth && !!lastFullDepthSnapshot;
+  const shouldDelayFallbackDepth = hasRawDepthRows
+    && !hasFullDepth
+    && !fallbackDepthAllowed
+    && !shouldHoldPreviousFullDepth;
+  const depthAsks = useMemo(() => {
+    if (hasFullDepth) return activeDepthAsks;
+    if (shouldHoldPreviousFullDepth) return lastFullDepthSnapshot?.asks || [];
+    if (fallbackDepthAllowed) return activeDepthAsks;
+    return [];
+  }, [activeDepthAsks, fallbackDepthAllowed, hasFullDepth, lastFullDepthSnapshot, shouldHoldPreviousFullDepth]);
+  const depthBids = useMemo(() => {
+    if (hasFullDepth) return activeDepthBids;
+    if (shouldHoldPreviousFullDepth) return lastFullDepthSnapshot?.bids || [];
+    if (fallbackDepthAllowed) return activeDepthBids;
+    return [];
+  }, [activeDepthBids, fallbackDepthAllowed, hasFullDepth, lastFullDepthSnapshot, shouldHoldPreviousFullDepth]);
+  const depthMode = hasFullDepth
+    ? activeDepthMode
+    : shouldHoldPreviousFullDepth
+      ? 'FULL_DEPTH'
+      : fallbackDepthAllowed
+        ? activeDepthMode
+        : null;
+  const depthLoading = activeDepthLoading || shouldDelayFallbackDepth;
+  const depthBestBid = maxPrice(activeDepthBids);
+  const depthBestAsk = minPrice(activeDepthAsks);
+  const depthBestBidNumber = getPositivePrice(depthBestBid);
+  const depthBestAskNumber = getPositivePrice(depthBestAsk);
+  const liveMidPrice = depthBestBidNumber !== null && depthBestAskNumber !== null && depthBestAskNumber >= depthBestBidNumber
+    ? (depthBestBidNumber + depthBestAskNumber) / 2
+    : null;
+
+  useEffect(() => {
+    handleDepthBestPricesChange({
+      bestBid: depthBestBid,
+      bestAsk: depthBestAsk,
+      ts: activeDepthTs,
+    });
+  }, [activeDepthTs, depthBestAsk, depthBestBid, handleDepthBestPricesChange]);
+
+  useEffect(() => {
+    if (!depthBelongsToCurrentSymbol) return;
+    if (!activeDepthAsks.length && !activeDepthBids.length) return;
+    handleDepthSnapshotChange({
+      symbol: contractSymbol,
+      asks: activeDepthAsks,
+      bids: activeDepthBids,
+      source: activeDepthSource,
+      depth_mode: activeDepthMode,
+      quote_freshness: activeDepthQuoteFreshness,
+      quote_source: activeDepthQuoteSource || activeDepthSource,
+      market_status: activeDepthMarketStatus,
+      executable: activeDepthExecutable,
+      closed_market_execution_mode: activeDepthClosedMarketExecutionMode,
+      ts: activeDepthTs,
+    });
+  }, [
+    activeDepthAsks,
+    activeDepthBids,
+    activeDepthClosedMarketExecutionMode,
+    activeDepthExecutable,
+    activeDepthMarketStatus,
+    activeDepthMode,
+    activeDepthQuoteFreshness,
+    activeDepthQuoteSource,
+    activeDepthSource,
+    activeDepthTs,
+    contractSymbol,
+    depthBelongsToCurrentSymbol,
+    handleDepthSnapshotChange,
+  ]);
+
+  useEffect(() => {
+    if (depthBestBidNumber !== null && depthBestAskNumber !== null && liveMidPrice !== null) {
+      setLiveDepthBbo({
+        bid: depthBestBidNumber,
+        ask: depthBestAskNumber,
+        mid: liveMidPrice,
+        source: 'LIVE_MID',
+        updatedAt: activeDepthUpdatedAt ?? Date.now(),
+      });
+      return;
+    }
+    setLiveDepthBbo(null);
+  }, [activeDepthUpdatedAt, depthBestAskNumber, depthBestBidNumber, liveMidPrice]);
+
+  const depthExpiredLastGoodQuote = isExpiredLastGoodBboQuote({
+    executable: activeDepthExecutable ?? undefined,
+    market_status: activeDepthMarketStatus || effectiveMarketStatus || undefined,
+    closed_market_execution_mode: activeDepthClosedMarketExecutionMode || undefined,
+    quote_freshness: activeDepthQuoteFreshness || undefined,
+    quote_source: activeDepthQuoteSource || undefined,
+    source: activeDepthSource || undefined,
+  });
+  const hasConfirmedDepthStatus = activeDepthExecutable !== null || depthExpiredLastGoodQuote;
+  const depthStatusLoading = activeDepthLoading && !hasConfirmedDepthStatus;
+  const ownDepthDisplayStatus = getContractQuoteDisplayStatus({
+    executable: activeDepthExecutable ?? undefined,
+    market_status: activeDepthMarketStatus || effectiveMarketStatus || undefined,
+    closed_market_execution_mode: activeDepthClosedMarketExecutionMode || undefined,
+    quote_freshness: activeDepthQuoteFreshness || undefined,
+    quote_source: activeDepthQuoteSource || undefined,
+    source: activeDepthSource || undefined,
+  }, {
+    loading: depthStatusLoading,
+  });
+  const quoteFallbackDisplayStatus = getContractQuoteDisplayStatus(quote, {
+    loading: quoteStatusLoading && !quote,
+  });
+  const shouldUseQuoteFallbackStatus = !hasConfirmedDepthStatus
+    && quoteFallbackDisplayStatus !== 'UNAVAILABLE';
+  const fallbackDepthDisplayStatus = shouldUseQuoteFallbackStatus
+    ? quoteFallbackDisplayStatus
+    : ownDepthDisplayStatus;
+  const depthStatus = marketUiState.status || (
+    displayPriceReady
+      ? (marketViewQuoteDisplayStatus || fallbackDepthDisplayStatus)
+      : 'LOADING'
+  );
+  const depthStatusLabel = marketUiState.label || (!displayPriceReady
+    ? t('marketDataLoadingLabel', 'contracts')
+    : rawMarketViewDisplayState && marketViewQuoteDisplayStatus
+    ? getMarketViewStatusLabel(rawMarketViewDisplayState, t)
+    : getContractQuoteStatusLabel(depthStatus, t));
 
   const contractKlineMode: ContractKlineMode = 'PROVIDER_KLINE';
   const derivedMarketState = useMemo<ContractMarketCenterState>(() => {
@@ -588,6 +1113,17 @@ export function useContractMarketView({
     displayState: rawMarketViewDisplayState,
     displayPriceSource,
     displayPriceLabel,
+    depthBids,
+    depthAsks,
+    depthLoading,
+    depthError: depthBelongsToCurrentSymbol ? depthState.error : null,
+    depthSource: activeDepthSource,
+    depthFreshness: activeDepthQuoteFreshness,
+    depthUpdatedAt: activeDepthUpdatedAt,
+    depthMode,
+    depthStatus,
+    depthStatusLabel,
+    liveMidPrice,
     bestBid: derivedMarketState.bestBid,
     bestAsk: derivedMarketState.bestAsk,
     spread: derivedMarketState.spread,

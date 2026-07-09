@@ -386,13 +386,20 @@ function ContractPageContent() {
     pricePrecision,
     quoteHint,
     marketRealtimeStatus,
-    initialDepth,
-    handleBestPricesChange,
-    handleDepthDataChange,
     marketView: activeContractMarketView,
     displayPrice: currentPriceNumber,
     displayPriceSource: currentPriceSource,
     displayPriceLabel: currentPriceSourceLabel,
+    depthBids,
+    depthAsks,
+    depthLoading,
+    depthError,
+    depthSource,
+    depthFreshness,
+    depthUpdatedAt,
+    depthMode,
+    depthStatus,
+    depthStatusLabel,
     bestBid: hookBestBid,
     bestAsk: hookBestAsk,
     spread: hookSpread,
@@ -411,11 +418,9 @@ function ContractPageContent() {
     quoteStatusTone,
     currentPriceReady,
     priceDirection: currentPriceDirection,
-    marketSessionRefreshKey,
     expiredLastGoodQuote,
     handleLatestKlineCloseChange,
     handleLastTradePriceChange,
-    handleLiveBboChange,
   } = useContractMarketView({
     contractSymbol,
     interval,
@@ -781,22 +786,25 @@ function ContractPageContent() {
                         symbol={contractSymbol}
                         priceDirection={currentPriceDirection}
                         pricePrecision={pricePrecision}
-                        marketStatus={contractMarketStatus}
-                        marketRealtimeStatus={marketRealtimeStatus}
-                        refreshKey={marketSessionRefreshKey}
-                        currentPrice={contractMarketState.displayPrice}
-                        currentPriceReady={currentPriceReady}
-                        currentPriceSource={contractMarketState.displayPriceSource}
-                        currentPriceLabel={contractMarketState.displayPriceLabel}
-                        marketUiState={marketUiState}
+                        bids={depthBids}
+                        asks={depthAsks}
+                        status={depthStatus}
+                        statusLabel={depthStatusLabel}
+                        centerPrice={contractMarketState.displayPrice}
+                        centerPriceReady={currentPriceReady}
+                        centerPriceSource={contractMarketState.displayPriceSource}
+                        centerPriceLabel={contractMarketState.displayPriceLabel}
+                        bestBid={hookBestBid}
+                        bestAsk={hookBestAsk}
+                        spread={hookSpread}
                         marketView={activeContractMarketView}
-                        quote={contractQuote}
-                        quoteLoading={quoteStatusLoading}
-                        initialDepth={initialDepth}
-                        onPriceSelect={setSelectedPrice}
-                        onBestPricesChange={handleBestPricesChange}
-                        onLiveBboChange={handleLiveBboChange}
-                        onDepthDataChange={handleDepthDataChange}
+                        depthMode={depthMode}
+                        depthSource={depthSource}
+                        depthFreshness={depthFreshness}
+                        depthUpdatedAt={depthUpdatedAt}
+                        loading={depthLoading}
+                        error={depthError}
+                        onPriceClick={setSelectedPrice}
                       />
                     </div>
 
