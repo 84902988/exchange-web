@@ -54,6 +54,10 @@ type TimeRangeFilterValues = {
   created_from?: string;
   created_to?: string;
 };
+type FilterSummaryChip = {
+  key: string;
+  label: string;
+};
 type OrderFeedback = {
   type: 'success' | 'error';
   message: string;
@@ -214,6 +218,7 @@ export default function ContractPositionTabs({
     ? t('latestPrice', 'contracts')
     : t('markPrice', 'contracts');
   const [activeTab, setActiveTab] = useState<TabKey>('positions');
+  const [filtersExpanded, setFiltersExpanded] = useState(false);
   const [internalScope, setInternalScope] = useState<PositionScope>('current');
   const scope = controlledScope ?? internalScope;
   const [pages, setPages] = useState<Record<TabKey, number>>({
@@ -271,6 +276,25 @@ export default function ContractPositionTabs({
     { key: 'position_side', label: t('direction', 'contracts'), options: directionFilterOptions },
     { key: 'action', label: t('filterAction', 'contracts'), options: actionFilterOptions },
   ], [actionFilterOptions, directionFilterOptions, t]);
+  const supportsOrderTradeFilters = activeTab === 'openOrders' || activeTab === 'historyOrders' || activeTab === 'trades';
+  const activeFilterGroups = activeTab === 'trades' ? tradeFilterGroups : orderFilterGroups;
+  const activeFilterValues = activeTab === 'openOrders'
+    ? activeOrdersFilters
+    : activeTab === 'historyOrders'
+      ? orderHistoryFilters
+      : activeTab === 'trades'
+        ? tradeHistoryFilters
+        : undefined;
+  const activeFilterChips = useMemo(
+    () => supportsOrderTradeFilters
+      ? buildFilterSummaryChips(
+        activeFilterGroups as Array<FilterGroup<string>>,
+        activeFilterValues as (Record<string, string | undefined> & TimeRangeFilterValues) | undefined,
+        t,
+      )
+      : [],
+    [activeFilterGroups, activeFilterValues, supportsOrderTradeFilters, t],
+  );
   const normalizedCurrentSymbol = useMemo(() => normalizeContractSymbol(currentSymbol), [currentSymbol]);
   const currentPositionRowsSource = useMemo(
     () => positionsPagination ? (positionsPageItems || []) : positions,
@@ -428,6 +452,10 @@ export default function ContractPositionTabs({
     setPages((previous) => ({ ...previous, [activeTab]: 1 }));
   }, [activeTab, scope]);
 
+  useEffect(() => {
+    setFiltersExpanded(false);
+  }, [activeTab]);
+
   function selectTab(tab: TabKey) {
     setActiveTab(tab);
     onActiveTabChange?.(tab);
@@ -437,6 +465,16 @@ export default function ContractPositionTabs({
   function changeScope(nextScope: PositionScope) {
     setInternalScope(nextScope);
     onScopeChange?.(nextScope);
+  }
+
+  function clearActiveFilters() {
+    if (activeTab === 'openOrders') {
+      onActiveOrdersFiltersChange?.({});
+    } else if (activeTab === 'historyOrders') {
+      onOrderHistoryFiltersChange?.({});
+    } else if (activeTab === 'trades') {
+      onTradeHistoryFiltersChange?.({});
+    }
   }
 
   function setTabPage(tab: TabKey, page: number) {
@@ -813,7 +851,15 @@ export default function ContractPositionTabs({
         </div>
       </div>
 
-      <PositionScopeSwitcher value={scope} onChange={changeScope} />
+      <PositionScopeSwitcher
+        value={scope}
+        onChange={changeScope}
+        filtersSupported={supportsOrderTradeFilters}
+        filtersExpanded={filtersExpanded}
+        filterChips={activeFilterChips}
+        onToggleFilters={() => setFiltersExpanded((value) => !value)}
+        onClearFilters={clearActiveFilters}
+      />
 
       <div className="overflow-visible">
         {activeTab === 'positions' ? (
@@ -862,15 +908,14 @@ export default function ContractPositionTabs({
         {activeTab === 'openOrders' ? (
           <>
             {orderFeedback ? <OrderFeedbackBox feedback={orderFeedback} /> : null}
-            <OrderTradeFilterBar
-              groups={orderFilterGroups}
-              values={activeOrdersFilters}
-              onChange={(key, value) => setOrderFilterValue(activeOrdersFilters, onActiveOrdersFiltersChange, key, value)}
-            />
-            <OrderTradeTimeFilterBar
-              values={activeOrdersFilters}
-              onChange={(timeFilters) => onActiveOrdersFiltersChange?.({ ...(activeOrdersFilters || {}), ...timeFilters })}
-            />
+            {filtersExpanded ? (
+              <OrderTradeAdvancedFilters
+                groups={orderFilterGroups}
+                values={activeOrdersFilters}
+                onFilterChange={(key, value) => setOrderFilterValue(activeOrdersFilters, onActiveOrdersFiltersChange, key, value)}
+                onTimeChange={(timeFilters) => onActiveOrdersFiltersChange?.({ ...(activeOrdersFilters || {}), ...timeFilters })}
+              />
+            ) : null}
             <ContractOrderTabs
               rows={pagedOpenOrders}
               emptyText={t('emptyOpenOrders', 'contracts')}
@@ -890,15 +935,14 @@ export default function ContractPositionTabs({
         ) : null}
         {activeTab === 'historyOrders' ? (
           <>
-            <OrderTradeFilterBar
-              groups={orderFilterGroups}
-              values={orderHistoryFilters}
-              onChange={(key, value) => setOrderFilterValue(orderHistoryFilters, onOrderHistoryFiltersChange, key, value)}
-            />
-            <OrderTradeTimeFilterBar
-              values={orderHistoryFilters}
-              onChange={(timeFilters) => onOrderHistoryFiltersChange?.({ ...(orderHistoryFilters || {}), ...timeFilters })}
-            />
+            {filtersExpanded ? (
+              <OrderTradeAdvancedFilters
+                groups={orderFilterGroups}
+                values={orderHistoryFilters}
+                onFilterChange={(key, value) => setOrderFilterValue(orderHistoryFilters, onOrderHistoryFiltersChange, key, value)}
+                onTimeChange={(timeFilters) => onOrderHistoryFiltersChange?.({ ...(orderHistoryFilters || {}), ...timeFilters })}
+              />
+            ) : null}
             <ContractOrderTabs
               rows={pagedHistoryOrders}
               emptyText={t('emptyHistoryOrders', 'contracts')}
@@ -918,15 +962,14 @@ export default function ContractPositionTabs({
         ) : null}
         {activeTab === 'trades' ? (
           <>
-            <OrderTradeFilterBar
-              groups={tradeFilterGroups}
-              values={tradeHistoryFilters}
-              onChange={(key, value) => setTradeFilterValue(tradeHistoryFilters, onTradeHistoryFiltersChange, key, value)}
-            />
-            <OrderTradeTimeFilterBar
-              values={tradeHistoryFilters}
-              onChange={(timeFilters) => onTradeHistoryFiltersChange?.({ ...(tradeHistoryFilters || {}), ...timeFilters })}
-            />
+            {filtersExpanded ? (
+              <OrderTradeAdvancedFilters
+                groups={tradeFilterGroups}
+                values={tradeHistoryFilters}
+                onFilterChange={(key, value) => setTradeFilterValue(tradeHistoryFilters, onTradeHistoryFiltersChange, key, value)}
+                onTimeChange={(timeFilters) => onTradeHistoryFiltersChange?.({ ...(tradeHistoryFilters || {}), ...timeFilters })}
+              />
+            ) : null}
             <TradesTable rows={pagedTrades} pricePrecision={pricePrecision} loading={isTradesTabLoading} />
             <PaginationControls
               page={tradeHistoryPagination?.page ?? pages.trades}
@@ -1090,6 +1133,49 @@ function getTotalPages(totalItems: number, size: number) {
   return Math.max(1, Math.ceil(totalItems / size));
 }
 
+function buildFilterSummaryChips(
+  groups: Array<FilterGroup<string>>,
+  values: (Record<string, string | undefined> & TimeRangeFilterValues) | undefined,
+  t: ContractTranslator,
+): FilterSummaryChip[] {
+  if (!values) return [];
+  const chips: FilterSummaryChip[] = [];
+  groups.forEach((group) => {
+    const value = values[group.key];
+    if (!value) return;
+    const option = group.options.find((item) => item.value === value);
+    if (option && option.value) {
+      chips.push({ key: group.key, label: option.label });
+    }
+  });
+  const timeLabel = getTimeRangeSummaryLabel(values, t);
+  if (timeLabel) {
+    chips.push({ key: 'time', label: timeLabel });
+  }
+  return chips;
+}
+
+function getTimeRangeSummaryLabel(values: TimeRangeFilterValues, t: ContractTranslator) {
+  if (!values.created_from && !values.created_to) return null;
+  const from = values.created_from ? new Date(values.created_from) : null;
+  const to = values.created_to ? new Date(values.created_to) : null;
+  if (from && to && !Number.isNaN(from.getTime()) && !Number.isNaN(to.getTime())) {
+    const diffDays = (to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000);
+    if (from.getHours() === 0 && from.getMinutes() === 0 && isSameLocalDate(from, new Date())) {
+      return t('filterToday', 'contracts');
+    }
+    if (Math.abs(diffDays - 7) < 0.08) return t('filterLast7Days', 'contracts');
+    if (Math.abs(diffDays - 30) < 0.08) return t('filterLast30Days', 'contracts');
+  }
+  return t('filterTimeRange', 'contracts');
+}
+
+function isSameLocalDate(left: Date, right: Date) {
+  return left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate();
+}
+
 function setOrderFilterValue(
   filters: ContractOrderFilterState | undefined,
   onChange: ((filters: ContractOrderFilterState) => void) | undefined,
@@ -1154,29 +1240,31 @@ function getQuickTimeRange(days: 0 | 7 | 30): TimeRangeFilterValues {
   };
 }
 
-function OrderTradeFilterBar<T extends string>({
+function OrderTradeAdvancedFilters<T extends string>({
   groups,
   values,
-  onChange,
+  onFilterChange,
+  onTimeChange,
 }: {
   groups: Array<FilterGroup<T>>;
-  values?: Partial<Record<T, string | undefined>>;
-  onChange: (key: T, value: string) => void;
+  values?: Partial<Record<T, string | undefined>> & TimeRangeFilterValues;
+  onFilterChange: (key: T, value: string) => void;
+  onTimeChange: (values: TimeRangeFilterValues) => void;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-2 border-b border-white/5 px-3 py-2 text-[12px] text-white/55">
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-white/5 px-2 py-1.5 text-[12px] text-white/55">
       {groups.map((group) => (
-        <div key={group.key} className="flex items-center gap-1.5">
+        <div key={group.key} className="flex h-7 items-center gap-1.5">
           <span className="shrink-0 text-white/40">{group.label}</span>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-0.5">
             {group.options.map((option) => {
               const active = (values?.[group.key] || '') === option.value;
               return (
                 <button
                   key={option.value || 'all'}
                   type="button"
-                  onClick={() => onChange(group.key, option.value)}
-                  className={`h-6 rounded-md px-2 text-[12px] transition-colors ${
+                  onClick={() => onFilterChange(group.key, option.value)}
+                  className={`h-6 rounded px-2 text-[12px] transition-colors ${
                     active
                       ? 'bg-white text-black'
                       : 'bg-white/[0.04] text-white/60 hover:bg-white/[0.08] hover:text-white'
@@ -1189,11 +1277,12 @@ function OrderTradeFilterBar<T extends string>({
           </div>
         </div>
       ))}
+      <OrderTradeTimeControls values={values} onChange={onTimeChange} />
     </div>
   );
 }
 
-function OrderTradeTimeFilterBar({
+function OrderTradeTimeControls({
   values,
   onChange,
 }: {
@@ -1201,47 +1290,46 @@ function OrderTradeTimeFilterBar({
   onChange: (values: TimeRangeFilterValues) => void;
 }) {
   const { t } = useLocaleContext();
-  const [draft, setDraft] = useState<TimeRangeFilterValues>(() => ({
+  const currentValues: TimeRangeFilterValues = {
     created_from: values?.created_from || '',
     created_to: values?.created_to || '',
-  }));
-  const hasRange = !!(draft.created_from || draft.created_to);
+  };
+  const hasRange = !!(currentValues.created_from || currentValues.created_to);
   const applyDraft = (nextDraft: TimeRangeFilterValues) => {
-    setDraft(nextDraft);
     onChange({
       created_from: nextDraft.created_from || undefined,
       created_to: nextDraft.created_to || undefined,
     });
   };
   const updateStartTime = (event: React.FormEvent<HTMLInputElement>) => {
-    applyDraft({ ...draft, created_from: event.currentTarget.value || undefined });
+    applyDraft({ ...currentValues, created_from: event.currentTarget.value || undefined });
   };
   const updateEndTime = (event: React.FormEvent<HTMLInputElement>) => {
-    applyDraft({ ...draft, created_to: event.currentTarget.value || undefined });
+    applyDraft({ ...currentValues, created_to: event.currentTarget.value || undefined });
   };
   return (
-    <div className="flex flex-wrap items-end gap-2 border-b border-white/5 px-3 py-2 text-[12px] text-white/55">
-      <label className="flex min-w-[160px] flex-col gap-1">
-        <span className="text-white/40">{t('filterStartTime', 'contracts')}</span>
+    <>
+      <label className="flex h-7 items-center gap-1.5">
+        <span className="shrink-0 text-white/40">{t('filterStartTime', 'contracts')}</span>
         <input
           type="datetime-local"
-          value={draft.created_from || ''}
+          value={currentValues.created_from || ''}
           onInput={updateStartTime}
           onChange={updateStartTime}
-          className="h-7 rounded-md border border-white/10 bg-white/[0.03] px-2 text-[12px] text-white/75 outline-none transition-colors hover:border-white/20 focus:border-[#f0b90b]/70"
+          className="h-6 w-[148px] rounded border border-white/10 bg-white/[0.03] px-1.5 text-[12px] text-white/75 outline-none transition-colors hover:border-white/20 focus:border-[#f0b90b]/70"
         />
       </label>
-      <label className="flex min-w-[160px] flex-col gap-1">
-        <span className="text-white/40">{t('filterEndTime', 'contracts')}</span>
+      <label className="flex h-7 items-center gap-1.5">
+        <span className="shrink-0 text-white/40">{t('filterEndTime', 'contracts')}</span>
         <input
           type="datetime-local"
-          value={draft.created_to || ''}
+          value={currentValues.created_to || ''}
           onInput={updateEndTime}
           onChange={updateEndTime}
-          className="h-7 rounded-md border border-white/10 bg-white/[0.03] px-2 text-[12px] text-white/75 outline-none transition-colors hover:border-white/20 focus:border-[#f0b90b]/70"
+          className="h-6 w-[148px] rounded border border-white/10 bg-white/[0.03] px-1.5 text-[12px] text-white/75 outline-none transition-colors hover:border-white/20 focus:border-[#f0b90b]/70"
         />
       </label>
-      <div className="flex flex-wrap items-center gap-1">
+      <div className="flex h-7 flex-wrap items-center gap-0.5">
         {[
           { key: 'today' as const, label: t('filterToday', 'contracts'), range: getQuickTimeRange(0) },
           { key: 'last7Days' as const, label: t('filterLast7Days', 'contracts'), range: getQuickTimeRange(7) },
@@ -1250,8 +1338,8 @@ function OrderTradeTimeFilterBar({
           <button
             key={item.key}
             type="button"
-            onClick={() => applyDraft({ ...draft, ...item.range })}
-            className="h-7 rounded-md bg-white/[0.04] px-2 text-[12px] text-white/60 transition-colors hover:bg-white/[0.08] hover:text-white"
+            onClick={() => applyDraft({ ...currentValues, ...item.range })}
+            className="h-6 rounded bg-white/[0.04] px-2 text-[12px] text-white/60 transition-colors hover:bg-white/[0.08] hover:text-white"
           >
             {item.label}
           </button>
@@ -1260,12 +1348,12 @@ function OrderTradeTimeFilterBar({
           type="button"
           disabled={!hasRange}
           onClick={() => applyDraft({ created_from: undefined, created_to: undefined })}
-          className="h-7 rounded-md border border-white/10 px-2 text-[12px] text-white/60 transition-colors hover:border-white/20 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+          className="h-6 rounded border border-white/10 px-2 text-[12px] text-white/60 transition-colors hover:border-white/20 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
         >
           {t('filterClear', 'contracts')}
         </button>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -1312,30 +1400,80 @@ function PaginationControls({
 function PositionScopeSwitcher({
   value,
   onChange,
+  filtersSupported,
+  filtersExpanded,
+  filterChips,
+  onToggleFilters,
+  onClearFilters,
 }: {
   value: PositionScope;
   onChange: (value: PositionScope) => void;
+  filtersSupported?: boolean;
+  filtersExpanded?: boolean;
+  filterChips?: FilterSummaryChip[];
+  onToggleFilters?: () => void;
+  onClearFilters?: () => void;
 }) {
   const { t } = useLocaleContext();
+  const chips = filterChips || [];
   return (
-    <div className="flex items-center gap-1 border-b border-white/5 px-3 py-2">
-      {[
-        { key: 'current' as const, label: t('currentSymbolScope', 'contracts') },
-        { key: 'all' as const, label: t('allPositionsScope', 'contracts') },
-      ].map((item) => (
-        <button
-          key={item.key}
-          type="button"
-          onClick={() => onChange(item.key)}
-          className={`h-7 rounded-md px-2.5 text-[12px] transition-colors ${
-            value === item.key
-              ? 'bg-white text-black'
-              : 'bg-white/[0.04] text-white/60 hover:bg-white/[0.08] hover:text-white'
-          }`}
-        >
-          {item.label}
-        </button>
-      ))}
+    <div className="flex min-h-[34px] flex-wrap items-center gap-1.5 border-b border-white/5 px-2 py-1">
+      <div className="flex items-center gap-0.5">
+        {[
+          { key: 'current' as const, label: t('currentSymbolScope', 'contracts') },
+          { key: 'all' as const, label: t('allContracts', 'contracts') },
+        ].map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            onClick={() => onChange(item.key)}
+            className={`h-6 rounded px-2 text-[12px] transition-colors ${
+              value === item.key
+                ? 'bg-white text-black'
+                : 'bg-white/[0.04] text-white/60 hover:bg-white/[0.08] hover:text-white'
+            }`}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+      {filtersSupported ? (
+        <>
+          <button
+            type="button"
+            onClick={onToggleFilters}
+            className={`h-6 rounded px-2 text-[12px] transition-colors ${
+              filtersExpanded
+                ? 'bg-white text-black'
+                : chips.length > 0
+                  ? 'bg-[#f0b90b]/15 text-[#f0b90b] hover:bg-[#f0b90b]/22'
+                  : 'bg-white/[0.04] text-white/65 hover:bg-white/[0.08] hover:text-white'
+            }`}
+          >
+            {filtersExpanded ? t('filterCollapse', 'contracts') : t('filterToggle', 'contracts')}
+          </button>
+          {chips.length > 0 ? (
+            <div className="flex min-w-0 flex-wrap items-center gap-1">
+              <span className="text-[11px] text-white/35">{t('filterApplied', 'contracts')}</span>
+              {chips.map((chip) => (
+                <span
+                  key={chip.key}
+                  className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[11px] leading-4 text-white/70"
+                >
+                  {chip.label}
+                </span>
+              ))}
+              <button
+                type="button"
+                onClick={onClearFilters}
+                className="h-5 rounded px-1.5 text-[11px] text-white/45 transition-colors hover:bg-white/[0.06] hover:text-white"
+              >
+                {t('filterClear', 'contracts')}
+              </button>
+            </div>
+          ) : null}
+        </>
+      ) : null}
     </div>
   );
 }
