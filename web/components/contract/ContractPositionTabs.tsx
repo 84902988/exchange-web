@@ -50,6 +50,10 @@ type FilterGroup<T extends string> = {
   label: string;
   options: FilterOption[];
 };
+type TimeRangeFilterValues = {
+  created_from?: string;
+  created_to?: string;
+};
 type OrderFeedback = {
   type: 'success' | 'error';
   message: string;
@@ -844,6 +848,10 @@ export default function ContractPositionTabs({
               values={activeOrdersFilters}
               onChange={(key, value) => setOrderFilterValue(activeOrdersFilters, onActiveOrdersFiltersChange, key, value)}
             />
+            <OrderTradeTimeFilterBar
+              values={activeOrdersFilters}
+              onChange={(timeFilters) => onActiveOrdersFiltersChange?.({ ...(activeOrdersFilters || {}), ...timeFilters })}
+            />
             <ContractOrderTabs
               rows={pagedOpenOrders}
               emptyText={t('emptyOpenOrders', 'contracts')}
@@ -868,6 +876,10 @@ export default function ContractPositionTabs({
               values={orderHistoryFilters}
               onChange={(key, value) => setOrderFilterValue(orderHistoryFilters, onOrderHistoryFiltersChange, key, value)}
             />
+            <OrderTradeTimeFilterBar
+              values={orderHistoryFilters}
+              onChange={(timeFilters) => onOrderHistoryFiltersChange?.({ ...(orderHistoryFilters || {}), ...timeFilters })}
+            />
             <ContractOrderTabs
               rows={pagedHistoryOrders}
               emptyText={t('emptyHistoryOrders', 'contracts')}
@@ -891,6 +903,10 @@ export default function ContractPositionTabs({
               groups={tradeFilterGroups}
               values={tradeHistoryFilters}
               onChange={(key, value) => setTradeFilterValue(tradeHistoryFilters, onTradeHistoryFiltersChange, key, value)}
+            />
+            <OrderTradeTimeFilterBar
+              values={tradeHistoryFilters}
+              onChange={(timeFilters) => onTradeHistoryFiltersChange?.({ ...(tradeHistoryFilters || {}), ...timeFilters })}
             />
             <TradesTable rows={pagedTrades} pricePrecision={pricePrecision} loading={isTradesTabLoading} />
             <PaginationControls
@@ -1023,6 +1039,38 @@ function setTradeFilterValue(
   onChange(next);
 }
 
+function padDatePart(value: number) {
+  return String(value).padStart(2, '0');
+}
+
+function formatDateTimeLocalValue(date: Date) {
+  return [
+    date.getFullYear(),
+    '-',
+    padDatePart(date.getMonth() + 1),
+    '-',
+    padDatePart(date.getDate()),
+    'T',
+    padDatePart(date.getHours()),
+    ':',
+    padDatePart(date.getMinutes()),
+  ].join('');
+}
+
+function getQuickTimeRange(days: 0 | 7 | 30): TimeRangeFilterValues {
+  const now = new Date();
+  const start = new Date(now);
+  if (days === 0) {
+    start.setHours(0, 0, 0, 0);
+  } else {
+    start.setDate(start.getDate() - days);
+  }
+  return {
+    created_from: formatDateTimeLocalValue(start),
+    created_to: formatDateTimeLocalValue(now),
+  };
+}
+
 function OrderTradeFilterBar<T extends string>({
   groups,
   values,
@@ -1058,6 +1106,82 @@ function OrderTradeFilterBar<T extends string>({
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+function OrderTradeTimeFilterBar({
+  values,
+  onChange,
+}: {
+  values?: TimeRangeFilterValues;
+  onChange: (values: TimeRangeFilterValues) => void;
+}) {
+  const { t } = useLocaleContext();
+  const [draft, setDraft] = useState<TimeRangeFilterValues>(() => ({
+    created_from: values?.created_from || '',
+    created_to: values?.created_to || '',
+  }));
+  const hasRange = !!(draft.created_from || draft.created_to);
+  const applyDraft = (nextDraft: TimeRangeFilterValues) => {
+    setDraft(nextDraft);
+    onChange({
+      created_from: nextDraft.created_from || undefined,
+      created_to: nextDraft.created_to || undefined,
+    });
+  };
+  const updateStartTime = (event: React.FormEvent<HTMLInputElement>) => {
+    applyDraft({ ...draft, created_from: event.currentTarget.value || undefined });
+  };
+  const updateEndTime = (event: React.FormEvent<HTMLInputElement>) => {
+    applyDraft({ ...draft, created_to: event.currentTarget.value || undefined });
+  };
+  return (
+    <div className="flex flex-wrap items-end gap-2 border-b border-white/5 px-3 py-2 text-[12px] text-white/55">
+      <label className="flex min-w-[160px] flex-col gap-1">
+        <span className="text-white/40">{t('filterStartTime', 'contracts')}</span>
+        <input
+          type="datetime-local"
+          value={draft.created_from || ''}
+          onInput={updateStartTime}
+          onChange={updateStartTime}
+          className="h-7 rounded-md border border-white/10 bg-white/[0.03] px-2 text-[12px] text-white/75 outline-none transition-colors hover:border-white/20 focus:border-[#f0b90b]/70"
+        />
+      </label>
+      <label className="flex min-w-[160px] flex-col gap-1">
+        <span className="text-white/40">{t('filterEndTime', 'contracts')}</span>
+        <input
+          type="datetime-local"
+          value={draft.created_to || ''}
+          onInput={updateEndTime}
+          onChange={updateEndTime}
+          className="h-7 rounded-md border border-white/10 bg-white/[0.03] px-2 text-[12px] text-white/75 outline-none transition-colors hover:border-white/20 focus:border-[#f0b90b]/70"
+        />
+      </label>
+      <div className="flex flex-wrap items-center gap-1">
+        {[
+          { key: 'today' as const, label: t('filterToday', 'contracts'), range: getQuickTimeRange(0) },
+          { key: 'last7Days' as const, label: t('filterLast7Days', 'contracts'), range: getQuickTimeRange(7) },
+          { key: 'last30Days' as const, label: t('filterLast30Days', 'contracts'), range: getQuickTimeRange(30) },
+        ].map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            onClick={() => applyDraft({ ...draft, ...item.range })}
+            className="h-7 rounded-md bg-white/[0.04] px-2 text-[12px] text-white/60 transition-colors hover:bg-white/[0.08] hover:text-white"
+          >
+            {item.label}
+          </button>
+        ))}
+        <button
+          type="button"
+          disabled={!hasRange}
+          onClick={() => applyDraft({ created_from: undefined, created_to: undefined })}
+          className="h-7 rounded-md border border-white/10 px-2 text-[12px] text-white/60 transition-colors hover:border-white/20 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+        >
+          {t('filterClear', 'contracts')}
+        </button>
+      </div>
     </div>
   );
 }

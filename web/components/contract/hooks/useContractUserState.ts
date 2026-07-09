@@ -28,11 +28,15 @@ export type ContractOrderFilterState = {
   position_side?: 'LONG' | 'SHORT' | string;
   order_type?: 'LIMIT' | 'MARKET' | string;
   action?: 'OPEN' | 'CLOSE' | string;
+  created_from?: string;
+  created_to?: string;
 };
 
 export type ContractTradeFilterState = {
   position_side?: 'LONG' | 'SHORT' | string;
   action?: 'OPEN' | 'CLOSE' | string;
+  created_from?: string;
+  created_to?: string;
 };
 
 type UseContractUserStateParams = {
@@ -87,11 +91,25 @@ function normalizeFilterValue(value: string | null | undefined) {
   return normalized || undefined;
 }
 
+function normalizeDateTimeFilterValue(value: string | null | undefined) {
+  const normalized = String(value || '').trim();
+  return normalized || undefined;
+}
+
+function toDateTimeQueryValue(value: string | null | undefined) {
+  const normalized = normalizeDateTimeFilterValue(value);
+  if (!normalized) return undefined;
+  const date = new Date(normalized);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : normalized;
+}
+
 function normalizeOrderFilters(filters: ContractOrderFilterState): ContractOrderFilterState {
   return {
     position_side: normalizeFilterValue(filters.position_side),
     order_type: normalizeFilterValue(filters.order_type),
     action: normalizeFilterValue(filters.action),
+    created_from: normalizeDateTimeFilterValue(filters.created_from),
+    created_to: normalizeDateTimeFilterValue(filters.created_to),
   };
 }
 
@@ -99,6 +117,8 @@ function normalizeTradeFilters(filters: ContractTradeFilterState): ContractTrade
   return {
     position_side: normalizeFilterValue(filters.position_side),
     action: normalizeFilterValue(filters.action),
+    created_from: normalizeDateTimeFilterValue(filters.created_from),
+    created_to: normalizeDateTimeFilterValue(filters.created_to),
   };
 }
 
@@ -674,6 +694,8 @@ export function useContractUserState({
               position_side: requestedActiveOrdersFilters.position_side,
               order_type: requestedActiveOrdersFilters.order_type,
               action: requestedActiveOrdersFilters.action,
+              created_from: toDateTimeQueryValue(requestedActiveOrdersFilters.created_from),
+              created_to: toDateTimeQueryValue(requestedActiveOrdersFilters.created_to),
               page: requestedActiveOrdersPage,
               page_size: CONTRACT_ORDER_TRADE_PAGE_SIZE,
             })
@@ -685,6 +707,8 @@ export function useContractUserState({
               position_side: requestedOrderHistoryFilters.position_side,
               order_type: requestedOrderHistoryFilters.order_type,
               action: requestedOrderHistoryFilters.action,
+              created_from: toDateTimeQueryValue(requestedOrderHistoryFilters.created_from),
+              created_to: toDateTimeQueryValue(requestedOrderHistoryFilters.created_to),
               page: requestedOrderHistoryPage,
               page_size: CONTRACT_ORDER_TRADE_PAGE_SIZE,
             })
@@ -694,6 +718,8 @@ export function useContractUserState({
               symbol: scopedSymbol,
               position_side: requestedTradeHistoryFilters.position_side,
               action: requestedTradeHistoryFilters.action,
+              created_from: toDateTimeQueryValue(requestedTradeHistoryFilters.created_from),
+              created_to: toDateTimeQueryValue(requestedTradeHistoryFilters.created_to),
               page: requestedTradeHistoryPage,
               page_size: CONTRACT_ORDER_TRADE_PAGE_SIZE,
             })
