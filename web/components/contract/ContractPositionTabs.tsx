@@ -209,7 +209,7 @@ export default function ContractPositionTabs({
   onScopeChange,
   onSuccess,
 }: ContractPositionTabsProps) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
   const normalizedTpSlTriggerPriceType = normalizeTpSlTriggerPriceType(tpSlTriggerPriceType);
   const tpSlTriggerPriceTypeHint = normalizedTpSlTriggerPriceType === 'LAST_PRICE'
     ? t('tpSlLastPriceTrigger', 'contracts')
@@ -321,20 +321,29 @@ export default function ContractPositionTabs({
   );
   const openPositionSummaries = scope === 'current' ? currentOpenPositionSummaries : allOpenPositionSummaries;
   const legacyOpenPositionSummaryRows = useMemo(
-    () => openPositionSummaries.map((summary) => ({
-      ...summary,
-      positions: allOpenPositions.filter((position) => (
-        normalizeContractSymbol(position.symbol) === normalizeContractSymbol(summary.symbol) &&
-        getPositionRecordSide(position) === getPositionRecordSide(summary)
-      )),
-    })),
+    () => buildSummaryPositionRows(openPositionSummaries, allOpenPositions),
     [allOpenPositions, openPositionSummaries],
   );
+  const pagedOpenPositionSummarySource = useMemo(() => {
+    const pageKeys = new Set(pagedOpenPositions.map(getPositionGroupKey).filter((key): key is string => !!key));
+    return openPositionSummaries.filter((summary) => pageKeys.has(getSummaryKey(summary)));
+  }, [openPositionSummaries, pagedOpenPositions]);
   const pagedOpenPositionSummaryRows = useMemo(
-    () => buildAggregatedPositionRows(pagedOpenPositions, openPositionSummaries),
-    [openPositionSummaries, pagedOpenPositions],
+    () => buildSummaryPositionRows(pagedOpenPositionSummarySource, pagedOpenPositions),
+    [pagedOpenPositionSummarySource, pagedOpenPositions],
   );
   const openPositionSummaryRows = positionsPagination ? pagedOpenPositionSummaryRows : legacyOpenPositionSummaryRows;
+  const positionsSummaryUnavailable = Boolean(
+    positionsPagination &&
+    pagedOpenPositions.length > 0 &&
+    pagedOpenPositionSummaryRows.length === 0,
+  );
+  const positionsEmptyTitle = positionsSummaryUnavailable
+    ? getPositionSummaryUnavailableTitle(locale)
+    : scope === 'current' ? t('emptyCurrentSymbolPositions', 'contracts') : t('emptyContractPositions', 'contracts');
+  const positionsEmptyDescription = positionsSummaryUnavailable
+    ? getPositionSummaryUnavailableDescription(locale)
+    : scope === 'current' ? t('emptyCurrentSymbolPositionsDesc', 'contracts') : t('emptyAllPositionsDesc', 'contracts');
   const historyPositions = useMemo(
     () => positions.filter((item) => (
       (item.status === 'CLOSED' || item.status === 'LIQUIDATED' || getPositionAmount(item) <= 0)
@@ -878,8 +887,8 @@ export default function ContractPositionTabs({
               loading={loading || isScopeSwitching}
               closingId={closingId}
               closingSummaryKey={closingSummaryKey}
-              emptyTitle={scope === 'current' ? t('emptyCurrentSymbolPositions', 'contracts') : t('emptyContractPositions', 'contracts')}
-              emptyDescription={scope === 'current' ? t('emptyCurrentSymbolPositionsDesc', 'contracts') : t('emptyAllPositionsDesc', 'contracts')}
+              emptyTitle={positionsEmptyTitle}
+              emptyDescription={positionsEmptyDescription}
               onClose={closeSummaryPosition}
               onEditTpSl={openSummaryTpSlEditor}
               onClosePosition={requestClosePosition}
@@ -1056,116 +1065,47 @@ function paginateItems<T>(items: T[], page: number, size: number) {
   return items.slice((safePage - 1) * size, safePage * size);
 }
 
-function formatAggregatedDecimal(value: number, precision = 8) {
-  if (!Number.isFinite(value)) return '0';
-  return String(Number(value.toFixed(precision)));
+function getPositionGroupKey(position: ContractPositionItem) {
+  const side = getPositionRecordSide(position);
+  if (!side) return null;
+  return `${normalizeContractSymbol(position.symbol)}:${side}`;
 }
 
-function resolveSharedTpSlMode(
-  positions: ContractPositionItem[],
-  field: 'take_profit_price' | 'stop_loss_price',
-) {
-  const values = positions
-    .map((position) => position[field])
-    .filter((value): value is string => !!value && toNumber(value) > 0);
-  if (values.length === 0) return null;
-  const first = values[0];
-  return values.every((value) => value === first) ? first : null;
-}
-
-function buildAggregatedPositionRows(
-  positions: ContractPositionItem[],
-  summaries: ContractPositionSummaryItem[] = [],
+function buildSummaryPositionRows(
+  summaries: ContractPositionSummaryItem[],
+  detailPositions: ContractPositionItem[],
 ): AggregatedPositionRow[] {
-  const grouped = new Map<string, ContractPositionItem[]>();
-  positions.forEach((position) => {
-    const side = getPositionRecordSide(position);
-    if (!side) return;
-    const key = `${normalizeContractSymbol(position.symbol)}:${side}`;
-    const rows = grouped.get(key) || [];
+  const detailsBySummaryKey = new Map<string, ContractPositionItem[]>();
+  detailPositions.forEach((position) => {
+    const key = getPositionGroupKey(position);
+    if (!key) return;
+    const rows = detailsBySummaryKey.get(key) || [];
     rows.push(position);
-    grouped.set(key, rows);
+    detailsBySummaryKey.set(key, rows);
   });
 
-  return Array.from(grouped.entries()).map(([key, rows]) => {
-    const [symbol, side] = key.split(':') as [string, ContractPositionSide];
-    const authoritativeSummary = summaries.find((summary) => (
-      normalizeContractSymbol(summary.symbol) === symbol &&
-      getPositionRecordSide(summary) === side
-    ));
-    const quantity = rows.reduce((sum, row) => sum + getPositionAmount(row), 0);
-    const entryNotional = rows.reduce((sum, row) => sum + (getPositionAmount(row) * toNumber(row.entry_price)), 0);
-    const avgEntryPrice = quantity > 0 ? entryNotional / quantity : 0;
-    const weightedMarkNotional = rows.reduce((sum, row) => sum + (getPositionAmount(row) * toNumber(row.mark_price)), 0);
-    const markPrice = quantity > 0 ? weightedMarkNotional / quantity : 0;
-    const marginAmount = rows.reduce((sum, row) => sum + toNumber(row.margin_amount), 0);
-    const unrealizedPnl = rows.reduce((sum, row) => sum + toNumber(row.unrealized_pnl), 0);
-    const liquidationPrice = authoritativeSummary?.liquidation_price
-      ?? (rows.length === 1 ? rows[0].liquidation_price : resolveSharedRiskField(rows, 'liquidation_price'));
-    const aggregatedRoe = calcUnrealizedPnlPercent(unrealizedPnl, marginAmount);
-    const roe = rows.length === 1 ? rows[0].roe : aggregatedRoe === null ? null : formatAggregatedDecimal(aggregatedRoe, 8);
-    const marginRatio = rows.length === 1 ? rows[0].margin_ratio : calculateMarginRatio(marginAmount, markPrice, quantity);
-    const liquidationDistance = authoritativeSummary?.liquidation_distance
-      ?? (rows.length === 1 ? rows[0].liquidation_distance : resolveSharedRiskField(rows, 'liquidation_distance'));
-    const liquidationDistanceRate = authoritativeSummary?.liquidation_distance_rate
-      ?? (rows.length === 1 ? rows[0].liquidation_distance_rate : resolveSharedRiskField(rows, 'liquidation_distance_rate'));
-    const leverage = resolveSharedLeverage(rows);
-    const takeProfitPrice = resolveSharedTpSlMode(rows, 'take_profit_price');
-    const stopLossPrice = resolveSharedTpSlMode(rows, 'stop_loss_price');
-    const tpSlMode: ContractPositionSummaryItem['tp_sl_mode'] = takeProfitPrice || stopLossPrice
-      ? rows.length === 1 ? 'SINGLE' : 'MIXED'
-      : 'NONE';
-
-    return {
-      symbol,
-      side,
-      leverage,
-      quantity: formatAggregatedDecimal(quantity),
-      avg_entry_price: formatAggregatedDecimal(avgEntryPrice),
-      mark_price: formatAggregatedDecimal(markPrice),
-      margin_amount: formatAggregatedDecimal(marginAmount),
-      unrealized_pnl: formatAggregatedDecimal(unrealizedPnl),
-      liquidation_price: liquidationPrice ?? null,
-      roe,
-      margin_ratio: marginRatio,
-      liquidation_distance: liquidationDistance,
-      liquidation_distance_rate: liquidationDistanceRate,
-      position_ids: rows.map((row) => row.id),
-      count: rows.length,
-      take_profit_price: takeProfitPrice,
-      stop_loss_price: stopLossPrice,
-      tp_sl_mode: tpSlMode,
-      positions: rows,
-    };
-  }).sort((left, right) => {
+  return summaries.map((summary) => ({
+    ...summary,
+    positions: detailsBySummaryKey.get(getSummaryKey(summary)) || [],
+  })).sort((left, right) => {
     const symbolCompare = normalizeContractSymbol(left.symbol).localeCompare(normalizeContractSymbol(right.symbol));
     if (symbolCompare !== 0) return symbolCompare;
     return String(left.side).localeCompare(String(right.side));
   });
 }
 
-function resolveSharedRiskField(
-  rows: ContractPositionItem[],
-  field: 'liquidation_price' | 'liquidation_distance' | 'liquidation_distance_rate',
-) {
-  const values = rows
-    .map((row) => row[field])
-    .filter((value): value is string => !!value && Number.isFinite(toNumber(value)));
-  if (values.length === 0) return null;
-  const first = values[0];
-  return values.every((value) => value === first) ? first : null;
+function getPositionSummaryUnavailableTitle(locale: string) {
+  if (locale === 'zh') return '暂无汇总数据';
+  if (locale === 'zh-TW') return '暫無匯總資料';
+  if (locale === 'ja') return '集計データはありません';
+  return 'Summary unavailable';
 }
 
-function resolveSharedLeverage(rows: ContractPositionItem[]) {
-  const values = new Set(rows.map((row) => Number(row.leverage)).filter((value) => Number.isFinite(value) && value > 0));
-  if (values.size !== 1) return null;
-  return Array.from(values)[0];
-}
-
-function calculateMarginRatio(marginAmount: number, markPrice: number, quantity: number) {
-  const notional = markPrice * Math.abs(quantity);
-  if (!Number.isFinite(marginAmount) || !Number.isFinite(notional) || marginAmount <= 0 || notional <= 0) return null;
-  return formatAggregatedDecimal((marginAmount / notional) * 100, 8);
+function getPositionSummaryUnavailableDescription(locale: string) {
+  if (locale === 'zh') return '当前页明细已加载，汇总风险字段暂不展示';
+  if (locale === 'zh-TW') return '目前頁面明細已載入，匯總風險欄位暫不顯示';
+  if (locale === 'ja') return '現在のページ明細は読み込み済みです。集計リスク項目は一時的に表示されません';
+  return 'Page details are loaded; summary risk fields are not shown yet.';
 }
 
 function filterRowsByScope<T extends { symbol?: string | null }>(
