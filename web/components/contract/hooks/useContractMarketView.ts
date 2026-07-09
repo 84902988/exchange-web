@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toNumber } from '@/components/contract/contractFormat';
+import { getContractMarketSourceLabel } from '@/components/contract/contractMarketSourceStatus';
 import { normalizeSide } from '@/components/spot/orderbook/orderbook.utils';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
@@ -1371,6 +1372,16 @@ export function useContractMarketView({
   const marketViewTradesFreshness = marketView?.trades_freshness ?? null;
   const klineSource = marketView?.kline_source ?? marketView?.kline_current_candle?.kline_mode ?? null;
   const klineFreshness = marketView?.kline_freshness ?? null;
+  const resolvedDepthSource = activeDepthSource ?? marketViewDepthSource;
+  const resolvedDepthFreshness = activeDepthQuoteFreshness ?? marketViewDepthFreshness;
+  const activeTradesSource = tradesBelongToCurrentSymbol ? tradesState.source : null;
+  const activeTradesFreshness = tradesBelongToCurrentSymbol ? tradesState.freshness : null;
+  const resolvedTradesSource = activeTradesSource ?? marketViewTradesSource;
+  const resolvedTradesFreshness = activeTradesFreshness ?? marketViewTradesFreshness;
+  const tickerSourceLabel = getContractMarketSourceLabel(tickerSource, tickerFreshness, t);
+  const depthSourceLabel = getContractMarketSourceLabel(resolvedDepthSource, resolvedDepthFreshness, t);
+  const tradesSourceLabel = getContractMarketSourceLabel(resolvedTradesSource, resolvedTradesFreshness, t);
+  const klineSourceLabel = getContractMarketSourceLabel(klineSource, klineFreshness, t);
 
   return {
     ...quoteState,
@@ -1387,8 +1398,10 @@ export function useContractMarketView({
     depthError: depthBelongsToCurrentSymbol ? depthState.error : null,
     tickerSource,
     tickerFreshness,
-    depthSource: activeDepthSource,
-    depthFreshness: activeDepthQuoteFreshness,
+    tickerSourceLabel,
+    depthSource: resolvedDepthSource,
+    depthFreshness: resolvedDepthFreshness,
+    depthSourceLabel,
     marketViewDepthSource,
     marketViewDepthFreshness,
     depthUpdatedAt: activeDepthUpdatedAt,
@@ -1399,12 +1412,14 @@ export function useContractMarketView({
     recentTrades,
     tradesLoading: tradesBelongToCurrentSymbol ? tradesState.loading : true,
     tradesError: tradesBelongToCurrentSymbol ? tradesState.error : null,
-    tradesSource: tradesBelongToCurrentSymbol ? tradesState.source : null,
-    tradesFreshness: tradesBelongToCurrentSymbol ? tradesState.freshness : null,
+    tradesSource: resolvedTradesSource,
+    tradesFreshness: resolvedTradesFreshness,
+    tradesSourceLabel,
     marketViewTradesSource,
     marketViewTradesFreshness,
     klineSource,
     klineFreshness,
+    klineSourceLabel,
     latestTradePrice: latestTradeTickPrice,
     latestTradeDirection,
     latestTradeSource,

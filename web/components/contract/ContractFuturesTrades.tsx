@@ -6,6 +6,12 @@ import {
 } from '@/lib/api/modules/contract';
 import { formatPrice as formatMarketPrice } from '@/lib/marketPrecision';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import {
+  getContractDomainStatusLabel,
+  getContractMarketSourceLabel,
+  getContractMarketSourceTone,
+  getContractMarketSourceToneClass,
+} from './contractMarketSourceStatus';
 
 type PriceDirection = 'up' | 'down' | 'flat';
 
@@ -49,6 +55,8 @@ export default function ContractFuturesTrades({
   trades = [],
   loading = false,
   status,
+  source,
+  freshness,
   pricePrecision,
   latestPriceDirection,
   onPriceClick,
@@ -57,6 +65,14 @@ export default function ContractFuturesTrades({
   const { t } = useLocaleContext();
   const handlePriceSelect = onPriceClick || onPriceSelect;
   const normalizedStatus = String(status || '').trim().toUpperCase();
+  const hasTradesSourceStatus = !!source || !!freshness;
+  const tradesSourceTone = getContractMarketSourceTone(source, freshness);
+  const tradesSourceStatusLabel = hasTradesSourceStatus
+    ? getContractMarketSourceLabel(source, freshness, t)
+    : null;
+  const tradesSourceStatusTitle = hasTradesSourceStatus
+    ? getContractDomainStatusLabel('trades', source, freshness, t)
+    : null;
 
   const data = useMemo(() => {
     return trades.map((item, index) => {
@@ -81,6 +97,14 @@ export default function ContractFuturesTrades({
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div className="text-[13px] font-medium text-white/88">{t('marketTrades', 'contracts')}</div>
+          {tradesSourceStatusLabel ? (
+            <div
+              className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getContractMarketSourceToneClass(tradesSourceTone)}`}
+              title={tradesSourceStatusTitle || undefined}
+            >
+              {tradesSourceStatusLabel}
+            </div>
+          ) : null}
           {normalizedStatus === 'CLOSED' ? (
             <div className="rounded-full border border-[#f0b90b]/20 bg-[#f0b90b]/10 px-2 py-0.5 text-[11px] font-semibold text-[#f0b90b]">
               {t('closedNoRealtimeTrades', 'contracts')}

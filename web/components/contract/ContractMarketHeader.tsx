@@ -3,6 +3,10 @@
 import type { ReactNode } from 'react';
 import MarketStatusBadge from '@/components/market/MarketStatusBadge';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import {
+  getContractDomainStatusLabel,
+  getContractMarketSourceLabel,
+} from './contractMarketSourceStatus';
 
 type PriceDirection = 'up' | 'down' | 'flat';
 
@@ -61,6 +65,19 @@ export default function ContractMarketHeader({
     : changeValue.startsWith('-')
       ? 'text-[#f6465d]'
       : 'text-white/58';
+  const hasTickerSourceStatus = !!quoteFreshness;
+  const tickerSourceStatusLabel = hasTickerSourceStatus
+    ? getContractMarketSourceLabel(null, quoteFreshness, t)
+    : null;
+  const tickerSourceStatusTitle = hasTickerSourceStatus
+    ? getContractDomainStatusLabel('ticker', null, quoteFreshness, t)
+    : null;
+  const tradeStatusTitle = [marketStatusText, tickerSourceStatusTitle]
+    .filter(Boolean)
+    .join(' · ');
+  const tradeStatusSubValue = tickerSourceStatusLabel && tickerSourceStatusLabel !== quoteStatusLabel
+    ? tickerSourceStatusLabel
+    : null;
 
   return (
     <div className="h-[74px] overflow-hidden border-b border-white/[0.06] bg-[#11161d] px-3 py-2.5 tabular-nums shadow-[inset_0_-1px_0_rgba(255,255,255,0.02)]">
@@ -105,8 +122,9 @@ export default function ContractMarketHeader({
               className="!rounded-none !border-0 !bg-transparent !px-0 !py-0 text-[13px] font-semibold"
             />
           )}
+          subValue={tradeStatusSubValue}
           valueClassName="font-sans text-[13px] font-semibold text-white/88"
-          title={marketStatusText || undefined}
+          title={tradeStatusTitle || undefined}
         />
 
         <div className="grid min-w-0 flex-1 grid-flow-col auto-cols-[minmax(132px,1fr)] gap-2 overflow-hidden">
