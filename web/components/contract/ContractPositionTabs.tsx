@@ -1144,7 +1144,7 @@ function buildFilterSummaryChips(
     const value = values[group.key];
     if (!value) return;
     const option = group.options.find((item) => item.value === value);
-    if (option && option.value) {
+    if (option?.value && option.label.trim()) {
       chips.push({ key: group.key, label: option.label });
     }
   });
@@ -1415,14 +1415,15 @@ function PositionScopeSwitcher({
   onClearFilters?: () => void;
 }) {
   const { t } = useLocaleContext();
-  const chips = filterChips || [];
+  const chips = (filterChips || []).filter((chip) => chip.label.trim());
+  const scopeOptions = [
+    { key: 'current' as const, label: t('currentSymbolScope', 'contracts') },
+    { key: 'all' as const, label: t('allContractsScope', 'contracts') },
+  ].filter((item) => item.label.trim());
   return (
     <div className="flex min-h-[34px] flex-wrap items-center gap-1.5 border-b border-white/5 px-2 py-1">
       <div className="flex items-center gap-0.5">
-        {[
-          { key: 'current' as const, label: t('currentSymbolScope', 'contracts') },
-          { key: 'all' as const, label: t('allContracts', 'contracts') },
-        ].map((item) => (
+        {scopeOptions.map((item) => (
           <button
             key={item.key}
             type="button"
