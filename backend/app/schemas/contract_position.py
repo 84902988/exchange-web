@@ -36,6 +36,13 @@ class ContractPositionListResponse(BaseModel):
     items: List[ContractPositionItem]
 
 
+class ContractPositionPageResponse(BaseModel):
+    items: List[ContractPositionItem]
+    total: int
+    page: int
+    page_size: int
+
+
 class ContractPositionSummaryItem(BaseModel):
     symbol: str
     side: str

@@ -455,6 +455,13 @@ export type ContractPositionListResponse = {
   items: ContractPositionItem[]
 }
 
+export type ContractPositionPageResponse = {
+  items: ContractPositionItem[]
+  total: number
+  page: number
+  page_size: number
+}
+
 export type ContractPositionTpSlMode = 'NONE' | 'SINGLE' | 'MIXED'
 
 export type ContractPositionSummaryItem = {
@@ -692,6 +699,19 @@ export function getContractPositions(params: {
   status?: string
 } = {}): Promise<ContractPositionListResponse> {
   return request<ContractPositionListResponse>(withQuery('/contract/positions', params))
+}
+
+export function getContractPositionsPaged(params: {
+  symbol?: string
+  status?: string
+  side?: string
+  position_side?: string
+  created_from?: string
+  created_to?: string
+  page?: number
+  page_size?: number
+} = {}): Promise<ContractPositionPageResponse> {
+  return request<ContractPositionPageResponse>(withQuery('/contract/positions/page', params))
 }
 
 export function getContractPositionSummaries(params: {

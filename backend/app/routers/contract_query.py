@@ -17,6 +17,7 @@ from app.services.contract_position_service import (
 from app.services.contract_query_service import (
     get_user_contract_orders,
     get_user_contract_position_summaries,
+    get_user_contract_positions_page,
     get_user_contract_positions,
     get_user_contract_trades,
 )
@@ -42,6 +43,44 @@ def contract_positions(
         raise HTTPException(
             status_code=500,
             detail={"code": "CONTRACT_POSITIONS_QUERY_FAILED", "message": "查询合约持仓失败"},
+        )
+
+
+@router.get("/positions/page")
+def contract_positions_page(
+    request: Request,
+    symbol: str = Query("", description="Optional contract symbol"),
+    status: str = Query("OPEN", description="Position status, default OPEN"),
+    side: str = Query("", description="Optional position side: LONG or SHORT"),
+    position_side: str = Query("", description="Optional position side alias: LONG or SHORT"),
+    created_from: str = Query("", description="Optional created_at lower bound"),
+    created_to: str = Query("", description="Optional created_at upper bound"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    trace_id = getattr(request.state, "trace_id", None)
+    try:
+        data = get_user_contract_positions_page(
+            db,
+            int(user_id),
+            symbol=symbol,
+            status=status,
+            side=side,
+            position_side=position_side,
+            created_from=created_from,
+            created_to=created_to,
+            page=page,
+            page_size=page_size,
+        )
+        return ok(data=data.model_dump(), trace_id=trace_id)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "CONTRACT_POSITIONS_PAGE_QUERY_FAILED", "message": "鏌ヨ鍚堢害鎸佷粨鍒嗛〉澶辫触"},
         )
 
 
