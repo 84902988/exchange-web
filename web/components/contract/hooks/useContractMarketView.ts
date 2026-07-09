@@ -6,6 +6,7 @@ import { normalizeSide } from '@/components/spot/orderbook/orderbook.utils';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
   getContractDepth,
+  getContractMarketTrades,
   getContractMarketView,
   getContractQuoteDisplayStatus,
   isExpiredLastGoodBboQuote,
@@ -21,6 +22,10 @@ import {
   contractMarketRealtime,
   type ContractMarketRealtimeMessage,
 } from '@/lib/realtime/contractMarketRealtime';
+import {
+  readContractTradesCache,
+  writeContractTradesCache,
+} from '@/lib/contractMarketCache';
 import {
   useContractMarketState,
   type PriceDirection,
@@ -79,6 +84,7 @@ type UseContractMarketViewParams = {
 
 const LIVE_DEPTH_BBO_TTL_MS = 5000;
 const FUTURES_DEPTH_LIMIT = 20;
+const FUTURES_TRADES_LIMIT = 30;
 const DEPTH_INITIAL_GRACE_MS = 1800;
 const DEPTH_FULL_DEGRADE_GRACE_MS = 3000;
 
@@ -100,6 +106,16 @@ type ContractDepthState = ContractDepthSnapshot & {
   symbol: string;
   loading: boolean;
   error: string | null;
+  updatedAt: number | null;
+};
+
+type ContractTradesState = {
+  symbol: string;
+  trades: ContractMarketTrade[];
+  loading: boolean;
+  error: string | null;
+  source: string | null;
+  freshness: string | null;
   updatedAt: number | null;
 };
 
@@ -249,6 +265,83 @@ function normalizeRealtimeLevels(value: unknown): ContractDepthLevel[] {
     ));
 }
 
+function normalizeTradeTime(value: unknown) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return Date.now();
+  return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+}
+
+function getTradePayloads(message: ContractMarketRealtimeMessage) {
+  if (Array.isArray(message.trades)) return message.trades;
+  if (isRecord(message.trade)) return [message.trade];
+  if (Array.isArray(message.data)) return message.data;
+  if (isRecord(message.data)) return [message.data];
+  return [message];
+}
+
+function extractRealtimeTrades(
+  message: ContractMarketRealtimeMessage,
+  currentSymbol: string,
+): ContractMarketTrade[] {
+  return getTradePayloads(message)
+    .flatMap((payload) => {
+      if (!isRecord(payload)) return [];
+      const msgSymbol = String(message.symbol || payload.symbol || '').trim().toUpperCase();
+      if (msgSymbol && msgSymbol !== normalizeContractSymbol(currentSymbol)) return [];
+
+      const price = payload.price ?? payload.last_price;
+      const qty = payload.qty ?? payload.amount ?? payload.quantity ?? payload.volume;
+      const priceSource = String(payload.price_source || '').trim().toUpperCase();
+      const normalizedQty = toNumber(qty as string | number | null);
+      if (
+        toNumber(price as string | number | null) <= 0
+        || (normalizedQty <= 0 && priceSource !== 'TRADE_TICK')
+      ) {
+        return [];
+      }
+
+      const time = normalizeTradeTime(payload.time ?? payload.ts ?? payload.timestamp);
+      const trade: ContractMarketTrade = {
+        id: payload.id ? String(payload.id) : `${time}-${price}-${normalizedQty}`,
+        price: String(price),
+        qty: String(normalizedQty > 0 ? normalizedQty : 0),
+        time,
+      };
+      if (payload.last_price) trade.last_price = String(payload.last_price);
+      if (payload.quoteQty) trade.quoteQty = String(payload.quoteQty);
+      if (payload.amount) trade.amount = String(payload.amount);
+      if (payload.volume) trade.volume = String(payload.volume);
+      if (payload.source) trade.source = String(payload.source);
+      if (payload.quote_source) trade.quote_source = String(payload.quote_source);
+      if (payload.quote_freshness) trade.quote_freshness = String(payload.quote_freshness);
+      if (payload.price_source) trade.price_source = String(payload.price_source);
+      if (typeof payload.synthetic === 'boolean') trade.synthetic = payload.synthetic;
+      if (payload.side) trade.side = String(payload.side);
+      if (typeof payload.isBuyerMaker === 'boolean') {
+        trade.isBuyerMaker = payload.isBuyerMaker;
+      } else if (typeof payload.is_buyer_maker === 'boolean') {
+        trade.isBuyerMaker = payload.is_buyer_maker;
+      }
+      return [trade];
+    });
+}
+
+function mergeTrades(
+  incoming: ContractMarketTrade[],
+  previous: ContractMarketTrade[],
+  limit = FUTURES_TRADES_LIMIT,
+) {
+  const seen = new Set<string>();
+  return [...incoming, ...previous]
+    .filter((item) => {
+      const key = String(item.id);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit);
+}
+
 function extractRealtimeDepth(
   message: ContractMarketRealtimeMessage,
   currentSymbol: string,
@@ -361,6 +454,15 @@ export function useContractMarketView({
     error: null,
     updatedAt: null,
   }));
+  const [tradesState, setTradesState] = useState<ContractTradesState>(() => ({
+    symbol: normalizeContractSymbol(contractSymbol),
+    trades: [],
+    loading: true,
+    error: null,
+    source: null,
+    freshness: null,
+    updatedAt: null,
+  }));
   const [fallbackDepthAllowed, setFallbackDepthAllowed] = useState(false);
   const [lastFullDepthSnapshot, setLastFullDepthSnapshot] = useState<{
     asks: ContractDepthLevel[];
@@ -372,6 +474,8 @@ export function useContractMarketView({
   const inFlightSymbolRef = useRef<string | null>(null);
   const depthRequestSeqRef = useRef(0);
   const depthInFlightSymbolRef = useRef<string | null>(null);
+  const tradesRequestSeqRef = useRef(0);
+  const tradesInFlightSymbolRef = useRef<string | null>(null);
   const mountedRef = useRef(false);
   const currentPriceRef = useRef<number | null>(null);
   const previousMarketViewDisplayStateRef = useRef<string | null>(null);
@@ -441,6 +545,8 @@ export function useContractMarketView({
     inFlightSymbolRef.current = null;
     depthRequestSeqRef.current += 1;
     depthInFlightSymbolRef.current = null;
+    tradesRequestSeqRef.current += 1;
+    tradesInFlightSymbolRef.current = null;
     currentPriceRef.current = null;
     previousMarketViewDisplayStateRef.current = null;
     setRestMarketView(null);
@@ -468,6 +574,15 @@ export function useContractMarketView({
     });
     setFallbackDepthAllowed(false);
     setLastFullDepthSnapshot(null);
+    setTradesState({
+      symbol: normalizeContractSymbol(contractSymbol),
+      trades: [],
+      loading: true,
+      error: null,
+      source: null,
+      freshness: null,
+      updatedAt: null,
+    });
     setPriceDirection('flat');
 
     void refreshMarketView();
@@ -699,6 +814,151 @@ export function useContractMarketView({
     return contractMarketRealtime.subscribe('depth', handleDepthMessage);
   }, [applyDepthSnapshot, contractSymbol, effectiveMarketStatus]);
 
+  const applyTradesSnapshot = useCallback((trades: ContractMarketTrade[], options: { loading?: boolean; error?: string | null } = {}) => {
+    const requestSymbol = normalizeContractSymbol(contractSymbol);
+    const nextRows = trades.slice(0, FUTURES_TRADES_LIMIT);
+    const latest = nextRows[0] || null;
+    setTradesState({
+      symbol: requestSymbol,
+      trades: nextRows,
+      loading: options.loading ?? false,
+      error: options.error ?? null,
+      source: latest?.source || latest?.quote_source || latest?.price_source || null,
+      freshness: latest?.quote_freshness || null,
+      updatedAt: latest ? normalizeTradeTime(latest.time ?? latest.ts) : null,
+    });
+    writeContractTradesCache(requestSymbol, {
+      trades: nextRows,
+      lastPrice: latest?.price ?? null,
+    });
+  }, [contractSymbol]);
+
+  const refreshTrades = useCallback(async () => {
+    const requestSymbol = normalizeContractSymbol(contractSymbol);
+    if (!requestSymbol) return;
+    if (effectiveMarketStatus === 'CLOSED') {
+      setTradesState((current) => ({
+        ...current,
+        symbol: requestSymbol,
+        loading: false,
+      }));
+      return;
+    }
+    if (tradesInFlightSymbolRef.current === requestSymbol) return;
+
+    const requestSeq = tradesRequestSeqRef.current + 1;
+    tradesRequestSeqRef.current = requestSeq;
+    tradesInFlightSymbolRef.current = requestSymbol;
+
+    try {
+      const trades = await getContractMarketTrades(requestSymbol, FUTURES_TRADES_LIMIT);
+      if (!mountedRef.current || tradesRequestSeqRef.current !== requestSeq) return;
+      applyTradesSnapshot([...trades].reverse());
+    } catch (error) {
+      if (!mountedRef.current || tradesRequestSeqRef.current !== requestSeq) return;
+      setTradesState((current) => ({
+        ...current,
+        symbol: requestSymbol,
+        loading: false,
+        error: getErrorMessage(error),
+      }));
+    } finally {
+      if (tradesInFlightSymbolRef.current === requestSymbol) {
+        tradesInFlightSymbolRef.current = null;
+      }
+    }
+  }, [applyTradesSnapshot, contractSymbol, effectiveMarketStatus]);
+
+  useEffect(() => {
+    const requestSymbol = normalizeContractSymbol(contractSymbol);
+    const cached = readContractTradesCache(requestSymbol);
+    if (cached?.trades?.length) {
+      applyTradesSnapshot(cached.trades.slice(0, FUTURES_TRADES_LIMIT), { loading: false });
+    } else {
+      setTradesState({
+        symbol: requestSymbol,
+        trades: [],
+        loading: true,
+        error: null,
+        source: null,
+        freshness: null,
+        updatedAt: null,
+      });
+    }
+
+    void refreshTrades();
+    if (effectiveMarketStatus === 'CLOSED' || quoteMarketRealtimeStatus === 'connected') {
+      return () => {
+        tradesRequestSeqRef.current += 1;
+      };
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshTrades();
+    }, 1500);
+
+    return () => {
+      tradesRequestSeqRef.current += 1;
+      window.clearInterval(timer);
+    };
+  }, [
+    applyTradesSnapshot,
+    contractSymbol,
+    effectiveMarketStatus,
+    quoteMarketRealtimeStatus,
+    refreshTrades,
+  ]);
+
+  useEffect(() => {
+    const handleTradeMessage = (message: ContractMarketRealtimeMessage) => {
+      if (effectiveMarketStatus === 'CLOSED') return;
+
+      const trades = extractRealtimeTrades(message, contractSymbol);
+      if (trades.length === 0) return;
+
+      setTradesState((current) => {
+        if (normalizeContractSymbol(current.symbol) !== normalizeContractSymbol(contractSymbol)) {
+          return current;
+        }
+        const nextRows = mergeTrades(trades, current.trades, FUTURES_TRADES_LIMIT);
+        const latest = nextRows[0] || null;
+        writeContractTradesCache(contractSymbol, {
+          trades: nextRows,
+          lastPrice: latest?.price ?? null,
+        });
+        return {
+          symbol: normalizeContractSymbol(contractSymbol),
+          trades: nextRows,
+          loading: false,
+          error: null,
+          source: latest?.source || latest?.quote_source || latest?.price_source || null,
+          freshness: latest?.quote_freshness || null,
+          updatedAt: latest ? normalizeTradeTime(latest.time ?? latest.ts) : Date.now(),
+        };
+      });
+    };
+
+    return contractMarketRealtime.subscribe('trade', handleTradeMessage);
+  }, [contractSymbol, effectiveMarketStatus]);
+
+  const tradesBelongToCurrentSymbol = normalizeContractSymbol(tradesState.symbol) === normalizeContractSymbol(contractSymbol);
+  const recentTrades = tradesBelongToCurrentSymbol ? tradesState.trades : [];
+  const latestTrade = recentTrades[0] || null;
+  const nextTrade = recentTrades[1] || null;
+  const latestTradeNumber = getPositivePrice(latestTrade?.price);
+  const nextTradeNumber = getPositivePrice(nextTrade?.price);
+  const latestTradeSource = latestTrade?.price_source || latestTrade?.source || null;
+  const latestTradeTickPrice = String(latestTrade?.price_source || '').trim().toUpperCase() === 'TRADE_TICK'
+    ? latestTradeNumber
+    : null;
+  const latestTradeDirection: PriceDirection = latestTradeNumber !== null && nextTradeNumber !== null
+    ? latestTradeNumber > nextTradeNumber
+      ? 'up'
+      : latestTradeNumber < nextTradeNumber
+        ? 'down'
+        : 'flat'
+    : 'flat';
+
   const marketViewDisplayPrice = getPositivePrice(marketView?.display_price);
   const marketViewCurrentPriceSource = marketViewDisplayPrice !== null
     ? normalizeCurrentPriceSource(marketView?.current_price_source || marketView?.display_price_source) || 'LIVE_MID'
@@ -706,7 +966,7 @@ export function useContractMarketView({
   const marketViewTradePrice = marketViewCurrentPriceSource === 'TRADE_TICK'
     ? getPositivePrice(marketView?.last_trade_price ?? marketView?.display_price)
     : null;
-  const tradeTickPrice = getPositivePrice(lastTradePrice) ?? marketViewTradePrice;
+  const tradeTickPrice = latestTradeTickPrice ?? getPositivePrice(lastTradePrice) ?? marketViewTradePrice;
   const liveDepthMidPrice = getPositivePrice(liveDepthBbo?.mid);
   const liveDepthMidFresh = liveDepthBbo?.source === 'LIVE_MID'
     && liveDepthMidPrice !== null
@@ -1124,6 +1384,14 @@ export function useContractMarketView({
     depthStatus,
     depthStatusLabel,
     liveMidPrice,
+    recentTrades,
+    tradesLoading: tradesBelongToCurrentSymbol ? tradesState.loading : true,
+    tradesError: tradesBelongToCurrentSymbol ? tradesState.error : null,
+    tradesSource: tradesBelongToCurrentSymbol ? tradesState.source : null,
+    tradesFreshness: tradesBelongToCurrentSymbol ? tradesState.freshness : null,
+    latestTradePrice: latestTradeTickPrice,
+    latestTradeDirection,
+    latestTradeSource,
     bestBid: derivedMarketState.bestBid,
     bestAsk: derivedMarketState.bestAsk,
     spread: derivedMarketState.spread,
