@@ -79,6 +79,7 @@ type ContractPositionTabsProps = {
   currentSymbol: string;
   scope?: PositionScope;
   positions: ContractPositionItem[];
+  positionsPageItems?: ContractPositionItem[];
   positionSummaries: ContractPositionSummaryItem[];
   activeOrders?: ContractOrderListItem[];
   orders: ContractOrderListItem[];
@@ -95,6 +96,7 @@ type ContractPositionTabsProps = {
   isTradesLoading?: boolean;
   realtimeStatus?: ContractRealtimeStatus;
   activeOrdersPagination?: ServerPaginationState;
+  positionsPagination?: ServerPaginationState;
   orderHistoryPagination?: ServerPaginationState;
   tradeHistoryPagination?: ServerPaginationState;
   activeOrdersFilters?: ContractOrderFilterState;
@@ -172,6 +174,7 @@ export default function ContractPositionTabs({
   currentSymbol,
   scope: controlledScope,
   positions,
+  positionsPageItems,
   positionSummaries,
   activeOrders,
   orders,
@@ -188,6 +191,7 @@ export default function ContractPositionTabs({
   isTradesLoading = false,
   realtimeStatus = 'idle',
   activeOrdersPagination,
+  positionsPagination,
   orderHistoryPagination,
   tradeHistoryPagination,
   activeOrdersFilters,
@@ -268,9 +272,17 @@ export default function ContractPositionTabs({
     { key: 'action', label: t('filterAction', 'contracts'), options: actionFilterOptions },
   ], [actionFilterOptions, directionFilterOptions, t]);
   const normalizedCurrentSymbol = useMemo(() => normalizeContractSymbol(currentSymbol), [currentSymbol]);
+  const currentPositionRowsSource = useMemo(
+    () => positionsPagination ? (positionsPageItems || []) : positions,
+    [positions, positionsPageItems, positionsPagination],
+  );
   const allOpenPositions = useMemo(
     () => positions.filter((item) => item.status === 'OPEN' && getPositionAmount(item) > 0),
     [positions],
+  );
+  const pagedOpenPositions = useMemo(
+    () => currentPositionRowsSource.filter((item) => item.status === 'OPEN' && getPositionAmount(item) > 0),
+    [currentPositionRowsSource],
   );
   const allOpenPositionSummaries = useMemo(
     () => positionSummaries.filter((item) => (
@@ -284,7 +296,7 @@ export default function ContractPositionTabs({
     [allOpenPositionSummaries, normalizedCurrentSymbol],
   );
   const openPositionSummaries = scope === 'current' ? currentOpenPositionSummaries : allOpenPositionSummaries;
-  const openPositionSummaryRows = useMemo(
+  const legacyOpenPositionSummaryRows = useMemo(
     () => openPositionSummaries.map((summary) => ({
       ...summary,
       positions: allOpenPositions.filter((position) => (
@@ -294,6 +306,11 @@ export default function ContractPositionTabs({
     })),
     [allOpenPositions, openPositionSummaries],
   );
+  const pagedOpenPositionSummaryRows = useMemo(
+    () => buildAggregatedPositionRows(pagedOpenPositions),
+    [pagedOpenPositions],
+  );
+  const openPositionSummaryRows = positionsPagination ? pagedOpenPositionSummaryRows : legacyOpenPositionSummaryRows;
   const historyPositions = useMemo(
     () => positions.filter((item) => (
       (item.status === 'CLOSED' || item.status === 'LIQUIDATED' || getPositionAmount(item) <= 0)
@@ -317,8 +334,8 @@ export default function ContractPositionTabs({
     [normalizedCurrentSymbol, scope, trades],
   );
   const pagedOpenPositionSummaries = useMemo(
-    () => paginateItems(openPositionSummaryRows, pages.positions, pageSize),
-    [openPositionSummaryRows, pages.positions],
+    () => positionsPagination ? openPositionSummaryRows : paginateItems(openPositionSummaryRows, pages.positions, pageSize),
+    [openPositionSummaryRows, pages.positions, positionsPagination],
   );
   const pagedHistoryPositions = useMemo(
     () => paginateItems(scopedHistoryPositions, pages.historyPositions, pageSize),
@@ -426,11 +443,13 @@ export default function ContractPositionTabs({
     const safePage = Math.max(1, page);
     const serverPagination = tab === 'openOrders'
       ? activeOrdersPagination
-      : tab === 'historyOrders'
-        ? orderHistoryPagination
-        : tab === 'trades'
-          ? tradeHistoryPagination
-          : null;
+      : tab === 'positions'
+        ? positionsPagination
+        : tab === 'historyOrders'
+          ? orderHistoryPagination
+          : tab === 'trades'
+            ? tradeHistoryPagination
+            : null;
     if (serverPagination) {
       serverPagination.onPageChange(safePage);
       return;
@@ -822,9 +841,9 @@ export default function ContractPositionTabs({
               onSymbolSelect={onSymbolSelect}
             />
             <PaginationControls
-              page={pages.positions}
-              totalItems={openPositionSummaryRows.length}
-              pageSize={pageSize}
+              page={positionsPagination?.page ?? pages.positions}
+              totalItems={positionsPagination?.total ?? openPositionSummaryRows.length}
+              pageSize={positionsPagination?.pageSize ?? pageSize}
               onPageChange={(page) => setTabPage('positions', page)}
             />
           </>
@@ -992,6 +1011,70 @@ export default function ContractPositionTabs({
 function paginateItems<T>(items: T[], page: number, size: number) {
   const safePage = Math.max(1, page);
   return items.slice((safePage - 1) * size, safePage * size);
+}
+
+function formatAggregatedDecimal(value: number, precision = 8) {
+  if (!Number.isFinite(value)) return '0';
+  return String(Number(value.toFixed(precision)));
+}
+
+function resolveSharedTpSlMode(
+  positions: ContractPositionItem[],
+  field: 'take_profit_price' | 'stop_loss_price',
+) {
+  const values = positions
+    .map((position) => position[field])
+    .filter((value): value is string => !!value && toNumber(value) > 0);
+  if (values.length === 0) return null;
+  const first = values[0];
+  return values.every((value) => value === first) ? first : null;
+}
+
+function buildAggregatedPositionRows(positions: ContractPositionItem[]): AggregatedPositionRow[] {
+  const grouped = new Map<string, ContractPositionItem[]>();
+  positions.forEach((position) => {
+    const side = getPositionRecordSide(position);
+    if (!side) return;
+    const key = `${normalizeContractSymbol(position.symbol)}:${side}`;
+    const rows = grouped.get(key) || [];
+    rows.push(position);
+    grouped.set(key, rows);
+  });
+
+  return Array.from(grouped.entries()).map(([key, rows]) => {
+    const [symbol, side] = key.split(':') as [string, ContractPositionSide];
+    const quantity = rows.reduce((sum, row) => sum + getPositionAmount(row), 0);
+    const entryNotional = rows.reduce((sum, row) => sum + (getPositionAmount(row) * toNumber(row.entry_price)), 0);
+    const avgEntryPrice = quantity > 0 ? entryNotional / quantity : 0;
+    const marginAmount = rows.reduce((sum, row) => sum + toNumber(row.margin_amount), 0);
+    const unrealizedPnl = rows.reduce((sum, row) => sum + toNumber(row.unrealized_pnl), 0);
+    const liquidationPrice = rows.find((row) => toNumber(row.liquidation_price) > 0)?.liquidation_price || '0';
+    const takeProfitPrice = resolveSharedTpSlMode(rows, 'take_profit_price');
+    const stopLossPrice = resolveSharedTpSlMode(rows, 'stop_loss_price');
+    const tpSlMode: ContractPositionSummaryItem['tp_sl_mode'] = takeProfitPrice || stopLossPrice
+      ? rows.length === 1 ? 'SINGLE' : 'MIXED'
+      : 'NONE';
+
+    return {
+      symbol,
+      side,
+      quantity: formatAggregatedDecimal(quantity),
+      avg_entry_price: formatAggregatedDecimal(avgEntryPrice),
+      margin_amount: formatAggregatedDecimal(marginAmount),
+      unrealized_pnl: formatAggregatedDecimal(unrealizedPnl),
+      liquidation_price: liquidationPrice,
+      position_ids: rows.map((row) => row.id),
+      count: rows.length,
+      take_profit_price: takeProfitPrice,
+      stop_loss_price: stopLossPrice,
+      tp_sl_mode: tpSlMode,
+      positions: rows,
+    };
+  }).sort((left, right) => {
+    const symbolCompare = normalizeContractSymbol(left.symbol).localeCompare(normalizeContractSymbol(right.symbol));
+    if (symbolCompare !== 0) return symbolCompare;
+    return String(left.side).localeCompare(String(right.side));
+  });
 }
 
 function filterRowsByScope<T extends { symbol?: string | null }>(
