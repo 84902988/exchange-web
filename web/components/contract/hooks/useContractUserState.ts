@@ -214,6 +214,58 @@ function getContractUserMessageSymbol(
   return String(message.symbol || payload.symbol || '').trim().toUpperCase();
 }
 
+function getContractUserMessageSymbols(
+  message: ContractUserRealtimeMessage,
+  payload: Record<string, unknown>,
+) {
+  const symbols = new Set<string>();
+  const addSymbol = (value: unknown) => {
+    const normalized = normalizeCacheSymbol(String(value || ''));
+    if (normalized) symbols.add(normalized);
+  };
+  const addRecordSymbols = (value: unknown) => {
+    asRecordArray(value).forEach((item) => addSymbol(item.symbol));
+  };
+
+  addSymbol(message.symbol);
+  addSymbol(payload.symbol);
+  [
+    message.positions,
+    message.position,
+    message.position_summaries,
+    message.position_summary,
+    message.orders,
+    message.order,
+    message.trades,
+    message.trade,
+    payload.positions,
+    payload.position,
+    payload.position_summaries,
+    payload.position_summary,
+    payload.orders,
+    payload.order,
+    payload.trades,
+    payload.trade,
+  ].forEach(addRecordSymbols);
+
+  return Array.from(symbols);
+}
+
+function isContractUserMessageForScope(
+  message: ContractUserRealtimeMessage,
+  payload: Record<string, unknown>,
+  currentSymbol: string,
+  scope: ContractDataScope,
+) {
+  if (scope === 'all') return true;
+
+  const normalizedCurrentSymbol = normalizeCacheSymbol(currentSymbol);
+  if (!normalizedCurrentSymbol) return false;
+
+  const messageSymbols = getContractUserMessageSymbols(message, payload);
+  return messageSymbols.length === 0 || messageSymbols.includes(normalizedCurrentSymbol);
+}
+
 function isContractUserMessageForSymbol(
   message: ContractUserRealtimeMessage,
   payload: Record<string, unknown>,
@@ -599,6 +651,12 @@ export function useContractUserState({
     return true;
   }, []);
 
+  const markScopedRealtimeMessage = useCallback((message: ContractUserRealtimeMessage) => {
+    const payload = getContractUserPayload(message);
+    if (!isContractUserMessageForScope(message, payload, contractSymbol, dataScope)) return null;
+    return markRealtimeMessage(message) ? payload : null;
+  }, [contractSymbol, dataScope, markRealtimeMessage]);
+
   const updateActivePositionScopeCache = useCallback((
     nextPositions: ContractPositionItem[],
     nextSummaries: ContractPositionSummaryItem[],
@@ -974,9 +1032,7 @@ export function useContractUserState({
     };
 
     const handleSnapshotMessage = (message: ContractUserRealtimeMessage) => {
-      if (!markRealtimeMessage(message)) return;
-      const payload = getContractUserPayload(message);
-      if (!isContractUserMessageForSymbol(message, payload, contractSymbol)) return;
+      if (!markScopedRealtimeMessage(message)) return;
 
       const nextAccount = extractContractAccountUpdate(message);
       if (nextAccount) {
@@ -1007,7 +1063,7 @@ export function useContractUserState({
 
     const handleAccountMessage = (message: ContractUserRealtimeMessage) => {
       if (String(message.type || '').toLowerCase().includes('snapshot')) return;
-      if (!markRealtimeMessage(message)) return;
+      if (!markScopedRealtimeMessage(message)) return;
       const nextAccount = extractContractAccountUpdate(message);
       if (nextAccount) {
         setAccount(nextAccount);
@@ -1018,18 +1074,21 @@ export function useContractUserState({
 
     const handlePositionsMessage = (message: ContractUserRealtimeMessage) => {
       if (String(message.type || '').toLowerCase().includes('snapshot')) return;
-      if (!markRealtimeMessage(message)) return;
-      applyRealtimePositionState(
-        extractContractPositionsUpdate(message, contractSymbol),
-        extractContractPositionSummariesUpdate(message, contractSymbol),
-      );
+      if (!markScopedRealtimeMessage(message)) return;
+      const positionsUpdate = extractContractPositionsUpdate(message, contractSymbol);
+      const summariesUpdate = extractContractPositionSummariesUpdate(message, contractSymbol);
+      if (!positionsUpdate && !summariesUpdate && dataScope === 'all' && activeTabRef.current === 'positions') {
+        void refreshPrivate({ silent: true });
+        return;
+      }
+      applyRealtimePositionState(positionsUpdate, summariesUpdate);
     };
 
     const handleOrdersMessage = (message: ContractUserRealtimeMessage) => {
       if (String(message.type || '').toLowerCase().includes('snapshot')) return;
-      if (!markRealtimeMessage(message)) return;
+      if (!markScopedRealtimeMessage(message)) return;
       const update = extractContractOrdersUpdate(message, contractSymbol);
-      if (!update) return;
+      if (!update && dataScope !== 'all') return;
       if (activeTabRef.current === 'openOrders' || activeTabRef.current === 'historyOrders') {
         void refreshPrivate({ silent: true });
       }
@@ -1038,9 +1097,9 @@ export function useContractUserState({
 
     const handleTradesMessage = (message: ContractUserRealtimeMessage) => {
       if (String(message.type || '').toLowerCase().includes('snapshot')) return;
-      if (!markRealtimeMessage(message)) return;
+      if (!markScopedRealtimeMessage(message)) return;
       const update = extractContractTradesUpdate(message, contractSymbol);
-      if (!update) return;
+      if (!update && dataScope !== 'all') return;
       if (activeTabRef.current === 'trades') {
         void refreshPrivate({ silent: true });
       }
@@ -1060,7 +1119,7 @@ export function useContractUserState({
       unsubscribeOrders();
       unsubscribeTrades();
     };
-  }, [contractSymbol, markRealtimeMessage, refreshPrivate, updateActivePositionScopeCache]);
+  }, [contractSymbol, dataScope, markScopedRealtimeMessage, refreshPrivate, updateActivePositionScopeCache]);
 
   useEffect(() => {
     if (!isLoggedIn) {
