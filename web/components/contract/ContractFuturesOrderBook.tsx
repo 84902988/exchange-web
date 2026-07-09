@@ -220,7 +220,7 @@ export default function ContractFuturesOrderBook({
 
       {loading && askRows.length === 0 && bidRows.length === 0 ? (
         <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-white/40">
-          {t('loading', 'common')}
+          {t('loading', 'contracts')}
         </div>
       ) : askRows.length === 0 && bidRows.length === 0 ? (
         <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-white/40">
