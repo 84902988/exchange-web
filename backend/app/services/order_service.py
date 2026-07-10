@@ -16,8 +16,13 @@ from app.db.models.trade import Trade
 from app.db.models.trading_pair import TradingPair
 from app.schemas.order import CreateOrderRequest
 from app.services.dealer_risk_service import DealerRiskRejected, check_dealer_order_risk
-from app.services.binance_market_service import BinanceMarketServiceError, binance_market_service
 from app.services.fee_service import apply_trade_fee
+from app.services.spot_execution_view import (
+    SpotExecutionSnapshot,
+    SpotExecutionUnavailable,
+    get_spot_execution_snapshot,
+    guard_spot_execution_snapshot,
+)
 from app.services.spot_order_payload import serialize_spot_order
 from app.services.stock_dealer_depth_service import (
     get_stock_trade_context,
@@ -42,6 +47,7 @@ class DealerPriceSnapshot:
     ref_price: Optional[Decimal]
     price_source: Optional[str] = None
     spread_bps: Optional[Decimal] = None
+    execution_snapshot: Optional[SpotExecutionSnapshot] = None
 
 
 def _generate_order_no(user_id: int) -> str:
@@ -138,51 +144,6 @@ def _get_trading_pair(db: Session, symbol: str) -> TradingPair:
     return pair
 
 
-def _get_dealer_reference_price(pair: TradingPair) -> Decimal:
-    if is_stock_dealer_pair(pair):
-        try:
-            return get_stock_trade_context(db=None, trading_pair=pair, limit=1).mid_price
-        except Exception:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="dealer reference price unavailable",
-            )
-
-    try:
-        payload = binance_market_service.get_ticker(symbol=pair.symbol)
-        price = Decimal(str(payload.price))
-    except (BinanceMarketServiceError, ValueError, TypeError, ArithmeticError):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="dealer reference price unavailable",
-        )
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="dealer reference price unavailable",
-        )
-
-    if price <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="dealer reference price unavailable",
-        )
-
-    return price
-
-
-def _parse_dealer_market_price(value) -> Optional[Decimal]:
-    try:
-        price = Decimal(str(value))
-    except (ValueError, TypeError, ArithmeticError):
-        return None
-
-    if price <= 0:
-        return None
-
-    return price
-
-
 def _dealer_price_source(value: object, fallback: str) -> str:
     text = str(value or fallback).strip().upper()
     return (text or fallback)[:32]
@@ -222,7 +183,12 @@ def _dealer_trade_snapshot_values(snapshot: Optional[DealerPriceSnapshot]) -> di
     }
 
 
-def _get_dealer_market_context(pair: TradingPair) -> DealerPriceSnapshot:
+def _get_dealer_market_context(
+    db: Session,
+    pair: TradingPair,
+    *,
+    require_executable: bool = True,
+) -> Optional[DealerPriceSnapshot]:
     if is_stock_dealer_pair(pair):
         try:
             context = get_stock_trade_context(db=None, trading_pair=pair, limit=1)
@@ -249,37 +215,36 @@ def _get_dealer_market_context(pair: TradingPair) -> DealerPriceSnapshot:
             spread_bps=_dealer_spread_bps(getattr(context, "spread_bps", None)),
         )
 
-    best_bid: Optional[Decimal] = None
-    best_ask: Optional[Decimal] = None
+    if str(getattr(pair, "data_source", "") or "").strip().upper() == "INTERNAL":
+        if require_executable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="internal pair cannot use dealer execution",
+            )
+        return None
 
     try:
-        depth = binance_market_service.get_depth(symbol=pair.symbol, limit=5)
-    except BinanceMarketServiceError:
-        depth = None
-    except Exception:
-        depth = None
-
-    if depth is not None:
-        if depth.bids:
-            best_bid = _parse_dealer_market_price(depth.bids[0].price)
-        if depth.asks:
-            best_ask = _parse_dealer_market_price(depth.asks[0].price)
-
-    if best_bid is not None and best_ask is not None:
-        return DealerPriceSnapshot(
-            best_bid=best_bid,
-            best_ask=best_ask,
-            ref_price=_dealer_ref_price_from_bbo(best_bid, best_ask),
-            price_source="BINANCE",
-            spread_bps=None,
+        execution = get_spot_execution_snapshot(
+            db,
+            pair.symbol,
+            require_executable=require_executable,
         )
-
+    except SpotExecutionUnavailable as exc:
+        if require_executable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="dealer market price unavailable",
+            ) from exc
+        return None
+    if execution is None:
+        return None
     return DealerPriceSnapshot(
-        best_bid=best_bid,
-        best_ask=best_ask,
-        ref_price=_get_dealer_reference_price(pair),
-        price_source="BINANCE",
+        best_bid=execution.best_bid,
+        best_ask=execution.best_ask,
+        ref_price=_dealer_ref_price_from_bbo(execution.best_bid, execution.best_ask),
+        price_source=_dealer_price_source(execution.provider, "SPOT_PROVIDER"),
         spread_bps=None,
+        execution_snapshot=execution,
     )
 
 
@@ -445,16 +410,108 @@ def _get_dealer_execution_price(
     best_bid: Optional[Decimal],
     best_ask: Optional[Decimal],
 ) -> Optional[Decimal]:
-    if order.side == "BUY":
+    return _get_dealer_execution_price_for_side(
+        order.side,
+        best_bid=best_bid,
+        best_ask=best_ask,
+    )
+
+
+def _get_dealer_execution_price_for_side(
+    side: str,
+    *,
+    best_bid: Optional[Decimal],
+    best_ask: Optional[Decimal],
+) -> Optional[Decimal]:
+    if side == "BUY":
         return best_ask
 
-    if order.side == "SELL":
+    if side == "SELL":
         return best_bid
 
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail="unsupported side",
     )
+
+
+def _final_dealer_execution_guard(
+    *,
+    pair: TradingPair,
+    dealer_snapshot: Optional[DealerPriceSnapshot],
+    reject_on_failure: bool,
+) -> bool:
+    if is_stock_dealer_pair(pair):
+        return True
+    result = guard_spot_execution_snapshot(
+        dealer_snapshot.execution_snapshot if dealer_snapshot is not None else None
+    )
+    if result.executable:
+        return True
+    if reject_on_failure:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="dealer market price unavailable",
+        )
+    return False
+
+
+def _execute_dealer_limit_order_if_eligible(
+    db: Session,
+    *,
+    order: Order,
+    pair: TradingPair,
+    dealer_snapshot: Optional[DealerPriceSnapshot],
+) -> bool:
+    if dealer_snapshot is None:
+        return False
+    best_bid = dealer_snapshot.best_bid
+    best_ask = dealer_snapshot.best_ask
+    guard_price = dealer_snapshot.ref_price
+    if not _should_fill_dealer_limit_order(order, best_bid=best_bid, best_ask=best_ask):
+        return False
+    execution_price = _get_dealer_execution_price(
+        order,
+        best_bid=best_bid,
+        best_ask=best_ask,
+    )
+    if execution_price is None or guard_price is None or guard_price <= 0:
+        return False
+    if not _is_dealer_price_within_guard(
+        execution_price=execution_price,
+        guard_price=guard_price,
+        max_deviation_rate=DEALER_MAX_DEVIATION_RATE,
+    ):
+        return False
+    remaining_amount = _remaining_amount(order, pair.amount_precision)
+    execution_quote_amount = _trade_value(execution_price * remaining_amount)
+    if not _check_dealer_execution_risk(
+        db,
+        pair=pair,
+        side=order.side,
+        order_type=order.order_type,
+        amount=remaining_amount,
+        quote_amount=execution_quote_amount,
+        ref_price=execution_price,
+        order_id=order.id,
+        user_id=order.user_id,
+        raise_on_reject=False,
+    ):
+        return False
+    if not _final_dealer_execution_guard(
+        pair=pair,
+        dealer_snapshot=dealer_snapshot,
+        reject_on_failure=False,
+    ):
+        return False
+    _fill_dealer_limit_order(
+        db,
+        order=order,
+        pair=pair,
+        execution_price=execution_price,
+        dealer_snapshot=dealer_snapshot,
+    )
+    return True
 
 
 def _is_dealer_price_within_guard(
@@ -1803,78 +1860,23 @@ def _create_dealer_limit_order(
         db.add(order)
         db.flush()
 
-        dealer_snapshot = _get_dealer_market_context(pair)
-        best_bid = dealer_snapshot.best_bid
-        best_ask = dealer_snapshot.best_ask
-        guard_price = dealer_snapshot.ref_price
-
-        if not _should_fill_dealer_limit_order(
-            order,
-            best_bid=best_bid,
-            best_ask=best_ask,
-        ):
-            order.status = "OPEN"
-            db.add(order)
-            db.flush()
-            db.refresh(order)
-            return order
-
-        execution_price = _get_dealer_execution_price(
-            order,
-            best_bid=best_bid,
-            best_ask=best_ask,
-        )
-        if execution_price is None:
-            order.status = "OPEN"
-            db.add(order)
-            db.flush()
-            db.refresh(order)
-            return order
-        if guard_price is None or guard_price <= 0:
-            order.status = "OPEN"
-            db.add(order)
-            db.flush()
-            db.refresh(order)
-            return order
-
-        if not _is_dealer_price_within_guard(
-            execution_price=execution_price,
-            guard_price=guard_price,
-            max_deviation_rate=DEALER_MAX_DEVIATION_RATE,
-        ):
-            order.status = "OPEN"
-            db.add(order)
-            db.flush()
-            db.refresh(order)
-            return order
-
-        remaining_amount = _remaining_amount(order, pair.amount_precision)
-        execution_quote_amount = _trade_value(execution_price * remaining_amount)
-        if not _check_dealer_execution_risk(
+        dealer_snapshot = _get_dealer_market_context(
             db,
-            pair=pair,
-            side=order.side,
-            order_type=order.order_type,
-            amount=remaining_amount,
-            quote_amount=execution_quote_amount,
-            ref_price=execution_price,
-            order_id=order.id,
-            user_id=order.user_id,
-            raise_on_reject=False,
-        ):
-            order.status = "OPEN"
-            db.add(order)
-            db.flush()
-            db.refresh(order)
-            return order
-
-        return _fill_dealer_limit_order(
+            pair,
+            require_executable=False,
+        )
+        filled = _execute_dealer_limit_order_if_eligible(
             db,
             order=order,
             pair=pair,
-            execution_price=execution_price,
             dealer_snapshot=dealer_snapshot,
         )
+        if not filled:
+            order.status = "OPEN"
+            db.add(order)
+            db.flush()
+            db.refresh(order)
+        return order
 
     except HTTPException:
         db.rollback()
@@ -1913,7 +1915,12 @@ def _create_dealer_market_order(
             detail="trading pair assets are disabled",
         )
 
-    dealer_snapshot = _get_dealer_market_context(pair)
+    dealer_snapshot = _get_dealer_market_context(db, pair, require_executable=True)
+    if dealer_snapshot is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="dealer market price unavailable",
+        )
     best_bid = dealer_snapshot.best_bid
     best_ask = dealer_snapshot.best_ask
     guard_price = dealer_snapshot.ref_price
@@ -1925,15 +1932,11 @@ def _create_dealer_market_order(
         guard_price,
     )
 
-    if payload.side == "BUY":
-        execution_price = best_ask
-    elif payload.side == "SELL":
-        execution_price = best_bid
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="unsupported side",
-        )
+    execution_price = _get_dealer_execution_price_for_side(
+        payload.side,
+        best_bid=best_bid,
+        best_ask=best_ask,
+    )
 
     if execution_price is None or execution_price <= 0:
         raise HTTPException(
@@ -2005,6 +2008,12 @@ def _create_dealer_market_order(
             order_id=None,
             user_id=user_id,
             raise_on_reject=True,
+        )
+
+        _final_dealer_execution_guard(
+            pair=pair,
+            dealer_snapshot=dealer_snapshot,
+            reject_on_failure=True,
         )
 
         user_quote_balance = _get_user_balance_for_update(
@@ -2159,6 +2168,12 @@ def _create_dealer_market_order(
             raise_on_reject=True,
         )
 
+        _final_dealer_execution_guard(
+            pair=pair,
+            dealer_snapshot=dealer_snapshot,
+            reject_on_failure=True,
+        )
+
         user_base_balance = _get_user_balance_for_update(
             db,
             user_id=user_id,
@@ -2301,6 +2316,11 @@ def _create_dealer_order(
     pair: TradingPair,
 ) -> Order:
     logger.debug("[_create_dealer_order] order_type=%s", payload.order_type)
+    if str(getattr(pair, "data_source", "") or "").strip().upper() == "INTERNAL":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="internal pair cannot use dealer execution",
+        )
     if payload.order_type == "LIMIT":
         logger.debug("[_create_dealer_order] order_type=LIMIT -> dealer limit")
         return _create_dealer_limit_order(
@@ -2354,61 +2374,28 @@ def process_open_dealer_orders(db: Session) -> int:
                 detail="trading pair not found",
             )
 
-        market_context = market_context_cache.get(pair.id)
-        if market_context is None:
-            market_context = _get_dealer_market_context(pair)
-            market_context_cache[pair.id] = market_context
-        best_bid = market_context.best_bid
-        best_ask = market_context.best_ask
-        guard_price = market_context.ref_price
-
-        if not _should_fill_dealer_limit_order(
-            order,
-            best_bid=best_bid,
-            best_ask=best_ask,
-        ):
-            continue
-
-        execution_price = _get_dealer_execution_price(
-            order,
-            best_bid=best_bid,
-            best_ask=best_ask,
-        )
-        if execution_price is None:
-            continue
-        if guard_price is None or guard_price <= 0:
-            continue
-
-        if not _is_dealer_price_within_guard(
-            execution_price=execution_price,
-            guard_price=guard_price,
-            max_deviation_rate=DEALER_MAX_DEVIATION_RATE,
-        ):
-            continue
-
-        remaining_amount = _remaining_amount(order, pair.amount_precision)
-        execution_quote_amount = _trade_value(execution_price * remaining_amount)
-        if not _check_dealer_execution_risk(
-            db,
-            pair=pair,
-            side=order.side,
-            order_type=order.order_type,
-            amount=remaining_amount,
-            quote_amount=execution_quote_amount,
-            ref_price=execution_price,
-            order_id=order.id,
-            user_id=order.user_id,
-            raise_on_reject=False,
-        ):
-            continue
-
-        _fill_dealer_limit_order(
+        if pair.id not in market_context_cache:
+            try:
+                market_context_cache[pair.id] = _get_dealer_market_context(
+                    db,
+                    pair,
+                    require_executable=False,
+                )
+            except Exception:
+                logger.warning(
+                    "dealer_loop_execution_snapshot_failed symbol=%s",
+                    pair.symbol,
+                    exc_info=True,
+                )
+                market_context_cache[pair.id] = None
+        market_context = market_context_cache[pair.id]
+        if not _execute_dealer_limit_order_if_eligible(
             db,
             order=order,
             pair=pair,
-            execution_price=execution_price,
             dealer_snapshot=market_context,
-        )
+        ):
+            continue
         filled_count += 1
 
     return filled_count

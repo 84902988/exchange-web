@@ -11,7 +11,12 @@ from app.db.models.trading_pair import TradingPair
 from app.db.session import SessionLocal
 from app.schemas.market import DepthItem, DepthResponse, TradesResponse
 from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT, enabled_spot_market_providers
-from app.services.spot_market_gateway_state import SpotGatewayBroadcastState, make_domain_key
+from app.services.spot_market_gateway_state import (
+    SpotGatewayBroadcastState,
+    SpotGatewayDepthAuthority,
+    SpotGatewayDepthState,
+    make_domain_key,
+)
 from app.services.spot_market_provider_ws import (
     ensure_spot_provider_ws_depth,
     ensure_spot_provider_ws_kline,
@@ -86,11 +91,13 @@ class SpotMarketGateway:
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_lock = asyncio.Lock()
         self._broadcast_state = SpotGatewayBroadcastState()
+        self._depth_authority = SpotGatewayDepthAuthority()
         self._ensured_kline_intervals: dict[str, set[str]] = {}
         self._pending_kline_releases: dict[str, dict[str, float]] = {}
         self._kline_release_grace_seconds = max(0.0, float(kline_release_grace_seconds))
         self._precision_cache: dict[str, tuple[int, int]] = {}
         self._symbol_providers: dict[str, str] = {}
+        self._pending_provider_switches: dict[str, tuple[str, str]] = {}
         self._broadcast_counters: dict[str, int] = {
             "depth": 0,
             "ticker": 0,
@@ -105,13 +112,18 @@ class SpotMarketGateway:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         if not normalized_symbol:
             return
+        active_provider = self._depth_authority.active_provider(normalized_symbol)
         if self._provider_symbol_allowed_is_default:
-            provider_code = await asyncio.to_thread(self._select_provider_ws_code, normalized_symbol)
+            provider_code = active_provider or await asyncio.to_thread(
+                self._select_provider_ws_code,
+                normalized_symbol,
+            )
         else:
             provider_code = PROVIDER_BITGET_SPOT
         if not provider_code or not await self._provider_symbol_allowed_async(normalized_symbol):
             return
         self._symbol_providers[normalized_symbol] = provider_code
+        self._depth_authority.ensure_provider(normalized_symbol, provider_code)
         await self._cancel_idle_release(normalized_symbol)
         try:
             if self._ensure_depth_accepts_provider:
@@ -188,6 +200,10 @@ class SpotMarketGateway:
                 for symbol, releases in self._pending_kline_releases.items()
             }
             symbol_providers = dict(self._symbol_providers)
+            provider_generations = {
+                symbol: self._depth_authority.active_generation(symbol)
+                for symbol in active_symbols
+            }
             broadcast_counters = dict(self._broadcast_counters)
             last_broadcast_at = dict(self._last_broadcast_at)
             last_broadcast_type = dict(self._last_broadcast_type)
@@ -207,6 +223,7 @@ class SpotMarketGateway:
                     "gateway_loop_active": bool(task_active.get(symbol)),
                     "subscriber_count": subscriber_counts.get(symbol),
                     "provider": symbol_providers.get(symbol),
+                    "provider_generation": provider_generations.get(symbol, 0),
                     "ensured_kline_intervals": ensured_kline_intervals.get(symbol, []),
                     "idle_release_pending": bool(idle_release_pending.get(symbol)),
                     "pending_kline_release_in_seconds": pending_kline_releases.get(symbol, {}),
@@ -218,6 +235,70 @@ class SpotMarketGateway:
             "broadcast_counters": broadcast_counters,
             "idle_stop_count": idle_stop_count,
         }
+
+    def get_authoritative_depth(self, symbol: str) -> Optional[SpotGatewayDepthState]:
+        return self._depth_authority.snapshot(normalize_spot_ws_symbol(symbol))
+
+    def get_active_depth_provider(self, symbol: str) -> tuple[Optional[str], int]:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        return (
+            self._depth_authority.active_provider(normalized_symbol),
+            self._depth_authority.active_generation(normalized_symbol),
+        )
+
+    def commit_authoritative_depth(
+        self,
+        *,
+        symbol: str,
+        provider: str,
+        provider_symbol: str,
+        depth: DepthResponse,
+        event_time_ms: int,
+        received_at_ms: int,
+        freshness: str,
+        source: str,
+        allow_switch: bool = False,
+        expected_provider: Optional[str] = None,
+    ) -> Optional[SpotGatewayDepthState]:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        try:
+            best_bid = Decimal(str(depth.bids[0].price)) if depth.bids else None
+            best_ask = Decimal(str(depth.asks[0].price)) if depth.asks else None
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        if (
+            best_bid is None
+            or best_ask is None
+            or best_bid <= 0
+            or best_ask <= 0
+            or best_ask < best_bid
+            or int(received_at_ms or 0) <= 0
+            or (
+                getattr(depth, "provider", None)
+                and str(getattr(depth, "provider", "") or "").strip().upper()
+                != str(provider or "").strip().upper()
+            )
+        ):
+            return None
+        previous_provider = self._depth_authority.active_provider(normalized_symbol)
+        state = self._depth_authority.commit(
+            symbol=normalized_symbol,
+            provider=provider,
+            provider_symbol=provider_symbol,
+            depth=depth,
+            event_time_ms=event_time_ms,
+            received_at_ms=received_at_ms,
+            freshness=freshness,
+            source=source,
+            allow_switch=allow_switch,
+            expected_provider=expected_provider,
+        )
+        if state is None:
+            return None
+        self._symbol_providers[normalized_symbol] = state.provider
+        if previous_provider and previous_provider != state.provider:
+            self._pending_provider_switches[normalized_symbol] = (previous_provider, state.provider)
+        return state
 
     @staticmethod
     def _consume_task_result(task: asyncio.Task[None]) -> None:
@@ -277,18 +358,37 @@ class SpotMarketGateway:
         current_task = asyncio.current_task()
         try:
             while True:
+                await self._apply_pending_provider_switch(symbol)
                 subscriber_count = await self._subscriber_count(symbol)
                 if subscriber_count <= 0:
                     await self.release_symbol_if_idle(symbol)
                     break
-                provider_code = self._symbol_providers.get(symbol)
+                provider_code = self._depth_authority.active_provider(symbol) or self._symbol_providers.get(symbol)
                 if not provider_code or not await self._provider_symbol_allowed_async(symbol):
                     break
-                if self._provider_symbol_allowed_is_default:
+                if self._provider_symbol_allowed_is_default and not self._depth_authority.fallback_active(symbol):
                     selected_provider_code = await asyncio.to_thread(self._select_provider_ws_code, symbol)
                     if selected_provider_code != provider_code:
                         await self._release_provider_symbol(symbol, provider_code)
                         break
+                authority_state = self._depth_authority.snapshot(symbol)
+                if (
+                    authority_state is not None
+                    and authority_state.provider == provider_code
+                    and int(time.time() * 1000) - authority_state.received_at_ms
+                    <= int(getattr(settings, "SPOT_PROVIDER_WS_DEPTH_MAX_AGE_MS", 1500) or 1500)
+                ):
+                    authoritative_depth = self._format_depth_for_broadcast(symbol, authority_state.depth)
+                    if self._should_broadcast_depth(symbol, authoritative_depth):
+                        try:
+                            await self._market_ws_manager().broadcast_depth_update(symbol, authoritative_depth)
+                            self._remember_broadcast_metric(symbol, "depth")
+                        except Exception:
+                            logger.warning(
+                                "spot_market_gateway_authoritative_depth_broadcast_failed symbol=%s",
+                                symbol,
+                                exc_info=True,
+                            )
                 try:
                     if self._get_depth_accepts_provider:
                         depth = self._get_depth(
@@ -306,6 +406,17 @@ class SpotMarketGateway:
                     depth = None
                 if depth is not None:
                     depth = self._format_depth_for_broadcast(symbol, depth)
+                    state = self.commit_authoritative_depth(
+                        symbol=symbol,
+                        provider=provider_code,
+                        provider_symbol="",
+                        depth=depth,
+                        event_time_ms=int(getattr(depth, "ts", 0) or 0),
+                        received_at_ms=int(getattr(depth, "fetched_at", 0) or int(time.time() * 1000)),
+                        freshness=str(getattr(depth, "freshness", None) or "LIVE"),
+                        source=str(getattr(depth, "source", None) or "LIVE_WS"),
+                    )
+                    depth = state.depth if state is not None else None
                 if depth is not None and self._should_broadcast_depth(symbol, depth):
                     try:
                         await self._market_ws_manager().broadcast_depth_update(symbol, depth)
@@ -441,6 +552,34 @@ class SpotMarketGateway:
                 if task is current_task:
                     self._tasks.pop(symbol, None)
 
+    async def _apply_pending_provider_switch(self, symbol: str) -> None:
+        pending = self._pending_provider_switches.pop(symbol, None)
+        if pending is None:
+            return
+        previous_provider, provider_code = pending
+        try:
+            if self._release_depth_accepts_provider:
+                await asyncio.to_thread(self._release_depth, symbol, provider=previous_provider)
+            else:
+                await asyncio.to_thread(self._release_depth, symbol)
+            if self._ensure_depth_accepts_provider:
+                self._ensure_depth(symbol, provider=provider_code)
+            else:
+                self._ensure_depth(symbol)
+            for interval in sorted(self._ensured_kline_intervals.get(symbol, set())):
+                self._ensure_kline_interval(symbol, interval, provider=provider_code)
+            self._broadcast_state.clear_symbol(symbol)
+        except Exception:
+            if self._depth_authority.active_provider(symbol) == provider_code:
+                self._pending_provider_switches[symbol] = (previous_provider, provider_code)
+            logger.warning(
+                "spot_market_gateway_provider_switch_failed symbol=%s previous=%s provider=%s",
+                symbol,
+                previous_provider,
+                provider_code,
+                exc_info=True,
+            )
+
     async def _release_provider_symbol(self, symbol: str, provider_code: str) -> None:
         if self._release_depth_accepts_provider:
             await asyncio.to_thread(self._release_depth, symbol, provider=provider_code)
@@ -451,6 +590,8 @@ class SpotMarketGateway:
         self._pending_kline_releases.pop(symbol, None)
         self._precision_cache.pop(symbol, None)
         self._symbol_providers.pop(symbol, None)
+        self._pending_provider_switches.pop(symbol, None)
+        self._depth_authority.clear_symbol(symbol)
 
     def _should_broadcast_depth(self, symbol: str, depth: DepthResponse) -> bool:
         domain_key = self._domain_key("depth", symbol, provider=getattr(depth, "provider", None))
@@ -838,7 +979,11 @@ class SpotMarketGateway:
                 "amount_precision": amount_precision,
                 "bids": adapt(list(depth.bids or [])),
                 "asks": adapt(list(depth.asks or [])),
-                "freshness": "LAST_GOOD" if getattr(depth, "stale", False) else "LIVE",
+                "freshness": (
+                    "LAST_GOOD"
+                    if getattr(depth, "stale", False)
+                    else str(getattr(depth, "freshness", None) or "LIVE").strip().upper()
+                ),
             }
         )
         return DepthResponse(**data)

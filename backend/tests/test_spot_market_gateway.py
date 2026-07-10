@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from threading import Barrier
 
 from app.routers import market as market_router
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
@@ -153,6 +155,14 @@ def _new_test_gateway() -> SpotMarketGateway:
     )
 
 
+def _new_authority_test_gateway() -> SpotMarketGateway:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    return _new_test_gateway()
+
+
 def _age_broadcast_state(gateway: SpotMarketGateway, domain_key, signature=None) -> None:
     gateway._broadcast_state.remember_broadcast(
         domain_key,
@@ -161,13 +171,13 @@ def _age_broadcast_state(gateway: SpotMarketGateway, domain_key, signature=None)
     )
 
 
-def _depth_response(*, bid_amount: str = "1", ts: int = 1000) -> DepthResponse:
+def _depth_response(*, bid_amount: str = "1", ts: int = 1000, provider: str = "BITGET_SPOT") -> DepthResponse:
     return DepthResponse(
         symbol="BTCUSDT",
         bids=[DepthItem(price="2", amount=bid_amount)],
         asks=[DepthItem(price="3", amount="1")],
         ts=ts,
-        provider="BITGET_SPOT",
+        provider=provider,
         source="LIVE_WS",
         fetched_at=ts,
     )
@@ -2752,6 +2762,242 @@ def test_bitget_spot_precision_metadata_uses_price_precision() -> None:
     assert metadata["display_price_precision"] == 2
     assert metadata["price_precision_source"] == "PROVIDER_TICK_SIZE"
     assert metadata["price_precision_provider"] == "BITGET_SPOT"
+
+
+def test_authoritative_depth_initial_provider_uses_generation_one() -> None:
+    gateway = _new_authority_test_gateway()
+    gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
+    state = gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="OKX_SPOT",
+        provider_symbol="BTC-USDT",
+        depth=_depth_response(ts=1000, provider="OKX_SPOT"),
+        event_time_ms=1000,
+        received_at_ms=1100,
+        freshness="LIVE",
+        source="LIVE_WS",
+    )
+    assert state is not None
+    assert state.provider == "OKX_SPOT"
+    assert state.provider_generation == 1
+    assert gateway.get_active_depth_provider("BTCUSDT") == ("OKX_SPOT", 1)
+
+
+def test_authoritative_depth_fallback_switch_is_atomic_and_increments_generation() -> None:
+    gateway = _new_authority_test_gateway()
+    gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
+    okx = gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="OKX_SPOT",
+        provider_symbol="BTC-USDT",
+        depth=_depth_response(ts=1000, provider="OKX_SPOT"),
+        event_time_ms=1000,
+        received_at_ms=1100,
+        freshness="LIVE",
+        source="LIVE_WS",
+    )
+    bitget = gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="BITGET_SPOT",
+        provider_symbol="BTCUSDT",
+        depth=_depth_response(bid_amount="2", ts=1200),
+        event_time_ms=1200,
+        received_at_ms=1300,
+        freshness="RECENT",
+        source="REST",
+        allow_switch=True,
+        expected_provider="OKX_SPOT",
+    )
+    assert okx is not None and bitget is not None
+    assert bitget.provider == "BITGET_SPOT"
+    assert bitget.provider_generation == 2
+    assert gateway.get_active_depth_provider("BTCUSDT") == ("BITGET_SPOT", 2)
+
+
+def test_incomplete_fallback_depth_cannot_switch_gateway_provider() -> None:
+    gateway = _new_authority_test_gateway()
+    gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
+    incomplete = DepthResponse(
+        symbol="BTCUSDT",
+        bids=[DepthItem(price="99", amount="1")],
+        asks=[],
+        ts=1200,
+        provider="BITGET_SPOT",
+        source="REST",
+        freshness="RECENT",
+        fetched_at=1300,
+    )
+    state = gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="BITGET_SPOT",
+        provider_symbol="BTCUSDT",
+        depth=incomplete,
+        event_time_ms=1200,
+        received_at_ms=1300,
+        freshness="RECENT",
+        source="REST",
+        allow_switch=True,
+        expected_provider="OKX_SPOT",
+    )
+    assert state is None
+    assert gateway.get_active_depth_provider("BTCUSDT") == ("OKX_SPOT", 1)
+
+
+def test_old_provider_late_depth_cannot_switch_back_after_fallback() -> None:
+    gateway = _new_authority_test_gateway()
+    gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
+    assert gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="BITGET_SPOT",
+        provider_symbol="BTCUSDT",
+        depth=_depth_response(ts=1200),
+        event_time_ms=1200,
+        received_at_ms=1300,
+        freshness="RECENT",
+        source="REST",
+        allow_switch=True,
+        expected_provider="OKX_SPOT",
+    ) is not None
+    late = gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="OKX_SPOT",
+        provider_symbol="BTC-USDT",
+        depth=_depth_response(ts=1400, provider="OKX_SPOT"),
+        event_time_ms=1400,
+        received_at_ms=1500,
+        freshness="LIVE",
+        source="LIVE_WS",
+    )
+    assert late is None
+    assert gateway.get_active_depth_provider("BTCUSDT") == ("BITGET_SPOT", 2)
+
+
+def test_same_provider_older_event_cannot_rollback_authoritative_depth() -> None:
+    gateway = _new_authority_test_gateway()
+    gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
+    assert gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="OKX_SPOT",
+        provider_symbol="BTC-USDT",
+        depth=_depth_response(bid_amount="2", ts=2000, provider="OKX_SPOT"),
+        event_time_ms=2000,
+        received_at_ms=2100,
+        freshness="LIVE",
+        source="LIVE_WS",
+    ) is not None
+    assert gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="OKX_SPOT",
+        provider_symbol="BTC-USDT",
+        depth=_depth_response(bid_amount="1", ts=1000, provider="OKX_SPOT"),
+        event_time_ms=1000,
+        received_at_ms=2200,
+        freshness="LIVE",
+        source="LIVE_WS",
+    ) is None
+    state = gateway.get_authoritative_depth("BTCUSDT")
+    assert state is not None
+    assert state.event_time_ms == 2000
+    assert state.depth.bids[0].amount == "2"
+
+
+def test_provider_switch_releases_old_ws_owner_and_ensures_new_provider() -> None:
+    gateway = _new_authority_test_gateway()
+    calls = []
+    gateway._release_depth_accepts_provider = True
+    gateway._ensure_depth_accepts_provider = True
+    gateway._ensure_kline_accepts_provider = True
+    gateway._release_depth = lambda symbol, provider: calls.append(("release", provider, symbol))
+    gateway._ensure_depth = lambda symbol, provider: calls.append(("ensure_depth", provider, symbol))
+    gateway._ensure_kline = lambda symbol, interval, provider: calls.append(
+        ("ensure_kline", provider, symbol, interval)
+    )
+    gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
+    gateway._symbol_providers["BTCUSDT"] = "OKX_SPOT"
+    gateway._ensured_kline_intervals["BTCUSDT"] = {"1m"}
+    assert gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="BITGET_SPOT",
+        provider_symbol="BTCUSDT",
+        depth=_depth_response(ts=1200),
+        event_time_ms=1200,
+        received_at_ms=1300,
+        freshness="RECENT",
+        source="REST",
+        allow_switch=True,
+        expected_provider="OKX_SPOT",
+    ) is not None
+    asyncio.run(gateway._apply_pending_provider_switch("BTCUSDT"))
+    assert ("release", "OKX_SPOT", "BTCUSDT") in calls
+    assert ("ensure_depth", "BITGET_SPOT", "BTCUSDT") in calls
+    assert ("ensure_kline", "BITGET_SPOT", "BTCUSDT", "1m") in calls
+
+
+def test_provider_switch_lifecycle_failure_keeps_rest_depth_public_and_retries() -> None:
+    gateway = _new_authority_test_gateway()
+    gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
+    gateway._symbol_providers["BTCUSDT"] = "OKX_SPOT"
+    gateway._release_depth_accepts_provider = True
+    gateway._ensure_depth_accepts_provider = True
+    gateway._release_depth = lambda symbol, provider: None
+    gateway._ensure_depth = lambda symbol, provider: (_ for _ in ()).throw(RuntimeError("ensure failed"))
+    switched = gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="BITGET_SPOT",
+        provider_symbol="BTCUSDT",
+        depth=_depth_response(ts=1200),
+        event_time_ms=1200,
+        received_at_ms=1300,
+        freshness="RECENT",
+        source="REST",
+        allow_switch=True,
+        expected_provider="OKX_SPOT",
+    )
+    assert switched is not None
+    asyncio.run(gateway._apply_pending_provider_switch("BTCUSDT"))
+    public_state = gateway.get_authoritative_depth("BTCUSDT")
+    assert public_state is not None
+    assert public_state.provider == "BITGET_SPOT"
+    assert public_state.provider_generation == 2
+    assert public_state.depth.bids[0].price == switched.depth.bids[0].price
+    assert gateway._symbol_providers["BTCUSDT"] == "BITGET_SPOT"
+    assert gateway._pending_provider_switches["BTCUSDT"] == ("OKX_SPOT", "BITGET_SPOT")
+
+
+def test_concurrent_fallback_candidates_cannot_publish_retired_generation() -> None:
+    gateway = _new_authority_test_gateway()
+    gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
+    gateway._symbol_providers["BTCUSDT"] = "OKX_SPOT"
+    barrier = Barrier(2)
+
+    def switch(provider: str, event_time_ms: int):
+        barrier.wait()
+        return gateway.commit_authoritative_depth(
+            symbol="BTCUSDT",
+            provider=provider,
+            provider_symbol="BTCUSDT",
+            depth=_depth_response(ts=event_time_ms, provider=provider),
+            event_time_ms=event_time_ms,
+            received_at_ms=event_time_ms + 1,
+            freshness="RECENT",
+            source="REST",
+            allow_switch=True,
+            expected_provider="OKX_SPOT",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda args: switch(*args),
+                (("BITGET_SPOT", 1200), ("BINANCE_SPOT", 1300)),
+            )
+        )
+    accepted = [result for result in results if result is not None]
+    assert len(accepted) == 1
+    public_state = gateway.get_authoritative_depth("BTCUSDT")
+    assert public_state is not None
+    assert public_state.provider == accepted[0].provider
+    assert public_state.provider_generation == accepted[0].provider_generation == 2
 
 
 if __name__ == "__main__":
