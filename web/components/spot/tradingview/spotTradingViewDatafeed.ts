@@ -41,12 +41,16 @@ type TradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M
 
 type TradingViewBar = SpotTradingViewBar;
 
-type SpotTradingViewRealtimeEvent = {
+export type SpotTradingViewRealtimeEvent = {
   symbol: string;
   interval: string;
   reason: 'kline';
   barTime: number;
-  updatedAtMs: number;
+  close: number;
+  provider: string | null;
+  source: string;
+  freshness: string;
+  receivedAtMs: number;
 };
 
 type TradingViewLibrarySymbolInfo = {
@@ -171,6 +175,7 @@ export type SpotTradingViewHistoryBarsEvent = {
   barCount: number;
   firstBarTime: number | null;
   lastBarTime: number | null;
+  lastBarClose: number | null;
   noData: boolean;
 };
 
@@ -1656,6 +1661,7 @@ export function createSpotTradingViewDatafeed(
             barCount: bars.length,
             firstBarTime: firstBar?.time ?? null,
             lastBarTime: lastBar?.time ?? null,
+            lastBarClose: lastBar?.close ?? null,
             noData: meta.noData,
           });
         } catch (error) {
@@ -2295,6 +2301,9 @@ export function createSpotTradingViewDatafeed(
           : null;
         const klineProvider = normalizeProvider(klinePayload?.provider || (message as { provider?: unknown }).provider);
         const klineSource = normalizeSource(klinePayload?.source || message.source);
+        const klineFreshness = normalizeKlineMetaValue(
+          klinePayload?.freshness || (message as { freshness?: unknown }).freshness,
+        ) || (klineSource === 'LIVE_WS' ? 'LIVE' : 'RECENT');
         const bar = klinePayloadToBar(message.kline, interval, klineProvider, klineSource);
         if (!bar) return;
 
@@ -2333,7 +2342,11 @@ export function createSpotTradingViewDatafeed(
           interval,
           reason: 'kline',
           barTime: bar.time,
-          updatedAtMs: Date.now(),
+          close: bar.close,
+          provider: klineProvider || null,
+          source: klineSource || 'LIVE_WS',
+          freshness: klineFreshness,
+          receivedAtMs: Date.now(),
         });
       };
 

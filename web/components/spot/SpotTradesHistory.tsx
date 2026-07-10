@@ -178,6 +178,8 @@ export default function SpotTradesHistory({
               return (
                 <div
                   key={`${getTradeTime(item) ?? ''}-${item.price}-${item.amount}-${index}`}
+                  data-testid={index === 0 ? 'spot-recent-trade-first' : undefined}
+                  data-trade-price={index === 0 ? String(item.price) : undefined}
                   className="grid grid-cols-[minmax(0,1.18fr)_minmax(0,0.92fr)_60px] items-center gap-x-2 px-2.5 py-1 text-[12px] transition-colors hover:bg-white/[0.03]"
                 >
                   <button

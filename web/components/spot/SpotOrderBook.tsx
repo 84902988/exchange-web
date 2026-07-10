@@ -29,6 +29,8 @@ type SpotOrderBookProps = {
   bestBid?: string | number | null;
   depthSource?: string | null;
   depthFreshness?: string | null;
+  displayPriceSource?: string | null;
+  displayPriceFreshness?: string | null;
   dataSource?: string | null;
   isLoading?: boolean;
   onPriceClick?: (price: string) => void;
@@ -95,6 +97,8 @@ export default function SpotOrderBook({
   bids: propBids = [],
   depthSource,
   depthFreshness,
+  displayPriceSource,
+  displayPriceFreshness,
   dataSource,
   isLoading = false,
   onPriceClick,
@@ -120,6 +124,15 @@ export default function SpotOrderBook({
     {
       source: depthSource,
       freshness: depthFreshness,
+      dataSource,
+      isLoading,
+    },
+    t,
+  );
+  const displayPriceStatus = resolveSpotMarketStatus(
+    {
+      source: displayPriceSource,
+      freshness: displayPriceFreshness,
       dataSource,
       isLoading,
     },
@@ -184,11 +197,18 @@ export default function SpotOrderBook({
             type="button"
             disabled={!onPriceClick || referencePrice === '--'}
             onClick={() => onPriceClick?.(String(referencePrice).replace(/,/g, ''))}
-            title="Latest Price"
-            aria-label="Latest Price"
-            className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center text-[17px] font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${referencePriceClass}`}
+            title={`${t('spotLatestPrice', 'asset')} · ${displayPriceStatus.fullLabel}`}
+            aria-label={`${t('spotLatestPrice', 'asset')} · ${displayPriceStatus.fullLabel}`}
+            data-testid="spot-orderbook-display-price"
+            data-display-source={displayPriceSource || ''}
+            data-display-freshness={displayPriceFreshness || ''}
+            className={`flex flex-col items-center gap-1 rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center text-[17px] font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${referencePriceClass}`}
           >
-            {referencePrice}
+            <span>{referencePrice}</span>
+            <span className="inline-flex items-center gap-1 text-[9px] font-medium text-white/42">
+              <span className={`h-1.5 w-1.5 rounded-full ${spotMarketStatusDotClass(displayPriceStatus.kind)}`} />
+              <span>{displayPriceStatus.compactLabel}</span>
+            </span>
           </button>
 
           <div className="grid min-h-0 grid-rows-9 gap-px overflow-hidden">

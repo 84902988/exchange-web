@@ -9,6 +9,10 @@ import {
   getTickerDirectionTextClass,
   type PriceDirection,
 } from './spotTickerColor';
+import {
+  resolveSpotMarketStatus,
+  spotMarketStatusDotClass,
+} from './spotMarketStatus';
 
 interface SpotHeaderProps {
   symbol: string;
@@ -42,6 +46,10 @@ export default function SpotHeader({
   priceDirection = 'flat',
   marketStatus,
   quoteFreshness,
+  tickerSource,
+  tickerFreshness,
+  dataSource,
+  isLoading = false,
   marketSessionType,
   symbolSelector,
 }: SpotHeaderProps) {
@@ -69,6 +77,12 @@ export default function SpotHeader({
 
   const priceColorClass = getTickerDirectionTextClass(priceDirection);
   const priceFlashClass = flash ? getTickerDirectionFlashClass(priceDirection) : '';
+  const displayPriceStatus = resolveSpotMarketStatus({
+    source: tickerSource,
+    freshness: tickerFreshness,
+    dataSource,
+    isLoading,
+  }, t);
 
   const statColorClass = useMemo(() => {
     if (isChangeUp) return 'text-[#00c087]';
@@ -107,6 +121,9 @@ export default function SpotHeader({
 
           <div className="flex w-[154px] flex-col justify-center gap-0.5">
             <div
+              data-testid="spot-header-display-price"
+              data-display-source={tickerSource || ''}
+              data-display-freshness={tickerFreshness || ''}
               className={`inline-flex max-w-full items-center truncate rounded-md px-1 py-0.5 text-[28px] font-semibold leading-none transition-all duration-200 ${priceColorClass} ${priceFlashClass} ${
                 flash ? 'scale-[1.02] shadow-[0_0_24px_rgba(255,255,255,0.04)]' : 'scale-100'
               }`}
@@ -115,6 +132,13 @@ export default function SpotHeader({
             </div>
             <div className="min-h-4 pl-1 text-[12px] font-semibold leading-tight">
               <span className={statColorClass}>{changeSummary}</span>
+            </div>
+            <div
+              className="inline-flex min-h-4 items-center gap-1 pl-1 text-[10px] font-medium text-white/42"
+              title={displayPriceStatus.fullLabel}
+            >
+              <span className={`h-1.5 w-1.5 rounded-full ${spotMarketStatusDotClass(displayPriceStatus.kind)}`} />
+              <span>{displayPriceStatus.compactLabel}</span>
             </div>
           </div>
         </div>

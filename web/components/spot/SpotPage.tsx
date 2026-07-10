@@ -24,6 +24,7 @@ import {
 } from '@/lib/api/modules/spot';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import { useSpotMarket } from './useSpotMarket';
+import type { SpotNativeCandleDisplayPrice } from './spotDisplayPrice';
 import {
   formatSpotPrice,
   normalizeSpotPriceInput,
@@ -588,7 +589,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const hasInitialSymbol = Boolean(String(initialSymbol || '').trim());
   const initialSpotSymbol = normalizeSpotApiSymbol(initialSymbol || DEFAULT_SPOT_SYMBOL) || DEFAULT_SPOT_SYMBOL;
   const [symbol, setSymbol] = useState(initialSpotSymbol);
-  const spotMarket = useSpotMarket(symbol);
+  const [nativeCandleDisplayPrice, setNativeCandleDisplayPrice] = useState<SpotNativeCandleDisplayPrice | null>(null);
+  const spotMarket = useSpotMarket(symbol, { nativeCandle: nativeCandleDisplayPrice });
   const symbolRef = useRef(symbol);
   const appliedCategoryRef = useRef('');
   const originalDocumentTitleRef = useRef<string | null>(null);
@@ -703,6 +705,11 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     pricePrecision: selectedPairPrecision,
     fallbackPrecision: selectedPairPrecision,
   });
+
+  const handleNativeCandleDisplay = useCallback((value: SpotNativeCandleDisplayPrice) => {
+    if (normalizeSpotApiSymbol(value.symbol) !== normalizeSpotApiSymbol(symbol)) return;
+    setNativeCandleDisplayPrice(value);
+  }, [symbol]);
 
   const toolbarPairs = useMemo(() => pairOptions, [pairOptions]);
   const toolbarSymbols = useMemo(
@@ -1460,10 +1467,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const isSwitchingSymbol = symbolRef.current !== symbol;
   const hasCurrentSpotMarketView = !spotMarket.marketView || normalizeSpotApiSymbol(spotMarket.marketView.symbol) === normalizedCurrentSymbol;
   const hasCurrentSpotDepth = !spotMarket.depth || normalizeSpotApiSymbol(spotMarket.depth.symbol) === normalizedCurrentSymbol;
-  const hasCurrentSpotLastTrade = !spotMarket.lastTradeSymbol || normalizeSpotApiSymbol(spotMarket.lastTradeSymbol) === normalizedCurrentSymbol;
-  const hasSpotTradePrice = !isSwitchingSymbol && hasCurrentSpotMarketView && hasCurrentSpotLastTrade && spotMarket.lastTradePrice !== null && spotMarket.lastTradePrice !== undefined && String(spotMarket.lastTradePrice).trim() !== '';
+  const activeDisplayPrice = spotMarket.displayPrice;
   const headerPriceValue = !isSwitchingSymbol && hasCurrentSpotMarketView
-    ? (hasSpotTradePrice ? spotMarket.lastTradePrice : spotMarket.displayPrice)
+    ? activeDisplayPrice.price
     : null;
   const spotLastPrice = formatPriceBySymbol(
     symbol,
@@ -1494,7 +1500,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const marketHeaderData = !isSwitchingSymbol && hasCurrentSpotMarketView
     ? buildMarketDataFromMarketView(symbol, spotMarket.marketView, pricePrecision) || EMPTY_MARKET_DATA
     : EMPTY_MARKET_DATA;
-  const priceDirection = !isSwitchingSymbol && hasSpotTradePrice
+  const priceDirection = !isSwitchingSymbol && activeDisplayPrice.isRealTrade
     ? spotMarket.lastTradeDirection
     : !isSwitchingSymbol
       ? spotMarket.priceDirection
@@ -1507,14 +1513,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     : marketFeedDataSource;
   const spotSources = !isSwitchingSymbol ? spotMarket.sources : { depth: null, trades: null, ticker: null, kline: null };
   const spotFreshness = !isSwitchingSymbol ? spotMarket.freshness : { depth: null, trades: null, ticker: null, kline: null };
-  const normalizedDisplayPriceSource = String(spotMarket.displayPriceSource || '').toLowerCase();
-  const spotPriceStatusDomain = hasSpotTradePrice || normalizedDisplayPriceSource.includes('trade')
-    ? 'trades'
-    : normalizedDisplayPriceSource.includes('kline')
-      ? 'kline'
-      : 'ticker';
-  const spotPriceStatusSource = spotSources[spotPriceStatusDomain];
-  const spotPriceStatusFreshness = spotFreshness[spotPriceStatusDomain];
+  const spotPriceStatusSource = activeDisplayPrice.source;
+  const spotPriceStatusFreshness = activeDisplayPrice.freshness;
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
   const marketSyncingText = t('loading', 'common');
   const shouldShowMarketSyncing = isSwitchingSymbol || (spotMarket.isLoading && spotLastPrice === '--');
@@ -1584,7 +1584,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           turnover={displayMarketHeaderData.turnover}
           priceDirection={priceDirection}
           marketStatus={spotMarketStatus}
-          quoteFreshness={null}
+          quoteFreshness={spotPriceStatusFreshness}
           tickerSource={spotPriceStatusSource}
           tickerFreshness={spotPriceStatusFreshness}
           dataSource={spotMarketDataSource}
@@ -1631,8 +1631,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                   dataSource={spotMarketDataSource}
                   klineSource={spotSources.kline}
                   klineFreshness={spotFreshness.kline}
-                  latestPrice={spotLastPrice}
-                  latestTradeOrTickerPrice={null}
+                  displayPrice={activeDisplayPrice}
+                  onNativeCandleDisplay={handleNativeCandleDisplay}
                   priceDirection={priceDirection}
                   pricePrecision={pricePrecision}
                   amountPrecision={currentAmountPrecision}
@@ -1685,6 +1685,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     bestBid={safeBestBid}
                     depthSource={spotSources.depth}
                     depthFreshness={spotFreshness.depth}
+                    displayPriceSource={activeDisplayPrice.source}
+                    displayPriceFreshness={activeDisplayPrice.freshness}
                     dataSource={spotMarketDataSource}
                     isLoading={isDepthLoading}
                     onPriceClick={handleOrderBookPriceClick}
