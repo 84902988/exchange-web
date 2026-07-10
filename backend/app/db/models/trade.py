@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Numeric, String, func
+from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Integer, Numeric, String, func
 
 from app.db.base import Base
 
@@ -32,6 +32,14 @@ class Trade(Base):
     dealer_best_ask = Column(Numeric(36, 18), nullable=True)
     dealer_price_source = Column(String(32), nullable=True)
     dealer_spread_bps = Column(Numeric(18, 8), nullable=True)
+    dealer_provider = Column(String(64), nullable=True)
+    dealer_provider_symbol = Column(String(64), nullable=True)
+    dealer_event_time_ms = Column(BigInteger, nullable=True)
+    dealer_received_at_ms = Column(BigInteger, nullable=True)
+    dealer_freshness = Column(String(32), nullable=True)
+    dealer_snapshot_id = Column(String(64), nullable=True)
+    dealer_provider_generation = Column(BigInteger, nullable=True)
+    dealer_snapshot_max_age_ms = Column(Integer, nullable=True)
 
     maker_order_id = Column(BigInteger, nullable=False)
     taker_order_id = Column(BigInteger, nullable=False)

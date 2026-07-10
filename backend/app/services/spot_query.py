@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from sqlalchemy import desc, or_
 from sqlalchemy.orm import Session, joinedload
@@ -22,6 +22,28 @@ def _fmt(value) -> str:
 
 def _fee_symbol(value) -> str:
     return str(value or "").upper().strip() or "USDT"
+
+
+def _fmt_optional(value) -> Optional[str]:
+    return _fmt(value) if value is not None else None
+
+
+def _spot_trade_dealer_evidence(row: Trade) -> Dict:
+    return {
+        "dealer_ref_price": _fmt_optional(getattr(row, "dealer_ref_price", None)),
+        "dealer_best_bid": _fmt_optional(getattr(row, "dealer_best_bid", None)),
+        "dealer_best_ask": _fmt_optional(getattr(row, "dealer_best_ask", None)),
+        "dealer_price_source": getattr(row, "dealer_price_source", None),
+        "dealer_spread_bps": _fmt_optional(getattr(row, "dealer_spread_bps", None)),
+        "dealer_provider": getattr(row, "dealer_provider", None),
+        "dealer_provider_symbol": getattr(row, "dealer_provider_symbol", None),
+        "dealer_event_time_ms": getattr(row, "dealer_event_time_ms", None),
+        "dealer_received_at_ms": getattr(row, "dealer_received_at_ms", None),
+        "dealer_freshness": getattr(row, "dealer_freshness", None),
+        "dealer_snapshot_id": getattr(row, "dealer_snapshot_id", None),
+        "dealer_provider_generation": getattr(row, "dealer_provider_generation", None),
+        "dealer_snapshot_max_age_ms": getattr(row, "dealer_snapshot_max_age_ms", None),
+    }
 
 
 def _get_pair_by_symbol(db: Session, symbol: str) -> TradingPair:
@@ -224,6 +246,7 @@ def get_my_trades(db: Session, user_id: int, symbol: str, limit: int = 100) -> D
             "fee_amount": _fmt(trade_fee_amount) if trade_fee_amount is not None else None,
             "fee_asset": _fee_symbol(trade_fee_asset_symbol),
             "fee_asset_symbol": _fee_symbol(trade_fee_asset_symbol),
+            **_spot_trade_dealer_evidence(row),
             "created_at": row.created_at.isoformat() if row.created_at else None,
         })
 
