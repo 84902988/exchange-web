@@ -450,7 +450,7 @@ def _depth_response_from_record(record: dict[str, Any], *, limit: Optional[int] 
         amount_precision=int(record.get("amount_precision") or 8),
         bids=[DepthItem(**item) for item in list(record.get("bids") or [])[:depth_limit]],
         asks=[DepthItem(**item) for item in list(record.get("asks") or [])[:depth_limit]],
-        ts=int(record.get("ts") or record.get("updated_at_ms") or _now_ms()),
+        ts=int(record.get("ts") or 0),
         provider=str(record.get("provider") or PROVIDER_BITGET_SPOT),
         stale=False,
         updated_at=record.get("updated_at"),

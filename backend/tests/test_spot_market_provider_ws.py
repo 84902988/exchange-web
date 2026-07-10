@@ -1415,6 +1415,24 @@ def test_cache_getters_missing_updated_at_and_empty_kline_return_none() -> None:
     assert service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000) is None
 
 
+def test_depth_response_does_not_impersonate_received_time_as_provider_event_time() -> None:
+    response = provider_ws._depth_response_from_record(
+        {
+            "symbol": "BTCUSDT",
+            "provider": provider_ws.PROVIDER_OKX_SPOT,
+            "provider_symbol": "BTC-USDT",
+            "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+            "freshness": "LIVE",
+            "bids": [{"price": "100", "amount": "1"}],
+            "asks": [{"price": "101", "amount": "1"}],
+            "updated_at_ms": 2000,
+        }
+    )
+    assert response.ts == 0
+    assert response.fetched_at == 2000
+    assert response.freshness is None
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
