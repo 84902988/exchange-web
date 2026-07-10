@@ -42,6 +42,13 @@ KLINE_CACHE_STATUS_COVERAGE_INVALID = "COVERAGE_INVALID"
 KLINE_CACHE_STATUS_STALE_OPEN = "STALE_OPEN"
 KLINE_CACHE_STATUS_PROVIDER_EMPTY = "PROVIDER_EMPTY"
 
+KLINE_CACHE_POLICY_STRICT_24X7 = "strict_24x7"
+KLINE_CACHE_POLICY_GAP_TOLERANT = "gap_tolerant"
+_KLINE_CACHE_POLICIES = {
+    KLINE_CACHE_POLICY_STRICT_24X7,
+    KLINE_CACHE_POLICY_GAP_TOLERANT,
+}
+
 KLINE_PROVIDER_ERROR_TIMEOUT = "TIMEOUT"
 KLINE_PROVIDER_ERROR_COOLDOWN = "COOLDOWN"
 KLINE_PROVIDER_ERROR_HTTP = "HTTP_ERROR"
@@ -387,6 +394,98 @@ def _validate_cached_klines_continuity(items: Iterable[Any], interval: str) -> b
         if current - previous != expected_delta:
             return False
     return True
+
+
+def _normalize_kline_cache_policy(cache_policy: str) -> str:
+    normalized = str(cache_policy or "").strip().lower()
+    if normalized not in _KLINE_CACHE_POLICIES:
+        raise ValueError("invalid kline cache policy")
+    return normalized
+
+
+def _validate_gap_tolerant_klines_continuity(items: Iterable[Any], interval: str) -> bool:
+    """Validate ordered, interval-aligned candles without requiring adjacent buckets."""
+
+    normalized_interval = normalize_kline_interval(interval)
+    open_times: list[int] = []
+    previous_open_time: Optional[int] = None
+    seen_open_times: set[int] = set()
+
+    for item in items:
+        open_time = _item_open_time_ms(item)
+        if open_time is None or open_time % 60_000 != 0:
+            return False
+        if open_time in seen_open_times:
+            return False
+        if previous_open_time is not None and open_time <= previous_open_time:
+            return False
+        seen_open_times.add(open_time)
+        open_times.append(open_time)
+        previous_open_time = open_time
+
+    if len(open_times) <= 1:
+        return True
+
+    if normalized_interval in {"1M", "1Mutc"}:
+        offset = timedelta(hours=8) if normalized_interval == "1M" else timedelta(0)
+        month_ordinals: list[int] = []
+        anchor: Optional[tuple[int, int, int, int]] = None
+        for open_time in open_times:
+            value = datetime.fromtimestamp(open_time / 1000, tz=timezone.utc) + offset
+            current_anchor = (value.day, value.hour, value.minute, value.second)
+            if anchor is None:
+                anchor = current_anchor
+            elif current_anchor != anchor:
+                return False
+            month_ordinals.append(value.year * 12 + value.month)
+        return all(current > previous for previous, current in zip(month_ordinals, month_ordinals[1:]))
+
+    expected_delta = interval_ms(normalized_interval)
+    alignment = open_times[0] % expected_delta
+    return all(open_time % expected_delta == alignment for open_time in open_times[1:])
+
+
+def _validate_gap_tolerant_klines_history_coverage(
+    items: Iterable[Any],
+    end_time_ms: Optional[int],
+) -> bool:
+    if end_time_ms in (None, "", 0):
+        return True
+    try:
+        cursor = int(end_time_ms)
+    except Exception:
+        return False
+    if cursor <= 0:
+        return False
+
+    rows = list(items)
+    if not rows:
+        return False
+    return all(
+        (open_time := _item_open_time_ms(item)) is not None and open_time < cursor
+        for item in rows
+    )
+
+
+def _validate_cached_klines_continuity_for_policy(
+    items: Iterable[Any],
+    interval: str,
+    cache_policy: str,
+) -> bool:
+    if cache_policy == KLINE_CACHE_POLICY_GAP_TOLERANT:
+        return _validate_gap_tolerant_klines_continuity(items, interval)
+    return _validate_cached_klines_continuity(items, interval)
+
+
+def _validate_cached_klines_history_coverage_for_policy(
+    items: Iterable[Any],
+    interval: str,
+    end_time_ms: Optional[int],
+    cache_policy: str,
+) -> bool:
+    if cache_policy == KLINE_CACHE_POLICY_GAP_TOLERANT:
+        return _validate_gap_tolerant_klines_history_coverage(items, end_time_ms)
+    return _validate_cached_klines_history_coverage(items, interval, end_time_ms)
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -876,10 +975,12 @@ def get_klines_cache_first(
     end_time_ms: Optional[int] = None,
     external_budget_seconds: Optional[float] = None,
     open_time_validator: Optional[OpenTimeValidator] = None,
+    cache_policy: str = KLINE_CACHE_POLICY_STRICT_24X7,
 ) -> KlineCacheResult:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
     normalized_limit = normalize_kline_limit(limit)
+    normalized_cache_policy = _normalize_kline_cache_policy(cache_policy)
 
     cached = _read_cached_klines(
         db,
@@ -890,8 +991,17 @@ def get_klines_cache_first(
         end_time_ms=end_time_ms,
         open_time_validator=open_time_validator,
     )
-    cached_continuous = _validate_cached_klines_continuity(cached, normalized_interval)
-    cached_coverage_valid = _validate_cached_klines_history_coverage(cached, normalized_interval, end_time_ms)
+    cached_continuous = _validate_cached_klines_continuity_for_policy(
+        cached,
+        normalized_interval,
+        normalized_cache_policy,
+    )
+    cached_coverage_valid = _validate_cached_klines_history_coverage_for_policy(
+        cached,
+        normalized_interval,
+        end_time_ms,
+        normalized_cache_policy,
+    )
     latest_cache_fresh = True
     if end_time_ms is None and len(cached) >= normalized_limit and cached_continuous:
         latest_cache_fresh = _latest_cache_is_fresh(
@@ -965,8 +1075,17 @@ def get_klines_cache_first(
             allow_stale_open=True,
             open_time_validator=open_time_validator,
         )
-        rows_continuous = _validate_cached_klines_continuity(rows, normalized_interval)
-        rows_coverage_valid = _validate_cached_klines_history_coverage(rows, normalized_interval, end_time_ms)
+        rows_continuous = _validate_cached_klines_continuity_for_policy(
+            rows,
+            normalized_interval,
+            normalized_cache_policy,
+        )
+        rows_coverage_valid = _validate_cached_klines_history_coverage_for_policy(
+            rows,
+            normalized_interval,
+            end_time_ms,
+            normalized_cache_policy,
+        )
         if rows and rows_continuous and rows_coverage_valid:
             return KlineCacheResult(
                 rows,
@@ -1086,6 +1205,34 @@ def get_klines_cache_first(
             provider_error_code=KLINE_PROVIDER_ERROR_EMPTY,
         )
 
+    if normalized_cache_policy == KLINE_CACHE_POLICY_GAP_TOLERANT:
+        external_continuous = _validate_gap_tolerant_klines_continuity(
+            external_items,
+            normalized_interval,
+        )
+        external_coverage_valid = _validate_gap_tolerant_klines_history_coverage(
+            external_items,
+            end_time_ms,
+        )
+        if not external_continuous or not external_coverage_valid:
+            invalid_status = (
+                KLINE_CACHE_STATUS_CONTINUITY_INVALID
+                if not external_continuous
+                else KLINE_CACHE_STATUS_COVERAGE_INVALID
+            )
+            logger.warning(
+                "kline_external_gap_tolerant_validation_failed market_type=%s symbol=%s interval=%s count=%s cache_status=%s",
+                market_type,
+                normalized_symbol,
+                normalized_interval,
+                len(external_items),
+                invalid_status,
+            )
+            return stale_cached(
+                cache_status_override=invalid_status,
+                provider_error_code=KLINE_PROVIDER_ERROR_UNKNOWN,
+            )
+
     upsert_klines(
         db,
         market_type=market_type,
@@ -1104,8 +1251,17 @@ def get_klines_cache_first(
         end_time_ms=end_time_ms,
         open_time_validator=open_time_validator,
     )
-    refreshed_continuous = _validate_cached_klines_continuity(refreshed, normalized_interval)
-    refreshed_coverage_valid = _validate_cached_klines_history_coverage(refreshed, normalized_interval, end_time_ms)
+    refreshed_continuous = _validate_cached_klines_continuity_for_policy(
+        refreshed,
+        normalized_interval,
+        normalized_cache_policy,
+    )
+    refreshed_coverage_valid = _validate_cached_klines_history_coverage_for_policy(
+        refreshed,
+        normalized_interval,
+        end_time_ms,
+        normalized_cache_policy,
+    )
     if refreshed and not refreshed_continuous:
         logger.debug(
             "kline_db_refreshed_cache_continuity_failed market_type=%s symbol=%s interval=%s count=%s",

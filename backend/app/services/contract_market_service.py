@@ -22,13 +22,15 @@ from app.services.itick_holiday_service import (
     itick_holiday_service,
 )
 from app.services.itick_market_service import ItickMarketServiceError, itick_market_service
-from app.services.market_kline_cache import get_klines_cache_first, upsert_klines
+from app.services.market_kline_cache import (
+    KLINE_CACHE_POLICY_GAP_TOLERANT,
+    get_klines_cache_first,
+)
 from app.services.contract_kline_response import (
     ContractKlineResult,
     coerce_contract_kline_result,
     contract_kline_error_result,
     contract_kline_process_cache_result,
-    contract_kline_provider_result,
 )
 from app.services.contract_market_provider_service import (
     MarketDataProviderConfig,
@@ -4361,7 +4363,7 @@ def get_contract_klines(
                 contract_symbol.symbol,
                 normalized_interval,
             )
-            if end_time_ms is None:
+            if end_time_ms is None and category != "INDEX":
                 _cache_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit, [])
             return ContractKlineResult(
                 [],
@@ -4385,49 +4387,25 @@ def get_contract_klines(
                 rows = [row for row in rows if int(row.get("open_time") or 0) < int(_fetch_end_time_ms)]
             return rows[-fetch_limit:] if rows else []
 
-        if category == "INDEX":
-            try:
-                rows = contract_kline_provider_result(
-                    _fetch_itick_contract_klines(safe_limit, end_time_ms),
-                    end_time_ms=end_time_ms,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "tradfi_index_kline_fetch_failed symbol=%s provider_symbol=%s market=%s region=%s interval=%s kType=%s limit=%s reason=%s",
-                    contract_symbol.symbol,
-                    provider_symbol,
-                    _itick_market_for_contract(contract_symbol),
-                    _itick_region_for_contract(contract_symbol),
-                    normalized_interval,
-                    _itick_contract_k_type[normalized_interval],
-                    safe_limit,
-                    exc,
-                )
-                rows = contract_kline_error_result(exc, end_time_ms=end_time_ms)
-        else:
-            rows = get_klines_cache_first(
-                db,
-                market_type="contract",
-                symbol=contract_symbol.symbol,
-                interval=normalized_interval,
-                limit=safe_limit,
-                end_time_ms=end_time_ms,
-                source="ITICK",
-                fetch_external=_fetch_itick_contract_klines,
-            )
+        rows = get_klines_cache_first(
+            db,
+            market_type="contract",
+            symbol=contract_symbol.symbol,
+            interval=normalized_interval,
+            limit=safe_limit,
+            end_time_ms=end_time_ms,
+            source="ITICK",
+            fetch_external=_fetch_itick_contract_klines,
+            **(
+                {"cache_policy": KLINE_CACHE_POLICY_GAP_TOLERANT}
+                if category == "INDEX"
+                else {}
+            ),
+        )
         rows = _provider_contract_kline_rows(rows, limit=safe_limit)
         if rows:
-            if end_time_ms is None:
+            if end_time_ms is None and category != "INDEX":
                 _cache_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit, rows)
-                if category == "INDEX":
-                    upsert_klines(
-                        db,
-                        market_type="contract",
-                        symbol=contract_symbol.symbol,
-                        interval=normalized_interval,
-                        items=rows,
-                        source="ITICK",
-                    )
             return rows
         if _is_tradfi_cfd_contract(contract_symbol):
             logger.warning(
