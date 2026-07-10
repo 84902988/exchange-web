@@ -331,6 +331,18 @@ export type ContractMarketKlineItem = {
   volume: number | string
 }
 
+export type ContractMarketKlineMetadataResponse = {
+  items: ContractMarketKlineItem[]
+  cache_status: string
+  freshness: 'RECENT' | 'CACHED' | 'STALE' | 'MISSING' | string
+  stale: boolean
+  history_incomplete: boolean
+  history_complete: boolean | null
+  has_more_before: boolean | null
+  provider_error_code: string | null
+  retryable: boolean
+}
+
 export type ContractMarketTrade = {
   id: number | string
   price: string
@@ -660,6 +672,21 @@ export function getContractMarketKlines(params: {
     interval: params.interval,
     limit: params.limit,
     end_time_ms: params.endTimeMs,
+  }))
+}
+
+export function getContractMarketKlinesMetadata(params: {
+  symbol: string
+  interval: string
+  limit?: number
+  endTimeMs?: number
+}): Promise<ContractMarketKlineMetadataResponse> {
+  return request<ContractMarketKlineMetadataResponse>(withQuery('/contract/market/kline', {
+    symbol: params.symbol,
+    interval: params.interval,
+    limit: params.limit,
+    end_time_ms: params.endTimeMs,
+    include_metadata: 1,
   }))
 }
 
