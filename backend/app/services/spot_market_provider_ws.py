@@ -42,8 +42,11 @@ BITGET_SPOT_KLINE_CHANNELS = {
     "1h": "candle1H",
     "4h": "candle4H",
     "1d": "candle1D",
+    "1Dutc": "candle1Dutc",
     "1w": "candle1W",
+    "1Wutc": "candle1Wutc",
     "1M": "candle1M",
+    "1Mutc": "candle1Mutc",
 }
 OKX_SPOT_KLINE_CHANNELS = {
     "1m": "candle1m",
@@ -57,6 +60,10 @@ OKX_SPOT_KLINE_CHANNELS = {
     "1Wutc": "candle1Wutc",
     "1M": "candle1M",
     "1Mutc": "candle1Mutc",
+}
+SPOT_PROVIDER_WS_KLINE_CHANNELS = {
+    PROVIDER_BITGET_SPOT: BITGET_SPOT_KLINE_CHANNELS,
+    PROVIDER_OKX_SPOT: OKX_SPOT_KLINE_CHANNELS,
 }
 SPOT_KLINE_INTERVAL_MS = {
     "1m": 60_000,
@@ -266,12 +273,22 @@ def normalize_spot_ws_kline_interval(interval: Any) -> str:
     return normalized
 
 
-def bitget_spot_kline_channel(interval: Any) -> str:
-    return BITGET_SPOT_KLINE_CHANNELS[normalize_spot_ws_kline_interval(interval)]
+def spot_provider_ws_kline_channel(provider: Any, interval: Any) -> Optional[str]:
+    provider_code = normalize_spot_ws_provider(provider)
+    normalized_interval = normalize_spot_ws_kline_interval(interval)
+    return SPOT_PROVIDER_WS_KLINE_CHANNELS.get(provider_code, {}).get(normalized_interval)
 
 
-def okx_spot_kline_channel(interval: Any) -> str:
-    return OKX_SPOT_KLINE_CHANNELS[normalize_spot_ws_kline_interval(interval)]
+def spot_provider_ws_supports_kline_interval(provider: Any, interval: Any) -> bool:
+    return spot_provider_ws_kline_channel(provider, interval) is not None
+
+
+def bitget_spot_kline_channel(interval: Any) -> Optional[str]:
+    return spot_provider_ws_kline_channel(PROVIDER_BITGET_SPOT, interval)
+
+
+def okx_spot_kline_channel(interval: Any) -> Optional[str]:
+    return spot_provider_ws_kline_channel(PROVIDER_OKX_SPOT, interval)
 
 
 def _kline_max_age_ms(value: Optional[int] = None) -> int:
@@ -1122,7 +1139,10 @@ class SpotMarketProviderWsService:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         normalized_interval = normalize_spot_ws_kline_interval(interval)
         provider_code = normalize_spot_ws_provider(provider)
-        if not spot_provider_ws_supports_provider(provider_code, domain="kline"):
+        if (
+            not spot_provider_ws_supports_provider(provider_code, domain="kline")
+            or not spot_provider_ws_supports_kline_interval(provider_code, normalized_interval)
+        ):
             return None
         now_ms = _now_ms()
         allowed_age_ms = _kline_max_age_ms(max_age_ms)
@@ -1437,7 +1457,11 @@ class SpotMarketProviderWsService:
         local_symbol = normalize_spot_ws_symbol(symbol)
         normalized_interval = normalize_spot_ws_kline_interval(interval)
         provider_code = normalize_spot_ws_provider(provider)
-        if not local_symbol or not spot_provider_ws_supports_provider(provider_code, domain="kline"):
+        if (
+            not local_symbol
+            or not spot_provider_ws_supports_provider(provider_code, domain="kline")
+            or not spot_provider_ws_supports_kline_interval(provider_code, normalized_interval)
+        ):
             return
         self._ensure_kline_symbol(local_symbol, normalized_interval, provider=provider_code)
 
@@ -1567,8 +1591,11 @@ class SpotMarketProviderWsService:
         provider_code = normalize_spot_ws_provider(provider)
         if not spot_provider_ws_supports_provider(provider_code, domain="kline"):
             return
-        provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
         normalized_interval = normalize_spot_ws_kline_interval(interval)
+        channel = spot_provider_ws_kline_channel(provider_code, normalized_interval)
+        if channel is None:
+            return
+        provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
         key = (provider_code, local_symbol, normalized_interval)
         with self._lock:
             task = self._kline_tasks.get(key)
@@ -1583,9 +1610,7 @@ class SpotMarketProviderWsService:
                 provider=provider_code,
                 provider_symbol=provider_symbol,
                 interval=normalized_interval,
-                channel=okx_spot_kline_channel(normalized_interval)
-                if provider_code == PROVIDER_OKX_SPOT
-                else bitget_spot_kline_channel(normalized_interval),
+                channel=channel,
                 kline_limit=_kline_limit(),
                 ws_url=str(
                     getattr(
