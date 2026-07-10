@@ -128,9 +128,14 @@ function emitRealtime(message: any) {
   realtimeHandlers.forEach((handler) => handler(message));
 }
 
+const policyModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./contractKlineCachePolicy.ts', import.meta.url)),
+  {},
+);
+
 const currentCacheModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractKlineCurrentCache.ts', import.meta.url)),
-  {},
+  { './contractKlineCachePolicy': policyModule },
 );
 
 const datafeedModule = loadTypeScriptModule(
@@ -143,6 +148,7 @@ const datafeedModule = loadTypeScriptModule(
       contractMarketRealtime: realtimeStub,
     },
     './contractKlineCurrentCache': currentCacheModule,
+    './contractKlineCachePolicy': policyModule,
   },
 );
 
@@ -514,11 +520,13 @@ test('concurrent identical current requests across datafeeds share one HTTP requ
   const secondLatest: Array<string | null> = [];
   const first = datafeedModule.createContractTradingViewDatafeed({
     symbol: 'DEDUPE_CURRENT_PERP',
+    category: 'CRYPTO',
     onLatestBar: (close: string | null) => firstLatest.push(close),
     onHistoryBars: (event: unknown) => firstLoadingEvents.push(event),
   });
   const second = datafeedModule.createContractTradingViewDatafeed({
     symbol: 'DEDUPE_CURRENT_PERP',
+    category: 'CRYPTO',
     onLatestBar: (close: string | null) => secondLatest.push(close),
     onHistoryBars: (event: unknown) => secondLoadingEvents.push(event),
   });
@@ -563,6 +571,7 @@ test('concurrent identical current requests across datafeeds share one HTTP requ
   const thirdLoadingEvents: any[] = [];
   const third = datafeedModule.createContractTradingViewDatafeed({
     symbol: 'DEDUPE_CURRENT_PERP',
+    category: 'CRYPTO',
     onHistoryBars: (event: unknown) => thirdLoadingEvents.push(event),
   });
   await third.getBars(
@@ -580,6 +589,137 @@ test('concurrent identical current requests across datafeeds share one HTTP requ
   first.destroy();
   second.destroy();
   third.destroy();
+});
+
+test('different category namespaces share C1 HTTP and populate both L1 entries', async () => {
+  const pending = deferred<KlineMetadata>();
+  const apiCalls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    return pending.promise;
+  };
+  const symbol = 'CATEGORY_C1_SHARED_PERP';
+  const cryptoHistory: HistoryCall[] = [];
+  const stockHistory: HistoryCall[] = [];
+  const crypto = datafeedModule.createContractTradingViewDatafeed({ symbol, category: 'CRYPTO' });
+  const stock = datafeedModule.createContractTradingViewDatafeed({ symbol, category: 'STOCK' });
+
+  const cryptoRequest = crypto.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => cryptoHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  const stockRequest = stock.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => stockHistory.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.equal(apiCalls.length, 1);
+  assert.equal('category' in apiCalls[0], false);
+  pending.resolve(metadata(pageEndingAt(1_717_000_000_000, 100, '102')));
+  await Promise.all([cryptoRequest, stockRequest]);
+
+  assert.equal(cryptoHistory.length, 1);
+  assert.equal(stockHistory.length, 1);
+  assert.deepEqual(cryptoHistory[0].bars, stockHistory[0].bars);
+  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'CRYPTO',
+    symbol,
+    interval: '1m',
+    limit: 100,
+  }));
+  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'STOCK',
+    symbol,
+    interval: '1m',
+    limit: 100,
+  }));
+
+  const nextCrypto = datafeedModule.createContractTradingViewDatafeed({ symbol, category: 'CRYPTO' });
+  const nextStock = datafeedModule.createContractTradingViewDatafeed({ symbol, category: 'STOCK' });
+  await nextCrypto.getBars(symbolInfo(symbol), '1', period, () => undefined, assert.fail);
+  await nextStock.getBars(symbolInfo(symbol), '1', period, () => undefined, assert.fail);
+  assert.equal(apiCalls.length, 1, 'both category-specific L1 entries must be reusable');
+
+  crypto.destroy();
+  stock.destroy();
+  nextCrypto.destroy();
+  nextStock.destroy();
+});
+
+test('UNKNOWN to real category rebuild cancels old callbacks while sharing the same C1 request', async () => {
+  const pending = deferred<KlineMetadata>();
+  let apiCalls = 0;
+  requestKlines = async () => {
+    apiCalls += 1;
+    return pending.promise;
+  };
+  const symbol = 'ASYNC_CATEGORY_PERP';
+  const oldHistory: HistoryCall[] = [];
+  const oldLatest: Array<string | null> = [];
+  const newHistory: HistoryCall[] = [];
+  const newLatest: Array<string | null> = [];
+  const unknown = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    category: 'UNKNOWN',
+    onLatestBar: (close: string | null) => oldLatest.push(close),
+  });
+  const oldRequest = unknown.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => oldHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  unknown.destroy();
+
+  const stock = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    category: 'STOCK',
+    onLatestBar: (close: string | null) => newLatest.push(close),
+  });
+  const newRequest = stock.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => newHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  assert.equal(apiCalls, 1);
+
+  pending.resolve(metadata(pageEndingAt(1_717_100_000_000, 100, '103')));
+  await Promise.all([oldRequest, newRequest]);
+  await Promise.resolve();
+
+  assert.deepEqual(oldHistory, []);
+  assert.deepEqual(oldLatest, []);
+  assert.equal(newHistory.length, 1);
+  assert.deepEqual(newLatest, ['103']);
+  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'UNKNOWN',
+    symbol,
+    interval: '1m',
+    limit: 100,
+  }));
+  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'STOCK',
+    symbol,
+    interval: '1m',
+    limit: 100,
+  }));
+  assert.equal(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'CRYPTO',
+    symbol,
+    interval: '1m',
+    limit: 100,
+  }), null);
+  assert.equal(currentCacheModule.contractKlineCurrentCache.size, 2);
+  stock.destroy();
 });
 
 
@@ -682,8 +822,9 @@ test('completed history in-flight request is removed and does not become a resul
 test('history request with an invalid cursor still bypasses current L1', async () => {
   const symbol = 'NO_HISTORY_CURRENT_CACHE_PERP';
   currentCacheModule.contractKlineCurrentCache.set(
-    { symbol, interval: '1m', limit: 100 },
+    { category: 'STOCK', symbol, interval: '1m', limit: 100 },
     metadata(pageEndingAt(1_717_005_000_000, 100, '109')),
+    15_000,
   );
   let apiCalls = 0;
   requestKlines = async () => {
@@ -691,7 +832,7 @@ test('history request with an invalid cursor still bypasses current L1', async (
     return metadata(pageEndingAt(1_717_006_000_000, 100, '110'));
   };
   const historyCalls: HistoryCall[] = [];
-  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol, category: 'STOCK' });
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await datafeed.getBars(
@@ -719,8 +860,14 @@ test('sequential current requests reuse L1 within one and across datafeed instan
   };
   const firstHistory: HistoryCall[] = [];
   const secondHistory: HistoryCall[] = [];
-  const first = datafeedModule.createContractTradingViewDatafeed({ symbol: 'L1_SEQUENTIAL_PERP' });
-  const second = datafeedModule.createContractTradingViewDatafeed({ symbol: 'L1_SEQUENTIAL_PERP' });
+  const first = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'L1_SEQUENTIAL_PERP',
+    category: 'INDEX',
+  });
+  const second = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'L1_SEQUENTIAL_PERP',
+    category: 'INDEX',
+  });
 
   await first.getBars(
     symbolInfo('L1_SEQUENTIAL_PERP'),
@@ -898,10 +1045,12 @@ test('cache-hit supersede settles the old callback and preserves the new result'
   currentCacheModule.contractKlineCurrentCache.set(
     { symbol: oldSymbol, interval: '1m', limit: 100 },
     metadata(pageEndingAt(1_717_050_000_000, 100, '116')),
+    15_000,
   );
   currentCacheModule.contractKlineCurrentCache.set(
     { symbol: newSymbol, interval: '1m', limit: 100 },
     metadata(pageEndingAt(1_717_060_000_000, 100, '117')),
+    15_000,
   );
   let apiCalls = 0;
   requestKlines = async () => {
@@ -948,6 +1097,7 @@ test('destroyed cache-hit caller has no side effects and does not affect another
   currentCacheModule.contractKlineCurrentCache.set(
     { symbol, interval: '1m', limit: 100 },
     metadata(pageEndingAt(1_717_070_000_000, 100, '118')),
+    15_000,
   );
   let apiCalls = 0;
   requestKlines = async () => {
@@ -1043,6 +1193,7 @@ test('older current L1 bars cannot roll back high-water mark and newer realtime 
   assert.equal(currentCacheModule.contractKlineCurrentCache.set(
     { symbol, interval: '1m', limit: 100 },
     metadata(pageEndingAt(newerRestTime - 60_000, 100, '129')),
+    15_000,
   ), true);
   const latest: Array<string | null> = [];
   const realtimeBars: any[] = [];
@@ -1397,6 +1548,7 @@ test('current L1 hit is page one and leaves only two C2 history pages', async ()
   assert.equal(currentCacheModule.contractKlineCurrentCache.set(
     { symbol, interval: '1m', limit: 500 },
     metadata(currentRows),
+    15_000,
   ), true);
   const apiCalls: KlineRequest[] = [];
   requestKlines = async (params) => {
@@ -1447,6 +1599,7 @@ test('current L1 hit that satisfies countBack sends no HTTP and completes once',
   assert.equal(currentCacheModule.contractKlineCurrentCache.set(
     { symbol, interval: '1m', limit: 100 },
     metadata(currentRows),
+    15_000,
   ), true);
   let apiCalls = 0;
   requestKlines = async () => {
@@ -1481,6 +1634,7 @@ test('evicted current L1 key requests HTTP again after the 65th write', async ()
     assert.equal(currentCacheModule.contractKlineCurrentCache.set(
       { symbol: `L1_FIFO_${index}_PERP`, interval: '1m', limit: 100 },
       metadata(pageEndingAt(1_800_200_000_000, 100, String(122 + index))),
+      15_000,
     ), true);
   }
   assert.equal(currentCacheModule.contractKlineCurrentCache.size, 64);

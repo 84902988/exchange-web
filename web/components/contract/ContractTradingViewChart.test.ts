@@ -54,6 +54,10 @@ const intervalToResolution = (interval: string) => ({
   '1M': '1M',
 }[interval] || '1');
 
+const policyModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./tradingview/contractKlineCachePolicy.ts', import.meta.url)),
+  {},
+);
 const chartModule = loadTypeScriptModule(
   fileURLToPath(new URL('./ContractTradingViewChart.tsx', import.meta.url)),
   {
@@ -78,6 +82,7 @@ const chartModule = loadTypeScriptModule(
       contractIntervalToTradingViewResolution: intervalToResolution,
       createContractTradingViewDatafeed: () => ({ destroy() {} }),
     },
+    './tradingview/contractKlineCachePolicy': policyModule,
   },
 );
 
@@ -238,6 +243,40 @@ test('candle interval changes keep widget identity and invoke setResolution', ()
   assert.equal(requestedResolution, '5');
   assert.equal(settled, 1);
   assert.equal(fallback, 0);
+});
+
+test('canonical category is part of widget identity while interval remains excluded', () => {
+  const base = {
+    symbol: 'SHARED_PERP',
+    category: 'UNKNOWN',
+    locale: 'en',
+    pricePrecision: 1,
+    amountPrecision: 4,
+    chartMode: 'candle',
+    fallbackNonce: 0,
+  };
+
+  const unknownKey = chartModule.buildContractWidgetIdentityKey(base);
+  const stockKey = chartModule.buildContractWidgetIdentityKey({ ...base, category: 'STOCK' });
+  const normalizedStockKey = chartModule.buildContractWidgetIdentityKey({
+    ...base,
+    category: ' stock ',
+  });
+  assert.notEqual(unknownKey, stockKey);
+  assert.equal(stockKey, normalizedStockKey);
+  assert.equal(
+    chartModule.buildContractWidgetIdentityKey({ ...base }),
+    chartModule.buildContractWidgetIdentityKey({ ...base, category: 'UNKNOWN' }),
+  );
+
+  const categoryIdentitySequence = ['UNKNOWN', ' stock ', 'STOCK'].map((category) => (
+    chartModule.buildContractWidgetIdentityKey({ ...base, category })
+  ));
+  const replacementCount = categoryIdentitySequence.slice(1).reduce(
+    (count, key, index) => count + (key === categoryIdentitySequence[index] ? 0 : 1),
+    0,
+  );
+  assert.equal(replacementCount, 1, 'UNKNOWN to STOCK must cause one stable widget replacement');
 });
 
 

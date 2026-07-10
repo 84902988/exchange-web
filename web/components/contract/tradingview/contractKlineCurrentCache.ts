@@ -2,12 +2,16 @@ import type {
   ContractMarketKlineItem,
   ContractMarketKlineMetadataResponse,
 } from '@/lib/api/modules/contract';
-
+import {
+  CONTRACT_KLINE_CURRENT_CACHE_TTL_MS,
+  normalizeContractKlineAssetClass,
+  type ContractKlineAssetClass,
+} from './contractKlineCachePolicy';
 
 export const CONTRACT_KLINE_CURRENT_CACHE_MAX_ENTRIES = 64;
-export const CONTRACT_KLINE_CURRENT_CACHE_TTL_MS = 15_000;
 
 export type ContractKlineCurrentCacheKeyParams = {
+  category?: ContractKlineAssetClass | string | null;
   symbol: string;
   interval: string;
   limit: number;
@@ -15,12 +19,12 @@ export type ContractKlineCurrentCacheKeyParams = {
 
 type ContractKlineCurrentCacheEntry = {
   response: ContractMarketKlineMetadataResponse;
+  writtenAt: number;
   expiresAt: number;
 };
 
 type ContractKlineCurrentCacheOptions = {
   maxEntries?: number;
-  ttlMs?: number;
   now?: () => number;
 };
 
@@ -41,6 +45,12 @@ function normalizeSymbol(symbol: string) {
 function normalizeInterval(interval: string) {
   const normalized = String(interval || '').trim();
   return normalized === '1M' ? '1M' : normalized.toLowerCase();
+}
+
+function normalizeTtlMs(ttlMs: number) {
+  return Number.isFinite(ttlMs) && ttlMs > 0
+    ? Math.max(1, Math.floor(ttlMs))
+    : CONTRACT_KLINE_CURRENT_CACHE_TTL_MS;
 }
 
 function toRecord(value: unknown): Record<string, unknown> | null {
@@ -85,7 +95,12 @@ export function cloneContractKlineMetadataResponse(
 }
 
 export function buildContractKlineCurrentCacheKey(params: ContractKlineCurrentCacheKeyParams) {
-  return `${normalizeSymbol(params.symbol)}|${normalizeInterval(params.interval)}|${params.limit}`;
+  return [
+    normalizeContractKlineAssetClass(params.category),
+    normalizeSymbol(params.symbol),
+    normalizeInterval(params.interval),
+    params.limit,
+  ].join('|');
 }
 
 export function isContractKlineCurrentResponseCacheable(value: unknown) {
@@ -112,17 +127,14 @@ export function isContractKlineCurrentResponseCacheable(value: unknown) {
 
 export class ContractKlineCurrentCache {
   private readonly maxEntries: number;
-  private readonly ttlMs: number;
   private readonly now: () => number;
   private readonly entries = new Map<string, ContractKlineCurrentCacheEntry>();
 
   constructor({
     maxEntries = CONTRACT_KLINE_CURRENT_CACHE_MAX_ENTRIES,
-    ttlMs = CONTRACT_KLINE_CURRENT_CACHE_TTL_MS,
     now = Date.now,
   }: ContractKlineCurrentCacheOptions = {}) {
     this.maxEntries = Math.max(1, Math.floor(maxEntries));
-    this.ttlMs = Math.max(1, Math.floor(ttlMs));
     this.now = now;
   }
 
@@ -140,13 +152,16 @@ export class ContractKlineCurrentCache {
   set(
     params: ContractKlineCurrentCacheKeyParams,
     response: ContractMarketKlineMetadataResponse,
+    ttlMs: number,
   ) {
     if (!isContractKlineCurrentResponseCacheable(response)) return false;
     const key = buildContractKlineCurrentCacheKey(params);
+    const writtenAt = this.now();
     this.entries.delete(key);
     this.entries.set(key, {
       response: cloneContractKlineMetadataResponse(response),
-      expiresAt: this.now() + this.ttlMs,
+      writtenAt,
+      expiresAt: writtenAt + normalizeTtlMs(ttlMs),
     });
     while (this.entries.size > this.maxEntries) {
       const oldestKey = this.entries.keys().next().value;

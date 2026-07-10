@@ -6,7 +6,10 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 
 
-function loadTypeScriptModule(filePath: string): Record<string, any> {
+function loadTypeScriptModule(
+  filePath: string,
+  mocks: Record<string, unknown> = {},
+): Record<string, any> {
   const source = readFileSync(filePath, 'utf8');
   const output = ts.transpileModule(source, {
     compilerOptions: {
@@ -20,6 +23,7 @@ function loadTypeScriptModule(filePath: string): Record<string, any> {
   const execute = new Function('require', 'module', 'exports', output);
   execute(
     (specifier: string) => {
+      if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier];
       throw new Error(`Unexpected test import: ${specifier}`);
     },
     loadedModule,
@@ -28,8 +32,12 @@ function loadTypeScriptModule(filePath: string): Record<string, any> {
   return loadedModule.exports;
 }
 
+const policyModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./contractKlineCachePolicy.ts', import.meta.url)),
+);
 const cacheModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractKlineCurrentCache.ts', import.meta.url)),
+  { './contractKlineCachePolicy': policyModule },
 );
 
 function response(overrides: Record<string, unknown> = {}) {
@@ -59,17 +67,35 @@ test('current cache key normalizes symbol and interval while keeping exact limit
   const buildKey = cacheModule.buildContractKlineCurrentCacheKey;
 
   assert.equal(
-    buildKey({ symbol: ' btcusdt_perp ', interval: '1H', limit: 300 }),
-    'BTCUSDT_PERP|1h|300',
+    buildKey({ category: 'crypto', symbol: ' btcusdt_perp ', interval: '1H', limit: 300 }),
+    'CRYPTO|BTCUSDT_PERP|1h|300',
+  );
+  assert.equal(
+    buildKey({ category: 'stock', symbol: 'aapl_usdt_perp', interval: '1M', limit: 200 }),
+    'STOCK|AAPL_USDT_PERP|1M|200',
   );
   assert.equal(
     buildKey({ symbol: 'aapl_usdt_perp', interval: '1M', limit: 200 }),
-    'AAPL_USDT_PERP|1M|200',
+    'UNKNOWN|AAPL_USDT_PERP|1M|200',
   );
   assert.notEqual(
     buildKey({ symbol: 'BTCUSDT_PERP', interval: '1h', limit: 300 }),
     buildKey({ symbol: 'BTCUSDT_PERP', interval: '1h', limit: 200 }),
   );
+});
+
+test('current cache keeps canonical category namespaces isolated', () => {
+  const cache = new cacheModule.ContractKlineCurrentCache();
+  const baseKey = { symbol: 'SHARED_PERP', interval: '1m', limit: 100 };
+
+  assert.equal(cache.set({ ...baseKey, category: 'CRYPTO' }, response(), 15_000), true);
+  assert.ok(cache.get({ ...baseKey, category: 'CRYPTO' }));
+  assert.equal(cache.get({ ...baseKey, category: 'STOCK' }), null);
+
+  cache.clear();
+  assert.equal(cache.set({ ...baseKey, category: 'UNKNOWN' }, response(), 15_000), true);
+  assert.ok(cache.get({ ...baseKey, category: 'UNKNOWN' }));
+  assert.equal(cache.get({ ...baseKey, category: 'INDEX' }), null);
 });
 
 
@@ -117,13 +143,12 @@ test('only complete non-stale provider current metadata is cacheable', () => {
 test('TTL starts on write does not extend on hit and copies values on read and write', () => {
   let now = 1_000;
   const cache = new cacheModule.ContractKlineCurrentCache({
-    ttlMs: 15_000,
     now: () => now,
   });
-  const key = { symbol: 'BTCUSDT_PERP', interval: '1m', limit: 100 };
+  const key = { category: 'CRYPTO', symbol: 'BTCUSDT_PERP', interval: '1m', limit: 100 };
   const source = response();
 
-  assert.equal(cache.set(key, source), true);
+  assert.equal(cache.set(key, source, 15_000), true);
   source.items[0].close = '999';
   source.items.push({ ...source.items[0], open_time: 1_717_000_060_000 });
   const first = cache.get(key);
@@ -144,8 +169,47 @@ test('TTL starts on write does not extend on hit and copies values on read and w
 
   assert.equal(cache.set(key, response({
     items: [{ ...response().items[0], close: '106' }],
-  })), true);
+  }), 2_000), true);
   assert.equal(cache.get(key).items[0].close, '106');
+  now = 17_999;
+  assert.ok(cache.get(key));
+  now = 18_000;
+  assert.equal(cache.get(key), null);
+});
+
+test('entry expiry is fixed at write time and replacement gets its own TTL', () => {
+  let now = 0;
+  const cache = new cacheModule.ContractKlineCurrentCache({ now: () => now });
+  const key = { category: 'INDEX', symbol: 'INDEX_PERP', interval: '1h', limit: 100 };
+
+  assert.equal(cache.set(key, response(), 1_000), true);
+  now = 500;
+  assert.ok(cache.get(key), 'a hit must not extend the original expiry');
+  now = 999;
+  assert.ok(cache.get(key));
+
+  assert.equal(cache.set(key, response({
+    items: [{ ...response().items[0], close: '106' }],
+  }), 4_000), true);
+  now = 1_000;
+  assert.equal(cache.get(key).items[0].close, '106');
+  now = 4_998;
+  assert.ok(cache.get(key));
+  now = 4_999;
+  assert.equal(cache.get(key), null);
+});
+
+test('invalid per-entry TTL values safely fall back to 15 seconds', () => {
+  for (const [index, ttlMs] of [0, -1, Number.NaN, Number.POSITIVE_INFINITY].entries()) {
+    let now = 0;
+    const cache = new cacheModule.ContractKlineCurrentCache({ now: () => now });
+    const key = { category: 'CFD', symbol: `TTL_${index}_PERP`, interval: '1m', limit: 100 };
+    assert.equal(cache.set(key, response(), ttlMs), true);
+    now = 14_999;
+    assert.ok(cache.get(key));
+    now = 15_000;
+    assert.equal(cache.get(key), null);
+  }
 });
 
 
@@ -157,7 +221,7 @@ test('FIFO capacity stays at 64 and evicts the earliest written key', () => {
       symbol: `FIFO_${index}_PERP`,
       interval: '1m',
       limit: 100,
-    }, response()), true);
+    }, response(), 15_000), true);
   }
 
   assert.equal(cache.size, 64);
@@ -167,7 +231,7 @@ test('FIFO capacity stays at 64 and evicts the earliest written key', () => {
 
   cache.set({ symbol: 'FIFO_64_PERP', interval: '1m', limit: 100 }, response({
     items: [{ ...response().items[0], close: '106' }],
-  }));
+  }), 15_000);
   assert.equal(cache.size, 64);
   assert.equal(
     cache.get({ symbol: 'FIFO_64_PERP', interval: '1m', limit: 100 }).items[0].close,
