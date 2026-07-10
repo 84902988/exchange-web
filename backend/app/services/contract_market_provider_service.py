@@ -491,6 +491,8 @@ def _endpoint_request(provider_code: str, endpoint_type: str, provider_symbol: s
             return "/api/v5/market/books", {"instId": symbol, "sz": min(safe_limit, 400)}
         if endpoint == "kline":
             return "/api/v5/market/candles", {"instId": symbol, "bar": "1m", "limit": min(safe_limit, 300)}
+        if endpoint == "kline_history":
+            return "/api/v5/market/history-candles", {"instId": symbol, "bar": "1m", "limit": min(safe_limit, 300)}
         if endpoint == "trades":
             return "/api/v5/market/trades", {"instId": symbol, "limit": min(safe_limit, 500)}
         if endpoint == "funding":

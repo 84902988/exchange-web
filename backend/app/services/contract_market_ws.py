@@ -16,8 +16,10 @@ def normalize_contract_ws_symbol(symbol: str) -> str:
 
 
 def normalize_contract_ws_interval(interval: str | None) -> str:
-    normalized = str(interval or "1m").strip().lower()
-    return normalized or "1m"
+    normalized = str(interval or "1m").strip()
+    if normalized == "1M":
+        return "1M"
+    return normalized.lower() or "1m"
 
 
 def _to_jsonable(value: Any) -> Any:

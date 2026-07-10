@@ -90,7 +90,10 @@ def _normalize_symbol(value: Any) -> str:
 
 
 def _normalize_interval(value: Any) -> str:
-    return str(value or "1m").strip().lower() or "1m"
+    normalized = str(value or "1m").strip()
+    if normalized == "1M":
+        return "1M"
+    return normalized.lower() or "1m"
 
 
 def _okx_kline_channel(interval: Any) -> Optional[str]:

@@ -2559,6 +2559,8 @@ def _provider_kline_extra_params(provider_code: str, interval: str, end_time_ms:
         params = {"interval": _normalize_contract_interval(interval)}
     else:
         params = {}
+    if end_time_ms and provider_code == "OKX_SWAP":
+        params["after"] = str(max(int(end_time_ms), 1))
     if end_time_ms and provider_code == "BINANCE_USDM":
         params["endTime"] = max(int(end_time_ms) - 1, 1)
     if end_time_ms and provider_code == "BITGET_USDT_FUTURES":
@@ -2602,9 +2604,14 @@ def _get_configured_contract_klines(
     for provider in enabled_contract_market_providers(db):
         try:
             provider_symbol = _configured_provider_symbol(db, provider, contract_symbol)
+            endpoint_type = (
+                "kline_history"
+                if provider.provider_code == "OKX_SWAP" and end_time_ms is not None
+                else "kline"
+            )
             payload = request_contract_market_provider_json(
                 provider,
-                "kline",
+                endpoint_type,
                 provider_symbol,
                 limit=limit,
                 extra_params=_provider_kline_extra_params(provider.provider_code, interval, end_time_ms),
