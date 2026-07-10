@@ -22,12 +22,28 @@ const CFD_CATEGORY_ALIASES = new Set([
   'FUTURES',
 ]);
 
-const CURRENT_CACHE_TTL_BY_ASSET_CLASS: Record<ContractKlineAssetClass, number> = {
-  CRYPTO: CONTRACT_KLINE_CURRENT_CACHE_TTL_MS,
-  STOCK: CONTRACT_KLINE_CURRENT_CACHE_TTL_MS,
-  CFD: CONTRACT_KLINE_CURRENT_CACHE_TTL_MS,
-  INDEX: CONTRACT_KLINE_CURRENT_CACHE_TTL_MS,
-  UNKNOWN: CONTRACT_KLINE_CURRENT_CACHE_TTL_MS,
+const CURRENT_CACHE_TTL_BY_ASSET_CLASS: Record<
+  ContractKlineAssetClass,
+  Readonly<Record<string, number>>
+> = {
+  CRYPTO: {
+    '1m': 5_000,
+    '5m': 10_000,
+    '15m': 10_000,
+  },
+  STOCK: {
+    '1m': 10_000,
+    '5m': 10_000,
+  },
+  CFD: {
+    '1m': 10_000,
+    '5m': 10_000,
+  },
+  INDEX: {
+    '1m': 10_000,
+    '5m': 10_000,
+  },
+  UNKNOWN: {},
 };
 
 export function normalizeContractKlineAssetClass(value: unknown): ContractKlineAssetClass {
@@ -54,5 +70,8 @@ export function getContractKlineCurrentCacheTtlMs({
   const assetClass = normalizeContractKlineAssetClass(category);
   const normalizedInterval = normalizeContractKlinePolicyInterval(interval);
   if (!normalizedInterval) return CONTRACT_KLINE_CURRENT_CACHE_TTL_MS;
-  return CURRENT_CACHE_TTL_BY_ASSET_CLASS[assetClass];
+  return (
+    CURRENT_CACHE_TTL_BY_ASSET_CLASS[assetClass][normalizedInterval]
+    ?? CONTRACT_KLINE_CURRENT_CACHE_TTL_MS
+  );
 }

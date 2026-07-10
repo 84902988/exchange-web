@@ -199,6 +199,62 @@ test('entry expiry is fixed at write time and replacement gets its own TTL', () 
   assert.equal(cache.get(key), null);
 });
 
+test('category and interval policy creates independent fixed entry expiry boundaries', () => {
+  let now = 0;
+  const cache = new cacheModule.ContractKlineCurrentCache({ now: () => now });
+  const getTtl = policyModule.getContractKlineCurrentCacheTtlMs;
+  const entries = [
+    { category: 'CRYPTO', symbol: 'CRYPTO_1M_PERP', interval: '1m', expiresAt: 5_000 },
+    { category: 'CRYPTO', symbol: 'CRYPTO_5M_PERP', interval: '5m', expiresAt: 10_000 },
+    { category: 'CRYPTO', symbol: 'CRYPTO_15M_PERP', interval: '15m', expiresAt: 10_000 },
+    { category: 'STOCK', symbol: 'STOCK_1M_PERP', interval: '1m', expiresAt: 10_000 },
+    { category: 'CFD', symbol: 'CFD_5M_PERP', interval: '5m', expiresAt: 10_000 },
+    { category: 'INDEX', symbol: 'INDEX_1M_PERP', interval: '1m', expiresAt: 10_000 },
+    { category: 'CRYPTO', symbol: 'CRYPTO_1H_PERP', interval: '1h', expiresAt: 15_000 },
+    { category: 'CRYPTO', symbol: 'CRYPTO_MONTH_PERP', interval: '1M', expiresAt: 15_000 },
+    { category: 'UNKNOWN', symbol: 'UNKNOWN_1M_PERP', interval: '1m', expiresAt: 15_000 },
+  ].map((entry) => ({ ...entry, limit: 100 }));
+
+  for (const entry of entries) {
+    const ttlMs = getTtl({ category: entry.category, interval: entry.interval });
+    assert.equal(ttlMs, entry.expiresAt);
+    assert.equal(cache.set(entry, response(), ttlMs), true);
+  }
+
+  now = 4_999;
+  entries.forEach((entry) => assert.ok(cache.get(entry), `${entry.symbol} expired before 5 seconds`));
+  now = 5_000;
+  assert.equal(cache.get(entries[0]), null);
+  entries.slice(1).forEach((entry) => assert.ok(cache.get(entry), `${entry.symbol} expired at 5 seconds`));
+
+  now = 9_999;
+  entries.slice(1).forEach((entry) => assert.ok(cache.get(entry), `${entry.symbol} expired before 10 seconds`));
+  now = 10_000;
+  entries.slice(1, 6).forEach((entry) => assert.equal(cache.get(entry), null, entry.symbol));
+  entries.slice(6).forEach((entry) => assert.ok(cache.get(entry), `${entry.symbol} expired at 10 seconds`));
+
+  assert.equal(getTtl({ category: 'UNKNOWN', interval: '1m' }), 15_000);
+  now = 14_999;
+  entries.slice(6).forEach((entry) => assert.ok(cache.get(entry), `${entry.symbol} expired before 15 seconds`));
+  now = 15_000;
+  entries.slice(6).forEach((entry) => assert.equal(cache.get(entry), null, entry.symbol));
+  assert.equal(cache.size, 0);
+});
+
+test('later policy calls do not reinterpret an existing entry expiry', () => {
+  let now = 0;
+  const cache = new cacheModule.ContractKlineCurrentCache({ now: () => now });
+  const getTtl = policyModule.getContractKlineCurrentCacheTtlMs;
+  const key = { category: 'CRYPTO', symbol: 'FIXED_TTL_PERP', interval: '1m', limit: 100 };
+
+  assert.equal(cache.set(key, response(), getTtl(key)), true);
+  assert.equal(getTtl({ category: 'UNKNOWN', interval: '1m' }), 15_000);
+  now = 4_999;
+  assert.ok(cache.get(key));
+  now = 5_000;
+  assert.equal(cache.get(key), null);
+});
+
 test('invalid per-entry TTL values safely fall back to 15 seconds', () => {
   for (const [index, ttlMs] of [0, -1, Number.NaN, Number.POSITIVE_INFINITY].entries()) {
     let now = 0;

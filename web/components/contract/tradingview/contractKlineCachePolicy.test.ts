@@ -87,15 +87,83 @@ test('policy interval normalization preserves monthly 1M and normalizes other ca
   assert.equal(normalize('UNKNOWN_INTERVAL'), 'unknown_interval');
 });
 
-test('D2A current cache policy remains 15 seconds for every category and interval', () => {
+test('D2B current cache policy applies the exact conservative category and interval matrix', () => {
   const getTtl = policyModule.getContractKlineCurrentCacheTtlMs;
-  const categories = ['CRYPTO', 'STOCK', 'CFD', 'INDEX', 'UNKNOWN'];
-  const intervals = ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M', 'UNKNOWN_INTERVAL'];
+  const matrix = {
+    CRYPTO: {
+      '1m': 5_000,
+      '5m': 10_000,
+      '15m': 10_000,
+      '1h': 15_000,
+      '4h': 15_000,
+      '1d': 15_000,
+      '1w': 15_000,
+      '1M': 15_000,
+      UNKNOWN_INTERVAL: 15_000,
+    },
+    STOCK: {
+      '1m': 10_000,
+      '5m': 10_000,
+      '15m': 15_000,
+      '1h': 15_000,
+      '4h': 15_000,
+      '1d': 15_000,
+      '1w': 15_000,
+      '1M': 15_000,
+      UNKNOWN_INTERVAL: 15_000,
+    },
+    CFD: {
+      '1m': 10_000,
+      '5m': 10_000,
+      '15m': 15_000,
+      '1h': 15_000,
+      '4h': 15_000,
+      '1d': 15_000,
+      '1w': 15_000,
+      '1M': 15_000,
+      UNKNOWN_INTERVAL: 15_000,
+    },
+    INDEX: {
+      '1m': 10_000,
+      '5m': 10_000,
+      '15m': 15_000,
+      '1h': 15_000,
+      '4h': 15_000,
+      '1d': 15_000,
+      '1w': 15_000,
+      '1M': 15_000,
+      UNKNOWN_INTERVAL: 15_000,
+    },
+    UNKNOWN: {
+      '1m': 15_000,
+      '5m': 15_000,
+      '15m': 15_000,
+      '1h': 15_000,
+      '4h': 15_000,
+      '1d': 15_000,
+      '1w': 15_000,
+      '1M': 15_000,
+      UNKNOWN_INTERVAL: 15_000,
+    },
+  };
 
-  for (const category of categories) {
-    for (const interval of intervals) {
-      assert.equal(getTtl({ category, interval }), 15_000, `${category}/${interval}`);
+  for (const [category, intervals] of Object.entries(matrix)) {
+    for (const [interval, ttlMs] of Object.entries(intervals)) {
+      assert.equal(getTtl({ category, interval }), ttlMs, `${category}/${interval}`);
     }
   }
-  assert.equal(getTtl({ category: 'not-loaded', interval: '' }), 15_000);
+});
+
+test('minute and monthly intervals stay distinct while unknown inputs remain conservative', () => {
+  const getTtl = policyModule.getContractKlineCurrentCacheTtlMs;
+
+  assert.equal(getTtl({ category: 'CRYPTO', interval: '1m' }), 5_000);
+  assert.equal(getTtl({ category: 'CRYPTO', interval: '1M' }), 15_000);
+  assert.equal(getTtl({ category: 'CRYPTO', interval: '1D' }), 15_000);
+  assert.equal(getTtl({ category: 'CRYPTO', interval: '1W' }), 15_000);
+  assert.equal(getTtl({ category: 'CRYPTO', interval: '' }), 15_000);
+  assert.equal(getTtl({ category: 'CRYPTO', interval: '2m' }), 15_000);
+  assert.equal(getTtl({ category: 'UNKNOWN', interval: '1m' }), 15_000);
+  assert.equal(getTtl({ category: 'not-loaded', interval: '1m' }), 15_000);
+  assert.equal(getTtl({ category: 'USDT', interval: '1m' }), 15_000);
 });
