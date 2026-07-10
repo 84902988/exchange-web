@@ -17,6 +17,7 @@ from app.schemas.contract_market import (
     ContractTickerListResponse,
 )
 from app.schemas.response import ok
+from app.services.contract_kline_response import serialize_contract_kline_response
 from app.services.contract_market_service import (
     CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION,
     CONTRACT_MARKET_STATUS_VERSION,
@@ -434,6 +435,10 @@ def contract_market_kline(
         ge=0,
         description="Optional history pagination end time in milliseconds. Returns klines with open_time < end_time_ms.",
     ),
+    include_metadata: bool = Query(
+        False,
+        description="Opt in to structured Kline response metadata. Default remains the legacy array response.",
+    ),
     db: Session = Depends(get_db),
 ):
     trace_id = getattr(request.state, "trace_id", None)
@@ -445,7 +450,14 @@ def contract_market_kline(
             limit=limit,
             end_time_ms=end_time_ms,
         )
-        return ok(data=rows, trace_id=trace_id)
+        return ok(
+            data=serialize_contract_kline_response(
+                rows,
+                include_metadata=include_metadata,
+                end_time_ms=end_time_ms,
+            ),
+            trace_id=trace_id,
+        )
     except ContractSymbolNotFound as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)})

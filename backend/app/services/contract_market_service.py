@@ -23,6 +23,13 @@ from app.services.itick_holiday_service import (
 )
 from app.services.itick_market_service import ItickMarketServiceError, itick_market_service
 from app.services.market_kline_cache import get_klines_cache_first, upsert_klines
+from app.services.contract_kline_response import (
+    ContractKlineResult,
+    coerce_contract_kline_result,
+    contract_kline_error_result,
+    contract_kline_process_cache_result,
+    contract_kline_provider_result,
+)
 from app.services.contract_market_provider_service import (
     MarketDataProviderConfig,
     ProviderCooldownError,
@@ -4179,16 +4186,17 @@ def _is_provider_contract_kline_row(row: dict[str, Any]) -> bool:
     return True
 
 
-def _provider_contract_kline_rows(rows: list[dict[str, Any]], *, limit: Optional[int] = None) -> list[dict[str, Any]]:
+def _provider_contract_kline_rows(rows: list[dict[str, Any]], *, limit: Optional[int] = None) -> ContractKlineResult:
+    result = coerce_contract_kline_result(rows)
     clean_rows = [
         dict(row)
-        for row in (rows or [])
+        for row in result
         if isinstance(row, dict) and _is_provider_contract_kline_row(row)
     ]
     if limit is None:
-        return clean_rows
+        return result.with_items(clean_rows)
     safe_limit = _normalize_kline_limit(limit)
-    return clean_rows[-safe_limit:]
+    return result.with_items(clean_rows[-safe_limit:])
 
 
 def _get_stock_contract_klines_from_itick(
@@ -4206,7 +4214,10 @@ def _get_stock_contract_klines_from_itick(
     if end_time_ms is None:
         cached_rows = _get_cached_contract_klines(normalized_symbol, normalized_interval, safe_limit)
         if cached_rows is not None:
-            return _provider_contract_kline_rows(cached_rows, limit=safe_limit)
+            return _provider_contract_kline_rows(
+                contract_kline_process_cache_result(cached_rows),
+                limit=safe_limit,
+            )
 
     if normalized_interval not in _itick_contract_k_type:
         logger.info(
@@ -4216,7 +4227,13 @@ def _get_stock_contract_klines_from_itick(
         )
         if end_time_ms is None:
             _cache_contract_klines(normalized_symbol, normalized_interval, safe_limit, [])
-        return []
+        return ContractKlineResult(
+            [],
+            origin="EMPTY",
+            cache_status="UNSUPPORTED_INTERVAL",
+            provider_error_code=None,
+            retryable=False,
+        )
 
     def _fetch_stock_contract_klines(fetch_limit: int, _fetch_end_time_ms: Optional[int]):
         payload = itick_market_service.get_stock_kline(
@@ -4307,7 +4324,7 @@ def get_contract_klines(
                 fetch_external=_fetch_configured_contract_klines,
             )
             return _provider_contract_kline_rows(rows, limit=safe_limit)
-        except Exception:
+        except Exception as exc:
             if not contract_market_last_good_enabled(db):
                 raise
             logger.warning(
@@ -4316,7 +4333,7 @@ def get_contract_klines(
                 normalized_interval,
                 safe_limit,
             )
-            return []
+            return contract_kline_error_result(exc, end_time_ms=end_time_ms)
 
     category = _contract_asset_category(contract_symbol)
     if provider == "ITICK":
@@ -4334,7 +4351,10 @@ def get_contract_klines(
         if category != "INDEX" and end_time_ms is None:
             cached_rows = _get_cached_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit)
             if cached_rows is not None:
-                return _provider_contract_kline_rows(cached_rows, limit=safe_limit)
+                return _provider_contract_kline_rows(
+                    contract_kline_process_cache_result(cached_rows),
+                    limit=safe_limit,
+                )
         if normalized_interval not in _itick_contract_k_type:
             logger.info(
                 "tradfi_cfd_kline_interval_unsupported symbol=%s interval=%s",
@@ -4343,7 +4363,13 @@ def get_contract_klines(
             )
             if end_time_ms is None:
                 _cache_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit, [])
-            return []
+            return ContractKlineResult(
+                [],
+                origin="EMPTY",
+                cache_status="UNSUPPORTED_INTERVAL",
+                provider_error_code=None,
+                retryable=False,
+            )
         def _fetch_itick_contract_klines(fetch_limit: int, _fetch_end_time_ms: Optional[int]):
             payload = itick_market_service.get_market_kline(
                 _itick_market_for_contract(contract_symbol),
@@ -4361,7 +4387,10 @@ def get_contract_klines(
 
         if category == "INDEX":
             try:
-                rows = _fetch_itick_contract_klines(safe_limit, end_time_ms)
+                rows = contract_kline_provider_result(
+                    _fetch_itick_contract_klines(safe_limit, end_time_ms),
+                    end_time_ms=end_time_ms,
+                )
             except Exception as exc:
                 logger.warning(
                     "tradfi_index_kline_fetch_failed symbol=%s provider_symbol=%s market=%s region=%s interval=%s kType=%s limit=%s reason=%s",
@@ -4374,7 +4403,7 @@ def get_contract_klines(
                     safe_limit,
                     exc,
                 )
-                rows = []
+                rows = contract_kline_error_result(exc, end_time_ms=end_time_ms)
         else:
             rows = get_klines_cache_first(
                 db,
@@ -4412,10 +4441,10 @@ def get_contract_klines(
                 safe_limit,
             )
             if category == "INDEX":
-                return []
+                return rows
             if end_time_ms is None:
                 _cache_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit, [])
-            return []
+            return rows
 
     logger.warning(
         "contract_kline_provider_missing_no_synthetic_fallback symbol=%s provider=%s category=%s interval=%s limit=%s",
@@ -4425,7 +4454,13 @@ def get_contract_klines(
         normalized_interval,
         safe_limit,
     )
-    return []
+    return ContractKlineResult(
+        [],
+        origin="EMPTY",
+        cache_status="PROVIDER_NOT_CONFIGURED",
+        provider_error_code=None,
+        retryable=False,
+    )
 
 
 def get_contract_recent_trades(db: Session, symbol: str, limit: int = 30) -> list[dict[str, Any]]:

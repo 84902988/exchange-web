@@ -134,6 +134,15 @@ def _contract_symbol():
     )
 
 
+def _itick_contract_symbol(*, category: str):
+    return SimpleNamespace(
+        symbol="US30_PERP",
+        provider="ITICK",
+        provider_symbol="US30",
+        category=category,
+    )
+
+
 def _provider_rows(*open_times: int):
     return {
         "data": [
@@ -141,6 +150,23 @@ def _provider_rows(*open_times: int):
             for open_time in open_times
         ]
     }
+
+
+class _SharedKlineCacheResult(list):
+    def __init__(
+        self,
+        rows,
+        *,
+        origin: str,
+        cache_status: str,
+        history_incomplete: bool = False,
+        provider_error_code: str | None = None,
+    ):
+        super().__init__(rows)
+        self.origin = origin
+        self.cache_status = cache_status
+        self.history_incomplete = history_incomplete
+        self.provider_error_code = provider_error_code
 
 
 def _configure_okx_fetch(service, payload, calls):
@@ -298,7 +324,11 @@ def test_contract_history_db_cache_hit_does_not_call_provider():
     def cache_first(_db, **kwargs):
         assert kwargs["end_time_ms"] == end_time_ms
         assert kwargs["source"] == "CONFIGURED"
-        return cached_rows
+        return _SharedKlineCacheResult(
+            cached_rows,
+            origin="DB_CACHE",
+            cache_status="HIT",
+        )
 
     service.get_klines_cache_first = cache_first
 
@@ -311,6 +341,92 @@ def test_contract_history_db_cache_hit_does_not_call_provider():
     )
 
     assert rows == cached_rows
+    assert rows.origin == "DB_CACHE"
+    assert rows.cache_status == "HIT"
+
+
+def test_tradfi_process_cache_path_preserves_cache_metadata():
+    service = _load_contract_market_service_module()
+    cached_rows = [
+        {
+            "open_time": 1_700_000_000_000,
+            "open": "100",
+            "high": "110",
+            "low": "90",
+            "close": "105",
+            "volume": "5",
+        }
+    ]
+    service._load_contract_symbol = lambda *_args, **_kwargs: _itick_contract_symbol(category="CFD")
+    service._contract_provider_symbol = lambda *_args, **_kwargs: "US30"
+    service._is_stock_contract_config = lambda *_args, **_kwargs: False
+    service._get_cached_contract_klines = lambda *_args, **_kwargs: cached_rows
+
+    rows = service.get_contract_klines(
+        object(),
+        "US30_PERP",
+        interval="1m",
+        limit=50,
+    )
+
+    assert rows == cached_rows
+    assert rows.origin == "PROCESS_CACHE"
+    assert rows.cache_status == "HIT"
+    assert rows.provider_error_code is None
+
+
+def test_index_direct_path_preserves_provider_and_unknown_empty_metadata():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol(category="INDEX")
+    payloads = [
+        {
+            "data": [
+                {
+                    "t": 1_700_000_000_000,
+                    "o": "100",
+                    "h": "110",
+                    "l": "90",
+                    "c": "105",
+                    "v": "5",
+                }
+            ]
+        },
+        {"data": []},
+    ]
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service._contract_provider_symbol = lambda *_args, **_kwargs: "US30"
+    service._is_stock_contract_config = lambda *_args, **_kwargs: False
+    service._itick_market_for_contract = lambda *_args, **_kwargs: "indices"
+    service._itick_region_for_contract = lambda *_args, **_kwargs: "US"
+    service._cache_contract_klines = lambda *_args, **_kwargs: None
+    service.upsert_klines = lambda *_args, **_kwargs: 0
+    service.itick_market_service = SimpleNamespace(
+        get_market_kline=lambda *_args, **_kwargs: payloads.pop(0),
+    )
+
+    current_rows = service.get_contract_klines(
+        object(),
+        "US30_PERP",
+        interval="1m",
+        limit=50,
+    )
+    history_rows = service.get_contract_klines(
+        object(),
+        "US30_PERP",
+        interval="1m",
+        limit=50,
+        end_time_ms=1_700_000_060_000,
+    )
+
+    assert current_rows.origin == "REST_FETCH"
+    assert current_rows.cache_status == "MISS"
+    assert len(current_rows) == 1
+    assert history_rows == []
+    assert history_rows.origin == "EMPTY"
+    assert history_rows.cache_status == "PROVIDER_EMPTY"
+    assert history_rows.provider_error_code == "EMPTY"
+    assert history_rows.history_incomplete is True
+    assert history_rows.retryable is True
 
 
 if __name__ == "__main__":
@@ -321,6 +437,8 @@ if __name__ == "__main__":
         test_okx_history_request_uses_history_endpoint_after_and_strict_boundary,
         test_okx_latest_rows_are_not_misreported_as_history_success,
         test_contract_history_db_cache_hit_does_not_call_provider,
+        test_tradfi_process_cache_path_preserves_cache_metadata,
+        test_index_direct_path_preserves_provider_and_unknown_empty_metadata,
     ]
     for test in tests:
         test()
