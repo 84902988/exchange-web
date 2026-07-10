@@ -3,6 +3,7 @@
 import {
   getContractMarketKlinesMetadata,
   type ContractMarketKlineItem,
+  type ContractMarketKlineMetadataResponse,
 } from '@/lib/api/modules/contract';
 import {
   contractMarketRealtime,
@@ -196,6 +197,52 @@ function normalizeContractInterval(interval: string) {
   const normalized = String(interval || '').trim();
   if (normalized === '1M') return '1M';
   return normalized.toLowerCase();
+}
+
+type ContractKlineInFlightRequest = {
+  symbol: string;
+  interval: string;
+  limit: number;
+  endTimeMs?: number | null;
+};
+
+const CONTRACT_KLINE_CURRENT_REQUEST_KEY = 'CURRENT';
+const contractKlineMetadataInFlight = new Map<
+  string,
+  Promise<ContractMarketKlineMetadataResponse>
+>();
+
+export function buildContractKlineInFlightKey(params: ContractKlineInFlightRequest) {
+  const requestSymbol = normalizeContractSymbol(params.symbol);
+  const requestInterval = normalizeContractInterval(params.interval);
+  const requestEndTime = params.endTimeMs === undefined || params.endTimeMs === null
+    ? CONTRACT_KLINE_CURRENT_REQUEST_KEY
+    : String(params.endTimeMs);
+  return `${requestSymbol}|${requestInterval}|${requestEndTime}|${params.limit}`;
+}
+
+function getContractMarketKlinesMetadataInFlight(
+  params: Omit<ContractKlineInFlightRequest, 'endTimeMs'> & { endTimeMs?: number },
+) {
+  const key = buildContractKlineInFlightKey(params);
+  const existing = contractKlineMetadataInFlight.get(key);
+  if (existing) return existing;
+
+  let request: Promise<ContractMarketKlineMetadataResponse>;
+  try {
+    request = getContractMarketKlinesMetadata(params);
+  } catch (error) {
+    request = Promise.reject(error);
+  }
+  contractKlineMetadataInFlight.set(key, request);
+
+  const cleanup = () => {
+    if (contractKlineMetadataInFlight.get(key) === request) {
+      contractKlineMetadataInFlight.delete(key);
+    }
+  };
+  void request.then(cleanup, cleanup);
+  return request;
 }
 
 function normalizeResolution(resolution: string): ContractTradingViewResolution {
@@ -535,7 +582,7 @@ export function createContractTradingViewDatafeed({
       const endTimeMs = resolveContractHistoryEndTimeMs(periodParams);
 
       try {
-        const result = await getContractMarketKlinesMetadata({
+        const result = await getContractMarketKlinesMetadataInFlight({
           symbol: requestSymbol,
           interval,
           limit,
