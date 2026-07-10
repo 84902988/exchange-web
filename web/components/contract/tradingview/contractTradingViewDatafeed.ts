@@ -124,10 +124,26 @@ type CreateContractTradingViewDatafeedOptions = {
   pricePrecision?: number | null;
   amountPrecision?: number | null;
   onLatestBar?: (close: string | null) => void;
+  onHistoryBars?: (event: ContractHistoryBarsEvent) => void;
+  onHistoryError?: (event: ContractHistoryErrorEvent) => void;
+};
+
+export type ContractHistoryBarsEvent = {
+  symbol: string;
+  interval: string;
+  resolution: string;
+  firstDataRequest: boolean;
+  barCount: number;
+  requestSeq: number;
+};
+
+export type ContractHistoryErrorEvent = Omit<ContractHistoryBarsEvent, 'barCount'> & {
+  error: string;
 };
 
 type SubscriptionEntry = {
   latestBarKey: string;
+  lastEmittedBarTime: number;
   unsubscribe: () => void;
 };
 
@@ -312,6 +328,26 @@ function buildLatestBarKey(symbol: string, interval: string) {
   return `${normalizeContractSymbol(symbol)}:${normalizeContractInterval(interval)}`;
 }
 
+const CONTRACT_KLINE_HIGH_WATER_MARK_CAPACITY = 128;
+const contractKlineHighWaterMarks = new Map<string, number>();
+
+function getContractKlineHighWaterMark(key: string) {
+  return contractKlineHighWaterMarks.get(key) || 0;
+}
+
+function advanceContractKlineHighWaterMark(key: string, time: number) {
+  if (!Number.isFinite(time) || time <= 0) return getContractKlineHighWaterMark(key);
+  const nextTime = Math.max(getContractKlineHighWaterMark(key), time);
+  contractKlineHighWaterMarks.delete(key);
+  contractKlineHighWaterMarks.set(key, nextTime);
+  while (contractKlineHighWaterMarks.size > CONTRACT_KLINE_HIGH_WATER_MARK_CAPACITY) {
+    const oldestKey = contractKlineHighWaterMarks.keys().next().value;
+    if (!oldestKey) break;
+    contractKlineHighWaterMarks.delete(oldestKey);
+  }
+  return nextTime;
+}
+
 type ContractKlineRequestToken = {
   sequence: number;
   key: string;
@@ -419,6 +455,8 @@ export function createContractTradingViewDatafeed({
   pricePrecision,
   amountPrecision,
   onLatestBar,
+  onHistoryBars,
+  onHistoryError,
 }: CreateContractTradingViewDatafeedOptions): ContractTradingViewDatafeed {
   const apiSymbol = normalizeContractSymbol(symbol);
   const displayName = displaySymbol || apiSymbol;
@@ -428,6 +466,22 @@ export function createContractTradingViewDatafeed({
 
   const notifyLatestBar = (bar: ContractTradingViewBar | null) => {
     onLatestBar?.(bar ? String(bar.close) : null);
+  };
+
+  const notifyHistoryBars = (event: ContractHistoryBarsEvent) => {
+    try {
+      onHistoryBars?.(event);
+    } catch {
+      // Observability callbacks must not change TradingView callback semantics.
+    }
+  };
+
+  const notifyHistoryError = (event: ContractHistoryErrorEvent) => {
+    try {
+      onHistoryError?.(event);
+    } catch {
+      // Observability callbacks must not change TradingView callback semantics.
+    }
   };
 
   return {
@@ -467,6 +521,7 @@ export function createContractTradingViewDatafeed({
 
     async getBars(symbolInfo, resolution, periodParams, onHistory, onError) {
       const requestSymbol = normalizeContractSymbol(symbolInfo.ticker || apiSymbol) || apiSymbol;
+      const requestResolution = normalizeResolution(resolution);
       const interval = tradingViewResolutionToContractInterval(resolution);
       const requestToken = requestGuard.begin(requestSymbol, interval, () => {
         onHistory([], { noData: false });
@@ -492,16 +547,37 @@ export function createContractTradingViewDatafeed({
         }
 
         requestGuard.complete(requestToken, () => {
+          const latestResponseBar = allBars[allBars.length - 1] || null;
           const latestBar = bars[bars.length - 1] || allBars[allBars.length - 1] || null;
+          if (latestResponseBar) {
+            advanceContractKlineHighWaterMark(latestBarKey, latestResponseBar.time);
+          }
           if (latestBar) {
             latestBars.set(latestBarKey, latestBar);
           }
           notifyLatestBar(latestBar);
+          notifyHistoryBars({
+            symbol: requestSymbol,
+            interval,
+            resolution: requestResolution,
+            firstDataRequest: periodParams.firstDataRequest === true,
+            barCount: bars.length,
+            requestSeq: requestToken.sequence,
+          });
           onHistory(bars, { noData: bars.length === 0 });
         });
       } catch {
         requestGuard.complete(requestToken, () => {
-          onError('Failed to load contract kline');
+          const error = 'Failed to load contract kline';
+          notifyHistoryError({
+            symbol: requestSymbol,
+            interval,
+            resolution: requestResolution,
+            firstDataRequest: periodParams.firstDataRequest === true,
+            requestSeq: requestToken.sequence,
+            error,
+          });
+          onError(error);
         });
       }
     },
@@ -510,21 +586,33 @@ export function createContractTradingViewDatafeed({
       const subscriptionSymbol = normalizeContractSymbol(symbolInfo.ticker || apiSymbol) || apiSymbol;
       const interval = tradingViewResolutionToContractInterval(resolution);
       const latestBarKey = buildLatestBarKey(subscriptionSymbol, interval);
-      contractMarketRealtime.setSession({ symbol: subscriptionSymbol, interval });
+      const subscription: SubscriptionEntry = {
+        latestBarKey,
+        lastEmittedBarTime: 0,
+        unsubscribe: () => undefined,
+      };
 
       const unsubscribe = contractMarketRealtime.subscribe('kline', (message) => {
         const nextBar = realtimeMessageToBar(message, subscriptionSymbol, interval);
         if (!nextBar) return;
 
         const previousBar = latestBars.get(latestBarKey);
-        if (previousBar && nextBar.time < previousBar.time) return;
+        const effectiveHighWaterMark = Math.max(
+          getContractKlineHighWaterMark(latestBarKey),
+          previousBar?.time || 0,
+          subscription.lastEmittedBarTime,
+        );
+        if (nextBar.time < effectiveHighWaterMark) return;
 
+        advanceContractKlineHighWaterMark(latestBarKey, nextBar.time);
+        subscription.lastEmittedBarTime = Math.max(subscription.lastEmittedBarTime, nextBar.time);
         latestBars.set(latestBarKey, nextBar);
         notifyLatestBar(nextBar);
         onRealtime(nextBar);
       });
 
-      subscriptions.set(subscriberUid, { latestBarKey, unsubscribe });
+      subscription.unsubscribe = unsubscribe;
+      subscriptions.set(subscriberUid, subscription);
     },
 
     unsubscribeBars(subscriberUid) {

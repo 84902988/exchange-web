@@ -73,12 +73,25 @@ function loadTypeScriptModule(
 }
 
 let requestKlines: (params: KlineRequest) => Promise<any[]> = async () => [];
+const realtimeHandlers = new Set<(message: any) => void>();
+const realtimeSessionCalls: any[] = [];
+let realtimeDisconnectCalls = 0;
 const realtimeStub = {
-  setSession() {},
-  subscribe() {
-    return () => {};
+  setSession(session: unknown) {
+    realtimeSessionCalls.push(session);
+  },
+  subscribe(_event: string, handler: (message: any) => void) {
+    realtimeHandlers.add(handler);
+    return () => realtimeHandlers.delete(handler);
+  },
+  disconnect() {
+    realtimeDisconnectCalls += 1;
   },
 };
+
+function emitRealtime(message: any) {
+  realtimeHandlers.forEach((handler) => handler(message));
+}
 
 const datafeedModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractTradingViewDatafeed.ts', import.meta.url)),
@@ -106,6 +119,16 @@ const row = (openTime: number, close: string) => ({
   low: close,
   close,
   volume: '1',
+});
+
+const realtimeCandle = (symbol: string, interval: string, openTime: number, close: string) => ({
+  type: 'contract_kline_update',
+  symbol,
+  interval,
+  kline: {
+    ...row(openTime, close),
+    source: 'LIVE_WS',
+  },
 });
 
 
@@ -177,11 +200,13 @@ test('provider realtime candles are accepted while quote-derived sources are rej
 test('normal current request calls onHistory exactly once and never calls onError', async () => {
   requestKlines = async () => [row(1_717_000_000_000, '101')];
   const historyCalls: HistoryCall[] = [];
+  const historyEvents: any[] = [];
   let errorCalls = 0;
   const latest: Array<string | null> = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({
     symbol: 'BTCUSDT_PERP',
     onLatestBar: (close: string | null) => latest.push(close),
+    onHistoryBars: (event: unknown) => historyEvents.push(event),
   });
 
   await datafeed.getBars(
@@ -197,6 +222,14 @@ test('normal current request calls onHistory exactly once and never calls onErro
   assert.equal(historyCalls[0].meta.noData, false);
   assert.equal(errorCalls, 0);
   assert.deepEqual(latest, ['101']);
+  assert.deepEqual(historyEvents, [{
+    symbol: 'BTCUSDT_PERP',
+    interval: '1m',
+    resolution: '1',
+    firstDataRequest: true,
+    barCount: 1,
+    requestSeq: 1,
+  }]);
 });
 
 
@@ -206,7 +239,11 @@ test('normal failed request calls onError exactly once and never calls onHistory
   };
   let historyCalls = 0;
   const errors: string[] = [];
-  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'BTCUSDT_PERP' });
+  const historyErrors: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'BTCUSDT_PERP',
+    onHistoryError: (event: unknown) => historyErrors.push(event),
+  });
 
   await datafeed.getBars(
     symbolInfo('BTCUSDT_PERP'),
@@ -218,6 +255,14 @@ test('normal failed request calls onError exactly once and never calls onHistory
 
   assert.equal(historyCalls, 0);
   assert.deepEqual(errors, ['Failed to load contract kline']);
+  assert.deepEqual(historyErrors, [{
+    symbol: 'BTCUSDT_PERP',
+    interval: '1m',
+    resolution: '1',
+    firstDataRequest: true,
+    requestSeq: 1,
+    error: 'Failed to load contract kline',
+  }]);
 });
 
 
@@ -233,9 +278,11 @@ test('same-interval newer request supersedes the older response exactly once', a
   const newHistoryCalls: HistoryCall[] = [];
   let oldErrorCalls = 0;
   let newErrorCalls = 0;
+  const historyEvents: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({
     symbol: 'BTCUSDT_PERP',
     onLatestBar: (close: string | null) => latest.push(close),
+    onHistoryBars: (event: unknown) => historyEvents.push(event),
   });
 
   const oldRequest = datafeed.getBars(
@@ -260,6 +307,7 @@ test('same-interval newer request supersedes the older response exactly once', a
   assert.equal(oldHistoryCalls[0].meta.noData, false);
   assert.equal(oldErrorCalls, 0);
   assert.deepEqual(latest, []);
+  assert.equal(historyEvents.length, 0, 'superseded empty settle is not a history completion event');
 
   pending[0].resolve([row(1_717_000_000_000, '101')]);
   await oldRequest;
@@ -273,6 +321,9 @@ test('same-interval newer request supersedes the older response exactly once', a
   assert.equal(oldErrorCalls, 0);
   assert.equal(newErrorCalls, 0);
   assert.deepEqual(latest, ['102']);
+  assert.equal(historyEvents.length, 1);
+  assert.equal(historyEvents[0].requestSeq, 2);
+  assert.equal(historyEvents[0].barCount, 1);
 });
 
 
@@ -395,10 +446,14 @@ test('destroyed datafeed cancels scheduled stale settlement and ignores late res
   };
   let historyCalls = 0;
   let errorCalls = 0;
+  const historyEvents: any[] = [];
+  const historyErrors: any[] = [];
   const latest: Array<string | null> = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({
     symbol: 'BTCUSDT_PERP',
     onLatestBar: (close: string | null) => latest.push(close),
+    onHistoryBars: (event: unknown) => historyEvents.push(event),
+    onHistoryError: (event: unknown) => historyErrors.push(event),
   });
 
   const oldRequest = datafeed.getBars(
@@ -424,6 +479,151 @@ test('destroyed datafeed cancels scheduled stale settlement and ignores late res
   assert.equal(historyCalls, 0);
   assert.equal(errorCalls, 0);
   assert.deepEqual(latest, []);
+  assert.deepEqual(historyEvents, []);
+  assert.deepEqual(historyErrors, []);
+});
+
+
+test('REST high-water mark rejects older realtime bars and accepts equal or newer candles', async () => {
+  const restTime = Date.parse('2026-07-10T08:02:00.000Z');
+  requestKlines = async () => [row(restTime, '1.14411')];
+  const latest: Array<string | null> = [];
+  const realtimeBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'EURUSD_MONO_PERP',
+    onLatestBar: (close: string | null) => latest.push(close),
+  });
+
+  await datafeed.getBars(
+    symbolInfo('EURUSD_MONO_PERP'),
+    '1',
+    period,
+    () => undefined,
+    assert.fail,
+  );
+  datafeed.subscribeBars(
+    symbolInfo('EURUSD_MONO_PERP'),
+    '1',
+    (bar: any) => realtimeBars.push(bar),
+    'mono-subscription',
+  );
+
+  emitRealtime(realtimeCandle('EURUSD_MONO_PERP', '1m', restTime - 60_000, '1.14393'));
+  assert.equal(realtimeBars.length, 0);
+  assert.deepEqual(latest, ['1.14411']);
+
+  emitRealtime(realtimeCandle('EURUSD_MONO_PERP', '1m', restTime, '1.14412'));
+  emitRealtime(realtimeCandle('EURUSD_MONO_PERP', '1m', restTime + 60_000, '1.14420'));
+  emitRealtime(realtimeCandle('EURUSD_MONO_PERP', '1m', restTime, '1.14400'));
+
+  assert.deepEqual(realtimeBars.map((bar) => bar.time), [restTime, restTime + 60_000]);
+  assert.deepEqual(latest, ['1.14411', '1.14412', '1.1442']);
+  datafeed.destroy();
+});
+
+
+test('module high-water mark survives datafeed destroy and rebuild', async () => {
+  const restTime = Date.parse('2026-07-10T08:02:00.000Z');
+  requestKlines = async () => [row(restTime, '200')];
+  const first = datafeedModule.createContractTradingViewDatafeed({ symbol: 'REBUILD_MONO_PERP' });
+  await first.getBars(
+    symbolInfo('REBUILD_MONO_PERP'),
+    '1',
+    period,
+    () => undefined,
+    assert.fail,
+  );
+  first.destroy();
+
+  const rebuiltRealtime: any[] = [];
+  const rebuiltLatest: Array<string | null> = [];
+  const rebuilt = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'REBUILD_MONO_PERP',
+    onLatestBar: (close: string | null) => rebuiltLatest.push(close),
+  });
+  rebuilt.subscribeBars(
+    symbolInfo('REBUILD_MONO_PERP'),
+    '1',
+    (bar: any) => rebuiltRealtime.push(bar),
+    'rebuilt-subscription',
+  );
+  emitRealtime(realtimeCandle('REBUILD_MONO_PERP', '1m', restTime - 60_000, '199'));
+
+  assert.deepEqual(rebuiltRealtime, []);
+  assert.deepEqual(rebuiltLatest, []);
+  rebuilt.destroy();
+});
+
+
+test('high-water marks isolate symbol and interval while preserving 1M case', async () => {
+  const highTime = Date.parse('2026-07-10T08:02:00.000Z');
+  const lowerTime = highTime - 60_000;
+  requestKlines = async () => [row(highTime, '300')];
+  const seeded = datafeedModule.createContractTradingViewDatafeed({ symbol: 'ISOLATION_A_PERP' });
+  await seeded.getBars(
+    symbolInfo('ISOLATION_A_PERP'),
+    '1',
+    period,
+    () => undefined,
+    assert.fail,
+  );
+
+  const otherSymbolBars: any[] = [];
+  const fiveMinuteBars: any[] = [];
+  const monthlyBars: any[] = [];
+  const otherSymbol = datafeedModule.createContractTradingViewDatafeed({ symbol: 'ISOLATION_B_PERP' });
+  otherSymbol.subscribeBars(
+    symbolInfo('ISOLATION_B_PERP'),
+    '1',
+    (bar: any) => otherSymbolBars.push(bar),
+    'other-symbol',
+  );
+  seeded.subscribeBars(
+    symbolInfo('ISOLATION_A_PERP'),
+    '5',
+    (bar: any) => fiveMinuteBars.push(bar),
+    'five-minute',
+  );
+  seeded.subscribeBars(
+    symbolInfo('ISOLATION_A_PERP'),
+    '1M',
+    (bar: any) => monthlyBars.push(bar),
+    'monthly',
+  );
+
+  emitRealtime(realtimeCandle('ISOLATION_B_PERP', '1m', lowerTime, '301'));
+  emitRealtime(realtimeCandle('ISOLATION_A_PERP', '5m', lowerTime, '302'));
+  emitRealtime(realtimeCandle('ISOLATION_A_PERP', '1M', lowerTime, '303'));
+
+  assert.deepEqual(otherSymbolBars.map((bar) => bar.time), [lowerTime]);
+  assert.deepEqual(fiveMinuteBars.map((bar) => bar.time), [lowerTime]);
+  assert.deepEqual(monthlyBars.map((bar) => bar.time), [lowerTime]);
+  otherSymbol.destroy();
+  seeded.destroy();
+});
+
+
+test('datafeed subscribers never take ownership of the public realtime session', () => {
+  realtimeSessionCalls.length = 0;
+  realtimeDisconnectCalls = 0;
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'SESSION_OWNER_PERP' });
+
+  datafeed.subscribeBars(
+    symbolInfo('SESSION_OWNER_PERP'),
+    '5',
+    () => undefined,
+    'old-five-minute-subscriber',
+  );
+  datafeed.subscribeBars(
+    symbolInfo('SESSION_OWNER_PERP'),
+    '1D',
+    () => undefined,
+    'new-daily-subscriber',
+  );
+  datafeed.destroy();
+
+  assert.deepEqual(realtimeSessionCalls, []);
+  assert.equal(realtimeDisconnectCalls, 0);
 });
 
 

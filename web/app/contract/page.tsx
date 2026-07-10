@@ -32,6 +32,7 @@ import type { SpotMarketPairItem } from '@/lib/api/modules/spot';
 import { isMockStockContractSymbol, toStockContractSymbol } from '@/lib/stockContracts';
 
 type RightPanelTab = 'orderbook' | 'trades';
+type ContractChartMode = 'time' | 'candle';
 type ContractUrlCategory = 'usdt' | 'stock' | 'cfd' | '';
 type ContractDataScope = 'current' | 'all';
 type ContractTranslator = (key: string, namespace?: 'contracts' | 'markets') => string;
@@ -359,6 +360,7 @@ function ContractPageContent() {
   const { isLoggedIn, loading: authLoading } = useAuth();
   const [contractSymbol, setContractSymbol] = useState(() => initialContractSymbol);
   const [interval, setIntervalValue] = useState('1m');
+  const [chartMode, setChartMode] = useState<ContractChartMode>('candle');
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
   const [contractDataScope, setContractDataScope] = useState<ContractDataScope>('current');
   const [contractUserTab, setContractUserTab] = useState<ContractPositionTabKey>('positions');
@@ -392,6 +394,7 @@ function ContractPageContent() {
     () => (isTradfiContractPair(currentContractPair) ? CONTRACT_TRADFI_INTERVAL_OPTIONS : CONTRACT_INTERVAL_OPTIONS),
     [currentContractPair],
   );
+  const effectiveKlineInterval = chartMode === 'time' ? '1m' : interval;
   const maxLeverage = currentContractPair?.maxLeverage || 200;
   const {
     marketSymbol,
@@ -442,7 +445,7 @@ function ContractPageContent() {
     handleLatestKlineCloseChange,
   } = useContractMarketView({
     contractSymbol,
-    interval,
+    interval: effectiveKlineInterval,
     symbolOptionMarketSymbol: symbolOption?.marketSymbol,
     symbolOptionPricePrecision: currentContractPair?.pricePrecision ?? symbolOption?.pricePrecision,
     fallbackMarketStatus: contractTicker?.market_status || currentContractPair?.marketStatus,
@@ -610,6 +613,11 @@ function ContractPageContent() {
     if (query.marketType === 'spot') return;
   }, []);
 
+  const handleContractIntervalChange = useCallback((nextInterval: string) => {
+    setChartMode('candle');
+    setIntervalValue(nextInterval);
+  }, []);
+
   useEffect(() => {
     setSelectedPrice(null);
   }, [contractSymbol]);
@@ -743,7 +751,7 @@ function ContractPageContent() {
               pairsLoading={contractPairsLoading}
               onPairQueryChange={handleToolbarPairQueryChange}
               onSymbolChange={(nextSymbol) => selectContractSymbol(nextSymbol)}
-              onIntervalChange={setIntervalValue}
+              onIntervalChange={handleContractIntervalChange}
             />
           )}
         />
@@ -772,8 +780,10 @@ function ContractPageContent() {
                       symbol={contractSymbol}
                       displaySymbol={currentContractPair?.displaySymbol || marketSymbol}
                       interval={interval}
+                      chartMode={chartMode}
                       intervalOptions={contractChartIntervalOptions}
-                      onIntervalChange={setIntervalValue}
+                      onChartModeChange={setChartMode}
+                      onIntervalChange={handleContractIntervalChange}
                       pricePrecision={pricePrecision}
                       amountPrecision={currentContractPair?.amountPrecision}
                       onLatestKlineCloseChange={handleLatestKlineCloseChange}
