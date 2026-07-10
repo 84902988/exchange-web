@@ -1,7 +1,7 @@
 'use client';
 
 import {
-  getContractMarketKlines,
+  getContractMarketKlinesMetadata,
   type ContractMarketKlineItem,
 } from '@/lib/api/modules/contract';
 import {
@@ -314,6 +314,19 @@ export function resolveContractHistoryEndTimeMs(periodParams: TradingViewPeriodP
   return Math.floor(to * 1000);
 }
 
+export function shouldReportContractHistoryNoData(result: unknown) {
+  const record = toRecord(result);
+  return Boolean(
+    record
+    && Array.isArray(record.items)
+    && record.items.length === 0
+    && record.history_complete === true
+    && record.has_more_before === false
+    && record.history_incomplete === false
+    && record.retryable === false
+  );
+}
+
 function sortAndDedupeBars(bars: ContractTradingViewBar[]) {
   const byTime = new Map<number, ContractTradingViewBar>();
   bars.forEach((bar) => {
@@ -456,7 +469,6 @@ export function createContractTradingViewDatafeed({
   amountPrecision,
   onLatestBar,
   onHistoryBars,
-  onHistoryError,
 }: CreateContractTradingViewDatafeedOptions): ContractTradingViewDatafeed {
   const apiSymbol = normalizeContractSymbol(symbol);
   const displayName = displaySymbol || apiSymbol;
@@ -471,14 +483,6 @@ export function createContractTradingViewDatafeed({
   const notifyHistoryBars = (event: ContractHistoryBarsEvent) => {
     try {
       onHistoryBars?.(event);
-    } catch {
-      // Observability callbacks must not change TradingView callback semantics.
-    }
-  };
-
-  const notifyHistoryError = (event: ContractHistoryErrorEvent) => {
-    try {
-      onHistoryError?.(event);
     } catch {
       // Observability callbacks must not change TradingView callback semantics.
     }
@@ -519,7 +523,7 @@ export function createContractTradingViewDatafeed({
       }));
     },
 
-    async getBars(symbolInfo, resolution, periodParams, onHistory, onError) {
+    async getBars(symbolInfo, resolution, periodParams, onHistory) {
       const requestSymbol = normalizeContractSymbol(symbolInfo.ticker || apiSymbol) || apiSymbol;
       const requestResolution = normalizeResolution(resolution);
       const interval = tradingViewResolutionToContractInterval(resolution);
@@ -531,13 +535,14 @@ export function createContractTradingViewDatafeed({
       const endTimeMs = resolveContractHistoryEndTimeMs(periodParams);
 
       try {
-        const response = await getContractMarketKlines({
+        const result = await getContractMarketKlinesMetadata({
           symbol: requestSymbol,
           interval,
           limit,
           endTimeMs,
         });
-        const allBars = sortAndDedupeBars(response.map(klineToBar).filter((bar): bar is ContractTradingViewBar => Boolean(bar)));
+        const responseItems = Array.isArray(result?.items) ? result.items : [];
+        const allBars = sortAndDedupeBars(responseItems.map(klineToBar).filter((bar): bar is ContractTradingViewBar => Boolean(bar)));
         const fromMs = Number.isFinite(periodParams.from) ? Math.floor(periodParams.from * 1000) : 0;
         const toMs = Number.isFinite(periodParams.to) ? Math.floor(periodParams.to * 1000) : Number.MAX_SAFE_INTEGER;
         let bars = allBars.filter((bar) => bar.time >= fromMs && bar.time <= toMs);
@@ -564,20 +569,19 @@ export function createContractTradingViewDatafeed({
             barCount: bars.length,
             requestSeq: requestToken.sequence,
           });
-          onHistory(bars, { noData: bars.length === 0 });
+          onHistory(bars, { noData: shouldReportContractHistoryNoData(result) });
         });
       } catch {
         requestGuard.complete(requestToken, () => {
-          const error = 'Failed to load contract kline';
-          notifyHistoryError({
+          notifyHistoryBars({
             symbol: requestSymbol,
             interval,
             resolution: requestResolution,
             firstDataRequest: periodParams.firstDataRequest === true,
+            barCount: 0,
             requestSeq: requestToken.sequence,
-            error,
           });
-          onError(error);
+          onHistory([], { noData: false });
         });
       }
     },
