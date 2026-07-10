@@ -91,8 +91,8 @@ def _load_contract_market_service_module():
     )
     _module(
         "app.services.market_kline_cache",
+        KLINE_CACHE_POLICY_GAP_TOLERANT="gap_tolerant",
         get_klines_cache_first=lambda *_args, **_kwargs: [],
-        upsert_klines=lambda *_args, **_kwargs: 0,
     )
     _module(
         "app.services.contract_market_provider_service",
@@ -375,36 +375,54 @@ def test_tradfi_process_cache_path_preserves_cache_metadata():
     assert rows.provider_error_code is None
 
 
-def test_index_direct_path_preserves_provider_and_unknown_empty_metadata():
+def test_index_cache_first_path_preserves_metadata_and_skips_process_cache_write():
     service = _load_contract_market_service_module()
     contract_symbol = _itick_contract_symbol(category="INDEX")
-    payloads = [
+    provider_rows = [
         {
-            "data": [
-                {
-                    "t": 1_700_000_000_000,
-                    "o": "100",
-                    "h": "110",
-                    "l": "90",
-                    "c": "105",
-                    "v": "5",
-                }
-            ]
-        },
-        {"data": []},
+            "open_time": 1_700_000_000_000,
+            "open": "100",
+            "high": "110",
+            "low": "90",
+            "close": "105",
+            "volume": "5",
+        }
     ]
+    cache_calls = []
     service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
     service._contract_provider_symbol = lambda *_args, **_kwargs: "US30"
     service._is_stock_contract_config = lambda *_args, **_kwargs: False
-    service._itick_market_for_contract = lambda *_args, **_kwargs: "indices"
-    service._itick_region_for_contract = lambda *_args, **_kwargs: "US"
-    service._cache_contract_klines = lambda *_args, **_kwargs: None
-    service.upsert_klines = lambda *_args, **_kwargs: 0
-    service.itick_market_service = SimpleNamespace(
-        get_market_kline=lambda *_args, **_kwargs: payloads.pop(0),
+    service._cache_contract_klines = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("Index must not write the unread process cache")
     )
 
+    def cache_first(_db, **kwargs):
+        cache_calls.append(kwargs)
+        assert kwargs["cache_policy"] == "gap_tolerant"
+        assert kwargs["source"] == "ITICK"
+        if kwargs["end_time_ms"] is None:
+            return _SharedKlineCacheResult(
+                provider_rows,
+                origin="REST_FETCH" if len(cache_calls) == 1 else "DB_CACHE",
+                cache_status="MISS" if len(cache_calls) == 1 else "HIT",
+            )
+        return _SharedKlineCacheResult(
+            [],
+            origin="EMPTY",
+            cache_status="PROVIDER_EMPTY",
+            history_incomplete=True,
+            provider_error_code="EMPTY",
+        )
+
+    service.get_klines_cache_first = cache_first
+
     current_rows = service.get_contract_klines(
+        object(),
+        "US30_PERP",
+        interval="1m",
+        limit=50,
+    )
+    cached_current_rows = service.get_contract_klines(
         object(),
         "US30_PERP",
         interval="1m",
@@ -421,12 +439,39 @@ def test_index_direct_path_preserves_provider_and_unknown_empty_metadata():
     assert current_rows.origin == "REST_FETCH"
     assert current_rows.cache_status == "MISS"
     assert len(current_rows) == 1
+    assert cached_current_rows.origin == "DB_CACHE"
+    assert cached_current_rows.cache_status == "HIT"
     assert history_rows == []
     assert history_rows.origin == "EMPTY"
     assert history_rows.cache_status == "PROVIDER_EMPTY"
     assert history_rows.provider_error_code == "EMPTY"
     assert history_rows.history_incomplete is True
     assert history_rows.retryable is True
+    assert [call["end_time_ms"] for call in cache_calls] == [None, None, 1_700_000_060_000]
+
+
+def test_index_unsupported_interval_does_not_write_process_cache():
+    service = _load_contract_market_service_module()
+    service._load_contract_symbol = lambda *_args, **_kwargs: _itick_contract_symbol(category="INDEX")
+    service._contract_provider_symbol = lambda *_args, **_kwargs: "US30"
+    service._is_stock_contract_config = lambda *_args, **_kwargs: False
+    service._cache_contract_klines = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("Index unsupported interval must not write the unread process cache")
+    )
+    service.get_klines_cache_first = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("unsupported interval must not enter cache-first fetch")
+    )
+
+    rows = service.get_contract_klines(
+        object(),
+        "US30_PERP",
+        interval="4h",
+        limit=50,
+    )
+
+    assert rows == []
+    assert rows.cache_status == "UNSUPPORTED_INTERVAL"
+    assert rows.retryable is False
 
 
 if __name__ == "__main__":
@@ -438,7 +483,8 @@ if __name__ == "__main__":
         test_okx_latest_rows_are_not_misreported_as_history_success,
         test_contract_history_db_cache_hit_does_not_call_provider,
         test_tradfi_process_cache_path_preserves_cache_metadata,
-        test_index_direct_path_preserves_provider_and_unknown_empty_metadata,
+        test_index_cache_first_path_preserves_metadata_and_skips_process_cache_write,
+        test_index_unsupported_interval_does_not_write_process_cache,
     ]
     for test in tests:
         test()
