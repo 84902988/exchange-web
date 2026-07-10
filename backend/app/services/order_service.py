@@ -174,13 +174,68 @@ def _dealer_trade_snapshot_values(snapshot: Optional[DealerPriceSnapshot]) -> di
             "dealer_price_source": None,
             "dealer_spread_bps": None,
         }
+    execution_snapshot = snapshot.execution_snapshot
     return {
         "dealer_ref_price": snapshot.ref_price,
-        "dealer_best_bid": snapshot.best_bid,
-        "dealer_best_ask": snapshot.best_ask,
-        "dealer_price_source": snapshot.price_source,
+        "dealer_best_bid": (
+            execution_snapshot.best_bid if execution_snapshot is not None else snapshot.best_bid
+        ),
+        "dealer_best_ask": (
+            execution_snapshot.best_ask if execution_snapshot is not None else snapshot.best_ask
+        ),
+        "dealer_price_source": (
+            execution_snapshot.source if execution_snapshot is not None else snapshot.price_source
+        ),
         "dealer_spread_bps": snapshot.spread_bps,
     }
+
+
+def apply_spot_execution_evidence(
+    trade: Trade,
+    snapshot: Optional[SpotExecutionSnapshot],
+) -> Trade:
+    if snapshot is None:
+        return trade
+    trade.dealer_provider = snapshot.provider
+    trade.dealer_provider_symbol = snapshot.provider_symbol
+    trade.dealer_event_time_ms = snapshot.event_time_ms
+    trade.dealer_received_at_ms = snapshot.received_at_ms
+    trade.dealer_freshness = snapshot.freshness
+    trade.dealer_snapshot_id = snapshot.snapshot_id
+    trade.dealer_provider_generation = snapshot.provider_generation
+    trade.dealer_snapshot_max_age_ms = snapshot.max_age_ms
+    return trade
+
+
+def _build_dealer_trade(
+    *,
+    pair: TradingPair,
+    order: Order,
+    execution_price: Decimal,
+    amount: Decimal,
+    quote_amount: Decimal,
+    dealer_snapshot: Optional[DealerPriceSnapshot],
+) -> Trade:
+    buyer_user_id = order.user_id if order.side == "BUY" else PLATFORM_USER_ID
+    seller_user_id = PLATFORM_USER_ID if order.side == "BUY" else order.user_id
+    trade = Trade(
+        trading_pair_id=pair.id,
+        buy_order_id=order.id,
+        sell_order_id=order.id,
+        buyer_user_id=buyer_user_id,
+        seller_user_id=seller_user_id,
+        price=execution_price,
+        amount=amount,
+        quote_amount=quote_amount,
+        maker_order_id=order.id,
+        taker_order_id=order.id,
+        counterparty_type="PLATFORM",
+        **_dealer_trade_snapshot_values(dealer_snapshot),
+    )
+    return apply_spot_execution_evidence(
+        trade,
+        dealer_snapshot.execution_snapshot if dealer_snapshot is not None else None,
+    )
 
 
 def _get_dealer_market_context(
@@ -701,19 +756,13 @@ def _fill_dealer_limit_order(
                 detail="dealer buy settlement produced negative balances",
             )
 
-        trade = Trade(
-            trading_pair_id=pair.id,
-            buy_order_id=order.id,
-            sell_order_id=order.id,
-            buyer_user_id=order.user_id,
-            seller_user_id=PLATFORM_USER_ID,
-            price=execution_price,
+        trade = _build_dealer_trade(
+            pair=pair,
+            order=order,
+            execution_price=execution_price,
             amount=amount,
             quote_amount=quote_amount,
-            maker_order_id=order.id,
-            taker_order_id=order.id,
-            counterparty_type="PLATFORM",
-            **_dealer_trade_snapshot_values(dealer_snapshot),
+            dealer_snapshot=dealer_snapshot,
         )
 
         _update_order_after_buy_trade(
@@ -796,19 +845,13 @@ def _fill_dealer_limit_order(
                 detail="dealer sell settlement produced negative balances",
             )
 
-        trade = Trade(
-            trading_pair_id=pair.id,
-            buy_order_id=order.id,
-            sell_order_id=order.id,
-            buyer_user_id=PLATFORM_USER_ID,
-            seller_user_id=order.user_id,
-            price=execution_price,
+        trade = _build_dealer_trade(
+            pair=pair,
+            order=order,
+            execution_price=execution_price,
             amount=amount,
             quote_amount=quote_amount,
-            maker_order_id=order.id,
-            taker_order_id=order.id,
-            counterparty_type="PLATFORM",
-            **_dealer_trade_snapshot_values(dealer_snapshot),
+            dealer_snapshot=dealer_snapshot,
         )
 
         _update_order_after_sell_trade(
@@ -2111,19 +2154,13 @@ def _create_dealer_market_order(
         db.add(order)
         db.flush()
 
-        trade = Trade(
-            trading_pair_id=pair.id,
-            buy_order_id=order.id,
-            sell_order_id=order.id,
-            buyer_user_id=order.user_id,
-            seller_user_id=PLATFORM_USER_ID,
-            price=execution_price,
+        trade = _build_dealer_trade(
+            pair=pair,
+            order=order,
+            execution_price=execution_price,
             amount=base_amount,
             quote_amount=quote_amount,
-            maker_order_id=order.id,
-            taker_order_id=order.id,
-            counterparty_type="PLATFORM",
-            **_dealer_trade_snapshot_values(dealer_snapshot),
+            dealer_snapshot=dealer_snapshot,
         )
     else:
         if payload.amount is None:
@@ -2269,19 +2306,13 @@ def _create_dealer_market_order(
         db.add(order)
         db.flush()
 
-        trade = Trade(
-            trading_pair_id=pair.id,
-            buy_order_id=order.id,
-            sell_order_id=order.id,
-            buyer_user_id=PLATFORM_USER_ID,
-            seller_user_id=order.user_id,
-            price=execution_price,
+        trade = _build_dealer_trade(
+            pair=pair,
+            order=order,
+            execution_price=execution_price,
             amount=amount,
             quote_amount=quote_amount,
-            maker_order_id=order.id,
-            taker_order_id=order.id,
-            counterparty_type="PLATFORM",
-            **_dealer_trade_snapshot_values(dealer_snapshot),
+            dealer_snapshot=dealer_snapshot,
         )
 
     db.add(trade)

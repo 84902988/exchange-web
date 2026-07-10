@@ -57,6 +57,19 @@ class SpotTradeItem(BaseModel):
     fee_amount: Optional[str] = None
     fee_asset: Optional[str] = None
     fee_asset_symbol: Optional[str] = None
+    dealer_ref_price: Optional[str] = None
+    dealer_best_bid: Optional[str] = None
+    dealer_best_ask: Optional[str] = None
+    dealer_price_source: Optional[str] = None
+    dealer_spread_bps: Optional[str] = None
+    dealer_provider: Optional[str] = None
+    dealer_provider_symbol: Optional[str] = None
+    dealer_event_time_ms: Optional[int] = None
+    dealer_received_at_ms: Optional[int] = None
+    dealer_freshness: Optional[str] = None
+    dealer_snapshot_id: Optional[str] = None
+    dealer_provider_generation: Optional[int] = None
+    dealer_snapshot_max_age_ms: Optional[int] = None
     created_at: Optional[str] = None
 
 
