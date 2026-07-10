@@ -48,6 +48,7 @@ from app.services.spot_kline_bucket import (
     normalize_spot_kline_bucket_interval,
     okx_spot_open_time_validator,
 )
+from app.services.spot_kline_response import build_spot_kline_terminal_metadata
 from app.services.contract_market_provider_service import (
     MarketDataProviderConfig,
     MarketDataProviderError,
@@ -1726,6 +1727,7 @@ def _spot_kline_result_metadata(
         "history_incomplete": bool(result.history_incomplete),
         "provider_error_code": result.provider_error_code,
         "provider_error_provider": result.provider_error_provider,
+        **build_spot_kline_terminal_metadata(result, end_time_ms=end_time_ms),
     }
 
 
@@ -3745,6 +3747,9 @@ def get_klines(
             "freshness": freshness,
             "cache_status": result_metadata.get("cache_status"),
             "history_incomplete": result_metadata.get("history_incomplete"),
+            "history_terminal": result_metadata.get("history_terminal"),
+            "terminal_reason": result_metadata.get("terminal_reason"),
+            "earliest_available_time": result_metadata.get("earliest_available_time"),
             "provider_error_code": result_metadata.get("provider_error_code"),
             "provider_error_provider": result_metadata.get("provider_error_provider"),
         }
@@ -3790,6 +3795,9 @@ def get_klines(
             "stale": result_metadata["stale"],
             "cache_status": result_metadata.get("cache_status"),
             "history_incomplete": result_metadata.get("history_incomplete"),
+            "history_terminal": result_metadata.get("history_terminal"),
+            "terminal_reason": result_metadata.get("terminal_reason"),
+            "earliest_available_time": result_metadata.get("earliest_available_time"),
             "provider_error_code": result_metadata.get("provider_error_code"),
             "provider_error_provider": result_metadata.get("provider_error_provider"),
         }
@@ -3828,6 +3836,9 @@ def get_klines(
             "stale": result_metadata["stale"],
             "cache_status": result_metadata.get("cache_status"),
             "history_incomplete": result_metadata.get("history_incomplete"),
+            "history_terminal": result_metadata.get("history_terminal"),
+            "terminal_reason": result_metadata.get("terminal_reason"),
+            "earliest_available_time": result_metadata.get("earliest_available_time"),
             "provider_error_code": result_metadata.get("provider_error_code"),
             "provider_error_provider": result_metadata.get("provider_error_provider"),
         }
@@ -3839,6 +3850,9 @@ def get_klines(
             "items": [],
             "source": "INTERNAL",
             "freshness": "MISSING",
+            "history_terminal": False if end_time_ms is not None else None,
+            "terminal_reason": None,
+            "earliest_available_time": None,
         }
 
     def _fetch_internal_spot_klines(fetch_limit: int, fetch_end_time_ms: Optional[int]):
@@ -3889,6 +3903,9 @@ def get_klines(
         "stale": result_metadata["stale"],
         "cache_status": result_metadata.get("cache_status"),
         "history_incomplete": result_metadata.get("history_incomplete"),
+        "history_terminal": result_metadata.get("history_terminal"),
+        "terminal_reason": result_metadata.get("terminal_reason"),
+        "earliest_available_time": result_metadata.get("earliest_available_time"),
         "provider_error_code": result_metadata.get("provider_error_code"),
         "provider_error_provider": result_metadata.get("provider_error_provider"),
     }
