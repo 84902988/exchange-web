@@ -152,8 +152,15 @@ const datafeedModule = loadTypeScriptModule(
   },
 );
 
+const defaultCurrentCacheNow = currentCacheModule.contractKlineCurrentCache.now;
+
 test.beforeEach(() => {
   currentCacheModule.contractKlineCurrentCache.clear();
+  currentCacheModule.contractKlineCurrentCache.now = defaultCurrentCacheNow;
+});
+
+test.afterEach(() => {
+  currentCacheModule.contractKlineCurrentCache.now = defaultCurrentCacheNow;
 });
 
 const symbolInfo = (ticker: string) => ({ ticker });
@@ -592,6 +599,8 @@ test('concurrent identical current requests across datafeeds share one HTTP requ
 });
 
 test('different category namespaces share C1 HTTP and populate both L1 entries', async () => {
+  let now = 0;
+  currentCacheModule.contractKlineCurrentCache.now = () => now;
   const pending = deferred<KlineMetadata>();
   const apiCalls: KlineRequest[] = [];
   requestKlines = async (params) => {
@@ -646,10 +655,74 @@ test('different category namespaces share C1 HTTP and populate both L1 entries',
   await nextStock.getBars(symbolInfo(symbol), '1', period, () => undefined, assert.fail);
   assert.equal(apiCalls.length, 1, 'both category-specific L1 entries must be reusable');
 
+  now = 4_999;
+  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'CRYPTO', symbol, interval: '1m', limit: 100,
+  }));
+  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'STOCK', symbol, interval: '1m', limit: 100,
+  }));
+  now = 5_000;
+  assert.equal(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'CRYPTO', symbol, interval: '1m', limit: 100,
+  }), null);
+  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'STOCK', symbol, interval: '1m', limit: 100,
+  }));
+  now = 9_999;
+  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'STOCK', symbol, interval: '1m', limit: 100,
+  }));
+  now = 10_000;
+  assert.equal(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'STOCK', symbol, interval: '1m', limit: 100,
+  }), null);
+
   crypto.destroy();
   stock.destroy();
   nextCrypto.destroy();
   nextStock.destroy();
+});
+
+test('expired CRYPTO 1m current L1 entry refetches and writes a fresh five-second entry', async () => {
+  let now = 0;
+  currentCacheModule.contractKlineCurrentCache.now = () => now;
+  let apiCalls = 0;
+  requestKlines = async () => {
+    apiCalls += 1;
+    return metadata(pageEndingAt(1_717_050_000_000, 100, String(120 + apiCalls)));
+  };
+  const symbol = 'CRYPTO_TTL_REFRESH_PERP';
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol, category: 'CRYPTO' });
+  const request = async () => datafeed.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  await request();
+  assert.equal(apiCalls, 1);
+  now = 4_999;
+  await request();
+  assert.equal(apiCalls, 1);
+  now = 5_000;
+  await request();
+  assert.equal(apiCalls, 2);
+  assert.equal(historyCalls.length, 3);
+  assert.equal(historyCalls[2].bars.at(-1)?.close, 122);
+
+  now = 9_999;
+  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'CRYPTO', symbol, interval: '1m', limit: 100,
+  }));
+  now = 10_000;
+  assert.equal(currentCacheModule.contractKlineCurrentCache.get({
+    category: 'CRYPTO', symbol, interval: '1m', limit: 100,
+  }), null);
+  datafeed.destroy();
 });
 
 test('UNKNOWN to real category rebuild cancels old callbacks while sharing the same C1 request', async () => {
