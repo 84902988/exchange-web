@@ -2905,16 +2905,20 @@ def test_provider_switch_releases_old_ws_owner_and_ensures_new_provider() -> Non
     gateway = _new_authority_test_gateway()
     calls = []
     gateway._release_depth_accepts_provider = True
+    gateway._release_kline_accepts_provider = True
     gateway._ensure_depth_accepts_provider = True
     gateway._ensure_kline_accepts_provider = True
     gateway._release_depth = lambda symbol, provider: calls.append(("release", provider, symbol))
+    gateway._release_kline = lambda symbol, interval, provider: calls.append(
+        ("release_kline", provider, symbol, interval)
+    )
     gateway._ensure_depth = lambda symbol, provider: calls.append(("ensure_depth", provider, symbol))
     gateway._ensure_kline = lambda symbol, interval, provider: calls.append(
         ("ensure_kline", provider, symbol, interval)
     )
     gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
     gateway._symbol_providers["BTCUSDT"] = "OKX_SPOT"
-    gateway._ensured_kline_intervals["BTCUSDT"] = {"1m"}
+    gateway._ensured_kline_intervals["BTCUSDT"] = {"1Dutc", "1Wutc", "1Mutc"}
     assert gateway.commit_authoritative_depth(
         symbol="BTCUSDT",
         provider="BITGET_SPOT",
@@ -2930,7 +2934,32 @@ def test_provider_switch_releases_old_ws_owner_and_ensures_new_provider() -> Non
     asyncio.run(gateway._apply_pending_provider_switch("BTCUSDT"))
     assert ("release", "OKX_SPOT", "BTCUSDT") in calls
     assert ("ensure_depth", "BITGET_SPOT", "BTCUSDT") in calls
-    assert ("ensure_kline", "BITGET_SPOT", "BTCUSDT", "1m") in calls
+    for interval in ("1Dutc", "1Wutc", "1Mutc"):
+        assert ("release_kline", "OKX_SPOT", "BTCUSDT", interval) in calls
+        assert ("ensure_kline", "BITGET_SPOT", "BTCUSDT", interval) in calls
+    assert gateway.get_active_depth_provider("BTCUSDT") == ("BITGET_SPOT", 2)
+
+    calls.clear()
+    assert gateway.commit_authoritative_depth(
+        symbol="BTCUSDT",
+        provider="OKX_SPOT",
+        provider_symbol="BTC-USDT",
+        depth=_depth_response(ts=1400, provider="OKX_SPOT"),
+        event_time_ms=1400,
+        received_at_ms=1500,
+        freshness="RECENT",
+        source="REST",
+        allow_switch=True,
+        expected_provider="BITGET_SPOT",
+    ) is not None
+    asyncio.run(gateway._apply_pending_provider_switch("BTCUSDT"))
+    assert ("release", "BITGET_SPOT", "BTCUSDT") in calls
+    assert ("ensure_depth", "OKX_SPOT", "BTCUSDT") in calls
+    for interval in ("1Dutc", "1Wutc", "1Mutc"):
+        assert ("release_kline", "BITGET_SPOT", "BTCUSDT", interval) in calls
+        assert ("ensure_kline", "OKX_SPOT", "BTCUSDT", interval) in calls
+    assert gateway.get_active_depth_provider("BTCUSDT") == ("OKX_SPOT", 3)
+    assert gateway._ensured_kline_intervals["BTCUSDT"] == {"1Dutc", "1Wutc", "1Mutc"}
 
 
 def test_provider_switch_lifecycle_failure_keeps_rest_depth_public_and_retries() -> None:

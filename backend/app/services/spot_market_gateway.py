@@ -562,6 +562,17 @@ class SpotMarketGateway:
                 await asyncio.to_thread(self._release_depth, symbol, provider=previous_provider)
             else:
                 await asyncio.to_thread(self._release_depth, symbol)
+            for interval in sorted(self._ensured_kline_intervals.get(symbol, set())):
+                if self._release_kline_accepts_provider:
+                    await asyncio.to_thread(
+                        self._release_kline,
+                        symbol,
+                        interval,
+                        provider=previous_provider,
+                    )
+                else:
+                    await asyncio.to_thread(self._release_kline, symbol, interval)
+                self._clear_kline_interval_state(symbol, interval, provider=previous_provider)
             if self._ensure_depth_accepts_provider:
                 self._ensure_depth(symbol, provider=provider_code)
             else:

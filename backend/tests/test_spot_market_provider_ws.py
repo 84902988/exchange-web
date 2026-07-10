@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import threading
+from datetime import datetime, timezone
 
 from app.services import spot_market_domain_cache as domain_cache
 from app.services import spot_market_provider_ws as provider_ws
@@ -772,8 +773,186 @@ def test_bitget_kline_channel_mapping() -> None:
     assert provider_ws.bitget_spot_kline_channel("1h") == "candle1H"
     assert provider_ws.bitget_spot_kline_channel("4h") == "candle4H"
     assert provider_ws.bitget_spot_kline_channel("1d") == "candle1D"
+    assert provider_ws.bitget_spot_kline_channel("1Dutc") == "candle1Dutc"
     assert provider_ws.bitget_spot_kline_channel("1w") == "candle1W"
+    assert provider_ws.bitget_spot_kline_channel("1Wutc") == "candle1Wutc"
     assert provider_ws.bitget_spot_kline_channel("1M") == "candle1M"
+    assert provider_ws.bitget_spot_kline_channel("1Mutc") == "candle1Mutc"
+
+    for interval in ("1m", "5m", "15m", "1h", "4h", "1Dutc", "1Wutc", "1Mutc"):
+        assert provider_ws.spot_provider_ws_supports_kline_interval(
+            provider_ws.PROVIDER_BITGET_SPOT,
+            interval,
+        )
+
+
+def _assert_bitget_native_utc_kline_anchor(
+    *,
+    interval: str,
+    channel: str,
+    utc_anchor_ms: int,
+) -> datetime:
+    anchor = datetime.fromtimestamp(utc_anchor_ms / 1000, tz=timezone.utc)
+    record = provider_ws.normalize_bitget_kline_message(
+        {
+            "arg": {"instType": "SPOT", "channel": channel, "instId": "BTCUSDT"},
+            "action": "update",
+            "data": [
+                [
+                    str(utc_anchor_ms),
+                    "100",
+                    "110",
+                    "90",
+                    "105",
+                    "1",
+                    "105",
+                    "105",
+                ]
+            ],
+        },
+        local_symbol="BTCUSDT",
+        provider_symbol="BTCUSDT",
+        interval=interval,
+        kline_limit=10,
+    )
+    assert record is not None
+    assert record["interval"] == interval
+    assert record["items"][0]["open_time"] == utc_anchor_ms
+    return anchor
+
+
+def test_bitget_native_1dutc_anchor_is_utc_midnight() -> None:
+    anchor = _assert_bitget_native_utc_kline_anchor(
+        interval="1Dutc",
+        channel="candle1Dutc",
+        utc_anchor_ms=1704153600000,
+    )
+    assert anchor == datetime(2024, 1, 2, 0, 0, tzinfo=timezone.utc)
+
+
+def test_bitget_native_1wutc_anchor_is_utc_monday() -> None:
+    anchor = _assert_bitget_native_utc_kline_anchor(
+        interval="1Wutc",
+        channel="candle1Wutc",
+        utc_anchor_ms=1704672000000,
+    )
+    assert anchor == datetime(2024, 1, 8, 0, 0, tzinfo=timezone.utc)
+    assert anchor.weekday() == 0
+
+
+def test_bitget_native_1mutc_anchor_is_utc_month_start() -> None:
+    anchor = _assert_bitget_native_utc_kline_anchor(
+        interval="1Mutc",
+        channel="candle1Mutc",
+        utc_anchor_ms=1706745600000,
+    )
+    assert anchor == datetime(2024, 2, 1, 0, 0, tzinfo=timezone.utc)
+    assert anchor.day == 1
+
+
+def test_unsupported_kline_capability_does_not_start_thread_or_reconnect() -> None:
+    original_capabilities = provider_ws.SPOT_PROVIDER_WS_KLINE_CHANNELS[
+        provider_ws.PROVIDER_BITGET_SPOT
+    ]
+    provider_ws.SPOT_PROVIDER_WS_KLINE_CHANNELS[provider_ws.PROVIDER_BITGET_SPOT] = {
+        key: value for key, value in original_capabilities.items() if key != "1Dutc"
+    }
+    try:
+        service = provider_ws.SpotMarketProviderWsService()
+        service.ensure_kline("BTCUSDT", "1Dutc", provider=provider_ws.PROVIDER_BITGET_SPOT)
+
+        key = (provider_ws.PROVIDER_BITGET_SPOT, "BTCUSDT", "1Dutc")
+        metric_key = ("kline", *key)
+        assert provider_ws.bitget_spot_kline_channel("1Dutc") is None
+        assert not provider_ws.spot_provider_ws_supports_kline_interval(
+            provider_ws.PROVIDER_BITGET_SPOT,
+            "1Dutc",
+        )
+        assert key not in service._kline_tasks
+        assert key not in service._kline_stops
+        assert key not in service._kline_connections
+        assert key not in service._kline_generations
+        assert metric_key not in service._task_started_at_ms
+        assert metric_key not in service._task_reconnect_counts
+        assert service.get_fresh_klines(
+            "BTCUSDT",
+            "1Dutc",
+            provider=provider_ws.PROVIDER_BITGET_SPOT,
+        ) is None
+        assert provider_ws.spot_provider_ws_supports_provider(
+            provider_ws.PROVIDER_BITGET_SPOT,
+            domain="depth",
+        )
+        assert provider_ws.spot_provider_ws_supports_provider(
+            provider_ws.PROVIDER_BITGET_SPOT,
+            domain="ticker",
+        )
+        assert provider_ws.spot_provider_ws_supports_provider(
+            provider_ws.PROVIDER_BITGET_SPOT,
+            domain="trades",
+        )
+    finally:
+        provider_ws.SPOT_PROVIDER_WS_KLINE_CHANNELS[
+            provider_ws.PROVIDER_BITGET_SPOT
+        ] = original_capabilities
+
+
+def test_bitget_utc_kline_ensure_is_idempotent_and_release_does_not_leak() -> None:
+    original_thread = provider_ws.threading.Thread
+
+    class FakeThread:
+        def __init__(self, *, target, args, name, daemon):
+            self.target = target
+            self.args = args
+            self.name = name
+            self.daemon = daemon
+            self.alive = False
+
+        def start(self) -> None:
+            self.alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout=None) -> None:
+            self.alive = False
+
+    try:
+        provider_ws.threading.Thread = FakeThread
+        service = provider_ws.SpotMarketProviderWsService()
+        intervals = ("1Dutc", "1Wutc", "1Mutc")
+        for interval in intervals:
+            service.ensure_kline("BTCUSDT", interval, provider=provider_ws.PROVIDER_BITGET_SPOT)
+            service.ensure_kline("BTCUSDT", interval, provider=provider_ws.PROVIDER_BITGET_SPOT)
+
+        keys = {
+            (provider_ws.PROVIDER_BITGET_SPOT, "BTCUSDT", interval)
+            for interval in intervals
+        }
+        assert set(service._kline_tasks) == keys
+        assert set(service._kline_stops) == keys
+        assert {key: service._kline_generations[key] for key in keys} == {
+            key: 1 for key in keys
+        }
+        assert {
+            key[2]: service._kline_tasks[key].args[0].channel for key in keys
+        } == {
+            "1Dutc": "candle1Dutc",
+            "1Wutc": "candle1Wutc",
+            "1Mutc": "candle1Mutc",
+        }
+
+        for interval in intervals:
+            service.release_kline("BTCUSDT", interval, provider=provider_ws.PROVIDER_BITGET_SPOT)
+
+        assert service._kline_tasks == {}
+        assert service._kline_stops == {}
+        assert service._kline_connections == {}
+        assert {key: service._kline_generations[key] for key in keys} == {
+            key: 2 for key in keys
+        }
+    finally:
+        provider_ws.threading.Thread = original_thread
 
 
 def test_okx_kline_channel_mapping() -> None:
