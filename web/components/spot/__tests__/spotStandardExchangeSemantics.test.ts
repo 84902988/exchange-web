@@ -110,6 +110,22 @@ describe('spot standard exchange semantics', () => {
     expect(view.depth_status).toBe('missing')
   })
 
+  it('keeps one-sided provider depth instead of treating it as an empty book', () => {
+    const depth = normalizeDepthForDisplay({
+      symbol: 'BTCUSDT',
+      bids: [{ price: '100', amount: '2' }],
+      asks: [],
+      source: 'LIVE_WS',
+      freshness: 'LIVE',
+      ts: 1_720_000_000_000,
+    })
+
+    expect(depth?.bids).toEqual([{ price: '100', amount: '2' }])
+    expect(depth?.asks).toEqual([])
+    expect(depth?.source).toBe('LIVE_WS')
+    expect(depth?.freshness).toBe('LIVE')
+  })
+
   it('handles private websocket ping without JSON parsing', () => {
     const sendPong = jest.fn()
 
