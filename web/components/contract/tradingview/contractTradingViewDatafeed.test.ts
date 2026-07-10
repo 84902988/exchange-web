@@ -169,6 +169,28 @@ test('current and history cursor policy only uses to for non-first requests', ()
 });
 
 
+test('in-flight key normalizes symbol interval and equivalent current cursors', () => {
+  const buildKey = datafeedModule.buildContractKlineInFlightKey;
+  const base = {
+    symbol: ' btcusdt_perp ',
+    interval: '1H',
+    limit: 300,
+  };
+
+  assert.equal(buildKey(base), 'BTCUSDT_PERP|1h|CURRENT|300');
+  assert.equal(buildKey({ ...base, endTimeMs: undefined }), buildKey(base));
+  assert.equal(buildKey({ ...base, endTimeMs: null }), buildKey(base));
+  assert.equal(
+    buildKey({ ...base, endTimeMs: 1_780_000_000_000 }),
+    'BTCUSDT_PERP|1h|1780000000000|300',
+  );
+  assert.equal(
+    buildKey({ ...base, interval: '1M' }),
+    'BTCUSDT_PERP|1M|CURRENT|300',
+  );
+});
+
+
 test('provider realtime candles are accepted while quote-derived sources are rejected', () => {
   const toBar = datafeedModule.realtimeMessageToBar;
   const restToBar = datafeedModule.klineToBar;
@@ -454,7 +476,236 @@ test('API failure safely settles empty history exactly once without noData or on
 });
 
 
-test('same-interval newer request supersedes the older response exactly once', async () => {
+test('concurrent identical current requests across datafeeds share one HTTP request', async () => {
+  const pending = deferred<KlineMetadata>();
+  const apiCalls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    return pending.promise;
+  };
+  const firstHistory: HistoryCall[] = [];
+  const secondHistory: HistoryCall[] = [];
+  const firstLoadingEvents: any[] = [];
+  const secondLoadingEvents: any[] = [];
+  const firstLatest: Array<string | null> = [];
+  const secondLatest: Array<string | null> = [];
+  const first = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'DEDUPE_CURRENT_PERP',
+    onLatestBar: (close: string | null) => firstLatest.push(close),
+    onHistoryBars: (event: unknown) => firstLoadingEvents.push(event),
+  });
+  const second = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'DEDUPE_CURRENT_PERP',
+    onLatestBar: (close: string | null) => secondLatest.push(close),
+    onHistoryBars: (event: unknown) => secondLoadingEvents.push(event),
+  });
+
+  const firstRequest = first.getBars(
+    symbolInfo('DEDUPE_CURRENT_PERP'),
+    '60',
+    { ...period, countBack: 300 },
+    (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  const secondRequest = second.getBars(
+    symbolInfo('DEDUPE_CURRENT_PERP'),
+    '60',
+    { ...period, countBack: 300 },
+    (bars: any[], meta: { noData?: boolean }) => secondHistory.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.deepEqual(apiCalls, [{
+    symbol: 'DEDUPE_CURRENT_PERP',
+    interval: '1h',
+    limit: 300,
+    endTimeMs: undefined,
+  }]);
+  pending.resolve(metadata([row(1_717_000_000_000, '101')]));
+  await Promise.all([firstRequest, secondRequest]);
+
+  assert.equal(firstHistory.length, 1);
+  assert.equal(secondHistory.length, 1);
+  assert.deepEqual(firstHistory[0].bars, secondHistory[0].bars);
+  assert.equal(firstHistory[0].meta.noData, false);
+  assert.equal(secondHistory[0].meta.noData, false);
+  assert.deepEqual(firstLatest, ['101']);
+  assert.deepEqual(secondLatest, ['101']);
+  assert.equal(firstLoadingEvents.length, 1);
+  assert.equal(secondLoadingEvents.length, 1);
+  assert.equal(firstLoadingEvents[0].firstDataRequest, true);
+  assert.equal(secondLoadingEvents[0].firstDataRequest, true);
+  first.destroy();
+  second.destroy();
+});
+
+
+test('concurrent identical history requests across datafeeds share one HTTP request', async () => {
+  const pending = deferred<KlineMetadata>();
+  const apiCalls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    return pending.promise;
+  };
+  const historyPeriod = { ...period, firstDataRequest: false, countBack: 200 };
+  const firstHistory: HistoryCall[] = [];
+  const secondHistory: HistoryCall[] = [];
+  const firstLoadingEvents: any[] = [];
+  const secondLoadingEvents: any[] = [];
+  const first = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'DEDUPE_HISTORY_PERP',
+    onHistoryBars: (event: unknown) => firstLoadingEvents.push(event),
+  });
+  const second = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'DEDUPE_HISTORY_PERP',
+    onHistoryBars: (event: unknown) => secondLoadingEvents.push(event),
+  });
+
+  const firstRequest = first.getBars(
+    symbolInfo('DEDUPE_HISTORY_PERP'),
+    '15',
+    historyPeriod,
+    (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  const secondRequest = second.getBars(
+    symbolInfo('DEDUPE_HISTORY_PERP'),
+    '15',
+    historyPeriod,
+    (bars: any[], meta: { noData?: boolean }) => secondHistory.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.deepEqual(apiCalls, [{
+    symbol: 'DEDUPE_HISTORY_PERP',
+    interval: '15m',
+    limit: 200,
+    endTimeMs: 2_000_000_000_000,
+  }]);
+  pending.resolve(metadata([row(1_717_000_000_000, '103')]));
+  await Promise.all([firstRequest, secondRequest]);
+
+  assert.equal(firstHistory.length, 1);
+  assert.equal(secondHistory.length, 1);
+  assert.deepEqual(firstHistory[0].bars, secondHistory[0].bars);
+  assert.equal(firstHistory[0].meta.noData, false);
+  assert.equal(secondHistory[0].meta.noData, false);
+  assert.equal(firstLoadingEvents.length, 1);
+  assert.equal(secondLoadingEvents.length, 1);
+  assert.equal(firstLoadingEvents[0].firstDataRequest, false);
+  assert.equal(secondLoadingEvents[0].firstDataRequest, false);
+  first.destroy();
+  second.destroy();
+});
+
+
+test('completed in-flight request is removed and does not become a result cache', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const apiCalls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'NO_RESULT_CACHE_PERP' });
+
+  const firstRequest = datafeed.getBars(
+    symbolInfo('NO_RESULT_CACHE_PERP'),
+    '1',
+    period,
+    () => undefined,
+    assert.fail,
+  );
+  assert.equal(apiCalls.length, 1);
+  pending[0].resolve(metadata([row(1_717_000_000_000, '101')]));
+  await firstRequest;
+
+  const secondRequest = datafeed.getBars(
+    symbolInfo('NO_RESULT_CACHE_PERP'),
+    '1',
+    period,
+    () => undefined,
+    assert.fail,
+  );
+  assert.equal(apiCalls.length, 2);
+  pending[1].resolve(metadata([row(1_717_000_060_000, '102')]));
+  await secondRequest;
+  assert.deepEqual(apiCalls[0], apiCalls[1]);
+  datafeed.destroy();
+});
+
+
+test('shared rejected request settles every live caller once without noData', async () => {
+  const pending = deferred<KlineMetadata>();
+  let apiCalls = 0;
+  requestKlines = async () => {
+    apiCalls += 1;
+    return pending.promise;
+  };
+  const firstHistory: HistoryCall[] = [];
+  const secondHistory: HistoryCall[] = [];
+  const firstLoadingEvents: any[] = [];
+  const secondLoadingEvents: any[] = [];
+  let firstErrors = 0;
+  let secondErrors = 0;
+  const first = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'DEDUPE_REJECT_PERP',
+    onHistoryBars: (event: unknown) => firstLoadingEvents.push(event),
+  });
+  const second = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'DEDUPE_REJECT_PERP',
+    onHistoryBars: (event: unknown) => secondLoadingEvents.push(event),
+  });
+
+  const firstRequest = first.getBars(
+    symbolInfo('DEDUPE_REJECT_PERP'),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
+    () => { firstErrors += 1; },
+  );
+  const secondRequest = second.getBars(
+    symbolInfo('DEDUPE_REJECT_PERP'),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => secondHistory.push({ bars, meta }),
+    () => { secondErrors += 1; },
+  );
+
+  assert.equal(apiCalls, 1);
+  pending.reject(new Error('shared provider unavailable'));
+  await Promise.all([firstRequest, secondRequest]);
+
+  for (const calls of [firstHistory, secondHistory]) {
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].bars, []);
+    assert.equal(calls[0].meta.noData, false);
+  }
+  assert.equal(firstErrors, 0);
+  assert.equal(secondErrors, 0);
+  assert.equal(firstLoadingEvents.length, 1);
+  assert.equal(secondLoadingEvents.length, 1);
+  const retryHistory: HistoryCall[] = [];
+  const retry = datafeedModule.createContractTradingViewDatafeed({ symbol: 'DEDUPE_REJECT_PERP' });
+  await retry.getBars(
+    symbolInfo('DEDUPE_REJECT_PERP'),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => retryHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  assert.equal(apiCalls, 2, 'rejected Promise must be removed instead of becoming a negative cache');
+  assert.equal(retryHistory.length, 1);
+  assert.deepEqual(retryHistory[0].bars, []);
+  assert.equal(retryHistory[0].meta.noData, false);
+  retry.destroy();
+  first.destroy();
+  second.destroy();
+});
+
+
+test('same-interval newer request supersedes the older callback while sharing HTTP', async () => {
   const pending: Array<Deferred<KlineMetadata>> = [];
   requestKlines = async () => {
     const request = deferred<KlineMetadata>();
@@ -497,13 +748,10 @@ test('same-interval newer request supersedes the older response exactly once', a
   assert.deepEqual(latest, []);
   assert.equal(historyEvents.length, 0, 'superseded empty settle is not a history completion event');
 
-  pending[0].resolve(metadata([row(1_717_000_000_000, '101')]));
-  await oldRequest;
-  assert.equal(oldHistoryCalls.length, 1, 'late response must not settle twice');
-  assert.deepEqual(latest, []);
-
-  pending[1].resolve(metadata([row(1_717_000_060_000, '102')]));
-  await newRequest;
+  assert.equal(pending.length, 1, 'identical requests must share one HTTP promise');
+  pending[0].resolve(metadata([row(1_717_000_060_000, '102')]));
+  await Promise.all([oldRequest, newRequest]);
+  assert.equal(oldHistoryCalls.length, 1, 'shared late response must not settle superseded callback twice');
   assert.equal(newHistoryCalls.length, 1);
   assert.equal(newHistoryCalls[0].bars[0].close, 102);
   assert.equal(oldErrorCalls, 0);
@@ -512,6 +760,188 @@ test('same-interval newer request supersedes the older response exactly once', a
   assert.equal(historyEvents.length, 1);
   assert.equal(historyEvents[0].requestSeq, 2);
   assert.equal(historyEvents[0].barCount, 1);
+});
+
+
+test('superseding one shared caller does not affect another live datafeed caller', async () => {
+  const sharedCurrent = deferred<KlineMetadata>();
+  const replacement = deferred<KlineMetadata>();
+  const apiCalls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    return params.interval === '1m' ? sharedCurrent.promise : replacement.promise;
+  };
+  const oldHistory: HistoryCall[] = [];
+  const replacementHistory: HistoryCall[] = [];
+  const liveHistory: HistoryCall[] = [];
+  const first = datafeedModule.createContractTradingViewDatafeed({ symbol: 'SHARED_SUPERSEDE_PERP' });
+  const second = datafeedModule.createContractTradingViewDatafeed({ symbol: 'SHARED_SUPERSEDE_PERP' });
+
+  const oldRequest = first.getBars(
+    symbolInfo('SHARED_SUPERSEDE_PERP'),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => oldHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  const liveRequest = second.getBars(
+    symbolInfo('SHARED_SUPERSEDE_PERP'),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => liveHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  const replacementRequest = first.getBars(
+    symbolInfo('SHARED_SUPERSEDE_PERP'),
+    '5',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => replacementHistory.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.equal(apiCalls.length, 2);
+  await Promise.resolve();
+  assert.equal(oldHistory.length, 1);
+  assert.deepEqual(oldHistory[0].bars, []);
+  assert.equal(oldHistory[0].meta.noData, false);
+
+  sharedCurrent.resolve(metadata([row(1_717_000_000_000, '101')]));
+  await Promise.all([oldRequest, liveRequest]);
+  assert.equal(oldHistory.length, 1, 'superseded shared caller must not settle twice');
+  assert.equal(liveHistory.length, 1);
+  assert.equal(liveHistory[0].bars[0].close, 101);
+
+  replacement.resolve(metadata([row(1_717_000_300_000, '105')]));
+  await replacementRequest;
+  assert.equal(replacementHistory.length, 1);
+  assert.equal(replacementHistory[0].bars[0].close, 105);
+  first.destroy();
+  second.destroy();
+});
+
+
+test('destroying one datafeed does not cancel another caller shared HTTP promise', async () => {
+  const pending = deferred<KlineMetadata>();
+  let apiCalls = 0;
+  requestKlines = async () => {
+    apiCalls += 1;
+    return pending.promise;
+  };
+  let destroyedHistoryCalls = 0;
+  let destroyedErrorCalls = 0;
+  const liveHistory: HistoryCall[] = [];
+  let liveErrorCalls = 0;
+  const destroyed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'SHARED_DESTROY_PERP' });
+  const live = datafeedModule.createContractTradingViewDatafeed({ symbol: 'SHARED_DESTROY_PERP' });
+
+  const destroyedRequest = destroyed.getBars(
+    symbolInfo('SHARED_DESTROY_PERP'),
+    '1',
+    period,
+    () => { destroyedHistoryCalls += 1; },
+    () => { destroyedErrorCalls += 1; },
+  );
+  const liveRequest = live.getBars(
+    symbolInfo('SHARED_DESTROY_PERP'),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => liveHistory.push({ bars, meta }),
+    () => { liveErrorCalls += 1; },
+  );
+
+  assert.equal(apiCalls, 1);
+  destroyed.destroy();
+  pending.resolve(metadata([row(1_717_000_000_000, '111')]));
+  await Promise.all([destroyedRequest, liveRequest]);
+
+  assert.equal(destroyedHistoryCalls, 0);
+  assert.equal(destroyedErrorCalls, 0);
+  assert.equal(liveHistory.length, 1);
+  assert.equal(liveHistory[0].bars[0].close, 111);
+  assert.equal(liveErrorCalls, 0);
+  live.destroy();
+});
+
+
+test('symbol interval history cursor and limit differences never share HTTP', async () => {
+  const cases = [
+    {
+      name: 'symbol',
+      first: { ticker: 'KEY_SYMBOL_A_PERP', resolution: '1', period },
+      second: { ticker: 'KEY_SYMBOL_B_PERP', resolution: '1', period },
+    },
+    {
+      name: 'interval',
+      first: { ticker: 'KEY_INTERVAL_PERP', resolution: '1', period },
+      second: { ticker: 'KEY_INTERVAL_PERP', resolution: '5', period },
+    },
+    {
+      name: 'endTimeMs',
+      first: {
+        ticker: 'KEY_END_PERP',
+        resolution: '1',
+        period: { ...period, firstDataRequest: false, to: 2_000_000_000 },
+      },
+      second: {
+        ticker: 'KEY_END_PERP',
+        resolution: '1',
+        period: { ...period, firstDataRequest: false, to: 1_999_999_999 },
+      },
+    },
+    {
+      name: 'limit',
+      first: {
+        ticker: 'KEY_LIMIT_PERP',
+        resolution: '1',
+        period: { ...period, countBack: 100 },
+      },
+      second: {
+        ticker: 'KEY_LIMIT_PERP',
+        resolution: '1',
+        period: { ...period, countBack: 200 },
+      },
+    },
+  ];
+
+  for (const item of cases) {
+    const pending: Array<Deferred<KlineMetadata>> = [];
+    const apiCalls: KlineRequest[] = [];
+    requestKlines = async (params) => {
+      apiCalls.push(params);
+      const request = deferred<KlineMetadata>();
+      pending.push(request);
+      return request.promise;
+    };
+    const firstHistory: HistoryCall[] = [];
+    const secondHistory: HistoryCall[] = [];
+    const first = datafeedModule.createContractTradingViewDatafeed({ symbol: item.first.ticker });
+    const second = datafeedModule.createContractTradingViewDatafeed({ symbol: item.second.ticker });
+
+    const firstRequest = first.getBars(
+      symbolInfo(item.first.ticker),
+      item.first.resolution,
+      item.first.period,
+      (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
+      assert.fail,
+    );
+    const secondRequest = second.getBars(
+      symbolInfo(item.second.ticker),
+      item.second.resolution,
+      item.second.period,
+      (bars: any[], meta: { noData?: boolean }) => secondHistory.push({ bars, meta }),
+      assert.fail,
+    );
+
+    assert.equal(apiCalls.length, 2, item.name);
+    assert.equal(pending.length, 2, item.name);
+    pending[0].resolve(metadata([row(1_717_000_000_000, '101')]));
+    pending[1].resolve(metadata([row(1_717_000_000_000, '102')]));
+    await Promise.all([firstRequest, secondRequest]);
+    assert.equal(firstHistory.length, 1, item.name);
+    assert.equal(secondHistory.length, 1, item.name);
+    first.destroy();
+    second.destroy();
+  }
 });
 
 
