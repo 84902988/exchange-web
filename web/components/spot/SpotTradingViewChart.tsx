@@ -70,7 +70,7 @@ type TradingViewLoadError = {
   message: string;
 };
 
-type SpotTradingViewChartProps = SpotChartProps & {
+type SpotTradingViewChartProps = Omit<SpotChartProps, 'isLoading'> & {
   chartMode?: 'time' | 'candle';
   intervalSwitchLoading?: boolean;
   onIntervalChange?: (value: string) => void;
@@ -279,7 +279,6 @@ export default function SpotTradingViewChart({
   height = 520,
   pricePrecision,
   amountPrecision,
-  isLoading: marketDataLoading = false,
   chartMode = 'candle',
   intervalSwitchLoading = false,
   onIntervalChange,
@@ -329,7 +328,7 @@ export default function SpotTradingViewChart({
   const widgetKey = `${normalizedSymbol}:${chartMode}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}:${resolutionFallbackNonce}`;
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
-  const showChartLoading = Boolean(chartLoadingReason || marketDataLoading || intervalSwitchLoading) && !activeLoadError;
+  const showChartLoading = Boolean(chartLoadingReason || intervalSwitchLoading) && !activeLoadError;
 
   const startChartLoading = useCallback((reason: string) => {
     chartLoadingSeqRef.current += 1;
