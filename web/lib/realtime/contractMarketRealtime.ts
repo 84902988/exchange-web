@@ -9,6 +9,10 @@ export type ContractMarketRealtimeMessage = {
   type: string;
   symbol?: string;
   interval?: string;
+  source?: string | null;
+  quote_source?: string | null;
+  kline_mode?: string | null;
+  price_source?: string | null;
   quote?: unknown;
   depth?: unknown;
   trade?: unknown;
@@ -31,15 +35,17 @@ function normalizeSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase();
 }
 
-function normalizeInterval(interval?: string) {
-  return String(interval || '1m').trim().toLowerCase() || '1m';
+export function normalizeContractMarketInterval(interval?: string) {
+  const normalized = String(interval || '1m').trim();
+  if (normalized === '1M') return '1M';
+  return normalized.toLowerCase() || '1m';
 }
 
 function appendMarketParams(rawUrl: string, symbol: string, interval?: string) {
   const normalizedSymbol = normalizeSymbol(symbol);
   if (!normalizedSymbol) return '';
 
-  const normalizedInterval = normalizeInterval(interval);
+  const normalizedInterval = normalizeContractMarketInterval(interval);
 
   try {
     const url = new URL(rawUrl);
@@ -85,7 +91,7 @@ function getEventType(message: ContractMarketRealtimeMessage): ContractMarketRea
   return null;
 }
 
-class ContractMarketRealtimeClient {
+export class ContractMarketRealtimeClient {
   private ws: WebSocket | null = null;
   private connectTimer: number | null = null;
   private reconnectTimer: number | null = null;
@@ -105,7 +111,7 @@ class ContractMarketRealtimeClient {
   setSession(session: ContractMarketSession) {
     const nextSymbol = normalizeSymbol(session.symbol);
     if (!nextSymbol) return;
-    const nextInterval = normalizeInterval(session.interval);
+    const nextInterval = normalizeContractMarketInterval(session.interval);
 
     const previousSymbol = this.requestedSymbol;
     const previousInterval = this.requestedInterval;
@@ -201,7 +207,7 @@ class ContractMarketRealtimeClient {
     this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = symbol;
-    this.socketOpenedWithInterval = normalizeInterval(interval);
+    this.socketOpenedWithInterval = normalizeContractMarketInterval(interval);
     this.setStatus(this.status === 'disconnected' || this.status === 'reconnecting' ? 'reconnecting' : 'connecting');
 
     const ws = new WebSocket(wsUrl);
@@ -256,7 +262,11 @@ class ContractMarketRealtimeClient {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
     try {
-      this.ws.send(JSON.stringify({ type: 'subscribe', symbol, interval: normalizeInterval(interval) }));
+      this.ws.send(JSON.stringify({
+        type: 'subscribe',
+        symbol,
+        interval: normalizeContractMarketInterval(interval),
+      }));
     } catch (err) {
       console.warn('[contractMarketRealtime] subscribe failed:', err);
     }

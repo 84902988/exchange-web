@@ -76,6 +76,8 @@ def _load_provider_ws_module():
 def test_itick_quote_subscription_symbol_by_category():
     module = _load_provider_ws_module()
 
+    assert module._normalize_interval("1m") == "1m"
+    assert module._normalize_interval("1M") == "1M"
     assert module._itick_quote_subscription_symbol("AAPL", "STOCK") == "AAPL$US"
     assert module._itick_quote_subscription_symbol("SPX", "INDEX") == "SPX$GB"
     assert module._itick_quote_subscription_symbol("SPX$GB", "INDEX") == "SPX$GB"
@@ -87,6 +89,7 @@ def test_itick_quote_subscription_symbol_by_category():
     assert module._itick_ws_url_for_category("wss://api.itick.org", "UNKNOWN") == "wss://api.itick.org/future"
     assert module._itick_kline_channel("1m") == "kline@1"
     assert module._itick_kline_channel("5m") is None
+    assert module._okx_kline_channel("1M") is None
 
 
 def test_itick_ticker_normalizer_uses_quote_fields_and_live_source():
@@ -414,7 +417,11 @@ def _load_gateway_module(provider_payload):
 
     ws_module = types.ModuleType("app.services.contract_market_ws")
     ws_module.contract_market_ws_manager = object()
-    ws_module.normalize_contract_ws_interval = lambda value: str(value or "1m").strip().lower() or "1m"
+    ws_module.normalize_contract_ws_interval = lambda value: (
+        "1M"
+        if str(value or "1m").strip() == "1M"
+        else str(value or "1m").strip().lower() or "1m"
+    )
     ws_module.normalize_contract_ws_symbol = lambda value: str(value or "").strip().upper()
     sys.modules["app.services.contract_market_ws"] = ws_module
 
@@ -488,6 +495,16 @@ def test_gateway_kline_falls_back_to_rest_when_provider_ws_missing():
     assert payload["source"] == "REST"
 
 
+def test_gateway_snapshot_preserves_monthly_interval():
+    module = _load_gateway_module(None)
+    gateway = module.ContractMarketGateway()
+
+    payload = gateway.snapshot_message("BTCUSDT_PERP", "1M")
+
+    assert payload["interval"] == "1M"
+    assert set(payload["data"]["klines"]) == {"1M"}
+
+
 if __name__ == "__main__":
     test_itick_quote_subscription_symbol_by_category()
     test_itick_ticker_normalizer_uses_quote_fields_and_live_source()
@@ -501,3 +518,4 @@ if __name__ == "__main__":
     test_okx_kline_channel_and_normalizer_still_work()
     test_gateway_kline_prefers_provider_ws_and_delegates_provider_specific_max_age()
     test_gateway_kline_falls_back_to_rest_when_provider_ws_missing()
+    test_gateway_snapshot_preserves_monthly_interval()

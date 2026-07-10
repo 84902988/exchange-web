@@ -60,6 +60,13 @@ type TradingViewPeriodParams = {
   countBack?: number;
 };
 
+type ContractKlinePayload = ContractMarketKlineItem & {
+  source?: unknown;
+  quote_source?: unknown;
+  kline_mode?: unknown;
+  price_source?: unknown;
+};
+
 type TradingViewDatafeedConfiguration = {
   supports_search: boolean;
   supports_group_request: boolean;
@@ -225,7 +232,7 @@ function toRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function isProviderKlinePayload(value: unknown) {
+export function isProviderKlinePayload(value: unknown) {
   const record = toRecord(value);
   if (!record) return false;
 
@@ -237,7 +244,7 @@ function isProviderKlinePayload(value: unknown) {
   });
 }
 
-function klineToBar(item: ContractMarketKlineItem): ContractTradingViewBar | null {
+export function klineToBar(item: ContractKlinePayload): ContractTradingViewBar | null {
   if (!isProviderKlinePayload(item)) return null;
 
   const time = normalizeTimeMs(item.open_time ?? item.time ?? item.timestamp);
@@ -252,7 +259,7 @@ function klineToBar(item: ContractMarketKlineItem): ContractTradingViewBar | nul
   return { time, open, high, low, close, volume };
 }
 
-function realtimeMessageToBar(
+export function realtimeMessageToBar(
   message: ContractMarketRealtimeMessage,
   expectedSymbol: string,
   expectedInterval: string,
@@ -262,6 +269,7 @@ function realtimeMessageToBar(
 
   const payload = toRecord(message.kline) || toRecord(message.data);
   if (!payload) return null;
+  if (!isProviderKlinePayload(message) || !isProviderKlinePayload(payload)) return null;
 
   const symbol = normalizeContractSymbol(String(message.symbol || payload.symbol || ''));
   if (symbol && symbol !== expectedSymbol) return null;
@@ -270,13 +278,24 @@ function realtimeMessageToBar(
   if (interval && interval !== normalizeContractInterval(expectedInterval)) return null;
 
   return klineToBar({
-    open_time: payload.open_time ?? payload.time ?? payload.timestamp,
+    open_time: (payload.open_time ?? payload.time ?? payload.timestamp) as string | number | undefined,
     open: payload.open as string | number,
     high: payload.high as string | number,
     low: payload.low as string | number,
     close: payload.close as string | number,
     volume: (payload.volume ?? 0) as string | number,
+    source: payload.source ?? message.source,
+    quote_source: payload.quote_source ?? message.quote_source,
+    kline_mode: payload.kline_mode ?? message.kline_mode,
+    price_source: payload.price_source ?? message.price_source,
   });
+}
+
+export function resolveContractHistoryEndTimeMs(periodParams: TradingViewPeriodParams) {
+  if (periodParams.firstDataRequest !== false) return undefined;
+  const to = Number(periodParams.to);
+  if (!Number.isFinite(to) || to <= 0) return undefined;
+  return Math.floor(to * 1000);
 }
 
 function sortAndDedupeBars(bars: ContractTradingViewBar[]) {
@@ -291,6 +310,76 @@ function sortAndDedupeBars(bars: ContractTradingViewBar[]) {
 
 function buildLatestBarKey(symbol: string, interval: string) {
   return `${normalizeContractSymbol(symbol)}:${normalizeContractInterval(interval)}`;
+}
+
+type ContractKlineRequestToken = {
+  sequence: number;
+  key: string;
+  settled: boolean;
+  supersededSettlementScheduled: boolean;
+  onSuperseded: () => void;
+};
+
+export class ContractKlineRequestGuard {
+  private sequence = 0;
+  private activeKey = '';
+  private activeToken: ContractKlineRequestToken | null = null;
+  private destroyed = false;
+
+  private scheduleSupersededSettlement(token: ContractKlineRequestToken) {
+    if (token.settled || token.supersededSettlementScheduled) return;
+    token.supersededSettlementScheduled = true;
+    queueMicrotask(() => {
+      token.supersededSettlementScheduled = false;
+      if (token.settled) return;
+      token.settled = true;
+      if (this.destroyed) return;
+      token.onSuperseded();
+    });
+  }
+
+  begin(symbol: string, interval: string, onSuperseded: () => void): ContractKlineRequestToken {
+    if (this.activeToken) {
+      this.scheduleSupersededSettlement(this.activeToken);
+    }
+    this.sequence += 1;
+    this.activeKey = buildLatestBarKey(symbol, interval);
+    const token = {
+      sequence: this.sequence,
+      key: this.activeKey,
+      settled: false,
+      supersededSettlementScheduled: false,
+      onSuperseded,
+    };
+    this.activeToken = token;
+    return token;
+  }
+
+  complete(token: ContractKlineRequestToken, callback: () => void) {
+    if (this.destroyed || token.settled) {
+      return false;
+    }
+    if (
+      token !== this.activeToken
+      || token.sequence !== this.sequence
+      || token.key !== this.activeKey
+    ) {
+      this.scheduleSupersededSettlement(token);
+      return false;
+    }
+
+    token.settled = true;
+    this.activeToken = null;
+    callback();
+    return true;
+  }
+
+  destroy() {
+    this.destroyed = true;
+    this.sequence += 1;
+    this.activeKey = '';
+    this.activeToken = null;
+  }
 }
 
 function buildSymbolInfo(params: {
@@ -335,6 +424,7 @@ export function createContractTradingViewDatafeed({
   const displayName = displaySymbol || apiSymbol;
   const latestBars = new Map<string, ContractTradingViewBar>();
   const subscriptions = new Map<string, SubscriptionEntry>();
+  const requestGuard = new ContractKlineRequestGuard();
 
   const notifyLatestBar = (bar: ContractTradingViewBar | null) => {
     onLatestBar?.(bar ? String(bar.close) : null);
@@ -375,15 +465,19 @@ export function createContractTradingViewDatafeed({
       }));
     },
 
-    async getBars(_symbolInfo, resolution, periodParams, onHistory, onError) {
+    async getBars(symbolInfo, resolution, periodParams, onHistory, onError) {
+      const requestSymbol = normalizeContractSymbol(symbolInfo.ticker || apiSymbol) || apiSymbol;
       const interval = tradingViewResolutionToContractInterval(resolution);
-      const latestBarKey = buildLatestBarKey(apiSymbol, interval);
+      const requestToken = requestGuard.begin(requestSymbol, interval, () => {
+        onHistory([], { noData: false });
+      });
+      const latestBarKey = buildLatestBarKey(requestSymbol, interval);
       const limit = clampKlineLimit(periodParams.countBack);
-      const endTimeMs = periodParams.to ? Math.floor(periodParams.to * 1000) : undefined;
+      const endTimeMs = resolveContractHistoryEndTimeMs(periodParams);
 
       try {
         const response = await getContractMarketKlines({
-          symbol: apiSymbol,
+          symbol: requestSymbol,
           interval,
           limit,
           endTimeMs,
@@ -397,24 +491,29 @@ export function createContractTradingViewDatafeed({
           bars = allBars.slice(-limit);
         }
 
-        const latestBar = bars[bars.length - 1] || allBars[allBars.length - 1] || null;
-        if (latestBar) {
-          latestBars.set(latestBarKey, latestBar);
-        }
-        notifyLatestBar(latestBar);
-        onHistory(bars, { noData: bars.length === 0 });
+        requestGuard.complete(requestToken, () => {
+          const latestBar = bars[bars.length - 1] || allBars[allBars.length - 1] || null;
+          if (latestBar) {
+            latestBars.set(latestBarKey, latestBar);
+          }
+          notifyLatestBar(latestBar);
+          onHistory(bars, { noData: bars.length === 0 });
+        });
       } catch {
-        onError('Failed to load contract kline');
+        requestGuard.complete(requestToken, () => {
+          onError('Failed to load contract kline');
+        });
       }
     },
 
-    subscribeBars(_symbolInfo, resolution, onRealtime, subscriberUid) {
+    subscribeBars(symbolInfo, resolution, onRealtime, subscriberUid) {
+      const subscriptionSymbol = normalizeContractSymbol(symbolInfo.ticker || apiSymbol) || apiSymbol;
       const interval = tradingViewResolutionToContractInterval(resolution);
-      const latestBarKey = buildLatestBarKey(apiSymbol, interval);
-      contractMarketRealtime.setSession({ symbol: apiSymbol, interval });
+      const latestBarKey = buildLatestBarKey(subscriptionSymbol, interval);
+      contractMarketRealtime.setSession({ symbol: subscriptionSymbol, interval });
 
       const unsubscribe = contractMarketRealtime.subscribe('kline', (message) => {
-        const nextBar = realtimeMessageToBar(message, apiSymbol, interval);
+        const nextBar = realtimeMessageToBar(message, subscriptionSymbol, interval);
         if (!nextBar) return;
 
         const previousBar = latestBars.get(latestBarKey);
@@ -436,6 +535,7 @@ export function createContractTradingViewDatafeed({
     },
 
     destroy() {
+      requestGuard.destroy();
       subscriptions.forEach((entry) => entry.unsubscribe());
       subscriptions.clear();
       latestBars.clear();
