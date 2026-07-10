@@ -207,6 +207,9 @@ type ContractKlineInFlightRequest = {
 };
 
 const CONTRACT_KLINE_CURRENT_REQUEST_KEY = 'CURRENT';
+export const CONTRACT_KLINE_MAX_HISTORY_PAGES = 3;
+export const CONTRACT_KLINE_MAX_ACCUMULATED_BARS = 1000;
+export const CONTRACT_KLINE_HISTORY_PAGE_LIMIT = 300;
 const contractKlineMetadataInFlight = new Map<
   string,
   Promise<ContractMarketKlineMetadataResponse>
@@ -384,6 +387,119 @@ function sortAndDedupeBars(bars: ContractTradingViewBar[]) {
   return Array.from(byTime.values()).sort((left, right) => left.time - right.time);
 }
 
+type LoadContractKlineBarsForCountBackOptions = {
+  symbol: string;
+  interval: string;
+  initialLimit: number;
+  initialEndTimeMs?: number;
+  requiredBars: number;
+  toTimeMs: number;
+  isActive: () => boolean;
+};
+
+type LoadContractKlineBarsForCountBackResult = {
+  bars: ContractTradingViewBar[];
+  terminalMetadata: ContractMarketKlineMetadataResponse | null;
+  pageCount: number;
+};
+
+async function loadContractKlineBarsForCountBack({
+  symbol,
+  interval,
+  initialLimit,
+  initialEndTimeMs,
+  requiredBars,
+  toTimeMs,
+  isActive,
+}: LoadContractKlineBarsForCountBackOptions): Promise<LoadContractKlineBarsForCountBackResult> {
+  const barsByTime = new Map<number, ContractTradingViewBar>();
+  let pageCount = 0;
+  let pageEndTimeMs = initialEndTimeMs;
+  let terminalMetadata: ContractMarketKlineMetadataResponse | null = null;
+
+  while (
+    pageCount < CONTRACT_KLINE_MAX_HISTORY_PAGES
+    && barsByTime.size < requiredBars
+    && barsByTime.size < CONTRACT_KLINE_MAX_ACCUMULATED_BARS
+    && isActive()
+  ) {
+    const remainingBars = Math.min(
+      requiredBars - barsByTime.size,
+      CONTRACT_KLINE_MAX_ACCUMULATED_BARS - barsByTime.size,
+    );
+    const limit = pageCount === 0
+      ? initialLimit
+      : Math.min(remainingBars, CONTRACT_KLINE_HISTORY_PAGE_LIMIT);
+    pageCount += 1;
+
+    let result: ContractMarketKlineMetadataResponse;
+    try {
+      result = await getContractMarketKlinesMetadataInFlight({
+        symbol,
+        interval,
+        limit,
+        endTimeMs: pageEndTimeMs,
+      });
+    } catch (error) {
+      if (pageCount === 1) throw error;
+      break;
+    }
+
+    if (!isActive()) break;
+    if (!result || !Array.isArray(result.items)) break;
+    if (shouldReportContractHistoryNoData(result)) {
+      terminalMetadata = result;
+    }
+
+    const pageBars = sortAndDedupeBars(
+      result.items
+        .map(klineToBar)
+        .filter((bar): bar is ContractTradingViewBar => Boolean(bar))
+        .filter((bar) => (
+          bar.time < toTimeMs
+          && (pageEndTimeMs === undefined || bar.time < pageEndTimeMs)
+        )),
+    );
+    if (pageBars.length === 0) break;
+
+    const newTimestampCount = pageBars.reduce(
+      (count, bar) => count + (barsByTime.has(bar.time) ? 0 : 1),
+      0,
+    );
+    const cappedBars = sortAndDedupeBars([
+      ...barsByTime.values(),
+      ...pageBars,
+    ]).slice(-CONTRACT_KLINE_MAX_ACCUMULATED_BARS);
+    barsByTime.clear();
+    cappedBars.forEach((bar) => barsByTime.set(bar.time, bar));
+
+    if (terminalMetadata || newTimestampCount === 0) break;
+    if (
+      barsByTime.size >= requiredBars
+      || barsByTime.size >= CONTRACT_KLINE_MAX_ACCUMULATED_BARS
+      || pageCount >= CONTRACT_KLINE_MAX_HISTORY_PAGES
+    ) {
+      break;
+    }
+
+    const earliestBarTime = Math.min(...barsByTime.keys());
+    if (
+      !Number.isFinite(earliestBarTime)
+      || earliestBarTime <= 0
+      || (pageEndTimeMs !== undefined && earliestBarTime >= pageEndTimeMs)
+    ) {
+      break;
+    }
+    pageEndTimeMs = earliestBarTime;
+  }
+
+  return {
+    bars: sortAndDedupeBars(Array.from(barsByTime.values())).slice(-requiredBars),
+    terminalMetadata,
+    pageCount,
+  };
+}
+
 function buildLatestBarKey(symbol: string, interval: string) {
   return `${normalizeContractSymbol(symbol)}:${normalizeContractInterval(interval)}`;
 }
@@ -468,6 +584,16 @@ export class ContractKlineRequestGuard {
     this.activeToken = null;
     callback();
     return true;
+  }
+
+  isActive(token: ContractKlineRequestToken) {
+    return Boolean(
+      !this.destroyed
+      && !token.settled
+      && token === this.activeToken
+      && token.sequence === this.sequence
+      && token.key === this.activeKey
+    );
   }
 
   destroy() {
@@ -578,36 +704,38 @@ export function createContractTradingViewDatafeed({
         onHistory([], { noData: false });
       });
       const latestBarKey = buildLatestBarKey(requestSymbol, interval);
-      const limit = clampKlineLimit(periodParams.countBack);
+      const requiredBars = Math.min(
+        clampKlineLimit(periodParams.countBack),
+        CONTRACT_KLINE_MAX_ACCUMULATED_BARS,
+      );
+      const limit = requiredBars;
       const endTimeMs = resolveContractHistoryEndTimeMs(periodParams);
+      const to = Number(periodParams.to);
+      const toTimeMs = Number.isFinite(to) && to > 0
+        ? Math.floor(to * 1000)
+        : Number.MAX_SAFE_INTEGER;
 
       try {
-        const result = await getContractMarketKlinesMetadataInFlight({
+        const result = await loadContractKlineBarsForCountBack({
           symbol: requestSymbol,
           interval,
-          limit,
-          endTimeMs,
+          initialLimit: limit,
+          initialEndTimeMs: endTimeMs,
+          requiredBars,
+          toTimeMs,
+          isActive: () => requestGuard.isActive(requestToken),
         });
-        const responseItems = Array.isArray(result?.items) ? result.items : [];
-        const allBars = sortAndDedupeBars(responseItems.map(klineToBar).filter((bar): bar is ContractTradingViewBar => Boolean(bar)));
-        const fromMs = Number.isFinite(periodParams.from) ? Math.floor(periodParams.from * 1000) : 0;
-        const toMs = Number.isFinite(periodParams.to) ? Math.floor(periodParams.to * 1000) : Number.MAX_SAFE_INTEGER;
-        let bars = allBars.filter((bar) => bar.time >= fromMs && bar.time <= toMs);
-
-        if (periodParams.firstDataRequest && bars.length === 0 && allBars.length > 0) {
-          bars = allBars.slice(-limit);
-        }
+        const bars = result.bars;
 
         requestGuard.complete(requestToken, () => {
-          const latestResponseBar = allBars[allBars.length - 1] || null;
-          const latestBar = bars[bars.length - 1] || allBars[allBars.length - 1] || null;
-          if (latestResponseBar) {
-            advanceContractKlineHighWaterMark(latestBarKey, latestResponseBar.time);
+          const latestBar = bars[bars.length - 1] || null;
+          if (periodParams.firstDataRequest !== false) {
+            if (latestBar) {
+              advanceContractKlineHighWaterMark(latestBarKey, latestBar.time);
+              latestBars.set(latestBarKey, latestBar);
+            }
+            notifyLatestBar(latestBar);
           }
-          if (latestBar) {
-            latestBars.set(latestBarKey, latestBar);
-          }
-          notifyLatestBar(latestBar);
           notifyHistoryBars({
             symbol: requestSymbol,
             interval,
@@ -616,7 +744,13 @@ export function createContractTradingViewDatafeed({
             barCount: bars.length,
             requestSeq: requestToken.sequence,
           });
-          onHistory(bars, { noData: shouldReportContractHistoryNoData(result) });
+          onHistory(bars, {
+            noData: Boolean(
+              bars.length === 0
+              && result.terminalMetadata
+              && shouldReportContractHistoryNoData(result.terminalMetadata)
+            ),
+          });
         });
       } catch {
         requestGuard.complete(requestToken, () => {

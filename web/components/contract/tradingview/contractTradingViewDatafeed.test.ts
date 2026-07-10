@@ -46,6 +46,14 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+async function waitFor(condition: () => boolean, message: string) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    if (condition()) return;
+    await Promise.resolve();
+  }
+  assert.ok(condition(), message);
+}
+
 function metadata(items: any[], overrides: Partial<KlineMetadata> = {}): KlineMetadata {
   return {
     items,
@@ -147,6 +155,11 @@ const row = (openTime: number, close: string) => ({
   close,
   volume: '1',
 });
+const pageEndingAt = (endTime: number, count: number, close: string, stepMs = 60_000) => (
+  Array.from({ length: count }, (_, index) => (
+    row(endTime - ((count - index - 1) * stepMs), close)
+  ))
+);
 
 const realtimeCandle = (symbol: string, interval: string, openTime: number, close: string) => ({
   type: 'contract_kline_update',
@@ -521,7 +534,7 @@ test('concurrent identical current requests across datafeeds share one HTTP requ
     limit: 300,
     endTimeMs: undefined,
   }]);
-  pending.resolve(metadata([row(1_717_000_000_000, '101')]));
+  pending.resolve(metadata(pageEndingAt(1_717_000_000_000, 300, '101')));
   await Promise.all([firstRequest, secondRequest]);
 
   assert.equal(firstHistory.length, 1);
@@ -582,7 +595,7 @@ test('concurrent identical history requests across datafeeds share one HTTP requ
     limit: 200,
     endTimeMs: 2_000_000_000_000,
   }]);
-  pending.resolve(metadata([row(1_717_000_000_000, '103')]));
+  pending.resolve(metadata(pageEndingAt(1_717_000_000_000, 200, '103')));
   await Promise.all([firstRequest, secondRequest]);
 
   assert.equal(firstHistory.length, 1);
@@ -618,7 +631,7 @@ test('completed in-flight request is removed and does not become a result cache'
     assert.fail,
   );
   assert.equal(apiCalls.length, 1);
-  pending[0].resolve(metadata([row(1_717_000_000_000, '101')]));
+  pending[0].resolve(metadata(pageEndingAt(1_717_000_000_000, 100, '101')));
   await firstRequest;
 
   const secondRequest = datafeed.getBars(
@@ -629,7 +642,7 @@ test('completed in-flight request is removed and does not become a result cache'
     assert.fail,
   );
   assert.equal(apiCalls.length, 2);
-  pending[1].resolve(metadata([row(1_717_000_060_000, '102')]));
+  pending[1].resolve(metadata(pageEndingAt(1_717_000_060_000, 100, '102')));
   await secondRequest;
   assert.deepEqual(apiCalls[0], apiCalls[1]);
   datafeed.destroy();
@@ -749,7 +762,7 @@ test('same-interval newer request supersedes the older callback while sharing HT
   assert.equal(historyEvents.length, 0, 'superseded empty settle is not a history completion event');
 
   assert.equal(pending.length, 1, 'identical requests must share one HTTP promise');
-  pending[0].resolve(metadata([row(1_717_000_060_000, '102')]));
+  pending[0].resolve(metadata(pageEndingAt(1_717_000_060_000, 100, '102')));
   await Promise.all([oldRequest, newRequest]);
   assert.equal(oldHistoryCalls.length, 1, 'shared late response must not settle superseded callback twice');
   assert.equal(newHistoryCalls.length, 1);
@@ -759,7 +772,7 @@ test('same-interval newer request supersedes the older callback while sharing HT
   assert.deepEqual(latest, ['102']);
   assert.equal(historyEvents.length, 1);
   assert.equal(historyEvents[0].requestSeq, 2);
-  assert.equal(historyEvents[0].barCount, 1);
+  assert.equal(historyEvents[0].barCount, 100);
 });
 
 
@@ -805,13 +818,13 @@ test('superseding one shared caller does not affect another live datafeed caller
   assert.deepEqual(oldHistory[0].bars, []);
   assert.equal(oldHistory[0].meta.noData, false);
 
-  sharedCurrent.resolve(metadata([row(1_717_000_000_000, '101')]));
+  sharedCurrent.resolve(metadata(pageEndingAt(1_717_000_000_000, 100, '101')));
   await Promise.all([oldRequest, liveRequest]);
   assert.equal(oldHistory.length, 1, 'superseded shared caller must not settle twice');
   assert.equal(liveHistory.length, 1);
   assert.equal(liveHistory[0].bars[0].close, 101);
 
-  replacement.resolve(metadata([row(1_717_000_300_000, '105')]));
+  replacement.resolve(metadata(pageEndingAt(1_717_000_300_000, 100, '105')));
   await replacementRequest;
   assert.equal(replacementHistory.length, 1);
   assert.equal(replacementHistory[0].bars[0].close, 105);
@@ -851,7 +864,7 @@ test('destroying one datafeed does not cancel another caller shared HTTP promise
 
   assert.equal(apiCalls, 1);
   destroyed.destroy();
-  pending.resolve(metadata([row(1_717_000_000_000, '111')]));
+  pending.resolve(metadata(pageEndingAt(1_717_000_000_000, 100, '111')));
   await Promise.all([destroyedRequest, liveRequest]);
 
   assert.equal(destroyedHistoryCalls, 0);
@@ -934,14 +947,729 @@ test('symbol interval history cursor and limit differences never share HTTP', as
 
     assert.equal(apiCalls.length, 2, item.name);
     assert.equal(pending.length, 2, item.name);
-    pending[0].resolve(metadata([row(1_717_000_000_000, '101')]));
-    pending[1].resolve(metadata([row(1_717_000_000_000, '102')]));
+    pending[0].resolve(metadata(pageEndingAt(
+      1_717_000_000_000,
+      apiCalls[0].limit || 100,
+      '101',
+    )));
+    pending[1].resolve(metadata(pageEndingAt(
+      1_717_000_000_000,
+      apiCalls[1].limit || 100,
+      '102',
+    )));
     await Promise.all([firstRequest, secondRequest]);
     assert.equal(firstHistory.length, 1, item.name);
     assert.equal(secondHistory.length, 1, item.name);
     first.destroy();
     second.destroy();
   }
+});
+
+
+test('current countBack is filled across three bounded pages', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const calls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    calls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const oldest = 1_800_000_000_000;
+  const step = 60_000;
+  const historyCalls: HistoryCall[] = [];
+  const loadingEvents: any[] = [];
+  const latest: Array<string | null> = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'PAGED_CURRENT_PERP',
+    onLatestBar: (close: string | null) => latest.push(close),
+    onHistoryBars: (event: unknown) => loadingEvents.push(event),
+  });
+
+  const request = datafeed.getBars(
+    symbolInfo('PAGED_CURRENT_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+  assert.deepEqual(calls[0], {
+    symbol: 'PAGED_CURRENT_PERP',
+    interval: '1m',
+    limit: 500,
+    endTimeMs: undefined,
+  });
+
+  pending[0].resolve(metadata(pageEndingAt(oldest + (499 * step), 200, '3')));
+  await waitFor(() => pending.length === 2, 'current second page was not requested');
+  assert.equal(calls[1].endTimeMs, oldest + (300 * step));
+  assert.equal(calls[1].limit, 300);
+
+  pending[1].resolve(metadata(pageEndingAt(oldest + (299 * step), 200, '2')));
+  await waitFor(() => pending.length === 3, 'current third page was not requested');
+  assert.equal(calls[2].endTimeMs, oldest + (100 * step));
+  assert.equal(calls[2].limit, 100);
+
+  pending[2].resolve(metadata(pageEndingAt(oldest + (99 * step), 100, '1')));
+  await request;
+
+  assert.equal(calls.length, 3);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 500);
+  assert.equal(new Set(historyCalls[0].bars.map((bar) => bar.time)).size, 500);
+  assert.deepEqual(
+    historyCalls[0].bars.map((bar) => bar.time),
+    [...historyCalls[0].bars.map((bar) => bar.time)].sort((left, right) => left - right),
+  );
+  assert.equal(historyCalls[0].meta.noData, false);
+  assert.deepEqual(latest, ['3']);
+  assert.equal(loadingEvents.length, 1);
+  assert.equal(loadingEvents[0].barCount, 500);
+  datafeed.destroy();
+});
+
+
+test('history countBack stops after the second page reaches the target', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const calls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    calls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const oldest = 1_700_000_000_000;
+  const step = 60_000;
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'PAGED_HISTORY_PERP' });
+
+  const request = datafeed.getBars(
+    symbolInfo('PAGED_HISTORY_PERP'),
+    '1',
+    { ...period, firstDataRequest: false, countBack: 250 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+  pending[0].resolve(metadata(pageEndingAt(oldest + (249 * step), 150, '2')));
+  await waitFor(() => pending.length === 2, 'history second page was not requested');
+
+  assert.equal(calls[0].endTimeMs, 2_000_000_000_000);
+  assert.equal(calls[0].limit, 250);
+  assert.equal(calls[1].endTimeMs, oldest + (100 * step));
+  assert.equal(calls[1].limit, 100);
+  pending[1].resolve(metadata(pageEndingAt(oldest + (99 * step), 100, '1')));
+  await request;
+
+  assert.equal(calls.length, 2);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 250);
+  assert.equal(historyCalls[0].meta.noData, false);
+  datafeed.destroy();
+});
+
+
+test('three-page ceiling returns partial bars without claiming noData', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const calls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    calls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const oldest = 1_700_000_000_000;
+  const step = 60_000;
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'PAGE_LIMIT_PERP' });
+  const request = datafeed.getBars(
+    symbolInfo('PAGE_LIMIT_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  pending[0].resolve(metadata(pageEndingAt(oldest + (299 * step), 100, '3')));
+  await waitFor(() => pending.length === 2, 'page limit second page missing');
+  pending[1].resolve(metadata(pageEndingAt(oldest + (199 * step), 100, '2')));
+  await waitFor(() => pending.length === 3, 'page limit third page missing');
+  pending[2].resolve(metadata(pageEndingAt(oldest + (99 * step), 100, '1')));
+  await request;
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls.map((item) => item.limit), [500, 300, 300]);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 300);
+  assert.equal(historyCalls[0].meta.noData, false);
+  datafeed.destroy();
+});
+
+
+test('countBack above 1000 is capped across at most three pages', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const calls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    calls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const oldest = 1_600_000_000_000;
+  const step = 60_000;
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'BAR_LIMIT_PERP' });
+  const request = datafeed.getBars(
+    symbolInfo('BAR_LIMIT_PERP'),
+    '1',
+    { ...period, countBack: 5000 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  pending[0].resolve(metadata(pageEndingAt(oldest + (999 * step), 400, '3')));
+  await waitFor(() => pending.length === 2, '1000 cap second page missing');
+  pending[1].resolve(metadata(pageEndingAt(oldest + (599 * step), 300, '2')));
+  await waitFor(() => pending.length === 3, '1000 cap third page missing');
+  pending[2].resolve(metadata(pageEndingAt(oldest + (299 * step), 300, '1')));
+  await request;
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls.map((item) => item.limit), [1000, 300, 300]);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 1000);
+  assert.equal(historyCalls[0].meta.noData, false);
+  datafeed.destroy();
+});
+
+
+test('overlapping and disordered pages merge into unique ascending bars', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  requestKlines = async () => {
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const oldest = 1_700_000_000_000;
+  const step = 60_000;
+  const firstPage = pageEndingAt(oldest + (299 * step), 200, '2');
+  const secondPage = pageEndingAt(oldest + (99 * step), 100, '1');
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'MERGE_PERP' });
+  const request = datafeed.getBars(
+    symbolInfo('MERGE_PERP'),
+    '1',
+    { ...period, countBack: 300 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  pending[0].resolve(metadata([...firstPage.slice().reverse(), firstPage[50]]));
+  await waitFor(() => pending.length === 2, 'merge second page missing');
+  pending[1].resolve(metadata([
+    ...secondPage.slice().reverse(),
+    firstPage[0],
+    firstPage[50],
+  ]));
+  await request;
+
+  const bars = historyCalls[0].bars;
+  assert.equal(bars.length, 300);
+  assert.equal(new Set(bars.map((bar) => bar.time)).size, 300);
+  assert.deepEqual(
+    bars.map((bar) => bar.time),
+    [...bars.map((bar) => bar.time)].sort((left, right) => left - right),
+  );
+  datafeed.destroy();
+});
+
+
+test('page without an earlier cursor stops pagination as no progress', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const calls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    calls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const firstPage = pageEndingAt(1_700_010_000_000, 100, '1');
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'NO_PROGRESS_PERP' });
+  const request = datafeed.getBars(
+    symbolInfo('NO_PROGRESS_PERP'),
+    '1',
+    { ...period, countBack: 300 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  pending[0].resolve(metadata(firstPage));
+  await waitFor(() => pending.length === 2, 'no-progress second page missing');
+  const cursor = calls[1].endTimeMs as number;
+  pending[1].resolve(metadata([
+    row(cursor, '2'),
+    row(cursor + 60_000, '2'),
+    ...firstPage,
+  ]));
+  await request;
+
+  assert.equal(calls.length, 2);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 100);
+  assert.equal(historyCalls[0].meta.noData, false);
+  datafeed.destroy();
+});
+
+
+test('second-page transient empty returns first-page bars without a third request', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  requestKlines = async () => {
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const firstPage = pageEndingAt(1_700_010_000_000, 100, '1');
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'SECOND_EMPTY_PERP' });
+  const request = datafeed.getBars(
+    symbolInfo('SECOND_EMPTY_PERP'),
+    '1',
+    { ...period, countBack: 300 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  pending[0].resolve(metadata(firstPage));
+  await waitFor(() => pending.length === 2, 'transient empty second page missing');
+  pending[1].resolve(metadata([], {
+    cache_status: 'PROVIDER_EMPTY',
+    history_incomplete: true,
+    history_complete: false,
+    has_more_before: null,
+    provider_error_code: 'EMPTY',
+    retryable: true,
+  }));
+  await request;
+
+  assert.equal(pending.length, 2);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 100);
+  assert.equal(historyCalls[0].meta.noData, false);
+  datafeed.destroy();
+});
+
+
+test('second-page rejection preserves partial bars and completes Loading once', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  requestKlines = async () => {
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const historyCalls: HistoryCall[] = [];
+  const loadingEvents: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'SECOND_REJECT_PERP',
+    onHistoryBars: (event: unknown) => loadingEvents.push(event),
+  });
+  const request = datafeed.getBars(
+    symbolInfo('SECOND_REJECT_PERP'),
+    '1',
+    { ...period, countBack: 300 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  pending[0].resolve(metadata(pageEndingAt(1_700_010_000_000, 100, '1')));
+  await waitFor(() => pending.length === 2, 'rejected second page missing');
+  pending[1].reject(new Error('second page unavailable'));
+  await request;
+
+  assert.equal(pending.length, 2);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 100);
+  assert.equal(historyCalls[0].meta.noData, false);
+  assert.equal(loadingEvents.length, 1);
+  assert.equal(loadingEvents[0].barCount, 100);
+  datafeed.destroy();
+});
+
+
+test('terminal metadata after partial bars stops paging without reporting noData', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  requestKlines = async () => {
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'PARTIAL_TERMINAL_PERP' });
+  const request = datafeed.getBars(
+    symbolInfo('PARTIAL_TERMINAL_PERP'),
+    '1',
+    { ...period, firstDataRequest: false, countBack: 300 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  pending[0].resolve(metadata(pageEndingAt(1_700_010_000_000, 100, '1')));
+  await waitFor(() => pending.length === 2, 'terminal second page missing');
+  pending[1].resolve(metadata([], {
+    history_complete: true,
+    has_more_before: false,
+    history_incomplete: false,
+    retryable: false,
+  }));
+  await request;
+
+  assert.equal(pending.length, 2);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 100);
+  assert.equal(historyCalls[0].meta.noData, false);
+  datafeed.destroy();
+});
+
+
+test('history pagination does not initialize latestBars high-water mark or onLatestBar', async () => {
+  const historyEnd = 1_700_010_000_000;
+  requestKlines = async () => metadata(pageEndingAt(historyEnd, 100, '1'));
+  const latest: Array<string | null> = [];
+  const realtimeBars: any[] = [];
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'HISTORY_STATE_ISOLATION_PERP',
+    onLatestBar: (close: string | null) => latest.push(close),
+  });
+
+  await datafeed.getBars(
+    symbolInfo('HISTORY_STATE_ISOLATION_PERP'),
+    '1',
+    { ...period, firstDataRequest: false, countBack: 100 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 100);
+  assert.deepEqual(latest, []);
+
+  datafeed.subscribeBars(
+    symbolInfo('HISTORY_STATE_ISOLATION_PERP'),
+    '1',
+    (bar: any) => realtimeBars.push(bar),
+    'history-state-isolation',
+  );
+  emitRealtime(realtimeCandle(
+    'HISTORY_STATE_ISOLATION_PERP',
+    '1m',
+    historyEnd - 60_000,
+    '77',
+  ));
+
+  assert.equal(realtimeBars.length, 1, 'history bars must not seed realtime high-water state');
+  assert.deepEqual(latest, ['77']);
+  datafeed.destroy();
+});
+
+
+test('terminal metadata remains local to one getBars flow and one datafeed', async () => {
+  let apiCalls = 0;
+  requestKlines = async () => {
+    apiCalls += 1;
+    if (apiCalls === 1) {
+      return metadata([], {
+        history_complete: true,
+        has_more_before: false,
+        history_incomplete: false,
+        retryable: false,
+      });
+    }
+    return metadata([], {
+      cache_status: 'PROVIDER_EMPTY',
+      history_complete: false,
+      has_more_before: null,
+      history_incomplete: true,
+      provider_error_code: 'EMPTY',
+      retryable: true,
+    });
+  };
+  const firstHistory: HistoryCall[] = [];
+  const secondHistory: HistoryCall[] = [];
+  const first = datafeedModule.createContractTradingViewDatafeed({ symbol: 'TERMINAL_LOCAL_PERP' });
+  const second = datafeedModule.createContractTradingViewDatafeed({ symbol: 'TERMINAL_LOCAL_PERP' });
+
+  await first.getBars(
+    symbolInfo('TERMINAL_LOCAL_PERP'),
+    '1',
+    { ...period, firstDataRequest: false },
+    (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  await first.getBars(
+    symbolInfo('TERMINAL_LOCAL_PERP'),
+    '1',
+    { ...period, firstDataRequest: false },
+    (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  await second.getBars(
+    symbolInfo('TERMINAL_LOCAL_PERP'),
+    '1',
+    { ...period, firstDataRequest: false },
+    (bars: any[], meta: { noData?: boolean }) => secondHistory.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.equal(apiCalls, 3);
+  assert.deepEqual(firstHistory.map((call) => call.meta.noData), [true, false]);
+  assert.deepEqual(secondHistory.map((call) => call.meta.noData), [false]);
+  first.destroy();
+  second.destroy();
+});
+
+
+test('countBack keeps bars before from while excluding candles at or after to', async () => {
+  const pending = deferred<KlineMetadata>();
+  let apiCalls = 0;
+  requestKlines = async () => {
+    apiCalls += 1;
+    return pending.promise;
+  };
+  const validBars = pageEndingAt(1_800_000_000_000, 100, '1');
+  const toTimeMs = 2_000_000_000_000;
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'FROM_COUNTBACK_PERP' });
+  const request = datafeed.getBars(
+    symbolInfo('FROM_COUNTBACK_PERP'),
+    '1',
+    {
+      from: 1_900_000_000,
+      to: 2_000_000_000,
+      firstDataRequest: true,
+      countBack: 100,
+    },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  pending.resolve(metadata([
+    ...validBars,
+    row(toTimeMs, '9'),
+    row(toTimeMs + 60_000, '10'),
+  ]));
+  await request;
+
+  assert.equal(apiCalls, 1);
+  assert.equal(historyCalls[0].bars.length, 100);
+  assert.ok(historyCalls[0].bars.every((bar) => bar.time < 1_900_000_000_000));
+  assert.ok(historyCalls[0].bars.every((bar) => bar.time < toTimeMs));
+  datafeed.destroy();
+});
+
+
+test('superseded first page does not schedule an old second page', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const calls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    calls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const oldHistory: HistoryCall[] = [];
+  const newHistory: HistoryCall[] = [];
+  const latest: Array<string | null> = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'SUPERSEDE_PAGE_PERP',
+    onLatestBar: (close: string | null) => latest.push(close),
+  });
+  const oldRequest = datafeed.getBars(
+    symbolInfo('SUPERSEDE_OLD_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    (bars: any[], meta: { noData?: boolean }) => oldHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  const newRequest = datafeed.getBars(
+    symbolInfo('SUPERSEDE_NEW_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    (bars: any[], meta: { noData?: boolean }) => newHistory.push({ bars, meta }),
+    assert.fail,
+  );
+
+  await Promise.resolve();
+  assert.equal(oldHistory.length, 1);
+  pending[0].resolve(metadata(pageEndingAt(1_700_000_000_000, 100, '1')));
+  await oldRequest;
+  assert.equal(calls.length, 2, 'superseded first page must not schedule page two');
+
+  pending[1].resolve(metadata(pageEndingAt(1_800_000_000_000, 500, '9')));
+  await newRequest;
+  assert.equal(oldHistory.length, 1);
+  assert.equal(newHistory.length, 1);
+  assert.equal(newHistory[0].bars.length, 500);
+  assert.deepEqual(latest, ['9']);
+  datafeed.destroy();
+});
+
+
+test('superseding while page two waits prevents old state updates and page three', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const calls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    calls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const oldHistory: HistoryCall[] = [];
+  const newHistory: HistoryCall[] = [];
+  const latest: Array<string | null> = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'SUPERSEDE_SECOND_PAGE_PERP',
+    onLatestBar: (close: string | null) => latest.push(close),
+  });
+  const oldRequest = datafeed.getBars(
+    symbolInfo('SUPERSEDE_SECOND_PAGE_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    (bars: any[], meta: { noData?: boolean }) => oldHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  pending[0].resolve(metadata(pageEndingAt(1_700_100_000_000, 100, '1')));
+  await waitFor(() => pending.length === 2, 'old second page was not requested');
+
+  const newRequest = datafeed.getBars(
+    symbolInfo('SUPERSEDE_REPLACEMENT_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    (bars: any[], meta: { noData?: boolean }) => newHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  await Promise.resolve();
+  assert.equal(oldHistory.length, 1);
+  assert.equal(pending.length, 3);
+
+  pending[1].resolve(metadata(pageEndingAt(1_700_000_000_000, 100, '2')));
+  await oldRequest;
+  assert.equal(calls.length, 3, 'superseded page two must not schedule page three');
+  assert.deepEqual(latest, []);
+
+  pending[2].resolve(metadata(pageEndingAt(1_800_000_000_000, 500, '9')));
+  await newRequest;
+  assert.equal(oldHistory.length, 1);
+  assert.equal(newHistory.length, 1);
+  assert.deepEqual(latest, ['9']);
+  datafeed.destroy();
+});
+
+
+test('destroy during shared pagination leaves the other datafeed flow intact', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const calls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    calls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const oldest = 1_700_000_000_000;
+  const step = 60_000;
+  let destroyedHistoryCalls = 0;
+  const liveHistory: HistoryCall[] = [];
+  const destroyed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'DESTROY_PAGING_PERP' });
+  const live = datafeedModule.createContractTradingViewDatafeed({ symbol: 'DESTROY_PAGING_PERP' });
+
+  const destroyedRequest = destroyed.getBars(
+    symbolInfo('DESTROY_PAGING_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    () => { destroyedHistoryCalls += 1; },
+    assert.fail,
+  );
+  const liveRequest = live.getBars(
+    symbolInfo('DESTROY_PAGING_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    (bars: any[], meta: { noData?: boolean }) => liveHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  assert.equal(calls.length, 1);
+
+  pending[0].resolve(metadata(pageEndingAt(oldest + (499 * step), 100, '3')));
+  await waitFor(() => pending.length === 2, 'shared second page missing');
+  destroyed.destroy();
+  pending[1].resolve(metadata(pageEndingAt(oldest + (399 * step), 200, '2')));
+  await waitFor(() => pending.length === 3, 'live third page missing after peer destroy');
+  pending[2].resolve(metadata(pageEndingAt(oldest + (199 * step), 200, '1')));
+  await Promise.all([destroyedRequest, liveRequest]);
+
+  assert.equal(calls.length, 3);
+  assert.equal(destroyedHistoryCalls, 0);
+  assert.equal(liveHistory.length, 1);
+  assert.equal(liveHistory[0].bars.length, 500);
+  assert.equal(liveHistory[0].meta.noData, false);
+  live.destroy();
+});
+
+
+test('concurrent identical multi-page flows share every HTTP page', async () => {
+  const pending: Array<Deferred<KlineMetadata>> = [];
+  const calls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    calls.push(params);
+    const request = deferred<KlineMetadata>();
+    pending.push(request);
+    return request.promise;
+  };
+  const oldest = 1_700_000_000_000;
+  const step = 60_000;
+  const firstHistory: HistoryCall[] = [];
+  const secondHistory: HistoryCall[] = [];
+  const firstLoading: any[] = [];
+  const secondLoading: any[] = [];
+  const first = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'SHARED_PAGES_PERP',
+    onHistoryBars: (event: unknown) => firstLoading.push(event),
+  });
+  const second = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'SHARED_PAGES_PERP',
+    onHistoryBars: (event: unknown) => secondLoading.push(event),
+  });
+  const firstRequest = first.getBars(
+    symbolInfo('SHARED_PAGES_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  const secondRequest = second.getBars(
+    symbolInfo('SHARED_PAGES_PERP'),
+    '1',
+    { ...period, countBack: 500 },
+    (bars: any[], meta: { noData?: boolean }) => secondHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  assert.equal(calls.length, 1);
+
+  pending[0].resolve(metadata(pageEndingAt(oldest + (499 * step), 200, '3')));
+  await waitFor(() => pending.length === 2, 'concurrent shared second page missing');
+  assert.equal(calls.length, 2);
+  pending[1].resolve(metadata(pageEndingAt(oldest + (299 * step), 200, '2')));
+  await waitFor(() => pending.length === 3, 'concurrent shared third page missing');
+  assert.equal(calls.length, 3);
+  pending[2].resolve(metadata(pageEndingAt(oldest + (99 * step), 100, '1')));
+  await Promise.all([firstRequest, secondRequest]);
+
+  assert.equal(calls.length, 3);
+  assert.equal(firstHistory.length, 1);
+  assert.equal(secondHistory.length, 1);
+  assert.equal(firstHistory[0].bars.length, 500);
+  assert.deepEqual(firstHistory[0].bars, secondHistory[0].bars);
+  assert.equal(firstLoading.length, 1);
+  assert.equal(secondLoading.length, 1);
+  first.destroy();
+  second.destroy();
 });
 
 
@@ -985,7 +1713,7 @@ test('interval switch drops the late response from the previous interval', async
   assert.equal(oneMinuteCalls[0].meta.noData, false);
   assert.deepEqual(latest, []);
 
-  pending[1].resolve(metadata([row(1_717_000_300_000, '105')]));
+  pending[1].resolve(metadata(pageEndingAt(1_717_000_300_000, 100, '105')));
   await fiveMinuteRequest;
   pending[0].reject(new Error('late 1m failure'));
   await oneMinuteRequest;
@@ -1040,7 +1768,7 @@ test('symbol switch drops the late response from the previous symbol', async () 
   assert.equal(oldSymbolCalls[0].meta.noData, false);
   assert.deepEqual(latest, []);
 
-  pending[1].resolve(metadata([row(1_717_000_060_000, '202')]));
+  pending[1].resolve(metadata(pageEndingAt(1_717_000_060_000, 100, '202')));
   await newSymbolRequest;
   pending[0].resolve(metadata([row(1_717_000_000_000, '101')]));
   await oldSymbolRequest;
