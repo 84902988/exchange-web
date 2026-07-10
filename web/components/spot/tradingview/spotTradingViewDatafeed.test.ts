@@ -136,6 +136,7 @@ const cacheModule = {
 }
 
 let requestKlines: (params: Record<string, unknown>) => Promise<KlineResponse> = async () => ({ items: [] })
+let klineSubscriber: ((message: Record<string, unknown>) => void) | null = null
 const datafeedModule = loadTypeScriptModule(
   fileURLToPath(new URL('./spotTradingViewDatafeed.ts', import.meta.url)),
   {
@@ -146,7 +147,14 @@ const datafeedModule = loadTypeScriptModule(
     '@/services/marketRealtime': {
       spotMarketRealtime: {
         acquireKlineInterval: () => () => undefined,
-        subscribe: () => () => undefined,
+        acquireSubscription: () => 'test-kline-subscription',
+        releaseSubscription: () => undefined,
+        subscribe: (_domain: string, handler: (message: Record<string, unknown>) => void) => {
+          klineSubscriber = handler
+          return () => {
+            if (klineSubscriber === handler) klineSubscriber = null
+          }
+        },
         releaseKlineIntervalOwner: () => undefined,
         syncKlineInterval: () => undefined,
       },
@@ -543,4 +551,71 @@ test('fatal request error calls only onError exactly once', async () => {
   assert.deepEqual(historyCalls, [])
   assert.equal(errors.length, 1)
   datafeed.destroy()
+})
+
+test('realtime kline metadata is exposed without rewriting provider OHLCV', async () => {
+  requestKlines = async () => metadata([row()])
+  const datafeedEvents: Array<Record<string, unknown>> = []
+  const emittedBars: Array<Record<string, unknown>> = []
+  const historyCalls: HistoryCall[] = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({
+    symbol: 'BTCUSDT',
+    onKlineRealtime: (event: Record<string, unknown>) => datafeedEvents.push(event),
+  })
+
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => historyCalls.length === 1, 'history setup did not settle')
+  datafeed.subscribeBars(symbolInfo(), '1', (bar: Record<string, unknown>) => emittedBars.push(bar), 'display-price-test')
+  assert.ok(klineSubscriber, 'kline subscriber was not registered')
+
+  const providerKline = {
+    open_time: 1_717_000_120_000,
+    open: '101',
+    high: '106',
+    low: '99',
+    close: '105',
+    volume: '7',
+    quote_volume: '721',
+    provider: 'OKX_SPOT',
+    source: 'LIVE_WS',
+    freshness: 'LIVE',
+  }
+  const originalKline = { ...providerKline }
+  klineSubscriber?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    source: 'LIVE_WS',
+    freshness: 'LIVE',
+    kline: providerKline,
+  })
+
+  assert.deepEqual(providerKline, originalKline)
+  assert.deepEqual(emittedBars.at(-1), {
+    time: 1_717_000_120_000,
+    open: 101,
+    high: 106,
+    low: 99,
+    close: 105,
+    volume: 7,
+  })
+  assert.deepEqual(datafeedEvents.at(-1), {
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    reason: 'kline',
+    barTime: 1_717_000_120_000,
+    close: 105,
+    provider: 'OKX_SPOT',
+    source: 'LIVE_WS',
+    freshness: 'LIVE',
+    receivedAtMs: datafeedEvents.at(-1)?.receivedAtMs,
+  })
+  datafeed.destroy()
+  assert.equal(klineSubscriber, null)
 })

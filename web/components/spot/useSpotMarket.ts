@@ -21,6 +21,13 @@ import {
   type RealtimePriceDirection,
 } from './spotTickerColor';
 import {
+  selectSpotDisplayPrice,
+  sortSpotTradesLatestFirst,
+  type SpotDisplayPrice,
+  type SpotDisplayPriceCandidate,
+  type SpotNativeCandleDisplayPrice,
+} from './spotDisplayPrice';
+import {
   extractSpotDepthEventTimeMs,
   extractSpotTickerEventTimeMs,
   extractSpotTradeEventTimeMs,
@@ -114,8 +121,7 @@ export type UseSpotMarketResult = {
   trades: SpotMarketTradeItem[];
   ticker: SpotMarketTickerItem | null;
   klineStatus: string | null;
-  displayPrice: string | number | null;
-  displayPriceSource: string | null;
+  displayPrice: SpotDisplayPrice;
   lastTradePrice: string | number | null;
   lastTradeAt: number | null;
   lastTradeDirection: RealtimePriceDirection;
@@ -133,6 +139,15 @@ export type UseSpotMarketResult = {
   isLoading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
+};
+
+type UseSpotMarketOptions = {
+  nativeCandle?: SpotNativeCandleDisplayPrice | null;
+};
+
+type SpotDisplayDomainEvents = {
+  trades: NormalizedSpotMarketDomainEvent<SpotMarketDomainPayload> | null;
+  ticker: NormalizedSpotMarketDomainEvent<SpotMarketDomainPayload> | null;
 };
 
 const SPOT_VIEW_FOREGROUND_POLL_MS = 10000;
@@ -161,11 +176,11 @@ function normalizeTrades(
   trades?: SpotMarketSnapshotMessage['trades'] | null,
 ): SpotMarketTradeItem[] {
   if (!trades) return [];
-  return normalizeSpotTrades({
+  return sortSpotTradesLatestFirst(normalizeSpotTrades({
     symbol: trades.symbol || '',
     items: trades.items,
     trades: trades.trades,
-  });
+  }), extractSpotTradeEventTimeMs);
 }
 
 function hasValue(value: unknown): boolean {
@@ -669,7 +684,10 @@ function mergeIncomingMarketViewBase(
   return nextView;
 }
 
-export function useSpotMarket(symbol: string): UseSpotMarketResult {
+export function useSpotMarket(
+  symbol: string,
+  { nativeCandle = null }: UseSpotMarketOptions = {},
+): UseSpotMarketResult {
   const normalizedSymbol = useMemo(() => normalizeSpotSymbol(symbol), [symbol]);
   const [marketView, setMarketView] = useState<SpotMarketView | null>(null);
   const [depth, setDepth] = useState<SpotDepthResponse | null>(null);
@@ -677,6 +695,10 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   const [lastPrice, setLastPrice] = useState<string | number | null>(null);
   const [priceDirection, setPriceDirection] = useState<RealtimePriceDirection>('flat');
   const [lastTradeState, setLastTradeState] = useState<SpotLastTradeState>(EMPTY_LAST_TRADE_STATE);
+  const [displayDomainEvents, setDisplayDomainEvents] = useState<SpotDisplayDomainEvents>({
+    trades: null,
+    ticker: null,
+  });
   const [isConnected, setIsConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -728,6 +750,16 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     );
     if (decision.accepted) {
       domainSequenceStateRef.current.set(key, decision.state);
+      if (
+        decision.state.current
+        && (incoming.domain === 'trades' || incoming.domain === 'ticker')
+      ) {
+        const acceptedEvent = decision.state.current;
+        setDisplayDomainEvents((current) => ({
+          ...current,
+          [incoming.domain]: acceptedEvent,
+        }));
+      }
     }
     return decision;
   }, []);
@@ -1283,12 +1315,44 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
   const orderbookMidPrice = hasUsableDepth ? getViewOrderbookMidPrice(marketView, depth) : null;
   const hasActiveTrade = isActiveLastTrade(lastTradeState, normalizedSymbol);
   const viewLastTradePrice = getViewLastTradePrice(marketView);
-  const displayPrice = hasActiveTrade
-    ? lastTradeState.price
-    : viewLastTradePrice ?? getViewDisplayPrice(marketView) ?? lastPrice;
   const lastTradePrice = hasActiveTrade ? lastTradeState.price : viewLastTradePrice;
   const outputPriceDirection = hasActiveTrade ? lastTradeState.direction : priceDirection;
   const ticker = marketView?.ticker ?? null;
+  const currentTradesEvent = displayDomainEvents.trades?.symbol === normalizedSymbol
+    ? displayDomainEvents.trades
+    : null;
+  const currentTickerEvent = displayDomainEvents.ticker?.symbol === normalizedSymbol
+    ? displayDomainEvents.ticker
+    : null;
+  const latestTrade = getLatestTrade(trades);
+  const tradeDisplayCandidate: SpotDisplayPriceCandidate | null = latestTrade && currentTradesEvent
+    ? {
+        symbol: normalizedSymbol,
+        price: latestTrade.price,
+        eventTimeMs: extractSpotTradeEventTimeMs(latestTrade) ?? currentTradesEvent.eventTimeMs,
+        receivedAtMs: currentTradesEvent.receivedAtMs,
+        source: latestTrade.source || currentTradesEvent.source,
+        provider: latestTrade.provider || currentTradesEvent.provider,
+        freshness: latestTrade.freshness || currentTradesEvent.freshness,
+      }
+    : null;
+  const tickerDisplayCandidate: SpotDisplayPriceCandidate | null = ticker && currentTickerEvent
+    ? {
+        symbol: normalizedSymbol,
+        price: getTickerLastPrice(ticker),
+        eventTimeMs: extractSpotTickerEventTimeMs(ticker) ?? currentTickerEvent.eventTimeMs,
+        receivedAtMs: currentTickerEvent.receivedAtMs,
+        source: getRecordText(ticker, 'source') || currentTickerEvent.source,
+        provider: getRecordText(ticker, 'provider') || currentTickerEvent.provider,
+        freshness: getRecordText(ticker, 'freshness') || getRecordText(ticker, 'quote_freshness') || currentTickerEvent.freshness,
+      }
+    : null;
+  const displayPrice = selectSpotDisplayPrice({
+    symbol: normalizedSymbol,
+    trade: tradeDisplayCandidate,
+    ticker: tickerDisplayCandidate,
+    kline: nativeCandle,
+  });
   const freshness: SpotMarketFreshnessMap = {
     depth: normalizeDomainValue(marketView?.depth_freshness) || depthFreshness(depth),
     trades: normalizeDomainValue(marketView?.trades_freshness) || tradeFreshness(trades),
@@ -1310,7 +1374,6 @@ export function useSpotMarket(symbol: string): UseSpotMarketResult {
     ticker,
     klineStatus: marketView?.kline_status ?? null,
     displayPrice,
-    displayPriceSource: marketView?.display_price_source ?? null,
     lastTradePrice,
     lastTradeAt: hasActiveTrade ? lastTradeState.at : null,
     lastTradeDirection: hasActiveTrade ? lastTradeState.direction : outputPriceDirection,
