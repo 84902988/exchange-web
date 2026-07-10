@@ -9,6 +9,7 @@ import {
   contractMarketRealtime,
   type ContractMarketRealtimeMessage,
 } from '@/lib/realtime/contractMarketRealtime';
+import { contractKlineCurrentCache } from './contractKlineCurrentCache';
 
 export type ContractTradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
 
@@ -248,6 +249,19 @@ function getContractMarketKlinesMetadataInFlight(
   return request;
 }
 
+async function getContractMarketKlinesMetadataCurrentCacheFirst(
+  params: Omit<ContractKlineInFlightRequest, 'endTimeMs'>,
+) {
+  const cached = contractKlineCurrentCache.get(params);
+  if (cached) return cached;
+  const result = await getContractMarketKlinesMetadataInFlight({
+    ...params,
+    endTimeMs: undefined,
+  });
+  contractKlineCurrentCache.set(params, result);
+  return result;
+}
+
 function normalizeResolution(resolution: string): ContractTradingViewResolution {
   const normalized = String(resolution || '').trim().toUpperCase();
   if (normalized === 'D') return '1D';
@@ -392,6 +406,7 @@ type LoadContractKlineBarsForCountBackOptions = {
   interval: string;
   initialLimit: number;
   initialEndTimeMs?: number;
+  useCurrentCache: boolean;
   requiredBars: number;
   toTimeMs: number;
   isActive: () => boolean;
@@ -408,6 +423,7 @@ async function loadContractKlineBarsForCountBack({
   interval,
   initialLimit,
   initialEndTimeMs,
+  useCurrentCache,
   requiredBars,
   toTimeMs,
   isActive,
@@ -430,16 +446,27 @@ async function loadContractKlineBarsForCountBack({
     const limit = pageCount === 0
       ? initialLimit
       : Math.min(remainingBars, CONTRACT_KLINE_HISTORY_PAGE_LIMIT);
+    const isCurrentFirstPage = (
+      useCurrentCache
+      && pageCount === 0
+      && pageEndTimeMs === undefined
+    );
     pageCount += 1;
 
     let result: ContractMarketKlineMetadataResponse;
     try {
-      result = await getContractMarketKlinesMetadataInFlight({
-        symbol,
-        interval,
-        limit,
-        endTimeMs: pageEndTimeMs,
-      });
+      result = isCurrentFirstPage
+        ? await getContractMarketKlinesMetadataCurrentCacheFirst({
+          symbol,
+          interval,
+          limit,
+        })
+        : await getContractMarketKlinesMetadataInFlight({
+          symbol,
+          interval,
+          limit,
+          endTimeMs: pageEndTimeMs,
+        });
     } catch (error) {
       if (pageCount === 1) throw error;
       break;
@@ -721,6 +748,7 @@ export function createContractTradingViewDatafeed({
           interval,
           initialLimit: limit,
           initialEndTimeMs: endTimeMs,
+          useCurrentCache: periodParams.firstDataRequest !== false && endTimeMs === undefined,
           requiredBars,
           toTimeMs,
           isActive: () => requestGuard.isActive(requestToken),
@@ -730,11 +758,14 @@ export function createContractTradingViewDatafeed({
         requestGuard.complete(requestToken, () => {
           const latestBar = bars[bars.length - 1] || null;
           if (periodParams.firstDataRequest !== false) {
-            if (latestBar) {
+            const highWaterMark = getContractKlineHighWaterMark(latestBarKey);
+            if (latestBar && latestBar.time >= highWaterMark) {
               advanceContractKlineHighWaterMark(latestBarKey, latestBar.time);
               latestBars.set(latestBarKey, latestBar);
+              notifyLatestBar(latestBar);
+            } else if (!latestBar && highWaterMark === 0) {
+              notifyLatestBar(null);
             }
-            notifyLatestBar(latestBar);
           }
           notifyHistoryBars({
             symbol: requestSymbol,
