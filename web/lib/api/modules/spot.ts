@@ -182,6 +182,9 @@ export type SpotMarketKlinesResponse = {
   freshness?: string | null
   cache_status?: string | null
   history_incomplete?: boolean | null
+  history_terminal?: boolean | null
+  terminal_reason?: string | null
+  earliest_available_time?: number | string | null
   provider_error_code?: string | null
   provider_error_provider?: string | null
 }

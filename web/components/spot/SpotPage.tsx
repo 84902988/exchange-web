@@ -595,6 +595,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const titleUpdateTimerRef = useRef<number | null>(null);
   const titleUpdatedAtRef = useRef(0);
   const [interval, setIntervalValue] = useState('1d');
+  const [committedInterval, setCommittedInterval] = useState('1d');
   const activeIntervalRef = useRef('1d');
   const intervalChangeTimerRef = useRef<number | null>(null);
   const intervalChangeSeqRef = useRef(0);
@@ -1366,6 +1367,29 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     clearChartIntervalSwitching(false);
   }, [clearChartIntervalSwitching]);
 
+  const handleChartIntervalResolutionCommit = useCallback((value: string) => {
+    const committedValue = normalizeSpotPageInterval(value);
+    if (!committedValue) return;
+    setCommittedInterval(committedValue);
+  }, []);
+
+  const handleChartIntervalResolutionFailure = useCallback((rollbackValue: string) => {
+    const normalizedRollback = normalizeSpotPageInterval(rollbackValue);
+    if (!normalizedRollback) {
+      clearChartIntervalSwitching(true);
+      return;
+    }
+    activeIntervalRef.current = normalizedRollback;
+    setIntervalValue(normalizedRollback);
+    setCommittedInterval(normalizedRollback);
+    clearChartIntervalSwitching(true);
+    spotPageIntervalDebug('interval-change-cancelled', {
+      interval: normalizedRollback,
+      source: 'tradingview-set-resolution',
+      reason: 'setResolution failed; rolled back to committed resolution',
+    });
+  }, [clearChartIntervalSwitching]);
+
   const handlePairQueryChange = useCallback((nextQuery: SpotPairQuery) => {
     setPairQuery((prev) => {
       if (getPairQueryKey(prev) === getPairQueryKey(nextQuery)) {
@@ -1570,7 +1594,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
             <GlobalMarketSelector
               key={`spot-header-selector-${initialCategory || 'default'}`}
               symbol={symbol}
-              interval={interval}
+              interval={committedInterval}
               chartMode={chartMode}
               symbols={toolbarSymbols}
               symbolLabels={symbolLabels}
@@ -1602,6 +1626,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                   onIntervalChange={handleChartIntervalChange}
                   onChartModeChange={handleChartModeChange}
                   onIntervalSwitchLoadComplete={handleChartIntervalLoaded}
+                  onIntervalResolutionCommit={handleChartIntervalResolutionCommit}
+                  onIntervalResolutionFailure={handleChartIntervalResolutionFailure}
                   dataSource={spotMarketDataSource}
                   klineSource={spotSources.kline}
                   klineFreshness={spotFreshness.kline}

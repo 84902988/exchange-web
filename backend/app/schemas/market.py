@@ -91,6 +91,9 @@ class KlineResponse(BaseModel):
     freshness: Optional[str] = None
     cache_status: Optional[str] = None
     history_incomplete: bool = False
+    history_terminal: Optional[bool] = None
+    terminal_reason: Optional[str] = None
+    earliest_available_time: Optional[int] = None
     provider_error_code: Optional[str] = None
     provider_error_provider: Optional[str] = None
 
