@@ -9,6 +9,10 @@ import {
   type ContractHistoryBarsEvent,
   type ContractHistoryErrorEvent,
 } from './tradingview/contractTradingViewDatafeed';
+import {
+  normalizeContractKlineAssetClass,
+  type ContractKlineAssetClass,
+} from './tradingview/contractKlineCachePolicy';
 
 export type ContractChartMode = 'time' | 'candle';
 
@@ -49,6 +53,7 @@ type TradingViewLoadError = {
 
 type ContractTradingViewChartProps = {
   symbol: string;
+  category?: ContractKlineAssetClass | string | null;
   displaySymbol?: string | null;
   interval: string;
   chartMode: ContractChartMode;
@@ -152,6 +157,7 @@ export function isContractToolbarButtonActive(
 
 export function buildContractWidgetIdentityKey(params: {
   symbol: string;
+  category?: ContractKlineAssetClass | string | null;
   locale: string;
   pricePrecision?: number | null;
   amountPrecision?: number | null;
@@ -160,6 +166,7 @@ export function buildContractWidgetIdentityKey(params: {
 }) {
   return [
     params.symbol,
+    normalizeContractKlineAssetClass(params.category),
     params.locale,
     params.pricePrecision ?? 'auto',
     params.amountPrecision ?? 'auto',
@@ -406,6 +413,7 @@ function getTradingViewGlobal() {
 
 export default function ContractTradingViewChart({
   symbol,
+  category,
   displaySymbol,
   interval,
   chartMode,
@@ -439,6 +447,10 @@ export default function ContractTradingViewChart({
     [reactId],
   );
   const normalizedSymbol = useMemo(() => normalizeTradingViewSymbol(symbol), [symbol]);
+  const canonicalCategory = useMemo(
+    () => normalizeContractKlineAssetClass(category),
+    [category],
+  );
   const activeIntervals = useMemo(
     () => (intervalOptions?.length ? intervalOptions : DEFAULT_INTERVAL_OPTIONS)
       .filter((item) => Boolean(String(item || '').trim())),
@@ -451,6 +463,7 @@ export default function ContractTradingViewChart({
   const [resolutionFallbackNonce, setResolutionFallbackNonce] = useState(0);
   const widgetKey = buildContractWidgetIdentityKey({
     symbol: normalizedSymbol,
+    category: canonicalCategory,
     locale,
     pricePrecision,
     amountPrecision,
@@ -659,6 +672,7 @@ export default function ContractTradingViewChart({
 
     const datafeed = createContractTradingViewDatafeed({
       symbol: normalizedSymbol,
+      category: canonicalCategory,
       displaySymbol: displayNameRef.current,
       pricePrecision,
       amountPrecision,
@@ -840,6 +854,7 @@ export default function ContractTradingViewChart({
   }, [
     amountPrecision,
     applyWidgetResolution,
+    canonicalCategory,
     chartMode,
     containerId,
     finishChartLoading,

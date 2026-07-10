@@ -13,6 +13,10 @@ import ContractPositionTabs, {
 } from '@/components/contract/ContractPositionTabs';
 import ContractTradingForm from '@/components/contract/ContractTradingForm';
 import ContractTradingViewChart from '@/components/contract/ContractTradingViewChart';
+import {
+  normalizeContractKlineAssetClass,
+  type ContractKlineAssetClass,
+} from '@/components/contract/tradingview/contractKlineCachePolicy';
 import { useContractMarketView } from '@/components/contract/hooks/useContractMarketView';
 import { useContractUserState } from '@/components/contract/hooks/useContractUserState';
 import GlobalMarketSelector, {
@@ -36,6 +40,9 @@ type ContractChartMode = 'time' | 'candle';
 type ContractUrlCategory = 'usdt' | 'stock' | 'cfd' | '';
 type ContractDataScope = 'current' | 'all';
 type ContractTranslator = (key: string, namespace?: 'contracts' | 'markets') => string;
+type ContractSelectorPair = GlobalMarketSelectorPair & {
+  contractKlineAssetClass?: ContractKlineAssetClass;
+};
 
 const DEFAULT_CONTRACT_SYMBOL = 'BTCUSDT_PERP';
 const CONTRACT_INTERVAL_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'];
@@ -174,7 +181,7 @@ function getContractDisplayLabel(item: ContractSymbolItem, t: ContractTranslator
   return `${marketDisplaySymbol} ${t('perpetual', 'contracts')}`;
 }
 
-function getFallbackContractPair(contractSymbol: string, pricePrecision: number, t: ContractTranslator): GlobalMarketSelectorPair {
+function getFallbackContractPair(contractSymbol: string, pricePrecision: number, t: ContractTranslator): ContractSelectorPair {
   const option = CONTRACT_SYMBOL_OPTIONS.find((item) => item.contractSymbol === contractSymbol);
   const marketSymbol = option?.marketSymbol || contractSymbolToMarketSymbol(contractSymbol);
   const label = `${formatContractMarketDisplaySymbol(marketSymbol, 'USDT')} ${t('perpetual', 'contracts')}`;
@@ -191,6 +198,7 @@ function getFallbackContractPair(contractSymbol: string, pricePrecision: number,
     pricePrecision,
     maxLeverage: 200,
     tpSlTriggerPriceType: 'MARK_PRICE',
+    contractKlineAssetClass: 'UNKNOWN',
   };
 }
 
@@ -198,7 +206,7 @@ function normalizeTpSlTriggerPriceType(value: unknown): 'MARK_PRICE' | 'LAST_PRI
   return String(value || '').trim().toUpperCase() === 'LAST_PRICE' ? 'LAST_PRICE' : 'MARK_PRICE';
 }
 
-function buildContractPairOption(item: ContractSymbolItem, t: ContractTranslator): GlobalMarketSelectorPair {
+function buildContractPairOption(item: ContractSymbolItem, t: ContractTranslator): ContractSelectorPair {
   const marketSymbol = contractSymbolToMarketSymbol(item.symbol);
   const category = normalizeContractCategoryValue(item.category || item.asset_type || item.underlying_type);
   const isStockContract = category === 'STOCK';
@@ -226,6 +234,7 @@ function buildContractPairOption(item: ContractSymbolItem, t: ContractTranslator
     tpSlTriggerPriceType: normalizeTpSlTriggerPriceType(item.tp_sl_trigger_price_type),
     pricePrecision: item.price_precision,
     maxLeverage: item.max_leverage,
+    contractKlineAssetClass: normalizeContractKlineAssetClass(item.category),
   };
 }
 
@@ -365,7 +374,7 @@ function ContractPageContent() {
   const [contractDataScope, setContractDataScope] = useState<ContractDataScope>('current');
   const [contractUserTab, setContractUserTab] = useState<ContractPositionTabKey>('positions');
   const [selectedPrice, setSelectedPrice] = useState<string | null>(null);
-  const [contractPairs, setContractPairs] = useState<GlobalMarketSelectorPair[]>(() => [
+  const [contractPairs, setContractPairs] = useState<ContractSelectorPair[]>(() => [
     getFallbackContractPair(DEFAULT_CONTRACT_SYMBOL, 1, t),
   ]);
   const [contractPairsLoading, setContractPairsLoading] = useState(false);
@@ -389,6 +398,9 @@ function ContractPageContent() {
   const currentContractPair = useMemo(
     () => contractPairs.find((item) => item.symbol === contractSymbol) || null,
     [contractPairs, contractSymbol],
+  );
+  const currentContractKlineAssetClass = normalizeContractKlineAssetClass(
+    currentContractPair?.contractKlineAssetClass,
   );
   const contractChartIntervalOptions = useMemo(
     () => (isTradfiContractPair(currentContractPair) ? CONTRACT_TRADFI_INTERVAL_OPTIONS : CONTRACT_INTERVAL_OPTIONS),
@@ -778,6 +790,7 @@ function ContractPageContent() {
                   <div className="min-h-0 flex-1">
                     <ContractTradingViewChart
                       symbol={contractSymbol}
+                      category={currentContractKlineAssetClass}
                       displaySymbol={currentContractPair?.displaySymbol || marketSymbol}
                       interval={interval}
                       chartMode={chartMode}

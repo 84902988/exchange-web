@@ -10,6 +10,11 @@ import {
   type ContractMarketRealtimeMessage,
 } from '@/lib/realtime/contractMarketRealtime';
 import { contractKlineCurrentCache } from './contractKlineCurrentCache';
+import {
+  getContractKlineCurrentCacheTtlMs,
+  normalizeContractKlineAssetClass,
+  type ContractKlineAssetClass,
+} from './contractKlineCachePolicy';
 
 export type ContractTradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
 
@@ -122,6 +127,7 @@ export type ContractTradingViewDatafeed = {
 
 type CreateContractTradingViewDatafeedOptions = {
   symbol: string;
+  category?: ContractKlineAssetClass | string | null;
   displaySymbol?: string | null;
   pricePrecision?: number | null;
   amountPrecision?: number | null;
@@ -251,14 +257,20 @@ function getContractMarketKlinesMetadataInFlight(
 
 async function getContractMarketKlinesMetadataCurrentCacheFirst(
   params: Omit<ContractKlineInFlightRequest, 'endTimeMs'>,
+  category: ContractKlineAssetClass,
 ) {
-  const cached = contractKlineCurrentCache.get(params);
+  const cacheParams = { ...params, category };
+  const cached = contractKlineCurrentCache.get(cacheParams);
   if (cached) return cached;
   const result = await getContractMarketKlinesMetadataInFlight({
     ...params,
     endTimeMs: undefined,
   });
-  contractKlineCurrentCache.set(params, result);
+  contractKlineCurrentCache.set(
+    cacheParams,
+    result,
+    getContractKlineCurrentCacheTtlMs({ category, interval: params.interval }),
+  );
   return result;
 }
 
@@ -403,6 +415,7 @@ function sortAndDedupeBars(bars: ContractTradingViewBar[]) {
 
 type LoadContractKlineBarsForCountBackOptions = {
   symbol: string;
+  category: ContractKlineAssetClass;
   interval: string;
   initialLimit: number;
   initialEndTimeMs?: number;
@@ -420,6 +433,7 @@ type LoadContractKlineBarsForCountBackResult = {
 
 async function loadContractKlineBarsForCountBack({
   symbol,
+  category,
   interval,
   initialLimit,
   initialEndTimeMs,
@@ -460,7 +474,7 @@ async function loadContractKlineBarsForCountBack({
           symbol,
           interval,
           limit,
-        })
+        }, category)
         : await getContractMarketKlinesMetadataInFlight({
           symbol,
           interval,
@@ -664,6 +678,7 @@ function buildSymbolInfo(params: {
 
 export function createContractTradingViewDatafeed({
   symbol,
+  category,
   displaySymbol,
   pricePrecision,
   amountPrecision,
@@ -671,6 +686,7 @@ export function createContractTradingViewDatafeed({
   onHistoryBars,
 }: CreateContractTradingViewDatafeedOptions): ContractTradingViewDatafeed {
   const apiSymbol = normalizeContractSymbol(symbol);
+  const assetClass = normalizeContractKlineAssetClass(category);
   const displayName = displaySymbol || apiSymbol;
   const latestBars = new Map<string, ContractTradingViewBar>();
   const subscriptions = new Map<string, SubscriptionEntry>();
@@ -745,6 +761,7 @@ export function createContractTradingViewDatafeed({
       try {
         const result = await loadContractKlineBarsForCountBack({
           symbol: requestSymbol,
+          category: assetClass,
           interval,
           initialLimit: limit,
           initialEndTimeMs: endTimeMs,
