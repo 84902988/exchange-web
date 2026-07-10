@@ -19,6 +19,18 @@ type KlineRequest = {
   endTimeMs?: number;
 };
 
+type KlineMetadata = {
+  items: any[];
+  cache_status: string;
+  freshness: string;
+  stale: boolean;
+  history_incomplete: boolean;
+  history_complete: boolean | null;
+  has_more_before: boolean | null;
+  provider_error_code: string | null;
+  retryable: boolean;
+};
+
 type HistoryCall = {
   bars: any[];
   meta: { noData?: boolean };
@@ -32,6 +44,21 @@ function deferred<T>(): Deferred<T> {
     reject = nextReject;
   });
   return { promise, resolve, reject };
+}
+
+function metadata(items: any[], overrides: Partial<KlineMetadata> = {}): KlineMetadata {
+  return {
+    items,
+    cache_status: 'MISS',
+    freshness: items.length ? 'RECENT' : 'MISSING',
+    stale: false,
+    history_incomplete: false,
+    history_complete: null,
+    has_more_before: null,
+    provider_error_code: null,
+    retryable: false,
+    ...overrides,
+  };
 }
 
 function loadTypeScriptModule(
@@ -72,7 +99,7 @@ function loadTypeScriptModule(
   return loadedModule.exports;
 }
 
-let requestKlines: (params: KlineRequest) => Promise<any[]> = async () => [];
+let requestKlines: (params: KlineRequest) => Promise<KlineMetadata> = async () => metadata([]);
 const realtimeHandlers = new Set<(message: any) => void>();
 const realtimeSessionCalls: any[] = [];
 let realtimeDisconnectCalls = 0;
@@ -97,7 +124,7 @@ const datafeedModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractTradingViewDatafeed.ts', import.meta.url)),
   {
     '@/lib/api/modules/contract': {
-      getContractMarketKlines: (params: KlineRequest) => requestKlines(params),
+      getContractMarketKlinesMetadata: (params: KlineRequest) => requestKlines(params),
     },
     '@/lib/realtime/contractMarketRealtime': {
       contractMarketRealtime: realtimeStub,
@@ -198,7 +225,7 @@ test('provider realtime candles are accepted while quote-derived sources are rej
 
 
 test('normal current request calls onHistory exactly once and never calls onError', async () => {
-  requestKlines = async () => [row(1_717_000_000_000, '101')];
+  requestKlines = async () => metadata([row(1_717_000_000_000, '101')]);
   const historyCalls: HistoryCall[] = [];
   const historyEvents: any[] = [];
   let errorCalls = 0;
@@ -233,15 +260,173 @@ test('normal current request calls onHistory exactly once and never calls onErro
 });
 
 
-test('normal failed request calls onError exactly once and never calls onHistory', async () => {
+test('noData helper accepts only a fully consistent explicit terminal result', () => {
+  const shouldReportNoData = datafeedModule.shouldReportContractHistoryNoData;
+  const terminal = metadata([], {
+    history_complete: true,
+    has_more_before: false,
+    history_incomplete: false,
+    retryable: false,
+  });
+
+  assert.equal(shouldReportNoData(terminal), true);
+  assert.equal(shouldReportNoData({ ...terminal, history_complete: false }), false);
+  assert.equal(shouldReportNoData({ ...terminal, has_more_before: null }), false);
+  assert.equal(shouldReportNoData({ ...terminal, history_incomplete: true }), false);
+  assert.equal(shouldReportNoData({ ...terminal, retryable: true }), false);
+  assert.equal(shouldReportNoData({ ...terminal, items: [row(1_717_000_000_000, '101')] }), false);
+  assert.equal(shouldReportNoData({ items: [] }), false);
+  assert.equal(shouldReportNoData(null), false);
+});
+
+
+test('ordinary provider empty history settles once with noData false', async () => {
+  requestKlines = async () => metadata([], {
+    cache_status: 'PROVIDER_EMPTY',
+    history_complete: false,
+    has_more_before: null,
+    history_incomplete: true,
+    provider_error_code: 'EMPTY',
+    retryable: true,
+  });
+  const historyCalls: HistoryCall[] = [];
+  let errorCalls = 0;
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'EMPTY_PERP' });
+
+  await datafeed.getBars(
+    symbolInfo('EMPTY_PERP'),
+    '1',
+    { ...period, firstDataRequest: false },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    () => { errorCalls += 1; },
+  );
+
+  assert.equal(historyCalls.length, 1);
+  assert.deepEqual(historyCalls[0].bars, []);
+  assert.equal(historyCalls[0].meta.noData, false);
+  assert.equal(errorCalls, 0);
+});
+
+
+test('transient metadata errors settle exactly once with noData false', async () => {
+  for (const providerErrorCode of ['TIMEOUT', 'COOLDOWN', 'HTTP_ERROR', 'UNKNOWN']) {
+    requestKlines = async () => metadata([], {
+      history_complete: false,
+      has_more_before: null,
+      history_incomplete: true,
+      provider_error_code: providerErrorCode,
+      retryable: true,
+    });
+    const historyCalls: HistoryCall[] = [];
+    let errorCalls = 0;
+    const datafeed = datafeedModule.createContractTradingViewDatafeed({
+      symbol: `${providerErrorCode}_PERP`,
+    });
+
+    await datafeed.getBars(
+      symbolInfo(`${providerErrorCode}_PERP`),
+      '1',
+      { ...period, firstDataRequest: false },
+      (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+      () => { errorCalls += 1; },
+    );
+
+    assert.equal(historyCalls.length, 1, providerErrorCode);
+    assert.deepEqual(historyCalls[0].bars, [], providerErrorCode);
+    assert.equal(historyCalls[0].meta.noData, false, providerErrorCode);
+    assert.equal(errorCalls, 0, providerErrorCode);
+  }
+});
+
+
+test('stale partial metadata returns provider bars without ending history', async () => {
+  requestKlines = async () => metadata([row(1_717_000_000_000, '103')], {
+    cache_status: 'SHORT',
+    freshness: 'STALE',
+    stale: true,
+    history_complete: false,
+    has_more_before: null,
+    history_incomplete: true,
+    provider_error_code: 'TIMEOUT',
+    retryable: true,
+  });
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'STALE_PERP' });
+
+  await datafeed.getBars(
+    symbolInfo('STALE_PERP'),
+    '1',
+    { ...period, firstDataRequest: false },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 1);
+  assert.equal(historyCalls[0].bars[0].close, 103);
+  assert.equal(historyCalls[0].meta.noData, false);
+});
+
+
+test('empty current metadata never reports history noData', async () => {
+  requestKlines = async () => metadata([], {
+    history_complete: null,
+    has_more_before: null,
+    history_incomplete: false,
+    retryable: true,
+  });
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'CURRENT_EMPTY_PERP' });
+
+  await datafeed.getBars(
+    symbolInfo('CURRENT_EMPTY_PERP'),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.equal(historyCalls.length, 1);
+  assert.deepEqual(historyCalls[0].bars, []);
+  assert.equal(historyCalls[0].meta.noData, false);
+});
+
+
+test('explicit terminal metadata is the only empty result reported as noData', async () => {
+  requestKlines = async () => metadata([], {
+    history_complete: true,
+    has_more_before: false,
+    history_incomplete: false,
+    retryable: false,
+  });
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'TERMINAL_PERP' });
+
+  await datafeed.getBars(
+    symbolInfo('TERMINAL_PERP'),
+    '1',
+    { ...period, firstDataRequest: false },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.equal(historyCalls.length, 1);
+  assert.deepEqual(historyCalls[0].bars, []);
+  assert.equal(historyCalls[0].meta.noData, true);
+});
+
+
+test('API failure safely settles empty history exactly once without noData or onError', async () => {
   requestKlines = async () => {
     throw new Error('provider unavailable');
   };
-  let historyCalls = 0;
+  const historyCalls: HistoryCall[] = [];
   const errors: string[] = [];
+  const historyEvents: any[] = [];
   const historyErrors: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({
     symbol: 'BTCUSDT_PERP',
+    onHistoryBars: (event: unknown) => historyEvents.push(event),
     onHistoryError: (event: unknown) => historyErrors.push(event),
   });
 
@@ -249,27 +434,30 @@ test('normal failed request calls onError exactly once and never calls onHistory
     symbolInfo('BTCUSDT_PERP'),
     '1',
     period,
-    () => { historyCalls += 1; },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
     (reason: string) => errors.push(reason),
   );
 
-  assert.equal(historyCalls, 0);
-  assert.deepEqual(errors, ['Failed to load contract kline']);
-  assert.deepEqual(historyErrors, [{
+  assert.equal(historyCalls.length, 1);
+  assert.deepEqual(historyCalls[0].bars, []);
+  assert.equal(historyCalls[0].meta.noData, false);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(historyEvents, [{
     symbol: 'BTCUSDT_PERP',
     interval: '1m',
     resolution: '1',
     firstDataRequest: true,
+    barCount: 0,
     requestSeq: 1,
-    error: 'Failed to load contract kline',
   }]);
+  assert.deepEqual(historyErrors, []);
 });
 
 
 test('same-interval newer request supersedes the older response exactly once', async () => {
-  const pending: Array<Deferred<any[]>> = [];
+  const pending: Array<Deferred<KlineMetadata>> = [];
   requestKlines = async () => {
-    const request = deferred<any[]>();
+    const request = deferred<KlineMetadata>();
     pending.push(request);
     return request.promise;
   };
@@ -309,12 +497,12 @@ test('same-interval newer request supersedes the older response exactly once', a
   assert.deepEqual(latest, []);
   assert.equal(historyEvents.length, 0, 'superseded empty settle is not a history completion event');
 
-  pending[0].resolve([row(1_717_000_000_000, '101')]);
+  pending[0].resolve(metadata([row(1_717_000_000_000, '101')]));
   await oldRequest;
   assert.equal(oldHistoryCalls.length, 1, 'late response must not settle twice');
   assert.deepEqual(latest, []);
 
-  pending[1].resolve([row(1_717_000_060_000, '102')]);
+  pending[1].resolve(metadata([row(1_717_000_060_000, '102')]));
   await newRequest;
   assert.equal(newHistoryCalls.length, 1);
   assert.equal(newHistoryCalls[0].bars[0].close, 102);
@@ -328,11 +516,11 @@ test('same-interval newer request supersedes the older response exactly once', a
 
 
 test('interval switch drops the late response from the previous interval', async () => {
-  const pending: Array<Deferred<any[]>> = [];
+  const pending: Array<Deferred<KlineMetadata>> = [];
   const calls: KlineRequest[] = [];
   requestKlines = async (params) => {
     calls.push(params);
-    const request = deferred<any[]>();
+    const request = deferred<KlineMetadata>();
     pending.push(request);
     return request.promise;
   };
@@ -367,7 +555,7 @@ test('interval switch drops the late response from the previous interval', async
   assert.equal(oneMinuteCalls[0].meta.noData, false);
   assert.deepEqual(latest, []);
 
-  pending[1].resolve([row(1_717_000_300_000, '105')]);
+  pending[1].resolve(metadata([row(1_717_000_300_000, '105')]));
   await fiveMinuteRequest;
   pending[0].reject(new Error('late 1m failure'));
   await oneMinuteRequest;
@@ -383,11 +571,11 @@ test('interval switch drops the late response from the previous interval', async
 
 
 test('symbol switch drops the late response from the previous symbol', async () => {
-  const pending: Array<Deferred<any[]>> = [];
+  const pending: Array<Deferred<KlineMetadata>> = [];
   const calls: KlineRequest[] = [];
   requestKlines = async (params) => {
     calls.push(params);
-    const request = deferred<any[]>();
+    const request = deferred<KlineMetadata>();
     pending.push(request);
     return request.promise;
   };
@@ -422,9 +610,9 @@ test('symbol switch drops the late response from the previous symbol', async () 
   assert.equal(oldSymbolCalls[0].meta.noData, false);
   assert.deepEqual(latest, []);
 
-  pending[1].resolve([row(1_717_000_060_000, '202')]);
+  pending[1].resolve(metadata([row(1_717_000_060_000, '202')]));
   await newSymbolRequest;
-  pending[0].resolve([row(1_717_000_000_000, '101')]);
+  pending[0].resolve(metadata([row(1_717_000_000_000, '101')]));
   await oldSymbolRequest;
 
   assert.deepEqual(calls.map((item) => item.symbol), ['BTCUSDT_PERP', 'ETHUSDT_PERP']);
@@ -438,9 +626,9 @@ test('symbol switch drops the late response from the previous symbol', async () 
 
 
 test('destroyed datafeed cancels scheduled stale settlement and ignores late responses', async () => {
-  const pending: Array<Deferred<any[]>> = [];
+  const pending: Array<Deferred<KlineMetadata>> = [];
   requestKlines = async () => {
-    const request = deferred<any[]>();
+    const request = deferred<KlineMetadata>();
     pending.push(request);
     return request.promise;
   };
@@ -472,7 +660,7 @@ test('destroyed datafeed cancels scheduled stale settlement and ignores late res
   );
   datafeed.destroy();
   await Promise.resolve();
-  pending[0].resolve([row(1_717_000_000_000, '101')]);
+  pending[0].resolve(metadata([row(1_717_000_000_000, '101')]));
   pending[1].reject(new Error('late destroyed request'));
   await Promise.all([oldRequest, newRequest]);
 
@@ -486,7 +674,7 @@ test('destroyed datafeed cancels scheduled stale settlement and ignores late res
 
 test('REST high-water mark rejects older realtime bars and accepts equal or newer candles', async () => {
   const restTime = Date.parse('2026-07-10T08:02:00.000Z');
-  requestKlines = async () => [row(restTime, '1.14411')];
+  requestKlines = async () => metadata([row(restTime, '1.14411')]);
   const latest: Array<string | null> = [];
   const realtimeBars: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({
@@ -524,7 +712,7 @@ test('REST high-water mark rejects older realtime bars and accepts equal or newe
 
 test('module high-water mark survives datafeed destroy and rebuild', async () => {
   const restTime = Date.parse('2026-07-10T08:02:00.000Z');
-  requestKlines = async () => [row(restTime, '200')];
+  requestKlines = async () => metadata([row(restTime, '200')]);
   const first = datafeedModule.createContractTradingViewDatafeed({ symbol: 'REBUILD_MONO_PERP' });
   await first.getBars(
     symbolInfo('REBUILD_MONO_PERP'),
@@ -558,7 +746,7 @@ test('module high-water mark survives datafeed destroy and rebuild', async () =>
 test('high-water marks isolate symbol and interval while preserving 1M case', async () => {
   const highTime = Date.parse('2026-07-10T08:02:00.000Z');
   const lowerTime = highTime - 60_000;
-  requestKlines = async () => [row(highTime, '300')];
+  requestKlines = async () => metadata([row(highTime, '300')]);
   const seeded = datafeedModule.createContractTradingViewDatafeed({ symbol: 'ISOLATION_A_PERP' });
   await seeded.getBars(
     symbolInfo('ISOLATION_A_PERP'),
