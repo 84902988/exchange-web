@@ -219,13 +219,18 @@ export function extractSpotTickerEventTimeMs(payload: unknown): number | null {
 }
 
 export function extractSpotTradeEventTimeMs(payload: unknown): number | null {
+  const record = asRecord(payload)
+  if (!record) return null
+
+  if (Object.prototype.hasOwnProperty.call(record, 'event_time_ms')) {
+    return normalizeSpotMarketEventTimeMs(record.event_time_ms)
+  }
+
   return extractEventTimeFromRecord(payload, [
     'ts',
-    'event_time_ms',
     'event_time',
     'trade_time',
     'time',
-    'updated_at_ms',
     'created_at',
   ])
 }

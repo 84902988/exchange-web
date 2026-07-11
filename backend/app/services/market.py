@@ -357,6 +357,13 @@ def _format_trades_for_pair(pair: TradingPair, trades: TradesResponse, limit: Op
                 freshness=getattr(item, "freshness", None) or getattr(trades, "freshness", None),
                 updated_at_ms=getattr(item, "updated_at_ms", None) or getattr(trades, "updated_at_ms", None),
                 created_at=getattr(item, "created_at", None),
+                event_time_ms=getattr(item, "event_time_ms", None),
+                received_at_ms=(
+                    getattr(item, "received_at_ms", None)
+                    or getattr(trades, "received_at_ms", None)
+                    or getattr(trades, "updated_at_ms", None)
+                ),
+                time_origin=getattr(item, "time_origin", None),
             )
         )
     data = trades.model_dump() if hasattr(trades, "model_dump") else trades.dict()
@@ -1098,12 +1105,22 @@ def _get_internal_trades(db: Session, pair: TradingPair, limit: int = 50) -> Tra
             if taker_order and taker_order.side:
                 trade_side = taker_order.side
 
+        trade_time_ms = _datetime_to_utc_ms(row.created_at)
+        trade_id = str(row.id) if getattr(row, "id", None) is not None else None
         trades.append(
             TradeItem(
+                id=trade_id,
+                trade_id=trade_id,
+                provider_trade_id=None,
                 price=_decimal_to_str(row.price),
                 amount=_decimal_to_str(row.amount),
                 side=trade_side,
-                ts=int(row.created_at.timestamp() * 1000),
+                ts=trade_time_ms,
+                event_time_ms=trade_time_ms,
+                received_at_ms=None,
+                created_at=row.created_at.isoformat(),
+                time_origin="PLATFORM_TRADE",
+                source="INTERNAL",
             )
         )
 
@@ -1584,40 +1601,77 @@ def _spot_trades_from_provider(
     provider_code: str,
     payload: Any,
     limit: int,
+    provider_symbol: Optional[str] = None,
 ) -> TradesResponse:
+    batch_received_at_ms = _now_ms()
+    normalized_provider = str(provider_code or "").strip().upper()
+    normalized_provider_symbol = str(provider_symbol or "").strip() or None
     rows = _spot_provider_rows(payload)
     trades: list[TradeItem] = []
     for row in rows[:limit]:
         if not isinstance(row, dict):
             continue
-        if provider_code == "OKX_SPOT":
+        if normalized_provider == "OKX_SPOT":
             price = row.get("px")
             amount = row.get("sz")
             side_text = str(row.get("side") or "").upper()
-            ts = _spot_provider_ts(row.get("ts"))
-        elif provider_code == "BITGET_SPOT":
+            event_time_ms = _spot_provider_event_time_ms(row.get("ts"))
+            raw_trade_id = row.get("tradeId")
+        elif normalized_provider == "BITGET_SPOT":
             price = row.get("price")
             amount = row.get("size") or row.get("baseVolume")
             side_text = str(row.get("side") or "").upper()
-            ts = _spot_provider_ts(row.get("ts"))
+            event_time_ms = _spot_provider_event_time_ms(row.get("ts"))
+            raw_trade_id = row.get("tradeId")
         else:
             price = row.get("price")
             amount = row.get("qty")
             side_text = "SELL" if bool(row.get("isBuyerMaker")) else "BUY"
-            ts = _spot_provider_ts(row.get("time"))
+            event_time_ms = _spot_provider_event_time_ms(row.get("time"))
+            raw_trade_id = row.get("id")
+            if raw_trade_id is None:
+                raw_trade_id = row.get("tradeId")
         if _to_decimal(price) <= 0 or _to_decimal(amount) <= 0:
             continue
+        provider_trade_id = str(raw_trade_id).strip() if raw_trade_id is not None else ""
+        provider_trade_id = provider_trade_id or None
+        compatibility_ts = event_time_ms or batch_received_at_ms
         trades.append(
             TradeItem(
+                id=provider_trade_id,
+                trade_id=provider_trade_id,
+                provider_trade_id=provider_trade_id,
                 price=_format_price_for_pair(pair, price),
                 amount=_format_amount_for_pair(pair, amount),
                 side="SELL" if side_text == "SELL" else "BUY",
-                ts=ts,
+                ts=compatibility_ts,
+                event_time_ms=event_time_ms,
+                received_at_ms=batch_received_at_ms,
+                created_at=(
+                    datetime.utcfromtimestamp(event_time_ms / 1000).isoformat()
+                    if event_time_ms is not None
+                    else None
+                ),
+                time_origin="PROVIDER",
+                provider=normalized_provider,
+                provider_symbol=normalized_provider_symbol,
+                source="external",
+                freshness="RECENT",
+                updated_at_ms=batch_received_at_ms,
             )
         )
     if not trades:
         raise ValueError("spot trades unavailable")
-    return TradesResponse(symbol=pair.symbol, trades=trades, provider=provider_code, stale=False, updated_at=datetime.utcnow().isoformat())
+    return TradesResponse(
+        symbol=pair.symbol,
+        trades=trades,
+        provider=normalized_provider,
+        provider_symbol=normalized_provider_symbol,
+        stale=False,
+        updated_at=datetime.utcfromtimestamp(batch_received_at_ms / 1000).isoformat(),
+        updated_at_ms=batch_received_at_ms,
+        received_at_ms=batch_received_at_ms,
+    )
 
 
 def _spot_klines_from_provider(
@@ -2105,7 +2159,13 @@ def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *
                 provider_symbol,
                 limit=limit,
             )
-            trades = _spot_trades_from_provider(pair=pair, provider_code=provider.provider_code, payload=payload, limit=limit)
+            trades = _spot_trades_from_provider(
+                pair=pair,
+                provider_code=provider.provider_code,
+                provider_symbol=provider_symbol,
+                payload=payload,
+                limit=limit,
+            )
             _SPOT_LAST_GOOD_TRADES[pair.symbol] = trades
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
             return trades
@@ -2334,6 +2394,7 @@ def _build_itick_fallback_trades(pair: TradingPair, limit: int = 50) -> TradesRe
                 amount=_decimal_to_str(max(amount, _amount_quant(pair))),
                 side="BUY" if idx % 2 == 0 else "SELL",
                 ts=now_ms - idx * 15_000,
+                time_origin="SYNTHETIC",
             )
         )
 

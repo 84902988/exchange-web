@@ -5,6 +5,7 @@ import inspect
 import json
 import threading
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from app.services import spot_market_domain_cache as domain_cache
 from app.services import spot_market_provider_ws as provider_ws
@@ -685,6 +686,13 @@ def test_bitget_trade_message_normalize() -> None:
     assert record["trades"][0]["side"] == "SELL"
     assert record["trades"][1]["id"] == "1000000000"
     assert record["trades"][1]["side"] == "BUY"
+    assert record["trades"][0]["event_time_ms"] == 1695709835823
+    assert record["trades"][1]["event_time_ms"] == 1695709835822
+    assert record["trades"][0]["received_at_ms"] == record["updated_at_ms"]
+    assert record["trades"][1]["received_at_ms"] == record["updated_at_ms"]
+    assert record["trades"][0]["time_origin"] == "PROVIDER"
+    assert record["trades"][0]["provider"] == provider_ws.PROVIDER_BITGET_SPOT
+    assert record["trades"][0]["provider_symbol"] == "BTCUSDT"
 
 
 def test_okx_trade_message_normalize_cache_and_dedupe() -> None:
@@ -730,6 +738,13 @@ def test_okx_trade_message_normalize_cache_and_dedupe() -> None:
     assert record["trades"][1]["id"] == "1000000000"
     assert record["trades"][1]["side"] == "BUY"
     assert record["trades"][0]["raw_trade"]["instId"] == "BTC-USDT"
+    assert record["trades"][0]["event_time_ms"] == 1695709835823
+    assert record["trades"][1]["event_time_ms"] == 1695709835822
+    assert record["trades"][0]["received_at_ms"] == record["updated_at_ms"]
+    assert record["trades"][1]["received_at_ms"] == record["updated_at_ms"]
+    assert record["trades"][0]["time_origin"] == "PROVIDER"
+    assert record["trades"][0]["provider"] == provider_ws.PROVIDER_OKX_SPOT
+    assert record["trades"][0]["provider_symbol"] == "BTC-USDT"
 
     service = provider_ws.SpotMarketProviderWsService()
     _activate_provider_trades(service, provider=provider_ws.PROVIDER_OKX_SPOT)
@@ -753,6 +768,36 @@ def test_okx_trade_message_normalize_cache_and_dedupe() -> None:
     assert trades.trades[0].price == "100"
     assert trades.provider_symbol == "BTC-USDT"
     assert service.get_fresh_trades("BTCUSDT", provider=provider_ws.PROVIDER_BITGET_SPOT) is None
+
+
+def test_ws_trade_message_without_provider_time_is_explicitly_untimed_and_captures_once() -> None:
+    with patch.object(provider_ws, "_now_ms", return_value=9_000) as clock:
+        record = provider_ws.normalize_bitget_trade_message(
+            {
+                "arg": {"instType": "SPOT", "channel": "trade", "instId": "BTCUSDT"},
+                "action": "update",
+                "data": [
+                    {"tradeId": "timed", "ts": "1000", "price": "100", "size": "1", "side": "buy"},
+                    {"tradeId": "untimed", "price": "99", "size": "2", "side": "sell"},
+                ],
+            },
+            local_symbol="BTCUSDT",
+            provider_symbol="BTCUSDT",
+            trades_limit=2,
+        )
+
+    assert clock.call_count == 1
+    assert record is not None
+    assert record["received_at_ms"] == 9_000
+    assert {item["received_at_ms"] for item in record["trades"]} == {9_000}
+    timed = next(item for item in record["trades"] if item["id"] == "timed")
+    untimed = next(item for item in record["trades"] if item["id"] == "untimed")
+    assert timed["event_time_ms"] == 1_000
+    assert timed["created_at"] == datetime.utcfromtimestamp(1).isoformat()
+    assert untimed["event_time_ms"] is None
+    assert untimed["ts"] == 9_000
+    assert untimed["created_at"] is None
+    assert untimed["time_origin"] == "PROVIDER"
 
 
 def test_okx_trades_do_not_drive_provider_kline_cache() -> None:
