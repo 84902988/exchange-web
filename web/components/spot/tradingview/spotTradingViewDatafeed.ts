@@ -19,6 +19,8 @@ import {
 import {
   buildKlineCachePerfPayload,
   cloneBars,
+  createSpotKlineRevisionCache,
+  extractSpotKlineRevisionMetadata,
   fetchAndCacheCurrentKlineBars,
   getBackendKlineIntervalForSpotInterval,
   getBarsContinuityStats,
@@ -35,6 +37,7 @@ import {
   shouldRejectKlineContinuity,
   writeCurrentKlineCache,
   type SpotTradingViewBar,
+  type SpotKlineRevisionCandidate,
 } from './spotKlineClientCache';
 
 type TradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
@@ -183,6 +186,7 @@ type EmitRealtimeBar = (bar: TradingViewBar, reason: string) => boolean;
 
 type HistoryKlineRequestResult = {
   bars: TradingViewBar[];
+  revisionCandidates: SpotKlineRevisionCandidate[];
   provider?: unknown;
   source?: unknown;
   freshness?: unknown;
@@ -1018,19 +1022,29 @@ function klinePayloadToBar(
   return klineToBar(payload as SpotMarketKlineItem, interval, provider, source);
 }
 
-function normalizeHistoryBars(
+function normalizeHistoryRevisionCandidates(
+  symbol: string,
   items: SpotMarketKlineItem[] | undefined,
   interval: string,
   provider?: unknown,
   source?: unknown,
-): TradingViewBar[] {
-  const byTime = new Map<number, TradingViewBar>();
+): SpotKlineRevisionCandidate[] {
+  const byOpenTime = new Map<number, SpotKlineRevisionCandidate>();
   for (const item of items || []) {
+    const openTime = normalizeKlineTimeMs(item);
     const bar = klineToBar(item, interval, provider, source);
-    if (!bar) continue;
-    byTime.set(bar.time, bar);
+    if (!openTime || !bar) continue;
+    byOpenTime.set(openTime, {
+      symbol,
+      interval,
+      openTime,
+      bar,
+      provider,
+      source,
+      revision: extractSpotKlineRevisionMetadata(item),
+    });
   }
-  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+  return Array.from(byOpenTime.values()).sort((left, right) => left.bar.time - right.bar.time);
 }
 
 function normalizeRequiredKlineBars(countBack: number, fallback: number) {
@@ -1124,9 +1138,17 @@ async function fetchKlineRequestBars(params: {
     endTime: params.endTime || null,
     rows: buildKlineItemDebugRows(payload.items, params.interval, payload.provider, payload.source),
   });
-  const bars = normalizeHistoryBars(payload.items, params.interval, payload.provider, payload.source);
+  const revisionCandidates = normalizeHistoryRevisionCandidates(
+    params.symbol,
+    payload.items,
+    params.interval,
+    payload.provider,
+    payload.source,
+  );
+  const bars = revisionCandidates.map((candidate) => ({ ...candidate.bar }));
   return {
     bars,
+    revisionCandidates,
     provider: payload.provider,
     source: payload.source,
     freshness: payload.freshness,
@@ -1196,6 +1218,7 @@ async function fetchCountBackKlineRequestBars(params: {
 }): Promise<HistoryKlineRequestResult> {
   const pages: NonNullable<HistoryKlineRequestResult['pages']> = [];
   let combinedBars: TradingViewBar[] = [];
+  let combinedRevisionCandidates: SpotKlineRevisionCandidate[] = [];
   let firstResult: HistoryKlineRequestResult | null = null;
   let cursorEndTime = params.endTime;
   let terminalNoData = false;
@@ -1269,6 +1292,7 @@ async function fetchCountBackKlineRequestBars(params: {
       return {
         ...result,
         bars: [],
+        revisionCandidates: [],
         pageCount: pages.length,
         requestedBars: params.requiredBars,
         reachedRequiredBars: false,
@@ -1278,7 +1302,13 @@ async function fetchCountBackKlineRequestBars(params: {
     }
 
     const beforeCount = combinedBars.length;
-    combinedBars = mergeTradingViewBars([...combinedBars, ...result.bars]);
+    const byOpenTime = new Map<number, SpotKlineRevisionCandidate>();
+    for (const candidate of [...combinedRevisionCandidates, ...result.revisionCandidates]) {
+      byOpenTime.set(candidate.openTime, candidate);
+    }
+    combinedRevisionCandidates = Array.from(byOpenTime.values())
+      .sort((left, right) => left.bar.time - right.bar.time);
+    combinedBars = mergeTradingViewBars(combinedRevisionCandidates.map((candidate) => candidate.bar));
     const earliestBar = combinedBars[0];
 
     if (combinedBars.length >= params.requiredBars || !earliestBar) break;
@@ -1288,16 +1318,19 @@ async function fetchCountBackKlineRequestBars(params: {
     cursorEndTime = earliestBar.time;
   }
 
-  const finalBars = mergeTradingViewBars(combinedBars)
+  const finalRevisionCandidates = combinedRevisionCandidates
     .slice(-Math.min(params.requiredBars, SPOT_TV_GETBARS_MAX_INTERNAL_BARS));
+  const finalBars = finalRevisionCandidates.map((candidate) => ({ ...candidate.bar }));
   const reachedRequiredBars = finalBars.length >= params.requiredBars;
   const baseResult = firstResult || {
     bars: [],
+    revisionCandidates: [],
   };
 
   return {
     ...baseResult,
     bars: finalBars,
+    revisionCandidates: finalRevisionCandidates,
     pageCount: pages.length,
     requestedBars: params.requiredBars,
     reachedRequiredBars,
@@ -1369,7 +1402,9 @@ export function createSpotTradingViewDatafeed(
   let destroyed = false;
   const requestGuard = new SpotKlineRequestGuard();
   const emptyRangeGuard = new SpotEmptyRangeGuard();
+  const revisionCache = createSpotKlineRevisionCache();
   let activeGetBarsLatestBarKey = '';
+  let activeRevisionInterval = '';
   const realtimeOwner = `tradingview:${apiSymbol}:${datafeedInstanceId}`;
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
@@ -1388,6 +1423,7 @@ export function createSpotTradingViewDatafeed(
 
   const clearRealtimeSubscriberState = (subscriberUid: string) => {
     const latestBarKey = latestBarKeyByUid.get(subscriberUid);
+    const activeInterval = activeRealtimeIntervalByUid.get(subscriberUid);
     if (latestBarKey) {
       latestBars.delete(latestBarKey);
       historyReadyByLatestBarKey.delete(latestBarKey);
@@ -1397,6 +1433,12 @@ export function createSpotTradingViewDatafeed(
     latestBarKeyByUid.delete(subscriberUid);
     activeRealtimeIntervalByUid.delete(subscriberUid);
     activeSubscriptionKeyByUid.delete(subscriberUid);
+    if (
+      activeInterval
+      && !Array.from(activeRealtimeIntervalByUid.values()).includes(activeInterval)
+    ) {
+      revisionCache.clearScope(apiSymbol, activeInterval);
+    }
   };
 
   const syncLastEmittedAfterHistory = (latestBarKey: string, latestBarTime: number) => {
@@ -1440,6 +1482,10 @@ export function createSpotTradingViewDatafeed(
       const requestResolution = normalizeResolution(resolution);
       const chartInterval = tradingViewResolutionToSpotInterval(requestResolution);
       const interval = getBackendKlineIntervalForTradingView(requestResolution);
+      if (activeRevisionInterval && activeRevisionInterval !== interval) {
+        revisionCache.clearScope(apiSymbol, activeRevisionInterval);
+      }
+      activeRevisionInterval = interval;
       const countBack = Number(periodParams.countBack || 0);
       const { isHistoryRequest, requestedEndTime } = classifyKlineRequest(periodParams);
       const requiredBars = isHistoryRequest
@@ -1804,7 +1850,25 @@ export function createSpotTradingViewDatafeed(
       if (!isHistoryRequest && !endTime) {
         const l1MinBars = getL1CurrentKlineCacheMinBars(interval, requiredBars);
         const cacheLookup = inspectCurrentKlineCache(apiSymbol, interval, requiredBars, { minBars: l1MinBars });
-        const cached = cacheLookup.hit;
+        const cachedHit = cacheLookup.hit;
+        const cached = cachedHit
+          ? {
+            ...cachedHit,
+            bars: revisionCache.mergeMany(
+              cachedHit.revisionCandidates?.length
+                ? cachedHit.revisionCandidates
+                : cachedHit.bars.map((bar) => ({
+                  symbol: apiSymbol,
+                  interval,
+                  openTime: bar.time,
+                  bar,
+                  provider: cachedHit.provider,
+                  source: cachedHit.source,
+                  revision: extractSpotKlineRevisionMetadata(null),
+                })),
+            ).map((candidate) => candidate.bar),
+          }
+          : null;
         const cachedContinuityStats = cached ? getBarsContinuityStats(cached.bars, interval) : null;
         const cachedSparseRealBars = Boolean(cached?.bars.length && isSparseRealKlineSeries({
           interval,
@@ -1986,7 +2050,13 @@ export function createSpotTradingViewDatafeed(
       });
 
       void request
-        .then((result) => {
+        .then((rawResult) => {
+          const revisionCandidates = revisionCache.mergeMany(rawResult.revisionCandidates);
+          const result: HistoryKlineRequestResult = {
+            ...rawResult,
+            revisionCandidates,
+            bars: revisionCandidates.map((candidate) => ({ ...candidate.bar })),
+          };
           const { bars, provider, source } = result;
           if (bars.length) {
             emptyRangeGuard.clearAfterBars(emptyRangeState.key, emptyRangeState.dataset);
@@ -2015,6 +2085,7 @@ export function createSpotTradingViewDatafeed(
               interval,
               limit: Math.max(requiredBars, bars.length),
               bars,
+              revisionCandidates,
               provider,
               source,
             });
@@ -2121,7 +2192,25 @@ export function createSpotTradingViewDatafeed(
             error: err instanceof Error ? err.message : String(err),
           });
           if (!isHistoryRequest) {
-            const cached = readCurrentKlineCache(apiSymbol, interval, requiredBars, { allowStale: true });
+            const cachedHit = readCurrentKlineCache(apiSymbol, interval, requiredBars, { allowStale: true });
+            const cached = cachedHit
+              ? {
+                ...cachedHit,
+                bars: revisionCache.mergeMany(
+                  cachedHit.revisionCandidates?.length
+                    ? cachedHit.revisionCandidates
+                    : cachedHit.bars.map((bar) => ({
+                      symbol: apiSymbol,
+                      interval,
+                      openTime: bar.time,
+                      bar,
+                      provider: cachedHit.provider,
+                      source: cachedHit.source,
+                      revision: extractSpotKlineRevisionMetadata(null),
+                    })),
+                ).map((candidate) => candidate.bar),
+              }
+              : null;
             const cachedContinuityStats = cached ? getBarsContinuityStats(cached.bars, interval) : null;
             if (
               cached?.bars.length &&
@@ -2225,6 +2314,7 @@ export function createSpotTradingViewDatafeed(
     subscribeBars(_symbolInfo, resolution, onRealtime, subscriberUid) {
       const existingUnsubscribe = unsubscribeByUid.get(subscriberUid);
       existingUnsubscribe?.();
+      if (existingUnsubscribe) clearRealtimeSubscriberState(subscriberUid);
 
       const requestResolution = normalizeResolution(resolution);
       const chartInterval = tradingViewResolutionToSpotInterval(requestResolution);
@@ -2311,6 +2401,23 @@ export function createSpotTradingViewDatafeed(
         const originalTime = klinePayload
           ? normalizeKlineTimeMs(klinePayload as SpotMarketKlineItem)
           : 0;
+        if (!originalTime) return;
+        const latestAcceptedTime = Math.max(
+          latestBar?.time || 0,
+          getRealtimeHighWaterMark(latestBarKey),
+          lastEmittedBarTimeByUid.get(subscriberUid) || 0,
+        );
+        if (bar.time < latestAcceptedTime) return;
+        const revisionResult = revisionCache.merge({
+          symbol: apiSymbol,
+          interval,
+          openTime: originalTime,
+          bar,
+          provider: klineProvider,
+          source: klineSource,
+          revision: extractSpotKlineRevisionMetadata(klinePayload),
+        });
+        const revisionBar = revisionResult.winner.bar;
         const realtimeDebugPayload = {
           eventType: message.type,
           symbol: apiSymbol,
@@ -2319,30 +2426,33 @@ export function createSpotTradingViewDatafeed(
           chartInterval,
           backendInterval: interval,
           originalTime,
-          normalizedTime: bar.time,
-          tradingDate: getTradingDateFromNormalizedTime(bar.time),
-          open: bar.open,
-          high: bar.high,
-          low: bar.low,
-          close: bar.close,
-          volume: bar.volume || 0,
+          normalizedTime: revisionBar.time,
+          tradingDate: getTradingDateFromNormalizedTime(revisionBar.time),
+          open: revisionBar.open,
+          high: revisionBar.high,
+          low: revisionBar.low,
+          close: revisionBar.close,
+          volume: revisionBar.volume || 0,
           isDwm: isProviderCandleOnlyInterval(interval),
-          matchedLastBarTime: Boolean(latestBar && latestBar.time === bar.time),
+          matchedLastBarTime: Boolean(latestBar && latestBar.time === revisionBar.time),
           provider: klineProvider || null,
           source: klineSource || null,
+          revisionDecision: revisionResult.decision,
+          revisionReason: revisionResult.reason,
         };
         spotTradingViewDebug('subscribeBars update', realtimeDebugPayload);
 
-        if (latestBar && bar.time < latestBar.time) return;
+        if (revisionResult.decision !== 'ACCEPT') return;
+        if (latestBar && revisionBar.time < latestBar.time) return;
 
-        const didEmit = emitRealtimeBar(bar, 'kline');
+        const didEmit = emitRealtimeBar(revisionBar, 'kline');
         if (!didEmit) return;
         options.onKlineRealtime?.({
           symbol: apiSymbol,
           interval,
           reason: 'kline',
-          barTime: bar.time,
-          close: bar.close,
+          barTime: revisionBar.time,
+          close: revisionBar.close,
           provider: klineProvider || null,
           source: klineSource || 'LIVE_WS',
           freshness: klineFreshness,
@@ -2435,6 +2545,8 @@ export function createSpotTradingViewDatafeed(
       unsubscribeByUid.clear();
       latestBarKeyByUid.clear();
       latestBars.clear();
+      revisionCache.clear();
+      activeRevisionInterval = '';
       historyReadyByLatestBarKey.clear();
       lastEmittedBarTimeByUid.clear();
       lastDroppedRealtimeBarByUid.clear();

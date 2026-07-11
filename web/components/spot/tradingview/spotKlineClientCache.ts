@@ -17,6 +17,51 @@ export type SpotTradingViewBar = {
   volume?: number;
 };
 
+export type SpotKlineRevisionMetadata = {
+  revisionEpoch: number | null;
+  revisionSeq: number | null;
+  isClosed: boolean | null;
+  closeStateSource: string | null;
+};
+
+export type SpotKlineRevisionCandidate = {
+  symbol: string;
+  interval: string;
+  openTime: number;
+  bar: SpotTradingViewBar;
+  provider?: unknown;
+  source?: unknown;
+  revision: SpotKlineRevisionMetadata;
+};
+
+export type SpotKlineRevisionMergeResult = {
+  decision: 'ACCEPT' | 'REJECT' | 'NO_CHANGE';
+  reason:
+    | 'NEW_BUCKET'
+    | 'NEW_EPOCH'
+    | 'STALE_EPOCH'
+    | 'NEWER_REVISION'
+    | 'STALE_REVISION'
+    | 'CLOSE_UPGRADE'
+    | 'CLOSED_DOWNGRADE'
+    | 'DUPLICATE'
+    | 'REVISION_CONFLICT'
+    | 'VERSIONED_OVER_LEGACY'
+    | 'LEGACY_BELOW_VERSIONED'
+    | 'LEGACY_UPDATE';
+  winner: SpotKlineRevisionCandidate;
+};
+
+export type SpotKlineRevisionCache = {
+  merge: (candidate: SpotKlineRevisionCandidate) => SpotKlineRevisionMergeResult;
+  mergeMany: (candidates: SpotKlineRevisionCandidate[]) => SpotKlineRevisionCandidate[];
+  get: (symbol: string, interval: string, openTime: number) => SpotKlineRevisionCandidate | null;
+  clearScope: (symbol: string, interval: string) => void;
+  clearSymbol: (symbol: string) => void;
+  clear: () => void;
+  size: () => number;
+};
+
 export type SpotKlineContinuityStats = {
   duplicateCount: number;
   gapCount: number;
@@ -34,6 +79,7 @@ export type SpotKlineCacheEntry = {
   returnedCount: number;
   terminalComplete: boolean;
   bars: SpotTradingViewBar[];
+  revisionCandidates?: SpotKlineRevisionCandidate[];
   provider?: unknown;
   source?: unknown;
   cachedAt: number;
@@ -113,6 +159,223 @@ const SPOT_KLINE_LOAD_POLICY: Record<string, SpotKlineLoadPolicy> = {
 const SPOT_KLINE_CONTRACT_PRELOAD_LIMIT = 360;
 
 const currentKlineCache = new Map<string, SpotKlineCacheEntry>();
+
+type SpotKlineScopeAuthority = {
+  revisionEpoch: number;
+  provider: string;
+};
+
+function normalizeRevisionNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : null;
+}
+
+function normalizeClosedState(value: unknown): boolean | null {
+  if (value === true || value === false) return value;
+  if (value === 1 || value === '1' || String(value).trim().toLowerCase() === 'true') return true;
+  if (value === 0 || value === '0' || String(value).trim().toLowerCase() === 'false') return false;
+  return null;
+}
+
+export function extractSpotKlineRevisionMetadata(payload: unknown): SpotKlineRevisionMetadata {
+  const item = payload && typeof payload === 'object'
+    ? payload as Record<string, unknown>
+    : {};
+  const closeStateSource = String(item.close_state_source || '').trim().toUpperCase();
+  return {
+    revisionEpoch: normalizeRevisionNumber(item.revision_epoch),
+    revisionSeq: normalizeRevisionNumber(item.revision_seq),
+    isClosed: normalizeClosedState(item.is_closed),
+    closeStateSource: closeStateSource || null,
+  };
+}
+
+function hasRevisionEvidence(revision: SpotKlineRevisionMetadata): boolean {
+  return revision.revisionEpoch !== null && revision.revisionSeq !== null;
+}
+
+function getCloseStateRank(revision: SpotKlineRevisionMetadata): number {
+  if (revision.isClosed === null) return 0;
+  if (!revision.isClosed) return 1;
+  return revision.closeStateSource === 'PROVIDER_CONFIRMED' ? 3 : 2;
+}
+
+function sameTradingViewBar(left: SpotTradingViewBar, right: SpotTradingViewBar): boolean {
+  return (
+    left.time === right.time
+    && left.open === right.open
+    && left.high === right.high
+    && left.low === right.low
+    && left.close === right.close
+    && Number(left.volume || 0) === Number(right.volume || 0)
+  );
+}
+
+function sameCloseState(left: SpotKlineRevisionMetadata, right: SpotKlineRevisionMetadata): boolean {
+  return (
+    left.isClosed === right.isClosed
+    && left.closeStateSource === right.closeStateSource
+  );
+}
+
+function cloneRevisionCandidate(candidate: SpotKlineRevisionCandidate): SpotKlineRevisionCandidate {
+  return {
+    ...candidate,
+    bar: { ...candidate.bar },
+    revision: { ...candidate.revision },
+  };
+}
+
+function buildRevisionScopeKey(symbol: string, interval: string): string {
+  return `${normalizeSpotSymbol(symbol)}:${normalizeSpotInterval(interval)}`;
+}
+
+export function buildSpotKlineRevisionKey(symbol: string, interval: string, openTime: number): string {
+  return `${buildRevisionScopeKey(symbol, interval)}:${Math.floor(openTime)}`;
+}
+
+export function createSpotKlineRevisionCache(): SpotKlineRevisionCache {
+  const winners = new Map<string, SpotKlineRevisionCandidate>();
+  const scopeAuthorities = new Map<string, SpotKlineScopeAuthority>();
+
+  const clearScope = (symbol: string, interval: string) => {
+    const scopeKey = buildRevisionScopeKey(symbol, interval);
+    for (const [key, candidate] of Array.from(winners.entries())) {
+      if (buildRevisionScopeKey(candidate.symbol, candidate.interval) === scopeKey) {
+        winners.delete(key);
+      }
+    }
+    scopeAuthorities.delete(scopeKey);
+  };
+
+  const merge = (rawCandidate: SpotKlineRevisionCandidate): SpotKlineRevisionMergeResult => {
+    const candidate = cloneRevisionCandidate({
+      ...rawCandidate,
+      symbol: normalizeSpotSymbol(rawCandidate.symbol),
+      interval: normalizeSpotInterval(rawCandidate.interval),
+      openTime: Math.floor(rawCandidate.openTime),
+    });
+    const key = buildSpotKlineRevisionKey(candidate.symbol, candidate.interval, candidate.openTime);
+    const scopeKey = buildRevisionScopeKey(candidate.symbol, candidate.interval);
+    const incomingHasRevision = hasRevisionEvidence(candidate.revision);
+    const incomingEpoch = candidate.revision.revisionEpoch;
+    const incomingProvider = normalizeProvider(candidate.provider);
+    const scopeAuthority = scopeAuthorities.get(scopeKey);
+
+    if (incomingHasRevision && incomingEpoch !== null) {
+      if (scopeAuthority && incomingEpoch < scopeAuthority.revisionEpoch) {
+        const winner = winners.get(key) || candidate;
+        return { decision: 'REJECT', reason: 'STALE_EPOCH', winner: cloneRevisionCandidate(winner) };
+      }
+      if (scopeAuthority && incomingEpoch === scopeAuthority.revisionEpoch) {
+        if (scopeAuthority.provider && incomingProvider && scopeAuthority.provider !== incomingProvider) {
+          const winner = winners.get(key) || candidate;
+          return { decision: 'REJECT', reason: 'STALE_EPOCH', winner: cloneRevisionCandidate(winner) };
+        }
+      }
+      if (!scopeAuthority || incomingEpoch > scopeAuthority.revisionEpoch) {
+        clearScope(candidate.symbol, candidate.interval);
+        scopeAuthorities.set(scopeKey, {
+          revisionEpoch: incomingEpoch,
+          provider: incomingProvider,
+        });
+      }
+    }
+
+    const existing = winners.get(key);
+    if (!existing) {
+      winners.set(key, candidate);
+      return { decision: 'ACCEPT', reason: 'NEW_BUCKET', winner: cloneRevisionCandidate(candidate) };
+    }
+
+    const existingHasRevision = hasRevisionEvidence(existing.revision);
+    if (incomingHasRevision && !existingHasRevision) {
+      winners.set(key, candidate);
+      return { decision: 'ACCEPT', reason: 'VERSIONED_OVER_LEGACY', winner: cloneRevisionCandidate(candidate) };
+    }
+    if (!incomingHasRevision && existingHasRevision) {
+      return { decision: 'REJECT', reason: 'LEGACY_BELOW_VERSIONED', winner: cloneRevisionCandidate(existing) };
+    }
+
+    if (incomingHasRevision && existingHasRevision) {
+      const existingEpoch = existing.revision.revisionEpoch as number;
+      const nextEpoch = candidate.revision.revisionEpoch as number;
+      if (nextEpoch < existingEpoch) {
+        return { decision: 'REJECT', reason: 'STALE_EPOCH', winner: cloneRevisionCandidate(existing) };
+      }
+      if (nextEpoch > existingEpoch) {
+        winners.set(key, candidate);
+        return { decision: 'ACCEPT', reason: 'NEW_EPOCH', winner: cloneRevisionCandidate(candidate) };
+      }
+
+      const existingCloseRank = getCloseStateRank(existing.revision);
+      const incomingCloseRank = getCloseStateRank(candidate.revision);
+      if (incomingCloseRank < existingCloseRank) {
+        return { decision: 'REJECT', reason: 'CLOSED_DOWNGRADE', winner: cloneRevisionCandidate(existing) };
+      }
+      if (incomingCloseRank > existingCloseRank) {
+        winners.set(key, candidate);
+        return { decision: 'ACCEPT', reason: 'CLOSE_UPGRADE', winner: cloneRevisionCandidate(candidate) };
+      }
+
+      const existingSeq = existing.revision.revisionSeq as number;
+      const incomingSeq = candidate.revision.revisionSeq as number;
+      if (incomingSeq < existingSeq) {
+        return { decision: 'REJECT', reason: 'STALE_REVISION', winner: cloneRevisionCandidate(existing) };
+      }
+      if (incomingSeq > existingSeq) {
+        winners.set(key, candidate);
+        return { decision: 'ACCEPT', reason: 'NEWER_REVISION', winner: cloneRevisionCandidate(candidate) };
+      }
+      if (sameTradingViewBar(existing.bar, candidate.bar) && sameCloseState(existing.revision, candidate.revision)) {
+        return { decision: 'NO_CHANGE', reason: 'DUPLICATE', winner: cloneRevisionCandidate(existing) };
+      }
+      return { decision: 'REJECT', reason: 'REVISION_CONFLICT', winner: cloneRevisionCandidate(existing) };
+    }
+
+    if (sameTradingViewBar(existing.bar, candidate.bar) && sameCloseState(existing.revision, candidate.revision)) {
+      return { decision: 'NO_CHANGE', reason: 'DUPLICATE', winner: cloneRevisionCandidate(existing) };
+    }
+    if (getCloseStateRank(candidate.revision) < getCloseStateRank(existing.revision)) {
+      return { decision: 'REJECT', reason: 'CLOSED_DOWNGRADE', winner: cloneRevisionCandidate(existing) };
+    }
+    winners.set(key, candidate);
+    return { decision: 'ACCEPT', reason: 'LEGACY_UPDATE', winner: cloneRevisionCandidate(candidate) };
+  };
+
+  return {
+    merge,
+    mergeMany(candidates) {
+      const candidateKeys = new Set<string>();
+      for (const candidate of candidates) {
+        candidateKeys.add(buildSpotKlineRevisionKey(candidate.symbol, candidate.interval, candidate.openTime));
+        merge(candidate);
+      }
+      return Array.from(candidateKeys)
+        .map((key) => winners.get(key))
+        .filter((candidate): candidate is SpotKlineRevisionCandidate => Boolean(candidate))
+        .map(cloneRevisionCandidate)
+        .sort((left, right) => left.bar.time - right.bar.time);
+    },
+    get(symbol, interval, openTime) {
+      const winner = winners.get(buildSpotKlineRevisionKey(symbol, interval, openTime));
+      return winner ? cloneRevisionCandidate(winner) : null;
+    },
+    clearScope,
+    clearSymbol(symbol) {
+      const normalizedSymbol = normalizeSpotSymbol(symbol);
+      for (const candidate of Array.from(winners.values())) {
+        if (candidate.symbol === normalizedSymbol) clearScope(candidate.symbol, candidate.interval);
+      }
+    },
+    clear() {
+      winners.clear();
+      scopeAuthorities.clear();
+    },
+    size: () => winners.size,
+  };
+}
 
 function normalizeProvider(value: unknown): string {
   return String(value || '').trim().toUpperCase();
@@ -417,7 +680,13 @@ export function inspectCurrentKlineCache(
 
     const returnedLimit = Math.min(requestedLimit, entry.bars.length);
     return {
-      hit: { ...entry, bars: cloneBars(entry.bars.slice(-returnedLimit)) },
+      hit: {
+        ...entry,
+        bars: cloneBars(entry.bars.slice(-returnedLimit)),
+        revisionCandidates: entry.revisionCandidates
+          ?.slice(-returnedLimit)
+          .map(cloneRevisionCandidate),
+      },
       reason: 'hit',
       candidate: entry,
       cacheAgeMs,
@@ -444,6 +713,7 @@ export function writeCurrentKlineCache(params: {
   interval: string;
   limit: number;
   bars: SpotTradingViewBar[];
+  revisionCandidates?: SpotKlineRevisionCandidate[];
   provider?: unknown;
   source?: unknown;
 }) {
@@ -453,7 +723,35 @@ export function writeCurrentKlineCache(params: {
   const normalizedInterval = normalizeSpotInterval(params.interval);
   const normalizedLimit = Math.max(1, params.limit);
   const key = buildCurrentKlineCacheKey(normalizedSymbol, normalizedInterval, normalizedLimit);
-  const storedBars = cloneBars(params.bars.slice(-normalizedLimit));
+  const revisionCache = createSpotKlineRevisionCache();
+  const existingScopeCandidates = Array.from(currentKlineCache.values())
+    .filter((entry) => entry.symbol === normalizedSymbol && entry.interval === normalizedInterval)
+    .flatMap((entry) => entry.revisionCandidates?.length
+      ? entry.revisionCandidates
+      : entry.bars.map((bar) => ({
+        symbol: normalizedSymbol,
+        interval: normalizedInterval,
+        openTime: bar.time,
+        bar,
+        provider: entry.provider,
+        source: entry.source,
+        revision: extractSpotKlineRevisionMetadata(null),
+      })));
+  revisionCache.mergeMany(existingScopeCandidates);
+  const incomingRevisionCandidates = params.revisionCandidates?.length
+    ? params.revisionCandidates
+    : params.bars.map((bar) => ({
+      symbol: normalizedSymbol,
+      interval: normalizedInterval,
+      openTime: bar.time,
+      bar,
+      provider: params.provider,
+      source: params.source,
+      revision: extractSpotKlineRevisionMetadata(null),
+    }));
+  const storedRevisionCandidates = revisionCache.mergeMany(incomingRevisionCandidates)
+    .slice(-normalizedLimit);
+  const storedBars = storedRevisionCandidates.map((candidate) => ({ ...candidate.bar }));
   if (shouldRejectKlineContinuity({
     interval: normalizedInterval,
     source: params.source,
@@ -476,6 +774,7 @@ export function writeCurrentKlineCache(params: {
     returnedCount: storedBars.length,
     terminalComplete,
     bars: storedBars,
+    revisionCandidates: storedRevisionCandidates,
     provider: params.provider,
     source: params.source,
     cachedAt,
@@ -511,7 +810,11 @@ export function writeCurrentKlineCache(params: {
       .forEach((item) => currentKlineCache.delete(item.key));
   }
 
-  return { ...entry, bars: cloneBars(entry.bars) };
+  return {
+    ...entry,
+    bars: cloneBars(entry.bars),
+    revisionCandidates: entry.revisionCandidates?.map(cloneRevisionCandidate),
+  };
 }
 
 function normalizeKlineTimeMs(item: SpotMarketKlineItem): number {
@@ -609,6 +912,31 @@ export function normalizeKlineItemsToTradingViewBars(
   return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
 }
 
+export function normalizeKlineItemsToRevisionCandidates(
+  symbol: string,
+  items: SpotMarketKlineItem[] | undefined,
+  interval: string,
+  provider?: unknown,
+  source?: unknown,
+): SpotKlineRevisionCandidate[] {
+  const byOpenTime = new Map<number, SpotKlineRevisionCandidate>();
+  for (const item of items || []) {
+    const openTime = normalizeKlineTimeMs(item);
+    const bar = klineToBar(item, interval, provider, source);
+    if (!openTime || !bar) continue;
+    byOpenTime.set(openTime, {
+      symbol,
+      interval,
+      openTime,
+      bar,
+      provider,
+      source,
+      revision: extractSpotKlineRevisionMetadata(item),
+    });
+  }
+  return Array.from(byOpenTime.values()).sort((left, right) => left.bar.time - right.bar.time);
+}
+
 export async function fetchAndCacheCurrentKlineBars(params: {
   symbol: string;
   interval: string;
@@ -621,18 +949,21 @@ export async function fetchAndCacheCurrentKlineBars(params: {
     limit: params.limit,
     forceRest: true,
   });
-  const bars = normalizeKlineItemsToTradingViewBars(
+  const revisionCandidates = normalizeKlineItemsToRevisionCandidates(
+    params.symbol,
     payload.items,
     params.interval,
     payload.provider,
     payload.source,
   );
+  const bars = revisionCandidates.map((candidate) => ({ ...candidate.bar }));
   if (!bars.length || (params.shouldStore && !params.shouldStore())) return null;
   return writeCurrentKlineCache({
     symbol: params.symbol,
     interval: params.interval,
     limit: params.limit,
     bars,
+    revisionCandidates,
     provider: payload.provider,
     source: payload.source,
   });
