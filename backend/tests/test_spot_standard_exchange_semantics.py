@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 from app.schemas.market import DepthResponse
@@ -88,6 +89,143 @@ def test_spot_ws_depth_payload_marks_empty_book_missing() -> None:
     assert payload["depth"]["source"] == "MISSING"
     assert payload["depth"]["freshness"] == "MISSING"
     assert payload["depth"]["stale"] is False
+
+
+def test_spot_ws_trade_incremental_payload_preserves_identity_and_time_contract() -> None:
+    async def run() -> None:
+        manager = MarketWsManager()
+        sent: list[tuple[str, dict]] = []
+
+        async def capture(symbol: str, payload: dict) -> None:
+            sent.append((symbol, payload))
+
+        manager._send_payload = capture
+        await manager.send_trade(
+            symbol="BTC/USDT",
+            id="item-id",
+            trade_id="trade-id",
+            provider_trade_id="provider-id",
+            price="100",
+            amount="2",
+            side="buy",
+            ts=1_000,
+            event_time_ms=1_000,
+            received_at_ms=2_000,
+            time_origin="PROVIDER",
+            created_at="1970-01-01T00:00:01",
+            provider="OKX_SPOT",
+            provider_symbol="BTC-USDT",
+            source="LIVE_WS",
+            freshness="LIVE",
+        )
+
+        assert len(sent) == 1
+        symbol, payload = sent[0]
+        assert symbol == "BTCUSDT"
+        assert payload["type"] == "spot_trade"
+        assert payload["trade_id"] == "trade-id"
+        assert payload["provider_trade_id"] == "provider-id"
+        assert payload["ts"] == 1_000
+        assert payload["event_time_ms"] == 1_000
+        assert payload["received_at_ms"] == 2_000
+        assert payload["time_origin"] == "PROVIDER"
+        assert payload["trade"] == {
+            "id": "item-id",
+            "trade_id": "trade-id",
+            "provider_trade_id": "provider-id",
+            "price": "100",
+            "amount": "2",
+            "side": "BUY",
+            "ts": 1_000,
+            "event_time_ms": 1_000,
+            "received_at_ms": 2_000,
+            "time_origin": "PROVIDER",
+            "created_at": "1970-01-01T00:00:01",
+            "provider": "OKX_SPOT",
+            "provider_symbol": "BTC-USDT",
+            "source": "LIVE_WS",
+            "freshness": "LIVE",
+        }
+
+    asyncio.run(run())
+
+
+def test_spot_ws_trade_incremental_keeps_explicit_untimed_and_zero_values() -> None:
+    async def run() -> None:
+        manager = MarketWsManager()
+        sent: list[dict] = []
+
+        async def capture(_symbol: str, payload: dict) -> None:
+            sent.append(payload)
+
+        manager._send_payload = capture
+        await manager.send_trade(
+            symbol="BTCUSDT",
+            id=0,
+            trade_id=0,
+            provider_trade_id=0,
+            price="100",
+            amount="1",
+            side="sell",
+            ts=9_999,
+            event_time_ms=None,
+            received_at_ms=0,
+            time_origin="PROVIDER",
+            created_at=None,
+            provider="BITGET_SPOT",
+            provider_symbol="BTCUSDT",
+            source="LIVE_WS",
+            freshness="LIVE",
+        )
+
+        payload = sent[0]
+        assert payload["trade_id"] == 0
+        assert payload["provider_trade_id"] == 0
+        assert payload["event_time_ms"] is None
+        assert payload["received_at_ms"] == 0
+        assert payload["trade"]["id"] == 0
+        assert payload["trade"]["trade_id"] == 0
+        assert payload["trade"]["provider_trade_id"] == 0
+        assert payload["trade"]["event_time_ms"] is None
+        assert payload["trade"]["received_at_ms"] == 0
+        assert payload["trade"]["created_at"] is None
+
+    asyncio.run(run())
+
+
+def test_spot_ws_trade_incremental_accepts_legacy_send_trade_signature() -> None:
+    async def run() -> None:
+        manager = MarketWsManager()
+        sent: list[dict] = []
+
+        async def capture(_symbol: str, payload: dict) -> None:
+            sent.append(payload)
+
+        manager._send_payload = capture
+        await manager.send_trade(
+            symbol="MFCUSDT",
+            price="10.5",
+            amount="2",
+            side="buy",
+            ts=1_234,
+            trade_id=77,
+        )
+
+        payload = sent[0]
+        assert payload["type"] == "spot_trade"
+        assert payload["symbol"] == "MFCUSDT"
+        assert payload["trade_id"] == 77
+        assert payload["provider_trade_id"] == 77
+        assert payload["ts"] == 1_234
+        assert payload["trade"]["id"] == 77
+        assert payload["trade"]["trade_id"] == 77
+        assert payload["trade"]["provider_trade_id"] == 77
+        assert payload["trade"]["price"] == "10.5"
+        assert payload["trade"]["amount"] == "2"
+        assert payload["trade"]["side"] == "BUY"
+        assert payload["trade"]["ts"] == 1_234
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

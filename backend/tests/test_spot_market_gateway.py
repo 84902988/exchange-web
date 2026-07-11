@@ -97,7 +97,8 @@ class FakeProvider:
             provider_symbol="BTCUSDT",
             source="LIVE_WS",
             freshness="LIVE",
-            updated_at_ms=1234,
+            updated_at_ms=9_000,
+            received_at_ms=8_000,
             trades=[
                 TradeItem(
                     id="trade-1",
@@ -107,11 +108,15 @@ class FakeProvider:
                     amount="1.2345",
                     side="BUY",
                     ts=1000,
+                    event_time_ms=1000,
+                    received_at_ms=2_345,
+                    time_origin="PROVIDER",
+                    created_at="1970-01-01T00:00:01",
                     provider="BITGET_SPOT",
                     provider_symbol="BTCUSDT",
                     source="LIVE_WS",
                     freshness="LIVE",
-                    updated_at_ms=1234,
+                    updated_at_ms=5_678,
                 )
             ],
         )
@@ -204,14 +209,17 @@ def _ticker_payload(**overrides) -> dict:
 
 
 def _trade_item(
-    trade_id: str | None,
+    item_id: str | None,
     *,
     price: str = "2",
     amount: str = "1",
     side: str = "BUY",
     ts: int = 1000,
+    **overrides,
 ) -> TradeItem:
-    return TradeItem(id=trade_id, price=price, amount=amount, side=side, ts=ts)
+    payload = {"id": item_id, "price": price, "amount": amount, "side": side, "ts": ts}
+    payload.update(overrides)
+    return TradeItem(**payload)
 
 
 def _trades_response(items: list[TradeItem]) -> TradesResponse:
@@ -559,7 +567,14 @@ def test_gateway_trade_broadcast_state_dedupes_ids_and_preserves_new_trade_order
 def test_gateway_trade_broadcast_state_uses_fallback_signature_without_trade_id() -> None:
     async def run() -> None:
         gateway = _new_test_gateway()
-        trade = _trade_item(None, price="2", amount="1", side="BUY", ts=1000)
+        trade = _trade_item(
+            None,
+            price="2",
+            amount="1",
+            side="BUY",
+            ts=1000,
+            event_time_ms=1000,
+        )
         trades = _trades_response([trade])
 
         first_batch = gateway._new_trades_for_broadcast("BTCUSDT", trades)
@@ -570,11 +585,83 @@ def test_gateway_trade_broadcast_state_uses_fallback_signature_without_trade_id(
         _age_broadcast_state(gateway, key)
         assert gateway._new_trades_for_broadcast("BTCUSDT", trades) == []
 
-        changed_trade = _trade_item(None, price="2", amount="1", side="BUY", ts=1001)
+        changed_trade = _trade_item(
+            None,
+            price="2",
+            amount="1",
+            side="BUY",
+            ts=1001,
+            event_time_ms=1001,
+        )
         _age_broadcast_state(gateway, key)
         changed_batch = gateway._new_trades_for_broadcast("BTCUSDT", _trades_response([changed_trade]))
         assert len(changed_batch) == 1
         assert changed_batch[0].ts == 1001
+
+    asyncio.run(run())
+
+
+def test_gateway_trade_signature_uses_shared_strong_identity_priority_and_provider_scope() -> None:
+    async def run() -> None:
+        gateway = _new_test_gateway()
+        full = _trade_item(
+            "item-id",
+            trade_id="trade-id",
+            provider_trade_id="provider-id",
+            provider="OKX_SPOT",
+        )
+        without_provider_id = _trade_item(
+            "item-id",
+            trade_id="trade-id",
+            provider_trade_id=None,
+            provider="OKX_SPOT",
+        )
+        without_trade_id = _trade_item(
+            "item-id",
+            trade_id=None,
+            provider_trade_id=None,
+            provider="OKX_SPOT",
+        )
+
+        assert gateway._trade_signature(full) == "provider:OKX_SPOT|trade:provider-id"
+        assert gateway._trade_signature(without_provider_id) == "provider:OKX_SPOT|trade:trade-id"
+        assert gateway._trade_signature(without_trade_id) == "provider:OKX_SPOT|trade:item-id"
+        assert gateway._trade_signature(full) != gateway._trade_signature(
+            full.model_copy(update={"provider": "BITGET_SPOT"})
+        )
+
+    asyncio.run(run())
+
+
+def test_gateway_weak_trade_occurrences_preserve_multiplicity_without_rebroadcast() -> None:
+    async def run() -> None:
+        gateway = _new_test_gateway()
+        weak = {
+            "event_time_ms": 1_000,
+            "received_at_ms": 2_000,
+            "provider": "BITGET_SPOT",
+            "provider_symbol": "BTCUSDT",
+        }
+        two = _trades_response([
+            _trade_item(None, **weak),
+            _trade_item(None, **weak),
+        ])
+
+        first_batch = gateway._new_trades_for_broadcast("BTCUSDT", two)
+        assert len(first_batch) == 2
+
+        key = gateway._domain_key("trades", "BTCUSDT", provider="BITGET_SPOT")
+        _age_broadcast_state(gateway, key)
+        assert gateway._new_trades_for_broadcast("BTCUSDT", two) == []
+
+        three = _trades_response([
+            _trade_item(None, **weak),
+            _trade_item(None, **weak),
+            _trade_item(None, **weak),
+        ])
+        _age_broadcast_state(gateway, key)
+        third_occurrence = gateway._new_trades_for_broadcast("BTCUSDT", three)
+        assert len(third_occurrence) == 1
 
     asyncio.run(run())
 
@@ -968,13 +1055,18 @@ def test_gateway_broadcasts_provider_trade_once() -> None:
         assert provider.ensured == ["BTCUSDT"]
         assert len(ws_manager.trade_broadcasts) == 1
         assert ws_manager.trade_broadcasts[0]["symbol"] == "BTCUSDT"
+        assert ws_manager.trade_broadcasts[0]["id"] == "trade-1"
         assert ws_manager.trade_broadcasts[0]["trade_id"] == "trade-1"
         assert ws_manager.trade_broadcasts[0]["provider_trade_id"] == "provider-trade-1"
         assert ws_manager.trade_broadcasts[0]["provider"] == "BITGET_SPOT"
         assert ws_manager.trade_broadcasts[0]["provider_symbol"] == "BTCUSDT"
         assert ws_manager.trade_broadcasts[0]["source"] == "LIVE_WS"
         assert ws_manager.trade_broadcasts[0]["freshness"] == "LIVE"
-        assert ws_manager.trade_broadcasts[0]["updated_at_ms"] == 1234
+        assert ws_manager.trade_broadcasts[0]["updated_at_ms"] == 5_678
+        assert ws_manager.trade_broadcasts[0]["event_time_ms"] == 1000
+        assert ws_manager.trade_broadcasts[0]["received_at_ms"] == 2_345
+        assert ws_manager.trade_broadcasts[0]["time_origin"] == "PROVIDER"
+        assert ws_manager.trade_broadcasts[0]["created_at"] == "1970-01-01T00:00:01"
         assert ws_manager.trade_broadcasts[0]["price"] == "2.1234"
 
         await asyncio.sleep(0.25)
