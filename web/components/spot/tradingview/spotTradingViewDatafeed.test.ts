@@ -104,9 +104,29 @@ const continuity = {
   invalidOhlcCount: 0,
 }
 
+const revisionCacheModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./spotKlineClientCache.ts', import.meta.url)),
+  {
+    '@/lib/api/modules/spot': {
+      getSpotKlines: async () => ({ items: [] }),
+      normalizeSpotSymbol: (symbol: string) => String(symbol || '').replace(/[^a-z0-9]/gi, '').toUpperCase(),
+    },
+    '../chart/chart.utils': {
+      normalizeTimeToSeconds: (value: unknown) => {
+        const number = Number(value)
+        if (!Number.isFinite(number)) return 0
+        return number > 9_999_999_999 ? Math.floor(number / 1000) : Math.floor(number)
+      },
+    },
+    './spotKlinePerf': { markSpotKlinePerf: () => null },
+  },
+)
+
 const cacheModule = {
   buildKlineCachePerfPayload: () => ({}),
   cloneBars: (bars: any[]) => bars.map((bar) => ({ ...bar })),
+  createSpotKlineRevisionCache: revisionCacheModule.createSpotKlineRevisionCache,
+  extractSpotKlineRevisionMetadata: revisionCacheModule.extractSpotKlineRevisionMetadata,
   fetchAndCacheCurrentKlineBars: async () => null,
   getBackendKlineIntervalForSpotInterval: (interval: string) => (
     interval.endsWith('utc') ? interval.slice(0, -3) : interval
@@ -618,4 +638,197 @@ test('realtime kline metadata is exposed without rewriting provider OHLCV', asyn
   })
   datafeed.destroy()
   assert.equal(klineSubscriber, null)
+})
+
+test('realtime revision guard accepts upgrades and suppresses stale duplicate downgrade and time violation', async () => {
+  requestKlines = async () => metadata([row()])
+  const emittedBars: Array<Record<string, unknown>> = []
+  const historyCalls: HistoryCall[] = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => historyCalls.length === 1, 'history setup did not settle')
+  datafeed.subscribeBars(symbolInfo(), '1', (bar: Record<string, unknown>) => emittedBars.push(bar), 'revision-test')
+  assert.ok(klineSubscriber, 'kline subscriber was not registered')
+
+  const emit = (overrides: Record<string, unknown>) => klineSubscriber?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    source: 'LIVE_WS',
+    kline: {
+      open_time: 1_717_000_120_000,
+      open: '101',
+      high: '106',
+      low: '99',
+      close: '101',
+      volume: '7',
+      provider: 'OKX_SPOT',
+      source: 'LIVE_WS',
+      revision_epoch: 1,
+      revision_seq: 5,
+      is_closed: false,
+      close_state_source: 'PROVIDER_CONFIRMED',
+      ...overrides,
+    },
+  })
+
+  emit({})
+  emit({ revision_seq: 4, close: '99' })
+  emit({})
+  emit({ revision_seq: 6, close: '102' })
+  emit({ revision_seq: 6, close: '102', is_closed: true })
+  emit({ revision_seq: 7, close: '102', is_closed: false })
+  emit({ open_time: 1_717_000_060_000, revision_seq: 99, close: '88' })
+
+  assert.deepEqual(emittedBars.map((bar) => bar.close), [101, 102, 102])
+  datafeed.destroy()
+})
+
+test('late REST getBars cannot overwrite newer realtime same-bucket revision', async () => {
+  requestKlines = async () => metadata([row()])
+  const initialHistory: HistoryCall[] = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => initialHistory.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => initialHistory.length === 1, 'initial history did not settle')
+  datafeed.subscribeBars(symbolInfo(), '1', () => undefined, 'rest-race-test')
+
+  const openTime = 1_717_000_120_000
+  klineSubscriber?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    source: 'LIVE_WS',
+    kline: {
+      ...row(openTime, '101'),
+      provider: 'OKX_SPOT',
+      source: 'LIVE_WS',
+      revision_epoch: 1,
+      revision_seq: 5,
+      is_closed: false,
+      close_state_source: 'PROVIDER_CONFIRMED',
+    },
+  })
+
+  requestKlines = async () => metadata([{
+    ...row(openTime, '100'),
+    revision_epoch: 1,
+    revision_seq: 3,
+    is_closed: false,
+    close_state_source: 'PROVIDER_CONFIRMED',
+  }], { provider: 'OKX_SPOT', source: 'REST_SNAPSHOT' })
+  const lateRestHistory: HistoryCall[] = []
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => lateRestHistory.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => lateRestHistory.length === 1, 'late REST history did not settle')
+
+  assert.equal(lateRestHistory[0].bars.at(-1)?.close, 101)
+  datafeed.destroy()
+})
+
+test('interval switch and destroy make retired realtime callbacks harmless', async () => {
+  requestKlines = async () => metadata([row()])
+  const historyCalls: HistoryCall[] = []
+  const emittedBars: Array<Record<string, unknown>> = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => historyCalls.length === 1, 'history setup did not settle')
+  datafeed.subscribeBars(symbolInfo(), '1', (bar: Record<string, unknown>) => emittedBars.push(bar), 'switch-test')
+  const retiredOneMinuteHandler = klineSubscriber
+
+  datafeed.subscribeBars(symbolInfo(), '5', (bar: Record<string, unknown>) => emittedBars.push(bar), 'switch-test')
+  retiredOneMinuteHandler?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    kline: { ...row(1_717_000_120_000, '99'), revision_epoch: 1, revision_seq: 99 },
+  })
+  assert.deepEqual(emittedBars, [])
+
+  const retiredFiveMinuteHandler = klineSubscriber
+  datafeed.destroy()
+  retiredFiveMinuteHandler?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '5m',
+    kline: { ...row(1_717_000_400_000, '105'), revision_epoch: 1, revision_seq: 1 },
+  })
+  assert.deepEqual(emittedBars, [])
+  assert.equal(klineSubscriber, null)
+})
+
+test('symbol switch destroys old revision state and accepts the new symbol independently', async () => {
+  requestKlines = async () => metadata([row()])
+  const btcHistory: HistoryCall[] = []
+  const btc = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+  btc.getBars(
+    symbolInfo('BTCUSDT'),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => btcHistory.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => btcHistory.length === 1, 'BTC history did not settle')
+  btc.subscribeBars(symbolInfo('BTCUSDT'), '1', () => undefined, 'symbol-test')
+  const retiredBtcHandler = klineSubscriber
+  btc.destroy()
+
+  const ethHistory: HistoryCall[] = []
+  const ethBars: Array<Record<string, unknown>> = []
+  const eth = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'ETHUSDT' })
+  eth.getBars(
+    symbolInfo('ETHUSDT'),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => ethHistory.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => ethHistory.length === 1, 'ETH history did not settle')
+  eth.subscribeBars(symbolInfo('ETHUSDT'), '1', (bar: Record<string, unknown>) => ethBars.push(bar), 'symbol-test')
+
+  retiredBtcHandler?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    kline: { ...row(1_717_000_120_000, '999'), revision_epoch: 99, revision_seq: 99 },
+  })
+  klineSubscriber?.({
+    type: 'spot_kline_update',
+    symbol: 'ETHUSDT',
+    interval: '1m',
+    kline: {
+      ...row(1_717_000_120_000, '105'),
+      provider: 'OKX_SPOT',
+      revision_epoch: 1,
+      revision_seq: 1,
+      is_closed: false,
+      close_state_source: 'PROVIDER_CONFIRMED',
+    },
+  })
+
+  assert.deepEqual(ethBars.map((bar) => bar.close), [105])
+  eth.destroy()
 })
