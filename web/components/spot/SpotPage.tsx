@@ -25,6 +25,7 @@ import {
 import { formatSpotDisplaySymbol } from './spotFormat';
 import { useSpotMarket } from './useSpotMarket';
 import type { SpotNativeCandleDisplayPrice } from './spotDisplayPrice';
+import { resolveSpotExecutableDepth } from './spotExecutableDepth';
 import {
   formatSpotPrice,
   normalizeSpotPriceInput,
@@ -229,6 +230,8 @@ function mergeSpotPairOption(existing: SpotPairOption, incoming: SpotPairOption)
     marketStatusText: preserveSpotPairValue(existing.marketStatusText, incoming.marketStatusText),
     marketSessionType: preserveSpotPairValue(existing.marketSessionType, incoming.marketSessionType),
     quoteFreshness: preserveSpotPairValue(existing.quoteFreshness, incoming.quoteFreshness),
+    status: preserveSpotPairValue(existing.status, incoming.status),
+    enabled: preserveSpotPairValue(existing.enabled, incoming.enabled),
     showSpotLogo: preserveSpotPairValue(existing.showSpotLogo, incoming.showSpotLogo) ?? false,
     spotLogoUrl: preserveSpotPairValue(existing.spotLogoUrl, incoming.spotLogoUrl),
   };
@@ -372,6 +375,8 @@ type SpotPairOption = {
   marketStatusText?: string | null;
   marketSessionType?: string | null;
   quoteFreshness?: string | null;
+  status?: number | string | null;
+  enabled?: boolean | null;
   showSpotLogo?: boolean;
   spotLogoUrl?: string | null;
 };
@@ -544,6 +549,8 @@ function buildSpotPairOption(item: SpotMarketTickerItem | SpotMarketPairItem): S
     marketStatusText: (item as SpotMarketTickerItem).market_status_text,
     marketSessionType: (item as SpotMarketTickerItem).market_session_type,
     quoteFreshness: (item as SpotMarketTickerItem).quote_freshness,
+    status: (item as SpotMarketPairItem).status,
+    enabled: (item as SpotMarketPairItem).enabled,
     ...(hasShowSpotLogo
       ? { showSpotLogo: parseBooleanFlag((item as SpotMarketTickerItem | SpotMarketPairItem).show_spot_logo) }
       : {}),
@@ -1479,16 +1486,14 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const orderbookReferencePrice = spotLastPrice;
   const safeSpotDepth = !isSwitchingSymbol && hasCurrentSpotMarketView && hasCurrentSpotDepth ? spotMarket.depth : null;
   const safeSpotTrades = !isSwitchingSymbol && hasCurrentSpotMarketView ? spotMarket.trades : [];
-  const safeBestAsk = !isSwitchingSymbol ? spotMarket.bestAsk : null;
-  const safeBestBid = !isSwitchingSymbol ? spotMarket.bestBid : null;
-  const safeOrderbookMidPrice = !isSwitchingSymbol ? spotMarket.orderbookMidPrice : null;
+  const safeBestAsk = !isSwitchingSymbol && hasCurrentSpotMarketView && hasCurrentSpotDepth
+    ? spotMarket.bestAsk
+    : null;
+  const safeBestBid = !isSwitchingSymbol && hasCurrentSpotMarketView && hasCurrentSpotDepth
+    ? spotMarket.bestBid
+    : null;
   const safeLastTradePrice = !isSwitchingSymbol ? spotMarket.lastTradePrice : null;
   const safeLastTradeAt = !isSwitchingSymbol ? spotMarket.lastTradeAt : null;
-  const formMarketPrice = formatOrderInputPriceBySymbol(
-    symbol,
-    String(safeOrderbookMidPrice ?? safeBestAsk ?? safeBestBid ?? ''),
-    pricePrecision,
-  );
   const latestTradePriceText = formatOrderInputPriceBySymbol(
     symbol,
     String(safeLastTradePrice ?? ''),
@@ -1513,6 +1518,27 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     : marketFeedDataSource;
   const spotSources = !isSwitchingSymbol ? spotMarket.sources : { depth: null, trades: null, ticker: null, kline: null };
   const spotFreshness = !isSwitchingSymbol ? spotMarket.freshness : { depth: null, trades: null, ticker: null, kline: null };
+  const executableDepth = resolveSpotExecutableDepth({
+    currentSymbol: normalizedCurrentSymbol,
+    depthSymbol: spotMarket.depth?.symbol || spotMarket.marketView?.symbol,
+    bestBid: safeBestBid,
+    bestAsk: safeBestAsk,
+    depthSource: spotSources.depth,
+    depthFreshness: spotFreshness.depth,
+    depthStatus: !isSwitchingSymbol && hasCurrentSpotMarketView
+      ? spotMarket.marketView?.depth_status
+      : null,
+    depthStale: safeSpotDepth?.stale,
+    dataSource: spotMarketDataSource,
+    marketStatus: !isSwitchingSymbol && hasCurrentSpotMarketView
+      ? spotMarket.marketView?.market_status || selectedTicker?.marketStatus
+      : selectedTicker?.marketStatus,
+    pairMarketStatus: selectedPair?.marketStatus,
+    pairEnabled: selectedPair?.enabled,
+    pairStatus: selectedPair?.status,
+    isSwitchingSymbol,
+    isLoading: isSwitchingSymbol || (spotMarket.isLoading && safeSpotDepth === null),
+  });
   const spotPriceStatusSource = activeDisplayPrice.source;
   const spotPriceStatusFreshness = activeDisplayPrice.freshness;
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
@@ -1723,10 +1749,11 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           <div className="min-h-[420px] min-w-0 xl:col-start-3 xl:row-start-1 xl:min-h-0">
             <div className="relative flex min-h-[420px] flex-col overflow-visible border border-white/10 bg-[#12161c] p-1.5 xl:min-h-[max(540px,62vh)] xl:p-2 [@media(max-height:850px)]:xl:min-h-0 [@media(max-height:850px)]:xl:p-1.5">
               <SpotTradingForm
+                key={normalizedCurrentSymbol}
                 symbol={symbol}
                 baseAsset={spotAssetSymbols.baseAsset}
                 quoteAsset={spotAssetSymbols.quoteAsset}
-                marketPrice={formMarketPrice}
+                executableDepth={executableDepth}
                 latestTradePrice={latestTradePriceText || null}
                 latestTradeAt={safeLastTradeAt}
                 selectedPrice={orderPrice}
@@ -1736,10 +1763,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                 accountBalances={accountBalances}
                 asks={spotDepthAsks}
                 bids={spotDepthBids}
-                depthSource={spotSources.depth}
-                depthFreshness={spotFreshness.depth}
-                dataSource={spotMarketDataSource}
-                marketDataLoading={spotMarket.isLoading || isSwitchingSymbol}
                 onPriceChange={setOrderPrice}
                 onOrderSuccess={handleOrderSuccess}
                 isLoggedIn={isLoggedIn}
