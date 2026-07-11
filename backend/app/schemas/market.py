@@ -18,6 +18,8 @@ class DepthResponse(BaseModel):
     bids: List[DepthItem]
     asks: List[DepthItem]
     ts: int
+    event_time_ms: Optional[int] = None
+    received_at_ms: Optional[int] = None
     provider: Optional[str] = None
     stale: bool = False
     updated_at: Optional[str] = None

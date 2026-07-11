@@ -441,6 +441,14 @@ def _spot_provider_ts(value: Any) -> int:
     return timestamp if timestamp > 0 else _now_ms()
 
 
+def _spot_provider_event_time_ms(value: Any) -> Optional[int]:
+    try:
+        timestamp = int(value or 0)
+    except Exception:
+        return None
+    return timestamp if timestamp > 0 else None
+
+
 def _trade_signature(trade: dict[str, Any]) -> str:
     trade_id = str(trade.get("id") or trade.get("tradeId") or "").strip()
     if trade_id:
@@ -461,6 +469,8 @@ def _public_kline_item(item: dict[str, Any]) -> dict[str, Any]:
 
 def _depth_response_from_record(record: dict[str, Any], *, limit: Optional[int] = None) -> DepthResponse:
     depth_limit = _depth_limit(limit)
+    event_time_ms = _spot_provider_event_time_ms(record.get("ts"))
+    received_at_ms = int(record.get("updated_at_ms") or 0)
     return DepthResponse(
         symbol=normalize_spot_ws_symbol(record.get("symbol")),
         price_precision=int(record.get("price_precision") or 8),
@@ -468,11 +478,13 @@ def _depth_response_from_record(record: dict[str, Any], *, limit: Optional[int] 
         bids=[DepthItem(**item) for item in list(record.get("bids") or [])[:depth_limit]],
         asks=[DepthItem(**item) for item in list(record.get("asks") or [])[:depth_limit]],
         ts=int(record.get("ts") or 0),
+        event_time_ms=event_time_ms,
+        received_at_ms=received_at_ms,
         provider=str(record.get("provider") or PROVIDER_BITGET_SPOT),
         stale=False,
         updated_at=record.get("updated_at"),
         source=str(record.get("source") or SPOT_PROVIDER_WS_SOURCE),
-        fetched_at=int(record.get("updated_at_ms") or _now_ms()),
+        fetched_at=received_at_ms,
     )
 
 
@@ -528,7 +540,7 @@ def normalize_bitget_depth_message(
         return None
 
     now_ms = _now_ms()
-    exchange_ts = _spot_provider_ts(row.get("ts"))
+    exchange_ts = _spot_provider_event_time_ms(row.get("ts")) or 0
     return {
         "symbol": normalize_spot_ws_symbol(local_symbol),
         "provider": PROVIDER_BITGET_SPOT,
@@ -583,7 +595,7 @@ def normalize_okx_depth_message(
         return None
 
     now_ms = _now_ms()
-    exchange_ts = _spot_provider_ts(row.get("ts"))
+    exchange_ts = _spot_provider_event_time_ms(row.get("ts")) or 0
     return {
         "symbol": normalize_spot_ws_symbol(local_symbol),
         "provider": PROVIDER_OKX_SPOT,

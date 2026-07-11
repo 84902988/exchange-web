@@ -1150,6 +1150,14 @@ def _spot_provider_ts(value: Any) -> int:
     return _now_ms()
 
 
+def _spot_provider_event_time_ms(value: Any) -> Optional[int]:
+    try:
+        timestamp = int(value or 0)
+    except Exception:
+        return None
+    return timestamp if timestamp > 0 else None
+
+
 def _spot_provider_symbol(db: Session, pair: TradingPair, provider: MarketDataProviderConfig) -> str:
     return resolve_spot_provider_symbol(
         db,
@@ -1516,11 +1524,10 @@ def _spot_depth_from_provider(
     payload: Any,
     limit: int,
 ) -> DepthResponse:
+    normalized_provider = str(provider_code or "").strip().upper()
     data = payload
-    if provider_code == "OKX_SPOT":
+    if normalized_provider in {"OKX_SPOT", "BITGET_SPOT"}:
         data = _spot_provider_first_row(payload)
-    elif provider_code == "BITGET_SPOT":
-        data = payload.get("data") if isinstance(payload, dict) else payload
     bids_raw = data.get("bids") if isinstance(data, dict) else None
     asks_raw = data.get("asks") if isinstance(data, dict) else None
 
@@ -1542,19 +1549,27 @@ def _spot_depth_from_provider(
     asks = adapt(asks_raw)
     if not bids or not asks:
         raise ValueError("spot depth unavailable")
-    now = datetime.utcnow().isoformat()
+    event_time_ms = _spot_provider_event_time_ms(
+        data.get("ts")
+        if normalized_provider in {"OKX_SPOT", "BITGET_SPOT"} and isinstance(data, dict)
+        else data.get("event_time_ms") if isinstance(data, dict) else None
+    )
+    received_at_ms = _now_ms()
+    updated_at = datetime.utcfromtimestamp(received_at_ms / 1000).isoformat()
     return DepthResponse(
         symbol=pair.symbol,
         price_precision=int(pair.price_precision or 8),
         amount_precision=int(pair.amount_precision or 8),
         bids=bids,
         asks=asks,
-        ts=_now_ms(),
+        ts=event_time_ms or received_at_ms,
+        event_time_ms=event_time_ms,
+        received_at_ms=received_at_ms,
         provider=provider_code,
         stale=False,
-        updated_at=now,
+        updated_at=updated_at,
         source="external",
-        fetched_at=_now_ms(),
+        fetched_at=received_at_ms,
     )
 
 
