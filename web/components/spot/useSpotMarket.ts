@@ -22,7 +22,6 @@ import {
 } from './spotTickerColor';
 import {
   selectSpotDisplayPrice,
-  sortSpotTradesLatestFirst,
   type SpotDisplayPrice,
   type SpotDisplayPriceCandidate,
   type SpotNativeCandleDisplayPrice,
@@ -42,6 +41,20 @@ import {
   type SpotMarketDomainSequenceState,
   type SpotMarketDomainTransport,
 } from './spotMarketDomainSequencer';
+import {
+  applySpotTradeReceivedAtMs,
+  getLatestSpotTradeRow,
+  getSpotTradeCollectionAction,
+  getSpotTradeReceivedAtMs,
+  limitSpotTradeRows,
+  mergeSpotTradeIncrementalRow,
+  mergeSpotTradeSnapshotRows,
+  resolveSpotTradeBatchReceivedAtMs,
+  resolveSpotTradeIncrementalReceivedAtMs,
+  shouldApplySpotTradeAuthoritySideEffects,
+  type SpotTradeCollectionAction,
+  type SpotWeakDeliveryCounts,
+} from './spotTradeRows';
 
 type SpotMarketCache = {
   symbol?: string;
@@ -78,6 +91,7 @@ type SpotTradeMessage = SpotMarketRealtimeMessage & {
   provider_symbol?: string | null;
   source?: string | null;
   freshness?: string | null;
+  received_at_ms?: string | number | null;
   trade?: SpotMarketTradeItem & { id?: string | number };
 };
 
@@ -153,7 +167,6 @@ type SpotDisplayDomainEvents = {
 const SPOT_VIEW_FOREGROUND_POLL_MS = 10000;
 const SPOT_VIEW_HIDDEN_POLL_MS = 30000;
 const SPOT_VIEW_MIN_REFRESH_INTERVAL_MS = 2000;
-const MAX_SEEN_TRADE_KEYS = 240;
 const EMPTY_LAST_TRADE_STATE: SpotLastTradeState = {
   price: null,
   at: null,
@@ -174,13 +187,20 @@ function normalizeDepth(depth?: SpotDepthResponse | null): SpotDepthResponse | n
 
 function normalizeTrades(
   trades?: SpotMarketSnapshotMessage['trades'] | null,
+  symbol = '',
+  fallbackProvider?: string | null,
+  fallbackProviderSymbol?: string | null,
 ): SpotMarketTradeItem[] {
   if (!trades) return [];
-  return sortSpotTradesLatestFirst(normalizeSpotTrades({
+  return limitSpotTradeRows(normalizeSpotTrades({
     symbol: trades.symbol || '',
     items: trades.items,
     trades: trades.trades,
-  }), extractSpotTradeEventTimeMs);
+  }), {
+    symbol: symbol || trades.symbol || '',
+    provider: fallbackProvider || getRecordText(trades, 'provider'),
+    providerSymbol: fallbackProviderSymbol || getRecordText(trades, 'provider_symbol'),
+  });
 }
 
 function hasValue(value: unknown): boolean {
@@ -374,17 +394,6 @@ function getTradeIdentity(trade?: SpotMarketTradeItem | null): {
   };
 }
 
-function getTradeDedupKey(
-  symbol: string,
-  trade?: SpotMarketTradeItem | null,
-  provider?: string | null,
-): string | null {
-  const { tradeId, providerTradeId } = getTradeIdentity(trade);
-  const id = providerTradeId || tradeId;
-  if (!id) return null;
-  return `${symbol}:${String(provider || trade?.provider || '').trim().toUpperCase() || 'UNKNOWN'}:${id}`;
-}
-
 function isActiveLastTrade(state: SpotLastTradeState, symbol: string): boolean {
   return sameSymbol(state.symbol, symbol) && hasValue(state.price);
 }
@@ -474,18 +483,12 @@ function getViewSummaryText(view: SpotMarketView, key: string): string | null {
   return getRecordText(view.raw_source_summary, key);
 }
 
-function getLatestTrade(trades: SpotMarketTradeItem[]): SpotMarketTradeItem | null {
-  let latestTrade: SpotMarketTradeItem | null = null;
-  let latestTimeMs: number | null = null;
-
-  for (const trade of trades) {
-    const eventTimeMs = extractSpotTradeEventTimeMs(trade);
-    if (!latestTrade || (eventTimeMs !== null && (latestTimeMs === null || eventTimeMs > latestTimeMs))) {
-      latestTrade = trade;
-      latestTimeMs = eventTimeMs;
-    }
-  }
-  return latestTrade;
+function getLatestTrade(
+  trades: SpotMarketTradeItem[],
+  symbol = '',
+  provider?: string | null,
+): SpotMarketTradeItem | null {
+  return getLatestSpotTradeRow(trades, { symbol, provider });
 }
 
 function createViewDomainEvent(
@@ -516,13 +519,21 @@ function createViewDomainEvent(
   }
 
   if (domain === 'trades') {
-    const nextTrades = normalizeTrades(view.trades);
+    const provider = getRecordText(view.trades, 'provider') || getViewSummaryText(view, 'trades_provider');
+    const providerSymbol = getRecordText(view.trades, 'provider_symbol');
+    const normalizedTrades = normalizeTrades(view.trades, symbol, provider, providerSymbol);
+    const tradeReceivedAtMs = resolveSpotTradeBatchReceivedAtMs(
+      view.trades,
+      normalizedTrades,
+      receivedAtMs,
+    );
+    const nextTrades = applySpotTradeReceivedAtMs(normalizedTrades, tradeReceivedAtMs);
     return {
       symbol,
       domain,
-      provider: getRecordText(view.trades, 'provider') || getViewSummaryText(view, 'trades_provider'),
+      provider,
       eventTimeMs: extractSpotTradesEventTimeMs(nextTrades),
-      receivedAtMs,
+      receivedAtMs: tradeReceivedAtMs,
       transport,
       source: getRecordText(view.trades, 'source') || view.trades_source || (nextTrades.length ? 'UNKNOWN' : 'MISSING'),
       freshness: getRecordText(view.trades, 'freshness') || view.trades_freshness || (nextTrades.length ? 'RECENT' : 'MISSING'),
@@ -582,7 +593,7 @@ export function applySpotMarketDomainEventToView(
 
   if (event.domain === 'trades') {
     const nextTrades = Array.isArray(event.data) ? event.data as SpotMarketTradeItem[] : [];
-    const latestTrade = getLatestTrade(nextTrades);
+    const latestTrade = getLatestTrade(nextTrades, event.symbol, event.provider);
     return {
       ...view,
       trades: buildTradesPayload(event.symbol, nextTrades),
@@ -649,6 +660,32 @@ function protectActiveLastTrade(
   };
 }
 
+function applyTradeRowsToView(
+  view: SpotMarketView,
+  symbol: string,
+  rows: SpotMarketTradeItem[],
+): SpotMarketView {
+  return {
+    ...view,
+    trades: buildTradesPayload(symbol, rows),
+    trades_status: rows.length ? 'ok' : view.trades_status,
+  };
+}
+
+function protectAuthoritativeTrade(
+  view: SpotMarketView,
+  trade: SpotMarketTradeItem | null,
+): SpotMarketView {
+  if (!trade || !hasValue(trade.price)) return view;
+  return {
+    ...view,
+    display_price: trade.price,
+    display_price_source: 'last_trade',
+    last_price: trade.price,
+    last_trade_price: trade.price,
+  };
+}
+
 function mergeIncomingMarketViewBase(
   previousView: SpotMarketView | null,
   incomingView: SpotMarketView,
@@ -695,6 +732,7 @@ export function useSpotMarket(
   const [lastPrice, setLastPrice] = useState<string | number | null>(null);
   const [priceDirection, setPriceDirection] = useState<RealtimePriceDirection>('flat');
   const [lastTradeState, setLastTradeState] = useState<SpotLastTradeState>(EMPTY_LAST_TRADE_STATE);
+  const [authoritativeTrade, setAuthoritativeTrade] = useState<SpotMarketTradeItem | null>(null);
   const [displayDomainEvents, setDisplayDomainEvents] = useState<SpotDisplayDomainEvents>({
     trades: null,
     ticker: null,
@@ -705,8 +743,9 @@ export function useSpotMarket(
   const lastPriceRef = useRef<string | number | null>(null);
   const priceDirectionRef = useRef<RealtimePriceDirection>('flat');
   const lastTradeStateRef = useRef<SpotLastTradeState>(EMPTY_LAST_TRADE_STATE);
-  const seenTradeKeysRef = useRef<Set<string>>(new Set());
-  const seenTradeKeyQueueRef = useRef<string[]>([]);
+  const authoritativeTradeRef = useRef<SpotMarketTradeItem | null>(null);
+  const tradesRef = useRef<SpotMarketTradeItem[]>([]);
+  const weakDeliveryCountsRef = useRef<SpotWeakDeliveryCounts>({});
   const requestSeqRef = useRef(0);
   const activeSymbolRef = useRef(normalizedSymbol);
   const refreshInFlightRef = useRef(false);
@@ -724,20 +763,14 @@ export function useSpotMarket(
     setLastTradeState(nextState);
   }, []);
 
-  const rememberTradeKey = useCallback((key: string | null): boolean => {
-    if (!key) return false;
-    const seenKeys = seenTradeKeysRef.current;
-    if (seenKeys.has(key)) return true;
+  const updateAuthoritativeTrade = useCallback((trade: SpotMarketTradeItem | null) => {
+    authoritativeTradeRef.current = trade;
+    setAuthoritativeTrade(trade);
+  }, []);
 
-    seenKeys.add(key);
-    seenTradeKeyQueueRef.current.push(key);
-
-    while (seenTradeKeyQueueRef.current.length > MAX_SEEN_TRADE_KEYS) {
-      const staleKey = seenTradeKeyQueueRef.current.shift();
-      if (staleKey) seenKeys.delete(staleKey);
-    }
-
-    return false;
+  const commitTradeRows = useCallback((rows: SpotMarketTradeItem[]) => {
+    tradesRef.current = rows;
+    setTrades(rows);
   }, []);
 
   const sequenceDomainEvent = useCallback((
@@ -772,6 +805,99 @@ export function useSpotMarket(
     )?.current || null;
   }, [normalizedSymbol]);
 
+  const synchronizeTradeDomainRows = useCallback((
+    rows: SpotMarketTradeItem[],
+    updateDisplayAuthority: boolean,
+  ): NormalizedSpotMarketDomainEvent<SpotMarketDomainPayload> | null => {
+    const key = getSpotMarketDomainHighWaterKey(normalizedSymbol, 'trades');
+    const state = domainSequenceStateRef.current.get(key);
+    if (!state?.current) return null;
+    const current = { ...state.current, data: rows };
+    domainSequenceStateRef.current.set(key, { ...state, current });
+    if (updateDisplayAuthority) {
+      setDisplayDomainEvents((events) => ({ ...events, trades: current }));
+    }
+    return current;
+  }, [normalizedSymbol]);
+
+  const mergeTradeCollection = useCallback((options: {
+    decision: SpotMarketDomainSequenceDecision<SpotMarketDomainPayload>
+    previousProvider?: string | null
+    incomingProvider?: string | null
+    incomingProviderSymbol?: string | null
+    incomingRows: SpotMarketTradeItem[]
+    incrementalTrade?: SpotMarketTradeItem
+  }) => {
+    const action: SpotTradeCollectionAction = getSpotTradeCollectionAction({
+      accepted: options.decision.accepted,
+      reason: options.decision.reason,
+      currentProvider: options.previousProvider,
+      incomingProvider: options.incomingProvider,
+    });
+    if (action === 'ignore') {
+      return {
+        action,
+        rows: tradesRef.current,
+        addedOccurrence: false,
+        authorityEvent: options.decision.state.current,
+      };
+    }
+
+    const currentRows = action === 'replace' ? [] : tradesRef.current;
+    if (action === 'replace') {
+      weakDeliveryCountsRef.current = {};
+      lastPriceRef.current = null;
+      priceDirectionRef.current = 'flat';
+      updateLastTradeState(EMPTY_LAST_TRADE_STATE);
+      setLastPrice(null);
+      setPriceDirection('flat');
+    }
+    let nextRows: SpotMarketTradeItem[];
+    let addedOccurrence = false;
+    if (options.incrementalTrade) {
+      const merged = mergeSpotTradeIncrementalRow(
+        currentRows,
+        options.incrementalTrade,
+        weakDeliveryCountsRef.current,
+        {
+          symbol: normalizedSymbol,
+          currentProvider: options.previousProvider,
+          incomingProvider: options.incomingProvider,
+          incomingProviderSymbol: options.incomingProviderSymbol,
+        },
+      );
+      nextRows = merged.rows;
+      weakDeliveryCountsRef.current = merged.deliveryCounts;
+      addedOccurrence = merged.addedOccurrence;
+    } else {
+      nextRows = mergeSpotTradeSnapshotRows(currentRows, options.incomingRows, {
+        symbol: normalizedSymbol,
+        currentProvider: options.previousProvider,
+        incomingProvider: options.incomingProvider,
+        incomingProviderSymbol: options.incomingProviderSymbol,
+      });
+    }
+    if (
+      options.decision.accepted
+      && (!options.incrementalTrade || addedOccurrence)
+    ) {
+      updateAuthoritativeTrade(getLatestSpotTradeRow(options.incomingRows, {
+        symbol: normalizedSymbol,
+        provider: options.incomingProvider,
+        providerSymbol: options.incomingProviderSymbol,
+      }));
+    }
+    commitTradeRows(nextRows);
+    const authorityEvent = synchronizeTradeDomainRows(nextRows, options.decision.accepted);
+    return { action, rows: nextRows, addedOccurrence, authorityEvent };
+  }, [
+    commitTradeRows,
+    normalizedSymbol,
+    synchronizeTradeDomainRows,
+    updateAuthoritativeTrade,
+    updateLastTradeState,
+  ]);
+
   const applyView = useCallback((
     view: SpotMarketView,
     transport: Extract<SpotMarketDomainTransport, 'rest' | 'ws_snapshot'>,
@@ -781,13 +907,27 @@ export function useSpotMarket(
     const decisions = new Map<SpotMarketDomain, SpotMarketDomainSequenceDecision<SpotMarketDomainPayload>>();
 
     for (const domain of presentDomains) {
-      decisions.set(domain, sequenceDomainEvent(createViewDomainEvent(
+      const previousEvent = getCurrentDomainEvent(domain);
+      const incomingEvent = createViewDomainEvent(
         view,
         normalizedSymbol,
         domain,
         transport,
         receivedAtMs,
-      )));
+      );
+      const decision = sequenceDomainEvent(incomingEvent);
+      decisions.set(domain, decision);
+      if (domain === 'trades') {
+        mergeTradeCollection({
+          decision,
+          previousProvider: previousEvent?.provider,
+          incomingProvider: incomingEvent.provider,
+          incomingProviderSymbol: getRecordText(view.trades, 'provider_symbol'),
+          incomingRows: Array.isArray(incomingEvent.data)
+            ? incomingEvent.data as SpotMarketTradeItem[]
+            : [],
+        });
+      }
     }
 
     const currentDomainEvents = {
@@ -803,17 +943,13 @@ export function useSpotMarket(
       for (const event of currentEvents) {
         nextView = applySpotMarketDomainEventToView(nextView, event);
       }
+      nextView = protectAuthoritativeTrade(nextView, authoritativeTradeRef.current);
       return protectActiveLastTrade(nextView, lastTradeStateRef.current, normalizedSymbol);
     };
     const mergedView = buildNextView(null);
 
     if (currentDomainEvents.depth) {
       setDepth(currentDomainEvents.depth.data as SpotDepthResponse | null);
-    }
-    if (currentDomainEvents.trades) {
-      setTrades(Array.isArray(currentDomainEvents.trades.data)
-        ? currentDomainEvents.trades.data as SpotMarketTradeItem[]
-        : []);
     }
     setMarketView((previousView) => buildNextView(previousView));
 
@@ -845,20 +981,20 @@ export function useSpotMarket(
       hasUsableMarketState(
         mergedView,
         mergedView.depth || null,
-        normalizeTrades(mergedView.trades),
+        tradesRef.current,
       )
     ) {
       writeMarketCache<SpotMarketCache>('spot', normalizedSymbol, {
         symbol: normalizedSymbol,
         marketView: mergedView,
         depth: mergedView.depth || null,
-        trades: normalizeTrades(mergedView.trades),
+        trades: tradesRef.current,
         lastPrice: getViewLastTradePrice(mergedView) ?? getViewDisplayPrice(mergedView),
         priceDirection: getViewDirection(mergedView),
         updatedAt: receivedAtMs,
       });
     }
-  }, [getCurrentDomainEvent, normalizedSymbol, sequenceDomainEvent]);
+  }, [getCurrentDomainEvent, mergeTradeCollection, normalizedSymbol, sequenceDomainEvent]);
 
   const refresh = useCallback(async (options?: SpotMarketRefreshOptions) => {
     const requestSymbol = normalizedSymbol;
@@ -934,17 +1070,18 @@ export function useSpotMarket(
     activeSymbolRef.current = normalizedSymbol;
     setMarketView(null);
     setDepth(null);
+    tradesRef.current = [];
+    weakDeliveryCountsRef.current = {};
+    updateAuthoritativeTrade(null);
     setTrades([]);
     setLastPrice(null);
     setPriceDirection('flat');
     updateLastTradeState(EMPTY_LAST_TRADE_STATE);
-    seenTradeKeysRef.current.clear();
-    seenTradeKeyQueueRef.current = [];
     lastPriceRef.current = null;
     priceDirectionRef.current = 'flat';
     setError(null);
     setIsLoading(true);
-  }, [normalizedSymbol, updateLastTradeState]);
+  }, [normalizedSymbol, updateAuthoritativeTrade, updateLastTradeState]);
 
   useEffect(() => {
     void refresh({ force: true });
@@ -1012,24 +1149,49 @@ export function useSpotMarket(
       }
 
       if (hasTradesPayload) {
-        const nextTrades = normalizeTrades(snapshot.trades);
+        const tradeProvider = getRecordText(snapshot.trades, 'provider');
+        const tradeProviderSymbol = getRecordText(snapshot.trades, 'provider_symbol');
+        const normalizedTrades = normalizeTrades(
+          snapshot.trades,
+          normalizedSymbol,
+          tradeProvider,
+          tradeProviderSymbol,
+        );
+        const tradeReceivedAtMs = resolveSpotTradeBatchReceivedAtMs(
+          snapshot.trades,
+          normalizedTrades,
+          receivedAtMs,
+        );
+        const nextTrades = applySpotTradeReceivedAtMs(normalizedTrades, tradeReceivedAtMs);
+        const previousTradeEvent = getCurrentDomainEvent('trades');
         const decision = sequenceDomainEvent({
           symbol: normalizedSymbol,
           domain: 'trades',
-          provider: getRecordText(snapshot.trades, 'provider'),
+          provider: tradeProvider,
           eventTimeMs: extractSpotTradesEventTimeMs(nextTrades),
-          receivedAtMs,
+          receivedAtMs: tradeReceivedAtMs,
           transport: 'ws_snapshot',
           source: getRecordText(snapshot.trades, 'source') || (nextTrades.length ? 'UNKNOWN' : 'MISSING'),
           freshness: getRecordText(snapshot.trades, 'freshness') || (nextTrades.length ? 'RECENT' : 'MISSING'),
           data: nextTrades,
         });
-        if (decision.accepted && decision.state.current) {
-          setTrades(nextTrades);
-          const acceptedEvent = decision.state.current;
+        const collection = mergeTradeCollection({
+          decision,
+          previousProvider: previousTradeEvent?.provider,
+          incomingProvider: tradeProvider,
+          incomingProviderSymbol: tradeProviderSymbol,
+          incomingRows: nextTrades,
+        });
+        const authorityEvent = collection.authorityEvent;
+        if (collection.action !== 'ignore' && authorityEvent) {
           setMarketView((prev) => prev
             ? protectActiveLastTrade(
-                applySpotMarketDomainEventToView(prev, acceptedEvent),
+                protectAuthoritativeTrade(
+                  decision.accepted
+                    ? applySpotMarketDomainEventToView(prev, authorityEvent)
+                    : applyTradeRowsToView(prev, normalizedSymbol, collection.rows),
+                  authoritativeTradeRef.current,
+                ),
                 lastTradeStateRef.current,
                 normalizedSymbol,
               )
@@ -1108,32 +1270,16 @@ export function useSpotMarket(
       const msgSymbol = normalizeSpotSymbol(data.symbol || '');
       if (msgSymbol !== normalizedSymbol || !data.trade) return;
 
-      const trade = data.trade;
+      const rawTrade = data.trade;
+      const deliveryReceivedAtMs = resolveSpotTradeIncrementalReceivedAtMs(
+        rawTrade,
+        data,
+        Date.now,
+      );
+      const trade = applySpotTradeReceivedAtMs([rawTrade], deliveryReceivedAtMs)[0];
       const tradeProvider = trade.provider || data.provider;
-      const tradeKey = getTradeDedupKey(normalizedSymbol, trade, tradeProvider);
-      if (tradeKey && seenTradeKeysRef.current.has(tradeKey)) return;
-
-      const currentTradesEvent = getCurrentDomainEvent('trades');
-      const normalizedTradeProvider = normalizeDomainValue(tradeProvider) || 'UNKNOWN';
-      const currentRows = (
-        currentTradesEvent &&
-        (
-          currentTradesEvent.provider === normalizedTradeProvider ||
-          currentTradesEvent.provider === 'UNKNOWN' ||
-          normalizedTradeProvider === 'UNKNOWN'
-        ) &&
-        Array.isArray(currentTradesEvent.data)
-      )
-        ? currentTradesEvent.data as SpotMarketTradeItem[]
-        : [];
-      const nextRows = (tradeKey
-        ? [
-            trade,
-            ...currentRows.filter((item) => (
-              getTradeDedupKey(normalizedSymbol, item, item.provider || tradeProvider) !== tradeKey
-            )),
-          ]
-        : [trade, ...currentRows]).slice(0, 30);
+      const tradeProviderSymbol = trade.provider_symbol || data.provider_symbol;
+      const previousTradeEvent = getCurrentDomainEvent('trades');
       const eventTimeMs = extractSpotTradeEventTimeMs(trade);
       const tradeSource = normalizeDomainValue(trade.source || data.source) || 'LIVE_WS';
       const nextTradeFreshness = normalizeDomainValue(trade.freshness || data.freshness) || 'LIVE';
@@ -1142,15 +1288,40 @@ export function useSpotMarket(
         domain: 'trades',
         provider: tradeProvider,
         eventTimeMs,
-        receivedAtMs: Date.now(),
+        receivedAtMs: deliveryReceivedAtMs ?? 0,
         transport: 'ws_incremental',
         source: tradeSource,
         freshness: nextTradeFreshness,
-        data: nextRows,
+        data: [trade],
       });
-      if (!decision.accepted || !decision.state.current) return;
-      rememberTradeKey(tradeKey);
-      setTrades(nextRows);
+      const collection = mergeTradeCollection({
+        decision,
+        previousProvider: previousTradeEvent?.provider,
+        incomingProvider: tradeProvider,
+        incomingProviderSymbol: tradeProviderSymbol,
+        incomingRows: [trade],
+        incrementalTrade: trade,
+      });
+      if (collection.action === 'ignore' || !collection.authorityEvent) return;
+
+      const shouldApplyTradeSideEffects = shouldApplySpotTradeAuthoritySideEffects({
+        accepted: decision.accepted,
+        addedOccurrence: collection.addedOccurrence,
+      });
+      if (!shouldApplyTradeSideEffects) {
+        setMarketView((prev) => {
+          if (!prev) return prev;
+          const nextView = decision.accepted
+            ? applySpotMarketDomainEventToView(prev, collection.authorityEvent!)
+            : applyTradeRowsToView(prev, normalizedSymbol, collection.rows);
+          return protectActiveLastTrade(
+            protectAuthoritativeTrade(nextView, authoritativeTradeRef.current),
+            lastTradeStateRef.current,
+            normalizedSymbol,
+          );
+        });
+        return;
+      }
 
       const nextDirection = getRealtimePriceDirection(
         trade.price,
@@ -1171,10 +1342,12 @@ export function useSpotMarket(
       updateLastTradeState(nextLastTradeState);
       setLastPrice(trade.price);
       setPriceDirection(nextDirection);
-      const acceptedEvent = decision.state.current;
       setMarketView((prev) => {
         if (!prev) return prev;
-        const nextView = applySpotMarketDomainEventToView(prev, acceptedEvent);
+        const nextView = protectAuthoritativeTrade(
+          applySpotMarketDomainEventToView(prev, collection.authorityEvent!),
+          authoritativeTradeRef.current,
+        );
         return protectActiveLastTrade(
           { ...nextView, price_direction: nextDirection },
           nextLastTradeState,
@@ -1249,8 +1422,8 @@ export function useSpotMarket(
   }, [
     applyView,
     getCurrentDomainEvent,
+    mergeTradeCollection,
     normalizedSymbol,
-    rememberTradeKey,
     sequenceDomainEvent,
     updateLastTradeState,
   ]);
@@ -1324,13 +1497,20 @@ export function useSpotMarket(
   const currentTickerEvent = displayDomainEvents.ticker?.symbol === normalizedSymbol
     ? displayDomainEvents.ticker
     : null;
-  const latestTrade = getLatestTrade(trades);
+  const authorityTradeRows = currentTradesEvent && Array.isArray(currentTradesEvent.data)
+    ? currentTradesEvent.data as SpotMarketTradeItem[]
+    : trades;
+  const latestTrade = authoritativeTrade || getLatestTrade(
+    authorityTradeRows,
+    normalizedSymbol,
+    currentTradesEvent?.provider,
+  );
   const tradeDisplayCandidate: SpotDisplayPriceCandidate | null = latestTrade && currentTradesEvent
     ? {
         symbol: normalizedSymbol,
         price: latestTrade.price,
         eventTimeMs: extractSpotTradeEventTimeMs(latestTrade) ?? currentTradesEvent.eventTimeMs,
-        receivedAtMs: currentTradesEvent.receivedAtMs,
+        receivedAtMs: getSpotTradeReceivedAtMs(latestTrade) ?? currentTradesEvent.receivedAtMs,
         source: latestTrade.source || currentTradesEvent.source,
         provider: latestTrade.provider || currentTradesEvent.provider,
         freshness: latestTrade.freshness || currentTradesEvent.freshness,

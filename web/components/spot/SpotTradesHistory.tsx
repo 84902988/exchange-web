@@ -11,6 +11,10 @@ import {
   resolveSpotMarketStatus,
   spotMarketStatusDotClass,
 } from './spotMarketStatus'
+import {
+  buildSpotTradeRenderRows,
+  getSpotTradeTimeValue,
+} from './spotTradeRows'
 
 type Props = {
   symbol: string
@@ -42,7 +46,7 @@ function formatAmount(value: string | number | undefined | null) {
   return n.toFixed(6)
 }
 
-function formatTime(value?: string | number) {
+function formatTime(value?: string | number | null) {
   if (!value) return '--:--:--'
 
   const date =
@@ -55,10 +59,6 @@ function formatTime(value?: string | number) {
   return date.toLocaleTimeString('zh-CN', {
     hour12: false,
   })
-}
-
-function getTradeTime(item: SpotMarketTradeItem) {
-  return item.ts ?? item.time
 }
 
 function splitSymbol(symbol: string) {
@@ -94,23 +94,25 @@ export default function SpotTradesHistory({
 }: Props) {
   const { t } = useLocaleContext()
   const rows = useMemo(() => trades.slice(0, limit), [limit, trades])
+  const renderRows = useMemo(() => buildSpotTradeRenderRows(rows, { symbol }), [rows, symbol])
 
   const data = useMemo(() => {
-    return rows.map((item, index) => {
-      const currentPrice = toNumber(item.price)
-      const nextItem = rows[index + 1]
-      const prevPrice = nextItem ? toNumber(nextItem.price) : currentPrice
+    return renderRows.map(({ trade, key }, index) => {
+      const currentPrice = toNumber(trade.price)
+      const nextTrade = renderRows[index + 1]?.trade
+      const prevPrice = nextTrade ? toNumber(nextTrade.price) : currentPrice
 
       let direction: 'up' | 'down' | 'flat' = 'flat'
       if (currentPrice > prevPrice) direction = 'up'
       else if (currentPrice < prevPrice) direction = 'down'
 
       return {
-        ...item,
+        trade,
+        key,
         direction,
       }
     })
-  }, [rows])
+  }, [renderRows])
 
   const { base, quote } = splitSymbol(symbol)
   const hasTrades = data.length > 0
@@ -160,9 +162,9 @@ export default function SpotTradesHistory({
 
           <div className="min-h-0 flex-1 overflow-y-auto [scrollbar-color:#3f3f46_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-zinc-700/60 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-500/80">
             {data.map((item, index) => {
-              const priceText = formatPrice(item.price, pricePrecision)
-              const amountText = formatAmount(item.amount)
-              const timeText = formatTime(getTradeTime(item))
+              const priceText = formatPrice(item.trade.price, pricePrecision)
+              const amountText = formatAmount(item.trade.amount)
+              const timeText = formatTime(getSpotTradeTimeValue(item.trade))
 
               let priceClassName = 'text-zinc-200'
               let arrow = ''
@@ -177,14 +179,14 @@ export default function SpotTradesHistory({
 
               return (
                 <div
-                  key={`${getTradeTime(item) ?? ''}-${item.price}-${item.amount}-${index}`}
+                  key={item.key}
                   data-testid={index === 0 ? 'spot-recent-trade-first' : undefined}
-                  data-trade-price={index === 0 ? String(item.price) : undefined}
+                  data-trade-price={index === 0 ? String(item.trade.price) : undefined}
                   className="grid grid-cols-[minmax(0,1.18fr)_minmax(0,0.92fr)_60px] items-center gap-x-2 px-2.5 py-1 text-[12px] transition-colors hover:bg-white/[0.03]"
                 >
                   <button
                     type="button"
-                    onClick={() => onPriceClick?.(String(item.price))}
+                    onClick={() => onPriceClick?.(String(item.trade.price))}
                     className={`overflow-hidden text-ellipsis whitespace-nowrap text-left font-medium tabular-nums ${priceClassName}`}
                   >
                     {priceText}
