@@ -446,7 +446,7 @@ async def spot_market_ws(websocket: WebSocket):
         await market_ws_manager.connect(connected_symbol, websocket, interval=interval)
         manager_connected = True
 
-        await market_ws_manager.send_snapshot(db, connected_symbol)
+        await market_ws_manager.send_snapshot_to_client(db, connected_symbol, websocket)
 
         while True:
             try:
@@ -461,7 +461,12 @@ async def spot_market_ws(websocket: WebSocket):
                     text = message.get("text") or ""
 
                     if text == "ping":
-                        await websocket.send_text("pong")
+                        await market_ws_manager.enqueue_to_client(
+                            websocket,
+                            "pong",
+                            symbol=connected_symbol,
+                            event_type="pong",
+                        )
                         continue
 
                     try:
@@ -495,7 +500,11 @@ async def spot_market_ws(websocket: WebSocket):
                             )
                             manager_connected = True
 
-                            await market_ws_manager.send_snapshot(db, connected_symbol)
+                            await market_ws_manager.send_snapshot_to_client(
+                                db,
+                                connected_symbol,
+                                websocket,
+                            )
 
             except WebSocketDisconnect:
                 break
