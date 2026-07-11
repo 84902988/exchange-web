@@ -150,6 +150,79 @@ def test_spot_ws_trade_incremental_payload_preserves_identity_and_time_contract(
     asyncio.run(run())
 
 
+def test_spot_ws_provider_kline_payload_preserves_revision_and_close_evidence() -> None:
+    async def run() -> None:
+        manager = MarketWsManager()
+        sent: list[tuple[str, dict]] = []
+
+        async def capture(symbol: str, payload: dict) -> None:
+            sent.append((symbol, payload))
+
+        manager._send_payload = capture
+        await manager.broadcast_provider_kline_update(
+            "BTCUSDT",
+            "1m",
+            {
+                "open_time": 2_000,
+                "close_time": 62_000,
+                "open": "100",
+                "high": "110",
+                "low": "95",
+                "close": "101",
+                "volume": "10",
+                "quote_volume": "1010",
+            },
+            source="LIVE_WS",
+            updated_at="1970-01-01T00:00:03",
+            revision_epoch=2,
+            revision_seq=7,
+            is_closed=True,
+            close_state_source="PROVIDER_CONFIRMED",
+        )
+
+        assert len(sent) == 1
+        symbol, payload = sent[0]
+        assert symbol == "BTCUSDT"
+        assert payload["type"] == "spot_kline_update"
+        assert payload["symbol"] == "BTCUSDT"
+        assert payload["interval"] == "1m"
+        assert payload["source"] == "LIVE_WS"
+        assert payload["kline"]["open_time"] == 2_000
+        assert payload["kline"]["revision_epoch"] == 2
+        assert payload["kline"]["revision_seq"] == 7
+        assert payload["kline"]["is_closed"] is True
+        assert payload["kline"]["close_state_source"] == "PROVIDER_CONFIRMED"
+        assert "event_time_ms" not in payload
+        assert "event_time_ms" not in payload["kline"]
+
+    asyncio.run(run())
+
+
+def test_spot_ws_provider_kline_payload_keeps_legacy_call_compatible() -> None:
+    async def run() -> None:
+        manager = MarketWsManager()
+        sent: list[tuple[str, dict]] = []
+
+        async def capture(symbol: str, payload: dict) -> None:
+            sent.append((symbol, payload))
+
+        manager._send_payload = capture
+        await manager.broadcast_provider_kline_update(
+            "BTCUSDT",
+            "1m",
+            {"open_time": 2_000, "close": "101"},
+        )
+
+        kline = sent[0][1]["kline"]
+        assert kline == {"open_time": 2_000, "close": "101"}
+        assert "revision_epoch" not in kline
+        assert "revision_seq" not in kline
+        assert "is_closed" not in kline
+        assert "close_state_source" not in kline
+
+    asyncio.run(run())
+
+
 def test_spot_ws_trade_incremental_keeps_explicit_untimed_and_zero_values() -> None:
     async def run() -> None:
         manager = MarketWsManager()

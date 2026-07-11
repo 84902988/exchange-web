@@ -439,8 +439,21 @@ class MarketWsManager:
         *,
         source: str = "LIVE_WS",
         updated_at: Any = None,
+        revision_epoch: Any = None,
+        revision_seq: Any = None,
+        is_closed: Any = None,
+        close_state_source: Any = None,
     ) -> None:
         kline_payload = kline.model_dump() if hasattr(kline, "model_dump") else dict(kline or {})
+        revision_fields = {
+            "revision_epoch": revision_epoch,
+            "revision_seq": revision_seq,
+            "is_closed": is_closed,
+            "close_state_source": close_state_source,
+        }
+        for key, value in revision_fields.items():
+            if value is not None:
+                kline_payload[key] = value
         await self._send_payload(
             symbol,
             {

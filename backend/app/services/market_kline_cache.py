@@ -23,6 +23,7 @@ from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
 logger = logging.getLogger(__name__)
 
 OpenTimeValidator = Callable[[int], bool]
+ExternalItemsReconciler = Callable[[list[dict[str, Any]]], Iterable[Any]]
 
 _KLINE_EXTERNAL_FETCH_WARNING_COOLDOWN_SECONDS = 60.0
 _KLINE_EXTERNAL_FETCH_WARNING_MAX_KEYS = 512
@@ -41,6 +42,7 @@ KLINE_CACHE_STATUS_CONTINUITY_INVALID = "CONTINUITY_INVALID"
 KLINE_CACHE_STATUS_COVERAGE_INVALID = "COVERAGE_INVALID"
 KLINE_CACHE_STATUS_STALE_OPEN = "STALE_OPEN"
 KLINE_CACHE_STATUS_PROVIDER_EMPTY = "PROVIDER_EMPTY"
+KLINE_CACHE_STATUS_RECONCILIATION_REJECTED = "RECONCILIATION_REJECTED"
 
 KLINE_CACHE_POLICY_STRICT_24X7 = "strict_24x7"
 KLINE_CACHE_POLICY_GAP_TOLERANT = "gap_tolerant"
@@ -976,6 +978,7 @@ def get_klines_cache_first(
     external_budget_seconds: Optional[float] = None,
     open_time_validator: Optional[OpenTimeValidator] = None,
     cache_policy: str = KLINE_CACHE_POLICY_STRICT_24X7,
+    reconcile_external_items: Optional[ExternalItemsReconciler] = None,
 ) -> KlineCacheResult:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
@@ -1233,6 +1236,22 @@ def get_klines_cache_first(
                 provider_error_code=KLINE_PROVIDER_ERROR_UNKNOWN,
             )
 
+    if reconcile_external_items is not None:
+        external_items = _filter_items_before_end_time(
+            _filter_items_by_open_time(
+                reconcile_external_items([dict(item) for item in external_items]) or [],
+                open_time_validator,
+            ),
+            end_time_ms,
+        )
+        if not external_items:
+            return KlineCacheResult(
+                [],
+                origin=KLINE_CACHE_ORIGIN_EMPTY,
+                cache_status=KLINE_CACHE_STATUS_RECONCILIATION_REJECTED,
+                history_incomplete=bool(end_time_ms is not None),
+            )
+
     upsert_klines(
         db,
         market_type=market_type,
@@ -1241,6 +1260,20 @@ def get_klines_cache_first(
         items=external_items,
         source=source,
     )
+
+    if reconcile_external_items is not None:
+        return KlineCacheResult(
+            [
+                serialize_kline_item(item, normalized_interval)
+                for item in (
+                    _normalize_item(raw_item, normalized_interval) for raw_item in external_items
+                )
+                if item is not None
+            ][-normalized_limit:],
+            origin=KLINE_CACHE_ORIGIN_REST_FETCH,
+            cache_status=cache_status,
+            history_incomplete=False,
+        )
 
     refreshed = _read_cached_klines(
         db,

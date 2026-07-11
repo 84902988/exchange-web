@@ -10,7 +10,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Optional
+from types import MappingProxyType
+from typing import Any, Mapping, Optional
 
 import websockets
 
@@ -18,6 +19,12 @@ from app.core.config import settings
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT
 from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
+from app.services.spot_kline_revision import (
+    KlineRevisionCandidate,
+    KlineRevisionDecision,
+    KlineRevisionReason,
+    compare_kline_revision,
+)
 from app.services.spot_market_domain_cache import is_fresh_record
 
 
@@ -621,6 +628,134 @@ def _public_kline_item(item: dict[str, Any]) -> dict[str, Any]:
     return {key: deepcopy(value) for key, value in item.items() if not str(key).startswith("_")}
 
 
+_KLINE_REVISION_STATE_KEY = "_revision_state"
+_KLINE_AUTO_SEQUENCE_REASONS = {
+    KlineRevisionReason.RECEIVED_AT_ONLY,
+    KlineRevisionReason.REVISION_CONFLICT,
+}
+
+
+def _kline_revision_int(value: Any, default: int = 0) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return max(0, int(default or 0))
+    return normalized if normalized >= 0 else max(0, int(default or 0))
+
+
+def _kline_revision_metadata_for_bucket(
+    bucket_revision_map: dict[Any, Any],
+    open_time: int,
+) -> dict[str, Any]:
+    metadata = bucket_revision_map.get(open_time)
+    if metadata is None:
+        metadata = bucket_revision_map.get(str(open_time))
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _kline_close_evidence(
+    item: dict[str, Any],
+    metadata: dict[str, Any],
+    provider: str,
+) -> tuple[Optional[bool], str]:
+    if "_is_closed" in item:
+        is_closed = item.get("_is_closed")
+    elif "is_closed" in metadata:
+        is_closed = metadata.get("is_closed")
+    elif "is_closed" in item:
+        is_closed = item.get("is_closed")
+    else:
+        is_closed = None
+
+    close_state_source = item.get("_close_state_source") or metadata.get("close_state_source")
+    if close_state_source:
+        return is_closed, str(close_state_source)
+
+    confirm = str(item.get("confirm") or "").strip()
+    if provider == PROVIDER_OKX_SPOT and confirm in {"0", "1"}:
+        return is_closed, "PROVIDER_CONFIRMED"
+    return is_closed, "UNKNOWN"
+
+
+def _kline_revision_candidate(
+    record: dict[str, Any],
+    item: dict[str, Any],
+    *,
+    revision_epoch: int,
+    provider_generation: int,
+    revision_seq: int,
+    metadata: Optional[dict[str, Any]] = None,
+) -> KlineRevisionCandidate:
+    metadata = metadata or {}
+    provider = str(item.get("provider") or record.get("provider") or PROVIDER_BITGET_SPOT).strip().upper()
+    is_closed, close_state_source = _kline_close_evidence(item, metadata, provider)
+    received_at_ms = _kline_revision_int(
+        item.get("_received_at_ms", metadata.get("received_at_ms", record.get("updated_at_ms"))),
+    )
+    provider_update_time_ms = item.get(
+        "_provider_update_time_ms",
+        metadata.get("provider_update_time_ms"),
+    )
+    if provider_update_time_ms is not None:
+        provider_update_time_ms = _kline_revision_int(provider_update_time_ms)
+
+    return KlineRevisionCandidate(
+        symbol=record.get("symbol"),
+        interval=record.get("interval"),
+        open_time=item.get("open_time"),
+        open=item.get("open"),
+        high=item.get("high"),
+        low=item.get("low"),
+        close=item.get("close"),
+        volume=item.get("volume", "0"),
+        quote_volume=item.get("quote_volume"),
+        provider=provider,
+        source=item.get("source") or record.get("source") or SPOT_PROVIDER_WS_SOURCE,
+        transport=item.get("_transport") or metadata.get("transport") or "WS",
+        provider_generation=provider_generation,
+        revision_epoch=revision_epoch,
+        revision_seq=revision_seq,
+        received_at_ms=received_at_ms,
+        is_closed=is_closed,
+        close_state_source=close_state_source,
+        provider_update_time_ms=provider_update_time_ms,
+    )
+
+
+def _kline_revision_metadata(candidate: KlineRevisionCandidate) -> dict[str, Any]:
+    return {
+        "revision_epoch": candidate.revision_epoch,
+        "provider_generation": candidate.provider_generation,
+        "revision_seq": candidate.revision_seq,
+        "received_at_ms": candidate.received_at_ms,
+        "provider_update_time_ms": candidate.provider_update_time_ms,
+        "transport": candidate.transport.value,
+        "is_closed": candidate.is_closed,
+        "close_state_source": candidate.close_state_source.value,
+    }
+
+
+def _stamp_kline_revision(
+    item: dict[str, Any],
+    candidate: KlineRevisionCandidate,
+) -> dict[str, Any]:
+    stamped = deepcopy(item)
+    metadata = _kline_revision_metadata(candidate)
+    stamped.update(
+        {
+            "_revision_epoch": metadata["revision_epoch"],
+            "_provider_generation": metadata["provider_generation"],
+            "_revision_seq": metadata["revision_seq"],
+            "_received_at_ms": metadata["received_at_ms"],
+            "_provider_update_time_ms": metadata["provider_update_time_ms"],
+            "_transport": metadata["transport"],
+            "_is_closed": metadata["is_closed"],
+            "_close_state_source": metadata["close_state_source"],
+        }
+    )
+    return stamped
+
+
 def _depth_response_from_record(record: dict[str, Any], *, limit: Optional[int] = None) -> DepthResponse:
     depth_limit = _depth_limit(limit)
     event_time_ms = _spot_provider_event_time_ms(record.get("ts"))
@@ -688,6 +823,72 @@ def _klines_response_from_record(record: dict[str, Any], *, limit: Optional[int]
         "stale": False,
         "updated_at": record.get("updated_at"),
     }
+
+
+def _freeze_kline_revision_snapshot(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {
+                key: _freeze_kline_revision_snapshot(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_kline_revision_snapshot(item) for item in value)
+    return deepcopy(value)
+
+
+def _kline_revision_response_from_record(
+    record: dict[str, Any],
+    *,
+    limit: Optional[int] = None,
+) -> Mapping[str, Any]:
+    kline_limit = _kline_limit(limit)
+    state_raw = record.get(_KLINE_REVISION_STATE_KEY)
+    state = state_raw if isinstance(state_raw, dict) else {}
+    bucket_map_raw = state.get("bucket_revision_map")
+    bucket_map = bucket_map_raw if isinstance(bucket_map_raw, dict) else {}
+    items: list[dict[str, Any]] = []
+    for item in list(record.get("items") or [])[-kline_limit:]:
+        if not isinstance(item, dict):
+            continue
+        public_item = _public_kline_item(item)
+        open_time = _kline_revision_int(item.get("open_time"))
+        metadata = _kline_revision_metadata_for_bucket(bucket_map, open_time)
+        public_item.update(
+            {
+                "revision_epoch": item.get(
+                    "_revision_epoch",
+                    metadata.get("revision_epoch"),
+                ),
+                "revision_seq": item.get(
+                    "_revision_seq",
+                    metadata.get("revision_seq"),
+                ),
+                "is_closed": item.get(
+                    "_is_closed",
+                    metadata.get("is_closed", item.get("is_closed")),
+                ),
+                "close_state_source": item.get(
+                    "_close_state_source",
+                    metadata.get("close_state_source"),
+                ),
+            }
+        )
+        items.append(public_item)
+
+    return _freeze_kline_revision_snapshot(
+        {
+            "symbol": normalize_spot_ws_symbol(record.get("symbol")),
+            "interval": normalize_spot_ws_kline_interval(record.get("interval")),
+            "items": items,
+            "provider": str(record.get("provider") or PROVIDER_BITGET_SPOT),
+            "source": str(record.get("source") or SPOT_PROVIDER_WS_SOURCE),
+            "freshness": str(record.get("freshness") or "LIVE"),
+            "stale": False,
+            "updated_at": record.get("updated_at"),
+        }
+    )
 
 
 def normalize_bitget_depth_message(
@@ -1392,6 +1593,37 @@ class SpotMarketProviderWsService:
                 return None
             return response
 
+    def get_fresh_kline_revisions(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        provider: Optional[str] = None,
+        max_age_ms: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Optional[Mapping[str, Any]]:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        normalized_interval = normalize_spot_ws_kline_interval(interval)
+        provider_code = normalize_spot_ws_provider(provider)
+        if (
+            not spot_provider_ws_supports_provider(provider_code, domain="kline")
+            or not spot_provider_ws_supports_kline_interval(provider_code, normalized_interval)
+        ):
+            return None
+        now_ms = _now_ms()
+        allowed_age_ms = _kline_max_age_ms(max_age_ms)
+        key = (provider_code, normalized_symbol, normalized_interval)
+        with self._lock:
+            item = self._kline_cache.get(key)
+            if item is None:
+                return None
+            if not is_fresh_record(item, allowed_age_ms, now_ms=now_ms):
+                return None
+            response = _kline_revision_response_from_record(item, limit=limit)
+            if not response.get("items"):
+                return None
+            return response
+
     def set_depth_cache_for_tests(self, record: dict[str, Any]) -> None:
         normalized_symbol = normalize_spot_ws_symbol(record.get("symbol"))
         if not normalized_symbol:
@@ -2012,8 +2244,37 @@ class SpotMarketProviderWsService:
         key: tuple[str, str, str],
         record: dict[str, Any],
         limit: int,
+        *,
+        generation: Optional[int] = None,
     ) -> dict[str, Any]:
         existing = self._kline_cache.get(key) or {}
+        existing_state_raw = existing.get(_KLINE_REVISION_STATE_KEY)
+        existing_state = existing_state_raw if isinstance(existing_state_raw, dict) else {}
+        existing_bucket_map_raw = existing_state.get("bucket_revision_map")
+        bucket_revision_map = (
+            deepcopy(existing_bucket_map_raw)
+            if isinstance(existing_bucket_map_raw, dict)
+            else {}
+        )
+        existing_epoch = _kline_revision_int(existing_state.get("epoch"), 1) or 1
+        incoming_epoch = _kline_revision_int(record.get("_revision_epoch"), existing_epoch) or existing_epoch
+        incoming_generation = _kline_revision_int(
+            generation,
+            _kline_revision_int(existing_state.get("generation"), 1) or 1,
+        ) or 1
+        existing_generation = _kline_revision_int(
+            existing_state.get("generation"),
+            incoming_generation,
+        ) or incoming_generation
+        if existing and incoming_epoch < existing_epoch:
+            return existing
+        if (
+            existing
+            and incoming_epoch == existing_epoch
+            and incoming_generation < existing_generation
+        ):
+            return existing
+        last_revision_seq = _kline_revision_int(existing_state.get("last_revision_seq"))
         by_open_time: dict[int, dict[str, Any]] = {}
         for item in list(existing.get("items") or []):
             try:
@@ -2022,6 +2283,30 @@ class SpotMarketProviderWsService:
                 continue
             if open_time > 0:
                 by_open_time[open_time] = item
+                metadata = _kline_revision_metadata_for_bucket(bucket_revision_map, open_time)
+                item_revision_seq = _kline_revision_int(
+                    item.get("_revision_seq", metadata.get("revision_seq")),
+                )
+                item_revision_epoch = _kline_revision_int(
+                    item.get("_revision_epoch", metadata.get("revision_epoch")),
+                    existing_epoch,
+                ) or existing_epoch
+                item_generation = _kline_revision_int(
+                    item.get("_provider_generation", metadata.get("provider_generation")),
+                    existing_generation,
+                ) or existing_generation
+                existing_candidate = _kline_revision_candidate(
+                    existing,
+                    item,
+                    revision_epoch=item_revision_epoch,
+                    provider_generation=item_generation,
+                    revision_seq=item_revision_seq,
+                    metadata=metadata,
+                )
+                bucket_revision_map[open_time] = _kline_revision_metadata(existing_candidate)
+                last_revision_seq = max(last_revision_seq, item_revision_seq)
+
+        accepted_any = False
         for item in list(record.get("items") or []):
             try:
                 open_time = int(item.get("open_time") or 0)
@@ -2029,12 +2314,102 @@ class SpotMarketProviderWsService:
                 continue
             if open_time <= 0:
                 continue
-            by_open_time[open_time] = deepcopy(item)
-        record["items"] = [
+
+            existing_item = by_open_time.get(open_time)
+            existing_candidate: Optional[KlineRevisionCandidate] = None
+            if existing_item is not None:
+                existing_metadata = _kline_revision_metadata_for_bucket(bucket_revision_map, open_time)
+                existing_candidate = _kline_revision_candidate(
+                    existing or record,
+                    existing_item,
+                    revision_epoch=_kline_revision_int(
+                        existing_item.get("_revision_epoch", existing_metadata.get("revision_epoch")),
+                        existing_epoch,
+                    )
+                    or existing_epoch,
+                    provider_generation=_kline_revision_int(
+                        existing_item.get(
+                            "_provider_generation",
+                            existing_metadata.get("provider_generation"),
+                        ),
+                        _kline_revision_int(
+                            existing_state.get("generation"),
+                            existing_generation,
+                        )
+                        or existing_generation,
+                    )
+                    or existing_generation,
+                    revision_seq=_kline_revision_int(
+                        existing_item.get("_revision_seq", existing_metadata.get("revision_seq")),
+                    ),
+                    metadata=existing_metadata,
+                )
+
+            explicit_revision_seq = item.get("_revision_seq")
+            incoming_candidate: Optional[KlineRevisionCandidate] = None
+            if explicit_revision_seq is not None:
+                incoming_candidate = _kline_revision_candidate(
+                    record,
+                    item,
+                    revision_epoch=incoming_epoch,
+                    provider_generation=incoming_generation,
+                    revision_seq=_kline_revision_int(explicit_revision_seq),
+                )
+            elif existing_candidate is not None:
+                probe_candidate = _kline_revision_candidate(
+                    record,
+                    item,
+                    revision_epoch=incoming_epoch,
+                    provider_generation=incoming_generation,
+                    revision_seq=existing_candidate.revision_seq,
+                )
+                probe = compare_kline_revision(existing_candidate, probe_candidate)
+                if probe.decision == KlineRevisionDecision.NO_CHANGE:
+                    continue
+                if (
+                    probe.decision == KlineRevisionDecision.REJECT
+                    and probe.reason not in _KLINE_AUTO_SEQUENCE_REASONS
+                ):
+                    continue
+
+            if incoming_candidate is None:
+                incoming_candidate = _kline_revision_candidate(
+                    record,
+                    item,
+                    revision_epoch=incoming_epoch,
+                    provider_generation=incoming_generation,
+                    revision_seq=last_revision_seq + 1,
+                )
+
+            comparison = compare_kline_revision(existing_candidate, incoming_candidate)
+            if comparison.decision != KlineRevisionDecision.ACCEPT:
+                continue
+
+            by_open_time[open_time] = _stamp_kline_revision(item, incoming_candidate)
+            bucket_revision_map[open_time] = _kline_revision_metadata(incoming_candidate)
+            last_revision_seq = max(last_revision_seq, incoming_candidate.revision_seq)
+            accepted_any = True
+
+        if existing and not accepted_any:
+            return existing
+
+        retained_open_times = sorted(by_open_time.keys())[-limit:]
+        merged_record = deepcopy(record)
+        merged_record["items"] = [
             by_open_time[open_time]
-            for open_time in sorted(by_open_time.keys())[-limit:]
+            for open_time in retained_open_times
         ]
-        return record
+        merged_record[_KLINE_REVISION_STATE_KEY] = {
+            "epoch": incoming_epoch,
+            "generation": incoming_generation,
+            "last_revision_seq": last_revision_seq,
+            "bucket_revision_map": {
+                open_time: bucket_revision_map[open_time]
+                for open_time in retained_open_times
+                if open_time in bucket_revision_map
+            },
+        }
+        return merged_record
 
     def _run_depth_thread(
         self,
@@ -3004,6 +3379,7 @@ class SpotMarketProviderWsService:
                 key,
                 record,
                 subscription.kline_limit,
+                generation=generation,
             )
 
     def _handle_okx_kline_message(
@@ -3038,6 +3414,7 @@ class SpotMarketProviderWsService:
                 key,
                 record,
                 subscription.kline_limit,
+                generation=generation,
             )
 
 
@@ -3120,6 +3497,23 @@ def get_spot_provider_ws_klines(
     limit: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     return spot_market_provider_ws.get_fresh_klines(
+        symbol,
+        interval,
+        provider=provider,
+        max_age_ms=max_age_ms,
+        limit=limit,
+    )
+
+
+def get_spot_provider_ws_kline_revisions(
+    symbol: str,
+    interval: str,
+    *,
+    provider: Optional[str] = None,
+    max_age_ms: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> Optional[Mapping[str, Any]]:
+    return spot_market_provider_ws.get_fresh_kline_revisions(
         symbol,
         interval,
         provider=provider,
