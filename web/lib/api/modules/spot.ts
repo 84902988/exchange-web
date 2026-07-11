@@ -242,7 +242,9 @@ export type SpotMarketTickerItem = {
   market_trading_hours?: string | null
   market_session_type?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string | null
-  ts?: string | null
+  ts?: string | number | null
+  event_time_ms?: number | null
+  received_at_ms?: number | null
   [key: string]: unknown
 }
 

@@ -129,6 +129,8 @@ class TickerItem(BaseModel):
     market_session_type: Optional[str] = None
     quote_freshness: str = "FALLBACK"
     ts: Optional[str] = None
+    event_time_ms: Optional[int] = None
+    received_at_ms: Optional[int] = None
     display_symbol: Optional[str] = None
     base_asset: Optional[str] = None
     quote_asset: Optional[str] = None

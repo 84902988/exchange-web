@@ -1435,6 +1435,7 @@ def _spot_ticker_from_provider(
     provider_code: str,
     payload: Any,
 ) -> TickerItem:
+    received_at_ms = _now_ms()
     price_change_24h_override: Optional[Decimal] = None
     price_change_percent_override: Optional[Decimal] = None
     if provider_code == "OKX_SPOT":
@@ -1445,7 +1446,7 @@ def _spot_ticker_from_provider(
         low_24h = _to_decimal(row.get("low24h"), last_price)
         base_volume = _to_decimal(row.get("vol24h"))
         quote_volume = _to_decimal(row.get("volCcy24h") or row.get("volCcyQuote24h"))
-        ts_ms = _spot_provider_ts(row.get("ts"))
+        event_time_ms = _spot_provider_event_time_ms(row.get("ts"))
     elif provider_code == "BITGET_SPOT":
         row = _spot_provider_first_row(payload)
         last_price = _to_decimal(row.get("lastPr") or row.get("last") or row.get("close"))
@@ -1455,7 +1456,7 @@ def _spot_ticker_from_provider(
         low_24h = _to_decimal(row.get("low24h"), last_price)
         base_volume = _to_decimal(row.get("baseVolume") or row.get("baseVol"))
         quote_volume = _to_decimal(row.get("quoteVolume") or row.get("quoteVol") or row.get("usdtVolume"))
-        ts_ms = _spot_provider_ts(row.get("ts"))
+        event_time_ms = _spot_provider_event_time_ms(row.get("ts"))
         price_change_24h_override = _bitget_spot_price_change_24h(
             last_price=last_price,
             open_24h=open_24h,
@@ -1474,7 +1475,7 @@ def _spot_ticker_from_provider(
         low_24h = _to_decimal(payload.get("lowPrice"), last_price)
         base_volume = _to_decimal(payload.get("volume"))
         quote_volume = _to_decimal(payload.get("quoteVolume"))
-        ts_ms = _spot_provider_ts(payload.get("closeTime"))
+        event_time_ms = _spot_provider_event_time_ms(payload.get("closeTime"))
     else:
         raise ValueError("unsupported spot ticker provider")
 
@@ -1493,7 +1494,9 @@ def _spot_ticker_from_provider(
     price_change_percent = price_change_percent_override if price_change_percent_override is not None else Decimal("0")
     if price_change_percent_override is None and open_24h > 0:
         price_change_percent = (price_change_24h / open_24h) * Decimal("100")
-    updated_at = datetime.utcfromtimestamp(ts_ms / 1000).isoformat()
+    compatibility_time_ms = event_time_ms or received_at_ms
+    updated_at = datetime.utcfromtimestamp(received_at_ms / 1000).isoformat()
+    compatibility_ts = datetime.utcfromtimestamp(compatibility_time_ms / 1000).isoformat()
 
     return TickerItem(
         symbol=pair.symbol,
@@ -1513,7 +1516,9 @@ def _spot_ticker_from_provider(
         stale=False,
         updated_at=updated_at,
         quote_freshness="LIVE",
-        ts=updated_at,
+        ts=compatibility_ts,
+        event_time_ms=event_time_ms,
+        received_at_ms=received_at_ms,
     )
 
 
@@ -1801,7 +1806,28 @@ def _spot_provider_ws_ticker_to_item(pair: TradingPair, record: dict[str, Any]) 
         price_change_percent = (price_change_24h / open_24h) * Decimal("100")
     if price_change_percent is None:
         price_change_percent = Decimal("0")
-    updated_at = str(record.get("updated_at") or datetime.utcnow().isoformat())
+    event_time_ms = (
+        _spot_provider_event_time_ms(record.get("event_time_ms"))
+        if "event_time_ms" in record
+        else _spot_provider_event_time_ms(record.get("ts"))
+    )
+    received_at_ms = _spot_provider_event_time_ms(
+        record.get("received_at_ms") or record.get("updated_at_ms")
+    )
+    updated_at = str(
+        record.get("updated_at")
+        or (
+            datetime.utcfromtimestamp(received_at_ms / 1000).isoformat()
+            if received_at_ms is not None
+            else datetime.utcnow().isoformat()
+        )
+    )
+    compatibility_time_ms = event_time_ms or received_at_ms
+    compatibility_ts = (
+        datetime.utcfromtimestamp(compatibility_time_ms / 1000).isoformat()
+        if compatibility_time_ms is not None
+        else updated_at
+    )
 
     return TickerItem(
         symbol=pair.symbol,
@@ -1822,7 +1848,9 @@ def _spot_provider_ws_ticker_to_item(pair: TradingPair, record: dict[str, Any]) 
         updated_at=updated_at,
         market_status=str(record.get("market_status") or "OPEN"),
         quote_freshness="LIVE",
-        ts=updated_at,
+        ts=compatibility_ts,
+        event_time_ms=event_time_ms,
+        received_at_ms=received_at_ms,
     )
 
 
@@ -2851,6 +2879,8 @@ def get_market_tickers(
             "source": ticker.source,
             "quote_freshness": ticker.quote_freshness,
             "ts": ticker.ts,
+            "event_time_ms": ticker.event_time_ms,
+            "received_at_ms": ticker.received_at_ms,
             **_ticker_metadata(pair),
         }
         for key in _SPOT_PRICE_PRECISION_PAYLOAD_KEYS:
