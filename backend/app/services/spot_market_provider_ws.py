@@ -490,16 +490,35 @@ def _depth_response_from_record(record: dict[str, Any], *, limit: Optional[int] 
 
 def _trades_response_from_record(record: dict[str, Any], *, limit: Optional[int] = None) -> TradesResponse:
     trade_limit = _trades_limit(limit)
+    provider = str(record.get("provider") or PROVIDER_BITGET_SPOT)
+    provider_symbol = str(record.get("provider_symbol") or "")
+    source = str(record.get("source") or SPOT_PROVIDER_WS_SOURCE)
+    freshness = str(record.get("freshness") or "LIVE")
+    received_at_ms = _spot_provider_event_time_ms(record.get("updated_at_ms"))
+    trades: list[TradeItem] = []
+    for raw_item in list(record.get("trades") or [])[:trade_limit]:
+        if not isinstance(raw_item, dict):
+            continue
+        item = dict(raw_item)
+        item.setdefault("provider", provider)
+        item.setdefault("provider_symbol", provider_symbol)
+        item.setdefault("source", source)
+        item.setdefault("freshness", freshness)
+        item.setdefault("received_at_ms", received_at_ms)
+        item.setdefault("updated_at_ms", received_at_ms)
+        item.setdefault("time_origin", "PROVIDER")
+        trades.append(TradeItem(**item))
     return TradesResponse(
         symbol=normalize_spot_ws_symbol(record.get("symbol")),
-        trades=[TradeItem(**item) for item in list(record.get("trades") or [])[:trade_limit]],
-        provider=str(record.get("provider") or PROVIDER_BITGET_SPOT),
-        provider_symbol=str(record.get("provider_symbol") or ""),
+        trades=trades,
+        provider=provider,
+        provider_symbol=provider_symbol,
         stale=False,
         updated_at=record.get("updated_at"),
-        updated_at_ms=int(record.get("updated_at_ms") or _now_ms()),
-        source=str(record.get("source") or SPOT_PROVIDER_WS_SOURCE),
-        freshness=str(record.get("freshness") or "LIVE"),
+        updated_at_ms=received_at_ms,
+        received_at_ms=received_at_ms,
+        source=source,
+        freshness=freshness,
     )
 
 
@@ -791,6 +810,7 @@ def normalize_bitget_trade_message(
     if not isinstance(data, list) or not data:
         return None
 
+    batch_received_at_ms = _now_ms()
     trades: list[dict[str, Any]] = []
     for row in data:
         if not isinstance(row, dict):
@@ -800,17 +820,33 @@ def normalize_bitget_trade_message(
         if price is None or amount is None or price <= 0 or amount <= 0:
             continue
         side_text = str(row.get("side") or "").upper()
-        ts = _spot_provider_ts(row.get("ts"))
+        event_time_ms = _spot_provider_event_time_ms(row.get("ts"))
+        compatibility_ts = event_time_ms or batch_received_at_ms
+        raw_trade_id = row.get("tradeId")
+        trade_id = str(raw_trade_id).strip() if raw_trade_id is not None else ""
+        trade_id = trade_id or None
         trades.append(
             {
-                "id": str(row.get("tradeId") or ""),
-                "trade_id": str(row.get("tradeId") or ""),
-                "provider_trade_id": str(row.get("tradeId") or ""),
+                "id": trade_id,
+                "trade_id": trade_id,
+                "provider_trade_id": trade_id,
                 "price": _decimal_to_str(price),
                 "amount": _decimal_to_str(amount),
                 "side": "SELL" if side_text == "SELL" else "BUY",
-                "ts": ts,
-                "created_at": datetime.utcfromtimestamp(ts / 1000).isoformat(),
+                "ts": compatibility_ts,
+                "event_time_ms": event_time_ms,
+                "received_at_ms": batch_received_at_ms,
+                "created_at": (
+                    datetime.utcfromtimestamp(event_time_ms / 1000).isoformat()
+                    if event_time_ms is not None
+                    else None
+                ),
+                "time_origin": "PROVIDER",
+                "provider": PROVIDER_BITGET_SPOT,
+                "provider_symbol": normalize_spot_ws_symbol(provider_symbol),
+                "source": SPOT_PROVIDER_WS_SOURCE,
+                "freshness": "LIVE",
+                "updated_at_ms": batch_received_at_ms,
                 "raw_trade": deepcopy(row),
             }
         )
@@ -819,7 +855,6 @@ def normalize_bitget_trade_message(
         return None
     trade_limit = _trades_limit(trades_limit)
     trades.sort(key=lambda item: int(item.get("ts") or 0), reverse=True)
-    now_ms = _now_ms()
     return {
         "symbol": normalize_spot_ws_symbol(local_symbol),
         "provider": PROVIDER_BITGET_SPOT,
@@ -827,9 +862,10 @@ def normalize_bitget_trade_message(
         "source": SPOT_PROVIDER_WS_SOURCE,
         "freshness": "LIVE",
         "trades": trades[:trade_limit],
-        "ts": int(trades[0].get("ts") or now_ms),
-        "updated_at_ms": now_ms,
-        "updated_at": datetime.utcfromtimestamp(now_ms / 1000).isoformat(),
+        "ts": int(trades[0].get("ts") or batch_received_at_ms),
+        "received_at_ms": batch_received_at_ms,
+        "updated_at_ms": batch_received_at_ms,
+        "updated_at": datetime.utcfromtimestamp(batch_received_at_ms / 1000).isoformat(),
     }
 
 
@@ -846,6 +882,7 @@ def normalize_okx_trade_message(
     if not isinstance(data, list) or not data:
         return None
 
+    batch_received_at_ms = _now_ms()
     trades: list[dict[str, Any]] = []
     for row in data:
         if not isinstance(row, dict):
@@ -855,8 +892,11 @@ def normalize_okx_trade_message(
         if price is None or amount is None or price <= 0 or amount <= 0:
             continue
         side_text = str(row.get("side") or "").upper()
-        trade_id = str(row.get("tradeId") or "").strip()
-        ts = _spot_provider_ts(row.get("ts"))
+        raw_trade_id = row.get("tradeId")
+        trade_id = str(raw_trade_id).strip() if raw_trade_id is not None else ""
+        trade_id = trade_id or None
+        event_time_ms = _spot_provider_event_time_ms(row.get("ts"))
+        compatibility_ts = event_time_ms or batch_received_at_ms
         trades.append(
             {
                 "id": trade_id,
@@ -865,8 +905,20 @@ def normalize_okx_trade_message(
                 "price": _decimal_to_str(price),
                 "amount": _decimal_to_str(amount),
                 "side": "SELL" if side_text == "SELL" else "BUY",
-                "ts": ts,
-                "created_at": datetime.utcfromtimestamp(ts / 1000).isoformat(),
+                "ts": compatibility_ts,
+                "event_time_ms": event_time_ms,
+                "received_at_ms": batch_received_at_ms,
+                "created_at": (
+                    datetime.utcfromtimestamp(event_time_ms / 1000).isoformat()
+                    if event_time_ms is not None
+                    else None
+                ),
+                "time_origin": "PROVIDER",
+                "provider": PROVIDER_OKX_SPOT,
+                "provider_symbol": str(provider_symbol or "").strip().upper(),
+                "source": SPOT_PROVIDER_WS_SOURCE,
+                "freshness": "LIVE",
+                "updated_at_ms": batch_received_at_ms,
                 "raw_trade": deepcopy(row),
             }
         )
@@ -875,7 +927,6 @@ def normalize_okx_trade_message(
         return None
     trade_limit = _trades_limit(trades_limit)
     trades.sort(key=lambda item: int(item.get("ts") or 0), reverse=True)
-    now_ms = _now_ms()
     return {
         "symbol": normalize_spot_ws_symbol(local_symbol),
         "provider": PROVIDER_OKX_SPOT,
@@ -883,9 +934,10 @@ def normalize_okx_trade_message(
         "source": SPOT_PROVIDER_WS_SOURCE,
         "freshness": "LIVE",
         "trades": trades[:trade_limit],
-        "ts": int(trades[0].get("ts") or now_ms),
-        "updated_at_ms": now_ms,
-        "updated_at": datetime.utcfromtimestamp(now_ms / 1000).isoformat(),
+        "ts": int(trades[0].get("ts") or batch_received_at_ms),
+        "received_at_ms": batch_received_at_ms,
+        "updated_at_ms": batch_received_at_ms,
+        "updated_at": datetime.utcfromtimestamp(batch_received_at_ms / 1000).isoformat(),
     }
 
 

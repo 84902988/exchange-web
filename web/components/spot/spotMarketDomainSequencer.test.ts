@@ -501,4 +501,103 @@ describe('spot market domain sequencer', () => {
     expect(decision.state.current?.eventTimeMs).toBeNull()
     expect(decision.state.current?.data.value).toBe('bootstrap-rest-ticker')
   })
+
+  it('treats explicit trade event_time_ms as authoritative over compatibility timestamps', () => {
+    expect(extractSpotTradeEventTimeMs({
+      event_time_ms: 1_720_000_002_000,
+      ts: 1_720_000_099_000,
+      updated_at_ms: 1_720_000_100_000,
+      received_at_ms: 1_720_000_101_000,
+      created_at: '2026-07-11T01:00:00',
+    })).toBe(1_720_000_002_000)
+  })
+
+  it.each([null, 0])(
+    'does not fall back when explicit trade event_time_ms is %s',
+    (eventTimeMs) => {
+      expect(extractSpotTradeEventTimeMs({
+        event_time_ms: eventTimeMs,
+        ts: 1_720_000_099_000,
+        updated_at_ms: 1_720_000_100_000,
+        received_at_ms: 1_720_000_101_000,
+        created_at: '2026-07-11T01:00:00',
+      })).toBeNull()
+    },
+  )
+
+  it('keeps legacy trade payloads compatible only when event_time_ms is absent', () => {
+    expect(extractSpotTradeEventTimeMs({ ts: 1_720_000_003_000 })).toBe(1_720_000_003_000)
+    expect(extractSpotTradeEventTimeMs({ event_time: 1_720_000_004_000 })).toBe(1_720_000_004_000)
+    expect(extractSpotTradeEventTimeMs({ trade_time: 1_720_000_005_000 })).toBe(1_720_000_005_000)
+    expect(extractSpotTradeEventTimeMs({ time: 1_720_000_006_000 })).toBe(1_720_000_006_000)
+    expect(extractSpotTradeEventTimeMs({ created_at: '2026-07-11T01:00:00' })).toBe(
+      Date.parse('2026-07-11T01:00:00Z'),
+    )
+    expect(extractSpotTradeEventTimeMs({ updated_at_ms: 1_720_000_100_000 })).toBeNull()
+    expect(extractSpotTradeEventTimeMs({ received_at_ms: 1_720_000_101_000 })).toBeNull()
+  })
+
+  it('ignores explicitly untimed trades when deriving batch high-water', () => {
+    const timedEventMs = 1_720_000_001_000
+    expect(extractSpotTradesEventTimeMs([
+      { event_time_ms: timedEventMs, ts: timedEventMs },
+      { event_time_ms: null, ts: 1_720_000_099_000 },
+    ])).toBe(timedEventMs)
+    expect(extractSpotTradesEventTimeMs([
+      { event_time_ms: null, ts: 1_720_000_099_000 },
+      { event_time_ms: 0, ts: 1_720_000_100_000 },
+    ])).toBeNull()
+  })
+
+  it('rejects a late REST trade batch when an untimed item has a future compatibility ts', () => {
+    const currentWsEventMs = 1_720_000_002_000
+    const restHighWaterMs = extractSpotTradesEventTimeMs([
+      { event_time_ms: 1_720_000_001_000, ts: 1_720_000_001_000 },
+      { event_time_ms: null, ts: 1_720_000_099_000 },
+    ])
+    const state = bootstrap({
+      domain: 'trades',
+      eventTimeMs: currentWsEventMs,
+      value: 'ws-trades',
+    })
+    const decision = sequenceSpotMarketDomainEvent(state, makeEvent({
+      domain: 'trades',
+      eventTimeMs: restHighWaterMs,
+      receivedAtMs: 1_720_000_099_999,
+      transport: 'rest',
+      source: 'REST',
+      freshness: 'RECENT',
+      value: 'rest-trades',
+    }))
+
+    expect(restHighWaterMs).toBe(1_720_000_001_000)
+    expect(decision.accepted).toBe(false)
+    expect(decision.reason).toBe('older_event_time')
+    expect(decision.state.current?.data.value).toBe('ws-trades')
+  })
+
+  it('uses the timed trade for display fields in a mixed timed and untimed batch', () => {
+    const trades: SpotMarketTradeItem[] = [
+      { price: '999', amount: '1', side: 'SELL', event_time_ms: null, ts: 1_720_000_099_000 },
+      { price: '100', amount: '1', side: 'BUY', event_time_ms: 1_720_000_001_000, ts: 1_720_000_001_000 },
+    ]
+    const decision = sequenceSpotMarketDomainEvent<SpotMarketTradeItem[]>(null, {
+      symbol: 'BTCUSDT',
+      domain: 'trades',
+      provider: 'OKX_SPOT',
+      eventTimeMs: extractSpotTradesEventTimeMs(trades),
+      receivedAtMs: 1_720_000_100_000,
+      transport: 'rest',
+      source: 'REST',
+      freshness: 'RECENT',
+      data: trades,
+    })
+    const view = applySpotMarketDomainEventToView(
+      { symbol: 'BTCUSDT' },
+      decision.state.current!,
+    )
+
+    expect(view.last_trade_price).toBe('100')
+    expect(view.display_price).toBe('100')
+  })
 })

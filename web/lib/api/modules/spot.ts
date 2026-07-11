@@ -100,6 +100,9 @@ export type SpotMarketTradeItem = {
   freshness?: string | null
   updated_at_ms?: string | number | null
   created_at?: string | null
+  event_time_ms?: number | null
+  received_at_ms?: number | null
+  time_origin?: string | null
 }
 
 export type SpotMarketTradesResponse = {
@@ -107,8 +110,11 @@ export type SpotMarketTradesResponse = {
   items?: SpotMarketTradeItem[]
   trades?: SpotMarketTradeItem[]
   provider?: string | null
+  provider_symbol?: string | null
   stale?: boolean
   updated_at?: string | null
+  updated_at_ms?: string | number | null
+  received_at_ms?: string | number | null
   source?: string | null
   freshness?: string | null
 }

@@ -48,6 +48,9 @@ class TradeItem(BaseModel):
     freshness: Optional[str] = None
     updated_at_ms: Optional[int] = None
     created_at: Optional[str] = None
+    event_time_ms: Optional[int] = None
+    received_at_ms: Optional[int] = None
+    time_origin: Optional[str] = None
 
 
 class TradesResponse(BaseModel):
@@ -58,6 +61,7 @@ class TradesResponse(BaseModel):
     stale: bool = False
     updated_at: Optional[str] = None
     updated_at_ms: Optional[int] = None
+    received_at_ms: Optional[int] = None
     source: Optional[str] = None
     freshness: Optional[str] = None
 
