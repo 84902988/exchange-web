@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Barrier
+from unittest.mock import patch
 
 from app.routers import market as market_router
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
@@ -717,6 +718,168 @@ def test_gateway_kline_broadcast_state_dedupes_detects_ohlcv_changes_and_isolate
     asyncio.run(run())
 
 
+def test_gateway_kline_revision_watermark_handles_close_epoch_seq_and_receive_time() -> None:
+    gateway = _new_authority_test_gateway()
+    first = _kline_payload(
+        is_closed=False,
+        close_state_source="PROVIDER_CONFIRMED",
+        revision_epoch=1,
+        revision_seq=1,
+        received_at_ms=10_000,
+    )
+    assert gateway._should_broadcast_kline(
+        "BTCUSDT",
+        "1m",
+        first,
+        provider="BITGET_SPOT",
+    ) is True
+    key = gateway._domain_key("kline", "BTCUSDT", provider="BITGET_SPOT", interval="1m")
+
+    finalized = _kline_payload(
+        is_closed=True,
+        close_state_source="PROVIDER_CONFIRMED",
+        revision_epoch=1,
+        revision_seq=2,
+        received_at_ms=10_100,
+    )
+    assert gateway._should_broadcast_kline(
+        "BTCUSDT",
+        "1m",
+        finalized,
+        provider="BITGET_SPOT",
+    ) is False
+    assert gateway._kline_revision_high_water[key] == (1_000, 1, 1)
+    _age_broadcast_state(gateway, key, gateway._kline_signature("BTCUSDT", "1m", first))
+    assert gateway._should_broadcast_kline(
+        "BTCUSDT",
+        "1m",
+        finalized,
+        provider="BITGET_SPOT",
+    ) is True
+
+    _age_broadcast_state(gateway, key, gateway._kline_signature("BTCUSDT", "1m", finalized))
+    assert gateway._should_broadcast_kline(
+        "BTCUSDT",
+        "1m",
+        finalized,
+        provider="BITGET_SPOT",
+    ) is False
+
+    stale_revision = _kline_payload(
+        is_closed=False,
+        close_state_source="PROVIDER_CONFIRMED",
+        revision_epoch=1,
+        revision_seq=1,
+        received_at_ms=99_999,
+    )
+    _age_broadcast_state(gateway, key, gateway._kline_signature("BTCUSDT", "1m", finalized))
+    assert gateway._should_broadcast_kline(
+        "BTCUSDT",
+        "1m",
+        stale_revision,
+        provider="BITGET_SPOT",
+    ) is False
+
+    old_epoch = _kline_payload(
+        is_closed=True,
+        close_state_source="PROVIDER_CONFIRMED",
+        revision_epoch=0,
+        revision_seq=99,
+    )
+    _age_broadcast_state(gateway, key, gateway._kline_signature("BTCUSDT", "1m", finalized))
+    assert gateway._should_broadcast_kline(
+        "BTCUSDT",
+        "1m",
+        old_epoch,
+        provider="BITGET_SPOT",
+    ) is False
+
+    new_epoch = _kline_payload(
+        is_closed=False,
+        close_state_source="UNKNOWN",
+        revision_epoch=2,
+        revision_seq=1,
+        received_at_ms=10_200,
+    )
+    _age_broadcast_state(gateway, key, gateway._kline_signature("BTCUSDT", "1m", finalized))
+    assert gateway._should_broadcast_kline(
+        "BTCUSDT",
+        "1m",
+        new_epoch,
+        provider="BITGET_SPOT",
+    ) is True
+
+    received_only = _kline_payload(
+        is_closed=False,
+        close_state_source="UNKNOWN",
+        revision_epoch=2,
+        revision_seq=1,
+        received_at_ms=88_888,
+    )
+    assert gateway._kline_signature("BTCUSDT", "1m", received_only) == gateway._kline_signature(
+        "BTCUSDT",
+        "1m",
+        new_epoch,
+    )
+    _age_broadcast_state(gateway, key, gateway._kline_signature("BTCUSDT", "1m", new_epoch))
+    assert gateway._should_broadcast_kline(
+        "BTCUSDT",
+        "1m",
+        received_only,
+        provider="BITGET_SPOT",
+    ) is False
+
+
+def test_gateway_latest_kline_remains_ordered_by_open_time_not_revision_seq() -> None:
+    gateway = _new_authority_test_gateway()
+    latest = gateway._latest_kline_for_broadcast(
+        {
+            "items": [
+                _kline_payload(open_time=2_000, revision_epoch=1, revision_seq=1),
+                _kline_payload(open_time=1_000, revision_epoch=1, revision_seq=99),
+            ]
+        }
+    )
+
+    assert latest is not None
+    assert latest["open_time"] == 2_000
+    assert latest["revision_seq"] == 1
+
+
+def test_gateway_defaults_to_revision_aware_provider_kline_getter() -> None:
+    calls = []
+
+    def revision_getter(*args, **kwargs):
+        calls.append((args, kwargs))
+        return None
+
+    with patch.object(
+        gateway_module,
+        "get_spot_provider_ws_kline_revisions",
+        revision_getter,
+    ):
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        gateway = SpotMarketGateway(
+            ensure_depth=lambda symbol: None,
+            ensure_kline=lambda symbol, interval: None,
+            release_depth=lambda symbol: None,
+            get_depth=lambda symbol: None,
+            get_ticker=lambda symbol: None,
+            get_trades=lambda symbol: None,
+            provider_symbol_allowed=lambda symbol: True,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=FakeWsManager(),
+        )
+
+    assert gateway._get_klines is revision_getter
+    assert gateway._get_klines_accepts_provider is True
+    assert gateway._get_klines("BTCUSDT", "1m", provider="BITGET_SPOT") is None
+    assert calls == [(('BTCUSDT', '1m'), {"provider": "BITGET_SPOT"})]
+
+
 def test_gateway_kline_interval_lifecycle_preserves_utc_intervals() -> None:
     async def run() -> None:
         ws_manager = FakeWsManager()
@@ -785,7 +948,7 @@ def test_gateway_sync_kline_intervals_releases_inactive_and_ensures_new_interval
         )
 
         gateway._ensured_kline_intervals["BTCUSDT"] = {"1m"}
-        kline = _kline_payload()
+        kline = _kline_payload(revision_epoch=1, revision_seq=1)
         assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is True
         assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is False
 
@@ -931,6 +1094,13 @@ def test_gateway_idle_release_clears_tracked_kline_intervals_without_per_interva
         await gateway.ensure_symbol("BTC/USDT", interval="1m")
         await asyncio.sleep(0.01)
         assert gateway._ensured_kline_intervals.get("BTCUSDT") == {"1m"}
+        revision_key = gateway._domain_key(
+            "kline",
+            "BTCUSDT",
+            provider="BITGET_SPOT",
+            interval="1m",
+        )
+        gateway._kline_revision_high_water[revision_key] = (1_000, 1, 1)
 
         ws_manager.count = 0
         await gateway.release_symbol_if_idle("BTCUSDT", idle_delay_seconds=0)
@@ -938,6 +1108,7 @@ def test_gateway_idle_release_clears_tracked_kline_intervals_without_per_interva
 
         assert provider.released == ["BTCUSDT"]
         assert "BTCUSDT" not in gateway._ensured_kline_intervals
+        assert revision_key not in gateway._kline_revision_high_water
 
     asyncio.run(run())
 
@@ -1116,6 +1287,57 @@ def test_gateway_broadcasts_provider_kline_once_without_trade_aggregation() -> N
         await gateway.release_symbol_if_idle("btcusdt", idle_delay_seconds=0)
         await asyncio.sleep(0.05)
         assert provider.released == ["BTCUSDT"]
+
+    asyncio.run(run())
+
+
+def test_gateway_broadcasts_revision_aware_provider_kline_metadata() -> None:
+    class RevisionProvider(FakeProvider):
+        def get_kline_revisions(self, symbol: str, interval: str, **kwargs) -> dict:
+            payload = self.get_klines(symbol, interval, **kwargs)
+            payload["items"][0].update(
+                {
+                    "revision_epoch": 2,
+                    "revision_seq": 7,
+                    "is_closed": True,
+                    "close_state_source": "PROVIDER_CONFIRMED",
+                    "received_at_ms": 99_999,
+                }
+            )
+            return payload
+
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        provider = RevisionProvider()
+        gateway = SpotMarketGateway(
+            ensure_depth=provider.ensure,
+            release_depth=provider.release,
+            ensure_kline=lambda symbol, interval: None,
+            get_depth=provider.get_depth,
+            get_ticker=provider.get_ticker,
+            get_trades=provider.get_trades,
+            get_kline_revisions=provider.get_kline_revisions,
+            provider_symbol_allowed=lambda symbol: True,
+            precision_resolver=lambda symbol: (2, 3),
+            ws_manager=ws_manager,
+        )
+
+        ws_manager.count = 1
+        await gateway.ensure_symbol("BTCUSDT", interval="1m")
+        await asyncio.sleep(0.05)
+
+        assert len(ws_manager.kline_broadcasts) == 1
+        broadcast = ws_manager.kline_broadcasts[0]
+        assert broadcast["kline"]["revision_epoch"] == 2
+        assert broadcast["kline"]["revision_seq"] == 7
+        assert broadcast["revision_epoch"] == 2
+        assert broadcast["revision_seq"] == 7
+        assert broadcast["is_closed"] is True
+        assert broadcast["close_state_source"] == "PROVIDER_CONFIRMED"
+
+        ws_manager.count = 0
+        await gateway.release_symbol_if_idle("BTCUSDT", idle_delay_seconds=0)
+        await asyncio.sleep(0.05)
 
     asyncio.run(run())
 
@@ -3011,6 +3233,17 @@ def test_provider_switch_releases_old_ws_owner_and_ensures_new_provider() -> Non
     gateway._depth_authority.ensure_provider("BTCUSDT", "OKX_SPOT")
     gateway._symbol_providers["BTCUSDT"] = "OKX_SPOT"
     gateway._ensured_kline_intervals["BTCUSDT"] = {"1Dutc", "1Wutc", "1Mutc"}
+    old_kline_keys = {
+        gateway._domain_key(
+            "kline",
+            "BTCUSDT",
+            provider="OKX_SPOT",
+            interval=interval,
+        )
+        for interval in gateway._ensured_kline_intervals["BTCUSDT"]
+    }
+    for key in old_kline_keys:
+        gateway._kline_revision_high_water[key] = (1_000, 1, 1)
     assert gateway.commit_authoritative_depth(
         symbol="BTCUSDT",
         provider="BITGET_SPOT",
@@ -3029,6 +3262,7 @@ def test_provider_switch_releases_old_ws_owner_and_ensures_new_provider() -> Non
     for interval in ("1Dutc", "1Wutc", "1Mutc"):
         assert ("release_kline", "OKX_SPOT", "BTCUSDT", interval) in calls
         assert ("ensure_kline", "BITGET_SPOT", "BTCUSDT", interval) in calls
+    assert all(key not in gateway._kline_revision_high_water for key in old_kline_keys)
     assert gateway.get_active_depth_provider("BTCUSDT") == ("BITGET_SPOT", 2)
 
     calls.clear()

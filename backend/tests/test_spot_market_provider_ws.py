@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -27,10 +28,22 @@ def _activate_provider_kline(
     interval: str = "1m",
     *,
     provider: str = provider_ws.PROVIDER_BITGET_SPOT,
+    generation: int = 1,
 ) -> None:
     with service._lock:
         service._kline_stops[(provider, symbol, interval)] = threading.Event()
-        service._kline_generations[(provider, symbol, interval)] = 1
+        service._kline_generations[(provider, symbol, interval)] = generation
+
+
+def _raw_kline_cache(
+    service: provider_ws.SpotMarketProviderWsService,
+    *,
+    provider: str = provider_ws.PROVIDER_BITGET_SPOT,
+    symbol: str = "BTCUSDT",
+    interval: str = "1m",
+) -> dict:
+    with service._lock:
+        return deepcopy(service._kline_cache[(provider, symbol, interval)])
 
 
 def _handle_trades(
@@ -1742,6 +1755,362 @@ def test_provider_kline_buckets_remain_sorted_and_limited() -> None:
         open_time + 180_000,
     ]
     assert len(fresh["items"]) == 3
+    raw = _raw_kline_cache(service)
+    assert set(raw["_revision_state"]["bucket_revision_map"]) == {
+        open_time + 60_000,
+        open_time + 120_000,
+        open_time + 180_000,
+    }
+
+
+def test_ws_kline_same_bucket_revision_upgrade_replaces_winner() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service)
+    open_time = 1_695_709_800_000
+
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "100", "10", "1000", "1000"]],
+    )
+    before = _raw_kline_cache(service)
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "101", "11", "1111", "1111"]],
+    )
+    after = _raw_kline_cache(service)
+
+    assert before["items"][0]["_revision_seq"] == 1
+    assert after["items"][0]["_revision_seq"] == 2
+    assert after["items"][0]["close"] == "101"
+    assert after["_revision_state"]["last_revision_seq"] == 2
+    fresh = service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000)
+    assert fresh is not None
+    assert fresh["items"][0]["close"] == "101"
+    assert all(not str(key).startswith("_") for key in fresh["items"][0])
+    assert "_revision_state" not in fresh
+
+
+def test_kline_revision_internal_getter_is_immutable_and_public_getter_stays_clean() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service)
+    open_time = 1_695_709_800_000
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "101", "10", "1010", "1010"]],
+    )
+
+    public = service.get_fresh_klines("BTCUSDT", "1m", max_age_ms=1000)
+    internal = service.get_fresh_kline_revisions("BTCUSDT", "1m", max_age_ms=1000)
+    with patch.object(provider_ws, "spot_market_provider_ws", service):
+        wrapped_internal = provider_ws.get_spot_provider_ws_kline_revisions(
+            "BTCUSDT",
+            "1m",
+            max_age_ms=1000,
+        )
+
+    assert public is not None
+    assert internal is not None
+    assert wrapped_internal is not None
+    assert "revision_epoch" not in public["items"][0]
+    assert "revision_seq" not in public["items"][0]
+    assert "close_state_source" not in public["items"][0]
+    assert "_revision_state" not in public
+    assert internal["items"][0]["revision_epoch"] == 1
+    assert internal["items"][0]["revision_seq"] == 1
+    assert internal["items"][0]["close_state_source"] == "UNKNOWN"
+    assert wrapped_internal["items"][0]["revision_seq"] == 1
+
+    try:
+        internal["provider"] = "MUTATED"
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("internal revision snapshot must be immutable")
+    try:
+        internal["items"][0]["revision_seq"] = 99
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("internal revision item must be immutable")
+
+    raw = _raw_kline_cache(service)
+    assert raw["provider"] == provider_ws.PROVIDER_BITGET_SPOT
+    assert raw["items"][0]["_revision_seq"] == 1
+
+
+def test_ws_kline_same_bucket_explicit_stale_revision_is_rejected() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service)
+    open_time = 1_695_709_800_000
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "100", "10", "1000", "1000"]],
+    )
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "101", "11", "1111", "1111"]],
+    )
+    key = (provider_ws.PROVIDER_BITGET_SPOT, "BTCUSDT", "1m")
+    stale_record = provider_ws.normalize_bitget_kline_message(
+        {
+            "data": [[str(open_time), "100", "110", "95", "99", "9", "891", "891"]],
+        },
+        local_symbol="BTCUSDT",
+        provider_symbol="BTCUSDT",
+        interval="1m",
+        kline_limit=30,
+    )
+    assert stale_record is not None
+    stale_record["items"][0]["_revision_seq"] = 1
+
+    with service._lock:
+        before_ref = service._kline_cache[key]
+        before = deepcopy(before_ref)
+        merged = service._merge_provider_kline_record_locked(
+            key,
+            stale_record,
+            30,
+            generation=1,
+        )
+        service._kline_cache[key] = merged
+        after_ref = service._kline_cache[key]
+
+    assert after_ref is before_ref
+    assert after_ref == before
+    assert after_ref["items"][0]["close"] == "101"
+    assert after_ref["items"][0]["_revision_seq"] == 2
+
+
+def test_ws_kline_duplicate_is_no_change_for_entire_raw_cache() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service)
+    open_time = 1_695_709_800_000
+    row = [str(open_time), "100", "110", "95", "101", "10", "1010", "1010"]
+    now_ms = provider_ws._now_ms()
+
+    with patch.object(provider_ws, "_now_ms", side_effect=[now_ms, now_ms + 100]):
+        _handle_bitget_klines(service, [row])
+        key = (provider_ws.PROVIDER_BITGET_SPOT, "BTCUSDT", "1m")
+        with service._lock:
+            before_ref = service._kline_cache[key]
+            before = deepcopy(before_ref)
+        _handle_bitget_klines(service, [row])
+        with service._lock:
+            after_ref = service._kline_cache[key]
+            after = deepcopy(after_ref)
+
+    assert after_ref is before_ref
+    assert after == before
+    assert after["_revision_state"]["last_revision_seq"] == 1
+    assert after["updated_at_ms"] == now_ms
+
+
+def test_ws_kline_provider_confirmed_close_cannot_reopen() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service, provider=provider_ws.PROVIDER_OKX_SPOT)
+    open_time = 1_695_709_800_000
+
+    _handle_okx_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "101", "10", "1010", "1010", "1"]],
+    )
+    before = _raw_kline_cache(service, provider=provider_ws.PROVIDER_OKX_SPOT)
+    _handle_okx_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "102", "11", "1122", "1122", "0"]],
+    )
+    after = _raw_kline_cache(service, provider=provider_ws.PROVIDER_OKX_SPOT)
+
+    assert after == before
+    assert after["items"][0]["is_closed"] is True
+    assert after["items"][0]["close"] == "101"
+    assert after["items"][0]["_revision_seq"] == 1
+
+
+def test_ws_kline_old_handler_generation_does_not_change_revision_cache() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service, generation=2)
+    open_time = 1_695_709_800_000
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "101", "10", "1010", "1010"]],
+        generation=2,
+    )
+    before = _raw_kline_cache(service)
+
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "99", "9", "891", "891"]],
+        generation=1,
+    )
+
+    assert _raw_kline_cache(service) == before
+    assert before["items"][0]["_provider_generation"] == 2
+
+
+def test_ws_kline_new_generation_bootstraps_existing_bucket() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service, generation=1)
+    open_time = 1_695_709_800_000
+    row = [str(open_time), "100", "110", "95", "101", "10", "1010", "1010"]
+    _handle_bitget_klines(service, [row], generation=1)
+    before = _raw_kline_cache(service)
+    key = (provider_ws.PROVIDER_BITGET_SPOT, "BTCUSDT", "1m")
+    with service._lock:
+        service._kline_generations[key] = 2
+
+    _handle_bitget_klines(service, [row], generation=2)
+    after = _raw_kline_cache(service)
+
+    assert before["items"][0]["_provider_generation"] == 1
+    assert after["items"][0]["_provider_generation"] == 2
+    assert after["items"][0]["_revision_seq"] > before["items"][0]["_revision_seq"]
+    assert after["_revision_state"]["generation"] == 2
+
+
+def test_ws_kline_new_epoch_bootstraps_same_bucket() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service)
+    open_time = 1_695_709_800_000
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "101", "10", "1010", "1010"]],
+    )
+    key = (provider_ws.PROVIDER_BITGET_SPOT, "BTCUSDT", "1m")
+    next_epoch_record = provider_ws.normalize_bitget_kline_message(
+        {
+            "data": [[str(open_time), "200", "210", "195", "205", "20", "4050", "4050"]],
+        },
+        local_symbol="BTCUSDT",
+        provider_symbol="BTCUSDT",
+        interval="1m",
+        kline_limit=30,
+    )
+    assert next_epoch_record is not None
+    next_epoch_record["_revision_epoch"] = 2
+
+    with service._lock:
+        service._kline_cache[key] = service._merge_provider_kline_record_locked(
+            key,
+            next_epoch_record,
+            30,
+            generation=1,
+        )
+    after = _raw_kline_cache(service)
+
+    assert after["_revision_state"]["epoch"] == 2
+    assert after["items"][0]["_revision_epoch"] == 2
+    assert after["items"][0]["close"] == "205"
+
+    stale_epoch_record = provider_ws.normalize_bitget_kline_message(
+        {
+            "data": [
+                [
+                    str(open_time + 60_000),
+                    "300",
+                    "310",
+                    "295",
+                    "305",
+                    "30",
+                    "9150",
+                    "9150",
+                ]
+            ],
+        },
+        local_symbol="BTCUSDT",
+        provider_symbol="BTCUSDT",
+        interval="1m",
+        kline_limit=30,
+    )
+    assert stale_epoch_record is not None
+    stale_epoch_record["_revision_epoch"] = 1
+    with service._lock:
+        before_ref = service._kline_cache[key]
+        merged = service._merge_provider_kline_record_locked(
+            key,
+            stale_epoch_record,
+            30,
+            generation=1,
+        )
+    assert merged is before_ref
+    assert [item["open_time"] for item in merged["items"]] == [open_time]
+
+
+def test_ws_kline_revision_only_changes_matching_open_time() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service)
+    first_open = 1_695_709_800_000
+    second_open = first_open + 60_000
+    _handle_bitget_klines(
+        service,
+        [
+            [str(second_open), "200", "210", "195", "205", "20", "4050", "4050"],
+            [str(first_open), "100", "110", "95", "101", "10", "1010", "1010"],
+        ],
+    )
+    before = _raw_kline_cache(service)
+    second_before = deepcopy(before["items"][1])
+
+    _handle_bitget_klines(
+        service,
+        [[str(first_open), "100", "110", "95", "102", "11", "1122", "1122"]],
+    )
+    after = _raw_kline_cache(service)
+
+    assert [item["open_time"] for item in after["items"]] == [first_open, second_open]
+    assert after["items"][0]["close"] == "102"
+    assert after["items"][0]["_revision_seq"] > before["items"][0]["_revision_seq"]
+    assert after["items"][1] == second_before
+
+
+def test_ws_kline_same_message_duplicate_bucket_uses_latest_revision() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service)
+    open_time = 1_695_709_800_000
+
+    _handle_bitget_klines(
+        service,
+        [
+            [str(open_time), "100", "110", "95", "100", "10", "1000", "1000"],
+            [str(open_time), "100", "110", "95", "101", "11", "1111", "1111"],
+        ],
+    )
+    raw = _raw_kline_cache(service)
+
+    assert len(raw["items"]) == 1
+    assert raw["items"][0]["close"] == "101"
+    assert raw["items"][0]["_revision_seq"] == 2
+    assert raw["_revision_state"]["last_revision_seq"] == 2
+
+
+def test_ws_kline_provider_switch_keeps_revision_states_isolated() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    open_time = 1_695_709_800_000
+    _activate_provider_kline(service, provider=provider_ws.PROVIDER_OKX_SPOT)
+    _activate_provider_kline(service, provider=provider_ws.PROVIDER_BITGET_SPOT)
+    _handle_okx_klines(
+        service,
+        [[str(open_time), "100", "110", "95", "101", "10", "1010", "1010", "0"]],
+    )
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "200", "210", "195", "205", "20", "4050", "4050"]],
+    )
+    okx_before = _raw_kline_cache(service, provider=provider_ws.PROVIDER_OKX_SPOT)
+    bitget_before = _raw_kline_cache(service, provider=provider_ws.PROVIDER_BITGET_SPOT)
+
+    _handle_bitget_klines(
+        service,
+        [[str(open_time), "200", "210", "195", "206", "21", "4326", "4326"]],
+    )
+    okx_after = _raw_kline_cache(service, provider=provider_ws.PROVIDER_OKX_SPOT)
+    bitget_after = _raw_kline_cache(service, provider=provider_ws.PROVIDER_BITGET_SPOT)
+
+    assert okx_after == okx_before
+    assert bitget_after["items"][0]["close"] == "206"
+    assert bitget_after["items"][0]["_revision_seq"] > bitget_before["items"][0]["_revision_seq"]
+    assert okx_after["_revision_state"]["epoch"] == 1
+    assert bitget_after["_revision_state"]["epoch"] == 1
 
 
 def test_provider_switch_isolated_and_late_old_generation_candle_is_dropped() -> None:

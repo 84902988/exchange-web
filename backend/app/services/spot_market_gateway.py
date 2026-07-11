@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from app.core.config import settings
 from app.db.models.trading_pair import TradingPair
@@ -21,7 +21,7 @@ from app.services.spot_market_provider_ws import (
     ensure_spot_provider_ws_depth,
     ensure_spot_provider_ws_kline,
     get_spot_provider_ws_depth,
-    get_spot_provider_ws_klines,
+    get_spot_provider_ws_kline_revisions,
     get_spot_provider_ws_ticker,
     get_spot_provider_ws_trades,
     normalize_spot_ws_symbol,
@@ -71,6 +71,7 @@ class SpotMarketGateway:
         get_ticker: Optional[Callable[..., Optional[dict[str, Any]]]] = None,
         get_trades: Optional[Callable[..., Optional[TradesResponse]]] = None,
         get_klines: Optional[Callable[..., Optional[dict[str, Any]]]] = None,
+        get_kline_revisions: Optional[Callable[..., Optional[Mapping[str, Any]]]] = None,
         provider_symbol_allowed: Optional[Callable[[str], bool]] = None,
         precision_resolver: Optional[Callable[[str], tuple[int, int]]] = None,
         ws_manager: Any = None,
@@ -90,8 +91,12 @@ class SpotMarketGateway:
         self._get_ticker_accepts_provider = get_ticker is None
         self._get_trades = get_trades or get_spot_provider_ws_trades
         self._get_trades_accepts_provider = get_trades is None
-        self._get_klines = get_klines or get_spot_provider_ws_klines
-        self._get_klines_accepts_provider = get_klines is None
+        self._get_klines = (
+            get_kline_revisions
+            or get_klines
+            or get_spot_provider_ws_kline_revisions
+        )
+        self._get_klines_accepts_provider = get_kline_revisions is None and get_klines is None
         self._provider_symbol_allowed = provider_symbol_allowed or self._default_provider_symbol_allowed
         self._provider_symbol_allowed_is_default = provider_symbol_allowed is None
         self._precision_resolver = precision_resolver or self._default_precision_resolver
@@ -100,6 +105,7 @@ class SpotMarketGateway:
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_lock = asyncio.Lock()
         self._broadcast_state = SpotGatewayBroadcastState()
+        self._kline_revision_high_water: dict[Any, tuple[int, int, int]] = {}
         self._depth_authority = SpotGatewayDepthAuthority()
         self._ensured_kline_intervals: dict[str, set[str]] = {}
         self._pending_kline_releases: dict[str, dict[str, float]] = {}
@@ -557,6 +563,10 @@ class SpotMarketGateway:
                                 kline,
                                 source=str((klines or {}).get("source") or "LIVE_WS"),
                                 updated_at=(klines or {}).get("updated_at"),
+                                revision_epoch=kline.get("revision_epoch"),
+                                revision_seq=kline.get("revision_seq"),
+                                is_closed=kline.get("is_closed"),
+                                close_state_source=kline.get("close_state_source"),
                             )
                             self._remember_broadcast_metric(symbol, "kline")
                         except Exception:
@@ -610,6 +620,7 @@ class SpotMarketGateway:
             for interval in sorted(self._ensured_kline_intervals.get(symbol, set())):
                 self._ensure_kline_interval(symbol, interval, provider=provider_code)
             self._broadcast_state.clear_symbol(symbol)
+            self._clear_kline_revision_symbol(symbol)
         except Exception:
             if self._depth_authority.active_provider(symbol) == provider_code:
                 self._pending_provider_switches[symbol] = (previous_provider, provider_code)
@@ -627,6 +638,7 @@ class SpotMarketGateway:
         else:
             await asyncio.to_thread(self._release_depth, symbol)
         self._broadcast_state.clear_symbol(symbol)
+        self._clear_kline_revision_symbol(symbol)
         self._ensured_kline_intervals.pop(symbol, None)
         self._pending_kline_releases.pop(symbol, None)
         self._precision_cache.pop(symbol, None)
@@ -822,23 +834,37 @@ class SpotMarketGateway:
         self._ensured_kline_intervals.setdefault(normalized_symbol, set()).add(normalized_interval)
 
     def _clear_kline_interval_state(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
-        self._broadcast_state.clear_domain_key(
-            self._domain_key(
-                "kline",
-                symbol,
-                provider=provider or self._symbol_providers.get(normalize_spot_ws_symbol(symbol)) or PROVIDER_BITGET_SPOT,
-                interval=interval,
-            )
+        domain_key = self._domain_key(
+            "kline",
+            symbol,
+            provider=provider or self._symbol_providers.get(normalize_spot_ws_symbol(symbol)) or PROVIDER_BITGET_SPOT,
+            interval=interval,
         )
+        self._broadcast_state.clear_domain_key(domain_key)
+        self._kline_revision_high_water.pop(domain_key, None)
 
-    def _latest_kline_for_broadcast(self, klines: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    def _clear_kline_revision_symbol(self, symbol: str) -> None:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        if not normalized_symbol:
+            return
+        for key in [
+            key
+            for key in self._kline_revision_high_water
+            if key.symbol == normalized_symbol
+        ]:
+            self._kline_revision_high_water.pop(key, None)
+
+    def _latest_kline_for_broadcast(
+        self,
+        klines: Optional[Mapping[str, Any]],
+    ) -> Optional[dict[str, Any]]:
         items = list((klines or {}).get("items") or [])
         if not items:
             return None
         valid_items: list[dict[str, Any]] = []
         for item in items:
-            if isinstance(item, dict):
-                valid_items.append(item)
+            if isinstance(item, Mapping):
+                valid_items.append(dict(item))
         if not valid_items:
             return None
         valid_items.sort(key=lambda item: int(item.get("open_time") or 0))
@@ -860,6 +886,14 @@ class SpotMarketGateway:
             interval=normalized_interval,
         )
         signature = self._kline_signature(symbol, normalized_interval, kline)
+        revision_identity = self._kline_revision_identity(kline)
+        previous_revision = self._kline_revision_high_water.get(domain_key)
+        if (
+            revision_identity is not None
+            and previous_revision is not None
+            and not self._is_newer_kline_revision(previous_revision, revision_identity)
+        ):
+            return False
         now_ms = self._broadcast_state.now_ms()
         if not self._broadcast_state.should_broadcast_domain(
             domain_key,
@@ -869,10 +903,24 @@ class SpotMarketGateway:
         ):
             return False
         self._broadcast_state.remember_broadcast(domain_key, signature, now_ms=now_ms)
+        if revision_identity is not None:
+            self._kline_revision_high_water[domain_key] = revision_identity
         return True
 
     def _kline_signature(self, symbol: str, interval: str, kline: dict[str, Any]) -> str:
-        keys = ("open_time", "open", "high", "low", "close", "volume", "quote_volume")
+        keys = (
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_volume",
+            "is_closed",
+            "close_state_source",
+            "revision_epoch",
+            "revision_seq",
+        )
         return repr(
             (
                 normalize_spot_ws_symbol(symbol),
@@ -880,6 +928,38 @@ class SpotMarketGateway:
                 tuple(kline.get(key) for key in keys),
             )
         )
+
+    def _kline_revision_identity(
+        self,
+        kline: Mapping[str, Any],
+    ) -> Optional[tuple[int, int, int]]:
+        values = (
+            kline.get("open_time"),
+            kline.get("revision_epoch"),
+            kline.get("revision_seq"),
+        )
+        if any(value is None for value in values):
+            return None
+        try:
+            open_time, revision_epoch, revision_seq = (int(value) for value in values)
+        except (TypeError, ValueError):
+            return None
+        if open_time <= 0 or revision_epoch < 0 or revision_seq < 0:
+            return None
+        return open_time, revision_epoch, revision_seq
+
+    def _is_newer_kline_revision(
+        self,
+        previous: tuple[int, int, int],
+        incoming: tuple[int, int, int],
+    ) -> bool:
+        previous_open_time, previous_epoch, previous_seq = previous
+        incoming_open_time, incoming_epoch, incoming_seq = incoming
+        if incoming_epoch != previous_epoch:
+            return incoming_epoch > previous_epoch
+        if incoming_open_time != previous_open_time:
+            return incoming_open_time > previous_open_time
+        return incoming_seq > previous_seq
 
     def _remember_broadcast_metric(self, symbol: str, domain: str) -> None:
         normalized_symbol = normalize_spot_ws_symbol(symbol)

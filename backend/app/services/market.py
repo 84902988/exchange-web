@@ -49,6 +49,12 @@ from app.services.spot_kline_bucket import (
     okx_spot_open_time_validator,
 )
 from app.services.spot_kline_response import build_spot_kline_terminal_metadata
+from app.services.spot_kline_revision import (
+    KlineRestWatermark,
+    KlineRevisionCandidate,
+    KlineRevisionDecision,
+    reconcile_rest_kline_candidate,
+)
 from app.services.contract_market_provider_service import (
     MarketDataProviderConfig,
     MarketDataProviderError,
@@ -71,6 +77,7 @@ from app.services.stock_dealer_depth_service import (
 from app.services.spot_kline_realtime import SPOT_KLINE_SOURCE_INTERNAL_TRADE
 from app.services.spot_market_provider_ws import (
     get_spot_provider_ws_depth,
+    get_spot_provider_ws_kline_revisions,
     get_spot_provider_ws_klines,
     get_spot_provider_ws_ticker,
     get_spot_provider_ws_trades,
@@ -1681,10 +1688,13 @@ def _spot_klines_from_provider(
     interval: str,
     limit: int,
     end_time_ms: Optional[int] = None,
+    received_at_ms: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     rows = _spot_provider_rows(payload)
     items: list[dict[str, Any]] = []
     step_ms = _INTERVAL_SECONDS[interval] * 1000
+    batch_received_at_ms = int(received_at_ms if received_at_ms is not None else _now_ms())
+    normalized_provider = str(provider_code or "").strip().upper()
     for row in rows:
         if not isinstance(row, list) or len(row) < 5:
             continue
@@ -1696,21 +1706,120 @@ def _spot_klines_from_provider(
             continue
         if end_time_ms and open_time >= int(end_time_ms):
             continue
-        quote_volume_index = 6 if provider_code == "BITGET_SPOT" else 7
+        quote_volume_index = 6 if normalized_provider == "BITGET_SPOT" else 7
+        close_time = open_time + step_ms
+        is_closed: Optional[bool] = close_time <= batch_received_at_ms
+        close_state_source = "TIME_DERIVED"
+        if normalized_provider == "OKX_SPOT" and len(row) > 8:
+            confirm = str(row[8] or "").strip()
+            if confirm in {"0", "1"}:
+                is_closed = confirm == "1"
+                close_state_source = "PROVIDER_CONFIRMED"
         items.append(
             {
                 "open_time": open_time,
-                "close_time": open_time + step_ms,
+                "close_time": close_time,
                 "open": str(row[1]),
                 "high": str(row[2]),
                 "low": str(row[3]),
                 "close": str(row[4]),
                 "volume": str(row[5] if len(row) > 5 else "0"),
                 "quote_volume": str(row[quote_volume_index] if len(row) > quote_volume_index else "0"),
+                "_provider": normalized_provider,
+                "_received_at_ms": batch_received_at_ms,
+                "_is_closed": is_closed,
+                "_close_state_source": close_state_source,
             }
         )
     items.sort(key=lambda item: int(item["open_time"]))
     return items[-limit:]
+
+
+def _spot_kline_candidate_from_item(
+    *,
+    symbol: str,
+    interval: str,
+    item: Any,
+    provider: str,
+    source: str,
+    transport: str,
+    revision_epoch: int,
+    revision_seq: int,
+) -> KlineRevisionCandidate:
+    item_mapping = item if isinstance(item, dict) else dict(item)
+    return KlineRevisionCandidate(
+        symbol=symbol,
+        interval=interval,
+        open_time=item_mapping.get("open_time"),
+        open=item_mapping.get("open"),
+        high=item_mapping.get("high"),
+        low=item_mapping.get("low"),
+        close=item_mapping.get("close"),
+        volume=item_mapping.get("volume", "0"),
+        quote_volume=item_mapping.get("quote_volume"),
+        provider=provider,
+        source=source,
+        transport=transport,
+        provider_generation=0,
+        revision_epoch=revision_epoch,
+        revision_seq=revision_seq,
+        received_at_ms=int(item_mapping.get("_received_at_ms") or 0),
+        is_closed=item_mapping.get("_is_closed", item_mapping.get("is_closed")),
+        close_state_source=item_mapping.get(
+            "_close_state_source",
+            item_mapping.get("close_state_source"),
+        ),
+        provider_update_time_ms=item_mapping.get("provider_update_time_ms"),
+    )
+
+
+def _capture_spot_kline_rest_watermark(
+    *,
+    symbol: str,
+    interval: str,
+    provider: str,
+) -> KlineRestWatermark:
+    normalized_provider = str(provider or "").strip().upper()
+    snapshot = get_spot_provider_ws_kline_revisions(
+        symbol,
+        interval,
+        provider=normalized_provider,
+        limit=1,
+    )
+    if not snapshot:
+        return KlineRestWatermark(
+            provider=normalized_provider,
+            revision_epoch=0,
+            revision_seq=0,
+        )
+
+    snapshot_provider = str(snapshot.get("provider") or normalized_provider).strip().upper()
+    snapshot_items = list(snapshot.get("items") or [])
+    if not snapshot_items:
+        return KlineRestWatermark(
+            provider=snapshot_provider,
+            revision_epoch=0,
+            revision_seq=0,
+        )
+    item = snapshot_items[-1]
+    revision_epoch = int(item.get("revision_epoch") or 0)
+    revision_seq = int(item.get("revision_seq") or 0)
+    winner = _spot_kline_candidate_from_item(
+        symbol=symbol,
+        interval=interval,
+        item=item,
+        provider=snapshot_provider,
+        source=str(snapshot.get("source") or "LIVE_WS"),
+        transport="WS",
+        revision_epoch=revision_epoch,
+        revision_seq=revision_seq,
+    )
+    return KlineRestWatermark(
+        provider=snapshot_provider,
+        revision_epoch=revision_epoch,
+        revision_seq=revision_seq,
+        winner=winner,
+    )
 
 
 def _merge_spot_live_ws_klines(
@@ -2291,6 +2400,9 @@ def _fetch_external_spot_klines(
     limit: int,
     end_time_ms: Optional[int],
     fast: bool = False,
+    before_provider_fetch: Optional[Callable[[str], None]] = None,
+    fetch_metadata: Optional[dict[str, Any]] = None,
+    update_last_good: bool = True,
 ) -> list[dict[str, Any]]:
     last_error: Optional[Exception] = None
     last_provider_code: Optional[str] = None
@@ -2299,6 +2411,8 @@ def _fetch_external_spot_klines(
     for provider in providers:
         try:
             last_provider_code = provider.provider_code
+            if before_provider_fetch is not None:
+                before_provider_fetch(provider.provider_code)
             provider_symbol = _spot_provider_symbol(db, pair, provider)
             request_provider = _spot_provider_request_config(provider, timeout_cap_ms=timeout_cap_ms)
             if provider.provider_code == "OKX_SPOT":
@@ -2326,11 +2440,20 @@ def _fetch_external_spot_klines(
                 )
             if not items:
                 raise ValueError("spot kline unavailable")
-            _SPOT_LAST_GOOD_KLINES[(pair.symbol, interval)] = {
-                "items": items,
-                "provider": provider.provider_code,
-                "updated_at": datetime.utcnow().isoformat(),
-            }
+            if fetch_metadata is not None:
+                fetch_metadata.clear()
+                fetch_metadata.update(
+                    {
+                        "provider": provider.provider_code,
+                        "from_last_good": False,
+                    }
+                )
+            if update_last_good:
+                _SPOT_LAST_GOOD_KLINES[(pair.symbol, interval)] = {
+                    "items": items,
+                    "provider": provider.provider_code,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
             return items
         except MarketDataProviderError as exc:
@@ -2365,6 +2488,14 @@ def _fetch_external_spot_klines(
     if contract_market_last_good_enabled(db):
         cached = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval))
         if cached and cached.get("items"):
+            if fetch_metadata is not None:
+                fetch_metadata.clear()
+                fetch_metadata.update(
+                    {
+                        "provider": cached.get("provider") or last_provider_code,
+                        "from_last_good": True,
+                    }
+                )
             return list(cached["items"])[-limit:]
     raise KlineProviderFetchError(
         "spot external kline unavailable",
@@ -3777,6 +3908,16 @@ def get_klines(
             primary_provider_code,
             interval,
         )
+        rest_request_watermark: dict[str, KlineRestWatermark] = {}
+        rest_fetch_metadata: dict[str, Any] = {}
+        accepted_rest_items: list[dict[str, Any]] = []
+
+        def _capture_rest_request_watermark(provider_code: str) -> None:
+            rest_request_watermark["value"] = _capture_spot_kline_rest_watermark(
+                symbol=pair.symbol,
+                interval=interval,
+                provider=provider_code,
+            )
 
         def _fetch_external_spot(fetch_limit: int, fetch_end_time_ms: Optional[int]):
             return _fetch_external_spot_klines(
@@ -3786,7 +3927,43 @@ def get_klines(
                 limit=fetch_limit,
                 end_time_ms=fetch_end_time_ms,
                 fast=False,
+                before_provider_fetch=_capture_rest_request_watermark,
+                fetch_metadata=rest_fetch_metadata,
+                update_last_good=False,
             )
+
+        def _reconcile_external_spot_items(
+            external_items: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            accepted_rest_items.clear()
+            provider_code = str(rest_fetch_metadata.get("provider") or "").strip().upper()
+            request_watermark = rest_request_watermark.get("value")
+            if request_watermark is None or not provider_code:
+                return []
+            current_watermark = _capture_spot_kline_rest_watermark(
+                symbol=pair.symbol,
+                interval=interval,
+                provider=provider_code,
+            )
+            for item in external_items:
+                incoming = _spot_kline_candidate_from_item(
+                    symbol=pair.symbol,
+                    interval=interval,
+                    item=item,
+                    provider=provider_code,
+                    source="REST_SNAPSHOT",
+                    transport="REST",
+                    revision_epoch=request_watermark.revision_epoch,
+                    revision_seq=0,
+                )
+                comparison = reconcile_rest_kline_candidate(
+                    request_watermark,
+                    current_watermark,
+                    incoming,
+                )
+                if comparison.decision == KlineRevisionDecision.ACCEPT:
+                    accepted_rest_items.append(dict(item))
+            return list(accepted_rest_items)
 
         cache_result = _coerce_kline_cache_result(
             get_klines_cache_first(
@@ -3800,9 +3977,24 @@ def get_klines(
                 fetch_external=_fetch_external_spot,
                 external_budget_seconds=6.0,
                 open_time_validator=cache_open_time_validator,
+                reconcile_external_items=_reconcile_external_spot_items,
             ),
             end_time_ms=end_time_ms,
         )
+        if accepted_rest_items and not bool(rest_fetch_metadata.get("from_last_good")):
+            accepted_provider = str(rest_fetch_metadata.get("provider") or primary_provider_code or "EXTERNAL_SPOT")
+            _SPOT_LAST_GOOD_KLINES[(pair.symbol, interval)] = {
+                "items": [
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if not str(key).startswith("_")
+                    }
+                    for item in accepted_rest_items
+                ],
+                "provider": accepted_provider,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
         items = cache_result.items
         result_metadata = _spot_kline_result_metadata(
             cache_result,
