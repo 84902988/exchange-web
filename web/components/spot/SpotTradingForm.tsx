@@ -28,24 +28,24 @@ import {
   getSpotPriceStep,
   normalizeSpotPriceInput,
 } from './spotPricePrecision';
+import {
+  resolveSpotOrderDepthInteraction,
+  type SpotExecutableDepthState,
+} from './spotExecutableDepth';
 
 interface SpotTradingFormProps {
   symbol: string;
   baseAsset?: string | null;
   quoteAsset?: string | null;
-  marketPrice: string;
+  executableDepth: SpotExecutableDepthState;
   selectedPrice?: string;
   pricePrecision: number;
   amountPrecision?: number | null;
   accountBalances?: SpotAccountBalanceItem[];
   asks?: SpotDepthLevel[];
   bids?: SpotDepthLevel[];
-  depthSource?: string | null;
-  depthFreshness?: string | null;
-  dataSource?: string | null;
   latestTradePrice?: string | number | null;
   latestTradeAt?: number | null;
-  marketDataLoading?: boolean;
   onPriceChange?: (price: string) => void;
   priceSelectNonce?: number;
   onOrderSuccess?: (order?: CreateSpotOrderResponse) => void;
@@ -744,19 +744,15 @@ export default function SpotTradingForm({
   symbol,
   baseAsset: pairBaseAsset,
   quoteAsset: pairQuoteAsset,
-  marketPrice,
+  executableDepth,
   selectedPrice = '',
   pricePrecision,
   amountPrecision,
   accountBalances = [],
   asks = [],
   bids = [],
-  depthSource,
-  depthFreshness,
-  dataSource,
   latestTradePrice = null,
   latestTradeAt = null,
-  marketDataLoading = false,
   onPriceChange,
   priceSelectNonce = 0,
   onOrderSuccess,
@@ -1020,13 +1016,14 @@ export default function SpotTradingForm({
   const minRcbFeeAmount = Math.max(toFiniteNumber(spotFeeSettings.min_rcb_fee_amount), 0);
   const rcbFeeDiscountPercentText = formatFeeRatioPercent(rcbFeeDiscountRate);
 
+  const orderDepthInteraction = useMemo(
+    () => resolveSpotOrderDepthInteraction(executableDepth, side, orderType),
+    [executableDepth, orderType, side],
+  );
   const currentPriceNumber = useMemo(() => {
-    if (marketDataLoading) {
-      return 0;
-    }
-    const num = Number(marketPrice || price || 0);
+    const num = Number(orderDepthInteraction.referencePrice || 0);
     return Number.isFinite(num) ? num : 0;
-  }, [marketDataLoading, marketPrice, price]);
+  }, [orderDepthInteraction.referencePrice]);
 
   const askLiquidityQuoteAmount = useMemo(() => getAskLiquidityQuoteAmount(asks), [asks]);
   const bidLiquidityAmount = useMemo(() => getBidLiquidityAmount(bids), [bids]);
@@ -1190,11 +1187,15 @@ export default function SpotTradingForm({
   const displayedFeeHintShowOpenLink = estimatedFeeInfo.showOpenLink;
 
   const estimatedBaseAmount = useMemo(() => {
-    if (!Number.isFinite(currentPriceNumber) || currentPriceNumber <= 0) {
-      return '0.0000';
+    if (orderType === 'limit') {
+      return formatAmount(amount || 0, safeAmountPrecision) || '0.0000';
     }
 
-    if (orderType === 'market' && side === 'buy') {
+    if (!Number.isFinite(currentPriceNumber) || currentPriceNumber <= 0) {
+      return '--';
+    }
+
+    if (side === 'buy') {
       return formatAmount(Number(quoteAmount || 0) / currentPriceNumber, safeAmountPrecision) || '0.0000';
     }
 
@@ -1203,7 +1204,7 @@ export default function SpotTradingForm({
 
   const estimatedQuoteAmount = useMemo(() => {
     if (!Number.isFinite(currentPriceNumber) || currentPriceNumber <= 0) {
-      return '0.00';
+      return '--';
     }
 
     return formatSummaryQuoteTotal(Number(amount || 0) * currentPriceNumber) || '0.00';
@@ -1214,7 +1215,7 @@ export default function SpotTradingForm({
   }, [price]);
 
   const liquidityError = useMemo(() => {
-    if (orderType !== 'market') {
+    if (orderType !== 'market' || !orderDepthInteraction.orderExecutable) {
       return '';
     }
 
@@ -1232,7 +1233,16 @@ export default function SpotTradingForm({
     }
 
     return '';
-  }, [amount, askLiquidityQuoteAmount, bidLiquidityAmount, copy, orderType, quoteAmount, side]);
+  }, [
+    amount,
+    askLiquidityQuoteAmount,
+    bidLiquidityAmount,
+    copy,
+    orderDepthInteraction.orderExecutable,
+    orderType,
+    quoteAmount,
+    side,
+  ]);
 
   const syncPriceToParent = (nextPrice: string) => {
     onPriceChange?.(nextPrice);
@@ -1268,11 +1278,8 @@ export default function SpotTradingForm({
   };
 
   const handlePriceStep = (direction: 'up' | 'down') => {
-    if (marketDataLoading && !price) {
-      return;
-    }
     const step = Number(getSpotPriceStep(pricePrecision));
-    const current = Number(price || marketPrice || 0);
+    const current = Number(price || 0);
     const safeCurrent = Number.isFinite(current) ? current : 0;
 
     const next =
@@ -1356,8 +1363,7 @@ export default function SpotTradingForm({
       return;
     }
 
-    const effectivePrice =
-      orderType === 'market' ? currentPriceNumber : Number(price || 0);
+    const effectivePrice = Number(price || 0);
 
     if (side === 'buy') {
       if (!Number.isFinite(effectivePrice) || effectivePrice <= 0) {
@@ -1395,10 +1401,6 @@ export default function SpotTradingForm({
       return;
     }
 
-    if (marketDataLoading) {
-      return;
-    }
-
     if (!isLoggedIn) {
       setSubmitError(copy.loginExpired);
       return;
@@ -1406,6 +1408,16 @@ export default function SpotTradingForm({
 
     const submitSide: SpotOrderSide = side === 'buy' ? 'BUY' : 'SELL';
     const payloadOrderType = orderType === 'limit' ? 'LIMIT' : 'MARKET';
+
+    if (!executableDepth.marketTradable) {
+      setSubmitError(copy.marketClosed);
+      return;
+    }
+
+    if (!orderDepthInteraction.orderExecutable) {
+      setSubmitError(copy.noMarketPrice);
+      return;
+    }
 
     if (liquidityError) {
       setSubmitError(liquidityError);
@@ -1515,6 +1527,29 @@ export default function SpotTradingForm({
 
   async function submitSpotOrder(order: PendingSpotOrder): Promise<void> {
     if (loading) return;
+    if (String(order.payload.symbol || '').trim().toUpperCase() !== String(symbol || '').trim().toUpperCase()) {
+      const message = copy.noMarketPrice;
+      if (pendingMarketOrder) {
+        setPendingMarketOrderError(message);
+      } else {
+        setSubmitError(message);
+      }
+      return;
+    }
+    const pendingInteraction = resolveSpotOrderDepthInteraction(
+      executableDepth,
+      order.payload.side === 'SELL' ? 'sell' : 'buy',
+      order.payload.order_type === 'MARKET' ? 'market' : 'limit',
+    );
+    if (!pendingInteraction.orderExecutable) {
+      const message = executableDepth.marketTradable ? copy.noMarketPrice : copy.marketClosed;
+      if (pendingMarketOrder) {
+        setPendingMarketOrderError(message);
+      } else {
+        setSubmitError(message);
+      }
+      return;
+    }
     const startedAt = Date.now();
 
     try {
@@ -1561,7 +1596,56 @@ export default function SpotTradingForm({
   const showAmountInput = isLimitOrder || side === 'sell';
   const showQuoteAmountInput = isMarketBuy;
   const isAuthChecking = authLoading || !authChecked;
-  const submitDisabled = loading || marketDataLoading || Boolean(liquidityError) || isAuthChecking;
+  const marketDepthError = !executableDepth.marketTradable
+    ? copy.marketClosed
+    : !orderDepthInteraction.orderExecutable
+      ? copy.noMarketPrice
+      : '';
+  const hasValidOrderInput = useMemo(() => {
+    const amountNumber = Number(amount || 0);
+    if (isLimitOrder) {
+      const priceNumber = Number(price || 0);
+      return Number.isFinite(priceNumber) && priceNumber > 0 && Number.isFinite(amountNumber) && amountNumber > 0;
+    }
+    if (isMarketBuy) {
+      const quoteNumber = Number(quoteAmount || 0);
+      const derivedAmount = currentPriceNumber > 0 ? quoteNumber / currentPriceNumber : 0;
+      const formattedDerivedAmount = Number(formatAmount(derivedAmount, safeAmountPrecision) || 0);
+      return Number.isFinite(quoteNumber)
+        && quoteNumber > 0
+        && Number.isFinite(formattedDerivedAmount)
+        && formattedDerivedAmount > 0;
+    }
+    return Number.isFinite(amountNumber) && amountNumber > 0;
+  }, [amount, currentPriceNumber, isLimitOrder, isMarketBuy, price, quoteAmount, safeAmountPrecision]);
+  const hasSufficientOrderBalance = useMemo(() => {
+    const amountNumber = Number(formatAmount(amount || 0, safeAmountPrecision) || 0);
+    if (side === 'sell') {
+      return Number.isFinite(amountNumber) && amountNumber <= baseSpotAvailable;
+    }
+    if (isMarketBuy) {
+      const quoteNumber = Number(formatQuoteAmount(quoteAmount || 0) || 0);
+      return Number.isFinite(quoteNumber) && quoteNumber <= quoteSpotAvailable;
+    }
+    const priceNumber = Number(price || 0);
+    const totalNumber = floorToPrecision(priceNumber * amountNumber, QUOTE_PRECISION);
+    return Number.isFinite(totalNumber) && totalNumber <= quoteSpotAvailable;
+  }, [
+    amount,
+    baseSpotAvailable,
+    isMarketBuy,
+    price,
+    quoteAmount,
+    quoteSpotAvailable,
+    safeAmountPrecision,
+    side,
+  ]);
+  const submitDisabled = loading
+    || Boolean(marketDepthError)
+    || Boolean(liquidityError)
+    || isAuthChecking
+    || !hasValidOrderInput
+    || !hasSufficientOrderBalance;
   const submitButtonText = isAuthChecking
     ? copy.checkingLogin
     : loading
@@ -1573,35 +1657,37 @@ export default function SpotTradingForm({
   const quoteAmountInputUnit = quoteAsset || 'USDT';
   const sliderValue = selectedPercent !== null ? Math.round(selectedPercent * 100) : 0;
 
-  const bestAskPrice = useMemo(() => {
-    const nextAsk = asks.find((item) => Number(item.price) > 0);
-    if (!nextAsk) {
-      return '';
-    }
-    return formatPrice(nextAsk.price, pricePrecision);
-  }, [asks, pricePrecision]);
-
-  const bestBidPrice = useMemo(() => {
-    const nextBid = bids.find((item) => Number(item.price) > 0);
-    if (!nextBid) {
-      return '';
-    }
-    return formatPrice(nextBid.price, pricePrecision);
-  }, [bids, pricePrecision]);
-
-  const bboPrice = marketDataLoading ? '' : side === 'buy' ? bestAskPrice : bestBidPrice;
-  const bboDisabled = marketDataLoading || !bboPrice;
+  const bboPrice = orderDepthInteraction.bboAvailable && orderDepthInteraction.referencePrice
+    ? formatPrice(orderDepthInteraction.referencePrice, pricePrecision)
+    : '';
+  const bboDisabled = !orderDepthInteraction.bboAvailable || !bboPrice;
+  const bboStatusSource = executableDepth.freshnessKind === 'fresh'
+    ? executableDepth.depthSource
+    : executableDepth.freshnessKind === 'loading'
+      ? null
+      : executableDepth.freshnessKind === 'missing'
+        ? 'MISSING'
+        : executableDepth.freshnessKind === 'unknown'
+          ? 'UNKNOWN'
+          : 'STALE';
+  const bboStatusFreshness = executableDepth.freshnessKind === 'fresh'
+    ? executableDepth.depthFreshness
+    : bboStatusSource;
   const bboStatus = resolveSpotMarketStatus(
     {
-      source: depthSource,
-      freshness: depthFreshness,
-      dataSource,
-      isLoading: marketDataLoading,
+      source: bboStatusSource,
+      freshness: bboStatusFreshness,
+      dataSource: executableDepth.dataSource,
+      isLoading: executableDepth.freshnessKind === 'loading',
     },
     localeT,
   );
   const bboBasisLabel = getSpotBboBasisLabel(side, localeT);
-  const bboAvailabilityLabel = getSpotBboAvailabilityLabel(bboStatus, Boolean(bboPrice), localeT);
+  const bboAvailabilityLabel = getSpotBboAvailabilityLabel(
+    bboStatus,
+    orderDepthInteraction.bboAvailable && Boolean(bboPrice),
+    localeT,
+  );
   const latestTradePriceDisplay =
     latestTradePrice !== null && latestTradePrice !== undefined && String(latestTradePrice).trim() !== ''
       ? String(latestTradePrice)
@@ -1647,7 +1733,7 @@ export default function SpotTradingForm({
   };
 
   const handleBboClick = () => {
-    if (marketDataLoading || !bboPrice) {
+    if (!orderDepthInteraction.bboAvailable || !bboPrice) {
       return;
     }
 
@@ -1692,7 +1778,7 @@ export default function SpotTradingForm({
       rows.push({
         key: 'estimated-base-amount',
         label: copy.estimatedBaseAmount,
-        value: `${estimatedBaseAmount} ${baseAsset || symbol}`,
+        value: estimatedBaseAmount === '--' ? '--' : `${estimatedBaseAmount} ${baseAsset || symbol}`,
       });
       rows.push({
         key: 'pay-amount',
@@ -1720,7 +1806,7 @@ export default function SpotTradingForm({
     rows.push({
       key: 'estimated-quote-amount',
       label: copy.estimatedQuoteAmount,
-      value: `${estimatedQuoteAmount} ${quoteAsset || 'USDT'}`,
+      value: estimatedQuoteAmount === '--' ? '--' : `${estimatedQuoteAmount} ${quoteAsset || 'USDT'}`,
     });
     rows.push({
       key: 'estimated-fee',
@@ -2105,9 +2191,9 @@ export default function SpotTradingForm({
                 </div>
               ) : null}
 
-              {!submitError && liquidityError ? (
+              {!submitError && (marketDepthError || liquidityError) ? (
                 <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-2 py-1 text-[12px] text-red-400">
-                  {liquidityError}
+                  {marketDepthError || liquidityError}
                 </div>
               ) : null}
 
