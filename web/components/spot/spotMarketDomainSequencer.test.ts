@@ -405,4 +405,100 @@ describe('spot market domain sequencer', () => {
     expect(decision.state.current?.data.value).toBe('ws-depth')
     expect(decision.state.current?.eventTimeMs).toBe(1_720_000_002_000)
   })
+
+  it('treats explicit ticker event_time_ms as authoritative over compatibility timestamps', () => {
+    expect(extractSpotTickerEventTimeMs({
+      event_time_ms: 1_720_000_002_000,
+      ts: 1_720_000_099_000,
+      event_time: 1_720_000_098_000,
+      received_at_ms: 1_720_000_100_000,
+    })).toBe(1_720_000_002_000)
+  })
+
+  it.each([null, 0])(
+    'does not fall back when explicit ticker event_time_ms is %s',
+    (eventTimeMs) => {
+      expect(extractSpotTickerEventTimeMs({
+        event_time_ms: eventTimeMs,
+        ts: 1_720_000_099_000,
+        updated_at_ms: 1_720_000_100_000,
+        received_at_ms: 1_720_000_101_000,
+      })).toBeNull()
+    },
+  )
+
+  it('keeps legacy ticker payloads compatible only when event_time_ms is absent', () => {
+    expect(extractSpotTickerEventTimeMs({ ts: 1_720_000_003_000 })).toBe(1_720_000_003_000)
+    expect(extractSpotTickerEventTimeMs({ event_time: 1_720_000_004_000 })).toBe(1_720_000_004_000)
+    expect(extractSpotTickerEventTimeMs({ received_at_ms: 1_720_000_100_000 })).toBeNull()
+    expect(extractSpotTickerEventTimeMs({ updated_at_ms: 1_720_000_100_000 })).toBeNull()
+  })
+
+  it('rejects late REST ticker by provider event time despite a much later receive time', () => {
+    const state = bootstrap({
+      domain: 'ticker',
+      eventTimeMs: 1_720_000_002_000,
+      receivedAtMs: 1_720_000_002_100,
+      value: 'ws-ticker',
+    })
+    const decision = sequenceSpotMarketDomainEvent(state, makeEvent({
+      domain: 'ticker',
+      eventTimeMs: extractSpotTickerEventTimeMs({
+        event_time_ms: 1_720_000_001_000,
+        ts: 1_720_000_099_000,
+        received_at_ms: 1_720_000_099_999,
+      }),
+      receivedAtMs: 1_720_000_099_999,
+      transport: 'rest',
+      source: 'REST',
+      freshness: 'RECENT',
+      value: 'late-rest-ticker',
+    }))
+
+    expect(decision.accepted).toBe(false)
+    expect(decision.reason).toBe('older_event_time')
+    expect(decision.state.current?.data.value).toBe('ws-ticker')
+  })
+
+  it('does not let untimed REST ticker overwrite timed WS ticker', () => {
+    const state = bootstrap({ domain: 'ticker', eventTimeMs: 2_000, value: 'ws-ticker' })
+    const decision = sequenceSpotMarketDomainEvent(state, makeEvent({
+      domain: 'ticker',
+      eventTimeMs: extractSpotTickerEventTimeMs({
+        event_time_ms: null,
+        ts: 99_000,
+        received_at_ms: 99_999,
+      }),
+      receivedAtMs: 99_999,
+      transport: 'rest',
+      source: 'REST',
+      freshness: 'RECENT',
+      value: 'untimed-rest-ticker',
+    }))
+
+    expect(decision.accepted).toBe(false)
+    expect(decision.reason).toBe('missing_event_time')
+    expect(decision.state.current?.data.value).toBe('ws-ticker')
+  })
+
+  it('allows untimed REST ticker to bootstrap cold state', () => {
+    const decision = sequenceSpotMarketDomainEvent(null, makeEvent({
+      domain: 'ticker',
+      eventTimeMs: extractSpotTickerEventTimeMs({
+        event_time_ms: null,
+        ts: 99_000,
+        received_at_ms: 99_999,
+      }),
+      receivedAtMs: 99_999,
+      transport: 'rest',
+      source: 'REST',
+      freshness: 'RECENT',
+      value: 'bootstrap-rest-ticker',
+    }))
+
+    expect(decision.accepted).toBe(true)
+    expect(decision.reason).toBe('bootstrap')
+    expect(decision.state.current?.eventTimeMs).toBeNull()
+    expect(decision.state.current?.data.value).toBe('bootstrap-rest-ticker')
+  })
 })

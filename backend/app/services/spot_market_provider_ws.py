@@ -926,7 +926,7 @@ def normalize_bitget_ticker_message(
     price_change_percent = _bitget_price_change_percent(open_24h, price_change_24h, change_ratio)
 
     now_ms = _now_ms()
-    exchange_ts = _spot_provider_ts(row.get("ts"))
+    exchange_ts = _spot_provider_event_time_ms(row.get("ts"))
     return {
         "symbol": normalize_spot_ws_symbol(local_symbol),
         "provider": PROVIDER_BITGET_SPOT,
@@ -944,7 +944,9 @@ def normalize_bitget_ticker_message(
         "quote_freshness": "LIVE",
         "stale": False,
         "market_status": "OPEN",
-        "ts": exchange_ts,
+        "ts": exchange_ts or now_ms,
+        "event_time_ms": exchange_ts,
+        "received_at_ms": now_ms,
         "updated_at_ms": now_ms,
         "updated_at": datetime.utcfromtimestamp(now_ms / 1000).isoformat(),
     }
@@ -990,7 +992,7 @@ def normalize_okx_ticker_message(
     last_amount = _to_decimal(row.get("lastSz"))
 
     now_ms = _now_ms()
-    exchange_ts = _spot_provider_ts(row.get("ts"))
+    exchange_ts = _spot_provider_event_time_ms(row.get("ts"))
     record = {
         "symbol": normalize_spot_ws_symbol(local_symbol),
         "provider": PROVIDER_OKX_SPOT,
@@ -1013,7 +1015,9 @@ def normalize_okx_ticker_message(
         "freshness": "LIVE",
         "stale": False,
         "market_status": "OPEN",
-        "ts": exchange_ts,
+        "ts": exchange_ts or now_ms,
+        "event_time_ms": exchange_ts,
+        "received_at_ms": now_ms,
         "updated_at_ms": now_ms,
         "updated_at": datetime.utcfromtimestamp(now_ms / 1000).isoformat(),
     }

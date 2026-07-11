@@ -517,6 +517,8 @@ def test_okx_ticker_message_normalize_and_cache() -> None:
     assert record["quote_volume_24h"] == "1000"
     assert record["quote_freshness"] == "LIVE"
     assert record["market_status"] == "OPEN"
+    assert record["event_time_ms"] == 1000
+    assert record["received_at_ms"] == record["updated_at_ms"]
 
     service = provider_ws.SpotMarketProviderWsService()
     service.set_ticker_cache_for_tests(record)
@@ -558,6 +560,8 @@ def test_bitget_ticker_message_normalize() -> None:
     assert record["price_change_24h"] == "2"
     assert record["price_change_percent"] == "2"
     assert record["quote_freshness"] == "LIVE"
+    assert record["event_time_ms"] == 1000
+    assert record["received_at_ms"] == record["updated_at_ms"]
 
 
 def test_bitget_ticker_message_normalize_negative_change24h() -> None:
