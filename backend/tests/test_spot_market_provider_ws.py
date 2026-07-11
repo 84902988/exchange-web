@@ -1608,8 +1608,36 @@ def test_depth_response_does_not_impersonate_received_time_as_provider_event_tim
         }
     )
     assert response.ts == 0
+    assert response.event_time_ms is None
+    assert response.received_at_ms == 2000
     assert response.fetched_at == 2000
     assert response.freshness is None
+
+
+def test_depth_response_exposes_record_event_and_receive_times_without_changing_depth_contract() -> None:
+    response = provider_ws._depth_response_from_record(
+        {
+            "symbol": "BTCUSDT",
+            "provider": provider_ws.PROVIDER_OKX_SPOT,
+            "provider_symbol": "BTC-USDT",
+            "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+            "freshness": "LIVE",
+            "bids": [{"price": "100", "amount": "1"}],
+            "asks": [{"price": "101", "amount": "2"}],
+            "ts": 1000,
+            "updated_at_ms": 2000,
+        }
+    )
+
+    assert response.event_time_ms == 1000
+    assert response.received_at_ms == 2000
+    assert response.ts == 1000
+    assert response.fetched_at == 2000
+    assert response.provider == provider_ws.PROVIDER_OKX_SPOT
+    assert response.source == provider_ws.SPOT_PROVIDER_WS_SOURCE
+    assert response.freshness is None
+    assert [(item.price, item.amount) for item in response.bids] == [("100", "1")]
+    assert [(item.price, item.amount) for item in response.asks] == [("101", "2")]
 
 
 if __name__ == "__main__":

@@ -73,6 +73,8 @@ export type SpotDepthResponse = {
   bids: SpotDepthLevel[]
   asks: SpotDepthLevel[]
   ts?: number
+  event_time_ms?: number | null
+  received_at_ms?: number | null
   provider?: string | null
   stale?: boolean
   updated_at?: string | null

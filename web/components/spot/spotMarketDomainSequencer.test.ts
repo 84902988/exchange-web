@@ -1,3 +1,4 @@
+import { describe, expect, it } from '@jest/globals'
 import type {
   SpotMarketTradeItem,
   SpotMarketView,
@@ -182,7 +183,11 @@ describe('spot market domain sequencer', () => {
 
   it('allows an untimed cold-start bootstrap', () => {
     const decision = sequenceSpotMarketDomainEvent(null, makeEvent({
-      eventTimeMs: null,
+      eventTimeMs: extractSpotDepthEventTimeMs({
+        event_time_ms: null,
+        ts: 99_000,
+        received_at_ms: 100_000,
+      }),
       transport: 'rest',
       freshness: 'CACHED',
     }))
@@ -195,9 +200,13 @@ describe('spot market domain sequencer', () => {
   it('does not let untimed data overwrite timed live state', () => {
     const state = bootstrap({ eventTimeMs: 5_000 })
     const decision = sequenceSpotMarketDomainEvent(state, makeEvent({
-      eventTimeMs: null,
+      eventTimeMs: extractSpotDepthEventTimeMs({
+        event_time_ms: null,
+        ts: 99_000,
+        received_at_ms: 100_000,
+      }),
       receivedAtMs: 50_000,
-      transport: 'ws_snapshot',
+      transport: 'rest',
     }))
 
     expect(decision.accepted).toBe(false)
@@ -339,5 +348,61 @@ describe('spot market domain sequencer', () => {
     ])).toBe(12_000)
     expect(extractSpotTradesEventTimeMs([])).toBeNull()
     expect(extractSpotDepthEventTimeMs({ updated_at: '2026-07-11T01:00:00' })).toBeNull()
+  })
+
+  it('treats explicit depth event_time_ms as authoritative over compatibility timestamps', () => {
+    expect(extractSpotDepthEventTimeMs({
+      event_time_ms: 1_720_000_002_000,
+      ts: 1_720_000_099_000,
+      updated_at_ms: 1_720_000_100_000,
+      received_at_ms: 1_720_000_101_000,
+    })).toBe(1_720_000_002_000)
+  })
+
+  it.each([null, 0])(
+    'does not fall back to local ts when explicit depth event_time_ms is %s',
+    (eventTimeMs) => {
+      expect(extractSpotDepthEventTimeMs({
+        event_time_ms: eventTimeMs,
+        ts: 1_720_000_099_000,
+        updated_at_ms: 1_720_000_100_000,
+        received_at_ms: 1_720_000_101_000,
+      })).toBeNull()
+    },
+  )
+
+  it('keeps legacy depth payloads compatible only when event_time_ms is absent', () => {
+    expect(extractSpotDepthEventTimeMs({ ts: 1_720_000_003_000 })).toBe(1_720_000_003_000)
+  })
+
+  it('never treats received_at_ms as provider event time', () => {
+    expect(extractSpotDepthEventTimeMs({ received_at_ms: 1_720_000_100_000 })).toBeNull()
+  })
+
+  it('rejects late REST depth by provider event time despite a much later receive time', () => {
+    const state = bootstrap({
+      domain: 'depth',
+      eventTimeMs: 1_720_000_002_000,
+      receivedAtMs: 1_720_000_002_100,
+      value: 'ws-depth',
+    })
+    const decision = sequenceSpotMarketDomainEvent(state, makeEvent({
+      domain: 'depth',
+      eventTimeMs: extractSpotDepthEventTimeMs({
+        event_time_ms: 1_720_000_001_000,
+        ts: 1_720_000_099_000,
+        received_at_ms: 1_720_000_099_999,
+      }),
+      receivedAtMs: 1_720_000_099_999,
+      transport: 'rest',
+      source: 'REST',
+      freshness: 'RECENT',
+      value: 'late-rest-depth',
+    }))
+
+    expect(decision.accepted).toBe(false)
+    expect(decision.reason).toBe('older_event_time')
+    expect(decision.state.current?.data.value).toBe('ws-depth')
+    expect(decision.state.current?.eventTimeMs).toBe(1_720_000_002_000)
   })
 })
