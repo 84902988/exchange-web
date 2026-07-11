@@ -449,18 +449,172 @@ def _spot_provider_event_time_ms(value: Any) -> Optional[int]:
     return timestamp if timestamp > 0 else None
 
 
-def _trade_signature(trade: dict[str, Any]) -> str:
-    trade_id = str(trade.get("id") or trade.get("tradeId") or "").strip()
-    if trade_id:
-        return f"id:{trade_id}"
-    return repr(
+def _trade_value(trade: Any, key: str) -> Any:
+    if isinstance(trade, dict):
+        return trade.get(key)
+    return getattr(trade, key, None)
+
+
+def _trade_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _trade_nonnegative_time_ms(value: Any) -> Optional[int]:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return None
+    return timestamp if timestamp >= 0 else None
+
+
+def spot_trade_event_time_ms(trade: Any) -> Optional[int]:
+    return _spot_provider_event_time_ms(_trade_value(trade, "event_time_ms"))
+
+
+def spot_trade_strong_identity(trade: Any, *, provider: Any = None) -> Optional[str]:
+    normalized_provider = _trade_text(_trade_value(trade, "provider")) or _trade_text(provider) or "UNKNOWN"
+    normalized_provider = normalized_provider.upper()
+    for key in ("provider_trade_id", "trade_id", "id"):
+        identity = _trade_text(_trade_value(trade, key))
+        if identity is not None:
+            return f"provider:{normalized_provider}|trade:{identity}"
+    return None
+
+
+def spot_trade_weak_fingerprint(
+    trade: Any,
+    *,
+    provider: Any = None,
+    provider_symbol: Any = None,
+) -> str:
+    normalized_provider = _trade_text(_trade_value(trade, "provider")) or _trade_text(provider) or "UNKNOWN"
+    normalized_provider_symbol = (
+        _trade_text(_trade_value(trade, "provider_symbol"))
+        or _trade_text(provider_symbol)
+        or "UNKNOWN"
+    )
+    event_time_ms = spot_trade_event_time_ms(trade)
+    event_time_token: Any = event_time_ms if event_time_ms is not None else "UNTIMED"
+    return "weak:" + repr(
         (
-            str(trade.get("price") or ""),
-            str(trade.get("amount") or trade.get("size") or ""),
-            str(trade.get("side") or "").upper(),
-            int(trade.get("ts") or 0),
+            normalized_provider.upper(),
+            normalized_provider_symbol.upper(),
+            event_time_token,
+            _trade_text(_trade_value(trade, "price")) or "",
+            _trade_text(_trade_value(trade, "amount")) or "",
+            (_trade_text(_trade_value(trade, "side")) or "").upper(),
         )
     )
+
+
+def _trade_signature(
+    trade: Any,
+    *,
+    provider: Any = None,
+    provider_symbol: Any = None,
+) -> str:
+    return spot_trade_strong_identity(trade, provider=provider) or spot_trade_weak_fingerprint(
+        trade,
+        provider=provider,
+        provider_symbol=provider_symbol,
+    )
+
+
+def _trade_received_at_ms(trade: Any) -> int:
+    received_at_ms = _trade_nonnegative_time_ms(_trade_value(trade, "received_at_ms"))
+    return received_at_ms if received_at_ms is not None else 0
+
+
+def _trade_completeness(trade: Any) -> int:
+    keys = (
+        "provider_trade_id",
+        "trade_id",
+        "id",
+        "event_time_ms",
+        "received_at_ms",
+        "time_origin",
+        "created_at",
+        "provider",
+        "provider_symbol",
+        "source",
+        "freshness",
+        "price",
+        "amount",
+        "side",
+    )
+    return sum(_trade_text(_trade_value(trade, key)) is not None for key in keys)
+
+
+def _trade_preference_key(trade: Any) -> tuple[int, int, int]:
+    return (
+        _trade_completeness(trade),
+        _trade_received_at_ms(trade),
+        spot_trade_event_time_ms(trade) or 0,
+    )
+
+
+def _trade_sort_key(trade: Any) -> tuple[int, int, str, int]:
+    event_time_ms = spot_trade_event_time_ms(trade)
+    identity = _trade_signature(trade)
+    received_at_ms = _trade_received_at_ms(trade)
+    if event_time_ms is not None:
+        return (0, -event_time_ms, identity, -received_at_ms)
+    return (1, -received_at_ms, identity, 0)
+
+
+def _trade_with_record_context(
+    trade: Any,
+    *,
+    provider: Any,
+    provider_symbol: Any,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(trade, dict):
+        return None
+    item = dict(trade)
+    if _trade_text(item.get("provider")) is None and provider is not None:
+        item["provider"] = provider
+    if _trade_text(item.get("provider_symbol")) is None and provider_symbol is not None:
+        item["provider_symbol"] = provider_symbol
+    return item
+
+
+def _merge_trade_records(
+    incoming: list[dict[str, Any]],
+    existing: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    strong_items: dict[str, dict[str, Any]] = {}
+    incoming_weak: dict[str, list[dict[str, Any]]] = {}
+    existing_weak: dict[str, list[dict[str, Any]]] = {}
+
+    for source_items, weak_buckets in ((incoming, incoming_weak), (existing, existing_weak)):
+        for trade in source_items:
+            strong_identity = spot_trade_strong_identity(trade)
+            if strong_identity is not None:
+                current = strong_items.get(strong_identity)
+                if current is None or _trade_preference_key(trade) > _trade_preference_key(current):
+                    strong_items[strong_identity] = trade
+                continue
+            fingerprint = spot_trade_weak_fingerprint(trade)
+            weak_buckets.setdefault(fingerprint, []).append(trade)
+
+    merged = list(strong_items.values())
+    for fingerprint in sorted(set(incoming_weak) | set(existing_weak)):
+        incoming_items = incoming_weak.get(fingerprint, [])
+        existing_items = existing_weak.get(fingerprint, [])
+        target_count = max(len(incoming_items), len(existing_items))
+        candidates = sorted(
+            incoming_items + existing_items,
+            key=_trade_preference_key,
+            reverse=True,
+        )
+        # Providers without IDs cannot offer absolute trade identity.  Preserve
+        # the largest observed multiplicity without pretending the weak
+        # fingerprint uniquely identifies each real trade.
+        merged.extend(candidates[:target_count])
+    return merged
 
 
 def _public_kline_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -854,7 +1008,13 @@ def normalize_bitget_trade_message(
     if not trades:
         return None
     trade_limit = _trades_limit(trades_limit)
-    trades.sort(key=lambda item: int(item.get("ts") or 0), reverse=True)
+    trades = _merge_trade_records(trades, [])
+    trades.sort(key=_trade_sort_key)
+    timed_event_values = [
+        event_time_ms
+        for trade in trades
+        if (event_time_ms := spot_trade_event_time_ms(trade)) is not None
+    ]
     return {
         "symbol": normalize_spot_ws_symbol(local_symbol),
         "provider": PROVIDER_BITGET_SPOT,
@@ -862,7 +1022,7 @@ def normalize_bitget_trade_message(
         "source": SPOT_PROVIDER_WS_SOURCE,
         "freshness": "LIVE",
         "trades": trades[:trade_limit],
-        "ts": int(trades[0].get("ts") or batch_received_at_ms),
+        "ts": max(timed_event_values) if timed_event_values else batch_received_at_ms,
         "received_at_ms": batch_received_at_ms,
         "updated_at_ms": batch_received_at_ms,
         "updated_at": datetime.utcfromtimestamp(batch_received_at_ms / 1000).isoformat(),
@@ -926,7 +1086,13 @@ def normalize_okx_trade_message(
     if not trades:
         return None
     trade_limit = _trades_limit(trades_limit)
-    trades.sort(key=lambda item: int(item.get("ts") or 0), reverse=True)
+    trades = _merge_trade_records(trades, [])
+    trades.sort(key=_trade_sort_key)
+    timed_event_values = [
+        event_time_ms
+        for trade in trades
+        if (event_time_ms := spot_trade_event_time_ms(trade)) is not None
+    ]
     return {
         "symbol": normalize_spot_ws_symbol(local_symbol),
         "provider": PROVIDER_OKX_SPOT,
@@ -934,7 +1100,7 @@ def normalize_okx_trade_message(
         "source": SPOT_PROVIDER_WS_SOURCE,
         "freshness": "LIVE",
         "trades": trades[:trade_limit],
-        "ts": int(trades[0].get("ts") or batch_received_at_ms),
+        "ts": max(timed_event_values) if timed_event_values else batch_received_at_ms,
         "received_at_ms": batch_received_at_ms,
         "updated_at_ms": batch_received_at_ms,
         "updated_at": datetime.utcfromtimestamp(batch_received_at_ms / 1000).isoformat(),
@@ -2706,18 +2872,60 @@ class SpotMarketProviderWsService:
         if self._trades_generations.get(key) != generation:
             return
         existing = self._trades_cache.get(key) or {}
-        combined = list(record.get("trades") or []) + list(existing.get("trades") or [])
-        deduped: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for trade in combined:
-            signature = _trade_signature(trade)
-            if not signature or signature in seen:
-                continue
-            seen.add(signature)
-            deduped.append(trade)
-            if len(deduped) >= subscription.trades_limit:
-                break
-        record["trades"] = deduped
+        incoming_provider = record.get("provider") or subscription.provider
+        incoming_provider_symbol = record.get("provider_symbol") or subscription.provider_symbol
+        existing_provider = existing.get("provider") or subscription.provider
+        existing_provider_symbol = existing.get("provider_symbol") or subscription.provider_symbol
+        incoming_items = [
+            item
+            for trade in list(record.get("trades") or [])
+            if (
+                item := _trade_with_record_context(
+                    trade,
+                    provider=incoming_provider,
+                    provider_symbol=incoming_provider_symbol,
+                )
+            )
+            is not None
+        ]
+        existing_items = [
+            item
+            for trade in list(existing.get("trades") or [])
+            if (
+                item := _trade_with_record_context(
+                    trade,
+                    provider=existing_provider,
+                    provider_symbol=existing_provider_symbol,
+                )
+            )
+            is not None
+        ]
+        merged = _merge_trade_records(incoming_items, existing_items)
+        merged.sort(key=_trade_sort_key)
+        final_trades = merged[: subscription.trades_limit]
+
+        received_candidates = [
+            value
+            for value in (
+                _trade_nonnegative_time_ms(record.get("received_at_ms")),
+                _trade_nonnegative_time_ms(record.get("updated_at_ms")),
+                _trade_nonnegative_time_ms(existing.get("received_at_ms")),
+                _trade_nonnegative_time_ms(existing.get("updated_at_ms")),
+                *(_trade_received_at_ms(trade) for trade in final_trades),
+            )
+            if value is not None
+        ]
+        latest_received_at_ms = max(received_candidates, default=0)
+        timed_event_values = [
+            event_time_ms
+            for trade in final_trades
+            if (event_time_ms := spot_trade_event_time_ms(trade)) is not None
+        ]
+        record["trades"] = final_trades
+        record["received_at_ms"] = latest_received_at_ms
+        record["updated_at_ms"] = latest_received_at_ms
+        record["updated_at"] = datetime.utcfromtimestamp(latest_received_at_ms / 1000).isoformat()
+        record["ts"] = max(timed_event_values) if timed_event_values else latest_received_at_ms
         self._trades_cache[key] = record
 
     def _handle_bitget_trades_message(

@@ -27,6 +27,8 @@ from app.services.spot_market_provider_ws import (
     normalize_spot_ws_symbol,
     release_spot_provider_ws_depth,
     release_spot_provider_ws_kline,
+    spot_trade_strong_identity,
+    spot_trade_weak_fingerprint,
     spot_provider_ws_supports_provider,
 )
 from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
@@ -48,6 +50,13 @@ def _is_executor_shutdown(exc: BaseException) -> bool:
         return False
     message = str(exc).strip().lower()
     return any(fragment in message for fragment in _EXECUTOR_SHUTDOWN_MESSAGES)
+
+
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 class SpotMarketGateway:
@@ -458,29 +467,50 @@ class SpotMarketGateway:
                     trades = None
                 for trade in self._new_trades_for_broadcast(symbol, trades):
                     try:
+                        item_id = getattr(trade, "id", None)
+                        trade_id = _first_not_none(getattr(trade, "trade_id", None), item_id)
+                        provider_trade_id = _first_not_none(
+                            getattr(trade, "provider_trade_id", None),
+                            trade_id,
+                            item_id,
+                        )
+                        trade_ts = getattr(trade, "ts", None)
                         await self._market_ws_manager().send_trade(
                             symbol=symbol,
                             price=getattr(trade, "price", None),
                             amount=getattr(trade, "amount", None),
                             side=getattr(trade, "side", ""),
-                            ts=int(getattr(trade, "ts", 0) or 0),
-                            trade_id=getattr(trade, "id", None),
-                            provider=getattr(trade, "provider", None) or getattr(trades, "provider", None),
-                            provider_symbol=(
-                                getattr(trade, "provider_symbol", None)
-                                or getattr(trades, "provider_symbol", None)
+                            ts=int(trade_ts) if trade_ts is not None else 0,
+                            id=item_id,
+                            trade_id=trade_id,
+                            provider=_first_not_none(
+                                getattr(trade, "provider", None),
+                                getattr(trades, "provider", None),
                             ),
-                            provider_trade_id=(
-                                getattr(trade, "provider_trade_id", None)
-                                or getattr(trade, "trade_id", None)
-                                or getattr(trade, "id", None)
+                            provider_symbol=_first_not_none(
+                                getattr(trade, "provider_symbol", None),
+                                getattr(trades, "provider_symbol", None),
                             ),
-                            source=getattr(trade, "source", None) or getattr(trades, "source", None),
-                            freshness=getattr(trade, "freshness", None) or getattr(trades, "freshness", None),
-                            updated_at_ms=(
-                                getattr(trade, "updated_at_ms", None)
-                                or getattr(trades, "updated_at_ms", None)
+                            provider_trade_id=provider_trade_id,
+                            source=_first_not_none(
+                                getattr(trade, "source", None),
+                                getattr(trades, "source", None),
                             ),
+                            freshness=_first_not_none(
+                                getattr(trade, "freshness", None),
+                                getattr(trades, "freshness", None),
+                            ),
+                            updated_at_ms=_first_not_none(
+                                getattr(trade, "updated_at_ms", None),
+                                getattr(trades, "updated_at_ms", None),
+                            ),
+                            event_time_ms=getattr(trade, "event_time_ms", None),
+                            received_at_ms=_first_not_none(
+                                getattr(trade, "received_at_ms", None),
+                                getattr(trades, "received_at_ms", None),
+                            ),
+                            time_origin=getattr(trade, "time_origin", None),
+                            created_at=getattr(trade, "created_at", None),
                         )
                         self._remember_broadcast_metric(symbol, "trades")
                     except Exception:
@@ -663,10 +693,26 @@ class SpotMarketGateway:
         ):
             return []
         batch_seen: set[str] = set()
+        weak_occurrences: dict[str, int] = {}
         new_items: list[Any] = []
         new_signatures: list[str] = []
+        provider = getattr(trades, "provider", None)
+        provider_symbol = getattr(trades, "provider_symbol", None)
         for trade in reversed(list(trades.trades or [])):
-            signature = self._trade_signature(trade)
+            strong_identity = spot_trade_strong_identity(trade, provider=provider)
+            if strong_identity is not None:
+                signature = strong_identity
+            else:
+                fingerprint = spot_trade_weak_fingerprint(
+                    trade,
+                    provider=provider,
+                    provider_symbol=provider_symbol,
+                )
+                occurrence = weak_occurrences.get(fingerprint, 0) + 1
+                weak_occurrences[fingerprint] = occurrence
+                # Weak identity is only a conservative multiset count.  Stable
+                # occurrences prevent replay while preserving real collisions.
+                signature = f"{fingerprint}|occurrence:{occurrence}"
             if (
                 not signature
                 or signature in batch_seen
@@ -681,17 +727,17 @@ class SpotMarketGateway:
             self._broadcast_state.remember_broadcast(domain_key, repr(new_signatures), now_ms=now_ms)
         return new_items
 
-    def _trade_signature(self, trade: Any) -> str:
-        trade_id = str(getattr(trade, "id", "") or "").strip()
-        if trade_id:
-            return f"id:{trade_id}"
-        return repr(
-            (
-                getattr(trade, "price", None),
-                getattr(trade, "amount", None),
-                str(getattr(trade, "side", "") or "").upper(),
-                int(getattr(trade, "ts", 0) or 0),
-            )
+    def _trade_signature(
+        self,
+        trade: Any,
+        *,
+        provider: Any = None,
+        provider_symbol: Any = None,
+    ) -> str:
+        return spot_trade_strong_identity(trade, provider=provider) or spot_trade_weak_fingerprint(
+            trade,
+            provider=provider,
+            provider_symbol=provider_symbol,
         )
 
     async def _active_kline_intervals(self, symbol: str) -> list[str]:

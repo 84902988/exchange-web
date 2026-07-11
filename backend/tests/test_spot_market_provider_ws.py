@@ -84,6 +84,71 @@ def _handle_okx_trades(
     )
 
 
+def _cache_trade(
+    *,
+    identity: str | None = None,
+    event_time_ms: int | None,
+    received_at_ms: int,
+    price: str = "100",
+    amount: str = "1",
+    side: str = "BUY",
+    provider: str = provider_ws.PROVIDER_BITGET_SPOT,
+    provider_symbol: str = "BTCUSDT",
+) -> dict:
+    trade = {
+        "price": price,
+        "amount": amount,
+        "side": side,
+        "ts": event_time_ms if event_time_ms is not None else received_at_ms,
+        "event_time_ms": event_time_ms,
+        "received_at_ms": received_at_ms,
+        "time_origin": "PROVIDER",
+        "provider": provider,
+        "provider_symbol": provider_symbol,
+        "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+        "freshness": "LIVE",
+    }
+    if identity is not None:
+        trade.update(id=identity, trade_id=identity, provider_trade_id=identity)
+    return trade
+
+
+def _store_cached_trades(
+    service: provider_ws.SpotMarketProviderWsService,
+    trades: list[dict],
+    *,
+    received_at_ms: int,
+    trades_limit: int = 30,
+    provider: str = provider_ws.PROVIDER_BITGET_SPOT,
+    provider_symbol: str = "BTCUSDT",
+    generation: int = 1,
+) -> dict:
+    subscription = provider_ws.SpotTradesSubscription(
+        local_symbol="BTCUSDT",
+        provider=provider,
+        provider_symbol=provider_symbol,
+        trades_limit=trades_limit,
+    )
+    key = (provider, "BTCUSDT")
+    with service._lock:
+        service._trades_generations.setdefault(key, generation)
+        service._store_trades_record_locked(
+            subscription,
+            {
+                "symbol": "BTCUSDT",
+                "provider": provider,
+                "provider_symbol": provider_symbol,
+                "source": provider_ws.SPOT_PROVIDER_WS_SOURCE,
+                "freshness": "LIVE",
+                "trades": trades,
+                "received_at_ms": received_at_ms,
+                "updated_at_ms": received_at_ms,
+            },
+            generation,
+        )
+        return service._trades_cache[key]
+
+
 def _handle_bitget_klines(
     service: provider_ws.SpotMarketProviderWsService,
     rows: list[list[str]],
@@ -798,6 +863,138 @@ def test_ws_trade_message_without_provider_time_is_explicitly_untimed_and_captur
     assert untimed["ts"] == 9_000
     assert untimed["created_at"] is None
     assert untimed["time_origin"] == "PROVIDER"
+
+
+def test_trade_identity_prefers_provider_trade_id_then_trade_id_then_id_and_includes_provider() -> None:
+    full = {
+        "provider": provider_ws.PROVIDER_OKX_SPOT,
+        "provider_trade_id": "provider-id",
+        "trade_id": "trade-id",
+        "id": "item-id",
+    }
+    without_provider_id = dict(full, provider_trade_id=None)
+    without_trade_id = dict(without_provider_id, trade_id=None)
+
+    assert provider_ws.spot_trade_strong_identity(full) == "provider:OKX_SPOT|trade:provider-id"
+    assert provider_ws.spot_trade_strong_identity(without_provider_id) == "provider:OKX_SPOT|trade:trade-id"
+    assert provider_ws.spot_trade_strong_identity(without_trade_id) == "provider:OKX_SPOT|trade:item-id"
+    assert provider_ws.spot_trade_strong_identity(full) != provider_ws.spot_trade_strong_identity(
+        dict(full, provider=provider_ws.PROVIDER_BITGET_SPOT)
+    )
+
+
+def test_trades_cache_strong_identity_dedupes_and_prefers_more_complete_newer_item() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    existing = _cache_trade(identity="same", event_time_ms=1_000, received_at_ms=2_000)
+    existing["id"] = "existing-item"
+    existing["trade_id"] = "existing-trade"
+    _store_cached_trades(service, [existing], received_at_ms=2_000)
+
+    incoming = _cache_trade(
+        identity="same",
+        event_time_ms=1_000,
+        received_at_ms=3_000,
+        price="101",
+    )
+    incoming["id"] = "incoming-item"
+    incoming["trade_id"] = "incoming-trade"
+    incoming["created_at"] = datetime.utcfromtimestamp(1).isoformat()
+    record = _store_cached_trades(service, [incoming], received_at_ms=3_000)
+
+    assert len(record["trades"]) == 1
+    assert record["trades"][0]["provider_trade_id"] == "same"
+    assert record["trades"][0]["price"] == "101"
+    assert record["trades"][0]["received_at_ms"] == 3_000
+
+
+def test_trades_cache_weak_fingerprint_uses_collision_aware_multiset_counts() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+
+    weak_two = [
+        _cache_trade(event_time_ms=1_000, received_at_ms=2_000),
+        _cache_trade(event_time_ms=1_000, received_at_ms=2_000),
+    ]
+    record = _store_cached_trades(service, weak_two, received_at_ms=2_000)
+    assert len(record["trades"]) == 2
+
+    replay = [
+        _cache_trade(event_time_ms=1_000, received_at_ms=3_000),
+        _cache_trade(event_time_ms=1_000, received_at_ms=3_000),
+    ]
+    record = _store_cached_trades(service, replay, received_at_ms=3_000)
+    assert len(record["trades"]) == 2
+
+    weak_three = [
+        _cache_trade(event_time_ms=1_000, received_at_ms=4_000),
+        _cache_trade(event_time_ms=1_000, received_at_ms=4_000),
+        _cache_trade(event_time_ms=1_000, received_at_ms=4_000),
+    ]
+    record = _store_cached_trades(service, weak_three, received_at_ms=4_000)
+    assert len(record["trades"]) == 3
+
+    record = _store_cached_trades(
+        service,
+        [_cache_trade(event_time_ms=1_000, received_at_ms=5_000)],
+        received_at_ms=5_000,
+    )
+    assert len(record["trades"]) == 3
+
+
+def test_trades_cache_sorts_globally_before_limit_and_late_trade_cannot_evict_newer_events() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _store_cached_trades(
+        service,
+        [
+            _cache_trade(identity="event-3000", event_time_ms=3_000, received_at_ms=4_000),
+            _cache_trade(identity="event-2000", event_time_ms=2_000, received_at_ms=4_000),
+        ],
+        received_at_ms=4_000,
+        trades_limit=2,
+    )
+    record = _store_cached_trades(
+        service,
+        [_cache_trade(identity="event-1000", event_time_ms=1_000, received_at_ms=99_999)],
+        received_at_ms=99_999,
+        trades_limit=2,
+    )
+
+    assert [trade["event_time_ms"] for trade in record["trades"]] == [3_000, 2_000]
+    assert record["received_at_ms"] == 99_999
+    assert record["updated_at_ms"] == 99_999
+    assert record["ts"] == 3_000
+
+
+def test_trades_cache_places_timed_before_untimed_and_only_sorts_untimed_by_received_time() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    record = _store_cached_trades(
+        service,
+        [
+            _cache_trade(identity="untimed-new", event_time_ms=None, received_at_ms=99_999),
+            _cache_trade(identity="timed", event_time_ms=1_000, received_at_ms=2_000),
+            _cache_trade(identity="untimed-old", event_time_ms=None, received_at_ms=3_000),
+        ],
+        received_at_ms=99_999,
+    )
+
+    assert [trade["provider_trade_id"] for trade in record["trades"]] == [
+        "timed",
+        "untimed-new",
+        "untimed-old",
+    ]
+    assert record["ts"] == 1_000
+
+    untimed_service = provider_ws.SpotMarketProviderWsService()
+    untimed_record = _store_cached_trades(
+        untimed_service,
+        [
+            _cache_trade(identity="received-100", event_time_ms=None, received_at_ms=100),
+            _cache_trade(identity="received-300", event_time_ms=None, received_at_ms=300),
+            _cache_trade(identity="received-200", event_time_ms=None, received_at_ms=200),
+        ],
+        received_at_ms=300,
+    )
+    assert [trade["received_at_ms"] for trade in untimed_record["trades"]] == [300, 200, 100]
+    assert untimed_record["ts"] == 300
 
 
 def test_okx_trades_do_not_drive_provider_kline_cache() -> None:

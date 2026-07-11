@@ -485,6 +485,7 @@ class MarketWsManager:
         amount: Any,
         side: str,
         ts: int,
+        id: Any = None,
         trade_id: Any = None,
         provider: Any = None,
         provider_symbol: Any = None,
@@ -492,37 +493,51 @@ class MarketWsManager:
         source: Any = None,
         freshness: Any = None,
         updated_at_ms: Any = None,
+        event_time_ms: Any = None,
+        received_at_ms: Any = None,
+        time_origin: Any = None,
+        created_at: Any = None,
     ) -> None:
         """
         增量推送：单笔成交
         """
         symbol = _normalize_symbol(symbol)
+        item_id = id if id is not None else trade_id
+        normalized_trade_id = trade_id if trade_id is not None else item_id
+        normalized_provider_trade_id = provider_trade_id
+        if normalized_provider_trade_id is None:
+            normalized_provider_trade_id = normalized_trade_id
+        if normalized_provider_trade_id is None:
+            normalized_provider_trade_id = item_id
         trade_payload = {
-            "id": trade_id,
-            "trade_id": trade_id,
-            "provider_trade_id": provider_trade_id or trade_id,
+            "id": item_id,
+            "trade_id": normalized_trade_id,
+            "provider_trade_id": normalized_provider_trade_id,
             "price": _to_str(price),
             "amount": _to_str(amount),
             "side": (side or "").upper(),
             "ts": ts,
+            "event_time_ms": event_time_ms,
+            "received_at_ms": received_at_ms,
+            "time_origin": time_origin,
+            "created_at": created_at,
+            "provider": str(provider) if provider is not None else None,
+            "provider_symbol": str(provider_symbol) if provider_symbol is not None else None,
+            "source": str(source) if source is not None else None,
+            "freshness": str(freshness) if freshness is not None else None,
         }
-        if provider is not None:
-            trade_payload["provider"] = str(provider)
-        if provider_symbol is not None:
-            trade_payload["provider_symbol"] = str(provider_symbol)
-        if source is not None:
-            trade_payload["source"] = str(source)
-        if freshness is not None:
-            trade_payload["freshness"] = str(freshness)
         if updated_at_ms is not None:
             trade_payload["updated_at_ms"] = updated_at_ms
 
         payload = {
             "type": "spot_trade",
             "symbol": symbol,
-            "trade_id": trade_id,
-            "provider_trade_id": provider_trade_id or trade_id,
+            "trade_id": normalized_trade_id,
+            "provider_trade_id": normalized_provider_trade_id,
             "ts": ts,
+            "event_time_ms": event_time_ms,
+            "received_at_ms": received_at_ms,
+            "time_origin": time_origin,
             "trade": trade_payload,
         }
         if provider is not None:
