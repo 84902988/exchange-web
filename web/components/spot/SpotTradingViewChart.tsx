@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import Script from 'next/script';
+import type { ChartPropertiesOverrides } from '../../public/tradingview/charting_library/charting_library';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import { spotMarketRealtime } from '@/services/marketRealtime';
 import type { SpotChartProps } from './chart/chart.types';
@@ -77,7 +78,8 @@ type TradingViewChartApi = {
 type TradingViewWidgetInstance = {
   remove: () => void;
   activeChart?: () => TradingViewChartApi;
-  onChartReady?: (callback: () => void) => void;
+  chartReady: () => Promise<void>;
+  applyOverrides?: (overrides: Partial<ChartPropertiesOverrides>) => void;
   headerReady: () => Promise<void>;
   createButton: (options?: {
     align?: 'left' | 'right';
@@ -143,6 +145,10 @@ const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
 const SPOT_TV_INITIAL_RIGHT_PADDING_BARS = 4;
 const SPOT_TV_INITIAL_VISIBLE_RANGE_DELAY_MS = 80;
 const SPOT_TV_RESOLUTION_KLINE_OWNER_PREFIX = 'spot-tradingview-chart-resolution';
+const SPOT_TV_PRICE_LABEL_OVERRIDES = {
+  'mainSeriesProperties.showPriceLine': false,
+  'scalesProperties.showSeriesLastValue': false,
+} satisfies Partial<ChartPropertiesOverrides>;
 const SPOT_TV_INITIAL_VISIBLE_BARS: Record<string, number> = {
   '1m': 75,
   '5m': 75,
@@ -374,6 +380,17 @@ export default function SpotTradingViewChart({
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
   const showChartLoading = Boolean(chartLoadingReason || intervalSwitchLoading) && !activeLoadError;
 
+  const restoreToolbarInteractionAfterReady = useCallback((widgetGeneration: number) => {
+    window.requestAnimationFrame(() => {
+      if (activeWidgetGenerationRef.current !== widgetGeneration) return;
+      const activeToken = activeChartLoadingTokenRef.current;
+      if (activeToken && chartLoadingCoordinatorRef.current?.isActive(activeToken)) return;
+      setSpotToolbarLoadingState(toolbarSlotRef.current, toolbarButtonRefs.current, {
+        loading: false,
+      });
+    });
+  }, []);
+
   const getChartLoadingCoordinator = useCallback(() => {
     if (!chartLoadingCoordinatorRef.current) {
       chartLoadingCoordinatorRef.current = new SpotChartLoadingCoordinator({
@@ -400,12 +417,13 @@ export default function SpotTradingViewChart({
           }
           if (activeWidgetGenerationRef.current === token.widgetGeneration) {
             onIntervalSwitchLoadCompleteRef.current?.();
+            restoreToolbarInteractionAfterReady(token.widgetGeneration);
           }
         },
       });
     }
     return chartLoadingCoordinatorRef.current;
-  }, []);
+  }, [restoreToolbarInteractionAfterReady]);
 
   const startChartLoading = useCallback((reason: string, widgetGeneration: number) => {
     if (!widgetGeneration || activeWidgetGenerationRef.current !== widgetGeneration) return null;
@@ -1430,6 +1448,7 @@ export default function SpotTradingViewChart({
       ],
       enabled_features: ['iframe_loading_same_origin', 'custom_resolutions'],
       overrides: {
+        ...SPOT_TV_PRICE_LABEL_OVERRIDES,
         'paneProperties.background': '#12161c',
         'paneProperties.backgroundType': 'solid',
         'paneProperties.vertGridProperties.color': 'rgba(255,255,255,0.04)',
@@ -1469,6 +1488,7 @@ export default function SpotTradingViewChart({
         || activeWidgetGenerationRef.current !== widgetGeneration
       ) return;
       chartReadyRef.current = true;
+      widget.applyOverrides?.(SPOT_TV_PRICE_LABEL_OVERRIDES);
       const chart = widget.activeChart?.();
       if (
         chart?.createShape
@@ -1495,13 +1515,10 @@ export default function SpotTradingViewChart({
       if (pendingInitialRange) {
         applyInitialVisibleRangeFromHistory(pendingInitialRange, 'chart-ready');
       }
+      restoreToolbarInteractionAfterReady(widgetGeneration);
     };
 
-    if (typeof widget.onChartReady === 'function') {
-      widget.onChartReady(markChartReady);
-    } else {
-      window.setTimeout(markChartReady, 0);
-    }
+    void widget.chartReady().then(markChartReady).catch(() => undefined);
 
     widget.headerReady().then(() => {
       if (
@@ -1613,6 +1630,7 @@ export default function SpotTradingViewChart({
       } else {
         setSpotToolbarLoadingState(toolbarSlot, toolbarButtonRefs.current, { loading: false });
       }
+      restoreToolbarInteractionAfterReady(widgetGeneration);
     }).catch(() => undefined);
 
     return () => {
@@ -1640,6 +1658,7 @@ export default function SpotTradingViewChart({
     startChartLoading,
     finishChartLoading,
     retireChartLoadingGeneration,
+    restoreToolbarInteractionAfterReady,
     widgetKey,
     widgetStyle,
   ]);
