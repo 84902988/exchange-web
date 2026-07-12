@@ -5,6 +5,7 @@ import {
 import { parseSpotPrivateWsMessage } from '../spotPrivateWs'
 import {
   pairMatchesSpotSelectorCategory,
+  pairMatchesSpotSelectorCryptoView,
   pairMatchesSpotSelectorSearch,
   type GlobalMarketSelectorPair,
 } from '../GlobalMarketSelector'
@@ -17,7 +18,7 @@ import {
 } from '../tradingview/spotKlineClientCache'
 
 describe('spot standard exchange semantics', () => {
-  const internalCryptoSpotPair: GlobalMarketSelectorPair = {
+  const internalPlatformSpotPair: GlobalMarketSelectorPair = {
     symbol: 'MFCUSDT',
     displaySymbol: 'MFC/USDT',
     baseAsset: 'MFC',
@@ -25,7 +26,28 @@ describe('spot standard exchange semantics', () => {
     assetType: 'CRYPTO',
     dataSource: 'INTERNAL',
     marketCategory: 'CRYPTO',
-    displayCategory: null,
+    displayCategory: 'PLATFORM',
+  }
+
+  const btcSpotPair: GlobalMarketSelectorPair = {
+    symbol: 'BTCUSDT',
+    displaySymbol: 'BTC/USDT',
+    baseAsset: 'BTC',
+    quoteAsset: 'USDT',
+    assetType: 'CRYPTO',
+    dataSource: 'BINANCE',
+    marketCategory: 'CRYPTO',
+    displayCategory: 'MAINSTREAM',
+  }
+
+  const ethContractPair: GlobalMarketSelectorPair = {
+    symbol: 'ETHUSDT-PERP',
+    displaySymbol: 'ETH/USDT PERP',
+    baseAsset: 'ETH',
+    quoteAsset: 'USDT',
+    assetType: 'CONTRACT',
+    marketMode: 'CONTRACT',
+    marketCategory: 'CONTRACT',
   }
 
   const rwaSpotPair: GlobalMarketSelectorPair = {
@@ -52,16 +74,31 @@ describe('spot standard exchange semantics', () => {
     )).toBe(true)
   })
 
-  it('keeps enabled internal crypto spot pairs visible in the regular spot selector category', () => {
-    expect(pairMatchesSpotSelectorCategory(internalCryptoSpotPair, 'spot')).toBe(true)
+  it('keeps MFC in the platform selector category when search is empty', () => {
+    expect(pairMatchesSpotSelectorCategory(internalPlatformSpotPair, 'spot')).toBe(false)
+    expect(pairMatchesSpotSelectorCategory(internalPlatformSpotPair, 'platform')).toBe(true)
+    expect(pairMatchesSpotSelectorCryptoView(internalPlatformSpotPair, 'spot', '', true)).toBe(false)
   })
 
   it('searches spot selector pairs by compact and slash display symbols', () => {
-    expect(pairMatchesSpotSelectorSearch(internalCryptoSpotPair, 'MFCUSDT')).toBe(true)
-    expect(pairMatchesSpotSelectorSearch(internalCryptoSpotPair, 'MFC/USDT')).toBe(true)
-    expect(pairMatchesSpotSelectorSearch(internalCryptoSpotPair, 'mfc')).toBe(true)
-    expect(pairMatchesSpotSelectorSearch(internalCryptoSpotPair, 'usdt')).toBe(true)
+    expect(pairMatchesSpotSelectorSearch(internalPlatformSpotPair, 'MFCUSDT')).toBe(true)
+    expect(pairMatchesSpotSelectorSearch(internalPlatformSpotPair, 'MFC/USDT')).toBe(true)
+    expect(pairMatchesSpotSelectorSearch(internalPlatformSpotPair, 'mfc')).toBe(true)
+    expect(pairMatchesSpotSelectorSearch(internalPlatformSpotPair, 'usdt')).toBe(true)
     expect(pairMatchesSpotSelectorSearch(rwaSpotPair, 'BON')).toBe(true)
+  })
+
+  it('searches across spot subcategories without mixing contract pairs', () => {
+    expect(pairMatchesSpotSelectorCryptoView(internalPlatformSpotPair, 'spot', 'MFCUSDT', true)).toBe(true)
+    expect(pairMatchesSpotSelectorCryptoView(rwaSpotPair, 'spot', 'BON', true)).toBe(true)
+    expect(pairMatchesSpotSelectorCryptoView(btcSpotPair, 'spot', 'BTC', true)).toBe(true)
+    expect(pairMatchesSpotSelectorCryptoView(ethContractPair, 'spot', 'ETH', true)).toBe(false)
+  })
+
+  it('restores the selected category when spot search is cleared', () => {
+    expect(pairMatchesSpotSelectorCryptoView(internalPlatformSpotPair, 'spot', 'MFC', true)).toBe(true)
+    expect(pairMatchesSpotSelectorCryptoView(internalPlatformSpotPair, 'spot', '', true)).toBe(false)
+    expect(pairMatchesSpotSelectorCryptoView(btcSpotPair, 'spot', '', true)).toBe(true)
   })
 
   it('clears old depth levels when backend marks depth missing', () => {

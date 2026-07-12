@@ -3,6 +3,7 @@ import type { SpotMarketConnectionStatus } from '@/services/marketRealtime';
 export type SpotMarketHydrationInput = {
   price?: string | number | null;
   source?: string | null;
+  freshness?: string | null;
   restLoading: boolean;
   connectionStatus: SpotMarketConnectionStatus;
 };
@@ -10,6 +11,7 @@ export type SpotMarketHydrationInput = {
 export type SpotMarketHydrationState = {
   hasValidPrice: boolean;
   hasLivePrice: boolean;
+  hasReadyPrice: boolean;
   isHydrating: boolean;
   isUnavailable: boolean;
 };
@@ -26,12 +28,20 @@ export function resolveSpotMarketHydration(
   input: SpotMarketHydrationInput,
 ): SpotMarketHydrationState {
   const hasValidPrice = hasValidSpotPrice(input.price);
-  const hasLivePrice = hasValidPrice && String(input.source || '').trim().toUpperCase() === 'LIVE_WS';
+  const source = String(input.source || '').trim().toUpperCase();
+  const freshness = String(input.freshness || '').trim().toUpperCase();
+  const hasLivePrice = hasValidPrice && source === 'LIVE_WS';
+  const hasAuthoritativeInternalPrice = (
+    hasValidPrice
+    && source === 'INTERNAL'
+    && (!freshness || freshness === 'LIVE' || freshness === 'RECENT')
+  );
+  const hasReadyPrice = hasLivePrice || hasAuthoritativeInternalPrice;
   const restUnavailable = !input.restLoading && !hasValidPrice;
   const websocketUnavailable = input.connectionStatus === 'closed';
   const isUnavailable = restUnavailable && websocketUnavailable;
   const isHydrating = (
-    !hasLivePrice
+    !hasReadyPrice
     && !isUnavailable
     && (input.restLoading || input.connectionStatus !== 'closed')
   );
@@ -39,6 +49,7 @@ export function resolveSpotMarketHydration(
   return {
     hasValidPrice,
     hasLivePrice,
+    hasReadyPrice,
     isHydrating,
     isUnavailable,
   };
