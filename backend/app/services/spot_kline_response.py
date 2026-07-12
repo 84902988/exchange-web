@@ -42,8 +42,10 @@ def build_spot_kline_terminal_metadata(
             "COVERAGE_INVALID",
         }
     )
+    has_terminal_evidence = bool(terminal_reason and earliest_available_time)
     history_terminal = bool(
         getattr(result, "history_terminal", False) is True
+        and has_terminal_evidence
         and not has_terminal_contradiction
     )
     return {

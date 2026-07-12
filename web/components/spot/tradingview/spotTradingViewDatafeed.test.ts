@@ -273,7 +273,8 @@ test('history noData requires explicit consistent terminal metadata', () => {
   assert.equal(policy({ history_terminal: true, history_incomplete: true }).noData, false)
   assert.equal(policy({ history_terminal: true, cache_status: 'SHORT' }).noData, false)
   assert.equal(policy({ history_terminal: true, stale: true }).noData, false)
-  assert.equal(policy({ history_terminal: true }, false).noData, false, 'current requests never end history')
+  assert.equal(policy({ history_terminal: true }, false).noData, true, 'terminal current result is final no-data')
+  assert.equal(policy({ provider_error_code: 'SYMBOL_NOT_FOUND' }, false).noData, true)
   assert.equal(resolvePolicy({
     isHistoryRequest: true,
     result: { bars: [{ time: 1 }], history_terminal: true },
@@ -339,6 +340,28 @@ test('explicit terminal history is the only empty response that reports noData',
   await waitFor(() => historyCalls.length === 1, 'terminal history did not settle')
 
   assert.equal(historyCalls[0].meta.noData, true)
+  datafeed.destroy()
+})
+
+test('permanently missing symbol settles once with noData true', async () => {
+  requestKlines = async () => {
+    throw Object.assign(new Error('symbol not found'), { code: 'SYMBOL_NOT_FOUND' })
+  }
+  const historyCalls: HistoryCall[] = []
+  const errors: string[] = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'NOTREALUSDT' })
+
+  datafeed.getBars(
+    symbolInfo('NOTREALUSDT'),
+    '1M',
+    { ...currentPeriod, countBack: 329 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    (reason: string) => errors.push(reason),
+  )
+  await waitFor(() => historyCalls.length === 1, 'missing symbol did not settle')
+
+  assert.deepEqual(historyCalls, [{ bars: [], meta: { noData: true } }])
+  assert.deepEqual(errors, [])
   datafeed.destroy()
 })
 
@@ -453,6 +476,64 @@ test('BTCUSDT 1M countBack 300 loads about 100 bars and requests provider bounda
   assert.equal(requestParams.length, 2, 'recorded boundary must prevent a duplicate provider request')
   assert.deepEqual(boundaryCalls[0].bars, [])
   assert.equal(boundaryCalls[0].meta.noData, true)
+  datafeed.destroy()
+  resetSWRHarness()
+})
+
+test('BTCUSDT 1M recoverable empty first page waits for the final 102 bars', async () => {
+  resetSWRHarness()
+  const earliestAvailableTime = Date.UTC(2018, 0, 1)
+  const availableRows = Array.from({ length: 102 }, (_, index) => (
+    row(Date.UTC(2018, index, 1), String(100 + index))
+  ))
+  const requestParams: Array<Record<string, unknown>> = []
+  requestKlines = async (params) => {
+    requestParams.push(params)
+    if (requestParams.length === 1) {
+      return metadata([], {
+        cache_status: 'PROVIDER_EMPTY',
+        history_incomplete: true,
+        provider_error_code: 'EMPTY',
+      })
+    }
+    if (requestParams.length === 2) {
+      return metadata(availableRows, {
+        source: 'REST_SNAPSHOT',
+        freshness: 'RECENT',
+      })
+    }
+    return metadata([], {
+      cache_status: 'HISTORY_BOUNDARY',
+      history_terminal: true,
+      terminal_reason: 'PROVIDER_HISTORY_BOUNDARY',
+      earliest_available_time: earliestAvailableTime,
+    })
+  }
+  const currentCalls: HistoryCall[] = []
+  let emptyCallbackCount = 0
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+
+  datafeed.getBars(
+    symbolInfo(),
+    '1M',
+    { ...currentPeriod, countBack: 329 },
+    (bars: any[], meta: { noData?: boolean }) => {
+      if (bars.length === 0) emptyCallbackCount += 1
+      currentCalls.push({ bars, meta })
+    },
+    assert.fail,
+  )
+  await waitFor(() => currentCalls.length === 1, 'recoverable monthly current chain did not settle')
+
+  assert.equal(requestParams.length, 3)
+  assert.equal(requestParams[0].limit, 329)
+  assert.equal(requestParams[1].limit, 329)
+  assert.equal(requestParams[1].endTime, undefined)
+  assert.equal(requestParams[2].limit, 227)
+  assert.equal(requestParams[2].endTime, earliestAvailableTime)
+  assert.equal(emptyCallbackCount, 0)
+  assert.equal(currentCalls[0].bars.length, 102)
+  assert.equal(currentCalls[0].meta.noData, false)
   datafeed.destroy()
   resetSWRHarness()
 })
@@ -839,6 +920,37 @@ test('intraday current history remains unaffected by terminal boundary support',
   assert.equal(requestCount, 3)
   assert.deepEqual(historyCalls.map((call) => call.meta.noData), [false, false, false])
   assert.deepEqual(historyCalls.map((call) => call.bars.length), [1, 1, 1])
+  datafeed.destroy()
+})
+
+test('1D and 1W current history still settle with bars', async () => {
+  const requestIntervals: string[] = []
+  requestKlines = async (params) => {
+    requestIntervals.push(String(params.interval))
+    return metadata([
+      row(
+        params.interval === '1Dutc' ? Date.UTC(2026, 6, 10) : Date.UTC(2026, 6, 6),
+        params.interval === '1Dutc' ? '201' : '202',
+      ),
+    ])
+  }
+  const historyCalls: HistoryCall[] = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+
+  for (const resolution of ['1D', '1W']) {
+    datafeed.getBars(
+      symbolInfo(),
+      resolution,
+      currentPeriod,
+      (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+      assert.fail,
+    )
+    await waitFor(() => historyCalls.length === requestIntervals.length, `${resolution} did not settle`)
+  }
+
+  assert.deepEqual(requestIntervals, ['1Dutc', '1Wutc'])
+  assert.deepEqual(historyCalls.map((call) => call.bars.length), [1, 1])
+  assert.deepEqual(historyCalls.map((call) => call.meta.noData), [false, false])
   datafeed.destroy()
 })
 

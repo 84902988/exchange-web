@@ -615,6 +615,17 @@ function isTransientKlineProviderErrorCode(value: unknown): boolean {
   );
 }
 
+function isPermanentKlineNoDataCode(value: unknown): boolean {
+  const code = normalizeKlineMetaValue(value);
+  return (
+    code === 'INVALID_SYMBOL' ||
+    code === 'SYMBOL_NOT_FOUND' ||
+    code === 'PAIR_NOT_FOUND' ||
+    code === 'MARKET_NOT_FOUND' ||
+    code === 'PERMANENT_NO_DATA'
+  );
+}
+
 function hasKlineHistoryMetadata(result: HistoryKlineRequestResult): boolean {
   return (
     result.freshness !== undefined ||
@@ -650,27 +661,24 @@ function isExplicitTerminalKlineResult(result: HistoryKlineRequestResult): boole
   return result.bars.length === 0 && hasExplicitTerminalKlineEvidence(result);
 }
 
+function isExplicitPermanentNoDataResult(result: HistoryKlineRequestResult): boolean {
+  if (result.bars.length > 0) return false;
+  return (
+    isPermanentKlineNoDataCode(result.provider_error_code) ||
+    isPermanentKlineNoDataCode(result.terminal_reason)
+  );
+}
+
 export function resolveHistoryNoDataPolicy(params: {
   isHistoryRequest: boolean;
   result: HistoryKlineRequestResult;
 }): HistoryNoDataPolicy {
   const { isHistoryRequest, result } = params;
-  if (!isHistoryRequest) {
-    return {
-      noData: false,
-      shouldError: false,
-      reason: 'current request',
-      hasMetadata: hasKlineHistoryMetadata(result),
-      terminalEmpty: false,
-      transientEmpty: false,
-    };
-  }
-
   if (result.bars.length > 0) {
     return {
       noData: false,
       shouldError: false,
-      reason: 'history bars returned',
+      reason: isHistoryRequest ? 'history bars returned' : 'current bars returned',
       hasMetadata: hasKlineHistoryMetadata(result),
       terminalEmpty: false,
       transientEmpty: false,
@@ -678,6 +686,31 @@ export function resolveHistoryNoDataPolicy(params: {
   }
 
   const hasMetadata = hasKlineHistoryMetadata(result);
+  const terminalEmpty = isExplicitTerminalKlineResult(result);
+  const permanentNoData = isExplicitPermanentNoDataResult(result);
+
+  if (terminalEmpty || permanentNoData) {
+    return {
+      noData: true,
+      shouldError: false,
+      reason: terminalEmpty ? 'terminal empty history' : 'permanent no data',
+      hasMetadata,
+      terminalEmpty,
+      transientEmpty: false,
+    };
+  }
+
+  if (!isHistoryRequest) {
+    return {
+      noData: false,
+      shouldError: false,
+      reason: 'recoverable empty current request',
+      hasMetadata,
+      terminalEmpty: false,
+      transientEmpty: true,
+    };
+  }
+
   if (!hasMetadata) {
     return {
       noData: false,
@@ -694,18 +727,6 @@ export function resolveHistoryNoDataPolicy(params: {
   const providerErrorCode = normalizeKlineMetaValue(result.provider_error_code);
   const stale = isTruthyKlineMeta(result.stale);
   const historyIncomplete = isTruthyKlineMeta(result.history_incomplete);
-  const terminalEmpty = isExplicitTerminalKlineResult(result);
-
-  if (terminalEmpty) {
-    return {
-      noData: true,
-      shouldError: false,
-      reason: 'terminal empty history',
-      hasMetadata,
-      terminalEmpty: true,
-      transientEmpty: false,
-    };
-  }
 
   const transientProviderEmpty = isTransientKlineProviderErrorCode(providerErrorCode);
   const transientEmpty = (
@@ -1243,9 +1264,13 @@ async function fetchCountBackKlineRequestBarsRaw(params: {
       forceRest: true,
     });
 
-    if (!firstResult) firstResult = result;
+    if (!firstResult || (!firstResult.bars.length && result.bars.length > 0)) {
+      firstResult = result;
+    }
 
     const terminalEmpty = isExplicitTerminalKlineResult(result);
+    const permanentNoData = isExplicitPermanentNoDataResult(result);
+    const finalNoData = terminalEmpty || permanentNoData;
     if (terminalEmpty) {
       terminalEvidence = result;
       params.onTerminalEvidence?.(result);
@@ -1287,8 +1312,23 @@ async function fetchCountBackKlineRequestBarsRaw(params: {
     });
 
     if (!result.bars.length) {
-      terminalNoData = terminalEmpty;
-      if (combinedBars.length || terminalEmpty) break;
+      terminalNoData = finalNoData;
+      if (combinedBars.length || finalNoData) break;
+      if (!params.isHistoryRequest && page < SPOT_TV_GETBARS_MAX_INTERNAL_PAGES) {
+        spotTradingViewDebug('getBars recoverable current empty deferred', {
+          requestSeq: params.requestSeq,
+          phase: params.phase,
+          symbol: params.symbol,
+          interval: normalizeSpotInterval(params.interval),
+          page,
+          limit,
+          end_time_ms: cursorEndTime || null,
+          history_terminal: result.history_terminal,
+          provider_error_code: result.provider_error_code,
+          cache_status: result.cache_status,
+        });
+        continue;
+      }
       return {
         ...result,
         bars: [],
@@ -1296,7 +1336,7 @@ async function fetchCountBackKlineRequestBarsRaw(params: {
         coverageKey: params.isHistoryRequest
           ? `history:${params.endTime || 0}`
           : 'current',
-        coverageComplete: terminalEmpty,
+        coverageComplete: finalNoData,
         terminalComplete: terminalEmpty,
         pageCount: pages.length,
         requestedBars: params.requiredBars,
@@ -2544,6 +2584,11 @@ export function createSpotTradingViewDatafeed(
           const noDataPolicy = resolveHistoryNoDataPolicy({ isHistoryRequest, result });
           const callbackNoData = noDataPolicy.noData;
           const noDataDecision = noDataPolicy.reason;
+          const recoverableCurrentEmptyExhausted = Boolean(
+            !isHistoryRequest &&
+            !bars.length &&
+            !callbackNoData
+          );
           const continuityStats = getBarsContinuityStats(bars, interval);
           const sparseRealBars = isSparseRealKlineSeries({
             interval,
@@ -2608,6 +2653,26 @@ export function createSpotTradingViewDatafeed(
             lastBars: buildBarDebugRows(bars),
           };
           spotTradingViewDebug('getBars response', responseDebugPayload);
+
+          if (recoverableCurrentEmptyExhausted) {
+            markSpotKlinePerf('getBars_recoverable_empty_exhausted', {
+              ...getBarsPerfPayload,
+              duration_ms: Math.max(0, getSpotDatafeedPerfNow() - restRequestStartedAt),
+              pageCount: result.pageCount,
+              history_terminal: result.history_terminal,
+              provider_error_code: result.provider_error_code,
+              note: 'current chain exhausted without a final history result',
+            });
+            spotTradingViewDebug('getBars recoverable current empty exhausted', {
+              ...requestDebugPayload,
+              pageCount: result.pageCount,
+              history_terminal: result.history_terminal,
+              provider_error_code: result.provider_error_code,
+              noData: false,
+            });
+            safeErrorCallback('Kline history temporarily unavailable');
+            return;
+          }
 
           if (!isHistoryRequest && canUpdateActiveHistoryState()) {
             rememberHistoryBars(bars);
@@ -2722,16 +2787,22 @@ export function createSpotTradingViewDatafeed(
               return;
             }
           }
-          const shouldEmitFatalError = isInvalidKlineRequestError(err) || isUnparseableKlineResponseError(err);
+          const permanentNoData = isInvalidKlineRequestError(err);
+          const shouldEmitFatalError = isUnparseableKlineResponseError(err);
           markSpotKlinePerf('getBars_error', {
             ...getBarsPerfPayload,
             duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
             fatal: shouldEmitFatalError,
+            permanent_no_data: permanentNoData,
             error: getKlineErrorMessage(err) || 'Failed to load spot history',
           });
           if (!isHistoryRequest && canUpdateActiveHistoryState()) {
             options.onKlineLoadStateChange?.(shouldEmitFatalError ? 'error' : 'empty');
             historyReadyByLatestBarKey.set(latestBarKey, true);
+          }
+          if (permanentNoData) {
+            safeHistoryCallback([], { noData: true }, 'permanent no data');
+            return;
           }
           if (shouldEmitFatalError) {
             safeErrorCallback(getKlineErrorMessage(err) || 'Failed to load spot history');

@@ -33,8 +33,12 @@ import {
 } from './tradingview/spotKlinePerf';
 import {
   requestSpotSetResolution,
-  setSpotToolbarDisabled,
+  setSpotToolbarLoadingState,
+  shouldStartSpotChartResolutionChange,
   SpotChartLoadingCoordinator,
+  SpotResolutionIntentCoordinator,
+  type SpotChartLoadingToken,
+  type SpotResolutionIntentToken,
 } from './tradingview/spotTradingViewResolutionState';
 
 type TradingViewVisibleRange = {
@@ -117,6 +121,12 @@ type SpotTvDebugEvent = {
 
 type SpotRecentVisibleRangeEvent = SpotTradingViewHistoryBarsEvent & {
   updatedAt: number;
+};
+
+type SpotChartLoadingToolbarOwner = {
+  token: SpotChartLoadingToken;
+  toolbarSlot: HTMLElement | null;
+  toolbarButtons: Map<string, HTMLButtonElement>;
 };
 
 const TRADINGVIEW_LIBRARY_PATH = '/tradingview/charting_library/';
@@ -317,8 +327,7 @@ export default function SpotTradingViewChart({
   const widgetRef = useRef<TradingViewWidgetInstance | null>(null);
   const datafeedRef = useRef<ReturnType<typeof createSpotTradingViewDatafeed> | null>(null);
   const chartReadyRef = useRef(false);
-  const currentResolutionRef = useRef('');
-  const pendingResolutionRef = useRef('');
+  const resolutionIntentCoordinatorRef = useRef(new SpotResolutionIntentCoordinator());
   const resolutionRequestSeqRef = useRef(0);
   const resolutionRequestCancelRef = useRef<(() => void) | null>(null);
   const activeIntervalRef = useRef('');
@@ -333,11 +342,13 @@ export default function SpotTradingViewChart({
   const toolbarButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const toolbarSlotRef = useRef<HTMLElement | null>(null);
   const chartLoadingCoordinatorRef = useRef<SpotChartLoadingCoordinator | null>(null);
+  const widgetGenerationSequenceRef = useRef(0);
+  const activeWidgetGenerationRef = useRef(0);
+  const activeChartLoadingTokenRef = useRef<SpotChartLoadingToken | null>(null);
+  const chartLoadingToolbarOwnerRef = useRef<SpotChartLoadingToolbarOwner | null>(null);
   const priceOverlayControllerRef = useRef<SpotTradingViewPriceOverlayController | null>(null);
   const displayPriceRef = useRef(displayPrice);
   const onNativeCandleDisplayRef = useRef(onNativeCandleDisplay);
-  const activeChartLoadingSeqRef = useRef(0);
-  const chartLoadingStartedAtRef = useRef(0);
   const onIntervalSwitchLoadCompleteRef = useRef(onIntervalSwitchLoadComplete);
   const onIntervalResolutionCommitRef = useRef(onIntervalResolutionCommit);
   const onIntervalResolutionFailureRef = useRef(onIntervalResolutionFailure);
@@ -367,35 +378,89 @@ export default function SpotTradingViewChart({
     if (!chartLoadingCoordinatorRef.current) {
       chartLoadingCoordinatorRef.current = new SpotChartLoadingCoordinator({
         onChange: setChartLoadingReason,
-        onSettled: () => {
-          setSpotToolbarDisabled(toolbarSlotRef.current, toolbarButtonRefs.current, false);
-          onIntervalSwitchLoadCompleteRef.current?.();
+        onSettled: (token) => {
+          const toolbarOwner = chartLoadingToolbarOwnerRef.current;
+          if (
+            toolbarOwner
+            && toolbarOwner.token.widgetGeneration === token.widgetGeneration
+            && toolbarOwner.token.sequence === token.sequence
+          ) {
+            setSpotToolbarLoadingState(
+              toolbarOwner.toolbarSlot,
+              toolbarOwner.toolbarButtons,
+              { loading: false },
+            );
+            chartLoadingToolbarOwnerRef.current = null;
+          }
+          if (
+            activeChartLoadingTokenRef.current?.widgetGeneration === token.widgetGeneration
+            && activeChartLoadingTokenRef.current?.sequence === token.sequence
+          ) {
+            activeChartLoadingTokenRef.current = null;
+          }
+          if (activeWidgetGenerationRef.current === token.widgetGeneration) {
+            onIntervalSwitchLoadCompleteRef.current?.();
+          }
         },
       });
     }
     return chartLoadingCoordinatorRef.current;
   }, []);
 
-  const startChartLoading = useCallback((reason: string) => {
-    chartLoadingStartedAtRef.current = getSpotChartPerfNow();
-    const loadingSeq = getChartLoadingCoordinator().start(reason);
-    activeChartLoadingSeqRef.current = loadingSeq;
-    setSpotToolbarDisabled(toolbarSlotRef.current, toolbarButtonRefs.current, true);
-    return loadingSeq;
+  const startChartLoading = useCallback((reason: string, widgetGeneration: number) => {
+    if (!widgetGeneration || activeWidgetGenerationRef.current !== widgetGeneration) return null;
+    const token = getChartLoadingCoordinator().start(widgetGeneration, reason);
+    const toolbarOwner: SpotChartLoadingToolbarOwner = {
+      token,
+      toolbarSlot: toolbarSlotRef.current,
+      toolbarButtons: new Map(toolbarButtonRefs.current),
+    };
+    activeChartLoadingTokenRef.current = token;
+    chartLoadingToolbarOwnerRef.current = toolbarOwner;
+    const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
+    setSpotToolbarLoadingState(toolbarOwner.toolbarSlot, toolbarOwner.toolbarButtons, {
+      loading: true,
+      pendingKey: resolutionState.pendingResolution
+        ? tradingViewResolutionToSpotInterval(resolutionState.pendingResolution.resolution)
+        : undefined,
+    });
+    return token;
   }, [getChartLoadingCoordinator]);
 
-  const finishChartLoading = useCallback((reason: string, loadingSeq = activeChartLoadingSeqRef.current) => {
-    const elapsedMs = Math.max(0, getSpotChartPerfNow() - chartLoadingStartedAtRef.current);
+  const finishChartLoading = useCallback((
+    reason: string,
+    token: SpotChartLoadingToken | null = activeChartLoadingTokenRef.current,
+  ) => {
+    if (!token || token.widgetGeneration !== activeWidgetGenerationRef.current) return false;
+    const elapsedMs = Math.max(0, Date.now() - token.startedAt);
     markSpotKlinePerf('chart_loading_end', {
       symbol: normalizedSymbolRef.current,
       interval: activeIntervalRef.current,
       resolution: widgetIntervalRef.current,
       reason,
       duration_ms: elapsedMs,
-      loading_sequence: loadingSeq,
+      loading_sequence: token.sequence,
+      widget_generation: token.widgetGeneration,
+      loading_intent: token.intent,
     });
-    return getChartLoadingCoordinator().finish(loadingSeq);
+    return getChartLoadingCoordinator().finish(token);
   }, [getChartLoadingCoordinator]);
+
+  const retireChartLoadingGeneration = useCallback((widgetGeneration: number) => {
+    const toolbarOwner = chartLoadingToolbarOwnerRef.current;
+    if (toolbarOwner?.token.widgetGeneration === widgetGeneration) {
+      setSpotToolbarLoadingState(
+        toolbarOwner.toolbarSlot,
+        toolbarOwner.toolbarButtons,
+        { loading: false },
+      );
+      chartLoadingToolbarOwnerRef.current = null;
+    }
+    if (activeChartLoadingTokenRef.current?.widgetGeneration === widgetGeneration) {
+      activeChartLoadingTokenRef.current = null;
+    }
+    return chartLoadingCoordinatorRef.current?.retireGeneration(widgetGeneration) ?? false;
+  }, []);
 
   const getPreloadManager = useCallback(() => {
     if (!preloadManagerRef.current) {
@@ -583,9 +648,10 @@ export default function SpotTradingViewChart({
         });
         return;
       }
+      const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
       if (
-        pendingResolutionRef.current === event.resolution &&
-        currentResolutionRef.current !== event.resolution
+        resolutionState.inFlightResolution === event.resolution &&
+        resolutionState.currentResolution !== event.resolution
       ) {
         pendingInitialVisibleRangeRef.current = event;
         spotTradingViewChartDebug('initial-visible-range', {
@@ -863,7 +929,11 @@ export default function SpotTradingViewChart({
     [applyInitialVisibleRangeFromHistory, resetInitialVisibleRangeIntent],
   );
 
-  const handleDatafeedHistoryBars = useCallback((event: SpotTradingViewHistoryBarsEvent) => {
+  const handleDatafeedHistoryBars = useCallback((
+    event: SpotTradingViewHistoryBarsEvent,
+    widgetGeneration: number,
+  ) => {
+    if (activeWidgetGenerationRef.current !== widgetGeneration) return;
     applyInitialVisibleRangeFromHistory(event);
     if (event.isHistoryRequest || event.phase !== 'current') return;
 
@@ -879,9 +949,11 @@ export default function SpotTradingViewChart({
       return;
     }
 
+    const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
     if (
-      currentResolutionRef.current === event.resolution
-      && (!pendingResolutionRef.current || pendingResolutionRef.current === event.resolution)
+      resolutionState.currentResolution === event.resolution
+      && !resolutionState.inFlightResolution
+      && !resolutionState.pendingResolution
     ) {
       finishChartLoading(event.barCount > 0 ? 'current-history-bars' : 'current-history-empty');
     }
@@ -920,120 +992,300 @@ export default function SpotTradingViewChart({
   }, []);
 
   const applyWidgetResolution = useCallback(
-    (nextResolution: string) => {
+    (nextResolution: string, widgetGeneration = activeWidgetGenerationRef.current) => {
       if (!nextResolution) return;
+      if (!widgetGeneration || activeWidgetGenerationRef.current !== widgetGeneration) return;
 
       const activeIntervalValue = activeIntervalRef.current;
-      const loadingSeq = startChartLoading('resolution-change');
+      const widget = widgetRef.current;
+      const canStart = Boolean(widget && chartReadyRef.current);
+      const intentCoordinator = resolutionIntentCoordinatorRef.current;
+      const previousIntentState = intentCoordinator.snapshot();
+      const latestIntent = intentCoordinator.latestIntent()
+        ?? intentCoordinator.registerIntent(nextResolution).intent;
+      const intentDecision = intentCoordinator.request(latestIntent, { canStart });
+      const updateToolbarIntentState = (
+        loading: boolean,
+        pendingResolution = intentDecision.snapshot.pendingResolution?.resolution,
+      ) => {
+        updateToolbarButtons(
+          toolbarButtonRefs.current,
+          chartModeRef.current,
+          activeIntervalRef.current,
+        );
+        setSpotToolbarLoadingState(toolbarSlotRef.current, toolbarButtonRefs.current, {
+          loading,
+          pendingKey: pendingResolution
+            ? tradingViewResolutionToSpotInterval(pendingResolution)
+            : undefined,
+        });
+      };
+
+      spotTradingViewChartDebug('resolution-intent-applied', {
+        from: previousIntentState.currentResolution,
+        to: nextResolution,
+        intentId: latestIntent.intentId,
+        latestIntentId: intentDecision.snapshot.latestIntentId,
+        latestResolution: intentCoordinator.latestIntent()?.resolution || null,
+        inFlightResolution: intentDecision.snapshot.inFlightResolution || null,
+        pendingResolution: intentDecision.snapshot.pendingResolution?.resolution || null,
+        pending: intentDecision.action === 'pending',
+        action: intentDecision.action,
+        requestSequence: intentDecision.snapshot.requestSequence,
+        widgetGeneration,
+      });
       markSpotKlinePerf('apply_resolution_start', {
         symbol: normalizedSymbolRef.current,
         interval: activeIntervalValue,
         resolution: nextResolution,
-        currentResolution: currentResolutionRef.current,
-        pendingResolution: pendingResolutionRef.current || null,
+        intentId: latestIntent.intentId,
+        latestIntentId: intentDecision.snapshot.latestIntentId,
+        currentResolution: intentDecision.snapshot.currentResolution,
+        inFlightResolution: intentDecision.snapshot.inFlightResolution || null,
+        pendingResolution: intentDecision.snapshot.pendingResolution?.resolution || null,
+        requestSequence: intentDecision.snapshot.requestSequence,
+        widget_generation: widgetGeneration,
       });
-      const widget = widgetRef.current;
-      if (!widget || !chartReadyRef.current) {
-        pendingResolutionRef.current = nextResolution;
+      if (!canStart || !widget) {
+        updateToolbarIntentState(Boolean(
+          intentDecision.snapshot.inFlightResolution
+          || intentDecision.snapshot.pendingResolution
+          || activeChartLoadingTokenRef.current
+        ));
         markSpotKlinePerf('apply_resolution_start', {
           symbol: normalizedSymbolRef.current,
           interval: activeIntervalValue,
           resolution: nextResolution,
-          currentResolution: currentResolutionRef.current,
+          intentId: latestIntent.intentId,
+          latestIntentId: intentDecision.snapshot.latestIntentId,
+          currentResolution: intentDecision.snapshot.currentResolution,
+          pendingResolution: intentDecision.snapshot.pendingResolution?.resolution || null,
+          requestSequence: intentDecision.snapshot.requestSequence,
+          widget_generation: widgetGeneration,
           note: !widget ? 'widget not ready' : 'chart not ready',
         });
         return;
       }
 
-      if (currentResolutionRef.current === nextResolution) {
-        pendingResolutionRef.current = '';
-        updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, activeIntervalRef.current);
+      if (intentDecision.action === 'pending') {
+        updateToolbarIntentState(true);
+        return;
+      }
+
+      if (intentDecision.action === 'stale') {
+        updateToolbarIntentState(Boolean(
+          intentDecision.snapshot.inFlightResolution
+          || intentDecision.snapshot.pendingResolution
+        ));
+        return;
+      }
+
+      if (intentDecision.action === 'noop') {
+        updateToolbarIntentState(Boolean(intentDecision.snapshot.inFlightResolution));
+        if (
+          intentDecision.snapshot.currentResolution !== nextResolution
+          || intentDecision.snapshot.inFlightResolution
+        ) return;
         syncKlineIntervalAfterResolutionCommit('already_current_resolution');
         applyRecentVisibleRangeAfterResolutionCommit('already_current_resolution');
         onIntervalResolutionCommitRef.current?.(activeIntervalValue);
-        finishChartLoading('already-current-resolution', loadingSeq);
+        const activeToken = activeChartLoadingTokenRef.current;
+        if (activeToken?.widgetGeneration === widgetGeneration) {
+          finishChartLoading('already-current-resolution', activeToken);
+        }
         markSpotKlinePerf('set_resolution_data_ready', {
           symbol: normalizedSymbolRef.current,
           interval: activeIntervalValue,
           resolution: nextResolution,
-          currentResolution: currentResolutionRef.current,
+          currentResolution: intentDecision.snapshot.currentResolution,
+          requestSequence: intentDecision.snapshot.requestSequence,
+          widget_generation: widgetGeneration,
           note: 'already current resolution',
           duration_ms: 0,
         });
         return;
       }
 
-      const chart = widget.activeChart?.();
-      const requestSeq = ++resolutionRequestSeqRef.current;
-      const resolutionRequestId = createSpotKlinePerfId('set-resolution');
-      const setResolutionStartedAt = getSpotChartPerfNow();
-      const previousResolution = currentResolutionRef.current;
-      const rollbackInterval = tradingViewResolutionToSpotInterval(previousResolution || '1');
-      pendingResolutionRef.current = nextResolution;
-      resetInitialVisibleRangeIntent();
-      resolutionRequestCancelRef.current?.();
-      markSpotKlinePerf('set_resolution_called', {
-        symbol: normalizedSymbolRef.current,
-        interval: activeIntervalValue,
-        resolution: nextResolution,
-        requestId: requestSeq,
-        resolutionRequestId,
-        previousResolution,
-      });
-      resolutionRequestCancelRef.current = requestSpotSetResolution({
-        chart,
-        resolution: nextResolution,
-        isCurrent: () => resolutionRequestSeqRef.current === requestSeq && widgetRef.current === widget,
-        onCommitted: (reason) => {
-          resolutionRequestCancelRef.current = null;
-          const durationMs = Math.max(0, getSpotChartPerfNow() - setResolutionStartedAt);
-          currentResolutionRef.current = nextResolution;
-          pendingResolutionRef.current = '';
-          updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, activeIntervalRef.current);
-          markSpotKlinePerf('set_resolution_data_ready', {
-            symbol: normalizedSymbolRef.current,
-            interval: activeIntervalRef.current,
-            resolution: nextResolution,
-            requestId: requestSeq,
-            resolutionRequestId,
-            duration_ms: durationMs,
-            note: reason,
-          });
-          onIntervalResolutionCommitRef.current?.(activeIntervalRef.current);
-          finishChartLoading('resolution-committed', loadingSeq);
-          syncKlineIntervalAfterResolutionCommit('resolution_commit');
-          const pendingInitialRange = pendingInitialVisibleRangeRef.current;
-          if (pendingInitialRange) {
-            applyInitialVisibleRangeFromHistory(pendingInitialRange, 'resolution-committed');
-          } else {
-            applyRecentVisibleRangeAfterResolutionCommit('resolution_commit');
-          }
-        },
-        onFailed: (reason, error) => {
-          resolutionRequestCancelRef.current = null;
-          pendingResolutionRef.current = '';
-          currentResolutionRef.current = previousResolution;
-          updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, rollbackInterval);
-          markSpotKlinePerf('set_resolution_error', {
-            symbol: normalizedSymbolRef.current,
-            interval: activeIntervalValue,
-            rollbackInterval,
-            resolution: nextResolution,
-            requestId: requestSeq,
-            resolutionRequestId,
-            duration_ms: Math.max(0, getSpotChartPerfNow() - setResolutionStartedAt),
-            note: reason,
-            error: error instanceof Error ? error.message : error ? String(error) : undefined,
-          });
-          onIntervalResolutionFailureRef.current?.(rollbackInterval);
-          finishChartLoading('resolution-failed', loadingSeq);
-        },
-      });
+      const runResolutionRequest = (intentToken: SpotResolutionIntentToken) => {
+        if (!intentCoordinator.canStart(intentToken)) return;
+        const resolution = intentToken.resolution;
+        const targetInterval = tradingViewResolutionToSpotInterval(resolution);
+        const targetBackendInterval = getBackendKlineIntervalForSpotInterval(targetInterval);
+        const resolutionState = intentCoordinator.snapshot();
+
+        if (!shouldStartSpotChartResolutionChange({
+          widgetAvailable: Boolean(widget),
+          chartReady: chartReadyRef.current,
+          currentResolution: resolutionState.currentResolution,
+          nextResolution: resolution,
+        })) return;
+
+        const loadingToken = startChartLoading('resolution-change', widgetGeneration);
+        if (!loadingToken) return;
+        getPreloadManager().setForegroundState({
+          loading: true,
+          symbol: normalizedSymbolRef.current,
+          interval: targetBackendInterval,
+          generation: intentToken.requestSequence,
+        });
+
+        const chart = widget.activeChart?.();
+        const requestSeq = ++resolutionRequestSeqRef.current;
+        const resolutionRequestId = createSpotKlinePerfId('set-resolution');
+        const setResolutionStartedAt = getSpotChartPerfNow();
+        const previousResolution = resolutionState.currentResolution;
+        const rollbackInterval = tradingViewResolutionToSpotInterval(previousResolution || '1');
+        resetInitialVisibleRangeIntent();
+        resolutionRequestCancelRef.current?.();
+        markSpotKlinePerf('set_resolution_called', {
+          symbol: normalizedSymbolRef.current,
+          interval: targetInterval,
+          resolution,
+          intentId: intentToken.intentId,
+          latestIntentId: resolutionState.latestIntentId,
+          requestId: requestSeq,
+          requestSequence: intentToken.requestSequence,
+          resolutionRequestId,
+          previousResolution,
+          widget_generation: widgetGeneration,
+        });
+        resolutionRequestCancelRef.current = requestSpotSetResolution({
+          chart,
+          resolution,
+          isCurrent: () => (
+            resolutionRequestSeqRef.current === requestSeq
+            && intentCoordinator.isCurrent(intentToken)
+            && widgetRef.current === widget
+            && activeWidgetGenerationRef.current === widgetGeneration
+          ),
+          onCommitted: (reason) => {
+            resolutionRequestCancelRef.current = null;
+            const settlement = intentCoordinator.commit(intentToken);
+            if (!settlement.accepted) return;
+            const durationMs = Math.max(0, getSpotChartPerfNow() - setResolutionStartedAt);
+            markSpotKlinePerf('set_resolution_data_ready', {
+              symbol: normalizedSymbolRef.current,
+              interval: targetInterval,
+              resolution,
+              intentId: intentToken.intentId,
+              latestIntentId: settlement.snapshot.latestIntentId,
+              requestId: requestSeq,
+              requestSequence: intentToken.requestSequence,
+              resolutionRequestId,
+              widget_generation: widgetGeneration,
+              duration_ms: durationMs,
+              note: reason,
+            });
+            spotTradingViewChartDebug('resolution-committed', {
+              resolution,
+              interval: targetInterval,
+              requestId: resolutionRequestId,
+              intentId: intentToken.intentId,
+              latestIntentId: settlement.snapshot.latestIntentId,
+              requestSequence: intentToken.requestSequence,
+              pendingResolution: settlement.snapshot.pendingResolution?.resolution || null,
+              nextResolution: settlement.nextToken?.resolution || null,
+              widgetGeneration,
+              reason,
+            });
+
+            if (settlement.nextToken) {
+              const nextInterval = tradingViewResolutionToSpotInterval(settlement.nextToken.resolution);
+              updateToolbarIntentState(true, settlement.nextToken.resolution);
+              spotTradingViewChartDebug('pending-resolution-started', {
+                resolution: settlement.nextToken.resolution,
+                intentId: settlement.nextToken.intentId,
+                interval: nextInterval,
+                requestSequence: settlement.nextToken.requestSequence,
+                previousResolution: resolution,
+                widgetGeneration,
+              });
+              runResolutionRequest(settlement.nextToken);
+              return;
+            }
+
+            updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, targetInterval);
+            onIntervalResolutionCommitRef.current?.(targetInterval);
+            finishChartLoading('resolution-committed', loadingToken);
+            getPreloadManager().setForegroundState({
+              loading: false,
+              symbol: normalizedSymbolRef.current,
+              interval: targetBackendInterval,
+              generation: intentToken.requestSequence,
+            });
+            syncKlineIntervalAfterResolutionCommit('resolution_commit');
+            const pendingInitialRange = pendingInitialVisibleRangeRef.current;
+            if (pendingInitialRange) {
+              applyInitialVisibleRangeFromHistory(pendingInitialRange, 'resolution-committed');
+            } else {
+              applyRecentVisibleRangeAfterResolutionCommit('resolution_commit');
+            }
+          },
+          onFailed: (reason, error) => {
+            resolutionRequestCancelRef.current = null;
+            const settlement = intentCoordinator.fail(intentToken);
+            if (!settlement.accepted) return;
+            markSpotKlinePerf('set_resolution_error', {
+              symbol: normalizedSymbolRef.current,
+              interval: targetInterval,
+              rollbackInterval,
+              resolution,
+              intentId: intentToken.intentId,
+              latestIntentId: settlement.snapshot.latestIntentId,
+              requestId: requestSeq,
+              requestSequence: intentToken.requestSequence,
+              resolutionRequestId,
+              widget_generation: widgetGeneration,
+              duration_ms: Math.max(0, getSpotChartPerfNow() - setResolutionStartedAt),
+              note: reason,
+              error: error instanceof Error ? error.message : error ? String(error) : undefined,
+            });
+
+            if (settlement.nextToken) {
+              const nextInterval = tradingViewResolutionToSpotInterval(settlement.nextToken.resolution);
+              updateToolbarIntentState(true, settlement.nextToken.resolution);
+              spotTradingViewChartDebug('pending-resolution-started', {
+                resolution: settlement.nextToken.resolution,
+                intentId: settlement.nextToken.intentId,
+                interval: nextInterval,
+                requestSequence: settlement.nextToken.requestSequence,
+                previousResolution: resolution,
+                widgetGeneration,
+                reason: 'previous resolution failed',
+              });
+              runResolutionRequest(settlement.nextToken);
+              return;
+            }
+
+            const committedResolution = settlement.snapshot.currentResolution || previousResolution;
+            const committedInterval = tradingViewResolutionToSpotInterval(committedResolution || '1');
+            updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, committedInterval);
+            onIntervalResolutionFailureRef.current?.(committedInterval);
+            finishChartLoading('resolution-failed', loadingToken);
+            getPreloadManager().setForegroundState({
+              loading: false,
+              symbol: normalizedSymbolRef.current,
+              interval: getBackendKlineIntervalForSpotInterval(committedInterval),
+              generation: intentToken.requestSequence,
+            });
+          },
+        });
+      };
+
+      if (!intentDecision.token) return;
+      if (!shouldStartSpotChartResolutionChange({
+        widgetAvailable: Boolean(widget),
+        chartReady: chartReadyRef.current,
+        currentResolution: previousIntentState.currentResolution,
+        nextResolution,
+      })) return;
+      runResolutionRequest(intentDecision.token);
     },
     [
       applyInitialVisibleRangeFromHistory,
       applyRecentVisibleRangeAfterResolutionCommit,
       finishChartLoading,
+      getPreloadManager,
       resetInitialVisibleRangeIntent,
       startChartLoading,
       syncKlineIntervalAfterResolutionCommit,
@@ -1062,6 +1314,16 @@ export default function SpotTradingViewChart({
   useEffect(() => () => {
     resolutionRequestCancelRef.current?.();
     resolutionRequestCancelRef.current = null;
+    const toolbarOwner = chartLoadingToolbarOwnerRef.current;
+    if (toolbarOwner) {
+      setSpotToolbarLoadingState(
+        toolbarOwner.toolbarSlot,
+        toolbarOwner.toolbarButtons,
+        { loading: false },
+      );
+      chartLoadingToolbarOwnerRef.current = null;
+    }
+    activeChartLoadingTokenRef.current = null;
     chartLoadingCoordinatorRef.current?.destroy();
     chartLoadingCoordinatorRef.current = null;
   }, []);
@@ -1073,16 +1335,18 @@ export default function SpotTradingViewChart({
 
   useEffect(() => {
     let cancelled = false;
+    let widgetGeneration = 0;
 
-    const cleanupWidget = () => {
+    const cleanupWidget = (generation = activeWidgetGenerationRef.current) => {
+      if (generation && activeWidgetGenerationRef.current !== generation) return;
+      if (generation) retireChartLoadingGeneration(generation);
       clearScheduledKlinePreload('widget cleanup');
       releaseResolutionKlineInterval('widget cleanup', normalizedSymbol);
       resolutionRequestCancelRef.current?.();
       resolutionRequestCancelRef.current = null;
       resolutionRequestSeqRef.current += 1;
       chartReadyRef.current = false;
-      currentResolutionRef.current = '';
-      pendingResolutionRef.current = '';
+      resolutionIntentCoordinatorRef.current.reset('');
       initialVisibleRangeApplySeqRef.current += 1;
       initialVisibleRangeAppliedKeyRef.current = '';
       pendingInitialVisibleRangeRef.current = null;
@@ -1095,6 +1359,9 @@ export default function SpotTradingViewChart({
       widgetRef.current = null;
       datafeedRef.current?.destroy();
       datafeedRef.current = null;
+      if (!generation || activeWidgetGenerationRef.current === generation) {
+        activeWidgetGenerationRef.current = 0;
+      }
     };
 
     cleanupWidget();
@@ -1119,23 +1386,24 @@ export default function SpotTradingViewChart({
     const initialResolution =
       widgetIntervalRef.current || spotIntervalToTradingViewResolution(initialInterval);
     chartReadyRef.current = false;
-    currentResolutionRef.current = initialResolution;
-    pendingResolutionRef.current = '';
+    resolutionIntentCoordinatorRef.current.reset(initialResolution);
     toolbarButtonRefs.current.clear();
+    widgetGeneration = ++widgetGenerationSequenceRef.current;
+    activeWidgetGenerationRef.current = widgetGeneration;
 
     const datafeed = createSpotTradingViewDatafeed({
       symbol: normalizedSymbol,
       displaySymbol: displayName,
       pricePrecision,
       amountPrecision,
-      onHistoryBars: handleDatafeedHistoryBars,
+      onHistoryBars: (event) => handleDatafeedHistoryBars(event, widgetGeneration),
       onKlineRealtime: handleDatafeedRealtime,
       debugEnabled: isSpotTradingViewDebugEnabled(),
     });
     datafeedRef.current = datafeed;
     const widgetBuildLoadingTimer = window.setTimeout(() => {
-      if (!cancelled) {
-        startChartLoading('widget-build');
+      if (!cancelled && activeWidgetGenerationRef.current === widgetGeneration) {
+        startChartLoading('widget-build', widgetGeneration);
       }
     }, 0);
 
@@ -1195,7 +1463,11 @@ export default function SpotTradingViewChart({
     widgetRef.current = widget;
 
     const markChartReady = () => {
-      if (cancelled || widgetRef.current !== widget) return;
+      if (
+        cancelled
+        || widgetRef.current !== widget
+        || activeWidgetGenerationRef.current !== widgetGeneration
+      ) return;
       chartReadyRef.current = true;
       const chart = widget.activeChart?.();
       if (
@@ -1209,11 +1481,15 @@ export default function SpotTradingViewChart({
         );
         priceOverlayControllerRef.current.update(displayPriceRef.current);
       }
-      const pendingResolution = pendingResolutionRef.current;
-      if (pendingResolution && pendingResolution !== currentResolutionRef.current) {
-        applyWidgetResolution(pendingResolution);
+      const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
+      const pendingResolution = resolutionState.pendingResolution;
+      if (pendingResolution && pendingResolution.resolution !== resolutionState.currentResolution) {
+        applyWidgetResolution(pendingResolution.resolution, widgetGeneration);
       } else {
-        pendingResolutionRef.current = '';
+        const activeToken = activeChartLoadingTokenRef.current;
+        if (activeToken?.widgetGeneration === widgetGeneration) {
+          finishChartLoading('chart-ready-current-resolution', activeToken);
+        }
       }
       const pendingInitialRange = pendingInitialVisibleRangeRef.current;
       if (pendingInitialRange) {
@@ -1228,7 +1504,11 @@ export default function SpotTradingViewChart({
     }
 
     widget.headerReady().then(() => {
-      if (cancelled) return;
+      if (
+        cancelled
+        || widgetRef.current !== widget
+        || activeWidgetGenerationRef.current !== widgetGeneration
+      ) return;
       const toolbarSlot = widget.createButton({ align: 'left', useTradingViewStyle: false });
       toolbarSlotRef.current = toolbarSlot;
       toolbarSlot.setAttribute('title', '');
@@ -1270,15 +1550,33 @@ export default function SpotTradingViewChart({
       };
 
       makeButton(TIME_SHARING_KEY, TIME_SHARING_LABEL, () => {
-        if (chartModeRef.current !== 'time') {
-          startChartLoading('toolbar-mode-change');
-        }
+        if (activeWidgetGenerationRef.current !== widgetGeneration) return;
         onChartModeChange?.('time');
       });
       SPOT_INTERVAL_OPTIONS.forEach((item) => {
         makeButton(item, formatIntervalLabel(item), () => {
-          if (chartModeRef.current !== 'candle' || activeIntervalRef.current !== item) {
-            startChartLoading('toolbar-interval-click');
+          if (activeWidgetGenerationRef.current !== widgetGeneration) return;
+          const targetResolution = spotIntervalToTradingViewResolution(item);
+          const intentRegistration = resolutionIntentCoordinatorRef.current.registerIntent(targetResolution);
+          const resolutionState = intentRegistration.snapshot;
+          spotTradingViewChartDebug('resolution-intent-requested', {
+            from: resolutionState.currentResolution,
+            to: targetResolution,
+            intentId: intentRegistration.intent.intentId,
+            latestIntentId: resolutionState.latestIntentId,
+            interval: item,
+            inFlightResolution: resolutionState.inFlightResolution || null,
+            pendingResolution: resolutionState.pendingResolution?.resolution || null,
+            pending: Boolean(resolutionState.pendingResolution),
+            requestSequence: resolutionState.requestSequence,
+            widgetGeneration,
+            source: 'tradingview-toolbar',
+          });
+          if (resolutionState.inFlightResolution || resolutionState.pendingResolution) {
+            setSpotToolbarLoadingState(toolbarSlotRef.current, toolbarButtonRefs.current, {
+              loading: true,
+              pendingKey: resolutionState.pendingResolution ? item : undefined,
+            });
           }
           if (chartModeRef.current !== 'candle') {
             onChartModeChange?.('candle');
@@ -1292,17 +1590,35 @@ export default function SpotTradingViewChart({
         });
       });
       updateToolbarButtons(toolbarButtonRefs.current, chartMode, activeIntervalRef.current);
-      setSpotToolbarDisabled(
-        toolbarSlot,
-        toolbarButtonRefs.current,
-        chartLoadingCoordinatorRef.current?.isActive() ?? false,
+      const activeToken = activeChartLoadingTokenRef.current;
+      const loadingActive = Boolean(
+        activeToken
+        && activeToken.widgetGeneration === widgetGeneration
+        && chartLoadingCoordinatorRef.current?.isActive(activeToken)
       );
+      if (loadingActive && activeToken) {
+        const toolbarOwner: SpotChartLoadingToolbarOwner = {
+          token: activeToken,
+          toolbarSlot,
+          toolbarButtons: new Map(toolbarButtonRefs.current),
+        };
+        chartLoadingToolbarOwnerRef.current = toolbarOwner;
+        const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
+        setSpotToolbarLoadingState(toolbarOwner.toolbarSlot, toolbarOwner.toolbarButtons, {
+          loading: true,
+          pendingKey: resolutionState.pendingResolution
+            ? tradingViewResolutionToSpotInterval(resolutionState.pendingResolution.resolution)
+            : undefined,
+        });
+      } else {
+        setSpotToolbarLoadingState(toolbarSlot, toolbarButtonRefs.current, { loading: false });
+      }
     }).catch(() => undefined);
 
     return () => {
       cancelled = true;
       window.clearTimeout(widgetBuildLoadingTimer);
-      cleanupWidget();
+      cleanupWidget(widgetGeneration);
     };
   }, [
     applyInitialVisibleRangeFromHistory,
@@ -1322,6 +1638,8 @@ export default function SpotTradingViewChart({
     releaseResolutionKlineInterval,
     scriptReady,
     startChartLoading,
+    finishChartLoading,
+    retireChartLoadingGeneration,
     widgetKey,
     widgetStyle,
   ]);
