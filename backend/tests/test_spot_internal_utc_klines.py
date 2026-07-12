@@ -4,10 +4,13 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
-from app.services import market
+from app.services import market, market_kline_cache
 from app.services.market_kline_cache import (
+    KLINE_CACHE_ORIGIN_EMPTY,
     KLINE_CACHE_ORIGIN_REST_FETCH,
+    KLINE_CACHE_STATUS_HISTORY_BOUNDARY,
     KLINE_CACHE_STATUS_MISS,
+    KLINE_TERMINAL_REASON_INTERNAL_HISTORY_BOUNDARY,
     KlineCacheResult,
 )
 
@@ -42,6 +45,33 @@ def _kline(open_time: int, open_: str, high: str, low: str, close: str, volume: 
         volume=Decimal(volume),
         quote_volume=Decimal(close) * Decimal(volume),
     )
+
+
+class _FirstRowQuery:
+    def __init__(self, row) -> None:
+        self.row = row
+
+    def filter(self, *_args, **_kwargs):
+        return self
+
+    def order_by(self, *_args, **_kwargs):
+        return self
+
+    def first(self):
+        return self.row
+
+
+class _InternalBoundaryDb:
+    def __init__(self, *, trade_row=None, market_kline_row=None) -> None:
+        self.trade_row = trade_row
+        self.market_kline_row = market_kline_row
+
+    def query(self, model):
+        if model is market.Trade:
+            return _FirstRowQuery(self.trade_row)
+        if model is market.MarketKline:
+            return _FirstRowQuery(self.market_kline_row)
+        raise AssertionError(f"unexpected model: {model}")
 
 
 def test_internal_1dutc_aggregates_real_trades_into_one_bucket() -> None:
@@ -128,6 +158,82 @@ def test_internal_utc_empty_does_not_create_price_only_kline() -> None:
     assert items == []
 
 
+def test_internal_utc_boundary_uses_earliest_real_trade_or_internal_kline() -> None:
+    trade_row = _trade(1, _dt(2026, 7, 8, 12), "10", "1")
+    market_kline_row = _kline(_ms(2026, 7, 1, 6), "9", "9", "9", "9", "2")
+    db = _InternalBoundaryDb(trade_row=trade_row, market_kline_row=market_kline_row)
+    pair = SimpleNamespace(id=7, symbol="MFCUSDT")
+
+    earliest = market._resolve_earliest_internal_kline_boundary_ms(db, pair, "1Dutc")
+
+    assert earliest == _ms(2026, 7, 1)
+    assert market._resolve_earliest_internal_kline_boundary_ms(db, pair, "1Wutc") == _ms(2026, 6, 29)
+    assert market._resolve_earliest_internal_kline_boundary_ms(db, pair, "1Mutc") == _ms(2026, 7, 1)
+
+
+def test_internal_utc_boundary_rejects_zero_fill_market_kline() -> None:
+    trade_row = _trade(1, _dt(2026, 7, 8, 12), "10", "1")
+    zero_fill_row = _kline(_ms(2026, 7, 1, 6), "9", "9", "9", "9", "0")
+    db = _InternalBoundaryDb(trade_row=trade_row, market_kline_row=zero_fill_row)
+    pair = SimpleNamespace(id=7, symbol="MFCUSDT")
+
+    earliest = market._resolve_earliest_internal_kline_boundary_ms(db, pair, "1Dutc")
+
+    assert earliest == _ms(2026, 7, 8)
+
+
+def test_internal_boundary_cache_isolated_from_provider_boundary(monkeypatch) -> None:
+    stored: dict[str, dict] = {}
+    writes: list[tuple[str, dict, int, int]] = []
+    monkeypatch.setattr(market_kline_cache, "cache_get_json", lambda key: stored.get(key))
+
+    def cache_set_json(key, value, ttl_seconds, *, last_good_ttl_seconds):
+        stored[key] = dict(value)
+        writes.append((key, dict(value), ttl_seconds, last_good_ttl_seconds))
+
+    monkeypatch.setattr(market_kline_cache, "cache_set_json", cache_set_json)
+    earliest = _ms(2026, 7, 1)
+
+    result = market_kline_cache.remember_internal_kline_history_boundary(
+        market_type="spot",
+        symbol="MFCUSDT",
+        interval="1Dutc",
+        earliest_available_time=earliest,
+        end_time_ms=earliest,
+    )
+
+    assert result is not None
+    assert result.origin == KLINE_CACHE_ORIGIN_EMPTY
+    assert result.cache_status == KLINE_CACHE_STATUS_HISTORY_BOUNDARY
+    assert result.history_terminal is True
+    assert result.terminal_reason == KLINE_TERMINAL_REASON_INTERNAL_HISTORY_BOUNDARY
+    assert result.earliest_available_time == earliest
+    provider_key = market_kline_cache._kline_history_boundary_cache_key(
+        market_type="spot",
+        symbol="MFCUSDT",
+        interval="1Dutc",
+    )
+    internal_key = market_kline_cache._kline_history_boundary_cache_key(
+        market_type="spot",
+        symbol="MFCUSDT",
+        interval="1Dutc",
+        boundary_scope=market_kline_cache.KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL,
+    )
+    assert provider_key != internal_key
+    assert provider_key not in stored
+    assert stored[internal_key]["boundary_scope"] == "INTERNAL"
+    assert writes[0][2:] == (24 * 60 * 60, 24 * 60 * 60)
+    cached_result = market_kline_cache.get_cached_internal_kline_history_boundary_result(
+        market_type="spot",
+        symbol="MFCUSDT",
+        interval="1Dutc",
+        end_time_ms=earliest - 1,
+    )
+    assert cached_result is not None
+    assert cached_result.terminal_reason == KLINE_TERMINAL_REASON_INTERNAL_HISTORY_BOUNDARY
+    assert cached_result.earliest_available_time == earliest
+
+
 def test_internal_utc_get_klines_uses_distinct_interval_cache_key(monkeypatch) -> None:
     class Pair:
         id = 1
@@ -137,6 +243,7 @@ def test_internal_utc_get_klines_uses_distinct_interval_cache_key(monkeypatch) -
     def fake_cache_first(*args, **kwargs):
         assert kwargs["interval"] == "1Dutc"
         assert kwargs["source"] == market.SPOT_KLINE_SOURCE_INTERNAL_TRADE
+        assert kwargs["history_boundary_scope"] == market_kline_cache.KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL
         return KlineCacheResult(
             kwargs["fetch_external"](kwargs["limit"], kwargs.get("end_time_ms")),
             origin=KLINE_CACHE_ORIGIN_REST_FETCH,
@@ -177,6 +284,91 @@ def test_internal_utc_get_klines_uses_distinct_interval_cache_key(monkeypatch) -
     assert result["source"] == "INTERNAL"
     assert result["freshness"] == "RECENT"
     assert result["items"][0]["open_time"] == _ms(2026, 7, 8)
+    assert result["history_terminal"] is None
+    assert result["terminal_reason"] is None
+    assert result["earliest_available_time"] is None
+
+
+def test_internal_utc_history_returns_terminal_at_real_boundary(monkeypatch) -> None:
+    class Pair:
+        id = 1
+        symbol = "MFCUSDT"
+        data_source = market.DATA_SOURCE_INTERNAL
+
+    earliest = _ms(2026, 7, 1)
+    monkeypatch.setattr(market, "_get_active_pair", lambda db, symbol: Pair())
+    monkeypatch.setattr(
+        market,
+        "_resolve_earliest_internal_kline_boundary_ms",
+        lambda db, pair, interval: earliest,
+    )
+    monkeypatch.setattr(market_kline_cache, "cache_get_json", lambda _key: None)
+    monkeypatch.setattr(
+        market_kline_cache,
+        "cache_set_json",
+        lambda _key, _value, _ttl_seconds, *, last_good_ttl_seconds: None,
+    )
+    monkeypatch.setattr(
+        market,
+        "get_klines_cache_first",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("boundary must bypass history fetch")),
+    )
+
+    result = market.get_klines(None, "MFCUSDT", "1Dutc", limit=30, end_time_ms=earliest)
+
+    assert result["items"] == []
+    assert result["history_incomplete"] is False
+    assert result["history_terminal"] is True
+    assert result["terminal_reason"] == KLINE_TERMINAL_REASON_INTERNAL_HISTORY_BOUNDARY
+    assert result["earliest_available_time"] == earliest
+
+
+def test_internal_utc_history_middle_page_remains_non_terminal(monkeypatch) -> None:
+    class Pair:
+        id = 1
+        symbol = "MFCUSDT"
+        data_source = market.DATA_SOURCE_INTERNAL
+
+    earliest = _ms(2026, 7, 1)
+    end_time = _ms(2026, 7, 10)
+    item = {
+        "open_time": _ms(2026, 7, 8),
+        "close_time": _ms(2026, 7, 9),
+        "open": "1",
+        "high": "1",
+        "low": "1",
+        "close": "1",
+        "volume": "1",
+        "quote_volume": "1",
+    }
+    monkeypatch.setattr(market, "_get_active_pair", lambda db, symbol: Pair())
+    monkeypatch.setattr(
+        market,
+        "_resolve_earliest_internal_kline_boundary_ms",
+        lambda db, pair, interval: earliest,
+    )
+    monkeypatch.setattr(market_kline_cache, "cache_get_json", lambda _key: None)
+    monkeypatch.setattr(
+        market_kline_cache,
+        "cache_set_json",
+        lambda _key, _value, _ttl_seconds, *, last_good_ttl_seconds: None,
+    )
+    def fake_cache_first(*args, **kwargs):
+        assert kwargs["history_boundary_scope"] == market_kline_cache.KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL
+        return KlineCacheResult(
+            [item],
+            origin=KLINE_CACHE_ORIGIN_REST_FETCH,
+            cache_status=KLINE_CACHE_STATUS_MISS,
+        )
+
+    monkeypatch.setattr(market, "get_klines_cache_first", fake_cache_first)
+
+    result = market.get_klines(None, "MFCUSDT", "1Dutc", limit=30, end_time_ms=end_time)
+
+    assert result["items"] == [item]
+    assert result["history_terminal"] is False
+    assert result["terminal_reason"] is None
+    assert result["earliest_available_time"] is None
 
 
 def test_external_utc_get_klines_stays_on_external_provider_path(monkeypatch) -> None:
@@ -212,10 +404,23 @@ def test_external_utc_get_klines_stays_on_external_provider_path(monkeypatch) ->
         "_get_internal_utc_aggregate_klines",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("external spot must not use internal aggregation")),
     )
+    monkeypatch.setattr(
+        market,
+        "_resolve_earliest_internal_kline_boundary_ms",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("external spot must not resolve internal boundary")),
+    )
 
-    result = market.get_klines(None, "BTCUSDT", "1Dutc", limit=10, force_rest=True)
+    result = market.get_klines(
+        None,
+        "BTCUSDT",
+        "1Dutc",
+        limit=10,
+        end_time_ms=_ms(2026, 7, 9),
+        force_rest=True,
+    )
 
     assert result["symbol"] == "BTCUSDT"
     assert result["interval"] == "1Dutc"
-    assert result["source"] == "REST_SNAPSHOT"
+    assert result["source"] == "REST_HISTORY"
     assert result["items"][0]["close"] == "105"
+    assert result["history_terminal"] is False

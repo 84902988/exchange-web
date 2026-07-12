@@ -55,7 +55,11 @@ KLINE_CACHE_STATUS_HISTORY_BOUNDARY = "HISTORY_BOUNDARY"
 
 KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY = "PROVIDER_HISTORY_BOUNDARY"
 KLINE_TERMINAL_REASON_CACHE_HISTORY_BOUNDARY = "CACHE_HISTORY_BOUNDARY"
+KLINE_TERMINAL_REASON_INTERNAL_HISTORY_BOUNDARY = "INTERNAL_HISTORY_BOUNDARY"
 KLINE_HISTORY_BOUNDARY_CACHE_TTL_SECONDS = 24 * 60 * 60
+KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER = "PROVIDER"
+KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL = "INTERNAL"
+_INTERNAL_KLINE_HISTORY_BOUNDARY_INTERVALS = {"1Dutc", "1Wutc", "1Mutc"}
 
 KLINE_CACHE_POLICY_STRICT_24X7 = "strict_24x7"
 KLINE_CACHE_POLICY_GAP_TOLERANT = "gap_tolerant"
@@ -1018,13 +1022,36 @@ def _read_continuous_monthly_history_start_ms(
     return _item_open_time_ms(items[0])
 
 
-def _kline_history_boundary_cache_key(*, market_type: str, symbol: str, interval: str) -> str:
+def _normalize_kline_history_boundary_scope(value: Optional[str]) -> str:
+    normalized = str(value or KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER).strip().upper()
+    if normalized == KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL:
+        return KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL
+    return KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER
+
+
+def _kline_history_boundary_interval_supported(interval: str, boundary_scope: str) -> bool:
+    if boundary_scope == KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL:
+        return interval in _INTERNAL_KLINE_HISTORY_BOUNDARY_INTERVALS
+    return interval == "1Mutc"
+
+
+def _kline_history_boundary_cache_key(
+    *,
+    market_type: str,
+    symbol: str,
+    interval: str,
+    boundary_scope: str = KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER,
+) -> str:
+    normalized_scope = _normalize_kline_history_boundary_scope(boundary_scope)
+    query_params = {"interval": normalize_kline_interval(interval)}
+    if normalized_scope == KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL:
+        query_params["boundary_scope"] = normalized_scope
     return market_cache_key(
         "market:kline:history_boundary",
         version=1,
         market_type=str(market_type or "").strip().upper(),
         symbol=_normalize_symbol(symbol),
-        query_params={"interval": normalize_kline_interval(interval)},
+        query_params=query_params,
     )
 
 
@@ -1033,10 +1060,12 @@ def _read_kline_history_boundary_cache(
     market_type: str,
     symbol: str,
     interval: str,
+    boundary_scope: str = KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER,
 ) -> Optional[dict[str, Any]]:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
-    if normalized_interval != "1Mutc":
+    normalized_scope = _normalize_kline_history_boundary_scope(boundary_scope)
+    if not _kline_history_boundary_interval_supported(normalized_interval, normalized_scope):
         return None
 
     cached = cache_get_json(
@@ -1044,6 +1073,7 @@ def _read_kline_history_boundary_cache(
             market_type=market_type,
             symbol=normalized_symbol,
             interval=normalized_interval,
+            boundary_scope=normalized_scope,
         )
     )
     if not isinstance(cached, dict):
@@ -1051,6 +1081,9 @@ def _read_kline_history_boundary_cache(
     if _normalize_symbol(cached.get("symbol")) != normalized_symbol:
         return None
     if normalize_kline_interval(cached.get("interval")) != normalized_interval:
+        return None
+    cached_scope = _normalize_kline_history_boundary_scope(cached.get("boundary_scope"))
+    if cached_scope != normalized_scope:
         return None
     try:
         earliest_available_time = int(cached.get("earliest_available_time") or 0)
@@ -1064,6 +1097,7 @@ def _read_kline_history_boundary_cache(
         "interval": normalized_interval,
         "earliest_available_time": earliest_available_time,
         "terminal_reason": terminal_reason,
+        "boundary_scope": normalized_scope,
     }
 
 
@@ -1074,16 +1108,18 @@ def _write_kline_history_boundary_cache(
     interval: str,
     earliest_available_time: int,
     terminal_reason: str,
+    boundary_scope: str = KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER,
 ) -> Optional[dict[str, Any]]:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
     normalized_terminal_reason = str(terminal_reason or "").strip()
+    normalized_scope = _normalize_kline_history_boundary_scope(boundary_scope)
     try:
         normalized_earliest_available_time = int(earliest_available_time or 0)
     except (TypeError, ValueError):
         return None
     if (
-        normalized_interval != "1Mutc"
+        not _kline_history_boundary_interval_supported(normalized_interval, normalized_scope)
         or normalized_earliest_available_time <= 0
         or not normalized_terminal_reason
     ):
@@ -1095,11 +1131,14 @@ def _write_kline_history_boundary_cache(
         "earliest_available_time": normalized_earliest_available_time,
         "terminal_reason": normalized_terminal_reason,
     }
+    if normalized_scope == KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL:
+        payload["boundary_scope"] = normalized_scope
     cache_set_json(
         _kline_history_boundary_cache_key(
             market_type=market_type,
             symbol=normalized_symbol,
             interval=normalized_interval,
+            boundary_scope=normalized_scope,
         ),
         payload,
         KLINE_HISTORY_BOUNDARY_CACHE_TTL_SECONDS,
@@ -1114,6 +1153,7 @@ def _cached_kline_history_boundary_result(
     symbol: str,
     interval: str,
     end_time_ms: Optional[int],
+    boundary_scope: str = KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER,
 ) -> Optional[KlineCacheResult]:
     if end_time_ms is None:
         return None
@@ -1121,19 +1161,72 @@ def _cached_kline_history_boundary_result(
         market_type=market_type,
         symbol=symbol,
         interval=interval,
+        boundary_scope=boundary_scope,
     )
     if not boundary:
         return None
     earliest_available_time = int(boundary["earliest_available_time"])
     if int(end_time_ms) > earliest_available_time:
         return None
+    normalized_scope = _normalize_kline_history_boundary_scope(boundary_scope)
     return KlineCacheResult(
         [],
         origin=KLINE_CACHE_ORIGIN_EMPTY,
         cache_status=KLINE_CACHE_STATUS_HISTORY_BOUNDARY,
         history_terminal=True,
-        terminal_reason=KLINE_TERMINAL_REASON_CACHE_HISTORY_BOUNDARY,
+        terminal_reason=(
+            KLINE_TERMINAL_REASON_INTERNAL_HISTORY_BOUNDARY
+            if normalized_scope == KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL
+            else KLINE_TERMINAL_REASON_CACHE_HISTORY_BOUNDARY
+        ),
         earliest_available_time=earliest_available_time,
+    )
+
+
+def get_cached_internal_kline_history_boundary_result(
+    *,
+    market_type: str,
+    symbol: str,
+    interval: str,
+    end_time_ms: Optional[int],
+) -> Optional[KlineCacheResult]:
+    return _cached_kline_history_boundary_result(
+        market_type=market_type,
+        symbol=symbol,
+        interval=interval,
+        end_time_ms=end_time_ms,
+        boundary_scope=KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL,
+    )
+
+
+def remember_internal_kline_history_boundary(
+    *,
+    market_type: str,
+    symbol: str,
+    interval: str,
+    earliest_available_time: int,
+    end_time_ms: Optional[int],
+) -> Optional[KlineCacheResult]:
+    boundary = _write_kline_history_boundary_cache(
+        market_type=market_type,
+        symbol=symbol,
+        interval=interval,
+        earliest_available_time=earliest_available_time,
+        terminal_reason=KLINE_TERMINAL_REASON_INTERNAL_HISTORY_BOUNDARY,
+        boundary_scope=KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL,
+    )
+    if not boundary or end_time_ms is None:
+        return None
+    normalized_earliest = int(boundary["earliest_available_time"])
+    if int(end_time_ms) > normalized_earliest:
+        return None
+    return KlineCacheResult(
+        [],
+        origin=KLINE_CACHE_ORIGIN_EMPTY,
+        cache_status=KLINE_CACHE_STATUS_HISTORY_BOUNDARY,
+        history_terminal=True,
+        terminal_reason=KLINE_TERMINAL_REASON_INTERNAL_HISTORY_BOUNDARY,
+        earliest_available_time=normalized_earliest,
     )
 
 
@@ -1342,6 +1435,7 @@ def _get_klines_cache_first(
     open_time_validator: Optional[OpenTimeValidator] = None,
     cache_policy: str = KLINE_CACHE_POLICY_STRICT_24X7,
     reconcile_external_items: Optional[ExternalItemsReconciler] = None,
+    history_boundary_scope: str = KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER,
 ) -> KlineCacheResult:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = normalize_kline_interval(interval)
@@ -1353,6 +1447,7 @@ def _get_klines_cache_first(
         symbol=normalized_symbol,
         interval=normalized_interval,
         end_time_ms=end_time_ms,
+        boundary_scope=history_boundary_scope,
     )
     if cached_history_boundary is not None:
         return cached_history_boundary
@@ -1574,6 +1669,7 @@ def _get_klines_cache_first(
             symbol=normalized_symbol,
             interval=normalized_interval,
             end_time_ms=end_time_ms,
+            boundary_scope=history_boundary_scope,
         )
         if cached_history_boundary is not None:
             return cached_history_boundary
@@ -1765,6 +1861,7 @@ def get_klines_cache_first(
     open_time_validator: Optional[OpenTimeValidator] = None,
     cache_policy: str = KLINE_CACHE_POLICY_STRICT_24X7,
     reconcile_external_items: Optional[ExternalItemsReconciler] = None,
+    history_boundary_scope: str = KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER,
 ) -> KlineCacheResult:
     result = _get_klines_cache_first(
         db,
@@ -1779,6 +1876,7 @@ def get_klines_cache_first(
         open_time_validator=open_time_validator,
         cache_policy=cache_policy,
         reconcile_external_items=reconcile_external_items,
+        history_boundary_scope=history_boundary_scope,
     )
     return _attach_market_kline_cache_metadata(
         result,

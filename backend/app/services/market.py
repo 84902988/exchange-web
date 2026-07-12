@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.db.models.market_kline import MarketKline
@@ -51,13 +51,16 @@ from app.services.market_kline_cache import (
     KLINE_PROVIDER_ERROR_HTTP,
     KLINE_PROVIDER_ERROR_TIMEOUT,
     KLINE_PROVIDER_ERROR_UNKNOWN,
+    KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL,
     KlineCacheResult,
     KlineProviderFetchError,
     KlineProviderHistoryBoundary,
     LATEST_KLINE_REFRESH_TTL_SECONDS,
     MarketKlineCacheMetadata,
     build_market_kline_cache_metadata,
+    get_cached_internal_kline_history_boundary_result,
     get_klines_cache_first,
+    remember_internal_kline_history_boundary,
 )
 from app.services.spot_kline_bucket import (
     normalize_spot_kline_bucket_interval,
@@ -4634,6 +4637,60 @@ def _get_internal_utc_klines_from_trades(
     )
 
 
+def _resolve_earliest_internal_kline_boundary_ms(
+    db: Session,
+    pair: TradingPair,
+    interval: str,
+) -> Optional[int]:
+    if interval not in _INTERNAL_SPOT_KLINE_UTC_AGGREGATE_INTERVALS:
+        return None
+
+    candidates: list[int] = []
+    trade_row = (
+        db.query(Trade)
+        .filter(
+            Trade.trading_pair_id == pair.id,
+            Trade.price > 0,
+            Trade.amount > 0,
+        )
+        .order_by(Trade.created_at.asc(), Trade.id.asc())
+        .first()
+    )
+    if trade_row is not None:
+        created_at = getattr(trade_row, "created_at", None)
+        if created_at is not None:
+            candidates.append(_datetime_to_utc_ms(created_at))
+
+    eligible_market_kline_intervals = tuple(
+        dict.fromkeys((*_INTERNAL_SPOT_KLINE_AGGREGATE_SOURCE_INTERVALS, interval))
+    )
+    market_kline_row = (
+        db.query(MarketKline)
+        .filter(
+            MarketKline.market_type == "spot",
+            MarketKline.symbol == pair.symbol,
+            MarketKline.interval.in_(eligible_market_kline_intervals),
+            MarketKline.source.in_(_INTERNAL_SPOT_KLINE_AGGREGATE_SOURCES),
+            or_(MarketKline.volume > 0, MarketKline.quote_volume > 0),
+        )
+        .order_by(MarketKline.open_time.asc())
+        .first()
+    )
+    if market_kline_row is not None:
+        try:
+            open_time_ms = int(getattr(market_kline_row, "open_time", 0) or 0)
+        except (TypeError, ValueError):
+            open_time_ms = 0
+        volume = _to_decimal(getattr(market_kline_row, "volume", None))
+        quote_volume = _to_decimal(getattr(market_kline_row, "quote_volume", None))
+        if open_time_ms > 0 and (volume > 0 or quote_volume > 0):
+            candidates.append(open_time_ms)
+
+    if not candidates:
+        return None
+    return min(_internal_utc_bucket_open_ms(value, interval) for value in candidates)
+
+
 def _get_internal_utc_aggregate_klines(
     db: Session,
     pair: TradingPair,
@@ -5195,8 +5252,30 @@ def get_klines(
             )
         return payload.get("items", [])
 
+    internal_boundary_result: Optional[KlineCacheResult] = None
+    parsed_end_time_ms = _parse_end_time_ms_int(end_time_ms)
+    if parsed_end_time_ms is not None and interval in _INTERNAL_SPOT_KLINE_UTC_AGGREGATE_INTERVALS:
+        internal_boundary_result = get_cached_internal_kline_history_boundary_result(
+            market_type="spot",
+            symbol=pair.symbol,
+            interval=interval,
+            end_time_ms=parsed_end_time_ms,
+        )
+        if internal_boundary_result is None:
+            earliest_available_time = _resolve_earliest_internal_kline_boundary_ms(db, pair, interval)
+            if earliest_available_time is not None:
+                internal_boundary_result = remember_internal_kline_history_boundary(
+                    market_type="spot",
+                    symbol=pair.symbol,
+                    interval=interval,
+                    earliest_available_time=earliest_available_time,
+                    end_time_ms=parsed_end_time_ms,
+                )
+
     cache_result = _coerce_kline_cache_result(
-        get_klines_cache_first(
+        internal_boundary_result
+        if internal_boundary_result is not None
+        else get_klines_cache_first(
             db,
             market_type="spot",
             symbol=pair.symbol,
@@ -5205,6 +5284,7 @@ def get_klines(
             end_time_ms=end_time_ms,
             source=SPOT_KLINE_SOURCE_INTERNAL_TRADE,
             fetch_external=_fetch_internal_spot_klines,
+            history_boundary_scope=KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL,
         ),
         end_time_ms=end_time_ms,
     )
