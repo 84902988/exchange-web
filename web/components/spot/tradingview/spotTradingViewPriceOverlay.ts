@@ -43,17 +43,9 @@ function overlayTimeSeconds(displayPrice: SpotDisplayPrice): number {
   return Math.max(1, Math.floor(timeMs / 1000));
 }
 
-function overlayColor(displayPrice: SpotDisplayPrice): string {
-  if (displayPrice.freshness === 'LIVE' && displayPrice.isRealTrade) return '#00c087';
-  if (displayPrice.freshness === 'LIVE') return '#38bdf8';
-  return '#f0b90b';
-}
-
-function overlayText(displayPrice: SpotDisplayPrice): string {
-  if (displayPrice.isRealTrade) return 'Latest trade';
-  if (displayPrice.sourceDomain === 'ticker') return 'Ticker display';
-  return 'Candle display';
-}
+const SPOT_PRICE_OVERLAY_UP_COLOR = '#00c087';
+const SPOT_PRICE_OVERLAY_DOWN_COLOR = '#f6465d';
+const SPOT_PRICE_OVERLAY_LINE_STYLE_DASHED = 2;
 
 function overlayPoint(displayPrice: SpotDisplayPrice) {
   return {
@@ -62,14 +54,13 @@ function overlayPoint(displayPrice: SpotDisplayPrice) {
   };
 }
 
-function overlayProperties(displayPrice: SpotDisplayPrice): Record<string, unknown> {
-  const color = overlayColor(displayPrice);
+function overlayProperties(color: string): Record<string, unknown> {
   return {
-    text: overlayText(displayPrice),
+    text: '',
     linecolor: color,
     textcolor: color,
     linewidth: 1,
-    linestyle: displayPrice.isRealTrade ? 0 : 2,
+    linestyle: SPOT_PRICE_OVERLAY_LINE_STYLE_DASHED,
     showPrice: true,
   };
 }
@@ -93,16 +84,27 @@ export class SpotTradingViewPriceOverlayController {
   private creating = false;
   private destroyed = false;
   private renderedKey: string | null = null;
+  private activeSymbol: string | null = null;
+  private lastPrice: number | null = null;
+  private color = SPOT_PRICE_OVERLAY_UP_COLOR;
 
   constructor(private readonly chart: SpotTradingViewOverlayChart) {}
 
   update(displayPrice: SpotDisplayPrice) {
     if (this.destroyed) return;
+    const symbol = String(displayPrice.symbol || '').trim().toUpperCase();
+    if (this.activeSymbol !== null && symbol !== this.activeSymbol) {
+      this.clear();
+      this.lastPrice = null;
+      this.color = SPOT_PRICE_OVERLAY_UP_COLOR;
+    }
+    this.activeSymbol = symbol;
     if (!shouldShowSpotDisplayPriceOverlay(displayPrice)) {
       this.clear();
       return;
     }
 
+    this.updateDirectionColor(Number(displayPrice.price));
     this.pendingDisplayPrice = displayPrice;
     if (this.entityId !== null) {
       const nextRenderKey = overlayRenderKey(displayPrice);
@@ -124,12 +126,12 @@ export class SpotTradingViewPriceOverlayController {
       disableUndo: true,
       showInObjectsTree: false,
       zOrder: 'top',
-      text: overlayText(displayPrice),
+      text: '',
       overrides: {
-        'linetoolhorzline.linecolor': overlayColor(displayPrice),
-        'linetoolhorzline.textcolor': overlayColor(displayPrice),
+        'linetoolhorzline.linecolor': this.color,
+        'linetoolhorzline.textcolor': this.color,
         'linetoolhorzline.linewidth': 1,
-        'linetoolhorzline.linestyle': displayPrice.isRealTrade ? 0 : 2,
+        'linetoolhorzline.linestyle': SPOT_PRICE_OVERLAY_LINE_STYLE_DASHED,
         'linetoolhorzline.showPrice': true,
       },
     }).then((entityId) => {
@@ -175,7 +177,7 @@ export class SpotTradingViewPriceOverlayController {
         ? currentPoints.map((point) => ({ ...point, price }))
         : [overlayPoint(displayPrice)];
       shape.setPoints(nextPoints);
-      shape.setProperties?.(overlayProperties(displayPrice));
+      shape.setProperties?.(overlayProperties(this.color));
       this.renderedKey = overlayRenderKey(displayPrice);
       return true;
     } catch {
@@ -189,6 +191,14 @@ export class SpotTradingViewPriceOverlayController {
     this.renderedKey = null;
     if (entityId !== null) this.removeEntity(entityId);
     this.update(displayPrice);
+  }
+
+  private updateDirectionColor(price: number) {
+    if (this.lastPrice !== null) {
+      if (price > this.lastPrice) this.color = SPOT_PRICE_OVERLAY_UP_COLOR;
+      if (price < this.lastPrice) this.color = SPOT_PRICE_OVERLAY_DOWN_COLOR;
+    }
+    this.lastPrice = price;
   }
 
   private removeEntity(entityId: SpotTradingViewOverlayEntityId) {
