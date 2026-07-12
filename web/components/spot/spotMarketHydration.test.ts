@@ -20,6 +20,7 @@ describe('spot market hydration', () => {
     })).toMatchObject({
       hasValidPrice: true,
       hasLivePrice: false,
+      hasReadyPrice: false,
       isHydrating: true,
       isUnavailable: false,
     });
@@ -31,7 +32,62 @@ describe('spot market hydration', () => {
       source: 'LIVE_WS',
       restLoading: false,
       connectionStatus: 'open',
-    })).toMatchObject({ hasLivePrice: true, isHydrating: false, isUnavailable: false });
+    })).toMatchObject({ hasLivePrice: true, hasReadyPrice: true, isHydrating: false, isUnavailable: false });
+  });
+
+  it.each(['RECENT', 'LIVE'])('finishes hydration for a valid INTERNAL %s price', (freshness) => {
+    expect(resolveSpotMarketHydration({
+      price: '1.010',
+      source: 'INTERNAL',
+      freshness,
+      restLoading: false,
+      connectionStatus: 'open',
+    })).toMatchObject({
+      hasValidPrice: true,
+      hasLivePrice: false,
+      hasReadyPrice: true,
+      isHydrating: false,
+      isUnavailable: false,
+    });
+  });
+
+  it('keeps legacy INTERNAL callers ready when freshness is not provided', () => {
+    expect(resolveSpotMarketHydration({
+      price: '1.010',
+      source: 'INTERNAL',
+      restLoading: false,
+      connectionStatus: 'open',
+    })).toMatchObject({ hasLivePrice: false, hasReadyPrice: true, isHydrating: false });
+  });
+
+  it('does not treat a stale INTERNAL price as ready', () => {
+    expect(resolveSpotMarketHydration({
+      price: '1.010',
+      source: 'INTERNAL',
+      freshness: 'STALE',
+      restLoading: false,
+      connectionStatus: 'open',
+    })).toMatchObject({ hasReadyPrice: false, isHydrating: true, isUnavailable: false });
+  });
+
+  it('keeps INTERNAL without a valid price loading while transport is available', () => {
+    expect(resolveSpotMarketHydration({
+      price: null,
+      source: 'INTERNAL',
+      freshness: 'RECENT',
+      restLoading: false,
+      connectionStatus: 'open',
+    })).toMatchObject({ hasReadyPrice: false, isHydrating: true, isUnavailable: false });
+  });
+
+  it('reports INTERNAL without a valid price unavailable after transport closes', () => {
+    expect(resolveSpotMarketHydration({
+      price: null,
+      source: 'INTERNAL',
+      freshness: 'RECENT',
+      restLoading: false,
+      connectionStatus: 'closed',
+    })).toMatchObject({ hasReadyPrice: false, isHydrating: false, isUnavailable: true });
   });
 
   it('does not report unavailable while WS is still connecting after REST failure', () => {

@@ -488,6 +488,20 @@ export function pairMatchesSpotSelectorCategory(pair: GlobalMarketSelectorPair, 
   return pairMatchesCryptoCategory(pair, category);
 }
 
+export function pairMatchesSpotSelectorCryptoView(
+  pair: GlobalMarketSelectorPair,
+  category: PairCategory,
+  query: string,
+  searchAcrossSpotSubcategories = false,
+): boolean {
+  const normalizedQuery = normalizePairSearchText(query);
+  const matchesCategory = searchAcrossSpotSubcategories && normalizedQuery
+    ? isSpotMarketPair(pair) && (isCryptoSpotPair(pair) || isPlatformPair(pair) || isRwaPair(pair))
+    : pairMatchesCryptoCategory(pair, category);
+
+  return matchesCategory && pairMatchesSpotSelectorSearch(pair, normalizedQuery);
+}
+
 function pairMatchesStockCategory(pair: GlobalMarketSelectorPair, category: StockCategory): boolean {
   void category;
   return isStockContractPair(pair);
@@ -1615,11 +1629,13 @@ export default function GlobalMarketSelector({
 
     onPairQueryChange?.({
       marketType: 'spot',
-      category: ['spot', 'platform', 'rwa'].includes(spotCategory) ? spotCategory : 'all',
+      category: pageType === 'spot' && pairKeyword
+        ? 'all'
+        : ['spot', 'platform', 'rwa'].includes(spotCategory) ? spotCategory : 'all',
       quote: 'all',
       keyword: pairKeyword,
     });
-  }, [marketTab, onPairQueryChange, open, pairKeyword, spotCategory]);
+  }, [marketTab, onPairQueryChange, open, pageType, pairKeyword, spotCategory]);
 
   useEffect(() => {
     if (!open || marketTab !== 'crypto' || spotCategory === 'contract') return;
@@ -1765,8 +1781,13 @@ export default function GlobalMarketSelector({
       return pairItems.filter((pair) => pairMatchesContractCategory(pair, contractCategory) && pairMatchesSearch(pair, query));
     }
 
-    return pairItems.filter((pair) => pairMatchesCryptoCategory(pair, spotCategory) && pairMatchesSearch(pair, query));
-  }, [contractCategory, favoritePairs, marketTab, pairItems, pairMatchesSearch, search, spotCategory, stockCategory]);
+    return pairItems.filter((pair) => pairMatchesSpotSelectorCryptoView(
+      pair,
+      spotCategory,
+      query,
+      pageType === 'spot',
+    ));
+  }, [contractCategory, favoritePairs, marketTab, pageType, pairItems, pairMatchesSearch, search, spotCategory, stockCategory]);
 
   const showInitialPairsLoading =
     filteredPairs.length === 0 &&
