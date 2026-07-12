@@ -21,6 +21,13 @@ from app.schemas.market import (
     TradesResponse,
 )
 from app.schemas.market_external import ExternalTickerResponse
+from app.schemas.spot_domain_snapshot import (
+    DomainCacheOrigin,
+    DomainFallbackReason,
+    DomainName,
+    DomainSource,
+    DomainTransport,
+)
 from app.services.binance_market_service import (
     BinanceMarketServiceError,
     binance_market_service,
@@ -30,6 +37,10 @@ from app.services.itick_market_service import (
     itick_market_service,
 )
 from app.services.itick_holiday_service import itick_holiday_service
+from app.services.market_domain_snapshot import (
+    MarketDomainSnapshot,
+    build_market_domain_snapshot,
+)
 from app.services.market_kline_cache import (
     KLINE_CACHE_ORIGIN_DB_CACHE,
     KLINE_CACHE_ORIGIN_EMPTY,
@@ -43,6 +54,9 @@ from app.services.market_kline_cache import (
     KlineCacheResult,
     KlineProviderFetchError,
     KlineProviderHistoryBoundary,
+    LATEST_KLINE_REFRESH_TTL_SECONDS,
+    MarketKlineCacheMetadata,
+    build_market_kline_cache_metadata,
     get_klines_cache_first,
 )
 from app.services.spot_kline_bucket import (
@@ -84,9 +98,23 @@ from app.services.spot_market_provider_ws import (
     get_spot_provider_ws_trades,
     spot_provider_ws_supports_provider,
 )
-from app.services.spot_depth_shared_cache import get_spot_depth_with_shared_cache
-from app.services.spot_ticker_shared_cache import get_spot_ticker_with_shared_cache
-from app.services.spot_trades_shared_cache import get_spot_trades_with_shared_cache
+from app.services.market_depth_cache import (
+    SPOT_DEPTH_SHARED_CACHE_TTL_MS,
+    SpotDepthCacheHit,
+    get_spot_depth_with_shared_cache,
+)
+from app.services.market_ticker_cache import get_spot_ticker_with_shared_cache
+from app.services.market_ticker_cache import (
+    SPOT_TICKER_SHARED_CACHE_TTL_MS,
+    SpotTickerCacheHit,
+)
+from app.services.market_trades_cache import (
+    SPOT_TRADES_SHARED_CACHE_TTL_MS,
+    SpotTradesCacheHit,
+    get_spot_trades_with_shared_cache,
+)
+from app.services.shared_market_cache import CACHE_VERSION
+from app.services.spot_domain_snapshot_freshness import DomainSnapshotContext
 
 logger = logging.getLogger(__name__)
 
@@ -2018,6 +2046,675 @@ def _spot_provider_ws_ticker_to_item(pair: TradingPair, record: dict[str, Any]) 
     )
 
 
+def _spot_market_gateway_service():
+    from app.services.spot_market_gateway import spot_market_gateway
+
+    return spot_market_gateway
+
+
+def _record_spot_ticker_domain_snapshot(
+    ticker: Optional[Any],
+    *,
+    context: DomainSnapshotContext,
+    domain_snapshot: Optional[MarketDomainSnapshot] = None,
+) -> None:
+    try:
+        if ticker is None:
+            payload = None
+        elif isinstance(ticker, dict):
+            payload = dict(ticker)
+        else:
+            payload = _ticker_to_dict(ticker)
+
+        if domain_snapshot is None:
+            updated_at = next(
+                (
+                    value
+                    for value in (
+                        context.cache_updated_at_ms,
+                        context.received_at_ms,
+                        context.db_updated_at_ms,
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            domain_snapshot = build_market_domain_snapshot(
+                symbol=context.symbol,
+                domain="ticker",
+                data=payload,
+                source=context.source.value,
+                provider=context.provider,
+                updated_at=updated_at,
+                version=CACHE_VERSION,
+                max_age_ms=context.ttl_ms or SPOT_TICKER_SHARED_CACHE_TTL_MS,
+                fallback_reason=(
+                    context.fallback_reason.value
+                    if context.fallback_reason is not None
+                    else None
+                ),
+            )
+
+        _spot_market_gateway_service().record_ticker_market_domain_snapshot(
+            snapshot=domain_snapshot,
+            context=context,
+        )
+    except Exception:
+        logger.warning(
+            "spot_ticker_domain_snapshot_record_failed symbol=%s source=%s",
+            context.symbol,
+            context.source.value,
+            exc_info=True,
+        )
+
+
+def _spot_ticker_snapshot_source(value: Any) -> DomainSource:
+    normalized = str(value or "").strip().upper()
+    if normalized == "LIVE_WS":
+        return DomainSource.LIVE_WS
+    if normalized == "INTERNAL":
+        return DomainSource.INTERNAL
+    if normalized == "LAST_GOOD":
+        return DomainSource.LAST_GOOD
+    if normalized in {"", "MISSING"}:
+        return DomainSource.MISSING
+    return DomainSource.REST_SNAPSHOT
+
+
+def _spot_ticker_failure_reason(error: Optional[Exception]) -> DomainFallbackReason:
+    if error is None:
+        return DomainFallbackReason.CACHE_MISS
+    if isinstance(error, ProviderCooldownError):
+        return DomainFallbackReason.PROVIDER_COOLDOWN
+    if isinstance(error, TimeoutError) or "timeout" in str(error).strip().lower():
+        return DomainFallbackReason.PROVIDER_TIMEOUT
+    return DomainFallbackReason.PROVIDER_ERROR
+
+
+def _record_spot_ticker_cache_hit(
+    *,
+    symbol: str,
+    cache_hit: SpotTickerCacheHit,
+) -> None:
+    metadata = getattr(cache_hit, "metadata", None)
+    if metadata is not None and hasattr(metadata, "to_domain_snapshot"):
+        domain_snapshot = metadata.to_domain_snapshot(symbol=symbol)
+    else:
+        # Compatibility with pre-B-2.1 raw cache hit records.
+        domain_snapshot = build_market_domain_snapshot(
+            symbol=symbol,
+            domain="ticker",
+            data=cache_hit.payload,
+            source=cache_hit.envelope.source,
+            provider=cache_hit.envelope.provider,
+            updated_at=cache_hit.envelope.updated_at_ms,
+            version=cache_hit.envelope.version,
+            max_age_ms=cache_hit.envelope.ttl_ms,
+        )
+    payload = dict(domain_snapshot.data)
+    try:
+        cache_origin = DomainCacheOrigin(cache_hit.cache_origin)
+    except ValueError:
+        cache_origin = DomainCacheOrigin.NONE
+    _record_spot_ticker_domain_snapshot(
+        payload,
+        context=DomainSnapshotContext(
+            domain=DomainName.TICKER,
+            symbol=symbol,
+            transport=DomainTransport.CACHE_READ,
+            cache_origin=cache_origin,
+            source=_spot_ticker_snapshot_source(domain_snapshot.source),
+            provider=domain_snapshot.provider,
+            provider_symbol=str(payload.get("provider_symbol") or "").strip() or None,
+            fallback_reason=None,
+            provider_event_time_ms=payload.get("event_time_ms"),
+            received_at_ms=payload.get("received_at_ms"),
+            cache_updated_at_ms=domain_snapshot.updated_at,
+            ttl_ms=cache_hit.envelope.ttl_ms,
+        ),
+        domain_snapshot=domain_snapshot,
+    )
+
+
+def _record_spot_trades_domain_snapshot(
+    trades: Optional[Any],
+    *,
+    context: DomainSnapshotContext,
+    domain_snapshot: Optional[MarketDomainSnapshot] = None,
+) -> None:
+    try:
+        if trades is None:
+            payload = None
+        elif isinstance(trades, dict):
+            payload = dict(trades)
+        elif hasattr(trades, "model_dump"):
+            payload = trades.model_dump()
+        else:
+            payload = trades.dict()
+
+        if domain_snapshot is None:
+            updated_at = next(
+                (
+                    value
+                    for value in (
+                        context.cache_updated_at_ms,
+                        context.received_at_ms,
+                        context.db_updated_at_ms,
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            domain_snapshot = build_market_domain_snapshot(
+                symbol=context.symbol,
+                domain="trades",
+                data=payload,
+                source=context.source.value,
+                provider=context.provider,
+                updated_at=updated_at,
+                version=CACHE_VERSION,
+                max_age_ms=context.ttl_ms or SPOT_TRADES_SHARED_CACHE_TTL_MS,
+                fallback_reason=(
+                    context.fallback_reason.value
+                    if context.fallback_reason is not None
+                    else None
+                ),
+            )
+
+        _spot_market_gateway_service().record_trades_market_domain_snapshot(
+            snapshot=domain_snapshot,
+            context=context,
+        )
+    except Exception:
+        logger.warning(
+            "spot_trades_domain_snapshot_record_failed symbol=%s source=%s",
+            context.symbol,
+            context.source.value,
+            exc_info=True,
+        )
+
+
+def _spot_trades_item_values(payload: Dict[str, Any], field: str) -> list[Any]:
+    items = payload.get("trades")
+    if not isinstance(items, list):
+        return []
+    return [item.get(field) for item in items if isinstance(item, dict)]
+
+
+def _spot_trades_text(payload: Dict[str, Any], field: str) -> Optional[str]:
+    direct = str(payload.get(field) or "").strip()
+    if direct:
+        return direct
+    values = {
+        str(value).strip()
+        for value in _spot_trades_item_values(payload, field)
+        if str(value or "").strip()
+    }
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _spot_trades_latest_time(payload: Dict[str, Any], *fields: str) -> Optional[int]:
+    values: list[int] = []
+    for field in fields:
+        candidates = [payload.get(field), *_spot_trades_item_values(payload, field)]
+        for value in candidates:
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                values.append(parsed)
+    return max(values) if values else None
+
+
+def _spot_trades_snapshot_source(payload: Dict[str, Any]) -> DomainSource:
+    return _spot_ticker_snapshot_source(_spot_trades_text(payload, "source"))
+
+
+def _spot_trades_failure_reason(error: Optional[Exception]) -> DomainFallbackReason:
+    if error is None:
+        return DomainFallbackReason.CACHE_MISS
+    if isinstance(error, ProviderCooldownError):
+        return DomainFallbackReason.PROVIDER_COOLDOWN
+    if isinstance(error, TimeoutError) or "timeout" in str(error).strip().lower():
+        return DomainFallbackReason.PROVIDER_TIMEOUT
+    return DomainFallbackReason.PROVIDER_ERROR
+
+
+def _record_spot_trades_cache_hit(
+    *,
+    symbol: str,
+    cache_hit: SpotTradesCacheHit,
+) -> None:
+    metadata = getattr(cache_hit, "metadata", None)
+    if metadata is not None and hasattr(metadata, "to_domain_snapshot"):
+        domain_snapshot = metadata.to_domain_snapshot(symbol=symbol)
+    else:
+        # Compatibility with pre-B-2.3 raw cache hit records.
+        domain_snapshot = build_market_domain_snapshot(
+            symbol=symbol,
+            domain="trades",
+            data=cache_hit.payload,
+            source=cache_hit.envelope.source,
+            provider=cache_hit.envelope.provider,
+            updated_at=cache_hit.envelope.updated_at_ms,
+            version=cache_hit.envelope.version,
+            max_age_ms=cache_hit.envelope.ttl_ms,
+        )
+    payload = dict(domain_snapshot.data)
+    try:
+        cache_origin = DomainCacheOrigin(cache_hit.cache_origin)
+    except ValueError:
+        cache_origin = DomainCacheOrigin.NONE
+    source = _spot_ticker_snapshot_source(domain_snapshot.source)
+    _record_spot_trades_domain_snapshot(
+        payload,
+        context=DomainSnapshotContext(
+            domain=DomainName.TRADES,
+            symbol=symbol,
+            transport=DomainTransport.CACHE_READ,
+            cache_origin=cache_origin,
+            source=source,
+            provider=domain_snapshot.provider,
+            provider_symbol=_spot_trades_text(payload, "provider_symbol"),
+            provider_event_time_ms=_spot_trades_latest_time(
+                payload,
+                "event_time_ms",
+            ),
+            received_at_ms=_spot_trades_latest_time(
+                payload,
+                "received_at_ms",
+                "updated_at_ms",
+            ),
+            cache_updated_at_ms=domain_snapshot.updated_at,
+            ttl_ms=cache_hit.envelope.ttl_ms,
+        ),
+        domain_snapshot=domain_snapshot,
+    )
+
+
+def _record_spot_depth_domain_snapshot(
+    depth: Optional[Any],
+    *,
+    context: DomainSnapshotContext,
+    domain_snapshot: Optional[MarketDomainSnapshot] = None,
+) -> None:
+    try:
+        if depth is None:
+            payload = None
+        elif isinstance(depth, dict):
+            payload = dict(depth)
+        elif hasattr(depth, "model_dump"):
+            payload = depth.model_dump()
+        else:
+            payload = depth.dict()
+
+        if domain_snapshot is None:
+            updated_at = next(
+                (
+                    value
+                    for value in (
+                        context.cache_updated_at_ms,
+                        context.received_at_ms,
+                        context.db_updated_at_ms,
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            domain_snapshot = build_market_domain_snapshot(
+                symbol=context.symbol,
+                domain="depth",
+                data=payload,
+                source=context.source.value,
+                provider=context.provider,
+                updated_at=updated_at,
+                version=CACHE_VERSION,
+                max_age_ms=context.ttl_ms or SPOT_DEPTH_SHARED_CACHE_TTL_MS,
+                fallback_reason=(
+                    context.fallback_reason.value
+                    if context.fallback_reason is not None
+                    else None
+                ),
+            )
+
+        _spot_market_gateway_service().record_depth_market_domain_snapshot(
+            snapshot=domain_snapshot,
+            context=context,
+        )
+    except Exception:
+        logger.warning(
+            "spot_depth_domain_snapshot_record_failed symbol=%s source=%s",
+            context.symbol,
+            context.source.value,
+            exc_info=True,
+        )
+
+
+def _spot_depth_failure_reason(error: Optional[Exception]) -> DomainFallbackReason:
+    if error is None:
+        return DomainFallbackReason.CACHE_MISS
+    if isinstance(error, ProviderCooldownError):
+        return DomainFallbackReason.PROVIDER_COOLDOWN
+    if isinstance(error, TimeoutError) or "timeout" in str(error).strip().lower():
+        return DomainFallbackReason.PROVIDER_TIMEOUT
+    return DomainFallbackReason.PROVIDER_ERROR
+
+
+def _spot_depth_non_negative_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _spot_depth_provider_generation(symbol: str, provider: Optional[str]) -> Optional[int]:
+    normalized_provider = str(provider or "").strip().upper()
+    if not normalized_provider:
+        return None
+    try:
+        active_provider, active_generation = (
+            _spot_market_gateway_service().get_active_depth_provider(symbol)
+        )
+    except Exception:
+        return None
+    if str(active_provider or "").strip().upper() != normalized_provider:
+        return None
+    return _spot_depth_non_negative_int(active_generation)
+
+
+def _record_spot_depth_cache_hit(
+    *,
+    symbol: str,
+    cache_hit: SpotDepthCacheHit,
+) -> None:
+    metadata = getattr(cache_hit, "metadata", None)
+    if metadata is not None and hasattr(metadata, "to_domain_snapshot"):
+        domain_snapshot = metadata.to_domain_snapshot(symbol=symbol)
+    else:
+        # Compatibility with pre-B-2.2 raw cache hit records.
+        domain_snapshot = build_market_domain_snapshot(
+            symbol=symbol,
+            domain="depth",
+            data=cache_hit.payload,
+            source=cache_hit.envelope.source,
+            provider=cache_hit.envelope.provider,
+            updated_at=cache_hit.envelope.updated_at_ms,
+            version=cache_hit.envelope.version,
+            max_age_ms=cache_hit.envelope.ttl_ms,
+        )
+    payload = dict(domain_snapshot.data)
+    try:
+        cache_origin = DomainCacheOrigin(cache_hit.cache_origin)
+    except ValueError:
+        cache_origin = DomainCacheOrigin.NONE
+    source = _spot_ticker_snapshot_source(domain_snapshot.source)
+    _record_spot_depth_domain_snapshot(
+        payload,
+        context=DomainSnapshotContext(
+            domain=DomainName.DEPTH,
+            symbol=symbol,
+            transport=DomainTransport.CACHE_READ,
+            cache_origin=cache_origin,
+            source=source,
+            provider=domain_snapshot.provider,
+            provider_symbol=str(payload.get("provider_symbol") or "").strip() or None,
+            provider_event_time_ms=_spot_depth_non_negative_int(
+                payload.get("event_time_ms") or payload.get("ts")
+            ),
+            received_at_ms=_spot_depth_non_negative_int(
+                payload.get("received_at_ms") or payload.get("fetched_at")
+            ),
+            cache_updated_at_ms=domain_snapshot.updated_at,
+            ttl_ms=cache_hit.envelope.ttl_ms,
+            provider_generation=_spot_depth_non_negative_int(
+                payload.get("provider_generation") or payload.get("generation")
+            ),
+        ),
+        domain_snapshot=domain_snapshot,
+    )
+
+
+def _record_spot_kline_domain_snapshot(
+    response: Dict[str, Any],
+    *,
+    context: DomainSnapshotContext,
+    domain_snapshot: Optional[MarketDomainSnapshot] = None,
+) -> None:
+    try:
+        if not context.interval:
+            raise ValueError("kline snapshot context requires an interval")
+        if domain_snapshot is None:
+            updated_at = next(
+                (
+                    value
+                    for value in (
+                        context.cache_updated_at_ms,
+                        context.db_updated_at_ms,
+                        context.received_at_ms,
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            metadata = build_market_kline_cache_metadata(
+                data=list(response.get("items") or []),
+                source=context.source.value,
+                provider=context.provider,
+                updated_at=updated_at,
+                interval=context.interval,
+            )
+            domain_snapshot = metadata.to_domain_snapshot(symbol=context.symbol)
+
+        _spot_market_gateway_service().record_kline_market_domain_snapshot(
+            snapshot=domain_snapshot,
+            kline=dict(response),
+            context=context,
+        )
+    except Exception:
+        logger.warning(
+            "spot_kline_domain_snapshot_record_failed symbol=%s interval=%s source=%s",
+            context.symbol,
+            context.interval,
+            context.source.value,
+            exc_info=True,
+        )
+
+
+def _spot_kline_time_ms(value: Any) -> Optional[int]:
+    parsed_int = _spot_depth_non_negative_int(value)
+    if parsed_int is not None:
+        return parsed_int
+    if isinstance(value, datetime):
+        return _datetime_to_utc_ms(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return _datetime_to_utc_ms(datetime.fromisoformat(text.replace("Z", "+00:00")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _spot_kline_latest_item_time(
+    response: Dict[str, Any],
+    *fields: str,
+) -> Optional[int]:
+    values: list[int] = []
+    items = response.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for field in fields:
+            value = _spot_kline_time_ms(item.get(field))
+            if value is not None:
+                values.append(value)
+    return max(values) if values else None
+
+
+def _record_external_spot_kline_result(
+    response: Dict[str, Any],
+    *,
+    cache_result: KlineCacheResult,
+    rest_fetch_metadata: Dict[str, Any],
+    interval: str,
+    end_time_ms: Optional[int],
+    live_ws_klines: Optional[Dict[str, Any]] = None,
+) -> None:
+    is_live_ws = str(response.get("source") or "").strip().upper() == "LIVE_WS"
+    history_terminal = response.get("history_terminal") is True
+    terminal_reason = str(response.get("terminal_reason") or "").strip()
+    from_last_good = bool(rest_fetch_metadata.get("from_last_good"))
+    if is_live_ws:
+        transport = DomainTransport.PROVIDER_WS
+        cache_origin = DomainCacheOrigin.PROVIDER_MEMORY
+        source = DomainSource.LIVE_WS
+        fallback_reason = None
+    elif history_terminal and terminal_reason:
+        transport = DomainTransport.CACHE_READ
+        cache_origin = DomainCacheOrigin.HISTORY_BOUNDARY
+        source = DomainSource.MISSING
+        fallback_reason = DomainFallbackReason.HISTORY_BOUNDARY
+    elif from_last_good:
+        transport = DomainTransport.CACHE_READ
+        cache_origin = DomainCacheOrigin.LAST_GOOD_MEMORY
+        source = DomainSource.LAST_GOOD
+        fallback_reason = None
+    elif cache_result.origin in {
+        KLINE_CACHE_ORIGIN_DB_CACHE,
+        KLINE_CACHE_ORIGIN_STALE_CACHE,
+    }:
+        transport = DomainTransport.DB_READ
+        cache_origin = DomainCacheOrigin.DATABASE
+        source = DomainSource.DB_CACHE
+        fallback_reason = None
+    elif cache_result.origin == KLINE_CACHE_ORIGIN_REST_FETCH:
+        transport = DomainTransport.PROVIDER_REST
+        cache_origin = DomainCacheOrigin.NONE
+        source = (
+            DomainSource.REST_HISTORY
+            if end_time_ms is not None
+            else DomainSource.REST_SNAPSHOT
+        )
+        fallback_reason = None
+    else:
+        transport = DomainTransport.NONE
+        cache_origin = DomainCacheOrigin.NONE
+        source = DomainSource.MISSING
+        fallback_reason = DomainFallbackReason.CACHE_MISS
+
+    updated_at_ms = _spot_kline_time_ms(response.get("updated_at"))
+    if transport == DomainTransport.DB_READ:
+        # KlineCacheResult does not expose the DB row update time.  Do not use
+        # unrelated last-good metadata as a database freshness clock.
+        updated_at_ms = None
+    received_at_ms = _spot_kline_time_ms(response.get("received_at_ms"))
+    if received_at_ms is None:
+        received_at_ms = _spot_kline_latest_item_time(
+            response,
+            "received_at_ms",
+            "updated_at_ms",
+        )
+    if received_at_ms is None and transport in {
+        DomainTransport.PROVIDER_REST,
+        DomainTransport.CACHE_READ,
+    }:
+        received_at_ms = updated_at_ms
+
+    provider_event_time_ms = _spot_kline_time_ms(
+        response.get("provider_event_time_ms")
+    )
+    if provider_event_time_ms is None:
+        provider_event_time_ms = _spot_kline_latest_item_time(
+            response,
+            "provider_update_time_ms",
+        )
+
+    provider = (
+        str(rest_fetch_metadata.get("provider") or response.get("provider") or "").strip()
+        or None
+    )
+    ttl_ms = int(LATEST_KLINE_REFRESH_TTL_SECONDS.get(interval, 30) * 1000)
+    cache_metadata = getattr(cache_result, "metadata", None)
+    if is_live_ws:
+        live_items = [
+            dict(item)
+            for item in list((live_ws_klines or {}).get("items") or [])
+            if isinstance(item, dict)
+        ]
+        current_items = (
+            [max(live_items, key=lambda item: int(item.get("open_time") or 0))]
+            if live_items
+            else []
+        )
+        live_updated_at_ms = _spot_kline_time_ms(
+            (live_ws_klines or {}).get("updated_at")
+        )
+        if live_updated_at_ms is None:
+            live_updated_at_ms = _spot_kline_latest_item_time(
+                {"items": current_items},
+                "received_at_ms",
+                "updated_at_ms",
+            )
+        cache_metadata = build_market_kline_cache_metadata(
+            data=current_items,
+            source=DomainSource.LIVE_WS.value,
+            provider=provider,
+            updated_at=live_updated_at_ms,
+            interval=interval,
+        )
+    elif from_last_good or not isinstance(cache_metadata, MarketKlineCacheMetadata):
+        cache_metadata = build_market_kline_cache_metadata(
+            data=list(response.get("items") or []),
+            source=source.value,
+            provider=provider,
+            updated_at=updated_at_ms,
+            interval=interval,
+        )
+    domain_snapshot = cache_metadata.to_domain_snapshot(
+        symbol=str(response.get("symbol") or "").strip().upper(),
+        fallback_reason=(fallback_reason.value if fallback_reason is not None else None),
+    )
+    _record_spot_kline_domain_snapshot(
+        response,
+        context=DomainSnapshotContext(
+            domain=DomainName.KLINE,
+            symbol=str(response.get("symbol") or "").strip().upper(),
+            interval=interval,
+            transport=transport,
+            cache_origin=cache_origin,
+            source=source,
+            provider=provider,
+            provider_symbol=str(response.get("provider_symbol") or "").strip() or None,
+            fallback_reason=fallback_reason,
+            provider_event_time_ms=provider_event_time_ms,
+            received_at_ms=received_at_ms,
+            cache_updated_at_ms=(
+                updated_at_ms
+                if transport == DomainTransport.CACHE_READ
+                else None
+            ),
+            db_updated_at_ms=(
+                updated_at_ms
+                if transport == DomainTransport.DB_READ
+                else None
+            ),
+            ttl_ms=ttl_ms,
+            provider_generation=_spot_depth_non_negative_int(
+                response.get("provider_generation")
+            ),
+        ),
+        domain_snapshot=domain_snapshot,
+    )
+
+
 def _is_spot_provider_cooldown_skip(exc: Exception) -> bool:
     return isinstance(exc, ProviderCooldownError)
 
@@ -2076,8 +2773,10 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = Fa
     last_error: Optional[Exception] = None
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
     primary_provider = providers[0] if providers else None
+    ws_lookup_attempted = False
     try:
         if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code, domain="ticker"):
+            ws_lookup_attempted = True
             live_record = get_spot_provider_ws_ticker(pair.symbol, provider=primary_provider.provider_code)
             if live_record is not None:
                 live_ticker = _spot_provider_ws_ticker_to_item(pair, live_record)
@@ -2087,6 +2786,27 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = Fa
                         _spot_provider_price_precision_metadata(db, pair, primary_provider),
                     )
                     _SPOT_LAST_GOOD_TICKERS[pair.symbol] = live_ticker
+                    _record_spot_ticker_domain_snapshot(
+                        live_ticker,
+                        context=DomainSnapshotContext(
+                            domain=DomainName.TICKER,
+                            symbol=pair.symbol,
+                            transport=DomainTransport.PROVIDER_WS,
+                            cache_origin=DomainCacheOrigin.PROVIDER_MEMORY,
+                            source=DomainSource.LIVE_WS,
+                            provider=(
+                                str(primary_provider.provider_code or "").strip()
+                                or None
+                            ),
+                            provider_symbol=(
+                                str(live_record.get("provider_symbol") or "").strip()
+                                or None
+                            ),
+                            provider_event_time_ms=live_ticker.event_time_ms,
+                            received_at_ms=live_ticker.received_at_ms,
+                            ttl_ms=SPOT_TICKER_SHARED_CACHE_TTL_MS,
+                        ),
+                    )
                     return live_ticker
     except Exception as exc:
         logger.debug("spot_provider_ws_ticker_unavailable symbol=%s reason=%s", pair.symbol, exc)
@@ -2108,6 +2828,26 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = Fa
             )
             _SPOT_LAST_GOOD_TICKERS[pair.symbol] = ticker
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
+            _record_spot_ticker_domain_snapshot(
+                ticker,
+                context=DomainSnapshotContext(
+                    domain=DomainName.TICKER,
+                    symbol=pair.symbol,
+                    transport=DomainTransport.PROVIDER_REST,
+                    cache_origin=DomainCacheOrigin.NONE,
+                    source=DomainSource.REST_SNAPSHOT,
+                    provider=str(provider.provider_code or "").strip() or None,
+                    provider_symbol=provider_symbol,
+                    fallback_reason=(
+                        DomainFallbackReason.WS_MISS
+                        if ws_lookup_attempted
+                        else None
+                    ),
+                    provider_event_time_ms=ticker.event_time_ms,
+                    received_at_ms=ticker.received_at_ms,
+                    ttl_ms=SPOT_TICKER_SHARED_CACHE_TTL_MS,
+                ),
+            )
             return ticker
         except ProviderCooldownError as exc:
             last_error = exc
@@ -2130,8 +2870,40 @@ def _get_external_spot_ticker(db: Session, pair: TradingPair, *, fast: bool = Fa
     if contract_market_last_good_enabled(db):
         fallback = _spot_last_good_ticker(pair)
         if fallback is not None:
+            original = _SPOT_LAST_GOOD_TICKERS.get(pair.symbol)
+            _record_spot_ticker_domain_snapshot(
+                fallback,
+                context=DomainSnapshotContext(
+                    domain=DomainName.TICKER,
+                    symbol=pair.symbol,
+                    transport=DomainTransport.CACHE_READ,
+                    cache_origin=DomainCacheOrigin.LAST_GOOD_MEMORY,
+                    source=DomainSource.LAST_GOOD,
+                    provider=(
+                        str(getattr(original, "provider", None) or "").strip()
+                        or None
+                    ),
+                    fallback_reason=_spot_ticker_failure_reason(last_error),
+                    provider_event_time_ms=getattr(original, "event_time_ms", None),
+                    received_at_ms=getattr(original, "received_at_ms", None),
+                    cache_updated_at_ms=getattr(original, "received_at_ms", None),
+                    ttl_ms=SPOT_TICKER_SHARED_CACHE_TTL_MS,
+                ),
+            )
             return fallback
     logger.warning("spot_provider_ticker_unavailable symbol=%s reason=%s", pair.symbol, last_error)
+    _record_spot_ticker_domain_snapshot(
+        None,
+        context=DomainSnapshotContext(
+            domain=DomainName.TICKER,
+            symbol=pair.symbol,
+            transport=DomainTransport.NONE,
+            cache_origin=DomainCacheOrigin.NONE,
+            source=DomainSource.MISSING,
+            fallback_reason=_spot_ticker_failure_reason(last_error),
+            ttl_ms=SPOT_TICKER_SHARED_CACHE_TTL_MS,
+        ),
+    )
     return None
 
 
@@ -2144,6 +2916,10 @@ def _get_external_spot_ticker_cached(db: Session, pair: TradingPair, *, fast: bo
         symbol=pair.symbol,
         data_source=_normalize_data_source(pair),
         loader=load_ticker,
+        cache_hit_observer=lambda cache_hit: _record_spot_ticker_cache_hit(
+            symbol=pair.symbol,
+            cache_hit=cache_hit,
+        ),
     )
     if not isinstance(payload, dict):
         return None
@@ -2167,10 +2943,37 @@ def _get_external_spot_depth_live_or_rest(
         live_depth = get_spot_provider_ws_depth(pair.symbol, provider=ws_provider_code, limit=limit)
         if live_depth is not None:
             formatted_depth = _format_depth_for_pair(pair, live_depth, limit=limit)
-            return _apply_spot_depth_price_precision_metadata(
+            formatted_depth = _apply_spot_depth_price_precision_metadata(
                 formatted_depth,
                 _spot_provider_price_precision_metadata(db, pair, ws_provider),
             )
+            _record_spot_depth_domain_snapshot(
+                formatted_depth,
+                context=DomainSnapshotContext(
+                    domain=DomainName.DEPTH,
+                    symbol=pair.symbol,
+                    transport=DomainTransport.PROVIDER_WS,
+                    cache_origin=DomainCacheOrigin.PROVIDER_MEMORY,
+                    source=DomainSource.LIVE_WS,
+                    provider=ws_provider_code,
+                    provider_symbol=(
+                        str(getattr(live_depth, "provider_symbol", None) or "").strip()
+                        or None
+                    ),
+                    provider_event_time_ms=_spot_depth_non_negative_int(
+                        formatted_depth.event_time_ms or formatted_depth.ts
+                    ),
+                    received_at_ms=_spot_depth_non_negative_int(
+                        formatted_depth.received_at_ms or formatted_depth.fetched_at
+                    ),
+                    ttl_ms=SPOT_DEPTH_SHARED_CACHE_TTL_MS,
+                    provider_generation=_spot_depth_provider_generation(
+                        pair.symbol,
+                        ws_provider_code,
+                    ),
+                ),
+            )
+            return formatted_depth
     return _get_external_spot_depth(db, pair, limit=limit, fast=fast)
 
 
@@ -2189,6 +2992,10 @@ def _get_external_spot_depth_cached(
         symbol=pair.symbol,
         data_source=_normalize_data_source(pair),
         loader=load_depth,
+        cache_hit_observer=lambda cache_hit: _record_spot_depth_cache_hit(
+            symbol=pair.symbol,
+            cache_hit=cache_hit,
+        ),
     )
     if not isinstance(payload, dict):
         raise ValueError("spot external depth unavailable")
@@ -2215,6 +3022,29 @@ def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20, *,
             )
             _SPOT_LAST_GOOD_DEPTHS[pair.symbol] = depth
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
+            _record_spot_depth_domain_snapshot(
+                depth,
+                context=DomainSnapshotContext(
+                    domain=DomainName.DEPTH,
+                    symbol=pair.symbol,
+                    transport=DomainTransport.PROVIDER_REST,
+                    cache_origin=DomainCacheOrigin.NONE,
+                    source=DomainSource.REST_SNAPSHOT,
+                    provider=str(provider.provider_code or "").strip() or None,
+                    provider_symbol=provider_symbol,
+                    provider_event_time_ms=_spot_depth_non_negative_int(
+                        depth.event_time_ms or depth.ts
+                    ),
+                    received_at_ms=_spot_depth_non_negative_int(
+                        depth.received_at_ms or depth.fetched_at
+                    ),
+                    ttl_ms=SPOT_DEPTH_SHARED_CACHE_TTL_MS,
+                    provider_generation=_spot_depth_provider_generation(
+                        pair.symbol,
+                        provider.provider_code,
+                    ),
+                ),
+            )
             return depth
         except MarketDataProviderError as exc:
             if _is_spot_provider_cooldown_skip(exc):
@@ -2237,8 +3067,48 @@ def _get_external_spot_depth(db: Session, pair: TradingPair, limit: int = 20, *,
     if contract_market_last_good_enabled(db) and pair.symbol in _SPOT_LAST_GOOD_DEPTHS:
         cached = _SPOT_LAST_GOOD_DEPTHS[pair.symbol]
         data = cached.model_dump() if hasattr(cached, "model_dump") else cached.dict()
+        original_provider = str(data.get("provider") or "").strip() or None
+        original_provider_symbol = str(data.get("provider_symbol") or "").strip() or None
         data.update({"provider": "LAST_GOOD", "stale": True})
-        return DepthResponse(**data)
+        fallback = DepthResponse(**data)
+        received_at_ms = _spot_depth_non_negative_int(
+            data.get("received_at_ms") or data.get("fetched_at")
+        )
+        _record_spot_depth_domain_snapshot(
+            fallback,
+            context=DomainSnapshotContext(
+                domain=DomainName.DEPTH,
+                symbol=pair.symbol,
+                transport=DomainTransport.CACHE_READ,
+                cache_origin=DomainCacheOrigin.LAST_GOOD_MEMORY,
+                source=DomainSource.LAST_GOOD,
+                provider=original_provider,
+                provider_symbol=original_provider_symbol,
+                fallback_reason=_spot_depth_failure_reason(last_error),
+                provider_event_time_ms=_spot_depth_non_negative_int(
+                    data.get("event_time_ms") or data.get("ts")
+                ),
+                received_at_ms=received_at_ms,
+                cache_updated_at_ms=received_at_ms,
+                ttl_ms=SPOT_DEPTH_SHARED_CACHE_TTL_MS,
+                provider_generation=_spot_depth_non_negative_int(
+                    data.get("provider_generation") or data.get("generation")
+                ),
+            ),
+        )
+        return fallback
+    _record_spot_depth_domain_snapshot(
+        None,
+        context=DomainSnapshotContext(
+            domain=DomainName.DEPTH,
+            symbol=pair.symbol,
+            transport=DomainTransport.NONE,
+            cache_origin=DomainCacheOrigin.NONE,
+            source=DomainSource.MISSING,
+            fallback_reason=_spot_depth_failure_reason(last_error),
+            ttl_ms=SPOT_DEPTH_SHARED_CACHE_TTL_MS,
+        ),
+    )
     raise ValueError(f"spot external depth unavailable: {last_error}")
 
 
@@ -2246,7 +3116,9 @@ def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *
     last_error: Optional[Exception] = None
     providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
     primary_provider = providers[0] if providers else None
+    ws_lookup_attempted = False
     if primary_provider is not None and spot_provider_ws_supports_provider(primary_provider.provider_code, domain="trades"):
+        ws_lookup_attempted = True
         try:
             live_trades = get_spot_provider_ws_trades(
                 pair.symbol,
@@ -2256,6 +3128,39 @@ def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *
             if live_trades is not None and live_trades.trades:
                 formatted_live_trades = _format_trades_for_pair(pair, live_trades, limit=limit)
                 _SPOT_LAST_GOOD_TRADES[pair.symbol] = formatted_live_trades
+                formatted_payload = (
+                    formatted_live_trades.model_dump()
+                    if hasattr(formatted_live_trades, "model_dump")
+                    else formatted_live_trades.dict()
+                )
+                _record_spot_trades_domain_snapshot(
+                    formatted_live_trades,
+                    context=DomainSnapshotContext(
+                        domain=DomainName.TRADES,
+                        symbol=pair.symbol,
+                        transport=DomainTransport.PROVIDER_WS,
+                        cache_origin=DomainCacheOrigin.PROVIDER_MEMORY,
+                        source=DomainSource.LIVE_WS,
+                        provider=(
+                            str(primary_provider.provider_code or "").strip()
+                            or None
+                        ),
+                        provider_symbol=_spot_trades_text(
+                            formatted_payload,
+                            "provider_symbol",
+                        ),
+                        provider_event_time_ms=_spot_trades_latest_time(
+                            formatted_payload,
+                            "event_time_ms",
+                        ),
+                        received_at_ms=_spot_trades_latest_time(
+                            formatted_payload,
+                            "received_at_ms",
+                            "updated_at_ms",
+                        ),
+                        ttl_ms=SPOT_TRADES_SHARED_CACHE_TTL_MS,
+                    ),
+                )
                 return formatted_live_trades
         except Exception as exc:
             logger.debug("spot_provider_ws_trades_unavailable symbol=%s reason=%s", pair.symbol, exc)
@@ -2278,6 +3183,34 @@ def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *
             )
             _SPOT_LAST_GOOD_TRADES[pair.symbol] = trades
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
+            trades_payload = trades.model_dump() if hasattr(trades, "model_dump") else trades.dict()
+            _record_spot_trades_domain_snapshot(
+                trades,
+                context=DomainSnapshotContext(
+                    domain=DomainName.TRADES,
+                    symbol=pair.symbol,
+                    transport=DomainTransport.PROVIDER_REST,
+                    cache_origin=DomainCacheOrigin.NONE,
+                    source=DomainSource.REST_SNAPSHOT,
+                    provider=str(provider.provider_code or "").strip() or None,
+                    provider_symbol=provider_symbol,
+                    fallback_reason=(
+                        DomainFallbackReason.WS_MISS
+                        if ws_lookup_attempted
+                        else None
+                    ),
+                    provider_event_time_ms=_spot_trades_latest_time(
+                        trades_payload,
+                        "event_time_ms",
+                    ),
+                    received_at_ms=_spot_trades_latest_time(
+                        trades_payload,
+                        "received_at_ms",
+                        "updated_at_ms",
+                    ),
+                    ttl_ms=SPOT_TRADES_SHARED_CACHE_TTL_MS,
+                ),
+            )
             return trades
         except MarketDataProviderError as exc:
             if _is_spot_provider_cooldown_skip(exc):
@@ -2300,8 +3233,51 @@ def _get_external_spot_trades(db: Session, pair: TradingPair, limit: int = 50, *
     if contract_market_last_good_enabled(db) and pair.symbol in _SPOT_LAST_GOOD_TRADES:
         cached = _SPOT_LAST_GOOD_TRADES[pair.symbol]
         data = cached.model_dump() if hasattr(cached, "model_dump") else cached.dict()
+        original_provider = _spot_trades_text(data, "provider")
+        original_provider_symbol = _spot_trades_text(data, "provider_symbol")
         data.update({"provider": "LAST_GOOD", "stale": True})
-        return TradesResponse(**data)
+        fallback = TradesResponse(**data)
+        _record_spot_trades_domain_snapshot(
+            fallback,
+            context=DomainSnapshotContext(
+                domain=DomainName.TRADES,
+                symbol=pair.symbol,
+                transport=DomainTransport.CACHE_READ,
+                cache_origin=DomainCacheOrigin.LAST_GOOD_MEMORY,
+                source=DomainSource.LAST_GOOD,
+                provider=original_provider,
+                provider_symbol=original_provider_symbol,
+                fallback_reason=_spot_trades_failure_reason(last_error),
+                provider_event_time_ms=_spot_trades_latest_time(
+                    data,
+                    "event_time_ms",
+                ),
+                received_at_ms=_spot_trades_latest_time(
+                    data,
+                    "received_at_ms",
+                    "updated_at_ms",
+                ),
+                cache_updated_at_ms=_spot_trades_latest_time(
+                    data,
+                    "received_at_ms",
+                    "updated_at_ms",
+                ),
+                ttl_ms=SPOT_TRADES_SHARED_CACHE_TTL_MS,
+            ),
+        )
+        return fallback
+    _record_spot_trades_domain_snapshot(
+        None,
+        context=DomainSnapshotContext(
+            domain=DomainName.TRADES,
+            symbol=pair.symbol,
+            transport=DomainTransport.NONE,
+            cache_origin=DomainCacheOrigin.NONE,
+            source=DomainSource.MISSING,
+            fallback_reason=_spot_trades_failure_reason(last_error),
+            ttl_ms=SPOT_TRADES_SHARED_CACHE_TTL_MS,
+        ),
+    )
     raise ValueError(f"spot external trades unavailable: {last_error}")
 
 
@@ -2320,6 +3296,10 @@ def _get_external_spot_trades_cached(
         symbol=pair.symbol,
         data_source=_normalize_data_source(pair),
         loader=load_trades,
+        cache_hit_observer=lambda cache_hit: _record_spot_trades_cache_hit(
+            symbol=pair.symbol,
+            cache_hit=cache_hit,
+        ),
     )
     if not isinstance(payload, dict):
         raise ValueError("spot external trades unavailable")
@@ -4068,7 +5048,7 @@ def get_klines(
                 freshness = str(result_metadata["freshness"])
                 stale = bool(result_metadata["stale"])
             updated_at = cached_meta.get("updated_at")
-        return {
+        response = {
             "symbol": pair.symbol,
             "interval": interval,
             "items": items,
@@ -4085,6 +5065,15 @@ def get_klines(
             "provider_error_code": result_metadata.get("provider_error_code"),
             "provider_error_provider": result_metadata.get("provider_error_provider"),
         }
+        _record_external_spot_kline_result(
+            response,
+            cache_result=cache_result,
+            rest_fetch_metadata=rest_fetch_metadata,
+            interval=interval,
+            end_time_ms=end_time_ms,
+            live_ws_klines=(live_ws_klines if has_live_ws_overlay else None),
+        )
+        return response
 
     if _is_itick_stock_pair(pair):
         logger.info(

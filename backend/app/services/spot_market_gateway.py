@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional
 
@@ -10,7 +11,20 @@ from app.core.config import settings
 from app.db.models.trading_pair import TradingPair
 from app.db.session import SessionLocal
 from app.schemas.market import DepthItem, DepthResponse, TradesResponse
+from app.schemas.spot_domain_snapshot import (
+    DepthDomainSnapshot,
+    DomainCacheOrigin,
+    DomainFallbackReason,
+    DomainFreshness,
+    DomainFreshnessBasis,
+    DomainName,
+    DomainSource,
+    DomainTransport,
+    TickerDomainSnapshot,
+    TradesDomainSnapshot,
+)
 from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT, enabled_spot_market_providers
+from app.services.market_domain_snapshot import MarketDomainSnapshot
 from app.services.spot_market_gateway_state import (
     SpotGatewayBroadcastState,
     SpotGatewayDepthAuthority,
@@ -32,6 +46,17 @@ from app.services.spot_market_provider_ws import (
     spot_provider_ws_supports_provider,
 )
 from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
+from app.services.spot_depth_domain_snapshot import map_depth_domain_snapshot
+from app.services.spot_kline_domain_snapshot import (
+    KlineDomainSnapshot,
+    map_kline_domain_snapshot,
+)
+from app.services.spot_ticker_domain_snapshot import map_ticker_domain_snapshot
+from app.services.spot_domain_snapshot_freshness import (
+    DomainSnapshotContext,
+    resolve_domain_snapshot_freshness,
+)
+from app.services.spot_trades_domain_snapshot import map_trades_domain_snapshot
 
 
 logger = logging.getLogger(__name__)
@@ -113,6 +138,10 @@ class SpotMarketGateway:
         self._precision_cache: dict[str, tuple[int, int]] = {}
         self._symbol_providers: dict[str, str] = {}
         self._pending_provider_switches: dict[str, tuple[str, str]] = {}
+        self._depth_domain_snapshots: dict[str, DepthDomainSnapshot] = {}
+        self._ticker_domain_snapshots: dict[str, TickerDomainSnapshot] = {}
+        self._trades_domain_snapshots: dict[str, TradesDomainSnapshot] = {}
+        self._kline_domain_snapshots: dict[tuple[str, str], KlineDomainSnapshot] = {}
         self._broadcast_counters: dict[str, int] = {
             "depth": 0,
             "ticker": 0,
@@ -274,6 +303,8 @@ class SpotMarketGateway:
         source: str,
         allow_switch: bool = False,
         expected_provider: Optional[str] = None,
+        snapshot_fallback_reason: Optional[DomainFallbackReason] = None,
+        snapshot_sequence: Optional[int] = None,
     ) -> Optional[SpotGatewayDepthState]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         try:
@@ -313,6 +344,35 @@ class SpotMarketGateway:
         self._symbol_providers[normalized_symbol] = state.provider
         if previous_provider and previous_provider != state.provider:
             self._pending_provider_switches[normalized_symbol] = (previous_provider, state.provider)
+        try:
+            snapshot_transport, snapshot_cache_origin = self._depth_snapshot_origin(state.source)
+            self._record_depth_domain_snapshot(
+                symbol=normalized_symbol,
+                depth=state.depth,
+                provider=state.provider,
+                provider_symbol=state.provider_symbol,
+                transport=snapshot_transport,
+                cache_origin=snapshot_cache_origin,
+                source=self._depth_snapshot_source(state.source),
+                freshness=self._depth_snapshot_freshness(state.freshness),
+                fallback_reason=snapshot_fallback_reason,
+                provider_event_time_ms=state.event_time_ms,
+                received_at_ms=state.received_at_ms,
+                cache_updated_at_ms=(
+                    state.received_at_ms
+                    if snapshot_cache_origin == DomainCacheOrigin.PROVIDER_MEMORY
+                    else None
+                ),
+                provider_generation=state.provider_generation,
+                sequence=snapshot_sequence,
+            )
+        except Exception:
+            logger.warning(
+                "spot_market_gateway_depth_snapshot_failed symbol=%s provider=%s",
+                normalized_symbol,
+                state.provider,
+                exc_info=True,
+            )
         return state
 
     @staticmethod
@@ -394,7 +454,12 @@ class SpotMarketGateway:
                     <= int(getattr(settings, "SPOT_PROVIDER_WS_DEPTH_MAX_AGE_MS", 1500) or 1500)
                 ):
                     authoritative_depth = self._format_depth_for_broadcast(symbol, authority_state.depth)
-                    if self._should_broadcast_depth(symbol, authoritative_depth):
+                    authority_snapshot = self.get_depth_domain_snapshot(symbol)
+                    if self._should_broadcast_depth(
+                        symbol,
+                        authoritative_depth,
+                        snapshot=authority_snapshot,
+                    ):
                         try:
                             await self._market_ws_manager().broadcast_depth_update(symbol, authoritative_depth)
                             self._remember_broadcast_metric(symbol, "depth")
@@ -419,6 +484,15 @@ class SpotMarketGateway:
                 except Exception:
                     logger.warning("spot_market_gateway_get_depth_failed symbol=%s", symbol, exc_info=True)
                     depth = None
+                if depth is None and authority_state is None:
+                    self._record_depth_domain_snapshot(
+                        symbol=symbol,
+                        depth=None,
+                        provider=provider_code,
+                        transport=DomainTransport.PROVIDER_WS,
+                        cache_origin=DomainCacheOrigin.PROVIDER_MEMORY,
+                        fallback_reason=DomainFallbackReason.CACHE_MISS,
+                    )
                 if depth is not None:
                     depth = self._format_depth_for_broadcast(symbol, depth)
                     state = self.commit_authoritative_depth(
@@ -432,7 +506,12 @@ class SpotMarketGateway:
                         source=str(getattr(depth, "source", None) or "LIVE_WS"),
                     )
                     depth = state.depth if state is not None else None
-                if depth is not None and self._should_broadcast_depth(symbol, depth):
+                depth_snapshot = self.get_depth_domain_snapshot(symbol)
+                if depth is not None and self._should_broadcast_depth(
+                    symbol,
+                    depth,
+                    snapshot=depth_snapshot,
+                ):
                     try:
                         await self._market_ws_manager().broadcast_depth_update(symbol, depth)
                         self._remember_broadcast_metric(symbol, "depth")
@@ -447,11 +526,27 @@ class SpotMarketGateway:
                 except Exception:
                     logger.warning("spot_market_gateway_get_ticker_failed symbol=%s", symbol, exc_info=True)
                     ticker = None
-                if ticker is not None:
-                    ticker = self._format_ticker_for_broadcast(symbol, ticker)
-                if ticker is not None and self._should_broadcast_ticker(symbol, ticker):
+                ticker_snapshot = self._record_ticker_domain_snapshot(
+                    symbol,
+                    ticker,
+                    transport=DomainTransport.PROVIDER_WS,
+                    cache_origin=DomainCacheOrigin.PROVIDER_MEMORY,
+                    fallback_reason=(
+                        DomainFallbackReason.CACHE_MISS if ticker is None else None
+                    ),
+                )
+                legacy_ticker = (
+                    self._format_ticker_for_broadcast(symbol, ticker_snapshot.data)
+                    if ticker_snapshot.data is not None
+                    else None
+                )
+                if legacy_ticker is not None and self._should_broadcast_ticker(
+                    symbol,
+                    legacy_ticker,
+                    snapshot=ticker_snapshot,
+                ):
                     try:
-                        await self._market_ws_manager().broadcast_ticker_update(symbol, ticker)
+                        await self._market_ws_manager().broadcast_ticker_update(symbol, legacy_ticker)
                         self._remember_broadcast_metric(symbol, "ticker")
                     except Exception:
                         logger.warning("spot_market_gateway_ticker_broadcast_failed symbol=%s", symbol, exc_info=True)
@@ -471,7 +566,30 @@ class SpotMarketGateway:
                 except Exception:
                     logger.warning("spot_market_gateway_get_trades_failed symbol=%s", symbol, exc_info=True)
                     trades = None
-                for trade in self._new_trades_for_broadcast(symbol, trades):
+                try:
+                    trades_snapshot = self._record_trades_domain_snapshot(
+                        symbol=symbol,
+                        trades=trades,
+                        provider=provider_code if trades is None else None,
+                        transport=DomainTransport.PROVIDER_WS,
+                        cache_origin=DomainCacheOrigin.PROVIDER_MEMORY,
+                        fallback_reason=(
+                            DomainFallbackReason.CACHE_MISS if trades is None else None
+                        ),
+                    )
+                except Exception:
+                    trades_snapshot = None
+                    logger.warning(
+                        "spot_market_gateway_trades_snapshot_failed symbol=%s provider=%s",
+                        symbol,
+                        provider_code,
+                        exc_info=True,
+                    )
+                for trade in self._new_trades_for_broadcast(
+                    symbol,
+                    trades,
+                    snapshot=trades_snapshot,
+                ):
                     try:
                         item_id = getattr(trade, "id", None)
                         trade_id = _first_not_none(getattr(trade, "trade_id", None), item_id)
@@ -550,11 +668,38 @@ class SpotMarketGateway:
                         )
                         klines = None
                     kline = self._latest_kline_for_broadcast(klines)
+                    try:
+                        kline_snapshot = self._record_kline_domain_snapshot(
+                            symbol=symbol,
+                            interval=interval,
+                            kline=klines,
+                            provider=(klines or {}).get("provider") or provider_code,
+                            provider_symbol=(klines or {}).get("provider_symbol"),
+                            transport=DomainTransport.PROVIDER_WS,
+                            cache_origin=DomainCacheOrigin.PROVIDER_MEMORY,
+                            fallback_reason=(
+                                DomainFallbackReason.CACHE_MISS if klines is None else None
+                            ),
+                            revision_epoch=(kline or {}).get("revision_epoch"),
+                            revision_sequence=(kline or {}).get("revision_seq"),
+                            is_closed=(kline or {}).get("is_closed"),
+                            close_state_source=(kline or {}).get("close_state_source"),
+                        )
+                    except Exception:
+                        kline_snapshot = None
+                        logger.warning(
+                            "spot_market_gateway_kline_snapshot_failed symbol=%s interval=%s provider=%s",
+                            symbol,
+                            interval,
+                            provider_code,
+                            exc_info=True,
+                        )
                     if kline is not None and self._should_broadcast_kline(
                         symbol,
                         interval,
                         kline,
                         provider=(klines or {}).get("provider"),
+                        snapshot=kline_snapshot,
                     ):
                         try:
                             await self._market_ws_manager().broadcast_provider_kline_update(
@@ -642,12 +787,26 @@ class SpotMarketGateway:
         self._ensured_kline_intervals.pop(symbol, None)
         self._pending_kline_releases.pop(symbol, None)
         self._precision_cache.pop(symbol, None)
+        self._depth_domain_snapshots.pop(symbol, None)
+        self._ticker_domain_snapshots.pop(symbol, None)
+        self._trades_domain_snapshots.pop(symbol, None)
         self._symbol_providers.pop(symbol, None)
         self._pending_provider_switches.pop(symbol, None)
         self._depth_authority.clear_symbol(symbol)
 
-    def _should_broadcast_depth(self, symbol: str, depth: DepthResponse) -> bool:
-        domain_key = self._domain_key("depth", symbol, provider=getattr(depth, "provider", None))
+    def _should_broadcast_depth(
+        self,
+        symbol: str,
+        depth: DepthResponse,
+        *,
+        snapshot: Optional[DepthDomainSnapshot] = None,
+    ) -> bool:
+        snapshot_provider = snapshot.metadata.provider if snapshot is not None else None
+        domain_key = self._domain_key(
+            "depth",
+            symbol,
+            provider=snapshot_provider or getattr(depth, "provider", None),
+        )
         signature = self._depth_signature(depth)
         now_ms = self._broadcast_state.now_ms()
         if not self._broadcast_state.should_broadcast_domain(
@@ -660,13 +819,197 @@ class SpotMarketGateway:
         self._broadcast_state.remember_broadcast(domain_key, signature, now_ms=now_ms)
         return True
 
+    def get_depth_domain_snapshot(self, symbol: str) -> Optional[DepthDomainSnapshot]:
+        return self._depth_domain_snapshots.get(normalize_spot_ws_symbol(symbol))
+
+    @staticmethod
+    def _depth_snapshot_origin(source: str) -> tuple[DomainTransport, DomainCacheOrigin]:
+        normalized_source = str(source or "").strip().upper()
+        if normalized_source == "LIVE_WS":
+            return DomainTransport.PROVIDER_WS, DomainCacheOrigin.PROVIDER_MEMORY
+        if normalized_source in {"REST", "REST_SNAPSHOT", "EXTERNAL"}:
+            return DomainTransport.PROVIDER_REST, DomainCacheOrigin.NONE
+        if normalized_source == "LAST_GOOD":
+            return DomainTransport.CACHE_READ, DomainCacheOrigin.LAST_GOOD_MEMORY
+        if normalized_source in {"STALE", "STALE_CACHE"}:
+            return DomainTransport.CACHE_READ, DomainCacheOrigin.REDIS
+        return DomainTransport.NONE, DomainCacheOrigin.NONE
+
+    @staticmethod
+    def _depth_snapshot_source(source: str) -> Optional[DomainSource]:
+        normalized_source = str(source or "").strip().upper()
+        return {
+            "LIVE_WS": DomainSource.LIVE_WS,
+            "REST": DomainSource.REST_SNAPSHOT,
+            "REST_SNAPSHOT": DomainSource.REST_SNAPSHOT,
+            "EXTERNAL": DomainSource.REST_SNAPSHOT,
+            "LAST_GOOD": DomainSource.LAST_GOOD,
+            "STALE": DomainSource.DB_CACHE,
+            "STALE_CACHE": DomainSource.DB_CACHE,
+            "INTERNAL": DomainSource.INTERNAL,
+        }.get(normalized_source)
+
+    @staticmethod
+    def _depth_snapshot_freshness(freshness: str) -> Optional[DomainFreshness]:
+        normalized_freshness = str(freshness or "").strip().upper()
+        return {
+            "LIVE": DomainFreshness.LIVE,
+            "RECENT": DomainFreshness.RECENT,
+            "STALE": DomainFreshness.STALE,
+            "LAST_GOOD": DomainFreshness.LAST_GOOD,
+            "LAST_VALID": DomainFreshness.LAST_GOOD,
+            "MISSING": DomainFreshness.MISSING,
+        }.get(normalized_freshness)
+
+    def record_depth_market_domain_snapshot(
+        self,
+        *,
+        snapshot: MarketDomainSnapshot,
+        context: DomainSnapshotContext,
+        emitted_at_ms: Optional[int] = None,
+    ) -> DepthDomainSnapshot:
+        if snapshot.domain != "depth":
+            raise ValueError("market domain snapshot must use the depth domain")
+        if context.domain != DomainName.DEPTH:
+            raise ValueError("depth snapshot context must use the depth domain")
+        normalized_symbol = normalize_spot_ws_symbol(snapshot.symbol)
+        if normalized_symbol != normalize_spot_ws_symbol(context.symbol):
+            raise ValueError("depth snapshot symbol does not match context")
+        if snapshot.data is not None and not isinstance(snapshot.data, Mapping):
+            raise ValueError("depth market domain snapshot data must be a mapping")
+
+        resolved_context = replace(
+            context,
+            symbol=normalized_symbol,
+            provider=snapshot.provider,
+            cache_updated_at_ms=(
+                context.cache_updated_at_ms
+                if context.cache_updated_at_ms is not None
+                else snapshot.updated_at
+            ),
+        )
+        depth = dict(snapshot.data) if isinstance(snapshot.data, Mapping) else None
+        return self.record_depth_domain_snapshot(
+            depth=depth,
+            context=resolved_context,
+            emitted_at_ms=emitted_at_ms,
+        )
+
+    def record_depth_domain_snapshot(
+        self,
+        *,
+        depth: Any,
+        context: DomainSnapshotContext,
+        emitted_at_ms: Optional[int] = None,
+    ) -> DepthDomainSnapshot:
+        if context.domain != DomainName.DEPTH:
+            raise ValueError("depth snapshot context must use the depth domain")
+        current_ms = int(emitted_at_ms if emitted_at_ms is not None else time.time() * 1000)
+        resolution = resolve_domain_snapshot_freshness(
+            context,
+            now_ms=current_ms,
+        )
+        return self._record_depth_domain_snapshot(
+            symbol=context.symbol,
+            depth=depth,
+            transport=context.transport,
+            cache_origin=context.cache_origin,
+            provider=context.provider,
+            provider_symbol=context.provider_symbol,
+            source=context.source,
+            freshness=resolution.freshness,
+            fallback_reason=context.fallback_reason,
+            provider_event_time_ms=context.provider_event_time_ms,
+            received_at_ms=context.received_at_ms,
+            cache_updated_at_ms=context.cache_updated_at_ms,
+            age_ms=resolution.age_ms,
+            ttl_ms=resolution.ttl_ms,
+            stale=resolution.stale,
+            provider_generation=context.provider_generation,
+            freshness_basis=resolution.freshness_basis,
+            emitted_at_ms=current_ms,
+        )
+
+    def _record_depth_domain_snapshot(
+        self,
+        *,
+        symbol: str,
+        depth: Any,
+        transport: DomainTransport = DomainTransport.PROVIDER_WS,
+        cache_origin: DomainCacheOrigin = DomainCacheOrigin.PROVIDER_MEMORY,
+        provider: Optional[str] = None,
+        provider_symbol: Optional[str] = None,
+        source: Optional[DomainSource] = None,
+        freshness: Optional[DomainFreshness] = None,
+        fallback_reason: Optional[DomainFallbackReason] = None,
+        provider_event_time_ms: Optional[int] = None,
+        received_at_ms: Optional[int] = None,
+        cache_updated_at_ms: Optional[int] = None,
+        age_ms: Optional[int] = None,
+        ttl_ms: Optional[int] = None,
+        stale: Optional[bool] = None,
+        provider_generation: Optional[int] = None,
+        sequence: Optional[int] = None,
+        freshness_basis: Optional[DomainFreshnessBasis] = None,
+        emitted_at_ms: Optional[int] = None,
+    ) -> DepthDomainSnapshot:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        current_ms = int(emitted_at_ms if emitted_at_ms is not None else time.time() * 1000)
+        resolved_age_ms = age_ms
+        if resolved_age_ms is None and cache_updated_at_ms is not None:
+            resolved_age_ms = max(0, current_ms - int(cache_updated_at_ms))
+        resolved_ttl_ms = ttl_ms
+        if resolved_ttl_ms is None and transport == DomainTransport.PROVIDER_WS:
+            resolved_ttl_ms = int(
+                getattr(settings, "SPOT_PROVIDER_WS_DEPTH_MAX_AGE_MS", 1500) or 1500
+            )
+        resolved_freshness_basis = freshness_basis or (
+            DomainFreshnessBasis.RECEIVED_AT
+            if depth is not None
+            else DomainFreshnessBasis.NOT_APPLICABLE
+        )
+        snapshot = map_depth_domain_snapshot(
+            symbol=normalized_symbol,
+            depth=depth,
+            transport=transport,
+            cache_origin=cache_origin,
+            provider=provider,
+            provider_symbol=provider_symbol,
+            source=source,
+            freshness=freshness,
+            fallback_reason=fallback_reason,
+            provider_event_time_ms=provider_event_time_ms,
+            received_at_ms=received_at_ms,
+            cache_updated_at_ms=cache_updated_at_ms,
+            age_ms=resolved_age_ms,
+            ttl_ms=resolved_ttl_ms,
+            stale=stale,
+            provider_generation=provider_generation,
+            sequence=sequence,
+            freshness_basis=resolved_freshness_basis,
+            emitted_at_ms=current_ms,
+        )
+        self._depth_domain_snapshots[normalized_symbol] = snapshot
+        return snapshot
+
     def _depth_signature(self, depth: DepthResponse) -> str:
         bids = [(item.price, item.amount) for item in depth.bids[:20]]
         asks = [(item.price, item.amount) for item in depth.asks[:20]]
         return repr((bids, asks, getattr(depth, "ts", None)))
 
-    def _should_broadcast_ticker(self, symbol: str, ticker: dict[str, Any]) -> bool:
-        domain_key = self._domain_key("ticker", symbol, provider=ticker.get("provider"))
+    def _should_broadcast_ticker(
+        self,
+        symbol: str,
+        ticker: dict[str, Any],
+        *,
+        snapshot: Optional[TickerDomainSnapshot] = None,
+    ) -> bool:
+        snapshot_provider = snapshot.metadata.provider if snapshot is not None else None
+        domain_key = self._domain_key(
+            "ticker",
+            symbol,
+            provider=snapshot_provider or ticker.get("provider"),
+        )
         signature = self._ticker_signature(ticker)
         now_ms = self._broadcast_state.now_ms()
         if not self._broadcast_state.should_broadcast_domain(
@@ -678,6 +1021,149 @@ class SpotMarketGateway:
             return False
         self._broadcast_state.remember_broadcast(domain_key, signature, now_ms=now_ms)
         return True
+
+    def get_ticker_domain_snapshot(self, symbol: str) -> Optional[TickerDomainSnapshot]:
+        return self._ticker_domain_snapshots.get(normalize_spot_ws_symbol(symbol))
+
+    def record_ticker_market_domain_snapshot(
+        self,
+        *,
+        snapshot: MarketDomainSnapshot,
+        context: DomainSnapshotContext,
+        emitted_at_ms: Optional[int] = None,
+    ) -> TickerDomainSnapshot:
+        if snapshot.domain != "ticker":
+            raise ValueError("market domain snapshot must use the ticker domain")
+        if context.domain != DomainName.TICKER:
+            raise ValueError("ticker snapshot context must use the ticker domain")
+        normalized_symbol = normalize_spot_ws_symbol(snapshot.symbol)
+        if normalized_symbol != normalize_spot_ws_symbol(context.symbol):
+            raise ValueError("ticker snapshot symbol does not match context")
+        if snapshot.data is not None and not isinstance(snapshot.data, Mapping):
+            raise ValueError("ticker market domain snapshot data must be a mapping")
+
+        resolved_context = replace(
+            context,
+            symbol=normalized_symbol,
+            provider=snapshot.provider,
+            cache_updated_at_ms=(
+                context.cache_updated_at_ms
+                if context.cache_updated_at_ms is not None
+                else snapshot.updated_at
+            ),
+        )
+        ticker = dict(snapshot.data) if isinstance(snapshot.data, Mapping) else None
+        return self.record_ticker_domain_snapshot(
+            ticker=ticker,
+            context=resolved_context,
+            emitted_at_ms=emitted_at_ms,
+        )
+
+    def record_ticker_domain_snapshot(
+        self,
+        *,
+        ticker: Optional[Mapping[str, Any]],
+        context: DomainSnapshotContext,
+        emitted_at_ms: Optional[int] = None,
+    ) -> TickerDomainSnapshot:
+        if context.domain != DomainName.TICKER:
+            raise ValueError("ticker snapshot context must use the ticker domain")
+        current_ms = int(emitted_at_ms if emitted_at_ms is not None else time.time() * 1000)
+        resolution = resolve_domain_snapshot_freshness(
+            context,
+            now_ms=current_ms,
+        )
+        return self._record_ticker_domain_snapshot(
+            context.symbol,
+            ticker,
+            transport=context.transport,
+            cache_origin=context.cache_origin,
+            provider=context.provider,
+            provider_symbol=context.provider_symbol,
+            source=context.source,
+            freshness=resolution.freshness,
+            fallback_reason=context.fallback_reason,
+            provider_event_time_ms=context.provider_event_time_ms,
+            received_at_ms=context.received_at_ms,
+            cache_updated_at_ms=context.cache_updated_at_ms,
+            age_ms=resolution.age_ms,
+            ttl_ms=resolution.ttl_ms,
+            freshness_basis=resolution.freshness_basis,
+            provider_generation=context.provider_generation,
+            emitted_at_ms=current_ms,
+        )
+
+    def _record_ticker_domain_snapshot(
+        self,
+        symbol: str,
+        ticker: Optional[Mapping[str, Any]],
+        *,
+        transport: DomainTransport = DomainTransport.PROVIDER_WS,
+        cache_origin: DomainCacheOrigin = DomainCacheOrigin.PROVIDER_MEMORY,
+        provider: Optional[str] = None,
+        provider_symbol: Optional[str] = None,
+        source: Optional[DomainSource] = None,
+        freshness: Optional[DomainFreshness] = None,
+        fallback_reason: Optional[DomainFallbackReason] = None,
+        provider_event_time_ms: Optional[int] = None,
+        received_at_ms: Optional[int] = None,
+        cache_updated_at_ms: Optional[int] = None,
+        age_ms: Optional[int] = None,
+        ttl_ms: Optional[int] = None,
+        freshness_basis: Optional[DomainFreshnessBasis] = None,
+        provider_generation: Optional[int] = None,
+        emitted_at_ms: Optional[int] = None,
+    ) -> TickerDomainSnapshot:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        current_ms = int(emitted_at_ms if emitted_at_ms is not None else time.time() * 1000)
+
+        resolved_cache_updated_at_ms = cache_updated_at_ms
+        if (
+            resolved_cache_updated_at_ms is None
+            and ticker is not None
+            and cache_origin != DomainCacheOrigin.NONE
+        ):
+            try:
+                resolved_cache_updated_at_ms = int(ticker.get("updated_at_ms"))
+            except (TypeError, ValueError):
+                resolved_cache_updated_at_ms = None
+
+        resolved_age_ms = age_ms
+        if resolved_age_ms is None and resolved_cache_updated_at_ms is not None:
+            resolved_age_ms = max(0, current_ms - resolved_cache_updated_at_ms)
+
+        resolved_ttl_ms = ttl_ms
+        if resolved_ttl_ms is None and transport == DomainTransport.PROVIDER_WS:
+            resolved_ttl_ms = int(
+                getattr(settings, "SPOT_PROVIDER_WS_TICKER_MAX_AGE_MS", 1500) or 1500
+            )
+
+        resolved_freshness_basis = freshness_basis or (
+            DomainFreshnessBasis.RECEIVED_AT
+            if ticker is not None
+            else DomainFreshnessBasis.NOT_APPLICABLE
+        )
+        snapshot = map_ticker_domain_snapshot(
+            symbol=normalized_symbol,
+            ticker=ticker,
+            transport=transport,
+            cache_origin=cache_origin,
+            provider=provider,
+            provider_symbol=provider_symbol,
+            source=source,
+            freshness=freshness,
+            fallback_reason=fallback_reason,
+            provider_event_time_ms=provider_event_time_ms,
+            received_at_ms=received_at_ms,
+            cache_updated_at_ms=resolved_cache_updated_at_ms,
+            age_ms=resolved_age_ms,
+            ttl_ms=resolved_ttl_ms,
+            freshness_basis=resolved_freshness_basis,
+            provider_generation=provider_generation,
+            emitted_at_ms=current_ms,
+        )
+        self._ticker_domain_snapshots[normalized_symbol] = snapshot
+        return snapshot
 
     def _ticker_signature(self, ticker: dict[str, Any]) -> str:
         keys = (
@@ -692,10 +1178,21 @@ class SpotMarketGateway:
         )
         return repr(tuple(ticker.get(key) for key in keys))
 
-    def _new_trades_for_broadcast(self, symbol: str, trades: Optional[TradesResponse]) -> list[Any]:
+    def _new_trades_for_broadcast(
+        self,
+        symbol: str,
+        trades: Optional[TradesResponse],
+        *,
+        snapshot: Optional[TradesDomainSnapshot] = None,
+    ) -> list[Any]:
         if trades is None or not getattr(trades, "trades", None):
             return []
-        domain_key = self._domain_key("trades", symbol, provider=getattr(trades, "provider", None))
+        snapshot_provider = snapshot.metadata.provider if snapshot is not None else None
+        domain_key = self._domain_key(
+            "trades",
+            symbol,
+            provider=snapshot_provider or getattr(trades, "provider", None),
+        )
         now_ms = self._broadcast_state.now_ms()
         if not self._broadcast_state.should_broadcast_domain(
             domain_key,
@@ -738,6 +1235,152 @@ class SpotMarketGateway:
             self._broadcast_state.remember_trade_signatures(domain_key, new_signatures, max_seen=200)
             self._broadcast_state.remember_broadcast(domain_key, repr(new_signatures), now_ms=now_ms)
         return new_items
+
+    def get_trades_domain_snapshot(self, symbol: str) -> Optional[TradesDomainSnapshot]:
+        return self._trades_domain_snapshots.get(normalize_spot_ws_symbol(symbol))
+
+    def record_trades_market_domain_snapshot(
+        self,
+        *,
+        snapshot: MarketDomainSnapshot,
+        context: DomainSnapshotContext,
+        emitted_at_ms: Optional[int] = None,
+    ) -> TradesDomainSnapshot:
+        if snapshot.domain != "trades":
+            raise ValueError("market domain snapshot must use the trades domain")
+        if context.domain != DomainName.TRADES:
+            raise ValueError("trades snapshot context must use the trades domain")
+        normalized_symbol = normalize_spot_ws_symbol(snapshot.symbol)
+        if normalized_symbol != normalize_spot_ws_symbol(context.symbol):
+            raise ValueError("trades snapshot symbol does not match context")
+        if snapshot.data is not None and not isinstance(snapshot.data, Mapping):
+            raise ValueError("trades market domain snapshot data must be a mapping")
+
+        resolved_context = replace(
+            context,
+            symbol=normalized_symbol,
+            provider=snapshot.provider,
+            cache_updated_at_ms=(
+                context.cache_updated_at_ms
+                if context.cache_updated_at_ms is not None
+                else snapshot.updated_at
+            ),
+        )
+        trades = dict(snapshot.data) if isinstance(snapshot.data, Mapping) else None
+        return self.record_trades_domain_snapshot(
+            trades=trades,
+            context=resolved_context,
+            emitted_at_ms=emitted_at_ms,
+        )
+
+    def record_trades_domain_snapshot(
+        self,
+        *,
+        trades: Any,
+        context: DomainSnapshotContext,
+        emitted_at_ms: Optional[int] = None,
+    ) -> TradesDomainSnapshot:
+        if context.domain != DomainName.TRADES:
+            raise ValueError("trades snapshot context must use the trades domain")
+        current_ms = int(emitted_at_ms if emitted_at_ms is not None else time.time() * 1000)
+        resolution = resolve_domain_snapshot_freshness(
+            context,
+            now_ms=current_ms,
+        )
+        return self._record_trades_domain_snapshot(
+            symbol=context.symbol,
+            trades=trades,
+            transport=context.transport,
+            cache_origin=context.cache_origin,
+            provider=context.provider,
+            provider_symbol=context.provider_symbol,
+            source=context.source,
+            freshness=resolution.freshness,
+            fallback_reason=context.fallback_reason,
+            provider_event_time_ms=context.provider_event_time_ms,
+            received_at_ms=context.received_at_ms,
+            cache_updated_at_ms=context.cache_updated_at_ms,
+            age_ms=resolution.age_ms,
+            ttl_ms=resolution.ttl_ms,
+            stale=resolution.stale,
+            freshness_basis=resolution.freshness_basis,
+            emitted_at_ms=current_ms,
+        )
+
+    def _record_trades_domain_snapshot(
+        self,
+        *,
+        symbol: str,
+        trades: Any,
+        transport: DomainTransport = DomainTransport.PROVIDER_WS,
+        cache_origin: DomainCacheOrigin = DomainCacheOrigin.PROVIDER_MEMORY,
+        provider: Optional[str] = None,
+        provider_symbol: Optional[str] = None,
+        source: Optional[DomainSource] = None,
+        freshness: Optional[DomainFreshness] = None,
+        fallback_reason: Optional[DomainFallbackReason] = None,
+        provider_event_time_ms: Optional[int] = None,
+        received_at_ms: Optional[int] = None,
+        cache_updated_at_ms: Optional[int] = None,
+        age_ms: Optional[int] = None,
+        ttl_ms: Optional[int] = None,
+        stale: Optional[bool] = None,
+        freshness_basis: Optional[DomainFreshnessBasis] = None,
+        emitted_at_ms: Optional[int] = None,
+    ) -> TradesDomainSnapshot:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        current_ms = int(emitted_at_ms if emitted_at_ms is not None else time.time() * 1000)
+
+        resolved_cache_updated_at_ms = cache_updated_at_ms
+        if (
+            resolved_cache_updated_at_ms is None
+            and trades is not None
+            and cache_origin != DomainCacheOrigin.NONE
+        ):
+            raw_cache_updated_at_ms = (
+                trades.get("updated_at_ms")
+                if isinstance(trades, Mapping)
+                else getattr(trades, "updated_at_ms", None)
+            )
+            try:
+                resolved_cache_updated_at_ms = int(raw_cache_updated_at_ms)
+            except (TypeError, ValueError):
+                resolved_cache_updated_at_ms = None
+
+        resolved_age_ms = age_ms
+        if resolved_age_ms is None and resolved_cache_updated_at_ms is not None:
+            resolved_age_ms = max(0, current_ms - resolved_cache_updated_at_ms)
+        resolved_ttl_ms = ttl_ms
+        if resolved_ttl_ms is None and transport == DomainTransport.PROVIDER_WS:
+            resolved_ttl_ms = int(
+                getattr(settings, "SPOT_PROVIDER_WS_TRADES_MAX_AGE_MS", 1500) or 1500
+            )
+        resolved_freshness_basis = freshness_basis or (
+            DomainFreshnessBasis.RECEIVED_AT
+            if trades is not None
+            else DomainFreshnessBasis.NOT_APPLICABLE
+        )
+        snapshot = map_trades_domain_snapshot(
+            symbol=normalized_symbol,
+            trades=trades,
+            transport=transport,
+            cache_origin=cache_origin,
+            provider=provider,
+            provider_symbol=provider_symbol,
+            source=source,
+            freshness=freshness,
+            fallback_reason=fallback_reason,
+            provider_event_time_ms=provider_event_time_ms,
+            received_at_ms=received_at_ms,
+            cache_updated_at_ms=resolved_cache_updated_at_ms,
+            age_ms=resolved_age_ms,
+            ttl_ms=resolved_ttl_ms,
+            stale=stale,
+            freshness_basis=resolved_freshness_basis,
+            emitted_at_ms=current_ms,
+        )
+        self._trades_domain_snapshots[normalized_symbol] = snapshot
+        return snapshot
 
     def _trade_signature(
         self,
@@ -834,14 +1477,17 @@ class SpotMarketGateway:
         self._ensured_kline_intervals.setdefault(normalized_symbol, set()).add(normalized_interval)
 
     def _clear_kline_interval_state(self, symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        normalized_interval = self._normalize_interval(interval)
         domain_key = self._domain_key(
             "kline",
-            symbol,
-            provider=provider or self._symbol_providers.get(normalize_spot_ws_symbol(symbol)) or PROVIDER_BITGET_SPOT,
-            interval=interval,
+            normalized_symbol,
+            provider=provider or self._symbol_providers.get(normalized_symbol) or PROVIDER_BITGET_SPOT,
+            interval=normalized_interval,
         )
         self._broadcast_state.clear_domain_key(domain_key)
         self._kline_revision_high_water.pop(domain_key, None)
+        self._kline_domain_snapshots.pop((normalized_symbol, normalized_interval), None)
 
     def _clear_kline_revision_symbol(self, symbol: str) -> None:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
@@ -853,6 +1499,12 @@ class SpotMarketGateway:
             if key.symbol == normalized_symbol
         ]:
             self._kline_revision_high_water.pop(key, None)
+        for key in [
+            key
+            for key in self._kline_domain_snapshots
+            if key[0] == normalized_symbol
+        ]:
+            self._kline_domain_snapshots.pop(key, None)
 
     def _latest_kline_for_broadcast(
         self,
@@ -877,12 +1529,14 @@ class SpotMarketGateway:
         kline: dict[str, Any],
         *,
         provider: Any = None,
+        snapshot: Optional[KlineDomainSnapshot] = None,
     ) -> bool:
         normalized_interval = self._normalize_interval(interval)
+        snapshot_provider = snapshot.metadata.provider if snapshot is not None else None
         domain_key = self._domain_key(
             "kline",
             symbol,
-            provider=provider or kline.get("provider"),
+            provider=snapshot_provider or provider or kline.get("provider"),
             interval=normalized_interval,
         )
         signature = self._kline_signature(symbol, normalized_interval, kline)
@@ -906,6 +1560,237 @@ class SpotMarketGateway:
         if revision_identity is not None:
             self._kline_revision_high_water[domain_key] = revision_identity
         return True
+
+    def get_kline_domain_snapshot(
+        self,
+        symbol: str,
+        interval: str,
+    ) -> Optional[KlineDomainSnapshot]:
+        return self._kline_domain_snapshots.get(
+            (normalize_spot_ws_symbol(symbol), self._normalize_interval(interval))
+        )
+
+    def record_kline_market_domain_snapshot(
+        self,
+        *,
+        snapshot: MarketDomainSnapshot,
+        kline: Mapping[str, Any],
+        context: DomainSnapshotContext,
+        emitted_at_ms: Optional[int] = None,
+    ) -> KlineDomainSnapshot:
+        if snapshot.domain != "kline":
+            raise ValueError("market domain snapshot must use the kline domain")
+        if context.domain != DomainName.KLINE:
+            raise ValueError("kline snapshot context must use the kline domain")
+        if not context.interval:
+            raise ValueError("kline snapshot context requires an interval")
+        normalized_symbol = normalize_spot_ws_symbol(snapshot.symbol)
+        if normalized_symbol != normalize_spot_ws_symbol(context.symbol):
+            raise ValueError("kline snapshot symbol does not match context")
+        if not isinstance(snapshot.data, (list, tuple)):
+            raise ValueError("kline market domain snapshot data must be a sequence")
+
+        resolved_context = replace(
+            context,
+            symbol=normalized_symbol,
+            provider=snapshot.provider or context.provider,
+            cache_updated_at_ms=(
+                context.cache_updated_at_ms
+                if context.cache_updated_at_ms is not None
+                else snapshot.updated_at
+                if context.transport != DomainTransport.DB_READ
+                else None
+            ),
+            db_updated_at_ms=(
+                context.db_updated_at_ms
+                if context.db_updated_at_ms is not None
+                else snapshot.updated_at
+                if context.transport == DomainTransport.DB_READ
+                else None
+            ),
+        )
+        current_ms = int(emitted_at_ms if emitted_at_ms is not None else time.time() * 1000)
+        resolution = resolve_domain_snapshot_freshness(
+            resolved_context,
+            now_ms=current_ms,
+        )
+        current_items = [
+            dict(item)
+            for item in snapshot.data
+            if isinstance(item, Mapping)
+        ]
+        latest_item = (
+            max(current_items, key=lambda item: int(item.get("open_time") or 0))
+            if current_items
+            else {}
+        )
+        resolved_cache_updated_at_ms = (
+            resolved_context.db_updated_at_ms
+            if resolved_context.transport == DomainTransport.DB_READ
+            else resolved_context.cache_updated_at_ms
+        )
+        return self._record_kline_domain_snapshot(
+            symbol=resolved_context.symbol,
+            interval=resolved_context.interval,
+            kline=dict(kline),
+            transport=resolved_context.transport,
+            cache_origin=resolved_context.cache_origin,
+            provider=resolved_context.provider,
+            provider_symbol=resolved_context.provider_symbol,
+            source=resolved_context.source,
+            freshness=resolution.freshness,
+            fallback_reason=resolved_context.fallback_reason,
+            provider_event_time_ms=resolved_context.provider_event_time_ms,
+            received_at_ms=resolved_context.received_at_ms,
+            cache_updated_at_ms=resolved_cache_updated_at_ms,
+            age_ms=resolution.age_ms,
+            ttl_ms=resolution.ttl_ms,
+            stale=resolution.stale,
+            provider_generation=resolved_context.provider_generation,
+            revision_epoch=latest_item.get("revision_epoch"),
+            revision_sequence=latest_item.get("revision_seq"),
+            is_closed=latest_item.get("is_closed"),
+            close_state_source=latest_item.get("close_state_source"),
+            freshness_basis=resolution.freshness_basis,
+            emitted_at_ms=current_ms,
+        )
+
+    def record_kline_domain_snapshot(
+        self,
+        *,
+        kline: Any,
+        context: DomainSnapshotContext,
+        emitted_at_ms: Optional[int] = None,
+    ) -> KlineDomainSnapshot:
+        if context.domain != DomainName.KLINE:
+            raise ValueError("kline snapshot context must use the kline domain")
+        if not context.interval:
+            raise ValueError("kline snapshot context requires an interval")
+        current_ms = int(emitted_at_ms if emitted_at_ms is not None else time.time() * 1000)
+        resolution = resolve_domain_snapshot_freshness(
+            context,
+            now_ms=current_ms,
+        )
+        resolved_cache_updated_at_ms = (
+            context.db_updated_at_ms
+            if context.transport == DomainTransport.DB_READ
+            else context.cache_updated_at_ms
+        )
+        return self._record_kline_domain_snapshot(
+            symbol=context.symbol,
+            interval=context.interval,
+            kline=kline,
+            transport=context.transport,
+            cache_origin=context.cache_origin,
+            provider=context.provider,
+            provider_symbol=context.provider_symbol,
+            source=context.source,
+            freshness=resolution.freshness,
+            fallback_reason=context.fallback_reason,
+            provider_event_time_ms=context.provider_event_time_ms,
+            received_at_ms=context.received_at_ms,
+            cache_updated_at_ms=resolved_cache_updated_at_ms,
+            age_ms=resolution.age_ms,
+            ttl_ms=resolution.ttl_ms,
+            stale=resolution.stale,
+            provider_generation=context.provider_generation,
+            freshness_basis=resolution.freshness_basis,
+            emitted_at_ms=current_ms,
+        )
+
+    def _record_kline_domain_snapshot(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        kline: Any,
+        transport: DomainTransport = DomainTransport.PROVIDER_WS,
+        cache_origin: DomainCacheOrigin = DomainCacheOrigin.PROVIDER_MEMORY,
+        provider: Optional[str] = None,
+        provider_symbol: Optional[str] = None,
+        source: Optional[DomainSource] = None,
+        freshness: Optional[DomainFreshness] = None,
+        fallback_reason: Optional[DomainFallbackReason] = None,
+        provider_event_time_ms: Optional[int] = None,
+        received_at_ms: Optional[int] = None,
+        cache_updated_at_ms: Optional[int] = None,
+        age_ms: Optional[int] = None,
+        ttl_ms: Optional[int] = None,
+        stale: Optional[bool] = None,
+        provider_generation: Optional[int] = None,
+        revision_epoch: Optional[int] = None,
+        revision_sequence: Optional[int] = None,
+        is_closed: Optional[bool] = None,
+        close_state_source: Optional[str] = None,
+        history_terminal: Optional[bool] = None,
+        history_incomplete: Optional[bool] = None,
+        terminal_reason: Optional[str] = None,
+        earliest_available_time: Optional[int] = None,
+        coverage_complete: Optional[bool] = None,
+        continuity_valid: Optional[bool] = None,
+        freshness_basis: Optional[DomainFreshnessBasis] = None,
+        emitted_at_ms: Optional[int] = None,
+    ) -> KlineDomainSnapshot:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        normalized_interval = self._normalize_interval(interval)
+        current_ms = int(emitted_at_ms if emitted_at_ms is not None else time.time() * 1000)
+
+        resolved_cache_updated_at_ms = cache_updated_at_ms
+        if (
+            resolved_cache_updated_at_ms is None
+            and isinstance(kline, Mapping)
+            and cache_origin != DomainCacheOrigin.NONE
+        ):
+            try:
+                resolved_cache_updated_at_ms = int(kline.get("updated_at_ms"))
+            except (TypeError, ValueError):
+                resolved_cache_updated_at_ms = None
+        resolved_age_ms = age_ms
+        if resolved_age_ms is None and resolved_cache_updated_at_ms is not None:
+            resolved_age_ms = max(0, current_ms - resolved_cache_updated_at_ms)
+        resolved_ttl_ms = ttl_ms
+        if resolved_ttl_ms is None and transport == DomainTransport.PROVIDER_WS:
+            resolved_ttl_ms = int(
+                getattr(settings, "SPOT_PROVIDER_WS_KLINE_MAX_AGE_MS", 1500) or 1500
+            )
+        resolved_freshness_basis = freshness_basis or (
+            DomainFreshnessBasis.RECEIVED_AT
+            if kline is not None
+            else DomainFreshnessBasis.NOT_APPLICABLE
+        )
+        snapshot = map_kline_domain_snapshot(
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+            kline=kline,
+            transport=transport,
+            cache_origin=cache_origin,
+            provider=provider,
+            provider_symbol=provider_symbol,
+            source=source,
+            freshness=freshness,
+            fallback_reason=fallback_reason,
+            provider_event_time_ms=provider_event_time_ms,
+            received_at_ms=received_at_ms,
+            cache_updated_at_ms=resolved_cache_updated_at_ms,
+            age_ms=resolved_age_ms,
+            ttl_ms=resolved_ttl_ms,
+            stale=stale,
+            provider_generation=provider_generation,
+            revision_epoch=revision_epoch,
+            revision_sequence=revision_sequence,
+            is_closed=is_closed,
+            close_state_source=close_state_source,
+            history_terminal=history_terminal,
+            history_incomplete=history_incomplete,
+            terminal_reason=terminal_reason,
+            earliest_available_time=earliest_available_time,
+            coverage_complete=coverage_complete,
+            continuity_valid=continuity_valid,
+            freshness_basis=resolved_freshness_basis,
+            emitted_at_ms=current_ms,
+        )
+        self._kline_domain_snapshots[(normalized_symbol, normalized_interval)] = snapshot
+        return snapshot
 
     def _kline_signature(self, symbol: str, interval: str, kline: dict[str, Any]) -> str:
         keys = (
