@@ -55,9 +55,111 @@ describe('SpotTradingViewPriceOverlayController', () => {
       disableUndo: true,
       showInObjectsTree: false,
       zOrder: 'top',
+      text: '',
+      overrides: {
+        'linetoolhorzline.linecolor': '#00c087',
+        'linetoolhorzline.textcolor': '#00c087',
+        'linetoolhorzline.linewidth': 1,
+        'linetoolhorzline.linestyle': 2,
+        'linetoolhorzline.showPrice': true,
+      },
     });
     expect(points.at(-1)).toEqual([{ time: 2, price: 102 }]);
+    expect(properties.at(-1)).toMatchObject({
+      text: '',
+      linecolor: '#00c087',
+      textcolor: '#00c087',
+      linestyle: 2,
+      showPrice: true,
+    });
     expect(JSON.stringify({ points, properties })).not.toMatch(/open|high|low|close|volume/i);
+  });
+
+  it('uses price direction colors and keeps the previous color when price is unchanged', async () => {
+    const properties: Array<Record<string, unknown>> = [];
+    const chart: SpotTradingViewOverlayChart = {
+      createShape: async () => 'overlay-1',
+      getShapeById: () => ({
+        getPoints: () => [{ time: 2, price: 101 }],
+        setPoints: jest.fn(),
+        setProperties: (next) => properties.push(next),
+      }),
+      removeEntity: jest.fn(),
+    };
+    const controller = new SpotTradingViewPriceOverlayController(chart);
+
+    controller.update(displayPrice({ price: '101' }));
+    await flushPromises();
+    controller.update(displayPrice({ price: '100', eventTimeMs: 3_000 }));
+    controller.update(displayPrice({ price: '100', eventTimeMs: 4_000 }));
+    controller.update(displayPrice({ price: '102', eventTimeMs: 5_000 }));
+
+    expect(properties.map((item) => item.linecolor)).toEqual([
+      '#f6465d',
+      '#f6465d',
+      '#00c087',
+    ]);
+  });
+
+  it('creates a ticker fallback with the final exchange color instead of a blue interim state', async () => {
+    const createShape = jest.fn<SpotTradingViewOverlayChart['createShape']>(async () => 'overlay-1');
+    const chart: SpotTradingViewOverlayChart = {
+      createShape,
+      getShapeById: () => ({ setPoints: jest.fn() }),
+      removeEntity: jest.fn(),
+    };
+    const controller = new SpotTradingViewPriceOverlayController(chart);
+
+    controller.update(displayPrice({
+      sourceDomain: 'ticker',
+      isRealTrade: false,
+    }));
+    await flushPromises();
+
+    expect(createShape.mock.calls[0][1]).toMatchObject({
+      text: '',
+      overrides: {
+        'linetoolhorzline.linecolor': '#00c087',
+        'linetoolhorzline.textcolor': '#00c087',
+        'linetoolhorzline.linestyle': 2,
+        'linetoolhorzline.showPrice': true,
+      },
+    });
+  });
+
+  it('cleans the old symbol entity before creating the new symbol overlay', async () => {
+    let createCount = 0;
+    const activeEntities = new Set<SpotTradingViewOverlayEntityId>();
+    const removeEntity = jest.fn<SpotTradingViewOverlayChart['removeEntity']>((entityId) => {
+      activeEntities.delete(entityId);
+    });
+    const createShape = jest.fn<SpotTradingViewOverlayChart['createShape']>(async () => {
+      const entityId = `overlay-${++createCount}`;
+      activeEntities.add(entityId);
+      return entityId;
+    });
+    const chart: SpotTradingViewOverlayChart = {
+      createShape,
+      getShapeById: () => ({ getPoints: () => [{ time: 2, price: 101 }], setPoints: jest.fn() }),
+      removeEntity,
+    };
+    const controller = new SpotTradingViewPriceOverlayController(chart);
+
+    controller.update(displayPrice({ symbol: 'BTCUSDT', price: '101' }));
+    await flushPromises();
+    controller.update(displayPrice({ symbol: 'ETHUSDT', price: '99', eventTimeMs: 3_000 }));
+    await flushPromises();
+
+    expect(removeEntity).toHaveBeenCalledWith('overlay-1', { disableUndo: true });
+    expect(createShape).toHaveBeenCalledTimes(2);
+    expect(activeEntities).toEqual(new Set(['overlay-2']));
+    expect(createShape.mock.calls[1][1]).toMatchObject({
+      text: '',
+      overrides: {
+        'linetoolhorzline.linecolor': '#00c087',
+        'linetoolhorzline.linestyle': 2,
+      },
+    });
   });
 
   it('does not duplicate an overlay while creation is in flight', async () => {
