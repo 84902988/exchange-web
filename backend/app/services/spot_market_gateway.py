@@ -151,6 +151,12 @@ class SpotMarketGateway:
         self._last_broadcast_at: dict[str, float] = {}
         self._last_broadcast_type: dict[str, str] = {}
         self._idle_stop_count = 0
+        self._provider_switch_count = 0
+        self._provider_switch_success_count = 0
+        self._provider_switch_failed_count = 0
+        self._provider_switch_total_duration_ms = 0.0
+        self._provider_switch_last_duration_ms: Optional[float] = None
+        self._provider_switch_last_at: Optional[float] = None
 
     async def ensure_symbol(self, symbol: str, *, interval: str = "1m") -> None:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
@@ -252,6 +258,18 @@ class SpotMarketGateway:
             last_broadcast_at = dict(self._last_broadcast_at)
             last_broadcast_type = dict(self._last_broadcast_type)
             idle_stop_count = self._idle_stop_count
+            provider_switch = {
+                "count": self._provider_switch_count,
+                "success": self._provider_switch_success_count,
+                "failed": self._provider_switch_failed_count,
+                "total_duration_ms": round(self._provider_switch_total_duration_ms, 3),
+                "average_duration_ms": round(
+                    self._provider_switch_total_duration_ms / self._provider_switch_count,
+                    3,
+                ) if self._provider_switch_count else 0.0,
+                "last_duration_ms": self._provider_switch_last_duration_ms,
+                "last_at": self._provider_switch_last_at,
+            }
 
         subscriber_counts = {}
         for symbol in active_symbols:
@@ -260,8 +278,21 @@ class SpotMarketGateway:
             except Exception:
                 subscriber_counts[symbol] = None
 
+        active_refresh_loop_count = sum(1 for active in task_active.values() if active)
+        active_interval_count = sum(len(intervals) for intervals in ensured_kline_intervals.values())
+        total_subscriber_count = sum(
+            int(count) for count in subscriber_counts.values() if count is not None
+        )
+        broadcast_total = sum(int(count) for count in broadcast_counters.values())
+        last_broadcast_time = max(last_broadcast_at.values(), default=None)
+
         return {
             "active_symbols": active_symbols,
+            "active_symbol_count": len(active_symbols),
+            "active_intervals": ensured_kline_intervals,
+            "active_interval_count": active_interval_count,
+            "active_refresh_loop_count": active_refresh_loop_count,
+            "subscriber_count": total_subscriber_count,
             "symbols": {
                 symbol: {
                     "gateway_loop_active": bool(task_active.get(symbol)),
@@ -277,6 +308,17 @@ class SpotMarketGateway:
                 for symbol in active_symbols
             },
             "broadcast_counters": broadcast_counters,
+            "broadcast": {
+                "total_count": broadcast_total,
+                "per_domain_count": broadcast_counters,
+                "last_broadcast_at": last_broadcast_time,
+            },
+            "provider_switch": provider_switch,
+            "latency": {
+                "cache_to_gateway_ms": None,
+                "available": False,
+                "reason": "provider cache read timestamps are not captured at the gateway boundary",
+            },
             "idle_stop_count": idle_stop_count,
         }
 
@@ -742,6 +784,8 @@ class SpotMarketGateway:
         if pending is None:
             return
         previous_provider, provider_code = pending
+        switch_started_at = time.perf_counter()
+        self._provider_switch_count += 1
         try:
             if self._release_depth_accepts_provider:
                 await asyncio.to_thread(self._release_depth, symbol, provider=previous_provider)
@@ -766,7 +810,9 @@ class SpotMarketGateway:
                 self._ensure_kline_interval(symbol, interval, provider=provider_code)
             self._broadcast_state.clear_symbol(symbol)
             self._clear_kline_revision_symbol(symbol)
+            self._provider_switch_success_count += 1
         except Exception:
+            self._provider_switch_failed_count += 1
             if self._depth_authority.active_provider(symbol) == provider_code:
                 self._pending_provider_switches[symbol] = (previous_provider, provider_code)
             logger.warning(
@@ -776,6 +822,11 @@ class SpotMarketGateway:
                 provider_code,
                 exc_info=True,
             )
+        finally:
+            duration_ms = max(0.0, (time.perf_counter() - switch_started_at) * 1000)
+            self._provider_switch_total_duration_ms += duration_ms
+            self._provider_switch_last_duration_ms = round(duration_ms, 3)
+            self._provider_switch_last_at = time.time()
 
     async def _release_provider_symbol(self, symbol: str, provider_code: str) -> None:
         if self._release_depth_accepts_provider:

@@ -12,6 +12,27 @@ from app.services import spot_market_domain_cache as domain_cache
 from app.services import spot_market_provider_ws as provider_ws
 
 
+class _MetricsThread:
+    def __init__(self, *, remains_alive_after_join: bool = False) -> None:
+        self.alive = False
+        self.remains_alive_after_join = remains_alive_after_join
+
+    def start(self) -> None:
+        self.alive = True
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def join(self, timeout: float | None = None) -> None:
+        if not self.remains_alive_after_join:
+            self.alive = False
+
+
+class _ClosedMetricsLoop:
+    def is_closed(self) -> bool:
+        return True
+
+
 def _activate_provider_trades(
     service: provider_ws.SpotMarketProviderWsService,
     symbol: str = "BTCUSDT",
@@ -2253,6 +2274,103 @@ def test_depth_response_exposes_record_event_and_receive_times_without_changing_
     assert response.freshness is None
     assert [(item.price, item.amount) for item in response.bids] == [("100", "1")]
     assert [(item.price, item.amount) for item in response.asks] == [("101", "2")]
+
+
+def test_provider_ws_metrics_snapshot_reports_zero_without_resources() -> None:
+    snapshot = provider_ws.SpotMarketProviderWsService().get_metrics_snapshot()
+
+    assert snapshot["active_connections"]["count"] == 0
+    assert snapshot["active_threads"] == {
+        "running_count": 0,
+        "stopping_count": 0,
+        "running": [],
+        "stopping": [],
+    }
+    assert snapshot["active_tasks"]["websocket_task_count"] == 0
+    assert snapshot["generation"]["retired_generation_count"] == 0
+    assert snapshot["lifecycle"] == {"created": 0, "released": 0, "release_timeout": 0}
+    assert snapshot["cache"]["depth"]["key_count"] == 0
+    assert snapshot["cache"]["kline"]["bucket_count"] == 0
+
+
+def test_provider_ws_metrics_track_connection_generation_release_and_cache_state() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    provider = provider_ws.PROVIDER_BITGET_SPOT
+    key = (provider, "BTCUSDT")
+    first_thread = _MetricsThread()
+
+    with patch.object(provider_ws.threading, "Thread", return_value=first_thread):
+        service._ensure_depth_symbol("BTCUSDT", provider=provider)
+    with service._lock:
+        service._depth_connections[key] = (_ClosedMetricsLoop(), object())
+
+    service.set_depth_cache_for_tests(
+        {
+            "provider": provider,
+            "symbol": "BTCUSDT",
+            "updated_at_ms": provider_ws._now_ms(),
+            "bids": [{"price": "100", "amount": "1"}],
+            "asks": [{"price": "101", "amount": "1"}],
+        }
+    )
+    service.set_kline_cache_for_tests(
+        {
+            "provider": provider,
+            "symbol": "BTCUSDT",
+            "interval": "1m",
+            "updated_at_ms": 1,
+            "items": [{"open_time": 1}, {"open_time": 2}],
+        }
+    )
+    service._remember_provider_task_reconnect("depth", provider, "BTCUSDT")
+
+    active = service.get_metrics_snapshot()
+    assert active["active_connections"]["count"] == 1
+    assert active["active_connections"]["by_domain"] == {"depth": 1}
+    assert active["active_threads"]["running_count"] == 1
+    assert active["active_tasks"]["websocket_task_count"] == 1
+    assert active["generation"]["records"] == [
+        {
+            "provider": provider,
+            "domain": "depth",
+            "symbol": "BTCUSDT",
+            "interval": None,
+            "current_generation": 1,
+            "retired_generation_count": 0,
+        }
+    ]
+    assert active["reconnect"]["count"] == 1
+    assert active["reconnect"]["consecutive_failures"] == 1
+    assert active["cache"]["depth"]["fresh_key_count"] == 1
+    assert active["cache"]["depth"]["active_key_count"] == 1
+    assert active["cache"]["kline"]["stale_key_count"] == 1
+    assert active["cache"]["kline"]["bucket_count"] == 2
+
+    service._stop_depth_subscription("BTCUSDT", provider=provider)
+    released = service.get_metrics_snapshot()
+    depth_generation = next(
+        item for item in released["generation"]["records"] if item["domain"] == "depth"
+    )
+    assert depth_generation["current_generation"] == 2
+    assert depth_generation["retired_generation_count"] == 1
+    assert released["lifecycle"] == {"created": 1, "released": 1, "release_timeout": 0}
+    assert released["active_threads"]["running_count"] == 0
+
+
+def test_provider_ws_metrics_count_release_timeout_without_changing_join_timeout() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    provider = provider_ws.PROVIDER_BITGET_SPOT
+    stuck_thread = _MetricsThread(remains_alive_after_join=True)
+
+    with patch.object(provider_ws.threading, "Thread", return_value=stuck_thread):
+        service._ensure_depth_symbol("BTCUSDT", provider=provider)
+    service._stop_depth_subscription("BTCUSDT", provider=provider)
+
+    snapshot = service.get_metrics_snapshot()
+    assert snapshot["lifecycle"]["created"] == 1
+    assert snapshot["lifecycle"]["released"] == 1
+    assert snapshot["lifecycle"]["release_timeout"] == 1
+    assert snapshot["active_threads"]["stopping_count"] == 0
 
 
 if __name__ == "__main__":
