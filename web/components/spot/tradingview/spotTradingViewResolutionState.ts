@@ -101,6 +101,12 @@ export function setSpotToolbarLoadingState(
 ) {
   if (toolbarSlot) {
     toolbarSlot.style.pointerEvents = 'auto';
+    toolbarSlot.removeAttribute('aria-disabled');
+    if ('disabled' in toolbarSlot) {
+      const interactiveSlot = toolbarSlot as HTMLButtonElement;
+      interactiveSlot.disabled = false;
+      interactiveSlot.tabIndex = 0;
+    }
     if (options.loading) {
       toolbarSlot.setAttribute('aria-busy', 'true');
     } else {

@@ -207,6 +207,8 @@ test('destroy cancels the current widget loading timer without settling it', () 
 
 test('toolbar remains interactive while exposing busy and pending state', () => {
   const slot = fakeElement()
+  slot.disabled = true
+  slot.setAttribute('aria-disabled', 'true')
   const button = fakeElement()
   const buttons = new Map([['1M', button]])
 
@@ -216,6 +218,9 @@ test('toolbar remains interactive while exposing busy and pending state', () => 
     { loading: true, pendingKey: '1M' },
   )
   assert.equal(slot.attributes.get('aria-busy'), 'true')
+  assert.equal(slot.attributes.has('aria-disabled'), false)
+  assert.equal(slot.disabled, false)
+  assert.equal(slot.tabIndex, 0)
   assert.equal(slot.style.pointerEvents, 'auto')
   assert.equal(button.attributes.get('data-resolution-pending'), 'true')
   assert.equal(button.attributes.has('aria-disabled'), false)
@@ -228,10 +233,33 @@ test('toolbar remains interactive while exposing busy and pending state', () => 
     { loading: false },
   )
   assert.equal(slot.attributes.has('aria-busy'), false)
+  assert.equal(slot.attributes.has('aria-disabled'), false)
   assert.equal(button.attributes.has('data-resolution-pending'), false)
   assert.equal(button.attributes.has('aria-disabled'), false)
   assert.equal(button.disabled, false)
   assert.equal(button.tabIndex, 0)
+})
+
+test('toolbar restore clears late TradingView disabled state from slot and buttons', () => {
+  const slot = fakeElement()
+  const button = fakeElement()
+  const buttons = new Map([['1m', button]])
+
+  slot.disabled = true
+  slot.setAttribute('aria-disabled', 'true')
+  button.disabled = true
+  button.setAttribute('aria-disabled', 'true')
+
+  setSpotToolbarLoadingState(
+    slot as unknown as HTMLElement,
+    buttons as unknown as Map<string, HTMLButtonElement>,
+    { loading: false },
+  )
+
+  assert.equal(slot.disabled, false)
+  assert.equal(slot.attributes.has('aria-disabled'), false)
+  assert.equal(button.disabled, false)
+  assert.equal(button.attributes.has('aria-disabled'), false)
 })
 
 test('setResolution failure restores toolbar and keeps page highlight on actual resolution', () => {
