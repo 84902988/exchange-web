@@ -70,7 +70,7 @@ export default function AssetOverview({
   };
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-6">
+    <div className="mb-6 grid grid-cols-1 gap-6 tabular-nums md:grid-cols-2 lg:grid-cols-4">
       <div className="bg-[#0e1117] rounded-xl p-5 border border-white/10 hover:border-white/20 transition-all duration-300 shadow-xl hover:shadow-2xl">
         <div className="flex items-center justify-between text-sm text-white/50 mb-2">
           <span>{t('totalAssetsUsdt', 'asset')}</span>
@@ -102,7 +102,7 @@ export default function AssetOverview({
             )}
           </div>
         </div>
-        <div className="text-3xl font-bold text-white">
+        <div className="text-[30px] font-semibold leading-none text-white">
           {isLoading ? '...' : `$${formatNumber(data.total)}`}
         </div>
         <div className="text-xs text-white/50 mt-2">
@@ -112,7 +112,7 @@ export default function AssetOverview({
 
       <div className="bg-[#0e1117] rounded-xl p-5 border border-white/10 hover:border-white/20 transition-all duration-300 shadow-xl hover:shadow-2xl">
         <div className="text-sm text-white/50 mb-2">{t('availableBalanceUsdt', 'asset')}</div>
-        <div className="text-3xl font-bold text-white">
+        <div className="text-[30px] font-semibold leading-none text-white">
           {isLoading ? '...' : `$${formatNumber(data.available)}`}
         </div>
         <div className="text-xs text-white/50 mt-2">
@@ -122,7 +122,7 @@ export default function AssetOverview({
 
       <div className="bg-[#0e1117] rounded-xl p-5 border border-white/10 hover:border-white/20 transition-all duration-300 shadow-xl hover:shadow-2xl">
         <div className="text-sm text-white/50 mb-2">{t('frozenBalanceUsdt', 'asset')}</div>
-        <div className="text-3xl font-bold text-white">
+        <div className="text-[30px] font-semibold leading-none text-white">
           {isLoading ? '...' : `$${formatNumber(data.frozen)}`}
         </div>
         <div className="text-xs text-white/50 mt-2">
@@ -132,7 +132,7 @@ export default function AssetOverview({
 
       <div className="bg-[#0e1117] rounded-xl p-5 border border-white/10 hover:border-white/20 transition-all duration-300 shadow-xl hover:shadow-2xl">
         <div className="text-sm text-white/50 mb-2">{t('todayProfitUsdt', 'asset')}</div>
-        <div className={`text-3xl font-bold ${data.todayProfit && data.todayProfit > 0 ? 'text-green-400' : 'text-red-400'}`}>
+        <div className={`text-[30px] font-semibold leading-none ${data.todayProfit && data.todayProfit > 0 ? 'text-green-400' : 'text-red-400'}`}>
           {isLoading ? '...' : data.todayProfit ? `$${formatNumber(data.todayProfit)}` : '--'}
         </div>
         <div className={`text-xs mt-2 ${data.todayProfitRate && data.todayProfitRate > 0 ? 'text-green-400' : 'text-red-400'}`}>

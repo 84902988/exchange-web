@@ -56,7 +56,7 @@ export default function AffiliateCalculator() {
                 value={userCount}
                 onChange={(event) => setUserCount(event.target.value)}
                 inputMode="numeric"
-                className="mt-2 w-full rounded-2xl border border-white/10 bg-black/35 px-4 py-3 text-sm text-white outline-none placeholder:text-white/25 focus:border-[#f0b90b]/60"
+                className="mt-2 w-full rounded-2xl border border-white/10 bg-black/35 px-4 py-3 text-[14px] font-medium tabular-nums text-white outline-none placeholder:text-white/25 focus:border-[#f0b90b]/60"
               />
             </label>
 
@@ -66,7 +66,7 @@ export default function AffiliateCalculator() {
                 value={dailyFee}
                 onChange={(event) => setDailyFee(event.target.value)}
                 inputMode="decimal"
-                className="mt-2 w-full rounded-2xl border border-white/10 bg-black/35 px-4 py-3 text-sm text-white outline-none placeholder:text-white/25 focus:border-[#f0b90b]/60"
+                className="mt-2 w-full rounded-2xl border border-white/10 bg-black/35 px-4 py-3 text-[14px] font-medium tabular-nums text-white outline-none placeholder:text-white/25 focus:border-[#f0b90b]/60"
               />
             </label>
 
@@ -78,7 +78,7 @@ export default function AffiliateCalculator() {
                     key={item}
                     type="button"
                     onClick={() => setLevel(item)}
-                    className={`rounded-2xl border px-4 py-3 text-sm font-bold transition ${
+                    className={`rounded-2xl border px-4 py-3 text-[14px] font-semibold tabular-nums transition ${
                       level === item
                         ? "border-[#f0b90b]/70 bg-[#f0b90b]/15 text-[#f0b90b]"
                         : "border-white/10 bg-black/25 text-white/75 hover:border-[#f0b90b]/35"
@@ -115,7 +115,7 @@ function ResultCard({
   return (
     <div className={`rounded-[1.35rem] border p-5 ${highlight ? "border-[#f0b90b]/25 bg-[#f0b90b]/12" : "border-white/10 bg-black/25"}`}>
       <div className="text-sm text-white/45">{label}</div>
-      <div className={`mt-3 text-3xl font-black tabular-nums ${highlight ? "text-[#f0b90b]" : "text-white"}`}>
+      <div className={`mt-3 text-[24px] font-semibold tabular-nums ${highlight ? "text-[#f0b90b]" : "text-white"}`}>
         {value}
       </div>
     </div>

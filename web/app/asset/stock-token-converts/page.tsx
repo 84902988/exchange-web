@@ -128,36 +128,36 @@ export default function StockTokenConvertsPage() {
             <div className="overflow-x-auto rounded-xl border border-white/10">
               <table className="min-w-[1040px] divide-y divide-white/10">
                 <thead className="bg-white/[0.03]">
-                  <tr className="text-left text-xs text-white/45">
-                    <th className="whitespace-nowrap px-5 py-4 font-medium">{t("stockTokenConvertRecordId", "asset")}</th>
-                    <th className="whitespace-nowrap px-5 py-4 font-medium">{t("equityCertificate", "asset")}</th>
-                    <th className="whitespace-nowrap px-5 py-4 font-medium">{t("stockTokenConvertArrivalToken", "asset")}</th>
-                    <th className="whitespace-nowrap px-5 py-4 font-medium">{t("stockTokenConvertAmount", "asset")}</th>
-                    <th className="whitespace-nowrap px-5 py-4 font-medium">{t("stockTokenConvertArrivalAmount", "asset")}</th>
-                    <th className="whitespace-nowrap px-5 py-4 font-medium">{t("conversionRate", "asset")}</th>
-                    <th className="whitespace-nowrap px-5 py-4 font-medium">{t("stockTokenConvertStatus", "asset")}</th>
-                    <th className="whitespace-nowrap px-5 py-4 font-medium">{t("stockTokenConvertTime", "asset")}</th>
+                  <tr className="text-left text-[11px] text-white/45">
+                    <th className="whitespace-nowrap px-5 py-3 font-medium">{t("stockTokenConvertRecordId", "asset")}</th>
+                    <th className="whitespace-nowrap px-5 py-3 font-medium">{t("equityCertificate", "asset")}</th>
+                    <th className="whitespace-nowrap px-5 py-3 font-medium">{t("stockTokenConvertArrivalToken", "asset")}</th>
+                    <th className="whitespace-nowrap px-5 py-3 font-medium">{t("stockTokenConvertAmount", "asset")}</th>
+                    <th className="whitespace-nowrap px-5 py-3 font-medium">{t("stockTokenConvertArrivalAmount", "asset")}</th>
+                    <th className="whitespace-nowrap px-5 py-3 font-medium">{t("conversionRate", "asset")}</th>
+                    <th className="whitespace-nowrap px-5 py-3 font-medium">{t("stockTokenConvertStatus", "asset")}</th>
+                    <th className="whitespace-nowrap px-5 py-3 font-medium">{t("stockTokenConvertTime", "asset")}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/10 bg-black/10">
                   {items.map((item) => (
-                    <tr key={item.id} className="text-sm text-white/75">
-                      <td className="whitespace-nowrap px-5 py-4 tabular-nums">{item.id}</td>
-                      <td className="whitespace-nowrap px-5 py-4 font-medium text-white">{item.from_symbol}</td>
-                      <td className="whitespace-nowrap px-5 py-4">{item.to_symbol}</td>
-                      <td className="whitespace-nowrap px-5 py-4 tabular-nums">
+                    <tr key={item.id} className="text-[13px] text-white/75">
+                      <td className="whitespace-nowrap px-5 py-3 font-medium tabular-nums">{item.id}</td>
+                      <td className="whitespace-nowrap px-5 py-3 font-medium text-white">{item.from_symbol}</td>
+                      <td className="whitespace-nowrap px-5 py-3">{item.to_symbol}</td>
+                      <td className="whitespace-nowrap px-5 py-3 font-medium tabular-nums">
                         {formatDisplayAmount(item.from_amount)} {item.from_symbol}
                       </td>
-                      <td className="whitespace-nowrap px-5 py-4 tabular-nums text-emerald-200">
+                      <td className="whitespace-nowrap px-5 py-3 font-medium tabular-nums text-emerald-200">
                         {formatDisplayAmount(item.to_amount)} {item.to_symbol}
                       </td>
-                      <td className="whitespace-nowrap px-5 py-4 tabular-nums text-white/70">
+                      <td className="whitespace-nowrap px-5 py-3 font-medium tabular-nums text-white/70">
                         1 : {formatDisplayAmount(item.conversion_rate)}
                       </td>
-                      <td className="whitespace-nowrap px-5 py-4">
+                      <td className="whitespace-nowrap px-5 py-3">
                         <StatusBadge status={item.status} t={t} />
                       </td>
-                      <td className="whitespace-nowrap px-5 py-4 text-white/55">
+                      <td className="whitespace-nowrap px-5 py-3 font-medium tabular-nums text-white/55">
                         {formatDate(item.created_at)}
                       </td>
                     </tr>

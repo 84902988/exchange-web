@@ -70,7 +70,7 @@ function renderField(label: string, value: string) {
   return (
     <div className="flex h-full min-h-[64px] min-w-0 flex-col rounded-xl border border-white/[0.06] bg-white/[0.03] px-4 py-3">
       <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">{label}</div>
-      <div className="mt-2 text-sm font-medium text-slate-100">{value}</div>
+      <div className="mt-2 text-[14px] font-medium tabular-nums text-slate-100">{value}</div>
     </div>
   );
 }
@@ -107,7 +107,7 @@ export default function VipLevelColumn({
           <div className="flex min-h-[64px] flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div className="min-w-0">
               <div className="text-xs uppercase tracking-[0.24em] text-slate-500">{level.level_code}</div>
-              <h3 className="mt-2 text-xl font-semibold text-white">{displayLevelName}</h3>
+              <h3 className="mt-2 text-[24px] font-semibold tabular-nums text-white">{displayLevelName}</h3>
             </div>
             {highlighted ? (
               <div className="inline-flex w-fit rounded-full border border-amber-300/25 bg-amber-400/10 px-3 py-1 text-xs font-medium text-amber-200">

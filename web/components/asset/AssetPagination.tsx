@@ -44,8 +44,8 @@ export default function AssetPagination({
   }
 
   return (
-    <div className="mt-4 flex flex-col gap-3 border-t border-white/10 pt-4 text-sm text-white/55 xl:flex-row xl:items-center xl:justify-between">
-      <div className="font-mono text-white/55">
+    <div className="mt-4 flex flex-col gap-3 border-t border-white/10 pt-4 text-[12px] tabular-nums text-white/55 xl:flex-row xl:items-center xl:justify-between">
+      <div className="font-medium text-white/55">
         {t('totalRecordsPrefix', 'asset')} {total} {t('totalRecordsSuffix', 'asset')}
       </div>
       <div className="flex flex-wrap items-center gap-2">
@@ -65,7 +65,7 @@ export default function AssetPagination({
         >
           {t('prevPage', 'asset')}
         </button>
-        <span className="min-w-24 text-center font-mono text-white/65">
+        <span className="min-w-24 text-center font-medium text-white/65">
           {t('pagePrefix', 'asset')} {safePage} / {totalPages} {t('pageSuffix', 'asset')}
         </span>
         <button
@@ -93,7 +93,7 @@ export default function AssetPagination({
               if (event.key === 'Enter') jumpToDraftPage();
             }}
             inputMode="numeric"
-            className="h-full w-12 bg-transparent text-center font-mono text-white outline-none"
+            className="h-full w-12 bg-transparent text-center font-medium tabular-nums text-white outline-none"
           />
           <span className="shrink-0 text-white/45">{t('pageUnit', 'asset')}</span>
         </label>
@@ -109,7 +109,7 @@ export default function AssetPagination({
           <select
             value={pageSize}
             onChange={(event) => handlePageSizeChange(event.target.value)}
-            className="h-full bg-transparent text-white outline-none"
+            className="h-full bg-transparent font-medium tabular-nums text-white outline-none"
           >
             {pageSizeOptions.map((option) => (
               <option key={option} value={option}>

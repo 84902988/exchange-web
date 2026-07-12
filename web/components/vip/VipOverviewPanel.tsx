@@ -27,9 +27,9 @@ export default function VipOverviewPanel({ overview, action, children }: VipOver
             {action ? <div className="flex justify-end">{action}</div> : null}
             <div className="rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 text-right">
               <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">{overview.primaryLabel}</div>
-              <div className="mt-1.5 text-xl font-semibold text-white">{overview.primaryValue}</div>
+              <div className="mt-1.5 text-[24px] font-semibold tabular-nums text-white">{overview.primaryValue}</div>
               <div className="mt-3 text-[11px] uppercase tracking-[0.22em] text-slate-500">{overview.secondaryLabel}</div>
-              <div className="mt-1.5 text-sm text-amber-300">{overview.secondaryValue}</div>
+              <div className="mt-1.5 text-[13px] font-medium tabular-nums text-amber-300">{overview.secondaryValue}</div>
             </div>
           </div>
         </div>
@@ -38,7 +38,7 @@ export default function VipOverviewPanel({ overview, action, children }: VipOver
           {overview.metrics.map((metric) => (
             <div key={metric.label} className="min-h-[64px] min-w-0 rounded-xl border border-white/[0.06] bg-white/[0.03] px-4 py-3">
               <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">{metric.label}</div>
-              <div className="mt-2 text-base font-semibold text-white">{metric.value}</div>
+              <div className="mt-2 text-[20px] font-semibold tabular-nums text-white">{metric.value}</div>
               {metric.hint ? <div className="mt-2 text-xs leading-5 text-slate-400">{metric.hint}</div> : null}
             </div>
           ))}

@@ -305,7 +305,7 @@ function BookRow({
     <button
       type="button"
       onClick={() => onPriceSelect?.(row.rawPrice)}
-      className="relative grid h-full min-h-0 grid-cols-3 items-center overflow-hidden rounded-[6px] px-1.5 text-left text-[12px] leading-4 tabular-nums transition-colors hover:bg-white/[0.035]"
+      className="relative grid h-full min-h-0 grid-cols-3 items-center overflow-hidden rounded-[6px] px-1.5 text-left text-[12px] font-medium leading-4 tabular-nums transition-colors hover:bg-white/[0.035]"
     >
       <div
         className={`absolute right-0 top-0 h-full ${bgClass}`}

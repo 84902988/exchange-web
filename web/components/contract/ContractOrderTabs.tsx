@@ -45,7 +45,7 @@ export default function ContractOrderTabs({
   }
 
   return (
-    <div className="space-y-2 p-3">
+    <div className="space-y-2 p-2">
       {rows.map((item) => {
         const action = formatContractOrderAction(item, t);
         const actionTone = contractOrderActionTone(item);
@@ -59,12 +59,12 @@ export default function ContractOrderTabs({
         return (
           <div
             key={item.id}
-            className="rounded-lg border border-white/[0.07] bg-[#0d1218] px-3 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]"
+            className="rounded-lg border border-white/[0.07] bg-[#0d1218] px-3 py-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]"
           >
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-semibold text-white">{displaySymbol(item.symbol)}</span>
+                  <span className="text-[13px] font-semibold text-white">{displaySymbol(item.symbol)}</span>
                   <span className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${actionBadgeClassName(actionTone)}`}>
                     {action}
                   </span>
@@ -91,7 +91,7 @@ export default function ContractOrderTabs({
               ) : null}
             </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+            <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-6">
               {priceMetrics.map((metric) => (
                 <OrderMetric key={metric.label} label={metric.label} value={metric.value} />
               ))}
@@ -242,9 +242,9 @@ function getOrderPriceMetrics(
 
 function OrderMetric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="min-w-0 rounded-md bg-white/[0.025] px-2 py-2">
-      <div className="truncate text-[11px] text-white/38">{label}</div>
-      <div className="mt-1 truncate font-mono text-[12px] text-white/86 tabular-nums">{value}</div>
+    <div className="min-w-0 rounded-md bg-white/[0.025] px-2 py-1.5">
+      <div className="truncate text-[10px] text-white/38">{label}</div>
+      <div className="mt-0.5 truncate text-[12px] font-medium tabular-nums text-white/86">{value}</div>
     </div>
   );
 }

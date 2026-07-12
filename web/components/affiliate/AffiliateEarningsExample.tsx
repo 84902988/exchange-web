@@ -46,13 +46,13 @@ export default function AffiliateEarningsExample({
             {rows.map(([labelKey, value]) => (
               <div key={labelKey} className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
                 <div className="text-xs text-white/42">{t(labelKey, "user")}</div>
-                <div className="mt-2 text-xl font-bold text-white">{value}</div>
+                <div className="mt-2 text-[20px] font-semibold tabular-nums text-white">{value}</div>
               </div>
             ))}
           </div>
           <div className="mt-4 rounded-2xl border border-[#f0b90b]/25 bg-[#f0b90b]/12 p-5">
             <div className="text-sm text-[#f8d878]">{t("affiliateExampleDailyCommission", "user")}</div>
-            <div className="mt-2 text-4xl font-black text-[#f0b90b]">400 USDT</div>
+            <div className="mt-2 text-[30px] font-bold tabular-nums text-[#f0b90b]">400 USDT</div>
           </div>
         </div>
       </div>

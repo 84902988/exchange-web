@@ -153,7 +153,7 @@
                   <td>
                     <span class="admin-badge admin-badge-{{ item.enabled_badge }}">{{ item.enabled_label }}</span>
                   </td>
-                  <td class="mono nowrap">{{ item.effective_display_label or ((item.display_price or '-') ~ ' ' ~ (item.display_unit or '')) }}</td>
+                  <td class="admin-number nowrap">{{ item.effective_display_label or ((item.display_price or '-') ~ ' ' ~ (item.display_unit or '')) }}</td>
                   <td class="nowrap" title="{{ item.display_value_label or '-' }}">{{ item.display_value_label or '-' }}</td>
                   <td>
                     <span class="admin-badge rwa-status-badge {{ item.market_status_badge_class or 'admin-badge-secondary' }}" title="{{ item.market_status_text or '' }}">

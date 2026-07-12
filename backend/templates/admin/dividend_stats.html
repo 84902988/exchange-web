@@ -161,7 +161,7 @@
             <tbody>
               {% for item in trends %}
                 <tr>
-                  <td class="mono-cell">{{ item.dividend_date }}</td>
+                  <td class="mono-cell admin-time">{{ item.dividend_date }}</td>
                   <td class="admin-amount">{{ item.total_fee_usdt }}</td>
                   <td class="admin-amount">{{ item.total_dividend_rcb }}</td>
                   <td><span class="admin-badge admin-badge-{{ item.status_badge }}" title="{{ item.status }}">{{ item.status_label }}</span></td>

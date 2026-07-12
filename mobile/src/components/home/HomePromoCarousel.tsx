@@ -2,7 +2,7 @@ import React from 'react';
 import {Pressable, StyleSheet, Text, View} from 'react-native';
 import {BadgePercent, Gift, Sparkles, Trophy} from 'lucide-react-native';
 import type {LucideIcon} from 'lucide-react-native';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 type PromoItem = {
   title: string;
@@ -125,26 +125,27 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   tag: {
+    ...typography.semibold,
     overflow: 'hidden',
     borderRadius: 8,
     paddingHorizontal: 7,
     paddingVertical: 2,
     color: colors.primary,
     fontSize: 10,
-    fontWeight: '700',
     backgroundColor: 'rgba(214, 168, 50, 0.16)',
   },
   page: {
+    ...typography.number,
     color: colors.textSubtle,
     fontSize: 11,
-    fontWeight: '700',
   },
   title: {
+    ...typography.sectionTitle,
     color: colors.text,
     fontSize: 16,
-    fontWeight: '800',
   },
   subtitle: {
+    ...typography.caption,
     color: colors.textMuted,
     fontSize: 12,
     lineHeight: 17,

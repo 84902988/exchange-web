@@ -162,7 +162,7 @@ function InviteLinkCard({
           {t("inviteCodeGenerating", "user")}
         </div>
       )}
-      <p className="mt-4 text-sm leading-6 text-gray-400">
+      <p className="mt-4 text-sm tabular-nums leading-6 text-gray-400">
         {t("inviteLinkDesc", "user").replace("{percent}", commissionPercent)}
       </p>
     </motion.div>
@@ -214,7 +214,7 @@ function InviteOverviewPanel({
           {cards.map((item) => (
             <div key={item.label} className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
               <div className="text-sm text-gray-400">{item.label}</div>
-              <div className="mt-2 break-words text-2xl font-bold text-amber-400">{item.value}</div>
+              <div className="mt-2 break-words text-[24px] font-semibold tabular-nums text-amber-400">{item.value}</div>
             </div>
           ))}
         </div>
@@ -248,8 +248,8 @@ function InviteRecordItem({ record, t }: { record: MyInviteRecentRecord; t: User
     <div className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <div className="text-sm text-gray-400">{formatDateTime(record.created_at)}</div>
-          <div className="mt-1 text-sm text-white">
+          <div className="text-[12px] tabular-nums text-gray-400">{formatDateTime(record.created_at)}</div>
+          <div className="mt-1 text-[13px] font-medium tabular-nums text-white">
             {t("inviteeUserId", "user")}: {record.invitee_user_id}
           </div>
         </div>
@@ -257,18 +257,18 @@ function InviteRecordItem({ record, t }: { record: MyInviteRecentRecord; t: User
           {statusText(record.status, t)}
         </span>
       </div>
-      <div className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 text-[13px] sm:grid-cols-3">
         <div>
           <div className="text-gray-500">{t("feeCoin", "user")}</div>
           <div className="mt-1 font-medium text-gray-200">{record.fee_coin_symbol}</div>
         </div>
         <div>
           <div className="text-gray-500">{t("feeAmount", "user")}</div>
-          <div className="mt-1 font-medium text-gray-200">{record.fee_amount}</div>
+          <div className="mt-1 font-medium tabular-nums text-gray-200">{record.fee_amount}</div>
         </div>
         <div>
           <div className="text-gray-500">{t("rewardRcb", "user")}</div>
-          <div className="mt-1 font-semibold text-amber-300">{record.commission_rcb_amount}</div>
+          <div className="mt-1 font-semibold tabular-nums text-amber-300">{record.commission_rcb_amount}</div>
         </div>
       </div>
     </div>
@@ -350,7 +350,7 @@ function InviteContent() {
         <div className="mx-auto flex max-w-7xl flex-col items-center justify-between gap-8 px-4 py-12 sm:px-6 lg:flex-row lg:px-8">
           <div>
             <h1 className="mb-3 text-3xl font-bold text-white md:text-4xl">{t("inviteHeroTitle", "user")}</h1>
-            <p className="mb-6 text-xl text-gray-300">
+            <p className="mb-6 text-xl tabular-nums text-gray-300">
               {t("inviteHeroDesc", "user").replace("{percent}", commissionPercent)}
             </p>
             <div className="flex flex-wrap gap-6">
@@ -377,7 +377,7 @@ function InviteContent() {
             transition={{ duration: 0.45, delay: 0.15 }}
             className="rounded-lg border border-white/10 bg-[#121217] p-6 text-center"
           >
-            <div className="mb-2 text-4xl font-bold text-amber-400">{commissionPercent}%</div>
+            <div className="mb-2 text-[30px] font-bold tabular-nums text-amber-400">{commissionPercent}%</div>
             <span className="text-sm text-gray-400">{t("inviteDefaultFeeShare", "user")}</span>
           </motion.div>
         </div>
@@ -465,7 +465,7 @@ function InviteContent() {
                         transition={{ duration: 0.3, delay: 0.05 * index }}
                         className="text-center"
                       >
-                        <div className="mb-2 text-2xl font-bold text-amber-400">{item.value}</div>
+                        <div className="mb-2 text-[20px] font-semibold tabular-nums text-amber-400">{item.value}</div>
                         <span className="text-sm text-gray-400">{item.label}</span>
                       </motion.div>
                     ))}

@@ -2,7 +2,7 @@ import React from 'react';
 import {Pressable, StyleSheet, Text, View} from 'react-native';
 import {Bell, ChevronRight, Headphones, ShieldCheck} from 'lucide-react-native';
 import type {LucideIcon} from 'lucide-react-native';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 type ServiceItem = {
   title: string;
@@ -109,11 +109,12 @@ const styles = StyleSheet.create({
     gap: 3,
   },
   serviceTitle: {
+    ...typography.semibold,
     color: colors.text,
     fontSize: 14,
-    fontWeight: '700',
   },
   serviceDesc: {
+    ...typography.caption,
     color: colors.textMuted,
     fontSize: 12,
     lineHeight: 16,
@@ -144,11 +145,13 @@ const styles = StyleSheet.create({
     backgroundColor: colors.gold,
   },
   noticeText: {
+    ...typography.caption,
     flex: 1,
     color: colors.textMuted,
     fontSize: 12,
   },
   noticeTime: {
+    ...typography.caption,
     color: colors.textSubtle,
     fontSize: 11,
   },

@@ -13,6 +13,7 @@
       --muted:rgba(255,255,255,.72);
       --brand:#BD3419;
       --danger:#ff6b6b;
+      --admin-font-sans:"HarmonyOS Sans SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
     }
     *{ box-sizing:border-box; }
     body{
@@ -26,7 +27,10 @@
         radial-gradient(circle at top, rgba(189,52,25,.18), transparent 35%),
         var(--bg);
       color:var(--text);
-      font-family:Arial, "Microsoft YaHei", sans-serif;
+      font-family:var(--admin-font-sans);
+      font-size:13px;
+      font-variant-numeric:tabular-nums;
+      font-feature-settings:"tnum" 1;
     }
     .wrap{ width:100%; max-width:420px; }
     .card{
@@ -38,8 +42,8 @@
     }
     .title{
       margin:0 0 8px;
-      font-size:22px;
-      font-weight:800;
+      font-size:20px;
+      font-weight:600;
     }
     .subtitle{
       margin:0 0 18px;
@@ -51,6 +55,7 @@
       display:block;
       margin:12px 0 6px;
       font-size:12px;
+      font-weight:500;
       color:var(--muted);
     }
     input{
@@ -60,6 +65,9 @@
       border:1px solid rgba(255,255,255,.14);
       background:rgba(0,0,0,.35);
       color:#fff;
+      font-family:inherit;
+      font-size:13px;
+      font-weight:500;
       outline:none;
     }
     button{
@@ -70,7 +78,9 @@
       border-radius:10px;
       background:var(--brand);
       color:#fff;
-      font-weight:700;
+      font-family:inherit;
+      font-size:13px;
+      font-weight:500;
       cursor:pointer;
     }
     .captcha-row{

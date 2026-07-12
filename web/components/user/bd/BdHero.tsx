@@ -166,7 +166,7 @@ function InfoRow({
   return (
     <div className="flex items-center justify-between gap-4 rounded-2xl bg-black/25 px-4 py-3">
       <span className="text-sm text-white/48">{label}</span>
-      <span className={`text-right text-sm font-semibold ${highlight ? "text-[#f0b90b]" : "text-white"}`}>
+      <span className={`text-right text-[14px] font-medium tabular-nums ${highlight ? "text-[#f0b90b]" : "text-white"}`}>
         {value}
       </span>
     </div>

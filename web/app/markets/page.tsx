@@ -1165,7 +1165,7 @@ function MarketsPageContent() {
             </p>
           </div>
 
-          <div className="text-sm text-white/45">
+          <div className="text-[12px] tabular-nums text-white/45">
             {t('updatedAt', 'markets')}：{updatedTimeLabel}
             {refreshing && rows.length > 0 ? <span className="ml-2 text-[#f0b90b]">{t('updating', 'common')}</span> : null}
           </div>
@@ -1190,10 +1190,10 @@ function MarketsPageContent() {
                       {marketCategoryLabel(row)}
                     </span>
                   </div>
-                  <div className="text-base font-semibold tabular-nums text-white sm:text-lg">
+                  <div className="text-[18px] font-semibold tabular-nums text-white">
                     {formatPrice(getTickerPrice(row), getTickerPricePrecision(row))}
                   </div>
-                  <div className={`mt-1 text-sm font-medium tabular-nums ${getChangeClass(getTickerChange(row))}`}>
+                  <div className={`mt-1 text-[13px] font-semibold tabular-nums ${getChangeClass(getTickerChange(row))}`}>
                     {formatChange(getTickerChange(row))}
                   </div>
                 </a>

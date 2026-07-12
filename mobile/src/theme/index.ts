@@ -53,4 +53,4 @@ export const layout = {
   tabBarContentInset: 24,
 } as const;
 
-export {fontFamily, fontFiles, typography} from './typography';
+export {fontConfig, fontFamily, fontFiles, typography} from './typography';

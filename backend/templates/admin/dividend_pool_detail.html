@@ -135,7 +135,7 @@
                   <td class="mono-cell">{{ record.level_code }}</td>
                   <td class="text-right">{{ record.dividend_rcb }}</td>
                   <td><span class="admin-badge admin-badge-{{ record.status_badge }}">{{ record.status }}</span></td>
-                  <td class="mono-cell">{{ record.paid_at }}</td>
+                  <td class="mono-cell admin-time">{{ record.paid_at }}</td>
                 </tr>
               {% endfor %}
             </tbody>
@@ -167,7 +167,7 @@
                   <td class="mono-cell">{{ item.action }}</td>
                   <td><span class="admin-badge admin-badge-{{ item.status_badge }}">{{ item.status }}</span></td>
                   <td>{{ item.message }}</td>
-                  <td class="mono-cell">{{ item.created_at }}</td>
+                  <td class="mono-cell admin-time">{{ item.created_at }}</td>
                 </tr>
               {% endfor %}
             </tbody>

@@ -48,8 +48,7 @@ const styles = StyleSheet.create({
     borderColor: colors.line,
   },
   label: {
-    ...typography.bold,
-    fontSize: 15,
+    ...typography.button,
   },
   primaryText: {
     color: colors.white,

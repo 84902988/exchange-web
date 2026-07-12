@@ -313,7 +313,7 @@ const styles = StyleSheet.create({
     minWidth: 0,
   },
   addressText: {
-    ...typography.number,
+    ...typography.identifier,
     color: colors.text,
     fontSize: 14,
   },

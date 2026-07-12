@@ -111,7 +111,7 @@ export default function BdApplyCard({
                 {statusLabelKeys[normalizedStatus] ? t(statusLabelKeys[normalizedStatus], 'user') : normalizedStatus}
               </span>
             </div>
-            <div className="mt-3 text-sm text-white/70">
+            <div className="mt-3 text-[14px] font-medium tabular-nums text-white/70">
               {application.apply_level} / {application.deposit_amount} {application.deposit_coin_symbol}
             </div>
             {statusHintKeys[normalizedStatus] ? (
@@ -145,7 +145,7 @@ export default function BdApplyCard({
                         : "border-white/10 bg-black/25 hover:border-[#f0b90b]/35 hover:bg-white/[0.04]"
                     }`}
                   >
-                    <div className="text-base font-bold text-white">{level.title}</div>
+                    <div className="text-[20px] font-semibold tabular-nums text-white">{level.title}</div>
                     <div className="mt-2 text-xs leading-5 text-white/48">{t(level.descKey, 'user')}</div>
                   </button>
                 );
@@ -174,7 +174,7 @@ export default function BdApplyCard({
               onChange={(event) => onDepositAmountChange(event.target.value)}
               inputMode="decimal"
               placeholder={t('bdDepositAmountPlaceholder', 'user')}
-              className="mt-2 w-full rounded-2xl border border-white/10 bg-black/35 px-4 py-3 text-sm text-white outline-none placeholder:text-white/25 focus:border-[#f0b90b]/60"
+              className="mt-2 w-full rounded-2xl border border-white/10 bg-black/35 px-4 py-3 text-[14px] font-medium tabular-nums text-white outline-none placeholder:text-white/25 focus:border-[#f0b90b]/60"
             />
           </label>
 

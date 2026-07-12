@@ -37,10 +37,9 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   amount: {
-    ...typography.number,
+    ...typography.cardNumber,
     color: colors.text,
     fontSize: 26,
-    fontWeight: '900',
   },
   button: {
     width: 88,
