@@ -194,11 +194,8 @@ const datafeedModule = loadTypeScriptModule(
         acquireKlineInterval: () => () => undefined,
         acquireSubscription: () => 'test-kline-subscription',
         releaseSubscription: () => undefined,
-        subscribe: (_domain: string, handler: (message: Record<string, unknown>) => void) => {
-          klineSubscriber = handler
-          return () => {
-            if (klineSubscriber === handler) klineSubscriber = null
-          }
+        subscribe: () => {
+          throw new Error('datafeed must not subscribe directly to marketRealtime kline')
         },
         releaseKlineIntervalOwner: () => undefined,
         syncKlineInterval: () => undefined,
@@ -217,6 +214,39 @@ const datafeedModule = loadTypeScriptModule(
     },
     './spotKlineClientCache': cacheModule,
     './spotKlinePreloadManager': preloadModule,
+    './spotKlineStoreAdapter': {
+      subscribeSpotKlineCurrent: ({
+        onSnapshot,
+      }: {
+        onSnapshot: (event: Record<string, unknown>) => void
+      }) => {
+        const handler = (message: Record<string, unknown>) => {
+          const kline = message.kline as Record<string, unknown>
+          onSnapshot({
+            snapshotId: `test-${String(kline?.revision_seq ?? 'none')}`,
+            symbol: message.symbol,
+            interval: message.interval,
+            kline,
+            provider: kline?.provider ?? message.provider ?? null,
+            source: kline?.source ?? message.source ?? 'LIVE_WS',
+            freshness: kline?.freshness ?? message.freshness ?? 'LIVE',
+            receivedAtMs: Number(message.received_at_ms) || Date.now(),
+            revision: {
+              epoch: kline?.revision_epoch ?? null,
+              sequence: kline?.revision_seq ?? null,
+              is_closed: kline?.is_closed ?? null,
+              close_state_source: kline?.close_state_source ?? null,
+            },
+            sequence: kline?.revision_seq ?? null,
+            closed: kline?.is_closed ?? null,
+          })
+        }
+        klineSubscriber = handler
+        return () => {
+          if (klineSubscriber === handler) klineSubscriber = null
+        }
+      },
+    },
   },
 )
 

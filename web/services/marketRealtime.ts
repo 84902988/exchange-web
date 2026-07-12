@@ -2,6 +2,7 @@
 
 import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl';
 import { markSpotKlinePerf } from '@/components/spot/tradingview/spotKlinePerf';
+import { attachSpotMarketStoreTransportMirror } from '@/lib/realtime/spotMarketStore.transport';
 
 type SpotMarketSnapshotMessage = {
   type: 'spot_market_snapshot';
@@ -802,3 +803,4 @@ class SpotMarketRealtimeClient {
 }
 
 export const spotMarketRealtime = new SpotMarketRealtimeClient();
+attachSpotMarketStoreTransportMirror(spotMarketRealtime);

@@ -2,10 +2,17 @@ import { beforeEach, describe, expect, it, jest } from '@jest/globals'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import {
   getSpotMarketView,
+  type SpotDepthResponse,
   type SpotMarketTradeItem,
   type SpotMarketView,
 } from '@/lib/api/modules/spot'
 import { spotMarketRealtime } from '@/services/marketRealtime'
+import { spotPublicMarketStore } from '@/lib/realtime/spotMarketStore'
+import {
+  attachSpotMarketStoreTransportMirror,
+  type SpotMarketMirrorTransport,
+} from '@/lib/realtime/spotMarketStore.transport'
+import { resetSpotTradesStoreAdapterForTests } from './spotTradesStoreAdapter'
 import { useSpotMarket } from './useSpotMarket'
 
 type RealtimeHandler = (message: Record<string, unknown>) => void
@@ -49,10 +56,11 @@ const mockSpotMarketRealtime = spotMarketRealtime as unknown as {
   __listeners: Map<string, Set<RealtimeHandler>>
   acquireSubscription: jest.Mock
   releaseSubscription: jest.Mock
-  subscribeStatus: jest.Mock
+  subscribeStatus: jest.Mock<(handler: (status: string) => void) => () => void>
   subscribe: jest.Mock
 }
 const mockRealtimeListeners = mockSpotMarketRealtime.__listeners
+let detachTickerStoreMirror: (() => void) | null = null
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -127,12 +135,20 @@ function marketView(symbol: string, trades: SpotMarketTradeItem[]): SpotMarketVi
 }
 
 beforeEach(() => {
+  detachTickerStoreMirror?.()
+  detachTickerStoreMirror = null
   mockRealtimeListeners.clear()
   mockedGetSpotMarketView.mockReset()
   mockSpotMarketRealtime.acquireSubscription.mockClear()
   mockSpotMarketRealtime.releaseSubscription.mockClear()
   mockSpotMarketRealtime.subscribe.mockClear()
   mockSpotMarketRealtime.subscribeStatus.mockClear()
+  spotPublicMarketStore.resetForTests()
+  resetSpotTradesStoreAdapterForTests(spotPublicMarketStore)
+  detachTickerStoreMirror = attachSpotMarketStoreTransportMirror(
+    mockSpotMarketRealtime as unknown as SpotMarketMirrorTransport,
+    spotPublicMarketStore,
+  )
 })
 
 describe('useSpotMarket trade collection', () => {
@@ -142,6 +158,10 @@ describe('useSpotMarket trade collection', () => {
     const { result } = renderHook(() => useSpotMarket('BTCUSDT'))
 
     await waitFor(() => expect(mockSpotMarketRealtime.acquireSubscription).toHaveBeenCalled())
+    const tradeListenerCount = mockSpotMarketRealtime.subscribe.mock.calls
+      .filter(([domain]) => domain === 'trade')
+      .length
+    expect(tradeListenerCount).toBe(1)
     const wsTrade = providerTrade({ id: 'ws', eventTimeMs: BASE + 2_000, price: '200' })
     act(() => emit('trade', tradeMessage(wsTrade)))
     await waitFor(() => expect(result.current.trades.map((row) => row.provider_trade_id)).toEqual(['ws']))
@@ -198,5 +218,158 @@ describe('useSpotMarket trade collection', () => {
     await waitFor(() => expect(result.current.symbol).toBe('ETHUSDT'))
     expect(result.current.trades).toEqual([])
     expect(result.current.lastTradePrice).toBeNull()
+  })
+})
+
+describe('useSpotMarket hydration', () => {
+  it('keeps a REST snapshot in hydration until a LIVE_WS ticker arrives', async () => {
+    mockedGetSpotMarketView.mockResolvedValueOnce({
+      symbol: 'BTCUSDT',
+      ticker: {
+        symbol: 'BTCUSDT',
+        last_price: '100',
+        source: 'REST_SNAPSHOT',
+        freshness: 'RECENT',
+      },
+      ticker_source: 'REST_SNAPSHOT',
+      ticker_freshness: 'RECENT',
+    } as SpotMarketView)
+
+    const { result } = renderHook(() => useSpotMarket('BTCUSDT'))
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    expect(result.current.displayPrice.price).toBe('100')
+    expect(result.current.isHydrating).toBe(true)
+
+    act(() => emit('ticker', {
+      type: 'spot_ticker_update',
+      symbol: 'BTCUSDT',
+      ticker: {
+        symbol: 'BTCUSDT',
+        last_price: '101',
+        source: 'LIVE_WS',
+        freshness: 'LIVE',
+      },
+    }))
+
+    await waitFor(() => expect(result.current.isHydrating).toBe(false))
+    expect(result.current.displayPrice.price).toBe('101')
+  })
+
+  it('keeps loading after REST failure until WS also closes', async () => {
+    let emitStatus: ((status: string) => void) | null = null
+    mockSpotMarketRealtime.subscribeStatus.mockImplementationOnce((handler: (status: string) => void) => {
+      emitStatus = handler
+      handler('connecting')
+      return () => undefined
+    })
+    mockedGetSpotMarketView.mockRejectedValueOnce(new Error('REST unavailable'))
+
+    const { result } = renderHook(() => useSpotMarket('BTCUSDT'))
+
+    await waitFor(() => expect(result.current.error).toBe('REST unavailable'))
+    expect(result.current.isHydrating).toBe(true)
+
+    act(() => emitStatus?.('closed'))
+
+    await waitFor(() => expect(result.current.isHydrating).toBe(false))
+    expect(result.current.displayPrice.price).toBeNull()
+  })
+})
+
+describe('useSpotMarket depth store migration', () => {
+  it('consumes REST and LIVE_WS depth from the store without a direct depth listener', async () => {
+    const restDepth = {
+      symbol: 'BTCUSDT',
+      provider: 'BINANCE',
+      source: 'REST_SNAPSHOT',
+      freshness: 'RECENT',
+      event_time_ms: BASE + 1_000,
+      provider_generation: 2,
+      sequence: 10,
+      checksum: 'rest-checksum',
+      bids: [{ price: '99', amount: '1' }],
+      asks: [{ price: '101', amount: '2' }],
+    } as SpotDepthResponse & {
+      provider_generation: number
+      sequence: number
+      checksum: string
+    }
+    mockedGetSpotMarketView.mockResolvedValueOnce({
+      symbol: 'BTCUSDT',
+      market_status: 'OPEN',
+      depth: restDepth,
+      depth_source: 'REST_SNAPSHOT',
+      depth_freshness: 'RECENT',
+    } as SpotMarketView)
+
+    const { result } = renderHook(() => useSpotMarket('BTCUSDT'))
+
+    await waitFor(() => expect(result.current.depth?.bids[0].price).toBe('99'))
+    expect(result.current.freshness.depth).toBe('RECENT')
+    expect(result.current.sources.depth).toBe('REST_SNAPSHOT')
+    expect((result.current.depth as typeof restDepth).sequence).toBe(10)
+    expect((result.current.depth as typeof restDepth).checksum).toBe('rest-checksum')
+    expect(result.current.bestBid).toBe('99')
+    expect(result.current.bestAsk).toBe('101')
+
+    const depthListenerCount = mockSpotMarketRealtime.subscribe.mock.calls
+      .filter(([domain]) => domain === 'depth')
+      .length
+    expect(depthListenerCount).toBe(1)
+
+    const liveDepth = {
+      ...restDepth,
+      source: 'LIVE_WS',
+      freshness: 'LIVE',
+      event_time_ms: BASE + 2_000,
+      sequence: 11,
+      checksum: 'live-checksum',
+      bids: [{ price: '100', amount: '3' }],
+      asks: [{ price: '102', amount: '4' }],
+    }
+    act(() => emit('depth', {
+      type: 'spot_depth_update',
+      symbol: 'BTCUSDT',
+      depth: liveDepth,
+    }))
+
+    await waitFor(() => expect(result.current.depth?.bids[0].price).toBe('100'))
+    expect(result.current.freshness.depth).toBe('LIVE')
+    expect(result.current.sources.depth).toBe('LIVE_WS')
+    expect((result.current.depth as typeof liveDepth).sequence).toBe(11)
+    expect((result.current.depth as typeof liveDepth).checksum).toBe('live-checksum')
+    expect(result.current.bestBid).toBe('100')
+    expect(result.current.bestAsk).toBe('102')
+    expect(result.current.marketView?.executable).toBe(true)
+  })
+
+  it('keeps stale depth non-executable and clears display levels', async () => {
+    mockedGetSpotMarketView.mockResolvedValueOnce({
+      symbol: 'BTCUSDT',
+      market_status: 'OPEN',
+      depth: {
+        symbol: 'BTCUSDT',
+        provider: 'BINANCE',
+        source: 'LAST_GOOD',
+        freshness: 'STALE',
+        stale: true,
+        bids: [{ price: '99', amount: '1' }],
+        asks: [{ price: '101', amount: '2' }],
+      },
+      depth_source: 'LAST_GOOD',
+      depth_freshness: 'STALE',
+    } as SpotMarketView)
+
+    const { result } = renderHook(() => useSpotMarket('BTCUSDT'))
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    expect(result.current.depth?.bids).toEqual([])
+    expect(result.current.depth?.asks).toEqual([])
+    expect(result.current.freshness.depth).toBe('STALE')
+    expect(result.current.sources.depth).toBe('LAST_GOOD')
+    expect(result.current.bestBid).toBeNull()
+    expect(result.current.bestAsk).toBeNull()
+    expect(result.current.marketView?.executable).toBe(false)
   })
 })
