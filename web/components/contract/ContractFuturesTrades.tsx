@@ -16,7 +16,6 @@ import {
 type PriceDirection = 'up' | 'down' | 'flat';
 
 type ContractFuturesTradesProps = {
-  symbol: string;
   trades?: ContractMarketTrade[];
   loading?: boolean;
   error?: string | null;
@@ -51,9 +50,9 @@ function formatTime(value: number) {
 }
 
 export default function ContractFuturesTrades({
-  symbol,
   trades = [],
   loading = false,
+  error,
   status,
   source,
   freshness,
@@ -94,9 +93,8 @@ export default function ContractFuturesTrades({
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <div className="text-[13px] font-medium text-white/88">{t('marketTrades', 'contracts')}</div>
+      {tradesSourceStatusLabel || normalizedStatus === 'CLOSED' ? (
+        <div className="mb-1.5 flex min-h-5 items-center gap-2 px-1">
           {tradesSourceStatusLabel ? (
             <div
               className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getContractMarketSourceToneClass(tradesSourceTone)}`}
@@ -111,10 +109,7 @@ export default function ContractFuturesTrades({
             </div>
           ) : null}
         </div>
-        <div className="rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/42">
-          {symbol}
-        </div>
-      </div>
+      ) : null}
 
       {loading && data.length === 0 ? (
         <div className="flex min-h-0 flex-1 items-center justify-center px-2.5 py-6 text-sm text-zinc-400">
@@ -122,7 +117,7 @@ export default function ContractFuturesTrades({
         </div>
       ) : data.length === 0 ? (
         <div className="flex min-h-0 flex-1 items-center justify-center px-2.5 py-6 text-sm text-zinc-400">
-          {t('noTradeData', 'contracts')}
+          {error ? t('marketDataUnavailable', 'contracts') : t('noTradeData', 'contracts')}
         </div>
       ) : (
         <>

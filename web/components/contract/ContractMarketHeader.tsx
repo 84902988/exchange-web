@@ -5,7 +5,6 @@ import MarketStatusBadge from '@/components/market/MarketStatusBadge';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
   getContractDomainStatusLabel,
-  getContractMarketSourceLabel,
 } from './contractMarketSourceStatus';
 
 type PriceDirection = 'up' | 'down' | 'flat';
@@ -66,75 +65,61 @@ export default function ContractMarketHeader({
       ? 'text-[#f6465d]'
       : 'text-white/58';
   const hasTickerSourceStatus = !!quoteFreshness;
-  const tickerSourceStatusLabel = hasTickerSourceStatus
-    ? getContractMarketSourceLabel(null, quoteFreshness, t)
-    : null;
   const tickerSourceStatusTitle = hasTickerSourceStatus
     ? getContractDomainStatusLabel('ticker', null, quoteFreshness, t)
     : null;
   const tradeStatusTitle = [marketStatusText, tickerSourceStatusTitle]
     .filter(Boolean)
     .join(' · ');
-  const tradeStatusSubValue = tickerSourceStatusLabel && tickerSourceStatusLabel !== quoteStatusLabel
-    ? tickerSourceStatusLabel
-    : null;
 
   return (
-    <div className="h-[74px] overflow-hidden border-b border-white/[0.06] bg-[#11161d] px-3 py-2.5 tabular-nums shadow-[inset_0_-1px_0_rgba(255,255,255,0.02)]">
-      <div className="flex h-full min-w-0 items-center gap-3 whitespace-nowrap">
-        <div className="flex h-[54px] w-[176px] min-w-0 shrink-0 items-center">
-          {symbolSelector || (
-            <span className="truncate text-[17px] font-semibold leading-none text-white">
-              {displaySymbol} {t('perpetual', 'contracts')}
-            </span>
-          )}
-        </div>
-
-        <div className="flex h-[54px] w-[174px] shrink-0 flex-col justify-center gap-1">
-          <div className={`max-w-full truncate text-[28px] font-semibold leading-none transition-all duration-200 ${priceColorClass}`}>
-            {price}
-          </div>
-          <div className="min-h-4 truncate text-[12px] font-semibold leading-tight">
-            <span className={changeColorClass}>{changeValue || '--'}</span>
-            {priceSourceLabel ? (
-              <span
-                className="ml-2 text-[11px] font-medium text-white/42"
-                data-price-source={priceSource}
-              >
-                {priceSourceLabel}
+    <div className="tabular-nums border-b border-white/[0.06] bg-[#11161d] px-3 py-2 shadow-[inset_0_-1px_0_rgba(255,255,255,0.02)]">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2.5 xl:flex-nowrap">
+        <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 whitespace-nowrap sm:min-w-[350px]">
+          <div className="flex min-w-0 flex-col justify-center gap-1">
+            {symbolSelector || (
+              <span className="truncate text-[17px] font-semibold leading-none text-white">
+                {displaySymbol} {t('perpetual', 'contracts')}
               </span>
-            ) : null}
+            )}
+          </div>
+
+          <div className="flex w-[174px] flex-col justify-center gap-0.5">
+            <div
+              data-price-source={priceSource}
+              title={priceSourceLabel || undefined}
+              className={`max-w-full truncate rounded-md px-1 py-0.5 text-[28px] font-semibold leading-none transition-all duration-200 ${priceColorClass}`}
+            >
+              {price}
+            </div>
+            <div className="min-h-4 pl-1 text-[12px] font-semibold leading-tight">
+              <span className={changeColorClass}>{changeValue || '--'}</span>
+            </div>
           </div>
         </div>
 
-        <Metric
-          className="w-[138px] shrink-0 flex-none"
-          label={t('tradeStatus', 'contracts')}
-          value={quoteStatusLabel ? (
-            <span className={`block max-w-full truncate text-[13px] font-medium leading-tight ${quoteStatusTextClass(quoteStatusTone)}`}>
-              {quoteStatusLabel}
-            </span>
-          ) : (
-            <MarketStatusBadge
-              marketStatus={marketStatus}
-              quoteFreshness={quoteFreshness}
-              marketSessionType={marketSessionType}
-              className="!rounded-none !border-0 !bg-transparent !px-0 !py-0 text-[13px] font-medium"
-            />
-          )}
-          subValue={tradeStatusSubValue}
-          valueClassName="font-sans text-[13px] font-medium text-white/88"
-          title={tradeStatusTitle || undefined}
-        />
-
-        <div className="grid min-w-0 flex-1 grid-flow-col auto-cols-[minmax(132px,1fr)] gap-2 overflow-hidden">
+        <div className="grid min-w-0 flex-1 grid-cols-2 gap-2 text-[12px] text-gray-300 md:grid-cols-4 xl:grid-cols-5">
+          <Metric
+            label={t('tradeStatus', 'contracts')}
+            value={(
+              <span className="flex min-w-0 items-center gap-1.5">
+                {quoteStatusLabel ? (
+                  <span className={`min-w-0 truncate text-[13px] font-medium leading-tight ${quoteStatusTextClass(quoteStatusTone)}`}>
+                    {quoteStatusLabel}
+                  </span>
+                ) : null}
+                <MarketStatusBadge
+                  marketStatus={marketStatus}
+                  quoteFreshness={quoteFreshness}
+                  marketSessionType={marketSessionType}
+                  className="max-w-full truncate !rounded-none !border-0 !bg-transparent !px-0 !py-0 text-[12px] font-medium"
+                />
+              </span>
+            )}
+            title={tradeStatusTitle || undefined}
+          />
           {metrics.map((metric) => (
-            <Metric
-              key={metric.label}
-              label={metric.label}
-              value={metric.value}
-              subValue={metric.subValue}
-            />
+            <Metric key={metric.label} label={metric.label} value={metric.value} subValue={metric.subValue} />
           ))}
         </div>
       </div>
@@ -180,7 +165,7 @@ function Metric({
   title?: string;
 }) {
   return (
-    <div className={`flex h-[54px] min-w-0 flex-col justify-center rounded-md border border-white/[0.07] bg-white/[0.025] px-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] ${className}`}>
+    <div className={`min-w-0 rounded-md border border-white/[0.045] bg-white/[0.02] px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] ${className}`}>
       <div className="truncate text-[10px] font-medium leading-none text-white/36">
         {label}
       </div>

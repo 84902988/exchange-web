@@ -426,6 +426,22 @@ export default function ContractPositionTabs({
   }, [orderFeedback]);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setPages({
+        positions: 1,
+        historyPositions: 1,
+        openOrders: 1,
+        historyOrders: 1,
+        trades: 1,
+      });
+      setInternalScope('current');
+      setFiltersExpanded(false);
+      onScopeChange?.('current');
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [currentSymbol, onScopeChange]);
+
+  useEffect(() => {
     const lengths: Record<TabKey, number> = {
       positions: openPositionSummaryRows.length,
       historyPositions: scopedHistoryPositions.length,
@@ -434,39 +450,32 @@ export default function ContractPositionTabs({
       trades: scopedTrades.length,
     };
 
-    setPages((previous) => {
-      let changed = false;
-      const next = { ...previous };
-      tabs.forEach((tab) => {
-        const maxPage = getTotalPages(lengths[tab.key], pageSize);
-        if (next[tab.key] > maxPage) {
-          next[tab.key] = maxPage;
-          changed = true;
-        }
-        if (next[tab.key] < 1) {
-          next[tab.key] = 1;
-          changed = true;
-        }
+    const timer = window.setTimeout(() => {
+      setPages((previous) => {
+        let changed = false;
+        const next = { ...previous };
+        tabs.forEach((tab) => {
+          const maxPage = getTotalPages(lengths[tab.key], pageSize);
+          if (next[tab.key] > maxPage) {
+            next[tab.key] = maxPage;
+            changed = true;
+          }
+          if (next[tab.key] < 1) {
+            next[tab.key] = 1;
+            changed = true;
+          }
+        });
+        return changed ? next : previous;
       });
-      return changed ? next : previous;
-    });
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [openPositionSummaryRows.length, scopedHistoryOrders.length, scopedHistoryPositions.length, scopedOpenOrders.length, scopedTrades.length]);
-
-  useEffect(() => {
-    setInternalScope('current');
-    onScopeChange?.('current');
-  }, [activeTab, onScopeChange]);
-
-  useEffect(() => {
-    setPages((previous) => ({ ...previous, [activeTab]: 1 }));
-  }, [activeTab, scope]);
-
-  useEffect(() => {
-    setFiltersExpanded(false);
-  }, [activeTab]);
 
   function selectTab(tab: TabKey) {
     setActiveTab(tab);
+    setInternalScope('current');
+    onScopeChange?.('current');
+    setFiltersExpanded(false);
     onActiveTabChange?.(tab);
     setTabPage(tab, 1);
   }
@@ -474,6 +483,7 @@ export default function ContractPositionTabs({
   function changeScope(nextScope: PositionScope) {
     setInternalScope(nextScope);
     onScopeChange?.(nextScope);
+    setTabPage(activeTab, 1);
   }
 
   function clearActiveFilters() {
@@ -836,39 +846,41 @@ export default function ContractPositionTabs({
   }
 
   return (
-    <div className="tabular-nums min-w-0 bg-[#12171f] px-2 py-1.5 text-white">
-      <div className="mb-1 flex items-center gap-2">
-        <div className="flex flex-wrap gap-2">
+    <div className="tabular-nums min-w-0 bg-[#12171f] text-white">
+      <div className="flex min-w-0 items-center border-b border-white/[0.06] px-2.5">
+        <div className="flex h-10 min-w-0 flex-1 items-stretch gap-5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         {tabs.map((tab) => (
           <button
             key={tab.key}
             type="button"
             onClick={() => selectTab(tab.key)}
-            className={`rounded-md px-2 py-0.5 text-[12px] font-medium ${
+            className={`relative shrink-0 px-0 text-[13px] font-medium leading-4 transition-colors ${
               activeTab === tab.key
-                ? 'bg-white text-black'
-                : 'bg-white/5 text-white/70'
+                ? 'text-white after:absolute after:inset-x-0 after:bottom-[-1px] after:h-0.5 after:rounded-full after:bg-white'
+                : 'text-white/58 hover:text-white/85'
             }`}
           >
             {t(tab.labelKey, 'contracts')}
           </button>
         ))}
         </div>
-        <div className="ml-auto flex shrink-0 items-center gap-1.5 self-center text-xs text-white/40" title={statusText}>
+        <div className="ml-3 flex shrink-0 items-center gap-1.5 self-center text-[11px] text-white/40" title={statusText}>
           <span className={`h-1.5 w-1.5 rounded-full ${realtimeDotClass}`} aria-hidden="true" />
           <span>{loading ? t('refreshing', 'contracts') : realtimeBadgeText}</span>
         </div>
       </div>
 
-      <PositionScopeSwitcher
-        value={scope}
-        onChange={changeScope}
-        filtersSupported={supportsOrderTradeFilters}
-        filtersExpanded={filtersExpanded}
-        filterChips={activeFilterChips}
-        onToggleFilters={() => setFiltersExpanded((value) => !value)}
-        onClearFilters={clearActiveFilters}
-      />
+      <div className="px-2 pt-1.5">
+        <PositionScopeSwitcher
+          value={scope}
+          onChange={changeScope}
+          filtersSupported={supportsOrderTradeFilters}
+          filtersExpanded={filtersExpanded}
+          filterChips={activeFilterChips}
+          onToggleFilters={() => setFiltersExpanded((value) => !value)}
+          onClearFilters={clearActiveFilters}
+        />
+      </div>
 
       <div className="overflow-visible">
         {activeTab === 'positions' ? (
