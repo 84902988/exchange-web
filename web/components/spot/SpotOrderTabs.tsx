@@ -13,6 +13,7 @@ import {
   SpotTradeItem,
 } from '@/lib/api/modules/spot'
 import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl'
+import { ApiError } from '@/lib/api/core/error'
 import { formatSpotDisplaySymbol } from './spotFormat'
 import { parseSpotPrivateWsMessage } from './spotPrivateWs'
 
@@ -87,6 +88,7 @@ type TradeRowItem = SpotTradeItem & {
 const PAGE_SIZE = 10
 const OPTIMISTIC_TRADE_TTL_MS = 3000
 const REST_REVALIDATE_DEBOUNCE_MS = 500
+const CURRENT_ORDERS_NETWORK_RETRY_DELAY_MS = 1500
 const CANCELLABLE_STATUSES = ['OPEN', 'PARTIALLY_FILLED']
 const TERMINAL_STATUSES = ['FILLED', 'CANCELED', 'REJECTED']
 const OPEN_ORDER_STATUSES = ['OPEN', 'PARTIALLY_FILLED', 'NEW']
@@ -735,6 +737,10 @@ function normalizeActionError(err: unknown, t: AssetTranslator) {
   return t('spotOrderCancelFailed', 'asset')
 }
 
+function isRecoverableNetworkError(err: unknown) {
+  return err instanceof ApiError && err.code === 'NETWORK_ERROR'
+}
+
 export default function SpotOrderTabs({
   symbol,
   refreshKey = 0,
@@ -763,6 +769,7 @@ export default function SpotOrderTabs({
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimerRef = useRef<number | null>(null)
   const revalidateTimerRef = useRef<number | null>(null)
+  const currentOrdersRetryTimerRef = useRef<number | null>(null)
   const optimisticCleanupTimerRef = useRef<number | null>(null)
   const currentSymbolRef = useRef('')
   const activeTabRef = useRef<TabKey>('current')
@@ -779,6 +786,17 @@ export default function SpotOrderTabs({
   const tradesLoadedRef = useRef(false)
   const currentUserIdRef = useRef<string>('')
   const onBalanceUpdateRef = useRef(onBalanceUpdate)
+  const loadCurrentOrdersRef = useRef<(
+    reason?: string,
+    networkRetryAttempt?: number,
+  ) => Promise<void>>(async () => undefined)
+
+  const clearCurrentOrdersRetryTimer = useCallback(() => {
+    if (currentOrdersRetryTimerRef.current !== null) {
+      window.clearTimeout(currentOrdersRetryTimerRef.current)
+      currentOrdersRetryTimerRef.current = null
+    }
+  }, [])
 
   useEffect(() => {
     currentUserIdRef.current = normalizeUserId(user?.id)
@@ -790,6 +808,7 @@ export default function SpotOrderTabs({
 
   useEffect(() => {
     if (!isLoggedIn) {
+      clearCurrentOrdersRetryTimer()
       currentOrdersLoadedRef.current = false
       historyOrdersLoadedRef.current = false
       tradesLoadedRef.current = false
@@ -805,7 +824,7 @@ export default function SpotOrderTabs({
       setOptimisticTrades([])
       restTradesRef.current = []
     }
-  }, [isLoggedIn])
+  }, [clearCurrentOrdersRetryTimer, isLoggedIn])
 
   const beginLoading = useCallback(() => {
     loadingCounterRef.current += 1
@@ -822,6 +841,7 @@ export default function SpotOrderTabs({
   }, [loading, onLoadingChange])
 
   useEffect(() => {
+    clearCurrentOrdersRetryTimer()
     currentSymbolRef.current = normalizeSymbol(symbol)
     if (revalidateTimerRef.current !== null) {
       window.clearTimeout(revalidateTimerRef.current)
@@ -848,7 +868,7 @@ export default function SpotOrderTabs({
     restTradesRef.current = []
     setActionError('')
     setActionSuccess('')
-  }, [symbol])
+  }, [clearCurrentOrdersRetryTimer, symbol])
 
   useEffect(() => {
     activeTabRef.current = tab
@@ -869,13 +889,14 @@ export default function SpotOrderTabs({
   }, [actionSuccess])
 
   useEffect(() => () => {
+    clearCurrentOrdersRetryTimer()
     if (revalidateTimerRef.current !== null) {
       window.clearTimeout(revalidateTimerRef.current)
     }
     if (optimisticCleanupTimerRef.current !== null) {
       window.clearTimeout(optimisticCleanupTimerRef.current)
     }
-  }, [])
+  }, [clearCurrentOrdersRetryTimer])
 
   useEffect(() => {
     if (optimisticCleanupTimerRef.current !== null) {
@@ -1079,12 +1100,18 @@ export default function SpotOrderTabs({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, isLoggedIn])
 
-  const loadCurrentOrders = useCallback(async (reason = 'manual') => {
-    void reason
+  const loadCurrentOrders = useCallback(async (
+    reason = 'manual',
+    networkRetryAttempt = 0,
+  ) => {
     if (!isLoggedIn) {
       currentOrdersLoadedRef.current = false
       setCurrentOrders([])
       return
+    }
+
+    if (reason !== 'network-retry') {
+      clearCurrentOrdersRetryTimer()
     }
 
     const requestSymbol = currentSymbolRef.current || normalizeSymbol(symbol)
@@ -1111,7 +1138,27 @@ export default function SpotOrderTabs({
       setCurrentOrders(filterBySymbol(currentRes.items || [], requestSymbol))
       currentOrdersLoadedRef.current = true
     } catch (err) {
-      if (currentOrdersRequestSeqRef.current === requestSeq) {
+      const isCurrentRequest =
+        currentOrdersRequestSeqRef.current === requestSeq &&
+        requestSymbol === currentSymbolRef.current
+
+      if (
+        isCurrentRequest &&
+        isRecoverableNetworkError(err) &&
+        networkRetryAttempt === 0
+      ) {
+        clearCurrentOrdersRetryTimer()
+        currentOrdersRetryTimerRef.current = window.setTimeout(() => {
+          currentOrdersRetryTimerRef.current = null
+          if (
+            currentOrdersRequestSeqRef.current !== requestSeq ||
+            requestSymbol !== currentSymbolRef.current
+          ) {
+            return
+          }
+          void loadCurrentOrdersRef.current('network-retry', 1)
+        }, CURRENT_ORDERS_NETWORK_RETRY_DELAY_MS)
+      } else if (isCurrentRequest && !isRecoverableNetworkError(err)) {
         console.error('SpotOrderTabs current orders load error:', err)
       }
     } finally {
@@ -1120,7 +1167,17 @@ export default function SpotOrderTabs({
         if (shouldShowLoading) endLoading()
       }
     }
-  }, [beginLoading, endLoading, isLoggedIn, symbol])
+  }, [
+    beginLoading,
+    clearCurrentOrdersRetryTimer,
+    endLoading,
+    isLoggedIn,
+    symbol,
+  ])
+
+  useEffect(() => {
+    loadCurrentOrdersRef.current = loadCurrentOrders
+  }, [loadCurrentOrders])
 
   useEffect(() => {
     if (tab !== 'current') return
