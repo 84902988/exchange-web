@@ -1480,6 +1480,10 @@ class SpotMarketProviderWsService:
         self._task_start_counts: dict[tuple[str, str, str, str], int] = {}
         self._task_stop_counts: dict[tuple[str, str, str, str], int] = {}
         self._task_reconnect_counts: dict[tuple[str, str, str, str], int] = {}
+        self._task_last_reconnect_at_ms: dict[tuple[str, str, str, str], int] = {}
+        self._task_consecutive_failures: dict[tuple[str, str, str, str], int] = {}
+        self._task_release_timeout_counts: dict[tuple[str, str, str, str], int] = {}
+        self._stopping_threads: dict[tuple[str, str, str, str], threading.Thread] = {}
         self._lock = threading.RLock()
 
     def get_fresh_depth(
@@ -1719,6 +1723,10 @@ class SpotMarketProviderWsService:
             self._task_start_counts.clear()
             self._task_stop_counts.clear()
             self._task_reconnect_counts.clear()
+            self._task_last_reconnect_at_ms.clear()
+            self._task_consecutive_failures.clear()
+            self._task_release_timeout_counts.clear()
+            self._stopping_threads.clear()
 
     def get_metrics_snapshot(self) -> dict[str, Any]:
         now_ms = _now_ms()
@@ -1803,13 +1811,165 @@ class SpotMarketProviderWsService:
                     for key, record in sorted(self._kline_cache.items())
                 ],
             }
+            active_connections = [item for item in active_provider_tasks if item["connected"]]
+            running_threads = [item for item in active_provider_tasks if item["thread_alive"]]
+            stopping_threads = [
+                self._provider_thread_identity_from_metric_key(metric_key)
+                for metric_key, thread in sorted(self._stopping_threads.items())
+                if thread.is_alive()
+            ]
+            generation_records = self._generation_records_locked()
+            reconnect_records = self._reconnect_records_locked()
+            cache_metrics = self._cache_metrics_locked(now_ms)
+            lifecycle_created = sum(self._task_start_counts.values())
+            lifecycle_released = sum(self._task_stop_counts.values())
+            lifecycle_release_timeout = sum(self._task_release_timeout_counts.values())
 
         return {
             "active_provider_task_count": len(active_provider_tasks),
             "active_provider_tasks": active_provider_tasks,
             "active_kline_intervals": active_kline_intervals,
             "cache_records": cache_records,
+            "active_connections": {
+                "count": len(active_connections),
+                "items": [self._provider_task_identity(item) for item in active_connections],
+                "by_provider": self._count_provider_task_dimension(active_connections, "provider"),
+                "by_domain": self._count_provider_task_dimension(active_connections, "domain"),
+            },
+            "active_threads": {
+                "running_count": len(running_threads),
+                "stopping_count": len(stopping_threads),
+                "running": [self._provider_task_identity(item) for item in running_threads],
+                "stopping": stopping_threads,
+            },
+            "active_tasks": {
+                "websocket_task_count": len(active_provider_tasks),
+                "reconnect_task_count": 0,
+                "reconnect_model": "inline_provider_loop",
+            },
+            "generation": {
+                "records": generation_records,
+                "current_generation_count": len(generation_records),
+                "retired_generation_count": sum(
+                    int(item["retired_generation_count"]) for item in generation_records
+                ),
+            },
+            "reconnect": {
+                "count": sum(int(item["reconnect_count"]) for item in reconnect_records),
+                "last_reconnect_at_ms": max(
+                    (int(item["last_reconnect_at_ms"] or 0) for item in reconnect_records),
+                    default=0,
+                ) or None,
+                "consecutive_failures": sum(
+                    int(item["consecutive_failures"]) for item in reconnect_records
+                ),
+                "max_consecutive_failures": max(
+                    (int(item["consecutive_failures"]) for item in reconnect_records),
+                    default=0,
+                ),
+                "records": reconnect_records,
+            },
+            "lifecycle": {
+                "created": lifecycle_created,
+                "released": lifecycle_released,
+                "release_timeout": lifecycle_release_timeout,
+            },
+            "cache": cache_metrics,
         }
+
+    @staticmethod
+    def _provider_task_identity(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "provider": item.get("provider"),
+            "domain": item.get("domain"),
+            "symbol": item.get("symbol"),
+            "interval": item.get("interval"),
+        }
+
+    @staticmethod
+    def _count_provider_task_dimension(items: list[dict[str, Any]], field: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in items:
+            value = str(item.get(field) or "")
+            counts[value] = counts.get(value, 0) + 1
+        return dict(sorted(counts.items()))
+
+    @staticmethod
+    def _provider_thread_identity_from_metric_key(
+        metric_key: tuple[str, str, str, str],
+    ) -> dict[str, Any]:
+        domain, provider, symbol, interval = metric_key
+        return {
+            "provider": provider,
+            "domain": domain,
+            "symbol": symbol,
+            "interval": interval or None,
+        }
+
+    def _generation_records_locked(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        generation_maps = (
+            ("depth", self._depth_generations),
+            ("ticker", self._ticker_generations),
+            ("trades", self._trades_generations),
+            ("kline", self._kline_generations),
+        )
+        for domain, generations in generation_maps:
+            for key, generation in sorted(generations.items()):
+                provider, symbol, *interval_parts = key
+                records.append(
+                    {
+                        "provider": provider,
+                        "domain": domain,
+                        "symbol": symbol,
+                        "interval": interval_parts[0] if interval_parts else None,
+                        "current_generation": int(generation),
+                        "retired_generation_count": max(0, int(generation) - 1),
+                    }
+                )
+        return records
+
+    def _reconnect_records_locked(self) -> list[dict[str, Any]]:
+        metric_keys = sorted(
+            set(self._task_reconnect_counts)
+            | set(self._task_last_reconnect_at_ms)
+            | set(self._task_consecutive_failures)
+        )
+        return [
+            {
+                **self._provider_thread_identity_from_metric_key(metric_key),
+                "reconnect_count": int(self._task_reconnect_counts.get(metric_key) or 0),
+                "last_reconnect_at_ms": self._task_last_reconnect_at_ms.get(metric_key),
+                "consecutive_failures": int(self._task_consecutive_failures.get(metric_key) or 0),
+            }
+            for metric_key in metric_keys
+        ]
+
+    def _cache_metrics_locked(self, now_ms: int) -> dict[str, dict[str, int]]:
+        cache_specs = {
+            "depth": (self._depth_cache, self._depth_tasks, _max_age_ms(None)),
+            "ticker": (self._ticker_cache, self._ticker_tasks, _ticker_max_age_ms(None)),
+            "trades": (self._trades_cache, self._trades_tasks, _trades_max_age_ms(None)),
+            "kline": (self._kline_cache, self._kline_tasks, _kline_max_age_ms(None)),
+        }
+        metrics: dict[str, dict[str, int]] = {}
+        for domain, (records, tasks, max_age_ms) in cache_specs.items():
+            fresh_key_count = sum(
+                1 for record in records.values() if is_fresh_record(record, max_age_ms, now_ms=now_ms)
+            )
+            key_count = len(records)
+            domain_metrics = {
+                "key_count": key_count,
+                "active_key_count": sum(1 for key in records if key in tasks),
+                "fresh_key_count": fresh_key_count,
+                "stale_key_count": key_count - fresh_key_count,
+            }
+            if domain == "kline":
+                domain_metrics["bucket_count"] = sum(
+                    len(record.get("items") or []) for record in records.values()
+                )
+            metrics[domain] = domain_metrics
+        return metrics
 
     def _provider_metric_key(
         self,
@@ -1830,6 +1990,7 @@ class SpotMarketProviderWsService:
         metric_key = self._provider_metric_key(domain, provider, symbol, interval)
         self._task_started_at_ms[metric_key] = _now_ms()
         self._task_start_counts[metric_key] = int(self._task_start_counts.get(metric_key) or 0) + 1
+        self._task_consecutive_failures[metric_key] = 0
 
     def _remember_provider_task_stopped_locked(
         self,
@@ -1852,6 +2013,45 @@ class SpotMarketProviderWsService:
         metric_key = self._provider_metric_key(domain, provider, symbol, interval)
         with self._lock:
             self._task_reconnect_counts[metric_key] = int(self._task_reconnect_counts.get(metric_key) or 0) + 1
+            self._task_last_reconnect_at_ms[metric_key] = _now_ms()
+            self._task_consecutive_failures[metric_key] = int(
+                self._task_consecutive_failures.get(metric_key) or 0
+            ) + 1
+
+    def _remember_provider_task_connected_locked(
+        self,
+        domain: str,
+        provider: str,
+        symbol: str,
+        interval: Optional[str] = None,
+    ) -> None:
+        metric_key = self._provider_metric_key(domain, provider, symbol, interval)
+        self._task_consecutive_failures[metric_key] = 0
+
+    def _join_provider_thread_for_release(
+        self,
+        *,
+        domain: str,
+        provider: str,
+        symbol: str,
+        interval: Optional[str],
+        task: Optional[threading.Thread],
+    ) -> None:
+        if task is None or not task.is_alive() or task is threading.current_thread():
+            return
+        metric_key = self._provider_metric_key(domain, provider, symbol, interval)
+        with self._lock:
+            self._stopping_threads[metric_key] = task
+        try:
+            task.join(timeout=2.0)
+        finally:
+            with self._lock:
+                if task.is_alive():
+                    self._task_release_timeout_counts[metric_key] = int(
+                        self._task_release_timeout_counts.get(metric_key) or 0
+                    ) + 1
+                if self._stopping_threads.get(metric_key) is task:
+                    self._stopping_threads.pop(metric_key, None)
 
     def _provider_task_snapshot_locked(
         self,
@@ -1878,6 +2078,9 @@ class SpotMarketProviderWsService:
             "start_count": int(self._task_start_counts.get(metric_key) or 0),
             "stop_count": int(self._task_stop_counts.get(metric_key) or 0),
             "reconnect_count": int(self._task_reconnect_counts.get(metric_key) or 0),
+            "last_reconnect_at_ms": self._task_last_reconnect_at_ms.get(metric_key),
+            "consecutive_failures": int(self._task_consecutive_failures.get(metric_key) or 0),
+            "release_timeout_count": int(self._task_release_timeout_counts.get(metric_key) or 0),
         }
 
     def _cache_record_snapshot_locked(
@@ -2148,8 +2351,13 @@ class SpotMarketProviderWsService:
                     asyncio.run_coroutine_threadsafe(websocket.close(), loop)
                 except Exception:
                     logger.debug("spot_provider_ws_depth_close_failed symbol=%s", local_symbol, exc_info=True)
-        if task is not None and task.is_alive() and task is not threading.current_thread():
-            task.join(timeout=2.0)
+        self._join_provider_thread_for_release(
+            domain="depth",
+            provider=provider_code,
+            symbol=local_symbol,
+            interval=None,
+            task=task,
+        )
 
     def _stop_trades_subscription(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
         provider_code = normalize_spot_ws_provider(provider)
@@ -2170,8 +2378,13 @@ class SpotMarketProviderWsService:
                     asyncio.run_coroutine_threadsafe(websocket.close(), loop)
                 except Exception:
                     logger.debug("spot_provider_ws_trades_close_failed symbol=%s", local_symbol, exc_info=True)
-        if task is not None and task.is_alive() and task is not threading.current_thread():
-            task.join(timeout=2.0)
+        self._join_provider_thread_for_release(
+            domain="trades",
+            provider=provider_code,
+            symbol=local_symbol,
+            interval=None,
+            task=task,
+        )
 
     def _stop_ticker_subscription(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
         provider_code = normalize_spot_ws_provider(provider)
@@ -2192,8 +2405,13 @@ class SpotMarketProviderWsService:
                     asyncio.run_coroutine_threadsafe(websocket.close(), loop)
                 except Exception:
                     logger.debug("spot_provider_ws_ticker_close_failed symbol=%s", local_symbol, exc_info=True)
-        if task is not None and task.is_alive() and task is not threading.current_thread():
-            task.join(timeout=2.0)
+        self._join_provider_thread_for_release(
+            domain="ticker",
+            provider=provider_code,
+            symbol=local_symbol,
+            interval=None,
+            task=task,
+        )
 
     def _stop_kline_subscriptions(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
         provider_code = normalize_spot_ws_provider(provider)
@@ -2236,8 +2454,13 @@ class SpotMarketProviderWsService:
                         normalized_interval,
                         exc_info=True,
                     )
-        if task is not None and task.is_alive() and task is not threading.current_thread():
-            task.join(timeout=2.0)
+        self._join_provider_thread_for_release(
+            domain="kline",
+            provider=provider_code,
+            symbol=local_symbol,
+            interval=normalized_interval,
+            task=task,
+        )
 
     def _merge_provider_kline_record_locked(
         self,
@@ -2639,6 +2862,9 @@ class SpotMarketProviderWsService:
                     stop_event.set()
                     return
                 self._depth_connections[key] = (loop, websocket)
+                self._remember_provider_task_connected_locked(
+                    "depth", subscription.provider, subscription.local_symbol
+                )
             logger.info(
                 "spot_provider_ws_depth_subscription_started provider=%s symbol=%s provider_symbol=%s channel=%s",
                 subscription.provider,
@@ -2704,6 +2930,9 @@ class SpotMarketProviderWsService:
                     stop_event.set()
                     return
                 self._depth_connections[key] = (loop, websocket)
+                self._remember_provider_task_connected_locked(
+                    "depth", subscription.provider, subscription.local_symbol
+                )
             logger.info(
                 "spot_provider_ws_depth_subscription_started provider=%s symbol=%s provider_symbol=%s channel=%s",
                 subscription.provider,
@@ -2770,6 +2999,9 @@ class SpotMarketProviderWsService:
                     stop_event.set()
                     return
                 self._ticker_connections[key] = (loop, websocket)
+                self._remember_provider_task_connected_locked(
+                    "ticker", subscription.provider, subscription.local_symbol
+                )
             logger.info(
                 "spot_provider_ws_ticker_subscription_started provider=%s symbol=%s provider_symbol=%s channel=%s",
                 subscription.provider,
@@ -2835,6 +3067,9 @@ class SpotMarketProviderWsService:
                     stop_event.set()
                     return
                 self._ticker_connections[key] = (loop, websocket)
+                self._remember_provider_task_connected_locked(
+                    "ticker", subscription.provider, subscription.local_symbol
+                )
             logger.info(
                 "spot_provider_ws_ticker_subscription_started provider=%s symbol=%s provider_symbol=%s channel=%s",
                 subscription.provider,
@@ -2901,6 +3136,9 @@ class SpotMarketProviderWsService:
                     stop_event.set()
                     return
                 self._trades_connections[key] = (loop, websocket)
+                self._remember_provider_task_connected_locked(
+                    "trades", subscription.provider, subscription.local_symbol
+                )
             logger.info(
                 "spot_provider_ws_trades_subscription_started provider=%s symbol=%s provider_symbol=%s channel=%s",
                 subscription.provider,
@@ -2966,6 +3204,9 @@ class SpotMarketProviderWsService:
                     stop_event.set()
                     return
                 self._trades_connections[key] = (loop, websocket)
+                self._remember_provider_task_connected_locked(
+                    "trades", subscription.provider, subscription.local_symbol
+                )
             logger.info(
                 "spot_provider_ws_trades_subscription_started provider=%s symbol=%s provider_symbol=%s channel=%s",
                 subscription.provider,
@@ -3032,6 +3273,12 @@ class SpotMarketProviderWsService:
                     stop_event.set()
                     return
                 self._kline_connections[key] = (loop, websocket)
+                self._remember_provider_task_connected_locked(
+                    "kline",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.interval,
+                )
             logger.info(
                 "spot_provider_ws_kline_subscription_started provider=%s symbol=%s provider_symbol=%s interval=%s channel=%s",
                 subscription.provider,
@@ -3099,6 +3346,12 @@ class SpotMarketProviderWsService:
                     stop_event.set()
                     return
                 self._kline_connections[key] = (loop, websocket)
+                self._remember_provider_task_connected_locked(
+                    "kline",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.interval,
+                )
             logger.info(
                 "spot_provider_ws_kline_subscription_started provider=%s symbol=%s provider_symbol=%s interval=%s channel=%s",
                 subscription.provider,

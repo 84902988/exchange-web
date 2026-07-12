@@ -3264,6 +3264,11 @@ def test_provider_switch_releases_old_ws_owner_and_ensures_new_provider() -> Non
         assert ("ensure_kline", "BITGET_SPOT", "BTCUSDT", interval) in calls
     assert all(key not in gateway._kline_revision_high_water for key in old_kline_keys)
     assert gateway.get_active_depth_provider("BTCUSDT") == ("BITGET_SPOT", 2)
+    first_metrics = asyncio.run(gateway.get_metrics_snapshot())
+    assert first_metrics["provider_switch"]["count"] == 1
+    assert first_metrics["provider_switch"]["success"] == 1
+    assert first_metrics["provider_switch"]["failed"] == 0
+    assert first_metrics["provider_switch"]["last_duration_ms"] is not None
 
     calls.clear()
     assert gateway.commit_authoritative_depth(
@@ -3286,6 +3291,10 @@ def test_provider_switch_releases_old_ws_owner_and_ensures_new_provider() -> Non
         assert ("ensure_kline", "OKX_SPOT", "BTCUSDT", interval) in calls
     assert gateway.get_active_depth_provider("BTCUSDT") == ("OKX_SPOT", 3)
     assert gateway._ensured_kline_intervals["BTCUSDT"] == {"1Dutc", "1Wutc", "1Mutc"}
+    second_metrics = asyncio.run(gateway.get_metrics_snapshot())
+    assert second_metrics["provider_switch"]["count"] == 2
+    assert second_metrics["provider_switch"]["success"] == 2
+    assert second_metrics["provider_switch"]["failed"] == 0
 
 
 def test_provider_switch_lifecycle_failure_keeps_rest_depth_public_and_retries() -> None:
@@ -3317,6 +3326,11 @@ def test_provider_switch_lifecycle_failure_keeps_rest_depth_public_and_retries()
     assert public_state.depth.bids[0].price == switched.depth.bids[0].price
     assert gateway._symbol_providers["BTCUSDT"] == "BITGET_SPOT"
     assert gateway._pending_provider_switches["BTCUSDT"] == ("OKX_SPOT", "BITGET_SPOT")
+    metrics = asyncio.run(gateway.get_metrics_snapshot())
+    assert metrics["provider_switch"]["count"] == 1
+    assert metrics["provider_switch"]["success"] == 0
+    assert metrics["provider_switch"]["failed"] == 1
+    assert metrics["provider_switch"]["last_duration_ms"] is not None
 
 
 def test_concurrent_fallback_candidates_cannot_publish_retired_generation() -> None:
@@ -3353,6 +3367,45 @@ def test_concurrent_fallback_candidates_cannot_publish_retired_generation() -> N
     assert public_state is not None
     assert public_state.provider == accepted[0].provider
     assert public_state.provider_generation == accepted[0].provider_generation == 2
+
+
+def test_gateway_metrics_snapshot_summarizes_symbols_intervals_subscribers_and_broadcasts() -> None:
+    async def run() -> None:
+        gateway = _new_test_gateway()
+        ws_manager = gateway._ws_manager
+        empty = await gateway.get_metrics_snapshot()
+        assert empty["active_symbol_count"] == 0
+        assert empty["active_interval_count"] == 0
+        assert empty["active_refresh_loop_count"] == 0
+        assert empty["subscriber_count"] == 0
+        assert empty["broadcast"]["total_count"] == 0
+
+        ws_manager.count = 3
+        gateway._symbol_providers["BTCUSDT"] = "BITGET_SPOT"
+        gateway._depth_authority.ensure_provider("BTCUSDT", "BITGET_SPOT")
+        gateway._ensured_kline_intervals["BTCUSDT"] = {"1m", "5m"}
+        refresh_task = asyncio.create_task(asyncio.sleep(60))
+        gateway._tasks["BTCUSDT"] = refresh_task
+        gateway._remember_broadcast_metric("BTCUSDT", "depth")
+        gateway._remember_broadcast_metric("BTCUSDT", "ticker")
+        try:
+            snapshot = await gateway.get_metrics_snapshot()
+        finally:
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
+
+        assert snapshot["active_symbol_count"] == 1
+        assert snapshot["active_interval_count"] == 2
+        assert snapshot["active_refresh_loop_count"] == 1
+        assert snapshot["subscriber_count"] == 3
+        assert snapshot["active_intervals"] == {"BTCUSDT": ["1m", "5m"]}
+        assert snapshot["broadcast"]["total_count"] == 2
+        assert snapshot["broadcast"]["per_domain_count"]["depth"] == 1
+        assert snapshot["broadcast"]["per_domain_count"]["ticker"] == 1
+        assert snapshot["latency"]["available"] is False
+        assert snapshot["latency"]["cache_to_gateway_ms"] is None
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
