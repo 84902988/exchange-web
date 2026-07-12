@@ -7,8 +7,6 @@ import {
 } from '@/lib/api/modules/spot';
 import {
   spotMarketRealtime,
-  type SpotMarketKlineMessage,
-  type SpotMarketRealtimeMessage,
 } from '@/services/marketRealtime';
 import { normalizeTimeToSeconds } from '../chart/chart.utils';
 import type { SpotChartProps, SpotKlineLoadState } from '../chart/chart.types';
@@ -45,6 +43,10 @@ import {
   requestSpotKlineInFlight,
   type SpotKlineInFlightRole,
 } from './spotKlinePreloadManager';
+import {
+  subscribeSpotKlineCurrent,
+  type SpotKlineStoreRealtimeEvent,
+} from './spotKlineStoreAdapter';
 
 type TradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
 
@@ -2895,25 +2897,22 @@ export function createSpotTradingViewDatafeed(
         return true;
       };
 
-      const handleKline = (realtimeMessage: SpotMarketRealtimeMessage) => {
+      const handleKline = (message: SpotKlineStoreRealtimeEvent) => {
         if (!isCurrentSubscription()) return;
 
-        const message = realtimeMessage as SpotMarketKlineMessage;
-        if (message.type !== 'spot_kline_update') return;
-
-        const msgSymbol = normalizeSpotSymbol(message.symbol || '');
+        const msgSymbol = normalizeSpotSymbol(message.symbol);
         if (msgSymbol !== apiSymbol) return;
 
-        const msgInterval = normalizeSpotInterval(String(message.interval || ''));
+        const msgInterval = normalizeSpotInterval(message.interval);
         if (msgInterval !== interval) return;
 
         const klinePayload = message.kline && typeof message.kline === 'object'
           ? message.kline as Record<string, unknown>
           : null;
-        const klineProvider = normalizeProvider(klinePayload?.provider || (message as { provider?: unknown }).provider);
+        const klineProvider = normalizeProvider(klinePayload?.provider || message.provider);
         const klineSource = normalizeSource(klinePayload?.source || message.source);
         const klineFreshness = normalizeKlineMetaValue(
-          klinePayload?.freshness || (message as { freshness?: unknown }).freshness,
+          klinePayload?.freshness || message.freshness,
         ) || (klineSource === 'LIVE_WS' ? 'LIVE' : 'RECENT');
         const bar = klinePayloadToBar(message.kline, interval, klineProvider, klineSource);
         if (!bar) return;
@@ -2929,6 +2928,16 @@ export function createSpotTradingViewDatafeed(
           lastEmittedBarTimeByUid.get(subscriberUid) || 0,
         );
         if (bar.time < latestAcceptedTime) return;
+        const revisionPayload = klinePayload
+          ? {
+              ...klinePayload,
+              revision_epoch: klinePayload.revision_epoch ?? message.revision?.epoch,
+              revision_seq: klinePayload.revision_seq ?? message.revision?.sequence ?? message.sequence,
+              is_closed: klinePayload.is_closed ?? message.revision?.is_closed ?? message.closed,
+              close_state_source: klinePayload.close_state_source
+                ?? message.revision?.close_state_source,
+            }
+          : null;
         const revisionResult = revisionCache.merge({
           symbol: apiSymbol,
           interval,
@@ -2936,11 +2945,11 @@ export function createSpotTradingViewDatafeed(
           bar,
           provider: klineProvider,
           source: klineSource,
-          revision: extractSpotKlineRevisionMetadata(klinePayload),
+          revision: extractSpotKlineRevisionMetadata(revisionPayload),
         });
         const revisionBar = revisionResult.winner.bar;
         const realtimeDebugPayload = {
-          eventType: message.type,
+          eventType: 'spot_kline_store_update',
           symbol: apiSymbol,
           msgSymbol,
           interval,
@@ -2977,7 +2986,7 @@ export function createSpotTradingViewDatafeed(
           provider: klineProvider || null,
           source: klineSource || 'LIVE_WS',
           freshness: klineFreshness,
-          receivedAtMs: Date.now(),
+          receivedAtMs: message.receivedAtMs,
         });
       };
 
@@ -2987,7 +2996,12 @@ export function createSpotTradingViewDatafeed(
         domains: ['kline'],
         owner: realtimeOwner,
       });
-      const unsubscribeKline = spotMarketRealtime.subscribe('kline', handleKline);
+      const unsubscribeKline = subscribeSpotKlineCurrent({
+        symbol: apiSymbol,
+        interval,
+        owner: `${realtimeOwner}:${subscriberUid}`,
+        onSnapshot: handleKline,
+      });
       const unsubscribe = () => {
         unsubscribeKline();
         spotMarketRealtime.releaseSubscription(subscriptionId);
