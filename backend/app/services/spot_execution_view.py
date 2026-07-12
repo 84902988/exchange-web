@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -12,6 +13,12 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.models.trading_pair import TradingPair
 from app.schemas.market import DepthItem, DepthResponse
+from app.schemas.spot_domain_snapshot import (
+    DomainCacheOrigin,
+    DomainName,
+    DomainSource,
+    DomainTransport,
+)
 from app.services.contract_market_provider_service import (
     MARKET_TYPE_SPOT,
     MarketDataProviderConfig,
@@ -23,10 +30,12 @@ from app.services.contract_market_provider_service import (
 )
 from app.services.spot_market_gateway import spot_market_gateway
 from app.services.spot_market_provider_ws import get_spot_provider_ws_depth
+from app.services.spot_domain_snapshot_freshness import DomainSnapshotContext
 
 
 _EXECUTABLE_SOURCES = {"LIVE_WS", "REST"}
 _EXECUTABLE_FRESHNESS = {"LIVE", "RECENT"}
+logger = logging.getLogger(__name__)
 
 
 class SpotExecutionUnavailable(RuntimeError):
@@ -480,6 +489,30 @@ def get_spot_execution_snapshot(
             )
             if state is None:
                 continue
+            try:
+                spot_market_gateway.record_depth_domain_snapshot(
+                    depth=state.depth,
+                    context=DomainSnapshotContext(
+                        domain=DomainName.DEPTH,
+                        symbol=normalized_symbol,
+                        transport=DomainTransport.PROVIDER_REST,
+                        cache_origin=DomainCacheOrigin.NONE,
+                        source=DomainSource.REST_SNAPSHOT,
+                        provider=state.provider,
+                        provider_symbol=state.provider_symbol,
+                        provider_event_time_ms=state.event_time_ms,
+                        received_at_ms=state.received_at_ms,
+                        ttl_ms=max_age_ms,
+                        provider_generation=state.provider_generation,
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "spot_execution_depth_snapshot_record_failed symbol=%s provider=%s",
+                    normalized_symbol,
+                    state.provider,
+                    exc_info=True,
+                )
             mark_contract_market_provider_success(db, provider_code, market_type=MARKET_TYPE_SPOT)
             snapshot = _build_snapshot(
                 symbol=normalized_symbol,
