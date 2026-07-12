@@ -174,6 +174,24 @@ def _summary_from_account(account: ContractAccount) -> ContractAccountSummaryRes
     )
 
 
+def _empty_account_summary(
+    *,
+    user_id: int,
+    margin_asset: str,
+) -> ContractAccountSummaryResponse:
+    return ContractAccountSummaryResponse(
+        user_id=user_id,
+        margin_asset=margin_asset,
+        available_margin="0",
+        used_margin="0",
+        frozen_margin="0",
+        position_margin="0",
+        realized_pnl="0",
+        unrealized_pnl="0",
+        equity="0",
+    )
+
+
 def get_or_create_contract_account(
     db: Session,
     user_id: int,
@@ -186,9 +204,19 @@ def get_or_create_contract_account(
 
 
 def get_contract_account_summary(db: Session, user_id: int) -> ContractAccountSummaryResponse:
-    account = get_or_create_contract_account(db, user_id, CONTRACT_MARGIN_ASSET)
-    db.commit()
-    db.refresh(account)
+    normalized_user_id = _normalize_user_id(user_id)
+    normalized_asset = _normalize_margin_asset(CONTRACT_MARGIN_ASSET)
+    account = (
+        db.query(ContractAccount)
+        .filter(ContractAccount.user_id == normalized_user_id)
+        .filter(ContractAccount.margin_asset == normalized_asset)
+        .first()
+    )
+    if account is None:
+        return _empty_account_summary(
+            user_id=normalized_user_id,
+            margin_asset=normalized_asset,
+        )
     return _summary_from_account(account)
 
 
