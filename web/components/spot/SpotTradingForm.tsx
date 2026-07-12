@@ -22,7 +22,6 @@ import {
   getSpotBboAvailabilityLabel,
   getSpotBboBasisLabel,
   resolveSpotMarketStatus,
-  spotMarketStatusDotClass,
 } from './spotMarketStatus';
 import {
   getSpotPriceStep,
@@ -1970,17 +1969,7 @@ export default function SpotTradingForm({
         </div>
 
         <div className="rounded-lg border border-white/[0.06] bg-[#0b1016] px-3 py-2.5 text-[11px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] [@media(max-height:850px)]:px-2.5 [@media(max-height:850px)]:py-1.5">
-          <div className="flex min-w-0 items-center justify-between gap-2">
-            <span className="min-w-0 truncate text-white/46">{bboBasisLabel}</span>
-            <span
-              className="inline-flex h-5 max-w-[4.25rem] shrink-0 items-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.025] px-1.5 text-[10px] font-semibold text-white/56"
-              title={bboStatus.fullLabel}
-              aria-label={bboStatus.fullLabel}
-            >
-              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${spotMarketStatusDotClass(bboStatus.kind)}`} />
-              <span className="min-w-0 truncate">{bboStatus.compactLabel}</span>
-            </span>
-          </div>
+          <div className="min-w-0 truncate text-white/46">{bboBasisLabel}</div>
           <div className="mt-1 flex min-w-0 items-center justify-between gap-2 text-white/36 [@media(max-height:850px)]:mt-0.5">
             <span className="min-w-0 truncate">{bboPrice || '--'}</span>
             <span className={bboStatus.isFresh && bboPrice ? 'text-emerald-200/78' : 'text-white/34'}>

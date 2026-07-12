@@ -26,6 +26,7 @@ export type SpotMarketStatusInput = {
   freshness?: string | null;
   dataSource?: string | null;
   isLoading?: boolean;
+  isHydrating?: boolean;
 };
 
 export type SpotKlineLoadState = 'loading' | 'loaded' | 'empty' | 'error';
@@ -155,7 +156,9 @@ export function resolveSpotMarketStatus(
 
   let kind: SpotMarketStatusKind = 'unavailable';
 
-  if (input.isLoading && !source && !freshness) {
+  if (input.isHydrating) {
+    kind = 'loading';
+  } else if (input.isLoading && !source && !freshness) {
     kind = 'loading';
   } else if (source && !UNKNOWN_VALUES.has(source)) {
     if (LOADING_VALUES.has(source)) {

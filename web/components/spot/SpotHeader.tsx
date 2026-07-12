@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useEffect, useMemo, useState } from 'react';
-import MarketStatusBadge from '@/components/market/MarketStatusBadge';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import {
@@ -11,8 +10,22 @@ import {
 } from './spotTickerColor';
 import {
   resolveSpotMarketStatus,
-  spotMarketStatusDotClass,
 } from './spotMarketStatus';
+
+type SpotMarketPresentationKind = 'live' | 'delayed' | 'unavailable' | 'loading';
+
+function spotMarketStatusTone(kind: SpotMarketPresentationKind) {
+  if (kind === 'live') {
+    return 'bg-[#00c087]';
+  }
+  if (kind === 'delayed') {
+    return 'bg-[#f0b90b]';
+  }
+  if (kind === 'unavailable') {
+    return 'bg-[#f6465d]';
+  }
+  return 'bg-white/36';
+}
 
 interface SpotHeaderProps {
   symbol: string;
@@ -30,6 +43,7 @@ interface SpotHeaderProps {
   tickerFreshness?: string | null;
   dataSource?: string | null;
   isLoading?: boolean;
+  isHydrating?: boolean;
   marketSessionType?: string | null;
   symbolSelector?: React.ReactNode;
 }
@@ -50,6 +64,7 @@ export default function SpotHeader({
   tickerFreshness,
   dataSource,
   isLoading = false,
+  isHydrating = false,
   marketSessionType,
   symbolSelector,
 }: SpotHeaderProps) {
@@ -79,10 +94,69 @@ export default function SpotHeader({
   const priceFlashClass = flash ? getTickerDirectionFlashClass(priceDirection) : '';
   const displayPriceStatus = resolveSpotMarketStatus({
     source: tickerSource,
-    freshness: tickerFreshness,
+    freshness: tickerFreshness || quoteFreshness,
     dataSource,
     isLoading,
+    isHydrating,
   }, t);
+  const marketStatusPresentation = useMemo(() => {
+    const assetLabel = (key: string, fallback: string) => {
+      const value = t(key, 'asset');
+      return value && value !== key ? value : fallback;
+    };
+    const presentationKind: SpotMarketPresentationKind = displayPriceStatus.kind === 'loading'
+      ? 'loading'
+      : displayPriceStatus.kind === 'unavailable'
+        ? 'unavailable'
+        : displayPriceStatus.kind === 'live' || displayPriceStatus.kind === 'internal'
+          ? 'live'
+          : 'delayed';
+
+    if (presentationKind === 'live') {
+      return {
+        kind: presentationKind,
+        label: assetLabel('spotMarketStatusLiveCompact', 'Live'),
+        fullLabel: assetLabel('spotMarketStatusLive', 'Live market'),
+      };
+    }
+    if (presentationKind === 'delayed') {
+      return {
+        kind: presentationKind,
+        label: assetLabel('spotMarketStatusDelayedCompact', 'Delayed'),
+        fullLabel: assetLabel('spotMarketStatusDelayed', 'Delayed market'),
+      };
+    }
+    if (presentationKind === 'unavailable') {
+      return {
+        kind: presentationKind,
+        label: assetLabel('spotMarketStatusUnavailableCompact', 'Unavailable'),
+        fullLabel: assetLabel('spotMarketStatusUnavailable', 'Unavailable'),
+      };
+    }
+    return {
+      kind: presentationKind,
+      label: assetLabel('spotMarketStatusLoadingCompact', 'Loading'),
+      fullLabel: assetLabel('spotMarketStatusLoading', 'Loading'),
+    };
+  }, [displayPriceStatus.kind, t]);
+  const displayPriceStatusTone = spotMarketStatusTone(marketStatusPresentation.kind);
+  const tradingSessionLabel = useMemo(() => {
+    const status = String(marketStatus || '').trim().toUpperCase();
+    const sessionType = String(marketSessionType || '').trim().toUpperCase();
+    const marketLabel = (key: string, fallback: string) => {
+      const value = t(key, 'markets');
+      return value && value !== key ? value : fallback;
+    };
+
+    if (sessionType === 'PRE_MARKET') return marketLabel('market.session.preMarket', 'Pre-market');
+    if (sessionType === 'AFTER_HOURS') return marketLabel('market.session.afterHours', 'After-hours');
+    if (status === 'HOLIDAY' || sessionType === 'HOLIDAY') {
+      return marketLabel('market.session.holiday', 'Market holiday');
+    }
+    if (status === 'CLOSED') return marketLabel('market.session.closed', 'Closed');
+    if (status === 'OPEN') return marketLabel('market.session.open', 'Trading');
+    return marketLabel('market.session.unknown', 'Status unknown');
+  }, [marketSessionType, marketStatus, t]);
 
   const statColorClass = useMemo(() => {
     if (isChangeUp) return 'text-[#00c087]';
@@ -133,13 +207,6 @@ export default function SpotHeader({
             <div className="min-h-4 pl-1 text-[12px] font-semibold leading-tight">
               <span className={statColorClass}>{changeSummary}</span>
             </div>
-            <div
-              className="inline-flex min-h-4 items-center gap-1 pl-1 text-[10px] font-medium text-white/42"
-              title={displayPriceStatus.fullLabel}
-            >
-              <span className={`h-1.5 w-1.5 rounded-full ${spotMarketStatusDotClass(displayPriceStatus.kind)}`} />
-              <span>{displayPriceStatus.compactLabel}</span>
-            </div>
           </div>
         </div>
 
@@ -147,12 +214,21 @@ export default function SpotHeader({
           <Metric
             label={t('spotHeaderTradeStatus', 'asset')}
             value={
-              <MarketStatusBadge
-                marketStatus={marketStatus || 'UNKNOWN'}
-                quoteFreshness={quoteFreshness}
-                marketSessionType={marketSessionType}
-                className="!border-transparent !bg-transparent !px-0 !py-0 text-[13px] font-medium"
-              />
+              <span
+                data-testid="spot-header-market-trading-status"
+                className="inline-flex min-w-0 items-center gap-1.5 whitespace-nowrap text-[13px] font-medium text-white/78"
+                title={`${marketStatusPresentation.fullLabel} · ${tradingSessionLabel}`}
+              >
+                <span className="inline-flex min-w-0 items-center gap-1">
+                  <span
+                    data-testid="spot-header-market-status-dot"
+                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${displayPriceStatusTone}`}
+                  />
+                  <span className="truncate">{marketStatusPresentation.label}</span>
+                </span>
+                <span className="text-white/36">·</span>
+                <span className="truncate">{tradingSessionLabel}</span>
+              </span>
             }
           />
           <Metric label={t('spotHeaderHigh24h', 'asset')} value={high24h} />
