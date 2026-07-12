@@ -477,6 +477,7 @@ export function useContractMarketView({
   const depthInFlightSymbolRef = useRef<string | null>(null);
   const tradesRequestSeqRef = useRef(0);
   const tradesInFlightSymbolRef = useRef<string | null>(null);
+  const marketViewErrorSymbolRef = useRef<string | null>(null);
   const mountedRef = useRef(false);
   const currentPriceRef = useRef<number | null>(null);
   const previousMarketViewDisplayStateRef = useRef<string | null>(null);
@@ -518,10 +519,12 @@ export function useContractMarketView({
         return;
       }
       setRestMarketView(view);
+      marketViewErrorSymbolRef.current = null;
       setMarketViewError(null);
     } catch (error) {
       if (!mountedRef.current || requestSeqRef.current !== requestSeq) return;
       setRestMarketView(null);
+      marketViewErrorSymbolRef.current = requestSymbol;
       setMarketViewError(getErrorMessage(error));
     } finally {
       if (inFlightSymbolRef.current === requestSymbol) {
@@ -550,6 +553,7 @@ export function useContractMarketView({
     tradesInFlightSymbolRef.current = null;
     currentPriceRef.current = null;
     previousMarketViewDisplayStateRef.current = null;
+    marketViewErrorSymbolRef.current = null;
     setRestMarketView(null);
     setWsState(null);
     setMarketViewError(null);
@@ -615,6 +619,12 @@ export function useContractMarketView({
     ? restMarketView
     : null;
   const marketView = activeRealtimeMarketView || activeRestMarketView;
+  const currentMarketViewLoading = marketViewLoading || Boolean(
+    !marketView && (restMarketView || wsState),
+  );
+  const currentMarketViewError = marketViewErrorSymbolRef.current === normalizeContractSymbol(contractSymbol)
+    ? marketViewError
+    : null;
 
   const quote = quoteState.contractQuote;
   const marketStatus = quote?.market_status || fallbackMarketStatus || null;
@@ -625,7 +635,7 @@ export function useContractMarketView({
   const quoteDisplayStatus = getContractQuoteDisplayStatus(quote, { loading: quoteStatusLoading });
   const rawMarketViewDisplayState = normalizeMarketViewDisplayState(marketView?.display_state);
   const marketViewDisplayState = normalizeMarketViewDisplayState(
-    rawMarketViewDisplayState || (marketViewLoading ? 'LOADING' : null),
+    rawMarketViewDisplayState || (currentMarketViewLoading ? 'LOADING' : null),
   );
   const marketViewQuoteDisplayStatus = marketViewStateToQuoteStatus(marketViewDisplayState);
   const effectiveQuoteDisplayStatus = marketViewQuoteDisplayStatus || quoteDisplayStatus;
@@ -1032,7 +1042,7 @@ export function useContractMarketView({
       };
     }
 
-    if (marketViewLoading && !marketView && quoteDisplayStatus === 'LOADING') {
+    if (currentMarketViewLoading && !marketView && quoteDisplayStatus === 'LOADING') {
       return {
         label: t('marketDataLoadingLabel', 'contracts'),
         isLoading: true,
@@ -1060,7 +1070,7 @@ export function useContractMarketView({
     marketSessionType,
     marketStatus,
     marketView,
-    marketViewLoading,
+    currentMarketViewLoading,
     quote?.executable,
     quoteDisplayStatus,
     rawMarketViewDisplayState,
@@ -1386,8 +1396,8 @@ export function useContractMarketView({
   return {
     ...quoteState,
     marketView,
-    marketViewLoading,
-    marketViewError,
+    marketViewLoading: currentMarketViewLoading,
+    marketViewError: currentMarketViewError,
     displayPrice,
     displayState: rawMarketViewDisplayState,
     displayPriceSource,

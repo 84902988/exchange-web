@@ -17,7 +17,6 @@ import {
 } from './contractMarketSourceStatus';
 
 type ContractFuturesOrderBookProps = {
-  symbol: string;
   priceDirection?: 'up' | 'down' | 'flat';
   pricePrecision: number;
   bids?: ContractDepthLevel[];
@@ -137,7 +136,6 @@ function sortLevelsByPrice(levels: ContractDepthLevel[], direction: 'asc' | 'des
 }
 
 export default function ContractFuturesOrderBook({
-  symbol,
   priceDirection = 'flat',
   pricePrecision,
   bids = [],
@@ -200,7 +198,6 @@ export default function ContractFuturesOrderBook({
       : priceDirection === 'down'
         ? 'text-[#f6465d]'
         : 'text-white';
-  const titleLabel = t('orderBook', 'contracts');
   const depthModeLabel = getDepthModeLabel(depthMode);
   const centerDisplayPrice = !hasCenterPrice || centerPriceNumber === null
     ? '--'
@@ -216,11 +213,8 @@ export default function ContractFuturesOrderBook({
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
-      <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
-        <div className="flex min-w-0 flex-nowrap items-center gap-2">
-          <div className="shrink-0 whitespace-nowrap text-[13px] font-medium text-white/88">
-            {titleLabel}
-          </div>
+      {hasDepthQuoteStatus || depthModeLabel ? (
+        <div className="mb-1.5 flex min-h-5 min-w-0 items-center gap-2 px-1">
           {hasDepthQuoteStatus ? (
             <div
               className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${displayDepthStatusClass}`}
@@ -235,10 +229,7 @@ export default function ContractFuturesOrderBook({
             </div>
           ) : null}
         </div>
-        <div className="shrink-0 whitespace-nowrap rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/42">
-          {displaySymbol(symbol)}
-        </div>
-      </div>
+      ) : null}
 
       <div className="mb-1.5 grid grid-cols-3 px-1 text-[11px] font-medium text-gray-400">
         <div>{t('price', 'contracts')}</div>
@@ -252,7 +243,7 @@ export default function ContractFuturesOrderBook({
         </div>
       ) : askRows.length === 0 && bidRows.length === 0 ? (
         <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-white/40">
-          {t('noOrderBookData', 'contracts')}
+          {error ? t('marketDataUnavailable', 'contracts') : t('noOrderBookData', 'contracts')}
         </div>
       ) : (
         <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-1">
@@ -316,8 +307,4 @@ function BookRow({
       <div className="relative text-right text-white/50">{formatAmount(row.total)}</div>
     </button>
   );
-}
-
-function displaySymbol(symbol: string) {
-  return symbol.replace(/_PERP$/, '');
 }
