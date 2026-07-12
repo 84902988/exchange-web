@@ -42,6 +42,7 @@ from app.services.market_kline_cache import (
     KLINE_PROVIDER_ERROR_UNKNOWN,
     KlineCacheResult,
     KlineProviderFetchError,
+    KlineProviderHistoryBoundary,
     get_klines_cache_first,
 )
 from app.services.spot_kline_bucket import (
@@ -2406,9 +2407,18 @@ def _fetch_external_spot_klines(
 ) -> list[dict[str, Any]]:
     last_error: Optional[Exception] = None
     last_provider_code: Optional[str] = None
-    providers = _enabled_spot_market_providers_for_pair(db, pair, max_providers=1 if fast else None)
+    providers = list(
+        _enabled_spot_market_providers_for_pair(
+            db,
+            pair,
+            max_providers=1 if fast else None,
+        )
+    )
+    explicit_empty_provider_codes: list[str] = []
+    had_non_boundary_error = False
     timeout_cap_ms = _SPOT_KLINE_FAST_TIMEOUT_CAP_MS if fast else _SPOT_PROVIDER_REQUEST_TIMEOUT_CAP_MS
     for provider in providers:
+        provider_returned_empty = False
         try:
             last_provider_code = provider.provider_code
             if before_provider_fetch is not None:
@@ -2439,6 +2449,8 @@ def _fetch_external_spot_klines(
                     end_time_ms=end_time_ms,
                 )
             if not items:
+                provider_returned_empty = True
+                explicit_empty_provider_codes.append(str(provider.provider_code))
                 raise ValueError("spot kline unavailable")
             if fetch_metadata is not None:
                 fetch_metadata.clear()
@@ -2457,6 +2469,7 @@ def _fetch_external_spot_klines(
             mark_contract_market_provider_success(db, provider.provider_code, market_type="SPOT")
             return items
         except MarketDataProviderError as exc:
+            had_non_boundary_error = True
             if _is_spot_provider_cooldown_skip(exc):
                 last_error = exc
                 logger.debug(
@@ -2476,6 +2489,8 @@ def _fetch_external_spot_klines(
                 reason=exc,
             )
         except Exception as exc:
+            if not provider_returned_empty:
+                had_non_boundary_error = True
             last_error = exc
             mark_contract_market_provider_failure(db, provider.provider_code, exc, cooldown_seconds=provider.cooldown_seconds, market_type="SPOT")
             _log_spot_provider_kline_failure(
@@ -2485,18 +2500,37 @@ def _fetch_external_spot_klines(
                 end_time_ms=end_time_ms,
                 reason=exc,
             )
+    monthly_history_boundary_candidate = bool(
+        end_time_ms is not None
+        and normalize_spot_kline_bucket_interval(interval) == "1Mutc"
+        and providers
+        and len(explicit_empty_provider_codes) == len(providers)
+        and not had_non_boundary_error
+    )
     if contract_market_last_good_enabled(db):
         cached = _SPOT_LAST_GOOD_KLINES.get((pair.symbol, interval))
         if cached and cached.get("items"):
-            if fetch_metadata is not None:
-                fetch_metadata.clear()
-                fetch_metadata.update(
-                    {
-                        "provider": cached.get("provider") or last_provider_code,
-                        "from_last_good": True,
-                    }
-                )
-            return list(cached["items"])[-limit:]
+            cached_items = list(cached["items"])[-limit:]
+            has_usable_history_item = not monthly_history_boundary_candidate or any(
+                int(item.get("open_time") or item.get("time") or 0) < int(end_time_ms or 0)
+                for item in cached_items
+                if isinstance(item, dict)
+            )
+            if has_usable_history_item:
+                if fetch_metadata is not None:
+                    fetch_metadata.clear()
+                    fetch_metadata.update(
+                        {
+                            "provider": cached.get("provider") or last_provider_code,
+                            "from_last_good": True,
+                        }
+                    )
+                return cached_items
+    if monthly_history_boundary_candidate:
+        raise KlineProviderHistoryBoundary(
+            "spot provider monthly history boundary",
+            provider_error_provider=last_provider_code,
+        )
     raise KlineProviderFetchError(
         "spot external kline unavailable",
         provider_error_code=_spot_kline_provider_error_code(last_error),
