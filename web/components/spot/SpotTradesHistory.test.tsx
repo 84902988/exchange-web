@@ -10,6 +10,33 @@ jest.mock('@/contexts/LocaleContext', () => ({
 }))
 
 describe('SpotTradesHistory', () => {
+  it('omits the redundant internal title row and shows up to 24 recent trades by default', () => {
+    const trades = Array.from({ length: 26 }, (_, index): SpotMarketTradeItem => ({
+      price: String(100 + index),
+      amount: '1',
+      side: 'BUY',
+      provider_trade_id: `trade-${index}`,
+      event_time_ms: 1_720_000_000_000 - index * 1_000,
+    }))
+
+    render(
+      <SpotTradesHistory
+        symbol="BTCUSDT"
+        displaySymbol="BTC/USDT"
+        pricePrecision={2}
+        trades={trades}
+      />,
+    )
+
+    expect(screen.queryByText('spotMarketTrades')).not.toBeInTheDocument()
+    expect(screen.queryByText('BTC/USDT')).not.toBeInTheDocument()
+    expect(screen.getAllByTestId(/spot-recent-trade-/)).toHaveLength(24)
+    expect(screen.getByTestId('spot-recent-trade-first').parentElement).toHaveClass(
+      'grid',
+      'auto-rows-[minmax(24px,1fr)]',
+    )
+  })
+
   it('renders colliding weak rows with unique keys and never displays compatibility ts as event time', () => {
     const consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined)
     const weak: SpotMarketTradeItem = {

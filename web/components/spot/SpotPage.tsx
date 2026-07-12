@@ -1543,7 +1543,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const spotPriceStatusFreshness = activeDisplayPrice.freshness;
   const spotMarketSessionType = selectedTicker?.marketSessionType || selectedPair?.marketSessionType || null;
   const marketSyncingText = t('loading', 'common');
-  const shouldShowMarketSyncing = isSwitchingSymbol || (spotMarket.isLoading && spotLastPrice === '--');
+  const shouldShowMarketHydrating = isSwitchingSymbol || spotMarket.isHydrating;
+  const shouldShowMarketSyncing = isSwitchingSymbol || (spotMarket.isHydrating && spotLastPrice === '--');
   const isDepthLoading = isSwitchingSymbol || (spotMarket.isLoading && safeSpotDepth === null);
   const isTradesLoading = isSwitchingSymbol || (spotMarket.isLoading && safeSpotTrades.length === 0);
   const displayLatestPrice = isSwitchingSymbol ? '--' : shouldShowMarketSyncing ? marketSyncingText : spotLastPrice;
@@ -1615,6 +1616,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           tickerFreshness={spotPriceStatusFreshness}
           dataSource={spotMarketDataSource}
           isLoading={shouldShowMarketSyncing}
+          isHydrating={shouldShowMarketHydrating}
           marketSessionType={spotMarketSessionType}
           symbolSelector={
             <GlobalMarketSelector
@@ -1670,14 +1672,14 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
           <div className="min-w-0 min-h-0 xl:col-start-2 xl:row-start-1">
             <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
-              <div className="shrink-0 border-b border-white/10 px-2.5 py-2">
-                <div className="inline-flex rounded-md bg-[#0b0e11] p-1">
+              <div className="shrink-0 border-b border-white/10 px-2.5">
+                <div className="inline-flex h-10 items-stretch gap-5">
                   <button
                     type="button"
                     onClick={() => setRightPanelTab('orderbook')}
-                    className={`rounded px-3 py-1.5 text-sm transition-colors ${
+                    className={`relative px-0 text-[13px] font-medium leading-4 transition-colors ${
                       rightPanelTab === 'orderbook'
-                        ? 'bg-white text-black'
+                        ? 'text-white after:absolute after:inset-x-0 after:bottom-[-1px] after:h-0.5 after:rounded-full after:bg-white'
                         : 'text-white/65 hover:text-white'
                     }`}
                   >
@@ -1686,9 +1688,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                   <button
                     type="button"
                     onClick={() => setRightPanelTab('trades')}
-                    className={`rounded px-3 py-1.5 text-sm transition-colors ${
+                    className={`relative px-0 text-[13px] font-medium leading-4 transition-colors ${
                       rightPanelTab === 'trades'
-                        ? 'bg-white text-black'
+                        ? 'text-white after:absolute after:inset-x-0 after:bottom-[-1px] after:h-0.5 after:rounded-full after:bg-white'
                         : 'text-white/65 hover:text-white'
                     }`}
                   >
@@ -1705,6 +1707,12 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                     referencePrice={orderbookReferencePrice}
                     pricePrecision={pricePrecision}
                     priceDirection={priceDirection}
+                    tradeDirection={spotMarket.lastTradeDirection}
+                    hasTradeDirection={
+                      activeDisplayPrice.isRealTrade
+                      && safeSpotTrades.length >= 2
+                      && spotMarket.lastTradeDirection !== 'flat'
+                    }
                     asks={spotDepthAsks}
                     bids={spotDepthBids}
                     bestAsk={safeBestAsk}

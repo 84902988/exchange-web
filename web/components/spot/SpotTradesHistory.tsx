@@ -5,12 +5,7 @@ import { useLocaleContext } from '@/contexts/LocaleContext'
 import {
   type SpotMarketTradeItem,
 } from '@/lib/api/modules/spot'
-import { formatSpotDisplaySymbol } from './spotFormat'
 import { formatSpotPrice } from './spotPricePrecision'
-import {
-  resolveSpotMarketStatus,
-  spotMarketStatusDotClass,
-} from './spotMarketStatus'
 import {
   buildSpotTradeRenderRows,
   getSpotTradeTimeValue,
@@ -82,13 +77,9 @@ function splitSymbol(symbol: string) {
 
 export default function SpotTradesHistory({
   symbol,
-  displaySymbol,
-  limit = 20,
+  limit = 24,
   pricePrecision,
   trades = [],
-  tradesSource,
-  tradesFreshness,
-  dataSource,
   isLoading = false,
   onPriceClick,
 }: Props) {
@@ -116,35 +107,9 @@ export default function SpotTradesHistory({
 
   const { base, quote } = splitSymbol(symbol)
   const hasTrades = data.length > 0
-  const tradesStatus = resolveSpotMarketStatus(
-    {
-      source: tradesSource,
-      freshness: tradesFreshness,
-      dataSource,
-      isLoading,
-    },
-    t,
-  )
 
   return (
     <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d]">
-      <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] bg-[#10151b]/70 px-2.5 py-2">
-        <div className="min-w-0 text-[13px] font-medium text-white/88">{t('spotMarketTrades', 'asset')}</div>
-        <div className="flex min-w-0 items-center gap-1.5">
-          <span
-            className="inline-flex h-5 max-w-[4.25rem] shrink-0 items-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.025] px-1.5 text-[10px] font-semibold text-white/56"
-            title={tradesStatus.fullLabel}
-            aria-label={tradesStatus.fullLabel}
-          >
-            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${spotMarketStatusDotClass(tradesStatus.kind)}`} />
-            <span className="min-w-0 truncate">{tradesStatus.compactLabel}</span>
-          </span>
-          <span className="rounded-full bg-white/[0.03] px-2 py-0.5 text-[13px] font-medium text-white/40">
-            {displaySymbol || formatSpotDisplaySymbol(symbol)}
-          </span>
-        </div>
-      </div>
-
       {!hasTrades ? (
         <div className="relative flex min-h-0 flex-1 items-center justify-center px-2.5 py-6 text-sm text-transparent">
           <span className="absolute inset-0 flex items-center justify-center px-3 text-center text-zinc-400">
@@ -160,7 +125,9 @@ export default function SpotTradesHistory({
             <div className="text-right">{t('spotTime', 'asset')}</div>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto [scrollbar-color:#3f3f46_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-zinc-700/60 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-500/80">
+          <div className={`min-h-0 flex-1 overflow-y-auto [scrollbar-color:#3f3f46_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-zinc-700/60 hover:[&::-webkit-scrollbar-thumb]:bg-zinc-500/80 ${
+            data.length >= limit ? 'grid auto-rows-[minmax(24px,1fr)]' : ''
+          }`}>
             {data.map((item, index) => {
               const priceText = formatPrice(item.trade.price, pricePrecision)
               const amountText = formatAmount(item.trade.amount)
@@ -180,7 +147,7 @@ export default function SpotTradesHistory({
               return (
                 <div
                   key={item.key}
-                  data-testid={index === 0 ? 'spot-recent-trade-first' : undefined}
+                  data-testid={index === 0 ? 'spot-recent-trade-first' : 'spot-recent-trade-row'}
                   data-trade-price={index === 0 ? String(item.trade.price) : undefined}
                   className="grid grid-cols-[minmax(0,1.18fr)_minmax(0,0.92fr)_60px] items-center gap-x-2 px-2.5 py-1 text-[12px] transition-colors hover:bg-white/[0.03]"
                 >
