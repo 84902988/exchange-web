@@ -65,6 +65,17 @@ function overlayProperties(color: string): Record<string, unknown> {
   };
 }
 
+function overlayCreateOverrides(color: string): Record<string, unknown> {
+  const properties = overlayProperties(color);
+  return {
+    'linetoolhorzline.linecolor': properties.linecolor,
+    'linetoolhorzline.textcolor': properties.textcolor,
+    'linetoolhorzline.linewidth': properties.linewidth,
+    'linetoolhorzline.linestyle': properties.linestyle,
+    'linetoolhorzline.showPrice': properties.showPrice,
+  };
+}
+
 function overlayRenderKey(displayPrice: SpotDisplayPrice): string {
   return [
     Number(displayPrice.price),
@@ -127,13 +138,7 @@ export class SpotTradingViewPriceOverlayController {
       showInObjectsTree: false,
       zOrder: 'top',
       text: '',
-      overrides: {
-        'linetoolhorzline.linecolor': this.color,
-        'linetoolhorzline.textcolor': this.color,
-        'linetoolhorzline.linewidth': 1,
-        'linetoolhorzline.linestyle': SPOT_PRICE_OVERLAY_LINE_STYLE_DASHED,
-        'linetoolhorzline.showPrice': true,
-      },
+      overrides: overlayCreateOverrides(this.color),
     }).then((entityId) => {
       this.creating = false;
       if (this.destroyed || generation !== this.createGeneration || !this.pendingDisplayPrice) {
@@ -143,6 +148,7 @@ export class SpotTradingViewPriceOverlayController {
         return;
       }
       this.entityId = entityId;
+      this.applyProperties(entityId);
       this.renderedKey = createdRenderKey;
       const pending = this.pendingDisplayPrice;
       if (pending && overlayRenderKey(pending) !== this.renderedKey) this.update(pending);
@@ -199,6 +205,14 @@ export class SpotTradingViewPriceOverlayController {
       if (price < this.lastPrice) this.color = SPOT_PRICE_OVERLAY_DOWN_COLOR;
     }
     this.lastPrice = price;
+  }
+
+  private applyProperties(entityId: SpotTradingViewOverlayEntityId) {
+    try {
+      this.chart.getShapeById(entityId).setProperties?.(overlayProperties(this.color));
+    } catch {
+      // Creation overrides already carry the same final style when the drawing API is unavailable.
+    }
   }
 
   private removeEntity(entityId: SpotTradingViewOverlayEntityId) {
