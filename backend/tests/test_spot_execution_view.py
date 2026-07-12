@@ -4,6 +4,7 @@ import time
 from decimal import Decimal
 
 from app.schemas.market import DepthItem, DepthResponse
+from app.schemas.spot_domain_snapshot import DomainSource, DomainTransport
 from app.services import spot_execution_view as execution
 from app.services.contract_market_provider_service import (
     MARKET_TYPE_SPOT,
@@ -198,7 +199,7 @@ def test_fresh_active_ws_snapshot_is_executable() -> None:
 
 def test_stale_ws_is_rejected_and_fresh_rest_is_used() -> None:
     stale_ms = int(time.time() * 1000) - 60_000
-    result, calls, _ = _run_with_sources(
+    result, calls, gateway = _run_with_sources(
         ws_by_provider={"OKX_SPOT": _depth("OKX_SPOT", received_at_ms=stale_ms)},
         rest_by_provider={"OKX_SPOT": _okx_rest()},
     )
@@ -206,6 +207,11 @@ def test_stale_ws_is_rejected_and_fresh_rest_is_used() -> None:
     assert result.source == "REST"
     assert result.freshness == "RECENT"
     assert calls == [("OKX_SPOT", "depth")]
+    domain_snapshot = gateway.get_depth_domain_snapshot("BTCUSDT")
+    assert domain_snapshot is not None
+    assert domain_snapshot.metadata.transport == DomainTransport.PROVIDER_REST
+    assert domain_snapshot.metadata.source == DomainSource.REST_SNAPSHOT
+    assert domain_snapshot.metadata.provider_generation == result.provider_generation
 
 
 def test_primary_failure_switches_atomically_to_complete_fallback() -> None:
@@ -223,6 +229,10 @@ def test_primary_failure_switches_atomically_to_complete_fallback() -> None:
     assert public_state.provider_generation == result.provider_generation
     assert Decimal(public_state.depth.bids[0].price) == result.best_bid
     assert Decimal(public_state.depth.asks[0].price) == result.best_ask
+    domain_snapshot = gateway.get_depth_domain_snapshot("BTCUSDT")
+    assert domain_snapshot is not None
+    assert domain_snapshot.metadata.provider == result.provider
+    assert domain_snapshot.metadata.provider_generation == result.provider_generation
     assert calls == [("OKX_SPOT", "depth"), ("BITGET_SPOT", "depth")]
 
 
