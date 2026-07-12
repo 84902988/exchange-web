@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from app.services.shared_market_cache import (
     DOMAIN_TICKER,
     FRESHNESS_FRESH,
+    MarketCacheEnvelope,
     SharedMarketCacheAdapter,
     build_market_cache_key,
 )
@@ -22,6 +24,13 @@ SPOT_EXTERNAL_DATA_SOURCE = "BINANCE"
 _spot_ticker_shared_cache = SharedMarketCacheAdapter(
     l1_ttl_ms=SPOT_TICKER_SHARED_CACHE_L1_TTL_MS,
 )
+
+
+@dataclass(frozen=True)
+class SpotTickerCacheHit:
+    payload: dict[str, Any]
+    envelope: MarketCacheEnvelope
+    cache_origin: str
 
 
 def should_use_spot_ticker_shared_cache(data_source: Any) -> bool:
@@ -43,6 +52,7 @@ def get_spot_ticker_with_shared_cache(
     loader: Callable[[], Optional[Mapping[str, Any]]],
     cache_adapter: Optional[SharedMarketCacheAdapter] = None,
     ttl_ms: int = SPOT_TICKER_SHARED_CACHE_TTL_MS,
+    cache_hit_observer: Optional[Callable[[SpotTickerCacheHit], None]] = None,
 ) -> Optional[dict[str, Any]]:
     if not should_use_spot_ticker_shared_cache(data_source):
         loaded = loader()
@@ -50,9 +60,18 @@ def get_spot_ticker_with_shared_cache(
 
     key = spot_ticker_shared_cache_key(symbol)
     adapter = cache_adapter or _spot_ticker_shared_cache
-    cached = _get_fresh_cached_ticker(adapter, key=key, ttl_ms=ttl_ms)
-    if cached is not None:
-        return cached
+    cache_hit = _get_fresh_cached_ticker(adapter, key=key, ttl_ms=ttl_ms)
+    if cache_hit is not None:
+        if cache_hit_observer is not None:
+            try:
+                cache_hit_observer(cache_hit)
+            except Exception as exc:
+                logger.debug(
+                    "spot_ticker_shared_cache_observer_failed key=%s reason=%s",
+                    key,
+                    exc,
+                )
+        return cache_hit.payload
 
     loaded = loader()
     if not isinstance(loaded, Mapping):
@@ -69,9 +88,15 @@ def _get_fresh_cached_ticker(
     *,
     key: str,
     ttl_ms: int,
-) -> Optional[dict[str, Any]]:
+) -> Optional[SpotTickerCacheHit]:
     try:
-        envelope = adapter.get(key, ttl_ms=ttl_ms)
+        if hasattr(adapter, "get_with_origin"):
+            lookup = adapter.get_with_origin(key, ttl_ms=ttl_ms)
+            envelope = lookup.envelope if lookup is not None else None
+            cache_origin = lookup.origin if lookup is not None else None
+        else:
+            envelope = adapter.get(key, ttl_ms=ttl_ms)
+            cache_origin = None
     except Exception as exc:
         logger.debug("spot_ticker_shared_cache_get_failed key=%s reason=%s", key, exc)
         return None
@@ -82,7 +107,11 @@ def _get_fresh_cached_ticker(
     payload = dict(envelope.data)
     if not _is_cacheable_spot_ticker(payload):
         return None
-    return payload
+    return SpotTickerCacheHit(
+        payload=payload,
+        envelope=envelope,
+        cache_origin=str(cache_origin or "NONE"),
+    )
 
 
 def _set_cached_ticker(

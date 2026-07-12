@@ -86,6 +86,16 @@ class MarketCacheEnvelope:
         }
 
 
+@dataclass(frozen=True)
+class MarketCacheLookup:
+    envelope: MarketCacheEnvelope
+    origin: str
+
+
+CACHE_LOOKUP_ORIGIN_L1_MEMORY = "L1_MEMORY"
+CACHE_LOOKUP_ORIGIN_REDIS = "REDIS"
+
+
 @dataclass
 class _L1Entry:
     envelope: MarketCacheEnvelope
@@ -246,17 +256,32 @@ class SharedMarketCacheAdapter:
         self._last_redis_error: Optional[Exception] = None
 
     def get(self, key: str, *, ttl_ms: Optional[int] = None) -> Optional[MarketCacheEnvelope]:
+        lookup = self.get_with_origin(key, ttl_ms=ttl_ms)
+        return lookup.envelope if lookup is not None else None
+
+    def get_with_origin(
+        self,
+        key: str,
+        *,
+        ttl_ms: Optional[int] = None,
+    ) -> Optional[MarketCacheLookup]:
         normalized_key = _normalize_cache_key(key)
         current_ms = self._clock_ms()
 
         cached_l1 = self._get_l1(normalized_key, current_ms=current_ms, ttl_ms=ttl_ms)
         if cached_l1 is not None:
-            return cached_l1
+            return MarketCacheLookup(
+                envelope=cached_l1,
+                origin=CACHE_LOOKUP_ORIGIN_L1_MEMORY,
+            )
 
         redis_envelope = self._get_l2(normalized_key, ttl_ms=ttl_ms, current_ms=current_ms)
         if redis_envelope is not None:
             self._set_l1(normalized_key, redis_envelope, current_ms=current_ms)
-            return redis_envelope
+            return MarketCacheLookup(
+                envelope=redis_envelope,
+                origin=CACHE_LOOKUP_ORIGIN_REDIS,
+            )
         return None
 
     def set(

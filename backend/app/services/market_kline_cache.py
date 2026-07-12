@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Optional
@@ -18,6 +19,12 @@ from app.services.market_cache_metrics import (
     record_kline_db_hit,
     record_kline_external_fetch,
 )
+from app.services.market_domain_snapshot import (
+    MarketDomainSnapshot,
+    build_market_domain_snapshot,
+)
+from app.services.market_freshness import resolve_market_freshness
+from app.services.shared_market_cache import CACHE_VERSION
 from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
 
 
@@ -93,6 +100,51 @@ class KlineProviderHistoryBoundary(KlineProviderFetchError):
         )
 
 
+@dataclass(frozen=True)
+class MarketKlineCacheMetadata:
+    data: list[dict[str, Any]]
+    source: str
+    provider: Optional[str]
+    updated_at: Optional[int]
+    version: str
+    interval: str
+    last_open_time: Optional[int]
+    revision: Optional[dict[str, Any]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "data": [dict(item) for item in self.data],
+            "source": self.source,
+            "provider": self.provider,
+            "updated_at": self.updated_at,
+            "version": self.version,
+            "interval": self.interval,
+            "last_open_time": self.last_open_time,
+            "revision": dict(self.revision) if self.revision is not None else None,
+        }
+
+    def to_domain_snapshot(
+        self,
+        *,
+        symbol: str,
+        fallback_reason: Optional[str] = None,
+        now_ms: Optional[int] = None,
+    ) -> MarketDomainSnapshot:
+        ttl_ms = LATEST_KLINE_REFRESH_TTL_SECONDS.get(self.interval, 30) * 1000
+        return build_market_domain_snapshot(
+            symbol=symbol,
+            domain="kline",
+            data=self.data,
+            source=self.source,
+            provider=self.provider,
+            updated_at=self.updated_at,
+            version=self.version,
+            max_age_ms=ttl_ms,
+            fallback_reason=fallback_reason,
+            now_ms=now_ms,
+        )
+
+
 class KlineCacheResult(list):
     def __init__(
         self,
@@ -106,6 +158,7 @@ class KlineCacheResult(list):
         history_terminal: bool = False,
         terminal_reason: Optional[str] = None,
         earliest_available_time: Optional[int] = None,
+        metadata: Optional[MarketKlineCacheMetadata] = None,
     ) -> None:
         super().__init__(items)
         self.origin = origin
@@ -119,6 +172,7 @@ class KlineCacheResult(list):
             self.earliest_available_time = int(earliest_available_time or 0) or None
         except (TypeError, ValueError):
             self.earliest_available_time = None
+        self.metadata = metadata
 
     @property
     def items(self) -> list[dict[str, Any]]:
@@ -266,6 +320,110 @@ def _item_open_time_ms(item: Any) -> Optional[int]:
             return None
         return open_time if open_time > 0 else None
     return None
+
+
+def _non_negative_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _latest_kline_item(items: Iterable[Any]) -> Optional[dict[str, Any]]:
+    latest: Optional[dict[str, Any]] = None
+    latest_open_time: Optional[int] = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        open_time = _item_open_time_ms(item)
+        if open_time is None:
+            continue
+        if latest_open_time is None or open_time > latest_open_time:
+            latest = dict(item)
+            latest_open_time = open_time
+    return latest
+
+
+def _kline_revision(item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if item is None:
+        return None
+    epoch = _non_negative_int(item.get("revision_epoch"))
+    sequence = _non_negative_int(item.get("revision_seq"))
+    if epoch is None or sequence is None:
+        return None
+    is_closed = item.get("is_closed")
+    close_state_source = str(item.get("close_state_source") or "").strip() or None
+    return {
+        "epoch": epoch,
+        "sequence": sequence,
+        "is_closed": is_closed if isinstance(is_closed, bool) else None,
+        "close_state_source": close_state_source,
+    }
+
+
+def build_market_kline_cache_metadata(
+    *,
+    data: Iterable[Any],
+    source: str,
+    provider: Optional[str],
+    updated_at: Optional[int],
+    interval: str,
+) -> MarketKlineCacheMetadata:
+    normalized_interval = normalize_kline_interval(interval)
+    items = [dict(item) for item in data if isinstance(item, dict)]
+    latest = _latest_kline_item(items)
+    return MarketKlineCacheMetadata(
+        data=items,
+        source=str(source or "MISSING"),
+        provider=str(provider or "").strip() or None,
+        updated_at=_non_negative_int(updated_at),
+        version=CACHE_VERSION,
+        interval=normalized_interval,
+        last_open_time=_item_open_time_ms(latest),
+        revision=_kline_revision(latest),
+    )
+
+
+def _kline_cache_metadata_source(
+    result: KlineCacheResult,
+    *,
+    end_time_ms: Optional[int],
+) -> str:
+    if result.origin == KLINE_CACHE_ORIGIN_DB_CACHE:
+        return "DB_CACHE"
+    if result.origin == KLINE_CACHE_ORIGIN_REST_FETCH:
+        return "REST_HISTORY" if end_time_ms is not None else "REST_SNAPSHOT"
+    if result.origin == KLINE_CACHE_ORIGIN_STALE_CACHE:
+        return "STALE_CACHE"
+    return "MISSING"
+
+
+def _attach_market_kline_cache_metadata(
+    result: KlineCacheResult,
+    *,
+    interval: str,
+    end_time_ms: Optional[int],
+) -> KlineCacheResult:
+    source = _kline_cache_metadata_source(result, end_time_ms=end_time_ms)
+    # REST_FETCH data was received during this call. DB rows deliberately keep
+    # updated_at=None here because the serialized row payload does not expose
+    # the authoritative database update timestamp.
+    updated_at = (
+        int(time.time() * 1000)
+        if result.origin == KLINE_CACHE_ORIGIN_REST_FETCH
+        else None
+    )
+    result.metadata = build_market_kline_cache_metadata(
+        data=result.items,
+        source=source,
+        provider=None,
+        updated_at=updated_at,
+        interval=interval,
+    )
+    return result
 
 
 def _add_one_calendar_month(value: datetime) -> datetime:
@@ -1022,7 +1180,12 @@ def _latest_cache_is_fresh(
 
     if latest is None or latest.updated_at is None:
         return False
-    return datetime.utcnow() - latest.updated_at <= timedelta(seconds=ttl_seconds)
+    freshness = resolve_market_freshness(
+        source="DB_CACHE",
+        updated_at=latest.updated_at,
+        max_age_ms=ttl_seconds * 1000,
+    )
+    return freshness.freshness == "LIVE" and not freshness.stale
 
 
 def upsert_klines(
@@ -1165,7 +1328,7 @@ def upsert_klines(
             return 0
 
 
-def get_klines_cache_first(
+def _get_klines_cache_first(
     db: Session,
     *,
     market_type: str,
@@ -1585,4 +1748,40 @@ def get_klines_cache_first(
         origin=KLINE_CACHE_ORIGIN_REST_FETCH,
         cache_status=cache_status,
         history_incomplete=False,
+    )
+
+
+def get_klines_cache_first(
+    db: Session,
+    *,
+    market_type: str,
+    symbol: str,
+    interval: str,
+    limit: int,
+    source: str,
+    fetch_external: Callable[[int, Optional[int]], Iterable[Any]],
+    end_time_ms: Optional[int] = None,
+    external_budget_seconds: Optional[float] = None,
+    open_time_validator: Optional[OpenTimeValidator] = None,
+    cache_policy: str = KLINE_CACHE_POLICY_STRICT_24X7,
+    reconcile_external_items: Optional[ExternalItemsReconciler] = None,
+) -> KlineCacheResult:
+    result = _get_klines_cache_first(
+        db,
+        market_type=market_type,
+        symbol=symbol,
+        interval=interval,
+        limit=limit,
+        source=source,
+        fetch_external=fetch_external,
+        end_time_ms=end_time_ms,
+        external_budget_seconds=external_budget_seconds,
+        open_time_validator=open_time_validator,
+        cache_policy=cache_policy,
+        reconcile_external_items=reconcile_external_items,
+    )
+    return _attach_market_kline_cache_metadata(
+        result,
+        interval=interval,
+        end_time_ms=end_time_ms,
     )
