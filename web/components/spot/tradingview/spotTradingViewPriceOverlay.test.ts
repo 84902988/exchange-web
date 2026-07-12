@@ -95,6 +95,7 @@ describe('SpotTradingViewPriceOverlayController', () => {
     controller.update(displayPrice({ price: '102', eventTimeMs: 5_000 }));
 
     expect(properties.map((item) => item.linecolor)).toEqual([
+      '#00c087',
       '#f6465d',
       '#f6465d',
       '#00c087',
@@ -103,9 +104,13 @@ describe('SpotTradingViewPriceOverlayController', () => {
 
   it('creates a ticker fallback with the final exchange color instead of a blue interim state', async () => {
     const createShape = jest.fn<SpotTradingViewOverlayChart['createShape']>(async () => 'overlay-1');
+    const properties: Array<Record<string, unknown>> = [];
     const chart: SpotTradingViewOverlayChart = {
       createShape,
-      getShapeById: () => ({ setPoints: jest.fn() }),
+      getShapeById: () => ({
+        setPoints: jest.fn(),
+        setProperties: (next) => properties.push(next),
+      }),
       removeEntity: jest.fn(),
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
@@ -124,6 +129,47 @@ describe('SpotTradingViewPriceOverlayController', () => {
         'linetoolhorzline.linestyle': 2,
         'linetoolhorzline.showPrice': true,
       },
+    });
+    expect(properties).toEqual([
+      expect.objectContaining({
+        text: '',
+        linecolor: '#00c087',
+        textcolor: '#00c087',
+        linewidth: 1,
+        linestyle: 2,
+        showPrice: true,
+      }),
+    ]);
+  });
+
+  it('applies the latest down color immediately when an in-flight entity is created', async () => {
+    let resolveShape!: (value: SpotTradingViewOverlayEntityId) => void;
+    const properties: Array<Record<string, unknown>> = [];
+    const chart: SpotTradingViewOverlayChart = {
+      createShape: () => new Promise<SpotTradingViewOverlayEntityId>((resolve) => {
+        resolveShape = resolve;
+      }),
+      getShapeById: () => ({
+        getPoints: () => [{ time: 2, price: 101 }],
+        setPoints: jest.fn(),
+        setProperties: (next) => properties.push(next),
+      }),
+      removeEntity: jest.fn(),
+    };
+    const controller = new SpotTradingViewPriceOverlayController(chart);
+
+    controller.update(displayPrice({ price: '101' }));
+    controller.update(displayPrice({ price: '100', eventTimeMs: 3_000 }));
+    resolveShape('overlay-1');
+    await flushPromises();
+
+    expect(properties[0]).toMatchObject({
+      text: '',
+      linecolor: '#f6465d',
+      textcolor: '#f6465d',
+      linewidth: 1,
+      linestyle: 2,
+      showPrice: true,
     });
   });
 
