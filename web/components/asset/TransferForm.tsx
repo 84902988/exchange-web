@@ -221,7 +221,7 @@ export default function TransferForm({
   return (
     <div
       id="asset-transfer-form"
-      className="bg-[#0e1117] rounded-xl p-5 border border-white/10 shadow-xl mt-6"
+      className="mt-6 rounded-xl border border-white/10 bg-[#0e1117] p-5 tabular-nums shadow-xl"
     >
       <h2 className="text-lg font-semibold text-white mb-2">{t('accountTransfer', 'asset')}</h2>
 
@@ -269,7 +269,7 @@ export default function TransferForm({
         />
 
         <input
-          className="bg-[#1a1f2e] border border-white/10 rounded-lg px-3 py-2 text-white"
+          className="rounded-lg border border-white/10 bg-[#1a1f2e] px-3 py-2 text-[14px] font-medium tabular-nums text-white"
           value={amount}
           onChange={(e) => {
             setAmount(e.target.value);
@@ -280,7 +280,7 @@ export default function TransferForm({
         />
       </div>
 
-      <div className="mb-3 rounded-lg border border-white/10 bg-[#121826] px-3 py-3 text-sm text-white/75">
+      <div className="mb-3 rounded-lg border border-white/10 bg-[#121826] px-3 py-3 text-sm tabular-nums text-white/75">
         <div className="font-medium text-white">
           {formatMessage(t('transferCurrentAvailableBalance', 'asset'), {
             amount: formatAmount(availableBalance, displayPrecision),
@@ -331,10 +331,10 @@ export default function TransferForm({
             {records.map((item) => (
               <div
                 key={item.transfer_no}
-                className="border border-white/10 rounded-lg px-3 py-2 text-sm text-white"
+                className="rounded-lg border border-white/10 px-3 py-2 text-sm tabular-nums text-white"
               >
                 <div>{`${item.symbol} | ${formatTransferDirection(item.from_account, item.to_account, t)}`}</div>
-                <div className="text-zinc-400">
+                <div className="font-medium text-white/80">
                   {`${t('transferRecordAmountLabel', 'asset')}: ${formatAmount(safeNum(item.amount), getDisplayPrecision(item.symbol, coins.find((coin) => coin.symbol === item.symbol)))}`}
                 </div>
                 <div className="text-zinc-400">{`${t('transferRecordStatusLabel', 'asset')}: ${getTransferStatusLabel(item['status'], t)}`}</div>

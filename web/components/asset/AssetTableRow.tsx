@@ -47,17 +47,17 @@ export default function AssetTableRow({
   };
 
   return (
-    <tr className="border-b border-white/10 transition-colors duration-150 hover:bg-[#0f1319]">
-      <td className="px-4 py-3">
+    <tr className="border-b border-white/10 tabular-nums transition-colors duration-150 hover:bg-[#0f1319]">
+      <td className="px-4 py-2.5">
         <div className="flex items-center">
           <div className={`mr-2 h-6 w-6 rounded ${getSymbolColor(asset.symbol)}`} />
           <span className="font-semibold text-white">{asset.symbol}</span>
         </div>
       </td>
-      <td className="px-4 py-3 text-right text-white">{formatBalance(asset.available)}</td>
-      <td className="px-4 py-3 text-right text-white">{formatBalance(asset.frozen)}</td>
-      <td className="px-4 py-3 text-right text-white">{formatBalance(asset.total)}</td>
-      <td className="px-4 py-3 text-right">
+      <td className="px-4 py-2.5 text-right font-medium text-white">{formatBalance(asset.available)}</td>
+      <td className="px-4 py-2.5 text-right font-medium text-white">{formatBalance(asset.frozen)}</td>
+      <td className="px-4 py-2.5 text-right font-medium text-white">{formatBalance(asset.total)}</td>
+      <td className="px-4 py-2.5 text-right">
         <div className="flex justify-end space-x-2">
           <button
             className="rounded-lg bg-gradient-to-r from-amber-500 to-amber-600 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition-all duration-300 hover:from-amber-600 hover:to-amber-700"

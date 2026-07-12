@@ -52,7 +52,7 @@ function SummaryCard({
   return (
     <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-5">
       <div className="text-sm text-white/50">{label}</div>
-      <div className="mt-3 break-all text-2xl font-semibold tabular-nums text-white">
+      <div className="mt-3 break-all text-[24px] font-semibold tabular-nums text-white">
         {value}
       </div>
       {hint ? <div className="mt-2 text-xs text-white/40">{hint}</div> : null}
@@ -76,36 +76,36 @@ function RecordsTable({ records, t }: { records: MyDividendRecord[]; t: UserTran
     <div className="overflow-x-auto rounded-2xl border border-white/10">
       <table className="min-w-full divide-y divide-white/10">
         <thead className="bg-white/[0.03]">
-          <tr className="text-left text-xs uppercase tracking-[0.14em] text-white/40">
-            <th className="px-5 py-4 font-medium">{t("dividendDate", "user")}</th>
-            <th className="px-5 py-4 font-medium">{t("svipLevel", "user")}</th>
-            <th className="px-5 py-4 font-medium">{t("dividendAmountRcb", "user")}</th>
-            <th className="px-5 py-4 font-medium">{t("convertedUsdt", "user")}</th>
-            <th className="px-5 py-4 font-medium">{t("status", "user")}</th>
-            <th className="px-5 py-4 font-medium">{t("paidAt", "user")}</th>
+          <tr className="text-left text-[11px] uppercase tracking-[0.14em] text-white/40">
+            <th className="px-5 py-3 font-medium">{t("dividendDate", "user")}</th>
+            <th className="px-5 py-3 font-medium">{t("svipLevel", "user")}</th>
+            <th className="px-5 py-3 font-medium">{t("dividendAmountRcb", "user")}</th>
+            <th className="px-5 py-3 font-medium">{t("convertedUsdt", "user")}</th>
+            <th className="px-5 py-3 font-medium">{t("status", "user")}</th>
+            <th className="px-5 py-3 font-medium">{t("paidAt", "user")}</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-white/10 bg-black/10">
           {records.map((item) => (
-            <tr key={item.id} className="text-sm text-white/75">
-              <td className="whitespace-nowrap px-5 py-4 tabular-nums">
+            <tr key={item.id} className="text-[13px] text-white/75">
+              <td className="whitespace-nowrap px-5 py-3 font-medium tabular-nums">
                 {displayValue(item.dividend_date)}
               </td>
-              <td className="whitespace-nowrap px-5 py-4 font-medium text-white">
+              <td className="whitespace-nowrap px-5 py-3 font-medium tabular-nums text-white">
                 {displayValue(item.svip_level_code)}
               </td>
-              <td className="whitespace-nowrap px-5 py-4 font-semibold tabular-nums text-amber-200">
+              <td className="whitespace-nowrap px-5 py-3 font-semibold tabular-nums text-amber-200">
                 {displayValue(item.amount_rcb)}
               </td>
-              <td className="whitespace-nowrap px-5 py-4 tabular-nums">
+              <td className="whitespace-nowrap px-5 py-3 font-medium tabular-nums">
                 {displayValue(item.amount_usdt)}
               </td>
-              <td className="whitespace-nowrap px-5 py-4">
+              <td className="whitespace-nowrap px-5 py-3">
                 <span className={`rounded-full border px-2.5 py-1 text-xs ${statusClass(item.status)}`}>
                   {statusText(item.status, t)}
                 </span>
               </td>
-              <td className="whitespace-nowrap px-5 py-4 tabular-nums text-white/55">
+              <td className="whitespace-nowrap px-5 py-3 font-medium tabular-nums text-white/55">
                 {displayValue(item.paid_at)}
               </td>
             </tr>

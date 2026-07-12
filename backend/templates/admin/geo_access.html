@@ -368,7 +368,7 @@
                 <td><span class="badge badge-info">{{ source_labels.get(item.source, item.source) }}</span></td>
                 <td><span class="badge {% if item.decision == 'BLOCK' %}badge-danger{% elif item.decision == 'MONITOR' %}badge-warning{% else %}badge-success{% endif %}">{{ decision_labels.get(item.decision, item.decision) }}</span></td>
                 <td class="geo-reason">{{ reason_labels.get(item.reason, item.reason) }}</td>
-                <td class="mono">{{ item.hit_count }}</td>
+                <td class="admin-number">{{ item.hit_count }}</td>
                 <td>{{ item.first_seen_at }}</td>
                 <td>{{ item.last_seen_at }}</td>
                 <td class="mono">{{ item.last_path or "-" }}</td>
@@ -415,7 +415,7 @@
                   <td><span class="badge badge-info">{{ source_labels.get(item.source, item.source) }}</span></td>
                   <td><span class="badge {% if item.decision == 'BLOCK' %}badge-danger{% elif item.decision == 'MONITOR' %}badge-warning{% else %}badge-success{% endif %}">{{ decision_labels.get(item.decision, item.decision) }}</span></td>
                   <td class="geo-reason">{{ reason_labels.get(item.reason, item.reason) }}</td>
-                  <td class="mono">{{ item.hit_count }}</td>
+                  <td class="admin-number">{{ item.hit_count }}</td>
                   <td class="mono">{{ item.method }}</td>
                   <td class="mono">{{ item.last_path or item.path }}</td>
                   <td>{{ item.user_agent or "-" }}</td>

@@ -71,20 +71,18 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(240, 90, 90, 0.14)',
   },
   avatarText: {
-    ...typography.medium,
+    ...typography.semibold,
     color: colors.marketText,
     fontSize: 10,
-    fontWeight: '900',
   },
   nameWrap: {
     flex: 1,
     minWidth: 0,
   },
   symbol: {
-    ...typography.medium,
+    ...typography.semibold,
     color: colors.marketText,
     fontSize: 13,
-    fontWeight: '900',
   },
   name: {
     marginTop: 3,
@@ -92,12 +90,11 @@ const styles = StyleSheet.create({
     fontSize: 10,
   },
   price: {
-    ...typography.number,
+    ...typography.marketPrice,
     width: 94,
     textAlign: 'right',
     color: colors.marketText,
     fontSize: 13,
-    fontWeight: '800',
   },
   badge: {
     width: 76,
@@ -117,6 +114,6 @@ const styles = StyleSheet.create({
     ...typography.number,
     color: colors.white,
     fontSize: 12,
-    fontWeight: '900',
+    fontWeight: '600',
   },
 });

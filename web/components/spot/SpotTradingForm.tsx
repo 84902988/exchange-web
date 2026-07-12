@@ -2001,7 +2001,7 @@ export default function SpotTradingForm({
                   onChange={(e) => handlePriceInputChange(e.target.value)}
                   onBlur={handlePriceBlur}
                   inputMode="decimal"
-                  className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 pr-10 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2.5 [@media(max-height:850px)]:py-1.5"
+                  className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 pr-10 text-[13px] font-medium tabular-nums text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2.5 [@media(max-height:850px)]:py-1.5"
                   placeholder={side === 'buy' ? copy.enterBuyPrice : copy.enterSellPrice}
                 />
 
@@ -2069,7 +2069,7 @@ export default function SpotTradingForm({
               onChange={(e) => handleAmountChange(e.target.value)}
               onBlur={handleAmountBlur}
               inputMode="decimal"
-              className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2.5 [@media(max-height:850px)]:py-1.5"
+              className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 text-[13px] font-medium tabular-nums text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2.5 [@media(max-height:850px)]:py-1.5"
               placeholder={formatCopy(copy.enterAmountWithAsset, { asset: amountInputUnit })}
             />
             {amountError ? (
@@ -2088,7 +2088,7 @@ export default function SpotTradingForm({
               onChange={(e) => handleQuoteAmountChange(e.target.value)}
               onBlur={handleQuoteAmountBlur}
               inputMode="decimal"
-              className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2.5 [@media(max-height:850px)]:py-1.5"
+              className="w-full rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 py-2 text-[13px] font-medium tabular-nums text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 xl:py-2.5 [@media(max-height:850px)]:py-1.5"
               placeholder={formatCopy(copy.enterBuyAmountWithAsset, { asset: quoteAmountInputUnit })}
             />
             {quoteAmountError ? (

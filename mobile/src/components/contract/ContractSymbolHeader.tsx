@@ -95,7 +95,7 @@ const styles = StyleSheet.create({
     gap: 2,
   },
   symbol: {
-    ...typography.heavy,
+    ...typography.semibold,
     color: colors.text,
     fontSize: 15,
   },
@@ -114,7 +114,7 @@ const styles = StyleSheet.create({
   change: {
     ...typography.number,
     fontSize: 10,
-    fontWeight: '800',
+    fontWeight: '600',
     lineHeight: 12,
   },
   priceBlock: {
@@ -122,9 +122,8 @@ const styles = StyleSheet.create({
     marginLeft: 6,
   },
   price: {
-    ...typography.number,
+    ...typography.marketPrice,
     fontSize: 15,
-    fontWeight: '900',
   },
   markPrice: {
     ...typography.number,

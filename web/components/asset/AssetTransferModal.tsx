@@ -328,7 +328,7 @@ export default function AssetTransferModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-4 backdrop-blur-sm">
-      <div className="max-h-[calc(100vh-32px)] w-full max-w-[520px] overflow-y-auto rounded-2xl border border-white/10 bg-[#151a21] text-white shadow-2xl">
+      <div className="max-h-[calc(100vh-32px)] w-full max-w-[520px] overflow-y-auto rounded-2xl border border-white/10 bg-[#151a21] tabular-nums text-white shadow-2xl">
         <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
           <h3 className="text-[18px] font-semibold">{t('transferFunds', 'asset')}</h3>
           <button
@@ -421,7 +421,7 @@ export default function AssetTransferModal({
                         <span className={`h-5 w-5 rounded-full ${coinDotClass(item.symbol)}`} />
                         <span className="font-semibold">{item.symbol}</span>
                       </span>
-                      <span className="text-[12px] text-white/45">
+                      <span className="text-[12px] font-medium tabular-nums text-white/45">
                         {fmtBalance(item.available)}
                       </span>
                     </button>
@@ -437,7 +437,7 @@ export default function AssetTransferModal({
           <div>
             <div className="mb-1.5 flex items-center justify-between text-[12px]">
               <span className="text-white/45">{t('quantity', 'asset')}</span>
-              <span className="text-white/45">
+              <span className="font-medium tabular-nums text-white/45">
                 {t('transferable', 'asset')}: {loadingBalance ? t('loading', 'common') : `${fmtBalance(available)} ${coin}`}
               </span>
             </div>
@@ -453,7 +453,7 @@ export default function AssetTransferModal({
                   setError('');
                   setSuccess('');
                 }}
-                className="min-w-0 flex-1 bg-transparent font-mono text-[16px] text-white outline-none placeholder:text-white/22"
+                className="min-w-0 flex-1 bg-transparent text-[16px] font-semibold tabular-nums text-white outline-none placeholder:text-white/22"
                 placeholder={t('transferAmountPlaceholder', 'asset')}
               />
               <button
@@ -475,7 +475,7 @@ export default function AssetTransferModal({
                 type="button"
                 disabled={availableNumber === null}
                 onClick={() => setPercent(percent)}
-                className={`h-8 rounded-lg border text-[12px] transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                className={`h-8 rounded-lg border text-[12px] font-medium tabular-nums transition disabled:cursor-not-allowed disabled:opacity-40 ${
                   selectedPercent === percent
                     ? 'border-[#f0b90b]/50 bg-[#f0b90b]/10 text-[#f0b90b]'
                     : 'border-white/10 text-white/65 hover:border-white/25 hover:bg-white/[0.06] hover:text-white'

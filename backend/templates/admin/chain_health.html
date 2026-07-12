@@ -163,10 +163,10 @@
                       <span class="health-address-short {% if item.hot_wallet_address_status_label == '未配置' %}empty{% endif %}" title="{{ item.hot_wallet_address_display }}">{{ item.hot_wallet_address_short }}</span>
                     </div>
                   </td>
-                  <td class="text-right mono">{{ item.deposit_network_count }}</td>
-                  <td class="text-right mono">{{ item.deposit_open_count }}</td>
-                  <td class="text-right mono">{{ item.withdraw_network_count }}</td>
-                  <td class="text-right mono">{{ item.withdraw_open_count }}</td>
+                  <td class="text-right admin-number">{{ item.deposit_network_count }}</td>
+                  <td class="text-right admin-number">{{ item.deposit_open_count }}</td>
+                  <td class="text-right admin-number">{{ item.withdraw_network_count }}</td>
+                  <td class="text-right admin-number">{{ item.withdraw_open_count }}</td>
                   <td><span class="admin-badge admin-badge-{{ item.capability_badge }}">{{ item.capability_label }}</span></td>
                   <td><span class="admin-badge admin-badge-{{ item.risk_badge }}">{{ item.risk_label }}</span></td>
                   <td>

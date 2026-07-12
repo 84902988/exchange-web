@@ -84,14 +84,14 @@ export default function ContractMarketHeader({
       <div className="flex h-full min-w-0 items-center gap-3 whitespace-nowrap">
         <div className="flex h-[54px] w-[176px] min-w-0 shrink-0 items-center">
           {symbolSelector || (
-            <span className="truncate text-[18px] font-semibold leading-none text-white">
+            <span className="truncate text-[17px] font-semibold leading-none text-white">
               {displaySymbol} {t('perpetual', 'contracts')}
             </span>
           )}
         </div>
 
         <div className="flex h-[54px] w-[174px] shrink-0 flex-col justify-center gap-1">
-          <div className={`max-w-full truncate text-[31px] font-semibold leading-none transition-all duration-200 ${priceColorClass}`}>
+          <div className={`max-w-full truncate text-[28px] font-semibold leading-none transition-all duration-200 ${priceColorClass}`}>
             {price}
           </div>
           <div className="min-h-4 truncate text-[12px] font-semibold leading-tight">
@@ -111,7 +111,7 @@ export default function ContractMarketHeader({
           className="w-[138px] shrink-0 flex-none"
           label={t('tradeStatus', 'contracts')}
           value={quoteStatusLabel ? (
-            <span className={`block max-w-full truncate text-[13px] font-semibold leading-tight ${quoteStatusTextClass(quoteStatusTone)}`}>
+            <span className={`block max-w-full truncate text-[13px] font-medium leading-tight ${quoteStatusTextClass(quoteStatusTone)}`}>
               {quoteStatusLabel}
             </span>
           ) : (
@@ -119,11 +119,11 @@ export default function ContractMarketHeader({
               marketStatus={marketStatus}
               quoteFreshness={quoteFreshness}
               marketSessionType={marketSessionType}
-              className="!rounded-none !border-0 !bg-transparent !px-0 !py-0 text-[13px] font-semibold"
+              className="!rounded-none !border-0 !bg-transparent !px-0 !py-0 text-[13px] font-medium"
             />
           )}
           subValue={tradeStatusSubValue}
-          valueClassName="font-sans text-[13px] font-semibold text-white/88"
+          valueClassName="font-sans text-[13px] font-medium text-white/88"
           title={tradeStatusTitle || undefined}
         />
 
@@ -169,7 +169,7 @@ function Metric({
   value,
   subValue,
   className = '',
-  valueClassName = 'font-mono text-[13px] font-semibold tabular-nums text-white/88',
+  valueClassName = 'font-sans text-[13px] font-medium tabular-nums text-white/88',
   title,
 }: {
   label: string;

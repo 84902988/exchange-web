@@ -103,8 +103,8 @@ export default function AffiliatePage() {
                 >
                   <div className="text-sm text-white/45">{t(item.titleKey, "user")}</div>
                   <div className="mt-3 flex items-end gap-3">
-                    <div className="text-3xl font-black text-[#f0b90b]">{item.level}</div>
-                    <div className="pb-1 text-sm font-semibold text-white/70">{item.rate} {t("affiliateCommissionSuffix", "user")}</div>
+                    <div className="text-[24px] font-semibold tabular-nums text-[#f0b90b]">{item.level}</div>
+                    <div className="pb-1 text-[14px] font-medium tabular-nums text-white/70">{item.rate} {t("affiliateCommissionSuffix", "user")}</div>
                   </div>
                   <p className="mt-3 text-sm leading-7 text-white/55">{t(item.descKey, "user")}</p>
                 </div>

@@ -1482,7 +1482,7 @@ function Field({
         <input
           value={value}
           onChange={(event) => onChange(event.target.value)}
-          className="min-w-0 flex-1 bg-transparent font-mono text-[12px] tabular-nums text-white outline-none placeholder:text-white/20"
+          className="min-w-0 flex-1 bg-transparent text-[13px] font-medium tabular-nums text-white outline-none placeholder:text-white/20"
           placeholder={placeholder}
         />
         {suffix ? <span className="ml-2 shrink-0 text-[11px] text-white/35">{suffix}</span> : null}
@@ -1524,7 +1524,7 @@ function TriggerPriceField({
           onChange={(event) => onChange(event.target.value)}
           onBlur={normalizePrice}
           inputMode="decimal"
-          className="min-w-0 flex-1 bg-transparent font-mono text-[12px] tabular-nums text-white outline-none placeholder:text-white/20"
+          className="min-w-0 flex-1 bg-transparent text-[13px] font-medium tabular-nums text-white outline-none placeholder:text-white/20"
           placeholder={placeholder}
         />
         {suffix ? <span className="ml-2 shrink-0 text-[11px] text-white/35">{suffix}</span> : null}
@@ -1590,7 +1590,7 @@ function PriceField({
             onChange={(event) => onChange(event.target.value)}
             onBlur={normalizePrice}
             inputMode="decimal"
-            className="w-full rounded-xl border border-white/[0.08] bg-[#0d1218] px-3 py-1.5 pr-10 text-[12px] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10"
+            className="w-full rounded-xl border border-white/[0.08] bg-[#0d1218] px-3 py-1.5 pr-10 text-[13px] font-medium tabular-nums text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10"
             placeholder={placeholder}
           />
           <div className="absolute right-2 top-1/2 flex -translate-y-1/2 flex-col">
@@ -1634,7 +1634,7 @@ function ReadonlyField({ label, value }: { label: string; value: string }) {
   return (
     <div>
       <span className="mb-1 block text-[11px] text-white/42">{label}</span>
-      <div className="flex h-9 items-center justify-between rounded-lg border border-white/[0.08] bg-[#0d1218] px-2.5 text-[12px] text-white/75">
+      <div className="flex h-9 items-center justify-between rounded-lg border border-white/[0.08] bg-[#0d1218] px-2.5 text-[13px] font-medium tabular-nums text-white/75">
         {value}
       </div>
     </div>

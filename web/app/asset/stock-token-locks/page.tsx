@@ -225,7 +225,7 @@ function StockLockMetric({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
       <div className="text-xs text-white/40">{label}</div>
-      <div className="mt-1 truncate font-mono text-sm font-semibold text-white" title={value}>
+      <div className="mt-1 truncate text-[13px] font-medium tabular-nums text-white" title={value}>
         {value}
       </div>
     </div>
@@ -369,7 +369,7 @@ export default function StockTokenLocksPage() {
               </p>
             </div>
             <div className="flex flex-wrap gap-3">
-              <div className="rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/60">
+              <div className="rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-[13px] font-medium tabular-nums text-white/60">
                 {formatMessage(t("convertibleBatches", "asset"), { count: rowsWithAvailable })}
               </div>
               <Link
@@ -438,7 +438,7 @@ export default function StockTokenLocksPage() {
                       <div className="w-full xl:w-80">
                         {releaseStarted ? (
                           <>
-                            <div className="flex items-center justify-between text-xs text-white/50">
+                            <div className="flex items-center justify-between text-[12px] font-medium tabular-nums text-white/50">
                               <span>{t("releaseProgress", "asset")}</span>
                               <span>{formatPercent(progress)}</span>
                             </div>
@@ -465,10 +465,10 @@ export default function StockTokenLocksPage() {
                     </div>
 
                     <div className="mt-5 flex flex-col gap-4 border-t border-white/10 pt-4 lg:flex-row lg:items-center lg:justify-between">
-                      <div className="grid gap-2 text-sm text-white/55 md:grid-cols-2 lg:flex-1">
+                      <div className="grid gap-2 text-[13px] text-white/55 md:grid-cols-2 lg:flex-1">
                         <div>
                           <span className="text-white/40">{t("timeRule", "asset")}</span>
-                          <span className="text-white/75">
+                          <span className="font-medium tabular-nums text-white/75">
                             {formatMessage(t("afterDaysDailyRelease", "asset"), {
                               days: item.lock_days,
                               rate: formatDailyReleaseRate(item.daily_release_rate),
@@ -477,13 +477,13 @@ export default function StockTokenLocksPage() {
                         </div>
                         <div>
                           <span className="text-white/40">{t("lockTime", "asset")}</span>
-                          <span className="text-white/75">
+                          <span className="font-medium tabular-nums text-white/75">
                             {formatDateOnly(item.lock_start_at)} - {formatDateOnly(item.lock_end_at)}
                           </span>
                         </div>
                         <div>
                           <span className="text-white/40">{t("releaseFinishTime", "asset")}</span>
-                          <span className="text-white/75">
+                          <span className="font-medium tabular-nums text-white/75">
                             {formatDateOnly(item.release_start_at)} - {formatDateOnly(item.release_finish_at)}
                           </span>
                         </div>
@@ -492,7 +492,7 @@ export default function StockTokenLocksPage() {
                       <div className="flex shrink-0 flex-col items-start gap-2 lg:items-end">
                         {canConvert ? (
                           <>
-                            <div className="text-xs leading-5 text-white/55">
+                            <div className="text-[12px] font-medium tabular-nums leading-5 text-white/55">
                               {formatMessage(t("convertibleTokenAmount", "asset"), {
                                 symbol: tradeSymbol,
                                 amount: formatAmount(item.available_amount),
@@ -551,22 +551,22 @@ export default function StockTokenLocksPage() {
               </button>
             </div>
 
-            <div className="mt-5 space-y-3 rounded-xl border border-white/10 bg-black/20 p-4 text-sm text-white/70">
+            <div className="mt-5 space-y-3 rounded-xl border border-white/10 bg-black/20 p-4 text-[13px] text-white/70">
               <div className="flex justify-between gap-4">
                 <span className="text-white/45">{t("convertibleEquity", "asset")}</span>
-                <span className="font-medium text-white">
+                <span className="font-medium tabular-nums text-white">
                   {formatDisplayAmount(selectedLock.available_amount)} {selectedLock.lock_symbol}
                 </span>
               </div>
               <div className="flex justify-between gap-4">
                 <span className="text-white/45">{t("conversionRate", "asset")}</span>
-                <span className="font-medium text-white">
+                <span className="font-medium tabular-nums text-white">
                   1 : {formatDisplayAmount(selectedLock.conversion_rate_snapshot)}
                 </span>
               </div>
               <div className="flex justify-between gap-4">
                 <span className="text-white/45">{t("estimatedArrival", "asset")}</span>
-                <span className="font-semibold text-amber-200">
+                <span className="font-semibold tabular-nums text-amber-200">
                   {formatDisplayAmount(selectedExpectedAmount)} {selectedTradeSymbol}
                 </span>
               </div>

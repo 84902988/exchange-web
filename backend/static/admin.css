@@ -1,10 +1,17 @@
 /* Admin UI foundation classes. Keep these scoped with the admin prefix. */
 
+:root{
+  --admin-font-sans:"HarmonyOS Sans SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+}
+
 .admin-page{
   flex:1 1 auto;
   min-width:0;
   padding:18px 18px 30px;
   overflow-x:auto;
+  font-family:var(--admin-font-sans);
+  font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;
 }
 
 .admin-page-header{
@@ -17,8 +24,8 @@
 
 .admin-page-title{
   margin:0;
-  font-size:24px;
-  font-weight:900;
+  font-size:20px;
+  font-weight:600;
   line-height:1.2;
   letter-spacing:0;
 }
@@ -58,7 +65,7 @@
 .admin-table td{
   padding:10px 9px;
   border-bottom:1px solid rgba(255,255,255,.08);
-  font-size:13px;
+  font-size:12px;
   line-height:1.45;
   text-align:left;
   vertical-align:top;
@@ -66,7 +73,8 @@
 
 .admin-table th{
   color:var(--muted);
-  font-weight:600;
+  font-size:11px;
+  font-weight:500;
   white-space:nowrap;
 }
 
@@ -109,6 +117,8 @@
   font-size:13px;
   line-height:1.45;
   flex-wrap:wrap;
+  font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;
 }
 
 .admin-pagination .pagination-actions,
@@ -136,8 +146,8 @@
   background:var(--brand);
   color:#fff;
   font:inherit;
-  font-size:14px;
-  font-weight:700;
+  font-size:13px;
+  font-weight:500;
   line-height:1;
   cursor:pointer;
   text-decoration:none;
@@ -189,8 +199,8 @@
   border-radius:999px;
   background:rgba(255,255,255,.05);
   color:#fff;
-  font-size:12px;
-  font-weight:700;
+  font-size:11px;
+  font-weight:500;
   line-height:1;
   white-space:nowrap;
 }
@@ -308,6 +318,106 @@
   background:rgba(177,52,52,.12);
   border-color:rgba(216,89,89,.24);
   color:#ffc6c6;
+}
+
+/* Shared admin typography and dense numeric presentation. */
+.admin-page input,
+.admin-page select,
+.admin-page textarea,
+.admin-page button{
+  font-family:var(--admin-font-sans);
+  font-size:13px;
+  font-weight:500;
+  font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;
+}
+
+.admin-page h2,
+.admin-page .section-title,
+.admin-page .overview-panel-title{
+  font-size:15px;
+  font-weight:600;
+}
+
+.admin-page h3{
+  font-size:14px;
+  font-weight:600;
+}
+
+.admin-page table{
+  font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;
+}
+
+.admin-page table th{
+  font-size:11px;
+  font-weight:500;
+}
+
+.admin-page table td{
+  font-size:12px;
+}
+
+.admin-page .stat-value{
+  font-size:26px;
+  font-weight:600;
+}
+
+.admin-page .mini-stat-value,
+.admin-page .bd-summary-value,
+.admin-page .gas-cost-value,
+.admin-page .vip-stat-value,
+.admin-page .collection-stat-value,
+.admin-page [class$="-stat-value"],
+.admin-page [class*="-stat-value "]{
+  font-size:22px;
+  font-weight:600;
+  font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;
+}
+
+.admin-page .withdraw-anomaly-stat strong,
+.admin-page .withdraw-anomaly-card strong{
+  font-size:22px;
+  font-weight:600;
+  font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;
+}
+
+.admin-page .summary-value,
+.admin-page .admin-number,
+.admin-page .admin-amount,
+.admin-page .admin-time,
+.admin-page .pagination,
+.admin-page .ops-number,
+.admin-page .bd-number,
+.admin-page .bd-coin-value,
+.admin-page .bd-volume-row-amount,
+.admin-page .vip-number,
+.admin-page .collection-amount,
+.admin-page .num-cell,
+.admin-page .time-cell,
+.admin-page .gas-primary-value.gas-cost-mono,
+.admin-page .gas-stat .gas-cost-mono,
+.admin-page input.gas-cost-mono,
+.admin-page .bd-summary-value.bd-detail-number,
+.admin-page .text-right.bd-detail-number,
+.admin-page .bd-detail-coin-value{
+  font-family:var(--admin-font-sans);
+  font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;
+}
+
+.admin-page .mono.admin-number,
+.admin-page .mono.admin-amount,
+.admin-page .mono.admin-time,
+.admin-page .text-right.mono,
+.admin-page .collection-mono.admin-number,
+.admin-page .collection-mono.collection-amount,
+.admin-page .collection-mono.num-cell,
+.admin-page .collection-mono.time-cell,
+.admin-page .collection-mono.admin-time{
+  font-family:var(--admin-font-sans);
 }
 
 @media (max-width:980px){

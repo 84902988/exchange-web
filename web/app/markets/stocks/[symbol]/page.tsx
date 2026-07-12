@@ -505,10 +505,10 @@ export default function StockMarketDetailPage() {
                 </h1>
               </div>
               <div className="text-left md:text-right">
-                <div className="text-3xl font-semibold tabular-nums text-white">
+                <div className="text-[30px] font-semibold tabular-nums text-white">
                   {formatPrice(stats.lastPrice)}
                 </div>
-                <div className={`mt-1 text-sm font-semibold tabular-nums ${changeClass}`}>
+                <div className={`mt-1 text-[14px] font-semibold tabular-nums ${changeClass}`}>
                   {formatPercent(stats.changePercent)}
                 </div>
               </div>
@@ -544,7 +544,7 @@ export default function StockMarketDetailPage() {
             </div>
           </div>
 
-          <div className="grid gap-2 border-b border-white/10 px-5 py-2 text-xs text-white/55 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-2 border-b border-white/10 px-5 py-2 text-[12px] font-medium tabular-nums text-white/55 sm:grid-cols-2 xl:grid-cols-4">
             <span>{t('time', 'asset')} {latestKlineInfo?.time ?? '--'}</span>
             <span>
               O {formatPrice(latestKlineInfo?.open ?? null)} / H {formatPrice(latestKlineInfo?.high ?? null)}
@@ -583,22 +583,22 @@ export default function StockMarketDetailPage() {
         <aside className="space-y-4">
           <section className="rounded-lg border border-white/10 bg-[#111418] p-5">
             <div className="mb-4 text-sm font-semibold text-white">{t('marketInfo', 'markets')}</div>
-            <div className="space-y-3 text-sm">
+            <div className="space-y-3 text-[14px]">
               <div className="flex items-center justify-between gap-3">
                 <span className="text-white/45">{t('todayHigh', 'markets')}</span>
-                <span className="tabular-nums text-white">{formatPrice(stats.high)}</span>
+                <span className="font-medium tabular-nums text-white">{formatPrice(stats.high)}</span>
               </div>
               <div className="flex items-center justify-between gap-3">
                 <span className="text-white/45">{t('todayLow', 'markets')}</span>
-                <span className="tabular-nums text-white">{formatPrice(stats.low)}</span>
+                <span className="font-medium tabular-nums text-white">{formatPrice(stats.low)}</span>
               </div>
               <div className="flex items-center justify-between gap-3">
                 <span className="text-white/45">{t('marketCap', 'markets')}</span>
-                <span className="tabular-nums text-white">{formatLargeNumber(stats.marketCap)}</span>
+                <span className="font-medium tabular-nums text-white">{formatLargeNumber(stats.marketCap)}</span>
               </div>
               <div className="flex items-center justify-between gap-3">
                 <span className="text-white/45">{t('peRatio', 'markets')}</span>
-                <span className="tabular-nums text-white">{stats.pe === null ? '--' : stats.pe.toFixed(2)}</span>
+                <span className="font-medium tabular-nums text-white">{stats.pe === null ? '--' : stats.pe.toFixed(2)}</span>
               </div>
             </div>
           </section>

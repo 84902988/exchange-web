@@ -1,7 +1,7 @@
 import React from 'react';
 import {Pressable, StyleSheet, Text} from 'react-native';
 import {Search} from 'lucide-react-native';
-import {colors} from '../../theme';
+import {colors, typography} from '../../theme';
 
 type Props = {
   placeholder?: string;
@@ -35,6 +35,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   placeholder: {
+    ...typography.regular,
     color: colors.textMuted,
     fontSize: 13,
   },

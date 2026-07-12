@@ -439,7 +439,7 @@ function BookRow({
     <button
       type="button"
       onClick={() => onPriceClick?.(row.rawPrice)}
-      className="relative grid h-full min-h-0 cursor-pointer grid-cols-3 items-center overflow-hidden rounded-[6px] px-1.5 text-left text-[12px] leading-4 tabular-nums transition-colors hover:bg-white/[0.035]"
+      className="relative grid h-full min-h-0 cursor-pointer grid-cols-3 items-center overflow-hidden rounded-[6px] px-1.5 text-left text-[12px] font-medium leading-4 tabular-nums transition-colors hover:bg-white/[0.035]"
     >
       <div
         className={`pointer-events-none absolute right-0 top-0 h-full ${bgClass}`}

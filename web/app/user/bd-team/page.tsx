@@ -298,25 +298,25 @@ export default function BdTeamPage() {
               <section className="grid gap-4 md:grid-cols-4">
                 <div className="rounded-[1.35rem] border border-[#f0b90b]/20 bg-[#f0b90b]/10 p-5">
                   <div className="text-sm text-[#f0b90b]">{t("myBdLevel", "user")}</div>
-                  <div className="mt-3 text-2xl font-black text-white">
+                  <div className="mt-3 text-[24px] font-semibold tabular-nums text-white">
                     {data.account?.bd_level || "--"}
                   </div>
                 </div>
                 <div className="rounded-[1.35rem] border border-white/10 bg-[#0d1118] p-5">
                   <div className="text-sm text-white/45">{t("currentInviteSystem", "user")}</div>
-                  <div className="mt-3 text-2xl font-black text-white">
+                  <div className="mt-3 text-[24px] font-semibold tabular-nums text-white">
                     {resolveInviteSystemLabel(t, data.summary.source_type)}
                   </div>
                 </div>
                 <div className="rounded-[1.35rem] border border-white/10 bg-[#0d1118] p-5">
                   <div className="text-sm text-white/45">{t("bdCommissionRate", "user")}</div>
-                  <div className="mt-3 text-2xl font-black text-white">
+                  <div className="mt-3 text-[24px] font-semibold tabular-nums text-white">
                     {formatRatePercent(data.account?.commission_rate)}
                   </div>
                 </div>
                 <div className="rounded-[1.35rem] border border-white/10 bg-[#0d1118] p-5">
                   <div className="text-sm text-white/45">{t("latestBdCommissionTime", "user")}</div>
-                  <div className="mt-3 text-lg font-bold text-white">
+                  <div className="mt-3 text-[14px] font-medium tabular-nums text-white">
                     {data.summary.latest_commission_at || "--"}
                   </div>
                 </div>
@@ -354,20 +354,20 @@ export default function BdTeamPage() {
                       <div className="mt-5 grid gap-3 sm:grid-cols-3">
                         <div>
                           <div className="text-xs text-white/40">{t("totalCommission", "user")}</div>
-                          <div className="mt-2 whitespace-nowrap text-xl font-black tabular-nums text-white">
-                            {item.total} <span className="text-sm text-white/45">{item.coin}</span>
+                          <div className="mt-2 whitespace-nowrap text-[20px] font-semibold tabular-nums text-white">
+                            {item.total} <span className="text-[13px] font-medium text-white/45">{item.coin}</span>
                           </div>
                         </div>
                         <div>
                           <div className="text-xs text-white/40">{t("pendingCommission", "user")}</div>
-                          <div className="mt-2 whitespace-nowrap text-xl font-black tabular-nums text-white">
-                            {item.pending} <span className="text-sm text-white/45">{item.coin}</span>
+                          <div className="mt-2 whitespace-nowrap text-[20px] font-semibold tabular-nums text-white">
+                            {item.pending} <span className="text-[13px] font-medium text-white/45">{item.coin}</span>
                           </div>
                         </div>
                         <div>
                           <div className="text-xs text-white/40">{t("paidCommission", "user")}</div>
-                          <div className="mt-2 whitespace-nowrap text-xl font-black tabular-nums text-white">
-                            {item.paid} <span className="text-sm text-white/45">{item.coin}</span>
+                          <div className="mt-2 whitespace-nowrap text-[20px] font-semibold tabular-nums text-white">
+                            {item.paid} <span className="text-[13px] font-medium text-white/45">{item.coin}</span>
                           </div>
                         </div>
                       </div>
@@ -382,13 +382,13 @@ export default function BdTeamPage() {
                     <h2 className="text-xl font-bold text-white">{t("recentCommissionRecords", "user")}</h2>
                     <p className="mt-1 text-sm text-white/45">{t("recentCommissionRecordsDesc", "user")}</p>
                   </div>
-                  <div className="text-sm text-white/45">{t("totalRecordsPrefix", "asset")} {data.total} {t("totalRecordsSuffix", "asset")}</div>
+                  <div className="text-[13px] font-medium tabular-nums text-white/45">{t("totalRecordsPrefix", "asset")} {data.total} {t("totalRecordsSuffix", "asset")}</div>
                 </div>
 
                 {data.records.length > 0 ? (
                   <div className="overflow-x-auto">
-                    <table className="w-full min-w-[760px] text-left text-sm">
-                      <thead className="text-xs uppercase tracking-[0.14em] text-white/35">
+                    <table className="w-full min-w-[760px] text-left text-[13px]">
+                      <thead className="text-[11px] uppercase tracking-[0.14em] text-white/35">
                         <tr className="border-b border-white/10">
                           <th className="py-3 pr-4 font-semibold">ID</th>
                           <th className="py-3 pr-4 font-semibold">{t("sourceUser", "user")}</th>
@@ -407,16 +407,16 @@ export default function BdTeamPage() {
                               : "RCB";
                           return (
                             <tr key={record.id} className="text-white/72">
-                              <td className="py-3 pr-4 font-mono text-white/55">{record.id}</td>
-                              <td className="py-3 pr-4">{record.source_user_id}</td>
-                              <td className="py-3 pr-4">
+                              <td className="py-3 pr-4 font-medium tabular-nums text-white/55">{record.id}</td>
+                              <td className="py-3 pr-4 font-medium tabular-nums">{record.source_user_id}</td>
+                              <td className="py-3 pr-4 font-medium tabular-nums">
                                 {formatAmount(record.original_fee_amount)} {record.fee_coin_symbol}
                               </td>
-                              <td className="py-3 pr-4 font-semibold text-white">
+                              <td className="py-3 pr-4 font-semibold tabular-nums text-white">
                                 {formatAmount(record.commission_amount)} {commissionAsset}
                               </td>
                               <td className="py-3 pr-4">{resolveBdCommissionStatus(t, record.status)}</td>
-                              <td className="py-3 pr-4 text-white/55">{record.created_at || "--"}</td>
+                              <td className="py-3 pr-4 font-medium tabular-nums text-white/55">{record.created_at || "--"}</td>
                             </tr>
                           );
                         })}

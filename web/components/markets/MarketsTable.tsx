@@ -237,7 +237,7 @@ export default function MarketsTable({
 
   const renderStateRow = (content: string, className = 'text-white/50') => (
     <tr>
-      <td colSpan={columnCount} className={`px-5 py-12 text-center text-sm ${className}`}>
+      <td colSpan={columnCount} className={`px-5 py-12 text-center text-[13px] ${className}`}>
         {content}
       </td>
     </tr>
@@ -302,29 +302,29 @@ export default function MarketsTable({
 
   const renderStockHeaders = () => (
     <tr className="border-b border-white/10">
-      <th className="w-[24%] px-5 py-4 text-left align-middle text-xs font-medium text-white/42">
+      <th className="w-[24%] px-5 py-4 text-left align-middle text-[11px] font-medium text-white/42">
         {activeSecondary === 'STOCK_CONTRACT' ? t('stockContracts', 'markets') : t('stocks', 'markets')}
       </th>
-      {renderSortableHeader('last_price', t('lastPrice', 'markets'), 'w-[14%] px-5 py-4 text-right text-xs font-medium')}
-      {renderSortableHeader('price_change_percent_24h', t('change24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-xs font-medium')}
-      {renderSortableHeader('high_24h', t('high24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-xs font-medium')}
-      {renderSortableHeader('low_24h', t('low24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-xs font-medium')}
-      {renderSortableHeader('quote_volume_24h', t('turnover', 'markets'), 'w-[15%] px-5 py-4 text-right text-xs font-medium')}
-      <th className="w-[96px] px-5 py-4 text-right align-middle text-xs font-medium text-white/42">{t('action', 'markets')}</th>
+      {renderSortableHeader('last_price', t('lastPrice', 'markets'), 'w-[14%] px-5 py-4 text-right text-[11px] font-medium')}
+      {renderSortableHeader('price_change_percent_24h', t('change24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-[11px] font-medium')}
+      {renderSortableHeader('high_24h', t('high24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-[11px] font-medium')}
+      {renderSortableHeader('low_24h', t('low24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-[11px] font-medium')}
+      {renderSortableHeader('quote_volume_24h', t('turnover', 'markets'), 'w-[15%] px-5 py-4 text-right text-[11px] font-medium')}
+      <th className="w-[96px] px-5 py-4 text-right align-middle text-[11px] font-medium text-white/42">{t('action', 'markets')}</th>
     </tr>
   )
 
   const renderDefaultHeaders = () => (
     <tr className="border-b border-white/10">
-      <th className="w-[24%] px-5 py-4 text-left align-middle text-xs font-medium text-white/42">
+      <th className="w-[24%] px-5 py-4 text-left align-middle text-[11px] font-medium text-white/42">
         {isCryptoTable ? t('tradingPair', 'markets') : t('name', 'markets')}
       </th>
-      {renderSortableHeader('last_price', t('lastPrice', 'markets'), 'w-[14%] px-5 py-4 text-right text-xs font-medium')}
-      {renderSortableHeader('price_change_percent_24h', isCryptoTable ? t('changePercent', 'markets') : t('change24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-xs font-medium')}
-      {renderSortableHeader('high_24h', isCryptoTable ? t('highPrice', 'markets') : t('high24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-xs font-medium')}
-      {renderSortableHeader('low_24h', isCryptoTable ? t('lowPrice', 'markets') : t('low24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-xs font-medium')}
-      {renderSortableHeader('quote_volume_24h', isCryptoTable ? t('turnover', 'markets') : t('turnover24h', 'markets'), 'w-[15%] px-5 py-4 text-right text-xs font-medium')}
-      <th className="w-[96px] px-5 py-4 text-right align-middle text-xs font-medium text-white/42">{t('action', 'markets')}</th>
+      {renderSortableHeader('last_price', t('lastPrice', 'markets'), 'w-[14%] px-5 py-4 text-right text-[11px] font-medium')}
+      {renderSortableHeader('price_change_percent_24h', isCryptoTable ? t('changePercent', 'markets') : t('change24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-[11px] font-medium')}
+      {renderSortableHeader('high_24h', isCryptoTable ? t('highPrice', 'markets') : t('high24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-[11px] font-medium')}
+      {renderSortableHeader('low_24h', isCryptoTable ? t('lowPrice', 'markets') : t('low24h', 'markets'), 'w-[13%] px-5 py-4 text-right text-[11px] font-medium')}
+      {renderSortableHeader('quote_volume_24h', isCryptoTable ? t('turnover', 'markets') : t('turnover24h', 'markets'), 'w-[15%] px-5 py-4 text-right text-[11px] font-medium')}
+      <th className="w-[96px] px-5 py-4 text-right align-middle text-[11px] font-medium text-white/42">{t('action', 'markets')}</th>
     </tr>
   )
 
@@ -340,7 +340,7 @@ export default function MarketsTable({
             {getAvatarText(row)}
           </div>
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold text-white">{getStockSymbolLabel(row)}</div>
+            <div className="truncate text-[14px] font-semibold text-white">{getStockSymbolLabel(row)}</div>
             <div className="mt-1 flex items-center gap-2 text-xs text-white/40">
               <span>{getStockSubtitle(row, t)}</span>
               <span className="rounded-sm bg-white/[0.06] px-1.5 py-0.5 text-[11px] text-white/55">
@@ -355,22 +355,22 @@ export default function MarketsTable({
           </div>
         </div>
       </td>
-      <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white">
+      <td className="px-5 py-5 text-right text-[13px] font-medium tabular-nums text-white">
         {renderMarketValue(
           getTickerPrice(row),
           formatPrice(getTickerPrice(row), getTickerPricePrecision(row)),
         )}
       </td>
-      <td className={`px-5 py-5 text-right text-sm font-semibold tabular-nums ${getChangeClass(getTickerChange(row))}`}>
+      <td className={`px-5 py-5 text-right text-[13px] font-semibold tabular-nums ${getChangeClass(getTickerChange(row))}`}>
         {renderMarketValue(getTickerChange(row), formatChange(getTickerChange(row)), 'ml-auto w-14')}
       </td>
-      <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
+      <td className="px-5 py-5 text-right text-[13px] font-medium tabular-nums text-white/75">
         {renderMarketValue(getTickerHigh(row), formatPrice(getTickerHigh(row), getTickerPricePrecision(row)))}
       </td>
-      <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
+      <td className="px-5 py-5 text-right text-[13px] font-medium tabular-nums text-white/75">
         {renderMarketValue(getTickerLow(row), formatPrice(getTickerLow(row), getTickerPricePrecision(row)))}
       </td>
-      <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
+      <td className="px-5 py-5 text-right text-[13px] font-medium tabular-nums text-white/75">
         {renderMarketValue(getTickerQuoteVolume(row), formatVolume(getTickerQuoteVolume(row)))}
       </td>
       <td className="w-[96px] px-5 py-5 text-right">
@@ -400,7 +400,7 @@ export default function MarketsTable({
             {getAvatarText(row)}
           </div>
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold text-white">{getDisplaySymbol(row)}</div>
+            <div className="truncate text-[14px] font-semibold text-white">{getDisplaySymbol(row)}</div>
             <div className="mt-1 flex items-center gap-2 text-xs text-white/40">
               <span>{isCryptoTable ? getCryptoSubLabel(row, isContractTable, t) : getSubLabelText(row, t)}</span>
               {isHotTicker(row) ? (
@@ -412,22 +412,22 @@ export default function MarketsTable({
           </div>
         </div>
       </td>
-      <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white">
+      <td className="px-5 py-5 text-right text-[13px] font-medium tabular-nums text-white">
         {renderMarketValue(
           getTickerPrice(row),
           formatPrice(getTickerPrice(row), getTickerPricePrecision(row)),
         )}
       </td>
-      <td className={`px-5 py-5 text-right text-sm font-semibold tabular-nums ${getChangeClass(getTickerChange(row))}`}>
+      <td className={`px-5 py-5 text-right text-[13px] font-semibold tabular-nums ${getChangeClass(getTickerChange(row))}`}>
         {renderMarketValue(getTickerChange(row), formatChange(getTickerChange(row)), 'ml-auto w-14')}
       </td>
-      <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
+      <td className="px-5 py-5 text-right text-[13px] font-medium tabular-nums text-white/75">
         {renderMarketValue(getTickerHigh(row), formatPrice(getTickerHigh(row), getTickerPricePrecision(row)))}
       </td>
-      <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
+      <td className="px-5 py-5 text-right text-[13px] font-medium tabular-nums text-white/75">
         {renderMarketValue(getTickerLow(row), formatPrice(getTickerLow(row), getTickerPricePrecision(row)))}
       </td>
-      <td className="px-5 py-5 text-right text-sm font-medium tabular-nums text-white/75">
+      <td className="px-5 py-5 text-right text-[13px] font-medium tabular-nums text-white/75">
         {renderMarketValue(getTickerQuoteVolume(row), formatVolume(getTickerQuoteVolume(row)))}
       </td>
       <td className="w-[96px] px-5 py-5 text-right">

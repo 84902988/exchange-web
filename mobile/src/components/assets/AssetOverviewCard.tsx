@@ -111,11 +111,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   amount: {
-    ...typography.number,
+    ...typography.cardNumber,
     marginTop: 8,
     color: colors.text,
-    fontSize: 30,
-    fontWeight: '900',
+    fontSize: 28,
   },
   usd: {
     ...typography.number,

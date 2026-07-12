@@ -355,7 +355,7 @@ function RcbLockModal({
         <div className="space-y-5 px-6 py-6">
           <div className="rounded-2xl border border-white/[0.06] bg-white/[0.03] px-4 py-3">
             <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{t('availableRcb', 'user')}</div>
-            <div className="mt-2 text-xl font-semibold text-white">
+            <div className="mt-2 text-[24px] font-semibold tabular-nums text-white">
               {formatAssetAmount(userSummary.rcb_funding_available)} RCB
             </div>
           </div>
@@ -369,7 +369,7 @@ function RcbLockModal({
                 value={amount}
                 onChange={(event) => setAmount(event.target.value)}
                 placeholder={t('enterRcbAmount', 'user')}
-                className="mt-2 w-full rounded-2xl border border-white/10 bg-black/30 px-4 py-3 text-sm text-white outline-none transition focus:border-amber-300/50"
+                className="mt-2 w-full rounded-2xl border border-white/10 bg-black/30 px-4 py-3 text-[14px] font-medium tabular-nums text-white outline-none transition focus:border-amber-300/50"
               />
             </div>
             <div>
@@ -388,7 +388,7 @@ function RcbLockModal({
                         setPeriod(days);
                       }}
                       className={[
-                        'rounded-2xl border px-3 py-2 text-sm transition',
+                        'rounded-2xl border px-3 py-2 text-[13px] font-medium tabular-nums transition',
                         selectedPeriod === days
                           ? 'border-amber-300/50 bg-amber-400/15 text-amber-200'
                           : 'border-white/10 bg-white/[0.03] text-white/70',
@@ -412,21 +412,21 @@ function RcbLockModal({
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="rounded-2xl border border-white/[0.06] bg-black/20 px-4 py-3">
               <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{t('estimatedSvipLevel', 'user')}</div>
-              <div className="mt-2 text-lg font-semibold text-amber-200">{predictedLevelCode}</div>
+              <div className="mt-2 text-[20px] font-semibold tabular-nums text-amber-200">{predictedLevelCode}</div>
             </div>
             <div className="rounded-2xl border border-white/[0.06] bg-black/20 px-4 py-3">
               <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{t('rcbAfterLock', 'user')}</div>
-              <div className="mt-2 text-lg font-semibold text-white">{formatAssetAmount(String(predictedLocked))} RCB</div>
+              <div className="mt-2 text-[20px] font-semibold tabular-nums text-white">{formatAssetAmount(String(predictedLocked))} RCB</div>
             </div>
             <div className="rounded-2xl border border-white/[0.06] bg-black/20 px-4 py-3">
               <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{t('estimatedFeeBenefits', 'user')}</div>
-              <div className="mt-2 text-sm font-semibold text-white">
+              <div className="mt-2 text-[14px] font-medium tabular-nums text-white">
                 Maker {formatFeeRate(predictedMakerFee)} / Taker {formatFeeRate(predictedTakerFee)}
               </div>
             </div>
             <div className="rounded-2xl border border-white/[0.06] bg-black/20 px-4 py-3">
               <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{t('dividendBenefitDesc', 'user')}</div>
-              <div className="mt-2 text-sm font-semibold text-emerald-200">
+              <div className="mt-2 text-[14px] font-medium tabular-nums text-emerald-200">
                 {predictedDividendRate
                   ? `${t('estimatedDividendRate', 'user')} ${formatFeeRate(predictedDividendRate)}`
                   : t('joinDividendAfterSvip', 'user')}

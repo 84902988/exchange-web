@@ -1397,7 +1397,7 @@ export default function SpotOrderTabs({
       <div className="mb-1 flex items-center justify-between gap-2">
         <div className="flex gap-2">
           <button
-            className={`rounded-md px-2 py-0.5 text-[12px] ${
+            className={`rounded-md px-2 py-0.5 text-[12px] font-medium ${
               tab === 'current'
                 ? 'bg-white text-black'
                 : 'bg-white/5 text-white/70'
@@ -1408,7 +1408,7 @@ export default function SpotOrderTabs({
           </button>
 
           <button
-            className={`rounded-md px-2 py-0.5 text-[12px] ${
+            className={`rounded-md px-2 py-0.5 text-[12px] font-medium ${
               tab === 'history'
                 ? 'bg-white text-black'
                 : 'bg-white/5 text-white/70'
@@ -1419,7 +1419,7 @@ export default function SpotOrderTabs({
           </button>
 
           <button
-            className={`rounded-md px-2 py-0.5 text-[12px] ${
+            className={`rounded-md px-2 py-0.5 text-[12px] font-medium ${
               tab === 'trades'
                 ? 'bg-white text-black'
                 : 'bg-white/5 text-white/70'
@@ -1448,16 +1448,16 @@ export default function SpotOrderTabs({
       {tab === 'current' ? (
         <>
           <div className="min-w-0">
-            <table className="w-full min-w-0 table-fixed text-left text-[13px]">
-              <thead className="text-[12px] text-gray-400">
+            <table className="w-full min-w-0 table-fixed text-left text-[12px]">
+              <thead className="text-[11px] text-gray-400">
                 <tr className="border-b border-white/10">
-                  <th className="w-[21%] py-1.5 pr-2 font-medium xl:py-2">{t('time', 'asset')}</th>
-                  <th className="w-[10%] py-1.5 pr-2 font-medium xl:py-2">{t('spotOrderSide', 'asset')}</th>
-                  <th className="w-[13%] py-1.5 pr-2 font-medium xl:py-2">{t('price', 'asset')}</th>
-                  <th className="w-[15%] py-1.5 pr-2 font-medium xl:py-2">{t('spotOrderAmount', 'asset')}</th>
-                  <th className="w-[15%] py-1.5 pr-2 font-medium xl:py-2">{t('spotOrderFilledFee', 'asset')}</th>
-                  <th className="w-[14%] py-1.5 pr-2 font-medium xl:py-2">{t('status', 'asset')}</th>
-                  <th className="w-[12%] py-1.5 text-right font-medium xl:py-2">{t('spotOrderAction', 'asset')}</th>
+                  <th className="w-[21%] py-1.5 pr-2 font-medium">{t('time', 'asset')}</th>
+                  <th className="w-[10%] py-1.5 pr-2 font-medium">{t('spotOrderSide', 'asset')}</th>
+                  <th className="w-[13%] py-1.5 pr-2 font-medium">{t('price', 'asset')}</th>
+                  <th className="w-[15%] py-1.5 pr-2 font-medium">{t('spotOrderAmount', 'asset')}</th>
+                  <th className="w-[15%] py-1.5 pr-2 font-medium">{t('spotOrderFilledFee', 'asset')}</th>
+                  <th className="w-[14%] py-1.5 pr-2 font-medium">{t('status', 'asset')}</th>
+                  <th className="w-[12%] py-1.5 text-right font-medium">{t('spotOrderAction', 'asset')}</th>
                 </tr>
               </thead>
 
@@ -1469,37 +1469,37 @@ export default function SpotOrderTabs({
                     return (
                     <tr
                       key={item.id}
-                      className="h-9 border-b border-white/10 text-[13px] text-white/90 transition-colors hover:bg-white/5 xl:h-10"
+                      className="h-8 border-b border-white/10 text-[12px] text-white/90 transition-colors hover:bg-white/5"
                     >
-                      <td className="py-2 pr-2 text-[13px] text-white/65 xl:py-2.5">
+                      <td className="py-1.5 pr-2 text-white/65">
                         <div className="truncate whitespace-nowrap">{formatTime(item.created_at)}</div>
                       </td>
-                      <td className={`py-2 pr-2 font-medium xl:py-2.5 ${sideClass(item.side)}`}>
+                      <td className={`py-1.5 pr-2 font-medium ${sideClass(item.side)}`}>
                         {sideText(item.side, t)}
                       </td>
-                      <td className="py-2 pr-2 xl:py-2.5">
+                      <td className="py-1.5 pr-2">
                         <div className="truncate whitespace-nowrap">{formatOrderDisplayPrice(item, t)}</div>
                       </td>
-                      <td className="py-2 pr-2 xl:py-2.5">
+                      <td className="py-1.5 pr-2">
                         <div className="truncate whitespace-nowrap">{fmtAmount(item.amount)}</div>
                       </td>
-                      <td className="py-2 pr-2 xl:py-2.5" title={feeDisplay.title || undefined}>
+                      <td className="py-1.5 pr-2" title={feeDisplay.title || undefined}>
                         <div className="truncate whitespace-nowrap">{fmtAmount(item.filled_amount)}</div>
                         <div className="mt-0.5 min-w-0">
-                          <div className="truncate whitespace-nowrap text-sm tabular-nums text-white/80">
+                          <div className="truncate whitespace-nowrap text-[12px] font-medium tabular-nums text-white/80">
                             {feeDisplay.main}
                           </div>
                           {feeDisplay.sub ? (
-                            <div className="truncate whitespace-nowrap text-xs text-gray-400">
+                            <div className="truncate whitespace-nowrap text-[10px] text-gray-400">
                               {feeDisplay.sub}
                             </div>
                           ) : null}
                         </div>
                       </td>
-                      <td className={`py-2 pr-2 xl:py-2.5 ${statusClass(item.status)}`}>
+                      <td className={`py-1.5 pr-2 ${statusClass(item.status)}`}>
                         <div className="truncate whitespace-nowrap">{statusText(item.status, t)}</div>
                       </td>
-                      <td className="py-2 text-right xl:py-2.5">
+                      <td className="py-1.5 text-right">
                         {canCancelOrder(item) ? (
                           <button
                             type="button"
@@ -1601,7 +1601,7 @@ function HistoryOrderRecords({ rows }: { rows: SpotOrderItem[] }) {
                   {statusText(item.status, t)}
                 </span>
                 <div className="flex flex-wrap items-center gap-2 text-[11px] text-white/45 sm:justify-end">
-                  <span className="font-mono text-white/60" title={feeDisplay.title || undefined}>
+                  <span className="font-medium tabular-nums text-white/60" title={feeDisplay.title || undefined}>
                     {feeDisplay.main}
                   </span>
                   <span>{formatRecordTime(item.updated_at || item.created_at)}</span>
@@ -1692,7 +1692,7 @@ function RecordMeta({ label, value }: { label: string; value: string }) {
   return (
     <span className="inline-flex items-center gap-1">
       <span>{label}</span>
-      <span className="font-mono text-white/70">{value}</span>
+      <span className="font-medium tabular-nums text-white/70">{value}</span>
     </span>
   )
 }

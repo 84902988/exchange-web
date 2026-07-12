@@ -844,7 +844,7 @@ export default function ContractPositionTabs({
             key={tab.key}
             type="button"
             onClick={() => selectTab(tab.key)}
-            className={`rounded-md px-2 py-0.5 text-[12px] ${
+            className={`rounded-md px-2 py-0.5 text-[12px] font-medium ${
               activeTab === tab.key
                 ? 'bg-white text-black'
                 : 'bg-white/5 text-white/70'
@@ -1866,12 +1866,12 @@ function AllPositionsTable({
   }
 
   return (
-    <div className="overflow-x-auto p-3">
+    <div className="overflow-x-auto p-2">
       <table className="w-full min-w-[1320px] table-fixed text-left text-[12px]">
-        <thead className="bg-[#0b0e11] text-white/40">
+        <thead className="bg-[#0b0e11] text-[11px] text-white/40">
           <tr>
             {[t('symbol', 'contracts'), t('direction', 'contracts'), t('leverage', 'contracts'), t('quantity', 'contracts'), t('entryPrice', 'contracts'), t('markPrice', 'contracts'), t('margin', 'contracts'), t('unrealizedPnl', 'contracts'), t('roe', 'contracts'), t('marginRatio', 'contracts'), t('liquidationPrice', 'contracts'), t('liquidationDistance', 'contracts'), t('risk', 'contracts'), t('status', 'contracts'), t('operation', 'contracts')].map((head) => (
-              <th key={head} className="whitespace-nowrap px-2 py-2 font-medium">{head}</th>
+              <th key={head} className="whitespace-nowrap px-2 py-1.5 font-medium">{head}</th>
             ))}
           </tr>
         </thead>
@@ -1901,7 +1901,7 @@ function AllPositionsTable({
 
             return (
               <tr key={item.id} className={isCurrent ? 'bg-white/[0.025] text-white/88' : 'text-white/78'}>
-                <td className="whitespace-nowrap px-2 py-2.5">
+                <td className="whitespace-nowrap px-2 py-2">
                   <button
                     type="button"
                     onClick={() => onSymbolSelect?.(item.symbol)}
@@ -1919,24 +1919,24 @@ function AllPositionsTable({
                 <Td>{formatDisplayPrice(item.entry_price, pricePrecision)}</Td>
                 <Td>{markPrice > 0 ? formatDisplayPrice(markPrice, pricePrecision) : '--'}</Td>
                 <Td>{formatNumber(item.margin_amount, 2)}</Td>
-                <td className={`whitespace-nowrap px-2 py-2.5 font-mono tabular-nums ${unrealizedClassName}`}>
+                <td className={`whitespace-nowrap px-2 py-2 font-medium tabular-nums ${unrealizedClassName}`}>
                   {formatSignedPnl(unrealized, 4)}
                 </td>
-                <td className={`whitespace-nowrap px-2 py-2.5 font-mono tabular-nums ${pnlClassName}`}>
+                <td className={`whitespace-nowrap px-2 py-2 font-medium tabular-nums ${pnlClassName}`}>
                   {formatPnlPercent(roe)}
                 </td>
                 <Td>{marginRatio}</Td>
                 <Td>{liquidationPrice ? formatDisplayPrice(liquidationPrice, pricePrecision) : '--'}</Td>
-                <td className={`whitespace-nowrap px-2 py-2.5 font-mono tabular-nums ${liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}`}>
+                <td className={`whitespace-nowrap px-2 py-2 font-medium tabular-nums ${liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}`}>
                   {liquidationDistance}
                 </td>
-                <td className={`whitespace-nowrap px-2 py-2.5 font-mono tabular-nums ${liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}`}>
+                <td className={`whitespace-nowrap px-2 py-2 font-medium tabular-nums ${liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}`}>
                   {liquidationRisk ? t(liquidationRisk.labelKey, 'contracts') : '--'}
                 </td>
-                <td className="whitespace-nowrap px-2 py-2.5">
+                <td className="whitespace-nowrap px-2 py-2">
                   <StatusBadge status={item.status} closeReason={item.close_reason} />
                 </td>
-                <td className="whitespace-nowrap px-2 py-2.5">
+                <td className="whitespace-nowrap px-2 py-2">
                   <div className="flex items-center gap-1.5">
                     <button
                       type="button"
@@ -2878,5 +2878,5 @@ function Td({
   className?: string;
 }) {
   const colorClass = color === 'green' ? 'text-[#00c087]' : color === 'red' ? 'text-[#f6465d]' : 'text-white/84';
-  return <td className={`whitespace-nowrap px-3 py-2.5 font-mono tabular-nums ${colorClass} ${className}`}>{children}</td>;
+  return <td className={`whitespace-nowrap px-2 py-2 font-medium tabular-nums ${colorClass} ${className}`}>{children}</td>;
 }

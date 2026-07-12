@@ -38,9 +38,9 @@ const styles = StyleSheet.create({
     borderBottomColor: colors.line,
   },
   name: {
+    ...typography.semibold,
     color: colors.text,
     fontSize: 15,
-    fontWeight: '800',
   },
   subtitle: {
     marginTop: 4,
@@ -51,10 +51,9 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
   },
   price: {
-    ...typography.number,
+    ...typography.marketPrice,
     color: colors.text,
     fontSize: 14,
-    fontWeight: '700',
     marginBottom: 6,
   },
   badge: {
@@ -75,6 +74,6 @@ const styles = StyleSheet.create({
     ...typography.number,
     color: colors.white,
     fontSize: 12,
-    fontWeight: '800',
+    fontWeight: '600',
   },
 });

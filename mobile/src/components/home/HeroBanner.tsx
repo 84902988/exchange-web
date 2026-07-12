@@ -75,11 +75,9 @@ const styles = StyleSheet.create({
     letterSpacing: 0,
   },
   title: {
+    ...typography.screenTitle,
     marginTop: 10,
     color: colors.text,
-    fontSize: 28,
-    lineHeight: 34,
-    fontWeight: '900',
   },
   subtitle: {
     marginTop: 10,

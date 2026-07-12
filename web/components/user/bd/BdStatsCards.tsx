@@ -101,8 +101,8 @@ export default function BdStatsCards({ data }: BdStatsCardsProps) {
             <div
               className={
                 isCountCard
-                  ? "mt-3 whitespace-nowrap text-2xl font-black tabular-nums text-white"
-                  : "mt-3 min-w-0 space-y-1 text-lg font-black leading-tight tabular-nums text-white"
+                  ? "mt-3 whitespace-nowrap text-[24px] font-semibold tabular-nums text-white"
+                  : "mt-3 min-w-0 space-y-1 text-[20px] font-semibold leading-tight tabular-nums text-white"
               }
             >
               {isCountCard

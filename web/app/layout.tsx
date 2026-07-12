@@ -46,6 +46,7 @@ export default function RootLayout({
           "text-white",
           "min-h-screen",
           "font-sans",
+          "tabular-nums",
         ].join(" ")}
       >
         <LocaleProvider>

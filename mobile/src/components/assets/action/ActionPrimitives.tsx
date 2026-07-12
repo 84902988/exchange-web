@@ -493,7 +493,7 @@ const styles = StyleSheet.create({
     textAlign: 'right',
   },
   mono: {
-    ...typography.number,
+    ...typography.identifier,
   },
   notice: {
     marginTop: 12,
