@@ -78,6 +78,9 @@ export type SpotKlineCacheEntry = {
   requestedLimit: number;
   returnedCount: number;
   terminalComplete: boolean;
+  historyTerminal: boolean;
+  terminalReason: string | null;
+  earliestBoundary: number | null;
   bars: SpotTradingViewBar[];
   revisionCandidates?: SpotKlineRevisionCandidate[];
   provider?: unknown;
@@ -109,6 +112,29 @@ export type SpotKlineCacheLookupResult = {
   requestedLimit: number;
 };
 
+export type SpotKlineStaleHistoryEligibilityReason =
+  | 'ELIGIBLE'
+  | 'MISSING_ENTRY'
+  | 'CACHE_METADATA_INVALID'
+  | 'FRESH'
+  | 'SOURCE_NOT_ALLOWED'
+  | 'INSUFFICIENT_BARS'
+  | 'CONTINUITY_INVALID'
+  | 'FORMING_CANDLE'
+  | 'REVISION_METADATA_INVALID'
+  | 'REVISION_CONFLICT'
+  | 'PROVIDER_EPOCH_MISMATCH';
+
+export type SpotKlineStaleHistoryEligibility = {
+  eligible: boolean;
+  reason: SpotKlineStaleHistoryEligibilityReason;
+  requiredBars: number;
+  bars: SpotTradingViewBar[];
+  revisionCandidates: SpotKlineRevisionCandidate[];
+  provider: string | null;
+  revisionEpoch: number | null;
+};
+
 export type SpotKlineLoadPolicy = {
   current: number;
   preload: number;
@@ -130,6 +156,14 @@ const SPOT_INTERVAL_MS: Record<string, number> = {
 };
 const ASIA_SHANGHAI_OFFSET_MS = 8 * 60 * 60_000;
 const CURRENT_KLINE_CACHE_MAX_KEYS = 64;
+const STALE_HISTORY_SNAPSHOT_SOURCES = new Set([
+  'REST',
+  'REST_SNAPSHOT',
+  'REST_HISTORY',
+  'DB_CACHE',
+  'STALE_CACHE',
+]);
+const SPOT_MONTHLY_STALE_HISTORY_FORMING_ALLOWANCE = 1;
 const CURRENT_KLINE_CACHE_TTL_MS: Record<string, number> = {
   '1m': 30_000,
   '5m': 30_000,
@@ -578,6 +612,246 @@ function isFreshKlineCacheEntry(entry: SpotKlineCacheEntry, now = Date.now()) {
   return now - entry.updatedAt <= getCurrentKlineCacheTtlMs(entry.interval);
 }
 
+function getStaleHistoryMinimumClosedBars(interval: string, requiredBars: number) {
+  if (normalizeSpotInterval(interval) !== '1Mutc') return requiredBars;
+  return Math.max(1, requiredBars - SPOT_MONTHLY_STALE_HISTORY_FORMING_ALLOWANCE);
+}
+
+function staleHistoryEligibilityResult(
+  reason: SpotKlineStaleHistoryEligibilityReason,
+  requiredBars: number,
+  overrides: Partial<SpotKlineStaleHistoryEligibility> = {},
+): SpotKlineStaleHistoryEligibility {
+  return {
+    eligible: reason === 'ELIGIBLE',
+    reason,
+    requiredBars,
+    bars: [],
+    revisionCandidates: [],
+    provider: null,
+    revisionEpoch: null,
+    ...overrides,
+  };
+}
+
+function hasValidRevisionMetadataShape(revision: unknown): revision is SpotKlineRevisionMetadata {
+  if (!revision || typeof revision !== 'object') return false;
+  const value = revision as Partial<SpotKlineRevisionMetadata>;
+  const hasEpoch = value.revisionEpoch !== null && value.revisionEpoch !== undefined;
+  const hasSequence = value.revisionSeq !== null && value.revisionSeq !== undefined;
+  if (hasEpoch !== hasSequence) return false;
+  if (
+    hasEpoch
+    && (!Number.isInteger(value.revisionEpoch) || Number(value.revisionEpoch) < 0
+      || !Number.isInteger(value.revisionSeq) || Number(value.revisionSeq) < 0)
+  ) {
+    return false;
+  }
+  if (value.isClosed !== null && value.isClosed !== undefined && typeof value.isClosed !== 'boolean') {
+    return false;
+  }
+  if (
+    value.closeStateSource !== null
+    && value.closeStateSource !== undefined
+    && typeof value.closeStateSource !== 'string'
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function sameRevisionMetadata(left: SpotKlineRevisionMetadata, right: SpotKlineRevisionMetadata) {
+  return (
+    left.revisionEpoch === right.revisionEpoch
+    && left.revisionSeq === right.revisionSeq
+    && left.isClosed === right.isClosed
+    && left.closeStateSource === right.closeStateSource
+  );
+}
+
+function isClosedHistoricalBar(
+  bar: SpotTradingViewBar,
+  interval: string,
+  revision: SpotKlineRevisionMetadata | null,
+  now: number,
+) {
+  if (revision?.isClosed === true) return true;
+  if (revision?.isClosed === false) return false;
+  return getExpectedNextBarTimeMs(interval, bar.time) <= now;
+}
+
+export function inspectStaleHistoryEligibility(
+  entry: SpotKlineCacheEntry | null | undefined,
+  options: { requiredBars: number; now?: number },
+): SpotKlineStaleHistoryEligibility {
+  const requiredBars = Math.max(1, Math.floor(Number(options.requiredBars) || 1));
+  if (!entry) return staleHistoryEligibilityResult('MISSING_ENTRY', requiredBars);
+
+  const now = Number.isFinite(options.now) ? Number(options.now) : Date.now();
+  const normalizedSymbol = normalizeSpotSymbol(entry.symbol);
+  const normalizedInterval = normalizeSpotInterval(entry.interval);
+  const minimumClosedBars = getStaleHistoryMinimumClosedBars(
+    normalizedInterval,
+    requiredBars,
+  );
+  const entryProvider = normalizeProvider(entry.provider);
+  const normalizedSource = normalizeSource(entry.source);
+  if (
+    !normalizedSymbol
+    || !normalizedInterval
+    || !Number.isFinite(entry.updatedAt)
+    || entry.updatedAt <= 0
+  ) {
+    return staleHistoryEligibilityResult('CACHE_METADATA_INVALID', requiredBars);
+  }
+  if (isFreshKlineCacheEntry(entry, now)) {
+    return staleHistoryEligibilityResult('FRESH', requiredBars, {
+      provider: entryProvider || null,
+    });
+  }
+  if (!STALE_HISTORY_SNAPSHOT_SOURCES.has(normalizedSource)) {
+    return staleHistoryEligibilityResult('SOURCE_NOT_ALLOWED', requiredBars, {
+      provider: entryProvider || null,
+    });
+  }
+  if (entry.bars.length < minimumClosedBars) {
+    return staleHistoryEligibilityResult('INSUFFICIENT_BARS', requiredBars, {
+      provider: entryProvider || null,
+    });
+  }
+
+  const continuityStats = getBarsContinuityStats(entry.bars, normalizedInterval);
+  if (shouldRejectKlineContinuity({
+    interval: normalizedInterval,
+    source: entry.source,
+    bars: entry.bars,
+    continuityStats,
+  })) {
+    return staleHistoryEligibilityResult('CONTINUITY_INVALID', requiredBars, {
+      provider: entryProvider || null,
+    });
+  }
+
+  const barsByTime = new Map(entry.bars.map((bar) => [bar.time, bar]));
+  const candidatesByOpenTime = new Map<number, SpotKlineRevisionCandidate>();
+  let authorityProvider = entryProvider;
+  let authorityEpoch: number | null = null;
+  let hasVersionedCandidate = false;
+  let hasLegacyCandidate = false;
+
+  for (const rawCandidate of entry.revisionCandidates || []) {
+    const candidate = cloneRevisionCandidate(rawCandidate);
+    const candidateProvider = normalizeProvider(candidate.provider || entry.provider);
+    const candidateSymbol = normalizeSpotSymbol(candidate.symbol);
+    const candidateInterval = normalizeSpotInterval(candidate.interval);
+    const openTime = Number(candidate.openTime);
+    const entryBar = barsByTime.get(openTime);
+    if (
+      candidateSymbol !== normalizedSymbol
+      || candidateInterval !== normalizedInterval
+      || !Number.isFinite(openTime)
+      || openTime <= 0
+      || candidate.bar.time !== openTime
+      || !entryBar
+      || !hasValidRevisionMetadataShape(candidate.revision)
+    ) {
+      return staleHistoryEligibilityResult('REVISION_METADATA_INVALID', requiredBars, {
+        provider: entryProvider || null,
+      });
+    }
+    if (!sameTradingViewBar(entryBar, candidate.bar)) {
+      return staleHistoryEligibilityResult('REVISION_CONFLICT', requiredBars, {
+        provider: entryProvider || null,
+      });
+    }
+
+    const existing = candidatesByOpenTime.get(openTime);
+    if (existing) {
+      if (
+        !sameTradingViewBar(existing.bar, candidate.bar)
+        || !sameRevisionMetadata(existing.revision, candidate.revision)
+        || normalizeProvider(existing.provider || entry.provider) !== candidateProvider
+      ) {
+        return staleHistoryEligibilityResult('REVISION_CONFLICT', requiredBars, {
+          provider: entryProvider || null,
+        });
+      }
+      continue;
+    }
+
+    const candidateHasRevision = hasRevisionEvidence(candidate.revision);
+    hasVersionedCandidate = hasVersionedCandidate || candidateHasRevision;
+    hasLegacyCandidate = hasLegacyCandidate || !candidateHasRevision;
+    if (candidateProvider) {
+      if (authorityProvider && authorityProvider !== candidateProvider) {
+        return staleHistoryEligibilityResult('PROVIDER_EPOCH_MISMATCH', requiredBars, {
+          provider: entryProvider || null,
+        });
+      }
+      authorityProvider = candidateProvider;
+    }
+    if (candidateHasRevision) {
+      const candidateEpoch = candidate.revision.revisionEpoch as number;
+      if (authorityEpoch !== null && authorityEpoch !== candidateEpoch) {
+        return staleHistoryEligibilityResult('PROVIDER_EPOCH_MISMATCH', requiredBars, {
+          provider: authorityProvider || null,
+        });
+      }
+      authorityEpoch = candidateEpoch;
+    }
+    candidatesByOpenTime.set(openTime, candidate);
+  }
+
+  if (hasVersionedCandidate && hasLegacyCandidate) {
+    return staleHistoryEligibilityResult('REVISION_METADATA_INVALID', requiredBars, {
+      provider: authorityProvider || null,
+      revisionEpoch: authorityEpoch,
+    });
+  }
+
+  const closedBars: SpotTradingViewBar[] = [];
+  let excludedFormingCandle = false;
+  for (const bar of entry.bars) {
+    const candidate = candidatesByOpenTime.get(bar.time) || null;
+    if (hasVersionedCandidate && !candidate) {
+      return staleHistoryEligibilityResult('REVISION_METADATA_INVALID', requiredBars, {
+        provider: authorityProvider || null,
+        revisionEpoch: authorityEpoch,
+      });
+    }
+    if (isClosedHistoricalBar(bar, normalizedInterval, candidate?.revision || null, now)) {
+      closedBars.push({ ...bar });
+    } else {
+      excludedFormingCandle = true;
+    }
+  }
+
+  if (closedBars.length < minimumClosedBars) {
+    return staleHistoryEligibilityResult(
+      excludedFormingCandle ? 'FORMING_CANDLE' : 'INSUFFICIENT_BARS',
+      requiredBars,
+      {
+        provider: authorityProvider || null,
+        revisionEpoch: authorityEpoch,
+      },
+    );
+  }
+
+  const selectedBars = closedBars.slice(-requiredBars);
+  const selectedTimes = new Set(selectedBars.map((bar) => bar.time));
+  const selectedCandidates = Array.from(candidatesByOpenTime.values())
+    .filter((candidate) => selectedTimes.has(candidate.openTime))
+    .sort((left, right) => left.openTime - right.openTime)
+    .map(cloneRevisionCandidate);
+
+  return staleHistoryEligibilityResult('ELIGIBLE', requiredBars, {
+    bars: selectedBars,
+    revisionCandidates: selectedCandidates,
+    provider: authorityProvider || null,
+    revisionEpoch: authorityEpoch,
+  });
+}
+
 function isTerminalCompleteKlineCacheEntry(interval: string, requestedLimit: number, returnedCount: number) {
   const normalizedInterval = normalizeSpotInterval(interval);
   return normalizedInterval === '1Mutc' && returnedCount > 0 && returnedCount < requestedLimit;
@@ -607,6 +881,9 @@ export function buildKlineCachePerfPayload(
     requestedLimit: entry?.requestedLimit || Math.max(1, fallback.limit),
     returnedCount: entry?.returnedCount || 0,
     terminalComplete: Boolean(entry?.terminalComplete),
+    historyTerminal: Boolean(entry?.historyTerminal),
+    terminalReason: entry?.terminalReason ?? null,
+    earliestBoundary: entry?.earliestBoundary ?? null,
     bars_count: entry?.bars.length || 0,
     cache_age_ms: entry ? Math.max(0, now - entry.updatedAt) : null,
     cached_at: entry?.cachedAt || null,
@@ -716,6 +993,9 @@ export function writeCurrentKlineCache(params: {
   revisionCandidates?: SpotKlineRevisionCandidate[];
   provider?: unknown;
   source?: unknown;
+  historyTerminal?: unknown;
+  terminalReason?: unknown;
+  earliestBoundary?: unknown;
 }) {
   if (!params.bars.length) return null;
 
@@ -723,6 +1003,32 @@ export function writeCurrentKlineCache(params: {
   const normalizedInterval = normalizeSpotInterval(params.interval);
   const normalizedLimit = Math.max(1, params.limit);
   const key = buildCurrentKlineCacheKey(normalizedSymbol, normalizedInterval, normalizedLimit);
+  const incomingTerminalReason = String(params.terminalReason || '').trim() || null;
+  const incomingEarliestBoundary = Number(params.earliestBoundary);
+  const hasIncomingTerminalBoundary = Boolean(
+    params.historyTerminal === true
+    && incomingTerminalReason
+    && Number.isFinite(incomingEarliestBoundary)
+    && incomingEarliestBoundary > 0
+  );
+  const existingTerminalBoundary = Array.from(currentKlineCache.values())
+    .filter((entry) => (
+      entry.symbol === normalizedSymbol
+      && entry.interval === normalizedInterval
+      && entry.historyTerminal
+      && entry.terminalReason
+      && entry.earliestBoundary !== null
+      && Number.isFinite(entry.earliestBoundary)
+      && entry.earliestBoundary > 0
+    ))
+    .sort((left, right) => right.updatedAt - left.updatedAt)[0] || null;
+  const historyTerminal = hasIncomingTerminalBoundary || Boolean(existingTerminalBoundary);
+  const terminalReason = hasIncomingTerminalBoundary
+    ? incomingTerminalReason
+    : existingTerminalBoundary?.terminalReason || null;
+  const earliestBoundary = hasIncomingTerminalBoundary
+    ? incomingEarliestBoundary
+    : existingTerminalBoundary?.earliestBoundary ?? null;
   const revisionCache = createSpotKlineRevisionCache();
   const existingScopeCandidates = Array.from(currentKlineCache.values())
     .filter((entry) => entry.symbol === normalizedSymbol && entry.interval === normalizedInterval)
@@ -759,7 +1065,7 @@ export function writeCurrentKlineCache(params: {
   })) {
     return null;
   }
-  const terminalComplete = isTerminalCompleteKlineCacheEntry(
+  const terminalComplete = historyTerminal || isTerminalCompleteKlineCacheEntry(
     normalizedInterval,
     normalizedLimit,
     storedBars.length,
@@ -773,6 +1079,9 @@ export function writeCurrentKlineCache(params: {
     requestedLimit: normalizedLimit,
     returnedCount: storedBars.length,
     terminalComplete,
+    historyTerminal,
+    terminalReason,
+    earliestBoundary,
     bars: storedBars,
     revisionCandidates: storedRevisionCandidates,
     provider: params.provider,
@@ -966,6 +1275,9 @@ export async function fetchAndCacheCurrentKlineBars(params: {
     revisionCandidates,
     provider: payload.provider,
     source: payload.source,
+    historyTerminal: payload.history_terminal,
+    terminalReason: payload.terminal_reason,
+    earliestBoundary: payload.earliest_available_time,
   });
 }
 

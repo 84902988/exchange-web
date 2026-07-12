@@ -29,6 +29,7 @@ import {
   getSpotKlineLoadPolicy,
   isSparseRealKlineSeries,
   inspectCurrentKlineCache,
+  inspectStaleHistoryEligibility,
   isProviderCandleOnlyInterval,
   isUtcProviderCandleInterval,
   mergeTradingViewBars,
@@ -39,6 +40,11 @@ import {
   type SpotTradingViewBar,
   type SpotKlineRevisionCandidate,
 } from './spotKlineClientCache';
+import {
+  getSpotKlinePreloadLimit,
+  requestSpotKlineInFlight,
+  type SpotKlineInFlightRole,
+} from './spotKlinePreloadManager';
 
 type TradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
 
@@ -163,6 +169,9 @@ type SpotTradingViewDatafeedOptions = Pick<
   onKlineLoadStateChange?: (state: SpotKlineLoadState) => void;
   onKlineRealtime?: (event: SpotTradingViewRealtimeEvent) => void;
   onHistoryBars?: (event: SpotTradingViewHistoryBarsEvent) => void;
+  inFlightDeadlineMs?: Partial<Record<SpotKlineInFlightRole, number>>;
+  getBarsWatchdogMs?: number;
+  getBarsHardTimeoutMs?: number;
 };
 
 export type SpotTradingViewHistoryBarsEvent = {
@@ -198,6 +207,9 @@ type HistoryKlineRequestResult = {
   earliest_available_time?: unknown;
   provider_error_code?: unknown;
   provider_error_provider?: unknown;
+  coverageKey?: string;
+  coverageComplete?: boolean;
+  terminalComplete?: boolean;
   pageCount?: number;
   requestedBars?: number;
   reachedRequiredBars?: boolean;
@@ -226,6 +238,15 @@ type HistoryNoDataPolicy = {
   hasMetadata: boolean;
   terminalEmpty: boolean;
   transientEmpty: boolean;
+};
+
+type SpotKlineTerminalBoundary = {
+  datafeedInstanceId: number;
+  symbol: string;
+  interval: string;
+  earliestAvailableTime: number;
+  terminalReason: string;
+  recordedAt: number;
 };
 
 type SpotTvDebugEvent = {
@@ -271,7 +292,6 @@ const SPOT_INTERVAL_TO_RESOLUTION: Record<string, TradingViewResolution> = {
 const ASIA_SHANGHAI_OFFSET_MS = 8 * 60 * 60_000;
 const TRADINGVIEW_TIMEZONE = 'Asia/Shanghai';
 const realtimeHighWaterMarkByKey = new Map<string, number>();
-const historyKlineRequestInFlightByKey = new Map<string, Promise<HistoryKlineRequestResult>>();
 let forcedSpotTradingViewDebugEnabled = false;
 let spotTradingViewGetBarsRequestSeq = 0;
 let spotTradingViewDatafeedInstanceSeq = 0;
@@ -279,6 +299,8 @@ const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
 const SPOT_TV_GETBARS_API_PAGE_LIMIT = 500;
 const SPOT_TV_GETBARS_MAX_INTERNAL_BARS = 1000;
 const SPOT_TV_GETBARS_MAX_INTERNAL_PAGES = 3;
+const SPOT_TV_GETBARS_SETTLE_WATCHDOG_MS = 4_250;
+const SPOT_TV_GETBARS_HARD_TIMEOUT_MS = 12_000;
 const SPOT_TV_EMPTY_RANGE_TTL_MS = 5_000;
 const SPOT_TV_EMPTY_RANGE_BACKOFF_MS = [120, 500, 1_000] as const;
 
@@ -607,8 +629,8 @@ function hasKlineHistoryMetadata(result: HistoryKlineRequestResult): boolean {
   );
 }
 
-function isExplicitTerminalKlineResult(result: HistoryKlineRequestResult): boolean {
-  if (result.bars.length > 0 || !isTruthyKlineMeta(result.history_terminal)) return false;
+function hasExplicitTerminalKlineEvidence(result: HistoryKlineRequestResult): boolean {
+  if (!isTruthyKlineMeta(result.history_terminal)) return false;
   if (isTruthyKlineMeta(result.history_incomplete) || isTruthyKlineMeta(result.stale)) return false;
   if (isTransientKlineProviderErrorCode(result.provider_error_code)) return false;
 
@@ -622,6 +644,10 @@ function isExplicitTerminalKlineResult(result: HistoryKlineRequestResult): boole
     cacheStatus === 'CONTINUITY_INVALID' ||
     cacheStatus === 'COVERAGE_INVALID'
   );
+}
+
+function isExplicitTerminalKlineResult(result: HistoryKlineRequestResult): boolean {
+  return result.bars.length === 0 && hasExplicitTerminalKlineEvidence(result);
 }
 
 export function resolveHistoryNoDataPolicy(params: {
@@ -703,8 +729,11 @@ export function resolveHistoryNoDataPolicy(params: {
 type SpotKlineRequestToken = {
   sequence: number;
   generation: string;
+  startedAt: number;
+  deadlineAt: number;
   settled: boolean;
   supersededSettlementScheduled: boolean;
+  watchdogHandle: ReturnType<typeof setTimeout> | null;
   onSuperseded: () => void;
 };
 
@@ -714,9 +743,16 @@ export class SpotKlineRequestGuard {
   private activeTokens = new Set<SpotKlineRequestToken>();
   private destroyed = false;
 
+  private clearWatchdog(token: SpotKlineRequestToken) {
+    if (token.watchdogHandle === null) return;
+    clearTimeout(token.watchdogHandle);
+    token.watchdogHandle = null;
+  }
+
   private scheduleSupersededSettlement(token: SpotKlineRequestToken) {
     if (token.settled || token.supersededSettlementScheduled) return;
     token.supersededSettlementScheduled = true;
+    this.clearWatchdog(token);
     queueMicrotask(() => {
       token.supersededSettlementScheduled = false;
       if (token.settled) return;
@@ -727,7 +763,11 @@ export class SpotKlineRequestGuard {
     });
   }
 
-  begin(generation: string, onSuperseded: () => void): SpotKlineRequestToken {
+  begin(
+    generation: string,
+    onSuperseded: () => void,
+    timing?: { startedAt: number; deadlineAt: number },
+  ): SpotKlineRequestToken {
     if (this.activeGeneration && this.activeGeneration !== generation) {
       for (const token of Array.from(this.activeTokens)) {
         this.scheduleSupersededSettlement(token);
@@ -738,8 +778,11 @@ export class SpotKlineRequestGuard {
     const token = {
       sequence: this.sequence,
       generation,
+      startedAt: timing?.startedAt ?? Date.now(),
+      deadlineAt: timing?.deadlineAt ?? Date.now(),
       settled: false,
       supersededSettlementScheduled: false,
+      watchdogHandle: null,
       onSuperseded,
     };
     this.activeTokens.add(token);
@@ -754,6 +797,7 @@ export class SpotKlineRequestGuard {
     }
 
     token.settled = true;
+    this.clearWatchdog(token);
     this.activeTokens.delete(token);
     callback();
     return true;
@@ -768,11 +812,23 @@ export class SpotKlineRequestGuard {
     );
   }
 
+  armWatchdog(token: SpotKlineRequestToken, onTimeout: () => void) {
+    if (!this.isActive(token)) return false;
+    this.clearWatchdog(token);
+    token.watchdogHandle = setTimeout(() => {
+      token.watchdogHandle = null;
+      if (!this.isActive(token)) return;
+      onTimeout();
+    }, Math.max(1, token.deadlineAt - Date.now()));
+    return true;
+  }
+
   destroy() {
     this.destroyed = true;
     this.sequence += 1;
     this.activeGeneration = '';
     for (const token of this.activeTokens) {
+      this.clearWatchdog(token);
       token.settled = true;
     }
     this.activeTokens.clear();
@@ -1063,9 +1119,17 @@ function getHistoryKlineLimit(interval: string, countBack: number) {
   return normalizeRequiredKlineBars(countBack, policy.history);
 }
 
+function isMonthlyProviderKlineInterval(interval: string) {
+  const normalized = normalizeSpotInterval(interval);
+  return normalized === '1M' || normalized === '1Mutc';
+}
+
 function getCurrentKlineInitialLimit(interval: string, requiredBars: number) {
   const policy = getSpotKlineLoadPolicy(interval);
   const normalizedRequiredBars = Math.max(1, Math.floor(requiredBars || policy.current));
+  if (isMonthlyProviderKlineInterval(interval)) {
+    return Math.min(normalizedRequiredBars, getSpotKlinePreloadLimit(interval));
+  }
   if (isProviderCandleOnlyInterval(interval)) {
     return Math.min(normalizedRequiredBars, policy.current);
   }
@@ -1076,25 +1140,6 @@ function getKlineRequestPageLimit(requiredBars: number, loadedBars = 0) {
   const remaining = Math.max(1, requiredBars - loadedBars);
   const remainingInternalCapacity = Math.max(1, SPOT_TV_GETBARS_MAX_INTERNAL_BARS - loadedBars);
   return Math.min(remaining, remainingInternalCapacity, SPOT_TV_GETBARS_API_PAGE_LIMIT);
-}
-
-function buildHistoryKlineInFlightKey(
-  symbol: string,
-  interval: string,
-  periodParams: TradingViewPeriodParams,
-  limit: number,
-  endTime?: number,
-) {
-  const from = Number(periodParams.from || 0);
-  const to = Number(periodParams.to || 0);
-  return [
-    normalizeSpotSymbol(symbol),
-    normalizeSpotInterval(interval),
-    Number.isFinite(from) ? from : 0,
-    Number.isFinite(to) ? to : 0,
-    Math.max(1, limit),
-    endTime || 0,
-  ].join(':');
 }
 
 function classifyKlineRequest(periodParams: TradingViewPeriodParams) {
@@ -1163,49 +1208,7 @@ async function fetchKlineRequestBars(params: {
   };
 }
 
-function getHistoryKlineRequestPromise(params: {
-  key: string;
-  symbol: string;
-  interval: string;
-  limit: number;
-  endTime?: number;
-}) {
-  const existing = historyKlineRequestInFlightByKey.get(params.key);
-  if (existing) {
-    spotTradingViewDebug('history in-flight dedupe key', {
-      key: params.key,
-      symbol: params.symbol,
-      interval: normalizeSpotInterval(params.interval),
-      limit: params.limit,
-      endTime: params.endTime || null,
-      deduped: true,
-    });
-    return existing;
-  }
-
-  spotTradingViewDebug('history in-flight dedupe key', {
-    key: params.key,
-    symbol: params.symbol,
-    interval: normalizeSpotInterval(params.interval),
-    limit: params.limit,
-    endTime: params.endTime || null,
-    deduped: false,
-  });
-
-  const request = fetchKlineRequestBars({
-    symbol: params.symbol,
-    interval: params.interval,
-    limit: params.limit,
-    endTime: params.endTime,
-    forceRest: true,
-  }).finally(() => {
-    historyKlineRequestInFlightByKey.delete(params.key);
-  });
-  historyKlineRequestInFlightByKey.set(params.key, request);
-  return request;
-}
-
-async function fetchCountBackKlineRequestBars(params: {
+async function fetchCountBackKlineRequestBarsRaw(params: {
   symbol: string;
   interval: string;
   requiredBars: number;
@@ -1215,11 +1218,15 @@ async function fetchCountBackKlineRequestBars(params: {
   periodParams: TradingViewPeriodParams;
   requestSeq: number;
   phase: string;
+  inFlightRole?: SpotKlineInFlightRole;
+  inFlightDeadlineMs?: number;
+  onTerminalEvidence?: (result: HistoryKlineRequestResult) => void;
 }): Promise<HistoryKlineRequestResult> {
   const pages: NonNullable<HistoryKlineRequestResult['pages']> = [];
   let combinedBars: TradingViewBar[] = [];
   let combinedRevisionCandidates: SpotKlineRevisionCandidate[] = [];
   let firstResult: HistoryKlineRequestResult | null = null;
+  let terminalEvidence: HistoryKlineRequestResult | null = null;
   let cursorEndTime = params.endTime;
   let terminalNoData = false;
 
@@ -1228,28 +1235,21 @@ async function fetchCountBackKlineRequestBars(params: {
     const limit = page === 1
       ? params.initialLimit
       : getKlineRequestPageLimit(params.requiredBars, loadedBars);
-    const key = params.isHistoryRequest && cursorEndTime
-      ? buildHistoryKlineInFlightKey(params.symbol, params.interval, params.periodParams, limit, cursorEndTime)
-      : '';
-    const result = key
-      ? await getHistoryKlineRequestPromise({
-        key,
-        symbol: params.symbol,
-        interval: params.interval,
-        limit,
-        endTime: cursorEndTime,
-      })
-      : await fetchKlineRequestBars({
-        symbol: params.symbol,
-        interval: params.interval,
-        limit,
-        endTime: cursorEndTime,
-        forceRest: true,
-      });
+    const result = await fetchKlineRequestBars({
+      symbol: params.symbol,
+      interval: params.interval,
+      limit,
+      endTime: cursorEndTime,
+      forceRest: true,
+    });
 
     if (!firstResult) firstResult = result;
 
     const terminalEmpty = isExplicitTerminalKlineResult(result);
+    if (terminalEmpty) {
+      terminalEvidence = result;
+      params.onTerminalEvidence?.(result);
+    }
     pages.push({
       page,
       limit,
@@ -1293,6 +1293,11 @@ async function fetchCountBackKlineRequestBars(params: {
         ...result,
         bars: [],
         revisionCandidates: [],
+        coverageKey: params.isHistoryRequest
+          ? `history:${params.endTime || 0}`
+          : 'current',
+        coverageComplete: terminalEmpty,
+        terminalComplete: terminalEmpty,
         pageCount: pages.length,
         requestedBars: params.requiredBars,
         reachedRequiredBars: false,
@@ -1329,14 +1334,112 @@ async function fetchCountBackKlineRequestBars(params: {
 
   return {
     ...baseResult,
+    ...(terminalEvidence ? {
+      history_terminal: terminalEvidence.history_terminal,
+      terminal_reason: terminalEvidence.terminal_reason,
+      earliest_available_time: terminalEvidence.earliest_available_time,
+    } : {}),
     bars: finalBars,
     revisionCandidates: finalRevisionCandidates,
+    coverageKey: params.isHistoryRequest
+      ? `history:${params.endTime || 0}`
+      : 'current',
+    coverageComplete: Boolean(terminalEvidence),
+    terminalComplete: Boolean(terminalEvidence),
     pageCount: pages.length,
     requestedBars: params.requiredBars,
     reachedRequiredBars,
     terminalNoData,
     pages,
   };
+}
+
+async function fetchCountBackKlineRequestBars(params: {
+  symbol: string;
+  interval: string;
+  requiredBars: number;
+  initialLimit: number;
+  endTime?: number;
+  isHistoryRequest: boolean;
+  periodParams: TradingViewPeriodParams;
+  requestSeq: number;
+  phase: string;
+  inFlightRole?: SpotKlineInFlightRole;
+  inFlightDeadlineMs?: number;
+  onTerminalEvidence?: (result: HistoryKlineRequestResult) => void;
+}): Promise<HistoryKlineRequestResult> {
+  const coverageKey = params.isHistoryRequest
+    ? `history:${params.endTime || 0}`
+    : 'current';
+  const requestedBars = !params.isHistoryRequest && isMonthlyProviderKlineInterval(params.interval)
+    ? Math.max(params.requiredBars, getSpotKlinePreloadLimit(params.interval))
+    : params.requiredBars;
+  const canReuseTerminalBoundary = (result: HistoryKlineRequestResult) => {
+    if (!params.isHistoryRequest || !params.endTime) return false;
+    if (!hasExplicitTerminalKlineEvidence(result)) return false;
+    const earliestAvailableTimeSeconds = normalizeTimeToSeconds(result.earliest_available_time);
+    return earliestAvailableTimeSeconds > 0
+      && params.endTime <= earliestAvailableTimeSeconds * 1000;
+  };
+
+  const outcome = await requestSpotKlineInFlight<HistoryKlineRequestResult>({
+    symbol: params.symbol,
+    interval: params.interval,
+    requestedBars,
+    role: params.inFlightRole || 'active',
+    deadlineMs: params.inFlightDeadlineMs,
+    canReuseResult: (result, context) => {
+      const historyResult = result as HistoryKlineRequestResult;
+      if (historyResult.coverageKey === coverageKey) {
+        return Boolean(
+          historyResult.coverageComplete
+          || context.existingRequestedBars >= requestedBars
+          || historyResult.bars.length >= params.requiredBars
+        );
+      }
+      return canReuseTerminalBoundary(historyResult);
+    },
+    getCoveredResult: params.isHistoryRequest
+      ? undefined
+      : () => {
+        const covered = inspectCurrentKlineCache(params.symbol, params.interval, requestedBars, {
+          minBars: requestedBars,
+        }).hit;
+        return covered ? {
+          bars: cloneBars(covered.bars),
+          revisionCandidates: covered.revisionCandidates || [],
+          provider: covered.provider,
+          source: covered.source,
+          coverageKey,
+          coverageComplete: covered.terminalComplete || covered.bars.length >= requestedBars,
+          terminalComplete: covered.terminalComplete,
+          history_terminal: covered.historyTerminal,
+          terminal_reason: covered.terminalReason,
+          earliest_available_time: covered.earliestBoundary,
+        } : null;
+      },
+    request: () => fetchCountBackKlineRequestBarsRaw(params),
+  });
+  const result = outcome.result;
+  params.onTerminalEvidence?.(result);
+
+  if (
+    params.isHistoryRequest
+    && result.coverageKey !== coverageKey
+    && canReuseTerminalBoundary(result)
+  ) {
+    return {
+      ...result,
+      bars: [],
+      revisionCandidates: [],
+      coverageKey,
+      coverageComplete: true,
+      terminalComplete: true,
+      terminalNoData: true,
+    };
+  }
+
+  return result;
 }
 
 function buildSymbolInfo(options: SpotTradingViewDatafeedOptions): TradingViewLibrarySymbolInfo {
@@ -1405,6 +1508,7 @@ export function createSpotTradingViewDatafeed(
   const revisionCache = createSpotKlineRevisionCache();
   let activeGetBarsLatestBarKey = '';
   let activeRevisionInterval = '';
+  let activeSWRRevalidateSequence = 0;
   const realtimeOwner = `tradingview:${apiSymbol}:${datafeedInstanceId}`;
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
@@ -1414,6 +1518,46 @@ export function createSpotTradingViewDatafeed(
   const activeSubscriptionKeyByUid = new Map<string, string>();
   const historyReadyByLatestBarKey = new Map<string, boolean>();
   const unsubscribeByUid = new Map<string, () => void>();
+  const terminalBoundaryByScope = new Map<string, SpotKlineTerminalBoundary>();
+  const getBarsHardTimeoutHandles = new Set<ReturnType<typeof setTimeout>>();
+
+  const getTerminalBoundaryScopeKey = (interval: string) => [
+    datafeedInstanceId,
+    apiSymbol,
+    normalizeSpotInterval(interval),
+  ].join(':');
+
+  const recordTerminalBoundary = (
+    interval: string,
+    result: HistoryKlineRequestResult,
+  ): SpotKlineTerminalBoundary | null => {
+    if (destroyed) return null;
+    if (!hasExplicitTerminalKlineEvidence(result)) return null;
+    const earliestAvailableTimeSeconds = normalizeTimeToSeconds(result.earliest_available_time);
+    const terminalReason = String(result.terminal_reason || '').trim();
+    if (earliestAvailableTimeSeconds <= 0 || !terminalReason) return null;
+
+    const key = getTerminalBoundaryScopeKey(interval);
+    const existing = terminalBoundaryByScope.get(key);
+    const earliestAvailableTime = Math.min(
+      existing?.earliestAvailableTime ?? Number.POSITIVE_INFINITY,
+      earliestAvailableTimeSeconds * 1000,
+    );
+    const boundary: SpotKlineTerminalBoundary = {
+      datafeedInstanceId,
+      symbol: apiSymbol,
+      interval: normalizeSpotInterval(interval),
+      earliestAvailableTime,
+      terminalReason,
+      recordedAt: Date.now(),
+    };
+    terminalBoundaryByScope.set(key, boundary);
+    return boundary;
+  };
+
+  const getTerminalBoundary = (interval: string) => (
+    terminalBoundaryByScope.get(getTerminalBoundaryScopeKey(interval)) || null
+  );
 
   const getLatestBarKey = (resolution: TradingViewResolution | string) =>
     `${apiSymbol}:${normalizeResolution(resolution)}`;
@@ -1479,6 +1623,7 @@ export function createSpotTradingViewDatafeed(
     getBars(_symbolInfo, resolution, periodParams, onHistory, onError) {
       const requestSeq = spotTradingViewGetBarsRequestSeq + 1;
       spotTradingViewGetBarsRequestSeq = requestSeq;
+      const swrRevalidateSequence = ++activeSWRRevalidateSequence;
       const requestResolution = normalizeResolution(resolution);
       const chartInterval = tradingViewResolutionToSpotInterval(requestResolution);
       const interval = getBackendKlineIntervalForTradingView(requestResolution);
@@ -1504,9 +1649,30 @@ export function createSpotTradingViewDatafeed(
         interval,
       ].join('|');
       emptyRangeGuard.activateGeneration(requestGeneration);
+      const getBarsStartedAt = getSpotDatafeedPerfNow();
+      const requestStartedAt = Date.now();
+      const configuredWatchdogMs = Number(options.getBarsWatchdogMs);
+      const watchdogMs = Number.isFinite(configuredWatchdogMs) && configuredWatchdogMs > 0
+        ? Math.max(1, Math.floor(configuredWatchdogMs))
+        : SPOT_TV_GETBARS_SETTLE_WATCHDOG_MS;
+      const configuredHardTimeoutMs = Number(options.getBarsHardTimeoutMs);
+      const hardTimeoutMs = Math.max(
+        watchdogMs + 1,
+        Number.isFinite(configuredHardTimeoutMs) && configuredHardTimeoutMs > 0
+          ? Math.floor(configuredHardTimeoutMs)
+          : SPOT_TV_GETBARS_HARD_TIMEOUT_MS,
+      );
       let didCompleteHistory = false;
+      let hardTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      const clearHardTimeout = () => {
+        if (hardTimeoutHandle === null) return;
+        clearTimeout(hardTimeoutHandle);
+        getBarsHardTimeoutHandles.delete(hardTimeoutHandle);
+        hardTimeoutHandle = null;
+      };
       const requestToken = requestGuard.begin(requestGeneration, () => {
         if (didCompleteHistory || destroyed) return;
+        clearHardTimeout();
         didCompleteHistory = true;
         spotTradingViewDebug('getBars superseded settle', {
           datafeedInstanceId,
@@ -1519,6 +1685,9 @@ export function createSpotTradingViewDatafeed(
           noData: false,
         });
         onHistory([], { noData: false });
+      }, {
+        startedAt: requestStartedAt,
+        deadlineAt: requestStartedAt + watchdogMs,
       });
       activeGetBarsLatestBarKey = latestBarKey;
       const isFirstDataRequest = periodParams.firstDataRequest !== false;
@@ -1555,7 +1724,6 @@ export function createSpotTradingViewDatafeed(
         forceRest: true,
       };
       const getBarsRequestId = createSpotKlinePerfId('getBars');
-      const getBarsStartedAt = getSpotDatafeedPerfNow();
       const getBarsPerfPayload = {
         datafeedInstanceId,
         requestId: getBarsRequestId,
@@ -1610,6 +1778,7 @@ export function createSpotTradingViewDatafeed(
         meta: { noData: boolean },
         emptyReason?: string,
       ) => {
+        clearHardTimeout();
         const guardState = getHistoryCallbackGuardState();
         const didSettle = requestGuard.complete(requestToken, () => {
           didCompleteHistory = true;
@@ -1721,6 +1890,7 @@ export function createSpotTradingViewDatafeed(
         }
       };
       const safeErrorCallback = (reason: string) => {
+        clearHardTimeout();
         const guardState = getHistoryCallbackGuardState();
         const didSettle = requestGuard.complete(requestToken, () => {
           didCompleteHistory = true;
@@ -1771,6 +1941,42 @@ export function createSpotTradingViewDatafeed(
         });
         onError(reason);
       };
+      requestGuard.armWatchdog(requestToken, () => {
+        if (!requestGuard.isActive(requestToken)) return;
+        markSpotKlinePerf('getBars_watchdog_timeout', {
+          ...getBarsPerfPayload,
+          duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+          watchdog_ms: watchdogMs,
+          hard_timeout_ms: hardTimeoutMs,
+          started_at: requestToken.startedAt,
+          deadline_at: requestToken.deadlineAt,
+          note: 'soft timeout only; request remains active',
+        });
+        spotTradingViewDebug('getBars watchdog timeout', {
+          ...requestDebugPayload,
+          watchdogMs,
+          hardTimeoutMs,
+          startedAt: requestToken.startedAt,
+          deadlineAt: requestToken.deadlineAt,
+          softTimeoutOnly: true,
+        });
+      });
+      hardTimeoutHandle = setTimeout(() => {
+        if (hardTimeoutHandle !== null) {
+          getBarsHardTimeoutHandles.delete(hardTimeoutHandle);
+        }
+        hardTimeoutHandle = null;
+        if (!requestGuard.isActive(requestToken)) return;
+        markSpotKlinePerf('getBars_hard_timeout', {
+          ...getBarsPerfPayload,
+          duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+          watchdog_ms: watchdogMs,
+          hard_timeout_ms: hardTimeoutMs,
+          note: 'hard timeout settled through onErrorCallback',
+        });
+        safeErrorCallback('Kline history request timed out');
+      }, hardTimeoutMs);
+      getBarsHardTimeoutHandles.add(hardTimeoutHandle);
       const rememberHistoryBars = (bars: TradingViewBar[]) => {
         const latestBar = bars[bars.length - 1] || null;
         if (latestBar) {
@@ -1847,6 +2053,27 @@ export function createSpotTradingViewDatafeed(
         return;
       }
 
+      if (isHistoryRequest && endTime) {
+        const boundary = getTerminalBoundary(interval);
+        if (boundary && endTime <= boundary.earliestAvailableTime) {
+          spotTradingViewDebug('getBars terminal boundary cache hit', {
+            datafeedInstanceId,
+            requestSeq,
+            requestGeneration,
+            symbol: apiSymbol,
+            resolution: requestResolution,
+            backendInterval: interval,
+            end_time_ms: endTime,
+            earliest_available_time: boundary.earliestAvailableTime,
+            terminal_reason: boundary.terminalReason,
+            recorded_at: boundary.recordedAt,
+            noData: true,
+          });
+          safeHistoryCallback([], { noData: true }, 'recorded terminal history boundary');
+          return;
+        }
+      }
+
       if (!isHistoryRequest && !endTime) {
         const l1MinBars = getL1CurrentKlineCacheMinBars(interval, requiredBars);
         const cacheLookup = inspectCurrentKlineCache(apiSymbol, interval, requiredBars, { minBars: l1MinBars });
@@ -1902,7 +2129,13 @@ export function createSpotTradingViewDatafeed(
             cacheLookup.continuityStats?.invalidOhlcCount ?? cachedContinuityStats?.invalidOhlcCount ?? null,
           sparseRealBars: cachedSparseRealBars,
         };
-        const cachedCoversRequestedBars = Boolean(cached?.bars.length && cached.bars.length >= requiredBars);
+        const cachedCoversRequestedBars = Boolean(
+          cached?.bars.length
+          && (
+            cached.bars.length >= requiredBars
+            || (isMonthlyProviderKlineInterval(interval) && cached.terminalComplete)
+          )
+        );
         if (
           cached?.bars.length &&
           cachedCoversRequestedBars &&
@@ -1910,6 +2143,17 @@ export function createSpotTradingViewDatafeed(
           cachedContinuityStats &&
           !cachedContinuityRejected
         ) {
+          if (cached.historyTerminal && cached.terminalReason && cached.earliestBoundary) {
+            recordTerminalBoundary(interval, {
+              bars: [],
+              revisionCandidates: [],
+              history_incomplete: false,
+              history_terminal: true,
+              terminal_reason: cached.terminalReason,
+              earliest_available_time: cached.earliestBoundary,
+              cache_status: 'HISTORY_BOUNDARY',
+            });
+          }
           if (canUpdateActiveHistoryState()) {
             rememberHistoryBars(cached.bars);
             options.onKlineLoadStateChange?.('loaded');
@@ -1968,10 +2212,53 @@ export function createSpotTradingViewDatafeed(
           safeHistoryCallback(cloneBars(cached.bars), { noData: false });
 
           if (!cached.terminalComplete) {
-            void fetchAndCacheCurrentKlineBars({
+            const refreshLimit = Math.max(
+              l1MinBars,
+              Math.min(requiredBars, cached.limit || requiredBars),
+            );
+            void requestSpotKlineInFlight({
               symbol: apiSymbol,
               interval,
-              limit: Math.max(l1MinBars, Math.min(requiredBars, cached.limit || requiredBars)),
+              requestedBars: refreshLimit,
+              role: 'revalidate',
+              deadlineMs: options.inFlightDeadlineMs?.revalidate,
+              getCoveredResult: () => {
+                const covered = inspectCurrentKlineCache(apiSymbol, interval, refreshLimit, {
+                  minBars: refreshLimit,
+                }).hit;
+                return covered ? {
+                  bars: cloneBars(covered.bars),
+                  revisionCandidates: covered.revisionCandidates || [],
+                  provider: covered.provider,
+                  source: covered.source,
+                  historyTerminal: covered.historyTerminal,
+                  terminalReason: covered.terminalReason,
+                  earliestBoundary: covered.earliestBoundary,
+                  history_terminal: covered.historyTerminal,
+                  terminal_reason: covered.terminalReason,
+                  earliest_available_time: covered.earliestBoundary,
+                } : null;
+              },
+              request: async (lease) => {
+                const refreshed = await fetchAndCacheCurrentKlineBars({
+                  symbol: apiSymbol,
+                  interval,
+                  limit: refreshLimit,
+                  shouldStore: () => !destroyed && lease.isCurrent(),
+                });
+                return {
+                  bars: refreshed?.bars || [],
+                  revisionCandidates: refreshed?.revisionCandidates || [],
+                  provider: refreshed?.provider,
+                  source: refreshed?.source,
+                  historyTerminal: refreshed?.historyTerminal,
+                  terminalReason: refreshed?.terminalReason,
+                  earliestBoundary: refreshed?.earliestBoundary,
+                  history_terminal: refreshed?.historyTerminal,
+                  terminal_reason: refreshed?.terminalReason,
+                  earliest_available_time: refreshed?.earliestBoundary,
+                };
+              },
             }).catch((err: unknown) => {
               if (process.env.NODE_ENV !== 'production') {
                 console.debug('[SpotTradingViewDatafeed] refresh kline cache failed', {
@@ -1985,6 +2272,162 @@ export function createSpotTradingViewDatafeed(
           }
           return;
         }
+
+        const staleCacheCandidate = cacheLookup.candidate;
+        const staleEligibility = (
+          periodParams.firstDataRequest === true
+          && cacheLookup.reason === 'expired'
+          && staleCacheCandidate
+        )
+          ? inspectStaleHistoryEligibility(staleCacheCandidate, { requiredBars })
+          : null;
+        if (staleEligibility?.eligible && staleCacheCandidate) {
+          const staleCandidates = staleEligibility.revisionCandidates.length
+            ? staleEligibility.revisionCandidates
+            : staleEligibility.bars.map((bar) => ({
+              symbol: apiSymbol,
+              interval,
+              openTime: bar.time,
+              bar,
+              provider: staleCacheCandidate.provider,
+              source: staleCacheCandidate.source,
+              revision: extractSpotKlineRevisionMetadata(null),
+            }));
+          const mergedStaleCandidates = revisionCache.mergeMany(staleCandidates);
+          const mergedStaleBars = mergedStaleCandidates.map((candidate) => ({ ...candidate.bar }));
+          const guardedStaleEligibility = inspectStaleHistoryEligibility({
+            ...staleCacheCandidate,
+            bars: mergedStaleBars,
+            revisionCandidates: mergedStaleCandidates,
+            returnedCount: mergedStaleBars.length,
+            firstTime: mergedStaleBars[0]?.time ?? null,
+            lastTime: mergedStaleBars[mergedStaleBars.length - 1]?.time ?? null,
+          }, { requiredBars });
+
+          if (guardedStaleEligibility.eligible) {
+            const staleBars = cloneBars(guardedStaleEligibility.bars);
+            if (canUpdateActiveHistoryState()) {
+              rememberHistoryBars(staleBars);
+              options.onKlineLoadStateChange?.('loaded');
+              historyReadyByLatestBarKey.set(latestBarKey, true);
+            }
+            emptyRangeGuard.clearAfterBars(emptyRangeState.key, emptyRangeState.dataset);
+            markSpotKlinePerf('kline_swr_cache_hit', {
+              ...cachePerfPayload,
+              duration_ms: Math.max(0, getSpotDatafeedPerfNow() - getBarsStartedAt),
+              bars_count: staleBars.length,
+              source: staleCacheCandidate.source,
+              provider: staleCacheCandidate.provider,
+              reason: guardedStaleEligibility.reason,
+            });
+            spotTradingViewDebug('getBars response', {
+              ...requestDebugPayload,
+              cacheHit: true,
+              staleWhileRevalidate: true,
+              noData: false,
+              provider: staleCacheCandidate.provider,
+              source: staleCacheCandidate.source,
+              ...getBarsDebugStats(staleBars, interval),
+              barsSummary: buildSpotTvDebugBarsSummary(staleBars),
+            });
+            safeHistoryCallback(staleBars, { noData: false }, 'stale-while-revalidate');
+
+            const isSWRScopeCurrent = () => Boolean(
+              !destroyed
+              && activeSWRRevalidateSequence === swrRevalidateSequence
+              && activeGetBarsLatestBarKey === latestBarKey
+              && activeRevisionInterval === interval
+            );
+            const revalidateStartedAt = getSpotDatafeedPerfNow();
+            markSpotKlinePerf('kline_swr_revalidate_start', {
+              ...getBarsPerfPayload,
+              stale_bars_count: staleBars.length,
+            });
+            void fetchCountBackKlineRequestBars({
+              symbol: apiSymbol,
+              interval,
+              requiredBars,
+              initialLimit: limit,
+              isHistoryRequest: false,
+              periodParams,
+              requestSeq,
+              phase: 'current',
+              inFlightRole: 'revalidate',
+              inFlightDeadlineMs: options.inFlightDeadlineMs?.revalidate,
+              onTerminalEvidence: (result) => {
+                recordTerminalBoundary(interval, result);
+              },
+            }).then((rawResult) => {
+              if (!isSWRScopeCurrent()) {
+                markSpotKlinePerf('kline_swr_revalidate_drop', {
+                  ...getBarsPerfPayload,
+                  duration_ms: Math.max(0, getSpotDatafeedPerfNow() - revalidateStartedAt),
+                  reason: 'retired datafeed scope',
+                });
+                return;
+              }
+
+              const refreshedCandidates = revisionCache.mergeMany(rawResult.revisionCandidates)
+                .slice(-requiredBars);
+              if (!isSWRScopeCurrent()) return;
+              const refreshedBars = refreshedCandidates.map((candidate) => ({ ...candidate.bar }));
+              const refreshedContinuity = getBarsContinuityStats(refreshedBars, interval);
+              if (
+                refreshedBars.length < requiredBars
+                || shouldRejectKlineContinuity({
+                  interval,
+                  source: rawResult.source,
+                  bars: refreshedBars,
+                  continuityStats: refreshedContinuity,
+                })
+              ) {
+                markSpotKlinePerf('kline_swr_revalidate_drop', {
+                  ...getBarsPerfPayload,
+                  duration_ms: Math.max(0, getSpotDatafeedPerfNow() - revalidateStartedAt),
+                  bars_count: refreshedBars.length,
+                  reason: 'incomplete or discontinuous refresh',
+                });
+                return;
+              }
+
+              writeCurrentKlineCache({
+                symbol: apiSymbol,
+                interval,
+                limit: requiredBars,
+                bars: refreshedBars,
+                revisionCandidates: refreshedCandidates,
+                provider: rawResult.provider,
+                source: rawResult.source,
+                historyTerminal: rawResult.history_terminal,
+                terminalReason: rawResult.terminal_reason,
+                earliestBoundary: rawResult.earliest_available_time,
+              });
+              markSpotKlinePerf('kline_swr_revalidate_success', {
+                ...getBarsPerfPayload,
+                duration_ms: Math.max(0, getSpotDatafeedPerfNow() - revalidateStartedAt),
+                bars_count: refreshedBars.length,
+                source: rawResult.source,
+                provider: rawResult.provider,
+              });
+            }).catch((err: unknown) => {
+              markSpotKlinePerf('kline_swr_revalidate_error', {
+                ...getBarsPerfPayload,
+                duration_ms: Math.max(0, getSpotDatafeedPerfNow() - revalidateStartedAt),
+                error: err instanceof Error ? err.message : String(err),
+              });
+              if (process.env.NODE_ENV !== 'production') {
+                console.debug('[SpotTradingViewDatafeed] SWR revalidate failed', {
+                  symbol: apiSymbol,
+                  interval,
+                  chartInterval,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            });
+            return;
+          }
+        }
+
         const cacheInsufficientForCountBack = Boolean(cached?.bars.length && cached.bars.length < requiredBars);
         const l1Reason = cacheInsufficientForCountBack ? 'insufficient_bars_for_countBack' : cacheLookup.reason;
         const l1Event = l1Reason === 'expired'
@@ -2047,6 +2490,10 @@ export function createSpotTradingViewDatafeed(
         periodParams,
         requestSeq,
         phase: requestKind,
+        inFlightDeadlineMs: options.inFlightDeadlineMs?.active,
+        onTerminalEvidence: (result) => {
+          recordTerminalBoundary(interval, result);
+        },
       });
 
       void request
@@ -2088,6 +2535,9 @@ export function createSpotTradingViewDatafeed(
               revisionCandidates,
               provider,
               source,
+              historyTerminal: result.history_terminal,
+              terminalReason: result.terminal_reason,
+              earliestBoundary: result.earliest_available_time,
             });
           }
 
@@ -2287,7 +2737,7 @@ export function createSpotTradingViewDatafeed(
             safeErrorCallback(getKlineErrorMessage(err) || 'Failed to load spot history');
             return;
           }
-          spotTradingViewDebug('getBars request soft empty after transient error', {
+          spotTradingViewDebug('getBars request error after transient failure', {
             requestSeq,
             phase: requestKind,
             symbol: apiSymbol,
@@ -2307,7 +2757,7 @@ export function createSpotTradingViewDatafeed(
             reason: getKlineErrorMessage(err) || 'Failed to load spot history',
           });
           emptyRangeGuard.rememberEmpty(emptyRangeState.key);
-          safeHistoryCallback([], { noData: false }, 'transient kline request failed');
+          safeErrorCallback(getKlineErrorMessage(err) || 'Failed to load spot history');
         });
     },
 
@@ -2537,8 +2987,12 @@ export function createSpotTradingViewDatafeed(
 
     destroy() {
       destroyed = true;
+      activeSWRRevalidateSequence += 1;
       requestGuard.destroy();
+      for (const timeoutHandle of getBarsHardTimeoutHandles) clearTimeout(timeoutHandle);
+      getBarsHardTimeoutHandles.clear();
       emptyRangeGuard.clear();
+      terminalBoundaryByScope.clear();
       for (const unsubscribe of Array.from(unsubscribeByUid.values())) {
         unsubscribe();
       }

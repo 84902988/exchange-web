@@ -86,6 +86,24 @@ def _open_times(rows: list[dict]) -> list[int]:
     return [int(row["open_time"]) for row in rows]
 
 
+def _install_history_boundary_cache(monkeypatch):
+    stored: dict[str, dict] = {}
+    writes: list[tuple[str, dict, int, int]] = []
+
+    monkeypatch.setattr(
+        market_kline_cache,
+        "cache_get_json",
+        lambda key: stored.get(key),
+    )
+
+    def cache_set_json(key, value, ttl_seconds, *, last_good_ttl_seconds):
+        stored[key] = dict(value)
+        writes.append((key, dict(value), ttl_seconds, last_good_ttl_seconds))
+
+    monkeypatch.setattr(market_kline_cache, "cache_set_json", cache_set_json)
+    return stored, writes
+
+
 class _DbOrig:
     def __init__(self, *args) -> None:
         self.args = args
@@ -811,6 +829,219 @@ def test_market_kline_cache_monthly_continuity_accepts_calendar_months_and_cross
         assert _open_times(rows) == cached_times
         assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_DB_CACHE
         assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HIT
+        assert rows.history_terminal is False
+
+
+def test_market_kline_cache_monthly_provider_boundary_requires_continuous_cached_history(monkeypatch) -> None:
+    stored, writes = _install_history_boundary_cache(monkeypatch)
+    db = _session()
+    now = datetime.utcnow()
+    cached_times = [
+        _ms(2018, 1, 1, 0),
+        _ms(2018, 2, 1, 0),
+        _ms(2018, 3, 1, 0),
+    ]
+    db.add_all(
+        [
+            _kline_row(index + 250, open_time, updated_at=now, interval="1Mutc")
+            for index, open_time in enumerate(cached_times)
+        ]
+    )
+    db.commit()
+
+    fetch_calls = 0
+
+    def fetch_external(_limit: int, _fetch_end_time_ms: int | None):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        raise market_kline_cache.KlineProviderHistoryBoundary(
+            "provider monthly history boundary",
+            provider_error_provider="OKX_SPOT",
+        )
+
+    rows = market_kline_cache.get_klines_cache_first(
+        db,
+        market_type="spot",
+        symbol="BTCUSDT",
+        interval="1Mutc",
+        limit=60,
+        source="EXTERNAL_SPOT",
+        fetch_external=fetch_external,
+        end_time_ms=cached_times[0],
+    )
+
+    assert rows == []
+    assert rows.origin == market_kline_cache.KLINE_CACHE_ORIGIN_EMPTY
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HISTORY_BOUNDARY
+    assert rows.history_incomplete is False
+    assert rows.history_terminal is True
+    assert rows.terminal_reason == market_kline_cache.KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY
+    assert rows.earliest_available_time == cached_times[0]
+    assert rows.provider_error_code is None
+    assert fetch_calls == 1
+    assert len(stored) == 1
+    assert len(writes) == 1
+    _, payload, ttl_seconds, last_good_ttl_seconds = writes[0]
+    assert payload == {
+        "symbol": "BTCUSDT",
+        "interval": "1Mutc",
+        "earliest_available_time": cached_times[0],
+        "terminal_reason": market_kline_cache.KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY,
+    }
+    assert ttl_seconds == 24 * 60 * 60
+    assert last_good_ttl_seconds == 24 * 60 * 60
+
+
+def test_market_kline_cache_monthly_known_boundary_short_circuits_provider(monkeypatch) -> None:
+    stored, _writes = _install_history_boundary_cache(monkeypatch)
+    earliest_available_time = _ms(2018, 1, 1, 0)
+    key = market_kline_cache._kline_history_boundary_cache_key(
+        market_type="spot",
+        symbol="BTCUSDT",
+        interval="1Mutc",
+    )
+    stored[key] = {
+        "symbol": "BTCUSDT",
+        "interval": "1Mutc",
+        "earliest_available_time": earliest_available_time,
+        "terminal_reason": market_kline_cache.KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY,
+    }
+    provider_calls = 0
+
+    def fetch_external(_limit: int, _fetch_end_time_ms: int | None):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("known boundary must not call provider")
+
+    rows = market_kline_cache.get_klines_cache_first(
+        _session(),
+        market_type="spot",
+        symbol="BTCUSDT",
+        interval="1Mutc",
+        limit=227,
+        source="EXTERNAL_SPOT",
+        fetch_external=fetch_external,
+        end_time_ms=_ms(1999, 2, 1, 0),
+    )
+
+    assert provider_calls == 0
+    assert rows == []
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HISTORY_BOUNDARY
+    assert rows.history_terminal is True
+    assert rows.history_incomplete is False
+    assert rows.terminal_reason == market_kline_cache.KLINE_TERMINAL_REASON_CACHE_HISTORY_BOUNDARY
+    assert rows.earliest_available_time == earliest_available_time
+
+
+def test_market_kline_cache_monthly_provider_cooldown_yields_to_concurrent_boundary(monkeypatch) -> None:
+    earliest_available_time = _ms(2018, 1, 1, 0)
+    boundary = {
+        "symbol": "BTCUSDT",
+        "interval": "1Mutc",
+        "earliest_available_time": earliest_available_time,
+        "terminal_reason": market_kline_cache.KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY,
+    }
+    boundary_reads = 0
+
+    def read_boundary(**_kwargs):
+        nonlocal boundary_reads
+        boundary_reads += 1
+        return None if boundary_reads == 1 else boundary
+
+    monkeypatch.setattr(market_kline_cache, "_read_kline_history_boundary_cache", read_boundary)
+    provider_calls = 0
+
+    def fetch_external(_limit: int, _fetch_end_time_ms: int | None):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise market_kline_cache.KlineProviderFetchError(
+            "provider cooldown",
+            provider_error_code=market_kline_cache.KLINE_PROVIDER_ERROR_COOLDOWN,
+            provider_error_provider="OKX_SPOT",
+        )
+
+    rows = market_kline_cache.get_klines_cache_first(
+        _session(),
+        market_type="spot",
+        symbol="BTCUSDT",
+        interval="1Mutc",
+        limit=227,
+        source="EXTERNAL_SPOT",
+        fetch_external=fetch_external,
+        end_time_ms=_ms(1999, 2, 1, 0),
+    )
+
+    assert provider_calls == 1
+    assert boundary_reads == 2
+    assert rows == []
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HISTORY_BOUNDARY
+    assert rows.history_terminal is True
+    assert rows.history_incomplete is False
+    assert rows.provider_error_code is None
+    assert rows.terminal_reason == market_kline_cache.KLINE_TERMINAL_REASON_CACHE_HISTORY_BOUNDARY
+    assert rows.earliest_available_time == earliest_available_time
+
+
+def test_market_kline_cache_monthly_provider_boundary_rejects_gapped_cache_evidence(monkeypatch) -> None:
+    _install_history_boundary_cache(monkeypatch)
+    db = _session()
+    now = datetime.utcnow()
+    cached_times = [_ms(2018, 1, 1, 0), _ms(2018, 3, 1, 0)]
+    db.add_all(
+        [
+            _kline_row(index + 275, open_time, updated_at=now, interval="1Mutc")
+            for index, open_time in enumerate(cached_times)
+        ]
+    )
+    db.commit()
+
+    rows = market_kline_cache.get_klines_cache_first(
+        db,
+        market_type="spot",
+        symbol="BTCUSDT",
+        interval="1Mutc",
+        limit=60,
+        source="EXTERNAL_SPOT",
+        fetch_external=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            market_kline_cache.KlineProviderHistoryBoundary(
+                "provider monthly history boundary",
+                provider_error_provider="OKX_SPOT",
+            )
+        ),
+        end_time_ms=cached_times[0],
+    )
+
+    assert rows == []
+    assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_PROVIDER_EMPTY
+    assert rows.history_incomplete is True
+    assert rows.history_terminal is False
+    assert rows.terminal_reason is None
+    assert rows.earliest_available_time is None
+
+
+def test_market_kline_cache_daily_and_weekly_empty_history_remain_non_terminal() -> None:
+    for interval in ("1Dutc", "1Wutc"):
+        db = _session()
+        rows = market_kline_cache.get_klines_cache_first(
+            db,
+            market_type="spot",
+            symbol="BTCUSDT",
+            interval=interval,
+            limit=60,
+            source="EXTERNAL_SPOT",
+            fetch_external=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                market_kline_cache.KlineProviderHistoryBoundary(
+                    "provider history boundary candidate",
+                    provider_error_provider="OKX_SPOT",
+                )
+            ),
+            end_time_ms=_ms(2018, 1, 1, 0),
+        )
+
+        assert rows == []
+        assert rows.cache_status == market_kline_cache.KLINE_CACHE_STATUS_PROVIDER_EMPTY
+        assert rows.history_incomplete is True
+        assert rows.history_terminal is False
 
 
 def test_market_kline_cache_monthly_gap_falls_back() -> None:

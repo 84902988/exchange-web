@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError, S
 from sqlalchemy.orm import Session
 
 from app.db.models.market_kline import MarketKline
+from app.services.market_cache import cache_get_json, cache_set_json, market_cache_key
 from app.services.market_cache_metrics import (
     record_error,
     record_kline_db_hit,
@@ -43,6 +44,11 @@ KLINE_CACHE_STATUS_COVERAGE_INVALID = "COVERAGE_INVALID"
 KLINE_CACHE_STATUS_STALE_OPEN = "STALE_OPEN"
 KLINE_CACHE_STATUS_PROVIDER_EMPTY = "PROVIDER_EMPTY"
 KLINE_CACHE_STATUS_RECONCILIATION_REJECTED = "RECONCILIATION_REJECTED"
+KLINE_CACHE_STATUS_HISTORY_BOUNDARY = "HISTORY_BOUNDARY"
+
+KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY = "PROVIDER_HISTORY_BOUNDARY"
+KLINE_TERMINAL_REASON_CACHE_HISTORY_BOUNDARY = "CACHE_HISTORY_BOUNDARY"
+KLINE_HISTORY_BOUNDARY_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 KLINE_CACHE_POLICY_STRICT_24X7 = "strict_24x7"
 KLINE_CACHE_POLICY_GAP_TOLERANT = "gap_tolerant"
@@ -78,6 +84,15 @@ class KlineProviderFetchError(RuntimeError):
         self.provider_error_provider = _sanitize_provider_error_provider(provider_error_provider)
 
 
+class KlineProviderHistoryBoundary(KlineProviderFetchError):
+    def __init__(self, message: str, *, provider_error_provider: Optional[str] = None) -> None:
+        super().__init__(
+            message,
+            provider_error_code=KLINE_PROVIDER_ERROR_EMPTY,
+            provider_error_provider=provider_error_provider,
+        )
+
+
 class KlineCacheResult(list):
     def __init__(
         self,
@@ -88,6 +103,9 @@ class KlineCacheResult(list):
         provider_error_code: Optional[str] = None,
         provider_error_provider: Optional[str] = None,
         history_incomplete: bool = False,
+        history_terminal: bool = False,
+        terminal_reason: Optional[str] = None,
+        earliest_available_time: Optional[int] = None,
     ) -> None:
         super().__init__(items)
         self.origin = origin
@@ -95,6 +113,12 @@ class KlineCacheResult(list):
         self.provider_error_code = _normalize_provider_error_code(provider_error_code) if provider_error_code else None
         self.provider_error_provider = _sanitize_provider_error_provider(provider_error_provider)
         self.history_incomplete = bool(history_incomplete)
+        self.history_terminal = bool(history_terminal)
+        self.terminal_reason = str(terminal_reason or "").strip() or None
+        try:
+            self.earliest_available_time = int(earliest_available_time or 0) or None
+        except (TypeError, ValueError):
+            self.earliest_available_time = None
 
     @property
     def items(self) -> list[dict[str, Any]]:
@@ -779,6 +803,182 @@ def _read_cached_klines(
     return items[-normalized_limit:]
 
 
+def _read_continuous_monthly_history_start_ms(
+    db: Session,
+    *,
+    market_type: str,
+    symbol: str,
+    interval: str,
+    open_time_validator: Optional[OpenTimeValidator] = None,
+) -> Optional[int]:
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_interval = normalize_kline_interval(interval)
+    if normalized_interval != "1Mutc":
+        return None
+
+    try:
+        rows = (
+            db.query(MarketKline)
+            .filter(
+                MarketKline.market_type == market_type,
+                MarketKline.symbol == normalized_symbol,
+                MarketKline.interval == normalized_interval,
+            )
+            .order_by(MarketKline.open_time.asc())
+            .limit(512)
+            .all()
+        )
+    except (ProgrammingError, OperationalError) as exc:
+        db.rollback()
+        if not _is_missing_table_error(exc):
+            logger.warning(
+                "market_klines history boundary read failed symbol=%s interval=%s error=%s",
+                normalized_symbol,
+                normalized_interval,
+                exc,
+            )
+        return None
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.warning(
+            "market_klines history boundary read failed symbol=%s interval=%s error=%s",
+            normalized_symbol,
+            normalized_interval,
+            exc,
+        )
+        return None
+
+    items = [
+        serialize_kline_item(row, normalized_interval)
+        for row in rows
+        if _item_matches_open_time_validator(row, open_time_validator)
+    ]
+    if len(items) < 2:
+        return None
+    if not _validate_cached_klines_continuity(items, normalized_interval):
+        return None
+    return _item_open_time_ms(items[0])
+
+
+def _kline_history_boundary_cache_key(*, market_type: str, symbol: str, interval: str) -> str:
+    return market_cache_key(
+        "market:kline:history_boundary",
+        version=1,
+        market_type=str(market_type or "").strip().upper(),
+        symbol=_normalize_symbol(symbol),
+        query_params={"interval": normalize_kline_interval(interval)},
+    )
+
+
+def _read_kline_history_boundary_cache(
+    *,
+    market_type: str,
+    symbol: str,
+    interval: str,
+) -> Optional[dict[str, Any]]:
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_interval = normalize_kline_interval(interval)
+    if normalized_interval != "1Mutc":
+        return None
+
+    cached = cache_get_json(
+        _kline_history_boundary_cache_key(
+            market_type=market_type,
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+        )
+    )
+    if not isinstance(cached, dict):
+        return None
+    if _normalize_symbol(cached.get("symbol")) != normalized_symbol:
+        return None
+    if normalize_kline_interval(cached.get("interval")) != normalized_interval:
+        return None
+    try:
+        earliest_available_time = int(cached.get("earliest_available_time") or 0)
+    except (TypeError, ValueError):
+        return None
+    terminal_reason = str(cached.get("terminal_reason") or "").strip()
+    if earliest_available_time <= 0 or not terminal_reason:
+        return None
+    return {
+        "symbol": normalized_symbol,
+        "interval": normalized_interval,
+        "earliest_available_time": earliest_available_time,
+        "terminal_reason": terminal_reason,
+    }
+
+
+def _write_kline_history_boundary_cache(
+    *,
+    market_type: str,
+    symbol: str,
+    interval: str,
+    earliest_available_time: int,
+    terminal_reason: str,
+) -> Optional[dict[str, Any]]:
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_interval = normalize_kline_interval(interval)
+    normalized_terminal_reason = str(terminal_reason or "").strip()
+    try:
+        normalized_earliest_available_time = int(earliest_available_time or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        normalized_interval != "1Mutc"
+        or normalized_earliest_available_time <= 0
+        or not normalized_terminal_reason
+    ):
+        return None
+
+    payload = {
+        "symbol": normalized_symbol,
+        "interval": normalized_interval,
+        "earliest_available_time": normalized_earliest_available_time,
+        "terminal_reason": normalized_terminal_reason,
+    }
+    cache_set_json(
+        _kline_history_boundary_cache_key(
+            market_type=market_type,
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+        ),
+        payload,
+        KLINE_HISTORY_BOUNDARY_CACHE_TTL_SECONDS,
+        last_good_ttl_seconds=KLINE_HISTORY_BOUNDARY_CACHE_TTL_SECONDS,
+    )
+    return payload
+
+
+def _cached_kline_history_boundary_result(
+    *,
+    market_type: str,
+    symbol: str,
+    interval: str,
+    end_time_ms: Optional[int],
+) -> Optional[KlineCacheResult]:
+    if end_time_ms is None:
+        return None
+    boundary = _read_kline_history_boundary_cache(
+        market_type=market_type,
+        symbol=symbol,
+        interval=interval,
+    )
+    if not boundary:
+        return None
+    earliest_available_time = int(boundary["earliest_available_time"])
+    if int(end_time_ms) > earliest_available_time:
+        return None
+    return KlineCacheResult(
+        [],
+        origin=KLINE_CACHE_ORIGIN_EMPTY,
+        cache_status=KLINE_CACHE_STATUS_HISTORY_BOUNDARY,
+        history_terminal=True,
+        terminal_reason=KLINE_TERMINAL_REASON_CACHE_HISTORY_BOUNDARY,
+        earliest_available_time=earliest_available_time,
+    )
+
+
 def _latest_cache_is_fresh(
     db: Session,
     *,
@@ -985,6 +1185,15 @@ def get_klines_cache_first(
     normalized_limit = normalize_kline_limit(limit)
     normalized_cache_policy = _normalize_kline_cache_policy(cache_policy)
 
+    cached_history_boundary = _cached_kline_history_boundary_result(
+        market_type=market_type,
+        symbol=normalized_symbol,
+        interval=normalized_interval,
+        end_time_ms=end_time_ms,
+    )
+    if cached_history_boundary is not None:
+        return cached_history_boundary
+
     cached = _read_cached_klines(
         db,
         market_type=market_type,
@@ -1163,7 +1372,48 @@ def get_klines_cache_first(
             ),
             end_time_ms,
         )
+    except KlineProviderHistoryBoundary as exc:
+        earliest_available_time = _read_continuous_monthly_history_start_ms(
+            db,
+            market_type=market_type,
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+            open_time_validator=open_time_validator,
+        )
+        if (
+            end_time_ms is not None
+            and earliest_available_time is not None
+            and int(end_time_ms) <= earliest_available_time
+        ):
+            _write_kline_history_boundary_cache(
+                market_type=market_type,
+                symbol=normalized_symbol,
+                interval=normalized_interval,
+                earliest_available_time=earliest_available_time,
+                terminal_reason=KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY,
+            )
+            return KlineCacheResult(
+                [],
+                origin=KLINE_CACHE_ORIGIN_EMPTY,
+                cache_status=KLINE_CACHE_STATUS_HISTORY_BOUNDARY,
+                history_terminal=True,
+                terminal_reason=KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY,
+                earliest_available_time=earliest_available_time,
+            )
+        return stale_cached(
+            cache_status_override=KLINE_CACHE_STATUS_PROVIDER_EMPTY,
+            provider_error_code=exc.provider_error_code,
+            provider_error_provider=exc.provider_error_provider,
+        )
     except Exception as exc:
+        cached_history_boundary = _cached_kline_history_boundary_result(
+            market_type=market_type,
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+            end_time_ms=end_time_ms,
+        )
+        if cached_history_boundary is not None:
+            return cached_history_boundary
         provider_error_code, provider_error_provider = _classify_provider_error(exc)
         record_error(
             provider=source,
