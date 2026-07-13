@@ -6,9 +6,12 @@ import { useQuery, useMutation } from '@tanstack/react-query';
 import { getKycStatus, applyKyc, uploadKycDocument, getKycResult } from '@/lib/api';
 import type { KycDocumentUploadRequest } from '@/lib/api';
 import UserSidebar from '@/components/user/UserSidebar';
+import { useAuth } from '@/lib/authContext';
+import { privateQueryKey } from '@/lib/authPrivateQueries';
 
 export default function KycPage() {
   const { t } = useLocaleContext();
+  const { userIdentityKey } = useAuth();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [selectedLevel] = useState(1);
   const [personalInfo, setPersonalInfo] = useState({
@@ -36,8 +39,9 @@ export default function KycPage() {
     isLoading: isLoadingKycStatus, 
     refetch: refetchKycStatus 
   } = useQuery({
-    queryKey: ['kycStatus'],
+    queryKey: privateQueryKey(userIdentityKey, 'kycStatus'),
     queryFn: getKycStatus,
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 60 * 5,
     throwOnError: false,
   });
@@ -65,9 +69,9 @@ export default function KycPage() {
   });
 
   useQuery({
-    queryKey: ['kycResult', applicationId],
+    queryKey: privateQueryKey(userIdentityKey, 'kycResult', applicationId),
     queryFn: () => getKycResult(applicationId),
-    enabled: !!applicationId,
+    enabled: userIdentityKey !== null && !!applicationId,
     staleTime: 1000 * 60 * 5,
     throwOnError: false,
   });

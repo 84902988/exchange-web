@@ -367,7 +367,7 @@ function ContractPageContent() {
   const initialContractSymbol = shouldUseInitialContractSymbol(initialUrlContractSymbol)
     ? initialUrlContractSymbol
     : DEFAULT_CONTRACT_SYMBOL;
-  const { isLoggedIn, loading: authLoading } = useAuth();
+  const { isLoggedIn, loading: authLoading, userIdentityKey } = useAuth();
   const isPageVisible = useContractPageVisibility();
   const [contractSymbol, setContractSymbol] = useState(() => initialContractSymbol);
   const [interval, setIntervalValue] = useState('1m');
@@ -588,6 +588,7 @@ function ContractPageContent() {
     dataScope: contractDataScope,
     activeTab: contractUserTab,
     isLoggedIn,
+    userIdentityKey,
     onErrorChange: setError,
   });
   const contractPairSymbols = useMemo(

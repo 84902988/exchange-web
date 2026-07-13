@@ -9,6 +9,8 @@ import { useLocaleContext } from "@/contexts/LocaleContext";
 import AssetsAPI, { type AccountBalanceItem, type CoinItem, type WithdrawOptionItem } from "@/lib/api/modules/assets";
 import type { WithdrawRecord } from "@/lib/api/modules/assets_withdraw";
 import { getUserInfo } from "@/lib/api/modules/user";
+import { useAuth } from "@/lib/authContext";
+import { privateQueryKey } from "@/lib/authPrivateQueries";
 
 import WithdrawForm from "./WithdrawForm";
 import WithdrawTips from "./WithdrawTips";
@@ -21,6 +23,7 @@ type WithdrawCoinOption = CoinItem & {
 
 function WithdrawPageContent() {
   const queryClient = useQueryClient();
+  const { userIdentityKey } = useAuth();
   const searchParams = useSearchParams();
   const requestedCoin = useMemo(() => {
     return (searchParams.get("coin") || searchParams.get("coin_symbol") || "")
@@ -72,15 +75,17 @@ function WithdrawPageContent() {
   });
 
   const balancesQuery = useQuery({
-    queryKey: ["assetAccountBalancesForWithdraw"],
+    queryKey: privateQueryKey(userIdentityKey, "assetAccountBalancesForWithdraw"),
     queryFn: () => AssetsAPI.getAccountBalances(),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 30,
     retry: 0,
   });
 
   const userInfoQuery = useQuery({
-    queryKey: ["meForWithdrawLock"],
+    queryKey: privateQueryKey(userIdentityKey, "meForWithdrawLock"),
     queryFn: getUserInfo,
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 30,
     retry: 0,
   });
@@ -185,10 +190,10 @@ function WithdrawPageContent() {
   };
 
   const refreshAfterWithdraw = useCallback(() => {
-    void queryClient.invalidateQueries({ queryKey: ["assetAccountBalancesForWithdraw"] });
-    void queryClient.invalidateQueries({ queryKey: ["withdraws"] });
-    void queryClient.invalidateQueries({ queryKey: ["userTransferRecords"] });
-  }, [queryClient]);
+    void queryClient.invalidateQueries({ queryKey: privateQueryKey(userIdentityKey, "assetAccountBalancesForWithdraw") });
+    void queryClient.invalidateQueries({ queryKey: privateQueryKey(userIdentityKey, "withdraws") });
+    void queryClient.invalidateQueries({ queryKey: privateQueryKey(userIdentityKey, "userTransferRecords") });
+  }, [queryClient, userIdentityKey]);
 
   const handleWithdrawRecordsChange = useCallback((records: WithdrawRecord[]) => {
     setLatestWithdrawRecords(records);

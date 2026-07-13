@@ -9,6 +9,8 @@ import CoinSelect from "@/components/asset/CoinSelect";
 import NetworkSelect from "@/components/asset/NetworkSelect";
 import { useLocaleContext } from "@/contexts/LocaleContext";
 import AssetsAPI, { DepositOptionItem, DepositRecord } from "@/lib/api/modules/assets";
+import { useAuth } from "@/lib/authContext";
+import { privateQueryKey } from "@/lib/authPrivateQueries";
 
 function buildQrUrl(text: string) {
   const qs = new URLSearchParams({ data: text, size: "220x220" }).toString();
@@ -118,6 +120,7 @@ function formatCoinLabel(coin: { symbol: string; name?: string }) {
 
 function DepositPageContent() {
   const { t } = useLocaleContext();
+  const { userIdentityKey } = useAuth();
   const searchParams = useSearchParams();
   const requestedCoin = useMemo(
     () => (searchParams.get("coin") || "").trim().toUpperCase(),
@@ -385,7 +388,7 @@ function DepositPageContent() {
 
   const depositsQuery = useQuery({
     queryKey: [
-      "assetDeposits",
+      ...privateQueryKey(userIdentityKey, "assetDeposits"),
       coinSymbol,
       networkCode,
       depStatus,
@@ -405,7 +408,7 @@ function DepositPageContent() {
         start_time,
         end_time,
       }),
-    enabled: !!coinSymbol && !!networkCode,
+    enabled: userIdentityKey !== null && !!coinSymbol && !!networkCode,
     staleTime: 3000,
     retry: 0,
   });

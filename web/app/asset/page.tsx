@@ -10,6 +10,8 @@ import AssetPagination from '@/components/asset/AssetPagination';
 import AssetSidebar from '@/components/asset/AssetSidebar';
 import AssetTransferModal from '@/components/asset/AssetTransferModal';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import { useAuth } from '@/lib/authContext';
+import { privateQueryKey } from '@/lib/authPrivateQueries';
 
 import AssetsAPI, {
   type AccountBalanceItem,
@@ -386,6 +388,7 @@ function statusClass(status: string) {
 export default function AssetPage() {
   const router = useRouter();
   const { locale, t } = useLocaleContext();
+  const { userIdentityKey } = useAuth();
   const currentLanguage: Language = locale;
 
   const [searchKeyword, setSearchKeyword] = useState('');
@@ -407,8 +410,9 @@ export default function AssetPage() {
   const [assetRefreshTime, setAssetRefreshTime] = useState('');
 
   const accountBalancesQuery = useQuery({
-    queryKey: ['assetAccountBalances'],
+    queryKey: privateQueryKey(userIdentityKey, 'assetAccountBalances'),
     queryFn: () => AssetsAPI.getAccountBalances(),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 30,
     retry: 0,
   });
@@ -422,15 +426,17 @@ export default function AssetPage() {
   });
 
   const contractAccountQuery = useQuery({
-    queryKey: ['assetContractAccountSummary'],
+    queryKey: privateQueryKey(userIdentityKey, 'assetContractAccountSummary'),
     queryFn: () => getContractAccountSummary(),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 15,
     retry: 0,
   });
 
   const transferRecordsQuery = useQuery({
-    queryKey: ['assetTransferRecords', transferRecordsPage],
+    queryKey: privateQueryKey(userIdentityKey, 'assetTransferRecords', transferRecordsPage),
     queryFn: () => TransferAPI.getTransferRecords({ page: transferRecordsPage, page_size: TRANSFER_RECORD_PAGE_SIZE }),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 15,
     retry: 0,
   });
