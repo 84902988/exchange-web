@@ -7,6 +7,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import AssetSidebar from '@/components/asset/AssetSidebar';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import { useAuth } from '@/lib/authContext';
+import { privateQueryKey } from '@/lib/authPrivateQueries';
 import {
   cancelSpotOrder,
   getSpotCurrentOrders,
@@ -210,7 +211,7 @@ function paginate<T>(items: T[], page: number): T[] {
 
 export default function AssetSpotOrdersPage() {
   const { t } = useLocaleContext();
-  const { user } = useAuth();
+  const { user, userIdentityKey } = useAuth();
   const queryClient = useQueryClient();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [symbol, setSymbol] = useState('BTCUSDT');
@@ -221,22 +222,25 @@ export default function AssetSpotOrdersPage() {
   const [typeFilter, setTypeFilter] = useState('ALL');
 
   const currentOrdersQuery = useQuery({
-    queryKey: ['assetSpotCurrentOrders', symbol],
+    queryKey: privateQueryKey(userIdentityKey, 'assetSpotCurrentOrders', symbol),
     queryFn: () => loadCurrentOrders(symbol),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 10,
     retry: 0,
   });
 
   const historyOrdersQuery = useQuery({
-    queryKey: ['assetSpotHistoryOrders', symbol],
+    queryKey: privateQueryKey(userIdentityKey, 'assetSpotHistoryOrders', symbol),
     queryFn: () => loadHistoryOrders(symbol),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 15,
     retry: 0,
   });
 
   const tradesQuery = useQuery({
-    queryKey: ['assetSpotTrades', symbol],
+    queryKey: privateQueryKey(userIdentityKey, 'assetSpotTrades', symbol),
     queryFn: () => loadTrades(symbol),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 15,
     retry: 0,
   });
@@ -245,8 +249,8 @@ export default function AssetSpotOrdersPage() {
     mutationFn: (orderId: number) => cancelSpotOrder(orderId),
     onSuccess: async () => {
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['assetSpotCurrentOrders'] }),
-        queryClient.invalidateQueries({ queryKey: ['assetSpotHistoryOrders'] }),
+        queryClient.invalidateQueries({ queryKey: privateQueryKey(userIdentityKey, 'assetSpotCurrentOrders') }),
+        queryClient.invalidateQueries({ queryKey: privateQueryKey(userIdentityKey, 'assetSpotHistoryOrders') }),
       ]);
     },
   });

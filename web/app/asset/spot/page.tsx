@@ -7,6 +7,8 @@ import { useQuery } from '@tanstack/react-query';
 import AssetSidebar from '@/components/asset/AssetSidebar';
 import AssetTransferModal from '@/components/asset/AssetTransferModal';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import { useAuth } from '@/lib/authContext';
+import { privateQueryKey } from '@/lib/authPrivateQueries';
 import AssetsAPI, { type AccountBalanceItem } from '@/lib/api/modules/assets';
 
 type SpotRow = {
@@ -79,13 +81,15 @@ function tradeHref(symbol: string) {
 
 export default function AssetSpotPage() {
   const { t } = useLocaleContext();
+  const { userIdentityKey } = useAuth();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [transferCoin, setTransferCoin] = useState('USDT');
   const [transferOpen, setTransferOpen] = useState(false);
 
   const balancesQuery = useQuery({
-    queryKey: ['assetSpotBalances'],
+    queryKey: privateQueryKey(userIdentityKey, 'assetSpotBalances'),
     queryFn: () => AssetsAPI.getAccountBalances(),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 30,
     retry: 0,
   });

@@ -14,12 +14,12 @@ import {
   getMe,
   login as apiLogin,
   logout as apiLogout,
-  refreshToken as apiRefreshToken,
   type MeOut,
 } from '@/lib/api';
 import { useQueryClient } from '@tanstack/react-query';
 import { AUTH_EXPIRED_EVENT } from '@/lib/api/core/request';
 import { clearPrivateAccountQueries } from '@/lib/authPrivateQueries';
+import { getUserIdentityKey, hasAuthIdentityChanged } from '@/lib/authIdentity';
 
 interface AuthState {
   user: MeOut | null;
@@ -30,6 +30,7 @@ interface AuthState {
 }
 
 interface AuthContextType extends AuthState {
+  userIdentityKey: string | null;
   login: (
     account: string,
     password: string,
@@ -101,26 +102,36 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const queryClient = useQueryClient();
   const [authState, setAuthState] = useState<AuthState>(initialAuthState);
   const checkingRef = useRef<Promise<void> | null>(null);
-  const refreshingRef = useRef<Promise<void> | null>(null);
+  const identityRef = useRef<string | null>(null);
 
-  const doRefresh = useCallback(async () => {
-    if (refreshingRef.current) return refreshingRef.current;
-
-    refreshingRef.current = (async () => {
-      await apiRefreshToken();
-    })();
-
-    try {
-      return await refreshingRef.current;
-    } finally {
-      refreshingRef.current = null;
+  const finishAuthenticated = useCallback((user: MeOut) => {
+    const nextIdentity = getUserIdentityKey(user);
+    if (!nextIdentity) {
+      throw new Error('Authenticated user is missing a stable identity');
     }
-  }, []);
+    if (hasAuthIdentityChanged(identityRef.current, nextIdentity)) {
+      clearPrivateAccountQueries(queryClient);
+      identityRef.current = nextIdentity;
+    }
+    cacheUser(user);
+    setAuthState({
+      user,
+      isLoggedIn: true,
+      authChecked: true,
+      loading: false,
+      error: null,
+    });
+  }, [queryClient]);
 
   const finishLoggedOut = useCallback((error: string | null = null) => {
     clearLocalAuth();
     cacheUser(null);
-    clearPrivateAccountQueries(queryClient);
+    if (identityRef.current !== null) {
+      clearPrivateAccountQueries(queryClient);
+      identityRef.current = null;
+    } else {
+      clearPrivateAccountQueries(queryClient);
+    }
     setAuthState({
       user: null,
       isLoggedIn: false,
@@ -150,14 +161,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
         try {
           const user = await getMe();
-          cacheUser(user);
-          setAuthState({
-            user,
-            isLoggedIn: true,
-            authChecked: true,
-            loading: false,
-            error: null,
-          });
+          finishAuthenticated(user);
           return;
         } catch (error) {
           if (isDisabledAccountError(error)) {
@@ -177,20 +181,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           }
         }
 
-        try {
-          await doRefresh();
-          const user = await getMe();
-          cacheUser(user);
-          setAuthState({
-            user,
-            isLoggedIn: true,
-            authChecked: true,
-            loading: false,
-            error: null,
-          });
-        } catch {
-          finishLoggedOut();
-        }
+        // request.ts owns the single refresh attempt and returns only the final
+        // /me result. A final unauthorized response is therefore anonymous.
+        finishLoggedOut();
       })();
 
       try {
@@ -199,7 +192,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         checkingRef.current = null;
       }
     },
-    [doRefresh, finishLoggedOut]
+    [finishAuthenticated, finishLoggedOut]
   );
 
   useEffect(() => {
@@ -234,14 +227,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
     try {
       const user = await getMe();
-      cacheUser(user);
-      setAuthState({
-        user,
-        isLoggedIn: true,
-        authChecked: true,
-        loading: false,
-        error: null,
-      });
+      finishAuthenticated(user);
     } catch (error) {
       console.warn('[Auth] login succeeded but session check failed', error);
       const message = isUnauthorizedError(error)
@@ -252,7 +238,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       finishLoggedOut(message);
       throw new Error(message);
     }
-  }, [finishLoggedOut]);
+  }, [finishAuthenticated, finishLoggedOut]);
 
   const logout = useCallback(async () => {
     setAuthState((prev) => ({ ...prev, loading: true, error: null }));
@@ -300,6 +286,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     <AuthContext.Provider
       value={{
         ...authState,
+        userIdentityKey: getUserIdentityKey(authState.user),
         login,
         logout,
         refreshUser,

@@ -1,7 +1,7 @@
 'use client';
 
-import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl';
-import { getAccessToken } from '@/lib/api/core/token';
+import { getRuntimeApiBaseUrl } from '../api/core/baseUrl';
+import { getAccessToken } from '../api/core/token';
 
 export type ContractUserRealtimeEventType = 'snapshot' | 'account' | 'positions' | 'orders' | 'trades';
 export type ContractUserRealtimeStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
@@ -31,11 +31,16 @@ export type ContractUserRealtimeStatusHandler = (status: ContractUserRealtimeSta
 
 type ContractUserSession = {
   isLoggedIn: boolean;
+  identityKey: string | null;
   symbol: string;
 };
 
 function normalizeSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase();
+}
+
+function normalizeIdentity(identity: string | null) {
+  return String(identity || '').trim();
 }
 
 function getPayload(message: ContractUserRealtimeMessage) {
@@ -93,12 +98,14 @@ function getConfiguredWsUrl(symbol: string) {
   }
 }
 
-class ContractUserRealtimeClient {
+export class ContractUserRealtimeClient {
   private ws: WebSocket | null = null;
   private connectTimer: number | null = null;
   private reconnectTimer: number | null = null;
   private socketOpenedWithSymbol = '';
+  private socketOpenedWithIdentity = '';
   private requestedSymbol = '';
+  private currentIdentity = '';
   private closedByClient = false;
   private loggedIn = false;
   private handlers = new Map<ContractUserRealtimeEventType, Set<ContractUserRealtimeHandler>>();
@@ -107,13 +114,19 @@ class ContractUserRealtimeClient {
 
   setSession(session: ContractUserSession) {
     const nextSymbol = normalizeSymbol(session.symbol);
+    const nextIdentity = normalizeIdentity(session.identityKey);
+    const identityChanged = this.currentIdentity !== nextIdentity;
+    if (identityChanged) {
+      this.disconnect();
+    }
     this.loggedIn = session.isLoggedIn;
 
-    if (!session.isLoggedIn || !nextSymbol) {
+    if (!session.isLoggedIn || !nextIdentity || !nextSymbol) {
       this.disconnect();
       return;
     }
 
+    this.currentIdentity = nextIdentity;
     const previousSymbol = this.requestedSymbol;
     this.requestedSymbol = nextSymbol;
     this.closedByClient = false;
@@ -171,7 +184,9 @@ class ContractUserRealtimeClient {
     this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = '';
+    this.socketOpenedWithIdentity = '';
     this.requestedSymbol = '';
+    this.currentIdentity = '';
     this.setStatus('idle');
 
     if (!this.ws) return;
@@ -189,15 +204,23 @@ class ContractUserRealtimeClient {
     if (typeof window === 'undefined') return;
 
     this.clearConnectTimer();
+    const scheduledIdentity = this.currentIdentity;
     this.connectTimer = window.setTimeout(() => {
       this.connectTimer = null;
-      if (this.closedByClient || !this.loggedIn || !this.requestedSymbol) return;
-      this.connect(this.requestedSymbol || symbol);
+      if (
+        this.closedByClient ||
+        !this.loggedIn ||
+        !this.requestedSymbol ||
+        !scheduledIdentity ||
+        this.currentIdentity !== scheduledIdentity
+      ) return;
+      this.connect(this.requestedSymbol || symbol, scheduledIdentity);
     }, 100);
   }
 
-  private connect(symbol: string) {
+  private connect(symbol: string, identity: string) {
     if (typeof window === 'undefined') return;
+    if (!identity || identity !== this.currentIdentity) return;
 
     const wsUrl = getConfiguredWsUrl(symbol);
     if (!wsUrl) return;
@@ -205,12 +228,17 @@ class ContractUserRealtimeClient {
     this.clearConnectTimer();
     this.clearReconnectTimer();
     this.socketOpenedWithSymbol = symbol;
+    this.socketOpenedWithIdentity = identity;
     this.setStatus(this.status === 'disconnected' || this.status === 'reconnecting' ? 'reconnecting' : 'connecting');
 
     const ws = new WebSocket(wsUrl);
     this.ws = ws;
 
     ws.onopen = () => {
+      if (identity !== this.currentIdentity) {
+        ws.close(1000, 'stale identity');
+        return;
+      }
       this.setStatus('connected');
       const latestSymbol = this.requestedSymbol;
       if (latestSymbol && latestSymbol !== this.socketOpenedWithSymbol) {
@@ -219,6 +247,7 @@ class ContractUserRealtimeClient {
     };
 
     ws.onmessage = (event) => {
+      if (identity !== this.currentIdentity || identity !== this.socketOpenedWithIdentity) return;
       if (event.data === 'pong' || event.data === 'ping') return;
 
       try {
@@ -246,7 +275,7 @@ class ContractUserRealtimeClient {
       this.clearReconnectTimer();
       this.setStatus('reconnecting');
       this.reconnectTimer = window.setTimeout(() => {
-        this.connect(this.requestedSymbol);
+        this.connect(this.requestedSymbol, this.currentIdentity);
       }, 1500);
     };
   }

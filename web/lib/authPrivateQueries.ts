@@ -1,5 +1,15 @@
 import type { Query, QueryClient } from '@tanstack/react-query';
 
+export type PrivateQueryIdentity = string | null;
+
+export function privateQueryKey(
+  identity: PrivateQueryIdentity,
+  domain: string,
+  ...params: readonly unknown[]
+) {
+  return ['private', identity, domain, ...params] as const;
+}
+
 const PRIVATE_QUERY_ROOTS = new Set([
   'assetAccountBalances',
   'assetAccountBalancesForWithdraw',
@@ -25,14 +35,15 @@ type PrivateQueryCacheClient = Pick<QueryClient, 'cancelQueries' | 'removeQuerie
 
 export function isPrivateAccountQuery(query: Pick<Query, 'queryKey'>) {
   const root = query.queryKey[0];
-  return typeof root === 'string' && PRIVATE_QUERY_ROOTS.has(root);
+  return root === 'private' || (typeof root === 'string' && PRIVATE_QUERY_ROOTS.has(root));
 }
 
 export function clearPrivateAccountQueries(queryClient: PrivateQueryCacheClient) {
   const filters = { predicate: isPrivateAccountQuery };
 
-  // Remove synchronously so anonymous UI cannot reuse stale account data, then
-  // remove once more after cancellation to close the in-flight request race.
+  // Begin cancellation first, remove synchronously so the next render cannot
+  // reuse stale data, then remove once more to close the in-flight race.
+  const cancellation = queryClient.cancelQueries(filters);
   queryClient.removeQueries(filters);
-  void queryClient.cancelQueries(filters).finally(() => queryClient.removeQueries(filters));
+  void cancellation.finally(() => queryClient.removeQueries(filters));
 }

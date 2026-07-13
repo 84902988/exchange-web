@@ -6,6 +6,8 @@ import { useQuery } from '@tanstack/react-query';
 
 import AssetSidebar from '@/components/asset/AssetSidebar';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import { useAuth } from '@/lib/authContext';
+import { privateQueryKey } from '@/lib/authPrivateQueries';
 import {
   getContractOrders,
   getContractTrades,
@@ -150,6 +152,7 @@ function paginateItems<T>(items: T[], page: number) {
 
 export default function AssetContractOrdersPage() {
   const { t } = useLocaleContext();
+  const { userIdentityKey } = useAuth();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [tab, setTab] = useState<'orders' | 'trades'>('orders');
   const [symbolFilter, setSymbolFilter] = useState('ALL');
@@ -160,15 +163,17 @@ export default function AssetContractOrdersPage() {
   const [tradesPage, setTradesPage] = useState(1);
 
   const ordersQuery = useQuery({
-    queryKey: ['assetContractOrders'],
+    queryKey: privateQueryKey(userIdentityKey, 'assetContractOrders'),
     queryFn: () => getContractOrders({ page: 1, page_size: 100 }),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 15,
     retry: 0,
   });
 
   const tradesQuery = useQuery({
-    queryKey: ['assetContractTrades'],
+    queryKey: privateQueryKey(userIdentityKey, 'assetContractTrades'),
     queryFn: () => getContractTrades({ page: 1, page_size: 100 }),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 15,
     retry: 0,
   });

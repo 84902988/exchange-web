@@ -7,6 +7,8 @@ import { useQuery } from '@tanstack/react-query';
 import AssetSidebar from '@/components/asset/AssetSidebar';
 import AssetTransferModal from '@/components/asset/AssetTransferModal';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import { useAuth } from '@/lib/authContext';
+import { privateQueryKey } from '@/lib/authPrivateQueries';
 import {
   getContractAccountSummary,
   getContractPositions,
@@ -65,19 +67,22 @@ function sideClass(side: string) {
 
 export default function AssetContractPage() {
   const { t } = useLocaleContext();
+  const { userIdentityKey } = useAuth();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [transferOpen, setTransferOpen] = useState(false);
 
   const contractAccountQuery = useQuery({
-    queryKey: ['assetContractDetail'],
+    queryKey: privateQueryKey(userIdentityKey, 'assetContractDetail'),
     queryFn: () => getContractAccountSummary(),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 15,
     retry: 0,
   });
 
   const positionsQuery = useQuery({
-    queryKey: ['assetContractPositions'],
+    queryKey: privateQueryKey(userIdentityKey, 'assetContractPositions'),
     queryFn: () => getContractPositions({ status: 'OPEN' }),
+    enabled: userIdentityKey !== null,
     staleTime: 1000 * 10,
     retry: 0,
   });

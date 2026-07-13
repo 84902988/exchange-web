@@ -8,6 +8,8 @@ import { ApiError } from "@/lib/api";
 import { useLocaleContext } from "@/contexts/LocaleContext";
 import WithdrawAPI, { type WithdrawRecord } from "@/lib/api/modules/assets_withdraw";
 import UserTransferAPI, { type UserTransferRecord } from "@/lib/api/modules/user_transfer";
+import { useAuth } from "@/lib/authContext";
+import { privateQueryKey } from "@/lib/authPrivateQueries";
 
 import type { Language } from "@/utils/language";
 
@@ -343,6 +345,7 @@ export default function WithdrawRecords({
   onWithdrawRecordsChange,
 }: Props) {
   const { t } = useLocaleContext();
+  const { userIdentityKey } = useAuth();
   const withdrawSendIncompleteMessage = t("assetWithdrawRecordsWithdrawFundsAreFrozenButOnChainSubmissionIsNot", "asset");
   const withdrawSendSubmitFailedMessage = t("assetWithdrawRecordsChainSendingTaskSubmissionFailedPleaseContinueFromWithdrawRecords", "asset");
   const [page, setPage] = useState(1);
@@ -371,7 +374,8 @@ export default function WithdrawRecords({
   };
 
   const withdrawsQuery = useQuery<WithdrawListResp, Error>({
-    queryKey: ["withdraws", page, pageSize],
+    queryKey: privateQueryKey(userIdentityKey, "withdraws", page, pageSize),
+    enabled: userIdentityKey !== null,
     queryFn: async () => {
       const resp = await AssetsAPI.getWithdraws({
         page,
@@ -385,7 +389,8 @@ export default function WithdrawRecords({
   });
 
   const userTransfersQuery = useQuery({
-    queryKey: ["userTransferRecords", page, pageSize, coinSymbol],
+    queryKey: privateQueryKey(userIdentityKey, "userTransferRecords", page, pageSize, coinSymbol),
+    enabled: userIdentityKey !== null,
     queryFn: async () => {
       return UserTransferAPI.getRecords({
         direction: "all",
@@ -621,8 +626,16 @@ export default function WithdrawRecords({
 
   useEffect(() => {
     if (!isEmptyNonFirstPage) return;
-    clearActionNotice();
-    setPage((p) => Math.max(1, p - 1));
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setVerifyMessage("");
+      setVerifyError("");
+      setPage((p) => Math.max(1, p - 1));
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [isEmptyNonFirstPage]);
 
   const onPrev = () => {
