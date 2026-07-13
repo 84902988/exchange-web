@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     # =====================
     APP_NAME: str = "exchange-api"
 
+    # KYC identity material must never live under the public static root.
+    # Production may override this with an absolute private-storage path.
+    KYC_STORAGE_DIR: str = str(BASE_DIR / "private" / "kyc")
+
     # =====================
     # Database
     # =====================

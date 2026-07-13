@@ -82,6 +82,8 @@ backups/
 tmp.py
 tmp2.py
 backend/tmp/
+backend/private/kyc/
+backend/static/uploads/kyc/
 output/
 *-diff.txt
 next

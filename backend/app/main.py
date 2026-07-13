@@ -13,7 +13,6 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # =========================
@@ -28,6 +27,7 @@ load_dotenv(dotenv_path=ENV_PATH, override=False)
 # =========================
 from app.core.config import settings  # noqa: E402
 from app.middleware.geo_restriction import GeoRestrictionMiddleware  # noqa: E402
+from app.services.public_static_files import KycIsolatedStaticFiles  # noqa: E402
 
 # Routers
 from app.routers.health import router as health_router  # noqa: E402
@@ -135,7 +135,7 @@ app = FastAPI(
 )
 app.mount(
     "/static",
-    StaticFiles(directory=str(BACKEND_DIR / "static"), check_dir=False),
+    KycIsolatedStaticFiles(directory=str(BACKEND_DIR / "static"), check_dir=False),
     name="static",
 )
 app.add_middleware(GeoRestrictionMiddleware)
