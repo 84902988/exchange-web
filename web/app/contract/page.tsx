@@ -18,6 +18,7 @@ import {
   type ContractKlineAssetClass,
 } from '@/components/contract/tradingview/contractKlineCachePolicy';
 import { useContractMarketView } from '@/components/contract/hooks/useContractMarketView';
+import { useContractPageVisibility } from '@/components/contract/hooks/useContractMarketViewPolling';
 import { useContractUserState } from '@/components/contract/hooks/useContractUserState';
 import GlobalMarketSelector, {
   type GlobalMarketSelectorPair,
@@ -367,6 +368,7 @@ function ContractPageContent() {
     ? initialUrlContractSymbol
     : DEFAULT_CONTRACT_SYMBOL;
   const { isLoggedIn, loading: authLoading } = useAuth();
+  const isPageVisible = useContractPageVisibility();
   const [contractSymbol, setContractSymbol] = useState(() => initialContractSymbol);
   const [interval, setIntervalValue] = useState('1m');
   const [chartMode, setChartMode] = useState<ContractChartMode>('candle');
@@ -676,6 +678,7 @@ function ContractPageContent() {
   }, [contractChartIntervalOptions, interval]);
 
   useEffect(() => {
+    if (!isPageVisible) return undefined;
     let alive = true;
 
     async function refreshTicker() {
@@ -698,7 +701,7 @@ function ContractPageContent() {
       alive = false;
       window.clearInterval(timer);
     };
-  }, [contractSymbol]);
+  }, [contractSymbol, isPageVisible]);
 
   useEffect(() => {
     if (!contractPairsLoaded) return;

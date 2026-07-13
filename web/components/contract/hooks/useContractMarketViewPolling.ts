@@ -1,0 +1,92 @@
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import type { ContractMarketRealtimeStatus } from '@/lib/realtime/contractMarketRealtime';
+
+export const CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS = 2_000;
+export const CONTRACT_MARKET_VIEW_RECONCILE_POLL_MS = 30_000;
+
+function readDocumentVisibility() {
+  return typeof document === 'undefined' || document.visibilityState !== 'hidden';
+}
+
+export function useContractPageVisibility() {
+  const [isPageVisible, setIsPageVisible] = useState(readDocumentVisibility);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      setIsPageVisible(readDocumentVisibility());
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, []);
+
+  return isPageVisible;
+}
+
+export function getContractMarketViewPollInterval(
+  realtimeStatus: ContractMarketRealtimeStatus,
+  isPageVisible: boolean,
+) {
+  if (!isPageVisible) return null;
+  return realtimeStatus === 'connected'
+    ? CONTRACT_MARKET_VIEW_RECONCILE_POLL_MS
+    : CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS;
+}
+
+export function useContractMarketViewPolling({
+  symbol,
+  realtimeStatus,
+  refresh,
+}: {
+  symbol: string;
+  realtimeStatus: ContractMarketRealtimeStatus;
+  refresh: () => void | Promise<void>;
+}) {
+  const isPageVisible = useContractPageVisibility();
+  const refreshRef = useRef(refresh);
+  const previousRealtimeStatusRef = useRef(realtimeStatus);
+  const previousVisibilityRef = useRef(isPageVisible);
+
+  useEffect(() => {
+    refreshRef.current = refresh;
+  }, [refresh]);
+
+  useEffect(() => {
+    void refreshRef.current();
+  }, [symbol]);
+
+  useEffect(() => {
+    const previousStatus = previousRealtimeStatusRef.current;
+    previousRealtimeStatusRef.current = realtimeStatus;
+    if (
+      isPageVisible
+      && realtimeStatus === 'connected'
+      && previousStatus !== 'connected'
+    ) {
+      void refreshRef.current();
+    }
+  }, [isPageVisible, realtimeStatus]);
+
+  useEffect(() => {
+    const wasPageVisible = previousVisibilityRef.current;
+    previousVisibilityRef.current = isPageVisible;
+    if (isPageVisible && !wasPageVisible) {
+      void refreshRef.current();
+    }
+  }, [isPageVisible]);
+
+  useEffect(() => {
+    const intervalMs = getContractMarketViewPollInterval(realtimeStatus, isPageVisible);
+    if (intervalMs === null) return undefined;
+
+    const timer = window.setInterval(() => {
+      void refreshRef.current();
+    }, intervalMs);
+
+    return () => window.clearInterval(timer);
+  }, [isPageVisible, realtimeStatus, symbol]);
+
+  return isPageVisible;
+}

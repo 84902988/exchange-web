@@ -31,6 +31,7 @@ import {
   useContractMarketState,
   type PriceDirection,
 } from './useContractMarketState';
+import { useContractMarketViewPolling } from './useContractMarketViewPolling';
 
 export type ContractCurrentPriceSource = 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK';
 
@@ -473,6 +474,7 @@ export function useContractMarketView({
   const [marketSessionRefreshKey, setMarketSessionRefreshKey] = useState(0);
   const requestSeqRef = useRef(0);
   const inFlightSymbolRef = useRef<string | null>(null);
+  const marketViewAbortControllerRef = useRef<AbortController | null>(null);
   const depthRequestSeqRef = useRef(0);
   const depthInFlightSymbolRef = useRef<string | null>(null);
   const tradesRequestSeqRef = useRef(0);
@@ -508,9 +510,11 @@ export function useContractMarketView({
     const requestSeq = requestSeqRef.current + 1;
     requestSeqRef.current = requestSeq;
     inFlightSymbolRef.current = requestSymbol;
+    const abortController = new AbortController();
+    marketViewAbortControllerRef.current = abortController;
 
     try {
-      const view = await getContractMarketView(requestSymbol);
+      const view = await getContractMarketView(requestSymbol, { signal: abortController.signal });
       if (
         !mountedRef.current
         || requestSeqRef.current !== requestSeq
@@ -522,6 +526,7 @@ export function useContractMarketView({
       marketViewErrorSymbolRef.current = null;
       setMarketViewError(null);
     } catch (error) {
+      if (abortController.signal.aborted) return;
       if (!mountedRef.current || requestSeqRef.current !== requestSeq) return;
       setRestMarketView(null);
       marketViewErrorSymbolRef.current = requestSymbol;
@@ -529,6 +534,9 @@ export function useContractMarketView({
     } finally {
       if (inFlightSymbolRef.current === requestSymbol) {
         inFlightSymbolRef.current = null;
+      }
+      if (marketViewAbortControllerRef.current === abortController) {
+        marketViewAbortControllerRef.current = null;
       }
       if (mountedRef.current && requestSeqRef.current === requestSeq) {
         setMarketViewLoading(false);
@@ -541,10 +549,14 @@ export function useContractMarketView({
     return () => {
       mountedRef.current = false;
       requestSeqRef.current += 1;
+      marketViewAbortControllerRef.current?.abort();
+      marketViewAbortControllerRef.current = null;
     };
   }, []);
 
   useEffect(() => {
+    marketViewAbortControllerRef.current?.abort();
+    marketViewAbortControllerRef.current = null;
     requestSeqRef.current += 1;
     inFlightSymbolRef.current = null;
     depthRequestSeqRef.current += 1;
@@ -590,16 +602,18 @@ export function useContractMarketView({
     });
     setPriceDirection('flat');
 
-    void refreshMarketView();
-    const timer = window.setInterval(() => {
-      void refreshMarketView();
-    }, 2000);
-
     return () => {
+      marketViewAbortControllerRef.current?.abort();
+      marketViewAbortControllerRef.current = null;
       requestSeqRef.current += 1;
-      window.clearInterval(timer);
     };
   }, [contractSymbol, refreshMarketView]);
+
+  useContractMarketViewPolling({
+    symbol: contractSymbol,
+    realtimeStatus: quoteMarketRealtimeStatus,
+    refresh: refreshMarketView,
+  });
 
   useEffect(() => {
     const handleMarketStateMessage = (message: ContractMarketRealtimeMessage) => {

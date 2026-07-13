@@ -616,8 +616,11 @@ export function getContractQuote(symbol: string): Promise<ContractQuote> {
   return request<ContractQuote>(withQuery('/contract/market/quote', { symbol }))
 }
 
-export function getContractMarketView(symbol: string): Promise<ContractMarketViewDetail> {
-  return request<ContractMarketViewDetail>(withQuery('/contract/market/view', { symbol }))
+export function getContractMarketView(
+  symbol: string,
+  options: Pick<RequestInit, 'signal'> = {},
+): Promise<ContractMarketViewDetail> {
+  return request<ContractMarketViewDetail>(withQuery('/contract/market/view', { symbol }), options)
 }
 
 export function getContractSymbols(params: {
