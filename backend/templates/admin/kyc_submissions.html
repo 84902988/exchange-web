@@ -496,34 +496,34 @@
                   <td>
                     <div class="kyc-actions">
                       <div class="kyc-image-links">
-                        {% if item.front_image_url %}
+                        {% if item.front_image_read_url %}
                           <button
                             type="button"
                             class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
                             data-kyc-image-preview
-                            data-image-url="{{ item.front_image_url }}"
+                            data-image-url="{{ item.front_image_read_url }}"
                             data-image-label="正面"
                           >正面</button>
                         {% else %}
                           <span class="admin-badge admin-badge-secondary kyc-upload-missing">未上传</span>
                         {% endif %}
-                        {% if item.back_image_url %}
+                        {% if item.back_image_read_url %}
                           <button
                             type="button"
                             class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
                             data-kyc-image-preview
-                            data-image-url="{{ item.back_image_url }}"
+                            data-image-url="{{ item.back_image_read_url }}"
                             data-image-label="反面"
                           >反面</button>
                         {% else %}
                           <span class="admin-badge admin-badge-secondary kyc-upload-missing">未上传</span>
                         {% endif %}
-                        {% if item.selfie_image_url %}
+                        {% if item.selfie_image_read_url %}
                           <button
                             type="button"
                             class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
                             data-kyc-image-preview
-                            data-image-url="{{ item.selfie_image_url }}"
+                            data-image-url="{{ item.selfie_image_read_url }}"
                             data-image-label="自拍"
                           >自拍</button>
                         {% else %}

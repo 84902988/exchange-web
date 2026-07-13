@@ -1,34 +1,21 @@
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
 from math import ceil
-from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
 from app.deps.auth import get_current_user_id
 from app.db.models import KycSubmission, User, UserProfile
 from app.db.session import get_db
+from app.services.kyc_storage import build_kyc_file_response, save_kyc_upload
 
 router = APIRouter(tags=["kyc"])
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-TEMPLATES_DIR = BASE_DIR / "templates"
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-ADMIN_COOKIE_NAME = "admin_auth"
-ADMIN_COOKIE_VALUE = "1"
-ALLOWED_IMAGE_TYPES = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/webp": ".webp",
-}
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
 KYC_LEVEL_VALUE = {"PRIMARY": 1, "ADVANCED": 2}
 VALID_KYC_LEVELS = set(KYC_LEVEL_VALUE)
 VALID_ID_TYPES = {"PASSPORT", "ID_CARD", "DRIVER_LICENSE"}
@@ -50,10 +37,28 @@ KYC_STATUS_BADGES = {
     "APPROVED": "success",
     "REJECTED": "danger",
 }
+# The current RBAC catalog has no KYC-specific permission. Keep KYC review
+# access aligned with the existing Admin KYC page until a narrower permission
+# is introduced in a dedicated RBAC change.
+ADMIN_KYC_PERMISSION = "users.view"
+KYC_MATERIAL_FIELDS = {
+    "front": "front_image_url",
+    "back": "back_image_url",
+    "selfie": "selfie_image_url",
+}
 
 
 def _ok(data: dict, trace_id: Optional[str] = None) -> dict:
     return {"ok": True, "data": data, "error": None, "trace_id": trace_id}
+
+
+def _material_read_url(item: KycSubmission, material_kind: str, *, admin: bool = False) -> Optional[str]:
+    field_name = KYC_MATERIAL_FIELDS[material_kind]
+    if not getattr(item, field_name, None):
+        return None
+    if admin:
+        return f"/admin/kyc/{int(item.id)}/materials/{material_kind}"
+    return f"/me/kyc/submissions/{int(item.id)}/materials/{material_kind}"
 
 
 def _serialize_submission(item: KycSubmission | None) -> Optional[dict]:
@@ -67,9 +72,9 @@ def _serialize_submission(item: KycSubmission | None) -> Optional[dict]:
         "country_code": item.country_code,
         "id_type": item.id_type,
         "id_number": item.id_number,
-        "front_image_url": item.front_image_url,
-        "back_image_url": item.back_image_url,
-        "selfie_image_url": item.selfie_image_url,
+        "front_image_url": _material_read_url(item, "front"),
+        "back_image_url": _material_read_url(item, "back"),
+        "selfie_image_url": _material_read_url(item, "selfie"),
         "review_status": item.review_status,
         "review_note": item.review_note,
         "reviewed_by": item.reviewed_by,
@@ -96,34 +101,17 @@ def _latest_submission(db: Session, user_id: int) -> KycSubmission | None:
     )
 
 
-async def _save_kyc_image(file: UploadFile, label: str) -> str:
-    content_type = (file.content_type or "").lower()
-    ext = ALLOWED_IMAGE_TYPES.get(content_type)
-    if not ext:
-        raise HTTPException(status_code=400, detail={"code": "INVALID_IMAGE", "message": f"{label} image type is not supported"})
-
-    content = await file.read(MAX_IMAGE_BYTES + 1)
-    await file.close()
-    if not content:
-        raise HTTPException(status_code=400, detail={"code": "IMAGE_REQUIRED", "message": f"{label} image is required"})
-    if len(content) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"code": "IMAGE_TOO_LARGE", "message": f"{label} image is too large"})
-
-    upload_dir = BASE_DIR / "static" / "uploads" / "kyc"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{uuid.uuid4().hex}{ext}"
-    (upload_dir / filename).write_bytes(content)
-    return f"/static/uploads/kyc/{filename}"
-
-
 def _has_upload_file(file: Optional[UploadFile]) -> bool:
     return bool(file and file.filename)
 
 
-def _admin_required(request: Request) -> Optional[RedirectResponse]:
-    if request.cookies.get(ADMIN_COOKIE_NAME) != ADMIN_COOKIE_VALUE:
-        return RedirectResponse(url="/admin/login", status_code=302)
-    return None
+def _admin_required(request: Request, db: Session) -> Optional[Response]:
+    from app.routers.admin_pages import require_admin, require_admin_permission
+
+    redirect = require_admin(request)
+    if redirect:
+        return redirect
+    return require_admin_permission(request, db, ADMIN_KYC_PERMISSION)
 
 
 def _admin_reviewer_id(request: Request) -> str:
@@ -196,9 +184,9 @@ def _serialize_admin_submission(item: KycSubmission) -> dict:
         "country_code": item.country_code,
         "id_type": item.id_type,
         "id_number": item.id_number,
-        "front_image_url": item.front_image_url,
-        "back_image_url": item.back_image_url,
-        "selfie_image_url": item.selfie_image_url,
+        "front_image_read_url": _material_read_url(item, "front", admin=True),
+        "back_image_read_url": _material_read_url(item, "back", admin=True),
+        "selfie_image_read_url": _material_read_url(item, "selfie", admin=True),
         "review_status": status,
         "status_label": _status_label(status),
         "status_badge": _status_badge(status),
@@ -230,6 +218,26 @@ def get_my_kyc(
         },
         trace_id,
     )
+
+
+def _submission_material_reference(item: KycSubmission, material_kind: str) -> Optional[str]:
+    field_name = KYC_MATERIAL_FIELDS.get(str(material_kind or "").strip().lower())
+    if field_name is None:
+        raise HTTPException(status_code=404, detail="KYC material not found")
+    return getattr(item, field_name, None)
+
+
+@router.get("/me/kyc/submissions/{submission_id}/materials/{material_kind}")
+def read_my_kyc_material(
+    submission_id: int,
+    material_kind: str,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    item = db.query(KycSubmission).filter(KycSubmission.id == int(submission_id)).first()
+    if item is None or int(item.user_id) != int(user_id):
+        raise HTTPException(status_code=404, detail="KYC material not found")
+    return build_kyc_file_response(_submission_material_reference(item, material_kind))
 
 
 @router.post("/me/kyc/submit")
@@ -286,9 +294,9 @@ async def submit_my_kyc(
     if approved_same_level:
         raise HTTPException(status_code=400, detail={"code": "KYC_LEVEL_APPROVED", "message": "KYC level is already approved"})
 
-    front_url = await _save_kyc_image(front_image, "front")
-    back_url = await _save_kyc_image(back_image, "back") if _has_upload_file(back_image) else None
-    selfie_url = await _save_kyc_image(selfie_image, "selfie")
+    front_url = await save_kyc_upload(front_image, "front")
+    back_url = await save_kyc_upload(back_image, "back") if _has_upload_file(back_image) else None
+    selfie_url = await save_kyc_upload(selfie_image, "selfie")
 
     now = datetime.utcnow()
     item = KycSubmission(
@@ -331,7 +339,7 @@ def admin_kyc_submissions(
     error: str = Query(""),
     db: Session = Depends(get_db),
 ):
-    redirect = _admin_required(request)
+    redirect = _admin_required(request, db)
     if redirect:
         return redirect
 
@@ -420,6 +428,22 @@ def admin_kyc_submissions(
     )
 
 
+@router.get("/admin/kyc/{submission_id}/materials/{material_kind}")
+def read_admin_kyc_material(
+    request: Request,
+    submission_id: int,
+    material_kind: str,
+    db: Session = Depends(get_db),
+):
+    blocked = _admin_required(request, db)
+    if blocked:
+        return blocked
+    item = db.query(KycSubmission).filter(KycSubmission.id == int(submission_id)).first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="KYC material not found")
+    return build_kyc_file_response(_submission_material_reference(item, material_kind))
+
+
 def _admin_review_redirect(next_path: str = "", notice: str = "", error: str = "") -> RedirectResponse:
     base = next_path if str(next_path or "").startswith("/admin/kyc/submissions") else "/admin/kyc/submissions"
     parts = urlsplit(base)
@@ -442,7 +466,7 @@ def approve_kyc_submission(
     next_path: str = Form("/admin/kyc/submissions"),
     db: Session = Depends(get_db),
 ):
-    redirect = _admin_required(request)
+    redirect = _admin_required(request, db)
     if redirect:
         return redirect
     item = db.query(KycSubmission).filter(KycSubmission.id == submission_id).first()
@@ -479,7 +503,7 @@ def reject_kyc_submission(
     next_path: str = Form("/admin/kyc/submissions"),
     db: Session = Depends(get_db),
 ):
-    redirect = _admin_required(request)
+    redirect = _admin_required(request, db)
     if redirect:
         return redirect
     item = db.query(KycSubmission).filter(KycSubmission.id == submission_id).first()
