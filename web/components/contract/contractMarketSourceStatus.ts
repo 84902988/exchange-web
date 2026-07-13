@@ -127,6 +127,52 @@ export function getContractMarketSourceLabel(
   return contractText(t, LABEL_KEYS[tone], FALLBACK_LABELS[tone]);
 }
 
+export function getContractTickerSourceLabel({
+  source,
+  freshness,
+  marketStatus,
+  marketSessionType,
+  executable,
+  t,
+}: {
+  source?: string | null;
+  freshness?: string | null;
+  marketStatus?: string | null;
+  marketSessionType?: string | null;
+  executable?: boolean | null;
+  t?: ContractTranslate;
+}) {
+  const normalizedSource = normalize(source);
+  const normalizedMarketStatus = normalize(marketStatus);
+  const normalizedSessionType = normalize(marketSessionType);
+  const isNonTradingSession = normalizedMarketStatus === 'CLOSED'
+    || normalizedMarketStatus === 'HOLIDAY'
+    || normalizedSessionType === 'PRE_MARKET'
+    || normalizedSessionType === 'AFTER_HOURS'
+    || normalizedSessionType === 'HOLIDAY'
+    || executable === false;
+  const tone = getContractMarketSourceTone(source, freshness);
+
+  if (normalizedSource === 'KLINE_CLOSE') {
+    return contractText(t, 'klineLatestPrice', 'Kline latest price');
+  }
+  if (tone === 'fallback' || (tone === 'realtime' && isNonTradingSession)) {
+    return contractText(t, 'lastQuoteLabel', 'Last quote');
+  }
+  return contractText(t, LABEL_KEYS[tone], FALLBACK_LABELS[tone]);
+}
+
+export function getContractTickerDomainStatusLabel(
+  options: Parameters<typeof getContractTickerSourceLabel>[0],
+) {
+  const domainLabel = contractText(
+    options.t,
+    DOMAIN_KEYS.ticker,
+    DOMAIN_FALLBACKS.ticker,
+  );
+  return `${domainLabel}: ${getContractTickerSourceLabel(options)}`;
+}
+
 export function getContractDomainStatusLabel(
   domain: ContractMarketSourceDomain,
   source?: string | null,

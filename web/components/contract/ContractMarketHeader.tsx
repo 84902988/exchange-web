@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import MarketStatusBadge from '@/components/market/MarketStatusBadge';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
-  getContractDomainStatusLabel,
+  getContractTickerDomainStatusLabel,
 } from './contractMarketSourceStatus';
 
 type PriceDirection = 'up' | 'down' | 'flat';
@@ -25,8 +25,10 @@ type ContractMarketHeaderProps = {
   hint?: string | null;
   marketStatus?: string | null;
   marketStatusText?: string | null;
-  quoteFreshness?: string | null;
+  tickerSource?: string | null;
+  tickerFreshness?: string | null;
   marketSessionType?: string | null;
+  executable?: boolean | null;
   priceDirection?: PriceDirection;
   priceSource?: 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK';
   priceSourceLabel?: string | null;
@@ -43,8 +45,10 @@ export default function ContractMarketHeader({
   hint,
   marketStatus,
   marketStatusText,
-  quoteFreshness,
+  tickerSource,
+  tickerFreshness,
   marketSessionType,
+  executable,
   priceDirection = 'flat',
   priceSource,
   priceSourceLabel,
@@ -64,9 +68,16 @@ export default function ContractMarketHeader({
     : changeValue.startsWith('-')
       ? 'text-[#f6465d]'
       : 'text-white/58';
-  const hasTickerSourceStatus = !!quoteFreshness;
+  const hasTickerSourceStatus = !!tickerSource || !!tickerFreshness;
   const tickerSourceStatusTitle = hasTickerSourceStatus
-    ? getContractDomainStatusLabel('ticker', null, quoteFreshness, t)
+    ? getContractTickerDomainStatusLabel({
+        source: tickerSource,
+        freshness: tickerFreshness,
+        marketStatus,
+        marketSessionType,
+        executable,
+        t,
+      })
     : null;
   const tradeStatusTitle = [marketStatusText, tickerSourceStatusTitle]
     .filter(Boolean)
@@ -110,7 +121,7 @@ export default function ContractMarketHeader({
                 ) : null}
                 <MarketStatusBadge
                   marketStatus={marketStatus}
-                  quoteFreshness={quoteFreshness}
+                  quoteFreshness={tickerFreshness}
                   marketSessionType={marketSessionType}
                   className="max-w-full truncate !rounded-none !border-0 !bg-transparent !px-0 !py-0 text-[12px] font-medium"
                 />

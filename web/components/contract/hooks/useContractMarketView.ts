@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toNumber } from '@/components/contract/contractFormat';
 import { getContractMarketSourceLabel } from '@/components/contract/contractMarketSourceStatus';
+import { parseContractMarketTimestamp } from '@/components/contract/contractMarketTimestamp';
 import { normalizeSide } from '@/components/spot/orderbook/orderbook.utils';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
@@ -61,7 +62,7 @@ export type ContractMarketCenterState = {
   quoteFreshness: string | null;
   displayState: string | null;
   executable: boolean | null;
-  updatedAt: number;
+  updatedAt: number | null;
 };
 
 type LiveDepthBbo = {
@@ -1250,7 +1251,7 @@ export function useContractMarketView({
     const nextSpread = nextBestBid !== null && nextBestAsk !== null && nextBestAsk >= nextBestBid
       ? nextBestAsk - nextBestBid
       : null;
-    const quoteTime = marketView?.quote_time ? Date.parse(String(marketView.quote_time)) : NaN;
+    const quoteTime = parseContractMarketTimestamp(marketView?.quote_time);
 
     return {
       symbol: contractSymbol,
@@ -1271,9 +1272,7 @@ export function useContractMarketView({
       executable: marketView?.executable ?? quote?.executable ?? null,
       updatedAt: liveDepthMidFresh && liveDepthBbo
         ? liveDepthBbo.updatedAt
-        : Number.isFinite(quoteTime)
-          ? quoteTime
-          : Date.now(),
+        : quoteTime,
     };
   }, [
     contractKlineMode,
@@ -1396,12 +1395,23 @@ export function useContractMarketView({
   const marketViewTradesFreshness = marketView?.trades_freshness ?? null;
   const klineSource = marketView?.kline_source ?? marketView?.kline_current_candle?.kline_mode ?? null;
   const klineFreshness = marketView?.kline_freshness ?? null;
-  const resolvedDepthSource = activeDepthSource ?? marketViewDepthSource;
-  const resolvedDepthFreshness = activeDepthQuoteFreshness ?? marketViewDepthFreshness;
+  const preferMarketViewDomainSemantics = marketView?.executable === false
+    || marketView?.market_status === 'CLOSED'
+    || marketView?.market_status === 'HOLIDAY';
+  const resolvedDepthSource = preferMarketViewDomainSemantics
+    ? marketViewDepthSource
+    : activeDepthSource ?? marketViewDepthSource;
+  const resolvedDepthFreshness = preferMarketViewDomainSemantics
+    ? marketViewDepthFreshness
+    : activeDepthQuoteFreshness ?? marketViewDepthFreshness;
   const activeTradesSource = tradesBelongToCurrentSymbol ? tradesState.source : null;
   const activeTradesFreshness = tradesBelongToCurrentSymbol ? tradesState.freshness : null;
-  const resolvedTradesSource = activeTradesSource ?? marketViewTradesSource;
-  const resolvedTradesFreshness = activeTradesFreshness ?? marketViewTradesFreshness;
+  const resolvedTradesSource = preferMarketViewDomainSemantics
+    ? marketViewTradesSource
+    : activeTradesSource ?? marketViewTradesSource;
+  const resolvedTradesFreshness = preferMarketViewDomainSemantics
+    ? marketViewTradesFreshness
+    : activeTradesFreshness ?? marketViewTradesFreshness;
   const tickerSourceLabel = getContractMarketSourceLabel(tickerSource, tickerFreshness, t);
   const depthSourceLabel = getContractMarketSourceLabel(resolvedDepthSource, resolvedDepthFreshness, t);
   const tradesSourceLabel = getContractMarketSourceLabel(resolvedTradesSource, resolvedTradesFreshness, t);
@@ -1464,7 +1474,7 @@ export function useContractMarketView({
     marketStateBestBid,
     marketStateBestAsk,
     marketUiState,
-    marketStatus,
+    marketStatus: marketView?.market_status ?? effectiveMarketStatus,
     marketStatusText,
     quoteFreshness,
     marketSessionType,
