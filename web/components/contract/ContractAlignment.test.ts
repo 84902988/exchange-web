@@ -18,6 +18,8 @@ test('contract terminal reuses the shared selector and isolates symbol-scoped pr
   expect(source).toContain('onActiveOrdersFiltersChange({})');
   expect(source).toContain('onOrderHistoryFiltersChange({})');
   expect(source).toContain('onTradeHistoryFiltersChange({})');
+  expect(source).toContain('function shouldUseInitialContractSymbol(symbol: string)');
+  expect(source).toContain('return Boolean(symbol)');
 });
 
 test('contract market panels keep click-to-fill states without duplicating the symbol title', () => {
@@ -49,6 +51,25 @@ test('contract market view rejects stale symbol data for market, depth, trades, 
   expect(source).toContain('depthBelongsToCurrentSymbol');
   expect(source).toContain('tradesBelongToCurrentSymbol');
   expect(source).toContain('marketViewErrorSymbolRef.current === normalizeContractSymbol(contractSymbol)');
+});
+
+test('contract quote refreshes collapse short reconnect bursts without caching failures', () => {
+  const source = readSource('components/contract/hooks/useContractMarketState.ts');
+
+  expect(source).toContain('CONTRACT_QUOTE_REQUEST_DEDUPE_MS = 1_000');
+  expect(source).toContain('if (existing?.promise) return existing.promise');
+  expect(source).toContain('contractQuoteRequestStore.delete(contractSymbol)');
+  expect(source).toContain('await loadContractQuote(contractSymbol)');
+});
+
+test('contract TradingView uses the current readiness API and asynchronous symbol resolution', () => {
+  const chartSource = readSource('components/contract/ContractTradingViewChart.tsx');
+  const datafeedSource = readSource('components/contract/tradingview/contractTradingViewDatafeed.ts');
+
+  expect(chartSource).toContain('widget.chartReady().then(markChartReady)');
+  expect(chartSource).toContain('setSpotToolbarLoadingState(toolbarSlot, toolbarButtonRefs.current, { loading: false })');
+  expect(datafeedSource).toContain("window.setTimeout(() => onError('Invalid contract symbol'), 0)");
+  expect(datafeedSource).toContain('window.setTimeout(() => {');
 });
 
 test('contract position tabs use the spot-style compact tab bar and reset scoped paging', () => {
