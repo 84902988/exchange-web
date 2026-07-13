@@ -175,13 +175,13 @@ export default function AssetSpotPage() {
                   rows.map((row) => (
                     <tr key={row.symbol} className="border-b border-white/5 text-sm last:border-0">
                       <td className="py-3 font-medium text-white">{row.symbol}</td>
-                      <td className="py-3 text-right font-mono tabular-nums text-white">
+                      <td className="py-3 text-right tabular-nums text-white">
                         {formatAssetAmount(row.available, row.symbol)}
                       </td>
-                      <td className="py-3 text-right font-mono tabular-nums text-white/70">
+                      <td className="py-3 text-right tabular-nums text-white/70">
                         {formatAssetAmount(row.frozen, row.symbol)}
                       </td>
-                      <td className="py-3 text-right font-mono tabular-nums text-white">
+                      <td className="py-3 text-right tabular-nums text-white">
                         {formatAssetAmount(row.total, row.symbol)}
                       </td>
                       <td className="py-3">

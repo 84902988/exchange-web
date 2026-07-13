@@ -962,7 +962,7 @@ export default function WithdrawRecords({
                           <div className="truncate text-white/75" title={formattedCreatedAt.title}>
                             {formattedCreatedAt.title}
                           </div>
-                          <div className="font-mono text-xs font-semibold tabular-nums text-white/90">
+                          <div className="text-xs font-semibold tabular-nums text-white/90">
                             {formatWithdrawAmount(amount)}
                           </div>
                         </div>

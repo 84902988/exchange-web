@@ -195,7 +195,7 @@ function MetricCard({
   return (
     <div className="rounded-xl border border-white/10 bg-[#0e1117] p-5 shadow-xl">
       <div className="text-sm text-white/45">{label}</div>
-      <div className={`mt-3 font-mono text-2xl font-semibold tabular-nums ${valueClass}`}>
+      <div className={`mt-3 text-2xl font-semibold tabular-nums ${valueClass}`}>
         {loading ? '...' : value}
       </div>
     </div>
@@ -282,26 +282,26 @@ function PositionsSection({
                         {sideLabel(position.side, t)}
                       </span>
                     </td>
-                    <td className="py-3 text-right font-mono tabular-nums text-white">
+                    <td className="py-3 text-right tabular-nums text-white">
                       {formatAmount(position.quantity)}
                     </td>
-                    <td className="py-3 text-right font-mono tabular-nums text-white/70">
+                    <td className="py-3 text-right tabular-nums text-white/70">
                       {formatPrice(position.entry_price)}
                     </td>
-                    <td className="py-3 text-right font-mono tabular-nums text-white/70">
+                    <td className="py-3 text-right tabular-nums text-white/70">
                       {formatPrice(position.mark_price)}
                     </td>
                     <td
-                      className={`py-3 text-right font-mono tabular-nums ${
+                      className={`py-3 text-right tabular-nums ${
                         pnl > 0 ? 'text-[#00c087]' : pnl < 0 ? 'text-[#f6465d]' : 'text-white/70'
                       }`}
                     >
                       {formatAmount(position.unrealized_pnl)}
                     </td>
-                    <td className="py-3 text-right font-mono tabular-nums text-white/70">
+                    <td className="py-3 text-right tabular-nums text-white/70">
                       {formatPrice(position.liquidation_price)}
                     </td>
-                    <td className="py-3 text-right font-mono tabular-nums text-white">
+                    <td className="py-3 text-right tabular-nums text-white">
                       {position.leverage}x
                     </td>
                     <td className="py-3 text-right">

@@ -17,7 +17,9 @@ import {
   refreshToken as apiRefreshToken,
   type MeOut,
 } from '@/lib/api';
+import { useQueryClient } from '@tanstack/react-query';
 import { AUTH_EXPIRED_EVENT } from '@/lib/api/core/request';
+import { clearPrivateAccountQueries } from '@/lib/authPrivateQueries';
 
 interface AuthState {
   user: MeOut | null;
@@ -96,6 +98,7 @@ function isDisabledAccountError(error: unknown) {
 }
 
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
+  const queryClient = useQueryClient();
   const [authState, setAuthState] = useState<AuthState>(initialAuthState);
   const checkingRef = useRef<Promise<void> | null>(null);
   const refreshingRef = useRef<Promise<void> | null>(null);
@@ -117,6 +120,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const finishLoggedOut = useCallback((error: string | null = null) => {
     clearLocalAuth();
     cacheUser(null);
+    clearPrivateAccountQueries(queryClient);
     setAuthState({
       user: null,
       isLoggedIn: false,
@@ -124,7 +128,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       loading: false,
       error,
     });
-  }, []);
+  }, [queryClient]);
 
   const checkAuthStatus = useCallback(
     async (opts?: { silent?: boolean }) => {

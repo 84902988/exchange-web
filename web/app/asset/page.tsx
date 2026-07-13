@@ -929,7 +929,7 @@ function AccountDistributionSection({
                 <div className="mt-1 text-xs text-white/45">{item.description}</div>
               </div>
               <div className="text-left md:text-right">
-                <div className="font-mono text-base font-semibold text-white">
+                <div className="text-base font-semibold tabular-nums text-white">
                   {loading ? '...' : `${formatNumber(item.value)} USDT`}
                 </div>
                 <div className="mt-1 text-xs text-white/45">{formatNumber(item.percent, 2)}%</div>
@@ -989,7 +989,7 @@ function AssetDistributionSection({
                 <div className="flex min-w-0 items-center gap-2">
                   <span className="h-3 w-3 rounded-full" style={{ backgroundColor: item.color }} />
                   <span className="shrink-0 font-semibold text-white">{item.symbol}</span>
-                  <span className="shrink-0 font-mono text-xs tabular-nums text-white/45">
+                  <span className="shrink-0 text-xs tabular-nums text-white/45">
                     {formatAssetQuantity(item.amount, item.precision)}
                   </span>
                 </div>
@@ -1029,7 +1029,7 @@ function SummaryCard({
   return (
     <div className="rounded-xl border border-white/10 bg-[#0e1117] p-5 shadow-xl">
       <div className="text-sm text-white/50">{label}</div>
-      <div className="mt-2 font-mono text-2xl font-semibold text-white">
+      <div className="mt-2 text-2xl font-semibold tabular-nums text-white">
         {loading ? '...' : value}
       </div>
       <div className="mt-2 text-xs text-white/45">{hint}</div>
@@ -1078,7 +1078,7 @@ function AccountCard({
             <span className="text-white/45">{item.label}</span>
             <span
               className={[
-                'font-mono tabular-nums',
+                'tabular-nums',
                 item.tone === 'positive'
                   ? 'text-[#00c087]'
                   : item.tone === 'negative'
@@ -1211,13 +1211,13 @@ function AccountDetailModal({
                   {visibleRows.map((row) => (
                     <tr key={row.symbol} className="border-b border-white/5 text-sm last:border-0">
                       <td className="py-3 pr-4 font-semibold text-white">{row.symbol}</td>
-                      <td className="py-3 text-right font-mono tabular-nums text-white/80">
+                      <td className="py-3 text-right tabular-nums text-white/80">
                         {formatNumber(row.available, row.precision)}
                       </td>
-                      <td className="py-3 text-right font-mono tabular-nums text-white/80">
+                      <td className="py-3 text-right tabular-nums text-white/80">
                         {formatNumber(row.frozen, row.precision)}
                       </td>
-                      <td className="py-3 text-right font-mono tabular-nums text-white">
+                      <td className="py-3 text-right tabular-nums text-white">
                         {formatNumber(row.total, row.precision)}
                       </td>
                     </tr>
@@ -1260,7 +1260,7 @@ function AccountDetailModal({
                   <div className="text-xs text-white/45">{metric.label}</div>
                   <div
                     className={[
-                      'mt-2 break-words font-mono text-sm font-semibold tabular-nums',
+                      'mt-2 break-words text-sm font-semibold tabular-nums',
                       metric.tone === 'positive'
                         ? 'text-[#00c087]'
                         : metric.tone === 'negative'
@@ -1359,7 +1359,7 @@ function TransferRecordsSection({
                 <tr key={record.id} className="border-b border-white/5 text-sm last:border-0">
                   <td className="py-3 text-white">{record.symbol || 'USDT'}</td>
                   <td className="py-3 text-white/70">{transferDirection(record, t)}</td>
-                  <td className="py-3 pr-8 text-right font-mono tabular-nums text-white">
+                  <td className="py-3 pr-8 text-right tabular-nums text-white">
                     {formatTransferAmount(record.amount, record.symbol)}
                   </td>
                   <td className="py-3 pl-8 text-center">
