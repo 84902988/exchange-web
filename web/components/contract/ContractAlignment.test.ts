@@ -51,6 +51,16 @@ test('contract market view rejects stale symbol data for market, depth, trades, 
   expect(source).toContain('depthBelongsToCurrentSymbol');
   expect(source).toContain('tradesBelongToCurrentSymbol');
   expect(source).toContain('marketViewErrorSymbolRef.current === normalizeContractSymbol(contractSymbol)');
+  expect(source).toContain('requestSeqRef.current !== requestSeq');
+  expect(source).toContain('marketViewAbortControllerRef.current?.abort()');
+});
+
+test('contract ticker polling is suspended while the page is hidden', () => {
+  const source = readSource('app/contract/page.tsx');
+
+  expect(source).toContain('const isPageVisible = useContractPageVisibility()');
+  expect(source).toContain('if (!isPageVisible) return undefined');
+  expect(source).toContain('}, [contractSymbol, isPageVisible]);');
 });
 
 test('contract quote refreshes collapse short reconnect bursts without caching failures', () => {
