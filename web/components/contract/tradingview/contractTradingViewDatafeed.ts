@@ -16,7 +16,7 @@ import {
   type ContractKlineAssetClass,
 } from './contractKlineCachePolicy';
 
-export type ContractTradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
+export type ContractTradingViewResolution = '1' | '5' | '15' | '30' | '60' | '240' | '1D' | '1W' | '1M';
 
 export type ContractTradingViewBar = {
   time: number;
@@ -155,11 +155,12 @@ type SubscriptionEntry = {
   unsubscribe: () => void;
 };
 
-const SUPPORTED_RESOLUTIONS: ContractTradingViewResolution[] = ['1', '5', '15', '60', '240', '1D', '1W', '1M'];
+const SUPPORTED_RESOLUTIONS: ContractTradingViewResolution[] = ['1', '5', '15', '30', '60', '240', '1D', '1W', '1M'];
 const RESOLUTION_TO_CONTRACT_INTERVAL: Record<ContractTradingViewResolution, string> = {
   '1': '1m',
   '5': '5m',
   '15': '15m',
+  '30': '30m',
   '60': '1h',
   '240': '4h',
   '1D': '1d',
@@ -170,6 +171,7 @@ const CONTRACT_INTERVAL_TO_RESOLUTION: Record<string, ContractTradingViewResolut
   '1m': '1',
   '5m': '5',
   '15m': '15',
+  '30m': '30',
   '1h': '60',
   '4h': '240',
   '1d': '1D',

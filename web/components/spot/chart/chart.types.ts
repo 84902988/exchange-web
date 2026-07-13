@@ -1,8 +1,3 @@
-import type {
-  CandlestickData,
-  UTCTimestamp,
-  WhitespaceData,
-} from 'lightweight-charts';
 import type { RealtimePriceDirection } from '../spotTickerColor';
 
 export type SpotKlineLoadState = 'loading' | 'loaded' | 'empty' | 'error';
@@ -63,5 +58,11 @@ export type WsTradeMessage = {
 };
 
 export type CandleSeriesPoint =
-  | CandlestickData<UTCTimestamp>
-  | WhitespaceData<UTCTimestamp>;
+  | {
+      time: number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+    }
+  | { time: number };

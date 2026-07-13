@@ -1,9 +1,4 @@
 import type {
-  HistogramData,
-  LineData,
-  UTCTimestamp,
-} from 'lightweight-charts';
-import type {
   CandleItem,
   CandleSeriesPoint,
   RawKlineItem,
@@ -98,11 +93,11 @@ export function adaptKlines(raw: RawKlineItem[]) {
 export function toChartCandles(candles: CandleItem[]): CandleSeriesPoint[] {
   return candles.map((c) => {
     if (c.isPlaceholder) {
-      return { time: c.time as UTCTimestamp };
+      return { time: c.time };
     }
 
     return {
-      time: c.time as UTCTimestamp,
+      time: c.time,
       open: c.open,
       high: c.high,
       low: c.low,
@@ -111,19 +106,26 @@ export function toChartCandles(candles: CandleItem[]): CandleSeriesPoint[] {
   });
 }
 
-export function toChartVolumes(volumes: VolumeItem[]): HistogramData<UTCTimestamp>[] {
+export function toChartVolumes(volumes: VolumeItem[]): Array<{
+  time: number;
+  value: number;
+  color: string;
+}> {
   return volumes
     .filter((v) => v.value > 0)
     .map((v) => ({
-      time: v.time as UTCTimestamp,
+      time: v.time,
       value: v.value,
       color: v.color,
     }));
 }
 
-export function toLineData(items: Array<{ time: number; value: number }>): LineData<UTCTimestamp>[] {
+export function toLineData(items: Array<{ time: number; value: number }>): Array<{
+  time: number;
+  value: number;
+}> {
   return items.map((item) => ({
-    time: item.time as UTCTimestamp,
+    time: item.time,
     value: item.value,
   }));
 }

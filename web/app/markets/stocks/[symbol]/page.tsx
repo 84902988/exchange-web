@@ -1,8 +1,7 @@
 ﻿'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import type { IChartApi, MouseEventParams, UTCTimestamp } from 'lightweight-charts'
 
 import { request } from '@/lib/api/core/request'
 import {
@@ -13,12 +12,10 @@ import {
   type StockQuotePayload,
 } from '@/lib/api/modules/market'
 import { getContractSymbols, type ContractSymbolItem } from '@/lib/api/modules/contract'
-import { adaptKlines, toChartCandles, toChartVolumes, toLineData } from '@/components/spot/chart/chart.adapter'
-import {
-  createSpotChartInstance,
-  resizeSpotChart,
-  type CreateSpotChartResult,
-} from '@/components/spot/chart/chart.setup'
+import ContractTradingViewChart, {
+  type ContractChartMode,
+} from '@/components/contract/ContractTradingViewChart'
+import { adaptKlines } from '@/components/spot/chart/chart.adapter'
 import type { CandleItem, RawKlineItem } from '@/components/spot/chart/chart.types'
 import { useLocaleContext } from '@/contexts/LocaleContext'
 
@@ -237,11 +234,6 @@ function calculateMovingAverage(candles: CandleItem[], period: number): Array<{ 
   return result
 }
 
-function clampIndex(index: number, length: number): number {
-  if (length <= 0) return -1
-  return Math.max(0, Math.min(length - 1, index))
-}
-
 function findLineValueAtTime(items: Array<{ time: number; value: number }>, time: number): number | null {
   return items.find((item) => item.time === time)?.value ?? null
 }
@@ -269,16 +261,12 @@ export default function StockMarketDetailPage() {
   const [stats, setStats] = useState<StockStats>(() => parseQuote(symbol, null, t))
   const [contract, setContract] = useState<ContractSymbolItem | null>(null)
   const [klines, setKlines] = useState<RawKlineItem[]>([])
+  const [chartMode, setChartMode] = useState<ContractChartMode>('candle')
   const [loading, setLoading] = useState(true)
   const [klineLoading, setKlineLoading] = useState(true)
   const [quoteError, setQuoteError] = useState('')
   const [klineMessage, setKlineMessage] = useState('')
-  const [selectedCandleIndex, setSelectedCandleIndex] = useState(-1)
-  const chartContainerRef = useRef<HTMLDivElement | null>(null)
-  const chartRef = useRef<IChartApi | null>(null)
-  const seriesRef = useRef<CreateSpotChartResult | null>(null)
   const klinesRef = useRef<RawKlineItem[]>([])
-  const candlesRef = useRef<CandleItem[]>([])
   const lastPriceRef = useRef<number | null>(null)
   const klineCacheRef = useRef<Record<string, RawKlineItem[]>>({})
   const preloadedSymbolRef = useRef('')
@@ -387,7 +375,9 @@ export default function StockMarketDetailPage() {
   const ma5Data = useMemo(() => calculateMovingAverage(chartData.candles, 5), [chartData.candles])
   const ma10Data = useMemo(() => calculateMovingAverage(chartData.candles, 10), [chartData.candles])
   const ma30Data = useMemo(() => calculateMovingAverage(chartData.candles, 30), [chartData.candles])
-  const selectedCandle = selectedCandleIndex >= 0 ? chartData.candles[selectedCandleIndex] : null
+  const selectedCandle = chartData.candles.length > 0
+    ? chartData.candles[chartData.candles.length - 1]
+    : null
   const latestKlineInfo = useMemo(() => {
     const candle = selectedCandle
     if (!candle || candle.isPlaceholder) return null
@@ -407,65 +397,6 @@ export default function StockMarketDetailPage() {
     }
   }, [selectedCandle, ma5Data, ma10Data, ma30Data])
 
-  useEffect(() => {
-    candlesRef.current = chartData.candles
-    setSelectedCandleIndex(chartData.candles.length > 0 ? chartData.candles.length - 1 : -1)
-  }, [chartData.candles])
-
-  useEffect(() => {
-    const chart = chartRef.current
-    const series = seriesRef.current
-    const candle = selectedCandle
-    if (!chart || !series || !candle || candle.isPlaceholder) return
-
-    chart.setCrosshairPosition(
-      candle.close,
-      candle.time as UTCTimestamp,
-      series.candleSeries,
-    )
-  }, [selectedCandle])
-
-  useEffect(() => {
-    const container = chartContainerRef.current
-    if (!container) return
-
-    const chartBundle = createSpotChartInstance(container, 420, 2)
-    chartRef.current = chartBundle.chart
-    seriesRef.current = chartBundle
-
-    const handleResize = () => resizeSpotChart(chartRef.current, container)
-    const handleCrosshairMove = (param: MouseEventParams) => {
-      if (typeof param.logical !== 'number') return
-      const nextIndex = clampIndex(Math.round(param.logical), candlesRef.current.length)
-      if (nextIndex >= 0) {
-        setSelectedCandleIndex(nextIndex)
-      }
-    }
-
-    window.addEventListener('resize', handleResize)
-    chartBundle.chart.subscribeCrosshairMove(handleCrosshairMove)
-
-    return () => {
-      window.removeEventListener('resize', handleResize)
-      chartBundle.chart.unsubscribeCrosshairMove(handleCrosshairMove)
-      chartBundle.chart.remove()
-      chartRef.current = null
-      seriesRef.current = null
-    }
-  }, [])
-
-  useEffect(() => {
-    const series = seriesRef.current
-    if (!series) return
-
-    series.candleSeries.setData(toChartCandles(chartData.candles))
-    series.volumeSeries.setData(toChartVolumes(chartData.volumes))
-    series.ma5Series.setData(toLineData(ma5Data))
-    series.ma10Series.setData(toLineData(ma10Data))
-    series.ma30Series.setData(toLineData(ma30Data))
-    series.chart.timeScale().fitContent()
-  }, [chartData, ma5Data, ma10Data, ma30Data])
-
   const changeClass =
     stats.changePercent === null
       ? 'text-white/55'
@@ -476,21 +407,6 @@ export default function StockMarketDetailPage() {
     ? `${contractDisplaySymbol(contract.symbol)} ${t('perpetual', 'markets')}`
     : `${symbol}USDT ${t('perpetual', 'markets')}`
   const showKlineEmpty = !loading && !klineLoading && klines.length === 0
-  const focusChartContainer = useCallback(() => {
-    chartContainerRef.current?.focus({ preventScroll: true })
-  }, [])
-  const handleChartKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
-    if (candlesRef.current.length === 0) return
-
-    event.preventDefault()
-    event.stopPropagation()
-    const direction = event.key === 'ArrowLeft' ? -1 : 1
-    setSelectedCandleIndex((currentIndex) => {
-      const safeIndex = currentIndex >= 0 ? currentIndex : candlesRef.current.length - 1
-      return clampIndex(safeIndex + direction, candlesRef.current.length)
-    })
-  }, [])
 
   return (
     <main className="min-h-screen bg-[#0b0e11] px-4 py-6 text-white sm:px-6 lg:px-8">
@@ -514,34 +430,6 @@ export default function StockMarketDetailPage() {
               </div>
             </div>
             {quoteError ? <div className="mt-3 text-sm text-[#ea3943]">{quoteError}</div> : null}
-          </div>
-
-          <div className="border-b border-white/10 px-5 py-3">
-            <div className="flex flex-wrap items-center gap-2">
-              {INTERVALS.map((item) => (
-                <button
-                  key={item}
-                  type="button"
-                  disabled={klineLoading && interval === item}
-                  onClick={() => {
-                    if (item !== interval) setInterval(item)
-                  }}
-                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-wait ${
-                    interval === item
-                      ? 'bg-[#f0b90b] text-black'
-                      : 'bg-white/[0.04] text-white/55 hover:bg-white/[0.08] hover:text-white'
-                  }`}
-                >
-                  {item}
-                </button>
-              ))}
-              {klineLoading ? <span className="ml-1 text-xs text-[#f0b90b]">{t('loading', 'common')}</span> : null}
-            </div>
-
-            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-              <span className="rounded bg-white/[0.12] px-2 py-1 text-white">MA</span>
-              <span className="rounded bg-white/[0.12] px-2 py-1 text-white">VOL</span>
-            </div>
           </div>
 
           <div className="grid gap-2 border-b border-white/10 px-5 py-2 text-[12px] font-medium tabular-nums text-white/55 sm:grid-cols-2 xl:grid-cols-4">
@@ -568,14 +456,17 @@ export default function StockMarketDetailPage() {
                 {t('noKlineForInterval', 'markets')}
               </div>
             ) : null}
-            <div
-              ref={chartContainerRef}
-              tabIndex={0}
-              title={t('stockChartKeyboardHint', 'markets')}
-              onMouseDownCapture={focusChartContainer}
-              onClick={focusChartContainer}
-              onKeyDown={handleChartKeyDown}
-              className="h-full w-full outline-none focus:outline-none focus:ring-0"
+            <ContractTradingViewChart
+              symbol={contract?.symbol || `${symbol}USDT`}
+              category="STOCK"
+              displaySymbol={symbol}
+              interval={interval}
+              chartMode={chartMode}
+              intervalOptions={INTERVALS}
+              height={420}
+              pricePrecision={2}
+              onChartModeChange={setChartMode}
+              onIntervalChange={setInterval}
             />
           </div>
         </section>

@@ -2099,12 +2099,23 @@ function normalizePositionSide(side: string | null | undefined): ContractPositio
   return null;
 }
 
-function getPositionRecordSide(record: Partial<ContractPositionItem & ContractPositionSummaryItem> | null | undefined): ContractPositionSide | null {
-  const sideRecord = record as Partial<ContractPositionItem & ContractPositionSummaryItem> & {
-    position_side?: string | null;
-    direction?: string | null;
-    close_side?: string | null;
-  } | null | undefined;
+type PositionSideRecord = {
+  side?: string | null;
+  position_side?: string | null;
+  direction?: string | null;
+  close_side?: string | null;
+};
+
+type PositionRiskRecord = {
+  liquidation_price?: string | number | null;
+  liquidation_distance_rate?: string | number | null;
+  roe?: string | number | null;
+  unrealized_pnl?: string | number | null;
+  margin_amount?: string | number | null;
+};
+
+function getPositionRecordSide(record: PositionSideRecord | null | undefined): ContractPositionSide | null {
+  const sideRecord = record;
 
   return (
     normalizePositionSide(sideRecord?.side) ||
@@ -2723,7 +2734,7 @@ function getPositionAmount(item: ContractPositionItem) {
   return toNumber(record.quantity ?? record.amount ?? record.size);
 }
 
-function getAuthoritativeLiquidationPrice(record: Partial<ContractPositionItem & ContractPositionSummaryItem> | null | undefined) {
+function getAuthoritativeLiquidationPrice(record: PositionRiskRecord | null | undefined) {
   const liquidationPrice = toNumber(record?.liquidation_price);
   return Number.isFinite(liquidationPrice) && liquidationPrice > 0 ? liquidationPrice : null;
 }
@@ -2732,7 +2743,7 @@ function hasRiskValue(value: string | number | null | undefined) {
   return value !== null && value !== undefined && String(value).trim() !== '';
 }
 
-function isNearLiquidation(record: Partial<ContractPositionItem & ContractPositionSummaryItem> | null | undefined) {
+function isNearLiquidation(record: PositionRiskRecord | null | undefined) {
   if (!hasRiskValue(record?.liquidation_distance_rate)) return false;
   const distanceRate = toNumber(record?.liquidation_distance_rate);
   return Number.isFinite(distanceRate) && distanceRate <= 2;
@@ -2767,7 +2778,7 @@ function formatLiquidationDistance(value: string | number | null | undefined, pr
   return `${formatDisplayPrice(num, precision)} USDT`;
 }
 
-function getPositionRoe(record: Partial<ContractPositionItem & ContractPositionSummaryItem> | null | undefined) {
+function getPositionRoe(record: PositionRiskRecord | null | undefined) {
   if (hasRiskValue(record?.roe)) {
     const roe = toNumber(record?.roe);
     if (Number.isFinite(roe)) return roe;
@@ -2775,7 +2786,7 @@ function getPositionRoe(record: Partial<ContractPositionItem & ContractPositionS
   return calcUnrealizedPnlPercent(toNumber(record?.unrealized_pnl), record?.margin_amount);
 }
 
-function getLiquidationRisk(record: Partial<ContractPositionItem & ContractPositionSummaryItem> | null | undefined): LiquidationRisk | null {
+function getLiquidationRisk(record: PositionRiskRecord | null | undefined): LiquidationRisk | null {
   if (!hasRiskValue(record?.liquidation_distance_rate)) return null;
   const distanceRate = toNumber(record?.liquidation_distance_rate);
   if (!Number.isFinite(distanceRate)) return null;
