@@ -13,6 +13,7 @@ import {
   normalizeContractKlineAssetClass,
   type ContractKlineAssetClass,
 } from './tradingview/contractKlineCachePolicy';
+import { setSpotToolbarLoadingState } from '@/components/spot/tradingview/spotTradingViewResolutionState';
 
 export type ContractChartMode = 'time' | 'candle';
 
@@ -30,7 +31,8 @@ type TradingViewWidgetInstance = {
   remove: () => void;
   activeChart: () => TradingViewChartApi;
   applyOverrides?: (overrides: Record<string, unknown>) => void;
-  onChartReady: (callback: () => void) => void;
+  chartReady?: () => Promise<void>;
+  onChartReady?: (callback: () => void) => void;
   headerReady: () => Promise<void>;
   createButton: (options?: {
     align?: 'left' | 'right';
@@ -430,6 +432,7 @@ export default function ContractTradingViewChart({
   const widgetRef = useRef<TradingViewWidgetInstance | null>(null);
   const datafeedRef = useRef<ReturnType<typeof createContractTradingViewDatafeed> | null>(null);
   const toolbarButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const toolbarSlotRef = useRef<HTMLElement | null>(null);
   const chartReadyRef = useRef(false);
   const currentResolutionRef = useRef('');
   const pendingResolutionRef = useRef('');
@@ -533,6 +536,15 @@ export default function ContractTradingViewChart({
     loadingCoordinator.finish(sequence);
   }, [loadingCoordinator]);
 
+  const restoreToolbarInteraction = useCallback((buildSeq: number) => {
+    window.requestAnimationFrame(() => {
+      if (datafeedBuildSeqRef.current !== buildSeq) return;
+      setSpotToolbarLoadingState(toolbarSlotRef.current, toolbarButtonRefs.current, {
+        loading: false,
+      });
+    });
+  }, []);
+
   const requestResolutionFallbackRebuild = useCallback((
     nextResolution: string,
     requestSeq: number,
@@ -609,6 +621,7 @@ export default function ContractTradingViewChart({
       pendingResolutionRef.current = '';
       inFlightResolutionRef.current = '';
       toolbarButtonRefs.current.clear();
+      toolbarSlotRef.current = null;
       datafeedRef.current?.destroy();
       datafeedRef.current = null;
       try {
@@ -768,9 +781,12 @@ export default function ContractTradingViewChart({
       if (pendingResolution && pendingResolution !== currentResolutionRef.current) {
         applyWidgetResolution(pendingResolution);
       }
+      restoreToolbarInteraction(buildSeq);
     };
 
-    if (typeof widget.onChartReady === 'function') {
+    if (typeof widget.chartReady === 'function') {
+      void widget.chartReady().then(markChartReady).catch(() => undefined);
+    } else if (typeof widget.onChartReady === 'function') {
       widget.onChartReady(markChartReady);
     } else {
       chartReadyTimer = window.setTimeout(markChartReady, 0);
@@ -779,6 +795,7 @@ export default function ContractTradingViewChart({
     void widget.headerReady().then(() => {
       if (cancelled || widgetRef.current !== widget) return;
       const toolbarSlot = widget.createButton({ align: 'left', useTradingViewStyle: false });
+      toolbarSlotRef.current = toolbarSlot;
       toolbarSlot.setAttribute('title', '');
       toolbarSlot.style.display = 'inline-flex';
       toolbarSlot.style.alignItems = 'center';
@@ -848,6 +865,8 @@ export default function ContractTradingViewChart({
           onIntervalChangeRef.current?.(selection.interval);
         });
       });
+      setSpotToolbarLoadingState(toolbarSlot, toolbarButtonRefs.current, { loading: false });
+      restoreToolbarInteraction(buildSeq);
     }).catch(() => undefined);
 
     return disposeEffect;
@@ -862,6 +881,7 @@ export default function ContractTradingViewChart({
     normalizedSymbol,
     pricePrecision,
     resolutionFallbackNonce,
+    restoreToolbarInteraction,
     scriptReady,
     startChartLoading,
     widgetKey,

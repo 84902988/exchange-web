@@ -78,6 +78,9 @@ const chartModule = loadTypeScriptModule(
     '@/contexts/LocaleContext': {
       useLocaleContext: () => ({ locale: 'en', t: (key: string) => key }),
     },
+    '@/components/spot/tradingview/spotTradingViewResolutionState': {
+      setSpotToolbarLoadingState: () => undefined,
+    },
     './tradingview/contractTradingViewDatafeed': {
       contractIntervalToTradingViewResolution: intervalToResolution,
       createContractTradingViewDatafeed: () => ({ destroy() {} }),

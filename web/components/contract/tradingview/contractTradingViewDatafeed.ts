@@ -727,16 +727,18 @@ export function createContractTradingViewDatafeed({
 
     resolveSymbol(_symbolName, onResolve, onError) {
       if (!apiSymbol) {
-        onError('Invalid contract symbol');
+        window.setTimeout(() => onError('Invalid contract symbol'), 0);
         return;
       }
 
-      onResolve(buildSymbolInfo({
-        symbol: apiSymbol,
-        displaySymbol: displayName,
-        pricePrecision,
-        amountPrecision,
-      }));
+      window.setTimeout(() => {
+        onResolve(buildSymbolInfo({
+          symbol: apiSymbol,
+          displaySymbol: displayName,
+          pricePrecision,
+          amountPrecision,
+        }));
+      }, 0);
     },
 
     async getBars(symbolInfo, resolution, periodParams, onHistory) {

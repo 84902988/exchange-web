@@ -62,6 +62,41 @@ type BestDepthState = {
   ts: string | number | null;
 };
 
+type ContractQuoteRequestEntry = {
+  promise: Promise<ContractQuote> | null;
+  quote: ContractQuote | null;
+  settledAt: number;
+};
+
+const CONTRACT_QUOTE_REQUEST_DEDUPE_MS = 1_000;
+const contractQuoteRequestStore = new Map<string, ContractQuoteRequestEntry>();
+
+function loadContractQuote(contractSymbol: string) {
+  const now = Date.now();
+  const existing = contractQuoteRequestStore.get(contractSymbol);
+  if (existing?.promise) return existing.promise;
+  if (existing?.quote && now - existing.settledAt < CONTRACT_QUOTE_REQUEST_DEDUPE_MS) {
+    return Promise.resolve(existing.quote);
+  }
+
+  const promise = getContractQuote(contractSymbol);
+  contractQuoteRequestStore.set(contractSymbol, {
+    promise,
+    quote: existing?.quote || null,
+    settledAt: existing?.settledAt || 0,
+  });
+  void promise.then((quote) => {
+    contractQuoteRequestStore.set(contractSymbol, {
+      promise: null,
+      quote,
+      settledAt: Date.now(),
+    });
+  }).catch(() => {
+    contractQuoteRequestStore.delete(contractSymbol);
+  });
+  return promise;
+}
+
 function getMarketSymbol(contractSymbol: string, symbolOptionMarketSymbol?: string | null) {
   return symbolOptionMarketSymbol || contractSymbol.replace(/_PERP$/, '');
 }
@@ -235,7 +270,7 @@ export function useContractMarketState({
       setContractQuoteLoading(true);
     }
     try {
-      const nextQuote = await getContractQuote(contractSymbol);
+      const nextQuote = await loadContractQuote(contractSymbol);
       const nextPrice = getQuoteTradePrice(nextQuote);
       applyLatestPrice(nextPrice);
       contractQuoteRef.current = nextQuote;
