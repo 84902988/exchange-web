@@ -490,9 +490,9 @@ function SpotOrdersTable({
               <td className="py-3 text-white">{item.symbol}</td>
               <td className={`py-3 font-medium ${sideClass(item.side)}`}>{sideLabel(item.side, t)}</td>
               <td className="py-3 text-white/70">{orderTypeLabel(item.order_type, t)}</td>
-              <td className="py-3 text-right font-mono text-white">{formatSpotOrderPrice(item, t)}</td>
-              <td className="py-3 text-right font-mono text-white">{formatNum(item.amount)}</td>
-              <td className="py-3 text-right font-mono text-white/70">{formatNum(item.filled_amount)}</td>
+              <td className="py-3 text-right tabular-nums text-white">{formatSpotOrderPrice(item, t)}</td>
+              <td className="py-3 text-right tabular-nums text-white">{formatNum(item.amount)}</td>
+              <td className="py-3 text-right tabular-nums text-white/70">{formatNum(item.filled_amount)}</td>
               <td className="py-3 text-right">
                 <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${statusClass(item.status)}`}>
                   {statusLabel(item.status, t)}
@@ -557,10 +557,10 @@ function SpotTradesTable({
               <tr key={item.trade_id} className="border-b border-white/5 text-sm last:border-0">
                 <td className="py-3 text-white">{item.symbol}</td>
                 <td className={`py-3 font-medium ${tradeSideClass(userSide, t)}`}>{userSide}</td>
-                <td className="py-3 text-right font-mono text-white">{formatNum(item.price)}</td>
-                <td className="py-3 text-right font-mono text-white">{formatNum(item.amount)}</td>
-                <td className="py-3 text-right font-mono text-white/70">{formatNum(item.quote_amount)}</td>
-                <td className="py-3 text-right font-mono text-white/70">{formatSpotTradeFee(item)}</td>
+                <td className="py-3 text-right tabular-nums text-white">{formatNum(item.price)}</td>
+                <td className="py-3 text-right tabular-nums text-white">{formatNum(item.amount)}</td>
+                <td className="py-3 text-right tabular-nums text-white/70">{formatNum(item.quote_amount)}</td>
+                <td className="py-3 text-right tabular-nums text-white/70">{formatSpotTradeFee(item)}</td>
                 <td className="py-3 text-right text-white/55">{formatDateTime(item.created_at)}</td>
               </tr>
             );
@@ -648,7 +648,7 @@ function PaginationBar({
       >
         {t('prevPage', 'asset')}
       </button>
-      <span className="px-1 font-mono text-white/70">
+      <span className="px-1 tabular-nums text-white/70">
         {page} / {totalPages}
       </span>
       <span className="text-white/45">
@@ -665,7 +665,7 @@ function PaginationBar({
           if (event.key === 'Enter') jumpTo(event.currentTarget.value);
         }}
         onBlur={(event) => jumpTo(event.currentTarget.value)}
-        className="h-8 w-16 rounded-lg border border-white/10 bg-[#090d12] px-2 text-center font-mono text-white outline-none transition-colors hover:border-white/20 focus:border-white/30 disabled:cursor-not-allowed disabled:opacity-35"
+        className="h-8 w-16 rounded-lg border border-white/10 bg-[#090d12] px-2 text-center tabular-nums text-white outline-none transition-colors hover:border-white/20 focus:border-white/30 disabled:cursor-not-allowed disabled:opacity-35"
       />
       <button
         type="button"

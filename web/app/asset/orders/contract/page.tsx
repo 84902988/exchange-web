@@ -398,9 +398,9 @@ function ContractOrdersTable({
                 <td className="py-3 text-white">{item.symbol}</td>
                 <td className={`py-3 font-medium ${sideClass(item.position_side)}`}>{sideText(item.position_side, t)}</td>
                 <td className="py-3 text-white/70">{actionText(item.action, t)} / {orderTypeText(item.order_type, t)}</td>
-                <td className="py-3 text-right font-mono text-white">{formatContractOrderPrice(item, t, tradeAvgPriceByOrderId.get(item.id))}</td>
-                <td className="py-3 text-right font-mono text-white">{formatNum(item.quantity)}</td>
-                <td className="py-3 text-right font-mono text-white/70">{item.leverage}x</td>
+                <td className="py-3 text-right tabular-nums text-white">{formatContractOrderPrice(item, t, tradeAvgPriceByOrderId.get(item.id))}</td>
+                <td className="py-3 text-right tabular-nums text-white">{formatNum(item.quantity)}</td>
+                <td className="py-3 text-right tabular-nums text-white/70">{item.leverage}x</td>
                 <td className="py-3 text-right text-white/70">{statusText(item.status, t)}</td>
                 <td className="py-3 text-right text-white/55">{formatDateTime(item.created_at)}</td>
               </tr>
@@ -467,10 +467,10 @@ function ContractTradesTable({
                   <td className="py-3 text-white">{item.symbol}</td>
                   <td className={`py-3 font-medium ${sideClass(item.position_side)}`}>{sideText(item.position_side, t)}</td>
                   <td className="py-3 text-white/70">{actionText(item.action, t)}</td>
-                  <td className="py-3 text-right font-mono text-white">{formatNum(item.price)}</td>
-                  <td className="py-3 text-right font-mono text-white">{formatNum(item.quantity)}</td>
-                  <td className="py-3 text-right font-mono text-white/70" title={t('spreadCostHelp', 'contracts')}>{formatNum(item.spread_fee ?? item.fee_amount, 6)}</td>
-                  <td className={`py-3 text-right font-mono ${pnl > 0 ? 'text-[#00c087]' : pnl < 0 ? 'text-[#f6465d]' : 'text-white/70'}`}>
+                  <td className="py-3 text-right tabular-nums text-white">{formatNum(item.price)}</td>
+                  <td className="py-3 text-right tabular-nums text-white">{formatNum(item.quantity)}</td>
+                  <td className="py-3 text-right tabular-nums text-white/70" title={t('spreadCostHelp', 'contracts')}>{formatNum(item.spread_fee ?? item.fee_amount, 6)}</td>
+                  <td className={`py-3 text-right tabular-nums ${pnl > 0 ? 'text-[#00c087]' : pnl < 0 ? 'text-[#f6465d]' : 'text-white/70'}`}>
                     {formatNum(item.realized_pnl)}
                   </td>
                   <td className="py-3 text-right text-white/55">{formatDateTime(item.created_at)}</td>
@@ -562,7 +562,7 @@ function PaginationBar({
       >
         {t('prevPage', 'asset')}
       </button>
-      <span className="px-1 font-mono text-white/70">
+      <span className="px-1 tabular-nums text-white/70">
         {page} / {totalPages}
       </span>
       <span className="text-white/45">
@@ -579,7 +579,7 @@ function PaginationBar({
           if (event.key === 'Enter') jumpTo(event.currentTarget.value);
         }}
         onBlur={(event) => jumpTo(event.currentTarget.value)}
-        className="h-8 w-16 rounded-lg border border-white/10 bg-[#090d12] px-2 text-center font-mono text-white outline-none transition-colors hover:border-white/20 focus:border-white/30 disabled:cursor-not-allowed disabled:opacity-35"
+        className="h-8 w-16 rounded-lg border border-white/10 bg-[#090d12] px-2 text-center tabular-nums text-white outline-none transition-colors hover:border-white/20 focus:border-white/30 disabled:cursor-not-allowed disabled:opacity-35"
       />
       <button
         type="button"
