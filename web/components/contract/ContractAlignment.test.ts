@@ -63,6 +63,21 @@ test('contract ticker polling is suspended while the page is hidden', () => {
   expect(source).toContain('}, [contractSymbol, isPageVisible]);');
 });
 
+test('contract header receives authoritative ticker status and does not synthesize quote time', () => {
+  const pageSource = readSource('app/contract/page.tsx');
+  const headerSource = readSource('components/contract/ContractMarketHeader.tsx');
+  const hookSource = readSource('components/contract/hooks/useContractMarketView.ts');
+
+  expect(pageSource).toContain('tickerSource={tickerSource}');
+  expect(pageSource).toContain('tickerFreshness={tickerFreshness}');
+  expect(pageSource).toContain('executable={contractExecutable}');
+  expect(headerSource).toContain('getContractTickerDomainStatusLabel({');
+  expect(headerSource).toContain('quoteFreshness={tickerFreshness}');
+  expect(hookSource).toContain('parseContractMarketTimestamp(marketView?.quote_time)');
+  expect(hookSource).toContain(': quoteTime,');
+  expect(hookSource).toContain('preferMarketViewDomainSemantics');
+});
+
 test('contract quote refreshes collapse short reconnect bursts without caching failures', () => {
   const source = readSource('components/contract/hooks/useContractMarketState.ts');
 

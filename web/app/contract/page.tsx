@@ -434,6 +434,8 @@ function ContractPageContent() {
     depthAsks,
     depthLoading,
     depthError,
+    tickerSource,
+    tickerFreshness,
     depthSource,
     depthFreshness,
     depthUpdatedAt,
@@ -457,7 +459,6 @@ function ContractPageContent() {
     marketUiState,
     marketStatus: contractMarketStatus,
     marketStatusText: contractMarketStatusText,
-    quoteFreshness: contractQuoteFreshness,
     marketSessionType: contractMarketSessionType,
     quoteStatusLoading,
     quoteStatusLabel,
@@ -783,8 +784,10 @@ function ContractPageContent() {
           hint={quoteHint}
           marketStatus={contractMarketStatus}
           marketStatusText={contractMarketStatusText}
-          quoteFreshness={contractQuoteFreshness}
+          tickerSource={tickerSource}
+          tickerFreshness={tickerFreshness}
           marketSessionType={contractMarketSessionType}
+          executable={contractExecutable}
           priceDirection={currentPriceDirection}
           priceSource={currentPriceSource}
           priceSourceLabel={currentPriceSourceLabel}
