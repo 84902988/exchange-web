@@ -30,6 +30,16 @@ _NON_RETRYABLE_EMPTY_CACHE_STATUSES = {
     "UNSUPPORTED_INTERVAL",
     "PROVIDER_NOT_CONFIGURED",
 }
+_TERMINAL_CONTRADICTION_CACHE_STATUSES = {
+    "PROVIDER_EMPTY",
+    "SHORT",
+    "TIMEOUT",
+    "ERROR",
+    "STALE",
+    "STALE_OPEN",
+    "CONTINUITY_INVALID",
+    "COVERAGE_INVALID",
+}
 
 
 def _normalize_text(value: Any) -> str:
@@ -38,6 +48,14 @@ def _normalize_text(value: Any) -> str:
 
 def _copy_items(items: Iterable[Any]) -> list[dict[str, Any]]:
     return [dict(item) for item in items if isinstance(item, dict)]
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    try:
+        normalized = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
 
 
 class ContractKlineResult(list):
@@ -52,6 +70,10 @@ class ContractKlineResult(list):
         history_incomplete: bool = False,
         history_complete: Optional[bool] = None,
         has_more_before: Optional[bool] = None,
+        history_terminal: Optional[bool] = None,
+        terminal_reason: Optional[str] = None,
+        earliest_available_time: Optional[int] = None,
+        coverage_complete: Optional[bool] = None,
         provider_error_code: Optional[str] = None,
         retryable: Optional[bool] = None,
     ) -> None:
@@ -68,6 +90,12 @@ class ContractKlineResult(list):
         )
         self.history_complete = None if history_complete is None else bool(history_complete)
         self.has_more_before = None if has_more_before is None else bool(has_more_before)
+        self.history_terminal = None if history_terminal is None else bool(history_terminal)
+        self.terminal_reason = str(terminal_reason or "").strip() or None
+        self.earliest_available_time = _positive_int(earliest_available_time)
+        self.coverage_complete = (
+            None if coverage_complete is None else bool(coverage_complete)
+        )
         if self.history_complete is True:
             if self.has_more_before is not False:
                 raise ValueError("history_complete requires has_more_before=false")
@@ -90,6 +118,10 @@ class ContractKlineResult(list):
             history_incomplete=self.history_incomplete,
             history_complete=self.history_complete,
             has_more_before=self.has_more_before,
+            history_terminal=self.history_terminal,
+            terminal_reason=self.terminal_reason,
+            earliest_available_time=self.earliest_available_time,
+            coverage_complete=self.coverage_complete,
             provider_error_code=self.provider_error_code,
             retryable=self.retryable,
         )
@@ -103,6 +135,10 @@ def coerce_contract_kline_result(
     history_incomplete: Optional[bool] = None,
     history_complete: Optional[bool] = None,
     has_more_before: Optional[bool] = None,
+    history_terminal: Optional[bool] = None,
+    terminal_reason: Optional[str] = None,
+    earliest_available_time: Optional[int] = None,
+    coverage_complete: Optional[bool] = None,
     provider_error_code: Optional[str] = None,
     retryable: Optional[bool] = None,
 ) -> ContractKlineResult:
@@ -115,6 +151,10 @@ def coerce_contract_kline_result(
                 history_incomplete,
                 history_complete,
                 has_more_before,
+                history_terminal,
+                terminal_reason,
+                earliest_available_time,
+                coverage_complete,
                 provider_error_code,
                 retryable,
             )
@@ -144,6 +184,26 @@ def coerce_contract_kline_result(
         if has_more_before is not None
         else getattr(rows, "has_more_before", None)
     )
+    resolved_history_terminal = (
+        history_terminal
+        if history_terminal is not None
+        else getattr(rows, "history_terminal", None)
+    )
+    resolved_terminal_reason = (
+        terminal_reason
+        if terminal_reason is not None
+        else getattr(rows, "terminal_reason", None)
+    )
+    resolved_earliest_available_time = (
+        earliest_available_time
+        if earliest_available_time is not None
+        else getattr(rows, "earliest_available_time", None)
+    )
+    resolved_coverage_complete = (
+        coverage_complete
+        if coverage_complete is not None
+        else getattr(rows, "coverage_complete", None)
+    )
     resolved_retryable = retryable
     if resolved_retryable is None and hasattr(rows, "retryable"):
         resolved_retryable = bool(getattr(rows, "retryable"))
@@ -159,6 +219,10 @@ def coerce_contract_kline_result(
         history_incomplete=resolved_history_incomplete,
         history_complete=resolved_history_complete,
         has_more_before=resolved_has_more_before,
+        history_terminal=resolved_history_terminal,
+        terminal_reason=resolved_terminal_reason,
+        earliest_available_time=resolved_earliest_available_time,
+        coverage_complete=resolved_coverage_complete,
         provider_error_code=resolved_provider_error_code,
         retryable=resolved_retryable,
     )
@@ -218,6 +282,62 @@ def contract_kline_error_result(
     )
 
 
+def build_contract_kline_terminal_metadata(
+    result: ContractKlineResult,
+    *,
+    end_time_ms: Optional[int],
+) -> dict[str, Any]:
+    """Expose terminal evidence only when it is complete and contradiction-free."""
+
+    if end_time_ms is None:
+        return {
+            "history_terminal": None,
+            "terminal_reason": None,
+            "earliest_available_time": None,
+            "coverage_complete": None,
+        }
+
+    terminal_reason = str(result.terminal_reason or "").strip() or None
+    earliest_available_time = _positive_int(result.earliest_available_time)
+    cache_status = _normalize_text(result.cache_status)
+    has_terminal_contradiction = bool(
+        result.history_incomplete
+        or result.provider_error_code
+        or result.retryable
+        or result.origin == KLINE_CACHE_ORIGIN_STALE_CACHE
+        or cache_status in _TERMINAL_CONTRADICTION_CACHE_STATUSES
+        or result.coverage_complete is False
+    )
+    has_terminal_evidence = bool(terminal_reason)
+    history_terminal = bool(
+        result.history_terminal is True
+        and has_terminal_evidence
+        and not has_terminal_contradiction
+    )
+
+    if history_terminal:
+        coverage_complete: Optional[bool] = True
+    elif has_terminal_contradiction:
+        coverage_complete = False
+    elif result.coverage_complete is not None:
+        coverage_complete = result.coverage_complete
+    elif result.history_complete is True:
+        coverage_complete = True
+    elif not result:
+        coverage_complete = False
+    else:
+        coverage_complete = None
+
+    return {
+        "history_terminal": history_terminal,
+        "terminal_reason": terminal_reason if history_terminal else None,
+        "earliest_available_time": (
+            earliest_available_time if history_terminal else None
+        ),
+        "coverage_complete": coverage_complete,
+    }
+
+
 def build_contract_kline_metadata(
     rows: Any,
     *,
@@ -226,6 +346,10 @@ def build_contract_kline_metadata(
     result = coerce_contract_kline_result(rows)
     origin = _normalize_text(result.origin)
     cache_status = _normalize_text(result.cache_status)
+    terminal_metadata = build_contract_kline_terminal_metadata(
+        result,
+        end_time_ms=end_time_ms,
+    )
 
     if origin in {KLINE_CACHE_ORIGIN_DB_CACHE, KLINE_CACHE_ORIGIN_PROCESS_CACHE}:
         freshness = "CACHED"
@@ -243,7 +367,10 @@ def build_contract_kline_metadata(
     history_complete: Optional[bool] = None
     has_more_before: Optional[bool] = None
     if end_time_ms is not None:
-        history_complete = result.history_complete is True
+        history_complete = bool(
+            result.history_complete is True
+            or terminal_metadata["history_terminal"] is True
+        )
         has_more_before = True if result.has_more_before is True else None
         if history_complete:
             has_more_before = False
@@ -269,6 +396,7 @@ def build_contract_kline_metadata(
         "history_incomplete": False if history_complete else history_incomplete,
         "history_complete": history_complete,
         "has_more_before": has_more_before,
+        **terminal_metadata,
         "provider_error_code": result.provider_error_code,
         "retryable": retryable,
     }

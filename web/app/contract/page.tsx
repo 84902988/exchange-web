@@ -5,9 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import ContractAccountPanel from '@/components/contract/ContractAccountPanel';
 import ContractFuturesOrderBook from '@/components/contract/ContractFuturesOrderBook';
 import ContractFuturesTrades from '@/components/contract/ContractFuturesTrades';
-import ContractMarketHeader, {
-  type HeaderMetric,
-} from '@/components/contract/ContractMarketHeader';
+import ContractMarketHeader from '@/components/contract/ContractMarketHeader';
 import ContractPositionTabs, {
   type ContractPositionTabKey,
 } from '@/components/contract/ContractPositionTabs';
@@ -49,24 +47,6 @@ const DEFAULT_CONTRACT_SYMBOL = 'BTCUSDT_PERP';
 const CONTRACT_INTERVAL_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'];
 const CONTRACT_TRADFI_INTERVAL_OPTIONS = CONTRACT_INTERVAL_OPTIONS.filter((item) => item !== '4h');
 const CFD_CONTRACT_CATEGORIES = new Set(['GOLD', 'FUTURES', 'INDEX', 'FOREX', 'METAL', 'COMMODITY']);
-const CRYPTO_CONTRACT_BASES = new Set([
-  'BTC',
-  'ETH',
-  'BNB',
-  'SOL',
-  'XRP',
-  'DOGE',
-  'ADA',
-  'AVAX',
-  'MATIC',
-  'DOT',
-  'LTC',
-  'BCH',
-  'LINK',
-  'TRX',
-  'TON',
-]);
-
 const CONTRACT_SYMBOL_OPTIONS = [
   { contractSymbol: DEFAULT_CONTRACT_SYMBOL, marketSymbol: 'BTCUSDT', pricePrecision: 1 },
 ];
@@ -155,12 +135,6 @@ function formatContractMarketDisplaySymbol(symbol: string, quoteAsset?: string |
     }
   }
   return normalized;
-}
-
-function isKnownCryptoContractSymbol(symbol: string) {
-  const marketSymbol = contractSymbolToMarketSymbol(symbol).toUpperCase();
-  const base = marketSymbol.replace(/(USDT|USDC|USD)$/, '');
-  return CRYPTO_CONTRACT_BASES.has(base);
 }
 
 function shouldUseInitialContractSymbol(symbol: string) {
@@ -287,16 +261,6 @@ function getTickerChangeAmount(ticker: ContractTickerItem | null) {
   return ticker?.price_change_24h ?? ticker?.change_24h ?? null;
 }
 
-function isCryptoContractPair(pair: GlobalMarketSelectorPair | null | undefined) {
-  if (!pair) return false;
-  const categories = getContractPairCategories(pair);
-  return (
-    categories.includes('CRYPTO') &&
-    !categories.includes('STOCK') &&
-    !categories.some((item) => CFD_CONTRACT_CATEGORIES.has(item))
-  );
-}
-
 function isTradfiContractPair(pair: GlobalMarketSelectorPair | null | undefined) {
   if (!pair) return false;
   const categories = getContractPairCategories(pair);
@@ -417,7 +381,6 @@ function ContractPageContent() {
     () => (isTradfiContractPair(currentContractPair) ? CONTRACT_TRADFI_INTERVAL_OPTIONS : CONTRACT_INTERVAL_OPTIONS),
     [currentContractPair],
   );
-  const effectiveKlineInterval = chartMode === 'time' ? '1m' : interval;
   const maxLeverage = currentContractPair?.maxLeverage || 200;
   const {
     marketSymbol,
@@ -458,18 +421,15 @@ function ContractPageContent() {
     marketState: contractMarketState,
     marketUiState,
     marketStatus: contractMarketStatus,
-    marketStatusText: contractMarketStatusText,
     marketSessionType: contractMarketSessionType,
     quoteStatusLoading,
     quoteStatusLabel,
     quoteStatusTone,
     currentPriceReady,
     priceDirection: currentPriceDirection,
-    expiredLastGoodQuote,
     handleLatestKlineCloseChange,
   } = useContractMarketView({
     contractSymbol,
-    interval: effectiveKlineInterval,
     symbolOptionMarketSymbol: symbolOption?.marketSymbol,
     symbolOptionPricePrecision: currentContractPair?.pricePrecision ?? symbolOption?.pricePrecision,
     fallbackMarketStatus: activeContractTicker?.market_status || currentContractPair?.marketStatus,
@@ -477,79 +437,10 @@ function ContractPageContent() {
     fallbackMarketSessionType: activeContractTicker?.market_session_type || currentContractPair?.marketSessionType,
     fallbackQuoteFreshness: activeContractTicker?.quote_freshness,
   });
-  const marketViewCategory = normalizeContractCategoryValue(activeContractMarketView?.category);
-  const isCryptoContract = isCryptoContractPair(currentContractPair)
-    || marketViewCategory === 'CRYPTO'
-    || isKnownCryptoContractSymbol(contractSymbol)
-    || (!!symbolOption && !currentContractPair);
   const currentPriceDisplay = currentPriceReady
     ? formatPrice(currentPriceNumber, pricePrecision)
     : '--';
-  const headerDisplayPrice = currentPriceDisplay;
-  const headerMainPrice = currentPriceDisplay;
-  const displayLastPrice = currentPriceDisplay;
-  const lastGoodQuotePrice = formatPrice(contractQuote?.last_price, pricePrecision);
   const tpSlTriggerPriceType = normalizeTpSlTriggerPriceType(currentContractPair?.tpSlTriggerPriceType);
-  const headerMetrics = useMemo<HeaderMetric[]>(() => {
-    const bid = formatPrice(hookBestBid, pricePrecision);
-    const ask = formatPrice(hookBestAsk, pricePrecision);
-    const spread = formatPrice(hookSpread, pricePrecision);
-    const highLow = `${formatPrice(activeContractTicker?.high_24h, pricePrecision)} / ${formatPrice(activeContractTicker?.low_24h, pricePrecision)}`;
-    const volumeTurnover = `${formatCompactAmount(activeContractTicker?.base_volume_24h)} / ${formatCompactAmount(activeContractTicker?.quote_volume_24h)}`;
-    const bidAskSpread = `${bid} / ${ask} / ${spread}`;
-    if (isCryptoContract) {
-      return [
-        {
-          label: `${t('markPrice', 'contracts')} / ${t('indexPrice', 'contracts')} / 资金费率`,
-          value: `${formatPrice(contractQuote?.mark_price, pricePrecision)} / ${formatPrice(contractQuote?.index_price, pricePrecision)} / ${formatFundingPercent(contractQuote?.funding_rate)}`,
-        },
-        { label: '24h高 / 低', value: highLow },
-        { label: '24h量 / 额', value: volumeTurnover },
-        { label: '买 / 卖 / 差', value: bidAskSpread },
-      ];
-    }
-
-    if (expiredLastGoodQuote) {
-      return [
-        {
-          label: `${currentPriceSourceLabel} / ${t('markLatest', 'contracts')}`,
-          value: `${headerDisplayPrice} / ${lastGoodQuotePrice}`,
-          subValue: quoteStatusLabel,
-        },
-        { label: '买 / 卖 / 差', value: bidAskSpread },
-        { label: '24h高 / 低', value: highLow },
-      ];
-    }
-
-    return [
-      {
-        label: `${t('markLatest', 'contracts')} / ${currentPriceSourceLabel}`,
-        value: `${formatPrice(contractQuote?.mark_price, pricePrecision)} / ${displayLastPrice}`,
-      },
-      { label: '买 / 卖 / 差', value: bidAskSpread },
-      { label: '24h高 / 低', value: highLow },
-    ];
-  }, [
-    activeContractTicker?.base_volume_24h,
-    contractQuote?.index_price,
-    contractQuote?.funding_rate,
-    contractQuote?.mark_price,
-    activeContractTicker?.high_24h,
-    activeContractTicker?.low_24h,
-    activeContractTicker?.quote_volume_24h,
-    currentPriceSourceLabel,
-    displayLastPrice,
-    expiredLastGoodQuote,
-    headerDisplayPrice,
-    isCryptoContract,
-    lastGoodQuotePrice,
-    hookBestAsk,
-    hookBestBid,
-    hookSpread,
-    pricePrecision,
-    quoteStatusLabel,
-    t,
-  ]);
   const headerChange = formatHeaderChange(
     getTickerChangeAmount(activeContractTicker),
     getTickerChangePercent(activeContractTicker),
@@ -777,21 +668,27 @@ function ContractPageContent() {
       <div className="w-full px-2 py-2 xl:px-3 xl:py-2">
         <ContractMarketHeader
           marketSymbol={marketSymbol}
-          price={headerMainPrice}
+          displayPrice={currentPriceDisplay}
           change={headerChange}
           quoteStatusLabel={quoteStatusLabel}
           quoteStatusTone={quoteStatusTone}
-          metrics={headerMetrics}
           hint={quoteHint}
           marketStatus={contractMarketStatus}
-          marketStatusText={contractMarketStatusText}
           tickerSource={tickerSource}
           tickerFreshness={tickerFreshness}
           marketSessionType={contractMarketSessionType}
           executable={contractExecutable}
           priceDirection={currentPriceDirection}
-          priceSource={currentPriceSource}
-          priceSourceLabel={currentPriceSourceLabel}
+          displayPriceSource={currentPriceSource}
+          displayPriceLabel={currentPriceSourceLabel}
+          markPrice={formatPrice(contractQuote?.mark_price, pricePrecision)}
+          indexPrice={formatPrice(contractQuote?.index_price, pricePrecision)}
+          fundingRate={formatFundingPercent(contractQuote?.funding_rate)}
+          bestBid={formatPrice(hookBestBid, pricePrecision)}
+          bestAsk={formatPrice(hookBestAsk, pricePrecision)}
+          spread={formatPrice(hookSpread, pricePrecision)}
+          highLow24h={`${formatPrice(activeContractTicker?.high_24h, pricePrecision)} / ${formatPrice(activeContractTicker?.low_24h, pricePrecision)}`}
+          volumeTurnover24h={`${formatCompactAmount(activeContractTicker?.base_volume_24h)} / ${formatCompactAmount(activeContractTicker?.quote_volume_24h)}`}
           symbolSelector={(
             <GlobalMarketSelector
               pageType="contract"
@@ -835,6 +732,8 @@ function ContractPageContent() {
                   onIntervalChange={handleContractIntervalChange}
                   pricePrecision={pricePrecision}
                   amountPrecision={currentContractPair?.amountPrecision}
+                  displayPrice={currentPriceNumber}
+                  priceDirection={currentPriceDirection}
                   onLatestKlineCloseChange={handleLatestKlineCloseChange}
                 />
               </div>
@@ -969,6 +868,7 @@ function ContractPageContent() {
                 executable={contractExecutable}
                 reasonCode={reasonCode}
                 pricePrecision={pricePrecision}
+                amountPrecision={currentContractPair?.amountPrecision}
                 quantityUnit={quantityUnit}
                 maxLeverage={maxLeverage}
                 availableMargin={account?.available_margin}

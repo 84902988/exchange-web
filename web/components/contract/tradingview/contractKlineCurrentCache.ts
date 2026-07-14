@@ -19,6 +19,7 @@ export type ContractKlineCurrentCacheKeyParams = {
 
 type ContractKlineCurrentCacheEntry = {
   response: ContractMarketKlineMetadataResponse;
+  coverage: number;
   writtenAt: number;
   expiresAt: number;
 };
@@ -103,6 +104,14 @@ export function buildContractKlineCurrentCacheKey(params: ContractKlineCurrentCa
   ].join('|');
 }
 
+function buildContractKlineCurrentCacheScopeKey(params: ContractKlineCurrentCacheKeyParams) {
+  return [
+    normalizeContractKlineAssetClass(params.category),
+    normalizeSymbol(params.symbol),
+    normalizeInterval(params.interval),
+  ].join('|');
+}
+
 export function isContractKlineCurrentResponseCacheable(value: unknown) {
   const record = toRecord(value);
   if (!record || !Array.isArray(record.items) || record.items.length === 0) return false;
@@ -149,6 +158,21 @@ export class ContractKlineCurrentCache {
     return cloneContractKlineMetadataResponse(entry.response);
   }
 
+  getAtLeast(params: ContractKlineCurrentCacheKeyParams) {
+    const scopePrefix = `${buildContractKlineCurrentCacheScopeKey(params)}|`;
+    const minimumLimit = Math.max(1, Math.ceil(Number(params.limit) || 1));
+    let bestEntry: ContractKlineCurrentCacheEntry | null = null;
+    for (const [key, entry] of this.entries) {
+      if (!key.startsWith(scopePrefix) || entry.coverage < minimumLimit) continue;
+      if (entry.expiresAt <= this.now()) {
+        this.entries.delete(key);
+        continue;
+      }
+      if (!bestEntry || entry.coverage < bestEntry.coverage) bestEntry = entry;
+    }
+    return bestEntry ? cloneContractKlineMetadataResponse(bestEntry.response) : null;
+  }
+
   set(
     params: ContractKlineCurrentCacheKeyParams,
     response: ContractMarketKlineMetadataResponse,
@@ -160,6 +184,10 @@ export class ContractKlineCurrentCache {
     this.entries.delete(key);
     this.entries.set(key, {
       response: cloneContractKlineMetadataResponse(response),
+      coverage: Math.min(
+        Math.max(1, Math.ceil(Number(params.limit) || 1)),
+        response.items.length,
+      ),
       writtenAt,
       expiresAt: writtenAt + normalizeTtlMs(ttlMs),
     });

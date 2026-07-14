@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useEffect, useMemo } from 'react';
 import {
   type ContractMarketTrade,
 } from '@/lib/api/modules/contract';
@@ -12,6 +12,10 @@ import {
   getContractMarketSourceTone,
   getContractMarketSourceToneClass,
 } from './contractMarketSourceStatus';
+import {
+  type ContractTradesStoreSnapshot,
+  useContractTradesStoreSnapshot,
+} from './hooks/contractMarketStoreAdapter';
 
 type PriceDirection = 'up' | 'down' | 'flat';
 
@@ -26,6 +30,26 @@ type ContractFuturesTradesProps = {
   latestPriceDirection?: PriceDirection;
   onPriceClick?: (price: string) => void;
   onPriceSelect?: (price: string) => void;
+};
+
+type ContractTradesLegacyRead = {
+  trades: ContractMarketTrade[];
+  loading: boolean;
+  error: string | null;
+  status: string | null;
+  source: string | null;
+  freshness: string | null;
+};
+
+export type ContractTradesMarketRead = ContractTradesLegacyRead & {
+  authority: 'STORE' | 'LEGACY_FALLBACK';
+  symbol: string | null;
+};
+
+export type ContractTradesReadDifference = {
+  field: 'trade_count' | 'trade_ids' | 'latest_trade' | 'source' | 'freshness';
+  store: unknown;
+  legacy: unknown;
 };
 
 function toNumber(value?: string | number | null) {
@@ -49,13 +73,94 @@ function formatTime(value: number) {
   return date.toLocaleTimeString('zh-CN', { hour12: false });
 }
 
+function isRenderableRealTrade(trade: ContractMarketTrade): boolean {
+  const synthetic = trade.synthetic === true || [
+    trade.price_source,
+    trade.source,
+    trade.quote_source,
+  ].some((value) => String(value ?? '').trim().toUpperCase().includes('SYNTHETIC'));
+  return !synthetic
+    && String(trade.id ?? '').trim().length > 0
+    && Number.isFinite(Number(trade.price))
+    && Number(trade.price) > 0
+    && Number.isFinite(Number(trade.qty))
+    && Number(trade.qty) > 0
+    && Number.isFinite(Number(trade.time))
+    && Number(trade.time) > 0;
+}
+
+function comparableTrade(trade: ContractMarketTrade | undefined) {
+  if (!trade) return null;
+  return {
+    id: String(trade.id),
+    price: String(trade.price),
+    qty: String(trade.qty),
+    time: Number(trade.time),
+  };
+}
+
+export function resolveContractTradesMarketRead(
+  store: ContractTradesStoreSnapshot | null,
+  legacy: ContractTradesLegacyRead,
+): ContractTradesMarketRead {
+  if (!store || legacy.loading) {
+    return {
+      ...legacy,
+      authority: 'LEGACY_FALLBACK',
+      symbol: null,
+    };
+  }
+  return {
+    trades: store.trades,
+    loading: false,
+    error: null,
+    status: legacy.status,
+    source: store.source,
+    freshness: store.freshness,
+    authority: 'STORE',
+    symbol: store.symbol,
+  };
+}
+
+export function getContractTradesReadDifferences(
+  store: ContractTradesStoreSnapshot | null,
+  legacy: ContractTradesLegacyRead,
+): ContractTradesReadDifference[] {
+  if (!store) return [];
+  const differences: ContractTradesReadDifference[] = [];
+  if (store.trades.length !== legacy.trades.length) {
+    differences.push({
+      field: 'trade_count',
+      store: store.trades.length,
+      legacy: legacy.trades.length,
+    });
+  }
+  const storeIds = store.trades.map((trade) => String(trade.id));
+  const legacyIds = legacy.trades.map((trade) => String(trade.id));
+  if (storeIds.join('|') !== legacyIds.join('|')) {
+    differences.push({ field: 'trade_ids', store: storeIds, legacy: legacyIds });
+  }
+  const storeLatest = comparableTrade(store.trades[0]);
+  const legacyLatest = comparableTrade(legacy.trades[0]);
+  if (JSON.stringify(storeLatest) !== JSON.stringify(legacyLatest)) {
+    differences.push({ field: 'latest_trade', store: storeLatest, legacy: legacyLatest });
+  }
+  if ((store.source ?? null) !== (legacy.source ?? null)) {
+    differences.push({ field: 'source', store: store.source, legacy: legacy.source });
+  }
+  if ((store.freshness ?? null) !== (legacy.freshness ?? null)) {
+    differences.push({ field: 'freshness', store: store.freshness, legacy: legacy.freshness });
+  }
+  return differences;
+}
+
 export default function ContractFuturesTrades({
-  trades = [],
-  loading = false,
-  error,
-  status,
-  source,
-  freshness,
+  trades: legacyTrades = [],
+  loading: legacyLoading = false,
+  error: legacyError,
+  status: legacyStatus,
+  source: legacySource,
+  freshness: legacyFreshness,
   pricePrecision,
   latestPriceDirection,
   onPriceClick,
@@ -63,6 +168,50 @@ export default function ContractFuturesTrades({
 }: ContractFuturesTradesProps) {
   const { t } = useLocaleContext();
   const handlePriceSelect = onPriceClick || onPriceSelect;
+  const storeSnapshot = useContractTradesStoreSnapshot();
+  const legacyRead = useMemo<ContractTradesLegacyRead>(() => ({
+    trades: legacyTrades.filter(isRenderableRealTrade),
+    loading: legacyLoading,
+    error: legacyError ?? null,
+    status: legacyStatus ?? null,
+    source: legacySource ?? null,
+    freshness: legacyFreshness ?? null,
+  }), [
+    legacyError,
+    legacyFreshness,
+    legacyLoading,
+    legacySource,
+    legacyStatus,
+    legacyTrades,
+  ]);
+  const marketRead = useMemo(
+    () => resolveContractTradesMarketRead(storeSnapshot, legacyRead),
+    [legacyRead, storeSnapshot],
+  );
+  const readDifferences = useMemo(
+    () => getContractTradesReadDifferences(storeSnapshot, legacyRead),
+    [legacyRead, storeSnapshot],
+  );
+  useEffect(() => {
+    if (marketRead.authority !== 'STORE' || !storeSnapshot || readDifferences.length === 0) return;
+    console.info('[contract-trades-domain-diff]', {
+      symbol: storeSnapshot.symbol,
+      provider: storeSnapshot.provider,
+      providerGeneration: storeSnapshot.providerGeneration,
+      revision: storeSnapshot.revision,
+      observedAtMs: storeSnapshot.observedAtMs,
+      differences: readDifferences,
+    });
+  }, [marketRead.authority, readDifferences, storeSnapshot]);
+
+  const {
+    trades,
+    loading,
+    error,
+    status,
+    source,
+    freshness,
+  } = marketRead;
   const normalizedStatus = String(status || '').trim().toUpperCase();
   const hasTradesSourceStatus = !!source || !!freshness;
   const tradesSourceTone = getContractMarketSourceTone(source, freshness);
@@ -80,7 +229,7 @@ export default function ContractFuturesTrades({
       const prevPrice = next ? toNumber(next.price) : currentPrice;
       return {
         ...item,
-        direction: index === 0 && latestPriceDirection
+        direction: marketRead.authority === 'LEGACY_FALLBACK' && index === 0 && latestPriceDirection
           ? latestPriceDirection
           : currentPrice > prevPrice
             ? 'up'
@@ -89,10 +238,17 @@ export default function ContractFuturesTrades({
               : 'flat',
       };
     });
-  }, [latestPriceDirection, trades]);
+  }, [latestPriceDirection, marketRead.authority, trades]);
 
   return (
-    <div className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2">
+    <div
+      className="tabular-nums flex h-full min-h-0 min-w-0 flex-col bg-[#11161d] px-2.5 py-2"
+      data-market-authority={marketRead.authority}
+      data-market-symbol={marketRead.symbol || undefined}
+      data-provider-generation={marketRead.authority === 'STORE'
+        ? storeSnapshot?.providerGeneration ?? undefined
+        : undefined}
+    >
       {tradesSourceStatusLabel || normalizedStatus === 'CLOSED' ? (
         <div className="mb-1.5 flex min-h-5 items-center gap-2 px-1">
           {tradesSourceStatusLabel ? (

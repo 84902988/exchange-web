@@ -37,7 +37,10 @@ from app.services.contract_market_service import (
 from app.services.contract_market_gateway import contract_market_gateway
 from app.services.contract_market_view import get_contract_market_view
 from app.services.contract_market_ws import (
+    contract_ws_payload_action,
     contract_market_ws_manager,
+    handle_contract_ws_domain_command,
+    handle_contract_ws_legacy_subscribe,
     normalize_contract_ws_interval,
     normalize_contract_ws_symbol,
 )
@@ -73,8 +76,7 @@ def _parse_ws_receive(message: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         except Exception:
             return "", {}
         if isinstance(parsed, dict):
-            action = str(parsed.get("type") or parsed.get("action") or "").strip().lower()
-            return action, parsed
+            return contract_ws_payload_action(parsed), parsed
         return "", {}
 
     if message.get("bytes") is not None:
@@ -83,8 +85,7 @@ def _parse_ws_receive(message: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         except Exception:
             return "", {}
         if isinstance(parsed, dict):
-            action = str(parsed.get("type") or parsed.get("action") or "").strip().lower()
-            return action, parsed
+            return contract_ws_payload_action(parsed), parsed
     return "", {}
 
 
@@ -169,25 +170,29 @@ async def contract_market_public_ws(
             if action == "ping":
                 await websocket.send_json({"type": "pong"})
                 continue
-            if action == "subscribe":
-                next_symbol = normalize_contract_ws_symbol(payload.get("symbol") or connected_symbol)
-                next_interval = normalize_contract_ws_interval(payload.get("interval") or connected_interval)
-                if not next_symbol:
-                    continue
-                previous_symbol = connected_symbol
-                connected_symbol = next_symbol
-                connected_interval = next_interval
-                await contract_market_ws_manager.connect(
-                    connected_symbol,
-                    websocket,
-                    interval=connected_interval,
-                    accepted=True,
-                )
-                if previous_symbol != connected_symbol:
-                    await contract_market_gateway.release_symbol_if_idle(previous_symbol)
-                snapshot = await contract_market_gateway.snapshot(connected_symbol, connected_interval)
-                await contract_market_ws_manager.send_to_one(websocket, snapshot)
-                await contract_market_gateway.ensure_symbol(connected_symbol)
+            domain_result = await handle_contract_ws_domain_command(
+                action=action,
+                payload=payload,
+                websocket=websocket,
+                manager=contract_market_ws_manager,
+                gateway=contract_market_gateway,
+                connected_symbol=connected_symbol,
+                connected_interval=connected_interval,
+            )
+            if domain_result is not None:
+                connected_symbol, connected_interval = domain_result
+                continue
+            legacy_result = await handle_contract_ws_legacy_subscribe(
+                action=action,
+                payload=payload,
+                websocket=websocket,
+                manager=contract_market_ws_manager,
+                gateway=contract_market_gateway,
+                connected_symbol=connected_symbol,
+                connected_interval=connected_interval,
+            )
+            if legacy_result is not None:
+                connected_symbol, connected_interval = legacy_result
     finally:
         if manager_connected:
             disconnected_symbol = await contract_market_ws_manager.disconnect(websocket)

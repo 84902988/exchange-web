@@ -9,12 +9,25 @@ import {
   contractMarketRealtime,
   type ContractMarketRealtimeMessage,
 } from '@/lib/realtime/contractMarketRealtime';
+import {
+  contractMarketStore,
+  selectContractMarketKlineEntry,
+  subscribeContractMarketKlineEntry,
+  type ContractMarketStoreEntry,
+} from '@/lib/realtime/contractMarketStore';
 import { contractKlineCurrentCache } from './contractKlineCurrentCache';
 import {
   getContractKlineCurrentCacheTtlMs,
   normalizeContractKlineAssetClass,
   type ContractKlineAssetClass,
 } from './contractKlineCachePolicy';
+import {
+  buildContractKlineRangeKey,
+  CONTRACT_KLINE_HISTORY_CHAIN_PAGE_LIMIT,
+  getContractKlineLoadPolicy,
+  resolveContractKlineRequestPlan,
+} from './contractKlineLoadPolicy';
+import { contractKlineRequestLeaseRegistry } from './contractKlinePreloadManager';
 
 export type ContractTradingViewResolution = '1' | '5' | '15' | '30' | '60' | '240' | '1D' | '1W' | '1M';
 
@@ -142,6 +155,8 @@ export type ContractHistoryBarsEvent = {
   resolution: string;
   firstDataRequest: boolean;
   barCount: number;
+  firstBarTime: number | null;
+  lastBarTime: number | null;
   requestSeq: number;
 };
 
@@ -150,9 +165,18 @@ export type ContractHistoryErrorEvent = Omit<ContractHistoryBarsEvent, 'barCount
 };
 
 type SubscriptionEntry = {
+  subscriberUid: string;
+  symbol: string;
+  interval: string;
+  ownerId: string;
+  generation: number;
   latestBarKey: string;
   lastEmittedBarTime: number;
-  unsubscribe: () => void;
+  lastEmittedBarFingerprint: string;
+  lastStoreBarTime: number;
+  legacyVersionCursor: KlineVersionCursor | null;
+  releaseKlineSubscription: () => void;
+  callback: DatafeedCallbacks['onRealtime'];
 };
 
 const SUPPORTED_RESOLUTIONS: ContractTradingViewResolution[] = ['1', '5', '15', '30', '60', '240', '1D', '1W', '1M'];
@@ -215,59 +239,45 @@ type ContractKlineInFlightRequest = {
   endTimeMs?: number | null;
 };
 
-const CONTRACT_KLINE_CURRENT_REQUEST_KEY = 'CURRENT';
 export const CONTRACT_KLINE_MAX_HISTORY_PAGES = 3;
 export const CONTRACT_KLINE_MAX_ACCUMULATED_BARS = 1000;
-export const CONTRACT_KLINE_HISTORY_PAGE_LIMIT = 300;
-const contractKlineMetadataInFlight = new Map<
-  string,
-  Promise<ContractMarketKlineMetadataResponse>
->();
+export const CONTRACT_KLINE_HISTORY_PAGE_LIMIT = CONTRACT_KLINE_HISTORY_CHAIN_PAGE_LIMIT;
 
 export function buildContractKlineInFlightKey(params: ContractKlineInFlightRequest) {
-  const requestSymbol = normalizeContractSymbol(params.symbol);
-  const requestInterval = normalizeContractInterval(params.interval);
-  const requestEndTime = params.endTimeMs === undefined || params.endTimeMs === null
-    ? CONTRACT_KLINE_CURRENT_REQUEST_KEY
-    : String(params.endTimeMs);
-  return `${requestSymbol}|${requestInterval}|${requestEndTime}|${params.limit}`;
+  return buildContractKlineRangeKey(params);
 }
 
 function getContractMarketKlinesMetadataInFlight(
   params: Omit<ContractKlineInFlightRequest, 'endTimeMs'> & { endTimeMs?: number },
+  deadlineAt?: number,
 ) {
   const key = buildContractKlineInFlightKey(params);
-  const existing = contractKlineMetadataInFlight.get(key);
-  if (existing) return existing;
-
-  let request: Promise<ContractMarketKlineMetadataResponse>;
-  try {
-    request = getContractMarketKlinesMetadata(params);
-  } catch (error) {
-    request = Promise.reject(error);
-  }
-  contractKlineMetadataInFlight.set(key, request);
-
-  const cleanup = () => {
-    if (contractKlineMetadataInFlight.get(key) === request) {
-      contractKlineMetadataInFlight.delete(key);
-    }
-  };
-  void request.then(cleanup, cleanup);
-  return request;
+  const policy = getContractKlineLoadPolicy(params.interval);
+  return contractKlineRequestLeaseRegistry.request({
+    key,
+    coverage: params.limit,
+    role: 'active',
+    deadlineMs: policy.requestDeadlineMs,
+    deadlineAt,
+    request: (coverage) => getContractMarketKlinesMetadata({
+      ...params,
+      limit: coverage,
+    }),
+  });
 }
 
 async function getContractMarketKlinesMetadataCurrentCacheFirst(
   params: Omit<ContractKlineInFlightRequest, 'endTimeMs'>,
   category: ContractKlineAssetClass,
+  deadlineAt?: number,
 ) {
   const cacheParams = { ...params, category };
-  const cached = contractKlineCurrentCache.get(cacheParams);
+  const cached = contractKlineCurrentCache.getAtLeast(cacheParams);
   if (cached) return cached;
   const result = await getContractMarketKlinesMetadataInFlight({
     ...params,
     endTimeMs: undefined,
-  });
+  }, deadlineAt);
   contractKlineCurrentCache.set(
     cacheParams,
     result,
@@ -301,12 +311,6 @@ function getPriceScale(precision?: number | null) {
     return 100;
   }
   return Math.max(1, 10 ** nextPrecision);
-}
-
-function clampKlineLimit(value: unknown) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return 300;
-  return Math.min(1000, Math.max(50, Math.ceil(numeric)));
 }
 
 function normalizeTimeMs(value: unknown) {
@@ -360,6 +364,7 @@ export function realtimeMessageToBar(
 ): ContractTradingViewBar | null {
   const type = String(message.type || '').toLowerCase();
   if (type !== 'contract_kline_update') return null;
+  if (message.domain && String(message.domain).trim().toLowerCase() !== 'kline') return null;
 
   const payload = toRecord(message.kline) || toRecord(message.data);
   if (!payload) return null;
@@ -385,11 +390,203 @@ export function realtimeMessageToBar(
   });
 }
 
+function readStoreKlinePayload(value: unknown): Record<string, unknown> | null {
+  if (Array.isArray(value)) {
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+      const item = toRecord(value[index]);
+      if (item) return item;
+    }
+    return null;
+  }
+  const record = toRecord(value);
+  if (!record) return null;
+  if (
+    record.open !== undefined
+    && record.high !== undefined
+    && record.low !== undefined
+    && record.close !== undefined
+  ) return record;
+  for (const key of ['kline', 'candle', 'kline_current_candle', 'data']) {
+    const nested = toRecord(record[key]);
+    if (nested) return nested;
+  }
+  for (const key of ['items', 'klines', 'rows']) {
+    const items = record[key];
+    if (!Array.isArray(items)) continue;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = toRecord(items[index]);
+      if (item) return item;
+    }
+  }
+  return null;
+}
+
+export function storeKlineEntryToBar(
+  entry: ContractMarketStoreEntry | null,
+  expectedSymbol: string,
+  expectedInterval: string,
+): ContractTradingViewBar | null {
+  if (!entry || entry.domain !== 'kline' || entry.stale) return null;
+  const symbol = normalizeContractSymbol(entry.symbol);
+  const interval = normalizeContractInterval(entry.interval || '');
+  if (symbol !== normalizeContractSymbol(expectedSymbol)) return null;
+  if (interval !== normalizeContractInterval(expectedInterval)) return null;
+  const payload = readStoreKlinePayload(entry.data);
+  if (!payload || payload.stale === true) return null;
+  const payloadSymbol = normalizeContractSymbol(String(payload.symbol || ''));
+  if (payloadSymbol && payloadSymbol !== symbol) return null;
+  const payloadInterval = normalizeContractInterval(String(payload.interval || ''));
+  if (payloadInterval && payloadInterval !== interval) return null;
+
+  return klineToBar({
+    open_time: (payload.open_time ?? payload.time ?? payload.timestamp) as string | number | undefined,
+    open: payload.open as string | number,
+    high: payload.high as string | number,
+    low: payload.low as string | number,
+    close: payload.close as string | number,
+    volume: (payload.volume ?? 0) as string | number,
+    source: payload.source ?? entry.source,
+    quote_source: payload.quote_source,
+    kline_mode: payload.kline_mode,
+    price_source: payload.price_source,
+  });
+}
+
+function realtimeBarFingerprint(bar: ContractTradingViewBar) {
+  return [bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume ?? 0].join('|');
+}
+
+type KlineVersionCursor = {
+  providerGeneration: number | null;
+  revisionEpoch: number | null;
+  revisionSequence: number | null;
+  observedAtMs: number;
+};
+
+function readVersionNumber(records: Array<Record<string, unknown> | null>, ...keys: string[]) {
+  for (const record of records) {
+    if (!record) continue;
+    for (const key of keys) {
+      const value = record[key];
+      if (value === null || value === undefined || value === '') continue;
+      const numeric = Number(value);
+      if (Number.isFinite(numeric) && numeric >= 0) return numeric;
+    }
+  }
+  return null;
+}
+
+function realtimeMessageVersion(
+  message: ContractMarketRealtimeMessage,
+  bar: ContractTradingViewBar,
+): KlineVersionCursor {
+  const messageRecord = message as Record<string, unknown>;
+  const payload = toRecord(message.kline) || toRecord(message.data);
+  const revision = toRecord(payload?.revision) || toRecord(messageRecord.revision);
+  const records = [payload, messageRecord];
+  return {
+    providerGeneration: readVersionNumber(
+      records,
+      'provider_generation',
+      'providerGeneration',
+      'generation',
+    ),
+    revisionEpoch: readVersionNumber(
+      [revision, ...records],
+      'epoch',
+      'revision_epoch',
+    ),
+    revisionSequence: readVersionNumber(
+      [revision, ...records],
+      'sequence',
+      'revision_sequence',
+      'revision_seq',
+    ),
+    observedAtMs: readVersionNumber(
+      records,
+      'provider_event_time_ms',
+      'event_time_ms',
+      'updated_at_ms',
+      'received_at_ms',
+    ) ?? bar.time,
+  };
+}
+
+function storeEntryVersion(entry: ContractMarketStoreEntry): KlineVersionCursor {
+  return {
+    providerGeneration: entry.providerGeneration,
+    revisionEpoch: entry.revision?.epoch ?? null,
+    revisionSequence: entry.revision?.sequence ?? null,
+    observedAtMs: entry.observedAtMs,
+  };
+}
+
+function acceptsKlineVersion(
+  current: KlineVersionCursor | null,
+  incoming: KlineVersionCursor,
+): boolean {
+  if (!current) return true;
+  let generationAdvanced = false;
+  if (current.providerGeneration !== null) {
+    if (incoming.providerGeneration === null) return false;
+    if (incoming.providerGeneration < current.providerGeneration) return false;
+    generationAdvanced = incoming.providerGeneration > current.providerGeneration;
+  } else if (incoming.providerGeneration !== null) {
+    generationAdvanced = true;
+  }
+  if (generationAdvanced) return true;
+
+  let revisionAdvanced = false;
+  if (current.revisionEpoch !== null) {
+    if (incoming.revisionEpoch === null) return false;
+    if (incoming.revisionEpoch < current.revisionEpoch) return false;
+    revisionAdvanced = incoming.revisionEpoch > current.revisionEpoch;
+  }
+  if (!revisionAdvanced && current.revisionSequence !== null) {
+    if (incoming.revisionSequence === null) return false;
+    if (incoming.revisionSequence < current.revisionSequence) return false;
+    revisionAdvanced = incoming.revisionSequence > current.revisionSequence;
+  }
+  return revisionAdvanced || incoming.observedAtMs >= current.observedAtMs;
+}
+
 export function resolveContractHistoryEndTimeMs(periodParams: TradingViewPeriodParams) {
   if (periodParams.firstDataRequest !== false) return undefined;
   const to = Number(periodParams.to);
   if (!Number.isFinite(to) || to <= 0) return undefined;
   return Math.floor(to * 1000);
+}
+
+function isContractHistoryMetaTrue(value: unknown) {
+  return value === true || value === 1 || String(value ?? '').trim().toLowerCase() === 'true';
+}
+
+export function hasExplicitContractHistoryTerminalEvidence(result: unknown) {
+  const record = toRecord(result);
+  if (!record || !Array.isArray(record.items)) return false;
+  const explicitTerminal = (
+    isContractHistoryMetaTrue(record.history_terminal)
+    || (record.history_complete === true && record.has_more_before === false)
+  );
+  if (!explicitTerminal) return false;
+  if (record.stale !== false || record.history_incomplete !== false || record.retryable !== false) {
+    return false;
+  }
+  if (
+    record.provider_error_code !== null
+    && record.provider_error_code !== undefined
+    && String(record.provider_error_code).trim() !== ''
+  ) return false;
+  const cacheStatus = String(record.cache_status || '').trim().toUpperCase();
+  return ![
+    'PROVIDER_EMPTY',
+    'TIMEOUT',
+    'ERROR',
+    'STALE',
+    'SHORT',
+    'CONTINUITY_INVALID',
+    'COVERAGE_INVALID',
+  ].includes(cacheStatus);
 }
 
 export function shouldReportContractHistoryNoData(result: unknown) {
@@ -398,9 +595,43 @@ export function shouldReportContractHistoryNoData(result: unknown) {
     record
     && Array.isArray(record.items)
     && record.items.length === 0
-    && record.history_complete === true
-    && record.has_more_before === false
+    && hasExplicitContractHistoryTerminalEvidence(record)
+  );
+}
+
+function getContractHistoryTerminalBoundaryMs(
+  result: ContractMarketKlineMetadataResponse | null,
+) {
+  const record = toRecord(result);
+  return normalizeTimeMs(record?.earliest_available_time);
+}
+
+function getContractHistoryTerminalReason(
+  result: ContractMarketKlineMetadataResponse | null,
+) {
+  const record = toRecord(result);
+  const reason = String(record?.terminal_reason || '').trim();
+  if (reason) return reason;
+  return hasExplicitContractHistoryTerminalEvidence(result) ? 'HISTORY_TERMINAL' : null;
+}
+
+function getContractHistoryErrorReason(
+  result: ContractMarketKlineMetadataResponse | null,
+  fallback = 'Kline history returned no terminal evidence',
+) {
+  const record = toRecord(result);
+  const providerErrorCode = String(record?.provider_error_code || '').trim();
+  return providerErrorCode ? `Kline history unavailable: ${providerErrorCode}` : fallback;
+}
+
+function shouldRetainContractHistoryCoverage(result: unknown) {
+  const record = toRecord(result);
+  return Boolean(
+    record
+    && Array.isArray(record.items)
+    && record.stale === false
     && record.history_incomplete === false
+    && record.provider_error_code === null
     && record.retryable === false
   );
 }
@@ -421,16 +652,40 @@ type LoadContractKlineBarsForCountBackOptions = {
   interval: string;
   initialLimit: number;
   initialEndTimeMs?: number;
+  initialBars?: ContractTradingViewBar[];
   useCurrentCache: boolean;
   requiredBars: number;
+  pageLimit: number;
   toTimeMs: number;
+  deadlineAt: number;
   isActive: () => boolean;
 };
 
 type LoadContractKlineBarsForCountBackResult = {
   bars: ContractTradingViewBar[];
+  lastMetadata: ContractMarketKlineMetadataResponse | null;
   terminalMetadata: ContractMarketKlineMetadataResponse | null;
   pageCount: number;
+  coverageReusable: boolean;
+  coverageComplete: boolean;
+  nextEndTimeMs: number | null;
+  terminalComplete: boolean;
+  terminalBoundary: number | null;
+  terminalReason: string | null;
+};
+
+export type HistoryCoverageState = {
+  symbol: string;
+  interval: string;
+  generation: string;
+  currentCacheLimit: number | null;
+  requestedBars: number;
+  returnedBars: ContractTradingViewBar[];
+  coverageComplete: boolean;
+  nextEndTimeMs: number | null;
+  terminalComplete: boolean;
+  terminalBoundary: number | null;
+  terminalReason: string | null;
 };
 
 async function loadContractKlineBarsForCountBack({
@@ -439,15 +694,25 @@ async function loadContractKlineBarsForCountBack({
   interval,
   initialLimit,
   initialEndTimeMs,
+  initialBars = [],
   useCurrentCache,
   requiredBars,
+  pageLimit,
   toTimeMs,
+  deadlineAt,
   isActive,
 }: LoadContractKlineBarsForCountBackOptions): Promise<LoadContractKlineBarsForCountBackResult> {
   const barsByTime = new Map<number, ContractTradingViewBar>();
+  sortAndDedupeBars(initialBars)
+    .slice(-CONTRACT_KLINE_MAX_ACCUMULATED_BARS)
+    .forEach((bar) => barsByTime.set(bar.time, bar));
   let pageCount = 0;
   let pageEndTimeMs = initialEndTimeMs;
+  let lastRequestedEndTimeMs = initialEndTimeMs;
   let terminalMetadata: ContractMarketKlineMetadataResponse | null = null;
+  let lastMetadata: ContractMarketKlineMetadataResponse | null = null;
+  let stalled = false;
+  let coverageReusable = true;
 
   while (
     pageCount < CONTRACT_KLINE_MAX_HISTORY_PAGES
@@ -455,18 +720,23 @@ async function loadContractKlineBarsForCountBack({
     && barsByTime.size < CONTRACT_KLINE_MAX_ACCUMULATED_BARS
     && isActive()
   ) {
+    if (Date.now() >= deadlineAt) {
+      if (barsByTime.size === 0) throw new Error('Contract kline history chain timed out');
+      break;
+    }
     const remainingBars = Math.min(
       requiredBars - barsByTime.size,
       CONTRACT_KLINE_MAX_ACCUMULATED_BARS - barsByTime.size,
     );
     const limit = pageCount === 0
       ? initialLimit
-      : Math.min(remainingBars, CONTRACT_KLINE_HISTORY_PAGE_LIMIT);
+      : Math.min(remainingBars, pageLimit, CONTRACT_KLINE_HISTORY_PAGE_LIMIT);
     const isCurrentFirstPage = (
       useCurrentCache
       && pageCount === 0
       && pageEndTimeMs === undefined
     );
+    lastRequestedEndTimeMs = pageEndTimeMs;
     pageCount += 1;
 
     let result: ContractMarketKlineMetadataResponse;
@@ -476,21 +746,25 @@ async function loadContractKlineBarsForCountBack({
           symbol,
           interval,
           limit,
-        }, category)
+        }, category, deadlineAt)
         : await getContractMarketKlinesMetadataInFlight({
           symbol,
           interval,
           limit,
           endTimeMs: pageEndTimeMs,
-        });
+        }, deadlineAt);
     } catch (error) {
-      if (pageCount === 1) throw error;
+      if (barsByTime.size === 0) throw error;
       break;
     }
 
     if (!isActive()) break;
     if (!result || !Array.isArray(result.items)) break;
-    if (shouldReportContractHistoryNoData(result)) {
+    lastMetadata = result;
+    if (!shouldRetainContractHistoryCoverage(result)) {
+      coverageReusable = false;
+    }
+    if (hasExplicitContractHistoryTerminalEvidence(result)) {
       terminalMetadata = result;
     }
 
@@ -503,7 +777,10 @@ async function loadContractKlineBarsForCountBack({
           && (pageEndTimeMs === undefined || bar.time < pageEndTimeMs)
         )),
     );
-    if (pageBars.length === 0) break;
+    if (pageBars.length === 0) {
+      stalled = !terminalMetadata;
+      break;
+    }
 
     const newTimestampCount = pageBars.reduce(
       (count, bar) => count + (barsByTime.has(bar.time) ? 0 : 1),
@@ -516,7 +793,10 @@ async function loadContractKlineBarsForCountBack({
     barsByTime.clear();
     cappedBars.forEach((bar) => barsByTime.set(bar.time, bar));
 
-    if (terminalMetadata || newTimestampCount === 0) break;
+    if (terminalMetadata || newTimestampCount === 0) {
+      stalled = !terminalMetadata && newTimestampCount === 0;
+      break;
+    }
     if (
       barsByTime.size >= requiredBars
       || barsByTime.size >= CONTRACT_KLINE_MAX_ACCUMULATED_BARS
@@ -536,10 +816,31 @@ async function loadContractKlineBarsForCountBack({
     pageEndTimeMs = earliestBarTime;
   }
 
+  const accumulatedBars = sortAndDedupeBars(Array.from(barsByTime.values()))
+    .slice(-CONTRACT_KLINE_MAX_ACCUMULATED_BARS);
+  const bars = accumulatedBars.slice(-requiredBars);
+  const terminalComplete = Boolean(terminalMetadata);
+  const coverageComplete = terminalComplete || bars.length >= requiredBars;
+  const earliestBarTime = accumulatedBars[0]?.time ?? null;
+  const explicitTerminalBoundary = getContractHistoryTerminalBoundaryMs(terminalMetadata);
+  const terminalBoundary = terminalComplete
+    ? explicitTerminalBoundary || earliestBarTime || lastRequestedEndTimeMs || initialEndTimeMs || null
+    : null;
+  const nextEndTimeMs = !terminalComplete && !stalled && earliestBarTime
+    ? earliestBarTime
+    : null;
+
   return {
-    bars: sortAndDedupeBars(Array.from(barsByTime.values())).slice(-requiredBars),
+    bars,
+    lastMetadata,
     terminalMetadata,
     pageCount,
+    coverageReusable,
+    coverageComplete,
+    nextEndTimeMs,
+    terminalComplete,
+    terminalBoundary,
+    terminalReason: getContractHistoryTerminalReason(terminalMetadata),
   };
 }
 
@@ -569,7 +870,7 @@ function advanceContractKlineHighWaterMark(key: string, time: number) {
 
 type ContractKlineRequestToken = {
   sequence: number;
-  key: string;
+  generation: string;
   settled: boolean;
   supersededSettlementScheduled: boolean;
   onSuperseded: () => void;
@@ -577,8 +878,8 @@ type ContractKlineRequestToken = {
 
 export class ContractKlineRequestGuard {
   private sequence = 0;
-  private activeKey = '';
-  private activeToken: ContractKlineRequestToken | null = null;
+  private activeGeneration = '';
+  private activeTokens = new Set<ContractKlineRequestToken>();
   private destroyed = false;
 
   private scheduleSupersededSettlement(token: ContractKlineRequestToken) {
@@ -588,25 +889,28 @@ export class ContractKlineRequestGuard {
       token.supersededSettlementScheduled = false;
       if (token.settled) return;
       token.settled = true;
+      this.activeTokens.delete(token);
       if (this.destroyed) return;
       token.onSuperseded();
     });
   }
 
-  begin(symbol: string, interval: string, onSuperseded: () => void): ContractKlineRequestToken {
-    if (this.activeToken) {
-      this.scheduleSupersededSettlement(this.activeToken);
+  begin(generation: string, onSuperseded: () => void): ContractKlineRequestToken {
+    if (this.activeGeneration && this.activeGeneration !== generation) {
+      for (const token of Array.from(this.activeTokens)) {
+        this.scheduleSupersededSettlement(token);
+      }
     }
     this.sequence += 1;
-    this.activeKey = buildLatestBarKey(symbol, interval);
+    this.activeGeneration = generation;
     const token = {
       sequence: this.sequence,
-      key: this.activeKey,
+      generation,
       settled: false,
       supersededSettlementScheduled: false,
       onSuperseded,
     };
-    this.activeToken = token;
+    this.activeTokens.add(token);
     return token;
   }
 
@@ -614,17 +918,13 @@ export class ContractKlineRequestGuard {
     if (this.destroyed || token.settled) {
       return false;
     }
-    if (
-      token !== this.activeToken
-      || token.sequence !== this.sequence
-      || token.key !== this.activeKey
-    ) {
+    if (token.generation !== this.activeGeneration || !this.activeTokens.has(token)) {
       this.scheduleSupersededSettlement(token);
       return false;
     }
 
     token.settled = true;
-    this.activeToken = null;
+    this.activeTokens.delete(token);
     callback();
     return true;
   }
@@ -633,19 +933,23 @@ export class ContractKlineRequestGuard {
     return Boolean(
       !this.destroyed
       && !token.settled
-      && token === this.activeToken
-      && token.sequence === this.sequence
-      && token.key === this.activeKey
+      && token.generation === this.activeGeneration
+      && this.activeTokens.has(token)
     );
   }
 
   destroy() {
     this.destroyed = true;
     this.sequence += 1;
-    this.activeKey = '';
-    this.activeToken = null;
+    this.activeGeneration = '';
+    for (const token of this.activeTokens) {
+      token.settled = true;
+    }
+    this.activeTokens.clear();
   }
 }
+
+let contractKlineDatafeedInstanceSequence = 0;
 
 function buildSymbolInfo(params: {
   symbol: string;
@@ -686,6 +990,7 @@ export function createContractTradingViewDatafeed({
   amountPrecision,
   onLatestBar,
   onHistoryBars,
+  onHistoryError,
 }: CreateContractTradingViewDatafeedOptions): ContractTradingViewDatafeed {
   const apiSymbol = normalizeContractSymbol(symbol);
   const assetClass = normalizeContractKlineAssetClass(category);
@@ -693,6 +998,9 @@ export function createContractTradingViewDatafeed({
   const latestBars = new Map<string, ContractTradingViewBar>();
   const subscriptions = new Map<string, SubscriptionEntry>();
   const requestGuard = new ContractKlineRequestGuard();
+  const datafeedInstanceId = ++contractKlineDatafeedInstanceSequence;
+  const historyCoverageByScope = new Map<string, HistoryCoverageState>();
+  let subscriptionGeneration = 0;
 
   const notifyLatestBar = (bar: ContractTradingViewBar | null) => {
     onLatestBar?.(bar ? String(bar.close) : null);
@@ -701,6 +1009,14 @@ export function createContractTradingViewDatafeed({
   const notifyHistoryBars = (event: ContractHistoryBarsEvent) => {
     try {
       onHistoryBars?.(event);
+    } catch {
+      // Observability callbacks must not change TradingView callback semantics.
+    }
+  };
+
+  const notifyHistoryError = (event: ContractHistoryErrorEvent) => {
+    try {
+      onHistoryError?.(event);
     } catch {
       // Observability callbacks must not change TradingView callback semantics.
     }
@@ -743,24 +1059,159 @@ export function createContractTradingViewDatafeed({
       }, 0);
     },
 
-    async getBars(symbolInfo, resolution, periodParams, onHistory) {
+    async getBars(symbolInfo, resolution, periodParams, onHistory, onError) {
       const requestSymbol = normalizeContractSymbol(symbolInfo.ticker || apiSymbol) || apiSymbol;
       const requestResolution = normalizeResolution(resolution);
       const interval = tradingViewResolutionToContractInterval(resolution);
-      const requestToken = requestGuard.begin(requestSymbol, interval, () => {
+      const requestGeneration = [datafeedInstanceId, requestSymbol, interval].join('|');
+      const requestToken = requestGuard.begin(requestGeneration, () => {
+        // A superseded request is lifecycle cancellation, not an empty provider result.
         onHistory([], { noData: false });
       });
       const latestBarKey = buildLatestBarKey(requestSymbol, interval);
-      const requiredBars = Math.min(
-        clampKlineLimit(periodParams.countBack),
-        CONTRACT_KLINE_MAX_ACCUMULATED_BARS,
-      );
-      const limit = requiredBars;
+      const firstDataRequest = periodParams.firstDataRequest !== false;
+      const requestPlan = resolveContractKlineRequestPlan({
+        interval,
+        countBack: periodParams.countBack,
+        firstDataRequest,
+        maxBars: CONTRACT_KLINE_MAX_ACCUMULATED_BARS,
+      });
+      const {
+        requiredBars,
+        initialLimit: limit,
+        pageLimit,
+        policy,
+      } = requestPlan;
+      const historyChainDeadlineAt = Date.now() + policy.historyChainDeadlineMs;
       const endTimeMs = resolveContractHistoryEndTimeMs(periodParams);
       const to = Number(periodParams.to);
       const toTimeMs = Number.isFinite(to) && to > 0
         ? Math.floor(to * 1000)
         : Number.MAX_SAFE_INTEGER;
+      const canCoordinateCoverage = firstDataRequest || endTimeMs !== undefined;
+      const retainedCoverage = canCoordinateCoverage
+        ? historyCoverageByScope.get(requestGeneration) ?? null
+        : null;
+      const currentCoverageIsFresh = Boolean(
+        !retainedCoverage
+        || !firstDataRequest
+        || (
+          retainedCoverage.currentCacheLimit !== null
+          && (
+            retainedCoverage.terminalComplete
+            || contractKlineCurrentCache.getAtLeast({
+              category: assetClass,
+              symbol: requestSymbol,
+              interval,
+              limit: retainedCoverage.currentCacheLimit,
+            })
+          )
+        )
+      );
+      const existingCoverage = currentCoverageIsFresh ? retainedCoverage : null;
+      if (retainedCoverage && !currentCoverageIsFresh) {
+        historyCoverageByScope.delete(requestGeneration);
+      }
+      const existingBarsForRange = existingCoverage
+        ? existingCoverage.returnedBars
+          .filter((bar) => bar.time < toTimeMs)
+          .slice(-requiredBars)
+        : [];
+
+      const completeHistoryRequest = (
+        bars: ContractTradingViewBar[],
+        noData: boolean,
+        nextCoverageState: HistoryCoverageState | null = null,
+      ) => requestGuard.complete(requestToken, () => {
+        if (
+          nextCoverageState
+        ) {
+          historyCoverageByScope.set(requestGeneration, nextCoverageState);
+        }
+        const latestBar = bars[bars.length - 1] || null;
+        if (firstDataRequest) {
+          const highWaterMark = getContractKlineHighWaterMark(latestBarKey);
+          if (latestBar && latestBar.time >= highWaterMark) {
+            advanceContractKlineHighWaterMark(latestBarKey, latestBar.time);
+            latestBars.set(latestBarKey, latestBar);
+            notifyLatestBar(latestBar);
+          } else if (!latestBar && highWaterMark === 0) {
+            notifyLatestBar(null);
+          }
+        }
+        onHistory(bars, { noData });
+        notifyHistoryBars({
+          symbol: requestSymbol,
+          interval,
+          resolution: requestResolution,
+          firstDataRequest,
+          barCount: bars.length,
+          firstBarTime: bars[0]?.time ?? null,
+          lastBarTime: latestBar?.time ?? null,
+          requestSeq: requestToken.sequence,
+        });
+      });
+
+      const completeHistoryError = (reason: string) => requestGuard.complete(requestToken, () => {
+        onError(reason);
+        notifyHistoryError({
+          symbol: requestSymbol,
+          interval,
+          resolution: requestResolution,
+          firstDataRequest,
+          firstBarTime: null,
+          lastBarTime: null,
+          requestSeq: requestToken.sequence,
+          error: reason,
+        });
+      });
+
+      const requestBeyondTerminalBoundary = Boolean(
+        existingCoverage?.terminalComplete
+        && (
+          existingCoverage.returnedBars.length === 0
+          || (
+            existingCoverage.terminalBoundary !== null
+            && (endTimeMs ?? toTimeMs) <= existingCoverage.terminalBoundary
+          )
+        )
+      );
+      const canReuseSettledCoverage = Boolean(
+        existingCoverage
+        && (
+          existingBarsForRange.length >= requiredBars
+          || existingCoverage.terminalComplete
+        )
+      );
+
+      if (existingCoverage && (requestBeyondTerminalBoundary || canReuseSettledCoverage)) {
+        completeHistoryRequest(
+          requestBeyondTerminalBoundary ? [] : existingBarsForRange,
+          requestBeyondTerminalBoundary || (
+            existingCoverage.terminalComplete
+            && existingBarsForRange.length === 0
+          ),
+        );
+        return;
+      }
+
+      const existingNextEndTimeMs = existingCoverage
+        ? existingCoverage.nextEndTimeMs ?? existingCoverage.returnedBars[0]?.time ?? null
+        : null;
+      const requestedRangeEndTimeMs = endTimeMs ?? (
+        toTimeMs === Number.MAX_SAFE_INTEGER ? null : toTimeMs
+      );
+      const continuationEndTimeMs = existingCoverage
+        ? [existingNextEndTimeMs, requestedRangeEndTimeMs]
+          .filter((value): value is number => value !== null && value > 0)
+          .reduce<number | null>((minimum, value) => (
+            minimum === null ? value : Math.min(minimum, value)
+          ), null)
+        : endTimeMs ?? null;
+      const targetRequiredBars = Math.max(
+        requiredBars,
+        existingCoverage?.requestedBars ?? 0,
+      );
 
       try {
         const result = await loadContractKlineBarsForCountBack({
@@ -768,101 +1219,241 @@ export function createContractTradingViewDatafeed({
           category: assetClass,
           interval,
           initialLimit: limit,
-          initialEndTimeMs: endTimeMs,
-          useCurrentCache: periodParams.firstDataRequest !== false && endTimeMs === undefined,
-          requiredBars,
+          initialEndTimeMs: continuationEndTimeMs ?? undefined,
+          initialBars: existingBarsForRange,
+          useCurrentCache: (
+            !existingCoverage
+            && firstDataRequest
+            && endTimeMs === undefined
+          ),
+          requiredBars: targetRequiredBars,
+          pageLimit,
           toTimeMs,
+          deadlineAt: historyChainDeadlineAt,
           isActive: () => requestGuard.isActive(requestToken),
         });
-        const bars = result.bars;
-
-        requestGuard.complete(requestToken, () => {
-          const latestBar = bars[bars.length - 1] || null;
-          if (periodParams.firstDataRequest !== false) {
-            const highWaterMark = getContractKlineHighWaterMark(latestBarKey);
-            if (latestBar && latestBar.time >= highWaterMark) {
-              advanceContractKlineHighWaterMark(latestBarKey, latestBar.time);
-              latestBars.set(latestBarKey, latestBar);
-              notifyLatestBar(latestBar);
-            } else if (!latestBar && highWaterMark === 0) {
-              notifyLatestBar(null);
-            }
-          }
-          notifyHistoryBars({
+        const bars = result.bars
+          .filter((bar) => bar.time < toTimeMs)
+          .slice(-requiredBars);
+        const scopedCoverage = historyCoverageByScope.get(requestGeneration) ?? null;
+        const previousCoverage = scopedCoverage?.generation === requestGeneration
+          ? scopedCoverage
+          : existingCoverage;
+        const mergedCoverageBars = sortAndDedupeBars([
+          ...(previousCoverage?.returnedBars ?? []),
+          ...result.bars,
+        ]).slice(-CONTRACT_KLINE_MAX_ACCUMULATED_BARS);
+        const mergedRequestedBars = Math.max(
+          targetRequiredBars,
+          previousCoverage?.requestedBars ?? 0,
+        );
+        const terminalComplete = Boolean(
+          previousCoverage?.terminalComplete || result.terminalComplete
+        );
+        const terminalBoundary = result.terminalBoundary !== null
+          ? Math.min(
+            previousCoverage?.terminalBoundary ?? result.terminalBoundary,
+            result.terminalBoundary,
+          )
+          : previousCoverage?.terminalBoundary ?? null;
+        const terminalReason = result.terminalReason
+          ?? previousCoverage?.terminalReason
+          ?? null;
+        const nextEndTimeMs = terminalComplete
+          ? null
+          : [previousCoverage?.nextEndTimeMs ?? null, result.nextEndTimeMs]
+            .filter((value): value is number => value !== null && value > 0)
+            .reduce<number | null>((minimum, value) => (
+              minimum === null ? value : Math.min(minimum, value)
+            ), null);
+        const nextCoverageState = canCoordinateCoverage
+          && result.coverageReusable
+          && (mergedCoverageBars.length > 0 || terminalComplete)
+          ? {
             symbol: requestSymbol,
             interval,
-            resolution: requestResolution,
-            firstDataRequest: periodParams.firstDataRequest === true,
-            barCount: bars.length,
-            requestSeq: requestToken.sequence,
-          });
-          onHistory(bars, {
-            noData: Boolean(
-              bars.length === 0
-              && result.terminalMetadata
-              && shouldReportContractHistoryNoData(result.terminalMetadata)
+            generation: requestGeneration,
+            currentCacheLimit: previousCoverage?.currentCacheLimit ?? (
+              firstDataRequest && endTimeMs === undefined ? limit : null
             ),
-          });
-        });
-      } catch {
-        requestGuard.complete(requestToken, () => {
-          notifyHistoryBars({
-            symbol: requestSymbol,
-            interval,
-            resolution: requestResolution,
-            firstDataRequest: periodParams.firstDataRequest === true,
-            barCount: 0,
-            requestSeq: requestToken.sequence,
-          });
-          onHistory([], { noData: false });
-        });
+            requestedBars: mergedRequestedBars,
+            returnedBars: mergedCoverageBars,
+            coverageComplete: terminalComplete
+              || mergedCoverageBars.length >= mergedRequestedBars,
+            nextEndTimeMs,
+            terminalComplete,
+            terminalBoundary,
+            terminalReason,
+          } satisfies HistoryCoverageState
+          : null;
+
+        if (bars.length === 0 && !terminalComplete) {
+          completeHistoryError(getContractHistoryErrorReason(result.lastMetadata));
+          return;
+        }
+
+        completeHistoryRequest(
+          bars,
+          bars.length === 0 && terminalComplete,
+          nextCoverageState,
+        );
+      } catch (error) {
+        completeHistoryError(
+          error instanceof Error && error.message
+            ? error.message
+            : 'Kline history request failed',
+        );
       }
     },
 
     subscribeBars(symbolInfo, resolution, onRealtime, subscriberUid) {
+      const normalizedSubscriberUid = String(subscriberUid || '');
       const subscriptionSymbol = normalizeContractSymbol(symbolInfo.ticker || apiSymbol) || apiSymbol;
       const interval = tradingViewResolutionToContractInterval(resolution);
       const latestBarKey = buildLatestBarKey(subscriptionSymbol, interval);
+      const generation = ++subscriptionGeneration;
+      const ownerId = [datafeedInstanceId, normalizedSubscriberUid, generation].join(':');
+
+      const previousSubscription = subscriptions.get(normalizedSubscriberUid);
+      if (previousSubscription) {
+        subscriptions.delete(normalizedSubscriberUid);
+        previousSubscription.releaseKlineSubscription();
+      }
+
       const subscription: SubscriptionEntry = {
+        subscriberUid: normalizedSubscriberUid,
+        symbol: subscriptionSymbol,
+        interval,
+        ownerId,
+        generation,
         latestBarKey,
         lastEmittedBarTime: 0,
-        unsubscribe: () => undefined,
+        lastEmittedBarFingerprint: '',
+        lastStoreBarTime: 0,
+        legacyVersionCursor: null,
+        releaseKlineSubscription: () => undefined,
+        callback: onRealtime,
       };
 
-      const unsubscribe = contractMarketRealtime.subscribe('kline', (message) => {
-        const nextBar = realtimeMessageToBar(message, subscriptionSymbol, interval);
-        if (!nextBar) return;
+      subscriptions.set(normalizedSubscriberUid, subscription);
+
+      const getActiveSubscription = () => {
+        const activeSubscription = subscriptions.get(normalizedSubscriberUid);
+        if (
+          !activeSubscription
+          || activeSubscription.subscriberUid !== normalizedSubscriberUid
+          || activeSubscription.ownerId !== ownerId
+          || activeSubscription.generation !== generation
+          || activeSubscription.symbol !== subscriptionSymbol
+          || activeSubscription.interval !== interval
+        ) return null;
+        return activeSubscription;
+      };
+
+      const emitRealtimeBar = (
+        nextBar: ContractTradingViewBar,
+        authority: 'STORE' | 'LEGACY_FALLBACK',
+      ): boolean => {
+        const activeSubscription = getActiveSubscription();
+        if (!activeSubscription) return false;
+        if (
+          authority === 'LEGACY_FALLBACK'
+          && nextBar.time <= activeSubscription.lastStoreBarTime
+        ) return false;
 
         const previousBar = latestBars.get(latestBarKey);
         const effectiveHighWaterMark = Math.max(
           getContractKlineHighWaterMark(latestBarKey),
           previousBar?.time || 0,
-          subscription.lastEmittedBarTime,
+          activeSubscription.lastEmittedBarTime,
         );
-        if (nextBar.time < effectiveHighWaterMark) return;
+        if (nextBar.time < effectiveHighWaterMark) return false;
+        const fingerprint = realtimeBarFingerprint(nextBar);
+        if (
+          nextBar.time === activeSubscription.lastEmittedBarTime
+          && fingerprint === activeSubscription.lastEmittedBarFingerprint
+        ) return false;
 
         advanceContractKlineHighWaterMark(latestBarKey, nextBar.time);
-        subscription.lastEmittedBarTime = Math.max(subscription.lastEmittedBarTime, nextBar.time);
+        activeSubscription.lastEmittedBarTime = Math.max(
+          activeSubscription.lastEmittedBarTime,
+          nextBar.time,
+        );
+        activeSubscription.lastEmittedBarFingerprint = fingerprint;
         latestBars.set(latestBarKey, nextBar);
         notifyLatestBar(nextBar);
-        onRealtime(nextBar);
-      });
+        activeSubscription.callback(nextBar);
+        return true;
+      };
 
-      subscription.unsubscribe = unsubscribe;
-      subscriptions.set(subscriberUid, subscription);
+      const handleStoreEntry = (entry: ContractMarketStoreEntry | null) => {
+        const activeSubscription = getActiveSubscription();
+        if (!activeSubscription) return;
+        const nextBar = storeKlineEntryToBar(entry, subscriptionSymbol, interval);
+        if (!nextBar) return;
+        activeSubscription.lastStoreBarTime = Math.max(
+          activeSubscription.lastStoreBarTime,
+          nextBar.time,
+        );
+        emitRealtimeBar(nextBar, 'STORE');
+      };
+
+      const releaseLegacyKlineSubscription = contractMarketRealtime.subscribeKline({
+        symbol: subscriptionSymbol,
+        interval,
+      }, (message) => {
+        if (!getActiveSubscription()) return;
+        const activeStoreSymbol = normalizeContractSymbol(
+          contractMarketStore.getState().activeSymbol || '',
+        );
+        if (activeStoreSymbol && activeStoreSymbol !== subscriptionSymbol) return;
+        const nextBar = realtimeMessageToBar(message, subscriptionSymbol, interval);
+        if (!nextBar) return;
+        const activeSubscription = getActiveSubscription();
+        if (!activeSubscription) return;
+        const version = realtimeMessageVersion(message, nextBar);
+        const storeEntry = selectContractMarketKlineEntry(
+          contractMarketStore.getState(),
+          subscriptionSymbol,
+          interval,
+        );
+        if (storeEntry && !acceptsKlineVersion(storeEntryVersion(storeEntry), version)) return;
+        if (!acceptsKlineVersion(activeSubscription.legacyVersionCursor, version)) return;
+        if (emitRealtimeBar(nextBar, 'LEGACY_FALLBACK')) {
+          activeSubscription.legacyVersionCursor = version;
+        }
+      });
+      const releaseStoreKlineSubscription = subscribeContractMarketKlineEntry(
+        subscriptionSymbol,
+        interval,
+        handleStoreEntry,
+      );
+
+      subscription.releaseKlineSubscription = () => {
+        releaseStoreKlineSubscription();
+        releaseLegacyKlineSubscription();
+      };
+      handleStoreEntry(selectContractMarketKlineEntry(
+        contractMarketStore.getState(),
+        subscriptionSymbol,
+        interval,
+      ));
     },
 
     unsubscribeBars(subscriberUid) {
-      const entry = subscriptions.get(subscriberUid);
+      const normalizedSubscriberUid = String(subscriberUid || '');
+      const entry = subscriptions.get(normalizedSubscriberUid);
       if (!entry) return;
-      entry.unsubscribe();
-      subscriptions.delete(subscriberUid);
+      subscriptions.delete(normalizedSubscriberUid);
+      entry.releaseKlineSubscription();
     },
 
     destroy() {
       requestGuard.destroy();
-      subscriptions.forEach((entry) => entry.unsubscribe());
+      historyCoverageByScope.clear();
+      const activeSubscriptions = Array.from(subscriptions.values());
       subscriptions.clear();
+      activeSubscriptions.forEach((entry) => entry.releaseKlineSubscription());
       latestBars.clear();
     },
   };

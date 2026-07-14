@@ -111,6 +111,111 @@ def test_history_rest_metadata_is_distinct_from_current_snapshot(monkeypatch) ->
     assert actual.metadata.revision is None
 
 
+def test_contract_monthly_provider_boundary_cache_supports_contract_interval(monkeypatch) -> None:
+    stored: dict[str, dict] = {}
+
+    monkeypatch.setattr(
+        market_kline_cache,
+        "cache_set_json",
+        lambda key, payload, *_args, **_kwargs: stored.__setitem__(key, dict(payload)),
+    )
+    monkeypatch.setattr(
+        market_kline_cache,
+        "cache_get_json",
+        lambda key: stored.get(key),
+    )
+
+    earliest_available_time = 1_561_910_400_000
+    written = market_kline_cache._write_kline_history_boundary_cache(
+        market_type="contract",
+        symbol="BTCUSDT_PERP",
+        interval="1M",
+        earliest_available_time=earliest_available_time,
+        terminal_reason=market_kline_cache.KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY,
+    )
+    cached = market_kline_cache._read_kline_history_boundary_cache(
+        market_type="contract",
+        symbol="BTCUSDT_PERP",
+        interval="1M",
+    )
+
+    assert written is not None
+    assert cached == {
+        "symbol": "BTCUSDT_PERP",
+        "interval": "1M",
+        "earliest_available_time": earliest_available_time,
+        "terminal_reason": market_kline_cache.KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY,
+        "boundary_scope": market_kline_cache.KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER,
+    }
+
+
+def test_contract_monthly_provider_boundary_returns_terminal_result(monkeypatch) -> None:
+    stored: dict[str, dict] = {}
+    boundary_cursor = 1_561_910_400_000
+    provider_calls = []
+
+    monkeypatch.setattr(
+        market_kline_cache,
+        "cache_set_json",
+        lambda key, payload, *_args, **_kwargs: stored.__setitem__(key, dict(payload)),
+    )
+    monkeypatch.setattr(
+        market_kline_cache,
+        "cache_get_json",
+        lambda key: stored.get(key),
+    )
+    monkeypatch.setattr(
+        market_kline_cache,
+        "_read_cached_klines",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        market_kline_cache,
+        "_read_continuous_monthly_history_start_ms",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def provider_boundary(_limit: int, _end_time_ms: int | None):
+        provider_calls.append((_limit, _end_time_ms))
+        raise market_kline_cache.KlineProviderHistoryBoundary(
+            "contract provider monthly history boundary",
+            provider_error_provider="OKX_SWAP",
+        )
+
+    def request_boundary():
+        return market_kline_cache.get_klines_cache_first(
+            object(),
+            market_type="contract",
+            symbol="BTCUSDT_PERP",
+            interval="1M",
+            limit=300,
+            source="CONFIGURED",
+            fetch_external=provider_boundary,
+            end_time_ms=boundary_cursor,
+        )
+
+    first = request_boundary()
+    second = request_boundary()
+
+    assert first == second == []
+    assert first.cache_status == second.cache_status == market_kline_cache.KLINE_CACHE_STATUS_HISTORY_BOUNDARY
+    assert first.history_terminal is second.history_terminal is True
+    assert first.terminal_reason == market_kline_cache.KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY
+    assert second.terminal_reason == market_kline_cache.KLINE_TERMINAL_REASON_CACHE_HISTORY_BOUNDARY
+    assert first.earliest_available_time is second.earliest_available_time is None
+    assert first.history_incomplete is second.history_incomplete is False
+    assert first.provider_error_code is second.provider_error_code is None
+    assert provider_calls == [(300, boundary_cursor)]
+    cached = market_kline_cache._read_kline_history_boundary_cache(
+        market_type="contract",
+        symbol="BTCUSDT_PERP",
+        interval="1M",
+    )
+    assert cached is not None
+    assert cached.get("earliest_available_time") is None
+    assert cached["boundary_cursor"] == boundary_cursor
+
+
 def test_db_cache_metadata_does_not_invent_provider_or_updated_at(monkeypatch) -> None:
     result = market_kline_cache.KlineCacheResult(
         [_bar(60_000)],

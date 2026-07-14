@@ -27,6 +27,10 @@ type KlineMetadata = {
   history_incomplete: boolean;
   history_complete: boolean | null;
   has_more_before: boolean | null;
+  history_terminal?: boolean | null;
+  terminal_reason?: string | null;
+  earliest_available_time?: number | null;
+  coverage_complete?: boolean | null;
   provider_error_code: string | null;
   retryable: boolean;
 };
@@ -52,6 +56,12 @@ async function waitFor(condition: () => boolean, message: string) {
     await Promise.resolve();
   }
   assert.ok(condition(), message);
+}
+
+async function flushPromises() {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 function metadata(items: any[], overrides: Partial<KlineMetadata> = {}): KlineMetadata {
@@ -109,11 +119,31 @@ function loadTypeScriptModule(
 
 let requestKlines: (params: KlineRequest) => Promise<KlineMetadata> = async () => metadata([]);
 const realtimeHandlers = new Set<(message: any) => void>();
-const realtimeSessionCalls: any[] = [];
+const realtimeMarketSessionCalls: string[] = [];
+const realtimeKlineOwnerCalls: Array<{ op: 'subscribe' | 'unsubscribe'; symbol: string; interval: string }> = [];
+const realtimeKlineSubscriptions: Array<{
+  symbol: string;
+  interval: string;
+  handler: (message: any) => void;
+  released: boolean;
+}> = [];
 let realtimeDisconnectCalls = 0;
 const realtimeStub = {
-  setSession(session: unknown) {
-    realtimeSessionCalls.push(session);
+  setMarketSession(symbol: string) {
+    realtimeMarketSessionCalls.push(symbol);
+    return () => undefined;
+  },
+  subscribeKline(session: { symbol: string; interval: string }, handler: (message: any) => void) {
+    realtimeKlineOwnerCalls.push({ op: 'subscribe', ...session });
+    const subscription = { ...session, handler, released: false };
+    realtimeKlineSubscriptions.push(subscription);
+    realtimeHandlers.add(handler);
+    return () => {
+      if (subscription.released) return;
+      subscription.released = true;
+      realtimeHandlers.delete(handler);
+      realtimeKlineOwnerCalls.push({ op: 'unsubscribe', ...session });
+    };
   },
   subscribe(_event: string, handler: (message: any) => void) {
     realtimeHandlers.add(handler);
@@ -138,6 +168,28 @@ const currentCacheModule = loadTypeScriptModule(
   { './contractKlineCachePolicy': policyModule },
 );
 
+const loadPolicyModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./contractKlineLoadPolicy.ts', import.meta.url)),
+  {},
+);
+
+const preloadManagerModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./contractKlinePreloadManager.ts', import.meta.url)),
+  {
+    '@/lib/api/modules/contract': {
+      getContractMarketKlinesMetadata: (params: KlineRequest) => requestKlines(params),
+    },
+    './contractKlineCachePolicy': policyModule,
+    './contractKlineCurrentCache': currentCacheModule,
+    './contractKlineLoadPolicy': loadPolicyModule,
+  },
+);
+
+const marketStoreModule = loadTypeScriptModule(
+  fileURLToPath(new URL('../../../lib/realtime/contractMarketStore.ts', import.meta.url)),
+  {},
+);
+
 const datafeedModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractTradingViewDatafeed.ts', import.meta.url)),
   {
@@ -147,16 +199,25 @@ const datafeedModule = loadTypeScriptModule(
     '@/lib/realtime/contractMarketRealtime': {
       contractMarketRealtime: realtimeStub,
     },
+    '@/lib/realtime/contractMarketStore': marketStoreModule,
     './contractKlineCurrentCache': currentCacheModule,
     './contractKlineCachePolicy': policyModule,
+    './contractKlineLoadPolicy': loadPolicyModule,
+    './contractKlinePreloadManager': preloadManagerModule,
   },
 );
 
 const defaultCurrentCacheNow = currentCacheModule.contractKlineCurrentCache.now;
 
 test.beforeEach(() => {
+  marketStoreModule.contractMarketStore.resetForTests();
   currentCacheModule.contractKlineCurrentCache.clear();
   currentCacheModule.contractKlineCurrentCache.now = defaultCurrentCacheNow;
+  realtimeHandlers.clear();
+  realtimeMarketSessionCalls.length = 0;
+  realtimeKlineOwnerCalls.length = 0;
+  realtimeKlineSubscriptions.length = 0;
+  realtimeDisconnectCalls = 0;
 });
 
 test.afterEach(() => {
@@ -194,6 +255,37 @@ const realtimeCandle = (symbol: string, interval: string, openTime: number, clos
   },
 });
 
+function ingestStoreKline(params: {
+  symbol: string;
+  interval: string;
+  openTime: number;
+  close: string;
+  eventTimeMs?: number;
+  generation?: number;
+  sequence?: number;
+}) {
+  return marketStoreModule.contractMarketStore.ingest({
+    symbol: params.symbol,
+    domain: 'kline',
+    interval: params.interval,
+    data: {
+      ...row(params.openTime, params.close),
+      symbol: params.symbol,
+      interval: params.interval,
+      source: 'PROVIDER_KLINE',
+      kline_mode: 'PROVIDER_KLINE',
+      price_source: 'KLINE_CLOSE',
+    },
+    transport: 'WS',
+    provider: 'BINANCE_USDM',
+    providerGeneration: params.generation,
+    revision: params.sequence === undefined
+      ? null
+      : { epoch: params.generation ?? null, sequence: params.sequence },
+    eventTimeMs: params.eventTimeMs ?? params.openTime,
+  });
+}
+
 
 test('current and history cursor policy only uses to for non-first requests', () => {
   const resolveEndTime = datafeedModule.resolveContractHistoryEndTimeMs;
@@ -213,16 +305,17 @@ test('in-flight key normalizes symbol interval and equivalent current cursors', 
     limit: 300,
   };
 
-  assert.equal(buildKey(base), 'BTCUSDT_PERP|1h|CURRENT|300');
+  assert.equal(buildKey(base), 'BTCUSDT_PERP|1h|CURRENT');
+  assert.equal(buildKey({ ...base, limit: 500 }), buildKey(base));
   assert.equal(buildKey({ ...base, endTimeMs: undefined }), buildKey(base));
   assert.equal(buildKey({ ...base, endTimeMs: null }), buildKey(base));
   assert.equal(
     buildKey({ ...base, endTimeMs: 1_780_000_000_000 }),
-    'BTCUSDT_PERP|1h|1780000000000|300',
+    'BTCUSDT_PERP|1h|1780000000000',
   );
   assert.equal(
     buildKey({ ...base, interval: '1M' }),
-    'BTCUSDT_PERP|1M|CURRENT|300',
+    'BTCUSDT_PERP|1M|CURRENT',
   );
 });
 
@@ -286,19 +379,26 @@ test('normal current request calls onHistory exactly once and never calls onErro
   requestKlines = async () => metadata([row(1_717_000_000_000, '101')]);
   const historyCalls: HistoryCall[] = [];
   const historyEvents: any[] = [];
+  const callbackOrder: string[] = [];
   let errorCalls = 0;
   const latest: Array<string | null> = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({
     symbol: 'BTCUSDT_PERP',
     onLatestBar: (close: string | null) => latest.push(close),
-    onHistoryBars: (event: unknown) => historyEvents.push(event),
+    onHistoryBars: (event: unknown) => {
+      callbackOrder.push('onHistoryBars');
+      historyEvents.push(event);
+    },
   });
 
   await datafeed.getBars(
     symbolInfo('BTCUSDT_PERP'),
     '1',
     period,
-    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    (bars: any[], meta: { noData?: boolean }) => {
+      callbackOrder.push('onHistory');
+      historyCalls.push({ bars, meta });
+    },
     () => { errorCalls += 1; },
   );
 
@@ -307,12 +407,15 @@ test('normal current request calls onHistory exactly once and never calls onErro
   assert.equal(historyCalls[0].meta.noData, false);
   assert.equal(errorCalls, 0);
   assert.deepEqual(latest, ['101']);
+  assert.deepEqual(callbackOrder, ['onHistory', 'onHistoryBars']);
   assert.deepEqual(historyEvents, [{
     symbol: 'BTCUSDT_PERP',
     interval: '1m',
     resolution: '1',
     firstDataRequest: true,
     barCount: 1,
+    firstBarTime: 1_717_000_000_000,
+    lastBarTime: 1_717_000_000_000,
     requestSeq: 1,
   }]);
 });
@@ -338,7 +441,7 @@ test('noData helper accepts only a fully consistent explicit terminal result', (
 });
 
 
-test('ordinary provider empty history settles once with noData false', async () => {
+test('ordinary provider empty history settles once through the error callback', async () => {
   requestKlines = async () => metadata([], {
     cache_status: 'PROVIDER_EMPTY',
     history_complete: false,
@@ -359,14 +462,12 @@ test('ordinary provider empty history settles once with noData false', async () 
     () => { errorCalls += 1; },
   );
 
-  assert.equal(historyCalls.length, 1);
-  assert.deepEqual(historyCalls[0].bars, []);
-  assert.equal(historyCalls[0].meta.noData, false);
-  assert.equal(errorCalls, 0);
+  assert.equal(historyCalls.length, 0);
+  assert.equal(errorCalls, 1);
 });
 
 
-test('transient metadata errors settle exactly once with noData false', async () => {
+test('transient metadata errors settle exactly once through the error callback', async () => {
   for (const providerErrorCode of ['TIMEOUT', 'COOLDOWN', 'HTTP_ERROR', 'UNKNOWN']) {
     requestKlines = async () => metadata([], {
       history_complete: false,
@@ -389,10 +490,8 @@ test('transient metadata errors settle exactly once with noData false', async ()
       () => { errorCalls += 1; },
     );
 
-    assert.equal(historyCalls.length, 1, providerErrorCode);
-    assert.deepEqual(historyCalls[0].bars, [], providerErrorCode);
-    assert.equal(historyCalls[0].meta.noData, false, providerErrorCode);
-    assert.equal(errorCalls, 0, providerErrorCode);
+    assert.equal(historyCalls.length, 0, providerErrorCode);
+    assert.equal(errorCalls, 1, providerErrorCode);
   }
 });
 
@@ -426,7 +525,7 @@ test('stale partial metadata returns provider bars without ending history', asyn
 });
 
 
-test('empty current metadata never reports history noData', async () => {
+test('unknown empty current metadata uses the error callback instead of noData', async () => {
   requestKlines = async () => metadata([], {
     history_complete: null,
     has_more_before: null,
@@ -434,6 +533,7 @@ test('empty current metadata never reports history noData', async () => {
     retryable: true,
   });
   const historyCalls: HistoryCall[] = [];
+  const errors: string[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'CURRENT_EMPTY_PERP' });
 
   await datafeed.getBars(
@@ -441,12 +541,11 @@ test('empty current metadata never reports history noData', async () => {
     '1',
     period,
     (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
-    assert.fail,
+    (reason: string) => errors.push(reason),
   );
 
-  assert.equal(historyCalls.length, 1);
-  assert.deepEqual(historyCalls[0].bars, []);
-  assert.equal(historyCalls[0].meta.noData, false);
+  assert.equal(historyCalls.length, 0);
+  assert.equal(errors.length, 1);
 });
 
 
@@ -474,7 +573,36 @@ test('explicit terminal metadata is the only empty result reported as noData', a
 });
 
 
-test('API failure safely settles empty history exactly once without noData or onError', async () => {
+test('contract monthly provider boundary reports noData without onError', async () => {
+  requestKlines = async () => metadata([], {
+    history_complete: true,
+    has_more_before: false,
+    history_terminal: true,
+    terminal_reason: 'PROVIDER_HISTORY_BOUNDARY',
+    earliest_available_time: null,
+    coverage_complete: true,
+    history_incomplete: false,
+    provider_error_code: null,
+    retryable: false,
+  });
+  const historyCalls: HistoryCall[] = [];
+  const errors: string[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'BTCUSDT_PERP' });
+
+  await datafeed.getBars(
+    symbolInfo('BTCUSDT_PERP'),
+    '1M',
+    { ...period, firstDataRequest: false },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    (reason: string) => errors.push(reason),
+  );
+
+  assert.deepEqual(historyCalls, [{ bars: [], meta: { noData: true } }]);
+  assert.deepEqual(errors, []);
+});
+
+
+test('API failure settles exactly once through error and history-error callbacks', async () => {
   requestKlines = async () => {
     throw new Error('provider unavailable');
   };
@@ -496,19 +624,19 @@ test('API failure safely settles empty history exactly once without noData or on
     (reason: string) => errors.push(reason),
   );
 
-  assert.equal(historyCalls.length, 1);
-  assert.deepEqual(historyCalls[0].bars, []);
-  assert.equal(historyCalls[0].meta.noData, false);
-  assert.deepEqual(errors, []);
-  assert.deepEqual(historyEvents, [{
+  assert.equal(historyCalls.length, 0);
+  assert.deepEqual(errors, ['provider unavailable']);
+  assert.deepEqual(historyEvents, []);
+  assert.deepEqual(historyErrors, [{
     symbol: 'BTCUSDT_PERP',
     interval: '1m',
     resolution: '1',
     firstDataRequest: true,
-    barCount: 0,
+    firstBarTime: null,
+    lastBarTime: null,
     requestSeq: 1,
+    error: 'provider unavailable',
   }]);
-  assert.deepEqual(historyErrors, []);
 });
 
 
@@ -556,7 +684,7 @@ test('concurrent identical current requests across datafeeds share one HTTP requ
   assert.deepEqual(apiCalls, [{
     symbol: 'DEDUPE_CURRENT_PERP',
     interval: '1h',
-    limit: 300,
+    limit: 150,
     endTimeMs: undefined,
   }]);
   pending.resolve(metadata(pageEndingAt(1_717_000_000_000, 300, '101')));
@@ -596,6 +724,72 @@ test('concurrent identical current requests across datafeeds share one HTTP requ
   first.destroy();
   second.destroy();
   third.destroy();
+});
+
+
+test('active datafeed history preempts preload and owns the current cache revision', async () => {
+  const preloadSource = deferred<KlineMetadata>();
+  const activeSource = deferred<KlineMetadata>();
+  const requests: KlineRequest[] = [];
+  let idleCallback: (() => void) | null = null;
+  requestKlines = async (params) => {
+    requests.push(params);
+    return requests.length === 1 ? preloadSource.promise : activeSource.promise;
+  };
+  const manager = new preloadManagerModule.ContractKlinePreloadManager({
+    getState: () => ({ symbol: 'PRIORITY_PERP', category: 'CRYPTO', interval: '1M' }),
+    idleScheduler: {
+      schedule: (callback: () => void) => {
+        idleCallback = callback;
+        return 1;
+      },
+      cancel: () => undefined,
+    },
+  });
+  manager.schedule({
+    symbol: 'PRIORITY_PERP',
+    interval: '1M',
+    firstDataRequest: true,
+    barCount: 60,
+  });
+  (idleCallback as unknown as () => void)();
+  await waitFor(() => requests.length === 1, 'preload request should start first');
+
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'PRIORITY_PERP',
+    category: 'CRYPTO',
+  });
+  const activeHistory = datafeed.getBars(
+    symbolInfo('PRIORITY_PERP'),
+    '1M',
+    { ...period, countBack: 60 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+  await waitFor(() => requests.length === 2, 'active request must not wait for preload');
+
+  const activeRows = Array.from({ length: 60 }, (_, index) => (
+    row(1_717_000_000_000 + index * 60_000, '500')
+  ));
+  activeSource.resolve(metadata(activeRows));
+  await activeHistory;
+  preloadSource.resolve(metadata(Array.from({ length: 60 }, (_, index) => (
+    row(1_716_000_000_000 + index * 60_000, '100')
+  ))));
+  await flushPromises();
+
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.at(-1)?.close, 500);
+  const cached = currentCacheModule.contractKlineCurrentCache.getAtLeast({
+    category: 'CRYPTO',
+    symbol: 'PRIORITY_PERP',
+    interval: '1M',
+    limit: 60,
+  });
+  assert.equal(cached?.items.at(-1)?.close, '500');
+  manager.destroy();
+  datafeed.destroy();
 });
 
 test('different category namespaces share C1 HTTP and populate both L1 entries', async () => {
@@ -835,7 +1029,7 @@ test('concurrent identical history requests across datafeeds share one HTTP requ
   assert.deepEqual(apiCalls, [{
     symbol: 'DEDUPE_HISTORY_PERP',
     interval: '15m',
-    limit: 200,
+    limit: 180,
     endTimeMs: 2_000_000_000_000,
   }]);
   pending.resolve(metadata(pageEndingAt(1_717_000_000_000, 200, '103')));
@@ -855,7 +1049,7 @@ test('concurrent identical history requests across datafeeds share one HTTP requ
 });
 
 
-test('completed history in-flight request is removed and does not become a result cache', async () => {
+test('settled history coverage is local to one datafeed while the global lease is removed', async () => {
   const pending: Array<Deferred<KlineMetadata>> = [];
   const apiCalls: KlineRequest[] = [];
   requestKlines = async (params) => {
@@ -877,18 +1071,33 @@ test('completed history in-flight request is removed and does not become a resul
   pending[0].resolve(metadata(pageEndingAt(1_717_000_000_000, 100, '101')));
   await firstRequest;
 
-  const secondRequest = datafeed.getBars(
+  const repeatedHistory: HistoryCall[] = [];
+  await datafeed.getBars(
+    symbolInfo('NO_RESULT_CACHE_PERP'),
+    '1',
+    { ...period, firstDataRequest: false },
+    (bars: any[], meta: { noData?: boolean }) => repeatedHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  assert.equal(apiCalls.length, 1, 'the same datafeed generation should reuse settled coverage');
+  assert.equal(repeatedHistory[0].bars.at(-1)?.close, 101);
+
+  const nextDatafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'NO_RESULT_CACHE_PERP',
+  });
+  const secondRequest = nextDatafeed.getBars(
     symbolInfo('NO_RESULT_CACHE_PERP'),
     '1',
     { ...period, firstDataRequest: false },
     () => undefined,
     assert.fail,
   );
-  assert.equal(apiCalls.length, 2);
+  assert.equal(apiCalls.length, 2, 'a new datafeed must not see another datafeed coverage state');
   pending[1].resolve(metadata(pageEndingAt(1_717_000_060_000, 100, '102')));
   await secondRequest;
   assert.deepEqual(apiCalls[0], apiCalls[1]);
   datafeed.destroy();
+  nextDatafeed.destroy();
 });
 
 
@@ -974,7 +1183,7 @@ test('sequential current requests reuse L1 within one and across datafeed instan
 });
 
 
-test('current L1 key keeps symbol interval and exact limit isolated', async () => {
+test('current L1 scope keeps symbol interval and full countBack coverage isolated', async () => {
   const apiCalls: KlineRequest[] = [];
   requestKlines = async (params) => {
     apiCalls.push(params);
@@ -999,13 +1208,15 @@ test('current L1 key keeps symbol interval and exact limit isolated', async () =
     datafeed.destroy();
   }
 
-  assert.equal(apiCalls.length, 4);
+  assert.equal(apiCalls.length, 5);
   assert.deepEqual(apiCalls.map((call) => [call.symbol, call.interval, call.limit]), [
     ['L1_KEY_A_PERP', '1m', 100],
     ['L1_KEY_B_PERP', '1m', 100],
     ['L1_KEY_A_PERP', '5m', 100],
-    ['L1_KEY_A_PERP', '1m', 200],
+    ['L1_KEY_A_PERP', '1m', 150],
+    ['L1_KEY_A_PERP', '1m', 50],
   ]);
+  assert.equal(typeof apiCalls[4].endTimeMs, 'number');
 });
 
 
@@ -1056,6 +1267,7 @@ test('empty error stale partial and rejected current responses never become L1 e
     currentCacheModule.contractKlineCurrentCache.clear();
     let apiCalls = 0;
     const historyCalls: HistoryCall[] = [];
+    const errors: string[] = [];
     requestKlines = async () => {
       apiCalls += 1;
       if (invalid.reject) throw new Error(invalid.name);
@@ -1070,14 +1282,19 @@ test('empty error stale partial and rejected current responses never become L1 e
         '1',
         period,
         (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
-        assert.fail,
+        (reason: string) => errors.push(reason),
       );
     }
 
     assert.equal(apiCalls, 2, `${invalid.name} unexpectedly hit L1`);
-    assert.equal(historyCalls.length, 2, `${invalid.name} callback count`);
-    assert.equal(historyCalls[0].meta.noData, false, `${invalid.name} first noData`);
-    assert.equal(historyCalls[1].meta.noData, false, `${invalid.name} second noData`);
+    if (invalid.response?.items.length) {
+      assert.equal(historyCalls.length, 2, `${invalid.name} history callback count`);
+      assert.equal(errors.length, 0, `${invalid.name} error callback count`);
+      assert.ok(historyCalls.every((call) => call.meta.noData === false));
+    } else {
+      assert.equal(historyCalls.length, 0, `${invalid.name} history callback count`);
+      assert.equal(errors.length, 2, `${invalid.name} error callback count`);
+    }
     datafeed.destroy();
   }
 });
@@ -1295,7 +1512,7 @@ test('older current L1 bars cannot roll back high-water mark and newer realtime 
 });
 
 
-test('shared rejected request settles every live caller once without noData', async () => {
+test('shared rejected request settles every live caller once through error callbacks', async () => {
   const pending = deferred<KlineMetadata>();
   let apiCalls = 0;
   requestKlines = async () => {
@@ -1336,35 +1553,32 @@ test('shared rejected request settles every live caller once without noData', as
   pending.reject(new Error('shared provider unavailable'));
   await Promise.all([firstRequest, secondRequest]);
 
-  for (const calls of [firstHistory, secondHistory]) {
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].bars, []);
-    assert.equal(calls[0].meta.noData, false);
-  }
-  assert.equal(firstErrors, 0);
-  assert.equal(secondErrors, 0);
-  assert.equal(firstLoadingEvents.length, 1);
-  assert.equal(secondLoadingEvents.length, 1);
+  assert.equal(firstHistory.length, 0);
+  assert.equal(secondHistory.length, 0);
+  assert.equal(firstErrors, 1);
+  assert.equal(secondErrors, 1);
+  assert.equal(firstLoadingEvents.length, 0);
+  assert.equal(secondLoadingEvents.length, 0);
   const retryHistory: HistoryCall[] = [];
+  const retryErrors: string[] = [];
   const retry = datafeedModule.createContractTradingViewDatafeed({ symbol: 'DEDUPE_REJECT_PERP' });
   await retry.getBars(
     symbolInfo('DEDUPE_REJECT_PERP'),
     '1',
     period,
     (bars: any[], meta: { noData?: boolean }) => retryHistory.push({ bars, meta }),
-    assert.fail,
+    (reason: string) => retryErrors.push(reason),
   );
   assert.equal(apiCalls, 2, 'rejected Promise must be removed instead of becoming a negative cache');
-  assert.equal(retryHistory.length, 1);
-  assert.deepEqual(retryHistory[0].bars, []);
-  assert.equal(retryHistory[0].meta.noData, false);
+  assert.equal(retryHistory.length, 0);
+  assert.deepEqual(retryErrors, ['shared provider unavailable']);
   retry.destroy();
   first.destroy();
   second.destroy();
 });
 
 
-test('same-interval newer request supersedes the older callback while sharing HTTP', async () => {
+test('same-generation identical requests share HTTP and both receive normal bars', async () => {
   const pending: Array<Deferred<KlineMetadata>> = [];
   requestKlines = async () => {
     const request = deferred<KlineMetadata>();
@@ -1398,27 +1612,26 @@ test('same-interval newer request supersedes the older callback while sharing HT
     () => { newErrorCalls += 1; },
   );
 
-  assert.equal(oldHistoryCalls.length, 0, 'superseded settlement must be asynchronous');
+  assert.equal(oldHistoryCalls.length, 0);
   await Promise.resolve();
-  assert.equal(oldHistoryCalls.length, 1);
-  assert.deepEqual(oldHistoryCalls[0].bars, []);
-  assert.equal(oldHistoryCalls[0].meta.noData, false);
+  assert.equal(oldHistoryCalls.length, 0, 'same-generation requests must remain active');
   assert.equal(oldErrorCalls, 0);
   assert.deepEqual(latest, []);
-  assert.equal(historyEvents.length, 0, 'superseded empty settle is not a history completion event');
+  assert.equal(historyEvents.length, 0);
 
   assert.equal(pending.length, 1, 'identical requests must share one HTTP promise');
   pending[0].resolve(metadata(pageEndingAt(1_717_000_060_000, 100, '102')));
   await Promise.all([oldRequest, newRequest]);
-  assert.equal(oldHistoryCalls.length, 1, 'shared late response must not settle superseded callback twice');
+  assert.equal(oldHistoryCalls.length, 1);
+  assert.equal(oldHistoryCalls[0].bars[0].close, 102);
   assert.equal(newHistoryCalls.length, 1);
   assert.equal(newHistoryCalls[0].bars[0].close, 102);
   assert.equal(oldErrorCalls, 0);
   assert.equal(newErrorCalls, 0);
-  assert.deepEqual(latest, ['102']);
-  assert.equal(historyEvents.length, 1);
-  assert.equal(historyEvents[0].requestSeq, 2);
-  assert.equal(historyEvents[0].barCount, 100);
+  assert.deepEqual(latest, ['102', '102']);
+  assert.equal(historyEvents.length, 2);
+  assert.deepEqual(historyEvents.map((event) => event.requestSeq), [1, 2]);
+  assert.ok(historyEvents.every((event) => event.barCount === 100));
 });
 
 
@@ -1479,6 +1692,65 @@ test('superseding one shared caller does not affect another live datafeed caller
 });
 
 
+test('rapid 5m to 1M to 5m retires stale generations without contaminating the final 5m', async () => {
+  const fiveMinute = deferred<KlineMetadata>();
+  const monthly = deferred<KlineMetadata>();
+  const apiCalls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    return params.interval === '1M' ? monthly.promise : fiveMinute.promise;
+  };
+  const oldFiveMinuteHistory: HistoryCall[] = [];
+  const monthlyHistory: HistoryCall[] = [];
+  const finalFiveMinuteHistory: HistoryCall[] = [];
+  const latest: Array<string | null> = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'RAPID_GENERATION_PERP',
+    onLatestBar: (close: string | null) => latest.push(close),
+  });
+
+  const oldFiveMinuteRequest = datafeed.getBars(
+    symbolInfo('RAPID_GENERATION_PERP'),
+    '5',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => oldFiveMinuteHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  const monthlyRequest = datafeed.getBars(
+    symbolInfo('RAPID_GENERATION_PERP'),
+    '1M',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => monthlyHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  const finalFiveMinuteRequest = datafeed.getBars(
+    symbolInfo('RAPID_GENERATION_PERP'),
+    '5',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => finalFiveMinuteHistory.push({ bars, meta }),
+    assert.fail,
+  );
+
+  await Promise.resolve();
+  assert.equal(apiCalls.length, 2, 'the final 5m request must reuse the active 5m range lease');
+  assert.equal(oldFiveMinuteHistory.length, 1);
+  assert.deepEqual(oldFiveMinuteHistory[0].bars, []);
+  assert.equal(monthlyHistory.length, 1);
+  assert.deepEqual(monthlyHistory[0].bars, []);
+
+  fiveMinute.resolve(metadata(pageEndingAt(1_717_000_300_000, 140, '205')));
+  monthly.resolve(metadata(pageEndingAt(1_717_000_000_000, 60, '999')));
+  await Promise.all([oldFiveMinuteRequest, monthlyRequest, finalFiveMinuteRequest]);
+
+  assert.equal(oldFiveMinuteHistory.length, 1);
+  assert.equal(monthlyHistory.length, 1);
+  assert.equal(finalFiveMinuteHistory.length, 1);
+  assert.equal(finalFiveMinuteHistory[0].bars.at(-1)?.close, 205);
+  assert.deepEqual(latest, ['205']);
+  datafeed.destroy();
+});
+
+
 test('destroying one datafeed does not cancel another caller shared HTTP promise', async () => {
   const pending = deferred<KlineMetadata>();
   let apiCalls = 0;
@@ -1522,7 +1794,7 @@ test('destroying one datafeed does not cancel another caller shared HTTP promise
 });
 
 
-test('symbol interval history cursor and limit differences never share HTTP', async () => {
+test('symbol interval and history cursor isolate HTTP while limit shares then upgrades', async () => {
   const cases = [
     {
       name: 'symbol',
@@ -1591,13 +1863,17 @@ test('symbol interval history cursor and limit differences never share HTTP', as
       assert.fail,
     );
 
-    assert.equal(apiCalls.length, 2, item.name);
-    assert.equal(pending.length, 2, item.name);
+    const initialRequestCount = item.name === 'limit' ? 1 : 2;
+    assert.equal(apiCalls.length, initialRequestCount, item.name);
+    assert.equal(pending.length, initialRequestCount, item.name);
     pending[0].resolve(metadata(pageEndingAt(
       1_717_000_000_000,
       apiCalls[0].limit || 100,
       '101',
     )));
+    if (item.name === 'limit') {
+      await waitFor(() => pending.length === 2, 'larger countBack upgrade request missing');
+    }
     pending[1].resolve(metadata(pageEndingAt(
       1_717_000_000_000,
       apiCalls[1].limit || 100,
@@ -1612,25 +1888,24 @@ test('symbol interval history cursor and limit differences never share HTTP', as
 });
 
 
-test('current L1 hit is page one and leaves only two C2 history pages', async () => {
+test('larger current L1 coverage is reused before a countBack deficit continuation', async () => {
   const symbol = 'L1_PAGED_CURRENT_PERP';
-  const step = 60_000;
   const currentEnd = 1_800_000_000_000;
-  const currentRows = pageEndingAt(currentEnd, 200, '120', step);
-  const currentEarliest = currentRows[0].open_time;
+  const currentRows = pageEndingAt(currentEnd, 200, '120');
   assert.equal(currentCacheModule.contractKlineCurrentCache.set(
     { symbol, interval: '1m', limit: 500 },
     metadata(currentRows),
     15_000,
   ), true);
+  assert.ok(currentCacheModule.contractKlineCurrentCache.getAtLeast({
+    symbol,
+    interval: '1m',
+    limit: 150,
+  }));
   const apiCalls: KlineRequest[] = [];
   requestKlines = async (params) => {
     apiCalls.push(params);
-    if (apiCalls.length === 1) {
-      return metadata(pageEndingAt(currentEarliest - step, 200, '119', step));
-    }
-    const secondPageEarliest = currentEarliest - (200 * step);
-    return metadata(pageEndingAt(secondPageEarliest - step, 100, '118', step));
+    return metadata(pageEndingAt(currentRows[0].open_time - 60_000, params.limit || 300, '119'));
   };
   const historyCalls: HistoryCall[] = [];
   const loadingEvents: any[] = [];
@@ -1647,16 +1922,9 @@ test('current L1 hit is page one and leaves only two C2 history pages', async ()
     assert.fail,
   );
 
-  assert.equal(apiCalls.length, 2);
-  assert.deepEqual(apiCalls, [
-    { symbol, interval: '1m', limit: 300, endTimeMs: currentEarliest },
-    {
-      symbol,
-      interval: '1m',
-      limit: 100,
-      endTimeMs: currentEarliest - (200 * step),
-    },
-  ]);
+  assert.equal(apiCalls.length, 1);
+  assert.equal(apiCalls[0].limit, 300);
+  assert.equal(apiCalls[0].endTimeMs, currentRows[0].open_time);
   assert.equal(historyCalls.length, 1);
   assert.equal(historyCalls[0].bars.length, 500);
   assert.equal(new Set(historyCalls[0].bars.map((bar) => bar.time)).size, 500);
@@ -1732,66 +2000,55 @@ test('evicted current L1 key requests HTTP again after the 65th write', async ()
 });
 
 
-test('current countBack is filled across three bounded pages', async () => {
-  const pending: Array<Deferred<KlineMetadata>> = [];
-  const calls: KlineRequest[] = [];
-  requestKlines = async (params) => {
-    calls.push(params);
-    const request = deferred<KlineMetadata>();
-    pending.push(request);
-    return request.promise;
-  };
-  const oldest = 1_800_000_000_000;
-  const step = 60_000;
-  const historyCalls: HistoryCall[] = [];
-  const loadingEvents: any[] = [];
-  const latest: Array<string | null> = [];
-  const datafeed = datafeedModule.createContractTradingViewDatafeed({
-    symbol: 'PAGED_CURRENT_PERP',
-    onLatestBar: (close: string | null) => latest.push(close),
-    onHistoryBars: (event: unknown) => loadingEvents.push(event),
-  });
+test('1W and 1M current countBack 300 complete through one continuation page', async () => {
+  const cases = [
+    { resolution: '1W', interval: '1w', firstCoverage: 80, continuationCoverage: 220 },
+    { resolution: '1M', interval: '1M', firstCoverage: 60, continuationCoverage: 240 },
+  ];
 
-  const request = datafeed.getBars(
-    symbolInfo('PAGED_CURRENT_PERP'),
-    '1',
-    { ...period, countBack: 500 },
-    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
-    assert.fail,
-  );
-  assert.deepEqual(calls[0], {
-    symbol: 'PAGED_CURRENT_PERP',
-    interval: '1m',
-    limit: 500,
-    endTimeMs: undefined,
-  });
+  for (const item of cases) {
+    currentCacheModule.contractKlineCurrentCache.clear();
+    const calls: KlineRequest[] = [];
+    const newestExclusive = 1_900_000_000_000;
+    requestKlines = async (params) => {
+      calls.push(params);
+      const endExclusive = params.endTimeMs ?? newestExclusive;
+      return metadata(pageEndingAt(
+        endExclusive - 60_000,
+        params.limit || 1,
+        String(300 - calls.length),
+      ));
+    };
+    const historyCalls: HistoryCall[] = [];
+    const loadingEvents: any[] = [];
+    const datafeed = datafeedModule.createContractTradingViewDatafeed({
+      symbol: `COUNTBACK_${item.interval}_PERP`,
+      onHistoryBars: (event: unknown) => loadingEvents.push(event),
+    });
 
-  pending[0].resolve(metadata(pageEndingAt(oldest + (499 * step), 200, '3')));
-  await waitFor(() => pending.length === 2, 'current second page was not requested');
-  assert.equal(calls[1].endTimeMs, oldest + (300 * step));
-  assert.equal(calls[1].limit, 300);
+    await datafeed.getBars(
+      symbolInfo(`COUNTBACK_${item.interval}_PERP`),
+      item.resolution,
+      { ...period, countBack: 300 },
+      (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+      assert.fail,
+    );
 
-  pending[1].resolve(metadata(pageEndingAt(oldest + (299 * step), 200, '2')));
-  await waitFor(() => pending.length === 3, 'current third page was not requested');
-  assert.equal(calls[2].endTimeMs, oldest + (100 * step));
-  assert.equal(calls[2].limit, 100);
-
-  pending[2].resolve(metadata(pageEndingAt(oldest + (99 * step), 100, '1')));
-  await request;
-
-  assert.equal(calls.length, 3);
-  assert.equal(historyCalls.length, 1);
-  assert.equal(historyCalls[0].bars.length, 500);
-  assert.equal(new Set(historyCalls[0].bars.map((bar) => bar.time)).size, 500);
-  assert.deepEqual(
-    historyCalls[0].bars.map((bar) => bar.time),
-    [...historyCalls[0].bars.map((bar) => bar.time)].sort((left, right) => left - right),
-  );
-  assert.equal(historyCalls[0].meta.noData, false);
-  assert.deepEqual(latest, ['3']);
-  assert.equal(loadingEvents.length, 1);
-  assert.equal(loadingEvents[0].barCount, 500);
-  datafeed.destroy();
+    assert.deepEqual(calls.map((call) => call.interval), [item.interval, item.interval]);
+    assert.deepEqual(
+      calls.map((call) => call.limit),
+      [item.firstCoverage, item.continuationCoverage],
+    );
+    assert.equal(calls[0].endTimeMs, undefined);
+    assert.equal(typeof calls[1].endTimeMs, 'number');
+    assert.equal(historyCalls.length, 1);
+    assert.equal(historyCalls[0].bars.length, 300);
+    assert.equal(new Set(historyCalls[0].bars.map((bar) => bar.time)).size, 300);
+    assert.equal(historyCalls[0].meta.noData, false);
+    assert.equal(loadingEvents.length, 1);
+    assert.equal(loadingEvents[0].barCount, 300);
+    datafeed.destroy();
+  }
 });
 
 
@@ -1820,7 +2077,7 @@ test('history countBack stops after the second page reaches the target', async (
   await waitFor(() => pending.length === 2, 'history second page was not requested');
 
   assert.equal(calls[0].endTimeMs, 2_000_000_000_000);
-  assert.equal(calls[0].limit, 250);
+  assert.equal(calls[0].limit, 200);
   assert.equal(calls[1].endTimeMs, oldest + (100 * step));
   assert.equal(calls[1].limit, 100);
   pending[1].resolve(metadata(pageEndingAt(oldest + (99 * step), 100, '1')));
@@ -1850,7 +2107,7 @@ test('three-page ceiling returns partial bars without claiming noData', async ()
   const request = datafeed.getBars(
     symbolInfo('PAGE_LIMIT_PERP'),
     '1',
-    { ...period, countBack: 500 },
+    { ...period, firstDataRequest: false, countBack: 500 },
     (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
     assert.fail,
   );
@@ -1863,7 +2120,7 @@ test('three-page ceiling returns partial bars without claiming noData', async ()
   await request;
 
   assert.equal(calls.length, 3);
-  assert.deepEqual(calls.map((item) => item.limit), [500, 300, 300]);
+  assert.deepEqual(calls.map((item) => item.limit), [200, 400, 300]);
   assert.equal(historyCalls.length, 1);
   assert.equal(historyCalls[0].bars.length, 300);
   assert.equal(historyCalls[0].meta.noData, false);
@@ -1887,7 +2144,7 @@ test('countBack above 1000 is capped across at most three pages', async () => {
   const request = datafeed.getBars(
     symbolInfo('BAR_LIMIT_PERP'),
     '1',
-    { ...period, countBack: 5000 },
+    { ...period, firstDataRequest: false, countBack: 5000 },
     (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
     assert.fail,
   );
@@ -1900,7 +2157,7 @@ test('countBack above 1000 is capped across at most three pages', async () => {
   await request;
 
   assert.equal(calls.length, 3);
-  assert.deepEqual(calls.map((item) => item.limit), [1000, 300, 300]);
+  assert.deepEqual(calls.map((item) => item.limit), [200, 500, 300]);
   assert.equal(historyCalls.length, 1);
   assert.equal(historyCalls[0].bars.length, 1000);
   assert.equal(historyCalls[0].meta.noData, false);
@@ -1924,7 +2181,7 @@ test('overlapping and disordered pages merge into unique ascending bars', async 
   const request = datafeed.getBars(
     symbolInfo('MERGE_PERP'),
     '1',
-    { ...period, countBack: 300 },
+    { ...period, firstDataRequest: false, countBack: 300 },
     (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
     assert.fail,
   );
@@ -2137,7 +2394,7 @@ test('history pagination does not initialize latestBars high-water mark or onLat
 });
 
 
-test('terminal metadata remains local to one getBars flow and one datafeed', async () => {
+test('terminal metadata persists within one generation and remains isolated by datafeed', async () => {
   let apiCalls = 0;
   requestKlines = async () => {
     apiCalls += 1;
@@ -2160,6 +2417,7 @@ test('terminal metadata remains local to one getBars flow and one datafeed', asy
   };
   const firstHistory: HistoryCall[] = [];
   const secondHistory: HistoryCall[] = [];
+  const secondErrors: string[] = [];
   const first = datafeedModule.createContractTradingViewDatafeed({ symbol: 'TERMINAL_LOCAL_PERP' });
   const second = datafeedModule.createContractTradingViewDatafeed({ symbol: 'TERMINAL_LOCAL_PERP' });
 
@@ -2182,14 +2440,198 @@ test('terminal metadata remains local to one getBars flow and one datafeed', asy
     '1',
     { ...period, firstDataRequest: false },
     (bars: any[], meta: { noData?: boolean }) => secondHistory.push({ bars, meta }),
+    (reason: string) => secondErrors.push(reason),
+  );
+
+  assert.equal(apiCalls, 2);
+  assert.deepEqual(firstHistory.map((call) => call.meta.noData), [true, true]);
+  assert.deepEqual(secondHistory, []);
+  assert.equal(secondErrors.length, 1);
+  first.destroy();
+  second.destroy();
+});
+
+
+test('monthly settled coverage bounds fifty repeated getBars calls and settles every callback once', async () => {
+  const apiCalls: KlineRequest[] = [];
+  const currentEnd = 1_717_500_000_000;
+  const currentBars = pageEndingAt(currentEnd, 40, '140');
+  const nextEndTimeMs = currentBars[0].open_time;
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    if (apiCalls.length === 1) return metadata(currentBars);
+    if (apiCalls.length === 2) throw new Error('older page temporarily unavailable');
+    if (apiCalls.length === 3) {
+      return metadata([], {
+        history_complete: true,
+        has_more_before: false,
+      });
+    }
+    assert.fail(`unexpected monthly history request ${apiCalls.length}`);
+  };
+  const callbackCounts = Array.from({ length: 51 }, () => 0);
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'MONTHLY_SETTLED_STORM_PERP',
+  });
+
+  for (let attempt = 0; attempt < callbackCounts.length; attempt += 1) {
+    await datafeed.getBars(
+      symbolInfo('MONTHLY_SETTLED_STORM_PERP'),
+      '1M',
+      { ...period, firstDataRequest: false, countBack: 60 },
+      (bars: any[], meta: { noData?: boolean }) => {
+        callbackCounts[attempt] += 1;
+        historyCalls.push({ bars, meta });
+      },
+      assert.fail,
+    );
+  }
+
+  assert.equal(apiCalls.length, 3, '51 getBars calls must not become 51 HTTP calls');
+  assert.equal(apiCalls[0].endTimeMs, period.to * 1000);
+  assert.equal(apiCalls[1].endTimeMs, nextEndTimeMs);
+  assert.equal(apiCalls[2].endTimeMs, nextEndTimeMs);
+  assert.ok(callbackCounts.every((count) => count === 1));
+  assert.equal(historyCalls.length, 51);
+  assert.ok(historyCalls.every((call) => call.bars.length === 40));
+  assert.ok(historyCalls.every((call) => call.meta.noData === false));
+  datafeed.destroy();
+});
+
+
+test('partial monthly coverage upgrades from nextEndTime instead of requesting CURRENT again', async () => {
+  const apiCalls: KlineRequest[] = [];
+  const currentBars = pageEndingAt(1_718_000_000_000, 40, '180');
+  const nextEndTimeMs = currentBars[0].open_time;
+  const olderBars = pageEndingAt(nextEndTimeMs - 60_000, 20, '160');
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    if (apiCalls.length === 1) return metadata(currentBars);
+    if (apiCalls.length === 2) throw new Error('settle partial coverage');
+    if (apiCalls.length === 3) return metadata(olderBars);
+    assert.fail(`unexpected coverage upgrade request ${apiCalls.length}`);
+  };
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'MONTHLY_COVERAGE_UPGRADE_PERP',
+  });
+
+  await datafeed.getBars(
+    symbolInfo('MONTHLY_COVERAGE_UPGRADE_PERP'),
+    '1M',
+    { ...period, firstDataRequest: false, countBack: 60 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+  await datafeed.getBars(
+    symbolInfo('MONTHLY_COVERAGE_UPGRADE_PERP'),
+    '1M',
+    { ...period, firstDataRequest: false, countBack: 60 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
     assert.fail,
   );
 
-  assert.equal(apiCalls, 3);
-  assert.deepEqual(firstHistory.map((call) => call.meta.noData), [true, false]);
-  assert.deepEqual(secondHistory.map((call) => call.meta.noData), [false]);
-  first.destroy();
-  second.destroy();
+  assert.equal(apiCalls.length, 3);
+  assert.equal(apiCalls.filter((call) => call.endTimeMs === undefined).length, 0);
+  assert.equal(apiCalls[0].endTimeMs, period.to * 1000);
+  assert.equal(apiCalls[2].endTimeMs, nextEndTimeMs);
+  assert.equal(historyCalls[0].bars.length, 40);
+  assert.equal(historyCalls[1].bars.length, 60);
+  assert.equal(historyCalls[1].bars[0].close, 160);
+  assert.equal(historyCalls[1].bars.at(-1)?.close, 180);
+  datafeed.destroy();
+});
+
+
+test('terminal monthly boundary answers older requests with noData and zero additional HTTP', async () => {
+  const apiCalls: KlineRequest[] = [];
+  const currentBars = pageEndingAt(1_718_500_000_000, 40, '185');
+  const terminalBoundary = currentBars[0].open_time;
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    if (apiCalls.length === 1) return metadata(currentBars);
+    if (apiCalls.length === 2) {
+      return metadata([], {
+        history_complete: true,
+        has_more_before: false,
+      });
+    }
+    assert.fail(`unexpected request past terminal boundary ${apiCalls.length}`);
+  };
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'MONTHLY_TERMINAL_BOUNDARY_PERP',
+  });
+
+  await datafeed.getBars(
+    symbolInfo('MONTHLY_TERMINAL_BOUNDARY_PERP'),
+    '1M',
+    { ...period, countBack: 60 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+  const httpCallsAtTerminal = apiCalls.length;
+  await datafeed.getBars(
+    symbolInfo('MONTHLY_TERMINAL_BOUNDARY_PERP'),
+    '1M',
+    {
+      ...period,
+      firstDataRequest: false,
+      countBack: 60,
+      to: terminalBoundary / 1000,
+    },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.equal(httpCallsAtTerminal, 2);
+  assert.equal(apiCalls.length, httpCallsAtTerminal);
+  assert.equal(historyCalls[0].bars.length, 40);
+  assert.deepEqual(historyCalls[1], { bars: [], meta: { noData: true } });
+  datafeed.destroy();
+});
+
+
+test('settled coverage remains isolated across sequential 5m to 1M to 5m generations', async () => {
+  let now = 0;
+  currentCacheModule.contractKlineCurrentCache.now = () => now;
+  const apiCalls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    if (apiCalls.length === 1) {
+      return metadata(pageEndingAt(1_719_000_000_000, 75, '105'));
+    }
+    if (apiCalls.length === 2) {
+      return metadata(pageEndingAt(1_719_100_000_000, 60, '1000'));
+    }
+    if (apiCalls.length === 3) {
+      return metadata(pageEndingAt(1_719_200_000_000, 75, '155'));
+    }
+    assert.fail(`unexpected generation request ${apiCalls.length}`);
+  };
+  const historyCalls: HistoryCall[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'COVERAGE_GENERATION_ISOLATION_PERP',
+    category: 'CRYPTO',
+  });
+  const request = async (resolution: string) => datafeed.getBars(
+    symbolInfo('COVERAGE_GENERATION_ISOLATION_PERP'),
+    resolution,
+    { ...period, countBack: 60 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  await request('5');
+  await request('1M');
+  now = 10_000;
+  await request('5');
+
+  assert.deepEqual(apiCalls.map((call) => call.interval), ['5m', '1M', '5m']);
+  assert.deepEqual(historyCalls.map((call) => call.bars.at(-1)?.close), [105, 1000, 155]);
+  assert.ok(historyCalls.every((call) => call.meta.noData === false));
+  datafeed.destroy();
 });
 
 
@@ -2349,14 +2791,14 @@ test('destroy during shared pagination leaves the other datafeed flow intact', a
   const destroyedRequest = destroyed.getBars(
     symbolInfo('DESTROY_PAGING_PERP'),
     '1',
-    { ...period, countBack: 500 },
+    { ...period, firstDataRequest: false, countBack: 500 },
     () => { destroyedHistoryCalls += 1; },
     assert.fail,
   );
   const liveRequest = live.getBars(
     symbolInfo('DESTROY_PAGING_PERP'),
     '1',
-    { ...period, countBack: 500 },
+    { ...period, firstDataRequest: false, countBack: 500 },
     (bars: any[], meta: { noData?: boolean }) => liveHistory.push({ bars, meta }),
     assert.fail,
   );
@@ -2405,14 +2847,14 @@ test('concurrent identical multi-page flows share every HTTP page', async () => 
   const firstRequest = first.getBars(
     symbolInfo('SHARED_PAGES_PERP'),
     '1',
-    { ...period, countBack: 500 },
+    { ...period, firstDataRequest: false, countBack: 500 },
     (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
     assert.fail,
   );
   const secondRequest = second.getBars(
     symbolInfo('SHARED_PAGES_PERP'),
     '1',
-    { ...period, countBack: 500 },
+    { ...period, firstDataRequest: false, countBack: 500 },
     (bars: any[], meta: { noData?: boolean }) => secondHistory.push({ bars, meta }),
     assert.fail,
   );
@@ -2715,9 +3157,255 @@ test('high-water marks isolate symbol and interval while preserving 1M case', as
 });
 
 
-test('datafeed subscribers never take ownership of the public realtime session', () => {
-  realtimeSessionCalls.length = 0;
-  realtimeDisconnectCalls = 0;
+test('Store kline is primary and non-kline domains or same-candle legacy fallback cannot overwrite it', () => {
+  const symbol = 'STORE_PRIMARY_PERP';
+  const openTime = 1_717_100_000_000;
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'store-primary-subscriber',
+  );
+
+  ingestStoreKline({ symbol, interval: '1m', openTime, close: '101' });
+  marketStoreModule.contractMarketStore.ingest({
+    symbol,
+    domain: 'ticker',
+    data: { display_price: '999', last_price: '999' },
+    transport: 'WS',
+    eventTimeMs: openTime + 1,
+  });
+  marketStoreModule.contractMarketStore.ingest({
+    symbol,
+    domain: 'depth',
+    data: { bids: [['998', '1']], asks: [['1000', '1']] },
+    transport: 'WS',
+    eventTimeMs: openTime + 1,
+  });
+  emitRealtime(realtimeCandle(symbol, '1m', openTime, '999'));
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '102',
+    eventTimeMs: openTime + 2,
+  });
+
+  assert.deepEqual(received.map((bar) => bar.close), [101, 102]);
+  datafeed.destroy();
+});
+
+
+test('legacy kline fallback rejects provider generation and revision rollback', () => {
+  const symbol = 'LEGACY_VERSION_PERP';
+  const received: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'legacy-version-subscriber',
+  );
+  const versionedCandle = (
+    openTime: number,
+    close: string,
+    generation: number,
+    sequence: number,
+  ) => ({
+    ...realtimeCandle(symbol, '1m', openTime, close),
+    provider_generation: generation,
+    revision: { epoch: generation, sequence },
+    provider_event_time_ms: openTime + sequence,
+  });
+
+  emitRealtime(versionedCandle(1_717_100_000_000, '111', 5, 10));
+  emitRealtime(versionedCandle(1_717_100_060_000, '112', 4, 99));
+  emitRealtime(versionedCandle(1_717_100_120_000, '113', 5, 9));
+  emitRealtime(versionedCandle(1_717_100_180_000, '114', 5, 11));
+
+  assert.deepEqual(received.map((bar) => bar.close), [111, 114]);
+  datafeed.destroy();
+});
+
+
+test('Store interval switch releases the old subscriber and keeps 1M distinct from 5m', () => {
+  const symbol = 'STORE_INTERVAL_PERP';
+  const monthly: any[] = [];
+  const fiveMinute: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1M',
+    (bar: any) => monthly.push(bar),
+    'store-shared-subscriber',
+  );
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '5',
+    (bar: any) => fiveMinute.push(bar),
+    'store-shared-subscriber',
+  );
+  ingestStoreKline({
+    symbol,
+    interval: '1M',
+    openTime: 1_716_000_000_000,
+    close: '201',
+  });
+  ingestStoreKline({
+    symbol,
+    interval: '5m',
+    openTime: 1_717_100_300_000,
+    close: '202',
+  });
+
+  assert.deepEqual(monthly, []);
+  assert.deepEqual(fiveMinute.map((bar) => bar.close), [202]);
+  datafeed.destroy();
+});
+
+
+test('Store symbol switch rejects the retired symbol and only updates the replacement subscriber', () => {
+  const btcBars: any[] = [];
+  const ethBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'STORE_BTC_PERP' });
+  marketStoreModule.contractMarketStore.activateSymbol('STORE_BTC_PERP');
+  datafeed.subscribeBars(
+    symbolInfo('STORE_BTC_PERP'),
+    '1',
+    (bar: any) => btcBars.push(bar),
+    'store-symbol-subscriber',
+  );
+
+  marketStoreModule.contractMarketStore.activateSymbol('STORE_ETH_PERP');
+  datafeed.subscribeBars(
+    symbolInfo('STORE_ETH_PERP'),
+    '1',
+    (bar: any) => ethBars.push(bar),
+    'store-symbol-subscriber',
+  );
+  const retired = ingestStoreKline({
+    symbol: 'STORE_BTC_PERP',
+    interval: '1m',
+    openTime: 1_717_100_000_000,
+    close: '301',
+  });
+  ingestStoreKline({
+    symbol: 'STORE_ETH_PERP',
+    interval: '1m',
+    openTime: 1_717_100_060_000,
+    close: '302',
+  });
+
+  assert.deepEqual(retired, {
+    accepted: false,
+    reason: 'OLD_SYMBOL',
+    key: null,
+    entry: null,
+  });
+  assert.deepEqual(btcBars, []);
+  assert.deepEqual(ethBars.map((bar) => bar.close), [302]);
+  datafeed.destroy();
+});
+
+
+test('Store rejects a stale candle without notifying subscribeBars', () => {
+  const symbol = 'STORE_STALE_PERP';
+  const openTime = 1_717_100_000_000;
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'store-stale-subscriber',
+  );
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '401',
+    eventTimeMs: openTime + 200,
+  });
+  const stale = ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '400',
+    eventTimeMs: openTime + 100,
+  });
+
+  assert.equal(stale.accepted, false);
+  assert.equal(stale.reason, 'STALE_EVENT');
+  assert.deepEqual(received.map((bar) => bar.close), [401]);
+  datafeed.destroy();
+});
+
+
+test('Store rejects revision and generation rollback before realtime callback', () => {
+  const symbol = 'STORE_REVISION_PERP';
+  const openTime = 1_717_100_000_000;
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'store-revision-subscriber',
+  );
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '501',
+    eventTimeMs: openTime + 100,
+    generation: 8,
+    sequence: 20,
+  });
+  const revisionRollback = ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '500',
+    eventTimeMs: openTime + 200,
+    generation: 8,
+    sequence: 19,
+  });
+  const generationRollback = ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '499',
+    eventTimeMs: openTime + 300,
+    generation: 7,
+    sequence: 99,
+  });
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '502',
+    eventTimeMs: openTime + 400,
+    generation: 8,
+    sequence: 21,
+  });
+
+  assert.equal(revisionRollback.reason, 'REVISION_ROLLBACK');
+  assert.equal(generationRollback.reason, 'GENERATION_ROLLBACK');
+  assert.deepEqual(received.map((bar) => bar.close), [501, 502]);
+  datafeed.destroy();
+});
+
+
+test('datafeed subscribers own only kline domains and never the market session', () => {
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'SESSION_OWNER_PERP' });
 
   datafeed.subscribeBars(
@@ -2734,12 +3422,138 @@ test('datafeed subscribers never take ownership of the public realtime session',
   );
   datafeed.destroy();
 
-  assert.deepEqual(realtimeSessionCalls, []);
+  assert.deepEqual(realtimeMarketSessionCalls, []);
+  assert.deepEqual(realtimeKlineOwnerCalls, [
+    { op: 'subscribe', symbol: 'SESSION_OWNER_PERP', interval: '5m' },
+    { op: 'subscribe', symbol: 'SESSION_OWNER_PERP', interval: '1d' },
+    { op: 'unsubscribe', symbol: 'SESSION_OWNER_PERP', interval: '5m' },
+    { op: 'unsubscribe', symbol: 'SESSION_OWNER_PERP', interval: '1d' },
+  ]);
   assert.equal(realtimeDisconnectCalls, 0);
 });
 
 
-test('realtime subscribe and snapshot retain the monthly interval', () => {
+test('same subscriber UID releases the monthly owner before subscribing five minutes', () => {
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'OWNER_SWITCH_PERP' });
+
+  datafeed.subscribeBars(
+    symbolInfo('OWNER_SWITCH_PERP'),
+    '1M',
+    () => undefined,
+    'shared-subscriber',
+  );
+  datafeed.subscribeBars(
+    symbolInfo('OWNER_SWITCH_PERP'),
+    '5',
+    () => undefined,
+    'shared-subscriber',
+  );
+
+  assert.deepEqual(realtimeKlineOwnerCalls, [
+    { op: 'subscribe', symbol: 'OWNER_SWITCH_PERP', interval: '1M' },
+    { op: 'unsubscribe', symbol: 'OWNER_SWITCH_PERP', interval: '1M' },
+    { op: 'subscribe', symbol: 'OWNER_SWITCH_PERP', interval: '5m' },
+  ]);
+
+  datafeed.unsubscribeBars('shared-subscriber');
+  assert.deepEqual(realtimeKlineOwnerCalls.at(-1), {
+    op: 'unsubscribe',
+    symbol: 'OWNER_SWITCH_PERP',
+    interval: '5m',
+  });
+});
+
+
+test('late monthly callback cannot write into the replacement five-minute subscriber', () => {
+  const monthlyBars: any[] = [];
+  const fiveMinuteBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'OWNER_DELAY_PERP' });
+
+  datafeed.subscribeBars(
+    symbolInfo('OWNER_DELAY_PERP'),
+    '1M',
+    (bar: any) => monthlyBars.push(bar),
+    'shared-delayed-subscriber',
+  );
+  const retiredMonthlyHandler = realtimeKlineSubscriptions[0].handler;
+
+  datafeed.subscribeBars(
+    symbolInfo('OWNER_DELAY_PERP'),
+    '5',
+    (bar: any) => fiveMinuteBars.push(bar),
+    'shared-delayed-subscriber',
+  );
+  const activeFiveMinuteHandler = realtimeKlineSubscriptions[1].handler;
+
+  retiredMonthlyHandler(realtimeCandle('OWNER_DELAY_PERP', '1M', 1_717_000_000_000, '101'));
+  activeFiveMinuteHandler(realtimeCandle('OWNER_DELAY_PERP', '5m', 1_717_000_300_000, '102'));
+
+  assert.deepEqual(monthlyBars, []);
+  assert.deepEqual(fiveMinuteBars.map((bar) => bar.close), [102]);
+  datafeed.destroy();
+});
+
+
+test('subscriber ownership remains isolated across symbols and intervals', () => {
+  const btcBars: any[] = [];
+  const ethBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'BTC_OWNER_PERP' });
+
+  datafeed.subscribeBars(
+    symbolInfo('BTC_OWNER_PERP'),
+    '1M',
+    (bar: any) => btcBars.push(bar),
+    'btc-monthly-subscriber',
+  );
+  datafeed.subscribeBars(
+    symbolInfo('ETH_OWNER_PERP'),
+    '5',
+    (bar: any) => ethBars.push(bar),
+    'eth-five-minute-subscriber',
+  );
+
+  emitRealtime(realtimeCandle('BTC_OWNER_PERP', '1M', 1_717_000_000_000, '201'));
+  emitRealtime(realtimeCandle('ETH_OWNER_PERP', '5m', 1_717_000_300_000, '301'));
+
+  assert.deepEqual(btcBars.map((bar) => bar.close), [201]);
+  assert.deepEqual(ethBars.map((bar) => bar.close), [301]);
+  datafeed.destroy();
+});
+
+
+test('destroy invalidates callbacks before releasing every kline owner', () => {
+  const received: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'OWNER_DESTROY_PERP' });
+
+  datafeed.subscribeBars(
+    symbolInfo('OWNER_DESTROY_PERP'),
+    '1M',
+    (bar: any) => received.push(bar),
+    'destroy-monthly-subscriber',
+  );
+  datafeed.subscribeBars(
+    symbolInfo('OWNER_DESTROY_PERP'),
+    '5',
+    (bar: any) => received.push(bar),
+    'destroy-five-minute-subscriber',
+  );
+  const retiredHandlers = realtimeKlineSubscriptions.map((subscription) => subscription.handler);
+
+  datafeed.destroy();
+  retiredHandlers[0](realtimeCandle('OWNER_DESTROY_PERP', '1M', 1_717_000_000_000, '401'));
+  retiredHandlers[1](realtimeCandle('OWNER_DESTROY_PERP', '5m', 1_717_000_300_000, '402'));
+
+  assert.deepEqual(received, []);
+  assert.deepEqual(realtimeKlineOwnerCalls, [
+    { op: 'subscribe', symbol: 'OWNER_DESTROY_PERP', interval: '1M' },
+    { op: 'subscribe', symbol: 'OWNER_DESTROY_PERP', interval: '5m' },
+    { op: 'unsubscribe', symbol: 'OWNER_DESTROY_PERP', interval: '1M' },
+    { op: 'unsubscribe', symbol: 'OWNER_DESTROY_PERP', interval: '5m' },
+  ]);
+});
+
+
+test('legacy realtime subscribe and snapshot retain the monthly interval', () => {
   const sockets: MockWebSocket[] = [];
 
   class MockWebSocket {
@@ -2829,6 +3643,187 @@ test('realtime subscribe and snapshot retain the monthly interval', () => {
     assert.equal(received[0].kline.close, '105');
     unsubscribe();
     client.disconnect();
+  } finally {
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+    Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: originalWebSocket });
+  }
+});
+
+
+test('domain-aware interval switches never resubscribe or overwrite the market domain', () => {
+  const sockets: MockWebSocket[] = [];
+
+  class MockWebSocket {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSING = 2;
+    static readonly CLOSED = 3;
+
+    readyState = MockWebSocket.CONNECTING;
+    sent: string[] = [];
+    onopen: (() => void) | null = null;
+    onmessage: ((event: { data: string }) => void) | null = null;
+    onerror: (() => void) | null = null;
+    onclose: (() => void) | null = null;
+    readonly url: string;
+
+    constructor(url: string) {
+      this.url = url;
+      sockets.push(this);
+    }
+
+    send(value: string) {
+      this.sent.push(value);
+    }
+
+    close() {
+      this.readyState = MockWebSocket.CLOSED;
+    }
+  }
+
+  const originalWindow = globalThis.window;
+  const originalWebSocket = globalThis.WebSocket;
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      setTimeout(callback: () => void) {
+        callback();
+        return 1;
+      },
+      clearTimeout() {},
+    },
+  });
+  Object.defineProperty(globalThis, 'WebSocket', {
+    configurable: true,
+    value: MockWebSocket,
+  });
+
+  try {
+    const realtimeModule = loadTypeScriptModule(
+      fileURLToPath(new URL('../../../lib/realtime/contractMarketRealtime.ts', import.meta.url)),
+      {
+        '@/lib/api/core/baseUrl': {
+          getRuntimeApiBaseUrl: () => 'http://127.0.0.1:8000',
+        },
+      },
+    );
+    const client = new realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    assert.equal(sockets.length, 1);
+    const socket = sockets[0];
+    socket.readyState = MockWebSocket.OPEN;
+    socket.onopen?.();
+
+    const marketEvents: string[] = [];
+    const klineEvents: any[] = [];
+    client.subscribe('quote', () => marketEvents.push('quote'));
+    client.subscribe('depth', () => marketEvents.push('depth'));
+    client.subscribe('trade', () => marketEvents.push('trade'));
+    client.subscribe('state', () => marketEvents.push('state'));
+
+    const releaseOneMinute = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      () => undefined,
+    );
+    const releaseMonthly = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1M' },
+      () => undefined,
+    );
+    const releaseFiveMinute = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '5m' },
+      (message: unknown) => klineEvents.push(message),
+    );
+
+    const commands = socket.sent.map((item) => JSON.parse(item));
+    assert.deepEqual(
+      commands.filter((item) => item.op === 'subscribe' && item.domain === 'market'),
+      [{ op: 'subscribe', domain: 'market', symbol: 'BTCUSDT_PERP' }],
+    );
+    assert.deepEqual(
+      commands
+        .filter((item) => item.op === 'subscribe' && item.domain === 'kline')
+        .map((item) => item.interval),
+      ['1m', '1M', '5m'],
+    );
+    assert.deepEqual(
+      commands
+        .filter((item) => item.op === 'unsubscribe' && item.domain === 'kline')
+        .map((item) => item.interval),
+      ['1m', '1M'],
+    );
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'contract_market_snapshot',
+        symbol: 'BTCUSDT_PERP',
+        interval: '1M',
+        data: {
+          quote: { symbol: 'BTCUSDT_PERP', last_price: '999' },
+          depth: { symbol: 'BTCUSDT_PERP', bids: [], asks: [] },
+          trades: [{ price: '999' }],
+          market_state: { symbol: 'BTCUSDT_PERP', display_price: '999' },
+        },
+      }),
+    });
+    assert.deepEqual(marketEvents, [], 'legacy bootstrap must not enter domain-aware market handlers');
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'contract_market_snapshot',
+        domain: 'market',
+        symbol: 'BTCUSDT_PERP',
+        data: {
+          quote: { symbol: 'BTCUSDT_PERP', last_price: '100' },
+          depth: { symbol: 'BTCUSDT_PERP', bids: [], asks: [] },
+          trades: [{ price: '100' }],
+          market_state: { symbol: 'BTCUSDT_PERP', display_price: '100' },
+        },
+      }),
+    });
+    assert.deepEqual(marketEvents, ['state', 'quote', 'depth', 'trade']);
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'contract_market_state',
+        domain: 'kline',
+        symbol: 'BTCUSDT_PERP',
+        interval: '1M',
+        data: { symbol: 'BTCUSDT_PERP', display_price: '777' },
+      }),
+    });
+    assert.deepEqual(
+      marketEvents,
+      ['state', 'quote', 'depth', 'trade'],
+      'kline-domain payloads must not enter market-state handlers',
+    );
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'contract_kline_snapshot',
+        domain: 'kline',
+        symbol: 'BTCUSDT_PERP',
+        interval: '5m',
+        kline: {
+          symbol: 'BTCUSDT_PERP',
+          interval: '5m',
+          open_time: 1_717_000_000_000,
+          open: '100',
+          high: '101',
+          low: '99',
+          close: '100.5',
+          volume: '10',
+          source: 'LIVE_WS',
+        },
+      }),
+    });
+    assert.equal(klineEvents.length, 1);
+    assert.deepEqual(marketEvents, ['state', 'quote', 'depth', 'trade']);
+
+    client.disconnect();
+    releaseFiveMinute();
+    releaseMonthly();
+    releaseOneMinute();
+    releaseMarket();
   } finally {
     Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
     Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: originalWebSocket });

@@ -171,40 +171,35 @@ class ItickMarketService:
         )
         cached = self._stock_kline_cache.get(cache_key)
         now = time.time()
-        if cached and now - float(cached.get("ts", 0)) <= self.STOCK_KLINE_CACHE_TTL_SECONDS:
-            return cached.get("payload")
-
-        try:
-            params = {
-                "region": normalized_region,
-                "code": normalized_code,
-                "kType": normalized_k_type,
-                "limit": normalized_limit,
-            }
-            if normalized_end_time:
-                params["endTime"] = max(normalized_end_time - 1, 1)
-            payload = self._request_json(
-                "/kline",
-                params,
-                timeout=self.STOCK_KLINE_REQUEST_TIMEOUT,
+        if cached:
+            cache_is_fresh = (
+                now - float(cached.get("ts", 0))
+                <= self.STOCK_KLINE_CACHE_TTL_SECONDS
             )
-        except Exception as exc:
-            if cached:
-                logger.warning(
-                    "itick stock kline stale cache fallback region=%s code=%s kType=%s limit=%s error=%s",
-                    normalized_region,
-                    normalized_code,
-                    normalized_k_type,
-                    normalized_limit,
-                    exc,
-                )
-                return cached.get("payload")
-            raise
+            cached_payload = cached.get("payload")
+            if cache_is_fresh and self._kline_payload_has_items(cached_payload):
+                return cached_payload
+            self._stock_kline_cache.pop(cache_key, None)
 
-        self._stock_kline_cache[cache_key] = {
-            "ts": now,
-            "payload": payload,
+        params = {
+            "region": normalized_region,
+            "code": normalized_code,
+            "kType": normalized_k_type,
+            "limit": normalized_limit,
         }
+        if normalized_end_time:
+            params["et"] = max(normalized_end_time - 1, 1)
+        payload = self._request_json(
+            "/kline",
+            params,
+            timeout=self.STOCK_KLINE_REQUEST_TIMEOUT,
+        )
+
+        if self._kline_payload_has_items(payload):
+            self._stock_kline_cache[cache_key] = {
+                "ts": now,
+                "payload": payload,
+            }
         return payload
 
     def get_stock_depth(self, region: str, code: str, limit: int = 20) -> Any:
@@ -307,7 +302,7 @@ class ItickMarketService:
             "limit": self._normalize_limit(limit),
         }
         if end_time_ms:
-            params["endTime"] = max(int(end_time_ms) - 1, 1)
+            params["et"] = max(int(end_time_ms) - 1, 1)
         return self._request_json(
             "/kline",
             params,
@@ -431,6 +426,19 @@ class ItickMarketService:
                 self._set_response_cache(response_cache_key, payload)
 
         return payload
+
+    @staticmethod
+    def _kline_payload_has_items(payload: Any) -> bool:
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        if isinstance(data, list):
+            return any(isinstance(item, (dict, list, tuple)) for item in data)
+        if isinstance(data, dict):
+            return any(
+                isinstance(items, list)
+                and any(isinstance(item, (dict, list, tuple)) for item in items)
+                for items in data.values()
+            )
+        return False
 
     def _extract_quote_items(self, payload: Any) -> List[Dict[str, Any]]:
         data = payload.get("data") if isinstance(payload, dict) else payload

@@ -1032,7 +1032,7 @@ def _normalize_kline_history_boundary_scope(value: Optional[str]) -> str:
 def _kline_history_boundary_interval_supported(interval: str, boundary_scope: str) -> bool:
     if boundary_scope == KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL:
         return interval in _INTERNAL_KLINE_HISTORY_BOUNDARY_INTERVALS
-    return interval == "1Mutc"
+    return interval in {"1M", "1Mutc"}
 
 
 def _kline_history_boundary_cache_key(
@@ -1087,18 +1087,23 @@ def _read_kline_history_boundary_cache(
         return None
     try:
         earliest_available_time = int(cached.get("earliest_available_time") or 0)
+        boundary_cursor = int(cached.get("boundary_cursor") or 0)
     except (TypeError, ValueError):
         return None
     terminal_reason = str(cached.get("terminal_reason") or "").strip()
-    if earliest_available_time <= 0 or not terminal_reason:
+    if (earliest_available_time <= 0 and boundary_cursor <= 0) or not terminal_reason:
         return None
-    return {
+    result: dict[str, Any] = {
         "symbol": normalized_symbol,
         "interval": normalized_interval,
-        "earliest_available_time": earliest_available_time,
         "terminal_reason": terminal_reason,
         "boundary_scope": normalized_scope,
     }
+    if earliest_available_time > 0:
+        result["earliest_available_time"] = earliest_available_time
+    if boundary_cursor > 0:
+        result["boundary_cursor"] = boundary_cursor
+    return result
 
 
 def _write_kline_history_boundary_cache(
@@ -1106,8 +1111,9 @@ def _write_kline_history_boundary_cache(
     market_type: str,
     symbol: str,
     interval: str,
-    earliest_available_time: int,
     terminal_reason: str,
+    earliest_available_time: Optional[int] = None,
+    boundary_cursor: Optional[int] = None,
     boundary_scope: str = KLINE_HISTORY_BOUNDARY_SCOPE_PROVIDER,
 ) -> Optional[dict[str, Any]]:
     normalized_symbol = _normalize_symbol(symbol)
@@ -1116,21 +1122,28 @@ def _write_kline_history_boundary_cache(
     normalized_scope = _normalize_kline_history_boundary_scope(boundary_scope)
     try:
         normalized_earliest_available_time = int(earliest_available_time or 0)
+        normalized_boundary_cursor = int(boundary_cursor or 0)
     except (TypeError, ValueError):
         return None
     if (
         not _kline_history_boundary_interval_supported(normalized_interval, normalized_scope)
-        or normalized_earliest_available_time <= 0
+        or (
+            normalized_earliest_available_time <= 0
+            and normalized_boundary_cursor <= 0
+        )
         or not normalized_terminal_reason
     ):
         return None
 
-    payload = {
+    payload: dict[str, Any] = {
         "symbol": normalized_symbol,
         "interval": normalized_interval,
-        "earliest_available_time": normalized_earliest_available_time,
         "terminal_reason": normalized_terminal_reason,
     }
+    if normalized_earliest_available_time > 0:
+        payload["earliest_available_time"] = normalized_earliest_available_time
+    if normalized_boundary_cursor > 0:
+        payload["boundary_cursor"] = normalized_boundary_cursor
     if normalized_scope == KLINE_HISTORY_BOUNDARY_SCOPE_INTERNAL:
         payload["boundary_scope"] = normalized_scope
     cache_set_json(
@@ -1165,8 +1178,10 @@ def _cached_kline_history_boundary_result(
     )
     if not boundary:
         return None
-    earliest_available_time = int(boundary["earliest_available_time"])
-    if int(end_time_ms) > earliest_available_time:
+    earliest_available_time = int(boundary.get("earliest_available_time") or 0) or None
+    boundary_cursor = int(boundary.get("boundary_cursor") or 0) or None
+    confirmed_boundary = earliest_available_time or boundary_cursor
+    if confirmed_boundary is None or int(end_time_ms) > confirmed_boundary:
         return None
     normalized_scope = _normalize_kline_history_boundary_scope(boundary_scope)
     return KlineCacheResult(
@@ -1638,16 +1653,28 @@ def _get_klines_cache_first(
             interval=normalized_interval,
             open_time_validator=open_time_validator,
         )
-        if (
-            end_time_ms is not None
-            and earliest_available_time is not None
-            and int(end_time_ms) <= earliest_available_time
+        contract_monthly_boundary_without_anchor = bool(
+            str(market_type or "").strip().upper() == "CONTRACT"
+            and normalized_interval == "1M"
+            and earliest_available_time is None
+        )
+        if end_time_ms is not None and (
+            contract_monthly_boundary_without_anchor
+            or (
+                earliest_available_time is not None
+                and int(end_time_ms) <= earliest_available_time
+            )
         ):
             _write_kline_history_boundary_cache(
                 market_type=market_type,
                 symbol=normalized_symbol,
                 interval=normalized_interval,
                 earliest_available_time=earliest_available_time,
+                boundary_cursor=(
+                    int(end_time_ms)
+                    if earliest_available_time is None
+                    else None
+                ),
                 terminal_reason=KLINE_TERMINAL_REASON_PROVIDER_HISTORY_BOUNDARY,
             )
             return KlineCacheResult(
