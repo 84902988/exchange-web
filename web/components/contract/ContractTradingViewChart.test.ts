@@ -1,10 +1,24 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- Dynamic test harness loads compiled TSX exports. */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { test as nodeTest } from 'node:test';
 import ts from 'typescript';
 
+const test = (
+  globalThis as typeof globalThis & { test?: typeof nodeTest }
+).test || nodeTest;
+
+function resolveWebTestFile(...relativePath: string[]) {
+  const webRoot = existsSync(resolve(process.cwd(), 'components', 'contract'))
+    ? process.cwd()
+    : resolve(process.cwd(), 'web');
+  return resolve(webRoot, ...relativePath);
+}
+
+function resolveContractTestFile(relativePath: string) {
+  return resolveWebTestFile('components', 'contract', relativePath);
+}
 
 function loadTypeScriptModule(
   filePath: string,
@@ -55,19 +69,34 @@ const intervalToResolution = (interval: string) => ({
 }[interval] || '1');
 
 const policyModule = loadTypeScriptModule(
-  fileURLToPath(new URL('./tradingview/contractKlineCachePolicy.ts', import.meta.url)),
+  resolveContractTestFile('tradingview/contractKlineCachePolicy.ts'),
   {},
 );
 const loadPolicyModule = loadTypeScriptModule(
-  fileURLToPath(new URL('./tradingview/contractKlineLoadPolicy.ts', import.meta.url)),
+  resolveContractTestFile('tradingview/contractKlineLoadPolicy.ts'),
   {},
 );
+const lifecycleProtocolModule = loadTypeScriptModule(
+  resolveWebTestFile('components/tradingview/klineLifecycleProtocol.ts'),
+  {},
+);
+const lifecycleRuntimeModule = loadTypeScriptModule(
+  resolveWebTestFile('components/tradingview/klineLifecycleRuntimeCoordinator.ts'),
+  {
+    './klineLifecycleProtocol': lifecycleProtocolModule,
+    './klineLifecycleObservability': {
+      recordKlineLifecycleDecision: () => undefined,
+      recordKlineLifecycleResetExecution: () => undefined,
+    },
+  },
+);
 const chartModule = loadTypeScriptModule(
-  fileURLToPath(new URL('./ContractTradingViewChart.tsx', import.meta.url)),
+  resolveContractTestFile('ContractTradingViewChart.tsx'),
   {
     react: {
       useCallback: (callback: unknown) => callback,
       useEffect() {},
+      useLayoutEffect() {},
       useId: () => 'test-id',
       useMemo: (factory: () => unknown) => factory(),
       useRef: (value: unknown) => ({ current: value }),
@@ -85,6 +114,8 @@ const chartModule = loadTypeScriptModule(
     '@/components/spot/tradingview/spotTradingViewResolutionState': {
       setSpotToolbarLoadingState: () => undefined,
     },
+    '@/components/tradingview/klineLifecycleProtocol': lifecycleProtocolModule,
+    '@/components/tradingview/klineLifecycleRuntimeCoordinator': lifecycleRuntimeModule,
     '@/components/tradingview/tradingViewViewportLifecycle': {
       applyTradingViewViewport: async () => ({
         applied: true,
@@ -436,31 +467,380 @@ test('rapid resolution changes ignore stale dataReady completion and keep the la
 });
 
 
-test('5m to 1M to 5m requests the second 5m while 1M is still in flight', () => {
-  const committedFiveMinute = {
-    requestedResolution: '5',
-    committedResolution: '5',
-    activeTradingViewResolution: '5',
-    inFlightResolution: '',
-  };
-  assert.equal(chartModule.shouldRequestContractResolution(committedFiveMinute, '1M'), true);
+function createContractRuntime(overrides: Record<string, unknown> = {}) {
+  return new lifecycleRuntimeModule.KlineLifecycleRuntimeCoordinator({
+    terminalType: 'CONTRACT',
+    widgetGeneration: 7,
+    datafeedInstanceId: 41,
+    symbol: 'BTCUSDT_PERP',
+    ...overrides,
+  });
+}
 
-  const monthlyInFlight = {
-    requestedResolution: '1M',
-    committedResolution: '5',
-    activeTradingViewResolution: '1M',
-    inFlightResolution: '2:1M',
+function beginContractRuntime(
+  coordinator: any,
+  resolution = '1',
+  interval = '1m',
+) {
+  return coordinator.beginIntent({ tradingViewResolution: resolution, backendInterval: interval });
+}
+
+function runtimeEvidence(identity: any, generation = identity.intentId) {
+  return {
+    ...identity,
+    subscriberUid: `subscriber-${generation}`,
+    subscriptionGeneration: generation,
+    ownerId: `owner-${generation}`,
   };
-  assert.equal(
-    chartModule.shouldRequestContractResolution(monthlyInFlight, '1M'),
-    false,
-    'the same in-flight target must remain deduplicated',
+}
+
+test('5m to 1M to 5m transport defers the latest session while one request is active', () => {
+  const runtime = createContractRuntime();
+  const transport = new chartModule.ContractResolutionIntentCoordinator();
+  const monthly = beginContractRuntime(runtime, '1M', '1M').identity;
+  const monthlyRequest = transport.request({
+    sessionId: monthly.sessionId,
+    resolution: monthly.tradingViewResolution,
+    intentId: monthly.intentId,
+  }, { canStart: true, isLatest: true });
+  assert.equal(monthlyRequest.action, 'start');
+
+  const finalFive = beginContractRuntime(runtime, '5', '5m').identity;
+  const pending = transport.request({
+    sessionId: finalFive.sessionId,
+    resolution: finalFive.tradingViewResolution,
+    intentId: finalFive.intentId,
+  }, { canStart: true, isLatest: true });
+  assert.equal(pending.action, 'pending');
+  assert.equal(runtime.snapshot().candidate?.sessionId, finalFive.sessionId);
+  assert.equal(transport.snapshot().activeToken?.sessionId, monthly.sessionId);
+});
+
+test('settling old transport lets the Runtime latest session start without legacy commit', () => {
+  const runtime = createContractRuntime();
+  const transport = new chartModule.ContractResolutionIntentCoordinator();
+  const first = beginContractRuntime(runtime, '1D', '1d').identity;
+  const firstRequest = transport.request({
+    sessionId: first.sessionId,
+    resolution: first.tradingViewResolution,
+    intentId: first.intentId,
+  }, { canStart: true, isLatest: true });
+  const latest = beginContractRuntime(runtime, '1', '1m').identity;
+
+  assert.equal(transport.settle(firstRequest.token).accepted, true);
+  assert.equal(runtime.applyResolution(first).accepted, false, 'retired session cannot resolve');
+  const latestRequest = transport.request({
+    sessionId: latest.sessionId,
+    resolution: latest.tradingViewResolution,
+    intentId: latest.intentId,
+  }, { canStart: true, isLatest: true });
+  assert.equal(latestRequest.action, 'start');
+  assert.equal(runtime.snapshot().committed, null);
+});
+
+test('transport coordinator snapshot contains scheduling state and no lifecycle truth', () => {
+  const transport = new chartModule.ContractResolutionIntentCoordinator();
+  const decision = transport.request({ sessionId: 'session-1', resolution: '1', intentId: 1 }, {
+    canStart: true,
+    isLatest: true,
+  });
+  assert.equal(decision.action, 'start');
+  assert.deepEqual(Object.keys(transport.snapshot()).sort(), ['activeToken', 'requestSequence']);
+  assert.equal('committedResolution' in transport.snapshot(), false);
+  assert.equal('lifecycleState' in transport.snapshot(), false);
+  const source = readFileSync(resolveContractTestFile('ContractTradingViewChart.tsx'), 'utf8');
+  assert.match(source, /new KlineLifecycleRuntimeCoordinator\(/);
+  assert.doesNotMatch(
+    source,
+    /committedResolutionRef|commitLifecycle|registerLifecycleSession|markLifecycleResolutionApplied|markLifecycleSubscriberReady/,
   );
+});
+
+test('transport reset invalidates the active request token without committing lifecycle state', () => {
+  const transport = new chartModule.ContractResolutionIntentCoordinator();
+  const decision = transport.request({ sessionId: 'session-1', resolution: '1', intentId: 1 }, {
+    canStart: true,
+    isLatest: true,
+  });
+  assert.equal(transport.isCurrent(decision.token), true);
+  transport.reset();
+  assert.equal(transport.isCurrent(decision.token), false);
+  assert.equal(transport.settle(decision.token).accepted, false);
+});
+
+
+test('resolution commit recheck is bounded and exhausts exactly once', () => {
+  const clock = new FakeClock();
+  let retryCalls = 0;
+  let exhaustedCalls = 0;
+  const retryController: any = new chartModule.ContractResolutionCommitRetryController({
+    clock,
+    delayMs: 10,
+    maxAttempts: 2,
+    onRetry: () => {
+      retryCalls += 1;
+      retryController.requestRetry();
+    },
+    onExhausted: () => { exhaustedCalls += 1; },
+  });
+
+  assert.equal(retryController.requestRetry(), true);
+  clock.advanceBy(20);
+  assert.equal(retryCalls, 2);
+  assert.equal(exhaustedCalls, 1);
+  assert.deepEqual(retryController.snapshot(), {
+    attempts: 2,
+    pending: false,
+    finished: true,
+  });
+  assert.equal(retryController.requestRetry(), false);
+  assert.equal(exhaustedCalls, 1);
+});
+
+
+test('deferred resolution continuation revalidates token widget generation and target', () => {
+  const token = { resolution: '1', intentId: 2, requestSequence: 3 };
+  const guardNames = ['token', 'widget', 'generation', 'target'] as const;
+
+  for (const rejectedGuard of guardNames) {
+    const scheduledMicrotasks: Array<() => void> = [];
+    const guards = {
+      token: true,
+      widget: true,
+      generation: true,
+      target: true,
+    };
+    let readyCalls = 0;
+    let rejectedCalls = 0;
+    chartModule.scheduleContractResolutionContinuation({
+      token,
+      isTokenCurrent: () => guards.token,
+      isWidgetCurrent: () => guards.widget,
+      isGenerationCurrent: () => guards.generation,
+      isTargetResolutionCurrent: () => guards.target,
+      onReady: () => { readyCalls += 1; },
+      onRejected: () => { rejectedCalls += 1; },
+      schedule: (callback: () => void) => scheduledMicrotasks.push(callback),
+    });
+
+    guards[rejectedGuard] = false;
+    scheduledMicrotasks.shift()?.();
+    assert.equal(readyCalls, 0, `${rejectedGuard} must be checked at execution time`);
+    assert.equal(rejectedCalls, 1);
+  }
+});
+
+
+function lifecycleEvidence(session: any, generation = 1) {
+  return {
+    ...lifecycleProtocolModule.getKlineLifecycleSessionIdentity(session),
+    subscriberUid: `subscriber-${session.backendInterval}-${generation}`,
+    subscriptionGeneration: generation,
+    ownerId: `owner-${session.backendInterval}-${generation}`,
+  };
+}
+
+test('Contract initial resolution follows REGISTER then RESOLUTION then SUBSCRIBER then COMMIT', () => {
+  const runtime = createContractRuntime();
+  const initial = beginContractRuntime(runtime, '1', '1m');
+  assert.equal(initial.decision.state.candidate?.state, 'INTENT_PENDING');
+  assert.equal(runtime.tryCommit(initial.identity).accepted, false);
+  assert.equal(runtime.applyResolution(initial.identity).state.candidate?.state, 'RESOLUTION_APPLIED');
+  assert.equal(runtime.tryCommit(initial.identity).accepted, false);
   assert.equal(
-    chartModule.shouldRequestContractResolution(monthlyInFlight, '5'),
+    runtime.recordSubscriber(runtimeEvidence(initial.identity, 1)).state.candidate?.state,
+    'SUBSCRIBER_READY',
+  );
+  assert.equal(runtime.tryCommit(initial.identity).state.committed?.state, 'COMMITTED');
+});
+
+test('resolution ready without realtime subscription evidence cannot commit', () => {
+  const runtime = createContractRuntime();
+  const { identity } = beginContractRuntime(runtime);
+  runtime.applyResolution(identity);
+  assert.equal(runtime.tryCommit(identity).accepted, false);
+  assert.equal(runtime.snapshot().candidate?.state, 'RESOLUTION_APPLIED');
+});
+
+test('subscriber readiness before resolution cannot commit', () => {
+  const runtime = createContractRuntime();
+  const { identity } = beginContractRuntime(runtime);
+  runtime.recordSubscriber(runtimeEvidence(identity, 2));
+  assert.equal(runtime.tryCommit(identity).accepted, false);
+  assert.equal(runtime.snapshot().candidate?.state, 'INTENT_PENDING');
+});
+
+test('matching resolution and subscriber evidence is the only Contract commit path', () => {
+  const runtime = createContractRuntime();
+  const { identity } = beginContractRuntime(runtime);
+  runtime.recordSubscriber(runtimeEvidence(identity, 3));
+  runtime.applyResolution(identity);
+  assert.equal(runtime.snapshot().candidate?.state, 'SUBSCRIBER_READY');
+  assert.equal(runtime.tryCommit(identity).accepted, true);
+  assert.equal(runtime.snapshot().committed?.sessionId, identity.sessionId);
+});
+
+test('rapid 1m to 5m to 1D to 1M commits only the final Contract intent', () => {
+  const runtime = createContractRuntime();
+  const identities = [
+    beginContractRuntime(runtime, '1', '1m').identity,
+    beginContractRuntime(runtime, '5', '5m').identity,
+    beginContractRuntime(runtime, '1D', '1d').identity,
+    beginContractRuntime(runtime, '1M', '1M').identity,
+  ];
+  for (const identity of identities.slice(0, -1)) {
+    assert.equal(runtime.applyResolution(identity).accepted, false);
+    assert.equal(runtime.recordSubscriber(runtimeEvidence(identity)).accepted, false);
+    assert.equal(runtime.tryCommit(identity).accepted, false);
+  }
+  const latest = identities.at(-1);
+  runtime.applyResolution(latest);
+  runtime.recordSubscriber(runtimeEvidence(latest, 9));
+  assert.equal(runtime.tryCommit(latest).accepted, true);
+  assert.equal(runtime.snapshot().committed?.backendInterval, '1M');
+});
+
+test('old resolution subscriber and commit callbacks are rejected after a newer intent', () => {
+  const runtime = createContractRuntime();
+  const oldIdentity = beginContractRuntime(runtime, '1', '1m').identity;
+  const latest = beginContractRuntime(runtime, '5', '5m').identity;
+  assert.equal(runtime.applyResolution(oldIdentity).reason, 'STALE_SESSION');
+  assert.equal(runtime.recordSubscriber(runtimeEvidence(oldIdentity, 1)).reason, 'STALE_SESSION');
+  assert.equal(runtime.tryCommit(oldIdentity).accepted, false);
+  assert.equal(runtime.snapshot().candidate?.sessionId, latest.sessionId);
+});
+
+test('Spot and Contract produce the same final state for one lifecycle event sequence', () => {
+  const run = (terminalType: 'SPOT' | 'CONTRACT') => {
+    const session = lifecycleProtocolModule.createKlineLifecycleSession({
+      terminalType,
+      widgetGeneration: 4,
+      datafeedInstanceId: 8,
+      intentId: 12,
+      symbol: 'BTCUSDT',
+      tradingViewResolution: '5',
+      backendInterval: '5m',
+    });
+    const identity = lifecycleProtocolModule.getKlineLifecycleSessionIdentity(session);
+    const evidence = lifecycleEvidence(session, 6);
+    let state = lifecycleProtocolModule.createInitialKlineLifecycleProtocolState();
+    state = lifecycleProtocolModule.reduceKlineLifecycle(
+      state,
+      { type: 'REGISTER_INTENT', session },
+    ).state;
+    state = lifecycleProtocolModule.reduceKlineLifecycle(
+      state,
+      { type: 'SUBSCRIBER_READY', evidence },
+    ).state;
+    state = lifecycleProtocolModule.reduceKlineLifecycle(
+      state,
+      { type: 'RESOLUTION_APPLIED', identity },
+    ).state;
+    state = lifecycleProtocolModule.reduceKlineLifecycle(
+      state,
+      { type: 'COMMIT', evidence },
+    ).state;
+    return {
+      latestIntentId: state.latestIntentId,
+      candidateState: state.candidate?.state || null,
+      committedState: state.committed?.state || null,
+      rearmUsed: state.candidateRearmUsed,
+    };
+  };
+
+  assert.deepEqual(run('CONTRACT'), run('SPOT'));
+});
+
+test('BTC to ETH to BTC supersedes old Contract sessions and rejects their late evidence', () => {
+  const firstBtc = createContractRuntime({ widgetGeneration: 1, datafeedInstanceId: 11 });
+  const firstIdentity = beginContractRuntime(firstBtc).identity;
+  firstBtc.retireAll('SYMBOL_SWITCH');
+  const eth = createContractRuntime({
+    widgetGeneration: 2,
+    datafeedInstanceId: 12,
+    symbol: 'ETHUSDT_PERP',
+  });
+  eth.retireAll('SYMBOL_SWITCH');
+  const secondBtc = createContractRuntime({ widgetGeneration: 3, datafeedInstanceId: 13 });
+  const secondIdentity = beginContractRuntime(secondBtc).identity;
+
+  assert.equal(firstBtc.recordSubscriber(runtimeEvidence(firstIdentity, 9)).accepted, false);
+  assert.notEqual(secondIdentity.sessionId, firstIdentity.sessionId);
+  assert.equal(secondBtc.snapshot().candidate?.symbol, 'BTCUSDT_PERP');
+});
+
+test('rapid 1m to 5m to 1D to 1M to 5m commits only the latest Contract intent', () => {
+  const runtime = createContractRuntime();
+  const sessions: any[] = [];
+  for (const [resolution, interval] of [
+    ['1', '1m'],
+    ['5', '5m'],
+    ['1D', '1d'],
+    ['1M', '1M'],
+    ['5', '5m'],
+  ]) {
+    sessions.push(beginContractRuntime(runtime, resolution, interval).identity);
+  }
+  const finalSession = sessions.at(-1);
+  assert.equal(runtime.applyResolution(sessions[1]).accepted, false);
+  runtime.applyResolution(finalSession);
+  runtime.recordSubscriber(runtimeEvidence(finalSession, 11));
+  assert.equal(runtime.tryCommit(finalSession).accepted, true);
+  assert.equal(runtime.snapshot().committed?.intentId, finalSession.intentId);
+  assert.equal(runtime.snapshot().committed?.backendInterval, '5m');
+});
+
+test('Contract widget destroy retires the generation and rejects late subscriber callbacks', () => {
+  const runtime = createContractRuntime({ widgetGeneration: 18 });
+  const { identity } = beginContractRuntime(runtime);
+  runtime.applyResolution(identity);
+  const retired = runtime.retireAll('WIDGET_DESTROY');
+
+  assert.equal(retired.accepted, true);
+  assert.equal(retired.retired[0]?.state, 'RETIRED');
+  assert.equal(runtime.applyResolution(identity).accepted, false);
+  assert.equal(runtime.recordSubscriber(runtimeEvidence(identity, 4)).accepted, false);
+  assert.equal(runtime.tryCommit(identity).accepted, false);
+});
+
+test('missing subscriber and restored baseline share one Contract rearm budget', () => {
+  const runtime = createContractRuntime();
+  const { identity } = beginContractRuntime(runtime);
+  runtime.applyResolution(identity);
+  const first = runtime.requestRearm(identity, 'RESTORED_BASELINE');
+  const second = runtime.requestRearm(identity, 'SUBSCRIBER_MISSING');
+  assert.equal(first.allowed, true);
+  assert.equal(first.permit?.source, 'RESTORED_BASELINE');
+  assert.equal(second.allowed, false);
+  assert.equal(second.reason, 'REARM_ALREADY_USED');
+  const beforeObservation = runtime.snapshot();
+  runtime.recordResetExecution(
+    identity,
+    'RESTORED_BASELINE',
     true,
-    'the old committed 5m value must not suppress the return setResolution request',
+    'RESET_EXECUTED',
+    runtimeEvidence(identity, 1),
   );
+  runtime.recordResetExecution(
+    identity,
+    'SUBSCRIBER_MISSING',
+    false,
+    'RESET_EXECUTION_FAILED',
+  );
+  assert.deepEqual(runtime.snapshot(), beforeObservation);
+});
+
+test('Contract Runtime keeps at most one candidate and one committed session', () => {
+  const runtime = createContractRuntime();
+  const committedIdentity = beginContractRuntime(runtime).identity;
+  runtime.applyResolution(committedIdentity);
+  runtime.recordSubscriber(runtimeEvidence(committedIdentity, 1));
+  runtime.tryCommit(committedIdentity);
+  const candidateIdentity = beginContractRuntime(runtime, '5', '5m').identity;
+  const state = runtime.snapshot();
+  assert.equal(state.committed?.sessionId, committedIdentity.sessionId);
+  assert.equal(state.candidate?.sessionId, candidateIdentity.sessionId);
+  assert.equal('retired' in state, false);
 });
 
 
@@ -615,6 +995,93 @@ test('native TradingView last value and main price line are disabled', () => {
     'mainSeriesProperties.showPriceLine': false,
     'scalesProperties.showSeriesLastValue': false,
   });
+});
+
+function makeReferencePrice(
+  value: number | null,
+  overrides: Record<string, unknown> = {},
+) {
+  const usable = value !== null;
+  return {
+    value,
+    domain: usable ? 'TRADES' : 'UNAVAILABLE',
+    source: usable ? 'CONTRACT_TRADES' : null,
+    provider: usable ? 'BINANCE_USDM' : null,
+    freshness: usable ? 'LIVE' : null,
+    eventTimeMs: usable ? 1_720_000_000_000 : null,
+    receivedAtMs: usable ? 1_720_000_000_100 : null,
+    generation: usable ? 9 : null,
+    revision: usable ? { epoch: 9, sequence: 12, isClosed: false, checksum: null } : null,
+    usable,
+    rejectReason: usable ? null : 'REFERENCE_PRICE_UNAVAILABLE',
+    symbol: 'BTCUSDT_PERP',
+    interval: '1m',
+    role: usable ? 'LAST_TRADE' : 'UNAVAILABLE',
+    ...overrides,
+  };
+}
+
+test('last trade reference 100 produces overlay 100', () => {
+  const overlayPrice = chartModule.resolveContractTradingViewOverlayPrice(
+    makeReferencePrice(100),
+    'BTCUSDT_PERP',
+  );
+
+  assert.equal(overlayPrice, 100);
+});
+
+test('Kline close remains 99 while last-trade overlay remains 100', () => {
+  const candle = { open: 98, high: 101, low: 97, close: 99 };
+  const overlayPrice = chartModule.resolveContractTradingViewOverlayPrice(
+    makeReferencePrice(100),
+    'BTCUSDT_PERP',
+  );
+
+  assert.equal(candle.close, 99);
+  assert.equal(overlayPrice, 100);
+});
+
+test('mark, index, book mid, and execution prices cannot influence overlay', () => {
+  const authority = {
+    reference_price: makeReferencePrice(100),
+    mark_price: { value: 110 },
+    index_price: { value: 111 },
+    book_mid_price: { value: 112 },
+    execution_bid: { value: 99 },
+    execution_ask: { value: 101 },
+  };
+  const overlayPrice = chartModule.resolveContractTradingViewOverlayPrice(
+    authority.reference_price,
+    'BTCUSDT_PERP',
+  );
+
+  assert.equal(overlayPrice, 100);
+  for (const domain of ['MARK', 'INDEX', 'DEPTH', 'EXECUTION']) {
+    assert.equal(
+      chartModule.resolveContractTradingViewOverlayPrice(
+        makeReferencePrice(110, { domain }),
+        'BTCUSDT_PERP',
+      ),
+      null,
+    );
+  }
+});
+
+test('unavailable or previous-symbol reference does not produce an overlay', () => {
+  assert.equal(
+    chartModule.resolveContractTradingViewOverlayPrice(
+      makeReferencePrice(null),
+      'BTCUSDT_PERP',
+    ),
+    null,
+  );
+  assert.equal(
+    chartModule.resolveContractTradingViewOverlayPrice(
+      makeReferencePrice(100, { symbol: 'BTCUSDT_PERP' }),
+      'ETHUSDT_PERP',
+    ),
+    null,
+  );
 });
 
 function createOverlayLifecycleHarness() {

@@ -153,13 +153,12 @@ type SpotTradingViewDatafeed = {
     onResetCacheNeeded?: () => void,
   ) => void;
   unsubscribeBars: (subscriberUid: string) => void;
+  getDatafeedInstanceId: () => number;
+  getRealtimeSubscriptionReadiness: (
+    symbol: string,
+    interval: string,
+  ) => SpotRealtimeSubscriptionReadiness | null;
   getActiveRealtimeIntervals: () => string[];
-  syncRealtimeKlineSubscription: (interval: string, reason?: string) => {
-    previousIntervals: string[];
-    activeIntervals: string[];
-    droppedIntervals: string[];
-    changed: boolean;
-  };
   destroy: () => void;
 };
 
@@ -171,10 +170,20 @@ type SpotTradingViewDatafeedOptions = Pick<
   onKlineLoadStateChange?: (state: SpotKlineLoadState) => void;
   onKlineRealtime?: (event: SpotTradingViewRealtimeEvent) => void;
   onHistoryBars?: (event: SpotTradingViewHistoryBarsEvent) => void;
+  onRealtimeSubscriptionReady?: (evidence: SpotRealtimeSubscriptionReadiness) => void;
   inFlightDeadlineMs?: Partial<Record<SpotKlineInFlightRole, number>>;
   getBarsWatchdogMs?: number;
   getBarsHardTimeoutMs?: number;
 };
+
+export type SpotRealtimeSubscriptionReadiness = Readonly<{
+  datafeedInstanceId: number;
+  subscriberUid: string;
+  subscriptionGeneration: number;
+  ownerId: string;
+  symbol: string;
+  interval: string;
+}>;
 
 export type SpotTradingViewHistoryBarsEvent = {
   requestSeq: number;
@@ -293,11 +302,11 @@ const SPOT_INTERVAL_TO_RESOLUTION: Record<string, TradingViewResolution> = {
 };
 const ASIA_SHANGHAI_OFFSET_MS = 8 * 60 * 60_000;
 const TRADINGVIEW_TIMEZONE = 'Asia/Shanghai';
-const realtimeHighWaterMarkByKey = new Map<string, number>();
 let forcedSpotTradingViewDebugEnabled = false;
 let spotTradingViewGetBarsRequestSeq = 0;
 let spotTradingViewDatafeedInstanceSeq = 0;
 const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
+const SPOT_TV_REALTIME_HIGH_WATER_CAPACITY = 128;
 const SPOT_TV_GETBARS_API_PAGE_LIMIT = 500;
 const SPOT_TV_GETBARS_MAX_INTERNAL_BARS = 1000;
 const SPOT_TV_GETBARS_MAX_INTERNAL_PAGES = 3;
@@ -1031,18 +1040,6 @@ function providerOpenTimeToTradingViewTimeMs(
   return normalizedTime;
 }
 
-function getRealtimeHighWaterMark(latestBarKey: string): number {
-  return realtimeHighWaterMarkByKey.get(latestBarKey) || 0;
-}
-
-function rememberRealtimeHighWaterMark(latestBarKey: string, time: number) {
-  if (!Number.isFinite(time) || time <= 0) return;
-  const previous = getRealtimeHighWaterMark(latestBarKey);
-  if (time > previous) {
-    realtimeHighWaterMarkByKey.set(latestBarKey, time);
-  }
-}
-
 function getPriceScale(precision?: number | null): number {
   const nextPrecision = Number(precision);
   if (!Number.isInteger(nextPrecision) || nextPrecision < 0 || nextPrecision > 12) {
@@ -1551,6 +1548,7 @@ export function createSpotTradingViewDatafeed(
   let activeGetBarsLatestBarKey = '';
   let activeRevisionInterval = '';
   let activeSWRRevalidateSequence = 0;
+  let subscriptionGenerationSequence = 0;
   const realtimeOwner = `tradingview:${apiSymbol}:${datafeedInstanceId}`;
   const latestBars = new Map<string, TradingViewBar>();
   const latestBarKeyByUid = new Map<string, string>();
@@ -1558,10 +1556,30 @@ export function createSpotTradingViewDatafeed(
   const lastEmittedBarTimeByUid = new Map<string, number>();
   const lastDroppedRealtimeBarByUid = new Map<string, string>();
   const activeSubscriptionKeyByUid = new Map<string, string>();
+  const activeSubscriptionGenerationByUid = new Map<string, number>();
+  const readinessByUid = new Map<string, SpotRealtimeSubscriptionReadiness>();
+  const realtimeHighWaterMarkByKey = new Map<string, number>();
   const historyReadyByLatestBarKey = new Map<string, boolean>();
   const unsubscribeByUid = new Map<string, () => void>();
   const terminalBoundaryByScope = new Map<string, SpotKlineTerminalBoundary>();
   const getBarsHardTimeoutHandles = new Set<ReturnType<typeof setTimeout>>();
+
+  const getRealtimeHighWaterMark = (latestBarKey: string): number => (
+    realtimeHighWaterMarkByKey.get(latestBarKey) || 0
+  );
+
+  const rememberRealtimeHighWaterMark = (latestBarKey: string, time: number) => {
+    if (!Number.isFinite(time) || time <= 0) return;
+    const previous = getRealtimeHighWaterMark(latestBarKey);
+    if (time <= previous) return;
+    realtimeHighWaterMarkByKey.delete(latestBarKey);
+    realtimeHighWaterMarkByKey.set(latestBarKey, time);
+    while (realtimeHighWaterMarkByKey.size > SPOT_TV_REALTIME_HIGH_WATER_CAPACITY) {
+      const oldestKey = realtimeHighWaterMarkByKey.keys().next().value;
+      if (!oldestKey) break;
+      realtimeHighWaterMarkByKey.delete(oldestKey);
+    }
+  };
 
   const getTerminalBoundaryScopeKey = (interval: string) => [
     datafeedInstanceId,
@@ -1619,6 +1637,8 @@ export function createSpotTradingViewDatafeed(
     latestBarKeyByUid.delete(subscriberUid);
     activeRealtimeIntervalByUid.delete(subscriberUid);
     activeSubscriptionKeyByUid.delete(subscriberUid);
+    activeSubscriptionGenerationByUid.delete(subscriberUid);
+    readinessByUid.delete(subscriberUid);
     if (
       activeInterval
       && !Array.from(activeRealtimeIntervalByUid.values()).includes(activeInterval)
@@ -2844,14 +2864,18 @@ export function createSpotTradingViewDatafeed(
       const interval = getBackendKlineIntervalForTradingView(requestResolution);
       const latestBarKey = getLatestBarKey(requestResolution);
       const subscriptionKey = getSubscriptionKey(interval, subscriberUid);
+      const subscriptionGeneration = ++subscriptionGenerationSequence;
       const isCurrentSubscription = () =>
+        !destroyed &&
         activeSubscriptionKeyByUid.get(subscriberUid) === subscriptionKey &&
-        latestBarKeyByUid.get(subscriberUid) === latestBarKey;
+        latestBarKeyByUid.get(subscriberUid) === latestBarKey &&
+        activeSubscriptionGenerationByUid.get(subscriberUid) === subscriptionGeneration;
 
       if (!historyReadyByLatestBarKey.has(latestBarKey)) {
         historyReadyByLatestBarKey.set(latestBarKey, false);
       }
       activeSubscriptionKeyByUid.set(subscriberUid, subscriptionKey);
+      activeSubscriptionGenerationByUid.set(subscriberUid, subscriptionGeneration);
       activeRealtimeIntervalByUid.set(subscriberUid, interval);
       lastEmittedBarTimeByUid.set(
         subscriberUid,
@@ -3007,6 +3031,16 @@ export function createSpotTradingViewDatafeed(
         spotMarketRealtime.releaseSubscription(subscriptionId);
       };
       unsubscribeByUid.set(subscriberUid, unsubscribe);
+      const readiness: SpotRealtimeSubscriptionReadiness = {
+        datafeedInstanceId,
+        subscriberUid,
+        subscriptionGeneration,
+        ownerId: `${realtimeOwner}:${subscriberUid}`,
+        symbol: apiSymbol,
+        interval,
+      };
+      readinessByUid.set(subscriberUid, readiness);
+      if (isCurrentSubscription()) options.onRealtimeSubscriptionReady?.(readiness);
     },
 
     unsubscribeBars(subscriberUid) {
@@ -3016,58 +3050,36 @@ export function createSpotTradingViewDatafeed(
       clearRealtimeSubscriberState(subscriberUid);
     },
 
-    getActiveRealtimeIntervals() {
-      return Array.from(new Set(activeRealtimeIntervalByUid.values()));
+    getDatafeedInstanceId() {
+      return datafeedInstanceId;
     },
 
-    syncRealtimeKlineSubscription(interval, reason = 'external realtime owner sync') {
+    getRealtimeSubscriptionReadiness(symbol, interval) {
+      if (destroyed || normalizeSpotSymbol(symbol) !== apiSymbol) return null;
       const normalizedInterval = normalizeSpotInterval(interval);
-      const previousIntervals = Array.from(new Set(activeRealtimeIntervalByUid.values()));
-      const droppedIntervals: string[] = [];
-
-      for (const [subscriberUid, activeInterval] of Array.from(activeRealtimeIntervalByUid.entries())) {
-        if (activeInterval === normalizedInterval) continue;
-
-        const unsubscribe = unsubscribeByUid.get(subscriberUid);
-        unsubscribe?.();
-        unsubscribeByUid.delete(subscriberUid);
-        clearRealtimeSubscriberState(subscriberUid);
-        if (!droppedIntervals.includes(activeInterval)) {
-          droppedIntervals.push(activeInterval);
+      let latestReadiness: SpotRealtimeSubscriptionReadiness | null = null;
+      for (const [subscriberUid, readiness] of readinessByUid.entries()) {
+        if (readiness.interval !== normalizedInterval) continue;
+        const activeGeneration = activeSubscriptionGenerationByUid.get(subscriberUid);
+        if (activeGeneration !== readiness.subscriptionGeneration) {
+          continue;
+        }
+        if (
+          activeSubscriptionKeyByUid.get(subscriberUid)
+          !== getSubscriptionKey(normalizedInterval, subscriberUid)
+        ) continue;
+        if (
+          !latestReadiness
+          || readiness.subscriptionGeneration > latestReadiness.subscriptionGeneration
+        ) {
+          latestReadiness = readiness;
         }
       }
+      return latestReadiness;
+    },
 
-      const activeIntervals = Array.from(new Set(activeRealtimeIntervalByUid.values()));
-      if (activeIntervals.includes(normalizedInterval)) {
-        spotMarketRealtime.syncKlineInterval({
-          symbol: apiSymbol,
-          interval: normalizedInterval,
-          owner: realtimeOwner,
-        });
-      } else {
-        spotMarketRealtime.releaseKlineIntervalOwner({
-          symbol: apiSymbol,
-          owner: realtimeOwner,
-        });
-      }
-
-      markSpotKlinePerf('kline_interval_datafeed_owner_sync', {
-        symbol: apiSymbol,
-        interval: normalizedInterval,
-        previousIntervals,
-        activeIntervals,
-        droppedIntervals,
-        changed: droppedIntervals.length > 0,
-        owner: realtimeOwner,
-        source: 'spotTradingViewDatafeed',
-        reason,
-      });
-      return {
-        previousIntervals,
-        activeIntervals,
-        droppedIntervals,
-        changed: droppedIntervals.length > 0,
-      };
+    getActiveRealtimeIntervals() {
+      return Array.from(new Set(activeRealtimeIntervalByUid.values()));
     },
 
     destroy() {
@@ -3091,6 +3103,9 @@ export function createSpotTradingViewDatafeed(
       lastDroppedRealtimeBarByUid.clear();
       activeRealtimeIntervalByUid.clear();
       activeSubscriptionKeyByUid.clear();
+      activeSubscriptionGenerationByUid.clear();
+      readinessByUid.clear();
+      realtimeHighWaterMarkByKey.clear();
     },
   };
 }

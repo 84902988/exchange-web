@@ -20,27 +20,21 @@ export type SpotChartLoadingToken = Readonly<{
 }>;
 
 export type SpotResolutionIntent = Readonly<{
+  sessionId: string;
   resolution: string;
   intentId: number;
 }>;
 
 export type SpotResolutionIntentToken = Readonly<{
+  sessionId: string;
   resolution: string;
   intentId: number;
   requestSequence: number;
 }>;
 
 export type SpotResolutionIntentSnapshot = Readonly<{
-  currentResolution: string;
-  inFlightResolution: string;
-  pendingResolution: SpotResolutionIntent | null;
-  latestIntentId: number;
+  activeToken: SpotResolutionIntentToken | null;
   requestSequence: number;
-}>;
-
-export type SpotResolutionIntentRegistration = Readonly<{
-  intent: SpotResolutionIntent;
-  snapshot: SpotResolutionIntentSnapshot;
 }>;
 
 export type SpotResolutionIntentDecision = Readonly<{
@@ -51,7 +45,6 @@ export type SpotResolutionIntentDecision = Readonly<{
 
 export type SpotResolutionIntentSettlement = Readonly<{
   accepted: boolean;
-  nextToken?: SpotResolutionIntentToken;
   snapshot: SpotResolutionIntentSnapshot;
 }>;
 
@@ -73,22 +66,73 @@ type SpotResolutionRequestOptions = {
   timeoutMs?: number;
 };
 
+type SpotSubscriberReadinessGraceOptions = {
+  isCurrent: () => boolean;
+  isSubscriberReady: () => boolean;
+  onExpired: () => void;
+  onSettled?: (outcome: 'SUBSCRIBER_READY' | 'EXPIRED' | 'STALE') => void;
+  clock?: SpotChartLoadingClock;
+  delayMs?: number;
+};
+
 export const SPOT_CHART_LOADING_MIN_VISIBLE_MS = 220;
 export const SPOT_CHART_LOADING_SAFETY_TIMEOUT_MS = 5_000;
 export const SPOT_SET_RESOLUTION_TIMEOUT_MS = 4_500;
+export const SPOT_SUBSCRIBER_READINESS_GRACE_MS = 400;
 
 export function shouldStartSpotChartResolutionChange(params: {
   widgetAvailable: boolean;
   chartReady: boolean;
-  currentResolution: string;
+  observedResolution: string;
   nextResolution: string;
 }) {
   return Boolean(
     params.widgetAvailable
     && params.chartReady
     && params.nextResolution
-    && params.currentResolution !== params.nextResolution
+    && params.observedResolution !== params.nextResolution
   );
+}
+
+export function shouldRequestSpotChartSubscriberRearm(params: {
+  resolutionApplied: boolean;
+  subscriberReady: boolean;
+}) {
+  return Boolean(
+    params.resolutionApplied
+    && !params.subscriberReady
+  );
+}
+
+export function scheduleSpotSubscriberReadinessGrace({
+  isCurrent,
+  isSubscriberReady,
+  onExpired,
+  onSettled,
+  clock = defaultClock(),
+  delayMs = SPOT_SUBSCRIBER_READINESS_GRACE_MS,
+}: SpotSubscriberReadinessGraceOptions) {
+  let active = true;
+  const handle = clock.setTimeout(() => {
+    if (!active) return;
+    active = false;
+    if (!isCurrent()) {
+      onSettled?.('STALE');
+      return;
+    }
+    if (isSubscriberReady()) {
+      onSettled?.('SUBSCRIBER_READY');
+      return;
+    }
+    onSettled?.('EXPIRED');
+    onExpired();
+  }, Math.max(0, delayMs));
+
+  return () => {
+    if (!active) return;
+    active = false;
+    clock.clearTimeout(handle);
+  };
 }
 
 export function setSpotToolbarLoadingState(
@@ -128,44 +172,29 @@ export function setSpotToolbarLoadingState(
 }
 
 export class SpotResolutionIntentCoordinator {
-  private currentResolution = '';
-  private inFlightResolution = '';
-  private pendingResolution: SpotResolutionIntent | null = null;
-  private latestIntentValue: SpotResolutionIntent | null = null;
-  private latestIntentId = 0;
+  private activeToken: SpotResolutionIntentToken | null = null;
   private requestSequence = 0;
-
-  constructor(currentResolution = '', initialIntentId = 0) {
-    this.currentResolution = String(currentResolution || '');
-    this.latestIntentId = Math.max(0, Math.floor(initialIntentId));
-  }
 
   private snapshotValue(): SpotResolutionIntentSnapshot {
     return {
-      currentResolution: this.currentResolution,
-      inFlightResolution: this.inFlightResolution,
-      pendingResolution: this.pendingResolution,
-      latestIntentId: this.latestIntentId,
+      activeToken: this.activeToken ? { ...this.activeToken } : null,
       requestSequence: this.requestSequence,
     };
   }
 
   private start(intent: SpotResolutionIntent): SpotResolutionIntentToken {
     this.requestSequence += 1;
-    this.inFlightResolution = intent.resolution;
-    return {
+    const token = {
       ...intent,
       requestSequence: this.requestSequence,
     };
+    this.activeToken = token;
+    return token;
   }
 
-  reset(currentResolution = '') {
+  reset() {
     this.requestSequence += 1;
-    this.latestIntentId += 1;
-    this.currentResolution = String(currentResolution || '');
-    this.inFlightResolution = '';
-    this.pendingResolution = null;
-    this.latestIntentValue = null;
+    this.activeToken = null;
     return this.snapshotValue();
   }
 
@@ -173,89 +202,29 @@ export class SpotResolutionIntentCoordinator {
     return this.snapshotValue();
   }
 
-  latestIntent() {
-    return this.latestIntentValue;
-  }
-
-  registerIntent(resolution: string): SpotResolutionIntentRegistration {
-    const nextResolution = String(resolution || '');
-    this.latestIntentId += 1;
-    const intent: SpotResolutionIntent = {
-      resolution: nextResolution,
-      intentId: this.latestIntentId,
-    };
-    this.latestIntentValue = intent;
-    this.pendingResolution = nextResolution
-      && nextResolution !== (this.inFlightResolution || this.currentResolution)
-      ? intent
-      : null;
-    return { intent, snapshot: this.snapshotValue() };
-  }
-
-  isLatestIntent(intent: SpotResolutionIntent | null | undefined) {
-    return Boolean(
-      intent
-      && intent.intentId === this.latestIntentId
-      && intent.resolution === this.latestIntentValue?.resolution
-      && intent.intentId === this.latestIntentValue?.intentId
-    );
-  }
-
   request(
     intent: SpotResolutionIntent,
-    options: { canStart?: boolean } = {},
+    options: { canStart?: boolean; isLatest?: boolean } = {},
   ): SpotResolutionIntentDecision {
     const nextResolution = String(intent.resolution || '');
-    if (!this.isLatestIntent(intent)) {
+    if (!intent.sessionId || intent.intentId <= 0 || options.isLatest === false) {
       return { action: 'stale', snapshot: this.snapshotValue() };
     }
     if (!nextResolution) {
       return { action: 'noop', snapshot: this.snapshotValue() };
     }
 
-    if (this.inFlightResolution) {
-      this.pendingResolution = nextResolution === this.inFlightResolution ? null : intent;
+    if (this.activeToken) {
       return {
-        action: this.pendingResolution ? 'pending' : 'noop',
+        action: this.activeToken.sessionId === intent.sessionId ? 'noop' : 'pending',
         snapshot: this.snapshotValue(),
       };
     }
 
     if (options.canStart === false) {
-      this.pendingResolution = nextResolution === this.currentResolution ? null : intent;
-      return {
-        action: this.pendingResolution ? 'pending' : 'noop',
-        snapshot: this.snapshotValue(),
-      };
-    }
-
-    if (nextResolution === this.currentResolution) {
-      if (this.pendingResolution?.intentId === intent.intentId) {
-        this.pendingResolution = null;
-      }
-      return { action: 'noop', snapshot: this.snapshotValue() };
-    }
-
-    if (this.pendingResolution?.intentId === intent.intentId) {
-      this.pendingResolution = null;
+      return { action: 'pending', snapshot: this.snapshotValue() };
     }
     const token = this.start(intent);
-    return { action: 'start', token, snapshot: this.snapshotValue() };
-  }
-
-  drainPending(): SpotResolutionIntentDecision {
-    if (this.inFlightResolution || !this.pendingResolution) {
-      return { action: 'noop', snapshot: this.snapshotValue() };
-    }
-    const pendingIntent = this.pendingResolution;
-    this.pendingResolution = null;
-    if (!this.isLatestIntent(pendingIntent)) {
-      return { action: 'stale', snapshot: this.snapshotValue() };
-    }
-    if (pendingIntent.resolution === this.currentResolution) {
-      return { action: 'noop', snapshot: this.snapshotValue() };
-    }
-    const token = this.start(pendingIntent);
     return { action: 'start', token, snapshot: this.snapshotValue() };
   }
 
@@ -264,38 +233,23 @@ export class SpotResolutionIntentCoordinator {
       token
       && token.requestSequence === this.requestSequence
       && token.intentId > 0
-      && token.resolution === this.inFlightResolution
+      && token.sessionId === this.activeToken?.sessionId
+      && token.resolution === this.activeToken?.resolution
     );
   }
 
   canStart(token: SpotResolutionIntentToken | null | undefined) {
-    return Boolean(this.isCurrent(token) && this.isLatestIntent(token));
+    return this.isCurrent(token);
   }
 
-  commit(token: SpotResolutionIntentToken): SpotResolutionIntentSettlement {
+  settle(token: SpotResolutionIntentToken): SpotResolutionIntentSettlement {
     if (!this.isCurrent(token)) {
       return { accepted: false, snapshot: this.snapshotValue() };
     }
-    this.currentResolution = token.resolution;
-    this.inFlightResolution = '';
-    const decision = this.drainPending();
+    this.activeToken = null;
     return {
       accepted: true,
-      nextToken: decision.token,
-      snapshot: decision.snapshot,
-    };
-  }
-
-  fail(token: SpotResolutionIntentToken): SpotResolutionIntentSettlement {
-    if (!this.isCurrent(token)) {
-      return { accepted: false, snapshot: this.snapshotValue() };
-    }
-    this.inFlightResolution = '';
-    const decision = this.drainPending();
-    return {
-      accepted: true,
-      nextToken: decision.token,
-      snapshot: decision.snapshot,
+      snapshot: this.snapshotValue(),
     };
   }
 }
@@ -455,6 +409,7 @@ export function requestSpotSetResolution({
 }: SpotResolutionRequestOptions) {
   const activeChart = chart;
   let finished = false;
+  let transportAccepted = false;
   let timeoutHandle: unknown = null;
 
   const readActualResolution = () => {
@@ -503,7 +458,9 @@ export function requestSpotSetResolution({
     timeoutHandle = null;
     const actualResolution = readActualResolution();
     if (actualResolution === resolution) {
-      commitOnce('setResolution timeout confirmed by chart resolution');
+      commitOnce(transportAccepted
+        ? 'setResolution accepted; timeout confirmed by chart resolution'
+        : 'setResolution timeout confirmed by chart resolution');
       return;
     }
     failOnce('setResolution timeout');
@@ -516,14 +473,14 @@ export function requestSpotSetResolution({
     if (result === false) {
       failOnce('setResolution returned false');
     } else if (result === true) {
-      commitOnce('setResolution returned true');
+      transportAccepted = true;
     } else if (result && typeof result.then === 'function') {
       void result.then((changed) => {
         if (changed === false) {
           failOnce('setResolution returned false');
           return;
         }
-        commitOnce('setResolution promise resolved');
+        if (!finished) transportAccepted = true;
       }).catch((error: unknown) => {
         failOnce('setResolution rejected', error);
       });

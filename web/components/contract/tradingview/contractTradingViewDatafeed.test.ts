@@ -255,6 +255,22 @@ const realtimeCandle = (symbol: string, interval: string, openTime: number, clos
   },
 });
 
+function klineVersionCursor(params: {
+  bucketTimeMs: number | null;
+  sequence: number | null;
+  generation?: number | null;
+  epoch?: number | null;
+  observedAtMs?: number;
+}) {
+  return {
+    bucketTimeMs: params.bucketTimeMs,
+    providerGeneration: params.generation ?? null,
+    revisionEpoch: params.epoch ?? null,
+    revisionSequence: params.sequence,
+    observedAtMs: params.observedAtMs ?? params.bucketTimeMs ?? 0,
+  };
+}
+
 function ingestStoreKline(params: {
   symbol: string;
   interval: string;
@@ -1468,7 +1484,7 @@ test('valid API response writes L1 even when its original datafeed is destroyed'
 });
 
 
-test('older current L1 bars cannot roll back high-water mark and newer realtime still enters', async () => {
+test('rebuilt current L1 establishes a new instance high-water baseline', async () => {
   const symbol = 'L1_HIGH_WATER_PERP';
   const newerRestTime = 1_717_100_000_000;
   let apiCalls = 0;
@@ -1494,19 +1510,19 @@ test('older current L1 bars cannot roll back high-water mark and newer realtime 
   await rebuilt.getBars(symbolInfo(symbol), '1', period, () => undefined, assert.fail);
 
   assert.equal(apiCalls, 1);
-  assert.deepEqual(latest, []);
+  assert.deepEqual(latest, ['129']);
   rebuilt.subscribeBars(
     symbolInfo(symbol),
     '1',
     (bar: any) => realtimeBars.push(bar),
     'l1-high-water',
   );
+  emitRealtime(realtimeCandle(symbol, '1m', newerRestTime - 120_000, '128.5'));
   emitRealtime(realtimeCandle(symbol, '1m', newerRestTime - 30_000, '129.5'));
-  emitRealtime(realtimeCandle(symbol, '1m', newerRestTime + 60_000, '131'));
 
   assert.equal(realtimeBars.length, 1);
-  assert.equal(realtimeBars[0].time, newerRestTime + 60_000);
-  assert.deepEqual(latest, ['131']);
+  assert.equal(realtimeBars[0].time, newerRestTime - 30_000);
+  assert.deepEqual(latest, ['129', '129.5']);
   rebuilt.unsubscribeBars('l1-high-water');
   rebuilt.destroy();
 });
@@ -3038,7 +3054,7 @@ test('destroyed datafeed cancels scheduled stale settlement and ignores late res
 });
 
 
-test('REST high-water mark rejects older realtime bars and accepts equal or newer candles', async () => {
+test('same datafeed rejects stale realtime bar and accepts equal or newer candles', async () => {
   const restTime = Date.parse('2026-07-10T08:02:00.000Z');
   requestKlines = async () => metadata([row(restTime, '1.14411')]);
   const latest: Array<string | null> = [];
@@ -3076,7 +3092,7 @@ test('REST high-water mark rejects older realtime bars and accepts equal or newe
 });
 
 
-test('module high-water mark survives datafeed destroy and rebuild', async () => {
+test('destroy and rebuild reset high-water for the replacement datafeed', async () => {
   const restTime = Date.parse('2026-07-10T08:02:00.000Z');
   requestKlines = async () => metadata([row(restTime, '200')]);
   const first = datafeedModule.createContractTradingViewDatafeed({ symbol: 'REBUILD_MONO_PERP' });
@@ -3103,9 +3119,275 @@ test('module high-water mark survives datafeed destroy and rebuild', async () =>
   );
   emitRealtime(realtimeCandle('REBUILD_MONO_PERP', '1m', restTime - 60_000, '199'));
 
-  assert.deepEqual(rebuiltRealtime, []);
-  assert.deepEqual(rebuiltLatest, []);
+  assert.deepEqual(rebuiltRealtime.map((bar) => bar.close), [199]);
+  assert.deepEqual(rebuiltLatest, ['199']);
   rebuilt.destroy();
+});
+
+
+test('BTC to ETH to BTC rebuild accepts the replacement BTC realtime candle', async () => {
+  const priorBtcTime = Date.parse('2026-07-10T08:02:00.000Z');
+  requestKlines = async () => metadata([row(priorBtcTime, '200')]);
+  const firstBtc = datafeedModule.createContractTradingViewDatafeed({ symbol: 'BTCUSDT_PERP' });
+  await firstBtc.getBars(
+    symbolInfo('BTCUSDT_PERP'),
+    '1',
+    period,
+    () => undefined,
+    assert.fail,
+  );
+  firstBtc.destroy();
+
+  const ethBars: any[] = [];
+  const eth = datafeedModule.createContractTradingViewDatafeed({ symbol: 'ETHUSDT_PERP' });
+  eth.subscribeBars(
+    symbolInfo('ETHUSDT_PERP'),
+    '1',
+    (bar: any) => ethBars.push(bar),
+    'eth-replacement',
+  );
+  emitRealtime(realtimeCandle('ETHUSDT_PERP', '1m', priorBtcTime - 120_000, '101'));
+  eth.destroy();
+
+  const replacementBtcBars: any[] = [];
+  const replacementBtc = datafeedModule.createContractTradingViewDatafeed({ symbol: 'BTCUSDT_PERP' });
+  replacementBtc.subscribeBars(
+    symbolInfo('BTCUSDT_PERP'),
+    '1',
+    (bar: any) => replacementBtcBars.push(bar),
+    'btc-replacement',
+  );
+  emitRealtime(realtimeCandle('BTCUSDT_PERP', '1m', priorBtcTime - 60_000, '199'));
+
+  assert.deepEqual(ethBars.map((bar) => bar.close), [101]);
+  assert.deepEqual(replacementBtcBars.map((bar) => bar.close), [199]);
+  replacementBtc.destroy();
+});
+
+
+test('restored baseline reset requires a Runtime permit and a new subscription generation', async () => {
+  const symbol = 'INTERVAL_LIFECYCLE_PERP';
+  const minuteTime = Date.parse('2026-07-10T08:02:00.000Z');
+  const dailyTime = Date.parse('2026-07-10T00:00:00.000Z');
+  const minuteBars: any[] = [];
+  const dailyBars: any[] = [];
+  const restoredMinuteBars: any[] = [];
+  const replacementMinuteBars: any[] = [];
+  const resetRequirements: any[] = [];
+  let resetCalls = 0;
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    onRealtimeResetRequired: (requirement: any) => resetRequirements.push(requirement),
+  });
+
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => minuteBars.push(bar),
+    'minute-initial',
+  );
+  emitRealtime(realtimeCandle(symbol, '1m', minuteTime, '100'));
+  datafeed.unsubscribeBars('minute-initial');
+
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1D',
+    (bar: any) => dailyBars.push(bar),
+    'daily-active',
+  );
+  emitRealtime(realtimeCandle(symbol, '1m', minuteTime + 60_000, '101'));
+  emitRealtime(realtimeCandle(symbol, '1d', dailyTime, '90'));
+  datafeed.unsubscribeBars('daily-active');
+
+  requestKlines = async () => metadata([row(minuteTime + 60_000, '101')]);
+  await datafeed.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    () => undefined,
+    assert.fail,
+  );
+
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => restoredMinuteBars.push(bar),
+    'minute-restored',
+    () => {
+      resetCalls += 1;
+      datafeed.unsubscribeBars('minute-restored');
+    },
+  );
+  await flushPromises();
+
+  assert.equal(resetCalls, 0, 'Datafeed must not approve or execute its own reset');
+  assert.equal(resetRequirements.length, 1);
+  const requirement = resetRequirements[0];
+  assert.equal(requirement.source, 'RESTORED_BASELINE');
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness(symbol, '1m'),
+    null,
+    'the restored generation cannot prove subscriber readiness before a Runtime permit',
+  );
+  const identity = {
+    sessionId: `CONTRACT:7:${datafeed.getDatafeedInstanceId()}:3`,
+    terminalType: 'CONTRACT',
+    widgetGeneration: 7,
+    datafeedInstanceId: datafeed.getDatafeedInstanceId(),
+    intentId: 3,
+    symbol,
+    tradingViewResolution: '1',
+    backendInterval: '1m',
+  };
+  const permit = {
+    permitId: `${identity.sessionId}:RESTORED_BASELINE`,
+    identity,
+    source: 'RESTORED_BASELINE',
+  };
+  assert.equal(datafeed.executeResetPermit(requirement, permit), true);
+  assert.equal(datafeed.executeResetPermit(requirement, permit), false, 'one permit executes once');
+  assert.equal(resetCalls, 1, 'the permitted reset executes exactly once');
+  assert.deepEqual(realtimeKlineOwnerCalls, [
+    { op: 'subscribe', symbol, interval: '1m' },
+    { op: 'unsubscribe', symbol, interval: '1m' },
+    { op: 'subscribe', symbol, interval: '1d' },
+    { op: 'unsubscribe', symbol, interval: '1d' },
+    { op: 'subscribe', symbol, interval: '1m' },
+  ], 'reset-triggered unsubscribe remains guarded until TradingView rearms');
+
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness(symbol, '1m'),
+    null,
+    'the reset generation remains blocked until subscribeBars creates a new generation',
+  );
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => replacementMinuteBars.push(bar),
+    'minute-restored',
+    () => assert.fail('the replacement generation must not consume another reset'),
+  );
+  const replacementReadiness = datafeed.getRealtimeSubscriptionReadiness(symbol, '1m');
+  assert.ok(
+    replacementReadiness?.subscriptionGeneration > requirement.subscriptionGeneration,
+    'commit evidence must come from the replacement subscription generation',
+  );
+
+  emitRealtime(realtimeCandle(symbol, '1d', dailyTime + 86_400_000, '91'));
+  emitRealtime(realtimeCandle(symbol, '1m', minuteTime - 60_000, '99'));
+  emitRealtime(realtimeCandle(symbol, '1m', minuteTime + 120_000, '102'));
+
+  assert.deepEqual(minuteBars.map((bar) => bar.close), [100]);
+  assert.deepEqual(dailyBars.map((bar) => bar.close), [90]);
+  assert.deepEqual(restoredMinuteBars, []);
+  assert.deepEqual(replacementMinuteBars.map((bar) => bar.close), [102]);
+
+  datafeed.unsubscribeBars('minute-restored');
+  assert.deepEqual(realtimeKlineOwnerCalls.at(-1), {
+    op: 'unsubscribe',
+    symbol,
+    interval: '1m',
+  }, 'a later lifecycle unsubscribe must still release the protected owner');
+  datafeed.destroy();
+});
+
+
+test('realtime readiness identifies only the latest active symbol interval subscription', async () => {
+  const symbol = 'BTCUSDT_PERP';
+  const readinessEvents: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    onRealtimeSubscriptionReady: (evidence: any) => readinessEvents.push(evidence),
+  });
+
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness(symbol, '1m'), null);
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    () => undefined,
+    'minute-readiness',
+  );
+  const minuteReadiness = datafeed.getRealtimeSubscriptionReadiness(symbol, '1m');
+  assert.equal(minuteReadiness?.datafeedInstanceId, datafeed.getDatafeedInstanceId());
+  assert.equal(minuteReadiness?.symbol, symbol);
+  assert.equal(minuteReadiness?.interval, '1m');
+  assert.equal(minuteReadiness?.subscriberUid, 'minute-readiness');
+  assert.ok(minuteReadiness?.ownerId);
+  assert.equal(minuteReadiness?.subscriptionGeneration, 1);
+  assert.equal(minuteReadiness?.generation, 1);
+
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1D',
+    () => undefined,
+    'daily-readiness',
+  );
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness(symbol, '1m'),
+    null,
+    'a previous interval cannot prove readiness after the latest interval changes',
+  );
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness(symbol, '1d')?.subscriberUid,
+    'daily-readiness',
+  );
+  await flushPromises();
+  assert.deepEqual(
+    readinessEvents.map((event) => [
+      event.datafeedInstanceId,
+      event.interval,
+      event.subscriberUid,
+      event.subscriptionGeneration,
+      event.generation,
+    ]),
+    [[datafeed.getDatafeedInstanceId(), '1d', 'daily-readiness', 2, 2]],
+    'superseded readiness callbacks must not publish stale interval evidence',
+  );
+
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1D',
+    () => undefined,
+    'daily-readiness-replacement',
+  );
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness(symbol, '1d')?.generation,
+    3,
+  );
+  datafeed.unsubscribeBars('daily-readiness-replacement');
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness(symbol, '1d'),
+    null,
+    'removing the latest generation must not expose an older callback as ready',
+  );
+  datafeed.destroy();
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness(symbol, '1d'), null);
+});
+
+
+test('BTC to ETH does not reset an unrelated symbol baseline', async () => {
+  let resetCalls = 0;
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'BTCUSDT_PERP' });
+
+  datafeed.subscribeBars(
+    symbolInfo('BTCUSDT_PERP'),
+    '1',
+    () => undefined,
+    'btc-minute',
+    () => { resetCalls += 1; },
+  );
+  datafeed.unsubscribeBars('btc-minute');
+  datafeed.subscribeBars(
+    symbolInfo('ETHUSDT_PERP'),
+    '1',
+    () => undefined,
+    'eth-minute',
+    () => { resetCalls += 1; },
+  );
+  await Promise.resolve();
+
+  assert.equal(resetCalls, 0);
+  datafeed.destroy();
 });
 
 
@@ -3199,8 +3481,169 @@ test('Store kline is primary and non-kline domains or same-candle legacy fallbac
 });
 
 
+test('new kline bucket accepts a reset revision sequence', () => {
+  const accepts = datafeedModule.acceptsKlineVersion;
+  const oldBucket = Date.parse('2026-07-14T14:35:00.000Z');
+  const newBucket = Date.parse('2026-07-14T14:46:00.000Z');
+  const current = klineVersionCursor({ bucketTimeMs: oldBucket, sequence: 1396 });
+
+  assert.equal(
+    accepts(current, klineVersionCursor({ bucketTimeMs: newBucket, sequence: 1 })),
+    true,
+  );
+  assert.equal(
+    accepts(current, klineVersionCursor({ bucketTimeMs: newBucket, sequence: 220 })),
+    true,
+  );
+});
+
+
+test('same kline bucket accepts a monotonic revision increase', () => {
+  const bucket = Date.parse('2026-07-14T14:46:00.000Z');
+
+  assert.equal(
+    datafeedModule.acceptsKlineVersion(
+      klineVersionCursor({ bucketTimeMs: bucket, sequence: 220 }),
+      klineVersionCursor({ bucketTimeMs: bucket, sequence: 221 }),
+    ),
+    true,
+  );
+});
+
+
+test('same kline bucket rejects revision rollback', () => {
+  const bucket = Date.parse('2026-07-14T14:46:00.000Z');
+
+  assert.equal(
+    datafeedModule.acceptsKlineVersion(
+      klineVersionCursor({ bucketTimeMs: bucket, sequence: 220 }),
+      klineVersionCursor({ bucketTimeMs: bucket, sequence: 219, observedAtMs: bucket + 1_000 }),
+    ),
+    false,
+  );
+});
+
+
+test('late old kline bucket cannot overwrite the current bucket with a higher revision', () => {
+  const oldBucket = Date.parse('2026-07-14T14:35:00.000Z');
+  const currentBucket = Date.parse('2026-07-14T14:46:00.000Z');
+
+  assert.equal(
+    datafeedModule.acceptsKlineVersion(
+      klineVersionCursor({ bucketTimeMs: currentBucket, sequence: 5 }),
+      klineVersionCursor({
+        bucketTimeMs: oldBucket,
+        sequence: 9999,
+        observedAtMs: currentBucket + 1_000,
+      }),
+    ),
+    false,
+  );
+});
+
+
+test('missing bucket identity keeps conservative legacy revision ordering', () => {
+  const oldBucket = Date.parse('2026-07-14T14:35:00.000Z');
+  const newBucket = Date.parse('2026-07-14T14:46:00.000Z');
+
+  assert.equal(
+    datafeedModule.acceptsKlineVersion(
+      klineVersionCursor({ bucketTimeMs: null, sequence: 1396, observedAtMs: oldBucket }),
+      klineVersionCursor({ bucketTimeMs: newBucket, sequence: 220 }),
+    ),
+    false,
+  );
+});
+
+
+test('runtime high-revision baseline accepts a lower revision from the next bucket', () => {
+  const symbol = 'BTCUSDT_PERP';
+  const oldBucket = Date.parse('2026-07-14T14:35:00.000Z');
+  const newBucket = Date.parse('2026-07-14T14:46:00.000Z');
+  const received: any[] = [];
+  const latest: Array<string | null> = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    onLatestBar: (close: string | null) => latest.push(close),
+  });
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'runtime-bucket-subscriber',
+  );
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime: oldBucket,
+    close: '63853.0',
+    eventTimeMs: oldBucket + 59_000,
+    sequence: 1396,
+  });
+  const versionedCandle = (openTime: number, close: string, sequence: number) => ({
+    ...realtimeCandle(symbol, '1m', openTime, close),
+    revision: { sequence },
+    provider_event_time_ms: openTime + sequence,
+  });
+
+  emitRealtime(versionedCandle(newBucket, '63833.9', 220));
+  emitRealtime(versionedCandle(newBucket, '63832.0', 219));
+  const advanced = versionedCandle(newBucket, '63834.0', 221);
+  emitRealtime(advanced);
+  emitRealtime(advanced);
+  emitRealtime(versionedCandle(oldBucket, '63999.0', 9999));
+
+  assert.deepEqual(
+    received.map((bar) => [bar.time, bar.close]),
+    [
+      [oldBucket, 63853],
+      [newBucket, 63833.9],
+      [newBucket, 63834],
+    ],
+  );
+  assert.deepEqual(latest, ['63853', '63833.9', '63834']);
+  datafeed.destroy();
+});
+
+
+test('new bucket from a retired subscription generation remains rejected', () => {
+  const symbol = 'RETIRED_BUCKET_PERP';
+  const retiredBars: any[] = [];
+  const activeBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => retiredBars.push(bar),
+    'shared-bucket-subscriber',
+  );
+  const retiredHandler = realtimeKlineSubscriptions[0].handler;
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => activeBars.push(bar),
+    'shared-bucket-subscriber',
+  );
+  const activeHandler = realtimeKlineSubscriptions[1].handler;
+  const newBucket = Date.parse('2026-07-14T14:46:00.000Z');
+  const message = {
+    ...realtimeCandle(symbol, '1m', newBucket, '701'),
+    revision: { sequence: 1 },
+  };
+
+  retiredHandler(message);
+  activeHandler(message);
+
+  assert.deepEqual(retiredBars, []);
+  assert.deepEqual(activeBars.map((bar) => bar.close), [701]);
+  datafeed.destroy();
+});
+
+
 test('legacy kline fallback rejects provider generation and revision rollback', () => {
   const symbol = 'LEGACY_VERSION_PERP';
+  const bucket = 1_717_100_000_000;
   const received: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
   datafeed.subscribeBars(
@@ -3221,10 +3664,10 @@ test('legacy kline fallback rejects provider generation and revision rollback', 
     provider_event_time_ms: openTime + sequence,
   });
 
-  emitRealtime(versionedCandle(1_717_100_000_000, '111', 5, 10));
-  emitRealtime(versionedCandle(1_717_100_060_000, '112', 4, 99));
-  emitRealtime(versionedCandle(1_717_100_120_000, '113', 5, 9));
-  emitRealtime(versionedCandle(1_717_100_180_000, '114', 5, 11));
+  emitRealtime(versionedCandle(bucket, '111', 5, 10));
+  emitRealtime(versionedCandle(bucket + 60_000, '112', 4, 99));
+  emitRealtime(versionedCandle(bucket, '113', 5, 9));
+  emitRealtime(versionedCandle(bucket, '114', 5, 11));
 
   assert.deepEqual(received.map((bar) => bar.close), [111, 114]);
   datafeed.destroy();
@@ -3490,6 +3933,46 @@ test('late monthly callback cannot write into the replacement five-minute subscr
 
   assert.deepEqual(monthlyBars, []);
   assert.deepEqual(fiveMinuteBars.map((bar) => bar.close), [102]);
+  datafeed.destroy();
+});
+
+
+test('fast 1m to 5m to 1D to 1m chain leaves only the final minute callback active', () => {
+  const symbol = 'FAST_INTERVAL_CHAIN_PERP';
+  const finalMinuteBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  const subscribe = (resolution: string, callback: (bar: any) => void) => {
+    datafeed.subscribeBars(
+      symbolInfo(symbol),
+      resolution,
+      callback,
+      'fast-chain-subscriber',
+    );
+  };
+
+  subscribe('1', () => assert.fail('retired initial 1m callback must stay inactive'));
+  subscribe('5', () => assert.fail('retired 5m callback must stay inactive'));
+  subscribe('1D', () => assert.fail('retired 1D callback must stay inactive'));
+  subscribe('1', (bar: any) => finalMinuteBars.push(bar));
+
+  const retiredHandlers = realtimeKlineSubscriptions.slice(0, 3).map(({ handler }) => handler);
+  retiredHandlers[0](realtimeCandle(symbol, '1m', 1_717_100_000_000, '801'));
+  retiredHandlers[1](realtimeCandle(symbol, '5m', 1_717_100_300_000, '802'));
+  retiredHandlers[2](realtimeCandle(symbol, '1d', 1_717_200_000_000, '803'));
+  realtimeKlineSubscriptions[3].handler(
+    realtimeCandle(symbol, '1m', 1_717_100_060_000, '804'),
+  );
+
+  assert.deepEqual(finalMinuteBars.map((bar) => bar.close), [804]);
+  assert.deepEqual(realtimeKlineOwnerCalls, [
+    { op: 'subscribe', symbol, interval: '1m' },
+    { op: 'unsubscribe', symbol, interval: '1m' },
+    { op: 'subscribe', symbol, interval: '5m' },
+    { op: 'unsubscribe', symbol, interval: '5m' },
+    { op: 'subscribe', symbol, interval: '1d' },
+    { op: 'unsubscribe', symbol, interval: '1d' },
+    { op: 'subscribe', symbol, interval: '1m' },
+  ]);
   datafeed.destroy();
 });
 

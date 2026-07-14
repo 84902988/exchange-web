@@ -1411,6 +1411,178 @@ test('late REST getBars cannot overwrite newer realtime same-bucket revision', a
   datafeed.destroy()
 })
 
+test('subscribeBars exposes readiness evidence when the callback chain is installed', () => {
+  const readinessEvents: Array<Record<string, unknown>> = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({
+    symbol: 'BTCUSDT',
+    onRealtimeSubscriptionReady: (evidence: Record<string, unknown>) => readinessEvents.push(evidence),
+  })
+  const datafeedInstanceId = datafeed.getDatafeedInstanceId()
+
+  datafeed.subscribeBars(symbolInfo(), '1', () => undefined, 'readiness-test')
+
+  assert.equal(readinessEvents.length, 1)
+  assert.deepEqual(readinessEvents[0], {
+    datafeedInstanceId,
+    subscriberUid: 'readiness-test',
+    subscriptionGeneration: 1,
+    ownerId: `tradingview:BTCUSDT:${datafeedInstanceId}:readiness-test`,
+    symbol: 'BTCUSDT',
+    interval: '1m',
+  })
+  assert.deepEqual(
+    datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '1m'),
+    readinessEvents[0],
+  )
+
+  datafeed.unsubscribeBars('readiness-test')
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '1m'), null)
+  datafeed.destroy()
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '1m'), null)
+})
+
+test('readiness lookup is dataset-scoped when TradingView reuses an older interval subscription', () => {
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+
+  datafeed.subscribeBars(symbolInfo(), '5', () => undefined, 'five-minute-reuse')
+  const fiveMinuteReadiness = datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '5m')
+  assert.equal(fiveMinuteReadiness?.subscriberUid, 'five-minute-reuse')
+  assert.equal(fiveMinuteReadiness?.subscriptionGeneration, 1)
+
+  datafeed.subscribeBars(symbolInfo(), '1M', () => undefined, 'monthly-current')
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '5m')?.subscriberUid,
+    'five-minute-reuse',
+  )
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '1Mutc')?.subscriberUid,
+    'monthly-current',
+  )
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '1Mutc')?.subscriptionGeneration,
+    2,
+  )
+  assert.deepEqual(datafeed.getActiveRealtimeIntervals().sort(), ['1Mutc', '5m'])
+
+  // TradingView may switch back to an active dataset without calling subscribeBars again.
+  assert.deepEqual(
+    datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '5m'),
+    fiveMinuteReadiness,
+  )
+
+  datafeed.unsubscribeBars('monthly-current')
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '1Mutc'), null)
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '5m')?.subscriberUid,
+    'five-minute-reuse',
+  )
+  datafeed.destroy()
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '5m'), null)
+})
+
+test('destroy clears instance-scoped realtime high-water before replacement datafeed starts', async () => {
+  const highTime = 1_717_000_180_000
+  requestKlines = async () => metadata([row(highTime, '110')])
+  const firstDatafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+  const firstHistory: HistoryCall[] = []
+  firstDatafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => firstHistory.length === 1, 'first instance history did not settle')
+  firstDatafeed.destroy()
+
+  const lowerTime = highTime - 60_000
+  requestKlines = async () => metadata([row(lowerTime, '100')])
+  const emittedBars: Array<Record<string, unknown>> = []
+  const replacement = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+  const replacementHistory: HistoryCall[] = []
+  replacement.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => replacementHistory.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => replacementHistory.length === 1, 'replacement history did not settle')
+  replacement.subscribeBars(
+    symbolInfo(),
+    '1',
+    (bar: Record<string, unknown>) => emittedBars.push(bar),
+    'replacement-high-water',
+  )
+  klineSubscriber?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    source: 'LIVE_WS',
+    kline: {
+      ...row(lowerTime, '101'),
+      provider: 'OKX_SPOT',
+      source: 'LIVE_WS',
+      revision_epoch: 1,
+      revision_seq: 2,
+      is_closed: false,
+      close_state_source: 'PROVIDER_CONFIRMED',
+    },
+  })
+  assert.deepEqual(emittedBars.map((bar) => bar.close), [101])
+  replacement.destroy()
+})
+
+test('subscription generation rejects a retired same-uid callback after 1m to 5m to 1m', async () => {
+  requestKlines = async () => metadata([row()])
+  const emittedBars: Array<Record<string, unknown>> = []
+  const readinessEvents: Array<Record<string, unknown>> = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({
+    symbol: 'BTCUSDT',
+    onRealtimeSubscriptionReady: (evidence: Record<string, unknown>) => readinessEvents.push(evidence),
+  })
+
+  datafeed.subscribeBars(symbolInfo(), '1', (bar: Record<string, unknown>) => emittedBars.push(bar), 'aba-test')
+  const retiredFirstOneMinuteHandler = klineSubscriber
+  datafeed.subscribeBars(symbolInfo(), '5', (bar: Record<string, unknown>) => emittedBars.push(bar), 'aba-test')
+  datafeed.subscribeBars(symbolInfo(), '1', (bar: Record<string, unknown>) => emittedBars.push(bar), 'aba-test')
+  const currentOneMinuteHandler = klineSubscriber
+
+  const historyCalls: HistoryCall[] = []
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => historyCalls.length === 1, 'replacement 1m history did not settle')
+
+  const message = {
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    kline: {
+      ...row(1_717_000_120_000, '105'),
+      provider: 'OKX_SPOT',
+      revision_epoch: 1,
+      revision_seq: 1,
+      is_closed: false,
+      close_state_source: 'PROVIDER_CONFIRMED',
+    },
+  }
+  retiredFirstOneMinuteHandler?.(message)
+  assert.equal(emittedBars.length, 0)
+  currentOneMinuteHandler?.(message)
+  assert.deepEqual(emittedBars.map((bar) => bar.close), [105])
+  assert.deepEqual(readinessEvents.map((event) => event.subscriptionGeneration), [1, 2, 3])
+  assert.equal(
+    datafeed.getRealtimeSubscriptionReadiness('BTCUSDT', '1m')?.subscriptionGeneration,
+    3,
+  )
+  datafeed.destroy()
+})
+
 test('interval switch and destroy make retired realtime callbacks harmless', async () => {
   requestKlines = async () => metadata([row()])
   const historyCalls: HistoryCall[] = []
