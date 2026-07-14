@@ -13,11 +13,24 @@ import {
   normalizeContractKlineAssetClass,
   type ContractKlineAssetClass,
 } from './tradingview/contractKlineCachePolicy';
+import {
+  getContractKlineVisibleBars,
+  normalizeContractKlineLoadInterval,
+} from './tradingview/contractKlineLoadPolicy';
+import { createContractKlinePreloadManager } from './tradingview/contractKlinePreloadManager';
+import {
+  ContractTradingViewPriceOverlayController,
+  type ContractPriceDirection,
+  type ContractTradingViewOverlayChart,
+} from './tradingview/contractTradingViewPriceOverlay';
 import { setSpotToolbarLoadingState } from '@/components/spot/tradingview/spotTradingViewResolutionState';
+import { applyTradingViewViewport } from '@/components/tradingview/tradingViewViewportLifecycle';
 
 export type ContractChartMode = 'time' | 'candle';
 
 export type TradingViewChartApi = {
+  dataReady?: () => Promise<boolean> | boolean;
+  resolution?: () => string;
   getSeries?: () => {
     setChartStyleProperties?: (chartStyle: number, preferences: Record<string, unknown>) => void;
   };
@@ -25,6 +38,21 @@ export type TradingViewChartApi = {
     resolution: string,
     options?: { dataReady?: () => void; doNotActivateChart?: boolean } | (() => void),
   ) => Promise<boolean> | boolean | void;
+  setVisibleRange?: (
+    range: { from: number; to?: number },
+    options?: {
+      applyDefaultRightMargin?: boolean;
+      percentRightMargin?: number;
+      rejectByTimeout?: number;
+    },
+  ) => Promise<void> | void;
+  getVisibleRange?: () => { from: number; to?: number };
+  getTimeScale?: () => {
+    setRightOffset?: (offset: number) => void;
+  };
+  createShape?: ContractTradingViewOverlayChart['createShape'];
+  getShapeById?: ContractTradingViewOverlayChart['getShapeById'];
+  removeEntity?: ContractTradingViewOverlayChart['removeEntity'];
 };
 
 type TradingViewWidgetInstance = {
@@ -63,6 +91,8 @@ type ContractTradingViewChartProps = {
   height?: number;
   pricePrecision?: number | null;
   amountPrecision?: number | null;
+  displayPrice?: number | null;
+  priceDirection?: ContractPriceDirection;
   onChartModeChange?: (value: ContractChartMode) => void;
   onIntervalChange?: (value: string) => void;
   onLatestKlineCloseChange?: (price: string | null) => void;
@@ -72,9 +102,56 @@ type ContractResolutionRequestParams = {
   chart: TradingViewChartApi | null;
   resolution: string;
   isCurrent: () => boolean;
-  onSettled: () => void;
-  onFallback: (reason: string, error?: unknown) => void;
+  onCommitted?: (reason: string, activeResolution: string) => void;
+  onFailed?: (reason: string, error?: unknown) => void;
+  // Legacy aliases remain supported for the existing Contract chart test/API surface.
+  onSettled?: (activeResolution: string) => void;
+  onFallback?: (reason: string, error?: unknown) => void;
+  clock?: ContractChartLoadingClock;
+  timeoutMs?: number;
 };
+
+export type ContractResolutionIntent = Readonly<{
+  resolution: string;
+  intentId: number;
+}>;
+
+export type ContractResolutionIntentToken = Readonly<{
+  resolution: string;
+  intentId: number;
+  requestSequence: number;
+}>;
+
+export type ContractResolutionIntentSnapshot = Readonly<{
+  currentResolution: string;
+  inFlightResolution: string;
+  pendingResolution: ContractResolutionIntent | null;
+  latestIntentId: number;
+  requestSequence: number;
+}>;
+
+type ContractResolutionIntentDecision = Readonly<{
+  action: 'start' | 'pending' | 'noop' | 'stale';
+  token?: ContractResolutionIntentToken;
+  snapshot: ContractResolutionIntentSnapshot;
+}>;
+
+type ContractResolutionIntentSettlement = Readonly<{
+  accepted: boolean;
+  nextToken?: ContractResolutionIntentToken;
+  snapshot: ContractResolutionIntentSnapshot;
+}>;
+
+export type ContractResolutionRequest = Promise<void> & {
+  cancel: () => void;
+};
+
+export type ContractResolutionLifecycleState = Readonly<{
+  requestedResolution: string;
+  committedResolution: string;
+  activeTradingViewResolution: string;
+  inFlightResolution: string;
+}>;
 
 type ContractChartLoadingClock = {
   now: () => number;
@@ -96,9 +173,95 @@ const TRADINGVIEW_CANDLE_STYLE = 1;
 const TRADINGVIEW_TIME_STYLE = 2;
 const CONTRACT_CHART_LOADING_MIN_VISIBLE_MS = 220;
 const CONTRACT_CHART_LOADING_SAFETY_TIMEOUT_MS = 5000;
+export const CONTRACT_SET_RESOLUTION_TIMEOUT_MS = 4500;
+const CONTRACT_TV_INITIAL_RIGHT_PADDING_BARS = 4;
 const DEFAULT_INTERVAL_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M'];
 const TIME_SHARING_KEY = 'time';
 const TIME_SHARING_LABEL = 'Time';
+
+export const CONTRACT_TV_PRICE_LABEL_OVERRIDES = {
+  'mainSeriesProperties.showPriceLine': false,
+  'scalesProperties.showSeriesLastValue': false,
+} as const;
+
+type ContractPriceOverlayInput = Parameters<
+  ContractTradingViewPriceOverlayController['update']
+>[0];
+
+type ContractPriceOverlayController = Pick<
+  ContractTradingViewPriceOverlayController,
+  'update' | 'destroy'
+>;
+
+export type ContractPriceOverlayLifecycleState = 'suspended' | 'active' | 'destroyed';
+
+export class ContractPriceOverlayLifecycle {
+  private lifecycleState: ContractPriceOverlayLifecycleState = 'suspended';
+
+  constructor(
+    private readonly getController: () => ContractPriceOverlayController | null,
+  ) {}
+
+  state() {
+    return this.lifecycleState;
+  }
+
+  suspend() {
+    if (this.lifecycleState === 'destroyed') return;
+    this.lifecycleState = 'suspended';
+  }
+
+  resume(input: ContractPriceOverlayInput) {
+    if (this.lifecycleState === 'destroyed') return;
+    this.lifecycleState = 'active';
+    this.getController()?.update(input);
+  }
+
+  update(input: ContractPriceOverlayInput) {
+    if (this.lifecycleState !== 'active') return;
+    this.getController()?.update(input);
+  }
+
+  destroy() {
+    if (this.lifecycleState === 'destroyed') return;
+    this.lifecycleState = 'destroyed';
+    this.getController()?.destroy();
+  }
+}
+
+const CONTRACT_TV_INTERVAL_SECONDS: Readonly<Record<string, number>> = {
+  '1m': 60,
+  '5m': 5 * 60,
+  '15m': 15 * 60,
+  '1h': 60 * 60,
+  '4h': 4 * 60 * 60,
+  '1d': 24 * 60 * 60,
+  '1w': 7 * 24 * 60 * 60,
+  '1M': 30 * 24 * 60 * 60,
+};
+
+export function resolveContractInitialVisibleRange(interval: string, latestBarTimeMs: number) {
+  const normalizedInterval = normalizeContractKlineLoadInterval(interval);
+  const intervalSeconds = CONTRACT_TV_INTERVAL_SECONDS[normalizedInterval]
+    ?? CONTRACT_TV_INTERVAL_SECONDS['1d'];
+  const targetVisibleBars = getContractKlineVisibleBars(normalizedInterval);
+  const latestBarTime = Math.floor(Number(latestBarTimeMs) / 1000);
+  if (!Number.isFinite(latestBarTime) || latestBarTime <= 0) return null;
+  return {
+    range: {
+      from: latestBarTime - intervalSeconds * targetVisibleBars,
+      to: latestBarTime,
+    },
+    fallbackRange: {
+      from: latestBarTime - intervalSeconds * targetVisibleBars,
+      to: latestBarTime + intervalSeconds * CONTRACT_TV_INITIAL_RIGHT_PADDING_BARS,
+    },
+    intervalSeconds,
+    latestBarTime,
+    rightPaddingBars: CONTRACT_TV_INITIAL_RIGHT_PADDING_BARS,
+    targetVisibleBars,
+  };
+}
 
 export const CONTRACT_TIME_SERIES_OVERRIDES = {
   'mainSeriesProperties.lineStyle.colorType': 'solid',
@@ -196,57 +359,353 @@ export function isContractHistoryEventCurrent(
     && event.requestSeq >= expected.minimumRequestSeq;
 }
 
+function normalizeContractResolutionValue(value: unknown) {
+  return String(value || '').trim();
+}
+
+export function readContractActiveTradingViewResolution(chart: TradingViewChartApi | null) {
+  if (typeof chart?.resolution !== 'function') return '';
+  try {
+    return normalizeContractResolutionValue(chart.resolution());
+  } catch {
+    return '';
+  }
+}
+
+export function shouldRequestContractResolution(
+  state: ContractResolutionLifecycleState,
+  targetResolution: string,
+) {
+  const target = normalizeContractResolutionValue(targetResolution);
+  if (!target) return false;
+  if (
+    state.requestedResolution === target
+    && state.inFlightResolution.endsWith(`:${target}`)
+  ) return false;
+  return Boolean(
+    state.inFlightResolution
+    || state.requestedResolution !== target
+    || state.committedResolution !== target
+    || state.activeTradingViewResolution !== target
+  );
+}
+
+export class ContractResolutionIntentCoordinator {
+  private currentResolution = '';
+  private inFlightResolution = '';
+  private pendingResolution: ContractResolutionIntent | null = null;
+  private latestIntentValue: ContractResolutionIntent | null = null;
+  private latestIntentId = 0;
+  private requestSequence = 0;
+
+  constructor(currentResolution = '') {
+    this.currentResolution = normalizeContractResolutionValue(currentResolution);
+  }
+
+  private snapshotValue(): ContractResolutionIntentSnapshot {
+    return {
+      currentResolution: this.currentResolution,
+      inFlightResolution: this.inFlightResolution,
+      pendingResolution: this.pendingResolution,
+      latestIntentId: this.latestIntentId,
+      requestSequence: this.requestSequence,
+    };
+  }
+
+  private start(intent: ContractResolutionIntent): ContractResolutionIntentToken {
+    this.requestSequence += 1;
+    this.inFlightResolution = intent.resolution;
+    return { ...intent, requestSequence: this.requestSequence };
+  }
+
+  reset(currentResolution = '') {
+    this.requestSequence += 1;
+    this.latestIntentId += 1;
+    this.currentResolution = normalizeContractResolutionValue(currentResolution);
+    this.inFlightResolution = '';
+    this.pendingResolution = null;
+    this.latestIntentValue = null;
+    return this.snapshotValue();
+  }
+
+  snapshot() {
+    return this.snapshotValue();
+  }
+
+  latestIntent() {
+    return this.latestIntentValue;
+  }
+
+  registerIntent(resolution: string) {
+    const nextResolution = normalizeContractResolutionValue(resolution);
+    this.latestIntentId += 1;
+    const intent: ContractResolutionIntent = {
+      resolution: nextResolution,
+      intentId: this.latestIntentId,
+    };
+    this.latestIntentValue = intent;
+    this.pendingResolution = nextResolution
+      && nextResolution !== (this.inFlightResolution || this.currentResolution)
+      ? intent
+      : null;
+    return { intent, snapshot: this.snapshotValue() };
+  }
+
+  isLatestIntent(intent: ContractResolutionIntent | null | undefined) {
+    return Boolean(
+      intent
+      && intent.intentId === this.latestIntentId
+      && intent.resolution === this.latestIntentValue?.resolution
+      && intent.intentId === this.latestIntentValue?.intentId
+    );
+  }
+
+  request(
+    intent: ContractResolutionIntent,
+    options: { canStart?: boolean } = {},
+  ): ContractResolutionIntentDecision {
+    const nextResolution = normalizeContractResolutionValue(intent.resolution);
+    if (!this.isLatestIntent(intent)) {
+      return { action: 'stale', snapshot: this.snapshotValue() };
+    }
+    if (!nextResolution) {
+      return { action: 'noop', snapshot: this.snapshotValue() };
+    }
+    if (this.inFlightResolution) {
+      this.pendingResolution = nextResolution === this.inFlightResolution ? null : intent;
+      return {
+        action: this.pendingResolution ? 'pending' : 'noop',
+        snapshot: this.snapshotValue(),
+      };
+    }
+    if (options.canStart === false) {
+      this.pendingResolution = nextResolution === this.currentResolution ? null : intent;
+      return {
+        action: this.pendingResolution ? 'pending' : 'noop',
+        snapshot: this.snapshotValue(),
+      };
+    }
+    if (nextResolution === this.currentResolution) {
+      if (this.pendingResolution?.intentId === intent.intentId) this.pendingResolution = null;
+      return { action: 'noop', snapshot: this.snapshotValue() };
+    }
+    if (this.pendingResolution?.intentId === intent.intentId) this.pendingResolution = null;
+    const token = this.start(intent);
+    return { action: 'start', token, snapshot: this.snapshotValue() };
+  }
+
+  private drainPending(): ContractResolutionIntentDecision {
+    if (this.inFlightResolution || !this.pendingResolution) {
+      return { action: 'noop', snapshot: this.snapshotValue() };
+    }
+    const pendingIntent = this.pendingResolution;
+    this.pendingResolution = null;
+    if (!this.isLatestIntent(pendingIntent)) {
+      return { action: 'stale', snapshot: this.snapshotValue() };
+    }
+    if (pendingIntent.resolution === this.currentResolution) {
+      return { action: 'noop', snapshot: this.snapshotValue() };
+    }
+    const token = this.start(pendingIntent);
+    return { action: 'start', token, snapshot: this.snapshotValue() };
+  }
+
+  isCurrent(token: ContractResolutionIntentToken | null | undefined) {
+    return Boolean(
+      token
+      && token.requestSequence === this.requestSequence
+      && token.intentId > 0
+      && token.resolution === this.inFlightResolution
+    );
+  }
+
+  canStart(token: ContractResolutionIntentToken | null | undefined) {
+    return Boolean(this.isCurrent(token) && this.isLatestIntent(token));
+  }
+
+  commit(token: ContractResolutionIntentToken): ContractResolutionIntentSettlement {
+    if (!this.isCurrent(token)) {
+      return { accepted: false, snapshot: this.snapshotValue() };
+    }
+    this.currentResolution = token.resolution;
+    this.inFlightResolution = '';
+    const decision = this.drainPending();
+    return {
+      accepted: true,
+      nextToken: decision.token,
+      snapshot: decision.snapshot,
+    };
+  }
+
+  fail(token: ContractResolutionIntentToken): ContractResolutionIntentSettlement {
+    if (!this.isCurrent(token)) {
+      return { accepted: false, snapshot: this.snapshotValue() };
+    }
+    this.inFlightResolution = '';
+    const decision = this.drainPending();
+    return {
+      accepted: true,
+      nextToken: decision.token,
+      snapshot: decision.snapshot,
+    };
+  }
+}
+
+function createContractResolutionClock(): ContractChartLoadingClock {
+  return {
+    now: () => Date.now(),
+    setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+    clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  };
+}
+
+export async function confirmContractResolutionReady(
+  chart: TradingViewChartApi | null,
+  requestedResolution: string,
+) {
+  const target = normalizeContractResolutionValue(requestedResolution);
+  if (typeof chart?.dataReady !== 'function') {
+    return { ok: false as const, activeResolution: '', reason: 'dataReady unavailable' };
+  }
+
+  try {
+    const ready = await chart.dataReady();
+    if (ready === false) {
+      return { ok: false as const, activeResolution: '', reason: 'dataReady returned false' };
+    }
+  } catch (error) {
+    return { ok: false as const, activeResolution: '', reason: 'dataReady rejected', error };
+  }
+
+  const activeResolution = readContractActiveTradingViewResolution(chart);
+  if (!activeResolution) {
+    return { ok: false as const, activeResolution: '', reason: 'resolution unavailable' };
+  }
+  if (activeResolution !== target) {
+    return {
+      ok: false as const,
+      activeResolution,
+      reason: 'resolution mismatch',
+    };
+  }
+  return { ok: true as const, activeResolution, reason: 'ready' };
+}
+
 export function requestContractSetResolution({
   chart,
   resolution,
   isCurrent,
+  onCommitted,
+  onFailed,
   onSettled,
   onFallback,
-}: ContractResolutionRequestParams) {
+  clock = createContractResolutionClock(),
+  timeoutMs = CONTRACT_SET_RESOLUTION_TIMEOUT_MS,
+}: ContractResolutionRequestParams): ContractResolutionRequest {
+  const targetResolution = normalizeContractResolutionValue(resolution);
   let finished = false;
+  let timeoutHandle: unknown = null;
+  let resolveCompletion: () => void = () => undefined;
+  const completion = new Promise<void>((resolve) => {
+    resolveCompletion = resolve;
+  }) as ContractResolutionRequest;
 
-  const settleOnce = () => {
+  const clearRequestTimeout = () => {
+    if (timeoutHandle === null) return;
+    clock.clearTimeout(timeoutHandle);
+    timeoutHandle = null;
+  };
+
+  const completeRequest = () => {
+    clearRequestTimeout();
+    resolveCompletion();
+  };
+
+  const settleOnce = (reason: string, authoritative = false) => {
     if (finished) return;
+    const activeResolution = readContractActiveTradingViewResolution(chart);
+    if (!authoritative && activeResolution && activeResolution !== targetResolution) {
+      fallbackOnce('setResolution commit mismatch');
+      return;
+    }
     finished = true;
-    if (isCurrent()) onSettled();
+    completeRequest();
+    if (!isCurrent()) return;
+    onCommitted?.(reason, activeResolution || targetResolution);
+    onSettled?.(activeResolution || targetResolution);
   };
 
   const fallbackOnce = (reason: string, error?: unknown) => {
     if (finished) return;
     finished = true;
-    if (isCurrent()) onFallback(reason, error);
+    completeRequest();
+    if (!isCurrent()) return;
+    onFailed?.(reason, error);
+    onFallback?.(reason, error);
   };
 
   const setResolution = chart?.setResolution;
   if (typeof setResolution !== 'function') {
     fallbackOnce('setResolution unavailable');
-    return;
-  }
+  } else {
+    timeoutHandle = clock.setTimeout(() => {
+      timeoutHandle = null;
+      const activeResolution = readContractActiveTradingViewResolution(chart);
+      if (activeResolution === targetResolution) {
+        settleOnce('setResolution timeout confirmed by chart resolution');
+        return;
+      }
+      fallbackOnce('setResolution timeout');
+    }, Math.max(0, timeoutMs));
 
-  try {
-    const result = setResolution.call(chart, resolution, { dataReady: settleOnce });
-    if (result === false) {
-      fallbackOnce('setResolution returned false');
-      return;
-    }
-    if (result === true) {
-      settleOnce();
-      return;
-    }
-    if (result && typeof result.then === 'function') {
-      void result.then((changed) => {
-        if (changed === false) {
-          fallbackOnce('setResolution returned false');
+    const confirmLegacyCompletion = () => {
+      if (finished || typeof chart?.dataReady !== 'function') return;
+      void confirmContractResolutionReady(chart, targetResolution).then((confirmation) => {
+        if (confirmation.ok) {
+          settleOnce('dataReady confirmed');
           return;
         }
-        settleOnce();
-      }).catch((error: unknown) => {
-        fallbackOnce('setResolution rejected', error);
+        fallbackOnce(
+          confirmation.reason,
+          'error' in confirmation ? confirmation.error : undefined,
+        );
       });
+    };
+
+    try {
+      const result = setResolution.call(chart, targetResolution, {
+        dataReady: () => settleOnce('dataReady callback', true),
+      });
+      if (result === false) {
+        fallbackOnce('setResolution returned false');
+      } else if (result === true) {
+        if (typeof chart?.dataReady === 'function') confirmLegacyCompletion();
+        else settleOnce('setResolution returned true');
+      } else if (result && typeof result.then === 'function') {
+        void result.then((changed) => {
+          if (changed === false) {
+            fallbackOnce('setResolution returned false');
+            return;
+          }
+          if (typeof chart?.dataReady === 'function') confirmLegacyCompletion();
+          else settleOnce('setResolution promise resolved');
+        }).catch((error: unknown) => {
+          fallbackOnce('setResolution rejected', error);
+        });
+      } else {
+        confirmLegacyCompletion();
+      }
+    } catch (error) {
+      fallbackOnce('setResolution threw', error);
     }
-  } catch (error) {
-    fallbackOnce('setResolution threw', error);
   }
+
+  completion.cancel = () => {
+    if (finished) return;
+    finished = true;
+    completeRequest();
+  };
+  return completion;
 }
 
 export class ContractChartLoadingCoordinator {
@@ -361,6 +820,17 @@ function formatIntervalLabel(value: string) {
   return normalized;
 }
 
+function resolveContractIntervalForResolution(
+  resolution: string,
+  intervals: string[],
+  fallbackInterval: string,
+) {
+  const normalizedResolution = normalizeContractResolutionValue(resolution);
+  return intervals.find(
+    (item) => contractIntervalToTradingViewResolution(item) === normalizedResolution,
+  ) || fallbackInterval;
+}
+
 function styleToolbarButton(button: HTMLButtonElement, active: boolean) {
   button.dataset.active = active ? '1' : '0';
   button.style.color = active ? '#f0b90b' : 'rgba(255,255,255,0.58)';
@@ -423,6 +893,8 @@ export default function ContractTradingViewChart({
   height = 520,
   pricePrecision,
   amountPrecision,
+  displayPrice = null,
+  priceDirection = 'flat',
   onChartModeChange,
   onIntervalChange,
   onLatestKlineCloseChange,
@@ -431,18 +903,31 @@ export default function ContractTradingViewChart({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const widgetRef = useRef<TradingViewWidgetInstance | null>(null);
   const datafeedRef = useRef<ReturnType<typeof createContractTradingViewDatafeed> | null>(null);
+  const priceOverlayControllerRef = useRef<ContractTradingViewPriceOverlayController | null>(null);
+  const priceOverlayLifecycleRef = useRef<ContractPriceOverlayLifecycle | null>(null);
+  const overlayIntervalRef = useRef('');
+  const preloadManagerRef = useRef<ReturnType<typeof createContractKlinePreloadManager> | null>(null);
   const toolbarButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const toolbarSlotRef = useRef<HTMLElement | null>(null);
   const chartReadyRef = useRef(false);
-  const currentResolutionRef = useRef('');
-  const pendingResolutionRef = useRef('');
-  const pendingResolutionSeqRef = useRef(0);
+  const resolutionIntentCoordinatorRef = useRef(new ContractResolutionIntentCoordinator());
+  const resolutionRequestRef = useRef<ContractResolutionRequest | null>(null);
+  const widgetGenerationSequenceRef = useRef(0);
+  const activeWidgetGenerationRef = useRef(0);
+  const requestedResolutionRef = useRef('');
+  const committedResolutionRef = useRef('');
+  const activeTradingViewResolutionRef = useRef('');
   const pendingResolutionLoadingSeqRef = useRef(0);
   const inFlightResolutionRef = useRef('');
   const resolutionRequestSeqRef = useRef(0);
-  const fallbackRequestSeqRef = useRef(0);
   const datafeedBuildSeqRef = useRef(0);
   const latestHistoryRequestSeqRef = useRef(0);
+  const preloadForegroundGenerationRef = useRef(0);
+  const pendingInitialVisibleRangeRef = useRef<ContractHistoryBarsEvent | null>(null);
+  const initialVisibleRangeAppliedKeyRef = useRef('');
+  const initialVisibleRangeInFlightKeyRef = useRef('');
+  const initialVisibleRangeApplySeqRef = useRef(0);
+  const flushPendingInitialVisibleRangeRef = useRef<(resolution: string) => void>(() => undefined);
   const activeChartLoadingSeqRef = useRef(0);
   const reactId = useId();
   const containerId = useMemo(
@@ -463,7 +948,6 @@ export default function ContractTradingViewChart({
   const effectiveInterval = resolveContractEffectiveKlineInterval(chartMode, activeInterval);
   const widgetInterval = contractIntervalToTradingViewResolution(effectiveInterval);
   const displayName = displaySymbol || normalizedSymbol;
-  const [resolutionFallbackNonce, setResolutionFallbackNonce] = useState(0);
   const widgetKey = buildContractWidgetIdentityKey({
     symbol: normalizedSymbol,
     category: canonicalCategory,
@@ -471,7 +955,7 @@ export default function ContractTradingViewChart({
     pricePrecision,
     amountPrecision,
     chartMode,
-    fallbackNonce: resolutionFallbackNonce,
+    fallbackNonce: 0,
   });
   const [scriptReady, setScriptReady] = useState(
     () => typeof window !== 'undefined' && Boolean(getTradingViewGlobal()?.widget),
@@ -488,6 +972,9 @@ export default function ContractTradingViewChart({
   const widgetIntervalRef = useRef(widgetInterval);
   const chartModeRef = useRef(chartMode);
   const displayNameRef = useRef(displayName);
+  const canonicalCategoryRef = useRef(canonicalCategory);
+  const displayPriceRef = useRef(displayPrice);
+  const priceDirectionRef = useRef(priceDirection);
   const widgetKeyRef = useRef(widgetKey);
   const onChartModeChangeRef = useRef(onChartModeChange);
   const onIntervalChangeRef = useRef(onIntervalChange);
@@ -507,6 +994,9 @@ export default function ContractTradingViewChart({
     widgetIntervalRef.current = widgetInterval;
     chartModeRef.current = chartMode;
     displayNameRef.current = displayName;
+    canonicalCategoryRef.current = canonicalCategory;
+    displayPriceRef.current = displayPrice;
+    priceDirectionRef.current = priceDirection;
     widgetKeyRef.current = widgetKey;
     onChartModeChangeRef.current = onChartModeChange;
     onIntervalChangeRef.current = onIntervalChange;
@@ -515,15 +1005,86 @@ export default function ContractTradingViewChart({
     activeInterval,
     activeIntervals,
     chartMode,
+    canonicalCategory,
+    displayPrice,
     displayName,
     effectiveInterval,
     normalizedSymbol,
     onChartModeChange,
     onIntervalChange,
     onLatestKlineCloseChange,
+    priceDirection,
     widgetInterval,
     widgetKey,
   ]);
+
+  const getPriceOverlayLifecycle = useCallback(() => {
+    if (!priceOverlayLifecycleRef.current) {
+      priceOverlayLifecycleRef.current = new ContractPriceOverlayLifecycle(
+        () => priceOverlayControllerRef.current,
+      );
+    }
+    return priceOverlayLifecycleRef.current;
+  }, []);
+
+  const priceOverlayInput = useCallback((interval?: string): ContractPriceOverlayInput => ({
+      symbol: normalizedSymbolRef.current,
+      interval: interval || overlayIntervalRef.current || effectiveIntervalRef.current,
+      displayPrice: displayPriceRef.current,
+      priceDirection: priceDirectionRef.current,
+  }), []);
+
+  const updatePriceOverlay = useCallback(() => {
+    getPriceOverlayLifecycle().update(priceOverlayInput());
+  }, [getPriceOverlayLifecycle, priceOverlayInput]);
+
+  const suspendPriceOverlay = useCallback(() => {
+    getPriceOverlayLifecycle().suspend();
+  }, [getPriceOverlayLifecycle]);
+
+  const resumePriceOverlay = useCallback((interval?: string) => {
+    const nextInterval = interval || overlayIntervalRef.current || effectiveIntervalRef.current;
+    overlayIntervalRef.current = nextInterval;
+    getPriceOverlayLifecycle().resume(priceOverlayInput(nextInterval));
+  }, [getPriceOverlayLifecycle, priceOverlayInput]);
+
+  const getPreloadManager = useCallback(() => {
+    if (!preloadManagerRef.current) {
+      preloadManagerRef.current = createContractKlinePreloadManager({
+        getState: () => ({
+          symbol: normalizedSymbolRef.current,
+          category: canonicalCategoryRef.current,
+          interval: effectiveIntervalRef.current,
+        }),
+      });
+    }
+    return preloadManagerRef.current;
+  }, []);
+
+  const pausePreloadForeground = useCallback((interval: string) => {
+    const generation = preloadForegroundGenerationRef.current + 1;
+    preloadForegroundGenerationRef.current = generation;
+    getPreloadManager().setForegroundState({
+      loading: true,
+      symbol: normalizedSymbolRef.current,
+      interval,
+      generation,
+    });
+    return generation;
+  }, [getPreloadManager]);
+
+  const resumePreloadForeground = useCallback((event: ContractHistoryBarsEvent | ContractHistoryErrorEvent) => {
+    getPreloadManager().setForegroundState({
+      loading: false,
+      symbol: event.symbol,
+      interval: event.interval,
+      generation: preloadForegroundGenerationRef.current,
+    });
+  }, [getPreloadManager]);
+
+  useEffect(() => {
+    updatePriceOverlay();
+  }, [displayPrice, priceDirection, updatePriceOverlay]);
 
   const startChartLoading = useCallback((reason: string) => {
     setLoadError(null);
@@ -545,80 +1106,255 @@ export default function ContractTradingViewChart({
     });
   }, []);
 
-  const requestResolutionFallbackRebuild = useCallback((
+  const applyWidgetResolution = useCallback((
     nextResolution: string,
-    requestSeq: number,
+    widgetGeneration = activeWidgetGenerationRef.current,
   ) => {
-    if (
-      resolutionRequestSeqRef.current !== requestSeq
-      || fallbackRequestSeqRef.current === requestSeq
-    ) return;
-    fallbackRequestSeqRef.current = requestSeq;
-    pendingResolutionRef.current = nextResolution;
-    inFlightResolutionRef.current = '';
-    activeChartLoadingSeqRef.current = startChartLoading('resolution-fallback-rebuild');
-    setResolutionFallbackNonce((current) => current + 1);
-  }, [startChartLoading]);
-
-  const applyWidgetResolution = useCallback((nextResolution: string) => {
     const normalizedResolution = String(nextResolution || '').trim();
-    if (!normalizedResolution) return;
-    if (currentResolutionRef.current === normalizedResolution) {
-      pendingResolutionRef.current = '';
-      inFlightResolutionRef.current = '';
+    if (
+      !normalizedResolution
+      || !widgetGeneration
+      || activeWidgetGenerationRef.current !== widgetGeneration
+    ) return;
+    const widget = widgetRef.current;
+    const coordinator = resolutionIntentCoordinatorRef.current;
+    const latestIntent = coordinator.latestIntent();
+    const intent = latestIntent?.resolution === normalizedResolution
+      ? latestIntent
+      : coordinator.registerIntent(normalizedResolution).intent;
+    requestedResolutionRef.current = normalizedResolution;
+    const decision = coordinator.request(intent, {
+      canStart: Boolean(widget && chartReadyRef.current),
+    });
+
+    if (decision.action === 'stale') return;
+    if (decision.action === 'noop') {
+      inFlightResolutionRef.current = decision.snapshot.inFlightResolution;
+      if (
+        decision.snapshot.currentResolution === normalizedResolution
+        && !decision.snapshot.inFlightResolution
+      ) {
+        committedResolutionRef.current = normalizedResolution;
+        activeTradingViewResolutionRef.current = normalizedResolution;
+      }
       return;
     }
 
-    if (pendingResolutionRef.current !== normalizedResolution) {
-      resolutionRequestSeqRef.current += 1;
-      pendingResolutionSeqRef.current = resolutionRequestSeqRef.current;
-      pendingResolutionRef.current = normalizedResolution;
-      pendingResolutionLoadingSeqRef.current = startChartLoading('set-resolution');
-      inFlightResolutionRef.current = '';
+    suspendPriceOverlay();
+    pausePreloadForeground(effectiveIntervalRef.current);
+    pendingInitialVisibleRangeRef.current = null;
+    initialVisibleRangeAppliedKeyRef.current = '';
+    initialVisibleRangeInFlightKeyRef.current = '';
+    initialVisibleRangeApplySeqRef.current += 1;
+    pendingResolutionLoadingSeqRef.current = startChartLoading('set-resolution');
+
+    if (decision.action === 'pending') {
+      inFlightResolutionRef.current = decision.snapshot.inFlightResolution;
+      return;
     }
+    if (!widget || !decision.token) return;
 
-    if (!chartReadyRef.current) return;
-    const requestSeq = pendingResolutionSeqRef.current;
-    const inFlightKey = `${requestSeq}:${normalizedResolution}`;
-    if (inFlightResolutionRef.current === inFlightKey) return;
+    const runResolutionRequest = (token: ContractResolutionIntentToken) => {
+      if (!coordinator.canStart(token)) return;
+      const targetResolution = token.resolution;
+      const requestSeq = ++resolutionRequestSeqRef.current;
+      inFlightResolutionRef.current = targetResolution;
+      resolutionRequestRef.current?.cancel();
 
-    const widget = widgetRef.current;
-    const chart = widget?.activeChart?.() || null;
-    inFlightResolutionRef.current = inFlightKey;
-    requestContractSetResolution({
-      chart,
-      resolution: normalizedResolution,
-      isCurrent: () => (
-        resolutionRequestSeqRef.current === requestSeq
-        && pendingResolutionRef.current === normalizedResolution
-        && widgetRef.current === widget
-      ),
-      onSettled: () => {
-        currentResolutionRef.current = normalizedResolution;
-        pendingResolutionRef.current = '';
-        inFlightResolutionRef.current = '';
-        finishChartLoading(pendingResolutionLoadingSeqRef.current);
-      },
-      onFallback: () => {
-        requestResolutionFallbackRebuild(normalizedResolution, requestSeq);
-      },
-    });
-  }, [finishChartLoading, requestResolutionFallbackRebuild, startChartLoading]);
+      const settleForeground = (resolution: string) => {
+        const interval = resolveContractIntervalForResolution(
+          resolution,
+          activeIntervalsRef.current,
+          activeIntervalRef.current,
+        );
+        getPreloadManager().setForegroundState({
+          loading: false,
+          symbol: normalizedSymbolRef.current,
+          interval,
+          generation: token.requestSequence,
+        });
+        return interval;
+      };
+
+      const rollbackChartToStableResolution = (
+        stableResolution: string,
+        onRollbackSettled: () => void,
+      ) => {
+        let rollbackSettled = false;
+        const settleRollbackOnce = () => {
+          if (rollbackSettled) return;
+          rollbackSettled = true;
+          onRollbackSettled();
+        };
+        if (!stableResolution) {
+          settleRollbackOnce();
+          return;
+        }
+        const activeChart = widget.activeChart?.() || null;
+        const observedResolution = readContractActiveTradingViewResolution(activeChart);
+        activeTradingViewResolutionRef.current = observedResolution;
+        if (observedResolution === stableResolution) {
+          settleRollbackOnce();
+          return;
+        }
+
+        const rollbackRequestSeq = ++resolutionRequestSeqRef.current;
+        let rollbackRequest: ContractResolutionRequest | null = null;
+        let settledSynchronously = false;
+        const clearRollbackRequest = () => {
+          if (!rollbackRequest) {
+            settledSynchronously = true;
+            return;
+          }
+          if (resolutionRequestRef.current === rollbackRequest) {
+            resolutionRequestRef.current = null;
+          }
+        };
+        const createdRollbackRequest = requestContractSetResolution({
+          chart: activeChart,
+          resolution: stableResolution,
+          isCurrent: () => (
+            resolutionRequestSeqRef.current === rollbackRequestSeq
+            && widgetRef.current === widget
+            && activeWidgetGenerationRef.current === widgetGeneration
+          ),
+          onCommitted: (_reason, activeResolution) => {
+            clearRollbackRequest();
+            activeTradingViewResolutionRef.current = activeResolution || stableResolution;
+            settleRollbackOnce();
+          },
+          onFailed: () => {
+            clearRollbackRequest();
+            settleRollbackOnce();
+          },
+        });
+        rollbackRequest = createdRollbackRequest;
+        if (!settledSynchronously) resolutionRequestRef.current = createdRollbackRequest;
+      };
+
+      let request: ContractResolutionRequest | null = null;
+      let settledSynchronously = false;
+      const clearActiveRequest = () => {
+        if (!request) {
+          settledSynchronously = true;
+          return;
+        }
+        if (resolutionRequestRef.current === request) resolutionRequestRef.current = null;
+      };
+      const createdRequest = requestContractSetResolution({
+        chart: widget.activeChart?.() || null,
+        resolution: targetResolution,
+        isCurrent: () => (
+          resolutionRequestSeqRef.current === requestSeq
+          && coordinator.isCurrent(token)
+          && widgetRef.current === widget
+          && activeWidgetGenerationRef.current === widgetGeneration
+        ),
+        onCommitted: (_reason, activeResolution) => {
+          clearActiveRequest();
+          const settlement = coordinator.commit(token);
+          if (!settlement.accepted) return;
+          committedResolutionRef.current = targetResolution;
+          activeTradingViewResolutionRef.current = activeResolution || targetResolution;
+          inFlightResolutionRef.current = settlement.snapshot.inFlightResolution;
+
+          if (settlement.nextToken) {
+            requestedResolutionRef.current = settlement.nextToken.resolution;
+            runResolutionRequest(settlement.nextToken);
+            return;
+          }
+
+          requestedResolutionRef.current = targetResolution;
+          settleForeground(targetResolution);
+          finishChartLoading(pendingResolutionLoadingSeqRef.current);
+          flushPendingInitialVisibleRangeRef.current(targetResolution);
+        },
+        onFailed: () => {
+          clearActiveRequest();
+          const settlement = coordinator.fail(token);
+          if (!settlement.accepted) return;
+          inFlightResolutionRef.current = settlement.snapshot.inFlightResolution;
+
+          if (settlement.nextToken) {
+            requestedResolutionRef.current = settlement.nextToken.resolution;
+            runResolutionRequest(settlement.nextToken);
+            return;
+          }
+
+          const stableResolution = settlement.snapshot.currentResolution;
+          const stableInterval = settleForeground(stableResolution);
+          requestedResolutionRef.current = stableResolution;
+          committedResolutionRef.current = stableResolution;
+          rollbackChartToStableResolution(
+            stableResolution,
+            () => resumePriceOverlay(stableInterval),
+          );
+          updateToolbarButtons(
+            toolbarButtonRefs.current,
+            chartModeRef.current,
+            stableInterval,
+          );
+          finishChartLoading(pendingResolutionLoadingSeqRef.current);
+          if (stableInterval && activeIntervalRef.current !== stableInterval) {
+            onIntervalChangeRef.current?.(stableInterval);
+          }
+        },
+      });
+      request = createdRequest;
+      if (!settledSynchronously) resolutionRequestRef.current = createdRequest;
+    };
+
+    runResolutionRequest(decision.token);
+  }, [
+    finishChartLoading,
+    getPreloadManager,
+    pausePreloadForeground,
+    resumePriceOverlay,
+    startChartLoading,
+    suspendPriceOverlay,
+  ]);
 
   useEffect(() => () => {
     loadingCoordinator.destroy();
   }, [loadingCoordinator]);
 
+  useEffect(() => () => {
+    preloadManagerRef.current?.destroy();
+    preloadManagerRef.current = null;
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
+    let widgetGeneration = 0;
     let chartReadyTimer: number | null = null;
     let widgetBuildLoadingTimer: number | null = null;
     let widgetBuildCompleted = false;
 
-    const cleanupWidget = () => {
+    const cleanupWidget = (generation = activeWidgetGenerationRef.current) => {
+      if (
+        generation
+        && activeWidgetGenerationRef.current
+        && activeWidgetGenerationRef.current !== generation
+      ) return;
+      activeWidgetGenerationRef.current = 0;
       chartReadyRef.current = false;
+      resolutionRequestRef.current?.cancel();
+      resolutionRequestRef.current = null;
+      resolutionIntentCoordinatorRef.current.reset('');
+      priceOverlayLifecycleRef.current?.destroy();
+      priceOverlayLifecycleRef.current = null;
+      priceOverlayControllerRef.current = null;
+      overlayIntervalRef.current = '';
+      preloadManagerRef.current?.cancel('contract chart widget cleanup');
+      pendingInitialVisibleRangeRef.current = null;
+      initialVisibleRangeAppliedKeyRef.current = '';
+      initialVisibleRangeInFlightKeyRef.current = '';
+      initialVisibleRangeApplySeqRef.current += 1;
+      flushPendingInitialVisibleRangeRef.current = () => undefined;
       resolutionRequestSeqRef.current += 1;
-      pendingResolutionRef.current = '';
+      requestedResolutionRef.current = '';
+      committedResolutionRef.current = '';
+      activeTradingViewResolutionRef.current = '';
       inFlightResolutionRef.current = '';
       toolbarButtonRefs.current.clear();
       toolbarSlotRef.current = null;
@@ -636,10 +1372,10 @@ export default function ContractTradingViewChart({
       cancelled = true;
       if (chartReadyTimer !== null) window.clearTimeout(chartReadyTimer);
       if (widgetBuildLoadingTimer !== null) window.clearTimeout(widgetBuildLoadingTimer);
-      cleanupWidget();
+      cleanupWidget(widgetGeneration);
     };
 
-    cleanupWidget();
+    cleanupWidget(activeWidgetGenerationRef.current);
     if (!scriptReady || !normalizedSymbol || !containerRef.current) {
       return disposeEffect;
     }
@@ -656,18 +1392,27 @@ export default function ContractTradingViewChart({
 
     const initialResolution = widgetIntervalRef.current;
     const initialStyle = resolveContractWidgetStyle(chartModeRef.current);
+    widgetGeneration = ++widgetGenerationSequenceRef.current;
+    activeWidgetGenerationRef.current = widgetGeneration;
     const buildSeq = datafeedBuildSeqRef.current + 1;
     datafeedBuildSeqRef.current = buildSeq;
     latestHistoryRequestSeqRef.current = 0;
+    pausePreloadForeground(effectiveIntervalRef.current);
+    overlayIntervalRef.current = effectiveIntervalRef.current;
+    suspendPriceOverlay();
     chartReadyRef.current = false;
-    currentResolutionRef.current = initialResolution;
-    pendingResolutionRef.current = '';
-    pendingResolutionSeqRef.current = resolutionRequestSeqRef.current;
+    resolutionIntentCoordinatorRef.current.reset(initialResolution);
+    requestedResolutionRef.current = initialResolution;
+    committedResolutionRef.current = initialResolution;
+    activeTradingViewResolutionRef.current = initialResolution;
     inFlightResolutionRef.current = '';
-    fallbackRequestSeqRef.current = 0;
     widgetBuildLoadingTimer = window.setTimeout(() => {
       widgetBuildLoadingTimer = null;
-      if (!cancelled && !widgetBuildCompleted) {
+      if (
+        !cancelled
+        && !widgetBuildCompleted
+        && activeWidgetGenerationRef.current === widgetGeneration
+      ) {
         activeChartLoadingSeqRef.current = startChartLoading('widget-build');
       }
     }, 0);
@@ -678,10 +1423,84 @@ export default function ContractTradingViewChart({
       && isContractHistoryEventCurrent(event, {
         symbol: normalizedSymbolRef.current,
         interval: effectiveIntervalRef.current,
-        resolution: widgetIntervalRef.current,
+        resolution: requestedResolutionRef.current || widgetIntervalRef.current,
         minimumRequestSeq: latestHistoryRequestSeqRef.current,
       })
     );
+
+    const applyInitialVisibleRange = (event: ContractHistoryBarsEvent) => {
+      if (!event.firstDataRequest || !eventMatchesCurrentChart(event)) return;
+      if (!event.lastBarTime) {
+        resumePreloadForeground(event);
+        return;
+      }
+      const rangeInfo = resolveContractInitialVisibleRange(event.interval, event.lastBarTime);
+      if (!rangeInfo) {
+        resumePreloadForeground(event);
+        return;
+      }
+      const applyKey = [event.symbol, event.interval, event.resolution, event.requestSeq].join('|');
+      if (initialVisibleRangeAppliedKeyRef.current === applyKey) {
+        resumePreloadForeground(event);
+        return;
+      }
+      if (initialVisibleRangeInFlightKeyRef.current === applyKey) return;
+
+      if (
+        (
+          requestedResolutionRef.current === event.resolution
+          && committedResolutionRef.current !== event.resolution
+        )
+        || inFlightResolutionRef.current === event.resolution
+      ) {
+        pendingInitialVisibleRangeRef.current = event;
+        return;
+      }
+
+      const activeWidget = widgetRef.current;
+      const chart = activeWidget?.activeChart?.() || null;
+      if (!activeWidget || !chartReadyRef.current || typeof chart?.setVisibleRange !== 'function') {
+        pendingInitialVisibleRangeRef.current = event;
+        return;
+      }
+
+      initialVisibleRangeInFlightKeyRef.current = applyKey;
+      pendingInitialVisibleRangeRef.current = null;
+      const applySeq = ++initialVisibleRangeApplySeqRef.current;
+      const isCurrentViewportIntent = () => (
+        initialVisibleRangeApplySeqRef.current === applySeq
+        && datafeedBuildSeqRef.current === buildSeq
+        && widgetRef.current === activeWidget
+        && normalizedSymbolRef.current === event.symbol
+        && effectiveIntervalRef.current === event.interval
+        && requestedResolutionRef.current === event.resolution
+        && latestHistoryRequestSeqRef.current === event.requestSeq
+      );
+      void applyTradingViewViewport({
+        chart,
+        range: rangeInfo.range,
+        fallbackRange: rangeInfo.fallbackRange,
+        intervalSeconds: rangeInfo.intervalSeconds,
+        rightPaddingBars: rangeInfo.rightPaddingBars,
+        isCurrent: isCurrentViewportIntent,
+        maxRetries: 1,
+      }).then((result) => {
+        if (initialVisibleRangeInFlightKeyRef.current === applyKey) {
+          initialVisibleRangeInFlightKeyRef.current = '';
+        }
+        if (!isCurrentViewportIntent()) return;
+        initialVisibleRangeAppliedKeyRef.current = result.applied ? applyKey : '';
+        resumePreloadForeground(event);
+      }).catch(() => {
+        if (isCurrentViewportIntent()) resumePreloadForeground(event);
+      });
+    };
+
+    flushPendingInitialVisibleRangeRef.current = (resolution) => {
+      const pendingEvent = pendingInitialVisibleRangeRef.current;
+      if (!pendingEvent || pendingEvent.resolution !== resolution) return;
+      applyInitialVisibleRange(pendingEvent);
+    };
 
     const datafeed = createContractTradingViewDatafeed({
       symbol: normalizedSymbol,
@@ -698,6 +1517,9 @@ export default function ContractTradingViewChart({
           widgetBuildLoadingTimer = null;
         }
         latestHistoryRequestSeqRef.current = event.requestSeq;
+        resumePriceOverlay(event.interval);
+        getPreloadManager().schedule(event);
+        applyInitialVisibleRange(event);
         setLoadError(null);
         finishChartLoading(activeChartLoadingSeqRef.current);
       },
@@ -709,7 +1531,9 @@ export default function ContractTradingViewChart({
           widgetBuildLoadingTimer = null;
         }
         latestHistoryRequestSeqRef.current = event.requestSeq;
+        resumePriceOverlay(event.interval);
         setLoadError({ key: widgetKeyRef.current, message: event.error });
+        resumePreloadForeground(event);
         finishChartLoading(activeChartLoadingSeqRef.current);
       },
     });
@@ -747,6 +1571,7 @@ export default function ContractTradingViewChart({
         'scalesProperties.showStudyPlotLabels': false,
         volumePaneSize: 'small',
         'mainSeriesProperties.style': initialStyle,
+        ...CONTRACT_TV_PRICE_LABEL_OVERRIDES,
         ...CONTRACT_TIME_SERIES_OVERRIDES,
         'mainSeriesProperties.candleStyle.upColor': '#00c087',
         'mainSeriesProperties.candleStyle.downColor': '#f6465d',
@@ -768,18 +1593,49 @@ export default function ContractTradingViewChart({
     widgetRef.current = widget;
 
     const markChartReady = () => {
-      if (cancelled || widgetRef.current !== widget) return;
-      widget.applyOverrides?.(CONTRACT_TIME_SERIES_OVERRIDES);
+      if (
+        cancelled
+        || widgetRef.current !== widget
+        || activeWidgetGenerationRef.current !== widgetGeneration
+      ) return;
+      widget.applyOverrides?.({
+        ...CONTRACT_TV_PRICE_LABEL_OVERRIDES,
+        ...CONTRACT_TIME_SERIES_OVERRIDES,
+      });
+      const chart = widget.activeChart();
+      if (
+        chart.createShape
+        && chart.getShapeById
+        && chart.removeEntity
+        && !priceOverlayControllerRef.current
+      ) {
+        priceOverlayControllerRef.current = new ContractTradingViewPriceOverlayController(
+          chart as ContractTradingViewOverlayChart,
+        );
+      }
       if (chartModeRef.current === 'time') {
-        widget.activeChart().getSeries?.().setChartStyleProperties?.(
+        chart.getSeries?.().setChartStyleProperties?.(
           TRADINGVIEW_TIME_STYLE,
           CONTRACT_TIME_LINE_STYLE_PREFERENCES,
         );
       }
       chartReadyRef.current = true;
-      const pendingResolution = pendingResolutionRef.current;
-      if (pendingResolution && pendingResolution !== currentResolutionRef.current) {
-        applyWidgetResolution(pendingResolution);
+      updatePriceOverlay();
+      const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
+      const activeResolution = readContractActiveTradingViewResolution(chart);
+      activeTradingViewResolutionRef.current = activeResolution || resolutionState.currentResolution;
+      committedResolutionRef.current = resolutionState.currentResolution;
+      const pendingResolution = resolutionState.pendingResolution;
+      if (pendingResolution) {
+        applyWidgetResolution(pendingResolution.resolution, widgetGeneration);
+      } else {
+        const requestedResolution = requestedResolutionRef.current || widgetIntervalRef.current;
+        if (requestedResolution !== resolutionState.currentResolution) {
+          applyWidgetResolution(requestedResolution, widgetGeneration);
+        } else {
+          const pendingInitialVisibleRange = pendingInitialVisibleRangeRef.current;
+          if (pendingInitialVisibleRange) applyInitialVisibleRange(pendingInitialVisibleRange);
+        }
       }
       restoreToolbarInteraction(buildSeq);
     };
@@ -793,7 +1649,11 @@ export default function ContractTradingViewChart({
     }
 
     void widget.headerReady().then(() => {
-      if (cancelled || widgetRef.current !== widget) return;
+      if (
+        cancelled
+        || widgetRef.current !== widget
+        || activeWidgetGenerationRef.current !== widgetGeneration
+      ) return;
       const toolbarSlot = widget.createButton({ align: 'left', useTradingViewStyle: false });
       toolbarSlotRef.current = toolbarSlot;
       toolbarSlot.setAttribute('title', '');
@@ -824,16 +1684,19 @@ export default function ContractTradingViewChart({
       };
 
       appendButton(TIME_SHARING_KEY, TIME_SHARING_LABEL, () => {
+        if (activeWidgetGenerationRef.current !== widgetGeneration) return;
         const selection = resolveContractToolbarSelection(
           TIME_SHARING_KEY,
           activeIntervalRef.current,
         );
+        pausePreloadForeground(selection.interval);
         if (chartModeRef.current !== selection.chartMode) {
           activeChartLoadingSeqRef.current = startChartLoading('toolbar-mode-change');
         }
         chartModeRef.current = selection.chartMode;
-        effectiveIntervalRef.current = '1m';
-        widgetIntervalRef.current = contractIntervalToTradingViewResolution('1m');
+        const targetResolution = contractIntervalToTradingViewResolution('1m');
+        resolutionIntentCoordinatorRef.current.registerIntent(targetResolution);
+        requestedResolutionRef.current = targetResolution;
         updateToolbarButtons(
           toolbarButtonRefs.current,
           selection.chartMode,
@@ -844,7 +1707,9 @@ export default function ContractTradingViewChart({
 
       activeIntervalsRef.current.forEach((item) => {
         appendButton(item, formatIntervalLabel(item), () => {
+          if (activeWidgetGenerationRef.current !== widgetGeneration) return;
           const selection = resolveContractToolbarSelection(item, activeIntervalRef.current);
+          pausePreloadForeground(selection.interval);
           if (
             chartModeRef.current !== selection.chartMode
             || activeIntervalRef.current !== selection.interval
@@ -853,9 +1718,9 @@ export default function ContractTradingViewChart({
           }
           const previousMode = chartModeRef.current;
           chartModeRef.current = selection.chartMode;
-          activeIntervalRef.current = selection.interval;
-          effectiveIntervalRef.current = selection.interval;
-          widgetIntervalRef.current = contractIntervalToTradingViewResolution(selection.interval);
+          const targetResolution = contractIntervalToTradingViewResolution(selection.interval);
+          resolutionIntentCoordinatorRef.current.registerIntent(targetResolution);
+          requestedResolutionRef.current = targetResolution;
           updateToolbarButtons(
             toolbarButtonRefs.current,
             selection.chartMode,
@@ -877,13 +1742,18 @@ export default function ContractTradingViewChart({
     chartMode,
     containerId,
     finishChartLoading,
+    getPreloadManager,
     locale,
     normalizedSymbol,
+    pausePreloadForeground,
     pricePrecision,
-    resolutionFallbackNonce,
     restoreToolbarInteraction,
+    resumePriceOverlay,
+    resumePreloadForeground,
     scriptReady,
     startChartLoading,
+    suspendPriceOverlay,
+    updatePriceOverlay,
     widgetKey,
   ]);
 

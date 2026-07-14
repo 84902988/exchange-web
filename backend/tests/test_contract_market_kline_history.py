@@ -61,6 +61,11 @@ def _load_contract_market_service_module():
     class ProviderCooldownError(RuntimeError):
         pass
 
+    class KlineProviderHistoryBoundary(RuntimeError):
+        def __init__(self, message: str, *, provider_error_provider: str | None = None):
+            super().__init__(message)
+            self.provider_error_provider = provider_error_provider
+
     _module(
         "app.core.config",
         settings=SimpleNamespace(BINANCE_USDM_USE_ENV_PROXY=False),
@@ -92,6 +97,7 @@ def _load_contract_market_service_module():
     _module(
         "app.services.market_kline_cache",
         KLINE_CACHE_POLICY_GAP_TOLERANT="gap_tolerant",
+        KlineProviderHistoryBoundary=KlineProviderHistoryBoundary,
         get_klines_cache_first=lambda *_args, **_kwargs: [],
     )
     _module(
@@ -121,8 +127,12 @@ def _load_contract_market_service_module():
     return module
 
 
-def _okx_provider():
-    return SimpleNamespace(provider_code="OKX_SWAP", cooldown_seconds=0)
+def _okx_provider(*, cooldown_seconds: int = 0):
+    return SimpleNamespace(provider_code="OKX_SWAP", cooldown_seconds=cooldown_seconds)
+
+
+def _bitget_provider(*, cooldown_seconds: int = 0):
+    return SimpleNamespace(provider_code="BITGET_USDT_FUTURES", cooldown_seconds=cooldown_seconds)
 
 
 def _contract_symbol():
@@ -134,17 +144,23 @@ def _contract_symbol():
     )
 
 
-def _itick_contract_symbol(*, category: str):
+def _itick_contract_symbol(
+    *,
+    category: str,
+    symbol: str = "US30_PERP",
+    provider_symbol: str = "US30",
+):
     return SimpleNamespace(
-        symbol="US30_PERP",
+        symbol=symbol,
         provider="ITICK",
-        provider_symbol="US30",
+        provider_symbol=provider_symbol,
         category=category,
     )
 
 
 def _provider_rows(*open_times: int):
     return {
+        "code": "0",
         "data": [
             [str(open_time), "100", "110", "90", "105", "5", "525", "525", "1"]
             for open_time in open_times
@@ -160,13 +176,41 @@ class _SharedKlineCacheResult(list):
         origin: str,
         cache_status: str,
         history_incomplete: bool = False,
+        history_terminal: bool = False,
+        terminal_reason: str | None = None,
+        earliest_available_time: int | None = None,
+        coverage_complete: bool | None = None,
         provider_error_code: str | None = None,
     ):
         super().__init__(rows)
         self.origin = origin
         self.cache_status = cache_status
         self.history_incomplete = history_incomplete
+        self.history_terminal = history_terminal
+        self.terminal_reason = terminal_reason
+        self.earliest_available_time = earliest_available_time
+        self.coverage_complete = coverage_complete
         self.provider_error_code = provider_error_code
+
+
+def _cache_first_fetches_provider(_db, **kwargs):
+    try:
+        rows = kwargs["fetch_external"](kwargs["limit"], kwargs["end_time_ms"])
+    except TimeoutError:
+        return _SharedKlineCacheResult(
+            [],
+            origin="EMPTY",
+            cache_status="TIMEOUT",
+            history_incomplete=kwargs["end_time_ms"] is not None,
+            provider_error_code="TIMEOUT",
+        )
+    return _SharedKlineCacheResult(
+        rows,
+        origin="REST_FETCH" if rows else "EMPTY",
+        cache_status="MISS" if rows else "PROVIDER_EMPTY",
+        history_incomplete=not rows and kwargs["end_time_ms"] is not None,
+        provider_error_code=None if rows else "EMPTY",
+    )
 
 
 def _configure_okx_fetch(service, payload, calls):
@@ -274,6 +318,338 @@ def test_okx_history_request_uses_history_endpoint_after_and_strict_boundary():
     assert calls[0]["endpoint_type"] == "kline_history"
     assert calls[0]["extra_params"] == {"bar": "1m", "after": str(end_time_ms)}
     assert all(row["open_time"] < end_time_ms for row in rows)
+
+
+def test_btc_monthly_current_returns_provider_rows():
+    service = _load_contract_market_service_module()
+    calls = []
+    monthly_open_times = [
+        1_767_225_600_000,
+        1_769_904_000_000,
+        1_772_582_400_000,
+    ]
+    _configure_okx_fetch(service, _provider_rows(*monthly_open_times), calls)
+
+    rows = service._get_configured_contract_klines(
+        object(),
+        _contract_symbol(),
+        interval="1M",
+        limit=60,
+        end_time_ms=None,
+    )
+
+    assert [row["open_time"] for row in rows] == monthly_open_times
+    assert calls == [
+        {
+            "endpoint_type": "kline",
+            "provider_symbol": "BTC-USDT-SWAP",
+            "limit": 60,
+            "extra_params": {"bar": "1M"},
+        }
+    ]
+
+
+def test_btc_monthly_history_pagination_uses_cursor():
+    service = _load_contract_market_service_module()
+    calls = []
+    end_time_ms = 1_772_582_400_000
+    previous_month = 1_769_904_000_000
+    _configure_okx_fetch(
+        service,
+        _provider_rows(previous_month, end_time_ms),
+        calls,
+    )
+
+    rows = service._get_configured_contract_klines(
+        object(),
+        _contract_symbol(),
+        interval="1M",
+        limit=240,
+        end_time_ms=end_time_ms,
+    )
+
+    assert [row["open_time"] for row in rows] == [previous_month]
+    assert calls == [
+        {
+            "endpoint_type": "kline_history",
+            "provider_symbol": "BTC-USDT-SWAP",
+            "limit": 240,
+            "extra_params": {"bar": "1M", "after": str(end_time_ms)},
+        }
+    ]
+
+
+def test_btc_monthly_history_beyond_earliest_raises_provider_boundary():
+    service = _load_contract_market_service_module()
+    calls = []
+    end_time_ms = 1_561_910_400_000
+    _configure_okx_fetch(service, _provider_rows(), calls)
+
+    try:
+        service._get_configured_contract_klines(
+            object(),
+            _contract_symbol(),
+            interval="1M",
+            limit=300,
+            end_time_ms=end_time_ms,
+        )
+    except service.KlineProviderHistoryBoundary as exc:
+        assert exc.provider_error_provider == "OKX_SWAP"
+    else:
+        raise AssertionError("empty BTC 1M provider history must publish a boundary")
+
+    assert calls == [
+        {
+            "endpoint_type": "kline_history",
+            "provider_symbol": "BTC-USDT-SWAP",
+            "limit": 300,
+            "extra_params": {"bar": "1M", "after": str(end_time_ms)},
+        }
+    ]
+
+
+def test_btc_monthly_explicit_empty_fallback_repeats_without_provider_cooldown():
+    service = _load_contract_market_service_module()
+    providers = (
+        _okx_provider(cooldown_seconds=60),
+        _bitget_provider(cooldown_seconds=60),
+    )
+    provider_calls = []
+    failure_calls = []
+    service.enabled_contract_market_providers = lambda _db: providers
+    service._configured_provider_symbol = lambda _db, provider, _symbol: (
+        "BTC-USDT-SWAP" if provider.provider_code == "OKX_SWAP" else "BTCUSDT"
+    )
+    service.mark_contract_market_provider_success = lambda *_args, **_kwargs: None
+    service.mark_contract_market_provider_failure = lambda *args, **kwargs: failure_calls.append(
+        (args, kwargs)
+    )
+
+    def request(provider, *_args, **_kwargs):
+        provider_calls.append(provider.provider_code)
+        if provider.provider_code == "OKX_SWAP":
+            return {"code": "0", "data": []}
+        return {"code": "00000", "data": []}
+
+    service.request_contract_market_provider_json = request
+
+    for _attempt in range(2):
+        try:
+            service._get_configured_contract_klines(
+                object(),
+                _contract_symbol(),
+                interval="1M",
+                limit=245,
+                end_time_ms=1_561_910_400_000,
+            )
+        except service.KlineProviderHistoryBoundary:
+            pass
+        else:
+            raise AssertionError("explicit monthly history empty must remain terminal")
+
+    assert provider_calls == [
+        "OKX_SWAP",
+        "BITGET_USDT_FUTURES",
+        "OKX_SWAP",
+        "BITGET_USDT_FUTURES",
+    ]
+    assert failure_calls == []
+
+
+def test_btc_monthly_timeout_and_network_failures_still_trigger_cooldown():
+    for provider_error in (
+        TimeoutError("provider timeout"),
+        ConnectionError("provider network unavailable"),
+    ):
+        service = _load_contract_market_service_module()
+        provider = _okx_provider(cooldown_seconds=60)
+        failure_calls = []
+        service.enabled_contract_market_providers = lambda _db: (provider,)
+        service._configured_provider_symbol = lambda *_args, **_kwargs: "BTC-USDT-SWAP"
+        service.request_contract_market_provider_json = (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(provider_error)
+        )
+        service.mark_contract_market_provider_failure = (
+            lambda _db, provider_code, error, **kwargs: failure_calls.append(
+                (provider_code, type(error), kwargs.get("cooldown_seconds"))
+            )
+        )
+
+        try:
+            service._get_configured_contract_klines(
+                object(),
+                _contract_symbol(),
+                interval="1M",
+                limit=245,
+                end_time_ms=1_561_910_400_000,
+            )
+        except service.KlineProviderHistoryBoundary as exc:
+            raise AssertionError("provider failure must not become terminal") from exc
+        except service.ContractQuoteUnavailable:
+            pass
+        else:
+            raise AssertionError("provider failure must remain unavailable")
+
+        assert failure_calls == [
+            ("OKX_SWAP", type(provider_error), 60),
+        ]
+
+
+def test_btc_monthly_provider_business_failure_still_triggers_cooldown():
+    service = _load_contract_market_service_module()
+    provider = _okx_provider(cooldown_seconds=60)
+    failure_calls = []
+    service.enabled_contract_market_providers = lambda _db: (provider,)
+    service._configured_provider_symbol = lambda *_args, **_kwargs: "BTC-USDT-SWAP"
+    service.request_contract_market_provider_json = lambda *_args, **_kwargs: {
+        "code": "51000",
+        "msg": "provider rejected request",
+        "data": [],
+    }
+    service.mark_contract_market_provider_failure = (
+        lambda _db, provider_code, error, **kwargs: failure_calls.append(
+            (provider_code, str(error), kwargs.get("cooldown_seconds"))
+        )
+    )
+
+    try:
+        service._get_configured_contract_klines(
+            object(),
+            _contract_symbol(),
+            interval="1M",
+            limit=245,
+            end_time_ms=1_561_910_400_000,
+        )
+    except service.KlineProviderHistoryBoundary as exc:
+        raise AssertionError("provider business failure must not become terminal") from exc
+    except service.ContractQuoteUnavailable:
+        pass
+    else:
+        raise AssertionError("provider business failure must remain unavailable")
+
+    assert failure_calls == [
+        ("OKX_SWAP", "OKX_SWAP_KLINE_PROVIDER_ERROR", 60),
+    ]
+
+
+def test_btc_monthly_provider_cooldown_is_not_history_boundary():
+    service = _load_contract_market_service_module()
+    service.enabled_contract_market_providers = lambda _db: (_okx_provider(),)
+    service._configured_provider_symbol = lambda *_args, **_kwargs: "BTC-USDT-SWAP"
+    service.request_contract_market_provider_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        service.ProviderCooldownError("provider is in cooldown")
+    )
+
+    try:
+        service._get_configured_contract_klines(
+            object(),
+            _contract_symbol(),
+            interval="1M",
+            limit=300,
+            end_time_ms=1_561_910_400_000,
+        )
+    except service.KlineProviderHistoryBoundary as exc:
+        raise AssertionError("provider cooldown must remain retryable, not terminal") from exc
+    except service.ContractQuoteUnavailable:
+        pass
+    else:
+        raise AssertionError("provider cooldown must remain unavailable")
+
+
+def test_btc_monthly_provider_unavailable_remains_retryable():
+    service = _load_contract_market_service_module()
+    service._load_contract_symbol = lambda *_args, **_kwargs: _contract_symbol()
+    service.enabled_contract_market_providers = lambda _db: (_okx_provider(),)
+    service._configured_provider_symbol = lambda *_args, **_kwargs: "BTC-USDT-SWAP"
+    service.mark_contract_market_provider_failure = lambda *_args, **_kwargs: None
+    service.request_contract_market_provider_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        service.ContractQuoteUnavailable("OKX_SWAP_KLINE_UNAVAILABLE")
+    )
+
+    def cache_first(_db, **kwargs):
+        try:
+            kwargs["fetch_external"](kwargs["limit"], kwargs["end_time_ms"])
+        except service.KlineProviderHistoryBoundary as exc:
+            raise AssertionError("provider outage must not become terminal") from exc
+        except service.ContractQuoteUnavailable:
+            return _SharedKlineCacheResult(
+                [],
+                origin="EMPTY",
+                cache_status="MISS",
+                history_incomplete=True,
+                provider_error_code="EMPTY",
+            )
+        raise AssertionError("provider outage must not return rows")
+
+    service.get_klines_cache_first = cache_first
+    end_time_ms = 1_561_910_400_000
+    rows = service.get_contract_klines(
+        object(),
+        "BTCUSDT_PERP",
+        interval="1M",
+        limit=300,
+        end_time_ms=end_time_ms,
+    )
+    from app.services.contract_kline_response import build_contract_kline_metadata
+
+    metadata = build_contract_kline_metadata(rows, end_time_ms=end_time_ms)
+
+    assert metadata["items"] == []
+    assert metadata["history_terminal"] is False
+    assert metadata["terminal_reason"] is None
+    assert metadata["history_complete"] is False
+    assert metadata["history_incomplete"] is True
+    assert metadata["provider_error_code"] == "EMPTY"
+    assert metadata["retryable"] is True
+
+
+def test_btc_monthly_history_boundary_serializes_terminal_response():
+    service = _load_contract_market_service_module()
+    service._load_contract_symbol = lambda *_args, **_kwargs: _contract_symbol()
+    calls = []
+    _configure_okx_fetch(service, _provider_rows(), calls)
+    earliest_available_time = 1_561_910_400_000
+
+    def cache_first(_db, **kwargs):
+        try:
+            kwargs["fetch_external"](kwargs["limit"], kwargs["end_time_ms"])
+        except service.KlineProviderHistoryBoundary:
+            return _SharedKlineCacheResult(
+                [],
+                origin="EMPTY",
+                cache_status="HISTORY_BOUNDARY",
+                history_terminal=True,
+                terminal_reason="PROVIDER_HISTORY_BOUNDARY",
+                earliest_available_time=earliest_available_time,
+                coverage_complete=True,
+            )
+        raise AssertionError("empty monthly provider history must raise a boundary")
+
+    service.get_klines_cache_first = cache_first
+
+    rows = service.get_contract_klines(
+        object(),
+        "BTCUSDT_PERP",
+        interval="1M",
+        limit=300,
+        end_time_ms=earliest_available_time,
+    )
+    from app.services.contract_kline_response import build_contract_kline_metadata
+
+    metadata = build_contract_kline_metadata(
+        rows,
+        end_time_ms=earliest_available_time,
+    )
+
+    assert metadata["items"] == []
+    assert metadata["history_terminal"] is True
+    assert metadata["terminal_reason"] == "PROVIDER_HISTORY_BOUNDARY"
+    assert metadata["earliest_available_time"] == earliest_available_time
+    assert metadata["history_complete"] is True
+    assert metadata["has_more_before"] is False
+    assert metadata["history_incomplete"] is False
+    assert metadata["provider_error_code"] is None
+    assert metadata["retryable"] is False
 
 
 def test_okx_latest_rows_are_not_misreported_as_history_success():
@@ -474,17 +850,239 @@ def test_index_unsupported_interval_does_not_write_process_cache():
     assert rows.retryable is False
 
 
+def test_aapl_history_uses_stock_provider_evidence():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol(
+        category="STOCK",
+        symbol="AAPLUSDT_PERP",
+        provider_symbol="AAPL",
+    )
+    calls = []
+    end_time_ms = 1_700_100_000_000
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.get_klines_cache_first = _cache_first_fetches_provider
+
+    def get_stock_kline(**kwargs):
+        calls.append(dict(kwargs))
+        return _provider_rows(end_time_ms - 86_400_000)
+
+    service.itick_market_service = SimpleNamespace(get_stock_kline=get_stock_kline)
+
+    rows = service.get_contract_klines(
+        object(),
+        "AAPLUSDT_PERP",
+        interval="1d",
+        limit=300,
+        end_time_ms=end_time_ms,
+    )
+
+    assert len(rows) == 1
+    assert calls == [
+        {
+            "region": "US",
+            "code": "AAPL",
+            "kType": 8,
+            "limit": 300,
+            "end_time_ms": end_time_ms,
+        }
+    ]
+
+
+def test_eurusd_history_uses_forex_provider_evidence():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol(
+        category="FOREX",
+        symbol="EURUSD_PERP",
+        provider_symbol="EURUSD",
+    )
+    calls = []
+    end_time_ms = 1_700_100_000_000
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.get_klines_cache_first = _cache_first_fetches_provider
+
+    def get_market_kline(*args, **kwargs):
+        calls.append((args, dict(kwargs)))
+        return _provider_rows(end_time_ms - 604_800_000)
+
+    service.itick_market_service = SimpleNamespace(get_market_kline=get_market_kline)
+
+    rows = service.get_contract_klines(
+        object(),
+        "EURUSD_PERP",
+        interval="1w",
+        limit=300,
+        end_time_ms=end_time_ms,
+    )
+
+    assert len(rows) == 1
+    assert calls == [
+        (
+            ("forex", "GB", "EURUSD", 9, 300),
+            {"end_time_ms": end_time_ms, "timeout": 4},
+        )
+    ]
+
+
+def test_xau_history_normalizes_symbol_and_uses_monthly_k_type():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol(
+        category="GOLD",
+        symbol="XAUUSDT_PERP",
+        provider_symbol="",
+    )
+    calls = []
+    end_time_ms = 1_700_100_000_000
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.get_klines_cache_first = _cache_first_fetches_provider
+
+    def get_market_kline(*args, **kwargs):
+        calls.append((args, dict(kwargs)))
+        return _provider_rows(end_time_ms - 2_678_400_000)
+
+    service.itick_market_service = SimpleNamespace(get_market_kline=get_market_kline)
+
+    rows = service.get_contract_klines(
+        object(),
+        "XAUUSDT_PERP",
+        interval="1M",
+        limit=300,
+        end_time_ms=end_time_ms,
+    )
+
+    assert len(rows) == 1
+    assert calls == [
+        (
+            ("forex", "GB", "XAUUSD", 10, 300),
+            {"end_time_ms": end_time_ms, "timeout": 4},
+        )
+    ]
+
+
+def test_empty_history_response_does_not_enter_process_success_cache():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol(
+        category="STOCK",
+        symbol="AAPLUSDT_PERP",
+        provider_symbol="AAPL",
+    )
+    provider_calls = []
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.get_klines_cache_first = _cache_first_fetches_provider
+    service._tradfi_kline_cache.clear()
+
+    def get_stock_kline(**_kwargs):
+        provider_calls.append(1)
+        return {"data": []}
+
+    service.itick_market_service = SimpleNamespace(get_stock_kline=get_stock_kline)
+
+    first = service.get_contract_klines(object(), "AAPLUSDT_PERP", interval="1d", limit=100)
+    second = service.get_contract_klines(object(), "AAPLUSDT_PERP", interval="1d", limit=100)
+
+    assert first == second == []
+    assert first.cache_status == second.cache_status == "PROVIDER_EMPTY"
+    assert first.provider_error_code == second.provider_error_code == "EMPTY"
+    assert len(provider_calls) == 2
+    assert service._tradfi_kline_cache == {}
+
+
+def test_timeout_history_response_does_not_enter_process_success_cache():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol(
+        category="STOCK",
+        symbol="AAPLUSDT_PERP",
+        provider_symbol="AAPL",
+    )
+    provider_calls = []
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.get_klines_cache_first = _cache_first_fetches_provider
+    service._tradfi_kline_cache.clear()
+
+    def get_stock_kline(**_kwargs):
+        provider_calls.append(1)
+        raise TimeoutError("provider timeout")
+
+    service.itick_market_service = SimpleNamespace(get_stock_kline=get_stock_kline)
+
+    first = service.get_contract_klines(object(), "AAPLUSDT_PERP", interval="1d", limit=100)
+    second = service.get_contract_klines(object(), "AAPLUSDT_PERP", interval="1d", limit=100)
+
+    assert first == second == []
+    assert first.cache_status == second.cache_status == "TIMEOUT"
+    assert first.provider_error_code == second.provider_error_code == "TIMEOUT"
+    assert len(provider_calls) == 2
+    assert service._tradfi_kline_cache == {}
+
+
+def test_monthly_history_response_preserves_terminal_metadata():
+    service = _load_contract_market_service_module()
+    service._load_contract_symbol = lambda *_args, **_kwargs: _itick_contract_symbol(
+        category="INDEX"
+    )
+    service._contract_provider_symbol = lambda *_args, **_kwargs: "US30"
+    service._is_stock_contract_config = lambda *_args, **_kwargs: False
+    captured = {}
+
+    def cache_first(_db, **kwargs):
+        captured.update(kwargs)
+        return _SharedKlineCacheResult(
+            [],
+            origin="EMPTY",
+            cache_status="HISTORY_BOUNDARY",
+            history_terminal=True,
+            terminal_reason="PROVIDER_HISTORY_BOUNDARY",
+            earliest_available_time=1_514_764_800_000,
+            coverage_complete=True,
+        )
+
+    service.get_klines_cache_first = cache_first
+    end_time_ms = 1_514_764_800_000
+
+    rows = service.get_contract_klines(
+        object(),
+        "US30_PERP",
+        interval="1M",
+        limit=300,
+        end_time_ms=end_time_ms,
+    )
+    from app.services.contract_kline_response import build_contract_kline_metadata
+
+    metadata = build_contract_kline_metadata(rows, end_time_ms=end_time_ms)
+
+    assert captured["interval"] == "1M"
+    assert captured["limit"] == 300
+    assert captured["end_time_ms"] == end_time_ms
+    assert rows.history_terminal is True
+    assert rows.terminal_reason == "PROVIDER_HISTORY_BOUNDARY"
+    assert rows.earliest_available_time == 1_514_764_800_000
+    assert rows.coverage_complete is True
+    assert metadata["history_terminal"] is True
+    assert metadata["terminal_reason"] == "PROVIDER_HISTORY_BOUNDARY"
+    assert metadata["earliest_available_time"] == 1_514_764_800_000
+    assert metadata["coverage_complete"] is True
+
+
 if __name__ == "__main__":
     tests = [
         test_contract_ws_interval_normalization_and_subscription_preserve_monthly,
         test_okx_swap_history_endpoint_is_distinct_from_current_candles,
         test_okx_current_request_uses_candles_without_history_cursor,
         test_okx_history_request_uses_history_endpoint_after_and_strict_boundary,
+        test_btc_monthly_current_returns_provider_rows,
+        test_btc_monthly_history_pagination_uses_cursor,
+        test_btc_monthly_history_beyond_earliest_raises_provider_boundary,
+        test_btc_monthly_explicit_empty_fallback_repeats_without_provider_cooldown,
+        test_btc_monthly_timeout_and_network_failures_still_trigger_cooldown,
+        test_btc_monthly_provider_business_failure_still_triggers_cooldown,
+        test_btc_monthly_provider_cooldown_is_not_history_boundary,
+        test_btc_monthly_provider_unavailable_remains_retryable,
+        test_btc_monthly_history_boundary_serializes_terminal_response,
         test_okx_latest_rows_are_not_misreported_as_history_success,
         test_contract_history_db_cache_hit_does_not_call_provider,
         test_tradfi_process_cache_path_preserves_cache_metadata,
         test_index_cache_first_path_preserves_metadata_and_skips_process_cache_write,
         test_index_unsupported_interval_does_not_write_process_cache,
+        test_monthly_history_response_preserves_terminal_metadata,
     ]
     for test in tests:
         test()

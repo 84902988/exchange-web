@@ -148,9 +148,30 @@ class ContractKlineCurrentCandle(BaseModel):
     updated_at_ms: int
 
 
+class ContractKlineHistoryMetadataResponse(BaseModel):
+    """Opt-in metadata payload for Contract Kline history responses."""
+
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    cache_status: str
+    freshness: str
+    stale: bool
+    history_incomplete: bool = False
+    history_complete: Optional[bool] = None
+    has_more_before: Optional[bool] = None
+    history_terminal: Optional[bool] = None
+    terminal_reason: Optional[str] = None
+    earliest_available_time: Optional[int] = Field(default=None, ge=0)
+    coverage_complete: Optional[bool] = None
+    provider_error_code: Optional[str] = None
+    retryable: bool = False
+
+
 class ContractMarketViewDetail(BaseModel):
     symbol: str
     display_symbol: str
+    view_version: str = "2"
+    authority_source: str = "LEGACY_COMPAT"
+    snapshot_authority: bool = False
     market_type: str = "CONTRACT"
     category: str = "INTERNAL"
     market_status: str = "UNKNOWN"
@@ -158,6 +179,10 @@ class ContractMarketViewDetail(BaseModel):
     display_price: Optional[str] = None
     display_price_source: str = "NONE"
     current_price_source: str = "NONE"
+    mark_price: Optional[str] = None
+    mark_price_source: Optional[str] = None
+    index_price: Optional[str] = None
+    index_price_source: Optional[str] = None
     ticker_source: Optional[str] = None
     ticker_freshness: Optional[str] = None
     depth_source: Optional[str] = None
@@ -182,4 +207,9 @@ class ContractMarketViewDetail(BaseModel):
     reason_code: str = "UNAVAILABLE"
     warnings: List[str] = Field(default_factory=list)
     kline_current_candle: Optional[ContractKlineCurrentCandle] = None
+    ticker: Optional[Dict[str, Any]] = None
+    depth: Optional[Dict[str, Any]] = None
+    trades: List[Dict[str, Any]] = Field(default_factory=list)
+    kline: Optional[Dict[str, Any]] = None
+    snapshot_metadata: Dict[str, Any] = Field(default_factory=dict)
     raw_source_summary: Dict[str, Any] = Field(default_factory=dict)

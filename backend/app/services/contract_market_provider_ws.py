@@ -277,6 +277,16 @@ def _timestamp_ms_from_value(value: Any) -> int:
     return int(numeric if numeric > 10_000_000_000 else numeric * 1000)
 
 
+def _optional_non_negative_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _sort_depth_side(levels: dict[str, Decimal], *, side: str, limit: int) -> list[list[Decimal]]:
     reverse = side == "bids"
     prices = sorted((_to_decimal(price) for price in levels.keys()), reverse=reverse)
@@ -1496,7 +1506,7 @@ class ContractMarketProviderWsService:
             self._depth_stops.pop(key, None)
             self._depth_tasks.pop(key, None)
             self._depth_connections.pop(key, None)
-            self._depth_generations.pop(key, None)
+            self._depth_generations[key] = self._depth_generations.get(key, 0) + 1
             if remove_cache:
                 self._depth_cache.pop(key, None)
 
@@ -1505,7 +1515,7 @@ class ContractMarketProviderWsService:
             self._trades_stops.pop(key, None)
             self._trades_tasks.pop(key, None)
             self._trades_connections.pop(key, None)
-            self._trades_generations.pop(key, None)
+            self._trades_generations[key] = self._trades_generations.get(key, 0) + 1
             if remove_cache:
                 self._trades_cache.pop(key, None)
 
@@ -1514,7 +1524,7 @@ class ContractMarketProviderWsService:
             self._ticker_stops.pop(key, None)
             self._ticker_tasks.pop(key, None)
             self._ticker_connections.pop(key, None)
-            self._ticker_generations.pop(key, None)
+            self._ticker_generations[key] = self._ticker_generations.get(key, 0) + 1
             if remove_cache:
                 self._ticker_cache.pop(key, None)
 
@@ -1523,7 +1533,7 @@ class ContractMarketProviderWsService:
             self._kline_stops.pop(key, None)
             self._kline_tasks.pop(key, None)
             self._kline_connections.pop(key, None)
-            self._kline_generations.pop(key, None)
+            self._kline_generations[key] = self._kline_generations.get(key, 0) + 1
             if remove_cache:
                 self._kline_cache.pop(key, None)
 
@@ -1903,7 +1913,13 @@ class ContractMarketProviderWsService:
                         raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
-                    self._handle_okx_depth_message(subscription, raw_message, bids, asks)
+                    self._handle_okx_depth_message(
+                        subscription,
+                        raw_message,
+                        bids,
+                        asks,
+                        generation=generation,
+                    )
             finally:
                 with self._lock:
                     current = self._depth_connections.get(key)
@@ -1956,7 +1972,11 @@ class ContractMarketProviderWsService:
                         raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
-                    self._handle_okx_trades_message(subscription, raw_message)
+                    self._handle_okx_trades_message(
+                        subscription,
+                        raw_message,
+                        generation=generation,
+                    )
             finally:
                 with self._lock:
                     current = self._trades_connections.get(key)
@@ -2020,7 +2040,11 @@ class ContractMarketProviderWsService:
                         raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
-                    self._handle_itick_trades_message(subscription, raw_message)
+                    self._handle_itick_trades_message(
+                        subscription,
+                        raw_message,
+                        generation=generation,
+                    )
             finally:
                 with self._lock:
                     current = self._trades_connections.get(key)
@@ -2085,7 +2109,11 @@ class ContractMarketProviderWsService:
                         raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
-                    self._handle_itick_depth_message(subscription, raw_message)
+                    self._handle_itick_depth_message(
+                        subscription,
+                        raw_message,
+                        generation=generation,
+                    )
             finally:
                 with self._lock:
                     current = self._depth_connections.get(key)
@@ -2139,7 +2167,11 @@ class ContractMarketProviderWsService:
                         raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
-                    self._handle_okx_ticker_message(subscription, raw_message)
+                    self._handle_okx_ticker_message(
+                        subscription,
+                        raw_message,
+                        generation=generation,
+                    )
             finally:
                 with self._lock:
                     current = self._ticker_connections.get(key)
@@ -2203,7 +2235,11 @@ class ContractMarketProviderWsService:
                         raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
-                    self._handle_itick_ticker_message(subscription, raw_message)
+                    self._handle_itick_ticker_message(
+                        subscription,
+                        raw_message,
+                        generation=generation,
+                    )
             finally:
                 with self._lock:
                     current = self._ticker_connections.get(key)
@@ -2259,7 +2295,11 @@ class ContractMarketProviderWsService:
                         raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
-                    self._handle_okx_kline_message(subscription, raw_message)
+                    self._handle_okx_kline_message(
+                        subscription,
+                        raw_message,
+                        generation=generation,
+                    )
             finally:
                 with self._lock:
                     current = self._kline_connections.get(key)
@@ -2326,7 +2366,11 @@ class ContractMarketProviderWsService:
                         raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
-                    self._handle_itick_kline_message(subscription, raw_message)
+                    self._handle_itick_kline_message(
+                        subscription,
+                        raw_message,
+                        generation=generation,
+                    )
             finally:
                 with self._lock:
                     current = self._kline_connections.get(key)
@@ -2347,6 +2391,8 @@ class ContractMarketProviderWsService:
         raw_message: Any,
         bids: dict[str, Decimal],
         asks: dict[str, Decimal],
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         try:
             message = json.loads(raw_message)
@@ -2377,12 +2423,15 @@ class ContractMarketProviderWsService:
             sequence=row.get("seqId"),
             checksum=row.get("checksum"),
             exchange_ts=row.get("ts"),
+            generation=generation,
         )
 
     def _handle_itick_depth_message(
         self,
         subscription: ProviderDepthSubscription,
         raw_message: Any,
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         try:
             message = json.loads(raw_message)
@@ -2401,6 +2450,7 @@ class ContractMarketProviderWsService:
                 sequence=row.get("seq") or row.get("sequence"),
                 checksum=row.get("checksum"),
                 exchange_ts=row.get("t") or row.get("timestamp") or row.get("time") or row.get("ts"),
+                generation=generation,
             )
 
     def _extract_itick_depth_rows(self, message: Any) -> list[dict[str, Any]]:
@@ -2458,6 +2508,8 @@ class ContractMarketProviderWsService:
         self,
         subscription: ProviderTradesSubscription,
         raw_message: Any,
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         try:
             message = json.loads(raw_message)
@@ -2477,12 +2529,14 @@ class ContractMarketProviderWsService:
             if trade is not None:
                 trades.append(trade)
         if trades:
-            self._set_trades_cache(subscription, trades)
+            self._set_trades_cache(subscription, trades, generation=generation)
 
     def _handle_itick_trades_message(
         self,
         subscription: ProviderTradesSubscription,
         raw_message: Any,
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         try:
             message = json.loads(raw_message)
@@ -2495,7 +2549,7 @@ class ContractMarketProviderWsService:
             if trade is not None:
                 trades.append(trade)
         if trades:
-            self._set_trades_cache(subscription, trades)
+            self._set_trades_cache(subscription, trades, generation=generation)
 
     def _extract_itick_trade_rows(self, message: Any) -> list[dict[str, Any]]:
         if isinstance(message, list):
@@ -2534,6 +2588,8 @@ class ContractMarketProviderWsService:
         self,
         subscription: ProviderTickerSubscription,
         raw_message: Any,
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         try:
             message = json.loads(raw_message)
@@ -2550,12 +2606,14 @@ class ContractMarketProviderWsService:
             return
         payload = self._normalize_okx_ticker(subscription, row)
         if payload is not None:
-            self._set_ticker_cache(subscription, payload)
+            self._set_ticker_cache(subscription, payload, generation=generation)
 
     def _handle_itick_ticker_message(
         self,
         subscription: ProviderTickerSubscription,
         raw_message: Any,
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         try:
             message = json.loads(raw_message)
@@ -2565,7 +2623,7 @@ class ContractMarketProviderWsService:
         for row in self._extract_itick_quote_rows(message):
             payload = self._normalize_itick_ticker(subscription, row)
             if payload is not None:
-                self._set_ticker_cache(subscription, payload)
+                self._set_ticker_cache(subscription, payload, generation=generation)
 
     def _extract_itick_quote_rows(self, message: Any) -> list[dict[str, Any]]:
         if isinstance(message, list):
@@ -2590,6 +2648,8 @@ class ContractMarketProviderWsService:
         self,
         subscription: ProviderKlineSubscription,
         raw_message: Any,
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         try:
             message = json.loads(raw_message)
@@ -2610,12 +2670,14 @@ class ContractMarketProviderWsService:
             return
         payload = self._normalize_okx_kline(subscription, row)
         if payload is not None:
-            self._set_kline_cache(subscription, payload)
+            self._set_kline_cache(subscription, payload, generation=generation)
 
     def _handle_itick_kline_message(
         self,
         subscription: ProviderKlineSubscription,
         raw_message: Any,
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         try:
             message = json.loads(raw_message)
@@ -2629,7 +2691,7 @@ class ContractMarketProviderWsService:
         for row in self._extract_itick_kline_rows(message):
             payload = self._normalize_itick_kline(subscription, row)
             if payload is not None:
-                self._set_kline_cache(subscription, payload)
+                self._set_kline_cache(subscription, payload, generation=generation)
 
     def _extract_itick_kline_rows(self, message: Any) -> list[dict[str, Any]]:
         if isinstance(message, list):
@@ -2961,12 +3023,26 @@ class ContractMarketProviderWsService:
         self,
         subscription: ProviderTradesSubscription,
         trades: list[dict[str, Any]],
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         now_ms = int(time.time() * 1000)
         now = datetime.now(timezone.utc)
         key = (subscription.provider, subscription.local_symbol)
         with self._lock:
-            previous = list(self._trades_cache.get(key, {}).get("trades") or [])
+            current_generation = self._trades_generations.get(key)
+            if generation is not None and generation != current_generation:
+                logger.debug(
+                    "contract_provider_ws_trades_generation_rejected provider=%s symbol=%s incoming=%s current=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    generation,
+                    current_generation,
+                )
+                return
+            effective_generation = generation if generation is not None else current_generation
+            previous_payload = self._trades_cache.get(key, {})
+            previous = list(previous_payload.get("trades") or [])
             seen: set[str] = set()
             merged: list[dict[str, Any]] = []
             for item in trades + previous:
@@ -2977,6 +3053,17 @@ class ContractMarketProviderWsService:
                 merged.append(item)
                 if len(merged) >= subscription.trades_limit:
                     break
+            previous_generation = _optional_non_negative_int(
+                previous_payload.get("provider_generation")
+            )
+            previous_revision = _optional_non_negative_int(
+                previous_payload.get("revision_sequence")
+            )
+            revision_sequence = (
+                (previous_revision or 0) + 1
+                if previous_generation == effective_generation
+                else 1
+            )
             self._trades_cache[key] = {
                 "symbol": subscription.local_symbol,
                 "provider": subscription.provider,
@@ -2988,36 +3075,101 @@ class ContractMarketProviderWsService:
                 "ts": now,
                 "updated_at": now,
                 "updated_at_ms": now_ms,
+                "received_at_ms": now_ms,
+                "provider_generation": effective_generation,
+                "revision_epoch": effective_generation,
+                "revision_sequence": revision_sequence,
             }
 
     def _set_ticker_cache(
         self,
         subscription: ProviderTickerSubscription,
         payload: dict[str, Any],
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         now_ms = int(time.time() * 1000)
         now = datetime.now(timezone.utc)
+        key = (subscription.provider, subscription.local_symbol)
         with self._lock:
-            self._ticker_cache[(subscription.provider, subscription.local_symbol)] = {
+            current_generation = self._ticker_generations.get(key)
+            if generation is not None and generation != current_generation:
+                logger.debug(
+                    "contract_provider_ws_ticker_generation_rejected provider=%s symbol=%s incoming=%s current=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    generation,
+                    current_generation,
+                )
+                return
+            effective_generation = generation if generation is not None else current_generation
+            previous_payload = self._ticker_cache.get(key, {})
+            previous_generation = _optional_non_negative_int(
+                previous_payload.get("provider_generation")
+            )
+            previous_revision = _optional_non_negative_int(
+                previous_payload.get("revision_sequence")
+            )
+            revision_sequence = (
+                (previous_revision or 0) + 1
+                if previous_generation == effective_generation
+                else 1
+            )
+            self._ticker_cache[key] = {
                 **payload,
                 "updated_at": now,
                 "updated_at_ms": now_ms,
+                "received_at_ms": now_ms,
+                "provider_generation": effective_generation,
+                "revision_epoch": effective_generation,
+                "revision_sequence": revision_sequence,
             }
 
     def _set_kline_cache(
         self,
         subscription: ProviderKlineSubscription,
         payload: dict[str, Any],
+        *,
+        generation: Optional[int] = None,
     ) -> None:
         now_ms = int(time.time() * 1000)
         now = datetime.now(timezone.utc)
         key = (subscription.provider, subscription.local_symbol, subscription.interval)
         with self._lock:
+            current_generation = self._kline_generations.get(key)
+            if generation is not None and generation != current_generation:
+                logger.debug(
+                    "contract_provider_ws_kline_generation_rejected "
+                    "provider=%s symbol=%s interval=%s incoming=%s current=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    subscription.interval,
+                    generation,
+                    current_generation,
+                )
+                return
+            effective_generation = generation if generation is not None else current_generation
+            previous_payload = self._kline_cache.get(key, {})
+            previous_generation = _optional_non_negative_int(
+                previous_payload.get("provider_generation")
+            )
+            previous_revision = _optional_non_negative_int(
+                previous_payload.get("revision_sequence")
+            )
+            revision_sequence = (
+                (previous_revision or 0) + 1
+                if previous_generation == effective_generation
+                else 1
+            )
             self._kline_cache[key] = {
                 **payload,
                 "updated_at": now,
                 "updated_at_ms": now_ms,
+                "received_at_ms": now_ms,
                 "ts": now,
+                "provider_generation": effective_generation,
+                "revision_epoch": effective_generation,
+                "revision_sequence": revision_sequence,
             }
 
     def _set_depth_cache(
@@ -3029,6 +3181,7 @@ class ContractMarketProviderWsService:
         sequence: Any = None,
         checksum: Any = None,
         exchange_ts: Any = None,
+        generation: Optional[int] = None,
     ) -> None:
         bid_levels = _sort_depth_side(bids, side="bids", limit=subscription.depth_limit)
         ask_levels = _sort_depth_side(asks, side="asks", limit=subscription.depth_limit)
@@ -3036,29 +3189,57 @@ class ContractMarketProviderWsService:
             return
         now_ms = int(time.time() * 1000)
         now = datetime.now(timezone.utc)
-        payload = {
-            "symbol": subscription.local_symbol,
-            "provider": subscription.provider,
-            "provider_symbol": subscription.provider_symbol,
-            "bids": bid_levels,
-            "asks": ask_levels,
-            "best_bid": _best_depth_price(bid_levels, side="bids"),
-            "best_ask": _best_depth_price(ask_levels, side="asks"),
-            "source": CONTRACT_PROVIDER_WS_SOURCE,
-            "depth_mode": "FULL_DEPTH",
-            "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
-            "quote_freshness": "LIVE",
-            "is_realtime": True,
-            "executable": True,
-            "ts": now,
-            "updated_at": now,
-            "updated_at_ms": now_ms,
-            "sequence": sequence,
-            "checksum": checksum,
-            "exchange_ts": exchange_ts,
-        }
+        key = (subscription.provider, subscription.local_symbol)
         with self._lock:
-            self._depth_cache[(subscription.provider, subscription.local_symbol)] = payload
+            current_generation = self._depth_generations.get(key)
+            if generation is not None and generation != current_generation:
+                logger.debug(
+                    "contract_provider_ws_depth_generation_rejected provider=%s symbol=%s incoming=%s current=%s",
+                    subscription.provider,
+                    subscription.local_symbol,
+                    generation,
+                    current_generation,
+                )
+                return
+            effective_generation = generation if generation is not None else current_generation
+            previous_payload = self._depth_cache.get(key, {})
+            previous_generation = _optional_non_negative_int(
+                previous_payload.get("provider_generation")
+            )
+            previous_revision = _optional_non_negative_int(
+                previous_payload.get("revision_sequence")
+            )
+            provider_sequence = _optional_non_negative_int(sequence)
+            revision_sequence = provider_sequence or (
+                (previous_revision or 0) + 1
+                if previous_generation == effective_generation
+                else 1
+            )
+            self._depth_cache[key] = {
+                "symbol": subscription.local_symbol,
+                "provider": subscription.provider,
+                "provider_symbol": subscription.provider_symbol,
+                "bids": bid_levels,
+                "asks": ask_levels,
+                "best_bid": _best_depth_price(bid_levels, side="bids"),
+                "best_ask": _best_depth_price(ask_levels, side="asks"),
+                "source": CONTRACT_PROVIDER_WS_SOURCE,
+                "depth_mode": "FULL_DEPTH",
+                "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
+                "quote_freshness": "LIVE",
+                "is_realtime": True,
+                "executable": True,
+                "ts": now,
+                "updated_at": now,
+                "updated_at_ms": now_ms,
+                "received_at_ms": now_ms,
+                "sequence": sequence,
+                "checksum": checksum,
+                "exchange_ts": exchange_ts,
+                "provider_generation": effective_generation,
+                "revision_epoch": effective_generation,
+                "revision_sequence": revision_sequence,
+            }
 
 
 contract_market_provider_ws = ContractMarketProviderWsService()

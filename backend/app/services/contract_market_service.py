@@ -22,8 +22,15 @@ from app.services.itick_holiday_service import (
     itick_holiday_service,
 )
 from app.services.itick_market_service import ItickMarketServiceError, itick_market_service
+from app.services.contract_itick_market_resolver import (
+    ITICK_KLINE_TYPE_BY_INTERVAL,
+    ContractItickKlineProviderEvidence,
+    resolve_contract_itick_kline_provider_evidence,
+    resolve_contract_itick_provider_symbol,
+)
 from app.services.market_kline_cache import (
     KLINE_CACHE_POLICY_GAP_TOLERANT,
+    KlineProviderHistoryBoundary,
     get_klines_cache_first,
 )
 from app.services.contract_kline_response import (
@@ -111,16 +118,7 @@ _stock_contract_quote_asset = "USDT"
 _tradfi_cfd_categories = {"CFD", "INDEX", "FOREX", "METAL", "COMMODITY"}
 _holiday_contract_categories = {"STOCK", "INDEX"}
 _contract_24x5_categories = {"FOREX", "METAL", "COMMODITY"}
-_itick_contract_k_type = {
-    "1m": 1,
-    "5m": 2,
-    "15m": 3,
-    "30m": 4,
-    "1h": 5,
-    "1d": 8,
-    "1w": 9,
-    "1M": 10,
-}
+_itick_contract_k_type = ITICK_KLINE_TYPE_BY_INTERVAL
 _contract_interval_seconds = {
     "1m": 60,
     "5m": 5 * 60,
@@ -2053,6 +2051,20 @@ def _contract_provider_symbol(contract_symbol: ContractSymbol) -> str:
     return str(contract_symbol.symbol or "").replace("_PERP", "").upper()
 
 
+def _contract_itick_kline_provider_evidence(
+    contract_symbol: ContractSymbol,
+    interval: str,
+) -> ContractItickKlineProviderEvidence:
+    category = _contract_asset_category(contract_symbol)
+    return resolve_contract_itick_kline_provider_evidence(
+        local_symbol=contract_symbol.symbol,
+        provider_symbol=getattr(contract_symbol, "provider_symbol", None),
+        category=category,
+        interval=interval,
+        explicit_region=_contract_session_code(contract_symbol, category),
+    )
+
+
 def _stock_provider_symbol_from_contract_symbol(symbol: str, provider_symbol: Optional[str] = None) -> str:
     raw_provider_symbol = str(provider_symbol or "").strip().upper()
     if raw_provider_symbol:
@@ -2601,6 +2613,25 @@ def _normalize_provider_kline_rows(provider_code: str, payload: Any) -> list[dic
     return rows
 
 
+def _provider_kline_payload_succeeded(provider_code: str, payload: Any) -> bool:
+    normalized_provider = str(provider_code or "").strip().upper()
+    if normalized_provider == "OKX_SWAP":
+        return bool(
+            isinstance(payload, dict)
+            and str(payload.get("code")).strip() == "0"
+            and isinstance(payload.get("data"), list)
+        )
+    if normalized_provider == "BITGET_USDT_FUTURES":
+        return bool(
+            isinstance(payload, dict)
+            and str(payload.get("code") or "").strip() == "00000"
+            and isinstance(payload.get("data"), list)
+        )
+    if normalized_provider == "BINANCE_USDM":
+        return isinstance(payload, list)
+    return False
+
+
 def _get_configured_contract_klines(
     db: Session,
     contract_symbol: ContractSymbol,
@@ -2610,8 +2641,13 @@ def _get_configured_contract_klines(
     end_time_ms: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     last_error: Optional[Exception] = None
-    for provider in enabled_contract_market_providers(db):
+    last_provider_code: Optional[str] = None
+    providers = tuple(enabled_contract_market_providers(db))
+    explicit_empty_provider_codes: list[str] = []
+    had_non_boundary_error = False
+    for provider in providers:
         try:
+            last_provider_code = provider.provider_code
             provider_symbol = _configured_provider_symbol(db, provider, contract_symbol)
             endpoint_type = (
                 "kline_history"
@@ -2625,15 +2661,28 @@ def _get_configured_contract_klines(
                 limit=limit,
                 extra_params=_provider_kline_extra_params(provider.provider_code, interval, end_time_ms),
             )
+            if not _provider_kline_payload_succeeded(provider.provider_code, payload):
+                raise ContractQuoteUnavailable(f"{provider.provider_code}_KLINE_PROVIDER_ERROR")
             rows = _normalize_provider_kline_rows(provider.provider_code, payload)
             if end_time_ms:
                 rows = [row for row in rows if int(row.get("open_time") or 0) < int(end_time_ms)]
             rows = rows[-limit:] if rows else []
             if not rows:
+                if end_time_ms is not None:
+                    explicit_empty_provider_codes.append(str(provider.provider_code))
+                    logger.debug(
+                        "contract_provider_kline_history_empty symbol=%s provider=%s interval=%s end_time_ms=%s",
+                        contract_symbol.symbol,
+                        provider.provider_code,
+                        interval,
+                        end_time_ms,
+                    )
+                    continue
                 raise ContractQuoteUnavailable(f"{provider.provider_code}_KLINE_UNAVAILABLE")
             mark_contract_market_provider_success(db, provider.provider_code)
             return rows
         except ProviderCooldownError as exc:
+            had_non_boundary_error = True
             last_error = exc
             logger.debug(
                 "contract_provider_kline_skipped_cooldown symbol=%s provider=%s interval=%s",
@@ -2643,6 +2692,7 @@ def _get_configured_contract_klines(
             )
             continue
         except Exception as exc:
+            had_non_boundary_error = True
             last_error = exc
             mark_contract_market_provider_failure(
                 db,
@@ -2658,6 +2708,18 @@ def _get_configured_contract_klines(
                 exc,
             )
             continue
+    monthly_history_boundary_candidate = bool(
+        end_time_ms is not None
+        and _normalize_contract_interval(interval) == "1M"
+        and providers
+        and len(explicit_empty_provider_codes) == len(providers)
+        and not had_non_boundary_error
+    )
+    if monthly_history_boundary_candidate:
+        raise KlineProviderHistoryBoundary(
+            "contract provider monthly history boundary",
+            provider_error_provider=last_provider_code,
+        )
     raise ContractQuoteUnavailable("CONTRACT_MARKET_PROVIDER_KLINE_UNAVAILABLE") from last_error
 
 
@@ -4082,11 +4144,15 @@ def _copy_kline_rows(rows: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in rows if isinstance(item, dict)]
 
 
-def _cache_contract_klines(symbol: str, interval: str, limit: int, rows: list[dict[str, Any]]) -> None:
+def _cache_contract_klines(symbol: str, interval: str, limit: int, rows: list[dict[str, Any]]) -> bool:
+    cache_rows = _copy_kline_rows(rows)
+    if not cache_rows:
+        return False
     _tradfi_kline_cache[_contract_kline_cache_key(symbol, interval, limit)] = {
         "ts": datetime.utcnow(),
-        "rows": _copy_kline_rows(rows),
+        "rows": cache_rows,
     }
+    return True
 
 
 def _get_cached_contract_klines(
@@ -4104,7 +4170,11 @@ def _get_cached_contract_klines(
         return None
     if not allow_stale and datetime.utcnow() - ts > _tradfi_kline_cache_ttl:
         return None
-    return _copy_kline_rows(cached.get("rows"))
+    cached_rows = _copy_kline_rows(cached.get("rows"))
+    if not cached_rows:
+        _tradfi_kline_cache.pop(_contract_kline_cache_key(symbol, interval, limit), None)
+        return None
+    return cached_rows
 
 
 def _to_timestamp_ms(value: Any) -> Optional[int]:
@@ -4188,7 +4258,9 @@ def _is_provider_contract_kline_row(row: dict[str, Any]) -> bool:
     return True
 
 
-def _provider_contract_kline_rows(rows: list[dict[str, Any]], *, limit: Optional[int] = None) -> ContractKlineResult:
+def _provider_contract_kline_rows(rows: Any, *, limit: Optional[int] = None) -> ContractKlineResult:
+    """Filter non-provider candles without dropping history authority metadata."""
+
     result = coerce_contract_kline_result(rows)
     clean_rows = [
         dict(row)
@@ -4227,8 +4299,6 @@ def _get_stock_contract_klines_from_itick(
             normalized_symbol,
             normalized_interval,
         )
-        if end_time_ms is None:
-            _cache_contract_klines(normalized_symbol, normalized_interval, safe_limit, [])
         return ContractKlineResult(
             [],
             origin="EMPTY",
@@ -4339,6 +4409,11 @@ def get_contract_klines(
 
     category = _contract_asset_category(contract_symbol)
     if provider == "ITICK":
+        provider_symbol = resolve_contract_itick_provider_symbol(
+            contract_symbol.symbol,
+            getattr(contract_symbol, "provider_symbol", None),
+            category,
+        )
         if _is_stock_contract_config(contract_symbol):
             rows = _get_stock_contract_klines_from_itick(
                 db,
@@ -4363,8 +4438,6 @@ def get_contract_klines(
                 contract_symbol.symbol,
                 normalized_interval,
             )
-            if end_time_ms is None and category != "INDEX":
-                _cache_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit, [])
             return ContractKlineResult(
                 [],
                 origin="EMPTY",
@@ -4372,12 +4445,16 @@ def get_contract_klines(
                 provider_error_code=None,
                 retryable=False,
             )
+        provider_evidence = _contract_itick_kline_provider_evidence(
+            contract_symbol,
+            normalized_interval,
+        )
         def _fetch_itick_contract_klines(fetch_limit: int, _fetch_end_time_ms: Optional[int]):
             payload = itick_market_service.get_market_kline(
-                _itick_market_for_contract(contract_symbol),
-                _itick_region_for_contract(contract_symbol),
-                provider_symbol,
-                _itick_contract_k_type[normalized_interval],
+                provider_evidence.market,
+                provider_evidence.region,
+                provider_evidence.provider_symbol,
+                provider_evidence.k_type,
                 fetch_limit,
                 end_time_ms=_fetch_end_time_ms,
                 timeout=4,
@@ -4412,16 +4489,14 @@ def get_contract_klines(
                 "tradfi_cfd_kline_empty symbol=%s provider_symbol=%s market=%s region=%s interval=%s kType=%s limit=%s",
                 contract_symbol.symbol,
                 provider_symbol,
-                _itick_market_for_contract(contract_symbol),
-                _itick_region_for_contract(contract_symbol),
+                provider_evidence.market,
+                provider_evidence.region,
                 normalized_interval,
                 _itick_contract_k_type[normalized_interval],
                 safe_limit,
             )
             if category == "INDEX":
                 return rows
-            if end_time_ms is None:
-                _cache_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit, [])
             return rows
 
     logger.warning(
@@ -4581,4 +4656,193 @@ def contract_depth_to_response(depth: dict[str, Any]) -> dict[str, Any]:
         "raw_best_ask": _format_optional_decimal(_to_decimal(depth.get("raw_best_ask"))),
         "source": depth["source"],
         "ts": depth["ts"],
+    }
+
+
+def get_contract_market_snapshot_authority(
+    symbol: str,
+    *,
+    interval: str = "1m",
+    refresh: bool = True,
+) -> dict[str, Any]:
+    """Return only Gateway-accepted domain snapshots for MarketView V2.
+
+    Provider refresh remains owned by ContractMarketGateway. This function
+    never returns the raw values produced by a provider refresh.
+    """
+
+    from app.schemas.contract_market_domain_snapshot import ContractMarketDomainName
+    from app.services.contract_market_gateway import contract_market_gateway
+
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_interval = str(interval or "1m").strip() or "1m"
+    warnings: list[str] = []
+    if refresh:
+        try:
+            contract_market_gateway._refresh_market_once(normalized_symbol)
+        except Exception as exc:
+            warnings.append(f"snapshot_market_refresh_failed:{type(exc).__name__}")
+        try:
+            contract_market_gateway._refresh_kline_once(
+                normalized_symbol,
+                normalized_interval,
+            )
+        except Exception as exc:
+            warnings.append(f"snapshot_kline_refresh_failed:{type(exc).__name__}")
+
+    snapshots = {
+        "ticker": contract_market_gateway.get_domain_snapshot(
+            ContractMarketDomainName.TICKER,
+            normalized_symbol,
+        ),
+        "depth": contract_market_gateway.get_domain_snapshot(
+            ContractMarketDomainName.DEPTH,
+            normalized_symbol,
+        ),
+        "trades": contract_market_gateway.get_domain_snapshot(
+            ContractMarketDomainName.TRADES,
+            normalized_symbol,
+        ),
+        "kline": contract_market_gateway.get_domain_snapshot(
+            ContractMarketDomainName.KLINE,
+            normalized_symbol,
+            interval=normalized_interval,
+        ),
+    }
+    return {
+        **snapshots,
+        "warnings": warnings,
+    }
+
+
+def _contract_market_view_category(
+    contract_symbol: Any,
+    quote: Optional[dict[str, Any]],
+    depth: Optional[dict[str, Any]],
+) -> str:
+    raw_category = (
+        getattr(contract_symbol, "category", None)
+        or (quote or {}).get("category")
+        or (depth or {}).get("category")
+        or ""
+    )
+    category = str(raw_category).strip().upper()
+    if category in {"GOLD", "SILVER", "METALS"}:
+        return "METAL"
+    if category in {"FUTURE", "FUTURES", "OIL", "ENERGY"}:
+        return "COMMODITY"
+    if category:
+        return category
+    provider = str(
+        getattr(contract_symbol, "provider", None)
+        or (quote or {}).get("provider")
+        or (depth or {}).get("provider")
+        or ""
+    ).strip().upper()
+    return "CRYPTO" if provider == "BINANCE" else "INTERNAL"
+
+
+def get_contract_market_view_legacy_inputs(
+    db: Session,
+    symbol: str,
+) -> dict[str, Any]:
+    """Preserve the pre-C-3 provider path for order execution only.
+
+    Public MarketView V2 must use ``get_contract_market_snapshot_authority``.
+    Keeping this adapter separate prevents the order execution path from being
+    silently migrated to new authority semantics in Phase C-3.
+    """
+
+    normalized_symbol = _normalize_symbol(symbol)
+    contract_symbol = (
+        db.query(ContractSymbol)
+        .filter(ContractSymbol.symbol == normalized_symbol)
+        .first()
+    )
+    quote: Optional[dict[str, Any]] = None
+    depth: Optional[dict[str, Any]] = None
+    latest_kline: Optional[dict[str, Any]] = None
+    latest_trade: Optional[dict[str, Any]] = None
+    warnings: list[str] = []
+
+    try:
+        quote = get_contract_quote(
+            db,
+            normalized_symbol,
+            log_context="contract_market_view_quote",
+        )
+    except ContractSymbolNotFound:
+        if contract_symbol is None:
+            raise
+        warnings.append("quote_unavailable")
+    except Exception as exc:
+        warnings.append(f"quote_unavailable:{type(exc).__name__}")
+
+    try:
+        depth = get_contract_depth(db, normalized_symbol, limit=5)
+    except ContractSymbolNotFound:
+        if contract_symbol is None and quote is None:
+            raise
+        warnings.append("depth_unavailable")
+    except Exception as exc:
+        warnings.append(f"depth_unavailable:{type(exc).__name__}")
+
+    try:
+        recent_trades = get_contract_recent_trades(
+            db,
+            normalized_symbol,
+            limit=1,
+        )
+        first_trade = recent_trades[0] if recent_trades else None
+        if (
+            isinstance(first_trade, dict)
+            and str(first_trade.get("price_source") or "").strip().upper()
+            == PRICE_SOURCE_TRADE_TICK
+        ):
+            latest_trade = first_trade
+    except Exception as exc:
+        warnings.append(f"trade_tick_unavailable:{type(exc).__name__}")
+
+    category = _contract_market_view_category(contract_symbol, quote, depth)
+    provider = str(
+        getattr(contract_symbol, "provider", None)
+        or (quote or {}).get("provider")
+        or (depth or {}).get("provider")
+        or ""
+    ).strip().upper()
+    should_load_current_kline = (
+        category
+        in {
+            "STOCK",
+            "FOREX",
+            "METAL",
+            "GOLD",
+            "COMMODITY",
+            "FUTURES",
+            "INDEX",
+            "CFD",
+        }
+        and category != "CRYPTO"
+        and provider != "BINANCE"
+    )
+    if should_load_current_kline:
+        try:
+            rows = get_contract_klines(
+                db,
+                symbol=normalized_symbol,
+                interval="1m",
+                limit=1,
+            )
+            latest_kline = rows[-1] if rows else None
+        except Exception as exc:
+            warnings.append(f"kline_unavailable:{type(exc).__name__}")
+
+    return {
+        "symbol": normalized_symbol,
+        "contract_symbol": contract_symbol,
+        "quote": quote,
+        "depth": depth,
+        "latest_kline": latest_kline,
+        "latest_trade": latest_trade,
+        "warnings": warnings,
     }

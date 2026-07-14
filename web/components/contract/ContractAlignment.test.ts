@@ -37,6 +37,8 @@ test('contract market panels keep click-to-fill states without duplicating the s
 test('contract execution prices remain direction-specific and never use display price', () => {
   const source = readSource('components/contract/ContractTradingForm.tsx');
 
+  expect(source).toContain('const resolvedExecutionBid = marketViewAuthority.executionBid ?? 0;');
+  expect(source).toContain('const resolvedExecutionAsk = marketViewAuthority.executionAsk ?? 0;');
   expect(source).toContain("closeSide === 'LONG' ? resolvedExecutionBid : resolvedExecutionAsk");
   expect(source).toContain("positionSide === 'LONG' ? resolvedExecutionAsk : resolvedExecutionBid");
   expect(source).not.toMatch(/currentActionExecutionPrice[^;]*display_price/);
@@ -63,7 +65,7 @@ test('contract ticker polling is suspended while the page is hidden', () => {
   expect(source).toContain('}, [contractSymbol, isPageVisible]);');
 });
 
-test('contract header receives authoritative ticker status and does not synthesize quote time', () => {
+test('contract header receives authoritative MarketView status and does not synthesize quote time', () => {
   const pageSource = readSource('app/contract/page.tsx');
   const headerSource = readSource('components/contract/ContractMarketHeader.tsx');
   const hookSource = readSource('components/contract/hooks/useContractMarketView.ts');
@@ -71,11 +73,15 @@ test('contract header receives authoritative ticker status and does not synthesi
   expect(pageSource).toContain('tickerSource={tickerSource}');
   expect(pageSource).toContain('tickerFreshness={tickerFreshness}');
   expect(pageSource).toContain('executable={contractExecutable}');
-  expect(headerSource).toContain('getContractTickerDomainStatusLabel({');
-  expect(headerSource).toContain('quoteFreshness={tickerFreshness}');
+  expect(headerSource).toContain('quoteStatusLabel');
+  expect(headerSource).toContain("data-display-freshness={tickerFreshness || ''}");
+  expect(headerSource).toContain('resolveContractHeaderMarketPresentation({');
+  expect(headerSource).not.toContain('getContractTickerDomainStatusLabel');
+  expect(headerSource).not.toContain('<MarketStatusBadge');
   expect(hookSource).toContain('parseContractMarketTimestamp(marketView?.quote_time)');
   expect(hookSource).toContain(': quoteTime,');
-  expect(hookSource).toContain('preferMarketViewDomainSemantics');
+  expect(hookSource).toContain('const displayPrice = marketViewAuthority.displayPrice;');
+  expect(hookSource).not.toContain('chartLastClose');
 });
 
 test('contract quote refreshes collapse short reconnect bursts without caching failures', () => {
@@ -85,6 +91,23 @@ test('contract quote refreshes collapse short reconnect bursts without caching f
   expect(source).toContain('if (existing?.promise) return existing.promise');
   expect(source).toContain('contractQuoteRequestStore.delete(contractSymbol)');
   expect(source).toContain('await loadContractQuote(contractSymbol)');
+});
+
+test('contract realtime keeps market symbol ownership separate from chart interval ownership', () => {
+  const pageSource = readSource('app/contract/page.tsx');
+  const marketStateSource = readSource('components/contract/hooks/useContractMarketState.ts');
+  const marketViewSource = readSource('components/contract/hooks/useContractMarketView.ts');
+  const datafeedSource = readSource('components/contract/tradingview/contractTradingViewDatafeed.ts');
+  const realtimeSource = readSource('lib/realtime/contractMarketRealtime.ts');
+
+  expect(pageSource).not.toContain('interval: effectiveKlineInterval,');
+  expect(marketStateSource).toContain('contractMarketRealtime.setMarketSession(contractSymbol)');
+  expect(marketStateSource).not.toContain('contractMarketRealtime.setSession({ symbol: contractSymbol, interval })');
+  expect(marketViewSource).toContain('isContractMarketDomainMessage(message)');
+  expect(datafeedSource).toContain('contractMarketRealtime.subscribeKline({');
+  expect(datafeedSource).not.toContain('contractMarketRealtime.setSession(');
+  expect(realtimeSource).toContain("this.sendDomainCommand('subscribe', 'market', this.marketSymbol)");
+  expect(realtimeSource).toContain("this.sendDomainCommand('unsubscribe', 'kline'");
 });
 
 test('contract TradingView uses the current readiness API and asynchronous symbol resolution', () => {

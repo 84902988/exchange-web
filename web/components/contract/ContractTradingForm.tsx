@@ -5,8 +5,6 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   closeContractOrder,
   closeContractSummaryOrder,
-  getContractQuoteDisplayStatus,
-  isExpiredLastGoodBboQuote,
   openContractOrder,
   type ContractMarketViewDetail,
   type ContractQuoteDisplayStatus,
@@ -27,6 +25,26 @@ import TradingConfirmModal from '@/components/common/TradingConfirmModal';
 import { formatPrice, formatRawPrice } from '@/lib/marketPrecision';
 import PercentageSlider from '@/components/spot/form/PercentageSlider';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import {
+  calculateContractSliderAmount,
+  formatContractAmountOnBlur,
+  isPositiveContractAmountAtPrecision,
+  normalizeContractAmountPrecision,
+  normalizeContractDecimalInput,
+} from './contractTradingForm.utils';
+import {
+  normalizeContractMarketViewDisplayState,
+  readContractMarketViewAuthority,
+  resolveContractMarketViewAuthorityPresentation,
+  type ContractMarketViewAuthorityState,
+} from './contractMarketView.utils';
+import {
+  buildContractTradingFormLegacyMarketRead,
+  getContractTradingFormMarketDifferences,
+  resolveContractTradingFormMarketRead,
+  resolveContractTradingFormMarketState,
+} from './ContractTradingFormMarketRead';
+import { useContractTradingFormStoreSnapshot } from './hooks/contractMarketStoreAdapter';
 
 type PositionMode = 'ONEWAY';
 type TradeTab = 'OPEN' | 'CLOSE';
@@ -35,12 +53,10 @@ type FormFeedback = {
   message: string;
 };
 type QuoteUnavailableReason =
-  | 'EXPIRED_LAST_GOOD_BBO'
   | 'MARKET_VIEW_EXPIRED'
   | 'MARKET_VIEW_DISPLAY_ONLY'
   | 'MARKET_VIEW_UNAVAILABLE'
   | 'NON_TRADING_SESSION'
-  | 'GENERIC_UNAVAILABLE'
   | null;
 type PendingContractOrder = {
   action: 'OPEN' | 'CLOSE';
@@ -61,6 +77,7 @@ type ContractTradingFormProps = {
   executable?: boolean | null;
   reasonCode?: string | null;
   pricePrecision: number;
+  amountPrecision?: number | null;
   quantityUnit?: string;
   maxLeverage?: number;
   availableMargin?: string | null;
@@ -78,12 +95,6 @@ type ContractTradingFormProps = {
   onSuccess: () => Promise<void> | void;
   tpSlTriggerPriceType?: ContractTpSlTriggerPriceType | string | null;
 };
-
-function getQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
-  if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
-  if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
-  return t('quoteTemporarilyUnavailableLabel', 'contracts');
-}
 
 const DEFAULT_MAX_LEVERAGE = 200;
 const TP_SL_STEP = 1;
@@ -120,11 +131,6 @@ function displayMoney(value: number | null, digits = 6) {
   return value === null ? '--' : `${formatNumber(value, digits)} USDT`;
 }
 
-function formatInputQuantity(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return '';
-  return value.toFixed(6).replace(/\.?0+$/, '');
-}
-
 function formatInputPrice(value: number, precision: number) {
   if (!Number.isFinite(value) || value <= 0) return '';
   return value.toFixed(precision);
@@ -153,32 +159,15 @@ function adjustTpSlPrice(value: string, delta: number, precision: number) {
   return formatInputPrice(next, precision);
 }
 
-function pickMarketReferencePrice(depthPrice: number, quotePrice: number, anchorPrice: number) {
-  if (depthPrice > 0) return depthPrice;
-  if (quotePrice > 0) return quotePrice;
-  if (anchorPrice > 0) return anchorPrice;
-  return 0;
-}
-
-function normalizeMarketViewDisplayState(value?: string | null) {
-  const normalized = String(value || '').trim().toUpperCase();
-  return normalized || null;
-}
-
 function isNonTradingMarketViewState(value?: string | null) {
-  const state = normalizeMarketViewDisplayState(value);
+  const state = normalizeContractMarketViewDisplayState(value);
   return state === 'PRE_MARKET'
     || state === 'AFTER_HOURS'
     || state === 'CLOSED'
     || state === 'MARKET_CLOSED'
-    || state === 'HOLIDAY';
-}
-
-function marketViewStateToQuoteStatus(value?: string | null): ContractQuoteDisplayStatus {
-  const state = normalizeMarketViewDisplayState(value);
-  if (state === 'LOADING') return 'LOADING';
-  if (state === 'LIVE_TRADABLE') return 'LIVE';
-  return 'UNAVAILABLE';
+    || state === 'HOLIDAY'
+    || state === 'CLOSED_LAST_GOOD_TRADABLE'
+    || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY';
 }
 
 function getMarketViewUnavailableReason(
@@ -188,8 +177,7 @@ function getMarketViewUnavailableReason(
 ): QuoteUnavailableReason {
   const unavailableByReason = isUnavailableExecutionReason(reasonCode ?? marketView?.reason_code);
   const unavailableByExecutable = (executable ?? marketView?.executable ?? null) === false;
-  if (!unavailableByExecutable && !unavailableByReason) return null;
-  const state = normalizeMarketViewDisplayState(marketView?.display_state);
+  const state = normalizeContractMarketViewDisplayState(marketView?.display_state);
   const reason = String(reasonCode ?? marketView?.reason_code ?? '').trim().toUpperCase();
   if (isNonTradingMarketViewState(state)) return 'NON_TRADING_SESSION';
   if (reason.includes('NON_TRADING') || reason.includes('CLOSED') || reason.includes('HOLIDAY')) {
@@ -201,12 +189,21 @@ function getMarketViewUnavailableReason(
   }
   if (state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY') return 'MARKET_VIEW_DISPLAY_ONLY';
   if (reason.includes('DIAGNOSTIC_ONLY')) return 'MARKET_VIEW_DISPLAY_ONLY';
+  if (!unavailableByExecutable && !unavailableByReason) return null;
   return 'MARKET_VIEW_UNAVAILABLE';
 }
 
-function getPositivePriceValue(value: string | number | null | undefined) {
-  const price = toNumber(value);
-  return price > 0 ? price : 0;
+function getMarketViewStatusHint(
+  state: ContractMarketViewAuthorityState,
+  t: (key: string, namespace?: 'contracts') => string,
+) {
+  if (state === 'loading') return t('marketDataLoadingLabel', 'contracts');
+  if (state === 'live') return t('realtimeQuoteLabel', 'contracts');
+  if (state === 'pre_market') return '盘前';
+  if (state === 'after_hours') return '盘后';
+  if (state === 'closed') return '闭市中';
+  if (state === 'holiday') return '休市中';
+  return t('quoteTemporarilyUnavailableLabel', 'contracts');
 }
 
 function isUnavailableExecutionReason(reasonCode?: string | null) {
@@ -263,20 +260,14 @@ export default function ContractTradingForm({
   positions = [],
   positionSummaries = [],
   selectedPrice,
-  bestBid,
-  bestAsk,
-  executionBid,
-  executionAsk,
-  executable,
-  reasonCode,
   pricePrecision,
+  amountPrecision,
   quantityUnit = 'BTC',
   maxLeverage = DEFAULT_MAX_LEVERAGE,
   availableMargin,
   isLoggedIn,
   disabled = false,
   quoteLoading = false,
-  marketUiState,
   onSuccess,
   tpSlTriggerPriceType,
 }: ContractTradingFormProps) {
@@ -303,6 +294,10 @@ export default function ContractTradingForm({
   const [feedback, setFeedback] = useState<FormFeedback | null>(null);
   const [openPercent, setOpenPercent] = useState(0);
   const [closePercent, setClosePercent] = useState(0);
+  const safeAmountPrecision = useMemo(
+    () => normalizeContractAmountPrecision(amountPrecision),
+    [amountPrecision],
+  );
   const effectiveMaxLeverage = useMemo(() => {
     const next = Math.floor(Number(maxLeverage));
     return Number.isFinite(next) && next > 0 ? next : DEFAULT_MAX_LEVERAGE;
@@ -363,87 +358,114 @@ export default function ContractTradingForm({
   const selectedCloseEntryPrice = selectedCloseSummary?.avg_entry_price || selectedClosePosition?.entry_price || null;
 
   const availableMarginNumber = toNumber(availableMargin);
-  const quantityNumber = toNumber(quantity);
-  const closeQuantityNumber = toNumber(closeQuantity || selectedCloseQuantity);
+  const quantityForOrder = formatContractAmountOnBlur(quantity, safeAmountPrecision);
+  const closeQuantityForOrder = closeQuantity.trim()
+    ? formatContractAmountOnBlur(closeQuantity, safeAmountPrecision)
+    : '';
+  const quantityNumber = toNumber(quantityForOrder);
+  const closeQuantityNumber = toNumber(closeQuantityForOrder || selectedCloseQuantity);
 
-  const quoteBidPrice = toNumber(quote?.bid_price);
-  const quoteAskPrice = toNumber(quote?.ask_price);
   const quoteMarkPrice = toNumber(quote?.mark_price);
   const quoteLastPrice = toNumber(quote?.last_price);
   const quoteSingleSideSpreadFeePrice = toNumber(quote?.single_side_spread_fee_price)
     || (toNumber(quote?.effective_total_spread) > 0 ? toNumber(quote?.effective_total_spread) / 2 : 0);
-  const quoteAnchorPrice = quoteBidPrice > 0 && quoteAskPrice > 0
-    ? (quoteBidPrice + quoteAskPrice) / 2
-    : quoteMarkPrice || quoteLastPrice;
-  const normalizedQuoteMarketStatus = String(quote?.market_status || '').trim().toUpperCase();
-  const isClosedMarketQuote = normalizedQuoteMarketStatus === 'CLOSED' || normalizedQuoteMarketStatus === 'HOLIDAY';
-  const hasMarketView = !!marketView;
-  const marketViewDisplayState = normalizeMarketViewDisplayState(marketView?.display_state);
-  const resolvedExecutionBid = getPositivePriceValue(executionBid ?? marketView?.execution_bid);
-  const resolvedExecutionAsk = getPositivePriceValue(executionAsk ?? marketView?.execution_ask);
-  const resolvedExecutable = executable ?? marketView?.executable ?? (!hasMarketView ? quote?.executable ?? null : null);
-  const resolvedReasonCode = reasonCode ?? marketView?.reason_code ?? null;
+  const tradingFormStoreSnapshot = useContractTradingFormStoreSnapshot(symbol);
+  const legacyDisplayMarketRead = useMemo(
+    () => buildContractTradingFormLegacyMarketRead({
+      quote,
+      marketView,
+      loading: quoteLoading && !marketView,
+    }),
+    [marketView, quote, quoteLoading],
+  );
+  const displayMarketRead = useMemo(
+    () => resolveContractTradingFormMarketRead(
+      tradingFormStoreSnapshot,
+      legacyDisplayMarketRead,
+    ),
+    [legacyDisplayMarketRead, tradingFormStoreSnapshot],
+  );
+  const displayMarketDifferences = useMemo(
+    () => getContractTradingFormMarketDifferences(
+      tradingFormStoreSnapshot,
+      legacyDisplayMarketRead,
+    ),
+    [legacyDisplayMarketRead, tradingFormStoreSnapshot],
+  );
+  useEffect(() => {
+    if (
+      displayMarketRead.authority !== 'STORE'
+      || !tradingFormStoreSnapshot
+      || displayMarketDifferences.length === 0
+    ) return;
+    console.info('[contract-trading-form-market-diff]', {
+      symbol: tradingFormStoreSnapshot.symbol,
+      provider: tradingFormStoreSnapshot.provider,
+      providerGeneration: tradingFormStoreSnapshot.providerGeneration,
+      revision: tradingFormStoreSnapshot.revision,
+      observedAtMs: tradingFormStoreSnapshot.observedAtMs,
+      differences: displayMarketDifferences,
+    });
+  }, [displayMarketDifferences, displayMarketRead.authority, tradingFormStoreSnapshot]);
+  const displayMarketState = resolveContractTradingFormMarketState(displayMarketRead);
+  const displayMarketStatusHint = getMarketViewStatusHint(displayMarketState, t);
+  const displayMarketStatusClassName = displayMarketState === 'live'
+    ? 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]'
+    : displayMarketState === 'loading'
+      ? 'border-white/10 bg-white/[0.05] text-white/58'
+      : displayMarketState === 'pre_market'
+        || displayMarketState === 'after_hours'
+        || displayMarketState === 'closed'
+        || displayMarketState === 'holiday'
+        ? 'border-[#f0b90b]/25 bg-[#f0b90b]/10 text-[#f0b90b]'
+        : 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]';
+  const marketViewAuthority = useMemo(
+    () => readContractMarketViewAuthority(marketView),
+    [marketView],
+  );
+  const marketViewPresentation = useMemo(
+    () => resolveContractMarketViewAuthorityPresentation({
+      marketView,
+      loading: quoteLoading && !marketView,
+    }),
+    [marketView, quoteLoading],
+  );
+  // Realtime Store is display-only here. Execution pricing and gating remain MarketView authority.
+  const resolvedExecutionBid = marketViewAuthority.executionBid ?? 0;
+  const resolvedExecutionAsk = marketViewAuthority.executionAsk ?? 0;
+  const resolvedExecutable = marketViewAuthority.executable;
+  const resolvedReasonCode = marketViewAuthority.reasonCode;
   const reasonCodeUnavailable = isUnavailableExecutionReason(resolvedReasonCode);
-  const quoteUnavailable = resolvedExecutable === false || reasonCodeUnavailable;
-  const quoteStatusLoading = hasMarketView ? marketViewDisplayState === 'LOADING' : quoteLoading && (!quote || quoteUnavailable);
-  const quoteDisplayStatus = hasMarketView
-    ? marketViewStateToQuoteStatus(marketViewDisplayState)
-    : getContractQuoteDisplayStatus(quote, { loading: quoteStatusLoading });
-  const quoteUnavailableReason: QuoteUnavailableReason = hasMarketView
+  const quoteUnavailable = !marketViewPresentation.isTradable || reasonCodeUnavailable;
+  const quoteStatusLoading = marketViewPresentation.isLoading;
+  const quoteUnavailableReason: QuoteUnavailableReason = quoteUnavailable && !quoteStatusLoading
     ? getMarketViewUnavailableReason(marketView, resolvedExecutable, resolvedReasonCode)
-    : isExpiredLastGoodBboQuote(quote)
-      ? 'EXPIRED_LAST_GOOD_BBO'
-      : quoteUnavailable && !quoteStatusLoading
-        ? 'GENERIC_UNAVAILABLE'
-        : null;
+      || 'MARKET_VIEW_UNAVAILABLE'
+    : null;
   const quoteLoadingFeedback = quoteStatusLoading ? t('marketDataLoadingLabel', 'contracts') : null;
   const quoteUnavailableFeedback = quoteUnavailableReason === 'NON_TRADING_SESSION'
     ? '当前非交易时段，暂不可下单'
-    : quoteUnavailableReason === 'EXPIRED_LAST_GOOD_BBO'
-      ? t('quoteUnavailableTradingHint', 'contracts')
     : quoteUnavailableReason === 'MARKET_VIEW_EXPIRED'
       ? t('quoteUnavailableTradingHint', 'contracts')
     : quoteUnavailableReason === 'MARKET_VIEW_DISPLAY_ONLY'
       ? t('quoteUnavailableTradingHint', 'contracts')
-    : quoteUnavailableReason === 'GENERIC_UNAVAILABLE'
-      || quoteUnavailableReason === 'MARKET_VIEW_UNAVAILABLE'
+    : quoteUnavailableReason === 'MARKET_VIEW_UNAVAILABLE'
       ? t('quoteUnavailableTradingHint', 'contracts')
       : null;
-  const ownQuoteStatusHint = quoteStatusLoading
-    ? getQuoteStatusLabel(quoteDisplayStatus, t)
-    : hasMarketView
-    ? quoteUnavailable
-      ? null
-      : getQuoteStatusLabel(quoteDisplayStatus, t)
-    : quote
-    ? quoteUnavailable
-      ? null
-      : getQuoteStatusLabel(quoteDisplayStatus, t)
-    : null;
-  const quoteStatusHint = marketUiState?.label || ownQuoteStatusHint;
-  const quoteStatusClassName = marketUiState?.isLoading
+  const quoteStatusHint = getMarketViewStatusHint(marketViewPresentation.state, t);
+  const quoteStatusClassName = marketViewPresentation.isLoading
     ? 'border-white/10 bg-white/[0.05] text-white/58'
-    : marketUiState?.isRealtime
+    : marketViewPresentation.isRealtime
     ? 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]'
-    : marketUiState && !marketUiState.isTradable
-    ? 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]'
-    : quoteStatusLoading
-    ? 'border-white/10 bg-white/[0.05] text-white/58'
-    : quoteUnavailable
-    ? 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]'
-    : quoteDisplayStatus === 'LIVE'
-      ? 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]'
-      : quoteDisplayStatus === 'LAST_QUOTE' || isClosedMarketQuote
+    : marketViewPresentation.state === 'pre_market'
+      || marketViewPresentation.state === 'after_hours'
+      || marketViewPresentation.state === 'closed'
+      || marketViewPresentation.state === 'holiday'
       ? 'border-[#f0b90b]/25 bg-[#f0b90b]/10 text-[#f0b90b]'
       : 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]';
 
-  const bidReferencePrice = useMemo(() => (
-    pickMarketReferencePrice(toNumber(bestBid), quoteBidPrice, quoteAnchorPrice)
-  ), [bestBid, quoteAnchorPrice, quoteBidPrice]);
-
-  const askReferencePrice = useMemo(() => (
-    pickMarketReferencePrice(toNumber(bestAsk), quoteAskPrice, quoteAnchorPrice)
-  ), [bestAsk, quoteAnchorPrice, quoteAskPrice]);
+  const bidReferencePrice = resolvedExecutionBid;
+  const askReferencePrice = resolvedExecutionAsk;
 
   const currentActionExecutionPrice = tradeTab === 'CLOSE'
     ? (closeSide === 'LONG' ? resolvedExecutionBid : resolvedExecutionAsk)
@@ -547,14 +569,14 @@ export default function ContractTradingForm({
 
   const closeEstimate = useMemo(() => {
     if (!selectedCloseSummary && !selectedClosePosition) return 0;
-    const qty = toNumber(closeQuantity || selectedCloseQuantity);
+    const qty = closeQuantityNumber;
     const entry = toNumber(selectedCloseEntryPrice);
     const closePrice = estimatedExecutionPrice;
     if (!qty || !entry || !closePrice) return 0;
     return closeSide === 'LONG'
       ? (closePrice - entry) * qty
       : (entry - closePrice) * qty;
-  }, [closeQuantity, closeSide, estimatedExecutionPrice, selectedCloseEntryPrice, selectedClosePosition, selectedCloseQuantity, selectedCloseSummary]);
+  }, [closeQuantityNumber, closeSide, estimatedExecutionPrice, selectedCloseEntryPrice, selectedClosePosition, selectedCloseSummary]);
 
   const submitDisabled = disabled
     || submitting
@@ -562,8 +584,11 @@ export default function ContractTradingForm({
     || quoteStatusLoading
     || quoteUnavailable
     || executionPriceMissing;
-  const openSubmitDisabled = submitDisabled || availableMarginNumber <= 0;
-  const closeDisabled = submitDisabled || (!selectedCloseSummary && !selectedClosePosition);
+  const openSubmitDisabled = submitDisabled || availableMarginNumber <= 0 || quantityNumber <= 0;
+  const closeQuantityInvalid = closeQuantity.trim() !== '' && closeQuantityNumber <= 0;
+  const closeDisabled = submitDisabled
+    || (!selectedCloseSummary && !selectedClosePosition)
+    || closeQuantityInvalid;
 
   function currentBboPrice() {
     if (tradeTab === 'OPEN') {
@@ -615,27 +640,54 @@ export default function ContractTradingForm({
     setStopLossPrice((current) => adjustTpSlPrice(current, delta, pricePrecision));
   }
 
+  function handleQuantityInputChange(value: string) {
+    const normalized = normalizeContractDecimalInput(value);
+    if (normalized === null) return;
+    setQuantity(normalized);
+    setOpenPercent(0);
+    setFeedback(null);
+  }
+
+  function handleQuantityBlur() {
+    if (!quantity) return;
+    setQuantity(formatContractAmountOnBlur(quantity, safeAmountPrecision));
+  }
+
+  function handleCloseQuantityInputChange(value: string) {
+    const normalized = normalizeContractDecimalInput(value);
+    if (normalized === null) return;
+    setCloseQuantity(normalized);
+    setClosePercent(0);
+    setFeedback(null);
+  }
+
+  function handleCloseQuantityBlur() {
+    if (!closeQuantity) return;
+    setCloseQuantity(formatContractAmountOnBlur(closeQuantity, safeAmountPrecision));
+  }
+
   function applyOpenPercent(percent: number) {
     const referencePrice = positionSide === 'LONG' ? longOpenPrice : shortOpenPrice;
     if (availableMarginNumber <= 0 || leverage <= 0 || referencePrice <= 0) return;
-    setQuantity(formatInputQuantity((availableMarginNumber * leverage * percent) / referencePrice));
+    const maximumQuantity = (availableMarginNumber * leverage) / referencePrice;
+    setQuantity(calculateContractSliderAmount(maximumQuantity, percent, safeAmountPrecision));
   }
 
   function handleOpenPercentChange(percent: number) {
     setOpenPercent(percent);
-    applyOpenPercent(percent / 100);
+    applyOpenPercent(percent);
   }
 
   function applyClosePercent(percent: number) {
     const maxQuantity = closeSide === 'LONG'
       ? toNumber(longSummary?.quantity || longPosition?.quantity || '0')
       : toNumber(shortSummary?.quantity || shortPosition?.quantity || '0');
-    setCloseQuantity(formatInputQuantity(maxQuantity * percent));
+    setCloseQuantity(calculateContractSliderAmount(maxQuantity, percent, safeAmountPrecision));
   }
 
   function handleClosePercentChange(percent: number) {
     setClosePercent(percent);
-    applyClosePercent(percent / 100);
+    applyClosePercent(percent);
   }
 
   function openReferencePrice(side: ContractPositionSide) {
@@ -669,7 +721,9 @@ export default function ContractTradingForm({
     const executionPrice = side === 'LONG' ? resolvedExecutionAsk : resolvedExecutionBid;
     if (executionPrice <= 0) return t('marketDataUnavailable', 'contracts');
     if (!quantity.trim()) return t('enterQuantity', 'contracts');
-    if (toNumber(quantity) <= 0) return t('enterValidOpenQuantity', 'contracts');
+    if (!isPositiveContractAmountAtPrecision(quantity, safeAmountPrecision)) {
+      return t('enterValidOpenQuantity', 'contracts');
+    }
     if (leverage <= 0) return t('enterValidLeverage', 'contracts');
     if (orderType === 'LIMIT' && toNumber(price) <= 0) return t('enterValidLimitPrice', 'contracts');
     if (leverage > effectiveMaxLeverage) {
@@ -688,7 +742,7 @@ export default function ContractTradingForm({
     if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
     const executionPrice = side === 'LONG' ? resolvedExecutionBid : resolvedExecutionAsk;
     if (executionPrice <= 0) return t('marketDataUnavailable', 'contracts');
-    const qty = toNumber(closeQuantity || maxQuantity);
+    const qty = toNumber(closeQuantityForOrder || maxQuantity);
     if (qty <= 0) return t('enterValidCloseQuantity', 'contracts');
     if (qty > toNumber(maxQuantity)) return t('closeQuantityExceedsMax', 'contracts');
     if (orderType === 'LIMIT' && toNumber(price) <= 0) return t('enterValidLimitPrice', 'contracts');
@@ -722,7 +776,7 @@ export default function ContractTradingForm({
         position_side: side,
         order_type: orderType,
         price: orderType === 'LIMIT' ? price : null,
-        quantity,
+        quantity: quantityForOrder,
         leverage,
         take_profit_price: tpSlEnabled && takeProfitPrice ? takeProfitPrice : null,
         stop_loss_price: tpSlEnabled && stopLossPrice ? stopLossPrice : null,
@@ -783,14 +837,14 @@ export default function ContractTradingForm({
           side,
           order_type: orderType,
           price: orderType === 'LIMIT' ? price : null,
-          quantity: closeQuantity || null,
+          quantity: closeQuantityForOrder || null,
         });
       } else {
         await closeContractOrder({
           position_id: position!.id,
           order_type: orderType,
           price: orderType === 'LIMIT' ? price : null,
-          quantity: closeQuantity || null,
+          quantity: closeQuantityForOrder || null,
         });
       }
       if (confirmed) {
@@ -827,7 +881,9 @@ export default function ContractTradingForm({
 
     const isOpen = pendingContractOrder.action === 'OPEN';
     const side = pendingContractOrder.side;
-    const confirmQuantity = isOpen ? quantity : closeQuantity || selectedCloseQuantity;
+    const confirmQuantity = isOpen
+      ? quantityForOrder
+      : closeQuantityForOrder || selectedCloseQuantity;
     const confirmMargin = isOpen
       ? (side === 'LONG' ? longMargin : shortMargin)
       : toNumber(selectedCloseSummary?.margin_amount || selectedClosePosition?.margin_amount || null);
@@ -860,7 +916,7 @@ export default function ContractTradingForm({
       { label: isOpen ? t('estimatedLiquidationPrice', 'contracts') : t('liquidationPriceShort', 'contracts'), value: liquidationPrice },
     ];
   }, [
-    closeQuantity,
+    closeQuantityForOrder,
     closeSpreadCostHint,
     estimatedExecutionPrice,
     leverage,
@@ -869,7 +925,7 @@ export default function ContractTradingForm({
     pendingContractOrder,
     price,
     pricePrecision,
-    quantity,
+    quantityForOrder,
     quantityUnit,
     selectedClosePosition,
     selectedCloseQuantity,
@@ -890,8 +946,51 @@ export default function ContractTradingForm({
   const contractRegisterHref = `/register?redirect=${encodeURIComponent(contractRedirect)}`;
 
   return (
-    <div className="tabular-nums space-y-1 text-sm text-white">
+    <div
+      className="tabular-nums space-y-1 text-sm text-white"
+      data-display-market-authority={displayMarketRead.authority}
+      data-display-market-symbol={displayMarketRead.symbol || undefined}
+      data-display-price={displayMarketRead.displayPrice || undefined}
+      data-mark-price={displayMarketRead.markPrice || undefined}
+      data-index-price={displayMarketRead.indexPrice || undefined}
+      data-market-status={displayMarketRead.marketStatus || undefined}
+      data-market-executable={displayMarketRead.executable ?? undefined}
+      data-display-source={displayMarketRead.source || undefined}
+      data-display-freshness={displayMarketRead.freshness || undefined}
+      data-display-stale={displayMarketRead.stale || undefined}
+      data-provider-generation={displayMarketRead.authority === 'STORE'
+        ? tradingFormStoreSnapshot?.providerGeneration ?? undefined
+        : undefined}
+    >
       <div className="space-y-1 overflow-visible">
+        <div
+          className="rounded-xl border border-white/[0.06] bg-[#0b1016] px-2 py-1.5"
+          data-testid="contract-trading-form-market-display"
+        >
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="truncate text-[10px] text-white/38" title={displayMarketRead.displayPriceSource || undefined}>
+              {t('tradeStatus', 'contracts')}
+            </span>
+            <span className={`shrink-0 rounded-full border px-1.5 py-px text-[10px] font-semibold ${displayMarketStatusClassName}`}>
+              {displayMarketStatusHint}
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-1">
+            <MarketDisplayValue
+              label={t('latestPrice', 'contracts')}
+              value={formatDisplayPrice(displayMarketRead.displayPrice, pricePrecision)}
+            />
+            <MarketDisplayValue
+              label={t('markPrice', 'contracts')}
+              value={formatDisplayPrice(displayMarketRead.markPrice, pricePrecision)}
+            />
+            <MarketDisplayValue
+              label={t('indexPrice', 'contracts')}
+              value={formatDisplayPrice(displayMarketRead.indexPrice, pricePrecision)}
+            />
+          </div>
+        </div>
+
         <div className="grid grid-cols-3 gap-1">
           <ModeButton
             label={t('marginMode', 'contracts')}
@@ -943,7 +1042,8 @@ export default function ContractTradingForm({
             tpSlEnabled={tpSlEnabled}
             submitDisabled={openSubmitDisabled}
             setPrice={setPrice}
-            setQuantity={setQuantity}
+            setQuantity={handleQuantityInputChange}
+            onQuantityBlur={handleQuantityBlur}
             setPositionSide={(next) => {
               setFeedback(null);
               setPositionSide(next);
@@ -981,7 +1081,8 @@ export default function ContractTradingForm({
             estimatedExecutionPrice={estimatedExecutionPrice}
             closeDisabled={closeDisabled}
             setPrice={setPrice}
-            setCloseQuantity={setCloseQuantity}
+            setCloseQuantity={handleCloseQuantityInputChange}
+            onCloseQuantityBlur={handleCloseQuantityBlur}
             setCloseSide={(next) => {
               setFeedback(null);
               setCloseSide(next);
@@ -1123,6 +1224,7 @@ function OpenPanel({
   submitDisabled,
   setPrice,
   setQuantity,
+  onQuantityBlur,
   setPositionSide,
   setTakeProfitPrice,
   setStopLossPrice,
@@ -1162,6 +1264,7 @@ function OpenPanel({
   submitDisabled: boolean;
   setPrice: (value: string) => void;
   setQuantity: (value: string) => void;
+  onQuantityBlur: () => void;
   setPositionSide: (value: ContractPositionSide) => void;
   setTakeProfitPrice: (value: string) => void;
   setStopLossPrice: (value: string) => void;
@@ -1210,7 +1313,14 @@ function OpenPanel({
       ) : (
         <ReadonlyField label={t('price', 'contracts')} value={t('market', 'contracts')} />
       )}
-      <Field label={t('quantity', 'contracts')} value={quantity} onChange={setQuantity} placeholder={t('enterQuantity', 'contracts')} suffix={quantityUnit} />
+      <Field
+        label={t('quantity', 'contracts')}
+        value={quantity}
+        onChange={setQuantity}
+        onBlur={onQuantityBlur}
+        placeholder={t('enterQuantity', 'contracts')}
+        suffix={quantityUnit}
+      />
       <PercentageSlider
         value={percentValue}
         side={isLong ? 'buy' : 'sell'}
@@ -1294,6 +1404,7 @@ function ClosePanel({
   closeDisabled,
   setPrice,
   setCloseQuantity,
+  onCloseQuantityBlur,
   setCloseSide,
   fillBboPrice,
   bboDisabled,
@@ -1321,6 +1432,7 @@ function ClosePanel({
   closeDisabled: boolean;
   setPrice: (value: string) => void;
   setCloseQuantity: (value: string) => void;
+  onCloseQuantityBlur: () => void;
   setCloseSide: (value: ContractPositionSide) => void;
   fillBboPrice: () => void;
   bboDisabled: boolean;
@@ -1357,7 +1469,14 @@ function ClosePanel({
         <ReadonlyField label={t('price', 'contracts')} value={t('market', 'contracts')} />
       )}
       <ReadonlyField label={t('closeableQuantity', 'contracts')} value={`${formatNumber(maxCloseQuantity, 8)} ${quantityUnit}`} />
-      <Field label={t('closeQuantity', 'contracts')} value={closeQuantity} onChange={setCloseQuantity} placeholder={selectedPosition ? t('emptyMeansCloseAll', 'contracts') : t('noClosablePosition', 'contracts')} suffix={quantityUnit} />
+      <Field
+        label={t('closeQuantity', 'contracts')}
+        value={closeQuantity}
+        onChange={setCloseQuantity}
+        onBlur={onCloseQuantityBlur}
+        placeholder={selectedPosition ? t('emptyMeansCloseAll', 'contracts') : t('noClosablePosition', 'contracts')}
+        suffix={quantityUnit}
+      />
       <PercentageSlider
         value={percentValue}
         side={isLong ? 'sell' : 'buy'}
@@ -1392,6 +1511,15 @@ function ClosePanel({
           <ContractLoginActions loginHref={loginHref} registerHref={registerHref} />
         )}
       </div>
+    </div>
+  );
+}
+
+function MarketDisplayValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-lg border border-white/[0.05] bg-white/[0.02] px-1.5 py-1">
+      <span className="block truncate text-[9px] leading-3 text-white/35">{label}</span>
+      <span className="block truncate text-[11px] font-semibold leading-4 text-white/88">{value}</span>
     </div>
   );
 }
@@ -1464,6 +1592,7 @@ function Field({
   label,
   value,
   onChange,
+  onBlur,
   placeholder,
   suffix,
   actions,
@@ -1471,6 +1600,7 @@ function Field({
   label: string;
   value: string;
   onChange: (value: string) => void;
+  onBlur?: () => void;
   placeholder: string;
   suffix?: string;
   actions?: ReactNode;
@@ -1478,10 +1608,12 @@ function Field({
   return (
     <label className="block">
       <span className="mb-1 block text-[11px] text-white/42">{label}</span>
-      <div className="flex h-9 items-center rounded-lg border border-white/[0.08] bg-[#0d1218] px-2.5 transition-colors hover:border-white/[0.14] focus-within:border-white/[0.2]">
+      <div className="flex h-10 items-center rounded-lg border border-white/[0.08] bg-[#0d1218] px-3 transition-all hover:border-white/[0.14] focus-within:border-white/[0.18] focus-within:bg-[#10161d] focus-within:ring-1 focus-within:ring-white/10 [@media(max-height:850px)]:h-9">
         <input
+          inputMode="decimal"
           value={value}
           onChange={(event) => onChange(event.target.value)}
+          onBlur={onBlur}
           className="min-w-0 flex-1 bg-transparent text-[13px] font-medium tabular-nums text-white outline-none placeholder:text-white/20"
           placeholder={placeholder}
         />

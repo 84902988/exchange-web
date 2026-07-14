@@ -10,8 +10,6 @@ import {
   getContractDepth,
   getContractMarketTrades,
   getContractMarketView,
-  getContractQuoteDisplayStatus,
-  isExpiredLastGoodBboQuote,
   type ContractDepthLevel,
   type ContractDepthMode,
   type ContractKlineCurrentCandle,
@@ -22,6 +20,8 @@ import {
 } from '@/lib/api/modules/contract';
 import {
   contractMarketRealtime,
+  isContractKlineDomainMessage,
+  isContractMarketDomainMessage,
   type ContractMarketRealtimeMessage,
 } from '@/lib/realtime/contractMarketRealtime';
 import {
@@ -33,6 +33,18 @@ import {
   type PriceDirection,
 } from './useContractMarketState';
 import { useContractMarketViewPolling } from './useContractMarketViewPolling';
+import {
+  hydrateContractMarketRestDomain,
+  hydrateContractMarketViewShadow,
+  ingestContractMarketWsDomain,
+} from './contractMarketStoreAdapter';
+import {
+  normalizeContractMarketViewDisplayState,
+  readContractMarketViewAuthority,
+  resolveContractMarketViewAuthorityPresentation,
+  shouldExposeContractMarketDepth,
+  type ContractMarketViewAuthorityState,
+} from '../contractMarketView.utils';
 
 export type ContractCurrentPriceSource = 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK';
 
@@ -48,7 +60,7 @@ export type ContractMarketUiState = {
 export type ContractMarketCenterState = {
   symbol: string;
   displayPrice: number | null;
-  displayPriceSource: ContractCurrentPriceSource;
+  displayPriceSource: ContractCurrentPriceSource | null;
   displayPriceLabel: string;
   bestBid: number | null;
   bestAsk: number | null;
@@ -65,31 +77,19 @@ export type ContractMarketCenterState = {
   updatedAt: number | null;
 };
 
-type LiveDepthBbo = {
-  bid: number | null;
-  ask: number | null;
-  mid: number | null;
-  source: 'LIVE_MID' | null;
-  updatedAt: number;
-};
-
 type UseContractMarketViewParams = {
   contractSymbol: string;
-  interval?: string;
   symbolOptionMarketSymbol?: string | null;
   symbolOptionPricePrecision?: number | null;
   fallbackMarketStatus?: string | null;
   fallbackMarketStatusText?: string | null;
   fallbackMarketSessionType?: string | null;
   fallbackQuoteFreshness?: string | null;
-  chartLastClose?: string | number | null;
 };
 
-const LIVE_DEPTH_BBO_TTL_MS = 5000;
 const FUTURES_DEPTH_LIMIT = 20;
 const FUTURES_TRADES_LIMIT = 30;
 const DEPTH_INITIAL_GRACE_MS = 1800;
-const DEPTH_FULL_DEGRADE_GRACE_MS = 3000;
 
 type ContractDepthSnapshot = {
   symbol?: string | null;
@@ -134,32 +134,8 @@ function normalizeCurrentPriceSource(value?: string | null): ContractCurrentPric
   return null;
 }
 
-function normalizeMarketViewDisplayState(value?: string | null) {
-  const normalized = String(value || '').trim().toUpperCase();
-  return normalized || null;
-}
-
-function marketViewStateToQuoteStatus(value?: string | null): ContractQuoteDisplayStatus | null {
-  const state = normalizeMarketViewDisplayState(value);
-  if (!state) return null;
-  if (state === 'LOADING') return 'LOADING';
-  if (state === 'LIVE_TRADABLE' || state === 'REGULAR_OPEN') return 'LIVE';
-  if (
-    state === 'PRE_MARKET'
-    || state === 'AFTER_HOURS'
-    || state === 'CLOSED'
-    || state === 'MARKET_CLOSED'
-    || state === 'HOLIDAY'
-    || state === 'CLOSED_LAST_GOOD_TRADABLE'
-    || state === 'CLOSED_LAST_GOOD_DISPLAY_ONLY'
-    || state === 'EXPIRED'
-    || state === 'UNAVAILABLE'
-  ) return 'UNAVAILABLE';
-  return null;
-}
-
 function isLiveMarketState(value?: string | null) {
-  const state = normalizeMarketViewDisplayState(value);
+  const state = normalizeContractMarketViewDisplayState(value);
   return (
     state === 'LIVE_TRADABLE'
     || state === 'REGULAR_OPEN'
@@ -171,7 +147,7 @@ function isLiveMarketState(value?: string | null) {
 }
 
 function isNonTradingMarketState(value?: string | null) {
-  const state = normalizeMarketViewDisplayState(value);
+  const state = normalizeContractMarketViewDisplayState(value);
   return (
     state === 'PRE_MARKET'
     || state === 'AFTER_HOURS'
@@ -182,27 +158,16 @@ function isNonTradingMarketState(value?: string | null) {
   );
 }
 
-function getNonTradingMarketViewStatusLabel(value: string) {
-  const state = normalizeMarketViewDisplayState(value);
-  if (state === 'PRE_MARKET') return '盘前';
-  if (state === 'AFTER_HOURS') return '盘后';
-  if (state === 'CLOSED' || state === 'MARKET_CLOSED') return '闭市中';
-  if (state === 'HOLIDAY') return '休市中';
-  return null;
-}
-
-function getMarketViewStatusLabel(value: string, t: (key: string, namespace?: 'contracts') => string) {
-  const state = normalizeMarketViewDisplayState(value);
-  if (state === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
-  if (state === 'LIVE_TRADABLE') return t('realtimeQuoteLabel', 'contracts');
-  const nonTradingLabel = getNonTradingMarketViewStatusLabel(value);
-  if (nonTradingLabel) return nonTradingLabel;
-  return t('quoteTemporarilyUnavailableLabel', 'contracts');
-}
-
-function getContractQuoteStatusLabel(status: ContractQuoteDisplayStatus, t: (key: string, namespace?: 'contracts') => string) {
-  if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
-  if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
+function getMarketViewStatusLabel(
+  state: ContractMarketViewAuthorityState,
+  t: (key: string, namespace?: 'contracts') => string,
+) {
+  if (state === 'loading') return t('marketDataLoadingLabel', 'contracts');
+  if (state === 'live') return t('realtimeQuoteLabel', 'contracts');
+  if (state === 'pre_market') return '盘前';
+  if (state === 'after_hours') return '盘后';
+  if (state === 'closed') return '闭市中';
+  if (state === 'holiday') return '休市中';
   return t('quoteTemporarilyUnavailableLabel', 'contracts');
 }
 
@@ -424,23 +389,17 @@ function getTimestampMillis(value?: string | number | null) {
 
 export function useContractMarketView({
   contractSymbol,
-  interval = '1m',
   symbolOptionMarketSymbol,
   symbolOptionPricePrecision,
   fallbackMarketStatus,
   fallbackMarketStatusText,
   fallbackMarketSessionType,
-  fallbackQuoteFreshness,
-  chartLastClose,
 }: UseContractMarketViewParams) {
   const { t } = useLocaleContext();
   const [restMarketView, setRestMarketView] = useState<ContractMarketViewDetail | null>(null);
   const [wsState, setWsState] = useState<ContractMarketViewDetail | null>(null);
   const [marketViewLoading, setMarketViewLoading] = useState(true);
   const [marketViewError, setMarketViewError] = useState<string | null>(null);
-  const [localChartLastClose, setLocalChartLastClose] = useState<string | null>(null);
-  const [lastTradePrice, setLastTradePrice] = useState<string | null>(null);
-  const [liveDepthBbo, setLiveDepthBbo] = useState<LiveDepthBbo | null>(null);
   const [depthState, setDepthState] = useState<ContractDepthState>(() => ({
     symbol: normalizeContractSymbol(contractSymbol),
     asks: [],
@@ -467,10 +426,6 @@ export function useContractMarketView({
     updatedAt: null,
   }));
   const [fallbackDepthAllowed, setFallbackDepthAllowed] = useState(false);
-  const [lastFullDepthSnapshot, setLastFullDepthSnapshot] = useState<{
-    asks: ContractDepthLevel[];
-    bids: ContractDepthLevel[];
-  } | null>(null);
   const [priceDirection, setPriceDirection] = useState<PriceDirection>('flat');
   const [marketSessionRefreshKey, setMarketSessionRefreshKey] = useState(0);
   const requestSeqRef = useRef(0);
@@ -487,7 +442,6 @@ export function useContractMarketView({
 
   const quoteState = useContractMarketState({
     contractSymbol,
-    interval,
     symbolOptionMarketSymbol,
     symbolOptionPricePrecision,
   });
@@ -523,6 +477,7 @@ export function useContractMarketView({
       ) {
         return;
       }
+      hydrateContractMarketViewShadow(view, 'REST');
       setRestMarketView(view);
       marketViewErrorSymbolRef.current = null;
       setMarketViewError(null);
@@ -571,9 +526,6 @@ export function useContractMarketView({
     setWsState(null);
     setMarketViewError(null);
     setMarketViewLoading(true);
-    setLocalChartLastClose(null);
-    setLastTradePrice(null);
-    setLiveDepthBbo(null);
     setDepthState({
       symbol: normalizeContractSymbol(contractSymbol),
       asks: [],
@@ -591,7 +543,6 @@ export function useContractMarketView({
       updatedAt: null,
     });
     setFallbackDepthAllowed(false);
-    setLastFullDepthSnapshot(null);
     setTradesState({
       symbol: normalizeContractSymbol(contractSymbol),
       trades: [],
@@ -618,9 +569,11 @@ export function useContractMarketView({
 
   useEffect(() => {
     const handleMarketStateMessage = (message: ContractMarketRealtimeMessage) => {
+      if (!isContractMarketDomainMessage(message)) return;
       const nextState = extractContractMarketStateMessage(message);
       if (!nextState) return;
       if (normalizeContractSymbol(nextState.symbol) !== normalizeContractSymbol(contractSymbol)) return;
+      hydrateContractMarketViewShadow(nextState, 'WS');
       setWsState(nextState);
     };
 
@@ -644,16 +597,13 @@ export function useContractMarketView({
   const quote = quoteState.contractQuote;
   const marketStatus = quote?.market_status || fallbackMarketStatus || null;
   const marketStatusText = quote?.market_status_text || fallbackMarketStatusText || null;
-  const quoteFreshness = quote?.quote_freshness || fallbackQuoteFreshness || null;
   const marketSessionType = quote?.market_session_type || fallbackMarketSessionType || null;
-  const quoteStatusLoading = quoteState.contractQuoteLoading && (!quote || quote.executable === false);
-  const quoteDisplayStatus = getContractQuoteDisplayStatus(quote, { loading: quoteStatusLoading });
-  const rawMarketViewDisplayState = normalizeMarketViewDisplayState(marketView?.display_state);
-  const marketViewDisplayState = normalizeMarketViewDisplayState(
-    rawMarketViewDisplayState || (currentMarketViewLoading ? 'LOADING' : null),
+  const marketViewAuthority = useMemo(
+    () => readContractMarketViewAuthority(marketView),
+    [marketView],
   );
-  const marketViewQuoteDisplayStatus = marketViewStateToQuoteStatus(marketViewDisplayState);
-  const effectiveQuoteDisplayStatus = marketViewQuoteDisplayStatus || quoteDisplayStatus;
+  const rawMarketViewDisplayState = marketViewAuthority.displayState;
+  const quoteStatusLoading = currentMarketViewLoading && !marketView;
   const depthBelongsToCurrentSymbol = normalizeContractSymbol(depthState.symbol) === normalizeContractSymbol(contractSymbol);
   const activeDepthAsks = useMemo(
     () => (depthBelongsToCurrentSymbol ? depthState.asks : []),
@@ -723,6 +673,12 @@ export function useContractMarketView({
       ) {
         return;
       }
+      hydrateContractMarketRestDomain({
+        symbol: requestSymbol,
+        domain: 'depth',
+        data: depth,
+        metadata: depth,
+      });
       applyDepthSnapshot({
         symbol: depth.symbol || requestSymbol,
         asks: depth.asks,
@@ -760,7 +716,6 @@ export function useContractMarketView({
     const cachedBids = cachedDepthBelongsToCurrentSymbol ? cachedDepth?.bids || [] : [];
 
     setFallbackDepthAllowed(false);
-    setLastFullDepthSnapshot(null);
 
     if (cachedAsks.length > 0 || cachedBids.length > 0) {
       const cachedDepthHasConfirmedStatus = cachedDepth?.executable !== undefined
@@ -830,10 +785,16 @@ export function useContractMarketView({
 
   useEffect(() => {
     const handleDepthMessage = (message: ContractMarketRealtimeMessage) => {
+      if (!isContractMarketDomainMessage(message)) return;
       if (effectiveMarketStatus === 'CLOSED') return;
 
       const depth = extractRealtimeDepth(message, contractSymbol);
       if (!depth) return;
+      ingestContractMarketWsDomain({
+        domain: 'depth',
+        message,
+        data: depth,
+      });
       applyDepthSnapshot(depth);
     };
 
@@ -879,7 +840,14 @@ export function useContractMarketView({
     try {
       const trades = await getContractMarketTrades(requestSymbol, FUTURES_TRADES_LIMIT);
       if (!mountedRef.current || tradesRequestSeqRef.current !== requestSeq) return;
-      applyTradesSnapshot([...trades].reverse());
+      const nextTrades = [...trades].reverse();
+      hydrateContractMarketRestDomain({
+        symbol: requestSymbol,
+        domain: 'trades',
+        data: nextTrades,
+        metadata: nextTrades[0] || null,
+      });
+      applyTradesSnapshot(nextTrades);
     } catch (error) {
       if (!mountedRef.current || tradesRequestSeqRef.current !== requestSeq) return;
       setTradesState((current) => ({
@@ -937,10 +905,16 @@ export function useContractMarketView({
 
   useEffect(() => {
     const handleTradeMessage = (message: ContractMarketRealtimeMessage) => {
+      if (!isContractMarketDomainMessage(message)) return;
       if (effectiveMarketStatus === 'CLOSED') return;
 
       const trades = extractRealtimeTrades(message, contractSymbol);
       if (trades.length === 0) return;
+      ingestContractMarketWsDomain({
+        domain: 'trades',
+        message,
+        data: trades,
+      });
 
       setTradesState((current) => {
         if (normalizeContractSymbol(current.symbol) !== normalizeContractSymbol(contractSymbol)) {
@@ -967,6 +941,20 @@ export function useContractMarketView({
     return contractMarketRealtime.subscribe('trade', handleTradeMessage);
   }, [contractSymbol, effectiveMarketStatus]);
 
+  useEffect(() => {
+    const handleKlineMessage = (message: ContractMarketRealtimeMessage) => {
+      if (!isContractKlineDomainMessage(message)) return;
+      ingestContractMarketWsDomain({
+        domain: 'kline',
+        message,
+        data: message.kline ?? message.data,
+        interval: message.interval || null,
+      });
+    };
+
+    return contractMarketRealtime.subscribe('kline', handleKlineMessage);
+  }, []);
+
   const tradesBelongToCurrentSymbol = normalizeContractSymbol(tradesState.symbol) === normalizeContractSymbol(contractSymbol);
   const recentTrades = tradesBelongToCurrentSymbol ? tradesState.trades : [];
   const latestTrade = recentTrades[0] || null;
@@ -985,165 +973,60 @@ export function useContractMarketView({
         : 'flat'
     : 'flat';
 
-  const marketViewDisplayPrice = getPositivePrice(marketView?.display_price);
-  const marketViewCurrentPriceSource = marketViewDisplayPrice !== null
-    ? normalizeCurrentPriceSource(marketView?.current_price_source || marketView?.display_price_source) || 'LIVE_MID'
+  const displayPrice = marketViewAuthority.displayPrice;
+  const displayPriceSource = displayPrice !== null
+    ? normalizeCurrentPriceSource(marketView?.current_price_source || marketView?.display_price_source)
     : null;
-  const marketViewTradePrice = marketViewCurrentPriceSource === 'TRADE_TICK'
-    ? getPositivePrice(marketView?.last_trade_price ?? marketView?.display_price)
-    : null;
-  const tradeTickPrice = latestTradeTickPrice ?? getPositivePrice(lastTradePrice) ?? marketViewTradePrice;
-  const liveDepthMidPrice = getPositivePrice(liveDepthBbo?.mid);
-  const liveDepthMidFresh = liveDepthBbo?.source === 'LIVE_MID'
-    && liveDepthMidPrice !== null
-    && Date.now() - liveDepthBbo.updatedAt <= LIVE_DEPTH_BBO_TTL_MS;
-  const chartClosePriceNumber = getPositivePrice(chartLastClose ?? localChartLastClose);
-  const displayPriceSource: ContractCurrentPriceSource = tradeTickPrice !== null
-    ? 'TRADE_TICK'
-    : liveDepthMidFresh
-      ? 'LIVE_MID'
-      : marketViewCurrentPriceSource || 'KLINE_CLOSE';
-  const displayPrice = tradeTickPrice !== null
-    ? tradeTickPrice
-    : liveDepthMidFresh
-      ? liveDepthMidPrice
-      : marketViewDisplayPrice !== null
-        ? marketViewDisplayPrice
-        : chartClosePriceNumber;
-  const displayPriceReady = displayPrice !== null;
   const displayPriceLabel = displayPriceSource === 'TRADE_TICK'
     ? t('latestPrice', 'contracts')
     : displayPriceSource === 'LIVE_MID'
       ? t('midPrice', 'contracts')
-      : t('klineLatestPrice', 'contracts');
+      : displayPriceSource === 'KLINE_CLOSE'
+        ? t('klineLatestPrice', 'contracts')
+        : t('latestPrice', 'contracts');
+
+  const marketViewAuthorityPresentation = useMemo(
+    () => resolveContractMarketViewAuthorityPresentation({
+      marketView,
+      loading: currentMarketViewLoading,
+    }),
+    [currentMarketViewLoading, marketView],
+  );
 
   const marketUiState = useMemo<ContractMarketUiState>(() => {
-    const executable = marketView?.executable ?? quote?.executable ?? null;
-    const liveByMarketView = isLiveMarketState(rawMarketViewDisplayState);
-    const liveBySession = isLiveMarketState(marketSessionType) || isLiveMarketState(marketStatus);
-    const quoteLive = quoteDisplayStatus === 'LIVE';
-    const isTradable = executable !== false && (liveByMarketView || liveBySession || quoteLive);
-
-    if (!displayPriceReady) {
-      return {
-        label: t('marketDataLoadingLabel', 'contracts'),
-        isLoading: true,
-        isTradable: false,
-        isRealtime: false,
-        reason: 'CURRENT_PRICE_PENDING',
-        status: 'LOADING',
-      };
-    }
-
-    if (rawMarketViewDisplayState && isNonTradingMarketState(rawMarketViewDisplayState)) {
-      return {
-        label: getMarketViewStatusLabel(rawMarketViewDisplayState, t),
-        isLoading: false,
-        isTradable: false,
-        isRealtime: false,
-        reason: `MARKET_VIEW_${rawMarketViewDisplayState}`,
-        status: 'UNAVAILABLE',
-      };
-    }
-
-    if (liveByMarketView || liveBySession || quoteLive) {
-      return {
-        label: t('realtimeQuoteLabel', 'contracts'),
-        isLoading: false,
-        isTradable,
-        isRealtime: true,
-        reason: liveByMarketView ? 'MARKET_VIEW_LIVE' : liveBySession ? 'SESSION_LIVE' : 'QUOTE_LIVE',
-        status: 'LIVE',
-      };
-    }
-
-    if (currentMarketViewLoading && !marketView && quoteDisplayStatus === 'LOADING') {
-      return {
-        label: t('marketDataLoadingLabel', 'contracts'),
-        isLoading: true,
-        isTradable: false,
-        isRealtime: false,
-        reason: 'MARKET_VIEW_LOADING',
-        status: 'LOADING',
-      };
-    }
-
-    const fallbackStatus = effectiveQuoteDisplayStatus === 'LOADING' ? 'LAST_QUOTE' : effectiveQuoteDisplayStatus;
     return {
-      label: rawMarketViewDisplayState
-        ? getMarketViewStatusLabel(rawMarketViewDisplayState, t)
-        : getContractQuoteStatusLabel(fallbackStatus, t),
-      isLoading: false,
-      isTradable,
-      isRealtime: fallbackStatus === 'LIVE',
-      reason: rawMarketViewDisplayState ? `MARKET_VIEW_${rawMarketViewDisplayState}` : `QUOTE_${fallbackStatus}`,
-      status: fallbackStatus,
+      ...marketViewAuthorityPresentation,
+      label: getMarketViewStatusLabel(marketViewAuthorityPresentation.state, t),
     };
   }, [
-    displayPriceReady,
-    effectiveQuoteDisplayStatus,
-    marketSessionType,
-    marketStatus,
-    marketView,
-    currentMarketViewLoading,
-    quote?.executable,
-    quoteDisplayStatus,
-    rawMarketViewDisplayState,
+    marketViewAuthorityPresentation,
     t,
   ]);
 
   const normalizedActiveDepthMode = String(activeDepthMode || '').trim().toUpperCase();
-  useEffect(() => {
-    if (normalizedActiveDepthMode !== 'FULL_DEPTH') return;
-    if (!activeDepthAsks.length || !activeDepthBids.length) return;
-    setLastFullDepthSnapshot({
-      asks: activeDepthAsks,
-      bids: activeDepthBids,
-    });
-  }, [activeDepthAsks, activeDepthBids, normalizedActiveDepthMode]);
-
-  useEffect(() => {
-    if (normalizedActiveDepthMode === 'FULL_DEPTH' || !lastFullDepthSnapshot) return undefined;
-    const timer = window.setTimeout(() => {
-      setLastFullDepthSnapshot(null);
-    }, DEPTH_FULL_DEGRADE_GRACE_MS);
-    return () => window.clearTimeout(timer);
-  }, [lastFullDepthSnapshot, normalizedActiveDepthMode]);
-
   const hasRawDepthRows = activeDepthAsks.length > 0 || activeDepthBids.length > 0;
   const hasFullDepth = normalizedActiveDepthMode === 'FULL_DEPTH';
-  const shouldHoldPreviousFullDepth = !hasFullDepth && !!lastFullDepthSnapshot;
   const shouldDelayFallbackDepth = hasRawDepthRows
     && !hasFullDepth
-    && !fallbackDepthAllowed
-    && !shouldHoldPreviousFullDepth;
+    && !fallbackDepthAllowed;
   const depthAsks = useMemo(() => {
     if (hasFullDepth) return activeDepthAsks;
-    if (shouldHoldPreviousFullDepth) return lastFullDepthSnapshot?.asks || [];
     if (fallbackDepthAllowed) return activeDepthAsks;
     return [];
-  }, [activeDepthAsks, fallbackDepthAllowed, hasFullDepth, lastFullDepthSnapshot, shouldHoldPreviousFullDepth]);
+  }, [activeDepthAsks, fallbackDepthAllowed, hasFullDepth]);
   const depthBids = useMemo(() => {
     if (hasFullDepth) return activeDepthBids;
-    if (shouldHoldPreviousFullDepth) return lastFullDepthSnapshot?.bids || [];
     if (fallbackDepthAllowed) return activeDepthBids;
     return [];
-  }, [activeDepthBids, fallbackDepthAllowed, hasFullDepth, lastFullDepthSnapshot, shouldHoldPreviousFullDepth]);
+  }, [activeDepthBids, fallbackDepthAllowed, hasFullDepth]);
   const depthMode = hasFullDepth
     ? activeDepthMode
-    : shouldHoldPreviousFullDepth
-      ? 'FULL_DEPTH'
-      : fallbackDepthAllowed
-        ? activeDepthMode
-        : null;
+    : fallbackDepthAllowed
+      ? activeDepthMode
+      : null;
   const depthLoading = activeDepthLoading || shouldDelayFallbackDepth;
   const depthBestBid = maxPrice(activeDepthBids);
   const depthBestAsk = minPrice(activeDepthAsks);
-  const depthBestBidNumber = getPositivePrice(depthBestBid);
-  const depthBestAskNumber = getPositivePrice(depthBestAsk);
-  const liveMidPrice = depthBestBidNumber !== null && depthBestAskNumber !== null && depthBestAskNumber >= depthBestBidNumber
-    ? (depthBestBidNumber + depthBestAskNumber) / 2
-    : null;
 
   useEffect(() => {
     handleDepthBestPricesChange({
@@ -1185,72 +1068,14 @@ export function useContractMarketView({
     handleDepthSnapshotChange,
   ]);
 
-  useEffect(() => {
-    if (depthBestBidNumber !== null && depthBestAskNumber !== null && liveMidPrice !== null) {
-      setLiveDepthBbo({
-        bid: depthBestBidNumber,
-        ask: depthBestAskNumber,
-        mid: liveMidPrice,
-        source: 'LIVE_MID',
-        updatedAt: activeDepthUpdatedAt ?? Date.now(),
-      });
-      return;
-    }
-    setLiveDepthBbo(null);
-  }, [activeDepthUpdatedAt, depthBestAskNumber, depthBestBidNumber, liveMidPrice]);
-
-  const depthExpiredLastGoodQuote = isExpiredLastGoodBboQuote({
-    executable: activeDepthExecutable ?? undefined,
-    market_status: activeDepthMarketStatus || effectiveMarketStatus || undefined,
-    closed_market_execution_mode: activeDepthClosedMarketExecutionMode || undefined,
-    quote_freshness: activeDepthQuoteFreshness || undefined,
-    quote_source: activeDepthQuoteSource || undefined,
-    source: activeDepthSource || undefined,
-  });
-  const hasConfirmedDepthStatus = activeDepthExecutable !== null || depthExpiredLastGoodQuote;
-  const depthStatusLoading = activeDepthLoading && !hasConfirmedDepthStatus;
-  const ownDepthDisplayStatus = getContractQuoteDisplayStatus({
-    executable: activeDepthExecutable ?? undefined,
-    market_status: activeDepthMarketStatus || effectiveMarketStatus || undefined,
-    closed_market_execution_mode: activeDepthClosedMarketExecutionMode || undefined,
-    quote_freshness: activeDepthQuoteFreshness || undefined,
-    quote_source: activeDepthQuoteSource || undefined,
-    source: activeDepthSource || undefined,
-  }, {
-    loading: depthStatusLoading,
-  });
-  const quoteFallbackDisplayStatus = getContractQuoteDisplayStatus(quote, {
-    loading: quoteStatusLoading && !quote,
-  });
-  const shouldUseQuoteFallbackStatus = !hasConfirmedDepthStatus
-    && quoteFallbackDisplayStatus !== 'UNAVAILABLE';
-  const fallbackDepthDisplayStatus = shouldUseQuoteFallbackStatus
-    ? quoteFallbackDisplayStatus
-    : ownDepthDisplayStatus;
-  const depthStatus = marketUiState.status || (
-    displayPriceReady
-      ? (marketViewQuoteDisplayStatus || fallbackDepthDisplayStatus)
-      : 'LOADING'
-  );
-  const depthStatusLabel = marketUiState.label || (!displayPriceReady
-    ? t('marketDataLoadingLabel', 'contracts')
-    : rawMarketViewDisplayState && marketViewQuoteDisplayStatus
-    ? getMarketViewStatusLabel(rawMarketViewDisplayState, t)
-    : getContractQuoteStatusLabel(depthStatus, t));
+  const exposeMarketDepth = shouldExposeContractMarketDepth(marketViewAuthorityPresentation);
+  const authoritativeDepthAsks = exposeMarketDepth ? depthAsks : [];
+  const authoritativeDepthBids = exposeMarketDepth ? depthBids : [];
+  const depthStatus = marketUiState.status;
+  const depthStatusLabel = marketUiState.label;
 
   const contractKlineMode: ContractKlineMode = 'PROVIDER_KLINE';
   const derivedMarketState = useMemo<ContractMarketCenterState>(() => {
-    const liveBid = liveDepthMidFresh ? getPositivePrice(liveDepthBbo?.bid) : null;
-    const liveAsk = liveDepthMidFresh ? getPositivePrice(liveDepthBbo?.ask) : null;
-    const marketViewBid = getPositivePrice(marketView?.best_bid);
-    const marketViewAsk = getPositivePrice(marketView?.best_ask);
-    const quoteBid = getPositivePrice(quote?.best_bid ?? quote?.bid_price ?? quote?.bid);
-    const quoteAsk = getPositivePrice(quote?.best_ask ?? quote?.ask_price ?? quote?.ask);
-    const nextBestBid = liveBid ?? marketViewBid ?? getPositivePrice(quoteState.bestBid) ?? quoteBid;
-    const nextBestAsk = liveAsk ?? marketViewAsk ?? getPositivePrice(quoteState.bestAsk) ?? quoteAsk;
-    const nextSpread = nextBestBid !== null && nextBestAsk !== null && nextBestAsk >= nextBestBid
-      ? nextBestAsk - nextBestBid
-      : null;
     const quoteTime = parseContractMarketTimestamp(marketView?.quote_time);
 
     return {
@@ -1258,21 +1083,19 @@ export function useContractMarketView({
       displayPrice,
       displayPriceSource,
       displayPriceLabel,
-      bestBid: nextBestBid,
-      bestAsk: nextBestAsk,
-      spread: nextSpread,
-      executionBid: getPositivePrice(marketView?.execution_bid),
-      executionAsk: getPositivePrice(marketView?.execution_ask),
-      latestTradePrice: tradeTickPrice,
-      latestTradePriceSource: tradeTickPrice !== null ? 'TRADE_TICK' : null,
+      bestBid: marketViewAuthority.bestBid,
+      bestAsk: marketViewAuthority.bestAsk,
+      spread: marketViewAuthority.spread,
+      executionBid: marketViewAuthority.executionBid,
+      executionAsk: marketViewAuthority.executionAsk,
+      latestTradePrice: latestTradeTickPrice,
+      latestTradePriceSource: latestTradeTickPrice !== null ? 'TRADE_TICK' : null,
       klineMode: contractKlineMode,
       klineCurrentCandle: marketView?.kline_current_candle ?? null,
-      quoteFreshness,
-      displayState: rawMarketViewDisplayState || marketSessionType || marketStatus || null,
-      executable: marketView?.executable ?? quote?.executable ?? null,
-      updatedAt: liveDepthMidFresh && liveDepthBbo
-        ? liveDepthBbo.updatedAt
-        : quoteTime,
+      quoteFreshness: marketView?.ticker_freshness ?? null,
+      displayState: marketViewAuthority.displayState,
+      executable: marketViewAuthority.executable,
+      updatedAt: quoteTime,
     };
   }, [
     contractKlineMode,
@@ -1280,77 +1103,14 @@ export function useContractMarketView({
     displayPrice,
     displayPriceLabel,
     displayPriceSource,
-    liveDepthBbo,
-    liveDepthMidFresh,
-    marketSessionType,
-    marketStatus,
+    latestTradeTickPrice,
     marketView,
-    quote,
-    quoteFreshness,
-    quoteState.bestAsk,
-    quoteState.bestBid,
-    rawMarketViewDisplayState,
-    tradeTickPrice,
+    marketViewAuthority,
   ]);
 
   const handleLatestKlineCloseChange = useCallback((value: string | null) => {
-    const nextPrice = getPositivePrice(value);
-    setLocalChartLastClose(nextPrice === null ? null : String(nextPrice));
+    void value;
   }, []);
-
-  const handleLastTradePriceChange = useCallback((
-    value: string,
-    source?: string | null,
-    trade?: ContractMarketTrade,
-  ) => {
-    const normalizedSource = String(source || trade?.price_source || '').trim().toUpperCase();
-    const nextPrice = getPositivePrice(value);
-    if (normalizedSource !== 'TRADE_TICK' || nextPrice === null) {
-      setLastTradePrice(null);
-      return;
-    }
-    setLastTradePrice(String(nextPrice));
-  }, []);
-
-  const handleLiveBboChange = useCallback((payload: LiveDepthBbo) => {
-    const bid = getPositivePrice(payload.bid);
-    const ask = getPositivePrice(payload.ask);
-    const mid = getPositivePrice(payload.mid);
-    if (payload.source !== 'LIVE_MID' || bid === null || ask === null || mid === null || ask < bid) {
-      setLiveDepthBbo(null);
-      return;
-    }
-    setLiveDepthBbo({
-      bid,
-      ask,
-      mid,
-      source: 'LIVE_MID',
-      updatedAt: payload.updatedAt,
-    });
-  }, []);
-
-  useEffect(() => {
-    const source = String(marketView?.current_price_source || marketView?.display_price_source || '').trim().toUpperCase();
-    const price = marketView?.last_trade_price || null;
-    const nextPrice = getPositivePrice(price);
-    if (source === 'TRADE_TICK' && nextPrice !== null) {
-      setLastTradePrice(String(nextPrice));
-    } else {
-      setLastTradePrice(null);
-    }
-  }, [marketView]);
-
-  useEffect(() => {
-    if (!liveDepthBbo || liveDepthBbo.mid === null) return undefined;
-    const age = Date.now() - liveDepthBbo.updatedAt;
-    const delay = Math.max(0, LIVE_DEPTH_BBO_TTL_MS - age) + 50;
-    const timer = window.setTimeout(() => {
-      setLiveDepthBbo((current) => (
-        current?.updatedAt === liveDepthBbo.updatedAt ? null : current
-      ));
-    }, delay);
-    return () => window.clearTimeout(timer);
-  }, [liveDepthBbo]);
 
   useEffect(() => {
     const nextPrice = displayPrice;
@@ -1371,7 +1131,7 @@ export function useContractMarketView({
 
   useEffect(() => {
     const previousState = previousMarketViewDisplayStateRef.current;
-    const currentState = rawMarketViewDisplayState || marketSessionType || marketStatus || null;
+    const currentState = rawMarketViewDisplayState;
     if (
       previousState
       && isNonTradingMarketState(previousState)
@@ -1380,38 +1140,24 @@ export function useContractMarketView({
       setMarketSessionRefreshKey((value) => value + 1);
     }
     previousMarketViewDisplayStateRef.current = currentState;
-  }, [marketSessionType, marketStatus, rawMarketViewDisplayState]);
+  }, [rawMarketViewDisplayState]);
 
   const marketStateBestBid = derivedMarketState.bestBid === null ? null : String(derivedMarketState.bestBid);
   const marketStateBestAsk = derivedMarketState.bestAsk === null ? null : String(derivedMarketState.bestAsk);
   const quoteStatusLabel = marketUiState.label;
   const quoteStatusTone = getContractQuoteStatusTone(marketUiState.status);
-  const expiredLastGoodQuote = isExpiredLastGoodBboQuote(quote);
-  const tickerSource = marketView?.ticker_source ?? quote?.quote_source ?? quote?.source ?? null;
-  const tickerFreshness = marketView?.ticker_freshness ?? quoteFreshness;
+  const tickerSource = marketView?.ticker_source ?? null;
+  const tickerFreshness = marketView?.ticker_freshness ?? null;
   const marketViewDepthSource = marketView?.depth_source ?? null;
   const marketViewDepthFreshness = marketView?.depth_freshness ?? null;
   const marketViewTradesSource = marketView?.trades_source ?? null;
   const marketViewTradesFreshness = marketView?.trades_freshness ?? null;
   const klineSource = marketView?.kline_source ?? marketView?.kline_current_candle?.kline_mode ?? null;
   const klineFreshness = marketView?.kline_freshness ?? null;
-  const preferMarketViewDomainSemantics = marketView?.executable === false
-    || marketView?.market_status === 'CLOSED'
-    || marketView?.market_status === 'HOLIDAY';
-  const resolvedDepthSource = preferMarketViewDomainSemantics
-    ? marketViewDepthSource
-    : activeDepthSource ?? marketViewDepthSource;
-  const resolvedDepthFreshness = preferMarketViewDomainSemantics
-    ? marketViewDepthFreshness
-    : activeDepthQuoteFreshness ?? marketViewDepthFreshness;
-  const activeTradesSource = tradesBelongToCurrentSymbol ? tradesState.source : null;
-  const activeTradesFreshness = tradesBelongToCurrentSymbol ? tradesState.freshness : null;
-  const resolvedTradesSource = preferMarketViewDomainSemantics
-    ? marketViewTradesSource
-    : activeTradesSource ?? marketViewTradesSource;
-  const resolvedTradesFreshness = preferMarketViewDomainSemantics
-    ? marketViewTradesFreshness
-    : activeTradesFreshness ?? marketViewTradesFreshness;
+  const resolvedDepthSource = marketViewDepthSource;
+  const resolvedDepthFreshness = marketViewDepthFreshness;
+  const resolvedTradesSource = marketViewTradesSource;
+  const resolvedTradesFreshness = marketViewTradesFreshness;
   const tickerSourceLabel = getContractMarketSourceLabel(tickerSource, tickerFreshness, t);
   const depthSourceLabel = getContractMarketSourceLabel(resolvedDepthSource, resolvedDepthFreshness, t);
   const tradesSourceLabel = getContractMarketSourceLabel(resolvedTradesSource, resolvedTradesFreshness, t);
@@ -1426,8 +1172,8 @@ export function useContractMarketView({
     displayState: rawMarketViewDisplayState,
     displayPriceSource,
     displayPriceLabel,
-    depthBids,
-    depthAsks,
+    depthBids: authoritativeDepthBids,
+    depthAsks: authoritativeDepthAsks,
     depthLoading,
     depthError: depthBelongsToCurrentSymbol ? depthState.error : null,
     tickerSource,
@@ -1442,7 +1188,6 @@ export function useContractMarketView({
     depthMode,
     depthStatus,
     depthStatusLabel,
-    liveMidPrice,
     recentTrades,
     tradesLoading: tradesBelongToCurrentSymbol ? tradesState.loading : true,
     tradesError: tradesBelongToCurrentSymbol ? tradesState.error : null,
@@ -1460,11 +1205,11 @@ export function useContractMarketView({
     bestBid: derivedMarketState.bestBid,
     bestAsk: derivedMarketState.bestAsk,
     spread: derivedMarketState.spread,
-    executable: derivedMarketState.executable,
-    executionBid: derivedMarketState.executionBid,
-    executionAsk: derivedMarketState.executionAsk,
+    executable: marketViewAuthority.executable,
+    executionBid: marketViewAuthority.executionBid,
+    executionAsk: marketViewAuthority.executionAsk,
     executionMode: marketView?.execution_mode ?? null,
-    reasonCode: marketView?.reason_code ?? null,
+    reasonCode: marketViewAuthority.reasonCode,
     warnings: marketView?.warnings ?? [],
     rawSourceSummary: marketView?.raw_source_summary ?? {},
     quote,
@@ -1474,20 +1219,17 @@ export function useContractMarketView({
     marketStateBestBid,
     marketStateBestAsk,
     marketUiState,
-    marketStatus: marketView?.market_status ?? effectiveMarketStatus,
+    marketStatus: marketView?.market_status ?? null,
     marketStatusText,
-    quoteFreshness,
+    quoteFreshness: marketView?.ticker_freshness ?? null,
     marketSessionType,
     quoteStatusLoading,
     quoteStatusLabel,
     quoteStatusTone,
-    quoteDisplayStatus,
+    quoteDisplayStatus: marketUiState.status,
     currentPriceReady: displayPrice !== null,
     priceDirection,
     marketSessionRefreshKey,
-    expiredLastGoodQuote,
     handleLatestKlineCloseChange,
-    handleLastTradePriceChange,
-    handleLiveBboChange,
   };
 }

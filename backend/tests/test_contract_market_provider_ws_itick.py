@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import types
@@ -369,6 +370,10 @@ def test_okx_kline_channel_and_normalizer_still_work():
 def _load_gateway_module(provider_payload):
     if str(BACKEND) not in sys.path:
         sys.path.insert(0, str(BACKEND))
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     config_module = types.ModuleType("app.core.config")
 
@@ -505,6 +510,112 @@ def test_gateway_snapshot_preserves_monthly_interval():
     assert set(payload["data"]["klines"]) == {"1M"}
 
 
+def test_gateway_domain_snapshots_keep_market_and_kline_payloads_separate():
+    module = _load_gateway_module(None)
+    gateway = module.ContractMarketGateway()
+    symbol = "BTCUSDT_PERP"
+    state = {"symbol": symbol, "display_price": "100"}
+    kline = {"symbol": symbol, "interval": "1M", "close": "101"}
+
+    gateway._set_latest(module.CONTRACT_MARKET_CACHE_QUOTE, symbol, {"symbol": symbol})
+    gateway._set_latest(module.CONTRACT_MARKET_CACHE_DEPTH, symbol, {"symbol": symbol})
+    gateway._set_latest(module.CONTRACT_MARKET_CACHE_TRADES, symbol, [{"price": "100"}])
+    gateway._set_latest(module.CONTRACT_MARKET_CACHE_STATE, symbol, state)
+    gateway._set_latest(module.CONTRACT_MARKET_CACHE_KLINE, symbol, kline, interval="1M")
+
+    market_payload = gateway.market_snapshot_message(symbol)
+    assert market_payload["domain"] == "market"
+    assert set(market_payload["data"]) == {"quote", "depth", "trades", "market_state", "status"}
+    assert "klines" not in market_payload["data"]
+
+    kline_payload = gateway.kline_snapshot_message(symbol, "1M")
+    assert kline_payload["domain"] == "kline"
+    assert kline_payload["interval"] == "1M"
+    assert kline_payload["kline"] == kline
+    assert "quote" not in kline_payload
+    assert "depth" not in kline_payload
+    assert "market_state" not in kline_payload
+
+
+def test_gateway_kline_snapshot_does_not_refresh_market_domain():
+    module = _load_gateway_module(None)
+    gateway = module.ContractMarketGateway()
+    symbol = "BTCUSDT_PERP"
+
+    def fail_market_refresh(*_args, **_kwargs):
+        raise AssertionError("kline snapshot must not refresh the market domain")
+
+    def seed_kline(request_symbol, interval, *_args, **_kwargs):
+        kline = {"symbol": request_symbol, "interval": interval, "close": "100"}
+        gateway._set_latest(module.CONTRACT_MARKET_CACHE_KLINE, request_symbol, kline, interval=interval)
+        return kline
+
+    gateway._refresh_market_once = fail_market_refresh
+    gateway._refresh_kline_once = seed_kline
+
+    payload = asyncio.run(gateway.kline_snapshot(symbol, "1M"))
+
+    assert payload["domain"] == "kline"
+    assert payload["interval"] == "1M"
+    assert payload["kline"]["close"] == "100"
+
+
+def test_gateway_market_state_cache_is_symbol_scoped():
+    module = _load_gateway_module(None)
+    gateway = module.ContractMarketGateway()
+    symbol = "BTCUSDT_PERP"
+    state = {"symbol": symbol, "display_price": "100"}
+
+    gateway._set_latest(module.CONTRACT_MARKET_CACHE_STATE, symbol, state)
+
+    monthly = gateway.snapshot_message(symbol, "1M")["data"]["market_state"]
+    five_minutes = gateway.snapshot_message(symbol, "5m")["data"]["market_state"]
+    state_message = gateway._state_message(symbol, state)
+
+    assert monthly == state
+    assert five_minutes == state
+    assert state_message["domain"] == "market"
+    assert "interval" not in state_message
+    assert "kline_current_candle" not in state_message["data"]
+
+
+def test_gateway_market_state_builder_ignores_kline_domain_cache():
+    module = _load_gateway_module(None)
+    gateway = module.ContractMarketGateway()
+    symbol = "AAPLUSDT_PERP"
+    captured = {}
+
+    class MarketViewModelStub:
+        def __init__(self, **payload):
+            self.payload = payload
+
+        def model_dump(self):
+            return dict(self.payload)
+
+    def build_market_view_stub(_symbol, **kwargs):
+        captured.update(kwargs)
+        return {
+            "symbol": symbol,
+            "display_price": "100",
+            "kline_current_candle": {"close": "999"},
+        }
+
+    module.ContractMarketViewDetail = MarketViewModelStub
+    module.build_contract_market_view = build_market_view_stub
+    gateway._set_latest(module.CONTRACT_MARKET_CACHE_QUOTE, symbol, {"symbol": symbol})
+    gateway._set_latest(
+        module.CONTRACT_MARKET_CACHE_KLINE,
+        symbol,
+        {"symbol": symbol, "interval": "1M", "close": "999"},
+        interval="1M",
+    )
+
+    state = gateway._build_market_state_from_latest(symbol)
+
+    assert captured["latest_kline"] is None
+    assert state == {"symbol": symbol, "display_price": "100"}
+
+
 if __name__ == "__main__":
     test_itick_quote_subscription_symbol_by_category()
     test_itick_ticker_normalizer_uses_quote_fields_and_live_source()
@@ -519,3 +630,7 @@ if __name__ == "__main__":
     test_gateway_kline_prefers_provider_ws_and_delegates_provider_specific_max_age()
     test_gateway_kline_falls_back_to_rest_when_provider_ws_missing()
     test_gateway_snapshot_preserves_monthly_interval()
+    test_gateway_domain_snapshots_keep_market_and_kline_payloads_separate()
+    test_gateway_kline_snapshot_does_not_refresh_market_domain()
+    test_gateway_market_state_cache_is_symbol_scoped()
+    test_gateway_market_state_builder_ignores_kline_domain_cache()

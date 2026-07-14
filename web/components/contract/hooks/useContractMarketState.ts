@@ -18,9 +18,15 @@ import {
 } from '@/lib/contractMarketCache';
 import {
   contractMarketRealtime,
+  isContractMarketDomainMessage,
   type ContractMarketRealtimeMessage,
   type ContractMarketRealtimeStatus,
 } from '@/lib/realtime/contractMarketRealtime';
+import {
+  activateContractMarketShadowSymbol,
+  hydrateContractMarketRestDomain,
+  ingestContractMarketWsDomain,
+} from './contractMarketStoreAdapter';
 
 export type PriceDirection = 'up' | 'down' | 'flat';
 
@@ -40,7 +46,6 @@ type ContractDepthSnapshot = {
 
 type UseContractMarketStateParams = {
   contractSymbol: string;
-  interval?: string;
   symbolOptionMarketSymbol?: string | null;
   symbolOptionPricePrecision?: number | null;
 };
@@ -167,7 +172,6 @@ function isContractSymbolConfigMissing(message: string | null) {
 
 export function useContractMarketState({
   contractSymbol,
-  interval = '1m',
   symbolOptionMarketSymbol,
   symbolOptionPricePrecision,
 }: UseContractMarketStateParams) {
@@ -265,6 +269,10 @@ export function useContractMarketState({
   const quoteHint = contractConfigMissing ? t('contractSymbolConfigMissing', 'contracts') : null;
   const initialDepth = hasHydrated ? readContractDepthCache(contractSymbol) || undefined : undefined;
 
+  useEffect(() => {
+    activateContractMarketShadowSymbol(contractSymbol);
+  }, [contractSymbol]);
+
   const refreshContractQuote = useCallback(async () => {
     if (quoteLoadedSymbolRef.current !== contractSymbol) {
       setContractQuoteLoading(true);
@@ -272,6 +280,12 @@ export function useContractMarketState({
     try {
       const nextQuote = await loadContractQuote(contractSymbol);
       const nextPrice = getQuoteTradePrice(nextQuote);
+      hydrateContractMarketRestDomain({
+        symbol: contractSymbol,
+        domain: 'ticker',
+        data: nextQuote,
+        metadata: nextQuote,
+      });
       applyLatestPrice(nextPrice);
       contractQuoteRef.current = nextQuote;
       quoteLoadedSymbolRef.current = contractSymbol;
@@ -342,19 +356,14 @@ export function useContractMarketState({
   }, [contractSymbol]);
 
   useEffect(() => {
-    contractMarketRealtime.setSession({ symbol: contractSymbol, interval });
-  }, [contractSymbol, interval]);
+    return contractMarketRealtime.setMarketSession(contractSymbol);
+  }, [contractSymbol]);
 
   useEffect(() => contractMarketRealtime.subscribeStatus(setMarketRealtimeStatus), []);
 
   useEffect(() => {
-    return () => {
-      contractMarketRealtime.disconnect();
-    };
-  }, []);
-
-  useEffect(() => {
     const handleQuoteMessage = (message: ContractMarketRealtimeMessage) => {
+      if (!isContractMarketDomainMessage(message)) return;
       const msgSymbol = getRealtimeMessageSymbol(message);
       if (msgSymbol && msgSymbol !== contractSymbol) return;
 
@@ -380,6 +389,11 @@ export function useContractMarketState({
       };
 
       const nextPrice = getQuoteTradePrice(mergedQuote);
+      ingestContractMarketWsDomain({
+        domain: 'ticker',
+        message,
+        data: mergedQuote,
+      });
       applyLatestPrice(nextPrice);
       contractQuoteRef.current = mergedQuote;
       quoteLoadedSymbolRef.current = contractSymbol;

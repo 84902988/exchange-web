@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
@@ -7,16 +8,16 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from app.db.models.contract_symbol import ContractSymbol
+from app.schemas.contract_market_domain_snapshot import (
+    ContractMarketDomainName,
+    ContractMarketDomainSnapshot,
+)
 from app.services.contract_market_guard import (
     QUOTE_FRESHNESS_LIVE,
     QUOTE_SOURCE_LAST_GOOD_BBO,
 )
 from app.services.contract_market_service import (
     ContractSymbolNotFound,
-    get_contract_depth,
-    get_contract_klines,
-    get_contract_quote,
-    get_contract_recent_trades,
 )
 from app.services.contract_trading_session_resolver import (
     SESSION_AFTER_HOURS,
@@ -666,6 +667,9 @@ def build_contract_market_view(
     latest_kline_close = _latest_kline_close(latest_kline)
     latest_trade_price = _latest_trade_price(latest_trade)
     latest_trade_time = _latest_trade_time(latest_trade)
+    mark_price = _first_payload_decimal(quote, key="mark_price")
+    index_price = _first_payload_decimal(quote, key="index_price")
+    reference_price_source = _payload_source_or_none(quote)
     bbo_freshness = _payload_freshness(bbo_payload)
     quote_freshness = _payload_freshness(quote)
     raw_executable = _raw_executable(quote, depth)
@@ -798,6 +802,9 @@ def build_contract_market_view(
     return {
         "symbol": normalized_symbol,
         "display_symbol": _display_symbol(normalized_symbol, contract_symbol),
+        "view_version": "2",
+        "authority_source": "LEGACY_COMPAT",
+        "snapshot_authority": False,
         "market_type": MARKET_TYPE_CONTRACT,
         "category": category,
         "market_status": market_status,
@@ -805,6 +812,10 @@ def build_contract_market_view(
         "display_price": _format_decimal(display_price),
         "display_price_source": display_price_source,
         "current_price_source": current_price_source,
+        "mark_price": _format_decimal(mark_price),
+        "mark_price_source": reference_price_source,
+        "index_price": _format_decimal(index_price),
+        "index_price_source": reference_price_source,
         "ticker_source": ticker_source,
         "ticker_freshness": ticker_freshness,
         "depth_source": depth_source,
@@ -833,6 +844,11 @@ def build_contract_market_view(
         "reason_code": reason_code,
         "warnings": source_warnings,
         "kline_current_candle": kline_current_candle,
+        "ticker": deepcopy(quote) if isinstance(quote, dict) else None,
+        "depth": deepcopy(depth) if isinstance(depth, dict) else None,
+        "trades": [deepcopy(latest_trade)] if isinstance(latest_trade, dict) else [],
+        "kline": deepcopy(latest_kline) if isinstance(latest_kline, dict) else None,
+        "snapshot_metadata": {},
         "raw_source_summary": _raw_source_summary(
             quote=quote,
             depth=depth,
@@ -846,6 +862,209 @@ def build_contract_market_view(
     }
 
 
+def _snapshot_domain_payload(
+    snapshot: Optional[ContractMarketDomainSnapshot[Any]],
+    *,
+    expected_domain: ContractMarketDomainName,
+    symbol: str,
+    warnings: list[str],
+    now: datetime,
+) -> Any:
+    domain_name = expected_domain.value
+    if snapshot is None:
+        _append_warning_once(warnings, f"{domain_name}_snapshot_missing")
+        return None
+    metadata = snapshot.metadata
+    if metadata.domain != expected_domain or _normalized(metadata.symbol) != symbol:
+        _append_warning_once(warnings, f"{domain_name}_snapshot_identity_mismatch")
+        return None
+    observed_at_ms = next(
+        (
+            value
+            for value in (
+                metadata.received_at_ms,
+                metadata.cache_updated_at_ms,
+                metadata.db_updated_at_ms,
+            )
+            if value is not None
+        ),
+        None,
+    )
+    dynamically_stale = bool(
+        metadata.stale
+        or (
+            observed_at_ms is not None
+            and metadata.ttl_ms is not None
+            and int(now.timestamp() * 1000) - observed_at_ms > metadata.ttl_ms
+        )
+    )
+    if dynamically_stale:
+        _append_warning_once(warnings, f"{domain_name}_snapshot_stale")
+    completeness = metadata.completeness.status.value.lower()
+    if completeness != "complete":
+        _append_warning_once(
+            warnings,
+            f"{domain_name}_snapshot_{completeness}",
+        )
+    payload = deepcopy(snapshot.data)
+    if isinstance(payload, dict):
+        payload.setdefault("source", metadata.source.value)
+        payload.setdefault("quote_source", metadata.source.value)
+        payload.setdefault("freshness", metadata.freshness.value)
+        payload.setdefault("quote_freshness", metadata.freshness.value)
+        if dynamically_stale:
+            payload["freshness"] = "STALE"
+            payload["quote_freshness"] = "STALE"
+            if expected_domain in {
+                ContractMarketDomainName.TICKER,
+                ContractMarketDomainName.DEPTH,
+            }:
+                payload["executable"] = False
+        if metadata.provider is not None:
+            payload.setdefault("provider", metadata.provider)
+        if metadata.provider_symbol is not None:
+            payload.setdefault("provider_symbol", metadata.provider_symbol)
+    return payload
+
+
+def _trades_from_snapshot_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [deepcopy(item) for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("trades", "items", "rows"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                return [deepcopy(item) for item in values if isinstance(item, dict)]
+        if payload.get("price") is not None:
+            return [deepcopy(payload)]
+    return []
+
+
+def _latest_kline_from_snapshot_payload(payload: Any) -> Optional[dict[str, Any]]:
+    if isinstance(payload, list):
+        rows = [item for item in payload if isinstance(item, dict)]
+        return deepcopy(rows[-1]) if rows else None
+    if isinstance(payload, dict):
+        for key in ("items", "klines", "rows"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                rows = [item for item in values if isinstance(item, dict)]
+                return deepcopy(rows[-1]) if rows else None
+        return deepcopy(payload)
+    return None
+
+
+def _snapshot_metadata_payload(
+    snapshots: dict[str, Optional[ContractMarketDomainSnapshot[Any]]],
+) -> dict[str, Any]:
+    return {
+        domain: snapshot.metadata.model_dump(mode="json")
+        for domain, snapshot in snapshots.items()
+        if snapshot is not None
+    }
+
+
+def build_contract_market_view_v2(
+    symbol: str,
+    *,
+    ticker_snapshot: Optional[ContractMarketDomainSnapshot[Any]],
+    depth_snapshot: Optional[ContractMarketDomainSnapshot[Any]],
+    trades_snapshot: Optional[ContractMarketDomainSnapshot[Any]],
+    kline_snapshot: Optional[ContractMarketDomainSnapshot[Any]],
+    contract_symbol: Any = None,
+    interval: str = DEFAULT_KLINE_INTERVAL,
+    warnings: Optional[list[str]] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Build public Contract MarketView exclusively from accepted snapshots."""
+
+    normalized_symbol = _normalized(symbol)
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    else:
+        now_dt = now_dt.astimezone(timezone.utc)
+    source_warnings = list(warnings or [])
+    ticker = _snapshot_domain_payload(
+        ticker_snapshot,
+        expected_domain=ContractMarketDomainName.TICKER,
+        symbol=normalized_symbol,
+        warnings=source_warnings,
+        now=now_dt,
+    )
+    depth = _snapshot_domain_payload(
+        depth_snapshot,
+        expected_domain=ContractMarketDomainName.DEPTH,
+        symbol=normalized_symbol,
+        warnings=source_warnings,
+        now=now_dt,
+    )
+    trades_payload = _snapshot_domain_payload(
+        trades_snapshot,
+        expected_domain=ContractMarketDomainName.TRADES,
+        symbol=normalized_symbol,
+        warnings=source_warnings,
+        now=now_dt,
+    )
+    kline_payload = _snapshot_domain_payload(
+        kline_snapshot,
+        expected_domain=ContractMarketDomainName.KLINE,
+        symbol=normalized_symbol,
+        warnings=source_warnings,
+        now=now_dt,
+    )
+    trades = _trades_from_snapshot_payload(trades_payload)
+    latest_trade = trades[0] if trades else None
+    latest_kline = _latest_kline_from_snapshot_payload(kline_payload)
+    view = build_contract_market_view(
+        normalized_symbol,
+        quote=ticker if isinstance(ticker, dict) else None,
+        depth=depth if isinstance(depth, dict) else None,
+        latest_kline=latest_kline,
+        latest_trade=latest_trade,
+        contract_symbol=contract_symbol,
+        interval=interval,
+        warnings=source_warnings,
+        now=now_dt,
+        mutate_quote_driven_state=False,
+    )
+    snapshots = {
+        "ticker": ticker_snapshot,
+        "depth": depth_snapshot,
+        "trades": trades_snapshot,
+        "kline": kline_snapshot,
+    }
+    view.update(
+        {
+            "view_version": "2",
+            "authority_source": "SNAPSHOT_AUTHORITY",
+            "snapshot_authority": True,
+            "ticker": ticker if isinstance(ticker, dict) else None,
+            "depth": depth if isinstance(depth, dict) else None,
+            "trades": trades,
+            "kline": latest_kline,
+            "snapshot_metadata": _snapshot_metadata_payload(snapshots),
+        }
+    )
+    return view
+
+
+def get_contract_market_snapshot_authority(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from app.services.contract_market_service import (
+        get_contract_market_snapshot_authority as load_snapshot_authority,
+    )
+
+    return load_snapshot_authority(*args, **kwargs)
+
+
+def get_contract_market_view_legacy_inputs(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from app.services.contract_market_service import (
+        get_contract_market_view_legacy_inputs as load_legacy_inputs,
+    )
+
+    return load_legacy_inputs(*args, **kwargs)
+
+
 def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
     normalized_symbol = _normalized(symbol)
     contract_symbol = (
@@ -853,68 +1072,43 @@ def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
         .filter(ContractSymbol.symbol == normalized_symbol)
         .first()
     )
-    quote: Optional[dict[str, Any]] = None
-    depth: Optional[dict[str, Any]] = None
-    latest_kline: Optional[dict[str, Any]] = None
-    latest_trade: Optional[dict[str, Any]] = None
-    warnings: list[str] = []
-
-    try:
-        quote = get_contract_quote(db, normalized_symbol, log_context="contract_market_view_quote")
-    except ContractSymbolNotFound:
-        if contract_symbol is None:
-            raise
-        warnings.append("quote_unavailable")
-    except Exception as exc:
-        warnings.append(f"quote_unavailable:{type(exc).__name__}")
-
-    try:
-        depth = get_contract_depth(db, normalized_symbol, limit=5)
-    except ContractSymbolNotFound:
-        if contract_symbol is None and quote is None:
-            raise
-        warnings.append("depth_unavailable")
-    except Exception as exc:
-        warnings.append(f"depth_unavailable:{type(exc).__name__}")
-
-    try:
-        recent_trades = get_contract_recent_trades(db, normalized_symbol, limit=1)
-        first_trade = recent_trades[0] if recent_trades else None
-        if isinstance(first_trade, dict) and _normalized(first_trade.get("price_source")) == DISPLAY_PRICE_SOURCE_TRADE_TICK:
-            latest_trade = first_trade
-    except Exception as exc:
-        warnings.append(f"trade_tick_unavailable:{type(exc).__name__}")
-
-    should_load_current_kline = (
-        _contract_category(contract_symbol, quote, depth) in _TRADFI_CATEGORIES
-        and not _is_crypto_contract(contract_symbol, quote, depth)
-    )
-    if should_load_current_kline or _should_load_latest_kline_for_last_good_check(
-        quote=quote,
-        depth=depth,
-        contract_symbol=contract_symbol,
-    ):
-        try:
-            rows = get_contract_klines(db, symbol=normalized_symbol, interval="1m", limit=1)
-            latest_kline = rows[-1] if rows else None
-        except Exception as exc:
-            warnings.append(f"kline_unavailable:{type(exc).__name__}")
-
-    return build_contract_market_view(
+    authority = get_contract_market_snapshot_authority(
         normalized_symbol,
-        quote=quote,
-        depth=depth,
-        latest_kline=latest_kline,
-        latest_trade=latest_trade,
+        interval=DEFAULT_KLINE_INTERVAL,
+    )
+    snapshots = (
+        authority.get("ticker"),
+        authority.get("depth"),
+        authority.get("trades"),
+        authority.get("kline"),
+    )
+    if contract_symbol is None and not any(snapshot is not None for snapshot in snapshots):
+        raise ContractSymbolNotFound(f"contract symbol {normalized_symbol} not found")
+    return build_contract_market_view_v2(
+        normalized_symbol,
+        ticker_snapshot=authority.get("ticker"),
+        depth_snapshot=authority.get("depth"),
+        trades_snapshot=authority.get("trades"),
+        kline_snapshot=authority.get("kline"),
         contract_symbol=contract_symbol,
         interval=DEFAULT_KLINE_INTERVAL,
-        warnings=warnings,
-        mutate_quote_driven_state=False,
+        warnings=authority.get("warnings") or [],
     )
 
 
 def get_contract_execution_view(db: Session, symbol: str) -> dict[str, Any]:
-    view = get_contract_market_view(db, symbol)
+    legacy_inputs = get_contract_market_view_legacy_inputs(db, symbol)
+    view = build_contract_market_view(
+        legacy_inputs["symbol"],
+        quote=legacy_inputs.get("quote"),
+        depth=legacy_inputs.get("depth"),
+        latest_kline=legacy_inputs.get("latest_kline"),
+        latest_trade=legacy_inputs.get("latest_trade"),
+        contract_symbol=legacy_inputs.get("contract_symbol"),
+        interval=DEFAULT_KLINE_INTERVAL,
+        warnings=legacy_inputs.get("warnings") or [],
+        mutate_quote_driven_state=False,
+    )
     keys = (
         "symbol",
         "executable",

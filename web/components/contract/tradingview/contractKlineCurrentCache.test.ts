@@ -296,3 +296,38 @@ test('FIFO capacity stays at 64 and evicts the earliest written key', () => {
   cache.clear();
   assert.equal(cache.size, 0);
 });
+
+test('getAtLeast reuses the smallest fresh entry that covers the requested limit', () => {
+  let now = 0;
+  const cache = new cacheModule.ContractKlineCurrentCache({ now: () => now });
+  const scope = { category: 'CRYPTO', symbol: 'BTCUSDT_PERP', interval: '1m' };
+  const baseItem = response().items[0];
+  assert.equal(cache.set({ ...scope, limit: 150 }, response({
+    items: Array.from({ length: 150 }, (_, index) => ({
+      ...baseItem,
+      open_time: Number(baseItem.open_time) + index * 60_000,
+    })),
+  }), 5_000), true);
+  assert.equal(cache.set({ ...scope, limit: 300 }, response({
+    items: Array.from({ length: 300 }, (_, index) => ({
+      ...baseItem,
+      open_time: Number(baseItem.open_time) + index * 60_000,
+      close: '300',
+    })),
+  }), 10_000), true);
+
+  assert.equal(cache.getAtLeast({ ...scope, limit: 100 }).items[0].close, '105');
+  assert.equal(cache.getAtLeast({ ...scope, limit: 200 }).items[0].close, '300');
+  assert.equal(cache.getAtLeast({ ...scope, limit: 301 }), null);
+
+  now = 5_000;
+  assert.equal(cache.getAtLeast({ ...scope, limit: 100 }).items[0].close, '300');
+});
+
+test('getAtLeast does not treat a partial response as its larger requested limit', () => {
+  const cache = new cacheModule.ContractKlineCurrentCache();
+  const scope = { category: 'CRYPTO', symbol: 'PARTIAL_PERP', interval: '1m' };
+  assert.equal(cache.set({ ...scope, limit: 150 }, response(), 5_000), true);
+  assert.equal(cache.getAtLeast({ ...scope, limit: 150 }), null);
+  assert.ok(cache.get({ ...scope, limit: 150 }));
+});

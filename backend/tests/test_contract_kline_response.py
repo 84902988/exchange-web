@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.encoders import jsonable_encoder
 
 from app.schemas.response import ok
+from app.schemas.contract_market import ContractKlineHistoryMetadataResponse
 from app.services.contract_kline_response import (
     ContractKlineResult,
     build_contract_kline_metadata,
@@ -60,6 +61,10 @@ def test_metadata_response_for_normal_provider_data() -> None:
         "history_incomplete": False,
         "history_complete": None,
         "has_more_before": None,
+        "history_terminal": None,
+        "terminal_reason": None,
+        "earliest_available_time": None,
+        "coverage_complete": None,
         "provider_error_code": None,
         "retryable": False,
     }
@@ -80,6 +85,8 @@ def test_metadata_response_preserves_db_cache_hit() -> None:
     assert payload["stale"] is False
     assert payload["history_complete"] is False
     assert payload["has_more_before"] is None
+    assert payload["history_terminal"] is False
+    assert payload["coverage_complete"] is None
 
 
 def test_metadata_response_preserves_stale_fallback() -> None:
@@ -121,6 +128,10 @@ def test_metadata_response_marks_transient_provider_error_retryable() -> None:
         assert payload["retryable"] is True
         assert payload["history_complete"] is False
         assert payload["has_more_before"] is None
+        assert payload["history_terminal"] is False
+        assert payload["terminal_reason"] is None
+        assert payload["earliest_available_time"] is None
+        assert payload["coverage_complete"] is False
 
 
 def test_transient_error_factory_classifies_all_retryable_error_families() -> None:
@@ -162,6 +173,8 @@ def test_metadata_response_does_not_treat_unavailable_empty_code_as_terminal() -
     assert payload["history_incomplete"] is True
     assert payload["history_complete"] is False
     assert payload["has_more_before"] is None
+    assert payload["history_terminal"] is False
+    assert payload["coverage_complete"] is False
 
     legacy_unknown = build_contract_kline_metadata(
         [],
@@ -188,6 +201,10 @@ def test_provider_empty_history_remains_unknown_and_retryable() -> None:
     assert payload["history_incomplete"] is True
     assert payload["history_complete"] is False
     assert payload["has_more_before"] is None
+    assert payload["history_terminal"] is False
+    assert payload["terminal_reason"] is None
+    assert payload["earliest_available_time"] is None
+    assert payload["coverage_complete"] is False
 
     current_payload = build_contract_kline_metadata(
         contract_kline_provider_result([], end_time_ms=None),
@@ -217,6 +234,89 @@ def test_metadata_response_keeps_partial_history_open() -> None:
     assert payload["history_incomplete"] is True
     assert payload["history_complete"] is False
     assert payload["has_more_before"] is None
+
+
+def test_terminal_history_preserves_spot_aligned_evidence() -> None:
+    result = ContractKlineResult(
+        [],
+        origin="EMPTY",
+        cache_status="HISTORY_BOUNDARY",
+        history_terminal=True,
+        terminal_reason="PROVIDER_HISTORY_BOUNDARY",
+        earliest_available_time=1_514_764_800_000,
+        retryable=False,
+    )
+
+    payload = build_contract_kline_metadata(
+        result,
+        end_time_ms=1_514_764_800_000,
+    )
+
+    assert payload["items"] == []
+    assert payload["history_terminal"] is True
+    assert payload["terminal_reason"] == "PROVIDER_HISTORY_BOUNDARY"
+    assert payload["earliest_available_time"] == 1_514_764_800_000
+    assert payload["coverage_complete"] is True
+    assert payload["history_complete"] is True
+    assert payload["has_more_before"] is False
+    assert payload["history_incomplete"] is False
+    assert payload["provider_error_code"] is None
+    assert payload["retryable"] is False
+    assert ContractKlineHistoryMetadataResponse.model_validate(payload).model_dump() == payload
+
+
+def test_terminal_history_does_not_require_an_unknown_earliest_time() -> None:
+    result = ContractKlineResult(
+        [],
+        origin="EMPTY",
+        cache_status="HISTORY_BOUNDARY",
+        history_terminal=True,
+        terminal_reason="PROVIDER_HISTORY_BOUNDARY",
+        earliest_available_time=None,
+        retryable=False,
+    )
+
+    payload = build_contract_kline_metadata(
+        result,
+        end_time_ms=1_561_910_400_000,
+    )
+
+    assert payload["history_terminal"] is True
+    assert payload["terminal_reason"] == "PROVIDER_HISTORY_BOUNDARY"
+    assert payload["earliest_available_time"] is None
+    assert payload["coverage_complete"] is True
+    assert payload["history_complete"] is True
+    assert payload["has_more_before"] is False
+    assert payload["history_incomplete"] is False
+    assert payload["provider_error_code"] is None
+    assert payload["retryable"] is False
+
+
+def test_transient_timeout_cannot_publish_terminal_evidence() -> None:
+    result = ContractKlineResult(
+        [],
+        origin="EMPTY",
+        cache_status="TIMEOUT",
+        history_incomplete=True,
+        history_terminal=True,
+        terminal_reason="PROVIDER_HISTORY_BOUNDARY",
+        earliest_available_time=1_514_764_800_000,
+        coverage_complete=True,
+        provider_error_code="TIMEOUT",
+        retryable=True,
+    )
+
+    payload = build_contract_kline_metadata(
+        result,
+        end_time_ms=1_700_000_060_000,
+    )
+
+    assert payload["history_terminal"] is False
+    assert payload["terminal_reason"] is None
+    assert payload["earliest_available_time"] is None
+    assert payload["coverage_complete"] is False
+    assert payload["provider_error_code"] == "TIMEOUT"
+    assert payload["retryable"] is True
 
 
 def test_process_cache_metadata_is_preserved_without_history_inference() -> None:
@@ -250,6 +350,8 @@ def test_explicit_terminal_evidence_contract_enforces_field_consistency() -> Non
     assert payload["has_more_before"] is False
     assert payload["history_incomplete"] is False
     assert payload["retryable"] is False
+    assert payload["history_terminal"] is False
+    assert payload["coverage_complete"] is True
 
     known_more = ContractKlineResult(
         [_row()],
@@ -338,6 +440,9 @@ if __name__ == "__main__":
         test_metadata_response_does_not_treat_unavailable_empty_code_as_terminal,
         test_provider_empty_history_remains_unknown_and_retryable,
         test_metadata_response_keeps_partial_history_open,
+        test_terminal_history_preserves_spot_aligned_evidence,
+        test_terminal_history_does_not_require_an_unknown_earliest_time,
+        test_transient_timeout_cannot_publish_terminal_evidence,
         test_process_cache_metadata_is_preserved_without_history_inference,
         test_explicit_terminal_evidence_contract_enforces_field_consistency,
         test_router_response_serialization_accepts_legacy_array_and_metadata_object,
