@@ -1,6 +1,14 @@
 'use client';
 
-import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import Script from 'next/script';
 import type { ChartPropertiesOverrides } from '../../public/tradingview/charting_library/charting_library';
 import { useLocaleContext } from '@/contexts/LocaleContext';
@@ -11,6 +19,7 @@ import {
   createSpotTradingViewDatafeed,
   spotIntervalToTradingViewResolution,
   tradingViewResolutionToSpotInterval,
+  type SpotRealtimeSubscriptionReadiness,
   type SpotTradingViewHistoryBarsEvent,
   type SpotTradingViewRealtimeEvent,
 } from './tradingview/spotTradingViewDatafeed';
@@ -34,13 +43,24 @@ import {
 } from './tradingview/spotKlinePerf';
 import {
   requestSpotSetResolution,
+  scheduleSpotSubscriberReadinessGrace,
   setSpotToolbarLoadingState,
+  shouldRequestSpotChartSubscriberRearm,
   shouldStartSpotChartResolutionChange,
   SpotChartLoadingCoordinator,
   SpotResolutionIntentCoordinator,
   type SpotChartLoadingToken,
   type SpotResolutionIntentToken,
 } from './tradingview/spotTradingViewResolutionState';
+import { applyTradingViewViewport } from '@/components/tradingview/tradingViewViewportLifecycle';
+import {
+  getKlineLifecycleSessionIdentity,
+  type KlineLifecycleReducerResult,
+  type KlineLifecycleSessionIdentity,
+  type KlineLifecycleSubscriberEvidence,
+} from '@/components/tradingview/klineLifecycleProtocol';
+import { KlineLifecycleRuntimeCoordinator } from '@/components/tradingview/klineLifecycleRuntimeCoordinator';
+import { bootstrapKlineLifecycleObservability } from '@/components/tradingview/klineLifecycleObservability';
 
 type TradingViewVisibleRange = {
   from: number;
@@ -55,10 +75,12 @@ type TradingViewVisibleRangeOptions = {
 
 type TradingViewTimeScaleApi = {
   setRightOffset?: (offset: number) => void;
-  rightOffset?: () => number;
 };
 
 type TradingViewChartApi = {
+  dataReady?: () => Promise<boolean> | boolean;
+  resetCache?: () => void;
+  resetData?: () => void;
   setResolution?: (
     resolution: string,
     options?: { dataReady?: () => void; doNotActivateChart?: boolean } | (() => void),
@@ -143,7 +165,6 @@ const TIME_SHARING_LABEL = 'Time';
 const TIME_SHARING_KEY = 'time';
 const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
 const SPOT_TV_INITIAL_RIGHT_PADDING_BARS = 4;
-const SPOT_TV_INITIAL_VISIBLE_RANGE_DELAY_MS = 80;
 const SPOT_TV_RESOLUTION_KLINE_OWNER_PREFIX = 'spot-tradingview-chart-resolution';
 const SPOT_TV_PRICE_LABEL_OVERRIDES = {
   'mainSeriesProperties.showPriceLine': false,
@@ -288,14 +309,6 @@ function readTradingViewVisibleRange(chart: TradingViewChartApi) {
   }
 }
 
-function readTradingViewRightOffset(timeScale: TradingViewTimeScaleApi | null) {
-  try {
-    return typeof timeScale?.rightOffset === 'function' ? timeScale.rightOffset() : null;
-  } catch {
-    return null;
-  }
-}
-
 function styleToolbarButton(button: HTMLButtonElement, active: boolean) {
   button.dataset.active = active ? '1' : '0';
   button.style.color = active ? '#f0b90b' : 'rgba(255,255,255,0.58)';
@@ -334,13 +347,17 @@ export default function SpotTradingViewChart({
   const datafeedRef = useRef<ReturnType<typeof createSpotTradingViewDatafeed> | null>(null);
   const chartReadyRef = useRef(false);
   const resolutionIntentCoordinatorRef = useRef(new SpotResolutionIntentCoordinator());
+  const lifecycleRuntimeCoordinatorRef = useRef<KlineLifecycleRuntimeCoordinator | null>(null);
   const resolutionRequestSeqRef = useRef(0);
   const resolutionRequestCancelRef = useRef<(() => void) | null>(null);
+  const subscriberReadinessGraceCancelRef = useRef<(() => void) | null>(null);
+  const subscriberReadinessGraceSessionRef = useRef('');
   const activeIntervalRef = useRef('');
   const chartModeRef = useRef<'time' | 'candle'>(chartMode);
   const normalizedSymbolRef = useRef('');
   const widgetIntervalRef = useRef('');
   const initialVisibleRangeAppliedKeyRef = useRef('');
+  const initialVisibleRangeInFlightKeyRef = useRef('');
   const initialVisibleRangeApplySeqRef = useRef(0);
   const pendingInitialVisibleRangeRef = useRef<SpotTradingViewHistoryBarsEvent | null>(null);
   const recentVisibleRangeEventsRef = useRef<Map<string, SpotRecentVisibleRangeEvent>>(new Map());
@@ -435,11 +452,11 @@ export default function SpotTradingViewChart({
     };
     activeChartLoadingTokenRef.current = token;
     chartLoadingToolbarOwnerRef.current = toolbarOwner;
-    const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
+    const lifecycleSnapshot = lifecycleRuntimeCoordinatorRef.current?.snapshot();
     setSpotToolbarLoadingState(toolbarOwner.toolbarSlot, toolbarOwner.toolbarButtons, {
       loading: true,
-      pendingKey: resolutionState.pendingResolution
-        ? tradingViewResolutionToSpotInterval(resolutionState.pendingResolution.resolution)
+      pendingKey: lifecycleSnapshot?.candidate
+        ? tradingViewResolutionToSpotInterval(lifecycleSnapshot.candidate.tradingViewResolution)
         : undefined,
     });
     return token;
@@ -541,12 +558,6 @@ export default function SpotTradingViewChart({
         interval: backendInterval,
         owner: resolutionKlineOwner,
       });
-      const datafeedSyncResult = datafeedRealtimeMatched
-        ? null
-        : datafeedRef.current?.syncRealtimeKlineSubscription(
-          backendInterval,
-          'resolution_commit_interval_mismatch',
-        );
 
       markSpotKlinePerf('kline_interval_sync_after_resolution_commit', {
         symbol: activeSymbol,
@@ -559,10 +570,6 @@ export default function SpotTradingViewChart({
         changed: syncResult?.changed ?? false,
         datafeedRealtimeIntervals,
         datafeedRealtimeMatched,
-        syncedDatafeedOwner: Boolean(datafeedSyncResult),
-        datafeedSyncChanged: datafeedSyncResult?.changed ?? false,
-        datafeedActiveIntervalsAfterSync: datafeedSyncResult?.activeIntervals ?? datafeedRealtimeIntervals,
-        datafeedDroppedIntervals: datafeedSyncResult?.droppedIntervals ?? [],
         reason,
         source: 'SpotTradingViewChart',
       });
@@ -571,7 +578,11 @@ export default function SpotTradingViewChart({
   );
 
   const applyInitialVisibleRangeFromHistory = useCallback(
-    (event: SpotTradingViewHistoryBarsEvent, triggerReason = 'history-callback') => {
+    (
+      event: SpotTradingViewHistoryBarsEvent,
+      triggerReason = 'history-callback',
+      expectedWidgetGeneration = activeWidgetGenerationRef.current,
+    ) => {
       scheduleKlinePreload(event, triggerReason);
       const activeSymbol = normalizedSymbolRef.current;
       const activeIntervalValue = activeIntervalRef.current || '1m';
@@ -658,18 +669,23 @@ export default function SpotTradingViewChart({
         lastTime: event.lastBarTime,
         reason: triggerReason,
       });
-      if (initialVisibleRangeAppliedKeyRef.current === applyKey) {
+      if (
+        initialVisibleRangeAppliedKeyRef.current === applyKey
+        || initialVisibleRangeInFlightKeyRef.current === applyKey
+      ) {
         spotTradingViewChartDebug('initial-visible-range', {
           ...baseDebugPayload,
           applied: false,
-          reason: 'already applied',
+          reason: initialVisibleRangeAppliedKeyRef.current === applyKey
+            ? 'already applied'
+            : 'apply already in flight',
         });
         return;
       }
-      const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
+      const lifecycleSnapshot = lifecycleRuntimeCoordinatorRef.current?.snapshot();
       if (
-        resolutionState.inFlightResolution === event.resolution &&
-        resolutionState.currentResolution !== event.resolution
+        lifecycleSnapshot?.candidate?.tradingViewResolution === event.resolution
+        && lifecycleSnapshot.committed?.tradingViewResolution !== event.resolution
       ) {
         pendingInitialVisibleRangeRef.current = event;
         spotTradingViewChartDebug('initial-visible-range', {
@@ -692,173 +708,51 @@ export default function SpotTradingViewChart({
         return;
       }
 
-      initialVisibleRangeAppliedKeyRef.current = applyKey;
+      initialVisibleRangeInFlightKeyRef.current = applyKey;
       pendingInitialVisibleRangeRef.current = null;
       const applySeq = ++initialVisibleRangeApplySeqRef.current;
       const visibleRangeRequestId = createSpotKlinePerfId('visible-range');
-      window.setTimeout(() => {
-        if (initialVisibleRangeApplySeqRef.current !== applySeq) return;
-        if (widgetRef.current !== widget) return;
-        if (normalizedSymbolRef.current !== activeSymbol) return;
-        if (widgetIntervalRef.current !== activeResolution) return;
-
-        const timeScale = typeof chart.getTimeScale === 'function' ? chart.getTimeScale() : null;
-        const canSetRightOffset = typeof timeScale?.setRightOffset === 'function';
-        const rightOffsetRange = canSetRightOffset ? rangeInfo.range : rangeInfo.fallbackRange;
-        const applyRightOffset = (stage: string) => {
-          if (!canSetRightOffset) return false;
-          try {
-            timeScale.setRightOffset?.(rangeInfo.rightPaddingBars);
-            const visibleRange = readTradingViewVisibleRange(chart);
-            const currentRightOffset = readTradingViewRightOffset(timeScale);
-            spotTradingViewChartDebug('right-offset-applied', {
-              ...baseDebugPayload,
-              stage,
-              applied: true,
-              rightOffsetApiAvailable: true,
-              rightPaddingBars: rangeInfo.rightPaddingBars,
-              currentRightOffset,
-              visibleFrom: visibleRange?.from ?? null,
-              visibleTo: visibleRange?.to ?? null,
-              rightPaddingClamped: visibleRange?.to ? visibleRange.to <= rangeInfo.latestBarTime : null,
-            });
-            return true;
-          } catch (error) {
-            spotTradingViewChartDebug('right-offset-applied', {
-              ...baseDebugPayload,
-              stage,
-              applied: false,
-              rightOffsetApiAvailable: true,
-              rightPaddingBars: rangeInfo.rightPaddingBars,
-              error: error instanceof Error ? error.message : String(error),
-            });
-            return false;
-          }
-        };
-        const stabilizeRightPadding = (stage: string) => {
-          window.requestAnimationFrame(() => {
-            window.setTimeout(() => {
-              if (initialVisibleRangeApplySeqRef.current !== applySeq) return;
-              if (widgetRef.current !== widget) return;
-              if (normalizedSymbolRef.current !== activeSymbol) return;
-              if (widgetIntervalRef.current !== activeResolution) return;
-              if (canSetRightOffset) {
-                applyRightOffset(stage);
-                return;
-              }
-              const visibleRange = readTradingViewVisibleRange(chart);
-              spotTradingViewChartDebug('right-offset-applied', {
-                ...baseDebugPayload,
-                stage,
-                applied: false,
-                rightOffsetApiAvailable: false,
-                rightPaddingBars: rangeInfo.rightPaddingBars,
-                visibleFrom: visibleRange?.from ?? null,
-                visibleTo: visibleRange?.to ?? null,
-                rightPaddingClamped: visibleRange?.to ? visibleRange.to <= rangeInfo.latestBarTime : null,
-                reason: 'timeScale right offset unavailable',
-              });
-            }, 50);
-          });
-        };
-
-        applyRightOffset('before-visible-range');
-        const visibleRangeStartedAt = getSpotChartPerfNow();
-        markSpotKlinePerf('visible_range_apply_start', {
-          symbol: event.symbol,
-          interval: event.interval,
-          backendInterval,
-          resolution: event.resolution,
-          requestId: event.requestSeq,
-          visibleRangeRequestId,
-          bars_count: event.barCount,
-          targetBars: rangeInfo.targetVisibleBars,
-          targetVisibleBars: rangeInfo.targetVisibleBars,
-          firstTime: event.firstBarTime,
-          lastTime: event.lastBarTime,
-          from: rightOffsetRange.from,
-          to: rightOffsetRange.to,
-          reason: triggerReason,
-          source: triggerReason,
-        });
-        const maybePromise = chart.setVisibleRange?.(rightOffsetRange, {
-          applyDefaultRightMargin: false,
-          percentRightMargin: 0,
-          rejectByTimeout: 1500,
-        });
-        const debugPayload = {
-          ...baseDebugPayload,
-          rightPaddingBars: rangeInfo.rightPaddingBars,
-          intervalSeconds: rangeInfo.intervalSeconds,
-          rightOffsetApiAvailable: canSetRightOffset,
-          rightOffsetApplied: canSetRightOffset,
-          from: rightOffsetRange.from,
-          to: rightOffsetRange.to,
-          applied: true,
-          reason: triggerReason,
-        };
-        if (maybePromise && typeof maybePromise.catch === 'function') {
-          void maybePromise
-            .then(() => {
-              applyRightOffset('after-visible-range');
-              stabilizeRightPadding('stabilize-visible-range');
-              const visibleRange = readTradingViewVisibleRange(chart);
-              markSpotKlinePerf('visible_range_apply_end', {
-                symbol: event.symbol,
-                interval: event.interval,
-                backendInterval,
-                resolution: event.resolution,
-                requestId: event.requestSeq,
-                visibleRangeRequestId,
-                duration_ms: Math.max(0, getSpotChartPerfNow() - visibleRangeStartedAt),
-                bars_count: event.barCount,
-                targetBars: rangeInfo.targetVisibleBars,
-                targetVisibleBars: rangeInfo.targetVisibleBars,
-                firstTime: event.firstBarTime,
-                lastTime: event.lastBarTime,
-                visibleFrom: visibleRange?.from ?? null,
-                visibleTo: visibleRange?.to ?? null,
-                reason: triggerReason,
-                source: triggerReason,
-              });
-              spotTradingViewChartDebug('initial-visible-range', {
-                ...debugPayload,
-                visibleFrom: visibleRange?.from ?? null,
-                visibleTo: visibleRange?.to ?? null,
-                rightPaddingClamped: visibleRange?.to ? visibleRange.to <= rangeInfo.latestBarTime : null,
-              });
-            })
-            .catch((error: unknown) => {
-              initialVisibleRangeAppliedKeyRef.current = '';
-              markSpotKlinePerf('visible_range_apply_end', {
-                symbol: event.symbol,
-                interval: event.interval,
-                backendInterval,
-                resolution: event.resolution,
-                requestId: event.requestSeq,
-                visibleRangeRequestId,
-                duration_ms: Math.max(0, getSpotChartPerfNow() - visibleRangeStartedAt),
-                bars_count: event.barCount,
-                targetBars: rangeInfo.targetVisibleBars,
-                targetVisibleBars: rangeInfo.targetVisibleBars,
-                firstTime: event.firstBarTime,
-                lastTime: event.lastBarTime,
-                source: triggerReason,
-                reason: triggerReason,
-                error: error instanceof Error ? error.message : String(error),
-              });
-              spotTradingViewChartDebug('initial-visible-range', {
-                ...debugPayload,
-                applied: false,
-                reason: 'setVisibleRange rejected',
-                error: error instanceof Error ? error.message : String(error),
-              });
-            });
-          return;
+      const visibleRangeStartedAt = getSpotChartPerfNow();
+      const isCurrentViewportIntent = () => (
+        initialVisibleRangeApplySeqRef.current === applySeq
+        && activeWidgetGenerationRef.current === expectedWidgetGeneration
+        && widgetRef.current === widget
+        && normalizedSymbolRef.current === activeSymbol
+        && widgetIntervalRef.current === activeResolution
+        && activeIntervalRef.current === activeIntervalValue
+      );
+      markSpotKlinePerf('visible_range_apply_start', {
+        symbol: event.symbol,
+        interval: event.interval,
+        backendInterval,
+        resolution: event.resolution,
+        requestId: event.requestSeq,
+        visibleRangeRequestId,
+        bars_count: event.barCount,
+        targetBars: rangeInfo.targetVisibleBars,
+        targetVisibleBars: rangeInfo.targetVisibleBars,
+        firstTime: event.firstBarTime,
+        lastTime: event.lastBarTime,
+        from: rangeInfo.range.from,
+        to: rangeInfo.range.to,
+        reason: triggerReason,
+        source: triggerReason,
+      });
+      void applyTradingViewViewport({
+        chart,
+        range: rangeInfo.range,
+        fallbackRange: rangeInfo.fallbackRange,
+        intervalSeconds: rangeInfo.intervalSeconds,
+        rightPaddingBars: rangeInfo.rightPaddingBars,
+        isCurrent: isCurrentViewportIntent,
+        maxRetries: 1,
+      }).then((result) => {
+        if (initialVisibleRangeInFlightKeyRef.current === applyKey) {
+          initialVisibleRangeInFlightKeyRef.current = '';
         }
-        applyRightOffset('after-visible-range');
-        stabilizeRightPadding('stabilize-visible-range');
-        const visibleRange = readTradingViewVisibleRange(chart);
+        if (!isCurrentViewportIntent()) return;
+        initialVisibleRangeAppliedKeyRef.current = result.applied ? applyKey : '';
+        const visibleRange = result.visibleRange ?? readTradingViewVisibleRange(chart);
         markSpotKlinePerf('visible_range_apply_end', {
           symbol: event.symbol,
           interval: event.interval,
@@ -876,14 +770,22 @@ export default function SpotTradingViewChart({
           visibleTo: visibleRange?.to ?? null,
           reason: triggerReason,
           source: triggerReason,
+          attempts: result.attempts,
+          applied: result.applied,
+          note: result.reason,
         });
         spotTradingViewChartDebug('initial-visible-range', {
-          ...debugPayload,
+          ...baseDebugPayload,
+          applied: result.applied,
+          reason: result.reason,
+          attempts: result.attempts,
+          rightPaddingBars: rangeInfo.rightPaddingBars,
+          intervalSeconds: rangeInfo.intervalSeconds,
           visibleFrom: visibleRange?.from ?? null,
           visibleTo: visibleRange?.to ?? null,
           rightPaddingClamped: visibleRange?.to ? visibleRange.to <= rangeInfo.latestBarTime : null,
         });
-      }, SPOT_TV_INITIAL_VISIBLE_RANGE_DELAY_MS);
+      });
     },
     [scheduleKlinePreload],
   );
@@ -891,6 +793,7 @@ export default function SpotTradingViewChart({
   const resetInitialVisibleRangeIntent = useCallback(() => {
     pendingInitialVisibleRangeRef.current = null;
     initialVisibleRangeAppliedKeyRef.current = '';
+    initialVisibleRangeInFlightKeyRef.current = '';
     initialVisibleRangeApplySeqRef.current += 1;
   }, []);
 
@@ -952,7 +855,7 @@ export default function SpotTradingViewChart({
     widgetGeneration: number,
   ) => {
     if (activeWidgetGenerationRef.current !== widgetGeneration) return;
-    applyInitialVisibleRangeFromHistory(event);
+    applyInitialVisibleRangeFromHistory(event, 'history-callback', widgetGeneration);
     if (event.isHistoryRequest || event.phase !== 'current') return;
 
     const activeSymbol = normalizedSymbolRef.current;
@@ -967,11 +870,11 @@ export default function SpotTradingViewChart({
       return;
     }
 
-    const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
+    const lifecycleSnapshot = lifecycleRuntimeCoordinatorRef.current?.snapshot();
     if (
-      resolutionState.currentResolution === event.resolution
-      && !resolutionState.inFlightResolution
-      && !resolutionState.pendingResolution
+      lifecycleSnapshot?.committed?.tradingViewResolution === event.resolution
+      && !lifecycleSnapshot.candidate
+      && !resolutionIntentCoordinatorRef.current.snapshot().activeToken
     ) {
       finishChartLoading(event.barCount > 0 ? 'current-history-bars' : 'current-history-empty');
     }
@@ -1009,23 +912,268 @@ export default function SpotTradingViewChart({
     });
   }, []);
 
+  const applyCommittedLifecycleEffects = useCallback((
+    decision: KlineLifecycleReducerResult,
+    reason: string,
+    metrics?: {
+      requestId?: number;
+      requestSequence?: number;
+      resolutionRequestId?: string;
+      startedAt?: number;
+    },
+  ) => {
+    const committed = decision.state.committed;
+    if (!decision.accepted || !committed) return false;
+    if (activeWidgetGenerationRef.current !== committed.widgetGeneration) return false;
+
+    const targetInterval = tradingViewResolutionToSpotInterval(committed.tradingViewResolution);
+    updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, targetInterval);
+    setSpotToolbarLoadingState(toolbarSlotRef.current, toolbarButtonRefs.current, { loading: false });
+    if (committed.intentId > 1) onIntervalResolutionCommitRef.current?.(targetInterval);
+    const loadingToken = activeChartLoadingTokenRef.current;
+    if (loadingToken?.widgetGeneration === committed.widgetGeneration) {
+      finishChartLoading('resolution-committed', loadingToken);
+    }
+    getPreloadManager().setForegroundState({
+      loading: false,
+      symbol: committed.symbol,
+      interval: committed.backendInterval,
+      generation: metrics?.requestSequence ?? committed.intentId,
+    });
+    syncKlineIntervalAfterResolutionCommit('resolution_commit');
+    const pendingInitialRange = pendingInitialVisibleRangeRef.current;
+    if (pendingInitialRange) {
+      applyInitialVisibleRangeFromHistory(pendingInitialRange, 'resolution-committed');
+    } else {
+      applyRecentVisibleRangeAfterResolutionCommit('resolution_commit');
+    }
+    markSpotKlinePerf('set_resolution_data_ready', {
+      symbol: committed.symbol,
+      interval: targetInterval,
+      resolution: committed.tradingViewResolution,
+      intentId: committed.intentId,
+      latestIntentId: decision.state.latestIntentId,
+      requestId: metrics?.requestId,
+      requestSequence: metrics?.requestSequence,
+      resolutionRequestId: metrics?.resolutionRequestId,
+      widget_generation: committed.widgetGeneration,
+      duration_ms: metrics?.startedAt === undefined
+        ? 0
+        : Math.max(0, getSpotChartPerfNow() - metrics.startedAt),
+      note: `${reason}; subscriber ready`,
+    });
+    spotTradingViewChartDebug('resolution-committed', {
+      resolution: committed.tradingViewResolution,
+      interval: targetInterval,
+      intentId: committed.intentId,
+      latestIntentId: decision.state.latestIntentId,
+      requestSequence: metrics?.requestSequence ?? null,
+      widgetGeneration: committed.widgetGeneration,
+      reason,
+    });
+    return true;
+  }, [
+    applyInitialVisibleRangeFromHistory,
+    applyRecentVisibleRangeAfterResolutionCommit,
+    finishChartLoading,
+    getPreloadManager,
+    syncKlineIntervalAfterResolutionCommit,
+  ]);
+
+  const tryCommitRuntimeCandidate = useCallback((
+    identity: KlineLifecycleSessionIdentity,
+    reason: string,
+    metrics?: Parameters<typeof applyCommittedLifecycleEffects>[2],
+  ) => {
+    const runtimeCoordinator = lifecycleRuntimeCoordinatorRef.current;
+    if (!runtimeCoordinator) return false;
+    const decision = runtimeCoordinator.tryCommit(identity);
+    return applyCommittedLifecycleEffects(decision, reason, metrics);
+  }, [applyCommittedLifecycleEffects]);
+
+  const cancelSubscriberReadinessGrace = useCallback((sessionId?: string) => {
+    if (
+      sessionId
+      && subscriberReadinessGraceSessionRef.current
+      && subscriberReadinessGraceSessionRef.current !== sessionId
+    ) return false;
+    subscriberReadinessGraceCancelRef.current?.();
+    subscriberReadinessGraceCancelRef.current = null;
+    subscriberReadinessGraceSessionRef.current = '';
+    return true;
+  }, []);
+
+  const requestMissingSubscriberRearm = useCallback((
+    identity: KlineLifecycleSessionIdentity,
+  ) => {
+    const runtimeCoordinator = lifecycleRuntimeCoordinatorRef.current;
+    const candidate = runtimeCoordinator?.snapshot().candidate;
+    if (
+      !runtimeCoordinator
+      || !candidate
+      || candidate.sessionId !== identity.sessionId
+      || activeWidgetGenerationRef.current !== identity.widgetGeneration
+    ) return false;
+
+    const result = runtimeCoordinator.requestRearm(identity, 'SUBSCRIBER_MISSING');
+    if (!result.allowed || !result.permit) return false;
+
+    const chart = widgetRef.current?.activeChart?.() || null;
+    if (
+      typeof chart?.resetCache !== 'function'
+      || typeof chart.resetData !== 'function'
+    ) {
+      runtimeCoordinator.recordResetExecution(
+        identity,
+        'SUBSCRIBER_MISSING',
+        false,
+        'RESET_EXECUTOR_UNAVAILABLE',
+      );
+      return false;
+    }
+    try {
+      chart.resetCache();
+      chart.resetData();
+      // Executor success does not imply subscriber recovery. The Runtime candidate remains
+      // RESOLUTION_APPLIED until the Datafeed produces matching readiness evidence.
+      runtimeCoordinator.recordResetExecution(
+        identity,
+        'SUBSCRIBER_MISSING',
+        true,
+        'RESET_EXECUTED',
+      );
+      return true;
+    } catch {
+      runtimeCoordinator.recordResetExecution(
+        identity,
+        'SUBSCRIBER_MISSING',
+        false,
+        'RESET_EXECUTION_FAILED',
+      );
+      return false;
+    }
+  }, []);
+
+  const recordRealtimeSubscriptionReadiness = useCallback((
+    readiness: SpotRealtimeSubscriptionReadiness,
+    widgetGeneration: number,
+  ) => {
+    if (activeWidgetGenerationRef.current !== widgetGeneration) return false;
+    const runtimeCoordinator = lifecycleRuntimeCoordinatorRef.current;
+    const datafeed = datafeedRef.current;
+    const candidate = runtimeCoordinator?.snapshot().candidate;
+    if (!runtimeCoordinator || !datafeed || !candidate) return false;
+
+    const activeReadiness = datafeed.getRealtimeSubscriptionReadiness(
+      readiness.symbol,
+      readiness.interval,
+    );
+    if (
+      !activeReadiness
+      || activeReadiness.datafeedInstanceId !== readiness.datafeedInstanceId
+      || activeReadiness.subscriberUid !== readiness.subscriberUid
+      || activeReadiness.subscriptionGeneration !== readiness.subscriptionGeneration
+      || activeReadiness.ownerId !== readiness.ownerId
+      || candidate.widgetGeneration !== widgetGeneration
+      || candidate.datafeedInstanceId !== readiness.datafeedInstanceId
+      || candidate.symbol !== normalizeTradingViewSymbol(readiness.symbol)
+      || candidate.backendInterval !== readiness.interval
+    ) {
+      return false;
+    }
+    const evidence: KlineLifecycleSubscriberEvidence = {
+      ...getKlineLifecycleSessionIdentity(candidate),
+      subscriberUid: readiness.subscriberUid,
+      subscriptionGeneration: readiness.subscriptionGeneration,
+      ownerId: readiness.ownerId,
+    };
+    const decision = runtimeCoordinator.recordSubscriber(evidence);
+    if (!decision.accepted && decision.reason !== 'SUBSCRIBER_ALREADY_READY') return false;
+    cancelSubscriberReadinessGrace(candidate.sessionId);
+    tryCommitRuntimeCandidate(
+      getKlineLifecycleSessionIdentity(candidate),
+      'subscriber readiness',
+    );
+    return true;
+  }, [cancelSubscriberReadinessGrace, tryCommitRuntimeCandidate]);
+
+  const beginLifecycleIntent = useCallback((
+    nextResolution: string,
+    widgetGeneration: number,
+  ): KlineLifecycleSessionIdentity | null => {
+    const runtimeCoordinator = lifecycleRuntimeCoordinatorRef.current;
+    const datafeed = datafeedRef.current;
+    if (
+      !runtimeCoordinator
+      || !datafeed
+      || activeWidgetGenerationRef.current !== widgetGeneration
+    ) return null;
+
+    const targetInterval = tradingViewResolutionToSpotInterval(nextResolution);
+    const backendInterval = getBackendKlineIntervalForSpotInterval(targetInterval);
+    const snapshot = runtimeCoordinator.snapshot();
+    if (
+      snapshot.candidate
+      && snapshot.candidate.widgetGeneration === widgetGeneration
+      && snapshot.candidate.datafeedInstanceId === datafeed.getDatafeedInstanceId()
+      && snapshot.candidate.symbol === normalizedSymbolRef.current
+      && snapshot.candidate.tradingViewResolution === nextResolution
+      && snapshot.candidate.backendInterval === backendInterval
+    ) {
+      return getKlineLifecycleSessionIdentity(snapshot.candidate);
+    }
+    if (
+      !snapshot.candidate
+      && snapshot.committed?.tradingViewResolution === nextResolution
+      && snapshot.committed.backendInterval === backendInterval
+    ) return null;
+
+    cancelSubscriberReadinessGrace();
+    const result = runtimeCoordinator.beginIntent({
+      tradingViewResolution: nextResolution,
+      backendInterval,
+    });
+    if (!result.decision.accepted) return null;
+    spotTradingViewChartDebug('resolution-intent-requested', {
+      from: snapshot.committed?.tradingViewResolution || null,
+      to: nextResolution,
+      intentId: result.identity.intentId,
+      latestIntentId: result.decision.state.latestIntentId,
+      interval: targetInterval,
+      pending: true,
+      widgetGeneration,
+    });
+    return result.identity;
+  }, [cancelSubscriberReadinessGrace]);
+
   const applyWidgetResolution = useCallback(
     (nextResolution: string, widgetGeneration = activeWidgetGenerationRef.current) => {
-      if (!nextResolution) return;
-      if (!widgetGeneration || activeWidgetGenerationRef.current !== widgetGeneration) return;
+      if (!nextResolution || !widgetGeneration) return;
+      if (activeWidgetGenerationRef.current !== widgetGeneration) return;
 
-      const activeIntervalValue = activeIntervalRef.current;
+      const runtimeCoordinator = lifecycleRuntimeCoordinatorRef.current;
       const widget = widgetRef.current;
-      const canStart = Boolean(widget && chartReadyRef.current);
-      const intentCoordinator = resolutionIntentCoordinatorRef.current;
-      const previousIntentState = intentCoordinator.snapshot();
-      const latestIntent = intentCoordinator.latestIntent()
-        ?? intentCoordinator.registerIntent(nextResolution).intent;
-      const intentDecision = intentCoordinator.request(latestIntent, { canStart });
-      const updateToolbarIntentState = (
-        loading: boolean,
-        pendingResolution = intentDecision.snapshot.pendingResolution?.resolution,
-      ) => {
+      if (!runtimeCoordinator || !widget) return;
+      const identity = beginLifecycleIntent(nextResolution, widgetGeneration);
+      if (!identity) return;
+      const candidate = runtimeCoordinator.snapshot().candidate;
+      if (!candidate || candidate.sessionId !== identity.sessionId) return;
+
+      const transportCoordinator = resolutionIntentCoordinatorRef.current;
+      const chart = widget.activeChart?.();
+      const chartResolution = (() => {
+        try {
+          return String(chart?.resolution?.() || '');
+        } catch {
+          return '';
+        }
+      })();
+      const isLatest = () => (
+        lifecycleRuntimeCoordinatorRef.current?.snapshot().candidate?.sessionId === identity.sessionId
+      );
+      const updateToolbarIntentState = (loading: boolean) => {
+        const candidateResolution = lifecycleRuntimeCoordinatorRef.current
+          ?.snapshot().candidate?.tradingViewResolution;
         updateToolbarButtons(
           toolbarButtonRefs.current,
           chartModeRef.current,
@@ -1033,134 +1181,222 @@ export default function SpotTradingViewChart({
         );
         setSpotToolbarLoadingState(toolbarSlotRef.current, toolbarButtonRefs.current, {
           loading,
-          pendingKey: pendingResolution
-            ? tradingViewResolutionToSpotInterval(pendingResolution)
+          pendingKey: candidateResolution
+            ? tradingViewResolutionToSpotInterval(candidateResolution)
             : undefined,
         });
       };
+      const scheduleLatestCandidate = () => {
+        const latestCandidate = lifecycleRuntimeCoordinatorRef.current?.snapshot().candidate;
+        if (!latestCandidate || latestCandidate.sessionId === identity.sessionId) return;
+        window.setTimeout(() => {
+          if (activeWidgetGenerationRef.current !== widgetGeneration) return;
+          applyWidgetResolution(latestCandidate.tradingViewResolution, widgetGeneration);
+        }, 0);
+      };
+      const recordActiveReadiness = () => {
+        const readiness = datafeedRef.current?.getRealtimeSubscriptionReadiness(
+          candidate.symbol,
+          candidate.backendInterval,
+        );
+        return readiness
+          ? recordRealtimeSubscriptionReadiness(readiness, widgetGeneration)
+          : false;
+      };
+      const applyResolutionEvidence = (
+        reason: string,
+        metrics?: Parameters<typeof applyCommittedLifecycleEffects>[2],
+      ) => {
+        const activeRuntime = lifecycleRuntimeCoordinatorRef.current;
+        if (!activeRuntime) return { applied: false, subscriberReady: false };
+        const resolutionDecision = activeRuntime.applyResolution(identity);
+        if (!resolutionDecision.accepted) return { applied: false, subscriberReady: false };
+        const subscriberReady = recordActiveReadiness();
+        if (subscriberReady) tryCommitRuntimeCandidate(identity, reason, metrics);
+        return { applied: true, subscriberReady };
+      };
+      const retireMissingSubscriberCandidate = (
+        metrics?: Parameters<typeof applyCommittedLifecycleEffects>[2],
+      ) => {
+        cancelSubscriberReadinessGrace(identity.sessionId);
+        const activeRuntime = lifecycleRuntimeCoordinatorRef.current;
+        if (!activeRuntime || !isLatest()) return false;
+        const retireDecision = activeRuntime.retireSession(identity, 'SUBSCRIBER_TIMEOUT');
+        if (!retireDecision.accepted) return false;
+        const latestCandidate = activeRuntime.snapshot().candidate;
+        if (latestCandidate) {
+          scheduleLatestCandidate();
+          return true;
+        }
 
+        const committed = retireDecision.state.committed;
+        const stableResolution = committed?.tradingViewResolution || chartResolution || nextResolution;
+        const stableInterval = tradingViewResolutionToSpotInterval(stableResolution);
+        updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, stableInterval);
+        setSpotToolbarLoadingState(
+          toolbarSlotRef.current,
+          toolbarButtonRefs.current,
+          { loading: false },
+        );
+        onIntervalResolutionFailureRef.current?.(stableInterval);
+        const loadingToken = activeChartLoadingTokenRef.current;
+        if (loadingToken?.widgetGeneration === widgetGeneration) {
+          finishChartLoading('subscriber-timeout', loadingToken);
+        }
+        getPreloadManager().setForegroundState({
+          loading: false,
+          symbol: committed?.symbol || candidate.symbol,
+          interval: committed?.backendInterval
+            || getBackendKlineIntervalForSpotInterval(stableInterval),
+          generation: metrics?.requestSequence ?? identity.intentId,
+        });
+        markSpotKlinePerf('set_resolution_error', {
+          symbol: candidate.symbol,
+          interval: tradingViewResolutionToSpotInterval(identity.tradingViewResolution),
+          resolution: identity.tradingViewResolution,
+          intentId: identity.intentId,
+          latestIntentId: activeRuntime.snapshot().latestIntentId,
+          requestId: metrics?.requestId,
+          requestSequence: metrics?.requestSequence,
+          resolutionRequestId: metrics?.resolutionRequestId,
+          widget_generation: widgetGeneration,
+          duration_ms: metrics?.startedAt === undefined
+            ? 0
+            : Math.max(0, getSpotChartPerfNow() - metrics.startedAt),
+          note: 'subscriber readiness timed out after one-shot rearm',
+        });
+        return true;
+      };
+      const scheduleSubscriberGrace = (
+        phase: 'BEFORE_REARM' | 'AFTER_REARM',
+        metrics?: Parameters<typeof applyCommittedLifecycleEffects>[2],
+      ) => {
+        cancelSubscriberReadinessGrace();
+        let cancelGrace: () => void = () => undefined;
+        cancelGrace = scheduleSpotSubscriberReadinessGrace({
+          isCurrent: isLatest,
+          isSubscriberReady: recordActiveReadiness,
+          onSettled: () => {
+            if (subscriberReadinessGraceCancelRef.current !== cancelGrace) return;
+            subscriberReadinessGraceCancelRef.current = null;
+            subscriberReadinessGraceSessionRef.current = '';
+          },
+          onExpired: () => {
+            if (phase === 'BEFORE_REARM' && requestMissingSubscriberRearm(identity)) {
+              scheduleSubscriberGrace('AFTER_REARM', metrics);
+              return;
+            }
+            retireMissingSubscriberCandidate(metrics);
+          },
+        });
+        subscriberReadinessGraceCancelRef.current = cancelGrace;
+        subscriberReadinessGraceSessionRef.current = identity.sessionId;
+      };
+      const postResolutionBarrierCheck = (
+        reason: string,
+        metrics?: Parameters<typeof applyCommittedLifecycleEffects>[2],
+      ) => {
+        const result = applyResolutionEvidence(reason, metrics);
+        if (
+          shouldRequestSpotChartSubscriberRearm({
+            resolutionApplied: result.applied,
+            subscriberReady: result.subscriberReady,
+          })
+        ) {
+          scheduleSubscriberGrace('BEFORE_REARM', metrics);
+        }
+        return result.applied;
+      };
+
+      if (chartReadyRef.current && chartResolution === nextResolution) {
+        postResolutionBarrierCheck('already current resolution');
+        return;
+      }
+
+      const intentDecision = transportCoordinator.request({
+        sessionId: identity.sessionId,
+        resolution: nextResolution,
+        intentId: identity.intentId,
+      }, {
+        canStart: Boolean(chartReadyRef.current && chart),
+        isLatest: isLatest(),
+      });
       spotTradingViewChartDebug('resolution-intent-applied', {
-        from: previousIntentState.currentResolution,
         to: nextResolution,
-        intentId: latestIntent.intentId,
-        latestIntentId: intentDecision.snapshot.latestIntentId,
-        latestResolution: intentCoordinator.latestIntent()?.resolution || null,
-        inFlightResolution: intentDecision.snapshot.inFlightResolution || null,
-        pendingResolution: intentDecision.snapshot.pendingResolution?.resolution || null,
+        intentId: identity.intentId,
+        latestIntentId: runtimeCoordinator.snapshot().latestIntentId,
+        inFlightResolution: intentDecision.snapshot.activeToken?.resolution || null,
+        pendingResolution: candidate.tradingViewResolution,
         pending: intentDecision.action === 'pending',
         action: intentDecision.action,
         requestSequence: intentDecision.snapshot.requestSequence,
         widgetGeneration,
       });
       markSpotKlinePerf('apply_resolution_start', {
-        symbol: normalizedSymbolRef.current,
-        interval: activeIntervalValue,
+        symbol: candidate.symbol,
+        interval: tradingViewResolutionToSpotInterval(nextResolution),
         resolution: nextResolution,
-        intentId: latestIntent.intentId,
-        latestIntentId: intentDecision.snapshot.latestIntentId,
-        currentResolution: intentDecision.snapshot.currentResolution,
-        inFlightResolution: intentDecision.snapshot.inFlightResolution || null,
-        pendingResolution: intentDecision.snapshot.pendingResolution?.resolution || null,
+        intentId: identity.intentId,
+        latestIntentId: runtimeCoordinator.snapshot().latestIntentId,
+        inFlightResolution: intentDecision.snapshot.activeToken?.resolution || null,
+        pendingResolution: candidate.tradingViewResolution,
         requestSequence: intentDecision.snapshot.requestSequence,
         widget_generation: widgetGeneration,
       });
-      if (!canStart || !widget) {
+      if (intentDecision.action !== 'start' || !intentDecision.token || !chart) {
         updateToolbarIntentState(Boolean(
-          intentDecision.snapshot.inFlightResolution
-          || intentDecision.snapshot.pendingResolution
+          intentDecision.snapshot.activeToken
+          || runtimeCoordinator.snapshot().candidate
           || activeChartLoadingTokenRef.current
         ));
-        markSpotKlinePerf('apply_resolution_start', {
-          symbol: normalizedSymbolRef.current,
-          interval: activeIntervalValue,
-          resolution: nextResolution,
-          intentId: latestIntent.intentId,
-          latestIntentId: intentDecision.snapshot.latestIntentId,
-          currentResolution: intentDecision.snapshot.currentResolution,
-          pendingResolution: intentDecision.snapshot.pendingResolution?.resolution || null,
-          requestSequence: intentDecision.snapshot.requestSequence,
-          widget_generation: widgetGeneration,
-          note: !widget ? 'widget not ready' : 'chart not ready',
-        });
-        return;
-      }
-
-      if (intentDecision.action === 'pending') {
-        updateToolbarIntentState(true);
-        return;
-      }
-
-      if (intentDecision.action === 'stale') {
-        updateToolbarIntentState(Boolean(
-          intentDecision.snapshot.inFlightResolution
-          || intentDecision.snapshot.pendingResolution
-        ));
-        return;
-      }
-
-      if (intentDecision.action === 'noop') {
-        updateToolbarIntentState(Boolean(intentDecision.snapshot.inFlightResolution));
-        if (
-          intentDecision.snapshot.currentResolution !== nextResolution
-          || intentDecision.snapshot.inFlightResolution
-        ) return;
-        syncKlineIntervalAfterResolutionCommit('already_current_resolution');
-        applyRecentVisibleRangeAfterResolutionCommit('already_current_resolution');
-        onIntervalResolutionCommitRef.current?.(activeIntervalValue);
-        const activeToken = activeChartLoadingTokenRef.current;
-        if (activeToken?.widgetGeneration === widgetGeneration) {
-          finishChartLoading('already-current-resolution', activeToken);
-        }
-        markSpotKlinePerf('set_resolution_data_ready', {
-          symbol: normalizedSymbolRef.current,
-          interval: activeIntervalValue,
-          resolution: nextResolution,
-          currentResolution: intentDecision.snapshot.currentResolution,
-          requestSequence: intentDecision.snapshot.requestSequence,
-          widget_generation: widgetGeneration,
-          note: 'already current resolution',
-          duration_ms: 0,
-        });
         return;
       }
 
       const runResolutionRequest = (intentToken: SpotResolutionIntentToken) => {
-        if (!intentCoordinator.canStart(intentToken)) return;
-        const resolution = intentToken.resolution;
-        const targetInterval = tradingViewResolutionToSpotInterval(resolution);
-        const targetBackendInterval = getBackendKlineIntervalForSpotInterval(targetInterval);
-        const resolutionState = intentCoordinator.snapshot();
-
+        if (!transportCoordinator.canStart(intentToken) || !isLatest()) {
+          transportCoordinator.settle(intentToken);
+          scheduleLatestCandidate();
+          return;
+        }
         if (!shouldStartSpotChartResolutionChange({
-          widgetAvailable: Boolean(widget),
+          widgetAvailable: true,
           chartReady: chartReadyRef.current,
-          currentResolution: resolutionState.currentResolution,
-          nextResolution: resolution,
-        })) return;
+          observedResolution: chartResolution,
+          nextResolution: intentToken.resolution,
+        })) {
+          transportCoordinator.settle(intentToken);
+          postResolutionBarrierCheck('current chart resolution');
+          return;
+        }
 
+        const targetInterval = tradingViewResolutionToSpotInterval(intentToken.resolution);
+        const targetBackendInterval = getBackendKlineIntervalForSpotInterval(targetInterval);
         const loadingToken = startChartLoading('resolution-change', widgetGeneration);
-        if (!loadingToken) return;
+        if (!loadingToken) {
+          transportCoordinator.settle(intentToken);
+          return;
+        }
         getPreloadManager().setForegroundState({
           loading: true,
-          symbol: normalizedSymbolRef.current,
+          symbol: candidate.symbol,
           interval: targetBackendInterval,
           generation: intentToken.requestSequence,
         });
-
-        const chart = widget.activeChart?.();
         const requestSeq = ++resolutionRequestSeqRef.current;
         const resolutionRequestId = createSpotKlinePerfId('set-resolution');
         const setResolutionStartedAt = getSpotChartPerfNow();
-        const previousResolution = resolutionState.currentResolution;
-        const rollbackInterval = tradingViewResolutionToSpotInterval(previousResolution || '1');
+        const previousResolution = runtimeCoordinator.snapshot().committed?.tradingViewResolution
+          || chartResolution
+          || '1';
+        const rollbackInterval = tradingViewResolutionToSpotInterval(previousResolution);
         resetInitialVisibleRangeIntent();
         resolutionRequestCancelRef.current?.();
         markSpotKlinePerf('set_resolution_called', {
-          symbol: normalizedSymbolRef.current,
+          symbol: candidate.symbol,
           interval: targetInterval,
-          resolution,
+          resolution: intentToken.resolution,
           intentId: intentToken.intentId,
-          latestIntentId: resolutionState.latestIntentId,
+          latestIntentId: runtimeCoordinator.snapshot().latestIntentId,
           requestId: requestSeq,
           requestSequence: intentToken.requestSequence,
           resolutionRequestId,
@@ -1169,87 +1405,36 @@ export default function SpotTradingViewChart({
         });
         resolutionRequestCancelRef.current = requestSpotSetResolution({
           chart,
-          resolution,
+          resolution: intentToken.resolution,
           isCurrent: () => (
             resolutionRequestSeqRef.current === requestSeq
-            && intentCoordinator.isCurrent(intentToken)
+            && transportCoordinator.isCurrent(intentToken)
             && widgetRef.current === widget
             && activeWidgetGenerationRef.current === widgetGeneration
           ),
           onCommitted: (reason) => {
             resolutionRequestCancelRef.current = null;
-            const settlement = intentCoordinator.commit(intentToken);
-            if (!settlement.accepted) return;
-            const durationMs = Math.max(0, getSpotChartPerfNow() - setResolutionStartedAt);
-            markSpotKlinePerf('set_resolution_data_ready', {
-              symbol: normalizedSymbolRef.current,
-              interval: targetInterval,
-              resolution,
-              intentId: intentToken.intentId,
-              latestIntentId: settlement.snapshot.latestIntentId,
+            if (!transportCoordinator.settle(intentToken).accepted) return;
+            const applied = postResolutionBarrierCheck(reason, {
               requestId: requestSeq,
               requestSequence: intentToken.requestSequence,
               resolutionRequestId,
-              widget_generation: widgetGeneration,
-              duration_ms: durationMs,
-              note: reason,
+              startedAt: setResolutionStartedAt,
             });
-            spotTradingViewChartDebug('resolution-committed', {
-              resolution,
-              interval: targetInterval,
-              requestId: resolutionRequestId,
-              intentId: intentToken.intentId,
-              latestIntentId: settlement.snapshot.latestIntentId,
-              requestSequence: intentToken.requestSequence,
-              pendingResolution: settlement.snapshot.pendingResolution?.resolution || null,
-              nextResolution: settlement.nextToken?.resolution || null,
-              widgetGeneration,
-              reason,
-            });
-
-            if (settlement.nextToken) {
-              const nextInterval = tradingViewResolutionToSpotInterval(settlement.nextToken.resolution);
-              updateToolbarIntentState(true, settlement.nextToken.resolution);
-              spotTradingViewChartDebug('pending-resolution-started', {
-                resolution: settlement.nextToken.resolution,
-                intentId: settlement.nextToken.intentId,
-                interval: nextInterval,
-                requestSequence: settlement.nextToken.requestSequence,
-                previousResolution: resolution,
-                widgetGeneration,
-              });
-              runResolutionRequest(settlement.nextToken);
-              return;
-            }
-
-            updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, targetInterval);
-            onIntervalResolutionCommitRef.current?.(targetInterval);
-            finishChartLoading('resolution-committed', loadingToken);
-            getPreloadManager().setForegroundState({
-              loading: false,
-              symbol: normalizedSymbolRef.current,
-              interval: targetBackendInterval,
-              generation: intentToken.requestSequence,
-            });
-            syncKlineIntervalAfterResolutionCommit('resolution_commit');
-            const pendingInitialRange = pendingInitialVisibleRangeRef.current;
-            if (pendingInitialRange) {
-              applyInitialVisibleRangeFromHistory(pendingInitialRange, 'resolution-committed');
-            } else {
-              applyRecentVisibleRangeAfterResolutionCommit('resolution_commit');
-            }
+            if (!applied) scheduleLatestCandidate();
           },
           onFailed: (reason, error) => {
             resolutionRequestCancelRef.current = null;
-            const settlement = intentCoordinator.fail(intentToken);
-            if (!settlement.accepted) return;
+            if (!transportCoordinator.settle(intentToken).accepted) return;
+            const activeRuntime = lifecycleRuntimeCoordinatorRef.current;
+            const retireDecision = activeRuntime?.retireSession(identity, 'RESOLUTION_FAILED');
             markSpotKlinePerf('set_resolution_error', {
-              symbol: normalizedSymbolRef.current,
+              symbol: candidate.symbol,
               interval: targetInterval,
               rollbackInterval,
-              resolution,
+              resolution: intentToken.resolution,
               intentId: intentToken.intentId,
-              latestIntentId: settlement.snapshot.latestIntentId,
+              latestIntentId: activeRuntime?.snapshot().latestIntentId ?? null,
               requestId: requestSeq,
               requestSequence: intentToken.requestSequence,
               resolutionRequestId,
@@ -1258,31 +1443,20 @@ export default function SpotTradingViewChart({
               note: reason,
               error: error instanceof Error ? error.message : error ? String(error) : undefined,
             });
-
-            if (settlement.nextToken) {
-              const nextInterval = tradingViewResolutionToSpotInterval(settlement.nextToken.resolution);
-              updateToolbarIntentState(true, settlement.nextToken.resolution);
-              spotTradingViewChartDebug('pending-resolution-started', {
-                resolution: settlement.nextToken.resolution,
-                intentId: settlement.nextToken.intentId,
-                interval: nextInterval,
-                requestSequence: settlement.nextToken.requestSequence,
-                previousResolution: resolution,
-                widgetGeneration,
-                reason: 'previous resolution failed',
-              });
-              runResolutionRequest(settlement.nextToken);
+            const latestCandidate = activeRuntime?.snapshot().candidate;
+            if (!retireDecision?.accepted || latestCandidate) {
+              scheduleLatestCandidate();
               return;
             }
-
-            const committedResolution = settlement.snapshot.currentResolution || previousResolution;
-            const committedInterval = tradingViewResolutionToSpotInterval(committedResolution || '1');
+            const stableResolution = activeRuntime?.snapshot().committed?.tradingViewResolution
+              || previousResolution;
+            const committedInterval = tradingViewResolutionToSpotInterval(stableResolution);
             updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, committedInterval);
             onIntervalResolutionFailureRef.current?.(committedInterval);
             finishChartLoading('resolution-failed', loadingToken);
             getPreloadManager().setForegroundState({
               loading: false,
-              symbol: normalizedSymbolRef.current,
+              symbol: candidate.symbol,
               interval: getBackendKlineIntervalForSpotInterval(committedInterval),
               generation: intentToken.requestSequence,
             });
@@ -1290,27 +1464,23 @@ export default function SpotTradingViewChart({
         });
       };
 
-      if (!intentDecision.token) return;
-      if (!shouldStartSpotChartResolutionChange({
-        widgetAvailable: Boolean(widget),
-        chartReady: chartReadyRef.current,
-        currentResolution: previousIntentState.currentResolution,
-        nextResolution,
-      })) return;
       runResolutionRequest(intentDecision.token);
     },
     [
-      applyInitialVisibleRangeFromHistory,
-      applyRecentVisibleRangeAfterResolutionCommit,
+      beginLifecycleIntent,
+      cancelSubscriberReadinessGrace,
       finishChartLoading,
       getPreloadManager,
+      recordRealtimeSubscriptionReadiness,
+      requestMissingSubscriberRearm,
       resetInitialVisibleRangeIntent,
       startChartLoading,
-      syncKlineIntervalAfterResolutionCommit,
+      tryCommitRuntimeCandidate,
     ],
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    bootstrapKlineLifecycleObservability();
     chartModeRef.current = chartMode;
     normalizedSymbolRef.current = normalizedSymbol;
     activeIntervalRef.current = activeInterval;
@@ -1330,6 +1500,7 @@ export default function SpotTradingViewChart({
   }, [displayPrice, onNativeCandleDisplay]);
 
   useEffect(() => () => {
+    cancelSubscriberReadinessGrace();
     resolutionRequestCancelRef.current?.();
     resolutionRequestCancelRef.current = null;
     const toolbarOwner = chartLoadingToolbarOwnerRef.current;
@@ -1344,7 +1515,7 @@ export default function SpotTradingViewChart({
     activeChartLoadingTokenRef.current = null;
     chartLoadingCoordinatorRef.current?.destroy();
     chartLoadingCoordinatorRef.current = null;
-  }, []);
+  }, [cancelSubscriberReadinessGrace]);
 
   useEffect(() => () => {
     clearScheduledKlinePreload('symbol changed or component unmounted');
@@ -1354,19 +1525,31 @@ export default function SpotTradingViewChart({
   useEffect(() => {
     let cancelled = false;
     let widgetGeneration = 0;
+    let runtimeCoordinator: KlineLifecycleRuntimeCoordinator | null = null;
 
     const cleanupWidget = (generation = activeWidgetGenerationRef.current) => {
       if (generation && activeWidgetGenerationRef.current !== generation) return;
       if (generation) retireChartLoadingGeneration(generation);
       clearScheduledKlinePreload('widget cleanup');
       releaseResolutionKlineInterval('widget cleanup', normalizedSymbol);
+      cancelSubscriberReadinessGrace();
       resolutionRequestCancelRef.current?.();
       resolutionRequestCancelRef.current = null;
       resolutionRequestSeqRef.current += 1;
       chartReadyRef.current = false;
-      resolutionIntentCoordinatorRef.current.reset('');
+      const retireReason = normalizedSymbolRef.current !== normalizedSymbol
+        ? 'SYMBOL_SWITCH'
+        : 'WIDGET_DESTROY';
+      const coordinatorToRetire = runtimeCoordinator || lifecycleRuntimeCoordinatorRef.current;
+      coordinatorToRetire?.retireAll(retireReason);
+      if (lifecycleRuntimeCoordinatorRef.current === coordinatorToRetire) {
+        lifecycleRuntimeCoordinatorRef.current = null;
+      }
+      runtimeCoordinator = null;
+      resolutionIntentCoordinatorRef.current.reset();
       initialVisibleRangeApplySeqRef.current += 1;
       initialVisibleRangeAppliedKeyRef.current = '';
+      initialVisibleRangeInFlightKeyRef.current = '';
       pendingInitialVisibleRangeRef.current = null;
       recentVisibleRangeEventsRef.current.clear();
       toolbarButtonRefs.current.clear();
@@ -1404,7 +1587,7 @@ export default function SpotTradingViewChart({
     const initialResolution =
       widgetIntervalRef.current || spotIntervalToTradingViewResolution(initialInterval);
     chartReadyRef.current = false;
-    resolutionIntentCoordinatorRef.current.reset(initialResolution);
+    resolutionIntentCoordinatorRef.current.reset();
     toolbarButtonRefs.current.clear();
     widgetGeneration = ++widgetGenerationSequenceRef.current;
     activeWidgetGenerationRef.current = widgetGeneration;
@@ -1416,9 +1599,23 @@ export default function SpotTradingViewChart({
       amountPrecision,
       onHistoryBars: (event) => handleDatafeedHistoryBars(event, widgetGeneration),
       onKlineRealtime: handleDatafeedRealtime,
+      onRealtimeSubscriptionReady: (evidence) => {
+        recordRealtimeSubscriptionReadiness(evidence, widgetGeneration);
+      },
       debugEnabled: isSpotTradingViewDebugEnabled(),
     });
     datafeedRef.current = datafeed;
+    runtimeCoordinator = new KlineLifecycleRuntimeCoordinator({
+      terminalType: 'SPOT',
+      widgetGeneration,
+      datafeedInstanceId: datafeed.getDatafeedInstanceId(),
+      symbol: normalizedSymbol,
+    });
+    lifecycleRuntimeCoordinatorRef.current = runtimeCoordinator;
+    runtimeCoordinator.beginIntent({
+      tradingViewResolution: initialResolution,
+      backendInterval: getBackendKlineIntervalForSpotInterval(initialInterval),
+    });
     const widgetBuildLoadingTimer = window.setTimeout(() => {
       if (!cancelled && activeWidgetGenerationRef.current === widgetGeneration) {
         startChartLoading('widget-build', widgetGeneration);
@@ -1501,16 +1698,9 @@ export default function SpotTradingViewChart({
         );
         priceOverlayControllerRef.current.update(displayPriceRef.current);
       }
-      const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
-      const pendingResolution = resolutionState.pendingResolution;
-      if (pendingResolution && pendingResolution.resolution !== resolutionState.currentResolution) {
-        applyWidgetResolution(pendingResolution.resolution, widgetGeneration);
-      } else {
-        const activeToken = activeChartLoadingTokenRef.current;
-        if (activeToken?.widgetGeneration === widgetGeneration) {
-          finishChartLoading('chart-ready-current-resolution', activeToken);
-        }
-      }
+      const candidateResolution = lifecycleRuntimeCoordinatorRef.current
+        ?.snapshot().candidate?.tradingViewResolution;
+      if (candidateResolution) applyWidgetResolution(candidateResolution, widgetGeneration);
       const pendingInitialRange = pendingInitialVisibleRangeRef.current;
       if (pendingInitialRange) {
         applyInitialVisibleRangeFromHistory(pendingInitialRange, 'chart-ready');
@@ -1574,25 +1764,11 @@ export default function SpotTradingViewChart({
         makeButton(item, formatIntervalLabel(item), () => {
           if (activeWidgetGenerationRef.current !== widgetGeneration) return;
           const targetResolution = spotIntervalToTradingViewResolution(item);
-          const intentRegistration = resolutionIntentCoordinatorRef.current.registerIntent(targetResolution);
-          const resolutionState = intentRegistration.snapshot;
-          spotTradingViewChartDebug('resolution-intent-requested', {
-            from: resolutionState.currentResolution,
-            to: targetResolution,
-            intentId: intentRegistration.intent.intentId,
-            latestIntentId: resolutionState.latestIntentId,
-            interval: item,
-            inFlightResolution: resolutionState.inFlightResolution || null,
-            pendingResolution: resolutionState.pendingResolution?.resolution || null,
-            pending: Boolean(resolutionState.pendingResolution),
-            requestSequence: resolutionState.requestSequence,
-            widgetGeneration,
-            source: 'tradingview-toolbar',
-          });
-          if (resolutionState.inFlightResolution || resolutionState.pendingResolution) {
+          const intentIdentity = beginLifecycleIntent(targetResolution, widgetGeneration);
+          if (intentIdentity) {
             setSpotToolbarLoadingState(toolbarSlotRef.current, toolbarButtonRefs.current, {
               loading: true,
-              pendingKey: resolutionState.pendingResolution ? item : undefined,
+              pendingKey: item,
             });
           }
           if (chartModeRef.current !== 'candle') {
@@ -1620,11 +1796,11 @@ export default function SpotTradingViewChart({
           toolbarButtons: new Map(toolbarButtonRefs.current),
         };
         chartLoadingToolbarOwnerRef.current = toolbarOwner;
-        const resolutionState = resolutionIntentCoordinatorRef.current.snapshot();
+        const lifecycleSnapshot = lifecycleRuntimeCoordinatorRef.current?.snapshot();
         setSpotToolbarLoadingState(toolbarOwner.toolbarSlot, toolbarOwner.toolbarButtons, {
           loading: true,
-          pendingKey: resolutionState.pendingResolution
-            ? tradingViewResolutionToSpotInterval(resolutionState.pendingResolution.resolution)
+          pendingKey: lifecycleSnapshot?.candidate
+            ? tradingViewResolutionToSpotInterval(lifecycleSnapshot.candidate.tradingViewResolution)
             : undefined,
         });
       } else {
@@ -1641,9 +1817,12 @@ export default function SpotTradingViewChart({
   }, [
     applyInitialVisibleRangeFromHistory,
     applyWidgetResolution,
+    beginLifecycleIntent,
     handleDatafeedHistoryBars,
     handleDatafeedRealtime,
+    recordRealtimeSubscriptionReadiness,
     amountPrecision,
+    cancelSubscriberReadinessGrace,
     clearScheduledKlinePreload,
     chartMode,
     containerId,

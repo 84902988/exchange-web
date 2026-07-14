@@ -28,6 +28,7 @@ import {
   resolveContractKlineRequestPlan,
 } from './contractKlineLoadPolicy';
 import { contractKlineRequestLeaseRegistry } from './contractKlinePreloadManager';
+import type { KlineLifecycleRearmPermit } from '@/components/tradingview/klineLifecycleRuntimeCoordinator';
 
 export type ContractTradingViewResolution = '1' | '5' | '15' | '30' | '60' | '240' | '1D' | '1W' | '1M';
 
@@ -133,10 +134,34 @@ export type ContractTradingViewDatafeed = {
     resolution: string,
     onRealtime: DatafeedCallbacks['onRealtime'],
     subscriberUid: string,
+    onResetCacheNeededCallback?: () => void,
   ) => void;
   unsubscribeBars: (subscriberUid: string) => void;
+  getRealtimeSubscriptionReadiness: (
+    symbol: string,
+    interval: string,
+  ) => ContractRealtimeSubscriptionReadiness | null;
+  getDatafeedInstanceId: () => number;
+  executeResetPermit: (
+    requirement: ContractRealtimeResetRequirement,
+    permit: KlineLifecycleRearmPermit,
+  ) => boolean;
   destroy: () => void;
 };
+
+export type ContractRealtimeSubscriptionReadiness = Readonly<{
+  datafeedInstanceId: number;
+  symbol: string;
+  interval: string;
+  subscriberUid: string;
+  ownerId: string;
+  subscriptionGeneration: number;
+  generation: number;
+}>;
+
+export type ContractRealtimeResetRequirement = ContractRealtimeSubscriptionReadiness & Readonly<{
+  source: 'RESTORED_BASELINE';
+}>;
 
 type CreateContractTradingViewDatafeedOptions = {
   symbol: string;
@@ -147,6 +172,8 @@ type CreateContractTradingViewDatafeedOptions = {
   onLatestBar?: (close: string | null) => void;
   onHistoryBars?: (event: ContractHistoryBarsEvent) => void;
   onHistoryError?: (event: ContractHistoryErrorEvent) => void;
+  onRealtimeSubscriptionReady?: (evidence: ContractRealtimeSubscriptionReadiness) => void;
+  onRealtimeResetRequired?: (requirement: ContractRealtimeResetRequirement) => void;
 };
 
 export type ContractHistoryBarsEvent = {
@@ -175,8 +202,20 @@ type SubscriptionEntry = {
   lastEmittedBarFingerprint: string;
   lastStoreBarTime: number;
   legacyVersionCursor: KlineVersionCursor | null;
+  readinessBlocked: boolean;
+  executedResetPermitId: string | null;
   releaseKlineSubscription: () => void;
   callback: DatafeedCallbacks['onRealtime'];
+  resetCallback: (() => void) | null;
+};
+
+type ResetUnsubscribeGuard = {
+  subscriberUid: string;
+  symbol: string;
+  interval: string;
+  ownerId: string;
+  generation: number;
+  latestBarKey: string;
 };
 
 const SUPPORTED_RESOLUTIONS: ContractTradingViewResolution[] = ['1', '5', '15', '30', '60', '240', '1D', '1W', '1M'];
@@ -456,7 +495,8 @@ function realtimeBarFingerprint(bar: ContractTradingViewBar) {
   return [bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume ?? 0].join('|');
 }
 
-type KlineVersionCursor = {
+export type KlineVersionCursor = {
+  bucketTimeMs: number | null;
   providerGeneration: number | null;
   revisionEpoch: number | null;
   revisionSequence: number | null;
@@ -485,6 +525,7 @@ function realtimeMessageVersion(
   const revision = toRecord(payload?.revision) || toRecord(messageRecord.revision);
   const records = [payload, messageRecord];
   return {
+    bucketTimeMs: normalizeTimeMs(bar.time) || null,
     providerGeneration: readVersionNumber(
       records,
       'provider_generation',
@@ -513,7 +554,11 @@ function realtimeMessageVersion(
 }
 
 function storeEntryVersion(entry: ContractMarketStoreEntry): KlineVersionCursor {
+  const payload = readStoreKlinePayload(entry.data);
   return {
+    bucketTimeMs: normalizeTimeMs(
+      payload?.open_time ?? payload?.time ?? payload?.timestamp,
+    ) || null,
     providerGeneration: entry.providerGeneration,
     revisionEpoch: entry.revision?.epoch ?? null,
     revisionSequence: entry.revision?.sequence ?? null,
@@ -521,7 +566,7 @@ function storeEntryVersion(entry: ContractMarketStoreEntry): KlineVersionCursor 
   };
 }
 
-function acceptsKlineVersion(
+export function acceptsKlineVersion(
   current: KlineVersionCursor | null,
   incoming: KlineVersionCursor,
 ): boolean {
@@ -534,6 +579,17 @@ function acceptsKlineVersion(
   } else if (incoming.providerGeneration !== null) {
     generationAdvanced = true;
   }
+
+  if (
+    current.bucketTimeMs !== null
+    && incoming.bucketTimeMs !== null
+  ) {
+    if (incoming.bucketTimeMs < current.bucketTimeMs) return false;
+    if (incoming.bucketTimeMs > current.bucketTimeMs) return true;
+  }
+
+  // A missing bucket identity cannot prove a candle rollover. Keep the legacy
+  // generation/revision ordering instead of substituting an arrival timestamp.
   if (generationAdvanced) return true;
 
   let revisionAdvanced = false;
@@ -849,24 +905,6 @@ function buildLatestBarKey(symbol: string, interval: string) {
 }
 
 const CONTRACT_KLINE_HIGH_WATER_MARK_CAPACITY = 128;
-const contractKlineHighWaterMarks = new Map<string, number>();
-
-function getContractKlineHighWaterMark(key: string) {
-  return contractKlineHighWaterMarks.get(key) || 0;
-}
-
-function advanceContractKlineHighWaterMark(key: string, time: number) {
-  if (!Number.isFinite(time) || time <= 0) return getContractKlineHighWaterMark(key);
-  const nextTime = Math.max(getContractKlineHighWaterMark(key), time);
-  contractKlineHighWaterMarks.delete(key);
-  contractKlineHighWaterMarks.set(key, nextTime);
-  while (contractKlineHighWaterMarks.size > CONTRACT_KLINE_HIGH_WATER_MARK_CAPACITY) {
-    const oldestKey = contractKlineHighWaterMarks.keys().next().value;
-    if (!oldestKey) break;
-    contractKlineHighWaterMarks.delete(oldestKey);
-  }
-  return nextTime;
-}
 
 type ContractKlineRequestToken = {
   sequence: number;
@@ -991,16 +1029,88 @@ export function createContractTradingViewDatafeed({
   onLatestBar,
   onHistoryBars,
   onHistoryError,
+  onRealtimeSubscriptionReady,
+  onRealtimeResetRequired,
 }: CreateContractTradingViewDatafeedOptions): ContractTradingViewDatafeed {
   const apiSymbol = normalizeContractSymbol(symbol);
   const assetClass = normalizeContractKlineAssetClass(category);
   const displayName = displaySymbol || apiSymbol;
   const latestBars = new Map<string, ContractTradingViewBar>();
+  const klineHighWaterMarks = new Map<string, number>();
   const subscriptions = new Map<string, SubscriptionEntry>();
+  const lastSubscriptionKeyBySymbol = new Map<string, string>();
+  const latestSubscriptionGenerationByKey = new Map<string, number>();
+  const restoreResetCandidates = new Set<string>();
+  const resetUnsubscribeGuards = new Map<string, ResetUnsubscribeGuard>();
   const requestGuard = new ContractKlineRequestGuard();
   const datafeedInstanceId = ++contractKlineDatafeedInstanceSequence;
   const historyCoverageByScope = new Map<string, HistoryCoverageState>();
   let subscriptionGeneration = 0;
+  let destroyed = false;
+
+  const scheduleLifecycleCallback = (callback: () => void) => {
+    if (typeof queueMicrotask === 'function') {
+      queueMicrotask(callback);
+      return;
+    }
+    void Promise.resolve().then(callback);
+  };
+
+  const getRealtimeSubscriptionReadiness = (
+    requestedSymbol: string,
+    requestedInterval: string,
+  ): ContractRealtimeSubscriptionReadiness | null => {
+    if (destroyed) return null;
+    const normalizedSymbol = normalizeContractSymbol(requestedSymbol);
+    const normalizedInterval = normalizeContractInterval(requestedInterval);
+    const latestBarKey = buildLatestBarKey(normalizedSymbol, normalizedInterval);
+    if (lastSubscriptionKeyBySymbol.get(normalizedSymbol) !== latestBarKey) return null;
+    const expectedGeneration = latestSubscriptionGenerationByKey.get(latestBarKey);
+    if (!expectedGeneration) return null;
+
+    let latestSubscription: SubscriptionEntry | null = null;
+    for (const subscription of subscriptions.values()) {
+      if (
+        subscription.symbol !== normalizedSymbol
+        || subscription.interval !== normalizedInterval
+        || subscription.latestBarKey !== latestBarKey
+        || subscription.generation !== expectedGeneration
+        || subscription.readinessBlocked
+        || (
+          latestSubscription
+          && subscription.generation <= latestSubscription.generation
+        )
+      ) continue;
+      latestSubscription = subscription;
+    }
+    if (!latestSubscription) return null;
+    return {
+      datafeedInstanceId,
+      symbol: latestSubscription.symbol,
+      interval: latestSubscription.interval,
+      subscriberUid: latestSubscription.subscriberUid,
+      ownerId: latestSubscription.ownerId,
+      subscriptionGeneration: latestSubscription.generation,
+      generation: latestSubscription.generation,
+    };
+  };
+
+  const getContractKlineHighWaterMark = (key: string) => (
+    klineHighWaterMarks.get(key) || 0
+  );
+
+  const advanceContractKlineHighWaterMark = (key: string, time: number) => {
+    if (!Number.isFinite(time) || time <= 0) return getContractKlineHighWaterMark(key);
+    const nextTime = Math.max(getContractKlineHighWaterMark(key), time);
+    klineHighWaterMarks.delete(key);
+    klineHighWaterMarks.set(key, nextTime);
+    while (klineHighWaterMarks.size > CONTRACT_KLINE_HIGH_WATER_MARK_CAPACITY) {
+      const oldestKey = klineHighWaterMarks.keys().next().value;
+      if (!oldestKey) break;
+      klineHighWaterMarks.delete(oldestKey);
+    }
+    return nextTime;
+  };
 
   const notifyLatestBar = (bar: ContractTradingViewBar | null) => {
     onLatestBar?.(bar ? String(bar.close) : null);
@@ -1306,13 +1416,30 @@ export function createContractTradingViewDatafeed({
       }
     },
 
-    subscribeBars(symbolInfo, resolution, onRealtime, subscriberUid) {
+    subscribeBars(
+      symbolInfo,
+      resolution,
+      onRealtime,
+      subscriberUid,
+      onResetCacheNeededCallback,
+    ) {
       const normalizedSubscriberUid = String(subscriberUid || '');
       const subscriptionSymbol = normalizeContractSymbol(symbolInfo.ticker || apiSymbol) || apiSymbol;
       const interval = tradingViewResolutionToContractInterval(resolution);
       const latestBarKey = buildLatestBarKey(subscriptionSymbol, interval);
       const generation = ++subscriptionGeneration;
       const ownerId = [datafeedInstanceId, normalizedSubscriberUid, generation].join(':');
+      const previousKeyForSymbol = lastSubscriptionKeyBySymbol.get(subscriptionSymbol) || '';
+      if (previousKeyForSymbol && previousKeyForSymbol !== latestBarKey) {
+        restoreResetCandidates.add(previousKeyForSymbol);
+      }
+      lastSubscriptionKeyBySymbol.set(subscriptionSymbol, latestBarKey);
+      latestSubscriptionGenerationByKey.set(latestBarKey, generation);
+      const shouldResetRestoredBaseline = (
+        typeof onResetCacheNeededCallback === 'function'
+        && restoreResetCandidates.delete(latestBarKey)
+      );
+      resetUnsubscribeGuards.delete(normalizedSubscriberUid);
 
       const previousSubscription = subscriptions.get(normalizedSubscriberUid);
       if (previousSubscription) {
@@ -1331,8 +1458,13 @@ export function createContractTradingViewDatafeed({
         lastEmittedBarFingerprint: '',
         lastStoreBarTime: 0,
         legacyVersionCursor: null,
+        readinessBlocked: shouldResetRestoredBaseline,
+        executedResetPermitId: null,
         releaseKlineSubscription: () => undefined,
         callback: onRealtime,
+        resetCallback: typeof onResetCacheNeededCallback === 'function'
+          ? onResetCacheNeededCallback
+          : null,
       };
 
       subscriptions.set(normalizedSubscriberUid, subscription);
@@ -1438,23 +1570,128 @@ export function createContractTradingViewDatafeed({
         subscriptionSymbol,
         interval,
       ));
+
+      const readiness = getRealtimeSubscriptionReadiness(subscriptionSymbol, interval);
+      if (!shouldResetRestoredBaseline && readiness?.ownerId === ownerId) {
+        scheduleLifecycleCallback(() => {
+          if (destroyed) return;
+          const activeReadiness = getRealtimeSubscriptionReadiness(
+            subscriptionSymbol,
+            interval,
+          );
+          if (activeReadiness?.ownerId !== ownerId) return;
+          try {
+            onRealtimeSubscriptionReady?.(activeReadiness);
+          } catch {
+            // Readiness observation must not change TradingView subscription semantics.
+          }
+        });
+      }
+
+      if (shouldResetRestoredBaseline) {
+        scheduleLifecycleCallback(() => {
+          if (destroyed) return;
+          const activeSubscription = getActiveSubscription();
+          if (!activeSubscription || !activeSubscription.resetCallback) return;
+          try {
+            onRealtimeResetRequired?.({
+              datafeedInstanceId,
+              symbol: activeSubscription.symbol,
+              interval: activeSubscription.interval,
+              subscriberUid: activeSubscription.subscriberUid,
+              ownerId: activeSubscription.ownerId,
+              subscriptionGeneration: activeSubscription.generation,
+              generation: activeSubscription.generation,
+              source: 'RESTORED_BASELINE',
+            });
+          } catch {
+            // Reset evidence observation must not change subscription semantics.
+          }
+        });
+      }
     },
 
     unsubscribeBars(subscriberUid) {
       const normalizedSubscriberUid = String(subscriberUid || '');
       const entry = subscriptions.get(normalizedSubscriberUid);
       if (!entry) return;
+      const resetGuard = resetUnsubscribeGuards.get(normalizedSubscriberUid);
+      const isResetLifecycleUnsubscribe = Boolean(
+        resetGuard
+        && resetGuard.subscriberUid === entry.subscriberUid
+        && resetGuard.symbol === entry.symbol
+        && resetGuard.interval === entry.interval
+        && resetGuard.ownerId === entry.ownerId
+        && resetGuard.generation === entry.generation
+        && resetGuard.latestBarKey === entry.latestBarKey
+        && lastSubscriptionKeyBySymbol.get(entry.symbol) === entry.latestBarKey
+      );
+      resetUnsubscribeGuards.delete(normalizedSubscriberUid);
+      if (isResetLifecycleUnsubscribe) return;
       subscriptions.delete(normalizedSubscriberUid);
       entry.releaseKlineSubscription();
     },
 
+    getRealtimeSubscriptionReadiness,
+    getDatafeedInstanceId: () => datafeedInstanceId,
+
+    executeResetPermit(requirement, permit) {
+      if (destroyed || !permit || permit.source !== requirement.source) return false;
+      const normalizedSubscriberUid = String(requirement.subscriberUid || '');
+      const entry = subscriptions.get(normalizedSubscriberUid);
+      if (
+        !entry
+        || !entry.readinessBlocked
+        || !entry.resetCallback
+        || entry.executedResetPermitId
+        || requirement.datafeedInstanceId !== datafeedInstanceId
+        || entry.symbol !== normalizeContractSymbol(requirement.symbol)
+        || entry.interval !== normalizeContractInterval(requirement.interval)
+        || entry.ownerId !== requirement.ownerId
+        || entry.generation !== requirement.subscriptionGeneration
+        || permit.identity.terminalType !== 'CONTRACT'
+        || permit.identity.datafeedInstanceId !== datafeedInstanceId
+        || permit.identity.symbol !== entry.symbol
+        || permit.identity.backendInterval !== entry.interval
+      ) return false;
+
+      entry.executedResetPermitId = permit.permitId;
+      const resetGuard: ResetUnsubscribeGuard = {
+        subscriberUid: entry.subscriberUid,
+        symbol: entry.symbol,
+        interval: entry.interval,
+        ownerId: entry.ownerId,
+        generation: entry.generation,
+        latestBarKey: entry.latestBarKey,
+      };
+      resetUnsubscribeGuards.set(normalizedSubscriberUid, resetGuard);
+      try {
+        entry.resetCallback();
+      } catch {
+        // A permitted TradingView reset remains best-effort.
+      } finally {
+        scheduleLifecycleCallback(() => {
+          if (resetUnsubscribeGuards.get(normalizedSubscriberUid) === resetGuard) {
+            resetUnsubscribeGuards.delete(normalizedSubscriberUid);
+          }
+        });
+      }
+      return true;
+    },
+
     destroy() {
+      destroyed = true;
       requestGuard.destroy();
       historyCoverageByScope.clear();
       const activeSubscriptions = Array.from(subscriptions.values());
       subscriptions.clear();
       activeSubscriptions.forEach((entry) => entry.releaseKlineSubscription());
       latestBars.clear();
+      klineHighWaterMarks.clear();
+      lastSubscriptionKeyBySymbol.clear();
+      latestSubscriptionGenerationByKey.clear();
+      restoreResetCandidates.clear();
+      resetUnsubscribeGuards.clear();
     },
   };
 }
