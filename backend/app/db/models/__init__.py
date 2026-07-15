@@ -20,6 +20,7 @@ from .user_vip_snapshot import UserVipSnapshot
 from .user_rcb_lock import UserRcbLock
 from .user_fee_preference import UserFeePreference
 from .spot_fee_settings import SpotFeeSettings
+from .spot_private_event import SpotPrivateEvent, SpotPrivateEventSequence
 from .system_config import SystemConfig
 from .site_content import Announcement, HelpArticle, HelpCategory, HomeBanner, SiteSettings
 from .support_ticket import SupportTicket, SupportTicketMessage
@@ -100,6 +101,8 @@ __all__ = [
     "UserRcbLock",
     "UserFeePreference",
     "SpotFeeSettings",
+    "SpotPrivateEvent",
+    "SpotPrivateEventSequence",
     "SystemConfig",
     "Announcement",
     "HelpArticle",

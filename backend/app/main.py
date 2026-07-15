@@ -89,6 +89,14 @@ from app.services.contract_private_ws import (
     start_contract_user_event_subscriber,
     stop_contract_user_event_subscriber,
 )
+from app.services.spot_private_event_relay import (
+    start_spot_private_event_relay,
+    stop_spot_private_event_relay,
+)
+from app.services.spot_private_event_subscriber import (
+    start_spot_private_event_subscriber,
+    stop_spot_private_event_subscriber,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -534,6 +542,12 @@ async def _startup_contract_private_ws_subscriber():
     start_contract_user_event_subscriber()
 
 
+@app.on_event("startup")
+async def _startup_spot_private_event_bridge():
+    start_spot_private_event_subscriber()
+    start_spot_private_event_relay()
+
+
 @app.on_event("shutdown")
 def _shutdown():
     global _withdraw_watcher, _contract_tp_sl_job, _contract_limit_order_job
@@ -580,6 +594,12 @@ def _shutdown():
 @app.on_event("shutdown")
 async def _shutdown_contract_private_ws_subscriber():
     await stop_contract_user_event_subscriber()
+
+
+@app.on_event("shutdown")
+async def _shutdown_spot_private_event_bridge():
+    await stop_spot_private_event_relay()
+    await stop_spot_private_event_subscriber()
 
 
 # =========================
