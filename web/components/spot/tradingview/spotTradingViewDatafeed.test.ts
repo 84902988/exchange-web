@@ -1263,7 +1263,7 @@ test('realtime kline metadata is exposed without rewriting provider OHLCV', asyn
   assert.ok(klineSubscriber, 'kline subscriber was not registered')
 
   const providerKline = {
-    open_time: 1_717_000_120_000,
+    open_time: 1_717_000_060_000,
     open: '101',
     high: '106',
     low: '99',
@@ -1286,7 +1286,7 @@ test('realtime kline metadata is exposed without rewriting provider OHLCV', asyn
 
   assert.deepEqual(providerKline, originalKline)
   assert.deepEqual(emittedBars.at(-1), {
-    time: 1_717_000_120_000,
+    time: 1_717_000_060_000,
     open: 101,
     high: 106,
     low: 99,
@@ -1297,7 +1297,7 @@ test('realtime kline metadata is exposed without rewriting provider OHLCV', asyn
     symbol: 'BTCUSDT',
     interval: '1m',
     reason: 'kline',
-    barTime: 1_717_000_120_000,
+    barTime: 1_717_000_060_000,
     close: 105,
     provider: 'OKX_SPOT',
     source: 'LIVE_WS',
@@ -1306,6 +1306,226 @@ test('realtime kline metadata is exposed without rewriting provider OHLCV', asyn
   })
   datafeed.destroy()
   assert.equal(klineSubscriber, null)
+})
+
+test('realtime reconnect gap backfills authoritative REST buckets before the current candle', async () => {
+  const anchorTime = Date.UTC(2026, 6, 15, 12, 38)
+  const targetTime = anchorTime + (11 * 60_000)
+  const requestParams: Array<Record<string, unknown>> = []
+  requestKlines = async (params) => {
+    requestParams.push(params)
+    if (requestParams.length === 1) {
+      return metadata([row(anchorTime, '100')], {
+        provider: 'OKX_SPOT',
+        source: 'REST_HISTORY',
+      })
+    }
+    return metadata(
+      Array.from({ length: 11 }, (_, index) => row(
+        anchorTime + ((index + 1) * 60_000),
+        String(101 + index),
+      )),
+      { provider: 'OKX_SPOT', source: 'REST_HISTORY' },
+    )
+  }
+  const historyCalls: HistoryCall[] = []
+  const emittedBars: Array<Record<string, unknown>> = []
+  const realtimeEvents: Array<Record<string, unknown>> = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({
+    symbol: 'BTCUSDT',
+    onKlineRealtime: (event: Record<string, unknown>) => realtimeEvents.push(event),
+  })
+
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => historyCalls.length === 1, 'history anchor did not settle')
+  datafeed.subscribeBars(
+    symbolInfo(),
+    '1',
+    (bar: Record<string, unknown>) => emittedBars.push(bar),
+    'gap-recovery-test',
+  )
+
+  klineSubscriber?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    source: 'LIVE_WS',
+    kline: {
+      ...row(targetTime, '999'),
+      provider: 'OKX_SPOT',
+      source: 'LIVE_WS',
+      revision_epoch: 1,
+      revision_seq: 9,
+      is_closed: false,
+      close_state_source: 'PROVIDER_CONFIRMED',
+    },
+  })
+  await waitFor(() => emittedBars.length === 11, 'authoritative gap recovery did not settle')
+
+  assert.equal(requestParams.length, 2)
+  assert.equal(requestParams[1].symbol, 'BTCUSDT')
+  assert.equal(requestParams[1].interval, '1m')
+  assert.equal(requestParams[1].forceRest, true)
+  assert.equal(requestParams[1].endTime, targetTime + 60_000)
+  assert.equal(requestParams[1].limit, 12)
+  assert.deepEqual(
+    emittedBars.map((bar) => bar.time),
+    Array.from({ length: 11 }, (_, index) => anchorTime + ((index + 1) * 60_000)),
+  )
+  assert.equal(emittedBars.at(-1)?.close, 999, 'live revision must remain the current-bucket winner')
+  assert.deepEqual(realtimeEvents.map((event) => event.barTime), [targetTime])
+  datafeed.destroy()
+})
+
+test('gap recovery uses the new subscription cursor instead of a retired live high-water', async () => {
+  const historyAnchorTime = Date.UTC(2026, 6, 15, 14, 3)
+  const recoveryTime = historyAnchorTime + 60_000
+  const liveHighWaterTime = recoveryTime + 60_000
+  const requestParams: Array<Record<string, unknown>> = []
+  requestKlines = async (params) => {
+    requestParams.push(params)
+    if (requestParams.length === 1) {
+      return metadata([row(liveHighWaterTime, '105')], {
+        provider: 'OKX_SPOT',
+        source: 'REST_HISTORY',
+      })
+    }
+    if (requestParams.length === 2) {
+      return metadata([row(historyAnchorTime, '103')], {
+        provider: 'OKX_SPOT',
+        source: 'REST_HISTORY',
+      })
+    }
+    return metadata([
+      row(recoveryTime, '104'),
+      row(liveHighWaterTime, '105'),
+    ], {
+      provider: 'OKX_SPOT',
+      source: 'REST_HISTORY',
+    })
+  }
+
+  const readinessEvents: Array<Record<string, unknown>> = []
+  const firstHistory: HistoryCall[] = []
+  const replacementHistory: HistoryCall[] = []
+  const emittedBars: Array<Record<string, unknown>> = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({
+    symbol: 'BTCUSDT',
+    onRealtimeSubscriptionReady: (event: Record<string, unknown>) => readinessEvents.push(event),
+  })
+
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => firstHistory.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => firstHistory.length === 1, 'initial 1m history did not settle')
+  datafeed.subscribeBars(symbolInfo(), '1', () => undefined, 'high-water-switch-test')
+  const retiredOneMinuteHandler = klineSubscriber
+
+  datafeed.subscribeBars(symbolInfo(), '5', () => undefined, 'high-water-switch-test')
+  datafeed.subscribeBars(
+    symbolInfo(),
+    '1',
+    (bar: Record<string, unknown>) => emittedBars.push(bar),
+    'high-water-switch-test',
+  )
+  const currentOneMinuteHandler = klineSubscriber
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => replacementHistory.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => replacementHistory.length === 1, 'replacement 1m history did not settle')
+
+  const liveRevision = {
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    source: 'LIVE_WS',
+    kline: {
+      ...row(liveHighWaterTime, '106'),
+      provider: 'OKX_SPOT',
+      source: 'LIVE_WS',
+      revision_epoch: 2,
+      revision_seq: 9,
+      is_closed: false,
+      close_state_source: 'PROVIDER_CONFIRMED',
+    },
+  }
+  retiredOneMinuteHandler?.(liveRevision)
+  assert.equal(emittedBars.length, 0, 'retired subscription must not enter recovery')
+  currentOneMinuteHandler?.(liveRevision)
+  await waitFor(() => emittedBars.length === 2, 'new generation gap recovery did not settle')
+
+  assert.deepEqual(emittedBars.map((bar) => bar.time), [recoveryTime, liveHighWaterTime])
+  assert.deepEqual(emittedBars.map((bar) => bar.close), [104, 106])
+  assert.deepEqual(readinessEvents.map((event) => event.subscriptionGeneration), [1, 2, 3])
+  assert.equal(requestParams.length, 3)
+  datafeed.destroy()
+})
+
+test('failed gap recovery records one target failure and does not retry every revision', async () => {
+  const anchorTime = Date.UTC(2026, 6, 15, 14, 3)
+  const targetTime = anchorTime + (2 * 60_000)
+  let requestCount = 0
+  requestKlines = async () => {
+    requestCount += 1
+    if (requestCount === 1) return metadata([row(anchorTime, '103')])
+    throw new Error('recovery unavailable')
+  }
+  const historyCalls: HistoryCall[] = []
+  const emittedBars: Array<Record<string, unknown>> = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => historyCalls.length === 1, 'history anchor did not settle')
+  datafeed.subscribeBars(
+    symbolInfo(),
+    '1',
+    (bar: Record<string, unknown>) => emittedBars.push(bar),
+    'bounded-gap-failure-test',
+  )
+
+  const emitRevision = (revisionSeq: number) => klineSubscriber?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    source: 'LIVE_WS',
+    kline: {
+      ...row(targetTime, String(105 + revisionSeq)),
+      provider: 'OKX_SPOT',
+      source: 'LIVE_WS',
+      revision_epoch: 1,
+      revision_seq: revisionSeq,
+      is_closed: false,
+      close_state_source: 'PROVIDER_CONFIRMED',
+    },
+  })
+  emitRevision(1)
+  await waitFor(() => requestCount === 2, 'first recovery request did not run')
+  await Promise.resolve()
+  emitRevision(2)
+  await Promise.resolve()
+
+  assert.equal(requestCount, 2, 'same failed target must not retry indefinitely')
+  assert.deepEqual(emittedBars, [])
+  datafeed.destroy()
 })
 
 test('realtime revision guard accepts upgrades and suppresses stale duplicate downgrade and time violation', async () => {
@@ -1331,7 +1551,7 @@ test('realtime revision guard accepts upgrades and suppresses stale duplicate do
     interval: '1m',
     source: 'LIVE_WS',
     kline: {
-      open_time: 1_717_000_120_000,
+      open_time: 1_717_000_060_000,
       open: '101',
       high: '106',
       low: '99',
@@ -1353,7 +1573,7 @@ test('realtime revision guard accepts upgrades and suppresses stale duplicate do
   emit({ revision_seq: 6, close: '102' })
   emit({ revision_seq: 6, close: '102', is_closed: true })
   emit({ revision_seq: 7, close: '102', is_closed: false })
-  emit({ open_time: 1_717_000_060_000, revision_seq: 99, close: '88' })
+  emit({ open_time: 1_716_999_940_000, revision_seq: 99, close: '88' })
 
   assert.deepEqual(emittedBars.map((bar) => bar.close), [101, 102, 102])
   datafeed.destroy()
@@ -1373,7 +1593,7 @@ test('late REST getBars cannot overwrite newer realtime same-bucket revision', a
   await waitFor(() => initialHistory.length === 1, 'initial history did not settle')
   datafeed.subscribeBars(symbolInfo(), '1', () => undefined, 'rest-race-test')
 
-  const openTime = 1_717_000_120_000
+  const openTime = 1_717_000_060_000
   klineSubscriber?.({
     type: 'spot_kline_update',
     symbol: 'BTCUSDT',
@@ -1563,7 +1783,7 @@ test('subscription generation rejects a retired same-uid callback after 1m to 5m
     symbol: 'BTCUSDT',
     interval: '1m',
     kline: {
-      ...row(1_717_000_120_000, '105'),
+      ...row(1_717_000_060_000, '105'),
       provider: 'OKX_SPOT',
       revision_epoch: 1,
       revision_seq: 1,
@@ -1660,7 +1880,7 @@ test('symbol switch destroys old revision state and accepts the new symbol indep
     symbol: 'ETHUSDT',
     interval: '1m',
     kline: {
-      ...row(1_717_000_120_000, '105'),
+      ...row(1_717_000_060_000, '105'),
       provider: 'OKX_SPOT',
       revision_epoch: 1,
       revision_seq: 1,
