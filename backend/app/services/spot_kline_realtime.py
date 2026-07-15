@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Optional
 
-from sqlalchemy import func
+from sqlalchemy import case, func, tuple_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -188,6 +188,7 @@ def apply_spot_trade_to_klines(
     rows_by_interval: dict[str, dict[str, Any]] = {}
 
     try:
+        insert_rows: list[dict[str, Any]] = []
         for interval in normalized_intervals:
             item = apply_trade_to_spot_kline_item(
                 None,
@@ -197,8 +198,7 @@ def apply_spot_trade_to_klines(
                 trade_ts_ms=trade_ts_ms,
             )
             rows_by_interval[interval] = item
-
-            stmt = mysql_insert(MarketKline).values(
+            insert_rows.append(
                 {
                     "market_type": SPOT_KLINE_MARKET_TYPE,
                     "symbol": normalized_symbol,
@@ -218,42 +218,62 @@ def apply_spot_trade_to_klines(
                     "updated_at": now,
                 }
             )
-            inserted = stmt.inserted
-            stmt = stmt.on_duplicate_key_update(
-                close_time=inserted.close_time,
-                high=func.greatest(MarketKline.high, inserted.high),
-                low=func.least(MarketKline.low, inserted.low),
-                close=inserted.close,
-                volume=MarketKline.volume + inserted.volume,
-                quote_volume=func.coalesce(MarketKline.quote_volume, Decimal("0"))
-                + inserted.quote_volume,
-                source=inserted.source,
-                is_closed=inserted.is_closed,
-                fetched_at=inserted.fetched_at,
-                updated_at=inserted.updated_at,
-            )
-            db.execute(stmt)
 
-        db.flush()
+        stmt = mysql_insert(MarketKline).values(insert_rows)
+        inserted = stmt.inserted
+        stmt = stmt.on_duplicate_key_update(
+            close_time=inserted.close_time,
+            high=func.greatest(MarketKline.high, inserted.high),
+            low=func.least(MarketKline.low, inserted.low),
+            close=inserted.close,
+            volume=MarketKline.volume + inserted.volume,
+            quote_volume=func.coalesce(MarketKline.quote_volume, Decimal("0"))
+            + inserted.quote_volume,
+            source=inserted.source,
+            is_closed=inserted.is_closed,
+            fetched_at=inserted.fetched_at,
+            updated_at=inserted.updated_at,
+        )
+        db.execute(stmt)
+
+        exact_keys = [
+            (interval, int(rows_by_interval[interval]["open_time"]))
+            for interval in normalized_intervals
+        ]
+        interval_order = case(
+            {interval: position for position, interval in enumerate(normalized_intervals)},
+            value=MarketKline.interval,
+            else_=len(normalized_intervals),
+        )
+        selected_rows = (
+            db.query(MarketKline)
+            .filter(
+                MarketKline.market_type == SPOT_KLINE_MARKET_TYPE,
+                MarketKline.symbol == normalized_symbol,
+                tuple_(MarketKline.interval, MarketKline.open_time).in_(exact_keys),
+            )
+            .order_by(interval_order)
+            .all()
+        )
+        selected_by_key = {
+            (str(row.interval), int(row.open_time)): row for row in selected_rows
+        }
 
         messages: list[dict[str, Any]] = []
-        for interval, fallback_item in rows_by_interval.items():
-            row = (
-                db.query(MarketKline)
-                .filter(
-                    MarketKline.market_type == SPOT_KLINE_MARKET_TYPE,
-                    MarketKline.symbol == normalized_symbol,
-                    MarketKline.interval == interval,
-                    MarketKline.open_time == int(fallback_item["open_time"]),
+        for interval in normalized_intervals:
+            open_time = int(rows_by_interval[interval]["open_time"])
+            row = selected_by_key.get((interval, open_time))
+            if row is None:
+                raise SQLAlchemyError(
+                    "spot kline batch select missing authoritative row "
+                    f"symbol={normalized_symbol} interval={interval} open_time={open_time}"
                 )
-                .first()
-            )
             updated_at = getattr(row, "updated_at", None) or now
             messages.append(
                 build_spot_kline_update_message(
                     symbol=normalized_symbol,
                     interval=interval,
-                    kline=row or fallback_item,
+                    kline=row,
                     source=source,
                     updated_at=updated_at.isoformat()
                     if hasattr(updated_at, "isoformat")
