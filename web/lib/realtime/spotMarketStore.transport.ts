@@ -230,6 +230,9 @@ function makeSnapshot<TData>(params: {
   const ageBasis = cacheUpdatedAtMs ?? receivedAtMs;
   const snapshotId = readText(records, 'snapshot_id')
     ?? `spot-mirror-${params.symbol}-${params.domain}-${params.interval ?? 'none'}-${++mirrorSnapshotSequence}`;
+  const providerEventTimeMs = readNumber(records, 'provider_event_time_ms')
+    ?? readNumber(records, 'event_time_ms')
+    ?? (params.domain === 'depth' ? readNumber([params.payload], 'ts') : null);
 
   return {
     schema_version: 'spot-domain-snapshot/v1',
@@ -247,8 +250,7 @@ function makeSnapshot<TData>(params: {
       source,
       freshness,
       fallback_reason: readEnum(records, 'fallback_reason', VALID_FALLBACK_REASONS),
-      provider_event_time_ms: readNumber(records, 'provider_event_time_ms')
-        ?? readNumber(records, 'event_time_ms'),
+      provider_event_time_ms: providerEventTimeMs,
       received_at_ms: receivedAtMs,
       cache_updated_at_ms: cacheUpdatedAtMs,
       age_ms: readNumber(records, 'age_ms') ?? Math.max(0, now - ageBasis),
