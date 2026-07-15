@@ -204,6 +204,34 @@ export type SpotTradingViewHistoryBarsEvent = {
 
 type EmitRealtimeBar = (bar: TradingViewBar, reason: string) => boolean;
 
+type SpotRealtimeRevisionEnvelope = {
+  candidate: SpotKlineRevisionCandidate;
+  provider: string;
+  source: string;
+  freshness: string;
+  receivedAtMs: number;
+};
+
+type SpotRealtimeGapRecoveryFailureReason =
+  | 'gap-recovery-stale'
+  | 'gap-recovery-missing'
+  | 'gap-recovery-invalid';
+
+type SpotRealtimeGapRecoveryResult =
+  | { recovered: true; targetTime: number }
+  | {
+      recovered: false;
+      targetTime: number;
+      reason: SpotRealtimeGapRecoveryFailureReason;
+    };
+
+type SpotRealtimeGapRecoveryState = {
+  subscriptionGeneration: number;
+  anchorTime: number;
+  cursorTime: number;
+  targetTime: number;
+};
+
 type HistoryKlineRequestResult = {
   bars: TradingViewBar[];
   revisionCandidates: SpotKlineRevisionCandidate[];
@@ -307,6 +335,7 @@ let spotTradingViewGetBarsRequestSeq = 0;
 let spotTradingViewDatafeedInstanceSeq = 0;
 const SPOT_TV_DEBUG_EVENT_LIMIT = 500;
 const SPOT_TV_REALTIME_HIGH_WATER_CAPACITY = 128;
+const SPOT_TV_REALTIME_GAP_RECOVERY_MAX_BARS = 500;
 const SPOT_TV_GETBARS_API_PAGE_LIMIT = 500;
 const SPOT_TV_GETBARS_MAX_INTERNAL_BARS = 1000;
 const SPOT_TV_GETBARS_MAX_INTERNAL_PAGES = 3;
@@ -314,6 +343,36 @@ const SPOT_TV_GETBARS_SETTLE_WATCHDOG_MS = 4_250;
 const SPOT_TV_GETBARS_HARD_TIMEOUT_MS = 12_000;
 const SPOT_TV_EMPTY_RANGE_TTL_MS = 5_000;
 const SPOT_TV_EMPTY_RANGE_BACKOFF_MS = [120, 500, 1_000] as const;
+
+function getExpectedNextRealtimeBarTimeMs(interval: string, timeMs: number) {
+  const normalizedInterval = normalizeSpotInterval(interval);
+  if (normalizedInterval === '1M' || normalizedInterval === '1Mutc') {
+    const date = new Date(timeMs);
+    return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1);
+  }
+  return timeMs + getSpotIntervalMs(normalizedInterval);
+}
+
+function hasRealtimeBarGap(interval: string, previousTime: number, nextTime: number) {
+  if (!Number.isFinite(previousTime) || previousTime <= 0) return false;
+  if (!Number.isFinite(nextTime) || nextTime <= previousTime) return false;
+  return nextTime > getExpectedNextRealtimeBarTimeMs(interval, previousTime);
+}
+
+function getRealtimeGapRecoveryLimit(interval: string, previousTime: number, nextTime: number) {
+  let cursor = previousTime;
+  let bars = 0;
+  while (cursor < nextTime && bars < SPOT_TV_REALTIME_GAP_RECOVERY_MAX_BARS) {
+    const nextCursor = getExpectedNextRealtimeBarTimeMs(interval, cursor);
+    if (!Number.isFinite(nextCursor) || nextCursor <= cursor) break;
+    cursor = nextCursor;
+    bars += 1;
+  }
+  return Math.min(
+    SPOT_TV_REALTIME_GAP_RECOVERY_MAX_BARS,
+    Math.max(2, bars + 1),
+  );
+}
 
 const DATAFEED_CONFIGURATION: TradingViewDatafeedConfiguration = {
   supports_search: true,
@@ -2865,8 +2924,10 @@ export function createSpotTradingViewDatafeed(
       const latestBarKey = getLatestBarKey(requestResolution);
       const subscriptionKey = getSubscriptionKey(interval, subscriberUid);
       const subscriptionGeneration = ++subscriptionGenerationSequence;
+      let subscriptionRetired = false;
       const isCurrentSubscription = () =>
         !destroyed &&
+        !subscriptionRetired &&
         activeSubscriptionKeyByUid.get(subscriberUid) === subscriptionKey &&
         latestBarKeyByUid.get(subscriberUid) === latestBarKey &&
         activeSubscriptionGenerationByUid.get(subscriberUid) === subscriptionGeneration;
@@ -2921,6 +2982,249 @@ export function createSpotTradingViewDatafeed(
         return true;
       };
 
+      let pendingGapRevision: SpotRealtimeRevisionEnvelope | null = null;
+      let gapRecoveryInFlight: Promise<void> | null = null;
+      let gapRecoveryState: SpotRealtimeGapRecoveryState | null = null;
+      let failedGapTargetTime = 0;
+
+      const notifyKlineRealtime = (
+        bar: TradingViewBar,
+        envelope: SpotRealtimeRevisionEnvelope,
+      ) => {
+        options.onKlineRealtime?.({
+          symbol: apiSymbol,
+          interval,
+          reason: 'kline',
+          barTime: bar.time,
+          close: bar.close,
+          provider: envelope.provider || null,
+          source: envelope.source || 'LIVE_WS',
+          freshness: envelope.freshness,
+          receivedAtMs: envelope.receivedAtMs,
+        });
+      };
+
+      const emitGapRecoveryBar = (bar: TradingViewBar) => {
+        const state = gapRecoveryState;
+        if (
+          !isCurrentSubscription()
+          || !state
+          || state.subscriptionGeneration !== subscriptionGeneration
+          || historyReadyByLatestBarKey.get(latestBarKey) === false
+          || !Number.isFinite(bar.time)
+          || latestBars.get(latestBarKey)?.time !== state.cursorTime
+          || bar.time <= state.cursorTime
+          || bar.time > state.targetTime
+        ) {
+          return false;
+        }
+
+        const nextBar = { ...bar };
+        latestBars.set(latestBarKey, nextBar);
+        lastEmittedBarTimeByUid.set(subscriberUid, nextBar.time);
+        state.cursorTime = nextBar.time;
+        onRealtime(nextBar);
+        return true;
+      };
+
+      const recoverRealtimeGap = async (
+        target: SpotRealtimeRevisionEnvelope,
+      ): Promise<SpotRealtimeGapRecoveryResult> => {
+        const targetTime = target.candidate.bar.time;
+        if (!isCurrentSubscription()) {
+          return { recovered: false, targetTime, reason: 'gap-recovery-stale' };
+        }
+        const anchor = latestBars.get(latestBarKey);
+        if (!anchor || !hasRealtimeBarGap(interval, anchor.time, targetTime)) {
+          const didEmit = emitRealtimeBar(target.candidate.bar, 'kline');
+          if (didEmit) notifyKlineRealtime(target.candidate.bar, target);
+          return didEmit
+            ? { recovered: true, targetTime }
+            : { recovered: false, targetTime, reason: 'gap-recovery-stale' };
+        }
+
+        gapRecoveryState = {
+          subscriptionGeneration,
+          anchorTime: anchor.time,
+          cursorTime: anchor.time,
+          targetTime,
+        };
+
+        const limit = getRealtimeGapRecoveryLimit(interval, anchor.time, targetTime);
+        spotTradingViewDebug('subscribeBars gap recovery start', {
+          symbol: apiSymbol,
+          interval,
+          chartInterval,
+          backendInterval: interval,
+          subscriberUid,
+          anchorTime: anchor.time,
+          targetTime,
+          limit,
+        });
+        const payload = await getSpotKlines({
+          symbol: apiSymbol,
+          interval,
+          limit,
+          endTime: getExpectedNextRealtimeBarTimeMs(interval, targetTime),
+          forceRest: true,
+        });
+        if (!isCurrentSubscription()) {
+          return { recovered: false, targetTime, reason: 'gap-recovery-stale' };
+        }
+        if (
+          gapRecoveryState?.anchorTime !== anchor.time
+          || latestBars.get(latestBarKey)?.time !== anchor.time
+        ) {
+          return { recovered: false, targetTime, reason: 'gap-recovery-stale' };
+        }
+
+        const latestTarget = pendingGapRevision?.candidate.bar.time === targetTime
+          ? pendingGapRevision
+          : target;
+        const restCandidates = normalizeHistoryRevisionCandidates(
+          apiSymbol,
+          payload.items,
+          interval,
+          payload.provider,
+          payload.source,
+        );
+        const recoveredCandidates = revisionCache.mergeMany([
+          ...restCandidates,
+          latestTarget.candidate,
+        ]).filter((candidate) => (
+          candidate.bar.time > anchor.time && candidate.bar.time <= targetTime
+        ));
+        const recoveredBars = mergeTradingViewBars([
+          anchor,
+          ...recoveredCandidates.map((candidate) => candidate.bar),
+        ]);
+        const continuityStats = getBarsContinuityStats(recoveredBars, interval);
+        const lastRecoveredBar = recoveredBars[recoveredBars.length - 1] || null;
+        const continuityRejected = (
+          lastRecoveredBar?.time !== targetTime
+          || shouldRejectKlineContinuity({
+            interval,
+            source: payload.source,
+            bars: recoveredBars,
+            continuityStats,
+          })
+        );
+        if (continuityRejected) {
+          spotTradingViewDebug('subscribeBars gap recovery incomplete', {
+            symbol: apiSymbol,
+            interval,
+            chartInterval,
+            backendInterval: interval,
+            subscriberUid,
+            anchorTime: anchor.time,
+            targetTime,
+            recoveredCount: Math.max(0, recoveredBars.length - 1),
+            lastRecoveredTime: lastRecoveredBar?.time || null,
+            continuityGapCount: continuityStats.gapCount,
+            continuityDuplicateCount: continuityStats.duplicateCount,
+            continuityOutOfOrderCount: continuityStats.outOfOrderCount,
+            continuityInvalidOhlcCount: continuityStats.invalidOhlcCount,
+            source: payload.source,
+            provider: payload.provider,
+          });
+          return {
+            recovered: false,
+            targetTime,
+            reason: lastRecoveredBar?.time !== targetTime
+              ? 'gap-recovery-missing'
+              : 'gap-recovery-invalid',
+          };
+        }
+
+        for (const recoveredBar of recoveredBars.slice(1)) {
+          if (!emitGapRecoveryBar(recoveredBar)) {
+            return { recovered: false, targetTime, reason: 'gap-recovery-stale' };
+          }
+        }
+        rememberRealtimeHighWaterMark(latestBarKey, targetTime);
+        notifyKlineRealtime(lastRecoveredBar, latestTarget);
+        spotTradingViewDebug('subscribeBars gap recovery success', {
+          symbol: apiSymbol,
+          interval,
+          chartInterval,
+          backendInterval: interval,
+          subscriberUid,
+          anchorTime: anchor.time,
+          targetTime,
+          recoveredCount: Math.max(0, recoveredBars.length - 1),
+          source: payload.source,
+          provider: payload.provider,
+        });
+        gapRecoveryState = null;
+        return { recovered: true, targetTime };
+      };
+
+      const queueRealtimeGapRecovery = (envelope: SpotRealtimeRevisionEnvelope) => {
+        const queuedTargetTime = envelope.candidate.bar.time;
+        if (queuedTargetTime === failedGapTargetTime) return;
+        if (queuedTargetTime > failedGapTargetTime) failedGapTargetTime = 0;
+        pendingGapRevision = envelope;
+        if (gapRecoveryInFlight) return;
+
+        const recovery = (async () => {
+          while (isCurrentSubscription() && pendingGapRevision) {
+            const target: SpotRealtimeRevisionEnvelope = pendingGapRevision;
+            const targetTime = target.candidate.bar.time;
+            let result: SpotRealtimeGapRecoveryResult;
+            try {
+              result = await recoverRealtimeGap(target);
+            } catch (error: unknown) {
+              result = {
+                recovered: false,
+                targetTime,
+                reason: 'gap-recovery-missing',
+              };
+              spotTradingViewDebug('subscribeBars gap recovery error', {
+                symbol: apiSymbol,
+                interval,
+                chartInterval,
+                backendInterval: interval,
+                subscriberUid,
+                targetTime,
+                reason: result.reason,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+
+            if (!isCurrentSubscription()) break;
+            if (!result.recovered) {
+              failedGapTargetTime = result.targetTime;
+              gapRecoveryState = null;
+              spotTradingViewDebug('subscribeBars gap recovery failed', {
+                symbol: apiSymbol,
+                interval,
+                chartInterval,
+                backendInterval: interval,
+                subscriberUid,
+                subscriptionGeneration,
+                targetTime: result.targetTime,
+                reason: result.reason,
+              });
+              if ((pendingGapRevision?.candidate.bar.time || 0) <= result.targetTime) {
+                pendingGapRevision = null;
+              }
+              continue;
+            }
+
+            failedGapTargetTime = 0;
+            gapRecoveryState = null;
+            if (pendingGapRevision?.candidate.bar.time === targetTime) {
+              pendingGapRevision = null;
+            }
+          }
+        })();
+        gapRecoveryInFlight = recovery;
+        void recovery
+          .finally(() => {
+            if (gapRecoveryInFlight === recovery) gapRecoveryInFlight = null;
+          });
+      };
+
       const handleKline = (message: SpotKlineStoreRealtimeEvent) => {
         if (!isCurrentSubscription()) return;
 
@@ -2950,6 +3254,7 @@ export function createSpotTradingViewDatafeed(
           latestBar?.time || 0,
           getRealtimeHighWaterMark(latestBarKey),
           lastEmittedBarTimeByUid.get(subscriberUid) || 0,
+          pendingGapRevision?.candidate.bar.time || 0,
         );
         if (bar.time < latestAcceptedTime) return;
         const revisionPayload = klinePayload
@@ -2999,19 +3304,26 @@ export function createSpotTradingViewDatafeed(
         if (revisionResult.decision !== 'ACCEPT') return;
         if (latestBar && revisionBar.time < latestBar.time) return;
 
-        const didEmit = emitRealtimeBar(revisionBar, 'kline');
-        if (!didEmit) return;
-        options.onKlineRealtime?.({
-          symbol: apiSymbol,
-          interval,
-          reason: 'kline',
-          barTime: revisionBar.time,
-          close: revisionBar.close,
-          provider: klineProvider || null,
-          source: klineSource || 'LIVE_WS',
+        const realtimeEnvelope: SpotRealtimeRevisionEnvelope = {
+          candidate: revisionResult.winner,
+          provider: klineProvider,
+          source: klineSource,
           freshness: klineFreshness,
           receivedAtMs: message.receivedAtMs,
-        });
+        };
+        const currentLatestBar = latestBars.get(latestBarKey);
+        if (
+          klineSource === 'LIVE_WS'
+          && currentLatestBar
+          && hasRealtimeBarGap(interval, currentLatestBar.time, revisionBar.time)
+        ) {
+          queueRealtimeGapRecovery(realtimeEnvelope);
+          return;
+        }
+
+        const didEmit = emitRealtimeBar(revisionBar, 'kline');
+        if (!didEmit) return;
+        notifyKlineRealtime(revisionBar, realtimeEnvelope);
       };
 
       const subscriptionId = spotMarketRealtime.acquireSubscription({
@@ -3027,6 +3339,10 @@ export function createSpotTradingViewDatafeed(
         onSnapshot: handleKline,
       });
       const unsubscribe = () => {
+        subscriptionRetired = true;
+        pendingGapRevision = null;
+        gapRecoveryState = null;
+        failedGapTargetTime = 0;
         unsubscribeKline();
         spotMarketRealtime.releaseSubscription(subscriptionId);
       };
