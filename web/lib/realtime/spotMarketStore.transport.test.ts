@@ -163,6 +163,192 @@ describe('Spot market transport mirror', () => {
     expect(transport.statusHandlers.size).toBe(0);
   });
 
+  it('accepts newer WS depth.ts after a REST snapshot and prefers explicit event_time_ms', () => {
+    const transport = new TestTransport();
+    const store = createSpotPublicMarketStore();
+    const detach = attachSpotMarketStoreTransportMirror(transport, store);
+
+    transport.emit('snapshot', {
+      type: 'spot_market_snapshot',
+      symbol: 'BTCUSDT',
+      depth: {
+        symbol: 'BTCUSDT',
+        bids: [{ price: '100', amount: '1' }],
+        asks: [{ price: '101', amount: '1' }],
+        provider: 'BINANCE',
+        transport: 'PROVIDER_REST',
+        source: 'REST_SNAPSHOT',
+        freshness: 'RECENT',
+        event_time_ms: 1_000,
+      },
+    });
+    transport.emit('depth', {
+      type: 'spot_depth_update',
+      symbol: 'BTCUSDT',
+      depth: {
+        symbol: 'BTCUSDT',
+        bids: [{ price: '110', amount: '2' }],
+        asks: [{ price: '111', amount: '2' }],
+        provider: 'BINANCE',
+        source: 'LIVE_WS',
+        freshness: 'LIVE',
+        ts: 1_100,
+      },
+    });
+
+    expect(store.getState().symbols.BTCUSDT.depth.snapshot?.data?.bids[0].price).toBe('110');
+    expect(store.getState().symbols.BTCUSDT.depth.snapshot?.metadata.provider_event_time_ms).toBe(1_100);
+
+    transport.emit('depth', {
+      type: 'spot_depth_update',
+      symbol: 'BTCUSDT',
+      depth: {
+        symbol: 'BTCUSDT',
+        bids: [{ price: '120', amount: '3' }],
+        asks: [{ price: '121', amount: '3' }],
+        provider: 'BINANCE',
+        source: 'LIVE_WS',
+        freshness: 'LIVE',
+        event_time_ms: 1_200,
+        ts: 900,
+      },
+    });
+
+    expect(store.getState().symbols.BTCUSDT.depth.snapshot?.data?.bids[0].price).toBe('120');
+    expect(store.getState().symbols.BTCUSDT.depth.snapshot?.metadata.provider_event_time_ms).toBe(1_200);
+    detach();
+  });
+
+  it('rejects WS depth.ts older than the current REST event time', () => {
+    const transport = new TestTransport();
+    const store = createSpotPublicMarketStore();
+    const detach = attachSpotMarketStoreTransportMirror(transport, store);
+
+    transport.emit('snapshot', {
+      type: 'spot_market_snapshot',
+      symbol: 'BTCUSDT',
+      depth: {
+        symbol: 'BTCUSDT',
+        bids: [{ price: '200', amount: '1' }],
+        asks: [{ price: '201', amount: '1' }],
+        provider: 'BINANCE',
+        transport: 'PROVIDER_REST',
+        source: 'REST_SNAPSHOT',
+        freshness: 'RECENT',
+        event_time_ms: 2_000,
+      },
+    });
+    const restSnapshot = store.getState().symbols.BTCUSDT.depth.snapshot;
+
+    transport.emit('depth', {
+      type: 'spot_depth_update',
+      symbol: 'BTCUSDT',
+      depth: {
+        symbol: 'BTCUSDT',
+        bids: [{ price: '190', amount: '2' }],
+        asks: [{ price: '191', amount: '2' }],
+        provider: 'BINANCE',
+        source: 'LIVE_WS',
+        freshness: 'LIVE',
+        ts: 1_900,
+      },
+    });
+
+    expect(store.getState().symbols.BTCUSDT.depth.snapshot).toBe(restSnapshot);
+    detach();
+  });
+
+  it('rejects a WS depth event from an older provider generation', () => {
+    const transport = new TestTransport();
+    const store = createSpotPublicMarketStore();
+    const detach = attachSpotMarketStoreTransportMirror(transport, store);
+
+    transport.emit('snapshot', {
+      type: 'spot_market_snapshot',
+      symbol: 'BTCUSDT',
+      depth: {
+        symbol: 'BTCUSDT',
+        bids: [{ price: '200', amount: '1' }],
+        asks: [{ price: '201', amount: '1' }],
+        provider: 'BINANCE',
+        transport: 'PROVIDER_REST',
+        source: 'REST_SNAPSHOT',
+        freshness: 'RECENT',
+        event_time_ms: 2_000,
+        generation: 2,
+      },
+    });
+    const generationTwoSnapshot = store.getState().symbols.BTCUSDT.depth.snapshot;
+
+    transport.emit('depth', {
+      type: 'spot_depth_update',
+      symbol: 'BTCUSDT',
+      depth: {
+        symbol: 'BTCUSDT',
+        bids: [{ price: '210', amount: '2' }],
+        asks: [{ price: '211', amount: '2' }],
+        provider: 'BINANCE',
+        source: 'LIVE_WS',
+        freshness: 'LIVE',
+        ts: 2_100,
+        generation: 1,
+      },
+    });
+
+    expect(store.getState().symbols.BTCUSDT.depth.snapshot).toBe(generationTwoSnapshot);
+    detach();
+  });
+
+  it('continuously applies a WS depth stream after its REST bootstrap snapshot', () => {
+    const transport = new TestTransport();
+    const store = createSpotPublicMarketStore();
+    const detach = attachSpotMarketStoreTransportMirror(transport, store);
+    const acceptedBidPrices: string[] = [];
+    let lastAcceptedPrice: string | null = null;
+    const unsubscribe = store.subscribe((state) => {
+      const price = state.symbols.BTCUSDT?.depth.snapshot?.data?.bids[0]?.price;
+      if (price === undefined || String(price) === lastAcceptedPrice) return;
+      lastAcceptedPrice = String(price);
+      acceptedBidPrices.push(lastAcceptedPrice);
+    });
+
+    transport.emit('snapshot', {
+      type: 'spot_market_snapshot',
+      symbol: 'BTCUSDT',
+      depth: {
+        symbol: 'BTCUSDT',
+        bids: [{ price: '100', amount: '1' }],
+        asks: [{ price: '101', amount: '1' }],
+        provider: 'BINANCE',
+        transport: 'PROVIDER_REST',
+        source: 'REST_SNAPSHOT',
+        freshness: 'RECENT',
+        event_time_ms: 1_000,
+      },
+    });
+
+    for (const [ts, bidPrice] of [[1_100, '110'], [1_200, '120'], [1_300, '130']] as const) {
+      transport.emit('depth', {
+        type: 'spot_depth_update',
+        symbol: 'BTCUSDT',
+        depth: {
+          symbol: 'BTCUSDT',
+          bids: [{ price: bidPrice, amount: '2' }],
+          asks: [{ price: String(Number(bidPrice) + 1), amount: '2' }],
+          provider: 'BINANCE',
+          source: 'LIVE_WS',
+          freshness: 'LIVE',
+          ts,
+        },
+      });
+    }
+
+    expect(acceptedBidPrices).toEqual(['100', '110', '120', '130']);
+    expect(store.getState().symbols.BTCUSDT.depth.snapshot?.metadata.provider_event_time_ms).toBe(1_300);
+    unsubscribe();
+    detach();
+  });
+
   it('attaches at most one listener set for the same transport and store', () => {
     const transport = new TestTransport();
     const store = createSpotPublicMarketStore();
