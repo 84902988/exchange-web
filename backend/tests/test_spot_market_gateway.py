@@ -12,6 +12,7 @@ from app.services import market
 from app.services import market_kline_cache
 from app.services import spot_market_gateway as gateway_module
 from app.services.spot_market_gateway import SpotMarketGateway
+from app.services.spot_kline_events import ProviderKlineRevisionAccepted
 
 
 def _ms(year: int, month: int, day: int, hour: int, minute: int = 0) -> int:
@@ -247,6 +248,71 @@ def _kline_payload(**overrides) -> dict:
     }
     payload.update(overrides)
     return payload
+
+
+def _accepted_kline_event(
+    gateway: SpotMarketGateway,
+    kline: dict,
+    *,
+    generation: int = 1,
+    provider: str = "BITGET_SPOT",
+    symbol: str = "BTCUSDT",
+    interval: str = "1m",
+) -> ProviderKlineRevisionAccepted:
+    return ProviderKlineRevisionAccepted(
+        provider=provider,
+        symbol=symbol,
+        interval=interval,
+        open_time=int(kline["open_time"]),
+        revision_epoch=int(kline["revision_epoch"]),
+        revision_seq=int(kline["revision_seq"]),
+        generation=generation,
+        signature=gateway._kline_signature(symbol, interval, kline),
+        accepted_at_ms=10_000,
+        is_closed=kline.get("is_closed"),
+    )
+
+
+def _new_event_kline_gateway(
+    items: list[dict],
+    *,
+    generation: int = 1,
+) -> tuple[SpotMarketGateway, FakeWsManager]:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    ws_manager = FakeWsManager()
+    provider = FakeProvider()
+
+    def get_kline_revisions(symbol: str, interval: str, **kwargs) -> dict:
+        return {
+            "symbol": symbol,
+            "interval": interval,
+            "provider": "BITGET_SPOT",
+            "provider_symbol": symbol,
+            "source": "LIVE_WS",
+            "freshness": "LIVE",
+            "updated_at_ms": 10_000,
+            "items": list(items),
+        }
+
+    gateway = SpotMarketGateway(
+        ensure_depth=provider.ensure,
+        ensure_kline=lambda symbol, interval: None,
+        release_depth=provider.release,
+        get_depth=provider.get_depth,
+        get_ticker=provider.get_ticker,
+        get_trades=provider.get_trades,
+        get_kline_revisions=get_kline_revisions,
+        get_kline_generation=lambda symbol, interval: generation,
+        provider_symbol_allowed=lambda symbol: True,
+        precision_resolver=lambda symbol: (2, 3),
+        ws_manager=ws_manager,
+    )
+    gateway._symbol_providers["BTCUSDT"] = "BITGET_SPOT"
+    gateway._ensured_kline_intervals["BTCUSDT"] = {"1m"}
+    return gateway, ws_manager
 
 
 def _spot_provider(code: str, *, priority: int = 1, enabled: bool = True):
@@ -676,20 +742,21 @@ def test_gateway_kline_broadcast_state_dedupes_detects_ohlcv_changes_and_isolate
         assert gateway._should_broadcast_kline("BTCUSDT", "1m", kline, provider="BITGET_SPOT") is False
 
         key = gateway._domain_key("kline", "BTCUSDT", provider="BITGET_SPOT", interval="1m")
-        assert gateway._kline_broadcast_interval_ms() == 500
+        assert gateway._kline_broadcast_interval_ms() == 200
+        assert gateway._loop_interval_seconds() == 0.2
         fixed_now = 1_000_000
         gateway._broadcast_state.now_ms = lambda: fixed_now
         changed_close = _kline_payload(close="2.6")
         gateway._broadcast_state.remember_broadcast(
             key,
             gateway._kline_signature("BTCUSDT", "1m", kline),
-            now_ms=fixed_now - 400,
+            now_ms=fixed_now - 199,
         )
         assert gateway._should_broadcast_kline("BTCUSDT", "1m", changed_close, provider="BITGET_SPOT") is False
         gateway._broadcast_state.remember_broadcast(
             key,
             gateway._kline_signature("BTCUSDT", "1m", kline),
-            now_ms=fixed_now - 500,
+            now_ms=fixed_now - 200,
         )
         assert gateway._should_broadcast_kline("BTCUSDT", "1m", changed_close, provider="BITGET_SPOT") is True
 
@@ -844,6 +911,170 @@ def test_gateway_latest_kline_remains_ordered_by_open_time_not_revision_seq() ->
     assert latest is not None
     assert latest["open_time"] == 2_000
     assert latest["revision_seq"] == 1
+
+
+def test_gateway_provider_kline_notification_only_schedules_on_gateway_loop() -> None:
+    kline = _kline_payload(revision_epoch=1, revision_seq=1)
+    gateway, ws_manager = _new_event_kline_gateway([kline])
+    scheduled: list[tuple[object, tuple[object, ...]]] = []
+
+    class DeferredLoop:
+        @staticmethod
+        def is_closed() -> bool:
+            return False
+
+        @staticmethod
+        def call_soon_threadsafe(callback, *args) -> None:
+            scheduled.append((callback, args))
+
+    gateway._kline_event_loop = DeferredLoop()
+    event = _accepted_kline_event(gateway, kline)
+    gateway.notify_provider_kline_revision(event)
+
+    assert ws_manager.kline_broadcasts == []
+    assert gateway._kline_pending == {}
+    assert len(scheduled) == 1
+    callback, args = scheduled[0]
+    assert callback == gateway._enqueue_provider_kline_revision
+    assert args == (event,)
+
+
+def test_gateway_accepted_kline_event_wakes_worker_and_uses_existing_broadcast_path() -> None:
+    async def run() -> None:
+        kline = _kline_payload(
+            revision_epoch=1,
+            revision_seq=1,
+            is_closed=False,
+            close_state_source="PROVIDER_CONFIRMED",
+        )
+        gateway, ws_manager = _new_event_kline_gateway([kline])
+        await gateway._ensure_kline_event_worker("BTCUSDT")
+        try:
+            event = _accepted_kline_event(gateway, kline)
+            gateway.notify_provider_kline_revision(event)
+            await asyncio.sleep(0.05)
+
+            assert len(ws_manager.kline_broadcasts) == 1
+            broadcast = ws_manager.kline_broadcasts[0]
+            assert broadcast["symbol"] == "BTCUSDT"
+            assert broadcast["interval"] == "1m"
+            assert broadcast["kline"]["revision_seq"] == 1
+            assert broadcast["revision_epoch"] == 1
+            assert broadcast["revision_seq"] == 1
+
+            gateway.notify_provider_kline_revision(event)
+            await asyncio.sleep(0.05)
+            assert len(ws_manager.kline_broadcasts) == 1
+        finally:
+            await gateway._stop_kline_event_worker("BTCUSDT")
+
+    asyncio.run(run())
+
+
+def test_gateway_event_pending_coalesces_same_bucket_to_highest_revision() -> None:
+    async def run() -> None:
+        revisions = [
+            _kline_payload(close=str(2 + revision / 10), revision_epoch=1, revision_seq=revision)
+            for revision in (1, 2, 3)
+        ]
+        gateway, ws_manager = _new_event_kline_gateway([revisions[-1]])
+        await gateway._ensure_kline_event_worker("BTCUSDT")
+        try:
+            for kline in revisions:
+                gateway._enqueue_provider_kline_revision(
+                    _accepted_kline_event(gateway, kline)
+                )
+            await asyncio.sleep(0.05)
+
+            assert len(ws_manager.kline_broadcasts) == 1
+            assert ws_manager.kline_broadcasts[0]["revision_seq"] == 3
+            assert ws_manager.kline_broadcasts[0]["kline"]["close"] == revisions[-1]["close"]
+        finally:
+            await gateway._stop_kline_event_worker("BTCUSDT")
+
+    asyncio.run(run())
+
+
+def test_gateway_event_pending_preserves_old_final_before_new_bucket_open() -> None:
+    async def run() -> None:
+        old_final = _kline_payload(
+            open_time=1_000,
+            close_time=60_999,
+            close="2.7",
+            revision_epoch=1,
+            revision_seq=1,
+            is_closed=True,
+            close_state_source="PROVIDER_CONFIRMED",
+        )
+        new_open = _kline_payload(
+            open_time=61_000,
+            close_time=120_999,
+            open="2.7",
+            high="2.7",
+            low="2.7",
+            close="2.7",
+            volume="0.1",
+            quote_volume="0.27",
+            revision_epoch=1,
+            revision_seq=2,
+            is_closed=False,
+            close_state_source="PROVIDER_CONFIRMED",
+        )
+        gateway, ws_manager = _new_event_kline_gateway([old_final, new_open])
+        await gateway._ensure_kline_event_worker("BTCUSDT")
+        try:
+            gateway._enqueue_provider_kline_revision(
+                _accepted_kline_event(gateway, new_open)
+            )
+            gateway._enqueue_provider_kline_revision(
+                _accepted_kline_event(gateway, old_final)
+            )
+            for _ in range(100):
+                if len(ws_manager.kline_broadcasts) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+
+            assert [
+                broadcast["kline"]["open_time"]
+                for broadcast in ws_manager.kline_broadcasts
+            ] == [1_000, 61_000]
+            assert ws_manager.kline_broadcasts[0]["is_closed"] is True
+            assert ws_manager.kline_broadcasts[1]["is_closed"] is False
+        finally:
+            await gateway._stop_kline_event_worker("BTCUSDT")
+
+    asyncio.run(run())
+
+
+def test_gateway_event_rejects_retired_provider_generation() -> None:
+    kline = _kline_payload(revision_epoch=1, revision_seq=1)
+    gateway, ws_manager = _new_event_kline_gateway([kline], generation=2)
+
+    gateway._enqueue_provider_kline_revision(
+        _accepted_kline_event(gateway, kline, generation=1)
+    )
+
+    assert gateway._kline_pending == {}
+    assert ws_manager.kline_broadcasts == []
+
+
+def test_gateway_polling_kline_fallback_broadcasts_without_accepted_event() -> None:
+    async def run() -> None:
+        kline = _kline_payload(revision_epoch=1, revision_seq=1)
+        gateway, ws_manager = _new_event_kline_gateway([kline])
+        gateway._kline_emit_locks["BTCUSDT"] = asyncio.Lock()
+
+        async with gateway._kline_emit_locks["BTCUSDT"]:
+            await gateway._poll_provider_kline_interval(
+                "BTCUSDT",
+                "1m",
+                "BITGET_SPOT",
+            )
+
+        assert len(ws_manager.kline_broadcasts) == 1
+        assert gateway._kline_pending == {}
+
+    asyncio.run(run())
 
 
 def test_gateway_defaults_to_revision_aware_provider_kline_getter() -> None:

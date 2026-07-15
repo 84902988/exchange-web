@@ -35,17 +35,23 @@ from app.services.spot_market_provider_ws import (
     ensure_spot_provider_ws_depth,
     ensure_spot_provider_ws_kline,
     get_spot_provider_ws_depth,
+    get_spot_provider_ws_kline_generation,
     get_spot_provider_ws_kline_revisions,
     get_spot_provider_ws_ticker,
     get_spot_provider_ws_trades,
     normalize_spot_ws_symbol,
     release_spot_provider_ws_depth,
     release_spot_provider_ws_kline,
+    set_spot_provider_ws_kline_revision_listener,
     spot_trade_strong_identity,
     spot_trade_weak_fingerprint,
     spot_provider_ws_supports_provider,
 )
 from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
+from app.services.spot_kline_events import (
+    ProviderKlineRevisionAccepted,
+    provider_kline_revision_signature,
+)
 from app.services.spot_depth_domain_snapshot import map_depth_domain_snapshot
 from app.services.spot_kline_domain_snapshot import (
     KlineDomainSnapshot,
@@ -61,7 +67,7 @@ from app.services.spot_trades_domain_snapshot import map_trades_domain_snapshot
 
 logger = logging.getLogger(__name__)
 
-_MAX_KLINE_BROADCAST_INTERVAL_MS = 500
+_MAX_KLINE_BROADCAST_INTERVAL_MS = 200
 _KLINE_INTERVAL_RELEASE_GRACE_SECONDS = 3.0
 _EXECUTOR_SHUTDOWN_MESSAGES = (
     "executor shutdown has been called",
@@ -97,6 +103,7 @@ class SpotMarketGateway:
         get_trades: Optional[Callable[..., Optional[TradesResponse]]] = None,
         get_klines: Optional[Callable[..., Optional[dict[str, Any]]]] = None,
         get_kline_revisions: Optional[Callable[..., Optional[Mapping[str, Any]]]] = None,
+        get_kline_generation: Optional[Callable[..., int]] = None,
         provider_symbol_allowed: Optional[Callable[[str], bool]] = None,
         precision_resolver: Optional[Callable[[str], tuple[int, int]]] = None,
         ws_manager: Any = None,
@@ -122,6 +129,8 @@ class SpotMarketGateway:
             or get_spot_provider_ws_kline_revisions
         )
         self._get_klines_accepts_provider = get_kline_revisions is None and get_klines is None
+        self._get_kline_generation = get_kline_generation or get_spot_provider_ws_kline_generation
+        self._get_kline_generation_accepts_provider = get_kline_generation is None
         self._provider_symbol_allowed = provider_symbol_allowed or self._default_provider_symbol_allowed
         self._provider_symbol_allowed_is_default = provider_symbol_allowed is None
         self._precision_resolver = precision_resolver or self._default_precision_resolver
@@ -131,6 +140,14 @@ class SpotMarketGateway:
         self._task_lock = asyncio.Lock()
         self._broadcast_state = SpotGatewayBroadcastState()
         self._kline_revision_high_water: dict[Any, tuple[int, int, int]] = {}
+        self._kline_event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._kline_pending: dict[
+            tuple[str, str, str],
+            dict[int, ProviderKlineRevisionAccepted],
+        ] = {}
+        self._kline_wakeup_events: dict[str, asyncio.Event] = {}
+        self._kline_event_tasks: dict[str, asyncio.Task[None]] = {}
+        self._kline_emit_locks: dict[str, asyncio.Lock] = {}
         self._depth_authority = SpotGatewayDepthAuthority()
         self._ensured_kline_intervals: dict[str, set[str]] = {}
         self._pending_kline_releases: dict[str, dict[str, float]] = {}
@@ -172,6 +189,7 @@ class SpotMarketGateway:
             provider_code = PROVIDER_BITGET_SPOT
         if not provider_code or not await self._provider_symbol_allowed_async(normalized_symbol):
             return
+        await self._ensure_kline_event_worker(normalized_symbol)
         self._symbol_providers[normalized_symbol] = provider_code
         self._depth_authority.ensure_provider(normalized_symbol, provider_code)
         await self._cancel_idle_release(normalized_symbol)
@@ -436,6 +454,294 @@ class SpotMarketGateway:
             if task is not None and not task.done():
                 task.cancel()
 
+    async def _ensure_kline_event_worker(self, symbol: str) -> None:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        if not normalized_symbol:
+            return
+        loop = asyncio.get_running_loop()
+        async with self._task_lock:
+            self._kline_event_loop = loop
+            self._kline_wakeup_events.setdefault(normalized_symbol, asyncio.Event())
+            self._kline_emit_lock(normalized_symbol)
+            task = self._kline_event_tasks.get(normalized_symbol)
+            if task is not None and not task.done():
+                return
+            task = asyncio.create_task(self._kline_event_worker(normalized_symbol))
+            task.add_done_callback(self._consume_task_result)
+            self._kline_event_tasks[normalized_symbol] = task
+
+    def notify_provider_kline_revision(
+        self,
+        event: ProviderKlineRevisionAccepted,
+    ) -> None:
+        loop = self._kline_event_loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._enqueue_provider_kline_revision, event)
+
+    def _kline_emit_lock(self, symbol: str) -> asyncio.Lock:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        return self._kline_emit_locks.setdefault(normalized_symbol, asyncio.Lock())
+
+    def _enqueue_provider_kline_revision(
+        self,
+        event: ProviderKlineRevisionAccepted,
+    ) -> None:
+        if not self._is_current_kline_event(event):
+            return
+        stream_key = self._kline_event_stream_key(event)
+        buckets = self._kline_pending.setdefault(stream_key, {})
+        current = buckets.get(event.open_time)
+        if current is not None and current.revision >= event.revision:
+            return
+        buckets[event.open_time] = event
+        wakeup = self._kline_wakeup_events.get(stream_key[1])
+        if wakeup is not None:
+            wakeup.set()
+
+    @staticmethod
+    def _kline_event_stream_key(
+        event: ProviderKlineRevisionAccepted,
+    ) -> tuple[str, str, str]:
+        return (
+            str(event.provider).strip().upper(),
+            normalize_spot_ws_symbol(event.symbol),
+            normalize_spot_kline_bucket_interval(event.interval),
+        )
+
+    def _is_current_kline_event(
+        self,
+        event: ProviderKlineRevisionAccepted,
+    ) -> bool:
+        provider, symbol, interval = self._kline_event_stream_key(event)
+        if not symbol or self._symbol_providers.get(symbol) != provider:
+            return False
+        if interval not in self._ensured_kline_intervals.get(symbol, set()):
+            return False
+        try:
+            if self._get_kline_generation_accepts_provider:
+                generation = self._get_kline_generation(
+                    symbol,
+                    interval,
+                    provider=provider,
+                )
+            else:
+                generation = self._get_kline_generation(symbol, interval)
+        except Exception:
+            logger.warning(
+                "spot_market_gateway_get_kline_generation_failed provider=%s symbol=%s interval=%s",
+                provider,
+                symbol,
+                interval,
+                exc_info=True,
+            )
+            return False
+        return int(generation or 0) == event.generation
+
+    def _take_pending_kline_events(
+        self,
+        symbol: str,
+    ) -> list[ProviderKlineRevisionAccepted]:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        accepted: list[ProviderKlineRevisionAccepted] = []
+        for stream_key in [
+            key for key in self._kline_pending if key[1] == normalized_symbol
+        ]:
+            accepted.extend(self._kline_pending.pop(stream_key, {}).values())
+        accepted.sort(
+            key=lambda event: (
+                event.interval,
+                event.open_time,
+                event.revision_epoch,
+                event.revision_seq,
+            )
+        )
+        return accepted
+
+    def _has_pending_kline_events(self, symbol: str) -> bool:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        return any(key[1] == normalized_symbol for key in self._kline_pending)
+
+    def _requeue_provider_kline_revision(
+        self,
+        event: ProviderKlineRevisionAccepted,
+    ) -> None:
+        if not self._is_current_kline_event(event):
+            return
+        stream_key = self._kline_event_stream_key(event)
+        buckets = self._kline_pending.setdefault(stream_key, {})
+        current = buckets.get(event.open_time)
+        if current is None or event.revision > current.revision:
+            buckets[event.open_time] = event
+
+    def _select_event_kline(
+        self,
+        klines: Optional[Mapping[str, Any]],
+        event: ProviderKlineRevisionAccepted,
+    ) -> Optional[dict[str, Any]]:
+        for item in (klines or {}).get("items") or []:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                if int(item.get("open_time") or 0) != event.open_time:
+                    continue
+                revision = (
+                    int(item.get("revision_epoch")),
+                    int(item.get("revision_seq")),
+                )
+            except (TypeError, ValueError):
+                continue
+            if revision < event.revision:
+                return None
+            candidate = dict(item)
+            if (
+                revision == event.revision
+                and self._kline_signature(event.symbol, event.interval, candidate)
+                != event.signature
+            ):
+                return None
+            return candidate
+        return None
+
+    def _event_for_kline(
+        self,
+        event: ProviderKlineRevisionAccepted,
+        kline: Mapping[str, Any],
+    ) -> ProviderKlineRevisionAccepted:
+        return replace(
+            event,
+            revision_epoch=int(kline.get("revision_epoch")),
+            revision_seq=int(kline.get("revision_seq")),
+            signature=self._kline_signature(event.symbol, event.interval, dict(kline)),
+            is_closed=kline.get("is_closed"),
+        )
+
+    def _candidate_is_newer_than_high_water(
+        self,
+        symbol: str,
+        interval: str,
+        kline: Mapping[str, Any],
+        *,
+        provider: Any,
+    ) -> bool:
+        identity = self._kline_revision_identity(kline)
+        if identity is None:
+            return False
+        domain_key = self._domain_key(
+            "kline",
+            symbol,
+            provider=provider or kline.get("provider"),
+            interval=interval,
+        )
+        previous = self._kline_revision_high_water.get(domain_key)
+        return previous is None or self._is_newer_kline_revision(previous, identity)
+
+    async def _kline_event_worker(self, symbol: str) -> None:
+        current_task = asyncio.current_task()
+        wakeup = self._kline_wakeup_events[symbol]
+        try:
+            while True:
+                await wakeup.wait()
+                wakeup.clear()
+                retry_after_gate = False
+                for event in self._take_pending_kline_events(symbol):
+                    if not self._is_current_kline_event(event):
+                        continue
+                    async with self._kline_emit_lock(symbol):
+                        retry_after_gate = (
+                            await self._process_provider_kline_event(event)
+                            or retry_after_gate
+                        )
+                if retry_after_gate:
+                    await asyncio.sleep(self._kline_broadcast_interval_seconds() + 0.001)
+                if self._has_pending_kline_events(symbol):
+                    wakeup.set()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.warning(
+                "spot_market_gateway_kline_event_worker_failed symbol=%s",
+                symbol,
+                exc_info=True,
+            )
+        finally:
+            async with self._task_lock:
+                task = self._kline_event_tasks.get(symbol)
+                if task is current_task:
+                    self._kline_event_tasks.pop(symbol, None)
+
+    async def _process_provider_kline_event(
+        self,
+        event: ProviderKlineRevisionAccepted,
+    ) -> bool:
+        provider, symbol, interval = self._kline_event_stream_key(event)
+        try:
+            klines = self._read_provider_klines(symbol, interval, provider)
+        except Exception:
+            logger.warning(
+                "spot_market_gateway_event_get_kline_failed provider=%s symbol=%s interval=%s",
+                provider,
+                symbol,
+                interval,
+                exc_info=True,
+            )
+            return False
+        kline = self._select_event_kline(klines, event)
+        if kline is None:
+            return False
+        current_event = self._event_for_kline(event, kline)
+        emitted = await self._emit_provider_kline(
+            symbol,
+            interval,
+            klines,
+            kline,
+            provider_code=provider,
+        )
+        if emitted:
+            return False
+        if self._candidate_is_newer_than_high_water(
+            symbol,
+            interval,
+            kline,
+            provider=(klines or {}).get("provider") or provider,
+        ):
+            self._requeue_provider_kline_revision(current_event)
+            return True
+        return False
+
+    async def _stop_kline_event_worker(self, symbol: str) -> None:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        async with self._task_lock:
+            task = self._kline_event_tasks.pop(normalized_symbol, None)
+            self._kline_wakeup_events.pop(normalized_symbol, None)
+            self._kline_emit_locks.pop(normalized_symbol, None)
+            self._clear_pending_kline_events(normalized_symbol)
+            if not self._kline_event_tasks:
+                self._kline_event_loop = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._clear_pending_kline_events(normalized_symbol)
+
+    def _clear_pending_kline_events(
+        self,
+        symbol: str,
+        *,
+        provider: Optional[str] = None,
+        interval: Optional[str] = None,
+    ) -> None:
+        normalized_symbol = normalize_spot_ws_symbol(symbol)
+        normalized_provider = str(provider).strip().upper() if provider is not None else None
+        normalized_interval = self._normalize_interval(interval) if interval is not None else None
+        for key in list(self._kline_pending):
+            if key[1] != normalized_symbol:
+                continue
+            if normalized_provider is not None and key[0] != normalized_provider:
+                continue
+            if normalized_interval is not None and key[2] != normalized_interval:
+                continue
+            self._kline_pending.pop(key, None)
+
     async def _idle_release_after_delay(self, symbol: str, delay_seconds: float) -> None:
         try:
             if delay_seconds > 0:
@@ -687,82 +993,12 @@ class SpotMarketGateway:
                     await self._active_kline_intervals(symbol),
                 )
                 for interval in active_kline_intervals:
-                    try:
-                        if self._get_klines_accepts_provider:
-                            klines = self._get_klines(
-                                symbol,
-                                interval,
-                                provider=provider_code,
-                                limit=int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_LIMIT", 300) or 300),
-                            )
-                        else:
-                            klines = self._get_klines(
-                                symbol,
-                                interval,
-                                limit=int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_LIMIT", 300) or 300),
-                            )
-                    except Exception:
-                        logger.warning(
-                            "spot_market_gateway_get_kline_failed symbol=%s interval=%s",
-                            symbol,
-                            interval,
-                            exc_info=True,
-                        )
-                        klines = None
-                    kline = self._latest_kline_for_broadcast(klines)
-                    try:
-                        kline_snapshot = self._record_kline_domain_snapshot(
-                            symbol=symbol,
-                            interval=interval,
-                            kline=klines,
-                            provider=(klines or {}).get("provider") or provider_code,
-                            provider_symbol=(klines or {}).get("provider_symbol"),
-                            transport=DomainTransport.PROVIDER_WS,
-                            cache_origin=DomainCacheOrigin.PROVIDER_MEMORY,
-                            fallback_reason=(
-                                DomainFallbackReason.CACHE_MISS if klines is None else None
-                            ),
-                            revision_epoch=(kline or {}).get("revision_epoch"),
-                            revision_sequence=(kline or {}).get("revision_seq"),
-                            is_closed=(kline or {}).get("is_closed"),
-                            close_state_source=(kline or {}).get("close_state_source"),
-                        )
-                    except Exception:
-                        kline_snapshot = None
-                        logger.warning(
-                            "spot_market_gateway_kline_snapshot_failed symbol=%s interval=%s provider=%s",
+                    async with self._kline_emit_lock(symbol):
+                        await self._poll_provider_kline_interval(
                             symbol,
                             interval,
                             provider_code,
-                            exc_info=True,
                         )
-                    if kline is not None and self._should_broadcast_kline(
-                        symbol,
-                        interval,
-                        kline,
-                        provider=(klines or {}).get("provider"),
-                        snapshot=kline_snapshot,
-                    ):
-                        try:
-                            await self._market_ws_manager().broadcast_provider_kline_update(
-                                symbol,
-                                interval,
-                                kline,
-                                source=str((klines or {}).get("source") or "LIVE_WS"),
-                                updated_at=(klines or {}).get("updated_at"),
-                                revision_epoch=kline.get("revision_epoch"),
-                                revision_seq=kline.get("revision_seq"),
-                                is_closed=kline.get("is_closed"),
-                                close_state_source=kline.get("close_state_source"),
-                            )
-                            self._remember_broadcast_metric(symbol, "kline")
-                        except Exception:
-                            logger.warning(
-                                "spot_market_gateway_kline_broadcast_failed symbol=%s interval=%s",
-                                symbol,
-                                interval,
-                                exc_info=True,
-                            )
 
                 await asyncio.sleep(self._loop_interval_seconds())
         except asyncio.CancelledError:
@@ -786,6 +1022,7 @@ class SpotMarketGateway:
         previous_provider, provider_code = pending
         switch_started_at = time.perf_counter()
         self._provider_switch_count += 1
+        self._clear_pending_kline_events(symbol, provider=previous_provider)
         try:
             if self._release_depth_accepts_provider:
                 await asyncio.to_thread(self._release_depth, symbol, provider=previous_provider)
@@ -829,6 +1066,7 @@ class SpotMarketGateway:
             self._provider_switch_last_at = time.time()
 
     async def _release_provider_symbol(self, symbol: str, provider_code: str) -> None:
+        await self._stop_kline_event_worker(symbol)
         if self._release_depth_accepts_provider:
             await asyncio.to_thread(self._release_depth, symbol, provider=provider_code)
         else:
@@ -1539,11 +1777,17 @@ class SpotMarketGateway:
         self._broadcast_state.clear_domain_key(domain_key)
         self._kline_revision_high_water.pop(domain_key, None)
         self._kline_domain_snapshots.pop((normalized_symbol, normalized_interval), None)
+        self._clear_pending_kline_events(
+            normalized_symbol,
+            provider=provider or self._symbol_providers.get(normalized_symbol) or PROVIDER_BITGET_SPOT,
+            interval=normalized_interval,
+        )
 
     def _clear_kline_revision_symbol(self, symbol: str) -> None:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         if not normalized_symbol:
             return
+        self._clear_pending_kline_events(normalized_symbol)
         for key in [
             key
             for key in self._kline_revision_high_water
@@ -1556,6 +1800,109 @@ class SpotMarketGateway:
             if key[0] == normalized_symbol
         ]:
             self._kline_domain_snapshots.pop(key, None)
+
+    def _read_provider_klines(
+        self,
+        symbol: str,
+        interval: str,
+        provider_code: str,
+    ) -> Optional[Mapping[str, Any]]:
+        limit = int(getattr(settings, "SPOT_PROVIDER_WS_KLINE_LIMIT", 300) or 300)
+        if self._get_klines_accepts_provider:
+            return self._get_klines(
+                symbol,
+                interval,
+                provider=provider_code,
+                limit=limit,
+            )
+        return self._get_klines(symbol, interval, limit=limit)
+
+    async def _poll_provider_kline_interval(
+        self,
+        symbol: str,
+        interval: str,
+        provider_code: str,
+    ) -> None:
+        try:
+            klines = self._read_provider_klines(symbol, interval, provider_code)
+        except Exception:
+            logger.warning(
+                "spot_market_gateway_get_kline_failed symbol=%s interval=%s",
+                symbol,
+                interval,
+                exc_info=True,
+            )
+            klines = None
+        await self._emit_provider_kline(
+            symbol,
+            interval,
+            klines,
+            self._latest_kline_for_broadcast(klines),
+            provider_code=provider_code,
+        )
+
+    async def _emit_provider_kline(
+        self,
+        symbol: str,
+        interval: str,
+        klines: Optional[Mapping[str, Any]],
+        kline: Optional[dict[str, Any]],
+        *,
+        provider_code: str,
+    ) -> bool:
+        try:
+            kline_snapshot = self._record_kline_domain_snapshot(
+                symbol=symbol,
+                interval=interval,
+                kline=klines,
+                provider=(klines or {}).get("provider") or provider_code,
+                provider_symbol=(klines or {}).get("provider_symbol"),
+                transport=DomainTransport.PROVIDER_WS,
+                cache_origin=DomainCacheOrigin.PROVIDER_MEMORY,
+                fallback_reason=(DomainFallbackReason.CACHE_MISS if klines is None else None),
+                revision_epoch=(kline or {}).get("revision_epoch"),
+                revision_sequence=(kline or {}).get("revision_seq"),
+                is_closed=(kline or {}).get("is_closed"),
+                close_state_source=(kline or {}).get("close_state_source"),
+            )
+        except Exception:
+            kline_snapshot = None
+            logger.warning(
+                "spot_market_gateway_kline_snapshot_failed symbol=%s interval=%s provider=%s",
+                symbol,
+                interval,
+                provider_code,
+                exc_info=True,
+            )
+        if kline is None or not self._should_broadcast_kline(
+            symbol,
+            interval,
+            kline,
+            provider=(klines or {}).get("provider") or provider_code,
+            snapshot=kline_snapshot,
+        ):
+            return False
+        try:
+            await self._market_ws_manager().broadcast_provider_kline_update(
+                symbol,
+                interval,
+                kline,
+                source=str((klines or {}).get("source") or "LIVE_WS"),
+                updated_at=(klines or {}).get("updated_at"),
+                revision_epoch=kline.get("revision_epoch"),
+                revision_seq=kline.get("revision_seq"),
+                is_closed=kline.get("is_closed"),
+                close_state_source=kline.get("close_state_source"),
+            )
+            self._remember_broadcast_metric(symbol, "kline")
+        except Exception:
+            logger.warning(
+                "spot_market_gateway_kline_broadcast_failed symbol=%s interval=%s",
+                symbol,
+                interval,
+                exc_info=True,
+            )
+        return True
 
     def _latest_kline_for_broadcast(
         self,
@@ -1844,25 +2191,10 @@ class SpotMarketGateway:
         return snapshot
 
     def _kline_signature(self, symbol: str, interval: str, kline: dict[str, Any]) -> str:
-        keys = (
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "quote_volume",
-            "is_closed",
-            "close_state_source",
-            "revision_epoch",
-            "revision_seq",
-        )
-        return repr(
-            (
-                normalize_spot_ws_symbol(symbol),
-                self._normalize_interval(interval),
-                tuple(kline.get(key) for key in keys),
-            )
+        return provider_kline_revision_signature(
+            symbol,
+            self._normalize_interval(interval),
+            kline,
         )
 
     def _kline_revision_identity(
@@ -2118,3 +2450,6 @@ class SpotMarketGateway:
 
 
 spot_market_gateway = SpotMarketGateway()
+set_spot_provider_ws_kline_revision_listener(
+    spot_market_gateway.notify_provider_kline_revision
+)

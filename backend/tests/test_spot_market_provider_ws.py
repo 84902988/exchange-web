@@ -5,6 +5,7 @@ import inspect
 import json
 import threading
 from copy import deepcopy
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -1782,6 +1783,54 @@ def test_provider_kline_buckets_remain_sorted_and_limited() -> None:
         open_time + 120_000,
         open_time + 180_000,
     }
+
+
+def test_provider_kline_accept_notifies_immutable_event_after_cache_assignment_and_lock_release() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    _activate_provider_kline(service)
+    open_time = 1_695_709_800_000
+    rows = [[str(open_time), "100", "110", "95", "101", "10", "1010", "1010"]]
+    observed: list[tuple[object, bool, int, str]] = []
+
+    def listener(event) -> None:
+        cache = service.get_fresh_kline_revisions("BTCUSDT", "1m", max_age_ms=1000)
+        observed.append(
+            (
+                event,
+                service._lock._is_owned(),
+                cache["items"][0]["revision_seq"],
+                provider_ws.provider_kline_revision_signature(
+                    "BTCUSDT",
+                    "1m",
+                    cache["items"][0],
+                ),
+            )
+        )
+
+    service.set_kline_revision_listener(listener)
+    _handle_bitget_klines(service, rows)
+    _handle_bitget_klines(service, rows)
+
+    assert len(observed) == 1
+    event, callback_owned_provider_lock, cached_revision_seq, cached_signature = observed[0]
+    assert callback_owned_provider_lock is False
+    assert cached_revision_seq == 1
+    assert event.provider == provider_ws.PROVIDER_BITGET_SPOT
+    assert event.symbol == "BTCUSDT"
+    assert event.interval == "1m"
+    assert event.open_time == open_time
+    assert event.revision == (1, 1)
+    assert event.generation == 1
+    assert event.signature == cached_signature
+    assert event.accepted_at_ms > 0
+    assert event.is_closed is None
+    assert not hasattr(event, "close")
+    try:
+        event.symbol = "ETHUSDT"
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("accepted revision event must be immutable")
 
 
 def test_ws_kline_same_bucket_revision_upgrade_replaces_winner() -> None:

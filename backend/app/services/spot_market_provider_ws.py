@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import websockets
 
@@ -19,6 +19,10 @@ from app.core.config import settings
 from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesResponse
 from app.services.contract_market_provider_service import PROVIDER_BITGET_SPOT, PROVIDER_OKX_SPOT
 from app.services.spot_kline_bucket import normalize_spot_kline_bucket_interval
+from app.services.spot_kline_events import (
+    ProviderKlineRevisionAccepted,
+    provider_kline_revision_signature,
+)
 from app.services.spot_kline_revision import (
     KlineRevisionCandidate,
     KlineRevisionDecision,
@@ -1484,7 +1488,53 @@ class SpotMarketProviderWsService:
         self._task_consecutive_failures: dict[tuple[str, str, str, str], int] = {}
         self._task_release_timeout_counts: dict[tuple[str, str, str, str], int] = {}
         self._stopping_threads: dict[tuple[str, str, str, str], threading.Thread] = {}
+        self._kline_revision_listener: Optional[
+            Callable[[ProviderKlineRevisionAccepted], None]
+        ] = None
         self._lock = threading.RLock()
+
+    def set_kline_revision_listener(
+        self,
+        listener: Optional[Callable[[ProviderKlineRevisionAccepted], None]],
+    ) -> None:
+        with self._lock:
+            self._kline_revision_listener = listener
+
+    def get_kline_generation(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> int:
+        key = (
+            normalize_spot_ws_provider(provider),
+            normalize_spot_ws_symbol(symbol),
+            normalize_spot_ws_kline_interval(interval),
+        )
+        with self._lock:
+            return int(self._kline_generations.get(key) or 0)
+
+    @staticmethod
+    def _notify_kline_revision_events(
+        listener: Optional[Callable[[ProviderKlineRevisionAccepted], None]],
+        events: list[ProviderKlineRevisionAccepted],
+    ) -> None:
+        if listener is None:
+            return
+        for event in events:
+            try:
+                listener(event)
+            except Exception:
+                logger.warning(
+                    "spot_provider_ws_kline_revision_notify_failed provider=%s symbol=%s interval=%s revision=%s:%s",
+                    event.provider,
+                    event.symbol,
+                    event.interval,
+                    event.revision_epoch,
+                    event.revision_seq,
+                    exc_info=True,
+                )
 
     def get_fresh_depth(
         self,
@@ -2469,6 +2519,7 @@ class SpotMarketProviderWsService:
         limit: int,
         *,
         generation: Optional[int] = None,
+        accepted_events: Optional[list[ProviderKlineRevisionAccepted]] = None,
     ) -> dict[str, Any]:
         existing = self._kline_cache.get(key) or {}
         existing_state_raw = existing.get(_KLINE_REVISION_STATE_KEY)
@@ -2608,10 +2659,39 @@ class SpotMarketProviderWsService:
             if comparison.decision != KlineRevisionDecision.ACCEPT:
                 continue
 
-            by_open_time[open_time] = _stamp_kline_revision(item, incoming_candidate)
+            stamped_item = _stamp_kline_revision(item, incoming_candidate)
+            by_open_time[open_time] = stamped_item
             bucket_revision_map[open_time] = _kline_revision_metadata(incoming_candidate)
             last_revision_seq = max(last_revision_seq, incoming_candidate.revision_seq)
             accepted_any = True
+            if accepted_events is not None:
+                event_kline = _public_kline_item(stamped_item)
+                event_kline.update(
+                    {
+                        "revision_epoch": incoming_candidate.revision_epoch,
+                        "revision_seq": incoming_candidate.revision_seq,
+                        "is_closed": incoming_candidate.is_closed,
+                        "close_state_source": incoming_candidate.close_state_source.value,
+                    }
+                )
+                accepted_events.append(
+                    ProviderKlineRevisionAccepted(
+                        provider=str(incoming_candidate.provider),
+                        symbol=normalize_spot_ws_symbol(incoming_candidate.symbol),
+                        interval=normalize_spot_ws_kline_interval(incoming_candidate.interval),
+                        open_time=incoming_candidate.open_time,
+                        revision_epoch=incoming_candidate.revision_epoch,
+                        revision_seq=incoming_candidate.revision_seq,
+                        generation=incoming_candidate.provider_generation,
+                        signature=provider_kline_revision_signature(
+                            incoming_candidate.symbol,
+                            incoming_candidate.interval,
+                            event_kline,
+                        ),
+                        accepted_at_ms=int(time.time() * 1000),
+                        is_closed=incoming_candidate.is_closed,
+                    )
+                )
 
         if existing and not accepted_any:
             return existing
@@ -3625,6 +3705,8 @@ class SpotMarketProviderWsService:
         if record is None:
             return
         key = (subscription.provider, subscription.local_symbol, subscription.interval)
+        accepted_events: list[ProviderKlineRevisionAccepted] = []
+        listener: Optional[Callable[[ProviderKlineRevisionAccepted], None]] = None
         with self._lock:
             if self._kline_generations.get(key) != generation:
                 return
@@ -3633,7 +3715,10 @@ class SpotMarketProviderWsService:
                 record,
                 subscription.kline_limit,
                 generation=generation,
+                accepted_events=accepted_events,
             )
+            listener = self._kline_revision_listener
+        self._notify_kline_revision_events(listener, accepted_events)
 
     def _handle_okx_kline_message(
         self,
@@ -3660,6 +3745,8 @@ class SpotMarketProviderWsService:
         if record is None:
             return
         key = (subscription.provider, subscription.local_symbol, subscription.interval)
+        accepted_events: list[ProviderKlineRevisionAccepted] = []
+        listener: Optional[Callable[[ProviderKlineRevisionAccepted], None]] = None
         with self._lock:
             if self._kline_generations.get(key) != generation:
                 return
@@ -3668,7 +3755,10 @@ class SpotMarketProviderWsService:
                 record,
                 subscription.kline_limit,
                 generation=generation,
+                accepted_events=accepted_events,
             )
+            listener = self._kline_revision_listener
+        self._notify_kline_revision_events(listener, accepted_events)
 
 
 spot_market_provider_ws = SpotMarketProviderWsService()
@@ -3773,6 +3863,25 @@ def get_spot_provider_ws_kline_revisions(
         max_age_ms=max_age_ms,
         limit=limit,
     )
+
+
+def get_spot_provider_ws_kline_generation(
+    symbol: str,
+    interval: str,
+    *,
+    provider: Optional[str] = None,
+) -> int:
+    return spot_market_provider_ws.get_kline_generation(
+        symbol,
+        interval,
+        provider=provider,
+    )
+
+
+def set_spot_provider_ws_kline_revision_listener(
+    listener: Optional[Callable[[ProviderKlineRevisionAccepted], None]],
+) -> None:
+    spot_market_provider_ws.set_kline_revision_listener(listener)
 
 
 def ensure_spot_provider_ws_kline(
