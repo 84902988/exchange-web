@@ -149,12 +149,14 @@ def _itick_contract_symbol(
     category: str,
     symbol: str = "US30_PERP",
     provider_symbol: str = "US30",
+    dwm_boundary_policy: str | None = "UTC_PASSTHROUGH",
 ):
     return SimpleNamespace(
         symbol=symbol,
         provider="ITICK",
         provider_symbol=provider_symbol,
         category=category,
+        _itick_dwm_boundary_policy=dwm_boundary_policy,
     )
 
 
@@ -320,13 +322,79 @@ def test_okx_history_request_uses_history_endpoint_after_and_strict_boundary():
     assert all(row["open_time"] < end_time_ms for row in rows)
 
 
+def test_okx_dwm_current_and_history_use_the_same_utc_provider_bar():
+    cases = (
+        ("1d", "1Dutc", 1_782_864_000_000, 86_400_000),
+        ("1w", "1Wutc", 1_783_296_000_000, 7 * 86_400_000),
+        ("1M", "1Mutc", 1_785_542_400_000, 31 * 86_400_000),
+    )
+
+    for interval, provider_bar, current_open_time, history_step in cases:
+        service = _load_contract_market_service_module()
+        calls = []
+        history_open_time = current_open_time - history_step
+        _configure_okx_fetch(
+            service,
+            _provider_rows(history_open_time, current_open_time),
+            calls,
+        )
+
+        current_rows = service._get_configured_contract_klines(
+            object(),
+            _contract_symbol(),
+            interval=interval,
+            limit=50,
+            end_time_ms=None,
+        )
+        history_rows = service._get_configured_contract_klines(
+            object(),
+            _contract_symbol(),
+            interval=interval,
+            limit=50,
+            end_time_ms=current_open_time,
+        )
+
+        assert current_rows[-1]["open_time"] == current_open_time
+        assert history_rows[-1]["open_time"] == history_open_time
+        assert calls[0]["extra_params"] == {"bar": provider_bar}
+        assert calls[1]["extra_params"] == {
+            "bar": provider_bar,
+            "after": str(current_open_time),
+        }
+
+
+def test_contract_dwm_cache_identity_isolated_from_legacy_local_intervals():
+    service = _load_contract_market_service_module()
+
+    assert service._contract_kline_cache_interval("1d") == "1Dutc"
+    assert service._contract_kline_cache_interval("1w") == "1Wutc"
+    assert service._contract_kline_cache_interval("1M") == "1Mutc"
+    assert service._contract_kline_cache_key("BTCUSDT_PERP", "1d", 50) == (
+        "BTCUSDT_PERP:1Dutc:50"
+    )
+
+
+def test_contract_dwm_boundary_validator_enforces_utc_period_start():
+    service = _load_contract_market_service_module()
+
+    assert service._contract_dwm_open_time_is_utc_boundary(1_782_864_000_000, "1d") is True
+    assert service._contract_dwm_open_time_is_utc_boundary(1_783_296_000_000, "1w") is True
+    assert service._contract_dwm_open_time_is_utc_boundary(1_785_542_400_000, "1M") is True
+    assert service._contract_dwm_open_time_is_utc_boundary(1_783_382_400_000, "1w") is False
+    assert service._contract_dwm_open_time_is_utc_boundary(1_785_715_200_000, "1M") is False
+    assert service._contract_dwm_open_time_is_utc_boundary(
+        1_782_864_000_000 + 60_000,
+        "1d",
+    ) is False
+
+
 def test_btc_monthly_current_returns_provider_rows():
     service = _load_contract_market_service_module()
     calls = []
     monthly_open_times = [
         1_767_225_600_000,
         1_769_904_000_000,
-        1_772_582_400_000,
+        1_772_323_200_000,
     ]
     _configure_okx_fetch(service, _provider_rows(*monthly_open_times), calls)
 
@@ -344,7 +412,7 @@ def test_btc_monthly_current_returns_provider_rows():
             "endpoint_type": "kline",
             "provider_symbol": "BTC-USDT-SWAP",
             "limit": 60,
-            "extra_params": {"bar": "1M"},
+            "extra_params": {"bar": "1Mutc"},
         }
     ]
 
@@ -352,7 +420,7 @@ def test_btc_monthly_current_returns_provider_rows():
 def test_btc_monthly_history_pagination_uses_cursor():
     service = _load_contract_market_service_module()
     calls = []
-    end_time_ms = 1_772_582_400_000
+    end_time_ms = 1_772_323_200_000
     previous_month = 1_769_904_000_000
     _configure_okx_fetch(
         service,
@@ -374,7 +442,7 @@ def test_btc_monthly_history_pagination_uses_cursor():
             "endpoint_type": "kline_history",
             "provider_symbol": "BTC-USDT-SWAP",
             "limit": 240,
-            "extra_params": {"bar": "1M", "after": str(end_time_ms)},
+            "extra_params": {"bar": "1Mutc", "after": str(end_time_ms)},
         }
     ]
 
@@ -403,7 +471,7 @@ def test_btc_monthly_history_beyond_earliest_raises_provider_boundary():
             "endpoint_type": "kline_history",
             "provider_symbol": "BTC-USDT-SWAP",
             "limit": 300,
-            "extra_params": {"bar": "1M", "after": str(end_time_ms)},
+            "extra_params": {"bar": "1Mutc", "after": str(end_time_ms)},
         }
     ]
 
@@ -850,6 +918,93 @@ def test_index_unsupported_interval_does_not_write_process_cache():
     assert rows.retryable is False
 
 
+def test_itick_dwm_unknown_boundary_policy_fails_closed_without_provider_call():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol(
+        category="FOREX",
+        symbol="EURUSD_PERP",
+        provider_symbol="EURUSD",
+        dwm_boundary_policy=None,
+    )
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.itick_market_service = SimpleNamespace(
+        get_market_kline=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unknown DWM policy must fail before provider IO")
+        )
+    )
+
+    rows = service.get_contract_klines(
+        object(),
+        "EURUSD_PERP",
+        interval="1d",
+        limit=50,
+    )
+
+    assert rows == []
+    assert rows.cache_status == "UNSUPPORTED_INTERVAL"
+    assert rows.provider_error_code == "ITICK_DWM_UTC_BOUNDARY_UNAVAILABLE"
+    assert rows.retryable is False
+
+
+def test_itick_known_utc_policy_uses_utc_cache_identity_and_preserves_time():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol(
+        category="FOREX",
+        symbol="EURUSD_PERP",
+        provider_symbol="EURUSD",
+    )
+    open_time = 1_783_296_000_000
+    captured = {}
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+
+    def cache_first(db, **kwargs):
+        captured.update(kwargs)
+        return _cache_first_fetches_provider(db, **kwargs)
+
+    service.get_klines_cache_first = cache_first
+    service.itick_market_service = SimpleNamespace(
+        get_market_kline=lambda *_args, **_kwargs: _provider_rows(open_time)
+    )
+
+    rows = service.get_contract_klines(
+        object(),
+        "EURUSD_PERP",
+        interval="1w",
+        limit=50,
+    )
+
+    assert [row["open_time"] for row in rows] == [open_time]
+    assert captured["interval"] == "1Wutc"
+    assert captured["open_time_validator"](open_time) is True
+
+
+def test_itick_known_utc_policy_rejects_non_utc_boundary_without_cache_write():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol(
+        category="FOREX",
+        symbol="EURUSD_PERP",
+        provider_symbol="EURUSD",
+    )
+    invalid_open_time = 1_783_296_000_000 + (4 * 60 * 60 * 1000)
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.get_klines_cache_first = _cache_first_fetches_provider
+    service.itick_market_service = SimpleNamespace(
+        get_market_kline=lambda *_args, **_kwargs: _provider_rows(invalid_open_time)
+    )
+
+    rows = service.get_contract_klines(
+        object(),
+        "EURUSD_PERP",
+        interval="1w",
+        limit=50,
+    )
+
+    assert rows == []
+    assert rows.cache_status == "UNSUPPORTED_INTERVAL"
+    assert rows.provider_error_code == "ITICK_DWM_UTC_BOUNDARY_UNAVAILABLE"
+    assert rows.retryable is False
+
+
 def test_aapl_history_uses_stock_provider_evidence():
     service = _load_contract_market_service_module()
     contract_symbol = _itick_contract_symbol(
@@ -858,7 +1013,7 @@ def test_aapl_history_uses_stock_provider_evidence():
         provider_symbol="AAPL",
     )
     calls = []
-    end_time_ms = 1_700_100_000_000
+    end_time_ms = 1_782_950_400_000
     service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
     service.get_klines_cache_first = _cache_first_fetches_provider
 
@@ -896,7 +1051,7 @@ def test_eurusd_history_uses_forex_provider_evidence():
         provider_symbol="EURUSD",
     )
     calls = []
-    end_time_ms = 1_700_100_000_000
+    end_time_ms = 1_783_900_800_000
     service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
     service.get_klines_cache_first = _cache_first_fetches_provider
 
@@ -931,7 +1086,7 @@ def test_xau_history_normalizes_symbol_and_uses_monthly_k_type():
         provider_symbol="",
     )
     calls = []
-    end_time_ms = 1_700_100_000_000
+    end_time_ms = 1_785_542_400_000
     service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
     service.get_klines_cache_first = _cache_first_fetches_provider
 
@@ -1049,7 +1204,7 @@ def test_monthly_history_response_preserves_terminal_metadata():
 
     metadata = build_contract_kline_metadata(rows, end_time_ms=end_time_ms)
 
-    assert captured["interval"] == "1M"
+    assert captured["interval"] == "1Mutc"
     assert captured["limit"] == 300
     assert captured["end_time_ms"] == end_time_ms
     assert rows.history_terminal is True

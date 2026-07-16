@@ -345,6 +345,28 @@ export function tradingViewResolutionToContractInterval(resolution: string) {
   return RESOLUTION_TO_CONTRACT_INTERVAL[normalizeResolution(resolution)] || '1m';
 }
 
+function isContractDwmInterval(interval?: string) {
+  const normalized = normalizeContractInterval(String(interval || ''));
+  return normalized === '1d' || normalized === '1w' || normalized === '1M';
+}
+
+export function isContractDwmUtcBoundary(time: number, interval?: string) {
+  const normalizedInterval = normalizeContractInterval(String(interval || ''));
+  if (!isContractDwmInterval(normalizedInterval)) return true;
+  if (!Number.isFinite(time) || time <= 0) return false;
+  const instant = new Date(time);
+  const atUtcMidnight = (
+    instant.getUTCHours() === 0
+    && instant.getUTCMinutes() === 0
+    && instant.getUTCSeconds() === 0
+    && instant.getUTCMilliseconds() === 0
+  );
+  if (!atUtcMidnight) return false;
+  if (normalizedInterval === '1w') return instant.getUTCDay() === 1;
+  if (normalizedInterval === '1M') return instant.getUTCDate() === 1;
+  return normalizedInterval === '1d';
+}
+
 function getPriceScale(precision?: number | null) {
   const nextPrecision = Number(precision);
   if (!Number.isInteger(nextPrecision) || nextPrecision < 0 || nextPrecision > 12) {
@@ -382,7 +404,10 @@ export function isProviderKlinePayload(value: unknown) {
   });
 }
 
-export function klineToBar(item: ContractKlinePayload): ContractTradingViewBar | null {
+export function klineToBar(
+  item: ContractKlinePayload,
+  interval?: string,
+): ContractTradingViewBar | null {
   if (!isProviderKlinePayload(item)) return null;
 
   const time = normalizeTimeMs(item.open_time ?? item.time ?? item.timestamp);
@@ -392,7 +417,14 @@ export function klineToBar(item: ContractKlinePayload): ContractTradingViewBar |
   const close = normalizeNumber(item.close);
   const volume = normalizeNumber(item.volume) ?? 0;
 
-  if (!time || open === null || high === null || low === null || close === null) return null;
+  if (
+    !time
+    || open === null
+    || high === null
+    || low === null
+    || close === null
+    || !isContractDwmUtcBoundary(time, interval)
+  ) return null;
 
   return { time, open, high, low, close, volume };
 }
@@ -428,7 +460,7 @@ export function realtimeMessageToBar(
     quote_source: payload.quote_source ?? message.quote_source,
     kline_mode: payload.kline_mode ?? message.kline_mode,
     price_source: payload.price_source ?? message.price_source,
-  });
+  }, expectedInterval);
 }
 
 function isFreshKlineEvidence(value: unknown) {
@@ -498,7 +530,7 @@ export function storeKlineEntryToBar(
     quote_source: payload.quote_source,
     kline_mode: payload.kline_mode,
     price_source: payload.price_source,
-  });
+  }, expectedInterval);
 }
 
 function realtimeBarFingerprint(bar: ContractTradingViewBar) {
@@ -836,7 +868,7 @@ async function loadContractKlineBarsForCountBack({
 
     const pageBars = sortAndDedupeBars(
       result.items
-        .map(klineToBar)
+        .map((item) => klineToBar(item, interval))
         .filter((bar): bar is ContractTradingViewBar => Boolean(bar))
         .filter((bar) => (
           bar.time < toTimeMs
