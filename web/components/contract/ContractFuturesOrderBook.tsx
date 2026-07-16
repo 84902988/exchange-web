@@ -26,6 +26,7 @@ import {
   useContractOrderBookStoreSnapshot,
   type ContractOrderBookStoreSnapshot,
 } from './hooks/contractMarketStoreAdapter';
+import type { ContractReferencePrice } from './contractPriceAuthority';
 
 type ContractFuturesOrderBookProps = {
   priceDirection?: 'up' | 'down' | 'flat';
@@ -34,10 +35,7 @@ type ContractFuturesOrderBookProps = {
   asks?: ContractDepthLevel[];
   status?: ContractQuoteDisplayStatus | null;
   statusLabel?: string | null;
-  centerPrice?: string | number | null;
-  centerPriceReady?: boolean;
-  centerPriceSource?: 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK' | null;
-  centerPriceLabel?: string | null;
+  referencePrice: ContractReferencePrice;
   bestBid?: string | number | null;
   bestAsk?: string | number | null;
   spread?: string | number | null;
@@ -66,10 +64,6 @@ type ContractOrderBookLegacyRead = {
   asks: ContractDepthLevel[];
   status: ContractQuoteDisplayStatus | null;
   statusLabel: string | null;
-  centerPrice: string | number | null;
-  centerPriceReady: boolean;
-  centerPriceSource: 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK' | null;
-  centerPriceLabel: string | null;
   bestBid: string | number | null;
   bestAsk: string | number | null;
   spread: string | number | null;
@@ -165,7 +159,6 @@ export function resolveContractOrderBookMarketRead(
   }
   const usable = isUsableStoreDepth(store);
   const status = resolveStoreDepthStatus(store, legacy.status);
-  const storeHasMidpoint = usable && store.midpoint !== null;
   return {
     authority: 'STORE',
     symbol: store.symbol,
@@ -173,10 +166,6 @@ export function resolveContractOrderBookMarketRead(
     asks: usable ? store.asks : EMPTY_DEPTH_LEVELS,
     status,
     statusLabel: status === legacy.status ? legacy.statusLabel : null,
-    centerPrice: storeHasMidpoint ? store.midpoint : legacy.centerPrice,
-    centerPriceReady: storeHasMidpoint ? true : legacy.centerPriceReady,
-    centerPriceSource: storeHasMidpoint ? 'LIVE_MID' : legacy.centerPriceSource,
-    centerPriceLabel: legacy.centerPriceLabel,
     bestBid: usable ? store.bestBid : null,
     bestAsk: usable ? store.bestAsk : null,
     spread: usable ? store.spread : null,
@@ -290,10 +279,7 @@ export default function ContractFuturesOrderBook({
   asks: legacyAsks = EMPTY_DEPTH_LEVELS,
   status: legacyStatus,
   statusLabel: legacyStatusLabel,
-  centerPrice: legacyCenterPrice,
-  centerPriceReady: legacyCenterPriceReady = false,
-  centerPriceSource: legacyCenterPriceSource,
-  centerPriceLabel: legacyCenterPriceLabel,
+  referencePrice,
   bestBid: legacyBestBid,
   bestAsk: legacyBestAsk,
   spread: legacySpread,
@@ -314,10 +300,6 @@ export default function ContractFuturesOrderBook({
     asks: legacyAsks,
     status: legacyStatus ?? null,
     statusLabel: legacyStatusLabel ?? null,
-    centerPrice: legacyCenterPrice ?? null,
-    centerPriceReady: legacyCenterPriceReady,
-    centerPriceSource: legacyCenterPriceSource ?? null,
-    centerPriceLabel: legacyCenterPriceLabel ?? null,
     bestBid: legacyBestBid ?? null,
     bestAsk: legacyBestAsk ?? null,
     spread: legacySpread ?? null,
@@ -332,10 +314,6 @@ export default function ContractFuturesOrderBook({
     legacyBestAsk,
     legacyBestBid,
     legacyBids,
-    legacyCenterPrice,
-    legacyCenterPriceLabel,
-    legacyCenterPriceReady,
-    legacyCenterPriceSource,
     legacyDepthFreshness,
     legacyDepthMode,
     legacyDepthSource,
@@ -352,10 +330,6 @@ export default function ContractFuturesOrderBook({
     asks,
     status,
     statusLabel,
-    centerPrice,
-    centerPriceReady,
-    centerPriceSource,
-    centerPriceLabel,
     depthMode,
     loading,
     error,
@@ -435,8 +409,12 @@ export default function ContractFuturesOrderBook({
           ? t('marketDataUnavailable', 'contracts')
         : t('noOrderBookData', 'contracts');
 
-  const centerPriceNumber = toPositivePrice(centerPrice);
-  const hasCenterPrice = centerPriceReady && centerPriceNumber !== null;
+  const centerPriceNumber = referencePrice.usable
+    ? toPositivePrice(referencePrice.value)
+    : null;
+  const hasCenterPrice = referencePrice.usable
+    && referencePrice.role !== 'UNAVAILABLE'
+    && centerPriceNumber !== null;
   const priceClass = priceDirection === 'up'
     ? 'text-[#00c087]'
     : priceDirection === 'down'
@@ -448,7 +426,11 @@ export default function ContractFuturesOrderBook({
   const centerSelectPrice = !hasCenterPrice || centerPriceNumber === null
     ? null
     : String(centerPriceNumber);
-  const centerLabel = centerPriceLabel || t('latestPrice', 'contracts');
+  const centerLabel = referencePrice.role === 'KLINE_CLOSE'
+    ? t('klineLatestPrice', 'contracts')
+    : referencePrice.role === 'LAST_TRADE'
+      ? t('latestPrice', 'contracts')
+      : t('marketDataUnavailable', 'contracts');
 
   return (
     <div
@@ -534,7 +516,10 @@ export default function ContractFuturesOrderBook({
             onClick={() => {
               if (centerSelectPrice) handlePriceSelect?.(centerSelectPrice);
             }}
-            data-price-source={centerPriceSource || ''}
+            data-price-freshness={referencePrice.freshness || ''}
+            data-price-role={referencePrice.role}
+            data-price-source={referencePrice.source || ''}
+            data-price-usable={referencePrice.usable ? 'true' : 'false'}
             data-testid="contract-orderbook-display-price"
             className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${priceClass}`}
           >

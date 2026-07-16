@@ -137,13 +137,27 @@ const bids = [
   { price: '98', amount: '1' },
 ];
 
+function makeReferencePrice(overrides: Record<string, unknown> = {}) {
+  return {
+    value: 99.8,
+    domain: 'TRADES',
+    source: 'TRADE_TICK',
+    provider: 'OKX_SWAP',
+    freshness: 'LIVE',
+    eventTimeMs: 1_720_000_000_000,
+    usable: true,
+    rejectReason: null,
+    symbol: 'BTCUSDT_PERP',
+    role: 'LAST_TRADE',
+    ...overrides,
+  };
+}
+
 const baseProps = {
   pricePrecision: 2,
   bids,
   asks,
-  centerPrice: '100',
-  centerPriceReady: true,
-  centerPriceSource: 'LIVE_MID',
+  referencePrice: makeReferencePrice(),
   depthMode: 'FULL_DEPTH',
   depthSource: 'LIVE_WS',
   depthFreshness: 'LIVE',
@@ -216,13 +230,13 @@ function resetDisplayMode() {
   orderBookStoreSnapshot = null;
 }
 
-test('FULL mode renders asks, MarketView center price, bids, and real-depth ratio', () => {
+test('FULL mode renders asks, reference price, bids, and real-depth ratio', () => {
   resetDisplayMode();
   const tree = renderOrderBook();
 
   assert.equal(findButton(tree, '\u5168\u90e8').props['aria-pressed'], true);
   assert.match(textContent(tree), /101\.00/);
-  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-display-price')), '100.00');
+  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-display-price')), '99.80');
   assert.match(textContent(tree), /99\.00/);
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-buy-ratio')), '40.00%');
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-sell-ratio')), '60.00%');
@@ -378,18 +392,29 @@ test('placeholder alignment is deterministic', () => {
   assert.deepEqual(utilsModule.padContractOrderBookRows([row], 'bottom', 3), [null, null, row]);
 });
 
-test('OrderBook reads Store depth first and emits a structured legacy diff', () => {
+test('OrderBook reads Store depth without overriding the real-trade reference price', () => {
   resetDisplayMode();
   orderBookStoreSnapshot = makeStoreDepthSnapshot();
+  const selected: string[] = [];
   const diffLogs: unknown[][] = [];
   const originalInfo = console.info;
   console.info = (...args: unknown[]) => diffLogs.push(args);
 
   try {
-    const tree = renderOrderBook();
+    const tree = renderOrderBook({
+      onPriceClick: (price: string) => selected.push(price),
+    });
+    const center = findByTestId(tree, 'contract-orderbook-display-price');
     assert.match(textContent(tree), /100\.00/);
     assert.doesNotMatch(textContent(findByTestId(tree, 'contract-orderbook-bid-rows')), /98\.00/);
-    assert.equal(textContent(findByTestId(tree, 'contract-orderbook-display-price')), '100.50');
+    assert.equal(textContent(center), '99.80');
+    assert.equal(center.props['aria-label'], '\u6700\u65b0\u4ef7');
+    assert.equal(center.props['data-price-role'], 'LAST_TRADE');
+    assert.equal(center.props['data-price-source'], 'TRADE_TICK');
+    assert.equal(center.props['data-price-freshness'], 'LIVE');
+    assert.equal(center.props['data-price-usable'], 'true');
+    center.props.onClick();
+    assert.deepEqual(selected, ['99.8']);
     assert.equal((tree as RenderNode).props['data-market-authority'], 'STORE');
     assert.equal((tree as RenderNode).props['data-market-symbol'], 'BTCUSDT_PERP');
     assert.equal((tree as RenderNode).props['data-provider-generation'], 8);
@@ -403,6 +428,79 @@ test('OrderBook reads Store depth first and emits a structured legacy diff', () 
   assert.ok(payload.differences.some((difference) => difference.field === 'bids'));
   assert.ok(payload.differences.some((difference) => difference.field === 'bestBid'));
   assert.ok(payload.differences.some((difference) => difference.field === 'spread'));
+});
+
+test('Kline fallback reference keeps its own value, label, source, and freshness', () => {
+  resetDisplayMode();
+  orderBookStoreSnapshot = makeStoreDepthSnapshot();
+  const selected: string[] = [];
+  const originalInfo = console.info;
+  console.info = () => undefined;
+
+  try {
+    const tree = renderOrderBook({
+      referencePrice: makeReferencePrice({
+        value: 98.75,
+        domain: 'KLINE',
+        source: 'KLINE_CLOSE',
+        provider: 'PROVIDER_KLINE',
+        freshness: 'CACHED',
+        role: 'KLINE_CLOSE',
+      }),
+      onPriceClick: (price: string) => selected.push(price),
+    });
+    const center = findByTestId(tree, 'contract-orderbook-display-price');
+
+    assert.equal(textContent(center), '98.75');
+    assert.equal(center.props['aria-label'], 'K\u7ebf\u6700\u65b0\u4ef7');
+    assert.equal(center.props['data-price-role'], 'KLINE_CLOSE');
+    assert.equal(center.props['data-price-source'], 'KLINE_CLOSE');
+    assert.equal(center.props['data-price-freshness'], 'CACHED');
+    center.props.onClick();
+    assert.deepEqual(selected, ['98.75']);
+  } finally {
+    console.info = originalInfo;
+  }
+});
+
+test('unavailable reference disables the center while Store depth remains visible', () => {
+  resetDisplayMode();
+  orderBookStoreSnapshot = makeStoreDepthSnapshot();
+  const selected: string[] = [];
+  const originalInfo = console.info;
+  console.info = () => undefined;
+
+  try {
+    const tree = renderOrderBook({
+      referencePrice: makeReferencePrice({
+        value: null,
+        domain: 'UNAVAILABLE',
+        source: null,
+        provider: null,
+        freshness: null,
+        eventTimeMs: null,
+        usable: false,
+        rejectReason: 'REFERENCE_PRICE_UNAVAILABLE',
+        role: 'UNAVAILABLE',
+      }),
+      onPriceClick: (price: string) => selected.push(price),
+    });
+    const center = findByTestId(tree, 'contract-orderbook-display-price');
+
+    assert.match(textContent(findByTestId(tree, 'contract-orderbook-ask-rows')), /101\.00/);
+    assert.match(textContent(findByTestId(tree, 'contract-orderbook-bid-rows')), /100\.00/);
+    assert.equal(textContent(center), '--');
+    assert.equal(center.props.disabled, true);
+    assert.equal(center.props['aria-label'], '\u5e02\u573a\u6570\u636e\u4e0d\u53ef\u7528');
+    assert.equal(center.props['data-price-role'], 'UNAVAILABLE');
+    assert.equal(center.props['data-price-source'], '');
+    assert.equal(center.props['data-price-freshness'], '');
+    assert.equal(center.props['data-price-usable'], 'false');
+    center.props.onClick();
+    assert.deepEqual(selected, []);
+  } finally {
+    console.info = originalInfo;
+  }
 });
 
 test('authoritative empty Store depth does not fall back to legacy rows', () => {
