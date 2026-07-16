@@ -63,6 +63,7 @@ CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION = "ld"
 CONTRACT_MARKET_STATUS_VERSION = "v2.2"
 
 QUOTE_FRESHNESS_LIVE = "LIVE"
+QUOTE_FRESHNESS_RECENT = "RECENT"
 QUOTE_FRESHNESS_STALE = "STALE"
 QUOTE_FRESHNESS_LAST_VALID = "LAST_VALID"
 QUOTE_FRESHNESS_FALLBACK = "FALLBACK"
@@ -72,7 +73,7 @@ DEPTH_MODE_SYNTHETIC_FROM_BBO = "SYNTHETIC_FROM_BBO"
 DEPTH_MODE_BBO_ONLY = "BBO_ONLY"
 PRICE_SOURCE_TRADE_TICK = "TRADE_TICK"
 PRICE_SOURCE_KLINE_CLOSE = "KLINE_CLOSE"
-PRICE_SOURCE_SYNTHETIC_FROM_QUOTE = "SYNTHETIC_FROM_QUOTE"
+CONTRACT_PROVIDER_REST_SOURCE = "PROVIDER_REST"
 _NON_PROVIDER_KLINE_SOURCE_TOKENS = {
     "BBO",
     "DEPTH",
@@ -212,6 +213,10 @@ class ContractSymbolNotFound(ContractMarketError):
 
 class ContractQuoteUnavailable(ContractMarketError):
     code = "CONTRACT_QUOTE_UNAVAILABLE"
+
+
+class ContractTradesUnavailable(ContractQuoteUnavailable):
+    code = "CONTRACT_MARKET_PROVIDER_TRADES_UNAVAILABLE"
 
 
 class ItickQuoteUnavailable(ContractQuoteUnavailable):
@@ -2723,43 +2728,73 @@ def _get_configured_contract_klines(
     raise ContractQuoteUnavailable("CONTRACT_MARKET_PROVIDER_KLINE_UNAVAILABLE") from last_error
 
 
-def _normalize_provider_trade_rows(provider_code: str, payload: Any, limit: int) -> list[dict[str, Any]]:
+def _normalize_provider_trade_rows(
+    provider_code: str,
+    payload: Any,
+    limit: int,
+    *,
+    symbol: Optional[str] = None,
+    provider_symbol: Optional[str] = None,
+) -> list[dict[str, Any]]:
     rows = _provider_data_rows(payload)
     normalized: list[dict[str, Any]] = []
     now_ms = int(datetime.utcnow().timestamp() * 1000)
+    normalized_provider = str(provider_code or "").strip().upper()
+    normalized_symbol = _normalize_symbol(symbol) if symbol else None
+    normalized_provider_symbol = str(provider_symbol or "").strip() or None
     for index, row in enumerate(rows[:limit]):
         if not isinstance(row, dict):
             continue
-        if provider_code == "OKX_SWAP":
+        if normalized_provider == "OKX_SWAP":
             trade_id = row.get("tradeId") or row.get("ts") or now_ms - index
             price = row.get("px")
             qty = row.get("sz")
-            ts = _provider_timestamp_ms(row.get("ts"))
+            ts = _to_timestamp_ms(row.get("ts"))
             side_text = str(row.get("side") or "").lower()
             is_buyer_maker = side_text == "sell"
-        elif provider_code == "BITGET_USDT_FUTURES":
+        elif normalized_provider == "BITGET_USDT_FUTURES":
             trade_id = row.get("tradeId") or row.get("ts") or now_ms - index
             price = row.get("price")
             qty = row.get("size")
-            ts = _provider_timestamp_ms(row.get("ts"))
+            ts = _to_timestamp_ms(row.get("ts"))
             side_text = str(row.get("side") or "").lower()
             is_buyer_maker = side_text == "sell"
         else:
             trade_id = row.get("id") or row.get("time") or now_ms - index
             price = row.get("price")
             qty = row.get("qty")
-            ts = _provider_timestamp_ms(row.get("time"))
+            ts = _to_timestamp_ms(row.get("time"))
             is_buyer_maker = bool(row.get("isBuyerMaker"))
-        if _to_decimal(price) is None or _to_decimal(qty) is None:
+        price_value = _to_decimal(price)
+        qty_value = _to_decimal(qty)
+        if (
+            price_value is None
+            or qty_value is None
+            or price_value <= 0
+            or qty_value <= 0
+            or ts is None
+            or ts <= 0
+        ):
             continue
         normalized.append(
             {
                 "id": trade_id,
+                "symbol": normalized_symbol,
                 "price": str(price),
                 "qty": str(qty),
                 "quoteQty": str(price),
                 "time": ts,
+                "event_time_ms": ts,
+                "received_at_ms": now_ms,
                 "isBuyerMaker": is_buyer_maker,
+                "price_source": PRICE_SOURCE_TRADE_TICK,
+                "freshness": QUOTE_FRESHNESS_RECENT,
+                "quote_freshness": QUOTE_FRESHNESS_RECENT,
+                "source": CONTRACT_PROVIDER_REST_SOURCE,
+                "quote_source": CONTRACT_PROVIDER_REST_SOURCE,
+                "provider": normalized_provider or None,
+                "provider_symbol": normalized_provider_symbol,
+                "synthetic": False,
             }
         )
     return normalized
@@ -2777,8 +2812,12 @@ def _normalize_itick_stock_tick_trade(
     if price is None or price <= 0:
         return None
     qty = _pick_positive_decimal(row, ["v", "volume", "qty", "quantity", "amount"])
+    if qty is None or qty <= 0:
+        return None
     ts_value = _pick_first_present(row, ["t", "ts", "time", "timestamp"])
-    ts = _provider_timestamp_ms(ts_value)
+    ts = _to_timestamp_ms(ts_value)
+    if ts is None or ts <= 0:
+        return None
     direction = str(row.get("d") or row.get("direction") or "").strip()
     side = None
     is_buyer_maker = None
@@ -2788,7 +2827,7 @@ def _normalize_itick_stock_tick_trade(
     elif direction == "2":
         side = "BUY"
         is_buyer_maker = False
-    amount = qty if qty is not None and qty > 0 else Decimal("0")
+    amount = qty
     trade_id = (
         row.get("id")
         or row.get("trade_id")
@@ -2809,19 +2848,59 @@ def _normalize_itick_stock_tick_trade(
         "quoteQty": _format_decimal(price * amount) if amount > 0 else None,
         "time": ts,
         "ts": ts,
+        "event_time_ms": ts,
+        "received_at_ms": int(datetime.utcnow().timestamp() * 1000),
         "side": side,
         "direction": direction or None,
         "trading_session": row.get("te"),
         "isBuyerMaker": is_buyer_maker,
         "source": source,
         "quote_source": source,
-        "quote_freshness": QUOTE_FRESHNESS_LIVE,
+        "freshness": QUOTE_FRESHNESS_RECENT,
+        "quote_freshness": QUOTE_FRESHNESS_RECENT,
         "price_source": PRICE_SOURCE_TRADE_TICK,
+        "synthetic": False,
         "exchange_ts": ts_value,
         "exchange_symbol": row.get("s"),
         "exchange_region": row.get("r"),
         "exchange": row.get("e"),
     }
+
+
+def _is_truthful_provider_ws_trade(row: Dict[str, Any], *, symbol: str) -> bool:
+    normalized_symbol = _normalize_symbol(symbol)
+    row_symbol = _normalize_symbol(row.get("symbol"))
+    price = _to_decimal(row.get("price") or row.get("last_price"))
+    qty = _to_decimal(row.get("qty") or row.get("amount") or row.get("quantity") or row.get("volume"))
+    event_time_ms = None
+    for key in ("event_time_ms", "time", "ts", "exchange_ts"):
+        event_time_ms = _to_timestamp_ms(row.get(key))
+        if event_time_ms is not None and event_time_ms > 0:
+            break
+    source = str(row.get("source") or row.get("quote_source") or "").strip().upper()
+    quote_source = str(row.get("quote_source") or source).strip().upper()
+    freshness = str(row.get("freshness") or row.get("quote_freshness") or "").strip().upper()
+    synthetic = row.get("synthetic") is True or str(row.get("synthetic") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    return bool(
+        row_symbol == normalized_symbol
+        and price is not None
+        and price > 0
+        and qty is not None
+        and qty > 0
+        and event_time_ms is not None
+        and event_time_ms > 0
+        and str(row.get("price_source") or "").strip().upper() == PRICE_SOURCE_TRADE_TICK
+        and source in {"LIVE_WS", "PROVIDER_WS"}
+        and quote_source in {"LIVE_WS", "PROVIDER_WS"}
+        and freshness == QUOTE_FRESHNESS_LIVE
+        and not synthetic
+        and str(row.get("provider") or "").strip()
+        and str(row.get("provider_symbol") or "").strip()
+    )
 
 
 def _get_provider_ws_stock_tick_trade(
@@ -2860,6 +2939,10 @@ def _get_provider_ws_stock_tick_trade(
         trade.setdefault("source", payload.get("source") or CONTRACT_PROVIDER_WS_SOURCE)
         trade.setdefault("quote_source", payload.get("quote_source") or trade.get("source"))
         trade.setdefault("quote_freshness", QUOTE_FRESHNESS_LIVE)
+        trade.setdefault("freshness", trade.get("quote_freshness"))
+        trade.setdefault("synthetic", False)
+        if not _is_truthful_provider_ws_trade(trade, symbol=contract_symbol.symbol):
+            continue
         trades.append(trade)
         if len(trades) >= limit:
             break
@@ -2906,7 +2989,13 @@ def _get_configured_contract_recent_trades(db: Session, contract_symbol: Contrac
         try:
             provider_symbol = _configured_provider_symbol(db, provider, contract_symbol)
             payload = request_contract_market_provider_json(provider, "trades", provider_symbol, limit=limit)
-            rows = _normalize_provider_trade_rows(provider.provider_code, payload, limit)
+            rows = _normalize_provider_trade_rows(
+                provider.provider_code,
+                payload,
+                limit,
+                symbol=contract_symbol.symbol,
+                provider_symbol=provider_symbol,
+            )
             if not rows:
                 raise ContractQuoteUnavailable(f"{provider.provider_code}_TRADES_UNAVAILABLE")
             mark_contract_market_provider_success(db, provider.provider_code)
@@ -2928,7 +3017,7 @@ def _get_configured_contract_recent_trades(db: Session, contract_symbol: Contrac
                 cooldown_seconds=provider.cooldown_seconds,
             )
             continue
-    raise ContractQuoteUnavailable("CONTRACT_MARKET_PROVIDER_TRADES_UNAVAILABLE") from last_error
+    raise ContractTradesUnavailable("CONTRACT_MARKET_PROVIDER_TRADES_UNAVAILABLE") from last_error
 
 
 def _get_binance_live_quote(contract_symbol: ContractSymbol) -> dict[str, Any]:
@@ -4526,16 +4615,9 @@ def get_contract_recent_trades(db: Session, symbol: str, limit: int = 30) -> lis
             raise
         if _is_market_closed(_market_status_for_stock_contract_symbol()):
             return []
-        quote = _get_stock_contract_quote(normalized_symbol)
-        price = quote["last_price"]
+        raise ContractTradesUnavailable("CONTRACT_MARKET_PROVIDER_TRADES_UNAVAILABLE")
     else:
         provider = str(contract_symbol.provider or "").strip().upper()
-        if provider == "BINANCE":
-            try:
-                return _get_configured_contract_recent_trades(db, contract_symbol, limit=safe_limit)
-            except Exception:
-                if not contract_market_last_good_enabled(db):
-                    raise
         if provider == "ITICK" and _is_market_closed(_market_status_for_contract_symbol(contract_symbol)):
             return []
         if provider == "ITICK" and str(getattr(contract_symbol, "category", "") or "").strip().upper() == "STOCK":
@@ -4545,33 +4627,8 @@ def get_contract_recent_trades(db: Session, symbol: str, limit: int = 30) -> lis
             rest_tick_trades = _get_itick_stock_tick_trade(contract_symbol)
             if rest_tick_trades:
                 return rest_tick_trades[:safe_limit]
-        quote = get_contract_quote(db, normalized_symbol)
-        price = quote["last_price"]
-
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
-    precision = 2
-    if "contract_symbol" in locals():
-        precision = int(getattr(contract_symbol, "price_precision", 2) or 2)
-    base_price = _to_decimal(price) or Decimal("1")
-    trades: list[dict[str, Any]] = []
-    for index in range(safe_limit):
-        direction = Decimal("1") if index % 2 == 0 else Decimal("-1")
-        next_price = _round_price(base_price * (Decimal("1") + direction * Decimal(index) / Decimal("100000")), precision)
-        trades.append(
-            {
-                "id": now_ms - index,
-                "price": _format_decimal(next_price),
-                "qty": _format_decimal(Decimal("1") + Decimal(index % 9) / Decimal("10")),
-                "quoteQty": _format_decimal(next_price),
-                "time": now_ms - index * 3000,
-                "isBuyerMaker": bool(index % 2),
-                "source": PRICE_SOURCE_SYNTHETIC_FROM_QUOTE,
-                "quote_source": PRICE_SOURCE_SYNTHETIC_FROM_QUOTE,
-                "price_source": PRICE_SOURCE_SYNTHETIC_FROM_QUOTE,
-                "synthetic": True,
-            }
-        )
-    return trades
+            raise ContractTradesUnavailable("CONTRACT_MARKET_PROVIDER_TRADES_UNAVAILABLE")
+        return _get_configured_contract_recent_trades(db, contract_symbol, limit=safe_limit)
 
 
 def contract_quote_to_response(quote: dict[str, Any]) -> dict[str, Any]:

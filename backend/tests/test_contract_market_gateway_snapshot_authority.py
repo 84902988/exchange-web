@@ -189,7 +189,22 @@ def test_gateway_builds_four_domain_snapshots_without_changing_legacy_payloads()
     }
     ticker = {"last_price": "101", "bid_price": "100", "ask_price": "102"}
     depth = {"bids": [["100", "1"]], "asks": [["102", "1"]]}
-    trades = [{"id": "t-1", "price": "101", "qty": "1"}]
+    trades = [
+        {
+            "id": "t-1",
+            "symbol": SYMBOL,
+            "price": "101",
+            "qty": "1",
+            "time": NOW_MS,
+            "source": "PROVIDER_WS",
+            "quote_source": "PROVIDER_WS",
+            "quote_freshness": "LIVE",
+            "price_source": "TRADE_TICK",
+            "provider": "OKX_SWAP",
+            "provider_symbol": "BTC-USDT-SWAP",
+            "synthetic": False,
+        }
+    ]
     kline = {
         "open_time": NOW_MS - 60_000,
         "open": "100",

@@ -19,6 +19,7 @@ from app.schemas.contract_market_domain_snapshot import (
     ContractMarketDomainCacheOrigin,
     ContractMarketDomainName,
     ContractMarketDomainSnapshot,
+    ContractMarketDomainSource,
     ContractMarketDomainTransport,
 )
 from app.services.contract_market_domain_snapshot import (
@@ -83,12 +84,27 @@ _CONTRACT_MARKET_DOMAIN_BY_CACHE = {
     CONTRACT_MARKET_CACHE_KLINE: ContractMarketDomainName.KLINE,
 }
 _CONTRACT_MARKET_PROVIDER_WS_SOURCES = {"LIVE_WS", "PROVIDER_WS"}
+_CONTRACT_MARKET_PROVIDER_REST_TRADE_SOURCES = {"PROVIDER_REST", "ITICK_TICK"}
+_CONTRACT_MARKET_REAL_TRADE_SOURCES = (
+    _CONTRACT_MARKET_PROVIDER_WS_SOURCES
+    | _CONTRACT_MARKET_PROVIDER_REST_TRADE_SOURCES
+)
 _CONTRACT_MARKET_AUTHORITY_FIELDS = {
     "provider_generation",
     "revision_epoch",
     "revision_seq",
     "revision_sequence",
 }
+_CONTRACT_TRADE_EVIDENCE_FIELDS = (
+    "provider",
+    "provider_symbol",
+    "source",
+    "quote_source",
+    "freshness",
+    "quote_freshness",
+    "price_source",
+    "received_at_ms",
+)
 
 
 def _utc_ms() -> int:
@@ -178,7 +194,16 @@ def _latest_key(template: str, symbol: str, *, interval: str | None = None) -> s
     return template.format(symbol=normalized_symbol, interval=normalize_contract_ws_interval(interval))
 
 
-def _normalize_trade(row: dict[str, Any], *, fallback_source: str | None = None) -> dict[str, Any]:
+def _normalize_trade(
+    row: dict[str, Any],
+    *,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized = dict(row)
+    if evidence:
+        for field in _CONTRACT_TRADE_EVIDENCE_FIELDS:
+            if normalized.get(field) in (None, "") and evidence.get(field) not in (None, ""):
+                normalized[field] = evidence[field]
     price = row.get("price") or row.get("last_price")
     amount = row.get("qty") or row.get("amount") or row.get("quantity") or row.get("volume")
     is_buyer_maker = row.get("isBuyerMaker")
@@ -186,13 +211,117 @@ def _normalize_trade(row: dict[str, Any], *, fallback_source: str | None = None)
     if side is None and isinstance(is_buyer_maker, bool):
         side = "SELL" if is_buyer_maker else "BUY"
     return {
-        **row,
+        **normalized,
         "price": str(price) if price is not None else "",
         "amount": str(amount) if amount is not None else "",
         "qty": str(amount) if amount is not None else "",
         "side": str(side or "").upper() or None,
-        "source": row.get("source") or fallback_source,
+        "source": normalized.get("source"),
     }
+
+
+def _positive_trade_decimal(value: Any) -> bool:
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return False
+    return parsed.is_finite() and parsed > 0
+
+
+def _optional_trade_timestamp_ms(value: Any) -> int | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        parsed = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        timestamp_ms = int(parsed.timestamp() * 1000)
+    else:
+        numeric: float | None = None
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+        elif isinstance(value, str):
+            try:
+                numeric = float(value)
+            except ValueError:
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    timestamp_ms = int(parsed.timestamp() * 1000)
+                except Exception:
+                    return None
+            else:
+                timestamp_ms = int(numeric if numeric > 10_000_000_000 else numeric * 1000)
+        else:
+            return None
+        if numeric is not None:
+            timestamp_ms = int(numeric if numeric > 10_000_000_000 else numeric * 1000)
+    if timestamp_ms <= 0 or timestamp_ms > _utc_ms() + 60_000:
+        return None
+    return timestamp_ms
+
+
+def _trade_event_time_ms(row: dict[str, Any]) -> int | None:
+    for key in ("event_time_ms", "time", "ts", "exchange_ts"):
+        timestamp_ms = _optional_trade_timestamp_ms(row.get(key))
+        if timestamp_ms is not None:
+            return timestamp_ms
+    return None
+
+
+def _synthetic_trade(row: dict[str, Any]) -> bool:
+    value = row.get("synthetic")
+    return value is True or str(value or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _truthful_contract_trade(row: dict[str, Any], *, symbol: str) -> bool:
+    expected_symbol = normalize_contract_ws_symbol(symbol)
+    row_symbol_text = str(row.get("symbol") or "").strip()
+    if not row_symbol_text:
+        return False
+    row_symbol = normalize_contract_ws_symbol(row_symbol_text)
+    source = str(row.get("source") or "").strip().upper()
+    quote_source = str(row.get("quote_source") or source).strip().upper()
+    freshness = str(row.get("freshness") or row.get("quote_freshness") or "").strip().upper()
+    expected_freshness = (
+        "LIVE"
+        if source in _CONTRACT_MARKET_PROVIDER_WS_SOURCES
+        else "RECENT"
+        if source in _CONTRACT_MARKET_PROVIDER_REST_TRADE_SOURCES
+        else ""
+    )
+    return bool(
+        row_symbol == expected_symbol
+        and _positive_trade_decimal(row.get("price") or row.get("last_price"))
+        and _positive_trade_decimal(
+            row.get("qty") or row.get("amount") or row.get("quantity") or row.get("volume")
+        )
+        and _trade_event_time_ms(row) is not None
+        and str(row.get("price_source") or "").strip().upper() == "TRADE_TICK"
+        and source in _CONTRACT_MARKET_REAL_TRADE_SOURCES
+        and quote_source in _CONTRACT_MARKET_REAL_TRADE_SOURCES
+        and freshness == expected_freshness
+        and not _synthetic_trade(row)
+        and str(row.get("provider") or "").strip()
+        and str(row.get("provider_symbol") or "").strip()
+    )
+
+
+def _truthful_contract_trades(
+    rows: Any,
+    *,
+    symbol: str,
+    evidence: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    truthful: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_trade(dict(item), evidence=evidence)
+        if _truthful_contract_trade(normalized, symbol=symbol):
+            truthful.append(normalized)
+    return truthful
 
 
 def _normalize_kline(row: dict[str, Any], *, source: str | None = None) -> dict[str, Any]:
@@ -687,22 +816,35 @@ class ContractMarketGateway:
             self._remember_depth_signature(symbol, depth)
             messages.append(self._depth_message(symbol, depth))
 
-        trades, trades_authority = self._load_trades_payload(
-            db,
-            symbol,
-            fallback_source=quote.get("source"),
-            allow_provider_ws=True,
-            ensure_provider_ws=ensure_provider_ws,
-        )
-        trades_accepted = self._set_latest(
-            CONTRACT_MARKET_CACHE_TRADES,
-            symbol,
-            trades,
-            authority_payload=trades_authority,
-        )
-        if trades and trades_accepted:
-            self._remember_trade_ids(symbol, trades)
-            messages.append(self._trade_message(symbol, trades[0], quote.get("source")))
+        try:
+            trades, trades_authority = self._load_trades_payload(
+                db,
+                symbol,
+                allow_provider_ws=True,
+                ensure_provider_ws=ensure_provider_ws,
+            )
+        except ContractMarketError:
+            logger.debug(
+                "contract_market_gateway_trades_refresh_unavailable symbol=%s",
+                symbol,
+                exc_info=True,
+            )
+        except Exception:
+            logger.warning(
+                "contract_market_gateway_trades_refresh_failed symbol=%s",
+                symbol,
+                exc_info=True,
+            )
+        else:
+            trades_accepted = self._set_latest(
+                CONTRACT_MARKET_CACHE_TRADES,
+                symbol,
+                trades,
+                authority_payload=trades_authority,
+            )
+            if trades and trades_accepted:
+                self._remember_trade_ids(symbol, trades)
+                messages.append(self._trade_message(symbol, trades[0]))
 
         state_message = self._state_message_from_latest(
             symbol,
@@ -876,13 +1018,20 @@ class ContractMarketGateway:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         db = SessionLocal()
         try:
-            trades, trades_authority = self._load_trades_payload(
-                db,
-                normalized_symbol,
-                fallback_source=None,
-                allow_provider_ws=True,
-                allow_rest_fallback=False,
-            )
+            try:
+                trades, trades_authority = self._load_trades_payload(
+                    db,
+                    normalized_symbol,
+                    allow_provider_ws=True,
+                    allow_rest_fallback=False,
+                )
+            except Exception:
+                logger.debug(
+                    "contract_market_gateway_provider_ws_trades_unavailable symbol=%s",
+                    normalized_symbol,
+                    exc_info=True,
+                )
+                return []
         finally:
             db.close()
         if not trades:
@@ -1090,7 +1239,6 @@ class ContractMarketGateway:
         db: Session,
         symbol: str,
         *,
-        fallback_source: Any = None,
         allow_provider_ws: bool,
         allow_rest_fallback: bool = True,
         ensure_provider_ws: bool = False,
@@ -1103,20 +1251,19 @@ class ContractMarketGateway:
                 ensure_subscription=ensure_provider_ws,
             )
             if isinstance(payload, dict):
-                trades = [
-                    _normalize_trade(dict(item), fallback_source=payload.get("source") or fallback_source)
-                    for item in payload.get("trades") or []
-                    if isinstance(item, dict)
-                ]
+                trades = _truthful_contract_trades(
+                    payload.get("trades") or [],
+                    symbol=symbol,
+                    evidence=payload,
+                )
                 if trades:
                     return trades[:CONTRACT_MARKET_WS_TRADES_LIMIT], payload
         if not allow_rest_fallback:
             return [], None
-        trades = [
-            _normalize_trade(dict(item), fallback_source=str(fallback_source or "") or None)
-            for item in get_contract_recent_trades(db, symbol=symbol, limit=CONTRACT_MARKET_WS_TRADES_LIMIT)
-            if isinstance(item, dict)
-        ]
+        trades = _truthful_contract_trades(
+            get_contract_recent_trades(db, symbol=symbol, limit=CONTRACT_MARKET_WS_TRADES_LIMIT),
+            symbol=symbol,
+        )
         return trades, trades
 
     def _refresh_loop_sleep_seconds(self) -> float:
@@ -1246,8 +1393,8 @@ class ContractMarketGateway:
             "depth": depth,
         }
 
-    def _trade_message(self, symbol: str, trade: dict[str, Any], source: Any = None) -> dict[str, Any]:
-        normalized_trade = _normalize_trade(trade, fallback_source=str(source or "") or None)
+    def _trade_message(self, symbol: str, trade: dict[str, Any]) -> dict[str, Any]:
+        normalized_trade = _normalize_trade(trade)
         return {
             "type": "contract_trade",
             "domain": "market",
@@ -1256,20 +1403,31 @@ class ContractMarketGateway:
             "ts": _timestamp_ms(normalized_trade.get("time") or normalized_trade.get("ts")),
             "source": normalized_trade.get("source"),
             "quote_source": normalized_trade.get("quote_source"),
+            "freshness": normalized_trade.get("freshness") or normalized_trade.get("quote_freshness"),
+            "quote_freshness": normalized_trade.get("quote_freshness"),
+            "price_source": normalized_trade.get("price_source"),
+            "provider": normalized_trade.get("provider"),
+            "provider_symbol": normalized_trade.get("provider_symbol"),
             "data": normalized_trade,
             "trade": normalized_trade,
         }
 
     def _trades_message(self, symbol: str, trades: list[dict[str, Any]]) -> dict[str, Any]:
-        normalized_trades = [_normalize_trade(dict(item), fallback_source=item.get("source")) for item in trades]
+        normalized_trades = [_normalize_trade(dict(item)) for item in trades]
+        latest_trade = normalized_trades[0] if normalized_trades else {}
         return {
             "type": "contract_trade",
             "domain": "market",
             "symbol": normalize_contract_ws_symbol(symbol),
             "market_symbol": _market_symbol(symbol),
             "ts": _timestamp_ms(normalized_trades[0].get("time") or normalized_trades[0].get("ts")) if normalized_trades else _utc_ms(),
-            "source": normalized_trades[0].get("source") if normalized_trades else None,
-            "quote_source": normalized_trades[0].get("quote_source") if normalized_trades else None,
+            "source": latest_trade.get("source"),
+            "quote_source": latest_trade.get("quote_source"),
+            "freshness": latest_trade.get("freshness") or latest_trade.get("quote_freshness"),
+            "quote_freshness": latest_trade.get("quote_freshness"),
+            "price_source": latest_trade.get("price_source"),
+            "provider": latest_trade.get("provider"),
+            "provider_symbol": latest_trade.get("provider_symbol"),
             "data": normalized_trades,
             "trades": normalized_trades,
             "trade": normalized_trades[0] if normalized_trades else None,
@@ -1352,6 +1510,11 @@ class ContractMarketGateway:
             or metadata.get("updated_at_ms")
             or _utc_ms()
         )
+        context_source = (
+            ContractMarketDomainSource.REST_SNAPSHOT
+            if source == "PROVIDER_REST"
+            else None
+        )
         context = ContractMarketDomainSnapshotContext(
             symbol=normalized_symbol,
             interval=normalized_interval,
@@ -1365,6 +1528,7 @@ class ContractMarketGateway:
                 if provider_ws_authority
                 else ContractMarketDomainCacheOrigin.NONE
             ),
+            source=context_source,
             received_at_ms=received_at_ms,
             ttl_ms=self._domain_snapshot_ttl_ms(domain),
             emitted_at_ms=_utc_ms(),
@@ -1441,6 +1605,13 @@ class ContractMarketGateway:
         interval: str | None = None,
         authority_payload: Any = None,
     ) -> bool:
+        if template == CONTRACT_MARKET_CACHE_TRADES:
+            if not isinstance(value, list):
+                return False
+            truthful_trades = _truthful_contract_trades(value, symbol=symbol)
+            if len(truthful_trades) != len(value):
+                return False
+            value = truthful_trades
         try:
             snapshot = self._build_domain_snapshot(
                 template=template,

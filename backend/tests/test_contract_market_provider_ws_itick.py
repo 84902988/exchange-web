@@ -238,6 +238,36 @@ def test_itick_trade_normalizer_marks_live_trade_tick_source():
     assert payload["side"] == "BUY"
 
 
+def test_okx_trade_normalizer_marks_live_trade_tick_source():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderTradesSubscription(
+        local_symbol="BTCUSDT_PERP",
+        provider="OKX_SWAP",
+        provider_symbol="BTC-USDT-SWAP",
+        trades_limit=30,
+    )
+
+    payload = service._normalize_okx_trade(
+        subscription,
+        {
+            "tradeId": "trade-1",
+            "px": "60000.5",
+            "sz": "0.01",
+            "ts": "1720000000000",
+            "side": "sell",
+        },
+    )
+
+    assert payload is not None
+    assert payload["provider"] == "OKX_SWAP"
+    assert payload["provider_symbol"] == "BTC-USDT-SWAP"
+    assert payload["source"] == "LIVE_WS"
+    assert payload["quote_freshness"] == "LIVE"
+    assert payload["price_source"] == "TRADE_TICK"
+    assert payload["side"] == "SELL"
+
+
 def test_itick_kline_normalizer_maps_verified_payload_without_millisecond_double_multiply():
     module = _load_provider_ws_module()
     service = module.ContractMarketProviderWsService()
@@ -519,7 +549,26 @@ def test_gateway_domain_snapshots_keep_market_and_kline_payloads_separate():
 
     gateway._set_latest(module.CONTRACT_MARKET_CACHE_QUOTE, symbol, {"symbol": symbol})
     gateway._set_latest(module.CONTRACT_MARKET_CACHE_DEPTH, symbol, {"symbol": symbol})
-    gateway._set_latest(module.CONTRACT_MARKET_CACHE_TRADES, symbol, [{"price": "100"}])
+    gateway._set_latest(
+        module.CONTRACT_MARKET_CACHE_TRADES,
+        symbol,
+        [
+            {
+                "id": "trade-1",
+                "symbol": symbol,
+                "price": "100",
+                "qty": "1",
+                "time": module._utc_ms(),
+                "source": "PROVIDER_WS",
+                "quote_source": "PROVIDER_WS",
+                "quote_freshness": "LIVE",
+                "price_source": "TRADE_TICK",
+                "provider": "OKX_SWAP",
+                "provider_symbol": "BTC-USDT-SWAP",
+                "synthetic": False,
+            }
+        ],
+    )
     gateway._set_latest(module.CONTRACT_MARKET_CACHE_STATE, symbol, state)
     gateway._set_latest(module.CONTRACT_MARKET_CACHE_KLINE, symbol, kline, interval="1M")
 

@@ -2748,6 +2748,7 @@ class ContractMarketProviderWsService:
             "source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_freshness": "LIVE",
+            "price_source": PRICE_SOURCE_TRADE_TICK,
         }
 
     def _normalize_itick_trade(
