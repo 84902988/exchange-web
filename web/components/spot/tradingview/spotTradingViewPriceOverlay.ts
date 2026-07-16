@@ -1,7 +1,11 @@
-import {
-  shouldShowSpotDisplayPriceOverlay,
-  type SpotDisplayPrice,
-} from '../spotDisplayPrice';
+export type SpotTradingViewCandleOverlayValue = {
+  symbol: string;
+  interval: string;
+  close: number;
+  barTime: number;
+  source: string;
+  receivedAtMs?: number;
+};
 
 export type SpotTradingViewOverlayEntityId = string | number;
 
@@ -38,19 +42,25 @@ export function isCurrentSpotTradingViewKlineFallback({
   );
 }
 
-function overlayTimeSeconds(displayPrice: SpotDisplayPrice): number {
-  const timeMs = Number(displayPrice.eventTimeMs || displayPrice.receivedAtMs || Date.now());
-  return Math.max(1, Math.floor(timeMs / 1000));
+function isValidCandleOverlayValue(value: SpotTradingViewCandleOverlayValue): boolean {
+  return (
+    String(value.symbol || '').trim().length > 0
+    && String(value.interval || '').trim().length > 0
+    && Number.isFinite(value.close)
+    && value.close > 0
+    && Number.isFinite(value.barTime)
+    && value.barTime > 0
+  );
 }
 
 const SPOT_PRICE_OVERLAY_UP_COLOR = '#00c087';
 const SPOT_PRICE_OVERLAY_DOWN_COLOR = '#f6465d';
 const SPOT_PRICE_OVERLAY_LINE_STYLE_DASHED = 2;
 
-function overlayPoint(displayPrice: SpotDisplayPrice) {
+function overlayPoint(value: SpotTradingViewCandleOverlayValue) {
   return {
-    time: overlayTimeSeconds(displayPrice),
-    price: Number(displayPrice.price),
+    time: Math.max(1, Math.floor(value.barTime / 1000)),
+    price: value.close,
   };
 }
 
@@ -76,59 +86,67 @@ function overlayCreateOverrides(color: string): Record<string, unknown> {
   };
 }
 
-function overlayRenderKey(displayPrice: SpotDisplayPrice): string {
+function overlayRenderKey(value: SpotTradingViewCandleOverlayValue): string {
   return [
-    Number(displayPrice.price),
-    displayPrice.sourceDomain,
-    displayPrice.source,
-    displayPrice.provider || '',
-    displayPrice.freshness,
-    displayPrice.isRealTrade ? 'trade' : 'reference',
-    displayPrice.eventTimeMs ?? displayPrice.receivedAtMs ?? '',
+    value.symbol,
+    value.interval,
+    value.barTime,
+    value.close,
+    value.source,
+    value.receivedAtMs ?? '',
   ].join(':');
 }
 
 export class SpotTradingViewPriceOverlayController {
   private entityId: SpotTradingViewOverlayEntityId | null = null;
-  private pendingDisplayPrice: SpotDisplayPrice | null = null;
+  private pendingValue: SpotTradingViewCandleOverlayValue | null = null;
   private createGeneration = 0;
   private creating = false;
   private destroyed = false;
   private renderedKey: string | null = null;
-  private activeSymbol: string | null = null;
+  private activeScopeKey: string | null = null;
+  private activeBarKey: string | null = null;
   private lastPrice: number | null = null;
   private color = SPOT_PRICE_OVERLAY_UP_COLOR;
 
   constructor(private readonly chart: SpotTradingViewOverlayChart) {}
 
-  update(displayPrice: SpotDisplayPrice) {
+  update(value: SpotTradingViewCandleOverlayValue) {
     if (this.destroyed) return;
-    const symbol = String(displayPrice.symbol || '').trim().toUpperCase();
-    if (this.activeSymbol !== null && symbol !== this.activeSymbol) {
-      this.clear();
-      this.lastPrice = null;
-      this.color = SPOT_PRICE_OVERLAY_UP_COLOR;
-    }
-    this.activeSymbol = symbol;
-    if (!shouldShowSpotDisplayPriceOverlay(displayPrice)) {
+    if (!isValidCandleOverlayValue(value)) {
       this.clear();
       return;
     }
 
-    this.updateDirectionColor(Number(displayPrice.price));
-    this.pendingDisplayPrice = displayPrice;
+    const symbol = String(value.symbol || '').trim().toUpperCase();
+    const interval = String(value.interval || '').trim();
+    const scopeKey = `${symbol}:${interval}`;
+    const barKey = `${scopeKey}:${value.barTime}`;
+    if (this.activeScopeKey !== null && scopeKey !== this.activeScopeKey) {
+      this.clear();
+      this.lastPrice = null;
+      this.color = SPOT_PRICE_OVERLAY_UP_COLOR;
+    }
+    this.activeScopeKey = scopeKey;
+    this.updateDirectionColor(value.close);
+    if (this.activeBarKey !== null && barKey !== this.activeBarKey) {
+      this.clear();
+    }
+    this.activeBarKey = barKey;
+
+    this.pendingValue = value;
     if (this.entityId !== null) {
-      const nextRenderKey = overlayRenderKey(displayPrice);
+      const nextRenderKey = overlayRenderKey(value);
       if (nextRenderKey === this.renderedKey) return;
-      if (!this.apply(displayPrice)) this.replace(displayPrice);
+      if (!this.apply(value)) this.replace(value);
       return;
     }
     if (this.creating) return;
 
     const generation = ++this.createGeneration;
     this.creating = true;
-    const createdRenderKey = overlayRenderKey(displayPrice);
-    const point = overlayPoint(displayPrice);
+    const createdRenderKey = overlayRenderKey(value);
+    const point = overlayPoint(value);
     void this.chart.createShape(point, {
       shape: 'horizontal_line',
       lock: true,
@@ -141,25 +159,26 @@ export class SpotTradingViewPriceOverlayController {
       overrides: overlayCreateOverrides(this.color),
     }).then((entityId) => {
       this.creating = false;
-      if (this.destroyed || generation !== this.createGeneration || !this.pendingDisplayPrice) {
+      if (this.destroyed || generation !== this.createGeneration || !this.pendingValue) {
         this.removeEntity(entityId);
-        const pending = this.pendingDisplayPrice;
+        const pending = this.pendingValue;
         if (!this.destroyed && pending) this.update(pending);
         return;
       }
       this.entityId = entityId;
       this.applyProperties(entityId);
       this.renderedKey = createdRenderKey;
-      const pending = this.pendingDisplayPrice;
+      const pending = this.pendingValue;
       if (pending && overlayRenderKey(pending) !== this.renderedKey) this.update(pending);
     }).catch(() => {
       this.creating = false;
-      if (generation === this.createGeneration) this.pendingDisplayPrice = null;
+      if (generation === this.createGeneration) this.pendingValue = null;
     });
   }
 
   clear() {
-    this.pendingDisplayPrice = null;
+    this.pendingValue = null;
+    this.activeBarKey = null;
     this.createGeneration += 1;
     const entityId = this.entityId;
     this.entityId = null;
@@ -173,30 +192,30 @@ export class SpotTradingViewPriceOverlayController {
     this.destroyed = true;
   }
 
-  private apply(displayPrice: SpotDisplayPrice): boolean {
+  private apply(value: SpotTradingViewCandleOverlayValue): boolean {
     if (this.entityId === null) return false;
     try {
       const shape = this.chart.getShapeById(this.entityId);
       const currentPoints = shape.getPoints?.() || [];
-      const price = Number(displayPrice.price);
+      const price = value.close;
       const nextPoints = currentPoints.length
         ? currentPoints.map((point) => ({ ...point, price }))
-        : [overlayPoint(displayPrice)];
+        : [overlayPoint(value)];
       shape.setPoints(nextPoints);
       shape.setProperties?.(overlayProperties(this.color));
-      this.renderedKey = overlayRenderKey(displayPrice);
+      this.renderedKey = overlayRenderKey(value);
       return true;
     } catch {
       return false;
     }
   }
 
-  private replace(displayPrice: SpotDisplayPrice) {
+  private replace(value: SpotTradingViewCandleOverlayValue) {
     const entityId = this.entityId;
     this.entityId = null;
     this.renderedKey = null;
     if (entityId !== null) this.removeEntity(entityId);
-    this.update(displayPrice);
+    this.update(value);
   }
 
   private updateDirectionColor(price: number) {
