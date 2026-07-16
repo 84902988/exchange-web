@@ -21,10 +21,10 @@ from sqlalchemy.orm import Session
 
 from app.core.rq import get_redis_url
 from app.db.session import SessionLocal
-from app.db.models.contract_account import ContractAccount
 from app.db.models.contract_order import ContractOrder
 from app.db.models.contract_position import ContractPosition
 from app.db.models.contract_trade import ContractTrade
+from app.services.contract_account_service import get_contract_account_summary
 from app.services.contract_query_service import (
     get_user_contract_orders,
     get_user_contract_position_summaries,
@@ -43,6 +43,7 @@ CONTRACT_USER_EVENTS_CHANNEL = "contract:user_events"
 CONTRACT_USER_EVENT_SUBSCRIBER_SERVICE = "contract_user_event_subscriber"
 CONTRACT_USER_EVENT_PUBLISH_HEALTH_KEY = "service:health:contract_user_event_publisher"
 CONTRACT_USER_EVENT_REDIS_UNAVAILABLE_LOG_INTERVAL_SECONDS = 30.0
+CONTRACT_ACCOUNT_EQUITY_REFRESH_INTERVAL_SECONDS = 1.0
 _subscriber_task: asyncio.Task[None] | None = None
 _subscriber_stop_event: asyncio.Event | None = None
 
@@ -111,36 +112,19 @@ def _symbol_from_models(
 
 
 def _account_payload(db: Session, user_id: int) -> dict[str, Any]:
-    account = db.query(ContractAccount).filter(ContractAccount.user_id == user_id).first()
-    if not account:
-        return {
-            "user_id": user_id,
-            "margin_asset": "USDT",
-            "available_margin": "0",
-            "used_margin": "0",
-            "frozen_margin": "0",
-            "position_margin": "0",
-            "realized_pnl": "0",
-            "unrealized_pnl": "0",
-            "equity": "0",
-        }
+    return get_contract_account_summary(db, int(user_id)).model_dump()
 
-    available_margin = Decimal(account.available_margin or 0)
-    frozen_margin = Decimal(account.frozen_margin or 0)
-    position_margin = Decimal(account.position_margin or 0)
-    realized_pnl = Decimal(account.realized_pnl or 0)
-    unrealized_pnl = Decimal(account.unrealized_pnl or 0)
-    return {
-        "user_id": int(account.user_id),
-        "margin_asset": account.margin_asset,
-        "available_margin": available_margin,
-        "used_margin": position_margin,
-        "frozen_margin": frozen_margin,
-        "position_margin": position_margin,
-        "realized_pnl": realized_pnl,
-        "unrealized_pnl": unrealized_pnl,
-        "equity": available_margin + frozen_margin + position_margin + unrealized_pnl,
-    }
+
+def _account_signature(account: dict[str, Any]) -> str:
+    return json.dumps(_to_jsonable(account), sort_keys=True, separators=(",", ":"))
+
+
+def _load_account_payload(user_id: int) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        return _account_payload(db, user_id)
+    finally:
+        db.close()
 
 
 def _snapshot_payload(db: Session, user_id: int, symbol: str | None = None) -> dict[str, Any]:
@@ -181,14 +165,22 @@ def _snapshot_payload(db: Session, user_id: int, symbol: str | None = None) -> d
 class ContractPrivateWsManager:
     def __init__(self) -> None:
         self._connections: dict[int, set[WebSocket]] = defaultdict(set)
+        self._account_refresh_tasks: dict[int, asyncio.Task[None]] = {}
+        self._account_signatures: dict[int, str] = {}
         self._lock = asyncio.Lock()
 
     async def connect(self, user_id: int, websocket: WebSocket) -> None:
         await websocket.accept()
         async with self._lock:
             self._connections[user_id].add(websocket)
+            task = self._account_refresh_tasks.get(user_id)
+            if task is None or task.done():
+                self._account_refresh_tasks[user_id] = asyncio.create_task(
+                    self._account_refresh_loop(user_id)
+                )
 
     async def disconnect(self, user_id: int, websocket: WebSocket) -> None:
+        refresh_task: asyncio.Task[None] | None = None
         async with self._lock:
             sockets = self._connections.get(user_id)
             if not sockets:
@@ -196,10 +188,58 @@ class ContractPrivateWsManager:
             sockets.discard(websocket)
             if not sockets:
                 self._connections.pop(user_id, None)
+                self._account_signatures.pop(user_id, None)
+                refresh_task = self._account_refresh_tasks.pop(user_id, None)
+        if refresh_task is not None and refresh_task is not asyncio.current_task():
+            refresh_task.cancel()
 
     async def has_user_connections(self, user_id: int) -> bool:
         async with self._lock:
             return bool(self._connections.get(user_id))
+
+    async def _remember_account_signature(self, user_id: int, account: dict[str, Any]) -> None:
+        async with self._lock:
+            self._account_signatures[user_id] = _account_signature(account)
+
+    async def _refresh_account_if_changed(self, user_id: int) -> bool:
+        if not await self.has_user_connections(user_id):
+            return False
+        account = await asyncio.to_thread(_load_account_payload, user_id)
+        signature = _account_signature(account)
+        async with self._lock:
+            if not self._connections.get(user_id):
+                return False
+            if self._account_signatures.get(user_id) == signature:
+                return False
+            self._account_signatures[user_id] = signature
+        payload = {"account": account}
+        await self._send_to_user(
+            user_id,
+            self._message("contract_user_account_update", payload, user_id=user_id),
+        )
+        return True
+
+    async def _account_refresh_loop(self, user_id: int) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while True:
+                await asyncio.sleep(CONTRACT_ACCOUNT_EQUITY_REFRESH_INTERVAL_SECONDS)
+                if not await self.has_user_connections(user_id):
+                    return
+                try:
+                    await self._refresh_account_if_changed(user_id)
+                except Exception:
+                    logger.warning(
+                        "contract_private_ws_account_refresh_failed user_id=%s",
+                        user_id,
+                        exc_info=True,
+                    )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            async with self._lock:
+                if self._account_refresh_tasks.get(user_id) is current_task:
+                    self._account_refresh_tasks.pop(user_id, None)
 
     def _message(
         self,
@@ -245,6 +285,15 @@ class ContractPrivateWsManager:
             return
         if not await self.has_user_connections(normalized_user_id):
             return
+        payload = message.get("payload")
+        if message.get("type") == "contract_user_account_update" and isinstance(payload, dict):
+            account = payload.get("account")
+            if isinstance(account, dict):
+                signature = _account_signature(account)
+                async with self._lock:
+                    if self._account_signatures.get(normalized_user_id) == signature:
+                        return
+                    self._account_signatures[normalized_user_id] = signature
         await self._send_to_user(normalized_user_id, _to_jsonable(message))
 
     async def send_snapshot_to_one(
@@ -255,10 +304,19 @@ class ContractPrivateWsManager:
         symbol: str | None = None,
     ) -> None:
         payload = _snapshot_payload(db, user_id, symbol)
+        account = payload.get("account")
+        if isinstance(account, dict):
+            await self._remember_account_signature(user_id, account)
         await websocket.send_json(self._message("contract_user_snapshot", payload, symbol=symbol, user_id=user_id))
 
     async def send_account_update(self, db: Session, user_id: int) -> None:
-        payload = {"account": _account_payload(db, user_id)}
+        account = _account_payload(db, user_id)
+        signature = _account_signature(account)
+        async with self._lock:
+            if self._account_signatures.get(user_id) == signature:
+                return
+            self._account_signatures[user_id] = signature
+        payload = {"account": account}
         await self._send_to_user(user_id, self._message("contract_user_account_update", payload, user_id=user_id))
 
     def build_account_update_event(self, db: Session, user_id: int) -> dict[str, Any]:

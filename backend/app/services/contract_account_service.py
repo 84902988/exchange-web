@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -9,14 +10,24 @@ from sqlalchemy.orm import Session
 
 from app.db.models.asset import BalanceLog, UserBalance
 from app.db.models.contract_account import ContractAccount
+from app.db.models.contract_position import ContractPosition
 from app.db.models.contract_margin_log import ContractMarginLog
 from app.schemas.contract_account import ContractAccountSummaryResponse, ContractTransferResponse
 from app.services.balance import FUNDING_BALANCE_CHAIN_KEY
 from app.services.contract_balance_log_service import add_contract_balance_log
+from app.services.contract_query_service import resolve_contract_position_pnl
 
 
 CONTRACT_MARGIN_ASSET = "USDT"
 CONTRACT_ACCOUNT_BIZ_TYPE = "CONTRACT_TRANSFER"
+
+
+@dataclass(frozen=True)
+class ContractAccountPnlSnapshot:
+    unrealized_pnl: Decimal | None
+    state: str
+    usable: bool
+    source: str
 
 
 class ContractAccountServiceError(ValueError):
@@ -155,12 +166,62 @@ def _lock_or_create_funding_balance(
     return balance
 
 
-def _summary_from_account(account: ContractAccount) -> ContractAccountSummaryResponse:
+def _account_position_pnl_snapshot(
+    db: Session,
+    *,
+    user_id: int,
+) -> ContractAccountPnlSnapshot:
+    positions = (
+        db.query(ContractPosition)
+        .filter(ContractPosition.user_id == int(user_id))
+        .filter(ContractPosition.status == "OPEN")
+        .filter(ContractPosition.quantity > 0)
+        .all()
+    )
+    if not positions:
+        return ContractAccountPnlSnapshot(
+            unrealized_pnl=Decimal("0"),
+            state="LIVE",
+            usable=True,
+            source="NO_OPEN_POSITIONS",
+        )
+
+    total = Decimal("0")
+    aggregate_state = "LIVE"
+    for position in positions:
+        snapshot = resolve_contract_position_pnl(db, position)
+        if snapshot.unrealized_pnl is None or snapshot.freshness == "UNAVAILABLE":
+            return ContractAccountPnlSnapshot(
+                unrealized_pnl=None,
+                state="UNAVAILABLE",
+                usable=False,
+                source="OPEN_POSITION_MARK_TO_MARKET",
+            )
+        total += snapshot.unrealized_pnl
+        if snapshot.freshness == "STALE":
+            aggregate_state = "STALE"
+        elif snapshot.freshness == "RECENT" and aggregate_state == "LIVE":
+            aggregate_state = "RECENT"
+
+    return ContractAccountPnlSnapshot(
+        unrealized_pnl=total,
+        state=aggregate_state,
+        usable=aggregate_state in {"LIVE", "RECENT"},
+        source="OPEN_POSITION_MARK_TO_MARKET",
+    )
+
+
+def _summary_from_account(db: Session, account: ContractAccount) -> ContractAccountSummaryResponse:
     available_margin = _q18(account.available_margin)
     frozen_margin = _q18(account.frozen_margin)
     position_margin = _q18(account.position_margin)
-    unrealized_pnl = _q18(account.unrealized_pnl)
-    equity = available_margin + frozen_margin + position_margin + unrealized_pnl
+    pnl_snapshot = _account_position_pnl_snapshot(db, user_id=int(account.user_id))
+    unrealized_pnl = pnl_snapshot.unrealized_pnl
+    equity = (
+        available_margin + frozen_margin + position_margin + unrealized_pnl
+        if unrealized_pnl is not None
+        else None
+    )
     return ContractAccountSummaryResponse(
         user_id=int(account.user_id),
         margin_asset=account.margin_asset,
@@ -169,8 +230,11 @@ def _summary_from_account(account: ContractAccount) -> ContractAccountSummaryRes
         frozen_margin=_fmt_decimal(frozen_margin),
         position_margin=_fmt_decimal(position_margin),
         realized_pnl=_fmt_decimal(account.realized_pnl),
-        unrealized_pnl=_fmt_decimal(unrealized_pnl),
-        equity=_fmt_decimal(equity),
+        unrealized_pnl=_fmt_decimal(unrealized_pnl) if unrealized_pnl is not None else None,
+        equity=_fmt_decimal(equity) if equity is not None else None,
+        equity_state=pnl_snapshot.state,
+        equity_usable=pnl_snapshot.usable,
+        equity_source=pnl_snapshot.source,
     )
 
 
@@ -189,6 +253,9 @@ def _empty_account_summary(
         realized_pnl="0",
         unrealized_pnl="0",
         equity="0",
+        equity_state="LIVE",
+        equity_usable=True,
+        equity_source="NO_OPEN_POSITIONS",
     )
 
 
@@ -217,7 +284,7 @@ def get_contract_account_summary(db: Session, user_id: int) -> ContractAccountSu
             user_id=normalized_user_id,
             margin_asset=normalized_asset,
         )
-    return _summary_from_account(account)
+    return _summary_from_account(db, account)
 
 
 def transfer_to_contract(
@@ -323,7 +390,7 @@ def transfer_to_contract(
         funding_available_after=_fmt_decimal(funding_after),
         contract_available_before=_fmt_decimal(contract_before),
         contract_available_after=_fmt_decimal(contract_after),
-        account=_summary_from_account(contract_account),
+        account=_summary_from_account(db, contract_account),
     )
 
 
@@ -432,5 +499,5 @@ def transfer_from_contract(
         funding_available_after=_fmt_decimal(funding_after),
         contract_available_before=_fmt_decimal(contract_before),
         contract_available_after=_fmt_decimal(contract_after),
-        account=_summary_from_account(contract_account),
+        account=_summary_from_account(db, contract_account),
     )

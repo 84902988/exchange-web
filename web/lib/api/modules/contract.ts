@@ -13,8 +13,11 @@ export type ContractAccountSummary = {
   frozen_margin: string
   position_margin: string
   realized_pnl: string
-  unrealized_pnl: string
-  equity: string
+  unrealized_pnl: string | null
+  equity: string | null
+  equity_state?: 'LIVE' | 'RECENT' | 'STALE' | 'UNAVAILABLE'
+  equity_usable?: boolean
+  equity_source?: string
 }
 
 export type ContractTransferResponse = {

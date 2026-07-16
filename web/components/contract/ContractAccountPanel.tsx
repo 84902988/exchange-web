@@ -27,8 +27,12 @@ export default function ContractAccountPanel({
 }: ContractAccountPanelProps) {
   const { t } = useLocaleContext();
   const [transferOpen, setTransferOpen] = useState(false);
-  const accountUnrealizedPnl = account?.unrealized_pnl
-    ?? (account as (ContractAccountSummary & { unrealizedPnl?: string | null }) | null)?.unrealizedPnl;
+  const accountEquityUsable = account?.equity_usable !== false;
+  const accountUnrealizedPnl = accountEquityUsable
+    ? account?.unrealized_pnl
+      ?? (account as (ContractAccountSummary & { unrealizedPnl?: string | null }) | null)?.unrealizedPnl
+    : null;
+  const accountEquity = accountEquityUsable ? account?.equity : null;
 
   return (
     <div className="tabular-nums text-sm text-white">
@@ -55,7 +59,7 @@ export default function ContractAccountPanel({
             <AccountRow label={t('availableMargin', 'contracts')} value={account?.available_margin} strong />
             <AccountRow label={t('positionMargin', 'contracts')} value={account?.used_margin || account?.position_margin} />
             <AccountRow label={t('frozenMargin', 'contracts')} value={account?.frozen_margin} />
-            <AccountRow label={t('accountEquity', 'contracts')} value={account?.equity} strong />
+            <AccountRow label={t('accountEquity', 'contracts')} value={accountEquity} strong />
             <AccountRow label={t('unrealizedPnl', 'contracts')} value={accountUnrealizedPnl} colored />
             <AccountRow label={t('realizedPnl', 'contracts')} value={account?.realized_pnl} colored />
           </div>
@@ -101,6 +105,7 @@ function AccountRow({
   strong?: boolean;
   colored?: boolean;
 }) {
+  const hasValue = value !== undefined && value !== null && value !== '';
   const num = toNumber(value);
   const colorClass = colored
     ? num > 0
@@ -116,7 +121,7 @@ function AccountRow({
     <div className="flex items-center justify-between gap-2 py-1 text-[12px]">
       <span className="min-w-0 text-white/42">{label}</span>
       <span className={`min-w-0 truncate text-right font-mono font-semibold ${colorClass}`}>
-        {formatNumber(value, 4)} USDT
+        {hasValue ? `${formatNumber(value, 4)} USDT` : '--'}
       </span>
     </div>
   );

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,8 +14,11 @@ class ContractAccountSummaryResponse(BaseModel):
     frozen_margin: str
     position_margin: str
     realized_pnl: str
-    unrealized_pnl: str
-    equity: str
+    unrealized_pnl: Optional[str]
+    equity: Optional[str]
+    equity_state: Literal["LIVE", "RECENT", "STALE", "UNAVAILABLE"]
+    equity_usable: bool
+    equity_source: str
 
 
 class ContractTransferRequest(BaseModel):
