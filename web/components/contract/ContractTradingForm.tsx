@@ -39,6 +39,10 @@ import {
   type ContractMarketViewAuthorityState,
 } from './contractMarketView.utils';
 import {
+  resolveContractExecutionPrice,
+  type ContractPriceAuthorityV1,
+} from './contractPriceAuthority';
+import {
   buildContractTradingFormLegacyMarketRead,
   getContractTradingFormMarketDifferences,
   resolveContractTradingFormMarketRead,
@@ -76,6 +80,7 @@ type ContractTradingFormProps = {
   executionAsk?: string | number | null;
   executable?: boolean | null;
   reasonCode?: string | null;
+  priceAuthority: ContractPriceAuthorityV1;
   pricePrecision: number;
   amountPrecision?: number | null;
   quantityUnit?: string;
@@ -260,6 +265,7 @@ export default function ContractTradingForm({
   positions = [],
   positionSummaries = [],
   selectedPrice,
+  priceAuthority,
   pricePrecision,
   amountPrecision,
   quantityUnit = 'BTC',
@@ -430,9 +436,32 @@ export default function ContractTradingForm({
     }),
     [marketView, quoteLoading],
   );
-  // Realtime Store is display-only here. Execution pricing and gating remain MarketView authority.
-  const resolvedExecutionBid = marketViewAuthority.executionBid ?? 0;
-  const resolvedExecutionAsk = marketViewAuthority.executionAsk ?? 0;
+  const executionPrices = useMemo(() => ({
+    openLong: resolveContractExecutionPrice({
+      authority: priceAuthority,
+      intent: 'OPEN_LONG',
+      expectedSymbol: symbol,
+    }),
+    openShort: resolveContractExecutionPrice({
+      authority: priceAuthority,
+      intent: 'OPEN_SHORT',
+      expectedSymbol: symbol,
+    }),
+    closeLong: resolveContractExecutionPrice({
+      authority: priceAuthority,
+      intent: 'CLOSE_LONG',
+      expectedSymbol: symbol,
+    }),
+    closeShort: resolveContractExecutionPrice({
+      authority: priceAuthority,
+      intent: 'CLOSE_SHORT',
+      expectedSymbol: symbol,
+    }),
+  }), [priceAuthority, symbol]);
+  // Price Authority owns execution. These legacy values remain isolated to
+  // the existing TP/SL reference behavior and MarketView availability state.
+  const legacyTpSlExecutionBid = marketViewAuthority.executionBid ?? 0;
+  const legacyTpSlExecutionAsk = marketViewAuthority.executionAsk ?? 0;
   const resolvedExecutable = marketViewAuthority.executable;
   const resolvedReasonCode = marketViewAuthority.reasonCode;
   const reasonCodeUnavailable = isUnavailableExecutionReason(resolvedReasonCode);
@@ -464,16 +493,12 @@ export default function ContractTradingForm({
       ? 'border-[#f0b90b]/25 bg-[#f0b90b]/10 text-[#f0b90b]'
       : 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]';
 
-  const bidReferencePrice = resolvedExecutionBid;
-  const askReferencePrice = resolvedExecutionAsk;
+  const currentActionExecution = tradeTab === 'CLOSE'
+    ? (closeSide === 'LONG' ? executionPrices.closeLong : executionPrices.closeShort)
+    : (positionSide === 'LONG' ? executionPrices.openLong : executionPrices.openShort);
 
-  const currentActionExecutionPrice = tradeTab === 'CLOSE'
-    ? (closeSide === 'LONG' ? resolvedExecutionBid : resolvedExecutionAsk)
-    : (positionSide === 'LONG' ? resolvedExecutionAsk : resolvedExecutionBid);
-
-  const longOpenPrice = orderType === 'LIMIT' ? toNumber(price) : resolvedExecutionAsk;
-  const shortOpenPrice = orderType === 'LIMIT' ? toNumber(price) : resolvedExecutionBid;
-  const currentOpenReferencePrice = positionSide === 'LONG' ? longOpenPrice : shortOpenPrice;
+  const longOpenPrice = orderType === 'LIMIT' ? toNumber(price) : executionPrices.openLong.price ?? 0;
+  const shortOpenPrice = orderType === 'LIMIT' ? toNumber(price) : executionPrices.openShort.price ?? 0;
   const longNotional = quantityNumber > 0 && longOpenPrice > 0 ? quantityNumber * longOpenPrice : null;
   const shortNotional = quantityNumber > 0 && shortOpenPrice > 0 ? quantityNumber * shortOpenPrice : null;
   const longMargin = longNotional !== null && leverage > 0 ? longNotional / leverage : null;
@@ -491,41 +516,52 @@ export default function ContractTradingForm({
 
   const limitPriceNumber = toNumber(price);
   const estimatedExecutionPrice = useMemo(() => {
+    if (!currentActionExecution.executable || currentActionExecution.price === null) {
+      return null;
+    }
     if (orderType === 'MARKET') {
-      return currentActionExecutionPrice > 0 ? currentActionExecutionPrice : null;
+      return currentActionExecution.price;
     }
     if (limitPriceNumber <= 0) return null;
 
     if (tradeTab === 'CLOSE') {
       if (closeSide === 'LONG') {
-        return resolvedExecutionBid > 0 && limitPriceNumber <= resolvedExecutionBid
-          ? resolvedExecutionBid
+        return executionPrices.closeLong.price !== null
+          && limitPriceNumber <= executionPrices.closeLong.price
+          ? executionPrices.closeLong.price
           : limitPriceNumber;
       }
-      return resolvedExecutionAsk > 0 && limitPriceNumber >= resolvedExecutionAsk
-        ? resolvedExecutionAsk
+      return executionPrices.closeShort.price !== null
+        && limitPriceNumber >= executionPrices.closeShort.price
+        ? executionPrices.closeShort.price
         : limitPriceNumber;
     }
 
     if (positionSide === 'LONG') {
-      return resolvedExecutionAsk > 0 && limitPriceNumber >= resolvedExecutionAsk
-        ? resolvedExecutionAsk
+      return executionPrices.openLong.price !== null
+        && limitPriceNumber >= executionPrices.openLong.price
+        ? executionPrices.openLong.price
         : limitPriceNumber;
     }
-    return resolvedExecutionBid > 0 && limitPriceNumber <= resolvedExecutionBid
-      ? resolvedExecutionBid
+    return executionPrices.openShort.price !== null
+      && limitPriceNumber <= executionPrices.openShort.price
+      ? executionPrices.openShort.price
       : limitPriceNumber;
   }, [
     closeSide,
-    currentActionExecutionPrice,
+    currentActionExecution.executable,
+    currentActionExecution.price,
+    executionPrices.closeLong.price,
+    executionPrices.closeShort.price,
+    executionPrices.openLong.price,
+    executionPrices.openShort.price,
     limitPriceNumber,
     orderType,
     positionSide,
-    resolvedExecutionAsk,
-    resolvedExecutionBid,
     tradeTab,
   ]);
-  const executionPriceMissing = currentActionExecutionPrice <= 0;
+  const executionPriceMissing = !currentActionExecution.executable
+    || currentActionExecution.price === null;
   const executionPriceFeedback = executionPriceMissing
     ? t('marketDataUnavailable', 'contracts')
     : null;
@@ -545,9 +581,14 @@ export default function ContractTradingForm({
   const currentTpSlTriggerReferencePrice = normalizedTpSlTriggerPriceType === 'LAST_PRICE'
     ? (quoteLastPrice > 0 ? quoteLastPrice : quoteMarkPrice)
     : quoteMarkPrice;
+  const currentTpSlFallbackOpenPrice = orderType === 'LIMIT'
+    ? toNumber(price)
+    : positionSide === 'LONG'
+      ? legacyTpSlExecutionAsk
+      : legacyTpSlExecutionBid;
   const currentTpSlReferencePrice = currentTpSlTriggerReferencePrice > 0
     ? currentTpSlTriggerReferencePrice
-    : currentOpenReferencePrice;
+    : currentTpSlFallbackOpenPrice;
 
   useEffect(() => {
     if (!tpSlEnabled || tradeTab !== 'OPEN' || currentTpSlReferencePrice <= 0) return;
@@ -591,15 +632,12 @@ export default function ContractTradingForm({
     || closeQuantityInvalid;
 
   function currentBboPrice() {
-    if (tradeTab === 'OPEN') {
-      return positionSide === 'LONG' ? askReferencePrice : bidReferencePrice;
-    }
-    return closeSide === 'LONG' ? bidReferencePrice : askReferencePrice;
+    return currentActionExecution.price;
   }
 
   function currentBboPriceText() {
     const next = currentBboPrice();
-    return next > 0 ? String(next) : '';
+    return next !== null ? String(next) : '';
   }
 
   function fillBboPrice() {
@@ -610,7 +648,7 @@ export default function ContractTradingForm({
   }
 
   function adjustLimitPrice(delta: number) {
-    const base = toNumber(price) || currentBboPrice();
+    const base = toNumber(price) || currentBboPrice() || 0;
     setPrice(formatInputPrice(Math.max(0, base + delta), pricePrecision));
   }
 
@@ -693,7 +731,7 @@ export default function ContractTradingForm({
   function openReferencePrice(side: ContractPositionSide) {
     if (currentTpSlReferencePrice > 0) return currentTpSlReferencePrice;
     if (orderType === 'LIMIT') return toNumber(price);
-    return side === 'LONG' ? resolvedExecutionAsk : resolvedExecutionBid;
+    return side === 'LONG' ? legacyTpSlExecutionAsk : legacyTpSlExecutionBid;
   }
 
   function validateTpSl(side: ContractPositionSide) {
@@ -718,8 +756,10 @@ export default function ContractTradingForm({
     if (availableMarginNumber <= 0) return t('transferMarginFirst', 'contracts');
     if (quoteStatusLoading) return t('marketDataLoadingLabel', 'contracts');
     if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
-    const executionPrice = side === 'LONG' ? resolvedExecutionAsk : resolvedExecutionBid;
-    if (executionPrice <= 0) return t('marketDataUnavailable', 'contracts');
+    const execution = side === 'LONG' ? executionPrices.openLong : executionPrices.openShort;
+    if (!execution.executable || execution.price === null) {
+      return t('marketDataUnavailable', 'contracts');
+    }
     if (!quantity.trim()) return t('enterQuantity', 'contracts');
     if (!isPositiveContractAmountAtPrecision(quantity, safeAmountPrecision)) {
       return t('enterValidOpenQuantity', 'contracts');
@@ -740,8 +780,10 @@ export default function ContractTradingForm({
     if (!selectedCloseSummary && !position) return t('noClosablePosition', 'contracts');
     if (quoteStatusLoading) return t('marketDataLoadingLabel', 'contracts');
     if (quoteUnavailableFeedback) return quoteUnavailableFeedback;
-    const executionPrice = side === 'LONG' ? resolvedExecutionBid : resolvedExecutionAsk;
-    if (executionPrice <= 0) return t('marketDataUnavailable', 'contracts');
+    const execution = side === 'LONG' ? executionPrices.closeLong : executionPrices.closeShort;
+    if (!execution.executable || execution.price === null) {
+      return t('marketDataUnavailable', 'contracts');
+    }
     const qty = toNumber(closeQuantityForOrder || maxQuantity);
     if (qty <= 0) return t('enterValidCloseQuantity', 'contracts');
     if (qty > toNumber(maxQuantity)) return t('closeQuantityExceedsMax', 'contracts');
@@ -1054,7 +1096,7 @@ export default function ContractTradingForm({
             stepTakeProfitPrice={stepTakeProfitPrice}
             stepStopLossPrice={stepStopLossPrice}
             fillBboPrice={fillBboPrice}
-            bboDisabled={currentBboPrice() <= 0}
+            bboDisabled={currentBboPrice() === null}
             pricePrecision={pricePrecision}
             quantityUnit={quantityUnit}
             adjustLimitPrice={adjustLimitPrice}
@@ -1088,7 +1130,7 @@ export default function ContractTradingForm({
               setCloseSide(next);
             }}
             fillBboPrice={fillBboPrice}
-            bboDisabled={currentBboPrice() <= 0}
+            bboDisabled={currentBboPrice() === null}
             pricePrecision={pricePrecision}
             quantityUnit={quantityUnit}
             adjustLimitPrice={adjustLimitPrice}

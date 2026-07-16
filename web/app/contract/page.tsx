@@ -393,6 +393,8 @@ function ContractPageContent() {
     displayPrice: currentPriceNumber,
     displayPriceSource: currentPriceSource,
     displayPriceLabel: currentPriceSourceLabel,
+    priceAuthority,
+    referencePrice,
     depthBids,
     depthAsks,
     depthLoading,
@@ -732,7 +734,7 @@ function ContractPageContent() {
                   onIntervalChange={handleContractIntervalChange}
                   pricePrecision={pricePrecision}
                   amountPrecision={currentContractPair?.amountPrecision}
-                  displayPrice={currentPriceNumber}
+                  referencePrice={referencePrice}
                   priceDirection={currentPriceDirection}
                   onLatestKlineCloseChange={handleLatestKlineCloseChange}
                 />
@@ -867,6 +869,7 @@ function ContractPageContent() {
                 executionAsk={executionAsk}
                 executable={contractExecutable}
                 reasonCode={reasonCode}
+                priceAuthority={priceAuthority}
                 pricePrecision={pricePrecision}
                 amountPrecision={currentContractPair?.amountPrecision}
                 quantityUnit={quantityUnit}

@@ -1,0 +1,335 @@
+type ContractPriceInput = string | number | null | undefined;
+
+export type ContractPriceDomain =
+  | 'TRADES'
+  | 'KLINE'
+  | 'EXECUTION'
+  | 'UNAVAILABLE';
+
+export type ContractReferencePriceRole = 'LAST_TRADE' | 'KLINE_CLOSE' | 'UNAVAILABLE';
+
+export type ContractExecutionIntent =
+  | 'OPEN_LONG'
+  | 'OPEN_SHORT'
+  | 'CLOSE_LONG'
+  | 'CLOSE_SHORT';
+
+export type ContractPriceEvidence = {
+  value: number | null;
+  domain: ContractPriceDomain;
+  source: string | null;
+  provider: string | null;
+  freshness: string | null;
+  eventTimeMs: number | null;
+  usable: boolean;
+  rejectReason: string | null;
+  symbol: string;
+};
+
+export type ContractReferencePrice = ContractPriceEvidence & {
+  role: ContractReferencePriceRole;
+};
+
+export type ContractTradeReferenceInput = {
+  symbol?: string | null;
+  price?: ContractPriceInput;
+  time?: string | number | null;
+  source?: string | null;
+  freshness?: string | null;
+  priceSource?: string | null;
+  synthetic?: boolean | null;
+};
+
+export type ContractKlineReferenceInput = {
+  symbol?: string | null;
+  close?: ContractPriceInput;
+  time?: string | number | null;
+  freshness?: string | null;
+  priceSource?: string | null;
+  klineMode?: string | null;
+};
+
+export type ContractExecutionBookInput = {
+  symbol?: string | null;
+  bid?: ContractPriceInput;
+  ask?: ContractPriceInput;
+  executable?: boolean | null;
+  mode?: string | null;
+  freshness?: string | null;
+  source?: string | null;
+  time?: string | number | null;
+};
+
+export type BuildContractPriceAuthorityInput = {
+  symbol: string;
+  trade?: ContractTradeReferenceInput | null;
+  kline?: ContractKlineReferenceInput | null;
+  execution?: ContractExecutionBookInput | null;
+};
+
+export type ContractPriceAuthorityV1 = {
+  symbol: string;
+  reference_price: ContractReferencePrice;
+  execution_bid: ContractPriceEvidence;
+  execution_ask: ContractPriceEvidence;
+  executable: boolean;
+  executionMode: string | null;
+};
+
+export type ResolveContractExecutionPriceInput = {
+  authority: ContractPriceAuthorityV1;
+  intent: ContractExecutionIntent;
+  expectedSymbol?: string | null;
+};
+
+export type ResolvedContractExecutionPrice = {
+  price: number | null;
+  basis: 'EXECUTION_BID' | 'EXECUTION_ASK';
+  executable: boolean;
+  rejectReason: string | null;
+  evidence: ContractPriceEvidence;
+};
+
+const REFERENCE_FRESHNESSES = new Set(['LIVE', 'RECENT', 'FRESH', 'CURRENT']);
+const KLINE_FRESHNESSES = new Set([...REFERENCE_FRESHNESSES, 'CACHED']);
+
+function normalizeToken(value: unknown): string | null {
+  const normalized = String(value ?? '').trim().toUpperCase();
+  return normalized || null;
+}
+
+function normalizeSymbol(value: unknown): string {
+  return normalizeToken(value) || '';
+}
+
+function positiveNumber(value: ContractPriceInput): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const normalized = typeof value === 'string' ? value.replace(/,/g, '').trim() : value;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function timestampMs(value: string | number | null | undefined): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'string' && !Number.isFinite(Number(value))) {
+    const parsedDate = Date.parse(value);
+    return Number.isFinite(parsedDate) && parsedDate > 0 ? parsedDate : null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed < 1_000_000_000_000 ? parsed * 1000 : parsed;
+}
+
+function unavailableEvidence(
+  symbol: string,
+  domain: ContractPriceDomain,
+  rejectReason: string,
+): ContractPriceEvidence {
+  return {
+    value: null,
+    domain,
+    source: null,
+    provider: null,
+    freshness: null,
+    eventTimeMs: null,
+    usable: false,
+    rejectReason,
+    symbol,
+  };
+}
+
+function buildTradeEvidence(
+  targetSymbol: string,
+  input?: ContractTradeReferenceInput | null,
+): ContractPriceEvidence {
+  if (!input) return unavailableEvidence(targetSymbol, 'TRADES', 'TRADE_EVIDENCE_MISSING');
+
+  const symbol = normalizeSymbol(input.symbol);
+  const value = positiveNumber(input.price);
+  const eventTimeMs = timestampMs(input.time);
+  const source = normalizeToken(input.source);
+  const freshness = normalizeToken(input.freshness);
+  const priceSource = normalizeToken(input.priceSource);
+  let rejectReason: string | null = null;
+
+  if (!targetSymbol || !symbol || symbol !== targetSymbol) rejectReason = 'SYMBOL_MISMATCH';
+  else if (input.synthetic === true || priceSource === 'SYNTHETIC_FROM_QUOTE') {
+    rejectReason = 'SYNTHETIC_TRADE';
+  } else if (priceSource !== 'TRADE_TICK') rejectReason = 'TRADE_PROVENANCE_INVALID';
+  else if (value === null) rejectReason = 'LAST_TRADE_MISSING';
+  else if (eventTimeMs === null) rejectReason = 'TRADE_TIME_MISSING';
+  else if (!source) rejectReason = 'TRADE_SOURCE_MISSING';
+  else if (!freshness || !REFERENCE_FRESHNESSES.has(freshness)) {
+    rejectReason = freshness === 'STALE' ? 'STALE' : 'FRESHNESS_UNUSABLE';
+  }
+
+  return {
+    value,
+    domain: 'TRADES',
+    source: priceSource,
+    provider: source,
+    freshness,
+    eventTimeMs,
+    usable: rejectReason === null,
+    rejectReason,
+    symbol: symbol || targetSymbol,
+  };
+}
+
+function buildKlineEvidence(
+  targetSymbol: string,
+  input?: ContractKlineReferenceInput | null,
+): ContractPriceEvidence {
+  if (!input) return unavailableEvidence(targetSymbol, 'KLINE', 'KLINE_EVIDENCE_MISSING');
+
+  const symbol = normalizeSymbol(input.symbol);
+  const value = positiveNumber(input.close);
+  const eventTimeMs = timestampMs(input.time);
+  const freshness = normalizeToken(input.freshness);
+  const priceSource = normalizeToken(input.priceSource);
+  const klineMode = normalizeToken(input.klineMode);
+  let rejectReason: string | null = null;
+
+  if (!targetSymbol || !symbol || symbol !== targetSymbol) rejectReason = 'SYMBOL_MISMATCH';
+  else if (klineMode !== 'PROVIDER_KLINE' || priceSource !== 'KLINE_CLOSE') {
+    rejectReason = 'KLINE_PROVENANCE_INVALID';
+  } else if (value === null) rejectReason = 'KLINE_CLOSE_MISSING';
+  else if (eventTimeMs === null) rejectReason = 'KLINE_TIME_MISSING';
+  else if (!freshness || !KLINE_FRESHNESSES.has(freshness)) {
+    rejectReason = freshness === 'STALE' ? 'STALE' : 'FRESHNESS_UNUSABLE';
+  }
+
+  return {
+    value,
+    domain: 'KLINE',
+    source: priceSource,
+    provider: klineMode,
+    freshness,
+    eventTimeMs,
+    usable: rejectReason === null,
+    rejectReason,
+    symbol: symbol || targetSymbol,
+  };
+}
+
+function selectReferencePrice(
+  targetSymbol: string,
+  trade: ContractPriceEvidence,
+  kline: ContractPriceEvidence,
+  hadTradeInput: boolean,
+  hadKlineInput: boolean,
+): ContractReferencePrice {
+  if (trade.usable) return { ...trade, role: 'LAST_TRADE' };
+  if (kline.usable) return { ...kline, role: 'KLINE_CLOSE' };
+
+  const rejectReason = hadTradeInput
+    ? trade.rejectReason
+    : hadKlineInput
+      ? kline.rejectReason
+      : 'REFERENCE_PRICE_UNAVAILABLE';
+  return {
+    ...unavailableEvidence(targetSymbol, 'UNAVAILABLE', rejectReason || 'REFERENCE_PRICE_UNAVAILABLE'),
+    role: 'UNAVAILABLE',
+  };
+}
+
+function executionRejectReason(
+  targetSymbol: string,
+  input?: ContractExecutionBookInput | null,
+): string | null {
+  if (!input) return 'BBO_MISSING';
+  const symbol = normalizeSymbol(input.symbol);
+  const bid = positiveNumber(input.bid);
+  const ask = positiveNumber(input.ask);
+  const mode = normalizeToken(input.mode);
+  const freshness = normalizeToken(input.freshness);
+
+  if (!targetSymbol || !symbol || symbol !== targetSymbol) return 'SYMBOL_MISMATCH';
+  if (bid === null || ask === null) return 'BBO_MISSING';
+  if (ask < bid) return 'BBO_CROSSED';
+  if (input.executable !== true) return 'MARKET_NOT_EXECUTABLE';
+  if (mode !== 'LIVE_BBO') return 'EXECUTION_MODE_NOT_ALLOWED';
+  if (freshness !== 'LIVE') return freshness === 'STALE' ? 'STALE' : 'FRESHNESS_UNUSABLE';
+  return null;
+}
+
+function buildExecutionEvidence(
+  targetSymbol: string,
+  input: ContractExecutionBookInput | null | undefined,
+  side: 'bid' | 'ask',
+  rejectReason: string | null,
+): ContractPriceEvidence {
+  const symbol = normalizeSymbol(input?.symbol) || targetSymbol;
+  return {
+    value: rejectReason ? null : positiveNumber(side === 'bid' ? input?.bid : input?.ask),
+    domain: 'EXECUTION',
+    source: normalizeToken(input?.source),
+    provider: null,
+    freshness: normalizeToken(input?.freshness),
+    eventTimeMs: timestampMs(input?.time),
+    usable: rejectReason === null,
+    rejectReason,
+    symbol,
+  };
+}
+
+export function buildContractPriceAuthority(
+  input: BuildContractPriceAuthorityInput,
+): ContractPriceAuthorityV1 {
+  const symbol = normalizeSymbol(input.symbol);
+  const trade = buildTradeEvidence(symbol, input.trade);
+  const kline = buildKlineEvidence(symbol, input.kline);
+  const executionFailure = executionRejectReason(symbol, input.execution);
+  const executionBid = buildExecutionEvidence(symbol, input.execution, 'bid', executionFailure);
+  const executionAsk = buildExecutionEvidence(symbol, input.execution, 'ask', executionFailure);
+
+  return {
+    symbol,
+    reference_price: selectReferencePrice(
+      symbol,
+      trade,
+      kline,
+      input.trade !== null && input.trade !== undefined,
+      input.kline !== null && input.kline !== undefined,
+    ),
+    execution_bid: executionBid,
+    execution_ask: executionAsk,
+    executable: executionFailure === null,
+    executionMode: normalizeToken(input.execution?.mode),
+  };
+}
+
+export function selectContractReferencePrice(
+  authority: ContractPriceAuthorityV1,
+): ContractReferencePrice {
+  return authority.reference_price;
+}
+
+export function resolveContractExecutionPrice(
+  input: ResolveContractExecutionPriceInput,
+): ResolvedContractExecutionPrice {
+  const useAsk = input.intent === 'OPEN_LONG' || input.intent === 'CLOSE_SHORT';
+  const evidence = useAsk ? input.authority.execution_ask : input.authority.execution_bid;
+  const basis = useAsk ? 'EXECUTION_ASK' : 'EXECUTION_BID';
+  const expectedSymbol = normalizeSymbol(input.expectedSymbol) || input.authority.symbol;
+  let rejectReason: string | null = null;
+
+  if (
+    normalizeSymbol(input.authority.symbol) !== expectedSymbol
+    || normalizeSymbol(evidence.symbol) !== expectedSymbol
+  ) {
+    rejectReason = 'SYMBOL_MISMATCH';
+  } else if (!input.authority.executable) {
+    rejectReason = evidence.rejectReason || 'MARKET_NOT_EXECUTABLE';
+  } else if (!evidence.usable || evidence.value === null) {
+    rejectReason = evidence.rejectReason || 'EXECUTION_PRICE_UNAVAILABLE';
+  }
+
+  return {
+    price: rejectReason ? null : evidence.value,
+    basis,
+    executable: rejectReason === null,
+    rejectReason,
+    evidence,
+  };
+}
