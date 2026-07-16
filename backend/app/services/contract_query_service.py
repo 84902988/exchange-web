@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from sqlalchemy import inspect
 from sqlalchemy.orm import Session, load_only
@@ -33,6 +35,15 @@ DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
 ACTIVE_ORDER_STATUSES = ("OPEN", "NEW", "PENDING", "PARTIALLY_FILLED")
 POSITION_PNL_USABLE_FRESHNESS = {"LIVE", "RECENT"}
+POSITION_PNL_STATE_PRIORITY = {"LIVE": 0, "RECENT": 1, "STALE": 2, "UNAVAILABLE": 3}
+
+
+@dataclass(frozen=True)
+class ContractPositionMarkEvidence:
+    mark_price: Optional[Decimal]
+    source: Optional[str]
+    freshness: str
+    usable: bool
 
 
 @dataclass(frozen=True)
@@ -42,6 +53,26 @@ class ContractPositionPnlSnapshot:
     source: Optional[str]
     freshness: str
     usable: bool
+
+
+_POSITION_MARK_EVIDENCE_CACHE: ContextVar[Optional[dict[str, ContractPositionMarkEvidence]]] = ContextVar(
+    "contract_position_mark_evidence_cache",
+    default=None,
+)
+
+
+@contextmanager
+def contract_position_mark_evidence_scope() -> Iterator[dict[str, ContractPositionMarkEvidence]]:
+    existing = _POSITION_MARK_EVIDENCE_CACHE.get()
+    if existing is not None:
+        yield existing
+        return
+    cache: dict[str, ContractPositionMarkEvidence] = {}
+    token = _POSITION_MARK_EVIDENCE_CACHE.set(cache)
+    try:
+        yield cache
+    finally:
+        _POSITION_MARK_EVIDENCE_CACHE.reset(token)
 
 
 def _normalize_symbol(symbol: Optional[str]) -> str:
@@ -139,19 +170,23 @@ def _position_pnl_from_mark(
     return None
 
 
-def resolve_contract_position_pnl(
+def _resolve_contract_position_mark(
     db: Session,
     position: ContractPosition,
-) -> ContractPositionPnlSnapshot:
+) -> ContractPositionMarkEvidence:
     table_mark_price = _d(position.mark_price)
     if _normalize_status(position.status) != "OPEN":
-        return ContractPositionPnlSnapshot(
+        return ContractPositionMarkEvidence(
             mark_price=table_mark_price if table_mark_price > 0 else None,
-            unrealized_pnl=_d(position.unrealized_pnl),
             source="POSITION_STORED",
             freshness="STALE",
             usable=False,
         )
+
+    normalized_symbol = _normalize_symbol(position.symbol)
+    evidence_cache = _POSITION_MARK_EVIDENCE_CACHE.get()
+    if evidence_cache is not None and normalized_symbol in evidence_cache:
+        return evidence_cache[normalized_symbol]
 
     try:
         quote = get_contract_quote(db, position.symbol)
@@ -167,34 +202,67 @@ def resolve_contract_position_pnl(
             or quote.get("freshness")
             or ("LIVE" if quote.get("is_realtime") is True else "")
         ).strip().upper()
-        pnl = _position_pnl_from_mark(position, mark_price)
-        if mark_price > 0 and pnl is not None:
+        if mark_price > 0:
             normalized_freshness = freshness if freshness in POSITION_PNL_USABLE_FRESHNESS else "STALE"
-            return ContractPositionPnlSnapshot(
+            evidence = ContractPositionMarkEvidence(
                 mark_price=mark_price,
-                unrealized_pnl=pnl,
                 source=source or "CONTRACT_QUOTE",
                 freshness=normalized_freshness,
                 usable=normalized_freshness in POSITION_PNL_USABLE_FRESHNESS,
             )
+            if evidence_cache is not None and normalized_symbol:
+                evidence_cache[normalized_symbol] = evidence
+            return evidence
     except Exception:
         pass
 
-    fallback_pnl = _position_pnl_from_mark(position, table_mark_price)
-    if table_mark_price > 0 and fallback_pnl is not None:
-        return ContractPositionPnlSnapshot(
+    if table_mark_price > 0:
+        evidence = ContractPositionMarkEvidence(
             mark_price=table_mark_price,
-            unrealized_pnl=fallback_pnl,
             source="POSITION_STORED_MARK",
             freshness="STALE",
             usable=False,
         )
-    return ContractPositionPnlSnapshot(
+        if evidence_cache is not None and normalized_symbol:
+            evidence_cache[normalized_symbol] = evidence
+        return evidence
+    evidence = ContractPositionMarkEvidence(
         mark_price=None,
-        unrealized_pnl=None,
         source=None,
         freshness="UNAVAILABLE",
         usable=False,
+    )
+    if evidence_cache is not None and normalized_symbol:
+        evidence_cache[normalized_symbol] = evidence
+    return evidence
+
+
+def resolve_contract_position_pnl(
+    db: Session,
+    position: ContractPosition,
+) -> ContractPositionPnlSnapshot:
+    if _normalize_status(position.status) != "OPEN":
+        mark_evidence = _resolve_contract_position_mark(db, position)
+        return ContractPositionPnlSnapshot(
+            mark_price=mark_evidence.mark_price,
+            unrealized_pnl=_d(position.unrealized_pnl),
+            source=mark_evidence.source,
+            freshness=mark_evidence.freshness,
+            usable=False,
+        )
+
+    mark_evidence = _resolve_contract_position_mark(db, position)
+    unrealized_pnl = (
+        _position_pnl_from_mark(position, mark_evidence.mark_price)
+        if mark_evidence.mark_price is not None
+        else None
+    )
+    return ContractPositionPnlSnapshot(
+        mark_price=mark_evidence.mark_price,
+        unrealized_pnl=unrealized_pnl,
+        source=mark_evidence.source,
+        freshness=mark_evidence.freshness if unrealized_pnl is not None else "UNAVAILABLE",
+        usable=mark_evidence.usable and unrealized_pnl is not None,
     )
 
 
@@ -206,6 +274,23 @@ def _position_mark_and_pnl(db: Session, position: ContractPosition) -> tuple[Dec
         mark_price if mark_price is not None else _d(position.mark_price),
         unrealized_pnl if unrealized_pnl is not None else _d(position.unrealized_pnl),
     )
+
+
+def _aggregate_position_truth_state(snapshots: list[ContractPositionPnlSnapshot]) -> str:
+    if not snapshots:
+        return "UNAVAILABLE"
+    return max(
+        (snapshot.freshness for snapshot in snapshots),
+        key=lambda state: POSITION_PNL_STATE_PRIORITY.get(state, POSITION_PNL_STATE_PRIORITY["UNAVAILABLE"]),
+    )
+
+
+def _resolve_position_pnl_snapshots(
+    db: Session,
+    positions: list[ContractPosition],
+) -> dict[int, ContractPositionPnlSnapshot]:
+    with contract_position_mark_evidence_scope():
+        return {id(position): resolve_contract_position_pnl(db, position) for position in positions}
 
 
 def _tp_sl_key(position: ContractPosition) -> tuple[str, str]:
@@ -334,20 +419,24 @@ def _position_risk_metrics(
     *,
     side: str,
     quantity: Decimal,
-    mark_price: Decimal,
+    mark_price: Optional[Decimal],
     margin_amount: Decimal,
-    unrealized_pnl: Decimal,
+    unrealized_pnl: Optional[Decimal],
     liquidation_price: Optional[Decimal],
 ) -> dict[str, Optional[Decimal]]:
     abs_quantity = abs(quantity)
-    roe = unrealized_pnl / margin_amount * Decimal("100") if margin_amount > 0 else None
-    notional = mark_price * abs_quantity
+    roe = (
+        unrealized_pnl / margin_amount * Decimal("100")
+        if unrealized_pnl is not None and margin_amount > 0
+        else None
+    )
+    notional = mark_price * abs_quantity if mark_price is not None else Decimal("0")
     margin_ratio = margin_amount / notional * Decimal("100") if notional > 0 else None
 
     liquidation_distance: Optional[Decimal] = None
     liquidation_distance_rate: Optional[Decimal] = None
     normalized_side = _normalize_status(side)
-    if liquidation_price is not None and mark_price > 0 and liquidation_price > 0:
+    if liquidation_price is not None and mark_price is not None and mark_price > 0 and liquidation_price > 0:
         if normalized_side == "LONG":
             liquidation_distance = mark_price - liquidation_price
         elif normalized_side == "SHORT":
@@ -431,9 +520,12 @@ def get_user_contract_positions(
     rows = query.order_by(ContractPosition.opened_at.desc(), ContractPosition.id.desc()).all()
     liquidation_thresholds = _symbol_liquidation_thresholds(db, rows)
     trade_summaries = _position_trade_summaries(db, int(user_id), [int(position.id) for position in rows])
+    pnl_snapshots = _resolve_position_pnl_snapshots(db, rows)
     items: list[ContractPositionItem] = []
     for position in rows:
-        mark_price, unrealized_pnl = _position_mark_and_pnl(db, position)
+        pnl_snapshot = pnl_snapshots[id(position)]
+        mark_price = pnl_snapshot.mark_price
+        unrealized_pnl = pnl_snapshot.unrealized_pnl
         liquidation_price = _position_display_liquidation_price(
             position,
             _liquidation_threshold_for_position(liquidation_thresholds, position),
@@ -462,10 +554,14 @@ def get_user_contract_positions(
                 leverage=int(position.leverage),
                 quantity=_fmt_decimal(position.quantity),
                 entry_price=_fmt_decimal(position.entry_price),
-                mark_price=_fmt_decimal(mark_price),
+                mark_price=_fmt_optional_decimal(mark_price),
+                mark_source=pnl_snapshot.source,
+                mark_freshness=pnl_snapshot.freshness,
+                mark_usable=pnl_snapshot.usable,
                 margin_amount=_fmt_decimal(position.margin_amount),
                 open_fee=_fmt_decimal(position.open_fee),
-                unrealized_pnl=_fmt_decimal(unrealized_pnl),
+                unrealized_pnl=_fmt_optional_decimal(unrealized_pnl),
+                unrealized_pnl_state=pnl_snapshot.freshness,
                 realized_pnl=_fmt_decimal(position.realized_pnl),
                 liquidation_price=_fmt_optional_decimal(liquidation_price),
                 roe=_fmt_optional_decimal(risk_metrics["roe"]),
@@ -538,9 +634,12 @@ def get_user_contract_positions_page(
 
     trade_summaries = _position_trade_summaries(db, int(user_id), [int(position.id) for position in rows])
     liquidation_thresholds = _symbol_liquidation_thresholds(db, rows)
+    pnl_snapshots = _resolve_position_pnl_snapshots(db, rows)
     items: list[ContractPositionItem] = []
     for position in rows:
-        mark_price, unrealized_pnl = _position_mark_and_pnl(db, position)
+        pnl_snapshot = pnl_snapshots[id(position)]
+        mark_price = pnl_snapshot.mark_price
+        unrealized_pnl = pnl_snapshot.unrealized_pnl
         liquidation_price = _position_display_liquidation_price(
             position,
             _liquidation_threshold_for_position(liquidation_thresholds, position),
@@ -569,10 +668,14 @@ def get_user_contract_positions_page(
                 leverage=int(position.leverage),
                 quantity=_fmt_decimal(position.quantity),
                 entry_price=_fmt_decimal(position.entry_price),
-                mark_price=_fmt_decimal(mark_price),
+                mark_price=_fmt_optional_decimal(mark_price),
+                mark_source=pnl_snapshot.source,
+                mark_freshness=pnl_snapshot.freshness,
+                mark_usable=pnl_snapshot.usable,
                 margin_amount=_fmt_decimal(position.margin_amount),
                 open_fee=_fmt_decimal(position.open_fee),
-                unrealized_pnl=_fmt_decimal(unrealized_pnl),
+                unrealized_pnl=_fmt_optional_decimal(unrealized_pnl),
+                unrealized_pnl_state=pnl_snapshot.freshness,
                 realized_pnl=_fmt_decimal(position.realized_pnl),
                 liquidation_price=_fmt_optional_decimal(liquidation_price),
                 roe=_fmt_optional_decimal(risk_metrics["roe"]),
@@ -627,6 +730,7 @@ def get_user_contract_position_summaries(
 
     rows = query.order_by(ContractPosition.symbol.asc(), ContractPosition.side.asc(), ContractPosition.id.asc()).all()
     liquidation_thresholds = _symbol_liquidation_thresholds(db, rows)
+    pnl_snapshots_by_position = _resolve_position_pnl_snapshots(db, rows)
     grouped: dict[tuple[str, str], list[ContractPosition]] = {}
     for position in rows:
         quantity = _d(position.quantity)
@@ -648,13 +752,39 @@ def get_user_contract_position_summaries(
         )
         avg_entry_price = weighted_entry_notional / total_quantity
         margin_amount = sum((_d(position.margin_amount) for position in group_rows), Decimal("0"))
-        unrealized_pnl = Decimal("0")
-        weighted_mark_notional = Decimal("0")
-        for position in group_rows:
-            position_mark_price, position_unrealized_pnl = _position_mark_and_pnl(db, position)
-            unrealized_pnl += position_unrealized_pnl
-            weighted_mark_notional += position_mark_price * _d(position.quantity)
-        mark_price = weighted_mark_notional / total_quantity if total_quantity > 0 else Decimal("0")
+        pnl_snapshots = [pnl_snapshots_by_position[id(position)] for position in group_rows]
+        truth_state = _aggregate_position_truth_state(pnl_snapshots)
+        complete = all(
+            snapshot.mark_price is not None and snapshot.unrealized_pnl is not None
+            for snapshot in pnl_snapshots
+        )
+        unrealized_pnl = (
+            sum((snapshot.unrealized_pnl for snapshot in pnl_snapshots if snapshot.unrealized_pnl is not None), Decimal("0"))
+            if complete
+            else None
+        )
+        weighted_mark_notional = (
+            sum(
+                (
+                    snapshot.mark_price * _d(position.quantity)
+                    for position, snapshot in zip(group_rows, pnl_snapshots)
+                    if snapshot.mark_price is not None
+                ),
+                Decimal("0"),
+            )
+            if complete
+            else None
+        )
+        mark_price = (
+            weighted_mark_notional / total_quantity
+            if weighted_mark_notional is not None and total_quantity > 0
+            else None
+        )
+        mark_sources = {snapshot.source for snapshot in pnl_snapshots if snapshot.source}
+        mark_source = next(iter(mark_sources)) if len(mark_sources) == 1 else "MIXED" if mark_sources else None
+        mark_usable = complete and truth_state in POSITION_PNL_USABLE_FRESHNESS and all(
+            snapshot.usable for snapshot in pnl_snapshots
+        )
         leverage_values = {int(position.leverage) for position in group_rows}
         display_leverage = next(iter(leverage_values)) if len(leverage_values) == 1 else None
 
@@ -676,9 +806,13 @@ def get_user_contract_position_summaries(
                 leverage=display_leverage,
                 quantity=_fmt_compact_decimal(total_quantity),
                 avg_entry_price=_fmt_compact_decimal(avg_entry_price),
-                mark_price=_fmt_compact_decimal(mark_price),
+                mark_price=_fmt_compact_decimal(mark_price) if mark_price is not None else None,
+                mark_source=mark_source,
+                mark_freshness=truth_state,
+                mark_usable=mark_usable,
                 margin_amount=_fmt_compact_decimal(margin_amount),
-                unrealized_pnl=_fmt_compact_decimal(unrealized_pnl),
+                unrealized_pnl=_fmt_compact_decimal(unrealized_pnl) if unrealized_pnl is not None else None,
+                unrealized_pnl_state=truth_state,
                 liquidation_price=_fmt_optional_decimal(liquidation_price),
                 roe=_fmt_optional_decimal(risk_metrics["roe"]),
                 margin_ratio=_fmt_optional_decimal(risk_metrics["margin_ratio"]),

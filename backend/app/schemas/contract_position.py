@@ -12,10 +12,14 @@ class ContractPositionItem(BaseModel):
     leverage: int
     quantity: str
     entry_price: str
-    mark_price: str
+    mark_price: Optional[str]
+    mark_source: Optional[str] = None
+    mark_freshness: Literal["LIVE", "RECENT", "STALE", "UNAVAILABLE"] = "UNAVAILABLE"
+    mark_usable: bool = False
     margin_amount: str
     open_fee: str
-    unrealized_pnl: str
+    unrealized_pnl: Optional[str]
+    unrealized_pnl_state: Literal["LIVE", "RECENT", "STALE", "UNAVAILABLE"] = "UNAVAILABLE"
     realized_pnl: str
     liquidation_price: Optional[str] = None
     roe: Optional[str] = None
@@ -54,8 +58,12 @@ class ContractPositionSummaryItem(BaseModel):
     quantity: str
     avg_entry_price: str
     mark_price: Optional[str] = None
+    mark_source: Optional[str] = None
+    mark_freshness: Literal["LIVE", "RECENT", "STALE", "UNAVAILABLE"] = "UNAVAILABLE"
+    mark_usable: bool = False
     margin_amount: str
-    unrealized_pnl: str
+    unrealized_pnl: Optional[str]
+    unrealized_pnl_state: Literal["LIVE", "RECENT", "STALE", "UNAVAILABLE"] = "UNAVAILABLE"
     liquidation_price: Optional[str] = None
     roe: Optional[str] = None
     margin_ratio: Optional[str] = None

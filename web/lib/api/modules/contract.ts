@@ -445,10 +445,14 @@ export type ContractPositionItem = {
   leverage: number
   quantity: string
   entry_price: string
-  mark_price: string
+  mark_price: string | null
+  mark_source?: string | null
+  mark_freshness?: 'LIVE' | 'RECENT' | 'STALE' | 'UNAVAILABLE'
+  mark_usable?: boolean
   margin_amount: string
   open_fee: string
-  unrealized_pnl: string
+  unrealized_pnl: string | null
+  unrealized_pnl_state?: 'LIVE' | 'RECENT' | 'STALE' | 'UNAVAILABLE'
   realized_pnl: string
   liquidation_price?: string | null
   roe?: string | null
@@ -490,8 +494,12 @@ export type ContractPositionSummaryItem = {
   quantity: string
   avg_entry_price: string
   mark_price?: string | null
+  mark_source?: string | null
+  mark_freshness?: 'LIVE' | 'RECENT' | 'STALE' | 'UNAVAILABLE'
+  mark_usable?: boolean
   margin_amount: string
-  unrealized_pnl: string
+  unrealized_pnl: string | null
+  unrealized_pnl_state?: 'LIVE' | 'RECENT' | 'STALE' | 'UNAVAILABLE'
   liquidation_price?: string | null
   roe?: string | null
   margin_ratio?: string | null
