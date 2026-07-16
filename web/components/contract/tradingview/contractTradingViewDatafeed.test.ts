@@ -121,20 +121,48 @@ let requestKlines: (params: KlineRequest) => Promise<KlineMetadata> = async () =
 const realtimeHandlers = new Set<(message: any) => void>();
 const realtimeMarketSessionCalls: string[] = [];
 const realtimeKlineOwnerCalls: Array<{ op: 'subscribe' | 'unsubscribe'; symbol: string; interval: string }> = [];
+const realtimeResolutionCalls: Array<{
+  op: 'begin' | 'commit' | 'rollback' | 'release';
+  symbol: string;
+  interval: string;
+  ownerId: string;
+  transitionGeneration: number;
+}> = [];
 const realtimeKlineSubscriptions: Array<{
   symbol: string;
   interval: string;
+  transitionGeneration?: number;
   handler: (message: any) => void;
   released: boolean;
 }> = [];
 let realtimeDisconnectCalls = 0;
 const realtimeStub = {
+  beginKlineResolutionTransition(identity: any) {
+    realtimeResolutionCalls.push({ op: 'begin', ...identity });
+    return true;
+  },
+  commitKlineResolutionTransition(identity: any) {
+    realtimeResolutionCalls.push({ op: 'commit', ...identity });
+    return true;
+  },
+  rollbackKlineResolutionTransition(identity: any) {
+    realtimeResolutionCalls.push({ op: 'rollback', ...identity });
+    return true;
+  },
+  releaseKlineResolutionOwner(identity: any) {
+    realtimeResolutionCalls.push({ op: 'release', ...identity });
+    return true;
+  },
   setMarketSession(symbol: string) {
     realtimeMarketSessionCalls.push(symbol);
     return () => undefined;
   },
   subscribeKline(session: { symbol: string; interval: string }, handler: (message: any) => void) {
-    realtimeKlineOwnerCalls.push({ op: 'subscribe', ...session });
+    realtimeKlineOwnerCalls.push({
+      op: 'subscribe',
+      symbol: session.symbol,
+      interval: session.interval,
+    });
     const subscription = { ...session, handler, released: false };
     realtimeKlineSubscriptions.push(subscription);
     realtimeHandlers.add(handler);
@@ -142,7 +170,11 @@ const realtimeStub = {
       if (subscription.released) return;
       subscription.released = true;
       realtimeHandlers.delete(handler);
-      realtimeKlineOwnerCalls.push({ op: 'unsubscribe', ...session });
+      realtimeKlineOwnerCalls.push({
+        op: 'unsubscribe',
+        symbol: session.symbol,
+        interval: session.interval,
+      });
     };
   },
   subscribe(_event: string, handler: (message: any) => void) {
@@ -216,6 +248,7 @@ test.beforeEach(() => {
   realtimeHandlers.clear();
   realtimeMarketSessionCalls.length = 0;
   realtimeKlineOwnerCalls.length = 0;
+  realtimeResolutionCalls.length = 0;
   realtimeKlineSubscriptions.length = 0;
   realtimeDisconnectCalls = 0;
 });
@@ -2891,6 +2924,321 @@ test('terminal monthly boundary answers older requests with noData and zero addi
 });
 
 
+test('1M valid history converts later provider EMPTY into terminal noData per symbol', async () => {
+  const symbols = ['BTCUSDT_PERP', 'ETHUSDT_PERP'];
+  const currentBarsBySymbol = new Map([
+    ['BTCUSDT_PERP', utcBoundaryPageEndingAt(
+      '1M',
+      Date.parse('2026-07-01T00:00:00.000Z'),
+      3,
+      '100',
+    )],
+    ['ETHUSDT_PERP', utcBoundaryPageEndingAt(
+      '1M',
+      Date.parse('2026-07-01T00:00:00.000Z'),
+      2,
+      '200',
+    )],
+  ]);
+  const baselineServed = new Set<string>();
+  const apiCalls: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    apiCalls.push(params);
+    if (!baselineServed.has(params.symbol)) {
+      baselineServed.add(params.symbol);
+      return metadata(currentBarsBySymbol.get(params.symbol) || []);
+    }
+    return metadata([], {
+      history_incomplete: true,
+      history_complete: false,
+      provider_error_code: 'EMPTY',
+      retryable: true,
+    });
+  };
+  const historyBySymbol = new Map<string, HistoryCall[]>();
+  const errors: string[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: symbols[0] });
+
+  for (const symbol of symbols) {
+    const calls: HistoryCall[] = [];
+    historyBySymbol.set(symbol, calls);
+    const earliestBarTime = currentBarsBySymbol.get(symbol)?.[0].open_time;
+    assert.ok(earliestBarTime);
+    await datafeed.getBars(
+      symbolInfo(symbol),
+      '1M',
+      { ...period, countBack: 60 },
+      (bars: any[], meta: { noData?: boolean }) => calls.push({ bars, meta }),
+      (reason: string) => errors.push(reason),
+    );
+    await datafeed.getBars(
+      symbolInfo(symbol),
+      '1M',
+      {
+        ...period,
+        firstDataRequest: false,
+        countBack: 60,
+        to: earliestBarTime / 1000,
+      },
+      (bars: any[], meta: { noData?: boolean }) => calls.push({ bars, meta }),
+      (reason: string) => errors.push(reason),
+    );
+    const requestsAtConfirmedTerminal = apiCalls.filter((call) => call.symbol === symbol).length;
+    await datafeed.getBars(
+      symbolInfo(symbol),
+      '1M',
+      {
+        ...period,
+        firstDataRequest: false,
+        countBack: 60,
+        to: earliestBarTime / 1000,
+      },
+      (bars: any[], meta: { noData?: boolean }) => calls.push({ bars, meta }),
+      (reason: string) => errors.push(reason),
+    );
+    assert.equal(
+      apiCalls.filter((call) => call.symbol === symbol).length,
+      requestsAtConfirmedTerminal,
+      `${symbol} confirmed terminal must be cached only inside its own scope`,
+    );
+  }
+
+  assert.deepEqual(errors, []);
+  assert.deepEqual(historyBySymbol.get('BTCUSDT_PERP')?.map((call) => call.bars.length), [3, 0, 0]);
+  assert.deepEqual(historyBySymbol.get('ETHUSDT_PERP')?.map((call) => call.bars.length), [2, 0, 0]);
+  assert.deepEqual(
+    historyBySymbol.get('BTCUSDT_PERP')?.slice(1).map((call) => call.meta.noData),
+    [true, true],
+  );
+  assert.deepEqual(
+    historyBySymbol.get('ETHUSDT_PERP')?.slice(1).map((call) => call.meta.noData),
+    [true, true],
+  );
+  assert.equal(apiCalls.filter((call) => call.symbol === 'BTCUSDT_PERP').length, 3);
+  assert.equal(apiCalls.filter((call) => call.symbol === 'ETHUSDT_PERP').length, 3);
+  datafeed.destroy();
+});
+
+
+test('1M provider EMPTY terminal state does not authorize 1m noData', async () => {
+  const symbol = 'MONTHLY_MINUTE_ISOLATION_PERP';
+  const currentBars = utcBoundaryPageEndingAt(
+    '1M',
+    Date.parse('2026-07-01T00:00:00.000Z'),
+    60,
+    '300',
+  );
+  let monthlyCalls = 0;
+  requestKlines = async (params) => {
+    if (params.interval === '1M' && monthlyCalls++ === 0) return metadata(currentBars);
+    return metadata([], {
+      history_incomplete: true,
+      history_complete: false,
+      provider_error_code: 'EMPTY',
+      retryable: true,
+    });
+  };
+  const monthlyHistory: HistoryCall[] = [];
+  const minuteHistory: HistoryCall[] = [];
+  const minuteErrors: string[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  const earliestBarTime = currentBars[0].open_time;
+
+  await datafeed.getBars(
+    symbolInfo(symbol),
+    '1M',
+    { ...period, countBack: 60 },
+    (bars: any[], meta: { noData?: boolean }) => monthlyHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  await datafeed.getBars(
+    symbolInfo(symbol),
+    '1M',
+    { ...period, firstDataRequest: false, countBack: 60, to: earliestBarTime / 1000 },
+    (bars: any[], meta: { noData?: boolean }) => monthlyHistory.push({ bars, meta }),
+    assert.fail,
+  );
+  await datafeed.getBars(
+    symbolInfo(symbol),
+    '1',
+    { ...period, firstDataRequest: false, countBack: 60, to: earliestBarTime / 1000 },
+    (bars: any[], meta: { noData?: boolean }) => minuteHistory.push({ bars, meta }),
+    (reason: string) => minuteErrors.push(reason),
+  );
+
+  assert.equal(monthlyHistory[0].bars.length, 60);
+  assert.deepEqual(monthlyHistory[1], { bars: [], meta: { noData: true } });
+  assert.deepEqual(minuteHistory, []);
+  assert.equal(minuteErrors.length, 1);
+  assert.match(minuteErrors[0], /EMPTY/);
+  datafeed.destroy();
+});
+
+
+test('first 1M provider EMPTY remains a history error', async () => {
+  requestKlines = async () => metadata([], {
+    history_incomplete: true,
+    history_complete: false,
+    provider_error_code: 'EMPTY',
+    retryable: true,
+  });
+  const historyCalls: HistoryCall[] = [];
+  const errors: string[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'MONTHLY_FIRST_EMPTY_PERP' });
+
+  await datafeed.getBars(
+    symbolInfo('MONTHLY_FIRST_EMPTY_PERP'),
+    '1M',
+    { ...period, countBack: 60 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    (reason: string) => errors.push(reason),
+  );
+
+  assert.deepEqual(historyCalls, []);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /EMPTY/);
+  datafeed.destroy();
+});
+
+
+test('1M terminal candidate keeps timeout 503 and non-EMPTY provider failures closed', async () => {
+  const cases = [
+    {
+      name: 'timeout',
+      fail: async () => { throw new Error('Contract kline history chain timed out'); },
+      expected: /timed out/,
+    },
+    {
+      name: '503',
+      fail: async () => { throw new Error('HTTP 503 provider unavailable'); },
+      expected: /503/,
+    },
+    {
+      name: 'provider',
+      fail: async () => metadata([], {
+        history_incomplete: true,
+        history_complete: false,
+        provider_error_code: 'UPSTREAM_FAILURE',
+        retryable: true,
+      }),
+      expected: /UPSTREAM_FAILURE/,
+    },
+  ];
+
+  for (const item of cases) {
+    const symbol = `MONTHLY_${item.name.toUpperCase()}_PERP`;
+    const currentBars = utcBoundaryPageEndingAt(
+      '1M',
+      Date.parse('2026-07-01T00:00:00.000Z'),
+      60,
+      '400',
+    );
+    let baselinePending = true;
+    requestKlines = async () => {
+      if (baselinePending) {
+        baselinePending = false;
+        return metadata(currentBars);
+      }
+      return item.fail();
+    };
+    const errors: string[] = [];
+    const failedHistory: HistoryCall[] = [];
+    const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+    await datafeed.getBars(
+      symbolInfo(symbol),
+      '1M',
+      { ...period, countBack: 60 },
+      () => undefined,
+      assert.fail,
+    );
+    await datafeed.getBars(
+      symbolInfo(symbol),
+      '1M',
+      {
+        ...period,
+        firstDataRequest: false,
+        countBack: 60,
+        to: currentBars[0].open_time / 1000,
+      },
+      (bars: any[], meta: { noData?: boolean }) => failedHistory.push({ bars, meta }),
+      (reason: string) => errors.push(reason),
+    );
+
+    assert.deepEqual(failedHistory, [], `${item.name} must not become noData`);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], item.expected);
+    datafeed.destroy();
+  }
+});
+
+
+test('1M realtime updates after valid history and EMPTY terminal confirmation', async () => {
+  const symbol = 'MONTHLY_HISTORY_READY_REALTIME_PERP';
+  const currentBars = utcBoundaryPageEndingAt(
+    '1M',
+    Date.parse('2026-07-01T00:00:00.000Z'),
+    60,
+    '500',
+  );
+  let baselinePending = true;
+  requestKlines = async () => {
+    if (baselinePending) {
+      baselinePending = false;
+      return metadata(currentBars);
+    }
+    return metadata([], {
+      history_incomplete: true,
+      history_complete: false,
+      provider_error_code: 'EMPTY',
+      retryable: true,
+    });
+  };
+  const historyCalls: HistoryCall[] = [];
+  const realtimeBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+
+  await datafeed.getBars(
+    symbolInfo(symbol),
+    '1M',
+    { ...period, countBack: 60 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+  await datafeed.getBars(
+    symbolInfo(symbol),
+    '1M',
+    {
+      ...period,
+      firstDataRequest: false,
+      countBack: 60,
+      to: currentBars[0].open_time / 1000,
+    },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1M',
+    (bar: any) => realtimeBars.push(bar),
+    'monthly-history-ready',
+  );
+  emitRealtime(realtimeCandle(
+    symbol,
+    '1M',
+    Date.parse('2026-08-01T00:00:00.000Z'),
+    '501',
+  ));
+
+  assert.deepEqual(historyCalls.map((call) => call.bars.length), [60, 0]);
+  assert.equal(historyCalls[1].meta.noData, true);
+  assert.equal(realtimeBars.length, 1);
+  assert.equal(realtimeBars[0].close, 501);
+  assert.equal(realtimeKlineSubscriptions.at(-1)?.interval, '1M');
+  datafeed.unsubscribeBars('monthly-history-ready');
+  datafeed.destroy();
+});
+
+
 test('settled coverage remains isolated across sequential 5m to 1M to 5m generations', async () => {
   let now = 0;
   currentCacheModule.contractKlineCurrentCache.now = () => now;
@@ -3719,6 +4067,7 @@ test('high-water marks isolate symbol and interval while preserving 1M case', as
     (bar: any) => fiveMinuteBars.push(bar),
     'five-minute',
   );
+  emitRealtime(realtimeCandle('ISOLATION_A_PERP', '5m', lowerTime, '302'));
   seeded.subscribeBars(
     symbolInfo('ISOLATION_A_PERP'),
     '1M',
@@ -3727,7 +4076,7 @@ test('high-water marks isolate symbol and interval while preserving 1M case', as
   );
 
   emitRealtime(realtimeCandle('ISOLATION_B_PERP', '1m', lowerTime, '301'));
-  emitRealtime(realtimeCandle('ISOLATION_A_PERP', '5m', lowerTime, '302'));
+  emitRealtime(realtimeCandle('ISOLATION_A_PERP', '5m', highTime, '304'));
   emitRealtime(realtimeCandle('ISOLATION_A_PERP', '1M', monthlyTime, '303'));
 
   assert.deepEqual(otherSymbolBars.map((bar) => bar.time), [lowerTime]);
@@ -4247,6 +4596,118 @@ test('late monthly callback cannot write into the replacement five-minute subscr
 
   assert.deepEqual(monthlyBars, []);
   assert.deepEqual(fiveMinuteBars.map((bar) => bar.close), [102]);
+  datafeed.destroy();
+});
+
+
+test('explicit 1W to 1m commit rejects the retired weekly callback after the new identity commits', async () => {
+  const symbol = 'RESOLUTION_COMMIT_PERP';
+  const weeklyBars: any[] = [];
+  const minuteBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol, '1W');
+  await establishHistoryBaseline(datafeed, symbol, '1');
+
+  assert.ok(datafeed.beginResolutionTransition({ symbol, interval: '1w', transitionGeneration: 1 }));
+  datafeed.subscribeBars(symbolInfo(symbol), '1W', (bar: any) => weeklyBars.push(bar), 'weekly-owner');
+  assert.equal(datafeed.commitResolutionTransition(1), true);
+  const retiredWeeklyHandler = realtimeKlineSubscriptions.at(-1)!.handler;
+
+  assert.ok(datafeed.beginResolutionTransition({ symbol, interval: '1m', transitionGeneration: 2 }));
+  retiredWeeklyHandler(realtimeCandle(
+    symbol,
+    '1w',
+    Date.parse('2026-07-13T00:00:00.000Z'),
+    '100',
+  ));
+  datafeed.subscribeBars(symbolInfo(symbol), '1', (bar: any) => minuteBars.push(bar), 'minute-owner');
+  const activeMinuteHandler = realtimeKlineSubscriptions.at(-1)!.handler;
+  assert.equal(datafeed.commitResolutionTransition(2), true);
+  datafeed.subscribeBars(symbolInfo(symbol), '1W', (bar: any) => weeklyBars.push(bar), 'late-weekly-owner');
+  const lateWeeklyHandler = realtimeKlineSubscriptions.at(-1)!.handler;
+
+  retiredWeeklyHandler(realtimeCandle(
+    symbol,
+    '1w',
+    Date.parse('2026-07-20T00:00:00.000Z'),
+    '101',
+  ));
+  lateWeeklyHandler(realtimeCandle(
+    symbol,
+    '1w',
+    Date.parse('2026-07-27T00:00:00.000Z'),
+    '102',
+  ));
+  activeMinuteHandler(
+    realtimeCandle(symbol, '1m', 1_721_000_060_000, '103'),
+  );
+  assert.deepEqual(weeklyBars, []);
+  assert.deepEqual(minuteBars.map((bar) => bar.close), [103]);
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness(symbol, '1m')?.transitionGeneration, 2);
+  assert.equal(
+    realtimeKlineSubscriptions.find((subscription) => subscription.interval === '1w')?.released,
+    true,
+  );
+  datafeed.destroy();
+});
+
+
+test('1m to 1M intent owns an exact monthly identity before TradingView cache reuse subscribes again', async () => {
+  const symbol = 'MONTHLY_CACHE_REUSE_PERP';
+  const minuteBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol, '1');
+  datafeed.beginResolutionTransition({ symbol, interval: '1m', transitionGeneration: 10 });
+  datafeed.subscribeBars(symbolInfo(symbol), '1', (bar: any) => minuteBars.push(bar), 'minute-cache-owner');
+  assert.equal(datafeed.commitResolutionTransition(10), true);
+  const retiredMinuteHandler = realtimeKlineSubscriptions.at(-1)!.handler;
+
+  const monthlyIdentity = datafeed.beginResolutionTransition({
+    symbol,
+    interval: '1M',
+    transitionGeneration: 11,
+  });
+  assert.equal(monthlyIdentity?.interval, '1M');
+  assert.equal(monthlyIdentity?.transitionGeneration, 11);
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness(symbol, '1m'), null);
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness(symbol, '1M')?.interval, '1M');
+  retiredMinuteHandler(realtimeCandle(symbol, '1m', 1_721_000_000_000, '201'));
+  assert.deepEqual(minuteBars, []);
+
+  datafeed.subscribeBars(symbolInfo(symbol), '1M', () => undefined, 'monthly-cache-owner');
+  const monthlySubscription = realtimeKlineSubscriptions.at(-1)!;
+  assert.equal(monthlySubscription.interval, '1M');
+  assert.equal(monthlySubscription.transitionGeneration, 11);
+  assert.equal(datafeed.commitResolutionTransition(11), true);
+  datafeed.unsubscribeBars('monthly-cache-owner');
+  assert.equal(monthlySubscription.released, true);
+  assert.ok(realtimeResolutionCalls.some((call) => (
+    call.op === 'begin'
+    && call.interval === '1M'
+    && call.transitionGeneration === 11
+  )));
+  datafeed.destroy();
+});
+
+
+test('failed candidate rollback restores only the explicit committed target identity', async () => {
+  const symbol = 'RESOLUTION_ROLLBACK_PERP';
+  const minuteBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol, '1');
+  datafeed.beginResolutionTransition({ symbol, interval: '1m', transitionGeneration: 21 });
+  datafeed.subscribeBars(symbolInfo(symbol), '1', (bar: any) => minuteBars.push(bar), 'rollback-minute');
+  assert.equal(datafeed.commitResolutionTransition(21), true);
+  const minuteHandler = realtimeKlineSubscriptions.at(-1)!.handler;
+
+  datafeed.beginResolutionTransition({ symbol, interval: '1h', transitionGeneration: 22 });
+  minuteHandler(realtimeCandle(symbol, '1m', 1_721_000_000_000, '301'));
+  assert.equal(minuteBars.length, 0);
+  assert.equal(datafeed.rollbackResolutionTransition(22), true);
+  minuteHandler(realtimeCandle(symbol, '1m', 1_721_000_060_000, '302'));
+  assert.deepEqual(minuteBars.map((bar) => bar.close), [302]);
+  assert.equal(datafeed.getRealtimeSubscriptionReadiness(symbol, '1m')?.transitionGeneration, 21);
+  assert.ok(realtimeResolutionCalls.some((call) => call.op === 'rollback' && call.transitionGeneration === 22));
   datafeed.destroy();
 });
 

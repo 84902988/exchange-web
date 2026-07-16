@@ -144,7 +144,7 @@ function klineCommands(socket: { sent: string[] }) {
 }
 
 
-test('failed 1m to 1H resolution candidate restores the suspended minute owner', () => {
+test('failed 1m to 1H resolution candidate rolls back only to the explicitly committed minute owner', () => {
   const harness = installRealtimeHarness();
 
   try {
@@ -156,12 +156,27 @@ test('failed 1m to 1H resolution candidate restores the suspended minute owner',
 
     const minuteEvents: unknown[] = [];
     const hourlyEvents: unknown[] = [];
+    const minuteIdentity = {
+      symbol: 'BTCUSDT_PERP',
+      interval: '1m',
+      ownerId: 'minute-owner',
+      transitionGeneration: 1,
+    };
+    assert.equal(client.beginKlineResolutionTransition(minuteIdentity), true);
     const releaseMinute = client.subscribeKline(
-      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      { symbol: 'BTCUSDT_PERP', interval: '1m', transitionGeneration: 1 },
       (message: unknown) => minuteEvents.push(message),
     );
+    assert.equal(client.commitKlineResolutionTransition(minuteIdentity), true);
+    const hourlyIdentity = {
+      symbol: 'BTCUSDT_PERP',
+      interval: '1h',
+      ownerId: 'hourly-owner',
+      transitionGeneration: 2,
+    };
+    assert.equal(client.beginKlineResolutionTransition(hourlyIdentity), true);
     const releaseHourly = client.subscribeKline(
-      { symbol: 'BTCUSDT_PERP', interval: '1H' },
+      { symbol: 'BTCUSDT_PERP', interval: '1H', transitionGeneration: 2 },
       (message: unknown) => hourlyEvents.push(message),
     );
 
@@ -178,7 +193,7 @@ test('failed 1m to 1H resolution candidate restores the suspended minute owner',
       ],
     );
 
-    releaseHourly();
+    assert.equal(client.rollbackKlineResolutionTransition(hourlyIdentity), true);
     socket.onmessage?.(klineSnapshot('1m'));
     assert.equal(minuteEvents.length, 1);
     assert.equal(hourlyEvents.length, 1);
@@ -193,7 +208,9 @@ test('failed 1m to 1H resolution candidate restores the suspended minute owner',
       ],
     );
 
+    releaseHourly();
     releaseMinute();
+    assert.equal(client.releaseKlineResolutionOwner(minuteIdentity), true);
     assert.equal(klineCommands(socket).at(-1), 'unsubscribe:BTCUSDT_PERP:1m');
     releaseMarket();
   } finally {
@@ -202,7 +219,7 @@ test('failed 1m to 1H resolution candidate restores the suspended minute owner',
 });
 
 
-test('1m to 5m to 1m restores the original callback without cross-interval delivery', () => {
+test('successful 1W to 1m commit permanently rejects the old callback even after a delayed delivery', () => {
   const harness = installRealtimeHarness();
 
   try {
@@ -212,38 +229,95 @@ test('1m to 5m to 1m restores the original callback without cross-interval deliv
     socket.readyState = harness.MockWebSocket.OPEN;
     socket.onopen?.();
 
+    const weeklyEvents: unknown[] = [];
     const minuteEvents: unknown[] = [];
-    const fiveMinuteEvents: unknown[] = [];
+    const weeklyIdentity = {
+      symbol: 'BTCUSDT_PERP',
+      interval: '1w',
+      ownerId: 'weekly-owner',
+      transitionGeneration: 1,
+    };
+    client.beginKlineResolutionTransition(weeklyIdentity);
+    const releaseWeekly = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1w', transitionGeneration: 1 },
+      (message: unknown) => weeklyEvents.push(message),
+    );
+    client.commitKlineResolutionTransition(weeklyIdentity);
+    const minuteIdentity = {
+      symbol: 'BTCUSDT_PERP',
+      interval: '1m',
+      ownerId: 'minute-owner',
+      transitionGeneration: 2,
+    };
+    client.beginKlineResolutionTransition(minuteIdentity);
     const releaseMinute = client.subscribeKline(
-      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      { symbol: 'BTCUSDT_PERP', interval: '1m', transitionGeneration: 2 },
       (message: unknown) => minuteEvents.push(message),
     );
-    const releaseFiveMinute = client.subscribeKline(
-      { symbol: 'BTCUSDT_PERP', interval: '5m' },
-      (message: unknown) => fiveMinuteEvents.push(message),
-    );
+    client.commitKlineResolutionTransition(minuteIdentity);
 
-    socket.onmessage?.(klineSnapshot('5m'));
+    socket.onmessage?.(klineSnapshot('1w'));
     socket.onmessage?.(klineSnapshot('1m'));
-    assert.deepEqual(minuteEvents, []);
-    assert.equal(fiveMinuteEvents.length, 1);
-
-    releaseFiveMinute();
-    socket.onmessage?.(klineSnapshot('1m'));
+    assert.deepEqual(weeklyEvents, []);
     assert.equal(minuteEvents.length, 1);
-    assert.equal(fiveMinuteEvents.length, 1);
+
+    const releaseStaleWeekly = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1w', transitionGeneration: 1 },
+      (message: unknown) => weeklyEvents.push(message),
+    );
+    socket.onmessage?.(klineSnapshot('1w'));
+    socket.onmessage?.(klineSnapshot('1m'));
+    assert.equal(minuteEvents.length, 2);
+    assert.deepEqual(weeklyEvents, []);
     assert.deepEqual(
       klineCommands(socket),
       [
-        'subscribe:BTCUSDT_PERP:1m',
-        'unsubscribe:BTCUSDT_PERP:1m',
-        'subscribe:BTCUSDT_PERP:5m',
-        'unsubscribe:BTCUSDT_PERP:5m',
+        'subscribe:BTCUSDT_PERP:1w',
+        'unsubscribe:BTCUSDT_PERP:1w',
         'subscribe:BTCUSDT_PERP:1m',
       ],
     );
 
+    releaseStaleWeekly();
+    releaseWeekly();
     releaseMinute();
+    assert.equal(client.releaseKlineResolutionOwner(minuteIdentity), true);
+    releaseMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+
+test('1M transition keeps exact monthly identity through subscribe and unsubscribe', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+    const monthlyIdentity = {
+      symbol: 'BTCUSDT_PERP',
+      interval: '1M',
+      ownerId: 'monthly-owner',
+      transitionGeneration: 7,
+    };
+
+    assert.equal(client.beginKlineResolutionTransition(monthlyIdentity), true);
+    const releaseMonthly = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1M', transitionGeneration: 7 },
+      () => undefined,
+    );
+    assert.equal(client.commitKlineResolutionTransition(monthlyIdentity), true);
+    releaseMonthly();
+    assert.equal(client.releaseKlineResolutionOwner(monthlyIdentity), true);
+
+    assert.deepEqual(klineCommands(socket), [
+      'subscribe:BTCUSDT_PERP:1M',
+      'unsubscribe:BTCUSDT_PERP:1M',
+    ]);
     releaseMarket();
   } finally {
     harness.restore();
