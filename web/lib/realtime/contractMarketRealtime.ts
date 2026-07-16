@@ -40,10 +40,12 @@ export type ContractKlineRealtimeSession = {
 
 type ContractRealtimeProtocolMode = 'idle' | 'legacy' | 'domain';
 
+type ContractKlineOwnerState = 'ACTIVE' | 'SUSPENDED' | 'DESTROYED';
+
 type ContractKlineOwner = ContractKlineRealtimeSession & {
   id: number;
   releaseEvents: () => void;
-  retired: boolean;
+  state: ContractKlineOwnerState;
 };
 
 function normalizeSymbol(symbol: string) {
@@ -153,7 +155,7 @@ export class ContractMarketRealtimeClient {
     this.protocolMode = 'legacy';
     this.marketSymbol = '';
     this.activeMarketOwner = 0;
-    this.retireAllKlineOwners();
+    this.destroyAllKlineOwners();
     this.requestedSymbol = nextSymbol;
     this.requestedInterval = nextInterval;
     this.closedByClient = false;
@@ -181,6 +183,16 @@ export class ContractMarketRealtimeClient {
     this.marketOwnerSequence = ownerId;
     const previousMode = this.protocolMode;
     const previousSymbol = this.marketSymbol;
+    const previousKlineOwner = this.getActiveKlineOwner();
+    const removedActiveKlineOwner = previousKlineOwner?.symbol !== nextSymbol
+      ? previousKlineOwner
+      : null;
+    const clearKlineOwners = Array.from(this.klineOwners.values()).some(
+      (owner) => owner.symbol !== nextSymbol,
+    );
+    if (clearKlineOwners) {
+      this.destroyKlineOwnersExcept(nextSymbol);
+    }
     this.activeMarketOwner = ownerId;
     this.marketSymbol = nextSymbol;
     this.protocolMode = 'domain';
@@ -190,6 +202,8 @@ export class ContractMarketRealtimeClient {
     const activeKline = this.getActiveKlineOwnerForSymbol(nextSymbol);
     if (activeKline) {
       this.requestedInterval = activeKline.interval;
+    } else if (clearKlineOwners) {
+      this.requestedInterval = '1m';
     }
 
     if (!getConfiguredWsUrl(nextSymbol, this.requestedInterval)) {
@@ -199,6 +213,14 @@ export class ContractMarketRealtimeClient {
     } else if (previousMode !== 'domain' || previousSymbol !== nextSymbol) {
       if (previousMode === 'domain' && previousSymbol) {
         this.sendDomainCommand('unsubscribe', 'market', previousSymbol);
+      }
+      if (removedActiveKlineOwner) {
+        this.sendDomainCommand(
+          'unsubscribe',
+          'kline',
+          removedActiveKlineOwner.symbol,
+          removedActiveKlineOwner.interval,
+        );
       }
       this.sendDomainCommand('subscribe', 'market', nextSymbol);
       if (activeKline) {
@@ -235,7 +257,7 @@ export class ContractMarketRealtimeClient {
     const previousMode = this.protocolMode;
     const previousOwner = this.getActiveKlineOwner();
     if (previousOwner) {
-      this.retireKlineOwner(previousOwner);
+      previousOwner.state = 'SUSPENDED';
     }
 
     const ownerId = this.klineOwnerSequence + 1;
@@ -244,9 +266,19 @@ export class ContractMarketRealtimeClient {
       id: ownerId,
       symbol,
       interval,
-      releaseEvents: this.subscribe('kline', handler),
-      retired: false,
+      releaseEvents: () => undefined,
+      state: 'ACTIVE',
     };
+    owner.releaseEvents = this.subscribe('kline', (message) => {
+      if (owner.state !== 'ACTIVE') return;
+      const messageSymbol = normalizeSymbol(message.symbol || '');
+      const messageInterval = message.interval
+        ? normalizeContractMarketInterval(message.interval)
+        : '';
+      if (messageSymbol && messageSymbol !== owner.symbol) return;
+      if (messageInterval && messageInterval !== owner.interval) return;
+      handler(message);
+    });
     this.klineOwners.set(ownerId, owner);
     this.protocolMode = 'domain';
     this.closedByClient = false;
@@ -275,17 +307,17 @@ export class ContractMarketRealtimeClient {
     return () => {
       if (!active) return;
       active = false;
-      const activeOwner = this.getActiveKlineOwner();
-      this.retireKlineOwner(owner);
-      if (activeOwner?.id !== ownerId) return;
+      const wasActive = owner.state === 'ACTIVE';
+      this.destroyKlineOwner(owner);
+      if (!wasActive) return;
 
-      if (this.protocolMode === 'domain') {
-        this.sendDomainCommand('unsubscribe', 'kline', activeOwner.symbol, activeOwner.interval);
-      }
-      this.requestedSymbol = this.marketSymbol || '';
-      if (!this.marketSymbol) {
-        this.requestedInterval = '1m';
-      }
+      const restoredOwner = this.getLatestSuspendedKlineOwner(
+        this.marketSymbol || owner.symbol,
+      );
+      if (restoredOwner) restoredOwner.state = 'ACTIVE';
+      this.switchKlineOwner(owner, restoredOwner);
+      this.requestedSymbol = this.marketSymbol || restoredOwner?.symbol || '';
+      this.requestedInterval = restoredOwner?.interval || '1m';
       this.closeDomainSocketIfIdle();
     };
   }
@@ -333,7 +365,7 @@ export class ContractMarketRealtimeClient {
     this.protocolMode = 'idle';
     this.marketSymbol = '';
     this.activeMarketOwner = 0;
-    this.retireAllKlineOwners();
+    this.destroyAllKlineOwners();
     this.setStatus('idle');
 
     if (!this.ws) return;
@@ -348,11 +380,9 @@ export class ContractMarketRealtimeClient {
   }
 
   private getActiveKlineOwner() {
-    let activeOwner: ContractKlineOwner | null = null;
-    for (const owner of this.klineOwners.values()) {
-      activeOwner = owner;
-    }
-    return activeOwner;
+    return Array.from(this.klineOwners.values()).find(
+      (owner) => owner.state === 'ACTIVE',
+    ) ?? null;
   }
 
   private getActiveKlineOwnerForSymbol(symbol: string) {
@@ -360,16 +390,59 @@ export class ContractMarketRealtimeClient {
     return activeOwner?.symbol === normalizeSymbol(symbol) ? activeOwner : null;
   }
 
-  private retireKlineOwner(owner: ContractKlineOwner) {
-    if (owner.retired) return;
-    owner.retired = true;
+  private getLatestSuspendedKlineOwner(symbol: string) {
+    const normalizedSymbol = normalizeSymbol(symbol);
+    const owners = Array.from(this.klineOwners.values());
+    for (let index = owners.length - 1; index >= 0; index -= 1) {
+      const owner = owners[index];
+      if (owner.state === 'SUSPENDED' && owner.symbol === normalizedSymbol) {
+        return owner;
+      }
+    }
+    return null;
+  }
+
+  private destroyKlineOwner(owner: ContractKlineOwner) {
+    if (owner.state === 'DESTROYED') return;
+    owner.state = 'DESTROYED';
     owner.releaseEvents();
     this.klineOwners.delete(owner.id);
   }
 
-  private retireAllKlineOwners() {
+  private destroyAllKlineOwners() {
     for (const owner of Array.from(this.klineOwners.values())) {
-      this.retireKlineOwner(owner);
+      this.destroyKlineOwner(owner);
+    }
+  }
+
+  private destroyKlineOwnersExcept(symbol: string) {
+    const normalizedSymbol = normalizeSymbol(symbol);
+    for (const owner of Array.from(this.klineOwners.values())) {
+      if (owner.symbol !== normalizedSymbol) this.destroyKlineOwner(owner);
+    }
+  }
+
+  private switchKlineOwner(
+    previousOwner: ContractKlineOwner | null,
+    nextOwner: ContractKlineOwner | null,
+  ) {
+    if (
+      this.protocolMode !== 'domain'
+      || this.sameKlineSession(previousOwner, nextOwner)
+    ) return;
+    if (previousOwner) {
+      this.sendDomainCommand(
+        'unsubscribe',
+        'kline',
+        previousOwner.symbol,
+        previousOwner.interval,
+      );
+    }
+    if (
+      nextOwner
+      && (!this.marketSymbol || this.marketSymbol === nextOwner.symbol)
+    ) {
+      this.sendDomainCommand('subscribe', 'kline', nextOwner.symbol, nextOwner.interval);
     }
   }
 
