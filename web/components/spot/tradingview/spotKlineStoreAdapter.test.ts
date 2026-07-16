@@ -86,6 +86,7 @@ describe('spot kline store adapter', () => {
     expect(event?.revision?.sequence).toBe(8);
     expect(event?.sequence).toBe(8);
     expect(event?.closed).toBe(true);
+    expect(event?.generation).toBe(3);
   });
 
   it('subscribes only to the selected symbol and interval and releases its interest', () => {

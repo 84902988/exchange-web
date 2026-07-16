@@ -7,6 +7,7 @@ import {
 } from '@/lib/api/modules/spot';
 import {
   spotMarketRealtime,
+  type SpotMarketCandlePreviewMessage,
 } from '@/services/marketRealtime';
 import { normalizeTimeToSeconds } from '../chart/chart.utils';
 import type { SpotChartProps, SpotKlineLoadState } from '../chart/chart.types';
@@ -47,6 +48,8 @@ import {
   subscribeSpotKlineCurrent,
   type SpotKlineStoreRealtimeEvent,
 } from './spotKlineStoreAdapter';
+import { SpotTradingViewPreviewCompositor } from './spotTradingViewPreviewCompositor';
+import { SpotTradingViewRealtimeBarFrameCoalescer } from './spotTradingViewRealtimeBarFrameCoalescer';
 
 type TradingViewResolution = '1' | '5' | '15' | '60' | '240' | '1D' | '1W' | '1M';
 
@@ -61,6 +64,15 @@ export type SpotTradingViewRealtimeEvent = {
   provider: string | null;
   source: string;
   freshness: string;
+  receivedAtMs: number;
+};
+
+export type SpotTradingViewCandleAuthorityEvent = {
+  symbol: string;
+  interval: string;
+  barTime: number;
+  close: number;
+  source: string;
   receivedAtMs: number;
 };
 
@@ -169,6 +181,7 @@ type SpotTradingViewDatafeedOptions = Pick<
   debugEnabled?: boolean;
   onKlineLoadStateChange?: (state: SpotKlineLoadState) => void;
   onKlineRealtime?: (event: SpotTradingViewRealtimeEvent) => void;
+  onCandleAuthority?: (event: SpotTradingViewCandleAuthorityEvent) => void;
   onHistoryBars?: (event: SpotTradingViewHistoryBarsEvent) => void;
   onRealtimeSubscriptionReady?: (evidence: SpotRealtimeSubscriptionReadiness) => void;
   inFlightDeadlineMs?: Partial<Record<SpotKlineInFlightRole, number>>;
@@ -621,6 +634,20 @@ function normalizeProvider(value: unknown): string {
 
 function normalizeSource(value: unknown): string {
   return String(value || '').trim().toUpperCase();
+}
+
+function toPositiveInteger(value: unknown): number | null {
+  const num = Number(value);
+  return Number.isInteger(num) && num > 0 ? num : null;
+}
+
+function toNonNegativeInteger(value: unknown): number | null {
+  const num = Number(value);
+  return Number.isInteger(num) && num >= 0 ? num : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
 }
 
 function normalizeKlineMetaValue(value: unknown): string {
@@ -2751,7 +2778,12 @@ export function createSpotTradingViewDatafeed(
               provider_error_code: result.provider_error_code,
               noData: false,
             });
-            safeErrorCallback('Kline history temporarily unavailable');
+            if (canUpdateActiveHistoryState()) {
+              options.onKlineLoadStateChange?.('loading');
+              historyReadyByLatestBarKey.set(latestBarKey, true);
+            }
+            emptyRangeGuard.rememberEmpty(emptyRangeState.key);
+            safeHistoryCallback([], { noData: false }, 'current baseline waiting');
             return;
           }
 
@@ -2944,7 +2976,18 @@ export function createSpotTradingViewDatafeed(
       );
       latestBarKeyByUid.set(subscriberUid, latestBarKey);
 
-      const emitRealtimeBar: EmitRealtimeBar = (bar, reason) => {
+      const notifyCandleAuthority = (bar: TradingViewBar, source: string) => {
+        options.onCandleAuthority?.({
+          symbol: apiSymbol,
+          interval,
+          barTime: bar.time,
+          close: bar.close,
+          source,
+          receivedAtMs: Date.now(),
+        });
+      };
+
+      const commitRealtimeBar: EmitRealtimeBar = (bar, reason) => {
         if (!isCurrentSubscription()) return false;
         if (historyReadyByLatestBarKey.get(latestBarKey) === false) return false;
         if (!Number.isFinite(bar.time) || bar.time <= 0) return false;
@@ -2979,7 +3022,46 @@ export function createSpotTradingViewDatafeed(
         rememberRealtimeHighWaterMark(latestBarKey, nextBar.time);
         lastEmittedBarTimeByUid.set(subscriberUid, nextBar.time);
         onRealtime(nextBar);
+        notifyCandleAuthority(nextBar, reason);
         return true;
+      };
+      const previewCompositor = new SpotTradingViewPreviewCompositor({
+        symbol: apiSymbol,
+        interval,
+      });
+      const realtimeBarFrameCoalescer = new SpotTradingViewRealtimeBarFrameCoalescer({
+        windowMs: 12,
+        onFlush: (candidate) => {
+          commitRealtimeBar(candidate.bar, candidate.source);
+        },
+      });
+      const emitRealtimeBar: EmitRealtimeBar = (bar, reason) => {
+        if (
+          !previewCompositor.supported
+          || (
+            reason !== 'preview'
+            && reason !== 'native-open'
+            && reason !== 'native-closed'
+          )
+        ) {
+          return commitRealtimeBar(bar, reason);
+        }
+        if (!isCurrentSubscription()) return false;
+        if (historyReadyByLatestBarKey.get(latestBarKey) === false) return false;
+
+        return realtimeBarFrameCoalescer.enqueue({
+          symbol: apiSymbol,
+          interval,
+          source: reason,
+          bar: {
+            time: bar.time,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: Number(bar.volume ?? 0),
+          },
+        });
       };
 
       let pendingGapRevision: SpotRealtimeRevisionEnvelope | null = null;
@@ -3024,6 +3106,7 @@ export function createSpotTradingViewDatafeed(
         lastEmittedBarTimeByUid.set(subscriberUid, nextBar.time);
         state.cursorTime = nextBar.time;
         onRealtime(nextBar);
+        notifyCandleAuthority(nextBar, 'gap-recovery');
         return true;
       };
 
@@ -3304,6 +3387,58 @@ export function createSpotTradingViewDatafeed(
         if (revisionResult.decision !== 'ACCEPT') return;
         if (latestBar && revisionBar.time < latestBar.time) return;
 
+        let displayBar: TradingViewBar = revisionBar;
+        let displayReason = revisionResult.winner.revision.isClosed === true
+          ? 'native-closed'
+          : 'native-open';
+        let shouldEmitDisplayBar = true;
+        if (previewCompositor.supported) {
+          const generation = toPositiveInteger(message.generation);
+          const nativeReceivedAtMs = toPositiveInteger(message.receivedAtMs) ?? Date.now();
+          const revisionEpoch = toNonNegativeInteger(
+            revisionResult.winner.revision.revisionEpoch,
+          );
+          const revisionSequence = toNonNegativeInteger(
+            revisionResult.winner.revision.revisionSeq,
+          );
+          if (generation !== null && revisionEpoch !== null && revisionSequence !== null) {
+            const nativeResult = previewCompositor.acceptNative({
+              symbol: apiSymbol,
+              interval,
+              openTime: revisionBar.time,
+              generation,
+              receivedAtMs: nativeReceivedAtMs,
+              revision: { epoch: revisionEpoch, sequence: revisionSequence },
+              isClosed: revisionResult.winner.revision.isClosed === true,
+              bar: {
+                ...revisionBar,
+                volume: Number(revisionBar.volume || 0),
+              },
+            });
+            if (nativeResult.accepted && nativeResult.bar) {
+              displayBar = { ...nativeResult.bar };
+              displayReason = revisionResult.winner.revision.isClosed === true
+                ? 'native-closed'
+                : (nativeResult.source === 'preview' ? 'preview' : 'native-open');
+              shouldEmitDisplayBar = nativeResult.reason !== 'NATIVE_OPEN_DEFERRED_TO_PREVIEW';
+            }
+            spotTradingViewDebug('subscribeBars preview native authority', {
+              symbol: apiSymbol,
+              interval,
+              subscriberUid,
+              accepted: nativeResult.accepted,
+              reason: nativeResult.reason,
+              source: nativeResult.source,
+              generation,
+              nativeReceivedAtMs,
+              revisionEpoch,
+              revisionSequence,
+              openTime: revisionBar.time,
+              isClosed: revisionResult.winner.revision.isClosed === true,
+            });
+          }
+        }
+
         const realtimeEnvelope: SpotRealtimeRevisionEnvelope = {
           candidate: revisionResult.winner,
           provider: klineProvider,
@@ -3321,9 +3456,109 @@ export function createSpotTradingViewDatafeed(
           return;
         }
 
-        const didEmit = emitRealtimeBar(revisionBar, 'kline');
+        if (!shouldEmitDisplayBar) {
+          notifyKlineRealtime(revisionBar, realtimeEnvelope);
+          return;
+        }
+        const didEmit = emitRealtimeBar(
+          displayBar,
+          displayReason,
+        );
         if (!didEmit) return;
         notifyKlineRealtime(revisionBar, realtimeEnvelope);
+      };
+
+      const handlePreview = (message: SpotMarketCandlePreviewMessage) => {
+        if (!isCurrentSubscription() || !previewCompositor.supported) return;
+        if (message.type !== 'spot_candle_preview_update') return;
+
+        const msgSymbol = normalizeSpotSymbol(message.symbol || '');
+        const msgInterval = normalizeSpotInterval(message.interval || '');
+        if (msgSymbol !== apiSymbol || msgInterval !== interval) return;
+
+        const previewPayload = asRecord(message.preview);
+        const baseRevision = asRecord(message.base_native_revision);
+        const provider = normalizeProvider(previewPayload?.provider || message.provider);
+        const previewReceivedAtMs = toPositiveInteger(message.received_at_ms) ?? Date.now();
+        const generation = toPositiveInteger(
+          previewPayload?.generation ?? message.provider_generation,
+        );
+        const previewSeq = toPositiveInteger(
+          previewPayload?.preview_seq ?? message.preview_seq,
+        );
+        const revisionEpoch = toNonNegativeInteger(
+          previewPayload?.revision_epoch ?? baseRevision?.epoch,
+        );
+        const revisionSequence = toNonNegativeInteger(
+          previewPayload?.revision_seq ?? baseRevision?.sequence,
+        );
+        const openTime = toPositiveInteger(previewPayload?.open_time);
+        const bar = klinePayloadToBar(
+          previewPayload,
+          interval,
+          provider,
+          message.source,
+        );
+        if (
+          provider !== 'OKX_SPOT'
+          || generation === null
+          || previewSeq === null
+          || revisionEpoch === null
+          || revisionSequence === null
+          || openTime === null
+          || !bar
+        ) {
+          spotTradingViewDebug('subscribeBars preview rejected', {
+            symbol: apiSymbol,
+            interval,
+            subscriberUid,
+            reason: 'INVALID_PREVIEW_MESSAGE',
+            provider,
+            generation,
+            previewSeq,
+            revisionEpoch,
+            revisionSequence,
+            openTime,
+          });
+          return;
+        }
+
+        const result = previewCompositor.acceptPreview({
+          symbol: msgSymbol,
+          interval: msgInterval,
+          openTime,
+          generation,
+          receivedAtMs: previewReceivedAtMs,
+          previewSeq,
+          baseNativeRevision: {
+            epoch: revisionEpoch,
+            sequence: revisionSequence,
+          },
+          bar: {
+            ...bar,
+            volume: Number(bar.volume || 0),
+          },
+        });
+        spotTradingViewDebug(
+          result.accepted
+            ? 'subscribeBars preview accepted'
+            : 'subscribeBars preview rejected',
+          {
+            symbol: apiSymbol,
+            interval,
+            subscriberUid,
+            reason: result.reason,
+            generation,
+            previewReceivedAtMs,
+            previewSeq,
+            revisionEpoch,
+            revisionSequence,
+            openTime,
+            close: result.bar?.close ?? null,
+          },
+        );
+        if (!result.accepted || !result.bar) return;
+        emitRealtimeBar(result.bar, 'preview');
       };
 
       const subscriptionId = spotMarketRealtime.acquireSubscription({
@@ -3338,11 +3573,18 @@ export function createSpotTradingViewDatafeed(
         owner: `${realtimeOwner}:${subscriberUid}`,
         onSnapshot: handleKline,
       });
+      const unsubscribePreview = previewCompositor.supported
+        ? spotMarketRealtime.subscribe('preview', (message) => {
+            if (message.type === 'spot_candle_preview_update') handlePreview(message);
+          })
+        : () => undefined;
       const unsubscribe = () => {
         subscriptionRetired = true;
         pendingGapRevision = null;
         gapRecoveryState = null;
         failedGapTargetTime = 0;
+        realtimeBarFrameCoalescer.cancel();
+        unsubscribePreview();
         unsubscribeKline();
         spotMarketRealtime.releaseSubscription(subscriptionId);
       };

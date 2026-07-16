@@ -19,6 +19,7 @@ export type SpotKlineStoreRealtimeEvent = {
   revision: DomainRevision | null;
   sequence: number | null;
   closed: boolean | null;
+  generation: number | null;
 };
 
 export type SubscribeSpotKlineCurrentOptions = {
@@ -68,6 +69,7 @@ export function klineSnapshotToRealtimeEvent(
     revision: snapshot.metadata.revision,
     sequence: slot?.sequence ?? snapshot.metadata.revision?.sequence ?? null,
     closed: slot?.isClosed ?? snapshot.metadata.revision?.is_closed ?? null,
+    generation: snapshot.metadata.provider_generation,
   };
 }
 

@@ -49,6 +49,14 @@ async function waitFor(condition: () => boolean, message: string) {
   assert.ok(condition(), message)
 }
 
+async function waitForRealtimeFrame(condition: () => boolean, message: string) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (condition()) return
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  assert.ok(condition(), message)
+}
+
 function wait(milliseconds: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
 }
@@ -182,6 +190,15 @@ const preloadModule = loadTypeScriptModule(
 
 let requestKlines: (params: Record<string, unknown>) => Promise<KlineResponse> = async () => ({ items: [] })
 let klineSubscriber: ((message: Record<string, unknown>) => void) | null = null
+let previewSubscriber: ((message: Record<string, unknown>) => void) | null = null
+const previewCompositorModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./spotTradingViewPreviewCompositor.ts', import.meta.url)),
+  {},
+)
+const realtimeBarFrameCoalescerModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./spotTradingViewRealtimeBarFrameCoalescer.ts', import.meta.url)),
+  {},
+)
 const datafeedModule = loadTypeScriptModule(
   fileURLToPath(new URL('./spotTradingViewDatafeed.ts', import.meta.url)),
   {
@@ -194,8 +211,14 @@ const datafeedModule = loadTypeScriptModule(
         acquireKlineInterval: () => () => undefined,
         acquireSubscription: () => 'test-kline-subscription',
         releaseSubscription: () => undefined,
-        subscribe: () => {
-          throw new Error('datafeed must not subscribe directly to marketRealtime kline')
+        subscribe: (type: string, handler: (message: Record<string, unknown>) => void) => {
+          if (type !== 'preview') {
+            throw new Error('datafeed must not subscribe directly to marketRealtime kline')
+          }
+          previewSubscriber = handler
+          return () => {
+            if (previewSubscriber === handler) previewSubscriber = null
+          }
         },
         releaseKlineIntervalOwner: () => undefined,
         syncKlineInterval: () => undefined,
@@ -239,6 +262,7 @@ const datafeedModule = loadTypeScriptModule(
             },
             sequence: kline?.revision_seq ?? null,
             closed: kline?.is_closed ?? null,
+            generation: kline?.provider_generation ?? message.provider_generation ?? null,
           })
         }
         klineSubscriber = handler
@@ -247,6 +271,8 @@ const datafeedModule = loadTypeScriptModule(
         }
       },
     },
+    './spotTradingViewPreviewCompositor': previewCompositorModule,
+    './spotTradingViewRealtimeBarFrameCoalescer': realtimeBarFrameCoalescerModule,
   },
 )
 
@@ -351,6 +377,80 @@ test('provider empty and incomplete history settles with noData false', async ()
 
   assert.deepEqual(historyCalls[0].bars, [])
   assert.equal(historyCalls[0].meta.noData, false)
+  datafeed.destroy()
+})
+
+test('resolution subscribe without a baseline waits for a valid realtime bar without error', async () => {
+  requestKlines = async () => metadata([], {
+    cache_status: 'PROVIDER_EMPTY',
+    history_incomplete: true,
+    history_terminal: false,
+    provider_error_code: 'EMPTY',
+  })
+  const historyCalls: HistoryCall[] = []
+  const errors: string[] = []
+  const emittedBars: Array<Record<string, unknown>> = []
+  const loadStates: string[] = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({
+    symbol: 'BTCUSDT',
+    onKlineLoadStateChange: (state: string) => loadStates.push(state),
+  })
+
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    (reason: string) => errors.push(reason),
+  )
+  await waitFor(() => historyCalls.length === 1, 'missing baseline did not enter waiting state')
+
+  assert.deepEqual(historyCalls, [{ bars: [], meta: { noData: false } }])
+  assert.deepEqual(errors, [])
+  assert.equal(loadStates.at(-1), 'loading')
+
+  datafeed.subscribeBars(
+    symbolInfo(),
+    '1',
+    (bar: Record<string, unknown>) => emittedBars.push(bar),
+    'missing-baseline-test',
+  )
+  assert.ok(klineSubscriber, 'kline subscriber was not registered')
+  assert.deepEqual(emittedBars, [])
+
+  const openTime = 1_717_000_060_000
+  klineSubscriber?.({
+    type: 'spot_kline_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    provider_generation: 4,
+    received_at_ms: 1_000,
+    kline: {
+      open_time: openTime,
+      open: '100',
+      high: '105',
+      low: '99',
+      close: '103',
+      volume: '10',
+      provider: 'OKX_SPOT',
+      source: 'LIVE_WS',
+      revision_epoch: 2,
+      revision_seq: 1,
+      is_closed: false,
+      close_state_source: 'PROVIDER_CONFIRMED',
+    },
+  })
+  await waitForRealtimeFrame(() => emittedBars.length === 1, 'valid realtime baseline did not flush')
+
+  assert.deepEqual(emittedBars, [{
+    time: openTime,
+    open: 100,
+    high: 105,
+    low: 99,
+    close: 103,
+    volume: 10,
+  }])
+  assert.deepEqual(errors, [])
   datafeed.destroy()
 })
 
@@ -1283,6 +1383,7 @@ test('realtime kline metadata is exposed without rewriting provider OHLCV', asyn
     freshness: 'LIVE',
     kline: providerKline,
   })
+  await waitForRealtimeFrame(() => emittedBars.length === 1, 'native realtime frame did not flush')
 
   assert.deepEqual(providerKline, originalKline)
   assert.deepEqual(emittedBars.at(-1), {
@@ -1568,15 +1669,165 @@ test('realtime revision guard accepts upgrades and suppresses stale duplicate do
   })
 
   emit({})
+  await waitForRealtimeFrame(() => emittedBars.length === 1, 'first native frame did not flush')
   emit({ revision_seq: 4, close: '99' })
   emit({})
   emit({ revision_seq: 6, close: '102' })
+  await waitForRealtimeFrame(() => emittedBars.length === 2, 'native upgrade frame did not flush')
   emit({ revision_seq: 6, close: '102', is_closed: true })
   emit({ revision_seq: 7, close: '102', is_closed: false })
   emit({ open_time: 1_716_999_940_000, revision_seq: 99, close: '88' })
 
   assert.deepEqual(emittedBars.map((bar) => bar.close), [101, 102, 102])
   datafeed.destroy()
+})
+
+test('preview stability guard defers stale Native OPEN but accepts catch-up and Native close', async () => {
+  requestKlines = async () => metadata([row()])
+  const emittedBars: Array<Record<string, unknown>> = []
+  const candleAuthorityEvents: Array<Record<string, unknown>> = []
+  const historyCalls: HistoryCall[] = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({
+    symbol: 'BTCUSDT',
+    onCandleAuthority: (event: Record<string, unknown>) => candleAuthorityEvents.push(event),
+  })
+
+  datafeed.getBars(
+    symbolInfo(),
+    '1',
+    currentPeriod,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  )
+  await waitFor(() => historyCalls.length === 1, 'history setup did not settle')
+  datafeed.subscribeBars(
+    symbolInfo(),
+    '1',
+    (bar: Record<string, unknown>) => emittedBars.push(bar),
+    'preview-compositor-test',
+  )
+  assert.ok(klineSubscriber, 'kline subscriber was not registered')
+  assert.ok(previewSubscriber, 'preview subscriber was not registered')
+
+  const openTime = 1_717_000_060_000
+  const emitNative = (
+    revisionSeq: number,
+    close: string,
+    isClosed = false,
+    volume = '10',
+    receivedAtMs = 1_000 + revisionSeq,
+  ) => {
+    klineSubscriber?.({
+      type: 'spot_kline_update',
+      symbol: 'BTCUSDT',
+      interval: '1m',
+      provider_generation: 4,
+      received_at_ms: receivedAtMs,
+      kline: {
+        open_time: openTime,
+        open: '100',
+        high: '105',
+        low: '99',
+        close,
+        volume,
+        provider: 'OKX_SPOT',
+        source: 'LIVE_WS',
+        revision_epoch: 2,
+        revision_seq: revisionSeq,
+        is_closed: isClosed,
+        close_state_source: 'PROVIDER_CONFIRMED',
+      },
+    })
+  }
+  const emitPreview = (
+    previewSeq: number,
+    baseRevisionSeq: number,
+    close: string,
+    overrides: Record<string, unknown> = {},
+  ) => {
+    previewSubscriber?.({
+      type: 'spot_candle_preview_update',
+      symbol: 'BTCUSDT',
+      interval: '1m',
+      provider: 'OKX_SPOT',
+      provider_generation: 4,
+      source: 'CANDLE_PREVIEW',
+      received_at_ms: 2_000 + previewSeq,
+      preview_seq: previewSeq,
+      base_native_revision: { epoch: 2, sequence: baseRevisionSeq },
+      preview: {
+        symbol: 'BTCUSDT',
+        interval: '1m',
+        provider: 'OKX_SPOT',
+        open_time: openTime,
+        open: '100',
+        high: '106',
+        low: '98',
+        close,
+        volume: '12',
+        revision_epoch: 2,
+        revision_seq: baseRevisionSeq,
+        generation: 4,
+        preview_seq: previewSeq,
+        ...overrides,
+      },
+    })
+  }
+
+  emitPreview(1, 1, '104')
+  emitNative(1, '101')
+  emitPreview(1, 1, '104')
+  await waitForRealtimeFrame(
+    () => emittedBars.length === 1,
+    'same-frame Native to Preview did not coalesce',
+  )
+  emitPreview(2, 1, '105')
+  await waitForRealtimeFrame(() => emittedBars.length === 2, 'preview-only frame did not flush')
+  emitPreview(3, 1, '106')
+  emitNative(2, '103')
+  await waitForRealtimeFrame(
+    () => emittedBars.length === 3,
+    'same-frame Preview to Native rebase did not coalesce',
+  )
+  emitPreview(4, 1, '106')
+  emitPreview(1, 2, '104')
+  await waitForRealtimeFrame(() => emittedBars.length === 4, 'rebased preview frame did not flush')
+  emitNative(3, '104', false, '12', 3_000)
+  await waitForRealtimeFrame(() => emittedBars.length === 5, 'caught-up Native frame did not flush')
+  emitNative(4, '102', true, '10', 4_000)
+  emitPreview(1, 4, '107')
+  emitPreview(2, 4, '108', { open_time: openTime - 60_000 })
+
+  assert.deepEqual(
+    emittedBars.map((bar) => ({ time: bar.time, close: bar.close, volume: bar.volume })),
+    [
+      { time: openTime, close: 104, volume: 12 },
+      { time: openTime, close: 105, volume: 12 },
+      { time: openTime, close: 106, volume: 12 },
+      { time: openTime, close: 104, volume: 12 },
+      { time: openTime, close: 104, volume: 12 },
+      { time: openTime, close: 102, volume: 10 },
+    ],
+  )
+  assert.deepEqual(
+    candleAuthorityEvents.map((event) => ({
+      symbol: event.symbol,
+      interval: event.interval,
+      barTime: event.barTime,
+      close: event.close,
+      source: event.source,
+    })),
+    [
+      { symbol: 'BTCUSDT', interval: '1m', barTime: openTime, close: 104, source: 'preview' },
+      { symbol: 'BTCUSDT', interval: '1m', barTime: openTime, close: 105, source: 'preview' },
+      { symbol: 'BTCUSDT', interval: '1m', barTime: openTime, close: 106, source: 'preview' },
+      { symbol: 'BTCUSDT', interval: '1m', barTime: openTime, close: 104, source: 'preview' },
+      { symbol: 'BTCUSDT', interval: '1m', barTime: openTime, close: 104, source: 'native-open' },
+      { symbol: 'BTCUSDT', interval: '1m', barTime: openTime, close: 102, source: 'native-closed' },
+    ],
+  )
+  datafeed.destroy()
+  assert.equal(previewSubscriber, null)
 })
 
 test('late REST getBars cannot overwrite newer realtime same-bucket revision', async () => {
@@ -1749,6 +2000,7 @@ test('destroy clears instance-scoped realtime high-water before replacement data
       close_state_source: 'PROVIDER_CONFIRMED',
     },
   })
+  await waitForRealtimeFrame(() => emittedBars.length === 1, 'replacement native frame did not flush')
   assert.deepEqual(emittedBars.map((bar) => bar.close), [101])
   replacement.destroy()
 })
@@ -1794,6 +2046,7 @@ test('subscription generation rejects a retired same-uid callback after 1m to 5m
   retiredFirstOneMinuteHandler?.(message)
   assert.equal(emittedBars.length, 0)
   currentOneMinuteHandler?.(message)
+  await waitForRealtimeFrame(() => emittedBars.length === 1, 'current generation frame did not flush')
   assert.deepEqual(emittedBars.map((bar) => bar.close), [105])
   assert.deepEqual(readinessEvents.map((event) => event.subscriptionGeneration), [1, 2, 3])
   assert.equal(
@@ -1888,6 +2141,7 @@ test('symbol switch destroys old revision state and accepts the new symbol indep
       close_state_source: 'PROVIDER_CONFIRMED',
     },
   })
+  await waitForRealtimeFrame(() => ethBars.length === 1, 'ETH realtime frame did not flush')
 
   assert.deepEqual(ethBars.map((bar) => bar.close), [105])
   eth.destroy()
@@ -1973,6 +2227,7 @@ function resetSWRHarness() {
   cacheWriteCalls.length = 0
   requestKlines = async () => ({ items: [] })
   klineSubscriber = null
+  previewSubscriber = null
 }
 
 function versionedRow(openTime: number, close: string, overrides: Record<string, unknown> = {}) {
@@ -2136,6 +2391,7 @@ test('SWR history excludes forming candle and realtime subscription maintains it
       source: 'LIVE_WS',
     },
   })
+  await waitForRealtimeFrame(() => realtimeBars.length === 1, 'SWR realtime frame did not flush')
   assert.deepEqual(realtimeBars.map((bar) => bar.close), [103])
 
   datafeed.destroy()
