@@ -41,9 +41,29 @@ export type SpotMarketKlineMessage = {
   kline?: unknown;
   source?: string;
   updated_at?: string;
+  provider_generation?: number | string;
 };
 
-export type SpotMarketRealtimeEventType = 'snapshot' | 'trade' | 'depth' | 'ticker' | 'kline';
+export type SpotMarketCandlePreviewMessage = {
+  type: 'spot_candle_preview_update';
+  symbol?: string;
+  interval?: string;
+  preview?: unknown;
+  source?: string;
+  provider?: string;
+  provider_generation?: number | string;
+  base_native_revision?: unknown;
+  preview_seq?: number | string;
+  received_at_ms?: number | string;
+};
+
+export type SpotMarketRealtimeEventType =
+  | 'snapshot'
+  | 'trade'
+  | 'depth'
+  | 'ticker'
+  | 'kline'
+  | 'preview';
 export type SpotMarketRealtimeDomain = 'snapshot' | 'depth' | 'trades' | 'ticker' | 'kline';
 export type SpotMarketConnectionStatus = 'connecting' | 'open' | 'closed';
 export type SpotMarketRealtimeMessage =
@@ -51,7 +71,8 @@ export type SpotMarketRealtimeMessage =
   | SpotMarketTradeMessage
   | SpotMarketDepthMessage
   | SpotMarketTickerMessage
-  | SpotMarketKlineMessage;
+  | SpotMarketKlineMessage
+  | SpotMarketCandlePreviewMessage;
 export type SpotMarketRealtimeHandler = (message: SpotMarketRealtimeMessage) => void;
 export type SpotMarketRealtimeStatusHandler = (status: SpotMarketConnectionStatus) => void;
 export type SpotMarketRealtimeSubscriptionOptions = {
@@ -647,6 +668,13 @@ class SpotMarketRealtimeClient {
           note: 'no active subscriber for kline interval',
         });
       }
+      return;
+    }
+
+    if (message.type === 'spot_candle_preview_update') {
+      if (this.shouldDispatch(message, connection, 'kline')) {
+        this.emit('preview', message);
+      }
     }
   }
 
@@ -688,8 +716,15 @@ class SpotMarketRealtimeClient {
   }
 
   private getMessageInterval(message: SpotMarketRealtimeMessage) {
-    if (message.type !== 'spot_kline_update') return BASE_INTERVAL;
+    if (
+      message.type !== 'spot_kline_update'
+      && message.type !== 'spot_candle_preview_update'
+    ) return BASE_INTERVAL;
     if (message.interval) return message.interval;
+    if (message.type === 'spot_candle_preview_update') {
+      const preview = getMessageObject(message.preview);
+      return String(preview?.interval || BASE_INTERVAL);
+    }
     const kline = getMessageObject(message.kline);
     return String(kline?.interval || BASE_INTERVAL);
   }
