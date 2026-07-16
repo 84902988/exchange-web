@@ -7,6 +7,7 @@ import {
 } from '@/lib/api/modules/contract';
 import {
   contractMarketRealtime,
+  type ContractKlineResolutionIdentity,
   type ContractMarketRealtimeMessage,
 } from '@/lib/realtime/contractMarketRealtime';
 import {
@@ -142,6 +143,11 @@ export type ContractTradingViewDatafeed = {
     interval: string,
   ) => ContractRealtimeSubscriptionReadiness | null;
   getDatafeedInstanceId: () => number;
+  beginResolutionTransition: (
+    transition: ContractResolutionTransitionInput,
+  ) => ContractActiveResolutionIdentity | null;
+  commitResolutionTransition: (transitionGeneration: number) => boolean;
+  rollbackResolutionTransition: (transitionGeneration: number) => boolean;
   executeResetPermit: (
     requirement: ContractRealtimeResetRequirement,
     permit: KlineLifecycleRearmPermit,
@@ -156,8 +162,17 @@ export type ContractRealtimeSubscriptionReadiness = Readonly<{
   subscriberUid: string;
   ownerId: string;
   subscriptionGeneration: number;
+  transitionGeneration: number;
   generation: number;
 }>;
+
+export type ContractResolutionTransitionInput = Readonly<{
+  symbol: string;
+  interval: string;
+  transitionGeneration: number;
+}>;
+
+export type ContractActiveResolutionIdentity = ContractRealtimeSubscriptionReadiness;
 
 export type ContractRealtimeResetRequirement = ContractRealtimeSubscriptionReadiness & Readonly<{
   source: 'RESTORED_BASELINE';
@@ -197,6 +212,8 @@ type SubscriptionEntry = {
   interval: string;
   ownerId: string;
   generation: number;
+  leaseGeneration: number;
+  transitionGeneration: number;
   latestBarKey: string;
   lastEmittedBarTime: number;
   lastEmittedBarFingerprint: string;
@@ -216,8 +233,15 @@ type ResetUnsubscribeGuard = {
   interval: string;
   ownerId: string;
   generation: number;
+  transitionGeneration: number;
   latestBarKey: string;
 };
+
+type ResolutionTransitionRecord = Readonly<{
+  candidate: ContractActiveResolutionIdentity;
+  rollbackTarget: ContractActiveResolutionIdentity | null;
+  explicit: boolean;
+}>;
 
 const SUPPORTED_RESOLUTIONS: ContractTradingViewResolution[] = ['1', '5', '15', '30', '60', '240', '1D', '1W', '1M'];
 const RESOLUTION_TO_CONTRACT_INTERVAL: Record<ContractTradingViewResolution, string> = {
@@ -722,6 +746,18 @@ function getContractHistoryErrorReason(
   return providerErrorCode ? `Kline history unavailable: ${providerErrorCode}` : fallback;
 }
 
+function isContractProviderEmptyHistory(
+  result: ContractMarketKlineMetadataResponse | null,
+) {
+  const record = toRecord(result);
+  return Boolean(
+    record
+    && Array.isArray(record.items)
+    && record.items.length === 0
+    && String(record.provider_error_code || '').trim().toUpperCase() === 'EMPTY'
+  );
+}
+
 function shouldRetainContractHistoryCoverage(result: unknown) {
   const record = toRecord(result);
   return Boolean(
@@ -784,6 +820,15 @@ export type HistoryCoverageState = {
   terminalComplete: boolean;
   terminalBoundary: number | null;
   terminalReason: string | null;
+};
+
+type MonthlyHistoryTerminalCandidate = {
+  datafeedInstanceId: number;
+  symbol: string;
+  interval: '1M';
+  hasValidBars: true;
+  earliestBarTime: number;
+  terminalBoundary: number | null;
 };
 
 async function loadContractKlineBarsForCountBack({
@@ -1085,10 +1130,17 @@ export function createContractTradingViewDatafeed({
   const latestSubscriptionGenerationByKey = new Map<string, number>();
   const restoreResetCandidates = new Set<string>();
   const resetUnsubscribeGuards = new Map<string, ResetUnsubscribeGuard>();
+  const activeResolutionIdentityBySymbol = new Map<string, ContractActiveResolutionIdentity>();
+  const committedResolutionIdentityBySymbol = new Map<string, ContractActiveResolutionIdentity>();
+  const resolutionTransitions = new Map<number, ResolutionTransitionRecord>();
   const requestGuard = new ContractKlineRequestGuard();
   const datafeedInstanceId = ++contractKlineDatafeedInstanceSequence;
   const historyCoverageByScope = new Map<string, HistoryCoverageState>();
+  const monthlyHistoryTerminalCandidates = new Map<string, MonthlyHistoryTerminalCandidate>();
   let subscriptionGeneration = 0;
+  let subscriptionLeaseGeneration = 0;
+  let transitionGenerationSequence = 0;
+  let explicitResolutionAuthorityEnabled = false;
   let destroyed = false;
 
   const scheduleLifecycleCallback = (callback: () => void) => {
@@ -1097,6 +1149,121 @@ export function createContractTradingViewDatafeed({
       return;
     }
     void Promise.resolve().then(callback);
+  };
+
+  const toRealtimeResolutionIdentity = (
+    identity: ContractActiveResolutionIdentity,
+  ): ContractKlineResolutionIdentity => ({
+    symbol: identity.symbol,
+    interval: identity.interval,
+    ownerId: identity.ownerId,
+    transitionGeneration: identity.transitionGeneration,
+  });
+
+  const findLatestSubscription = (symbolValue: string, intervalValue: string) => {
+    let latest: SubscriptionEntry | null = null;
+    for (const entry of subscriptions.values()) {
+      if (
+        entry.symbol !== symbolValue
+        || entry.interval !== intervalValue
+        || (latest && entry.leaseGeneration <= latest.leaseGeneration)
+      ) continue;
+      latest = entry;
+    }
+    return latest;
+  };
+
+  const bindSubscriptionToIdentity = (
+    entry: SubscriptionEntry,
+    identity: ContractActiveResolutionIdentity,
+  ): ContractActiveResolutionIdentity => {
+    entry.ownerId = identity.ownerId;
+    entry.generation = identity.subscriptionGeneration;
+    entry.transitionGeneration = identity.transitionGeneration;
+    entry.readinessBlocked = false;
+    return {
+      ...identity,
+      subscriberUid: entry.subscriberUid,
+    };
+  };
+
+  const activateResolutionIdentity = (identity: ContractActiveResolutionIdentity) => {
+    const key = buildLatestBarKey(identity.symbol, identity.interval);
+    activeResolutionIdentityBySymbol.set(identity.symbol, identity);
+    lastSubscriptionKeyBySymbol.set(identity.symbol, key);
+    latestSubscriptionGenerationByKey.set(key, identity.subscriptionGeneration);
+  };
+
+  const beginResolutionTransitionInternal = (
+    input: ContractResolutionTransitionInput,
+    explicit: boolean,
+  ): ContractActiveResolutionIdentity | null => {
+    if (destroyed) return null;
+    const transitionGeneration = Math.floor(Number(input.transitionGeneration));
+    const symbolValue = normalizeContractSymbol(input.symbol);
+    const intervalValue = normalizeContractInterval(input.interval);
+    if (!symbolValue || !intervalValue || !Number.isInteger(transitionGeneration) || transitionGeneration <= 0) {
+      return null;
+    }
+    if (explicit) explicitResolutionAuthorityEnabled = true;
+    const current = activeResolutionIdentityBySymbol.get(symbolValue) ?? null;
+    if (
+      current
+      && current.transitionGeneration === transitionGeneration
+      && current.interval === intervalValue
+    ) {
+      const record = resolutionTransitions.get(transitionGeneration);
+      if (record && explicit && !record.explicit) {
+        resolutionTransitions.set(transitionGeneration, { ...record, explicit: true });
+      }
+      return current;
+    }
+    if (current && transitionGeneration <= current.transitionGeneration) return null;
+
+    transitionGenerationSequence = Math.max(transitionGenerationSequence, transitionGeneration);
+    const generation = ++subscriptionGeneration;
+    const ownerId = [
+      datafeedInstanceId,
+      symbolValue,
+      intervalValue,
+      'resolution',
+      transitionGeneration,
+      generation,
+    ].join(':');
+    let candidate: ContractActiveResolutionIdentity = {
+      datafeedInstanceId,
+      symbol: symbolValue,
+      interval: intervalValue,
+      subscriberUid: `${ownerId}:pending`,
+      ownerId,
+      subscriptionGeneration: generation,
+      transitionGeneration,
+      generation,
+    };
+    const cachedSubscription = findLatestSubscription(symbolValue, intervalValue);
+    if (cachedSubscription) {
+      candidate = bindSubscriptionToIdentity(cachedSubscription, candidate);
+    }
+    const rollbackTarget = committedResolutionIdentityBySymbol.get(symbolValue) ?? null;
+    resolutionTransitions.set(transitionGeneration, { candidate, rollbackTarget, explicit });
+    activateResolutionIdentity(candidate);
+    contractMarketRealtime.beginKlineResolutionTransition(
+      toRealtimeResolutionIdentity(candidate),
+    );
+    scheduleLifecycleCallback(() => {
+      const active = activeResolutionIdentityBySymbol.get(symbolValue);
+      if (
+        !active
+        || active.transitionGeneration !== transitionGeneration
+        || active.subscriberUid !== candidate.subscriberUid
+      ) return;
+      try {
+        onRealtimeSubscriptionReady?.(active);
+      } catch {
+        // Resolution-owner readiness is observational and must not change lifecycle state.
+      }
+    });
+    return candidate;
   };
 
   const getRealtimeSubscriptionReadiness = (
@@ -1108,34 +1275,108 @@ export function createContractTradingViewDatafeed({
     const normalizedInterval = normalizeContractInterval(requestedInterval);
     const latestBarKey = buildLatestBarKey(normalizedSymbol, normalizedInterval);
     if (lastSubscriptionKeyBySymbol.get(normalizedSymbol) !== latestBarKey) return null;
-    const expectedGeneration = latestSubscriptionGenerationByKey.get(latestBarKey);
-    if (!expectedGeneration) return null;
+    const activeIdentity = activeResolutionIdentityBySymbol.get(normalizedSymbol) ?? null;
+    if (!activeIdentity || activeIdentity.interval !== normalizedInterval) return null;
+    const activeSubscription = subscriptions.get(activeIdentity.subscriberUid);
+    if (
+      !activeSubscription
+      && activeIdentity.subscriberUid !== `${activeIdentity.ownerId}:pending`
+    ) return null;
+    if (
+      activeSubscription
+      && (
+        activeSubscription.readinessBlocked
+        || activeSubscription.ownerId !== activeIdentity.ownerId
+        || activeSubscription.generation !== activeIdentity.subscriptionGeneration
+        || activeSubscription.transitionGeneration !== activeIdentity.transitionGeneration
+      )
+    ) return null;
+    return activeIdentity;
+  };
 
-    let latestSubscription: SubscriptionEntry | null = null;
-    for (const subscription of subscriptions.values()) {
+  const commitResolutionTransition = (transitionGenerationValue: number) => {
+    if (destroyed) return false;
+    const transitionGeneration = Math.floor(Number(transitionGenerationValue));
+    const transition = resolutionTransitions.get(transitionGeneration);
+    if (!transition) return false;
+    const activeIdentity = activeResolutionIdentityBySymbol.get(transition.candidate.symbol) ?? null;
+    if (
+      !activeIdentity
+      || activeIdentity.transitionGeneration !== transitionGeneration
+      || activeIdentity.interval !== transition.candidate.interval
+    ) return false;
+
+    if (!contractMarketRealtime.commitKlineResolutionTransition(
+      toRealtimeResolutionIdentity(activeIdentity),
+    )) return false;
+    committedResolutionIdentityBySymbol.set(activeIdentity.symbol, activeIdentity);
+
+    for (const entry of Array.from(subscriptions.values())) {
       if (
-        subscription.symbol !== normalizedSymbol
-        || subscription.interval !== normalizedInterval
-        || subscription.latestBarKey !== latestBarKey
-        || subscription.generation !== expectedGeneration
-        || subscription.readinessBlocked
+        entry.symbol !== activeIdentity.symbol
         || (
-          latestSubscription
-          && subscription.generation <= latestSubscription.generation
+          entry.interval === activeIdentity.interval
+          && entry.transitionGeneration === transitionGeneration
         )
       ) continue;
-      latestSubscription = subscription;
+      subscriptions.delete(entry.subscriberUid);
+      resetUnsubscribeGuards.delete(entry.subscriberUid);
+      entry.releaseKlineSubscription();
     }
-    if (!latestSubscription) return null;
-    return {
-      datafeedInstanceId,
-      symbol: latestSubscription.symbol,
-      interval: latestSubscription.interval,
-      subscriberUid: latestSubscription.subscriberUid,
-      ownerId: latestSubscription.ownerId,
-      subscriptionGeneration: latestSubscription.generation,
-      generation: latestSubscription.generation,
-    };
+    for (const [generation, record] of resolutionTransitions) {
+      if (
+        record.candidate.symbol === activeIdentity.symbol
+        && generation <= transitionGeneration
+      ) resolutionTransitions.delete(generation);
+    }
+    return true;
+  };
+
+  const rollbackResolutionTransition = (transitionGenerationValue: number) => {
+    if (destroyed) return false;
+    const transitionGeneration = Math.floor(Number(transitionGenerationValue));
+    const transition = resolutionTransitions.get(transitionGeneration);
+    if (!transition) return false;
+    const activeIdentity = activeResolutionIdentityBySymbol.get(transition.candidate.symbol) ?? null;
+    if (
+      !activeIdentity
+      || activeIdentity.transitionGeneration !== transitionGeneration
+      || activeIdentity.interval !== transition.candidate.interval
+    ) return false;
+
+    if (!contractMarketRealtime.rollbackKlineResolutionTransition(
+      toRealtimeResolutionIdentity(activeIdentity),
+    )) return false;
+    for (const entry of Array.from(subscriptions.values())) {
+      if (
+        entry.symbol !== activeIdentity.symbol
+        || entry.transitionGeneration !== transitionGeneration
+      ) continue;
+      subscriptions.delete(entry.subscriberUid);
+      resetUnsubscribeGuards.delete(entry.subscriberUid);
+      entry.releaseKlineSubscription();
+    }
+    resolutionTransitions.delete(transitionGeneration);
+    const rollbackTarget = transition.rollbackTarget;
+    if (rollbackTarget) {
+      activateResolutionIdentity(rollbackTarget);
+      committedResolutionIdentityBySymbol.set(rollbackTarget.symbol, rollbackTarget);
+      scheduleLifecycleCallback(() => {
+        if (destroyed) return;
+        const active = activeResolutionIdentityBySymbol.get(rollbackTarget.symbol);
+        if (active?.transitionGeneration !== rollbackTarget.transitionGeneration) return;
+        try {
+          onRealtimeSubscriptionReady?.(active);
+        } catch {
+          // Rollback readiness is observational and must not change lifecycle state.
+        }
+      });
+    } else {
+      activeResolutionIdentityBySymbol.delete(activeIdentity.symbol);
+      committedResolutionIdentityBySymbol.delete(activeIdentity.symbol);
+      lastSubscriptionKeyBySymbol.delete(activeIdentity.symbol);
+    }
+    return true;
   };
 
   const getContractKlineHighWaterMark = (key: string) => (
@@ -1176,6 +1417,12 @@ export function createContractTradingViewDatafeed({
   };
 
   return {
+    beginResolutionTransition: (transition) => (
+      beginResolutionTransitionInternal(transition, true)
+    ),
+    commitResolutionTransition,
+    rollbackResolutionTransition,
+
     onReady(callback) {
       window.setTimeout(() => callback(DATAFEED_CONFIGURATION), 0);
     },
@@ -1328,6 +1575,25 @@ export function createContractTradingViewDatafeed({
         });
       });
 
+      const requestedRangeEndTimeMs = endTimeMs ?? (
+        toTimeMs === Number.MAX_SAFE_INTEGER ? null : toTimeMs
+      );
+      const monthlyTerminalCandidateKey = interval === '1M'
+        ? [datafeedInstanceId, requestSymbol, interval].join('|')
+        : null;
+      const monthlyTerminalCandidate = monthlyTerminalCandidateKey
+        ? monthlyHistoryTerminalCandidates.get(monthlyTerminalCandidateKey) ?? null
+        : null;
+      if (
+        monthlyTerminalCandidate
+        && monthlyTerminalCandidate.terminalBoundary !== null
+        && requestedRangeEndTimeMs !== null
+        && requestedRangeEndTimeMs <= monthlyTerminalCandidate.terminalBoundary
+      ) {
+        completeHistoryRequest([], true);
+        return;
+      }
+
       const requestBeyondTerminalBoundary = Boolean(
         existingCoverage?.terminalComplete
         && (
@@ -1360,9 +1626,6 @@ export function createContractTradingViewDatafeed({
       const existingNextEndTimeMs = existingCoverage
         ? existingCoverage.nextEndTimeMs ?? existingCoverage.returnedBars[0]?.time ?? null
         : null;
-      const requestedRangeEndTimeMs = endTimeMs ?? (
-        toTimeMs === Number.MAX_SAFE_INTEGER ? null : toTimeMs
-      );
       const continuationEndTimeMs = existingCoverage
         ? [existingNextEndTimeMs, requestedRangeEndTimeMs]
           .filter((value): value is number => value !== null && value > 0)
@@ -1397,6 +1660,27 @@ export function createContractTradingViewDatafeed({
         const bars = result.bars
           .filter((bar) => bar.time < toTimeMs)
           .slice(-requiredBars);
+        if (monthlyTerminalCandidateKey && bars.length > 0) {
+          const earliestReturnedBarTime = bars[0].time;
+          const previousCandidate = monthlyHistoryTerminalCandidates.get(
+            monthlyTerminalCandidateKey,
+          ) ?? null;
+          const earliestBarTime = Math.min(
+            previousCandidate?.earliestBarTime ?? earliestReturnedBarTime,
+            earliestReturnedBarTime,
+          );
+          monthlyHistoryTerminalCandidates.set(monthlyTerminalCandidateKey, {
+            datafeedInstanceId,
+            symbol: requestSymbol,
+            interval: '1M',
+            hasValidBars: true,
+            earliestBarTime,
+            terminalBoundary: previousCandidate
+              && earliestBarTime === previousCandidate.earliestBarTime
+              ? previousCandidate.terminalBoundary
+              : null,
+          });
+        }
         const scopedCoverage = historyCoverageByScope.get(requestGeneration) ?? null;
         const previousCoverage = scopedCoverage?.generation === requestGeneration
           ? scopedCoverage
@@ -1449,6 +1733,30 @@ export function createContractTradingViewDatafeed({
           } satisfies HistoryCoverageState
           : null;
 
+        const terminalCandidateAfterLoad = monthlyTerminalCandidateKey
+          ? monthlyHistoryTerminalCandidates.get(monthlyTerminalCandidateKey) ?? null
+          : null;
+        const confirmsMonthlyHistoryTerminal = Boolean(
+          bars.length === 0
+          && terminalCandidateAfterLoad
+          && terminalCandidateAfterLoad.hasValidBars
+          && requestedRangeEndTimeMs !== null
+          && requestedRangeEndTimeMs <= terminalCandidateAfterLoad.earliestBarTime
+          && isContractProviderEmptyHistory(result.lastMetadata)
+        );
+        if (
+          confirmsMonthlyHistoryTerminal
+          && monthlyTerminalCandidateKey
+          && terminalCandidateAfterLoad
+        ) {
+          monthlyHistoryTerminalCandidates.set(monthlyTerminalCandidateKey, {
+            ...terminalCandidateAfterLoad,
+            terminalBoundary: terminalCandidateAfterLoad.earliestBarTime,
+          });
+          completeHistoryRequest([], true);
+          return;
+        }
+
         if (bars.length === 0 && !terminalComplete) {
           completeHistoryError(getContractHistoryErrorReason(result.lastMetadata));
           return;
@@ -1479,16 +1787,83 @@ export function createContractTradingViewDatafeed({
       const subscriptionSymbol = normalizeContractSymbol(symbolInfo.ticker || apiSymbol) || apiSymbol;
       const interval = tradingViewResolutionToContractInterval(resolution);
       const latestBarKey = buildLatestBarKey(subscriptionSymbol, interval);
-      const generation = ++subscriptionGeneration;
-      const ownerId = [datafeedInstanceId, normalizedSubscriberUid, generation].join(':');
       const previousKeyForSymbol = lastSubscriptionKeyBySymbol.get(subscriptionSymbol) || '';
-      if (previousKeyForSymbol && previousKeyForSymbol !== latestBarKey) {
+      let resolutionIdentity = activeResolutionIdentityBySymbol.get(subscriptionSymbol) ?? null;
+      const activeTransition = resolutionIdentity
+        ? resolutionTransitions.get(resolutionIdentity.transitionGeneration) ?? null
+        : null;
+      if (
+        !resolutionIdentity
+        || (
+          resolutionIdentity.interval !== interval
+          && !explicitResolutionAuthorityEnabled
+          && !activeTransition?.explicit
+        )
+      ) {
+        resolutionIdentity = beginResolutionTransitionInternal({
+          symbol: subscriptionSymbol,
+          interval,
+          transitionGeneration: ++transitionGenerationSequence,
+        }, false);
+      }
+      const belongsToActiveResolution = Boolean(
+        resolutionIdentity
+        && resolutionIdentity.interval === interval
+      );
+      const pendingResolutionIdentity = Boolean(
+        belongsToActiveResolution
+        && resolutionIdentity
+        && resolutionIdentity.subscriberUid === `${resolutionIdentity.ownerId}:pending`
+      );
+      const generation = pendingResolutionIdentity && resolutionIdentity
+        ? resolutionIdentity.subscriptionGeneration
+        : ++subscriptionGeneration;
+      const ownerId = belongsToActiveResolution && resolutionIdentity
+        ? pendingResolutionIdentity
+          ? resolutionIdentity.ownerId
+          : [
+            datafeedInstanceId,
+            normalizedSubscriberUid,
+            resolutionIdentity.transitionGeneration,
+            generation,
+          ].join(':')
+        : [datafeedInstanceId, normalizedSubscriberUid, 'stale', generation].join(':');
+      const transitionGeneration = belongsToActiveResolution && resolutionIdentity
+        ? resolutionIdentity.transitionGeneration
+        : 0;
+      if (belongsToActiveResolution && resolutionIdentity) {
+        resolutionIdentity = {
+          ...resolutionIdentity,
+          subscriberUid: normalizedSubscriberUid,
+          ownerId,
+          subscriptionGeneration: generation,
+          generation,
+        };
+        activateResolutionIdentity(resolutionIdentity);
+        const transition = resolutionTransitions.get(transitionGeneration);
+        if (transition) {
+          resolutionTransitions.set(transitionGeneration, {
+            ...transition,
+            candidate: resolutionIdentity,
+          });
+        }
+        if (
+          committedResolutionIdentityBySymbol.get(subscriptionSymbol)?.transitionGeneration
+            === transitionGeneration
+        ) {
+          committedResolutionIdentityBySymbol.set(subscriptionSymbol, resolutionIdentity);
+        }
+        contractMarketRealtime.beginKlineResolutionTransition(
+          toRealtimeResolutionIdentity(resolutionIdentity),
+        );
+      }
+      if (belongsToActiveResolution && previousKeyForSymbol && previousKeyForSymbol !== latestBarKey) {
         restoreResetCandidates.add(previousKeyForSymbol);
       }
-      lastSubscriptionKeyBySymbol.set(subscriptionSymbol, latestBarKey);
-      latestSubscriptionGenerationByKey.set(latestBarKey, generation);
       const shouldResetRestoredBaseline = (
-        typeof onResetCacheNeededCallback === 'function'
+        belongsToActiveResolution
+        && !activeTransition?.explicit
+        && typeof onResetCacheNeededCallback === 'function'
         && restoreResetCandidates.delete(latestBarKey)
       );
       if (!historyReadyByLatestBarKey.has(latestBarKey) || shouldResetRestoredBaseline) {
@@ -1508,6 +1883,8 @@ export function createContractTradingViewDatafeed({
         interval,
         ownerId,
         generation,
+        leaseGeneration: ++subscriptionLeaseGeneration,
+        transitionGeneration,
         latestBarKey,
         lastEmittedBarTime: 0,
         lastEmittedBarFingerprint: '',
@@ -1532,8 +1909,21 @@ export function createContractTradingViewDatafeed({
           || activeSubscription.subscriberUid !== normalizedSubscriberUid
           || activeSubscription.ownerId !== ownerId
           || activeSubscription.generation !== generation
+          || activeSubscription.leaseGeneration !== subscription.leaseGeneration
+          || activeSubscription.transitionGeneration !== transitionGeneration
           || activeSubscription.symbol !== subscriptionSymbol
           || activeSubscription.interval !== interval
+        ) return null;
+        const activeIdentity = activeResolutionIdentityBySymbol.get(subscriptionSymbol);
+        if (
+          !activeIdentity
+          || activeIdentity.interval !== interval
+          || activeIdentity.subscriberUid !== normalizedSubscriberUid
+          || activeIdentity.ownerId !== ownerId
+          || activeIdentity.subscriptionGeneration !== generation
+          || activeIdentity.transitionGeneration !== transitionGeneration
+          || lastSubscriptionKeyBySymbol.get(subscriptionSymbol) !== latestBarKey
+          || latestSubscriptionGenerationByKey.get(latestBarKey) !== generation
         ) return null;
         return activeSubscription;
       };
@@ -1590,6 +1980,7 @@ export function createContractTradingViewDatafeed({
       const releaseLegacyKlineSubscription = contractMarketRealtime.subscribeKline({
         symbol: subscriptionSymbol,
         interval,
+        transitionGeneration,
       }, (message) => {
         if (!getActiveSubscription()) return;
         const activeStoreSymbol = normalizeContractSymbol(
@@ -1665,6 +2056,7 @@ export function createContractTradingViewDatafeed({
               subscriberUid: activeSubscription.subscriberUid,
               ownerId: activeSubscription.ownerId,
               subscriptionGeneration: activeSubscription.generation,
+              transitionGeneration: activeSubscription.transitionGeneration,
               generation: activeSubscription.generation,
               source: 'RESTORED_BASELINE',
             });
@@ -1687,6 +2079,7 @@ export function createContractTradingViewDatafeed({
         && resetGuard.interval === entry.interval
         && resetGuard.ownerId === entry.ownerId
         && resetGuard.generation === entry.generation
+        && resetGuard.transitionGeneration === entry.transitionGeneration
         && resetGuard.latestBarKey === entry.latestBarKey
         && lastSubscriptionKeyBySymbol.get(entry.symbol) === entry.latestBarKey
       );
@@ -1713,10 +2106,12 @@ export function createContractTradingViewDatafeed({
         || entry.interval !== normalizeContractInterval(requirement.interval)
         || entry.ownerId !== requirement.ownerId
         || entry.generation !== requirement.subscriptionGeneration
+        || entry.transitionGeneration !== requirement.transitionGeneration
         || permit.identity.terminalType !== 'CONTRACT'
         || permit.identity.datafeedInstanceId !== datafeedInstanceId
         || permit.identity.symbol !== entry.symbol
         || permit.identity.backendInterval !== entry.interval
+        || permit.identity.intentId !== entry.transitionGeneration
       ) return false;
 
       entry.executedResetPermitId = permit.permitId;
@@ -1726,6 +2121,7 @@ export function createContractTradingViewDatafeed({
         interval: entry.interval,
         ownerId: entry.ownerId,
         generation: entry.generation,
+        transitionGeneration: entry.transitionGeneration,
         latestBarKey: entry.latestBarKey,
       };
       resetUnsubscribeGuards.set(normalizedSubscriberUid, resetGuard);
@@ -1744,19 +2140,29 @@ export function createContractTradingViewDatafeed({
     },
 
     destroy() {
+      const activeResolutionIdentities = Array.from(activeResolutionIdentityBySymbol.values());
       destroyed = true;
       requestGuard.destroy();
       historyCoverageByScope.clear();
+      monthlyHistoryTerminalCandidates.clear();
       historyReadyByLatestBarKey.clear();
       const activeSubscriptions = Array.from(subscriptions.values());
       subscriptions.clear();
       activeSubscriptions.forEach((entry) => entry.releaseKlineSubscription());
+      activeResolutionIdentities.forEach((identity) => {
+        contractMarketRealtime.releaseKlineResolutionOwner(
+          toRealtimeResolutionIdentity(identity),
+        );
+      });
       latestBars.clear();
       klineHighWaterMarks.clear();
       lastSubscriptionKeyBySymbol.clear();
       latestSubscriptionGenerationByKey.clear();
       restoreResetCandidates.clear();
       resetUnsubscribeGuards.clear();
+      activeResolutionIdentityBySymbol.clear();
+      committedResolutionIdentityBySymbol.clear();
+      resolutionTransitions.clear();
     },
   };
 }

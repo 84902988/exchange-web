@@ -1175,6 +1175,7 @@ export default function ContractTradingViewChart({
     const committed = decision.state.committed;
     if (!decision.accepted || !committed) return false;
     if (activeWidgetGenerationRef.current !== committed.widgetGeneration) return false;
+    if (!datafeedRef.current?.commitResolutionTransition(committed.intentId)) return false;
 
     const committedInterval = resolveContractCommittedToolbarInterval(
       committed.tradingViewResolution,
@@ -1228,10 +1229,12 @@ export default function ContractTradingViewChart({
       || activeReadiness.subscriberUid !== readiness.subscriberUid
       || activeReadiness.ownerId !== readiness.ownerId
       || activeReadiness.subscriptionGeneration !== readiness.subscriptionGeneration
+      || activeReadiness.transitionGeneration !== readiness.transitionGeneration
       || candidate.widgetGeneration !== widgetGeneration
       || candidate.datafeedInstanceId !== readiness.datafeedInstanceId
       || candidate.symbol !== normalizeTradingViewSymbol(readiness.symbol)
       || candidate.backendInterval !== readiness.interval
+      || candidate.intentId !== readiness.transitionGeneration
     ) return false;
 
     const evidence: KlineLifecycleSubscriberEvidence = {
@@ -1301,6 +1304,7 @@ export default function ContractTradingViewChart({
       || requirement.datafeedInstanceId !== identity.datafeedInstanceId
       || normalizeTradingViewSymbol(requirement.symbol) !== identity.symbol
       || requirement.interval !== identity.backendInterval
+      || requirement.transitionGeneration !== identity.intentId
     ) return false;
     return requestLifecycleRearm(identity, requirement.source, requirement);
   }, [requestLifecycleRearm]);
@@ -1411,6 +1415,7 @@ export default function ContractTradingViewChart({
         const candidate = runtimeCoordinator?.snapshot().candidate;
         if (candidate?.sessionId !== identity.sessionId) return;
         runtimeCoordinator?.retireSession(identity, 'SUBSCRIBER_TIMEOUT');
+        datafeedRef.current?.rollbackResolutionTransition(identity.intentId);
         restoreCommittedLifecycleView(widgetGeneration);
       },
     });
@@ -1496,7 +1501,15 @@ export default function ContractTradingViewChart({
       && snapshot.candidate.symbol === normalizedSymbolRef.current
       && snapshot.candidate.tradingViewResolution === nextResolution
       && snapshot.candidate.backendInterval === backendInterval
-    ) return getKlineLifecycleSessionIdentity(snapshot.candidate);
+    ) {
+      const identity = getKlineLifecycleSessionIdentity(snapshot.candidate);
+      datafeed.beginResolutionTransition({
+        symbol: identity.symbol,
+        interval: identity.backendInterval,
+        transitionGeneration: identity.intentId,
+      });
+      return identity;
+    }
     if (
       !snapshot.candidate
       && snapshot.committed?.tradingViewResolution === nextResolution
@@ -1506,7 +1519,15 @@ export default function ContractTradingViewChart({
       tradingViewResolution: nextResolution,
       backendInterval,
     });
-    return result.decision.accepted ? result.identity : null;
+    if (!result.decision.accepted) return null;
+    const resolutionIdentity = datafeed.beginResolutionTransition({
+      symbol: result.identity.symbol,
+      interval: result.identity.backendInterval,
+      transitionGeneration: result.identity.intentId,
+    });
+    if (resolutionIdentity) return result.identity;
+    runtimeCoordinator.retireSession(result.identity, 'RESOLUTION_FAILED');
+    return null;
   }, []);
 
   const applyWidgetResolution = useCallback((
@@ -1615,6 +1636,7 @@ export default function ContractTradingViewChart({
           scheduleLatestCandidate();
           return;
         }
+        datafeedRef.current?.rollbackResolutionTransition(identity.intentId);
         restoreCommittedLifecycleView(widgetGeneration);
       },
     });
@@ -1884,10 +1906,17 @@ export default function ContractTradingViewChart({
       symbol: normalizedSymbol,
     });
     lifecycleRuntimeCoordinatorRef.current = widgetRuntimeCoordinator;
-    widgetRuntimeCoordinator.beginIntent({
+    const initialIntent = widgetRuntimeCoordinator.beginIntent({
       tradingViewResolution: initialResolution,
       backendInterval: effectiveIntervalRef.current,
     });
+    if (initialIntent.decision.accepted) {
+      datafeed.beginResolutionTransition({
+        symbol: initialIntent.identity.symbol,
+        interval: initialIntent.identity.backendInterval,
+        transitionGeneration: initialIntent.identity.intentId,
+      });
+    }
 
     const widget = new tradingView.widget({
       autosize: true,

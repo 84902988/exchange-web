@@ -20,6 +20,11 @@ function resolveContractTestFile(relativePath: string) {
   return resolveWebTestFile('components', 'contract', relativePath);
 }
 
+const contractChartSource = readFileSync(
+  resolveContractTestFile('ContractTradingViewChart.tsx'),
+  'utf8',
+);
+
 function loadTypeScriptModule(
   filePath: string,
   mocks: Record<string, unknown>,
@@ -181,6 +186,21 @@ class FakeClock {
     this.nowValue = target;
   }
 }
+
+
+test('Chart wires resolution intent commit and failed-candidate rollback to the datafeed authority', () => {
+  assert.match(contractChartSource, /datafeed\.beginResolutionTransition\(\{/);
+  assert.match(contractChartSource, /transitionGeneration:\s*result\.identity\.intentId/);
+  assert.match(
+    contractChartSource,
+    /datafeedRef\.current\?\.commitResolutionTransition\(committed\.intentId\)/,
+  );
+  assert.match(
+    contractChartSource,
+    /datafeedRef\.current\?\.rollbackResolutionTransition\(identity\.intentId\)/,
+  );
+  assert.match(contractChartSource, /transitionGeneration:\s*initialIntent\.identity\.intentId/);
+});
 
 
 test('TIME keeps the candle interval while using real 1m line mode', () => {
