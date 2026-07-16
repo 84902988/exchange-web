@@ -34,6 +34,16 @@ class _ClosedMetricsLoop:
         return True
 
 
+class _OpenMetricsLoop:
+    def is_closed(self) -> bool:
+        return False
+
+
+class _MetricsWebSocket:
+    def close(self) -> object:
+        return object()
+
+
 def _activate_provider_trades(
     service: provider_ws.SpotMarketProviderWsService,
     symbol: str = "BTCUSDT",
@@ -1234,6 +1244,113 @@ def test_bitget_utc_kline_ensure_is_idempotent_and_release_does_not_leak() -> No
         }
     finally:
         provider_ws.threading.Thread = original_thread
+
+
+def test_kline_worker_alive_with_recent_message_but_no_revision_is_recovered() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    provider = provider_ws.PROVIDER_OKX_SPOT
+    key = (provider, "BTCUSDT", "1m")
+    first_thread = _MetricsThread()
+    replacement_thread = _MetricsThread()
+    now_ms = [1_000_000]
+
+    with (
+        patch.object(provider_ws, "_now_ms", side_effect=lambda: now_ms[0]),
+        patch.object(
+            provider_ws.threading,
+            "Thread",
+            side_effect=[first_thread, replacement_thread],
+        ),
+        patch.object(provider_ws.asyncio, "run_coroutine_threadsafe", return_value=None),
+    ):
+        service.ensure_kline("BTCUSDT", "1m", provider=provider)
+        now_ms[0] += provider_ws._kline_worker_startup_grace_ms() + 1
+        with service._lock:
+            service._kline_connections[key] = (_OpenMetricsLoop(), _MetricsWebSocket())
+            service._kline_last_message_at_ms[key] = now_ms[0]
+
+        service.ensure_kline("BTCUSDT", "1m", provider=provider)
+
+    assert first_thread.is_alive() is False
+    assert replacement_thread.is_alive() is True
+    assert service._kline_tasks[key] is replacement_thread
+    assert service._kline_generations[key] == 3
+    assert service._kline_health_recovery_counts[key] == 1
+
+
+def test_healthy_kline_worker_is_unchanged_and_metrics_expose_revision_health() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    provider = provider_ws.PROVIDER_OKX_SPOT
+    key = (provider, "BTCUSDT", "1m")
+    thread = _MetricsThread()
+    now_ms = 2_000_000
+
+    with (
+        patch.object(provider_ws, "_now_ms", return_value=now_ms),
+        patch.object(provider_ws.threading, "Thread", return_value=thread),
+    ):
+        service.ensure_kline("BTCUSDT", "1m", provider=provider)
+        with service._lock:
+            service._kline_connections[key] = (_OpenMetricsLoop(), _MetricsWebSocket())
+            service._kline_last_message_at_ms[key] = now_ms
+            service._kline_last_revision_at_ms[key] = now_ms
+            service._kline_last_revision_epoch[key] = 4
+            service._kline_last_revision_seq[key] = 27
+
+        service.ensure_kline("BTCUSDT", "1m", provider=provider)
+        snapshot = service.get_metrics_snapshot()
+
+    worker = snapshot["kline_workers"]["items"][0]
+    assert service._kline_tasks[key] is thread
+    assert service._kline_generations[key] == 1
+    assert snapshot["kline_workers"]["healthy_count"] == 1
+    assert snapshot["kline_workers"]["unhealthy_count"] == 0
+    assert worker["status"] == "healthy"
+    assert worker["connected"] is True
+    assert worker["recent_kline_message"] is True
+    assert worker["revision_progressing"] is True
+    assert worker["last_message_time_ms"] == now_ms
+    assert worker["last_kline_revision_time_ms"] == now_ms
+    assert worker["last_revision_epoch"] == 4
+    assert worker["last_revision_seq"] == 27
+    assert worker["generation"] == 1
+
+
+def test_disconnected_kline_worker_recovers_and_rejects_stale_generation() -> None:
+    service = provider_ws.SpotMarketProviderWsService()
+    provider = provider_ws.PROVIDER_OKX_SPOT
+    key = (provider, "BTCUSDT", "1m")
+    metric_key = ("kline", provider, "BTCUSDT", "1m")
+    first_thread = _MetricsThread()
+    replacement_thread = _MetricsThread()
+    now_ms = [3_000_000]
+    open_time = 1_695_709_800_000
+    row = [str(open_time), "100", "110", "95", "101", "10", "1010", "1010", "0"]
+
+    with (
+        patch.object(provider_ws, "_now_ms", side_effect=lambda: now_ms[0]),
+        patch.object(
+            provider_ws.threading,
+            "Thread",
+            side_effect=[first_thread, replacement_thread],
+        ),
+    ):
+        service.ensure_kline("BTCUSDT", "1m", provider=provider)
+        now_ms[0] += provider_ws._kline_worker_startup_grace_ms() + 1
+        with service._lock:
+            service._task_last_reconnect_at_ms[metric_key] = 3_000_000
+
+        service.ensure_kline("BTCUSDT", "1m", provider=provider)
+        _handle_okx_klines(service, [row], generation=1)
+        assert key not in service._kline_cache
+
+        _handle_okx_klines(service, [row], generation=3)
+
+    assert first_thread.is_alive() is False
+    assert replacement_thread.is_alive() is True
+    assert service._kline_generations[key] == 3
+    assert service._kline_health_recovery_counts[key] == 1
+    assert _raw_kline_cache(service, provider=provider)["items"][0]["_provider_generation"] == 3
 
 
 def test_okx_kline_channel_mapping() -> None:

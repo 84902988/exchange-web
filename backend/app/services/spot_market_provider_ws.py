@@ -307,6 +307,24 @@ def _kline_max_age_ms(value: Optional[int] = None) -> int:
     return max(100, int(configured or 1500))
 
 
+def _kline_worker_health_timeout_ms(value: Optional[int] = None) -> int:
+    configured = (
+        value
+        if value is not None
+        else getattr(settings, "SPOT_PROVIDER_WS_KLINE_HEALTH_TIMEOUT_MS", 15_000)
+    )
+    return max(1_000, int(configured or 15_000))
+
+
+def _kline_worker_startup_grace_ms(value: Optional[int] = None) -> int:
+    configured = (
+        value
+        if value is not None
+        else getattr(settings, "SPOT_PROVIDER_WS_KLINE_HEALTH_STARTUP_GRACE_MS", 15_000)
+    )
+    return max(1_000, int(configured or 15_000))
+
+
 def _kline_limit(value: Optional[int] = None) -> int:
     configured = value if value is not None else getattr(settings, "SPOT_PROVIDER_WS_KLINE_LIMIT", 300)
     return max(1, min(int(configured or 300), 1000))
@@ -1488,6 +1506,13 @@ class SpotMarketProviderWsService:
         self._task_consecutive_failures: dict[tuple[str, str, str, str], int] = {}
         self._task_release_timeout_counts: dict[tuple[str, str, str, str], int] = {}
         self._stopping_threads: dict[tuple[str, str, str, str], threading.Thread] = {}
+        self._kline_last_message_at_ms: dict[tuple[str, str, str], int] = {}
+        self._kline_last_revision_at_ms: dict[tuple[str, str, str], int] = {}
+        self._kline_last_revision_epoch: dict[tuple[str, str, str], int] = {}
+        self._kline_last_revision_seq: dict[tuple[str, str, str], int] = {}
+        self._kline_health_recovery_counts: dict[tuple[str, str, str], int] = {}
+        self._kline_last_health_recovery_at_ms: dict[tuple[str, str, str], int] = {}
+        self._kline_recovering: set[tuple[str, str, str]] = set()
         self._kline_revision_listener: Optional[
             Callable[[ProviderKlineRevisionAccepted], None]
         ] = None
@@ -1777,6 +1802,13 @@ class SpotMarketProviderWsService:
             self._task_consecutive_failures.clear()
             self._task_release_timeout_counts.clear()
             self._stopping_threads.clear()
+            self._kline_last_message_at_ms.clear()
+            self._kline_last_revision_at_ms.clear()
+            self._kline_last_revision_epoch.clear()
+            self._kline_last_revision_seq.clear()
+            self._kline_health_recovery_counts.clear()
+            self._kline_last_health_recovery_at_ms.clear()
+            self._kline_recovering.clear()
 
     def get_metrics_snapshot(self) -> dict[str, Any]:
         now_ms = _now_ms()
@@ -1835,6 +1867,11 @@ class SpotMarketProviderWsService:
                     )
                 )
 
+            kline_workers = [
+                self._kline_worker_health_snapshot_locked(key, task, now_ms=now_ms)
+                for key, task in sorted(self._kline_tasks.items())
+            ]
+
             active_kline_intervals = [
                 {
                     "provider": provider,
@@ -1879,6 +1916,12 @@ class SpotMarketProviderWsService:
             "active_provider_task_count": len(active_provider_tasks),
             "active_provider_tasks": active_provider_tasks,
             "active_kline_intervals": active_kline_intervals,
+            "kline_workers": {
+                "count": len(kline_workers),
+                "healthy_count": sum(1 for item in kline_workers if item["healthy"]),
+                "unhealthy_count": sum(1 for item in kline_workers if not item["healthy"]),
+                "items": kline_workers,
+            },
             "cache_records": cache_records,
             "active_connections": {
                 "count": len(active_connections),
@@ -2133,6 +2176,113 @@ class SpotMarketProviderWsService:
             "release_timeout_count": int(self._task_release_timeout_counts.get(metric_key) or 0),
         }
 
+    def _kline_connection_open_locked(self, key: tuple[str, str, str]) -> bool:
+        connection = self._kline_connections.get(key)
+        if connection is None:
+            return False
+        loop, _websocket = connection
+        try:
+            return not loop.is_closed()
+        except Exception:
+            return False
+
+    def _kline_worker_health_snapshot_locked(
+        self,
+        key: tuple[str, str, str],
+        task: threading.Thread,
+        *,
+        now_ms: Optional[int] = None,
+    ) -> dict[str, Any]:
+        provider, symbol, interval = key
+        observed_at_ms = int(now_ms if now_ms is not None else _now_ms())
+        metric_key = self._provider_metric_key("kline", provider, symbol, interval)
+        started_at_ms = int(self._task_started_at_ms.get(metric_key) or 0)
+        last_reconnect_at_ms = int(self._task_last_reconnect_at_ms.get(metric_key) or 0)
+        grace_anchor_ms = max(started_at_ms, last_reconnect_at_ms)
+        startup_grace_ms = _kline_worker_startup_grace_ms()
+        startup_grace_remaining_ms = max(
+            0,
+            grace_anchor_ms + startup_grace_ms - observed_at_ms,
+        ) if grace_anchor_ms > 0 else 0
+        timeout_ms = _kline_worker_health_timeout_ms()
+        last_message_at_ms = self._kline_last_message_at_ms.get(key)
+        last_revision_at_ms = self._kline_last_revision_at_ms.get(key)
+        last_message_age_ms = (
+            max(0, observed_at_ms - int(last_message_at_ms))
+            if last_message_at_ms is not None
+            else None
+        )
+        last_revision_age_ms = (
+            max(0, observed_at_ms - int(last_revision_at_ms))
+            if last_revision_at_ms is not None
+            else None
+        )
+        thread_alive = task.is_alive()
+        connected = self._kline_connection_open_locked(key)
+        recent_message = last_message_age_ms is not None and last_message_age_ms <= timeout_ms
+        revision_progressing = last_revision_age_ms is not None and last_revision_age_ms <= timeout_ms
+        healthy = bool(thread_alive and connected and recent_message and revision_progressing)
+
+        if healthy:
+            reason = "HEALTHY"
+        elif not thread_alive:
+            reason = "THREAD_NOT_ALIVE"
+        elif startup_grace_remaining_ms > 0:
+            reason = "STARTING_GRACE"
+        elif not connected:
+            reason = "DISCONNECTED"
+        elif not recent_message:
+            reason = "MESSAGE_STALE" if last_message_at_ms is not None else "NO_MESSAGE"
+        else:
+            reason = "REVISION_STALE" if last_revision_at_ms is not None else "NO_REVISION"
+
+        return {
+            "provider": provider,
+            "symbol": symbol,
+            "interval": interval,
+            "status": "healthy" if healthy else "unhealthy",
+            "healthy": healthy,
+            "reason": reason,
+            "thread_alive": thread_alive,
+            "connected": connected,
+            "recent_kline_message": recent_message,
+            "revision_progressing": revision_progressing,
+            "last_message_time_ms": last_message_at_ms,
+            "last_message_age_ms": last_message_age_ms,
+            "last_kline_revision_time_ms": last_revision_at_ms,
+            "last_kline_revision_age_ms": last_revision_age_ms,
+            "last_revision_epoch": self._kline_last_revision_epoch.get(key),
+            "last_revision_seq": self._kline_last_revision_seq.get(key),
+            "generation": int(self._kline_generations.get(key) or 0),
+            "health_timeout_ms": timeout_ms,
+            "startup_grace_remaining_ms": startup_grace_remaining_ms,
+            "recovery_in_progress": key in self._kline_recovering,
+            "recovery_count": int(self._kline_health_recovery_counts.get(key) or 0),
+            "last_recovery_at_ms": self._kline_last_health_recovery_at_ms.get(key),
+        }
+
+    @staticmethod
+    def _kline_worker_should_recover(health: Mapping[str, Any]) -> bool:
+        return bool(
+            health.get("thread_alive")
+            and not health.get("healthy")
+            and int(health.get("startup_grace_remaining_ms") or 0) <= 0
+        )
+
+    def _remember_kline_message_locked(self, key: tuple[str, str, str], *, now_ms: Optional[int] = None) -> None:
+        self._kline_last_message_at_ms[key] = int(now_ms if now_ms is not None else _now_ms())
+
+    def _remember_kline_revision_locked(
+        self,
+        key: tuple[str, str, str],
+        event: ProviderKlineRevisionAccepted,
+        *,
+        now_ms: Optional[int] = None,
+    ) -> None:
+        self._kline_last_revision_at_ms[key] = int(now_ms if now_ms is not None else _now_ms())
+        self._kline_last_revision_epoch[key] = int(event.revision_epoch)
+        self._kline_last_revision_seq[key] = int(event.revision_seq)
+
     def _cache_record_snapshot_locked(
         self,
         domain: str,
@@ -2316,46 +2466,112 @@ class SpotMarketProviderWsService:
             return
         provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
         key = (provider_code, local_symbol, normalized_interval)
+        unhealthy_snapshot: Optional[dict[str, Any]] = None
         with self._lock:
+            if key in self._kline_recovering:
+                return
             task = self._kline_tasks.get(key)
             if task is not None and task.is_alive():
+                health = self._kline_worker_health_snapshot_locked(key, task)
+                if not self._kline_worker_should_recover(health):
+                    return
+                unhealthy_snapshot = health
+                self._kline_recovering.add(key)
+            else:
+                self._start_kline_subscription_locked(
+                    key,
+                    provider_symbol=provider_symbol,
+                    channel=channel,
+                )
                 return
-            generation = self._kline_generations.get(key, 0) + 1
-            self._kline_generations[key] = generation
-            stop_event = threading.Event()
-            self._kline_stops[key] = stop_event
-            subscription = SpotKlineSubscription(
-                local_symbol=local_symbol,
+
+        logger.warning(
+            "spot_provider_ws_kline_worker_unhealthy provider=%s symbol=%s interval=%s "
+            "reason=%s generation=%s last_message_time_ms=%s last_revision_time_ms=%s",
+            provider_code,
+            local_symbol,
+            normalized_interval,
+            (unhealthy_snapshot or {}).get("reason"),
+            (unhealthy_snapshot or {}).get("generation"),
+            (unhealthy_snapshot or {}).get("last_message_time_ms"),
+            (unhealthy_snapshot or {}).get("last_kline_revision_time_ms"),
+        )
+        try:
+            self._stop_kline_subscription(
+                local_symbol,
+                normalized_interval,
                 provider=provider_code,
-                provider_symbol=provider_symbol,
-                interval=normalized_interval,
-                channel=channel,
-                kline_limit=_kline_limit(),
-                ws_url=str(
-                    getattr(
-                        settings,
-                        "SPOT_PROVIDER_WS_OKX_BUSINESS_URL"
-                        if provider_code == PROVIDER_OKX_SPOT
-                        else "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL",
-                        "",
-                    )
-                    or ""
-                ).strip(),
             )
-            thread = threading.Thread(
-                target=self._run_kline_thread,
-                args=(subscription, stop_event, generation),
-                name=f"spot-kline-ws-{provider_code}-{local_symbol}-{normalized_interval}",
-                daemon=True,
-            )
-            self._kline_tasks[key] = thread
-            self._remember_provider_task_started_locked(
-                "kline",
+            with self._lock:
+                self._start_kline_subscription_locked(
+                    key,
+                    provider_symbol=provider_symbol,
+                    channel=channel,
+                )
+                self._kline_health_recovery_counts[key] = int(
+                    self._kline_health_recovery_counts.get(key) or 0
+                ) + 1
+                self._kline_last_health_recovery_at_ms[key] = _now_ms()
+                recovered_generation = int(self._kline_generations.get(key) or 0)
+            logger.warning(
+                "spot_provider_ws_kline_worker_recovered provider=%s symbol=%s interval=%s generation=%s",
                 provider_code,
                 local_symbol,
                 normalized_interval,
+                recovered_generation,
             )
-            thread.start()
+        finally:
+            with self._lock:
+                self._kline_recovering.discard(key)
+
+    def _start_kline_subscription_locked(
+        self,
+        key: tuple[str, str, str],
+        *,
+        provider_symbol: str,
+        channel: str,
+    ) -> None:
+        provider_code, local_symbol, normalized_interval = key
+        generation = self._kline_generations.get(key, 0) + 1
+        self._kline_generations[key] = generation
+        self._kline_last_message_at_ms.pop(key, None)
+        self._kline_last_revision_at_ms.pop(key, None)
+        self._kline_last_revision_epoch.pop(key, None)
+        self._kline_last_revision_seq.pop(key, None)
+        stop_event = threading.Event()
+        self._kline_stops[key] = stop_event
+        subscription = SpotKlineSubscription(
+            local_symbol=local_symbol,
+            provider=provider_code,
+            provider_symbol=provider_symbol,
+            interval=normalized_interval,
+            channel=channel,
+            kline_limit=_kline_limit(),
+            ws_url=str(
+                getattr(
+                    settings,
+                    "SPOT_PROVIDER_WS_OKX_BUSINESS_URL"
+                    if provider_code == PROVIDER_OKX_SPOT
+                    else "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL",
+                    "",
+                )
+                or ""
+            ).strip(),
+        )
+        thread = threading.Thread(
+            target=self._run_kline_thread,
+            args=(subscription, stop_event, generation),
+            name=f"spot-kline-ws-{provider_code}-{local_symbol}-{normalized_interval}",
+            daemon=True,
+        )
+        self._kline_tasks[key] = thread
+        self._remember_provider_task_started_locked(
+            "kline",
+            provider_code,
+            local_symbol,
+            normalized_interval,
+        )
+        thread.start()
 
     def release_symbol(self, symbol: str, *, provider: Optional[str] = None) -> None:
         local_symbol = normalize_spot_ws_symbol(symbol)
@@ -3705,11 +3921,13 @@ class SpotMarketProviderWsService:
         if record is None:
             return
         key = (subscription.provider, subscription.local_symbol, subscription.interval)
+        received_at_ms = int(record.get("updated_at_ms") or _now_ms())
         accepted_events: list[ProviderKlineRevisionAccepted] = []
         listener: Optional[Callable[[ProviderKlineRevisionAccepted], None]] = None
         with self._lock:
             if self._kline_generations.get(key) != generation:
                 return
+            self._remember_kline_message_locked(key, now_ms=received_at_ms)
             self._kline_cache[key] = self._merge_provider_kline_record_locked(
                 key,
                 record,
@@ -3717,6 +3935,12 @@ class SpotMarketProviderWsService:
                 generation=generation,
                 accepted_events=accepted_events,
             )
+            if accepted_events:
+                self._remember_kline_revision_locked(
+                    key,
+                    accepted_events[-1],
+                    now_ms=received_at_ms,
+                )
             listener = self._kline_revision_listener
         self._notify_kline_revision_events(listener, accepted_events)
 
@@ -3745,11 +3969,13 @@ class SpotMarketProviderWsService:
         if record is None:
             return
         key = (subscription.provider, subscription.local_symbol, subscription.interval)
+        received_at_ms = int(record.get("updated_at_ms") or _now_ms())
         accepted_events: list[ProviderKlineRevisionAccepted] = []
         listener: Optional[Callable[[ProviderKlineRevisionAccepted], None]] = None
         with self._lock:
             if self._kline_generations.get(key) != generation:
                 return
+            self._remember_kline_message_locked(key, now_ms=received_at_ms)
             self._kline_cache[key] = self._merge_provider_kline_record_locked(
                 key,
                 record,
@@ -3757,6 +3983,12 @@ class SpotMarketProviderWsService:
                 generation=generation,
                 accepted_events=accepted_events,
             )
+            if accepted_events:
+                self._remember_kline_revision_locked(
+                    key,
+                    accepted_events[-1],
+                    now_ms=received_at_ms,
+                )
             listener = self._kline_revision_listener
         self._notify_kline_revision_events(listener, accepted_events)
 
