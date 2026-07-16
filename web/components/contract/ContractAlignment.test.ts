@@ -119,6 +119,18 @@ test('contract TradingView overlay consumes Price Authority without changing the
   expect(chartSource).not.toContain('displayPrice?: number | null;');
 });
 
+test('contract TradingView and OrderBook share one referencePrice contract', () => {
+  const pageSource = readSource('app/contract/page.tsx');
+  const orderBookSource = readSource('components/contract/ContractFuturesOrderBook.tsx');
+
+  expect(pageSource).toMatch(/<ContractTradingViewChart[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
+  expect(pageSource).toMatch(/<ContractFuturesOrderBook[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
+  expect(pageSource).not.toContain('centerPrice={contractMarketState.displayPrice}');
+  expect(orderBookSource).toContain('referencePrice: ContractReferencePrice;');
+  expect(orderBookSource).toContain('const centerPriceNumber = referencePrice.usable');
+  expect(orderBookSource).not.toContain('storeHasMidpoint');
+});
+
 test('every ContractTradingViewChart consumer provides a symbol-matched referencePrice', () => {
   const contractPageSource = readSource('app/contract/page.tsx');
   const stockPageSource = readSource('app/markets/stocks/[symbol]/page.tsx');

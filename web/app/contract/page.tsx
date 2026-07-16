@@ -420,7 +420,6 @@ function ContractPageContent() {
     executionBid,
     executionAsk,
     reasonCode,
-    marketState: contractMarketState,
     marketUiState,
     marketStatus: contractMarketStatus,
     marketSessionType: contractMarketSessionType,
@@ -780,10 +779,7 @@ function ContractPageContent() {
                     asks={depthAsks}
                     status={depthStatus}
                     statusLabel={depthStatusLabel}
-                    centerPrice={contractMarketState.displayPrice}
-                    centerPriceReady={currentPriceReady}
-                    centerPriceSource={contractMarketState.displayPriceSource}
-                    centerPriceLabel={contractMarketState.displayPriceLabel}
+                    referencePrice={referencePrice}
                     bestBid={hookBestBid}
                     bestAsk={hookBestAsk}
                     spread={hookSpread}
