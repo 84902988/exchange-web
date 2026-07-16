@@ -17,7 +17,9 @@ from app.services.contract_market_domain_freshness import (
     resolve_contract_market_domain_freshness,
 )
 from app.services.contract_market_domain_snapshot import (
+    ContractMarketDomainSnapshotAuthorityReason,
     ContractMarketDomainSnapshotContext,
+    compare_contract_market_domain_snapshots,
     map_contract_depth_domain_snapshot,
     map_contract_kline_domain_snapshot,
     map_contract_ticker_domain_snapshot,
@@ -150,21 +152,31 @@ def test_trades_snapshot_accepts_legacy_list_without_reshaping_it():
     trades = [
         {
             "id": "trade-2",
+            "symbol": "BTCUSDT_PERP",
             "price": "60780.1",
             "qty": "0.5",
             "time": 1_720_000_000_120,
             "provider": "OKX_SWAP",
             "provider_symbol": "BTC-USDT-SWAP",
             "source": "LIVE_WS",
+            "quote_source": "LIVE_WS",
+            "quote_freshness": "LIVE",
+            "price_source": "TRADE_TICK",
+            "synthetic": False,
         },
         {
             "id": "trade-1",
+            "symbol": "BTCUSDT_PERP",
             "price": "60780.0",
             "amount": "0.25",
             "time": 1_720_000_000_100,
             "provider": "OKX_SWAP",
             "provider_symbol": "BTC-USDT-SWAP",
             "source": "LIVE_WS",
+            "quote_source": "LIVE_WS",
+            "quote_freshness": "LIVE",
+            "price_source": "TRADE_TICK",
+            "synthetic": False,
         },
     ]
 
@@ -181,6 +193,65 @@ def test_trades_snapshot_accepts_legacy_list_without_reshaping_it():
     assert snapshot.metadata.provider_symbol == "BTC-USDT-SWAP"
     assert snapshot.metadata.completeness.status == ContractMarketDomainCompletenessStatus.COMPLETE
     assert snapshot.metadata.completeness.item_count == 2
+
+
+def test_provider_rest_trade_snapshot_is_recent():
+    trade = {
+        "id": "trade-rest-1",
+        "symbol": "BTCUSDT_PERP",
+        "price": "60780.1",
+        "qty": "0.5",
+        "time": 1_720_000_000_120,
+        "provider": "OKX_SWAP",
+        "provider_symbol": "BTC-USDT-SWAP",
+        "source": "PROVIDER_REST",
+        "quote_source": "PROVIDER_REST",
+        "quote_freshness": "RECENT",
+        "price_source": "TRADE_TICK",
+        "synthetic": False,
+        "received_at_ms": 1_720_000_000_150,
+    }
+    context = ContractMarketDomainSnapshotContext(
+        symbol="BTCUSDT_PERP",
+        transport=ContractMarketDomainTransport.PROVIDER_REST,
+        cache_origin=ContractMarketDomainCacheOrigin.NONE,
+        source=ContractMarketDomainSource.REST_SNAPSHOT,
+        received_at_ms=1_720_000_000_150,
+        ttl_ms=1_500,
+        emitted_at_ms=NOW_MS,
+    )
+
+    snapshot = map_contract_trades_domain_snapshot(context=context, trades=[trade])
+
+    assert snapshot.metadata.source == ContractMarketDomainSource.REST_SNAPSHOT
+    assert snapshot.metadata.freshness == ContractMarketDomainFreshness.RECENT
+    assert snapshot.metadata.completeness.status == ContractMarketDomainCompletenessStatus.COMPLETE
+
+
+def test_synthetic_trade_snapshot_is_invalid_and_cannot_bootstrap_authority():
+    synthetic = {
+        "id": "fake-1",
+        "symbol": "BTCUSDT_PERP",
+        "price": "60780.1",
+        "qty": "0.5",
+        "time": 1_720_000_000_120,
+        "source": "SYNTHETIC_FROM_QUOTE",
+        "quote_source": "SYNTHETIC_FROM_QUOTE",
+        "quote_freshness": "LIVE",
+        "price_source": "SYNTHETIC_FROM_QUOTE",
+        "synthetic": True,
+    }
+    snapshot = map_contract_trades_domain_snapshot(
+        context=_live_context(source=None, provider=None, provider_symbol=None),
+        trades=[synthetic],
+    )
+
+    assert snapshot.metadata.source == ContractMarketDomainSource.MISSING
+    assert snapshot.metadata.freshness == ContractMarketDomainFreshness.MISSING
+    assert snapshot.metadata.completeness.status == ContractMarketDomainCompletenessStatus.INVALID
+    result = compare_contract_market_domain_snapshots(None, snapshot)
+    assert result.accepted is False
+    assert result.reason == ContractMarketDomainSnapshotAuthorityReason.INVALID_SNAPSHOT
 
 
 def test_kline_snapshot_carries_revision_and_complete_terminal_evidence():

@@ -48,6 +48,7 @@ class ContractMarketDomainSnapshotAuthorityDecision(str, Enum):
 class ContractMarketDomainSnapshotAuthorityReason(str, Enum):
     BOOTSTRAP = "BOOTSTRAP"
     ACCEPTED = "ACCEPTED"
+    INVALID_SNAPSHOT = "INVALID_SNAPSHOT"
     PROVIDER_SWITCH = "PROVIDER_SWITCH"
     NEW_GENERATION = "NEW_GENERATION"
     OLD_GENERATION = "OLD_GENERATION"
@@ -143,6 +144,21 @@ def compare_contract_market_domain_snapshots(
     provider lineage. Local observation time is the final ordering fallback.
     """
 
+    incoming_metadata = incoming.metadata
+    if (
+        incoming_metadata.domain == ContractMarketDomainName.TRADES
+        and incoming_metadata.completeness.status
+        in {
+            ContractMarketDomainCompletenessStatus.INVALID,
+            ContractMarketDomainCompletenessStatus.PARTIAL,
+        }
+    ):
+        return _authority_result(
+            accepted=False,
+            reason=ContractMarketDomainSnapshotAuthorityReason.INVALID_SNAPSHOT,
+            current=current,
+            incoming=incoming,
+        )
     if current is None:
         return _authority_result(
             accepted=True,
@@ -159,7 +175,6 @@ def compare_contract_market_domain_snapshots(
         )
 
     current_metadata = current.metadata
-    incoming_metadata = incoming.metadata
     same_provider = current_metadata.provider == incoming_metadata.provider
     current_generation = current_metadata.provider_generation
     incoming_generation = incoming_metadata.provider_generation
@@ -382,6 +397,8 @@ class ContractMarketDomainSnapshotContext:
 _LEGACY_SOURCE_MAP = {
     "LIVE_WS": ContractMarketDomainSource.LIVE_WS,
     "PROVIDER_WS": ContractMarketDomainSource.LIVE_WS,
+    "PROVIDER_REST": ContractMarketDomainSource.REST_SNAPSHOT,
+    "ITICK_TICK": ContractMarketDomainSource.REST_SNAPSHOT,
     "REST_SNAPSHOT": ContractMarketDomainSource.REST_SNAPSHOT,
     "EXTERNAL": ContractMarketDomainSource.REST_SNAPSHOT,
     "CONFIGURED": ContractMarketDomainSource.REST_SNAPSHOT,
@@ -724,16 +741,56 @@ def _trade_items(payload: Optional[Any]) -> list[Mapping[str, Any]]:
     return []
 
 
-def _trade_valid(item: Mapping[str, Any]) -> bool:
+_PROVIDER_WS_TRADE_SOURCES = {"LIVE_WS", "PROVIDER_WS"}
+_PROVIDER_REST_TRADE_SOURCES = {"PROVIDER_REST", "ITICK_TICK"}
+_REAL_TRADE_SOURCES = _PROVIDER_WS_TRADE_SOURCES | _PROVIDER_REST_TRADE_SOURCES
+
+
+def _trade_valid(item: Mapping[str, Any], *, expected_symbol: str) -> bool:
     price = item.get("price", item.get("last_price"))
     amount = item.get("qty", item.get("amount", item.get("quantity", item.get("volume"))))
-    return _positive_decimal(price) and _positive_decimal(amount)
+    item_symbol = _normalize_symbol(item.get("symbol"))
+    source = str(item.get("source") or "").strip().upper()
+    quote_source = str(item.get("quote_source") or source).strip().upper()
+    freshness = str(item.get("freshness") or item.get("quote_freshness") or "").strip().upper()
+    expected_freshness = (
+        ContractMarketDomainFreshness.LIVE.value
+        if source in _PROVIDER_WS_TRADE_SOURCES
+        else ContractMarketDomainFreshness.RECENT.value
+        if source in _PROVIDER_REST_TRADE_SOURCES
+        else ""
+    )
+    synthetic = item.get("synthetic") is True or str(item.get("synthetic") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    event_time_ms = None
+    for key in ("event_time_ms", "time", "ts", "exchange_ts"):
+        event_time_ms = _timestamp_ms(item.get(key))
+        if event_time_ms is not None and event_time_ms > 0:
+            break
+    return bool(
+        item_symbol == _normalize_symbol(expected_symbol)
+        and _positive_decimal(price)
+        and _positive_decimal(amount)
+        and event_time_ms is not None
+        and event_time_ms > 0
+        and str(item.get("price_source") or "").strip().upper() == "TRADE_TICK"
+        and source in _REAL_TRADE_SOURCES
+        and quote_source in _REAL_TRADE_SOURCES
+        and freshness == expected_freshness
+        and not synthetic
+        and _optional_text(item.get("provider")) is not None
+        and _optional_text(item.get("provider_symbol")) is not None
+    )
 
 
 def _trades_completeness(
     payload: Optional[Any],
     *,
     valid_container: bool,
+    expected_symbol: str,
 ) -> ContractMarketDomainCompleteness:
     if not valid_container:
         return ContractMarketDomainCompleteness(
@@ -747,7 +804,7 @@ def _trades_completeness(
             status=ContractMarketDomainCompletenessStatus.EMPTY,
             has_data=False,
         )
-    valid_count = sum(1 for item in items if _trade_valid(item))
+    valid_count = sum(1 for item in items if _trade_valid(item, expected_symbol=expected_symbol))
     invalid_count = len(items) - valid_count
     if valid_count == 0:
         status = ContractMarketDomainCompletenessStatus.INVALID
@@ -1024,7 +1081,11 @@ def map_contract_trades_domain_snapshot(
         domain=ContractMarketDomainName.TRADES,
         payload=metadata_payload,
         context=context,
-        completeness=_trades_completeness(payload, valid_container=valid_container),
+        completeness=_trades_completeness(
+            payload,
+            valid_container=valid_container,
+            expected_symbol=context.symbol,
+        ),
         now_ms=emitted_at_ms,
     )
     return ContractTradesDomainSnapshot(
