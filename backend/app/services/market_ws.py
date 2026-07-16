@@ -100,6 +100,8 @@ class ClientSendMailboxItem:
     revision_epoch: Optional[int] = None
     revision_seq: Optional[int] = None
     is_closed: Optional[bool] = None
+    preview_key: Optional[tuple[Any, ...]] = None
+    preview_seq: Optional[int] = None
 
     @property
     def sequence(self) -> int:
@@ -112,6 +114,8 @@ MAILBOX_DEPTH_COALESCED = "depth_coalesced"
 MAILBOX_TICKER_COALESCED = "ticker_coalesced"
 MAILBOX_KLINE_REPLACED = "kline_replaced"
 MAILBOX_KLINE_STALE_REJECTED = "kline_stale_rejected"
+MAILBOX_PREVIEW_REPLACED = "preview_replaced"
+MAILBOX_PREVIEW_STALE_REJECTED = "preview_stale_rejected"
 
 
 class TradeBacklogFull(Exception):
@@ -132,6 +136,8 @@ def _client_send_domain(event_type: str) -> str:
         return "ticker"
     if normalized == "spot_kline_update":
         return "kline"
+    if normalized == "spot_candle_preview_update":
+        return "preview"
     return "control"
 
 
@@ -170,6 +176,8 @@ def _client_send_mailbox_item(
     revision_epoch: Optional[int] = None
     revision_seq: Optional[int] = None
     is_closed: Optional[bool] = None
+    preview_key: Optional[tuple[Any, ...]] = None
+    preview_seq: Optional[int] = None
     if domain == "kline" and isinstance(payload, dict):
         kline = payload.get("kline")
         kline_payload = kline if isinstance(kline, dict) else {}
@@ -186,6 +194,16 @@ def _client_send_mailbox_item(
         is_closed = _optional_bool(
             kline_payload.get("is_closed", payload.get("is_closed"))
         )
+    elif domain == "preview" and isinstance(payload, dict):
+        preview = payload.get("preview")
+        preview_payload = preview if isinstance(preview, dict) else {}
+        interval = _normalize_interval(str(payload.get("interval") or "1m"))
+        open_time = _optional_int(preview_payload.get("open_time"))
+        if open_time is not None:
+            preview_key = (symbol, interval, open_time)
+        preview_seq = _optional_int(
+            preview_payload.get("preview_seq", payload.get("preview_seq"))
+        )
     return ClientSendMailboxItem(
         first_sequence=sequence,
         latest_sequence=sequence,
@@ -199,6 +217,8 @@ def _client_send_mailbox_item(
         revision_epoch=revision_epoch,
         revision_seq=revision_seq,
         is_closed=is_closed,
+        preview_key=preview_key,
+        preview_seq=preview_seq,
     )
 
 
@@ -213,6 +233,7 @@ class ClientSendMailbox:
     depth_slot: Optional[ClientSendMailboxItem] = None
     ticker_slot: Optional[ClientSendMailboxItem] = None
     kline_pending: dict[tuple[Any, ...], ClientSendMailboxItem] = field(default_factory=dict)
+    preview_pending: dict[tuple[Any, ...], ClientSendMailboxItem] = field(default_factory=dict)
     trade_queue_high_watermark: int = 0
     trade_warning_active: bool = False
     _ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
@@ -226,6 +247,7 @@ class ClientSendMailbox:
             + (1 if self.depth_slot is not None else 0)
             + (1 if self.ticker_slot is not None else 0)
             + len(self.kline_pending)
+            + len(self.preview_pending)
         )
 
     @property
@@ -253,6 +275,7 @@ class ClientSendMailbox:
             "depth": 1 if self.depth_slot is not None else 0,
             "ticker": 1 if self.ticker_slot is not None else 0,
             "kline": len(self.kline_pending),
+            "preview": len(self.preview_pending),
         }
 
     def put_nowait(self, item: ClientSendMailboxItem) -> str:
@@ -308,6 +331,27 @@ class ClientSendMailbox:
                 return MAILBOX_KLINE_REPLACED
             self._ensure_capacity()
             self.kline_pending[key] = replace(item, kline_key=key)
+        elif item.domain == "preview":
+            key = item.preview_key or (item.symbol, "unkeyed", item.latest_sequence)
+            existing = self.preview_pending.get(key)
+            if existing is not None:
+                if (
+                    existing.preview_seq is not None
+                    and (
+                        item.preview_seq is None
+                        or item.preview_seq <= existing.preview_seq
+                    )
+                ):
+                    return MAILBOX_PREVIEW_STALE_REJECTED
+                self.preview_pending[key] = replace(
+                    item,
+                    first_sequence=existing.first_sequence,
+                    preview_key=key,
+                )
+                self._ready.set()
+                return MAILBOX_PREVIEW_REPLACED
+            self._ensure_capacity()
+            self.preview_pending[key] = replace(item, preview_key=key)
         else:
             self._ensure_capacity()
             self.control_queue.append(item)
@@ -374,6 +418,16 @@ class ClientSendMailbox:
                     ),
                 )
             )
+        if self.preview_pending:
+            candidates.append(
+                (
+                    "preview",
+                    min(
+                        self.preview_pending.values(),
+                        key=lambda item: item.first_sequence,
+                    ),
+                )
+            )
         return candidates
 
     def _pop_domain(self, domain: str) -> ClientSendMailboxItem:
@@ -390,12 +444,19 @@ class ClientSendMailbox:
         elif domain == "ticker":
             item = self.ticker_slot
             self.ticker_slot = None
-        else:
+        elif domain == "kline":
             key, item = min(
                 self.kline_pending.items(),
                 key=lambda pair: pair[1].first_sequence,
             )
             self.kline_pending.pop(key, None)
+            return item
+        else:
+            key, item = min(
+                self.preview_pending.items(),
+                key=lambda pair: pair[1].first_sequence,
+            )
+            self.preview_pending.pop(key, None)
             return item
         if item is None:
             raise asyncio.QueueEmpty
@@ -424,6 +485,7 @@ class ClientSendMailbox:
         self.depth_slot = None
         self.ticker_slot = None
         self.kline_pending.clear()
+        self.preview_pending.clear()
         self.trade_warning_active = False
         self._ready.clear()
 
@@ -468,6 +530,8 @@ class MarketWsManager:
         self._ticker_coalesced_count = 0
         self._kline_revision_replace_count = 0
         self._kline_stale_replace_reject_count = 0
+        self._preview_replace_count = 0
+        self._preview_stale_replace_reject_count = 0
         self._trade_queue_high_watermark = 0
         self._trade_backlog_warning_count = 0
         self._trade_backlog_disconnect_count = 0
@@ -687,6 +751,10 @@ class MarketWsManager:
             self._kline_revision_replace_count += 1
         elif result == MAILBOX_KLINE_STALE_REJECTED:
             self._kline_stale_replace_reject_count += 1
+        elif result == MAILBOX_PREVIEW_REPLACED:
+            self._preview_replace_count += 1
+        elif result == MAILBOX_PREVIEW_STALE_REJECTED:
+            self._preview_stale_replace_reject_count += 1
 
     async def _remove_clients(
         self,
@@ -857,6 +925,10 @@ class MarketWsManager:
                 len(state.mailbox.kline_pending)
                 for state in self._client_send_states.values()
             )
+            pending_preview_count = sum(
+                len(state.mailbox.preview_pending)
+                for state in self._client_send_states.values()
+            )
             trade_queue_depth = sum(
                 len(state.mailbox.trade_queue)
                 for state in self._client_send_states.values()
@@ -934,9 +1006,12 @@ class MarketWsManager:
                     "ticker_coalesced_count": self._ticker_coalesced_count,
                     "kline_revision_replace_count": self._kline_revision_replace_count,
                     "kline_stale_replace_reject_count": self._kline_stale_replace_reject_count,
+                    "preview_replace_count": self._preview_replace_count,
+                    "preview_stale_replace_reject_count": self._preview_stale_replace_reject_count,
                     "pending_depth_slot": pending_depth_slot,
                     "pending_ticker_slot": pending_ticker_slot,
                     "pending_kline_count": pending_kline_count,
+                    "pending_preview_count": pending_preview_count,
                     "trade_queue_depth": trade_queue_depth,
                     "trade_queue_high_watermark": self._trade_queue_high_watermark,
                     "trade_backlog_warning_count": self._trade_backlog_warning_count,
@@ -1061,7 +1136,10 @@ class MarketWsManager:
                     self._mark_queue_full(state, symbol=symbol)
                 else:
                     self._remember_mailbox_put_result(state, item, put_result)
-                    if put_result != MAILBOX_KLINE_STALE_REJECTED:
+                    if put_result not in {
+                        MAILBOX_KLINE_STALE_REJECTED,
+                        MAILBOX_PREVIEW_STALE_REJECTED,
+                    }:
                         state.last_enqueue_at = item.enqueue_time
                         state.queue_high_watermark = max(
                             state.queue_high_watermark,
@@ -1183,7 +1261,7 @@ class MarketWsManager:
         payload_type = str(payload.get("type") or "")
         interval = (
             _normalize_interval(str(payload.get("interval") or "1m"))
-            if payload_type == "spot_kline_update"
+            if payload_type in {"spot_kline_update", "spot_candle_preview_update"}
             else None
         )
         async with self._lock:
@@ -1202,7 +1280,7 @@ class MarketWsManager:
     async def _get_payload_recipients(self, symbol: str, payload: dict) -> list[WebSocket]:
         symbol = _normalize_symbol(symbol)
         payload_type = str(payload.get("type") or "")
-        if payload_type != "spot_kline_update":
+        if payload_type not in {"spot_kline_update", "spot_candle_preview_update"}:
             return await self._get_connections(symbol)
 
         interval = _normalize_interval(str(payload.get("interval") or "1m"))
@@ -1398,6 +1476,7 @@ class MarketWsManager:
         revision_seq: Any = None,
         is_closed: Any = None,
         close_state_source: Any = None,
+        provider_generation: Any = None,
     ) -> None:
         kline_payload = kline.model_dump() if hasattr(kline, "model_dump") else dict(kline or {})
         revision_fields = {
@@ -1405,6 +1484,7 @@ class MarketWsManager:
             "revision_seq": revision_seq,
             "is_closed": is_closed,
             "close_state_source": close_state_source,
+            "provider_generation": provider_generation,
         }
         for key, value in revision_fields.items():
             if value is not None:
@@ -1418,6 +1498,47 @@ class MarketWsManager:
                 "kline": kline_payload,
                 "source": source,
                 "updated_at": updated_at,
+                "provider_generation": provider_generation,
+            },
+        )
+
+    async def broadcast_spot_candle_preview_update(
+        self,
+        symbol: str,
+        interval: str,
+        preview: Any,
+        *,
+        received_at_ms: Any = None,
+    ) -> None:
+        raw_preview = (
+            preview.model_dump()
+            if hasattr(preview, "model_dump")
+            else dict(getattr(preview, "__dict__", preview) or {})
+        )
+        preview_payload = {
+            key: _to_str(value) if isinstance(value, Decimal) else value
+            for key, value in raw_preview.items()
+        }
+        revision_epoch = _optional_int(preview_payload.get("revision_epoch"))
+        revision_seq = _optional_int(preview_payload.get("revision_seq"))
+        generation = _optional_int(preview_payload.get("generation"))
+        preview_seq = _optional_int(preview_payload.get("preview_seq"))
+        await self._send_payload(
+            symbol,
+            {
+                "type": "spot_candle_preview_update",
+                "symbol": _normalize_symbol(symbol),
+                "interval": _normalize_interval(str(interval or "1m")),
+                "preview": preview_payload,
+                "source": "CANDLE_PREVIEW",
+                "provider": preview_payload.get("provider"),
+                "provider_generation": generation,
+                "base_native_revision": {
+                    "epoch": revision_epoch,
+                    "sequence": revision_seq,
+                },
+                "preview_seq": preview_seq,
+                "received_at_ms": received_at_ms,
             },
         )
 
