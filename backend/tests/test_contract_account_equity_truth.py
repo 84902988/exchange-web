@@ -249,6 +249,13 @@ def test_private_ws_mark_refresh_is_throttled_by_value_signature(monkeypatch):
         lambda _db, _symbol: _quote(mark["value"]),
     )
     monkeypatch.setattr(private_ws, "SessionLocal", lambda: db)
+    empty_items = SimpleNamespace(model_dump=lambda: {"items": []})
+    monkeypatch.setattr(private_ws, "get_user_contract_positions", lambda *args, **kwargs: empty_items)
+    monkeypatch.setattr(
+        private_ws,
+        "get_user_contract_position_summaries",
+        lambda *args, **kwargs: empty_items,
+    )
     websocket = _WebSocket()
 
     async def scenario():
@@ -256,6 +263,11 @@ def test_private_ws_mark_refresh_is_throttled_by_value_signature(monkeypatch):
         manager._connections[42].add(websocket)
         initial = private_ws._account_payload(db, 42)
         await manager._remember_account_signature(42, initial)
+        manager._position_signatures[42] = private_ws._position_signature({
+            "positions": [],
+            "position_summaries": [],
+            "mark_only": True,
+        })
 
         assert await manager._refresh_account_if_changed(42) is False
         mark["value"] = "115"

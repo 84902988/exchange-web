@@ -215,6 +215,14 @@ function getContractUserPayload(message: ContractUserRealtimeMessage) {
   return isRecord(message.data) ? message.data : message as Record<string, unknown>;
 }
 
+export function isContractPositionMarkOnlyMessage(message: ContractUserRealtimeMessage) {
+  const payload = getContractUserPayload(message);
+  const messageRecord = message as unknown as Record<string, unknown>;
+  return String(message.type || '').trim().toLowerCase() === 'contract_user_position_mark_update'
+    || payload.mark_only === true
+    || messageRecord.mark_only === true;
+}
+
 function getContractUserMessageSymbol(
   message: ContractUserRealtimeMessage,
   payload: Record<string, unknown>,
@@ -259,7 +267,7 @@ function getContractUserMessageSymbols(
   return Array.from(symbols);
 }
 
-function isContractUserMessageForScope(
+export function isContractUserMessageForScope(
   message: ContractUserRealtimeMessage,
   payload: Record<string, unknown>,
   currentSymbol: string,
@@ -307,6 +315,7 @@ function extractContractAccountUpdate(message: ContractUserRealtimeMessage) {
 function extractContractPositionsUpdate(
   message: ContractUserRealtimeMessage,
   currentSymbol: string,
+  includeAllSymbols = false,
 ) {
   const payload = getContractUserPayload(message);
   if (!isContractUserMessageForSymbol(message, payload, currentSymbol)) return null;
@@ -324,7 +333,7 @@ function extractContractPositionsUpdate(
     ...asRecordArray(payload.position),
   ].filter((item) => {
     const itemSymbol = String(item.symbol || '').trim().toUpperCase();
-    return !itemSymbol || itemSymbol === currentSymbol.toUpperCase();
+    return includeAllSymbols || !itemSymbol || itemSymbol === currentSymbol.toUpperCase();
   });
 
   if (items.length === 0) return null;
@@ -337,6 +346,7 @@ function extractContractPositionsUpdate(
 function extractContractPositionSummariesUpdate(
   message: ContractUserRealtimeMessage,
   currentSymbol: string,
+  includeAllSymbols = false,
 ) {
   const payload = getContractUserPayload(message);
   if (!isContractUserMessageForSymbol(message, payload, currentSymbol)) return null;
@@ -348,7 +358,7 @@ function extractContractPositionSummariesUpdate(
     ...asRecordArray(payload.position_summary),
   ].filter((item) => {
     const itemSymbol = String(item.symbol || '').trim().toUpperCase();
-    return !itemSymbol || itemSymbol === currentSymbol.toUpperCase();
+    return includeAllSymbols || !itemSymbol || itemSymbol === currentSymbol.toUpperCase();
   });
 
   return {
@@ -436,7 +446,22 @@ function replaceOrMergePositionSummaries(
   items: ContractPositionSummaryItem[],
   replace: boolean,
   currentSymbol: string,
+  includeAllSymbols = false,
 ) {
+  if (includeAllSymbols) {
+    const map = new Map<string, ContractPositionSummaryItem>();
+    if (!replace) {
+      previous.forEach((item) => {
+        const key = `${normalizeCacheSymbol(item.symbol)}:${String(item.side || '').trim().toUpperCase()}`;
+        map.set(key, item);
+      });
+    }
+    items.forEach((item) => {
+      const key = `${normalizeCacheSymbol(item.symbol)}:${String(item.side || '').trim().toUpperCase()}`;
+      map.set(key, item);
+    });
+    return Array.from(map.values());
+  }
   const normalizedSymbol = currentSymbol.toUpperCase();
   const currentItems = replace
     ? items
@@ -649,7 +674,7 @@ export function useContractUserState({
   const markRealtimeMessage = useCallback((message: ContractUserRealtimeMessage) => {
     const seq = getMessageSeq(message);
     if (seq !== null) {
-      if (seq < lastRealtimeSeqRef.current) return false;
+      if (!acceptsContractRealtimeSequence(lastRealtimeSeqRef.current, message)) return false;
       if (seq > lastRealtimeSeqRef.current) {
         lastRealtimeSeqRef.current = seq;
         realtimeVersionRef.current += 1;
@@ -686,6 +711,30 @@ export function useContractUserState({
       positionSummaries: nextSummaries,
       loadedAt: Date.now(),
     });
+  }, []);
+
+  const patchPositionMarkCaches = useCallback((
+    positionUpdates: ContractPositionItem[],
+    summaryUpdates: ContractPositionSummaryItem[],
+  ) => {
+    positionScopeCacheRef.current.forEach((entry, key) => {
+      positionScopeCacheRef.current.set(key, {
+        positions: mergeContractPositionMarkRows(entry.positions, positionUpdates),
+        positionSummaries: mergeContractPositionMarkSummaries(entry.positionSummaries, summaryUpdates),
+        loadedAt: Date.now(),
+      });
+    });
+    positionsPageCacheRef.current.forEach((entry, key) => {
+      positionsPageCacheRef.current.set(key, {
+        ...entry,
+        rows: mergeContractPositionMarkRows(entry.rows, positionUpdates),
+        loadedAt: Date.now(),
+      });
+    });
+    const activePage = positionsPageCacheRef.current.get(activePositionsPageCacheKeyRef.current);
+    if (activePage) {
+      setPositionsPageItems(activePage.rows);
+    }
   }, []);
 
   const prefetchAllPositionScope = useCallback(() => {
@@ -1035,14 +1084,19 @@ export function useContractUserState({
     const applyRealtimePositionState = (
       positionsUpdate: ReturnType<typeof extractContractPositionsUpdate> | null,
       summariesUpdate: ReturnType<typeof extractContractPositionSummariesUpdate> | null,
+      message: ContractUserRealtimeMessage,
     ) => {
       if (!positionsUpdate && !summariesUpdate) return;
+      const markOnly = isContractPositionMarkOnlyMessage(message);
+      if (markOnly) {
+        patchPositionMarkCaches(positionsUpdate?.items || [], summariesUpdate?.items || []);
+      }
 
       const nextPositions = positionsUpdate
         ? replaceOrMergePositions(
             positionsRef.current,
             positionsUpdate.items,
-            positionsUpdate.replace,
+            markOnly ? false : positionsUpdate.replace,
             contractSymbol,
           )
         : positionsRef.current;
@@ -1050,8 +1104,9 @@ export function useContractUserState({
         ? replaceOrMergePositionSummaries(
             positionSummariesRef.current,
             summariesUpdate.items,
-            summariesUpdate.replace,
+            markOnly ? false : summariesUpdate.replace,
             contractSymbol,
+            dataScope === 'all',
           )
         : positionSummariesRef.current;
 
@@ -1062,7 +1117,12 @@ export function useContractUserState({
       updateActivePositionScopeCache(nextPositions, nextSummaries);
       setIsScopeSwitching(false);
       hasLoadedPrivateRef.current = true;
-      if (activeTabRef.current === 'positions') {
+      if (shouldRefreshPositionsFromRestAfterRealtime(
+        message,
+        Boolean(positionsUpdate || summariesUpdate),
+        dataScope,
+        activeTabRef.current,
+      )) {
         void refreshPrivate({ silent: true });
       }
     };
@@ -1076,8 +1136,9 @@ export function useContractUserState({
         setAccountError(null);
       }
       applyRealtimePositionState(
-        extractContractPositionsUpdate(message, contractSymbol),
-        extractContractPositionSummariesUpdate(message, contractSymbol),
+        extractContractPositionsUpdate(message, contractSymbol, dataScope === 'all'),
+        extractContractPositionSummariesUpdate(message, contractSymbol, dataScope === 'all'),
+        message,
       );
 
       const ordersUpdate = extractContractOrdersUpdate(message, contractSymbol);
@@ -1111,13 +1172,18 @@ export function useContractUserState({
     const handlePositionsMessage = (message: ContractUserRealtimeMessage) => {
       if (String(message.type || '').toLowerCase().includes('snapshot')) return;
       if (!markScopedRealtimeMessage(message)) return;
-      const positionsUpdate = extractContractPositionsUpdate(message, contractSymbol);
-      const summariesUpdate = extractContractPositionSummariesUpdate(message, contractSymbol);
-      if (!positionsUpdate && !summariesUpdate && dataScope === 'all' && activeTabRef.current === 'positions') {
+      const positionsUpdate = extractContractPositionsUpdate(message, contractSymbol, dataScope === 'all');
+      const summariesUpdate = extractContractPositionSummariesUpdate(message, contractSymbol, dataScope === 'all');
+      if (!positionsUpdate && !summariesUpdate && shouldRefreshPositionsFromRestAfterRealtime(
+        message,
+        false,
+        dataScope,
+        activeTabRef.current,
+      )) {
         void refreshPrivate({ silent: true });
         return;
       }
-      applyRealtimePositionState(positionsUpdate, summariesUpdate);
+      applyRealtimePositionState(positionsUpdate, summariesUpdate, message);
     };
 
     const handleOrdersMessage = (message: ContractUserRealtimeMessage) => {
@@ -1155,7 +1221,7 @@ export function useContractUserState({
       unsubscribeOrders();
       unsubscribeTrades();
     };
-  }, [contractSymbol, dataScope, markScopedRealtimeMessage, refreshPrivate, updateActivePositionScopeCache]);
+  }, [contractSymbol, dataScope, markScopedRealtimeMessage, patchPositionMarkCaches, refreshPrivate, updateActivePositionScopeCache]);
 
   useEffect(() => {
     const identityChanged = privateStateIdentityRef.current !== normalizedUserIdentity;
@@ -1437,4 +1503,45 @@ export function useContractUserState({
     onOrderHistoryFiltersChange: handleOrderHistoryFiltersChange,
     onTradeHistoryFiltersChange: handleTradeHistoryFiltersChange,
   };
+}
+
+export function mergeContractPositionMarkRows(
+  previous: ContractPositionItem[],
+  updates: ContractPositionItem[],
+) {
+  const updatesById = new Map(updates.map((item) => [item.id, item]));
+  return previous.map((item) => {
+    const update = updatesById.get(item.id);
+    return update ? { ...item, ...update } : item;
+  });
+}
+
+export function mergeContractPositionMarkSummaries(
+  previous: ContractPositionSummaryItem[],
+  updates: ContractPositionSummaryItem[],
+) {
+  const updatesByKey = new Map(updates.map((item) => [
+    `${normalizeCacheSymbol(item.symbol)}:${String(item.side || '').trim().toUpperCase()}`,
+    item,
+  ]));
+  return previous.map((item) => {
+    const key = `${normalizeCacheSymbol(item.symbol)}:${String(item.side || '').trim().toUpperCase()}`;
+    const update = updatesByKey.get(key);
+    return update ? { ...item, ...update } : item;
+  });
+}
+
+export function shouldRefreshPositionsFromRestAfterRealtime(
+  message: ContractUserRealtimeMessage,
+  hasPositionUpdate: boolean,
+  dataScope: ContractDataScope,
+  activeTab: ContractUserDataTab,
+) {
+  if (isContractPositionMarkOnlyMessage(message)) return false;
+  return activeTab === 'positions' && (hasPositionUpdate || dataScope === 'all');
+}
+
+export function acceptsContractRealtimeSequence(lastSeq: number, message: ContractUserRealtimeMessage) {
+  const seq = getMessageSeq(message);
+  return seq === null || seq >= lastSeq;
 }

@@ -26,6 +26,7 @@ from app.db.models.contract_position import ContractPosition
 from app.db.models.contract_trade import ContractTrade
 from app.services.contract_account_service import get_contract_account_summary
 from app.services.contract_query_service import (
+    contract_position_mark_evidence_scope,
     get_user_contract_orders,
     get_user_contract_position_summaries,
     get_user_contract_positions,
@@ -119,26 +120,47 @@ def _account_signature(account: dict[str, Any]) -> str:
     return json.dumps(_to_jsonable(account), sort_keys=True, separators=(",", ":"))
 
 
-def _load_account_payload(user_id: int) -> dict[str, Any]:
+def _position_signature(payload: dict[str, Any]) -> str:
+    return json.dumps(_to_jsonable(payload), sort_keys=True, separators=(",", ":"))
+
+
+def _load_mark_to_market_payload(user_id: int) -> dict[str, Any]:
     db = SessionLocal()
     try:
-        return _account_payload(db, user_id)
+        with contract_position_mark_evidence_scope():
+            account = _account_payload(db, user_id)
+            positions = get_user_contract_positions(
+                db,
+                user_id=user_id,
+                status="OPEN",
+            ).model_dump().get("items") or []
+            position_summaries = get_user_contract_position_summaries(
+                db,
+                user_id=user_id,
+            ).model_dump().get("items") or []
+        return {
+            "account": account,
+            "positions": positions,
+            "position_summaries": position_summaries,
+        }
     finally:
         db.close()
 
 
 def _snapshot_payload(db: Session, user_id: int, symbol: str | None = None) -> dict[str, Any]:
-    positions = get_user_contract_positions(
-        db,
-        user_id=user_id,
-        symbol=symbol,
-        status="ALL",
-    ).model_dump()
-    position_summaries = get_user_contract_position_summaries(
-        db,
-        user_id=user_id,
-        symbol=symbol,
-    ).model_dump()
+    with contract_position_mark_evidence_scope():
+        positions = get_user_contract_positions(
+            db,
+            user_id=user_id,
+            symbol=symbol,
+            status="ALL",
+        ).model_dump()
+        position_summaries = get_user_contract_position_summaries(
+            db,
+            user_id=user_id,
+            symbol=symbol,
+        ).model_dump()
+        account = _account_payload(db, user_id)
     orders = get_user_contract_orders(
         db,
         user_id=user_id,
@@ -154,7 +176,7 @@ def _snapshot_payload(db: Session, user_id: int, symbol: str | None = None) -> d
         page_size=100,
     ).model_dump()
     return {
-        "account": _account_payload(db, user_id),
+        "account": account,
         "positions": positions.get("items") or [],
         "position_summaries": position_summaries.get("items") or [],
         "orders": orders.get("items") or [],
@@ -167,6 +189,7 @@ class ContractPrivateWsManager:
         self._connections: dict[int, set[WebSocket]] = defaultdict(set)
         self._account_refresh_tasks: dict[int, asyncio.Task[None]] = {}
         self._account_signatures: dict[int, str] = {}
+        self._position_signatures: dict[int, str] = {}
         self._lock = asyncio.Lock()
 
     async def connect(self, user_id: int, websocket: WebSocket) -> None:
@@ -189,6 +212,7 @@ class ContractPrivateWsManager:
             if not sockets:
                 self._connections.pop(user_id, None)
                 self._account_signatures.pop(user_id, None)
+                self._position_signatures.pop(user_id, None)
                 refresh_task = self._account_refresh_tasks.pop(user_id, None)
         if refresh_task is not None and refresh_task is not asyncio.current_task():
             refresh_task.cancel()
@@ -204,20 +228,40 @@ class ContractPrivateWsManager:
     async def _refresh_account_if_changed(self, user_id: int) -> bool:
         if not await self.has_user_connections(user_id):
             return False
-        account = await asyncio.to_thread(_load_account_payload, user_id)
-        signature = _account_signature(account)
+        snapshot = await asyncio.to_thread(_load_mark_to_market_payload, user_id)
+        account = snapshot["account"]
+        position_payload = {
+            "positions": snapshot["positions"],
+            "position_summaries": snapshot["position_summaries"],
+            "mark_only": True,
+        }
+        account_signature = _account_signature(account)
+        position_signature = _position_signature(position_payload)
         async with self._lock:
             if not self._connections.get(user_id):
                 return False
-            if self._account_signatures.get(user_id) == signature:
-                return False
-            self._account_signatures[user_id] = signature
-        payload = {"account": account}
-        await self._send_to_user(
-            user_id,
-            self._message("contract_user_account_update", payload, user_id=user_id),
-        )
-        return True
+            account_changed = self._account_signatures.get(user_id) != account_signature
+            positions_changed = self._position_signatures.get(user_id) != position_signature
+            if account_changed:
+                self._account_signatures[user_id] = account_signature
+            if positions_changed:
+                self._position_signatures[user_id] = position_signature
+        if account_changed:
+            payload = {"account": account}
+            await self._send_to_user(
+                user_id,
+                self._message("contract_user_account_update", payload, user_id=user_id),
+            )
+        if positions_changed:
+            await self._send_to_user(
+                user_id,
+                self._message(
+                    "contract_user_position_mark_update",
+                    position_payload,
+                    user_id=user_id,
+                ),
+            )
+        return account_changed or positions_changed
 
     async def _account_refresh_loop(self, user_id: int) -> None:
         current_task = asyncio.current_task()
@@ -230,7 +274,7 @@ class ContractPrivateWsManager:
                     await self._refresh_account_if_changed(user_id)
                 except Exception:
                     logger.warning(
-                        "contract_private_ws_account_refresh_failed user_id=%s",
+                        "contract_private_ws_mark_to_market_refresh_failed user_id=%s",
                         user_id,
                         exc_info=True,
                     )
@@ -330,17 +374,18 @@ class ContractPrivateWsManager:
         symbol: str,
         position_id: int | None = None,
     ) -> dict[str, Any]:
-        positions = get_user_contract_positions(
-            db,
-            user_id=user_id,
-            symbol=symbol,
-            status="ALL",
-        ).model_dump().get("items") or []
-        summaries = get_user_contract_position_summaries(
-            db,
-            user_id=user_id,
-            symbol=symbol,
-        ).model_dump().get("items") or []
+        with contract_position_mark_evidence_scope():
+            positions = get_user_contract_positions(
+                db,
+                user_id=user_id,
+                symbol=symbol,
+                status="ALL",
+            ).model_dump().get("items") or []
+            summaries = get_user_contract_position_summaries(
+                db,
+                user_id=user_id,
+                symbol=symbol,
+            ).model_dump().get("items") or []
         payload = {
             "position": _first(positions, position_id),
             "positions": positions,
