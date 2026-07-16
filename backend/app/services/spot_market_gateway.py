@@ -52,6 +52,12 @@ from app.services.spot_kline_events import (
     ProviderKlineRevisionAccepted,
     provider_kline_revision_signature,
 )
+from app.services.spot_candle_preview import (
+    SUPPORTED_SPOT_CANDLE_PREVIEW_INTERVALS,
+    SUPPORTED_SPOT_CANDLE_PREVIEW_SYMBOLS,
+    SpotCandlePreviewEngine,
+    SpotPreviewTradeStatus,
+)
 from app.services.spot_depth_domain_snapshot import map_depth_domain_snapshot
 from app.services.spot_kline_domain_snapshot import (
     KlineDomainSnapshot,
@@ -107,6 +113,7 @@ class SpotMarketGateway:
         provider_symbol_allowed: Optional[Callable[[str], bool]] = None,
         precision_resolver: Optional[Callable[[str], tuple[int, int]]] = None,
         ws_manager: Any = None,
+        candle_preview_engine: Optional[SpotCandlePreviewEngine] = None,
         kline_release_grace_seconds: float = _KLINE_INTERVAL_RELEASE_GRACE_SECONDS,
     ) -> None:
         self._ensure_depth = ensure_depth or ensure_spot_provider_ws_depth
@@ -135,6 +142,13 @@ class SpotMarketGateway:
         self._provider_symbol_allowed_is_default = provider_symbol_allowed is None
         self._precision_resolver = precision_resolver or self._default_precision_resolver
         self._ws_manager = ws_manager
+        self._candle_preview_engine = candle_preview_engine or SpotCandlePreviewEngine()
+        self._candle_preview_reject_counts: dict[str, int] = {
+            SpotPreviewTradeStatus.NO_BASELINE.value: 0,
+            SpotPreviewTradeStatus.GENERATION_MISMATCH.value: 0,
+            SpotPreviewTradeStatus.OPEN_TIME_MISMATCH.value: 0,
+        }
+        self._candle_preview_reject_counts_by_symbol: dict[str, dict[str, int]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_lock = asyncio.Lock()
@@ -288,6 +302,11 @@ class SpotMarketGateway:
                 "last_duration_ms": self._provider_switch_last_duration_ms,
                 "last_at": self._provider_switch_last_at,
             }
+            candle_preview_reject_counts = dict(self._candle_preview_reject_counts)
+            candle_preview_reject_counts_by_symbol = {
+                symbol: dict(counts)
+                for symbol, counts in self._candle_preview_reject_counts_by_symbol.items()
+            }
 
         subscriber_counts = {}
         for symbol in active_symbols:
@@ -332,6 +351,10 @@ class SpotMarketGateway:
                 "last_broadcast_at": last_broadcast_time,
             },
             "provider_switch": provider_switch,
+            "candle_preview": {
+                "reject_counts": candle_preview_reject_counts,
+                "reject_counts_by_symbol": candle_preview_reject_counts_by_symbol,
+            },
             "latency": {
                 "cache_to_gateway_ms": None,
                 "available": False,
@@ -696,6 +719,7 @@ class SpotMarketGateway:
             klines,
             kline,
             provider_code=provider,
+            provider_generation=event.generation,
         )
         if emitted:
             return False
@@ -983,6 +1007,24 @@ class SpotMarketGateway:
                             ),
                             time_origin=getattr(trade, "time_origin", None),
                             created_at=getattr(trade, "created_at", None),
+                        )
+                        await self._accept_and_broadcast_candle_preview_trade(
+                            symbol=symbol,
+                            provider=_first_not_none(
+                                getattr(trade, "provider", None),
+                                getattr(trades, "provider", None),
+                            ),
+                            provider_trade_id=provider_trade_id,
+                            price=getattr(trade, "price", None),
+                            amount=getattr(trade, "amount", None),
+                            event_time_ms=_first_not_none(
+                                getattr(trade, "event_time_ms", None),
+                                trade_ts,
+                            ),
+                            received_at_ms=_first_not_none(
+                                getattr(trade, "received_at_ms", None),
+                                getattr(trades, "received_at_ms", None),
+                            ),
                         )
                         self._remember_broadcast_metric(symbol, "trades")
                     except Exception:
@@ -1817,6 +1859,150 @@ class SpotMarketGateway:
             )
         return self._get_klines(symbol, interval, limit=limit)
 
+    def _read_kline_generation_for_preview(
+        self,
+        symbol: str,
+        interval: str,
+        provider_code: str,
+    ) -> int:
+        try:
+            if self._get_kline_generation_accepts_provider:
+                generation = self._get_kline_generation(
+                    symbol,
+                    interval,
+                    provider=provider_code,
+                )
+            else:
+                generation = self._get_kline_generation(symbol, interval)
+        except Exception:
+            logger.warning(
+                "spot_candle_preview_generation_read_failed provider=%s symbol=%s interval=%s",
+                provider_code,
+                symbol,
+                interval,
+                exc_info=True,
+            )
+            return 0
+        return int(generation or 0)
+
+    def _remember_candle_preview_reject(
+        self,
+        symbol: str,
+        status: SpotPreviewTradeStatus,
+    ) -> None:
+        reason = status.value
+        self._candle_preview_reject_counts[reason] = int(
+            self._candle_preview_reject_counts.get(reason) or 0
+        ) + 1
+        symbol_counts = self._candle_preview_reject_counts_by_symbol.setdefault(symbol, {})
+        symbol_counts[reason] = int(symbol_counts.get(reason) or 0) + 1
+
+    def _accept_candle_preview_native(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        provider: str,
+        kline: Mapping[str, Any],
+        generation: int,
+    ) -> None:
+        if (
+            symbol not in SUPPORTED_SPOT_CANDLE_PREVIEW_SYMBOLS
+            or interval not in SUPPORTED_SPOT_CANDLE_PREVIEW_INTERVALS
+            or generation <= 0
+        ):
+            return
+        closed_value = kline.get("is_closed")
+        is_closed = (
+            closed_value is True
+            or closed_value == 1
+            or str(closed_value or "").strip().lower() in {"1", "true", "closed"}
+        )
+        try:
+            self._candle_preview_engine.accept_native_revision(
+                {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "provider": provider,
+                    "open_time": kline.get("open_time"),
+                    "open": kline.get("open"),
+                    "high": kline.get("high"),
+                    "low": kline.get("low"),
+                    "close": kline.get("close"),
+                    "volume": kline.get("volume"),
+                    "quote_volume": kline.get("quote_volume"),
+                    "revision_epoch": kline.get("revision_epoch"),
+                    "revision_seq": kline.get("revision_seq"),
+                    "generation": generation,
+                    "is_closed": is_closed,
+                }
+            )
+        except Exception:
+            logger.warning(
+                "spot_candle_preview_native_rejected provider=%s symbol=%s interval=%s",
+                provider,
+                symbol,
+                interval,
+                exc_info=True,
+            )
+
+    async def _accept_and_broadcast_candle_preview_trade(
+        self,
+        *,
+        symbol: str,
+        provider: Any,
+        provider_trade_id: Any,
+        price: Any,
+        amount: Any,
+        event_time_ms: Any,
+        received_at_ms: Any,
+    ) -> None:
+        interval = "1m"
+        normalized_provider = str(provider or "").strip().upper()
+        if (
+            symbol not in SUPPORTED_SPOT_CANDLE_PREVIEW_SYMBOLS
+            or interval not in SUPPORTED_SPOT_CANDLE_PREVIEW_INTERVALS
+            or not normalized_provider
+        ):
+            return
+        generation = self._read_kline_generation_for_preview(
+            symbol,
+            interval,
+            normalized_provider,
+        )
+        if generation <= 0:
+            return
+        try:
+            result = self._candle_preview_engine.accept_trade(
+                {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "provider": normalized_provider,
+                    "provider_trade_id": provider_trade_id,
+                    "price": price,
+                    "size": amount,
+                    "event_time_ms": event_time_ms,
+                    "generation": generation,
+                }
+            )
+            if result.status is not SpotPreviewTradeStatus.APPLIED or result.preview is None:
+                self._remember_candle_preview_reject(symbol, result.status)
+                return
+            await self._market_ws_manager().broadcast_spot_candle_preview_update(
+                symbol,
+                interval,
+                result.preview,
+                received_at_ms=received_at_ms,
+            )
+        except Exception:
+            logger.warning(
+                "spot_candle_preview_trade_rejected provider=%s symbol=%s interval=%s",
+                normalized_provider,
+                symbol,
+                interval,
+                exc_info=True,
+            )
+
     async def _poll_provider_kline_interval(
         self,
         symbol: str,
@@ -1849,6 +2035,7 @@ class SpotMarketGateway:
         kline: Optional[dict[str, Any]],
         *,
         provider_code: str,
+        provider_generation: Optional[int] = None,
     ) -> bool:
         try:
             kline_snapshot = self._record_kline_domain_snapshot(
@@ -1882,6 +2069,21 @@ class SpotMarketGateway:
             snapshot=kline_snapshot,
         ):
             return False
+        provider = str((klines or {}).get("provider") or provider_code).strip().upper()
+        generation = int(provider_generation or 0)
+        if generation <= 0:
+            generation = self._read_kline_generation_for_preview(
+                symbol,
+                interval,
+                provider,
+            )
+        self._accept_candle_preview_native(
+            symbol=symbol,
+            interval=interval,
+            provider=provider,
+            kline=kline,
+            generation=generation,
+        )
         try:
             await self._market_ws_manager().broadcast_provider_kline_update(
                 symbol,
@@ -1893,6 +2095,7 @@ class SpotMarketGateway:
                 revision_seq=kline.get("revision_seq"),
                 is_closed=kline.get("is_closed"),
                 close_state_source=kline.get("close_state_source"),
+                provider_generation=generation or None,
             )
             self._remember_broadcast_metric(symbol, "kline")
         except Exception:

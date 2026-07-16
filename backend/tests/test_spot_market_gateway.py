@@ -11,6 +11,7 @@ from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesRespon
 from app.services import market
 from app.services import market_kline_cache
 from app.services import spot_market_gateway as gateway_module
+from app.services.spot_candle_preview import SpotPreviewTradeStatus
 from app.services.spot_market_gateway import SpotMarketGateway
 from app.services.spot_kline_events import ProviderKlineRevisionAccepted
 
@@ -3635,6 +3636,51 @@ def test_gateway_metrics_snapshot_summarizes_symbols_intervals_subscribers_and_b
         assert snapshot["broadcast"]["per_domain_count"]["ticker"] == 1
         assert snapshot["latency"]["available"] is False
         assert snapshot["latency"]["cache_to_gateway_ms"] is None
+
+    asyncio.run(run())
+
+
+def test_gateway_metrics_count_required_preview_reject_reasons_by_symbol() -> None:
+    class RejectingPreviewEngine:
+        def __init__(self) -> None:
+            self.statuses = iter(
+                (
+                    SpotPreviewTradeStatus.NO_BASELINE,
+                    SpotPreviewTradeStatus.GENERATION_MISMATCH,
+                    SpotPreviewTradeStatus.OPEN_TIME_MISMATCH,
+                )
+            )
+
+        def accept_trade(self, payload):
+            status = next(self.statuses)
+            return type("PreviewResult", (), {"status": status, "preview": None})()
+
+    async def run() -> None:
+        gateway = _new_test_gateway()
+        gateway._candle_preview_engine = RejectingPreviewEngine()
+        gateway._get_kline_generation = lambda symbol, interval, **kwargs: 7
+
+        for trade_id in ("trade-1", "trade-2", "trade-3"):
+            await gateway._accept_and_broadcast_candle_preview_trade(
+                symbol="BTCUSDT",
+                provider="OKX_SPOT",
+                provider_trade_id=trade_id,
+                price="100",
+                amount="1",
+                event_time_ms=1_695_709_800_000,
+                received_at_ms=1_695_709_800_001,
+            )
+
+        snapshot = await gateway.get_metrics_snapshot()
+        expected = {
+            "NO_BASELINE": 1,
+            "GENERATION_MISMATCH": 1,
+            "OPEN_TIME_MISMATCH": 1,
+        }
+        assert snapshot["candle_preview"]["reject_counts"] == expected
+        assert snapshot["candle_preview"]["reject_counts_by_symbol"] == {
+            "BTCUSDT": expected
+        }
 
     asyncio.run(run())
 

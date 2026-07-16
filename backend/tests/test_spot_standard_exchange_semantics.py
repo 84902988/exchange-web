@@ -629,11 +629,14 @@ def test_spot_ws_client_mailboxes_are_independent_ordered_and_cleaned_on_disconn
             "slow_disconnect_count": 0,
             "depth_coalesced_count": 0,
             "ticker_coalesced_count": 0,
-            "kline_revision_replace_count": 0,
-            "kline_stale_replace_reject_count": 0,
+                "kline_revision_replace_count": 0,
+                "kline_stale_replace_reject_count": 0,
+                "preview_replace_count": 0,
+                "preview_stale_replace_reject_count": 0,
             "pending_depth_slot": 0,
             "pending_ticker_slot": 0,
-            "pending_kline_count": 0,
+                "pending_kline_count": 0,
+                "pending_preview_count": 0,
             "trade_queue_depth": 2,
             "trade_queue_high_watermark": 2,
             "trade_backlog_warning_count": 0,
@@ -732,6 +735,7 @@ def test_spot_ws_client_domain_mailbox_routes_domains_and_preserves_global_order
             "depth": 1,
             "ticker": 1,
             "kline": 1,
+            "preview": 0,
         }
         assert mailbox.depth_slot is not None
         assert mailbox.depth_slot.event_type == "spot_depth_update"
@@ -760,6 +764,7 @@ def test_spot_ws_client_domain_mailbox_routes_domains_and_preserves_global_order
             "depth": 0,
             "ticker": 0,
             "kline": 0,
+            "preview": 0,
         }
 
     asyncio.run(run())
@@ -1232,6 +1237,7 @@ def test_spot_ws_disconnect_clears_pending_coalesced_state() -> None:
             "depth": 1,
             "ticker": 1,
             "kline": 1,
+            "preview": 0,
         }
 
         await manager.disconnect("BTCUSDT", websocket)
