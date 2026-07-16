@@ -53,6 +53,7 @@ const EMPTY_MARKET_DATA: SpotHeaderMarketData = {
   turnover: '--',
 };
 const DEFAULT_SPOT_SYMBOL = 'BTCUSDT';
+const DEFAULT_SPOT_INTERVAL = '1m';
 const SPOT_PAIR_PAGE_SIZE = 6;
 const SPOT_PAIR_PAGE_CACHE_TTL_MS = 60_000;
 const SPOT_PAIR_TICKER_BATCH_TTL_MS = 30_000;
@@ -603,9 +604,9 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const originalDocumentTitleRef = useRef<string | null>(null);
   const titleUpdateTimerRef = useRef<number | null>(null);
   const titleUpdatedAtRef = useRef(0);
-  const [interval, setIntervalValue] = useState('1d');
-  const [committedInterval, setCommittedInterval] = useState('1d');
-  const activeIntervalRef = useRef('1d');
+  const [interval, setIntervalValue] = useState(DEFAULT_SPOT_INTERVAL);
+  const [committedInterval, setCommittedInterval] = useState(DEFAULT_SPOT_INTERVAL);
+  const activeIntervalRef = useRef(DEFAULT_SPOT_INTERVAL);
   const intervalChangeTimerRef = useRef<number | null>(null);
   const intervalChangeSeqRef = useRef(0);
   const chartIntervalSwitchStartedAtRef = useRef(0);

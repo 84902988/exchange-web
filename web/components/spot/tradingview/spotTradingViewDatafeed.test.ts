@@ -1587,7 +1587,11 @@ test('failed gap recovery records one target failure and does not retry every re
   }
   const historyCalls: HistoryCall[] = []
   const emittedBars: Array<Record<string, unknown>> = []
-  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
+  const syncEvidence: Array<Record<string, unknown>> = []
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({
+    symbol: 'BTCUSDT',
+    onRealtimeSyncEvidence: (event: Record<string, unknown>) => syncEvidence.push(event),
+  })
   datafeed.getBars(
     symbolInfo(),
     '1',
@@ -1626,6 +1630,8 @@ test('failed gap recovery records one target failure and does not retry every re
 
   assert.equal(requestCount, 2, 'same failed target must not retry indefinitely')
   assert.deepEqual(emittedBars, [])
+  assert.equal(syncEvidence.length, 2, 'accepted native evidence must not depend on gap recovery')
+  assert.deepEqual(syncEvidence.map((event) => event.barTime), [targetTime, targetTime])
   datafeed.destroy()
 })
 

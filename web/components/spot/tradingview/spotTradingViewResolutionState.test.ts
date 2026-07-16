@@ -62,6 +62,7 @@ const runtimeCoordinatorModule = loadTypeScriptModule(
   },
 )
 const {
+  getCurrentSpotResolutionChart,
   requestSpotSetResolution,
   scheduleSpotSubscriberReadinessGrace,
   setSpotToolbarLoadingState,
@@ -250,6 +251,48 @@ test('same resolution and unavailable chart do not require a resolution loading 
     observedResolution: '1D',
     nextResolution: '1M',
   }), true)
+})
+
+test('resolution chart lookup skips missing unready and stale widgets', () => {
+  let activeChartCalls = 0
+  const chart = { resolution: () => '1' }
+  const widget = {
+    activeChart: () => {
+      activeChartCalls += 1
+      return chart
+    },
+  }
+
+  assert.equal(getCurrentSpotResolutionChart({
+    widget: undefined,
+    chartReady: true,
+    isCurrent: () => true,
+  }), null)
+  assert.equal(getCurrentSpotResolutionChart({
+    widget,
+    chartReady: false,
+    isCurrent: () => true,
+  }), null)
+  assert.equal(getCurrentSpotResolutionChart({
+    widget,
+    chartReady: true,
+    isCurrent: () => false,
+  }), null)
+  assert.equal(activeChartCalls, 0)
+})
+
+test('resolution chart lookup contains destroyed widget access and preserves the active path', () => {
+  const chart = { resolution: () => '5' }
+  assert.equal(getCurrentSpotResolutionChart({
+    widget: { activeChart: () => { throw new Error('destroyed widget') } },
+    chartReady: true,
+    isCurrent: () => true,
+  }), null)
+  assert.equal(getCurrentSpotResolutionChart({
+    widget: { activeChart: () => chart },
+    chartReady: true,
+    isCurrent: () => true,
+  }), chart)
 })
 
 test('loading token records widget generation sequence intent and start time', () => {
@@ -957,4 +1000,11 @@ test('Spot chart uses Runtime Coordinator as its only lifecycle commit authority
   assert.doesNotMatch(chartSource, /committedResolutionRef/)
   assert.match(chartSource, /'SYMBOL_SWITCH'/)
   assert.match(chartSource, /'WIDGET_DESTROY'/)
+  assert.doesNotMatch(chartSource, /\bwidget(?:Ref\.current)?\.activeChart\?\.\(\)/)
+  assert.match(chartSource, /getCurrentSpotResolutionChart<TradingViewChartApi>/)
+  assert.match(chartSource, /applyWidgetResolution\(widgetInterval, widgetGeneration\)/)
+  assert.ok(
+    chartSource.indexOf('widgetRef.current = null;')
+      < chartSource.indexOf('widgetToRemove?.remove();'),
+  )
 })

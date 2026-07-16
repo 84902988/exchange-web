@@ -56,6 +56,10 @@ type SpotResolutionChart = {
   resolution?: () => string;
 };
 
+type SpotResolutionWidget<TChart> = {
+  activeChart?: () => TChart;
+};
+
 type SpotResolutionRequestOptions = {
   chart: SpotResolutionChart | null | undefined;
   resolution: string;
@@ -92,6 +96,23 @@ export function shouldStartSpotChartResolutionChange(params: {
     && params.nextResolution
     && params.observedResolution !== params.nextResolution
   );
+}
+
+export function getCurrentSpotResolutionChart<TChart>({
+  widget,
+  chartReady,
+  isCurrent,
+}: {
+  widget: SpotResolutionWidget<TChart> | null | undefined;
+  chartReady: boolean;
+  isCurrent: () => boolean;
+}): TChart | null {
+  if (!widget || !chartReady || !isCurrent()) return null;
+  try {
+    return widget.activeChart?.() ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export function shouldRequestSpotChartSubscriberRearm(params: {
