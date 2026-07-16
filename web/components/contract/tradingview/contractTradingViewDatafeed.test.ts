@@ -247,7 +247,14 @@ async function establishHistoryBaseline(
   resolution = '1',
 ) {
   const previousRequestKlines = requestKlines;
-  requestKlines = async () => metadata([row(TEST_HISTORY_BASELINE_TIME, '1')]);
+  const baselineTime = resolution === '1M'
+    ? Date.parse('2020-09-01T00:00:00.000Z')
+    : resolution === '1W'
+      ? Date.parse('2020-09-14T00:00:00.000Z')
+      : resolution === '1D'
+        ? Date.parse('2020-09-14T00:00:00.000Z')
+        : TEST_HISTORY_BASELINE_TIME;
+  requestKlines = async () => metadata([row(baselineTime, '1')]);
   try {
     await datafeed.getBars(
       symbolInfo(symbol),
@@ -264,6 +271,41 @@ const pageEndingAt = (endTime: number, count: number, close: string, stepMs = 60
   Array.from({ length: count }, (_, index) => (
     row(endTime - ((count - index - 1) * stepMs), close)
   ))
+);
+
+const previousUtcBoundary = (time: number, interval: '1d' | '1w' | '1M') => {
+  if (interval === '1M') {
+    const instant = new Date(time);
+    return Date.UTC(instant.getUTCFullYear(), instant.getUTCMonth() - 1, 1);
+  }
+  return time - (interval === '1w' ? 7 : 1) * 86_400_000;
+};
+
+const utcBoundaryPageEndingAt = (
+  interval: '1d' | '1w' | '1M',
+  endTime: number,
+  count: number,
+  close: string,
+) => {
+  const rows = [];
+  let cursor = endTime;
+  for (let index = 0; index < count; index += 1) {
+    rows.push(row(cursor, close));
+    cursor = previousUtcBoundary(cursor, interval);
+  }
+  return rows.reverse();
+};
+
+const utcBoundaryPageBefore = (
+  interval: '1d' | '1w' | '1M',
+  endExclusive: number,
+  count: number,
+  close: string,
+) => utcBoundaryPageEndingAt(
+  interval,
+  previousUtcBoundary(endExclusive, interval),
+  count,
+  close,
 );
 
 const realtimeCandle = (symbol: string, interval: string, openTime: number, close: string) => ({
@@ -442,6 +484,86 @@ test('provider realtime candles are accepted while quote-derived sources are rej
     null,
   );
   assert.ok(restToBar(basePayload), 'source-less provider REST rows remain compatible');
+});
+
+
+test('DWM UTC boundary validator preserves valid provider times and rejects invalid times', () => {
+  const validTimes = [
+    ['1d', Date.parse('2026-07-01T00:00:00.000Z')],
+    ['1w', Date.parse('2026-07-06T00:00:00.000Z')],
+    ['1M', Date.parse('2026-08-01T00:00:00.000Z')],
+  ] as const;
+
+  for (const [interval, time] of validTimes) {
+    const valid = datafeedModule.klineToBar(row(time, '101'), interval);
+    const invalid = datafeedModule.klineToBar(row(time + 60_000, '101'), interval);
+    assert.equal(valid?.time, time, interval);
+    assert.equal(invalid, null, interval);
+  }
+  assert.equal(
+    datafeedModule.klineToBar(row(Date.parse('2026-07-07T00:00:00.000Z'), '101'), '1w'),
+    null,
+  );
+  assert.equal(
+    datafeedModule.klineToBar(row(Date.parse('2026-08-03T00:00:00.000Z'), '101'), '1M'),
+    null,
+  );
+});
+
+
+test('DWM history and realtime conversion resolve the same UTC bucket', () => {
+  const openTime = Date.parse('2026-07-06T00:00:00.000Z');
+  const payload = { ...row(openTime, '101'), source: 'LIVE_WS' };
+  const history = datafeedModule.klineToBar(payload, '1w');
+  const realtime = datafeedModule.realtimeMessageToBar({
+    type: 'contract_kline_update',
+    domain: 'kline',
+    symbol: 'BTCUSDT_PERP',
+    interval: '1w',
+    kline: payload,
+  }, 'BTCUSDT_PERP', '1w');
+  const invalidRealtime = datafeedModule.realtimeMessageToBar({
+    type: 'contract_kline_update',
+    domain: 'kline',
+    symbol: 'BTCUSDT_PERP',
+    interval: '1w',
+    kline: { ...payload, open_time: openTime + 60_000 },
+  }, 'BTCUSDT_PERP', '1w');
+
+  assert.equal(history?.time, openTime);
+  assert.equal(realtime?.time, openTime);
+  assert.equal(invalidRealtime, null);
+});
+
+
+test('duplicate DWM history rows collapse to one TradingView bucket', async () => {
+  const previousRequestKlines = requestKlines;
+  const openTime = Date.parse('2026-07-01T00:00:00.000Z');
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'BTCUSDT_PERP',
+  });
+  requestKlines = async () => metadata([
+    row(openTime, '100'),
+    row(openTime, '101'),
+  ]);
+
+  try {
+    const historyCalls: HistoryCall[] = [];
+    await datafeed.getBars(
+      symbolInfo('BTCUSDT_PERP'),
+      '1D',
+      { ...period, countBack: 1 },
+      (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+      assert.fail,
+    );
+
+    assert.equal(historyCalls.length, 1);
+    assert.equal(historyCalls[0].bars.length, 1);
+    assert.equal(historyCalls[0].bars[0].time, openTime);
+  } finally {
+    requestKlines = previousRequestKlines;
+    datafeed.destroy();
+  }
 });
 
 
@@ -924,14 +1046,20 @@ test('active datafeed history preempts preload and owns the current cache revisi
   );
   await waitFor(() => requests.length === 2, 'active request must not wait for preload');
 
-  const activeRows = Array.from({ length: 60 }, (_, index) => (
-    row(1_717_000_000_000 + index * 60_000, '500')
-  ));
+  const activeRows = utcBoundaryPageEndingAt(
+    '1M',
+    Date.parse('2026-07-01T00:00:00.000Z'),
+    60,
+    '500',
+  );
   activeSource.resolve(metadata(activeRows));
   await activeHistory;
-  preloadSource.resolve(metadata(Array.from({ length: 60 }, (_, index) => (
-    row(1_716_000_000_000 + index * 60_000, '100')
-  ))));
+  preloadSource.resolve(metadata(utcBoundaryPageEndingAt(
+    '1M',
+    Date.parse('2026-07-01T00:00:00.000Z'),
+    60,
+    '100',
+  )));
   await flushPromises();
 
   assert.equal(historyCalls.length, 1);
@@ -2164,12 +2292,15 @@ test('1W and 1M current countBack 300 complete through one continuation page', a
   for (const item of cases) {
     currentCacheModule.contractKlineCurrentCache.clear();
     const calls: KlineRequest[] = [];
-    const newestExclusive = 1_900_000_000_000;
+    const newestExclusive = item.interval === '1M'
+      ? Date.parse('2031-08-01T00:00:00.000Z')
+      : Date.parse('2026-07-20T00:00:00.000Z');
     requestKlines = async (params) => {
       calls.push(params);
       const endExclusive = params.endTimeMs ?? newestExclusive;
-      return metadata(pageEndingAt(
-        endExclusive - 60_000,
+      return metadata(utcBoundaryPageBefore(
+        item.interval as '1w' | '1M',
+        endExclusive,
         params.limit || 1,
         String(300 - calls.length),
       ));
@@ -2611,8 +2742,8 @@ test('terminal metadata persists within one generation and remains isolated by d
 
 test('monthly settled coverage bounds fifty repeated getBars calls and settles every callback once', async () => {
   const apiCalls: KlineRequest[] = [];
-  const currentEnd = 1_717_500_000_000;
-  const currentBars = pageEndingAt(currentEnd, 40, '140');
+  const currentEnd = Date.parse('2026-07-01T00:00:00.000Z');
+  const currentBars = utcBoundaryPageEndingAt('1M', currentEnd, 40, '140');
   const nextEndTimeMs = currentBars[0].open_time;
   requestKlines = async (params) => {
     apiCalls.push(params);
@@ -2659,9 +2790,14 @@ test('monthly settled coverage bounds fifty repeated getBars calls and settles e
 
 test('partial monthly coverage upgrades from nextEndTime instead of requesting CURRENT again', async () => {
   const apiCalls: KlineRequest[] = [];
-  const currentBars = pageEndingAt(1_718_000_000_000, 40, '180');
+  const currentBars = utcBoundaryPageEndingAt(
+    '1M',
+    Date.parse('2026-07-01T00:00:00.000Z'),
+    40,
+    '180',
+  );
   const nextEndTimeMs = currentBars[0].open_time;
-  const olderBars = pageEndingAt(nextEndTimeMs - 60_000, 20, '160');
+  const olderBars = utcBoundaryPageBefore('1M', nextEndTimeMs, 20, '160');
   requestKlines = async (params) => {
     apiCalls.push(params);
     if (apiCalls.length === 1) return metadata(currentBars);
@@ -2703,7 +2839,12 @@ test('partial monthly coverage upgrades from nextEndTime instead of requesting C
 
 test('terminal monthly boundary answers older requests with noData and zero additional HTTP', async () => {
   const apiCalls: KlineRequest[] = [];
-  const currentBars = pageEndingAt(1_718_500_000_000, 40, '185');
+  const currentBars = utcBoundaryPageEndingAt(
+    '1M',
+    Date.parse('2026-07-01T00:00:00.000Z'),
+    40,
+    '185',
+  );
   const terminalBoundary = currentBars[0].open_time;
   requestKlines = async (params) => {
     apiCalls.push(params);
@@ -2760,7 +2901,12 @@ test('settled coverage remains isolated across sequential 5m to 1M to 5m generat
       return metadata(pageEndingAt(1_719_000_000_000, 75, '105'));
     }
     if (apiCalls.length === 2) {
-      return metadata(pageEndingAt(1_719_100_000_000, 60, '1000'));
+      return metadata(utcBoundaryPageEndingAt(
+        '1M',
+        Date.parse('2026-07-01T00:00:00.000Z'),
+        60,
+        '1000',
+      ));
     }
     if (apiCalls.length === 3) {
       return metadata(pageEndingAt(1_719_200_000_000, 75, '155'));
@@ -3543,6 +3689,7 @@ test('BTC to ETH does not reset an unrelated symbol baseline', async () => {
 test('high-water marks isolate symbol and interval while preserving 1M case', async () => {
   const highTime = Date.parse('2026-07-10T08:02:00.000Z');
   const lowerTime = highTime - 60_000;
+  const monthlyTime = Date.parse('2026-07-01T00:00:00.000Z');
   requestKlines = async () => metadata([row(highTime, '300')]);
   const seeded = datafeedModule.createContractTradingViewDatafeed({ symbol: 'ISOLATION_A_PERP' });
   await seeded.getBars(
@@ -3581,11 +3728,11 @@ test('high-water marks isolate symbol and interval while preserving 1M case', as
 
   emitRealtime(realtimeCandle('ISOLATION_B_PERP', '1m', lowerTime, '301'));
   emitRealtime(realtimeCandle('ISOLATION_A_PERP', '5m', lowerTime, '302'));
-  emitRealtime(realtimeCandle('ISOLATION_A_PERP', '1M', lowerTime, '303'));
+  emitRealtime(realtimeCandle('ISOLATION_A_PERP', '1M', monthlyTime, '303'));
 
   assert.deepEqual(otherSymbolBars.map((bar) => bar.time), [lowerTime]);
   assert.deepEqual(fiveMinuteBars.map((bar) => bar.time), [lowerTime]);
-  assert.deepEqual(monthlyBars.map((bar) => bar.time), [lowerTime]);
+  assert.deepEqual(monthlyBars.map((bar) => bar.time), [monthlyTime]);
   otherSymbol.destroy();
   seeded.destroy();
 });
@@ -4168,7 +4315,12 @@ test('subscriber ownership remains isolated across symbols and intervals', async
     'eth-five-minute-subscriber',
   );
 
-  emitRealtime(realtimeCandle('BTC_OWNER_PERP', '1M', 1_717_000_000_000, '201'));
+  emitRealtime(realtimeCandle(
+    'BTC_OWNER_PERP',
+    '1M',
+    Date.parse('2026-07-01T00:00:00.000Z'),
+    '201',
+  ));
   emitRealtime(realtimeCandle('ETH_OWNER_PERP', '5m', 1_717_000_300_000, '301'));
 
   assert.deepEqual(btcBars.map((bar) => bar.close), [201]);

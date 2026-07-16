@@ -1655,7 +1655,7 @@ def _get_klines_cache_first(
         )
         contract_monthly_boundary_without_anchor = bool(
             str(market_type or "").strip().upper() == "CONTRACT"
-            and normalized_interval == "1M"
+            and normalized_interval in {"1M", "1Mutc"}
             and earliest_available_time is None
         )
         if end_time_ms is not None and (
