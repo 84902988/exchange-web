@@ -37,12 +37,15 @@ test('contract market panels keep click-to-fill states without duplicating the s
 test('contract execution prices remain direction-specific and never use display price', () => {
   const source = readSource('components/contract/ContractTradingForm.tsx');
 
-  expect(source).toContain('const resolvedExecutionBid = marketViewAuthority.executionBid ?? 0;');
-  expect(source).toContain('const resolvedExecutionAsk = marketViewAuthority.executionAsk ?? 0;');
-  expect(source).toContain("closeSide === 'LONG' ? resolvedExecutionBid : resolvedExecutionAsk");
-  expect(source).toContain("positionSide === 'LONG' ? resolvedExecutionAsk : resolvedExecutionBid");
-  expect(source).not.toMatch(/currentActionExecutionPrice[^;]*display_price/);
-  expect(source).not.toMatch(/currentActionExecutionPrice[^;]*localChartLastClose/);
+  expect(source).toContain('resolveContractExecutionPrice({');
+  expect(source).toContain("intent: 'OPEN_LONG'");
+  expect(source).toContain("intent: 'OPEN_SHORT'");
+  expect(source).toContain("intent: 'CLOSE_LONG'");
+  expect(source).toContain("intent: 'CLOSE_SHORT'");
+  expect(source).toContain("closeSide === 'LONG' ? executionPrices.closeLong : executionPrices.closeShort");
+  expect(source).toContain("positionSide === 'LONG' ? executionPrices.openLong : executionPrices.openShort");
+  expect(source).not.toMatch(/currentActionExecution[^;]*display_price/);
+  expect(source).not.toMatch(/currentActionExecution[^;]*localChartLastClose/);
 });
 
 test('contract market view rejects stale symbol data for market, depth, trades, and errors', () => {
@@ -55,6 +58,25 @@ test('contract market view rejects stale symbol data for market, depth, trades, 
   expect(source).toContain('marketViewErrorSymbolRef.current === normalizeContractSymbol(contractSymbol)');
   expect(source).toContain('requestSeqRef.current !== requestSeq');
   expect(source).toContain('marketViewAbortControllerRef.current?.abort()');
+});
+
+test('Contract Price Authority keeps trade provenance on one evidence row', () => {
+  const source = readSource('components/contract/hooks/useContractMarketView.ts');
+  const authoritySection = source.slice(
+    source.indexOf('const priceAuthority = useMemo'),
+    source.indexOf('const referencePrice = useMemo'),
+  );
+
+  expect(authoritySection).toContain('price: latestTrade.price');
+  expect(authoritySection).toContain('time: latestTrade.time ?? latestTrade.ts');
+  expect(authoritySection).toContain('source: latestTrade.source ?? latestTrade.quote_source');
+  expect(authoritySection).toContain('freshness: latestTrade.quote_freshness');
+  expect(authoritySection).toContain('priceSource: latestTrade.price_source');
+  expect(authoritySection).toContain('synthetic: latestTrade.synthetic');
+  expect(authoritySection).not.toContain('tradesState.source');
+  expect(authoritySection).not.toContain('tradesState.freshness');
+  expect(authoritySection).not.toContain('display_price');
+  expect(authoritySection).not.toContain('mark_price');
 });
 
 test('contract ticker polling is suspended while the page is hidden', () => {
@@ -82,6 +104,38 @@ test('contract header receives authoritative MarketView status and does not synt
   expect(hookSource).toContain(': quoteTime,');
   expect(hookSource).toContain('const displayPrice = marketViewAuthority.displayPrice;');
   expect(hookSource).not.toContain('chartLastClose');
+});
+
+test('contract TradingView overlay consumes Price Authority without changing the Kline datafeed path', () => {
+  const pageSource = readSource('app/contract/page.tsx');
+  const chartSource = readSource('components/contract/ContractTradingViewChart.tsx');
+
+  expect(pageSource).toMatch(/<ContractTradingViewChart[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
+  expect(pageSource).not.toContain('displayPrice={currentPriceNumber}');
+  expect(chartSource).toContain('referencePrice: ContractReferencePrice;');
+  expect(chartSource).toContain('resolveContractTradingViewOverlayPrice(referencePrice, normalizedSymbol)');
+  expect(chartSource).toContain('createContractTradingViewDatafeed({');
+  expect(chartSource).toContain('onLatestBar: (price) => onLatestKlineCloseChangeRef.current?.(price)');
+  expect(chartSource).not.toContain('displayPrice?: number | null;');
+});
+
+test('every ContractTradingViewChart consumer provides a symbol-matched referencePrice', () => {
+  const contractPageSource = readSource('app/contract/page.tsx');
+  const stockPageSource = readSource('app/markets/stocks/[symbol]/page.tsx');
+
+  expect(contractPageSource).toMatch(
+    /<ContractTradingViewChart[\s\S]*?symbol=\{contractSymbol\}[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/,
+  );
+  expect(stockPageSource).toMatch(
+    /<ContractTradingViewChart[\s\S]*?symbol=\{chartMarketSymbol\}[\s\S]*?referencePrice=\{chartReferencePrice\}[\s\S]*?\/>/,
+  );
+  expect(stockPageSource).toContain('const value = stats.lastPrice !== null');
+  expect(stockPageSource).toContain("role: usable ? 'LAST_TRADE' : 'UNAVAILABLE'");
+  expect(stockPageSource).toContain("domain: usable ? 'TRADES' : 'UNAVAILABLE'");
+  expect(stockPageSource).toContain("source: usable ? 'STOCK_QUOTE_LAST_PRICE' : null");
+  expect(stockPageSource).toContain("rejectReason: usable ? null : 'REFERENCE_PRICE_UNAVAILABLE'");
+  expect(stockPageSource).toContain('symbol: chartMarketSymbol');
+  expect(stockPageSource).not.toContain('buildContractPriceAuthority');
 });
 
 test('contract quote refreshes collapse short reconnect bursts without caching failures', () => {

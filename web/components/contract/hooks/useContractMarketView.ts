@@ -45,6 +45,10 @@ import {
   shouldExposeContractMarketDepth,
   type ContractMarketViewAuthorityState,
 } from '../contractMarketView.utils';
+import {
+  buildContractPriceAuthority,
+  selectContractReferencePrice,
+} from '../contractPriceAuthority';
 
 export type ContractCurrentPriceSource = 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK';
 
@@ -973,6 +977,48 @@ export function useContractMarketView({
         : 'flat'
     : 'flat';
 
+  const priceAuthority = useMemo(() => buildContractPriceAuthority({
+    symbol: contractSymbol,
+    trade: latestTrade ? {
+      symbol: contractSymbol,
+      price: latestTrade.price,
+      time: latestTrade.time ?? latestTrade.ts,
+      source: latestTrade.source ?? latestTrade.quote_source,
+      freshness: latestTrade.quote_freshness,
+      priceSource: latestTrade.price_source,
+      synthetic: latestTrade.synthetic,
+    } : null,
+    kline: marketView?.kline_current_candle ? {
+      symbol: marketView.symbol,
+      close: marketView.kline_current_candle.close,
+      time: marketView.kline_current_candle.updated_at_ms
+        ?? marketView.kline_current_candle.time
+        ?? marketView.kline_current_candle.open_time
+        ?? marketView.kline_current_candle.timestamp,
+      freshness: marketView.kline_freshness,
+      priceSource: marketView.kline_current_candle.price_source,
+      klineMode: marketView.kline_current_candle.kline_mode ?? marketView.kline_source,
+    } : null,
+    execution: marketView ? {
+      symbol: marketView.symbol,
+      bid: marketView.execution_bid,
+      ask: marketView.execution_ask,
+      executable: marketView.executable,
+      mode: marketView.execution_mode,
+      freshness: marketView.depth_freshness,
+      source: marketView.depth_source,
+      time: marketView.quote_time,
+    } : null,
+  }), [
+    contractSymbol,
+    latestTrade,
+    marketView,
+  ]);
+  const referencePrice = useMemo(
+    () => selectContractReferencePrice(priceAuthority),
+    [priceAuthority],
+  );
+
   const displayPrice = marketViewAuthority.displayPrice;
   const displayPriceSource = displayPrice !== null
     ? normalizeCurrentPriceSource(marketView?.current_price_source || marketView?.display_price_source)
@@ -1168,6 +1214,8 @@ export function useContractMarketView({
     marketView,
     marketViewLoading: currentMarketViewLoading,
     marketViewError: currentMarketViewError,
+    priceAuthority,
+    referencePrice,
     displayPrice,
     displayState: rawMarketViewDisplayState,
     displayPriceSource,

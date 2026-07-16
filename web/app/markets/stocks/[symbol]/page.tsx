@@ -15,6 +15,7 @@ import { getContractSymbols, type ContractSymbolItem } from '@/lib/api/modules/c
 import ContractTradingViewChart, {
   type ContractChartMode,
 } from '@/components/contract/ContractTradingViewChart'
+import type { ContractReferencePrice } from '@/components/contract/contractPriceAuthority'
 import { adaptKlines } from '@/components/spot/chart/chart.adapter'
 import type { CandleItem, RawKlineItem } from '@/components/spot/chart/chart.types'
 import { useLocaleContext } from '@/contexts/LocaleContext'
@@ -406,6 +407,28 @@ export default function StockMarketDetailPage() {
   const contractLabel = contract
     ? `${contractDisplaySymbol(contract.symbol)} ${t('perpetual', 'markets')}`
     : `${symbol}USDT ${t('perpetual', 'markets')}`
+  const chartMarketSymbol = contract?.symbol || `${symbol}USDT`
+  const chartReferencePrice = useMemo<ContractReferencePrice>(() => {
+    const value = stats.lastPrice !== null
+      && Number.isFinite(stats.lastPrice)
+      && stats.lastPrice > 0
+      ? stats.lastPrice
+      : null
+    const usable = value !== null
+
+    return {
+      value,
+      role: usable ? 'LAST_TRADE' : 'UNAVAILABLE',
+      domain: usable ? 'TRADES' : 'UNAVAILABLE',
+      source: usable ? 'STOCK_QUOTE_LAST_PRICE' : null,
+      provider: null,
+      freshness: null,
+      eventTimeMs: null,
+      usable,
+      rejectReason: usable ? null : 'REFERENCE_PRICE_UNAVAILABLE',
+      symbol: chartMarketSymbol,
+    }
+  }, [chartMarketSymbol, stats.lastPrice])
   const showKlineEmpty = !loading && !klineLoading && klines.length === 0
 
   return (
@@ -457,7 +480,7 @@ export default function StockMarketDetailPage() {
               </div>
             ) : null}
             <ContractTradingViewChart
-              symbol={contract?.symbol || `${symbol}USDT`}
+              symbol={chartMarketSymbol}
               category="STOCK"
               displaySymbol={symbol}
               interval={interval}
@@ -465,6 +488,7 @@ export default function StockMarketDetailPage() {
               intervalOptions={INTERVALS}
               height={420}
               pricePrecision={2}
+              referencePrice={chartReferencePrice}
               onChartModeChange={setChartMode}
               onIntervalChange={setInterval}
             />
