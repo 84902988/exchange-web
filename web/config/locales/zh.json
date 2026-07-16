@@ -1041,6 +1041,7 @@
     "spotChartLoadingMore": "正在加载更多历史...",
     "spotChartBackToLatest": "回到最新",
     "spotChartLoading": "K线加载中...",
+    "spotChartRealtimeSyncing": "实时K线同步中...",
     "spotChartNoData": "暂无K线数据",
     "spotOrderActualFee": "实际手续费",
     "spotOrderActualFeeTitle": "实际手续费 {fee}",

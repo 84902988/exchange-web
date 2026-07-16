@@ -1041,6 +1041,7 @@
     "spotChartLoadingMore": "Loading more history...",
     "spotChartBackToLatest": "Back to latest",
     "spotChartLoading": "Loading K-line data...",
+    "spotChartRealtimeSyncing": "Syncing real-time K-line...",
     "spotChartNoData": "No K-line data",
     "spotOrderActualFee": "Actual fee",
     "spotOrderActualFeeTitle": "Actual fee {fee}",

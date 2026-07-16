@@ -180,6 +180,7 @@ type SpotTradingViewDatafeedOptions = Pick<
 > & {
   debugEnabled?: boolean;
   onKlineLoadStateChange?: (state: SpotKlineLoadState) => void;
+  onRealtimeSyncEvidence?: (event: SpotTradingViewRealtimeEvent) => void;
   onKlineRealtime?: (event: SpotTradingViewRealtimeEvent) => void;
   onCandleAuthority?: (event: SpotTradingViewCandleAuthorityEvent) => void;
   onHistoryBars?: (event: SpotTradingViewHistoryBarsEvent) => void;
@@ -3069,21 +3070,25 @@ export function createSpotTradingViewDatafeed(
       let gapRecoveryState: SpotRealtimeGapRecoveryState | null = null;
       let failedGapTargetTime = 0;
 
+      const buildKlineRealtimeEvent = (
+        bar: TradingViewBar,
+        envelope: SpotRealtimeRevisionEnvelope,
+      ): SpotTradingViewRealtimeEvent => ({
+        symbol: apiSymbol,
+        interval,
+        reason: 'kline',
+        barTime: bar.time,
+        close: bar.close,
+        provider: envelope.provider || null,
+        source: envelope.source || 'LIVE_WS',
+        freshness: envelope.freshness,
+        receivedAtMs: envelope.receivedAtMs,
+      });
       const notifyKlineRealtime = (
         bar: TradingViewBar,
         envelope: SpotRealtimeRevisionEnvelope,
       ) => {
-        options.onKlineRealtime?.({
-          symbol: apiSymbol,
-          interval,
-          reason: 'kline',
-          barTime: bar.time,
-          close: bar.close,
-          provider: envelope.provider || null,
-          source: envelope.source || 'LIVE_WS',
-          freshness: envelope.freshness,
-          receivedAtMs: envelope.receivedAtMs,
-        });
+        options.onKlineRealtime?.(buildKlineRealtimeEvent(bar, envelope));
       };
 
       const emitGapRecoveryBar = (bar: TradingViewBar) => {
@@ -3446,6 +3451,9 @@ export function createSpotTradingViewDatafeed(
           freshness: klineFreshness,
           receivedAtMs: message.receivedAtMs,
         };
+        options.onRealtimeSyncEvidence?.(
+          buildKlineRealtimeEvent(revisionBar, realtimeEnvelope),
+        );
         const currentLatestBar = latestBars.get(latestBarKey);
         if (
           klineSource === 'LIVE_WS'

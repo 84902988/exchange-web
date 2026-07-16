@@ -1041,6 +1041,7 @@
     "spotChartLoadingMore": "過去データをさらに読み込み中...",
     "spotChartBackToLatest": "最新へ戻る",
     "spotChartLoading": "Kラインデータを読み込み中...",
+    "spotChartRealtimeSyncing": "リアルタイムKラインを同期中...",
     "spotChartNoData": "Kラインデータがありません",
     "spotOrderActualFee": "注文手数料",
     "spotOrderActualFeeTitle": "注文手数料 {fee}",

@@ -41,6 +41,7 @@ import {
   markSpotKlinePerf,
 } from './tradingview/spotKlinePerf';
 import {
+  getCurrentSpotResolutionChart,
   requestSpotSetResolution,
   scheduleSpotSubscriberReadinessGrace,
   setSpotToolbarLoadingState,
@@ -51,6 +52,12 @@ import {
   type SpotChartLoadingToken,
   type SpotResolutionIntentToken,
 } from './tradingview/spotTradingViewResolutionState';
+import {
+  beginSpotTradingViewRealtimeSync,
+  isSpotTradingViewRealtimeSyncPending,
+  settleSpotTradingViewRealtimeSync,
+  type SpotTradingViewRealtimeSyncState,
+} from './tradingview/spotTradingViewRealtimeSyncState';
 import { applyTradingViewViewport } from '@/components/tradingview/tradingViewViewportLifecycle';
 import {
   getKlineLifecycleSessionIdentity,
@@ -169,14 +176,14 @@ const SPOT_TV_PRICE_LABEL_OVERRIDES = {
   'scalesProperties.showSeriesLastValue': false,
 } satisfies Partial<ChartPropertiesOverrides>;
 const SPOT_TV_INITIAL_VISIBLE_BARS: Record<string, number> = {
-  '1m': 75,
-  '5m': 75,
-  '15m': 85,
-  '1h': 75,
-  '4h': 65,
-  '1d': 60,
-  '1w': 45,
-  '1M': 36,
+  '1m': 50,
+  '5m': 50,
+  '15m': 50,
+  '1h': 50,
+  '4h': 50,
+  '1d': 50,
+  '1w': 50,
+  '1M': 50,
 };
 const SPOT_TV_INTERVAL_SECONDS: Record<string, number> = {
   '1m': 60,
@@ -376,6 +383,12 @@ export default function SpotTradingViewChart({
   const [loadError, setLoadError] = useState<TradingViewLoadError | null>(null);
   const [scriptReady, setScriptReady] = useState(false);
   const [chartLoadingReason, setChartLoadingReason] = useState<string>('initial');
+  const [realtimeSyncState, setRealtimeSyncState] = useState<SpotTradingViewRealtimeSyncState>({
+    symbol: '',
+    interval: '',
+    widgetGeneration: 0,
+    pending: false,
+  });
   const reactId = useId();
   const containerId = useMemo(
     () => `spot-tv-chart-${reactId.replace(/[^a-zA-Z0-9_-]/g, '')}`,
@@ -394,6 +407,16 @@ export default function SpotTradingViewChart({
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
   const showChartLoading = Boolean(chartLoadingReason || intervalSwitchLoading) && !activeLoadError;
+  const activeBackendInterval = getBackendKlineIntervalForSpotInterval(activeInterval);
+  const showRealtimeSync = (
+    !showChartLoading
+    && !activeLoadError
+    && isSpotTradingViewRealtimeSyncPending(realtimeSyncState, {
+      symbol: normalizedSymbol,
+      interval: activeBackendInterval,
+      widgetGeneration: activeWidgetGenerationRef.current,
+    })
+  );
 
   const restoreToolbarInteractionAfterReady = useCallback((widgetGeneration: number) => {
     window.requestAnimationFrame(() => {
@@ -695,7 +718,14 @@ export default function SpotTradingViewChart({
       }
 
       const widget = widgetRef.current;
-      const chart = widget?.activeChart?.();
+      const chart = getCurrentSpotResolutionChart<TradingViewChartApi>({
+        widget,
+        chartReady: chartReadyRef.current,
+        isCurrent: () => (
+          widgetRef.current === widget
+          && activeWidgetGenerationRef.current === expectedWidgetGeneration
+        ),
+      });
       if (!widget || !chartReadyRef.current || !chart || typeof chart.setVisibleRange !== 'function') {
         pendingInitialVisibleRangeRef.current = event;
         spotTradingViewChartDebug('initial-visible-range', {
@@ -928,14 +958,34 @@ export default function SpotTradingViewChart({
     });
   }, [updateCandlePriceOverlay]);
 
-  const handleDatafeedRealtime = useCallback((event: SpotTradingViewRealtimeEvent) => {
+  const handleRealtimeSyncEvidence = useCallback((
+    event: SpotTradingViewRealtimeEvent,
+    widgetGeneration = activeWidgetGenerationRef.current,
+  ) => {
     const activeIntervalValue = activeIntervalRef.current || event.interval;
     if (!isCurrentSpotTradingViewKlineFallback({
       eventSymbol: event.symbol,
       eventInterval: event.interval,
       activeSymbol: normalizedSymbolRef.current,
       activeBackendInterval: getBackendKlineIntervalForSpotInterval(activeIntervalValue),
-    })) return;
+    })) return false;
+    setRealtimeSyncState((current) => settleSpotTradingViewRealtimeSync(current, {
+      symbol: event.symbol,
+      interval: event.interval,
+      widgetGeneration,
+      source: event.source,
+      freshness: event.freshness,
+      receivedAtMs: event.receivedAtMs,
+    }));
+    return true;
+  }, []);
+
+  const handleDatafeedRealtime = useCallback((
+    event: SpotTradingViewRealtimeEvent,
+    widgetGeneration = activeWidgetGenerationRef.current,
+  ) => {
+    if (!handleRealtimeSyncEvidence(event, widgetGeneration)) return;
+    const activeIntervalValue = activeIntervalRef.current || event.interval;
     onNativeCandleDisplayRef.current?.({
       symbol: event.symbol,
       interval: activeIntervalValue,
@@ -946,7 +996,7 @@ export default function SpotTradingViewChart({
       provider: event.provider,
       freshness: event.freshness,
     });
-  }, []);
+  }, [handleRealtimeSyncEvidence]);
 
   const applyCommittedLifecycleEffects = useCallback((
     decision: KlineLifecycleReducerResult,
@@ -1054,7 +1104,15 @@ export default function SpotTradingViewChart({
     const result = runtimeCoordinator.requestRearm(identity, 'SUBSCRIBER_MISSING');
     if (!result.allowed || !result.permit) return false;
 
-    const chart = widgetRef.current?.activeChart?.() || null;
+    const widget = widgetRef.current;
+    const chart = getCurrentSpotResolutionChart<TradingViewChartApi>({
+      widget,
+      chartReady: chartReadyRef.current,
+      isCurrent: () => (
+        widgetRef.current === widget
+        && activeWidgetGenerationRef.current === identity.widgetGeneration
+      ),
+    });
     if (
       typeof chart?.resetCache !== 'function'
       || typeof chart.resetData !== 'function'
@@ -1190,13 +1248,21 @@ export default function SpotTradingViewChart({
       const runtimeCoordinator = lifecycleRuntimeCoordinatorRef.current;
       const widget = widgetRef.current;
       if (!runtimeCoordinator || !widget) return;
+      const isCurrentWidget = () => (
+        widgetRef.current === widget
+        && activeWidgetGenerationRef.current === widgetGeneration
+      );
       const identity = beginLifecycleIntent(nextResolution, widgetGeneration);
       if (!identity) return;
       const candidate = runtimeCoordinator.snapshot().candidate;
       if (!candidate || candidate.sessionId !== identity.sessionId) return;
 
       const transportCoordinator = resolutionIntentCoordinatorRef.current;
-      const chart = widget.activeChart?.();
+      const chart = getCurrentSpotResolutionChart<TradingViewChartApi>({
+        widget,
+        chartReady: chartReadyRef.current,
+        isCurrent: isCurrentWidget,
+      });
       const chartResolution = (() => {
         try {
           return String(chart?.resolution?.() || '');
@@ -1205,7 +1271,8 @@ export default function SpotTradingViewChart({
         }
       })();
       const isLatest = () => (
-        lifecycleRuntimeCoordinatorRef.current?.snapshot().candidate?.sessionId === identity.sessionId
+        isCurrentWidget()
+        && lifecycleRuntimeCoordinatorRef.current?.snapshot().candidate?.sessionId === identity.sessionId
       );
       const updateToolbarIntentState = (loading: boolean) => {
         const candidateResolution = lifecycleRuntimeCoordinatorRef.current
@@ -1226,7 +1293,7 @@ export default function SpotTradingViewChart({
         const latestCandidate = lifecycleRuntimeCoordinatorRef.current?.snapshot().candidate;
         if (!latestCandidate || latestCandidate.sessionId === identity.sessionId) return;
         window.setTimeout(() => {
-          if (activeWidgetGenerationRef.current !== widgetGeneration) return;
+          if (!isCurrentWidget()) return;
           applyWidgetResolution(latestCandidate.tradingViewResolution, widgetGeneration);
         }, 0);
       };
@@ -1532,6 +1599,11 @@ export default function SpotTradingViewChart({
     normalizedSymbolRef.current = normalizedSymbol;
     activeIntervalRef.current = activeInterval;
     widgetIntervalRef.current = widgetInterval;
+    setRealtimeSyncState(beginSpotTradingViewRealtimeSync({
+      symbol: normalizedSymbol,
+      interval: getBackendKlineIntervalForSpotInterval(activeInterval),
+      widgetGeneration: activeWidgetGenerationRef.current,
+    }));
   }, [activeInterval, chartMode, normalizedSymbol, widgetInterval]);
 
   useEffect(() => {
@@ -1601,8 +1673,13 @@ export default function SpotTradingViewChart({
       toolbarSlotRef.current = null;
       priceOverlayControllerRef.current?.destroy();
       priceOverlayControllerRef.current = null;
-      widgetRef.current?.remove();
+      const widgetToRemove = widgetRef.current;
       widgetRef.current = null;
+      try {
+        widgetToRemove?.remove();
+      } catch {
+        // TradingView may already have torn down its internal chart during route cleanup.
+      }
       datafeedRef.current?.destroy();
       datafeedRef.current = null;
       if (!generation || activeWidgetGenerationRef.current === generation) {
@@ -1636,6 +1713,11 @@ export default function SpotTradingViewChart({
     toolbarButtonRefs.current.clear();
     widgetGeneration = ++widgetGenerationSequenceRef.current;
     activeWidgetGenerationRef.current = widgetGeneration;
+    setRealtimeSyncState(beginSpotTradingViewRealtimeSync({
+      symbol: normalizedSymbol,
+      interval: getBackendKlineIntervalForSpotInterval(initialInterval),
+      widgetGeneration,
+    }));
 
     const datafeed = createSpotTradingViewDatafeed({
       symbol: normalizedSymbol,
@@ -1643,7 +1725,8 @@ export default function SpotTradingViewChart({
       pricePrecision,
       amountPrecision,
       onHistoryBars: (event) => handleDatafeedHistoryBars(event, widgetGeneration),
-      onKlineRealtime: handleDatafeedRealtime,
+      onRealtimeSyncEvidence: (event) => handleRealtimeSyncEvidence(event, widgetGeneration),
+      onKlineRealtime: (event) => handleDatafeedRealtime(event, widgetGeneration),
       onCandleAuthority: handleCandleAuthority,
       onRealtimeSubscriptionReady: (evidence) => {
         recordRealtimeSubscriptionReadiness(evidence, widgetGeneration);
@@ -1732,7 +1815,15 @@ export default function SpotTradingViewChart({
       ) return;
       chartReadyRef.current = true;
       widget.applyOverrides?.(SPOT_TV_PRICE_LABEL_OVERRIDES);
-      const chart = widget.activeChart?.();
+      const chart = getCurrentSpotResolutionChart<TradingViewChartApi>({
+        widget,
+        chartReady: chartReadyRef.current,
+        isCurrent: () => (
+          !cancelled
+          && widgetRef.current === widget
+          && activeWidgetGenerationRef.current === widgetGeneration
+        ),
+      });
       if (
         chart?.createShape
         && chart.getShapeById
@@ -1868,6 +1959,7 @@ export default function SpotTradingViewChart({
     handleCandleAuthority,
     handleDatafeedHistoryBars,
     handleDatafeedRealtime,
+    handleRealtimeSyncEvidence,
     recordRealtimeSubscriptionReadiness,
     amountPrecision,
     cancelSubscriberReadinessGrace,
@@ -1892,9 +1984,10 @@ export default function SpotTradingViewChart({
 
   useEffect(() => {
     let cancelled = false;
+    const widgetGeneration = activeWidgetGenerationRef.current;
 
     const timer = window.setTimeout(() => {
-      if (!cancelled) applyWidgetResolution(widgetInterval);
+      if (!cancelled) applyWidgetResolution(widgetInterval, widgetGeneration);
     }, 0);
 
     return () => {
@@ -1907,6 +2000,7 @@ export default function SpotTradingViewChart({
     <div
       className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]"
       style={{ minHeight: height }}
+      data-spot-chart-realtime-sync={showRealtimeSync ? 'pending' : 'ready'}
     >
       <Script
         src={TRADINGVIEW_SCRIPT_SRC}
@@ -1951,6 +2045,18 @@ export default function SpotTradingViewChart({
                 style={{ animationDelay: `${item * 110}ms` }}
               />
             ))}
+          </div>
+        </div>
+      ) : null}
+      {showRealtimeSync ? (
+        <div
+          className="pointer-events-none absolute right-3 top-12 z-20"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="flex items-center gap-2 rounded-full border border-white/[0.08] bg-[#0b0e11]/80 px-3 py-1.5 text-xs text-[#aeb4bf] shadow-lg backdrop-blur-sm">
+            <span className="h-3 w-3 animate-spin rounded-full border-2 border-[#f0b90b]/30 border-t-[#f0b90b]" />
+            <span>{t('spotChartRealtimeSyncing', 'asset')}</span>
           </div>
         </div>
       ) : null}
