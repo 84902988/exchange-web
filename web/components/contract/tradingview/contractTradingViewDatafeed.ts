@@ -205,6 +205,7 @@ type SubscriptionEntry = {
   readinessBlocked: boolean;
   executedResetPermitId: string | null;
   releaseKlineSubscription: () => void;
+  replayReadyStore: () => void;
   callback: DatafeedCallbacks['onRealtime'];
   resetCallback: (() => void) | null;
 };
@@ -340,7 +341,7 @@ export function contractIntervalToTradingViewResolution(interval: string): Contr
   return CONTRACT_INTERVAL_TO_RESOLUTION[normalizeContractInterval(interval)] || '1';
 }
 
-function tradingViewResolutionToContractInterval(resolution: string) {
+export function tradingViewResolutionToContractInterval(resolution: string) {
   return RESOLUTION_TO_CONTRACT_INTERVAL[normalizeResolution(resolution)] || '1m';
 }
 
@@ -408,6 +409,7 @@ export function realtimeMessageToBar(
   const payload = toRecord(message.kline) || toRecord(message.data);
   if (!payload) return null;
   if (!isProviderKlinePayload(message) || !isProviderKlinePayload(payload)) return null;
+  if (!isFreshKlineEvidence(message) || !isFreshKlineEvidence(payload)) return null;
 
   const symbol = normalizeContractSymbol(String(message.symbol || payload.symbol || ''));
   if (symbol && symbol !== expectedSymbol) return null;
@@ -427,6 +429,14 @@ export function realtimeMessageToBar(
     kline_mode: payload.kline_mode ?? message.kline_mode,
     price_source: payload.price_source ?? message.price_source,
   });
+}
+
+function isFreshKlineEvidence(value: unknown) {
+  const record = toRecord(value);
+  if (!record) return true;
+  if (record.stale === true) return false;
+  const freshness = String(record.freshness || '').trim().toUpperCase();
+  return !['STALE', 'LAST_GOOD', 'MISSING', 'UNAVAILABLE', 'INVALID'].includes(freshness);
 }
 
 function readStoreKlinePayload(value: unknown): Record<string, unknown> | null {
@@ -1038,6 +1048,7 @@ export function createContractTradingViewDatafeed({
   const latestBars = new Map<string, ContractTradingViewBar>();
   const klineHighWaterMarks = new Map<string, number>();
   const subscriptions = new Map<string, SubscriptionEntry>();
+  const historyReadyByLatestBarKey = new Map<string, boolean>();
   const lastSubscriptionKeyBySymbol = new Map<string, string>();
   const latestSubscriptionGenerationByKey = new Map<string, number>();
   const restoreResetCandidates = new Set<string>();
@@ -1180,6 +1191,9 @@ export function createContractTradingViewDatafeed({
       });
       const latestBarKey = buildLatestBarKey(requestSymbol, interval);
       const firstDataRequest = periodParams.firstDataRequest !== false;
+      if (firstDataRequest) {
+        historyReadyByLatestBarKey.set(latestBarKey, false);
+      }
       const requestPlan = resolveContractKlineRequestPlan({
         interval,
         countBack: periodParams.countBack,
@@ -1260,6 +1274,12 @@ export function createContractTradingViewDatafeed({
           lastBarTime: latestBar?.time ?? null,
           requestSeq: requestToken.sequence,
         });
+        if (firstDataRequest) {
+          historyReadyByLatestBarKey.set(latestBarKey, true);
+          for (const entry of subscriptions.values()) {
+            if (entry.latestBarKey === latestBarKey) entry.replayReadyStore();
+          }
+        }
       });
 
       const completeHistoryError = (reason: string) => requestGuard.complete(requestToken, () => {
@@ -1439,6 +1459,9 @@ export function createContractTradingViewDatafeed({
         typeof onResetCacheNeededCallback === 'function'
         && restoreResetCandidates.delete(latestBarKey)
       );
+      if (!historyReadyByLatestBarKey.has(latestBarKey) || shouldResetRestoredBaseline) {
+        historyReadyByLatestBarKey.set(latestBarKey, false);
+      }
       resetUnsubscribeGuards.delete(normalizedSubscriberUid);
 
       const previousSubscription = subscriptions.get(normalizedSubscriberUid);
@@ -1461,6 +1484,7 @@ export function createContractTradingViewDatafeed({
         readinessBlocked: shouldResetRestoredBaseline,
         executedResetPermitId: null,
         releaseKlineSubscription: () => undefined,
+        replayReadyStore: () => undefined,
         callback: onRealtime,
         resetCallback: typeof onResetCacheNeededCallback === 'function'
           ? onResetCacheNeededCallback
@@ -1488,6 +1512,7 @@ export function createContractTradingViewDatafeed({
       ): boolean => {
         const activeSubscription = getActiveSubscription();
         if (!activeSubscription) return false;
+        if (historyReadyByLatestBarKey.get(latestBarKey) !== true) return false;
         if (
           authority === 'LEGACY_FALLBACK'
           && nextBar.time <= activeSubscription.lastStoreBarTime
@@ -1564,6 +1589,13 @@ export function createContractTradingViewDatafeed({
       subscription.releaseKlineSubscription = () => {
         releaseStoreKlineSubscription();
         releaseLegacyKlineSubscription();
+      };
+      subscription.replayReadyStore = () => {
+        handleStoreEntry(selectContractMarketKlineEntry(
+          contractMarketStore.getState(),
+          subscriptionSymbol,
+          interval,
+        ));
       };
       handleStoreEntry(selectContractMarketKlineEntry(
         contractMarketStore.getState(),
@@ -1683,6 +1715,7 @@ export function createContractTradingViewDatafeed({
       destroyed = true;
       requestGuard.destroy();
       historyCoverageByScope.clear();
+      historyReadyByLatestBarKey.clear();
       const activeSubscriptions = Array.from(subscriptions.values());
       subscriptions.clear();
       activeSubscriptions.forEach((entry) => entry.releaseKlineSubscription());

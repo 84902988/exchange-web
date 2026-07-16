@@ -114,15 +114,15 @@ function installRealtimeHarness() {
 }
 
 
-function klineSnapshot(interval: string) {
+function klineSnapshot(interval: string, symbol = 'BTCUSDT_PERP') {
   return {
     data: JSON.stringify({
       type: 'contract_kline_snapshot',
       domain: 'kline',
-      symbol: 'BTCUSDT_PERP',
+      symbol,
       interval,
       kline: {
-        symbol: 'BTCUSDT_PERP',
+        symbol,
         interval,
         open_time: 1_717_000_000_000,
         open: '100',
@@ -136,7 +136,15 @@ function klineSnapshot(interval: string) {
 }
 
 
-test('replacing a monthly owner retires its handler and never falls back after five-minute release', () => {
+function klineCommands(socket: { sent: string[] }) {
+  return socket.sent
+    .map((item) => JSON.parse(item))
+    .filter((item) => item.domain === 'kline')
+    .map((item) => `${item.op}:${item.symbol}:${item.interval}`);
+}
+
+
+test('failed 1m to 1H resolution candidate restores the suspended minute owner', () => {
   const harness = installRealtimeHarness();
 
   try {
@@ -146,39 +154,47 @@ test('replacing a monthly owner retires its handler and never falls back after f
     socket.readyState = harness.MockWebSocket.OPEN;
     socket.onopen?.();
 
-    const monthlyEvents: unknown[] = [];
-    const fiveMinuteEvents: unknown[] = [];
-    const releaseMonthly = client.subscribeKline(
-      { symbol: 'BTCUSDT_PERP', interval: '1M' },
-      (message: unknown) => monthlyEvents.push(message),
+    const minuteEvents: unknown[] = [];
+    const hourlyEvents: unknown[] = [];
+    const releaseMinute = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      (message: unknown) => minuteEvents.push(message),
     );
-    const releaseFiveMinute = client.subscribeKline(
-      { symbol: 'BTCUSDT_PERP', interval: '5m' },
-      (message: unknown) => fiveMinuteEvents.push(message),
+    const releaseHourly = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1H' },
+      (message: unknown) => hourlyEvents.push(message),
     );
 
-    socket.onmessage?.(klineSnapshot('5m'));
-    assert.deepEqual(monthlyEvents, []);
-    assert.equal(fiveMinuteEvents.length, 1);
+    socket.onmessage?.(klineSnapshot('1h'));
+    assert.deepEqual(minuteEvents, []);
+    assert.equal(hourlyEvents.length, 1);
 
     assert.deepEqual(
-      socket.sent
-        .map((item) => JSON.parse(item))
-        .filter((item) => item.domain === 'kline')
-        .map((item) => `${item.op}:${item.interval}`),
-      ['subscribe:1M', 'unsubscribe:1M', 'subscribe:5m'],
+      klineCommands(socket),
+      [
+        'subscribe:BTCUSDT_PERP:1m',
+        'unsubscribe:BTCUSDT_PERP:1m',
+        'subscribe:BTCUSDT_PERP:1h',
+      ],
     );
 
-    releaseFiveMinute();
-    releaseMonthly();
+    releaseHourly();
+    socket.onmessage?.(klineSnapshot('1m'));
+    assert.equal(minuteEvents.length, 1);
+    assert.equal(hourlyEvents.length, 1);
     assert.deepEqual(
-      socket.sent
-        .map((item) => JSON.parse(item))
-        .filter((item) => item.domain === 'kline')
-        .map((item) => `${item.op}:${item.interval}`),
-      ['subscribe:1M', 'unsubscribe:1M', 'subscribe:5m', 'unsubscribe:5m'],
-      'retired monthly owner must not be subscribed again',
+      klineCommands(socket),
+      [
+        'subscribe:BTCUSDT_PERP:1m',
+        'unsubscribe:BTCUSDT_PERP:1m',
+        'subscribe:BTCUSDT_PERP:1h',
+        'unsubscribe:BTCUSDT_PERP:1h',
+        'subscribe:BTCUSDT_PERP:1m',
+      ],
     );
+
+    releaseMinute();
+    assert.equal(klineCommands(socket).at(-1), 'unsubscribe:BTCUSDT_PERP:1m');
     releaseMarket();
   } finally {
     harness.restore();
@@ -186,7 +202,7 @@ test('replacing a monthly owner retires its handler and never falls back after f
 });
 
 
-test('disconnect retires every kline event owner before stale socket delivery', () => {
+test('1m to 5m to 1m restores the original callback without cross-interval delivery', () => {
   const harness = installRealtimeHarness();
 
   try {
@@ -196,19 +212,184 @@ test('disconnect retires every kline event owner before stale socket delivery', 
     socket.readyState = harness.MockWebSocket.OPEN;
     socket.onopen?.();
 
-    const received: unknown[] = [];
-    const releaseKline = client.subscribeKline(
+    const minuteEvents: unknown[] = [];
+    const fiveMinuteEvents: unknown[] = [];
+    const releaseMinute = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      (message: unknown) => minuteEvents.push(message),
+    );
+    const releaseFiveMinute = client.subscribeKline(
       { symbol: 'BTCUSDT_PERP', interval: '5m' },
-      (message: unknown) => received.push(message),
+      (message: unknown) => fiveMinuteEvents.push(message),
+    );
+
+    socket.onmessage?.(klineSnapshot('5m'));
+    socket.onmessage?.(klineSnapshot('1m'));
+    assert.deepEqual(minuteEvents, []);
+    assert.equal(fiveMinuteEvents.length, 1);
+
+    releaseFiveMinute();
+    socket.onmessage?.(klineSnapshot('1m'));
+    assert.equal(minuteEvents.length, 1);
+    assert.equal(fiveMinuteEvents.length, 1);
+    assert.deepEqual(
+      klineCommands(socket),
+      [
+        'subscribe:BTCUSDT_PERP:1m',
+        'unsubscribe:BTCUSDT_PERP:1m',
+        'subscribe:BTCUSDT_PERP:5m',
+        'unsubscribe:BTCUSDT_PERP:5m',
+        'subscribe:BTCUSDT_PERP:1m',
+      ],
+    );
+
+    releaseMinute();
+    releaseMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+
+test('BTC to ETH destroys every prior-symbol owner without changing market-domain ownership', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseBtcMarket = client.setMarketSession('BTCUSDT_PERP');
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+
+    const btcEvents: unknown[] = [];
+    const ethEvents: unknown[] = [];
+    const releaseBtcMinute = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      (message: unknown) => btcEvents.push(message),
+    );
+    const releaseBtcDaily = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1d' },
+      (message: unknown) => btcEvents.push(message),
+    );
+
+    const releaseEthMarket = client.setMarketSession('ETHUSDT_PERP');
+    const releaseEthMinute = client.subscribeKline(
+      { symbol: 'ETHUSDT_PERP', interval: '1m' },
+      (message: unknown) => ethEvents.push(message),
+    );
+    releaseBtcDaily();
+    releaseBtcMinute();
+    releaseBtcMarket();
+
+    socket.onmessage?.(klineSnapshot('1m', 'BTCUSDT_PERP'));
+    socket.onmessage?.(klineSnapshot('1m', 'ETHUSDT_PERP'));
+    assert.deepEqual(btcEvents, []);
+    assert.equal(ethEvents.length, 1);
+    assert.deepEqual(
+      socket.sent
+        .map((item) => JSON.parse(item))
+        .filter((item) => item.domain === 'market')
+        .map((item) => `${item.op}:${item.symbol}`),
+      [
+        'subscribe:BTCUSDT_PERP',
+        'unsubscribe:BTCUSDT_PERP',
+        'subscribe:ETHUSDT_PERP',
+      ],
+    );
+    assert.deepEqual(
+      klineCommands(socket),
+      [
+        'subscribe:BTCUSDT_PERP:1m',
+        'unsubscribe:BTCUSDT_PERP:1m',
+        'subscribe:BTCUSDT_PERP:1d',
+        'unsubscribe:BTCUSDT_PERP:1d',
+        'subscribe:ETHUSDT_PERP:1m',
+      ],
+    );
+
+    releaseEthMinute();
+    releaseEthMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+
+test('disconnect destroys every kline owner and later releases cannot restore one', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+
+    const minuteEvents: unknown[] = [];
+    const dailyEvents: unknown[] = [];
+    const releaseMinute = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      (message: unknown) => minuteEvents.push(message),
+    );
+    const releaseDaily = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1d' },
+      (message: unknown) => dailyEvents.push(message),
     );
     const staleDelivery = socket.onmessage;
+    const commandsBeforeDisconnect = [...socket.sent];
 
     client.disconnect();
-    staleDelivery?.(klineSnapshot('5m'));
-    releaseKline();
+    staleDelivery?.(klineSnapshot('1m'));
+    releaseDaily();
+    releaseMinute();
     releaseMarket();
 
-    assert.deepEqual(received, []);
+    assert.deepEqual(minuteEvents, []);
+    assert.deepEqual(dailyEvents, []);
+    assert.deepEqual(socket.sent, commandsBeforeDisconnect);
+  } finally {
+    harness.restore();
+  }
+});
+
+
+test('destroyed client generation cannot deliver into a recreated owner', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const retiredEvents: unknown[] = [];
+    const firstClient = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseFirstMarket = firstClient.setMarketSession('BTCUSDT_PERP');
+    const firstSocket = harness.sockets[0];
+    firstSocket.readyState = harness.MockWebSocket.OPEN;
+    firstSocket.onopen?.();
+    const releaseFirstKline = firstClient.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      (message: unknown) => retiredEvents.push(message),
+    );
+    const staleDelivery = firstSocket.onmessage;
+    firstClient.disconnect();
+
+    const recreatedEvents: unknown[] = [];
+    const recreatedClient = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseRecreatedMarket = recreatedClient.setMarketSession('BTCUSDT_PERP');
+    const recreatedSocket = harness.sockets[1];
+    recreatedSocket.readyState = harness.MockWebSocket.OPEN;
+    recreatedSocket.onopen?.();
+    const releaseRecreatedKline = recreatedClient.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      (message: unknown) => recreatedEvents.push(message),
+    );
+
+    staleDelivery?.(klineSnapshot('1m'));
+    recreatedSocket.onmessage?.(klineSnapshot('1m'));
+
+    assert.deepEqual(retiredEvents, []);
+    assert.equal(recreatedEvents.length, 1);
+    releaseFirstKline();
+    releaseFirstMarket();
+    releaseRecreatedKline();
+    releaseRecreatedMarket();
   } finally {
     harness.restore();
   }

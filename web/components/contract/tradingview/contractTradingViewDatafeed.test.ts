@@ -239,6 +239,27 @@ const row = (openTime: number, close: string) => ({
   close,
   volume: '1',
 });
+const TEST_HISTORY_BASELINE_TIME = 1_600_000_000_000;
+
+async function establishHistoryBaseline(
+  datafeed: any,
+  symbol: string,
+  resolution = '1',
+) {
+  const previousRequestKlines = requestKlines;
+  requestKlines = async () => metadata([row(TEST_HISTORY_BASELINE_TIME, '1')]);
+  try {
+    await datafeed.getBars(
+      symbolInfo(symbol),
+      resolution,
+      period,
+      () => undefined,
+      assert.fail,
+    );
+  } finally {
+    requestKlines = previousRequestKlines;
+  }
+}
 const pageEndingAt = (endTime: number, count: number, close: string, stepMs = 60_000) => (
   Array.from({ length: count }, (_, index) => (
     row(endTime - ((count - index - 1) * stepMs), close)
@@ -336,6 +357,31 @@ test('in-flight key normalizes symbol interval and equivalent current cursors', 
 });
 
 
+test('all eight production resolutions map bidirectionally without fallback', () => {
+  const expected = [
+    ['1', '1m'],
+    ['5', '5m'],
+    ['15', '15m'],
+    ['60', '1h'],
+    ['240', '4h'],
+    ['1D', '1d'],
+    ['1W', '1w'],
+    ['1M', '1M'],
+  ];
+
+  for (const [resolution, interval] of expected) {
+    assert.equal(
+      datafeedModule.tradingViewResolutionToContractInterval(resolution),
+      interval,
+    );
+    assert.equal(
+      datafeedModule.contractIntervalToTradingViewResolution(interval),
+      resolution,
+    );
+  }
+});
+
+
 test('provider realtime candles are accepted while quote-derived sources are rejected', () => {
   const toBar = datafeedModule.realtimeMessageToBar;
   const restToBar = datafeedModule.klineToBar;
@@ -387,6 +433,14 @@ test('provider realtime candles are accepted while quote-derived sources are rej
     ),
     null,
   );
+  assert.equal(
+    toBar(message({ ...basePayload, source: 'LIVE_WS', freshness: 'STALE' }), 'BTCUSDT_PERP', '1m'),
+    null,
+  );
+  assert.equal(
+    toBar(message({ ...basePayload, source: 'LIVE_WS', stale: true }), 'BTCUSDT_PERP', '1m'),
+    null,
+  );
   assert.ok(restToBar(basePayload), 'source-less provider REST rows remain compatible');
 });
 
@@ -434,6 +488,91 @@ test('normal current request calls onHistory exactly once and never calls onErro
     lastBarTime: 1_717_000_000_000,
     requestSeq: 1,
   }]);
+});
+
+
+test('history barrier defers an early Store candle and replays it only after baseline completion', async () => {
+  const symbol = 'HISTORY_BARRIER_PERP';
+  const baselineTime = 1_717_000_000_000;
+  const storeTime = baselineTime + 60_000;
+  const pending = deferred<KlineMetadata>();
+  const callbackOrder: string[] = [];
+  const realtimeBars: any[] = [];
+  requestKlines = () => pending.promise;
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+
+  const historyRequest = datafeed.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    () => callbackOrder.push('history'),
+    assert.fail,
+  );
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => {
+      callbackOrder.push(`realtime:${bar.close}`);
+      realtimeBars.push(bar);
+    },
+    'history-barrier-subscriber',
+  );
+
+  ingestStoreKline({ symbol, interval: '1m', openTime: storeTime, close: '102' });
+  assert.deepEqual(realtimeBars, [], 'Store hydrate must not bypass the pending history baseline');
+
+  pending.resolve(metadata([row(baselineTime, '101')]));
+  await historyRequest;
+
+  assert.deepEqual(callbackOrder, ['history', 'realtime:102']);
+  assert.deepEqual((realtimeBars as any[]).map((bar) => bar.close), [102]);
+
+  emitRealtime(realtimeCandle(symbol, '1m', storeTime + 60_000, '103'));
+  assert.deepEqual((realtimeBars as any[]).map((bar) => bar.close), [102, 103]);
+  datafeed.destroy();
+});
+
+
+test('history failure keeps realtime closed until a replacement baseline succeeds', async () => {
+  const symbol = 'HISTORY_FAILURE_BARRIER_PERP';
+  const realtimeBars: any[] = [];
+  let requestAttempt = 0;
+  let errorCalls = 0;
+  requestKlines = async () => {
+    requestAttempt += 1;
+    if (requestAttempt === 1) throw new Error('history unavailable');
+    return metadata([row(1_717_000_000_000, '201')]);
+  };
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+
+  await datafeed.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    assert.fail,
+    () => { errorCalls += 1; },
+  );
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => realtimeBars.push(bar),
+    'history-failure-subscriber',
+  );
+  emitRealtime(realtimeCandle(symbol, '1m', 1_717_000_060_000, '202'));
+  assert.equal(errorCalls, 1);
+  assert.deepEqual(realtimeBars, []);
+
+  await datafeed.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    () => undefined,
+    assert.fail,
+  );
+  emitRealtime(realtimeCandle(symbol, '1m', 1_717_000_120_000, '203'));
+  assert.deepEqual((realtimeBars as any[]).map((bar) => bar.close), [203]);
+  datafeed.destroy();
 });
 
 
@@ -2390,6 +2529,8 @@ test('history pagination does not initialize latestBars high-water mark or onLat
   assert.equal(historyCalls.length, 1);
   assert.equal(historyCalls[0].bars.length, 100);
   assert.deepEqual(latest, []);
+  await establishHistoryBaseline(datafeed, 'HISTORY_STATE_ISOLATION_PERP');
+  latest.length = 0;
 
   datafeed.subscribeBars(
     symbolInfo('HISTORY_STATE_ISOLATION_PERP'),
@@ -3111,6 +3252,8 @@ test('destroy and rebuild reset high-water for the replacement datafeed', async 
     symbol: 'REBUILD_MONO_PERP',
     onLatestBar: (close: string | null) => rebuiltLatest.push(close),
   });
+  await establishHistoryBaseline(rebuilt, 'REBUILD_MONO_PERP');
+  rebuiltLatest.length = 0;
   rebuilt.subscribeBars(
     symbolInfo('REBUILD_MONO_PERP'),
     '1',
@@ -3140,6 +3283,7 @@ test('BTC to ETH to BTC rebuild accepts the replacement BTC realtime candle', as
 
   const ethBars: any[] = [];
   const eth = datafeedModule.createContractTradingViewDatafeed({ symbol: 'ETHUSDT_PERP' });
+  await establishHistoryBaseline(eth, 'ETHUSDT_PERP');
   eth.subscribeBars(
     symbolInfo('ETHUSDT_PERP'),
     '1',
@@ -3151,6 +3295,7 @@ test('BTC to ETH to BTC rebuild accepts the replacement BTC realtime candle', as
 
   const replacementBtcBars: any[] = [];
   const replacementBtc = datafeedModule.createContractTradingViewDatafeed({ symbol: 'BTCUSDT_PERP' });
+  await establishHistoryBaseline(replacementBtc, 'BTCUSDT_PERP');
   replacementBtc.subscribeBars(
     symbolInfo('BTCUSDT_PERP'),
     '1',
@@ -3180,6 +3325,8 @@ test('restored baseline reset requires a Runtime permit and a new subscription g
     onRealtimeResetRequired: (requirement: any) => resetRequirements.push(requirement),
   });
 
+  await establishHistoryBaseline(datafeed, symbol, '1');
+
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '1',
@@ -3189,6 +3336,7 @@ test('restored baseline reset requires a Runtime permit and a new subscription g
   emitRealtime(realtimeCandle(symbol, '1m', minuteTime, '100'));
   datafeed.unsubscribeBars('minute-initial');
 
+  await establishHistoryBaseline(datafeed, symbol, '1D');
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '1D',
@@ -3260,6 +3408,7 @@ test('restored baseline reset requires a Runtime permit and a new subscription g
     null,
     'the reset generation remains blocked until subscribeBars creates a new generation',
   );
+  await establishHistoryBaseline(datafeed, symbol, '1');
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '1',
@@ -3408,6 +3557,9 @@ test('high-water marks isolate symbol and interval while preserving 1M case', as
   const fiveMinuteBars: any[] = [];
   const monthlyBars: any[] = [];
   const otherSymbol = datafeedModule.createContractTradingViewDatafeed({ symbol: 'ISOLATION_B_PERP' });
+  await establishHistoryBaseline(otherSymbol, 'ISOLATION_B_PERP', '1');
+  await establishHistoryBaseline(seeded, 'ISOLATION_A_PERP', '5');
+  await establishHistoryBaseline(seeded, 'ISOLATION_A_PERP', '1M');
   otherSymbol.subscribeBars(
     symbolInfo('ISOLATION_B_PERP'),
     '1',
@@ -3439,12 +3591,13 @@ test('high-water marks isolate symbol and interval while preserving 1M case', as
 });
 
 
-test('Store kline is primary and non-kline domains or same-candle legacy fallback cannot overwrite it', () => {
+test('Store kline is primary and non-kline domains or same-candle legacy fallback cannot overwrite it', async () => {
   const symbol = 'STORE_PRIMARY_PERP';
   const openTime = 1_717_100_000_000;
   const received: any[] = [];
   marketStoreModule.contractMarketStore.activateSymbol(symbol);
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol);
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '1',
@@ -3556,7 +3709,7 @@ test('missing bucket identity keeps conservative legacy revision ordering', () =
 });
 
 
-test('runtime high-revision baseline accepts a lower revision from the next bucket', () => {
+test('runtime high-revision baseline accepts a lower revision from the next bucket', async () => {
   const symbol = 'BTCUSDT_PERP';
   const oldBucket = Date.parse('2026-07-14T14:35:00.000Z');
   const newBucket = Date.parse('2026-07-14T14:46:00.000Z');
@@ -3567,6 +3720,8 @@ test('runtime high-revision baseline accepts a lower revision from the next buck
     onLatestBar: (close: string | null) => latest.push(close),
   });
   marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  await establishHistoryBaseline(datafeed, symbol);
+  latest.length = 0;
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '1',
@@ -3607,11 +3762,12 @@ test('runtime high-revision baseline accepts a lower revision from the next buck
 });
 
 
-test('new bucket from a retired subscription generation remains rejected', () => {
+test('new bucket from a retired subscription generation remains rejected', async () => {
   const symbol = 'RETIRED_BUCKET_PERP';
   const retiredBars: any[] = [];
   const activeBars: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol);
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '1',
@@ -3641,11 +3797,12 @@ test('new bucket from a retired subscription generation remains rejected', () =>
 });
 
 
-test('legacy kline fallback rejects provider generation and revision rollback', () => {
+test('legacy kline fallback rejects provider generation and revision rollback', async () => {
   const symbol = 'LEGACY_VERSION_PERP';
   const bucket = 1_717_100_000_000;
   const received: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol);
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '1',
@@ -3674,12 +3831,15 @@ test('legacy kline fallback rejects provider generation and revision rollback', 
 });
 
 
-test('Store interval switch releases the old subscriber and keeps 1M distinct from 5m', () => {
+test('Store interval switch releases the old subscriber and keeps 1M distinct from 5m', async () => {
   const symbol = 'STORE_INTERVAL_PERP';
   const monthly: any[] = [];
   const fiveMinute: any[] = [];
   marketStoreModule.contractMarketStore.activateSymbol(symbol);
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+
+  await establishHistoryBaseline(datafeed, symbol, '1M');
+  await establishHistoryBaseline(datafeed, symbol, '5');
 
   datafeed.subscribeBars(
     symbolInfo(symbol),
@@ -3712,11 +3872,12 @@ test('Store interval switch releases the old subscriber and keeps 1M distinct fr
 });
 
 
-test('Store symbol switch rejects the retired symbol and only updates the replacement subscriber', () => {
+test('Store symbol switch rejects the retired symbol and only updates the replacement subscriber', async () => {
   const btcBars: any[] = [];
   const ethBars: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'STORE_BTC_PERP' });
   marketStoreModule.contractMarketStore.activateSymbol('STORE_BTC_PERP');
+  await establishHistoryBaseline(datafeed, 'STORE_BTC_PERP');
   datafeed.subscribeBars(
     symbolInfo('STORE_BTC_PERP'),
     '1',
@@ -3725,6 +3886,7 @@ test('Store symbol switch rejects the retired symbol and only updates the replac
   );
 
   marketStoreModule.contractMarketStore.activateSymbol('STORE_ETH_PERP');
+  await establishHistoryBaseline(datafeed, 'STORE_ETH_PERP');
   datafeed.subscribeBars(
     symbolInfo('STORE_ETH_PERP'),
     '1',
@@ -3756,12 +3918,13 @@ test('Store symbol switch rejects the retired symbol and only updates the replac
 });
 
 
-test('Store rejects a stale candle without notifying subscribeBars', () => {
+test('Store rejects a stale candle without notifying subscribeBars', async () => {
   const symbol = 'STORE_STALE_PERP';
   const openTime = 1_717_100_000_000;
   const received: any[] = [];
   marketStoreModule.contractMarketStore.activateSymbol(symbol);
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol);
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '1',
@@ -3791,12 +3954,13 @@ test('Store rejects a stale candle without notifying subscribeBars', () => {
 });
 
 
-test('Store rejects revision and generation rollback before realtime callback', () => {
+test('Store rejects revision and generation rollback before realtime callback', async () => {
   const symbol = 'STORE_REVISION_PERP';
   const openTime = 1_717_100_000_000;
   const received: any[] = [];
   marketStoreModule.contractMarketStore.activateSymbol(symbol);
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol);
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '1',
@@ -3907,10 +4071,13 @@ test('same subscriber UID releases the monthly owner before subscribing five min
 });
 
 
-test('late monthly callback cannot write into the replacement five-minute subscriber', () => {
+test('late monthly callback cannot write into the replacement five-minute subscriber', async () => {
   const monthlyBars: any[] = [];
   const fiveMinuteBars: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'OWNER_DELAY_PERP' });
+
+  await establishHistoryBaseline(datafeed, 'OWNER_DELAY_PERP', '1M');
+  await establishHistoryBaseline(datafeed, 'OWNER_DELAY_PERP', '5');
 
   datafeed.subscribeBars(
     symbolInfo('OWNER_DELAY_PERP'),
@@ -3937,10 +4104,13 @@ test('late monthly callback cannot write into the replacement five-minute subscr
 });
 
 
-test('fast 1m to 5m to 1D to 1m chain leaves only the final minute callback active', () => {
+test('fast 1m to 5m to 1D to 1m chain leaves only the final minute callback active', async () => {
   const symbol = 'FAST_INTERVAL_CHAIN_PERP';
   const finalMinuteBars: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol, '1');
+  await establishHistoryBaseline(datafeed, symbol, '5');
+  await establishHistoryBaseline(datafeed, symbol, '1D');
   const subscribe = (resolution: string, callback: (bar: any) => void) => {
     datafeed.subscribeBars(
       symbolInfo(symbol),
@@ -3977,10 +4147,13 @@ test('fast 1m to 5m to 1D to 1m chain leaves only the final minute callback acti
 });
 
 
-test('subscriber ownership remains isolated across symbols and intervals', () => {
+test('subscriber ownership remains isolated across symbols and intervals', async () => {
   const btcBars: any[] = [];
   const ethBars: any[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'BTC_OWNER_PERP' });
+
+  await establishHistoryBaseline(datafeed, 'BTC_OWNER_PERP', '1M');
+  await establishHistoryBaseline(datafeed, 'ETH_OWNER_PERP', '5');
 
   datafeed.subscribeBars(
     symbolInfo('BTC_OWNER_PERP'),
