@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
@@ -31,6 +32,16 @@ DEFAULT_PAGE = 1
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
 ACTIVE_ORDER_STATUSES = ("OPEN", "NEW", "PENDING", "PARTIALLY_FILLED")
+POSITION_PNL_USABLE_FRESHNESS = {"LIVE", "RECENT"}
+
+
+@dataclass(frozen=True)
+class ContractPositionPnlSnapshot:
+    mark_price: Optional[Decimal]
+    unrealized_pnl: Optional[Decimal]
+    source: Optional[str]
+    freshness: str
+    usable: bool
 
 
 def _normalize_symbol(symbol: Optional[str]) -> str:
@@ -110,27 +121,91 @@ def _fmt_datetime(value: Any) -> Optional[str]:
     return value.isoformat()
 
 
-def _position_mark_and_pnl(db: Session, position: ContractPosition) -> tuple[Decimal, Decimal]:
+def _position_pnl_from_mark(
+    position: ContractPosition,
+    mark_price: Decimal,
+) -> Optional[Decimal]:
+    if mark_price <= 0:
+        return None
+    entry_price = _d(position.entry_price)
+    quantity = _d(position.quantity)
+    if entry_price <= 0 or quantity <= 0:
+        return None
+    side = _normalize_status(position.side)
+    if side == "LONG":
+        return (mark_price - entry_price) * quantity
+    if side == "SHORT":
+        return (entry_price - mark_price) * quantity
+    return None
+
+
+def resolve_contract_position_pnl(
+    db: Session,
+    position: ContractPosition,
+) -> ContractPositionPnlSnapshot:
     table_mark_price = _d(position.mark_price)
     if _normalize_status(position.status) != "OPEN":
-        return table_mark_price, _d(position.unrealized_pnl)
+        return ContractPositionPnlSnapshot(
+            mark_price=table_mark_price if table_mark_price > 0 else None,
+            unrealized_pnl=_d(position.unrealized_pnl),
+            source="POSITION_STORED",
+            freshness="STALE",
+            usable=False,
+        )
 
     try:
         quote = get_contract_quote(db, position.symbol)
-        mark_price = _d(quote["mark_price"])
+        mark_price = _d(quote.get("mark_price"))
+        source = str(
+            quote.get("quote_source")
+            or quote.get("source")
+            or quote.get("price_source")
+            or "CONTRACT_QUOTE"
+        ).strip().upper()
+        freshness = str(
+            quote.get("quote_freshness")
+            or quote.get("freshness")
+            or ("LIVE" if quote.get("is_realtime") is True else "")
+        ).strip().upper()
+        pnl = _position_pnl_from_mark(position, mark_price)
+        if mark_price > 0 and pnl is not None:
+            normalized_freshness = freshness if freshness in POSITION_PNL_USABLE_FRESHNESS else "STALE"
+            return ContractPositionPnlSnapshot(
+                mark_price=mark_price,
+                unrealized_pnl=pnl,
+                source=source or "CONTRACT_QUOTE",
+                freshness=normalized_freshness,
+                usable=normalized_freshness in POSITION_PNL_USABLE_FRESHNESS,
+            )
     except Exception:
-        mark_price = table_mark_price
+        pass
 
-    entry_price = _d(position.entry_price)
-    quantity = _d(position.quantity)
-    side = _normalize_status(position.side)
-    if side == "LONG":
-        unrealized_pnl = (mark_price - entry_price) * quantity
-    elif side == "SHORT":
-        unrealized_pnl = (entry_price - mark_price) * quantity
-    else:
-        unrealized_pnl = _d(position.unrealized_pnl)
-    return mark_price, unrealized_pnl
+    fallback_pnl = _position_pnl_from_mark(position, table_mark_price)
+    if table_mark_price > 0 and fallback_pnl is not None:
+        return ContractPositionPnlSnapshot(
+            mark_price=table_mark_price,
+            unrealized_pnl=fallback_pnl,
+            source="POSITION_STORED_MARK",
+            freshness="STALE",
+            usable=False,
+        )
+    return ContractPositionPnlSnapshot(
+        mark_price=None,
+        unrealized_pnl=None,
+        source=None,
+        freshness="UNAVAILABLE",
+        usable=False,
+    )
+
+
+def _position_mark_and_pnl(db: Session, position: ContractPosition) -> tuple[Decimal, Decimal]:
+    snapshot = resolve_contract_position_pnl(db, position)
+    mark_price = snapshot.mark_price
+    unrealized_pnl = snapshot.unrealized_pnl
+    return (
+        mark_price if mark_price is not None else _d(position.mark_price),
+        unrealized_pnl if unrealized_pnl is not None else _d(position.unrealized_pnl),
+    )
 
 
 def _tp_sl_key(position: ContractPosition) -> tuple[str, str]:
