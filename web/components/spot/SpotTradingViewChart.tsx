@@ -20,16 +20,15 @@ import {
   spotIntervalToTradingViewResolution,
   tradingViewResolutionToSpotInterval,
   type SpotRealtimeSubscriptionReadiness,
+  type SpotTradingViewCandleAuthorityEvent,
   type SpotTradingViewHistoryBarsEvent,
   type SpotTradingViewRealtimeEvent,
 } from './tradingview/spotTradingViewDatafeed';
-import type {
-  SpotDisplayPrice,
-  SpotNativeCandleDisplayPrice,
-} from './spotDisplayPrice';
+import type { SpotNativeCandleDisplayPrice } from './spotDisplayPrice';
 import {
   isCurrentSpotTradingViewKlineFallback,
   SpotTradingViewPriceOverlayController,
+  type SpotTradingViewCandleOverlayValue,
   type SpotTradingViewOverlayChart,
 } from './tradingview/spotTradingViewPriceOverlay';
 import { getBackendKlineIntervalForSpotInterval } from './tradingview/spotKlineClientCache';
@@ -119,7 +118,6 @@ type TradingViewLoadError = {
 };
 
 type SpotTradingViewChartProps = Omit<SpotChartProps, 'isLoading'> & {
-  displayPrice: SpotDisplayPrice;
   chartMode?: 'time' | 'candle';
   intervalSwitchLoading?: boolean;
   onIntervalChange?: (value: string) => void;
@@ -338,7 +336,6 @@ export default function SpotTradingViewChart({
   onIntervalSwitchLoadComplete,
   onIntervalResolutionCommit,
   onIntervalResolutionFailure,
-  displayPrice,
   onNativeCandleDisplay,
 }: SpotTradingViewChartProps) {
   const { locale, t } = useLocaleContext();
@@ -370,7 +367,8 @@ export default function SpotTradingViewChart({
   const activeChartLoadingTokenRef = useRef<SpotChartLoadingToken | null>(null);
   const chartLoadingToolbarOwnerRef = useRef<SpotChartLoadingToolbarOwner | null>(null);
   const priceOverlayControllerRef = useRef<SpotTradingViewPriceOverlayController | null>(null);
-  const displayPriceRef = useRef(displayPrice);
+  const activeCandleOverlayRef = useRef<SpotTradingViewCandleOverlayValue | null>(null);
+  const activeCandleOverlayScopeRef = useRef('');
   const onNativeCandleDisplayRef = useRef(onNativeCandleDisplay);
   const onIntervalSwitchLoadCompleteRef = useRef(onIntervalSwitchLoadComplete);
   const onIntervalResolutionCommitRef = useRef(onIntervalResolutionCommit);
@@ -850,6 +848,24 @@ export default function SpotTradingViewChart({
     [applyInitialVisibleRangeFromHistory, resetInitialVisibleRangeIntent],
   );
 
+  const updateCandlePriceOverlay = useCallback((value: SpotTradingViewCandleOverlayValue) => {
+    const activeIntervalValue = activeIntervalRef.current || value.interval;
+    if (!isCurrentSpotTradingViewKlineFallback({
+      eventSymbol: value.symbol,
+      eventInterval: value.interval,
+      activeSymbol: normalizedSymbolRef.current,
+      activeBackendInterval: getBackendKlineIntervalForSpotInterval(activeIntervalValue),
+    })) return;
+
+    activeCandleOverlayRef.current = value;
+    priceOverlayControllerRef.current?.update(value);
+    if (containerRef.current) {
+      containerRef.current.dataset.spotChartCandleClose = String(value.close);
+      containerRef.current.dataset.spotChartCandleSource = value.source;
+      containerRef.current.dataset.spotChartCandleBarTime = String(value.barTime);
+    }
+  }, []);
+
   const handleDatafeedHistoryBars = useCallback((
     event: SpotTradingViewHistoryBarsEvent,
     widgetGeneration: number,
@@ -879,18 +895,38 @@ export default function SpotTradingViewChart({
       finishChartLoading(event.barCount > 0 ? 'current-history-bars' : 'current-history-empty');
     }
     if (event.lastBarClose !== null && event.lastBarTime !== null) {
+      const receivedAtMs = Date.now();
+      updateCandlePriceOverlay({
+        symbol: activeSymbol,
+        interval: event.backendInterval,
+        close: event.lastBarClose,
+        barTime: event.lastBarTime,
+        source: 'REST_HISTORY',
+        receivedAtMs,
+      });
       onNativeCandleDisplayRef.current?.({
         symbol: activeSymbol,
         interval: activeIntervalValue,
         price: event.lastBarClose,
         eventTimeMs: event.lastBarTime,
-        receivedAtMs: Date.now(),
+        receivedAtMs,
         source: 'REST_HISTORY',
         provider: null,
         freshness: 'CACHED',
       });
     }
-  }, [applyInitialVisibleRangeFromHistory, finishChartLoading]);
+  }, [applyInitialVisibleRangeFromHistory, finishChartLoading, updateCandlePriceOverlay]);
+
+  const handleCandleAuthority = useCallback((event: SpotTradingViewCandleAuthorityEvent) => {
+    updateCandlePriceOverlay({
+      symbol: event.symbol,
+      interval: event.interval,
+      close: event.close,
+      barTime: event.barTime,
+      source: event.source,
+      receivedAtMs: event.receivedAtMs,
+    });
+  }, [updateCandlePriceOverlay]);
 
   const handleDatafeedRealtime = useCallback((event: SpotTradingViewRealtimeEvent) => {
     const activeIntervalValue = activeIntervalRef.current || event.interval;
@@ -1481,6 +1517,17 @@ export default function SpotTradingViewChart({
 
   useLayoutEffect(() => {
     bootstrapKlineLifecycleObservability();
+    const nextCandleOverlayScope = `${normalizedSymbol}:${getBackendKlineIntervalForSpotInterval(activeInterval)}`;
+    if (activeCandleOverlayScopeRef.current !== nextCandleOverlayScope) {
+      activeCandleOverlayScopeRef.current = nextCandleOverlayScope;
+      activeCandleOverlayRef.current = null;
+      priceOverlayControllerRef.current?.clear();
+      if (containerRef.current) {
+        containerRef.current.dataset.spotChartCandleClose = '';
+        containerRef.current.dataset.spotChartCandleSource = '';
+        containerRef.current.dataset.spotChartCandleBarTime = '';
+      }
+    }
     chartModeRef.current = chartMode;
     normalizedSymbolRef.current = normalizedSymbol;
     activeIntervalRef.current = activeInterval;
@@ -1494,10 +1541,8 @@ export default function SpotTradingViewChart({
   }, [onIntervalResolutionCommit, onIntervalResolutionFailure, onIntervalSwitchLoadComplete]);
 
   useEffect(() => {
-    displayPriceRef.current = displayPrice;
     onNativeCandleDisplayRef.current = onNativeCandleDisplay;
-    priceOverlayControllerRef.current?.update(displayPrice);
-  }, [displayPrice, onNativeCandleDisplay]);
+  }, [onNativeCandleDisplay]);
 
   useEffect(() => () => {
     cancelSubscriberReadinessGrace();
@@ -1599,6 +1644,7 @@ export default function SpotTradingViewChart({
       amountPrecision,
       onHistoryBars: (event) => handleDatafeedHistoryBars(event, widgetGeneration),
       onKlineRealtime: handleDatafeedRealtime,
+      onCandleAuthority: handleCandleAuthority,
       onRealtimeSubscriptionReady: (evidence) => {
         recordRealtimeSubscriptionReadiness(evidence, widgetGeneration);
       },
@@ -1696,7 +1742,8 @@ export default function SpotTradingViewChart({
         priceOverlayControllerRef.current = new SpotTradingViewPriceOverlayController(
           chart as SpotTradingViewOverlayChart,
         );
-        priceOverlayControllerRef.current.update(displayPriceRef.current);
+        const activeCandleOverlay = activeCandleOverlayRef.current;
+        if (activeCandleOverlay) priceOverlayControllerRef.current.update(activeCandleOverlay);
       }
       const candidateResolution = lifecycleRuntimeCoordinatorRef.current
         ?.snapshot().candidate?.tradingViewResolution;
@@ -1818,6 +1865,7 @@ export default function SpotTradingViewChart({
     applyInitialVisibleRangeFromHistory,
     applyWidgetResolution,
     beginLifecycleIntent,
+    handleCandleAuthority,
     handleDatafeedHistoryBars,
     handleDatafeedRealtime,
     recordRealtimeSubscriptionReadiness,
@@ -1859,9 +1907,6 @@ export default function SpotTradingViewChart({
     <div
       className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]"
       style={{ minHeight: height }}
-      data-spot-display-price={displayPrice.price ?? ''}
-      data-spot-display-domain={displayPrice.sourceDomain}
-      data-spot-display-freshness={displayPrice.freshness}
     >
       <Script
         src={TRADINGVIEW_SCRIPT_SRC}
@@ -1877,6 +1922,9 @@ export default function SpotTradingViewChart({
       <div
         id={containerId}
         ref={containerRef}
+        data-spot-chart-candle-close=""
+        data-spot-chart-candle-source=""
+        data-spot-chart-candle-bar-time=""
         className="min-h-0 flex-1"
         aria-label={`${displayName || normalizedSymbol} ${chartMode === 'time' ? 'time' : activeInterval}`}
       />

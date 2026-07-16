@@ -2,22 +2,21 @@ import { describe, expect, it, jest } from '@jest/globals';
 import {
   isCurrentSpotTradingViewKlineFallback,
   SpotTradingViewPriceOverlayController,
+  type SpotTradingViewCandleOverlayValue,
   type SpotTradingViewOverlayChart,
   type SpotTradingViewOverlayEntityId,
 } from './spotTradingViewPriceOverlay';
-import type { SpotDisplayPrice } from '../spotDisplayPrice';
 
-function displayPrice(overrides: Partial<SpotDisplayPrice> = {}): SpotDisplayPrice {
+function candleOverlay(
+  overrides: Partial<SpotTradingViewCandleOverlayValue> = {},
+): SpotTradingViewCandleOverlayValue {
   return {
     symbol: 'BTCUSDT',
-    price: '101',
-    eventTimeMs: 2_000,
+    interval: '1m',
+    close: 101,
+    barTime: 1_717_000_060_000,
+    source: 'native-open',
     receivedAtMs: 2_100,
-    sourceDomain: 'trades',
-    source: 'LIVE_WS',
-    provider: 'OKX_SPOT',
-    freshness: 'LIVE',
-    isRealTrade: true,
     ...overrides,
   };
 }
@@ -27,14 +26,14 @@ function flushPromises() {
 }
 
 describe('SpotTradingViewPriceOverlayController', () => {
-  it('creates one horizontal line and updates it without touching any candle fields', async () => {
+  it('creates one horizontal line and updates it from candle close only', async () => {
     const points: unknown[] = [];
     const properties: unknown[] = [];
     const createShape = jest.fn<SpotTradingViewOverlayChart['createShape']>(async () => 'overlay-1');
     const chart: SpotTradingViewOverlayChart = {
       createShape,
       getShapeById: () => ({
-        getPoints: () => [{ time: 2, price: 101 }],
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
         setPoints: (next) => points.push(next),
         setProperties: (next) => properties.push(next),
       }),
@@ -42,11 +41,12 @@ describe('SpotTradingViewPriceOverlayController', () => {
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice());
+    controller.update(candleOverlay());
     await flushPromises();
-    controller.update(displayPrice({ price: '102', eventTimeMs: 3_000 }));
+    controller.update(candleOverlay({ close: 102, source: 'preview', receivedAtMs: 3_000 }));
 
     expect(createShape).toHaveBeenCalledTimes(1);
+    expect(createShape.mock.calls[0][0]).toEqual({ time: 1_717_000_060, price: 101 });
     expect(createShape.mock.calls[0][1]).toMatchObject({
       shape: 'horizontal_line',
       lock: true,
@@ -64,7 +64,7 @@ describe('SpotTradingViewPriceOverlayController', () => {
         'linetoolhorzline.showPrice': true,
       },
     });
-    expect(points.at(-1)).toEqual([{ time: 2, price: 102 }]);
+    expect(points.at(-1)).toEqual([{ time: 1_717_000_060, price: 102 }]);
     expect(properties.at(-1)).toMatchObject({
       text: '',
       linecolor: '#00c087',
@@ -72,7 +72,81 @@ describe('SpotTradingViewPriceOverlayController', () => {
       linestyle: 2,
       showPrice: true,
     });
-    expect(JSON.stringify({ points, properties })).not.toMatch(/open|high|low|close|volume/i);
+  });
+
+  it('keeps the chart line unchanged when only the ticker/header price moves', async () => {
+    const setPoints = jest.fn();
+    const chart: SpotTradingViewOverlayChart = {
+      createShape: async () => 'overlay-1',
+      getShapeById: () => ({
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
+        setPoints,
+      }),
+      removeEntity: jest.fn(),
+    };
+    const controller = new SpotTradingViewPriceOverlayController(chart);
+    let headerLastPrice = 101;
+
+    controller.update(candleOverlay({ close: 101 }));
+    await flushPromises();
+    headerLastPrice = 105;
+
+    expect(headerLastPrice).toBe(105);
+    expect(setPoints).not.toHaveBeenCalled();
+  });
+
+  it('follows a Preview candle update and then the final Native rebase close', async () => {
+    const setPoints = jest.fn();
+    const chart: SpotTradingViewOverlayChart = {
+      createShape: async () => 'overlay-1',
+      getShapeById: () => ({
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
+        setPoints,
+      }),
+      removeEntity: jest.fn(),
+    };
+    const controller = new SpotTradingViewPriceOverlayController(chart);
+
+    controller.update(candleOverlay({ close: 101, source: 'native-open' }));
+    await flushPromises();
+    controller.update(candleOverlay({ close: 104, source: 'preview', receivedAtMs: 2_200 }));
+    controller.update(candleOverlay({ close: 102, source: 'native-closed', receivedAtMs: 2_300 }));
+
+    expect(setPoints.mock.calls.map(([points]) => points)).toEqual([
+      [{ time: 1_717_000_060, price: 104 }],
+      [{ time: 1_717_000_060, price: 102 }],
+    ]);
+  });
+
+  it('removes the old candle line and establishes a new one at the minute boundary', async () => {
+    let createCount = 0;
+    const removeEntity = jest.fn<SpotTradingViewOverlayChart['removeEntity']>();
+    const createShape = jest.fn<SpotTradingViewOverlayChart['createShape']>(async () => (
+      `overlay-${++createCount}`
+    ));
+    const chart: SpotTradingViewOverlayChart = {
+      createShape,
+      getShapeById: () => ({
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
+        setPoints: jest.fn(),
+      }),
+      removeEntity,
+    };
+    const controller = new SpotTradingViewPriceOverlayController(chart);
+
+    controller.update(candleOverlay({ close: 101 }));
+    await flushPromises();
+    controller.update(candleOverlay({
+      close: 103,
+      barTime: 1_717_000_120_000,
+      source: 'native-open',
+      receivedAtMs: 3_000,
+    }));
+    await flushPromises();
+
+    expect(removeEntity).toHaveBeenCalledWith('overlay-1', { disableUndo: true });
+    expect(createShape).toHaveBeenCalledTimes(2);
+    expect(createShape.mock.calls[1][0]).toEqual({ time: 1_717_000_120, price: 103 });
   });
 
   it('uses price direction colors and keeps the previous color when price is unchanged', async () => {
@@ -80,7 +154,7 @@ describe('SpotTradingViewPriceOverlayController', () => {
     const chart: SpotTradingViewOverlayChart = {
       createShape: async () => 'overlay-1',
       getShapeById: () => ({
-        getPoints: () => [{ time: 2, price: 101 }],
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
         setPoints: jest.fn(),
         setProperties: (next) => properties.push(next),
       }),
@@ -88,57 +162,17 @@ describe('SpotTradingViewPriceOverlayController', () => {
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice({ price: '101' }));
+    controller.update(candleOverlay({ close: 101 }));
     await flushPromises();
-    controller.update(displayPrice({ price: '100', eventTimeMs: 3_000 }));
-    controller.update(displayPrice({ price: '100', eventTimeMs: 4_000 }));
-    controller.update(displayPrice({ price: '102', eventTimeMs: 5_000 }));
+    controller.update(candleOverlay({ close: 100, source: 'preview', receivedAtMs: 3_000 }));
+    controller.update(candleOverlay({ close: 100, source: 'preview', receivedAtMs: 4_000 }));
+    controller.update(candleOverlay({ close: 102, source: 'preview', receivedAtMs: 5_000 }));
 
     expect(properties.map((item) => item.linecolor)).toEqual([
       '#00c087',
       '#f6465d',
       '#f6465d',
       '#00c087',
-    ]);
-  });
-
-  it('creates a ticker fallback with the final exchange color instead of a blue interim state', async () => {
-    const createShape = jest.fn<SpotTradingViewOverlayChart['createShape']>(async () => 'overlay-1');
-    const properties: Array<Record<string, unknown>> = [];
-    const chart: SpotTradingViewOverlayChart = {
-      createShape,
-      getShapeById: () => ({
-        setPoints: jest.fn(),
-        setProperties: (next) => properties.push(next),
-      }),
-      removeEntity: jest.fn(),
-    };
-    const controller = new SpotTradingViewPriceOverlayController(chart);
-
-    controller.update(displayPrice({
-      sourceDomain: 'ticker',
-      isRealTrade: false,
-    }));
-    await flushPromises();
-
-    expect(createShape.mock.calls[0][1]).toMatchObject({
-      text: '',
-      overrides: {
-        'linetoolhorzline.linecolor': '#00c087',
-        'linetoolhorzline.textcolor': '#00c087',
-        'linetoolhorzline.linestyle': 2,
-        'linetoolhorzline.showPrice': true,
-      },
-    });
-    expect(properties).toEqual([
-      expect.objectContaining({
-        text: '',
-        linecolor: '#00c087',
-        textcolor: '#00c087',
-        linewidth: 1,
-        linestyle: 2,
-        showPrice: true,
-      }),
     ]);
   });
 
@@ -150,7 +184,7 @@ describe('SpotTradingViewPriceOverlayController', () => {
         resolveShape = resolve;
       }),
       getShapeById: () => ({
-        getPoints: () => [{ time: 2, price: 101 }],
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
         setPoints: jest.fn(),
         setProperties: (next) => properties.push(next),
       }),
@@ -158,8 +192,8 @@ describe('SpotTradingViewPriceOverlayController', () => {
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice({ price: '101' }));
-    controller.update(displayPrice({ price: '100', eventTimeMs: 3_000 }));
+    controller.update(candleOverlay({ close: 101 }));
+    controller.update(candleOverlay({ close: 100, source: 'preview', receivedAtMs: 3_000 }));
     resolveShape('overlay-1');
     await flushPromises();
 
@@ -173,7 +207,7 @@ describe('SpotTradingViewPriceOverlayController', () => {
     });
   });
 
-  it('cleans the old symbol entity before creating the new symbol overlay', async () => {
+  it('cleans the old scope entity before creating the new symbol overlay', async () => {
     let createCount = 0;
     const activeEntities = new Set<SpotTradingViewOverlayEntityId>();
     const removeEntity = jest.fn<SpotTradingViewOverlayChart['removeEntity']>((entityId) => {
@@ -186,14 +220,17 @@ describe('SpotTradingViewPriceOverlayController', () => {
     });
     const chart: SpotTradingViewOverlayChart = {
       createShape,
-      getShapeById: () => ({ getPoints: () => [{ time: 2, price: 101 }], setPoints: jest.fn() }),
+      getShapeById: () => ({
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
+        setPoints: jest.fn(),
+      }),
       removeEntity,
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice({ symbol: 'BTCUSDT', price: '101' }));
+    controller.update(candleOverlay({ symbol: 'BTCUSDT', close: 101 }));
     await flushPromises();
-    controller.update(displayPrice({ symbol: 'ETHUSDT', price: '99', eventTimeMs: 3_000 }));
+    controller.update(candleOverlay({ symbol: 'ETHUSDT', close: 99, receivedAtMs: 3_000 }));
     await flushPromises();
 
     expect(removeEntity).toHaveBeenCalledWith('overlay-1', { disableUndo: true });
@@ -216,32 +253,38 @@ describe('SpotTradingViewPriceOverlayController', () => {
     const setPoints = jest.fn();
     const chart: SpotTradingViewOverlayChart = {
       createShape,
-      getShapeById: () => ({ getPoints: () => [{ time: 2, price: 101 }], setPoints }),
+      getShapeById: () => ({
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
+        setPoints,
+      }),
       removeEntity: jest.fn(),
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice({ price: '101' }));
-    controller.update(displayPrice({ price: '102', eventTimeMs: 3_000 }));
+    controller.update(candleOverlay({ close: 101 }));
+    controller.update(candleOverlay({ close: 102, source: 'preview', receivedAtMs: 3_000 }));
     resolveShape('overlay-1');
     await flushPromises();
 
     expect(createShape).toHaveBeenCalledTimes(1);
-    expect(setPoints).toHaveBeenLastCalledWith([{ time: 2, price: 102 }]);
+    expect(setPoints).toHaveBeenLastCalledWith([{ time: 1_717_000_060, price: 102 }]);
   });
 
-  it('removes the line for stale or missing display state', async () => {
+  it('removes the line for invalid candle state', async () => {
     const removeEntity = jest.fn();
     const chart: SpotTradingViewOverlayChart = {
       createShape: async () => 'overlay-1',
-      getShapeById: () => ({ getPoints: () => [{ time: 2, price: 101 }], setPoints: jest.fn() }),
+      getShapeById: () => ({
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
+        setPoints: jest.fn(),
+      }),
       removeEntity,
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice());
+    controller.update(candleOverlay());
     await flushPromises();
-    controller.update(displayPrice({ freshness: 'STALE' }));
+    controller.update(candleOverlay({ close: Number.NaN }));
 
     expect(removeEntity).toHaveBeenCalledWith('overlay-1', { disableUndo: true });
   });
@@ -270,9 +313,9 @@ describe('SpotTradingViewPriceOverlayController', () => {
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice({ price: '101' }));
+    controller.update(candleOverlay({ close: 101 }));
     await flushPromises();
-    controller.update(displayPrice({ price: '101', eventTimeMs: 3_000 }));
+    controller.update(candleOverlay({ close: 101, source: 'preview', receivedAtMs: 3_000 }));
     await flushPromises();
 
     expect(createCount).toBe(2);
@@ -298,7 +341,10 @@ describe('SpotTradingViewPriceOverlayController', () => {
       },
       getShapeById: (entityId) => {
         if (!activeEntities.has(entityId)) throw new Error('entity removed by chart cleanup');
-        return { getPoints: () => [{ time: 2, price: 101 }], setPoints: jest.fn() };
+        return {
+          getPoints: () => [{ time: 1_717_000_060, price: 101 }],
+          setPoints: jest.fn(),
+        };
       },
       removeEntity: (entityId) => {
         if (!activeEntities.delete(entityId)) throw new Error('entity already removed');
@@ -306,11 +352,11 @@ describe('SpotTradingViewPriceOverlayController', () => {
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice({ price: '101' }));
+    controller.update(candleOverlay({ close: 101 }));
     await flushPromises();
     activeEntities.delete('ordinary-drawing');
     activeEntities.delete('system-overlay-1');
-    controller.update(displayPrice({ price: '101', eventTimeMs: 3_000 }));
+    controller.update(candleOverlay({ close: 101, source: 'preview', receivedAtMs: 3_000 }));
     await flushPromises();
 
     expect(createCount).toBe(2);
@@ -344,16 +390,19 @@ describe('SpotTradingViewPriceOverlayController', () => {
     const removeEntity = jest.fn();
     const chart: SpotTradingViewOverlayChart = {
       createShape: async () => 'overlay-1',
-      getShapeById: () => ({ getPoints: () => [{ time: 2, price: 101 }], setPoints }),
+      getShapeById: () => ({
+        getPoints: () => [{ time: 1_717_000_060, price: 101 }],
+        setPoints,
+      }),
       removeEntity,
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice());
+    controller.update(candleOverlay());
     await flushPromises();
     const callsBeforeDestroy = setPoints.mock.calls.length;
     controller.destroy();
-    controller.update(displayPrice({ price: '103' }));
+    controller.update(candleOverlay({ close: 103 }));
 
     expect(removeEntity).toHaveBeenCalledWith('overlay-1', { disableUndo: true });
     expect(setPoints).toHaveBeenCalledTimes(callsBeforeDestroy);
@@ -371,7 +420,7 @@ describe('SpotTradingViewPriceOverlayController', () => {
     };
     const controller = new SpotTradingViewPriceOverlayController(chart);
 
-    controller.update(displayPrice());
+    controller.update(candleOverlay());
     controller.destroy();
     resolveShape('late-overlay');
     await flushPromises();

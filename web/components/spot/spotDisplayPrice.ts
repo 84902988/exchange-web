@@ -25,7 +25,10 @@ type SelectSpotDisplayPriceInput = {
   trade?: SpotDisplayPriceCandidate | null;
   ticker?: SpotDisplayPriceCandidate | null;
   kline?: SpotDisplayPriceCandidate | null;
+  nowMs?: number;
 };
+
+export const SPOT_DISPLAY_TRADE_ACTIVE_WINDOW_MS = 3_000;
 
 const USABLE_DISPLAY_FRESHNESS = new Set([
   'LIVE',
@@ -54,6 +57,35 @@ function isUsableCandidate(
   const price = Number(candidate.price);
   if (!Number.isFinite(price) || price <= 0) return false;
   return USABLE_DISPLAY_FRESHNESS.has(normalizeText(candidate.freshness, 'UNKNOWN'));
+}
+
+function candidateObservedAtMs(candidate: SpotDisplayPriceCandidate): number | null {
+  return normalizeTime(candidate.eventTimeMs) ?? normalizeTime(candidate.receivedAtMs);
+}
+
+function isTradeWithinActiveWindow(
+  trade: SpotDisplayPriceCandidate,
+  nowMs: number,
+): boolean {
+  const receivedAtMs = normalizeTime(trade.receivedAtMs);
+  const activeAtMs = receivedAtMs ?? normalizeTime(trade.eventTimeMs);
+  if (activeAtMs === null) return false;
+
+  const ageMs = nowMs - activeAtMs;
+  return ageMs >= 0 && ageMs <= SPOT_DISPLAY_TRADE_ACTIVE_WINDOW_MS;
+}
+
+function isTradeAtLeastAsNewAsTicker(
+  trade: SpotDisplayPriceCandidate,
+  ticker: SpotDisplayPriceCandidate | null | undefined,
+  symbol: string,
+): boolean {
+  if (!isUsableCandidate(ticker, symbol)) return true;
+
+  const tradeObservedAtMs = candidateObservedAtMs(trade);
+  const tickerObservedAtMs = candidateObservedAtMs(ticker);
+  if (tradeObservedAtMs === null || tickerObservedAtMs === null) return true;
+  return tradeObservedAtMs >= tickerObservedAtMs;
 }
 
 function selectCandidate(
@@ -92,9 +124,17 @@ export function selectSpotDisplayPrice({
   trade,
   ticker,
   kline,
+  nowMs = Date.now(),
 }: SelectSpotDisplayPriceInput): SpotDisplayPrice {
   const normalizedSymbol = normalizeText(symbol, '');
-  if (isUsableCandidate(trade, normalizedSymbol)) return selectCandidate(trade, 'trades');
+  const normalizedNowMs = normalizeTime(nowMs) ?? Date.now();
+  if (
+    isUsableCandidate(trade, normalizedSymbol) &&
+    isTradeWithinActiveWindow(trade, normalizedNowMs) &&
+    isTradeAtLeastAsNewAsTicker(trade, ticker, normalizedSymbol)
+  ) {
+    return selectCandidate(trade, 'trades');
+  }
   if (isUsableCandidate(ticker, normalizedSymbol)) return selectCandidate(ticker, 'ticker');
   if (isUsableCandidate(kline, normalizedSymbol)) return selectCandidate(kline, 'kline');
   return unavailableSpotDisplayPrice(normalizedSymbol);

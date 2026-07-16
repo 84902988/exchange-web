@@ -1659,7 +1659,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                   dataSource={spotMarketDataSource}
                   klineSource={spotSources.kline}
                   klineFreshness={spotFreshness.kline}
-                  displayPrice={activeDisplayPrice}
                   onNativeCandleDisplay={handleNativeCandleDisplay}
                   priceDirection={priceDirection}
                   pricePrecision={pricePrecision}
