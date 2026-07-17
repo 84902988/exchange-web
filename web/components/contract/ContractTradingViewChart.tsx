@@ -24,7 +24,6 @@ import {
   type ContractKlineAssetClass,
 } from './tradingview/contractKlineCachePolicy';
 import {
-  getContractKlineVisibleBars,
   normalizeContractKlineLoadInterval,
 } from './tradingview/contractKlineLoadPolicy';
 import { createContractKlinePreloadManager } from './tradingview/contractKlinePreloadManager';
@@ -269,12 +268,13 @@ const CONTRACT_TV_INTERVAL_SECONDS: Readonly<Record<string, number>> = {
   '1w': 7 * 24 * 60 * 60,
   '1M': 30 * 24 * 60 * 60,
 };
+const CONTRACT_TV_INITIAL_VISIBLE_BARS = 50;
 
 export function resolveContractInitialVisibleRange(interval: string, latestBarTimeMs: number) {
   const normalizedInterval = normalizeContractKlineLoadInterval(interval);
   const intervalSeconds = CONTRACT_TV_INTERVAL_SECONDS[normalizedInterval]
     ?? CONTRACT_TV_INTERVAL_SECONDS['1d'];
-  const targetVisibleBars = getContractKlineVisibleBars(normalizedInterval);
+  const targetVisibleBars = CONTRACT_TV_INITIAL_VISIBLE_BARS;
   const latestBarTime = Math.floor(Number(latestBarTimeMs) / 1000);
   if (!Number.isFinite(latestBarTime) || latestBarTime <= 0) return null;
   return {
@@ -294,26 +294,10 @@ export function resolveContractInitialVisibleRange(interval: string, latestBarTi
 }
 
 export const CONTRACT_TIME_SERIES_OVERRIDES = {
-  'mainSeriesProperties.lineStyle.colorType': 'solid',
-  'mainSeriesProperties.lineStyle.gradientStartColor': '#f0b90b',
-  'mainSeriesProperties.lineStyle.gradientEndColor': '#f0b90b',
-  'mainSeriesProperties.lineStyle.color': '#f0b90b',
-  'mainSeriesProperties.lineStyle.linewidth': 2,
-  'mainSeriesProperties.lineStyle.linestyle': 0,
-  'mainSeriesProperties.lineStyle.priceSource': 'close',
   'mainSeriesProperties.areaStyle.color1': 'rgba(240,185,11,0.24)',
   'mainSeriesProperties.areaStyle.color2': 'rgba(240,185,11,0.02)',
   'mainSeriesProperties.areaStyle.linecolor': '#f0b90b',
   'mainSeriesProperties.areaStyle.linewidth': 2,
-} as const;
-
-export const CONTRACT_TIME_LINE_STYLE_PREFERENCES = {
-  colorType: 'solid',
-  gradientStartColor: '#f0b90b',
-  gradientEndColor: '#f0b90b',
-  color: '#f0b90b',
-  linestyle: 0,
-  linewidth: 2,
 } as const;
 
 export const CONTRACT_CHART_LOADING_OVERLAY_CLASS_NAME =
@@ -839,6 +823,7 @@ export function resolveContractTradingViewOverlayPrice(
   const roleMatchesDomain = (
     (referencePrice.role === 'LAST_TRADE' && referencePrice.domain === 'TRADES')
     || (referencePrice.role === 'KLINE_CLOSE' && referencePrice.domain === 'KLINE')
+    || (referencePrice.role === 'LAST_PRICE' && referencePrice.domain === 'TICKER')
   );
   if (
     !referencePrice.usable
@@ -1990,12 +1975,6 @@ export default function ContractTradingViewChart({
       ) {
         priceOverlayControllerRef.current = new ContractTradingViewPriceOverlayController(
           chart as ContractTradingViewOverlayChart,
-        );
-      }
-      if (chartModeRef.current === 'time') {
-        chart.getSeries?.().setChartStyleProperties?.(
-          TRADINGVIEW_TIME_STYLE,
-          CONTRACT_TIME_LINE_STYLE_PREFERENCES,
         );
       }
       chartReadyRef.current = true;
