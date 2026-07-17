@@ -195,6 +195,30 @@ const baseProps = {
   volumeTurnover24h: '100.00 / 6.40M',
 };
 
+function makeReferencePrice(
+  value: number | null,
+  overrides: Record<string, unknown> = {},
+) {
+  const usable = value !== null;
+  return {
+    value,
+    domain: usable ? 'TRADES' : 'UNAVAILABLE',
+    source: usable ? 'CONTRACT_TRADES' : null,
+    provider: usable ? 'BINANCE_USDM' : null,
+    freshness: usable ? 'LIVE' : null,
+    eventTimeMs: usable ? 1_720_000_000_000 : null,
+    receivedAtMs: usable ? 1_720_000_000_100 : null,
+    generation: usable ? 9 : null,
+    revision: usable ? { epoch: 9, sequence: 12, isClosed: false, checksum: null } : null,
+    usable,
+    rejectReason: usable ? null : 'REFERENCE_PRICE_UNAVAILABLE',
+    symbol: 'BTCUSDT_PERP',
+    interval: '1m',
+    role: usable ? 'LAST_TRADE' : 'UNAVAILABLE',
+    ...overrides,
+  };
+}
+
 function makeStoreSnapshot(overrides: Record<string, unknown> = {}) {
   return {
     symbol: 'BTCUSDT_PERP',
@@ -264,19 +288,132 @@ function findByTestId(tree: unknown, testId: string) {
   return found;
 }
 
-test('Header renders only the authoritative displayPrice as its main price', () => {
+test('Header renders the last-trade reference price as its only main price', () => {
   resetHarness();
+  storeSnapshotsBySymbol.BTCUSDT_PERP = makeStoreSnapshot({ displayPrice: '777.77' });
   const tree = renderHeader({
-    displayPrice: '123.45',
+    referencePrice: makeReferencePrice(123.45),
+    pricePrecision: 2,
     chartClose: '999.99',
-    lastTradePrice: '888.88',
-    depthMid: '777.77',
+    depthMid: '888.88',
   });
   const mainPrice = findByTestId(tree, 'contract-header-display-price');
 
   assert.equal(textContent(mainPrice), '123.45');
-  assert.equal(mainPrice.props['data-display-source'], 'LIVE_MID');
+  assert.equal(mainPrice.props['data-display-source'], 'CONTRACT_TRADES');
+  assert.equal(mainPrice.props['data-reference-role'], 'LAST_TRADE');
   assert.doesNotMatch(textContent(tree), /999\.99|888\.88|777\.77/);
+});
+
+test('Header accepts the legacy page price contract when referencePrice wiring is absent', () => {
+  resetHarness();
+  const tree = renderHeader({
+    referencePrice: undefined,
+    displayPrice: '64,321.5',
+    displayPriceSource: 'TRADE_TICK',
+    displayPriceLabel: '\u6700\u65b0\u6210\u4ea4',
+    tickerFreshness: 'LIVE',
+  });
+  const mainPrice = findByTestId(tree, 'contract-header-display-price');
+
+  assert.equal(textContent(mainPrice), '64,321.5');
+  assert.equal(mainPrice.props['data-display-source'], 'TRADE_TICK');
+  assert.equal(mainPrice.props['data-display-freshness'], 'LIVE');
+  assert.equal(mainPrice.props['data-reference-role'], '');
+  assert.equal(mainPrice.props.title, '\u6700\u65b0\u6210\u4ea4');
+});
+
+test('Header does not promote a live midpoint when last trade is unavailable', () => {
+  resetHarness();
+  storeSnapshotsBySymbol.BTCUSDT_PERP = makeStoreSnapshot({ displayPrice: '101' });
+  const tree = renderHeader({
+    referencePrice: makeReferencePrice(null),
+    displayPrice: '101.0',
+    displayPriceSource: 'LIVE_MID',
+    depthMid: '101.0',
+  });
+  const mainPrice = findByTestId(tree, 'contract-header-display-price');
+
+  assert.equal(textContent(mainPrice), '--');
+  assert.equal(mainPrice.props['data-reference-role'], 'UNAVAILABLE');
+  assert.doesNotMatch(textContent(tree), /101\.0/);
+});
+
+test('Header displays a closed-market Kline fallback with the KLINE_CLOSE role', () => {
+  resetHarness();
+  const tree = renderHeader({
+    referencePrice: makeReferencePrice(99, {
+      domain: 'KLINE',
+      source: 'CONTRACT_KLINE',
+      freshness: 'HISTORICAL',
+      role: 'KLINE_CLOSE',
+    }),
+    pricePrecision: 1,
+    quoteStatusLabel: '\u95ed\u5e02\u4e2d',
+    quoteStatusTone: 'unavailable',
+    marketStatus: 'CLOSED',
+    executable: false,
+  });
+  const mainPrice = findByTestId(tree, 'contract-header-display-price');
+
+  assert.equal(textContent(mainPrice), '99.0');
+  assert.equal(mainPrice.props['data-reference-role'], 'KLINE_CLOSE');
+  assert.equal(mainPrice.props['data-display-source'], 'CONTRACT_KLINE');
+});
+
+test('closed market keeps provider last price visible when reference evidence is unavailable', () => {
+  resetHarness();
+  const tree = renderHeader({
+    referencePrice: makeReferencePrice(null),
+    displayPrice: '327.50',
+    displayPriceSource: 'TRADE_TICK',
+    displayPriceLabel: '\u6700\u65b0\u6210\u4ea4',
+    tickerFreshness: 'LAST_VALID',
+    quoteStatusLabel: '\u76d8\u540e',
+    quoteStatusTone: 'unavailable',
+    marketStatus: 'CLOSED',
+    marketSessionType: 'AFTER_HOURS',
+    executable: false,
+  });
+  const mainPrice = findByTestId(tree, 'contract-header-display-price');
+
+  assert.equal(textContent(mainPrice), '327.50');
+  assert.equal(mainPrice.props['data-reference-role'], '');
+  assert.equal(mainPrice.props['data-display-source'], 'TRADE_TICK');
+  assert.equal(mainPrice.props['data-display-freshness'], 'LAST_VALID');
+  assert.equal(
+    textContent(findByTestId(tree, 'contract-header-market-status')),
+    '\u76d8\u540e\u00b7\u4e0d\u53ef\u4ea4\u6613',
+  );
+});
+
+test('open market does not bypass unavailable reference evidence with a display fallback', () => {
+  resetHarness();
+  const tree = renderHeader({
+    referencePrice: makeReferencePrice(null),
+    displayPrice: '327.50',
+    marketStatus: 'OPEN',
+    marketSessionType: 'REGULAR',
+    executable: false,
+  });
+
+  assert.equal(textContent(findByTestId(tree, 'contract-header-display-price')), '--');
+});
+
+test('Header keeps the reference main price separate from contract product metrics', () => {
+  resetHarness();
+  const tree = renderHeader({
+    referencePrice: makeReferencePrice(100),
+    pricePrecision: 1,
+    markPrice: '120.0',
+    indexPrice: '121.0',
+    fundingRate: '+0.0200%',
+  });
+
+  assert.equal(textContent(findByTestId(tree, 'contract-header-display-price')), '100.0');
+  assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c120.0');
+  assert.equal(textContent(findByTestId(tree, 'contract-header-index-price')), '\u6307\u6570\u4ef7\u683c121.0');
+  assert.equal(textContent(findByTestId(tree, 'contract-header-funding-rate')), '\u8d44\u91d1\u8d39\u7387+0.0200%');
 });
 
 test('priceDirection applies up, down, and flat main-price colors', () => {
@@ -320,11 +457,11 @@ test('price changes use a direction-colored 320ms flash and scale feedback', () 
 
 test('authoritative MarketView labels map PRE_MARKET, REGULAR, AFTER_HOURS, CLOSED, and HOLIDAY', () => {
   const cases = [
-    [{ quoteStatusLabel: '\u76d8\u524d', quoteStatusTone: 'unavailable', executable: false }, '\u76d8\u524d', 'pre_market'],
-    [{ quoteStatusLabel: '\u5b9e\u65f6', quoteStatusTone: 'live', executable: true }, '\u5b9e\u65f6', 'live'],
-    [{ quoteStatusLabel: '\u76d8\u540e', quoteStatusTone: 'unavailable', executable: false }, '\u76d8\u540e', 'after_hours'],
-    [{ quoteStatusLabel: '\u95ed\u5e02\u4e2d', quoteStatusTone: 'unavailable', executable: false }, '\u95ed\u5e02\u4e2d', 'closed'],
-    [{ quoteStatusLabel: '\u4f11\u5e02\u4e2d', quoteStatusTone: 'unavailable', executable: false }, '\u4f11\u5e02\u4e2d', 'holiday'],
+    [{ quoteStatusLabel: '\u76d8\u524d', quoteStatusTone: 'unavailable', executable: false }, '\u76d8\u524d\u00b7\u4e0d\u53ef\u4ea4\u6613', 'pre_market'],
+    [{ quoteStatusLabel: '\u5b9e\u65f6', quoteStatusTone: 'live', executable: true }, '\u5b9e\u65f6\u00b7\u4ea4\u6613\u4e2d', 'live'],
+    [{ quoteStatusLabel: '\u76d8\u540e', quoteStatusTone: 'unavailable', executable: false }, '\u76d8\u540e\u00b7\u4e0d\u53ef\u4ea4\u6613', 'after_hours'],
+    [{ quoteStatusLabel: '\u95ed\u5e02\u4e2d', quoteStatusTone: 'unavailable', executable: false }, '\u95ed\u5e02\u4e2d\u00b7\u4e0d\u53ef\u4ea4\u6613', 'closed'],
+    [{ quoteStatusLabel: '\u4f11\u5e02\u4e2d', quoteStatusTone: 'unavailable', executable: false }, '\u4f11\u5e02\u4e2d\u00b7\u4e0d\u53ef\u4ea4\u6613', 'holiday'],
   ] as const;
 
   for (const [overrides, expectedLabel, expectedState] of cases) {
@@ -349,7 +486,7 @@ test('unavailable price/status renders only the user-facing unavailable state', 
   });
   const status = findByTestId(tree, 'contract-header-market-status');
 
-  assert.equal(textContent(status), '\u884c\u60c5\u6682\u4e0d\u53ef\u7528');
+  assert.equal(textContent(status), '\u884c\u60c5\u6682\u4e0d\u53ef\u7528\u00b7\u4e0d\u53ef\u4ea4\u6613');
   assert.doesNotMatch(textContent(tree), /LAST_GOOD_BBO|FALLBACK|STALE/);
 });
 

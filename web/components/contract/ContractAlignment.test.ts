@@ -79,12 +79,13 @@ test('Contract Price Authority keeps trade provenance on one evidence row', () =
   expect(authoritySection).not.toContain('mark_price');
 });
 
-test('contract ticker polling is suspended while the page is hidden', () => {
+test('contract ticker polling runs only while visible and realtime is disconnected', () => {
   const source = readSource('app/contract/page.tsx');
 
   expect(source).toContain('const isPageVisible = useContractPageVisibility()');
   expect(source).toContain('if (!isPageVisible) return undefined');
-  expect(source).toContain('}, [contractSymbol, isPageVisible]);');
+  expect(source).toContain("if (!isPageVisible || contractMarketRealtimeStatus === 'connected') return undefined");
+  expect(source).toContain('[contractMarketRealtimeStatus, isPageVisible, refreshContractTicker]');
 });
 
 test('contract header receives authoritative MarketView status and does not synthesize quote time', () => {
@@ -95,8 +96,9 @@ test('contract header receives authoritative MarketView status and does not synt
   expect(pageSource).toContain('tickerSource={tickerSource}');
   expect(pageSource).toContain('tickerFreshness={tickerFreshness}');
   expect(pageSource).toContain('executable={contractExecutable}');
+  expect(pageSource).toContain('referencePrice={referencePrice}');
   expect(headerSource).toContain('quoteStatusLabel');
-  expect(headerSource).toContain("data-display-freshness={tickerFreshness || ''}");
+  expect(headerSource).toContain("data-display-freshness={displayPriceFreshness || ''}");
   expect(headerSource).toContain('resolveContractHeaderMarketPresentation({');
   expect(headerSource).not.toContain('getContractTickerDomainStatusLabel');
   expect(headerSource).not.toContain('<MarketStatusBadge');
@@ -125,6 +127,8 @@ test('contract TradingView and OrderBook share one referencePrice contract', () 
 
   expect(pageSource).toMatch(/<ContractTradingViewChart[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
   expect(pageSource).toMatch(/<ContractFuturesOrderBook[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
+  expect(pageSource).toContain('fallbackLastPrice: activeContractTicker?.last_price');
+  expect(pageSource).not.toContain('displayOnlyPrice=');
   expect(pageSource).not.toContain('centerPrice={contractMarketState.displayPrice}');
   expect(orderBookSource).toContain('referencePrice: ContractReferencePrice;');
   expect(orderBookSource).toContain('const centerPriceNumber = referencePrice.usable');
