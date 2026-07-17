@@ -327,6 +327,7 @@ def _truthful_contract_trades(
 def _normalize_kline(row: dict[str, Any], *, source: str | None = None) -> dict[str, Any]:
     open_time = row.get("open_time") or row.get("time") or row.get("timestamp")
     open_time_ms = _timestamp_ms(open_time)
+    volume = row.get("volume")
     return {
         **row,
         "time": int(open_time_ms / 1000),
@@ -335,7 +336,7 @@ def _normalize_kline(row: dict[str, Any], *, source: str | None = None) -> dict[
         "high": str(row.get("high") or ""),
         "low": str(row.get("low") or ""),
         "close": str(row.get("close") or ""),
-        "volume": str(row.get("volume") or "0"),
+        "volume": str(volume) if volume not in (None, "") else None,
         "is_final": bool(row.get("is_final", False)),
         "source": row.get("source") or source,
     }
@@ -1077,7 +1078,7 @@ class ContractMarketGateway:
                 if not isinstance(payload, dict):
                     continue
                 kline = _legacy_domain_value(
-                    _normalize_kline(payload, source=payload.get("source"))
+                    _normalize_kline(payload, source=payload.get("source") or "LIVE_WS")
                 )
                 signature = self._kline_signature(kline)
                 if self._last_kline_signature.get(key) == signature:

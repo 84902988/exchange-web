@@ -128,6 +128,11 @@ test('only complete non-stale provider current metadata is cacheable', () => {
     ] }),
     response({ items: [{ ...response().items[0], open_time: 0 }] }),
     response({ items: [{ ...response().items[0], close: 'not-a-number' }] }),
+    response({ items: [{ ...response().items[0], volume: undefined }] }),
+    response({ items: [{ ...response().items[0], volume: null }] }),
+    response({ items: [{ ...response().items[0], volume: '' }] }),
+    response({ items: [{ ...response().items[0], volume: 'not-a-number' }] }),
+    response({ items: [{ ...response().items[0], volume: '-1' }] }),
     response({ items: [
       response().items[0],
       { ...response().items[0], source: 'BBO' },
@@ -137,6 +142,9 @@ test('only complete non-stale provider current metadata is cacheable', () => {
   ]) {
     assert.equal(isCacheable(invalid), false);
   }
+  assert.equal(isCacheable(response({
+    items: [{ ...response().items[0], volume: '0' }],
+  })), true, 'an explicit zero-volume provider candle remains valid evidence');
 });
 
 
