@@ -22,6 +22,23 @@ test('contract terminal reuses the shared selector and isolates symbol-scoped pr
   expect(source).toContain('return Boolean(symbol)');
 });
 
+test('contract chart capability classification ignores localized display groups', () => {
+  const source = readSource('app/contract/page.tsx');
+  const capabilityStart = source.indexOf('function getContractPairCapabilityCategories');
+  const capabilityEnd = source.indexOf('function contractPairMatchesUrlCategory', capabilityStart);
+  const capabilitySource = source.slice(capabilityStart, capabilityEnd);
+  const tradfiStart = source.indexOf('function isTradfiContractPair');
+  const tradfiEnd = source.indexOf('// Kept for future cross-market toolbar support', tradfiStart);
+  const tradfiSource = source.slice(tradfiStart, tradfiEnd);
+
+  expect(capabilitySource).toContain('pair.assetType');
+  expect(capabilitySource).toContain('pair.marketCategory');
+  expect(capabilitySource).toContain('pair.marketSubCategory');
+  expect(capabilitySource).not.toContain('pair.displayGroup');
+  expect(tradfiSource).toContain('getContractPairCapabilityCategories(pair)');
+  expect(source).toContain("CONTRACT_INTERVAL_OPTIONS.filter((item) => item !== '4h')");
+});
+
 test('contract market panels keep click-to-fill states without duplicating the symbol title', () => {
   const pageSource = readSource('app/contract/page.tsx');
   const orderBookSource = readSource('components/contract/ContractFuturesOrderBook.tsx');
