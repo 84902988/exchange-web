@@ -201,6 +201,18 @@ export class ContractMarketStore {
     return this.state.sessionGeneration;
   }
 
+  restartSession(symbolValue: unknown = this.state.activeSymbol): number {
+    const symbol = normalizeSymbol(symbolValue);
+    if (!symbol) return this.state.sessionGeneration;
+    if (this.state.activeSymbol !== symbol) return this.activateSymbol(symbol);
+    this.replaceState({
+      ...this.state,
+      sessionGeneration: this.state.sessionGeneration + 1,
+      version: this.state.version + 1,
+    });
+    return this.state.sessionGeneration;
+  }
+
   getEntry<TData = unknown>(
     symbol: unknown,
     domain: ContractMarketStoreDomain,
@@ -225,10 +237,23 @@ export class ContractMarketStore {
     }
 
     const key = buildContractMarketStoreKey(symbol, input.domain, interval);
-    const current = this.state.entries[key] ?? null;
+    const storedCurrent = this.state.entries[key] ?? null;
+    const current = storedCurrent?.sessionGeneration === this.state.sessionGeneration
+      ? storedCurrent
+      : null;
     const provider = normalizeText(input.provider);
     const freshness = normalizeText(input.freshness);
-    const providerGeneration = normalizeNonNegativeNumber(input.providerGeneration);
+    const incomingProviderGeneration = normalizeNonNegativeNumber(input.providerGeneration);
+    // Contract depth REST bootstraps expose the provider generation, while the
+    // live depth envelope currently omits it. Preserve the accepted lineage
+    // only for the same depth provider; all symbol/provider/time fences below
+    // still apply and other domains keep their strict generation contract.
+    const providerGeneration = input.domain === 'depth'
+      && input.transport === 'WS'
+      && incomingProviderGeneration === null
+      && current?.provider === provider
+      ? current.providerGeneration
+      : incomingProviderGeneration;
     const revision = normalizeRevision(input.revision);
     const eventTimeMs = normalizeTimestamp(input.eventTimeMs);
     const receivedAtMs = normalizeTimestamp(input.receivedAtMs) ?? Date.now();

@@ -3,10 +3,11 @@ type ContractPriceInput = string | number | null | undefined;
 export type ContractPriceDomain =
   | 'TRADES'
   | 'KLINE'
+  | 'TICKER'
   | 'EXECUTION'
   | 'UNAVAILABLE';
 
-export type ContractReferencePriceRole = 'LAST_TRADE' | 'KLINE_CLOSE' | 'UNAVAILABLE';
+export type ContractReferencePriceRole = 'LAST_TRADE' | 'KLINE_CLOSE' | 'LAST_PRICE' | 'UNAVAILABLE';
 
 export type ContractExecutionIntent =
   | 'OPEN_LONG'
@@ -49,6 +50,16 @@ export type ContractKlineReferenceInput = {
   klineMode?: string | null;
 };
 
+export type ContractTickerReferenceInput = {
+  symbol?: string | null;
+  price?: ContractPriceInput;
+  time?: string | number | null;
+  source?: string | null;
+  freshness?: string | null;
+  marketStatus?: string | null;
+  marketSessionType?: string | null;
+};
+
 export type ContractExecutionBookInput = {
   symbol?: string | null;
   bid?: ContractPriceInput;
@@ -64,6 +75,7 @@ export type BuildContractPriceAuthorityInput = {
   symbol: string;
   trade?: ContractTradeReferenceInput | null;
   kline?: ContractKlineReferenceInput | null;
+  ticker?: ContractTickerReferenceInput | null;
   execution?: ContractExecutionBookInput | null;
 };
 
@@ -92,6 +104,18 @@ export type ResolvedContractExecutionPrice = {
 
 const REFERENCE_FRESHNESSES = new Set(['LIVE', 'RECENT', 'FRESH', 'CURRENT']);
 const KLINE_FRESHNESSES = new Set([...REFERENCE_FRESHNESSES, 'CACHED']);
+const NON_TRADING_TICKER_FRESHNESSES = new Set([
+  ...KLINE_FRESHNESSES,
+  'LAST_VALID',
+  'LAST_GOOD',
+  'STALE',
+]);
+const NON_TRADING_SESSION_TOKENS = new Set([
+  'PRE_MARKET',
+  'AFTER_HOURS',
+  'CLOSED',
+  'HOLIDAY',
+]);
 
 function normalizeToken(value: unknown): string | null {
   const normalized = String(value ?? '').trim().toUpperCase();
@@ -212,21 +236,67 @@ function buildKlineEvidence(
   };
 }
 
+function buildTickerEvidence(
+  targetSymbol: string,
+  input?: ContractTickerReferenceInput | null,
+): ContractPriceEvidence {
+  if (!input) return unavailableEvidence(targetSymbol, 'TICKER', 'TICKER_EVIDENCE_MISSING');
+
+  const symbol = normalizeSymbol(input.symbol);
+  const value = positiveNumber(input.price);
+  const eventTimeMs = timestampMs(input.time);
+  const provider = normalizeToken(input.source);
+  const freshness = normalizeToken(input.freshness);
+  const marketStatus = normalizeToken(input.marketStatus);
+  const marketSessionType = normalizeToken(input.marketSessionType);
+  const isNonTradingSession = NON_TRADING_SESSION_TOKENS.has(marketStatus || '')
+    || NON_TRADING_SESSION_TOKENS.has(marketSessionType || '');
+  const permittedFreshness = isNonTradingSession
+    ? NON_TRADING_TICKER_FRESHNESSES
+    : REFERENCE_FRESHNESSES;
+  let rejectReason: string | null = null;
+
+  if (!targetSymbol || !symbol || symbol !== targetSymbol) rejectReason = 'SYMBOL_MISMATCH';
+  else if (value === null) rejectReason = 'LAST_PRICE_MISSING';
+  else if (eventTimeMs === null) rejectReason = 'TICKER_TIME_MISSING';
+  else if (!provider) rejectReason = 'TICKER_SOURCE_MISSING';
+  else if (!freshness || !permittedFreshness.has(freshness)) {
+    rejectReason = freshness === 'STALE' ? 'STALE' : 'FRESHNESS_UNUSABLE';
+  }
+
+  return {
+    value,
+    domain: 'TICKER',
+    source: 'LAST_PRICE',
+    provider,
+    freshness,
+    eventTimeMs,
+    usable: rejectReason === null,
+    rejectReason,
+    symbol: symbol || targetSymbol,
+  };
+}
+
 function selectReferencePrice(
   targetSymbol: string,
   trade: ContractPriceEvidence,
   kline: ContractPriceEvidence,
+  ticker: ContractPriceEvidence,
   hadTradeInput: boolean,
   hadKlineInput: boolean,
+  hadTickerInput: boolean,
 ): ContractReferencePrice {
   if (trade.usable) return { ...trade, role: 'LAST_TRADE' };
   if (kline.usable) return { ...kline, role: 'KLINE_CLOSE' };
+  if (ticker.usable) return { ...ticker, role: 'LAST_PRICE' };
 
   const rejectReason = hadTradeInput
     ? trade.rejectReason
     : hadKlineInput
       ? kline.rejectReason
-      : 'REFERENCE_PRICE_UNAVAILABLE';
+      : hadTickerInput
+        ? ticker.rejectReason
+        : 'REFERENCE_PRICE_UNAVAILABLE';
   return {
     ...unavailableEvidence(targetSymbol, 'UNAVAILABLE', rejectReason || 'REFERENCE_PRICE_UNAVAILABLE'),
     role: 'UNAVAILABLE',
@@ -279,6 +349,7 @@ export function buildContractPriceAuthority(
   const symbol = normalizeSymbol(input.symbol);
   const trade = buildTradeEvidence(symbol, input.trade);
   const kline = buildKlineEvidence(symbol, input.kline);
+  const ticker = buildTickerEvidence(symbol, input.ticker);
   const executionFailure = executionRejectReason(symbol, input.execution);
   const executionBid = buildExecutionEvidence(symbol, input.execution, 'bid', executionFailure);
   const executionAsk = buildExecutionEvidence(symbol, input.execution, 'ask', executionFailure);
@@ -289,8 +360,10 @@ export function buildContractPriceAuthority(
       symbol,
       trade,
       kline,
+      ticker,
       input.trade !== null && input.trade !== undefined,
       input.kline !== null && input.kline !== undefined,
+      input.ticker !== null && input.ticker !== undefined,
     ),
     execution_bid: executionBid,
     execution_ask: executionAsk,

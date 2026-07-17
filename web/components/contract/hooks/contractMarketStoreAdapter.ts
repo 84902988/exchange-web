@@ -219,7 +219,11 @@ function tradeIdentity(value: unknown): string {
 
 function mergeRealtimeTrades(symbol: string, incoming: unknown): unknown {
   if (!Array.isArray(incoming)) return incoming;
-  const current = contractMarketStore.getEntry<unknown[]>(symbol, 'trades')?.data;
+  const state = contractMarketStore.getState();
+  const entry = contractMarketStore.getEntry<unknown[]>(symbol, 'trades');
+  const current = entry?.sessionGeneration === state.sessionGeneration
+    ? entry.data
+    : null;
   if (!Array.isArray(current)) return incoming;
   const seen = new Set<string>();
   return [...incoming, ...current]
@@ -395,8 +399,19 @@ export function selectContractHeaderStoreSnapshot(
 ): ContractHeaderStoreSnapshot | null {
   const symbol = normalizeSymbol(symbolValue);
   if (!symbol) return null;
-  const tickerEntry = state.entries[buildContractMarketStoreKey(symbol, 'ticker')];
-  const depthEntry = state.entries[buildContractMarketStoreKey(symbol, 'depth')];
+  const activeSymbol = normalizeSymbol(state.activeSymbol);
+  const tickerCandidate = activeSymbol === symbol
+    ? state.entries[buildContractMarketStoreKey(symbol, 'ticker')]
+    : undefined;
+  const depthCandidate = activeSymbol === symbol
+    ? state.entries[buildContractMarketStoreKey(symbol, 'depth')]
+    : undefined;
+  const tickerEntry = tickerCandidate?.sessionGeneration === state.sessionGeneration
+    ? tickerCandidate
+    : undefined;
+  const depthEntry = depthCandidate?.sessionGeneration === state.sessionGeneration
+    ? depthCandidate
+    : undefined;
   const cached = headerSnapshotCache.get(symbol);
   if (
     cached
@@ -625,8 +640,11 @@ export function selectContractOrderBookStoreSnapshot(
   state: ContractMarketStoreState,
 ): ContractOrderBookStoreSnapshot | null {
   const symbol = normalizeSymbol(state.activeSymbol);
-  const depthEntry = symbol
+  const depthCandidate = symbol
     ? state.entries[buildContractMarketStoreKey(symbol, 'depth')]
+    : undefined;
+  const depthEntry = depthCandidate?.sessionGeneration === state.sessionGeneration
+    ? depthCandidate
     : undefined;
   if (
     orderBookSnapshotCache.activeSymbol === (symbol || null)
@@ -806,8 +824,11 @@ export function selectContractTradesStoreSnapshot(
   state: ContractMarketStoreState,
 ): ContractTradesStoreSnapshot | null {
   const symbol = normalizeSymbol(state.activeSymbol);
-  const tradesEntry = symbol
+  const tradesCandidate = symbol
     ? state.entries[buildContractMarketStoreKey(symbol, 'trades')]
+    : undefined;
+  const tradesEntry = tradesCandidate?.sessionGeneration === state.sessionGeneration
+    ? tradesCandidate
     : undefined;
   if (
     tradesSnapshotCache.activeSymbol === (symbol || null)
@@ -865,6 +886,10 @@ export function useContractTradesStoreSnapshot(): ContractTradesStoreSnapshot | 
 
 export function activateContractMarketShadowSymbol(symbol: string): number {
   return contractMarketStore.activateSymbol(symbol);
+}
+
+export function restartContractMarketShadowSession(symbol: string): number {
+  return contractMarketStore.restartSession(symbol);
 }
 
 export function writeContractMarketShadowDomain({

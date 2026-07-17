@@ -26,6 +26,7 @@ import {
   activateContractMarketShadowSymbol,
   hydrateContractMarketRestDomain,
   ingestContractMarketWsDomain,
+  restartContractMarketShadowSession,
 } from './contractMarketStoreAdapter';
 
 export type PriceDirection = 'up' | 'down' | 'flat';
@@ -195,6 +196,7 @@ export function useContractMarketState({
   const contractQuoteRef = useRef<ContractQuoteWithPremiumFields | null>(null);
   const quoteLoadedSymbolRef = useRef<string | null>(null);
   const latestMarketPriceRef = useRef(0);
+  const previousMarketRealtimeStatusRef = useRef<ContractMarketRealtimeStatus>('idle');
 
   const marketSymbol = useMemo(
     () => getMarketSymbol(contractSymbol, symbolOptionMarketSymbol),
@@ -280,12 +282,13 @@ export function useContractMarketState({
     try {
       const nextQuote = await loadContractQuote(contractSymbol);
       const nextPrice = getQuoteTradePrice(nextQuote);
-      hydrateContractMarketRestDomain({
+      const storeResult = hydrateContractMarketRestDomain({
         symbol: contractSymbol,
         domain: 'ticker',
         data: nextQuote,
         metadata: nextQuote,
       });
+      if (!storeResult.accepted) return;
       applyLatestPrice(nextPrice);
       contractQuoteRef.current = nextQuote;
       quoteLoadedSymbolRef.current = contractSymbol;
@@ -362,6 +365,23 @@ export function useContractMarketState({
   useEffect(() => contractMarketRealtime.subscribeStatus(setMarketRealtimeStatus), []);
 
   useEffect(() => {
+    const previousStatus = previousMarketRealtimeStatusRef.current;
+    previousMarketRealtimeStatusRef.current = marketRealtimeStatus;
+    if (previousStatus !== 'connected' || marketRealtimeStatus === 'connected') return;
+
+    restartContractMarketShadowSession(contractSymbol);
+    contractQuoteRef.current = null;
+    quoteLoadedSymbolRef.current = null;
+    latestMarketPriceRef.current = 0;
+    setContractQuoteLoading(true);
+    setContractQuoteState({ symbol: contractSymbol, quote: null });
+    setLatestMarketPrice(null);
+    setPriceDirection('flat');
+    setBestDepth({ symbol: contractSymbol, bestBid: null, bestAsk: null, ts: null });
+    void refreshContractQuote();
+  }, [contractSymbol, marketRealtimeStatus, refreshContractQuote]);
+
+  useEffect(() => {
     const handleQuoteMessage = (message: ContractMarketRealtimeMessage) => {
       if (!isContractMarketDomainMessage(message)) return;
       const msgSymbol = getRealtimeMessageSymbol(message);
@@ -389,11 +409,12 @@ export function useContractMarketState({
       };
 
       const nextPrice = getQuoteTradePrice(mergedQuote);
-      ingestContractMarketWsDomain({
+      const storeResult = ingestContractMarketWsDomain({
         domain: 'ticker',
         message,
         data: mergedQuote,
       });
+      if (!storeResult.accepted) return;
       applyLatestPrice(nextPrice);
       contractQuoteRef.current = mergedQuote;
       quoteLoadedSymbolRef.current = contractSymbol;
@@ -411,6 +432,9 @@ export function useContractMarketState({
 
   useEffect(() => {
     void Promise.resolve().then(refreshContractQuote);
+  }, [refreshContractQuote]);
+
+  useEffect(() => {
     if (marketRealtimeStatus === 'connected') return undefined;
 
     const timer = window.setInterval(() => {
