@@ -227,28 +227,17 @@ test('TIME and candle toolbar highlights are mutually exclusive', () => {
 });
 
 
-test('TIME uses yellow line and area overrides while Loading remains click-through', () => {
+test('TIME keeps the native Spot gradient without changing candle or volume colors', () => {
   assert.deepEqual(chartModule.CONTRACT_TIME_SERIES_OVERRIDES, {
-    'mainSeriesProperties.lineStyle.colorType': 'solid',
-    'mainSeriesProperties.lineStyle.gradientStartColor': '#f0b90b',
-    'mainSeriesProperties.lineStyle.gradientEndColor': '#f0b90b',
-    'mainSeriesProperties.lineStyle.color': '#f0b90b',
-    'mainSeriesProperties.lineStyle.linewidth': 2,
-    'mainSeriesProperties.lineStyle.linestyle': 0,
-    'mainSeriesProperties.lineStyle.priceSource': 'close',
     'mainSeriesProperties.areaStyle.color1': 'rgba(240,185,11,0.24)',
     'mainSeriesProperties.areaStyle.color2': 'rgba(240,185,11,0.02)',
     'mainSeriesProperties.areaStyle.linecolor': '#f0b90b',
     'mainSeriesProperties.areaStyle.linewidth': 2,
   });
-  assert.deepEqual(chartModule.CONTRACT_TIME_LINE_STYLE_PREFERENCES, {
-    colorType: 'solid',
-    gradientStartColor: '#f0b90b',
-    gradientEndColor: '#f0b90b',
-    color: '#f0b90b',
-    linestyle: 0,
-    linewidth: 2,
-  });
+  assert.equal(
+    Object.keys(chartModule.CONTRACT_TIME_SERIES_OVERRIDES).some((key) => key.includes('lineStyle')),
+    false,
+  );
   assert.match(chartModule.CONTRACT_CHART_LOADING_OVERLAY_CLASS_NAME, /pointer-events-none/);
   assert.doesNotMatch(chartModule.CONTRACT_CHART_LOADING_OVERLAY_CLASS_NAME, /pointer-events-auto/);
 });
@@ -995,19 +984,21 @@ test('destroyed Loading coordinator clears timers without later side effects', (
   assert.equal(clock.tasks.size, 0);
 });
 
-test('initial visible range uses the Contract policy and keeps four right-padding bars', () => {
+test('initial visible range matches Spot at 50 bars and keeps four right-padding bars', () => {
   const latestBarTimeMs = 1_800_000_000_000;
-  const monthly = chartModule.resolveContractInitialVisibleRange('1M', latestBarTimeMs);
-  assert.equal(monthly.targetVisibleBars, 36);
-  assert.equal(monthly.rightPaddingBars, 4);
-  assert.equal(
-    monthly.range.to - monthly.range.from,
-    36 * 30 * 24 * 60 * 60,
-  );
+  for (const interval of ['1m', '5m', '15m', '1h', '4h', '1d', '1w', '1M']) {
+    const range = chartModule.resolveContractInitialVisibleRange(interval, latestBarTimeMs);
+    assert.equal(range.targetVisibleBars, 50, interval);
+    assert.equal(range.rightPaddingBars, 4, interval);
+    assert.equal(range.range.to, Math.floor(latestBarTimeMs / 1000), interval);
+  }
 
   const fifteenMinutes = chartModule.resolveContractInitialVisibleRange('15m', latestBarTimeMs);
-  assert.equal(fifteenMinutes.targetVisibleBars, 85);
   assert.equal(fifteenMinutes.intervalSeconds, 15 * 60);
+  assert.equal(
+    fifteenMinutes.range.to - fifteenMinutes.range.from,
+    50 * 15 * 60,
+  );
 });
 
 test('native TradingView last value and main price line are disabled', () => {
@@ -1048,6 +1039,21 @@ test('last trade reference 100 produces overlay 100', () => {
   );
 
   assert.equal(overlayPrice, 100);
+});
+
+test('closed-market ticker reference produces the same TradingView overlay evidence', () => {
+  const overlayPrice = chartModule.resolveContractTradingViewOverlayPrice(
+    makeReferencePrice(327.5, {
+      domain: 'TICKER',
+      source: 'LAST_PRICE',
+      provider: 'ITICK_QUOTE',
+      freshness: 'LAST_VALID',
+      role: 'LAST_PRICE',
+    }),
+    'BTCUSDT_PERP',
+  );
+
+  assert.equal(overlayPrice, 327.5);
 });
 
 test('Kline close remains 99 while last-trade overlay remains 100', () => {
