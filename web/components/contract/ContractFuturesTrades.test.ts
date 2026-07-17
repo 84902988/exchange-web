@@ -91,12 +91,6 @@ const componentModule = loadTypeScriptModule(
         t: (key: string) => translations[key] || key,
       }),
     },
-    './contractMarketSourceStatus': {
-      getContractDomainStatusLabel: () => '\u6210\u4ea4\u6765\u6e90: \u5b9e\u65f6',
-      getContractMarketSourceLabel: () => '\u5b9e\u65f6',
-      getContractMarketSourceTone: () => 'realtime',
-      getContractMarketSourceToneClass: () => 'realtime',
-    },
     './hooks/contractMarketStoreAdapter': {
       useContractTradesStoreSnapshot: () => tradesStoreSnapshot,
     },
@@ -160,7 +154,7 @@ function textContent(value: unknown): string {
   return textContent(node.props?.children);
 }
 
-test('Trades reads Store first and emits a structured legacy diff', () => {
+test('Trades reads Store first without emitting production diff logs', () => {
   tradesStoreSnapshot = makeStoreSnapshot();
   const logs: unknown[][] = [];
   const originalInfo = console.info;
@@ -172,8 +166,7 @@ test('Trades reads Store first and emits a structured legacy diff', () => {
     assert.equal(tree.props['data-market-authority'], 'STORE');
     assert.equal(tree.props['data-market-symbol'], 'BTCUSDT_PERP');
     assert.equal(tree.props['data-provider-generation'], 9);
-    assert.equal(logs.length, 1);
-    assert.equal(logs[0][0], '[contract-trades-domain-diff]');
+    assert.equal(logs.length, 0);
   } finally {
     console.info = originalInfo;
   }
@@ -185,6 +178,14 @@ test('Trades falls back to legacy only while Store is missing', () => {
 
   assert.match(textContent(tree), /64000\.00/);
   assert.equal(tree.props['data-market-authority'], 'LEGACY_FALLBACK');
+});
+
+test('Trades keeps realtime provenance in diagnostics without duplicating a realtime badge', () => {
+  tradesStoreSnapshot = null;
+  const tree = renderTrades();
+
+  assert.match(textContent(tree), /64000\.00/);
+  assert.doesNotMatch(textContent(tree), /\u5b9e\u65f6/);
 });
 
 test('symbol-switch loading guard never renders the previous Store trades', () => {

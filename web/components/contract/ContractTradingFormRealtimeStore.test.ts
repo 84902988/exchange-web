@@ -16,6 +16,12 @@ function writeTicker(params: {
   executable?: boolean;
   eventTimeMs: number;
   generation?: number;
+  revision?: {
+    epoch: number;
+    sequence: number;
+    isClosed?: boolean;
+    checksum?: string;
+  };
 }) {
   const symbol = params.symbol || 'BTCUSDT_PERP';
   return writeContractMarketShadowDomain({
@@ -39,6 +45,7 @@ function writeTicker(params: {
       provider: 'BINANCE_USDM',
       provider_generation: params.generation,
       provider_event_time_ms: params.eventTimeMs,
+      revision: params.revision,
     },
   });
 }
@@ -90,6 +97,30 @@ describe('Contract TradingForm realtime Store adapter', () => {
     expect(selectTradingForm()).toMatchObject({
       displayPrice: '64000',
       providerGeneration: 12,
+    });
+  });
+
+  it('rejects revision rollback even when the quote arrives later', () => {
+    contractMarketStore.resetForTests();
+    activateContractMarketShadowSymbol('BTCUSDT_PERP');
+    writeTicker({
+      displayPrice: '64000',
+      eventTimeMs: 1_720_000_000_100,
+      generation: 12,
+      revision: { epoch: 2, sequence: 30, checksum: 'r30' },
+    });
+    const rollback = writeTicker({
+      displayPrice: '65000',
+      eventTimeMs: 1_720_000_000_300,
+      generation: 12,
+      revision: { epoch: 2, sequence: 29, checksum: 'r29' },
+    });
+
+    expect(rollback).toMatchObject({ accepted: false, reason: 'REVISION_ROLLBACK' });
+    expect(selectTradingForm()).toMatchObject({
+      displayPrice: '64000',
+      providerGeneration: 12,
+      revision: { epoch: 2, sequence: 30 },
     });
   });
 
