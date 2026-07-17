@@ -908,9 +908,7 @@ async function loadContractKlineBarsForCountBack({
     if (!isActive()) break;
     if (!result || !Array.isArray(result.items)) break;
     lastMetadata = result;
-    if (!shouldRetainContractHistoryCoverage(result)) {
-      coverageReusable = false;
-    }
+    const pageCoverageReusable = shouldRetainContractHistoryCoverage(result);
     if (hasExplicitContractHistoryTerminalEvidence(result)) {
       terminalMetadata = result;
     }
@@ -924,6 +922,9 @@ async function loadContractKlineBarsForCountBack({
           && (pageEndTimeMs === undefined || bar.time < pageEndTimeMs)
         )),
     );
+    if (!pageCoverageReusable && pageBars.length > 0) {
+      coverageReusable = false;
+    }
     if (pageBars.length === 0) {
       stalled = !terminalMetadata;
       break;

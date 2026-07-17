@@ -104,6 +104,13 @@ test('only complete non-stale provider current metadata is cacheable', () => {
 
   assert.equal(isCacheable(response()), true);
   assert.equal(isCacheable(response({ freshness: 'CACHED', cache_status: 'HIT' })), true);
+  for (const cacheStatus of ['CONTINUITY_INVALID', 'STALE_OPEN', 'SHORT']) {
+    assert.equal(
+      isCacheable(response({ cache_status: cacheStatus })),
+      true,
+      `${cacheStatus} remains recent provider evidence when fail-closed metadata is clean`,
+    );
+  }
   for (const invalid of [
     response({ items: [] }),
     response({ stale: true, freshness: 'STALE' }),

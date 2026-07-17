@@ -39,6 +39,13 @@ const NON_PROVIDER_KLINE_SOURCE_TOKENS = new Set([
   'TRADE_TICK',
 ]);
 
+const RECENT_PROVIDER_CACHE_STATUSES = new Set([
+  'MISS',
+  'CONTINUITY_INVALID',
+  'STALE_OPEN',
+  'SHORT',
+]);
+
 function normalizeSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
 }
@@ -130,7 +137,7 @@ export function isContractKlineCurrentResponseCacheable(value: unknown) {
     ? record.cache_status.trim().toUpperCase()
     : '';
   const freshnessMatchesCacheStatus = (
-    (record.freshness === 'RECENT' && cacheStatus === 'MISS')
+    (record.freshness === 'RECENT' && RECENT_PROVIDER_CACHE_STATUSES.has(cacheStatus))
     || (record.freshness === 'CACHED' && cacheStatus === 'HIT')
   );
   return (

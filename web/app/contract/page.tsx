@@ -374,6 +374,7 @@ function ContractPageContent() {
     () => contractPairs.find((item) => item.symbol === contractSymbol) || null,
     [contractPairs, contractSymbol],
   );
+  const chartBootstrapReady = contractPairsLoaded && currentContractPair !== null;
   const activeContractTicker = useMemo(
     () => contractTicker && normalizeContractSymbol(contractTicker.symbol) === contractSymbol
       ? contractTicker
@@ -740,21 +741,29 @@ function ContractPageContent() {
           <div className="min-h-[420px] min-w-0 xl:col-start-1 xl:row-start-1 xl:min-h-0">
             <div className="flex h-full min-h-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
               <div className="min-h-0 flex-1">
-                <ContractTradingViewChart
-                  symbol={contractSymbol}
-                  category={currentContractKlineAssetClass}
-                  displaySymbol={currentContractPair?.displaySymbol || marketSymbol}
-                  interval={interval}
-                  chartMode={chartMode}
-                  intervalOptions={contractChartIntervalOptions}
-                  onChartModeChange={setChartMode}
-                  onIntervalChange={handleContractIntervalChange}
-                  pricePrecision={pricePrecision}
-                  amountPrecision={currentContractPair?.amountPrecision}
-                  referencePrice={referencePrice}
-                  priceDirection={currentPriceDirection}
-                  onLatestKlineCloseChange={handleLatestKlineCloseChange}
-                />
+                {chartBootstrapReady ? (
+                  <ContractTradingViewChart
+                    symbol={contractSymbol}
+                    category={currentContractKlineAssetClass}
+                    displaySymbol={currentContractPair.displaySymbol || marketSymbol}
+                    interval={interval}
+                    chartMode={chartMode}
+                    intervalOptions={contractChartIntervalOptions}
+                    onChartModeChange={setChartMode}
+                    onIntervalChange={handleContractIntervalChange}
+                    pricePrecision={pricePrecision}
+                    amountPrecision={currentContractPair.amountPrecision}
+                    referencePrice={referencePrice}
+                    priceDirection={currentPriceDirection}
+                    onLatestKlineCloseChange={handleLatestKlineCloseChange}
+                  />
+                ) : (
+                  <div
+                    aria-hidden="true"
+                    className="h-full min-h-[420px] animate-pulse bg-white/[0.015]"
+                    data-contract-chart-bootstrap="pending"
+                  />
+                )}
               </div>
             </div>
           </div>
