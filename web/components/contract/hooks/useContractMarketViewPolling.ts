@@ -4,7 +4,6 @@ import { useEffect, useRef, useState } from 'react';
 import type { ContractMarketRealtimeStatus } from '@/lib/realtime/contractMarketRealtime';
 
 export const CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS = 2_000;
-export const CONTRACT_MARKET_VIEW_RECONCILE_POLL_MS = 30_000;
 
 function readDocumentVisibility() {
   return typeof document === 'undefined' || document.visibilityState !== 'hidden';
@@ -30,9 +29,7 @@ export function getContractMarketViewPollInterval(
   isPageVisible: boolean,
 ) {
   if (!isPageVisible) return null;
-  return realtimeStatus === 'connected'
-    ? CONTRACT_MARKET_VIEW_RECONCILE_POLL_MS
-    : CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS;
+  return realtimeStatus === 'connected' ? null : CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS;
 }
 
 export function useContractMarketViewPolling({
@@ -46,7 +43,6 @@ export function useContractMarketViewPolling({
 }) {
   const isPageVisible = useContractPageVisibility();
   const refreshRef = useRef(refresh);
-  const previousRealtimeStatusRef = useRef(realtimeStatus);
   const previousVisibilityRef = useRef(isPageVisible);
 
   useEffect(() => {
@@ -58,24 +54,12 @@ export function useContractMarketViewPolling({
   }, [symbol]);
 
   useEffect(() => {
-    const previousStatus = previousRealtimeStatusRef.current;
-    previousRealtimeStatusRef.current = realtimeStatus;
-    if (
-      isPageVisible
-      && realtimeStatus === 'connected'
-      && previousStatus !== 'connected'
-    ) {
+    const wasPageVisible = previousVisibilityRef.current;
+    previousVisibilityRef.current = isPageVisible;
+    if (isPageVisible && !wasPageVisible && realtimeStatus !== 'connected') {
       void refreshRef.current();
     }
   }, [isPageVisible, realtimeStatus]);
-
-  useEffect(() => {
-    const wasPageVisible = previousVisibilityRef.current;
-    previousVisibilityRef.current = isPageVisible;
-    if (isPageVisible && !wasPageVisible) {
-      void refreshRef.current();
-    }
-  }, [isPageVisible]);
 
   useEffect(() => {
     const intervalMs = getContractMarketViewPollInterval(realtimeStatus, isPageVisible);

@@ -23,6 +23,7 @@ import {
   isContractKlineDomainMessage,
   isContractMarketDomainMessage,
   type ContractMarketRealtimeMessage,
+  type ContractMarketRealtimeStatus,
 } from '@/lib/realtime/contractMarketRealtime';
 import {
   readContractTradesCache,
@@ -89,6 +90,9 @@ type UseContractMarketViewParams = {
   fallbackMarketStatusText?: string | null;
   fallbackMarketSessionType?: string | null;
   fallbackQuoteFreshness?: string | null;
+  fallbackLastPrice?: string | number | null;
+  fallbackLastPriceSource?: string | null;
+  fallbackLastPriceTime?: string | number | null;
 };
 
 const FUTURES_DEPTH_LIMIT = 20;
@@ -398,6 +402,10 @@ export function useContractMarketView({
   fallbackMarketStatus,
   fallbackMarketStatusText,
   fallbackMarketSessionType,
+  fallbackQuoteFreshness,
+  fallbackLastPrice,
+  fallbackLastPriceSource,
+  fallbackLastPriceTime,
 }: UseContractMarketViewParams) {
   const { t } = useLocaleContext();
   const [restMarketView, setRestMarketView] = useState<ContractMarketViewDetail | null>(null);
@@ -443,6 +451,7 @@ export function useContractMarketView({
   const mountedRef = useRef(false);
   const currentPriceRef = useRef<number | null>(null);
   const previousMarketViewDisplayStateRef = useRef<string | null>(null);
+  const previousMarketRealtimeStatusRef = useRef<ContractMarketRealtimeStatus>('idle');
 
   const quoteState = useContractMarketState({
     contractSymbol,
@@ -481,7 +490,11 @@ export function useContractMarketView({
       ) {
         return;
       }
-      hydrateContractMarketViewShadow(view, 'REST');
+      const storeResults = hydrateContractMarketViewShadow(view, 'REST');
+      const tickerAccepted = storeResults.some((result) => (
+        result.accepted && result.entry?.domain === 'ticker'
+      ));
+      if (!tickerAccepted) return;
       setRestMarketView(view);
       marketViewErrorSymbolRef.current = null;
       setMarketViewError(null);
@@ -577,14 +590,45 @@ export function useContractMarketView({
       const nextState = extractContractMarketStateMessage(message);
       if (!nextState) return;
       if (normalizeContractSymbol(nextState.symbol) !== normalizeContractSymbol(contractSymbol)) return;
-      hydrateContractMarketViewShadow(nextState, 'WS');
+      const storeResults = hydrateContractMarketViewShadow(nextState, 'WS');
+      const tickerAccepted = storeResults.some((result) => (
+        result.accepted && result.entry?.domain === 'ticker'
+      ));
+      if (!tickerAccepted) return;
       setWsState(nextState);
     };
 
     return contractMarketRealtime.subscribe('state', handleMarketStateMessage);
   }, [contractSymbol]);
 
-  const activeRealtimeMarketView = normalizeContractSymbol(wsState?.symbol) === normalizeContractSymbol(contractSymbol)
+  useEffect(() => {
+    const previousStatus = previousMarketRealtimeStatusRef.current;
+    previousMarketRealtimeStatusRef.current = quoteMarketRealtimeStatus;
+    if (previousStatus !== 'connected' || quoteMarketRealtimeStatus === 'connected') return;
+
+    setWsState(null);
+    setDepthState((current) => ({
+      ...current,
+      symbol: normalizeContractSymbol(contractSymbol),
+      asks: [],
+      bids: [],
+      loading: true,
+      error: null,
+    }));
+    setTradesState((current) => ({
+      ...current,
+      symbol: normalizeContractSymbol(contractSymbol),
+      trades: [],
+      loading: true,
+      error: null,
+      source: null,
+      freshness: null,
+      updatedAt: null,
+    }));
+  }, [contractSymbol, quoteMarketRealtimeStatus]);
+
+  const activeRealtimeMarketView = quoteMarketRealtimeStatus === 'connected'
+    && normalizeContractSymbol(wsState?.symbol) === normalizeContractSymbol(contractSymbol)
     ? wsState
     : null;
   const activeRestMarketView = normalizeContractSymbol(restMarketView?.symbol) === normalizeContractSymbol(contractSymbol)
@@ -677,12 +721,13 @@ export function useContractMarketView({
       ) {
         return;
       }
-      hydrateContractMarketRestDomain({
+      const storeResult = hydrateContractMarketRestDomain({
         symbol: requestSymbol,
         domain: 'depth',
         data: depth,
         metadata: depth,
       });
+      if (!storeResult.accepted) return;
       applyDepthSnapshot({
         symbol: depth.symbol || requestSymbol,
         asks: depth.asks,
@@ -762,7 +807,10 @@ export function useContractMarketView({
       setFallbackDepthAllowed(true);
     }, DEPTH_INITIAL_GRACE_MS);
 
+    // REST bootstraps every session, then becomes a disconnected-only fallback.
+    // While realtime is connected, every depth frame comes from the WS Store path.
     void refreshDepth();
+
     if (quoteMarketRealtimeStatus === 'connected') {
       return () => {
         depthRequestSeqRef.current += 1;
@@ -794,11 +842,12 @@ export function useContractMarketView({
 
       const depth = extractRealtimeDepth(message, contractSymbol);
       if (!depth) return;
-      ingestContractMarketWsDomain({
+      const storeResult = ingestContractMarketWsDomain({
         domain: 'depth',
         message,
         data: depth,
       });
+      if (!storeResult.accepted) return;
       applyDepthSnapshot(depth);
     };
 
@@ -845,12 +894,13 @@ export function useContractMarketView({
       const trades = await getContractMarketTrades(requestSymbol, FUTURES_TRADES_LIMIT);
       if (!mountedRef.current || tradesRequestSeqRef.current !== requestSeq) return;
       const nextTrades = [...trades].reverse();
-      hydrateContractMarketRestDomain({
+      const storeResult = hydrateContractMarketRestDomain({
         symbol: requestSymbol,
         domain: 'trades',
         data: nextTrades,
         metadata: nextTrades[0] || null,
       });
+      if (!storeResult.accepted) return;
       applyTradesSnapshot(nextTrades);
     } catch (error) {
       if (!mountedRef.current || tradesRequestSeqRef.current !== requestSeq) return;
@@ -914,11 +964,12 @@ export function useContractMarketView({
 
       const trades = extractRealtimeTrades(message, contractSymbol);
       if (trades.length === 0) return;
-      ingestContractMarketWsDomain({
+      const storeResult = ingestContractMarketWsDomain({
         domain: 'trades',
         message,
         data: trades,
       });
+      if (!storeResult.accepted) return;
 
       setTradesState((current) => {
         if (normalizeContractSymbol(current.symbol) !== normalizeContractSymbol(contractSymbol)) {
@@ -999,6 +1050,15 @@ export function useContractMarketView({
       priceSource: marketView.kline_current_candle.price_source,
       klineMode: marketView.kline_current_candle.kline_mode ?? marketView.kline_source,
     } : null,
+    ticker: {
+      symbol: contractSymbol,
+      price: fallbackLastPrice,
+      time: fallbackLastPriceTime,
+      source: fallbackLastPriceSource,
+      freshness: fallbackQuoteFreshness,
+      marketStatus: fallbackMarketStatus,
+      marketSessionType: fallbackMarketSessionType,
+    },
     execution: marketView ? {
       symbol: marketView.symbol,
       bid: marketView.execution_bid,
@@ -1011,6 +1071,12 @@ export function useContractMarketView({
     } : null,
   }), [
     contractSymbol,
+    fallbackLastPrice,
+    fallbackLastPriceSource,
+    fallbackLastPriceTime,
+    fallbackMarketSessionType,
+    fallbackMarketStatus,
+    fallbackQuoteFreshness,
     latestTrade,
     marketView,
   ]);
