@@ -126,15 +126,12 @@ function sumPositiveAmount(levels: Array<{ amount: string | number }>) {
 export function calculateContractOrderBookDepthRatio({
   bids,
   asks,
-  displayMode,
   depthMode,
 }: {
   bids: ContractDepthLevel[];
   asks: ContractDepthLevel[];
-  displayMode: ContractOrderBookDisplayMode;
   depthMode?: ContractDepthMode | null;
 }): ContractOrderBookDepthRatio | null {
-  if (displayMode !== 'FULL') return null;
   if (normalizeContractDepthMode(depthMode) !== 'FULL_DEPTH') return null;
 
   const normalizedBids = normalizeLevels(bids, 'bid', CONTRACT_ORDERBOOK_LEVEL_LIMIT);

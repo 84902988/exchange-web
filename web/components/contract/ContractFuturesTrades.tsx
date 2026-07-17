@@ -1,17 +1,11 @@
 'use client';
 
-import { useEffect, useMemo } from 'react';
+import { useMemo } from 'react';
 import {
   type ContractMarketTrade,
 } from '@/lib/api/modules/contract';
 import { formatPrice as formatMarketPrice } from '@/lib/marketPrecision';
 import { useLocaleContext } from '@/contexts/LocaleContext';
-import {
-  getContractDomainStatusLabel,
-  getContractMarketSourceLabel,
-  getContractMarketSourceTone,
-  getContractMarketSourceToneClass,
-} from './contractMarketSourceStatus';
 import {
   type ContractTradesStoreSnapshot,
   useContractTradesStoreSnapshot,
@@ -188,39 +182,13 @@ export default function ContractFuturesTrades({
     () => resolveContractTradesMarketRead(storeSnapshot, legacyRead),
     [legacyRead, storeSnapshot],
   );
-  const readDifferences = useMemo(
-    () => getContractTradesReadDifferences(storeSnapshot, legacyRead),
-    [legacyRead, storeSnapshot],
-  );
-  useEffect(() => {
-    if (marketRead.authority !== 'STORE' || !storeSnapshot || readDifferences.length === 0) return;
-    console.info('[contract-trades-domain-diff]', {
-      symbol: storeSnapshot.symbol,
-      provider: storeSnapshot.provider,
-      providerGeneration: storeSnapshot.providerGeneration,
-      revision: storeSnapshot.revision,
-      observedAtMs: storeSnapshot.observedAtMs,
-      differences: readDifferences,
-    });
-  }, [marketRead.authority, readDifferences, storeSnapshot]);
-
   const {
     trades,
     loading,
     error,
     status,
-    source,
-    freshness,
   } = marketRead;
   const normalizedStatus = String(status || '').trim().toUpperCase();
-  const hasTradesSourceStatus = !!source || !!freshness;
-  const tradesSourceTone = getContractMarketSourceTone(source, freshness);
-  const tradesSourceStatusLabel = hasTradesSourceStatus
-    ? getContractMarketSourceLabel(source, freshness, t)
-    : null;
-  const tradesSourceStatusTitle = hasTradesSourceStatus
-    ? getContractDomainStatusLabel('trades', source, freshness, t)
-    : null;
 
   const data = useMemo(() => {
     return trades.map((item, index) => {
@@ -249,21 +217,11 @@ export default function ContractFuturesTrades({
         ? storeSnapshot?.providerGeneration ?? undefined
         : undefined}
     >
-      {tradesSourceStatusLabel || normalizedStatus === 'CLOSED' ? (
+      {normalizedStatus === 'CLOSED' ? (
         <div className="mb-1.5 flex min-h-5 items-center gap-2 px-1">
-          {tradesSourceStatusLabel ? (
-            <div
-              className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getContractMarketSourceToneClass(tradesSourceTone)}`}
-              title={tradesSourceStatusTitle || undefined}
-            >
-              {tradesSourceStatusLabel}
-            </div>
-          ) : null}
-          {normalizedStatus === 'CLOSED' ? (
-            <div className="rounded-full border border-[#f0b90b]/20 bg-[#f0b90b]/10 px-2 py-0.5 text-[11px] font-semibold text-[#f0b90b]">
-              {t('closedNoRealtimeTrades', 'contracts')}
-            </div>
-          ) : null}
+          <div className="rounded-full border border-[#f0b90b]/20 bg-[#f0b90b]/10 px-2 py-0.5 text-[11px] font-semibold text-[#f0b90b]">
+            {t('closedNoRealtimeTrades', 'contracts')}
+          </div>
         </div>
       ) : null}
 

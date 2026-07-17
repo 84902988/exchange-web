@@ -36,7 +36,6 @@ import {
   normalizeContractMarketViewDisplayState,
   readContractMarketViewAuthority,
   resolveContractMarketViewAuthorityPresentation,
-  type ContractMarketViewAuthorityState,
 } from './contractMarketView.utils';
 import {
   resolveContractExecutionPrice,
@@ -44,9 +43,7 @@ import {
 } from './contractPriceAuthority';
 import {
   buildContractTradingFormLegacyMarketRead,
-  getContractTradingFormMarketDifferences,
   resolveContractTradingFormMarketRead,
-  resolveContractTradingFormMarketState,
 } from './ContractTradingFormMarketRead';
 import { useContractTradingFormStoreSnapshot } from './hooks/contractMarketStoreAdapter';
 
@@ -196,19 +193,6 @@ function getMarketViewUnavailableReason(
   if (reason.includes('DIAGNOSTIC_ONLY')) return 'MARKET_VIEW_DISPLAY_ONLY';
   if (!unavailableByExecutable && !unavailableByReason) return null;
   return 'MARKET_VIEW_UNAVAILABLE';
-}
-
-function getMarketViewStatusHint(
-  state: ContractMarketViewAuthorityState,
-  t: (key: string, namespace?: 'contracts') => string,
-) {
-  if (state === 'loading') return t('marketDataLoadingLabel', 'contracts');
-  if (state === 'live') return t('realtimeQuoteLabel', 'contracts');
-  if (state === 'pre_market') return '盘前';
-  if (state === 'after_hours') return '盘后';
-  if (state === 'closed') return '闭市中';
-  if (state === 'holiday') return '休市中';
-  return t('quoteTemporarilyUnavailableLabel', 'contracts');
 }
 
 function isUnavailableExecutionReason(reasonCode?: string | null) {
@@ -391,40 +375,6 @@ export default function ContractTradingForm({
     ),
     [legacyDisplayMarketRead, tradingFormStoreSnapshot],
   );
-  const displayMarketDifferences = useMemo(
-    () => getContractTradingFormMarketDifferences(
-      tradingFormStoreSnapshot,
-      legacyDisplayMarketRead,
-    ),
-    [legacyDisplayMarketRead, tradingFormStoreSnapshot],
-  );
-  useEffect(() => {
-    if (
-      displayMarketRead.authority !== 'STORE'
-      || !tradingFormStoreSnapshot
-      || displayMarketDifferences.length === 0
-    ) return;
-    console.info('[contract-trading-form-market-diff]', {
-      symbol: tradingFormStoreSnapshot.symbol,
-      provider: tradingFormStoreSnapshot.provider,
-      providerGeneration: tradingFormStoreSnapshot.providerGeneration,
-      revision: tradingFormStoreSnapshot.revision,
-      observedAtMs: tradingFormStoreSnapshot.observedAtMs,
-      differences: displayMarketDifferences,
-    });
-  }, [displayMarketDifferences, displayMarketRead.authority, tradingFormStoreSnapshot]);
-  const displayMarketState = resolveContractTradingFormMarketState(displayMarketRead);
-  const displayMarketStatusHint = getMarketViewStatusHint(displayMarketState, t);
-  const displayMarketStatusClassName = displayMarketState === 'live'
-    ? 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]'
-    : displayMarketState === 'loading'
-      ? 'border-white/10 bg-white/[0.05] text-white/58'
-      : displayMarketState === 'pre_market'
-        || displayMarketState === 'after_hours'
-        || displayMarketState === 'closed'
-        || displayMarketState === 'holiday'
-        ? 'border-[#f0b90b]/25 bg-[#f0b90b]/10 text-[#f0b90b]'
-        : 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]';
   const marketViewAuthority = useMemo(
     () => readContractMarketViewAuthority(marketView),
     [marketView],
@@ -481,18 +431,6 @@ export default function ContractTradingForm({
     : quoteUnavailableReason === 'MARKET_VIEW_UNAVAILABLE'
       ? t('quoteUnavailableTradingHint', 'contracts')
       : null;
-  const quoteStatusHint = getMarketViewStatusHint(marketViewPresentation.state, t);
-  const quoteStatusClassName = marketViewPresentation.isLoading
-    ? 'border-white/10 bg-white/[0.05] text-white/58'
-    : marketViewPresentation.isRealtime
-    ? 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]'
-    : marketViewPresentation.state === 'pre_market'
-      || marketViewPresentation.state === 'after_hours'
-      || marketViewPresentation.state === 'closed'
-      || marketViewPresentation.state === 'holiday'
-      ? 'border-[#f0b90b]/25 bg-[#f0b90b]/10 text-[#f0b90b]'
-      : 'border-[#f6465d]/25 bg-[#f6465d]/10 text-[#f6465d]';
-
   const currentActionExecution = tradeTab === 'CLOSE'
     ? (closeSide === 'LONG' ? executionPrices.closeLong : executionPrices.closeShort)
     : (positionSide === 'LONG' ? executionPrices.openLong : executionPrices.openShort);
@@ -989,12 +927,9 @@ export default function ContractTradingForm({
 
   return (
     <div
-      className="tabular-nums space-y-1 text-sm text-white"
+      className="tabular-nums flex min-h-full min-w-0 flex-col overflow-x-hidden text-sm text-white"
       data-display-market-authority={displayMarketRead.authority}
       data-display-market-symbol={displayMarketRead.symbol || undefined}
-      data-display-price={displayMarketRead.displayPrice || undefined}
-      data-mark-price={displayMarketRead.markPrice || undefined}
-      data-index-price={displayMarketRead.indexPrice || undefined}
       data-market-status={displayMarketRead.marketStatus || undefined}
       data-market-executable={displayMarketRead.executable ?? undefined}
       data-display-source={displayMarketRead.source || undefined}
@@ -1004,35 +939,7 @@ export default function ContractTradingForm({
         ? tradingFormStoreSnapshot?.providerGeneration ?? undefined
         : undefined}
     >
-      <div className="space-y-1 overflow-visible">
-        <div
-          className="rounded-xl border border-white/[0.06] bg-[#0b1016] px-2 py-1.5"
-          data-testid="contract-trading-form-market-display"
-        >
-          <div className="mb-1 flex items-center justify-between gap-2">
-            <span className="truncate text-[10px] text-white/38" title={displayMarketRead.displayPriceSource || undefined}>
-              {t('tradeStatus', 'contracts')}
-            </span>
-            <span className={`shrink-0 rounded-full border px-1.5 py-px text-[10px] font-semibold ${displayMarketStatusClassName}`}>
-              {displayMarketStatusHint}
-            </span>
-          </div>
-          <div className="grid grid-cols-3 gap-1">
-            <MarketDisplayValue
-              label={t('latestPrice', 'contracts')}
-              value={formatDisplayPrice(displayMarketRead.displayPrice, pricePrecision)}
-            />
-            <MarketDisplayValue
-              label={t('markPrice', 'contracts')}
-              value={formatDisplayPrice(displayMarketRead.markPrice, pricePrecision)}
-            />
-            <MarketDisplayValue
-              label={t('indexPrice', 'contracts')}
-              value={formatDisplayPrice(displayMarketRead.indexPrice, pricePrecision)}
-            />
-          </div>
-        </div>
-
+      <div className="flex flex-1 flex-col gap-2 overflow-visible xl:gap-2.5 [@media(max-height:850px)]:gap-1.5">
         <div className="grid grid-cols-3 gap-1">
           <ModeButton
             label={t('marginMode', 'contracts')}
@@ -1145,12 +1052,6 @@ export default function ContractTradingForm({
         )}
 
         {displayFeedback ? <FormFeedbackBox feedback={displayFeedback} /> : null}
-
-        {quoteStatusHint ? (
-          <div className={`rounded-xl border px-2.5 py-1.5 text-[12px] leading-5 ${quoteStatusClassName}`}>
-            {quoteStatusHint}
-          </div>
-        ) : null}
 
       </div>
 
@@ -1331,7 +1232,7 @@ function OpenPanel({
   const buttonText = isLong ? t('openLong', 'contracts') : t('openShort', 'contracts');
 
   return (
-    <div className="space-y-1.5">
+    <div className="flex min-h-full flex-col gap-2.5 [@media(max-height:850px)]:gap-1.5">
       <SideSwitcher value={positionSide} onChange={setPositionSide} />
 
       <div className="flex items-center justify-between text-[11px] text-white/45">
@@ -1363,14 +1264,16 @@ function OpenPanel({
         placeholder={t('enterQuantity', 'contracts')}
         suffix={quantityUnit}
       />
-      <PercentageSlider
-        value={percentValue}
-        side={isLong ? 'buy' : 'sell'}
-        onChange={onPercentChange}
-        disabled={!isLoggedIn || availableMargin <= 0}
-      />
+      <div className="shrink-0 px-2" data-testid="contract-trading-form-percentage-slider">
+        <PercentageSlider
+          value={percentValue}
+          side={isLong ? 'buy' : 'sell'}
+          onChange={onPercentChange}
+          disabled={!isLoggedIn || availableMargin <= 0}
+        />
+      </div>
 
-      <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] p-1.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
+      <div className="shrink-0 rounded-xl border border-white/[0.06] bg-[#0b1016] p-2.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] [@media(max-height:850px)]:p-1.5">
         <SummaryRow label={t('estimatedExecutionPrice', 'contracts')} value={estimatedExecutionPrice === null ? '--' : `${formatDisplayPrice(estimatedExecutionPrice, pricePrecision)} USDT`} />
         <SummaryDualRow label={t('estimatedOpenValue', 'contracts')} longValue={displayMoney(longNotional, 4)} shortValue={displayMoney(shortNotional, 4)} activeSide={positionSide} />
         <SummaryDualRow label={t('estimatedMargin', 'contracts')} longValue={displayMoney(longMargin, 6)} shortValue={displayMoney(shortMargin, 6)} activeSide={positionSide} />
@@ -1380,36 +1283,42 @@ function OpenPanel({
         <SummaryRow label={t('riskNotice', 'contracts')} value={t('riskDataUnavailable', 'contracts')} muted />
       </div>
 
-      <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] p-1.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
-        <label className="flex cursor-pointer items-center gap-2 text-[12px] text-white/75">
-          <input type="checkbox" checked={tpSlEnabled} onChange={(event) => setTpSlEnabled(event.target.checked)} className="h-3.5 w-3.5 accent-[#f0b90b]" />
-          {t('takeProfitStopLossShort', 'contracts')}
-        </label>
-        {tpSlEnabled ? (
-          <div className="mt-1.5 space-y-1.5">
-            <TriggerPriceField
-              label={t('takeProfitTriggerPrice', 'contracts')}
-              value={takeProfitPrice}
-              onChange={setTakeProfitPrice}
-              onStep={stepTakeProfitPrice}
-              placeholder={t('takeProfitPlaceholder', 'contracts')}
-              pricePrecision={pricePrecision}
-              suffix="USDT"
-            />
-            <TriggerPriceField
-              label={t('stopLossTriggerPrice', 'contracts')}
-              value={stopLossPrice}
-              onChange={setStopLossPrice}
-              onStep={stepStopLossPrice}
-              placeholder={t('stopLossPlaceholder', 'contracts')}
-              pricePrecision={pricePrecision}
-              suffix="USDT"
-            />
-            <div className="text-[11px] leading-4 text-white/50">{tpSlTriggerPriceTypeHint}</div>
-            <div className="text-[11px] leading-4 text-white/38">{t('tpSlMarketCloseDesc', 'contracts')}</div>
-          </div>
-        ) : null}
-      </div>
+        <div
+          className="flex shrink-0 flex-col rounded-xl border border-white/[0.06] bg-[#0b1016] p-2.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] [@media(max-height:850px)]:p-1.5"
+          data-testid="contract-trading-form-tp-sl-region"
+        >
+          <label className="flex cursor-pointer items-center gap-2 text-[12px] text-white/75">
+            <input type="checkbox" checked={tpSlEnabled} onChange={(event) => setTpSlEnabled(event.target.checked)} className="h-3.5 w-3.5 accent-[#f0b90b]" />
+            {t('takeProfitStopLossShort', 'contracts')}
+          </label>
+          {tpSlEnabled ? (
+            <div
+              className="mt-1.5 space-y-1.5"
+              data-testid="contract-trading-form-tp-sl-scroll"
+            >
+              <TriggerPriceField
+                label={t('takeProfitTriggerPrice', 'contracts')}
+                value={takeProfitPrice}
+                onChange={setTakeProfitPrice}
+                onStep={stepTakeProfitPrice}
+                placeholder={t('takeProfitPlaceholder', 'contracts')}
+                pricePrecision={pricePrecision}
+                suffix="USDT"
+              />
+              <TriggerPriceField
+                label={t('stopLossTriggerPrice', 'contracts')}
+                value={stopLossPrice}
+                onChange={setStopLossPrice}
+                onStep={stepStopLossPrice}
+                placeholder={t('stopLossPlaceholder', 'contracts')}
+                pricePrecision={pricePrecision}
+                suffix="USDT"
+              />
+              <div className="text-[11px] leading-4 text-white/50">{tpSlTriggerPriceTypeHint}</div>
+              <div className="text-[11px] leading-4 text-white/38">{t('tpSlMarketCloseDesc', 'contracts')}</div>
+            </div>
+          ) : null}
+        </div>
 
       {isLoggedIn && availableMargin <= 0 ? (
         <div className="rounded-xl border border-[#f6465d]/20 bg-[#f6465d]/10 px-2 py-1 text-[12px] text-[#f6465d]">
@@ -1417,9 +1326,9 @@ function OpenPanel({
         </div>
       ) : null}
 
-      <div>
+      <div className="mt-auto shrink-0 pt-2 [@media(max-height:850px)]:pt-1" data-testid="contract-trading-form-submit-dock">
         {isLoggedIn ? (
-          <button type="button" disabled={submitDisabled} onClick={() => submitOpen(positionSide)} className={`w-full rounded-xl ${buttonToneClass} py-2 text-[14px] font-semibold text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-opacity disabled:cursor-not-allowed disabled:opacity-45`}>
+          <button type="button" disabled={submitDisabled} onClick={() => submitOpen(positionSide)} className={`w-full rounded-xl ${buttonToneClass} py-2.5 text-[14px] font-semibold text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-opacity disabled:cursor-not-allowed disabled:opacity-45 [@media(max-height:850px)]:py-2`}>
             {submitting ? t('openSubmitting', 'contracts') : buttonText}
           </button>
         ) : (
@@ -1493,7 +1402,7 @@ function ClosePanel({
   const buttonText = isLong ? t('closeLong', 'contracts') : t('closeShort', 'contracts');
 
   return (
-    <div className="space-y-1.5">
+    <div className="flex min-h-full flex-col gap-2.5 [@media(max-height:850px)]:gap-1.5">
       <SideSwitcher value={closeSide} onChange={setCloseSide} longText={t('closeLong', 'contracts')} shortText={t('closeShort', 'contracts')} />
 
       {orderType === 'LIMIT' ? (
@@ -1519,14 +1428,16 @@ function ClosePanel({
         placeholder={selectedPosition ? t('emptyMeansCloseAll', 'contracts') : t('noClosablePosition', 'contracts')}
         suffix={quantityUnit}
       />
-      <PercentageSlider
-        value={percentValue}
-        side={isLong ? 'sell' : 'buy'}
-        onChange={onPercentChange}
-        disabled={!isLoggedIn || (!selectedSummary && !selectedPosition)}
-      />
+      <div className="shrink-0 px-2" data-testid="contract-trading-form-percentage-slider">
+        <PercentageSlider
+          value={percentValue}
+          side={isLong ? 'sell' : 'buy'}
+          onChange={onPercentChange}
+          disabled={!isLoggedIn || (!selectedSummary && !selectedPosition)}
+        />
+      </div>
 
-      <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] p-1.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
+      <div className="rounded-xl border border-white/[0.06] bg-[#0b1016] p-2.5 text-[12px] shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] [@media(max-height:850px)]:p-1.5">
         <SummaryRow label={t('positionSide', 'contracts')} value={selectedSummary || selectedPosition ? sideText(closeSide, t) : '--'} valueClassName={sideTone(closeSide)} />
         <SummaryRow label={t('avgEntryPrice', 'contracts')} value={avgEntryPrice ? `${formatDisplayPrice(avgEntryPrice, pricePrecision)} USDT` : '--'} />
         <SummaryRow label={t('estimatedExecutionPrice', 'contracts')} value={estimatedExecutionPrice === null ? '--' : `${formatDisplayPrice(estimatedExecutionPrice, pricePrecision)} USDT`} />
@@ -1544,24 +1455,15 @@ function ClosePanel({
         </div>
       ) : null}
 
-      <div>
+      <div className="mt-auto shrink-0 pt-2 [@media(max-height:850px)]:pt-1" data-testid="contract-trading-form-submit-dock">
         {isLoggedIn ? (
-          <button type="button" disabled={closeDisabled} onClick={() => submitClose(closeSide)} className={`w-full rounded-xl ${buttonToneClass} py-2 text-[14px] font-semibold text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-opacity disabled:cursor-not-allowed disabled:opacity-45`}>
+          <button type="button" disabled={closeDisabled} onClick={() => submitClose(closeSide)} className={`w-full rounded-xl ${buttonToneClass} py-2.5 text-[14px] font-semibold text-white shadow-[0_12px_28px_rgba(0,0,0,0.28)] transition-opacity disabled:cursor-not-allowed disabled:opacity-45 [@media(max-height:850px)]:py-2`}>
             {submitting ? t('closeSubmitting', 'contracts') : buttonText}
           </button>
         ) : (
           <ContractLoginActions loginHref={loginHref} registerHref={registerHref} />
         )}
       </div>
-    </div>
-  );
-}
-
-function MarketDisplayValue({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="min-w-0 rounded-lg border border-white/[0.05] bg-white/[0.02] px-1.5 py-1">
-      <span className="block truncate text-[9px] leading-3 text-white/35">{label}</span>
-      <span className="block truncate text-[11px] font-semibold leading-4 text-white/88">{value}</span>
     </div>
   );
 }
@@ -1580,7 +1482,7 @@ function ModeButton({
   onClick?: () => void;
 }) {
   return (
-    <button type="button" disabled={disabled} onClick={onClick} title={title} className="min-w-0 rounded-lg border border-white/[0.08] bg-[#0b0e11] px-1.5 py-1 text-left transition-colors hover:border-white/[0.14] disabled:cursor-default disabled:hover:border-white/[0.08]">
+    <button type="button" disabled={disabled} onClick={onClick} title={title} className="min-w-0 rounded-lg border border-white/[0.08] bg-[#0b0e11] px-2 py-1.5 text-left transition-colors hover:border-white/[0.14] disabled:cursor-default disabled:hover:border-white/[0.08] [@media(max-height:850px)]:px-1.5 [@media(max-height:850px)]:py-1">
       <span className="block truncate text-[10px] leading-3.5 text-white/38">{label}</span>
       <span className="block truncate text-[12px] font-semibold leading-4 text-white">{value}</span>
     </button>
@@ -1597,7 +1499,7 @@ function TabButton({
   children: ReactNode;
 }) {
   return (
-    <button type="button" onClick={onClick} className={`rounded-lg py-1 text-[14px] font-semibold transition-all ${active ? 'bg-white text-black' : 'text-white/46 hover:text-white/78'}`}>
+    <button type="button" onClick={onClick} className={`rounded-lg py-1.5 text-[14px] font-semibold transition-all [@media(max-height:850px)]:py-1 ${active ? 'bg-white text-black' : 'text-white/46 hover:text-white/78'}`}>
       {children}
     </button>
   );
@@ -1620,10 +1522,10 @@ function SideSwitcher({
 
   return (
     <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/[0.06] bg-[#0b1016] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
-      <button type="button" onClick={() => onChange('LONG')} className={`rounded-lg py-1 text-[14px] font-semibold transition-all ${value === 'LONG' ? 'bg-[#00c087] text-white shadow-[0_10px_24px_rgba(22,163,74,0.22)]' : 'text-white/46 hover:text-white/78'}`}>
+      <button type="button" onClick={() => onChange('LONG')} className={`rounded-lg py-1.5 text-[14px] font-semibold transition-all [@media(max-height:850px)]:py-1 ${value === 'LONG' ? 'bg-[#00c087] text-white shadow-[0_10px_24px_rgba(22,163,74,0.22)]' : 'text-white/46 hover:text-white/78'}`}>
         {resolvedLongText}
       </button>
-      <button type="button" onClick={() => onChange('SHORT')} className={`rounded-lg py-1 text-[14px] font-semibold transition-all ${value === 'SHORT' ? 'bg-[#f6465d] text-white shadow-[0_10px_24px_rgba(220,38,38,0.22)]' : 'text-white/46 hover:text-white/78'}`}>
+      <button type="button" onClick={() => onChange('SHORT')} className={`rounded-lg py-1.5 text-[14px] font-semibold transition-all [@media(max-height:850px)]:py-1 ${value === 'SHORT' ? 'bg-[#f6465d] text-white shadow-[0_10px_24px_rgba(220,38,38,0.22)]' : 'text-white/46 hover:text-white/78'}`}>
         {resolvedShortText}
       </button>
     </div>
@@ -1764,7 +1666,7 @@ function PriceField({
             onChange={(event) => onChange(event.target.value)}
             onBlur={normalizePrice}
             inputMode="decimal"
-            className="w-full rounded-xl border border-white/[0.08] bg-[#0d1218] px-3 py-1.5 pr-10 text-[13px] font-medium tabular-nums text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10"
+            className="w-full rounded-xl border border-white/[0.08] bg-[#0d1218] px-3 py-2 pr-10 text-[13px] font-medium tabular-nums text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] outline-none transition-colors placeholder:text-white/20 hover:border-white/[0.14] focus:border-white/[0.18] focus:bg-[#10161d] focus:ring-1 focus:ring-white/10 [@media(max-height:850px)]:py-1.5"
             placeholder={placeholder}
           />
           <div className="absolute right-2 top-1/2 flex -translate-y-1/2 flex-col">
@@ -1829,7 +1731,7 @@ function SummaryRow({
   title?: string;
 }) {
   return (
-    <div className="flex items-center justify-between gap-2 py-px text-[12px]">
+    <div className="flex items-center justify-between gap-2 py-0.5 text-[12px] [@media(max-height:850px)]:py-px">
       <span className="min-w-0 shrink-0 text-white/42" title={title}>{label}</span>
       <span className={`min-w-0 truncate text-right font-medium ${valueClassName || (muted ? 'text-white/62' : 'text-white/90')}`}>
         {value}
