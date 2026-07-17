@@ -158,6 +158,44 @@ describe('Contract Header realtime Store hydration', () => {
     });
   });
 
+  it('hides the previous snapshot after a realtime session restart', () => {
+    const store = createContractMarketStore();
+    store.activateSymbol('BTCUSDT_PERP');
+    store.ingest({
+      symbol: 'BTCUSDT_PERP',
+      domain: 'ticker',
+      data: { display_price: '64000' },
+      transport: 'WS',
+      provider: 'BINANCE_USDM',
+      providerGeneration: 8,
+      eventTimeMs: 1_720_000_000_200,
+    });
+    expect(selectContractHeaderStoreSnapshot(store.getState(), 'BTCUSDT_PERP')?.displayPrice)
+      .toBe('64000');
+
+    store.restartSession('BTCUSDT_PERP');
+    const restarted = selectContractHeaderStoreSnapshot(store.getState(), 'BTCUSDT_PERP');
+    expect(restarted).toMatchObject({
+      symbol: 'BTCUSDT_PERP',
+      displayPrice: null,
+      source: null,
+      providerGeneration: null,
+    });
+
+    const fallback = store.ingest({
+      symbol: 'BTCUSDT_PERP',
+      domain: 'ticker',
+      data: { display_price: '63950' },
+      transport: 'REST',
+      provider: 'BINANCE_USDM',
+      providerGeneration: 7,
+      eventTimeMs: 1_720_000_000_100,
+    });
+    expect(fallback.accepted).toBe(true);
+    expect(selectContractHeaderStoreSnapshot(store.getState(), 'BTCUSDT_PERP')?.displayPrice)
+      .toBe('63950');
+  });
+
   it('keeps symbol snapshots isolated while switching during hydration', () => {
     const store = createContractMarketStore();
     store.activateSymbol('BTCUSDT_PERP');

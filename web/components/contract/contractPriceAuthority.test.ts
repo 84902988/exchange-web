@@ -5,6 +5,7 @@ import {
   resolveContractExecutionPrice,
   type ContractExecutionBookInput,
   type ContractKlineReferenceInput,
+  type ContractTickerReferenceInput,
   type ContractTradeReferenceInput,
 } from './contractPriceAuthority';
 
@@ -36,6 +37,21 @@ function providerKline(
     freshness: 'RECENT',
     priceSource: 'KLINE_CLOSE',
     klineMode: 'PROVIDER_KLINE',
+    ...overrides,
+  };
+}
+
+function closedTicker(
+  overrides: Partial<ContractTickerReferenceInput> = {},
+): ContractTickerReferenceInput {
+  return {
+    symbol: SYMBOL,
+    price: '2398.5',
+    time: NOW,
+    source: 'ITICK_QUOTE',
+    freshness: 'LAST_VALID',
+    marketStatus: 'CLOSED',
+    marketSessionType: 'OFF_HOURS',
     ...overrides,
   };
 }
@@ -116,6 +132,77 @@ test('synthetic quote trade is rejected and provider KLINE_CLOSE is the only fal
   assert.equal(withoutFallback.reference_price.role, 'UNAVAILABLE');
   assert.equal(withoutFallback.reference_price.usable, false);
   assert.equal(withoutFallback.reference_price.rejectReason, 'SYNTHETIC_TRADE');
+});
+
+test('closed-market ticker last price is a shared reference fallback with explicit provenance', () => {
+  const authority = buildContractPriceAuthority({
+    symbol: SYMBOL,
+    ticker: closedTicker(),
+  });
+
+  assert.deepEqual(
+    {
+      role: authority.reference_price.role,
+      domain: authority.reference_price.domain,
+      value: authority.reference_price.value,
+      source: authority.reference_price.source,
+      provider: authority.reference_price.provider,
+      freshness: authority.reference_price.freshness,
+      eventTimeMs: authority.reference_price.eventTimeMs,
+      usable: authority.reference_price.usable,
+    },
+    {
+      role: 'LAST_PRICE',
+      domain: 'TICKER',
+      value: 2398.5,
+      source: 'LAST_PRICE',
+      provider: 'ITICK_QUOTE',
+      freshness: 'LAST_VALID',
+      eventTimeMs: NOW,
+      usable: true,
+    },
+  );
+});
+
+test('live-session ticker is a reference only when trade and kline evidence are absent', () => {
+  const liveTickerOnly = buildContractPriceAuthority({
+    symbol: SYMBOL,
+    ticker: closedTicker({
+      freshness: 'LIVE',
+      marketStatus: 'OPEN',
+      marketSessionType: 'REGULAR',
+    }),
+  });
+  const withTrade = buildContractPriceAuthority({
+    symbol: SYMBOL,
+    trade: realTrade(),
+    kline: providerKline(),
+    ticker: closedTicker({
+      freshness: 'LIVE',
+      marketStatus: 'OPEN',
+      marketSessionType: 'REGULAR',
+    }),
+  });
+
+  assert.equal(liveTickerOnly.reference_price.role, 'LAST_PRICE');
+  assert.equal(liveTickerOnly.reference_price.domain, 'TICKER');
+  assert.equal(liveTickerOnly.reference_price.usable, true);
+  assert.equal(withTrade.reference_price.role, 'LAST_TRADE');
+  assert.equal(withTrade.reference_price.domain, 'TRADES');
+});
+
+test('stale live-session ticker fails closed', () => {
+  const authority = buildContractPriceAuthority({
+    symbol: SYMBOL,
+    ticker: closedTicker({
+      freshness: 'STALE',
+      marketStatus: 'OPEN',
+      marketSessionType: 'REGULAR',
+    }),
+  });
+
+  assert.equal(authority.reference_price.role, 'UNAVAILABLE');
+  assert.equal(authority.reference_price.rejectReason, 'STALE');
 });
 
 test('reference price is structured unavailable when no permitted evidence exists', () => {

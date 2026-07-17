@@ -2,6 +2,7 @@ import { describe, expect, it } from '@jest/globals';
 import { contractMarketStore } from '../../lib/realtime/contractMarketStore';
 import {
   activateContractMarketShadowSymbol,
+  ingestContractMarketWsDomain,
   selectContractOrderBookStoreSnapshot,
   subscribeContractOrderBookStore,
   writeContractMarketShadowDomain,
@@ -49,6 +50,7 @@ describe('Contract OrderBook realtime store adapter', () => {
     expect(selectOrderBook()?.symbol).toBe('BTCUSDT_PERP');
 
     activateContractMarketShadowSymbol('ETHUSDT_PERP');
+    expect(selectOrderBook()).toBeNull();
     const retired = writeDepth({
       symbol: 'BTCUSDT_PERP',
       eventTimeMs: 1_720_000_000_200,
@@ -65,6 +67,7 @@ describe('Contract OrderBook realtime store adapter', () => {
       symbol: 'ETHUSDT_PERP',
       bestBid: '3500',
       bestAsk: '3501',
+      midpoint: '3500.5',
     });
   });
 
@@ -107,15 +110,15 @@ describe('Contract OrderBook realtime store adapter', () => {
     contractMarketStore.resetForTests();
     activateContractMarketShadowSymbol('BTCUSDT_PERP');
     writeDepth({
-      bids: [['63999', '1'], ['64000', '2']],
-      asks: [['64002', '1'], ['64001', '2']],
+      bids: [['99', '1'], ['100', '2']],
+      asks: [['103', '1'], ['102', '2']],
     });
 
     expect(selectOrderBook()).toMatchObject({
-      bestBid: '64000',
-      bestAsk: '64001',
-      midpoint: '64000.5',
-      spread: '1',
+      bestBid: '100',
+      bestAsk: '102',
+      midpoint: '101',
+      spread: '2',
     });
   });
 
@@ -166,5 +169,114 @@ describe('Contract OrderBook realtime store adapter', () => {
     });
     expect(depthNotifications).toBe(1);
     unsubscribe();
+  });
+
+  it('publishes each accepted WS depth frame to OrderBook subscribers synchronously', () => {
+    contractMarketStore.resetForTests();
+    activateContractMarketShadowSymbol('BTCUSDT_PERP');
+    const order: string[] = [];
+    const unsubscribe = subscribeContractOrderBookStore(() => {
+      order.push('notified');
+    });
+
+    const accepted = ingestContractMarketWsDomain({
+      domain: 'depth',
+      message: {
+        type: 'contract_depth',
+        symbol: 'BTCUSDT_PERP',
+        depth: {
+          symbol: 'BTCUSDT_PERP',
+          bids: [['64100', '4'], ['64099', '1']],
+          asks: [['64101', '2'], ['64102', '3']],
+          depth_mode: 'FULL_DEPTH',
+          source: 'LIVE_WS',
+          quote_freshness: 'LIVE',
+          provider: 'BINANCE_USDM',
+          provider_generation: 17,
+          revision: { epoch: 17, sequence: 41 },
+          provider_event_time_ms: 1_720_000_000_400,
+        },
+      },
+    });
+    order.push('returned');
+
+    expect(accepted).toMatchObject({ accepted: true });
+    expect(order).toEqual(['notified', 'returned']);
+    expect(selectOrderBook()).toMatchObject({
+      bestBid: '64100',
+      bestAsk: '64101',
+      providerGeneration: 17,
+      revision: { epoch: 17, sequence: 41 },
+    });
+    unsubscribe();
+  });
+
+  it('keeps the REST depth generation when same-provider WS frames omit it', () => {
+    contractMarketStore.resetForTests();
+    activateContractMarketShadowSymbol('BTCUSDT_PERP');
+    writeContractMarketShadowDomain({
+      symbol: 'BTCUSDT_PERP',
+      domain: 'depth',
+      data: {
+        symbol: 'BTCUSDT_PERP',
+        bids: [['64000', '1'], ['63999', '2']],
+        asks: [['64001', '1'], ['64002', '2']],
+        depth_mode: 'FULL_DEPTH',
+        source: 'REST',
+        freshness: 'RECENT',
+        provider: 'OKX_SWAP',
+        provider_generation: 21,
+        provider_event_time_ms: 1_720_000_000_100,
+      },
+      transport: 'REST',
+    });
+
+    const wsDepth = ingestContractMarketWsDomain({
+      domain: 'depth',
+      message: {
+        type: 'contract_depth',
+        symbol: 'BTCUSDT_PERP',
+        depth: {
+          symbol: 'BTCUSDT_PERP',
+          bids: [['64100', '9'], ['64099', '1']],
+          asks: [['64101', '3'], ['64102', '1']],
+          depth_mode: 'FULL_DEPTH',
+          source: 'LIVE_WS',
+          quote_freshness: 'LIVE',
+          provider: 'OKX_SWAP',
+          provider_event_time_ms: 1_720_000_000_200,
+        },
+      },
+    });
+
+    expect(wsDepth).toMatchObject({ accepted: true, reason: 'ACCEPTED' });
+    expect(selectOrderBook()).toMatchObject({
+      bestBid: '64100',
+      bestAsk: '64101',
+      provider: 'OKX_SWAP',
+      providerGeneration: 21,
+      freshness: 'LIVE',
+    });
+
+    const staleWsDepth = ingestContractMarketWsDomain({
+      domain: 'depth',
+      message: {
+        type: 'contract_depth',
+        symbol: 'BTCUSDT_PERP',
+        depth: {
+          symbol: 'BTCUSDT_PERP',
+          bids: [['63000', '1'], ['62999', '1']],
+          asks: [['63001', '1'], ['63002', '1']],
+          depth_mode: 'FULL_DEPTH',
+          source: 'LIVE_WS',
+          quote_freshness: 'LIVE',
+          provider: 'OKX_SWAP',
+          provider_event_time_ms: 1_720_000_000_150,
+        },
+      },
+    });
+
+    expect(staleWsDepth).toMatchObject({ accepted: false, reason: 'STALE_EVENT' });
+    expect(selectOrderBook()).toMatchObject({ bestBid: '64100', bestAsk: '64101' });
   });
 });

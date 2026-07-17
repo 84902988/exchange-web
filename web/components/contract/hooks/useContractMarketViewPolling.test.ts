@@ -2,7 +2,6 @@ import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import {
   CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS,
-  CONTRACT_MARKET_VIEW_RECONCILE_POLL_MS,
   getContractMarketViewPollInterval,
   useContractMarketViewPolling,
 } from './useContractMarketViewPolling';
@@ -29,10 +28,8 @@ afterEach(() => {
 });
 
 describe('contract market view polling lifecycle', () => {
-  it('uses low-frequency reconciliation while connected and fallback polling while disconnected', () => {
-    expect(getContractMarketViewPollInterval('connected', true)).toBe(
-      CONTRACT_MARKET_VIEW_RECONCILE_POLL_MS,
-    );
+  it('disables REST polling while connected and uses it only as a visible fallback', () => {
+    expect(getContractMarketViewPollInterval('connected', true)).toBeNull();
     expect(getContractMarketViewPollInterval('disconnected', true)).toBe(
       CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS,
     );
@@ -51,16 +48,16 @@ describe('contract market view polling lifecycle', () => {
     );
 
     expect(refresh).toHaveBeenCalledTimes(1);
-    act(() => jest.advanceTimersByTime(CONTRACT_MARKET_VIEW_RECONCILE_POLL_MS));
-    expect(refresh).toHaveBeenCalledTimes(2);
+    act(() => jest.advanceTimersByTime(CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS * 20));
+    expect(refresh).toHaveBeenCalledTimes(1);
 
     rerender({ symbol: 'ETHUSDT_PERP' });
-    expect(refresh).toHaveBeenCalledTimes(3);
-    act(() => jest.advanceTimersByTime(CONTRACT_MARKET_VIEW_RECONCILE_POLL_MS));
-    expect(refresh).toHaveBeenCalledTimes(4);
+    expect(refresh).toHaveBeenCalledTimes(2);
+    act(() => jest.advanceTimersByTime(CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS * 20));
+    expect(refresh).toHaveBeenCalledTimes(2);
   });
 
-  it('restores fallback polling while disconnected and reconciles immediately after reconnect', () => {
+  it('restores fallback polling while disconnected and stops it after reconnect', () => {
     const refresh = jest.fn<() => void>();
     type HookProps = { realtimeStatus: ContractMarketRealtimeStatus };
     const { rerender } = renderHook(
@@ -78,7 +75,9 @@ describe('contract market view polling lifecycle', () => {
     expect(refresh).toHaveBeenCalledTimes(4);
 
     rerender({ realtimeStatus: 'connected' });
-    expect(refresh).toHaveBeenCalledTimes(5);
+    expect(refresh).toHaveBeenCalledTimes(4);
+    act(() => jest.advanceTimersByTime(CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS * 3));
+    expect(refresh).toHaveBeenCalledTimes(4);
   });
 
   it('stops hidden timers, refreshes once on visibility regain, and cleans up on unmount', () => {

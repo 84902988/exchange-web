@@ -236,38 +236,58 @@ test('FULL mode renders asks, reference price, bids, and real-depth ratio', () =
 
   assert.equal(findButton(tree, '\u5168\u90e8').props['aria-pressed'], true);
   assert.match(textContent(tree), /101\.00/);
-  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-display-price')), '99.80');
+  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-price-value')), '99.80');
   assert.match(textContent(tree), /99\.00/);
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-buy-ratio')), '40.00%');
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-sell-ratio')), '60.00%');
+  assert.equal(findByTestId(tree, 'contract-orderbook-buy-ratio-bar').props.style.width, '40%');
+  assert.equal(findByTestId(tree, 'contract-orderbook-sell-ratio-bar').props.style.width, '60%');
 });
 
-test('BUY mode renders only bids and suppresses the depth ratio', () => {
+test('reference center keeps the large authority price and adds its direction cue', () => {
+  resetDisplayMode();
+  const upTree = renderOrderBook({ priceDirection: 'up' });
+  const upValue = findByTestId(upTree, 'contract-orderbook-price-value');
+  const upDirection = findByTestId(upTree, 'contract-orderbook-price-direction');
+
+  assert.equal(textContent(upValue), '99.80');
+  assert.match(String(upValue.props.className), /text-\[20px\]/);
+  assert.equal(textContent(upDirection), '\u2191');
+  assert.match(String(upDirection.props.className), /text-\[#00c087\]/);
+
+  const downTree = renderOrderBook({ priceDirection: 'down' });
+  const downDirection = findByTestId(downTree, 'contract-orderbook-price-direction');
+  assert.equal(textContent(downDirection), '\u2193');
+  assert.match(String(downDirection.props.className), /text-\[#f6465d\]/);
+
+  const flatTree = renderOrderBook({ priceDirection: 'flat' });
+  assert.equal(walk(flatTree).some((node) => (
+    node.props['data-testid'] === 'contract-orderbook-price-direction'
+  )), false);
+});
+
+test('BUY mode keeps the reference center and the aggregate two-sided depth ratio', () => {
   resetDisplayMode();
   findButton(renderOrderBook(), '\u4e70\u76d8').props.onClick();
   const tree = renderOrderBook();
 
   assert.doesNotMatch(textContent(tree), /101\.00/);
-  assert.equal(walk(tree).some((node) => (
-    node.props['data-testid'] === 'contract-orderbook-display-price'
-  )), false);
+  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-price-value')), '99.80');
   assert.match(textContent(tree), /99\.00/);
-  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-buy-ratio')), '--');
-  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-sell-ratio')), '--');
+  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-buy-ratio')), '40.00%');
+  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-sell-ratio')), '60.00%');
 });
 
-test('SELL mode renders only asks and suppresses the depth ratio', () => {
+test('SELL mode keeps the reference center and the aggregate two-sided depth ratio', () => {
   resetDisplayMode();
   findButton(renderOrderBook(), '\u5356\u76d8').props.onClick();
   const tree = renderOrderBook();
 
   assert.match(textContent(tree), /101\.00/);
   assert.doesNotMatch(textContent(tree), /99\.00/);
-  assert.equal(walk(tree).some((node) => (
-    node.props['data-testid'] === 'contract-orderbook-display-price'
-  )), false);
-  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-buy-ratio')), '--');
-  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-sell-ratio')), '--');
+  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-price-value')), '99.80');
+  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-buy-ratio')), '40.00%');
+  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-sell-ratio')), '60.00%');
 });
 
 test('BBO_ONLY keeps its hint and never publishes a market-depth ratio', () => {
@@ -325,6 +345,8 @@ test('loading a replacement symbol removes previous rows and keeps fixed placeho
 
   assert.doesNotMatch(textContent(loadingTree), /101\.00/);
   assert.doesNotMatch(textContent(loadingTree), /99\.00/);
+  assert.equal(textContent(findByTestId(loadingTree, 'contract-orderbook-price-value')), '99.80');
+  assert.match(String(findByTestId(loadingTree, 'contract-orderbook-display-price').props.className), /z-20/);
   assert.equal(placeholders.length, 18);
   assert.equal(textContent(findByTestId(loadingTree, 'contract-orderbook-empty-state')), '\u52a0\u8f7d\u4e2d');
 });
@@ -374,9 +396,15 @@ test('ratio rejects best-bid/best-ask-only evidence even when mislabeled FULL_DE
   assert.equal(utilsModule.calculateContractOrderBookDepthRatio({
     bids: bids.slice(0, 1),
     asks: asks.slice(0, 1),
-    displayMode: 'FULL',
     depthMode: 'FULL_DEPTH',
   }), null);
+});
+
+test('OrderBook does not duplicate the realtime status badge inside the panel', () => {
+  resetDisplayMode();
+  const tree = renderOrderBook({ status: 'LIVE', statusLabel: '\u5b9e\u65f6' });
+
+  assert.doesNotMatch(textContent(tree), /\u5b9e\u65f6/);
 });
 
 test('placeholder alignment is deterministic', () => {
@@ -392,7 +420,7 @@ test('placeholder alignment is deterministic', () => {
   assert.deepEqual(utilsModule.padContractOrderBookRows([row], 'bottom', 3), [null, null, row]);
 });
 
-test('OrderBook reads Store depth without overriding the real-trade reference price', () => {
+test('OrderBook reads Store depth without overriding reference price or logging each frame', () => {
   resetDisplayMode();
   orderBookStoreSnapshot = makeStoreDepthSnapshot();
   const selected: string[] = [];
@@ -407,7 +435,7 @@ test('OrderBook reads Store depth without overriding the real-trade reference pr
     const center = findByTestId(tree, 'contract-orderbook-display-price');
     assert.match(textContent(tree), /100\.00/);
     assert.doesNotMatch(textContent(findByTestId(tree, 'contract-orderbook-bid-rows')), /98\.00/);
-    assert.equal(textContent(center), '99.80');
+    assert.equal(textContent(findByTestId(tree, 'contract-orderbook-price-value')), '99.80');
     assert.equal(center.props['aria-label'], '\u6700\u65b0\u4ef7');
     assert.equal(center.props['data-price-role'], 'LAST_TRADE');
     assert.equal(center.props['data-price-source'], 'TRADE_TICK');
@@ -422,12 +450,43 @@ test('OrderBook reads Store depth without overriding the real-trade reference pr
     console.info = originalInfo;
   }
 
-  assert.equal(diffLogs.length, 1);
-  assert.equal(diffLogs[0][0], '[contract-orderbook-depth-diff]');
-  const payload = diffLogs[0][1] as { differences: Array<{ field: string }> };
-  assert.ok(payload.differences.some((difference) => difference.field === 'bids'));
-  assert.ok(payload.differences.some((difference) => difference.field === 'bestBid'));
-  assert.ok(payload.differences.some((difference) => difference.field === 'spread'));
+  assert.equal(diffLogs.length, 0);
+});
+
+test('realtime Store depth refreshes rows and ratio while center follows reference authority', () => {
+  resetDisplayMode();
+  const originalInfo = console.info;
+  console.info = () => undefined;
+
+  try {
+    orderBookStoreSnapshot = makeStoreDepthSnapshot({
+      bids: [{ price: '100', amount: '3' }, { price: '99', amount: '1' }],
+      asks: [{ price: '101', amount: '5' }, { price: '102', amount: '1' }],
+    });
+    const firstTree = renderOrderBook();
+    assert.equal(textContent(findByTestId(firstTree, 'contract-orderbook-buy-ratio')), '40.00%');
+    assert.equal(textContent(findByTestId(firstTree, 'contract-orderbook-price-value')), '99.80');
+
+    orderBookStoreSnapshot = makeStoreDepthSnapshot({
+      bids: [{ price: '100.5', amount: '9' }, { price: '100', amount: '1' }],
+      asks: [{ price: '101', amount: '1' }, { price: '101.5', amount: '1' }],
+      bestBid: '100.5',
+      bestAsk: '101',
+      spread: '0.5',
+      midpoint: '100.75',
+      observedAtMs: 1_720_000_000_200,
+    });
+    const nextTree = renderOrderBook({
+      referencePrice: makeReferencePrice({ value: 100.25, eventTimeMs: 1_720_000_000_200 }),
+    });
+
+    assert.match(textContent(findByTestId(nextTree, 'contract-orderbook-bid-rows')), /100\.50/);
+    assert.equal(textContent(findByTestId(nextTree, 'contract-orderbook-buy-ratio')), '83.33%');
+    assert.equal(textContent(findByTestId(nextTree, 'contract-orderbook-sell-ratio')), '16.67%');
+    assert.equal(textContent(findByTestId(nextTree, 'contract-orderbook-price-value')), '100.25');
+  } finally {
+    console.info = originalInfo;
+  }
 });
 
 test('Kline fallback reference keeps its own value, label, source, and freshness', () => {
@@ -451,7 +510,7 @@ test('Kline fallback reference keeps its own value, label, source, and freshness
     });
     const center = findByTestId(tree, 'contract-orderbook-display-price');
 
-    assert.equal(textContent(center), '98.75');
+    assert.equal(textContent(findByTestId(tree, 'contract-orderbook-price-value')), '98.75');
     assert.equal(center.props['aria-label'], 'K\u7ebf\u6700\u65b0\u4ef7');
     assert.equal(center.props['data-price-role'], 'KLINE_CLOSE');
     assert.equal(center.props['data-price-source'], 'KLINE_CLOSE');
@@ -489,7 +548,7 @@ test('unavailable reference disables the center while Store depth remains visibl
 
     assert.match(textContent(findByTestId(tree, 'contract-orderbook-ask-rows')), /101\.00/);
     assert.match(textContent(findByTestId(tree, 'contract-orderbook-bid-rows')), /100\.00/);
-    assert.equal(textContent(center), '--');
+    assert.equal(textContent(findByTestId(tree, 'contract-orderbook-price-value')), '--');
     assert.equal(center.props.disabled, true);
     assert.equal(center.props['aria-label'], '\u5e02\u573a\u6570\u636e\u4e0d\u53ef\u7528');
     assert.equal(center.props['data-price-role'], 'UNAVAILABLE');
@@ -519,11 +578,58 @@ test('authoritative empty Store depth does not fall back to legacy rows', () => 
   try {
     const tree = renderOrderBook();
     assert.doesNotMatch(textContent(tree), /101\.00|99\.00|98\.00/);
-    assert.equal(
-      textContent(findByTestId(tree, 'contract-orderbook-empty-state')),
-      '\u6682\u65e0\u76d8\u53e3\u6570\u636e',
-    );
+    const emptyState = findByTestId(tree, 'contract-orderbook-empty-state');
+    const center = findByTestId(tree, 'contract-orderbook-display-price');
+    assert.equal(textContent(emptyState), '\u6682\u65e0\u76d8\u53e3\u6570\u636e');
+    assert.equal(emptyState.props['data-empty-scope'], 'depth-side');
+    assert.equal(textContent(findByTestId(tree, 'contract-orderbook-price-value')), '99.80');
+    assert.match(center.props.className, /h-11 min-h-11/);
     assert.equal((tree as RenderNode).props['data-market-authority'], 'STORE');
+  } finally {
+    console.info = originalInfo;
+  }
+});
+
+test('closed-market ticker authority keeps one selectable center reference while depth is empty', () => {
+  resetDisplayMode();
+  orderBookStoreSnapshot = makeStoreDepthSnapshot({
+    bids: [],
+    asks: [],
+    bestBid: null,
+    bestAsk: null,
+    spread: null,
+    midpoint: null,
+  });
+  const selected: string[] = [];
+  const originalInfo = console.info;
+  console.info = () => undefined;
+
+  try {
+    const tree = renderOrderBook({
+      referencePrice: makeReferencePrice({
+        value: 327.5,
+        domain: 'TICKER',
+        source: 'LAST_PRICE',
+        provider: 'ITICK_QUOTE',
+        freshness: 'LAST_VALID',
+        eventTimeMs: 1_720_000_000_000,
+        usable: true,
+        rejectReason: null,
+        role: 'LAST_PRICE',
+      }),
+      onPriceClick: (price: string) => selected.push(price),
+    });
+    const center = findByTestId(tree, 'contract-orderbook-display-price');
+
+    assert.equal(textContent(findByTestId(tree, 'contract-orderbook-price-value')), '327.50');
+    assert.equal(center.props.disabled, false);
+    assert.equal(center.props['data-price-role'], 'LAST_PRICE');
+    assert.equal(center.props['data-price-source'], 'LAST_PRICE');
+    assert.equal(center.props['data-price-freshness'], 'LAST_VALID');
+    assert.equal(center.props['data-price-usable'], 'true');
+    assert.equal(findByTestId(tree, 'contract-orderbook-empty-state').props['data-empty-scope'], 'depth-side');
+    center.props.onClick();
+    assert.deepEqual(selected, ['327.5']);
   } finally {
     console.info = originalInfo;
   }

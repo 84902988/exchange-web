@@ -86,6 +86,40 @@ describe('ContractMarketStore', () => {
     expect(store.getEntry('BTCUSDT_PERP', 'ticker')?.providerGeneration).toBe(8);
   });
 
+  it('does not revive the previous session when returning to the same symbol', () => {
+    const store = createContractMarketStore();
+    store.activateSymbol('BTCUSDT_PERP');
+    store.ingest({
+      symbol: 'BTCUSDT_PERP',
+      domain: 'ticker',
+      data: { last_price: '64000' },
+      transport: 'WS',
+      provider: 'BINANCE_USDM',
+      providerGeneration: 8,
+      eventTimeMs: 1_720_000_000_200,
+    });
+
+    store.activateSymbol('ETHUSDT_PERP');
+    store.activateSymbol('BTCUSDT_PERP');
+    const result = store.ingest({
+      symbol: 'BTCUSDT_PERP',
+      domain: 'ticker',
+      data: { last_price: '63900' },
+      transport: 'REST',
+      provider: 'BINANCE_USDM',
+      providerGeneration: 7,
+      eventTimeMs: 1_720_000_000_100,
+    });
+
+    expect(result.accepted).toBe(true);
+    expect(store.getEntry<{ last_price: string }>('BTCUSDT_PERP', 'ticker'))
+      .toMatchObject({
+        sessionGeneration: store.getState().sessionGeneration,
+        providerGeneration: 7,
+        data: { last_price: '63900' },
+      });
+  });
+
   it('isolates kline authority by symbol and interval', () => {
     const store = createContractMarketStore();
     store.activateSymbol('BTCUSDT_PERP');
