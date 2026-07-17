@@ -6,6 +6,7 @@ import {
   useContractHeaderStoreSnapshot,
   type ContractHeaderStoreSnapshot,
 } from './hooks/contractMarketStoreAdapter';
+import type { ContractReferencePrice } from './contractPriceAuthority';
 
 export type ContractHeaderPriceDirection = 'up' | 'down' | 'flat';
 export type ContractHeaderQuoteStatusTone = 'loading' | 'live' | 'last' | 'expired' | 'unavailable';
@@ -19,6 +20,8 @@ type ContractHeaderLabels = {
   holiday: string;
   unavailable: string;
   fundingRate: string;
+  trading: string;
+  notTradable: string;
   bestBid: string;
   bestAsk: string;
 };
@@ -32,6 +35,8 @@ const HEADER_LABELS: Record<string, ContractHeaderLabels> = {
     holiday: 'Market holiday',
     unavailable: 'Market data unavailable',
     fundingRate: 'Funding Rate',
+    trading: 'Trading',
+    notTradable: 'Unavailable',
     bestBid: 'Best Bid',
     bestAsk: 'Best Ask',
   },
@@ -43,6 +48,8 @@ const HEADER_LABELS: Record<string, ContractHeaderLabels> = {
     holiday: '\u4f11\u5e02\u4e2d',
     unavailable: '\u884c\u60c5\u6682\u4e0d\u53ef\u7528',
     fundingRate: '\u8d44\u91d1\u8d39\u7387',
+    trading: '\u4ea4\u6613\u4e2d',
+    notTradable: '\u4e0d\u53ef\u4ea4\u6613',
     bestBid: '\u4e70\u4e00',
     bestAsk: '\u5356\u4e00',
   },
@@ -54,6 +61,8 @@ const HEADER_LABELS: Record<string, ContractHeaderLabels> = {
     holiday: '\u4f11\u5e02\u4e2d',
     unavailable: '\u884c\u60c5\u66ab\u4e0d\u53ef\u7528',
     fundingRate: '\u8cc7\u91d1\u8cbb\u7387',
+    trading: '\u4ea4\u6613\u4e2d',
+    notTradable: '\u4e0d\u53ef\u4ea4\u6613',
     bestBid: '\u8cb7\u4e00',
     bestAsk: '\u8ce3\u4e00',
   },
@@ -65,6 +74,8 @@ const HEADER_LABELS: Record<string, ContractHeaderLabels> = {
     holiday: '\u4f11\u5834\u4e2d',
     unavailable: '\u5e02\u5834\u30c7\u30fc\u30bf\u3092\u5229\u7528\u3067\u304d\u307e\u305b\u3093',
     fundingRate: '\u8cc7\u91d1\u8abf\u9054\u7387',
+    trading: '\u53d6\u5f15\u4e2d',
+    notTradable: '\u53d6\u5f15\u4e0d\u53ef',
     bestBid: '\u6700\u826f\u8cb7\u6c17\u914d',
     bestAsk: '\u6700\u826f\u58f2\u6c17\u914d',
   },
@@ -72,6 +83,8 @@ const HEADER_LABELS: Record<string, ContractHeaderLabels> = {
 
 type ContractMarketHeaderProps = {
   marketSymbol: string;
+  referencePrice?: ContractReferencePrice | null;
+  pricePrecision?: number;
   displayPrice: string;
   change?: string | null;
   quoteStatusLabel?: string | null;
@@ -329,6 +342,7 @@ export function resolveContractHeaderMarketPresentation({
 }): {
   state: ContractHeaderMarketState;
   label: string;
+  tradingLabel: string;
   dotClass: string;
 } {
   const labels = getHeaderLabels(locale);
@@ -340,30 +354,60 @@ export function resolveContractHeaderMarketPresentation({
   if (
     includesAny(statusLabel, ['PRE-MARKET', '\u76d8\u524d', '\u76e4\u524d', '\u30d7\u30ec\u30de\u30fc\u30b1\u30c3\u30c8'])
   ) {
-    return { state: 'pre_market', label: labels.preMarket, dotClass: 'bg-[#f0b90b]' };
+    return {
+      state: 'pre_market',
+      label: labels.preMarket,
+      tradingLabel: labels.notTradable,
+      dotClass: 'bg-[#f0b90b]',
+    };
   }
   if (
     includesAny(statusLabel, ['AFTER-HOURS', '\u76d8\u540e', '\u76e4\u5f8C', '\u6642\u9593\u5916'])
   ) {
-    return { state: 'after_hours', label: labels.afterHours, dotClass: 'bg-[#f0b90b]' };
+    return {
+      state: 'after_hours',
+      label: labels.afterHours,
+      tradingLabel: labels.notTradable,
+      dotClass: 'bg-[#f0b90b]',
+    };
   }
   if (
     includesAny(statusLabel, ['HOLIDAY', '\u4f11\u5e02', '\u4f11\u5834', '\u5e02\u5834\u5047\u671f'])
   ) {
-    return { state: 'holiday', label: labels.holiday, dotClass: 'bg-[#f0b90b]' };
+    return {
+      state: 'holiday',
+      label: labels.holiday,
+      tradingLabel: labels.notTradable,
+      dotClass: 'bg-[#f0b90b]',
+    };
   }
   if (
     includesAny(statusLabel, ['CLOSED', '\u95ed\u5e02', '\u9589\u5e02', '\u9589\u5834'])
   ) {
-    return { state: 'closed', label: labels.closed, dotClass: 'bg-[#f0b90b]' };
+    return {
+      state: 'closed',
+      label: labels.closed,
+      tradingLabel: labels.notTradable,
+      dotClass: 'bg-[#f0b90b]',
+    };
   }
 
   const hasDisplayPrice = !!String(displayPrice || '').trim() && displayPrice !== '--';
   if (!hasDisplayPrice || executable !== true || quoteStatusTone !== 'live') {
-    return { state: 'unavailable', label: labels.unavailable, dotClass: 'bg-[#f6465d]' };
+    return {
+      state: 'unavailable',
+      label: labels.unavailable,
+      tradingLabel: labels.notTradable,
+      dotClass: 'bg-[#f6465d]',
+    };
   }
 
-  return { state: 'live', label: labels.live, dotClass: 'bg-[#00c087]' };
+  return {
+    state: 'live',
+    label: labels.live,
+    tradingLabel: labels.trading,
+    dotClass: 'bg-[#00c087]',
+  };
 }
 
 function priceDirectionTextClass(direction: ContractHeaderPriceDirection) {
@@ -378,8 +422,34 @@ function priceDirectionFlashClass(direction: ContractHeaderPriceDirection) {
   return '';
 }
 
+function formatReferencePrice(referencePrice: ContractReferencePrice | null | undefined, pricePrecision: number) {
+  if (!referencePrice?.usable || referencePrice.value === null || !Number.isFinite(referencePrice.value)) {
+    return '--';
+  }
+  const precision = Number.isInteger(pricePrecision) && pricePrecision >= 0
+    ? Math.min(pricePrecision, 12)
+    : 2;
+  return referencePrice.value.toLocaleString('en-US', {
+    minimumFractionDigits: precision,
+    maximumFractionDigits: precision,
+  });
+}
+
+function isClosedMarketDisplayState(
+  marketStatus?: string | null,
+  marketSessionType?: string | null,
+) {
+  const normalizedStatus = String(marketStatus || '').trim().toUpperCase();
+  const normalizedSession = String(marketSessionType || '').trim().toUpperCase();
+  return normalizedStatus === 'CLOSED'
+    || normalizedStatus === 'HOLIDAY'
+    || ['PRE_MARKET', 'AFTER_HOURS', 'CLOSED', 'HOLIDAY'].includes(normalizedSession);
+}
+
 export default function ContractMarketHeader({
   marketSymbol,
+  referencePrice,
+  pricePrecision = 2,
   displayPrice: legacyDisplayPrice,
   change: legacyChange,
   quoteStatusLabel: legacyQuoteStatusLabel,
@@ -450,16 +520,16 @@ export default function ContractMarketHeader({
   ]);
   const marketRead = resolveContractHeaderMarketRead(storeSnapshot, legacyRead);
   const {
-    displayPrice,
+    displayPrice: marketReadDisplayPrice,
     change,
     quoteStatusLabel,
     quoteStatusTone,
     marketStatus,
-    tickerFreshness,
+    tickerFreshness: marketReadTickerFreshness,
     marketSessionType,
     executable,
-    displayPriceSource,
-    displayPriceLabel,
+    displayPriceSource: marketReadDisplayPriceSource,
+    displayPriceLabel: marketReadDisplayPriceLabel,
     markPrice,
     indexPrice,
     fundingRate,
@@ -469,6 +539,41 @@ export default function ContractMarketHeader({
     highLow24h,
     volumeTurnover24h,
   } = marketRead;
+  const hasReferencePriceContract = referencePrice !== null && referencePrice !== undefined;
+  const usesReferencePrice = hasReferencePriceContract && referencePrice.usable;
+  const usesClosedMarketDisplayFallback = hasReferencePriceContract
+    && !referencePrice.usable
+    && isClosedMarketDisplayState(marketStatus, marketSessionType);
+  const legacyDisplayValue = String(legacyDisplayPrice || '').trim() || '--';
+  const displayPrice = usesReferencePrice
+    ? formatReferencePrice(referencePrice, pricePrecision)
+    : !hasReferencePriceContract
+      ? marketReadDisplayPrice
+      : usesClosedMarketDisplayFallback
+        ? legacyDisplayValue
+        : '--';
+  const displayPriceFreshness = usesReferencePrice
+    ? referencePrice.freshness
+    : !hasReferencePriceContract
+      ? marketReadTickerFreshness
+      : usesClosedMarketDisplayFallback
+        ? legacyTickerFreshness
+        : referencePrice.freshness;
+  const displayPriceSource = usesReferencePrice
+    ? referencePrice.source
+    : !hasReferencePriceContract
+      ? marketReadDisplayPriceSource
+      : usesClosedMarketDisplayFallback
+        ? legacyDisplayPriceSource
+        : referencePrice.source;
+  const referencePriceRole = hasReferencePriceContract && !usesClosedMarketDisplayFallback
+    ? referencePrice.role
+    : null;
+  const displayPriceTitle = hasReferencePriceContract && !usesClosedMarketDisplayFallback
+    ? referencePrice.role
+    : !hasReferencePriceContract
+      ? marketReadDisplayPriceLabel
+      : legacyDisplayPriceLabel;
 
   useEffect(() => {
     const differences = getContractHeaderReadDifferences(storeSnapshot, legacyRead);
@@ -525,8 +630,9 @@ export default function ContractMarketHeader({
   return (
     <div
       className="tabular-nums border-b border-white/[0.06] bg-[#11161d] px-3 py-2 shadow-[inset_0_-1px_0_rgba(255,255,255,0.02)]"
-      data-market-authority={marketRead.authority}
+      data-market-authority={hasReferencePriceContract ? 'PRICE_AUTHORITY_V1' : marketRead.authority}
       data-provider-generation={storeSnapshot?.providerGeneration ?? ''}
+      data-secondary-market-authority={marketRead.authority}
     >
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2.5 xl:flex-nowrap">
         <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 whitespace-nowrap sm:min-w-[350px]">
@@ -543,10 +649,11 @@ export default function ContractMarketHeader({
               className={`inline-flex max-w-full items-center truncate rounded-md px-1 py-0.5 text-[28px] font-semibold leading-none transition-all duration-200 ${priceColorClass} ${priceFlashClass} ${
                 flash ? 'scale-[1.02] shadow-[0_0_24px_rgba(255,255,255,0.04)]' : 'scale-100'
               }`}
-              data-display-freshness={tickerFreshness || ''}
+              data-display-freshness={displayPriceFreshness || ''}
               data-display-source={displayPriceSource || ''}
+              data-reference-role={referencePriceRole || ''}
               data-testid="contract-header-display-price"
-              title={displayPriceLabel || undefined}
+              title={displayPriceTitle || undefined}
             >
               {displayPrice}
             </div>
@@ -560,7 +667,7 @@ export default function ContractMarketHeader({
           <Metric
             label={t('tradeStatus', 'contracts')}
             testId="contract-header-market-status-card"
-            title={marketPresentation.label}
+            title={`${marketPresentation.label} \u00b7 ${marketPresentation.tradingLabel}`}
             value={(
               <span
                 className="inline-flex min-w-0 items-center gap-1.5 whitespace-nowrap text-[13px] font-medium text-white/78"
@@ -573,6 +680,8 @@ export default function ContractMarketHeader({
                   data-testid="contract-header-market-status-dot"
                 />
                 <span className="truncate">{marketPresentation.label}</span>
+                <span className="text-white/36">{'\u00b7'}</span>
+                <span className="truncate">{marketPresentation.tradingLabel}</span>
               </span>
             )}
           />

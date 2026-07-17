@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import ContractAccountPanel from '@/components/contract/ContractAccountPanel';
 import ContractFuturesOrderBook from '@/components/contract/ContractFuturesOrderBook';
@@ -348,6 +348,7 @@ function ContractPageContent() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [contractTicker, setContractTicker] = useState<ContractTickerItem | null>(null);
+  const tickerRequestSeqRef = useRef(0);
   const urlContractSymbol = useMemo(
     () => normalizeContractSymbol(searchParams.get('symbol')),
     [searchParams],
@@ -386,6 +387,7 @@ function ContractPageContent() {
     marketSymbol,
     quantityUnit,
     quote: contractQuote,
+    marketRealtimeStatus: contractMarketRealtimeStatus,
     contractAvailabilityError,
     pricePrecision,
     quoteHint,
@@ -437,6 +439,9 @@ function ContractPageContent() {
     fallbackMarketStatusText: activeContractTicker?.market_status_text || currentContractPair?.marketStatusText,
     fallbackMarketSessionType: activeContractTicker?.market_session_type || currentContractPair?.marketSessionType,
     fallbackQuoteFreshness: activeContractTicker?.quote_freshness,
+    fallbackLastPrice: activeContractTicker?.last_price ?? activeContractTicker?.price,
+    fallbackLastPriceSource: activeContractTicker?.source,
+    fallbackLastPriceTime: activeContractTicker?.ts,
   });
   const currentPriceDisplay = currentPriceReady
     ? formatPrice(currentPriceNumber, pricePrecision)
@@ -571,31 +576,34 @@ function ContractPageContent() {
     return () => window.clearTimeout(timer);
   }, [contractChartIntervalOptions, interval]);
 
+  const refreshContractTicker = useCallback(async () => {
+    const requestSeq = tickerRequestSeqRef.current + 1;
+    tickerRequestSeqRef.current = requestSeq;
+    try {
+      const response = await getContractTickers({ symbols: [contractSymbol], limit: 1 });
+      if (tickerRequestSeqRef.current !== requestSeq) return;
+      const ticker = response.items.find((item) => item.symbol === contractSymbol) || null;
+      setContractTicker(ticker);
+    } catch {
+      if (tickerRequestSeqRef.current === requestSeq) setContractTicker(null);
+    }
+  }, [contractSymbol]);
+
   useEffect(() => {
     if (!isPageVisible) return undefined;
-    let alive = true;
-
-    async function refreshTicker() {
-      try {
-        const response = await getContractTickers({ symbols: [contractSymbol], limit: 1 });
-        if (!alive) return;
-        const ticker = response.items.find((item) => item.symbol === contractSymbol) || response.items[0] || null;
-        setContractTicker(ticker);
-      } catch {
-        if (alive) setContractTicker(null);
-      }
-    }
-
-    void refreshTicker();
-    const timer = window.setInterval(() => {
-      void refreshTicker();
-    }, 5000);
-
+    void refreshContractTicker();
     return () => {
-      alive = false;
-      window.clearInterval(timer);
+      tickerRequestSeqRef.current += 1;
     };
-  }, [contractSymbol, isPageVisible]);
+  }, [isPageVisible, refreshContractTicker]);
+
+  useEffect(() => {
+    if (!isPageVisible || contractMarketRealtimeStatus === 'connected') return undefined;
+    const timer = window.setInterval(() => {
+      void refreshContractTicker();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [contractMarketRealtimeStatus, isPageVisible, refreshContractTicker]);
 
   useEffect(() => {
     if (!contractPairsLoaded) return;
@@ -669,6 +677,8 @@ function ContractPageContent() {
       <div className="w-full px-2 py-2 xl:px-3 xl:py-2">
         <ContractMarketHeader
           marketSymbol={marketSymbol}
+          referencePrice={referencePrice}
+          pricePrecision={pricePrecision}
           displayPrice={currentPriceDisplay}
           change={headerChange}
           quoteStatusLabel={quoteStatusLabel}
