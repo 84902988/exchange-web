@@ -2614,10 +2614,13 @@ def _normalize_provider_kline_rows(provider_code: str, payload: Any) -> list[dic
     rows: list[dict[str, Any]] = []
     raw_rows = _provider_data_rows(payload)
     for row in raw_rows:
-        if not isinstance(row, list) or len(row) < 5:
+        if not isinstance(row, list) or len(row) < 6:
             continue
         open_time = _provider_timestamp_ms(row[0])
         if any(_to_decimal(value) is None for value in (row[1], row[2], row[3], row[4])):
+            continue
+        volume = _to_decimal(row[5])
+        if volume is None or volume < 0:
             continue
         rows.append(
             {
@@ -2626,7 +2629,7 @@ def _normalize_provider_kline_rows(provider_code: str, payload: Any) -> list[dic
                 "high": str(row[2]),
                 "low": str(row[3]),
                 "close": str(row[4]),
-                "volume": str(row[5] if len(row) > 5 else "0"),
+                "volume": format(volume, "f"),
                 "quote_volume": str(row[6] if len(row) > 6 else "0"),
             }
         )
@@ -4397,13 +4400,16 @@ def _extract_itick_kline_rows(payload: Any) -> list[dict[str, Any]]:
         elif isinstance(item, (list, tuple)) and len(item) >= 5:
             open_time = _to_timestamp_ms(item[0])
             open_price, high_price, low_price, close_price = item[1], item[2], item[3], item[4]
-            volume = item[5] if len(item) > 5 else "0"
+            volume = item[5] if len(item) > 5 else None
         else:
             continue
 
         if open_time is None:
             continue
         if any(_to_decimal(value) is None for value in (open_price, high_price, low_price, close_price)):
+            continue
+        normalized_volume = _to_decimal(volume)
+        if normalized_volume is None or normalized_volume < 0:
             continue
         rows.append(
             {
@@ -4412,7 +4418,7 @@ def _extract_itick_kline_rows(payload: Any) -> list[dict[str, Any]]:
                 "high": str(high_price),
                 "low": str(low_price),
                 "close": str(close_price),
-                "volume": str(volume or "0"),
+                "volume": format(normalized_volume, "f"),
             }
         )
 
@@ -4428,7 +4434,13 @@ def _is_provider_contract_kline_row(row: dict[str, Any]) -> bool:
         normalized = str(raw_value).strip().upper()
         if normalized in _NON_PROVIDER_KLINE_SOURCE_TOKENS or "QUOTE" in normalized:
             return False
-    return True
+    open_time = _to_timestamp_ms(row.get("open_time") or row.get("time") or row.get("timestamp"))
+    if open_time is None:
+        return False
+    if any(_to_decimal(row.get(key)) is None for key in ("open", "high", "low", "close")):
+        return False
+    volume = _to_decimal(row.get("volume"))
+    return volume is not None and volume >= 0
 
 
 def _provider_contract_kline_rows(rows: Any, *, limit: Optional[int] = None) -> ContractKlineResult:

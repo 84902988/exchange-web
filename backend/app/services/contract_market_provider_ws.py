@@ -2946,6 +2946,8 @@ class ContractMarketProviderWsService:
             or high_price is None
             or low_price is None
             or close_price is None
+            or volume is None
+            or volume < 0
         ):
             return None
         quote_volume = _to_decimal(row[7] if len(row) > 7 else None)
@@ -2962,7 +2964,7 @@ class ContractMarketProviderWsService:
             "high": format(high_price, "f"),
             "low": format(low_price, "f"),
             "close": format(close_price, "f"),
-            "volume": format(volume or Decimal("0"), "f"),
+            "volume": format(volume, "f"),
             "quote_volume": format(quote_volume, "f") if quote_volume is not None else None,
             "is_closed": confirm == "1" if confirm else None,
             "is_final": confirm == "1" if confirm else False,
@@ -2984,15 +2986,17 @@ class ContractMarketProviderWsService:
         high_price = _to_decimal(row.get("h"))
         low_price = _to_decimal(row.get("l"))
         close_price = _to_decimal(row.get("c"))
+        volume = _to_decimal(row.get("v"))
         if (
             open_time_ms <= 0
             or open_price is None
             or high_price is None
             or low_price is None
             or close_price is None
+            or volume is None
+            or volume < 0
         ):
             return None
-        volume = _to_decimal(row.get("v"))
         quote_volume = _to_decimal(row.get("tu"))
         return {
             "symbol": subscription.local_symbol,
@@ -3007,7 +3011,7 @@ class ContractMarketProviderWsService:
             "high": format(high_price, "f"),
             "low": format(low_price, "f"),
             "close": format(close_price, "f"),
-            "volume": format(volume or Decimal("0"), "f"),
+            "volume": format(volume, "f"),
             "quote_volume": format(quote_volume, "f") if quote_volume is not None else None,
             "turnover": format(quote_volume, "f") if quote_volume is not None else None,
             "is_closed": False,

@@ -372,6 +372,7 @@ function ingestStoreKline(params: {
   interval: string;
   openTime: number;
   close: string;
+  volume?: string;
   eventTimeMs?: number;
   generation?: number;
   sequence?: number;
@@ -382,6 +383,7 @@ function ingestStoreKline(params: {
     interval: params.interval,
     data: {
       ...row(params.openTime, params.close),
+      volume: params.volume ?? '1',
       symbol: params.symbol,
       interval: params.interval,
       source: 'PROVIDER_KLINE',
@@ -517,6 +519,34 @@ test('provider realtime candles are accepted while quote-derived sources are rej
     null,
   );
   assert.ok(restToBar(basePayload), 'source-less provider REST rows remain compatible');
+});
+
+
+test('history and realtime bars fail closed without complete provider volume evidence', () => {
+  const payload = {
+    open_time: 1_717_000_000_000,
+    open: '100',
+    high: '110',
+    low: '90',
+    close: '105',
+  };
+  const realtime = (volume: unknown) => datafeedModule.realtimeMessageToBar({
+    type: 'contract_kline_update',
+    symbol: 'BTCUSDT_PERP',
+    interval: '1m',
+    kline: { ...payload, volume, source: 'LIVE_WS' },
+  }, 'BTCUSDT_PERP', '1m');
+
+  assert.equal(datafeedModule.klineToBar({ ...payload, volume: '0' })?.volume, 0);
+  assert.equal(realtime('0')?.volume, 0);
+  for (const invalidVolume of [undefined, null, '', 'not-a-number', '-1']) {
+    assert.equal(
+      datafeedModule.klineToBar({ ...payload, volume: invalidVolume }),
+      null,
+      `history volume ${String(invalidVolume)}`,
+    );
+    assert.equal(realtime(invalidVolume), null, `realtime volume ${String(invalidVolume)}`);
+  }
 });
 
 
@@ -4126,6 +4156,48 @@ test('Store kline is primary and non-kline domains or same-candle legacy fallbac
   });
 
   assert.deepEqual(received.map((bar) => bar.close), [101, 102]);
+  datafeed.destroy();
+});
+
+
+test('Store realtime revisions publish close and volume from the same candle evidence', async () => {
+  const symbol = 'STORE_OHLCV_PERP';
+  const openTime = 1_717_100_000_000;
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol);
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'store-ohlcv-subscriber',
+  );
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '101',
+    volume: '5',
+    eventTimeMs: openTime + 1,
+  });
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '102',
+    volume: '8',
+    eventTimeMs: openTime + 2,
+  });
+
+  assert.deepEqual(
+    received.map((bar) => ({ close: bar.close, volume: bar.volume })),
+    [
+      { close: 101, volume: 5 },
+      { close: 102, volume: 8 },
+    ],
+  );
   datafeed.destroy();
 });
 

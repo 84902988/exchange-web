@@ -76,10 +76,20 @@ function isProviderKlineItem(value: unknown) {
   if (!hasProviderSource) return false;
 
   const openTime = Number(record.open_time ?? record.time ?? record.timestamp);
-  const hasValidOhlc = ['open', 'high', 'low', 'close'].every((key) => (
-    Number.isFinite(Number(record[key]))
-  ));
-  return Number.isFinite(openTime) && openTime > 0 && hasValidOhlc;
+  const hasValidOhlc = ['open', 'high', 'low', 'close'].every((key) => {
+    const value = record[key];
+    return value !== undefined
+      && value !== null
+      && value !== ''
+      && Number.isFinite(Number(value));
+  });
+  const volume = Number(record.volume);
+  const hasValidVolume = record.volume !== undefined
+    && record.volume !== null
+    && record.volume !== ''
+    && Number.isFinite(volume)
+    && volume >= 0;
+  return Number.isFinite(openTime) && openTime > 0 && hasValidOhlc && hasValidVolume;
 }
 
 function cloneKlineItem(item: ContractMarketKlineItem) {

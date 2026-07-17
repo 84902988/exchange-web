@@ -406,6 +406,8 @@ function normalizeTimeMs(value: unknown) {
 }
 
 function normalizeNumber(value: unknown) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
 }
@@ -439,7 +441,7 @@ export function klineToBar(
   const high = normalizeNumber(item.high);
   const low = normalizeNumber(item.low);
   const close = normalizeNumber(item.close);
-  const volume = normalizeNumber(item.volume) ?? 0;
+  const volume = normalizeNumber(item.volume);
 
   if (
     !time
@@ -447,6 +449,8 @@ export function klineToBar(
     || high === null
     || low === null
     || close === null
+    || volume === null
+    || volume < 0
     || !isContractDwmUtcBoundary(time, interval)
   ) return null;
 
@@ -479,7 +483,7 @@ export function realtimeMessageToBar(
     high: payload.high as string | number,
     low: payload.low as string | number,
     close: payload.close as string | number,
-    volume: (payload.volume ?? 0) as string | number,
+    volume: payload.volume as string | number,
     source: payload.source ?? message.source,
     quote_source: payload.quote_source ?? message.quote_source,
     kline_mode: payload.kline_mode ?? message.kline_mode,
@@ -549,7 +553,7 @@ export function storeKlineEntryToBar(
     high: payload.high as string | number,
     low: payload.low as string | number,
     close: payload.close as string | number,
-    volume: (payload.volume ?? 0) as string | number,
+    volume: payload.volume as string | number,
     source: payload.source ?? entry.source,
     quote_source: payload.quote_source,
     kline_mode: payload.kline_mode,
@@ -558,7 +562,7 @@ export function storeKlineEntryToBar(
 }
 
 function realtimeBarFingerprint(bar: ContractTradingViewBar) {
-  return [bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume ?? 0].join('|');
+  return [bar.time, bar.open, bar.high, bar.low, bar.close, String(bar.volume)].join('|');
 }
 
 export type KlineVersionCursor = {
