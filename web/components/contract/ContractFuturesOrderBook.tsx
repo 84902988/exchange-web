@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   type ContractDepthLevel,
   type ContractDepthMode,
@@ -94,24 +94,6 @@ const ORDERBOOK_MODE_LABELS: Record<string, Record<ContractOrderBookDisplayMode,
   'zh-TW': { FULL: '\u5168\u90e8', BUY: '\u8cb7\u76e4', SELL: '\u8ce3\u76e4' },
   ja: { FULL: '\u3059\u3079\u3066', BUY: '\u8cb7\u3044\u677f', SELL: '\u58f2\u308a\u677f' },
 };
-
-function getQuoteStatusLabel(
-  status: ContractQuoteDisplayStatus,
-  t: (key: string, namespace?: 'contracts') => string,
-) {
-  if (status === 'LOADING') return t('marketDataLoadingLabel', 'contracts');
-  if (status === 'LIVE') return t('realtimeQuoteLabel', 'contracts');
-  return t('quoteTemporarilyUnavailableLabel', 'contracts');
-}
-
-function quoteStatusBadgeClass(status: ContractQuoteDisplayStatus) {
-  if (status === 'LOADING') return 'border-white/10 bg-white/[0.05] text-white/58';
-  if (status === 'LIVE') return 'border-[#00c087]/20 bg-[#00c087]/10 text-[#00c087]';
-  if (status === 'EXPIRED_LAST_QUOTE' || status === 'UNAVAILABLE') {
-    return 'border-[#f6465d]/20 bg-[#f6465d]/10 text-[#f6465d]';
-  }
-  return 'border-[#f0b90b]/20 bg-[#f0b90b]/10 text-[#f0b90b]';
-}
 
 function toPositivePrice(value?: string | number | null) {
   if (value === undefined || value === null || value === '') return null;
@@ -329,34 +311,15 @@ export default function ContractFuturesOrderBook({
     bids,
     asks,
     status,
-    statusLabel,
     depthMode,
     loading,
     error,
   } = marketRead;
 
-  useEffect(() => {
-    const differences = getContractOrderBookReadDifferences(storeSnapshot, legacyRead);
-    if (!storeSnapshot || marketRead.authority !== 'STORE' || differences.length === 0) return;
-    console.info('[contract-orderbook-depth-diff]', {
-      symbol: storeSnapshot.symbol,
-      provider: storeSnapshot.provider,
-      providerGeneration: storeSnapshot.providerGeneration,
-      revision: storeSnapshot.revision,
-      observedAtMs: storeSnapshot.observedAtMs,
-      differences,
-    });
-  }, [legacyRead, marketRead.authority, storeSnapshot]);
-
   const handlePriceSelect = onPriceClick || onPriceSelect;
   const modeLabels = ORDERBOOK_MODE_LABELS[locale] || ORDERBOOK_MODE_LABELS.en;
   const normalizedDepthMode = normalizeContractDepthMode(depthMode);
   const displayStatus = status ?? null;
-  const depthStatusLabel = statusLabel || (displayStatus ? getQuoteStatusLabel(displayStatus, t) : null);
-  const displayDepthStatusClass = displayStatus
-    ? quoteStatusBadgeClass(displayStatus)
-    : 'border-white/10 bg-white/[0.05] text-white/58';
-  const hasDepthQuoteStatus = !!depthStatusLabel && !!displayStatus;
   const depthModeLabel = getContractDepthModeLabel(depthMode);
 
   const depthUnavailable = loading
@@ -386,12 +349,10 @@ export default function ContractFuturesOrderBook({
     () => calculateContractOrderBookDepthRatio({
       bids: visibleBids,
       asks: visibleAsks,
-      displayMode,
       depthMode,
     }),
     [
       depthMode,
-      displayMode,
       visibleAsks,
       visibleBids,
     ],
@@ -426,11 +387,21 @@ export default function ContractFuturesOrderBook({
   const centerSelectPrice = !hasCenterPrice || centerPriceNumber === null
     ? null
     : String(centerPriceNumber);
+  const directionArrow = hasCenterPrice && priceDirection === 'up'
+    ? { symbol: '\u2191', colorClass: 'text-[#00c087]' }
+    : hasCenterPrice && priceDirection === 'down'
+      ? { symbol: '\u2193', colorClass: 'text-[#f6465d]' }
+      : null;
   const centerLabel = referencePrice.role === 'KLINE_CLOSE'
     ? t('klineLatestPrice', 'contracts')
-    : referencePrice.role === 'LAST_TRADE'
+    : referencePrice.role === 'LAST_TRADE' || referencePrice.role === 'LAST_PRICE'
       ? t('latestPrice', 'contracts')
       : t('marketDataUnavailable', 'contracts');
+  const contentGridClass = displayMode === 'FULL'
+    ? 'grid-rows-[minmax(0,1fr)_auto_minmax(0,1fr)]'
+    : displayMode === 'BUY'
+      ? 'grid-rows-[auto_minmax(0,1fr)]'
+      : 'grid-rows-[minmax(0,1fr)_auto]';
 
   return (
     <div
@@ -466,13 +437,6 @@ export default function ContractFuturesOrderBook({
         </div>
 
         <div className="flex min-w-0 items-center justify-end gap-1.5 overflow-hidden">
-          {hasDepthQuoteStatus ? (
-            <div
-              className={`shrink truncate rounded-full border px-2 py-0.5 text-[10px] font-semibold ${displayDepthStatusClass}`}
-            >
-              {depthStatusLabel}
-            </div>
-          ) : null}
           {depthModeLabel ? (
             <div
               className="shrink-0 whitespace-nowrap rounded-full border border-[#f0b90b]/25 bg-[#f0b90b]/10 px-2 py-0.5 text-[10px] font-semibold text-[#f0b90b]"
@@ -491,11 +455,7 @@ export default function ContractFuturesOrderBook({
       </div>
 
       <div
-        className={`relative grid min-h-0 flex-1 gap-1 ${
-          displayMode === 'FULL'
-            ? 'grid-rows-[minmax(0,1fr)_auto_minmax(0,1fr)]'
-            : 'grid-rows-1'
-        }`}
+        className={`relative grid min-h-0 flex-1 gap-1 ${contentGridClass}`}
         data-testid="contract-orderbook-depth-area"
       >
         {showAsks ? (
@@ -504,28 +464,38 @@ export default function ContractFuturesOrderBook({
             side="ask"
             pricePrecision={pricePrecision}
             onPriceSelect={handlePriceSelect}
+            emptyStateLabel={!hasSelectedDepth ? emptyStateLabel : null}
           />
         ) : null}
 
-        {displayMode === 'FULL' ? (
-          <button
-            type="button"
-            aria-label={centerLabel}
-            title={centerLabel}
-            disabled={!handlePriceSelect || centerDisplayPrice === '--' || !centerSelectPrice}
-            onClick={() => {
-              if (centerSelectPrice) handlePriceSelect?.(centerSelectPrice);
-            }}
-            data-price-freshness={referencePrice.freshness || ''}
-            data-price-role={referencePrice.role}
-            data-price-source={referencePrice.source || ''}
-            data-price-usable={referencePrice.usable ? 'true' : 'false'}
-            data-testid="contract-orderbook-display-price"
-            className={`rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${priceClass}`}
-          >
-            <span className="block text-[17px] leading-none">{centerDisplayPrice}</span>
-          </button>
-        ) : null}
+        <button
+          type="button"
+          aria-label={centerLabel}
+          title={centerLabel}
+          disabled={!handlePriceSelect || centerDisplayPrice === '--' || !centerSelectPrice}
+          onClick={() => {
+            if (centerSelectPrice) handlePriceSelect?.(centerSelectPrice);
+          }}
+          data-price-freshness={referencePrice.freshness || ''}
+          data-price-role={referencePrice.role}
+          data-price-source={referencePrice.source || ''}
+          data-price-usable={referencePrice.usable ? 'true' : 'false'}
+          data-testid="contract-orderbook-display-price"
+          className={`relative z-20 flex h-11 min-h-11 items-center justify-center rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-center font-semibold leading-none transition-colors hover:bg-white/[0.05] disabled:cursor-default disabled:hover:bg-white/[0.02] ${priceClass}`}
+        >
+          <span className="text-[20px] leading-none" data-testid="contract-orderbook-price-value">
+            {centerDisplayPrice}
+          </span>
+          {directionArrow ? (
+            <span
+              aria-hidden="true"
+              className={`ml-1.5 text-[16px] font-black leading-none ${directionArrow.colorClass}`}
+              data-testid="contract-orderbook-price-direction"
+            >
+              {directionArrow.symbol}
+            </span>
+          ) : null}
+        </button>
 
         {showBids ? (
           <OrderBookSide
@@ -533,16 +503,8 @@ export default function ContractFuturesOrderBook({
             side="bid"
             pricePrecision={pricePrecision}
             onPriceSelect={handlePriceSelect}
+            emptyStateLabel={!hasSelectedDepth && !showAsks ? emptyStateLabel : null}
           />
-        ) : null}
-
-        {!hasSelectedDepth ? (
-          <div
-            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center px-3 text-center text-sm text-white/40"
-            data-testid="contract-orderbook-empty-state"
-          >
-            {emptyStateLabel}
-          </div>
         ) : null}
       </div>
 
@@ -556,15 +518,17 @@ function OrderBookSide({
   side,
   pricePrecision,
   onPriceSelect,
+  emptyStateLabel,
 }: {
   slots: ContractOrderBookRowSlot[];
   side: 'ask' | 'bid';
   pricePrecision: number;
   onPriceSelect?: (price: string) => void;
+  emptyStateLabel?: string | null;
 }) {
   return (
     <div
-      className="grid min-h-0 gap-px overflow-hidden"
+      className="relative grid min-h-0 gap-px overflow-hidden"
       data-testid={`contract-orderbook-${side}-rows`}
       style={{ gridTemplateRows: `repeat(${slots.length}, minmax(0, 1fr))` }}
     >
@@ -581,6 +545,15 @@ function OrderBookSide({
           <EmptyBookRow key={`${side}-slot-${index}`} side={side} />
         )
       ))}
+      {emptyStateLabel ? (
+        <div
+          className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center px-3 text-center text-sm text-white/40"
+          data-empty-scope="depth-side"
+          data-testid="contract-orderbook-empty-state"
+        >
+          {emptyStateLabel}
+        </div>
+      ) : null}
     </div>
   );
 }
