@@ -35,6 +35,10 @@ import {
 } from './useContractMarketState';
 import { useContractMarketViewPolling } from './useContractMarketViewPolling';
 import {
+  resolveContractRestBootstrap,
+  type ContractRestBootstrapCursor,
+} from './contractRestBootstrapPolicy';
+import {
   hydrateContractMarketRestDomain,
   hydrateContractMarketViewShadow,
   ingestContractMarketWsDomain,
@@ -445,8 +449,16 @@ export function useContractMarketView({
   const marketViewAbortControllerRef = useRef<AbortController | null>(null);
   const depthRequestSeqRef = useRef(0);
   const depthInFlightSymbolRef = useRef<string | null>(null);
+  const depthRestBootstrapRef = useRef<ContractRestBootstrapCursor>({
+    key: null,
+    realtimeStatus: 'idle',
+  });
   const tradesRequestSeqRef = useRef(0);
   const tradesInFlightSymbolRef = useRef<string | null>(null);
+  const tradesRestBootstrapRef = useRef<ContractRestBootstrapCursor>({
+    key: null,
+    realtimeStatus: 'idle',
+  });
   const marketViewErrorSymbolRef = useRef<string | null>(null);
   const mountedRef = useRef(false);
   const currentPriceRef = useRef<number | null>(null);
@@ -807,28 +819,31 @@ export function useContractMarketView({
       setFallbackDepthAllowed(true);
     }, DEPTH_INITIAL_GRACE_MS);
 
-    // REST bootstraps every session, then becomes a disconnected-only fallback.
-    // While realtime is connected, every depth frame comes from the WS Store path.
-    void refreshDepth();
+    return () => window.clearTimeout(fallbackTimer);
+  }, [applyDepthSnapshot, contractSymbol, marketSessionRefreshKey]);
 
-    if (quoteMarketRealtimeStatus === 'connected') {
-      return () => {
-        depthRequestSeqRef.current += 1;
-        window.clearTimeout(fallbackTimer);
-      };
-    }
+  useEffect(() => {
+    const requestSymbol = normalizeContractSymbol(contractSymbol);
+    const bootstrapKey = `${requestSymbol}|${marketSessionRefreshKey}`;
+    const decision = resolveContractRestBootstrap(
+      depthRestBootstrapRef.current,
+      bootstrapKey,
+      quoteMarketRealtimeStatus,
+    );
+    depthRestBootstrapRef.current = decision.next;
+
+    // REST runs once per symbol/session bootstrap and immediately after WS loss.
+    // While realtime is connected, every depth frame comes from the WS Store path.
+    if (decision.shouldRefresh) void refreshDepth();
+
+    if (quoteMarketRealtimeStatus === 'connected') return undefined;
 
     const timer = window.setInterval(() => {
       void refreshDepth();
     }, 1500);
 
-    return () => {
-      depthRequestSeqRef.current += 1;
-      window.clearTimeout(fallbackTimer);
-      window.clearInterval(timer);
-    };
+    return () => window.clearInterval(timer);
   }, [
-    applyDepthSnapshot,
     contractSymbol,
     marketSessionRefreshKey,
     quoteMarketRealtimeStatus,
@@ -933,26 +948,33 @@ export function useContractMarketView({
         updatedAt: null,
       });
     }
+  }, [applyTradesSnapshot, contractSymbol]);
 
-    void refreshTrades();
+  useEffect(() => {
+    const requestSymbol = normalizeContractSymbol(contractSymbol);
+    const sessionMode = effectiveMarketStatus === 'CLOSED' ? 'CLOSED' : 'ACTIVE';
+    const bootstrapKey = `${requestSymbol}|${marketSessionRefreshKey}|${sessionMode}`;
+    const decision = resolveContractRestBootstrap(
+      tradesRestBootstrapRef.current,
+      bootstrapKey,
+      quoteMarketRealtimeStatus,
+    );
+    tradesRestBootstrapRef.current = decision.next;
+
+    if (decision.shouldRefresh) void refreshTrades();
     if (effectiveMarketStatus === 'CLOSED' || quoteMarketRealtimeStatus === 'connected') {
-      return () => {
-        tradesRequestSeqRef.current += 1;
-      };
+      return undefined;
     }
 
     const timer = window.setInterval(() => {
       void refreshTrades();
     }, 1500);
 
-    return () => {
-      tradesRequestSeqRef.current += 1;
-      window.clearInterval(timer);
-    };
+    return () => window.clearInterval(timer);
   }, [
-    applyTradesSnapshot,
     contractSymbol,
     effectiveMarketStatus,
+    marketSessionRefreshKey,
     quoteMarketRealtimeStatus,
     refreshTrades,
   ]);

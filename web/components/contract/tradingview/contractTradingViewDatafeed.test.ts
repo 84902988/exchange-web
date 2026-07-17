@@ -1728,6 +1728,72 @@ test('cache-hit supersede settles the old callback and preserves the new result'
 });
 
 
+test('current L1 hit settles history and opens the realtime barrier with the cached latest bar', async () => {
+  const symbol = 'L1_HISTORY_SETTLEMENT_PERP';
+  const baselineTime = 1_717_080_000_000;
+  const storeTime = baselineTime + 60_000;
+  assert.equal(currentCacheModule.contractKlineCurrentCache.set(
+    { symbol, interval: '1m', limit: 100 },
+    metadata(pageEndingAt(baselineTime, 100, '118')),
+    15_000,
+  ), true);
+  let apiCalls = 0;
+  requestKlines = async () => {
+    apiCalls += 1;
+    throw new Error('verified current L1 coverage must settle without HTTP');
+  };
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  ingestStoreKline({ symbol, interval: '1m', openTime: storeTime, close: '119' });
+
+  const historyCalls: HistoryCall[] = [];
+  const historyEvents: any[] = [];
+  const latest: Array<string | null> = [];
+  const realtimeBars: any[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    onLatestBar: (close: string | null) => latest.push(close),
+    onHistoryBars: (event: unknown) => historyEvents.push(event),
+  });
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => realtimeBars.push(bar),
+    'l1-history-settlement',
+  );
+
+  await datafeed.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+
+  assert.equal(apiCalls, 0);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 100);
+  assert.equal(historyCalls[0].bars[0].time, baselineTime - (99 * 60_000));
+  assert.equal(historyCalls[0].bars.at(-1)?.time, baselineTime);
+  assert.equal(historyCalls[0].meta.noData, false);
+  assert.equal(historyEvents.length, 1);
+  assert.deepEqual(historyEvents[0], {
+    symbol,
+    interval: '1m',
+    resolution: '1',
+    firstDataRequest: true,
+    barCount: 100,
+    firstBarTime: baselineTime - (99 * 60_000),
+    lastBarTime: baselineTime,
+    requestSeq: 1,
+  });
+  assert.deepEqual(latest, ['118', '119']);
+  assert.equal(realtimeBars.length, 1);
+  assert.equal(realtimeBars[0].time, storeTime);
+  assert.equal(realtimeBars[0].close, 119);
+  datafeed.destroy();
+});
+
+
 test('destroyed cache-hit caller has no side effects and does not affect another instance', async () => {
   const symbol = 'L1_DESTROY_HIT_PERP';
   currentCacheModule.contractKlineCurrentCache.set(
@@ -2627,6 +2693,17 @@ test('second-page transient empty returns first-page bars without a third reques
   assert.equal(historyCalls.length, 1);
   assert.equal(historyCalls[0].bars.length, 100);
   assert.equal(historyCalls[0].meta.noData, false);
+
+  await datafeed.getBars(
+    symbolInfo('SECOND_EMPTY_PERP'),
+    '1',
+    { ...period, countBack: 100 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    assert.fail,
+  );
+  assert.equal(pending.length, 2, 'verified first-page coverage is reused after an empty continuation');
+  assert.equal(historyCalls.length, 2);
+  assert.equal(historyCalls[1].bars.length, 100);
   datafeed.destroy();
 });
 
