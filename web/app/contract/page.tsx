@@ -94,6 +94,14 @@ function getContractPairCategories(pair: GlobalMarketSelectorPair) {
   ].map(normalizeContractCategoryValue);
 }
 
+function getContractPairCapabilityCategories(pair: GlobalMarketSelectorPair) {
+  return [
+    pair.assetType,
+    pair.marketCategory,
+    pair.marketSubCategory,
+  ].map(normalizeContractCategoryValue);
+}
+
 function contractPairMatchesUrlCategory(pair: GlobalMarketSelectorPair, category: ContractUrlCategory) {
   if (!category) return false;
 
@@ -263,7 +271,7 @@ function getTickerChangeAmount(ticker: ContractTickerItem | null) {
 
 function isTradfiContractPair(pair: GlobalMarketSelectorPair | null | undefined) {
   if (!pair) return false;
-  const categories = getContractPairCategories(pair);
+  const categories = getContractPairCapabilityCategories(pair);
   return categories.includes('STOCK') || categories.some((item) => CFD_CONTRACT_CATEGORIES.has(item));
 }
 

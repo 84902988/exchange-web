@@ -69,9 +69,22 @@ export type TradingViewChartApi = {
   getTimeScale?: () => {
     setRightOffset?: (offset: number) => void;
   };
+  getPanes?: () => readonly TradingViewPaneApi[];
   createShape?: ContractTradingViewOverlayChart['createShape'];
   getShapeById?: ContractTradingViewOverlayChart['getShapeById'];
   removeEntity?: ContractTradingViewOverlayChart['removeEntity'];
+};
+
+type TradingViewVisiblePriceRange = { from: number; to: number };
+
+type TradingViewPriceScaleApi = {
+  getVisiblePriceRange?: () => TradingViewVisiblePriceRange | null;
+  setVisiblePriceRange?: (range: TradingViewVisiblePriceRange) => void;
+};
+
+type TradingViewPaneApi = {
+  hasMainSeries?: () => boolean;
+  getMainSourcePriceScale?: () => TradingViewPriceScaleApi | null;
 };
 
 type TradingViewWidgetInstance = {
@@ -383,6 +396,96 @@ export function readContractActiveTradingViewResolution(chart: TradingViewChartA
     return normalizeContractResolutionValue(chart.resolution());
   } catch {
     return '';
+  }
+}
+
+export function getCurrentContractTradingViewChart<TChart>({
+  widget,
+  chartReady,
+  isCurrent,
+}: {
+  widget: { activeChart?: () => TChart } | null | undefined;
+  chartReady: boolean;
+  isCurrent: () => boolean;
+}): TChart | null {
+  if (!widget || !chartReady || !isCurrent()) return null;
+  try {
+    const chart = widget.activeChart?.() ?? null;
+    return chart && isCurrent() ? chart : null;
+  } catch {
+    return null;
+  }
+}
+
+export type ContractReferenceViewportResult = 'UNAVAILABLE' | 'VISIBLE' | 'APPLIED' | 'ALREADY';
+
+export function ensureContractReferencePriceViewport({
+  chart,
+  referencePrice,
+  isCurrent,
+}: {
+  chart: TradingViewChartApi | null;
+  referencePrice: number | null;
+  isCurrent: () => boolean;
+}): Exclude<ContractReferenceViewportResult, 'ALREADY'> {
+  if (
+    !chart
+    || referencePrice === null
+    || !Number.isFinite(referencePrice)
+    || referencePrice <= 0
+    || !isCurrent()
+  ) return 'UNAVAILABLE';
+
+  try {
+    const panes = chart.getPanes?.() || [];
+    const mainPane = panes.find((pane) => pane.hasMainSeries?.()) || panes[0];
+    const priceScale = mainPane?.getMainSourcePriceScale?.() || null;
+    const visibleRange = priceScale?.getVisiblePriceRange?.() || null;
+    if (
+      !priceScale?.setVisiblePriceRange
+      || !visibleRange
+      || !Number.isFinite(visibleRange.from)
+      || !Number.isFinite(visibleRange.to)
+    ) return 'UNAVAILABLE';
+
+    const lower = Math.min(visibleRange.from, visibleRange.to);
+    const upper = Math.max(visibleRange.from, visibleRange.to);
+    if (referencePrice >= lower && referencePrice <= upper) return 'VISIBLE';
+
+    const expandedLower = Math.min(lower, referencePrice);
+    const expandedUpper = Math.max(upper, referencePrice);
+    const expandedSpan = Math.max(expandedUpper - expandedLower, Math.abs(referencePrice) * 0.001);
+    const padding = expandedSpan * 0.04;
+    if (!isCurrent()) return 'UNAVAILABLE';
+    priceScale.setVisiblePriceRange({
+      from: Math.max(0, expandedLower - padding),
+      to: expandedUpper + padding,
+    });
+    return 'APPLIED';
+  } catch {
+    return 'UNAVAILABLE';
+  }
+}
+
+export class ContractReferenceViewportCoordinator {
+  private handledScope = '';
+
+  ensure(params: {
+    scope: string;
+    chart: TradingViewChartApi | null;
+    referencePrice: number | null;
+    isCurrent: () => boolean;
+  }): ContractReferenceViewportResult {
+    if (params.scope && this.handledScope === params.scope) return 'ALREADY';
+    const result = ensureContractReferencePriceViewport(params);
+    if (params.scope && (result === 'VISIBLE' || result === 'APPLIED')) {
+      this.handledScope = params.scope;
+    }
+    return result;
+  }
+
+  reset() {
+    this.handledScope = '';
   }
 }
 
@@ -950,6 +1053,8 @@ export default function ContractTradingViewChart({
   const datafeedRef = useRef<ReturnType<typeof createContractTradingViewDatafeed> | null>(null);
   const priceOverlayControllerRef = useRef<ContractTradingViewPriceOverlayController | null>(null);
   const priceOverlayLifecycleRef = useRef<ContractPriceOverlayLifecycle | null>(null);
+  const referenceViewportCoordinatorRef = useRef(new ContractReferenceViewportCoordinator());
+  const referenceViewportReadyScopeRef = useRef('');
   const overlayIntervalRef = useRef('');
   const preloadManagerRef = useRef<ReturnType<typeof createContractKlinePreloadManager> | null>(null);
   const toolbarButtonRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -1098,6 +1203,31 @@ export default function ContractTradingViewChart({
     getPriceOverlayLifecycle().resume(priceOverlayInput(nextInterval));
   }, [getPriceOverlayLifecycle, priceOverlayInput]);
 
+  const ensureReferencePriceViewport = useCallback((interval?: string) => {
+    const widget = widgetRef.current;
+    const widgetGeneration = activeWidgetGenerationRef.current;
+    const targetInterval = interval || effectiveIntervalRef.current;
+    const scope = [widgetGeneration, normalizedSymbolRef.current, targetInterval].join('|');
+    if (referenceViewportReadyScopeRef.current !== scope) return 'UNAVAILABLE';
+    const isCurrent = () => (
+      widgetRef.current === widget
+      && activeWidgetGenerationRef.current === widgetGeneration
+      && normalizedSymbolRef.current !== ''
+      && effectiveIntervalRef.current === targetInterval
+    );
+    const chart = getCurrentContractTradingViewChart<TradingViewChartApi>({
+      widget,
+      chartReady: chartReadyRef.current,
+      isCurrent,
+    });
+    return referenceViewportCoordinatorRef.current.ensure({
+      scope,
+      chart,
+      referencePrice: overlayPriceRef.current,
+      isCurrent,
+    });
+  }, []);
+
   const getPreloadManager = useCallback(() => {
     if (!preloadManagerRef.current) {
       preloadManagerRef.current = createContractKlinePreloadManager({
@@ -1134,7 +1264,8 @@ export default function ContractTradingViewChart({
 
   useEffect(() => {
     updatePriceOverlay();
-  }, [overlayPrice, priceDirection, updatePriceOverlay]);
+    ensureReferencePriceViewport(effectiveInterval);
+  }, [effectiveInterval, ensureReferencePriceViewport, normalizedSymbol, overlayPrice, priceDirection, updatePriceOverlay]);
 
   const startChartLoading = useCallback((reason: string) => {
     setLoadError(null);
@@ -1168,8 +1299,16 @@ export default function ContractTradingViewChart({
       activeIntervalRef.current,
     );
     requestedResolutionRef.current = committed.tradingViewResolution;
+    const widget = widgetRef.current;
     activeTradingViewResolutionRef.current = readContractActiveTradingViewResolution(
-      widgetRef.current?.activeChart?.() || null,
+      getCurrentContractTradingViewChart<TradingViewChartApi>({
+        widget,
+        chartReady: chartReadyRef.current,
+        isCurrent: () => (
+          widgetRef.current === widget
+          && activeWidgetGenerationRef.current === committed.widgetGeneration
+        ),
+      }),
     ) || committed.tradingViewResolution;
     updateToolbarButtons(toolbarButtonRefs.current, chartModeRef.current, committedInterval);
     getPreloadManager().setForegroundState({
@@ -1261,7 +1400,16 @@ export default function ContractTradingViewChart({
       return executed;
     }
     try {
-      const chart = widgetRef.current?.activeChart?.() || null;
+      const widget = widgetRef.current;
+      const widgetGeneration = activeWidgetGenerationRef.current;
+      const chart = getCurrentContractTradingViewChart<TradingViewChartApi>({
+        widget,
+        chartReady: chartReadyRef.current,
+        isCurrent: () => (
+          widgetRef.current === widget
+          && activeWidgetGenerationRef.current === widgetGeneration
+        ),
+      });
       if (typeof chart?.resetData !== 'function') return false;
       chart.resetData();
       runtimeCoordinator.recordResetExecution(
@@ -1318,7 +1466,16 @@ export default function ContractTradingViewChart({
     if (activeWidgetGenerationRef.current !== widgetGeneration) return;
     const widget = widgetRef.current;
     const runtimeCommitted = lifecycleRuntimeCoordinatorRef.current?.snapshot().committed;
-    const observedResolution = readContractActiveTradingViewResolution(widget?.activeChart?.() || null);
+    const observedResolution = readContractActiveTradingViewResolution(
+      getCurrentContractTradingViewChart<TradingViewChartApi>({
+        widget,
+        chartReady: chartReadyRef.current,
+        isCurrent: () => (
+          widgetRef.current === widget
+          && activeWidgetGenerationRef.current === widgetGeneration
+        ),
+      }),
+    );
     const stableResolution = runtimeCommitted?.tradingViewResolution
       || observedResolution
       || widgetIntervalRef.current;
@@ -1355,7 +1512,14 @@ export default function ContractTradingViewChart({
       if (resolutionRequestRef.current === rollbackRequest) resolutionRequestRef.current = null;
     };
     const createdRollbackRequest = requestContractSetResolution({
-      chart: widget.activeChart?.() || null,
+      chart: getCurrentContractTradingViewChart<TradingViewChartApi>({
+        widget,
+        chartReady: chartReadyRef.current,
+        isCurrent: () => (
+          widgetRef.current === widget
+          && activeWidgetGenerationRef.current === widgetGeneration
+        ),
+      }),
       resolution: stableResolution,
       isCurrent: () => (
         resolutionRequestSeqRef.current === rollbackRequestSeq
@@ -1424,8 +1588,16 @@ export default function ContractTradingViewChart({
         clearWait();
         return false;
       }
+      const widget = widgetRef.current;
       const observedResolution = readContractActiveTradingViewResolution(
-        widgetRef.current.activeChart?.() || null,
+        getCurrentContractTradingViewChart<TradingViewChartApi>({
+          widget,
+          chartReady: chartReadyRef.current,
+          isCurrent: () => (
+            widgetRef.current === widget
+            && activeWidgetGenerationRef.current === widgetGeneration
+          ),
+        }),
       );
       if (observedResolution !== candidate.tradingViewResolution) {
         retryController?.requestRetry();
@@ -1532,7 +1704,14 @@ export default function ContractTradingViewChart({
     if (!candidate || candidate.sessionId !== identity.sessionId) return;
 
     const transportCoordinator = resolutionIntentCoordinatorRef.current;
-    const chart = widget.activeChart?.() || null;
+    const chart = getCurrentContractTradingViewChart<TradingViewChartApi>({
+      widget,
+      chartReady: chartReadyRef.current,
+      isCurrent: () => (
+        widgetRef.current === widget
+        && activeWidgetGenerationRef.current === widgetGeneration
+      ),
+    });
     const observedResolution = readContractActiveTradingViewResolution(chart);
     const isLatest = () => (
       lifecycleRuntimeCoordinatorRef.current?.snapshot().candidate?.sessionId === identity.sessionId
@@ -1681,6 +1860,8 @@ export default function ContractTradingViewChart({
       priceOverlayLifecycleRef.current = null;
       priceOverlayControllerRef.current = null;
       overlayIntervalRef.current = '';
+      referenceViewportCoordinatorRef.current.reset();
+      referenceViewportReadyScopeRef.current = '';
       preloadManagerRef.current?.cancel('contract chart widget cleanup');
       pendingInitialVisibleRangeRef.current = null;
       initialVisibleRangeAppliedKeyRef.current = '';
@@ -1787,7 +1968,14 @@ export default function ContractTradingViewChart({
       }
 
       const activeWidget = widgetRef.current;
-      const chart = activeWidget?.activeChart?.() || null;
+      const chart = getCurrentContractTradingViewChart<TradingViewChartApi>({
+        widget: activeWidget,
+        chartReady: chartReadyRef.current,
+        isCurrent: () => (
+          widgetRef.current === activeWidget
+          && activeWidgetGenerationRef.current === widgetGeneration
+        ),
+      });
       if (!activeWidget || !chartReadyRef.current || typeof chart?.setVisibleRange !== 'function') {
         pendingInitialVisibleRangeRef.current = event;
         return;
@@ -1819,6 +2007,14 @@ export default function ContractTradingViewChart({
         }
         if (!isCurrentViewportIntent()) return;
         initialVisibleRangeAppliedKeyRef.current = result.applied ? applyKey : '';
+        referenceViewportReadyScopeRef.current = [
+          widgetGeneration,
+          event.symbol,
+          event.interval,
+        ].join('|');
+        window.setTimeout(() => {
+          if (isCurrentViewportIntent()) ensureReferencePriceViewport(event.interval);
+        }, 0);
         resumePreloadForeground(event);
       }).catch(() => {
         if (isCurrentViewportIntent()) resumePreloadForeground(event);
@@ -1966,7 +2162,16 @@ export default function ContractTradingViewChart({
         ...CONTRACT_TV_PRICE_LABEL_OVERRIDES,
         ...CONTRACT_TIME_SERIES_OVERRIDES,
       });
-      const chart = widget.activeChart();
+      const chart = getCurrentContractTradingViewChart<TradingViewChartApi>({
+        widget,
+        chartReady: true,
+        isCurrent: () => (
+          !cancelled
+          && widgetRef.current === widget
+          && activeWidgetGenerationRef.current === widgetGeneration
+        ),
+      });
+      if (!chart) return;
       if (
         chart.createShape
         && chart.getShapeById
@@ -2084,6 +2289,7 @@ export default function ContractTradingViewChart({
     chartMode,
     containerId,
     finishChartLoading,
+    ensureReferencePriceViewport,
     getPreloadManager,
     handleRealtimeResetRequirement,
     locale,

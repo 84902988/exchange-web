@@ -1008,6 +1008,66 @@ test('native TradingView last value and main price line are disabled', () => {
   });
 });
 
+test('contract chart lookup contains destroyed widget access and rejects stale instances', () => {
+  const chart = { resolution: () => '5' };
+  assert.equal(chartModule.getCurrentContractTradingViewChart({
+    widget: { activeChart: () => { throw new Error('destroyed widget'); } },
+    chartReady: true,
+    isCurrent: () => true,
+  }), null);
+  assert.equal(chartModule.getCurrentContractTradingViewChart({
+    widget: { activeChart: () => chart },
+    chartReady: true,
+    isCurrent: () => false,
+  }), null);
+  assert.equal(chartModule.getCurrentContractTradingViewChart({
+    widget: { activeChart: () => chart },
+    chartReady: true,
+    isCurrent: () => true,
+  }), chart);
+});
+
+test('reference viewport expands once per symbol interval scope without following realtime ticks', () => {
+  const appliedRanges: Array<{ from: number; to: number }> = [];
+  const priceScale = {
+    getVisiblePriceRange: () => ({ from: 334, to: 335 }),
+    setVisiblePriceRange: (range: { from: number; to: number }) => appliedRanges.push(range),
+  };
+  const chart = {
+    getPanes: () => [{
+      hasMainSeries: () => true,
+      getMainSourcePriceScale: () => priceScale,
+    }],
+  };
+  const coordinator = new chartModule.ContractReferenceViewportCoordinator();
+
+  assert.equal(coordinator.ensure({
+    scope: '1|AAPLUSDT_PERP|1m',
+    chart,
+    referencePrice: 315,
+    isCurrent: () => true,
+  }), 'APPLIED');
+  assert.equal(appliedRanges.length, 1);
+  assert.ok(appliedRanges[0].from < 315);
+  assert.ok(appliedRanges[0].to > 335);
+
+  assert.equal(coordinator.ensure({
+    scope: '1|AAPLUSDT_PERP|1m',
+    chart,
+    referencePrice: 314,
+    isCurrent: () => true,
+  }), 'ALREADY');
+  assert.equal(appliedRanges.length, 1, 'realtime ticks must not keep rescaling the viewport');
+
+  assert.equal(coordinator.ensure({
+    scope: '1|AAPLUSDT_PERP|1d',
+    chart,
+    referencePrice: 315,
+    isCurrent: () => true,
+  }), 'APPLIED');
+  assert.equal(appliedRanges.length, 2, 'resolution switch gets one new viewport fit');
+});
+
 function makeReferencePrice(
   value: number | null,
   overrides: Record<string, unknown> = {},
