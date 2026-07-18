@@ -11,6 +11,7 @@ import ContractPositionTabs, {
 } from '@/components/contract/ContractPositionTabs';
 import ContractTradingForm from '@/components/contract/ContractTradingForm';
 import ContractTradingViewChart from '@/components/contract/ContractTradingViewChart';
+import { resolveContractSymbolUrlSyncOwnership } from '@/components/contract/contractSymbolNavigation';
 import {
   normalizeContractKlineAssetClass,
   type ContractKlineAssetClass,
@@ -357,6 +358,7 @@ function ContractPageContent() {
   const [error, setError] = useState<string | null>(null);
   const [contractTicker, setContractTicker] = useState<ContractTickerItem | null>(null);
   const tickerRequestSeqRef = useRef(0);
+  const pendingNavigationSymbolRef = useRef<string | null>(null);
   const urlContractSymbol = useMemo(
     () => normalizeContractSymbol(searchParams.get('symbol')),
     [searchParams],
@@ -514,6 +516,7 @@ function ContractPageContent() {
 
   const selectContractSymbol = useCallback((nextSymbol: string, historyMode: 'push' | 'replace' = 'push') => {
     const normalizedSymbol = normalizeContractSymbol(nextSymbol) || DEFAULT_CONTRACT_SYMBOL;
+    pendingNavigationSymbolRef.current = normalizedSymbol;
     setSelectedPriceState(null);
     setNotice(null);
     setError(null);
@@ -619,6 +622,12 @@ function ContractPageContent() {
     const timer = window.setTimeout(() => {
       const availableSymbols = new Set(contractPairs.map((item) => item.symbol));
       const requestedSymbol = urlContractSymbol;
+      const urlSyncOwnership = resolveContractSymbolUrlSyncOwnership({
+        pendingNavigationSymbol: pendingNavigationSymbolRef.current,
+        urlContractSymbol: requestedSymbol,
+      });
+      pendingNavigationSymbolRef.current = urlSyncOwnership.pendingNavigationSymbol;
+      if (!urlSyncOwnership.shouldApplyUrlSymbol) return;
 
       if (requestedSymbol && availableSymbols.has(requestedSymbol)) {
         if (contractSymbol !== requestedSymbol) {
