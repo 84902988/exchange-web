@@ -7,6 +7,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import requests
+
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "backend"
@@ -1196,6 +1198,53 @@ def test_xau_history_normalizes_symbol_and_uses_monthly_k_type():
             ("forex", "GB", "XAUUSD", 10, 300),
             {"end_time_ms": end_time_ms, "timeout": 4},
         )
+    ]
+
+
+def test_xau_monthly_transport_failure_retries_once_and_settles_history():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol_with_provider_session_policy(
+        category="GOLD",
+        symbol="XAUUSDT_PERP",
+        provider_symbol="XAUUSD",
+    )
+    provider_open_time = 1_782_878_400_000
+    expected_utc_open_time = 1_782_864_000_000
+    calls = []
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.get_klines_cache_first = _cache_first_fetches_provider
+
+    def get_market_kline(*args, **kwargs):
+        calls.append((args, dict(kwargs)))
+        if len(calls) == 1:
+            try:
+                raise requests.ReadTimeout("transient iTick XAU monthly timeout")
+            except requests.ReadTimeout as exc:
+                raise service.ItickMarketServiceError(
+                    "iTick stock market request failed"
+                ) from exc
+        return _provider_rows(provider_open_time)
+
+    service.itick_market_service = SimpleNamespace(get_market_kline=get_market_kline)
+
+    rows = service.get_contract_klines(
+        object(),
+        "XAUUSDT_PERP",
+        interval="1M",
+        limit=60,
+    )
+
+    assert [row["open_time"] for row in rows] == [expected_utc_open_time]
+    assert [row["volume"] for row in rows] == ["5"]
+    assert calls == [
+        (
+            ("forex", "GB", "XAUUSD", 10, 60),
+            {"end_time_ms": None, "timeout": 4},
+        ),
+        (
+            ("forex", "GB", "XAUUSD", 10, 60),
+            {"end_time_ms": None, "timeout": 4},
+        ),
     ]
 
 

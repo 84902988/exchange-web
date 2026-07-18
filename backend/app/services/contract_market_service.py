@@ -4714,15 +4714,30 @@ def get_contract_klines(
 
         def _fetch_itick_contract_klines(fetch_limit: int, _fetch_end_time_ms: Optional[int]):
             nonlocal boundary_rejected
-            payload = itick_market_service.get_market_kline(
-                provider_evidence.market,
-                provider_evidence.region,
-                provider_evidence.provider_symbol,
-                provider_evidence.k_type,
-                fetch_limit,
-                end_time_ms=_fetch_end_time_ms,
-                timeout=4,
-            )
+            payload = None
+            for attempt in range(2):
+                try:
+                    payload = itick_market_service.get_market_kline(
+                        provider_evidence.market,
+                        provider_evidence.region,
+                        provider_evidence.provider_symbol,
+                        provider_evidence.k_type,
+                        fetch_limit,
+                        end_time_ms=_fetch_end_time_ms,
+                        timeout=4,
+                    )
+                    break
+                except ItickMarketServiceError as exc:
+                    transport_error = isinstance(exc.__cause__, requests.RequestException)
+                    if attempt > 0 or not transport_error:
+                        raise
+                    logger.info(
+                        "contract_itick_kline_transport_retry symbol=%s provider_symbol=%s interval=%s end_time_ms=%s",
+                        contract_symbol.symbol,
+                        provider_evidence.provider_symbol,
+                        normalized_interval,
+                        _fetch_end_time_ms,
+                    )
             rows = _extract_itick_kline_rows(payload)
             rows = _normalize_itick_dwm_rows(rows, normalized_interval, dwm_session_policy)
             if rows is None:
