@@ -1,4 +1,10 @@
+import pytest
+
+from app.db.models.contract_symbol import ContractSymbol
 from app.services.contract_itick_market_resolver import (
+    ITICK_DWM_AMERICA_NEW_YORK_SESSION,
+    normalize_contract_itick_dwm_open_time,
+    resolve_contract_itick_dwm_session_policy,
     resolve_contract_itick_kline_provider_evidence,
 )
 
@@ -50,3 +56,45 @@ def test_xau_history_provider_evidence_normalizes_contract_quote_asset():
     assert evidence.k_type == 10
     assert evidence.endpoint == "/forex/kline"
     assert evidence.cursor_parameter == "et"
+
+
+@pytest.mark.parametrize(
+    ("category", "symbol", "provider_symbol", "interval", "provider_open_time", "utc_open_time"),
+    [
+        ("STOCK", "AAPLUSDT_PERP", "AAPL", "1d", 1_784_174_400_000, 1_784_160_000_000),
+        ("STOCK", "AAPLUSDT_PERP", "AAPL", "1w", 1_783_915_200_000, 1_783_900_800_000),
+        ("STOCK", "AAPLUSDT_PERP", "AAPL", "1M", 1_782_878_400_000, 1_782_864_000_000),
+        ("GOLD", "XAUUSDT_PERP", "XAUUSD", "1d", 1_784_174_400_000, 1_784_160_000_000),
+        ("GOLD", "XAUUSDT_PERP", "XAUUSD", "1w", 1_783_915_200_000, 1_783_900_800_000),
+        ("GOLD", "XAUUSDT_PERP", "XAUUSD", "1M", 1_782_878_400_000, 1_782_864_000_000),
+        ("FOREX", "EURUSD_PERP", "EURUSD", "1d", 1_784_174_400_000, 1_784_160_000_000),
+        ("FOREX", "EURUSD_PERP", "EURUSD", "1w", 1_783_915_200_000, 1_783_900_800_000),
+        ("FOREX", "EURUSD_PERP", "EURUSD", "1M", 1_782_878_400_000, 1_782_864_000_000),
+    ],
+)
+def test_production_orm_symbol_resolves_dwm_session_policy(
+    category,
+    symbol,
+    provider_symbol,
+    interval,
+    provider_open_time,
+    utc_open_time,
+):
+    contract_symbol = ContractSymbol(
+        symbol=symbol,
+        display_name=symbol,
+        category=category,
+        provider="ITICK",
+        provider_symbol=provider_symbol,
+    )
+
+    policy = resolve_contract_itick_dwm_session_policy(contract_symbol)
+
+    assert policy is not None
+    assert policy.code == ITICK_DWM_AMERICA_NEW_YORK_SESSION
+    assert policy.timezone_name == "America/New_York"
+    assert normalize_contract_itick_dwm_open_time(
+        provider_open_time,
+        interval,
+        policy,
+    ) == utc_open_time

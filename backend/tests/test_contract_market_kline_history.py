@@ -160,6 +160,20 @@ def _itick_contract_symbol(
     )
 
 
+def _itick_contract_symbol_with_provider_session_policy(
+    *,
+    category: str,
+    symbol: str,
+    provider_symbol: str,
+):
+    return SimpleNamespace(
+        symbol=symbol,
+        provider="ITICK",
+        provider_symbol=provider_symbol,
+        category=category,
+    )
+
+
 def _provider_rows(*open_times: int):
     return {
         "code": "0",
@@ -1003,6 +1017,78 @@ def test_itick_known_utc_policy_rejects_non_utc_boundary_without_cache_write():
     assert rows.cache_status == "UNSUPPORTED_INTERVAL"
     assert rows.provider_error_code == "ITICK_DWM_UTC_BOUNDARY_UNAVAILABLE"
     assert rows.retryable is False
+
+
+def test_itick_provider_session_policy_normalizes_aapl_xau_and_eurusd_dwm_to_utc():
+    service = _load_contract_market_service_module()
+    cases = [
+        ("STOCK", "AAPLUSDT_PERP", "AAPL", "1d", 1_784_174_400_000, 1_784_160_000_000),
+        ("STOCK", "AAPLUSDT_PERP", "AAPL", "1w", 1_783_915_200_000, 1_783_900_800_000),
+        ("STOCK", "AAPLUSDT_PERP", "AAPL", "1M", 1_782_878_400_000, 1_782_864_000_000),
+        ("GOLD", "XAUUSDT_PERP", "XAUUSD", "1d", 1_784_174_400_000, 1_784_160_000_000),
+        ("GOLD", "XAUUSDT_PERP", "XAUUSD", "1w", 1_783_915_200_000, 1_783_900_800_000),
+        ("GOLD", "XAUUSDT_PERP", "XAUUSD", "1M", 1_782_878_400_000, 1_782_864_000_000),
+        ("FOREX", "EURUSD_PERP", "EURUSD", "1d", 1_784_174_400_000, 1_784_160_000_000),
+        ("FOREX", "EURUSD_PERP", "EURUSD", "1w", 1_783_915_200_000, 1_783_900_800_000),
+        ("FOREX", "EURUSD_PERP", "EURUSD", "1M", 1_782_878_400_000, 1_782_864_000_000),
+    ]
+    expected_cache_intervals = {"1d": "1Dutc", "1w": "1Wutc", "1M": "1Mutc"}
+
+    for category, symbol, provider_symbol, interval, provider_open_time, utc_open_time in cases:
+        contract_symbol = _itick_contract_symbol_with_provider_session_policy(
+            category=category,
+            symbol=symbol,
+            provider_symbol=provider_symbol,
+        )
+        captured = {}
+        service._load_contract_symbol = lambda *_args, _contract=contract_symbol, **_kwargs: _contract
+        service._tradfi_kline_cache.clear()
+
+        def cache_first(db, **kwargs):
+            captured.update(kwargs)
+            return _cache_first_fetches_provider(db, **kwargs)
+
+        service.get_klines_cache_first = cache_first
+        service.itick_market_service = SimpleNamespace(
+            get_stock_kline=lambda **_kwargs: _provider_rows(provider_open_time),
+            get_market_kline=lambda *_args, **_kwargs: _provider_rows(provider_open_time),
+        )
+
+        rows = service.get_contract_klines(
+            object(),
+            symbol,
+            interval=interval,
+            limit=50,
+        )
+
+        assert [row["open_time"] for row in rows] == [utc_open_time]
+        assert captured["interval"] == expected_cache_intervals[interval]
+        assert captured["open_time_validator"](utc_open_time) is True
+
+
+def test_itick_provider_session_policy_rejects_non_session_boundary():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol_with_provider_session_policy(
+        category="STOCK",
+        symbol="AAPLUSDT_PERP",
+        provider_symbol="AAPL",
+    )
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.get_klines_cache_first = _cache_first_fetches_provider
+    service.itick_market_service = SimpleNamespace(
+        get_stock_kline=lambda **_kwargs: _provider_rows(1_784_170_800_000)
+    )
+
+    rows = service.get_contract_klines(
+        object(),
+        "AAPLUSDT_PERP",
+        interval="1d",
+        limit=50,
+    )
+
+    assert rows == []
+    assert rows.cache_status == "UNSUPPORTED_INTERVAL"
+    assert rows.provider_error_code == "ITICK_DWM_UTC_BOUNDARY_UNAVAILABLE"
 
 
 def test_aapl_history_uses_stock_provider_evidence():

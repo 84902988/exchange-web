@@ -24,8 +24,11 @@ from app.services.itick_holiday_service import (
 from app.services.itick_market_service import ItickMarketServiceError, itick_market_service
 from app.services.contract_itick_market_resolver import (
     ITICK_KLINE_TYPE_BY_INTERVAL,
+    ContractItickDwmSessionPolicy,
     ContractItickKlineProviderEvidence,
+    normalize_contract_itick_dwm_open_time,
     resolve_contract_itick_kline_provider_evidence,
+    resolve_contract_itick_dwm_session_policy,
     resolve_contract_itick_provider_symbol,
 )
 from app.services.market_kline_cache import (
@@ -137,7 +140,6 @@ _contract_dwm_utc_cache_intervals = {
     "1w": "1Wutc",
     "1M": "1Mutc",
 }
-_itick_dwm_utc_passthrough_policy = "UTC_PASSTHROUGH"
 _itick_dwm_boundary_unavailable_code = "ITICK_DWM_UTC_BOUNDARY_UNAVAILABLE"
 _tradfi_reference_prices = {
     "DJI": Decimal("39000"),
@@ -4283,17 +4285,37 @@ def _contract_dwm_rows_have_utc_boundary(rows: list[dict[str, Any]], interval: s
     )
 
 
-def _normalize_itick_dwm_boundary_policy(value: Any) -> Optional[str]:
-    normalized = str(value or "").strip().upper()
-    if normalized == _itick_dwm_utc_passthrough_policy:
-        return normalized
-    return None
+def _contract_itick_dwm_session_policy(
+    contract_symbol: Any,
+) -> Optional[ContractItickDwmSessionPolicy]:
+    return resolve_contract_itick_dwm_session_policy(contract_symbol)
 
 
-def _contract_itick_dwm_boundary_policy(contract_symbol: Any) -> Optional[str]:
-    return _normalize_itick_dwm_boundary_policy(
-        getattr(contract_symbol, "_itick_dwm_boundary_policy", None)
-    )
+def _normalize_itick_dwm_rows(
+    rows: list[dict[str, Any]],
+    interval: str,
+    policy: Optional[ContractItickDwmSessionPolicy],
+) -> Optional[list[dict[str, Any]]]:
+    normalized_interval = _normalize_contract_interval(interval)
+    if normalized_interval not in _contract_dwm_intervals:
+        return rows
+    if policy is None:
+        return None
+
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        normalized_open_time = normalize_contract_itick_dwm_open_time(
+            row.get("open_time"),
+            normalized_interval,
+            policy,
+        )
+        if normalized_open_time is None:
+            return None
+        normalized_row = dict(row)
+        normalized_row["open_time"] = normalized_open_time
+        normalized_rows.append(normalized_row)
+    normalized_rows.sort(key=lambda item: int(item["open_time"]))
+    return normalized_rows
 
 
 def _itick_dwm_boundary_unavailable_result() -> ContractKlineResult:
@@ -4466,13 +4488,12 @@ def _get_stock_contract_klines_from_itick(
     interval: str,
     limit: int,
     end_time_ms: Optional[int] = None,
-    dwm_boundary_policy: Optional[str] = None,
+    dwm_session_policy: Optional[ContractItickDwmSessionPolicy] = None,
 ) -> list[dict[str, Any]]:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_interval = _normalize_contract_interval(interval)
     safe_limit = _normalize_kline_limit(limit)
-    normalized_dwm_policy = _normalize_itick_dwm_boundary_policy(dwm_boundary_policy)
-    if normalized_interval in _contract_dwm_intervals and normalized_dwm_policy is None:
+    if normalized_interval in _contract_dwm_intervals and dwm_session_policy is None:
         logger.warning(
             "stock_contract_kline_dwm_boundary_policy_unavailable symbol=%s interval=%s",
             normalized_symbol,
@@ -4513,6 +4534,10 @@ def _get_stock_contract_klines_from_itick(
             end_time_ms=_fetch_end_time_ms,
         )
         rows = _extract_itick_kline_rows(payload)
+        rows = _normalize_itick_dwm_rows(rows, normalized_interval, dwm_session_policy)
+        if rows is None:
+            boundary_rejected = True
+            return []
         if (
             normalized_interval in _contract_dwm_intervals
             and rows
@@ -4585,7 +4610,7 @@ def get_contract_klines(
             interval=normalized_interval,
             limit=safe_limit,
             end_time_ms=end_time_ms,
-            dwm_boundary_policy=None,
+            dwm_session_policy=None,
         )
 
     provider = str(contract_symbol.provider or "").strip().upper()
@@ -4636,8 +4661,8 @@ def get_contract_klines(
 
     category = _contract_asset_category(contract_symbol)
     if provider == "ITICK":
-        dwm_boundary_policy = _contract_itick_dwm_boundary_policy(contract_symbol)
-        if normalized_interval in _contract_dwm_intervals and dwm_boundary_policy is None:
+        dwm_session_policy = _contract_itick_dwm_session_policy(contract_symbol)
+        if normalized_interval in _contract_dwm_intervals and dwm_session_policy is None:
             logger.warning(
                 "contract_itick_kline_dwm_boundary_policy_unavailable symbol=%s interval=%s",
                 contract_symbol.symbol,
@@ -4657,7 +4682,7 @@ def get_contract_klines(
                 interval=normalized_interval,
                 limit=safe_limit,
                 end_time_ms=end_time_ms,
-                dwm_boundary_policy=dwm_boundary_policy,
+                dwm_session_policy=dwm_session_policy,
             )
             return rows
 
@@ -4699,6 +4724,10 @@ def get_contract_klines(
                 timeout=4,
             )
             rows = _extract_itick_kline_rows(payload)
+            rows = _normalize_itick_dwm_rows(rows, normalized_interval, dwm_session_policy)
+            if rows is None:
+                boundary_rejected = True
+                return []
             if (
                 normalized_interval in _contract_dwm_intervals
                 and rows
