@@ -34,6 +34,7 @@ import {
 import { getBackendKlineIntervalForSpotInterval } from './tradingview/spotKlineClientCache';
 import {
   createSpotKlinePreloadManager,
+  preloadSpotTradingViewKlineCache,
   type SpotKlinePreloadManager,
 } from './tradingview/spotKlinePreloadManager';
 import {
@@ -926,8 +927,6 @@ export default function SpotTradingViewChart({
   ) => {
     if (activeWidgetGenerationRef.current !== widgetGeneration) return;
     applyInitialVisibleRangeFromHistory(event, 'history-callback', widgetGeneration);
-    if (event.isHistoryRequest || event.phase !== 'current') return;
-
     const activeSymbol = normalizedSymbolRef.current;
     const activeIntervalValue = activeIntervalRef.current || '1m';
     const activeResolution = widgetIntervalRef.current || spotIntervalToTradingViewResolution(activeIntervalValue);
@@ -941,11 +940,22 @@ export default function SpotTradingViewChart({
     }
 
     const lifecycleSnapshot = lifecycleRuntimeCoordinatorRef.current?.snapshot();
-    if (
+    const lifecycleCommitted = Boolean(
       lifecycleSnapshot?.committed?.tradingViewResolution === event.resolution
       && !lifecycleSnapshot.candidate
       && !resolutionIntentCoordinatorRef.current.snapshot().activeToken
-    ) {
+    );
+    if (event.isHistoryRequest || event.phase !== 'current') {
+      if (event.barCount > 0 && lifecycleCommitted) {
+        scheduleKlinePreload({
+          ...event,
+          phase: 'current',
+          isHistoryRequest: false,
+        }, 'history-after-resolution-commit');
+      }
+      return;
+    }
+    if (lifecycleCommitted) {
       finishChartLoading(event.barCount > 0 ? 'current-history-bars' : 'current-history-empty');
     }
     if (event.lastBarClose !== null && event.lastBarTime !== null) {
@@ -969,7 +979,12 @@ export default function SpotTradingViewChart({
         freshness: 'CACHED',
       });
     }
-  }, [applyInitialVisibleRangeFromHistory, finishChartLoading, updateCandlePriceOverlay]);
+  }, [
+    applyInitialVisibleRangeFromHistory,
+    finishChartLoading,
+    scheduleKlinePreload,
+    updateCandlePriceOverlay,
+  ]);
 
   const handleCandleAuthority = useCallback((event: SpotTradingViewCandleAuthorityEvent) => {
     updateCandlePriceOverlay({
@@ -1044,12 +1059,26 @@ export default function SpotTradingViewChart({
     if (loadingToken?.widgetGeneration === committed.widgetGeneration) {
       finishChartLoading('resolution-committed', loadingToken);
     }
-    getPreloadManager().setForegroundState({
+    const preloadManager = getPreloadManager();
+    preloadManager.setForegroundState({
       loading: false,
       symbol: committed.symbol,
       interval: committed.backendInterval,
       generation: metrics?.requestSequence ?? committed.intentId,
     });
+    const committedHistory = recentVisibleRangeEventsRef.current.get(
+      buildVisibleRangeSnapshotKey(committed.symbol, committed.backendInterval),
+    );
+    if (
+      committedHistory?.barCount
+      && committedHistory.resolution === committed.tradingViewResolution
+    ) {
+      preloadManager.schedule({
+        ...committedHistory,
+        phase: 'current',
+        isHistoryRequest: false,
+      }, 'resolution-committed-history');
+    }
     syncKlineIntervalAfterResolutionCommit('resolution_commit');
     const pendingInitialRange = pendingInitialVisibleRangeRef.current;
     if (pendingInitialRange) {
@@ -1767,10 +1796,31 @@ export default function SpotTradingViewChart({
       symbol: normalizedSymbol,
     });
     lifecycleRuntimeCoordinatorRef.current = runtimeCoordinator;
-    runtimeCoordinator.beginIntent({
+    const initialLifecycleIntent = runtimeCoordinator.beginIntent({
       tradingViewResolution: initialResolution,
       backendInterval: getBackendKlineIntervalForSpotInterval(initialInterval),
     });
+    if (initialLifecycleIntent.decision.accepted) {
+      const initialBackendInterval = initialLifecycleIntent.identity.backendInterval;
+      getPreloadManager().setForegroundState({
+        loading: true,
+        symbol: normalizedSymbol,
+        interval: initialBackendInterval,
+        generation: initialLifecycleIntent.identity.intentId,
+      });
+      void preloadSpotTradingViewKlineCache({
+        symbol: normalizedSymbol,
+        intervals: [initialBackendInterval],
+        activeInterval: initialBackendInterval,
+        concurrency: 1,
+        role: 'active',
+        shouldContinue: () => (
+          !cancelled
+          && activeWidgetGenerationRef.current === widgetGeneration
+          && normalizedSymbolRef.current === normalizedSymbol
+        ),
+      });
+    }
     const widgetBuildLoadingTimer = window.setTimeout(() => {
       if (!cancelled && activeWidgetGenerationRef.current === widgetGeneration) {
         startChartLoading('widget-build', widgetGeneration);
@@ -2096,6 +2146,7 @@ export default function SpotTradingViewChart({
     scriptReady,
     startChartLoading,
     finishChartLoading,
+    getPreloadManager,
     retireChartLoadingGeneration,
     restoreToolbarInteractionAfterReady,
     widgetKey,

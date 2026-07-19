@@ -975,9 +975,34 @@ test('Spot chart uses Runtime Coordinator as its only lifecycle commit authority
 
   assert.match(chartSource, /new KlineLifecycleRuntimeCoordinator/)
   assert.match(chartSource, /runtimeCoordinator\.beginIntent/)
+  assert.match(chartSource, /const initialLifecycleIntent = runtimeCoordinator\.beginIntent/)
+  assert.match(
+    chartSource,
+    /initialLifecycleIntent\.decision\.accepted[\s\S]{0,350}setForegroundState\(\{[\s\S]{0,200}loading: true[\s\S]{0,200}generation: initialLifecycleIntent\.identity\.intentId/,
+  )
+  assert.ok(
+    chartSource.indexOf('generation: initialLifecycleIntent.identity.intentId')
+      < chartSource.indexOf('const widget = new tradingView.widget'),
+  )
+  assert.match(
+    chartSource,
+    /preloadSpotTradingViewKlineCache\(\{[\s\S]{0,400}role: 'active'/,
+  )
+  assert.ok(
+    chartSource.indexOf('void preloadSpotTradingViewKlineCache')
+      < chartSource.indexOf('const widget = new tradingView.widget'),
+  )
   assert.match(chartSource, /activeRuntime\.applyResolution/)
   assert.match(chartSource, /runtimeCoordinator\.recordSubscriber/)
   assert.match(chartSource, /runtimeCoordinator\.tryCommit/)
+  assert.match(
+    chartSource,
+    /const committedHistory = recentVisibleRangeEventsRef\.current\.get[\s\S]{0,450}preloadManager\.schedule\(\{[\s\S]{0,200}phase: 'current'[\s\S]{0,100}isHistoryRequest: false/,
+  )
+  assert.match(
+    chartSource,
+    /event\.isHistoryRequest \|\| event\.phase !== 'current'[\s\S]{0,350}scheduleKlinePreload\(\{[\s\S]{0,180}isHistoryRequest: false[\s\S]{0,100}history-after-resolution-commit/,
+  )
   assert.match(chartSource, /shouldRequestSpotChartSubscriberRearm/)
   assert.match(chartSource, /const postResolutionBarrierCheck =/)
   assert.match(
