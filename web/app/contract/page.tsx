@@ -11,13 +11,13 @@ import ContractPositionTabs, {
 } from '@/components/contract/ContractPositionTabs';
 import ContractTradingForm from '@/components/contract/ContractTradingForm';
 import ContractTradingViewChart from '@/components/contract/ContractTradingViewChart';
+import { formatContractHeaderChange } from '@/components/contract/contractHeaderChange';
 import { resolveContractSymbolUrlSyncOwnership } from '@/components/contract/contractSymbolNavigation';
 import {
   normalizeContractKlineAssetClass,
   type ContractKlineAssetClass,
 } from '@/components/contract/tradingview/contractKlineCachePolicy';
 import { useContractMarketView } from '@/components/contract/hooks/useContractMarketView';
-import { useContractPageVisibility } from '@/components/contract/hooks/useContractMarketViewPolling';
 import { useContractUserState } from '@/components/contract/hooks/useContractUserState';
 import GlobalMarketSelector, {
   type GlobalMarketSelectorPair,
@@ -28,8 +28,7 @@ import { useLocaleContext } from '@/contexts/LocaleContext';
 import { formatPrice } from '@/lib/marketPrecision';
 import {
   getContractSymbols,
-  getContractTickers,
-  type ContractTickerItem,
+  type ContractSymbolListResponse,
   type ContractSymbolItem,
 } from '@/lib/api/modules/contract';
 import type { SpotMarketPairItem } from '@/lib/api/modules/spot';
@@ -51,6 +50,40 @@ const CFD_CONTRACT_CATEGORIES = new Set(['GOLD', 'FUTURES', 'INDEX', 'FOREX', 'M
 const CONTRACT_SYMBOL_OPTIONS = [
   { contractSymbol: DEFAULT_CONTRACT_SYMBOL, marketSymbol: 'BTCUSDT', pricePrecision: 1 },
 ];
+const CONTRACT_SYMBOL_REQUEST_CACHE_MS = 5_000;
+type ContractSymbolRequestEntry = {
+  promise: Promise<ContractSymbolListResponse> | null;
+  response: ContractSymbolListResponse | null;
+  settledAt: number;
+};
+const contractSymbolRequestStore = new Map<string, ContractSymbolRequestEntry>();
+
+function loadContractSymbols(params: Parameters<typeof getContractSymbols>[0]) {
+  const key = JSON.stringify(params);
+  const existing = contractSymbolRequestStore.get(key);
+  const now = Date.now();
+  if (existing?.promise) return existing.promise;
+  if (existing?.response && now - existing.settledAt < CONTRACT_SYMBOL_REQUEST_CACHE_MS) {
+    return Promise.resolve(existing.response);
+  }
+
+  const promise = getContractSymbols(params);
+  contractSymbolRequestStore.set(key, {
+    promise,
+    response: existing?.response || null,
+    settledAt: existing?.settledAt || 0,
+  });
+  void promise.then((response) => {
+    contractSymbolRequestStore.set(key, {
+      promise: null,
+      response,
+      settledAt: Date.now(),
+    });
+  }).catch(() => {
+    contractSymbolRequestStore.delete(key);
+  });
+  return promise;
+}
 
 function getContractSymbol(marketSymbol: string) {
   const normalized = String(marketSymbol || '').trim().toUpperCase();
@@ -234,40 +267,10 @@ function formatCompactAmount(value: unknown, precision = 2) {
   return amount.toFixed(precision);
 }
 
-function formatSignedPercent(value: unknown) {
-  const percent = Number(value);
-  if (!Number.isFinite(percent)) return '--';
-  if (percent === 0) return '0.00%';
-  return `${percent > 0 ? '+' : ''}${percent.toFixed(2)}%`;
-}
-
 function formatFundingPercent(value: unknown) {
   const rate = Number(value);
   if (!Number.isFinite(rate)) return '--';
   return `${rate > 0 ? '+' : ''}${(rate * 100).toFixed(4)}%`;
-}
-
-function formatSignedPriceChange(value: unknown, pricePrecision: number) {
-  const amount = Number(value);
-  if (!Number.isFinite(amount)) return '--';
-  if (amount === 0) return formatPrice(0, pricePrecision);
-  return `${amount > 0 ? '+' : ''}${amount.toFixed(pricePrecision)}`;
-}
-
-function formatHeaderChange(changeAmount: unknown, changePercent: unknown, pricePrecision: number) {
-  const amount = formatSignedPriceChange(changeAmount, pricePrecision);
-  const percent = formatSignedPercent(changePercent);
-  if (amount !== '--' && percent !== '--') return `${amount} / ${percent}`;
-  if (amount !== '--') return amount;
-  return percent;
-}
-
-function getTickerChangePercent(ticker: ContractTickerItem | null) {
-  return ticker?.price_change_percent_24h ?? ticker?.priceChangePercent ?? null;
-}
-
-function getTickerChangeAmount(ticker: ContractTickerItem | null) {
-  return ticker?.price_change_24h ?? ticker?.change_24h ?? null;
 }
 
 function isTradfiContractPair(pair: GlobalMarketSelectorPair | null | undefined) {
@@ -341,7 +344,6 @@ function ContractPageContent() {
     ? initialUrlContractSymbol
     : DEFAULT_CONTRACT_SYMBOL;
   const { isLoggedIn, loading: authLoading, userIdentityKey } = useAuth();
-  const isPageVisible = useContractPageVisibility();
   const [contractSymbol, setContractSymbol] = useState(() => initialContractSymbol);
   const [interval, setIntervalValue] = useState('1m');
   const [chartMode, setChartMode] = useState<ContractChartMode>('candle');
@@ -356,8 +358,6 @@ function ContractPageContent() {
   const [contractPairsLoaded, setContractPairsLoaded] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [contractTicker, setContractTicker] = useState<ContractTickerItem | null>(null);
-  const tickerRequestSeqRef = useRef(0);
   const pendingNavigationSymbolRef = useRef<string | null>(null);
   const initialContractSymbolRef = useRef(initialContractSymbol);
   const urlContractSymbol = useMemo(
@@ -386,12 +386,6 @@ function ContractPageContent() {
   const chartBootstrapReady = currentContractPair !== null
     && currentContractKlineAssetClass !== 'UNKNOWN'
     && chartBootstrapMatchesUrlCategory;
-  const activeContractTicker = useMemo(
-    () => contractTicker && normalizeContractSymbol(contractTicker.symbol) === contractSymbol
-      ? contractTicker
-      : null,
-    [contractSymbol, contractTicker],
-  );
   const selectedPrice = selectedPriceState?.symbol === contractSymbol
     ? selectedPriceState.price
     : null;
@@ -404,7 +398,6 @@ function ContractPageContent() {
     marketSymbol,
     quantityUnit,
     quote: contractQuote,
-    marketRealtimeStatus: contractMarketRealtimeStatus,
     contractAvailabilityError,
     pricePrecision,
     quoteHint,
@@ -452,23 +445,19 @@ function ContractPageContent() {
     contractSymbol,
     symbolOptionMarketSymbol: symbolOption?.marketSymbol,
     symbolOptionPricePrecision: currentContractPair?.pricePrecision ?? symbolOption?.pricePrecision,
-    fallbackMarketStatus: activeContractTicker?.market_status || currentContractPair?.marketStatus,
-    fallbackMarketStatusText: activeContractTicker?.market_status_text || currentContractPair?.marketStatusText,
-    fallbackMarketSessionType: activeContractTicker?.market_session_type || currentContractPair?.marketSessionType,
-    fallbackQuoteFreshness: activeContractTicker?.quote_freshness,
-    fallbackLastPrice: activeContractTicker?.last_price ?? activeContractTicker?.price,
-    fallbackLastPriceSource: activeContractTicker?.source,
-    fallbackLastPriceTime: activeContractTicker?.ts,
+    fallbackMarketStatus: currentContractPair?.marketStatus,
+    fallbackMarketStatusText: currentContractPair?.marketStatusText,
+    fallbackMarketSessionType: currentContractPair?.marketSessionType,
   });
   const currentPriceDisplay = currentPriceReady
     ? formatPrice(currentPriceNumber, pricePrecision)
     : '--';
   const tpSlTriggerPriceType = normalizeTpSlTriggerPriceType(currentContractPair?.tpSlTriggerPriceType);
-  const headerChange = formatHeaderChange(
-    getTickerChangeAmount(activeContractTicker),
-    getTickerChangePercent(activeContractTicker),
+  const headerChange = formatContractHeaderChange({
+    changeAmount: contractQuote?.price_change_24h,
+    changePercent: contractQuote?.price_change_percent_24h,
     pricePrecision,
-  );
+  });
 
   const {
     account,
@@ -541,7 +530,7 @@ function ContractPageContent() {
     const bootstrapSymbol = initialContractSymbolRef.current;
 
     try {
-      const bootstrapResponse = await getContractSymbols({
+      const bootstrapResponse = await loadContractSymbols({
         keyword: bootstrapSymbol,
         page: 1,
         page_size: 1,
@@ -561,7 +550,7 @@ function ContractPageContent() {
     }
 
     try {
-      const contractResponse = await getContractSymbols({ category: 'all', quote: 'all', page: 1, page_size: 100 });
+      const contractResponse = await loadContractSymbols({ category: 'all', quote: 'all', page: 1, page_size: 100 });
       const catalogPairs = contractResponse.items.map((item) => buildContractPairOption(item, t));
       setContractPairs((previous) => {
         const bootstrapPair = previous.find((item) => item.symbol === bootstrapSymbol) || null;
@@ -622,35 +611,6 @@ function ContractPageContent() {
     }, 0);
     return () => window.clearTimeout(timer);
   }, [contractChartIntervalOptions, interval]);
-
-  const refreshContractTicker = useCallback(async () => {
-    const requestSeq = tickerRequestSeqRef.current + 1;
-    tickerRequestSeqRef.current = requestSeq;
-    try {
-      const response = await getContractTickers({ symbols: [contractSymbol], limit: 1 });
-      if (tickerRequestSeqRef.current !== requestSeq) return;
-      const ticker = response.items.find((item) => item.symbol === contractSymbol) || null;
-      setContractTicker(ticker);
-    } catch {
-      if (tickerRequestSeqRef.current === requestSeq) setContractTicker(null);
-    }
-  }, [contractSymbol]);
-
-  useEffect(() => {
-    if (!isPageVisible) return undefined;
-    void refreshContractTicker();
-    return () => {
-      tickerRequestSeqRef.current += 1;
-    };
-  }, [isPageVisible, refreshContractTicker]);
-
-  useEffect(() => {
-    if (!isPageVisible || contractMarketRealtimeStatus === 'connected') return undefined;
-    const timer = window.setInterval(() => {
-      void refreshContractTicker();
-    }, 5000);
-    return () => window.clearInterval(timer);
-  }, [contractMarketRealtimeStatus, isPageVisible, refreshContractTicker]);
 
   useEffect(() => {
     if (!contractPairsLoaded) return;
@@ -751,8 +711,8 @@ function ContractPageContent() {
           bestBid={formatPrice(hookBestBid, pricePrecision)}
           bestAsk={formatPrice(hookBestAsk, pricePrecision)}
           spread={formatPrice(hookSpread, pricePrecision)}
-          highLow24h={`${formatPrice(activeContractTicker?.high_24h, pricePrecision)} / ${formatPrice(activeContractTicker?.low_24h, pricePrecision)}`}
-          volumeTurnover24h={`${formatCompactAmount(activeContractTicker?.base_volume_24h)} / ${formatCompactAmount(activeContractTicker?.quote_volume_24h)}`}
+          highLow24h={`${formatPrice(contractQuote?.high_24h, pricePrecision)} / ${formatPrice(contractQuote?.low_24h, pricePrecision)}`}
+          volumeTurnover24h={`${formatCompactAmount(contractQuote?.base_volume_24h)} / ${formatCompactAmount(contractQuote?.quote_volume_24h)}`}
           symbolSelector={(
             <GlobalMarketSelector
               pageType="contract"

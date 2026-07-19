@@ -31,8 +31,12 @@ import {
 } from '@/lib/contractMarketCache';
 import {
   useContractMarketState,
-  type PriceDirection,
 } from './useContractMarketState';
+import {
+  advanceContractPriceDirection,
+  createContractPriceDirectionState,
+  type ContractPriceDirection,
+} from '../contractPriceDirection';
 import { useContractMarketViewPolling } from './useContractMarketViewPolling';
 import {
   resolveContractRestBootstrap,
@@ -102,6 +106,7 @@ type UseContractMarketViewParams = {
 const FUTURES_DEPTH_LIMIT = 20;
 const FUTURES_TRADES_LIMIT = 30;
 const DEPTH_INITIAL_GRACE_MS = 1800;
+const REST_BOOTSTRAP_GRACE_MS = 750;
 
 type ContractDepthSnapshot = {
   symbol?: string | null;
@@ -442,7 +447,7 @@ export function useContractMarketView({
     updatedAt: null,
   }));
   const [fallbackDepthAllowed, setFallbackDepthAllowed] = useState(false);
-  const [priceDirection, setPriceDirection] = useState<PriceDirection>('flat');
+  const [priceDirection, setPriceDirection] = useState<ContractPriceDirection>('flat');
   const [marketSessionRefreshKey, setMarketSessionRefreshKey] = useState(0);
   const requestSeqRef = useRef(0);
   const inFlightSymbolRef = useRef<string | null>(null);
@@ -461,7 +466,7 @@ export function useContractMarketView({
   });
   const marketViewErrorSymbolRef = useRef<string | null>(null);
   const mountedRef = useRef(false);
-  const currentPriceRef = useRef<number | null>(null);
+  const priceDirectionStateRef = useRef(createContractPriceDirectionState(contractSymbol));
   const previousMarketViewDisplayStateRef = useRef<string | null>(null);
   const previousMarketRealtimeStatusRef = useRef<ContractMarketRealtimeStatus>('idle');
 
@@ -548,7 +553,7 @@ export function useContractMarketView({
     depthInFlightSymbolRef.current = null;
     tradesRequestSeqRef.current += 1;
     tradesInFlightSymbolRef.current = null;
-    currentPriceRef.current = null;
+    priceDirectionStateRef.current = createContractPriceDirectionState(contractSymbol);
     previousMarketViewDisplayStateRef.current = null;
     marketViewErrorSymbolRef.current = null;
     setRestMarketView(null);
@@ -825,6 +830,8 @@ export function useContractMarketView({
   useEffect(() => {
     const requestSymbol = normalizeContractSymbol(contractSymbol);
     const bootstrapKey = `${requestSymbol}|${marketSessionRefreshKey}`;
+    const lostRealtime = depthRestBootstrapRef.current.realtimeStatus === 'connected'
+      && quoteMarketRealtimeStatus !== 'connected';
     const decision = resolveContractRestBootstrap(
       depthRestBootstrapRef.current,
       bootstrapKey,
@@ -832,17 +839,33 @@ export function useContractMarketView({
     );
     depthRestBootstrapRef.current = decision.next;
 
-    // REST runs once per symbol/session bootstrap and immediately after WS loss.
+    // Give the authoritative WS snapshot a short first-load grace period. REST
+    // still runs immediately after a real WS loss.
     // While realtime is connected, every depth frame comes from the WS Store path.
-    if (decision.shouldRefresh) void refreshDepth();
+    let bootstrapTimer: number | null = null;
+    if (decision.shouldRefresh) {
+      if (lostRealtime) void refreshDepth();
+      else {
+        bootstrapTimer = window.setTimeout(() => {
+          void refreshDepth();
+        }, REST_BOOTSTRAP_GRACE_MS);
+      }
+    }
 
-    if (quoteMarketRealtimeStatus === 'connected') return undefined;
+    if (quoteMarketRealtimeStatus === 'connected') {
+      return () => {
+        if (bootstrapTimer !== null) window.clearTimeout(bootstrapTimer);
+      };
+    }
 
     const timer = window.setInterval(() => {
       void refreshDepth();
     }, 1500);
 
-    return () => window.clearInterval(timer);
+    return () => {
+      if (bootstrapTimer !== null) window.clearTimeout(bootstrapTimer);
+      window.clearInterval(timer);
+    };
   }, [
     contractSymbol,
     marketSessionRefreshKey,
@@ -954,6 +977,8 @@ export function useContractMarketView({
     const requestSymbol = normalizeContractSymbol(contractSymbol);
     const sessionMode = effectiveMarketStatus === 'CLOSED' ? 'CLOSED' : 'ACTIVE';
     const bootstrapKey = `${requestSymbol}|${marketSessionRefreshKey}|${sessionMode}`;
+    const lostRealtime = tradesRestBootstrapRef.current.realtimeStatus === 'connected'
+      && quoteMarketRealtimeStatus !== 'connected';
     const decision = resolveContractRestBootstrap(
       tradesRestBootstrapRef.current,
       bootstrapKey,
@@ -961,16 +986,29 @@ export function useContractMarketView({
     );
     tradesRestBootstrapRef.current = decision.next;
 
-    if (decision.shouldRefresh) void refreshTrades();
+    let bootstrapTimer: number | null = null;
+    if (decision.shouldRefresh) {
+      if (lostRealtime) void refreshTrades();
+      else {
+        bootstrapTimer = window.setTimeout(() => {
+          void refreshTrades();
+        }, REST_BOOTSTRAP_GRACE_MS);
+      }
+    }
     if (effectiveMarketStatus === 'CLOSED' || quoteMarketRealtimeStatus === 'connected') {
-      return undefined;
+      return () => {
+        if (bootstrapTimer !== null) window.clearTimeout(bootstrapTimer);
+      };
     }
 
     const timer = window.setInterval(() => {
       void refreshTrades();
     }, 1500);
 
-    return () => window.clearInterval(timer);
+    return () => {
+      if (bootstrapTimer !== null) window.clearTimeout(bootstrapTimer);
+      window.clearInterval(timer);
+    };
   }, [
     contractSymbol,
     effectiveMarketStatus,
@@ -1043,7 +1081,7 @@ export function useContractMarketView({
   const latestTradeTickPrice = String(latestTrade?.price_source || '').trim().toUpperCase() === 'TRADE_TICK'
     ? latestTradeNumber
     : null;
-  const latestTradeDirection: PriceDirection = latestTradeNumber !== null && nextTradeNumber !== null
+  const latestTradeDirection: ContractPriceDirection = latestTradeNumber !== null && nextTradeNumber !== null
     ? latestTradeNumber > nextTradeNumber
       ? 'up'
       : latestTradeNumber < nextTradeNumber
@@ -1075,12 +1113,12 @@ export function useContractMarketView({
     } : null,
     ticker: {
       symbol: contractSymbol,
-      price: fallbackLastPrice,
-      time: fallbackLastPriceTime,
-      source: fallbackLastPriceSource,
-      freshness: fallbackQuoteFreshness,
-      marketStatus: fallbackMarketStatus,
-      marketSessionType: fallbackMarketSessionType,
+      price: quote?.last_price ?? fallbackLastPrice,
+      time: quote?.ts ?? fallbackLastPriceTime,
+      source: quote?.source ?? quote?.quote_source ?? fallbackLastPriceSource,
+      freshness: quote?.quote_freshness ?? fallbackQuoteFreshness,
+      marketStatus: quote?.market_status ?? fallbackMarketStatus,
+      marketSessionType: quote?.market_session_type ?? fallbackMarketSessionType,
     },
     execution: marketView ? {
       symbol: marketView.symbol,
@@ -1102,6 +1140,13 @@ export function useContractMarketView({
     fallbackQuoteFreshness,
     latestTrade,
     marketView,
+    quote?.last_price,
+    quote?.market_session_type,
+    quote?.market_status,
+    quote?.quote_freshness,
+    quote?.quote_source,
+    quote?.source,
+    quote?.ts,
   ]);
   const referencePrice = useMemo(
     () => selectContractReferencePrice(priceAuthority),
@@ -1248,21 +1293,15 @@ export function useContractMarketView({
   }, []);
 
   useEffect(() => {
-    const nextPrice = displayPrice;
-    if (nextPrice === null) {
-      currentPriceRef.current = null;
-      setPriceDirection('flat');
-      return;
-    }
-
-    const previousPrice = currentPriceRef.current;
-    if (previousPrice === null) {
-      setPriceDirection('flat');
-    } else {
-      setPriceDirection(nextPrice > previousPrice ? 'up' : nextPrice < previousPrice ? 'down' : 'flat');
-    }
-    currentPriceRef.current = nextPrice;
-  }, [displayPrice]);
+    const currentState = priceDirectionStateRef.current;
+    const nextState = advanceContractPriceDirection(currentState, {
+      symbol: contractSymbol,
+      price: referencePrice.usable ? referencePrice.value : null,
+    });
+    if (nextState === currentState) return;
+    priceDirectionStateRef.current = nextState;
+    setPriceDirection((current) => current === nextState.direction ? current : nextState.direction);
+  }, [contractSymbol, referencePrice.usable, referencePrice.value]);
 
   useEffect(() => {
     const previousState = previousMarketViewDisplayStateRef.current;

@@ -7,6 +7,14 @@ const pageSource = readFileSync(
   resolve(process.cwd(), 'app/contract/page.tsx'),
   'utf8',
 );
+const marketStateSource = readFileSync(
+  resolve(process.cwd(), 'components/contract/hooks/useContractMarketState.ts'),
+  'utf8',
+);
+const marketViewSource = readFileSync(
+  resolve(process.cwd(), 'components/contract/hooks/useContractMarketView.ts'),
+  'utf8',
+);
 
 describe('Contract TradingView bootstrap experience', () => {
   test('waits for symbol metadata before creating the only chart widget consumer', () => {
@@ -23,12 +31,21 @@ describe('Contract TradingView bootstrap experience', () => {
 
   test('loads current symbol metadata before the full selector catalog', () => {
     const bootstrapRequestIndex = pageSource.indexOf('keyword: bootstrapSymbol');
-    const catalogRequestIndex = pageSource.indexOf("getContractSymbols({ category: 'all'");
+    const catalogRequestIndex = pageSource.indexOf("loadContractSymbols({ category: 'all'");
 
     expect(bootstrapRequestIndex).toBeGreaterThan(-1);
     expect(catalogRequestIndex).toBeGreaterThan(bootstrapRequestIndex);
     expect(pageSource).toContain('page_size: 1');
     expect(pageSource).toContain('The full catalog remains the fail-closed metadata fallback.');
+    expect(pageSource).toContain('const contractSymbolRequestStore = new Map<string, ContractSymbolRequestEntry>();');
+  });
+
+  test('gives authoritative realtime a bootstrap grace before REST fallbacks', () => {
+    expect(marketStateSource).toContain('CONTRACT_QUOTE_REST_BOOTSTRAP_GRACE_MS');
+    expect(marketStateSource).toContain("if (marketRealtimeStatus === 'connected') return undefined;");
+    expect(marketViewSource).toContain('REST_BOOTSTRAP_GRACE_MS');
+    expect(marketViewSource).toContain('if (lostRealtime) void refreshDepth();');
+    expect(marketViewSource).toContain('if (lostRealtime) void refreshTrades();');
   });
 
   test('keeps a pending ETH to BTC selection ahead of the stale URL', () => {

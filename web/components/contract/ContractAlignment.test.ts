@@ -11,7 +11,7 @@ test('contract terminal reuses the shared selector and isolates symbol-scoped pr
 
   expect(source).toContain("from '@/components/spot/GlobalMarketSelector'");
   expect(source).toContain('placement="header"');
-  expect(source).toContain('normalizeContractSymbol(contractTicker.symbol) === contractSymbol');
+  expect(source).not.toContain('contractTicker');
   expect(source).toContain('selectedPriceState?.symbol === contractSymbol');
   expect(source).toContain('key={contractSymbol}');
   expect(source).toContain("setContractDataScope('current')");
@@ -96,13 +96,15 @@ test('Contract Price Authority keeps trade provenance on one evidence row', () =
   expect(authoritySection).not.toContain('mark_price');
 });
 
-test('contract ticker polling runs only while visible and realtime is disconnected', () => {
+test('contract header metrics reuse quote/store bootstrap without a duplicate ticker request', () => {
   const source = readSource('app/contract/page.tsx');
 
-  expect(source).toContain('const isPageVisible = useContractPageVisibility()');
-  expect(source).toContain('if (!isPageVisible) return undefined');
-  expect(source).toContain("if (!isPageVisible || contractMarketRealtimeStatus === 'connected') return undefined");
-  expect(source).toContain('[contractMarketRealtimeStatus, isPageVisible, refreshContractTicker]');
+  expect(source).not.toContain('getContractTickers');
+  expect(source).not.toContain('refreshContractTicker');
+  expect(source).toContain('changeAmount: contractQuote?.price_change_24h');
+  expect(source).toContain('changePercent: contractQuote?.price_change_percent_24h');
+  expect(source).toContain('contractQuote?.base_volume_24h');
+  expect(source).toContain('contractQuote?.quote_volume_24h');
 });
 
 test('contract header receives authoritative MarketView status and does not synthesize quote time', () => {
@@ -140,16 +142,31 @@ test('contract TradingView overlay consumes Price Authority without changing the
 
 test('contract TradingView and OrderBook share one referencePrice contract', () => {
   const pageSource = readSource('app/contract/page.tsx');
+  const hookSource = readSource('components/contract/hooks/useContractMarketView.ts');
   const orderBookSource = readSource('components/contract/ContractFuturesOrderBook.tsx');
 
   expect(pageSource).toMatch(/<ContractTradingViewChart[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
   expect(pageSource).toMatch(/<ContractFuturesOrderBook[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
-  expect(pageSource).toContain('fallbackLastPrice: activeContractTicker?.last_price');
+  expect(hookSource).toContain('price: quote?.last_price ?? fallbackLastPrice');
   expect(pageSource).not.toContain('displayOnlyPrice=');
   expect(pageSource).not.toContain('centerPrice={contractMarketState.displayPrice}');
   expect(orderBookSource).toContain('referencePrice: ContractReferencePrice;');
   expect(orderBookSource).toContain('const centerPriceNumber = referencePrice.usable');
   expect(orderBookSource).not.toContain('storeHasMidpoint');
+});
+
+test('contract Header, TradingView, and OrderBook share one reference-price direction owner', () => {
+  const pageSource = readSource('app/contract/page.tsx');
+  const marketStateSource = readSource('components/contract/hooks/useContractMarketState.ts');
+  const marketViewSource = readSource('components/contract/hooks/useContractMarketView.ts');
+
+  expect(pageSource).toMatch(/<ContractMarketHeader[\s\S]*?priceDirection=\{currentPriceDirection\}[\s\S]*?\/>/);
+  expect(pageSource).toMatch(/<ContractTradingViewChart[\s\S]*?priceDirection=\{currentPriceDirection\}[\s\S]*?\/>/);
+  expect(pageSource).toMatch(/<ContractFuturesOrderBook[\s\S]*?priceDirection=\{currentPriceDirection\}[\s\S]*?\/>/);
+  expect(marketViewSource).toContain('advanceContractPriceDirection(currentState, {');
+  expect(marketViewSource).toContain('price: referencePrice.usable ? referencePrice.value : null');
+  expect(marketStateSource).not.toContain('setPriceDirection');
+  expect(marketStateSource).not.toContain('latestMarketPriceRef');
 });
 
 test('every ContractTradingViewChart consumer provides a symbol-matched referencePrice', () => {
@@ -194,7 +211,7 @@ test('contract realtime keeps market symbol ownership separate from chart interv
   expect(datafeedSource).toContain('contractMarketRealtime.subscribeKline({');
   expect(datafeedSource).not.toContain('contractMarketRealtime.setSession(');
   expect(realtimeSource).toContain("this.sendDomainCommand('subscribe', 'market', this.marketSymbol)");
-  expect(realtimeSource).toContain("this.sendDomainCommand('unsubscribe', 'kline'");
+  expect(realtimeSource).toMatch(/this\.sendDomainCommand\(\s*'unsubscribe',\s*'kline'/);
 });
 
 test('contract TradingView uses the current readiness API and asynchronous symbol resolution', () => {
