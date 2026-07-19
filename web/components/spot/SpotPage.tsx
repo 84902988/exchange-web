@@ -1760,6 +1760,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           <div className="flex min-h-[150px] min-w-0 flex-col overflow-visible border border-white/10 bg-[#12161c] xl:col-span-2 xl:col-start-1 xl:row-start-2 xl:min-h-0">
             <SpotOrderTabs
               symbol={symbol}
+              pricePrecision={pricePrecision}
               refreshKey={refreshKey}
               onOrdersChanged={handleOrdersChanged}
               onLoadingChange={setOrdersLoading}
