@@ -220,6 +220,13 @@ export type ContractQuote = ContractQuoteAvailability & {
   index_price?: string | number | null
   funding_rate?: string | number | null
   next_funding_time?: number | string | null
+  open_24h?: string | number | null
+  price_change_24h?: string | number | null
+  price_change_percent_24h?: string | number | null
+  high_24h?: string | number | null
+  low_24h?: string | number | null
+  base_volume_24h?: string | number | null
+  quote_volume_24h?: string | number | null
   source: string
   ts: string
 }
@@ -694,14 +701,14 @@ export function getContractMarketKlinesMetadata(params: {
   interval: string
   limit?: number
   endTimeMs?: number
-}): Promise<ContractMarketKlineMetadataResponse> {
+}, options: Pick<RequestInit, 'signal'> = {}): Promise<ContractMarketKlineMetadataResponse> {
   return request<ContractMarketKlineMetadataResponse>(withQuery('/contract/market/kline', {
     symbol: params.symbol,
     interval: params.interval,
     limit: params.limit,
     end_time_ms: params.endTimeMs,
     include_metadata: 1,
-  }))
+  }), options)
 }
 
 export function getContractMarketTrades(symbol: string, limit = 30): Promise<ContractMarketTrade[]> {

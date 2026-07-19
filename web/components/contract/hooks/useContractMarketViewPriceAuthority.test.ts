@@ -14,10 +14,10 @@ describe('useContractMarketView Price Authority wiring', () => {
     expect(hookSource).toMatch(/const priceAuthority = useMemo/);
     expect(hookSource).toMatch(/const referencePrice = useMemo/);
     expect(hookSource).toMatch(/ticker:\s*\{/);
-    expect(hookSource).toMatch(/price:\s*fallbackLastPrice/);
-    expect(hookSource).toMatch(/source:\s*fallbackLastPriceSource/);
-    expect(hookSource).toMatch(/freshness:\s*fallbackQuoteFreshness/);
-    expect(hookSource).toMatch(/marketStatus:\s*fallbackMarketStatus/);
+    expect(hookSource).toMatch(/price:\s*quote\?\.last_price \?\? fallbackLastPrice/);
+    expect(hookSource).toMatch(/source:\s*quote\?\.source \?\? quote\?\.quote_source \?\? fallbackLastPriceSource/);
+    expect(hookSource).toMatch(/freshness:\s*quote\?\.quote_freshness \?\? fallbackQuoteFreshness/);
+    expect(hookSource).toMatch(/marketStatus:\s*quote\?\.market_status \?\? fallbackMarketStatus/);
     expect(hookSource).toMatch(/priceAuthority,\s*\n\s*referencePrice,\s*\n\s*displayPrice,/);
     expect(hookSource).toMatch(/const displayPrice = marketViewAuthority\.displayPrice;/);
   });

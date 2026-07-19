@@ -6,6 +6,7 @@ import {
   useContractHeaderStoreSnapshot,
   type ContractHeaderStoreSnapshot,
 } from './hooks/contractMarketStoreAdapter';
+import { formatContractHeaderChange } from './contractHeaderChange';
 import type { ContractReferencePrice } from './contractPriceAuthority';
 
 export type ContractHeaderPriceDirection = 'up' | 'down' | 'flat';
@@ -179,12 +180,6 @@ function formatStoreFunding(value: string | null, legacyValue: string | null): s
   return `${percent > 0 ? '+' : ''}${percent.toFixed(precision)}%`;
 }
 
-function formatSigned(value: string, precision: number, suffix = '') {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return '--';
-  return `${numeric > 0 ? '+' : ''}${numeric.toFixed(precision)}${suffix}`;
-}
-
 function formatStoreChange(
   store: ContractHeaderStoreSnapshot,
   fallback: string | null,
@@ -192,14 +187,11 @@ function formatStoreChange(
 ) {
   if (store.priceChange24h === null && store.priceChangePercent24h === null) return fallback;
   const precision = inferFractionDigits(displayPriceFallback, 2);
-  const amount = store.priceChange24h === null
-    ? '--'
-    : formatSigned(store.priceChange24h, precision);
-  const percent = store.priceChangePercent24h === null
-    ? '--'
-    : formatSigned(store.priceChangePercent24h, 2, '%');
-  if (amount !== '--' && percent !== '--') return `${amount} / ${percent}`;
-  return amount !== '--' ? amount : percent;
+  return formatContractHeaderChange({
+    changeAmount: store.priceChange24h,
+    changePercent: store.priceChangePercent24h,
+    pricePrecision: precision,
+  }) ?? fallback;
 }
 
 function formatCompactAmount(value: string | null) {
@@ -535,7 +527,6 @@ export default function ContractMarketHeader({
     fundingRate,
     bestBid,
     bestAsk,
-    spread,
     highLow24h,
     volumeTurnover24h,
   } = marketRead;
@@ -690,7 +681,7 @@ export default function ContractMarketHeader({
           <Metric label={labels.fundingRate} testId="contract-header-funding-rate" value={fundingRate || '--'} />
           <Metric label={labels.bestBid} testId="contract-header-best-bid" value={bestBid || '--'} />
           <Metric label={labels.bestAsk} testId="contract-header-best-ask" value={bestAsk || '--'} />
-          <Metric label={t('spread', 'contracts')} testId="contract-header-spread" value={spread || '--'} />
+          <Metric label={t('spread', 'contracts')} testId="contract-header-spread" value={t('spreadFloating', 'contracts')} />
           <Metric label={t('highLow24h', 'contracts')} testId="contract-header-high-low-24h" value={highLow24h || '--'} />
           <Metric
             label={`${t('volume24h', 'contracts')} / ${t('turnover24h', 'contracts')}`}

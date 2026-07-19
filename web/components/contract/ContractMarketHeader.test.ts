@@ -85,6 +85,7 @@ const translations: Record<string, string> = {
   markPrice: '\u6807\u8bb0\u4ef7\u683c',
   indexPrice: '\u6307\u6570\u4ef7\u683c',
   spread: '\u4ef7\u5dee',
+  spreadFloating: '\u6d6e\u52a8',
 };
 
 const Fragment = Symbol('Fragment');
@@ -115,6 +116,11 @@ Object.defineProperty(globalThis, 'window', {
     clearTimeout: clock.clearTimeout,
   },
 });
+
+const headerChangeModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./contractHeaderChange.ts', import.meta.url)),
+  {},
+);
 
 const headerModule = loadTypeScriptModule(
   fileURLToPath(new URL('./ContractMarketHeader.tsx', import.meta.url)),
@@ -161,6 +167,7 @@ const headerModule = loadTypeScriptModule(
     './hooks/contractMarketStoreAdapter': {
       useContractHeaderStoreSnapshot: (symbol: string) => storeSnapshotsBySymbol[symbol] ?? null,
     },
+    './contractHeaderChange': headerChangeModule,
     './contractMarketSourceStatus': {
       getContractTickerDomainStatusLabel: () => '\u884c\u60c5\u6765\u6e90: \u5b9e\u65f6',
     },
@@ -499,7 +506,7 @@ test('contract metrics remain separate cards without duplicating main price', ()
   assert.equal(textContent(findByTestId(tree, 'contract-header-funding-rate')), '\u8d44\u91d1\u8d39\u7387+0.0100%');
   assert.equal(textContent(findByTestId(tree, 'contract-header-best-bid')), '\u4e70\u4e0063,999.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-best-ask')), '\u5356\u4e0064,001.0');
-  assert.equal(textContent(findByTestId(tree, 'contract-header-spread')), '\u4ef7\u5dee2.0');
+  assert.equal(textContent(findByTestId(tree, 'contract-header-spread')), '\u4ef7\u5dee\u6d6e\u52a8');
   assert.equal(textContent(findByTestId(tree, 'contract-header-high-low-24h')), 'highLow24h65,000.0 / 63,000.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-volume-turnover-24h')), 'volume24h / turnover24h100.00 / 6.40M');
   assert.equal(textContent(tree).split('64,000.0').length - 1, 1);
@@ -590,7 +597,7 @@ test('Header keeps the complete legacy fallback while Store is safely empty', ()
     assert.equal(textContent(findByTestId(tree, 'contract-header-index-price')), '\u6307\u6570\u4ef7\u683c63,997.0');
     assert.equal(textContent(findByTestId(tree, 'contract-header-best-bid')), '\u4e70\u4e0063,999.0');
     assert.equal(textContent(findByTestId(tree, 'contract-header-best-ask')), '\u5356\u4e0064,001.0');
-    assert.equal(textContent(findByTestId(tree, 'contract-header-spread')), '\u4ef7\u5dee2.0');
+    assert.equal(textContent(findByTestId(tree, 'contract-header-spread')), '\u4ef7\u5dee\u6d6e\u52a8');
   } finally {
     console.info = originalInfo;
   }

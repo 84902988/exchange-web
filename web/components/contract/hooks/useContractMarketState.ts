@@ -29,8 +29,6 @@ import {
   restartContractMarketShadowSession,
 } from './contractMarketStoreAdapter';
 
-export type PriceDirection = 'up' | 'down' | 'flat';
-
 type ContractDepthSnapshot = {
   symbol?: string | null;
   asks: ContractDepthLevel[];
@@ -75,6 +73,7 @@ type ContractQuoteRequestEntry = {
 };
 
 const CONTRACT_QUOTE_REQUEST_DEDUPE_MS = 1_000;
+const CONTRACT_QUOTE_REST_BOOTSTRAP_GRACE_MS = 750;
 const contractQuoteRequestStore = new Map<string, ContractQuoteRequestEntry>();
 
 function loadContractQuote(contractSymbol: string) {
@@ -147,15 +146,6 @@ function extractRealtimeQuote(message: ContractMarketRealtimeMessage): ContractQ
   return record as unknown as ContractQuoteWithPremiumFields;
 }
 
-function getQuoteTradePrice(quote?: ContractQuoteWithPremiumFields | null) {
-  if (!quote) return 0;
-  const record = quote as ContractQuoteWithPremiumFields & {
-    price?: string | number | null;
-    last?: string | number | null;
-  };
-  return toNumber(record.last_price ?? record.price ?? record.last);
-}
-
 export function formatFundingRate(value?: string | number | null) {
   const num = Number(value);
   if (!Number.isFinite(num)) return '--';
@@ -179,8 +169,6 @@ export function useContractMarketState({
   const { t } = useLocaleContext();
   const [hasHydrated, setHasHydrated] = useState(false);
   const [marketRealtimeStatus, setMarketRealtimeStatus] = useState<ContractMarketRealtimeStatus>('idle');
-  const [priceDirection, setPriceDirection] = useState<PriceDirection>('flat');
-  const [latestMarketPrice, setLatestMarketPrice] = useState<number | null>(null);
   const [bestDepth, setBestDepth] = useState<BestDepthState>(() => ({
     symbol: contractSymbol,
     bestBid: null,
@@ -195,7 +183,6 @@ export function useContractMarketState({
   const [contractAvailabilityError, setContractAvailabilityError] = useState<string | null>(null);
   const contractQuoteRef = useRef<ContractQuoteWithPremiumFields | null>(null);
   const quoteLoadedSymbolRef = useRef<string | null>(null);
-  const latestMarketPriceRef = useRef(0);
   const previousMarketRealtimeStatusRef = useRef<ContractMarketRealtimeStatus>('idle');
 
   const marketSymbol = useMemo(
@@ -208,12 +195,6 @@ export function useContractMarketState({
   const contractQuote = contractQuoteState.symbol === contractSymbol
     ? contractQuoteState.quote
     : fallbackQuoteCache?.quote || null;
-  const fallbackLatestPrice = toNumber(fallbackQuoteCache?.lastPrice ?? contractQuote?.last_price);
-  const activeLatestMarketPrice = contractQuoteState.symbol === contractSymbol
-    ? latestMarketPrice
-    : fallbackLatestPrice > 0
-      ? fallbackLatestPrice
-      : null;
   const quantityUnit = useMemo(() => getContractQuantityUnit(contractSymbol), [contractSymbol]);
   const pricePrecision = getSymbolPricePrecision(
     contractSymbol,
@@ -250,23 +231,6 @@ export function useContractMarketState({
     };
   }, [bestAsk, bestBid, contractQuote?.mark_price, pricePrecision, t]);
 
-  const applyLatestPrice = useCallback((value?: string | number | null) => {
-    const nextPrice = toNumber(value);
-    if (!nextPrice) return;
-    const previousPrice = latestMarketPriceRef.current;
-    if (previousPrice) {
-      setPriceDirection(nextPrice > previousPrice ? 'up' : nextPrice < previousPrice ? 'down' : 'flat');
-    } else {
-      setPriceDirection('flat');
-    }
-    latestMarketPriceRef.current = nextPrice;
-    setLatestMarketPrice(nextPrice);
-  }, []);
-
-  const latestPrice = formatPrice(
-    hasHydrated ? activeLatestMarketPrice || contractQuote?.last_price : null,
-    pricePrecision,
-  );
   const contractConfigMissing = isContractSymbolConfigMissing(contractAvailabilityError);
   const quoteHint = contractConfigMissing ? t('contractSymbolConfigMissing', 'contracts') : null;
   const initialDepth = hasHydrated ? readContractDepthCache(contractSymbol) || undefined : undefined;
@@ -281,7 +245,6 @@ export function useContractMarketState({
     }
     try {
       const nextQuote = await loadContractQuote(contractSymbol);
-      const nextPrice = getQuoteTradePrice(nextQuote);
       const storeResult = hydrateContractMarketRestDomain({
         symbol: contractSymbol,
         domain: 'ticker',
@@ -289,7 +252,6 @@ export function useContractMarketState({
         metadata: nextQuote,
       });
       if (!storeResult.accepted) return;
-      applyLatestPrice(nextPrice);
       contractQuoteRef.current = nextQuote;
       quoteLoadedSymbolRef.current = contractSymbol;
       setContractQuoteState({
@@ -303,7 +265,7 @@ export function useContractMarketState({
     } finally {
       setContractQuoteLoading(false);
     }
-  }, [applyLatestPrice, contractSymbol, t]);
+  }, [contractSymbol, t]);
 
   const handleBestPricesChange = useCallback(({
     bestBid: nextBestBid,
@@ -347,10 +309,6 @@ export function useContractMarketState({
         quote: cache.quote || null,
       });
       setContractAvailabilityError(null);
-      setPriceDirection('flat');
-      const cachedPrice = toNumber(cache.lastPrice ?? cache.quote?.last_price);
-      latestMarketPriceRef.current = cachedPrice || 0;
-      setLatestMarketPrice(cachedPrice > 0 ? cachedPrice : null);
     });
 
     return () => {
@@ -372,11 +330,8 @@ export function useContractMarketState({
     restartContractMarketShadowSession(contractSymbol);
     contractQuoteRef.current = null;
     quoteLoadedSymbolRef.current = null;
-    latestMarketPriceRef.current = 0;
     setContractQuoteLoading(true);
     setContractQuoteState({ symbol: contractSymbol, quote: null });
-    setLatestMarketPrice(null);
-    setPriceDirection('flat');
     setBestDepth({ symbol: contractSymbol, bestBid: null, bestAsk: null, ts: null });
     void refreshContractQuote();
   }, [contractSymbol, marketRealtimeStatus, refreshContractQuote]);
@@ -408,14 +363,12 @@ export function useContractMarketState({
         ...nextQuote,
       };
 
-      const nextPrice = getQuoteTradePrice(mergedQuote);
       const storeResult = ingestContractMarketWsDomain({
         domain: 'ticker',
         message,
         data: mergedQuote,
       });
       if (!storeResult.accepted) return;
-      applyLatestPrice(nextPrice);
       contractQuoteRef.current = mergedQuote;
       quoteLoadedSymbolRef.current = contractSymbol;
       setContractQuoteLoading(false);
@@ -428,11 +381,15 @@ export function useContractMarketState({
     };
 
     return contractMarketRealtime.subscribe('quote', handleQuoteMessage);
-  }, [applyLatestPrice, contractSymbol]);
+  }, [contractSymbol]);
 
   useEffect(() => {
-    void Promise.resolve().then(refreshContractQuote);
-  }, [refreshContractQuote]);
+    if (marketRealtimeStatus === 'connected') return undefined;
+    const timer = window.setTimeout(() => {
+      void refreshContractQuote();
+    }, CONTRACT_QUOTE_REST_BOOTSTRAP_GRACE_MS);
+    return () => window.clearTimeout(timer);
+  }, [marketRealtimeStatus, refreshContractQuote]);
 
   useEffect(() => {
     if (marketRealtimeStatus === 'connected') return undefined;
@@ -447,9 +404,6 @@ export function useContractMarketState({
   return {
     marketSymbol,
     quantityUnit,
-    priceDirection,
-    latestPrice,
-    latestMarketPrice: activeLatestMarketPrice,
     bestBid,
     bestAsk,
     bestDepthTimestamp,
@@ -464,7 +418,6 @@ export function useContractMarketState({
     quoteHint,
     marketRealtimeStatus,
     initialDepth,
-    applyLatestPrice,
     handleBestPricesChange,
     handleDepthDataChange,
   };
