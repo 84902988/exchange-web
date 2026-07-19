@@ -24,7 +24,7 @@ from app.db.session import SessionLocal
 from app.services.fee_service import apply_trade_fee
 from app.services.market_ws import market_ws_manager
 from app.services.spot_order_payload import serialize_spot_order
-from app.services.spot_private_ws import spot_private_ws_manager
+from app.services.spot_private_event_bridge import create_spot_private_event
 from app.services.spot_public_depth_events import publish_spot_public_depth_refresh
 
 
@@ -43,6 +43,9 @@ _AUTO_MATCH_PAIR_LOCK_TTL_SECONDS = 4
 _LOCAL_PAIR_LOCKS: dict[int, threading.Lock] = {}
 _LOCAL_PAIR_LOCKS_GUARD = threading.Lock()
 ACTIVE_MATCH_EXECUTION_MODE = "MATCHING"
+MATCHING_ORDER_PARTIAL_FILLED_EVENT = "ORDER_PARTIAL_FILLED"
+MATCHING_ORDER_FILLED_EVENT = "ORDER_FILLED"
+MATCHING_BALANCE_UPDATED_EVENT = "BALANCE_UPDATED"
 T = TypeVar("T")
 
 
@@ -612,6 +615,47 @@ def update_sell_order_after_trade(
     update_order_status(order)
 
 
+def _matching_order_event_type(order: Order) -> str:
+    status = str(order.status or "").upper().strip()
+    if status == "FILLED":
+        return MATCHING_ORDER_FILLED_EVENT
+    if status == "PARTIALLY_FILLED":
+        return MATCHING_ORDER_PARTIAL_FILLED_EVENT
+    raise RuntimeError(
+        f"matching order private event requires filled status: order_id={order.id} status={status}"
+    )
+
+
+def _create_matching_private_events(
+    db: Session,
+    *,
+    symbol: str,
+    orders: Tuple[Order, ...],
+) -> None:
+    affected_user_ids: set[int] = set()
+    ordered_orders = sorted(orders, key=lambda order: int(order.user_id))
+    for order in ordered_orders:
+        user_id = int(order.user_id)
+        affected_user_ids.add(user_id)
+        create_spot_private_event(
+            db,
+            user_id=user_id,
+            event_type=_matching_order_event_type(order),
+            payload={
+                "symbol": norm_symbol(symbol),
+                "order": serialize_spot_order(order, symbol),
+            },
+        )
+
+    for user_id in sorted(affected_user_ids):
+        create_spot_private_event(
+            db,
+            user_id=user_id,
+            event_type=MATCHING_BALANCE_UPDATED_EVENT,
+            payload={},
+        )
+
+
 def _prepare_trade_context(
     db: Session,
     trading_pair_id: int,
@@ -743,34 +787,6 @@ async def _push_depth_and_snapshot(
         )
     finally:
         ws_db.close()
-
-
-def _push_private_order_updates(updates) -> None:
-    for item in updates or []:
-        _fire_and_forget(
-            spot_private_ws_manager.send_order_update(
-                item["user_id"],
-                item["symbol"],
-                item["order"],
-            ),
-            "private ws push error",
-        )
-
-
-async def _push_spot_balance_update(user_id: int) -> None:
-    ws_db = SessionLocal()
-    try:
-        await spot_private_ws_manager.send_account_balances_snapshot(ws_db, int(user_id))
-    finally:
-        ws_db.close()
-
-
-def _push_private_balance_updates(user_ids) -> None:
-    for user_id in sorted({int(item) for item in user_ids or [] if item is not None}):
-        _fire_and_forget(
-            _push_spot_balance_update(user_id),
-            "private balance ws push error",
-        )
 
 
 def _settle_one_trade(
@@ -1095,6 +1111,12 @@ def _settle_one_trade(
         role="MAKER" if maker.id == sell.id else "TAKER",
     )
 
+    _create_matching_private_events(
+        db,
+        symbol=pair.symbol,
+        orders=(buy, sell),
+    )
+
     taker_side = (taker.side or "").upper()
 
     return {
@@ -1106,25 +1128,12 @@ def _settle_one_trade(
         "quote_amount": trade_quote_amount,
         "symbol": pair.symbol,
         "trade_side": taker_side,
-        "_private_updates": [
-            {
-                "user_id": buy.user_id,
-                "symbol": pair.symbol,
-                "order": serialize_spot_order(buy, pair.symbol),
-            },
-            {
-                "user_id": sell.user_id,
-                "symbol": pair.symbol,
-                "order": serialize_spot_order(sell, pair.symbol),
-            },
-        ],
     }
 
 
 def _run_match_once_unlocked(db: Session, trading_pair_id: int):
     try:
         result = _settle_one_trade(db, trading_pair_id)
-        private_updates = result.pop("_private_updates", [])
         db.commit()
 
         _push_trade_and_depth(
@@ -1134,8 +1143,6 @@ def _run_match_once_unlocked(db: Session, trading_pair_id: int):
             side=result["trade_side"],
             trade_id=result["trade_id"],
         )
-        _push_private_order_updates(private_updates)
-        _push_private_balance_updates(item["user_id"] for item in private_updates)
 
         return {
             "matched": True,
@@ -1198,7 +1205,6 @@ def _run_match_loop_unlocked(
         for _ in range(max_rounds):
             try:
                 result = _settle_one_trade(db, trading_pair_id)
-                trade_private_updates = result.pop("_private_updates", [])
                 db.commit()
                 matched_count += 1
                 trade_ids.append(result["trade_id"])
@@ -1208,10 +1214,6 @@ def _run_match_loop_unlocked(
                     amount=result["amount"],
                     side=result["trade_side"],
                     trade_id=result["trade_id"],
-                )
-                _push_private_order_updates(trade_private_updates)
-                _push_private_balance_updates(
-                    item["user_id"] for item in trade_private_updates
                 )
             except DirtyMatchingOrderError as e:
                 if not skip_dirty_orders:
