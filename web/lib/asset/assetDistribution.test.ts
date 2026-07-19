@@ -16,6 +16,7 @@ describe("buildAssetValuationDistribution", () => {
     ]);
 
     expect(result.map((item) => item.percent)).toEqual([50, 50]);
+    expect(result.map((item) => item.usdtValue)).toEqual([100, 100]);
   });
 
   it("fails the whole distribution closed when a held asset has no price", () => {
@@ -23,6 +24,7 @@ describe("buildAssetValuationDistribution", () => {
 
     expect(result).toHaveLength(2);
     expect(result.map((item) => item.percent)).toEqual([null, null]);
+    expect(result.map((item) => item.usdtValue)).toEqual([100, null]);
   });
 
   it.each(["0", "-1", "invalid"])(

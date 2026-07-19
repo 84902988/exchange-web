@@ -11,6 +11,7 @@ export type AssetValuationDistributionItem = {
   symbol: string;
   amount: number;
   precision: number;
+  usdtValue: number | null;
   percent: number | null;
 };
 
@@ -68,6 +69,7 @@ export function buildAssetValuationDistribution(
     symbol,
     amount,
     precision,
+    usdtValue,
     percent:
       valueTotal !== null && valueTotal > 0 && usdtValue !== null
         ? (usdtValue / valueTotal) * 100
