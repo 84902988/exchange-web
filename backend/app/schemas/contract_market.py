@@ -41,6 +41,13 @@ class ContractQuoteResponse(BaseModel):
     index_price: Optional[str] = None
     funding_rate: Optional[str] = None
     next_funding_time: Optional[int] = None
+    open_24h: Optional[str] = None
+    price_change_24h: Optional[str] = None
+    price_change_percent_24h: Optional[str] = None
+    high_24h: Optional[str] = None
+    low_24h: Optional[str] = None
+    base_volume_24h: Optional[str] = None
+    quote_volume_24h: Optional[str] = None
     source: str
     ts: datetime
 

@@ -24,6 +24,7 @@ from app.services.contract_market_provider_service import (
     is_contract_market_provider_in_cooldown,
     resolve_contract_provider_symbol,
 )
+from app.services.contract_ticker_evidence import resolve_contract_ticker_24h_evidence
 
 
 logger = logging.getLogger(__name__)
@@ -2968,9 +2969,10 @@ class ContractMarketProviderWsService:
         low_24h = _to_decimal(row.get("low24h"))
         base_volume_24h = _to_decimal(row.get("vol24h"))
         quote_volume_24h = _to_decimal(row.get("volCcy24h"))
-        price_change_percent_24h = None
-        if open_24h is not None and open_24h > 0 and last_price is not None:
-            price_change_percent_24h = ((last_price - open_24h) / open_24h) * Decimal("100")
+        change_evidence = resolve_contract_ticker_24h_evidence(
+            last_price=last_price,
+            open_24h=open_24h,
+        )
         return {
             "symbol": subscription.local_symbol,
             "provider": subscription.provider,
@@ -2986,12 +2988,13 @@ class ContractMarketProviderWsService:
             "last_price": last_price,
             "mark_price": mark_price,
             "index_price": mark_price,
-            "open_24h": open_24h,
+            "open_24h": change_evidence.open_24h,
+            "price_change_24h": change_evidence.price_change_24h,
             "high_24h": high_24h,
             "low_24h": low_24h,
             "base_volume_24h": base_volume_24h,
             "quote_volume_24h": quote_volume_24h,
-            "price_change_percent_24h": price_change_percent_24h,
+            "price_change_percent_24h": change_evidence.price_change_percent_24h,
             "source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_freshness": "LIVE",
@@ -3035,6 +3038,19 @@ class ContractMarketProviderWsService:
         ts_ms = _timestamp_ms_from_value(ts_value)
         ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
         market_status = _pick_first_present(row, ["market_status", "marketStatus"])
+        open_24h = _pick_decimal(row, ["o", "open", "open_price", "openPrice"])
+        change_evidence = resolve_contract_ticker_24h_evidence(
+            last_price=last_price,
+            open_24h=open_24h,
+            price_change_24h=_pick_first_present(
+                row,
+                ["ch", "change", "price_change", "priceChange"],
+            ),
+            price_change_percent_24h=_pick_first_present(
+                row,
+                ["chp", "rate", "change_percent", "price_change_percent", "pct_chg"],
+            ),
+        )
         return {
             "symbol": subscription.local_symbol,
             "provider": PROVIDER_ITICK,
@@ -3048,15 +3064,13 @@ class ContractMarketProviderWsService:
             "last_price": last_price,
             "mark_price": mark_price,
             "index_price": mark_price,
-            "open_24h": _pick_decimal(row, ["o", "open", "open_price", "openPrice"]),
+            "open_24h": change_evidence.open_24h,
+            "price_change_24h": change_evidence.price_change_24h,
             "high_24h": _pick_decimal(row, ["h", "high", "high_price", "highPrice"]),
             "low_24h": _pick_decimal(row, ["l", "low", "low_price", "lowPrice"]),
             "base_volume_24h": _pick_decimal(row, ["v", "volume", "vol", "base_volume", "baseVolume"]),
             "quote_volume_24h": _pick_decimal(row, ["tu", "qv", "turnover", "amount", "value"]),
-            "price_change_percent_24h": _pick_decimal(
-                row,
-                ["chp", "rate", "change_percent", "price_change_percent", "pct_chg"],
-            ),
+            "price_change_percent_24h": change_evidence.price_change_percent_24h,
             "price_field": price_field,
             "market_status": market_status,
             "source": CONTRACT_PROVIDER_WS_SOURCE,
