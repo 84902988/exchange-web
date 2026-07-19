@@ -26,13 +26,19 @@ import ContractOrderTabs, {
   contractOrderActionTone,
   formatContractOrderAction,
 } from './ContractOrderTabs';
-import { formatPrice as formatMarketPrice, formatRawPrice as formatRawMarketPrice } from '@/lib/marketPrecision';
+import { formatPrice as formatMarketPrice } from '@/lib/marketPrecision';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import type { ContractOrderFilterState, ContractTradeFilterState } from './hooks/useContractUserState';
 import {
   resolveContractTpSlEditorReference,
   resolveContractTpSlQuoteReference,
 } from './contractTpSlReference';
+import {
+  buildContractTpSlDraftPrices,
+  refreshContractTpSlRecommendations,
+  validateContractTpSlPrices,
+  type ContractTpSlDraftFieldOrigin,
+} from './contractTpSlDraftPolicy';
 
 export type ContractPositionTabKey = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
 type TabKey = ContractPositionTabKey;
@@ -76,7 +82,9 @@ type TpSlDraft = {
   referencePrice: string | null;
   referencePriceLabel: string;
   takeProfitPrice: string;
+  takeProfitOrigin: ContractTpSlDraftFieldOrigin;
   stopLossPrice: string;
+  stopLossOrigin: ContractTpSlDraftFieldOrigin;
 };
 
 type AggregatedPositionRow = ContractPositionSummaryItem & {
@@ -130,7 +138,6 @@ const tabs: Array<{ key: TabKey; labelKey: string }> = [
 const cancelTimeoutMs = 15000;
 const pageSize = 5;
 const TP_SL_EDITOR_STEP = 1;
-const TP_SL_DEFAULT_OFFSET_RATE = 0.002;
 const CONTRACT_TRADE_CONFIRM_HIDDEN_KEY = 'contract_trade_confirm_hidden';
 
 function normalizeTpSlTriggerPriceType(value: ContractTpSlTriggerPriceType | string | null | undefined): ContractTpSlTriggerPriceType {
@@ -673,9 +680,9 @@ export default function ContractPositionTabs({
       setOrderFeedback({ type: 'error', message: t('positionSideInvalidRetry', 'contracts') });
       return;
     }
-    const defaultPrices = buildTpSlEditorDefaultPrices({
+    const draftPrices = buildContractTpSlDraftPrices({
       side,
-      markPrice: referencePrice,
+      referencePrice,
       entryPrice: position.entry_price,
       takeProfitPrice: position.take_profit_price,
       stopLossPrice: position.stop_loss_price,
@@ -687,8 +694,10 @@ export default function ContractPositionTabs({
       positions: [{ ...position, side }],
       referencePrice: referencePrice === null || referencePrice === undefined ? null : String(referencePrice),
       referencePriceLabel: tpSlReferencePriceLabel,
-      takeProfitPrice: defaultPrices.takeProfitPrice,
-      stopLossPrice: defaultPrices.stopLossPrice,
+      takeProfitPrice: draftPrices.takeProfit.value,
+      takeProfitOrigin: draftPrices.takeProfit.origin,
+      stopLossPrice: draftPrices.stopLoss.value,
+      stopLossOrigin: draftPrices.stopLoss.origin,
     });
   }
 
@@ -707,9 +716,9 @@ export default function ContractPositionTabs({
       setOrderFeedback({ type: 'error', message: t('tpSlSummaryDetailsMissing', 'contracts') });
       return;
     }
-    const defaultPrices = buildTpSlEditorDefaultPrices({
+    const draftPrices = buildContractTpSlDraftPrices({
       side,
-      markPrice: referencePrice,
+      referencePrice,
       entryPrice: summary.avg_entry_price || representative.entry_price,
       takeProfitPrice: summary.tp_sl_mode === 'SINGLE' ? summary.take_profit_price : representative.take_profit_price,
       stopLossPrice: summary.tp_sl_mode === 'SINGLE' ? summary.stop_loss_price : representative.stop_loss_price,
@@ -727,8 +736,10 @@ export default function ContractPositionTabs({
       positions: detailPositions.map((position) => ({ ...position, side: getPositionRecordSide(position) || side })),
       referencePrice: referencePrice === null || referencePrice === undefined ? null : String(referencePrice),
       referencePriceLabel: tpSlReferencePriceLabel,
-      takeProfitPrice: defaultPrices.takeProfitPrice,
-      stopLossPrice: defaultPrices.stopLossPrice,
+      takeProfitPrice: draftPrices.takeProfit.value,
+      takeProfitOrigin: draftPrices.takeProfit.origin,
+      stopLossPrice: draftPrices.stopLoss.value,
+      stopLossOrigin: draftPrices.stopLoss.origin,
     });
   }
 
@@ -754,16 +765,48 @@ export default function ContractPositionTabs({
       triggerPriceType: normalizedTpSlTriggerPriceType,
       fallback: tpSlDraft.referencePrice,
     });
+    const side = getPositionRecordSide(tpSlDraft.position);
+    if (!side) {
+      setTpSlError(t('positionSideInvalidRetry', 'contracts'));
+      return;
+    }
+    const refreshedPrices = refreshContractTpSlRecommendations({
+      side,
+      referencePrice: latestReferencePrice,
+      prices: {
+        takeProfit: {
+          value: tpSlDraft.takeProfitPrice,
+          origin: tpSlDraft.takeProfitOrigin,
+        },
+        stopLoss: {
+          value: tpSlDraft.stopLossPrice,
+          origin: tpSlDraft.stopLossOrigin,
+        },
+      },
+      pricePrecision,
+    });
+    if (
+      refreshedPrices.takeProfit.value !== tpSlDraft.takeProfitPrice
+      || refreshedPrices.stopLoss.value !== tpSlDraft.stopLossPrice
+    ) {
+      setTpSlDraft((current) => current ? {
+        ...current,
+        takeProfitPrice: refreshedPrices.takeProfit.value,
+        stopLossPrice: refreshedPrices.stopLoss.value,
+      } : current);
+    }
     const referencePrice = toNumber(latestReferencePrice);
-    const takeProfitText = normalizeTpSlInputText(tpSlDraft.takeProfitPrice);
-    const stopLossText = normalizeTpSlInputText(tpSlDraft.stopLossPrice);
+    const takeProfitText = normalizeTpSlInputText(refreshedPrices.takeProfit.value);
+    const stopLossText = normalizeTpSlInputText(refreshedPrices.stopLoss.value);
     const takeProfitPrice = takeProfitText === '' ? null : takeProfitText;
     const stopLossPrice = stopLossText === '' ? null : stopLossText;
     const takeProfitNumber = takeProfitPrice === null ? null : Number(takeProfitPrice);
     const stopLossNumber = stopLossPrice === null ? null : Number(stopLossPrice);
 
     if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
-      setTpSlError(t('markPriceUnavailableTpSl', 'contracts'));
+      setTpSlError(formatI18nTemplate(t('tpSlReferenceUnavailable', 'contracts'), {
+        reference: tpSlDraft.referencePriceLabel,
+      }));
       return;
     }
     if (takeProfitNumber !== null && (!Number.isFinite(takeProfitNumber) || takeProfitNumber <= 0)) {
@@ -775,30 +818,23 @@ export default function ContractPositionTabs({
       return;
     }
 
-    const side = getPositionRecordSide(tpSlDraft.position);
-    if (!side) {
-      setTpSlError(t('positionSideInvalidRetry', 'contracts'));
+    const validationError = validateContractTpSlPrices({
+      side,
+      referencePrice,
+      takeProfitPrice,
+      stopLossPrice,
+    });
+    if (validationError) {
+      const validationMessageKey = {
+        LONG_TP_MUST_BE_ABOVE_REFERENCE: 'longTakeProfitAboveReference',
+        LONG_SL_MUST_BE_BELOW_REFERENCE: 'longStopLossBelowReference',
+        SHORT_TP_MUST_BE_BELOW_REFERENCE: 'shortTakeProfitBelowReference',
+        SHORT_SL_MUST_BE_ABOVE_REFERENCE: 'shortStopLossAboveReference',
+      }[validationError];
+      setTpSlError(formatI18nTemplate(t(validationMessageKey, 'contracts'), {
+        reference: tpSlDraft.referencePriceLabel,
+      }));
       return;
-    }
-    if (side === 'LONG') {
-      if (takeProfitNumber !== null && takeProfitNumber <= referencePrice) {
-        setTpSlError(t('longTakeProfitAboveMark', 'contracts'));
-        return;
-      }
-      if (stopLossNumber !== null && stopLossNumber >= referencePrice) {
-        setTpSlError(t('longStopLossBelowMark', 'contracts'));
-        return;
-      }
-    }
-    if (side === 'SHORT') {
-      if (takeProfitNumber !== null && takeProfitNumber >= referencePrice) {
-        setTpSlError(t('shortTakeProfitBelowMark', 'contracts'));
-        return;
-      }
-      if (stopLossNumber !== null && stopLossNumber <= referencePrice) {
-        setTpSlError(t('shortStopLossAboveMark', 'contracts'));
-        return;
-      }
     }
 
     setTpSlSaving(true);
@@ -1643,7 +1679,8 @@ function SummaryPositionsCards({
               />
               <PositionMetric label={t('margin', 'contracts')} value={`${formatNumber(item.margin_amount, 4)} USDT`} />
               <PositionMetric
-                label={t('unrealizedPnl', 'contracts')}
+                label={t('unrealizedPnlByMark', 'contracts')}
+                labelTitle={t('unrealizedPnlMarkPriceTitle', 'contracts')}
                 value={unrealized === null ? (truthUnavailableLabel ?? '--') : `${formatSignedPnl(unrealized, 4)} USDT`}
                 valueClassName={unrealized === null ? 'text-white/55' : unrealized > 0 ? 'text-[#00c087]' : unrealized < 0 ? 'text-[#f6465d]' : 'text-white/55'}
               />
@@ -1811,7 +1848,8 @@ function PositionsTable({
               />
               <PositionMetric label={t('margin', 'contracts')} value={`${formatNumber(item.margin_amount, 2)} USDT`} />
               <PositionMetric
-                label={t('unrealizedPnl', 'contracts')}
+                label={t('unrealizedPnlByMark', 'contracts')}
+                labelTitle={t('unrealizedPnlMarkPriceTitle', 'contracts')}
                 value={unrealizedText}
                 valueClassName={unrealized === null ? 'text-white/55' : unrealized > 0 ? 'text-[#00c087]' : unrealized < 0 ? 'text-[#f6465d]' : 'text-white/55'}
               />
@@ -1867,7 +1905,7 @@ function AllPositionsTable({
       <table className="w-full min-w-[1040px] table-fixed text-left text-[12px]">
         <thead className="bg-[#0b0e11] text-[11px] text-white/40">
           <tr>
-            {[t('symbol', 'contracts'), t('direction', 'contracts'), t('leverage', 'contracts'), t('quantity', 'contracts'), t('entryPrice', 'contracts'), t('markPrice', 'contracts'), t('margin', 'contracts'), t('unrealizedPnl', 'contracts'), t('roe', 'contracts'), t('marginRatio', 'contracts'), t('status', 'contracts'), t('operation', 'contracts')].map((head) => (
+            {[t('symbol', 'contracts'), t('direction', 'contracts'), t('leverage', 'contracts'), t('quantity', 'contracts'), t('entryPrice', 'contracts'), t('markPrice', 'contracts'), t('margin', 'contracts'), t('unrealizedPnlByMark', 'contracts'), t('roe', 'contracts'), t('marginRatio', 'contracts'), t('status', 'contracts'), t('operation', 'contracts')].map((head) => (
               <th key={head} className="whitespace-nowrap px-2 py-1.5 font-medium">{head}</th>
             ))}
           </tr>
@@ -2124,68 +2162,6 @@ function formatOptionalTpSlBadge(value: string | number | null | undefined, prec
   return toNumber(value) > 0 ? formatDisplayPrice(value, precision) : null;
 }
 
-function formatOptionalTpSlInput(value: string | number | null | undefined, precision: number) {
-  return toNumber(value) > 0 ? formatRawMarketPrice(value, precision) : '';
-}
-
-function isTpSlPriceValidForSide(
-  side: ContractPositionSide,
-  type: 'TAKE_PROFIT' | 'STOP_LOSS',
-  price: number,
-  markPrice: number,
-) {
-  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(markPrice) || markPrice <= 0) return false;
-  if (side === 'LONG') {
-    return type === 'TAKE_PROFIT' ? price > markPrice : price < markPrice;
-  }
-  return type === 'TAKE_PROFIT' ? price < markPrice : price > markPrice;
-}
-
-function buildTpSlEditorDefaultPrices({
-  side,
-  markPrice,
-  entryPrice,
-  takeProfitPrice,
-  stopLossPrice,
-  pricePrecision,
-}: {
-  side: ContractPositionSide;
-  markPrice: string | number | null;
-  entryPrice: string | number | null | undefined;
-  takeProfitPrice: string | number | null | undefined;
-  stopLossPrice: string | number | null | undefined;
-  pricePrecision: number;
-}) {
-  const referencePrice = toNumber(markPrice) > 0 ? toNumber(markPrice) : toNumber(entryPrice);
-  const currentTakeProfit = formatOptionalTpSlInput(takeProfitPrice, pricePrecision);
-  const currentStopLoss = formatOptionalTpSlInput(stopLossPrice, pricePrecision);
-  const currentTakeProfitNumber = toNumber(currentTakeProfit);
-  const currentStopLossNumber = toNumber(currentStopLoss);
-
-  if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
-    return {
-      takeProfitPrice: currentTakeProfit,
-      stopLossPrice: currentStopLoss,
-    };
-  }
-
-  const defaultTakeProfit = side === 'LONG'
-    ? referencePrice * (1 + TP_SL_DEFAULT_OFFSET_RATE)
-    : referencePrice * (1 - TP_SL_DEFAULT_OFFSET_RATE);
-  const defaultStopLoss = side === 'LONG'
-    ? referencePrice * (1 - TP_SL_DEFAULT_OFFSET_RATE)
-    : referencePrice * (1 + TP_SL_DEFAULT_OFFSET_RATE);
-
-  return {
-    takeProfitPrice: isTpSlPriceValidForSide(side, 'TAKE_PROFIT', currentTakeProfitNumber, referencePrice)
-      ? currentTakeProfit
-      : formatRawMarketPrice(defaultTakeProfit, pricePrecision),
-    stopLossPrice: isTpSlPriceValidForSide(side, 'STOP_LOSS', currentStopLossNumber, referencePrice)
-      ? currentStopLoss
-      : formatRawMarketPrice(defaultStopLoss, pricePrecision),
-  };
-}
-
 function normalizeTpSlInputText(value: string) {
   return value.replace(/,/g, '').trim();
 }
@@ -2301,7 +2277,7 @@ function PositionDetailCard({
         <DetailMetric label={t('takeProfit', 'contracts')} value={takeProfitBadge ?? '--'} />
         <DetailMetric label={t('stopLoss', 'contracts')} value={stopLossBadge ?? '--'} />
         <DetailMetric
-          label={t('unrealizedPnl', 'contracts')}
+          label={t('unrealizedPnlByMark', 'contracts')}
           value={unrealized === null ? truthUnavailableLabel ?? '--' : `${formatSignedPnl(unrealized, 4)} USDT`}
           valueClassName={unrealized === null ? 'text-white/55' : unrealized > 0 ? 'text-[#00c087]' : unrealized < 0 ? 'text-[#f6465d]' : 'text-white/80'}
         />
@@ -2454,9 +2430,11 @@ function TpSlEditorDialog({
   const referencePrice = toNumber(draft.referencePrice);
   const isSummaryTarget = draft.target.mode === 'summary';
   const stepTpSlPrice = (field: 'takeProfitPrice' | 'stopLossPrice', delta: number) => {
+    const originField = field === 'takeProfitPrice' ? 'takeProfitOrigin' : 'stopLossOrigin';
     onChange((current) => current ? {
       ...current,
       [field]: adjustTpSlEditorPrice(current[field], current.referencePrice, delta),
+      [originField]: 'USER',
     } : current);
   };
 
@@ -2487,13 +2465,21 @@ function TpSlEditorDialog({
           <TpSlEditorPriceInput
             label={t('takeProfitPrice', 'contracts')}
             value={draft.takeProfitPrice}
-            onChange={(value) => onChange((current) => current ? { ...current, takeProfitPrice: value } : current)}
+            onChange={(value) => onChange((current) => current ? {
+              ...current,
+              takeProfitPrice: value,
+              takeProfitOrigin: 'USER',
+            } : current)}
             onStep={(delta) => stepTpSlPrice('takeProfitPrice', delta)}
           />
           <TpSlEditorPriceInput
             label={t('stopLossPrice', 'contracts')}
             value={draft.stopLossPrice}
-            onChange={(value) => onChange((current) => current ? { ...current, stopLossPrice: value } : current)}
+            onChange={(value) => onChange((current) => current ? {
+              ...current,
+              stopLossPrice: value,
+              stopLossOrigin: 'USER',
+            } : current)}
             onStep={(delta) => stepTpSlPrice('stopLossPrice', delta)}
           />
         </div>
