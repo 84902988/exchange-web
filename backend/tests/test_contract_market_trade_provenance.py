@@ -17,7 +17,8 @@ from app.services.contract_market_gateway import (
 SYMBOL = "BTCUSDT_PERP"
 
 
-def test_provider_rest_trade_normalization_carries_complete_evidence():
+def test_provider_rest_trade_normalization_carries_complete_evidence(monkeypatch):
+    monkeypatch.setattr(market_service.time, "time", lambda: 1_720_000_000.125)
     trades = market_service._normalize_provider_trade_rows(
         "OKX_SWAP",
         {
@@ -47,10 +48,12 @@ def test_provider_rest_trade_normalization_carries_complete_evidence():
     assert trade["provider"] == "OKX_SWAP"
     assert trade["provider_symbol"] == "BTC-USDT-SWAP"
     assert trade["event_time_ms"] == 1720000000000
+    assert trade["received_at_ms"] == 1720000000125
     assert trade["synthetic"] is False
 
 
 def test_itick_rest_tick_is_a_recent_real_trade_source(monkeypatch):
+    monkeypatch.setattr(market_service.time, "time", lambda: 1_720_000_001.250)
     trade = market_service._normalize_itick_stock_tick_trade(
         symbol="AAPLUSDT_PERP",
         provider_symbol="AAPL",
@@ -69,6 +72,7 @@ def test_itick_rest_tick_is_a_recent_real_trade_source(monkeypatch):
     assert trade["price_source"] == "TRADE_TICK"
     assert trade["freshness"] == "RECENT"
     assert trade["quote_freshness"] == "RECENT"
+    assert trade["received_at_ms"] == 1720000001250
     assert trade["synthetic"] is False
 
     monkeypatch.setattr(gateway_module, "provider_ws_trades_enabled", lambda: False)
@@ -471,6 +475,7 @@ def test_trades_failure_isolated_from_quote_and_depth(monkeypatch):
         object(),
         SYMBOL,
         ensure_provider_ws=False,
+        intervals=[],
     )
 
     assert [message["type"] for message in messages] == [

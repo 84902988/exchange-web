@@ -31,6 +31,7 @@ def _load_provider_ws_module():
         CONTRACT_PROVIDER_WS_ITICK_KLINE_MAX_AGE_MS = 90000
         CONTRACT_PROVIDER_WS_ITICK_KLINE_BROADCAST_INTERVAL_MS = 1000
         CONTRACT_PROVIDER_WS_ITICK_URL = "wss://api.itick.org"
+        CONTRACT_PROVIDER_WS_OKX_PUBLIC_URL = "wss://ws.okx.com:8443/ws/v5/public"
         CONTRACT_PROVIDER_WS_OKX_BUSINESS_URL = "wss://ws.okx.com:8443/ws/v5/business"
         ITICK_API_TOKEN = "test-token"
         ITICK_API_KEY = None
@@ -397,6 +398,59 @@ def test_okx_kline_channel_and_normalizer_still_work():
     assert payload["is_final"] is True
 
 
+def test_okx_trades_channel_uses_public_websocket_endpoint():
+    module = _load_provider_ws_module()
+
+    assert module._okx_trades_ws_url() == "wss://ws.okx.com:8443/ws/v5/public"
+
+
+def test_kline_cache_notifies_only_the_current_provider_generation():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderKlineSubscription(
+        local_symbol="BTCUSDT_PERP",
+        provider=module.PROVIDER_OKX_SWAP,
+        provider_symbol="BTC-USDT-SWAP",
+        interval="1m",
+        channel="candle1m",
+    )
+    key = (module.PROVIDER_OKX_SWAP, "BTCUSDT_PERP", "1m")
+    service._kline_generations[key] = 3
+    accepted = []
+    service.set_kline_revision_listener(accepted.append)
+    payload = {
+        "symbol": "BTCUSDT_PERP",
+        "provider": module.PROVIDER_OKX_SWAP,
+        "provider_symbol": "BTC-USDT-SWAP",
+        "interval": "1m",
+        "open_time": 1_720_000_020_000,
+        "open": "100",
+        "high": "102",
+        "low": "99",
+        "close": "101",
+        "volume": "50",
+        "quote_volume": "5050",
+        "is_closed": False,
+    }
+
+    service._set_kline_cache(subscription, payload, generation=2)
+    assert accepted == []
+    service._set_kline_cache(subscription, payload, generation=3)
+
+    assert len(accepted) == 1
+    assert accepted[0].provider == module.PROVIDER_OKX_SWAP
+    assert accepted[0].symbol == "BTCUSDT_PERP"
+    assert accepted[0].interval == "1m"
+    assert accepted[0].generation == 3
+    assert accepted[0].open_time == 1_720_000_020_000
+    assert accepted[0].revision == (3, 1)
+    assert service.get_kline_generation(
+        "BTCUSDT_PERP",
+        "1m",
+        provider=module.PROVIDER_OKX_SWAP,
+    ) == 3
+
+
 def _load_gateway_module(provider_payload):
     if str(BACKEND) not in sys.path:
         sys.path.insert(0, str(BACKEND))
@@ -462,7 +516,13 @@ def _load_gateway_module(provider_payload):
 
     provider_ws_module = types.ModuleType("app.services.contract_market_provider_ws")
     calls = []
+    provider_ws_module.ContractProviderKlineRevisionAccepted = type(
+        "ContractProviderKlineRevisionAccepted",
+        (),
+        {},
+    )
     provider_ws_module.force_stop_provider_ws_subscriptions_for_symbol = lambda symbol: {}
+    provider_ws_module.get_contract_provider_ws_kline_generation = lambda *args, **kwargs: 0
     provider_ws_module.provider_ws_depth_enabled = lambda: False
     provider_ws_module.provider_ws_kline_enabled = lambda: True
     provider_ws_module.provider_ws_ticker_enabled = lambda: False
@@ -476,6 +536,7 @@ def _load_gateway_module(provider_payload):
     provider_ws_module.select_fresh_provider_ws_kline = select_fresh_provider_ws_kline
     provider_ws_module.select_fresh_provider_ws_ticker = lambda *args, **kwargs: None
     provider_ws_module.select_fresh_provider_ws_trades = lambda *args, **kwargs: None
+    provider_ws_module.set_contract_provider_ws_kline_revision_listener = lambda listener: None
     sys.modules["app.services.contract_market_provider_ws"] = provider_ws_module
 
     module_path = BACKEND / "app" / "services" / "contract_market_gateway.py"
@@ -527,7 +588,9 @@ def test_gateway_kline_falls_back_to_rest_when_provider_ws_missing():
     )
 
     assert payload is not None
-    assert payload["source"] == "REST"
+    assert payload["source"] == "PROVIDER_REST"
+    assert payload["fallback_reason"] == "WS_MISS"
+    assert payload["received_at_ms"] > 0
 
 
 def test_gateway_snapshot_preserves_monthly_interval():
@@ -544,8 +607,28 @@ def test_gateway_domain_snapshots_keep_market_and_kline_payloads_separate():
     module = _load_gateway_module(None)
     gateway = module.ContractMarketGateway()
     symbol = "BTCUSDT_PERP"
+    now_ms = module._utc_ms()
     state = {"symbol": symbol, "display_price": "100"}
-    kline = {"symbol": symbol, "interval": "1M", "close": "101"}
+    kline = {
+        "symbol": symbol,
+        "interval": "1M",
+        "open_time": now_ms - 60_000,
+        "open": "100",
+        "high": "102",
+        "low": "99",
+        "close": "101",
+        "volume": "8",
+    }
+    kline_authority = {
+        **kline,
+        "source": "LIVE_WS",
+        "provider": "OKX_SWAP",
+        "provider_symbol": "BTC-USDT-SWAP",
+        "received_at_ms": now_ms,
+        "provider_generation": 1,
+        "revision_epoch": 1,
+        "revision_sequence": 1,
+    }
 
     gateway._set_latest(module.CONTRACT_MARKET_CACHE_QUOTE, symbol, {"symbol": symbol})
     gateway._set_latest(module.CONTRACT_MARKET_CACHE_DEPTH, symbol, {"symbol": symbol})
@@ -570,7 +653,13 @@ def test_gateway_domain_snapshots_keep_market_and_kline_payloads_separate():
         ],
     )
     gateway._set_latest(module.CONTRACT_MARKET_CACHE_STATE, symbol, state)
-    gateway._set_latest(module.CONTRACT_MARKET_CACHE_KLINE, symbol, kline, interval="1M")
+    gateway._set_latest(
+        module.CONTRACT_MARKET_CACHE_KLINE,
+        symbol,
+        kline,
+        interval="1M",
+        authority_payload=kline_authority,
+    )
 
     market_payload = gateway.market_snapshot_message(symbol)
     assert market_payload["domain"] == "market"
@@ -580,7 +669,10 @@ def test_gateway_domain_snapshots_keep_market_and_kline_payloads_separate():
     kline_payload = gateway.kline_snapshot_message(symbol, "1M")
     assert kline_payload["domain"] == "kline"
     assert kline_payload["interval"] == "1M"
-    assert kline_payload["kline"] == kline
+    assert kline_payload["kline"]["close"] == "101"
+    assert kline_payload["kline"]["volume"] == "8"
+    assert kline_payload["source"] == "LIVE_WS"
+    assert kline_payload["provider_generation"] == 1
     assert "quote" not in kline_payload
     assert "depth" not in kline_payload
     assert "market_state" not in kline_payload
@@ -595,8 +687,33 @@ def test_gateway_kline_snapshot_does_not_refresh_market_domain():
         raise AssertionError("kline snapshot must not refresh the market domain")
 
     def seed_kline(request_symbol, interval, *_args, **_kwargs):
-        kline = {"symbol": request_symbol, "interval": interval, "close": "100"}
-        gateway._set_latest(module.CONTRACT_MARKET_CACHE_KLINE, request_symbol, kline, interval=interval)
+        now_ms = module._utc_ms()
+        kline = {
+            "symbol": request_symbol,
+            "interval": interval,
+            "open_time": now_ms - 60_000,
+            "open": "99",
+            "high": "101",
+            "low": "98",
+            "close": "100",
+            "volume": "5",
+        }
+        gateway._set_latest(
+            module.CONTRACT_MARKET_CACHE_KLINE,
+            request_symbol,
+            kline,
+            interval=interval,
+            authority_payload={
+                **kline,
+                "source": "LIVE_WS",
+                "provider": "OKX_SWAP",
+                "provider_symbol": "BTC-USDT-SWAP",
+                "received_at_ms": now_ms,
+                "provider_generation": 1,
+                "revision_epoch": 1,
+                "revision_sequence": 1,
+            },
+        )
         return kline
 
     gateway._refresh_market_once = fail_market_refresh

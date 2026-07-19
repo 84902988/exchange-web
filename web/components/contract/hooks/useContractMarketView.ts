@@ -1021,6 +1021,7 @@ export function useContractMarketView({
   useEffect(() => {
     const handleKlineMessage = (message: ContractMarketRealtimeMessage) => {
       if (!isContractKlineDomainMessage(message)) return;
+      if (String(message.type || '').toLowerCase() === 'contract_candle_preview_update') return;
       ingestContractMarketWsDomain({
         domain: 'kline',
         message,

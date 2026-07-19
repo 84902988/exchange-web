@@ -2,7 +2,7 @@
 
 import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl';
 
-export type ContractMarketRealtimeEventType = 'quote' | 'depth' | 'trade' | 'kline' | 'state';
+export type ContractMarketRealtimeEventType = 'quote' | 'depth' | 'trade' | 'kline' | 'preview' | 'state';
 export type ContractMarketRealtimeStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 export type ContractMarketRealtimeDomain = 'market' | 'kline';
 
@@ -12,9 +12,18 @@ export type ContractMarketRealtimeMessage = {
   symbol?: string;
   interval?: string;
   source?: string | null;
+  freshness?: string | null;
   quote_source?: string | null;
   kline_mode?: string | null;
   price_source?: string | null;
+  provider?: string | null;
+  provider_generation?: number | null;
+  received_at_ms?: number | null;
+  preview_sequence?: number | null;
+  settlement_revision?: string | null;
+  base_native_revision?: unknown;
+  preview?: unknown;
+  candle_previews?: unknown;
   quote?: unknown;
   depth?: unknown;
   trade?: unknown;
@@ -144,6 +153,7 @@ function getEventType(message: ContractMarketRealtimeMessage): ContractMarketRea
   const type = String(message.type || '').toLowerCase();
 
   if (type.includes('market_state')) return 'state';
+  if (type.includes('candle_preview')) return 'preview';
   if (type.includes('quote')) return 'quote';
   if (type.includes('depth') || type.includes('orderbook')) return 'depth';
   if (type.includes('kline') || type.includes('candle')) return 'kline';
@@ -831,10 +841,24 @@ export class ContractMarketRealtimeClient {
     const eventType = getEventType(message);
     if (!eventType) return;
     if (this.protocolMode === 'domain') {
-      const domainMatches = eventType === 'kline'
+      const domainMatches = eventType === 'kline' || eventType === 'preview'
         ? isContractKlineDomainMessage(message)
         : isContractMarketDomainMessage(message);
       if (!domainMatches) return;
+    }
+    if (eventType === 'trade' && Array.isArray(message.candle_previews)) {
+      for (const item of message.candle_previews) {
+        if (!item || typeof item !== 'object') continue;
+        const preview = item as ContractMarketRealtimeMessage;
+        if (getEventType(preview) !== 'preview') continue;
+        if (
+          normalizeSymbol(preview.symbol || '')
+          !== normalizeSymbol(message.symbol || '')
+        ) continue;
+        // Preview first, then trade, inside the same WebSocket task. TradingView
+        // is committed before React paints the Header trade state.
+        this.dispatch(preview);
+      }
     }
     this.emit(eventType, message);
   }
