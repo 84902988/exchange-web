@@ -28,6 +28,7 @@ import {
   normalizePrivateIdentity,
   scopeContractPrivateCacheKey,
 } from '@/components/contract/contractPrivateIdentity';
+import { ContractPrivateRefreshCoordinator } from './contractPrivateRefreshCoordinator';
 
 export type ContractUserDataTab = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
 
@@ -551,6 +552,8 @@ export function useContractUserState({
   const ordersCacheRef = useRef<Map<string, ListScopeCacheEntry<ContractOrderListItem>>>(new Map());
   const tradesCacheRef = useRef<Map<string, ListScopeCacheEntry<ContractTradeListItem>>>(new Map());
   const allPrefetchInFlightRef = useRef<Promise<void> | null>(null);
+  const privateRefreshCoordinatorRef = useRef(new ContractPrivateRefreshCoordinator());
+  const refreshPrivateReplayRef = useRef<(options?: { silent?: boolean }) => Promise<void>>(async () => undefined);
   const refreshPrivateRequestSeqRef = useRef(0);
   const realtimeVersionRef = useRef(0);
   const lastRealtimeSeqRef = useRef(0);
@@ -671,13 +674,21 @@ export function useContractUserState({
     setTrades(entry.rows);
   }, []);
 
-  const markRealtimeMessage = useCallback((message: ContractUserRealtimeMessage) => {
+  const invalidatePrivateRestBaseline = useCallback(() => {
+    realtimeVersionRef.current += 1;
+    privateRefreshCoordinatorRef.current.replayActive();
+  }, []);
+
+  const markRealtimeMessage = useCallback((
+    message: ContractUserRealtimeMessage,
+    invalidateRestBaseline = true,
+  ) => {
     const seq = getMessageSeq(message);
     if (seq !== null) {
       if (!acceptsContractRealtimeSequence(lastRealtimeSeqRef.current, message)) return false;
       if (seq > lastRealtimeSeqRef.current) {
         lastRealtimeSeqRef.current = seq;
-        realtimeVersionRef.current += 1;
+        if (invalidateRestBaseline) invalidatePrivateRestBaseline();
       }
       return true;
     }
@@ -687,19 +698,22 @@ export function useContractUserState({
       if (serverTs < lastRealtimeTsRef.current) return false;
       if (serverTs > lastRealtimeTsRef.current) {
         lastRealtimeTsRef.current = serverTs;
-        realtimeVersionRef.current += 1;
+        if (invalidateRestBaseline) invalidatePrivateRestBaseline();
       }
     } else {
-      realtimeVersionRef.current += 1;
+      if (invalidateRestBaseline) invalidatePrivateRestBaseline();
     }
     return true;
-  }, []);
+  }, [invalidatePrivateRestBaseline]);
 
   const markScopedRealtimeMessage = useCallback((message: ContractUserRealtimeMessage) => {
     if (!canAcceptContractPrivateResult(normalizedUserIdentity, privateStateIdentityRef.current)) return null;
     const payload = getContractUserPayload(message);
     if (!isContractUserMessageForScope(message, payload, contractSymbol, dataScope)) return null;
-    return markRealtimeMessage(message) ? payload : null;
+    return markRealtimeMessage(
+      message,
+      !isContractPositionMarkOnlyMessage(message),
+    ) ? payload : null;
   }, [contractSymbol, dataScope, markRealtimeMessage, normalizedUserIdentity]);
 
   const updateActivePositionScopeCache = useCallback((
@@ -781,9 +795,6 @@ export function useContractUserState({
     if (!isLoggedIn || !normalizedUserIdentity) return;
 
     const requestedIdentity = normalizedUserIdentity;
-    const requestSeq = refreshPrivateRequestSeqRef.current + 1;
-    refreshPrivateRequestSeqRef.current = requestSeq;
-    const realtimeVersionAtStart = realtimeVersionRef.current;
     const requestedScope = dataScope;
     const requestedActiveTab = activeTab;
     const scopedSymbol = getScopedSymbol(requestedScope, contractSymbol);
@@ -822,6 +833,18 @@ export function useContractUserState({
       requestedTradeHistoryPage,
       requestedTradeHistoryFilters,
     );
+    const privateRefreshKey = [
+      positionScopeKey,
+      positionsPageCacheKey,
+      activeOrdersScopeKey,
+      ordersCacheKey,
+      tradesCacheKey,
+      requestedActiveTab,
+    ].join('|');
+    if (privateRefreshCoordinatorRef.current.request(privateRefreshKey) === 'COALESCED') return;
+    const requestSeq = refreshPrivateRequestSeqRef.current + 1;
+    refreshPrivateRequestSeqRef.current = requestSeq;
+    const realtimeVersionAtStart = realtimeVersionRef.current;
     const shouldRequestPositionsPage = requestedActiveTab === 'positions';
     const shouldRequestActiveOrders = requestedActiveTab === 'openOrders';
     const shouldRequestOrderHistory = requestedActiveTab === 'historyOrders';
@@ -1017,6 +1040,7 @@ export function useContractUserState({
         void prefetchAllPositionScope();
       }
     } finally {
+      const shouldReplay = privateRefreshCoordinatorRef.current.settle(privateRefreshKey);
       if (refreshPrivateRequestSeqRef.current !== requestSeq) {
         return;
       }
@@ -1038,6 +1062,11 @@ export function useContractUserState({
       }
       if (shouldShowLoading) {
         setPrivateLoading(false);
+      }
+      if (shouldReplay && isActivePositionScope()) {
+        queueMicrotask(() => {
+          void refreshPrivateReplayRef.current({ silent: true });
+        });
       }
     }
   }, [
@@ -1061,6 +1090,10 @@ export function useContractUserState({
     tradeHistoryFilters,
     tradeHistoryPage,
   ]);
+
+  useEffect(() => {
+    refreshPrivateReplayRef.current = refreshPrivate;
+  }, [refreshPrivate]);
 
   const refreshPrivateSilently = useCallback(() => refreshPrivate({ silent: true }), [refreshPrivate]);
 
@@ -1240,6 +1273,7 @@ export function useContractUserState({
       ordersCacheRef.current.clear();
       tradesCacheRef.current.clear();
       allPrefetchInFlightRef.current = null;
+      privateRefreshCoordinatorRef.current.reset();
       setPrivateLoading(false);
       setIsScopeSwitching(false);
       setIsAllPositionsLoading(false);
