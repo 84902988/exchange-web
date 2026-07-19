@@ -13,7 +13,6 @@ import {
   type SpotDepthLevel,
   type SpotOrderSide,
 } from '@/lib/api/modules/spot';
-import { getVipFeePreference, getVipOverview } from '@/lib/api/modules/vip';
 import TradingConfirmModal from '@/components/common/TradingConfirmModal';
 import PercentageSlider from './form/PercentageSlider';
 import { useLocaleContext } from '@/contexts/LocaleContext';
@@ -31,6 +30,7 @@ import {
   resolveSpotOrderDepthInteraction,
   type SpotExecutableDepthState,
 } from './spotExecutableDepth';
+import { loadSpotVipBootstrapSingleFlight } from './spotPrivateBootstrap';
 
 interface SpotTradingFormProps {
   symbol: string;
@@ -52,6 +52,7 @@ interface SpotTradingFormProps {
   authLoading?: boolean;
   authChecked?: boolean;
   userId?: number | string | null;
+  userIdentityKey?: string | null;
 }
 
 type PendingSpotOrder = {
@@ -759,6 +760,7 @@ export default function SpotTradingForm({
   authLoading = false,
   authChecked = true,
   userId = null,
+  userIdentityKey = null,
 }: SpotTradingFormProps) {
   const { t: localeT } = useLocaleContext();
   const copy = useMemo(() => buildSpotFormCopy(localeT), [localeT]);
@@ -895,7 +897,7 @@ export default function SpotTradingForm({
   useEffect(() => {
     let alive = true;
 
-    if (!isLoggedIn) {
+    if (!isLoggedIn || !userIdentityKey) {
       setVipMakerFeeRate(null);
       setVipTakerFeeRate(null);
       setUseRcbFee(false);
@@ -906,10 +908,7 @@ export default function SpotTradingForm({
 
     const run = async () => {
       try {
-        const [overview, preference] = await Promise.all([
-          getVipOverview(),
-          getVipFeePreference(),
-        ]);
+        const { overview, preference } = await loadSpotVipBootstrapSingleFlight(userIdentityKey);
         if (!alive) return;
         setVipMakerFeeRate(overview.user_summary?.effective_spot_maker_fee ?? null);
         setVipTakerFeeRate(overview.user_summary?.effective_spot_taker_fee ?? null);
@@ -928,7 +927,7 @@ export default function SpotTradingForm({
     return () => {
       alive = false;
     };
-  }, [isLoggedIn]);
+  }, [isLoggedIn, userIdentityKey]);
 
   useEffect(() => {
     let alive = true;
