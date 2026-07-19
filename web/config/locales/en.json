@@ -2431,7 +2431,7 @@
     "pair": "Pair",
     "direction": "Side",
     "quantity": "Quantity",
-    "estimatedExecutionPrice": "预估成交价",
+    "estimatedExecutionPrice": "Estimated execution price",
     "notionalValue": "Notional",
     "cost": "Cost",
     "currentLeverage": "Current leverage",

@@ -892,7 +892,7 @@ export default function ContractTradingForm({
       },
       { label: t('leverage', 'contracts'), value: `${confirmLeverage || leverage}x` },
       { label: t('margin', 'contracts'), value: displayMoney(confirmMargin, 6) },
-      { label: t('spreadCost', 'contracts'), value: confirmSpreadCost === null ? '--' : `${formatPrice(confirmSpreadCost, 2)} USDT` },
+      { label: t('spreadCost', 'contracts'), value: confirmSpreadCost === null ? '--' : `≈ ${formatPrice(confirmSpreadCost, 2)} USDT` },
       { label: isOpen ? t('estimatedLiquidationPrice', 'contracts') : t('liquidationPriceShort', 'contracts'), value: liquidationPrice },
     ];
   }, [
@@ -1278,7 +1278,7 @@ function OpenPanel({
         <SummaryDualRow label={t('estimatedOpenValue', 'contracts')} longValue={displayMoney(longNotional, 4)} shortValue={displayMoney(shortNotional, 4)} activeSide={positionSide} />
         <SummaryDualRow label={t('estimatedMargin', 'contracts')} longValue={displayMoney(longMargin, 6)} shortValue={displayMoney(shortMargin, 6)} activeSide={positionSide} />
         <SummaryDualRow label={t('estimatedLiquidationPrice', 'contracts')} longValue="--" shortValue="--" activeSide={positionSide} muted />
-        <SummaryRow label={t('spreadCost', 'contracts')} value={spreadCostHint === null ? '--' : `${formatPrice(spreadCostHint, 2)} USDT`} muted title={spreadHintText} />
+        <SummaryRow label={t('spreadCost', 'contracts')} value={spreadCostHint === null ? '--' : `≈ ${formatPrice(spreadCostHint, 2)} USDT`} muted title={spreadHintText} />
         <SummaryRow label={t('currentLeverage', 'contracts')} value={`${leverage}x`} />
         <SummaryRow label={t('riskNotice', 'contracts')} value={t('riskDataUnavailable', 'contracts')} muted />
       </div>
