@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.db.models.contract_position import ContractPosition
 from app.schemas.contract_order import ContractPositionTpSlUpdateRequest, ContractPositionTpSlUpdateResponse
 from app.services.contract_market_service import get_contract_quote
+from app.services.contract_tp_sl_service import resolve_position_tp_sl_trigger_reference
 
 
 class ContractPositionServiceError(ValueError):
@@ -60,19 +61,25 @@ def _normalize_position_side(value: Any) -> str:
     return normalized
 
 
-def _get_mark_price(db: Session, position: ContractPosition) -> Decimal:
+def _get_tp_sl_reference_snapshot(db: Session, position: ContractPosition) -> tuple[Decimal, Decimal]:
+    quote: dict[str, Any] = {}
     try:
         quote = get_contract_quote(db, str(position.symbol))
         mark_price = _q18(quote.get("mark_price"))
-        if mark_price > Decimal("0"):
-            return mark_price
     except Exception:
-        pass
+        mark_price = Decimal("0")
 
-    mark_price = _q18(position.mark_price)
-    if mark_price > Decimal("0"):
-        return mark_price
-    raise ContractPositionQuoteUnavailable("CONTRACT_MARK_PRICE_UNAVAILABLE")
+    if mark_price <= Decimal("0"):
+        mark_price = _q18(position.mark_price)
+        if mark_price > Decimal("0"):
+            quote = {**quote, "mark_price": mark_price}
+    if mark_price <= Decimal("0"):
+        raise ContractPositionQuoteUnavailable("CONTRACT_MARK_PRICE_UNAVAILABLE")
+
+    trigger_price, resolved_mark_price, _ = resolve_position_tp_sl_trigger_reference(db, position, quote)
+    if trigger_price <= Decimal("0"):
+        raise ContractPositionQuoteUnavailable("CONTRACT_TP_SL_REFERENCE_UNAVAILABLE")
+    return trigger_price, resolved_mark_price if resolved_mark_price > Decimal("0") else mark_price
 
 
 def _validate_tp_sl_prices(
@@ -121,7 +128,7 @@ def update_contract_position_tp_sl(
         raise ContractPositionNotOpen("POSITION_NOT_OPEN")
 
     side = _normalize_position_side(position.side)
-    mark_price = _get_mark_price(db, position)
+    trigger_reference_price, mark_price = _get_tp_sl_reference_snapshot(db, position)
 
     position = (
         db.query(ContractPosition)
@@ -144,7 +151,7 @@ def update_contract_position_tp_sl(
 
     _validate_tp_sl_prices(
         side=side,
-        mark_price=mark_price,
+        mark_price=trigger_reference_price,
         take_profit_price=take_profit_price,
         stop_loss_price=stop_loss_price,
     )
