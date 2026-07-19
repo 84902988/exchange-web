@@ -539,7 +539,7 @@
     "accountDistribution": "Account distribution",
     "accountDistributionDesc": "Shows funds across accounts using the current USDT basis.",
     "assetDistribution": "Asset distribution",
-    "assetDistributionDesc": "Shows holdings by current asset quantity.",
+    "assetDistributionDesc": "Shows holdings by USDT value converted at the latest traded price.",
     "noAssetDistribution": "No asset distribution",
     "viewAccountDetails": "View account details",
     "fundingAccountDetails": "Funding account details",

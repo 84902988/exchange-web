@@ -539,7 +539,7 @@
     "accountDistribution": "账户分布",
     "accountDistributionDesc": "按当前 USDT 口径展示各账户资金分布。",
     "assetDistribution": "资产分布",
-    "assetDistributionDesc": "按当前资产数量展示持仓分布。",
+    "assetDistributionDesc": "按最新成交价折算 USDT 资产价值展示持仓分布。",
     "noAssetDistribution": "暂无资产分布",
     "viewAccountDetails": "查看账户详情",
     "fundingAccountDetails": "资金账户详情",

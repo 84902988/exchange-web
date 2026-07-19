@@ -22,6 +22,8 @@ import {
   getContractAccountSummary,
   type ContractAccountSummary,
 } from '@/lib/api/modules/contract';
+import { getSpotMarketTickers } from '@/lib/api/modules/spot';
+import { buildAssetValuationDistribution } from '@/lib/asset/assetDistribution';
 
 import type { Language } from '@/utils/language';
 
@@ -449,6 +451,19 @@ export default function AssetPage() {
   const coins = useMemo(() => coinsQuery.data || [], [coinsQuery.data]);
   const assets = useMemo(() => buildAssets(accountBalances, coins), [accountBalances, coins]);
   const visibleAssets = useMemo(() => assets.filter(hasVisibleAssetBalance), [assets]);
+  const distributionSymbols = useMemo(
+    () => Array.from(
+      new Set(visibleAssets.map((asset) => asset.symbol).filter((symbol) => symbol !== 'USDT')),
+    ),
+    [visibleAssets],
+  );
+  const distributionTickersQuery = useQuery({
+    queryKey: ['assetDistributionTickers', distributionSymbols],
+    queryFn: () => getSpotMarketTickers(distributionSymbols.map((symbol) => `${symbol}USDT`)),
+    enabled: distributionSymbols.length > 0,
+    staleTime: 1000 * 15,
+    retry: 0,
+  });
   const contractAccount = contractAccountQuery.data || zeroContractAccount;
   const fundingDetailRows = useMemo(
     () => buildAccountDetailRows(accountBalances, 'funding', coins),
@@ -575,15 +590,14 @@ export default function AssetPage() {
   }, [accountStats, t]);
 
   const assetDistribution = useMemo(() => {
-    const quantityTotal = visibleAssets.reduce((sum, asset) => sum + asset.total, 0);
-    return visibleAssets.map((asset, index) => ({
-      symbol: asset.symbol,
-      amount: asset.total,
-      precision: asset.displayPrecision,
-      percent: quantityTotal > 0 ? percentOf(asset.total, quantityTotal) : null,
+    return buildAssetValuationDistribution(
+      visibleAssets,
+      distributionTickersQuery.data || [],
+    ).map((item, index) => ({
+      ...item,
       color: ['#26a17b', '#f7931a', '#627eea', '#f0b90b', '#00c087', '#8b5cf6'][index % 6],
     }));
-  }, [visibleAssets]);
+  }, [distributionTickersQuery.data, visibleAssets]);
 
   const filteredAssets = useMemo(() => {
     const keyword = searchKeyword.trim().toLowerCase();
@@ -762,7 +776,10 @@ export default function AssetPage() {
             loading={isLoading}
             onTransferClick={() => openTransfer('funding', 'spot')}
           />
-          <AssetDistributionSection items={assetDistribution} loading={isLoading} />
+          <AssetDistributionSection
+            items={assetDistribution}
+            loading={isLoading || distributionTickersQuery.isLoading}
+          />
         </section>
 
         <section className="mb-6 grid grid-cols-1 gap-4 xl:grid-cols-3">

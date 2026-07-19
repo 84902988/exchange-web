@@ -539,7 +539,7 @@
     "accountDistribution": "帳戶分佈",
     "accountDistributionDesc": "按目前 USDT 口徑展示各帳戶資金分佈。",
     "assetDistribution": "資產分佈",
-    "assetDistributionDesc": "按目前資產數量展示持倉分佈。",
+    "assetDistributionDesc": "按最新成交價折算 USDT 資產價值展示持倉分佈。",
     "noAssetDistribution": "暫無資產分佈",
     "viewAccountDetails": "查看帳戶詳情",
     "fundingAccountDetails": "資金帳戶詳情",
