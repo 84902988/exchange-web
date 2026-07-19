@@ -14,9 +14,8 @@ test('position risk presentation fails closed for stale and unavailable marks', 
   expect(source).toContain('const truthUnavailableLabel = getPositionTruthUnavailableLabel(item);');
 });
 
-test('UPNL margin and liquidation risk use the same position snapshot state', () => {
+test('UPNL and margin presentation use the same position snapshot state', () => {
   expect(source).toContain('const marginRatio = truthUnavailableLabel ?? formatPlainPercent(item.margin_ratio);');
-  expect(source).toContain('const liquidationDistance = truthUnavailableLabel ?? formatLiquidationDistance(item.liquidation_distance, pricePrecision);');
   expect(source).toContain('if (!isPositionMarkSnapshotUsable(record)) return null;');
   expect(source).toContain("unrealized === null ? (truthUnavailableLabel ?? '--')");
 });

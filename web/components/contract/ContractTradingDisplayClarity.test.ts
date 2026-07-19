@@ -6,12 +6,23 @@ function readSource(relativePath: string) {
   return readFileSync(resolve(process.cwd(), relativePath), 'utf8');
 }
 
-test('position metric overflow protection preserves liquidation risk evidence', () => {
+test('active position cards omit liquidation metrics while preserving compact value overflow handling', () => {
   const source = readSource('components/contract/ContractPositionTabs.tsx');
+  const summaryCards = source.slice(
+    source.indexOf('function SummaryPositionsCards'),
+    source.indexOf('function PositionsTable'),
+  );
+  const detailCard = source.slice(
+    source.indexOf('function PositionDetailCard'),
+    source.indexOf('function ClosePositionDialog'),
+  );
 
-  expect(source).toContain("label={t('liquidationPrice', 'contracts')}");
-  expect(source).toContain("label={t('liquidationDistance', 'contracts')}");
-  expect(source).toContain('<RiskBar risk={liquidationRisk} />');
+  expect(summaryCards).not.toContain("label={t('liquidationPrice', 'contracts')}");
+  expect(summaryCards).not.toContain("label={t('liquidationDistance', 'contracts')}");
+  expect(summaryCards).not.toContain('<RiskBar');
+  expect(detailCard).not.toContain("label={t('liquidationPrice', 'contracts')}");
+  expect(detailCard).not.toContain("label={t('liquidationDistance', 'contracts')}");
+  expect(source).not.toContain('function RiskBar');
   expect(source).toContain('truncate whitespace-nowrap font-mono');
   expect(source).toContain('title={value}');
 });
