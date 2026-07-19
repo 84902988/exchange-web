@@ -62,21 +62,14 @@ function appendSessionParams(rawUrl: string, symbol: string) {
   const normalizedSymbol = normalizeSymbol(symbol);
   if (!normalizedSymbol) return '';
 
-  const accessToken = getAccessToken();
   try {
     const url = new URL(rawUrl);
     if (!url.searchParams.has('symbol')) {
       url.searchParams.set('symbol', normalizedSymbol);
     }
-    if (accessToken && !url.searchParams.has('access_token')) {
-      url.searchParams.set('access_token', accessToken);
-    }
     return url.toString();
   } catch {
     const params = new URLSearchParams({ symbol: normalizedSymbol });
-    if (accessToken) {
-      params.set('access_token', accessToken);
-    }
     return rawUrl.includes('?')
       ? `${rawUrl}&${params.toString()}`
       : `${rawUrl}?${params.toString()}`;
@@ -231,7 +224,10 @@ export class ContractUserRealtimeClient {
     this.socketOpenedWithIdentity = identity;
     this.setStatus(this.status === 'disconnected' || this.status === 'reconnecting' ? 'reconnecting' : 'connecting');
 
-    const ws = new WebSocket(wsUrl);
+    const accessToken = getAccessToken();
+    const ws = accessToken
+      ? new WebSocket(wsUrl, ['contract-auth', accessToken])
+      : new WebSocket(wsUrl);
     this.ws = ws;
 
     ws.onopen = () => {
