@@ -123,13 +123,29 @@ test('native newer than Preview is accepted after it catches the trade state', (
   const rebased = compositor.acceptNative(native({
     receivedAtMs: 3_000,
     revision: { epoch: 1, sequence: 2 },
-    bar: { ...native().bar, close: 103, volume: 12 },
+    bar: { ...native().bar, close: 104, high: 104, volume: 12 },
   }))
 
   assert.equal(rebased.reason, 'NATIVE_ACCEPTED')
   assert.equal(rebased.source, 'native')
-  assert.equal(rebased.bar?.close, 103)
+  assert.equal(rebased.bar?.close, 104)
   assert.equal(compositor.getOutput().source, 'native')
+})
+
+test('volume-ahead Native OPEN waits until its close matches the settled trade', () => {
+  const compositor = new SpotTradingViewPreviewCompositor({ symbol: 'BTCUSDT', interval: '1m' })
+  compositor.acceptNative(native())
+  compositor.acceptPreview(preview())
+
+  const ahead = compositor.acceptNative(native({
+    receivedAtMs: 3_000,
+    revision: { epoch: 1, sequence: 2 },
+    bar: { ...native().bar, close: 103, volume: 13 },
+  }))
+
+  assert.equal(ahead.reason, 'NATIVE_OPEN_DEFERRED_TO_PREVIEW')
+  assert.equal(ahead.source, 'preview')
+  assert.equal(ahead.bar?.close, 104)
 })
 
 test('Preview cannot regress the caught-up Native volume on a new baseline', () => {
@@ -139,7 +155,7 @@ test('Preview cannot regress the caught-up Native volume on a new baseline', () 
   compositor.acceptNative(native({
     receivedAtMs: 3_000,
     revision: { epoch: 1, sequence: 2 },
-    bar: { ...native().bar, close: 103, volume: 12 },
+    bar: { ...native().bar, close: 104, high: 104, volume: 12 },
   }))
 
   const rollback = compositor.acceptPreview(preview({
@@ -202,12 +218,15 @@ test('generation change rebases and rejects the previous generation', () => {
 test('symbol and interval scopes are isolated', () => {
   const btc = new SpotTradingViewPreviewCompositor({ symbol: 'BTCUSDT', interval: '1m' })
   const eth = new SpotTradingViewPreviewCompositor({ symbol: 'ETHUSDT', interval: '1m' })
+  const sol = new SpotTradingViewPreviewCompositor({ symbol: 'SOLUSDT', interval: '1m' })
   const fiveMinute = new SpotTradingViewPreviewCompositor({ symbol: 'BTCUSDT', interval: '5m' })
   btc.acceptNative(native())
   eth.acceptNative(native({ symbol: 'ETHUSDT' }))
 
   assert.equal(btc.acceptPreview(preview({ symbol: 'ETHUSDT' })).reason, 'SYMBOL_MISMATCH')
   assert.equal(eth.acceptPreview(preview({ symbol: 'ETHUSDT' })).source, 'preview')
+  assert.equal(sol.acceptNative(native({ symbol: 'SOLUSDT' })).source, 'native')
+  assert.equal(sol.acceptPreview(preview({ symbol: 'SOLUSDT' })).source, 'preview')
   assert.equal(btc.acceptPreview(preview({ interval: '5m' })).reason, 'INTERVAL_MISMATCH')
   assert.equal(fiveMinute.acceptNative(native({ interval: '5m' })).reason, 'UNSUPPORTED_SCOPE')
 })
@@ -242,7 +261,7 @@ test('freshness state records the active bar revision and receive clocks', () =>
   })
 })
 
-test('rebased Preview sequence may reset but same-bar volume cannot regress', () => {
+test('rebased Preview preserves same-candle volume high-water', () => {
   const compositor = new SpotTradingViewPreviewCompositor({ symbol: 'BTCUSDT', interval: '1m' })
   compositor.acceptNative(native())
   compositor.acceptPreview(preview({ previewSeq: 4, bar: { ...preview().bar, volume: 14 } }))
@@ -260,13 +279,14 @@ test('rebased Preview sequence may reset but same-bar volume cannot regress', ()
   }))
   const advanced = compositor.acceptPreview(preview({
     receivedAtMs: 4_010,
-    previewSeq: 2,
+    previewSeq: 1,
     baseNativeRevision: { epoch: 1, sequence: 2 },
-    bar: { ...preview().bar, volume: 15 },
+    bar: { ...preview().bar, close: 105, high: 105, volume: 15 },
   }))
 
   assert.equal(rollback.reason, 'PREVIEW_TRADE_STATE_STALE')
   assert.equal(advanced.source, 'preview')
+  assert.equal(advanced.bar?.close, 105)
   assert.equal(advanced.bar?.volume, 15)
 })
 

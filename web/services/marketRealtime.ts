@@ -19,7 +19,9 @@ export type SpotMarketTradeMessage = {
   source?: string;
   freshness?: string;
   updated_at_ms?: number | string;
+  settlement_revision?: string;
   trade?: unknown;
+  candle_preview?: SpotMarketCandlePreviewMessage;
 };
 
 type SpotMarketDepthMessage = {
@@ -55,6 +57,7 @@ export type SpotMarketCandlePreviewMessage = {
   base_native_revision?: unknown;
   preview_seq?: number | string;
   received_at_ms?: number | string;
+  settlement_revision?: string;
 };
 
 export type SpotMarketRealtimeEventType =
@@ -626,6 +629,16 @@ class SpotMarketRealtimeClient {
     }
 
     if (message.type === 'spot_trade') {
+      const preview = message.candle_preview;
+      if (
+        preview?.type === 'spot_candle_preview_update'
+        && normalizeSymbol(preview.symbol || '') === connection.symbol
+        && this.shouldDispatch(preview, connection, 'kline')
+      ) {
+        // Commit TradingView evidence before React paints the corresponding
+        // trade state; both subscribers run in this single WebSocket task.
+        this.emit('preview', preview);
+      }
       if (this.shouldDispatch(message, connection, 'trades')) {
         this.emit('trade', message);
       }

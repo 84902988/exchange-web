@@ -163,6 +163,54 @@ def _optional_bool(value: Any) -> Optional[bool]:
     return None
 
 
+def _spot_candle_preview_message(
+    symbol: str,
+    interval: str,
+    preview: Any,
+    *,
+    received_at_ms: Any = None,
+) -> dict[str, Any]:
+    raw_preview = (
+        preview.model_dump()
+        if hasattr(preview, "model_dump")
+        else dict(getattr(preview, "__dict__", preview) or {})
+    )
+    preview_payload = {
+        key: _to_str(value) if isinstance(value, Decimal) else value
+        for key, value in raw_preview.items()
+    }
+    revision_epoch = _optional_int(preview_payload.get("revision_epoch"))
+    revision_seq = _optional_int(preview_payload.get("revision_seq"))
+    generation = _optional_int(preview_payload.get("generation"))
+    preview_seq = _optional_int(preview_payload.get("preview_seq"))
+    baseline_source = str(preview_payload.get("baseline_source") or "NATIVE")
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_interval = _normalize_interval(str(interval or "1m"))
+    settlement_revision = (
+        f"spot:{normalized_symbol}:{normalized_interval}:"
+        f"{generation}:{preview_payload.get('open_time')}:"
+        f"{revision_epoch}:{revision_seq}:{preview_seq}"
+    )
+    return {
+        "type": "spot_candle_preview_update",
+        "symbol": normalized_symbol,
+        "interval": normalized_interval,
+        "preview": preview_payload,
+        "source": "CANDLE_PREVIEW",
+        "baseline_source": baseline_source,
+        "baseline_anchor_open_time": preview_payload.get("baseline_anchor_open_time"),
+        "provider": preview_payload.get("provider"),
+        "provider_generation": generation,
+        "base_native_revision": {
+            "epoch": revision_epoch,
+            "sequence": revision_seq,
+        },
+        "preview_seq": preview_seq,
+        "received_at_ms": received_at_ms,
+        "settlement_revision": settlement_revision,
+    }
+
+
 def _client_send_mailbox_item(
     *,
     sequence: int,
@@ -1510,36 +1558,14 @@ class MarketWsManager:
         *,
         received_at_ms: Any = None,
     ) -> None:
-        raw_preview = (
-            preview.model_dump()
-            if hasattr(preview, "model_dump")
-            else dict(getattr(preview, "__dict__", preview) or {})
-        )
-        preview_payload = {
-            key: _to_str(value) if isinstance(value, Decimal) else value
-            for key, value in raw_preview.items()
-        }
-        revision_epoch = _optional_int(preview_payload.get("revision_epoch"))
-        revision_seq = _optional_int(preview_payload.get("revision_seq"))
-        generation = _optional_int(preview_payload.get("generation"))
-        preview_seq = _optional_int(preview_payload.get("preview_seq"))
         await self._send_payload(
             symbol,
-            {
-                "type": "spot_candle_preview_update",
-                "symbol": _normalize_symbol(symbol),
-                "interval": _normalize_interval(str(interval or "1m")),
-                "preview": preview_payload,
-                "source": "CANDLE_PREVIEW",
-                "provider": preview_payload.get("provider"),
-                "provider_generation": generation,
-                "base_native_revision": {
-                    "epoch": revision_epoch,
-                    "sequence": revision_seq,
-                },
-                "preview_seq": preview_seq,
-                "received_at_ms": received_at_ms,
-            },
+            _spot_candle_preview_message(
+                symbol,
+                interval,
+                preview,
+                received_at_ms=received_at_ms,
+            ),
         )
 
     async def _snapshot_payload(self, symbol: str) -> dict:
@@ -1608,6 +1634,8 @@ class MarketWsManager:
         received_at_ms: Any = None,
         time_origin: Any = None,
         created_at: Any = None,
+        candle_preview: Any = None,
+        candle_preview_received_at_ms: Any = None,
     ) -> None:
         """
         增量推送：单笔成交
@@ -1661,6 +1689,16 @@ class MarketWsManager:
             payload["freshness"] = str(freshness)
         if updated_at_ms is not None:
             payload["updated_at_ms"] = updated_at_ms
+        if candle_preview is not None:
+            preview_interval = str(getattr(candle_preview, "interval", "1m") or "1m")
+            preview_message = _spot_candle_preview_message(
+                symbol,
+                preview_interval,
+                candle_preview,
+                received_at_ms=candle_preview_received_at_ms,
+            )
+            payload["candle_preview"] = preview_message
+            payload["settlement_revision"] = preview_message["settlement_revision"]
         await self._send_payload(symbol, payload)
 
     async def send_kline_update(

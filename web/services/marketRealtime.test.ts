@@ -58,3 +58,45 @@ test('preview messages ride only the matching active kline interval', () => {
   assert.deepEqual(messages, [preview])
   unsubscribe()
 })
+
+test('trade settlement emits embedded preview before trade in one websocket task', () => {
+  const { spotMarketRealtime } = loadMarketRealtimeModule()
+  const events: string[] = []
+  const previews: unknown[] = []
+  const trades: unknown[] = []
+  const releasePreview = spotMarketRealtime.subscribe('preview', (message: unknown) => {
+    events.push('preview')
+    previews.push(message)
+  })
+  const releaseTrade = spotMarketRealtime.subscribe('trade', (message: unknown) => {
+    events.push('trade')
+    trades.push(message)
+  })
+  const connection = {
+    symbol: 'BTCUSDT',
+    domains: new Map([['trades', new Set(['market-owner'])]]),
+    klineIntervals: new Map([['1m', new Set(['tv-owner'])]]),
+  }
+  const preview = {
+    type: 'spot_candle_preview_update',
+    symbol: 'BTCUSDT',
+    interval: '1m',
+    settlement_revision: 'spot:BTCUSDT:1m:3:1:3:8:1',
+    preview: { close: '101', volume: '11' },
+  }
+  const trade = {
+    type: 'spot_trade',
+    symbol: 'BTCUSDT',
+    settlement_revision: preview.settlement_revision,
+    trade: { id: 'trade-1', price: '101', amount: '1' },
+    candle_preview: preview,
+  }
+
+  spotMarketRealtime.dispatch(trade, connection)
+
+  assert.deepEqual(events, ['preview', 'trade'])
+  assert.deepEqual(previews, [preview])
+  assert.deepEqual(trades, [trade])
+  releaseTrade()
+  releasePreview()
+})

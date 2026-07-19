@@ -11,8 +11,9 @@ from app.schemas.market import DepthItem, DepthResponse, TradeItem, TradesRespon
 from app.services import market
 from app.services import market_kline_cache
 from app.services import spot_market_gateway as gateway_module
-from app.services.spot_candle_preview import SpotPreviewTradeStatus
+from app.services.spot_candle_preview import SpotCandlePreview, SpotPreviewTradeStatus
 from app.services.spot_market_gateway import SpotMarketGateway
+from app.services.spot_kline_bucket import spot_kline_bucket_start_ms
 from app.services.spot_kline_events import ProviderKlineRevisionAccepted
 
 
@@ -26,6 +27,8 @@ class FakeWsManager:
         self.broadcasts: list[tuple[str, DepthResponse]] = []
         self.ticker_broadcasts: list[tuple[str, dict]] = []
         self.trade_broadcasts: list[dict] = []
+        self.preview_broadcasts: list[dict] = []
+        self.event_order: list[tuple[str, str]] = []
         self.kline_broadcasts: list[dict] = []
         self.kline_call_count = 0
         self.intervals = ["1m"]
@@ -41,6 +44,19 @@ class FakeWsManager:
 
     async def send_trade(self, **kwargs) -> None:
         self.trade_broadcasts.append(kwargs)
+        self.event_order.append(("trade", str(kwargs.get("trade_id") or kwargs.get("id"))))
+
+    async def broadcast_spot_candle_preview_update(
+        self,
+        symbol: str,
+        interval: str,
+        preview: SpotCandlePreview,
+        **kwargs,
+    ) -> None:
+        self.preview_broadcasts.append(
+            {"symbol": symbol, "interval": interval, "preview": preview, **kwargs}
+        )
+        self.event_order.append(("preview", format(preview.close, "f")))
 
     async def send_kline_update(self, **kwargs) -> None:
         raise AssertionError("send_kline_update must not be called for provider kline")
@@ -1479,6 +1495,106 @@ def test_gateway_broadcasts_provider_trade_once() -> None:
         await gateway.release_symbol_if_idle("btcusdt", idle_delay_seconds=0)
         await asyncio.sleep(0.05)
         assert provider.released == ["BTCUSDT"]
+
+    asyncio.run(run())
+
+
+def test_gateway_batches_preview_after_all_corresponding_trades() -> None:
+    async def run() -> None:
+        ws_manager = FakeWsManager()
+        preview_symbol = "SOLUSDT"
+        gateway = SpotMarketGateway(
+            get_kline_generation=lambda _symbol, _interval: 7,
+            ws_manager=ws_manager,
+        )
+        open_time = spot_kline_bucket_start_ms(
+            1_710_000_090_000,
+            "1m",
+            provider="OKX_SPOT",
+        )
+        gateway._accept_candle_preview_native(
+            symbol=preview_symbol,
+            interval="1m",
+            provider="OKX_SPOT",
+            generation=7,
+            kline={
+                "open_time": open_time,
+                "open": "100",
+                "high": "100",
+                "low": "100",
+                "close": "100",
+                "volume": "10",
+                "quote_volume": "1000",
+                "revision_epoch": 1,
+                "revision_seq": 5,
+                "is_closed": False,
+            },
+        )
+        trades = TradesResponse(
+            symbol=preview_symbol,
+            provider="OKX_SPOT",
+            provider_symbol="SOL-USDT",
+            source="LIVE_WS",
+            freshness="LIVE",
+            received_at_ms=open_time + 30_020,
+            trades=[
+                TradeItem(
+                    id="trade-1",
+                    trade_id="trade-1",
+                    provider_trade_id="trade-1",
+                    price="101",
+                    amount="1",
+                    side="BUY",
+                    ts=open_time + 30_000,
+                    event_time_ms=open_time + 30_000,
+                    received_at_ms=open_time + 30_010,
+                    provider="OKX_SPOT",
+                    provider_symbol="SOL-USDT",
+                    source="LIVE_WS",
+                    freshness="LIVE",
+                ),
+                TradeItem(
+                    id="trade-2",
+                    trade_id="trade-2",
+                    provider_trade_id="trade-2",
+                    price="102",
+                    amount="2",
+                    side="BUY",
+                    ts=open_time + 30_001,
+                    event_time_ms=open_time + 30_001,
+                    received_at_ms=open_time + 30_020,
+                    provider="OKX_SPOT",
+                    provider_symbol="SOL-USDT",
+                    source="LIVE_WS",
+                    freshness="LIVE",
+                ),
+            ],
+        )
+
+        await gateway._broadcast_trade_batch(preview_symbol, trades, list(trades.trades))
+
+        assert ws_manager.event_order == [
+            ("trade", "trade-1"),
+            ("trade", "trade-2"),
+            ("preview", "102"),
+        ]
+        assert len(ws_manager.preview_broadcasts) == 1
+        assert [
+            format(item["candle_preview"].close, "f")
+            for item in ws_manager.trade_broadcasts
+        ] == ["101", "102"]
+        assert [
+            item["candle_preview"].preview_seq
+            for item in ws_manager.trade_broadcasts
+        ] == [1, 2]
+        assert all(
+            item["candle_preview_received_at_ms"] is not None
+            for item in ws_manager.trade_broadcasts
+        )
+        preview = ws_manager.preview_broadcasts[0]["preview"]
+        assert preview.volume == 13
+        assert preview.preview_seq == 2
+        assert ws_manager.preview_broadcasts[0]["received_at_ms"] == open_time + 30_020
 
     asyncio.run(run())
 

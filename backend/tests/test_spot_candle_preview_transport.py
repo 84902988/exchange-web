@@ -115,6 +115,92 @@ def test_preview_broadcast_payload_preserves_baseline_authority_fields() -> None
         assert payload["provider_generation"] == 2
         assert payload["preview_seq"] == 5
         assert payload["base_native_revision"] == {"epoch": 3, "sequence": 8}
+        assert payload["baseline_source"] == "NATIVE"
+        assert payload["preview"]["baseline_source"] == "NATIVE"
+
+        rollover = SpotCandlePreview(
+            **{
+                **preview.__dict__,
+                "open_time": preview.open_time + 60_000,
+                "open": Decimal("107"),
+                "high": Decimal("107"),
+                "low": Decimal("107"),
+                "close": Decimal("107"),
+                "volume": Decimal("1"),
+                "quote_volume": Decimal("107"),
+                "preview_seq": 1,
+                "applied_trade_count": 1,
+                "baseline_source": "TRADE_ROLLOVER",
+                "baseline_anchor_open_time": preview.open_time,
+            }
+        )
+        await manager.broadcast_spot_candle_preview_update(
+            "BTCUSDT",
+            "1m",
+            rollover,
+            received_at_ms=1_710_000_120_100,
+        )
+        rollover_payload = captured[-1][1]
+        assert rollover_payload["baseline_source"] == "TRADE_ROLLOVER"
+        assert rollover_payload["baseline_anchor_open_time"] == preview.open_time
+        assert rollover_payload["preview"]["volume"] == "1"
+
+    asyncio.run(run())
+
+
+def test_trade_payload_embeds_the_same_preview_settlement_revision() -> None:
+    async def run() -> None:
+        manager = MarketWsManager()
+        captured: list[tuple[str, dict]] = []
+
+        async def capture(symbol: str, payload: dict) -> None:
+            captured.append((symbol, payload))
+
+        manager._send_payload = capture
+        preview = SpotCandlePreview(
+            symbol="BTCUSDT",
+            interval="1m",
+            provider="OKX_SPOT",
+            open_time=1_710_000_060_000,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("101"),
+            volume=Decimal("12"),
+            quote_volume=Decimal("1212"),
+            revision_epoch=3,
+            revision_seq=8,
+            generation=2,
+            preview_seq=5,
+            applied_trade_count=5,
+        )
+
+        await manager.send_trade(
+            symbol="BTCUSDT",
+            id="trade-5",
+            trade_id="trade-5",
+            provider_trade_id="trade-5",
+            price="101",
+            amount="1",
+            side="buy",
+            ts=1_710_000_090_000,
+            event_time_ms=1_710_000_090_000,
+            received_at_ms=1_710_000_090_100,
+            provider="OKX_SPOT",
+            source="LIVE_WS",
+            freshness="LIVE",
+            candle_preview=preview,
+            candle_preview_received_at_ms=1_710_000_090_100,
+        )
+
+        assert len(captured) == 1
+        _, trade_payload = captured[0]
+        embedded = trade_payload["candle_preview"]
+        assert embedded["type"] == "spot_candle_preview_update"
+        assert embedded["preview"]["close"] == trade_payload["trade"]["price"]
+        assert embedded["preview"]["volume"] == "12"
+        assert trade_payload["settlement_revision"] == embedded["settlement_revision"]
+        assert embedded["settlement_revision"].endswith(":3:8:5")
 
     asyncio.run(run())
 
