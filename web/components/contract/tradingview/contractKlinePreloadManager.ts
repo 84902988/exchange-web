@@ -30,12 +30,15 @@ type ContractKlineLeaseEntry = {
   leaseId: number;
   key: string;
   role: ContractKlineRequestRole;
+  ownerTracked: boolean;
+  owners: Set<string>;
   revision: number;
   coverage: number;
   requestedCoverage: number;
   deadlineAt: number;
   retired: boolean;
   timeoutHandle: unknown;
+  abortController: AbortController;
   promise: Promise<ContractMarketKlineMetadataResponse>;
   resolve: (value: ContractMarketKlineMetadataResponse) => void;
   reject: (reason: unknown) => void;
@@ -45,6 +48,7 @@ export type ContractKlineRequestLease = {
   leaseId: number;
   role: ContractKlineRequestRole;
   revision: number;
+  signal: AbortSignal;
   isCurrent: () => boolean;
 };
 
@@ -52,6 +56,7 @@ export type ContractKlineLeaseRequest = {
   key: string;
   coverage: number;
   role: ContractKlineRequestRole;
+  ownerId?: string | null;
   deadlineMs: number;
   deadlineAt?: number;
   request: (
@@ -176,6 +181,21 @@ export class ContractKlineRequestLeaseRegistry {
     }
     const existing = this.entries.get(key);
     if (existing && !existing.retired) {
+      const incomingOwnerId = String(params.ownerId || '').trim() || null;
+      if (
+        params.role === 'active'
+        && existing.role === 'active'
+        && incomingOwnerId !== null
+        && existing.ownerTracked
+        && existing.owners.size === 0
+      ) {
+        this.retire(existing, 'superseded active history owner');
+        return this.start({ ...params, key, coverage });
+      }
+      if (incomingOwnerId !== null) {
+        existing.ownerTracked = true;
+        existing.owners.add(incomingOwnerId);
+      }
       existing.requestedCoverage = Math.max(existing.requestedCoverage, coverage);
       this.tightenDeadline(existing, params.deadlineMs, params.deadlineAt);
       return existing.promise.then((response) => {
@@ -198,6 +218,14 @@ export class ContractKlineRequestLeaseRegistry {
     });
   }
 
+  releaseOwner(ownerId: string) {
+    const normalizedOwnerId = String(ownerId || '').trim();
+    if (!normalizedOwnerId) return;
+    for (const entry of this.entries.values()) {
+      entry.owners.delete(normalizedOwnerId);
+    }
+  }
+
   get hasActiveRequest() {
     return Array.from(this.entries.values()).some((entry) => (
       !entry.retired && entry.role === 'active'
@@ -213,6 +241,7 @@ export class ContractKlineRequestLeaseRegistry {
       leaseId: entry.leaseId,
       key: entry.key,
       role: entry.role,
+      ownerIds: Array.from(entry.owners),
       revision: entry.revision,
       coverage: entry.coverage,
       requestedCoverage: entry.requestedCoverage,
@@ -245,12 +274,15 @@ export class ContractKlineRequestLeaseRegistry {
       leaseId,
       key: params.key,
       role: params.role,
+      ownerTracked: Boolean(String(params.ownerId || '').trim()),
+      owners: new Set(String(params.ownerId || '').trim() ? [String(params.ownerId).trim()] : []),
       revision,
       coverage: params.coverage,
       requestedCoverage: params.coverage,
       deadlineAt,
       retired: false,
       timeoutHandle: null,
+      abortController: new AbortController(),
       promise,
       resolve,
       reject,
@@ -272,6 +304,7 @@ export class ContractKlineRequestLeaseRegistry {
       leaseId,
       role: params.role,
       revision,
+      signal: entry.abortController.signal,
       isCurrent: () => !entry.retired && this.entries.get(entry.key) === entry,
     };
     try {
@@ -308,6 +341,7 @@ export class ContractKlineRequestLeaseRegistry {
       if (entry.retired || this.entries.get(entry.key) !== entry) return;
       entry.retired = true;
       this.entries.delete(entry.key);
+      entry.abortController.abort();
       entry.reject(new ContractKlineLeaseTimeoutError(entry.key, entry.leaseId));
     }, remainingMs);
   }
@@ -332,6 +366,7 @@ export class ContractKlineRequestLeaseRegistry {
     entry.retired = true;
     this.clock.clearTimeout(entry.timeoutHandle);
     this.entries.delete(entry.key);
+    entry.abortController.abort();
     const identity = getRangeKeyIdentity(entry.key);
     recordContractKlineLifecycleEvent({
       event: 'lease_retired',

@@ -38,7 +38,10 @@ import {
   getContractKlineLoadPolicy,
   resolveContractKlineRequestPlan,
 } from './contractKlineLoadPolicy';
-import { contractKlineRequestLeaseRegistry } from './contractKlinePreloadManager';
+import {
+  ContractKlineLeaseTimeoutError,
+  contractKlineRequestLeaseRegistry,
+} from './contractKlinePreloadManager';
 import type { KlineLifecycleRearmPermit } from '@/components/tradingview/klineLifecycleRuntimeCoordinator';
 
 export type ContractTradingViewResolution = '1' | '5' | '15' | '30' | '60' | '240' | '1D' | '1W' | '1M';
@@ -324,6 +327,7 @@ export function buildContractKlineInFlightKey(params: ContractKlineInFlightReque
 function getContractMarketKlinesMetadataInFlight(
   params: Omit<ContractKlineInFlightRequest, 'endTimeMs'> & { endTimeMs?: number },
   deadlineAt?: number,
+  ownerId?: string,
 ) {
   const key = buildContractKlineInFlightKey(params);
   const policy = getContractKlineLoadPolicy(params.interval);
@@ -331,12 +335,13 @@ function getContractMarketKlinesMetadataInFlight(
     key,
     coverage: params.limit,
     role: 'active',
+    ownerId,
     deadlineMs: policy.requestDeadlineMs,
     deadlineAt,
-    request: (coverage) => getContractMarketKlinesMetadata({
+    request: (coverage, lease) => getContractMarketKlinesMetadata({
       ...params,
       limit: coverage,
-    }),
+    }, { signal: lease.signal }),
   });
 }
 
@@ -344,6 +349,7 @@ async function getContractMarketKlinesMetadataCurrentCacheFirst(
   params: Omit<ContractKlineInFlightRequest, 'endTimeMs'>,
   category: ContractKlineAssetClass,
   deadlineAt?: number,
+  ownerId?: string,
 ) {
   const cacheParams = { ...params, category };
   const cached = contractKlineCurrentCache.getAtLeast(cacheParams);
@@ -351,7 +357,7 @@ async function getContractMarketKlinesMetadataCurrentCacheFirst(
   const result = await getContractMarketKlinesMetadataInFlight({
     ...params,
     endTimeMs: undefined,
-  }, deadlineAt);
+  }, deadlineAt, ownerId);
   contractKlineCurrentCache.set(
     cacheParams,
     result,
@@ -888,6 +894,7 @@ type LoadContractKlineBarsForCountBackOptions = {
   pageLimit: number;
   toTimeMs: number;
   deadlineAt: number;
+  ownerId: string;
   isActive: () => boolean;
 };
 
@@ -939,6 +946,7 @@ async function loadContractKlineBarsForCountBack({
   pageLimit,
   toTimeMs,
   deadlineAt,
+  ownerId,
   isActive,
 }: LoadContractKlineBarsForCountBackOptions): Promise<LoadContractKlineBarsForCountBackResult> {
   const barsByTime = new Map<number, ContractTradingViewBar>();
@@ -985,13 +993,13 @@ async function loadContractKlineBarsForCountBack({
           symbol,
           interval,
           limit,
-        }, category, deadlineAt)
+        }, category, deadlineAt, ownerId)
         : await getContractMarketKlinesMetadataInFlight({
           symbol,
           interval,
           limit,
           endTimeMs: pageEndTimeMs,
-        }, deadlineAt);
+        }, deadlineAt, ownerId);
     } catch (error) {
       if (barsByTime.size === 0) throw error;
       break;
@@ -1736,7 +1744,7 @@ export function createContractTradingViewDatafeed({
       );
 
       try {
-        const result = await loadContractKlineBarsForCountBack({
+        const loadBars = (deadlineAt: number) => loadContractKlineBarsForCountBack({
           symbol: requestSymbol,
           category: assetClass,
           interval,
@@ -1751,9 +1759,22 @@ export function createContractTradingViewDatafeed({
           requiredBars: targetRequiredBars,
           pageLimit,
           toTimeMs,
-          deadlineAt: historyChainDeadlineAt,
+          deadlineAt,
+          ownerId: String(datafeedInstanceId),
           isActive: () => requestGuard.isActive(requestToken),
         });
+        let result;
+        try {
+          result = await loadBars(historyChainDeadlineAt);
+        } catch (error) {
+          if (
+            !(error instanceof ContractKlineLeaseTimeoutError)
+            || !requestGuard.isActive(requestToken)
+          ) {
+            throw error;
+          }
+          result = await loadBars(Date.now() + policy.historyChainDeadlineMs);
+        }
         const bars = result.bars
           .filter((bar) => bar.time < toTimeMs)
           .slice(-requiredBars);
@@ -2348,6 +2369,7 @@ export function createContractTradingViewDatafeed({
       const activeResolutionIdentities = Array.from(activeResolutionIdentityBySymbol.values());
       destroyed = true;
       requestGuard.destroy();
+      contractKlineRequestLeaseRegistry.releaseOwner(String(datafeedInstanceId));
       historyCoverageByScope.clear();
       monthlyHistoryTerminalCandidates.clear();
       historyReadyByLatestBarKey.clear();

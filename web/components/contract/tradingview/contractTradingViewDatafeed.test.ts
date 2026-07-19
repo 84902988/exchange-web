@@ -1394,12 +1394,13 @@ test('expired CRYPTO 1m current L1 entry refetches and writes a fresh five-secon
   datafeed.destroy();
 });
 
-test('UNKNOWN to real category rebuild cancels old callbacks while sharing the same C1 request', async () => {
-  const pending = deferred<KlineMetadata>();
+test('UNKNOWN to real category rebuild replaces an abandoned C1 request and fences its late response', async () => {
+  const abandoned = deferred<KlineMetadata>();
+  const replacement = deferred<KlineMetadata>();
   let apiCalls = 0;
   requestKlines = async () => {
     apiCalls += 1;
-    return pending.promise;
+    return apiCalls === 1 ? abandoned.promise : replacement.promise;
   };
   const symbol = 'ASYNC_CATEGORY_PERP';
   const oldHistory: HistoryCall[] = [];
@@ -1432,22 +1433,24 @@ test('UNKNOWN to real category rebuild cancels old callbacks while sharing the s
     (bars: any[], meta: { noData?: boolean }) => newHistory.push({ bars, meta }),
     assert.fail,
   );
-  assert.equal(apiCalls, 1);
+  assert.equal(apiCalls, 2);
 
-  pending.resolve(metadata(pageEndingAt(1_717_100_000_000, 100, '103')));
-  await Promise.all([oldRequest, newRequest]);
+  replacement.resolve(metadata(pageEndingAt(1_717_100_000_000, 100, '103')));
+  await newRequest;
+  abandoned.resolve(metadata(pageEndingAt(1_717_100_000_000, 100, '101')));
+  await oldRequest;
   await Promise.resolve();
 
   assert.deepEqual(oldHistory, []);
   assert.deepEqual(oldLatest, []);
   assert.equal(newHistory.length, 1);
   assert.deepEqual(newLatest, ['103']);
-  assert.ok(currentCacheModule.contractKlineCurrentCache.get({
+  assert.equal(currentCacheModule.contractKlineCurrentCache.get({
     category: 'UNKNOWN',
     symbol,
     interval: '1m',
     limit: 100,
-  }));
+  }), null);
   assert.ok(currentCacheModule.contractKlineCurrentCache.get({
     category: 'STOCK',
     symbol,
@@ -1460,7 +1463,7 @@ test('UNKNOWN to real category rebuild cancels old callbacks while sharing the s
     interval: '1m',
     limit: 100,
   }), null);
-  assert.equal(currentCacheModule.contractKlineCurrentCache.size, 2);
+  assert.equal(currentCacheModule.contractKlineCurrentCache.size, 1);
   stock.destroy();
 });
 
@@ -2116,6 +2119,39 @@ test('shared rejected request settles every live caller once through error callb
   retry.destroy();
   first.destroy();
   second.destroy();
+});
+
+test('current history retries one transient lease timeout before settling TradingView', async () => {
+  let apiCalls = 0;
+  requestKlines = async () => {
+    apiCalls += 1;
+    if (apiCalls === 1) {
+      throw new preloadManagerModule.ContractKlineLeaseTimeoutError(
+        'LEASE_RETRY_PERP|1m|CURRENT',
+        1,
+      );
+    }
+    return metadata(pageEndingAt(1_717_100_000_000, 100, '107'));
+  };
+  const history: HistoryCall[] = [];
+  const errors: string[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'LEASE_RETRY_PERP',
+  });
+
+  await datafeed.getBars(
+    symbolInfo('LEASE_RETRY_PERP'),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => history.push({ bars, meta }),
+    (reason: string) => errors.push(reason),
+  );
+
+  assert.equal(apiCalls, 2);
+  assert.equal(history.length, 1);
+  assert.equal(history[0].bars.at(-1)?.close, 107);
+  assert.deepEqual(errors, []);
+  datafeed.destroy();
 });
 
 

@@ -186,6 +186,38 @@ test('deadline retires a lease and ignores its late producer result', async () =
   assert.equal(current.items.length, 60);
 });
 
+test('new active datafeed owner replaces an abandoned lease for the same history range', async () => {
+  const registry = new managerModule.ContractKlineRequestLeaseRegistry();
+  const abandoned = deferred<any>();
+  const replacement = deferred<any>();
+  let requestCount = 0;
+  const observed = { abandonedSignal: null as AbortSignal | null };
+  const base = {
+    key: 'BTCUSDT_PERP|1m|CURRENT',
+    coverage: 150,
+    role: 'active',
+    deadlineMs: 1_000,
+    request: (_coverage: number, lease: { signal: AbortSignal }) => {
+      requestCount += 1;
+      if (requestCount === 1) observed.abandonedSignal = lease.signal;
+      return requestCount === 1 ? abandoned.promise : replacement.promise;
+    },
+  };
+
+  const first = registry.request({ ...base, ownerId: 'datafeed-1' });
+  registry.releaseOwner('datafeed-1');
+  const second = registry.request({ ...base, ownerId: 'datafeed-2' });
+
+  assert.equal(requestCount, 2);
+  assert.equal(observed.abandonedSignal?.aborted, true);
+  await assert.rejects(first, { name: 'ContractKlineLeaseRetiredError' });
+  replacement.resolve(metadata(150));
+  assert.equal((await second).items.length, 150);
+  abandoned.resolve(metadata(150));
+  await flushPromises();
+  assert.equal(registry.size, 0);
+});
+
 test('absolute history-chain deadline caps every lease and blocks late page starts', async () => {
   const clock = new FakeClock();
   const registry = new managerModule.ContractKlineRequestLeaseRegistry(clock);
