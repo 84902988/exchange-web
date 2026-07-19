@@ -13,7 +13,6 @@ import SpotAssetInfo from './SpotAssetInfo';
 import SpotOrderTabs from './SpotOrderTabs';
 import { useAuth } from '@/lib/authContext';
 import {
-  getSpotAccountBalances,
   getSpotMarketPairs,
   getSpotMarketTickers,
   normalizeSpotDataSource,
@@ -22,6 +21,7 @@ import {
   type SpotMarketTickerItem,
   type SpotMarketView,
 } from '@/lib/api/modules/spot';
+import { loadSpotAccountBalancesSingleFlight } from './spotPrivateBootstrap';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import { useSpotMarket } from './useSpotMarket';
 import type { SpotNativeCandleDisplayPrice } from './spotDisplayPrice';
@@ -600,7 +600,7 @@ function getToolbarInitialCategory(category?: string): 'rwa' | undefined {
 export default function SpotPage({ initialSymbol, initialCategory }: SpotPageProps) {
   const router = useRouter();
   const { t } = useLocaleContext();
-  const { user, isLoggedIn, loading: authLoading, authChecked } = useAuth();
+  const { user, userIdentityKey, isLoggedIn, loading: authLoading, authChecked } = useAuth();
   const hasInitialSymbol = Boolean(String(initialSymbol || '').trim());
   const initialSpotSymbol = normalizeSpotApiSymbol(initialSymbol || DEFAULT_SPOT_SYMBOL) || DEFAULT_SPOT_SYMBOL;
   const [symbol, setSymbol] = useState(initialSpotSymbol);
@@ -637,6 +637,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
   const accountBalancesLoadedRef = useRef(false);
   const accountBalancesInFlightRef = useRef(false);
+  const accountBalancesIdentityRef = useRef<string | null>(null);
   const accountBalancesRequestSeqRef = useRef(0);
   const lastAccountBalancesStartedAtRef = useRef(0);
   const [pairQuery, setPairQuery] = useState<SpotPairQuery>(() => getInitialPairQuery(initialCategory));
@@ -1005,11 +1006,21 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   }, [hasInitialSymbol, initialCategory, pairOptions, pairOptionsQueryKey, router, symbol]);
 
   const loadAccountBalances = useCallback(async (options?: { force?: boolean; silent?: boolean }) => {
-    if (!isLoggedIn) {
+    if (!isLoggedIn || !userIdentityKey) {
+      accountBalancesIdentityRef.current = null;
       accountBalancesLoadedRef.current = false;
       accountBalancesInFlightRef.current = false;
       setAccountBalances([]);
       return;
+    }
+
+    if (accountBalancesIdentityRef.current !== userIdentityKey) {
+      accountBalancesIdentityRef.current = userIdentityKey;
+      accountBalancesLoadedRef.current = false;
+      accountBalancesInFlightRef.current = false;
+      accountBalancesRequestSeqRef.current += 1;
+      lastAccountBalancesStartedAtRef.current = 0;
+      setAccountBalances([]);
     }
 
     const now = Date.now();
@@ -1033,7 +1044,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       if (shouldShowLoading) {
         setBalancesLoading(true);
       }
-      const data = await getSpotAccountBalances();
+      const data = await loadSpotAccountBalancesSingleFlight(userIdentityKey);
       if (accountBalancesRequestSeqRef.current !== requestSeq) {
         return;
       }
@@ -1049,7 +1060,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         setBalancesLoading(false);
       }
     }
-  }, [isLoggedIn]);
+  }, [isLoggedIn, userIdentityKey]);
 
   useEffect(() => {
     void loadAccountBalances({
@@ -1060,6 +1071,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
   useEffect(() => {
     if (!isLoggedIn) {
+      accountBalancesIdentityRef.current = null;
       return undefined;
     }
 
@@ -1110,6 +1122,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
 
   useEffect(() => {
     if (!isLoggedIn) {
+      accountBalancesIdentityRef.current = null;
       accountBalancesLoadedRef.current = false;
       accountBalancesInFlightRef.current = false;
       accountBalancesRequestSeqRef.current += 1;
@@ -1791,6 +1804,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                 authLoading={authLoading}
                 authChecked={authChecked}
                 userId={user?.id ?? null}
+                userIdentityKey={userIdentityKey}
               />
             </div>
           </div>
