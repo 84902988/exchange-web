@@ -798,6 +798,7 @@ function ContractPageContent() {
                     pricePrecision={pricePrecision}
                     amountPrecision={currentContractPair.amountPrecision}
                     referencePrice={referencePrice}
+                    positions={openPositionsForTrading}
                     priceDirection={currentPriceDirection}
                     onLatestKlineCloseChange={handleLatestKlineCloseChange}
                   />

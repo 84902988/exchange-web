@@ -11,6 +11,7 @@ import {
 } from 'react';
 import Script from 'next/script';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import type { ContractPositionItem } from '@/lib/api/modules/contract';
 import {
   contractIntervalToTradingViewResolution,
   createContractTradingViewDatafeed,
@@ -32,6 +33,11 @@ import {
   type ContractPriceDirection,
   type ContractTradingViewOverlayChart,
 } from './tradingview/contractTradingViewPriceOverlay';
+import {
+  buildContractTradingViewPositionLines,
+  ContractTradingViewPositionLinesController,
+  type ContractTradingViewPositionLine,
+} from './tradingview/contractTradingViewPositionLines';
 import type { ContractReferencePrice } from './contractPriceAuthority';
 import { setSpotToolbarLoadingState } from '@/components/spot/tradingview/spotTradingViewResolutionState';
 import {
@@ -124,6 +130,7 @@ type ContractTradingViewChartProps = {
   pricePrecision?: number | null;
   amountPrecision?: number | null;
   referencePrice: ContractReferencePrice;
+  positions?: ContractPositionItem[];
   priceDirection?: ContractPriceDirection;
   onChartModeChange?: (value: ContractChartMode) => void;
   onIntervalChange?: (value: string) => void;
@@ -1042,6 +1049,7 @@ export default function ContractTradingViewChart({
   pricePrecision,
   amountPrecision,
   referencePrice,
+  positions = [],
   priceDirection = 'flat',
   onChartModeChange,
   onIntervalChange,
@@ -1053,6 +1061,7 @@ export default function ContractTradingViewChart({
   const datafeedRef = useRef<ReturnType<typeof createContractTradingViewDatafeed> | null>(null);
   const priceOverlayControllerRef = useRef<ContractTradingViewPriceOverlayController | null>(null);
   const priceOverlayLifecycleRef = useRef<ContractPriceOverlayLifecycle | null>(null);
+  const positionLinesControllerRef = useRef<ContractTradingViewPositionLinesController | null>(null);
   const referenceViewportCoordinatorRef = useRef(new ContractReferenceViewportCoordinator());
   const referenceViewportReadyScopeRef = useRef('');
   const overlayIntervalRef = useRef('');
@@ -1103,6 +1112,22 @@ export default function ContractTradingViewChart({
     () => resolveContractTradingViewOverlayPrice(referencePrice, normalizedSymbol),
     [normalizedSymbol, referencePrice],
   );
+  const positionLinesSignature = positions.map((position) => [
+    position.id,
+    position.symbol,
+    position.side,
+    position.status,
+    position.quantity,
+    position.entry_price,
+    position.take_profit_price,
+    position.stop_loss_price,
+  ].join(':')).join('|');
+  const positionLines = useMemo(
+    () => buildContractTradingViewPositionLines(positions, normalizedSymbol),
+    // Realtime mark/PnL snapshots intentionally do not rebuild drawing inputs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [normalizedSymbol, positionLinesSignature],
+  );
   const widgetKey = buildContractWidgetIdentityKey({
     symbol: normalizedSymbol,
     category: canonicalCategory,
@@ -1134,6 +1159,10 @@ export default function ContractTradingViewChart({
   const onChartModeChangeRef = useRef(onChartModeChange);
   const onIntervalChangeRef = useRef(onIntervalChange);
   const onLatestKlineCloseChangeRef = useRef(onLatestKlineCloseChange);
+  const positionLinesInputRef = useRef<{ symbol: string; lines: ContractTradingViewPositionLine[] }>({
+    symbol: normalizedSymbol,
+    lines: positionLines,
+  });
 
   const [loadingCoordinator] = useState(() => (
     new ContractChartLoadingCoordinator({
@@ -1156,6 +1185,7 @@ export default function ContractTradingViewChart({
     onChartModeChangeRef.current = onChartModeChange;
     onIntervalChangeRef.current = onIntervalChange;
     onLatestKlineCloseChangeRef.current = onLatestKlineCloseChange;
+    positionLinesInputRef.current = { symbol: normalizedSymbol, lines: positionLines };
   }, [
     activeInterval,
     activeIntervals,
@@ -1168,6 +1198,7 @@ export default function ContractTradingViewChart({
     onIntervalChange,
     onLatestKlineCloseChange,
     overlayPrice,
+    positionLines,
     priceDirection,
     widgetInterval,
     widgetKey,
@@ -1192,6 +1223,11 @@ export default function ContractTradingViewChart({
   const updatePriceOverlay = useCallback(() => {
     getPriceOverlayLifecycle().update(priceOverlayInput());
   }, [getPriceOverlayLifecycle, priceOverlayInput]);
+
+  const updatePositionLines = useCallback(() => {
+    const input = positionLinesInputRef.current;
+    positionLinesControllerRef.current?.update(input.symbol, input.lines);
+  }, []);
 
   const suspendPriceOverlay = useCallback(() => {
     getPriceOverlayLifecycle().suspend();
@@ -1266,6 +1302,11 @@ export default function ContractTradingViewChart({
     updatePriceOverlay();
     ensureReferencePriceViewport(effectiveInterval);
   }, [effectiveInterval, ensureReferencePriceViewport, normalizedSymbol, overlayPrice, priceDirection, updatePriceOverlay]);
+
+  useEffect(() => {
+    positionLinesInputRef.current = { symbol: normalizedSymbol, lines: positionLines };
+    updatePositionLines();
+  }, [normalizedSymbol, positionLines, updatePositionLines]);
 
   const startChartLoading = useCallback((reason: string) => {
     setLoadError(null);
@@ -1859,6 +1900,8 @@ export default function ContractTradingViewChart({
       priceOverlayLifecycleRef.current?.destroy();
       priceOverlayLifecycleRef.current = null;
       priceOverlayControllerRef.current = null;
+      positionLinesControllerRef.current?.destroy();
+      positionLinesControllerRef.current = null;
       overlayIntervalRef.current = '';
       referenceViewportCoordinatorRef.current.reset();
       referenceViewportReadyScopeRef.current = '';
@@ -2182,8 +2225,19 @@ export default function ContractTradingViewChart({
           chart as ContractTradingViewOverlayChart,
         );
       }
+      if (
+        chart.createShape
+        && chart.getShapeById
+        && chart.removeEntity
+        && !positionLinesControllerRef.current
+      ) {
+        positionLinesControllerRef.current = new ContractTradingViewPositionLinesController(
+          chart as ContractTradingViewOverlayChart,
+        );
+      }
       chartReadyRef.current = true;
       updatePriceOverlay();
+      updatePositionLines();
       const activeResolution = readContractActiveTradingViewResolution(chart);
       activeTradingViewResolutionRef.current = activeResolution || initialResolution;
       const candidate = lifecycleRuntimeCoordinatorRef.current?.snapshot().candidate;
@@ -2304,6 +2358,7 @@ export default function ContractTradingViewChart({
     startChartLoading,
     suspendPriceOverlay,
     updatePriceOverlay,
+    updatePositionLines,
     widgetKey,
   ]);
 

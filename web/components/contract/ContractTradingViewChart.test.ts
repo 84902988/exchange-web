@@ -150,6 +150,14 @@ const chartModule = loadTypeScriptModule(
         destroy() {}
       },
     },
+    './tradingview/contractTradingViewPositionLines': {
+      buildContractTradingViewPositionLines: () => [],
+      ContractTradingViewPositionLinesController: class {
+        update() {}
+        clear() {}
+        destroy() {}
+      },
+    },
   },
 );
 
