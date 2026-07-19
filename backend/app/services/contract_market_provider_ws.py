@@ -43,6 +43,76 @@ _OKX_KLINE_CHANNELS = {
     "4h": "candle4H",
     "1d": "candle1D",
 }
+_PROVIDER_WS_DISCONNECT_LOG_THROTTLE_SECONDS = 30.0
+_PROVIDER_WS_DISCONNECT_LOG_LAST_AT: dict[tuple[str, str, str, str, str], float] = {}
+
+
+def _websocket_connection_closed_types() -> tuple[type[BaseException], ...]:
+    websocket_exceptions = getattr(websockets, "exceptions", None)
+    if websocket_exceptions is None:
+        return ()
+    exception_types: list[type[BaseException]] = []
+    for name in ("ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK"):
+        exception_type = getattr(websocket_exceptions, name, None)
+        if isinstance(exception_type, type):
+            exception_types.append(exception_type)
+    return tuple(exception_types)
+
+
+_PROVIDER_WS_RECOVERABLE_EXCEPTIONS = (
+    OSError,
+    TimeoutError,
+    asyncio.TimeoutError,
+    *_websocket_connection_closed_types(),
+)
+
+
+def _is_provider_ws_recoverable_disconnect(exc: BaseException) -> bool:
+    return isinstance(exc, _PROVIDER_WS_RECOVERABLE_EXCEPTIONS)
+
+
+def _log_provider_ws_disconnected(
+    domain: str,
+    subscription: Any,
+    exc: BaseException,
+    *,
+    retry_in: float,
+) -> None:
+    reason = type(exc).__name__
+    interval = str(getattr(subscription, "interval", "") or "")
+    key = (
+        str(domain),
+        subscription.provider,
+        subscription.local_symbol,
+        interval,
+        reason,
+    )
+    now = time.monotonic()
+    last_at = _PROVIDER_WS_DISCONNECT_LOG_LAST_AT.get(key)
+    if last_at is not None and now - last_at < _PROVIDER_WS_DISCONNECT_LOG_THROTTLE_SECONDS:
+        return
+    _PROVIDER_WS_DISCONNECT_LOG_LAST_AT[key] = now
+    if interval:
+        logger.warning(
+            "contract_provider_ws_%s_disconnected provider=%s symbol=%s provider_symbol=%s interval=%s reason=%s retry_in=%.1fs",
+            domain,
+            subscription.provider,
+            subscription.local_symbol,
+            subscription.provider_symbol,
+            interval,
+            reason,
+            retry_in,
+        )
+        return
+    logger.warning(
+        "contract_provider_ws_%s_disconnected provider=%s symbol=%s provider_symbol=%s reason=%s retry_in=%.1fs",
+        domain,
+        subscription.provider,
+        subscription.local_symbol,
+        subscription.provider_symbol,
+        reason,
+        retry_in,
+    )
 
 
 @dataclass(frozen=True)
@@ -1769,16 +1839,21 @@ class ContractMarketProviderWsService:
                 reconnect_delay = 1.0
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if stop_event.is_set():
                     break
-                logger.warning(
-                    "contract_provider_ws_depth_disconnected provider=%s symbol=%s provider_symbol=%s",
-                    subscription.provider,
-                    subscription.local_symbol,
-                    subscription.provider_symbol,
-                    exc_info=True,
-                )
+                if _is_provider_ws_recoverable_disconnect(exc):
+                    _log_provider_ws_disconnected(
+                        "depth", subscription, exc, retry_in=reconnect_delay
+                    )
+                else:
+                    logger.warning(
+                        "contract_provider_ws_depth_disconnected provider=%s symbol=%s provider_symbol=%s",
+                        subscription.provider,
+                        subscription.local_symbol,
+                        subscription.provider_symbol,
+                        exc_info=True,
+                    )
                 try:
                     await asyncio.wait_for(asyncio.to_thread(stop_event.wait), timeout=reconnect_delay)
                     break
@@ -1812,16 +1887,21 @@ class ContractMarketProviderWsService:
                 reconnect_delay = 1.0
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if stop_event.is_set():
                     break
-                logger.warning(
-                    "contract_provider_ws_trades_disconnected provider=%s symbol=%s provider_symbol=%s",
-                    subscription.provider,
-                    subscription.local_symbol,
-                    subscription.provider_symbol,
-                    exc_info=True,
-                )
+                if _is_provider_ws_recoverable_disconnect(exc):
+                    _log_provider_ws_disconnected(
+                        "trades", subscription, exc, retry_in=reconnect_delay
+                    )
+                else:
+                    logger.warning(
+                        "contract_provider_ws_trades_disconnected provider=%s symbol=%s provider_symbol=%s",
+                        subscription.provider,
+                        subscription.local_symbol,
+                        subscription.provider_symbol,
+                        exc_info=True,
+                    )
                 try:
                     await asyncio.wait_for(asyncio.to_thread(stop_event.wait), timeout=reconnect_delay)
                     break
@@ -1855,16 +1935,21 @@ class ContractMarketProviderWsService:
                 reconnect_delay = 1.0
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if stop_event.is_set():
                     break
-                logger.warning(
-                    "contract_provider_ws_ticker_disconnected provider=%s symbol=%s provider_symbol=%s",
-                    subscription.provider,
-                    subscription.local_symbol,
-                    subscription.provider_symbol,
-                    exc_info=True,
-                )
+                if _is_provider_ws_recoverable_disconnect(exc):
+                    _log_provider_ws_disconnected(
+                        "ticker", subscription, exc, retry_in=reconnect_delay
+                    )
+                else:
+                    logger.warning(
+                        "contract_provider_ws_ticker_disconnected provider=%s symbol=%s provider_symbol=%s",
+                        subscription.provider,
+                        subscription.local_symbol,
+                        subscription.provider_symbol,
+                        exc_info=True,
+                    )
                 try:
                     await asyncio.wait_for(asyncio.to_thread(stop_event.wait), timeout=reconnect_delay)
                     break
@@ -1898,17 +1983,22 @@ class ContractMarketProviderWsService:
                 reconnect_delay = 1.0
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if stop_event.is_set():
                     break
-                logger.warning(
-                    "contract_provider_ws_kline_disconnected provider=%s symbol=%s provider_symbol=%s interval=%s",
-                    subscription.provider,
-                    subscription.local_symbol,
-                    subscription.provider_symbol,
-                    subscription.interval,
-                    exc_info=True,
-                )
+                if _is_provider_ws_recoverable_disconnect(exc):
+                    _log_provider_ws_disconnected(
+                        "kline", subscription, exc, retry_in=reconnect_delay
+                    )
+                else:
+                    logger.warning(
+                        "contract_provider_ws_kline_disconnected provider=%s symbol=%s provider_symbol=%s interval=%s",
+                        subscription.provider,
+                        subscription.local_symbol,
+                        subscription.provider_symbol,
+                        subscription.interval,
+                        exc_info=True,
+                    )
                 try:
                     await asyncio.wait_for(asyncio.to_thread(stop_event.wait), timeout=reconnect_delay)
                     break
