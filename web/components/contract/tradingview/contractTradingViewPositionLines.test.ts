@@ -38,9 +38,27 @@ describe('buildContractTradingViewPositionLines', () => {
       position({ id: 8, symbol: 'ETHUSDT_PERP' }),
       position({ id: 9, status: 'CLOSED' }),
     ], 'BTCUSDT_PERP')).toEqual([
-      expect.objectContaining({ key: '7:ENTRY', price: 100, text: 'BUY ENTRY' }),
-      expect.objectContaining({ key: '7:SL', price: 90, text: 'BUY SL' }),
-      expect.objectContaining({ key: '7:TP', price: 110, text: 'BUY TP' }),
+      expect.objectContaining({ key: '7:ENTRY', price: 100, text: 'BUY ENTRY#1' }),
+      expect.objectContaining({ key: '7:SL', price: 90, text: 'BUY SL#1' }),
+      expect.objectContaining({ key: '7:TP', price: 110, text: 'BUY TP#1' }),
+    ]);
+  });
+
+  it('assigns one stable number to every line belonging to the same position', () => {
+    const lines = buildContractTradingViewPositionLines([
+      position({ id: 12, side: 'SHORT' }),
+      position({ id: 7, side: 'LONG' }),
+    ], 'BTCUSDT_PERP');
+
+    expect(lines.filter((line) => line.key.startsWith('7:')).map((line) => line.text).sort()).toEqual([
+      'BUY ENTRY#1',
+      'BUY SL#1',
+      'BUY TP#1',
+    ]);
+    expect(lines.filter((line) => line.key.startsWith('12:')).map((line) => line.text).sort()).toEqual([
+      'SELL ENTRY#2',
+      'SELL SL#2',
+      'SELL TP#2',
     ]);
   });
 
