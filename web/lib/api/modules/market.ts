@@ -1,4 +1,4 @@
-import { request } from '../core/request'
+import { publicRequest } from '../core/request'
 import { withContentLanguage } from '../core/locale'
 
 export type SpotMarketDataSource = 'internal' | 'external'
@@ -242,7 +242,7 @@ export async function getSpotMarketDepth(
     limit: String(limit),
   })
 
-  return request<SpotMarketDepthResponse>(buildRelativeUrl('/market/depth', params))
+  return publicRequest<SpotMarketDepthResponse>(buildRelativeUrl('/market/depth', params))
 }
 
 export async function getSpotMarketTrades(
@@ -255,7 +255,7 @@ export async function getSpotMarketTrades(
     limit: String(limit),
   })
 
-  return request<SpotMarketTradesResponse>(
+  return publicRequest<SpotMarketTradesResponse>(
     buildRelativeUrl('/market/trades', params),
   )
 }
@@ -278,13 +278,13 @@ export async function getSpotMarketKlines(params: {
     query.set('end_time', String(endTime))
   }
 
-  return request<SpotMarketKlinesResponse>(buildRelativeUrl('/market/kline', query))
+  return publicRequest<SpotMarketKlinesResponse>(buildRelativeUrl('/market/kline', query))
 }
 
 export async function getReferenceOverlay(symbol: string): Promise<ReferenceOverlayPayload> {
   const normalizedSymbol = normalizeSpotSymbol(symbol)
   const query = new URLSearchParams({ symbol: normalizedSymbol })
-  return request<ReferenceOverlayPayload>(withContentLanguage(buildRelativeUrl('/market/reference-overlays', query)))
+  return publicRequest<ReferenceOverlayPayload>(withContentLanguage(buildRelativeUrl('/market/reference-overlays', query)))
 }
 
 export async function getStockQuote(symbol: string): Promise<StockQuotePayload> {
@@ -294,7 +294,7 @@ export async function getStockQuote(symbol: string): Promise<StockQuotePayload> 
     code: normalizedSymbol,
   })
 
-  return request<StockQuotePayload>(
+  return publicRequest<StockQuotePayload>(
     buildRelativeUrl('/market/itick/stock/quote', params),
   )
 }
@@ -335,7 +335,7 @@ export async function getStockInfo(symbol: string): Promise<StockInfoPayload> {
     code: normalizedSymbol,
   })
 
-  return request<StockInfoPayload>(
+  return publicRequest<StockInfoPayload>(
     buildRelativeUrl('/market/itick/stock/info', params),
   )
 }
@@ -353,13 +353,13 @@ export async function getStockKline(params: {
     limit: String(params.limit || getStockKlineLimit(params.interval)),
   })
 
-  return request<StockKlinePayload>(
+  return publicRequest<StockKlinePayload>(
     buildRelativeUrl('/market/itick/stock/kline', query),
   )
 }
 
 export async function getMarketTickers(): Promise<MarketTickerItem[]> {
-  const payload = await request<MarketTickerItem[] | { items?: MarketTickerItem[] }>(
+  const payload = await publicRequest<MarketTickerItem[] | { items?: MarketTickerItem[] }>(
     '/market/tickers',
   )
 
@@ -375,7 +375,7 @@ export async function getMarketTickers(): Promise<MarketTickerItem[]> {
 }
 
 export async function getMfcRwaReferencePrice(): Promise<MfcRwaReferencePrice> {
-  return request<MfcRwaReferencePrice>('/market/rwa/iron62/reference')
+  return publicRequest<MfcRwaReferencePrice>('/market/rwa/iron62/reference')
 }
 
 export async function getMfcRwaReferenceKline(params?: {
@@ -386,7 +386,7 @@ export async function getMfcRwaReferenceKline(params?: {
     interval: params?.interval || '1d',
     limit: String(params?.limit || 120),
   })
-  return request<MfcRwaReferenceKline>(buildRelativeUrl('/market/rwa/iron62/kline', query))
+  return publicRequest<MfcRwaReferenceKline>(buildRelativeUrl('/market/rwa/iron62/kline', query))
 }
 
 export function normalizeSpotMarketTrades(

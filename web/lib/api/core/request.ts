@@ -5,6 +5,10 @@ import { getAccessToken, getRefreshToken, setTokens } from "./token";
 
 export const AUTH_EXPIRED_EVENT = "app:auth-expired";
 
+export type ApiRequestOptions = RequestInit & {
+  auth?: "auto" | "omit";
+};
+
 function joinUrl(base: string, path: string) {
   const b = base.replace(/\/+$/, "");
   const p = path.startsWith("/") ? path : `/${path}`;
@@ -197,30 +201,35 @@ function parseApiErrorFromResponsePayload(payload: unknown, httpStatus: number, 
 
 export const request = async <T>(
   path: string,
-  options: RequestInit = {},
+  options: ApiRequestOptions = {},
   retryCount: number = 0,
   maxRetries: number = 1,
   _internal?: { retriedAfterRefresh?: boolean } // 防止无限 refresh 重试
 ): Promise<T> => {
   const baseUrl = getRuntimeHttpApiBaseUrl();
   const url = joinUrl(baseUrl, path);
+  const { auth: authPolicy = "auto", ...fetchOptions } = options;
 
   try {
-    const headers = new Headers(options.headers || {});
+    const headers = new Headers(fetchOptions.headers || {});
 
     const isFormData =
-      typeof FormData !== "undefined" && options.body instanceof FormData;
+      typeof FormData !== "undefined" && fetchOptions.body instanceof FormData;
 
-    const hasBody = options.body !== undefined && options.body !== null;
+    const hasBody = fetchOptions.body !== undefined && fetchOptions.body !== null;
 
     // ✅ 只有有 body 且不是 FormData 才设置 JSON Content-Type
     if (hasBody && !isFormData && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
 
-    const accessToken = getAccessToken();
-    if (accessToken && !headers.has("Authorization")) {
-      headers.set("Authorization", `Bearer ${accessToken}`);
+    if (authPolicy === "omit") {
+      headers.delete("Authorization");
+    } else {
+      const accessToken = getAccessToken();
+      if (accessToken && !headers.has("Authorization")) {
+        headers.set("Authorization", `Bearer ${accessToken}`);
+      }
     }
 
     // ✅（可选）CSRF 预留：如果你后端做了 CSRF（双重提交），这里带上 header
@@ -228,21 +237,21 @@ export const request = async <T>(
     // if (csrf && !headers.has("X-CSRF-Token")) headers.set("X-CSRF-Token", csrf);
 
     // ✅ 如果 body 是普通对象，自动 JSON.stringify
-    let body = options.body;
+    let body = fetchOptions.body;
     if (hasBody && !isFormData && isObjectBody(body)) {
       body = JSON.stringify(body);
     }
 
     const response = await fetch(url, {
-      ...options,
+      ...fetchOptions,
       headers,
       body,
       cache: "no-store",
-      credentials: "include", // ✅ 关键：让浏览器存/带 HttpOnly Cookie
+      credentials: authPolicy === "omit" ? "omit" : "include",
     });
 
     // ====== 关键：401 自动 refresh 再重放（大所 Web 常见） ======
-    const canRefreshAfter401 = canAttemptRefreshAfter401(path);
+    const canRefreshAfter401 = authPolicy !== "omit" && canAttemptRefreshAfter401(path);
     if (response.status === 401 && canRefreshAfter401 && !_internal?.retriedAfterRefresh) {
       // 同一时间只发一次 refresh
       if (!refreshPromise) {
@@ -277,8 +286,9 @@ export const request = async <T>(
       );
 
       if (
-        isAuthExpiredError(response.status, errorCode, errorMessage) ||
-        isAccountDisabledError(response.status, errorCode, errorMessage)
+        authPolicy !== "omit" &&
+        (isAuthExpiredError(response.status, errorCode, errorMessage) ||
+          isAccountDisabledError(response.status, errorCode, errorMessage))
       ) {
         broadcastAuthExpired();
       }
@@ -334,3 +344,8 @@ export const request = async <T>(
     );
   }
 };
+
+export const publicRequest = async <T>(
+  path: string,
+  options: Omit<ApiRequestOptions, "auth"> = {},
+): Promise<T> => request<T>(path, { ...options, auth: "omit" });
