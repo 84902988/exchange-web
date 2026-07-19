@@ -5,6 +5,9 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
+
+from starlette.websockets import WebSocketDisconnect
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,6 +22,7 @@ from app.services.contract_market_ws import (
     handle_contract_ws_domain_command,
     handle_contract_ws_legacy_subscribe,
 )
+from app.routers import contract_market as contract_market_router
 
 
 def test_domain_and_legacy_action_fields_are_both_supported() -> None:
@@ -215,6 +219,73 @@ def test_legacy_subscribe_still_uses_full_snapshot() -> None:
         assert gateway.market_calls == []
         assert gateway.kline_calls == []
         assert manager.sent[0]["type"] == "contract_market_snapshot"
+
+    asyncio.run(scenario())
+
+
+def test_public_ws_treats_disconnect_during_domain_snapshot_as_normal_cleanup() -> None:
+    class DisconnectingWebSocket:
+        def __init__(self) -> None:
+            self.receive_count = 0
+
+        async def receive(self) -> dict[str, Any]:
+            self.receive_count += 1
+            return {
+                "type": "websocket.receive",
+                "text": json.dumps({
+                    "op": "subscribe",
+                    "domain": "market",
+                    "symbol": "BTCUSDT_PERP",
+                }),
+            }
+
+    class DisconnectingManager(ManagerStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_count = 0
+            self.disconnect_count = 0
+
+        async def connect(
+            self,
+            symbol: str,
+            _websocket: Any,
+            *,
+            interval: str | None = None,
+            accepted: bool = False,
+            legacy: bool = True,
+        ) -> None:
+            self.legacy_calls.append((symbol, interval, legacy))
+
+        async def send_to_one(self, _websocket: Any, payload: dict[str, Any]) -> None:
+            self.send_count += 1
+            if self.send_count == 2:
+                raise WebSocketDisconnect(code=1006)
+            self.sent.append(payload)
+
+        async def disconnect(self, _websocket: Any) -> str:
+            self.disconnect_count += 1
+            return "BTCUSDT_PERP"
+
+    async def scenario() -> None:
+        manager = DisconnectingManager()
+        gateway = GatewayStub()
+        websocket = DisconnectingWebSocket()
+
+        with (
+            patch.object(contract_market_router, "contract_market_ws_manager", manager),
+            patch.object(contract_market_router, "contract_market_gateway", gateway),
+        ):
+            await contract_market_router.contract_market_public_ws(
+                websocket,
+                symbol="BTCUSDT_PERP",
+                interval="1m",
+            )
+
+        assert websocket.receive_count == 1
+        assert manager.send_count == 2
+        assert manager.disconnect_count == 1
+        assert gateway.ensure_calls == ["BTCUSDT_PERP"]
+        assert gateway.release_calls == ["BTCUSDT_PERP"]
 
     asyncio.run(scenario())
 
