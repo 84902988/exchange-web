@@ -90,16 +90,18 @@ export function buildContractTradingViewPositionLines(
   const normalizedSymbol = normalizeSymbol(symbol);
   if (!normalizedSymbol) return [];
 
+  const eligiblePositions = (positions || []).filter((position) => (
+    normalizeSymbol(position.symbol) === normalizedSymbol
+    && String(position.status || '').trim().toUpperCase() === 'OPEN'
+    && positivePrice(position.quantity) !== null
+  )).sort((left, right) => Number(left.id) - Number(right.id));
+
   const lines: ContractTradingViewPositionLine[] = [];
-  for (const position of positions || []) {
-    if (
-      normalizeSymbol(position.symbol) !== normalizedSymbol
-      || String(position.status || '').trim().toUpperCase() !== 'OPEN'
-      || positivePrice(position.quantity) === null
-    ) continue;
+  for (const [positionIndex, position] of eligiblePositions.entries()) {
 
     const side = String(position.side || '').trim().toUpperCase();
     const sideLabel = side === 'SHORT' ? 'SELL' : 'BUY';
+    const positionNumber = positionIndex + 1;
     const entryPrice = positivePrice(position.entry_price);
     const takeProfitPrice = positivePrice(position.take_profit_price);
     const stopLossPrice = positivePrice(position.stop_loss_price);
@@ -109,7 +111,7 @@ export function buildContractTradingViewPositionLines(
         key: `${position.id}:ENTRY`,
         kind: 'ENTRY',
         price: entryPrice,
-        text: `${sideLabel} ENTRY`,
+        text: `${sideLabel} ENTRY#${positionNumber}`,
       });
     }
     if (takeProfitPrice !== null) {
@@ -117,7 +119,7 @@ export function buildContractTradingViewPositionLines(
         key: `${position.id}:TP`,
         kind: 'TAKE_PROFIT',
         price: takeProfitPrice,
-        text: `${sideLabel} TP`,
+        text: `${sideLabel} TP#${positionNumber}`,
       });
     }
     if (stopLossPrice !== null) {
@@ -125,7 +127,7 @@ export function buildContractTradingViewPositionLines(
         key: `${position.id}:SL`,
         kind: 'STOP_LOSS',
         price: stopLossPrice,
-        text: `${sideLabel} SL`,
+        text: `${sideLabel} SL#${positionNumber}`,
       });
     }
   }
