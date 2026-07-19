@@ -79,6 +79,16 @@ def _normalize_symbol(symbol: Optional[str]) -> str:
     return str(symbol or "").strip().upper()
 
 
+def _contract_symbol_aliases(symbol: Optional[str]) -> tuple[str, ...]:
+    normalized = _normalize_symbol(symbol)
+    if not normalized:
+        return ()
+    if normalized.endswith("_PERP"):
+        legacy_symbol = normalized[:-5]
+        return (normalized, legacy_symbol) if legacy_symbol else (normalized,)
+    return (normalized, f"{normalized}_PERP")
+
+
 def _normalize_status(status: Optional[str]) -> str:
     return str(status or "").strip().upper()
 
@@ -511,7 +521,7 @@ def get_user_contract_positions(
 
     normalized_symbol = _normalize_symbol(symbol)
     if normalized_symbol:
-        query = query.filter(ContractPosition.symbol == normalized_symbol)
+        query = query.filter(ContractPosition.symbol.in_(_contract_symbol_aliases(normalized_symbol)))
 
     normalized_status = _normalize_status(status)
     if normalized_status and normalized_status != "ALL":
@@ -604,7 +614,7 @@ def get_user_contract_positions_page(
 
     normalized_symbol = _normalize_symbol(symbol)
     if normalized_symbol:
-        query = query.filter(ContractPosition.symbol == normalized_symbol)
+        query = query.filter(ContractPosition.symbol.in_(_contract_symbol_aliases(normalized_symbol)))
 
     normalized_status = _normalize_status(status)
     if normalized_status and normalized_status != "ALL":
@@ -720,7 +730,7 @@ def get_user_contract_position_summaries(
 
     normalized_symbol = _normalize_symbol(symbol)
     if normalized_symbol:
-        query = query.filter(ContractPosition.symbol == normalized_symbol)
+        query = query.filter(ContractPosition.symbol.in_(_contract_symbol_aliases(normalized_symbol)))
 
     normalized_side = _normalize_status(side)
     if normalized_side:
@@ -850,7 +860,7 @@ def get_user_contract_orders(
 
     normalized_symbol = _normalize_symbol(symbol)
     if normalized_symbol:
-        query = query.filter(ContractOrder.symbol == normalized_symbol)
+        query = query.filter(ContractOrder.symbol.in_(_contract_symbol_aliases(normalized_symbol)))
 
     normalized_status = _normalize_status(status)
     if normalized_status:
@@ -974,7 +984,7 @@ def get_user_contract_trades(
 
     normalized_symbol = _normalize_symbol(symbol)
     if normalized_symbol:
-        query = query.filter(ContractTrade.symbol == normalized_symbol)
+        query = query.filter(ContractTrade.symbol.in_(_contract_symbol_aliases(normalized_symbol)))
 
     normalized_side = _normalize_status(side)
     if normalized_side:

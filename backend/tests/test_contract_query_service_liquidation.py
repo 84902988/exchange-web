@@ -6,6 +6,12 @@ from types import SimpleNamespace
 from app.services import contract_query_service as service
 
 
+def test_contract_query_symbol_aliases_cover_canonical_and_legacy_storage():
+    assert service._contract_symbol_aliases("BTCUSDT_PERP") == ("BTCUSDT_PERP", "BTCUSDT")
+    assert service._contract_symbol_aliases("AAPLUSDT") == ("AAPLUSDT", "AAPLUSDT_PERP")
+    assert service._contract_symbol_aliases("") == ()
+
+
 def _position(**overrides):
     payload = {
         "symbol": "AAPLUSDT_PERP",
