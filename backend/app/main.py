@@ -97,6 +97,10 @@ from app.services.spot_private_event_subscriber import (
     start_spot_private_event_subscriber,
     stop_spot_private_event_subscriber,
 )
+from app.services.spot_public_depth_events import (
+    start_spot_public_depth_event_subscriber,
+    stop_spot_public_depth_event_subscriber,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -546,6 +550,7 @@ async def _startup_contract_private_ws_subscriber():
 async def _startup_spot_private_event_bridge():
     start_spot_private_event_subscriber()
     start_spot_private_event_relay()
+    start_spot_public_depth_event_subscriber()
 
 
 @app.on_event("shutdown")
@@ -598,6 +603,7 @@ async def _shutdown_contract_private_ws_subscriber():
 
 @app.on_event("shutdown")
 async def _shutdown_spot_private_event_bridge():
+    await stop_spot_public_depth_event_subscriber()
     await stop_spot_private_event_relay()
     await stop_spot_private_event_subscriber()
 

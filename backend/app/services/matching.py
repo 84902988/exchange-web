@@ -25,6 +25,7 @@ from app.services.fee_service import apply_trade_fee
 from app.services.market_ws import market_ws_manager
 from app.services.spot_order_payload import serialize_spot_order
 from app.services.spot_private_ws import spot_private_ws_manager
+from app.services.spot_public_depth_events import publish_spot_public_depth_refresh
 
 
 logger = logging.getLogger(__name__)
@@ -683,6 +684,8 @@ def _push_trade_and_depth(
 ) -> None:
     try:
         ts = int(time.time() * 1000)
+
+        publish_spot_public_depth_refresh(symbol, reason="trade_matched")
 
         _fire_and_forget(
             market_ws_manager.send_trade(

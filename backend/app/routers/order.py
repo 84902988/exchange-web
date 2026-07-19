@@ -17,6 +17,7 @@ from app.services.market_ws import market_ws_manager
 from app.services.order_service import cancel_order, create_order
 from app.services.spot_order_payload import serialize_spot_order
 from app.services.spot_private_ws import spot_private_ws_manager
+from app.services.spot_public_depth_events import publish_spot_public_depth_refresh
 
 
 router = APIRouter(prefix="/order", tags=["order"])
@@ -60,6 +61,8 @@ def _broadcast_public_orderbook(symbol: str) -> None:
     normalized_symbol = (symbol or "").upper().strip()
     if not normalized_symbol:
         return
+
+    publish_spot_public_depth_refresh(normalized_symbol, reason="order_changed")
 
     _fire_and_forget(
         _push_depth_and_snapshot(normalized_symbol),
