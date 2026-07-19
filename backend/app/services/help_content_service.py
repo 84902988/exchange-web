@@ -461,7 +461,7 @@ def _normalize_article_payload(payload: dict[str, Any]) -> dict[str, Any]:
     content = _primary_text_from_payload(payload, "content")
     return {
         "category_id": _parse_int(payload.get("category_id"), 0),
-        "slug": _slugify(payload.get("slug")),
+        "slug": _slugify(payload.get("slug")) or _slugify(title),
         "title": title,
         "summary": summary or None,
         "content": content,

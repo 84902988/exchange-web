@@ -230,11 +230,16 @@ KYC, 身份认证, 合规
         wordMap.forEach(([source, target]) => {
           next = next.replaceAll(source, ` ${target} `);
         });
-        return next
+        const asciiSlug = next
           .normalize("NFKD")
           .replace(/[\u0300-\u036f]/g, "")
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, "-")
+          .replace(/-+/g, "-")
+          .replace(/^-|-$/g, "");
+        return asciiSlug || compact
+          .toLowerCase()
+          .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
           .replace(/-+/g, "-")
           .replace(/^-|-$/g, "");
       };
