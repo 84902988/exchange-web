@@ -2372,7 +2372,7 @@ function DetailMetric({
   return (
     <div className="min-w-0">
       <div className="text-xs text-white/38">{label}</div>
-      <div className={`whitespace-nowrap font-mono text-[12px] tabular-nums ${valueClassName}`}>{value}</div>
+      <div className={`truncate whitespace-nowrap font-mono text-[12px] tabular-nums ${valueClassName}`} title={value}>{value}</div>
     </div>
   );
 }
