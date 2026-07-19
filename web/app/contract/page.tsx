@@ -359,6 +359,7 @@ function ContractPageContent() {
   const [contractTicker, setContractTicker] = useState<ContractTickerItem | null>(null);
   const tickerRequestSeqRef = useRef(0);
   const pendingNavigationSymbolRef = useRef<string | null>(null);
+  const initialContractSymbolRef = useRef(initialContractSymbol);
   const urlContractSymbol = useMemo(
     () => normalizeContractSymbol(searchParams.get('symbol')),
     [searchParams],
@@ -376,7 +377,15 @@ function ContractPageContent() {
     () => contractPairs.find((item) => item.symbol === contractSymbol) || null,
     [contractPairs, contractSymbol],
   );
-  const chartBootstrapReady = contractPairsLoaded && currentContractPair !== null;
+  const currentContractKlineAssetClass = normalizeContractKlineAssetClass(
+    currentContractPair?.contractKlineAssetClass,
+  );
+  const chartBootstrapMatchesUrlCategory = Boolean(urlContractSymbol)
+    || !urlContractCategory
+    || Boolean(currentContractPair && contractPairMatchesUrlCategory(currentContractPair, urlContractCategory));
+  const chartBootstrapReady = currentContractPair !== null
+    && currentContractKlineAssetClass !== 'UNKNOWN'
+    && chartBootstrapMatchesUrlCategory;
   const activeContractTicker = useMemo(
     () => contractTicker && normalizeContractSymbol(contractTicker.symbol) === contractSymbol
       ? contractTicker
@@ -386,9 +395,6 @@ function ContractPageContent() {
   const selectedPrice = selectedPriceState?.symbol === contractSymbol
     ? selectedPriceState.price
     : null;
-  const currentContractKlineAssetClass = normalizeContractKlineAssetClass(
-    currentContractPair?.contractKlineAssetClass,
-  );
   const contractChartIntervalOptions = useMemo(
     () => (isTradfiContractPair(currentContractPair) ? CONTRACT_TRADFI_INTERVAL_OPTIONS : CONTRACT_INTERVAL_OPTIONS),
     [currentContractPair],
@@ -532,9 +538,38 @@ function ContractPageContent() {
 
   const refreshContractPairs = useCallback(async () => {
     setContractPairsLoading(true);
+    const bootstrapSymbol = initialContractSymbolRef.current;
+
+    try {
+      const bootstrapResponse = await getContractSymbols({
+        keyword: bootstrapSymbol,
+        page: 1,
+        page_size: 1,
+      });
+      const bootstrapItem = bootstrapResponse.items.find(
+        (item) => normalizeContractSymbol(item.symbol) === bootstrapSymbol,
+      );
+      if (bootstrapItem) {
+        const bootstrapPair = buildContractPairOption(bootstrapItem, t);
+        setContractPairs((previous) => [
+          bootstrapPair,
+          ...previous.filter((item) => item.symbol !== bootstrapPair.symbol),
+        ]);
+      }
+    } catch {
+      // The full catalog remains the fail-closed metadata fallback.
+    }
+
     try {
       const contractResponse = await getContractSymbols({ category: 'all', quote: 'all', page: 1, page_size: 100 });
-      setContractPairs(contractResponse.items.map((item) => buildContractPairOption(item, t)));
+      const catalogPairs = contractResponse.items.map((item) => buildContractPairOption(item, t));
+      setContractPairs((previous) => {
+        const bootstrapPair = previous.find((item) => item.symbol === bootstrapSymbol) || null;
+        if (!bootstrapPair || catalogPairs.some((item) => item.symbol === bootstrapPair.symbol)) {
+          return catalogPairs;
+        }
+        return [bootstrapPair, ...catalogPairs];
+      });
     } catch {
       setContractPairs((previous) => {
         if (previous.some((item) => item.symbol === DEFAULT_CONTRACT_SYMBOL)) return previous;

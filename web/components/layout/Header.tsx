@@ -3,7 +3,7 @@
 import Image from 'next/image';
 import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
-import { usePathname, useSearchParams } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 
 import { menuConfig, Language } from '@/config/menuConfig';
 import MegaMenu from './MegaMenu';
@@ -25,6 +25,7 @@ const DEFAULT_COMMON_TRANSLATIONS = (enTranslations as { common: Record<string, 
 export default function Header() {
   const { isLoggedIn } = useAuth();
   const { t } = useLocaleContext();
+  const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const searchKey = searchParams.toString();
@@ -54,6 +55,14 @@ export default function Header() {
     const timer = window.setTimeout(() => setMounted(true), 0);
     return () => window.clearTimeout(timer);
   }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      router.prefetch('/trade/spot');
+      router.prefetch('/contract?category=usdt');
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [router]);
 
   useEffect(() => {
     const syncTimer = window.setTimeout(() => {
@@ -248,7 +257,12 @@ export default function Header() {
                   key={item.labelKey}
                   className="relative"
                   onMouseEnter={() => {
-                    if (hasMegaMenu) handleMenuHover(item.labelKey);
+                    if (item.megaMenu) {
+                      item.megaMenu.groups.forEach((group) => {
+                        group.items.forEach((menuItem) => router.prefetch(menuItem.href));
+                      });
+                      handleMenuHover(item.labelKey);
+                    }
                   }}
                   onMouseLeave={() => {
                     if (hasMegaMenu) handleMenuLeave();

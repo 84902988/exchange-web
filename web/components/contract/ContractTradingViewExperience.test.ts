@@ -10,13 +10,25 @@ const pageSource = readFileSync(
 
 describe('Contract TradingView bootstrap experience', () => {
   test('waits for symbol metadata before creating the only chart widget consumer', () => {
-    expect(pageSource).toContain(
+    expect(pageSource).toContain("currentContractKlineAssetClass !== 'UNKNOWN'");
+    expect(pageSource).toContain('&& chartBootstrapMatchesUrlCategory;');
+    expect(pageSource).not.toContain(
       'const chartBootstrapReady = contractPairsLoaded && currentContractPair !== null;',
     );
     expect(pageSource).toMatch(
       /\{chartBootstrapReady \? \([\s\S]*?<ContractTradingViewChart[\s\S]*?: \([\s\S]*?data-contract-chart-bootstrap="pending"/,
     );
     expect(pageSource.match(/<ContractTradingViewChart/g)).toHaveLength(1);
+  });
+
+  test('loads current symbol metadata before the full selector catalog', () => {
+    const bootstrapRequestIndex = pageSource.indexOf('keyword: bootstrapSymbol');
+    const catalogRequestIndex = pageSource.indexOf("getContractSymbols({ category: 'all'");
+
+    expect(bootstrapRequestIndex).toBeGreaterThan(-1);
+    expect(catalogRequestIndex).toBeGreaterThan(bootstrapRequestIndex);
+    expect(pageSource).toContain('page_size: 1');
+    expect(pageSource).toContain('The full catalog remains the fail-closed metadata fallback.');
   });
 
   test('keeps a pending ETH to BTC selection ahead of the stale URL', () => {
