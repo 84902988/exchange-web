@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import websockets
 from sqlalchemy.orm import Session
@@ -83,6 +83,21 @@ class ProviderKlineSubscription:
     channel: str
     ws_symbol: Optional[str] = None
     ws_url: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ContractProviderKlineRevisionAccepted:
+    provider: str
+    symbol: str
+    interval: str
+    generation: int
+    open_time: int
+    revision_epoch: int
+    revision_sequence: int
+
+    @property
+    def revision(self) -> tuple[int, int]:
+        return self.revision_epoch, self.revision_sequence
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -200,6 +215,12 @@ def _depth_limit() -> int:
 
 def _trades_limit() -> int:
     return max(1, min(int(getattr(settings, "CONTRACT_PROVIDER_WS_TRADES_LIMIT", 30) or 30), 100))
+
+
+def _okx_trades_ws_url() -> str:
+    # OKX's `trades` channel is a public-channel feed. The business endpoint is
+    # reserved for channels such as `trades-all` and candlesticks.
+    return str(getattr(settings, "CONTRACT_PROVIDER_WS_OKX_PUBLIC_URL", "") or "").strip()
 
 
 def _max_age_ms(value: Optional[int] = None, *, setting_name: str = "CONTRACT_PROVIDER_WS_DEPTH_MAX_AGE_MS") -> int:
@@ -370,7 +391,38 @@ class ContractMarketProviderWsService:
         self._kline_stops: dict[tuple[str, str, str], threading.Event] = {}
         self._kline_connections: dict[tuple[str, str, str], tuple[asyncio.AbstractEventLoop, Any]] = {}
         self._kline_generations: dict[tuple[str, str, str], int] = {}
+        self._kline_revision_listener: Optional[
+            Callable[[ContractProviderKlineRevisionAccepted], None]
+        ] = None
         self._lock = threading.RLock()
+
+    def set_kline_revision_listener(
+        self,
+        listener: Optional[Callable[[ContractProviderKlineRevisionAccepted], None]],
+    ) -> None:
+        with self._lock:
+            self._kline_revision_listener = listener
+
+    def get_kline_generation(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> int:
+        normalized_symbol = _normalize_symbol(symbol)
+        normalized_interval = _normalize_interval(interval)
+        normalized_provider = _normalize_symbol(provider) if provider else None
+        with self._lock:
+            candidates = [
+                generation
+                for (provider_code, local_symbol, item_interval), generation
+                in self._kline_generations.items()
+                if local_symbol == normalized_symbol
+                and item_interval == normalized_interval
+                and (normalized_provider is None or provider_code == normalized_provider)
+            ]
+        return max((int(item or 0) for item in candidates), default=0)
 
     def get_fresh_provider_ws_depth(
         self,
@@ -1940,9 +1992,9 @@ class ContractMarketProviderWsService:
     ) -> None:
         if stop_event.is_set() or not provider_ws_trades_enabled():
             return
-        url = str(getattr(settings, "CONTRACT_PROVIDER_WS_OKX_BUSINESS_URL", "") or "").strip()
+        url = _okx_trades_ws_url()
         if not url:
-            raise ValueError("CONTRACT_PROVIDER_WS_OKX_BUSINESS_URL is required")
+            raise ValueError("CONTRACT_PROVIDER_WS_OKX_PUBLIC_URL is required")
         subscribe_payload = {
             "op": "subscribe",
             "args": [{"channel": "trades", "instId": subscription.provider_symbol}],
@@ -3140,6 +3192,8 @@ class ContractMarketProviderWsService:
         now_ms = int(time.time() * 1000)
         now = datetime.now(timezone.utc)
         key = (subscription.provider, subscription.local_symbol, subscription.interval)
+        accepted_event: ContractProviderKlineRevisionAccepted | None = None
+        listener: Optional[Callable[[ContractProviderKlineRevisionAccepted], None]] = None
         with self._lock:
             current_generation = self._kline_generations.get(key)
             if generation is not None and generation != current_generation:
@@ -3176,6 +3230,31 @@ class ContractMarketProviderWsService:
                 "revision_epoch": effective_generation,
                 "revision_sequence": revision_sequence,
             }
+            if effective_generation is not None and int(effective_generation) > 0:
+                accepted_event = ContractProviderKlineRevisionAccepted(
+                    provider=subscription.provider,
+                    symbol=subscription.local_symbol,
+                    interval=subscription.interval,
+                    generation=int(effective_generation),
+                    open_time=int(payload.get("open_time") or payload.get("open_time_ms") or 0),
+                    revision_epoch=int(effective_generation),
+                    revision_sequence=revision_sequence,
+                )
+                listener = self._kline_revision_listener
+        if accepted_event is not None and listener is not None:
+            try:
+                listener(accepted_event)
+            except Exception:
+                logger.warning(
+                    "contract_provider_ws_kline_revision_notify_failed "
+                    "provider=%s symbol=%s interval=%s revision=%s:%s",
+                    accepted_event.provider,
+                    accepted_event.symbol,
+                    accepted_event.interval,
+                    accepted_event.revision_epoch,
+                    accepted_event.revision_sequence,
+                    exc_info=True,
+                )
 
     def _set_depth_cache(
         self,
@@ -3364,6 +3443,25 @@ def select_fresh_provider_ws_kline(
         max_age_ms=max_age_ms,
         ensure_subscription=ensure_subscription,
     )
+
+
+def get_contract_provider_ws_kline_generation(
+    symbol: str,
+    interval: str,
+    *,
+    provider: Optional[str] = None,
+) -> int:
+    return contract_market_provider_ws.get_kline_generation(
+        symbol,
+        interval,
+        provider=provider,
+    )
+
+
+def set_contract_provider_ws_kline_revision_listener(
+    listener: Optional[Callable[[ContractProviderKlineRevisionAccepted], None]],
+) -> None:
+    contract_market_provider_ws.set_kline_revision_listener(listener)
 
 
 def stop_provider_ws_depth_subscriptions_for_symbol(symbol: str) -> None:

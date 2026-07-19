@@ -144,6 +144,96 @@ function klineCommands(socket: { sent: string[] }) {
 }
 
 
+test('domain mode routes candle preview only through the kline preview channel', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+    const previewEvents: unknown[] = [];
+    const klineEvents: unknown[] = [];
+    const tradeEvents: unknown[] = [];
+    const releasePreview = client.subscribe('preview', (message: unknown) => previewEvents.push(message));
+    const releaseKline = client.subscribe('kline', (message: unknown) => klineEvents.push(message));
+    const releaseTrade = client.subscribe('trade', (message: unknown) => tradeEvents.push(message));
+    const message = {
+      type: 'contract_candle_preview_update',
+      domain: 'kline',
+      symbol: 'BTCUSDT_PERP',
+      interval: '1m',
+      preview: { close: '100', volume: '5' },
+    };
+
+    socket.onmessage?.({ data: JSON.stringify(message) });
+    socket.onmessage?.({ data: JSON.stringify({ ...message, domain: 'market' }) });
+
+    assert.deepEqual(previewEvents, [message]);
+    assert.deepEqual(klineEvents, []);
+    assert.deepEqual(tradeEvents, []);
+    releaseTrade();
+    releaseKline();
+    releasePreview();
+    releaseMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+
+test('trade settlement emits embedded preview before trade in one websocket task', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+    const events: string[] = [];
+    const previews: unknown[] = [];
+    const trades: unknown[] = [];
+    const releasePreview = client.subscribe('preview', (message: unknown) => {
+      events.push('preview');
+      previews.push(message);
+    });
+    const releaseTrade = client.subscribe('trade', (message: unknown) => {
+      events.push('trade');
+      trades.push(message);
+    });
+    const preview = {
+      type: 'contract_candle_preview_update',
+      domain: 'kline',
+      symbol: 'BTCUSDT_PERP',
+      interval: '1m',
+      settlement_revision: 'contract:BTCUSDT_PERP:1m:3:1:3:8:1',
+      preview: { close: '101', volume: '11' },
+    };
+    const trade = {
+      type: 'contract_trade',
+      domain: 'market',
+      symbol: 'BTCUSDT_PERP',
+      settlement_revision: preview.settlement_revision,
+      trades: [{ id: 'trade-1', price: '101', qty: '1' }],
+      candle_previews: [preview],
+    };
+
+    socket.onmessage?.({ data: JSON.stringify(trade) });
+
+    assert.deepEqual(events, ['preview', 'trade']);
+    assert.deepEqual(previews, [preview]);
+    assert.deepEqual(trades, [trade]);
+    releaseTrade();
+    releasePreview();
+    releaseMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+
 test('failed 1m to 1H resolution candidate rolls back only to the explicitly committed minute owner', () => {
   const harness = installRealtimeHarness();
 
@@ -258,7 +348,7 @@ test('successful 1W to 1m commit permanently rejects the old callback even after
 
     socket.onmessage?.(klineSnapshot('1w'));
     socket.onmessage?.(klineSnapshot('1m'));
-    assert.deepEqual(weeklyEvents, []);
+    assert.equal(weeklyEvents.length, 0);
     assert.equal(minuteEvents.length, 1);
 
     const releaseStaleWeekly = client.subscribeKline(

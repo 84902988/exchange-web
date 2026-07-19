@@ -20,7 +20,9 @@ from app.services.contract_market_gateway import (
     CONTRACT_MARKET_CACHE_TRADES,
     ContractMarketGateway,
 )
+from app.services import contract_market_gateway as gateway_module
 from app.services.contract_market_provider_ws import (
+    ContractProviderKlineRevisionAccepted,
     ContractMarketProviderWsService,
     ProviderTickerSubscription,
 )
@@ -176,6 +178,348 @@ def test_gateway_rejects_revision_sequence_rollback():
     assert winner.data["close"] == "102"
 
 
+def test_gateway_contract_preview_advances_close_and_volume_from_same_trade_evidence(
+    monkeypatch,
+):
+    gateway = ContractMarketGateway()
+    preview_symbol = "SOLUSDT_PERP"
+    open_time = (NOW_MS // 60_000) * 60_000
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 3,
+    )
+    gateway._accept_candle_preview_native(
+        preview_symbol,
+        "1m",
+        {
+            "symbol": preview_symbol,
+            "interval": "1m",
+            "provider": "OKX_SWAP",
+            "provider_generation": 3,
+            "revision_epoch": 3,
+            "revision_sequence": 8,
+            "open_time": open_time,
+            "open": "100",
+            "high": "102",
+            "low": "99",
+            "close": "101",
+            "volume": "50",
+            "quote_volume": "5050",
+            "is_closed": False,
+        },
+    )
+    settlement_messages = gateway._trade_preview_settlement_messages(
+        preview_symbol,
+        ["1m"],
+        [
+            {
+                "id": "trade-1",
+                "symbol": preview_symbol,
+                "provider": "OKX_SWAP",
+                "provider_symbol": "SOL-USDT-SWAP",
+                "price": "103",
+                "qty": "2",
+                "time": open_time + 30_000,
+                "received_at_ms": open_time + 30_010 - (8 * 60 * 60 * 1000),
+                "source": "LIVE_WS",
+                "quote_source": "LIVE_WS",
+                "quote_freshness": "LIVE",
+                "price_source": "TRADE_TICK",
+            }
+        ],
+        {
+            "provider": "OKX_SWAP",
+            # Trades and Kline subscriptions own independent transport
+            # generations. Preview identity must use the Kline generation.
+            "provider_generation": 99,
+            "received_at_ms": open_time + 30_010,
+        },
+    )
+
+    assert len(settlement_messages) == 2
+    trade_message, message = settlement_messages
+    assert trade_message["type"] == "contract_trade"
+    assert trade_message["candle_previews"] == [message]
+    assert trade_message["settlement_revision"] == message["settlement_revision"]
+    assert trade_message["trade"]["id"] == message["settlement_trade_id"]
+    assert trade_message["trade"]["price"] == message["preview"]["close"]
+    assert message["type"] == "contract_candle_preview_update"
+    assert message["domain"] == "kline"
+    assert message["source"] == "TRADE_PREVIEW"
+    assert message["provider_generation"] == 3
+    assert message["received_at_ms"] == open_time + 30_010
+    assert message["preview"]["received_at_ms"] == open_time + 30_010
+    assert message["base_native_revision"] == {"epoch": 3, "sequence": 8}
+    assert message["preview"]["open"] == "100"
+    assert message["preview"]["high"] == "103"
+    assert message["preview"]["low"] == "99"
+    assert message["preview"]["close"] == "103"
+    assert message["preview"]["volume"] == "52"
+    assert message["preview"]["quote_volume"] == "5256"
+    assert message["preview"]["preview_sequence"] == 1
+    assert message["preview"]["baseline_source"] == "NATIVE"
+    assert message["preview"]["baseline_anchor_open_time"] is None
+    assert message["settlement_trade_id"] == "trade-1"
+    assert message["settlement_trade_price"] == "103"
+    assert message["settlement_revision"].endswith(":3:8:1")
+
+
+def test_gateway_marks_generic_contiguous_rollover_as_trade_seeded(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "SOLUSDT_PERP"
+    open_time = (NOW_MS // 60_000) * 60_000
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 3,
+    )
+    gateway._accept_candle_preview_native(
+        symbol,
+        "1m",
+        {
+            "provider": "OKX_SWAP",
+            "provider_generation": 3,
+            "revision_epoch": 3,
+            "revision_sequence": 8,
+            "open_time": open_time,
+            "open": "100",
+            "high": "102",
+            "low": "99",
+            "close": "101",
+            "volume": "50",
+            "quote_volume": "5050",
+            "is_closed": False,
+        },
+    )
+
+    messages = gateway._candle_preview_messages(
+        symbol,
+        ["1m"],
+        [{
+            "id": "sol-next-minute",
+            "provider": "OKX_SWAP",
+            "price": "103",
+            "qty": "2",
+            "time": open_time + 60_001,
+        }],
+        {"provider": "OKX_SWAP", "received_at_ms": open_time + 60_010},
+    )
+
+    assert len(messages) == 1
+    message = messages[0]
+    assert message["preview"]["kline_mode"] == "TRADE_SEEDED_ROLLOVER_PREVIEW"
+    assert message["preview"]["baseline_source"] == "TRADE_ROLLOVER"
+    assert message["preview"]["baseline_anchor_open_time"] == open_time
+    assert message["preview"]["open_time"] == open_time + 60_000
+    assert message["preview"]["close"] == "103"
+    assert message["preview"]["volume"] == "2"
+
+
+def test_gateway_contract_preview_fails_closed_without_native_ohlcv_or_generation(
+    monkeypatch,
+):
+    gateway = ContractMarketGateway()
+    open_time = (NOW_MS // 60_000) * 60_000
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 3,
+    )
+    gateway._accept_candle_preview_native(
+        SYMBOL,
+        "1m",
+        {
+            "provider": "OKX_SWAP",
+            "provider_generation": 3,
+            "revision_epoch": 3,
+            "revision_sequence": 1,
+            "open_time": open_time,
+            "open": "100",
+            "high": "100",
+            "low": "100",
+            "close": "100",
+            "volume": None,
+            "is_closed": False,
+        },
+    )
+
+    assert gateway._candle_preview_messages(
+        SYMBOL,
+        ["1m"],
+        [{"id": "trade-1", "provider": "OKX_SWAP", "price": "101", "qty": "1", "time": open_time + 1_000}],
+        {"provider": "OKX_SWAP", "provider_generation": 3},
+    ) == []
+    gateway._accept_candle_preview_native(
+        SYMBOL,
+        "1m",
+        {
+            "provider": "OKX_SWAP",
+            "provider_generation": 3,
+            "revision_epoch": 3,
+            "revision_sequence": 2,
+            "open_time": open_time,
+            "open": "100",
+            "high": "100",
+            "low": "100",
+            "close": "100",
+            "volume": "5",
+            "is_closed": False,
+        },
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 0,
+    )
+    assert gateway._candle_preview_messages(
+        SYMBOL,
+        ["1m"],
+        [{"id": "trade-2", "provider": "OKX_SWAP", "price": "101", "qty": "1", "time": open_time + 2_000}],
+        {"provider": "OKX_SWAP", "provider_generation": None},
+    ) == []
+
+
+def test_gateway_trade_dedupe_survives_rolling_provider_windows():
+    gateway = ContractMarketGateway()
+    trade_a = {"id": "trade-a", "price": "100", "qty": "1"}
+    trade_b = {"id": "trade-b", "price": "101", "qty": "2"}
+
+    assert gateway._filter_new_trades(SYMBOL, [trade_a]) == [trade_a]
+    gateway._remember_trade_ids(SYMBOL, [trade_a])
+
+    assert gateway._filter_new_trades(SYMBOL, [trade_b]) == [trade_b]
+    gateway._remember_trade_ids(SYMBOL, [trade_b])
+
+    # A trade that leaves the provider's rolling cache and later reappears must
+    # not be broadcast again ahead of a newer Header/reference price.
+    assert gateway._filter_new_trades(SYMBOL, [trade_a]) == []
+    assert gateway._filter_new_trades(SYMBOL, [trade_b, trade_b]) == []
+
+
+def test_gateway_trade_dedupe_rejects_duplicates_inside_one_batch():
+    gateway = ContractMarketGateway()
+    trade = {"id": "trade-a", "price": "100", "qty": "1"}
+
+    assert gateway._filter_new_trades(SYMBOL, [trade, trade]) == [trade]
+
+
+def test_gateway_trade_settlement_orders_header_evidence_by_event_time():
+    gateway = ContractMarketGateway()
+
+    message = gateway._trades_message(
+        SYMBOL,
+        [
+            {"id": "older", "price": "100", "qty": "1", "time": NOW_MS - 10},
+            {"id": "latest", "price": "101", "qty": "1", "time": NOW_MS},
+        ],
+    )
+
+    assert message["trade"]["id"] == "latest"
+    assert message["trades"][0]["price"] == "101"
+
+
+def test_gateway_trade_settlement_prefers_the_preview_trade_over_timestamp_ties():
+    gateway = ContractMarketGateway()
+
+    message = gateway._trades_message(
+        SYMBOL,
+        [
+            {"id": "first", "price": "100", "qty": "1", "time": NOW_MS},
+            {"id": "settled", "price": "101", "qty": "1", "time": NOW_MS},
+            {"id": "third", "price": "99", "qty": "1", "time": NOW_MS},
+        ],
+        preferred_trade_id="settled",
+    )
+
+    assert message["trade"]["id"] == "settled"
+    assert message["trades"][0]["price"] == "101"
+
+
+def test_gateway_coalesces_only_current_provider_kline_generation(monkeypatch):
+    gateway = ContractMarketGateway()
+    gateway._provider_ws_allowed_symbols.add(SYMBOL)
+    gateway._kline_wakeup_events[SYMBOL] = __import__("asyncio").Event()
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 3,
+    )
+    accepted = ContractProviderKlineRevisionAccepted(
+        provider="OKX_SWAP",
+        symbol=SYMBOL,
+        interval="1m",
+        generation=3,
+        open_time=(NOW_MS // 60_000) * 60_000,
+        revision_epoch=3,
+        revision_sequence=8,
+    )
+    stale = ContractProviderKlineRevisionAccepted(
+        provider="OKX_SWAP",
+        symbol=SYMBOL,
+        interval="1m",
+        generation=2,
+        open_time=accepted.open_time,
+        revision_epoch=2,
+        revision_sequence=99,
+    )
+
+    gateway._enqueue_provider_kline_revision(stale)
+    assert gateway._pending_provider_kline_events == {}
+    gateway._enqueue_provider_kline_revision(accepted)
+
+    assert gateway._pending_provider_kline_events[(SYMBOL, "1m")] == accepted
+    assert gateway._kline_wakeup_events[SYMBOL].is_set()
+
+
+def test_gateway_broadcast_cycle_primes_native_revision_before_trade_preview(monkeypatch):
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    gateway = ContractMarketGateway()
+    emitted: list[str] = []
+    monkeypatch.setattr(
+        gateway,
+        "_refresh_provider_ws_market_once",
+        lambda *_args, **_kwargs: [
+            {"type": "contract_trade"},
+            {"type": "contract_candle_preview_update"},
+        ],
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_refresh_provider_ws_klines_once",
+        lambda *_args, **_kwargs: [{"type": "contract_kline_update"}],
+    )
+
+    async def capture(_symbol, message):
+        emitted.append(message["type"])
+
+    monkeypatch.setattr(
+        gateway_module.contract_market_ws_manager,
+        "broadcast_to_symbol",
+        capture,
+    )
+
+    try:
+        loop.run_until_complete(gateway._refresh_and_broadcast_cycle(
+            SYMBOL,
+            ["1m"],
+            market_subscriber_count=1,
+            should_refresh_all=False,
+        ))
+    finally:
+        loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    assert emitted == [
+        "contract_kline_update",
+        "contract_trade",
+        "contract_candle_preview_update",
+    ]
+
+
 def test_gateway_builds_four_domain_snapshots_without_changing_legacy_payloads():
     gateway = ContractMarketGateway()
     authority = {
@@ -295,3 +639,270 @@ def test_provider_ws_cache_carries_generation_and_rejects_old_writer():
     assert winner["revision_epoch"] == 2
     assert winner["revision_sequence"] == 1
     assert winner["last_price"] == "101"
+
+
+def test_gateway_kline_message_preserves_provider_ws_authority_evidence():
+    gateway = ContractMarketGateway()
+    now_ms = gateway_module._utc_ms()
+    kline = {
+        "open_time": now_ms - 60_000,
+        "open": "100",
+        "high": "103",
+        "low": "99",
+        "close": "102",
+        "volume": "8",
+        "source": "LIVE_WS",
+        "provider": "OKX_SWAP",
+        "provider_symbol": "BTC-USDT-SWAP",
+        "received_at_ms": now_ms,
+        "provider_generation": 7,
+        "revision_epoch": 7,
+        "revision_sequence": 12,
+        "is_closed": False,
+    }
+
+    assert gateway._set_latest(
+        CONTRACT_MARKET_CACHE_KLINE,
+        SYMBOL,
+        kline,
+        interval="1m",
+        authority_payload=kline,
+    )
+
+    message = gateway._kline_message(SYMBOL, "1m")
+
+    assert message is not None
+    assert message["source"] == "LIVE_WS"
+    assert message["provider"] == "OKX_SWAP"
+    assert message["transport"] == "PROVIDER_WS"
+    assert message["freshness"] == "LIVE"
+    assert message["provider_generation"] == 7
+    assert message["revision_epoch"] == 7
+    assert message["revision_sequence"] == 12
+    assert message["revision"]["epoch"] == 7
+    assert message["revision"]["sequence"] == 12
+    assert message["revision"]["is_closed"] is False
+    assert message["data"]["close"] == "102"
+    assert message["data"]["volume"] == "8"
+    assert message["data"]["provider_generation"] == 7
+    assert message["data"]["revision_sequence"] == 12
+
+
+def test_gateway_kline_message_fails_closed_without_volume():
+    gateway = ContractMarketGateway()
+    now_ms = gateway_module._utc_ms()
+    kline = {
+        "open_time": now_ms - 60_000,
+        "open": "100",
+        "high": "103",
+        "low": "99",
+        "close": "102",
+        "volume": None,
+        "source": "LIVE_WS",
+        "provider": "OKX_SWAP",
+        "provider_symbol": "BTC-USDT-SWAP",
+        "received_at_ms": now_ms,
+        "provider_generation": 7,
+        "revision_epoch": 7,
+        "revision_sequence": 12,
+    }
+
+    assert not gateway._set_latest(
+        CONTRACT_MARKET_CACHE_KLINE,
+        SYMBOL,
+        kline,
+        interval="1m",
+        authority_payload=kline,
+    )
+
+    assert gateway.get_domain_snapshot(
+        ContractMarketDomainName.KLINE,
+        SYMBOL,
+        interval="1m",
+    ) is None
+    assert gateway._kline_message(SYMBOL, "1m") is None
+
+
+def test_gateway_kline_message_fails_closed_for_unstamped_process_cache():
+    gateway = ContractMarketGateway()
+    kline = {
+        "open_time": NOW_MS - 60_000,
+        "open": "100",
+        "high": "103",
+        "low": "99",
+        "close": "102",
+        "volume": "8",
+        "source": "PROCESS_CACHE",
+    }
+
+    assert gateway._set_latest(
+        CONTRACT_MARKET_CACHE_KLINE,
+        SYMBOL,
+        kline,
+        interval="1m",
+        authority_payload=kline,
+    )
+
+    snapshot = gateway.get_domain_snapshot(
+        ContractMarketDomainName.KLINE,
+        SYMBOL,
+        interval="1m",
+    )
+    assert snapshot is not None
+    assert snapshot.metadata.transport == ContractMarketDomainTransport.CACHE_READ
+    assert snapshot.metadata.cache_origin == ContractMarketDomainCacheOrigin.PROCESS_MEMORY
+    assert snapshot.metadata.stale is True
+    assert gateway._kline_message(SYMBOL, "1m") is None
+
+
+def test_gateway_kline_message_expires_authority_at_read_time(monkeypatch):
+    now_ms = 1_800_000_000_000
+    clock = {"now_ms": now_ms}
+    monkeypatch.setattr(gateway_module, "_utc_ms", lambda: clock["now_ms"])
+    gateway = ContractMarketGateway()
+    kline = {
+        "open_time": now_ms - 60_000,
+        "open": "100",
+        "high": "103",
+        "low": "99",
+        "close": "102",
+        "volume": "8",
+        "source": "LIVE_WS",
+        "provider": "OKX_SWAP",
+        "provider_symbol": "BTC-USDT-SWAP",
+        "received_at_ms": now_ms,
+        "provider_generation": 7,
+        "revision_epoch": 7,
+        "revision_sequence": 12,
+    }
+
+    assert gateway._set_latest(
+        CONTRACT_MARKET_CACHE_KLINE,
+        SYMBOL,
+        kline,
+        interval="1m",
+        authority_payload=kline,
+    )
+    assert gateway._kline_message(SYMBOL, "1m") is not None
+
+    clock["now_ms"] += 1_501
+
+    assert gateway._kline_message(SYMBOL, "1m") is None
+
+
+def test_gateway_caps_kline_broadcast_interval_at_spot_parity(monkeypatch):
+    monkeypatch.setattr(
+        gateway_module.settings,
+        "CONTRACT_PROVIDER_WS_ITICK_KLINE_BROADCAST_INTERVAL_MS",
+        1000,
+    )
+
+    assert ContractMarketGateway()._provider_ws_kline_broadcast_interval_seconds() == 0.2
+
+
+def test_gateway_throttles_rest_kline_fallback_and_marks_its_authority(monkeypatch):
+    gateway = ContractMarketGateway()
+    calls: list[tuple[bool, bool]] = []
+    now_ms = gateway_module._utc_ms()
+
+    class SessionStub:
+        def close(self) -> None:
+            return None
+
+    def load_kline_payload(
+        _db,
+        symbol,
+        *,
+        interval,
+        allow_provider_ws,
+        allow_rest_fallback=True,
+        ensure_provider_ws=False,
+    ):
+        assert symbol == SYMBOL
+        assert interval == "1m"
+        assert ensure_provider_ws is False
+        calls.append((allow_provider_ws, allow_rest_fallback))
+        if allow_provider_ws:
+            return None
+        return {
+            "open_time": now_ms - 60_000,
+            "open": "100",
+            "high": "101",
+            "low": "99",
+            "close": "100.5",
+            "volume": "4",
+            "source": "PROVIDER_REST",
+            "freshness": "RECENT",
+            "fallback_reason": "WS_MISS",
+            "received_at_ms": now_ms,
+        }
+
+    monkeypatch.setattr(gateway_module, "SessionLocal", SessionStub)
+    monkeypatch.setattr(gateway, "_load_kline_payload", load_kline_payload)
+
+    first = gateway._refresh_kline_once(SYMBOL, "1m")
+    second = gateway._refresh_kline_once(SYMBOL, "1m")
+
+    assert first is not None
+    assert second is None
+    assert calls == [(True, False), (False, True), (True, False)]
+    message = gateway._kline_message(SYMBOL, "1m")
+    assert message is not None
+    assert message["source"] == "REST_SNAPSHOT"
+    assert message["transport"] == "PROVIDER_REST"
+    assert message["fallback_reason"] == "WS_MISS"
+    assert message["freshness"] == "RECENT"
+    assert message["data"]["volume"] == "4"
+
+
+def test_gateway_suppresses_identical_ws_kline_but_emits_new_revision(monkeypatch):
+    gateway = ContractMarketGateway()
+    now_ms = gateway_module._utc_ms()
+    revision_sequences = iter((1, 1, 2))
+
+    class SessionStub:
+        def close(self) -> None:
+            return None
+
+    def load_kline_payload(
+        _db,
+        symbol,
+        *,
+        interval,
+        allow_provider_ws,
+        allow_rest_fallback=True,
+        ensure_provider_ws=False,
+    ):
+        assert symbol == SYMBOL
+        assert interval == "1m"
+        assert allow_provider_ws is True
+        assert allow_rest_fallback is False
+        return {
+            "open_time": now_ms - 60_000,
+            "open": "100",
+            "high": "102",
+            "low": "99",
+            "close": "101",
+            "volume": "6",
+            "source": "LIVE_WS",
+            "provider": "OKX_SWAP",
+            "provider_symbol": "BTC-USDT-SWAP",
+            "received_at_ms": now_ms,
+            "provider_generation": 3,
+            "revision_epoch": 3,
+            "revision_sequence": next(revision_sequences),
+        }
+
+    monkeypatch.setattr(gateway_module, "SessionLocal", SessionStub)
+    monkeypatch.setattr(gateway, "_load_kline_payload", load_kline_payload)
+
+    first = gateway._refresh_kline_once(SYMBOL, "1m")
+    duplicate = gateway._refresh_kline_once(SYMBOL, "1m")
+    revised = gateway._refresh_kline_once(SYMBOL, "1m")
+
+    assert first is not None
+    assert duplicate is None
+    assert revised is not None
+    message = gateway._kline_message(SYMBOL, "1m")
+    assert message is not None
+    assert message["revision_sequence"] == 2

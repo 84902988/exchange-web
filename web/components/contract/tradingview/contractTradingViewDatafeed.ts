@@ -18,6 +18,16 @@ import {
 } from '@/lib/realtime/contractMarketStore';
 import { contractKlineCurrentCache } from './contractKlineCurrentCache';
 import {
+  ContractTradingViewPreviewCompositor,
+  type ContractPreviewInput,
+  type ContractPreviewNativeInput,
+} from './contractTradingViewPreviewCompositor';
+import {
+  ContractTradingViewRealtimeBarFrameCoalescer,
+  type ContractTradingViewRealtimeBarAuthority,
+  type ContractTradingViewRealtimeBarFrameSource,
+} from './contractTradingViewRealtimeBarFrameCoalescer';
+import {
   getContractKlineCurrentCacheTtlMs,
   normalizeContractKlineAssetClass,
   type ContractKlineAssetClass,
@@ -412,6 +422,16 @@ function normalizeNumber(value: unknown) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function positiveInteger(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : null;
+}
+
+function nonNegativeInteger(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
 function toRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -489,6 +509,78 @@ export function realtimeMessageToBar(
     kline_mode: payload.kline_mode ?? message.kline_mode,
     price_source: payload.price_source ?? message.price_source,
   }, expectedInterval);
+}
+
+export function realtimePreviewMessageToInput(
+  message: ContractMarketRealtimeMessage,
+  expectedSymbol: string,
+  expectedInterval: string,
+): ContractPreviewInput | null {
+  if (String(message.type || '').toLowerCase() !== 'contract_candle_preview_update') {
+    return null;
+  }
+  if (message.domain && String(message.domain).trim().toLowerCase() !== 'kline') return null;
+  const payload = toRecord(message.preview) || toRecord(message.data);
+  const baseRevision = toRecord(message.base_native_revision);
+  if (!payload || !baseRevision) return null;
+  const symbol = normalizeContractSymbol(String(message.symbol || payload.symbol || ''));
+  const interval = normalizeContractInterval(String(message.interval || payload.interval || ''));
+  if (symbol !== normalizeContractSymbol(expectedSymbol)) return null;
+  if (interval !== normalizeContractInterval(expectedInterval)) return null;
+  if (String(message.provider || payload.provider || '').trim().toUpperCase() !== 'OKX_SWAP') {
+    return null;
+  }
+  if (String(message.source || payload.source || '').trim().toUpperCase() !== 'TRADE_PREVIEW') {
+    return null;
+  }
+  if (String(payload.freshness || message.freshness || '').trim().toUpperCase() !== 'LIVE') {
+    return null;
+  }
+  const openTime = normalizeTimeMs(payload.open_time ?? payload.open_time_ms ?? payload.time);
+  const generation = positiveInteger(
+    payload.provider_generation ?? message.provider_generation,
+  );
+  const receivedAtMs = positiveInteger(
+    payload.received_at_ms ?? message.received_at_ms,
+  );
+  const previewSequence = positiveInteger(
+    payload.preview_sequence ?? message.preview_sequence,
+  );
+  const epoch = nonNegativeInteger(payload.revision_epoch ?? baseRevision.epoch);
+  const sequence = nonNegativeInteger(
+    payload.revision_sequence ?? payload.revision_seq ?? baseRevision.sequence,
+  );
+  const open = normalizeNumber(payload.open);
+  const high = normalizeNumber(payload.high);
+  const low = normalizeNumber(payload.low);
+  const close = normalizeNumber(payload.close);
+  const volume = normalizeNumber(payload.volume);
+  if (
+    !openTime
+    || generation === null
+    || receivedAtMs === null
+    || previewSequence === null
+    || epoch === null
+    || sequence === null
+    || open === null
+    || high === null
+    || low === null
+    || close === null
+    || volume === null
+    || volume < 0
+    || high < Math.max(open, low, close)
+    || low > Math.min(open, high, close)
+  ) return null;
+  return {
+    symbol,
+    interval,
+    openTime,
+    generation,
+    receivedAtMs,
+    previewSequence,
+    baseNativeRevision: { epoch, sequence },
+    bar: { time: openTime, open, high, low, close, volume },
+  };
 }
 
 function isFreshKlineEvidence(value: unknown) {
@@ -1933,9 +2025,9 @@ export function createContractTradingViewDatafeed({
         return activeSubscription;
       };
 
-      const emitRealtimeBar = (
+      const commitRealtimeBar = (
         nextBar: ContractTradingViewBar,
-        authority: 'STORE' | 'LEGACY_FALLBACK',
+        authority: ContractTradingViewRealtimeBarAuthority,
       ): boolean => {
         const activeSubscription = getActiveSubscription();
         if (!activeSubscription) return false;
@@ -1970,16 +2062,99 @@ export function createContractTradingViewDatafeed({
         return true;
       };
 
+      const previewCompositor = new ContractTradingViewPreviewCompositor({
+        symbol: subscriptionSymbol,
+        interval,
+      });
+      const realtimeBarFrameCoalescer = new ContractTradingViewRealtimeBarFrameCoalescer({
+        windowMs: 12,
+        onFlush: (candidate) => {
+          commitRealtimeBar(candidate.bar, candidate.authority);
+        },
+      });
+      const emitRealtimeBar = (
+        nextBar: ContractTradingViewBar,
+        authority: ContractTradingViewRealtimeBarAuthority,
+        source?: ContractTradingViewRealtimeBarFrameSource,
+      ): boolean => {
+        if (!previewCompositor.supported || !source) {
+          return commitRealtimeBar(nextBar, authority);
+        }
+        if (!getActiveSubscription()) return false;
+        if (historyReadyByLatestBarKey.get(latestBarKey) !== true) return false;
+        return realtimeBarFrameCoalescer.enqueue({
+          symbol: subscriptionSymbol,
+          interval,
+          source,
+          authority,
+          bar: {
+            time: nextBar.time,
+            open: nextBar.open,
+            high: nextBar.high,
+            low: nextBar.low,
+            close: nextBar.close,
+            volume: Number(nextBar.volume ?? 0),
+          },
+        });
+      };
+
+      const emitNativeBar = (
+        nextBar: ContractTradingViewBar,
+        version: KlineVersionCursor,
+        isClosed: boolean,
+        authority: 'STORE' | 'LEGACY_FALLBACK',
+      ): boolean => {
+        if (!previewCompositor.supported) return emitRealtimeBar(nextBar, authority);
+        const generation = positiveInteger(version.providerGeneration);
+        const epoch = nonNegativeInteger(version.revisionEpoch);
+        const sequence = nonNegativeInteger(version.revisionSequence);
+        const receivedAtMs = positiveInteger(version.observedAtMs);
+        if (
+          generation === null
+          || epoch === null
+          || sequence === null
+          || receivedAtMs === null
+        ) return emitRealtimeBar(nextBar, authority);
+        const nativeInput: ContractPreviewNativeInput = {
+          symbol: subscriptionSymbol,
+          interval,
+          openTime: nextBar.time,
+          generation,
+          receivedAtMs,
+          revision: { epoch, sequence },
+          isClosed,
+          bar: {
+            ...nextBar,
+            volume: Number(nextBar.volume ?? 0),
+          },
+        };
+        const result = previewCompositor.acceptNative(nativeInput);
+        if (!result.accepted || !result.bar) return false;
+        if (result.reason === 'NATIVE_OPEN_DEFERRED_TO_PREVIEW') return true;
+        const source: ContractTradingViewRealtimeBarFrameSource = isClosed
+          ? 'native-closed'
+          : result.source === 'preview'
+            ? 'preview'
+            : 'native-open';
+        return emitRealtimeBar(result.bar, authority, source);
+      };
+
       const handleStoreEntry = (entry: ContractMarketStoreEntry | null) => {
         const activeSubscription = getActiveSubscription();
         if (!activeSubscription) return;
+        if (!entry) return;
         const nextBar = storeKlineEntryToBar(entry, subscriptionSymbol, interval);
         if (!nextBar) return;
         activeSubscription.lastStoreBarTime = Math.max(
           activeSubscription.lastStoreBarTime,
           nextBar.time,
         );
-        emitRealtimeBar(nextBar, 'STORE');
+        emitNativeBar(
+          nextBar,
+          storeEntryVersion(entry),
+          entry.revision?.isClosed === true,
+          'STORE',
+        );
       };
 
       const releaseLegacyKlineSubscription = contractMarketRealtime.subscribeKline({
@@ -2004,10 +2179,32 @@ export function createContractTradingViewDatafeed({
         );
         if (storeEntry && !acceptsKlineVersion(storeEntryVersion(storeEntry), version)) return;
         if (!acceptsKlineVersion(activeSubscription.legacyVersionCursor, version)) return;
-        if (emitRealtimeBar(nextBar, 'LEGACY_FALLBACK')) {
+        const messageRecord = message as Record<string, unknown>;
+        const payload = toRecord(message.kline) || toRecord(message.data);
+        const revision = toRecord(payload?.revision) || toRecord(messageRecord.revision);
+        const isClosed = (
+          payload?.is_closed === true
+          || revision?.is_closed === true
+          || messageRecord.is_closed === true
+        );
+        if (emitNativeBar(nextBar, version, isClosed, 'LEGACY_FALLBACK')) {
           activeSubscription.legacyVersionCursor = version;
         }
       });
+      const releasePreviewSubscription = previewCompositor.supported
+        ? contractMarketRealtime.subscribe('preview', (message) => {
+            if (!getActiveSubscription()) return;
+            const input = realtimePreviewMessageToInput(
+              message,
+              subscriptionSymbol,
+              interval,
+            );
+            if (!input) return;
+            const result = previewCompositor.acceptPreview(input);
+            if (!result.accepted || !result.bar) return;
+            emitRealtimeBar(result.bar, 'PREVIEW', 'preview');
+          })
+        : () => undefined;
       const releaseStoreKlineSubscription = subscribeContractMarketKlineEntry(
         subscriptionSymbol,
         interval,
@@ -2015,8 +2212,11 @@ export function createContractTradingViewDatafeed({
       );
 
       subscription.releaseKlineSubscription = () => {
+        realtimeBarFrameCoalescer.cancel();
+        releasePreviewSubscription();
         releaseStoreKlineSubscription();
         releaseLegacyKlineSubscription();
+        previewCompositor.reset();
       };
       subscription.replayReadyStore = () => {
         handleStoreEntry(selectContractMarketKlineEntry(

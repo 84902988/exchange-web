@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+from collections import OrderedDict
 from copy import deepcopy
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -17,6 +18,8 @@ from app.db.session import SessionLocal
 from app.schemas.contract_market import ContractDepthResponse, ContractMarketViewDetail, ContractQuoteResponse
 from app.schemas.contract_market_domain_snapshot import (
     ContractMarketDomainCacheOrigin,
+    ContractMarketDomainCompletenessStatus,
+    ContractMarketDomainFallbackReason,
     ContractMarketDomainName,
     ContractMarketDomainSnapshot,
     ContractMarketDomainSource,
@@ -51,8 +54,16 @@ from app.services.contract_market_ws import (
     normalize_contract_ws_symbol,
 )
 from app.services.contract_market_view import build_contract_market_view
+from app.services.contract_candle_preview import (
+    SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS,
+    ContractCandlePreview,
+    ContractCandlePreviewEngine,
+    ContractPreviewTradeStatus,
+)
 from app.services.contract_market_provider_ws import (
+    ContractProviderKlineRevisionAccepted,
     force_stop_provider_ws_subscriptions_for_symbol,
+    get_contract_provider_ws_kline_generation,
     provider_ws_depth_enabled,
     provider_ws_kline_enabled,
     provider_ws_ticker_enabled,
@@ -61,6 +72,7 @@ from app.services.contract_market_provider_ws import (
     select_fresh_provider_ws_kline,
     select_fresh_provider_ws_ticker,
     select_fresh_provider_ws_trades,
+    set_contract_provider_ws_kline_revision_listener,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,6 +82,9 @@ CONTRACT_MARKET_WS_DEPTH_LIMIT = 20
 CONTRACT_MARKET_WS_TRADES_LIMIT = 30
 CONTRACT_MARKET_WS_KLINE_LIMIT = 2
 CONTRACT_MARKET_WS_DEPTH_FALLBACK_SLEEP_SECONDS = 1.0
+CONTRACT_MARKET_WS_KLINE_REST_FALLBACK_INTERVAL_SECONDS = 10.0
+CONTRACT_MARKET_WS_KLINE_BROADCAST_INTERVAL_MAX_MS = 200
+CONTRACT_MARKET_WS_TRADE_DEDUPE_MAX_IDS = 4_096
 
 CONTRACT_MARKET_CACHE_QUOTE = "contract:market:{symbol}:quote"
 CONTRACT_MARKET_CACHE_DEPTH = "contract:market:{symbol}:depth"
@@ -228,6 +243,16 @@ def _positive_trade_decimal(value: Any) -> bool:
     return parsed.is_finite() and parsed > 0
 
 
+def _non_negative_kline_volume(value: Any) -> bool:
+    if value in (None, "") or isinstance(value, bool):
+        return False
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return False
+    return parsed.is_finite() and parsed >= 0
+
+
 def _optional_trade_timestamp_ms(value: Any) -> int | None:
     if value in (None, "") or isinstance(value, bool):
         return None
@@ -354,20 +379,39 @@ class ContractMarketGateway:
         self._last_depth_signature: dict[str, str] = {}
         self._last_kline_broadcast_at: dict[tuple[str, str], float] = {}
         self._last_kline_signature: dict[tuple[str, str], str] = {}
+        self._last_kline_rest_fallback_at: dict[tuple[str, str], float] = {}
         self._last_quote_signature: dict[str, str] = {}
         self._last_state_signature: dict[str, str] = {}
-        self._last_trade_ids: dict[str, set[str]] = {}
+        self._last_trade_ids: dict[str, OrderedDict[str, None]] = {}
         self._provider_ws_allowed_symbols: set[str] = set()
         self._snapshot_authority = ContractMarketDomainSnapshotAuthority()
+        self._candle_preview_engine = ContractCandlePreviewEngine()
+        self._kline_event_loop: asyncio.AbstractEventLoop | None = None
+        self._kline_event_tasks: dict[str, asyncio.Task[None]] = {}
+        self._kline_wakeup_events: dict[str, asyncio.Event] = {}
+        self._kline_refresh_locks: dict[str, asyncio.Lock] = {}
+        self._pending_provider_kline_events: dict[
+            tuple[str, str],
+            ContractProviderKlineRevisionAccepted,
+        ] = {}
         self._state_lock = threading.RLock()
 
     async def ensure_symbol(self, symbol: str) -> None:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         if not normalized_symbol:
             return
+        loop = asyncio.get_running_loop()
         with self._state_lock:
             self._provider_ws_allowed_symbols.add(normalized_symbol)
         async with self._task_lock:
+            self._kline_event_loop = loop
+            self._kline_wakeup_events.setdefault(normalized_symbol, asyncio.Event())
+            self._kline_refresh_locks.setdefault(normalized_symbol, asyncio.Lock())
+            event_task = self._kline_event_tasks.get(normalized_symbol)
+            if event_task is None or event_task.done():
+                self._kline_event_tasks[normalized_symbol] = asyncio.create_task(
+                    self._kline_event_worker(normalized_symbol)
+                )
             task = self._tasks.get(normalized_symbol)
             if task is not None and not task.done():
                 return
@@ -398,6 +442,16 @@ class ContractMarketGateway:
             if task is not None and not task.done():
                 task.cancel()
                 cancelled_task = True
+            event_task = self._kline_event_tasks.pop(normalized_symbol, None)
+            if event_task is not None and not event_task.done():
+                event_task.cancel()
+        self._kline_wakeup_events.pop(normalized_symbol, None)
+        self._kline_refresh_locks.pop(normalized_symbol, None)
+        for key in [
+            key for key in self._pending_provider_kline_events if key[0] == normalized_symbol
+        ]:
+            self._pending_provider_kline_events.pop(key, None)
+        self._candle_preview_engine.clear_symbol(normalized_symbol)
         logger.info(
             "contract_market_gateway_release_symbol_if_idle_stop symbol=%s cancelled_task=%s",
             normalized_symbol,
@@ -466,11 +520,8 @@ class ContractMarketGateway:
     def snapshot_message(self, symbol: str, interval: str = "1m", *, status: str = "ok") -> dict[str, Any]:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         normalized_interval = normalize_contract_ws_interval(interval)
-        latest_kline = self._get_latest(
-            CONTRACT_MARKET_CACHE_KLINE,
-            normalized_symbol,
-            interval=normalized_interval,
-        )
+        resolved_kline = self._kline_authority_payload(normalized_symbol, normalized_interval)
+        authoritative_kline = resolved_kline[0] if resolved_kline is not None else None
         return {
             "type": "contract_market_snapshot",
             "symbol": normalized_symbol,
@@ -482,7 +533,7 @@ class ContractMarketGateway:
                 "depth": self._get_latest(CONTRACT_MARKET_CACHE_DEPTH, normalized_symbol),
                 "trades": self._get_latest(CONTRACT_MARKET_CACHE_TRADES, normalized_symbol) or [],
                 "klines": {
-                    normalized_interval: dict(latest_kline) if isinstance(latest_kline, dict) else None
+                    normalized_interval: authoritative_kline
                 },
                 "market_state": self._get_latest(
                     CONTRACT_MARKET_CACHE_STATE,
@@ -518,23 +569,126 @@ class ContractMarketGateway:
     ) -> dict[str, Any]:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         normalized_interval = normalize_contract_ws_interval(interval)
-        latest_kline = self._get_latest(
-            CONTRACT_MARKET_CACHE_KLINE,
-            normalized_symbol,
-            interval=normalized_interval,
-        )
-        kline = dict(latest_kline) if isinstance(latest_kline, dict) else None
+        message = self._kline_message(normalized_symbol, normalized_interval)
+        if message is None:
+            return {
+                "type": "contract_kline_snapshot",
+                "domain": "kline",
+                "symbol": normalized_symbol,
+                "market_symbol": _market_symbol(normalized_symbol),
+                "interval": normalized_interval,
+                "ts": _utc_ms(),
+                "status": status if status != "ok" else "unavailable",
+                "data": None,
+                "kline": None,
+            }
         return {
+            **message,
             "type": "contract_kline_snapshot",
-            "domain": "kline",
-            "symbol": normalized_symbol,
-            "market_symbol": _market_symbol(normalized_symbol),
-            "interval": normalized_interval,
-            "ts": _utc_ms(),
             "status": status,
-            "data": kline,
-            "kline": kline,
         }
+
+    def notify_provider_kline_revision(
+        self,
+        event: ContractProviderKlineRevisionAccepted,
+    ) -> None:
+        loop = self._kline_event_loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._enqueue_provider_kline_revision, event)
+
+    def _is_current_provider_kline_event(
+        self,
+        event: ContractProviderKlineRevisionAccepted,
+    ) -> bool:
+        symbol = normalize_contract_ws_symbol(event.symbol)
+        interval = normalize_contract_ws_interval(event.interval)
+        with self._state_lock:
+            if symbol not in self._provider_ws_allowed_symbols:
+                return False
+        return get_contract_provider_ws_kline_generation(
+            symbol,
+            interval,
+            provider=event.provider,
+        ) == event.generation
+
+    def _enqueue_provider_kline_revision(
+        self,
+        event: ContractProviderKlineRevisionAccepted,
+    ) -> None:
+        if not self._is_current_provider_kline_event(event):
+            return
+        key = (
+            normalize_contract_ws_symbol(event.symbol),
+            normalize_contract_ws_interval(event.interval),
+        )
+        current = self._pending_provider_kline_events.get(key)
+        if (
+            current is not None
+            and current.generation == event.generation
+            and current.revision >= event.revision
+        ):
+            return
+        self._pending_provider_kline_events[key] = event
+        wakeup = self._kline_wakeup_events.get(key[0])
+        if wakeup is not None:
+            wakeup.set()
+
+    async def _kline_event_worker(self, symbol: str) -> None:
+        current_task = asyncio.current_task()
+        wakeup = self._kline_wakeup_events[symbol]
+        try:
+            while True:
+                await wakeup.wait()
+                wakeup.clear()
+                subscribed_intervals = {
+                    normalize_contract_ws_interval(item)
+                    for item in await contract_market_ws_manager.subscribed_intervals(symbol)
+                }
+                retry_delay: float | None = None
+                for key in sorted(
+                    [key for key in self._pending_provider_kline_events if key[0] == symbol]
+                ):
+                    event = self._pending_provider_kline_events.pop(key)
+                    if key[1] not in subscribed_intervals:
+                        continue
+                    if not self._is_current_provider_kline_event(event):
+                        continue
+                    remaining = (
+                        self._provider_ws_kline_broadcast_interval_seconds()
+                        - (time.monotonic() - self._last_kline_broadcast_at.get(key, 0.0))
+                    )
+                    if remaining > 0:
+                        self._pending_provider_kline_events[key] = event
+                        retry_delay = remaining if retry_delay is None else min(retry_delay, remaining)
+                        continue
+                    async with self._kline_refresh_locks.setdefault(
+                        symbol,
+                        asyncio.Lock(),
+                    ):
+                        messages = await asyncio.to_thread(
+                            self._refresh_provider_ws_klines_once,
+                            symbol,
+                            [key[1]],
+                        )
+                        for message in messages:
+                            await contract_market_ws_manager.broadcast_to_symbol(symbol, message)
+                if any(key[0] == symbol for key in self._pending_provider_kline_events):
+                    if retry_delay is not None:
+                        await asyncio.sleep(max(0.01, retry_delay + 0.001))
+                    wakeup.set()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.warning(
+                "contract_market_gateway_kline_event_worker_failed symbol=%s",
+                symbol,
+                exc_info=True,
+            )
+        finally:
+            async with self._task_lock:
+                if self._kline_event_tasks.get(symbol) is current_task:
+                    self._kline_event_tasks.pop(symbol, None)
 
     async def _refresh_loop(self, symbol: str) -> None:
         current_task = asyncio.current_task()
@@ -554,62 +708,24 @@ class ContractMarketGateway:
                 now = time.monotonic()
                 last_full_refresh_at = self._last_full_refresh_at.get(symbol, 0.0)
                 should_refresh_all = now - last_full_refresh_at >= CONTRACT_MARKET_WS_QUOTE_INTERVAL_SECONDS
-                market_messages: list[dict[str, Any]] = []
-                if market_subscriber_count > 0:
-                    try:
-                        if should_refresh_all:
-                            market_messages = await asyncio.to_thread(
-                                self._refresh_market_once,
-                                symbol,
-                                True,
-                            )
-                        else:
-                            market_messages = await asyncio.to_thread(
-                                self._refresh_provider_ws_market_once,
-                                symbol,
-                            )
-                    except (ContractSymbolNotFound, ContractMarketError):
-                        logger.debug("contract_market_gateway_market_refresh_unavailable symbol=%s", symbol, exc_info=True)
-                        market_messages = [self._status_message(symbol, "unavailable")]
-                    except Exception:
-                        logger.warning("contract_market_gateway_market_refresh_failed symbol=%s", symbol, exc_info=True)
-                        market_messages = [self._status_message(symbol, "error")]
-
-                for message in market_messages:
-                    await contract_market_ws_manager.broadcast_to_symbol(symbol, message)
-
-                kline_messages: list[dict[str, Any]] = []
                 if intervals:
-                    try:
-                        if should_refresh_all:
-                            kline_messages.extend(await asyncio.to_thread(
-                                self._refresh_klines_once,
-                                symbol,
-                                intervals,
-                                True,
-                            ))
-                        kline_messages.extend(await asyncio.to_thread(
-                            self._refresh_provider_ws_klines_once,
+                    async with self._kline_refresh_locks.setdefault(
+                        symbol,
+                        asyncio.Lock(),
+                    ):
+                        await self._refresh_and_broadcast_cycle(
                             symbol,
                             intervals,
-                        ))
-                    except (ContractSymbolNotFound, ContractMarketError):
-                        logger.debug(
-                            "contract_market_gateway_kline_refresh_unavailable symbol=%s intervals=%s",
-                            symbol,
-                            intervals,
-                            exc_info=True,
+                            market_subscriber_count=market_subscriber_count,
+                            should_refresh_all=should_refresh_all,
                         )
-                    except Exception:
-                        logger.warning(
-                            "contract_market_gateway_kline_refresh_failed symbol=%s intervals=%s",
-                            symbol,
-                            intervals,
-                            exc_info=True,
-                        )
-
-                for message in kline_messages:
-                    await contract_market_ws_manager.broadcast_to_symbol(symbol, message)
+                else:
+                    await self._refresh_and_broadcast_cycle(
+                        symbol,
+                        intervals,
+                        market_subscriber_count=market_subscriber_count,
+                        should_refresh_all=should_refresh_all,
+                    )
 
                 if should_refresh_all:
                     self._last_full_refresh_at[symbol] = now
@@ -633,6 +749,17 @@ class ContractMarketGateway:
                 )
                 with self._state_lock:
                     self._provider_ws_allowed_symbols.discard(symbol)
+                async with self._task_lock:
+                    event_task = self._kline_event_tasks.pop(symbol, None)
+                    if event_task is not None and not event_task.done():
+                        event_task.cancel()
+                self._kline_wakeup_events.pop(symbol, None)
+                self._kline_refresh_locks.pop(symbol, None)
+                for key in [
+                    key for key in self._pending_provider_kline_events if key[0] == symbol
+                ]:
+                    self._pending_provider_kline_events.pop(key, None)
+                self._candle_preview_engine.clear_symbol(symbol)
                 stop_report = force_stop_provider_ws_subscriptions_for_symbol(symbol)
                 logger.info(
                     "contract_market_gateway_refresh_loop_provider_stop_report symbol=%s report=%s",
@@ -653,11 +780,92 @@ class ContractMarketGateway:
                 self._last_kline_signature.pop(key, None)
             for key in [key for key in self._last_kline_broadcast_at if key[0] == symbol]:
                 self._last_kline_broadcast_at.pop(key, None)
+            for key in [key for key in self._last_kline_rest_fallback_at if key[0] == symbol]:
+                self._last_kline_rest_fallback_at.pop(key, None)
             self._last_state_signature.pop(symbol, None)
             for key in [key for key in self._kline_locks if key[0] == symbol]:
                 self._kline_locks.pop(key, None)
             self._last_quote_signature.pop(symbol, None)
             self._last_trade_ids.pop(symbol, None)
+
+    async def _refresh_and_broadcast_cycle(
+        self,
+        symbol: str,
+        intervals: list[str],
+        *,
+        market_subscriber_count: int,
+        should_refresh_all: bool,
+    ) -> None:
+        # Establish and publish the provider Kline baseline before any ticker or
+        # trade from this cycle can advance visible market price. This ordering
+        # is capability-based (provider + interval), so every listed symbol
+        # receives the same settlement contract.
+        kline_messages: list[dict[str, Any]] = []
+        if intervals:
+            try:
+                if should_refresh_all:
+                    kline_messages.extend(await asyncio.to_thread(
+                        self._refresh_klines_once,
+                        symbol,
+                        intervals,
+                        True,
+                    ))
+                kline_messages.extend(await asyncio.to_thread(
+                    self._refresh_provider_ws_klines_once,
+                    symbol,
+                    intervals,
+                ))
+            except (ContractSymbolNotFound, ContractMarketError):
+                logger.debug(
+                    "contract_market_gateway_kline_refresh_unavailable symbol=%s intervals=%s",
+                    symbol,
+                    intervals,
+                    exc_info=True,
+                )
+            except Exception:
+                logger.warning(
+                    "contract_market_gateway_kline_refresh_failed symbol=%s intervals=%s",
+                    symbol,
+                    intervals,
+                    exc_info=True,
+                )
+
+        for message in kline_messages:
+            await contract_market_ws_manager.broadcast_to_symbol(symbol, message)
+
+        market_messages: list[dict[str, Any]] = []
+        if market_subscriber_count > 0:
+            try:
+                if should_refresh_all:
+                    market_messages = await asyncio.to_thread(
+                        self._refresh_market_once,
+                        symbol,
+                        True,
+                        intervals,
+                    )
+                else:
+                    market_messages = await asyncio.to_thread(
+                        self._refresh_provider_ws_market_once,
+                        symbol,
+                        intervals,
+                    )
+            except (ContractSymbolNotFound, ContractMarketError):
+                logger.debug(
+                    "contract_market_gateway_market_refresh_unavailable symbol=%s",
+                    symbol,
+                    exc_info=True,
+                )
+                market_messages = [self._status_message(symbol, "unavailable")]
+            except Exception:
+                logger.warning(
+                    "contract_market_gateway_market_refresh_failed symbol=%s",
+                    symbol,
+                    exc_info=True,
+                )
+                market_messages = [self._status_message(symbol, "error")]
+
+        for message in market_messages:
+            await contract_market_ws_manager.broadcast_to_symbol(symbol, message)
 
     def _refresh_symbol_once(
         self,
@@ -668,6 +876,7 @@ class ContractMarketGateway:
         messages = self._refresh_market_once(
             symbol,
             ensure_provider_ws=ensure_provider_ws,
+            intervals=intervals,
         )
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         for interval in sorted({normalize_contract_ws_interval(item) for item in intervals} or {"1m"}):
@@ -677,13 +886,16 @@ class ContractMarketGateway:
                 ensure_provider_ws=ensure_provider_ws,
             )
             if isinstance(kline, dict):
-                messages.append(self._kline_message(normalized_symbol, interval, kline))
+                message = self._kline_message(normalized_symbol, interval)
+                if message is not None:
+                    messages.append(message)
         return messages
 
     def _refresh_market_once(
         self,
         symbol: str,
         ensure_provider_ws: bool = False,
+        intervals: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         if ensure_provider_ws:
@@ -701,6 +913,7 @@ class ContractMarketGateway:
                     db,
                     normalized_symbol,
                     ensure_provider_ws=ensure_provider_ws,
+                    intervals=intervals or [],
                 )
             finally:
                 db.close()
@@ -720,12 +933,7 @@ class ContractMarketGateway:
                 ensure_provider_ws = normalized_symbol in self._provider_ws_allowed_symbols
         lock = self._kline_locks.setdefault((normalized_symbol, normalized_interval), threading.Lock())
         if not lock.acquire(blocking=False):
-            cached = self._get_latest(
-                CONTRACT_MARKET_CACHE_KLINE,
-                normalized_symbol,
-                interval=normalized_interval,
-            )
-            return dict(cached) if isinstance(cached, dict) else None
+            return None
         try:
             db = SessionLocal()
             try:
@@ -734,15 +942,35 @@ class ContractMarketGateway:
                     interval=normalized_interval,
                     symbol=normalized_symbol,
                     allow_provider_ws=True,
+                    allow_rest_fallback=False,
                     ensure_provider_ws=ensure_provider_ws,
                 )
+                if isinstance(latest_row, dict):
+                    self._last_kline_rest_fallback_at.pop(
+                        (normalized_symbol, normalized_interval),
+                        None,
+                    )
+                elif self._should_refresh_kline_rest_fallback(
+                    normalized_symbol,
+                    normalized_interval,
+                ):
+                    self._last_kline_rest_fallback_at[(normalized_symbol, normalized_interval)] = time.monotonic()
+                    latest_row = self._load_kline_payload(
+                        db,
+                        interval=normalized_interval,
+                        symbol=normalized_symbol,
+                        allow_provider_ws=False,
+                        allow_rest_fallback=True,
+                        ensure_provider_ws=False,
+                    )
             finally:
                 db.close()
             if not isinstance(latest_row, dict):
                 return None
-            kline = _legacy_domain_value(
-                _normalize_kline(latest_row, source=latest_row.get("source"))
-            )
+            kline = _normalize_kline(latest_row, source=latest_row.get("source"))
+            key = (normalized_symbol, normalized_interval)
+            signature = self._kline_signature(kline)
+            duplicate = self._last_kline_signature.get(key) == signature
             accepted = self._set_latest(
                 CONTRACT_MARKET_CACHE_KLINE,
                 normalized_symbol,
@@ -752,7 +980,15 @@ class ContractMarketGateway:
             )
             if not accepted:
                 return None
-            self._remember_kline_signature(normalized_symbol, normalized_interval, kline)
+            self._accept_candle_preview_native(
+                normalized_symbol,
+                normalized_interval,
+                {**latest_row, **kline},
+            )
+            if duplicate:
+                return None
+            self._last_kline_signature[key] = signature
+            self._last_kline_broadcast_at[key] = time.monotonic()
             return kline
         finally:
             lock.release()
@@ -772,7 +1008,9 @@ class ContractMarketGateway:
                 ensure_provider_ws=ensure_provider_ws,
             )
             if isinstance(kline, dict):
-                messages.append(self._kline_message(normalized_symbol, interval, kline))
+                message = self._kline_message(normalized_symbol, interval)
+                if message is not None:
+                    messages.append(message)
         return messages
 
     def _load_market_state(
@@ -781,6 +1019,7 @@ class ContractMarketGateway:
         symbol: str,
         *,
         ensure_provider_ws: bool,
+        intervals: list[str],
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         contract_symbol = _load_contract_symbol(db, symbol)
@@ -837,6 +1076,7 @@ class ContractMarketGateway:
                 exc_info=True,
             )
         else:
+            new_trades = self._filter_new_trades(symbol, trades)
             trades_accepted = self._set_latest(
                 CONTRACT_MARKET_CACHE_TRADES,
                 symbol,
@@ -845,7 +1085,13 @@ class ContractMarketGateway:
             )
             if trades and trades_accepted:
                 self._remember_trade_ids(symbol, trades)
-                messages.append(self._trade_message(symbol, trades[0]))
+                if new_trades:
+                    messages.extend(self._trade_preview_settlement_messages(
+                        symbol,
+                        intervals,
+                        new_trades,
+                        trades_authority,
+                    ))
 
         state_message = self._state_message_from_latest(
             symbol,
@@ -858,15 +1104,19 @@ class ContractMarketGateway:
         return messages
 
     def _refresh_provider_ws_once(self, symbol: str, intervals: list[str] | None = None) -> list[dict[str, Any]]:
-        messages = self._refresh_provider_ws_market_once(symbol)
+        messages = self._refresh_provider_ws_market_once(symbol, intervals)
         messages.extend(self._refresh_provider_ws_klines_once(symbol, intervals or []))
         return messages
 
-    def _refresh_provider_ws_market_once(self, symbol: str) -> list[dict[str, Any]]:
+    def _refresh_provider_ws_market_once(
+        self,
+        symbol: str,
+        intervals: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         messages.extend(self._refresh_provider_ws_depth_once(symbol))
         messages.extend(self._refresh_provider_ws_ticker_once(symbol))
-        messages.extend(self._refresh_provider_ws_trades_once(symbol))
+        messages.extend(self._refresh_provider_ws_trades_once(symbol, intervals))
         messages.extend(self._state_messages_from_latest(symbol, []))
         return messages
 
@@ -1013,7 +1263,11 @@ class ContractMarketGateway:
         self._last_depth_broadcast_at[normalized_symbol] = time.monotonic()
         return [self._depth_message(normalized_symbol, depth)]
 
-    def _refresh_provider_ws_trades_once(self, symbol: str) -> list[dict[str, Any]]:
+    def _refresh_provider_ws_trades_once(
+        self,
+        symbol: str,
+        intervals: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         if not provider_ws_trades_enabled():
             return []
         normalized_symbol = normalize_contract_ws_symbol(symbol)
@@ -1048,7 +1302,281 @@ class ContractMarketGateway:
         ):
             return []
         self._remember_trade_ids(normalized_symbol, trades)
-        return [self._trades_message(normalized_symbol, new_trades)]
+        return self._trade_preview_settlement_messages(
+            normalized_symbol,
+            intervals or [],
+            new_trades,
+            trades_authority,
+        )
+
+    def _trade_preview_settlement_messages(
+        self,
+        symbol: str,
+        intervals: list[str],
+        trades: list[dict[str, Any]],
+        authority_payload: Any,
+    ) -> list[dict[str, Any]]:
+        preview_messages = self._candle_preview_messages(
+            symbol,
+            intervals,
+            trades,
+            authority_payload,
+        )
+        settlement_trade_id = (
+            preview_messages[-1].get("settlement_trade_id")
+            if preview_messages
+            else None
+        )
+        trade_message = self._trades_message(
+            symbol,
+            trades,
+            preferred_trade_id=settlement_trade_id,
+        )
+        if preview_messages:
+            # Keep the legacy top-level preview frames for kline-only clients,
+            # while embedding the same evidence in the trade frame so market
+            # and TradingView consumers can settle before the next paint.
+            trade_message["candle_previews"] = preview_messages
+            trade_message["settlement_revision"] = preview_messages[-1].get(
+                "settlement_revision"
+            )
+        return [trade_message, *preview_messages]
+
+    def _candle_preview_messages(
+        self,
+        symbol: str,
+        intervals: list[str],
+        trades: list[dict[str, Any]],
+        authority_payload: Any,
+    ) -> list[dict[str, Any]]:
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        active_intervals = sorted(
+            {
+                normalize_contract_ws_interval(item)
+                for item in intervals
+                if normalize_contract_ws_interval(item)
+                in SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS
+            }
+        )
+        if not active_intervals:
+            return []
+        authority = _authority_mapping(authority_payload)
+        provider = str(authority.get("provider") or "").strip().upper()
+        if provider != "OKX_SWAP":
+            return []
+
+        ordered_trades = sorted(
+            (item for item in trades if isinstance(item, dict)),
+            key=lambda item: _trade_event_time_ms(item) or 0,
+        )
+        accepted_by_interval: dict[
+            str,
+            tuple[ContractCandlePreview, int, str, str],
+        ] = {}
+        for interval in active_intervals:
+            try:
+                generation = int(
+                    get_contract_provider_ws_kline_generation(
+                        normalized_symbol,
+                        interval,
+                        provider=provider,
+                    )
+                    or 0
+                )
+            except Exception:
+                logger.warning(
+                    "contract_candle_preview_generation_read_failed "
+                    "provider=%s symbol=%s interval=%s",
+                    provider,
+                    normalized_symbol,
+                    interval,
+                    exc_info=True,
+                )
+                continue
+            if generation <= 0:
+                continue
+            for trade in ordered_trades:
+                event_time_ms = _trade_event_time_ms(trade)
+                if event_time_ms is None:
+                    continue
+                trade_provider = str(
+                    trade.get("provider") or provider
+                ).strip().upper()
+                if trade_provider != provider:
+                    continue
+                try:
+                    result = self._candle_preview_engine.accept_trade(
+                        {
+                            "symbol": normalized_symbol,
+                            "interval": interval,
+                            "provider": trade_provider,
+                            "provider_trade_id": trade.get("id") or trade.get("trade_id"),
+                            "price": trade.get("price") or trade.get("last_price"),
+                            "size": (
+                                trade.get("qty")
+                                or trade.get("amount")
+                                or trade.get("quantity")
+                            ),
+                            "event_time_ms": event_time_ms,
+                            "generation": generation,
+                        }
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if result.status is ContractPreviewTradeStatus.APPLIED and result.preview is not None:
+                    received_at_ms = int(
+                        authority.get("received_at_ms")
+                        or _utc_ms()
+                    )
+                    accepted_by_interval[interval] = (
+                        result.preview,
+                        received_at_ms,
+                        result.trade.provider_trade_id,
+                        format(result.trade.price, "f"),
+                    )
+        return [
+            self._candle_preview_message(
+                preview,
+                received_at_ms=received_at_ms,
+                settlement_trade_id=settlement_trade_id,
+                settlement_trade_price=settlement_trade_price,
+            )
+            for _, (
+                preview,
+                received_at_ms,
+                settlement_trade_id,
+                settlement_trade_price,
+            ) in sorted(accepted_by_interval.items())
+        ]
+
+    @staticmethod
+    def _candle_preview_message(
+        preview: ContractCandlePreview,
+        *,
+        received_at_ms: int,
+        settlement_trade_id: str,
+        settlement_trade_price: str,
+    ) -> dict[str, Any]:
+        trade_seeded_rollover = preview.baseline_source == "TRADE_ROLLOVER"
+        settlement_revision = (
+            f"contract:{preview.symbol}:{preview.interval}:"
+            f"{preview.generation}:{preview.open_time}:"
+            f"{preview.revision_epoch}:{preview.revision_sequence}:"
+            f"{preview.preview_sequence}"
+        )
+        preview_payload = {
+            "symbol": preview.symbol,
+            "interval": preview.interval,
+            "provider": preview.provider,
+            "open_time": preview.open_time,
+            "open_time_ms": preview.open_time,
+            "time": int(preview.open_time / 1000),
+            "open": format(preview.open, "f"),
+            "high": format(preview.high, "f"),
+            "low": format(preview.low, "f"),
+            "close": format(preview.close, "f"),
+            "volume": format(preview.volume, "f"),
+            "quote_volume": (
+                format(preview.quote_volume, "f")
+                if preview.quote_volume is not None
+                else None
+            ),
+            "source": "TRADE_PREVIEW",
+            "freshness": "LIVE",
+            "transport": "PROVIDER_WS",
+            "kline_mode": (
+                "TRADE_SEEDED_ROLLOVER_PREVIEW"
+                if trade_seeded_rollover
+                else "NATIVE_BASELINED_TRADE_PREVIEW"
+            ),
+            "price_source": "TRADE_TICK",
+            "baseline_source": preview.baseline_source,
+            "baseline_anchor_open_time": preview.baseline_anchor_open_time,
+            "provider_generation": preview.generation,
+            "revision_epoch": preview.revision_epoch,
+            "revision_sequence": preview.revision_sequence,
+            "preview_sequence": preview.preview_sequence,
+            "applied_trade_count": preview.applied_trade_count,
+            "settlement_trade_id": settlement_trade_id,
+            "settlement_trade_price": settlement_trade_price,
+            "received_at_ms": received_at_ms,
+            "is_closed": False,
+            "is_final": False,
+        }
+        return {
+            "type": "contract_candle_preview_update",
+            "domain": "kline",
+            "symbol": preview.symbol,
+            "market_symbol": _market_symbol(preview.symbol),
+            "interval": preview.interval,
+            "provider": preview.provider,
+            "source": "TRADE_PREVIEW",
+            "freshness": "LIVE",
+            "baseline_source": preview.baseline_source,
+            "baseline_anchor_open_time": preview.baseline_anchor_open_time,
+            "provider_generation": preview.generation,
+            "received_at_ms": received_at_ms,
+            "preview_sequence": preview.preview_sequence,
+            "base_native_revision": {
+                "epoch": preview.revision_epoch,
+                "sequence": preview.revision_sequence,
+            },
+            "settlement_revision": settlement_revision,
+            "settlement_trade_id": settlement_trade_id,
+            "settlement_trade_price": settlement_trade_price,
+            "preview": preview_payload,
+            "data": preview_payload,
+        }
+
+    def _accept_candle_preview_native(
+        self,
+        symbol: str,
+        interval: str,
+        payload: dict[str, Any],
+    ) -> None:
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        normalized_interval = normalize_contract_ws_interval(interval)
+        if normalized_interval not in SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS:
+            return
+        provider = str(payload.get("provider") or "").strip().upper()
+        generation = int(payload.get("provider_generation") or 0)
+        if provider != "OKX_SWAP" or generation <= 0:
+            return
+        closed_value = payload.get("is_closed")
+        is_closed = (
+            closed_value is True
+            or closed_value == 1
+            or str(closed_value or "").strip().lower() in {"1", "true", "closed"}
+        )
+        try:
+            self._candle_preview_engine.accept_native_revision(
+                {
+                    "symbol": normalized_symbol,
+                    "interval": normalized_interval,
+                    "provider": provider,
+                    "open_time": payload.get("open_time") or payload.get("open_time_ms"),
+                    "open": payload.get("open"),
+                    "high": payload.get("high"),
+                    "low": payload.get("low"),
+                    "close": payload.get("close"),
+                    "volume": payload.get("volume"),
+                    "quote_volume": payload.get("quote_volume"),
+                    "revision_epoch": payload.get("revision_epoch"),
+                    "revision_sequence": (
+                        payload.get("revision_sequence") or payload.get("revision_seq")
+                    ),
+                    "generation": generation,
+                    "is_closed": is_closed,
+                }
+            )
+        except (TypeError, ValueError):
+            logger.debug(
+                "contract_candle_preview_native_rejected provider=%s symbol=%s interval=%s",
+                provider,
+                normalized_symbol,
+                normalized_interval,
+                exc_info=True,
+            )
 
     def _refresh_provider_ws_klines_once(self, symbol: str, intervals: list[str]) -> list[dict[str, Any]]:
         if not provider_ws_kline_enabled():
@@ -1077,9 +1605,7 @@ class ContractMarketGateway:
                 )
                 if not isinstance(payload, dict):
                     continue
-                kline = _legacy_domain_value(
-                    _normalize_kline(payload, source=payload.get("source") or "LIVE_WS")
-                )
+                kline = _normalize_kline(payload, source=payload.get("source") or "LIVE_WS")
                 signature = self._kline_signature(kline)
                 if self._last_kline_signature.get(key) == signature:
                     continue
@@ -1091,9 +1617,16 @@ class ContractMarketGateway:
                     authority_payload=payload,
                 ):
                     continue
+                self._accept_candle_preview_native(
+                    normalized_symbol,
+                    interval,
+                    {**payload, **kline},
+                )
                 self._last_kline_signature[key] = signature
                 self._last_kline_broadcast_at[key] = time.monotonic()
-                messages.append(self._kline_message(normalized_symbol, interval, kline))
+                message = self._kline_message(normalized_symbol, interval)
+                if message is not None:
+                    messages.append(message)
         finally:
             db.close()
         return messages
@@ -1126,8 +1659,36 @@ class ContractMarketGateway:
             interval=normalized_interval,
             limit=CONTRACT_MARKET_WS_KLINE_LIMIT,
         )
+        if bool(getattr(rows, "history_incomplete", False)):
+            return None
         latest_row = rows[-1] if rows else None
-        return latest_row if isinstance(latest_row, dict) else None
+        if not isinstance(latest_row, dict):
+            return None
+        result_origin = str(getattr(rows, "origin", "") or "").strip().upper()
+        source = {
+            "DB_CACHE": "DB_CACHE",
+            "PROCESS_CACHE": "PROCESS_CACHE",
+            "STALE_CACHE": "STALE_CACHE",
+        }.get(result_origin, "PROVIDER_REST")
+        contract_symbol = None
+        try:
+            contract_symbol = _load_contract_symbol(db, symbol)
+        except Exception:
+            pass
+        received_at_ms = latest_row.get("received_at_ms")
+        if received_at_ms in (None, "") and source == "PROVIDER_REST":
+            received_at_ms = _utc_ms()
+        return {
+            **latest_row,
+            "source": source,
+            "provider": latest_row.get("provider") or getattr(contract_symbol, "provider", None),
+            "provider_symbol": (
+                latest_row.get("provider_symbol")
+                or getattr(contract_symbol, "provider_symbol", None)
+            ),
+            "fallback_reason": ContractMarketDomainFallbackReason.WS_MISS.value,
+            "received_at_ms": received_at_ms,
+        }
 
     def _load_depth_payload(
         self,
@@ -1283,7 +1844,28 @@ class ContractMarketGateway:
 
     def _provider_ws_kline_broadcast_interval_seconds(self) -> float:
         interval_ms = int(getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_KLINE_BROADCAST_INTERVAL_MS", 1000) or 1000)
-        return max(0.2, min(interval_ms / 1000, 5.0))
+        return max(
+            0.1,
+            min(interval_ms, CONTRACT_MARKET_WS_KLINE_BROADCAST_INTERVAL_MAX_MS) / 1000,
+        )
+
+    def _should_refresh_kline_rest_fallback(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        key = (
+            normalize_contract_ws_symbol(symbol),
+            normalize_contract_ws_interval(interval),
+        )
+        current = time.monotonic() if now is None else float(now)
+        last_refresh = self._last_kline_rest_fallback_at.get(key)
+        return (
+            last_refresh is None
+            or current - last_refresh >= CONTRACT_MARKET_WS_KLINE_REST_FALLBACK_INTERVAL_SECONDS
+        )
 
     def _remember_depth_signature(self, symbol: str, depth: dict[str, Any]) -> None:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
@@ -1302,18 +1884,28 @@ class ContractMarketGateway:
 
     def _remember_trade_ids(self, symbol: str, trades: list[dict[str, Any]]) -> None:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
-        ids = {str(item.get("id") or "") for item in trades if item.get("id") is not None}
-        if ids:
-            self._last_trade_ids[normalized_symbol] = ids
+        seen = self._last_trade_ids.setdefault(normalized_symbol, OrderedDict())
+        for item in trades:
+            trade_id = str(item.get("id") or "")
+            if not trade_id:
+                continue
+            seen[trade_id] = None
+            seen.move_to_end(trade_id)
+        while len(seen) > CONTRACT_MARKET_WS_TRADE_DEDUPE_MAX_IDS:
+            seen.popitem(last=False)
+        if not seen:
+            self._last_trade_ids.pop(normalized_symbol, None)
 
     def _filter_new_trades(self, symbol: str, trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
-        seen = self._last_trade_ids.get(normalized_symbol) or set()
+        seen = self._last_trade_ids.get(normalized_symbol) or {}
+        batch_seen: set[str] = set()
         fresh: list[dict[str, Any]] = []
         for item in trades:
             trade_id = str(item.get("id") or "")
-            if not trade_id or trade_id in seen:
+            if not trade_id or trade_id in seen or trade_id in batch_seen:
                 continue
+            batch_seen.add(trade_id)
             fresh.append(item)
         return fresh
 
@@ -1352,6 +1944,12 @@ class ContractMarketGateway:
                 "close": kline.get("close"),
                 "volume": kline.get("volume"),
                 "source": kline.get("source"),
+                "provider": kline.get("provider"),
+                "provider_generation": kline.get("provider_generation"),
+                "revision_epoch": kline.get("revision_epoch"),
+                "revision_sequence": kline.get("revision_sequence") or kline.get("revision_seq"),
+                "is_closed": kline.get("is_closed"),
+                "close_state_source": kline.get("close_state_source"),
             }
         )
 
@@ -1413,8 +2011,27 @@ class ContractMarketGateway:
             "trade": normalized_trade,
         }
 
-    def _trades_message(self, symbol: str, trades: list[dict[str, Any]]) -> dict[str, Any]:
-        normalized_trades = [_normalize_trade(dict(item)) for item in trades]
+    def _trades_message(
+        self,
+        symbol: str,
+        trades: list[dict[str, Any]],
+        *,
+        preferred_trade_id: Any = None,
+    ) -> dict[str, Any]:
+        normalized_preferred_trade_id = str(preferred_trade_id or "")
+        indexed_trades = [
+            (index, _normalize_trade(dict(item)))
+            for index, item in enumerate(trades)
+        ]
+        indexed_trades.sort(
+            key=lambda item: (
+                str(item[1].get("id") or "") == normalized_preferred_trade_id,
+                _trade_event_time_ms(item[1]) or 0,
+                item[0],
+            ),
+            reverse=True,
+        )
+        normalized_trades = [item for _, item in indexed_trades]
         latest_trade = normalized_trades[0] if normalized_trades else {}
         return {
             "type": "contract_trade",
@@ -1434,19 +2051,91 @@ class ContractMarketGateway:
             "trade": normalized_trades[0] if normalized_trades else None,
         }
 
-    def _kline_message(self, symbol: str, interval: str, kline: dict[str, Any]) -> dict[str, Any]:
+    def _kline_authority_payload(
+        self,
+        symbol: str,
+        interval: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
         normalized_interval = normalize_contract_ws_interval(interval)
+        snapshot = self.get_domain_snapshot(
+            ContractMarketDomainName.KLINE,
+            normalized_symbol,
+            interval=normalized_interval,
+        )
+        if snapshot is None or not isinstance(snapshot.data, dict):
+            return None
+        metadata = snapshot.metadata
+        observed_at_ms = (
+            metadata.received_at_ms
+            or metadata.cache_updated_at_ms
+            or metadata.db_updated_at_ms
+        )
+        expired = bool(
+            observed_at_ms is None
+            or metadata.ttl_ms is None
+            or _utc_ms() - observed_at_ms > metadata.ttl_ms
+        )
+        if (
+            metadata.stale
+            or expired
+            or metadata.source == ContractMarketDomainSource.MISSING
+            or metadata.completeness.status != ContractMarketDomainCompletenessStatus.COMPLETE
+            or not _non_negative_kline_volume(snapshot.data.get("volume"))
+        ):
+            return None
+        revision = metadata.revision
+        revision_payload = revision.model_dump() if revision is not None else None
+        authority = {
+            "source": metadata.source.value,
+            "provider": metadata.provider,
+            "provider_symbol": metadata.provider_symbol,
+            "freshness": metadata.freshness.value,
+            "transport": metadata.transport.value,
+            "cache_origin": metadata.cache_origin.value,
+            "fallback_reason": (
+                metadata.fallback_reason.value
+                if metadata.fallback_reason is not None
+                else None
+            ),
+            "provider_generation": metadata.provider_generation,
+            "revision": revision_payload,
+            "revision_epoch": revision.epoch if revision is not None else None,
+            "revision_sequence": revision.sequence if revision is not None else None,
+            "is_closed": revision.is_closed if revision is not None else None,
+            "close_state_source": revision.close_state_source if revision is not None else None,
+            "provider_event_time_ms": metadata.provider_event_time_ms,
+            "received_at_ms": metadata.received_at_ms,
+            "stale": metadata.stale,
+            "snapshot_id": snapshot.snapshot_id,
+        }
+        present_authority = {
+            key: value
+            for key, value in authority.items()
+            if value is not None
+        }
+        return ({**snapshot.data, **present_authority}, present_authority)
+
+    def _kline_message(
+        self,
+        symbol: str,
+        interval: str,
+    ) -> dict[str, Any] | None:
+        normalized_interval = normalize_contract_ws_interval(interval)
+        resolved = self._kline_authority_payload(symbol, normalized_interval)
+        if resolved is None:
+            return None
+        payload, authority = resolved
         return {
             "type": "contract_kline_update",
             "domain": "kline",
             "symbol": normalize_contract_ws_symbol(symbol),
             "market_symbol": _market_symbol(symbol),
             "interval": normalized_interval,
-            "ts": _timestamp_ms(kline.get("open_time") or kline.get("time")),
-            "source": kline.get("source"),
-            "quote_source": kline.get("quote_source"),
-            "data": kline,
-            "kline": kline,
+            "ts": _timestamp_ms(payload.get("open_time") or payload.get("time")),
+            **authority,
+            "data": payload,
+            "kline": payload,
         }
 
     def _state_message(self, symbol: str, state: dict[str, Any]) -> dict[str, Any]:
@@ -1471,7 +2160,27 @@ class ContractMarketGateway:
             "data": {"status": status},
         }
 
-    def _domain_snapshot_ttl_ms(self, domain: ContractMarketDomainName) -> int:
+    def _domain_snapshot_ttl_ms(
+        self,
+        domain: ContractMarketDomainName,
+        *,
+        provider: Any = None,
+    ) -> int:
+        if (
+            domain == ContractMarketDomainName.KLINE
+            and str(provider or "").strip().upper() == "ITICK"
+        ):
+            return max(
+                100,
+                int(
+                    getattr(
+                        settings,
+                        "CONTRACT_PROVIDER_WS_ITICK_KLINE_MAX_AGE_MS",
+                        90000,
+                    )
+                    or 90000
+                ),
+            )
         setting_name = {
             ContractMarketDomainName.TICKER: "CONTRACT_PROVIDER_WS_TICKER_MAX_AGE_MS",
             ContractMarketDomainName.DEPTH: "CONTRACT_PROVIDER_WS_DEPTH_MAX_AGE_MS",
@@ -1506,32 +2215,61 @@ class ContractMarketGateway:
             source in _CONTRACT_MARKET_PROVIDER_WS_SOURCES
             or provider_generation is not None
         )
-        received_at_ms = (
-            metadata.get("received_at_ms")
-            or metadata.get("updated_at_ms")
-            or _utc_ms()
-        )
+        cache_authority = {
+            "DB_CACHE": (
+                ContractMarketDomainTransport.CACHE_READ,
+                ContractMarketDomainCacheOrigin.DATABASE,
+            ),
+            "PROCESS_CACHE": (
+                ContractMarketDomainTransport.CACHE_READ,
+                ContractMarketDomainCacheOrigin.PROCESS_MEMORY,
+            ),
+            "STALE_CACHE": (
+                ContractMarketDomainTransport.CACHE_READ,
+                ContractMarketDomainCacheOrigin.LAST_GOOD_MEMORY,
+            ),
+        }.get(source)
+        received_at_ms = metadata.get("received_at_ms") or metadata.get("updated_at_ms")
+        if received_at_ms in (None, "") and cache_authority is None:
+            received_at_ms = _utc_ms()
         context_source = (
             ContractMarketDomainSource.REST_SNAPSHOT
             if source == "PROVIDER_REST"
             else None
         )
+        raw_fallback_reason = str(metadata.get("fallback_reason") or "").strip().upper()
+        try:
+            fallback_reason = (
+                ContractMarketDomainFallbackReason(raw_fallback_reason)
+                if raw_fallback_reason
+                else None
+            )
+        except ValueError:
+            fallback_reason = ContractMarketDomainFallbackReason.UNKNOWN
         context = ContractMarketDomainSnapshotContext(
             symbol=normalized_symbol,
             interval=normalized_interval,
             transport=(
                 ContractMarketDomainTransport.PROVIDER_WS
                 if provider_ws_authority
+                else cache_authority[0]
+                if cache_authority is not None
                 else ContractMarketDomainTransport.PROVIDER_REST
             ),
             cache_origin=(
                 ContractMarketDomainCacheOrigin.PROVIDER_MEMORY
                 if provider_ws_authority
+                else cache_authority[1]
+                if cache_authority is not None
                 else ContractMarketDomainCacheOrigin.NONE
             ),
             source=context_source,
+            fallback_reason=fallback_reason,
             received_at_ms=received_at_ms,
-            ttl_ms=self._domain_snapshot_ttl_ms(domain),
+            ttl_ms=self._domain_snapshot_ttl_ms(
+                domain,
+                provider=metadata.get("provider"),
+            ),
             emitted_at_ms=_utc_ms(),
         )
         legacy_value = _legacy_domain_value(value)
@@ -1606,6 +2344,10 @@ class ContractMarketGateway:
         interval: str | None = None,
         authority_payload: Any = None,
     ) -> bool:
+        if template == CONTRACT_MARKET_CACHE_KLINE:
+            kline = _authority_mapping(value)
+            if not kline or not _non_negative_kline_volume(kline.get("volume")):
+                return False
         if template == CONTRACT_MARKET_CACHE_TRADES:
             if not isinstance(value, list):
                 return False
@@ -1642,3 +2384,6 @@ class ContractMarketGateway:
 
 
 contract_market_gateway = ContractMarketGateway()
+set_contract_provider_ws_kline_revision_listener(
+    contract_market_gateway.notify_provider_kline_revision
+)

@@ -222,6 +222,28 @@ const marketStoreModule = loadTypeScriptModule(
   {},
 );
 
+const previewCompositorModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./contractTradingViewPreviewCompositor.ts', import.meta.url)),
+  {},
+);
+
+const realtimeBarFrameCoalescerModule = {
+  ContractTradingViewRealtimeBarFrameCoalescer: class {
+    private readonly onFlush: (candidate: any) => void;
+
+    constructor(options: { onFlush: (candidate: any) => void }) {
+      this.onFlush = options.onFlush;
+    }
+
+    enqueue(candidate: any) {
+      this.onFlush(candidate);
+      return true;
+    }
+
+    cancel() {}
+  },
+};
+
 const datafeedModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractTradingViewDatafeed.ts', import.meta.url)),
   {
@@ -236,6 +258,8 @@ const datafeedModule = loadTypeScriptModule(
     './contractKlineCachePolicy': policyModule,
     './contractKlineLoadPolicy': loadPolicyModule,
     './contractKlinePreloadManager': preloadManagerModule,
+    './contractTradingViewPreviewCompositor': previewCompositorModule,
+    './contractTradingViewRealtimeBarFrameCoalescer': realtimeBarFrameCoalescerModule,
   },
 );
 
@@ -376,6 +400,7 @@ function ingestStoreKline(params: {
   eventTimeMs?: number;
   generation?: number;
   sequence?: number;
+  isClosed?: boolean;
 }) {
   return marketStoreModule.contractMarketStore.ingest({
     symbol: params.symbol,
@@ -395,9 +420,65 @@ function ingestStoreKline(params: {
     providerGeneration: params.generation,
     revision: params.sequence === undefined
       ? null
-      : { epoch: params.generation ?? null, sequence: params.sequence },
+      : {
+          epoch: params.generation ?? null,
+          sequence: params.sequence,
+          isClosed: params.isClosed ?? false,
+        },
     eventTimeMs: params.eventTimeMs ?? params.openTime,
   });
+}
+
+function realtimePreview(params: {
+  symbol: string;
+  interval?: string;
+  openTime: number;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume?: string;
+  generation: number;
+  sequence: number;
+  previewSequence: number;
+  receivedAtMs?: number;
+}) {
+  const interval = params.interval ?? '1m';
+  const preview = {
+    symbol: params.symbol,
+    interval,
+    provider: 'OKX_SWAP',
+    open_time: params.openTime,
+    open: params.open,
+    high: params.high,
+    low: params.low,
+    close: params.close,
+    volume: params.volume,
+    source: 'TRADE_PREVIEW',
+    freshness: 'LIVE',
+    provider_generation: params.generation,
+    revision_epoch: params.generation,
+    revision_sequence: params.sequence,
+    preview_sequence: params.previewSequence,
+    received_at_ms: params.receivedAtMs ?? params.openTime + 1_000,
+  };
+  return {
+    type: 'contract_candle_preview_update',
+    domain: 'kline',
+    symbol: params.symbol,
+    interval,
+    provider: 'OKX_SWAP',
+    source: 'TRADE_PREVIEW',
+    freshness: 'LIVE',
+    provider_generation: params.generation,
+    preview_sequence: params.previewSequence,
+    received_at_ms: preview.received_at_ms,
+    base_native_revision: {
+      epoch: params.generation,
+      sequence: params.sequence,
+    },
+    preview,
+  };
 }
 
 
@@ -547,6 +628,54 @@ test('history and realtime bars fail closed without complete provider volume evi
     );
     assert.equal(realtime(invalidVolume), null, `realtime volume ${String(invalidVolume)}`);
   }
+});
+
+
+test('trade preview input requires complete live OKX OHLCV revision evidence', () => {
+  const toInput = datafeedModule.realtimePreviewMessageToInput;
+  const valid = realtimePreview({
+    symbol: 'BTCUSDT_PERP',
+    openTime: 1_717_000_000_000,
+    open: '100',
+    high: '103',
+    low: '99',
+    close: '102',
+    volume: '7',
+    generation: 4,
+    sequence: 8,
+    previewSequence: 2,
+  });
+
+  assert.deepEqual(
+    toInput(valid, 'BTCUSDT_PERP', '1m')?.bar,
+    { time: 1_717_000_000_000, open: 100, high: 103, low: 99, close: 102, volume: 7 },
+  );
+  assert.equal(
+    toInput({ ...valid, preview: { ...valid.preview, volume: undefined } }, 'BTCUSDT_PERP', '1m'),
+    null,
+  );
+  assert.equal(
+    toInput({ ...valid, provider: 'ITICK' }, 'BTCUSDT_PERP', '1m'),
+    null,
+  );
+  assert.equal(
+    toInput({
+      ...valid,
+      freshness: 'STALE',
+      preview: { ...valid.preview, freshness: 'STALE' },
+    }, 'BTCUSDT_PERP', '1m'),
+    null,
+  );
+  assert.equal(
+    toInput({
+      ...valid,
+      provider_generation: 0,
+      preview: { ...valid.preview, provider_generation: 0 },
+    }, 'BTCUSDT_PERP', '1m'),
+    null,
+  );
+  assert.equal(toInput(valid, 'ETHUSDT_PERP', '1m'), null);
+  assert.equal(toInput(valid, 'BTCUSDT_PERP', '5m'), null);
 });
 
 
@@ -4273,6 +4402,93 @@ test('Store realtime revisions publish close and volume from the same candle evi
     [
       { close: 101, volume: 5 },
       { close: 102, volume: 8 },
+    ],
+  );
+  datafeed.destroy();
+});
+
+
+test('BTC 1m preview advances close and volume together until the native candle settles', async () => {
+  const symbol = 'BTCUSDT_PERP';
+  const openTime = 1_717_100_020_000;
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol);
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'native-preview-settlement-subscriber',
+  );
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '100',
+    volume: '5',
+    eventTimeMs: openTime + 1_000,
+    generation: 7,
+    sequence: 10,
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime,
+    open: '100',
+    high: '103',
+    low: '100',
+    close: '103',
+    volume: '7',
+    generation: 7,
+    sequence: 10,
+    previewSequence: 1,
+    receivedAtMs: openTime + 2_000,
+  }));
+
+  // A later open Native revision cannot visually roll the accepted preview
+  // backward while the provider candle is still settling.
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '102',
+    volume: '6',
+    eventTimeMs: openTime + 3_000,
+    generation: 7,
+    sequence: 11,
+  });
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '104',
+    volume: '8',
+    eventTimeMs: openTime + 59_000,
+    generation: 7,
+    sequence: 12,
+    isClosed: true,
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime,
+    open: '100',
+    high: '105',
+    low: '100',
+    close: '105',
+    volume: '9',
+    generation: 7,
+    sequence: 12,
+    previewSequence: 2,
+    receivedAtMs: openTime + 60_000,
+  }));
+
+  assert.deepEqual(
+    received.map((bar) => ({ close: bar.close, volume: bar.volume })),
+    [
+      { close: 100, volume: 5 },
+      { close: 103, volume: 7 },
+      { close: 104, volume: 8 },
     ],
   );
   datafeed.destroy();
