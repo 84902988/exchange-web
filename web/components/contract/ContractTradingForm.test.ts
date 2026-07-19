@@ -239,9 +239,10 @@ test('TradingForm display state synchronizes closed market without replacing exe
     stale: true,
   }), 'unavailable');
   assert.match(formSource, /resolveContractExecutionPrice\(\{/);
-  assert.match(formSource, /\[contract-trading-form-market-diff\]/);
+  assert.doesNotMatch(formSource, /\[contract-trading-form-market-diff\]/);
   assert.doesNotMatch(formSource, /executionPrices\s*=\s*displayMarketRead/);
-  assert.match(formSource, /data-display-price=\{displayMarketRead\.displayPrice/);
-  assert.match(formSource, /data-mark-price=\{displayMarketRead\.markPrice/);
-  assert.match(formSource, /data-index-price=\{displayMarketRead\.indexPrice/);
+  assert.doesNotMatch(formSource, /contract-trading-form-market-display/);
+  assert.doesNotMatch(formSource, /data-display-price=\{displayMarketRead\.displayPrice/);
+  assert.doesNotMatch(formSource, /data-mark-price=\{displayMarketRead\.markPrice/);
+  assert.doesNotMatch(formSource, /data-index-price=\{displayMarketRead\.indexPrice/);
 });
