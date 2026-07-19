@@ -72,7 +72,8 @@ export function resolveRuntimeHttpApiBaseUrl({
 }): string {
   const normalizedHost = String(host || "").trim().toLowerCase();
   const normalizedOrigin = String(origin || "").trim().replace(/\/+$/, "");
-  const canUseFrontendProxy = Boolean(getCpolarIoApiBaseUrl(normalizedHost))
+  const canUseFrontendProxy = ["127.0.0.1", "localhost", "::1", "[::1]"].includes(normalizedHost)
+    || Boolean(getCpolarIoApiBaseUrl(normalizedHost))
     || normalizedHost.endsWith(".cpolar.top");
 
   if (canUseFrontendProxy && normalizedOrigin) {

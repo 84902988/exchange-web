@@ -1,4 +1,4 @@
-import { request } from "@/lib/api/core/request";
+import { publicRequest } from "@/lib/api/core/request";
 import { getContentApiLanguage, withContentLanguage } from "@/lib/api/core/locale";
 import type { Language } from "@/utils/language";
 
@@ -156,7 +156,7 @@ export async function getSiteConfig(language?: string): Promise<SiteConfig> {
   }
 
   // Collapse concurrent Header/Footer/title requests for the same language.
-  const requestPromise = request<SiteConfig>(withContentLanguage("/site/config", cacheKey))
+  const requestPromise = publicRequest<SiteConfig>(withContentLanguage("/site/config", cacheKey))
     .then((config) => {
       siteConfigCache.set(cacheKey, {
         result: config,
@@ -186,17 +186,17 @@ export async function getSiteConfig(language?: string): Promise<SiteConfig> {
 }
 
 export async function getHomeBanners(language?: string): Promise<{ items: HomeBanner[] }> {
-  return request<{ items: HomeBanner[] }>(withContentLanguage("/home/banners", language));
+  return publicRequest<{ items: HomeBanner[] }>(withContentLanguage("/home/banners", language));
 }
 
 export async function getLatestAnnouncements(language?: string): Promise<{ items: LatestAnnouncement[] }> {
-  return request<{ items: LatestAnnouncement[] }>(withContentLanguage("/announcements/latest", language));
+  return publicRequest<{ items: LatestAnnouncement[] }>(withContentLanguage("/announcements/latest", language));
 }
 
 export async function getAboutPage(language?: string): Promise<AboutPageContent> {
-  return request<AboutPageContent>(withContentLanguage("/site/pages/about", language));
+  return publicRequest<AboutPageContent>(withContentLanguage("/site/pages/about", language));
 }
 
 export async function getLegalPage(pageKey: LegalPageKey, language?: string): Promise<LegalPageContent> {
-  return request<LegalPageContent>(withContentLanguage(`/site/pages/legal/${pageKey}`, language));
+  return publicRequest<LegalPageContent>(withContentLanguage(`/site/pages/legal/${pageKey}`, language));
 }

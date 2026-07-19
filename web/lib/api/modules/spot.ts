@@ -1,4 +1,4 @@
-import { request } from '../core/request'
+import { publicRequest, request } from '../core/request'
 
 export type SpotOrderSide = 'BUY' | 'SELL'
 export type SpotOrderType = 'LIMIT' | 'MARKET'
@@ -37,7 +37,7 @@ export async function createSpotOrder(
 }
 
 export async function getSpotFeeSettings(): Promise<SpotFeeSettings> {
-  return request<SpotFeeSettings>('/spot/fee-settings')
+  return publicRequest<SpotFeeSettings>('/spot/fee-settings')
 }
 
 export type CancelSpotOrderResponse = {
@@ -359,7 +359,7 @@ export async function getSpotMarketTickers(
     }
   }
 
-  const payload = await request<SpotMarketTickerItem[] | { items?: SpotMarketTickerItem[] }>(
+  const payload = await publicRequest<SpotMarketTickerItem[] | { items?: SpotMarketTickerItem[] }>(
     buildRelativeUrl('/market/tickers', params),
   )
 
@@ -390,7 +390,7 @@ export async function getSpotMarketPairs(
     query.set('keyword', keyword)
   }
 
-  const payload = await request<SpotMarketPairsResponse>(
+  const payload = await publicRequest<SpotMarketPairsResponse>(
     buildRelativeUrl('/market/pairs', query),
   )
 
@@ -408,7 +408,7 @@ export async function getSpotMarketView(symbol: string): Promise<SpotMarketView>
     symbol: normalizedSymbol,
   })
 
-  return request<SpotMarketView>(buildRelativeUrl('/market/spot/view', params))
+  return publicRequest<SpotMarketView>(buildRelativeUrl('/market/spot/view', params))
 }
 
 export async function getSpotDepth(
@@ -421,7 +421,7 @@ export async function getSpotDepth(
     limit: String(limit),
   })
 
-  return request<SpotDepthResponse>(buildRelativeUrl('/market/depth', params))
+  return publicRequest<SpotDepthResponse>(buildRelativeUrl('/market/depth', params))
 }
 
 export function normalizeSpotTrades(
@@ -448,7 +448,7 @@ export async function getSpotTrades(
     limit: String(limit),
   })
 
-  return request<SpotMarketTradesResponse>(buildRelativeUrl('/market/trades', params))
+  return publicRequest<SpotMarketTradesResponse>(buildRelativeUrl('/market/trades', params))
 }
 
 export async function getSpotKlines(params: {
@@ -473,7 +473,7 @@ export async function getSpotKlines(params: {
     query.set('force_rest', '1')
   }
 
-  return request<SpotMarketKlinesResponse>(buildRelativeUrl('/market/kline', query))
+  return publicRequest<SpotMarketKlinesResponse>(buildRelativeUrl('/market/kline', query))
 }
 
 export type SpotBalanceItem = {
