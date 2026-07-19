@@ -1558,12 +1558,8 @@ function SummaryPositionsCards({
         const tpSlReferencePrice = isCurrent
           ? getTpSlReferencePrice(quote, tpSlTriggerPriceType, markPrice)
           : markPrice;
-        const liquidationPrice = getAuthoritativeLiquidationPrice(item);
         const unrealized = getPositionUnrealizedPnl(item);
         const roe = getPositionRoe(item);
-        const marginRatio = truthUnavailableLabel ?? formatPlainPercent(item.margin_ratio);
-        const liquidationDistance = truthUnavailableLabel ?? formatLiquidationDistance(item.liquidation_distance, pricePrecision);
-        const liquidationRisk = getLiquidationRisk(item);
         const displayUnit = scope === 'current' ? quantityUnit : inferPositionQuantityUnit(item.symbol, quantityUnit);
         const closing = closingSummaryKey === summaryKey;
         const detailsExpanded = expandedDetailKeys.has(summaryKey);
@@ -1621,7 +1617,7 @@ function SummaryPositionsCards({
               </div>
             </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-10">
+            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-8">
               <PositionMetric label={t('quantity', 'contracts')} value={`${formatNumber(item.quantity, 6)} ${displayUnit}`} />
               <PositionMetric
                 label={t('entryPrice', 'contracts')}
@@ -1632,10 +1628,6 @@ function SummaryPositionsCards({
                 label={t('markPrice', 'contracts')}
                 labelTitle={t('markPriceRiskTitle', 'contracts')}
                 value={truthUnavailableLabel ?? (riskMarkPrice ? `${formatDisplayPrice(riskMarkPrice, pricePrecision)} USDT` : '--')}
-              />
-              <PositionMetric
-                label={t('liquidationPrice', 'contracts')}
-                value={liquidationPrice ? `${formatDisplayPrice(liquidationPrice, pricePrecision)} USDT` : '--'}
               />
               <PositionMetric label={t('margin', 'contracts')} value={`${formatNumber(item.margin_amount, 4)} USDT`} />
               <PositionMetric
@@ -1648,15 +1640,9 @@ function SummaryPositionsCards({
                 value={formatPnlPercent(roe)}
                 valueClassName={roe === null ? 'text-white/55' : roe > 0 ? 'text-[#00c087]' : roe < 0 ? 'text-[#f6465d]' : 'text-white/55'}
               />
-              <PositionMetric label={t('marginRatio', 'contracts')} value={marginRatio} />
-              <PositionMetric
-                label={t('liquidationDistance', 'contracts')}
-                value={liquidationDistance}
-                valueClassName={liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}
-              />
+              <PositionMetric label={t('marginRatio', 'contracts')} value={truthUnavailableLabel ?? formatPlainPercent(item.margin_ratio)} />
               <PositionMetric label={t('status', 'contracts')} value={statusLabel('OPEN', null, t)} />
             </div>
-            <RiskBar risk={liquidationRisk} />
 
             <details
               open={detailsExpanded}
@@ -1742,16 +1728,12 @@ function PositionsTable({
         const markPrice = toNumber(item.mark_price) > 0 ? item.mark_price : toNumber(quote?.mark_price) > 0 ? quote?.mark_price : null;
         const truthUnavailableLabel = getPositionTruthUnavailableLabel(item);
         const riskMarkPrice = !truthUnavailableLabel && toNumber(item.mark_price) > 0 ? item.mark_price : null;
-        const liquidationPrice = getAuthoritativeLiquidationPrice(item);
         const nearLiquidation = isNearLiquidation(item);
         const unrealized = getPositionUnrealizedPnl(item);
         const unrealizedText = unrealized === null
           ? truthUnavailableLabel ?? '--'
           : `${formatSignedPnl(unrealized, 4)} USDT`;
         const roe = getPositionRoe(item);
-        const marginRatio = truthUnavailableLabel ?? formatPlainPercent(item.margin_ratio);
-        const liquidationDistance = truthUnavailableLabel ?? formatLiquidationDistance(item.liquidation_distance, pricePrecision);
-        const liquidationRisk = getLiquidationRisk(item);
         const isOpen = item.status === 'OPEN';
         const isLiquidated = item.status === 'LIQUIDATED';
         const hasTpSl = hasPositionTpSl(item);
@@ -1809,7 +1791,7 @@ function PositionsTable({
               </div>
             </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-10">
+            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-8">
               <PositionMetric label={t('quantity', 'contracts')} value={`${formatNumber(item.quantity, 6)} ${quantityUnit}`} />
               <PositionMetric
                 label={t('entryPrice', 'contracts')}
@@ -1820,11 +1802,6 @@ function PositionsTable({
                 label={t('markPrice', 'contracts')}
                 labelTitle={t('markPricePnlRiskTitle', 'contracts')}
                 value={truthUnavailableLabel ?? (riskMarkPrice ? `${formatDisplayPrice(riskMarkPrice, pricePrecision)} USDT` : '--')}
-              />
-              <PositionMetric
-                label={t('liquidationPrice', 'contracts')}
-                value={liquidationPrice ? `${formatDisplayPrice(liquidationPrice, pricePrecision)} USDT` : '--'}
-                valueClassName={nearLiquidation ? 'text-[#f6465d]' : 'text-white/86'}
               />
               <PositionMetric label={t('margin', 'contracts')} value={`${formatNumber(item.margin_amount, 2)} USDT`} />
               <PositionMetric
@@ -1837,15 +1814,9 @@ function PositionsTable({
                 value={formatPnlPercent(roe)}
                 valueClassName={roe === null ? 'text-white/55' : roe > 0 ? 'text-[#00c087]' : roe < 0 ? 'text-[#f6465d]' : 'text-white/55'}
               />
-              <PositionMetric label={t('marginRatio', 'contracts')} value={marginRatio} />
-              <PositionMetric
-                label={t('liquidationDistance', 'contracts')}
-                value={liquidationDistance}
-                valueClassName={liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}
-              />
+              <PositionMetric label={t('marginRatio', 'contracts')} value={truthUnavailableLabel ?? formatPlainPercent(item.margin_ratio)} />
               <PositionMetric label={t('status', 'contracts')} value={statusLabel(item.status, item.close_reason, t)} />
             </div>
-            <RiskBar risk={liquidationRisk} />
           </div>
         );
       })}
@@ -2289,11 +2260,8 @@ function PositionDetailCard({
     ? position.mark_price
     : null;
   const unrealized = getPositionUnrealizedPnl(position);
-  const liquidationPrice = getAuthoritativeLiquidationPrice(position);
   const roe = getPositionRoe(position);
   const marginRatio = truthUnavailableLabel ?? formatPlainPercent(position.margin_ratio);
-  const liquidationDistance = truthUnavailableLabel ?? formatLiquidationDistance(position.liquidation_distance, pricePrecision);
-  const liquidationRisk = getLiquidationRisk(position);
   const takeProfitBadge = formatOptionalTpSlBadge(position.take_profit_price, pricePrecision);
   const stopLossBadge = formatOptionalTpSlBadge(position.stop_loss_price, pricePrecision);
   const isOpen = position.status === 'OPEN';
@@ -2330,11 +2298,10 @@ function PositionDetailCard({
         ) : null}
       </div>
 
-      <div className="grid grid-cols-2 gap-x-6 gap-y-2 md:grid-cols-3 xl:grid-cols-10">
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2 md:grid-cols-3 xl:grid-cols-6">
         <DetailMetric label={t('quantity', 'contracts')} value={formatNumber(position.quantity, 6)} />
         <DetailMetric label={t('entryPrice', 'contracts')} value={formatDisplayPrice(position.entry_price, pricePrecision)} />
         <DetailMetric label={t('markPrice', 'contracts')} value={truthUnavailableLabel ?? (positionSnapshotMarkPrice ? formatDisplayPrice(positionSnapshotMarkPrice, pricePrecision) : '--')} />
-        <DetailMetric label={t('liquidationPrice', 'contracts')} value={liquidationPrice ? formatDisplayPrice(liquidationPrice, pricePrecision) : '--'} />
         <DetailMetric label={t('margin', 'contracts')} value={`${formatNumber(position.margin_amount, 4)} USDT`} />
         <DetailMetric label={t('openedAt', 'contracts')} value={formatHistoryTime(position.opened_at)} />
         <DetailMetric label={t('takeProfit', 'contracts')} value={takeProfitBadge ?? '--'} />
@@ -2350,11 +2317,6 @@ function PositionDetailCard({
           valueClassName={roe === null ? 'text-white/55' : roe > 0 ? 'text-[#00c087]' : roe < 0 ? 'text-[#f6465d]' : 'text-white/80'}
         />
         <DetailMetric label={t('marginRatio', 'contracts')} value={marginRatio} />
-        <DetailMetric
-          label={t('liquidationDistance', 'contracts')}
-          value={liquidationDistance}
-          valueClassName={liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}
-        />
       </div>
     </div>
   );
@@ -2640,34 +2602,6 @@ type LiquidationRisk = {
   percent: number;
   tone: 'low' | 'medium' | 'high' | 'extreme';
 };
-
-function RiskBar({
- risk }: { risk: LiquidationRisk | null }) {
-  const { t } = useLocaleContext();
-  const barClassName = risk ? riskBarClassName(risk.tone) : 'bg-white/12';
-  const labelClassName = risk ? riskTextClassName(risk.tone) : 'text-white/45';
-
-  return (
-    <div className="mt-3 rounded-md bg-white/[0.025] px-2 py-2">
-      <div className="mb-1.5 flex items-center justify-between text-[11px]">
-        <span className="text-white/38">{t('liquidationRisk', 'contracts')}</span>
-        <span className={`font-medium ${labelClassName}`}>{risk ? t(risk.labelKey, 'contracts') : '--'}</span>
-      </div>
-      <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
-        <div
-          className={`h-full rounded-full transition-[width] ${barClassName}`}
-          style={{ width: `${risk ? risk.percent : 0}%` }}
-        />
-      </div>
-    </div>
-  );
-}
-
-function riskBarClassName(tone: LiquidationRisk['tone']) {
-  if (tone === 'extreme' || tone === 'high') return 'bg-[#f6465d]';
-  if (tone === 'medium') return 'bg-[#f0b90b]';
-  return 'bg-[#00c087]';
-}
 
 function riskTextClassName(tone: LiquidationRisk['tone']) {
   if (tone === 'extreme' || tone === 'high') return 'text-[#f6465d]';
