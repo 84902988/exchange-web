@@ -150,6 +150,23 @@ def _tp_sl_trigger_price_from_quote(
     return mark_price, normalized_type == TP_SL_TRIGGER_LAST_PRICE
 
 
+def resolve_position_tp_sl_trigger_reference(
+    db: Session,
+    position: ContractPosition,
+    quote: dict[str, Any],
+) -> tuple[Decimal, Decimal, str]:
+    """Return the exact trigger reference shared by validation and the scanner."""
+    mark_price = _q18(quote.get("mark_price"))
+    trigger_price_type = _position_tp_sl_trigger_price_type(db, position)
+    trigger_price, _ = _tp_sl_trigger_price_from_quote(
+        quote,
+        mark_price,
+        trigger_price_type,
+        symbol=position.symbol,
+    )
+    return trigger_price, mark_price, trigger_price_type
+
+
 def _log_detached_last_price_fallback(*, symbol: Any, last_price: Decimal, fallback_price: Decimal) -> None:
     normalized_symbol = str(symbol or "").strip().upper() or "-"
     key = ("detached_last_price_fallback", normalized_symbol, "")
@@ -380,15 +397,20 @@ def execute_contract_tp_sl(
     if risk.is_liquidatable:
         raise ContractTpSlSkippedLiquidation("POSITION_LIQUIDATION_PRIORITY")
 
-    trigger_price_type = normalize_tp_sl_trigger_price_type(
-        trigger_price_type_override or _position_tp_sl_trigger_price_type(db, position)
-    )
-    trigger_price, _ = _tp_sl_trigger_price_from_quote(
-        quote,
-        mark_price,
-        trigger_price_type,
-        symbol=position.symbol,
-    )
+    if trigger_price_type_override:
+        trigger_price_type = normalize_tp_sl_trigger_price_type(trigger_price_type_override)
+        trigger_price, _ = _tp_sl_trigger_price_from_quote(
+            quote,
+            mark_price,
+            trigger_price_type,
+            symbol=position.symbol,
+        )
+    else:
+        trigger_price, _, trigger_price_type = resolve_position_tp_sl_trigger_reference(
+            db,
+            position,
+            quote,
+        )
     last_price = _quote_last_price(quote)
     trigger_type = _detect_tp_sl_trigger(position, trigger_price)
     if trigger_type is None:
