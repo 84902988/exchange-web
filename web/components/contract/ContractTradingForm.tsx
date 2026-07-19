@@ -31,6 +31,7 @@ import {
   isPositiveContractAmountAtPrecision,
   normalizeContractAmountPrecision,
   normalizeContractDecimalInput,
+  resolveContractOpenEntryReference,
 } from './contractTradingForm.utils';
 import {
   normalizeContractMarketViewDisplayState,
@@ -224,24 +225,6 @@ function contractActionText(action: PendingContractOrder['action'], side: Contra
   return side === 'LONG' ? t('closeLong', 'contracts') : t('closeShort', 'contracts');
 }
 
-function getPositionLiquidationPrice(position: ContractPositionItem | null, pricePrecision: number) {
-  if (!position) return '--';
-  const record = position as ContractPositionItem & {
-    estimated_liquidation_price?: string | number | null;
-  };
-  const liquidationPrice = toNumber(record.liquidation_price);
-  if (liquidationPrice > 0) return `${formatDisplayPrice(record.liquidation_price, pricePrecision)} USDT`;
-  const estimatedPrice = toNumber(record.estimated_liquidation_price);
-  return estimatedPrice > 0 ? `${formatDisplayPrice(record.estimated_liquidation_price, pricePrecision)} USDT` : '--';
-}
-
-function getSummaryLiquidationPrice(summary: ContractPositionSummaryItem | null, pricePrecision: number) {
-  if (!summary) return '--';
-  return toNumber(summary.liquidation_price) > 0
-    ? `${formatDisplayPrice(summary.liquidation_price, pricePrecision)} USDT`
-    : '--';
-}
-
 export default function ContractTradingForm({
   symbol,
   quote,
@@ -355,8 +338,6 @@ export default function ContractTradingForm({
   const quantityNumber = toNumber(quantityForOrder);
   const closeQuantityNumber = toNumber(closeQuantityForOrder || selectedCloseQuantity);
 
-  const quoteMarkPrice = toNumber(quote?.mark_price);
-  const quoteLastPrice = toNumber(quote?.last_price);
   const quoteSingleSideSpreadFeePrice = toNumber(quote?.single_side_spread_fee_price)
     || (toNumber(quote?.effective_total_spread) > 0 ? toNumber(quote?.effective_total_spread) / 2 : 0);
   const tradingFormStoreSnapshot = useContractTradingFormStoreSnapshot(symbol);
@@ -408,10 +389,6 @@ export default function ContractTradingForm({
       expectedSymbol: symbol,
     }),
   }), [priceAuthority, symbol]);
-  // Price Authority owns execution. These legacy values remain isolated to
-  // the existing TP/SL reference behavior and MarketView availability state.
-  const legacyTpSlExecutionBid = marketViewAuthority.executionBid ?? 0;
-  const legacyTpSlExecutionAsk = marketViewAuthority.executionAsk ?? 0;
   const resolvedExecutable = marketViewAuthority.executable;
   const resolvedReasonCode = marketViewAuthority.reasonCode;
   const reasonCodeUnavailable = isUnavailableExecutionReason(resolvedReasonCode);
@@ -516,17 +493,16 @@ export default function ContractTradingForm({
   const tpSlTriggerPriceTypeHint = normalizedTpSlTriggerPriceType === 'LAST_PRICE'
     ? t('tpSlLastPriceTrigger', 'contracts')
     : t('tpSlMarkPriceTrigger', 'contracts');
-  const currentTpSlTriggerReferencePrice = normalizedTpSlTriggerPriceType === 'LAST_PRICE'
-    ? (quoteLastPrice > 0 ? quoteLastPrice : quoteMarkPrice)
-    : quoteMarkPrice;
-  const currentTpSlFallbackOpenPrice = orderType === 'LIMIT'
-    ? toNumber(price)
-    : positionSide === 'LONG'
-      ? legacyTpSlExecutionAsk
-      : legacyTpSlExecutionBid;
-  const currentTpSlReferencePrice = currentTpSlTriggerReferencePrice > 0
-    ? currentTpSlTriggerReferencePrice
-    : currentTpSlFallbackOpenPrice;
+  const currentOpenExecution = positionSide === 'LONG'
+    ? executionPrices.openLong
+    : executionPrices.openShort;
+  const currentTpSlReferencePrice = resolveContractOpenEntryReference({
+    side: positionSide,
+    orderType,
+    limitPrice: price,
+    executionPrice: currentOpenExecution.price,
+    executable: currentOpenExecution.executable,
+  }) ?? 0;
 
   useEffect(() => {
     if (!tpSlEnabled || tradeTab !== 'OPEN' || currentTpSlReferencePrice <= 0) return;
@@ -667,9 +643,14 @@ export default function ContractTradingForm({
   }
 
   function openReferencePrice(side: ContractPositionSide) {
-    if (currentTpSlReferencePrice > 0) return currentTpSlReferencePrice;
-    if (orderType === 'LIMIT') return toNumber(price);
-    return side === 'LONG' ? legacyTpSlExecutionAsk : legacyTpSlExecutionBid;
+    const execution = side === 'LONG' ? executionPrices.openLong : executionPrices.openShort;
+    return resolveContractOpenEntryReference({
+      side,
+      orderType,
+      limitPrice: price,
+      executionPrice: execution.price,
+      executable: execution.executable,
+    }) ?? 0;
   }
 
   function validateTpSl(side: ContractPositionSide) {
@@ -868,11 +849,6 @@ export default function ContractTradingForm({
       ? (side === 'LONG' ? longMargin : shortMargin)
       : toNumber(selectedCloseSummary?.margin_amount || selectedClosePosition?.margin_amount || null);
     const confirmSpreadCost = isOpen ? spreadCostHint : closeSpreadCostHint;
-    const liquidationPrice = isOpen
-      ? '--'
-      : selectedCloseSummary
-        ? getSummaryLiquidationPrice(selectedCloseSummary, pricePrecision)
-        : getPositionLiquidationPrice(selectedClosePosition, pricePrecision);
     const confirmLeverage = isOpen
       ? leverage
       : toNumber(selectedClosePosition?.leverage || leverage);
@@ -893,7 +869,6 @@ export default function ContractTradingForm({
       { label: t('leverage', 'contracts'), value: `${confirmLeverage || leverage}x` },
       { label: t('margin', 'contracts'), value: displayMoney(confirmMargin, 6) },
       { label: t('spreadCost', 'contracts'), value: confirmSpreadCost === null ? '--' : `≈ ${formatPrice(confirmSpreadCost, 2)} USDT` },
-      { label: isOpen ? t('estimatedLiquidationPrice', 'contracts') : t('liquidationPriceShort', 'contracts'), value: liquidationPrice },
     ];
   }, [
     closeQuantityForOrder,
@@ -1229,11 +1204,11 @@ function OpenPanel({
   const { t } = useLocaleContext();
   const isLong = positionSide === 'LONG';
   const buttonToneClass = isLong ? 'bg-[#00c087]' : 'bg-[#f6465d]';
-  const buttonText = isLong ? t('openLong', 'contracts') : t('openShort', 'contracts');
+  const buttonText = isLong ? t('confirmBuy', 'contracts') : t('confirmSell', 'contracts');
 
   return (
     <div className="flex min-h-full flex-col gap-2.5 [@media(max-height:850px)]:gap-1.5">
-      <SideSwitcher value={positionSide} onChange={setPositionSide} />
+      <SideSwitcher value={positionSide} onChange={setPositionSide} longText={t('buyOrder', 'contracts')} shortText={t('sellOrder', 'contracts')} />
 
       <div className="flex items-center justify-between text-[11px] text-white/45">
         <span>{t('availableShort', 'contracts')}</span>
@@ -1277,10 +1252,8 @@ function OpenPanel({
         <SummaryRow label={t('estimatedExecutionPrice', 'contracts')} value={estimatedExecutionPrice === null ? '--' : `${formatDisplayPrice(estimatedExecutionPrice, pricePrecision)} USDT`} />
         <SummaryDualRow label={t('estimatedOpenValue', 'contracts')} longValue={displayMoney(longNotional, 4)} shortValue={displayMoney(shortNotional, 4)} activeSide={positionSide} />
         <SummaryDualRow label={t('estimatedMargin', 'contracts')} longValue={displayMoney(longMargin, 6)} shortValue={displayMoney(shortMargin, 6)} activeSide={positionSide} />
-        <SummaryDualRow label={t('estimatedLiquidationPrice', 'contracts')} longValue="--" shortValue="--" activeSide={positionSide} muted />
         <SummaryRow label={t('spreadCost', 'contracts')} value={spreadCostHint === null ? '--' : `≈ ${formatPrice(spreadCostHint, 2)} USDT`} muted title={spreadHintText} />
         <SummaryRow label={t('currentLeverage', 'contracts')} value={`${leverage}x`} />
-        <SummaryRow label={t('riskNotice', 'contracts')} value={t('riskDataUnavailable', 'contracts')} muted />
       </div>
 
         <div
@@ -1399,11 +1372,11 @@ function ClosePanel({
   const { t } = useLocaleContext();
   const isLong = closeSide === 'LONG';
   const buttonToneClass = isLong ? 'bg-[#00c087]' : 'bg-[#f6465d]';
-  const buttonText = isLong ? t('closeLong', 'contracts') : t('closeShort', 'contracts');
+  const buttonText = t('closePositionAction', 'contracts');
 
   return (
     <div className="flex min-h-full flex-col gap-2.5 [@media(max-height:850px)]:gap-1.5">
-      <SideSwitcher value={closeSide} onChange={setCloseSide} longText={t('closeLong', 'contracts')} shortText={t('closeShort', 'contracts')} />
+      <SideSwitcher value={closeSide} onChange={setCloseSide} longText={t('buyOrder', 'contracts')} shortText={t('sellOrder', 'contracts')} />
 
       {orderType === 'LIMIT' ? (
         <PriceField
@@ -1441,7 +1414,6 @@ function ClosePanel({
         <SummaryRow label={t('positionSide', 'contracts')} value={selectedSummary || selectedPosition ? sideText(closeSide, t) : '--'} valueClassName={sideTone(closeSide)} />
         <SummaryRow label={t('avgEntryPrice', 'contracts')} value={avgEntryPrice ? `${formatDisplayPrice(avgEntryPrice, pricePrecision)} USDT` : '--'} />
         <SummaryRow label={t('estimatedExecutionPrice', 'contracts')} value={estimatedExecutionPrice === null ? '--' : `${formatDisplayPrice(estimatedExecutionPrice, pricePrecision)} USDT`} />
-        <SummaryRow label={t('liquidationPriceShort', 'contracts')} value={selectedSummary ? getSummaryLiquidationPrice(selectedSummary, pricePrecision) : getPositionLiquidationPrice(selectedPosition, pricePrecision)} />
         <SummaryRow
           label={t('estimatedPnl', 'contracts')}
           value={`${closeEstimate >= 0 ? '+' : ''}${formatNumber(closeEstimate, 6)} USDT`}
