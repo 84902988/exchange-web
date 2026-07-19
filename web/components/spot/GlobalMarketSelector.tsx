@@ -2076,6 +2076,14 @@ export default function GlobalMarketSelector({
               )}
             </span>
             <span className={`min-w-0 truncate font-semibold leading-none ${isHeaderPlacement ? 'text-[17px]' : 'text-[15px]'}`}>{currentLabel}</span>
+            {pageType === 'contract' && isHeaderPlacement ? (
+              <span
+                className="shrink-0 rounded-full bg-white/[0.12] px-1.5 py-0.5 text-[10px] font-semibold leading-none text-white"
+                data-testid="market-selector-contract-badge"
+              >
+                {t('perpetualSuffix', 'markets')}
+              </span>
+            ) : null}
             <span
               aria-hidden="true"
               className={`relative h-3 w-3 shrink-0 transition-transform duration-150 ${open ? 'rotate-180' : ''}`}
