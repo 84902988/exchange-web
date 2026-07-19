@@ -29,6 +29,7 @@ import {
   scopeContractPrivateCacheKey,
 } from '@/components/contract/contractPrivateIdentity';
 import { ContractPrivateRefreshCoordinator } from './contractPrivateRefreshCoordinator';
+import { buildContractPrivatePositionPageSnapshot } from './contractPrivateSnapshotPage';
 
 export type ContractUserDataTab = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
 
@@ -562,6 +563,7 @@ export function useContractUserState({
   const positionSummariesRef = useRef<ContractPositionSummaryItem[]>([]);
   const hasPrefetchedAllRef = useRef(false);
   const activeTabRef = useRef<ContractUserDataTab>(activeTab);
+  const positionsPageRef = useRef(positionsPage);
   const privateStateIdentityRef = useRef(normalizedUserIdentity);
   const activePositionScopeKey = useMemo(
     () => getPositionScopeCacheKey(normalizedUserIdentity, dataScope, contractSymbol),
@@ -592,6 +594,10 @@ export function useContractUserState({
   useEffect(() => {
     activeTabRef.current = activeTab;
   }, [activeTab]);
+
+  useEffect(() => {
+    positionsPageRef.current = positionsPage;
+  }, [positionsPage]);
 
   useEffect(() => {
     activePositionScopeKeyRef.current = activePositionScopeKey;
@@ -1148,6 +1154,26 @@ export function useContractUserState({
       setPositions(nextPositions);
       setPositionSummaries(nextSummaries);
       updateActivePositionScopeCache(nextPositions, nextSummaries);
+      const isInitialCurrentScopeSnapshot = (
+        dataScope === 'current'
+        && String(message.type || '').toLowerCase().includes('snapshot')
+        && positionsUpdate?.replace === true
+      );
+      if (isInitialCurrentScopeSnapshot) {
+        const snapshotPage = buildContractPrivatePositionPageSnapshot({
+          positions: nextPositions,
+          symbol: contractSymbol,
+          page: positionsPageRef.current,
+          pageSize: CONTRACT_ORDER_TRADE_PAGE_SIZE,
+        });
+        const entry: ListScopeCacheEntry<ContractPositionItem> = {
+          ...snapshotPage,
+          loadedAt: Date.now(),
+        };
+        positionsPageCacheRef.current.set(activePositionsPageCacheKeyRef.current, entry);
+        applyPositionsPageCache(entry);
+        setPositionsPaginationMeta(getListPaginationMeta(entry));
+      }
       setIsScopeSwitching(false);
       hasLoadedPrivateRef.current = true;
       if (shouldRefreshPositionsFromRestAfterRealtime(
@@ -1155,7 +1181,7 @@ export function useContractUserState({
         Boolean(positionsUpdate || summariesUpdate),
         dataScope,
         activeTabRef.current,
-      )) {
+      ) && !isInitialCurrentScopeSnapshot) {
         void refreshPrivate({ silent: true });
       }
     };
@@ -1254,7 +1280,7 @@ export function useContractUserState({
       unsubscribeOrders();
       unsubscribeTrades();
     };
-  }, [contractSymbol, dataScope, markScopedRealtimeMessage, patchPositionMarkCaches, refreshPrivate, updateActivePositionScopeCache]);
+  }, [applyPositionsPageCache, contractSymbol, dataScope, markScopedRealtimeMessage, patchPositionMarkCaches, refreshPrivate, updateActivePositionScopeCache]);
 
   useEffect(() => {
     const identityChanged = privateStateIdentityRef.current !== normalizedUserIdentity;
