@@ -19,6 +19,7 @@ import { parseSpotPrivateWsMessage } from './spotPrivateWs'
 
 type Props = {
   symbol: string
+  pricePrecision?: number
   refreshKey?: number
   onOrdersChanged?: () => void
   onLoadingChange?: (loading: boolean) => void
@@ -93,16 +94,23 @@ const CANCELLABLE_STATUSES = ['OPEN', 'PARTIALLY_FILLED']
 const TERMINAL_STATUSES = ['FILLED', 'CANCELED', 'REJECTED']
 const OPEN_ORDER_STATUSES = ['OPEN', 'PARTIALLY_FILLED', 'NEW']
 
+function normalizePricePrecision(value: number | undefined) {
+  if (!Number.isFinite(value)) return 2
+  return Math.max(0, Math.min(12, Math.floor(Number(value))))
+}
+
 function fmtPrice(v?: string | number, fixed = 2) {
+  const precision = normalizePricePrecision(fixed)
   const n = Number(v ?? 0)
-  if (!Number.isFinite(n)) return '0.00'
-  return n.toFixed(fixed)
+  if (!Number.isFinite(n)) return (0).toFixed(precision)
+  return n.toFixed(precision)
 }
 
 function fmtOrderPrice(v?: string | number, fixed = 2) {
+  const precision = normalizePricePrecision(fixed)
   const n = Number(v ?? 0)
   if (!Number.isFinite(n) || n <= 0) return '--'
-  return n.toFixed(fixed)
+  return n.toFixed(precision)
 }
 
 function fmtAmount(v?: string | number, fixed = 4) {
@@ -243,12 +251,12 @@ function orderTypeText(orderType: string | null | undefined, t: AssetTranslator)
   return normalized || '--'
 }
 
-function formatOrderDisplayPrice(order: SpotOrderItem, t: AssetTranslator) {
+function formatOrderDisplayPrice(order: SpotOrderItem, t: AssetTranslator, pricePrecision: number) {
   if (normalizeOrderType(order.order_type) === 'MARKET') {
     const avgPrice = toFiniteNumber(order.avg_price)
-    return avgPrice > 0 ? fmtPrice(avgPrice) : t('market', 'asset')
+    return avgPrice > 0 ? fmtPrice(avgPrice, pricePrecision) : t('market', 'asset')
   }
-  return fmtOrderPrice(order.price)
+  return fmtOrderPrice(order.price, pricePrecision)
 }
 
 function formatTradeFeeDisplay(trade: TradeRowItem) {
@@ -743,6 +751,7 @@ function isRecoverableNetworkError(err: unknown) {
 
 export default function SpotOrderTabs({
   symbol,
+  pricePrecision: requestedPricePrecision = 2,
   refreshKey = 0,
   onOrdersChanged,
   onLoadingChange,
@@ -751,6 +760,7 @@ export default function SpotOrderTabs({
   const { t } = useLocaleContext()
   const { user, isLoggedIn } = useAuth()
   const displaySymbol = useMemo(() => formatSpotDisplaySymbol(symbol), [symbol])
+  const pricePrecision = normalizePricePrecision(requestedPricePrecision)
   const [tab, setTab] = useState<TabKey>('current')
   const [currentOrders, setCurrentOrders] = useState<SpotOrderItem[]>([])
   const [historyOrders, setHistoryOrders] = useState<SpotOrderItem[]>([])
@@ -1478,7 +1488,7 @@ export default function SpotOrderTabs({
                         {sideText(item.side, t)}
                       </td>
                       <td className="py-1.5 pr-2">
-                        <div className="truncate whitespace-nowrap">{formatOrderDisplayPrice(item, t)}</div>
+                        <div className="truncate whitespace-nowrap">{formatOrderDisplayPrice(item, t, pricePrecision)}</div>
                       </td>
                       <td className="py-1.5 pr-2">
                         <div className="truncate whitespace-nowrap">{fmtAmount(item.amount)}</div>
@@ -1534,7 +1544,7 @@ export default function SpotOrderTabs({
         </>
       ) : tab === 'history' ? (
         <>
-          <HistoryOrderRecords rows={pagedRows as SpotOrderItem[]} />
+          <HistoryOrderRecords rows={pagedRows as SpotOrderItem[]} pricePrecision={pricePrecision} />
           <RecordsFooter
             hasRows={hasRows}
             currentPage={currentPage}
@@ -1546,6 +1556,7 @@ export default function SpotOrderTabs({
         <>
           <TradeRecords
             rows={pagedRows as TradeRowItem[]}
+            pricePrecision={pricePrecision}
             currentUserId={user?.id}
             userOrderSideMap={userOrderSideMap}
             orderFeeDisplayMap={orderFeeDisplayMap}
@@ -1562,7 +1573,7 @@ export default function SpotOrderTabs({
   )
 }
 
-function HistoryOrderRecords({ rows }: { rows: SpotOrderItem[] }) {
+function HistoryOrderRecords({ rows, pricePrecision }: { rows: SpotOrderItem[]; pricePrecision: number }) {
   const { t } = useLocaleContext()
   if (rows.length === 0) return null
 
@@ -1590,7 +1601,7 @@ function HistoryOrderRecords({ rows }: { rows: SpotOrderItem[] }) {
                   </span>
                 </div>
                 <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-white/45">
-                  <RecordMeta label={t('spotOrderOrderPrice', 'asset')} value={formatOrderDisplayPrice(item, t)} />
+                  <RecordMeta label={t('spotOrderOrderPrice', 'asset')} value={formatOrderDisplayPrice(item, t, pricePrecision)} />
                   <RecordMeta label={t('spotOrderAmount', 'asset')} value={fmtAmount(item.amount)} />
                   <RecordMeta label={t('spotOrderFilledAmount', 'asset')} value={fmtAmount(item.filled_amount)} />
                 </div>
@@ -1617,11 +1628,13 @@ function HistoryOrderRecords({ rows }: { rows: SpotOrderItem[] }) {
 
 function TradeRecords({
   rows,
+  pricePrecision,
   currentUserId,
   userOrderSideMap,
   orderFeeDisplayMap,
 }: {
   rows: TradeRowItem[]
+  pricePrecision: number
   currentUserId?: number | string | null
   userOrderSideMap: Map<string, TradeDirection>
   orderFeeDisplayMap: Map<string, string>
@@ -1667,7 +1680,7 @@ function TradeRecords({
                   </span>
                 </div>
                 <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-white/45">
-                  <RecordMeta label={t('spotOrderTradePrice', 'asset')} value={fmtPrice(item.price)} />
+                  <RecordMeta label={t('spotOrderTradePrice', 'asset')} value={fmtPrice(item.price, pricePrecision)} />
                   <RecordMeta label={t('spotOrderAmount', 'asset')} value={fmtAmount(item.amount)} />
                   <RecordMeta label={t('spotOrderQuoteAmount', 'asset')} value={fmtAmount(item.quote_amount)} />
                 </div>

@@ -137,6 +137,21 @@ describe('SpotOrderTabs current orders recovery', () => {
     expect(onLoadingChange).toHaveBeenLastCalledWith(false)
   })
 
+  it('renders order prices with the active market precision', async () => {
+    currentOrdersMock.mockResolvedValue(
+      buildResponse('MFCUSDT', [{
+        ...buildOrder('MFCUSDT'),
+        price: '0.012',
+      }]),
+    )
+
+    render(<SpotOrderTabs symbol="MFCUSDT" pricePrecision={3} />)
+    await flushAsyncWork()
+
+    expect(screen.getByText('0.012')).toBeInTheDocument()
+    expect(screen.queryByText('0.01')).not.toBeInTheDocument()
+  })
+
   it('retries a NETWORK_ERROR once without console.error and succeeds', async () => {
     const consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined)
     currentOrdersMock
