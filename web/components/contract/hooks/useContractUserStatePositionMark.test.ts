@@ -19,6 +19,17 @@ test('mark-only position events never trigger a REST fanout', () => {
   expect(source).toContain('if (isContractPositionMarkOnlyMessage(message)) return false;');
   expect(source).toContain('markOnly ? false : positionsUpdate.replace');
   expect(source).toContain('markOnly ? false : summariesUpdate.replace');
+  expect(source).toContain('!isContractPositionMarkOnlyMessage(message)');
+  expect(source).toContain('if (invalidateRestBaseline) invalidatePrivateRestBaseline();');
+  expect(source).toContain('privateRefreshCoordinatorRef.current.replayActive();');
+});
+
+test('private REST refreshes are single-flight per visible scope with one trailing replay', () => {
+  expect(source).toContain('const privateRefreshCoordinatorRef = useRef(new ContractPrivateRefreshCoordinator());');
+  expect(source).toContain("request(privateRefreshKey) === 'COALESCED'");
+  expect(source).toContain('const shouldReplay = privateRefreshCoordinatorRef.current.settle(privateRefreshKey);');
+  expect(source).toContain('void refreshPrivateReplayRef.current({ silent: true });');
+  expect(source).toContain('privateRefreshCoordinatorRef.current.reset();');
 });
 
 test('position events preserve symbol and sequence fences', () => {
