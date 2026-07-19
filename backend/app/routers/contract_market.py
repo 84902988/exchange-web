@@ -193,6 +193,8 @@ async def contract_market_public_ws(
             )
             if legacy_result is not None:
                 connected_symbol, connected_interval = legacy_result
+    except WebSocketDisconnect:
+        pass
     finally:
         if manager_connected:
             disconnected_symbol = await contract_market_ws_manager.disconnect(websocket)
