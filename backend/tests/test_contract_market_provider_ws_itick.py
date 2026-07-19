@@ -404,6 +404,42 @@ def test_okx_trades_channel_uses_public_websocket_endpoint():
     assert module._okx_trades_ws_url() == "wss://ws.okx.com:8443/ws/v5/public"
 
 
+def test_recoverable_provider_disconnect_is_throttled_without_traceback(caplog):
+    module = _load_provider_ws_module()
+    module._PROVIDER_WS_DISCONNECT_LOG_LAST_AT.clear()
+    subscription = module.ProviderKlineSubscription(
+        local_symbol="BTCUSDT_PERP",
+        provider=module.PROVIDER_OKX_SWAP,
+        provider_symbol="BTC-USDT-SWAP",
+        interval="1m",
+        channel="candle1m",
+    )
+
+    with caplog.at_level("WARNING"):
+        module._log_provider_ws_disconnected(
+            "kline",
+            subscription,
+            ConnectionResetError("peer reset"),
+            retry_in=1.0,
+        )
+        module._log_provider_ws_disconnected(
+            "kline",
+            subscription,
+            ConnectionResetError("peer reset again"),
+            retry_in=2.0,
+        )
+
+    records = [
+        record
+        for record in caplog.records
+        if "contract_provider_ws_kline_disconnected" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert "reason=ConnectionResetError" in records[0].getMessage()
+    assert "retry_in=1.0s" in records[0].getMessage()
+    assert records[0].exc_info is None
+
+
 def test_kline_cache_notifies_only_the_current_provider_generation():
     module = _load_provider_ws_module()
     service = module.ContractMarketProviderWsService()
