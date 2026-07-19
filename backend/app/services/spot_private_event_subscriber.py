@@ -7,7 +7,10 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable
 
+from sqlalchemy.orm import Session
+
 from app.core.rq import get_redis_connection, get_redis_url
+from app.db.session import SessionLocal
 from app.services.service_heartbeat import beat_service_heartbeat
 from app.services.spot_private_event_bridge import SPOT_PRIVATE_EVENTS_CHANNEL
 from app.services.spot_private_ws import SpotPrivateWsManager, spot_private_ws_manager
@@ -17,6 +20,15 @@ logger = logging.getLogger(__name__)
 
 SPOT_PRIVATE_EVENT_SUBSCRIBER_SERVICE = "spot_private_event_subscriber"
 DEFAULT_SEEN_EVENT_LIMIT = 10_000
+SPOT_PRIVATE_ORDER_EVENT_TYPES = frozenset(
+    {
+        "ORDER_CREATED",
+        "ORDER_PARTIAL_FILLED",
+        "ORDER_FILLED",
+        "ORDER_CANCELED",
+    }
+)
+SPOT_PRIVATE_BALANCE_EVENT_TYPE = "BALANCE_UPDATED"
 
 
 def _decode_event(data: Any) -> dict[str, Any] | None:
@@ -59,9 +71,11 @@ class SpotPrivateEventDispatcher:
         self,
         manager: SpotPrivateWsManager = spot_private_ws_manager,
         *,
+        session_factory: Callable[[], Session] = SessionLocal,
         seen_event_limit: int = DEFAULT_SEEN_EVENT_LIMIT,
     ) -> None:
         self._manager = manager
+        self._session_factory = session_factory
         self._seen_event_limit = max(100, int(seen_event_limit))
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
         self._high_water_by_user: dict[int, int] = {}
@@ -86,6 +100,18 @@ class SpotPrivateEventDispatcher:
         if user_id <= 0 or sequence <= 0:
             return False
 
+        event_type = str(event.get("event_type") or "").upper().strip()
+        if (
+            event_type not in SPOT_PRIVATE_ORDER_EVENT_TYPES
+            and event_type != SPOT_PRIVATE_BALANCE_EVENT_TYPE
+        ):
+            logger.warning(
+                "spot_private_event_invalid_type event_id=%s event_type=%s",
+                event_id,
+                event_type,
+            )
+            return False
+
         high_water = int(self._high_water_by_user.get(user_id, 0))
         if sequence <= high_water:
             self._remember_event(event_id)
@@ -95,13 +121,21 @@ class SpotPrivateEventDispatcher:
         if not isinstance(payload, dict):
             logger.warning("spot_private_event_invalid_payload event_id=%s", event_id)
             return False
-        symbol = str(payload.get("symbol") or "").upper().strip()
-        order_payload = payload.get("order")
-        if not symbol or not isinstance(order_payload, dict):
-            logger.warning("spot_private_event_invalid_order_payload event_id=%s", event_id)
-            return False
 
-        await self._manager.send_order_update(user_id, symbol, order_payload)
+        if event_type == SPOT_PRIVATE_BALANCE_EVENT_TYPE:
+            db = self._session_factory()
+            try:
+                await self._manager.send_account_balances_snapshot(db, user_id)
+            finally:
+                db.close()
+        else:
+            symbol = str(payload.get("symbol") or "").upper().strip()
+            order_payload = payload.get("order")
+            if not symbol or not isinstance(order_payload, dict):
+                logger.warning("spot_private_event_invalid_order_payload event_id=%s", event_id)
+                return False
+            await self._manager.send_order_update(user_id, symbol, order_payload)
+
         self._high_water_by_user[user_id] = sequence
         self._remember_event(event_id)
         return True

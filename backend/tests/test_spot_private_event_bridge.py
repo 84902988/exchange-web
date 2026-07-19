@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime
+from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+import app.services.matching as matching_module
 import app.services.spot_private_event_relay as relay_module
 from app.db.base import Base
 from app.db.models.spot_private_event import SpotPrivateEvent, SpotPrivateEventSequence
@@ -17,6 +21,7 @@ from app.services.spot_private_event_bridge import (
     SPOT_PRIVATE_EVENT_PUBLISHED,
     create_spot_private_event,
 )
+from app.services.matching import _create_matching_private_events
 from app.services.spot_private_event_relay import SpotPrivateEventRelay
 from app.services.spot_private_event_subscriber import (
     SpotPrivateEventDispatcher,
@@ -51,6 +56,37 @@ def _payload(order_id: int = 1, status: str = "OPEN") -> dict[str, Any]:
             "remaining_amount": "1",
         },
     }
+
+
+def _matching_order(
+    *,
+    order_id: int,
+    user_id: int,
+    side: str,
+    status: str,
+    filled_amount: str,
+) -> SimpleNamespace:
+    amount = Decimal("1")
+    filled = Decimal(filled_amount)
+    now = datetime.utcnow()
+    return SimpleNamespace(
+        id=order_id,
+        user_id=user_id,
+        side=side,
+        order_type="LIMIT",
+        price=Decimal("100"),
+        amount=amount,
+        filled_amount=filled,
+        avg_price=Decimal("100"),
+        frozen_amount=Decimal("0"),
+        executed_quote_amount=filled * Decimal("100"),
+        fee_amount=Decimal("0"),
+        fee_asset_id=None,
+        fee_asset_symbol="USDT",
+        status=status,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 def _run_async(coro):
@@ -110,9 +146,28 @@ class FakeRedis:
 class FakeManager:
     def __init__(self) -> None:
         self.calls: list[tuple[int, str, dict[str, Any]]] = []
+        self.balance_calls: list[int] = []
 
     async def send_order_update(self, user_id, symbol, order_payload):
         self.calls.append((int(user_id), str(symbol), dict(order_payload)))
+
+    async def send_account_balances_snapshot(self, db, user_id):
+        del db
+        self.balance_calls.append(int(user_id))
+
+
+class FailingBalanceManager(FakeManager):
+    async def send_account_balances_snapshot(self, db, user_id):
+        del db, user_id
+        raise RuntimeError("balance snapshot failed")
+
+
+class TrackingSession:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_sequence_is_strictly_incremented_per_user():
@@ -188,6 +243,7 @@ def test_duplicate_event_is_dispatched_only_once():
         "event_id": "evt-1",
         "user_id": 11,
         "sequence": 101,
+        "event_type": "ORDER_PARTIAL_FILLED",
         "payload": _payload(),
     }
 
@@ -233,6 +289,182 @@ def test_redis_publish_failure_keeps_event_pending():
         assert event.retry_count == 1
     finally:
         verify_db.close()
+
+
+def test_matching_fill_flows_outbox_relay_subscriber_to_ws_manager():
+    Session = _session_factory()
+    db = Session()
+    try:
+        _create_matching_private_events(
+            db,
+            symbol="BTCUSDT",
+            orders=(
+                _matching_order(
+                    order_id=501,
+                    user_id=101,
+                    side="BUY",
+                    status="FILLED",
+                    filled_amount="1",
+                ),
+                _matching_order(
+                    order_id=502,
+                    user_id=202,
+                    side="SELL",
+                    status="PARTIALLY_FILLED",
+                    filled_amount="0.5",
+                ),
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    verify_db = Session()
+    try:
+        events = verify_db.execute(
+            select(SpotPrivateEvent).order_by(
+                SpotPrivateEvent.user_id.asc(),
+                SpotPrivateEvent.sequence.asc(),
+            )
+        ).scalars().all()
+        assert [(event.user_id, event.sequence, event.event_type) for event in events] == [
+            (101, 1, "ORDER_FILLED"),
+            (101, 2, "BALANCE_UPDATED"),
+            (202, 1, "ORDER_PARTIAL_FILLED"),
+            (202, 2, "BALANCE_UPDATED"),
+        ]
+        assert len({event.event_id for event in events}) == 4
+    finally:
+        verify_db.close()
+
+    redis = FakeRedis()
+    relay = SpotPrivateEventRelay(
+        session_factory=Session,
+        redis_factory=lambda: redis,
+        owner_id="matching-relay",
+        lock_token="matching-token",
+    )
+    assert relay.run_once().published == 4
+
+    manager = FakeManager()
+    dispatcher = SpotPrivateEventDispatcher(
+        manager,  # type: ignore[arg-type]
+        session_factory=Session,
+    )
+
+    async def dispatch_all():
+        for _channel, event in redis.published:
+            assert await dispatcher.dispatch(event) is True
+        for _channel, event in redis.published:
+            assert await dispatcher.dispatch(event) is False
+
+    _run_async(dispatch_all())
+    assert [(item[0], item[1]) for item in manager.calls] == [
+        (101, "BTCUSDT"),
+        (202, "BTCUSDT"),
+    ]
+    assert manager.balance_calls == [101, 202]
+
+
+def test_matching_private_events_rollback_with_trade_transaction():
+    Session = _session_factory()
+    db = Session()
+    try:
+        _create_matching_private_events(
+            db,
+            symbol="BTCUSDT",
+            orders=(
+                _matching_order(
+                    order_id=601,
+                    user_id=303,
+                    side="BUY",
+                    status="FILLED",
+                    filled_amount="1",
+                ),
+                _matching_order(
+                    order_id=602,
+                    user_id=404,
+                    side="SELL",
+                    status="FILLED",
+                    filled_amount="1",
+                ),
+            ),
+        )
+        assert db.execute(select(SpotPrivateEvent)).scalars().all()
+        db.rollback()
+    finally:
+        db.close()
+
+    verify_db = Session()
+    try:
+        assert verify_db.execute(select(SpotPrivateEvent)).scalars().all() == []
+        assert verify_db.execute(select(SpotPrivateEventSequence)).scalars().all() == []
+    finally:
+        verify_db.close()
+
+
+def test_matching_private_events_lock_user_sequences_in_stable_order(monkeypatch):
+    calls: list[tuple[int, str]] = []
+
+    def record_event(_db, *, user_id, event_type, payload):
+        del payload
+        calls.append((int(user_id), str(event_type)))
+
+    monkeypatch.setattr(matching_module, "create_spot_private_event", record_event)
+    matching_module._create_matching_private_events(
+        object(),  # type: ignore[arg-type]
+        symbol="BTCUSDT",
+        orders=(
+            _matching_order(
+                order_id=702,
+                user_id=202,
+                side="SELL",
+                status="PARTIALLY_FILLED",
+                filled_amount="0.5",
+            ),
+            _matching_order(
+                order_id=701,
+                user_id=101,
+                side="BUY",
+                status="FILLED",
+                filled_amount="1",
+            ),
+        ),
+    )
+
+    assert calls == [
+        (101, "ORDER_FILLED"),
+        (202, "ORDER_PARTIAL_FILLED"),
+        (101, "BALANCE_UPDATED"),
+        (202, "BALANCE_UPDATED"),
+    ]
+
+
+def test_balance_dispatch_closes_session_when_snapshot_fails():
+    session = TrackingSession()
+    dispatcher = SpotPrivateEventDispatcher(
+        FailingBalanceManager(),  # type: ignore[arg-type]
+        session_factory=lambda: session,  # type: ignore[arg-type]
+    )
+
+    async def dispatch_balance_event():
+        try:
+            await dispatcher.dispatch(
+                {
+                    "event_id": "balance-failure",
+                    "user_id": 808,
+                    "sequence": 1,
+                    "event_type": "BALANCE_UPDATED",
+                    "payload": {},
+                }
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "balance snapshot failed"
+            return
+        raise AssertionError("balance snapshot failure did not propagate")
+
+    _run_async(dispatch_balance_event())
+    assert session.closed is True
 
 
 def test_single_active_relay_lock_rejects_second_owner():
@@ -430,6 +662,7 @@ def test_two_api_dispatchers_each_fan_out_to_local_manager():
         "event_id": "evt-multi-process",
         "user_id": 13,
         "sequence": 201,
+        "event_type": "ORDER_FILLED",
         "payload": _payload(order_id=88),
     }
 
@@ -453,6 +686,7 @@ def test_fresh_dispatcher_after_api_restart_accepts_next_event():
                 "event_id": "evt-before-api-restart",
                 "user_id": 15,
                 "sequence": 401,
+                "event_type": "ORDER_PARTIAL_FILLED",
                 "payload": _payload(order_id=101),
             }
         ) is True
@@ -463,6 +697,7 @@ def test_fresh_dispatcher_after_api_restart_accepts_next_event():
                 "event_id": "evt-after-api-restart",
                 "user_id": 15,
                 "sequence": 402,
+                "event_type": "ORDER_PARTIAL_FILLED",
                 "payload": _payload(order_id=101, status="PARTIALLY_FILLED"),
             }
         ) is True
@@ -530,6 +765,7 @@ def test_subscriber_recovers_after_redis_connection_failure():
             "event_id": "evt-after-restart",
             "user_id": 14,
             "sequence": 301,
+            "event_type": "ORDER_FILLED",
             "payload": _payload(order_id=99),
         }
         clients = [
