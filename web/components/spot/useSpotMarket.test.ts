@@ -162,7 +162,12 @@ describe('useSpotMarket trade collection', () => {
       .filter(([domain]) => domain === 'trade')
       .length
     expect(tradeListenerCount).toBe(1)
-    const wsTrade = providerTrade({ id: 'ws', eventTimeMs: BASE + 2_000, price: '200' })
+    const wsTrade = providerTrade({
+      id: 'ws',
+      eventTimeMs: BASE + 2_000,
+      receivedAtMs: Date.now(),
+      price: '200',
+    })
     act(() => emit('trade', tradeMessage(wsTrade)))
     await waitFor(() => expect(result.current.trades.map((row) => row.provider_trade_id)).toEqual(['ws']))
     expect(result.current.displayPrice.price).toBe('200')
