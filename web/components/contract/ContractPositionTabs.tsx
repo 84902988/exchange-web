@@ -29,6 +29,10 @@ import ContractOrderTabs, {
 import { formatPrice as formatMarketPrice, formatRawPrice as formatRawMarketPrice } from '@/lib/marketPrecision';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import type { ContractOrderFilterState, ContractTradeFilterState } from './hooks/useContractUserState';
+import {
+  resolveContractTpSlEditorReference,
+  resolveContractTpSlQuoteReference,
+} from './contractTpSlReference';
 
 export type ContractPositionTabKey = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
 type TabKey = ContractPositionTabKey;
@@ -131,18 +135,6 @@ const CONTRACT_TRADE_CONFIRM_HIDDEN_KEY = 'contract_trade_confirm_hidden';
 
 function normalizeTpSlTriggerPriceType(value: ContractTpSlTriggerPriceType | string | null | undefined): ContractTpSlTriggerPriceType {
   return value === 'LAST_PRICE' ? 'LAST_PRICE' : 'MARK_PRICE';
-}
-
-function getTpSlReferencePrice(
-  quote: ContractQuote | null | undefined,
-  triggerPriceType: ContractTpSlTriggerPriceType,
-  fallback?: string | number | null,
-) {
-  const preferred = triggerPriceType === 'LAST_PRICE' ? quote?.last_price : quote?.mark_price;
-  if (toNumber(preferred) > 0) return preferred ?? null;
-  const markPrice = quote?.mark_price;
-  if (toNumber(markPrice) > 0) return markPrice ?? null;
-  return fallback ?? null;
 }
 
 function formatI18nTemplate(template: string, values: Record<string, string | number>) {
@@ -753,7 +745,16 @@ export default function ContractPositionTabs({
   async function saveTpSl() {
     if (!tpSlDraft || tpSlSaving) return;
 
-    const referencePrice = toNumber(tpSlDraft.referencePrice);
+    const latestReferencePrice = resolveContractTpSlEditorReference({
+      draftSymbol: tpSlDraft.position.symbol,
+      positionIds: tpSlDraft.positions.map((position) => position.id),
+      currentSymbol,
+      positions,
+      quote,
+      triggerPriceType: normalizedTpSlTriggerPriceType,
+      fallback: tpSlDraft.referencePrice,
+    });
+    const referencePrice = toNumber(latestReferencePrice);
     const takeProfitText = normalizeTpSlInputText(tpSlDraft.takeProfitPrice);
     const stopLossText = normalizeTpSlInputText(tpSlDraft.stopLossPrice);
     const takeProfitPrice = takeProfitText === '' ? null : takeProfitText;
@@ -1058,7 +1059,18 @@ export default function ContractPositionTabs({
       ) : null}
       {tpSlDraft ? (
         <TpSlEditorDialog
-          draft={tpSlDraft}
+          draft={{
+            ...tpSlDraft,
+            referencePrice: String(resolveContractTpSlEditorReference({
+              draftSymbol: tpSlDraft.position.symbol,
+              positionIds: tpSlDraft.positions.map((position) => position.id),
+              currentSymbol,
+              positions,
+              quote,
+              triggerPriceType: normalizedTpSlTriggerPriceType,
+              fallback: tpSlDraft.referencePrice,
+            }) || ''),
+          }}
           error={tpSlError}
           pricePrecision={pricePrecision}
           tpSlTriggerPriceTypeHint={tpSlTriggerPriceTypeHint}
@@ -1556,7 +1568,7 @@ function SummaryPositionsCards({
           ? item.mark_price ?? null
           : null;
         const tpSlReferencePrice = isCurrent
-          ? getTpSlReferencePrice(quote, tpSlTriggerPriceType, markPrice)
+          ? resolveContractTpSlQuoteReference(quote, tpSlTriggerPriceType, markPrice)
           : markPrice;
         const unrealized = getPositionUnrealizedPnl(item);
         const roe = getPositionRoe(item);
@@ -1728,7 +1740,6 @@ function PositionsTable({
         const markPrice = toNumber(item.mark_price) > 0 ? item.mark_price : toNumber(quote?.mark_price) > 0 ? quote?.mark_price : null;
         const truthUnavailableLabel = getPositionTruthUnavailableLabel(item);
         const riskMarkPrice = !truthUnavailableLabel && toNumber(item.mark_price) > 0 ? item.mark_price : null;
-        const nearLiquidation = isNearLiquidation(item);
         const unrealized = getPositionUnrealizedPnl(item);
         const unrealizedText = unrealized === null
           ? truthUnavailableLabel ?? '--'
@@ -1756,11 +1767,6 @@ function PositionsTable({
                   <StatusBadge status={item.status} closeReason={item.close_reason} />
                   {takeProfitBadge ? <TpSlBadge type="TP" value={takeProfitBadge} /> : null}
                   {stopLossBadge ? <TpSlBadge type="SL" value={stopLossBadge} /> : null}
-                  {nearLiquidation ? (
-                    <span className="rounded border border-[#f6465d]/30 bg-[#f6465d]/12 px-1.5 py-0.5 text-[11px] font-semibold text-[#f6465d]">
-                      {t('highRisk', 'contracts')}
-                    </span>
-                  ) : null}
                 </div>
               </div>
 
@@ -1858,10 +1864,10 @@ function AllPositionsTable({
 
   return (
     <div className="overflow-x-auto p-2">
-      <table className="w-full min-w-[1320px] table-fixed text-left text-[12px]">
+      <table className="w-full min-w-[1040px] table-fixed text-left text-[12px]">
         <thead className="bg-[#0b0e11] text-[11px] text-white/40">
           <tr>
-            {[t('symbol', 'contracts'), t('direction', 'contracts'), t('leverage', 'contracts'), t('quantity', 'contracts'), t('entryPrice', 'contracts'), t('markPrice', 'contracts'), t('margin', 'contracts'), t('unrealizedPnl', 'contracts'), t('roe', 'contracts'), t('marginRatio', 'contracts'), t('liquidationPrice', 'contracts'), t('liquidationDistance', 'contracts'), t('risk', 'contracts'), t('status', 'contracts'), t('operation', 'contracts')].map((head) => (
+            {[t('symbol', 'contracts'), t('direction', 'contracts'), t('leverage', 'contracts'), t('quantity', 'contracts'), t('entryPrice', 'contracts'), t('markPrice', 'contracts'), t('margin', 'contracts'), t('unrealizedPnl', 'contracts'), t('roe', 'contracts'), t('marginRatio', 'contracts'), t('status', 'contracts'), t('operation', 'contracts')].map((head) => (
               <th key={head} className="whitespace-nowrap px-2 py-1.5 font-medium">{head}</th>
             ))}
           </tr>
@@ -1872,12 +1878,9 @@ function AllPositionsTable({
             const isCurrent = itemSymbol === currentSymbol;
             const truthUnavailableLabel = getPositionTruthUnavailableLabel(item);
             const markPrice = !truthUnavailableLabel ? toNumber(item.mark_price) : 0;
-            const liquidationPrice = getAuthoritativeLiquidationPrice(item);
             const unrealized = getPositionUnrealizedPnl(item);
             const roe = getPositionRoe(item);
             const marginRatio = truthUnavailableLabel ?? formatPlainPercent(item.margin_ratio);
-            const liquidationDistance = truthUnavailableLabel ?? formatLiquidationDistance(item.liquidation_distance, pricePrecision);
-            const liquidationRisk = getLiquidationRisk(item);
             const unrealizedClassName = unrealized === null
               ? 'text-white/55'
               : unrealized > 0
@@ -1920,13 +1923,6 @@ function AllPositionsTable({
                   {formatPnlPercent(roe)}
                 </td>
                 <Td>{marginRatio}</Td>
-                <Td>{liquidationPrice ? formatDisplayPrice(liquidationPrice, pricePrecision) : '--'}</Td>
-                <td className={`whitespace-nowrap px-2 py-2 font-medium tabular-nums ${liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}`}>
-                  {liquidationDistance}
-                </td>
-                <td className={`whitespace-nowrap px-2 py-2 font-medium tabular-nums ${liquidationRisk ? riskTextClassName(liquidationRisk.tone) : 'text-white/55'}`}>
-                  {liquidationRisk ? t(liquidationRisk.labelKey, 'contracts') : '--'}
-                </td>
                 <td className="whitespace-nowrap px-2 py-2">
                   <StatusBadge status={item.status} closeReason={item.close_reason} />
                 </td>
@@ -2089,8 +2085,6 @@ type PositionSideRecord = {
 };
 
 type PositionRiskRecord = {
-  liquidation_price?: string | number | null;
-  liquidation_distance_rate?: string | number | null;
   roe?: string | number | null;
   unrealized_pnl?: string | number | null;
   margin_amount?: string | number | null;
@@ -2597,18 +2591,6 @@ function PositionMetric({
   );
 }
 
-type LiquidationRisk = {
-  labelKey: string;
-  percent: number;
-  tone: 'low' | 'medium' | 'high' | 'extreme';
-};
-
-function riskTextClassName(tone: LiquidationRisk['tone']) {
-  if (tone === 'extreme' || tone === 'high') return 'text-[#f6465d]';
-  if (tone === 'medium') return 'text-[#f0b90b]';
-  return 'text-[#00c087]';
-}
-
 function TradesTable({
  rows, pricePrecision, loading }: { rows: ContractTradeListItem[]; pricePrecision: number; loading: boolean }) {
   const { t } = useLocaleContext();
@@ -2673,8 +2655,8 @@ function TradesTable({
 
 function sideLabel(value: string, t?: ContractTranslator) {
   const side = normalizePositionSide(value);
-  if (side === 'LONG') return t ? t('positionSideLong', 'contracts') : '多头';
-  if (side === 'SHORT') return t ? t('positionSideShort', 'contracts') : '空头';
+  if (side === 'LONG') return t ? t('positionSideLong', 'contracts') : '买单';
+  if (side === 'SHORT') return t ? t('positionSideShort', 'contracts') : '卖单';
   return value || '--';
 }
 
@@ -2686,20 +2668,8 @@ function getPositionAmount(item: ContractPositionItem) {
   return toNumber(record.quantity ?? record.amount ?? record.size);
 }
 
-function getAuthoritativeLiquidationPrice(record: PositionRiskRecord | null | undefined) {
-  const liquidationPrice = toNumber(record?.liquidation_price);
-  return Number.isFinite(liquidationPrice) && liquidationPrice > 0 ? liquidationPrice : null;
-}
-
 function hasRiskValue(value: string | number | null | undefined) {
   return value !== null && value !== undefined && String(value).trim() !== '';
-}
-
-function isNearLiquidation(record: PositionRiskRecord | null | undefined) {
-  if (!isPositionMarkSnapshotUsable(record)) return false;
-  if (!hasRiskValue(record?.liquidation_distance_rate)) return false;
-  const distanceRate = toNumber(record?.liquidation_distance_rate);
-  return Number.isFinite(distanceRate) && distanceRate <= 2;
 }
 
 function calcUnrealizedPnlPercent(unrealizedPnl: number | null, marginAmount: string | number | null | undefined) {
@@ -2724,13 +2694,6 @@ function formatPlainPercent(value: string | number | null | undefined) {
   return `${num.toFixed(2)}%`;
 }
 
-function formatLiquidationDistance(value: string | number | null | undefined, precision: number) {
-  if (!hasRiskValue(value)) return '--';
-  const num = toNumber(value);
-  if (!Number.isFinite(num)) return '--';
-  return `${formatDisplayPrice(num, precision)} USDT`;
-}
-
 function getPositionRoe(record: PositionRiskRecord | null | undefined) {
   if (!isPositionMarkSnapshotUsable(record)) return null;
   if (hasRiskValue(record?.roe)) {
@@ -2738,23 +2701,6 @@ function getPositionRoe(record: PositionRiskRecord | null | undefined) {
     if (Number.isFinite(roe)) return roe;
   }
   return calcUnrealizedPnlPercent(toNumber(record?.unrealized_pnl), record?.margin_amount);
-}
-
-function getLiquidationRisk(record: PositionRiskRecord | null | undefined): LiquidationRisk | null {
-  if (!isPositionMarkSnapshotUsable(record)) return null;
-  if (!hasRiskValue(record?.liquidation_distance_rate)) return null;
-  const distanceRate = toNumber(record?.liquidation_distance_rate);
-  if (!Number.isFinite(distanceRate)) return null;
-
-  const percent = clamp(100 - distanceRate * 10, 0, 100);
-  if (distanceRate <= 0) return { labelKey: 'riskExtreme', percent, tone: 'extreme' };
-  if (distanceRate <= 2) return { labelKey: 'riskHigh', percent, tone: 'high' };
-  if (distanceRate <= 5) return { labelKey: 'riskMedium', percent, tone: 'medium' };
-  return { labelKey: 'riskLow', percent, tone: 'low' };
-}
-
-function clamp(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value));
 }
 
 function formatDisplayPrice(value: string | number | null | undefined, precision: number) {

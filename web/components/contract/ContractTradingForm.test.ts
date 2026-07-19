@@ -8,6 +8,7 @@ import {
   isPositiveContractAmountAtPrecision,
   normalizeContractAmountPrecision,
   normalizeContractDecimalInput,
+  resolveContractOpenEntryReference,
 } from './contractTradingForm.utils';
 import {
   buildContractTradingFormLegacyMarketRead,
@@ -60,6 +61,37 @@ test('precision-adjusted zero remains non-submittable', () => {
   assert.equal(adjustedAmount, '0.000');
   assert.equal(isPositiveContractAmountAtPrecision(adjustedAmount, 3), false);
   assert.equal(isPositiveContractAmountAtPrecision('0.001', 3), true);
+});
+
+test('TP/SL entry validation uses the same side-specific execution price as the order', () => {
+  assert.equal(resolveContractOpenEntryReference({
+    side: 'LONG',
+    orderType: 'MARKET',
+    limitPrice: '',
+    executionPrice: 101,
+    executable: true,
+  }), 101);
+  assert.equal(resolveContractOpenEntryReference({
+    side: 'LONG',
+    orderType: 'LIMIT',
+    limitPrice: 105,
+    executionPrice: 101,
+    executable: true,
+  }), 101);
+  assert.equal(resolveContractOpenEntryReference({
+    side: 'SHORT',
+    orderType: 'LIMIT',
+    limitPrice: 105,
+    executionPrice: 100,
+    executable: true,
+  }), 105);
+  assert.equal(resolveContractOpenEntryReference({
+    side: 'SHORT',
+    orderType: 'MARKET',
+    limitPrice: '',
+    executionPrice: 100,
+    executable: false,
+  }), null);
 });
 
 test('TradingForm wires symbol amountPrecision', () => {
@@ -121,11 +153,10 @@ test('BBO, execution validation, and MARKET margin reference fail closed', () =>
   assert.doesNotMatch(formSource, /currentActionExecution[^;]*(?:display_price|mark_price|last_price)/);
 });
 
-test('TP/SL references remain outside Price Authority scope', () => {
-  assert.match(formSource, /const quoteMarkPrice = toNumber\(quote\?\.mark_price\);/);
-  assert.match(formSource, /const quoteLastPrice = toNumber\(quote\?\.last_price\);/);
-  assert.match(formSource, /legacyTpSlExecutionAsk/);
-  assert.match(formSource, /legacyTpSlExecutionBid/);
+test('TP/SL entry validation reuses execution authority without consuming display prices', () => {
+  assert.match(formSource, /resolveContractOpenEntryReference\(\{/);
+  assert.match(formSource, /executionPrice: execution\.price,/);
+  assert.match(formSource, /executable: execution\.executable,/);
   assert.doesNotMatch(formSource, /priceAuthority\.(?:reference_price|mark_price|last_trade_price|index_price)/);
 });
 

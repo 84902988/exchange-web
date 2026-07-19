@@ -73,3 +73,28 @@ export function isPositiveContractAmountAtPrecision(
   const formatted = formatContractAmountOnBlur(value, precision);
   return formatted !== '' && Number(formatted) > 0;
 }
+
+export function resolveContractOpenEntryReference({
+  side,
+  orderType,
+  limitPrice,
+  executionPrice,
+  executable,
+}: {
+  side: 'LONG' | 'SHORT';
+  orderType: 'MARKET' | 'LIMIT';
+  limitPrice: string | number;
+  executionPrice: string | number | null;
+  executable: boolean;
+}): number | null {
+  const liveExecutionPrice = Number(executionPrice);
+  if (!executable || !Number.isFinite(liveExecutionPrice) || liveExecutionPrice <= 0) return null;
+  if (orderType === 'MARKET') return liveExecutionPrice;
+
+  const normalizedLimitPrice = Number(limitPrice);
+  if (!Number.isFinite(normalizedLimitPrice) || normalizedLimitPrice <= 0) return null;
+  const isMarketable = side === 'LONG'
+    ? normalizedLimitPrice >= liveExecutionPrice
+    : normalizedLimitPrice <= liveExecutionPrice;
+  return isMarketable ? liveExecutionPrice : normalizedLimitPrice;
+}
