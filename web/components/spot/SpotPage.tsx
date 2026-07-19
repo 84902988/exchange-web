@@ -36,6 +36,7 @@ import {
   createSpotKlinePerfId,
   markSpotKlinePerf,
 } from './tradingview/spotKlinePerf';
+import { resolveSpotRwaLogo } from './spotRwaLogo';
 
 interface SpotHeaderMarketData {
   change: string;
@@ -235,6 +236,7 @@ function mergeSpotPairOption(existing: SpotPairOption, incoming: SpotPairOption)
     enabled: preserveSpotPairValue(existing.enabled, incoming.enabled),
     showSpotLogo: preserveSpotPairValue(existing.showSpotLogo, incoming.showSpotLogo) ?? false,
     spotLogoUrl: preserveSpotPairValue(existing.spotLogoUrl, incoming.spotLogoUrl),
+    spotLogoAlt: preserveSpotPairValue(existing.spotLogoAlt, incoming.spotLogoAlt),
   };
 }
 
@@ -380,6 +382,7 @@ type SpotPairOption = {
   enabled?: boolean | null;
   showSpotLogo?: boolean;
   spotLogoUrl?: string | null;
+  spotLogoAlt?: string | null;
 };
 
 function normalizeSpotApiSymbol(value?: string | null): string {
@@ -509,6 +512,7 @@ function buildSpotPairOption(item: SpotMarketTickerItem | SpotMarketPairItem): S
   const hasBaseAssetLogoUrl = hasOwnMarketPayloadField(item, 'base_asset_logo_url');
   const hasShowSpotLogo = hasOwnMarketPayloadField(item, 'show_spot_logo');
   const hasSpotLogoUrl = hasOwnMarketPayloadField(item, 'spot_logo_url');
+  const hasSpotLogoAlt = hasOwnMarketPayloadField(item, 'spot_logo_alt');
 
   return {
     symbol,
@@ -557,6 +561,9 @@ function buildSpotPairOption(item: SpotMarketTickerItem | SpotMarketPairItem): S
       : {}),
     ...(hasSpotLogoUrl
       ? { spotLogoUrl: String((item as SpotMarketTickerItem | SpotMarketPairItem).spot_logo_url || '').trim() || null }
+      : {}),
+    ...(hasSpotLogoAlt
+      ? { spotLogoAlt: String((item as SpotMarketTickerItem | SpotMarketPairItem).spot_logo_alt || '').trim() || null }
       : {}),
   };
 }
@@ -654,6 +661,10 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     }
     return selectedPair;
   }, [headerTicker, selectedPair, symbol]);
+  const selectedSpotLogo = useMemo(
+    () => resolveSpotRwaLogo(selectedPair, symbol),
+    [selectedPair, symbol],
+  );
   const selectedDisplayPricePrecision = useMemo(() => {
     const normalizedSymbol = normalizeSpotApiSymbol(symbol);
     const viewPrecision = getSpotDisplayPricePrecision(spotMarket.marketView);
@@ -1665,6 +1676,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                   pricePrecision={pricePrecision}
                   amountPrecision={currentAmountPrecision}
                   showRwaReference={showRwaReference}
+                  spotLogoUrl={selectedSpotLogo?.url}
+                  spotLogoAlt={selectedSpotLogo?.alt}
                 />
               </div>
             </div>

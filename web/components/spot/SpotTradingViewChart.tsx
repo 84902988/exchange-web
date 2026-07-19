@@ -67,6 +67,7 @@ import {
 } from '@/components/tradingview/klineLifecycleProtocol';
 import { KlineLifecycleRuntimeCoordinator } from '@/components/tradingview/klineLifecycleRuntimeCoordinator';
 import { bootstrapKlineLifecycleObservability } from '@/components/tradingview/klineLifecycleObservability';
+import { renderSpotTradingViewLogo } from './spotRwaLogo';
 
 type TradingViewVisibleRange = {
   from: number;
@@ -133,6 +134,8 @@ type SpotTradingViewChartProps = Omit<SpotChartProps, 'isLoading'> & {
   onIntervalResolutionCommit?: (value: string) => void;
   onIntervalResolutionFailure?: (rollbackValue: string) => void;
   onNativeCandleDisplay?: (value: SpotNativeCandleDisplayPrice) => void;
+  spotLogoUrl?: string | null;
+  spotLogoAlt?: string | null;
 };
 
 type SpotTradingViewWindow = {
@@ -344,6 +347,8 @@ export default function SpotTradingViewChart({
   onIntervalResolutionCommit,
   onIntervalResolutionFailure,
   onNativeCandleDisplay,
+  spotLogoUrl,
+  spotLogoAlt,
 }: SpotTradingViewChartProps) {
   const { locale, t } = useLocaleContext();
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -368,6 +373,9 @@ export default function SpotTradingViewChart({
   const preloadManagerRef = useRef<SpotKlinePreloadManager | null>(null);
   const toolbarButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const toolbarSlotRef = useRef<HTMLElement | null>(null);
+  const spotLogoSlotRef = useRef<HTMLElement | null>(null);
+  const spotLogoUrlRef = useRef('');
+  const spotLogoAltRef = useRef('');
   const chartLoadingCoordinatorRef = useRef<SpotChartLoadingCoordinator | null>(null);
   const widgetGenerationSequenceRef = useRef(0);
   const activeWidgetGenerationRef = useRef(0);
@@ -406,6 +414,22 @@ export default function SpotTradingViewChart({
   const widgetKey = `${normalizedSymbol}:${chartMode}:${locale}:${pricePrecision ?? 'auto'}:${amountPrecision ?? 'auto'}`;
   const displayName = displaySymbol || formatSpotDisplaySymbol(normalizedSymbol);
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
+
+  useEffect(() => {
+    const logoUrl = String(spotLogoUrl || '').trim();
+    const logoAlt = String(spotLogoAlt || '').trim();
+    spotLogoUrlRef.current = logoUrl;
+    spotLogoAltRef.current = logoAlt;
+
+    const slot = spotLogoSlotRef.current;
+    if (!slot) return;
+    renderSpotTradingViewLogo(slot, {
+      url: logoUrl,
+      alt: logoAlt,
+      displayName,
+      getCurrentUrl: () => spotLogoUrlRef.current,
+    });
+  }, [displayName, spotLogoAlt, spotLogoUrl]);
   const showChartLoading = Boolean(chartLoadingReason || intervalSwitchLoading) && !activeLoadError;
   const activeBackendInterval = getBackendKlineIntervalForSpotInterval(activeInterval);
   const showRealtimeSync = (
@@ -1671,6 +1695,8 @@ export default function SpotTradingViewChart({
       recentVisibleRangeEventsRef.current.clear();
       toolbarButtonRefs.current.clear();
       toolbarSlotRef.current = null;
+      spotLogoSlotRef.current?.remove();
+      spotLogoSlotRef.current = null;
       priceOverlayControllerRef.current?.destroy();
       priceOverlayControllerRef.current = null;
       const widgetToRemove = widgetRef.current;
@@ -1750,6 +1776,8 @@ export default function SpotTradingViewChart({
         startChartLoading('widget-build', widgetGeneration);
       }
     }, 0);
+    const logoPlacementTimers: number[] = [];
+    let logoToolbarResizeObserver: ResizeObserver | null = null;
 
     const widget = new tradingView.widget({
       autosize: true,
@@ -1920,6 +1948,96 @@ export default function SpotTradingViewChart({
           onIntervalChange?.(item);
         });
       });
+
+      const spotLogoSlot = toolbarSlot.ownerDocument.createElement('div');
+      spotLogoSlotRef.current = spotLogoSlot;
+      spotLogoSlot.dataset.spotRwaLogo = 'toolbar-overlay';
+      toolbarSlot.ownerDocument.body.appendChild(spotLogoSlot);
+      spotLogoSlot.style.alignItems = 'center';
+      spotLogoSlot.style.justifyContent = 'center';
+      spotLogoSlot.style.position = 'fixed';
+      spotLogoSlot.style.width = '190px';
+      spotLogoSlot.style.overflow = 'hidden';
+      spotLogoSlot.style.margin = '0';
+      spotLogoSlot.style.background = 'transparent';
+      spotLogoSlot.style.border = '0';
+      spotLogoSlot.style.pointerEvents = 'none';
+      spotLogoSlot.style.zIndex = '10';
+      spotLogoSlot.style.visibility = 'hidden';
+      renderSpotTradingViewLogo(spotLogoSlot, {
+        url: spotLogoUrlRef.current,
+        alt: spotLogoAltRef.current,
+        displayName,
+        getCurrentUrl: () => spotLogoUrlRef.current,
+      });
+
+      const placeLogoBetweenToolbarGroups = () => {
+        const document = spotLogoSlot.ownerDocument;
+        const toolbarRect = toolbarSlot.getBoundingClientRect();
+        const controls = Array.from(
+          document.querySelectorAll<HTMLElement>('[data-name], [aria-label], [title]'),
+        ).filter((element) => {
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0
+            && rect.height > 0
+            && rect.bottom > toolbarRect.top
+            && rect.top < toolbarRect.bottom;
+        });
+        const identityOf = (element: HTMLElement) => [
+          element.dataset.name,
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+        ].join(' ').toLowerCase();
+        const quickSearch = controls.find(
+          (element) => element.dataset.name === 'header-toolbar-quick-search',
+        ) || controls.find((element) => {
+          const identity = identityOf(element);
+          return identity.includes('quick-search')
+            || identity.includes('quick search')
+            || identity.includes('快速搜索')
+            || identity.includes('快捷搜索');
+        });
+        if (!quickSearch) return;
+
+        const quickSearchRect = quickSearch.getBoundingClientRect();
+        const undoRedoButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+          .filter((button) => {
+            const rect = button.getBoundingClientRect();
+            return rect.width > 0
+              && rect.height > 0
+              && rect.bottom > toolbarRect.top
+              && rect.top < toolbarRect.bottom
+              && rect.left >= toolbarRect.right
+              && rect.right <= quickSearchRect.left
+              && !button.getAttribute('aria-label')
+              && !button.getAttribute('title')
+              && !button.dataset.name
+              && !String(button.textContent || '').trim()
+              && Boolean(button.querySelector('svg'));
+          });
+        const undoRedoRight = undoRedoButtons.reduce(
+          (right, button) => Math.max(right, button.getBoundingClientRect().right),
+          toolbarRect.right,
+        );
+        const leftBoundary = undoRedoRight;
+        const rightBoundary = quickSearchRect.left;
+        if (rightBoundary <= leftBoundary) return;
+        const availableWidth = rightBoundary - leftBoundary;
+        spotLogoSlot.style.left = `${(leftBoundary + rightBoundary) / 2}px`;
+        spotLogoSlot.style.top = `${quickSearchRect.top}px`;
+        spotLogoSlot.style.height = `${quickSearchRect.height}px`;
+        spotLogoSlot.style.width = `${Math.min(190, availableWidth)}px`;
+        spotLogoSlot.style.transform = 'translateX(-50%)';
+        spotLogoSlot.style.visibility = availableWidth >= 120 ? 'visible' : 'hidden';
+      };
+      [0, 60, 180].forEach((delay) => {
+        logoPlacementTimers.push(window.setTimeout(placeLogoBetweenToolbarGroups, delay));
+      });
+      const ToolbarResizeObserver = toolbarSlot.ownerDocument.defaultView?.ResizeObserver;
+      if (ToolbarResizeObserver) {
+        logoToolbarResizeObserver = new ToolbarResizeObserver(placeLogoBetweenToolbarGroups);
+        logoToolbarResizeObserver.observe(toolbarSlot.ownerDocument.documentElement);
+      }
       updateToolbarButtons(toolbarButtonRefs.current, chartMode, activeIntervalRef.current);
       const activeToken = activeChartLoadingTokenRef.current;
       const loadingActive = Boolean(
@@ -1950,6 +2068,8 @@ export default function SpotTradingViewChart({
     return () => {
       cancelled = true;
       window.clearTimeout(widgetBuildLoadingTimer);
+      logoPlacementTimers.forEach((timer) => window.clearTimeout(timer));
+      logoToolbarResizeObserver?.disconnect();
       cleanupWidget(widgetGeneration);
     };
   }, [
