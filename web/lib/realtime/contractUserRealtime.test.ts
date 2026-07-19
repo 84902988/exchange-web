@@ -8,6 +8,8 @@ class MockWebSocket {
   static readonly CLOSED = 3;
   static instances: MockWebSocket[] = [];
 
+  readonly url: string;
+  readonly protocols: string[];
   readyState = MockWebSocket.CONNECTING;
   closeCount = 0;
   onopen: ((event: Event) => void) | null = null;
@@ -15,7 +17,9 @@ class MockWebSocket {
   onerror: ((event: Event) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
 
-  constructor() {
+  constructor(url: string, protocols?: string | string[]) {
+    this.url = url;
+    this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
     MockWebSocket.instances.push(this);
   }
 
@@ -31,6 +35,7 @@ describe('ContractUserRealtimeClient identity lifecycle', () => {
   beforeEach(() => {
     jest.useFakeTimers();
     MockWebSocket.instances = [];
+    window.localStorage.setItem('access_token', 'test-access-token');
     Object.defineProperty(globalThis, 'WebSocket', {
       configurable: true,
       value: MockWebSocket,
@@ -38,6 +43,7 @@ describe('ContractUserRealtimeClient identity lifecycle', () => {
   });
 
   afterEach(() => {
+    window.localStorage.clear();
     jest.runOnlyPendingTimers();
     jest.useRealTimers();
   });
@@ -56,6 +62,8 @@ describe('ContractUserRealtimeClient identity lifecycle', () => {
     client.setSession(session);
     jest.advanceTimersByTime(200);
     expect(MockWebSocket.instances).toHaveLength(1);
+    expect(MockWebSocket.instances[0].url).not.toContain('access_token=');
+    expect(MockWebSocket.instances[0].protocols).toEqual(['contract-auth', 'test-access-token']);
     client.disconnect();
   });
 

@@ -192,8 +192,17 @@ class ContractPrivateWsManager:
         self._position_signatures: dict[int, str] = {}
         self._lock = asyncio.Lock()
 
-    async def connect(self, user_id: int, websocket: WebSocket) -> None:
-        await websocket.accept()
+    async def connect(
+        self,
+        user_id: int,
+        websocket: WebSocket,
+        *,
+        subprotocol: str | None = None,
+    ) -> None:
+        if subprotocol:
+            await websocket.accept(subprotocol=subprotocol)
+        else:
+            await websocket.accept()
         async with self._lock:
             self._connections[user_id].add(websocket)
             task = self._account_refresh_tasks.get(user_id)

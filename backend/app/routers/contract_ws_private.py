@@ -16,6 +16,7 @@ from app.services.contract_private_ws import contract_private_ws_manager, get_co
 
 router = APIRouter(prefix="/contract", tags=["contract-private"])
 logger = logging.getLogger(__name__)
+CONTRACT_PRIVATE_WS_AUTH_PROTOCOL = "contract-auth"
 
 
 @router.get("/ws/private/health")
@@ -23,8 +24,30 @@ def contract_private_ws_health(user_id: int = Depends(get_current_user_id)):
     return ok(data=get_contract_user_event_bridge_health())
 
 
+def _private_ws_protocols(websocket: WebSocket) -> list[str]:
+    return [
+        value.strip()
+        for value in (websocket.headers.get("sec-websocket-protocol") or "").split(",")
+        if value.strip()
+    ]
+
+
+def _private_ws_protocol_token(websocket: WebSocket) -> str | None:
+    protocols = _private_ws_protocols(websocket)
+    try:
+        auth_index = protocols.index(CONTRACT_PRIVATE_WS_AUTH_PROTOCOL)
+    except ValueError:
+        return None
+    token_index = auth_index + 1
+    return protocols[token_index] if token_index < len(protocols) else None
+
+
 def _get_user_id_from_websocket(websocket: WebSocket) -> int | None:
-    token = websocket.cookies.get("access_token") or websocket.query_params.get("access_token")
+    token = (
+        websocket.cookies.get("access_token")
+        or _private_ws_protocol_token(websocket)
+        or websocket.query_params.get("access_token")
+    )
     if not token:
         return None
     if token.lower().startswith("bearer "):
@@ -55,7 +78,12 @@ async def contract_private_ws(
         return
 
     active_symbol = symbol.strip().upper() if symbol else None
-    await contract_private_ws_manager.connect(user_id, websocket)
+    negotiated_protocol = (
+        CONTRACT_PRIVATE_WS_AUTH_PROTOCOL
+        if CONTRACT_PRIVATE_WS_AUTH_PROTOCOL in _private_ws_protocols(websocket)
+        else None
+    )
+    await contract_private_ws_manager.connect(user_id, websocket, subprotocol=negotiated_protocol)
     try:
         await contract_private_ws_manager.send_snapshot_to_one(websocket, db, user_id, active_symbol)
         while True:
