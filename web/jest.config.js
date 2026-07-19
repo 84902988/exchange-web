@@ -3,7 +3,6 @@ const config = {
   testEnvironment: 'jest-environment-jsdom',
   setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
   moduleNameMapper: {
-    '^@/(.*)$': '<rootDir>/src/$1',
     '^@/components/(.*)$': '<rootDir>/components/$1',
     '^@/lib/(.*)$': '<rootDir>/lib/$1',
     '^@/types/(.*)$': '<rootDir>/types/$1',
@@ -12,6 +11,7 @@ const config = {
     '^@/contexts/(.*)$': '<rootDir>/contexts/$1',
     '^@/hooks/(.*)$': '<rootDir>/hooks/$1',
     '^@/store/(.*)$': '<rootDir>/store/$1',
+    '^@/(.*)$': '<rootDir>/$1',
   },
   transform: {
     '^.+\\.(js|jsx|ts|tsx)$': ['babel-jest', {
