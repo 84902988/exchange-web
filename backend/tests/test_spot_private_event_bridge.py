@@ -556,6 +556,50 @@ def test_relay_redis_client_has_bounded_timeouts(monkeypatch):
         redis.close()
 
 
+def test_relay_run_reuses_one_redis_client_across_poll_cycles():
+    async def run():
+        class TrackingRedis(FakeRedis):
+            def __init__(self) -> None:
+                super().__init__()
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        redis = TrackingRedis()
+        factory_calls = 0
+
+        def redis_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return redis
+
+        relay = SpotPrivateEventRelay(
+            redis_factory=redis_factory,
+            owner_id="relay-reuse",
+            lock_token="relay-reuse-token",
+            poll_interval_seconds=0.05,
+        )
+        cycles = 0
+
+        def run_once_tracked(shared_redis):
+            nonlocal cycles
+            assert shared_redis is redis
+            cycles += 1
+            if cycles >= 3:
+                relay.request_stop()
+            return relay_module.SpotPrivateEventRelayResult(active=True)
+
+        relay._run_once_tracked = run_once_tracked
+        await asyncio.wait_for(relay.run(asyncio.Event()), timeout=1.0)
+
+        assert cycles == 3
+        assert factory_calls == 1
+        assert redis.closed is True
+
+    _run_async(run())
+
+
 class SlowUnavailableRedis(FakeRedis):
     def __init__(self) -> None:
         super().__init__()

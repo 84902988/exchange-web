@@ -204,10 +204,12 @@ class SpotPrivateEventRelay:
             exc_info=True,
         )
 
-    def run_once(self) -> SpotPrivateEventRelayResult:
+    def run_once(self, redis: Any | None = None) -> SpotPrivateEventRelayResult:
         if self._shutdown_requested.is_set():
             return SpotPrivateEventRelayResult(active=False)
-        redis = self._redis_factory()
+        owns_redis = redis is None
+        if redis is None:
+            redis = self._redis_factory()
         try:
             if not self._acquire_or_renew_lock(redis):
                 result = SpotPrivateEventRelayResult(active=False)
@@ -259,7 +261,8 @@ class SpotPrivateEventRelay:
             finally:
                 db.close()
         finally:
-            _close_redis(redis)
+            if owns_redis:
+                _close_redis(redis)
 
     def release_lock(self) -> bool:
         redis = self._redis_factory()
@@ -268,37 +271,41 @@ class SpotPrivateEventRelay:
         finally:
             _close_redis(redis)
 
-    def _run_once_tracked(self) -> SpotPrivateEventRelayResult:
+    def _run_once_tracked(self, redis: Any | None = None) -> SpotPrivateEventRelayResult:
         self._run_once_idle.clear()
         try:
-            return self.run_once()
+            return self.run_once(redis)
         finally:
             self._run_once_idle.set()
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        while not stop_event.is_set() and not self._shutdown_requested.is_set():
-            delay = self.poll_interval_seconds
-            try:
-                result = await asyncio.to_thread(self._run_once_tracked)
-                if result.failed:
-                    delay = self.failure_retry_seconds
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                now = time.monotonic()
-                if now - self._last_error_log_at >= 30.0:
-                    self._last_error_log_at = now
-                    logger.warning("spot_private_event_relay_cycle_failed", exc_info=True)
-                else:
-                    logger.debug("spot_private_event_relay_cycle_failed", exc_info=True)
+        redis = self._redis_factory()
+        try:
+            while not stop_event.is_set() and not self._shutdown_requested.is_set():
+                delay = self.poll_interval_seconds
+                try:
+                    result = await asyncio.to_thread(self._run_once_tracked, redis)
+                    if result.failed:
+                        delay = self.failure_retry_seconds
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    now = time.monotonic()
+                    if now - self._last_error_log_at >= 30.0:
+                        self._last_error_log_at = now
+                        logger.warning("spot_private_event_relay_cycle_failed", exc_info=True)
+                    else:
+                        logger.debug("spot_private_event_relay_cycle_failed", exc_info=True)
 
-            try:
-                await asyncio.wait_for(
-                    stop_event.wait(),
-                    timeout=delay,
-                )
-            except asyncio.TimeoutError:
-                pass
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(),
+                        timeout=delay,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            _close_redis(redis)
 
 
 _relay_task: asyncio.Task[None] | None = None
