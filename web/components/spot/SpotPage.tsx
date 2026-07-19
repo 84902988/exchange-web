@@ -1686,11 +1686,11 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           <div className="min-w-0 min-h-0 xl:col-start-2 xl:row-start-1">
             <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
               <div className="shrink-0 border-b border-white/10 px-2.5">
-                <div className="inline-flex h-10 items-stretch gap-5">
+                <div className="flex h-10 min-w-0 items-stretch gap-3">
                   <button
                     type="button"
                     onClick={() => setRightPanelTab('orderbook')}
-                    className={`relative px-0 text-[13px] font-medium leading-4 transition-colors ${
+                    className={`relative shrink-0 whitespace-nowrap px-0 text-[13px] font-medium leading-4 transition-colors ${
                       rightPanelTab === 'orderbook'
                         ? 'text-white after:absolute after:inset-x-0 after:bottom-[-1px] after:h-0.5 after:rounded-full after:bg-white'
                         : 'text-white/65 hover:text-white'
@@ -1701,7 +1701,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                   <button
                     type="button"
                     onClick={() => setRightPanelTab('trades')}
-                    className={`relative px-0 text-[13px] font-medium leading-4 transition-colors ${
+                    className={`relative shrink-0 whitespace-nowrap px-0 text-[13px] font-medium leading-4 transition-colors ${
                       rightPanelTab === 'trades'
                         ? 'text-white after:absolute after:inset-x-0 after:bottom-[-1px] after:h-0.5 after:rounded-full after:bg-white'
                         : 'text-white/65 hover:text-white'
