@@ -57,10 +57,26 @@ def _get_pair_by_symbol(db: Session, symbol: str) -> TradingPair:
     return pair
 
 
-def _build_order_item(row: Order, pair: TradingPair) -> Dict:
+def _remaining_amount(row: Order) -> Decimal:
     remaining = (row.amount or Decimal("0")) - (row.filled_amount or Decimal("0"))
-    if remaining < 0:
-        remaining = Decimal("0")
+    return max(remaining, Decimal("0"))
+
+
+def _is_effectively_open(row: Order) -> bool:
+    return str(row.status or "").upper().strip() in OPEN_STATUSES and _remaining_amount(row) > 0
+
+
+def _build_order_item(row: Order, pair: TradingPair) -> Dict:
+    remaining = _remaining_amount(row)
+    amount = row.amount or Decimal("0")
+    filled_amount = row.filled_amount or Decimal("0")
+    status = row.status
+    if str(status or "").upper().strip() in OPEN_STATUSES and amount > 0 and filled_amount >= amount:
+        # Historical rows created before the matching status invariant was
+        # enforced can retain PARTIALLY_FILLED after their remaining amount
+        # reaches zero. Keep the database immutable here, but expose the
+        # effective terminal state consistently to current/history consumers.
+        status = "FILLED"
 
     fee_asset = getattr(row, "fee_asset", None)
     fee_asset_symbol = _fee_symbol(getattr(row, "fee_asset_symbol", None) or (fee_asset.symbol if fee_asset else None))
@@ -79,7 +95,7 @@ def _build_order_item(row: Order, pair: TradingPair) -> Dict:
         "fee_amount": _fmt(row.fee_amount),
         "fee_asset_id": row.fee_asset_id,
         "fee_asset_symbol": fee_asset_symbol,
-        "status": row.status,
+        "status": status,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
@@ -139,6 +155,7 @@ def get_current_orders(db: Session, user_id: int, symbol: str, limit: int = 50) 
             Order.user_id == user_id,
             Order.trading_pair_id == pair.id,
             Order.status.in_(OPEN_STATUSES),
+            Order.amount > Order.filled_amount,
         )
         .order_by(desc(Order.id))
         .limit(limit)
@@ -147,7 +164,10 @@ def get_current_orders(db: Session, user_id: int, symbol: str, limit: int = 50) 
 
     items: List[Dict] = []
     for row in rows:
-        items.append(_build_order_item(row, pair))
+        # Keep a fail-closed read guard in addition to the SQL predicate so a
+        # stale ORM row can never reappear through a private-event snapshot.
+        if _is_effectively_open(row):
+            items.append(_build_order_item(row, pair))
 
     return {
         "symbol": pair.symbol,
@@ -168,7 +188,10 @@ def get_history_orders(db: Session, user_id: int, symbol: str, limit: int = 100)
         .filter(
             Order.user_id == user_id,
             Order.trading_pair_id == pair.id,
-            ~Order.status.in_(OPEN_STATUSES),
+            or_(
+                ~Order.status.in_(OPEN_STATUSES),
+                Order.amount <= Order.filled_amount,
+            ),
         )
         .order_by(desc(Order.id))
         .limit(limit)
