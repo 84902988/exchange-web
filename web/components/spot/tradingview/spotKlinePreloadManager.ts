@@ -16,6 +16,7 @@ import { markSpotKlinePerf } from './spotKlinePerf';
 export const SPOT_KLINE_PRELOAD_COMMON_INTERVALS = ['4h', '1h', '15m', '5m', '1m'];
 export const SPOT_KLINE_PRELOAD_COARSE_INTERVALS = ['1d', '1w', '1M'];
 export const SPOT_KLINE_PRELOAD_DELAY_MS = 1800;
+export const SPOT_KLINE_PRELOAD_MAX_CONCURRENCY = 1;
 
 const SPOT_KLINE_PRELOAD_LIMIT_BY_INTERVAL: Readonly<Record<string, number>> = {
   '1m': 360,
@@ -85,12 +86,13 @@ type PreloadSpotTradingViewKlineCacheOptions = {
   activeInterval?: string;
   concurrency?: number;
   shouldContinue?: () => boolean;
+  role?: SpotKlineInFlightRole;
 };
 
 export type SpotKlineInFlightRole = 'active' | 'revalidate' | 'preload';
 
 const SPOT_KLINE_INFLIGHT_DEADLINE_MS: Record<SpotKlineInFlightRole, number> = {
-  active: 15_000,
+  active: 45_000,
   revalidate: 15_000,
   preload: 15_000,
 };
@@ -111,7 +113,18 @@ export type SpotKlineInFlightResult = {
   earliest_available_time?: unknown;
 };
 
-function getSpotKlineInFlightTerminalMetadata(result: SpotKlineInFlightResult | null | undefined) {
+type SpotKlineTerminalMetadataEvidence = {
+  historyTerminal?: boolean;
+  terminalReason?: string | null;
+  earliestBoundary?: number | null;
+  history_terminal?: unknown;
+  terminal_reason?: unknown;
+  earliest_available_time?: unknown;
+};
+
+function getSpotKlineInFlightTerminalMetadata(
+  result: SpotKlineTerminalMetadataEvidence | null | undefined,
+) {
   const historyTerminal = result?.historyTerminal === true || result?.history_terminal === true;
   const terminalReason = String(result?.terminalReason || result?.terminal_reason || '').trim() || null;
   const earliestBoundary = Number(result?.earliestBoundary || result?.earliest_available_time);
@@ -556,12 +569,23 @@ export function getSpotPreloadIntervals() {
   ];
 }
 
+export function getSpotBackgroundPreloadIntervals(activeInterval: string) {
+  const activeBackendInterval = getBackendKlineIntervalForSpotInterval(
+    normalizeSpotInterval(activeInterval),
+  );
+  return getSpotPreloadIntervals().filter((interval) => (
+    getBackendKlineIntervalForSpotInterval(normalizeSpotInterval(interval))
+    !== activeBackendInterval
+  ));
+}
+
 export async function preloadSpotTradingViewKlineCache({
   symbol,
   intervals,
   activeInterval,
   concurrency = 1,
   shouldContinue,
+  role = 'preload',
 }: PreloadSpotTradingViewKlineCacheOptions) {
   const normalizedSymbol = normalizeSpotSymbol(symbol);
   if (!normalizedSymbol) return;
@@ -612,7 +636,11 @@ export async function preloadSpotTradingViewKlineCache({
 
   if (!queue.length) return;
 
-  const workerCount = Math.max(1, Math.min(Math.floor(concurrency || 1), 1, queue.length));
+  const workerCount = Math.max(1, Math.min(
+    Math.floor(concurrency || 1),
+    SPOT_KLINE_PRELOAD_MAX_CONCURRENCY,
+    queue.length,
+  ));
   let cursor = 0;
   const shouldRun = () => !shouldContinue || shouldContinue();
 
@@ -636,18 +664,22 @@ export async function preloadSpotTradingViewKlineCache({
           await waitForSpotKlinePreloadGap(shouldContinue);
           continue;
         }
-        markSpotKlinePerf('kline_preload_start', {
-          symbol: normalizedSymbol,
-          interval: item.interval,
-          backendInterval: item.interval,
-          limit: item.limit,
-          reason: 'idle preload',
-        });
+        const isForegroundPrewarm = role === 'active';
+        markSpotKlinePerf(
+          isForegroundPrewarm ? 'kline_foreground_prewarm_start' : 'kline_preload_start',
+          {
+            symbol: normalizedSymbol,
+            interval: item.interval,
+            backendInterval: item.interval,
+            limit: item.limit,
+            reason: isForegroundPrewarm ? 'widget bootstrap prewarm' : 'idle preload',
+          },
+        );
         const outcome = await requestSpotKlineInFlight({
           symbol: normalizedSymbol,
           interval: item.interval,
           requestedBars: item.limit,
-          role: 'preload',
+          role,
           getCoveredResult: () => {
             const covered = inspectCurrentKlineCache(normalizedSymbol, item.interval, item.limit, {
               minBars: item.limit,
@@ -716,44 +748,62 @@ export async function preloadSpotTradingViewKlineCache({
           minBars: item.limit,
         }).hit;
         if (!shouldRun()) {
-          markSpotKlinePerf('kline_preload_cancel', {
+          markSpotKlinePerf(
+            isForegroundPrewarm ? 'kline_foreground_prewarm_cancel' : 'kline_preload_cancel',
+            {
+              symbol: normalizedSymbol,
+              interval: item.interval,
+              backendInterval: item.interval,
+              limit: item.limit,
+              duration_ms: Math.max(0, getSpotKlinePreloadPerfNow() - startedAt),
+              bars_count: cached?.bars.length || 0,
+              reason: isForegroundPrewarm
+                ? 'widget bootstrap prewarm cancelled before store'
+                : 'preload cancelled before store',
+            },
+          );
+          return;
+        }
+        markSpotKlinePerf(
+          isForegroundPrewarm ? 'kline_foreground_prewarm_success' : 'kline_preload_success',
+          {
+            ...(cached
+              ? buildKlineCachePerfPayload(cached, {
+                symbol: normalizedSymbol,
+                interval: item.interval,
+                limit: item.limit,
+              })
+              : {
+                symbol: normalizedSymbol,
+                interval: item.interval,
+                backendInterval: item.interval,
+                limit: item.limit,
+                bars_count: 0,
+              }),
+            duration_ms: Math.max(0, getSpotKlinePreloadPerfNow() - startedAt),
+            reason: cached
+              ? (isForegroundPrewarm ? 'widget bootstrap prewarm stored' : 'preload stored')
+              : (isForegroundPrewarm
+                ? 'widget bootstrap prewarm returned no bars'
+                : 'preload returned no bars'),
+          },
+        );
+      } catch (err) {
+        const isForegroundPrewarm = role === 'active';
+        markSpotKlinePerf(
+          isForegroundPrewarm ? 'kline_foreground_prewarm_error' : 'kline_preload_error',
+          {
             symbol: normalizedSymbol,
             interval: item.interval,
             backendInterval: item.interval,
             limit: item.limit,
             duration_ms: Math.max(0, getSpotKlinePreloadPerfNow() - startedAt),
-            bars_count: cached?.bars.length || 0,
-            reason: 'preload cancelled before store',
-          });
-          return;
-        }
-        markSpotKlinePerf('kline_preload_success', {
-          ...(cached
-            ? buildKlineCachePerfPayload(cached, {
-              symbol: normalizedSymbol,
-              interval: item.interval,
-              limit: item.limit,
-            })
-            : {
-              symbol: normalizedSymbol,
-              interval: item.interval,
-              backendInterval: item.interval,
-              limit: item.limit,
-              bars_count: 0,
-            }),
-          duration_ms: Math.max(0, getSpotKlinePreloadPerfNow() - startedAt),
-          reason: cached ? 'preload stored' : 'preload returned no bars',
-        });
-      } catch (err) {
-        markSpotKlinePerf('kline_preload_error', {
-          symbol: normalizedSymbol,
-          interval: item.interval,
-          backendInterval: item.interval,
-          limit: item.limit,
-          duration_ms: Math.max(0, getSpotKlinePreloadPerfNow() - startedAt),
-          reason: 'preload request failed',
-          error: err instanceof Error ? err.message : String(err),
-        });
+            reason: isForegroundPrewarm
+              ? 'widget bootstrap prewarm request failed'
+              : 'preload request failed',
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
         if (process.env.NODE_ENV !== 'production') {
           console.debug('[SpotKlinePreloadManager] preload kline cache failed', {
             symbol: normalizedSymbol,
@@ -825,7 +875,7 @@ export function createSpotKlinePreloadManager(params: {
 
     const eventInterval = event.interval || activeInterval;
     const eventBackendInterval = event.backendInterval || getBackendKlineIntervalForSpotInterval(eventInterval);
-    const intervals = getSpotPreloadIntervals();
+    const intervals = getSpotBackgroundPreloadIntervals(eventBackendInterval);
     if (!intervals.length) return;
     deferredSchedule = { event, reason };
 
@@ -872,8 +922,7 @@ export function createSpotKlinePreloadManager(params: {
         void preloadSpotTradingViewKlineCache({
           symbol: activeSymbol,
           intervals,
-          activeInterval: eventBackendInterval,
-          concurrency: 1,
+          concurrency: SPOT_KLINE_PRELOAD_MAX_CONCURRENCY,
           shouldContinue: () => (
             preloadSeq === scheduleSeq &&
             normalizeSpotSymbol(params.getState().symbol) === activeSymbol

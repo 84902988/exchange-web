@@ -61,6 +61,10 @@ function wait(milliseconds: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
 }
 
+test('foreground getBars hard timeout tolerates serialized public tunnel delivery', () => {
+  assert.equal(datafeedModule.SPOT_TV_GETBARS_HARD_TIMEOUT_MS, 45_000)
+})
+
 function loadTypeScriptModule(
   filePath: string,
   mocks: Record<string, unknown>,

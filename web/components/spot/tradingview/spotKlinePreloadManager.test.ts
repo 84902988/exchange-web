@@ -556,6 +556,30 @@ test('active monthly preload requests 1Mutc with full terminal coverage', async 
   ])
 })
 
+test('foreground widget prewarm uses active ownership and records dedicated evidence', async () => {
+  resetHarness()
+
+  await preloadModule.preloadSpotTradingViewKlineCache({
+    symbol: 'BTCUSDT',
+    intervals: ['1m'],
+    activeInterval: '1m',
+    concurrency: 1,
+    role: 'active',
+  })
+
+  assert.deepEqual(fetchCalls.map(({ interval, limit }) => ({ interval, limit })), [
+    { interval: '1m', limit: 360 },
+  ])
+  assert.equal(
+    perfEvents.some(({ event }) => event === 'kline_foreground_prewarm_start'),
+    true,
+  )
+  assert.equal(
+    perfEvents.some(({ event }) => event === 'kline_foreground_prewarm_success'),
+    true,
+  )
+})
+
 test('monthly preload skips a terminal-complete cache that covers the 360-bar policy', async () => {
   resetHarness()
   const result = makeResult(100, '1Mutc')
@@ -659,6 +683,19 @@ test('preload processes the active interval before other intervals', async () =>
   assert.deepEqual(fetchCalls.map((call) => call.interval), ['5m', '1m'])
 })
 
+test('background preload excludes the foreground interval', () => {
+  resetHarness()
+
+  assert.deepEqual(
+    preloadModule.getSpotBackgroundPreloadIntervals('1m'),
+    ['4h', '1h', '15m', '5m', '1d', '1w', '1M'],
+  )
+  assert.deepEqual(
+    preloadModule.getSpotBackgroundPreloadIntervals('1M'),
+    ['4h', '1h', '15m', '5m', '1m', '1d', '1w'],
+  )
+})
+
 test('multiple preloads for one symbol interval share the same fetch', async () => {
   resetHarness()
   const pending = deferred<Awaited<ReturnType<typeof fetchCurrent>>>()
@@ -739,7 +776,7 @@ test('preload failure leaves existing stale candidate untouched', async () => {
   assert.ok(perfEvents.some((entry) => entry.event === 'kline_preload_error'))
 })
 
-test('foreground loading cancels pending preload dispatch and resumes the latest interval', async () => {
+test('foreground loading cancels pending preload dispatch and resumes alternatives after commit', async () => {
   resetHarness()
   const state = {
     symbol: 'BTCUSDT',
@@ -790,7 +827,8 @@ test('foreground loading cancels pending preload dispatch and resumes the latest
   await wait(0)
   await wait(0)
 
-  assert.equal(fetchCalls[0]?.interval, '1Mutc')
+  assert.equal(fetchCalls[0]?.interval, '4h')
+  assert.equal(fetchCalls.some((call) => call.interval === '1Mutc'), false)
   assert.ok(perfEvents.some((entry) => (
     entry.event === 'kline_preload_foreground_resume'
     && entry.payload.delay_ms === 1_800
