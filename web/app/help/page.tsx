@@ -11,6 +11,7 @@ import {
   type HelpArticle,
   type HelpCategory,
 } from "@/lib/help/helpContent";
+import { resolveHelpSourceCategories } from "@/lib/help/helpSourcePolicy";
 
 type ArticleWithCategory = ReturnType<typeof flattenHelpArticles>[number];
 
@@ -113,7 +114,7 @@ function HelpSectionList({ article }: { article: HelpArticle }) {
 export default function HelpPage() {
   const { locale, t } = useLocaleContext();
   const [cmsCategories, setCmsCategories] = useState<HelpCategory[] | null>(null);
-  const sourceCategories = cmsCategories?.length ? cmsCategories : helpCategories;
+  const sourceCategories = resolveHelpSourceCategories(cmsCategories);
   const allArticles = useMemo(() => flattenHelpArticles(sourceCategories), [sourceCategories]);
   const [selectedArticleId, setSelectedArticleId] = useState<string>(helpCategories[0].articles[0].id);
   const [query, setQuery] = useState("");
@@ -125,7 +126,7 @@ export default function HelpPage() {
       .then((data) => {
         if (cancelled) return;
         const categories = mapCmsHelpCategories(data.categories, locale);
-        setCmsCategories(categories.length > 0 ? categories : null);
+        setCmsCategories(categories);
       })
       .catch(() => {
         if (!cancelled) {
