@@ -109,6 +109,9 @@ def test_itick_ticker_normalizer_uses_quote_fields_and_live_source():
         {
             "s": "XAUUSD",
             "ld": "2365.12",
+            "o": "2400",
+            "change": "-34.88",
+            "rate": "-1.4533333333",
             "bp": "2365.00",
             "ap": "2365.24",
             "t": 1717000000000,
@@ -123,10 +126,43 @@ def test_itick_ticker_normalizer_uses_quote_fields_and_live_source():
     assert payload["ask_price"] == Decimal("2365.24")
     assert payload["last_price"] == Decimal("2365.12")
     assert payload["mark_price"] == Decimal("2365.12")
+    assert payload["open_24h"] == Decimal("2400")
+    assert payload["price_change_24h"] == Decimal("-34.88")
+    assert payload["price_change_percent_24h"] == Decimal("-1.453333333333333333333333333")
     assert payload["source"] == "LIVE_WS"
     assert payload["quote_source"] == "LIVE_WS"
     assert payload["is_realtime"] is True
     assert payload["market_status"] == "OPEN"
+
+
+def test_okx_ticker_normalizer_emits_complete_change_evidence():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderTickerSubscription(
+        local_symbol="BTCUSDT_PERP",
+        provider="OKX_SWAP",
+        provider_symbol="BTC-USDT-SWAP",
+    )
+
+    payload = service._normalize_okx_ticker(
+        subscription,
+        {
+            "bidPx": "104.9",
+            "askPx": "105.1",
+            "last": "105",
+            "open24h": "100",
+            "high24h": "110",
+            "low24h": "90",
+            "vol24h": "12",
+            "volCcy24h": "1260",
+            "ts": "1717000000000",
+        },
+    )
+
+    assert payload is not None
+    assert payload["open_24h"] == Decimal("100")
+    assert payload["price_change_24h"] == Decimal("5")
+    assert payload["price_change_percent_24h"] == Decimal("5.00")
 
 
 def test_itick_ticker_normalizer_synthesizes_bbo_from_last_price():

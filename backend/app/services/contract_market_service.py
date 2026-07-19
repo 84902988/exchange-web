@@ -57,6 +57,7 @@ from app.services.contract_market_guard import (
     executable_contract_quote_rejection_reason,
     require_executable_contract_quote,
 )
+from app.services.contract_ticker_evidence import resolve_contract_ticker_24h_evidence
 
 
 logger = logging.getLogger(__name__)
@@ -109,8 +110,10 @@ _contract_market_symbol_warning_cooldown_seconds = 60
 _tradfi_quote_cache_ttl = timedelta(seconds=60)
 _tradfi_forex_quote_cache_ttl = timedelta(seconds=2)
 _tradfi_kline_cache_ttl = timedelta(seconds=45)
-_itick_ticker_24h_fields = (
+_contract_ticker_24h_fields = (
+    "open_24h",
     "price_change_24h",
+    "price_change_percent_24h",
     "high_24h",
     "low_24h",
     "base_volume_24h",
@@ -1085,7 +1088,6 @@ def _ticker_from_quote_payload(symbol: str, quote: dict[str, Any]) -> dict[str, 
     return {
         "symbol": _normalize_symbol(symbol),
         "last_price": _format_decimal(quote.get("last_price")),
-        "price_change_percent_24h": quote.get("price_change_percent_24h"),
         "source": quote.get("source"),
         "ts": quote.get("ts"),
         **_ticker_24h_fields_from_quote(quote),
@@ -1191,7 +1193,7 @@ def _quote_from_depth(contract_symbol: ContractSymbol, depth: dict[str, Any], *,
     ask_price = _require_positive(depth.get("best_ask"), "ask_price")
     last_price = (bid_price + ask_price) / Decimal("2")
     mark_price = _calculate_mark_price(bid_price=bid_price, ask_price=ask_price, last_price=last_price)
-    return _quote_payload(
+    quote = _quote_payload(
         symbol=contract_symbol.symbol,
         provider=depth["provider"],
         provider_symbol=depth["provider_symbol"],
@@ -1202,6 +1204,8 @@ def _quote_from_depth(contract_symbol: ContractSymbol, depth: dict[str, Any], *,
         source=source,
         ts=depth["ts"],
     )
+    quote.update(_ticker_24h_fields_from_quote(depth))
+    return quote
 
 
 def _closed_bbo_payload_timestamp(payload: Optional[dict[str, Any]]) -> Optional[datetime]:
@@ -1329,6 +1333,7 @@ def _quote_from_open_market_depth_if_live(
         else _quote_from_stock_depth(contract_symbol.symbol, depth, source=str(depth.get("source") or "ITICK_DEPTH"))
     )
     derived["price_precision"] = int(getattr(contract_symbol, "price_precision", quote.get("price_precision") or 8) or 8)
+    _merge_ticker_24h_evidence(derived, quote)
     _cache_tradfi_quote(derived)
     return derived
 
@@ -1597,12 +1602,36 @@ def _extract_itick_24h_ticker_fields(
     ):
         # iTick stock contract quote may omit quote turnover; estimate it from last price and base volume.
         quote_volume_24h = base_volume_24h * last_price
+    change_evidence = resolve_contract_ticker_24h_evidence(
+        last_price=last_price,
+        open_24h=_pick_first_present(
+            data,
+            ["o", "open", "open_price", "open_24h", "openPrice", "day_open", "dayOpen"],
+        ),
+        price_change_24h=_pick_first_present(
+            data,
+            ["change", "price_change", "price_change_24h", "ch", "priceChange", "changePrice"],
+        ),
+        price_change_percent_24h=_pick_first_present(
+            data,
+            [
+                "chp",
+                "rate",
+                "change_percent",
+                "price_change_percent",
+                "price_change_percent_24h",
+                "percent",
+                "pct_chg",
+                "changePercent",
+                "priceChangePercent",
+            ],
+        ),
+    )
     return {
-        "price_change_24h": _format_optional_decimal(
-            _pick_decimal_present(
-                data,
-                ["change", "price_change", "price_change_24h", "ch", "priceChange", "changePrice"],
-            )
+        "open_24h": _format_optional_decimal(change_evidence.open_24h),
+        "price_change_24h": _format_optional_decimal(change_evidence.price_change_24h),
+        "price_change_percent_24h": _format_optional_decimal(
+            change_evidence.price_change_percent_24h
         ),
         "high_24h": _format_optional_decimal(
             _pick_decimal_present(
@@ -1624,11 +1653,59 @@ def _extract_itick_24h_ticker_fields(
 
 
 def _ticker_24h_fields_from_quote(quote: dict[str, Any]) -> dict[str, Any]:
-    return {key: quote.get(key) for key in _itick_ticker_24h_fields}
+    return {key: quote.get(key) for key in _contract_ticker_24h_fields}
 
 
-def _has_ticker_24h_fields(item: dict[str, Any]) -> bool:
-    return any(item.get(key) not in (None, "") for key in _itick_ticker_24h_fields)
+def _has_ticker_change_evidence(item: dict[str, Any]) -> bool:
+    return any(
+        item.get(key) not in (None, "")
+        for key in ("open_24h", "price_change_24h", "price_change_percent_24h")
+    )
+
+
+def _merge_ticker_24h_evidence(
+    target: dict[str, Any],
+    evidence: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(evidence, dict):
+        return target
+    target.update({
+        key: evidence.get(key)
+        for key in _contract_ticker_24h_fields
+        if evidence.get(key) not in (None, "")
+    })
+    return target
+
+
+def _ensure_closed_itick_ticker_evidence(
+    contract_symbol: ContractSymbol,
+    quote: dict[str, Any],
+) -> dict[str, Any]:
+    if _has_ticker_change_evidence(quote):
+        return quote
+
+    cached_quote = _get_cached_tradfi_quote_for_contract(contract_symbol, allow_stale=False)
+    _merge_ticker_24h_evidence(quote, cached_quote)
+    if _has_ticker_change_evidence(quote):
+        return quote
+
+    try:
+        if _is_tradfi_cfd_contract(contract_symbol):
+            ticker = _contract_ticker_from_itick_cfd(contract_symbol)
+        else:
+            ticker = _contract_ticker_from_stock_contract(
+                contract_symbol.symbol,
+                provider_symbol=contract_symbol.provider_symbol,
+            )
+        _merge_ticker_24h_evidence(quote, ticker)
+    except Exception as exc:
+        logger.debug(
+            "closed_itick_ticker_evidence_unavailable symbol=%s provider_symbol=%s reason=%s",
+            contract_symbol.symbol,
+            contract_symbol.provider_symbol,
+            exc,
+        )
+    return quote
 
 
 def _extract_itick_data_candidates(payload: Any) -> list[Dict[str, Any]]:
@@ -1663,7 +1740,11 @@ def _extract_stock_quote_item(payload: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _get_stock_contract_reference_price(provider_symbol: str, *, log_context: str = "contract_quote") -> Decimal:
+def _get_stock_contract_reference_price(
+    provider_symbol: str,
+    *,
+    log_context: str = "contract_quote",
+) -> tuple[Decimal, dict[str, Optional[str]], datetime]:
     try:
         payload = itick_market_service.get_stock_quote(region=_stock_contract_region, code=provider_symbol, timeout=2)
     except ItickMarketServiceError as exc:
@@ -1681,8 +1762,15 @@ def _get_stock_contract_reference_price(provider_symbol: str, *, log_context: st
     if data is None:
         raise ItickQuoteUnavailable("ITICK_STOCK_QUOTE_MISSING_PRICE")
 
-    price = _pick_positive_decimal(data, ["p", "ld", "last", "price", "latest_price", "close", "c"])
-    return _require_positive(price, "last_price")
+    price = _require_positive(
+        _pick_positive_decimal(data, ["p", "ld", "last", "price", "latest_price", "close", "c"]),
+        "last_price",
+    )
+    return (
+        price,
+        _extract_itick_24h_ticker_fields(data, last_price=price),
+        _itick_quote_timestamp(data),
+    )
 
 
 def _pick_depth_side(data: Dict[str, Any], keys: List[str]) -> Any:
@@ -1823,15 +1911,21 @@ def _build_stock_depth_from_quote(
     limit: int,
     log_context: str = "contract_quote",
 ) -> dict[str, Any]:
-    price = _get_stock_contract_reference_price(provider_symbol, log_context=log_context)
-    return _build_stock_depth_from_prices(
+    price, ticker_24h_fields, quote_ts = _get_stock_contract_reference_price(
+        provider_symbol,
+        log_context=log_context,
+    )
+    depth = _build_stock_depth_from_prices(
         symbol=symbol,
         provider_symbol=provider_symbol,
         best_bid=price * Decimal("0.9995"),
         best_ask=price * Decimal("1.0005"),
         limit=limit,
         source="ITICK_QUOTE_FALLBACK",
+        ts=quote_ts,
     )
+    depth.update(ticker_24h_fields)
+    return depth
 
 
 def _extract_itick_stock_depth_top(payload: Any) -> tuple[Optional[Decimal], Optional[Decimal], Optional[datetime]]:
@@ -1984,6 +2078,7 @@ def _quote_from_stock_depth(symbol: str, depth: dict[str, Any], *, source: str) 
         ts=depth["ts"],
     )
     quote["price_precision"] = 2
+    quote.update(_ticker_24h_fields_from_quote(depth))
     return quote
 
 
@@ -1994,22 +2089,43 @@ def _get_stock_contract_quote(
     log_context: str = "contract_quote",
 ) -> dict[str, Any]:
     normalized_symbol = _normalize_symbol(symbol)
+    normalized_provider_symbol = str(
+        provider_symbol or _stock_contract_underlying(normalized_symbol) or ""
+    ).strip().upper()
+    if not normalized_provider_symbol:
+        raise ContractSymbolNotFound("contract symbol not found or disabled")
     cached_quote = _get_cached_tradfi_quote(
         normalized_symbol,
         allow_stale=itick_market_service.is_quote_depth_cooldown_active(),
     )
-    if cached_quote is not None:
+    if cached_quote is not None and (
+        _has_ticker_change_evidence(cached_quote)
+        or itick_market_service.is_quote_depth_cooldown_active()
+    ):
         return cached_quote
 
     cached_depth = _get_cached_depth(normalized_symbol, limit=5, source="LIVE")
     if cached_depth is not None:
-        quote = _quote_from_stock_depth(normalized_symbol, cached_depth, source="LIVE")
-        _cache_tradfi_quote(quote)
-        return quote
-
-    depth = _get_stock_contract_depth(normalized_symbol, provider_symbol, limit=10, log_context=log_context)
-    _cache_depth(depth)
+        depth = cached_depth
+    else:
+        depth = _get_stock_contract_depth(
+            normalized_symbol,
+            normalized_provider_symbol,
+            limit=10,
+            log_context=log_context,
+        )
+        _cache_depth(depth)
     quote = _quote_from_stock_depth(normalized_symbol, depth, source=depth["source"])
+    if not _has_ticker_change_evidence(quote):
+        try:
+            _price, ticker_24h_fields, _quote_ts = _get_stock_contract_reference_price(
+                normalized_provider_symbol,
+                log_context=log_context,
+            )
+            quote.update(ticker_24h_fields)
+        except Exception:
+            # Depth remains usable for execution/display while 24h evidence fails closed.
+            pass
     _cache_tradfi_quote(quote)
     return quote
 
@@ -2117,7 +2233,9 @@ def _stable_reference_price(provider_symbol: str, category: str) -> Decimal:
     return max(base * (Decimal("1") + jitter_bps), Decimal("0.0001"))
 
 
-def _get_itick_cfd_reference_price(contract_symbol: ContractSymbol) -> tuple[Decimal, str, Optional[str], datetime]:
+def _get_itick_cfd_reference_price(
+    contract_symbol: ContractSymbol,
+) -> tuple[Decimal, str, Optional[str], datetime, dict[str, Optional[str]]]:
     provider_symbol = _contract_provider_symbol(contract_symbol)
     category = _contract_asset_category(contract_symbol)
     market = _itick_market_for_contract(contract_symbol)
@@ -2145,7 +2263,13 @@ def _get_itick_cfd_reference_price(contract_symbol: ContractSymbol) -> tuple[Dec
                         market,
                         price_field,
                     )
-                return price, "ITICK", price_field, _itick_quote_timestamp(data)
+                return (
+                    price,
+                    "ITICK",
+                    price_field,
+                    _itick_quote_timestamp(data),
+                    _extract_itick_24h_ticker_fields(data, last_price=price),
+                )
     except Exception as exc:
         _log_contract_market_warning(
             log_context="contract_quote",
@@ -2169,7 +2293,7 @@ def _get_itick_cfd_reference_price(contract_symbol: ContractSymbol) -> tuple[Dec
         category,
         _format_decimal(fallback_price),
     )
-    return fallback_price, "CFD_FALLBACK", None, datetime.utcnow()
+    return fallback_price, "CFD_FALLBACK", None, datetime.utcnow(), {}
 
 
 def _extend_cfd_depth_side(
@@ -2203,6 +2327,7 @@ def _build_cfd_depth_from_price(
     limit: int,
     price_field: Optional[str] = None,
     ts: Optional[datetime] = None,
+    ticker_24h_fields: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     precision = int(getattr(contract_symbol, "price_precision", 2) or 2)
     quant = _price_quant(precision)
@@ -2237,13 +2362,27 @@ def _build_cfd_depth_from_price(
     depth["price_precision"] = precision
     if price_field:
         depth["price_field"] = price_field
+    if ticker_24h_fields:
+        depth.update({
+            key: ticker_24h_fields.get(key)
+            for key in _contract_ticker_24h_fields
+        })
     return depth
 
 
-def _get_itick_cfd_depth(contract_symbol: ContractSymbol, *, limit: int = 20) -> dict[str, Any]:
+def _get_itick_cfd_depth(
+    contract_symbol: ContractSymbol,
+    *,
+    limit: int = 20,
+    require_ticker_evidence: bool = False,
+) -> dict[str, Any]:
     safe_limit = max(5, min(int(limit or 20), 100))
     cached_quote = _get_cached_tradfi_quote_for_contract(contract_symbol)
-    if cached_quote is not None:
+    if cached_quote is not None and (
+        not require_ticker_evidence
+        or _has_ticker_change_evidence(cached_quote)
+        or itick_market_service.is_quote_depth_cooldown_active()
+    ):
         reference_price = _require_positive(_to_decimal(cached_quote.get("last_price")), "last_price")
         return _build_cfd_depth_from_price(
             contract_symbol=contract_symbol,
@@ -2252,8 +2391,11 @@ def _get_itick_cfd_depth(contract_symbol: ContractSymbol, *, limit: int = 20) ->
             limit=safe_limit,
             price_field=cached_quote.get("price_field"),
             ts=_normalize_quote_ts(cached_quote.get("ts")),
+            ticker_24h_fields=_ticker_24h_fields_from_quote(cached_quote),
         )
-    reference_price, source, price_field, quote_ts = _get_itick_cfd_reference_price(contract_symbol)
+    reference_price, source, price_field, quote_ts, ticker_24h_fields = _get_itick_cfd_reference_price(
+        contract_symbol
+    )
     return _build_cfd_depth_from_price(
         contract_symbol=contract_symbol,
         reference_price=reference_price,
@@ -2261,6 +2403,7 @@ def _get_itick_cfd_depth(contract_symbol: ContractSymbol, *, limit: int = 20) ->
         limit=safe_limit,
         price_field=price_field,
         ts=quote_ts,
+        ticker_24h_fields=ticker_24h_fields,
     )
 
 
@@ -2269,6 +2412,7 @@ def _quote_from_cfd_depth(contract_symbol: ContractSymbol, depth: dict[str, Any]
     quote["price_precision"] = int(getattr(contract_symbol, "price_precision", 2) or 2)
     if depth.get("price_field"):
         quote["price_field"] = depth.get("price_field")
+    quote.update(_ticker_24h_fields_from_quote(depth))
     return quote
 
 
@@ -2320,7 +2464,7 @@ def _provider_first_row(payload: Any) -> dict[str, Any]:
 
 def _provider_timestamp_ms(value: Any) -> int:
     timestamp = _to_timestamp_ms(value)
-    return timestamp or int(datetime.utcnow().timestamp() * 1000)
+    return timestamp or int(time.time() * 1000)
 
 
 def _normalize_provider_depth(
@@ -2364,6 +2508,63 @@ def _provider_ticker_last_price(provider_code: str, payload: Any) -> Optional[De
     if provider_code == "BINANCE_USDM" and isinstance(payload, dict):
         return _to_decimal(_pick_first_present(payload, ["lastPrice", "price"]))
     return None
+
+
+def _provider_ticker_24h_fields(
+    provider_code: str,
+    payload: Any,
+    *,
+    last_price: Optional[Decimal],
+) -> dict[str, Any]:
+    normalized_provider = str(provider_code or "").strip().upper()
+    row = _provider_first_row(payload)
+
+    if normalized_provider == "OKX_SWAP":
+        open_24h = row.get("open24h")
+        native_change = None
+        native_percent = None
+        high_24h = _to_decimal(row.get("high24h"))
+        low_24h = _to_decimal(row.get("low24h"))
+        base_volume_24h = _to_decimal(row.get("vol24h"))
+        quote_volume_24h = _to_decimal(row.get("volCcy24h"))
+    elif normalized_provider == "BITGET_USDT_FUTURES":
+        open_24h = _pick_first_present(row, ["open24h", "open24Hr"])
+        native_change = _pick_first_present(row, ["priceChange", "change"])
+        native_percent = _pick_first_present(row, ["change24h", "priceChangePercent"])
+        high_24h = _to_decimal(row.get("high24h"))
+        low_24h = _to_decimal(row.get("low24h"))
+        base_volume_24h = _to_decimal(row.get("baseVolume"))
+        quote_volume_24h = _to_decimal(row.get("quoteVolume"))
+    else:
+        source = payload if isinstance(payload, dict) else row
+        open_24h = _pick_first_present(source, ["openPrice", "open24h", "open_24h"])
+        native_change = _pick_first_present(source, ["priceChange", "price_change_24h"])
+        native_percent = _pick_first_present(
+            source,
+            ["priceChangePercent", "change24h", "price_change_percent_24h"],
+        )
+        high_24h = _to_decimal(source.get("highPrice"))
+        low_24h = _to_decimal(source.get("lowPrice"))
+        base_volume_24h = _to_decimal(source.get("volume"))
+        quote_volume_24h = _to_decimal(source.get("quoteVolume"))
+
+    change_evidence = resolve_contract_ticker_24h_evidence(
+        last_price=last_price,
+        open_24h=open_24h,
+        price_change_24h=native_change,
+        price_change_percent_24h=native_percent,
+    )
+    return {
+        "open_24h": _format_optional_decimal(change_evidence.open_24h),
+        "price_change_24h": _format_optional_decimal(change_evidence.price_change_24h),
+        "price_change_percent_24h": _format_optional_decimal(
+            change_evidence.price_change_percent_24h
+        ),
+        "high_24h": _format_optional_decimal(high_24h),
+        "low_24h": _format_optional_decimal(low_24h),
+        "base_volume_24h": _format_optional_decimal(base_volume_24h),
+        "quote_volume_24h": _format_optional_decimal(quote_volume_24h),
+    }
 
 
 def _provider_funding_rate(provider_code: str, payload: Any) -> Optional[Decimal]:
@@ -2460,12 +2661,19 @@ def _get_configured_contract_live_quote(db: Session, contract_symbol: ContractSy
                 limit=5,
             )
             last_price: Optional[Decimal] = None
+            ticker_24h_fields: dict[str, Any] = {}
             funding_rate: Optional[Decimal] = None
             try:
                 ticker_payload = request_contract_market_provider_json(provider, "ticker", provider_symbol, limit=1)
                 last_price = _provider_ticker_last_price(provider.provider_code, ticker_payload)
+                ticker_24h_fields = _provider_ticker_24h_fields(
+                    provider.provider_code,
+                    ticker_payload,
+                    last_price=last_price,
+                )
             except Exception:
                 last_price = None
+                ticker_24h_fields = {}
             try:
                 funding_payload = request_contract_market_provider_json(provider, "funding", provider_symbol, limit=1)
                 funding_rate = _provider_funding_rate(provider.provider_code, funding_payload)
@@ -2474,6 +2682,8 @@ def _get_configured_contract_live_quote(db: Session, contract_symbol: ContractSy
             quote = _depth_to_quote(contract_symbol=contract_symbol, depth=depth, last_price=last_price)
             quote["provider"] = provider.provider_code
             quote["provider_symbol"] = provider_symbol
+            quote.update(ticker_24h_fields)
+            depth.update(ticker_24h_fields)
             if funding_rate is not None:
                 quote["funding_rate"] = funding_rate
             _cache_depth(depth)
@@ -2523,35 +2733,18 @@ def _configured_contract_ticker(db: Session, contract_symbol: ContractSymbol) ->
             last_price = _provider_ticker_last_price(provider.provider_code, payload)
             if last_price is None or last_price <= 0:
                 raise ContractQuoteUnavailable(f"{provider.provider_code}_TICKER_UNAVAILABLE")
-            row = _provider_first_row(payload)
-            if provider.provider_code == "OKX_SWAP":
-                high_24h = _to_decimal(row.get("high24h"))
-                low_24h = _to_decimal(row.get("low24h"))
-                volume = _to_decimal(row.get("vol24h"))
-                quote_volume = _to_decimal(row.get("volCcy24h"))
-            elif provider.provider_code == "BITGET_USDT_FUTURES":
-                high_24h = _to_decimal(row.get("high24h"))
-                low_24h = _to_decimal(row.get("low24h"))
-                volume = _to_decimal(row.get("baseVolume"))
-                quote_volume = _to_decimal(row.get("quoteVolume"))
-            else:
-                high_24h = _to_decimal(payload.get("highPrice")) if isinstance(payload, dict) else None
-                low_24h = _to_decimal(payload.get("lowPrice")) if isinstance(payload, dict) else None
-                volume = _to_decimal(payload.get("volume")) if isinstance(payload, dict) else None
-                quote_volume = _to_decimal(payload.get("quoteVolume")) if isinstance(payload, dict) else None
+            ticker_24h_fields = _provider_ticker_24h_fields(
+                provider.provider_code,
+                payload,
+                last_price=last_price,
+            )
             mark_contract_market_provider_success(db, provider.provider_code)
             return {
                 "symbol": contract_symbol.symbol,
                 "last_price": _format_decimal(last_price),
-                "price_change_24h": None,
-                "price_change_percent_24h": str(row.get("change24h") or row.get("priceChangePercent") or "")
-                or None,
-                "high_24h": _format_optional_decimal(high_24h),
-                "low_24h": _format_optional_decimal(low_24h),
-                "base_volume_24h": _format_optional_decimal(volume),
-                "quote_volume_24h": _format_optional_decimal(quote_volume),
                 "source": "LIVE",
                 "ts": datetime.utcnow(),
+                **ticker_24h_fields,
             }
         except ProviderCooldownError as exc:
             last_error = exc
@@ -2767,7 +2960,7 @@ def _normalize_provider_trade_rows(
 ) -> list[dict[str, Any]]:
     rows = _provider_data_rows(payload)
     normalized: list[dict[str, Any]] = []
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    now_ms = int(time.time() * 1000)
     normalized_provider = str(provider_code or "").strip().upper()
     normalized_symbol = _normalize_symbol(symbol) if symbol else None
     normalized_provider_symbol = str(provider_symbol or "").strip() or None
@@ -2878,7 +3071,7 @@ def _normalize_itick_stock_tick_trade(
         "time": ts,
         "ts": ts,
         "event_time_ms": ts,
-        "received_at_ms": int(datetime.utcnow().timestamp() * 1000),
+        "received_at_ms": int(time.time() * 1000),
         "side": side,
         "direction": direction or None,
         "trading_session": row.get("te"),
@@ -3326,11 +3519,18 @@ def _get_itick_live_quote(contract_symbol: ContractSymbol, *, log_context: str =
             contract_symbol,
             allow_stale=itick_market_service.is_quote_depth_cooldown_active(),
         )
-        if cached_quote is not None:
+        if cached_quote is not None and (
+            _has_ticker_change_evidence(cached_quote)
+            or itick_market_service.is_quote_depth_cooldown_active()
+        ):
             return cached_quote
         if itick_market_service.is_quote_depth_cooldown_active():
             raise ItickQuoteUnavailable("ITICK_COOLDOWN_ACTIVE")
-        depth = _get_itick_cfd_depth(contract_symbol, limit=10)
+        depth = _get_itick_cfd_depth(
+            contract_symbol,
+            limit=10,
+            require_ticker_evidence=True,
+        )
         _cache_depth(depth)
         quote = _quote_from_cfd_depth(contract_symbol, depth, source=depth["source"])
         _cache_tradfi_quote(quote)
@@ -3423,11 +3623,18 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
         contract_symbol,
         market_status,
     ):
+        if provider == "ITICK":
+            _ensure_closed_itick_ticker_evidence(contract_symbol, frozen_quote)
         return _contract_quote_with_status(frozen_quote, market_status, contract_symbol)
 
     try:
         if provider == "BINANCE":
-            quote = _recent_cached_quote(contract_symbol) or _get_configured_contract_live_quote(db, contract_symbol)
+            cached_quote = _recent_cached_quote(contract_symbol)
+            quote = (
+                cached_quote
+                if cached_quote is not None and _has_ticker_change_evidence(cached_quote)
+                else _get_configured_contract_live_quote(db, contract_symbol)
+            )
         elif provider == "ITICK":
             quote = _get_itick_live_quote(contract_symbol, log_context=log_context)
         else:
@@ -3631,7 +3838,8 @@ def _contract_ticker_from_stock_contract(
             allow_stale=itick_market_service.is_quote_depth_cooldown_active(),
         )
         if cached_ticker is not None and (
-            itick_market_service.is_quote_depth_cooldown_active() or _has_ticker_24h_fields(cached_ticker)
+            itick_market_service.is_quote_depth_cooldown_active()
+            or _has_ticker_change_evidence(cached_ticker)
         ):
             return cached_ticker
         if itick_market_service.is_quote_depth_cooldown_active():
@@ -3645,10 +3853,6 @@ def _contract_ticker_from_stock_contract(
     else:
         data = quote_item
     last_price = _pick_positive_decimal(data, ["p", "ld", "last", "price", "latest_price", "close", "c"])
-    change_percent = _pick_first_present(
-        data,
-        ["chp", "rate", "change_percent", "price_change_percent", "percent", "pct_chg"],
-    )
     ticker_24h_fields = _extract_itick_24h_ticker_fields(data, last_price=last_price)
     if last_price is not None and last_price > 0:
         quote_ts = _itick_quote_timestamp(data)
@@ -3658,12 +3862,10 @@ def _contract_ticker_from_stock_contract(
             data=data,
         )
         quote.update(ticker_24h_fields)
-        quote["price_change_percent_24h"] = str(change_percent) if change_percent not in (None, "") else None
         _cache_tradfi_quote(quote)
     return {
         "symbol": normalized_symbol,
         "last_price": _format_decimal(last_price) if last_price is not None and last_price > 0 else None,
-        "price_change_percent_24h": str(change_percent) if change_percent not in (None, "") else None,
         "source": "ITICK_QUOTE" if last_price is not None and last_price > 0 else None,
         "ts": quote_ts if last_price is not None and last_price > 0 else None,
         **ticker_24h_fields,
@@ -3675,7 +3877,7 @@ def _contract_ticker_from_itick_cfd(contract_symbol: ContractSymbol) -> dict[str
     is_cooldown_active = itick_market_service.is_quote_depth_cooldown_active()
     cached_quote = _get_cached_tradfi_quote_for_contract(contract_symbol, allow_stale=is_cooldown_active)
     cached_ticker = _ticker_from_quote_payload(contract_symbol.symbol, cached_quote) if cached_quote is not None else None
-    if cached_ticker is not None and (is_cooldown_active or _has_ticker_24h_fields(cached_ticker)):
+    if cached_ticker is not None and (is_cooldown_active or _has_ticker_change_evidence(cached_ticker)):
         return cached_ticker
     if is_cooldown_active:
         return {"symbol": contract_symbol.symbol, "last_price": None, "price_change_percent_24h": None}
@@ -3690,10 +3892,6 @@ def _contract_ticker_from_itick_cfd(contract_symbol: ContractSymbol) -> dict[str
             data,
             prefer_forex_latest=_uses_itick_latest_price_field(contract_symbol),
         )
-        change_percent = _pick_first_present(
-            data,
-            ["chp", "rate", "change_percent", "price_change_percent", "percent", "pct_chg"],
-        )
         ticker_24h_fields = _extract_itick_24h_ticker_fields(data, last_price=last_price)
         if last_price is not None and last_price > 0:
             quote_ts = _itick_quote_timestamp(data)
@@ -3707,12 +3905,10 @@ def _contract_ticker_from_itick_cfd(contract_symbol: ContractSymbol) -> dict[str
             )
             quote = _quote_from_cfd_depth(contract_symbol, depth, source="ITICK_QUOTE")
             quote.update(ticker_24h_fields)
-            quote["price_change_percent_24h"] = str(change_percent) if change_percent not in (None, "") else None
             _cache_tradfi_quote(quote)
             return {
                 "symbol": contract_symbol.symbol,
                 "last_price": _format_decimal(last_price),
-                "price_change_percent_24h": str(change_percent) if change_percent not in (None, "") else None,
                 "source": "ITICK_QUOTE",
                 "ts": quote_ts,
                 **ticker_24h_fields,
@@ -4888,6 +5084,15 @@ def contract_quote_to_response(quote: dict[str, Any]) -> dict[str, Any]:
         "index_price": _format_optional_decimal(_quote_display_index_price(quote)),
         "funding_rate": _format_optional_decimal(_to_decimal(quote.get("funding_rate"))),
         "next_funding_time": quote.get("next_funding_time"),
+        "open_24h": _format_optional_decimal(_to_decimal(quote.get("open_24h"))),
+        "price_change_24h": _format_optional_decimal(_to_decimal(quote.get("price_change_24h"))),
+        "price_change_percent_24h": _format_optional_decimal(
+            _to_decimal(quote.get("price_change_percent_24h"))
+        ),
+        "high_24h": _format_optional_decimal(_to_decimal(quote.get("high_24h"))),
+        "low_24h": _format_optional_decimal(_to_decimal(quote.get("low_24h"))),
+        "base_volume_24h": _format_optional_decimal(_to_decimal(quote.get("base_volume_24h"))),
+        "quote_volume_24h": _format_optional_decimal(_to_decimal(quote.get("quote_volume_24h"))),
         "source": quote["source"],
         "ts": quote["ts"],
     }

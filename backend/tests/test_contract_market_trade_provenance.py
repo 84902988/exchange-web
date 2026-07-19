@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,18 @@ from app.services.contract_market_gateway import (
 
 
 SYMBOL = "BTCUSDT_PERP"
+
+
+@pytest.fixture(autouse=True)
+def gateway_event_loop():
+    """Keep direct gateway construction deterministic on Python 3.9."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        yield
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 def test_provider_rest_trade_normalization_carries_complete_evidence(monkeypatch):

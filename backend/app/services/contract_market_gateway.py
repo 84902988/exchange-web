@@ -1930,6 +1930,13 @@ class ContractMarketGateway:
                 "ask_price": quote.get("ask_price"),
                 "last_price": quote.get("last_price"),
                 "mark_price": quote.get("mark_price"),
+                "open_24h": quote.get("open_24h"),
+                "price_change_24h": quote.get("price_change_24h"),
+                "price_change_percent_24h": quote.get("price_change_percent_24h"),
+                "high_24h": quote.get("high_24h"),
+                "low_24h": quote.get("low_24h"),
+                "base_volume_24h": quote.get("base_volume_24h"),
+                "quote_volume_24h": quote.get("quote_volume_24h"),
                 "source": quote.get("source"),
             }
         )
@@ -1965,6 +1972,18 @@ class ContractMarketGateway:
                 "execution_ask": state.get("execution_ask"),
                 "display_state": state.get("display_state"),
                 "executable": state.get("executable"),
+                "ticker_24h": {
+                    key: (state.get("ticker") or {}).get(key)
+                    for key in (
+                        "open_24h",
+                        "price_change_24h",
+                        "price_change_percent_24h",
+                        "high_24h",
+                        "low_24h",
+                        "base_volume_24h",
+                        "quote_volume_24h",
+                    )
+                },
             }
         )
 

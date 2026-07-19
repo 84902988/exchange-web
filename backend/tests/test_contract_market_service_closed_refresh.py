@@ -215,7 +215,7 @@ def test_closed_market_expired_last_good_quote_refreshes_itick_and_updates_last_
     assert result["ask_price"] == Decimal("281.30")
     assert result["last_good_at"] == new_ts
     assert result["last_good_bbo_valid"] is True
-    assert result["executable"] is True
+    assert result["executable"] is False
     synced_depth = service._get_closed_depth(contract.symbol, limit=5)
     assert synced_depth is not None
     assert synced_depth["best_bid"] == Decimal("281.10")
@@ -263,13 +263,13 @@ def test_closed_market_expired_depth_uses_refreshed_quote_when_depth_unavailable
 
     assert result["source"] == "LAST_GOOD_BBO"
     assert result["quote_freshness"] == "LAST_VALID"
-    assert result["executable"] is True
+    assert result["executable"] is False
     assert result["best_bid"] == Decimal("281.10")
     assert result["best_ask"] == Decimal("281.30")
     assert saved and saved[0]["bid_price"] == Decimal("281.10")
 
 
-def test_closed_market_depth_refresh_success_syncs_quote_and_is_executable():
+def test_closed_market_depth_refresh_success_syncs_quote_but_remains_not_executable():
     _reset_closed_caches()
     contract = _contract()
     old_ts = datetime.now(timezone.utc) - timedelta(days=8)
@@ -291,7 +291,7 @@ def test_closed_market_depth_refresh_success_syncs_quote_and_is_executable():
 
     assert depth["source"] == "LAST_GOOD_BBO"
     assert depth["quote_freshness"] == "LAST_VALID"
-    assert depth["executable"] is True
+    assert depth["executable"] is False
     assert depth["best_bid"] == Decimal("204.35")
     assert depth["best_ask"] == Decimal("204.83")
 
@@ -303,7 +303,7 @@ def test_closed_market_depth_refresh_success_syncs_quote_and_is_executable():
 
     assert quote["source"] == "LAST_GOOD_BBO"
     assert quote["quote_freshness"] == "LAST_VALID"
-    assert quote["executable"] is True
+    assert quote["executable"] is False
     assert quote["bid_price"] == Decimal("204.35")
     assert quote["ask_price"] == Decimal("204.83")
     assert saved and saved[0]["bid_price"] == Decimal("204.35")
