@@ -176,6 +176,27 @@ def test_market_view_v2_reports_missing_domains_and_reason_code():
     assert "missing_bbo" in view["warnings"]
 
 
+def test_market_view_v2_empty_trades_do_not_create_last_trade_price():
+    ticker, depth, _, kline = _snapshots()
+    empty_trades = map_contract_trades_domain_snapshot(
+        context=_context(sequence=3),
+        trades=[],
+    )
+
+    view = market_view.build_contract_market_view_v2(
+        SYMBOL,
+        ticker_snapshot=ticker,
+        depth_snapshot=depth,
+        trades_snapshot=empty_trades,
+        kline_snapshot=kline,
+        contract_symbol=_contract(),
+        now=NOW,
+    )
+
+    assert view["trades"] == []
+    assert view["last_trade_price"] is None
+
+
 def test_market_view_v2_dynamically_expires_execution_prices():
     ticker, depth, trades, kline = _snapshots()
 
