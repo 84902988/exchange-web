@@ -85,7 +85,6 @@ type MutableSpotPreviewCompositorFreshnessState = {
   nativeReceivedAt: number | null;
 };
 
-const SUPPORTED_SYMBOLS = new Set(['BTCUSDT', 'ETHUSDT']);
 const SUPPORTED_INTERVAL = '1m';
 
 function normalizeSymbol(value: unknown): string {
@@ -141,6 +140,10 @@ function isPreviewTradeStateNewer(
   preview: SpotPreviewCompositorPreviewInput,
   native: SpotPreviewCompositorNativeInput,
 ): boolean {
+  // Native OPEN and trade preview arrive on independent provider channels.
+  // Do not let volume-first Native evidence move the visible close ahead of
+  // the Header's settled trade. CLOSED Native still wins in acceptNative().
+  if (preview.bar.close !== native.bar.close) return true;
   if (preview.bar.volume !== native.bar.volume) {
     return preview.bar.volume > native.bar.volume;
   }
@@ -157,10 +160,7 @@ export class SpotTradingViewPreviewCompositor {
   constructor(scope: { symbol: string; interval: string }) {
     this.symbol = normalizeSymbol(scope.symbol);
     this.interval = normalizeInterval(scope.interval);
-    this.supported = (
-      SUPPORTED_SYMBOLS.has(this.symbol)
-      && this.interval === SUPPORTED_INTERVAL
-    );
+    this.supported = Boolean(this.symbol) && this.interval === SUPPORTED_INTERVAL;
     this.freshnessState = {
       symbol: this.symbol,
       interval: this.interval,
@@ -293,7 +293,11 @@ export class SpotTradingViewPreviewCompositor {
       if (samePreviewBaseline && input.previewSeq <= currentPreview.previewSeq) {
         return this.reject('PREVIEW_SEQUENCE_STALE');
       }
-      if (input.bar.volume < currentPreview.bar.volume) {
+      if (
+        input.openTime === currentPreview.openTime
+        && input.generation === currentPreview.generation
+        && input.bar.volume < currentPreview.bar.volume
+      ) {
         return this.reject('PREVIEW_TRADE_STATE_STALE');
       }
     }

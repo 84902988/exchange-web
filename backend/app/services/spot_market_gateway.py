@@ -54,7 +54,7 @@ from app.services.spot_kline_events import (
 )
 from app.services.spot_candle_preview import (
     SUPPORTED_SPOT_CANDLE_PREVIEW_INTERVALS,
-    SUPPORTED_SPOT_CANDLE_PREVIEW_SYMBOLS,
+    SpotCandlePreview,
     SpotCandlePreviewEngine,
     SpotPreviewTradeStatus,
 )
@@ -818,6 +818,20 @@ class SpotMarketGateway:
                     if selected_provider_code != provider_code:
                         await self._release_provider_symbol(symbol, provider_code)
                         break
+                # Prime and publish active Kline baselines before ticker/trade
+                # updates from the same cycle. This prevents a newly listed or
+                # reconnected symbol from exposing price without matching OHLCV.
+                active_kline_intervals = await self._sync_kline_intervals(
+                    symbol,
+                    await self._active_kline_intervals(symbol),
+                )
+                for interval in active_kline_intervals:
+                    async with self._kline_emit_lock(symbol):
+                        await self._poll_provider_kline_interval(
+                            symbol,
+                            interval,
+                            provider_code,
+                        )
                 authority_state = self._depth_authority.snapshot(symbol)
                 if (
                     authority_state is not None
@@ -957,90 +971,16 @@ class SpotMarketGateway:
                         provider_code,
                         exc_info=True,
                     )
-                for trade in self._new_trades_for_broadcast(
-                    symbol,
-                    trades,
-                    snapshot=trades_snapshot,
-                ):
-                    try:
-                        item_id = getattr(trade, "id", None)
-                        trade_id = _first_not_none(getattr(trade, "trade_id", None), item_id)
-                        provider_trade_id = _first_not_none(
-                            getattr(trade, "provider_trade_id", None),
-                            trade_id,
-                            item_id,
-                        )
-                        trade_ts = getattr(trade, "ts", None)
-                        await self._market_ws_manager().send_trade(
-                            symbol=symbol,
-                            price=getattr(trade, "price", None),
-                            amount=getattr(trade, "amount", None),
-                            side=getattr(trade, "side", ""),
-                            ts=int(trade_ts) if trade_ts is not None else 0,
-                            id=item_id,
-                            trade_id=trade_id,
-                            provider=_first_not_none(
-                                getattr(trade, "provider", None),
-                                getattr(trades, "provider", None),
-                            ),
-                            provider_symbol=_first_not_none(
-                                getattr(trade, "provider_symbol", None),
-                                getattr(trades, "provider_symbol", None),
-                            ),
-                            provider_trade_id=provider_trade_id,
-                            source=_first_not_none(
-                                getattr(trade, "source", None),
-                                getattr(trades, "source", None),
-                            ),
-                            freshness=_first_not_none(
-                                getattr(trade, "freshness", None),
-                                getattr(trades, "freshness", None),
-                            ),
-                            updated_at_ms=_first_not_none(
-                                getattr(trade, "updated_at_ms", None),
-                                getattr(trades, "updated_at_ms", None),
-                            ),
-                            event_time_ms=getattr(trade, "event_time_ms", None),
-                            received_at_ms=_first_not_none(
-                                getattr(trade, "received_at_ms", None),
-                                getattr(trades, "received_at_ms", None),
-                            ),
-                            time_origin=getattr(trade, "time_origin", None),
-                            created_at=getattr(trade, "created_at", None),
-                        )
-                        await self._accept_and_broadcast_candle_preview_trade(
-                            symbol=symbol,
-                            provider=_first_not_none(
-                                getattr(trade, "provider", None),
-                                getattr(trades, "provider", None),
-                            ),
-                            provider_trade_id=provider_trade_id,
-                            price=getattr(trade, "price", None),
-                            amount=getattr(trade, "amount", None),
-                            event_time_ms=_first_not_none(
-                                getattr(trade, "event_time_ms", None),
-                                trade_ts,
-                            ),
-                            received_at_ms=_first_not_none(
-                                getattr(trade, "received_at_ms", None),
-                                getattr(trades, "received_at_ms", None),
-                            ),
-                        )
-                        self._remember_broadcast_metric(symbol, "trades")
-                    except Exception:
-                        logger.warning("spot_market_gateway_trade_broadcast_failed symbol=%s", symbol, exc_info=True)
-
-                active_kline_intervals = await self._sync_kline_intervals(
-                    symbol,
-                    await self._active_kline_intervals(symbol),
-                )
-                for interval in active_kline_intervals:
-                    async with self._kline_emit_lock(symbol):
-                        await self._poll_provider_kline_interval(
+                async with self._kline_emit_lock(symbol):
+                    await self._broadcast_trade_batch(
+                        symbol,
+                        trades,
+                        self._new_trades_for_broadcast(
                             symbol,
-                            interval,
-                            provider_code,
-                        )
+                            trades,
+                            snapshot=trades_snapshot,
+                        ),
+                    )
 
                 await asyncio.sleep(self._loop_interval_seconds())
         except asyncio.CancelledError:
@@ -1726,6 +1666,104 @@ class SpotMarketGateway:
             provider_symbol=provider_symbol,
         )
 
+    async def _broadcast_trade_batch(
+        self,
+        symbol: str,
+        trades: Optional[TradesResponse],
+        new_trades: list[Any],
+    ) -> None:
+        latest_preview: tuple[SpotCandlePreview, Any] | None = None
+        for trade in new_trades:
+            try:
+                item_id = getattr(trade, "id", None)
+                trade_id = _first_not_none(getattr(trade, "trade_id", None), item_id)
+                provider_trade_id = _first_not_none(
+                    getattr(trade, "provider_trade_id", None),
+                    trade_id,
+                    item_id,
+                )
+                trade_ts = getattr(trade, "ts", None)
+                provider = _first_not_none(
+                    getattr(trade, "provider", None),
+                    getattr(trades, "provider", None),
+                )
+                received_at_ms = _first_not_none(
+                    getattr(trade, "received_at_ms", None),
+                    getattr(trades, "received_at_ms", None),
+                )
+                preview = self._accept_candle_preview_trade(
+                    symbol=symbol,
+                    provider=provider,
+                    provider_trade_id=provider_trade_id,
+                    price=getattr(trade, "price", None),
+                    amount=getattr(trade, "amount", None),
+                    event_time_ms=_first_not_none(
+                        getattr(trade, "event_time_ms", None),
+                        trade_ts,
+                    ),
+                )
+                if preview is not None:
+                    latest_preview = (preview, received_at_ms)
+                await self._market_ws_manager().send_trade(
+                    symbol=symbol,
+                    price=getattr(trade, "price", None),
+                    amount=getattr(trade, "amount", None),
+                    side=getattr(trade, "side", ""),
+                    ts=int(trade_ts) if trade_ts is not None else 0,
+                    id=item_id,
+                    trade_id=trade_id,
+                    provider=provider,
+                    provider_symbol=_first_not_none(
+                        getattr(trade, "provider_symbol", None),
+                        getattr(trades, "provider_symbol", None),
+                    ),
+                    provider_trade_id=provider_trade_id,
+                    source=_first_not_none(
+                        getattr(trade, "source", None),
+                        getattr(trades, "source", None),
+                    ),
+                    freshness=_first_not_none(
+                        getattr(trade, "freshness", None),
+                        getattr(trades, "freshness", None),
+                    ),
+                    updated_at_ms=_first_not_none(
+                        getattr(trade, "updated_at_ms", None),
+                        getattr(trades, "updated_at_ms", None),
+                    ),
+                    event_time_ms=getattr(trade, "event_time_ms", None),
+                    received_at_ms=received_at_ms,
+                    time_origin=getattr(trade, "time_origin", None),
+                    created_at=getattr(trade, "created_at", None),
+                    candle_preview=preview,
+                    candle_preview_received_at_ms=received_at_ms,
+                )
+                self._remember_broadcast_metric(symbol, "trades")
+            except Exception:
+                logger.warning(
+                    "spot_market_gateway_trade_broadcast_failed symbol=%s",
+                    symbol,
+                    exc_info=True,
+                )
+
+        if latest_preview is None:
+            return
+        preview, received_at_ms = latest_preview
+        try:
+            await self._market_ws_manager().broadcast_spot_candle_preview_update(
+                symbol,
+                preview.interval,
+                preview,
+                received_at_ms=received_at_ms,
+            )
+        except Exception:
+            logger.warning(
+                "spot_candle_preview_broadcast_failed provider=%s symbol=%s interval=%s",
+                preview.provider,
+                symbol,
+                preview.interval,
+                exc_info=True,
+            )
+
     async def _active_kline_intervals(self, symbol: str) -> list[str]:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         try:
@@ -1906,11 +1944,7 @@ class SpotMarketGateway:
         kline: Mapping[str, Any],
         generation: int,
     ) -> None:
-        if (
-            symbol not in SUPPORTED_SPOT_CANDLE_PREVIEW_SYMBOLS
-            or interval not in SUPPORTED_SPOT_CANDLE_PREVIEW_INTERVALS
-            or generation <= 0
-        ):
+        if interval not in SUPPORTED_SPOT_CANDLE_PREVIEW_INTERVALS or generation <= 0:
             return
         closed_value = kline.get("is_closed")
         is_closed = (
@@ -1957,21 +1991,56 @@ class SpotMarketGateway:
         event_time_ms: Any,
         received_at_ms: Any,
     ) -> None:
+        preview = self._accept_candle_preview_trade(
+            symbol=symbol,
+            provider=provider,
+            provider_trade_id=provider_trade_id,
+            price=price,
+            amount=amount,
+            event_time_ms=event_time_ms,
+        )
+        if preview is None:
+            return
+        try:
+            await self._market_ws_manager().broadcast_spot_candle_preview_update(
+                symbol,
+                preview.interval,
+                preview,
+                received_at_ms=received_at_ms,
+            )
+        except Exception:
+            logger.warning(
+                "spot_candle_preview_broadcast_failed provider=%s symbol=%s interval=%s",
+                preview.provider,
+                symbol,
+                preview.interval,
+                exc_info=True,
+            )
+
+    def _accept_candle_preview_trade(
+        self,
+        *,
+        symbol: str,
+        provider: Any,
+        provider_trade_id: Any,
+        price: Any,
+        amount: Any,
+        event_time_ms: Any,
+    ) -> SpotCandlePreview | None:
         interval = "1m"
         normalized_provider = str(provider or "").strip().upper()
         if (
-            symbol not in SUPPORTED_SPOT_CANDLE_PREVIEW_SYMBOLS
-            or interval not in SUPPORTED_SPOT_CANDLE_PREVIEW_INTERVALS
+            interval not in SUPPORTED_SPOT_CANDLE_PREVIEW_INTERVALS
             or not normalized_provider
         ):
-            return
+            return None
         generation = self._read_kline_generation_for_preview(
             symbol,
             interval,
             normalized_provider,
         )
         if generation <= 0:
-            return
+            return None
         try:
             result = self._candle_preview_engine.accept_trade(
                 {
@@ -1987,13 +2056,8 @@ class SpotMarketGateway:
             )
             if result.status is not SpotPreviewTradeStatus.APPLIED or result.preview is None:
                 self._remember_candle_preview_reject(symbol, result.status)
-                return
-            await self._market_ws_manager().broadcast_spot_candle_preview_update(
-                symbol,
-                interval,
-                result.preview,
-                received_at_ms=received_at_ms,
-            )
+                return None
+            return result.preview
         except Exception:
             logger.warning(
                 "spot_candle_preview_trade_rejected provider=%s symbol=%s interval=%s",
@@ -2002,6 +2066,7 @@ class SpotMarketGateway:
                 interval,
                 exc_info=True,
             )
+            return None
 
     async def _poll_provider_kline_interval(
         self,

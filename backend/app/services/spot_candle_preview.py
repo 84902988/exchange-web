@@ -9,7 +9,6 @@ from typing import Any, Mapping
 from app.services.spot_kline_bucket import spot_kline_bucket_start_ms
 
 
-SUPPORTED_SPOT_CANDLE_PREVIEW_SYMBOLS = frozenset({"BTCUSDT", "ETHUSDT"})
 SUPPORTED_SPOT_CANDLE_PREVIEW_INTERVALS = frozenset({"1m"})
 SPOT_CANDLE_PREVIEW_PROVIDER = "OKX_SPOT"
 
@@ -32,11 +31,30 @@ def _supported_symbol(value: Any) -> str:
     symbol = "".join(
         character
         for character in _required_text(value, field="symbol", uppercase=True)
-        if character.isalnum()
+        if character.isascii() and character.isalnum()
     )
-    if symbol not in SUPPORTED_SPOT_CANDLE_PREVIEW_SYMBOLS:
-        raise ValueError(f"unsupported spot candle preview symbol: {symbol}")
+    if not symbol:
+        raise ValueError("symbol must contain at least one alphanumeric character")
     return symbol
+
+
+def is_supported_spot_candle_preview_symbol(value: Any) -> bool:
+    """Return whether a symbol can use the generic Spot preview contract."""
+    try:
+        _supported_symbol(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+class _GenericSpotCandlePreviewSymbolScope:
+    """Compatibility container for excluded shadow tooling; not a production allowlist."""
+
+    def __contains__(self, value: Any) -> bool:
+        return is_supported_spot_candle_preview_symbol(value)
+
+
+SUPPORTED_SPOT_CANDLE_PREVIEW_SYMBOLS = _GenericSpotCandlePreviewSymbolScope()
 
 
 def _supported_interval(value: Any) -> str:
@@ -169,6 +187,8 @@ class SpotCandlePreview:
     generation: int
     preview_seq: int = 0
     applied_trade_count: int = 0
+    baseline_source: str = "NATIVE"
+    baseline_anchor_open_time: int | None = None
 
 
 class SpotNativePreviewStatus(str, Enum):
@@ -212,6 +232,7 @@ class SpotPreviewTradeResult:
 class _ActivePreviewState:
     baseline: SpotNativeKlineRevision
     preview: SpotCandlePreview
+    trade_seeded_rollover: bool = False
 
 
 def normalize_spot_native_kline_revision(
@@ -321,6 +342,7 @@ class SpotCandlePreviewEngine:
 
     def __init__(self) -> None:
         self._states: dict[tuple[str, str], _ActivePreviewState] = {}
+        self._rollover_anchors: dict[tuple[str, str], SpotNativeKlineRevision] = {}
         self._tombstones: set[tuple[str, str, int]] = set()
         self._seen_trades: dict[
             tuple[str, str, str, int, str],
@@ -338,9 +360,15 @@ class SpotCandlePreviewEngine:
         with self._lock:
             current = self._states.get(state_key)
             if revision.provider != SPOT_CANDLE_PREVIEW_PROVIDER:
-                switched = current is not None and current.baseline.provider != revision.provider
+                anchor = self._rollover_anchors.get(state_key)
+                switched = (
+                    current is not None and current.baseline.provider != revision.provider
+                ) or (
+                    anchor is not None and anchor.provider != revision.provider
+                )
                 if switched:
                     self._states.pop(state_key, None)
+                    self._rollover_anchors.pop(state_key, None)
                 return SpotNativePreviewResult(
                     SpotNativePreviewStatus.PROVIDER_SWITCHED
                     if switched
@@ -376,6 +404,12 @@ class SpotCandlePreviewEngine:
                         revision,
                         current.preview,
                     )
+                elif (
+                    current.trade_seeded_rollover
+                    and revision.generation == current.baseline.generation
+                    and revision.open_time == current.baseline.open_time
+                ):
+                    status = SpotNativePreviewStatus.REBASED
                 elif revision.generation == current.baseline.generation:
                     if revision.open_time == current.baseline.open_time:
                         if revision.revision < current.baseline.revision:
@@ -416,10 +450,30 @@ class SpotCandlePreviewEngine:
                     status = SpotNativePreviewStatus.REBASED
 
             preview = self._preview_from_native(revision)
+            if (
+                current is not None
+                and current.baseline.provider == revision.provider
+                and current.baseline.open_time == revision.open_time
+                and current.baseline.generation == revision.generation
+            ):
+                # Keep accepted same-candle trade evidence across an OPEN Native
+                # rebase. The provider Kline and trade streams are asynchronous;
+                # a newer Kline revision can legitimately lag the trade stream.
+                # CLOSED Native is handled above and remains final authority.
+                previous = current.preview
+                preview = replace(
+                    preview,
+                    high=max(preview.high, previous.high),
+                    low=min(preview.low, previous.low),
+                    close=previous.close,
+                    volume=max(preview.volume, previous.volume),
+                    quote_volume=max(preview.quote_volume, previous.quote_volume),
+                )
             self._states[state_key] = _ActivePreviewState(
                 baseline=revision,
                 preview=preview,
             )
+            self._rollover_anchors[state_key] = revision
             return SpotNativePreviewResult(status, revision, preview)
 
     def accept_trade(
@@ -439,10 +493,17 @@ class SpotCandlePreviewEngine:
                     current.preview if current is not None else None,
                 )
             if current is None:
+                current = self._seed_contiguous_rollover(state_key, None, trade)
+                if current is None:
+                    return SpotPreviewTradeResult(
+                        SpotPreviewTradeStatus.NO_BASELINE,
+                        trade,
+                        None,
+                    )
                 return SpotPreviewTradeResult(
-                    SpotPreviewTradeStatus.NO_BASELINE,
+                    SpotPreviewTradeStatus.APPLIED,
                     trade,
-                    None,
+                    current.preview,
                 )
             if (
                 trade.provider != SPOT_CANDLE_PREVIEW_PROVIDER
@@ -460,10 +521,17 @@ class SpotCandlePreviewEngine:
                     current.preview,
                 )
             if trade.open_time != current.baseline.open_time:
+                seeded = self._seed_contiguous_rollover(state_key, current, trade)
+                if seeded is None:
+                    return SpotPreviewTradeResult(
+                        SpotPreviewTradeStatus.OPEN_TIME_MISMATCH,
+                        trade,
+                        current.preview,
+                    )
                 return SpotPreviewTradeResult(
-                    SpotPreviewTradeStatus.OPEN_TIME_MISMATCH,
+                    SpotPreviewTradeStatus.APPLIED,
                     trade,
-                    current.preview,
+                    seeded.preview,
                 )
 
             seen_signature = self._seen_trades.get(trade.identity)
@@ -493,6 +561,73 @@ class SpotCandlePreviewEngine:
                 trade,
                 next_preview,
             )
+
+    def _seed_contiguous_rollover(
+        self,
+        state_key: tuple[str, str],
+        current: _ActivePreviewState | None,
+        trade: SpotAcceptedOkxTrade,
+    ) -> _ActivePreviewState | None:
+        anchor = (
+            current.baseline
+            if current is not None and not current.trade_seeded_rollover
+            else self._rollover_anchors.get(state_key)
+        )
+        if (
+            anchor is None
+            or trade.provider != SPOT_CANDLE_PREVIEW_PROVIDER
+            or trade.provider != anchor.provider
+            or trade.generation != anchor.generation
+            or trade.open_time != anchor.open_time + 60_000
+        ):
+            return None
+        if trade.identity in self._seen_trades:
+            return None
+
+        self._tombstones.add(anchor.bucket_key)
+        self._forget_other_bucket_trades(
+            trade.symbol,
+            trade.interval,
+            trade.open_time,
+        )
+        synthetic_baseline = replace(
+            anchor,
+            open_time=trade.open_time,
+            open=trade.price,
+            high=trade.price,
+            low=trade.price,
+            close=trade.price,
+            volume=Decimal("0"),
+            quote_volume=Decimal("0"),
+            is_closed=False,
+        )
+        preview = SpotCandlePreview(
+            symbol=trade.symbol,
+            interval=trade.interval,
+            provider=trade.provider,
+            open_time=trade.open_time,
+            open=trade.price,
+            high=trade.price,
+            low=trade.price,
+            close=trade.price,
+            volume=trade.size,
+            quote_volume=trade.price * trade.size,
+            revision_epoch=anchor.revision_epoch,
+            revision_seq=anchor.revision_seq,
+            generation=trade.generation,
+            preview_seq=1,
+            applied_trade_count=1,
+            baseline_source="TRADE_ROLLOVER",
+            baseline_anchor_open_time=anchor.open_time,
+        )
+        seeded = _ActivePreviewState(
+            baseline=synthetic_baseline,
+            preview=preview,
+            trade_seeded_rollover=True,
+        )
+        self._states[state_key] = seeded
+        self._seen_trades[trade.identity] = trade.content_signature
+        return seeded
 
     def get_preview(self, symbol: str, interval: str = "1m") -> SpotCandlePreview | None:
         state_key = (_supported_symbol(symbol), _supported_interval(interval))
@@ -531,7 +666,10 @@ class SpotCandlePreviewEngine:
             if (
                 current.baseline.provider != revision.provider
                 or current.baseline.generation != revision.generation
-                or revision.revision < current.baseline.revision
+                or (
+                    not current.trade_seeded_rollover
+                    and revision.revision < current.baseline.revision
+                )
             ):
                 return SpotNativePreviewResult(
                     SpotNativePreviewStatus.STALE,
@@ -539,6 +677,7 @@ class SpotCandlePreviewEngine:
                     current.preview,
                 )
             self._states.pop((revision.symbol, revision.interval), None)
+        self._rollover_anchors[(revision.symbol, revision.interval)] = revision
         self._tombstones.add(revision.bucket_key)
         return SpotNativePreviewResult(
             SpotNativePreviewStatus.CLOSED,
@@ -594,4 +733,5 @@ __all__ = [
     "SpotPreviewTradeStatus",
     "normalize_spot_accepted_okx_trade",
     "normalize_spot_native_kline_revision",
+    "is_supported_spot_candle_preview_symbol",
 ]
