@@ -1,6 +1,6 @@
 import { ApiResponse } from "./types";
 import { ApiError } from "./error";
-import { getRuntimeApiBaseUrl } from "./baseUrl";
+import { getRuntimeHttpApiBaseUrl } from "./baseUrl";
 import { getAccessToken, getRefreshToken, setTokens } from "./token";
 
 export const AUTH_EXPIRED_EVENT = "app:auth-expired";
@@ -202,7 +202,7 @@ export const request = async <T>(
   maxRetries: number = 1,
   _internal?: { retriedAfterRefresh?: boolean } // 防止无限 refresh 重试
 ): Promise<T> => {
-  const baseUrl = getRuntimeApiBaseUrl();
+  const baseUrl = getRuntimeHttpApiBaseUrl();
   const url = joinUrl(baseUrl, path);
 
   try {

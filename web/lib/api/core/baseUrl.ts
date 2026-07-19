@@ -61,4 +61,36 @@ export function getRuntimeApiBaseUrl(): string {
   return getConfiguredApiBaseUrl() || LOCAL_API_BASE_URL;
 }
 
+export function resolveRuntimeHttpApiBaseUrl({
+  host,
+  origin,
+  apiBaseUrl,
+}: {
+  host: string;
+  origin: string;
+  apiBaseUrl: string;
+}): string {
+  const normalizedHost = String(host || "").trim().toLowerCase();
+  const normalizedOrigin = String(origin || "").trim().replace(/\/+$/, "");
+  const canUseFrontendProxy = Boolean(getCpolarIoApiBaseUrl(normalizedHost))
+    || normalizedHost.endsWith(".cpolar.top");
+
+  if (canUseFrontendProxy && normalizedOrigin) {
+    return `${normalizedOrigin}/api`;
+  }
+
+  return apiBaseUrl;
+}
+
+export function getRuntimeHttpApiBaseUrl(): string {
+  const apiBaseUrl = getRuntimeApiBaseUrl();
+  if (typeof window === "undefined") return apiBaseUrl;
+
+  return resolveRuntimeHttpApiBaseUrl({
+    host: window.location.hostname,
+    origin: window.location.origin,
+    apiBaseUrl,
+  });
+}
+
 export const getBaseUrl = getRuntimeApiBaseUrl;

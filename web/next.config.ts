@@ -14,6 +14,19 @@ const nextConfig: NextConfig = {
       { source: "/static/:path*", destination: `${backend}/static/:path*` },
     ];
   },
+  async headers() {
+    return [
+      {
+        source: "/tradingview/charting_library/:path*",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=3600, stale-while-revalidate=86400",
+          },
+        ],
+      },
+    ];
+  },
 };
 
 export default nextConfig;
