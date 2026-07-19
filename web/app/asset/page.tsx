@@ -980,6 +980,7 @@ function AssetDistributionSection({
     symbol: string;
     amount: number;
     precision: number;
+    usdtValue: number | null;
     percent: number | null;
     color: string;
   }>;
@@ -1016,8 +1017,11 @@ function AssetDistributionSection({
                     {formatAssetQuantity(item.amount, item.precision)}
                   </span>
                 </div>
-                <div className="shrink-0 text-right text-xs text-white/55">
-                  {formatDistributionPercent(item.percent)}
+                <div className="shrink-0 text-right">
+                  <div className="text-xs font-medium tabular-nums text-white/75">
+                    {item.usdtValue === null ? '--' : `≈ ${formatUsdtAmount(item.usdtValue)} USDT`}
+                  </div>
+                  <div className="text-[11px] text-white/45">{formatDistributionPercent(item.percent)}</div>
                 </div>
               </div>
               <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
