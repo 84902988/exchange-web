@@ -10,6 +10,7 @@ from app.services.spot_public_depth_events import (
     SpotPublicDepthEventSubscriber,
     _coalesce_events_by_symbol,
     publish_spot_public_depth_refresh,
+    publish_spot_public_trade,
 )
 
 
@@ -31,6 +32,12 @@ class FakeManager:
 
     async def send_snapshot(self, db, symbol):
         self.calls.append(("snapshot", symbol))
+
+    async def send_trade(self, **kwargs):
+        self.calls.append(("trade", kwargs["symbol"]))
+
+    async def broadcast_provider_kline_update(self, symbol, interval, kline, **kwargs):
+        self.calls.append(("kline", symbol))
 
 
 class FakeSyncRedis:
@@ -156,6 +163,31 @@ def test_publish_factory_failure_is_fail_safe():
     ) is False
 
 
+def test_publish_trade_includes_fill_without_losing_decimal_text():
+    redis = FakeSyncRedis()
+
+    assert publish_spot_public_trade(
+        "mfcusdt",
+        price="1.2300",
+        amount="4.5600",
+        side="buy",
+        ts=123456,
+        trade_id=77,
+        kline_updates=[{"interval": "1m", "kline": {"close": "1.2300"}}],
+        redis_factory=lambda: redis,
+    ) is True
+
+    payload = json.loads(redis.published[0][1])
+    assert payload["event_type"] == "trade"
+    assert payload["symbol"] == "MFCUSDT"
+    assert payload["price"] == "1.2300"
+    assert payload["amount"] == "4.5600"
+    assert payload["side"] == "BUY"
+    assert payload["trade_id"] == 77
+    assert payload["kline_updates"][0]["interval"] == "1m"
+    assert redis.closed is True
+
+
 def test_publish_result_is_not_overridden_by_close_failure():
     redis = CloseFailingSyncRedis()
 
@@ -191,6 +223,37 @@ def test_dispatch_skips_event_published_by_same_worker():
         )
     ) is False
     assert opened is False
+
+
+def test_dispatches_local_trade_on_api_event_loop_before_market_refresh():
+    session = FakeSession()
+    manager = FakeManager()
+    dispatcher = SpotPublicDepthEventDispatcher(
+        manager,  # type: ignore[arg-type]
+        session_factory=lambda: session,
+        local_worker_id="worker-a",
+    )
+
+    event = {
+        "event_id": "trade-1",
+        "event_type": "trade",
+        "symbol": "mfcusdt",
+        "publisher_id": "worker-a",
+        "price": "1.23",
+        "amount": "4.56",
+        "side": "BUY",
+        "ts": 123456,
+        "trade_id": 77,
+        "kline_updates": [{"interval": "1m", "kline": {"close": "1.23"}}],
+    }
+    assert asyncio.run(dispatcher.dispatch(event)) is True
+    assert manager.calls == [
+        ("trade", "MFCUSDT"),
+        ("kline", "MFCUSDT"),
+        ("depth", "MFCUSDT"),
+        ("snapshot", "MFCUSDT"),
+    ]
+    assert session.closed is True
 
 
 def test_dispatch_rejects_duplicate_event_id():
@@ -231,6 +294,19 @@ def test_coalesce_events_keeps_latest_event_per_symbol():
     )
 
     assert [event["event_id"] for event in events] == ["btc-2", "eth-1"]
+
+
+def test_coalesce_never_drops_trade_events_or_their_order():
+    events = _coalesce_events_by_symbol(
+        [
+            {"event_id": "depth-1", "symbol": "MFCUSDT"},
+            {"event_id": "trade-1", "event_type": "trade", "symbol": "MFCUSDT"},
+            {"event_id": "trade-2", "event_type": "trade", "symbol": "mfcusdt"},
+            {"event_id": "depth-2", "symbol": "MFCUSDT"},
+        ]
+    )
+
+    assert [event["event_id"] for event in events] == ["trade-1", "trade-2", "depth-2"]
 
 
 def test_subscriber_coalesces_queued_symbols_and_closes_resources():

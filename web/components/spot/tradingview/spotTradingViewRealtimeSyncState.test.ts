@@ -26,10 +26,9 @@ new Function('require', 'module', 'exports', output)(
 const {
   beginSpotTradingViewRealtimeSync,
   isSpotTradingViewRealtimeSyncPending,
-  settleSpotTradingViewRealtimeSync,
+  recordSpotTradingViewHistorySettlement,
+  recordSpotTradingViewSubscriberSettlement,
 } = loadedModule.exports as typeof import('./spotTradingViewRealtimeSyncState')
-
-const NOW = 1_800_000_000_000
 
 function begin(interval = '1h', widgetGeneration = 7) {
   return beginSpotTradingViewRealtimeSync({
@@ -39,87 +38,76 @@ function begin(interval = '1h', widgetGeneration = 7) {
   })
 }
 
-function realtimeEvent(overrides: Record<string, unknown> = {}) {
+function history(overrides: Record<string, unknown> = {}) {
   return {
     symbol: 'ETHUSDT',
     interval: '1h',
     widgetGeneration: 7,
-    source: 'LIVE_WS',
-    freshness: 'LIVE',
-    receivedAtMs: NOW - 100,
+    phase: 'current' as const,
+    isHistoryRequest: false,
+    barCount: 120,
     ...overrides,
   }
 }
 
-test('a valid cold interval scope starts pending', () => {
-  const state = begin()
-  assert.equal(state.pending, true)
-  assert.equal(isSpotTradingViewRealtimeSyncPending(state, {
+function subscriber(overrides: Record<string, unknown> = {}) {
+  return {
+    symbol: 'ETHUSDT',
+    interval: '1h',
+    widgetGeneration: 7,
+    subscriberUid: 'subscriber-1',
+    subscriptionGeneration: 3,
+    ownerId: 'spot-tv:subscriber-1',
+    ...overrides,
+  }
+}
+
+test('cold bootstrap remains pending until current history and subscriber readiness both settle', () => {
+  const initial = begin()
+  const historyReady = recordSpotTradingViewHistorySettlement(initial, history())
+  assert.equal(historyReady.historyReady, true)
+  assert.equal(historyReady.subscriberReady, false)
+  assert.equal(historyReady.pending, true)
+
+  const settled = recordSpotTradingViewSubscriberSettlement(historyReady, subscriber())
+  assert.equal(settled.pending, false)
+  assert.equal(isSpotTradingViewRealtimeSyncPending(settled, {
     symbol: 'ETH/USDT',
     interval: '1h',
     widgetGeneration: 7,
-  }), true)
+  }), false)
 })
 
-test('fresh matching realtime candle settles the UX-only pending state', () => {
-  const state = begin()
-  const settled = settleSpotTradingViewRealtimeSync(
-    state,
-    realtimeEvent(),
-    NOW,
-  )
-  assert.equal(settled.pending, false)
+test('silent market settles when subscriber readiness arrives before current history', () => {
+  const subscriberReady = recordSpotTradingViewSubscriberSettlement(begin(), subscriber())
+  assert.equal(subscriberReady.pending, true)
+  assert.equal(recordSpotTradingViewHistorySettlement(subscriberReady, history()).pending, false)
 })
 
-test('history and cached snapshots cannot settle realtime sync', () => {
-  const state = begin()
-  assert.equal(settleSpotTradingViewRealtimeSync(state, realtimeEvent({
-    source: 'REST_HISTORY',
-    freshness: 'CACHED',
-  }), NOW), state)
-  assert.equal(settleSpotTradingViewRealtimeSync(state, realtimeEvent({
-    source: 'LIVE_WS',
-    freshness: 'STALE',
-  }), NOW), state)
-})
-
-test('stale symbol interval and widget callbacks cannot settle a newer scope', () => {
-  const state = begin()
-  for (const overrides of [
-    { symbol: 'BTCUSDT' },
-    { interval: '4h' },
-    { widgetGeneration: 6 },
+test('empty continuation and stale scope evidence cannot settle a bootstrap', () => {
+  const initial = begin()
+  for (const event of [
+    history({ barCount: 0 }),
+    history({ phase: 'history', isHistoryRequest: true }),
+    history({ symbol: 'BTCUSDT' }),
+    history({ interval: '4h' }),
+    history({ widgetGeneration: 6 }),
   ]) {
-    assert.equal(
-      settleSpotTradingViewRealtimeSync(state, realtimeEvent(overrides), NOW),
-      state,
-    )
+    assert.equal(recordSpotTradingViewHistorySettlement(initial, event), initial)
+  }
+  for (const event of [
+    subscriber({ subscriberUid: '' }),
+    subscriber({ subscriptionGeneration: 0 }),
+    subscriber({ ownerId: '' }),
+    subscriber({ symbol: 'BTCUSDT' }),
+  ]) {
+    assert.equal(recordSpotTradingViewSubscriberSettlement(initial, event), initial)
   }
 })
 
-test('an old store replay remains pending until a fresh realtime candle arrives', () => {
-  const state = begin()
-  const oldReplay = settleSpotTradingViewRealtimeSync(state, realtimeEvent({
-    receivedAtMs: NOW - 10_001,
-  }), NOW)
-  assert.equal(oldReplay, state)
-  assert.equal(settleSpotTradingViewRealtimeSync(
-    oldReplay,
-    realtimeEvent({ receivedAtMs: NOW }),
-    NOW,
-  ).pending, false)
-})
-
-test('realtime sync UX remains a non-blocking status badge', () => {
+test('chart keeps settlement observable without rendering a realtime syncing prompt', () => {
   const chartSource = readFileSync(chartModulePath, 'utf8')
-  const promptStart = chartSource.indexOf('{showRealtimeSync ? (')
-  const promptEnd = chartSource.indexOf(') : null}', promptStart)
-
-  assert.ok(promptStart >= 0)
-  assert.ok(promptEnd > promptStart)
-
-  const promptSource = chartSource.slice(promptStart, promptEnd)
-  assert.match(promptSource, /pointer-events-none absolute right-3 top-12/)
-  assert.doesNotMatch(promptSource, /\binset-0\b/)
-  assert.doesNotMatch(promptSource, /backgroundImage/)
+  assert.match(chartSource, /data-spot-chart-realtime-sync=\{realtimeBootstrapPending \? 'pending' : 'ready'\}/)
+  assert.doesNotMatch(chartSource, /spotChartRealtimeSyncing/)
+  assert.doesNotMatch(chartSource, /\{showRealtimeSync \? \(/)
 })

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -14,6 +14,7 @@ from app.services.contract_position_service import (
     ContractPositionServiceError,
     update_contract_position_tp_sl,
 )
+from app.services.contract_private_ws import publish_contract_user_updates_background as publish_contract_user_updates
 from app.services.contract_query_service import (
     get_user_contract_orders,
     get_user_contract_position_summaries,
@@ -110,12 +111,21 @@ def contract_position_tp_sl_update(
     position_id: int,
     request: Request,
     payload: ContractPositionTpSlUpdateRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
     trace_id = getattr(request.state, "trace_id", None)
     try:
         data = update_contract_position_tp_sl(db, int(user_id), int(position_id), payload)
+        background_tasks.add_task(
+            publish_contract_user_updates,
+            user_id=int(user_id),
+            symbols=[data.symbol],
+            position_ids=[data.position_id],
+            include_account=False,
+            prefer_transaction_mark=True,
+        )
         return ok(data=data.model_dump(), trace_id=trace_id)
     except (ContractPositionBadRequest, ContractPositionNotOpen, ContractPositionQuoteUnavailable) as exc:
         db.rollback()

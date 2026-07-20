@@ -3,10 +3,44 @@ import pytest
 from app.db.models.contract_symbol import ContractSymbol
 from app.services.contract_itick_market_resolver import (
     ITICK_DWM_AMERICA_NEW_YORK_SESSION,
+    ITICK_DWM_UTC_PASSTHROUGH,
     normalize_contract_itick_dwm_open_time,
     resolve_contract_itick_dwm_session_policy,
     resolve_contract_itick_kline_provider_evidence,
 )
+
+
+@pytest.mark.parametrize("provider_symbol", ["NAS100", "SPX", "DJI"])
+def test_global_index_history_uses_itick_gb_namespace(provider_symbol):
+    evidence = resolve_contract_itick_kline_provider_evidence(
+        local_symbol=f"{provider_symbol}USDT_PERP",
+        provider_symbol=provider_symbol,
+        category="INDEX",
+        interval="1d",
+    )
+
+    assert evidence.market == "indices"
+    assert evidence.region == "GB"
+    assert evidence.k_type == 8
+
+
+def test_global_index_dwm_policy_preserves_provider_utc_boundary():
+    contract_symbol = ContractSymbol(
+        symbol="NAS100USDT_PERP",
+        display_name="NAS100",
+        category="INDEX",
+        provider="ITICK",
+        provider_symbol="NAS100",
+    )
+    policy = resolve_contract_itick_dwm_session_policy(contract_symbol)
+
+    assert policy is not None
+    assert policy.code == ITICK_DWM_UTC_PASSTHROUGH
+    assert normalize_contract_itick_dwm_open_time(
+        1_784_505_600_000,
+        "1d",
+        policy,
+    ) == 1_784_505_600_000
 
 
 def test_aapl_history_provider_evidence():

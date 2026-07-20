@@ -205,6 +205,11 @@ const loadPolicyModule = loadTypeScriptModule(
   {},
 );
 
+const preloadPriorityModule = loadTypeScriptModule(
+  fileURLToPath(new URL('../../../lib/tradingview/klinePreloadPriority.ts', import.meta.url)),
+  {},
+);
+
 const preloadManagerModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractKlinePreloadManager.ts', import.meta.url)),
   {
@@ -214,6 +219,7 @@ const preloadManagerModule = loadTypeScriptModule(
     './contractKlineCachePolicy': policyModule,
     './contractKlineCurrentCache': currentCacheModule,
     './contractKlineLoadPolicy': loadPolicyModule,
+    '@/lib/tradingview/klinePreloadPriority': preloadPriorityModule,
   },
 );
 
@@ -395,6 +401,9 @@ function ingestStoreKline(params: {
   symbol: string;
   interval: string;
   openTime: number;
+  open?: string;
+  high?: string;
+  low?: string;
   close: string;
   volume?: string;
   eventTimeMs?: number;
@@ -408,6 +417,9 @@ function ingestStoreKline(params: {
     interval: params.interval,
     data: {
       ...row(params.openTime, params.close),
+      open: params.open ?? params.close,
+      high: params.high ?? params.close,
+      low: params.low ?? params.close,
       volume: params.volume ?? '1',
       symbol: params.symbol,
       interval: params.interval,
@@ -442,12 +454,14 @@ function realtimePreview(params: {
   sequence: number;
   previewSequence: number;
   receivedAtMs?: number;
+  provider?: string;
 }) {
   const interval = params.interval ?? '1m';
+  const provider = params.provider ?? 'OKX_SWAP';
   const preview = {
     symbol: params.symbol,
     interval,
-    provider: 'OKX_SWAP',
+    provider,
     open_time: params.openTime,
     open: params.open,
     high: params.high,
@@ -467,7 +481,7 @@ function realtimePreview(params: {
     domain: 'kline',
     symbol: params.symbol,
     interval,
-    provider: 'OKX_SWAP',
+    provider,
     source: 'TRADE_PREVIEW',
     freshness: 'LIVE',
     provider_generation: params.generation,
@@ -631,7 +645,7 @@ test('history and realtime bars fail closed without complete provider volume evi
 });
 
 
-test('trade preview input requires complete live OKX OHLCV revision evidence', () => {
+test('trade preview input requires complete live supported-provider OHLCV revision evidence', () => {
   const toInput = datafeedModule.realtimePreviewMessageToInput;
   const valid = realtimePreview({
     symbol: 'BTCUSDT_PERP',
@@ -650,12 +664,54 @@ test('trade preview input requires complete live OKX OHLCV revision evidence', (
     toInput(valid, 'BTCUSDT_PERP', '1m')?.bar,
     { time: 1_717_000_000_000, open: 100, high: 103, low: 99, close: 102, volume: 7 },
   );
+  assert.deepEqual(
+    toInput(realtimePreview({
+      ...{
+        symbol: 'NAS100USDT_PERP',
+        openTime: 1_717_000_000_000,
+        open: '28850',
+        high: '28860',
+        low: '28840',
+        close: '28858',
+        volume: '12',
+        generation: 1,
+        sequence: 3,
+        previewSequence: 2,
+      },
+      provider: 'ITICK',
+    }), 'NAS100USDT_PERP', '1m')?.bar,
+    { time: 1_717_000_000_000, open: 28850, high: 28860, low: 28840, close: 28858, volume: 12 },
+  );
+  assert.deepEqual(
+    toInput(realtimePreview({
+      symbol: 'AAPLUSDT_PERP',
+      interval: '5m',
+      openTime: 1_716_999_900_000,
+      open: '329.20',
+      high: '329.70',
+      low: '329.10',
+      close: '329.43',
+      volume: '1002',
+      generation: 9,
+      sequence: 12,
+      previewSequence: 1,
+      provider: 'ITICK',
+    }), 'AAPLUSDT_PERP', '5m')?.bar,
+    {
+      time: 1_716_999_900_000,
+      open: 329.20,
+      high: 329.70,
+      low: 329.10,
+      close: 329.43,
+      volume: 1002,
+    },
+  );
   assert.equal(
     toInput({ ...valid, preview: { ...valid.preview, volume: undefined } }, 'BTCUSDT_PERP', '1m'),
     null,
   );
   assert.equal(
-    toInput({ ...valid, provider: 'ITICK' }, 'BTCUSDT_PERP', '1m'),
+    toInput({ ...valid, provider: 'UNSUPPORTED' }, 'BTCUSDT_PERP', '1m'),
     null,
   );
   assert.equal(
@@ -4525,6 +4581,60 @@ test('BTC 1m preview advances close and volume together until the native candle 
       { close: 100, volume: 5 },
       { close: 103, volume: 7 },
       { close: 104, volume: 8 },
+    ],
+  );
+  datafeed.destroy();
+});
+
+
+test('AAPL 5m preview advances the active candle from the settled trade stream', async () => {
+  const symbol = 'AAPLUSDT_PERP';
+  const openTime = 1_717_099_800_000;
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol, '5');
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '5',
+    (bar: any) => received.push(bar),
+    'aapl-five-minute-preview-subscriber',
+  );
+
+  ingestStoreKline({
+    symbol,
+    interval: '5m',
+    openTime,
+    open: '329.20',
+    high: '329.70',
+    low: '329.10',
+    close: '329.54',
+    volume: '1000',
+    eventTimeMs: openTime + 1_000,
+    generation: 9,
+    sequence: 12,
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    interval: '5m',
+    openTime,
+    open: '329.20',
+    high: '329.70',
+    low: '329.10',
+    close: '329.43',
+    volume: '1002',
+    generation: 9,
+    sequence: 12,
+    previewSequence: 1,
+    receivedAtMs: openTime + 2_000,
+    provider: 'ITICK',
+  }));
+
+  assert.deepEqual(
+    received.map((bar) => ({ close: bar.close, volume: bar.volume })),
+    [
+      { close: 329.54, volume: 1000 },
+      { close: 329.43, volume: 1002 },
     ],
   );
   datafeed.destroy();

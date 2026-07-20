@@ -1,9 +1,9 @@
-export const SPOT_REALTIME_SYNC_MAX_EVENT_AGE_MS = 10_000;
-
 export type SpotTradingViewRealtimeSyncState = Readonly<{
   symbol: string;
   interval: string;
   widgetGeneration: number;
+  historyReady: boolean;
+  subscriberReady: boolean;
   pending: boolean;
 }>;
 
@@ -13,26 +13,17 @@ export type SpotTradingViewRealtimeSyncScope = Readonly<{
   widgetGeneration: number;
 }>;
 
-export type SpotTradingViewRealtimeSyncEvent = SpotTradingViewRealtimeSyncScope & Readonly<{
-  source: string;
-  freshness: string;
-  receivedAtMs: number;
+export type SpotTradingViewHistorySettlement = SpotTradingViewRealtimeSyncScope & Readonly<{
+  phase: 'current' | 'history';
+  isHistoryRequest: boolean;
+  barCount: number;
 }>;
 
-const NON_REALTIME_SOURCES = new Set([
-  'REST_HISTORY',
-  'REST_SNAPSHOT',
-  'DB_CACHE',
-  'LAST_GOOD',
-  'MISSING',
-]);
-
-const NON_REALTIME_FRESHNESS = new Set([
-  'CACHED',
-  'STALE',
-  'LAST_GOOD',
-  'MISSING',
-]);
+export type SpotTradingViewSubscriberSettlement = SpotTradingViewRealtimeSyncScope & Readonly<{
+  subscriberUid: string;
+  subscriptionGeneration: number;
+  ownerId: string;
+}>;
 
 function normalizeSymbol(value: unknown): string {
   return String(value ?? '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -56,46 +47,78 @@ export function beginSpotTradingViewRealtimeSync(
   scope: SpotTradingViewRealtimeSyncScope,
 ): SpotTradingViewRealtimeSyncState {
   const normalized = normalizeScope(scope);
+  const pending = Boolean(normalized.symbol && normalized.interval && normalized.widgetGeneration);
   return {
     ...normalized,
-    pending: Boolean(normalized.symbol && normalized.interval && normalized.widgetGeneration),
+    historyReady: false,
+    subscriberReady: false,
+    pending,
   };
 }
 
-export function settleSpotTradingViewRealtimeSync(
+function matchesActiveScope(
   state: SpotTradingViewRealtimeSyncState,
-  event: SpotTradingViewRealtimeSyncEvent,
-  nowMs = Date.now(),
-): SpotTradingViewRealtimeSyncState {
-  if (!state.pending) return state;
-
+  event: SpotTradingViewRealtimeSyncScope,
+) {
   const normalizedEvent = normalizeScope(event);
-  if (
+  return (
     normalizedEvent.symbol !== state.symbol
-    || normalizedEvent.interval !== state.interval
-    || normalizedEvent.widgetGeneration !== state.widgetGeneration
-  ) {
-    return state;
-  }
+    ? false
+    : normalizedEvent.interval === state.interval
+      && normalizedEvent.widgetGeneration === state.widgetGeneration
+  );
+}
 
-  const source = String(event.source || '').trim().toUpperCase();
-  const freshness = String(event.freshness || '').trim().toUpperCase();
-  if (NON_REALTIME_SOURCES.has(source) || NON_REALTIME_FRESHNESS.has(freshness)) {
-    return state;
-  }
-
-  const receivedAtMs = Number(event.receivedAtMs);
-  const eventAgeMs = Number(nowMs) - receivedAtMs;
+function withSettlement(
+  state: SpotTradingViewRealtimeSyncState,
+  patch: Partial<Pick<SpotTradingViewRealtimeSyncState, 'historyReady' | 'subscriberReady'>>,
+): SpotTradingViewRealtimeSyncState {
+  const historyReady = patch.historyReady ?? state.historyReady;
+  const subscriberReady = patch.subscriberReady ?? state.subscriberReady;
   if (
-    !Number.isFinite(receivedAtMs)
-    || receivedAtMs <= 0
-    || !Number.isFinite(eventAgeMs)
-    || eventAgeMs > SPOT_REALTIME_SYNC_MAX_EVENT_AGE_MS
+    historyReady === state.historyReady
+    && subscriberReady === state.subscriberReady
+  ) return state;
+  return {
+    ...state,
+    historyReady,
+    subscriberReady,
+    pending: !(historyReady && subscriberReady),
+  };
+}
+
+export function recordSpotTradingViewHistorySettlement(
+  state: SpotTradingViewRealtimeSyncState,
+  event: SpotTradingViewHistorySettlement,
+): SpotTradingViewRealtimeSyncState {
+  if (
+    !state.pending
+    || !matchesActiveScope(state, event)
+    || event.phase !== 'current'
+    || event.isHistoryRequest
+    || !Number.isFinite(event.barCount)
+    || event.barCount <= 0
   ) {
     return state;
   }
+  return withSettlement(state, { historyReady: true });
+}
 
-  return { ...state, pending: false };
+export function recordSpotTradingViewSubscriberSettlement(
+  state: SpotTradingViewRealtimeSyncState,
+  event: SpotTradingViewSubscriberSettlement,
+): SpotTradingViewRealtimeSyncState {
+  if (
+    !state.pending
+    || !matchesActiveScope(state, event)
+    || !String(event.subscriberUid || '').trim()
+    || !String(event.ownerId || '').trim()
+    || !Number.isInteger(event.subscriptionGeneration)
+    || event.subscriptionGeneration <= 0
+  ) {
+    return state;
+  }
+  return withSettlement(state, { subscriberReady: true });
 }
 
 export function isSpotTradingViewRealtimeSyncPending(

@@ -38,6 +38,7 @@ from app.services.contract_market_service import (
     ContractMarketError,
     ContractSymbolNotFound,
     _contract_depth_with_status,
+    _quote_from_depth,
     _contract_quote_with_status,
     _load_contract_symbol,
     _market_status_for_contract_symbol,
@@ -55,6 +56,7 @@ from app.services.contract_market_ws import (
 )
 from app.services.contract_market_view import build_contract_market_view
 from app.services.contract_candle_preview import (
+    CONTRACT_CANDLE_PREVIEW_PROVIDERS,
     SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS,
     ContractCandlePreview,
     ContractCandlePreviewEngine,
@@ -417,6 +419,33 @@ class ContractMarketGateway:
                 return
             self._tasks[normalized_symbol] = asyncio.create_task(self._refresh_loop(normalized_symbol))
 
+    def invalidate_symbol_configuration(self, symbol: str) -> None:
+        """Drop process-local state after an admin changes a contract mapping."""
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        if not normalized_symbol:
+            return
+        cache_prefix = f"contract:market:{normalized_symbol}:"
+        with self._state_lock:
+            for key in [key for key in self._latest if key.startswith(cache_prefix)]:
+                self._latest.pop(key, None)
+            self._last_full_refresh_at.pop(normalized_symbol, None)
+            self._last_depth_broadcast_at.pop(normalized_symbol, None)
+            self._last_depth_signature.pop(normalized_symbol, None)
+            self._last_quote_signature.pop(normalized_symbol, None)
+            self._last_state_signature.pop(normalized_symbol, None)
+            self._last_trade_ids.pop(normalized_symbol, None)
+            for mapping in (
+                self._last_kline_broadcast_at,
+                self._last_kline_signature,
+                self._last_kline_rest_fallback_at,
+                self._kline_locks,
+                self._pending_provider_kline_events,
+            ):
+                for key in [key for key in mapping if key[0] == normalized_symbol]:
+                    mapping.pop(key, None)
+            self._snapshot_authority.clear_symbol(normalized_symbol)
+            self._candle_preview_engine.clear_symbol(normalized_symbol)
+
     async def release_symbol_if_idle(self, symbol: str) -> None:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         if not normalized_symbol:
@@ -471,7 +500,12 @@ class ContractMarketGateway:
         normalized_interval = normalize_contract_ws_interval(interval)
         status = "ok"
         try:
-            await asyncio.to_thread(self._refresh_symbol_once, normalized_symbol, [normalized_interval])
+            await asyncio.to_thread(
+                self._refresh_symbol_once,
+                normalized_symbol,
+                [normalized_interval],
+                True,
+            )
         except (ContractSymbolNotFound, ContractMarketError):
             status = "unavailable"
             logger.debug("contract_market_gateway_snapshot_unavailable symbol=%s", normalized_symbol, exc_info=True)
@@ -484,7 +518,7 @@ class ContractMarketGateway:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         status = "ok"
         try:
-            await asyncio.to_thread(self._refresh_market_once, normalized_symbol)
+            await asyncio.to_thread(self._refresh_market_once, normalized_symbol, True)
         except (ContractSymbolNotFound, ContractMarketError):
             status = "unavailable"
             logger.debug("contract_market_gateway_market_snapshot_unavailable symbol=%s", normalized_symbol, exc_info=True)
@@ -498,7 +532,12 @@ class ContractMarketGateway:
         normalized_interval = normalize_contract_ws_interval(interval)
         status = "ok"
         try:
-            await asyncio.to_thread(self._refresh_kline_once, normalized_symbol, normalized_interval)
+            await asyncio.to_thread(
+                self._refresh_kline_once,
+                normalized_symbol,
+                normalized_interval,
+                True,
+            )
         except (ContractSymbolNotFound, ContractMarketError):
             status = "unavailable"
             logger.debug(
@@ -1140,13 +1179,18 @@ class ContractMarketGateway:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         quote = self._get_latest(CONTRACT_MARKET_CACHE_QUOTE, normalized_symbol)
         depth = self._get_latest(CONTRACT_MARKET_CACHE_DEPTH, normalized_symbol)
+        latest_kline = self._get_latest(
+            CONTRACT_MARKET_CACHE_KLINE,
+            normalized_symbol,
+            interval="1m",
+        )
         if not isinstance(quote, dict) and not isinstance(depth, dict):
             return None
         view = build_contract_market_view(
             normalized_symbol,
             quote=quote if isinstance(quote, dict) else None,
             depth=depth if isinstance(depth, dict) else None,
-            latest_kline=None,
+            latest_kline=latest_kline if isinstance(latest_kline, dict) else None,
             latest_trade=self._latest_trade_tick_from_cache(normalized_symbol),
             contract_symbol=contract_symbol,
         )
@@ -1362,7 +1406,7 @@ class ContractMarketGateway:
             return []
         authority = _authority_mapping(authority_payload)
         provider = str(authority.get("provider") or "").strip().upper()
-        if provider != "OKX_SWAP":
+        if provider not in CONTRACT_CANDLE_PREVIEW_PROVIDERS:
             return []
 
         ordered_trades = sorted(
@@ -1539,8 +1583,19 @@ class ContractMarketGateway:
         if normalized_interval not in SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS:
             return
         provider = str(payload.get("provider") or "").strip().upper()
+        if provider not in CONTRACT_CANDLE_PREVIEW_PROVIDERS:
+            return
         generation = int(payload.get("provider_generation") or 0)
-        if provider != "OKX_SWAP" or generation <= 0:
+        if generation <= 0 and provider == "ITICK":
+            generation = int(
+                get_contract_provider_ws_kline_generation(
+                    normalized_symbol,
+                    normalized_interval,
+                    provider=provider,
+                )
+                or 0
+            )
+        if generation <= 0:
             return
         closed_value = payload.get("is_closed")
         is_closed = (
@@ -1561,9 +1616,11 @@ class ContractMarketGateway:
                     "close": payload.get("close"),
                     "volume": payload.get("volume"),
                     "quote_volume": payload.get("quote_volume"),
-                    "revision_epoch": payload.get("revision_epoch"),
+                    "revision_epoch": payload.get("revision_epoch") or generation,
                     "revision_sequence": (
-                        payload.get("revision_sequence") or payload.get("revision_seq")
+                        payload.get("revision_sequence")
+                        or payload.get("revision_seq")
+                        or 0
                     ),
                     "generation": generation,
                     "is_closed": is_closed,
@@ -1734,9 +1791,74 @@ class ContractMarketGateway:
                 prepared_quote = self._prepare_provider_ws_quote_payload(db, symbol, payload)
                 if prepared_quote is not None:
                     return prepared_quote
+        if allow_provider_ws and provider_ws_depth_enabled():
+            depth = select_fresh_provider_ws_depth(
+                db,
+                symbol,
+                max_age_ms=int(
+                    getattr(settings, "CONTRACT_PROVIDER_WS_DEPTH_MAX_AGE_MS", 1500)
+                    or 1500
+                ),
+                ensure_subscription=ensure_provider_ws,
+            )
+            if isinstance(depth, dict):
+                prepared_quote = self._prepare_provider_ws_depth_quote_payload(
+                    db,
+                    symbol,
+                    depth,
+                )
+                if prepared_quote is not None:
+                    return prepared_quote
         if not allow_rest_fallback:
             return None
         return get_contract_quote(db, symbol)
+
+    def _prepare_provider_ws_depth_quote_payload(
+        self,
+        db: Session,
+        symbol: str,
+        depth: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            contract_symbol = _load_contract_symbol(db, symbol)
+            market_status = _market_status_for_contract_symbol(contract_symbol)
+            prepared = deepcopy(depth)
+            prepared["best_bid"] = prepared.get("best_bid") or prepared.get("bid")
+            prepared["best_ask"] = prepared.get("best_ask") or prepared.get("ask")
+            quote = _quote_from_depth(
+                contract_symbol,
+                prepared,
+                source="LIVE_WS",
+            )
+            quote.update(
+                {
+                    "provider": prepared.get("provider") or getattr(contract_symbol, "provider", None),
+                    "provider_symbol": (
+                        prepared.get("provider_symbol")
+                        or getattr(contract_symbol, "provider_symbol", None)
+                    ),
+                    "price_precision": int(
+                        getattr(contract_symbol, "price_precision", None)
+                        or prepared.get("price_precision")
+                        or 8
+                    ),
+                    "source": "LIVE_WS",
+                    "quote_source": "LIVE_WS",
+                    "quote_freshness": "LIVE",
+                    "received_at_ms": prepared.get("received_at_ms"),
+                    "provider_generation": prepared.get("provider_generation"),
+                    "revision_epoch": prepared.get("revision_epoch"),
+                    "revision_sequence": prepared.get("revision_sequence"),
+                }
+            )
+            return _contract_quote_with_status(quote, market_status, contract_symbol)
+        except Exception:
+            logger.debug(
+                "contract_market_gateway_provider_ws_depth_quote_prepare_failed symbol=%s",
+                symbol,
+                exc_info=True,
+            )
+            return None
 
     def _prepare_provider_ws_quote_payload(
         self,

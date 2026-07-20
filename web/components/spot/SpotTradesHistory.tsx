@@ -2,6 +2,8 @@
 
 import { useMemo } from 'react'
 import { useLocaleContext } from '@/contexts/LocaleContext'
+import { useDisplayTimeZone } from '@/hooks/useDisplayTimeZone'
+import { formatDisplayTime } from '@/lib/displayTimeZone'
 import {
   type SpotMarketTradeItem,
 } from '@/lib/api/modules/spot'
@@ -41,21 +43,6 @@ function formatAmount(value: string | number | undefined | null) {
   return n.toFixed(6)
 }
 
-function formatTime(value?: string | number | null) {
-  if (!value) return '--:--:--'
-
-  const date =
-    typeof value === 'number'
-      ? new Date(value < 1e12 ? value * 1000 : value)
-      : new Date(String(value))
-
-  if (Number.isNaN(date.getTime())) return '--:--:--'
-
-  return date.toLocaleTimeString('zh-CN', {
-    hour12: false,
-  })
-}
-
 function splitSymbol(symbol: string) {
   const s = String(symbol || '').toUpperCase()
 
@@ -83,7 +70,8 @@ export default function SpotTradesHistory({
   isLoading = false,
   onPriceClick,
 }: Props) {
-  const { t } = useLocaleContext()
+  const { t, locale } = useLocaleContext()
+  const displayTimeZone = useDisplayTimeZone()
   const rows = useMemo(() => trades.slice(0, limit), [limit, trades])
   const renderRows = useMemo(() => buildSpotTradeRenderRows(rows, { symbol }), [rows, symbol])
 
@@ -131,7 +119,11 @@ export default function SpotTradesHistory({
             {data.map((item, index) => {
               const priceText = formatPrice(item.trade.price, pricePrecision)
               const amountText = formatAmount(item.trade.amount)
-              const timeText = formatTime(getSpotTradeTimeValue(item.trade))
+              const timeText = formatDisplayTime(
+                getSpotTradeTimeValue(item.trade),
+                displayTimeZone,
+                locale,
+              )
 
               let priceClassName = 'text-zinc-200'
               let arrow = ''

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -17,16 +18,27 @@ def _load_provider_ws_module():
     if str(BACKEND) not in sys.path:
         sys.path.insert(0, str(BACKEND))
 
+    overridden_module_names = (
+        "app.core.config",
+        "app.services.contract_market_provider_service",
+        "websockets",
+        "sqlalchemy",
+        "sqlalchemy.orm",
+        "app.db.models.contract_symbol",
+    )
+    previous_modules = {
+        name: sys.modules.get(name)
+        for name in overridden_module_names
+    }
+
     config_module = types.ModuleType("app.core.config")
 
     class SettingsStub:
         CONTRACT_PROVIDER_WS_ENABLED = True
+        CONTRACT_PROVIDER_WS_DEPTH_ENABLED = True
         CONTRACT_PROVIDER_WS_TICKER_ENABLED = True
         CONTRACT_PROVIDER_WS_KLINE_ENABLED = True
         CONTRACT_PROVIDER_WS_TRADES_ENABLED = True
-        CONTRACT_PROVIDER_WS_ITICK_ENABLED = True
-        CONTRACT_PROVIDER_WS_ITICK_KLINE_ENABLED = True
-        CONTRACT_PROVIDER_WS_ITICK_TRADES_ENABLED = True
         CONTRACT_PROVIDER_WS_KLINE_MAX_AGE_MS = 1500
         CONTRACT_PROVIDER_WS_ITICK_KLINE_MAX_AGE_MS = 90000
         CONTRACT_PROVIDER_WS_ITICK_KLINE_BROADCAST_INTERVAL_MS = 1000
@@ -71,7 +83,14 @@ def _load_provider_ws_module():
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        for name, previous in previous_modules.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
     return module
 
 
@@ -133,6 +152,103 @@ def test_itick_ticker_normalizer_uses_quote_fields_and_live_source():
     assert payload["quote_source"] == "LIVE_WS"
     assert payload["is_realtime"] is True
     assert payload["market_status"] == "OPEN"
+
+
+def test_itick_shared_ticker_registration_routes_without_starting_legacy_symbol_thread():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    notified = []
+    service._itick_transport.notify = lambda market: notified.append(market)
+
+    service.ensure_ticker_subscription(
+        local_symbol="EURUSD_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="EURUSD",
+        ws_symbol="EURUSD$GB",
+        ws_url="wss://api.itick.org/forex",
+    )
+
+    assert service._ticker_tasks == {}
+    assert service._itick_router.registered_count() == 1
+    assert service._itick_plan.market_plan("forex").symbols_for("quote") == ("EURUSD$GB",)
+    assert notified == ["forex"]
+
+    dispatched = service._itick_router.dispatch(
+        "forex",
+        '{"code":1,"data":{"s":"EURUSD","type":"quote","ld":1.1429,"p":1.1428,"t":1717000000000}}',
+    )
+    assert dispatched == 1
+    assert service._ticker_cache[(module.PROVIDER_ITICK, "EURUSD_PERP")]["source"] == "LIVE_WS"
+
+    service.stop_ticker_subscription(local_symbol="EURUSD_PERP", provider=module.PROVIDER_ITICK)
+    assert service._itick_router.registered_count() == 0
+    assert service._itick_plan.market_plan("forex").symbols_for("quote") == ()
+    assert notified == ["forex", "forex"]
+
+
+def test_itick_shared_kline_registration_owns_stable_generation_and_routes_it():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    service._itick_transport.notify = lambda _market: None
+    key = (module.PROVIDER_ITICK, "EURUSD_PERP", "1m")
+
+    ensure_args = {
+        "local_symbol": "EURUSD_PERP",
+        "provider": module.PROVIDER_ITICK,
+        "provider_symbol": "EURUSD",
+        "interval": "1m",
+        "ws_symbol": "EURUSD$GB",
+        "ws_url": "wss://api.itick.org/forex",
+    }
+    service.ensure_kline_subscription(**ensure_args)
+    generation = service.get_kline_generation("EURUSD_PERP", "1m", provider=module.PROVIDER_ITICK)
+    service.ensure_kline_subscription(**ensure_args)
+
+    assert generation == 1
+    assert service._kline_generations[key] == generation
+    assert service._itick_router.dispatch(
+        "forex",
+        '{"o":1.14025,"h":1.14029,"l":1.14021,"c":1.14024,"v":291.8,"tu":332.725565,"t":1782889500000,"s":"eurusd","type":"kline@1"}',
+    ) == 1
+    assert service._kline_cache[key]["provider_generation"] == generation
+
+    service.stop_kline_subscription(
+        local_symbol="EURUSD_PERP",
+        provider=module.PROVIDER_ITICK,
+        interval="1m",
+    )
+    assert service._kline_generations[key] == generation + 1
+
+
+def test_stop_all_clears_shared_itick_routes_and_logical_subscriptions():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    service._itick_transport.notify = lambda _market: None
+    stopped = []
+    service._itick_transport.stop_all = lambda: stopped.append(True)
+
+    service.ensure_ticker_subscription(
+        local_symbol="EURUSD_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="EURUSD",
+        ws_symbol="EURUSD$GB",
+        ws_url="wss://api.itick.org/forex",
+    )
+    service.ensure_kline_subscription(
+        local_symbol="XAUUSDT_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="XAUUSD",
+        interval="1m",
+        ws_symbol="XAUUSD$GB",
+        ws_url="wss://api.itick.org/forex",
+    )
+
+    service.stop_all()
+
+    assert stopped == [True]
+    assert service._itick_registrations == {}
+    assert service._itick_router.registered_count() == 0
+    assert service._itick_plan.active_markets() == frozenset()
 
 
 def test_okx_ticker_normalizer_emits_complete_change_evidence():
@@ -244,6 +360,86 @@ def test_itick_trades_subscription_resolver_uses_stock_tick_endpoint():
     assert subscription.provider_symbol == "AAPL"
     assert subscription.ws_symbol == "AAPL$US"
     assert subscription.ws_url == "wss://api.itick.org/stock"
+
+
+def test_itick_cfd_depth_and_tick_resolvers_use_shared_forex_endpoint():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+
+    class Contract:
+        symbol = "EURUSD_PERP"
+        status = 1
+        provider = "ITICK"
+        provider_symbol = "EURUSD"
+        category = "FOREX"
+
+    class Query:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return Contract()
+
+    class Db:
+        def query(self, _model):
+            return Query()
+
+    depth = service._itick_depth_subscription_for_symbol(Db(), "EURUSD_PERP")
+    trades = service._itick_trades_subscription_for_symbol(Db(), "EURUSD_PERP")
+
+    assert depth is not None and trades is not None
+    assert depth.ws_symbol == "EURUSD$GB"
+    assert trades.ws_symbol == "EURUSD$GB"
+    assert depth.ws_url == trades.ws_url == "wss://api.itick.org/forex"
+
+
+def test_itick_one_level_depth_is_truthfully_cached_as_bbo_only():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderDepthSubscription(
+        local_symbol="EURUSD_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="EURUSD",
+        depth_limit=20,
+        ws_symbol="EURUSD$GB",
+    )
+
+    service._handle_itick_depth_message(
+        subscription,
+        '{"code":1,"data":{"s":"EURUSD","type":"depth","t":1717000000000,"a":[{"p":1.143,"v":0,"o":1}],"b":[{"p":1.1428,"v":0,"o":1}]}}',
+    )
+
+    payload = service._depth_cache[(module.PROVIDER_ITICK, "EURUSD_PERP")]
+    assert payload["depth_mode"] == "BBO_ONLY"
+    assert len(payload["asks"]) == len(payload["bids"]) == 1
+    assert payload["asks"][0][1] == Decimal("0")
+    assert payload["bids"][0][1] == Decimal("0")
+
+
+def test_itick_stock_multi_level_depth_preserves_provider_levels():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderDepthSubscription(
+        local_symbol="AAPLUSDT_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="AAPL",
+        depth_limit=20,
+        ws_symbol="AAPL$US",
+        ws_url="wss://api.itick.org/stock",
+    )
+    asks = [{"po": level, "p": 330 + level / 100, "v": level * 10, "o": level} for level in range(1, 11)]
+    bids = [{"po": level, "p": 330 - level / 100, "v": level * 10, "o": level} for level in range(1, 11)]
+
+    service._handle_itick_depth_message(
+        subscription,
+        json.dumps({"code": 1, "data": {"s": "AAPL", "type": "depth", "a": asks, "b": bids}}),
+    )
+
+    payload = service._depth_cache[(module.PROVIDER_ITICK, "AAPLUSDT_PERP")]
+    assert payload["depth_mode"] == "FULL_DEPTH"
+    assert len(payload["asks"]) == len(payload["bids"]) == 10
+    assert payload["best_bid"] == Decimal("329.99")
+    assert payload["best_ask"] == Decimal("330.01")
 
 
 def test_itick_trade_normalizer_marks_live_trade_tick_source():
@@ -523,6 +719,44 @@ def test_kline_cache_notifies_only_the_current_provider_generation():
     ) == 3
 
 
+def test_force_stop_symbol_releases_shared_itick_routes_plan_and_caches():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    service._itick_transport.notify = lambda _market: None
+    local_symbol = "EURUSD_PERP"
+    market = "forex"
+    provider_symbol = "EURUSD"
+
+    for stream in ("depth", "tick", "quote", "kline@1"):
+        interval = "1m" if stream == "kline@1" else ""
+        key = (stream, local_symbol, interval)
+        consumer_id = ":".join(part for part in key if part)
+        service._itick_router.register(
+            market=market,
+            provider_symbol=provider_symbol,
+            stream=stream,
+            consumer_id=consumer_id,
+            handler=lambda _raw: None,
+        )
+        service._itick_plan.acquire(market=market, symbol=provider_symbol, stream=stream)
+        service._itick_registrations[key] = (market, provider_symbol, consumer_id)
+
+    service._depth_cache[(module.PROVIDER_ITICK, local_symbol)] = {"value": 1}
+    service._trades_cache[(module.PROVIDER_ITICK, local_symbol)] = {"value": 1}
+    service._ticker_cache[(module.PROVIDER_ITICK, local_symbol)] = {"value": 1}
+    service._kline_cache[(module.PROVIDER_ITICK, local_symbol, "1m")] = {"value": 1}
+
+    report = service.force_stop_depth_subscriptions_for_symbol(local_symbol)
+
+    assert report["shared_registration_count"] == 4
+    assert service._itick_registrations == {}
+    assert service._itick_plan.market_plan(market).symbols_by_stream == ()
+    assert service._depth_cache == {}
+    assert service._trades_cache == {}
+    assert service._ticker_cache == {}
+    assert service._kline_cache == {}
+
+
 def _load_gateway_module(provider_payload):
     if str(BACKEND) not in sys.path:
         sys.path.insert(0, str(BACKEND))
@@ -530,6 +764,19 @@ def _load_gateway_module(provider_payload):
         asyncio.get_event_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
+
+    overridden_module_names = (
+        "app.core.config",
+        "app.db.session",
+        "app.schemas.contract_market",
+        "app.services.contract_market_service",
+        "app.services.contract_market_ws",
+        "app.services.contract_market_provider_ws",
+    )
+    previous_modules = {
+        name: sys.modules.get(name)
+        for name in overridden_module_names
+    }
 
     config_module = types.ModuleType("app.core.config")
 
@@ -554,6 +801,7 @@ def _load_gateway_module(provider_payload):
     service_module.ContractMarketError = RuntimeError
     service_module.ContractSymbolNotFound = LookupError
     service_module._contract_depth_with_status = lambda *args, **kwargs: None
+    service_module._quote_from_depth = lambda *args, **kwargs: {}
     service_module._contract_quote_with_status = lambda *args, **kwargs: None
     service_module._load_contract_symbol = lambda *args, **kwargs: None
     service_module._market_status_for_contract_symbol = lambda *args, **kwargs: None
@@ -616,7 +864,14 @@ def _load_gateway_module(provider_payload):
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        for name, previous in previous_modules.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
     module._provider_ws_calls = calls
     return module
 

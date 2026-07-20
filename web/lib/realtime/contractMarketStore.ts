@@ -244,17 +244,26 @@ export class ContractMarketStore {
     const provider = normalizeText(input.provider);
     const freshness = normalizeText(input.freshness);
     const incomingProviderGeneration = normalizeNonNegativeNumber(input.providerGeneration);
-    // Contract depth REST bootstraps expose the provider generation, while the
-    // live depth envelope currently omits it. Preserve the accepted lineage
-    // only for the same depth provider; all symbol/provider/time fences below
-    // still apply and other domains keep their strict generation contract.
-    const providerGeneration = input.domain === 'depth'
+    // Contract market snapshots expose lineage metadata, while provider
+    // ticker/depth tick envelopes intentionally omit it. Preserve the accepted
+    // lineage only for same-provider WS market increments; all symbol,
+    // provider and event-time fences below still apply.
+    const inheritsMarketSnapshotLineage = (input.domain === 'ticker' || input.domain === 'depth')
       && input.transport === 'WS'
+      && current?.provider === provider;
+    const providerGeneration = inheritsMarketSnapshotLineage
       && incomingProviderGeneration === null
-      && current?.provider === provider
       ? current.providerGeneration
       : incomingProviderGeneration;
-    const revision = normalizeRevision(input.revision);
+    const incomingRevision = normalizeRevision(input.revision);
+    // Revision belongs to the accepted market snapshot lineage. Provider
+    // ticker/depth tick frames intentionally omit it, so keep that lineage for
+    // newer same-provider WS market updates instead of treating every live
+    // tick as a rollback. Kline/trades retain the strict revision requirement.
+    const revision = inheritsMarketSnapshotLineage
+      && incomingRevision === null
+      ? current.revision
+      : incomingRevision;
     const eventTimeMs = normalizeTimestamp(input.eventTimeMs);
     const receivedAtMs = normalizeTimestamp(input.receivedAtMs) ?? Date.now();
     const observedAtMs = eventTimeMs ?? receivedAtMs;

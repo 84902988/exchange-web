@@ -221,6 +221,52 @@ def test_account_and_position_share_one_mark_evidence(monkeypatch):
     assert account.equity_state == position_snapshot.freshness == "LIVE"
 
 
+def test_private_command_event_seeds_transaction_mark_before_account_reconciliation(monkeypatch):
+    position = _position(mark_price="107")
+    db = _Session(account=_account(), positions=[position])
+    manager = private_ws.contract_private_ws_manager
+
+    def provider_quote_must_not_run(*_args, **_kwargs):
+        raise AssertionError("transaction event must not perform another provider quote request")
+
+    def build_position_event(event_db, user_id, symbol, position_id=None):
+        snapshot = query_service.resolve_contract_position_pnl(event_db, position)
+        return {
+            "type": "contract_user_position_update",
+            "user_id": user_id,
+            "symbol": symbol,
+            "position_id": position_id,
+            "mark_price": str(snapshot.mark_price),
+            "mark_freshness": snapshot.freshness,
+            "mark_usable": snapshot.usable,
+        }
+
+    monkeypatch.setattr(query_service, "get_contract_quote", provider_quote_must_not_run)
+    monkeypatch.setattr(manager, "build_position_update_event", build_position_event)
+    monkeypatch.setattr(
+        manager,
+        "build_account_update_event",
+        lambda _db, user_id: {"type": "contract_user_account_update", "user_id": user_id},
+    )
+
+    events = manager.build_state_update_events(
+        db,
+        42,
+        symbols=["BTCUSDT_PERP"],
+        position_ids=[1],
+        include_account=True,
+        prefer_transaction_mark=True,
+    )
+
+    assert [event["type"] for event in events] == [
+        "contract_user_position_update",
+        "contract_user_account_update",
+    ]
+    assert events[0]["mark_price"] == "107"
+    assert events[0]["mark_freshness"] == "RECENT"
+    assert events[0]["mark_usable"] is True
+
+
 def _mark_snapshot(user_id, positions, *, equity="100"):
     return {
         "account": {"user_id": user_id, "equity": equity},
@@ -274,7 +320,9 @@ def test_private_ws_position_signature_dedupes_and_updates_hedge_positions(monke
     asyncio.run(scenario())
 
     position_messages = [message for message in websocket.messages if message["type"] == "contract_user_position_mark_update"]
+    account_messages = [message for message in websocket.messages if message["type"] == "contract_user_account_update"]
     assert len(position_messages) == 2
+    assert all(message["mark_only"] is True for message in account_messages)
     assert {item["side"] for item in position_messages[-1]["positions"] if item["symbol"] == "BTCUSDT_PERP"} == {"LONG", "SHORT"}
     assert {item["symbol"] for item in position_messages[-1]["positions"]} == {"BTCUSDT_PERP", "ETHUSDT_PERP"}
     assert position_messages[-1]["positions"][0]["margin_ratio"] == "8.70"

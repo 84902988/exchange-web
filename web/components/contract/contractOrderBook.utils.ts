@@ -59,13 +59,6 @@ export function normalizeContractDepthMode(mode?: ContractDepthMode | null) {
   return normalizeToken(mode);
 }
 
-export function getContractDepthModeLabel(mode?: ContractDepthMode | null) {
-  const normalized = normalizeContractDepthMode(mode);
-  if (normalized === 'BBO_ONLY') return '\u6a21\u62df\u76d8\u53e3';
-  if (normalized === 'SYNTHETIC_FROM_BBO') return '\u4ec5\u6700\u4f73\u4e70\u5356\u4ef7';
-  return null;
-}
-
 export function getContractOrderBookLevelLimit(
   displayMode: ContractOrderBookDisplayMode,
 ) {
@@ -153,7 +146,7 @@ export function calculateContractOrderBookDepthRatio({
 
 export function formatContractOrderBookAmount(value: number) {
   if (!Number.isFinite(value)) return '--';
-  if (value === 0) return '0';
+  if (value === 0) return '--';
   if (Math.abs(value) < 0.001) {
     return value.toFixed(6).replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1');
   }

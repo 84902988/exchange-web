@@ -64,7 +64,20 @@ _ITICK_DWM_PRODUCTION_POLICY_BY_CATEGORY_REGION = {
     ("FOREX", "GB"): ITICK_DWM_AMERICA_NEW_YORK_SESSION,
     ("METAL", "GB"): ITICK_DWM_AMERICA_NEW_YORK_SESSION,
     ("COMMODITY", "GB"): ITICK_DWM_AMERICA_NEW_YORK_SESSION,
+    # iTick serves the configured global index symbols from its GB namespace
+    # and their D/W/M bars are already aligned to UTC boundaries.
+    ("INDEX", "GB"): ITICK_DWM_UTC_PASSTHROUGH,
 }
+
+_ITICK_GB_INDEX_SYMBOLS = frozenset({
+    "DJI",
+    "DJIA",
+    "NAS100",
+    "NDX",
+    "SPX",
+    "US30",
+    "US500",
+})
 
 
 def normalize_contract_itick_category(value: Any) -> str:
@@ -138,6 +151,8 @@ def resolve_contract_itick_region(
             return "DE"
         if symbol in {"N225", "NI225", "JP225", "NKY"}:
             return "JP"
+        if symbol in _ITICK_GB_INDEX_SYMBOLS:
+            return "GB"
         return "US"
     return "US"
 

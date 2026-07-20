@@ -134,6 +134,11 @@ const revisionCacheModule = loadTypeScriptModule(
   },
 )
 
+const preloadPriorityModule = loadTypeScriptModule(
+  fileURLToPath(new URL('../../../lib/tradingview/klinePreloadPriority.ts', import.meta.url)),
+  {},
+)
+
 let currentCacheLookup: Record<string, any> | null = null
 const cacheWriteCalls: Array<Record<string, any>> = []
 
@@ -189,6 +194,7 @@ const preloadModule = loadTypeScriptModule(
     },
     './spotKlineClientCache': cacheModule,
     './spotKlinePerf': { markSpotKlinePerf: () => null },
+    '@/lib/tradingview/klinePreloadPriority': preloadPriorityModule,
   },
 )
 
@@ -1591,11 +1597,7 @@ test('failed gap recovery records one target failure and does not retry every re
   }
   const historyCalls: HistoryCall[] = []
   const emittedBars: Array<Record<string, unknown>> = []
-  const syncEvidence: Array<Record<string, unknown>> = []
-  const datafeed = datafeedModule.createSpotTradingViewDatafeed({
-    symbol: 'BTCUSDT',
-    onRealtimeSyncEvidence: (event: Record<string, unknown>) => syncEvidence.push(event),
-  })
+  const datafeed = datafeedModule.createSpotTradingViewDatafeed({ symbol: 'BTCUSDT' })
   datafeed.getBars(
     symbolInfo(),
     '1',
@@ -1634,8 +1636,6 @@ test('failed gap recovery records one target failure and does not retry every re
 
   assert.equal(requestCount, 2, 'same failed target must not retry indefinitely')
   assert.deepEqual(emittedBars, [])
-  assert.equal(syncEvidence.length, 2, 'accepted native evidence must not depend on gap recovery')
-  assert.deepEqual(syncEvidence.map((event) => event.barTime), [targetTime, targetTime])
   datafeed.destroy()
 })
 

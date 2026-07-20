@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
+from app.core.datetime_utils import utc_isoformat
 from app.db.models.order import Order
 
 
@@ -52,6 +53,6 @@ def serialize_spot_order(order: Order, symbol: Optional[str] = None) -> Dict[str
         "fee_asset_id": order.fee_asset_id,
         "fee_asset_symbol": fee_asset_symbol,
         "status": order.status,
-        "created_at": order.created_at.isoformat() if order.created_at else None,
-        "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+        "created_at": utc_isoformat(order.created_at),
+        "updated_at": utc_isoformat(order.updated_at),
     }

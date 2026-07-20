@@ -37,6 +37,12 @@ import {
   markSpotKlinePerf,
 } from './tradingview/spotKlinePerf';
 import { resolveSpotRwaLogo } from './spotRwaLogo';
+import {
+  getSpotTradingViewBootstrapMetadata,
+  rememberSpotTradingViewBootstrapMetadata,
+  resolveSpotTradingViewBootstrapMetadata,
+  type SpotTradingViewBootstrapMetadata,
+} from './tradingview/spotTradingViewBootstrap';
 
 interface SpotHeaderMarketData {
   change: string;
@@ -725,6 +731,37 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     pricePrecision: selectedPairPrecision,
     fallbackPrecision: selectedPairPrecision,
   });
+  const spotChartMetadataCandidate = useMemo(() => resolveSpotTradingViewBootstrapMetadata({
+    symbol,
+    pair: selectedPair || (
+      normalizeSpotApiSymbol(headerTicker?.symbol) === normalizeSpotApiSymbol(symbol)
+        ? headerTicker
+        : null
+    ),
+    fallbackDisplaySymbol: formatSpotDisplaySymbol(symbol),
+  }), [headerTicker, selectedPair, symbol]);
+  const [spotChartBootstrap, setSpotChartBootstrap] = useState<SpotTradingViewBootstrapMetadata | null>(
+    () => getSpotTradingViewBootstrapMetadata(initialSpotSymbol),
+  );
+  const activeSpotChartBootstrap = spotChartBootstrap?.symbol === normalizeSpotApiSymbol(symbol)
+    ? spotChartBootstrap
+    : null;
+
+  useEffect(() => {
+    const normalizedSymbol = normalizeSpotApiSymbol(symbol);
+    const cached = getSpotTradingViewBootstrapMetadata(normalizedSymbol);
+    const nextMetadata = cached || spotChartMetadataCandidate;
+    if (!nextMetadata) {
+      if (spotChartBootstrap?.symbol !== normalizedSymbol) setSpotChartBootstrap(null);
+      return;
+    }
+    rememberSpotTradingViewBootstrapMetadata(nextMetadata);
+    setSpotChartBootstrap((previous) => (
+      previous?.symbol === nextMetadata.symbol
+        ? previous
+        : nextMetadata
+    ));
+  }, [spotChartBootstrap?.symbol, spotChartMetadataCandidate, symbol]);
 
   const handleNativeCandleDisplay = useCallback((value: SpotNativeCandleDisplayPrice) => {
     if (normalizeSpotApiSymbol(value.symbol) !== normalizeSpotApiSymbol(symbol)) return;
@@ -1672,7 +1709,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
               <div className="min-h-0 flex-1">
                 <SpotTradingViewChart
                   symbol={symbol}
-                  displaySymbol={currentDisplaySymbol}
+                  bootstrapReady={Boolean(activeSpotChartBootstrap)}
+                  displaySymbol={activeSpotChartBootstrap?.displaySymbol || currentDisplaySymbol}
                   interval={interval}
                   chartMode={chartMode}
                   intervalSwitchLoading={chartIntervalSwitching}
@@ -1686,8 +1724,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                   klineFreshness={spotFreshness.kline}
                   onNativeCandleDisplay={handleNativeCandleDisplay}
                   priceDirection={priceDirection}
-                  pricePrecision={pricePrecision}
-                  amountPrecision={currentAmountPrecision}
+                  pricePrecision={activeSpotChartBootstrap?.pricePrecision ?? null}
+                  amountPrecision={activeSpotChartBootstrap?.amountPrecision ?? null}
                   showRwaReference={showRwaReference}
                   spotLogoUrl={selectedSpotLogo?.url}
                   spotLogoAlt={selectedSpotLogo?.alt}

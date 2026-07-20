@@ -747,7 +747,7 @@ export default function ContractTradingForm({
         setPendingContractError('');
       }
       showFeedback('success', orderType === 'LIMIT' ? t('openLimitSubmitted', 'contracts') : t('openMarketSuccess', 'contracts'));
-      await onSuccess();
+      void Promise.resolve(onSuccess()).catch(() => undefined);
     } catch (error) {
       const message = friendlyContractError(error, t);
       if (confirmed) {
@@ -769,7 +769,7 @@ export default function ContractTradingForm({
       setPendingContractOrder(null);
       setPendingContractError('');
       showFeedback('error', t('positionUpdatedRetry', 'contracts'));
-      await onSuccess();
+      void Promise.resolve(onSuccess()).catch(() => undefined);
       return;
     }
 
@@ -813,7 +813,7 @@ export default function ContractTradingForm({
         setPendingContractError('');
       }
       showFeedback('success', orderType === 'LIMIT' ? t('closeLimitSubmitted', 'contracts') : t('closeMarketSuccess', 'contracts'));
-      await onSuccess();
+      void Promise.resolve(onSuccess()).catch(() => undefined);
     } catch (error) {
       const message = friendlyContractError(error, t);
       if (confirmed) {

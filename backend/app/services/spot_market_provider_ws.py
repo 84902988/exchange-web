@@ -30,6 +30,8 @@ from app.services.spot_kline_revision import (
     compare_kline_revision,
 )
 from app.services.spot_market_domain_cache import is_fresh_record
+from app.services.okx_shared_ws_transport import OkxSharedWsTransport, OkxWsSubscription
+from app.services.bitget_shared_ws_transport import BitgetSharedWsTransport, BitgetWsSubscription
 
 
 logger = logging.getLogger(__name__)
@@ -1517,6 +1519,109 @@ class SpotMarketProviderWsService:
             Callable[[ProviderKlineRevisionAccepted], None]
         ] = None
         self._lock = threading.RLock()
+        self._okx_registrations: dict[tuple[str, str, str], tuple[OkxWsSubscription, str]] = {}
+        self._okx_transport = OkxSharedWsTransport(
+            urls={
+                "public": str(getattr(settings, "SPOT_PROVIDER_WS_OKX_PUBLIC_URL", "") or ""),
+                "business": str(getattr(settings, "SPOT_PROVIDER_WS_OKX_BUSINESS_URL", "") or ""),
+            }
+        )
+        self._bitget_registrations: dict[tuple[str, str, str], tuple[BitgetWsSubscription, str]] = {}
+        self._bitget_transport = BitgetSharedWsTransport(
+            url=str(getattr(settings, "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL", "") or "")
+        )
+
+    def _ensure_okx_shared(self, *, domain: str, subscription: Any) -> None:
+        local_symbol = normalize_spot_ws_symbol(subscription.local_symbol)
+        interval = normalize_spot_ws_kline_interval(getattr(subscription, "interval", "")) if domain == "kline" else ""
+        registration_key = (domain, local_symbol, interval)
+        generation_key = (PROVIDER_OKX_SPOT, local_symbol, interval) if domain == "kline" else (PROVIDER_OKX_SPOT, local_symbol)
+        with self._lock:
+            if registration_key in self._okx_registrations:
+                return
+            generations = {
+                "depth": self._depth_generations,
+                "ticker": self._ticker_generations,
+                "trades": self._trades_generations,
+                "kline": self._kline_generations,
+            }[domain]
+            generation = generations.get(generation_key, 0) + 1
+            generations[generation_key] = generation
+            handler = {
+                "depth": lambda raw: self._handle_okx_depth_message(subscription, raw, generation),
+                "ticker": lambda raw: self._handle_okx_ticker_message(subscription, raw, generation),
+                "trades": lambda raw: self._handle_okx_trades_message(subscription, raw, generation),
+                "kline": lambda raw: self._handle_okx_kline_message(subscription, raw, generation),
+            }[domain]
+            logical = OkxWsSubscription(
+                "business" if domain == "kline" else "public",
+                subscription.channel,
+                subscription.provider_symbol,
+            )
+            consumer_id = f"spot:{domain}:{local_symbol}:{interval}"
+            self._okx_registrations[registration_key] = (logical, consumer_id)
+            self._remember_provider_task_started_locked(domain, PROVIDER_OKX_SPOT, local_symbol, interval or None)
+        self._okx_transport.acquire(logical, consumer_id, handler)
+
+    def _release_okx_shared(self, *, domain: str, local_symbol: str, interval: str = "") -> bool:
+        normalized_interval = normalize_spot_ws_kline_interval(interval) if domain == "kline" else ""
+        key = (domain, normalize_spot_ws_symbol(local_symbol), normalized_interval)
+        with self._lock:
+            registration = self._okx_registrations.pop(key, None)
+        if registration is None:
+            return False
+        generation_key = (PROVIDER_OKX_SPOT, key[1], key[2]) if domain == "kline" else (PROVIDER_OKX_SPOT, key[1])
+        with self._lock:
+            generations = {"depth": self._depth_generations, "ticker": self._ticker_generations, "trades": self._trades_generations, "kline": self._kline_generations}[domain]
+            generations[generation_key] = generations.get(generation_key, 0) + 1
+            self._remember_provider_task_stopped_locked(domain, PROVIDER_OKX_SPOT, key[1], key[2] or None)
+        logical, consumer_id = registration
+        self._okx_transport.release(logical, consumer_id)
+        return True
+
+    def _ensure_bitget_shared(self, *, domain: str, subscription: Any) -> None:
+        local_symbol = normalize_spot_ws_symbol(subscription.local_symbol)
+        interval = normalize_spot_ws_kline_interval(getattr(subscription, "interval", "")) if domain == "kline" else ""
+        registration_key = (domain, local_symbol, interval)
+        generation_key = (PROVIDER_BITGET_SPOT, local_symbol, interval) if domain == "kline" else (PROVIDER_BITGET_SPOT, local_symbol)
+        with self._lock:
+            if registration_key in self._bitget_registrations:
+                return
+            generations = {
+                "depth": self._depth_generations,
+                "ticker": self._ticker_generations,
+                "trades": self._trades_generations,
+                "kline": self._kline_generations,
+            }[domain]
+            generation = generations.get(generation_key, 0) + 1
+            generations[generation_key] = generation
+            handler = {
+                "depth": lambda raw: self._handle_bitget_depth_message(subscription, raw, generation),
+                "ticker": lambda raw: self._handle_bitget_ticker_message(subscription, raw, generation),
+                "trades": lambda raw: self._handle_bitget_trades_message(subscription, raw, generation),
+                "kline": lambda raw: self._handle_bitget_kline_message(subscription, raw, generation),
+            }[domain]
+            logical = BitgetWsSubscription(subscription.channel, subscription.provider_symbol)
+            consumer_id = f"spot:{domain}:{local_symbol}:{interval}"
+            self._bitget_registrations[registration_key] = (logical, consumer_id)
+            self._remember_provider_task_started_locked(domain, PROVIDER_BITGET_SPOT, local_symbol, interval or None)
+        self._bitget_transport.acquire(logical, consumer_id, handler)
+
+    def _release_bitget_shared(self, *, domain: str, local_symbol: str, interval: str = "") -> bool:
+        normalized_interval = normalize_spot_ws_kline_interval(interval) if domain == "kline" else ""
+        key = (domain, normalize_spot_ws_symbol(local_symbol), normalized_interval)
+        with self._lock:
+            registration = self._bitget_registrations.pop(key, None)
+        if registration is None:
+            return False
+        generation_key = (PROVIDER_BITGET_SPOT, key[1], key[2]) if domain == "kline" else (PROVIDER_BITGET_SPOT, key[1])
+        with self._lock:
+            generations = {"depth": self._depth_generations, "ticker": self._ticker_generations, "trades": self._trades_generations, "kline": self._kline_generations}[domain]
+            generations[generation_key] = generations.get(generation_key, 0) + 1
+            self._remember_provider_task_stopped_locked(domain, PROVIDER_BITGET_SPOT, key[1], key[2] or None)
+        logical, consumer_id = registration
+        self._bitget_transport.release(logical, consumer_id)
+        return True
 
     def set_kline_revision_listener(
         self,
@@ -1772,7 +1877,11 @@ class SpotMarketProviderWsService:
             self._kline_cache[(provider_code, normalized_symbol, normalized_interval)] = payload
 
     def clear_for_tests(self) -> None:
+        self._okx_transport.stop_all()
+        self._bitget_transport.stop_all()
         with self._lock:
+            self._okx_registrations.clear()
+            self._bitget_registrations.clear()
             self._depth_cache.clear()
             self._ticker_cache.clear()
             self._trades_cache.clear()
@@ -1809,6 +1918,37 @@ class SpotMarketProviderWsService:
             self._kline_health_recovery_counts.clear()
             self._kline_last_health_recovery_at_ms.clear()
             self._kline_recovering.clear()
+
+    def stop_all(self) -> None:
+        """Stop shared transports and retire every legacy per-symbol worker."""
+        with self._lock:
+            okx_keys = tuple(self._okx_registrations)
+            bitget_keys = tuple(self._bitget_registrations)
+            legacy_symbols = {
+                (provider, symbol)
+                for provider, symbol in (
+                    set(self._depth_tasks)
+                    | set(self._ticker_tasks)
+                    | set(self._trades_tasks)
+                    | set(self._depth_stops)
+                    | set(self._ticker_stops)
+                    | set(self._trades_stops)
+                )
+            }
+            legacy_klines = {
+                (provider, symbol, interval)
+                for provider, symbol, interval in set(self._kline_tasks) | set(self._kline_stops)
+            }
+        for domain, symbol, interval in okx_keys:
+            self._release_okx_shared(domain=domain, local_symbol=symbol, interval=interval)
+        for domain, symbol, interval in bitget_keys:
+            self._release_bitget_shared(domain=domain, local_symbol=symbol, interval=interval)
+        self._okx_transport.stop_all()
+        self._bitget_transport.stop_all()
+        for provider, symbol in legacy_symbols:
+            self.release_symbol(symbol, provider=provider)
+        for provider, symbol, interval in legacy_klines:
+            self.release_kline(symbol, interval, provider=provider)
 
     def get_metrics_snapshot(self) -> dict[str, Any]:
         now_ms = _now_ms()
@@ -1913,6 +2053,11 @@ class SpotMarketProviderWsService:
             lifecycle_release_timeout = sum(self._task_release_timeout_counts.values())
 
         return {
+            "shared_transports": {
+                "okx": self._okx_transport.debug_state(),
+                "bitget": self._bitget_transport.debug_state(),
+                "logical_registration_count": len(self._okx_registrations) + len(self._bitget_registrations),
+            },
             "active_provider_task_count": len(active_provider_tasks),
             "active_provider_tasks": active_provider_tasks,
             "active_kline_intervals": active_kline_intervals,
@@ -2339,6 +2484,18 @@ class SpotMarketProviderWsService:
         if not spot_provider_ws_supports_provider(provider_code, domain="depth"):
             return
         provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
+        if provider_code == PROVIDER_OKX_SPOT:
+            self._ensure_okx_shared(
+                domain="depth",
+                subscription=SpotDepthSubscription(local_symbol, provider_code, provider_symbol, _depth_limit(), OKX_SPOT_DEPTH_CHANNEL, str(getattr(settings, "SPOT_PROVIDER_WS_OKX_PUBLIC_URL", "") or "")),
+            )
+            return
+        if provider_code == PROVIDER_BITGET_SPOT:
+            self._ensure_bitget_shared(
+                domain="depth",
+                subscription=SpotDepthSubscription(local_symbol, provider_code, provider_symbol, _depth_limit(), BITGET_SPOT_DEPTH_CHANNEL, str(getattr(settings, "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL", "") or "")),
+            )
+            return
         key = (provider_code, local_symbol)
         with self._lock:
             task = self._depth_tasks.get(key)
@@ -2380,6 +2537,18 @@ class SpotMarketProviderWsService:
         if not spot_provider_ws_supports_provider(provider_code, domain="ticker"):
             return
         provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
+        if provider_code == PROVIDER_OKX_SPOT:
+            self._ensure_okx_shared(
+                domain="ticker",
+                subscription=SpotTickerSubscription(local_symbol, provider_code, provider_symbol, OKX_SPOT_TICKER_CHANNEL, str(getattr(settings, "SPOT_PROVIDER_WS_OKX_PUBLIC_URL", "") or "")),
+            )
+            return
+        if provider_code == PROVIDER_BITGET_SPOT:
+            self._ensure_bitget_shared(
+                domain="ticker",
+                subscription=SpotTickerSubscription(local_symbol, provider_code, provider_symbol, BITGET_SPOT_TICKER_CHANNEL, str(getattr(settings, "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL", "") or "")),
+            )
+            return
         key = (provider_code, local_symbol)
         with self._lock:
             task = self._ticker_tasks.get(key)
@@ -2420,6 +2589,18 @@ class SpotMarketProviderWsService:
         if not spot_provider_ws_supports_provider(provider_code, domain="trades"):
             return
         provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
+        if provider_code == PROVIDER_OKX_SPOT:
+            self._ensure_okx_shared(
+                domain="trades",
+                subscription=SpotTradesSubscription(local_symbol, provider_code, provider_symbol, _trades_limit(), OKX_SPOT_TRADES_CHANNEL, str(getattr(settings, "SPOT_PROVIDER_WS_OKX_PUBLIC_URL", "") or "")),
+            )
+            return
+        if provider_code == PROVIDER_BITGET_SPOT:
+            self._ensure_bitget_shared(
+                domain="trades",
+                subscription=SpotTradesSubscription(local_symbol, provider_code, provider_symbol, _trades_limit(), BITGET_SPOT_TRADES_CHANNEL, str(getattr(settings, "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL", "") or "")),
+            )
+            return
         key = (provider_code, local_symbol)
         with self._lock:
             task = self._trades_tasks.get(key)
@@ -2465,6 +2646,18 @@ class SpotMarketProviderWsService:
         if channel is None:
             return
         provider_symbol = okx_spot_ws_symbol(local_symbol) if provider_code == PROVIDER_OKX_SPOT else local_symbol
+        if provider_code == PROVIDER_OKX_SPOT:
+            self._ensure_okx_shared(
+                domain="kline",
+                subscription=SpotKlineSubscription(local_symbol, provider_code, provider_symbol, normalized_interval, channel, _kline_limit(), str(getattr(settings, "SPOT_PROVIDER_WS_OKX_BUSINESS_URL", "") or "")),
+            )
+            return
+        if provider_code == PROVIDER_BITGET_SPOT:
+            self._ensure_bitget_shared(
+                domain="kline",
+                subscription=SpotKlineSubscription(local_symbol, provider_code, provider_symbol, normalized_interval, channel, _kline_limit(), str(getattr(settings, "SPOT_PROVIDER_WS_BITGET_PUBLIC_URL", "") or "")),
+            )
+            return
         key = (provider_code, local_symbol, normalized_interval)
         unhealthy_snapshot: Optional[dict[str, Any]] = None
         with self._lock:
@@ -2600,6 +2793,10 @@ class SpotMarketProviderWsService:
 
     def _stop_depth_subscription(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
         provider_code = normalize_spot_ws_provider(provider)
+        if provider_code == PROVIDER_OKX_SPOT and self._release_okx_shared(domain="depth", local_symbol=local_symbol):
+            return
+        if provider_code == PROVIDER_BITGET_SPOT and self._release_bitget_shared(domain="depth", local_symbol=local_symbol):
+            return
         key = (provider_code, local_symbol)
         with self._lock:
             stop_event = self._depth_stops.pop(key, None)
@@ -2627,6 +2824,10 @@ class SpotMarketProviderWsService:
 
     def _stop_trades_subscription(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
         provider_code = normalize_spot_ws_provider(provider)
+        if provider_code == PROVIDER_OKX_SPOT and self._release_okx_shared(domain="trades", local_symbol=local_symbol):
+            return
+        if provider_code == PROVIDER_BITGET_SPOT and self._release_bitget_shared(domain="trades", local_symbol=local_symbol):
+            return
         key = (provider_code, local_symbol)
         with self._lock:
             stop_event = self._trades_stops.pop(key, None)
@@ -2654,6 +2855,10 @@ class SpotMarketProviderWsService:
 
     def _stop_ticker_subscription(self, local_symbol: str, *, provider: Optional[str] = None) -> None:
         provider_code = normalize_spot_ws_provider(provider)
+        if provider_code == PROVIDER_OKX_SPOT and self._release_okx_shared(domain="ticker", local_symbol=local_symbol):
+            return
+        if provider_code == PROVIDER_BITGET_SPOT and self._release_bitget_shared(domain="ticker", local_symbol=local_symbol):
+            return
         key = (provider_code, local_symbol)
         with self._lock:
             stop_event = self._ticker_stops.pop(key, None)
@@ -2687,12 +2892,24 @@ class SpotMarketProviderWsService:
                 for provider, symbol, interval in self._kline_tasks.keys()
                 if provider == provider_code and symbol == local_symbol
             ]
+            intervals.extend(
+                interval for domain, symbol, interval in self._okx_registrations
+                if domain == "kline" and symbol == local_symbol and interval not in intervals
+            )
+            intervals.extend(
+                interval for domain, symbol, interval in self._bitget_registrations
+                if domain == "kline" and symbol == local_symbol and interval not in intervals
+            )
         for interval in intervals:
             self._stop_kline_subscription(local_symbol, interval, provider=provider_code)
 
     def _stop_kline_subscription(self, local_symbol: str, interval: str, *, provider: Optional[str] = None) -> None:
         normalized_interval = normalize_spot_ws_kline_interval(interval)
         provider_code = normalize_spot_ws_provider(provider)
+        if provider_code == PROVIDER_OKX_SPOT and self._release_okx_shared(domain="kline", local_symbol=local_symbol, interval=normalized_interval):
+            return
+        if provider_code == PROVIDER_BITGET_SPOT and self._release_bitget_shared(domain="kline", local_symbol=local_symbol, interval=normalized_interval):
+            return
         key = (provider_code, local_symbol, normalized_interval)
         with self._lock:
             stop_event = self._kline_stops.pop(key, None)
@@ -4134,3 +4351,7 @@ def release_spot_provider_ws_kline(
 ) -> None:
     if spot_provider_ws_supports_provider(provider, domain="kline"):
         spot_market_provider_ws.release_kline(symbol, interval, provider=provider)
+
+
+def stop_spot_provider_ws() -> None:
+    spot_market_provider_ws.stop_all()

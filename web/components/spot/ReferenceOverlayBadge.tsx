@@ -17,7 +17,7 @@ export default function ReferenceOverlayBadge({
   return (
     <div
       title={titleParts}
-      className="pointer-events-auto absolute left-3 top-3 z-10 max-w-[calc(100%-1.5rem)] rounded-lg border bg-[#090b10]/82 px-3 py-2 shadow-lg shadow-black/25 backdrop-blur-sm"
+      className="pointer-events-auto absolute left-3 top-3 z-10 max-w-[calc(100%-1.5rem)] rounded-lg border bg-[#090b10]/70 px-3 py-2 shadow-lg shadow-black/25 backdrop-blur-md"
       style={{ borderColor: `${badgeColor}59` }}
     >
       <div className="text-[11px] font-medium leading-4" style={{ color: badgeColor }}>

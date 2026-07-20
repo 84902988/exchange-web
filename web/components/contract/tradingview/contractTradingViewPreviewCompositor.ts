@@ -65,7 +65,7 @@ type State = {
   preview: ContractPreviewInput | null;
 };
 
-const SUPPORTED_INTERVAL = '1m';
+const SUPPORTED_INTERVALS = new Set(['1m', '5m']);
 const VALID_SYMBOL = /^[A-Z0-9][A-Z0-9_-]*$/;
 
 function normalizeSymbol(value: unknown) {
@@ -127,7 +127,7 @@ export class ContractTradingViewPreviewCompositor {
   constructor(scope: { symbol: string; interval: string }) {
     this.symbol = normalizeSymbol(scope.symbol);
     this.interval = normalizeInterval(scope.interval);
-    this.supported = VALID_SYMBOL.test(this.symbol) && this.interval === SUPPORTED_INTERVAL;
+    this.supported = VALID_SYMBOL.test(this.symbol) && SUPPORTED_INTERVALS.has(this.interval);
   }
 
   acceptNative(input: ContractPreviewNativeInput): ContractPreviewResult {

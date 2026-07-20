@@ -84,6 +84,7 @@ const HEADER_LABELS: Record<string, ContractHeaderLabels> = {
 
 type ContractMarketHeaderProps = {
   marketSymbol: string;
+  isTradfi?: boolean;
   referencePrice?: ContractReferencePrice | null;
   pricePrecision?: number;
   displayPrice: string;
@@ -100,6 +101,7 @@ type ContractMarketHeaderProps = {
   displayPriceSource?: 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK' | null;
   displayPriceLabel?: string | null;
   markPrice?: string | null;
+  markPriceLabel?: string | null;
   indexPrice?: string | null;
   fundingRate?: string | null;
   bestBid?: string | null;
@@ -440,6 +442,7 @@ function isClosedMarketDisplayState(
 
 export default function ContractMarketHeader({
   marketSymbol,
+  isTradfi = false,
   referencePrice,
   pricePrecision = 2,
   displayPrice: legacyDisplayPrice,
@@ -456,6 +459,7 @@ export default function ContractMarketHeader({
   displayPriceSource: legacyDisplayPriceSource,
   displayPriceLabel: legacyDisplayPriceLabel,
   markPrice: legacyMarkPrice,
+  markPriceLabel,
   indexPrice: legacyIndexPrice,
   fundingRate: legacyFundingRate,
   bestBid: legacyBestBid,
@@ -654,7 +658,7 @@ export default function ContractMarketHeader({
           </div>
         </div>
 
-        <div className="grid min-w-0 flex-1 grid-cols-2 gap-2 text-[12px] text-gray-300 md:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-9">
+        <div className={`grid min-w-0 flex-1 grid-cols-2 gap-2 text-[12px] text-gray-300 md:grid-cols-4 xl:grid-cols-5 ${isTradfi ? '2xl:grid-cols-7' : '2xl:grid-cols-9'}`}>
           <Metric
             label={t('tradeStatus', 'contracts')}
             testId="contract-header-market-status-card"
@@ -676,11 +680,15 @@ export default function ContractMarketHeader({
               </span>
             )}
           />
-          <Metric label={t('markPrice', 'contracts')} testId="contract-header-mark-price" value={markPrice || '--'} />
-          <Metric label={t('indexPrice', 'contracts')} testId="contract-header-index-price" value={indexPrice || '--'} />
-          <Metric label={labels.fundingRate} testId="contract-header-funding-rate" value={fundingRate || '--'} />
-          <Metric label={labels.bestBid} testId="contract-header-best-bid" value={bestBid || '--'} />
-          <Metric label={labels.bestAsk} testId="contract-header-best-ask" value={bestAsk || '--'} />
+          <Metric label={markPriceLabel || t('markPrice', 'contracts')} testId="contract-header-mark-price" value={markPrice || '--'} />
+          {!isTradfi ? <Metric label={t('indexPrice', 'contracts')} testId="contract-header-index-price" value={indexPrice || '--'} /> : null}
+          {!isTradfi ? (
+            <>
+              <Metric label={labels.fundingRate} testId="contract-header-funding-rate" value={fundingRate || '--'} />
+              <Metric label={labels.bestBid} testId="contract-header-best-bid" value={bestBid || '--'} />
+              <Metric label={labels.bestAsk} testId="contract-header-best-ask" value={bestAsk || '--'} />
+            </>
+          ) : null}
           <Metric label={t('spread', 'contracts')} testId="contract-header-spread" value={t('spreadFloating', 'contracts')} />
           <Metric label={t('highLow24h', 'contracts')} testId="contract-header-high-low-24h" value={highLow24h || '--'} />
           <Metric
@@ -688,6 +696,12 @@ export default function ContractMarketHeader({
             testId="contract-header-volume-turnover-24h"
             value={volumeTurnover24h || '--'}
           />
+          {isTradfi ? (
+            <>
+              <Metric label={labels.bestBid} testId="contract-header-best-bid" value={bestBid || '--'} />
+              <Metric label={labels.bestAsk} testId="contract-header-best-ask" value={bestAsk || '--'} />
+            </>
+          ) : null}
         </div>
       </div>
       {hint ? <div className="sr-only">{hint}</div> : null}

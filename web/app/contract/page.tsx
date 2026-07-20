@@ -244,6 +244,7 @@ function buildContractPairOption(item: ContractSymbolItem, t: ContractTranslator
     marketSessionType: item.market_session_type,
     tpSlTriggerPriceType: normalizeTpSlTriggerPriceType(item.tp_sl_trigger_price_type),
     pricePrecision: item.price_precision,
+    amountPrecision: item.quantity_precision,
     maxLeverage: item.max_leverage,
     contractKlineAssetClass: normalizeContractKlineAssetClass(item.category),
   };
@@ -276,7 +277,12 @@ function formatFundingPercent(value: unknown) {
 function isTradfiContractPair(pair: GlobalMarketSelectorPair | null | undefined) {
   if (!pair) return false;
   const categories = getContractPairCapabilityCategories(pair);
-  return categories.includes('STOCK') || categories.some((item) => CFD_CONTRACT_CATEGORIES.has(item));
+  return categories.includes('STOCK') || isCfdContractPair(pair);
+}
+
+function isCfdContractPair(pair: GlobalMarketSelectorPair | null | undefined) {
+  if (!pair) return false;
+  return getContractPairCapabilityCategories(pair).some((item) => CFD_CONTRACT_CATEGORIES.has(item));
 }
 
 // Kept for future cross-market toolbar support; contract page no longer calls spot pair APIs on first paint.
@@ -377,9 +383,22 @@ function ContractPageContent() {
     () => contractPairs.find((item) => item.symbol === contractSymbol) || null,
     [contractPairs, contractSymbol],
   );
+  const currentContractUsesValuationPrice = isTradfiContractPair(currentContractPair);
+  const tradfiContractSymbols = useMemo(
+    () => contractPairs
+      .filter((item) => isTradfiContractPair(item))
+      .map((item) => normalizeContractSymbol(item.symbol)),
+    [contractPairs],
+  );
   const currentContractKlineAssetClass = normalizeContractKlineAssetClass(
     currentContractPair?.contractKlineAssetClass,
   );
+  const currentContractUsesTradfiHeader = currentContractPair
+    ? currentContractUsesValuationPrice
+    : urlContractCategory === 'cfd' || urlContractCategory === 'stock';
+  const currentContractUsesTradfiChartLayout = currentContractPair
+    ? isTradfiContractPair(currentContractPair)
+    : urlContractCategory === 'cfd' || urlContractCategory === 'stock';
   const chartBootstrapMatchesUrlCategory = Boolean(urlContractSymbol)
     || !urlContractCategory
     || Boolean(currentContractPair && contractPairMatchesUrlCategory(currentContractPair, urlContractCategory));
@@ -390,8 +409,8 @@ function ContractPageContent() {
     ? selectedPriceState.price
     : null;
   const contractChartIntervalOptions = useMemo(
-    () => (isTradfiContractPair(currentContractPair) ? CONTRACT_TRADFI_INTERVAL_OPTIONS : CONTRACT_INTERVAL_OPTIONS),
-    [currentContractPair],
+    () => (currentContractUsesValuationPrice ? CONTRACT_TRADFI_INTERVAL_OPTIONS : CONTRACT_INTERVAL_OPTIONS),
+    [currentContractUsesValuationPrice],
   );
   const maxLeverage = currentContractPair?.maxLeverage || 200;
   const {
@@ -449,6 +468,17 @@ function ContractPageContent() {
     fallbackMarketStatusText: currentContractPair?.marketStatusText,
     fallbackMarketSessionType: currentContractPair?.marketSessionType,
   });
+  const liveBestBidNumber = Number(hookBestBid);
+  const liveBestAskNumber = Number(hookBestAsk);
+  const liveBboMidpoint = (
+    Number.isFinite(liveBestBidNumber) &&
+    Number.isFinite(liveBestAskNumber) &&
+    liveBestBidNumber > 0 &&
+    liveBestAskNumber >= liveBestBidNumber
+  ) ? (liveBestBidNumber + liveBestAskNumber) / 2 : null;
+  const headerMarkOrValuationPrice = currentContractUsesValuationPrice
+    ? liveBboMidpoint ?? contractQuote?.mark_price
+    : contractQuote?.mark_price;
   const currentPriceDisplay = currentPriceReady
     ? formatPrice(currentPriceNumber, pricePrecision)
     : '--';
@@ -528,6 +558,7 @@ function ContractPageContent() {
   const refreshContractPairs = useCallback(async () => {
     setContractPairsLoading(true);
     const bootstrapSymbol = initialContractSymbolRef.current;
+    let catalogLoaded = false;
 
     try {
       const bootstrapResponse = await loadContractSymbols({
@@ -551,6 +582,7 @@ function ContractPageContent() {
 
     try {
       const contractResponse = await loadContractSymbols({ category: 'all', quote: 'all', page: 1, page_size: 100 });
+      catalogLoaded = true;
       const catalogPairs = contractResponse.items.map((item) => buildContractPairOption(item, t));
       setContractPairs((previous) => {
         const bootstrapPair = previous.find((item) => item.symbol === bootstrapSymbol) || null;
@@ -568,6 +600,7 @@ function ContractPageContent() {
       setContractPairsLoaded(true);
       setContractPairsLoading(false);
     }
+    return catalogLoaded;
   }, [t]);
 
   const handleToolbarPairQueryChange = useCallback((query: PairQueryUpdate) => {
@@ -580,10 +613,26 @@ function ContractPageContent() {
   }, []);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      void refreshContractPairs();
+    let disposed = false;
+    let timer: number | null = null;
+    let retryAttempt = 0;
+    const run = async () => {
+      const loaded = await refreshContractPairs();
+      if (disposed || loaded) return;
+      const retryDelays = [1000, 2000, 5000, 10000];
+      const delay = retryDelays[Math.min(retryAttempt, retryDelays.length - 1)];
+      retryAttempt += 1;
+      timer = window.setTimeout(() => {
+        void run();
+      }, delay);
+    };
+    timer = window.setTimeout(() => {
+      void run();
     }, 0);
-    return () => window.clearTimeout(timer);
+    return () => {
+      disposed = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
   }, [refreshContractPairs]);
 
   useEffect(() => {
@@ -690,6 +739,7 @@ function ContractPageContent() {
       <div className="w-full px-2 py-2 xl:px-3 xl:py-2">
         <ContractMarketHeader
           marketSymbol={marketSymbol}
+          isTradfi={currentContractUsesTradfiHeader}
           referencePrice={referencePrice}
           pricePrecision={pricePrecision}
           displayPrice={currentPriceDisplay}
@@ -705,7 +755,8 @@ function ContractPageContent() {
           priceDirection={currentPriceDirection}
           displayPriceSource={currentPriceSource}
           displayPriceLabel={currentPriceSourceLabel}
-          markPrice={formatPrice(contractQuote?.mark_price, pricePrecision)}
+          markPrice={formatPrice(headerMarkOrValuationPrice, pricePrecision)}
+          markPriceLabel={currentContractUsesValuationPrice ? t('valuationPrice', 'contracts') : undefined}
           indexPrice={formatPrice(contractQuote?.index_price, pricePrecision)}
           fundingRate={formatFundingPercent(contractQuote?.funding_rate)}
           bestBid={formatPrice(hookBestBid, pricePrecision)}
@@ -741,38 +792,32 @@ function ContractPageContent() {
           </div>
         ) : null}
 
-        <div className="mt-2 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,8.6fr)_minmax(240px,1.95fr)_minmax(260px,1.85fr)] xl:grid-rows-[minmax(max(540px,62vh),auto)_minmax(170px,auto)] xl:items-stretch">
-          <div className="min-h-[420px] min-w-0 xl:col-start-1 xl:row-start-1 xl:min-h-0">
+        <div className="mt-2 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,8.6fr)_minmax(240px,1.95fr)_minmax(260px,1.85fr)] xl:grid-rows-[minmax(max(540px,62vh),max(540px,62vh))_minmax(170px,auto)] xl:items-stretch">
+          <div className={`min-h-[420px] min-w-0 xl:col-start-1 xl:row-start-1 xl:min-h-0 ${currentContractUsesTradfiChartLayout ? 'xl:col-span-2' : ''}`}>
             <div className="flex h-full min-h-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
               <div className="min-h-0 flex-1">
-                {chartBootstrapReady ? (
-                  <ContractTradingViewChart
-                    symbol={contractSymbol}
-                    category={currentContractKlineAssetClass}
-                    displaySymbol={currentContractPair.displaySymbol || marketSymbol}
-                    interval={interval}
-                    chartMode={chartMode}
-                    intervalOptions={contractChartIntervalOptions}
-                    onChartModeChange={setChartMode}
-                    onIntervalChange={handleContractIntervalChange}
-                    pricePrecision={pricePrecision}
-                    amountPrecision={currentContractPair.amountPrecision}
-                    referencePrice={referencePrice}
-                    positions={openPositionsForTrading}
-                    priceDirection={currentPriceDirection}
-                    onLatestKlineCloseChange={handleLatestKlineCloseChange}
-                  />
-                ) : (
-                  <div
-                    aria-hidden="true"
-                    className="h-full min-h-[420px] animate-pulse bg-white/[0.015]"
-                    data-contract-chart-bootstrap="pending"
-                  />
-                )}
+                <ContractTradingViewChart
+                  bootstrapReady={chartBootstrapReady}
+                  symbol={contractSymbol}
+                  category={currentContractKlineAssetClass}
+                  displaySymbol={currentContractPair?.displaySymbol || marketSymbol}
+                  interval={interval}
+                  chartMode={chartMode}
+                  intervalOptions={contractChartIntervalOptions}
+                  onChartModeChange={setChartMode}
+                  onIntervalChange={handleContractIntervalChange}
+                  pricePrecision={currentContractPair?.pricePrecision ?? null}
+                  amountPrecision={currentContractPair?.amountPrecision ?? null}
+                  referencePrice={referencePrice}
+                  positions={openPositionsForTrading}
+                  priceDirection={currentPriceDirection}
+                  onLatestKlineCloseChange={handleLatestKlineCloseChange}
+                />
               </div>
             </div>
           </div>
 
+          {!currentContractUsesTradfiChartLayout ? (
           <div className="min-h-0 min-w-0 xl:col-start-2 xl:row-start-1">
             <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
               <div className="shrink-0 border-b border-white/10 px-2.5">
@@ -842,6 +887,7 @@ function ContractPageContent() {
               </div>
             </div>
           </div>
+          ) : null}
 
           <div className="flex min-h-[150px] min-w-0 flex-col overflow-visible border border-white/10 bg-[#12161c] xl:col-span-2 xl:col-start-1 xl:row-start-2 xl:min-h-0">
             <ContractPositionTabs
@@ -854,6 +900,10 @@ function ContractPageContent() {
               orders={orders}
               trades={trades}
               quote={contractQuote}
+              liveBestBid={hookBestBid}
+              liveBestAsk={hookBestAsk}
+              liveMarketUsable={marketUiState.status === 'LIVE' && contractExecutable === true}
+              tradfiSymbols={tradfiContractSymbols}
               pricePrecision={pricePrecision}
               quantityUnit={quantityUnit}
               isLoggedIn={isLoggedIn}

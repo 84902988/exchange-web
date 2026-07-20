@@ -13,7 +13,6 @@ import {
   buildContractOrderBookRows,
   calculateContractOrderBookDepthRatio,
   formatContractOrderBookAmount,
-  getContractDepthModeLabel,
   getContractOrderBookDataLimit,
   getContractOrderBookLevelLimit,
   normalizeContractDepthMode,
@@ -320,7 +319,6 @@ export default function ContractFuturesOrderBook({
   const modeLabels = ORDERBOOK_MODE_LABELS[locale] || ORDERBOOK_MODE_LABELS.en;
   const normalizedDepthMode = normalizeContractDepthMode(depthMode);
   const displayStatus = status ?? null;
-  const depthModeLabel = getContractDepthModeLabel(depthMode);
 
   const depthUnavailable = loading
     || !!error;
@@ -436,16 +434,6 @@ export default function ContractFuturesOrderBook({
           ))}
         </div>
 
-        <div className="flex min-w-0 items-center justify-end gap-1.5 overflow-hidden">
-          {depthModeLabel ? (
-            <div
-              className="shrink-0 whitespace-nowrap rounded-full border border-[#f0b90b]/25 bg-[#f0b90b]/10 px-2 py-0.5 text-[10px] font-semibold text-[#f0b90b]"
-              data-testid="contract-orderbook-depth-mode-label"
-            >
-              {depthModeLabel}
-            </div>
-          ) : null}
-        </div>
       </div>
 
       <div className="mb-1 grid grid-cols-3 px-1.5 text-[11px] font-medium leading-4 text-gray-400">

@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.datetime_utils import spot_trade_utc_isoformat, spot_trade_utc_timestamp_ms
 from app.db.models.market_kline import MarketKline
 from app.db.models.order import Order
 from app.db.models.trade import Trade
@@ -1144,7 +1145,7 @@ def _get_internal_trades(db: Session, pair: TradingPair, limit: int = 50) -> Tra
             if taker_order and taker_order.side:
                 trade_side = taker_order.side
 
-        trade_time_ms = _datetime_to_utc_ms(row.created_at)
+        trade_time_ms = spot_trade_utc_timestamp_ms(row.created_at)
         trade_id = str(row.id) if getattr(row, "id", None) is not None else None
         trades.append(
             TradeItem(
@@ -1157,7 +1158,7 @@ def _get_internal_trades(db: Session, pair: TradingPair, limit: int = 50) -> Tra
                 ts=trade_time_ms,
                 event_time_ms=trade_time_ms,
                 received_at_ms=None,
-                created_at=row.created_at.isoformat(),
+                created_at=spot_trade_utc_isoformat(row.created_at),
                 time_origin="PLATFORM_TRADE",
                 source="INTERNAL",
             )

@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 from sqlalchemy import desc, or_
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.datetime_utils import spot_trade_utc_isoformat, utc_isoformat
 from app.db.models.asset import BalanceLog, UserBalance
 from app.db.models.order import Order
 from app.db.models.trade import Trade
@@ -96,8 +97,8 @@ def _build_order_item(row: Order, pair: TradingPair) -> Dict:
         "fee_asset_id": row.fee_asset_id,
         "fee_asset_symbol": fee_asset_symbol,
         "status": status,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "created_at": utc_isoformat(row.created_at),
+        "updated_at": utc_isoformat(row.updated_at),
     }
 
 
@@ -270,7 +271,7 @@ def get_my_trades(db: Session, user_id: int, symbol: str, limit: int = 100) -> D
             "fee_asset": _fee_symbol(trade_fee_asset_symbol),
             "fee_asset_symbol": _fee_symbol(trade_fee_asset_symbol),
             **_spot_trade_dealer_evidence(row),
-            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "created_at": spot_trade_utc_isoformat(row.created_at),
         })
 
     return {

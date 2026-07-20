@@ -180,7 +180,6 @@ type SpotTradingViewDatafeedOptions = Pick<
 > & {
   debugEnabled?: boolean;
   onKlineLoadStateChange?: (state: SpotKlineLoadState) => void;
-  onRealtimeSyncEvidence?: (event: SpotTradingViewRealtimeEvent) => void;
   onKlineRealtime?: (event: SpotTradingViewRealtimeEvent) => void;
   onCandleAuthority?: (event: SpotTradingViewCandleAuthorityEvent) => void;
   onHistoryBars?: (event: SpotTradingViewHistoryBarsEvent) => void;
@@ -3451,9 +3450,6 @@ export function createSpotTradingViewDatafeed(
           freshness: klineFreshness,
           receivedAtMs: message.receivedAtMs,
         };
-        options.onRealtimeSyncEvidence?.(
-          buildKlineRealtimeEvent(revisionBar, realtimeEnvelope),
-        );
         const currentLatestBar = latestBars.get(latestBarKey);
         if (
           klineSource === 'LIVE_WS'

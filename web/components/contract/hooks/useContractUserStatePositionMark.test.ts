@@ -19,7 +19,10 @@ test('mark-only position events never trigger a REST fanout', () => {
   expect(source).toContain('if (isContractPositionMarkOnlyMessage(message)) return false;');
   expect(source).toContain('markOnly ? false : positionsUpdate.replace');
   expect(source).toContain('markOnly ? false : summariesUpdate.replace');
-  expect(source).toContain('!isContractPositionMarkOnlyMessage(message)');
+  expect(source).toContain('const markOnly = isContractPositionMarkOnlyMessage(message);');
+  expect(source).toContain('!markOnly,');
+  expect(source).toContain('const sequenceRef = markOnly ? lastMarkRealtimeSeqRef : lastRealtimeSeqRef;');
+  expect(source).toContain('const timestampRef = markOnly ? lastMarkRealtimeTsRef : lastRealtimeTsRef;');
   expect(source).toContain('if (invalidateRestBaseline) invalidatePrivateRestBaseline();');
   expect(source).toContain('privateRefreshCoordinatorRef.current.replayActive();');
 });
@@ -34,7 +37,7 @@ test('private REST refreshes are single-flight per visible scope with one traili
 
 test('position events preserve symbol and sequence fences', () => {
   expect(source).toContain("return messageSymbols.length === 0 || messageSymbols.includes(normalizedCurrentSymbol);");
-  expect(source).toContain('if (!acceptsContractRealtimeSequence(lastRealtimeSeqRef.current, message)) return false;');
+  expect(source).toContain('if (!acceptsContractRealtimeSequence(sequenceRef.current, message)) return false;');
   expect(source).toContain('return seq === null || seq >= lastSeq;');
   expect(source).toContain("extractContractPositionsUpdate(message, contractSymbol, dataScope === 'all')");
 });

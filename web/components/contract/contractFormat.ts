@@ -1,4 +1,5 @@
 import { ApiError } from '@/lib/api';
+import { formatDisplayDateTime } from '@/lib/displayTimeZone';
 
 export type ContractErrorTranslator = (key: string, namespace?: 'contracts') => string;
 
@@ -60,11 +61,8 @@ export function formatFixedNumber(value?: string | number | null, digits = 4) {
   }).format(num);
 }
 
-export function formatTime(value?: string | null) {
-  if (!value) return '-';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString();
+export function formatTime(value: string | null | undefined, timeZone: string, locale?: string) {
+  return formatDisplayDateTime(value, timeZone, locale);
 }
 
 export function friendlyContractError(error: unknown, t?: ContractErrorTranslator) {

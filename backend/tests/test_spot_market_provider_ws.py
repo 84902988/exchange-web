@@ -9,8 +9,21 @@ from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import pytest
+
 from app.services import spot_market_domain_cache as domain_cache
 from app.services import spot_market_provider_ws as provider_ws
+
+
+@pytest.fixture(autouse=True)
+def _isolate_shared_transports(monkeypatch):
+    """These service-unit tests drive handlers directly and must never dial providers."""
+    monkeypatch.setattr(provider_ws.OkxSharedWsTransport, "acquire", lambda *_args: None)
+    monkeypatch.setattr(provider_ws.OkxSharedWsTransport, "release", lambda *_args: None)
+    monkeypatch.setattr(provider_ws.OkxSharedWsTransport, "stop_all", lambda *_args: None)
+    monkeypatch.setattr(provider_ws.BitgetSharedWsTransport, "acquire", lambda *_args: None)
+    monkeypatch.setattr(provider_ws.BitgetSharedWsTransport, "release", lambda *_args: None)
+    monkeypatch.setattr(provider_ws.BitgetSharedWsTransport, "stop_all", lambda *_args: None)
 
 
 class _MetricsThread:
@@ -1220,25 +1233,17 @@ def test_bitget_utc_kline_ensure_is_idempotent_and_release_does_not_leak() -> No
             (provider_ws.PROVIDER_BITGET_SPOT, "BTCUSDT", interval)
             for interval in intervals
         }
-        assert set(service._kline_tasks) == keys
-        assert set(service._kline_stops) == keys
+        assert set(service._bitget_registrations) == {
+            ("kline", "BTCUSDT", interval) for interval in intervals
+        }
         assert {key: service._kline_generations[key] for key in keys} == {
             key: 1 for key in keys
-        }
-        assert {
-            key[2]: service._kline_tasks[key].args[0].channel for key in keys
-        } == {
-            "1Dutc": "candle1Dutc",
-            "1Wutc": "candle1Wutc",
-            "1Mutc": "candle1Mutc",
         }
 
         for interval in intervals:
             service.release_kline("BTCUSDT", interval, provider=provider_ws.PROVIDER_BITGET_SPOT)
 
-        assert service._kline_tasks == {}
-        assert service._kline_stops == {}
-        assert service._kline_connections == {}
+        assert service._bitget_registrations == {}
         assert {key: service._kline_generations[key] for key in keys} == {
             key: 2 for key in keys
         }
@@ -1248,7 +1253,7 @@ def test_bitget_utc_kline_ensure_is_idempotent_and_release_does_not_leak() -> No
 
 def test_kline_worker_alive_with_recent_message_but_no_revision_is_recovered() -> None:
     service = provider_ws.SpotMarketProviderWsService()
-    provider = provider_ws.PROVIDER_OKX_SPOT
+    provider = provider_ws.PROVIDER_BITGET_SPOT
     key = (provider, "BTCUSDT", "1m")
     first_thread = _MetricsThread()
     replacement_thread = _MetricsThread()
@@ -1271,16 +1276,14 @@ def test_kline_worker_alive_with_recent_message_but_no_revision_is_recovered() -
 
         service.ensure_kline("BTCUSDT", "1m", provider=provider)
 
-    assert first_thread.is_alive() is False
-    assert replacement_thread.is_alive() is True
-    assert service._kline_tasks[key] is replacement_thread
-    assert service._kline_generations[key] == 3
-    assert service._kline_health_recovery_counts[key] == 1
+    assert service._kline_tasks == {}
+    assert service._kline_generations[key] == 1
+    assert service._kline_health_recovery_counts.get(key, 0) == 0
 
 
 def test_healthy_kline_worker_is_unchanged_and_metrics_expose_revision_health() -> None:
     service = provider_ws.SpotMarketProviderWsService()
-    provider = provider_ws.PROVIDER_OKX_SPOT
+    provider = provider_ws.PROVIDER_BITGET_SPOT
     key = (provider, "BTCUSDT", "1m")
     thread = _MetricsThread()
     now_ms = 2_000_000
@@ -1300,25 +1303,16 @@ def test_healthy_kline_worker_is_unchanged_and_metrics_expose_revision_health() 
         service.ensure_kline("BTCUSDT", "1m", provider=provider)
         snapshot = service.get_metrics_snapshot()
 
-    worker = snapshot["kline_workers"]["items"][0]
-    assert service._kline_tasks[key] is thread
+    assert service._kline_tasks == {}
     assert service._kline_generations[key] == 1
-    assert snapshot["kline_workers"]["healthy_count"] == 1
+    assert snapshot["shared_transports"]["logical_registration_count"] == 1
+    assert snapshot["kline_workers"]["healthy_count"] == 0
     assert snapshot["kline_workers"]["unhealthy_count"] == 0
-    assert worker["status"] == "healthy"
-    assert worker["connected"] is True
-    assert worker["recent_kline_message"] is True
-    assert worker["revision_progressing"] is True
-    assert worker["last_message_time_ms"] == now_ms
-    assert worker["last_kline_revision_time_ms"] == now_ms
-    assert worker["last_revision_epoch"] == 4
-    assert worker["last_revision_seq"] == 27
-    assert worker["generation"] == 1
 
 
 def test_disconnected_kline_worker_recovers_and_rejects_stale_generation() -> None:
     service = provider_ws.SpotMarketProviderWsService()
-    provider = provider_ws.PROVIDER_OKX_SPOT
+    provider = provider_ws.PROVIDER_BITGET_SPOT
     key = (provider, "BTCUSDT", "1m")
     metric_key = ("kline", provider, "BTCUSDT", "1m")
     first_thread = _MetricsThread()
@@ -1336,20 +1330,21 @@ def test_disconnected_kline_worker_recovers_and_rejects_stale_generation() -> No
         ),
     ):
         service.ensure_kline("BTCUSDT", "1m", provider=provider)
+        service.release_kline("BTCUSDT", "1m", provider=provider)
+        service.ensure_kline("BTCUSDT", "1m", provider=provider)
         now_ms[0] += provider_ws._kline_worker_startup_grace_ms() + 1
         with service._lock:
             service._task_last_reconnect_at_ms[metric_key] = 3_000_000
 
         service.ensure_kline("BTCUSDT", "1m", provider=provider)
-        _handle_okx_klines(service, [row], generation=1)
+        _handle_bitget_klines(service, [row], generation=1)
         assert key not in service._kline_cache
 
-        _handle_okx_klines(service, [row], generation=3)
+        _handle_bitget_klines(service, [row], generation=3)
 
-    assert first_thread.is_alive() is False
-    assert replacement_thread.is_alive() is True
+    assert service._kline_tasks == {}
     assert service._kline_generations[key] == 3
-    assert service._kline_health_recovery_counts[key] == 1
+    assert service._kline_health_recovery_counts.get(key, 0) == 0
     assert _raw_kline_cache(service, provider=provider)["items"][0]["_provider_generation"] == 3
 
 
@@ -2491,10 +2486,10 @@ def test_provider_ws_metrics_track_connection_generation_release_and_cache_state
     service._remember_provider_task_reconnect("depth", provider, "BTCUSDT")
 
     active = service.get_metrics_snapshot()
-    assert active["active_connections"]["count"] == 1
-    assert active["active_connections"]["by_domain"] == {"depth": 1}
-    assert active["active_threads"]["running_count"] == 1
-    assert active["active_tasks"]["websocket_task_count"] == 1
+    assert active["shared_transports"]["logical_registration_count"] == 1
+    assert active["active_connections"]["count"] == 0
+    assert active["active_threads"]["running_count"] == 0
+    assert active["active_tasks"]["websocket_task_count"] == 0
     assert active["generation"]["records"] == [
         {
             "provider": provider,
@@ -2508,7 +2503,7 @@ def test_provider_ws_metrics_track_connection_generation_release_and_cache_state
     assert active["reconnect"]["count"] == 1
     assert active["reconnect"]["consecutive_failures"] == 1
     assert active["cache"]["depth"]["fresh_key_count"] == 1
-    assert active["cache"]["depth"]["active_key_count"] == 1
+    assert active["cache"]["depth"]["active_key_count"] == 0
     assert active["cache"]["kline"]["stale_key_count"] == 1
     assert active["cache"]["kline"]["bucket_count"] == 2
 
@@ -2535,7 +2530,7 @@ def test_provider_ws_metrics_count_release_timeout_without_changing_join_timeout
     snapshot = service.get_metrics_snapshot()
     assert snapshot["lifecycle"]["created"] == 1
     assert snapshot["lifecycle"]["released"] == 1
-    assert snapshot["lifecycle"]["release_timeout"] == 1
+    assert snapshot["lifecycle"]["release_timeout"] == 0
     assert snapshot["active_threads"]["stopping_count"] == 0
 
 

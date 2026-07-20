@@ -39,6 +39,24 @@ test('contract chart capability classification ignores localized display groups'
   expect(source).toContain("CONTRACT_INTERVAL_OPTIONS.filter((item) => item !== '4h')");
 });
 
+test('CFD and stock contracts hide the market-list panel and let the chart occupy both market columns', () => {
+  const source = readSource('app/contract/page.tsx');
+  const cfdStart = source.indexOf('function isCfdContractPair');
+  const cfdEnd = source.indexOf('// Kept for future cross-market toolbar support', cfdStart);
+  const cfdSource = source.slice(cfdStart, cfdEnd);
+  const tradfiStart = source.indexOf('function isTradfiContractPair');
+  const tradfiSource = source.slice(tradfiStart, cfdStart);
+
+  expect(cfdSource).toContain('getContractPairCapabilityCategories(pair)');
+  expect(cfdSource).toContain('CFD_CONTRACT_CATEGORIES.has(item)');
+  expect(cfdSource).not.toContain('_PERP');
+  expect(tradfiSource).toContain("categories.includes('STOCK')");
+  expect(tradfiSource).toContain('isCfdContractPair(pair)');
+  expect(source).toContain("currentContractUsesTradfiChartLayout ? 'xl:col-span-2' : ''");
+  expect(source).toContain("!currentContractUsesTradfiChartLayout ? (");
+  expect(source).toContain("urlContractCategory === 'cfd' || urlContractCategory === 'stock'");
+});
+
 test('contract market panels keep click-to-fill states without duplicating the symbol title', () => {
   const pageSource = readSource('app/contract/page.tsx');
   const orderBookSource = readSource('components/contract/ContractFuturesOrderBook.tsx');
@@ -75,6 +93,19 @@ test('contract market view rejects stale symbol data for market, depth, trades, 
   expect(source).toContain('marketViewErrorSymbolRef.current === normalizeContractSymbol(contractSymbol)');
   expect(source).toContain('requestSeqRef.current !== requestSeq');
   expect(source).toContain('marketViewAbortControllerRef.current?.abort()');
+});
+
+test('BBO-only depth enters realtime authority before quantity-based rows are derived', () => {
+  const source = readSource('components/contract/hooks/useContractMarketView.ts');
+  const handlerStart = source.indexOf('const handleDepthMessage =');
+  const handlerEnd = source.indexOf("contractMarketRealtime.subscribe('depth'", handlerStart);
+  const handlerSource = source.slice(handlerStart, handlerEnd);
+
+  expect(handlerStart).toBeGreaterThanOrEqual(0);
+  expect(handlerEnd).toBeGreaterThan(handlerStart);
+  expect(handlerSource.indexOf('ingestContractMarketWsDomain({')).toBeGreaterThanOrEqual(0);
+  expect(handlerSource.indexOf('ingestContractMarketWsDomain({'))
+    .toBeLessThan(handlerSource.indexOf('extractRealtimeDepth(message, contractSymbol)'));
 });
 
 test('Contract Price Authority keeps trade provenance on one evidence row', () => {
@@ -127,7 +158,7 @@ test('contract header receives authoritative MarketView status and does not synt
   expect(hookSource).not.toContain('chartLastClose');
 });
 
-test('contract TradingView overlay consumes Price Authority without changing the Kline datafeed path', () => {
+test('contract TradingView overlay uses the latest Kline close with Price Authority fallback without changing the datafeed path', () => {
   const pageSource = readSource('app/contract/page.tsx');
   const chartSource = readSource('components/contract/ContractTradingViewChart.tsx');
 
@@ -136,7 +167,10 @@ test('contract TradingView overlay consumes Price Authority without changing the
   expect(chartSource).toContain('referencePrice: ContractReferencePrice;');
   expect(chartSource).toContain('resolveContractTradingViewOverlayPrice(referencePrice, normalizedSymbol)');
   expect(chartSource).toContain('createContractTradingViewDatafeed({');
-  expect(chartSource).toContain('onLatestBar: (price) => onLatestKlineCloseChangeRef.current?.(price)');
+  expect(chartSource).toContain('onLatestBar: (price) => {');
+  expect(chartSource).toContain('latestKlineOverlayRef.current = {');
+  expect(chartSource).toContain('overlayPriceRef.current = nextPrice ?? referenceOverlayPriceRef.current;');
+  expect(chartSource).toContain('onLatestKlineCloseChangeRef.current?.(price);');
   expect(chartSource).not.toContain('displayPrice?: number | null;');
 });
 

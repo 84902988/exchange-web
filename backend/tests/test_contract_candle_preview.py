@@ -4,11 +4,13 @@ from app.services.contract_candle_preview import (
     ContractCandlePreviewEngine,
     ContractNativePreviewStatus,
     ContractPreviewTradeStatus,
+    contract_candle_bucket_start_ms,
 )
 
 
 SYMBOL = "BTCUSDT_PERP"
 OPEN_TIME = 1_720_000_020_000
+FIVE_MINUTE_OPEN_TIME = (OPEN_TIME // 300_000) * 300_000
 
 
 def _native(**overrides):
@@ -90,6 +92,63 @@ def test_provider_generation_and_bucket_mismatch_are_rejected():
 
     assert wrong_generation.status is ContractPreviewTradeStatus.GENERATION_MISMATCH
     assert wrong_bucket.status is ContractPreviewTradeStatus.OPEN_TIME_MISMATCH
+
+
+def test_five_minute_preview_uses_interval_aligned_bucket_and_rollover():
+    engine = ContractCandlePreviewEngine()
+    baseline = engine.accept_native_revision(
+        _native(interval="5m", open_time=FIVE_MINUTE_OPEN_TIME)
+    )
+    current = engine.accept_trade(
+        _trade(
+            "five-current",
+            "103",
+            "2",
+            interval="5m",
+            event_time_ms=FIVE_MINUTE_OPEN_TIME + 299_999,
+        )
+    )
+    rollover = engine.accept_trade(
+        _trade(
+            "five-next",
+            "104",
+            "1",
+            interval="5m",
+            event_time_ms=FIVE_MINUTE_OPEN_TIME + 300_001,
+        )
+    )
+
+    assert baseline.status is ContractNativePreviewStatus.BASELINE_CREATED
+    assert current.status is ContractPreviewTradeStatus.APPLIED
+    assert current.preview is not None
+    assert current.preview.open_time == FIVE_MINUTE_OPEN_TIME
+    assert rollover.status is ContractPreviewTradeStatus.APPLIED
+    assert rollover.preview is not None
+    assert rollover.preview.open_time == FIVE_MINUTE_OPEN_TIME + 300_000
+    assert rollover.preview.baseline_source == "TRADE_ROLLOVER"
+    assert contract_candle_bucket_start_ms(
+        FIVE_MINUTE_OPEN_TIME + 299_999,
+        "5m",
+    ) == FIVE_MINUTE_OPEN_TIME
+
+
+def test_late_trade_updates_range_and_volume_without_rolling_back_close():
+    engine = ContractCandlePreviewEngine()
+    engine.accept_native_revision(_native())
+    newest = engine.accept_trade(
+        _trade("newest", "103", "2", event_time_ms=OPEN_TIME + 40_000)
+    )
+    late = engine.accept_trade(
+        _trade("late", "98", "1", event_time_ms=OPEN_TIME + 20_000)
+    )
+
+    assert newest.status is ContractPreviewTradeStatus.APPLIED
+    assert late.status is ContractPreviewTradeStatus.APPLIED
+    assert late.preview is not None
+    assert str(late.preview.high) == "103"
+    assert str(late.preview.low) == "98"
+    assert str(late.preview.close) == "103"
+    assert str(late.preview.volume) == "53"
 
 
 def test_generic_symbol_contiguous_trade_opens_complete_next_bucket_before_native():
@@ -291,7 +350,7 @@ def test_missing_or_negative_volume_and_unsupported_interval_fail_closed():
         _native(volume=None),
         _native(volume="-1"),
         _native(symbol="@@@"),
-        _native(interval="5m"),
+        _native(interval="15m"),
     ):
         try:
             engine.accept_native_revision(native)
@@ -314,3 +373,29 @@ def test_new_okx_contract_symbol_uses_the_same_preview_capability():
     assert result.preview.symbol == symbol
     assert str(result.preview.close) == "103"
     assert str(result.preview.volume) == "52"
+
+
+def test_itick_contract_uses_the_same_native_baseline_and_trade_ohlcv_preview():
+    engine = ContractCandlePreviewEngine()
+    symbol = "NAS100USDT_PERP"
+
+    baseline = engine.accept_native_revision(
+        _native(symbol=symbol, provider="ITICK", quote_volume=None)
+    )
+    result = engine.accept_trade(
+        _trade(
+            "nas100-tick-1",
+            "103",
+            "2",
+            symbol=symbol,
+            provider="ITICK",
+        )
+    )
+
+    assert baseline.status is ContractNativePreviewStatus.BASELINE_CREATED
+    assert result.status is ContractPreviewTradeStatus.APPLIED
+    assert result.preview is not None
+    assert result.preview.provider == "ITICK"
+    assert str(result.preview.close) == "103"
+    assert str(result.preview.volume) == "52"
+    assert result.preview.quote_volume is None

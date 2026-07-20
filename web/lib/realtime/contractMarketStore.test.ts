@@ -178,6 +178,101 @@ describe('ContractMarketStore', () => {
       .toBe('64000');
   });
 
+  it('keeps the accepted revision lineage for newer same-provider WS depth ticks', () => {
+    const store = createContractMarketStore();
+    store.activateSymbol('XAUUSDT_PERP');
+    store.ingest({
+      symbol: 'XAUUSDT_PERP',
+      domain: 'depth',
+      data: { bids: [['4000.10', '0']], asks: [['4000.60', '0']] },
+      transport: 'WS',
+      provider: 'ITICK',
+      providerGeneration: 9,
+      revision: { epoch: 4, sequence: 31 },
+      eventTimeMs: 1_720_000_000_100,
+    });
+
+    const result = store.ingest({
+      symbol: 'XAUUSDT_PERP',
+      domain: 'depth',
+      data: { bids: [['4000.20', '0']], asks: [['4000.70', '0']] },
+      transport: 'WS',
+      provider: 'ITICK',
+      eventTimeMs: 1_720_000_000_200,
+    });
+
+    expect(result).toMatchObject({ accepted: true, reason: 'ACCEPTED' });
+    expect(store.getEntry<{ bids: string[][]; asks: string[][] }>('XAUUSDT_PERP', 'depth'))
+      .toMatchObject({
+        providerGeneration: 9,
+        revision: { epoch: 4, sequence: 31 },
+        data: { bids: [['4000.20', '0']], asks: [['4000.70', '0']] },
+      });
+  });
+
+  it('keeps the accepted revision lineage for newer same-provider WS ticker ticks', () => {
+    const store = createContractMarketStore();
+    store.activateSymbol('XAUUSDT_PERP');
+    store.ingest({
+      symbol: 'XAUUSDT_PERP',
+      domain: 'ticker',
+      data: { last_price: '4000.35' },
+      transport: 'WS',
+      provider: 'ITICK',
+      providerGeneration: 9,
+      revision: { epoch: 4, sequence: 31 },
+      eventTimeMs: 1_720_000_000_100,
+    });
+
+    const result = store.ingest({
+      symbol: 'XAUUSDT_PERP',
+      domain: 'ticker',
+      data: { last_price: '4000.45' },
+      transport: 'WS',
+      provider: 'ITICK',
+      eventTimeMs: 1_720_000_000_200,
+    });
+
+    expect(result).toMatchObject({ accepted: true, reason: 'ACCEPTED' });
+    expect(store.getEntry<{ last_price: string }>('XAUUSDT_PERP', 'ticker'))
+      .toMatchObject({
+        providerGeneration: 9,
+        revision: { epoch: 4, sequence: 31 },
+        data: { last_price: '4000.45' },
+      });
+  });
+
+  it('keeps missing revision strict for non-market-increment WS domains', () => {
+    const store = createContractMarketStore();
+    store.activateSymbol('BTCUSDT_PERP');
+    store.ingest({
+      symbol: 'BTCUSDT_PERP',
+      domain: 'kline',
+      interval: '1m',
+      data: { close: '64000' },
+      transport: 'WS',
+      provider: 'BINANCE_USDM',
+      providerGeneration: 3,
+      revision: { epoch: 3, sequence: 22 },
+      eventTimeMs: 1_720_000_000_100,
+    });
+
+    const result = store.ingest({
+      symbol: 'BTCUSDT_PERP',
+      domain: 'kline',
+      interval: '1m',
+      data: { close: '64001' },
+      transport: 'WS',
+      provider: 'BINANCE_USDM',
+      providerGeneration: 3,
+      eventTimeMs: 1_720_000_000_200,
+    });
+
+    expect(result).toMatchObject({ accepted: false, reason: 'REVISION_ROLLBACK' });
+    expect(store.getEntry<{ close: string }>('BTCUSDT_PERP', 'kline', '1m')?.data.close)
+      .toBe('64000');
+  });
+
   it('selects and subscribes to kline authority by active symbol and exact interval', () => {
     contractMarketStore.resetForTests();
     contractMarketStore.activateSymbol('BTCUSDT_PERP');

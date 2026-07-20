@@ -49,6 +49,11 @@ import {
 } from '@/components/tradingview/klineLifecycleProtocol';
 import { KlineLifecycleRuntimeCoordinator } from '@/components/tradingview/klineLifecycleRuntimeCoordinator';
 import { applyTradingViewViewport } from '@/components/tradingview/tradingViewViewportLifecycle';
+import { getDisplayTimeZone } from '@/lib/displayTimeZone';
+import {
+  bindTradingViewDisplayTimeZone,
+  type TradingViewTimezoneChart,
+} from '@/lib/tradingview/displayTimeZoneSync';
 
 export type ContractChartMode = 'time' | 'candle';
 
@@ -79,6 +84,7 @@ export type TradingViewChartApi = {
   createShape?: ContractTradingViewOverlayChart['createShape'];
   getShapeById?: ContractTradingViewOverlayChart['getShapeById'];
   removeEntity?: ContractTradingViewOverlayChart['removeEntity'];
+  getTimezoneApi?: TradingViewTimezoneChart['getTimezoneApi'];
 };
 
 type TradingViewVisiblePriceRange = { from: number; to: number };
@@ -120,6 +126,7 @@ type TradingViewLoadError = {
 };
 
 type ContractTradingViewChartProps = {
+  bootstrapReady?: boolean;
   symbol: string;
   category?: ContractKlineAssetClass | string | null;
   displaySymbol?: string | null;
@@ -215,11 +222,11 @@ type ContractChartLoadingCoordinatorOptions = {
 
 const TRADINGVIEW_LIBRARY_PATH = '/tradingview/charting_library/';
 const TRADINGVIEW_SCRIPT_SRC = `${TRADINGVIEW_LIBRARY_PATH}charting_library.js`;
-const TRADINGVIEW_TIMEZONE = 'Asia/Shanghai';
 const TRADINGVIEW_CANDLE_STYLE = 1;
 const TRADINGVIEW_TIME_STYLE = 2;
-const CONTRACT_CHART_LOADING_MIN_VISIBLE_MS = 220;
+export const CONTRACT_CHART_LOADING_MIN_VISIBLE_MS = 520;
 const CONTRACT_CHART_LOADING_SAFETY_TIMEOUT_MS = 5000;
+export const CONTRACT_CHART_LOADING_DOT_COUNT = 4;
 export const CONTRACT_SET_RESOLUTION_TIMEOUT_MS = 4500;
 export const CONTRACT_RESOLUTION_COMMIT_RECHECK_DELAY_MS = 50;
 export const CONTRACT_RESOLUTION_COMMIT_RECHECK_MAX_ATTEMPTS = 40;
@@ -1008,6 +1015,7 @@ function createToolbarButton(params: {
   label: string;
   active: boolean;
   onClick: () => void;
+  onIntent?: (source: string) => void;
 }) {
   const button = params.owner.createElement('button');
   button.type = 'button';
@@ -1021,8 +1029,11 @@ function createToolbarButton(params: {
   button.style.whiteSpace = 'nowrap';
   styleToolbarButton(button, params.active);
   button.addEventListener('mouseenter', () => {
+    params.onIntent?.('pointerenter');
     if (button.dataset.active !== '1') button.style.color = 'rgba(255,255,255,0.86)';
   });
+  button.addEventListener('focus', () => params.onIntent?.('focus'));
+  button.addEventListener('touchstart', () => params.onIntent?.('touchstart'), { passive: true });
   button.addEventListener('mouseleave', () => {
     if (button.dataset.active !== '1') button.style.color = 'rgba(255,255,255,0.58)';
   });
@@ -1039,6 +1050,7 @@ function getTradingViewGlobal() {
 }
 
 export default function ContractTradingViewChart({
+  bootstrapReady = true,
   symbol,
   category,
   displaySymbol,
@@ -1141,9 +1153,12 @@ export default function ContractTradingViewChart({
     () => typeof window !== 'undefined' && Boolean(getTradingViewGlobal()?.widget),
   );
   const [loadError, setLoadError] = useState<TradingViewLoadError | null>(null);
-  const [chartLoadingReason, setChartLoadingReason] = useState('');
+  const [chartLoadingReason, setChartLoadingReason] = useState('bootstrap');
   const activeLoadError = loadError?.key === widgetKey ? loadError.message : '';
-  const showChartLoading = shouldShowContractChartLoading(chartLoadingReason, activeLoadError);
+  const showChartLoading = !activeLoadError && (
+    !bootstrapReady
+    || shouldShowContractChartLoading(chartLoadingReason, activeLoadError)
+  );
 
   const normalizedSymbolRef = useRef(normalizedSymbol);
   const activeIntervalsRef = useRef(activeIntervals);
@@ -1154,6 +1169,11 @@ export default function ContractTradingViewChart({
   const displayNameRef = useRef(displayName);
   const canonicalCategoryRef = useRef(canonicalCategory);
   const overlayPriceRef = useRef(overlayPrice);
+  const referenceOverlayPriceRef = useRef(overlayPrice);
+  const latestKlineOverlayRef = useRef<{ scope: string; price: number | null }>({
+    scope: '',
+    price: null,
+  });
   const priceDirectionRef = useRef(priceDirection);
   const widgetKeyRef = useRef(widgetKey);
   const onChartModeChangeRef = useRef(onChartModeChange);
@@ -1164,13 +1184,21 @@ export default function ContractTradingViewChart({
     lines: positionLines,
   });
 
-  const [loadingCoordinator] = useState(() => (
-    new ContractChartLoadingCoordinator({
-      onChange: setChartLoadingReason,
-    })
-  ));
+  const loadingCoordinatorRef = useRef<ContractChartLoadingCoordinator | null>(null);
+  const getLoadingCoordinator = useCallback(() => {
+    if (!loadingCoordinatorRef.current) {
+      loadingCoordinatorRef.current = new ContractChartLoadingCoordinator({
+        onChange: setChartLoadingReason,
+      });
+    }
+    return loadingCoordinatorRef.current;
+  }, []);
 
   useLayoutEffect(() => {
+    const overlayScope = `${normalizedSymbol}|${effectiveInterval}`;
+    if (latestKlineOverlayRef.current.scope !== overlayScope) {
+      latestKlineOverlayRef.current = { scope: overlayScope, price: null };
+    }
     normalizedSymbolRef.current = normalizedSymbol;
     activeIntervalsRef.current = activeIntervals;
     activeIntervalRef.current = activeInterval;
@@ -1179,7 +1207,8 @@ export default function ContractTradingViewChart({
     chartModeRef.current = chartMode;
     displayNameRef.current = displayName;
     canonicalCategoryRef.current = canonicalCategory;
-    overlayPriceRef.current = overlayPrice;
+    referenceOverlayPriceRef.current = overlayPrice;
+    overlayPriceRef.current = latestKlineOverlayRef.current.price ?? referenceOverlayPriceRef.current;
     priceDirectionRef.current = priceDirection;
     widgetKeyRef.current = widgetKey;
     onChartModeChangeRef.current = onChartModeChange;
@@ -1271,6 +1300,7 @@ export default function ContractTradingViewChart({
           symbol: normalizedSymbolRef.current,
           category: canonicalCategoryRef.current,
           interval: effectiveIntervalRef.current,
+          intervals: activeIntervalsRef.current,
         }),
       });
     }
@@ -1310,14 +1340,14 @@ export default function ContractTradingViewChart({
 
   const startChartLoading = useCallback((reason: string) => {
     setLoadError(null);
-    const sequence = loadingCoordinator.start(reason);
+    const sequence = getLoadingCoordinator().start(reason);
     activeChartLoadingSeqRef.current = sequence;
     return sequence;
-  }, [loadingCoordinator]);
+  }, [getLoadingCoordinator]);
 
   const finishChartLoading = useCallback((sequence: number) => {
-    loadingCoordinator.finish(sequence);
-  }, [loadingCoordinator]);
+    loadingCoordinatorRef.current?.finish(sequence);
+  }, []);
 
   const restoreToolbarInteraction = useCallback((buildSeq: number) => {
     window.requestAnimationFrame(() => {
@@ -1860,8 +1890,9 @@ export default function ContractTradingViewChart({
   ]);
 
   useEffect(() => () => {
-    loadingCoordinator.destroy();
-  }, [loadingCoordinator]);
+    loadingCoordinatorRef.current?.destroy();
+    loadingCoordinatorRef.current = null;
+  }, []);
 
   useEffect(() => () => {
     preloadManagerRef.current?.destroy();
@@ -1875,6 +1906,7 @@ export default function ContractTradingViewChart({
     let chartReadyTimer: number | null = null;
     let widgetBuildLoadingTimer: number | null = null;
     let widgetBuildCompleted = false;
+    let releaseDisplayTimeZoneSync: () => void = () => undefined;
 
     const cleanupWidget = (generation = activeWidgetGenerationRef.current) => {
       if (
@@ -1882,6 +1914,8 @@ export default function ContractTradingViewChart({
         && activeWidgetGenerationRef.current
         && activeWidgetGenerationRef.current !== generation
       ) return;
+      releaseDisplayTimeZoneSync();
+      releaseDisplayTimeZoneSync = () => undefined;
       activeWidgetGenerationRef.current = 0;
       chartReadyRef.current = false;
       resolutionRequestRef.current?.cancel();
@@ -1934,7 +1968,7 @@ export default function ContractTradingViewChart({
     };
 
     cleanupWidget(activeWidgetGenerationRef.current);
-    if (!scriptReady || !normalizedSymbol || !containerRef.current) {
+    if (!bootstrapReady || !scriptReady || !normalizedSymbol || !containerRef.current) {
       return disposeEffect;
     }
 
@@ -2076,7 +2110,19 @@ export default function ContractTradingViewChart({
       displaySymbol: displayNameRef.current,
       pricePrecision,
       amountPrecision,
-      onLatestBar: (price) => onLatestKlineCloseChangeRef.current?.(price),
+      onLatestBar: (price) => {
+        const numericPrice = Number(price);
+        const nextPrice = Number.isFinite(numericPrice) && numericPrice > 0
+          ? numericPrice
+          : null;
+        latestKlineOverlayRef.current = {
+          scope: `${normalizedSymbol}|${effectiveIntervalRef.current}`,
+          price: nextPrice,
+        };
+        overlayPriceRef.current = nextPrice ?? referenceOverlayPriceRef.current;
+        updatePriceOverlay();
+        onLatestKlineCloseChangeRef.current?.(price);
+      },
       onHistoryBars: (event) => {
         if (!event.firstDataRequest || !eventMatchesCurrentChart(event)) return;
         widgetBuildCompleted = true;
@@ -2150,7 +2196,7 @@ export default function ContractTradingViewChart({
       datafeed,
       library_path: TRADINGVIEW_LIBRARY_PATH,
       locale: resolveTradingViewLocale(locale),
-      timezone: TRADINGVIEW_TIMEZONE,
+      timezone: getDisplayTimeZone(),
       theme: 'dark',
       style: initialStyle,
       header_widget_buttons_mode: 'compact',
@@ -2215,6 +2261,8 @@ export default function ContractTradingViewChart({
         ),
       });
       if (!chart) return;
+      releaseDisplayTimeZoneSync();
+      releaseDisplayTimeZoneSync = bindTradingViewDisplayTimeZone(chart);
       if (
         chart.createShape
         && chart.getShapeById
@@ -2277,7 +2325,12 @@ export default function ContractTradingViewChart({
       toolbarSlot.style.border = '0';
       toolbarSlot.style.cursor = 'default';
 
-      const appendButton = (key: string, label: string, onClick: () => void) => {
+      const appendButton = (
+        key: string,
+        label: string,
+        onClick: () => void,
+        onIntent?: (source: string) => void,
+      ) => {
         const button = createToolbarButton({
           owner: toolbarSlot.ownerDocument,
           key,
@@ -2288,6 +2341,7 @@ export default function ContractTradingViewChart({
             activeIntervalRef.current,
           ),
           onClick,
+          onIntent,
         });
         toolbarSlot.appendChild(button);
         toolbarButtonRefs.current.set(key, button);
@@ -2328,6 +2382,9 @@ export default function ContractTradingViewChart({
           requestedResolutionRef.current = targetResolution;
           if (previousMode !== 'candle') onChartModeChangeRef.current?.('candle');
           onIntervalChangeRef.current?.(selection.interval);
+        }, (source) => {
+          if (activeWidgetGenerationRef.current !== widgetGeneration) return;
+          getPreloadManager().prewarmInterval(item, `toolbar-${source}`);
         });
       });
       setSpotToolbarLoadingState(toolbarSlot, toolbarButtonRefs.current, { loading: false });
@@ -2337,6 +2394,7 @@ export default function ContractTradingViewChart({
     return disposeEffect;
   }, [
     amountPrecision,
+    bootstrapReady,
     applyWidgetResolution,
     beginLifecycleIntent,
     canonicalCategory,
@@ -2380,7 +2438,12 @@ export default function ContractTradingViewChart({
   }, [activeInterval, chartMode]);
 
   return (
-    <div className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]" style={{ minHeight: height }}>
+    <div
+      className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]"
+      style={{ minHeight: height }}
+      data-contract-chart-loading={showChartLoading ? 'pending' : 'ready'}
+      data-contract-chart-bootstrap={bootstrapReady ? 'ready' : 'pending'}
+    >
       <Script
         src={TRADINGVIEW_SCRIPT_SRC}
         strategy="afterInteractive"
@@ -2412,7 +2475,7 @@ export default function ContractTradingViewChart({
           aria-hidden="true"
         >
           <div className="flex items-center gap-2 rounded-full border border-white/[0.06] bg-[#0b0e11]/55 px-4 py-3 shadow-[0_18px_50px_rgba(0,0,0,0.36)]">
-            {[0, 1, 2, 3].map((item) => (
+            {Array.from({ length: CONTRACT_CHART_LOADING_DOT_COUNT }, (_, item) => (
               <span
                 key={item}
                 className="h-2 w-2 animate-bounce rounded-full bg-[#f0b90b] shadow-[0_0_14px_rgba(240,185,11,0.72)]"

@@ -43,6 +43,38 @@ describe('resolveContractTpSlEditorReference', () => {
     })).toBe('106');
   });
 
+  it('uses the live BBO midpoint for a current TradFi position', () => {
+    expect(resolveContractTpSlEditorReference({
+      draftSymbol: 'XAUUSDT_PERP',
+      positionIds: [9],
+      currentSymbol: 'XAUUSDT_PERP',
+      positions: [{ ...position, symbol: 'XAUUSDT_PERP' }],
+      quote: { mark_price: '4017.32', last_price: '4017.32' },
+      triggerPriceType: 'LAST_PRICE',
+      fallback: '4017.32',
+      liveBestBid: '4011.63',
+      liveBestAsk: '4012.35',
+      liveMarketUsable: true,
+      preferLiveBbo: true,
+    })).toBe(4011.99);
+  });
+
+  it('does not use BBO when the live market is not usable', () => {
+    expect(resolveContractTpSlEditorReference({
+      draftSymbol: 'XAUUSDT_PERP',
+      positionIds: [9],
+      currentSymbol: 'XAUUSDT_PERP',
+      positions: [{ ...position, symbol: 'XAUUSDT_PERP' }],
+      quote: { mark_price: '4017.32', last_price: '4017.32' },
+      triggerPriceType: 'LAST_PRICE',
+      fallback: '4017.32',
+      liveBestBid: '4011.63',
+      liveBestAsk: '4012.35',
+      liveMarketUsable: false,
+      preferLiveBbo: true,
+    })).toBe('4017.32');
+  });
+
   it('does not apply the active-symbol quote to a different symbol', () => {
     expect(resolveContractTpSlEditorReference({
       draftSymbol: 'ETHUSDT_PERP',

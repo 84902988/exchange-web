@@ -1090,7 +1090,10 @@ def test_market_kline_cache_provider_error_returns_stale_short_history_metadata(
     db = _session()
     now = datetime.utcnow()
     interval = "4h"
-    cached_times = [_ms(2026, 6, 1, 0), _ms(2026, 6, 1, 4)]
+    # Keep the short cache anchored to the requested history cursor. Older
+    # rows that do not reach the cursor are correctly rejected as a coverage
+    # gap and therefore cannot exercise the stale-short-cache fallback.
+    cached_times = [_ms(2026, 6, 1, 16), _ms(2026, 6, 1, 20)]
     end_time_ms = _ms(2026, 6, 2, 0)
     db.add_all(
         [

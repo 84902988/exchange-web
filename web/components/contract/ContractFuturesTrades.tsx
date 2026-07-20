@@ -6,6 +6,8 @@ import {
 } from '@/lib/api/modules/contract';
 import { formatPrice as formatMarketPrice } from '@/lib/marketPrecision';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import { useDisplayTimeZone } from '@/hooks/useDisplayTimeZone';
+import { formatDisplayTime } from '@/lib/displayTimeZone';
 import {
   type ContractTradesStoreSnapshot,
   useContractTradesStoreSnapshot,
@@ -59,12 +61,6 @@ function formatPrice(value: string | number, precision: number) {
 function formatAmount(value: string | number) {
   const n = toNumber(value);
   return n ? n.toFixed(6) : '--';
-}
-
-function formatTime(value: number) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '--:--:--';
-  return date.toLocaleTimeString('zh-CN', { hour12: false });
 }
 
 function isRenderableRealTrade(trade: ContractMarketTrade): boolean {
@@ -160,7 +156,8 @@ export default function ContractFuturesTrades({
   onPriceClick,
   onPriceSelect,
 }: ContractFuturesTradesProps) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
   const handlePriceSelect = onPriceClick || onPriceSelect;
   const storeSnapshot = useContractTradesStoreSnapshot();
   const legacyRead = useMemo<ContractTradesLegacyRead>(() => ({
@@ -263,7 +260,9 @@ export default function ContractFuturesTrades({
                   <div className="overflow-hidden text-ellipsis whitespace-nowrap text-right text-zinc-200/90">
                     {formatAmount(item.qty)}
                   </div>
-                  <div className="text-right text-zinc-400">{formatTime(item.time)}</div>
+                  <div className="text-right text-zinc-400">
+                    {formatDisplayTime(item.time, displayTimeZone, locale)}
+                  </div>
                 </button>
               );
             })}

@@ -13,11 +13,28 @@ function normalizeSymbol(value: unknown) {
   return String(value ?? '').trim().toUpperCase();
 }
 
+type ContractTpSlLiveReferenceOptions = {
+  liveBestBid?: string | number | null;
+  liveBestAsk?: string | number | null;
+  liveMarketUsable?: boolean;
+  preferLiveBbo?: boolean;
+};
+
+function resolveLiveBboMidpoint(options: ContractTpSlLiveReferenceOptions) {
+  if (!options.preferLiveBbo || !options.liveMarketUsable) return null;
+  const bid = positiveNumber(options.liveBestBid);
+  const ask = positiveNumber(options.liveBestAsk);
+  return bid !== null && ask !== null && ask >= bid ? (bid + ask) / 2 : null;
+}
+
 export function resolveContractTpSlQuoteReference(
   quote: Pick<ContractQuote, 'mark_price' | 'last_price'> | null | undefined,
   triggerPriceType: ContractTpSlTriggerPriceType,
   fallback?: string | number | null,
+  liveOptions: ContractTpSlLiveReferenceOptions = {},
 ) {
+  const liveBboMidpoint = resolveLiveBboMidpoint(liveOptions);
+  if (liveBboMidpoint !== null) return liveBboMidpoint;
   const preferred = triggerPriceType === 'LAST_PRICE' ? quote?.last_price : quote?.mark_price;
   if (positiveNumber(preferred) !== null) return preferred ?? null;
   if (positiveNumber(quote?.mark_price) !== null) return quote?.mark_price ?? null;
@@ -32,6 +49,10 @@ export function resolveContractTpSlEditorReference({
   quote,
   triggerPriceType,
   fallback,
+  liveBestBid,
+  liveBestAsk,
+  liveMarketUsable,
+  preferLiveBbo,
 }: {
   draftSymbol: string;
   positionIds: number[];
@@ -40,7 +61,7 @@ export function resolveContractTpSlEditorReference({
   quote: Pick<ContractQuote, 'mark_price' | 'last_price'> | null | undefined;
   triggerPriceType: ContractTpSlTriggerPriceType;
   fallback: string | number | null;
-}) {
+} & ContractTpSlLiveReferenceOptions) {
   const positionIdSet = new Set(positionIds.map(Number));
   const latestPosition = positions.find((position) => (
     positionIdSet.has(Number(position.id))
@@ -54,5 +75,10 @@ export function resolveContractTpSlEditorReference({
   if (normalizeSymbol(draftSymbol) !== normalizeSymbol(currentSymbol)) {
     return latestPositionMark;
   }
-  return resolveContractTpSlQuoteReference(quote, triggerPriceType, latestPositionMark);
+  return resolveContractTpSlQuoteReference(quote, triggerPriceType, latestPositionMark, {
+    liveBestBid,
+    liveBestAsk,
+    liveMarketUsable,
+    preferLiveBbo,
+  });
 }

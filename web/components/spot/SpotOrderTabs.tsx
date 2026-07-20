@@ -14,6 +14,9 @@ import {
 } from '@/lib/api/modules/spot'
 import { getRuntimeApiBaseUrl } from '@/lib/api/core/baseUrl'
 import { ApiError } from '@/lib/api/core/error'
+import { getAccessToken } from '@/lib/api/core/token'
+import { formatDisplayDateTime } from '@/lib/displayTimeZone'
+import { useDisplayTimeZone } from '@/hooks/useDisplayTimeZone'
 import { formatSpotDisplaySymbol } from './spotFormat'
 import { parseSpotPrivateWsMessage } from './spotPrivateWs'
 
@@ -90,6 +93,10 @@ const PAGE_SIZE = 10
 const OPTIMISTIC_TRADE_TTL_MS = 3000
 const REST_REVALIDATE_DEBOUNCE_MS = 500
 const CURRENT_ORDERS_NETWORK_RETRY_DELAY_MS = 1500
+const CURRENT_ORDERS_EVENT_REVALIDATE_DEBOUNCE_MS = 150
+const PRIVATE_WS_RECONNECT_BASE_DELAY_MS = 1500
+const PRIVATE_WS_RECONNECT_MAX_DELAY_MS = 15000
+const PRIVATE_WS_AUTH_PROTOCOL = 'spot-auth'
 const CANCELLABLE_STATUSES = ['OPEN', 'PARTIALLY_FILLED']
 const TERMINAL_STATUSES = ['FILLED', 'CANCELED', 'REJECTED']
 const OPEN_ORDER_STATUSES = ['OPEN', 'PARTIALLY_FILLED', 'NEW']
@@ -221,11 +228,8 @@ function toFiniteNumber(value?: string | number | null) {
   return Number.isFinite(n) ? n : 0
 }
 
-function formatTime(v?: string | null) {
-  if (!v) return '--'
-  const d = new Date(v)
-  if (Number.isNaN(d.getTime())) return '--'
-  return d.toLocaleString()
+function formatTime(v: string | null | undefined, timeZone: string, locale?: string) {
+  return formatDisplayDateTime(v, timeZone, locale)
 }
 
 function sideClass(side: string) {
@@ -280,8 +284,8 @@ function getOrderFeeFields(order: SpotOrderItem) {
   }
 }
 
-function formatRecordTime(value?: string | null) {
-  const text = formatTime(value)
+function formatRecordTime(value: string | null | undefined, timeZone: string, locale?: string) {
+  const text = formatTime(value, timeZone, locale)
   return text === '--' ? text : text.replace(/-/g, '/')
 }
 
@@ -493,14 +497,15 @@ function buildPrivateWsUrl(symbol: string) {
   const url = new URL(apiBase)
   const protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   const params = new URLSearchParams({ symbol })
-  const accessToken =
-    typeof window !== 'undefined'
-      ? window.localStorage.getItem('access_token')
-      : null
-  if (accessToken) {
-    params.set('access_token', accessToken)
-  }
   return `${protocol}//${url.host}/spot/ws/private?${params.toString()}`
+}
+
+function createPrivateWebSocket(symbol: string) {
+  const url = buildPrivateWsUrl(symbol)
+  const accessToken = getAccessToken()
+  return accessToken
+    ? new WebSocket(url, [PRIVATE_WS_AUTH_PROTOCOL, accessToken])
+    : new WebSocket(url)
 }
 
 function patchCurrentOrdersList(
@@ -757,7 +762,8 @@ export default function SpotOrderTabs({
   onLoadingChange,
   onBalanceUpdate,
 }: Props) {
-  const { t } = useLocaleContext()
+  const { t, locale } = useLocaleContext()
+  const displayTimeZone = useDisplayTimeZone()
   const { user, isLoggedIn } = useAuth()
   const displaySymbol = useMemo(() => formatSpotDisplaySymbol(symbol), [symbol])
   const pricePrecision = normalizePricePrecision(requestedPricePrecision)
@@ -786,6 +792,7 @@ export default function SpotOrderTabs({
   const restTradesRef = useRef<TradeRowItem[]>([])
   const loadingCounterRef = useRef(0)
   const currentOrdersInFlightKeyRef = useRef<string | null>(null)
+  const currentOrdersRevalidatePendingRef = useRef(false)
   const historyOrdersInFlightKeyRef = useRef<string | null>(null)
   const tradesInFlightKeyRef = useRef<string | null>(null)
   const currentOrdersRequestSeqRef = useRef(0)
@@ -823,6 +830,7 @@ export default function SpotOrderTabs({
       historyOrdersLoadedRef.current = false
       tradesLoadedRef.current = false
       currentOrdersInFlightKeyRef.current = null
+      currentOrdersRevalidatePendingRef.current = false
       historyOrdersInFlightKeyRef.current = null
       tradesInFlightKeyRef.current = null
       currentOrdersRequestSeqRef.current += 1
@@ -861,6 +869,7 @@ export default function SpotOrderTabs({
     historyOrdersLoadedRef.current = false
     tradesLoadedRef.current = false
     currentOrdersInFlightKeyRef.current = null
+    currentOrdersRevalidatePendingRef.current = false
     historyOrdersInFlightKeyRef.current = null
     tradesInFlightKeyRef.current = null
     currentOrdersRequestSeqRef.current += 1
@@ -947,6 +956,9 @@ export default function SpotOrderTabs({
   useEffect(() => {
     let dead = false
     let connectTimer: number | null = null
+    let currentOrdersEventRevalidateTimer: number | null = null
+    let reconnectAttempt = 0
+    let preOpenAuthRecoveryAttempted = false
 
     const normalizedSymbol = normalizeSymbol(symbol)
     currentSymbolRef.current = normalizedSymbol
@@ -965,6 +977,16 @@ export default function SpotOrderTabs({
       }
     }
 
+    const scheduleCurrentOrdersEventRevalidation = () => {
+      if (currentOrdersEventRevalidateTimer !== null) {
+        window.clearTimeout(currentOrdersEventRevalidateTimer)
+      }
+      currentOrdersEventRevalidateTimer = window.setTimeout(() => {
+        currentOrdersEventRevalidateTimer = null
+        void loadCurrentOrdersRef.current('ws-balance-update')
+      }, CURRENT_ORDERS_EVENT_REVALIDATE_DEBOUNCE_MS)
+    }
+
     const closeWs = () => {
       clearConnectTimer()
       clearReconnectTimer()
@@ -980,6 +1002,20 @@ export default function SpotOrderTabs({
       }
     }
 
+    const scheduleReconnect = () => {
+      if (dead || !normalizedSymbol || !isLoggedIn) return
+      clearReconnectTimer()
+      const delay = Math.min(
+        PRIVATE_WS_RECONNECT_BASE_DELAY_MS * (2 ** reconnectAttempt),
+        PRIVATE_WS_RECONNECT_MAX_DELAY_MS,
+      )
+      reconnectAttempt = Math.min(reconnectAttempt + 1, 4)
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null
+        connect()
+      }, delay)
+    }
+
     if (!normalizedSymbol || !isLoggedIn) {
       setCurrentOrders([])
       closeWs()
@@ -992,8 +1028,15 @@ export default function SpotOrderTabs({
     const connect = () => {
       if (dead || !normalizedSymbol) return
 
-      const ws = new WebSocket(buildPrivateWsUrl(normalizedSymbol))
+      const ws = createPrivateWebSocket(normalizedSymbol)
+      let opened = false
       wsRef.current = ws
+
+      ws.onopen = () => {
+        opened = true
+        reconnectAttempt = 0
+        preOpenAuthRecoveryAttempted = false
+      }
 
       ws.onmessage = (event) => {
         if (dead) return
@@ -1022,6 +1065,7 @@ export default function SpotOrderTabs({
             if (items.length > 0) {
               onBalanceUpdateRef.current?.(items)
             }
+            scheduleCurrentOrdersEventRevalidation()
             return
           }
 
@@ -1087,14 +1131,14 @@ export default function SpotOrderTabs({
 
         clearReconnectTimer()
 
-        if (event.code === 1008) {
-          console.warn('SpotOrderTabs private ws auth failed or expired')
-          return
+        if (
+          event.code === 1008 ||
+          (!opened && !preOpenAuthRecoveryAttempted)
+        ) {
+          preOpenAuthRecoveryAttempted = true
+          void loadCurrentOrdersRef.current('ws-auth-recovery')
         }
-
-        reconnectTimerRef.current = window.setTimeout(() => {
-          connect()
-        }, 1500)
+        scheduleReconnect()
       }
     }
 
@@ -1105,10 +1149,14 @@ export default function SpotOrderTabs({
 
     return () => {
       dead = true
+      if (currentOrdersEventRevalidateTimer !== null) {
+        window.clearTimeout(currentOrdersEventRevalidateTimer)
+        currentOrdersEventRevalidateTimer = null
+      }
       closeWs()
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, isLoggedIn])
+  }, [symbol, isLoggedIn, user?.id])
 
   const loadCurrentOrders = useCallback(async (
     reason = 'manual',
@@ -1129,6 +1177,7 @@ export default function SpotOrderTabs({
 
     const requestKey = `${requestSymbol}:current`
     if (currentOrdersInFlightKeyRef.current === requestKey) {
+      currentOrdersRevalidatePendingRef.current = true
       return
     }
 
@@ -1175,6 +1224,13 @@ export default function SpotOrderTabs({
       if (currentOrdersRequestSeqRef.current === requestSeq) {
         currentOrdersInFlightKeyRef.current = null
         if (shouldShowLoading) endLoading()
+        const shouldRunCoalescedRevalidation =
+          currentOrdersRevalidatePendingRef.current &&
+          requestSymbol === currentSymbolRef.current
+        currentOrdersRevalidatePendingRef.current = false
+        if (shouldRunCoalescedRevalidation) {
+          void loadCurrentOrdersRef.current('coalesced')
+        }
       }
     }
   }, [
@@ -1482,7 +1538,7 @@ export default function SpotOrderTabs({
                       className="h-8 border-b border-white/10 text-[12px] text-white/90 transition-colors hover:bg-white/5"
                     >
                       <td className="py-1.5 pr-2 text-white/65">
-                        <div className="truncate whitespace-nowrap">{formatTime(item.created_at)}</div>
+                        <div className="truncate whitespace-nowrap">{formatTime(item.created_at, displayTimeZone, locale)}</div>
                       </td>
                       <td className={`py-1.5 pr-2 font-medium ${sideClass(item.side)}`}>
                         {sideText(item.side, t)}
@@ -1544,7 +1600,12 @@ export default function SpotOrderTabs({
         </>
       ) : tab === 'history' ? (
         <>
-          <HistoryOrderRecords rows={pagedRows as SpotOrderItem[]} pricePrecision={pricePrecision} />
+          <HistoryOrderRecords
+            rows={pagedRows as SpotOrderItem[]}
+            pricePrecision={pricePrecision}
+            timeZone={displayTimeZone}
+            locale={locale}
+          />
           <RecordsFooter
             hasRows={hasRows}
             currentPage={currentPage}
@@ -1560,6 +1621,8 @@ export default function SpotOrderTabs({
             currentUserId={user?.id}
             userOrderSideMap={userOrderSideMap}
             orderFeeDisplayMap={orderFeeDisplayMap}
+            timeZone={displayTimeZone}
+            locale={locale}
           />
           <RecordsFooter
             hasRows={hasRows}
@@ -1573,7 +1636,17 @@ export default function SpotOrderTabs({
   )
 }
 
-function HistoryOrderRecords({ rows, pricePrecision }: { rows: SpotOrderItem[]; pricePrecision: number }) {
+function HistoryOrderRecords({
+  rows,
+  pricePrecision,
+  timeZone,
+  locale,
+}: {
+  rows: SpotOrderItem[]
+  pricePrecision: number
+  timeZone: string
+  locale?: string
+}) {
   const { t } = useLocaleContext()
   if (rows.length === 0) return null
 
@@ -1615,7 +1688,7 @@ function HistoryOrderRecords({ rows, pricePrecision }: { rows: SpotOrderItem[]; 
                   <span className="font-medium tabular-nums text-white/60" title={feeDisplay.title || undefined}>
                     {feeDisplay.main}
                   </span>
-                  <span>{formatRecordTime(item.updated_at || item.created_at)}</span>
+                  <span>{formatRecordTime(item.updated_at || item.created_at, timeZone, locale)}</span>
                 </div>
               </div>
             </div>
@@ -1632,12 +1705,16 @@ function TradeRecords({
   currentUserId,
   userOrderSideMap,
   orderFeeDisplayMap,
+  timeZone,
+  locale,
 }: {
   rows: TradeRowItem[]
   pricePrecision: number
   currentUserId?: number | string | null
   userOrderSideMap: Map<string, TradeDirection>
   orderFeeDisplayMap: Map<string, string>
+  timeZone: string
+  locale?: string
 }) {
   const { t } = useLocaleContext()
   if (rows.length === 0) return null
@@ -1691,7 +1768,7 @@ function TradeRecords({
                   <span className="text-[12px] text-[#f0b90b]">{t('fee', 'asset')}</span>
                   <span className="tabular-nums font-medium text-white/60">{feeDisplay}</span>
                 </div>
-                <span>{formatRecordTime(item.created_at)}</span>
+                <span>{formatRecordTime(item.created_at, timeZone, locale)}</span>
               </div>
             </div>
           </div>

@@ -8,6 +8,8 @@ import AssetSidebar from '@/components/asset/AssetSidebar';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import { useAuth } from '@/lib/authContext';
 import { privateQueryKey } from '@/lib/authPrivateQueries';
+import { useDisplayTimeZone } from '@/hooks/useDisplayTimeZone';
+import { formatDisplayDateTime } from '@/lib/displayTimeZone';
 import {
   cancelSpotOrder,
   getSpotCurrentOrders,
@@ -118,17 +120,6 @@ function statusClass(status: string) {
 function isCurrentOrder(item: SpotOrderItem) {
   const status = normalizeText(item.status);
   return status === 'OPEN' || status === 'PARTIALLY_FILLED';
-}
-
-function formatDateTime(value?: string | null) {
-  if (!value) return '--';
-  const text = String(value).trim();
-  if (!text) return '--';
-  return text
-    .replace('T', ' ')
-    .replace(/\.\d+Z?$/, '')
-    .replace(/Z$/, '')
-    .slice(0, 19);
 }
 
 function formatSpotTradeFee(item: SpotTradeItem) {
@@ -452,7 +443,8 @@ function SpotOrdersTable({
   cancelingId?: number;
   onCancel: (orderId: number) => void;
 }) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
 
   if (loading) return <div className="py-12 text-center text-white/55">{t('loadingSpotOrders', 'asset')}</div>;
   if (error) return <div className="py-12 text-center text-[#f6465d]">{t('spotOrdersLoadFailed', 'asset')}</div>;
@@ -502,7 +494,7 @@ function SpotOrdersTable({
                   {statusLabel(item.status, t)}
                 </span>
               </td>
-              <td className="py-3 text-right text-white/55">{formatDateTime(item.created_at)}</td>
+              <td className="py-3 text-right text-white/55">{formatDisplayDateTime(item.created_at, displayTimeZone, locale)}</td>
               {tab === 'current' ? (
                 <td className="py-3 text-right">
                   <button
@@ -534,7 +526,8 @@ function SpotTradesTable({
   loading?: boolean;
   error?: boolean;
 }) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
 
   if (loading) return <div className="py-12 text-center text-white/55">{t('loadingSpotTrades', 'asset')}</div>;
   if (error) return <div className="py-12 text-center text-[#f6465d]">{t('spotTradesLoadFailed', 'asset')}</div>;
@@ -565,7 +558,7 @@ function SpotTradesTable({
                 <td className="py-3 text-right tabular-nums text-white">{formatNum(item.amount)}</td>
                 <td className="py-3 text-right tabular-nums text-white/70">{formatNum(item.quote_amount)}</td>
                 <td className="py-3 text-right tabular-nums text-white/70">{formatSpotTradeFee(item)}</td>
-                <td className="py-3 text-right text-white/55">{formatDateTime(item.created_at)}</td>
+                <td className="py-3 text-right text-white/55">{formatDisplayDateTime(item.created_at, displayTimeZone, locale)}</td>
               </tr>
             );
           })}

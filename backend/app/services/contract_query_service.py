@@ -10,6 +10,7 @@ from typing import Any, Iterator, Optional
 from sqlalchemy import inspect
 from sqlalchemy.orm import Session, load_only
 
+from app.core.datetime_utils import utc_isoformat
 from app.db.models.contract_order import ContractOrder
 from app.db.models.contract_position import ContractPosition
 from app.db.models.contract_symbol import ContractSymbol
@@ -62,12 +63,21 @@ _POSITION_MARK_EVIDENCE_CACHE: ContextVar[Optional[dict[str, ContractPositionMar
 
 
 @contextmanager
-def contract_position_mark_evidence_scope() -> Iterator[dict[str, ContractPositionMarkEvidence]]:
+def contract_position_mark_evidence_scope(
+    initial: Optional[dict[str, ContractPositionMarkEvidence]] = None,
+) -> Iterator[dict[str, ContractPositionMarkEvidence]]:
     existing = _POSITION_MARK_EVIDENCE_CACHE.get()
     if existing is not None:
+        if initial:
+            for symbol, evidence in initial.items():
+                existing.setdefault(_normalize_symbol(symbol), evidence)
         yield existing
         return
-    cache: dict[str, ContractPositionMarkEvidence] = {}
+    cache: dict[str, ContractPositionMarkEvidence] = {
+        _normalize_symbol(symbol): evidence
+        for symbol, evidence in (initial or {}).items()
+        if _normalize_symbol(symbol)
+    }
     token = _POSITION_MARK_EVIDENCE_CACHE.set(cache)
     try:
         yield cache
@@ -157,9 +167,7 @@ def _table_has_column(db: Session, table_name: str, column_name: str) -> bool:
 
 
 def _fmt_datetime(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    return value.isoformat()
+    return utc_isoformat(value)
 
 
 def _position_pnl_from_mark(

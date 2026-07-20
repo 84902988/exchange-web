@@ -117,6 +117,33 @@ def test_live_tradable_crypto_requires_fresh_bbo():
     assert view["execution_mode"] == "LIVE_BBO"
 
 
+def test_live_crypto_depth_bbo_is_not_disabled_by_a_stale_ticker_domain():
+    view = build_contract_market_view(
+        "BTCUSDT_PERP",
+        quote=_quote(
+            quote_freshness="STALE",
+            bid_price="99",
+            ask_price="103",
+            executable=False,
+        ),
+        depth=_depth(
+            quote_freshness="LIVE",
+            best_bid="100",
+            best_ask="102",
+            executable=True,
+        ),
+        contract_symbol=_contract(),
+        now=NOW,
+    )
+
+    assert view["display_state"] == "LIVE_TRADABLE"
+    assert view["display_price"] == "101"
+    assert view["executable"] is True
+    assert view["execution_bid"] == "100"
+    assert view["execution_ask"] == "102"
+    assert view["reason_code"] == "LIVE_BBO"
+
+
 def test_live_tradfi_bbo_display_price_is_not_overwritten_by_kline_close():
     view = build_contract_market_view(
         "XAGUSDT_PERP",
@@ -152,6 +179,53 @@ def test_live_tradfi_bbo_display_price_is_not_overwritten_by_kline_close():
     assert view["execution_bid"] == "60.120"
     assert view["execution_ask"] == "60.130"
     assert view["raw_source_summary"]["latest_kline_close"] == "60.049"
+
+
+def test_live_tradfi_depth_bbo_is_not_disabled_by_a_stale_ticker_domain():
+    view = build_contract_market_view(
+        "XAGUSDT_PERP",
+        quote=_quote(
+            symbol="XAGUSDT_PERP",
+            provider="ITICK",
+            category="METAL",
+            quote_source="LIVE_WS",
+            source="LIVE_WS",
+            quote_freshness="STALE",
+            bid_price="60.100",
+            ask_price="60.150",
+            executable=False,
+        ),
+        depth=_depth(
+            symbol="XAGUSDT_PERP",
+            provider="ITICK",
+            category="METAL",
+            quote_source="LIVE_WS",
+            source="LIVE_WS",
+            quote_freshness="LIVE",
+            best_bid="60.120",
+            best_ask="60.130",
+            executable=True,
+        ),
+        latest_trade={
+            "price": "60.127",
+            "price_source": "TRADE_TICK",
+            "source": "LIVE_WS",
+            "quote_freshness": "LIVE",
+            "time": int((NOW - timedelta(milliseconds=100)).timestamp() * 1000),
+        },
+        contract_symbol=_contract(symbol="XAGUSDT_PERP", category="METAL", provider="ITICK"),
+        now=NOW,
+    )
+
+    assert view["display_state"] == "LIVE_TRADABLE"
+    assert view["display_price"] == "60.127"
+    assert view["display_price_source"] == "TRADE_TICK"
+    assert view["executable"] is True
+    assert view["execution_bid"] == "60.120"
+    assert view["execution_ask"] == "60.130"
+    assert view["execution_mode"] == "LIVE_BBO"
+    assert view["reason_code"] == "LIVE_BBO"
+    assert view["raw_source_summary"]["executable"] is True
 
 
 def test_tradfi_current_candle_uses_provider_bucket_not_server_now():

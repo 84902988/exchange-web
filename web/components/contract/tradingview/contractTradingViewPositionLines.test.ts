@@ -31,6 +31,14 @@ function settlePositionLineQueue(delayMs = 320) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
+async function waitForPositionLineState(predicate: () => boolean, timeoutMs = 1_500) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for position-line controller state');
+    await settlePositionLineQueue(10);
+  }
+}
+
 describe('buildContractTradingViewPositionLines', () => {
   it('builds entry, take-profit and stop-loss lines only for the active open symbol', () => {
     expect(buildContractTradingViewPositionLines([
@@ -93,7 +101,7 @@ describe('ContractTradingViewPositionLinesController', () => {
     const controller = new ContractTradingViewPositionLinesController(chart);
 
     controller.update('BTCUSDT_PERP', buildContractTradingViewPositionLines([position()], 'BTCUSDT_PERP'));
-    await settlePositionLineQueue();
+    await waitForPositionLineState(() => shapes.size === 3);
 
     expect(maxInFlight).toBe(1);
     expect(nextId).toBe(3);
@@ -121,7 +129,10 @@ describe('ContractTradingViewPositionLinesController', () => {
     const controller = new ContractTradingViewPositionLinesController(chart);
 
     controller.update('BTCUSDT_PERP', buildContractTradingViewPositionLines([position()], 'BTCUSDT_PERP'));
-    await settlePositionLineQueue();
+    await waitForPositionLineState(() => (
+      createdAt.length === 3
+      && Array.from(points.values()).map((value) => value[0]?.price).sort((a, b) => a - b).join(',') === '90,100,110'
+    ));
 
     expect(createdAt).toEqual([100, 100, 100]);
     expect(Array.from(points.values()).map((value) => value[0].price).sort((a, b) => a - b)).toEqual([90, 100, 110]);
@@ -144,6 +155,65 @@ describe('ContractTradingViewPositionLinesController', () => {
     await settlePositionLineQueue(260);
 
     expect(attempts).toBe(2);
+  });
+
+  it('waits for a newly-created TradingView shape handle instead of recreating the drawing', async () => {
+    let createAttempts = 0;
+    let lookupAttempts = 0;
+    let appliedPrice = 0;
+    const chart = {
+      createShape: async () => {
+        createAttempts += 1;
+        return 7;
+      },
+      getShapeById: () => {
+        lookupAttempts += 1;
+        if (lookupAttempts < 3) throw new Error('shape handle is not ready');
+        return {
+          getPoints: () => [{ time: 1, price: 100 }],
+          setPoints: (points: Array<{ time: number; price: number }>) => {
+            appliedPrice = points[0]?.price || 0;
+          },
+        };
+      },
+      removeEntity: () => undefined,
+    };
+    const controller = new ContractTradingViewPositionLinesController(chart);
+
+    controller.update('BTCUSDT_PERP', [{ key: '7:TP', kind: 'TAKE_PROFIT', price: 110, text: 'BUY TP' }]);
+    await settlePositionLineQueue(500);
+
+    expect(createAttempts).toBe(1);
+    expect(lookupAttempts).toBe(3);
+    expect(appliedPrice).toBe(110);
+  });
+
+  it('moves TP and SL only after TradingView has committed the anchored shape', async () => {
+    let nextId = 0;
+    const createdAt = new Map<number, number>();
+    const points = new Map<number, Array<{ time: number; price: number }>>();
+    const chart = {
+      createShape: async (point: { time: number; price: number }) => {
+        const id = ++nextId;
+        createdAt.set(id, Date.now());
+        points.set(id, [point]);
+        return id;
+      },
+      getShapeById: (entityId: ContractTradingViewOverlayEntityId) => ({
+        getPoints: () => points.get(Number(entityId)) || [],
+        setPoints: (nextPoints: Array<{ time: number; price: number }>) => {
+          const ageMs = Date.now() - (createdAt.get(Number(entityId)) || 0);
+          if (ageMs >= 100) points.set(Number(entityId), nextPoints);
+        },
+      }),
+      removeEntity: () => undefined,
+    };
+    const controller = new ContractTradingViewPositionLinesController(chart);
+
+    controller.update('BTCUSDT_PERP', buildContractTradingViewPositionLines([position()], 'BTCUSDT_PERP'));
+    await settlePositionLineQueue(700);
+
+    expect(Array.from(points.values()).map((value) => value[0].price).sort((a, b) => a - b)).toEqual([90, 100, 110]);
   });
 
   it('rejects duplicate TradingView entity ids and retries until every position line owns one entity', async () => {

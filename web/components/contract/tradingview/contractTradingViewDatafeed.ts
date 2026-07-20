@@ -46,6 +46,8 @@ import type { KlineLifecycleRearmPermit } from '@/components/tradingview/klineLi
 
 export type ContractTradingViewResolution = '1' | '5' | '15' | '30' | '60' | '240' | '1D' | '1W' | '1M';
 
+const CONTRACT_CANDLE_PREVIEW_PROVIDERS = new Set(['OKX_SWAP', 'ITICK']);
+
 export type ContractTradingViewBar = {
   time: number;
   open: number;
@@ -533,7 +535,9 @@ export function realtimePreviewMessageToInput(
   const interval = normalizeContractInterval(String(message.interval || payload.interval || ''));
   if (symbol !== normalizeContractSymbol(expectedSymbol)) return null;
   if (interval !== normalizeContractInterval(expectedInterval)) return null;
-  if (String(message.provider || payload.provider || '').trim().toUpperCase() !== 'OKX_SWAP') {
+  if (!CONTRACT_CANDLE_PREVIEW_PROVIDERS.has(
+    String(message.provider || payload.provider || '').trim().toUpperCase(),
+  )) {
     return null;
   }
   if (String(message.source || payload.source || '').trim().toUpperCase() !== 'TRADE_PREVIEW') {

@@ -28,6 +28,9 @@ const POSITION_LINE_STYLE: Record<ContractTradingViewPositionLineKind, { color: 
 const POSITION_LINE_CREATE_RETRY_LIMIT = 3;
 const POSITION_LINE_INITIAL_CREATE_DELAY_MS = 80;
 const POSITION_LINE_RETRY_DELAY_MS = 120;
+const POSITION_LINE_APPLY_READY_ATTEMPTS = 5;
+const POSITION_LINE_APPLY_INITIAL_DELAY_MS = 120;
+const POSITION_LINE_APPLY_READY_DELAY_MS = 60;
 
 function waitForPositionLineCreate(delayMs: number) {
   return new Promise<void>((resolve) => {
@@ -273,11 +276,13 @@ export class ContractTradingViewPositionLinesController {
         this.removeEntity(entityId);
         return;
       }
-      this.entities.set(key, { id: entityId, renderKey: lineRenderKey(line) });
-      if (!this.apply(entityId, desiredLine)) {
+      const applied = await this.applyWhenReady(key, entityId, generation, desiredLine);
+      if (!applied) {
         this.entities.delete(key);
         this.removeEntity(entityId);
-        this.retryCreate(key);
+        if (!this.destroyed && generation === this.scopeGeneration && this.desired.has(key)) {
+          this.retryCreate(key);
+        }
         return;
       }
       this.createAttempts.delete(key);
@@ -286,6 +291,26 @@ export class ContractTradingViewPositionLinesController {
       if (this.destroyed || generation !== this.scopeGeneration || !this.desired.has(key)) return;
       this.retryCreate(key);
     }
+  }
+
+  private async applyWhenReady(
+    key: string,
+    entityId: ContractTradingViewOverlayEntityId,
+    generation: number,
+    fallbackLine: ContractTradingViewPositionLine,
+  ) {
+    if (fallbackLine.kind !== 'ENTRY') {
+      await waitForPositionLineCreate(POSITION_LINE_APPLY_INITIAL_DELAY_MS);
+    }
+    for (let attempt = 0; attempt < POSITION_LINE_APPLY_READY_ATTEMPTS; attempt += 1) {
+      if (this.destroyed || generation !== this.scopeGeneration || !this.desired.has(key)) return false;
+      const line = this.desired.get(key) || fallbackLine;
+      if (this.apply(entityId, line)) return true;
+      if (attempt + 1 < POSITION_LINE_APPLY_READY_ATTEMPTS) {
+        await waitForPositionLineCreate(POSITION_LINE_APPLY_READY_DELAY_MS * (attempt + 1));
+      }
+    }
+    return false;
   }
 
   private hasEntityId(entityId: ContractTradingViewOverlayEntityId) {

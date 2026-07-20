@@ -223,6 +223,82 @@ def test_legacy_subscribe_still_uses_full_snapshot() -> None:
     asyncio.run(scenario())
 
 
+def test_domain_subscribe_prewarms_gateway_before_snapshot() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+
+        class OrderedManager(ManagerStub):
+            async def subscribe_domain(self, *args: Any, **kwargs: Any) -> None:
+                events.append("subscribe")
+                await super().subscribe_domain(*args, **kwargs)
+
+            async def send_to_one(self, *args: Any, **kwargs: Any) -> None:
+                events.append("send")
+                await super().send_to_one(*args, **kwargs)
+
+        class OrderedGateway(GatewayStub):
+            async def ensure_symbol(self, symbol: str) -> None:
+                events.append("ensure")
+                await super().ensure_symbol(symbol)
+
+            async def market_snapshot(self, symbol: str) -> dict[str, Any]:
+                events.append("snapshot")
+                return await super().market_snapshot(symbol)
+
+        result = await handle_contract_ws_domain_command(
+            action="subscribe",
+            payload={"op": "subscribe", "domain": "market", "symbol": "BTCUSDT_PERP"},
+            websocket=object(),
+            manager=OrderedManager(),
+            gateway=OrderedGateway(),
+            connected_symbol="BTCUSDT_PERP",
+            connected_interval="1m",
+        )
+
+        assert result == ("BTCUSDT_PERP", "1m")
+        assert events == ["subscribe", "ensure", "snapshot", "send"]
+
+    asyncio.run(scenario())
+
+
+def test_legacy_subscribe_prewarms_gateway_before_snapshot() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+
+        class OrderedManager(ManagerStub):
+            async def connect(self, *args: Any, **kwargs: Any) -> None:
+                events.append("connect")
+                await super().connect(*args, **kwargs)
+
+            async def send_to_one(self, *args: Any, **kwargs: Any) -> None:
+                events.append("send")
+                await super().send_to_one(*args, **kwargs)
+
+        class OrderedGateway(GatewayStub):
+            async def ensure_symbol(self, symbol: str) -> None:
+                events.append("ensure")
+                await super().ensure_symbol(symbol)
+
+            async def snapshot(self, symbol: str, interval: str) -> dict[str, Any]:
+                events.append("snapshot")
+                return await super().snapshot(symbol, interval)
+
+        result = await handle_contract_ws_legacy_subscribe(
+            action="subscribe",
+            payload={"type": "subscribe", "symbol": "BTCUSDT_PERP", "interval": "1m"},
+            websocket=object(),
+            manager=OrderedManager(),
+            gateway=OrderedGateway(),
+            connected_symbol="BTCUSDT_PERP",
+            connected_interval="1m",
+        )
+
+        assert result == ("BTCUSDT_PERP", "1m")
+        assert events == ["connect", "ensure", "snapshot", "send"]
+
+    asyncio.run(scenario())
+
+
 def test_public_ws_treats_disconnect_during_domain_snapshot_as_normal_cleanup() -> None:
     class DisconnectingWebSocket:
         def __init__(self) -> None:
@@ -284,8 +360,72 @@ def test_public_ws_treats_disconnect_during_domain_snapshot_as_normal_cleanup() 
         assert websocket.receive_count == 1
         assert manager.send_count == 2
         assert manager.disconnect_count == 1
-        assert gateway.ensure_calls == ["BTCUSDT_PERP"]
+        assert gateway.ensure_calls == ["BTCUSDT_PERP", "BTCUSDT_PERP"]
         assert gateway.release_calls == ["BTCUSDT_PERP"]
+
+    asyncio.run(scenario())
+
+
+def test_public_ws_prewarms_gateway_before_initial_snapshot() -> None:
+    class DisconnectingWebSocket:
+        async def receive(self) -> dict[str, Any]:
+            raise WebSocketDisconnect(code=1000)
+
+    async def scenario() -> None:
+        events: list[str] = []
+
+        class OrderedManager(ManagerStub):
+            async def connect(
+                self,
+                symbol: str,
+                _websocket: Any,
+                *,
+                interval: str | None = None,
+                accepted: bool = False,
+                legacy: bool = True,
+            ) -> None:
+                events.append("connect")
+                self.legacy_calls.append((symbol, interval, legacy))
+
+            async def send_to_one(self, *args: Any, **kwargs: Any) -> None:
+                events.append("send")
+                await super().send_to_one(*args, **kwargs)
+
+            async def disconnect(self, _websocket: Any) -> str:
+                events.append("disconnect")
+                return "BTCUSDT_PERP"
+
+        class OrderedGateway(GatewayStub):
+            async def ensure_symbol(self, symbol: str) -> None:
+                events.append("ensure")
+                await super().ensure_symbol(symbol)
+
+            async def snapshot(self, symbol: str, interval: str) -> dict[str, Any]:
+                events.append("snapshot")
+                return await super().snapshot(symbol, interval)
+
+            async def release_symbol_if_idle(self, symbol: str) -> None:
+                events.append("release")
+                await super().release_symbol_if_idle(symbol)
+
+        with (
+            patch.object(contract_market_router, "contract_market_ws_manager", OrderedManager()),
+            patch.object(contract_market_router, "contract_market_gateway", OrderedGateway()),
+        ):
+            await contract_market_router.contract_market_public_ws(
+                DisconnectingWebSocket(),
+                symbol="BTCUSDT_PERP",
+                interval="1m",
+            )
+
+        assert events == [
+            "connect",
+            "ensure",
+            "snapshot",
+            "send",
+            "disconnect",
+            "release",
+        ]
 
     asyncio.run(scenario())
 

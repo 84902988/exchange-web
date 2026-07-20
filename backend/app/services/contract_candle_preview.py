@@ -7,9 +7,15 @@ from threading import RLock
 from typing import Any, Mapping
 
 
-SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS = frozenset({"1m"})
+_CONTRACT_CANDLE_PREVIEW_INTERVAL_MS = {
+    "1m": 60_000,
+    "5m": 5 * 60_000,
+}
+SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS = frozenset(
+    _CONTRACT_CANDLE_PREVIEW_INTERVAL_MS
+)
 CONTRACT_CANDLE_PREVIEW_PROVIDER = "OKX_SWAP"
-_MINUTE_MS = 60_000
+CONTRACT_CANDLE_PREVIEW_PROVIDERS = frozenset({"OKX_SWAP", "ITICK"})
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -81,11 +87,12 @@ def _required_bool(value: Any, *, field: str) -> bool:
 
 
 def contract_candle_bucket_start_ms(event_time_ms: Any, interval: Any) -> int:
-    _supported_interval(interval)
+    normalized_interval = _supported_interval(interval)
     timestamp_ms = _nonnegative_int(event_time_ms, field="event_time_ms")
     if timestamp_ms <= 0:
         raise ValueError("event_time_ms must be positive")
-    return (timestamp_ms // _MINUTE_MS) * _MINUTE_MS
+    interval_ms = _CONTRACT_CANDLE_PREVIEW_INTERVAL_MS[normalized_interval]
+    return (timestamp_ms // interval_ms) * interval_ms
 
 
 @dataclass(frozen=True)
@@ -222,6 +229,7 @@ class _ActivePreviewState:
     baseline: ContractNativeKlineRevision
     preview: ContractCandlePreview
     trade_seeded_rollover: bool = False
+    last_trade_event_time_ms: int | None = None
 
 
 def normalize_contract_native_kline_revision(
@@ -317,7 +325,7 @@ def normalize_contract_accepted_trade(
 
 
 class ContractCandlePreviewEngine:
-    """Native-baselined Contract preview built only from accepted OKX trades."""
+    """Native-baselined Contract preview built from accepted provider trades."""
 
     def __init__(self) -> None:
         self._states: dict[tuple[str, str], _ActivePreviewState] = {}
@@ -339,7 +347,7 @@ class ContractCandlePreviewEngine:
         state_key = (revision.symbol, revision.interval)
         with self._lock:
             current = self._states.get(state_key)
-            if revision.provider != CONTRACT_CANDLE_PREVIEW_PROVIDER:
+            if revision.provider not in CONTRACT_CANDLE_PREVIEW_PROVIDERS:
                 anchor = self._rollover_anchors.get(state_key)
                 switched = (
                     current is not None and current.baseline.provider != revision.provider
@@ -459,7 +467,21 @@ class ContractCandlePreviewEngine:
                         else previous_quote_volume
                     ),
                 )
-            self._states[state_key] = _ActivePreviewState(revision, preview)
+            preserve_trade_high_water = (
+                current is not None
+                and current.baseline.provider == revision.provider
+                and current.baseline.open_time == revision.open_time
+                and current.baseline.generation == revision.generation
+            )
+            self._states[state_key] = _ActivePreviewState(
+                revision,
+                preview,
+                last_trade_event_time_ms=(
+                    current.last_trade_event_time_ms
+                    if preserve_trade_high_water and current is not None
+                    else None
+                ),
+            )
             self._rollover_anchors[state_key] = revision
             return ContractNativePreviewResult(status, revision, preview)
 
@@ -569,7 +591,7 @@ class ContractCandlePreviewEngine:
                     current.preview,
                 )
             if (
-                trade.provider != CONTRACT_CANDLE_PREVIEW_PROVIDER
+                trade.provider not in CONTRACT_CANDLE_PREVIEW_PROVIDERS
                 or trade.provider != current.baseline.provider
             ):
                 return ContractPreviewTradeResult(
@@ -610,17 +632,23 @@ class ContractCandlePreviewEngine:
             quote_volume = current.preview.quote_volume
             if quote_volume is not None:
                 quote_volume += trade.price * trade.size
+            advances_close = (
+                current.last_trade_event_time_ms is None
+                or trade.event_time_ms >= current.last_trade_event_time_ms
+            )
             next_preview = replace(
                 current.preview,
                 high=max(current.preview.high, trade.price),
                 low=min(current.preview.low, trade.price),
-                close=trade.price,
+                close=trade.price if advances_close else current.preview.close,
                 volume=current.preview.volume + trade.size,
                 quote_volume=quote_volume,
                 preview_sequence=current.preview.preview_sequence + 1,
                 applied_trade_count=current.preview.applied_trade_count + 1,
             )
             current.preview = next_preview
+            if advances_close:
+                current.last_trade_event_time_ms = trade.event_time_ms
             self._seen_trades[trade.identity] = trade.content_signature
             return ContractPreviewTradeResult(
                 ContractPreviewTradeStatus.APPLIED,
@@ -641,10 +669,11 @@ class ContractCandlePreviewEngine:
         )
         if (
             anchor is None
-            or trade.provider != CONTRACT_CANDLE_PREVIEW_PROVIDER
+            or trade.provider not in CONTRACT_CANDLE_PREVIEW_PROVIDERS
             or trade.provider != anchor.provider
             or trade.generation != anchor.generation
-            or trade.open_time != anchor.open_time + _MINUTE_MS
+            or trade.open_time
+            != anchor.open_time + _CONTRACT_CANDLE_PREVIEW_INTERVAL_MS[trade.interval]
         ):
             return None
 
@@ -696,6 +725,7 @@ class ContractCandlePreviewEngine:
             baseline=synthetic_baseline,
             preview=preview,
             trade_seeded_rollover=True,
+            last_trade_event_time_ms=trade.event_time_ms,
         )
         self._states[state_key] = seeded
         self._seen_trades[trade.identity] = trade.content_signature
@@ -738,6 +768,7 @@ class ContractCandlePreviewEngine:
 
 __all__ = [
     "CONTRACT_CANDLE_PREVIEW_PROVIDER",
+    "CONTRACT_CANDLE_PREVIEW_PROVIDERS",
     "SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS",
     "ContractAcceptedTrade",
     "ContractCandlePreview",

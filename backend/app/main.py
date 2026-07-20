@@ -591,6 +591,18 @@ def _shutdown():
             _withdraw_watcher.stop()
             logger.debug("[withdraw_watcher] stopped")
     finally:
+        try:
+            from app.services.contract_market_provider_ws import stop_contract_provider_ws
+
+            stop_contract_provider_ws()
+        except Exception:
+            logger.exception("[contract_market_provider_ws] stop failed")
+        try:
+            from app.services.spot_market_provider_ws import stop_spot_provider_ws
+
+            stop_spot_provider_ws()
+        except Exception:
+            logger.exception("[spot_market_provider_ws] stop failed")
         _withdraw_watcher = None
         _contract_tp_sl_job = None
         _contract_limit_order_job = None
