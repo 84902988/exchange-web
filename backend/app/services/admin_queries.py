@@ -10907,6 +10907,9 @@ def admin_create_contract_symbol(db: Session, payload: Dict[str, Any]) -> Dict[s
         db.rollback()
         logger.exception("admin_create_contract_symbol failed")
         return {"ok": False, "errors": ["合约品种创建失败"], "form": form}
+    from app.services.contract_symbol_runtime_lifecycle import invalidate_contract_symbol_runtime
+
+    invalidate_contract_symbol_runtime(values["symbol"])
     return {"ok": True, "errors": [], "form": form}
 
 
@@ -10958,6 +10961,9 @@ def admin_update_contract_symbol(db: Session, symbol_id: int, payload: Dict[str,
         db.rollback()
         logger.exception("admin_update_contract_symbol failed")
         return {"ok": False, "errors": ["合约品种更新失败"], "form": form}
+    from app.services.contract_symbol_runtime_lifecycle import invalidate_contract_symbol_runtime
+
+    invalidate_contract_symbol_runtime(current.get("symbol"))
     return {"ok": True, "errors": [], "form": form}
 
 
@@ -10977,6 +10983,9 @@ def admin_toggle_contract_symbol_status(db: Session, symbol_id: int) -> Dict[str
         db.rollback()
         logger.exception("admin_toggle_contract_symbol_status failed")
         return {"ok": False, "message": "合约品种状态更新失败"}
+    from app.services.contract_symbol_runtime_lifecycle import invalidate_contract_symbol_runtime
+
+    invalidate_contract_symbol_runtime(current.get("symbol"))
     return {"ok": True, "message": "合约品种已启用" if next_status == 1 else "合约品种已禁用"}
 
 

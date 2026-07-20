@@ -25,6 +25,10 @@ from app.services.contract_market_provider_service import (
     resolve_contract_provider_symbol,
 )
 from app.services.contract_ticker_evidence import resolve_contract_ticker_24h_evidence
+from app.services.contract_itick_ws_message_router import ItickWsMessageRouter
+from app.services.contract_itick_ws_subscription_plan import ItickWsSubscriptionPlan
+from app.services.contract_itick_ws_transport import ItickSharedWsTransport
+from app.services.okx_shared_ws_transport import OkxSharedWsTransport, OkxWsSubscription
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +36,7 @@ logger = logging.getLogger(__name__)
 CONTRACT_PROVIDER_WS_SOURCE = "LIVE_WS"
 PRICE_SOURCE_TRADE_TICK = "TRADE_TICK"
 PROVIDER_ITICK = "ITICK"
+_ITICK_TRADFI_WS_CATEGORIES = frozenset({"STOCK", "FOREX", "METAL", "COMMODITY", "INDEX"})
 _SUPPORTED_DEPTH_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
 _SUPPORTED_TRADES_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
 _SUPPORTED_TICKER_WS_PROVIDERS = {PROVIDER_OKX_SWAP, PROVIDER_ITICK}
@@ -46,6 +51,26 @@ _OKX_KLINE_CHANNELS = {
 }
 _PROVIDER_WS_DISCONNECT_LOG_THROTTLE_SECONDS = 30.0
 _PROVIDER_WS_DISCONNECT_LOG_LAST_AT: dict[tuple[str, str, str, str, str], float] = {}
+_OKX_WS_MESSAGE_IDLE_TIMEOUT_SECONDS = 10.0
+
+
+class ContractProviderWsIdleTimeout(TimeoutError):
+    pass
+
+
+async def _recv_okx_message_with_idle_watchdog(
+    websocket: Any,
+    *,
+    last_message_at: float,
+    idle_timeout_seconds: float = _OKX_WS_MESSAGE_IDLE_TIMEOUT_SECONDS,
+) -> tuple[Any | None, float]:
+    try:
+        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+    except asyncio.TimeoutError as exc:
+        if time.monotonic() - last_message_at >= max(1.0, float(idle_timeout_seconds)):
+            raise ContractProviderWsIdleTimeout("OKX websocket business messages became idle") from exc
+        return None, last_message_at
+    return raw_message, time.monotonic()
 
 
 def _websocket_connection_closed_types() -> tuple[type[BaseException], ...]:
@@ -307,10 +332,7 @@ def provider_ws_depth_enabled() -> bool:
 
 
 def provider_ws_itick_depth_enabled() -> bool:
-    return bool(
-        provider_ws_depth_enabled()
-        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_ENABLED", False)
-    )
+    return provider_ws_depth_enabled()
 
 
 def provider_ws_trades_enabled() -> bool:
@@ -321,11 +343,7 @@ def provider_ws_trades_enabled() -> bool:
 
 
 def provider_ws_itick_trades_enabled() -> bool:
-    return bool(
-        provider_ws_trades_enabled()
-        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_ENABLED", False)
-        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_TRADES_ENABLED", False)
-    )
+    return provider_ws_trades_enabled()
 
 
 def provider_ws_ticker_enabled() -> bool:
@@ -343,18 +361,11 @@ def provider_ws_kline_enabled() -> bool:
 
 
 def provider_ws_itick_quote_enabled() -> bool:
-    return bool(
-        provider_ws_ticker_enabled()
-        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_ENABLED", False)
-    )
+    return provider_ws_ticker_enabled()
 
 
 def provider_ws_itick_kline_enabled() -> bool:
-    return bool(
-        provider_ws_kline_enabled()
-        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_ENABLED", False)
-        and getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_KLINE_ENABLED", False)
-    )
+    return provider_ws_kline_enabled()
 
 
 def _timestamp_ms_from_value(value: Any) -> int:
@@ -387,7 +398,7 @@ def _sort_depth_side(levels: dict[str, Decimal], *, side: str, limit: int) -> li
         if price is None:
             continue
         quantity = levels.get(format(price, "f"))
-        if quantity is None or quantity <= 0:
+        if quantity is None or quantity < 0:
             continue
         rows.append([price, quantity])
         if len(rows) >= limit:
@@ -466,6 +477,182 @@ class ContractMarketProviderWsService:
             Callable[[ContractProviderKlineRevisionAccepted], None]
         ] = None
         self._lock = threading.RLock()
+        self._itick_plan = ItickWsSubscriptionPlan()
+        self._itick_router = ItickWsMessageRouter()
+        self._itick_registrations: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+        self._itick_transport = ItickSharedWsTransport(
+            plan=self._itick_plan,
+            base_url=str(getattr(settings, "CONTRACT_PROVIDER_WS_ITICK_URL", "") or ""),
+            token_provider=lambda: str(
+                getattr(settings, "ITICK_API_TOKEN", None)
+                or getattr(settings, "ITICK_API_KEY", None)
+                or ""
+            ),
+            message_handler=self._itick_router.dispatch,
+        )
+        self._okx_registrations: dict[tuple[str, str, str], tuple[OkxWsSubscription, str]] = {}
+        self._okx_transport = OkxSharedWsTransport(
+            urls={
+                "public": str(getattr(settings, "CONTRACT_PROVIDER_WS_OKX_PUBLIC_URL", "") or ""),
+                "business": str(getattr(settings, "CONTRACT_PROVIDER_WS_OKX_BUSINESS_URL", "") or ""),
+            }
+        )
+
+    def _ensure_okx_shared_subscription(self, *, stream: str, subscription: Any) -> None:
+        local_symbol = _normalize_symbol(subscription.local_symbol)
+        interval = _normalize_interval(getattr(subscription, "interval", "")) if stream == "kline" else ""
+        registration_key = (stream, local_symbol, interval)
+        with self._lock:
+            if registration_key in self._okx_registrations:
+                return
+            generation_key = (PROVIDER_OKX_SWAP, local_symbol, interval) if stream == "kline" else (PROVIDER_OKX_SWAP, local_symbol)
+            generations = {
+                "depth": self._depth_generations,
+                "trades": self._trades_generations,
+                "ticker": self._ticker_generations,
+                "kline": self._kline_generations,
+            }[stream]
+            generation = generations.get(generation_key, 0) + 1
+            generations[generation_key] = generation
+            bids: dict[str, Decimal] = {}
+            asks: dict[str, Decimal] = {}
+            handler = {
+                "depth": lambda raw: self._handle_okx_depth_message(subscription, raw, bids, asks, generation=generation),
+                "trades": lambda raw: self._handle_okx_trades_message(subscription, raw, generation=generation),
+                "ticker": lambda raw: self._handle_okx_ticker_message(subscription, raw, generation=generation),
+                "kline": lambda raw: self._handle_okx_kline_message(subscription, raw, generation=generation),
+            }[stream]
+            channel = (
+                str(subscription.channel)
+                if stream == "kline"
+                else {"depth": "books", "trades": "trades", "ticker": "tickers"}[stream]
+            )
+            endpoint = "business" if stream == "kline" else "public"
+            logical = OkxWsSubscription(endpoint, channel, subscription.provider_symbol)
+            consumer_id = f"contract:{stream}:{local_symbol}:{interval}"
+            self._okx_registrations[registration_key] = (logical, consumer_id)
+        self._okx_transport.acquire(logical, consumer_id, handler)
+
+    def _release_okx_shared_subscription(self, *, stream: str, local_symbol: str, interval: str = "") -> bool:
+        key = (stream, _normalize_symbol(local_symbol), _normalize_interval(interval) if stream == "kline" else "")
+        with self._lock:
+            registration = self._okx_registrations.pop(key, None)
+        if registration is None:
+            return False
+        logical, consumer_id = registration
+        self._okx_transport.release(logical, consumer_id)
+        return True
+
+    @staticmethod
+    def _itick_market_from_url(ws_url: Optional[str]) -> str:
+        market = str(ws_url or "").strip().rstrip("/").rsplit("/", 1)[-1].lower()
+        return ItickWsSubscriptionPlan.normalize_market(market)
+
+    def _ensure_itick_shared_subscription(
+        self,
+        *,
+        stream: str,
+        local_symbol: str,
+        ws_symbol: str,
+        ws_url: Optional[str],
+        subscription: Any,
+    ) -> None:
+        market = self._itick_market_from_url(ws_url)
+        normalized_local = _normalize_symbol(local_symbol)
+        normalized_stream = str(stream or "").strip().lower()
+        registration_key = (normalized_stream, normalized_local, getattr(subscription, "interval", "") or "")
+        consumer_id = ":".join(part for part in registration_key if part)
+        with self._lock:
+            if registration_key in self._itick_registrations:
+                return
+            if normalized_stream == "depth":
+                generation_key = (PROVIDER_ITICK, normalized_local)
+                generations = self._depth_generations
+            elif normalized_stream == "tick":
+                generation_key = (PROVIDER_ITICK, normalized_local)
+                generations = self._trades_generations
+            elif normalized_stream == "quote":
+                generation_key = (PROVIDER_ITICK, normalized_local)
+                generations = self._ticker_generations
+            elif normalized_stream == "kline@1":
+                generation_key = (
+                    PROVIDER_ITICK,
+                    normalized_local,
+                    _normalize_interval(getattr(subscription, "interval", "")),
+                )
+                generations = self._kline_generations
+            else:
+                raise ValueError(f"unsupported shared iTick stream: {normalized_stream}")
+            generation = generations.get(generation_key, 0) + 1
+            generations[generation_key] = generation
+            handler = {
+                "depth": lambda raw: self._handle_itick_depth_message(
+                    subscription, raw, generation=generation
+                ),
+                "tick": lambda raw: self._handle_itick_trades_message(
+                    subscription, raw, generation=generation
+                ),
+                "quote": lambda raw: self._handle_itick_ticker_message(
+                    subscription, raw, generation=generation
+                ),
+                "kline@1": lambda raw: self._handle_itick_kline_message(
+                    subscription, raw, generation=generation
+                ),
+            }[normalized_stream]
+            self._itick_router.register(
+                market=market,
+                provider_symbol=ws_symbol,
+                stream=normalized_stream,
+                consumer_id=consumer_id,
+                handler=handler,
+            )
+            self._itick_plan.acquire(market=market, symbol=ws_symbol, stream=normalized_stream)
+            self._itick_registrations[registration_key] = (market, ws_symbol, consumer_id)
+        self._itick_transport.notify(market)
+
+    def _release_itick_shared_subscription(
+        self,
+        *,
+        stream: str,
+        local_symbol: str,
+        interval: str = "",
+    ) -> bool:
+        registration_key = (
+            str(stream or "").strip().lower(),
+            _normalize_symbol(local_symbol),
+            _normalize_interval(interval) if interval else "",
+        )
+        with self._lock:
+            registration = self._itick_registrations.pop(registration_key, None)
+            if registration is None:
+                return False
+            market, ws_symbol, consumer_id = registration
+            self._retire_itick_shared_generation(registration_key)
+            self._itick_router.unregister(
+                market=market,
+                provider_symbol=ws_symbol,
+                stream=registration_key[0],
+                consumer_id=consumer_id,
+            )
+            self._itick_plan.release(market=market, symbol=ws_symbol, stream=registration_key[0])
+        self._itick_transport.notify(market)
+        return True
+
+    def _retire_itick_shared_generation(self, registration_key: tuple[str, str, str]) -> None:
+        stream, local_symbol, interval = registration_key
+        if stream == "depth":
+            generation_key = (PROVIDER_ITICK, local_symbol)
+            generations = self._depth_generations
+        elif stream == "tick":
+            generation_key = (PROVIDER_ITICK, local_symbol)
+            generations = self._trades_generations
+        elif stream == "quote":
+            generation_key = (PROVIDER_ITICK, local_symbol)
+            generations = self._ticker_generations
+        else:
+            generation_key = (PROVIDER_ITICK, local_symbol, interval)
+            generations = self._kline_generations
+        generations[generation_key] = generations.get(generation_key, 0) + 1
 
     def set_kline_revision_listener(
         self,
@@ -662,7 +849,7 @@ class ContractMarketProviderWsService:
             return None
         provider_code = _normalize_symbol(getattr(contract_symbol, "provider", None))
         category = _normalize_contract_category(getattr(contract_symbol, "category", None))
-        if provider_code != PROVIDER_ITICK or category != "STOCK":
+        if provider_code != PROVIDER_ITICK or category not in _ITICK_TRADFI_WS_CATEGORIES:
             return None
         provider_symbol = _normalize_symbol(
             getattr(contract_symbol, "provider_symbol", None)
@@ -704,7 +891,7 @@ class ContractMarketProviderWsService:
             return None
         provider_code = _normalize_symbol(getattr(contract_symbol, "provider", None))
         category = _normalize_contract_category(getattr(contract_symbol, "category", None))
-        if provider_code != PROVIDER_ITICK or category != "STOCK":
+        if provider_code != PROVIDER_ITICK or category not in _ITICK_TRADFI_WS_CATEGORIES:
             return None
         provider_symbol = _normalize_symbol(
             getattr(contract_symbol, "provider_symbol", None)
@@ -1074,6 +1261,29 @@ class ContractMarketProviderWsService:
         if provider_code not in _SUPPORTED_DEPTH_WS_PROVIDERS:
             logger.debug("contract_provider_ws_depth_unsupported provider=%s symbol=%s", provider_code, normalized_symbol)
             return
+        if provider_code == PROVIDER_ITICK:
+            subscription = ProviderDepthSubscription(
+                local_symbol=normalized_symbol,
+                provider=provider_code,
+                provider_symbol=normalized_provider_symbol,
+                depth_limit=max(5, min(int(depth_limit or 20), 100)),
+                ws_symbol=_normalize_symbol(ws_symbol or provider_symbol),
+                ws_url=str(ws_url or "").strip() or None,
+            )
+            self._ensure_itick_shared_subscription(
+                stream="depth",
+                local_symbol=normalized_symbol,
+                ws_symbol=subscription.ws_symbol or normalized_provider_symbol,
+                ws_url=subscription.ws_url,
+                subscription=subscription,
+            )
+            return
+        if provider_code == PROVIDER_OKX_SWAP:
+            self._ensure_okx_shared_subscription(
+                stream="depth",
+                subscription=ProviderDepthSubscription(normalized_symbol, provider_code, normalized_provider_symbol, max(5, min(int(depth_limit or 20), 100))),
+            )
+            return
         key = (provider_code, normalized_symbol)
         with self._lock:
             existing = self._depth_tasks.get(key)
@@ -1128,6 +1338,29 @@ class ContractMarketProviderWsService:
         if provider_code == PROVIDER_ITICK and not provider_ws_itick_trades_enabled():
             logger.debug("contract_provider_ws_trades_itick_disabled symbol=%s", normalized_symbol)
             return
+        if provider_code == PROVIDER_ITICK:
+            subscription = ProviderTradesSubscription(
+                local_symbol=normalized_symbol,
+                provider=provider_code,
+                provider_symbol=normalized_provider_symbol,
+                trades_limit=max(1, min(int(trades_limit or 30), 100)),
+                ws_symbol=normalized_ws_symbol or normalized_provider_symbol,
+                ws_url=str(ws_url or "").strip() or None,
+            )
+            self._ensure_itick_shared_subscription(
+                stream="tick",
+                local_symbol=normalized_symbol,
+                ws_symbol=subscription.ws_symbol or normalized_provider_symbol,
+                ws_url=subscription.ws_url,
+                subscription=subscription,
+            )
+            return
+        if provider_code == PROVIDER_OKX_SWAP:
+            self._ensure_okx_shared_subscription(
+                stream="trades",
+                subscription=ProviderTradesSubscription(normalized_symbol, provider_code, normalized_provider_symbol, max(1, min(int(trades_limit or 30), 100))),
+            )
+            return
         key = (provider_code, normalized_symbol)
         with self._lock:
             existing = self._trades_tasks.get(key)
@@ -1180,6 +1413,28 @@ class ContractMarketProviderWsService:
             return
         if provider_code == PROVIDER_ITICK and not provider_ws_itick_quote_enabled():
             logger.debug("contract_provider_ws_ticker_itick_disabled symbol=%s", normalized_symbol)
+            return
+        if provider_code == PROVIDER_ITICK:
+            subscription = ProviderTickerSubscription(
+                local_symbol=normalized_symbol,
+                provider=provider_code,
+                provider_symbol=normalized_provider_symbol,
+                ws_symbol=normalized_ws_symbol,
+                ws_url=str(ws_url or "").strip() or None,
+            )
+            self._ensure_itick_shared_subscription(
+                stream="quote",
+                local_symbol=normalized_symbol,
+                ws_symbol=subscription.ws_symbol or normalized_provider_symbol,
+                ws_url=subscription.ws_url,
+                subscription=subscription,
+            )
+            return
+        if provider_code == PROVIDER_OKX_SWAP:
+            self._ensure_okx_shared_subscription(
+                stream="ticker",
+                subscription=ProviderTickerSubscription(normalized_symbol, provider_code, normalized_provider_symbol),
+            )
             return
         key = (provider_code, normalized_symbol)
         with self._lock:
@@ -1240,6 +1495,30 @@ class ContractMarketProviderWsService:
                 normalized_interval,
             )
             return
+        if provider_code == PROVIDER_ITICK:
+            subscription = ProviderKlineSubscription(
+                local_symbol=normalized_symbol,
+                provider=provider_code,
+                provider_symbol=normalized_provider_symbol,
+                interval=normalized_interval,
+                channel=channel,
+                ws_symbol=_normalize_symbol(ws_symbol or provider_symbol),
+                ws_url=str(ws_url or "").strip() or None,
+            )
+            self._ensure_itick_shared_subscription(
+                stream=channel,
+                local_symbol=normalized_symbol,
+                ws_symbol=subscription.ws_symbol or normalized_provider_symbol,
+                ws_url=subscription.ws_url,
+                subscription=subscription,
+            )
+            return
+        if provider_code == PROVIDER_OKX_SWAP:
+            self._ensure_okx_shared_subscription(
+                stream="kline",
+                subscription=ProviderKlineSubscription(normalized_symbol, provider_code, normalized_provider_symbol, normalized_interval, channel),
+            )
+            return
         key = (provider_code, normalized_symbol, normalized_interval)
         with self._lock:
             existing = self._kline_tasks.get(key)
@@ -1275,6 +1554,12 @@ class ContractMarketProviderWsService:
             thread.start()
 
     def stop_depth_subscription(self, *, local_symbol: str, provider: str) -> None:
+        if _normalize_symbol(provider) == PROVIDER_ITICK and self._release_itick_shared_subscription(
+            stream="depth", local_symbol=local_symbol
+        ):
+            return
+        if _normalize_symbol(provider) == PROVIDER_OKX_SWAP and self._release_okx_shared_subscription(stream="depth", local_symbol=local_symbol):
+            return
         key = (_normalize_symbol(provider), _normalize_symbol(local_symbol))
         with self._lock:
             stop_event = self._depth_stops.get(key)
@@ -1299,6 +1584,12 @@ class ContractMarketProviderWsService:
         self._clear_depth_subscription_state(key, remove_cache=False)
 
     def stop_trades_subscription(self, *, local_symbol: str, provider: str) -> None:
+        if _normalize_symbol(provider) == PROVIDER_ITICK and self._release_itick_shared_subscription(
+            stream="tick", local_symbol=local_symbol
+        ):
+            return
+        if _normalize_symbol(provider) == PROVIDER_OKX_SWAP and self._release_okx_shared_subscription(stream="trades", local_symbol=local_symbol):
+            return
         key = (_normalize_symbol(provider), _normalize_symbol(local_symbol))
         with self._lock:
             stop_event = self._trades_stops.get(key)
@@ -1323,6 +1614,12 @@ class ContractMarketProviderWsService:
         self._clear_trades_subscription_state(key, remove_cache=False)
 
     def stop_ticker_subscription(self, *, local_symbol: str, provider: str) -> None:
+        if _normalize_symbol(provider) == PROVIDER_ITICK and self._release_itick_shared_subscription(
+            stream="quote", local_symbol=local_symbol
+        ):
+            return
+        if _normalize_symbol(provider) == PROVIDER_OKX_SWAP and self._release_okx_shared_subscription(stream="ticker", local_symbol=local_symbol):
+            return
         key = (_normalize_symbol(provider), _normalize_symbol(local_symbol))
         with self._lock:
             stop_event = self._ticker_stops.get(key)
@@ -1347,6 +1644,12 @@ class ContractMarketProviderWsService:
         self._clear_ticker_subscription_state(key, remove_cache=False)
 
     def stop_kline_subscription(self, *, local_symbol: str, provider: str, interval: str) -> None:
+        if _normalize_symbol(provider) == PROVIDER_ITICK and self._release_itick_shared_subscription(
+            stream="kline@1", local_symbol=local_symbol, interval=interval
+        ):
+            return
+        if _normalize_symbol(provider) == PROVIDER_OKX_SWAP and self._release_okx_shared_subscription(stream="kline", local_symbol=local_symbol, interval=interval):
+            return
         key = (_normalize_symbol(provider), _normalize_symbol(local_symbol), _normalize_interval(interval))
         with self._lock:
             stop_event = self._kline_stops.get(key)
@@ -1391,6 +1694,48 @@ class ContractMarketProviderWsService:
                 "alive_after_stop": [],
                 "registry_after": self.debug_provider_ws_depth_subscriptions(),
             }
+        with self._lock:
+            shared_keys = [
+                key for key in self._itick_registrations if key[1] == normalized_symbol
+            ]
+            okx_keys = [
+                key for key in self._okx_registrations if key[1] == normalized_symbol
+            ]
+        for stream, _symbol, interval in okx_keys:
+            self._release_okx_shared_subscription(
+                stream=stream,
+                local_symbol=normalized_symbol,
+                interval=interval,
+            )
+        shared_markets: set[str] = set()
+        for stream, _symbol, interval in shared_keys:
+            with self._lock:
+                registration = self._itick_registrations.pop((stream, normalized_symbol, interval), None)
+            if registration is None:
+                continue
+            with self._lock:
+                self._retire_itick_shared_generation((stream, normalized_symbol, interval))
+            market, ws_symbol, consumer_id = registration
+            self._itick_router.unregister(
+                market=market,
+                provider_symbol=ws_symbol,
+                stream=stream,
+                consumer_id=consumer_id,
+            )
+            self._itick_plan.release(market=market, symbol=ws_symbol, stream=stream)
+            shared_markets.add(market)
+        with self._lock:
+            self._depth_cache.pop((PROVIDER_ITICK, normalized_symbol), None)
+            self._trades_cache.pop((PROVIDER_ITICK, normalized_symbol), None)
+            self._ticker_cache.pop((PROVIDER_ITICK, normalized_symbol), None)
+            for key in [
+                key
+                for key in self._kline_cache
+                if key[0] == PROVIDER_ITICK and key[1] == normalized_symbol
+            ]:
+                self._kline_cache.pop(key, None)
+        for market in shared_markets:
+            self._itick_transport.notify(market)
         depth_report = self._force_stop_stream_subscriptions_for_symbol(
             local_symbol=normalized_symbol,
             wait_seconds=wait_seconds,
@@ -1413,6 +1758,8 @@ class ContractMarketProviderWsService:
         )
         report = {
             "symbol": normalized_symbol,
+            "shared_registration_count": len(shared_keys),
+            "okx_shared_registration_count": len(okx_keys),
             "depth": depth_report,
             "trades": trades_report,
             "ticker": ticker_report,
@@ -1423,6 +1770,23 @@ class ContractMarketProviderWsService:
         return report
 
     def stop_all(self) -> None:
+        self._okx_transport.stop_all()
+        with self._lock:
+            self._okx_registrations.clear()
+        with self._lock:
+            shared_registrations = tuple(self._itick_registrations.items())
+            self._itick_registrations.clear()
+        for (stream, _local_symbol, _interval), (market, ws_symbol, consumer_id) in shared_registrations:
+            with self._lock:
+                self._retire_itick_shared_generation((stream, _local_symbol, _interval))
+            self._itick_router.unregister(
+                market=market,
+                provider_symbol=ws_symbol,
+                stream=stream,
+                consumer_id=consumer_id,
+            )
+            self._itick_plan.release(market=market, symbol=ws_symbol, stream=stream)
+        self._itick_transport.stop_all()
         with self._lock:
             depth_symbols = {key[1] for key in set(self._depth_stops) | set(self._depth_tasks) | set(self._depth_connections)}
             trades_symbols = {key[1] for key in set(self._trades_stops) | set(self._trades_tasks) | set(self._trades_connections)}
@@ -1664,6 +2028,8 @@ class ContractMarketProviderWsService:
         now_ms = int(time.time() * 1000)
         with self._lock:
             return {
+                "okx_shared": self._okx_transport.debug_state(),
+                "okx_shared_registrations": sorted(map(str, self._okx_registrations.keys())),
                 "tasks": {
                     str(key): bool(thread is not None and thread.is_alive())
                     for key, thread in self._depth_tasks.items()
@@ -2051,10 +2417,13 @@ class ContractMarketProviderWsService:
             )
             try:
                 await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                last_message_at = time.monotonic()
                 while not stop_event.is_set() and provider_ws_depth_enabled():
-                    try:
-                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                    except asyncio.TimeoutError:
+                    raw_message, last_message_at = await _recv_okx_message_with_idle_watchdog(
+                        websocket,
+                        last_message_at=last_message_at,
+                    )
+                    if raw_message is None:
                         continue
                     self._handle_okx_depth_message(
                         subscription,
@@ -2110,10 +2479,13 @@ class ContractMarketProviderWsService:
             )
             try:
                 await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                last_message_at = time.monotonic()
                 while not stop_event.is_set() and provider_ws_trades_enabled():
-                    try:
-                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                    except asyncio.TimeoutError:
+                    raw_message, last_message_at = await _recv_okx_message_with_idle_watchdog(
+                        websocket,
+                        last_message_at=last_message_at,
+                    )
+                    if raw_message is None:
                         continue
                     self._handle_okx_trades_message(
                         subscription,
@@ -2305,10 +2677,13 @@ class ContractMarketProviderWsService:
             )
             try:
                 await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                last_message_at = time.monotonic()
                 while not stop_event.is_set() and provider_ws_ticker_enabled():
-                    try:
-                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                    except asyncio.TimeoutError:
+                    raw_message, last_message_at = await _recv_okx_message_with_idle_watchdog(
+                        websocket,
+                        last_message_at=last_message_at,
+                    )
+                    if raw_message is None:
                         continue
                     self._handle_okx_ticker_message(
                         subscription,
@@ -2433,10 +2808,13 @@ class ContractMarketProviderWsService:
             )
             try:
                 await websocket.send(json.dumps(subscribe_payload, separators=(",", ":")))
+                last_message_at = time.monotonic()
                 while not stop_event.is_set() and provider_ws_kline_enabled():
-                    try:
-                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                    except asyncio.TimeoutError:
+                    raw_message, last_message_at = await _recv_okx_message_with_idle_watchdog(
+                        websocket,
+                        last_message_at=last_message_at,
+                    )
+                    if raw_message is None:
                         continue
                     self._handle_okx_kline_message(
                         subscription,
@@ -2642,7 +3020,9 @@ class ContractMarketProviderWsService:
                 price_raw, quantity_raw = item[0], item[1]
             price = _to_decimal(price_raw)
             quantity = _to_decimal(quantity_raw)
-            if price is None or quantity is None or price <= 0 or quantity <= 0:
+            if quantity is None or quantity <= 0:
+                quantity = Decimal("0")
+            if price is None or price <= 0:
                 continue
             normalized[format(price, "f")] = quantity
         return normalized
@@ -3412,7 +3792,11 @@ class ContractMarketProviderWsService:
                 "best_bid": _best_depth_price(bid_levels, side="bids"),
                 "best_ask": _best_depth_price(ask_levels, side="asks"),
                 "source": CONTRACT_PROVIDER_WS_SOURCE,
-                "depth_mode": "FULL_DEPTH",
+                "depth_mode": (
+                    "FULL_DEPTH"
+                    if len(bid_levels) > 1 and len(ask_levels) > 1
+                    else "BBO_ONLY"
+                ),
                 "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
                 "quote_freshness": "LIVE",
                 "is_realtime": True,
@@ -3596,3 +3980,7 @@ def force_stop_provider_ws_subscriptions_for_symbol(
 
 def debug_provider_ws_depth_subscriptions() -> dict[str, Any]:
     return contract_market_provider_ws.debug_provider_ws_depth_subscriptions()
+
+
+def stop_contract_provider_ws() -> None:
+    contract_market_provider_ws.stop_all()

@@ -227,6 +227,32 @@ describe('useSpotMarket trade collection', () => {
 })
 
 describe('useSpotMarket hydration', () => {
+  it('hydrates a separator-bearing canonical symbol from its normalized store identity', async () => {
+    const receivedAtMs = Date.now()
+    mockedGetSpotMarketView.mockResolvedValueOnce({
+      symbol: 'BON-2USDT',
+      ticker: {
+        symbol: 'BON-2USDT',
+        provider: 'INTERNAL',
+        last_price: '1.24000000',
+        source: 'INTERNAL',
+        freshness: 'LIVE',
+        event_time_ms: receivedAtMs,
+      },
+      ticker_last_price: '1.24000000',
+      ticker_source: 'INTERNAL',
+      ticker_freshness: 'LIVE',
+      quote_freshness: 'LIVE',
+      data_source: 'INTERNAL',
+    } as SpotMarketView)
+
+    const { result } = renderHook(() => useSpotMarket('BON-2USDT'))
+
+    await waitFor(() => expect(result.current.displayPrice.price).toBe('1.24000000'))
+    expect(result.current.displayPrice.source).toBe('INTERNAL')
+    expect(result.current.isHydrating).toBe(false)
+  })
+
   it('keeps a REST snapshot in hydration until a LIVE_WS ticker arrives', async () => {
     mockedGetSpotMarketView.mockResolvedValueOnce({
       symbol: 'BTCUSDT',

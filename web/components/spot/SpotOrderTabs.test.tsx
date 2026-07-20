@@ -46,10 +46,21 @@ jest.mock('@/lib/api/modules/spot', () => ({
 }), { virtual: true })
 
 class MockWebSocket {
+  static instances: MockWebSocket[] = []
+
+  readonly url: string
+  readonly protocols?: string | string[]
+
   onopen: ((event: Event) => void) | null = null
   onmessage: ((event: MessageEvent) => void) | null = null
   onerror: ((event: Event) => void) | null = null
   onclose: ((event: CloseEvent) => void) | null = null
+
+  constructor(url = '', protocols?: string | string[]) {
+    this.url = url
+    this.protocols = protocols
+    MockWebSocket.instances.push(this)
+  }
 
   send() {}
 
@@ -103,6 +114,7 @@ describe('SpotOrderTabs current orders recovery', () => {
   beforeEach(() => {
     jest.useFakeTimers()
     jest.clearAllMocks()
+    MockWebSocket.instances = []
     Object.defineProperty(window, 'WebSocket', {
       configurable: true,
       writable: true,
@@ -112,6 +124,7 @@ describe('SpotOrderTabs current orders recovery', () => {
 
   afterEach(() => {
     cleanup()
+    window.localStorage.clear()
     jest.clearAllTimers()
     jest.useRealTimers()
     jest.restoreAllMocks()
@@ -264,5 +277,191 @@ describe('SpotOrderTabs current orders recovery', () => {
       'SpotOrderTabs current orders load error:',
       error,
     )
+  })
+
+  it('does not resurrect a filled order when an older REST request finishes after the private update', async () => {
+    let resolveCurrentOrders: ((value: ReturnType<typeof buildResponse>) => void) | null = null
+    currentOrdersMock.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveCurrentOrders = resolve
+      }),
+    )
+
+    render(<SpotOrderTabs symbol="MFCUSDT" pricePrecision={3} />)
+    await flushAsyncWork()
+    expect(currentOrdersMock).toHaveBeenCalledTimes(1)
+    expect(resolveCurrentOrders).not.toBeNull()
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+      await Promise.resolve()
+    })
+
+    const ws = MockWebSocket.instances.at(-1)
+    expect(ws).toBeDefined()
+
+    const filledOrder = {
+      ...buildOrder('MFCUSDT', 9),
+      price: '0.112',
+      filled_amount: '2',
+      remaining_amount: '0',
+      status: 'FILLED',
+      updated_at: '2026-07-13T00:00:01Z',
+    }
+
+    act(() => {
+      ws?.onmessage?.({
+        data: JSON.stringify({
+          type: 'spot_user_order_update',
+          symbol: 'MFCUSDT',
+          order: filledOrder,
+        }),
+      } as MessageEvent)
+    })
+
+    await act(async () => {
+      resolveCurrentOrders?.(
+        buildResponse('MFCUSDT', [{
+          ...buildOrder('MFCUSDT', 9),
+          price: '0.112',
+        }]),
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByText('0.112')).not.toBeInTheDocument()
+  })
+
+  it('debounces balance bursts and coalesces revalidation behind an in-flight request', async () => {
+    let resolveInitialRequest: ((value: ReturnType<typeof buildResponse>) => void) | null = null
+    currentOrdersMock
+      .mockImplementationOnce(
+        () => new Promise((resolve) => {
+          resolveInitialRequest = resolve
+        }),
+      )
+      .mockResolvedValueOnce(buildResponse('MFCUSDT'))
+
+    render(<SpotOrderTabs symbol="MFCUSDT" pricePrecision={3} />)
+    await flushAsyncWork()
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+      await Promise.resolve()
+    })
+    const ws = MockWebSocket.instances.at(-1)
+    expect(ws).toBeDefined()
+
+    act(() => {
+      const balanceUpdate = {
+        data: JSON.stringify({
+          type: 'spot_user_balance_update',
+          account_type: 'spot',
+          items: [{ symbol: 'MFC', available: '10', frozen: '0' }],
+        }),
+      } as MessageEvent
+      ws?.onmessage?.(balanceUpdate)
+      ws?.onmessage?.(balanceUpdate)
+    })
+    expect(currentOrdersMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      jest.advanceTimersByTime(149)
+      await Promise.resolve()
+    })
+    expect(currentOrdersMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      jest.advanceTimersByTime(1)
+      await Promise.resolve()
+    })
+    expect(currentOrdersMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveInitialRequest?.(
+        buildResponse('MFCUSDT', [{
+          ...buildOrder('MFCUSDT', 10),
+          price: '0.112',
+        }]),
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(currentOrdersMock).toHaveBeenCalledTimes(2)
+    expect(screen.queryByText('0.112')).not.toBeInTheDocument()
+  })
+
+  it('reconnects after an auth close and reads the refreshed token', async () => {
+    window.localStorage.setItem('access_token', 'expired-token')
+    currentOrdersMock.mockResolvedValue(buildResponse('MFCUSDT'))
+
+    render(<SpotOrderTabs symbol="MFCUSDT" />)
+    await flushAsyncWork()
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+      await Promise.resolve()
+    })
+
+    const firstSocket = MockWebSocket.instances.at(-1)
+    expect(firstSocket?.url).toBe('ws://127.0.0.1:8000/spot/ws/private?symbol=MFCUSDT')
+    expect(firstSocket?.protocols).toEqual(['spot-auth', 'expired-token'])
+
+    window.localStorage.setItem('access_token', 'refreshed-token')
+    act(() => {
+      firstSocket?.onclose?.({ code: 1008 } as CloseEvent)
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(1500)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(MockWebSocket.instances[1]?.protocols).toEqual([
+      'spot-auth',
+      'refreshed-token',
+    ])
+  })
+
+  it('recovers auth once when a rejected handshake is reported as a pre-open abnormal close', async () => {
+    window.localStorage.setItem('access_token', 'expired-token')
+    currentOrdersMock
+      .mockResolvedValueOnce(buildResponse('MFCUSDT'))
+      .mockImplementationOnce(async () => {
+        window.localStorage.setItem('access_token', 'refreshed-token')
+        return buildResponse('MFCUSDT')
+      })
+
+    render(<SpotOrderTabs symbol="MFCUSDT" />)
+    await flushAsyncWork()
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+      await Promise.resolve()
+    })
+
+    const firstSocket = MockWebSocket.instances.at(-1)
+    act(() => {
+      firstSocket?.onclose?.({ code: 1006 } as CloseEvent)
+    })
+    await flushAsyncWork()
+    expect(currentOrdersMock).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      jest.advanceTimersByTime(1500)
+      await Promise.resolve()
+    })
+
+    const secondSocket = MockWebSocket.instances.at(-1)
+    expect(secondSocket?.protocols).toEqual(['spot-auth', 'refreshed-token'])
+
+    act(() => {
+      secondSocket?.onclose?.({ code: 1006 } as CloseEvent)
+    })
+    await flushAsyncWork()
+    expect(currentOrdersMock).toHaveBeenCalledTimes(2)
   })
 })

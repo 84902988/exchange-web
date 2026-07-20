@@ -551,11 +551,10 @@ def _last_good_bbo_older_than_latest_kline(
     return last_good_at is not None and latest_kline_time is not None and latest_kline_time > last_good_at
 
 
-def _raw_executable(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> Optional[bool]:
-    for payload in (quote, depth):
-        value = (payload or {}).get("executable")
-        if isinstance(value, bool):
-            return value
+def _raw_executable(bbo_payload: Optional[dict[str, Any]]) -> Optional[bool]:
+    value = (bbo_payload or {}).get("executable")
+    if isinstance(value, bool):
+        return value
     return None
 
 
@@ -672,7 +671,9 @@ def build_contract_market_view(
     reference_price_source = _payload_source_or_none(quote)
     bbo_freshness = _payload_freshness(bbo_payload)
     quote_freshness = _payload_freshness(quote)
-    raw_executable = _raw_executable(quote, depth)
+    # Execution authority belongs to the payload that supplied the selected
+    # BBO. A stale ticker must not disable a newer, live depth BBO.
+    raw_executable = _raw_executable(bbo_payload)
     has_bbo = bid is not None and ask is not None and ask >= bid
     is_closed = market_status in _CLOSED_MARKET_STATUSES
     last_good_older_than_kline = _last_good_bbo_older_than_latest_kline(
@@ -754,7 +755,12 @@ def build_contract_market_view(
         display_price = latest_trade_price
         display_price_source = DISPLAY_PRICE_SOURCE_TRADE_TICK
         current_price_source = DISPLAY_PRICE_SOURCE_TRADE_TICK
-    elif not is_crypto and latest_kline_close is not None and display_price is None:
+    elif (
+        not is_crypto
+        and latest_kline_close is not None
+        and display_price is None
+        and (is_closed or display_state in _NON_TRADING_DISPLAY_STATES)
+    ):
         display_price = latest_kline_close
         display_price_source = DISPLAY_PRICE_SOURCE_KLINE_CLOSE
         current_price_source = DISPLAY_PRICE_SOURCE_KLINE_CLOSE

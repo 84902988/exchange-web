@@ -23,9 +23,13 @@ from app.db.models.trading_pair import TradingPair
 from app.db.session import SessionLocal
 from app.services.fee_service import apply_trade_fee
 from app.services.market_ws import market_ws_manager
+from app.services.spot_kline_realtime import apply_spot_trade_to_klines
 from app.services.spot_order_payload import serialize_spot_order
 from app.services.spot_private_event_bridge import create_spot_private_event
-from app.services.spot_public_depth_events import publish_spot_public_depth_refresh
+from app.services.spot_public_depth_events import (
+    publish_spot_public_depth_refresh,
+    publish_spot_public_trade,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -729,52 +733,74 @@ def _push_trade_and_depth(
     try:
         ts = int(time.time() * 1000)
 
-        publish_spot_public_depth_refresh(symbol, reason="trade_matched")
-
-        _fire_and_forget(
-            market_ws_manager.send_trade(
+        kline_updates: list[dict[str, Any]] = []
+        kline_db = SessionLocal()
+        try:
+            kline_updates = apply_spot_trade_to_klines(
+                kline_db,
                 symbol=symbol,
-                price=price,
-                amount=amount,
-                side=side,
-                ts=ts,
-                trade_id=trade_id,
-            ),
-            "public ws trade push error",
-        )
+                trade_price=price,
+                trade_amount=amount,
+                trade_ts_ms=ts,
+            )
+        except Exception:
+            logger.warning("public ws kline update build error symbol=%s", symbol, exc_info=True)
+        finally:
+            kline_db.close()
 
-        _fire_and_forget(
-            _push_depth_and_snapshot(
-                symbol=symbol,
-                price=price,
-                amount=amount,
-                ts=ts,
-            ),
-            "public ws depth/snapshot push error",
+        published = publish_spot_public_trade(
+            symbol,
+            price=price,
+            amount=amount,
+            side=side,
+            ts=ts,
+            trade_id=trade_id,
+            kline_updates=kline_updates,
         )
+        if not published:
+            _fire_and_forget(
+                market_ws_manager.send_trade(
+                    symbol=symbol,
+                    price=price,
+                    amount=amount,
+                    side=side,
+                    ts=ts,
+                    trade_id=trade_id,
+                ),
+                "public ws trade push error",
+            )
+            _fire_and_forget(
+                _push_trade_depth_and_snapshot(
+                    symbol=symbol,
+                    price=price,
+                    amount=amount,
+                    ts=ts,
+                    kline_updates=kline_updates,
+                ),
+                "public ws depth/snapshot push error",
+            )
     except Exception as e:
         logger.exception("[public ws push error]")
 
 
-async def _push_depth_and_snapshot(
+async def _push_trade_depth_and_snapshot(
     *,
     symbol: str,
     price: Decimal,
     amount: Decimal,
     ts: int,
+    kline_updates: list[dict[str, Any]],
 ) -> None:
     ws_db = SessionLocal()
     try:
-        try:
-            await market_ws_manager.send_kline_update(
-                db=ws_db,
-                symbol=symbol,
-                price=price,
-                amount=amount,
-                ts=ts,
+        for update in kline_updates:
+            await market_ws_manager.broadcast_provider_kline_update(
+                symbol,
+                str(update.get("interval") or "1m"),
+                update.get("kline") or {},
+                source=str(update.get("source") or "INTERNAL_TRADE"),
+                updated_at=update.get("updated_at"),
             )
-        except Exception:
-            logger.warning("public ws kline push error symbol=%s", symbol, exc_info=True)
 
         await market_ws_manager.send_depth_update(
             db=ws_db,

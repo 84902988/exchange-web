@@ -233,9 +233,42 @@ def test_internal_trade_uses_platform_identity_and_created_at() -> None:
     assert item.ts == expected_ms
     assert item.event_time_ms == expected_ms
     assert item.received_at_ms is None
-    assert item.created_at == created_at.isoformat()
+    assert item.created_at == "2026-07-11T01:02:03.456000Z"
     assert item.time_origin == "PLATFORM_TRADE"
     assert item.source == "INTERNAL"
+
+
+def test_internal_trade_normalizes_legacy_mysql_local_time_without_touching_kline_buckets() -> None:
+    created_at = datetime(2026, 7, 21, 0, 29, 55, 690000)
+    row = SimpleNamespace(
+        id=78,
+        price=Decimal("100.25"),
+        amount=Decimal("1.5"),
+        created_at=created_at,
+        taker_order_id=None,
+    )
+
+    class Query:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [row]
+
+    class Db:
+        def query(self, *args, **kwargs):
+            return Query()
+
+    item = market._get_internal_trades(Db(), _pair(), limit=10).trades[0]
+
+    assert item.event_time_ms == 1_784_564_995_690
+    assert item.created_at == "2026-07-20T16:29:55.690000Z"
 
 
 if __name__ == "__main__":

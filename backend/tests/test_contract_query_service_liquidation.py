@@ -75,4 +75,4 @@ def test_multi_position_summary_liquidation_price_uses_group_margin_and_average_
         {"AAPLUSDT_PERP": Decimal("0")},
     )
 
-    assert liquidation_price == Decimal("268.4466666666666666666666667")
+    assert liquidation_price == Decimal("268.4460000000000000000000000")

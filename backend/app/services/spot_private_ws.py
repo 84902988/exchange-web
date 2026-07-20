@@ -12,6 +12,7 @@ from fastapi import WebSocket
 from sqlalchemy.orm import Session
 
 from app.db.models.asset import UserBalance
+from app.core.datetime_utils import utc_isoformat
 from app.services.balance import SPOT_BALANCE_CHAIN_KEY
 from app.services.spot_query import get_current_orders
 
@@ -27,7 +28,7 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, Decimal):
         return format(value, "f")
     if isinstance(value, datetime):
-        return value.isoformat()
+        return utc_isoformat(value)
     if isinstance(value, dict):
         return {key: _to_jsonable(val) for key, val in value.items()}
     if isinstance(value, list):

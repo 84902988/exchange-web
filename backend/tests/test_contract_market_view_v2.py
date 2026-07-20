@@ -10,6 +10,7 @@ from app.schemas.contract_market_domain_snapshot import (
     ContractMarketDomainSource,
     ContractMarketDomainTransport,
 )
+from app.services import contract_market_service as market_service
 from app.services import contract_market_view as market_view
 from app.services.contract_market_domain_snapshot import (
     ContractMarketDomainSnapshotContext,
@@ -292,7 +293,7 @@ def test_public_market_view_reads_authority_bundle(monkeypatch):
     assert view["depth"]["best_bid"] == "100"
 
 
-def test_execution_view_keeps_legacy_input_adapter(monkeypatch):
+def test_execution_view_keeps_legacy_input_adapter_with_quote_only_bbo(monkeypatch):
     monkeypatch.setattr(
         market_view,
         "get_contract_market_snapshot_authority",
@@ -307,7 +308,7 @@ def test_execution_view_keeps_legacy_input_adapter(monkeypatch):
             "symbol": SYMBOL,
             "contract_symbol": _contract(),
             "quote": _snapshots()[0].data,
-            "depth": _snapshots()[1].data,
+            "depth": None,
             "latest_trade": None,
             "latest_kline": None,
             "warnings": [],
@@ -319,3 +320,49 @@ def test_execution_view_keeps_legacy_input_adapter(monkeypatch):
     assert execution["executable"] is True
     assert execution["execution_bid"] == "100"
     assert execution["execution_ask"] == "102"
+
+
+def test_execution_legacy_inputs_do_not_fan_out_after_complete_quote_bbo(monkeypatch):
+    quote = {
+        "symbol": SYMBOL,
+        "bid_price": "100",
+        "ask_price": "102",
+        "last_price": "101",
+        "market_status": "OPEN",
+        "market_session_type": "REGULAR",
+        "freshness": "LIVE",
+    }
+    monkeypatch.setattr(market_service, "get_contract_quote", lambda *_args, **_kwargs: quote)
+    monkeypatch.setattr(
+        market_service,
+        "get_contract_depth",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("complete quote BBO must skip depth")),
+    )
+    monkeypatch.setattr(
+        market_service,
+        "get_contract_recent_trades",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("execution must skip recent trades")),
+    )
+    monkeypatch.setattr(
+        market_service,
+        "get_contract_klines",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("execution must skip klines")),
+    )
+
+    class Query:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return _contract()
+
+    class Db:
+        def query(self, *_args, **_kwargs):
+            return Query()
+
+    inputs = market_service.get_contract_market_view_legacy_inputs(Db(), SYMBOL)
+
+    assert inputs["quote"] == quote
+    assert inputs["depth"] is None
+    assert inputs["latest_trade"] is None
+    assert inputs["latest_kline"] is None

@@ -20,12 +20,14 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.orm import Session
 
 from app.core.rq import get_redis_url
+from app.core.datetime_utils import utc_isoformat
 from app.db.session import SessionLocal
 from app.db.models.contract_order import ContractOrder
 from app.db.models.contract_position import ContractPosition
 from app.db.models.contract_trade import ContractTrade
 from app.services.contract_account_service import get_contract_account_summary
 from app.services.contract_query_service import (
+    ContractPositionMarkEvidence,
     contract_position_mark_evidence_scope,
     get_user_contract_orders,
     get_user_contract_position_summaries,
@@ -61,7 +63,7 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, datetime):
-        return value.isoformat()
+        return utc_isoformat(value)
     if isinstance(value, BaseModel):
         return _to_jsonable(value.model_dump())
     if isinstance(value, dict):
@@ -256,7 +258,7 @@ class ContractPrivateWsManager:
             if positions_changed:
                 self._position_signatures[user_id] = position_signature
         if account_changed:
-            payload = {"account": account}
+            payload = {"account": account, "mark_only": True}
             await self._send_to_user(
                 user_id,
                 self._message("contract_user_account_update", payload, user_id=user_id),
@@ -505,6 +507,7 @@ class ContractPrivateWsManager:
         order_ids: Iterable[int] | None = None,
         trade_ids: Iterable[int] | None = None,
         include_account: bool = True,
+        prefer_transaction_mark: bool = False,
     ) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         known_symbols = {str(symbol) for symbol in (symbols or []) if symbol}
@@ -512,39 +515,70 @@ class ContractPrivateWsManager:
         order_ids = [int(item) for item in (order_ids or []) if item is not None]
         trade_ids = [int(item) for item in (trade_ids or []) if item is not None]
 
-        if include_account:
-            events.append(self.build_account_update_event(db, user_id))
+        position_rows = (
+            db.query(ContractPosition)
+            .filter(ContractPosition.user_id == int(user_id))
+            .filter(ContractPosition.id.in_(position_ids))
+            .all()
+            if position_ids
+            else []
+        )
+        positions_by_id = {int(position.id): position for position in position_rows}
+        transaction_mark_evidence: dict[str, ContractPositionMarkEvidence] = {}
+        if prefer_transaction_mark:
+            for position in position_rows:
+                symbol = str(position.symbol or "").strip().upper()
+                mark_price = Decimal(str(position.mark_price or "0"))
+                if symbol and mark_price > 0:
+                    transaction_mark_evidence[symbol] = ContractPositionMarkEvidence(
+                        mark_price=mark_price,
+                        source="POSITION_TRANSACTION_MARK",
+                        freshness="RECENT",
+                        usable=True,
+                    )
 
-        for position_id in position_ids:
-            symbol = _symbol_from_models(db, user_id, position_id=position_id)
-            if symbol:
-                known_symbols.add(symbol)
-                events.append(self.build_position_update_event(db, user_id, symbol, position_id=position_id))
-
-        for order_id in order_ids:
-            symbol = _symbol_from_models(db, user_id, order_id=order_id)
-            if symbol:
-                known_symbols.add(symbol)
-                events.append(self.build_order_update_event(db, user_id, symbol, order_id=order_id))
-                trade = (
-                    db.query(ContractTrade)
-                    .filter(ContractTrade.order_id == int(order_id))
-                    .filter(ContractTrade.user_id == int(user_id))
-                    .order_by(ContractTrade.id.desc())
-                    .first()
+        with contract_position_mark_evidence_scope(transaction_mark_evidence):
+            # User-visible entities are published before the account
+            # reconciliation. This prevents a live mark refresh from delaying
+            # the position/order event that confirms the completed command.
+            for position_id in position_ids:
+                position = positions_by_id.get(position_id)
+                symbol = str(position.symbol) if position is not None else _symbol_from_models(
+                    db,
+                    user_id,
+                    position_id=position_id,
                 )
-                if trade and int(trade.id) not in trade_ids:
-                    trade_ids.append(int(trade.id))
+                if symbol:
+                    known_symbols.add(symbol)
+                    events.append(self.build_position_update_event(db, user_id, symbol, position_id=position_id))
 
-        for trade_id in trade_ids:
-            symbol = _symbol_from_models(db, user_id, trade_id=trade_id)
-            if symbol:
-                known_symbols.add(symbol)
-                events.append(self.build_trade_update_event(db, user_id, symbol, trade_id=trade_id))
+            for order_id in order_ids:
+                symbol = _symbol_from_models(db, user_id, order_id=order_id)
+                if symbol:
+                    known_symbols.add(symbol)
+                    events.append(self.build_order_update_event(db, user_id, symbol, order_id=order_id))
+                    trade = (
+                        db.query(ContractTrade)
+                        .filter(ContractTrade.order_id == int(order_id))
+                        .filter(ContractTrade.user_id == int(user_id))
+                        .order_by(ContractTrade.id.desc())
+                        .first()
+                    )
+                    if trade and int(trade.id) not in trade_ids:
+                        trade_ids.append(int(trade.id))
 
-        if not position_ids:
-            for symbol in sorted(known_symbols):
-                events.append(self.build_position_update_event(db, user_id, symbol))
+            for trade_id in trade_ids:
+                symbol = _symbol_from_models(db, user_id, trade_id=trade_id)
+                if symbol:
+                    known_symbols.add(symbol)
+                    events.append(self.build_trade_update_event(db, user_id, symbol, trade_id=trade_id))
+
+            if not position_ids:
+                for symbol in sorted(known_symbols):
+                    events.append(self.build_position_update_event(db, user_id, symbol))
+
+            if include_account:
+                events.append(self.build_account_update_event(db, user_id))
         return events
 
 
@@ -829,10 +863,43 @@ async def _publish_contract_user_updates(
     order_ids: Iterable[int] | None = None,
     trade_ids: Iterable[int] | None = None,
     include_account: bool = True,
+    prefer_transaction_mark: bool = False,
 ) -> None:
+    try:
+        events = await asyncio.to_thread(
+            _build_contract_user_update_events,
+            user_id=user_id,
+            symbols=symbols,
+            position_ids=position_ids,
+            order_ids=order_ids,
+            trade_ids=trade_ids,
+            include_account=include_account,
+            prefer_transaction_mark=prefer_transaction_mark,
+        )
+    except Exception:
+        logger.warning("contract_private_ws_event_build_failed user_id=%s", user_id, exc_info=True)
+        return
+    for event in events:
+        try:
+            await asyncio.to_thread(_publish_event_to_redis, event)
+        except Exception:
+            logger.warning("contract_private_ws_redis_publish_failed user_id=%s", user_id, exc_info=True)
+            return
+
+
+def _build_contract_user_update_events(
+    *,
+    user_id: int,
+    symbols: Iterable[str] | None = None,
+    position_ids: Iterable[int] | None = None,
+    order_ids: Iterable[int] | None = None,
+    trade_ids: Iterable[int] | None = None,
+    include_account: bool = True,
+    prefer_transaction_mark: bool = False,
+) -> list[dict[str, Any]]:
     db = SessionLocal()
     try:
-        events = contract_private_ws_manager.build_state_update_events(
+        return contract_private_ws_manager.build_state_update_events(
             db,
             user_id,
             symbols=symbols,
@@ -840,13 +907,37 @@ async def _publish_contract_user_updates(
             order_ids=order_ids,
             trade_ids=trade_ids,
             include_account=include_account,
+            prefer_transaction_mark=prefer_transaction_mark,
         )
-        for event in events:
-            await asyncio.to_thread(_publish_event_to_redis, event)
-    except Exception:
-        logger.warning("contract_private_ws_redis_publish_failed user_id=%s", user_id, exc_info=True)
     finally:
         db.close()
+
+
+async def publish_contract_user_updates_background(
+    *,
+    user_id: int | None,
+    symbols: Iterable[str] | None = None,
+    position_ids: Iterable[int] | None = None,
+    order_ids: Iterable[int] | None = None,
+    trade_ids: Iterable[int] | None = None,
+    include_account: bool = True,
+    prefer_transaction_mark: bool = False,
+) -> None:
+    """Publish command events without entering Starlette's shared sync-task queue."""
+    if user_id is None:
+        return
+    try:
+        await _publish_contract_user_updates(
+            user_id=int(user_id),
+            symbols=symbols,
+            position_ids=position_ids,
+            order_ids=order_ids,
+            trade_ids=trade_ids,
+            include_account=include_account,
+            prefer_transaction_mark=prefer_transaction_mark,
+        )
+    except Exception:
+        logger.warning("contract_private_ws_event_build_failed user_id=%s", user_id, exc_info=True)
 
 
 def publish_contract_user_updates(
@@ -857,6 +948,7 @@ def publish_contract_user_updates(
     order_ids: Iterable[int] | None = None,
     trade_ids: Iterable[int] | None = None,
     include_account: bool = True,
+    prefer_transaction_mark: bool = False,
 ) -> None:
     if user_id is None:
         return
@@ -871,6 +963,7 @@ def publish_contract_user_updates(
                 order_ids=order_ids,
                 trade_ids=trade_ids,
                 include_account=include_account,
+                prefer_transaction_mark=prefer_transaction_mark,
             )
         )
     else:
@@ -882,5 +975,6 @@ def publish_contract_user_updates(
                 order_ids=order_ids,
                 trade_ids=trade_ids,
                 include_account=include_account,
+                prefer_transaction_mark=prefer_transaction_mark,
             )
         )

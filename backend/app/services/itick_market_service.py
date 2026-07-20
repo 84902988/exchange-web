@@ -285,6 +285,16 @@ class ItickMarketService:
             base_url=self._get_market_base_url(market),
         )
 
+    def get_market_depth(self, market: str, region: str, code: str) -> Any:
+        return self._request_json(
+            "/depth",
+            {
+                "region": self._normalize_region(region),
+                "code": self._normalize_code(code),
+            },
+            base_url=self._get_market_base_url(market),
+        )
+
     def get_market_kline(
         self,
         market: str,

@@ -29,7 +29,9 @@ from app.services.contract_itick_market_resolver import (
     normalize_contract_itick_dwm_open_time,
     resolve_contract_itick_kline_provider_evidence,
     resolve_contract_itick_dwm_session_policy,
+    resolve_contract_itick_market,
     resolve_contract_itick_provider_symbol,
+    resolve_contract_itick_region,
 )
 from app.services.market_kline_cache import (
     KLINE_CACHE_POLICY_GAP_TOLERANT,
@@ -73,7 +75,6 @@ QUOTE_FRESHNESS_LAST_VALID = "LAST_VALID"
 QUOTE_FRESHNESS_FALLBACK = "FALLBACK"
 QUOTE_SOURCE_LAST_GOOD_BBO = "LAST_GOOD_BBO"
 DEPTH_MODE_FULL_DEPTH = "FULL_DEPTH"
-DEPTH_MODE_SYNTHETIC_FROM_BBO = "SYNTHETIC_FROM_BBO"
 DEPTH_MODE_BBO_ONLY = "BBO_ONLY"
 PRICE_SOURCE_TRADE_TICK = "TRADE_TICK"
 PRICE_SOURCE_KLINE_CLOSE = "KLINE_CLOSE"
@@ -1132,8 +1133,8 @@ def _depth_from_quote_payload(quote: dict[str, Any], *, limit: int, source: str)
         symbol=str(quote["symbol"]),
         provider=str(quote["provider"]),
         provider_symbol=str(quote["provider_symbol"]),
-        bids=[_depth_level(bid, Decimal("1"))],
-        asks=[_depth_level(ask, Decimal("1"))],
+        bids=[_depth_level(bid, Decimal("0"))],
+        asks=[_depth_level(ask, Decimal("0"))],
         source=source,
         ts=quote.get("ts") if isinstance(quote.get("ts"), datetime) else datetime.utcnow(),
         depth_mode=DEPTH_MODE_BBO_ONLY,
@@ -1812,7 +1813,7 @@ def _normalize_stock_depth_levels(levels: Any, *, side: str) -> list[list[Decima
         if price is None or price <= 0:
             continue
         if quantity is None or quantity <= 0:
-            quantity = Decimal("1")
+            quantity = Decimal("0")
         normalized.append(_depth_level(price, quantity))
 
     return sorted(normalized, key=lambda item: item[0], reverse=side == "bid")
@@ -1835,35 +1836,6 @@ def _round_stock_price(value: Decimal) -> Decimal:
     return value.quantize(_stock_price_quant())
 
 
-def _stock_depth_gap(reference_price: Decimal, best_bid: Decimal, best_ask: Decimal) -> Decimal:
-    spread = best_ask - best_bid
-    if spread > 0:
-        return max(spread / Decimal("2"), _stock_price_quant())
-    return max(reference_price * Decimal("0.00025"), _stock_price_quant())
-
-
-def _extend_stock_depth_side(
-    levels: list[list[Decimal]],
-    *,
-    side: str,
-    start_price: Decimal,
-    gap: Decimal,
-    limit: int,
-) -> list[list[Decimal]]:
-    items = _copy_depth_levels(levels, limit)
-    first_qty = items[0][1] if items else Decimal("10")
-    index = len(items)
-    while len(items) < limit:
-        step = Decimal(index)
-        price = start_price - (gap * step) if side == "bid" else start_price + (gap * step)
-        if price <= 0:
-            break
-        quantity = first_qty + Decimal(index * 3)
-        items.append(_depth_level(_round_stock_price(price), quantity))
-        index += 1
-    return items
-
-
 def _build_stock_depth_from_prices(
     *,
     symbol: str,
@@ -1874,22 +1846,8 @@ def _build_stock_depth_from_prices(
     source: str,
     ts: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    last_price = (best_bid + best_ask) / Decimal("2")
-    gap = _stock_depth_gap(last_price, best_bid, best_ask)
-    bids = _extend_stock_depth_side(
-        [_depth_level(_round_stock_price(best_bid), Decimal("10"))],
-        side="bid",
-        start_price=best_bid,
-        gap=gap,
-        limit=limit,
-    )
-    asks = _extend_stock_depth_side(
-        [_depth_level(_round_stock_price(best_ask), Decimal("10"))],
-        side="ask",
-        start_price=best_ask,
-        gap=gap,
-        limit=limit,
-    )
+    bids = [_depth_level(_round_stock_price(best_bid), Decimal("0"))]
+    asks = [_depth_level(_round_stock_price(best_ask), Decimal("0"))]
     depth = _depth_payload(
         symbol=symbol,
         provider="ITICK",
@@ -1898,7 +1856,7 @@ def _build_stock_depth_from_prices(
         asks=asks,
         source=source,
         ts=ts or datetime.utcnow(),
-        depth_mode=DEPTH_MODE_SYNTHETIC_FROM_BBO,
+        depth_mode=DEPTH_MODE_BBO_ONLY,
     )
     depth["price_precision"] = 2
     return depth
@@ -2005,7 +1963,11 @@ def _get_stock_contract_depth(
                 asks=asks[:safe_limit],
                 source="ITICK_DEPTH",
                 ts=depth_ts or datetime.utcnow(),
-                depth_mode=DEPTH_MODE_FULL_DEPTH,
+                depth_mode=(
+                    DEPTH_MODE_FULL_DEPTH
+                    if len(bids) > 1 and len(asks) > 1
+                    else DEPTH_MODE_BBO_ONLY
+                ),
             )
             depth["price_precision"] = 2
             return depth
@@ -2192,7 +2154,10 @@ def _contract_itick_kline_provider_evidence(
         provider_symbol=getattr(contract_symbol, "provider_symbol", None),
         category=category,
         interval=interval,
-        explicit_region=_contract_session_code(contract_symbol, category),
+        # Provider namespace is not the same thing as the exchange holiday
+        # session. iTick serves NAS100/SPX/DJI under indices/GB even though
+        # their market-session calendar is US.
+        explicit_region=_itick_region_for_contract(contract_symbol),
     )
 
 
@@ -2296,29 +2261,6 @@ def _get_itick_cfd_reference_price(
     return fallback_price, "CFD_FALLBACK", None, datetime.utcnow(), {}
 
 
-def _extend_cfd_depth_side(
-    levels: list[list[Decimal]],
-    *,
-    side: str,
-    start_price: Decimal,
-    gap: Decimal,
-    limit: int,
-    precision: int,
-) -> list[list[Decimal]]:
-    items = _copy_depth_levels(levels, limit)
-    first_qty = items[0][1] if items else Decimal("10")
-    index = len(items)
-    while len(items) < limit:
-        step = Decimal(index)
-        price = start_price - (gap * step) if side == "bid" else start_price + (gap * step)
-        if price <= 0:
-            break
-        quantity = first_qty + Decimal(index * 5)
-        items.append(_depth_level(_round_price(price, precision), quantity))
-        index += 1
-    return items
-
-
 def _build_cfd_depth_from_price(
     *,
     contract_symbol: ContractSymbol,
@@ -2334,30 +2276,15 @@ def _build_cfd_depth_from_price(
     spread_half = max(reference_price * Decimal("0.0005"), quant)
     best_bid = _round_price(reference_price - spread_half, precision)
     best_ask = _round_price(reference_price + spread_half, precision)
-    gap = max(spread_half, quant)
     depth = _depth_payload(
         symbol=contract_symbol.symbol,
         provider="ITICK",
         provider_symbol=_contract_provider_symbol(contract_symbol),
-        bids=_extend_cfd_depth_side(
-            [_depth_level(best_bid, Decimal("10"))],
-            side="bid",
-            start_price=best_bid,
-            gap=gap,
-            limit=limit,
-            precision=precision,
-        ),
-        asks=_extend_cfd_depth_side(
-            [_depth_level(best_ask, Decimal("10"))],
-            side="ask",
-            start_price=best_ask,
-            gap=gap,
-            limit=limit,
-            precision=precision,
-        ),
+        bids=[_depth_level(best_bid, Decimal("0"))],
+        asks=[_depth_level(best_ask, Decimal("0"))],
         source=source,
         ts=ts or datetime.utcnow(),
-        depth_mode=DEPTH_MODE_SYNTHETIC_FROM_BBO,
+        depth_mode=DEPTH_MODE_BBO_ONLY,
     )
     depth["price_precision"] = precision
     if price_field:
@@ -2377,6 +2304,42 @@ def _get_itick_cfd_depth(
     require_ticker_evidence: bool = False,
 ) -> dict[str, Any]:
     safe_limit = max(5, min(int(limit or 20), 100))
+    provider_symbol = _contract_provider_symbol(contract_symbol)
+    category = _contract_asset_category(contract_symbol)
+    market = resolve_contract_itick_market(category)
+    region = resolve_contract_itick_region(category, provider_symbol)
+    try:
+        depth_payload = itick_market_service.get_market_depth(
+            market=market,
+            region=region,
+            code=provider_symbol,
+        )
+        bids, asks, depth_ts = _extract_itick_stock_depth_levels(depth_payload)
+        if bids and asks:
+            depth = _depth_payload(
+                symbol=contract_symbol.symbol,
+                provider="ITICK",
+                provider_symbol=provider_symbol,
+                bids=bids[:safe_limit],
+                asks=asks[:safe_limit],
+                source="ITICK_DEPTH",
+                ts=depth_ts or datetime.utcnow(),
+                depth_mode=(
+                    DEPTH_MODE_FULL_DEPTH
+                    if len(bids) > 1 and len(asks) > 1
+                    else DEPTH_MODE_BBO_ONLY
+                ),
+            )
+            depth["price_precision"] = int(getattr(contract_symbol, "price_precision", 2) or 2)
+            return depth
+    except Exception as exc:
+        logger.debug(
+            "itick_cfd_depth_unavailable symbol=%s provider_symbol=%s category=%s reason=%s",
+            contract_symbol.symbol,
+            provider_symbol,
+            category,
+            exc,
+        )
     cached_quote = _get_cached_tradfi_quote_for_contract(contract_symbol)
     if cached_quote is not None and (
         not require_ticker_evidence
@@ -4356,8 +4319,8 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
                 symbol=contract_symbol.symbol,
                 provider=fallback["provider"],
                 provider_symbol=fallback["provider_symbol"],
-                bids=[_depth_level(bid, Decimal("1"))],
-                asks=[_depth_level(ask, Decimal("1"))],
+                bids=[_depth_level(bid, Decimal("0"))],
+                asks=[_depth_level(ask, Decimal("0"))],
                 source="LAST_VALID",
                 ts=fallback["ts"],
                 depth_mode=DEPTH_MODE_BBO_ONLY,
@@ -5257,64 +5220,23 @@ def get_contract_market_view_legacy_inputs(
     except Exception as exc:
         warnings.append(f"quote_unavailable:{type(exc).__name__}")
 
-    try:
-        depth = get_contract_depth(db, normalized_symbol, limit=5)
-    except ContractSymbolNotFound:
-        if contract_symbol is None and quote is None:
-            raise
-        warnings.append("depth_unavailable")
-    except Exception as exc:
-        warnings.append(f"depth_unavailable:{type(exc).__name__}")
-
-    try:
-        recent_trades = get_contract_recent_trades(
-            db,
-            normalized_symbol,
-            limit=1,
-        )
-        first_trade = recent_trades[0] if recent_trades else None
-        if (
-            isinstance(first_trade, dict)
-            and str(first_trade.get("price_source") or "").strip().upper()
-            == PRICE_SOURCE_TRADE_TICK
-        ):
-            latest_trade = first_trade
-    except Exception as exc:
-        warnings.append(f"trade_tick_unavailable:{type(exc).__name__}")
-
-    category = _contract_market_view_category(contract_symbol, quote, depth)
-    provider = str(
-        getattr(contract_symbol, "provider", None)
-        or (quote or {}).get("provider")
-        or (depth or {}).get("provider")
-        or ""
-    ).strip().upper()
-    should_load_current_kline = (
-        category
-        in {
-            "STOCK",
-            "FOREX",
-            "METAL",
-            "GOLD",
-            "COMMODITY",
-            "FUTURES",
-            "INDEX",
-            "CFD",
-        }
-        and category != "CRYPTO"
-        and provider != "BINANCE"
+    quote_bid = _to_decimal((quote or {}).get("bid_price") or (quote or {}).get("best_bid") or (quote or {}).get("bid"))
+    quote_ask = _to_decimal((quote or {}).get("ask_price") or (quote or {}).get("best_ask") or (quote or {}).get("ask"))
+    quote_has_bbo = (
+        quote_bid is not None
+        and quote_ask is not None
+        and quote_bid > 0
+        and quote_ask >= quote_bid
     )
-    if should_load_current_kline:
+    if not quote_has_bbo:
         try:
-            rows = get_contract_klines(
-                db,
-                symbol=normalized_symbol,
-                interval="1m",
-                limit=1,
-            )
-            latest_kline = rows[-1] if rows else None
+            depth = get_contract_depth(db, normalized_symbol, limit=5)
+        except ContractSymbolNotFound:
+            if contract_symbol is None and quote is None:
+                raise
+            warnings.append("depth_unavailable")
         except Exception as exc:
-            warnings.append(f"kline_unavailable:{type(exc).__name__}")
+            warnings.append(f"depth_unavailable:{type(exc).__name__}")
 
     return {
         "symbol": normalized_symbol,

@@ -155,9 +155,12 @@ async def contract_market_public_ws(
             interval=connected_interval,
         )
         manager_connected = True
+        # Start provider-native subscriptions before the potentially slow
+        # REST-backed bootstrap snapshot. This lets the snapshot consume a
+        # warm WS cache instead of serializing REST first and WS second.
+        await contract_market_gateway.ensure_symbol(connected_symbol)
         snapshot = await contract_market_gateway.snapshot(connected_symbol, connected_interval)
         await contract_market_ws_manager.send_to_one(websocket, snapshot)
-        await contract_market_gateway.ensure_symbol(connected_symbol)
 
         while True:
             try:

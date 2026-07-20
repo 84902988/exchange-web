@@ -262,8 +262,14 @@ function hasTickerData(view?: SpotMarketView | null): boolean {
   );
 }
 
+function normalizeSpotMarketIdentity(value: unknown): string {
+  return normalizeSpotSymbol(String(value || '')).replace(/[^A-Z0-9]/g, '');
+}
+
 function sameSymbol(value: unknown, symbol: string): boolean {
-  return normalizeSpotSymbol(String(value || '')) === symbol;
+  const eventIdentity = normalizeSpotMarketIdentity(value);
+  const activeIdentity = normalizeSpotMarketIdentity(symbol);
+  return Boolean(eventIdentity && activeIdentity && eventIdentity === activeIdentity);
 }
 
 function buildTradesPayload(symbol: string, trades: SpotMarketTradeItem[]) {
@@ -744,6 +750,7 @@ export function useSpotMarket(
   ) => {
     const presentDomains = getPresentSpotMarketDomains(view);
     const receivedAtMs = Date.now();
+    const storeSymbol = normalizeSpotMarketIdentity(normalizedSymbol);
     let tickerAccepted = !presentDomains.includes('ticker');
     let depthAccepted = !presentDomains.includes('depth');
     let tradesAccepted = !presentDomains.includes('trades');
@@ -760,7 +767,7 @@ export function useSpotMarket(
       spotPublicMarketStore.ingestTicker(tickerSnapshot);
       const authoritativeTickerSnapshot = spotPublicMarketStore
         .getState()
-        .symbols[normalizedSymbol]
+        .symbols[storeSymbol]
         ?.ticker.snapshot;
       tickerAccepted = (
         authoritativeTickerSnapshot?.snapshot_id === tickerSnapshot.snapshot_id
@@ -780,7 +787,7 @@ export function useSpotMarket(
       spotPublicMarketStore.ingestDepth(depthSnapshot);
       const authoritativeDepthSnapshot = spotPublicMarketStore
         .getState()
-        .symbols[normalizedSymbol]
+        .symbols[storeSymbol]
         ?.depth.snapshot;
       depthAccepted = (
         authoritativeDepthSnapshot?.snapshot_id === depthSnapshot.snapshot_id
@@ -806,13 +813,13 @@ export function useSpotMarket(
 
     const currentDomainEvents = {
       ticker: tickerSnapshotToDomainEvent(
-        spotPublicMarketStore.getState().symbols[normalizedSymbol]?.ticker.snapshot,
+        spotPublicMarketStore.getState().symbols[storeSymbol]?.ticker.snapshot,
       ),
       depth: depthSnapshotToDomainEvent(
-        spotPublicMarketStore.getState().symbols[normalizedSymbol]?.depth.snapshot,
+        spotPublicMarketStore.getState().symbols[storeSymbol]?.depth.snapshot,
       ),
       trades: tradesSnapshotToDomainEvent(
-        spotPublicMarketStore.getState().symbols[normalizedSymbol]?.trades.snapshot,
+        spotPublicMarketStore.getState().symbols[storeSymbol]?.trades.snapshot,
       ),
     };
     const currentEvents: NormalizedSpotMarketDomainEvent<SpotMarketDomainPayload>[] = [];
@@ -823,7 +830,7 @@ export function useSpotMarket(
       }
     }
     const currentTradesMetadata = getSpotTradesCollectionMetadata(
-      spotPublicMarketStore.getState().symbols[normalizedSymbol]?.trades.snapshot,
+      spotPublicMarketStore.getState().symbols[storeSymbol]?.trades.snapshot,
     );
     const buildNextView = (previousView: SpotMarketView | null) => {
       let nextView = mergeIncomingMarketViewBase(previousView, view, presentDomains);
@@ -1010,7 +1017,7 @@ export function useSpotMarket(
     const handleSnapshot = (message: SpotMarketRealtimeMessage) => {
       const snapshot = message as SpotMarketSnapshotMessage;
       const msgSymbol = normalizeSpotSymbol(snapshot.symbol || snapshot.market_view?.symbol || '');
-      if (msgSymbol !== normalizedSymbol) return;
+      if (!sameSymbol(msgSymbol, normalizedSymbol)) return;
 
       if (snapshot.market_view) {
         applyView(snapshot.market_view, 'ws_snapshot');
@@ -1034,7 +1041,7 @@ export function useSpotMarket(
   ]);
 
   useEffect(() => {
-    if (!tickerStoreEvent || tickerStoreEvent.symbol !== normalizedSymbol) return;
+    if (!tickerStoreEvent || !sameSymbol(tickerStoreEvent.symbol, normalizedSymbol)) return;
 
     const ticker = tickerStoreEvent.data;
     const tickerLastPrice = getTickerLastPrice(ticker);
@@ -1068,7 +1075,7 @@ export function useSpotMarket(
   }, [normalizedSymbol, tickerStoreEvent]);
 
   useEffect(() => {
-    if (!depthStoreEvent || depthStoreEvent.symbol !== normalizedSymbol) return;
+    if (!depthStoreEvent || !sameSymbol(depthStoreEvent.symbol, normalizedSymbol)) return;
 
     setMarketView((previousView) => {
       if (!previousView) return previousView;
@@ -1081,7 +1088,7 @@ export function useSpotMarket(
   }, [depthStoreEvent, normalizedSymbol]);
 
   useEffect(() => {
-    if (!tradesStoreEvent || tradesStoreEvent.symbol !== normalizedSymbol) return;
+    if (!tradesStoreEvent || !sameSymbol(tradesStoreEvent.symbol, normalizedSymbol)) return;
 
     const collectionMetadata = getSpotTradesCollectionMetadata(tradesStoreSlot?.snapshot);
     const authorityTrade = collectionMetadata?.authorityTrade;
@@ -1198,10 +1205,10 @@ export function useSpotMarket(
   const outputPriceDirection = hasActiveTrade ? lastTradeState.direction : priceDirection;
   const ticker = tickerStoreEvent?.data ?? null;
   const trades = tradesStoreEvent?.data ?? [];
-  const currentTradesEvent = tradesStoreEvent?.symbol === normalizedSymbol
+  const currentTradesEvent = sameSymbol(tradesStoreEvent?.symbol, normalizedSymbol)
     ? tradesStoreEvent
     : null;
-  const currentTickerEvent = tickerStoreEvent?.symbol === normalizedSymbol
+  const currentTickerEvent = sameSymbol(tickerStoreEvent?.symbol, normalizedSymbol)
     ? tickerStoreEvent
     : null;
   const latestTrade = getSpotTradesCollectionMetadata(tradesStoreSlot?.snapshot)?.authorityTrade

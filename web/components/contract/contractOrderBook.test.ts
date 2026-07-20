@@ -244,6 +244,29 @@ test('FULL mode renders asks, reference price, bids, and real-depth ratio', () =
   assert.equal(findByTestId(tree, 'contract-orderbook-sell-ratio-bar').props.style.width, '60%');
 });
 
+test('native ten-level stock depth keeps the nearest nine levels on each side', () => {
+  const tree = renderOrderBook({
+    asks: Array.from({ length: 10 }, (_, index) => ({
+      price: String(101 + index),
+      amount: String(index + 1),
+    })),
+    bids: Array.from({ length: 10 }, (_, index) => ({
+      price: String(99 - index),
+      amount: String(index + 1),
+    })),
+    depthMode: 'FULL_DEPTH',
+  });
+  const askText = textContent(findByTestId(tree, 'contract-orderbook-ask-rows'));
+  const bidText = textContent(findByTestId(tree, 'contract-orderbook-bid-rows'));
+
+  assert.match(askText, /101\.00/);
+  assert.match(askText, /109\.00/);
+  assert.doesNotMatch(askText, /110\.00/);
+  assert.match(bidText, /99\.00/);
+  assert.match(bidText, /91\.00/);
+  assert.doesNotMatch(bidText, /90\.00/);
+});
+
 test('reference center keeps the large authority price and adds its direction cue', () => {
   resetDisplayMode();
   const upTree = renderOrderBook({ priceDirection: 'up' });
@@ -290,25 +313,25 @@ test('SELL mode keeps the reference center and the aggregate two-sided depth rat
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-sell-ratio')), '60.00%');
 });
 
-test('BBO_ONLY keeps its hint and never publishes a market-depth ratio', () => {
+test('BBO_ONLY hides its mode label and never publishes a market-depth ratio', () => {
   resetDisplayMode();
   const tree = renderOrderBook({ depthMode: 'BBO_ONLY' });
 
   assert.equal(
-    textContent(findByTestId(tree, 'contract-orderbook-depth-mode-label')),
-    '\u6a21\u62df\u76d8\u53e3',
+    walk(tree).some((node) => node.props['data-testid'] === 'contract-orderbook-depth-mode-label'),
+    false,
   );
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-buy-ratio')), '--');
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-sell-ratio')), '--');
 });
 
-test('SYNTHETIC_FROM_BBO keeps its hint and never publishes a market-depth ratio', () => {
+test('SYNTHETIC_FROM_BBO hides its mode label and never publishes a market-depth ratio', () => {
   resetDisplayMode();
   const tree = renderOrderBook({ depthMode: 'SYNTHETIC_FROM_BBO' });
 
   assert.equal(
-    textContent(findByTestId(tree, 'contract-orderbook-depth-mode-label')),
-    '\u4ec5\u6700\u4f73\u4e70\u5356\u4ef7',
+    walk(tree).some((node) => node.props['data-testid'] === 'contract-orderbook-depth-mode-label'),
+    false,
   );
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-buy-ratio')), '--');
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-sell-ratio')), '--');
@@ -398,6 +421,11 @@ test('ratio rejects best-bid/best-ask-only evidence even when mislabeled FULL_DE
     asks: asks.slice(0, 1),
     depthMode: 'FULL_DEPTH',
   }), null);
+});
+
+test('unknown BBO quantity is displayed as unavailable instead of a synthetic lot', () => {
+  assert.equal(utilsModule.formatContractOrderBookAmount(0), '--');
+  assert.equal(utilsModule.formatContractOrderBookAmount(1), '1.000');
 });
 
 test('OrderBook does not duplicate the realtime status badge inside the panel', () => {

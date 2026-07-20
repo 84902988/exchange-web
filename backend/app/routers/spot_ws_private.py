@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 
 from jose import JWTError
@@ -14,10 +16,31 @@ router = APIRouter(
     tags=["spot-private"],
 )
 
+SPOT_PRIVATE_WS_AUTH_PROTOCOL = "spot-auth"
+
+
+def _private_ws_protocols(websocket: WebSocket) -> list[str]:
+    return [
+        value.strip()
+        for value in (websocket.headers.get("sec-websocket-protocol") or "").split(",")
+        if value.strip()
+    ]
+
+
+def _private_ws_protocol_token(websocket: WebSocket) -> str | None:
+    protocols = _private_ws_protocols(websocket)
+    try:
+        auth_index = protocols.index(SPOT_PRIVATE_WS_AUTH_PROTOCOL)
+    except ValueError:
+        return None
+    token_index = auth_index + 1
+    return protocols[token_index] if token_index < len(protocols) else None
+
 
 def _get_user_id_from_websocket(websocket: WebSocket) -> int:
     token = (
-        websocket.cookies.get(settings.ACCESS_TOKEN_COOKIE_NAME or "access_token")
+        _private_ws_protocol_token(websocket)
+        or websocket.cookies.get(settings.ACCESS_TOKEN_COOKIE_NAME or "access_token")
         or websocket.query_params.get("access_token")
         or websocket.query_params.get("token")
     )
@@ -54,7 +77,12 @@ async def spot_private_ws(websocket: WebSocket):
     manager_connected = False
 
     try:
-        await websocket.accept()
+        negotiated_protocol = (
+            SPOT_PRIVATE_WS_AUTH_PROTOCOL
+            if SPOT_PRIVATE_WS_AUTH_PROTOCOL in _private_ws_protocols(websocket)
+            else None
+        )
+        await websocket.accept(subprotocol=negotiated_protocol)
 
         await spot_private_ws_manager.connect(user_id, connected_symbol, websocket)
         manager_connected = True

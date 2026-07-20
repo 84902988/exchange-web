@@ -3,6 +3,7 @@ import { contractMarketStore } from '../../lib/realtime/contractMarketStore';
 import {
   activateContractMarketShadowSymbol,
   ingestContractMarketWsDomain,
+  selectContractMarketViewStoreAuthoritySnapshot,
   selectContractOrderBookStoreSnapshot,
   subscribeContractOrderBookStore,
   writeContractMarketShadowDomain,
@@ -209,6 +210,67 @@ describe('Contract OrderBook realtime store adapter', () => {
       revision: { epoch: 17, sequence: 41 },
     });
     unsubscribe();
+  });
+
+  it('advances real BBO-only prices when the provider does not publish quantity', () => {
+    contractMarketStore.resetForTests();
+    activateContractMarketShadowSymbol('XAUUSDT_PERP');
+
+    const first = ingestContractMarketWsDomain({
+      domain: 'depth',
+      message: {
+        type: 'contract_depth',
+        symbol: 'XAUUSDT_PERP',
+        depth: {
+          symbol: 'XAUUSDT_PERP',
+          bids: [['4010.33', '0']],
+          asks: [['4010.93', '0']],
+          depth_mode: 'BBO_ONLY',
+          source: 'LIVE_WS',
+          quote_freshness: 'LIVE',
+          provider: 'ITICK',
+          provider_event_time_ms: 1_720_000_000_100,
+        },
+      },
+    });
+    const second = ingestContractMarketWsDomain({
+      domain: 'depth',
+      message: {
+        type: 'contract_depth',
+        symbol: 'XAUUSDT_PERP',
+        depth: {
+          symbol: 'XAUUSDT_PERP',
+          bids: [['4011.12', '0']],
+          asks: [['4011.74', '0']],
+          depth_mode: 'BBO_ONLY',
+          source: 'LIVE_WS',
+          quote_freshness: 'LIVE',
+          provider: 'ITICK',
+          provider_event_time_ms: 1_720_000_000_200,
+        },
+      },
+    });
+
+    expect(first).toMatchObject({ accepted: true });
+    expect(second).toMatchObject({ accepted: true });
+    expect(selectOrderBook()).toMatchObject({
+      symbol: 'XAUUSDT_PERP',
+      bestBid: '4011.12',
+      bestAsk: '4011.74',
+      midpoint: '4011.43',
+      depthMode: 'BBO_ONLY',
+      source: 'LIVE_WS',
+      provider: 'ITICK',
+    });
+    expect(selectContractMarketViewStoreAuthoritySnapshot(
+      contractMarketStore.getState(),
+      'XAUUSDT_PERP',
+    )).toMatchObject({
+      bestBid: '4011.12',
+      bestAsk: '4011.74',
+      depthSource: 'LIVE_WS',
+      hasRealtimeBboAuthority: true,
+    });
   });
 
   it('keeps the REST depth generation when same-provider WS frames omit it', () => {

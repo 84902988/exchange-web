@@ -12,10 +12,18 @@ import {
   type SpotTradingViewBar,
 } from './spotKlineClientCache';
 import { markSpotKlinePerf } from './spotKlinePerf';
+import {
+  KLINE_PRELOAD_IDLE_DELAY_MS,
+  KLINE_PRELOAD_IDLE_TIMEOUT_MS,
+  KLINE_PRELOAD_BACKGROUND_INTERVAL_LIMIT,
+  KLINE_PRELOAD_REQUEST_GAP_MS,
+  promoteKlinePreloadInterval,
+  rankKlinePreloadIntervals,
+} from '@/lib/tradingview/klinePreloadPriority';
 
 export const SPOT_KLINE_PRELOAD_COMMON_INTERVALS = ['4h', '1h', '15m', '5m', '1m'];
 export const SPOT_KLINE_PRELOAD_COARSE_INTERVALS = ['1d', '1w', '1M'];
-export const SPOT_KLINE_PRELOAD_DELAY_MS = 1800;
+export const SPOT_KLINE_PRELOAD_DELAY_MS = KLINE_PRELOAD_IDLE_DELAY_MS;
 export const SPOT_KLINE_PRELOAD_MAX_CONCURRENCY = 1;
 
 const SPOT_KLINE_PRELOAD_LIMIT_BY_INTERVAL: Readonly<Record<string, number>> = {
@@ -36,7 +44,7 @@ const SPOT_PRELOAD_ALLOWED_INTERVALS = new Set([
   '1Wutc',
   '1Dutc',
 ]);
-const SPOT_KLINE_PRELOAD_GAP_MS = 300;
+const SPOT_KLINE_PRELOAD_GAP_MS = KLINE_PRELOAD_REQUEST_GAP_MS;
 
 export function getSpotKlinePreloadLimit(interval: string): number {
   const backendInterval = getBackendKlineIntervalForSpotInterval(
@@ -69,6 +77,7 @@ export type SpotKlinePreloadHistoryEvent = {
 
 export type SpotKlinePreloadManager = {
   schedule: (event: SpotKlinePreloadHistoryEvent, reason: string) => void;
+  prewarmInterval: (interval: string, reason: string) => boolean;
   cancel: (reason: string) => void;
   setForegroundState: (state: SpotKlinePreloadForegroundState) => void;
 };
@@ -509,7 +518,7 @@ function requestSpotKlinePreloadIdle(callback: () => void): SpotKlinePreloadIdle
   if (typeof window.requestIdleCallback === 'function') {
     return {
       type: 'idle',
-      id: window.requestIdleCallback(callback, { timeout: 1200 }),
+      id: window.requestIdleCallback(callback, { timeout: KLINE_PRELOAD_IDLE_TIMEOUT_MS }),
     };
   }
 
@@ -570,13 +579,7 @@ export function getSpotPreloadIntervals() {
 }
 
 export function getSpotBackgroundPreloadIntervals(activeInterval: string) {
-  const activeBackendInterval = getBackendKlineIntervalForSpotInterval(
-    normalizeSpotInterval(activeInterval),
-  );
-  return getSpotPreloadIntervals().filter((interval) => (
-    getBackendKlineIntervalForSpotInterval(normalizeSpotInterval(interval))
-    !== activeBackendInterval
-  ));
+  return rankKlinePreloadIntervals(activeInterval, getSpotPreloadIntervals());
 }
 
 export async function preloadSpotTradingViewKlineCache({
@@ -831,6 +834,9 @@ export function createSpotKlinePreloadManager(params: {
   let preloadOwnerSymbol = '';
   let preloadRunning = false;
   let preloadSeq = 0;
+  let preloadQueue: string[] = [];
+  let activePreloadInterval = '';
+  let pendingIntentInterval = '';
   let foregroundState: SpotKlinePreloadForegroundState | null = null;
   let deferredSchedule: { event: SpotKlinePreloadHistoryEvent; reason: string } | null = null;
 
@@ -847,6 +853,8 @@ export function createSpotKlinePreloadManager(params: {
     }
     preloadOwnerSymbol = '';
     preloadRunning = false;
+    preloadQueue = [];
+    activePreloadInterval = '';
     if (hadPendingWork) {
       const state = params.getState();
       markSpotKlinePerf('kline_preload_cancel', {
@@ -861,6 +869,7 @@ export function createSpotKlinePreloadManager(params: {
     stopActiveSequence(reason);
     foregroundState = null;
     deferredSchedule = null;
+    pendingIntentInterval = '';
   };
 
   const schedule = (event: SpotKlinePreloadHistoryEvent, reason: string) => {
@@ -875,7 +884,12 @@ export function createSpotKlinePreloadManager(params: {
 
     const eventInterval = event.interval || activeInterval;
     const eventBackendInterval = event.backendInterval || getBackendKlineIntervalForSpotInterval(eventInterval);
-    const intervals = getSpotBackgroundPreloadIntervals(eventBackendInterval);
+    let intervals = getSpotBackgroundPreloadIntervals(eventBackendInterval)
+      .slice(0, KLINE_PRELOAD_BACKGROUND_INTERVAL_LIMIT);
+    if (pendingIntentInterval) {
+      intervals = promoteKlinePreloadInterval(intervals, pendingIntentInterval);
+      pendingIntentInterval = '';
+    }
     if (!intervals.length) return;
     deferredSchedule = { event, reason };
 
@@ -902,6 +916,7 @@ export function createSpotKlinePreloadManager(params: {
 
     const scheduleSeq = ++preloadSeq;
     preloadOwnerSymbol = activeSymbol;
+    preloadQueue = [...intervals];
     markSpotKlinePerf('kline_preload_schedule', {
       symbol: activeSymbol,
       interval: eventInterval,
@@ -919,15 +934,29 @@ export function createSpotKlinePreloadManager(params: {
         preloadIdle = null;
         if (preloadSeq !== scheduleSeq) return;
         preloadRunning = true;
-        void preloadSpotTradingViewKlineCache({
-          symbol: activeSymbol,
-          intervals,
-          concurrency: SPOT_KLINE_PRELOAD_MAX_CONCURRENCY,
-          shouldContinue: () => (
-            preloadSeq === scheduleSeq &&
-            normalizeSpotSymbol(params.getState().symbol) === activeSymbol
-          ),
-        }).catch((err: unknown) => {
+        const shouldContinue = () => (
+          preloadSeq === scheduleSeq
+          && !foregroundState?.loading
+          && normalizeSpotSymbol(params.getState().symbol) === activeSymbol
+        );
+        const runQueue = async () => {
+          while (shouldContinue()) {
+            const interval = preloadQueue.shift();
+            if (!interval) return;
+            activePreloadInterval = interval;
+            try {
+              await preloadSpotTradingViewKlineCache({
+                symbol: activeSymbol,
+                intervals: [interval],
+                concurrency: SPOT_KLINE_PRELOAD_MAX_CONCURRENCY,
+                shouldContinue,
+              });
+            } finally {
+              if (activePreloadInterval === interval) activePreloadInterval = '';
+            }
+          }
+        };
+        void runQueue().catch((err: unknown) => {
           if (process.env.NODE_ENV !== 'production') {
             console.debug('[SpotKlinePreloadManager] preload kline cache failed', {
               symbol: activeSymbol,
@@ -939,10 +968,43 @@ export function createSpotKlinePreloadManager(params: {
           if (preloadSeq === scheduleSeq && preloadOwnerSymbol === activeSymbol) {
             preloadOwnerSymbol = '';
             preloadRunning = false;
+            preloadQueue = [];
+            activePreloadInterval = '';
           }
         });
       });
     }, SPOT_KLINE_PRELOAD_DELAY_MS);
+  };
+
+  const prewarmInterval = (interval: string, reason: string) => {
+    const state = params.getState();
+    const activeSymbol = normalizeSpotSymbol(state.symbol);
+    const targetInterval = getBackendKlineIntervalForSpotInterval(normalizeSpotInterval(interval));
+    const activeInterval = getBackendKlineIntervalForSpotInterval(normalizeSpotInterval(state.interval));
+    if (!activeSymbol || !targetInterval || targetInterval === activeInterval) return false;
+    if (!isSpotPreloadAllowedInterval(targetInterval)) return false;
+
+    pendingIntentInterval = targetInterval;
+    if (foregroundState?.loading) return false;
+    if (activePreloadInterval === targetInterval) {
+      pendingIntentInterval = '';
+      return true;
+    }
+    if (preloadOwnerSymbol === activeSymbol && (preloadTimer !== null || preloadIdle !== null || preloadRunning)) {
+      preloadQueue = promoteKlinePreloadInterval(preloadQueue, targetInterval)
+        .slice(0, KLINE_PRELOAD_BACKGROUND_INTERVAL_LIMIT);
+      pendingIntentInterval = '';
+      markSpotKlinePerf('kline_preload_intent_promoted', {
+        symbol: activeSymbol,
+        interval: targetInterval,
+        reason,
+      });
+      return true;
+    }
+    const deferred = deferredSchedule;
+    if (!deferred) return false;
+    schedule(deferred.event, `${deferred.reason}; ${reason}`);
+    return true;
   };
 
   const setForegroundState = (state: SpotKlinePreloadForegroundState) => {
@@ -960,6 +1022,7 @@ export function createSpotKlinePreloadManager(params: {
       ) return;
       const changedGeneration = foregroundState?.generation !== normalizedState.generation;
       foregroundState = normalizedState;
+      pendingIntentInterval = '';
       if (changedGeneration || preloadTimer !== null || preloadIdle !== null || preloadRunning) {
         stopActiveSequence('foreground resolution loading');
       }
@@ -1004,6 +1067,7 @@ export function createSpotKlinePreloadManager(params: {
 
   return {
     schedule,
+    prewarmInterval,
     cancel,
     setForegroundState,
   };

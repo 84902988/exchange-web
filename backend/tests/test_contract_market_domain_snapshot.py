@@ -148,6 +148,24 @@ def test_depth_snapshot_preserves_book_and_marks_one_sided_data_partial():
     assert snapshot.metadata.completeness.missing_fields == ["asks"]
 
 
+def test_bbo_snapshot_keeps_prices_when_provider_quantity_is_unavailable():
+    snapshot = map_contract_depth_domain_snapshot(
+        context=_live_context(provider_generation=1),
+        depth={
+            "symbol": "XAGUSDT_PERP",
+            "provider": "ITICK",
+            "source": "LIVE_WS",
+            "depth_mode": "BBO_ONLY",
+            "bids": [["57.084", "0"]],
+            "asks": [["57.105", "0"]],
+        },
+    )
+
+    assert snapshot.metadata.completeness.status == ContractMarketDomainCompletenessStatus.COMPLETE
+    assert snapshot.data["bids"] == [["57.084", "0"]]
+    assert snapshot.data["asks"] == [["57.105", "0"]]
+
+
 def test_trades_snapshot_accepts_legacy_list_without_reshaping_it():
     trades = [
         {

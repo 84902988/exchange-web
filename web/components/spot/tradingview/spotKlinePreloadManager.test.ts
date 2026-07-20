@@ -146,6 +146,11 @@ const cacheModule = {
   },
 }
 
+const preloadPriorityModule = loadTypeScriptModule(
+  fileURLToPath(new URL('../../../lib/tradingview/klinePreloadPriority.ts', import.meta.url)),
+  {},
+)
+
 const preloadModule = loadTypeScriptModule(
   fileURLToPath(new URL('./spotKlinePreloadManager.ts', import.meta.url)),
   {
@@ -158,6 +163,7 @@ const preloadModule = loadTypeScriptModule(
         perfEvents.push({ event, payload })
       },
     },
+    '@/lib/tradingview/klinePreloadPriority': preloadPriorityModule,
   },
 )
 
@@ -688,11 +694,11 @@ test('background preload excludes the foreground interval', () => {
 
   assert.deepEqual(
     preloadModule.getSpotBackgroundPreloadIntervals('1m'),
-    ['4h', '1h', '15m', '5m', '1d', '1w', '1M'],
+    ['5m', '15m', '1h', '4h', '1d', '1w', '1M'],
   )
   assert.deepEqual(
     preloadModule.getSpotBackgroundPreloadIntervals('1M'),
-    ['4h', '1h', '15m', '5m', '1m', '1d', '1w'],
+    ['1w', '1d', '4h', '1h', '15m', '5m', '1m'],
   )
 })
 
@@ -827,12 +833,35 @@ test('foreground loading cancels pending preload dispatch and resumes alternativ
   await wait(0)
   await wait(0)
 
-  assert.equal(fetchCalls[0]?.interval, '4h')
+  assert.equal(fetchCalls[0]?.interval, '1Wutc')
   assert.equal(fetchCalls.some((call) => call.interval === '1Mutc'), false)
   assert.ok(perfEvents.some((entry) => (
     entry.event === 'kline_preload_foreground_resume'
-    && entry.payload.delay_ms === 1_800
+    && entry.payload.delay_ms === 180
   )))
+})
+
+test('toolbar intent promotes the requested interval ahead of the idle queue', async () => {
+  resetHarness()
+  const state = { symbol: 'BTCUSDT', interval: '1m', resolution: '1' }
+  const manager = preloadModule.createSpotKlinePreloadManager({ getState: () => state })
+  manager.schedule({
+    phase: 'current',
+    isHistoryRequest: false,
+    symbol: 'BTCUSDT',
+    resolution: '1',
+    interval: '1m',
+    backendInterval: '1m',
+    requiredBars: 329,
+    barCount: 329,
+  }, 'initial history')
+  assert.equal(manager.prewarmInterval('1h', 'toolbar-pointerenter'), true)
+  await wait(0)
+  await wait(0)
+
+  assert.equal(fetchCalls[0]?.interval, '1h')
+  assert.ok(perfEvents.some((entry) => entry.event === 'kline_preload_intent_promoted'))
+  manager.cancel('test complete')
 })
 
 test('running preload may finish during foreground loading but cannot dispatch its next interval', async () => {

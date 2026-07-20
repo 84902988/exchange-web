@@ -669,7 +669,7 @@ def _depth_level_valid(value: Any) -> bool:
         price, amount = value[0], value[1]
     else:
         return False
-    return _positive_decimal(price) and _positive_decimal(amount)
+    return _positive_decimal(price) and _positive_decimal(amount, allow_zero=True)
 
 
 def _depth_completeness(

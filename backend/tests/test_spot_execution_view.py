@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from decimal import Decimal
 
@@ -60,6 +61,14 @@ def _depth(
 
 
 def _gateway(active_provider: str = "OKX_SPOT") -> SpotMarketGateway:
+    # Python 3.9's asyncio.Lock constructor still requires a current loop.
+    # Earlier tests may legitimately call asyncio.run(), which clears the
+    # policy loop when it exits, so make this synchronous test helper
+    # independent of collection/execution order.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     gateway = SpotMarketGateway(
         provider_symbol_allowed=lambda symbol: True,
         precision_resolver=lambda symbol: (2, 4),

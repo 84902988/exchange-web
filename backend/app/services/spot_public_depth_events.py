@@ -81,6 +81,63 @@ def publish_spot_public_depth_refresh(
                     )
 
 
+def publish_spot_public_trade(
+    symbol: str,
+    *,
+    price: Any,
+    amount: Any,
+    side: str,
+    ts: int,
+    trade_id: Any = None,
+    kline_updates: list[dict[str, Any]] | None = None,
+    redis_factory: Callable[[], Any] = _default_publisher_redis_factory,
+) -> bool:
+    """Publish one internal fill for ordered fan-out on every API event loop."""
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return False
+    redis = None
+    try:
+        redis = redis_factory()
+        redis.publish(
+            SPOT_PUBLIC_DEPTH_EVENTS_CHANNEL,
+            json.dumps(
+                {
+                    "event_id": f"spot-trade-{uuid4().hex}",
+                    "event_type": "trade",
+                    "symbol": normalized_symbol,
+                    "price": str(price),
+                    "amount": str(amount),
+                    "side": str(side or "").upper(),
+                    "ts": int(ts),
+                    "trade_id": trade_id,
+                    "kline_updates": list(kline_updates or []),
+                    "reason": "trade_matched",
+                    "publisher_id": SPOT_PUBLIC_DEPTH_WORKER_ID,
+                    "published_at_ms": int(time.time() * 1000),
+                },
+                separators=(",", ":"),
+            ),
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "spot_public_trade_event_publish_failed symbol=%s trade_id=%s",
+            normalized_symbol,
+            trade_id,
+            exc_info=True,
+        )
+        return False
+    finally:
+        if redis is not None:
+            close = getattr(redis, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.debug("spot public trade publisher redis close failed", exc_info=True)
+
+
 def _decode_event(data: Any) -> dict[str, Any] | None:
     if isinstance(data, (bytes, bytearray)):
         data = data.decode("utf-8")
@@ -123,7 +180,8 @@ class SpotPublicDepthEventDispatcher:
 
     async def dispatch(self, event: dict[str, Any]) -> bool:
         publisher_id = str(event.get("publisher_id") or "").strip()
-        if publisher_id and publisher_id == self._local_worker_id:
+        event_type = str(event.get("event_type") or "depth").lower().strip()
+        if event_type != "trade" and publisher_id and publisher_id == self._local_worker_id:
             return False
 
         event_id = str(event.get("event_id") or "").strip()
@@ -135,6 +193,25 @@ class SpotPublicDepthEventDispatcher:
             return False
         db = self._session_factory()
         try:
+            if event_type == "trade":
+                await self._manager.send_trade(
+                    symbol=symbol,
+                    price=event.get("price"),
+                    amount=event.get("amount"),
+                    side=str(event.get("side") or ""),
+                    ts=int(event.get("ts") or 0),
+                    trade_id=event.get("trade_id"),
+                )
+                for update in event.get("kline_updates") or []:
+                    if not isinstance(update, dict):
+                        continue
+                    await self._manager.broadcast_provider_kline_update(
+                        symbol,
+                        str(update.get("interval") or "1m"),
+                        update.get("kline") or {},
+                        source=str(update.get("source") or "INTERNAL_TRADE"),
+                        updated_at=update.get("updated_at"),
+                    )
             await self._manager.send_depth_update(db=db, symbol=symbol, limit=20)
             await self._manager.send_snapshot(db, symbol)
         finally:
@@ -144,13 +221,17 @@ class SpotPublicDepthEventDispatcher:
 
 
 def _coalesce_events_by_symbol(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    trade_events: list[dict[str, Any]] = []
     latest_by_symbol: dict[str, dict[str, Any]] = {}
     for event in events:
         symbol = str(event.get("symbol") or "").upper().strip()
         if not symbol:
             continue
+        if str(event.get("event_type") or "depth").lower().strip() == "trade":
+            trade_events.append(event)
+            continue
         latest_by_symbol[symbol] = event
-    return list(latest_by_symbol.values())
+    return [*trade_events, *latest_by_symbol.values()]
 
 
 def _default_redis_factory() -> Any:

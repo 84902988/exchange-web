@@ -28,6 +28,7 @@ import ContractOrderTabs, {
 } from './ContractOrderTabs';
 import { formatPrice as formatMarketPrice } from '@/lib/marketPrecision';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import { useDisplayTimeZone } from '@/hooks/useDisplayTimeZone';
 import type { ContractOrderFilterState, ContractTradeFilterState } from './hooks/useContractUserState';
 import {
   resolveContractTpSlEditorReference,
@@ -39,6 +40,7 @@ import {
   validateContractTpSlPrices,
   type ContractTpSlDraftFieldOrigin,
 } from './contractTpSlDraftPolicy';
+import { resolveLiveContractPositionValuation } from './contractPositionValuation';
 
 export type ContractPositionTabKey = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
 type TabKey = ContractPositionTabKey;
@@ -101,6 +103,10 @@ type ContractPositionTabsProps = {
   orders: ContractOrderListItem[];
   trades: ContractTradeListItem[];
   quote?: ContractQuote | null;
+  liveBestBid?: string | number | null;
+  liveBestAsk?: string | number | null;
+  liveMarketUsable?: boolean;
+  tradfiSymbols?: readonly string[];
   tpSlTriggerPriceType?: ContractTpSlTriggerPriceType | string | null;
   pricePrecision: number;
   quantityUnit?: string;
@@ -183,6 +189,10 @@ export default function ContractPositionTabs({
   orders,
   trades,
   quote,
+  liveBestBid,
+  liveBestAsk,
+  liveMarketUsable = false,
+  tradfiSymbols = [],
   tpSlTriggerPriceType,
   pricePrecision,
   quantityUnit = 'BTC',
@@ -295,6 +305,10 @@ export default function ContractPositionTabs({
     [activeFilterGroups, activeFilterValues, supportsOrderTradeFilters, t],
   );
   const normalizedCurrentSymbol = useMemo(() => normalizeContractSymbol(currentSymbol), [currentSymbol]);
+  const tradfiSymbolSet = useMemo(
+    () => new Set(tradfiSymbols.map((symbol) => normalizeContractSymbol(symbol)).filter(Boolean)),
+    [tradfiSymbols],
+  );
   const currentPositionRowsSource = useMemo(
     () => positionsPagination ? (positionsPageItems || []) : positions,
     [positions, positionsPageItems, positionsPagination],
@@ -545,7 +559,7 @@ export default function ContractPositionTabs({
       setPendingClosePosition(null);
       setCloseQuantityDraft('');
       setPendingCloseSummary(null);
-      await onSuccess();
+      void Promise.resolve(onSuccess()).catch(() => undefined);
     } catch (error) {
       const message = friendlyContractError(error, t);
       if (pendingClosePosition) {
@@ -589,7 +603,7 @@ export default function ContractPositionTabs({
       setPendingClosePosition(null);
       setCloseQuantityDraft('');
       setPendingCloseSummary(null);
-      await onSuccess();
+      void Promise.resolve(onSuccess()).catch(() => undefined);
     } catch (error) {
       setClosePositionError(friendlyContractError(error, t));
     } finally {
@@ -658,7 +672,7 @@ export default function ContractPositionTabs({
       setPendingCloseSummary(null);
       setConfirmError('');
       setOrderFeedback({ type: 'success', message: t('closePositionSuccess', 'contracts') });
-      await onSuccess();
+      void Promise.resolve(onSuccess()).catch(() => undefined);
     } catch (error) {
       const message = friendlyContractError(error, t);
       if (directSubmit) {
@@ -693,7 +707,9 @@ export default function ContractPositionTabs({
       position: { ...position, side },
       positions: [{ ...position, side }],
       referencePrice: referencePrice === null || referencePrice === undefined ? null : String(referencePrice),
-      referencePriceLabel: tpSlReferencePriceLabel,
+      referencePriceLabel: tradfiSymbolSet.has(normalizeContractSymbol(position.symbol))
+        ? t('valuationPrice', 'contracts')
+        : tpSlReferencePriceLabel,
       takeProfitPrice: draftPrices.takeProfit.value,
       takeProfitOrigin: draftPrices.takeProfit.origin,
       stopLossPrice: draftPrices.stopLoss.value,
@@ -735,7 +751,9 @@ export default function ContractPositionTabs({
       position: { ...representative, side },
       positions: detailPositions.map((position) => ({ ...position, side: getPositionRecordSide(position) || side })),
       referencePrice: referencePrice === null || referencePrice === undefined ? null : String(referencePrice),
-      referencePriceLabel: tpSlReferencePriceLabel,
+      referencePriceLabel: tradfiSymbolSet.has(normalizeContractSymbol(summary.symbol))
+        ? t('valuationPrice', 'contracts')
+        : tpSlReferencePriceLabel,
       takeProfitPrice: draftPrices.takeProfit.value,
       takeProfitOrigin: draftPrices.takeProfit.origin,
       stopLossPrice: draftPrices.stopLoss.value,
@@ -764,6 +782,10 @@ export default function ContractPositionTabs({
       quote,
       triggerPriceType: normalizedTpSlTriggerPriceType,
       fallback: tpSlDraft.referencePrice,
+      liveBestBid,
+      liveBestAsk,
+      liveMarketUsable,
+      preferLiveBbo: tradfiSymbolSet.has(normalizeContractSymbol(tpSlDraft.position.symbol)),
     });
     const side = getPositionRecordSide(tpSlDraft.position);
     if (!side) {
@@ -851,13 +873,13 @@ export default function ContractPositionTabs({
       if (failedCount > 0) {
         setTpSlError(failedCount === results.length ? t('tpSlSaveFailedRetry', 'contracts') : t('tpSlPartialSaveFailed', 'contracts'));
         if (failedCount < results.length) {
-          await onSuccess();
+          void Promise.resolve(onSuccess()).catch(() => undefined);
         }
         return;
       }
       closeTpSlEditor();
       setOrderFeedback({ type: 'success', message: t('tpSlUpdated', 'contracts') });
-      await onSuccess();
+      void Promise.resolve(onSuccess()).catch(() => undefined);
     } catch (error) {
       setTpSlError(friendlyContractError(error, t));
     } finally {
@@ -926,8 +948,12 @@ export default function ContractPositionTabs({
             <SummaryPositionsCards
               rows={pagedOpenPositionSummaries}
               currentSymbol={normalizedCurrentSymbol}
+              tradfiSymbols={tradfiSymbolSet}
               scope={scope}
               quote={quote}
+              liveBestBid={liveBestBid}
+              liveBestAsk={liveBestAsk}
+              liveMarketUsable={liveMarketUsable}
               tpSlTriggerPriceType={normalizedTpSlTriggerPriceType}
               tpSlTriggerPriceTypeHint={tpSlTriggerPriceTypeHint}
               pricePrecision={pricePrecision}
@@ -1105,6 +1131,10 @@ export default function ContractPositionTabs({
               quote,
               triggerPriceType: normalizedTpSlTriggerPriceType,
               fallback: tpSlDraft.referencePrice,
+              liveBestBid,
+              liveBestAsk,
+              liveMarketUsable,
+              preferLiveBbo: tradfiSymbolSet.has(normalizeContractSymbol(tpSlDraft.position.symbol)),
             }) || ''),
           }}
           error={tpSlError}
@@ -1530,8 +1560,12 @@ function PositionScopeSwitcher({
 function SummaryPositionsCards({
   rows,
   currentSymbol,
+  tradfiSymbols,
   scope,
   quote,
+  liveBestBid,
+  liveBestAsk,
+  liveMarketUsable,
   tpSlTriggerPriceType,
   tpSlTriggerPriceTypeHint,
   pricePrecision,
@@ -1550,8 +1584,12 @@ function SummaryPositionsCards({
 }: {
   rows: AggregatedPositionRow[];
   currentSymbol: string;
+  tradfiSymbols: ReadonlySet<string>;
   scope: PositionScope;
   quote?: ContractQuote | null;
+  liveBestBid?: string | number | null;
+  liveBestAsk?: string | number | null;
+  liveMarketUsable: boolean;
   tpSlTriggerPriceType: ContractTpSlTriggerPriceType;
   tpSlTriggerPriceTypeHint: string;
   pricePrecision: number;
@@ -1596,18 +1634,45 @@ function SummaryPositionsCards({
         const side = normalizePositionSide(item.side);
         const itemSymbol = normalizeContractSymbol(item.symbol);
         const isCurrent = itemSymbol === currentSymbol;
+        const usesValuationPrice = tradfiSymbols.has(itemSymbol);
         const markPrice: string | number | null = toNumber(item.mark_price) > 0
           ? item.mark_price ?? null
           : item.positions.find((position) => toNumber(position.mark_price) > 0)?.mark_price ?? null;
         const truthUnavailableLabel = getPositionTruthUnavailableLabel(item);
-        const riskMarkPrice: string | number | null = !truthUnavailableLabel && toNumber(item.mark_price) > 0
+        const liveValuation = resolveLiveContractPositionValuation({
+          positionSymbol: item.symbol,
+          currentSymbol,
+          side: item.side,
+          quantity: item.quantity,
+          entryPrice: item.avg_entry_price,
+          marginAmount: item.margin_amount,
+          quote,
+          liveBestBid,
+          liveBestAsk,
+          liveMarketUsable,
+          useBboMidpoint: usesValuationPrice,
+        });
+        const displayTruthUnavailableLabel = liveValuation ? null : truthUnavailableLabel;
+        const snapshotMarkPrice: string | number | null = !truthUnavailableLabel && toNumber(item.mark_price) > 0
           ? item.mark_price ?? null
           : null;
+        const displayValuationPrice: string | number | null = liveValuation?.price ?? snapshotMarkPrice;
         const tpSlReferencePrice = isCurrent
-          ? resolveContractTpSlQuoteReference(quote, tpSlTriggerPriceType, markPrice)
+          ? resolveContractTpSlQuoteReference(quote, tpSlTriggerPriceType, markPrice, {
+              liveBestBid,
+              liveBestAsk,
+              liveMarketUsable,
+              preferLiveBbo: usesValuationPrice,
+            })
           : markPrice;
-        const unrealized = getPositionUnrealizedPnl(item);
-        const roe = getPositionRoe(item);
+        const unrealized = liveValuation?.unrealizedPnl ?? getPositionUnrealizedPnl(item);
+        const roe = liveValuation?.roe ?? getPositionRoe(item);
+        const priceLabel = usesValuationPrice ? t('valuationPrice', 'contracts') : t('markPrice', 'contracts');
+        const priceLabelTitle = usesValuationPrice ? t('valuationPriceRiskTitle', 'contracts') : t('markPriceRiskTitle', 'contracts');
+        const unrealizedLabel = usesValuationPrice ? t('unrealizedPnlByValuation', 'contracts') : t('unrealizedPnlByMark', 'contracts');
+        const unrealizedLabelTitle = usesValuationPrice
+          ? t('unrealizedPnlValuationPriceTitle', 'contracts')
+          : t('unrealizedPnlMarkPriceTitle', 'contracts');
         const displayUnit = scope === 'current' ? quantityUnit : inferPositionQuantityUnit(item.symbol, quantityUnit);
         const closing = closingSummaryKey === summaryKey;
         const detailsExpanded = expandedDetailKeys.has(summaryKey);
@@ -1673,15 +1738,15 @@ function SummaryPositionsCards({
                 value={`${formatDisplayPrice(item.avg_entry_price, pricePrecision)} USDT`}
               />
               <PositionMetric
-                label={t('markPrice', 'contracts')}
-                labelTitle={t('markPriceRiskTitle', 'contracts')}
-                value={truthUnavailableLabel ?? (riskMarkPrice ? `${formatDisplayPrice(riskMarkPrice, pricePrecision)} USDT` : '--')}
+                label={priceLabel}
+                labelTitle={priceLabelTitle}
+                value={displayTruthUnavailableLabel ?? (displayValuationPrice ? `${formatDisplayPrice(displayValuationPrice, pricePrecision)} USDT` : '--')}
               />
               <PositionMetric label={t('margin', 'contracts')} value={`${formatNumber(item.margin_amount, 4)} USDT`} />
               <PositionMetric
-                label={t('unrealizedPnlByMark', 'contracts')}
-                labelTitle={t('unrealizedPnlMarkPriceTitle', 'contracts')}
-                value={unrealized === null ? (truthUnavailableLabel ?? '--') : `${formatSignedPnl(unrealized, 4)} USDT`}
+                label={unrealizedLabel}
+                labelTitle={unrealizedLabelTitle}
+                value={unrealized === null ? (displayTruthUnavailableLabel ?? '--') : `${formatSignedPnl(unrealized, 4)} USDT`}
                 valueClassName={unrealized === null ? 'text-white/55' : unrealized > 0 ? 'text-[#00c087]' : unrealized < 0 ? 'text-[#f6465d]' : 'text-white/55'}
               />
               <PositionMetric
@@ -1719,6 +1784,12 @@ function SummaryPositionsCards({
                     index={index}
                     position={position}
                     markPrice={markPrice}
+                    currentSymbol={currentSymbol}
+                    quote={quote}
+                    liveBestBid={liveBestBid}
+                    liveBestAsk={liveBestAsk}
+                    liveMarketUsable={liveMarketUsable}
+                    usesValuationPrice={usesValuationPrice}
                     tpSlTriggerPriceTypeHint={tpSlTriggerPriceTypeHint}
                     pricePrecision={pricePrecision}
                     closing={closingId === position.id}
@@ -2003,7 +2074,8 @@ function HistoryPositionsTable({
   isLoggedIn: boolean;
   loading: boolean;
 }) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
   if (rows.length === 0) {
     return (
       <EmptyState
@@ -2048,7 +2120,7 @@ function HistoryPositionsTable({
                 </div>
                 <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                   <StatusBadge status={item.status} closeReason={item.close_reason} />
-                  <span className="text-[11px] text-white/38">{formatHistoryTime(item.closed_at)}</span>
+                  <span className="text-[11px] text-white/38">{formatHistoryTime(item.closed_at, displayTimeZone, locale)}</span>
                 </div>
               </div>
             </div>
@@ -2094,8 +2166,8 @@ function HistoryMeta({
   );
 }
 
-function formatHistoryTime(value?: string | null) {
-  const text = formatTime(value);
+function formatHistoryTime(value: string | null | undefined, timeZone: string, locale?: string) {
+  const text = formatTime(value, timeZone, locale);
   return text === '--' ? text : text.replace(/-/g, '/');
 }
 
@@ -2208,6 +2280,12 @@ function PositionDetailCard({
   index,
   position,
   markPrice,
+  currentSymbol,
+  quote,
+  liveBestBid,
+  liveBestAsk,
+  liveMarketUsable,
+  usesValuationPrice,
   tpSlTriggerPriceTypeHint,
   pricePrecision,
   closing,
@@ -2217,21 +2295,45 @@ function PositionDetailCard({
   index: number;
   position: ContractPositionItem;
   markPrice: string | number | null;
+  currentSymbol: string;
+  quote?: ContractQuote | null;
+  liveBestBid?: string | number | null;
+  liveBestAsk?: string | number | null;
+  liveMarketUsable: boolean;
+  usesValuationPrice: boolean;
   tpSlTriggerPriceTypeHint: string;
   pricePrecision: number;
   closing: boolean;
   onEditTpSl: (position: ContractPositionItem, markPrice: string | number | null) => void;
   onClose: (position: ContractPositionItem) => void;
 }) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
   const detailMarkPrice = toNumber(markPrice) > 0 ? markPrice : position.mark_price;
   const truthUnavailableLabel = getPositionTruthUnavailableLabel(position);
+  const liveValuation = resolveLiveContractPositionValuation({
+    positionSymbol: position.symbol,
+    currentSymbol,
+    side: position.side,
+    quantity: position.quantity,
+    entryPrice: position.entry_price,
+    marginAmount: position.margin_amount,
+    quote,
+    liveBestBid,
+    liveBestAsk,
+    liveMarketUsable,
+    useBboMidpoint: usesValuationPrice,
+  });
+  const displayTruthUnavailableLabel = liveValuation ? null : truthUnavailableLabel;
   const positionSnapshotMarkPrice = !truthUnavailableLabel && toNumber(position.mark_price) > 0
     ? position.mark_price
     : null;
-  const unrealized = getPositionUnrealizedPnl(position);
-  const roe = getPositionRoe(position);
+  const displayValuationPrice = liveValuation?.price ?? positionSnapshotMarkPrice;
+  const unrealized = liveValuation?.unrealizedPnl ?? getPositionUnrealizedPnl(position);
+  const roe = liveValuation?.roe ?? getPositionRoe(position);
   const marginRatio = truthUnavailableLabel ?? formatPlainPercent(position.margin_ratio);
+  const priceLabel = usesValuationPrice ? t('valuationPrice', 'contracts') : t('markPrice', 'contracts');
+  const unrealizedLabel = usesValuationPrice ? t('unrealizedPnlByValuation', 'contracts') : t('unrealizedPnlByMark', 'contracts');
   const takeProfitBadge = formatOptionalTpSlBadge(position.take_profit_price, pricePrecision);
   const stopLossBadge = formatOptionalTpSlBadge(position.stop_loss_price, pricePrecision);
   const isOpen = position.status === 'OPEN';
@@ -2271,14 +2373,14 @@ function PositionDetailCard({
       <div className="grid grid-cols-2 gap-x-6 gap-y-2 md:grid-cols-3 xl:grid-cols-6">
         <DetailMetric label={t('quantity', 'contracts')} value={formatNumber(position.quantity, 6)} />
         <DetailMetric label={t('entryPrice', 'contracts')} value={formatDisplayPrice(position.entry_price, pricePrecision)} />
-        <DetailMetric label={t('markPrice', 'contracts')} value={truthUnavailableLabel ?? (positionSnapshotMarkPrice ? formatDisplayPrice(positionSnapshotMarkPrice, pricePrecision) : '--')} />
+        <DetailMetric label={priceLabel} value={displayTruthUnavailableLabel ?? (displayValuationPrice ? formatDisplayPrice(displayValuationPrice, pricePrecision) : '--')} />
         <DetailMetric label={t('margin', 'contracts')} value={`${formatNumber(position.margin_amount, 4)} USDT`} />
-        <DetailMetric label={t('openedAt', 'contracts')} value={formatHistoryTime(position.opened_at)} />
+        <DetailMetric label={t('openedAt', 'contracts')} value={formatHistoryTime(position.opened_at, displayTimeZone, locale)} />
         <DetailMetric label={t('takeProfit', 'contracts')} value={takeProfitBadge ?? '--'} />
         <DetailMetric label={t('stopLoss', 'contracts')} value={stopLossBadge ?? '--'} />
         <DetailMetric
-          label={t('unrealizedPnlByMark', 'contracts')}
-          value={unrealized === null ? truthUnavailableLabel ?? '--' : `${formatSignedPnl(unrealized, 4)} USDT`}
+          label={unrealizedLabel}
+          value={unrealized === null ? displayTruthUnavailableLabel ?? '--' : `${formatSignedPnl(unrealized, 4)} USDT`}
           valueClassName={unrealized === null ? 'text-white/55' : unrealized > 0 ? 'text-[#00c087]' : unrealized < 0 ? 'text-[#f6465d]' : 'text-white/80'}
         />
         <DetailMetric
@@ -2433,7 +2535,7 @@ function TpSlEditorDialog({
     const originField = field === 'takeProfitPrice' ? 'takeProfitOrigin' : 'stopLossOrigin';
     onChange((current) => current ? {
       ...current,
-      [field]: adjustTpSlEditorPrice(current[field], current.referencePrice, delta),
+      [field]: adjustTpSlEditorPrice(current[field], draft.referencePrice, delta),
       [originField]: 'USER',
     } : current);
   };
@@ -2579,7 +2681,8 @@ function PositionMetric({
 
 function TradesTable({
  rows, pricePrecision, loading }: { rows: ContractTradeListItem[]; pricePrecision: number; loading: boolean }) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
   if (rows.length === 0 && loading) {
     return (
       <EmptyState
@@ -2618,7 +2721,7 @@ function TradesTable({
                 </span>
                 <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[11px] text-white/65">{item.leverage}x</span>
               </div>
-              <span className="text-[11px] text-white/38">{formatTime(item.created_at)}</span>
+              <span className="text-[11px] text-white/38">{formatTime(item.created_at, displayTimeZone, locale)}</span>
             </div>
 
             <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
 from app.schemas.contract_market_domain_snapshot import (
     ContractMarketDomainCacheOrigin,
     ContractMarketDomainName,
@@ -30,6 +34,42 @@ from app.services.contract_market_provider_ws import (
 
 NOW_MS = 1_720_000_000_000
 SYMBOL = "BTCUSDT_PERP"
+
+
+@pytest.fixture(autouse=True)
+def _ensure_current_event_loop() -> None:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+def test_gateway_snapshots_request_provider_ws_warmup() -> None:
+    calls: list[tuple[str, str, str | None, bool]] = []
+
+    async def scenario() -> None:
+        gateway = ContractMarketGateway()
+        gateway._refresh_symbol_once = lambda symbol, intervals, ensure: calls.append(
+            ("full", symbol, intervals[0], ensure)
+        )
+        gateway._refresh_market_once = lambda symbol, ensure: calls.append(
+            ("market", symbol, None, ensure)
+        )
+        gateway._refresh_kline_once = lambda symbol, interval, ensure: calls.append(
+            ("kline", symbol, interval, ensure)
+        )
+
+        await gateway.snapshot(SYMBOL, "1m")
+        await gateway.market_snapshot(SYMBOL)
+        await gateway.kline_snapshot(SYMBOL, "5m")
+
+    asyncio.run(scenario())
+
+    assert calls == [
+        ("full", SYMBOL, "1m", True),
+        ("market", SYMBOL, None, True),
+        ("kline", SYMBOL, "5m", True),
+    ]
 
 
 def _context(
@@ -263,6 +303,140 @@ def test_gateway_contract_preview_advances_close_and_volume_from_same_trade_evid
     assert message["settlement_trade_id"] == "trade-1"
     assert message["settlement_trade_price"] == "103"
     assert message["settlement_revision"].endswith(":3:8:1")
+
+
+def test_gateway_itick_preview_bootstraps_rest_native_with_live_generation(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "NAS100USDT_PERP"
+    open_time = (NOW_MS // 60_000) * 60_000
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 7,
+    )
+    gateway._accept_candle_preview_native(
+        symbol,
+        "1m",
+        {
+            "provider": "ITICK",
+            "open_time": open_time,
+            "open": "28820",
+            "high": "28824",
+            "low": "28818",
+            "close": "28822",
+            "volume": "490",
+            "quote_volume": None,
+            "is_closed": False,
+        },
+    )
+
+    messages = gateway._candle_preview_messages(
+        symbol,
+        ["1m"],
+        [{
+            "id": "nas-tick-1",
+            "provider": "ITICK",
+            "price": "28821.84",
+            "qty": "2",
+            "time": open_time + 30_000,
+        }],
+        {"provider": "ITICK", "received_at_ms": open_time + 30_010},
+    )
+
+    assert len(messages) == 1
+    assert messages[0]["provider"] == "ITICK"
+    assert messages[0]["provider_generation"] == 7
+    assert messages[0]["preview"]["close"] == "28821.84"
+    assert messages[0]["preview"]["volume"] == "492"
+    assert messages[0]["base_native_revision"] == {"epoch": 7, "sequence": 0}
+
+
+def test_gateway_five_minute_preview_only_processes_the_subscribed_interval(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "AAPLUSDT_PERP"
+    open_time = (NOW_MS // 300_000) * 300_000
+    generation_reads: list[str] = []
+
+    def read_generation(_symbol, interval, **_kwargs):
+        generation_reads.append(interval)
+        return 9
+
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        read_generation,
+    )
+    gateway._accept_candle_preview_native(
+        symbol,
+        "5m",
+        {
+            "provider": "ITICK",
+            "provider_generation": 9,
+            "revision_epoch": 9,
+            "revision_sequence": 12,
+            "open_time": open_time,
+            "open": "329.20",
+            "high": "329.70",
+            "low": "329.10",
+            "close": "329.54",
+            "volume": "1000",
+            "quote_volume": None,
+            "is_closed": False,
+        },
+    )
+
+    messages = gateway._candle_preview_messages(
+        symbol,
+        ["5m", "15m", "5m"],
+        [{
+            "id": "aapl-five-tick-1",
+            "provider": "ITICK",
+            "price": "329.43",
+            "qty": "2",
+            "time": open_time + 120_000,
+        }],
+        {"provider": "ITICK", "received_at_ms": open_time + 120_010},
+    )
+
+    assert generation_reads == ["5m"]
+    assert len(messages) == 1
+    assert messages[0]["interval"] == "5m"
+    assert messages[0]["preview"]["open_time"] == open_time
+    assert messages[0]["preview"]["close"] == "329.43"
+
+
+def test_gateway_quote_falls_back_to_live_provider_depth_before_rest(monkeypatch):
+    gateway = ContractMarketGateway()
+    depth = {
+        "provider": "ITICK",
+        "provider_symbol": "NAS100",
+        "best_bid": "28820",
+        "best_ask": "28822",
+        "source": "LIVE_WS",
+    }
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_ticker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_depth", lambda *_args, **_kwargs: depth)
+    monkeypatch.setattr(
+        gateway,
+        "_prepare_provider_ws_depth_quote_payload",
+        lambda _db, _symbol, payload: {"source": "LIVE_WS", "best_bid": payload["best_bid"]},
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_quote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("REST must not run")),
+    )
+
+    quote = gateway._load_quote_payload(
+        object(),
+        "NAS100USDT_PERP",
+        allow_provider_ws=True,
+        ensure_provider_ws=True,
+    )
+
+    assert quote == {"source": "LIVE_WS", "best_bid": "28820"}
 
 
 def test_gateway_marks_generic_contiguous_rollover_as_trade_seeded(monkeypatch):
@@ -639,6 +813,22 @@ def test_provider_ws_cache_carries_generation_and_rejects_old_writer():
     assert winner["revision_epoch"] == 2
     assert winner["revision_sequence"] == 1
     assert winner["last_price"] == "101"
+
+
+def test_gateway_symbol_configuration_invalidation_drops_all_local_state():
+    gateway = ContractMarketGateway()
+    gateway._latest[f"contract:market:{SYMBOL}:quote"] = {"last_price": "101"}
+    gateway._latest[f"contract:market:{SYMBOL}:kline:1m"] = [{"close": "101"}]
+    gateway._latest["contract:market:ETHUSDT_PERP:quote"] = {"last_price": "200"}
+    gateway._last_quote_signature[SYMBOL] = "old"
+    gateway._last_kline_signature[(SYMBOL, "1m")] = "old"
+
+    gateway.invalidate_symbol_configuration(SYMBOL)
+
+    assert all(not key.startswith(f"contract:market:{SYMBOL}:") for key in gateway._latest)
+    assert gateway._latest["contract:market:ETHUSDT_PERP:quote"] == {"last_price": "200"}
+    assert SYMBOL not in gateway._last_quote_signature
+    assert (SYMBOL, "1m") not in gateway._last_kline_signature
 
 
 def test_gateway_kline_message_preserves_provider_ws_authority_evidence():

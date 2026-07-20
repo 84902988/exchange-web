@@ -22,8 +22,8 @@ export type ReferenceOverlayTranslator = (key: string, namespace?: 'asset') => s
 const IRON62_USD_PER_TON_TO_MFC_USDT_DIVISOR = 1000;
 const TROY_OUNCE_GRAMS = 31.1034768;
 
-function normalizeReferenceSymbol(symbol: string) {
-  return String(symbol || '').replace(/\//g, '').toUpperCase();
+export function normalizeReferenceOverlaySymbol(symbol: string) {
+  return String(symbol || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
 }
 
 function formatReferenceText(template: string, values: Record<string, string>) {
@@ -34,7 +34,7 @@ function formatReferenceText(template: string, values: Record<string, string>) {
 }
 
 function stripReferenceQuoteSuffix(symbol: string) {
-  return normalizeReferenceSymbol(symbol)
+  return normalizeReferenceOverlaySymbol(symbol)
     .replace(/2USDT$/, '')
     .replace(/USDT$/, '')
     .replace(/USD$/, '');
@@ -165,7 +165,7 @@ export function getReferenceOverlayConfig(
   symbol: string,
   t: ReferenceOverlayTranslator,
 ): ReferenceOverlayConfig | null {
-  const normalizedSymbol = normalizeReferenceSymbol(symbol);
+  const normalizedSymbol = normalizeReferenceOverlaySymbol(symbol);
 
   if (normalizedSymbol === 'MFCUSDT') {
     const copy = localizedReferenceCopy({
@@ -229,7 +229,7 @@ export function normalizeReferenceOverlayConfig(
   const kind = String(record.reference_type || record.kind || '').toUpperCase();
   if (kind !== 'IRON' && kind !== 'GOLD' && kind !== 'STOCK' && kind !== 'RWA') return null;
 
-  const symbol = normalizeReferenceSymbol(String(record.symbol || ''));
+  const symbol = normalizeReferenceOverlaySymbol(String(record.symbol || ''));
   if (!symbol) return null;
 
   const rawSourcePriceLabel = typeof record.source_price_label === 'string'
@@ -257,11 +257,9 @@ export function normalizeReferenceOverlayConfig(
     priceSource: sourcePrice,
     t,
   });
-  const customTitle = readReferenceText(record.title);
   const customSourceLabel = readReferenceText(record.source_label) || readReferenceText(record.subtitle);
-  const customLineTitle = readReferenceText(record.line_title);
   const customDisplayValueLabel = readReferenceText(record.display_value_label);
-  const title = customTitle || copy.title;
+  const title = copy.title;
 
   return {
     enabled: true,
@@ -271,8 +269,8 @@ export function normalizeReferenceOverlayConfig(
     valueLabel: sourcePrice === 'MANUAL' && customDisplayValueLabel ? customDisplayValueLabel : copy.valueLabel,
     sourceLabel: customSourceLabel || copy.sourceLabel,
     sourcePriceLabel: kind === 'IRON' ? localizedIronSourcePriceLabel(rawSourcePriceLabel, t) : rawSourcePriceLabel,
-    description: readReferenceText(record.description) || copy.description,
-    lineTitle: customLineTitle || title || copy.lineTitle,
+    description: copy.description,
+    lineTitle: copy.lineTitle || title,
     lineColor: String(record.line_color || '#f0b90b').trim(),
     badgeColor: String(record.badge_color || record.line_color || '#f0b90b').trim(),
     displayPrice: normalizedDisplayPrice,

@@ -77,13 +77,13 @@ async def handle_contract_ws_domain_command(
     )
     if previous_symbol != next_symbol:
         await gateway.release_symbol_if_idle(previous_symbol)
+    await gateway.ensure_symbol(next_symbol)
     snapshot = (
         await gateway.market_snapshot(next_symbol)
         if domain == "market"
         else await gateway.kline_snapshot(next_symbol, next_interval)
     )
     await manager.send_to_one(websocket, snapshot)
-    await gateway.ensure_symbol(next_symbol)
     return next_symbol, next_interval if domain == "kline" else connected_interval
 
 
@@ -113,9 +113,9 @@ async def handle_contract_ws_legacy_subscribe(
     )
     if previous_symbol != next_symbol:
         await gateway.release_symbol_if_idle(previous_symbol)
+    await gateway.ensure_symbol(next_symbol)
     snapshot = await gateway.snapshot(next_symbol, next_interval)
     await manager.send_to_one(websocket, snapshot)
-    await gateway.ensure_symbol(next_symbol)
     return next_symbol, next_interval
 
 

@@ -86,6 +86,12 @@ const componentModule = loadTypeScriptModule(
     '@/lib/marketPrecision': {
       formatPrice: (value: number, precision: number) => value.toFixed(precision),
     },
+    '@/hooks/useDisplayTimeZone': {
+      useDisplayTimeZone: () => 'Etc/UTC',
+    },
+    '@/lib/displayTimeZone': {
+      formatDisplayTime: () => '00:00:00',
+    },
     '@/contexts/LocaleContext': {
       useLocaleContext: () => ({
         t: (key: string) => translations[key] || key,

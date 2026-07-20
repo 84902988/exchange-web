@@ -423,6 +423,16 @@ test('Header keeps the reference main price separate from contract product metri
   assert.equal(textContent(findByTestId(tree, 'contract-header-funding-rate')), '\u8d44\u91d1\u8d39\u7387+0.0200%');
 });
 
+test('TradFi header can label the platform midpoint as valuation price', () => {
+  resetHarness();
+  const tree = renderHeader({
+    markPrice: '120.0',
+    markPriceLabel: '\u4f30\u503c\u4ef7\u683c',
+  });
+
+  assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u4f30\u503c\u4ef7\u683c120.0');
+});
+
 test('priceDirection applies up, down, and flat main-price colors', () => {
   const cases = [
     ['up', 'text-[#00c087]'],
@@ -510,6 +520,23 @@ test('contract metrics remain separate cards without duplicating main price', ()
   assert.equal(textContent(findByTestId(tree, 'contract-header-high-low-24h')), 'highLow24h65,000.0 / 63,000.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-volume-turnover-24h')), 'volume24h / turnover24h100.00 / 6.40M');
   assert.equal(textContent(tree).split('64,000.0').length - 1, 1);
+});
+
+test('TradFi header omits synthetic funding/index metrics and places executable BBO cards last', () => {
+  resetHarness();
+  const tree = renderHeader({ isTradfi: true });
+  const metricTestIds = walk(tree)
+    .map((node) => node.props['data-testid'])
+    .filter((value): value is string => typeof value === 'string' && value.startsWith('contract-header-'));
+
+  assert.equal(metricTestIds.includes('contract-header-funding-rate'), false);
+  assert.equal(metricTestIds.includes('contract-header-index-price'), false);
+  assert.deepEqual(metricTestIds.slice(-2), [
+    'contract-header-best-bid',
+    'contract-header-best-ask',
+  ]);
+  assert.equal(textContent(findByTestId(tree, 'contract-header-best-bid')), '\u4e70\u4e0063,999.0');
+  assert.equal(textContent(findByTestId(tree, 'contract-header-best-ask')), '\u5356\u4e0064,001.0');
 });
 
 test('Header reads display, mark, and index prices from Store and emits a structured diff log', () => {

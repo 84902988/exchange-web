@@ -14,7 +14,6 @@ if str(BACKEND) not in sys.path:
 from app.services.contract_market_service import (  # noqa: E402
     DEPTH_MODE_BBO_ONLY,
     DEPTH_MODE_FULL_DEPTH,
-    DEPTH_MODE_SYNTHETIC_FROM_BBO,
     _build_stock_depth_from_prices,
     _depth_from_quote_payload,
     _extract_itick_stock_depth_levels,
@@ -44,7 +43,7 @@ def test_itick_stock_depth_levels_parse_as_full_depth_source():
     assert asks[0][0] == Decimal("291.7")
 
 
-def test_synthetic_stock_depth_is_marked_from_bbo():
+def test_stock_bbo_fallback_stays_one_level_and_truthful():
     depth = _build_stock_depth_from_prices(
         symbol="AAPLUSDT_PERP",
         provider_symbol="AAPL",
@@ -55,9 +54,9 @@ def test_synthetic_stock_depth_is_marked_from_bbo():
         ts=datetime.utcnow(),
     )
 
-    assert depth["depth_mode"] == DEPTH_MODE_SYNTHETIC_FROM_BBO
-    assert len(depth["bids"]) == 5
-    assert len(depth["asks"]) == 5
+    assert depth["depth_mode"] == DEPTH_MODE_BBO_ONLY
+    assert len(depth["bids"]) == 1
+    assert len(depth["asks"]) == 1
 
 
 def test_quote_derived_depth_is_marked_bbo_only():

@@ -25,6 +25,17 @@ const contractChartSource = readFileSync(
   'utf8',
 );
 
+test('keeps the chart mounted for early script loading but fences widget creation on metadata', () => {
+  assert.match(contractChartSource, /bootstrapReady\?: boolean;/);
+  assert.match(
+    contractChartSource,
+    /if \(!bootstrapReady \|\| !scriptReady \|\| !normalizedSymbol \|\| !containerRef\.current\)/,
+  );
+  assert.match(contractChartSource, /data-contract-chart-bootstrap=\{bootstrapReady \? 'ready' : 'pending'\}/);
+  assert.match(contractChartSource, /!bootstrapReady[\s\S]*shouldShowContractChartLoading/);
+  assert.match(contractChartSource, /useState\('bootstrap'\)/);
+});
+
 function loadTypeScriptModule(
   filePath: string,
   mocks: Record<string, unknown>,
@@ -116,6 +127,12 @@ const chartModule = loadTypeScriptModule(
     '@/contexts/LocaleContext': {
       useLocaleContext: () => ({ locale: 'en', t: (key: string) => key }),
     },
+    '@/lib/displayTimeZone': {
+      getDisplayTimeZone: () => 'Etc/UTC',
+    },
+    '@/lib/tradingview/displayTimeZoneSync': {
+      bindTradingViewDisplayTimeZone: () => () => undefined,
+    },
     '@/components/spot/tradingview/spotTradingViewResolutionState': {
       setSpotToolbarLoadingState: () => undefined,
     },
@@ -138,6 +155,7 @@ const chartModule = loadTypeScriptModule(
     './tradingview/contractKlinePreloadManager': {
       createContractKlinePreloadManager: () => ({
         schedule() {},
+        prewarmInterval() { return true; },
         cancel() {},
         setForegroundState() {},
         destroy() {},
@@ -899,7 +917,7 @@ test('current history completion ends Loading while an old history event cannot'
   const oldEvent = { ...expected, requestSeq: 1 };
   const currentEvent = { ...expected, requestSeq: 2, barCount: 0, firstDataRequest: true };
   if (chartModule.isContractHistoryEventCurrent(oldEvent, expected)) coordinator.finish(sequence);
-  clock.advanceBy(220);
+  clock.advanceBy(chartModule.CONTRACT_CHART_LOADING_MIN_VISIBLE_MS);
   assert.deepEqual(changes, ['set-resolution']);
   if (chartModule.isContractHistoryEventCurrent(currentEvent, expected)) coordinator.finish(sequence);
   clock.advanceBy(0);
@@ -908,6 +926,8 @@ test('current history completion ends Loading while an old history event cannot'
 
 
 test('Loading starts immediately, respects minimum visibility, and settles once', () => {
+  assert.equal(chartModule.CONTRACT_CHART_LOADING_DOT_COUNT, 4);
+  assert.equal(chartModule.CONTRACT_CHART_LOADING_MIN_VISIBLE_MS, 520);
   const clock = new FakeClock();
   const changes: string[] = [];
   const coordinator = new chartModule.ContractChartLoadingCoordinator({
@@ -919,7 +939,7 @@ test('Loading starts immediately, respects minimum visibility, and settles once'
   assert.deepEqual(changes, ['interval-click']);
   assert.equal(coordinator.finish(sequence), true);
   assert.equal(coordinator.finish(sequence), false);
-  clock.advanceBy(219);
+  clock.advanceBy(chartModule.CONTRACT_CHART_LOADING_MIN_VISIBLE_MS - 1);
   assert.deepEqual(changes, ['interval-click']);
   clock.advanceBy(1);
   assert.deepEqual(changes, ['interval-click', '']);
@@ -937,7 +957,7 @@ test('old Loading completion cannot close the latest request', () => {
   const oldSequence = coordinator.start('1m');
   const latestSequence = coordinator.start('15m');
   assert.equal(coordinator.finish(oldSequence), false);
-  clock.advanceBy(500);
+  clock.advanceBy(chartModule.CONTRACT_CHART_LOADING_MIN_VISIBLE_MS);
   assert.deepEqual(changes, ['1m', '15m']);
   assert.equal(coordinator.finish(latestSequence), true);
   clock.advanceBy(0);
@@ -973,7 +993,7 @@ test('load error hides and finishes Loading without duplicate completion', () =>
   assert.equal(chartModule.shouldShowContractChartLoading('widget-build', 'load failed'), false);
   assert.equal(coordinator.finish(sequence), true);
   assert.equal(coordinator.finish(sequence), false);
-  clock.advanceBy(220);
+  clock.advanceBy(chartModule.CONTRACT_CHART_LOADING_MIN_VISIBLE_MS);
   assert.deepEqual(changes, ['widget-build', '']);
 });
 

@@ -30,6 +30,9 @@ afterEach(() => {
 describe('contract market view polling lifecycle', () => {
   it('disables REST polling while connected and uses it only as a visible fallback', () => {
     expect(getContractMarketViewPollInterval('connected', true)).toBeNull();
+    expect(getContractMarketViewPollInterval('connected', true, true)).toBe(
+      CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS,
+    );
     expect(getContractMarketViewPollInterval('disconnected', true)).toBe(
       CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS,
     );
@@ -57,7 +60,7 @@ describe('contract market view polling lifecycle', () => {
     expect(refresh).toHaveBeenCalledTimes(2);
   });
 
-  it('restores fallback polling while disconnected and stops it after reconnect', () => {
+  it('refreshes immediately after reconnect and then stops fallback polling', () => {
     const refresh = jest.fn<() => void>();
     type HookProps = { realtimeStatus: ContractMarketRealtimeStatus };
     const { rerender } = renderHook(
@@ -75,9 +78,30 @@ describe('contract market view polling lifecycle', () => {
     expect(refresh).toHaveBeenCalledTimes(4);
 
     rerender({ realtimeStatus: 'connected' });
-    expect(refresh).toHaveBeenCalledTimes(4);
+    expect(refresh).toHaveBeenCalledTimes(5);
     act(() => jest.advanceTimersByTime(CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS * 3));
-    expect(refresh).toHaveBeenCalledTimes(4);
+    expect(refresh).toHaveBeenCalledTimes(5);
+  });
+
+  it('polls a connected socket only while the full market view still needs recovery', () => {
+    const refresh = jest.fn<() => void>();
+    const { rerender } = renderHook(
+      ({ recoveryRequired }) => useContractMarketViewPolling({
+        symbol: 'XAUUSDT_PERP',
+        realtimeStatus: 'connected',
+        recoveryRequired,
+        refresh,
+      }),
+      { initialProps: { recoveryRequired: true } },
+    );
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    act(() => jest.advanceTimersByTime(CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS * 2));
+    expect(refresh).toHaveBeenCalledTimes(3);
+
+    rerender({ recoveryRequired: false });
+    act(() => jest.advanceTimersByTime(CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS * 2));
+    expect(refresh).toHaveBeenCalledTimes(3);
   });
 
   it('stops hidden timers, refreshes once on visibility regain, and cleans up on unmount', () => {

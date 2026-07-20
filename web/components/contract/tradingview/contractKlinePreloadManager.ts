@@ -17,6 +17,14 @@ import {
   normalizeContractKlineLoadInterval,
   normalizeContractKlineLoadSymbol,
 } from './contractKlineLoadPolicy';
+import {
+  KLINE_PRELOAD_IDLE_DELAY_MS,
+  KLINE_PRELOAD_IDLE_TIMEOUT_MS,
+  KLINE_PRELOAD_BACKGROUND_INTERVAL_LIMIT,
+  KLINE_PRELOAD_REQUEST_GAP_MS,
+  promoteKlinePreloadInterval,
+  rankKlinePreloadIntervals,
+} from '@/lib/tradingview/klinePreloadPriority';
 
 export type ContractKlineRequestRole = 'active' | 'preload';
 
@@ -387,6 +395,7 @@ export type ContractKlinePreloadState = {
   symbol: string;
   category: ContractKlineAssetClass | string | null | undefined;
   interval: string;
+  intervals?: readonly string[];
 };
 
 export type ContractKlinePreloadForegroundState = {
@@ -474,10 +483,10 @@ function createDefaultIdleScheduler(): ContractKlineIdleScheduler {
       if (typeof browserWindow.requestIdleCallback === 'function') {
         return {
           kind: 'idle',
-          handle: browserWindow.requestIdleCallback(callback, { timeout: 1_500 }),
+          handle: browserWindow.requestIdleCallback(callback, { timeout: KLINE_PRELOAD_IDLE_TIMEOUT_MS }),
         };
       }
-      return { kind: 'timer', handle: window.setTimeout(callback, 250) };
+      return { kind: 'timer', handle: window.setTimeout(callback, KLINE_PRELOAD_IDLE_DELAY_MS) };
     },
     cancel(value) {
       const handle = value as { kind?: string; handle?: number } | null;
@@ -490,6 +499,13 @@ function createDefaultIdleScheduler(): ContractKlineIdleScheduler {
       window.clearTimeout(handle.handle);
     },
   };
+}
+
+function waitForContractKlinePreloadGap() {
+  if (typeof window === 'undefined') return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, KLINE_PRELOAD_REQUEST_GAP_MS);
+  });
 }
 
 function buildPreloadStateKey(state: ContractKlinePreloadState) {
@@ -508,9 +524,13 @@ export class ContractKlinePreloadManager {
   private idleHandle: unknown = null;
   private generation = 0;
   private preloadRunning = false;
+  private preloadQueue: string[] = [];
+  private activePreloadInterval = '';
+  private pendingIntentInterval = '';
   private ownerStateKey = '';
   private foregroundState: ContractKlinePreloadForegroundState | null = null;
   private deferredEvent: ContractKlinePreloadHistoryEvent | null = null;
+  private lastHistoryEvent: ContractKlinePreloadHistoryEvent | null = null;
   private destroyed = false;
 
   constructor(private readonly options: ContractKlinePreloadManagerOptions) {
@@ -527,6 +547,7 @@ export class ContractKlinePreloadManager {
     const eventKey = buildPreloadStateKey({ ...state, symbol: event.symbol, interval: event.interval });
     if (!stateKey || stateKey !== eventKey) return false;
 
+    this.lastHistoryEvent = { ...event };
     this.deferredEvent = { ...event };
     const symbol = normalizeContractKlineLoadSymbol(state.symbol);
     const interval = normalizeContractKlineLoadInterval(state.interval);
@@ -556,6 +577,17 @@ export class ContractKlinePreloadManager {
     this.stopActiveSequence('preload state changed');
     this.deferredEvent = { ...event };
     this.ownerStateKey = stateKey;
+    const availableIntervals = state.intervals?.length ? state.intervals : [state.interval];
+    let intervals = [
+      ...rankKlinePreloadIntervals(state.interval, availableIntervals)
+        .slice(0, KLINE_PRELOAD_BACKGROUND_INTERVAL_LIMIT),
+      state.interval,
+    ].map(normalizeContractKlineLoadInterval);
+    if (this.pendingIntentInterval) {
+      intervals = promoteKlinePreloadInterval(intervals, this.pendingIntentInterval);
+      this.pendingIntentInterval = '';
+    }
+    this.preloadQueue = Array.from(new Set(intervals.filter(Boolean)));
 
     const generation = this.generation;
     recordContractKlineLifecycleEvent({
@@ -574,8 +606,53 @@ export class ContractKlinePreloadManager {
 
   cancel(reason = 'preload cancelled') {
     this.deferredEvent = null;
+    this.lastHistoryEvent = null;
+    this.pendingIntentInterval = '';
     this.foregroundState = null;
     this.stopActiveSequence(reason);
+  }
+
+  prewarmInterval(interval: string, reason = 'toolbar intent') {
+    if (this.destroyed) return false;
+    const state = this.options.getState();
+    const targetInterval = normalizeContractKlineLoadInterval(interval);
+    const activeInterval = normalizeContractKlineLoadInterval(state.interval);
+    const availableIntervals = (state.intervals?.length ? state.intervals : [state.interval])
+      .map(normalizeContractKlineLoadInterval);
+    if (
+      !targetInterval
+      || targetInterval === activeInterval
+      || !availableIntervals.includes(targetInterval)
+    ) return false;
+    this.pendingIntentInterval = targetInterval;
+    if (this.foregroundState?.loading) return false;
+    if (this.activePreloadInterval === targetInterval) {
+      this.pendingIntentInterval = '';
+      return true;
+    }
+
+    const stateKey = buildPreloadStateKey(state);
+    if (this.ownerStateKey === stateKey && (this.idleHandle !== null || this.preloadRunning)) {
+      const activeCoverageInterval = normalizeContractKlineLoadInterval(state.interval);
+      const promotedAlternatives = promoteKlinePreloadInterval(
+        this.preloadQueue.filter((item) => item !== activeCoverageInterval),
+        targetInterval,
+      ).slice(0, KLINE_PRELOAD_BACKGROUND_INTERVAL_LIMIT);
+      this.preloadQueue = [...promotedAlternatives, activeCoverageInterval];
+      this.pendingIntentInterval = '';
+      recordContractKlineLifecycleEvent({
+        event: 'preload_intent_promoted',
+        role: 'preload',
+        generation: this.generation,
+        symbol: normalizeContractKlineLoadSymbol(state.symbol),
+        interval: targetInterval,
+        reason,
+      });
+      return true;
+    }
+    const lastHistoryEvent = this.lastHistoryEvent;
+    if (!lastHistoryEvent) return false;
+    return this.schedule(lastHistoryEvent);
   }
 
   setForegroundState(state: ContractKlinePreloadForegroundState) {
@@ -600,6 +677,7 @@ export class ContractKlinePreloadManager {
       ) return;
       this.foregroundState = normalizedState;
       this.deferredEvent = null;
+      this.pendingIntentInterval = '';
       this.stopActiveSequence('foreground lifecycle started');
       recordContractKlineLifecycleEvent({
         event: 'preload_foreground_pause',
@@ -647,6 +725,8 @@ export class ContractKlinePreloadManager {
       ownerStateKey: this.ownerStateKey,
       foregroundState: this.foregroundState ? { ...this.foregroundState } : null,
       deferredEvent: this.deferredEvent ? { ...this.deferredEvent } : null,
+      preloadQueue: [...this.preloadQueue],
+      activePreloadInterval: this.activePreloadInterval,
     };
   }
 
@@ -662,6 +742,8 @@ export class ContractKlinePreloadManager {
       this.idleHandle = null;
     }
     this.preloadRunning = false;
+    this.preloadQueue = [];
+    this.activePreloadInterval = '';
     this.ownerStateKey = '';
     if (hadWork) {
       recordContractKlineLifecycleEvent({
@@ -688,68 +770,85 @@ export class ContractKlinePreloadManager {
       || this.leaseRegistry.hasActiveRequest
     ) return;
     const symbol = normalizeContractKlineLoadSymbol(state.symbol);
-    const interval = normalizeContractKlineLoadInterval(state.interval);
     const category = normalizeContractKlineAssetClass(state.category);
-    const policy = getContractKlineLoadPolicy(interval);
-    const cacheParams = { category, symbol, interval, limit: policy.preloadLimit };
     this.preloadRunning = true;
-    recordContractKlineLifecycleEvent({
-      event: 'preload_started',
-      role: 'preload',
-      generation,
-      symbol,
-      interval,
-    });
 
     try {
-      const cached = this.cache.getAtLeast?.(cacheParams) ?? this.cache.get(cacheParams);
-      if (cached) return;
-      const rangeKey = buildContractKlineRangeKey({ symbol, interval });
-      let leaseRevision = 0;
-      const response = await this.leaseRegistry.request({
-        key: rangeKey,
-        coverage: policy.preloadLimit,
-        role: 'preload',
-        deadlineMs: policy.preloadDeadlineMs,
-        request: (coverage, lease) => {
-          leaseRevision = lease.revision;
-          return this.requestKlines({ symbol, interval, limit: coverage });
-        },
-      });
-      if (
-        !this.isCurrent(stateKey, generation)
-        || leaseRevision <= 0
-        || this.leaseRegistry.getRevision(rangeKey) !== leaseRevision
+      while (
+        this.isCurrent(stateKey, generation)
+        && !this.foregroundState?.loading
+        && !this.leaseRegistry.hasActiveRequest
       ) {
+        const interval = this.preloadQueue.shift();
+        if (!interval) return;
+        this.activePreloadInterval = interval;
+        const policy = getContractKlineLoadPolicy(interval);
+        const cacheParams = { category, symbol, interval, limit: policy.preloadLimit };
         recordContractKlineLifecycleEvent({
-          event: 'preload_late_result_dropped',
+          event: 'preload_started',
           role: 'preload',
           generation,
           symbol,
           interval,
-          revision: leaseRevision,
-          reason: 'state generation or lease revision changed',
         });
-        return;
+        try {
+          const cached = this.cache.getAtLeast?.(cacheParams) ?? this.cache.get(cacheParams);
+          if (cached) continue;
+          const rangeKey = buildContractKlineRangeKey({ symbol, interval });
+          let leaseRevision = 0;
+          const response = await this.leaseRegistry.request({
+            key: rangeKey,
+            coverage: policy.preloadLimit,
+            role: 'preload',
+            deadlineMs: policy.preloadDeadlineMs,
+            request: (coverage, lease) => {
+              leaseRevision = lease.revision;
+              return this.requestKlines({ symbol, interval, limit: coverage });
+            },
+          });
+          if (
+            !this.isCurrent(stateKey, generation)
+            || leaseRevision <= 0
+            || this.leaseRegistry.getRevision(rangeKey) !== leaseRevision
+          ) {
+            recordContractKlineLifecycleEvent({
+              event: 'preload_late_result_dropped',
+              role: 'preload',
+              generation,
+              symbol,
+              interval,
+              revision: leaseRevision,
+              reason: 'state generation or lease revision changed',
+            });
+            return;
+          }
+          this.cache.set(
+            cacheParams,
+            response,
+            getContractKlineCurrentCacheTtlMs({ category, interval }),
+          );
+          recordContractKlineLifecycleEvent({
+            event: 'preload_cache_written',
+            role: 'preload',
+            generation,
+            symbol,
+            interval,
+            revision: leaseRevision,
+          });
+        } catch {
+          // Idle preload is best-effort and must never change the active chart request path.
+        } finally {
+          if (this.activePreloadInterval === interval) this.activePreloadInterval = '';
+        }
+        if (this.preloadQueue.length && this.isCurrent(stateKey, generation)) {
+          await waitForContractKlinePreloadGap();
+        }
       }
-      this.cache.set(
-        cacheParams,
-        response,
-        getContractKlineCurrentCacheTtlMs({ category, interval }),
-      );
-      recordContractKlineLifecycleEvent({
-        event: 'preload_cache_written',
-        role: 'preload',
-        generation,
-        symbol,
-        interval,
-        revision: leaseRevision,
-      });
-    } catch {
-      // Idle preload is best-effort and must never change the active chart request path.
     } finally {
       if (this.generation === generation && this.ownerStateKey === stateKey) {
         this.preloadRunning = false;
+        this.preloadQueue = [];
+        this.activePreloadInterval = '';
         this.ownerStateKey = '';
         this.deferredEvent = null;
       }

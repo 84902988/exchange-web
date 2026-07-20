@@ -23,10 +23,15 @@ describe('Contract TradingView bootstrap experience', () => {
     expect(pageSource).not.toContain(
       'const chartBootstrapReady = contractPairsLoaded && currentContractPair !== null;',
     );
-    expect(pageSource).toMatch(
-      /\{chartBootstrapReady \? \([\s\S]*?<ContractTradingViewChart[\s\S]*?: \([\s\S]*?data-contract-chart-bootstrap="pending"/,
-    );
+    expect(pageSource).toContain('bootstrapReady={chartBootstrapReady}');
+    expect(pageSource).not.toContain('{chartBootstrapReady ? (');
     expect(pageSource.match(/<ContractTradingViewChart/g)).toHaveLength(1);
+  });
+
+  test('loads the TradingView script while metadata settles and uses catalog precision once', () => {
+    expect(pageSource).toContain('amountPrecision: item.quantity_precision');
+    expect(pageSource).toContain('pricePrecision={currentContractPair?.pricePrecision ?? null}');
+    expect(pageSource).toContain('amountPrecision={currentContractPair?.amountPrecision ?? null}');
   });
 
   test('loads current symbol metadata before the full selector catalog', () => {
@@ -37,6 +42,8 @@ describe('Contract TradingView bootstrap experience', () => {
     expect(catalogRequestIndex).toBeGreaterThan(bootstrapRequestIndex);
     expect(pageSource).toContain('page_size: 1');
     expect(pageSource).toContain('The full catalog remains the fail-closed metadata fallback.');
+    expect(pageSource).toContain('const retryDelays = [1000, 2000, 5000, 10000]');
+    expect(pageSource).toContain('if (disposed || loaded) return;');
     expect(pageSource).toContain('const contractSymbolRequestStore = new Map<string, ContractSymbolRequestEntry>();');
   });
 

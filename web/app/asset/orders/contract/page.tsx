@@ -8,6 +8,8 @@ import AssetSidebar from '@/components/asset/AssetSidebar';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import { useAuth } from '@/lib/authContext';
 import { privateQueryKey } from '@/lib/authPrivateQueries';
+import { useDisplayTimeZone } from '@/hooks/useDisplayTimeZone';
+import { formatDisplayDateTime } from '@/lib/displayTimeZone';
 import {
   getContractOrders,
   getContractTrades,
@@ -125,17 +127,6 @@ function statusText(value: string, t: AssetTranslator) {
     EXPIRED: t('expired', 'asset'),
   };
   return labels[normalized] || value || '--';
-}
-
-function formatDateTime(value?: string | null) {
-  if (!value) return '--';
-  const text = String(value).trim();
-  if (!text) return '--';
-  return text
-    .replace('T', ' ')
-    .replace(/\.\d+Z?$/, '')
-    .replace(/Z$/, '')
-    .slice(0, 19);
 }
 
 function paginateItems<T>(items: T[], page: number) {
@@ -368,7 +359,8 @@ function ContractOrdersTable({
   loading?: boolean;
   error?: boolean;
 }) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
 
   if (loading) return <div className="py-12 text-center text-white/55">{t('loadingContractOrders', 'asset')}</div>;
   if (error) return <div className="py-12 text-center text-[#f6465d]">{t('contractOrdersLoadFailed', 'asset')}</div>;
@@ -407,7 +399,7 @@ function ContractOrdersTable({
                 <td className="py-3 text-right tabular-nums text-white">{formatNum(item.quantity)}</td>
                 <td className="py-3 text-right tabular-nums text-white/70">{item.leverage}x</td>
                 <td className="py-3 text-right text-white/70">{statusText(item.status, t)}</td>
-                <td className="py-3 text-right text-white/55">{formatDateTime(item.created_at)}</td>
+                <td className="py-3 text-right text-white/55">{formatDisplayDateTime(item.created_at, displayTimeZone, locale)}</td>
               </tr>
             ))}
           </tbody>
@@ -435,7 +427,8 @@ function ContractTradesTable({
   loading?: boolean;
   error?: boolean;
 }) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
 
   if (loading) return <div className="py-12 text-center text-white/55">{t('loadingContractTrades', 'asset')}</div>;
   if (error) return <div className="py-12 text-center text-[#f6465d]">{t('contractTradesLoadFailed', 'asset')}</div>;
@@ -478,7 +471,7 @@ function ContractTradesTable({
                   <td className={`py-3 text-right tabular-nums ${pnl > 0 ? 'text-[#00c087]' : pnl < 0 ? 'text-[#f6465d]' : 'text-white/70'}`}>
                     {formatNum(item.realized_pnl)}
                   </td>
-                  <td className="py-3 text-right text-white/55">{formatDateTime(item.created_at)}</td>
+                  <td className="py-3 text-right text-white/55">{formatDisplayDateTime(item.created_at, displayTimeZone, locale)}</td>
                 </tr>
               );
             })}

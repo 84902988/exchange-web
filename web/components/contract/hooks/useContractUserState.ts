@@ -29,7 +29,10 @@ import {
   scopeContractPrivateCacheKey,
 } from '@/components/contract/contractPrivateIdentity';
 import { ContractPrivateRefreshCoordinator } from './contractPrivateRefreshCoordinator';
-import { buildContractPrivatePositionPageSnapshot } from './contractPrivateSnapshotPage';
+import {
+  buildContractPrivateOrderPageSnapshot,
+  buildContractPrivatePositionPageSnapshot,
+} from './contractPrivateSnapshotPage';
 
 export type ContractUserDataTab = 'positions' | 'historyPositions' | 'openOrders' | 'historyOrders' | 'trades';
 
@@ -559,6 +562,8 @@ export function useContractUserState({
   const realtimeVersionRef = useRef(0);
   const lastRealtimeSeqRef = useRef(0);
   const lastRealtimeTsRef = useRef(0);
+  const lastMarkRealtimeSeqRef = useRef(0);
+  const lastMarkRealtimeTsRef = useRef(0);
   const positionsRef = useRef<ContractPositionItem[]>([]);
   const positionSummariesRef = useRef<ContractPositionSummaryItem[]>([]);
   const hasPrefetchedAllRef = useRef(false);
@@ -688,12 +693,15 @@ export function useContractUserState({
   const markRealtimeMessage = useCallback((
     message: ContractUserRealtimeMessage,
     invalidateRestBaseline = true,
+    markOnly = false,
   ) => {
+    const sequenceRef = markOnly ? lastMarkRealtimeSeqRef : lastRealtimeSeqRef;
+    const timestampRef = markOnly ? lastMarkRealtimeTsRef : lastRealtimeTsRef;
     const seq = getMessageSeq(message);
     if (seq !== null) {
-      if (!acceptsContractRealtimeSequence(lastRealtimeSeqRef.current, message)) return false;
-      if (seq > lastRealtimeSeqRef.current) {
-        lastRealtimeSeqRef.current = seq;
+      if (!acceptsContractRealtimeSequence(sequenceRef.current, message)) return false;
+      if (seq > sequenceRef.current) {
+        sequenceRef.current = seq;
         if (invalidateRestBaseline) invalidatePrivateRestBaseline();
       }
       return true;
@@ -701,9 +709,9 @@ export function useContractUserState({
 
     const serverTs = getMessageServerTs(message);
     if (serverTs !== null) {
-      if (serverTs < lastRealtimeTsRef.current) return false;
-      if (serverTs > lastRealtimeTsRef.current) {
-        lastRealtimeTsRef.current = serverTs;
+      if (serverTs < timestampRef.current) return false;
+      if (serverTs > timestampRef.current) {
+        timestampRef.current = serverTs;
         if (invalidateRestBaseline) invalidatePrivateRestBaseline();
       }
     } else {
@@ -716,9 +724,11 @@ export function useContractUserState({
     if (!canAcceptContractPrivateResult(normalizedUserIdentity, privateStateIdentityRef.current)) return null;
     const payload = getContractUserPayload(message);
     if (!isContractUserMessageForScope(message, payload, contractSymbol, dataScope)) return null;
+    const markOnly = isContractPositionMarkOnlyMessage(message);
     return markRealtimeMessage(
       message,
-      !isContractPositionMarkOnlyMessage(message),
+      !markOnly,
+      markOnly,
     ) ? payload : null;
   }, [contractSymbol, dataScope, markRealtimeMessage, normalizedUserIdentity]);
 
@@ -1154,12 +1164,12 @@ export function useContractUserState({
       setPositions(nextPositions);
       setPositionSummaries(nextSummaries);
       updateActivePositionScopeCache(nextPositions, nextSummaries);
-      const isInitialCurrentScopeSnapshot = (
+      const hasAuthoritativeCurrentScopePositions = (
         dataScope === 'current'
-        && String(message.type || '').toLowerCase().includes('snapshot')
         && positionsUpdate?.replace === true
+        && !markOnly
       );
-      if (isInitialCurrentScopeSnapshot) {
+      if (hasAuthoritativeCurrentScopePositions) {
         const snapshotPage = buildContractPrivatePositionPageSnapshot({
           positions: nextPositions,
           symbol: contractSymbol,
@@ -1174,6 +1184,11 @@ export function useContractUserState({
         applyPositionsPageCache(entry);
         setPositionsPaginationMeta(getListPaginationMeta(entry));
       }
+      const isInitialCurrentScopeSnapshot = (
+        dataScope === 'current'
+        && String(message.type || '').toLowerCase().includes('snapshot')
+        && positionsUpdate?.replace === true
+      );
       setIsScopeSwitching(false);
       hasLoadedPrivateRef.current = true;
       if (shouldRefreshPositionsFromRestAfterRealtime(
@@ -1183,6 +1198,43 @@ export function useContractUserState({
         activeTabRef.current,
       ) && !isInitialCurrentScopeSnapshot) {
         void refreshPrivate({ silent: true });
+      }
+    };
+
+    const applyRealtimeOrderState = (update: ReturnType<typeof extractContractOrdersUpdate> | null) => {
+      if (!update?.replace || dataScope !== 'current') return;
+      const activeSnapshot = buildContractPrivateOrderPageSnapshot({
+        orders: update.items,
+        symbol: contractSymbol,
+        statusGroup: 'ACTIVE',
+        filters: activeOrdersFilters,
+        page: activeOrdersPage,
+        pageSize: CONTRACT_ORDER_TRADE_PAGE_SIZE,
+      });
+      const historySnapshot = buildContractPrivateOrderPageSnapshot({
+        orders: update.items,
+        symbol: contractSymbol,
+        statusGroup: 'HISTORY',
+        filters: orderHistoryFilters,
+        page: orderHistoryPage,
+        pageSize: CONTRACT_ORDER_TRADE_PAGE_SIZE,
+      });
+      const activeEntry: ListScopeCacheEntry<ContractOrderListItem> = {
+        ...activeSnapshot,
+        loadedAt: Date.now(),
+      };
+      const historyEntry: ListScopeCacheEntry<ContractOrderListItem> = {
+        ...historySnapshot,
+        loadedAt: Date.now(),
+      };
+      activeOrdersCacheRef.current.set(activeOrdersScopeKeyRef.current, activeEntry);
+      ordersCacheRef.current.set(activeOrdersCacheKeyRef.current, historyEntry);
+      if (activeTabRef.current === 'openOrders') {
+        applyActiveOrdersCache(activeEntry);
+        setActiveOrdersPaginationMeta(getListPaginationMeta(activeEntry));
+      } else if (activeTabRef.current === 'historyOrders') {
+        applyOrdersCache(historyEntry);
+        setOrderHistoryPaginationMeta(getListPaginationMeta(historyEntry));
       }
     };
 
@@ -1202,6 +1254,7 @@ export function useContractUserState({
 
       const ordersUpdate = extractContractOrdersUpdate(message, contractSymbol);
       if (ordersUpdate) {
+        applyRealtimeOrderState(ordersUpdate);
         if (activeTabRef.current === 'openOrders' || activeTabRef.current === 'historyOrders') {
           void refreshPrivate({ silent: true });
         }
@@ -1250,6 +1303,7 @@ export function useContractUserState({
       if (!markScopedRealtimeMessage(message)) return;
       const update = extractContractOrdersUpdate(message, contractSymbol);
       if (!update && dataScope !== 'all') return;
+      applyRealtimeOrderState(update);
       if (activeTabRef.current === 'openOrders' || activeTabRef.current === 'historyOrders') {
         void refreshPrivate({ silent: true });
       }
@@ -1280,7 +1334,21 @@ export function useContractUserState({
       unsubscribeOrders();
       unsubscribeTrades();
     };
-  }, [applyPositionsPageCache, contractSymbol, dataScope, markScopedRealtimeMessage, patchPositionMarkCaches, refreshPrivate, updateActivePositionScopeCache]);
+  }, [
+    activeOrdersFilters,
+    activeOrdersPage,
+    applyActiveOrdersCache,
+    applyOrdersCache,
+    applyPositionsPageCache,
+    contractSymbol,
+    dataScope,
+    markScopedRealtimeMessage,
+    orderHistoryFilters,
+    orderHistoryPage,
+    patchPositionMarkCaches,
+    refreshPrivate,
+    updateActivePositionScopeCache,
+  ]);
 
   useEffect(() => {
     const identityChanged = privateStateIdentityRef.current !== normalizedUserIdentity;
@@ -1289,6 +1357,8 @@ export function useContractUserState({
       realtimeVersionRef.current = 0;
       lastRealtimeSeqRef.current = 0;
       lastRealtimeTsRef.current = 0;
+      lastMarkRealtimeSeqRef.current = 0;
+      lastMarkRealtimeTsRef.current = 0;
       privateStateIdentityRef.current = normalizedUserIdentity;
       setPrivateStateIdentity(normalizedUserIdentity);
       hasLoadedPrivateRef.current = false;

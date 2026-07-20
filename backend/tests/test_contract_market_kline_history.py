@@ -1093,6 +1093,47 @@ def test_itick_provider_session_policy_rejects_non_session_boundary():
     assert rows.provider_error_code == "ITICK_DWM_UTC_BOUNDARY_UNAVAILABLE"
 
 
+def test_itick_global_index_kline_uses_gb_namespace_and_utc_boundary():
+    service = _load_contract_market_service_module()
+    contract_symbol = _itick_contract_symbol_with_provider_session_policy(
+        category="INDEX",
+        symbol="NAS100USDT_PERP",
+        provider_symbol="NAS100",
+    )
+    open_time = 1_784_505_600_000
+    captured_provider_call = {}
+    service._load_contract_symbol = lambda *_args, **_kwargs: contract_symbol
+    service.get_klines_cache_first = _cache_first_fetches_provider
+
+    def get_market_kline(market, region, code, k_type, limit, **_kwargs):
+        captured_provider_call.update(
+            market=market,
+            region=region,
+            code=code,
+            k_type=k_type,
+            limit=limit,
+        )
+        return _provider_rows(open_time)
+
+    service.itick_market_service = SimpleNamespace(get_market_kline=get_market_kline)
+
+    rows = service.get_contract_klines(
+        object(),
+        "NAS100USDT_PERP",
+        interval="1d",
+        limit=50,
+    )
+
+    assert [row["open_time"] for row in rows] == [open_time]
+    assert captured_provider_call == {
+        "market": "indices",
+        "region": "GB",
+        "code": "NAS100",
+        "k_type": 8,
+        "limit": 50,
+    }
+
+
 def test_aapl_history_uses_stock_provider_evidence():
     service = _load_contract_market_service_module()
     contract_symbol = _itick_contract_symbol(

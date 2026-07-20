@@ -3,6 +3,7 @@
 import type { ContractOrderListItem, ContractPositionItem } from '@/lib/api/modules/contract';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import { formatPrice } from '@/lib/marketPrecision';
+import { useDisplayTimeZone } from '@/hooks/useDisplayTimeZone';
 import { formatNumber, formatTime, toNumber } from './contractFormat';
 
 type ContractTranslator = (key: string, namespace?: 'contracts') => string;
@@ -32,7 +33,8 @@ export default function ContractOrderTabs({
   cancelingOrderId = null,
   onCancel,
 }: ContractOrderTabsProps) {
-  const { t } = useLocaleContext();
+  const { t, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
   const displayLoadingText = loadingText || t('ordersRefreshingData', 'contracts');
   const displayLoadingDescription = loadingDescription || t('ordersSyncingDesc', 'contracts');
 
@@ -74,7 +76,7 @@ export default function ContractOrderTabs({
                   <OrderStatusBadge status={item.status} filledQuantity={filledQuantity} t={t} />
                 </div>
                 <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-white/38">
-                  <span>{formatTime(item.created_at)}</span>
+                  <span>{formatTime(item.created_at, displayTimeZone, locale)}</span>
                   <span title={item.order_no}>{t('orderPrefix', 'contracts')} {shortOrderNo(item.order_no)}</span>
                 </div>
               </div>

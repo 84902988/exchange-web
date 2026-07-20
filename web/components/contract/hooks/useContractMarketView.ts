@@ -43,9 +43,12 @@ import {
   type ContractRestBootstrapCursor,
 } from './contractRestBootstrapPolicy';
 import {
+  CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS,
   hydrateContractMarketRestDomain,
   hydrateContractMarketViewShadow,
   ingestContractMarketWsDomain,
+  projectContractMarketViewStoreAuthority,
+  useContractMarketViewStoreAuthoritySnapshot,
 } from './contractMarketStoreAdapter';
 import {
   normalizeContractMarketViewDisplayState,
@@ -448,6 +451,7 @@ export function useContractMarketView({
   }));
   const [fallbackDepthAllowed, setFallbackDepthAllowed] = useState(false);
   const [priceDirection, setPriceDirection] = useState<ContractPriceDirection>('flat');
+  const [storeAuthorityEvaluationTimeMs, setStoreAuthorityEvaluationTimeMs] = useState(0);
   const [marketSessionRefreshKey, setMarketSessionRefreshKey] = useState(0);
   const requestSeqRef = useRef(0);
   const inFlightSymbolRef = useRef<string | null>(null);
@@ -475,6 +479,7 @@ export function useContractMarketView({
     symbolOptionMarketSymbol,
     symbolOptionPricePrecision,
   });
+  const storeMarketViewAuthority = useContractMarketViewStoreAuthoritySnapshot(contractSymbol);
   const {
     initialDepth,
     marketRealtimeStatus: quoteMarketRealtimeStatus,
@@ -507,11 +512,7 @@ export function useContractMarketView({
       ) {
         return;
       }
-      const storeResults = hydrateContractMarketViewShadow(view, 'REST');
-      const tickerAccepted = storeResults.some((result) => (
-        result.accepted && result.entry?.domain === 'ticker'
-      ));
-      if (!tickerAccepted) return;
+      hydrateContractMarketViewShadow(view, 'REST');
       setRestMarketView(view);
       marketViewErrorSymbolRef.current = null;
       setMarketViewError(null);
@@ -595,12 +596,6 @@ export function useContractMarketView({
     };
   }, [contractSymbol, refreshMarketView]);
 
-  useContractMarketViewPolling({
-    symbol: contractSymbol,
-    realtimeStatus: quoteMarketRealtimeStatus,
-    refresh: refreshMarketView,
-  });
-
   useEffect(() => {
     const handleMarketStateMessage = (message: ContractMarketRealtimeMessage) => {
       if (!isContractMarketDomainMessage(message)) return;
@@ -651,7 +646,59 @@ export function useContractMarketView({
   const activeRestMarketView = normalizeContractSymbol(restMarketView?.symbol) === normalizeContractSymbol(contractSymbol)
     ? restMarketView
     : null;
-  const marketView = activeRealtimeMarketView || activeRestMarketView;
+  useEffect(() => {
+    if (
+      quoteMarketRealtimeStatus !== 'connected'
+      || !storeMarketViewAuthority?.hasRealtimeAuthority
+      || storeMarketViewAuthority.tickerObservedAtMs <= 0
+    ) return undefined;
+    const tickerExpiresAt = storeMarketViewAuthority.tickerObservedAtMs
+      + CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS;
+    const bboExpiresAt = storeMarketViewAuthority.executable === true
+      && storeMarketViewAuthority.bboObservedAtMs > 0
+      ? storeMarketViewAuthority.bboObservedAtMs
+        + CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS
+      : Number.POSITIVE_INFINITY;
+    const expiresAt = Math.min(tickerExpiresAt, bboExpiresAt);
+    const remainingMs = expiresAt - Date.now();
+    if (remainingMs <= 0) return undefined;
+    const timer = window.setTimeout(() => {
+      setStoreAuthorityEvaluationTimeMs(Date.now());
+    }, remainingMs + 1);
+    return () => window.clearTimeout(timer);
+  }, [
+    quoteMarketRealtimeStatus,
+    storeAuthorityEvaluationTimeMs,
+    storeMarketViewAuthority,
+  ]);
+  const storeMarketView = useMemo(
+    () => quoteMarketRealtimeStatus === 'connected'
+      ? projectContractMarketViewStoreAuthority(
+        storeMarketViewAuthority,
+        activeRestMarketView,
+        Math.max(Date.now(), storeAuthorityEvaluationTimeMs),
+      )
+      : null,
+    [
+      activeRestMarketView,
+      quoteMarketRealtimeStatus,
+      storeAuthorityEvaluationTimeMs,
+      storeMarketViewAuthority,
+    ],
+  );
+  const marketView = storeMarketView || activeRestMarketView || activeRealtimeMarketView;
+  const marketViewRecoveryRequired = quoteMarketRealtimeStatus === 'connected' && (
+    !marketView
+    || normalizeContractMarketViewDisplayState(marketView.display_state) === 'MARKET_DATA_UNAVAILABLE'
+    || normalizeContractMarketViewDisplayState(marketView.display_state) === 'UNAVAILABLE'
+    || normalizeContractMarketViewDisplayState(marketView.display_state) === 'UNKNOWN'
+  );
+  useContractMarketViewPolling({
+    symbol: contractSymbol,
+    realtimeStatus: quoteMarketRealtimeStatus,
+    recoveryRequired: marketViewRecoveryRequired,
+    refresh: refreshMarketView,
+  });
   const currentMarketViewLoading = marketViewLoading || Boolean(
     !marketView && (restMarketView || wsState),
   );
@@ -878,14 +925,18 @@ export function useContractMarketView({
       if (!isContractMarketDomainMessage(message)) return;
       if (effectiveMarketStatus === 'CLOSED') return;
 
-      const depth = extractRealtimeDepth(message, contractSymbol);
-      if (!depth) return;
+      // BBO-only providers can publish real bid/ask prices without a usable
+      // quantity. Persist the raw authority frame before deriving visual rows;
+      // otherwise those zero-quantity frames are dropped and Header/Form BBO
+      // freezes even though the provider WebSocket is still advancing.
       const storeResult = ingestContractMarketWsDomain({
         domain: 'depth',
         message,
-        data: depth,
       });
       if (!storeResult.accepted) return;
+
+      const depth = extractRealtimeDepth(message, contractSymbol);
+      if (!depth) return;
       applyDepthSnapshot(depth);
     };
 

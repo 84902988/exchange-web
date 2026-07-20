@@ -100,6 +100,10 @@ const loadPolicyModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractKlineLoadPolicy.ts', import.meta.url)),
   {},
 );
+const preloadPriorityModule = loadTypeScriptModule(
+  fileURLToPath(new URL('../../../lib/tradingview/klinePreloadPriority.ts', import.meta.url)),
+  {},
+);
 const cachePolicyStub = {
   normalizeContractKlineAssetClass: (value: unknown) => String(value || 'UNKNOWN').toUpperCase(),
   getContractKlineCurrentCacheTtlMs: () => 15_000,
@@ -120,6 +124,7 @@ const managerModule = loadTypeScriptModule(
       contractKlineCurrentCache: defaultCacheStub,
     },
     './contractKlineLoadPolicy': loadPolicyModule,
+    '@/lib/tradingview/klinePreloadPriority': preloadPriorityModule,
   },
 );
 
@@ -655,5 +660,81 @@ test('late preload result cannot overwrite a newer active cache revision', async
     && Number.isInteger(event.generation)
   )));
   assert.ok(lifecycleEvents.some((event: any) => event.role === 'active'));
+  manager.destroy();
+});
+
+test('contract preloads capability-filtered adjacent intervals before expanding active coverage', async () => {
+  const requests: string[] = [];
+  let idleCallback: (() => void) | null = null;
+  const manager = new managerModule.ContractKlinePreloadManager({
+    getState: () => ({
+      symbol: 'BTCUSDT_PERP',
+      category: 'CRYPTO',
+      interval: '1m',
+      intervals: ['1m', '5m', '15m', '1h', '4h'],
+    }),
+    cache: defaultCacheStub,
+    leaseRegistry: new managerModule.ContractKlineRequestLeaseRegistry(),
+    request: async ({ interval }: { interval: string }) => {
+      requests.push(interval);
+      return metadata(360);
+    },
+    idleScheduler: {
+      schedule: (callback: () => void) => {
+        idleCallback = callback;
+        return 1;
+      },
+      cancel: () => undefined,
+    },
+  });
+  manager.schedule({
+    symbol: 'BTCUSDT_PERP',
+    interval: '1m',
+    firstDataRequest: true,
+    barCount: 150,
+  });
+  (idleCallback as unknown as () => void)();
+  for (let index = 0; index < 8; index += 1) await flushPromises();
+
+  assert.deepEqual(requests, ['5m', '15m', '1h', '1m']);
+  manager.destroy();
+});
+
+test('contract toolbar intent promotes an available interval without adding unsupported capability', async () => {
+  const requests: string[] = [];
+  let idleCallback: (() => void) | null = null;
+  const manager = new managerModule.ContractKlinePreloadManager({
+    getState: () => ({
+      symbol: 'AAPLUSDT_PERP',
+      category: 'STOCK',
+      interval: '1d',
+      intervals: ['1d', '1w', '1M'],
+    }),
+    cache: defaultCacheStub,
+    leaseRegistry: new managerModule.ContractKlineRequestLeaseRegistry(),
+    request: async ({ interval }: { interval: string }) => {
+      requests.push(interval);
+      return metadata(120);
+    },
+    idleScheduler: {
+      schedule: (callback: () => void) => {
+        idleCallback = callback;
+        return 1;
+      },
+      cancel: () => undefined,
+    },
+  });
+  manager.schedule({
+    symbol: 'AAPLUSDT_PERP',
+    interval: '1d',
+    firstDataRequest: true,
+    barCount: 100,
+  });
+  assert.equal(manager.prewarmInterval('1M', 'toolbar-pointerenter'), true);
+  assert.equal(manager.prewarmInterval('4h', 'unsupported-toolbar'), false);
+  (idleCallback as unknown as () => void)();
+  for (let index = 0; index < 6; index += 1) await flushPromises();
+
+  assert.deepEqual(requests, ['1M', '1w', '1d']);
   manager.destroy();
 });

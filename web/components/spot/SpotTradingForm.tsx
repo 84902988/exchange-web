@@ -16,6 +16,8 @@ import {
 import TradingConfirmModal from '@/components/common/TradingConfirmModal';
 import PercentageSlider from './form/PercentageSlider';
 import { useLocaleContext } from '@/contexts/LocaleContext';
+import { useDisplayTimeZone } from '@/hooks/useDisplayTimeZone';
+import { formatDisplayTime } from '@/lib/displayTimeZone';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import {
   getSpotBboAvailabilityLabel,
@@ -31,6 +33,10 @@ import {
   type SpotExecutableDepthState,
 } from './spotExecutableDepth';
 import { loadSpotVipBootstrapSingleFlight } from './spotPrivateBootstrap';
+import {
+  resolveSpotFeePreferenceDisplay,
+  type SpotFeeHintTone,
+} from './spotFeePreferenceDisplay';
 
 interface SpotTradingFormProps {
   symbol: string;
@@ -60,15 +66,13 @@ type PendingSpotOrder = {
   submitPrice: string;
 };
 
-type FeeHintTone = 'neutral' | 'success' | 'warning';
-
 type EstimatedFeeInfo = {
   display: string;
   payment: string;
   hintTitle: string;
   hintSubtitle: string;
   hintDetails: string[];
-  hintTone: FeeHintTone;
+  hintTone: SpotFeeHintTone;
   rcbReady: boolean;
   showOpenLink: boolean;
 };
@@ -89,7 +93,6 @@ const PERCENT_TICKS = new Set([0, 25, 50, 75, 100]);
 const SUCCESS_MESSAGE_DURATION_MS = 4000;
 const MIN_SUBMIT_LOADING_MS = 600;
 const SPOT_FEE_SETTINGS_CACHE_TTL_MS = 120_000;
-const LATEST_TRADE_LABEL = String.fromCharCode(26368, 26032, 25104, 20132);
 
 let cachedSpotFeeSettings: { settings: SpotFeeSettings; fetchedAt: number } | null = null;
 let spotFeeSettingsRequest: Promise<SpotFeeSettings> | null = null;
@@ -133,6 +136,7 @@ type SpotFormCopy = {
   symbol: string
   type: string
   orderPrice: string
+  latestTrade: string
   available: string
   total: string
   estimatedBaseAmount: string
@@ -218,6 +222,7 @@ function buildSpotFormCopy(t: AssetTranslator): SpotFormCopy {
     symbol: t('spotFormSymbol', 'asset'),
     type: t('spotFormType', 'asset'),
     orderPrice: t('spotFormOrderPrice', 'asset'),
+    latestTrade: t('spotFormLatestTrade', 'asset'),
     available: t('spotFormAvailable', 'asset'),
     total: t('spotFormTotal', 'asset'),
     estimatedBaseAmount: t('spotFormEstimatedBaseAmount', 'asset'),
@@ -368,13 +373,14 @@ function formatPrice(value: string | number, precision: number): string {
   return normalizeSpotPriceInput(value, precision);
 }
 
-function formatLatestTradeTime(value?: number | null): string {
+function formatLatestTradeTime(
+  value: number | null | undefined,
+  timeZone: string,
+  locale?: string,
+): string {
   const num = Number(value);
   if (!Number.isFinite(num) || num <= 0) return '';
-
-  return new Date(num).toLocaleTimeString('zh-CN', {
-    hour12: false,
-  });
+  return formatDisplayTime(num, timeZone, locale);
 }
 
 function normalizePrecision(value: unknown, fallback: number): number {
@@ -762,7 +768,8 @@ export default function SpotTradingForm({
   userId = null,
   userIdentityKey = null,
 }: SpotTradingFormProps) {
-  const { t: localeT } = useLocaleContext();
+  const { t: localeT, locale } = useLocaleContext();
+  const displayTimeZone = useDisplayTimeZone();
   const copy = useMemo(() => buildSpotFormCopy(localeT), [localeT]);
   const [side, setSide] = useState<'buy' | 'sell'>('buy');
   const [orderType, setOrderType] = useState<'limit' | 'market'>('limit');
@@ -1049,7 +1056,7 @@ export default function SpotTradingForm({
 
   const estimatedFeeInfo = useMemo<EstimatedFeeInfo>(() => {
     const rate = parseFeeRate(orderType === 'limit' ? vipMakerFeeRate : vipTakerFeeRate);
-    if (!isLoggedIn || rate === null || total <= 0) {
+    if (!isLoggedIn) {
       return {
         display: '--',
         payment: '--',
@@ -1059,6 +1066,25 @@ export default function SpotTradingForm({
         hintTone: 'neutral',
         rcbReady: false,
         showOpenLink: false,
+      };
+    }
+
+    const preferenceDisplay = resolveSpotFeePreferenceDisplay({
+      spotRcbFeeEnabled: spotFeeSettings.spot_rcb_fee_enabled,
+      useRcbFee,
+      rcbPaymentLabel: copy.rcbPayment,
+      usdtFeeTitle: copy.usdtFeeTitle,
+      rcbDisabledSubtitle: copy.rcbDisabled,
+      rcbEnableSubtitle: formatCopy(copy.rcbEnableHint, { percent: rcbFeeDiscountPercentText }),
+      rcbEnabledTitle: formatCopy(copy.rcbEnabledHint, { percent: rcbFeeDiscountPercentText }),
+    });
+
+    if (rate === null || total <= 0) {
+      return {
+        display: '--',
+        ...preferenceDisplay,
+        hintDetails: [],
+        rcbReady: false,
       };
     }
 
@@ -1081,26 +1107,18 @@ export default function SpotTradingForm({
     if (!spotFeeSettings.spot_rcb_fee_enabled) {
       return {
         display: feeUsdtDisplay,
-        payment: 'USDT',
-        hintTitle: copy.usdtFeeTitle,
-        hintSubtitle: copy.rcbDisabled,
+        ...preferenceDisplay,
         hintDetails: [],
-        hintTone: 'neutral',
         rcbReady: false,
-        showOpenLink: false,
       };
     }
 
     if (!useRcbFee) {
       return {
         display: feeUsdtDisplay,
-        payment: 'USDT',
-        hintTitle: copy.usdtFeeTitle,
-        hintSubtitle: formatCopy(copy.rcbEnableHint, { percent: rcbFeeDiscountPercentText }),
+        ...preferenceDisplay,
         hintDetails: [],
-        hintTone: 'neutral',
         rcbReady: false,
-        showOpenLink: true,
       };
     }
 
@@ -1690,7 +1708,7 @@ export default function SpotTradingForm({
     latestTradePrice !== null && latestTradePrice !== undefined && String(latestTradePrice).trim() !== ''
       ? String(latestTradePrice)
       : '--';
-  const latestTradeTimeDisplay = formatLatestTradeTime(latestTradeAt);
+  const latestTradeTimeDisplay = formatLatestTradeTime(latestTradeAt, displayTimeZone, locale);
 
   const handleSliderChange = (nextValue: number) => {
     const safeValue = clampPercentValue(nextValue);
@@ -1976,7 +1994,7 @@ export default function SpotTradingForm({
             </span>
           </div>
           <div className="mt-1 flex min-w-0 items-center justify-between gap-2 text-white/36 [@media(max-height:850px)]:mt-0.5">
-            <span className="min-w-0 truncate">{LATEST_TRADE_LABEL}</span>
+            <span className="min-w-0 truncate">{copy.latestTrade}</span>
             <span className="min-w-0 truncate text-right text-white/62">
               {latestTradePriceDisplay}
               {latestTradeTimeDisplay ? (

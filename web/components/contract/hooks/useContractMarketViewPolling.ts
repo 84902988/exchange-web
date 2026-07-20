@@ -27,23 +27,29 @@ export function useContractPageVisibility() {
 export function getContractMarketViewPollInterval(
   realtimeStatus: ContractMarketRealtimeStatus,
   isPageVisible: boolean,
+  recoveryRequired = false,
 ) {
   if (!isPageVisible) return null;
-  return realtimeStatus === 'connected' ? null : CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS;
+  return realtimeStatus === 'connected' && !recoveryRequired
+    ? null
+    : CONTRACT_MARKET_VIEW_FALLBACK_POLL_MS;
 }
 
 export function useContractMarketViewPolling({
   symbol,
   realtimeStatus,
+  recoveryRequired = false,
   refresh,
 }: {
   symbol: string;
   realtimeStatus: ContractMarketRealtimeStatus;
+  recoveryRequired?: boolean;
   refresh: () => void | Promise<void>;
 }) {
   const isPageVisible = useContractPageVisibility();
   const refreshRef = useRef(refresh);
   const previousVisibilityRef = useRef(isPageVisible);
+  const previousRealtimeStatusRef = useRef(realtimeStatus);
 
   useEffect(() => {
     refreshRef.current = refresh;
@@ -62,7 +68,23 @@ export function useContractMarketViewPolling({
   }, [isPageVisible, realtimeStatus]);
 
   useEffect(() => {
-    const intervalMs = getContractMarketViewPollInterval(realtimeStatus, isPageVisible);
+    const previousStatus = previousRealtimeStatusRef.current;
+    previousRealtimeStatusRef.current = realtimeStatus;
+    if (
+      isPageVisible
+      && realtimeStatus === 'connected'
+      && (previousStatus === 'disconnected' || previousStatus === 'reconnecting')
+    ) {
+      void refreshRef.current();
+    }
+  }, [isPageVisible, realtimeStatus]);
+
+  useEffect(() => {
+    const intervalMs = getContractMarketViewPollInterval(
+      realtimeStatus,
+      isPageVisible,
+      recoveryRequired,
+    );
     if (intervalMs === null) return undefined;
 
     const timer = window.setInterval(() => {
@@ -70,7 +92,7 @@ export function useContractMarketViewPolling({
     }, intervalMs);
 
     return () => window.clearInterval(timer);
-  }, [isPageVisible, realtimeStatus, symbol]);
+  }, [isPageVisible, realtimeStatus, recoveryRequired, symbol]);
 
   return isPageVisible;
 }

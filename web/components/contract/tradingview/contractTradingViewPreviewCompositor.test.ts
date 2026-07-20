@@ -230,7 +230,26 @@ test('generation, revision, volume and scope mismatches fail closed', () => {
     new ContractTradingViewPreviewCompositor({
       symbol: 'SOLUSDT_PERP',
       interval: '5m',
-    }).acceptNative(native({ symbol: 'SOLUSDT_PERP', interval: '5m' })).reason,
+    }).acceptNative(native({ symbol: 'SOLUSDT_PERP', interval: '5m' })).source,
+    'native',
+  )
+  const fiveMinute = new ContractTradingViewPreviewCompositor({
+    symbol: 'SOLUSDT_PERP',
+    interval: '5m',
+  })
+  fiveMinute.acceptNative(native({ symbol: 'SOLUSDT_PERP', interval: '5m' }))
+  assert.equal(
+    fiveMinute.acceptPreview(preview({
+      symbol: 'SOLUSDT_PERP',
+      interval: '5m',
+    })).source,
+    'preview',
+  )
+  assert.equal(
+    new ContractTradingViewPreviewCompositor({
+      symbol: 'SOLUSDT_PERP',
+      interval: '15m',
+    }).acceptNative(native({ symbol: 'SOLUSDT_PERP', interval: '15m' })).reason,
     'UNSUPPORTED_SCOPE',
   )
 })
