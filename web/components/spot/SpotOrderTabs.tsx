@@ -89,6 +89,9 @@ type TradeRowItem = SpotTradeItem & {
   expiresAt?: number
 }
 
+const EMPTY_SPOT_ORDERS: SpotOrderItem[] = []
+const EMPTY_SPOT_TRADES: TradeRowItem[] = []
+
 const PAGE_SIZE = 10
 const OPTIMISTIC_TRADE_TTL_MS = 3000
 const REST_REVALIDATE_DEBOUNCE_MS = 500
@@ -765,6 +768,10 @@ export default function SpotOrderTabs({
   const { t, locale } = useLocaleContext()
   const displayTimeZone = useDisplayTimeZone()
   const { user, isLoggedIn } = useAuth()
+  const accountScope = normalizeUserId(user?.id)
+  const activePrivateDataScope = accountScope
+    ? `${accountScope}:${normalizeSymbol(symbol)}`
+    : ''
   const displaySymbol = useMemo(() => formatSpotDisplaySymbol(symbol), [symbol])
   const pricePrecision = normalizePricePrecision(requestedPricePrecision)
   const [tab, setTab] = useState<TabKey>('current')
@@ -772,6 +779,7 @@ export default function SpotOrderTabs({
   const [historyOrders, setHistoryOrders] = useState<SpotOrderItem[]>([])
   const [myTrades, setMyTrades] = useState<TradeRowItem[]>([])
   const [optimisticTrades, setOptimisticTrades] = useState<TradeRowItem[]>([])
+  const [loadedPrivateDataScope, setLoadedPrivateDataScope] = useState(activePrivateDataScope)
   const [loading, setLoading] = useState(false)
   const [cancelingOrderId, setCancelingOrderId] = useState<number | null>(null)
   const [actionError, setActionError] = useState('')
@@ -816,8 +824,8 @@ export default function SpotOrderTabs({
   }, [])
 
   useEffect(() => {
-    currentUserIdRef.current = normalizeUserId(user?.id)
-  }, [user?.id])
+    currentUserIdRef.current = accountScope
+  }, [accountScope])
 
   useEffect(() => {
     onBalanceUpdateRef.current = onBalanceUpdate
@@ -885,9 +893,10 @@ export default function SpotOrderTabs({
     })
     setOptimisticTrades([])
     restTradesRef.current = []
+    setLoadedPrivateDataScope(activePrivateDataScope)
     setActionError('')
     setActionSuccess('')
-  }, [clearCurrentOrdersRetryTimer, symbol])
+  }, [activePrivateDataScope, clearCurrentOrdersRetryTimer, symbol])
 
   useEffect(() => {
     activeTabRef.current = tab
@@ -961,6 +970,7 @@ export default function SpotOrderTabs({
     let preOpenAuthRecoveryAttempted = false
 
     const normalizedSymbol = normalizeSymbol(symbol)
+    const connectionAccountScope = accountScope
     currentSymbolRef.current = normalizedSymbol
 
     const clearConnectTimer = () => {
@@ -1003,7 +1013,7 @@ export default function SpotOrderTabs({
     }
 
     const scheduleReconnect = () => {
-      if (dead || !normalizedSymbol || !isLoggedIn) return
+      if (dead || !normalizedSymbol || !isLoggedIn || !connectionAccountScope) return
       clearReconnectTimer()
       const delay = Math.min(
         PRIVATE_WS_RECONNECT_BASE_DELAY_MS * (2 ** reconnectAttempt),
@@ -1016,7 +1026,7 @@ export default function SpotOrderTabs({
       }, delay)
     }
 
-    if (!normalizedSymbol || !isLoggedIn) {
+    if (!normalizedSymbol || !isLoggedIn || !connectionAccountScope) {
       setCurrentOrders([])
       closeWs()
       return () => {
@@ -1039,7 +1049,7 @@ export default function SpotOrderTabs({
       }
 
       ws.onmessage = (event) => {
-        if (dead) return
+        if (dead || currentUserIdRef.current !== connectionAccountScope) return
 
         try {
           const data = parseSpotPrivateWsMessage(event.data, {
@@ -1156,13 +1166,14 @@ export default function SpotOrderTabs({
       closeWs()
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, isLoggedIn, user?.id])
+  }, [accountScope, symbol, isLoggedIn])
 
   const loadCurrentOrders = useCallback(async (
     reason = 'manual',
     networkRetryAttempt = 0,
   ) => {
-    if (!isLoggedIn) {
+    const requestAccountScope = accountScope
+    if (!isLoggedIn || !requestAccountScope) {
       currentOrdersLoadedRef.current = false
       setCurrentOrders([])
       return
@@ -1175,7 +1186,7 @@ export default function SpotOrderTabs({
     const requestSymbol = currentSymbolRef.current || normalizeSymbol(symbol)
     if (!requestSymbol) return
 
-    const requestKey = `${requestSymbol}:current`
+    const requestKey = `${requestAccountScope}:${requestSymbol}:current`
     if (currentOrdersInFlightKeyRef.current === requestKey) {
       currentOrdersRevalidatePendingRef.current = true
       return
@@ -1190,7 +1201,8 @@ export default function SpotOrderTabs({
       const currentRes = await getSpotCurrentOrders(requestSymbol, 50)
       if (
         currentOrdersRequestSeqRef.current !== requestSeq ||
-        requestSymbol !== currentSymbolRef.current
+        requestSymbol !== currentSymbolRef.current ||
+        requestAccountScope !== currentUserIdRef.current
       ) {
         return
       }
@@ -1199,7 +1211,8 @@ export default function SpotOrderTabs({
     } catch (err) {
       const isCurrentRequest =
         currentOrdersRequestSeqRef.current === requestSeq &&
-        requestSymbol === currentSymbolRef.current
+        requestSymbol === currentSymbolRef.current &&
+        requestAccountScope === currentUserIdRef.current
 
       if (
         isCurrentRequest &&
@@ -1211,7 +1224,8 @@ export default function SpotOrderTabs({
           currentOrdersRetryTimerRef.current = null
           if (
             currentOrdersRequestSeqRef.current !== requestSeq ||
-            requestSymbol !== currentSymbolRef.current
+            requestSymbol !== currentSymbolRef.current ||
+            requestAccountScope !== currentUserIdRef.current
           ) {
             return
           }
@@ -1226,7 +1240,8 @@ export default function SpotOrderTabs({
         if (shouldShowLoading) endLoading()
         const shouldRunCoalescedRevalidation =
           currentOrdersRevalidatePendingRef.current &&
-          requestSymbol === currentSymbolRef.current
+          requestSymbol === currentSymbolRef.current &&
+          requestAccountScope === currentUserIdRef.current
         currentOrdersRevalidatePendingRef.current = false
         if (shouldRunCoalescedRevalidation) {
           void loadCurrentOrdersRef.current('coalesced')
@@ -1235,6 +1250,7 @@ export default function SpotOrderTabs({
     }
   }, [
     beginLoading,
+    accountScope,
     clearCurrentOrdersRetryTimer,
     endLoading,
     isLoggedIn,
@@ -1252,11 +1268,12 @@ export default function SpotOrderTabs({
 
   const loadHistoryOrders = useCallback(async (reason = 'manual') => {
     void reason
-    if (!isLoggedIn) return
+    const requestAccountScope = accountScope
+    if (!isLoggedIn || !requestAccountScope) return
     const requestSymbol = currentSymbolRef.current || normalizeSymbol(symbol)
     if (!requestSymbol) return
 
-    const requestKey = `${requestSymbol}:history`
+    const requestKey = `${requestAccountScope}:${requestSymbol}:history`
     if (historyOrdersInFlightKeyRef.current === requestKey) {
       return
     }
@@ -1270,7 +1287,8 @@ export default function SpotOrderTabs({
       const historyRes = await getSpotHistoryOrders(requestSymbol, 100)
       if (
         historyOrdersRequestSeqRef.current !== requestSeq ||
-        requestSymbol !== currentSymbolRef.current
+        requestSymbol !== currentSymbolRef.current ||
+        requestAccountScope !== currentUserIdRef.current
       ) {
         return
       }
@@ -1286,15 +1304,16 @@ export default function SpotOrderTabs({
         if (shouldShowLoading) endLoading()
       }
     }
-  }, [beginLoading, endLoading, isLoggedIn, symbol])
+  }, [accountScope, beginLoading, endLoading, isLoggedIn, symbol])
 
   const loadMyTrades = useCallback(async (reason = 'manual') => {
     void reason
-    if (!isLoggedIn) return
+    const requestAccountScope = accountScope
+    if (!isLoggedIn || !requestAccountScope) return
     const requestSymbol = currentSymbolRef.current || normalizeSymbol(symbol)
     if (!requestSymbol) return
 
-    const requestKey = `${requestSymbol}:trades`
+    const requestKey = `${requestAccountScope}:${requestSymbol}:trades`
     if (tradesInFlightKeyRef.current === requestKey) {
       return
     }
@@ -1308,7 +1327,8 @@ export default function SpotOrderTabs({
       const tradesRes = await getSpotMyTrades(requestSymbol, 100)
       if (
         tradesRequestSeqRef.current !== requestSeq ||
-        requestSymbol !== currentSymbolRef.current
+        requestSymbol !== currentSymbolRef.current ||
+        requestAccountScope !== currentUserIdRef.current
       ) {
         return
       }
@@ -1327,7 +1347,7 @@ export default function SpotOrderTabs({
         if (shouldShowLoading) endLoading()
       }
     }
-  }, [beginLoading, endLoading, isLoggedIn, symbol])
+  }, [accountScope, beginLoading, endLoading, isLoggedIn, symbol])
 
   const scheduleHistoryAndTradesReload = useCallback(
     (reason = 'manual', delayMs = REST_REVALIDATE_DEBOUNCE_MS, targetTab: TabKey = activeTabRef.current) => {
@@ -1358,9 +1378,16 @@ export default function SpotOrderTabs({
     scheduleHistoryAndTradesReload('active-tab', 0, tab)
   }, [refreshKey, scheduleHistoryAndTradesReload, symbol, tab])
 
+  const hasActivePrivateDataScope = Boolean(activePrivateDataScope) &&
+    loadedPrivateDataScope === activePrivateDataScope
+  const scopedCurrentOrders = hasActivePrivateDataScope ? currentOrders : EMPTY_SPOT_ORDERS
+  const scopedHistoryOrders = hasActivePrivateDataScope ? historyOrders : EMPTY_SPOT_ORDERS
+  const scopedMyTrades = hasActivePrivateDataScope ? myTrades : EMPTY_SPOT_TRADES
+  const scopedOptimisticTrades = hasActivePrivateDataScope ? optimisticTrades : EMPTY_SPOT_TRADES
+
   const userOrderSideMap = useMemo(() => {
     const map = new Map<string, TradeDirection>()
-    const allOrders = mergeOrdersById(currentOrders, historyOrders)
+    const allOrders = mergeOrdersById(scopedCurrentOrders, scopedHistoryOrders)
 
     for (const order of allOrders) {
       const orderId = normalizeOrderId(order?.id)
@@ -1370,21 +1397,21 @@ export default function SpotOrderTabs({
     }
 
     return map
-  }, [currentOrders, historyOrders])
+  }, [scopedCurrentOrders, scopedHistoryOrders])
 
   const visibleCurrentOrders = useMemo(
-    () => mergeOrdersById(currentOrders, historyOrders).filter(isCurrentOrder),
-    [currentOrders, historyOrders],
+    () => mergeOrdersById(scopedCurrentOrders, scopedHistoryOrders).filter(isCurrentOrder),
+    [scopedCurrentOrders, scopedHistoryOrders],
   )
 
   const visibleHistoryOrders = useMemo(
-    () => mergeOrdersById(currentOrders, historyOrders).filter(isHistoryOrder),
-    [currentOrders, historyOrders],
+    () => mergeOrdersById(scopedCurrentOrders, scopedHistoryOrders).filter(isHistoryOrder),
+    [scopedCurrentOrders, scopedHistoryOrders],
   )
 
   const orderFeeDisplayMap = useMemo(() => {
     const map = new Map<string, string>()
-    mergeOrdersById(currentOrders, historyOrders).forEach((order) => {
+    mergeOrdersById(scopedCurrentOrders, scopedHistoryOrders).forEach((order) => {
       const orderId = normalizeOrderId(order.id)
       const feeDisplay = formatFeeAmount(order)
       if (orderId && feeDisplay !== '--') {
@@ -1392,11 +1419,11 @@ export default function SpotOrderTabs({
       }
     })
     return map
-  }, [currentOrders, historyOrders])
+  }, [scopedCurrentOrders, scopedHistoryOrders])
 
   const visibleTrades = useMemo(
-    () => mergeRestAndOptimisticTrades(myTrades, optimisticTrades, currentSymbolRef.current || normalizeSymbol(symbol)),
-    [myTrades, optimisticTrades, symbol],
+    () => mergeRestAndOptimisticTrades(scopedMyTrades, scopedOptimisticTrades, currentSymbolRef.current || normalizeSymbol(symbol)),
+    [scopedMyTrades, scopedOptimisticTrades, symbol],
   )
 
   const rows = useMemo(() => {

@@ -37,11 +37,13 @@ import {
   resolveSpotFeePreferenceDisplay,
   type SpotFeeHintTone,
 } from './spotFeePreferenceDisplay';
+import { resolveSpotEstimatedFeeRate } from './spotEstimatedFeeRate';
 
 interface SpotTradingFormProps {
   symbol: string;
   baseAsset?: string | null;
   quoteAsset?: string | null;
+  marketMode?: string | null;
   executableDepth: SpotExecutableDepthState;
   selectedPrice?: string;
   pricePrecision: number;
@@ -475,11 +477,6 @@ function isPositiveDecimalInput(value: string): boolean {
   return Number.isFinite(num) && num > 0;
 }
 
-function parseFeeRate(value: string | null | undefined): number | null {
-  const num = Number(value);
-  return Number.isFinite(num) && num >= 0 ? num : null;
-}
-
 function parsePositiveRatio(value: string | number | null | undefined, fallback: number): number {
   const num = Number(value);
   return Number.isFinite(num) && num > 0 && num <= 1 ? num : fallback;
@@ -750,6 +747,7 @@ export default function SpotTradingForm({
   symbol,
   baseAsset: pairBaseAsset,
   quoteAsset: pairQuoteAsset,
+  marketMode = null,
   executableDepth,
   selectedPrice = '',
   pricePrecision,
@@ -1054,8 +1052,40 @@ export default function SpotTradingForm({
     return priceNumber * amountNumber;
   }, [amount, currentPriceNumber, orderType, price, quoteAmount, side]);
 
+  const estimatedFeeRate = useMemo(() => (
+    resolveSpotEstimatedFeeRate({
+      orderType,
+      side,
+      limitPrice: price,
+      marketMode,
+      makerFeeRate: vipMakerFeeRate,
+      takerFeeRate: vipTakerFeeRate,
+      executableDepth: {
+        isCurrentSymbol: executableDepth.isCurrentSymbol,
+        freshnessKind: executableDepth.freshnessKind,
+        hasFreshBid: executableDepth.hasFreshBid,
+        hasFreshAsk: executableDepth.hasFreshAsk,
+        buyReferencePrice: executableDepth.buyReferencePrice,
+        sellReferencePrice: executableDepth.sellReferencePrice,
+      },
+    }).rate
+  ), [
+    executableDepth.buyReferencePrice,
+    executableDepth.freshnessKind,
+    executableDepth.hasFreshAsk,
+    executableDepth.hasFreshBid,
+    executableDepth.isCurrentSymbol,
+    executableDepth.sellReferencePrice,
+    marketMode,
+    orderType,
+    price,
+    side,
+    vipMakerFeeRate,
+    vipTakerFeeRate,
+  ]);
+
   const estimatedFeeInfo = useMemo<EstimatedFeeInfo>(() => {
-    const rate = parseFeeRate(orderType === 'limit' ? vipMakerFeeRate : vipTakerFeeRate);
+    const rate = estimatedFeeRate;
     if (!isLoggedIn) {
       return {
         display: '--',
@@ -1181,7 +1211,7 @@ export default function SpotTradingForm({
   }, [
     copy,
     isLoggedIn,
-    orderType,
+    estimatedFeeRate,
     rcbFeeDiscountPercentText,
     rcbFeeDiscountRate,
     rcbSpotAvailable,
@@ -1190,8 +1220,6 @@ export default function SpotTradingForm({
     spotFeeSettings.spot_rcb_fee_enabled,
     total,
     useRcbFee,
-    vipMakerFeeRate,
-    vipTakerFeeRate,
   ]);
 
   const estimatedFeeDisplay = estimatedFeeInfo.display;

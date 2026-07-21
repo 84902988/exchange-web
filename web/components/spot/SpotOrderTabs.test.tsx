@@ -1,17 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals'
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { ApiError } from '@/lib/api/core/error'
 import {
   getSpotCurrentOrders,
+  getSpotMyTrades,
   type SpotOrderItem,
+  type SpotTradeItem,
 } from '@/lib/api/modules/spot'
 import SpotOrderTabs from './SpotOrderTabs'
 
+let mockAuthState = {
+  user: { id: 7 },
+  isLoggedIn: true,
+}
+
 jest.mock('@/lib/authContext', () => ({
-  useAuth: () => ({
-    user: { id: 7 },
-    isLoggedIn: true,
-  }),
+  useAuth: () => mockAuthState,
 }), { virtual: true })
 
 jest.mock('@/contexts/LocaleContext', () => ({
@@ -68,6 +72,7 @@ class MockWebSocket {
 }
 
 const currentOrdersMock = jest.mocked(getSpotCurrentOrders)
+const myTradesMock = jest.mocked(getSpotMyTrades)
 
 function buildOrder(symbol: string, id = 1): SpotOrderItem {
   return {
@@ -95,6 +100,40 @@ function buildResponse(symbol: string, items: SpotOrderItem[] = []) {
   }
 }
 
+function buildTradeResponse(symbol: string, items: SpotTradeItem[] = []) {
+  return {
+    symbol,
+    total: items.length,
+    items,
+  }
+}
+
+function buildTrade(
+  symbol: string,
+  feeAmount: string,
+  side: 'BUY' | 'SELL',
+  userId: number,
+): SpotTradeItem {
+  return {
+    trade_id: 141197,
+    symbol,
+    side,
+    price: '0.109',
+    amount: '30',
+    quote_amount: '3.27',
+    buyer_user_id: side === 'BUY' ? userId : 99,
+    seller_user_id: side === 'SELL' ? userId : 99,
+    buy_order_id: 141247,
+    sell_order_id: 141246,
+    maker_order_id: 141246,
+    taker_order_id: 141247,
+    role: side === 'SELL' ? 'MAKER' : 'TAKER',
+    fee_amount: feeAmount,
+    fee_asset_symbol: 'USDT',
+    created_at: '2026-07-20T20:42:10Z',
+  }
+}
+
 async function flushAsyncWork() {
   await act(async () => {
     await Promise.resolve()
@@ -114,6 +153,10 @@ describe('SpotOrderTabs current orders recovery', () => {
   beforeEach(() => {
     jest.useFakeTimers()
     jest.clearAllMocks()
+    mockAuthState = {
+      user: { id: 7 },
+      isLoggedIn: true,
+    }
     MockWebSocket.instances = []
     Object.defineProperty(window, 'WebSocket', {
       configurable: true,
@@ -163,6 +206,57 @@ describe('SpotOrderTabs current orders recovery', () => {
 
     expect(screen.getByText('0.012')).toBeInTheDocument()
     expect(screen.queryByText('0.01')).not.toBeInTheDocument()
+  })
+
+  it('isolates trade fee rows and late responses when the authenticated account changes', async () => {
+    let resolveOldAccountTrades: ((value: ReturnType<typeof buildTradeResponse>) => void) | null = null
+    currentOrdersMock.mockResolvedValue(buildResponse('MFCUSDT'))
+    myTradesMock
+      .mockImplementationOnce(
+        () => new Promise((resolve) => {
+          resolveOldAccountTrades = resolve
+        }),
+      )
+      .mockResolvedValueOnce(
+        buildTradeResponse('MFCUSDT', [buildTrade('MFCUSDT', '0.001308', 'SELL', 8)]),
+      )
+
+    const view = render(<SpotOrderTabs symbol="MFCUSDT" pricePrecision={3} />)
+    await flushAsyncWork()
+
+    fireEvent.click(screen.getByText('myTrades'))
+    await act(async () => {
+      jest.advanceTimersByTime(0)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(myTradesMock).toHaveBeenCalledTimes(1)
+
+    mockAuthState = {
+      user: { id: 8 },
+      isLoggedIn: true,
+    }
+    view.rerender(<SpotOrderTabs symbol="MFCUSDT" pricePrecision={3} />)
+    await act(async () => {
+      jest.advanceTimersByTime(0)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(myTradesMock).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('0.001308 USDT')).toBeTruthy()
+    expect(screen.queryByText('0.01308 USDT')).toBeNull()
+
+    await act(async () => {
+      resolveOldAccountTrades?.(
+        buildTradeResponse('MFCUSDT', [buildTrade('MFCUSDT', '0.01308', 'BUY', 7)]),
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByText('0.001308 USDT')).toBeTruthy()
+    expect(screen.queryByText('0.01308 USDT')).toBeNull()
   })
 
   it('retries a NETWORK_ERROR once without console.error and succeeds', async () => {

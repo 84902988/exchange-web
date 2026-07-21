@@ -219,6 +219,82 @@ describe('Spot market transport mirror', () => {
     detach();
   });
 
+  it('accepts an authoritative empty internal depth snapshot and clears filled levels', () => {
+    const transport = new TestTransport();
+    const store = createSpotPublicMarketStore();
+    const detach = attachSpotMarketStoreTransportMirror(transport, store);
+
+    transport.emit('depth', {
+      type: 'spot_depth_update',
+      symbol: 'MFCUSDT',
+      depth: {
+        symbol: 'MFCUSDT',
+        bids: [{ price: '0.108', amount: '29.800' }],
+        asks: [{ price: '0.108', amount: '29.800' }],
+        source: 'INTERNAL',
+        freshness: 'RECENT',
+        ts: 1_000,
+      },
+    });
+    transport.emit('depth', {
+      type: 'spot_depth_update',
+      symbol: 'MFCUSDT',
+      depth: {
+        symbol: 'MFCUSDT',
+        bids: [],
+        asks: [],
+        source: 'INTERNAL',
+        freshness: 'RECENT',
+        ts: 1_100,
+      },
+    });
+
+    const depthSlot = store.getState().symbols.MFCUSDT.depth;
+    expect(depthSlot.snapshot?.data?.bids).toEqual([]);
+    expect(depthSlot.snapshot?.data?.asks).toEqual([]);
+    expect(depthSlot.snapshot?.metadata.completeness.status).toBe('EMPTY');
+    expect(depthSlot.snapshot?.metadata.source).toBe('INTERNAL');
+    expect(depthSlot.snapshot?.metadata.freshness).toBe('RECENT');
+    detach();
+  });
+
+  it('still rejects a missing empty depth frame so transport gaps do not erase a good book', () => {
+    const transport = new TestTransport();
+    const store = createSpotPublicMarketStore();
+    const detach = attachSpotMarketStoreTransportMirror(transport, store);
+
+    transport.emit('depth', {
+      type: 'spot_depth_update',
+      symbol: 'MFCUSDT',
+      depth: {
+        symbol: 'MFCUSDT',
+        bids: [{ price: '0.108', amount: '29.800' }],
+        asks: [{ price: '0.109', amount: '10.000' }],
+        source: 'INTERNAL',
+        freshness: 'RECENT',
+        ts: 1_000,
+      },
+    });
+    transport.emit('depth', {
+      type: 'spot_depth_update',
+      symbol: 'MFCUSDT',
+      depth: {
+        symbol: 'MFCUSDT',
+        bids: [],
+        asks: [],
+        source: 'MISSING',
+        freshness: 'MISSING',
+        ts: 1_100,
+      },
+    });
+
+    const depthSlot = store.getState().symbols.MFCUSDT.depth;
+    expect(depthSlot.snapshot?.data?.bids[0].price).toBe('0.108');
+    expect(depthSlot.snapshot?.data?.asks[0].price).toBe('0.109');
+    expect(depthSlot.snapshot?.metadata.source).toBe('INTERNAL');
+    detach();
+  });
+
   it('rejects WS depth.ts older than the current REST event time', () => {
     const transport = new TestTransport();
     const store = createSpotPublicMarketStore();

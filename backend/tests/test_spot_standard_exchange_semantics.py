@@ -104,7 +104,7 @@ def test_selector_spot_category_does_not_include_contract_pair() -> None:
     assert market._pair_matches_category(pair, "spot") is False
 
 
-def test_spot_ws_depth_payload_marks_empty_book_missing() -> None:
+def test_spot_ws_depth_payload_preserves_authoritative_empty_internal_book() -> None:
     _ensure_test_event_loop()
     manager = MarketWsManager()
     depth = DepthResponse(
@@ -124,9 +124,63 @@ def test_spot_ws_depth_payload_marks_empty_book_missing() -> None:
     assert payload["symbol"] == "MFCUSDT"
     assert payload["depth"]["bids"] == []
     assert payload["depth"]["asks"] == []
+    assert payload["depth"]["source"] == "INTERNAL"
+    assert payload["depth"]["freshness"] == "RECENT"
+    assert payload["depth"]["stale"] is False
+
+
+def test_internal_empty_book_remains_authoritative_and_recent() -> None:
+    class EmptyQuery:
+        def filter(self, *args):
+            return self
+
+        def group_by(self, *args):
+            return self
+
+        def order_by(self, *args):
+            return self
+
+        def limit(self, *args):
+            return self
+
+        def all(self):
+            return []
+
+    class EmptyDepthDb:
+        def query(self, *args):
+            return EmptyQuery()
+
+    pair = SimpleNamespace(
+        id=1,
+        symbol="MFCUSDT",
+        price_precision=3,
+        amount_precision=3,
+    )
+
+    depth = market._get_internal_depth(EmptyDepthDb(), pair)
+
+    assert depth.bids == []
+    assert depth.asks == []
+    assert depth.source == "INTERNAL"
+    assert depth.freshness == "RECENT"
+
+
+def test_spot_ws_depth_payload_keeps_unknown_empty_book_missing() -> None:
+    _ensure_test_event_loop()
+    manager = MarketWsManager()
+    depth = DepthResponse(
+        symbol="MFCUSDT",
+        price_precision=3,
+        amount_precision=3,
+        bids=[],
+        asks=[],
+        ts=1000,
+    )
+
+    payload = manager._depth_update_payload("MFCUSDT", depth)
+
     assert payload["depth"]["source"] == "MISSING"
     assert payload["depth"]["freshness"] == "MISSING"
-    assert payload["depth"]["stale"] is False
 
 
 def test_spot_ws_trade_incremental_payload_preserves_identity_and_time_contract() -> None:

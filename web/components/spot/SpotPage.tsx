@@ -1826,6 +1826,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
                 symbol={symbol}
                 baseAsset={spotAssetSymbols.baseAsset}
                 quoteAsset={spotAssetSymbols.quoteAsset}
+                marketMode={selectedTicker?.marketMode || selectedPair?.marketMode || null}
                 executableDepth={executableDepth}
                 latestTradePrice={latestTradePriceText || null}
                 latestTradeAt={safeLastTradeAt}
