@@ -18,7 +18,13 @@ if BACKEND_DIR not in sys.path:
 ENV_PATH = Path(BACKEND_DIR) / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=False)
 
-from app.core.rq import QUEUE_NAMES, RQNotInstalledError, get_queue, get_redis_url  # noqa: E402
+from app.core.rq import (  # noqa: E402
+    QUEUE_NAMES,
+    RQNotInstalledError,
+    SCHEDULED_JOB_QUEUE_NAMES,
+    get_queue,
+    get_redis_url,
+)
 
 
 WORKER_HEARTBEAT_INTERVAL_SECONDS = 10
@@ -69,6 +75,10 @@ def _resolve_queue_names(requested_names: list[str]) -> list[str]:
     return names
 
 
+def _scheduler_required(queue_names: list[str]) -> bool:
+    return any(queue_name in SCHEDULED_JOB_QUEUE_NAMES for queue_name in queue_names)
+
+
 def _start_simple_worker_heartbeat(worker: object, interval_seconds: int = WORKER_HEARTBEAT_INTERVAL_SECONDS) -> threading.Event:
     stop_event = threading.Event()
 
@@ -112,11 +122,13 @@ def main(argv: list[str] | None = None) -> int:
     print("redis_url:", _mask_redis_url(get_redis_url()))
     print("configured_queues:", ", ".join(QUEUE_NAMES))
     print("loaded_queues:", ", ".join(queue.name for queue in queues))
+    scheduler_enabled = _scheduler_required(queue_names)
+    print("scheduler_enabled:", scheduler_enabled)
 
     worker = SimpleWorker(queues)
     heartbeat_stop_event = _start_simple_worker_heartbeat(worker)
     try:
-        worker.work()
+        worker.work(with_scheduler=scheduler_enabled)
     finally:
         heartbeat_stop_event.set()
     return 0

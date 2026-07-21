@@ -27,6 +27,17 @@ QUEUE_NAMES = (
     QUEUE_MAINTENANCE,
 )
 
+# These queues enqueue delayed retries through rq.Retry(interval=...).  At
+# least one worker serving each queue must run RQ's scheduler, otherwise failed
+# jobs remain in ScheduledJobRegistry forever.
+SCHEDULED_JOB_QUEUE_NAMES = frozenset(
+    {
+        QUEUE_EMAIL,
+        QUEUE_PAYOUT,
+        QUEUE_RELEASE,
+    }
+)
+
 
 class RQNotInstalledError(RuntimeError):
     pass
