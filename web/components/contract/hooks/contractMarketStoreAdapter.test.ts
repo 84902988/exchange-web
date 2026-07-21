@@ -152,6 +152,35 @@ describe('Contract Header realtime Store hydration', () => {
       });
   });
 
+  it('does not expose an iTick quote-derived spread as Header BBO', () => {
+    const store = createContractMarketStore();
+    store.activateSymbol('EURUSD_PERP');
+    store.ingest({
+      symbol: 'EURUSD_PERP',
+      domain: 'ticker',
+      data: {
+        display_price: '1.14250',
+        best_bid: '1.14193',
+        best_ask: '1.14307',
+        market_status: 'OPEN',
+        executable: true,
+      },
+      transport: 'WS',
+      source: 'LIVE_WS',
+      provider: 'ITICK',
+      freshness: 'LIVE',
+      eventTimeMs: Date.now(),
+    });
+
+    expect(selectContractHeaderStoreSnapshot(store.getState(), 'EURUSD_PERP'))
+      .toMatchObject({
+        displayPrice: '1.14250',
+        bestBid: null,
+        bestAsk: null,
+        spread: null,
+      });
+  });
+
   it('moves an anonymous Header from safe empty state to hydrated authority', () => {
     const store = createContractMarketStore();
     store.activateSymbol('XAUUSDT_PERP');
@@ -375,6 +404,41 @@ describe('Contract MarketView realtime Store recovery', () => {
     expect(projectContractMarketViewStoreAuthority(staleAuthority)).toBeNull();
   });
 
+  it('requires iTick depth or explicit execution fields for realtime BBO authority', () => {
+    const store = createContractMarketStore();
+    const nowMs = Date.now();
+    store.activateSymbol('XAUUSDT_PERP');
+    store.ingest({
+      symbol: 'XAUUSDT_PERP',
+      domain: 'ticker',
+      data: {
+        display_price: '4012.5',
+        display_state: 'LIVE_TRADABLE',
+        executable: true,
+        best_bid: '4010.49',
+        best_ask: '4014.51',
+      },
+      transport: 'WS',
+      source: 'LIVE_WS',
+      provider: 'ITICK',
+      freshness: 'LIVE',
+      eventTimeMs: nowMs,
+    });
+
+    const authority = selectContractMarketViewStoreAuthoritySnapshot(
+      store.getState(),
+      'XAUUSDT_PERP',
+    );
+    expect(authority).toMatchObject({
+      bestBid: null,
+      bestAsk: null,
+      executionBid: null,
+      executionAsk: null,
+      hasRealtimeBboAuthority: false,
+    });
+    expect(projectContractMarketViewStoreAuthority(authority, null, nowMs)).toBeNull();
+  });
+
   it('does not combine a REST ticker with WS depth into realtime MarketView authority', () => {
     const store = createContractMarketStore();
     const nowMs = Date.now();
@@ -459,6 +523,70 @@ describe('Contract MarketView realtime Store recovery', () => {
 
     expect(contractMarketStore.getEntry<Record<string, unknown>>(symbol, 'ticker')?.data)
       .toEqual({ last_price: '101' });
+  });
+
+  it('preserves REST 24h evidence when a newer WS ticker only updates price', () => {
+    const symbol = 'EURUSD_PERP';
+    activateContractMarketShadowSymbol(symbol);
+    writeContractMarketShadowDomain({
+      symbol,
+      domain: 'ticker',
+      data: {
+        last_price: '1.14219',
+        price_change_24h: '0.00075',
+        price_change_percent_24h: '0.065704',
+        high_24h: '1.14278',
+        low_24h: '1.14088',
+        base_volume_24h: '259978.6',
+        quote_volume_24h: '296805.11612',
+      },
+      transport: 'REST',
+      metadata: { ts: 1_720_000_000_100 },
+    });
+    writeContractMarketShadowDomain({
+      symbol,
+      domain: 'ticker',
+      data: {
+        last_price: '1.14227',
+        price_change_24h: null,
+        price_change_percent_24h: null,
+      },
+      transport: 'WS',
+      metadata: { ts: 1_720_000_000_200 },
+    });
+
+    expect(contractMarketStore.getEntry<Record<string, unknown>>(symbol, 'ticker')?.data)
+      .toMatchObject({
+        last_price: '1.14227',
+        price_change_24h: '0.00075',
+        price_change_percent_24h: '0.065704',
+        high_24h: '1.14278',
+        low_24h: '1.14088',
+        base_volume_24h: '259978.6',
+        quote_volume_24h: '296805.11612',
+      });
+  });
+
+  it('does not treat explicit zero ticker evidence as missing', () => {
+    const symbol = 'ZERO_CHANGE_PERP';
+    activateContractMarketShadowSymbol(symbol);
+    writeContractMarketShadowDomain({
+      symbol,
+      domain: 'ticker',
+      data: { price_change_24h: '1', price_change_percent_24h: '2' },
+      transport: 'WS',
+      metadata: { ts: 1_720_000_000_100 },
+    });
+    writeContractMarketShadowDomain({
+      symbol,
+      domain: 'ticker',
+      data: { price_change_24h: 0, price_change_percent_24h: 0 },
+      transport: 'WS',
+      metadata: { ts: 1_720_000_000_200 },
+    });
+
+    expect(contractMarketStore.getEntry<Record<string, unknown>>(symbol, 'ticker')?.data)
+      .toMatchObject({ price_change_24h: 0, price_change_percent_24h: 0 });
   });
 
   it('preserves structural state when a newer quote updates the shared ticker domain', () => {

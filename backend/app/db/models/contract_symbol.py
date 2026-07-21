@@ -17,6 +17,11 @@ class ContractSymbolCategory(str, Enum):
     CRYPTO = "CRYPTO"
     STOCK = "STOCK"
     CFD = "CFD"
+    INDEX = "INDEX"
+    FOREX = "FOREX"
+    METAL = "METAL"
+    COMMODITY = "COMMODITY"
+    # Legacy aliases remain valid for existing rows/admin input.
     GOLD = "GOLD"
     FUTURES = "FUTURES"
 

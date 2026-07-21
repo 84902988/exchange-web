@@ -137,6 +137,7 @@ type ContractTradingViewChartProps = {
   pricePrecision?: number | null;
   amountPrecision?: number | null;
   referencePrice: ContractReferencePrice;
+  preferReferencePriceOverlay?: boolean;
   positions?: ContractPositionItem[];
   priceDirection?: ContractPriceDirection;
   onChartModeChange?: (value: ContractChartMode) => void;
@@ -953,6 +954,24 @@ export function resolveContractTradingViewOverlayPrice(
   return referencePrice.value;
 }
 
+export function resolveContractTradingViewActiveOverlayPrice(
+  preferReferencePriceOverlay: boolean,
+  latestKlinePrice: number | null,
+  referenceOverlayPrice: number | null,
+) {
+  const numericReferencePrice = Number(referenceOverlayPrice);
+  if (preferReferencePriceOverlay) {
+    return Number.isFinite(numericReferencePrice) && numericReferencePrice > 0
+      ? numericReferencePrice
+      : null;
+  }
+  const numericKlinePrice = Number(latestKlinePrice);
+  if (Number.isFinite(numericKlinePrice) && numericKlinePrice > 0) return numericKlinePrice;
+  return Number.isFinite(numericReferencePrice) && numericReferencePrice > 0
+    ? numericReferencePrice
+    : null;
+}
+
 function resolveTradingViewLocale(locale: string) {
   if (locale === 'zh-TW') return 'zh_TW';
   if (locale === 'zh') return 'zh';
@@ -1061,6 +1080,7 @@ export default function ContractTradingViewChart({
   pricePrecision,
   amountPrecision,
   referencePrice,
+  preferReferencePriceOverlay = false,
   positions = [],
   priceDirection = 'flat',
   onChartModeChange,
@@ -1168,7 +1188,12 @@ export default function ContractTradingViewChart({
   const chartModeRef = useRef(chartMode);
   const displayNameRef = useRef(displayName);
   const canonicalCategoryRef = useRef(canonicalCategory);
-  const overlayPriceRef = useRef(overlayPrice);
+  const preferReferencePriceOverlayRef = useRef(preferReferencePriceOverlay);
+  const overlayPriceRef = useRef(resolveContractTradingViewActiveOverlayPrice(
+    preferReferencePriceOverlay,
+    null,
+    overlayPrice,
+  ));
   const referenceOverlayPriceRef = useRef(overlayPrice);
   const latestKlineOverlayRef = useRef<{ scope: string; price: number | null }>({
     scope: '',
@@ -1207,8 +1232,13 @@ export default function ContractTradingViewChart({
     chartModeRef.current = chartMode;
     displayNameRef.current = displayName;
     canonicalCategoryRef.current = canonicalCategory;
+    preferReferencePriceOverlayRef.current = preferReferencePriceOverlay;
     referenceOverlayPriceRef.current = overlayPrice;
-    overlayPriceRef.current = latestKlineOverlayRef.current.price ?? referenceOverlayPriceRef.current;
+    overlayPriceRef.current = resolveContractTradingViewActiveOverlayPrice(
+      preferReferencePriceOverlayRef.current,
+      latestKlineOverlayRef.current.price,
+      referenceOverlayPriceRef.current,
+    );
     priceDirectionRef.current = priceDirection;
     widgetKeyRef.current = widgetKey;
     onChartModeChangeRef.current = onChartModeChange;
@@ -1227,6 +1257,7 @@ export default function ContractTradingViewChart({
     onIntervalChange,
     onLatestKlineCloseChange,
     overlayPrice,
+    preferReferencePriceOverlay,
     positionLines,
     priceDirection,
     widgetInterval,
@@ -1328,10 +1359,26 @@ export default function ContractTradingViewChart({
     });
   }, [getPreloadManager]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     updatePriceOverlay();
+  }, [
+    effectiveInterval,
+    normalizedSymbol,
+    overlayPrice,
+    preferReferencePriceOverlay,
+    priceDirection,
+    updatePriceOverlay,
+  ]);
+
+  useEffect(() => {
     ensureReferencePriceViewport(effectiveInterval);
-  }, [effectiveInterval, ensureReferencePriceViewport, normalizedSymbol, overlayPrice, priceDirection, updatePriceOverlay]);
+  }, [
+    effectiveInterval,
+    ensureReferencePriceViewport,
+    normalizedSymbol,
+    overlayPrice,
+    preferReferencePriceOverlay,
+  ]);
 
   useEffect(() => {
     positionLinesInputRef.current = { symbol: normalizedSymbol, lines: positionLines };
@@ -2119,7 +2166,11 @@ export default function ContractTradingViewChart({
           scope: `${normalizedSymbol}|${effectiveIntervalRef.current}`,
           price: nextPrice,
         };
-        overlayPriceRef.current = nextPrice ?? referenceOverlayPriceRef.current;
+        overlayPriceRef.current = resolveContractTradingViewActiveOverlayPrice(
+          preferReferencePriceOverlayRef.current,
+          nextPrice,
+          referenceOverlayPriceRef.current,
+        );
         updatePriceOverlay();
         onLatestKlineCloseChangeRef.current?.(price);
       },

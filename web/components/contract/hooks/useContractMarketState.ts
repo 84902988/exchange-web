@@ -28,6 +28,8 @@ import {
   ingestContractMarketWsDomain,
   restartContractMarketShadowSession,
 } from './contractMarketStoreAdapter';
+import { useContractMarketTransportRecovery } from './useContractMarketTransportRecovery';
+import { mergeContractQuoteIncrement } from './contractQuoteIncrement';
 
 type ContractDepthSnapshot = {
   symbol?: string | null;
@@ -184,6 +186,10 @@ export function useContractMarketState({
   const contractQuoteRef = useRef<ContractQuoteWithPremiumFields | null>(null);
   const quoteLoadedSymbolRef = useRef<string | null>(null);
   const previousMarketRealtimeStatusRef = useRef<ContractMarketRealtimeStatus>('idle');
+  const transportRecovery = useContractMarketTransportRecovery(
+    contractSymbol,
+    marketRealtimeStatus,
+  );
 
   const marketSymbol = useMemo(
     () => getMarketSymbol(contractSymbol, symbolOptionMarketSymbol),
@@ -327,6 +333,14 @@ export function useContractMarketState({
     previousMarketRealtimeStatusRef.current = marketRealtimeStatus;
     if (previousStatus !== 'connected' || marketRealtimeStatus === 'connected') return;
 
+    // Start the REST recovery path immediately, but do not destroy the last
+    // accepted realtime snapshot for a single short socket reconnect.
+    void refreshContractQuote();
+  }, [marketRealtimeStatus, refreshContractQuote]);
+
+  useEffect(() => {
+    if (!transportRecovery.recoveryExpired) return;
+
     restartContractMarketShadowSession(contractSymbol);
     contractQuoteRef.current = null;
     quoteLoadedSymbolRef.current = null;
@@ -334,7 +348,7 @@ export function useContractMarketState({
     setContractQuoteState({ symbol: contractSymbol, quote: null });
     setBestDepth({ symbol: contractSymbol, bestBid: null, bestAsk: null, ts: null });
     void refreshContractQuote();
-  }, [contractSymbol, marketRealtimeStatus, refreshContractQuote]);
+  }, [contractSymbol, refreshContractQuote, transportRecovery.recoveryExpired]);
 
   useEffect(() => {
     const handleQuoteMessage = (message: ContractMarketRealtimeMessage) => {
@@ -345,23 +359,7 @@ export function useContractMarketState({
       const nextQuote = extractRealtimeQuote(message);
       if (!nextQuote) return;
       const previousQuote = contractQuoteRef.current;
-      const mergedQuote = {
-        ...(previousQuote ? {
-          market_status: previousQuote?.market_status,
-          market_status_text: previousQuote?.market_status_text,
-          market_session_code: previousQuote?.market_session_code,
-          market_timezone: previousQuote?.market_timezone,
-          market_trading_hours: previousQuote?.market_trading_hours,
-          market_session_type: previousQuote?.market_session_type,
-          quote_freshness: previousQuote?.quote_freshness,
-          quote_source: previousQuote?.quote_source,
-          executable: previousQuote?.executable,
-          is_realtime: previousQuote?.is_realtime,
-          last_good_at: previousQuote?.last_good_at,
-          stale: previousQuote?.stale,
-        } : {}),
-        ...nextQuote,
-      };
+      const mergedQuote = mergeContractQuoteIncrement(previousQuote, nextQuote);
 
       const storeResult = ingestContractMarketWsDomain({
         domain: 'ticker',

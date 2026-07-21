@@ -277,6 +277,20 @@ const CONTRACT_TICKER_STRUCTURAL_AUTHORITY_FIELDS = [
   'warnings',
 ] as const;
 
+const CONTRACT_TICKER_SNAPSHOT_EVIDENCE_FIELDS = [
+  'open_24h',
+  'price_change_24h',
+  'price_change_percent_24h',
+  'high_24h',
+  'low_24h',
+  'base_volume_24h',
+  'quote_volume_24h',
+] as const;
+
+function isMissingTickerSnapshotValue(value: unknown) {
+  return value === undefined || value === null || value === '';
+}
+
 function mergeTickerStructuralAuthority(
   symbol: string,
   incoming: unknown,
@@ -286,17 +300,30 @@ function mergeTickerStructuralAuthority(
   if (!incomingRecord || transport !== 'WS') return incoming;
   const state = contractMarketStore.getState();
   const entry = contractMarketStore.getEntry<unknown>(symbol, 'ticker');
-  const current = entry?.sessionGeneration === state.sessionGeneration
+  const currentSnapshot = entry?.sessionGeneration === state.sessionGeneration
+    && !entry.stale
+    ? asRecord(entry.data)
+    : null;
+  const currentStructuralAuthority = entry?.sessionGeneration === state.sessionGeneration
     && entry.transport === 'WS'
     && !entry.stale
     ? asRecord(entry.data)
     : null;
-  if (!current) return incoming;
+  if (!currentSnapshot) return incoming;
 
   const merged = { ...incomingRecord };
+  for (const field of CONTRACT_TICKER_SNAPSHOT_EVIDENCE_FIELDS) {
+    if (
+      isMissingTickerSnapshotValue(merged[field])
+      && !isMissingTickerSnapshotValue(currentSnapshot[field])
+    ) {
+      merged[field] = currentSnapshot[field];
+    }
+  }
+  if (!currentStructuralAuthority) return merged;
   for (const field of CONTRACT_TICKER_STRUCTURAL_AUTHORITY_FIELDS) {
-    if (merged[field] === undefined && current[field] !== undefined) {
-      merged[field] = current[field];
+    if (merged[field] === undefined && currentStructuralAuthority[field] !== undefined) {
+      merged[field] = currentStructuralAuthority[field];
     }
   }
   return merged;
@@ -500,8 +527,20 @@ export function selectContractHeaderStoreSnapshot(
 
   const ticker = asRecord(tickerEntry?.data);
   const depth = asRecord(depthEntry?.data);
-  const bestBid = readBookBest(depth, 'bid') ?? readBookBest(ticker, 'bid');
-  const bestAsk = readBookBest(depth, 'ask') ?? readBookBest(ticker, 'ask');
+  const depthBid = readBookBest(depth, 'bid');
+  const depthAsk = readBookBest(depth, 'ask');
+  const explicitTickerExecutionBid = readPrice(ticker, 'execution_bid');
+  const explicitTickerExecutionAsk = readPrice(ticker, 'execution_ask');
+  const tickerProvider = String(tickerEntry?.provider || readValue(ticker, 'provider') || '')
+    .trim()
+    .toUpperCase();
+  const allowGenericTickerBbo = tickerProvider !== 'ITICK';
+  const tickerBid = explicitTickerExecutionBid
+    ?? (allowGenericTickerBbo ? readBookBest(ticker, 'bid') : null);
+  const tickerAsk = explicitTickerExecutionAsk
+    ?? (allowGenericTickerBbo ? readBookBest(ticker, 'ask') : null);
+  const bestBid = depthBid ?? tickerBid;
+  const bestAsk = depthAsk ?? tickerAsk;
   const display = resolveDisplayPrice(ticker, bestBid, bestAsk);
   const bid = Number(bestBid);
   const ask = Number(bestAsk);
@@ -620,15 +659,6 @@ export function selectContractMarketViewStoreAuthoritySnapshot(
   const tickerBid = readBookBest(ticker, 'bid');
   const tickerAsk = readBookBest(ticker, 'ask');
   const hasDepthBbo = depthBid !== null && depthAsk !== null;
-  const hasTickerBbo = tickerBid !== null && tickerAsk !== null;
-  const bestBid = hasDepthBbo ? depthBid : hasTickerBbo ? tickerBid : null;
-  const bestAsk = hasDepthBbo ? depthAsk : hasTickerBbo ? tickerAsk : null;
-  const display = resolveDisplayPrice(ticker, bestBid, bestAsk);
-  const executable = typeof ticker?.executable === 'boolean'
-    ? ticker.executable
-    : typeof depth?.executable === 'boolean'
-      ? depth.executable
-      : null;
   const explicitDepthExecutionBid = readPrice(depth, 'execution_bid');
   const explicitDepthExecutionAsk = readPrice(depth, 'execution_ask');
   const explicitTickerExecutionBid = readPrice(ticker, 'execution_bid');
@@ -637,6 +667,33 @@ export function selectContractMarketViewStoreAuthoritySnapshot(
     && explicitDepthExecutionAsk !== null;
   const hasTickerExecutionBbo = explicitTickerExecutionBid !== null
     && explicitTickerExecutionAsk !== null;
+  const tickerProvider = String(
+    realtimeTickerEntry?.provider || readValue(ticker, 'provider') || '',
+  ).trim().toUpperCase();
+  const hasGenericTickerBbo = tickerProvider !== 'ITICK'
+    && tickerBid !== null
+    && tickerAsk !== null;
+  const hasTickerBbo = hasTickerExecutionBbo || hasGenericTickerBbo;
+  const bestBid = hasDepthBbo
+    ? depthBid
+    : hasTickerExecutionBbo
+      ? explicitTickerExecutionBid
+      : hasGenericTickerBbo
+        ? tickerBid
+        : null;
+  const bestAsk = hasDepthBbo
+    ? depthAsk
+    : hasTickerExecutionBbo
+      ? explicitTickerExecutionAsk
+      : hasGenericTickerBbo
+        ? tickerAsk
+        : null;
+  const display = resolveDisplayPrice(ticker, bestBid, bestAsk);
+  const executable = typeof ticker?.executable === 'boolean'
+    ? ticker.executable
+    : typeof depth?.executable === 'boolean'
+      ? depth.executable
+      : null;
   const bboAuthorityEntry = hasDepthExecutionBbo
     ? realtimeDepthEntry
     : hasTickerExecutionBbo

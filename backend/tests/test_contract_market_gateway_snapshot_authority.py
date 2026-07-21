@@ -72,6 +72,25 @@ def test_gateway_snapshots_request_provider_ws_warmup() -> None:
     ]
 
 
+def test_gateway_uses_itick_cadence_ttl_without_weakening_crypto_ttl(monkeypatch):
+    monkeypatch.setattr(gateway_module.settings, "CONTRACT_PROVIDER_WS_TICKER_MAX_AGE_MS", 1500)
+    monkeypatch.setattr(gateway_module.settings, "CONTRACT_PROVIDER_WS_DEPTH_MAX_AGE_MS", 1500)
+    gateway = ContractMarketGateway()
+
+    assert gateway._domain_snapshot_ttl_ms(
+        ContractMarketDomainName.TICKER,
+        provider="ITICK",
+    ) == 5_000
+    assert gateway._domain_snapshot_ttl_ms(
+        ContractMarketDomainName.DEPTH,
+        provider="itick",
+    ) == 5_000
+    assert gateway._domain_snapshot_ttl_ms(
+        ContractMarketDomainName.TICKER,
+        provider="OKX_SWAP",
+    ) == 1_500
+
+
 def _context(
     *,
     received_at_ms: int,
@@ -421,7 +440,10 @@ def test_gateway_quote_falls_back_to_live_provider_depth_before_rest(monkeypatch
     monkeypatch.setattr(
         gateway,
         "_prepare_provider_ws_depth_quote_payload",
-        lambda _db, _symbol, payload: {"source": "LIVE_WS", "best_bid": payload["best_bid"]},
+        lambda _db, _symbol, payload, **_kwargs: {
+            "source": "LIVE_WS",
+            "best_bid": payload["best_bid"],
+        },
     )
     monkeypatch.setattr(
         gateway_module,
@@ -437,6 +459,104 @@ def test_gateway_quote_falls_back_to_live_provider_depth_before_rest(monkeypatch
     )
 
     assert quote == {"source": "LIVE_WS", "best_bid": "28820"}
+
+
+def test_gateway_carries_native_ticker_status_into_depth_quote(monkeypatch):
+    gateway = ContractMarketGateway()
+    ticker = {
+        "provider": "ITICK",
+        "provider_trading_status": 0,
+        "provider_market_status": "OPEN",
+        "source": "LIVE_WS",
+    }
+    depth = {
+        "provider": "ITICK",
+        "provider_symbol": "FUTURE_INDEX",
+        "best_bid": "100",
+        "best_ask": "101",
+        "source": "LIVE_WS",
+    }
+    captured = {}
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_ticker", lambda *_args, **_kwargs: ticker)
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_depth", lambda *_args, **_kwargs: depth)
+    monkeypatch.setattr(gateway, "_prepare_provider_ws_quote_payload", lambda *_args, **_kwargs: None)
+
+    def prepare_depth_quote(_db, _symbol, payload, *, status_payload=None):
+        captured["depth"] = payload
+        captured["status"] = status_payload
+        return {"source": "LIVE_WS", "best_bid": payload["best_bid"]}
+
+    monkeypatch.setattr(gateway, "_prepare_provider_ws_depth_quote_payload", prepare_depth_quote)
+
+    quote = gateway._load_quote_payload(
+        object(),
+        "FUTUREINDEXUSDT_PERP",
+        allow_provider_ws=True,
+        allow_rest_fallback=False,
+        ensure_provider_ws=True,
+    )
+
+    assert quote == {"source": "LIVE_WS", "best_bid": "100"}
+    assert captured["depth"] is depth
+    assert captured["status"] is ticker
+
+
+def test_gateway_reuses_bounded_rest_ticker_evidence_for_partial_ws_frames(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "EURUSD_PERP"
+    calls: list[tuple[list[str], int]] = []
+
+    def load_tickers(_db, requested_symbol):
+        calls.append(([requested_symbol], 1))
+        return [{
+            "symbol": symbol,
+            "price_change_24h": "0.00075",
+            "price_change_percent_24h": "0.065704",
+            "high_24h": "1.14278",
+            "low_24h": "1.14088",
+            "base_volume_24h": "259978.6",
+            "quote_volume_24h": "296805.11612",
+        }]
+
+    monkeypatch.setattr(gateway_module, "_load_contract_ticker_24h_evidence", load_tickers)
+    provider_frame = {
+        "symbol": symbol,
+        "provider": "ITICK",
+        "last_price": "1.14219",
+    }
+    first = gateway._enrich_provider_ws_ticker_24h(
+        object(),
+        symbol,
+        {
+            **provider_frame,
+            "bid_price": "1.14210",
+            "ask_price": "1.14225",
+            "source": "LIVE_WS",
+        },
+        provider_frame=provider_frame,
+    )
+    gateway._latest[CONTRACT_MARKET_CACHE_QUOTE.format(symbol=symbol)] = first
+    second = gateway._enrich_provider_ws_ticker_24h(
+        object(),
+        symbol,
+        {
+            **provider_frame,
+            "last_price": "1.14227",
+            "bid_price": "1.14220",
+            "ask_price": "1.14235",
+            "source": "LIVE_WS",
+        },
+        provider_frame=provider_frame,
+    )
+
+    assert calls == [([symbol], 1)]
+    assert first["bid_price"] == "1.14210"
+    assert second["bid_price"] == "1.14220"
+    assert second["price_change_24h"] == "0.00075"
+    assert second["high_24h"] == "1.14278"
+    assert second["quote_volume_24h"] == "296805.11612"
 
 
 def test_gateway_marks_generic_contiguous_rollover_as_trade_seeded(monkeypatch):

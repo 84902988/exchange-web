@@ -809,6 +809,7 @@ function ContractPageContent() {
                   pricePrecision={currentContractPair?.pricePrecision ?? null}
                   amountPrecision={currentContractPair?.amountPrecision ?? null}
                   referencePrice={referencePrice}
+                  preferReferencePriceOverlay={currentContractUsesValuationPrice}
                   positions={openPositionsForTrading}
                   priceDirection={currentPriceDirection}
                   onLatestKlineCloseChange={handleLatestKlineCloseChange}

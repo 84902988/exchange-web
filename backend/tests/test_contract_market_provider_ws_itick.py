@@ -9,6 +9,8 @@ from pathlib import Path
 from decimal import Decimal
 import time
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "backend"
@@ -154,6 +156,56 @@ def test_itick_ticker_normalizer_uses_quote_fields_and_live_source():
     assert payload["market_status"] == "OPEN"
 
 
+def test_itick_ticker_normalizer_uses_official_event_time_and_native_status():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderTickerSubscription(
+        local_symbol="NAS100USDT_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="NAS100",
+        ws_symbol="NAS100$GB",
+    )
+
+    payload = service._normalize_itick_ticker(
+        subscription,
+        {
+            "s": "NAS100",
+            "ld": "28825.34",
+            "t": 1_784_621_729_000,
+            "ts": 0,
+        },
+    )
+
+    assert payload is not None
+    assert payload["provider_trading_status"] == 0
+    assert payload["provider_market_status"] == "OPEN"
+    assert payload["market_status"] == "OPEN"
+    assert payload["exchange_ts"] == 1_784_621_729_000
+    assert int(payload["ts"].timestamp() * 1000) == 1_784_621_729_000
+
+
+@pytest.mark.parametrize("provider_status", [1, 2, 3])
+def test_itick_ticker_normalizer_maps_non_normal_native_status_to_closed(provider_status):
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderTickerSubscription(
+        local_symbol="EURUSD_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="EURUSD",
+        ws_symbol="EURUSD$GB",
+    )
+
+    payload = service._normalize_itick_ticker(
+        subscription,
+        {"ld": "1.14182", "t": 1_784_621_729_000, "ts": provider_status},
+    )
+
+    assert payload is not None
+    assert payload["provider_trading_status"] == provider_status
+    assert payload["provider_market_status"] == "CLOSED"
+    assert payload["market_status"] == "CLOSED"
+
+
 def test_itick_shared_ticker_registration_routes_without_starting_legacy_symbol_thread():
     module = _load_provider_ws_module()
     service = module.ContractMarketProviderWsService()
@@ -281,7 +333,7 @@ def test_okx_ticker_normalizer_emits_complete_change_evidence():
     assert payload["price_change_percent_24h"] == Decimal("5.00")
 
 
-def test_itick_ticker_normalizer_synthesizes_bbo_from_last_price():
+def test_itick_ticker_normalizer_does_not_synthesize_executable_bbo_from_last_price():
     module = _load_provider_ws_module()
     service = module.ContractMarketProviderWsService()
     subscription = module.ProviderTickerSubscription(
@@ -294,9 +346,29 @@ def test_itick_ticker_normalizer_synthesizes_bbo_from_last_price():
     payload = service._normalize_itick_ticker(subscription, {"p": "200", "t": 1717000000})
 
     assert payload is not None
-    assert payload["bid_price"] == Decimal("199.9000")
-    assert payload["ask_price"] == Decimal("200.1000")
+    assert payload["bid_price"] is None
+    assert payload["ask_price"] is None
     assert payload["last_price"] == Decimal("200")
+    assert payload["mark_price"] == Decimal("200")
+    assert "executable" not in payload
+
+
+def test_itick_ticker_normalizer_replaces_missing_provider_time_with_normalized_time(monkeypatch):
+    module = _load_provider_ws_module()
+    monkeypatch.setattr(module.time, "time", lambda: 1_720_000_000.123)
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderTickerSubscription(
+        local_symbol="EURUSD_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="EURUSD",
+        ws_symbol="EURUSD$GB",
+    )
+
+    payload = service._normalize_itick_ticker(subscription, {"p": "1.14250", "t": 0})
+
+    assert payload is not None
+    assert payload["exchange_ts"] == 1_720_000_000_123
+    assert int(payload["ts"].timestamp() * 1000) == 1_720_000_000_123
 
 
 def test_itick_kline_subscription_resolver_uses_category_endpoint_and_kline_type():
@@ -1112,7 +1184,7 @@ def test_gateway_market_state_builder_ignores_kline_domain_cache():
 if __name__ == "__main__":
     test_itick_quote_subscription_symbol_by_category()
     test_itick_ticker_normalizer_uses_quote_fields_and_live_source()
-    test_itick_ticker_normalizer_synthesizes_bbo_from_last_price()
+    test_itick_ticker_normalizer_does_not_synthesize_executable_bbo_from_last_price()
     test_itick_kline_subscription_resolver_uses_category_endpoint_and_kline_type()
     test_itick_trades_subscription_resolver_uses_stock_tick_endpoint()
     test_itick_trade_normalizer_marks_live_trade_tick_source()

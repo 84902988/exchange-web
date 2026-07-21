@@ -399,6 +399,8 @@ _LEGACY_SOURCE_MAP = {
     "PROVIDER_WS": ContractMarketDomainSource.LIVE_WS,
     "PROVIDER_REST": ContractMarketDomainSource.REST_SNAPSHOT,
     "ITICK_TICK": ContractMarketDomainSource.REST_SNAPSHOT,
+    "ITICK_QUOTE": ContractMarketDomainSource.REST_SNAPSHOT,
+    "ITICK_DEPTH": ContractMarketDomainSource.REST_SNAPSHOT,
     "REST_SNAPSHOT": ContractMarketDomainSource.REST_SNAPSHOT,
     "EXTERNAL": ContractMarketDomainSource.REST_SNAPSHOT,
     "CONFIGURED": ContractMarketDomainSource.REST_SNAPSHOT,

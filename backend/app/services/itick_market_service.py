@@ -285,6 +285,101 @@ class ItickMarketService:
             base_url=self._get_market_base_url(market),
         )
 
+    def get_market_quotes_by_code(
+        self,
+        market: str,
+        region: str,
+        codes: List[str],
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load multiple non-stock quotes with bounded provider fan-out.
+
+        The contract selector needs the same 24-hour fields for several CFD
+        symbols at once. Calling ``get_market_quote`` per symbol serializes
+        network latency, so this method uses iTick's ``/quotes`` endpoint in
+        provider-sized chunks while preserving the existing cache/cooldown
+        behavior and alias normalization.
+        """
+
+        normalized_market = (market or "stock").strip().lower()
+        normalized_region = self._normalize_region(region)
+        normalized_codes: List[str] = []
+        seen_codes = set()
+        for code in codes or []:
+            if not str(code or "").strip():
+                continue
+            normalized_code = self._normalize_code(code)
+            if normalized_code in seen_codes:
+                continue
+            seen_codes.add(normalized_code)
+            normalized_codes.append(normalized_code)
+
+        if not normalized_codes:
+            return {}
+
+        quote_by_code: Dict[str, Dict[str, Any]] = {}
+        missing_codes: List[str] = []
+        allow_stale = self.is_quote_depth_cooldown_active()
+        use_cache = normalized_market != "forex"
+        for code in normalized_codes:
+            cached_item = (
+                self._get_cached_quote_item(
+                    self._quote_cache_key(normalized_market, normalized_region, code),
+                    allow_stale=allow_stale,
+                )
+                if use_cache
+                else None
+            )
+            if cached_item is not None:
+                quote_by_code[code] = cached_item
+                self._index_quote_aliases(quote_by_code, cached_item)
+            else:
+                missing_codes.append(code)
+
+        if not missing_codes or allow_stale:
+            return quote_by_code
+
+        logger.debug(
+            "itick market batch quotes request market=%s region=%s count=%s",
+            normalized_market,
+            normalized_region,
+            len(missing_codes),
+        )
+        for index in range(0, len(missing_codes), self.QUOTES_BATCH_SIZE):
+            chunk = missing_codes[index : index + self.QUOTES_BATCH_SIZE]
+            try:
+                payload = self._request_json(
+                    "/quotes",
+                    {
+                        "region": normalized_region,
+                        "codes": ",".join(chunk),
+                    },
+                    base_url=self._get_market_base_url(normalized_market),
+                    timeout=timeout,
+                )
+            except ItickMarketRateLimited:
+                break
+
+            for item in self._extract_quote_items(payload):
+                enriched_item = self._enrich_stock_quote_item(item)
+                self._index_quote_aliases(quote_by_code, enriched_item)
+                if not use_cache:
+                    continue
+                for raw_code in [
+                    enriched_item.get("s"),
+                    enriched_item.get("code"),
+                    enriched_item.get("symbol"),
+                    enriched_item.get("c"),
+                ]:
+                    code = str(raw_code or "").upper().strip()
+                    if code:
+                        self._set_quote_item_cache(
+                            self._quote_cache_key(normalized_market, normalized_region, code),
+                            enriched_item,
+                        )
+
+        return quote_by_code
+
     def get_market_depth(self, market: str, region: str, code: str) -> Any:
         return self._request_json(
             "/depth",

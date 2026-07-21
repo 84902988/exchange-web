@@ -87,6 +87,7 @@ CONTRACT_MARKET_WS_DEPTH_FALLBACK_SLEEP_SECONDS = 1.0
 CONTRACT_MARKET_WS_KLINE_REST_FALLBACK_INTERVAL_SECONDS = 10.0
 CONTRACT_MARKET_WS_KLINE_BROADCAST_INTERVAL_MAX_MS = 200
 CONTRACT_MARKET_WS_TRADE_DEDUPE_MAX_IDS = 4_096
+CONTRACT_MARKET_WS_TICKER_24H_REFRESH_INTERVAL_SECONDS = 30.0
 
 CONTRACT_MARKET_CACHE_QUOTE = "contract:market:{symbol}:quote"
 CONTRACT_MARKET_CACHE_DEPTH = "contract:market:{symbol}:depth"
@@ -122,10 +123,40 @@ _CONTRACT_TRADE_EVIDENCE_FIELDS = (
     "price_source",
     "received_at_ms",
 )
+_CONTRACT_TICKER_24H_FIELDS = (
+    "open_24h",
+    "price_change_24h",
+    "price_change_percent_24h",
+    "high_24h",
+    "low_24h",
+    "base_volume_24h",
+    "quote_volume_24h",
+)
+_CONTRACT_TICKER_24H_HEADER_FIELDS = (
+    "price_change_24h",
+    "price_change_percent_24h",
+    "high_24h",
+    "low_24h",
+    "base_volume_24h",
+    "quote_volume_24h",
+)
 
 
 def _utc_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _load_contract_ticker_24h_evidence(
+    db: Session,
+    symbol: str,
+) -> list[dict[str, Any]]:
+    # Keep the batch ticker dependency off the gateway import path. Some
+    # workers and isolated domain tests intentionally load this module with a
+    # minimal market-service surface, while the enrichment itself only runs
+    # for provider frames that omit daily evidence.
+    from app.services.contract_market_service import get_contract_tickers
+
+    return get_contract_tickers(db, symbols=[symbol], limit=1)
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -383,6 +414,7 @@ class ContractMarketGateway:
         self._last_kline_signature: dict[tuple[str, str], str] = {}
         self._last_kline_rest_fallback_at: dict[tuple[str, str], float] = {}
         self._last_quote_signature: dict[str, str] = {}
+        self._last_ticker_24h_refresh_at: dict[str, float] = {}
         self._last_state_signature: dict[str, str] = {}
         self._last_trade_ids: dict[str, OrderedDict[str, None]] = {}
         self._provider_ws_allowed_symbols: set[str] = set()
@@ -432,6 +464,7 @@ class ContractMarketGateway:
             self._last_depth_broadcast_at.pop(normalized_symbol, None)
             self._last_depth_signature.pop(normalized_symbol, None)
             self._last_quote_signature.pop(normalized_symbol, None)
+            self._last_ticker_24h_refresh_at.pop(normalized_symbol, None)
             self._last_state_signature.pop(normalized_symbol, None)
             self._last_trade_ids.pop(normalized_symbol, None)
             for mapping in (
@@ -825,6 +858,7 @@ class ContractMarketGateway:
             for key in [key for key in self._kline_locks if key[0] == symbol]:
                 self._kline_locks.pop(key, None)
             self._last_quote_signature.pop(symbol, None)
+            self._last_ticker_24h_refresh_at.pop(symbol, None)
             self._last_trade_ids.pop(symbol, None)
 
     async def _refresh_and_broadcast_cycle(
@@ -1757,6 +1791,19 @@ class ContractMarketGateway:
         ensure_provider_ws: bool = False,
     ) -> dict[str, Any] | None:
         if allow_provider_ws and provider_ws_depth_enabled():
+            status_payload = (
+                select_fresh_provider_ws_ticker(
+                    db,
+                    symbol,
+                    max_age_ms=int(
+                        getattr(settings, "CONTRACT_PROVIDER_WS_TICKER_MAX_AGE_MS", 1500)
+                        or 1500
+                    ),
+                    ensure_subscription=ensure_provider_ws,
+                )
+                if provider_ws_ticker_enabled()
+                else None
+            )
             depth = select_fresh_provider_ws_depth(
                 db,
                 symbol,
@@ -1764,7 +1811,12 @@ class ContractMarketGateway:
                 ensure_subscription=ensure_provider_ws,
             )
             if depth is not None:
-                prepared_depth = self._prepare_provider_ws_depth_payload(db, symbol, depth)
+                prepared_depth = self._prepare_provider_ws_depth_payload(
+                    db,
+                    symbol,
+                    depth,
+                    status_payload=status_payload,
+                )
                 if prepared_depth is not None:
                     return prepared_depth
         if not allow_rest_fallback:
@@ -1780,6 +1832,7 @@ class ContractMarketGateway:
         allow_rest_fallback: bool = True,
         ensure_provider_ws: bool = False,
     ) -> dict[str, Any] | None:
+        status_payload: dict[str, Any] | None = None
         if allow_provider_ws and provider_ws_ticker_enabled():
             payload = select_fresh_provider_ws_ticker(
                 db,
@@ -1788,9 +1841,15 @@ class ContractMarketGateway:
                 ensure_subscription=ensure_provider_ws,
             )
             if isinstance(payload, dict):
+                status_payload = payload
                 prepared_quote = self._prepare_provider_ws_quote_payload(db, symbol, payload)
                 if prepared_quote is not None:
-                    return prepared_quote
+                    return self._enrich_provider_ws_ticker_24h(
+                        db,
+                        symbol,
+                        prepared_quote,
+                        provider_frame=prepared_quote,
+                    )
         if allow_provider_ws and provider_ws_depth_enabled():
             depth = select_fresh_provider_ws_depth(
                 db,
@@ -1806,23 +1865,118 @@ class ContractMarketGateway:
                     db,
                     symbol,
                     depth,
+                    status_payload=status_payload,
                 )
                 if prepared_quote is not None:
-                    return prepared_quote
+                    return self._enrich_provider_ws_ticker_24h(
+                        db,
+                        symbol,
+                        prepared_quote,
+                        provider_frame=prepared_quote,
+                    )
         if not allow_rest_fallback:
             return None
         return get_contract_quote(db, symbol)
+
+    @staticmethod
+    def _merge_ticker_24h_fields(
+        target: dict[str, Any],
+        evidence: Any,
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        if not isinstance(evidence, dict):
+            return target
+        for field in _CONTRACT_TICKER_24H_FIELDS:
+            value = evidence.get(field)
+            if value in (None, ""):
+                continue
+            if overwrite or target.get(field) in (None, ""):
+                target[field] = value
+        return target
+
+    @staticmethod
+    def _has_complete_header_ticker_24h(evidence: Any) -> bool:
+        return isinstance(evidence, dict) and all(
+            evidence.get(field) not in (None, "")
+            for field in _CONTRACT_TICKER_24H_HEADER_FIELDS
+        )
+
+    def _enrich_provider_ws_ticker_24h(
+        self,
+        db: Session,
+        symbol: str,
+        quote: dict[str, Any],
+        *,
+        provider_frame: Any,
+    ) -> dict[str, Any]:
+        """Keep slow-moving ticker evidence attached to fast provider frames.
+
+        iTick's CFD WebSocket/depth frames commonly contain current price/BBO
+        only. The REST ticker carries the real daily change, range, and volume.
+        Keep the last accepted evidence between frames and refresh it at a
+        bounded cadence so the 1-second market loop never becomes a 1-second
+        upstream REST poll.
+        """
+
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        prepared = deepcopy(quote)
+        self._merge_ticker_24h_fields(prepared, provider_frame, overwrite=True)
+        provider_has_complete_evidence = self._has_complete_header_ticker_24h(provider_frame)
+        latest_quote = self._get_latest(CONTRACT_MARKET_CACHE_QUOTE, normalized_symbol)
+        self._merge_ticker_24h_fields(prepared, latest_quote)
+
+        if provider_has_complete_evidence:
+            return prepared
+
+        now = time.monotonic()
+        last_refresh_at = self._last_ticker_24h_refresh_at.get(normalized_symbol)
+        if (
+            last_refresh_at is not None
+            and now - last_refresh_at < CONTRACT_MARKET_WS_TICKER_24H_REFRESH_INTERVAL_SECONDS
+        ):
+            return prepared
+
+        # Record the attempt before I/O. A provider failure therefore backs off
+        # for the same bounded interval instead of retrying on every WS frame.
+        self._last_ticker_24h_refresh_at[normalized_symbol] = now
+        try:
+            ticker_rows = _load_contract_ticker_24h_evidence(db, normalized_symbol)
+        except Exception:
+            logger.debug(
+                "contract_market_gateway_ticker_24h_refresh_failed symbol=%s",
+                normalized_symbol,
+                exc_info=True,
+            )
+            return prepared
+
+        ticker = next(
+            (
+                row
+                for row in ticker_rows
+                if isinstance(row, dict)
+                and normalize_contract_ws_symbol(row.get("symbol")) == normalized_symbol
+            ),
+            None,
+        )
+        return self._merge_ticker_24h_fields(prepared, ticker, overwrite=True)
 
     def _prepare_provider_ws_depth_quote_payload(
         self,
         db: Session,
         symbol: str,
         depth: dict[str, Any],
+        *,
+        status_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         try:
             contract_symbol = _load_contract_symbol(db, symbol)
-            market_status = _market_status_for_contract_symbol(contract_symbol)
             prepared = deepcopy(depth)
+            status_evidence = status_payload if isinstance(status_payload, dict) else prepared
+            for key in ("provider_trading_status", "provider_market_status"):
+                if isinstance(status_payload, dict) and status_payload.get(key) is not None:
+                    prepared[key] = status_payload.get(key)
+            market_status = _market_status_for_contract_symbol(contract_symbol, status_evidence)
             prepared["best_bid"] = prepared.get("best_bid") or prepared.get("bid")
             prepared["best_ask"] = prepared.get("best_ask") or prepared.get("ask")
             quote = _quote_from_depth(
@@ -1851,6 +2005,7 @@ class ContractMarketGateway:
                     "revision_sequence": prepared.get("revision_sequence"),
                 }
             )
+            self._merge_ticker_24h_fields(quote, status_payload, overwrite=True)
             return _contract_quote_with_status(quote, market_status, contract_symbol)
         except Exception:
             logger.debug(
@@ -1871,7 +2026,7 @@ class ContractMarketGateway:
             if not prepared.get("bid_price") or not prepared.get("ask_price"):
                 return None
             contract_symbol = _load_contract_symbol(db, symbol)
-            market_status = _market_status_for_contract_symbol(contract_symbol)
+            market_status = _market_status_for_contract_symbol(contract_symbol, prepared)
             prepared["symbol"] = normalize_contract_ws_symbol(prepared.get("symbol") or symbol)
             prepared["price_precision"] = int(
                 getattr(contract_symbol, "price_precision", None) or prepared.get("price_precision") or 8
@@ -1890,13 +2045,19 @@ class ContractMarketGateway:
         db: Session,
         symbol: str,
         depth: dict[str, Any],
+        *,
+        status_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         try:
             prepared = deepcopy(depth)
             if not prepared.get("bids") or not prepared.get("asks"):
                 return None
             contract_symbol = _load_contract_symbol(db, symbol)
-            market_status = _market_status_for_contract_symbol(contract_symbol)
+            status_evidence = status_payload if isinstance(status_payload, dict) else prepared
+            for key in ("provider_trading_status", "provider_market_status"):
+                if isinstance(status_payload, dict) and status_payload.get(key) is not None:
+                    prepared[key] = status_payload.get(key)
+            market_status = _market_status_for_contract_symbol(contract_symbol, status_evidence)
             prepared["symbol"] = normalize_contract_ws_symbol(prepared.get("symbol") or symbol)
             prepared["price_precision"] = int(
                 getattr(contract_symbol, "price_precision", None) or prepared.get("price_precision") or 8
@@ -2307,9 +2468,22 @@ class ContractMarketGateway:
         *,
         provider: Any = None,
     ) -> int:
+        normalized_provider = str(provider or "").strip().upper()
+        if (
+            normalized_provider == "ITICK"
+            and domain in {
+                ContractMarketDomainName.TICKER,
+                ContractMarketDomainName.DEPTH,
+            }
+        ):
+            # iTick tradfi quote/depth frames are cadence-driven rather than a
+            # guaranteed sub-second heartbeat. One missed 1.5s window must not
+            # alternate the public market state between tradable and expired.
+            # Five seconds still fails closed on a sustained provider outage.
+            return 5_000
         if (
             domain == ContractMarketDomainName.KLINE
-            and str(provider or "").strip().upper() == "ITICK"
+            and normalized_provider == "ITICK"
         ):
             return max(
                 100,

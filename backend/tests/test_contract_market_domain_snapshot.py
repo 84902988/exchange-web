@@ -246,6 +246,42 @@ def test_provider_rest_trade_snapshot_is_recent():
     assert snapshot.metadata.completeness.status == ContractMarketDomainCompletenessStatus.COMPLETE
 
 
+def test_itick_rest_quote_and_depth_sources_are_recent_snapshots():
+    context = ContractMarketDomainSnapshotContext(
+        symbol="XAUUSDT_PERP",
+        transport=ContractMarketDomainTransport.PROVIDER_REST,
+        cache_origin=ContractMarketDomainCacheOrigin.NONE,
+        received_at_ms=NOW_MS - 50,
+        ttl_ms=1_500,
+        emitted_at_ms=NOW_MS,
+    )
+
+    ticker = map_contract_ticker_domain_snapshot(
+        context=context,
+        ticker={
+            "symbol": "XAUUSDT_PERP",
+            "provider": "ITICK",
+            "source": "ITICK_QUOTE",
+            "last_price": "4012.5",
+        },
+    )
+    depth = map_contract_depth_domain_snapshot(
+        context=context,
+        depth={
+            "symbol": "XAUUSDT_PERP",
+            "provider": "ITICK",
+            "source": "ITICK_DEPTH",
+            "bids": [["4012.1", "0"]],
+            "asks": [["4012.9", "0"]],
+        },
+    )
+
+    assert ticker.metadata.source == ContractMarketDomainSource.REST_SNAPSHOT
+    assert ticker.metadata.freshness == ContractMarketDomainFreshness.RECENT
+    assert depth.metadata.source == ContractMarketDomainSource.REST_SNAPSHOT
+    assert depth.metadata.freshness == ContractMarketDomainFreshness.RECENT
+
+
 def test_synthetic_trade_snapshot_is_invalid_and_cannot_bootstrap_authority():
     synthetic = {
         "id": "fake-1",
