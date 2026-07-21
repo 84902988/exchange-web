@@ -22,6 +22,17 @@ test('contract terminal reuses the shared selector and isolates symbol-scoped pr
   expect(source).toContain('return Boolean(symbol)');
 });
 
+test('contract browser title follows the symbol-scoped realtime display price', () => {
+  const source = readSource('components/contract/ContractMarketHeader.tsx');
+
+  expect(source).toContain("originalDocumentTitleRef.current = document.title || 'Royal Exchange'");
+  expect(source).toContain("displayPrice && displayPrice !== '--'");
+  expect(source).toContain('`${titlePrice} ${displaySymbol} 合约交易 | Royal Exchange`');
+  expect(source).toContain('Math.max(1000 - (now - titleUpdatedAtRef.current), 0)');
+  expect(source).toContain("document.title = originalDocumentTitleRef.current || 'Royal Exchange'");
+  expect(source).toContain('}, [displayPrice, displaySymbol]);');
+});
+
 test('contract chart capability classification ignores localized display groups', () => {
   const source = readSource('app/contract/page.tsx');
   const capabilityStart = source.indexOf('function getContractPairCapabilityCategories');
@@ -158,20 +169,23 @@ test('contract header receives authoritative MarketView status and does not synt
   expect(hookSource).not.toContain('chartLastClose');
 });
 
-test('contract TradingView overlay uses the latest Kline close with Price Authority fallback without changing the datafeed path', () => {
+test('tradfi TradingView line follows Header price while crypto keeps Kline/Price Authority fallback', () => {
   const pageSource = readSource('app/contract/page.tsx');
   const chartSource = readSource('components/contract/ContractTradingViewChart.tsx');
 
   expect(pageSource).toMatch(/<ContractTradingViewChart[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
-  expect(pageSource).not.toContain('displayPrice={currentPriceNumber}');
+  expect(pageSource).toContain(
+    'preferReferencePriceOverlay={currentContractUsesValuationPrice}',
+  );
   expect(chartSource).toContain('referencePrice: ContractReferencePrice;');
+  expect(chartSource).toContain('preferReferencePriceOverlay?: boolean;');
   expect(chartSource).toContain('resolveContractTradingViewOverlayPrice(referencePrice, normalizedSymbol)');
+  expect(chartSource).toContain('resolveContractTradingViewActiveOverlayPrice(');
   expect(chartSource).toContain('createContractTradingViewDatafeed({');
   expect(chartSource).toContain('onLatestBar: (price) => {');
   expect(chartSource).toContain('latestKlineOverlayRef.current = {');
-  expect(chartSource).toContain('overlayPriceRef.current = nextPrice ?? referenceOverlayPriceRef.current;');
+  expect(chartSource).toContain('preferReferencePriceOverlayRef.current,');
   expect(chartSource).toContain('onLatestKlineCloseChangeRef.current?.(price);');
-  expect(chartSource).not.toContain('displayPrice?: number | null;');
 });
 
 test('contract TradingView and OrderBook share one referencePrice contract', () => {

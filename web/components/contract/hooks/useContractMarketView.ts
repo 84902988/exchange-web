@@ -23,7 +23,6 @@ import {
   isContractKlineDomainMessage,
   isContractMarketDomainMessage,
   type ContractMarketRealtimeMessage,
-  type ContractMarketRealtimeStatus,
 } from '@/lib/realtime/contractMarketRealtime';
 import {
   readContractTradesCache,
@@ -61,6 +60,7 @@ import {
   buildContractPriceAuthority,
   selectContractReferencePrice,
 } from '../contractPriceAuthority';
+import { useContractMarketTransportRecovery } from './useContractMarketTransportRecovery';
 
 export type ContractCurrentPriceSource = 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK';
 
@@ -472,7 +472,6 @@ export function useContractMarketView({
   const mountedRef = useRef(false);
   const priceDirectionStateRef = useRef(createContractPriceDirectionState(contractSymbol));
   const previousMarketViewDisplayStateRef = useRef<string | null>(null);
-  const previousMarketRealtimeStatusRef = useRef<ContractMarketRealtimeStatus>('idle');
 
   const quoteState = useContractMarketState({
     contractSymbol,
@@ -486,6 +485,10 @@ export function useContractMarketView({
     handleBestPricesChange: handleDepthBestPricesChange,
     handleDepthDataChange: handleDepthSnapshotChange,
   } = quoteState;
+  const transportRecovery = useContractMarketTransportRecovery(
+    contractSymbol,
+    quoteMarketRealtimeStatus,
+  );
   const initialDepthRef = useRef<ContractDepthSnapshot | undefined>(initialDepth);
 
   useEffect(() => {
@@ -614,9 +617,7 @@ export function useContractMarketView({
   }, [contractSymbol]);
 
   useEffect(() => {
-    const previousStatus = previousMarketRealtimeStatusRef.current;
-    previousMarketRealtimeStatusRef.current = quoteMarketRealtimeStatus;
-    if (previousStatus !== 'connected' || quoteMarketRealtimeStatus === 'connected') return;
+    if (!transportRecovery.recoveryExpired) return;
 
     setWsState(null);
     setDepthState((current) => ({
@@ -637,9 +638,9 @@ export function useContractMarketView({
       freshness: null,
       updatedAt: null,
     }));
-  }, [contractSymbol, quoteMarketRealtimeStatus]);
+  }, [contractSymbol, transportRecovery.recoveryExpired]);
 
-  const activeRealtimeMarketView = quoteMarketRealtimeStatus === 'connected'
+  const activeRealtimeMarketView = transportRecovery.preserveRealtimeAuthority
     && normalizeContractSymbol(wsState?.symbol) === normalizeContractSymbol(contractSymbol)
     ? wsState
     : null;
@@ -648,7 +649,7 @@ export function useContractMarketView({
     : null;
   useEffect(() => {
     if (
-      quoteMarketRealtimeStatus !== 'connected'
+      !transportRecovery.preserveRealtimeAuthority
       || !storeMarketViewAuthority?.hasRealtimeAuthority
       || storeMarketViewAuthority.tickerObservedAtMs <= 0
     ) return undefined;
@@ -667,12 +668,12 @@ export function useContractMarketView({
     }, remainingMs + 1);
     return () => window.clearTimeout(timer);
   }, [
-    quoteMarketRealtimeStatus,
+    transportRecovery.preserveRealtimeAuthority,
     storeAuthorityEvaluationTimeMs,
     storeMarketViewAuthority,
   ]);
   const storeMarketView = useMemo(
-    () => quoteMarketRealtimeStatus === 'connected'
+    () => transportRecovery.preserveRealtimeAuthority
       ? projectContractMarketViewStoreAuthority(
         storeMarketViewAuthority,
         activeRestMarketView,
@@ -681,7 +682,7 @@ export function useContractMarketView({
       : null,
     [
       activeRestMarketView,
-      quoteMarketRealtimeStatus,
+      transportRecovery.preserveRealtimeAuthority,
       storeAuthorityEvaluationTimeMs,
       storeMarketViewAuthority,
     ],

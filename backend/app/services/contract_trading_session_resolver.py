@@ -22,8 +22,16 @@ REASON_NON_TRADING_SESSION = "NON_TRADING_SESSION"
 REASON_CRYPTO_24_7 = "CRYPTO_24_7"
 REASON_TRADING_SESSION_UNKNOWN = "TRADING_SESSION_UNKNOWN"
 
-_US_EQUITY_CATEGORIES = {"STOCK", "INDEX", "CFD"}
-_TRADFI_24X5_CATEGORIES = {"FOREX", "METAL", "GOLD", "COMMODITY", "FUTURES"}
+_US_EQUITY_CATEGORIES = {"STOCK"}
+_PROVIDER_SESSION_CATEGORIES = {
+    "CFD",
+    "INDEX",
+    "FOREX",
+    "METAL",
+    "GOLD",
+    "COMMODITY",
+    "FUTURES",
+}
 _CRYPTO_CATEGORIES = {"CRYPTO"}
 _OPEN_MARKET_STATUSES = {"OPEN", "TRADING"}
 _CLOSED_MARKET_STATUSES = {"CLOSED", "SUSPENDED"}
@@ -197,7 +205,10 @@ def _resolve_us_equity_session(
     return _session_result(SESSION_UNKNOWN, reason_code=REASON_TRADING_SESSION_UNKNOWN)
 
 
-def _resolve_24x5_session(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> ContractTradingSession:
+def _resolve_provider_session(
+    quote: Optional[dict[str, Any]],
+    depth: Optional[dict[str, Any]],
+) -> ContractTradingSession:
     market_status = _market_status(quote, depth)
     if market_status in _HOLIDAY_MARKET_STATUSES:
         return _session_result(SESSION_HOLIDAY)
@@ -228,6 +239,6 @@ def resolve_contract_trading_session(
         )
     if category in _US_EQUITY_CATEGORIES:
         return _resolve_us_equity_session(quote, depth, now)
-    if category in _TRADFI_24X5_CATEGORIES:
-        return _resolve_24x5_session(quote, depth)
-    return _resolve_24x5_session(quote, depth)
+    if category in _PROVIDER_SESSION_CATEGORIES:
+        return _resolve_provider_session(quote, depth)
+    return _resolve_provider_session(quote, depth)

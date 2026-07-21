@@ -155,6 +155,97 @@ def test_open_market_depth_replacement_preserves_ticker_evidence(monkeypatch) ->
     assert resolved["price_change_percent_24h"] == "-5"
 
 
+def test_cfd_native_depth_is_enriched_without_replacing_native_bbo(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    contract = SimpleNamespace(
+        symbol="EURUSD_PERP",
+        provider="ITICK",
+        provider_symbol="EURUSD",
+        category="FOREX",
+        price_precision=5,
+    )
+    monkeypatch.setattr(
+        service.itick_market_service,
+        "get_market_depth",
+        lambda **_kwargs: {"data": {}},
+    )
+    monkeypatch.setattr(
+        service,
+        "_extract_itick_stock_depth_levels",
+        lambda _payload: (
+            [[Decimal("1.14210"), Decimal("1")]],
+            [[Decimal("1.14225"), Decimal("1")]],
+            now,
+        ),
+    )
+    monkeypatch.setattr(service, "_get_cached_tradfi_quote_for_contract", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.itick_market_service, "is_quote_depth_cooldown_active", lambda: False)
+    monkeypatch.setattr(
+        service,
+        "_get_itick_cfd_reference_price",
+        lambda _contract: (
+            Decimal("1.14219"),
+            "ITICK",
+            "latest_price",
+            now,
+            {
+                "open_24h": "1.14144",
+                "price_change_24h": "0.00075",
+                "price_change_percent_24h": "0.065704",
+                "high_24h": "1.14278",
+                "low_24h": "1.14088",
+                "base_volume_24h": "259978.6",
+                "quote_volume_24h": "296805.11612",
+            },
+        ),
+    )
+
+    depth = service._get_itick_cfd_depth(contract, require_ticker_evidence=True)
+
+    assert depth["best_bid"] == Decimal("1.14210")
+    assert depth["best_ask"] == Decimal("1.14225")
+    assert depth["source"] == "ITICK_DEPTH"
+    assert depth["price_change_24h"] == "0.00075"
+    assert depth["high_24h"] == "1.14278"
+    assert depth["quote_volume_24h"] == "296805.11612"
+
+
+def test_cfd_depth_only_path_does_not_request_ticker_evidence(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    contract = SimpleNamespace(
+        symbol="XAGUSDT_PERP",
+        provider="ITICK",
+        provider_symbol="XAGUSD",
+        category="METAL",
+        price_precision=3,
+    )
+    monkeypatch.setattr(
+        service.itick_market_service,
+        "get_market_depth",
+        lambda **_kwargs: {"data": {}},
+    )
+    monkeypatch.setattr(
+        service,
+        "_extract_itick_stock_depth_levels",
+        lambda _payload: (
+            [[Decimal("58.957"), Decimal("1")]],
+            [[Decimal("58.993"), Decimal("1")]],
+            now,
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_get_itick_cfd_reference_price",
+        lambda _contract: (_ for _ in ()).throw(AssertionError("ticker REST must not run")),
+    )
+
+    depth = service._get_itick_cfd_depth(contract, require_ticker_evidence=False)
+
+    assert depth["best_bid"] == Decimal("58.957")
+    assert depth["best_ask"] == Decimal("58.993")
+    assert "price_change_24h" not in depth
+
+
 def test_closed_market_ticker_enrichment_does_not_replace_last_good_bbo(monkeypatch) -> None:
     quote = {
         "symbol": "AAPLUSDT_PERP",

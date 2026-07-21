@@ -292,6 +292,35 @@ def _pick_first_present(data: dict[str, Any], keys: list[str]) -> Any:
     return None
 
 
+def _normalize_itick_trading_status(value: Any) -> Optional[int]:
+    """Return iTick's quote status code without confusing it with timestamps."""
+
+    if value in (None, ""):
+        return None
+    try:
+        normalized = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized in {0, 1, 2, 3} else None
+
+
+def _normalize_provider_market_status(
+    value: Any,
+    *,
+    provider_trading_status: Optional[int],
+) -> Optional[str]:
+    explicit = str(value or "").strip().upper()
+    if explicit in {"OPEN", "TRADING"}:
+        return "OPEN"
+    if explicit in {"CLOSED", "SUSPENDED", "HOLIDAY", "DELISTED", "CIRCUIT_BREAKER"}:
+        return "CLOSED"
+    if provider_trading_status == 0:
+        return "OPEN"
+    if provider_trading_status in {1, 2, 3}:
+        return "CLOSED"
+    return None
+
+
 def _pick_decimal(data: dict[str, Any], keys: list[str]) -> Optional[Decimal]:
     value, _key = _pick_decimal_with_key(data, keys)
     return value
@@ -3406,18 +3435,39 @@ class ContractMarketProviderWsService:
                 last_price = (bid_price + ask_price) / Decimal("2")
             else:
                 return None
-        if bid_price is None or ask_price is None or bid_price <= 0 or ask_price <= 0 or ask_price <= bid_price:
-            spread_half = max(last_price * Decimal("0.0005"), Decimal("0.00000001"))
-            bid_price = last_price - spread_half
-            ask_price = last_price + spread_half
-        mark_price = (bid_price + ask_price) / Decimal("2")
+        has_native_bbo = (
+            bid_price is not None
+            and ask_price is not None
+            and bid_price > 0
+            and ask_price > bid_price
+        )
+        if not has_native_bbo:
+            # iTick quote frames may contain only the latest price. A synthetic
+            # spread is display data, not executable BBO authority; leave it
+            # empty and let the independent depth channel own bid/ask.
+            bid_price = None
+            ask_price = None
+        mark_price = (
+            (bid_price + ask_price) / Decimal("2")
+            if has_native_bbo and bid_price is not None and ask_price is not None
+            else last_price
+        )
         ts_value = _pick_first_present(
             row,
-            ["ts", "t", "time", "timestamp", "quote_time", "price_time"],
+            # In iTick quote payloads ``t`` is the event timestamp while
+            # ``ts`` is the instrument trading-status code (0..3). Treating
+            # status 0 as epoch time made healthy quotes look stale.
+            ["t", "time", "timestamp", "quote_time", "price_time"],
         )
         ts_ms = _timestamp_ms_from_value(ts_value)
         ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-        market_status = _pick_first_present(row, ["market_status", "marketStatus"])
+        provider_trading_status = _normalize_itick_trading_status(
+            _pick_first_present(row, ["trading_status", "tradingStatus", "ts"])
+        )
+        provider_market_status = _normalize_provider_market_status(
+            _pick_first_present(row, ["market_status", "marketStatus"]),
+            provider_trading_status=provider_trading_status,
+        )
         open_24h = _pick_decimal(row, ["o", "open", "open_price", "openPrice"])
         change_evidence = resolve_contract_ticker_24h_evidence(
             last_price=last_price,
@@ -3452,14 +3502,17 @@ class ContractMarketProviderWsService:
             "quote_volume_24h": _pick_decimal(row, ["tu", "qv", "turnover", "amount", "value"]),
             "price_change_percent_24h": change_evidence.price_change_percent_24h,
             "price_field": price_field,
-            "market_status": market_status,
+            "provider_trading_status": provider_trading_status,
+            "provider_market_status": provider_market_status,
+            "market_status": provider_market_status,
             "source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_source": CONTRACT_PROVIDER_WS_SOURCE,
             "quote_freshness": "LIVE",
             "is_realtime": True,
-            "executable": True,
             "ts": ts,
-            "exchange_ts": ts_value,
+            # The provider can omit or zero its event-time field. Use the
+            # normalized receive-time fallback consistently in that case.
+            "exchange_ts": ts_ms,
             "ws_symbol": subscription.ws_symbol or subscription.provider_symbol,
         }
 

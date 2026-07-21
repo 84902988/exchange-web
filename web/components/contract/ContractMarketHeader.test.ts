@@ -92,10 +92,12 @@ const Fragment = Symbol('Fragment');
 const clock = new FakeClock();
 let flashState = false;
 let effectCursor = 0;
+let refCursor = 0;
 let effectStates: Array<{
   deps: unknown[];
   cleanup?: () => void;
 }> = [];
+let refStates: Array<{ current: unknown }> = [];
 let storeSnapshotsBySymbol: Record<string, Record<string, unknown> | null> = {};
 
 function createRenderNode(
@@ -115,6 +117,11 @@ Object.defineProperty(globalThis, 'window', {
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
   },
+});
+
+Object.defineProperty(globalThis, 'document', {
+  configurable: true,
+  value: { title: 'Royal Exchange' },
 });
 
 const headerChangeModule = loadTypeScriptModule(
@@ -144,6 +151,12 @@ const headerModule = loadTypeScriptModule(
         };
       },
       useMemo: (factory: () => unknown) => factory(),
+      useRef: (initialValue: unknown) => {
+        const index = refCursor;
+        refCursor += 1;
+        refStates[index] ??= { current: initialValue };
+        return refStates[index];
+      },
       useState: () => [
         flashState,
         (nextValue: boolean | ((current: boolean) => boolean)) => {
@@ -262,8 +275,11 @@ function resetHarness() {
   for (const state of effectStates) state.cleanup?.();
   effectStates = [];
   effectCursor = 0;
+  refStates = [];
+  refCursor = 0;
   storeSnapshotsBySymbol = {};
   flashState = false;
+  document.title = 'Royal Exchange';
   clock.now = 0;
   clock.nextId = 1;
   clock.tasks.clear();
@@ -271,6 +287,7 @@ function resetHarness() {
 
 function renderHeader(overrides: Record<string, unknown> = {}) {
   effectCursor = 0;
+  refCursor = 0;
   return ContractMarketHeader({ ...baseProps, ...overrides });
 }
 
@@ -294,6 +311,40 @@ function findByTestId(tree: unknown, testId: string) {
   assert.ok(found, `Expected data-testid=${testId}`);
   return found;
 }
+
+function findByClassToken(tree: unknown, token: string) {
+  const found = walk(tree).find((node) => (
+    typeof node.props.className === 'string' && node.props.className.includes(token)
+  ));
+  assert.ok(found, `Expected class token=${token}`);
+  return found;
+}
+
+test('tradfi Header keeps all seven metric cards on one xl laptop row', () => {
+  resetHarness();
+  const tree = renderHeader({ isTradfi: true });
+  const metrics = findByClassToken(
+    tree,
+    'xl:grid-cols-[1.05fr_0.9fr_0.75fr_1.3fr_1.35fr_0.85fr_0.85fr]',
+  );
+
+  assert.match(metrics.props.className, /md:grid-cols-4/);
+  assert.doesNotMatch(metrics.props.className, /2xl:grid-cols-7/);
+});
+
+test('crypto Header keeps eight visible metric cards on one xl laptop row without funding rate', () => {
+  resetHarness();
+  const tree = renderHeader();
+  const metrics = findByClassToken(tree, 'xl:grid-cols-8');
+  const metricTestIds = (Array.isArray(metrics.props.children)
+    ? metrics.props.children.flat(Infinity)
+    : [metrics.props.children])
+    .map((node) => (node as RenderNode | null)?.props?.['data-testid'])
+    .filter((value): value is string => typeof value === 'string');
+
+  assert.equal(metricTestIds.length, 8);
+  assert.equal(metricTestIds.includes('contract-header-funding-rate'), false);
+});
 
 test('Header renders the last-trade reference price as its only main price', () => {
   resetHarness();
@@ -420,7 +471,7 @@ test('Header keeps the reference main price separate from contract product metri
   assert.equal(textContent(findByTestId(tree, 'contract-header-display-price')), '100.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c120.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-index-price')), '\u6307\u6570\u4ef7\u683c121.0');
-  assert.equal(textContent(findByTestId(tree, 'contract-header-funding-rate')), '\u8d44\u91d1\u8d39\u7387+0.0200%');
+  assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-funding-rate'), false);
 });
 
 test('TradFi header can label the platform midpoint as valuation price', () => {
@@ -489,6 +540,23 @@ test('authoritative MarketView labels map PRE_MARKET, REGULAR, AFTER_HOURS, CLOS
   }
 });
 
+test('initial market bootstrap renders loading instead of a false unavailable state', () => {
+  resetHarness();
+  const tree = renderHeader({
+    displayPrice: '--',
+    quoteStatusLabel: '行情加载中',
+    quoteStatusTone: 'loading',
+    marketStatus: null,
+    marketSessionType: null,
+    executable: null,
+  });
+  const status = findByTestId(tree, 'contract-header-market-status');
+
+  assert.equal(textContent(status), '加载中·等待行情');
+  assert.equal(status.props['data-market-state'], 'loading');
+  assert.match(findByTestId(tree, 'contract-header-market-status-dot').props.className, /animate-pulse/);
+});
+
 test('unavailable price/status renders only the user-facing unavailable state', () => {
   resetHarness();
   const tree = renderHeader({
@@ -513,7 +581,7 @@ test('contract metrics remain separate cards without duplicating main price', ()
 
   assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c63,998.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-index-price')), '\u6307\u6570\u4ef7\u683c63,997.0');
-  assert.equal(textContent(findByTestId(tree, 'contract-header-funding-rate')), '\u8d44\u91d1\u8d39\u7387+0.0100%');
+  assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-funding-rate'), false);
   assert.equal(textContent(findByTestId(tree, 'contract-header-best-bid')), '\u4e70\u4e0063,999.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-best-ask')), '\u5356\u4e0064,001.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-spread')), '\u4ef7\u5dee\u6d6e\u52a8');

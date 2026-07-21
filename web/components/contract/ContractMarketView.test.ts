@@ -122,10 +122,10 @@ test('execution bid and ask remain independent MarketView authority fields', () 
   assert.equal(authority.executionBid, 98);
   assert.equal(authority.executionAsk, 102);
   assert.equal(presentation.isTradable, true);
-  assert.match(formSource, /const resolvedExecutionBid = marketViewAuthority\.executionBid \?\? 0;/);
-  assert.match(formSource, /const resolvedExecutionAsk = marketViewAuthority\.executionAsk \?\? 0;/);
-  assert.match(formSource, /closeSide === 'LONG' \? resolvedExecutionBid : resolvedExecutionAsk/);
-  assert.match(formSource, /positionSide === 'LONG' \? resolvedExecutionAsk : resolvedExecutionBid/);
+  assert.match(formSource, /intent: 'OPEN_LONG'/);
+  assert.match(formSource, /intent: 'OPEN_SHORT'/);
+  assert.match(formSource, /closeSide === 'LONG' \? executionPrices\.closeLong : executionPrices\.closeShort/);
+  assert.match(formSource, /positionSide === 'LONG' \? executionPrices\.openLong : executionPrices\.openShort/);
   assert.doesNotMatch(formSource, /getPositivePriceValue\(executionBid|getPositivePriceValue\(executionAsk/);
 });
 

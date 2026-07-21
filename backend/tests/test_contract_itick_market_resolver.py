@@ -10,7 +10,7 @@ from app.services.contract_itick_market_resolver import (
 )
 
 
-@pytest.mark.parametrize("provider_symbol", ["NAS100", "SPX", "DJI"])
+@pytest.mark.parametrize("provider_symbol", ["NAS100", "SPX", "DJI", "FUTURE_INDEX"])
 def test_global_index_history_uses_itick_gb_namespace(provider_symbol):
     evidence = resolve_contract_itick_kline_provider_evidence(
         local_symbol=f"{provider_symbol}USDT_PERP",

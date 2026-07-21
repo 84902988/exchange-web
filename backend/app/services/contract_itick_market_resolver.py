@@ -69,17 +69,6 @@ _ITICK_DWM_PRODUCTION_POLICY_BY_CATEGORY_REGION = {
     ("INDEX", "GB"): ITICK_DWM_UTC_PASSTHROUGH,
 }
 
-_ITICK_GB_INDEX_SYMBOLS = frozenset({
-    "DJI",
-    "DJIA",
-    "NAS100",
-    "NDX",
-    "SPX",
-    "US30",
-    "US500",
-})
-
-
 def normalize_contract_itick_category(value: Any) -> str:
     normalized = str(value or "").strip().upper()
     if normalized in {"GOLD", "SILVER", "METAL"}:
@@ -144,16 +133,10 @@ def resolve_contract_itick_region(
     if normalized_category in {"FOREX", "METAL", "COMMODITY"}:
         return "GB"
     if normalized_category == "INDEX":
-        symbol = str(provider_symbol or "").strip().upper()
-        if symbol in {"HSI", "HK50", "HKG33", "HKHSI"}:
-            return "HK"
-        if symbol in {"DAX", "GER40", "DE40", "DAX40"}:
-            return "DE"
-        if symbol in {"N225", "NI225", "JP225", "NKY"}:
-            return "JP"
-        if symbol in _ITICK_GB_INDEX_SYMBOLS:
-            return "GB"
-        return "US"
+        # iTick exposes index instruments through its GB provider namespace.
+        # This namespace is routing metadata, not an exchange-hours calendar;
+        # callers can still supply an explicit region for a provider exception.
+        return "GB"
     return "US"
 
 

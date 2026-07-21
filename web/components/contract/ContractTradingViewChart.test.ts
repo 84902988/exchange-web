@@ -1155,6 +1155,31 @@ test('Kline close remains 99 while last-trade overlay remains 100', () => {
   assert.equal(overlayPrice, 100);
 });
 
+test('tradfi current price line uses the Header price before the latest Kline catches up', () => {
+  assert.equal(
+    chartModule.resolveContractTradingViewActiveOverlayPrice(true, 4059.3, 4060.08),
+    4060.08,
+  );
+});
+
+test('tradfi current price line stays hidden until the symbol-scoped Header price is ready', () => {
+  assert.equal(
+    chartModule.resolveContractTradingViewActiveOverlayPrice(true, 4059.3, null),
+    null,
+  );
+});
+
+test('legacy crypto overlay keeps latest-Kline then Price Authority fallback precedence', () => {
+  assert.equal(
+    chartModule.resolveContractTradingViewActiveOverlayPrice(false, 99, 100),
+    99,
+  );
+  assert.equal(
+    chartModule.resolveContractTradingViewActiveOverlayPrice(false, null, 100),
+    100,
+  );
+});
+
 test('mark, index, book mid, and execution prices cannot influence overlay', () => {
   const authority = {
     reference_price: makeReferencePrice(100),

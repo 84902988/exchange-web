@@ -67,6 +67,9 @@ logger = logging.getLogger(__name__)
 CONTRACT_MARKET_SESSION_POLICY_VERSION = "v1"
 CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION = "ld"
 CONTRACT_MARKET_STATUS_VERSION = "v2.2"
+MARKET_STATUS_OPEN = "OPEN"
+_PROVIDER_MARKET_STATUS_TEXT_OPEN = "交易中"
+_PROVIDER_MARKET_STATUS_TEXT_CLOSED = "休市中 · 平台报价"
 
 QUOTE_FRESHNESS_LIVE = "LIVE"
 QUOTE_FRESHNESS_RECENT = "RECENT"
@@ -124,8 +127,11 @@ _stock_contract_ticker_request_limit = 20
 _stock_contract_region = "US"
 _stock_contract_quote_asset = "USDT"
 _tradfi_cfd_categories = {"CFD", "INDEX", "FOREX", "METAL", "COMMODITY"}
-_holiday_contract_categories = {"STOCK", "INDEX"}
-_contract_24x5_categories = {"FOREX", "METAL", "COMMODITY"}
+_itick_provider_session_categories = frozenset(_tradfi_cfd_categories)
+_itick_provider_status_fields = (
+    "provider_trading_status",
+    "provider_market_status",
+)
 _itick_contract_k_type = ITICK_KLINE_TYPE_BY_INTERVAL
 _contract_interval_seconds = {
     "1m": 60,
@@ -338,20 +344,105 @@ def _get_contract_symbol_optional_columns(db: Session) -> set[str]:
     return _contract_symbol_optional_columns
 
 
-def _market_status_for_contract_symbol(contract_symbol: ContractSymbol) -> ItickMarketStatus:
+def _normalize_itick_provider_trading_status(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        normalized = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized in {0, 1, 2, 3} else None
+
+
+def _itick_provider_status_fields_from_quote(data: Dict[str, Any]) -> dict[str, Any]:
+    provider_trading_status = _normalize_itick_provider_trading_status(
+        _pick_first_present(data, ["trading_status", "tradingStatus", "ts"])
+    )
+    explicit_status = str(
+        _pick_first_present(data, ["provider_market_status", "market_status", "marketStatus"])
+        or ""
+    ).strip().upper()
+    if explicit_status in {"OPEN", "TRADING"}:
+        provider_market_status = MARKET_STATUS_OPEN
+    elif explicit_status in {"CLOSED", "SUSPENDED", "HOLIDAY", "DELISTED", "CIRCUIT_BREAKER"}:
+        provider_market_status = MARKET_STATUS_CLOSED
+    elif provider_trading_status == 0:
+        provider_market_status = MARKET_STATUS_OPEN
+    elif provider_trading_status in {1, 2, 3}:
+        provider_market_status = MARKET_STATUS_CLOSED
+    else:
+        provider_market_status = None
+    return {
+        "provider_trading_status": provider_trading_status,
+        "provider_market_status": provider_market_status,
+    }
+
+
+def _provider_native_market_status(
+    contract_symbol: ContractSymbol,
+    payload: Optional[dict[str, Any]],
+) -> ItickMarketStatus:
+    status_code = _normalize_itick_provider_trading_status(
+        (payload or {}).get("provider_trading_status")
+    )
+    provider_status = str((payload or {}).get("provider_market_status") or "").strip().upper()
+    if status_code in {1, 2, 3} or provider_status in {
+        "CLOSED",
+        "SUSPENDED",
+        "HOLIDAY",
+        "DELISTED",
+        "CIRCUIT_BREAKER",
+    }:
+        return ItickMarketStatus(
+            market_status=MARKET_STATUS_CLOSED,
+            market_status_text=_PROVIDER_MARKET_STATUS_TEXT_CLOSED,
+            market_session_code=None,
+            market_timezone=None,
+            market_trading_hours="PROVIDER_NATIVE",
+            market_session_type="CLOSED",
+        )
+
+    source = str((payload or {}).get("quote_source") or (payload or {}).get("source") or "").strip().upper()
+    non_live_source = (
+        not source
+        or source == QUOTE_SOURCE_LAST_GOOD_BBO
+        or "FALLBACK" in source
+        or "LAST_VALID" in source
+    )
+    is_live = (
+        isinstance(payload, dict)
+        and not non_live_source
+        and _quote_freshness_for_payload(payload) == QUOTE_FRESHNESS_LIVE
+    )
+    if is_live and (status_code == 0 or provider_status in {"OPEN", "TRADING"} or source):
+        return ItickMarketStatus(
+            market_status=MARKET_STATUS_OPEN,
+            market_status_text=_PROVIDER_MARKET_STATUS_TEXT_OPEN,
+            market_session_code=None,
+            market_timezone=None,
+            market_trading_hours="PROVIDER_NATIVE",
+            market_session_type="REGULAR",
+        )
+    return itick_holiday_service.unknown(None, None, "PROVIDER_NATIVE")
+
+
+def _market_status_for_contract_symbol(
+    contract_symbol: ContractSymbol,
+    payload: Optional[dict[str, Any]] = None,
+) -> ItickMarketStatus:
     category = _contract_asset_category(contract_symbol)
     provider = str(getattr(contract_symbol, "provider", "") or "").strip().upper()
     if provider != "ITICK":
         return itick_holiday_service.crypto_open()
     if category == "STOCK":
+        provider_status = _provider_native_market_status(contract_symbol, payload)
+        if provider_status.market_status == MARKET_STATUS_CLOSED:
+            return provider_status
         return itick_holiday_service.get_us_stock_regular_status()
-    if category in _contract_24x5_categories:
-        return itick_holiday_service.forex_24x5_status()
-    if category in _holiday_contract_categories:
-        session_code = _contract_session_code(contract_symbol, category)
-        if session_code:
-            return itick_holiday_service.get_market_status(session_code)
-    return itick_holiday_service.crypto_open()
+    if category in _itick_provider_session_categories:
+        return _provider_native_market_status(contract_symbol, payload)
+    # An unknown iTick category must never inherit crypto's 24/7 permission.
+    return itick_holiday_service.unknown(None, None, None)
 
 
 def _market_status_for_stock_contract_symbol() -> ItickMarketStatus:
@@ -366,42 +457,7 @@ def _contract_session_code(contract_symbol: ContractSymbol, category: Optional[s
     normalized_category = category or _contract_asset_category(contract_symbol)
     if normalized_category == "STOCK":
         return _stock_contract_region
-    if normalized_category in ("INDEX", "METAL", "COMMODITY"):
-        return _fallback_session_code_for_contract(contract_symbol, normalized_category)
     return None
-
-
-def _fallback_session_code_for_contract(contract_symbol: ContractSymbol, category: str) -> str:
-    provider_symbol = _contract_provider_symbol(contract_symbol)
-    if category == "INDEX":
-        if provider_symbol in {"HSI", "HK50", "HKG33", "HKHSI"}:
-            return "HK"
-        if provider_symbol in {"DAX", "GER40", "DE40", "DAX40"}:
-            return "DE"
-        if provider_symbol in {"N225", "NI225", "JP225", "NKY"}:
-            return "JP"
-        if provider_symbol in {"STI", "SG30"}:
-            return "SG"
-        if provider_symbol in {"ASX200", "AUS200"}:
-            return "AU"
-        if provider_symbol in {"FTSE", "UK100"}:
-            return "GB"
-        if provider_symbol in {"SSE", "CSI300", "CN50"}:
-            return "CN"
-        if provider_symbol in {"DJ", "DJI", "US30", "SPX", "SPX500", "US500", "NAS100", "NDX"}:
-            return "US"
-        return "US"
-    if category == "METAL":
-        if provider_symbol.startswith(("XAU", "XAG", "GOLD", "SILVER")):
-            return "GB"
-        return "GB"
-    if category == "COMMODITY":
-        if provider_symbol.startswith(("BRENT", "XBR", "UKOIL")):
-            return "GB"
-        if provider_symbol.startswith(("OIL", "WTI", "USOIL")):
-            return "GB"
-        return "GB"
-    return "GB"
 
 
 def _normalize_quote_ts(value: Any) -> Optional[datetime]:
@@ -561,7 +617,7 @@ def _required_last_good_trading_day(
     now: Optional[datetime] = None,
 ) -> Optional[date_cls]:
     category = _contract_asset_category(contract_symbol) if contract_symbol is not None else ""
-    if category not in (_tradfi_cfd_categories | _holiday_contract_categories | _contract_24x5_categories):
+    if category not in (_tradfi_cfd_categories | {"STOCK"}):
         return None
 
     current = _last_good_bbo_local_now(status, now)
@@ -1092,6 +1148,11 @@ def _ticker_from_quote_payload(symbol: str, quote: dict[str, Any]) -> dict[str, 
         "source": quote.get("source"),
         "ts": quote.get("ts"),
         **_ticker_24h_fields_from_quote(quote),
+        **{
+            key: quote.get(key)
+            for key in _itick_provider_status_fields
+            if quote.get(key) is not None
+        },
     }
 
 
@@ -2130,11 +2191,16 @@ def _get_cached_tradfi_quote_for_contract(
 
 def _itick_region_for_contract(contract_symbol: ContractSymbol) -> str:
     category = _contract_asset_category(contract_symbol)
-    if category == "INDEX":
-        return "GB"
-    if category in ("FOREX", "METAL", "COMMODITY"):
-        return _contract_session_code(contract_symbol, category) or "GB"
-    return "US"
+    explicit_region = ""
+    for attr_name in ("_external_region_override", "_region_override", "external_region", "region"):
+        explicit_region = str(getattr(contract_symbol, attr_name, "") or "").strip().upper()
+        if explicit_region:
+            break
+    return resolve_contract_itick_region(
+        category,
+        _contract_provider_symbol(contract_symbol),
+        explicit_region or None,
+    )
 
 
 def _contract_provider_symbol(contract_symbol: ContractSymbol) -> str:
@@ -2154,9 +2220,8 @@ def _contract_itick_kline_provider_evidence(
         provider_symbol=getattr(contract_symbol, "provider_symbol", None),
         category=category,
         interval=interval,
-        # Provider namespace is not the same thing as the exchange holiday
-        # session. iTick serves NAS100/SPX/DJI under indices/GB even though
-        # their market-session calendar is US.
+        # This is iTick's provider namespace. Trading permission is resolved
+        # independently from live provider status/freshness.
         explicit_region=_itick_region_for_contract(contract_symbol),
     )
 
@@ -2200,7 +2265,7 @@ def _stable_reference_price(provider_symbol: str, category: str) -> Decimal:
 
 def _get_itick_cfd_reference_price(
     contract_symbol: ContractSymbol,
-) -> tuple[Decimal, str, Optional[str], datetime, dict[str, Optional[str]]]:
+) -> tuple[Decimal, str, Optional[str], datetime, dict[str, Any]]:
     provider_symbol = _contract_provider_symbol(contract_symbol)
     category = _contract_asset_category(contract_symbol)
     market = _itick_market_for_contract(contract_symbol)
@@ -2233,7 +2298,10 @@ def _get_itick_cfd_reference_price(
                     "ITICK",
                     price_field,
                     _itick_quote_timestamp(data),
-                    _extract_itick_24h_ticker_fields(data, last_price=price),
+                    {
+                        **_extract_itick_24h_ticker_fields(data, last_price=price),
+                        **_itick_provider_status_fields_from_quote(data),
+                    },
                 )
     except Exception as exc:
         _log_contract_market_warning(
@@ -2292,7 +2360,8 @@ def _build_cfd_depth_from_price(
     if ticker_24h_fields:
         depth.update({
             key: ticker_24h_fields.get(key)
-            for key in _contract_ticker_24h_fields
+            for key in (*_contract_ticker_24h_fields, *_itick_provider_status_fields)
+            if ticker_24h_fields.get(key) is not None
         })
     return depth
 
@@ -2331,6 +2400,30 @@ def _get_itick_cfd_depth(
                 ),
             )
             depth["price_precision"] = int(getattr(contract_symbol, "price_precision", 2) or 2)
+            if require_ticker_evidence:
+                # Native depth owns executable BBO, but iTick's depth response
+                # does not carry the daily ticker fields used by the Header.
+                # Enrich the same snapshot from the quote endpoint without
+                # replacing either side of the provider-native book.
+                ticker_evidence = _get_cached_tradfi_quote_for_contract(contract_symbol)
+                if not _has_ticker_change_evidence(ticker_evidence or {}):
+                    if not itick_market_service.is_quote_depth_cooldown_active():
+                        (
+                            _reference_price,
+                            _reference_source,
+                            _reference_price_field,
+                            _reference_ts,
+                            ticker_evidence,
+                        ) = _get_itick_cfd_reference_price(contract_symbol)
+                    else:
+                        ticker_evidence = None
+                _merge_ticker_24h_evidence(depth, ticker_evidence)
+                if isinstance(ticker_evidence, dict):
+                    depth.update({
+                        key: ticker_evidence.get(key)
+                        for key in _itick_provider_status_fields
+                        if ticker_evidence.get(key) is not None
+                    })
             return depth
     except Exception as exc:
         logger.debug(
@@ -2376,6 +2469,11 @@ def _quote_from_cfd_depth(contract_symbol: ContractSymbol, depth: dict[str, Any]
     if depth.get("price_field"):
         quote["price_field"] = depth.get("price_field")
     quote.update(_ticker_24h_fields_from_quote(depth))
+    quote.update({
+        key: depth.get(key)
+        for key in _itick_provider_status_fields
+        if depth.get(key) is not None
+    })
     return quote
 
 
@@ -3603,6 +3701,9 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
         else:
             raise ContractQuoteUnavailable(f"provider {provider} quote is unavailable")
 
+        if provider == "ITICK":
+            market_status = _market_status_for_contract_symbol(contract_symbol, quote)
+            is_closed_market = _is_market_closed(market_status)
         if provider == "ITICK" and not is_closed_market:
             quote = _quote_from_open_market_depth_if_live(
                 contract_symbol,
@@ -3610,6 +3711,8 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
                 market_status=market_status,
                 log_context=log_context,
             )
+            market_status = _market_status_for_contract_symbol(contract_symbol, quote)
+            is_closed_market = _is_market_closed(market_status)
         quote["price_precision"] = int(getattr(contract_symbol, "price_precision", 8) or 8)
         quote = _freeze_quote_if_closed(quote, market_status, prefer_cached=not is_closed_market)
         if is_closed_market and _is_payload_newer(quote, _get_closed_depth(contract_symbol.symbol, limit=5)):
@@ -3835,7 +3938,11 @@ def _contract_ticker_from_stock_contract(
     }
 
 
-def _contract_ticker_from_itick_cfd(contract_symbol: ContractSymbol) -> dict[str, Any]:
+def _contract_ticker_from_itick_cfd(
+    contract_symbol: ContractSymbol,
+    *,
+    quote_item: Optional[Dict[str, Any]] = None,
+) -> dict[str, Any]:
     provider_symbol = _contract_provider_symbol(contract_symbol)
     is_cooldown_active = itick_market_service.is_quote_depth_cooldown_active()
     cached_quote = _get_cached_tradfi_quote_for_contract(contract_symbol, allow_stale=is_cooldown_active)
@@ -3845,17 +3952,21 @@ def _contract_ticker_from_itick_cfd(contract_symbol: ContractSymbol) -> dict[str
     if is_cooldown_active:
         return {"symbol": contract_symbol.symbol, "last_price": None, "price_change_percent_24h": None}
     try:
-        payload = itick_market_service.get_market_quote(
-            _itick_market_for_contract(contract_symbol),
-            _itick_region_for_contract(contract_symbol),
-            provider_symbol,
-        )
-        data = _extract_stock_quote_item(payload) or {}
+        if quote_item is None:
+            payload = itick_market_service.get_market_quote(
+                _itick_market_for_contract(contract_symbol),
+                _itick_region_for_contract(contract_symbol),
+                provider_symbol,
+            )
+            data = _extract_stock_quote_item(payload) or {}
+        else:
+            data = dict(quote_item)
         last_price, price_field = _pick_itick_quote_reference_price(
             data,
             prefer_forex_latest=_uses_itick_latest_price_field(contract_symbol),
         )
         ticker_24h_fields = _extract_itick_24h_ticker_fields(data, last_price=last_price)
+        provider_status_fields = _itick_provider_status_fields_from_quote(data)
         if last_price is not None and last_price > 0:
             quote_ts = _itick_quote_timestamp(data)
             depth = _build_cfd_depth_from_price(
@@ -3865,9 +3976,14 @@ def _contract_ticker_from_itick_cfd(contract_symbol: ContractSymbol) -> dict[str
                 limit=10,
                 price_field=price_field,
                 ts=quote_ts,
+                ticker_24h_fields={
+                    **ticker_24h_fields,
+                    **provider_status_fields,
+                },
             )
             quote = _quote_from_cfd_depth(contract_symbol, depth, source="ITICK_QUOTE")
             quote.update(ticker_24h_fields)
+            quote.update(provider_status_fields)
             _cache_tradfi_quote(quote)
             return {
                 "symbol": contract_symbol.symbol,
@@ -3875,6 +3991,7 @@ def _contract_ticker_from_itick_cfd(contract_symbol: ContractSymbol) -> dict[str
                 "source": "ITICK_QUOTE",
                 "ts": quote_ts,
                 **ticker_24h_fields,
+                **provider_status_fields,
             }
     except Exception as exc:
         cached_quote = _get_cached_tradfi_quote_for_contract(contract_symbol, allow_stale=True)
@@ -4004,6 +4121,103 @@ def _stock_contract_tickers_from_symbols(
     return items
 
 
+def _itick_cfd_tickers_from_symbols(
+    db: Session,
+    contract_symbols: List[ContractSymbol],
+) -> List[Dict[str, Any]]:
+    """Resolve iTick CFD tickers with one batch request per market/region.
+
+    The previous selector path called the provider once per symbol. The batch
+    endpoint keeps the same per-symbol mapping, cache, fallback, and market
+    status semantics while removing serialized upstream latency.
+    """
+
+    if not contract_symbols:
+        return []
+
+    ticker_by_symbol: dict[str, dict[str, Any]] = {}
+    grouped_rows: dict[tuple[str, str], list[ContractSymbol]] = {}
+    cooldown_active = itick_market_service.is_quote_depth_cooldown_active()
+    for contract_symbol in contract_symbols:
+        cached_quote = _get_cached_tradfi_quote_for_contract(
+            contract_symbol,
+            allow_stale=cooldown_active,
+        )
+        cached_ticker = (
+            _ticker_from_quote_payload(contract_symbol.symbol, cached_quote)
+            if cached_quote is not None
+            else None
+        )
+        if cached_ticker is not None and (cooldown_active or _has_ticker_change_evidence(cached_ticker)):
+            ticker_by_symbol[contract_symbol.symbol] = cached_ticker
+            continue
+
+        group_key = (
+            _itick_market_for_contract(contract_symbol),
+            _itick_region_for_contract(contract_symbol),
+        )
+        grouped_rows.setdefault(group_key, []).append(contract_symbol)
+
+    for (market, region), rows in grouped_rows.items():
+        code_by_symbol = {
+            contract_symbol.symbol: _contract_provider_symbol(contract_symbol)
+            for contract_symbol in rows
+        }
+        quote_by_code: dict[str, dict[str, Any]] = {}
+        try:
+            quote_by_code = itick_market_service.get_market_quotes_by_code(
+                market,
+                region,
+                list(code_by_symbol.values()),
+                timeout=3,
+            )
+        except Exception as exc:
+            logger.warning(
+                "tradfi_cfd_ticker_batch_unavailable market=%s region=%s count=%s reason=%s",
+                market,
+                region,
+                len(rows),
+                exc,
+            )
+
+        for contract_symbol in rows:
+            provider_symbol = code_by_symbol[contract_symbol.symbol]
+            quote_item = (
+                quote_by_code.get(provider_symbol)
+                or quote_by_code.get(provider_symbol.replace("US.", ""))
+                or quote_by_code.get(contract_symbol.symbol)
+            )
+            try:
+                ticker_by_symbol[contract_symbol.symbol] = _contract_ticker_from_itick_cfd(
+                    contract_symbol,
+                    # An empty batch item must stay on the bounded fallback path.
+                    # Passing ``None`` would make the single-symbol helper issue a
+                    # second upstream request for every omitted symbol.
+                    quote_item=quote_item or {},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "tradfi_cfd_ticker_batch_item_fallback symbol=%s provider_symbol=%s reason=%s",
+                    contract_symbol.symbol,
+                    provider_symbol,
+                    exc,
+                )
+                fallback = get_last_valid_contract_quote(db, contract_symbol.symbol)
+                ticker_by_symbol[contract_symbol.symbol] = {
+                    "symbol": contract_symbol.symbol,
+                    "last_price": _format_decimal(fallback["last_price"]) if fallback else None,
+                    "price_change_percent_24h": None,
+                    "source": "LAST_VALID" if fallback else "CFD_FALLBACK",
+                    "ts": fallback.get("ts") if fallback else None,
+                }
+
+    return [
+        ticker_by_symbol[contract_symbol.symbol]
+        for contract_symbol in contract_symbols
+        if contract_symbol.symbol in ticker_by_symbol
+    ]
+
+
 def get_contract_tickers(
     db: Session,
     symbols: Optional[List[str]] = None,
@@ -4020,6 +4234,7 @@ def get_contract_tickers(
     attach_contract_symbol_market_metadata(db, rows)
     items: list[dict[str, Any]] = []
     stock_contract_rows: list[ContractSymbol] = []
+    itick_cfd_rows: list[ContractSymbol] = []
     for contract_symbol in rows:
         provider = str(contract_symbol.provider or "").strip().upper()
         try:
@@ -4030,7 +4245,7 @@ def get_contract_tickers(
                 if _is_stock_contract_config(contract_symbol):
                     stock_contract_rows.append(contract_symbol)
                 else:
-                    items.append(_contract_ticker_from_itick_cfd(contract_symbol))
+                    itick_cfd_rows.append(contract_symbol)
                 continue
             raise ContractQuoteUnavailable(f"provider {provider} ticker is unavailable")
         except Exception as exc:
@@ -4058,6 +4273,8 @@ def get_contract_tickers(
                     "ts": fallback.get("ts") if fallback else None,
                 }
             )
+    if itick_cfd_rows:
+        items.extend(_itick_cfd_tickers_from_symbols(db, itick_cfd_rows))
     if stock_contract_rows:
         code_by_symbol = {
             str(contract_symbol.symbol or "").upper(): _stock_provider_symbol_from_contract_symbol(
@@ -4081,7 +4298,7 @@ def get_contract_tickers(
         item_symbol = str(item.get("symbol") or "").upper()
         contract_symbol = row_by_symbol.get(item_symbol)
         status = (
-            _market_status_for_contract_symbol(contract_symbol)
+            _market_status_for_contract_symbol(contract_symbol, item)
             if contract_symbol is not None
             else _market_status_for_stock_contract_symbol()
         )
@@ -4157,6 +4374,9 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
         else:
             raise ContractQuoteUnavailable(f"provider {provider} depth is unavailable")
 
+        if provider == "ITICK":
+            market_status = _market_status_for_contract_symbol(contract_symbol, depth)
+            is_closed_market = _is_market_closed(market_status)
         depth["price_precision"] = int(getattr(contract_symbol, "price_precision", depth.get("price_precision") or 8) or 8)
         depth = _freeze_depth_if_closed(depth, market_status, limit=safe_limit, prefer_cached=not is_closed_market)
         if provider == "ITICK" and not is_closed_market and _quote_freshness_for_payload(depth) != QUOTE_FRESHNESS_LIVE:

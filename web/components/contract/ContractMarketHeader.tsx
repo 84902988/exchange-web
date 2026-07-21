@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
   useContractHeaderStoreSnapshot,
@@ -11,16 +11,17 @@ import type { ContractReferencePrice } from './contractPriceAuthority';
 
 export type ContractHeaderPriceDirection = 'up' | 'down' | 'flat';
 export type ContractHeaderQuoteStatusTone = 'loading' | 'live' | 'last' | 'expired' | 'unavailable';
-export type ContractHeaderMarketState = 'live' | 'pre_market' | 'after_hours' | 'closed' | 'holiday' | 'unavailable';
+export type ContractHeaderMarketState = 'loading' | 'live' | 'pre_market' | 'after_hours' | 'closed' | 'holiday' | 'unavailable';
 
 type ContractHeaderLabels = {
+  loading: string;
+  waitingForQuote: string;
   live: string;
   preMarket: string;
   afterHours: string;
   closed: string;
   holiday: string;
   unavailable: string;
-  fundingRate: string;
   trading: string;
   notTradable: string;
   bestBid: string;
@@ -29,52 +30,56 @@ type ContractHeaderLabels = {
 
 const HEADER_LABELS: Record<string, ContractHeaderLabels> = {
   en: {
+    loading: 'Loading',
+    waitingForQuote: 'Waiting for quote',
     live: 'Live',
     preMarket: 'Pre-market',
     afterHours: 'After-hours',
     closed: 'Closed',
     holiday: 'Market holiday',
     unavailable: 'Market data unavailable',
-    fundingRate: 'Funding Rate',
     trading: 'Trading',
     notTradable: 'Unavailable',
     bestBid: 'Best Bid',
     bestAsk: 'Best Ask',
   },
   zh: {
+    loading: '\u52a0\u8f7d\u4e2d',
+    waitingForQuote: '\u7b49\u5f85\u884c\u60c5',
     live: '\u5b9e\u65f6',
     preMarket: '\u76d8\u524d',
     afterHours: '\u76d8\u540e',
     closed: '\u95ed\u5e02\u4e2d',
     holiday: '\u4f11\u5e02\u4e2d',
     unavailable: '\u884c\u60c5\u6682\u4e0d\u53ef\u7528',
-    fundingRate: '\u8d44\u91d1\u8d39\u7387',
     trading: '\u4ea4\u6613\u4e2d',
     notTradable: '\u4e0d\u53ef\u4ea4\u6613',
     bestBid: '\u4e70\u4e00',
     bestAsk: '\u5356\u4e00',
   },
   'zh-TW': {
+    loading: '\u8f09\u5165\u4e2d',
+    waitingForQuote: '\u7b49\u5f85\u884c\u60c5',
     live: '\u5373\u6642',
     preMarket: '\u76e4\u524d',
     afterHours: '\u76e4\u5f8c',
     closed: '\u9589\u5e02\u4e2d',
     holiday: '\u4f11\u5e02\u4e2d',
     unavailable: '\u884c\u60c5\u66ab\u4e0d\u53ef\u7528',
-    fundingRate: '\u8cc7\u91d1\u8cbb\u7387',
     trading: '\u4ea4\u6613\u4e2d',
     notTradable: '\u4e0d\u53ef\u4ea4\u6613',
     bestBid: '\u8cb7\u4e00',
     bestAsk: '\u8ce3\u4e00',
   },
   ja: {
+    loading: '\u8aad\u307f\u8fbc\u307f\u4e2d',
+    waitingForQuote: '\u30ec\u30fc\u30c8\u5f85\u3061',
     live: '\u30ea\u30a2\u30eb\u30bf\u30a4\u30e0',
     preMarket: '\u30d7\u30ec\u30de\u30fc\u30b1\u30c3\u30c8',
     afterHours: '\u6642\u9593\u5916',
     closed: '\u9589\u5834\u4e2d',
     holiday: '\u4f11\u5834\u4e2d',
     unavailable: '\u5e02\u5834\u30c7\u30fc\u30bf\u3092\u5229\u7528\u3067\u304d\u307e\u305b\u3093',
-    fundingRate: '\u8cc7\u91d1\u8abf\u9054\u7387',
     trading: '\u53d6\u5f15\u4e2d',
     notTradable: '\u53d6\u5f15\u4e0d\u53ef',
     bestBid: '\u6700\u826f\u8cb7\u6c17\u914d',
@@ -345,6 +350,15 @@ export function resolveContractHeaderMarketPresentation({
     .filter(Boolean)
     .join(' ');
 
+  if (quoteStatusTone === 'loading') {
+    return {
+      state: 'loading',
+      label: labels.loading,
+      tradingLabel: labels.waitingForQuote,
+      dotClass: 'bg-[#f0b90b] animate-pulse',
+    };
+  }
+
   if (
     includesAny(statusLabel, ['PRE-MARKET', '\u76d8\u524d', '\u76e4\u524d', '\u30d7\u30ec\u30de\u30fc\u30b1\u30c3\u30c8'])
   ) {
@@ -471,6 +485,9 @@ export default function ContractMarketHeader({
 }: ContractMarketHeaderProps) {
   const { locale, t } = useLocaleContext();
   const [flash, setFlash] = useState(false);
+  const originalDocumentTitleRef = useRef<string | null>(null);
+  const titleUpdateTimerRef = useRef<number | null>(null);
+  const titleUpdatedAtRef = useRef(0);
   const labels = getHeaderLabels(locale);
   const storeSnapshot = useContractHeaderStoreSnapshot(marketSymbol);
   const legacyRead = useMemo<ContractHeaderLegacyRead>(() => ({
@@ -528,7 +545,6 @@ export default function ContractMarketHeader({
     displayPriceLabel: marketReadDisplayPriceLabel,
     markPrice,
     indexPrice,
-    fundingRate,
     bestBid,
     bestAsk,
     highLow24h,
@@ -569,6 +585,45 @@ export default function ContractMarketHeader({
     : !hasReferencePriceContract
       ? marketReadDisplayPriceLabel
       : legacyDisplayPriceLabel;
+  const displaySymbol = formatContractDisplaySymbol(marketSymbol);
+
+  useEffect(() => {
+    originalDocumentTitleRef.current = document.title || 'Royal Exchange';
+
+    return () => {
+      if (titleUpdateTimerRef.current !== null) {
+        window.clearTimeout(titleUpdateTimerRef.current);
+        titleUpdateTimerRef.current = null;
+      }
+      document.title = originalDocumentTitleRef.current || 'Royal Exchange';
+    };
+  }, []);
+
+  useEffect(() => {
+    const titlePrice = displayPrice && displayPrice !== '--' ? displayPrice : '';
+    const nextTitle = titlePrice
+      ? `${titlePrice} ${displaySymbol} 合约交易 | Royal Exchange`
+      : `${displaySymbol} 合约交易 | Royal Exchange`;
+    const now = Date.now();
+    const remainingMs = Math.max(1000 - (now - titleUpdatedAtRef.current), 0);
+    const applyTitle = () => {
+      document.title = nextTitle;
+      titleUpdatedAtRef.current = Date.now();
+      titleUpdateTimerRef.current = null;
+    };
+
+    if (titleUpdateTimerRef.current !== null) {
+      window.clearTimeout(titleUpdateTimerRef.current);
+      titleUpdateTimerRef.current = null;
+    }
+
+    if (remainingMs === 0) {
+      applyTitle();
+      return;
+    }
+
+    titleUpdateTimerRef.current = window.setTimeout(applyTitle, remainingMs);
+  }, [displayPrice, displaySymbol]);
 
   useEffect(() => {
     const differences = getContractHeaderReadDifferences(storeSnapshot, legacyRead);
@@ -605,7 +660,6 @@ export default function ContractMarketHeader({
 
   const priceColorClass = priceDirectionTextClass(priceDirection);
   const priceFlashClass = flash ? priceDirectionFlashClass(priceDirection) : '';
-  const displaySymbol = formatContractDisplaySymbol(marketSymbol);
   const changeValue = String(change || '').trim();
   const changeColorClass = changeValue.startsWith('+')
     ? 'text-[#00c087]'
@@ -658,7 +712,7 @@ export default function ContractMarketHeader({
           </div>
         </div>
 
-        <div className={`grid min-w-0 flex-1 grid-cols-2 gap-2 text-[12px] text-gray-300 md:grid-cols-4 xl:grid-cols-5 ${isTradfi ? '2xl:grid-cols-7' : '2xl:grid-cols-9'}`}>
+        <div className={`grid min-w-0 flex-1 grid-cols-2 gap-2 text-[12px] text-gray-300 md:grid-cols-4 ${isTradfi ? 'xl:grid-cols-[1.05fr_0.9fr_0.75fr_1.3fr_1.35fr_0.85fr_0.85fr]' : 'xl:grid-cols-8'}`}>
           <Metric
             label={t('tradeStatus', 'contracts')}
             testId="contract-header-market-status-card"
@@ -684,7 +738,6 @@ export default function ContractMarketHeader({
           {!isTradfi ? <Metric label={t('indexPrice', 'contracts')} testId="contract-header-index-price" value={indexPrice || '--'} /> : null}
           {!isTradfi ? (
             <>
-              <Metric label={labels.fundingRate} testId="contract-header-funding-rate" value={fundingRate || '--'} />
               <Metric label={labels.bestBid} testId="contract-header-best-bid" value={bestBid || '--'} />
               <Metric label={labels.bestAsk} testId="contract-header-best-ask" value={bestAsk || '--'} />
             </>
