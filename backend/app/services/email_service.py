@@ -22,6 +22,8 @@ def _build_client() -> DmClient:
         access_key_id=settings.ALIYUN_ACCESS_KEY_ID,
         access_key_secret=settings.ALIYUN_ACCESS_KEY_SECRET,
         region_id=settings.ALIYUN_DM_REGION,
+        connect_timeout=max(1000, int(settings.ALIYUN_DM_CONNECT_TIMEOUT_MS)),
+        read_timeout=max(1000, int(settings.ALIYUN_DM_READ_TIMEOUT_MS)),
     )
     # 你现在这样拼 endpoint 是没问题的
     config.endpoint = f"dm.{settings.ALIYUN_DM_REGION}.aliyuncs.com"

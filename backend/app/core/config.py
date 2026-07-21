@@ -166,6 +166,8 @@ class Settings(BaseSettings):
     ALIYUN_ACCESS_KEY_SECRET: str
 
     ALIYUN_DM_REGION: str = "ap-southeast-1"
+    ALIYUN_DM_CONNECT_TIMEOUT_MS: int = 5000
+    ALIYUN_DM_READ_TIMEOUT_MS: int = 10000
     # 阿里云控制台创建的发信地址
     ALIYUN_DM_ACCOUNT_NAME: str = "no-reply@royalex.world"
     # 发信人昵称
