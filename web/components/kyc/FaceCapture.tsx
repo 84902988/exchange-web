@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { kycService } from '@/lib/services/kycService';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import type { FaceVerificationResult } from '@/lib/api';
@@ -51,20 +51,20 @@ export default function FaceCapture({
       });
 
       streamRef.current = stream;
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.play();
-        setIsCameraActive(true);
-        setError(null);
-      }
+      setIsCameraActive(true);
+      setError(null);
     } catch (err) {
       setError(t('kycCaptureCameraAccessFailed', 'user'));
       console.error('Camera access failed:', err);
     }
   };
 
-  const closeCamera = () => {
+  const resetLiveness = useCallback(() => {
+    setLivenessStep(0);
+    setLivenessCompleted(false);
+  }, []);
+
+  const closeCamera = useCallback(() => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -77,25 +77,20 @@ export default function FaceCapture({
     setIsCameraActive(false);
     setFacePreview(null);
     resetLiveness();
-  };
-
-  const resetLiveness = () => {
-    setLivenessStep(0);
-    setLivenessCompleted(false);
-  };
+  }, [resetLiveness]);
 
   const startLiveness = () => {
     resetLiveness();
     setIsCapturing(true);
   };
 
-  const nextLivenessStep = () => {
+  const nextLivenessStep = useCallback(() => {
     if (livenessStep < livenessSteps.length - 1) {
       setLivenessStep((step) => step + 1);
     } else {
       setLivenessCompleted(true);
     }
-  };
+  }, [livenessStep, livenessSteps.length]);
 
   const captureFace = () => {
     if (!videoRef.current || !canvasRef.current) return;
@@ -150,8 +145,21 @@ export default function FaceCapture({
   };
 
   useEffect(() => {
-    return () => {
+    if (!isCameraActive || !videoRef.current || !streamRef.current) return;
+
+    const video = videoRef.current;
+    video.srcObject = streamRef.current;
+    void video.play().catch((err) => {
+      console.error('Camera playback failed:', err);
+      setError(t('kycCaptureCameraAccessFailed', 'user'));
       closeCamera();
+    });
+  }, [closeCamera, isCameraActive, t]);
+
+  useEffect(() => {
+    return () => {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
     };
   }, []);
 
@@ -169,7 +177,7 @@ export default function FaceCapture({
         clearTimeout(timer);
       }
     };
-  }, [isCapturing, livenessCompleted, livenessStep]);
+  }, [isCapturing, livenessCompleted, nextLivenessStep]);
 
   return (
     <div className="space-y-6">

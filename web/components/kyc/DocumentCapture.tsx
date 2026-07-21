@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, ChangeEvent } from 'react';
+import { useState, useRef, useEffect, ChangeEvent } from 'react';
 import { DocumentVerificationResult, KycDocumentUploadRequest } from '@/lib/api';
 import { kycService } from '@/lib/services/kycService';
 import { useLocaleContext } from '@/contexts/LocaleContext';
@@ -46,6 +46,7 @@ export default function DocumentCapture({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
   const supportedDocumentTypes = kycService.getSupportedDocumentTypes(countryCode);
   const requiresBackSide = supportedDocumentTypes.find((type) => type.type === selectedDocumentType)?.requiresBackSide || false;
@@ -92,26 +93,46 @@ export default function DocumentCapture({
     setError(null);
   };
 
-  const toggleCamera = async () => {
-    setShowCamera(!showCamera);
+  const stopCamera = () => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setShowCamera(false);
+  };
 
-    if (!showCamera) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.play();
-        }
-      } catch (err) {
-        setError(t('kycCaptureCameraAccessFailed', 'user'));
-        console.error('Camera access failed:', err);
-        setShowCamera(false);
-      }
-    } else if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach((track) => track.stop());
+  const toggleCamera = async () => {
+    if (showCamera) {
+      stopCamera();
+      return;
+    }
+
+    try {
+      streamRef.current = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      setShowCamera(true);
+      setError(null);
+    } catch (err) {
+      setError(t('kycCaptureCameraAccessFailed', 'user'));
+      console.error('Camera access failed:', err);
+      stopCamera();
     }
   };
+
+  useEffect(() => {
+    if (!showCamera || !videoRef.current || !streamRef.current) return;
+
+    const video = videoRef.current;
+    video.srcObject = streamRef.current;
+    void video.play().catch((err) => {
+      console.error('Camera playback failed:', err);
+      setError(t('kycCaptureCameraAccessFailed', 'user'));
+      stopCamera();
+    });
+  }, [showCamera, t]);
+
+  useEffect(() => () => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  }, []);
 
   const capturePhoto = () => {
     if (!videoRef.current || !canvasRef.current) return;
@@ -142,7 +163,7 @@ export default function DocumentCapture({
         setError(null);
       }
 
-      toggleCamera();
+      stopCamera();
     }, 'image/jpeg', 0.9);
   };
 
@@ -189,10 +210,11 @@ export default function DocumentCapture({
   return (
     <div className="space-y-6">
       <div>
-        <label className="block text-sm font-medium text-white mb-2">
+        <label htmlFor="kyc-document-type" className="block text-sm font-medium text-white mb-2">
           {t('kycCaptureDocumentType', 'user')}
         </label>
         <select
+          id="kyc-document-type"
           value={selectedDocumentType}
           onChange={handleDocumentTypeChange}
           className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-md text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
@@ -319,6 +341,7 @@ export default function DocumentCapture({
               ref={fileInputRef}
               type="file"
               accept="image/*"
+              aria-label={t('kycCaptureChooseFile', 'user')}
               onChange={handleFileChange}
               className="hidden"
             />

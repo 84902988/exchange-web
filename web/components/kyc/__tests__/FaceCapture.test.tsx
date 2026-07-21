@@ -3,6 +3,16 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import FaceCapture from '../FaceCapture';
 import { kycService } from '@/lib/services/kycService';
 
+jest.mock('@/contexts/LocaleContext', () => {
+  const translations = jest.requireActual('@/config/locales/zh.json') as Record<string, Record<string, string>>;
+
+  return {
+    useLocaleContext: () => ({
+      t: (key: string, namespace = 'common') => translations[namespace]?.[key] ?? key,
+    }),
+  };
+});
+
 // Mock the kycService
 jest.mock('@/lib/services/kycService', () => ({
   kycService: {
@@ -26,9 +36,22 @@ global.navigator.mediaDevices = {
 describe('FaceCapture Component', () => {
   const mockOnFaceVerified = jest.fn();
   const mockOnError = jest.fn();
+
+  beforeAll(() => {
+    jest.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined);
+    jest.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      drawImage: jest.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    jest.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation((callback) => {
+      callback(new Blob(['face'], { type: 'image/jpeg' }));
+    });
+    jest.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/jpeg;base64,dGVzdA==');
+  });
   
   beforeEach(() => {
     jest.clearAllMocks();
+    Object.defineProperty(HTMLVideoElement.prototype, 'videoWidth', { configurable: true, value: 1280 });
+    Object.defineProperty(HTMLVideoElement.prototype, 'videoHeight', { configurable: true, value: 720 });
   });
   
   it('renders correctly with initial state', () => {
@@ -58,10 +81,8 @@ describe('FaceCapture Component', () => {
     
     await waitFor(() => {
       expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalled();
+      expect(screen.getByText('开始活体检测')).toBeInTheDocument();
     });
-    
-    // Check if start liveness button is displayed
-    expect(screen.getByText('开始活体检测')).toBeInTheDocument();
   });
   
   it('handles start liveness detection', async () => {
@@ -161,6 +182,9 @@ describe('FaceCapture Component', () => {
     await waitFor(() => {
       fireEvent.click(screen.getByText('下一步'));
     });
+    await waitFor(() => {
+      fireEvent.click(screen.getByText('下一步'));
+    });
     
     // Wait for capture button to appear
     await waitFor(() => {
@@ -210,6 +234,9 @@ describe('FaceCapture Component', () => {
     
     // Mock completing all liveness steps
     fireEvent.click(screen.getByText('下一步'));
+    await waitFor(() => {
+      fireEvent.click(screen.getByText('下一步'));
+    });
     await waitFor(() => {
       fireEvent.click(screen.getByText('下一步'));
     });

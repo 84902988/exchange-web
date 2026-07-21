@@ -3,6 +3,16 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import DocumentCapture from '../DocumentCapture';
 import { kycService } from '@/lib/services/kycService';
 
+jest.mock('@/contexts/LocaleContext', () => {
+  const translations = jest.requireActual('@/config/locales/zh.json') as Record<string, Record<string, string>>;
+
+  return {
+    useLocaleContext: () => ({
+      t: (key: string, namespace = 'common') => translations[namespace]?.[key] ?? key,
+    }),
+  };
+});
+
 // Mock the kycService
 jest.mock('@/lib/services/kycService', () => ({
   kycService: {
@@ -18,6 +28,13 @@ jest.mock('@/lib/services/kycService', () => ({
 describe('DocumentCapture Component', () => {
   const mockOnDocumentVerified = jest.fn();
   const mockOnError = jest.fn();
+
+  beforeAll(() => {
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: jest.fn(() => 'blob:test-document'),
+    });
+  });
   
   beforeEach(() => {
     jest.clearAllMocks();
@@ -69,7 +86,7 @@ describe('DocumentCapture Component', () => {
     const file = new File(['test-content'], 'test.jpg', { type: 'image/jpeg' });
     
     // Mock the file input
-    const fileInput = screen.getByLabelText(/选择文件/i).closest('button')?.nextElementSibling as HTMLInputElement;
+    const fileInput = screen.getByLabelText(/选择文件/i) as HTMLInputElement;
     
     // Mock validation
     (kycService.validateDocumentQuality as jest.Mock).mockResolvedValue(80);
@@ -82,7 +99,7 @@ describe('DocumentCapture Component', () => {
     });
     
     // Check if preview is displayed
-    expect(screen.getByAltText('Document Preview')).toBeInTheDocument();
+    expect(screen.getByRole('img')).toBeInTheDocument();
   });
   
   it('shows error for low quality document', async () => {
@@ -99,7 +116,7 @@ describe('DocumentCapture Component', () => {
     const file = new File(['test-content'], 'test.jpg', { type: 'image/jpeg' });
     
     // Mock the file input
-    const fileInput = screen.getByLabelText(/选择文件/i).closest('button')?.nextElementSibling as HTMLInputElement;
+    const fileInput = screen.getByLabelText(/选择文件/i) as HTMLInputElement;
     
     // Mock validation with low score
     (kycService.validateDocumentQuality as jest.Mock).mockResolvedValue(40);
@@ -112,7 +129,7 @@ describe('DocumentCapture Component', () => {
     });
     
     // Check if error is displayed
-    expect(screen.getByText('文档质量较低，请重新拍摄或选择更清晰的照片')).toBeInTheDocument();
+    expect(screen.getByText('证件质量较低，请重新拍摄或选择更清晰的照片')).toBeInTheDocument();
   });
   
   it('handles verification button click', async () => {
@@ -129,7 +146,7 @@ describe('DocumentCapture Component', () => {
     const file = new File(['test-content'], 'test.jpg', { type: 'image/jpeg' });
     
     // Mock the file input
-    const fileInput = screen.getByLabelText(/选择文件/i).closest('button')?.nextElementSibling as HTMLInputElement;
+    const fileInput = screen.getByLabelText(/选择文件/i) as HTMLInputElement;
     
     // Mock validation
     (kycService.validateDocumentQuality as jest.Mock).mockResolvedValue(80);
@@ -183,7 +200,7 @@ describe('DocumentCapture Component', () => {
     const file = new File(['test-content'], 'test.jpg', { type: 'image/jpeg' });
     
     // Mock the file input
-    const fileInput = screen.getByLabelText(/选择文件/i).closest('button')?.nextElementSibling as HTMLInputElement;
+    const fileInput = screen.getByLabelText(/选择文件/i) as HTMLInputElement;
     
     // Mock validation
     (kycService.validateDocumentQuality as jest.Mock).mockResolvedValue(80);
