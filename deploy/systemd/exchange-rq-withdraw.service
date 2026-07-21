@@ -1,17 +1,31 @@
 [Unit]
 Description=Exchange RQ worker - withdraw
 After=network-online.target redis.service
-Wants=network-online.target
+Wants=network-online.target redis.service
+PartOf=exchange-backend.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/exchange-web/backend
 EnvironmentFile=/opt/exchange-web/backend/.env
+Environment=PYTHONUNBUFFERED=1
 User=exchange
 Group=exchange
 ExecStart=/opt/exchange-web/.venv/bin/python scripts/start_rq_worker.py withdraw
 Restart=always
 RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

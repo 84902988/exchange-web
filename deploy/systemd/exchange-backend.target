@@ -1,0 +1,19 @@
+[Unit]
+Description=Exchange backend API, workers, schedulers, and scanners
+Wants=exchange-api.service
+Wants=exchange-rq-email.service exchange-rq-withdraw.service exchange-rq-payout.service exchange-rq-release.service
+Wants=exchange-rq-tx-confirm.service exchange-rq-collection.service exchange-rq-gas.service exchange-rq-maintenance.service
+Wants=exchange-withdraw-fee-scheduler.service exchange-collection-auto-scheduler.service
+Wants=exchange-spot-match-worker.service exchange-dealer-loop.service
+Wants=exchange-liquidation-scanner.service exchange-tp-sl-scanner.service
+Wants=exchange-contract-limit-order-scanner.service exchange-contract-accounting-reconciliation-scheduler.service
+After=exchange-api.service
+After=exchange-rq-email.service exchange-rq-withdraw.service exchange-rq-payout.service exchange-rq-release.service
+After=exchange-rq-tx-confirm.service exchange-rq-collection.service exchange-rq-gas.service exchange-rq-maintenance.service
+After=exchange-withdraw-fee-scheduler.service exchange-collection-auto-scheduler.service
+After=exchange-spot-match-worker.service exchange-dealer-loop.service
+After=exchange-liquidation-scanner.service exchange-tp-sl-scanner.service
+After=exchange-contract-limit-order-scanner.service exchange-contract-accounting-reconciliation-scheduler.service
+
+[Install]
+WantedBy=multi-user.target
