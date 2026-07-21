@@ -2,7 +2,7 @@
 
 import Image from 'next/image';
 import Link from 'next/link';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 
 import { menuConfig, Language } from '@/config/menuConfig';
@@ -15,12 +15,13 @@ import { getAnnouncementUnreadCount } from '@/lib/api/modules/announcements';
 import MobileMenu from './MobileMenu';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import enTranslations from '@/config/locales/en.json';
+import HeaderMarketSearch from './HeaderMarketSearch';
+import { DEFAULT_SITE_LOGO_URL, resolveSiteLogoUrl } from '@/lib/siteLogo';
 
-const FALLBACK_LOGO_URL = fallbackSiteConfig.logo_url || '/icons/logo-1.svg';
+const FALLBACK_LOGO_URL = fallbackSiteConfig.logo_url || DEFAULT_SITE_LOGO_URL;
 const FALLBACK_SITE_NAME = fallbackSiteConfig.site_name || 'Royal Exchange';
 const FALLBACK_SITE_SLOGAN = fallbackSiteConfig.site_slogan || '';
 const DEFAULT_COMMON_TRANSLATIONS = (enTranslations as { common: Record<string, string> }).common;
-
 
 export default function Header() {
   const { isLoggedIn } = useAuth();
@@ -33,6 +34,8 @@ export default function Header() {
   const [mounted, setMounted] = useState(false);
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const menuTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchButtonRef = useRef<HTMLButtonElement>(null);
+  const previousRouteKeyRef = useRef(`${pathname}?${searchKey}`);
 
   const [showModal, setShowModal] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
@@ -87,7 +90,7 @@ export default function Header() {
       .then((config) => {
         if (cancelled) return;
         setSiteBrand({
-          logoUrl: config.logo_url || FALLBACK_LOGO_URL,
+          logoUrl: resolveSiteLogoUrl(config.logo_url),
           siteName: config.site_name || FALLBACK_SITE_NAME,
           siteSlogan: config.site_slogan ?? FALLBACK_SITE_SLOGAN,
           appAndroidQrUrl: config.app_android_qr_url || '',
@@ -157,12 +160,17 @@ export default function Header() {
   };
 
   useEffect(() => {
+    const routeKey = `${pathname}?${searchKey}`;
+    if (previousRouteKeyRef.current === routeKey) return;
+    previousRouteKeyRef.current = routeKey;
+
     const timer = setTimeout(() => {
       if (menuTimerRef.current) {
         clearTimeout(menuTimerRef.current);
         menuTimerRef.current = null;
       }
       setActiveMenu(null);
+      setShowSearch(false);
     }, 0);
     return () => clearTimeout(timer);
   }, [pathname, searchKey]);
@@ -200,7 +208,8 @@ export default function Header() {
     setShowModal(false);
   };
 
-  const handleSearchClick = () => setShowSearch((v) => !v);
+  const handleSearchClick = useCallback(() => setShowSearch((visible) => !visible), []);
+  const handleCloseSearch = useCallback(() => setShowSearch(false), []);
 
   const handleDownloadHover = () => setShowQR(true);
   const handleDownloadLeave = () => setShowQR(false);
@@ -322,9 +331,13 @@ export default function Header() {
 
           <div className="relative">
             <button
+              ref={searchButtonRef}
+              type="button"
               onClick={handleSearchClick}
               className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
               aria-label={headerT('search')}
+              aria-expanded={showSearch}
+              aria-controls="header-market-search-results"
             >
               <Image src="/icons/header-search-1.svg" alt={headerT('search')} width={11} height={11} className="h-[11px] w-[11px] object-contain" />
             </button>
@@ -492,27 +505,9 @@ export default function Header() {
         menuItems={menuConfig.items}
       />
 
-      {showSearch && (
-        <div className="border-b border-white/10 bg-[#0a0a0d] px-3.5 py-3">
-          <div className="mx-auto max-w-7xl">
-            <div className="relative">
-              <input
-                type="text"
-                placeholder={headerT('searchPlaceholder')}
-                className="h-10 w-full rounded-md border border-white/15 bg-white/10 px-4 py-2 text-sm text-white placeholder-white/50 outline-none focus:border-amber-500 transition-colors duration-200"
-                autoFocus
-              />
-              <button
-                onClick={handleSearchClick}
-                className="absolute right-3 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center text-white/50 hover:text-white transition-colors duration-200"
-                aria-label={headerT('closeSearch')}
-              >
-                {'\u00d7'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {showSearch ? (
+        <HeaderMarketSearch onClose={handleCloseSearch} triggerRef={searchButtonRef} />
+      ) : null}
     </>
   );
 }

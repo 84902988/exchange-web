@@ -41,6 +41,9 @@ const CATEGORY_LABEL_KEYS: Record<string, string> = {
   CONTRACT: 'contract',
 }
 
+const TRADE_BUTTON_CLASS =
+  'inline-flex min-w-[72px] items-center justify-center whitespace-nowrap rounded-full bg-[#f0b90b] px-3 py-1.5 text-xs font-semibold text-black transition-colors hover:bg-[#f8c83d]'
+
 export function toNumber(value: unknown): number | null {
   const nextValue = Number(value)
   return Number.isFinite(nextValue) ? nextValue : null
@@ -380,7 +383,7 @@ export default function MarketsTable({
             event.stopPropagation()
             goTrade(row)
           }}
-          className="inline-flex min-w-[72px] items-center justify-end whitespace-nowrap text-xs font-medium text-[#f0b90b] transition-colors hover:text-[#f8c83d]"
+          className={TRADE_BUTTON_CLASS}
         >
           {t('tradeNow', 'markets')}
         </button>
@@ -437,11 +440,7 @@ export default function MarketsTable({
             event.stopPropagation()
             goTrade(row)
           }}
-          className={
-            isCryptoTable
-              ? 'inline-flex min-w-[72px] items-center justify-end whitespace-nowrap text-xs font-medium text-[#f0b90b] transition-colors hover:text-[#f8c83d]'
-              : 'inline-flex min-w-[72px] items-center justify-center whitespace-nowrap rounded-full bg-[#f0b90b] px-3 py-1.5 text-xs font-semibold text-black transition-colors hover:bg-[#f8c83d]'
-          }
+          className={TRADE_BUTTON_CLASS}
         >
           {t('tradeNow', 'markets')}
         </button>

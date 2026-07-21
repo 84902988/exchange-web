@@ -32,6 +32,11 @@ import {
   readSharedMarketsRowsCache,
   writeSharedMarketsRowsCache,
 } from '@/lib/marketCache'
+import { readContractSelectorTickerCache } from '@/lib/contractSelectorTickerCache'
+import {
+  buildMarketsTickerRefreshTasks,
+  runMarketsTickerRefreshTasks,
+} from '@/lib/marketsRefreshScheduler'
 import { toStockContractSymbol } from '@/lib/stockContracts'
 import { useLocaleContext } from '@/contexts/LocaleContext'
 
@@ -52,12 +57,13 @@ type SecondaryTab =
 type UrlMarketView = 'DEFAULT' | 'RWA'
 type MarketsTranslator = (key: string, namespace?: 'markets') => string
 
-const TICKER_REFRESH_INTERVAL_MS = 5000
+const TICKER_REFRESH_INTERVAL_MS = 15_000
 const METADATA_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 const PAIRS_PAGE_SIZE = 100
 const TICKER_BATCH_SIZE = 50
 const TICKER_CHUNK_CONCURRENCY = 3
-const CONTRACT_TICKER_BATCH_SIZE = 25
+const CONTRACT_TICKER_BATCH_SIZE = 20
+const INITIAL_PRIORITY_TICKER_LIMIT = 24
 
 let marketsRowsCache: MarketTickerItem[] = []
 let marketsLastUpdatedCache: Date | null = null
@@ -279,11 +285,56 @@ function writeMarketsRowsCache(rows: MarketTickerItem[], lastUpdated: Date | nul
   writeSharedMarketsRowsCache(rows, lastUpdated)
 }
 
+function seedContractTickerCacheFromSelector() {
+  readContractSelectorTickerCache().forEach((item) => {
+    contractTickerCache.set(item.symbol, {
+      symbol: item.symbol,
+      last_price: item.price,
+      price_change_24h: item.priceChange24h,
+      price_change_percent_24h:
+        item.change24h ?? item.percentChange24h ?? item.priceChangePercent,
+      high_24h: item.high24h,
+      low_24h: item.low24h,
+      base_volume_24h: item.baseVolume24h,
+      quote_volume_24h: item.quoteVolume24h ?? item.volume24h,
+      market_status: item.marketStatus ?? undefined,
+      market_status_text: item.marketStatusText,
+      quote_freshness: item.quoteFreshness ?? undefined,
+    })
+  })
+}
+
+function seedTickerCachesFromRows(rows: MarketTickerItem[]) {
+  rows.forEach((row) => {
+    if (isContractRow(row) && !isMockStockContractRow(row)) {
+      contractTickerCache.set(getSymbolKey(row.symbol), {
+        symbol: getSymbolKey(row.symbol),
+        last_price: row.last_price,
+        price_change_24h: row.price_change_24h,
+        price_change_percent_24h: row.price_change_percent_24h ?? row.change_24h,
+        high_24h: row.high_24h,
+        low_24h: row.low_24h,
+        base_volume_24h: row.base_volume_24h,
+        quote_volume_24h: row.quote_volume_24h,
+        market_status: row.market_status ?? undefined,
+        market_status_text: row.market_status_text,
+        quote_freshness: row.quote_freshness ?? undefined,
+        source: typeof row.source === 'string' ? row.source : undefined,
+        ts: typeof row.ts === 'string' ? row.ts : undefined,
+      })
+      return
+    }
+    spotTickerCache.set(getTickerLookupSymbol(row), row)
+  })
+}
+
 function ensureMarketsRowsCacheLoaded() {
   if (marketsRowsCacheLoaded) return
   marketsRowsCacheLoaded = true
 
   const cached = readMarketsRowsCache()
+  if (cached) seedTickerCachesFromRows(cached.rows)
+  seedContractTickerCacheFromSelector()
   if (!cached) return
 
   marketsRowsCache = applyTickerCaches(cached.rows)
@@ -575,24 +626,42 @@ function applyTickerCaches(baseRows: MarketTickerItem[]): MarketTickerItem[] {
 }
 
 async function fetchAllSpotPairs(): Promise<SpotMarketPairItem[]> {
-  const allPairs: SpotMarketPairItem[] = []
-  let page = 1
-  let total = 0
+  const firstPage = await getSpotMarketPairs({
+    marketType: 'spot',
+    category: 'all',
+    quote: 'all',
+    page: 1,
+    pageSize: PAIRS_PAGE_SIZE,
+  })
+  const pageSize = Math.max(1, Number(firstPage.page_size || PAIRS_PAGE_SIZE))
+  const pageCount = Math.min(20, Math.ceil(Number(firstPage.total || 0) / pageSize))
+  if (pageCount <= 1) return firstPage.items
 
-  do {
-    const payload = await getSpotMarketPairs({
+  const remainingPages = await Promise.all(
+    Array.from({ length: pageCount - 1 }, (_, index) => getSpotMarketPairs({
       marketType: 'spot',
       category: 'all',
       quote: 'all',
-      page,
-      pageSize: PAIRS_PAGE_SIZE,
-    })
-    allPairs.push(...payload.items)
-    total = payload.total
-    page += 1
-  } while (allPairs.length < total && page < 20)
+      page: index + 2,
+      pageSize,
+    })),
+  )
+  return [firstPage, ...remainingPages].flatMap((page) => page.items)
+}
 
-  return allPairs
+async function fetchAllContractSymbols(): Promise<ContractSymbolItem[]> {
+  const firstPage = await getContractSymbols({ page: 1, page_size: PAIRS_PAGE_SIZE })
+  const pageSize = Math.max(1, Number(firstPage.page_size || PAIRS_PAGE_SIZE))
+  const pageCount = Math.min(20, Math.ceil(Number(firstPage.total || 0) / pageSize))
+  if (pageCount <= 1) return firstPage.items
+
+  const remainingPages = await Promise.all(
+    Array.from({ length: pageCount - 1 }, (_, index) => getContractSymbols({
+      page: index + 2,
+      page_size: pageSize,
+    })),
+  )
+  return [firstPage, ...remainingPages].flatMap((page) => page.items)
 }
 
 function mergeRowsBySymbol(rows: MarketTickerItem[]): MarketTickerItem[] {
@@ -620,15 +689,6 @@ async function hydrateSpotTickerChunk(symbols: string[]): Promise<MarketTickerIt
 
 function uniqueSymbols(symbols: string[]): string[] {
   return Array.from(new Set(symbols.map(getSymbolKey).filter(Boolean)))
-}
-
-function chunkItems<T>(items: T[], size: number): T[][] {
-  const chunks: T[][] = []
-  const safeSize = Math.max(1, size)
-  for (let index = 0; index < items.length; index += safeSize) {
-    chunks.push(items.slice(index, index + safeSize))
-  }
-  return chunks
 }
 
 function buildRowsFromSpotPairs(spotPairs: SpotMarketPairItem[], t: MarketsTranslator): MarketTickerItem[] {
@@ -685,6 +745,30 @@ function getSlowContractSymbols(rows: MarketTickerItem[]): string[] {
       .filter((row) => isContractRow(row) && !isMockStockContractRow(row) && !isCryptoContractRow(row))
       .map((row) => getSymbolKey(row.symbol)),
   )
+}
+
+function getInitialPriorityTickerSymbols(symbolGroups: string[][]): string[] {
+  const normalizedGroups = symbolGroups.map(uniqueSymbols)
+  const available = new Set(normalizedGroups.flat())
+  const selected = SUMMARY_SYMBOLS.filter((symbol) => available.has(getSymbolKey(symbol)))
+  const selectedSet = new Set(selected)
+  let groupIndex = 0
+
+  while (selected.length < INITIAL_PRIORITY_TICKER_LIMIT) {
+    let appended = false
+    for (const group of normalizedGroups) {
+      const symbol = group[groupIndex]
+      if (!symbol || selectedSet.has(symbol)) continue
+      selected.push(symbol)
+      selectedSet.add(symbol)
+      appended = true
+      if (selected.length >= INITIAL_PRIORITY_TICKER_LIMIT) break
+    }
+    if (!appended && normalizedGroups.every((group) => groupIndex >= group.length - 1)) break
+    groupIndex += 1
+  }
+
+  return selected
 }
 
 function filterByPrimary(rows: MarketTickerItem[], primaryTab: PrimaryTab): MarketTickerItem[] {
@@ -829,7 +913,7 @@ function getEmptyText(
 }
 
 function MarketsPageContent() {
-  const { locale, t } = useLocaleContext()
+  const { t } = useLocaleContext()
   const searchParams = useSearchParams()
   const categoryParam = searchParams.get('category') || ''
   const subParam = searchParams.get('sub') || ''
@@ -846,76 +930,98 @@ function MarketsPageContent() {
   const [loading, setLoading] = useState(() => marketsRowsCache.length === 0)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(() => marketsLastUpdatedCache)
-  const [hasMounted, setHasMounted] = useState(false)
   const metadataInFlightRef = useRef(false)
   const tickerInFlightRef = useRef(false)
   const pendingTickerRefreshRef = useRef(false)
   const tickerRequestIdRef = useRef(0)
 
-  const commitRows = useCallback((nextRows: MarketTickerItem[], lastUpdatedAt: Date | null = new Date()) => {
+  const commitRows = useCallback((
+    nextRows: MarketTickerItem[],
+    lastUpdatedAt: Date | null = new Date(),
+    persist = true,
+  ) => {
     const dedupedRows = mergeRowsBySymbol(nextRows)
     marketsRowsCache = dedupedRows
     marketsLastUpdatedCache = lastUpdatedAt
     rowsRef.current = dedupedRows
     setRows(dedupedRows)
-    setLastUpdated(lastUpdatedAt)
-    writeMarketsRowsCache(dedupedRows, lastUpdatedAt)
+    if (persist) {
+      writeMarketsRowsCache(dedupedRows, lastUpdatedAt)
+    }
   }, [])
 
   const refreshTickers = useCallback(async (sourceRows?: MarketTickerItem[]) => {
     if (tickerInFlightRef.current) {
-      pendingTickerRefreshRef.current = true
+      // Metadata changes must be replayed. Periodic ticks may be dropped while
+      // an existing refresh is running so a slow provider cannot create a loop.
+      if (sourceRows?.length) pendingTickerRefreshRef.current = true
       return
     }
 
     const baseRows = sourceRows?.length ? sourceRows : rowsRef.current
     if (baseRows.length === 0) return
+    const shouldCommitProgressively = Boolean(sourceRows?.length)
 
     tickerInFlightRef.current = true
     pendingTickerRefreshRef.current = false
     setRefreshing(true)
     const tickerRequestId = tickerRequestIdRef.current + 1
     tickerRequestIdRef.current = tickerRequestId
+    let successfulTaskCount = 0
 
-    const commitIfCurrent = (nextRows: MarketTickerItem[]) => {
+    const commitIfCurrent = (nextRows: MarketTickerItem[], persist = false) => {
       if (tickerRequestIdRef.current !== tickerRequestId) return
-      commitRows(nextRows, new Date())
+      commitRows(nextRows, new Date(), persist)
     }
 
-    const runSpotTickerChunks = async (symbols: string[]) => {
-      const chunks = chunkItems(uniqueSymbols(symbols), TICKER_BATCH_SIZE)
-      for (let index = 0; index < chunks.length; index += TICKER_CHUNK_CONCURRENCY) {
-        const group = chunks.slice(index, index + TICKER_CHUNK_CONCURRENCY)
-        await Promise.allSettled(
-          group.map(async (chunk) => {
-            const tickerRows = await hydrateSpotTickerChunk(chunk)
-            commitIfCurrent(mergeTickerIntoRows(rowsRef.current, tickerRows))
-          }),
-        )
-      }
-    }
-
-    const runContractTickerChunks = async (symbols: string[], batchSize = CONTRACT_TICKER_BATCH_SIZE) => {
-      const chunks = chunkItems(uniqueSymbols(symbols), batchSize)
-      for (let index = 0; index < chunks.length; index += TICKER_CHUNK_CONCURRENCY) {
-        const group = chunks.slice(index, index + TICKER_CHUNK_CONCURRENCY)
-        await Promise.allSettled(
-          group.map(async (chunk) => {
-            const payload = await getContractTickers({ symbols: chunk, limit: chunk.length })
-            payload.items.forEach((item) => contractTickerCache.set(getSymbolKey(item.symbol), item))
-            commitIfCurrent(applyTickerCaches(rowsRef.current))
-          }),
-        )
-      }
-    }
+    const cryptoSpotSymbols = getCryptoSpotTickerSymbols(baseRows)
+    const cryptoContractSymbols = getCryptoContractSymbols(baseRows)
+    const tradfiSpotSymbols = getSlowSpotTickerSymbols(baseRows)
+    const tradfiContractSymbols = getSlowContractSymbols(baseRows)
+    const tasks = buildMarketsTickerRefreshTasks({
+      prioritySymbols: getInitialPriorityTickerSymbols([
+        cryptoSpotSymbols,
+        cryptoContractSymbols,
+        tradfiSpotSymbols,
+        tradfiContractSymbols,
+      ]),
+      cryptoSpotSymbols,
+      cryptoContractSymbols,
+      tradfiSpotSymbols,
+      tradfiContractSymbols,
+      spotBatchSize: TICKER_BATCH_SIZE,
+      contractBatchSize: CONTRACT_TICKER_BATCH_SIZE,
+    })
 
     try {
-      await runSpotTickerChunks(getCryptoSpotTickerSymbols(baseRows))
-      await runContractTickerChunks(getCryptoContractSymbols(rowsRef.current))
-      await runSpotTickerChunks(getSlowSpotTickerSymbols(rowsRef.current))
-      await runContractTickerChunks(getSlowContractSymbols(rowsRef.current), 12)
-      commitIfCurrent(applyTickerCaches(rowsRef.current))
+      const results = await runMarketsTickerRefreshTasks(
+        tasks,
+        async (task) => {
+          if (task.market === 'spot') {
+            const tickerRows = await hydrateSpotTickerChunk(task.symbols)
+            successfulTaskCount += 1
+            if (shouldCommitProgressively) {
+              commitIfCurrent(mergeTickerIntoRows(rowsRef.current, tickerRows))
+            }
+            return
+          }
+
+          const payload = await getContractTickers({ symbols: task.symbols, limit: task.symbols.length })
+          payload.items.forEach((item) => contractTickerCache.set(getSymbolKey(item.symbol), item))
+          successfulTaskCount += 1
+          if (shouldCommitProgressively) {
+            commitIfCurrent(applyTickerCaches(rowsRef.current))
+          }
+        },
+        TICKER_CHUNK_CONCURRENCY,
+      )
+      const failedTaskCount = results.filter((result) => result.status === 'rejected').length
+      if (failedTaskCount > 0) {
+        console.warn(`Markets ticker refresh completed with ${failedTaskCount} failed batch(es)`)
+      }
+      if (successfulTaskCount > 0) {
+        commitIfCurrent(applyTickerCaches(rowsRef.current), true)
+      }
     } finally {
       if (tickerRequestIdRef.current === tickerRequestId) {
         tickerInFlightRef.current = false
@@ -944,59 +1050,31 @@ function MarketsPageContent() {
 
     try {
       setError('')
-
-      const loadSpotRows = async () => {
-        try {
-          const spotPairs = await fetchAllSpotPairs()
-          if (requestIdRef.current !== requestId) return true
-
-          const nextRows = applyTickerCaches(
-            mergeRowsBySymbol([
-              ...buildRowsFromSpotPairs(spotPairs, t),
-              ...getContractMetadataRows(rowsRef.current),
-            ]),
-          )
-          commitRows(nextRows, new Date())
-          setLoading(false)
-          void refreshTickers(nextRows)
-          return true
-        } catch {
-          return false
-        }
-      }
-
-      const loadContractRows = async () => {
-        try {
-          const contractSymbols = await getContractSymbols({ page_size: PAIRS_PAGE_SIZE })
-          if (requestIdRef.current !== requestId) return true
-
-          const contractRows = contractSymbols.items.map((item) =>
-            buildContractRow(item, contractTickerCache.get(getSymbolKey(item.symbol)), t),
-          )
-          const nextRows = applyTickerCaches(
-            mergeRowsBySymbol([
-              ...getSpotMetadataRows(rowsRef.current),
-              ...contractRows,
-            ]),
-          )
-          commitRows(nextRows, new Date())
-          setLoading(false)
-          void refreshTickers(nextRows)
-          return true
-        } catch {
-          return false
-        }
-      }
-
       const [spotResult, contractResult] = await Promise.allSettled([
-        loadSpotRows(),
-        loadContractRows(),
+        fetchAllSpotPairs(),
+        fetchAllContractSymbols(),
       ])
-      const spotOk = spotResult.status === 'fulfilled' && spotResult.value
-      const contractOk = contractResult.status === 'fulfilled' && contractResult.value
+      if (requestIdRef.current !== requestId) return
+
+      const spotOk = spotResult.status === 'fulfilled'
+      const contractOk = contractResult.status === 'fulfilled'
       if (!spotOk && !contractOk && rowsRef.current.length === 0) {
         setError(t('marketLoadFailed', 'markets'))
+        return
       }
+
+      const spotRows = spotOk
+        ? buildRowsFromSpotPairs(spotResult.value, t)
+        : getSpotMetadataRows(rowsRef.current)
+      const contractRows = contractOk
+        ? contractResult.value.map((item) =>
+            buildContractRow(item, contractTickerCache.get(getSymbolKey(item.symbol)), t),
+          )
+        : getContractMetadataRows(rowsRef.current)
+      const nextRows = applyTickerCaches(mergeRowsBySymbol([...spotRows, ...contractRows]))
+      commitRows(nextRows, marketsLastUpdatedCache, true)
+      setLoading(false)
+      void refreshTickers(nextRows)
     } finally {
       metadataInFlightRef.current = false
       setLoading(false)
@@ -1007,13 +1085,11 @@ function MarketsPageContent() {
   }, [commitRows, refreshTickers, t])
 
   useEffect(() => {
-    setHasMounted(true)
     ensureMarketsRowsCacheLoaded()
     if (marketsRowsCache.length === 0) return
 
     rowsRef.current = marketsRowsCache
     setRows(marketsRowsCache)
-    setLastUpdated(marketsLastUpdatedCache)
     setLoading(false)
   }, [])
 
@@ -1027,7 +1103,12 @@ function MarketsPageContent() {
 
     const refreshMarketTickers = () => {
       if (!mounted) return
-      void refreshTickers(rowsRef.current)
+      if (document.visibilityState !== 'visible') return
+      void refreshTickers()
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') refreshMarketTickers()
     }
 
     void refreshMetadata()
@@ -1035,11 +1116,13 @@ function MarketsPageContent() {
       void refreshMetadata()
     }, METADATA_REFRESH_INTERVAL_MS)
     const tickerTimer = window.setInterval(refreshMarketTickers, TICKER_REFRESH_INTERVAL_MS)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
 
     return () => {
       mounted = false
       window.clearInterval(metadataTimer)
       window.clearInterval(tickerTimer)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
   }, [loadMarketsMetadata, refreshTickers])
   useEffect(() => {
@@ -1106,10 +1189,6 @@ function MarketsPageContent() {
 
   const secondaryTabs = getSecondaryTabs(primaryTab)
   const emptyText = getEmptyText(primaryTab, secondaryTab, urlMarketView, t)
-  const updatedTimeLabel =
-    hasMounted && lastUpdated
-      ? lastUpdated.toLocaleTimeString(locale === 'zh-TW' ? 'zh-TW' : locale === 'ja' ? 'ja-JP' : locale === 'en' ? 'en-US' : 'zh-CN')
-      : '--'
   const primaryTabLabel = (key: PrimaryTab, fallback: string) => {
     const map: Record<PrimaryTab, string> = {
       ALL: 'all',
@@ -1165,10 +1244,9 @@ function MarketsPageContent() {
             </p>
           </div>
 
-          <div className="text-[12px] tabular-nums text-white/45">
-            {t('updatedAt', 'markets')}：{updatedTimeLabel}
-            {refreshing && rows.length > 0 ? <span className="ml-2 text-[#f0b90b]">{t('updating', 'common')}</span> : null}
-          </div>
+          {refreshing && rows.length > 0 ? (
+            <div className="text-[12px] text-[#f0b90b]">{t('updating', 'common')}</div>
+          ) : null}
         </section>
 
         {visibleSummaryRows.length > 0 ? (
