@@ -1,4 +1,5 @@
 import { publicRequest } from "@/lib/api/core/request";
+import { DEFAULT_SITE_LOGO_URL } from "@/lib/siteLogo";
 import { getContentApiLanguage, withContentLanguage } from "@/lib/api/core/locale";
 import type { Language } from "@/utils/language";
 
@@ -118,7 +119,7 @@ export type LegalPageContent = {
 export const fallbackSiteConfig: SiteConfig = {
   site_name: "Royal Exchange",
   site_slogan: "",
-  logo_url: "/icons/logo-1.svg",
+  logo_url: DEFAULT_SITE_LOGO_URL,
   support_email: "",
   risk_disclaimer: "",
   footer_disclaimer: "",

@@ -9,9 +9,23 @@ export const metadata: Metadata = {
   title: "Royal Exchange",
   description: "",
   icons: {
-    icon: "/icons/logo-1.svg",
-    shortcut: "/icons/logo-1.svg",
-    apple: "/icons/logo-1.svg",
+    icon: [
+      {
+        url: "/icons/royal-exchange-favicon-32.png?v=20260721",
+        type: "image/png",
+        sizes: "32x32",
+      },
+      {
+        url: "/favicon.ico?v=20260721",
+        type: "image/x-icon",
+      },
+    ],
+    shortcut: "/favicon.ico?v=20260721",
+    apple: {
+      url: "/icons/royal-exchange-apple-touch-icon.png?v=20260721",
+      type: "image/png",
+      sizes: "180x180",
+    },
   },
 };
 
@@ -32,6 +46,9 @@ export default function RootLayout({
                   var locale = localStorage.getItem('language') || localStorage.getItem('locale');
                   if (locale && locale !== 'en') {
                     document.documentElement.classList.add('locale-preload');
+                    window.setTimeout(function(){
+                      document.documentElement.classList.remove('locale-preload');
+                    }, 1500);
                   }
                 } catch (e) {}
               })();
