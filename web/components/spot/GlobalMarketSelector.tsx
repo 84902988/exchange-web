@@ -18,6 +18,10 @@ import {
 import type { MarketTickerItem } from '@/lib/api/modules/market';
 import { readSharedMarketsRowsCache } from '@/lib/marketCache';
 import { readContractQuoteCache } from '@/lib/contractMarketCache';
+import {
+  readContractSelectorTickerCache,
+  writeContractSelectorTickerCache,
+} from '@/lib/contractSelectorTickerCache';
 import { formatSpotDisplaySymbol } from './spotFormat';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
@@ -151,7 +155,8 @@ const SPOT_TICKER_BATCH_SIZE = 30;
 const SPOT_TICKER_PRELOAD_SIZE = 50;
 const PAIRS_PAGE_SIZE = 100;
 const CONTRACT_TICKER_BATCH_SIZE = 25;
-const STOCK_CONTRACT_TICKER_BATCH_SIZE = 12;
+const STOCK_CONTRACT_TICKER_BATCH_SIZE = 20;
+const CONTRACT_TICKER_PREWARM_SIZE = 20;
 const CONTRACT_TICKER_REFRESH_TTL_MS = 25_000;
 const STOCK_CONTRACT_TICKER_REFRESH_TTL_MS = 60_000;
 const VISIBLE_TICKER_LOAD_DEBOUNCE_MS = 350;
@@ -170,6 +175,23 @@ const contractTickerCacheStore = new Map<string, GlobalMarketSelectorPair>();
 const contractTickerHydratingStore = new Set<string>();
 const contractTickerFetchedAtStore = new Map<string, number>();
 const contractTickerBatchHydratingStore = new Set<string>();
+const contractTickerSubscribers = new Set<() => void>();
+let contractTickerPersistenceSeeded = false;
+
+function notifyContractTickerSubscribers() {
+  contractTickerSubscribers.forEach((subscriber) => subscriber());
+}
+
+function seedPersistedContractTickerCacheOnce(): number {
+  if (contractTickerPersistenceSeeded) return 0;
+  contractTickerPersistenceSeeded = true;
+  const persistedItems = readContractSelectorTickerCache();
+  persistedItems.forEach(({ updatedAt, ...ticker }) => {
+    contractTickerCacheStore.set(ticker.symbol, ticker);
+    contractTickerFetchedAtStore.set(ticker.symbol, updatedAt);
+  });
+  return persistedItems.length;
+}
 
 function appendMarketSuffix(value: string, suffix: string): string {
   const base = String(value || '').trim();
@@ -518,6 +540,38 @@ function getEmptyPairText(marketTab: MarketLayerTab, t: (key: string, namespace?
   if (marketTab === 'stock') return t('noStockContracts', 'markets');
   if (marketTab === 'cfd') return t('noCfdPairs', 'markets');
   return t('noPairs', 'markets');
+}
+
+export function getContractTickerPrefetchSymbols(
+  pairs: GlobalMarketSelectorPair[],
+  currentSymbol: string,
+  limit = CONTRACT_TICKER_PREWARM_SIZE,
+): string[] {
+  const safeLimit = Math.max(1, Math.min(Math.floor(limit || CONTRACT_TICKER_PREWARM_SIZE), CONTRACT_TICKER_BATCH_SIZE));
+  const contractPairs = pairs.filter(
+    (pair) => getPairMarket(pair) === 'contract' && !isMockStockContractPair(pair),
+  );
+  const current = contractPairs.find((pair) => normalize(pair.symbol) === normalize(currentSymbol)) || null;
+  const sameClass = current
+    ? contractPairs.filter((pair) => {
+        if (isStockContractPair(current)) return isStockContractPair(pair);
+        if (isTradfiCfdPair(current)) return isTradfiCfdPair(pair);
+        return isCryptoContractPair(pair);
+      })
+    : contractPairs;
+  const sameSubClass = current && isTradfiCfdPair(current)
+    ? sameClass.filter((pair) => normalizeAssetClass(pair) === normalizeAssetClass(current))
+    : sameClass;
+
+  return mergeUniquePairs(
+    current ? [current] : [],
+    sameSubClass,
+    sameClass,
+    contractPairs,
+  )
+    .map((pair) => normalize(pair.symbol))
+    .filter(Boolean)
+    .slice(0, safeLimit);
 }
 
 function formatPercent(value?: string | number | null): string {
@@ -890,17 +944,29 @@ function mergePairsWithContractTickerCache(
 ): GlobalMarketSelectorPair[] {
   return pairs.map((pair) => {
     const ticker = tickerCache.get(pair.symbol);
-    if (ticker) return mergePairMarketData(pair, ticker);
-
     const quoteCache = readContractQuoteCache(pair.symbol);
-    if (quoteCache.lastPrice) {
-      return mergePairMarketData(pair, {
+    const quote = quoteCache.quote as unknown as Record<string, unknown> | null;
+    const quoteTicker = quoteCache.lastPrice || quote
+      ? {
         symbol: pair.symbol,
         price: quoteCache.lastPrice,
-      });
-    }
+        change24h: optionalTickerValue(quote?.price_change_percent_24h ?? quote?.change_24h),
+        percentChange24h: optionalTickerValue(quote?.percent_change_24h),
+        priceChangePercent: optionalTickerValue(quote?.price_change_percent_24h),
+        priceChange24h: optionalTickerValue(quote?.price_change_24h),
+        volume24h: optionalTickerValue(quote?.quote_volume_24h ?? quote?.base_volume_24h),
+        baseVolume24h: optionalTickerValue(quote?.base_volume_24h),
+        quoteVolume24h: optionalTickerValue(quote?.quote_volume_24h),
+        high24h: optionalTickerValue(quote?.high_24h),
+        low24h: optionalTickerValue(quote?.low_24h),
+        marketStatus: typeof quote?.market_status === 'string' ? quote.market_status : null,
+        marketStatusText: typeof quote?.market_status_text === 'string' ? quote.market_status_text : null,
+        quoteFreshness: typeof quote?.quote_freshness === 'string' ? quote.quote_freshness : null,
+      } satisfies GlobalMarketSelectorPair
+      : null;
 
-    return pair;
+    const tickerMerged = ticker ? mergePairMarketData(pair, ticker) : pair;
+    return quoteTicker ? mergePairMarketData(tickerMerged, quoteTicker) : tickerMerged;
   });
 }
 
@@ -926,8 +992,8 @@ function cacheContractTickerItems(
   tickerCache: Map<string, GlobalMarketSelectorPair>,
   tickers: ContractTickerItem[],
   fetchedAt?: Map<string, number>,
-): boolean {
-  let changed = false;
+): GlobalMarketSelectorPair[] {
+  const cachedItems: GlobalMarketSelectorPair[] = [];
   const now = Date.now();
 
   tickers.forEach((ticker) => {
@@ -935,11 +1001,11 @@ function cacheContractTickerItems(
     if (option) {
       tickerCache.set(option.symbol, option);
       fetchedAt?.set(option.symbol, now);
-      changed = true;
+      cachedItems.push(option);
     }
   });
 
-  return changed;
+  return cachedItems;
 }
 
 function seedSelectorCachesFromSharedRows(params: {
@@ -1276,6 +1342,24 @@ export default function GlobalMarketSelector({
   }, [interval, intervalOptions, onIntervalChange]);
 
   useEffect(() => {
+    const subscriber = () => {
+      setContractTickerCacheVersion((value) => value + 1);
+      setContractTickerHydratingVersion((value) => value + 1);
+    };
+    contractTickerSubscribers.add(subscriber);
+    subscriber();
+    return () => {
+      contractTickerSubscribers.delete(subscriber);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (seedPersistedContractTickerCacheOnce() > 0) {
+      notifyContractTickerSubscribers();
+    }
+  }, []);
+
+  useEffect(() => {
     if (!open) {
       wasOpenRef.current = false;
       return;
@@ -1372,47 +1456,93 @@ export default function GlobalMarketSelector({
     if (selectedSymbols.length === 0) return;
 
     selectedSymbols.forEach((item) => contractTickerHydratingRef.current.add(item));
-    setContractTickerHydratingVersion((value) => value + 1);
+    notifyContractTickerSubscribers();
 
     const loadTickers = async () => {
-      let changed = false;
       try {
+        const batches: string[][] = [];
         for (let index = 0; index < selectedSymbols.length; index += safeBatchSize) {
-          const batch = selectedSymbols.slice(index, index + safeBatchSize);
-          const batchKey = batch.join(',');
-          if (contractTickerBatchHydratingRef.current.has(batchKey)) {
-            continue;
-          }
-          contractTickerBatchHydratingRef.current.add(batchKey);
-          try {
-            const response = await getContractTickers({ symbols: batch, limit: batch.length });
-            changed = cacheContractTickerItems(
-              contractTickerCacheRef.current,
-              response.items,
-              contractTickerFetchedAtRef.current,
-            ) || changed;
-          } catch (error) {
-            console.warn('GlobalMarketSelector contract ticker batch warning:', error);
-          } finally {
-            const fetchedAt = Date.now();
-            batch.forEach((item) => contractTickerFetchedAtRef.current.set(item, fetchedAt));
-            contractTickerBatchHydratingRef.current.delete(batchKey);
-          }
+          batches.push(selectedSymbols.slice(index, index + safeBatchSize));
         }
-
-        if (changed) {
-          setContractTickerCacheVersion((value) => value + 1);
-        }
+        let nextBatchIndex = 0;
+        const workerCount = Math.min(2, batches.length);
+        const workers = Array.from({ length: workerCount }, async () => {
+          while (nextBatchIndex < batches.length) {
+            const batchIndex = nextBatchIndex;
+            nextBatchIndex += 1;
+            const batch = batches[batchIndex];
+            const batchKey = batch.join(',');
+            if (contractTickerBatchHydratingRef.current.has(batchKey)) {
+              batch.forEach((item) => contractTickerHydratingRef.current.delete(item));
+              notifyContractTickerSubscribers();
+              continue;
+            }
+            contractTickerBatchHydratingRef.current.add(batchKey);
+            try {
+              const response = await getContractTickers({ symbols: batch, limit: batch.length });
+              const cachedItems = cacheContractTickerItems(
+                contractTickerCacheRef.current,
+                response.items,
+                contractTickerFetchedAtRef.current,
+              );
+              if (cachedItems.length > 0) {
+                const updatedAt = Date.now();
+                writeContractSelectorTickerCache(cachedItems.map((item) => ({
+                  symbol: item.symbol,
+                  price: item.price,
+                  change24h: item.change24h,
+                  percentChange24h: item.percentChange24h,
+                  priceChangePercent: item.priceChangePercent,
+                  priceChange24h: item.priceChange24h,
+                  volume24h: item.volume24h,
+                  baseVolume24h: item.baseVolume24h,
+                  quoteVolume24h: item.quoteVolume24h,
+                  high24h: item.high24h,
+                  low24h: item.low24h,
+                  marketStatus: item.marketStatus,
+                  marketStatusText: item.marketStatusText,
+                  quoteFreshness: item.quoteFreshness,
+                  updatedAt,
+                })));
+              }
+            } catch (error) {
+              console.warn('GlobalMarketSelector contract ticker batch warning:', error);
+            } finally {
+              batch.forEach((item) => contractTickerHydratingRef.current.delete(item));
+              contractTickerBatchHydratingRef.current.delete(batchKey);
+              notifyContractTickerSubscribers();
+            }
+          }
+        });
+        await Promise.all(workers);
       } catch (error) {
         console.error('GlobalMarketSelector contract ticker load error:', error);
       } finally {
         selectedSymbols.forEach((item) => contractTickerHydratingRef.current.delete(item));
-        setContractTickerHydratingVersion((value) => value + 1);
+        notifyContractTickerSubscribers();
       }
     };
 
     void loadTickers();
   }, []);
+
+  const contractTickerPrewarmSymbols = useMemo(
+    () => getContractTickerPrefetchSymbols(externalPairItems, symbol, CONTRACT_TICKER_PREWARM_SIZE),
+    [externalPairItems, symbol],
+  );
+
+  useEffect(() => {
+    if (pageType !== 'contract' || contractTickerPrewarmSymbols.length === 0) return;
+    hydrateContractTickerSymbols(
+      contractTickerPrewarmSymbols,
+      CONTRACT_TICKER_PREWARM_SIZE,
+      {
+        ttlMs: currentPair && isStockContractPair(currentPair)
+          ? STOCK_CONTRACT_TICKER_REFRESH_TTL_MS
+          : CONTRACT_TICKER_REFRESH_TTL_MS,
+      },
+    );
+  }, [contractTickerPrewarmSymbols, currentPair, hydrateContractTickerSymbols, pageType]);
 
   const favoriteKeySet = useMemo(
     () => new Set(favoriteSymbols.map((item) => getFavoriteKey(item.symbol, item.market))),
@@ -1547,7 +1677,7 @@ export default function GlobalMarketSelector({
           DEFAULT_CONTRACT_PAIRS_CACHE_KEY,
         )?.length;
         const shouldPreloadSpotPairs = pageType === 'spot';
-        const shouldPreloadContractPairs = pageType === 'contract';
+        const shouldPreloadContractPairs = pageType === 'contract' && pairs === undefined;
         if (!shouldPreloadSpotPairs && !shouldPreloadContractPairs) return;
         if (
           (!shouldPreloadSpotPairs || hasDefaultSpotPairs) &&
@@ -1620,7 +1750,7 @@ export default function GlobalMarketSelector({
     return () => {
       cancelled = true;
     };
-  }, [contractPairsCacheKey, externalPairItems, hydrateTickerSymbols, marketDisplayLabels, pageType, spotPairsCacheKey]);
+  }, [contractPairsCacheKey, externalPairItems, hydrateTickerSymbols, marketDisplayLabels, pageType, pairs, spotPairsCacheKey]);
 
   useEffect(() => {
     if (!open) return;
@@ -1700,6 +1830,14 @@ export default function GlobalMarketSelector({
 
   useEffect(() => {
     if (!open || !needsContractRows) return;
+    if (
+      !pairKeyword &&
+      pairs !== undefined &&
+      externalPairItems.some(isContractMarketPair)
+    ) {
+      setContractPairsLoading(false);
+      return;
+    }
 
     const requestId = ++contractRequestIdRef.current;
     const cachedPairs =
@@ -1760,7 +1898,7 @@ export default function GlobalMarketSelector({
     };
 
     void loadContractPairs();
-  }, [contractPairCategory, contractPairQuote, contractPairsCacheKey, externalPairItems, marketDisplayLabels, needsContractRows, open, pairKeyword]);
+  }, [contractPairCategory, contractPairQuote, contractPairsCacheKey, externalPairItems, marketDisplayLabels, needsContractRows, open, pairKeyword, pairs]);
 
   const pairMatchesSearch = useCallback((pair: GlobalMarketSelectorPair, query: string) => {
     return pairMatchesSpotSelectorSearch(pair, query);
