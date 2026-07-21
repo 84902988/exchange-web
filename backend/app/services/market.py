@@ -1031,8 +1031,11 @@ def _get_internal_depth(db: Session, pair: TradingPair, limit: int = 20) -> Dept
         ts=_now_ms(),
         provider=None,
         stale=False,
-        source="INTERNAL" if bids or asks else "MISSING",
-        freshness="RECENT" if bids or asks else "MISSING",
+        # An empty internal order book is still an authoritative, current
+        # snapshot.  Marking it MISSING makes clients preserve stale levels
+        # instead of clearing fully filled/cancelled price levels.
+        source="INTERNAL",
+        freshness="RECENT",
     )
 
 

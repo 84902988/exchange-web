@@ -151,7 +151,8 @@ class SpotMarketGateway:
         self._candle_preview_reject_counts_by_symbol: dict[str, dict[str, int]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
-        self._task_lock = asyncio.Lock()
+        self._async_primitives_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._task_lock: Optional[asyncio.Lock] = None
         self._broadcast_state = SpotGatewayBroadcastState()
         self._kline_revision_high_water: dict[Any, tuple[int, int, int]] = {}
         self._kline_event_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -220,7 +221,7 @@ class SpotMarketGateway:
                 )
         except Exception:
             logger.warning("spot_market_gateway_ensure_provider_ws_failed symbol=%s", normalized_symbol, exc_info=True)
-        async with self._task_lock:
+        async with self._task_guard_lock():
             task = self._tasks.get(normalized_symbol)
             if task is not None and not task.done():
                 return
@@ -240,7 +241,7 @@ class SpotMarketGateway:
         subscriber_count = await self._subscriber_count(normalized_symbol)
         if subscriber_count > 0:
             return
-        async with self._task_lock:
+        async with self._task_guard_lock():
             idle_task = self._idle_tasks.get(normalized_symbol)
             if idle_task is not None and not idle_task.done():
                 return
@@ -254,7 +255,7 @@ class SpotMarketGateway:
             self._idle_tasks[normalized_symbol] = task
 
     async def get_metrics_snapshot(self) -> dict[str, Any]:
-        async with self._task_lock:
+        async with self._task_guard_lock():
             now = time.monotonic()
             active_symbols = sorted(
                 set(self._tasks.keys())
@@ -472,7 +473,7 @@ class SpotMarketGateway:
             logger.warning("spot_market_gateway_task_failed", exc_info=True)
 
     async def _cancel_idle_release(self, symbol: str) -> None:
-        async with self._task_lock:
+        async with self._task_guard_lock():
             task = self._idle_tasks.pop(symbol, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -482,7 +483,7 @@ class SpotMarketGateway:
         if not normalized_symbol:
             return
         loop = asyncio.get_running_loop()
-        async with self._task_lock:
+        async with self._task_guard_lock():
             self._kline_event_loop = loop
             self._kline_wakeup_events.setdefault(normalized_symbol, asyncio.Event())
             self._kline_emit_lock(normalized_symbol)
@@ -502,7 +503,32 @@ class SpotMarketGateway:
             return
         loop.call_soon_threadsafe(self._enqueue_provider_kline_revision, event)
 
+    def _ensure_async_primitives(self) -> None:
+        current_loop = asyncio.get_running_loop()
+        if self._async_primitives_loop is current_loop and self._task_lock is not None:
+            return
+
+        active_tasks = [
+            task
+            for task_map in (self._tasks, self._idle_tasks, self._kline_event_tasks)
+            for task in task_map.values()
+            if not task.done()
+        ]
+        if self._async_primitives_loop is not None and active_tasks:
+            raise RuntimeError("spot market gateway cannot switch event loops while tasks are active")
+
+        self._async_primitives_loop = current_loop
+        self._task_lock = asyncio.Lock()
+        self._kline_wakeup_events.clear()
+        self._kline_emit_locks.clear()
+
+    def _task_guard_lock(self) -> asyncio.Lock:
+        self._ensure_async_primitives()
+        assert self._task_lock is not None
+        return self._task_lock
+
     def _kline_emit_lock(self, symbol: str) -> asyncio.Lock:
+        self._ensure_async_primitives()
         normalized_symbol = normalize_spot_ws_symbol(symbol)
         return self._kline_emit_locks.setdefault(normalized_symbol, asyncio.Lock())
 
@@ -688,7 +714,7 @@ class SpotMarketGateway:
                 exc_info=True,
             )
         finally:
-            async with self._task_lock:
+            async with self._task_guard_lock():
                 task = self._kline_event_tasks.get(symbol)
                 if task is current_task:
                     self._kline_event_tasks.pop(symbol, None)
@@ -735,7 +761,7 @@ class SpotMarketGateway:
 
     async def _stop_kline_event_worker(self, symbol: str) -> None:
         normalized_symbol = normalize_spot_ws_symbol(symbol)
-        async with self._task_lock:
+        async with self._task_guard_lock():
             task = self._kline_event_tasks.pop(normalized_symbol, None)
             self._kline_wakeup_events.pop(normalized_symbol, None)
             self._kline_emit_locks.pop(normalized_symbol, None)
@@ -773,7 +799,7 @@ class SpotMarketGateway:
             subscriber_count = await self._subscriber_count(symbol)
             if subscriber_count > 0:
                 return
-            async with self._task_lock:
+            async with self._task_guard_lock():
                 refresh_task = self._tasks.pop(symbol, None)
                 if refresh_task is not None and not refresh_task.done():
                     refresh_task.cancel()
@@ -796,7 +822,7 @@ class SpotMarketGateway:
         except Exception:
             logger.warning("spot_market_gateway_release_failed symbol=%s", symbol, exc_info=True)
         finally:
-            async with self._task_lock:
+            async with self._task_guard_lock():
                 task = self._idle_tasks.get(symbol)
                 if task is asyncio.current_task():
                     self._idle_tasks.pop(symbol, None)
@@ -992,7 +1018,7 @@ class SpotMarketGateway:
         except Exception:
             logger.warning("spot_market_gateway_refresh_loop_failed symbol=%s", symbol, exc_info=True)
         finally:
-            async with self._task_lock:
+            async with self._task_guard_lock():
                 task = self._tasks.get(symbol)
                 if task is current_task:
                     self._tasks.pop(symbol, None)

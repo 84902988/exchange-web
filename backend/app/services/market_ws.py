@@ -1470,13 +1470,15 @@ class MarketWsManager:
             for item in getattr(depth, "asks", [])
         ]
         has_depth_levels = bool(bids or asks)
+        explicit_source = str(getattr(depth, "source", None) or "").strip().upper()
+        explicit_freshness = str(getattr(depth, "freshness", None) or "").strip().upper()
         depth_payload = {
             "symbol": getattr(depth, "symbol", symbol),
             "bids": bids,
             "asks": asks,
             "ts": getattr(depth, "ts", None),
-            "source": (getattr(depth, "source", None) or "INTERNAL") if has_depth_levels else "MISSING",
-            "freshness": (getattr(depth, "freshness", None) or "RECENT") if has_depth_levels else "MISSING",
+            "source": explicit_source or ("INTERNAL" if has_depth_levels else "MISSING"),
+            "freshness": explicit_freshness or ("RECENT" if has_depth_levels else "MISSING"),
             "stale": bool(getattr(depth, "stale", False)) if has_depth_levels else False,
         }
         for key in (
