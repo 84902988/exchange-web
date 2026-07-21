@@ -17,7 +17,12 @@ export type SharedMarketsRowsCache = {
 };
 
 function canUseStorage() {
-  return typeof window !== 'undefined' && !!window.localStorage;
+  if (typeof window === 'undefined') return false;
+  try {
+    return !!window.localStorage;
+  } catch {
+    return false;
+  }
 }
 
 export function getMarketCacheKey(kind: 'spot' | 'contract', symbol: string) {

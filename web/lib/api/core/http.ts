@@ -1,7 +1,7 @@
 import { request } from "./request";
 
 // GET
-export const apiGet = <T>(path: string): Promise<T> => {
+export const apiGet = <T,>(path: string): Promise<T> => {
   return request<T>(path, { method: "GET" });
 };
 
@@ -16,6 +16,6 @@ export const apiPut = <T, B = unknown>(path: string, body: B): Promise<T> => {
 };
 
 // DELETE
-export const apiDelete = <T>(path: string): Promise<T> => {
+export const apiDelete = <T,>(path: string): Promise<T> => {
   return request<T>(path, { method: "DELETE" });
 };

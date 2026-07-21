@@ -1,3 +1,11 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
+const path = require('path');
+const { discoverNodeNativeTests, toCrossPlatformPattern } = require('./scripts/test-file-discovery.cjs');
+
+const nodeNativeTestPatterns = discoverNodeNativeTests(__dirname).map((testPath) => (
+  toCrossPlatformPattern(path.relative(__dirname, testPath))
+));
+
 /** @type {import('jest').Config} */
 const config = {
   testEnvironment: 'jest-environment-jsdom',
@@ -23,6 +31,7 @@ const config = {
     }],
   },
   testMatch: ['**/__tests__/**/*.(js|jsx|ts|tsx)', '**/?(*.)+(spec|test).(js|jsx|ts|tsx)'],
+  testPathIgnorePatterns: nodeNativeTestPatterns,
   collectCoverageFrom: [
     'components/**/*.{js,jsx,ts,tsx}',
     'lib/**/*.{js,jsx,ts,tsx}',

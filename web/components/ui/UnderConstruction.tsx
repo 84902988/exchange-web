@@ -1,8 +1,10 @@
 'use client';
 
+import Image from 'next/image';
 import { ReactNode, useState, useEffect } from 'react';
 import { DEFAULT_LANGUAGE, getCurrentLanguage, getTranslatedLabel } from '@/utils/language';
 import { Language, LanguageChangedEvent } from '@/types';
+import { DEFAULT_SITE_LOGO_URL } from '@/lib/siteLogo';
 
 interface TranslatedText {
   en: string;
@@ -77,10 +79,12 @@ export default function UnderConstruction({
         {/* 装饰性图标或图像 */}
         <div className="mt-12 flex justify-center">
           <div className="w-40 h-40 rounded-full bg-white/10 flex items-center justify-center">
-            <img 
-              src="/icons/logo-1.svg" 
-              alt="Logo" 
-              className="w-20 h-20 object-contain" 
+            <Image
+              src={DEFAULT_SITE_LOGO_URL}
+              alt="Logo"
+              width={80}
+              height={80}
+              className="h-20 w-20 object-contain"
             />
           </div>
         </div>
