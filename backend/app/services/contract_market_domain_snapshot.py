@@ -181,6 +181,23 @@ def compare_contract_market_domain_snapshots(
 
     if (
         same_provider
+        and current_generation is None
+        and incoming_generation is not None
+        and incoming_metadata.transport == ContractMarketDomainTransport.PROVIDER_WS
+    ):
+        # A generation-bearing provider WebSocket frame is stronger authority
+        # than a generation-less REST bootstrap from the same provider. REST
+        # responses are stamped when this process receives them, so receive
+        # time alone must not let an older provider value replace live BBO.
+        return _authority_result(
+            accepted=True,
+            reason=ContractMarketDomainSnapshotAuthorityReason.NEW_GENERATION,
+            current=current,
+            incoming=incoming,
+        )
+
+    if (
+        same_provider
         and current_generation is not None
         and incoming_generation is not None
     ):
@@ -205,6 +222,22 @@ def compare_contract_market_domain_snapshots(
         and incoming_generation is None
         and incoming_metadata.transport == ContractMarketDomainTransport.PROVIDER_WS
     ):
+        return _authority_result(
+            accepted=False,
+            reason=ContractMarketDomainSnapshotAuthorityReason.OLD_GENERATION,
+            current=current,
+            incoming=incoming,
+        )
+
+    if (
+        same_provider
+        and current_generation is not None
+        and incoming_generation is None
+        and current_metadata.transport == ContractMarketDomainTransport.PROVIDER_WS
+        and not _snapshot_is_stale(current, now_ms=incoming.emitted_at_ms)
+    ):
+        # Preserve realtime provider authority while it is fresh. REST may
+        # become the fallback only after the WS winner has exceeded its TTL.
         return _authority_result(
             accepted=False,
             reason=ContractMarketDomainSnapshotAuthorityReason.OLD_GENERATION,
@@ -397,6 +430,7 @@ class ContractMarketDomainSnapshotContext:
 _LEGACY_SOURCE_MAP = {
     "LIVE_WS": ContractMarketDomainSource.LIVE_WS,
     "PROVIDER_WS": ContractMarketDomainSource.LIVE_WS,
+    "ITICK_LIVE_WS_DERIVED_BBO": ContractMarketDomainSource.LIVE_WS,
     "PROVIDER_REST": ContractMarketDomainSource.REST_SNAPSHOT,
     "ITICK_TICK": ContractMarketDomainSource.REST_SNAPSHOT,
     "ITICK_QUOTE": ContractMarketDomainSource.REST_SNAPSHOT,

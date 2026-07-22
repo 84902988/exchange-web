@@ -12,6 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from app.jobs.withdraw_fee_maintenance_scheduler import (  # noqa: E402
+    get_withdraw_fee_scheduler_heartbeat_payload,
     process_withdraw_fee_maintenance_scheduler_once,
     run_withdraw_fee_maintenance_scheduler_forever,
 )
@@ -31,7 +32,10 @@ def main(argv: list[str] | None = None) -> int:
         result = process_withdraw_fee_maintenance_scheduler_once()
         print(json.dumps(result, ensure_ascii=False, default=str))
         return 0 if result.get("ok") else 1
-    heartbeat_stop_event = start_heartbeat_thread("withdraw_fee_scheduler")
+    heartbeat_stop_event = start_heartbeat_thread(
+        "withdraw_fee_scheduler",
+        extra_payload_factory=get_withdraw_fee_scheduler_heartbeat_payload,
+    )
     try:
         run_withdraw_fee_maintenance_scheduler_forever()
     finally:

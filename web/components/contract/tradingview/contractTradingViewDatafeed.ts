@@ -36,6 +36,7 @@ import {
   buildContractKlineRangeKey,
   CONTRACT_KLINE_HISTORY_CHAIN_PAGE_LIMIT,
   getContractKlineLoadPolicy,
+  normalizeContractKlineLoadSymbol,
   resolveContractKlineRequestPlan,
 } from './contractKlineLoadPolicy';
 import {
@@ -302,7 +303,7 @@ const NON_PROVIDER_KLINE_SOURCE_TOKENS = new Set([
 ]);
 
 function normalizeContractSymbol(symbol: string) {
-  return String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+  return normalizeContractKlineLoadSymbol(symbol);
 }
 
 function normalizeContractInterval(interval: string) {
@@ -556,6 +557,16 @@ export function realtimePreviewMessageToInput(
   const previewSequence = positiveInteger(
     payload.preview_sequence ?? message.preview_sequence,
   );
+  const baselineSource = String(
+    payload.baseline_source ?? message.baseline_source ?? '',
+  ).trim().toUpperCase();
+  const baselineAnchorValue = (
+    payload.baseline_anchor_open_time
+    ?? message.baseline_anchor_open_time
+  );
+  const baselineAnchorOpenTime = baselineAnchorValue == null
+    ? null
+    : normalizeTimeMs(baselineAnchorValue);
   const epoch = nonNegativeInteger(payload.revision_epoch ?? baseRevision.epoch);
   const sequence = nonNegativeInteger(
     payload.revision_sequence ?? payload.revision_seq ?? baseRevision.sequence,
@@ -570,6 +581,15 @@ export function realtimePreviewMessageToInput(
     || generation === null
     || receivedAtMs === null
     || previewSequence === null
+    || !['NATIVE', 'TRADE_ROLLOVER'].includes(baselineSource)
+    || (
+      baselineSource === 'TRADE_ROLLOVER'
+      && baselineAnchorOpenTime === null
+    )
+    || (
+      baselineSource === 'NATIVE'
+      && baselineAnchorOpenTime !== null
+    )
     || epoch === null
     || sequence === null
     || open === null
@@ -589,6 +609,8 @@ export function realtimePreviewMessageToInput(
     receivedAtMs,
     previewSequence,
     baseNativeRevision: { epoch, sequence },
+    baselineSource: baselineSource as ContractPreviewInput['baselineSource'],
+    baselineAnchorOpenTime,
     bar: { time: openTime, open, high, low, close, volume },
   };
 }
@@ -929,6 +951,11 @@ export type HistoryCoverageState = {
   terminalReason: string | null;
 };
 
+type ValidHistoryRange = {
+  earliestBarTime: number;
+  latestBarTime: number;
+};
+
 type MonthlyHistoryTerminalCandidate = {
   datafeedInstanceId: number;
   symbol: string;
@@ -1245,6 +1272,7 @@ export function createContractTradingViewDatafeed({
   const requestGuard = new ContractKlineRequestGuard();
   const datafeedInstanceId = ++contractKlineDatafeedInstanceSequence;
   const historyCoverageByScope = new Map<string, HistoryCoverageState>();
+  const validHistoryRangeByScope = new Map<string, ValidHistoryRange>();
   const monthlyHistoryTerminalCandidates = new Map<string, MonthlyHistoryTerminalCandidate>();
   let subscriptionGeneration = 0;
   let subscriptionLeaseGeneration = 0;
@@ -1641,6 +1669,20 @@ export function createContractTradingViewDatafeed({
           historyCoverageByScope.set(requestGeneration, nextCoverageState);
         }
         const latestBar = bars[bars.length - 1] || null;
+        const earliestBar = bars[0] || null;
+        if (earliestBar && latestBar) {
+          const previousRange = validHistoryRangeByScope.get(requestGeneration) ?? null;
+          validHistoryRangeByScope.set(requestGeneration, {
+            earliestBarTime: Math.min(
+              previousRange?.earliestBarTime ?? earliestBar.time,
+              earliestBar.time,
+            ),
+            latestBarTime: Math.max(
+              previousRange?.latestBarTime ?? latestBar.time,
+              latestBar.time,
+            ),
+          });
+        }
         if (firstDataRequest) {
           const highWaterMark = getContractKlineHighWaterMark(latestBarKey);
           if (latestBar && latestBar.time >= highWaterMark) {
@@ -1880,6 +1922,23 @@ export function createContractTradingViewDatafeed({
         }
 
         if (bars.length === 0 && !terminalComplete) {
+          const validHistoryRange = validHistoryRangeByScope.get(requestGeneration) ?? null;
+          const isOlderEmptyBackfill = Boolean(
+            !firstDataRequest
+            && validHistoryRange
+            && requestedRangeEndTimeMs !== null
+            && requestedRangeEndTimeMs <= validHistoryRange.earliestBarTime
+            && isContractProviderEmptyHistory(result.lastMetadata)
+          );
+          if (isOlderEmptyBackfill) {
+            // TradingView may immediately ask for bars older than a provider's
+            // available stock/TradFi window.  Once this datafeed has already
+            // rendered valid bars for the same symbol and interval, treat that
+            // older empty page as a scoped history boundary.  Calling onError
+            // here discards the valid chart and surfaces "Symbol Error".
+            completeHistoryRequest([], true, nextCoverageState);
+            return;
+          }
           completeHistoryError(getContractHistoryErrorReason(result.lastMetadata));
           return;
         }
@@ -2182,6 +2241,32 @@ export function createContractTradingViewDatafeed({
         );
       };
 
+      const acceptPreviewMessage = (message: ContractMarketRealtimeMessage) => {
+        if (!getActiveSubscription()) return;
+        // Before history is committed there is no authoritative baseline for
+        // the preview compositor. The realtime client retains the latest
+        // symbol+interval preview and replayReadyStore applies it immediately
+        // after the Native baseline becomes ready.
+        if (historyReadyByLatestBarKey.get(latestBarKey) !== true) return;
+        const input = realtimePreviewMessageToInput(
+          message,
+          subscriptionSymbol,
+          interval,
+        );
+        if (!input) return;
+        const result = previewCompositor.acceptPreview(input);
+        if (!result.accepted || !result.bar) return;
+        emitRealtimeBar(result.bar, 'PREVIEW', 'preview');
+      };
+
+      const replayLatestPreview = () => {
+        const latestPreview = contractMarketRealtime.getLatestPreview({
+          symbol: subscriptionSymbol,
+          interval,
+        });
+        if (latestPreview) acceptPreviewMessage(latestPreview);
+      };
+
       const releaseLegacyKlineSubscription = contractMarketRealtime.subscribeKline({
         symbol: subscriptionSymbol,
         interval,
@@ -2217,18 +2302,7 @@ export function createContractTradingViewDatafeed({
         }
       });
       const releasePreviewSubscription = previewCompositor.supported
-        ? contractMarketRealtime.subscribe('preview', (message) => {
-            if (!getActiveSubscription()) return;
-            const input = realtimePreviewMessageToInput(
-              message,
-              subscriptionSymbol,
-              interval,
-            );
-            if (!input) return;
-            const result = previewCompositor.acceptPreview(input);
-            if (!result.accepted || !result.bar) return;
-            emitRealtimeBar(result.bar, 'PREVIEW', 'preview');
-          })
+        ? contractMarketRealtime.subscribe('preview', acceptPreviewMessage)
         : () => undefined;
       const releaseStoreKlineSubscription = subscribeContractMarketKlineEntry(
         subscriptionSymbol,
@@ -2249,12 +2323,9 @@ export function createContractTradingViewDatafeed({
           subscriptionSymbol,
           interval,
         ));
+        replayLatestPreview();
       };
-      handleStoreEntry(selectContractMarketKlineEntry(
-        contractMarketStore.getState(),
-        subscriptionSymbol,
-        interval,
-      ));
+      subscription.replayReadyStore();
 
       const readiness = getRealtimeSubscriptionReadiness(subscriptionSymbol, interval);
       if (!shouldResetRestoredBaseline && readiness?.ownerId === ownerId) {
@@ -2375,6 +2446,7 @@ export function createContractTradingViewDatafeed({
       requestGuard.destroy();
       contractKlineRequestLeaseRegistry.releaseOwner(String(datafeedInstanceId));
       historyCoverageByScope.clear();
+      validHistoryRangeByScope.clear();
       monthlyHistoryTerminalCandidates.clear();
       historyReadyByLatestBarKey.clear();
       const activeSubscriptions = Array.from(subscriptions.values());

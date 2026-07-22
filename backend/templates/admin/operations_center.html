@@ -3,11 +3,12 @@
 {% block title %}系统运行中心{% endblock %}
 {% block page_title %}系统运行中心{% endblock %}
 {% block page_subtitle %}
-  <div class="page-subtitle">集中查看 API、Redis、RQ 队列、常驻服务和失败任务状态。</div>
+  <div class="page-subtitle">集中查看 API、Redis、RQ 队列、常驻服务和失败注册状态。</div>
 {% endblock %}
 
 {% block page_actions %}
   <div class="ops-actions">
+    <a href="/admin/system/operations" class="btn secondary admin-btn admin-btn-secondary">刷新状态</a>
     <a href="/admin/system/rq" class="btn secondary admin-btn admin-btn-secondary">RQ 队列详情</a>
     <a href="/admin/system/services" class="btn secondary admin-btn admin-btn-secondary">服务总览</a>
     <a href="/admin/collections/center" class="btn secondary admin-btn admin-btn-secondary">归集中心</a>
@@ -157,7 +158,7 @@
       </div>
       <div class="stat-card">
         <div class="stat-card-head">
-          <div class="stat-label">失败任务</div>
+          <div class="stat-label">失败注册</div>
           <div class="stat-icon">F</div>
         </div>
         <div class="stat-value ops-number">{{ summary.failed_total }}</div>
@@ -188,7 +189,7 @@
         {% endif %}
       </div>
       <div class="ops-panel">
-        <div class="ops-panel-title">失败任务</div>
+        <div class="ops-panel-title">失败注册</div>
         {% if oc.failed_queue_rows %}
           <ul class="ops-list">
             {% for row in oc.failed_queue_rows %}
@@ -196,7 +197,7 @@
             {% endfor %}
           </ul>
         {% else %}
-          <div class="empty-state admin-empty">暂无失败任务</div>
+          <div class="empty-state admin-empty">暂无失败注册</div>
         {% endif %}
       </div>
       <div class="ops-panel">
@@ -217,7 +218,7 @@
   <section class="page-section">
     <div class="table-card">
       <div class="section-title">RQ 队列状态</div>
-      <p class="ops-table-note">展示核心队列的在线处理能力、积压和失败任务数量。</p>
+      <p class="ops-table-note">展示核心队列的在线处理能力、积压和 RQ FailedJobRegistry 数量；失败注册可能包含已过去的历史任务。</p>
       <div class="table-wrap admin-table-wrap">
         <table class="data-table admin-table">
           <thead>

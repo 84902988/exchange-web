@@ -77,6 +77,7 @@ export type BuildContractPriceAuthorityInput = {
   kline?: ContractKlineReferenceInput | null;
   ticker?: ContractTickerReferenceInput | null;
   execution?: ContractExecutionBookInput | null;
+  nowMs?: number;
 };
 
 export type ContractPriceAuthorityV1 = {
@@ -103,6 +104,8 @@ export type ResolvedContractExecutionPrice = {
 };
 
 const REFERENCE_FRESHNESSES = new Set(['LIVE', 'RECENT', 'FRESH', 'CURRENT']);
+const TRADE_MAX_QUOTE_LAG_MS = 60_000;
+const TRADE_MAX_FUTURE_SKEW_MS = 30_000;
 const KLINE_FRESHNESSES = new Set([...REFERENCE_FRESHNESSES, 'CACHED']);
 const NON_TRADING_TICKER_FRESHNESSES = new Set([
   ...KLINE_FRESHNESSES,
@@ -277,6 +280,41 @@ function buildTickerEvidence(
   };
 }
 
+function applyTradeOrderingGuard(
+  trade: ContractPriceEvidence,
+  kline: ContractPriceEvidence,
+  ticker: ContractPriceEvidence,
+  nowMs: number,
+): ContractPriceEvidence {
+  if (!trade.usable || trade.eventTimeMs === null) return trade;
+
+  let rejectReason: string | null = null;
+  if (trade.eventTimeMs > nowMs + TRADE_MAX_FUTURE_SKEW_MS) {
+    rejectReason = 'TRADE_TIME_IN_FUTURE';
+  } else if (
+    kline.usable
+    && kline.eventTimeMs !== null
+    && trade.eventTimeMs < kline.eventTimeMs
+  ) {
+    // Kline evidence uses the active provider bucket open time. A cached trade
+    // from an older bucket must never override the currently displayed candle.
+    rejectReason = 'TRADE_OLDER_THAN_KLINE';
+  } else if (
+    ticker.usable
+    && ticker.eventTimeMs !== null
+    && ticker.eventTimeMs - trade.eventTimeMs > TRADE_MAX_QUOTE_LAG_MS
+  ) {
+    // This primarily fences localStorage trade rows during rapid symbol
+    // revisit. A current quote may be newer than the latest real trade, but an
+    // entire minute of lag is no longer suitable as a live Header authority.
+    rejectReason = 'TRADE_TOO_OLD_FOR_QUOTE';
+  }
+
+  return rejectReason
+    ? { ...trade, usable: false, rejectReason }
+    : trade;
+}
+
 function selectReferencePrice(
   targetSymbol: string,
   trade: ContractPriceEvidence,
@@ -347,9 +385,16 @@ export function buildContractPriceAuthority(
   input: BuildContractPriceAuthorityInput,
 ): ContractPriceAuthorityV1 {
   const symbol = normalizeSymbol(input.symbol);
-  const trade = buildTradeEvidence(symbol, input.trade);
   const kline = buildKlineEvidence(symbol, input.kline);
   const ticker = buildTickerEvidence(symbol, input.ticker);
+  const trade = applyTradeOrderingGuard(
+    buildTradeEvidence(symbol, input.trade),
+    kline,
+    ticker,
+    typeof input.nowMs === 'number' && Number.isFinite(input.nowMs)
+      ? input.nowMs
+      : Date.now(),
+  );
   const executionFailure = executionRejectReason(symbol, input.execution);
   const executionBid = buildExecutionEvidence(symbol, input.execution, 'bid', executionFailure);
   const executionAsk = buildExecutionEvidence(symbol, input.execution, 'ask', executionFailure);

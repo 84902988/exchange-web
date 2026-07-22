@@ -489,7 +489,6 @@ export default function StockMarketDetailPage() {
               height={420}
               pricePrecision={2}
               referencePrice={chartReferencePrice}
-              preferReferencePriceOverlay
               onChartModeChange={setChartMode}
               onIntervalChange={setInterval}
             />

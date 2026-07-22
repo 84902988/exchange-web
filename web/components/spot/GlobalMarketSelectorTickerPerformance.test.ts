@@ -1,6 +1,8 @@
 import { describe, expect, it } from '@jest/globals';
 import {
   getContractTickerPrefetchSymbols,
+  resolveContractSelectorTickerAuthority,
+  resolveSelectorPricePrecision,
   type GlobalMarketSelectorPair,
 } from './GlobalMarketSelector';
 
@@ -50,5 +52,99 @@ describe('contract selector ticker prewarm priority', () => {
 
   it('excludes mock contracts that use the spot ticker path', () => {
     expect(getContractTickerPrefetchSymbols(pairs, 'MOCKUSDT_PERP', 10)).not.toContain('MOCKUSDT_PERP');
+  });
+});
+
+describe('contract selector ticker authority', () => {
+  it.each([
+    ['SPXUSDT_PERP', 'INDEX'],
+    ['EURUSD_PERP', 'FOREX'],
+    ['XAUUSDT_PERP', 'GOLD'],
+    ['BRENTUSDT_PERP', 'FUTURES'],
+    ['AAPLUSDT_PERP', 'STOCK'],
+  ])('keeps a fresh batch ticker over a stale local quote for %s (%s)', (symbol) => {
+    const resolved = resolveContractSelectorTickerAuthority({
+      batchTicker: {
+        symbol,
+        price: '7489.95',
+        change24h: '0.34',
+        quoteFreshness: 'LIVE',
+      },
+      batchUpdatedAt: 20_000,
+      quoteTicker: {
+        symbol,
+        price: '0.35',
+        change24h: '-0.61',
+        quoteFreshness: 'LAST_VALID',
+      },
+      quoteUpdatedAt: 30_000,
+    });
+
+    expect(resolved).toMatchObject({
+      symbol,
+      price: '7489.95',
+      change24h: '0.34',
+      quoteFreshness: 'LIVE',
+    });
+  });
+
+  it('uses the newer local quote when both sources have equal freshness', () => {
+    const resolved = resolveContractSelectorTickerAuthority({
+      batchTicker: {
+        symbol: 'BTCUSDT_PERP',
+        price: '66200.0',
+        quoteFreshness: 'LIVE',
+      },
+      batchUpdatedAt: 20_000,
+      quoteTicker: {
+        symbol: 'BTCUSDT_PERP',
+        price: '66201.5',
+        quoteFreshness: 'LIVE',
+      },
+      quoteUpdatedAt: 21_000,
+    });
+
+    expect(resolved?.price).toBe('66201.5');
+  });
+
+  it('keeps authoritative contract precision beside the winning ticker price', () => {
+    const resolved = resolveContractSelectorTickerAuthority({
+      batchTicker: {
+        symbol: 'EURUSD_PERP',
+        price: '1.14080',
+        displayPricePrecision: 5,
+        pricePrecision: 5,
+        quoteFreshness: 'LIVE',
+      },
+      batchUpdatedAt: 20_000,
+      quoteTicker: {
+        symbol: 'EURUSD_PERP',
+        price: '1.14079',
+        quoteFreshness: 'LIVE',
+      },
+      quoteUpdatedAt: 19_000,
+    });
+
+    expect(resolved).toMatchObject({
+      price: '1.14080',
+      displayPricePrecision: 5,
+      pricePrecision: 5,
+    });
+  });
+});
+
+describe('contract selector price precision fallback', () => {
+  it.each([
+    ['EURUSD_PERP', '1.14080', 5],
+    ['GBPUSD_PERP', '1.33811', 5],
+    ['USDJPY_PERP', '163.009', 3],
+  ])('does not collapse %s to an integer during cache warmup', (symbol, price, expected) => {
+    expect(resolveSelectorPricePrecision(price, {
+      symbol,
+      assetType: 'FOREX',
+      marketCategory: 'FOREX',
+      marketSubCategory: 'FOREX',
+      pricePrecision: 0,
+    })).toBe(expected);
   });
 });

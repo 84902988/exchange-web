@@ -832,3 +832,14 @@ def test_subscriber_recovers_after_redis_connection_failure():
     _run_async(run())
     assert len(manager.calls) == 1
     assert manager.calls[0][0:2] == (14, "BTCUSDT")
+
+
+def test_subscriber_heartbeat_failure_is_observability_only():
+    async def run():
+        def broken_heartbeat(_status: str, _dispatch_count: int):
+            raise RuntimeError("heartbeat unavailable")
+
+        subscriber = SpotPrivateEventSubscriber(heartbeat=broken_heartbeat)
+        await subscriber._beat("subscribed", 0)
+
+    _run_async(run())

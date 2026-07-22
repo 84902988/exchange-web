@@ -228,6 +228,81 @@ def test_live_tradfi_depth_bbo_is_not_disabled_by_a_stale_ticker_domain():
     assert view["raw_source_summary"]["executable"] is True
 
 
+def test_stale_tradfi_trade_cannot_override_live_bbo_display_price():
+    view = build_contract_market_view(
+        "XAGUSDT_PERP",
+        quote=_quote(
+            symbol="XAGUSDT_PERP",
+            provider="ITICK",
+            category="METAL",
+            bid_price="60.120",
+            ask_price="60.130",
+        ),
+        depth=_depth(
+            symbol="XAGUSDT_PERP",
+            provider="ITICK",
+            category="METAL",
+            best_bid="60.120",
+            best_ask="60.130",
+        ),
+        latest_kline=_kline(close="60.124"),
+        latest_trade={
+            "price": "59.500",
+            "price_source": "TRADE_TICK",
+            "source": "LIVE_WS",
+            "quote_freshness": "STALE",
+            "time": int((NOW - timedelta(seconds=2)).timestamp() * 1000),
+        },
+        contract_symbol=_contract(symbol="XAGUSDT_PERP", category="METAL", provider="ITICK"),
+        now=NOW,
+    )
+
+    assert view["display_state"] == "LIVE_TRADABLE"
+    assert view["display_price"] == "60.125"
+    assert view["display_price_source"] == "LIVE_MID"
+    assert view["last_trade_price"] == "59.500"
+    assert "latest_trade_not_display_eligible" in view["warnings"]
+
+
+def test_old_tradfi_trade_cannot_override_a_newer_native_kline_bucket():
+    view = build_contract_market_view(
+        "AAPLUSDT_PERP",
+        quote=_quote(
+            symbol="AAPLUSDT_PERP",
+            provider="ITICK",
+            category="STOCK",
+            bid_price="210.10",
+            ask_price="210.20",
+        ),
+        depth=_depth(
+            symbol="AAPLUSDT_PERP",
+            provider="ITICK",
+            category="STOCK",
+            best_bid="210.10",
+            best_ask="210.20",
+        ),
+        latest_kline=_kline(
+            open_time=int((NOW - timedelta(minutes=1)).timestamp() * 1000),
+            close="210.14",
+        ),
+        latest_trade={
+            "price": "205.00",
+            "price_source": "TRADE_TICK",
+            "source": "LIVE_WS",
+            "quote_freshness": "LIVE",
+            "time": int((NOW - timedelta(minutes=2)).timestamp() * 1000),
+        },
+        contract_symbol=_contract(symbol="AAPLUSDT_PERP", category="STOCK", provider="ITICK"),
+        now=NOW,
+    )
+
+    assert view["display_state"] == "LIVE_TRADABLE"
+    assert view["display_price"] == "210.15"
+    assert view["display_price_source"] == "LIVE_MID"
+    assert view["last_trade_price"] == "205.00"
+    assert "latest_trade_not_display_eligible" in view["warnings"]
+
+
 def test_tradfi_current_candle_uses_provider_bucket_not_server_now():
     provider_bucket = NOW + timedelta(minutes=1)
     view = build_contract_market_view(

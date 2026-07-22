@@ -61,7 +61,7 @@
           </div>
 
           <div class="field">
-            <label for="rcb_fee_discount_percent">RCB抵扣比例</label>
+            <label for="rcb_fee_discount_percent">RCB手续费支付比例</label>
             <input
               id="rcb_fee_discount_percent"
               type="text"
@@ -69,7 +69,7 @@
               value="{{ discount_percent_input }}"
               placeholder="75"
             />
-            <div class="spot-fee-help">按百分比填写，例如 75 表示按 USDT 手续费的 75% 折算扣 RCB。有效范围：大于 0 且不超过 100。</div>
+            <div class="spot-fee-help">按百分比填写，例如 25 表示启用 RCB 支付时按原 USDT 手续费的 25% 计算（即 2.5 折），不是减免 25%。有效范围：大于 0 且不超过 100。</div>
           </div>
 
           <div class="spot-fee-actions">
@@ -91,7 +91,7 @@
             </div>
           </div>
           <div class="spot-fee-summary-item">
-            <div class="spot-fee-label">抵扣比例</div>
+            <div class="spot-fee-label">手续费支付比例</div>
             <div class="spot-fee-value">{{ discount_percent_input }}%</div>
           </div>
         </div>

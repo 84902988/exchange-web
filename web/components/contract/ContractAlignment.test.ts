@@ -20,6 +20,9 @@ test('contract terminal reuses the shared selector and isolates symbol-scoped pr
   expect(source).toContain('onTradeHistoryFiltersChange({})');
   expect(source).toContain('function shouldUseInitialContractSymbol(symbol: string)');
   expect(source).toContain('return Boolean(symbol)');
+  expect(source).toContain('selectorDisplayPrice = referencePrice.usable');
+  expect(source).toContain('price: selectorDisplayPrice');
+  expect(source).toContain('if (item.symbol !== contractSymbol || selectorDisplayPrice === null) return item;');
 });
 
 test('contract browser title follows the symbol-scoped realtime display price', () => {
@@ -169,22 +172,22 @@ test('contract header receives authoritative MarketView status and does not synt
   expect(hookSource).not.toContain('chartLastClose');
 });
 
-test('tradfi TradingView line follows Header price while crypto keeps Kline/Price Authority fallback', () => {
+test('TradingView price line shares Header reference price without mutating candles', () => {
   const pageSource = readSource('app/contract/page.tsx');
+  const stockPageSource = readSource('app/markets/stocks/[symbol]/page.tsx');
   const chartSource = readSource('components/contract/ContractTradingViewChart.tsx');
 
   expect(pageSource).toMatch(/<ContractTradingViewChart[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
-  expect(pageSource).toContain(
-    'preferReferencePriceOverlay={currentContractUsesValuationPrice}',
-  );
+  expect(pageSource).not.toContain('preferReferencePriceOverlay=');
+  expect(stockPageSource).not.toContain('preferReferencePriceOverlay');
   expect(chartSource).toContain('referencePrice: ContractReferencePrice;');
-  expect(chartSource).toContain('preferReferencePriceOverlay?: boolean;');
+  expect(chartSource).not.toContain('preferReferencePriceOverlay');
   expect(chartSource).toContain('resolveContractTradingViewOverlayPrice(referencePrice, normalizedSymbol)');
   expect(chartSource).toContain('resolveContractTradingViewActiveOverlayPrice(');
   expect(chartSource).toContain('createContractTradingViewDatafeed({');
   expect(chartSource).toContain('onLatestBar: (price) => {');
   expect(chartSource).toContain('latestKlineOverlayRef.current = {');
-  expect(chartSource).toContain('preferReferencePriceOverlayRef.current,');
+  expect(chartSource).toContain('latestKlineOverlayRef.current.price,');
   expect(chartSource).toContain('onLatestKlineCloseChangeRef.current?.(price);');
 });
 
@@ -241,8 +244,22 @@ test('contract quote refreshes collapse short reconnect bursts without caching f
 
   expect(source).toContain('CONTRACT_QUOTE_REQUEST_DEDUPE_MS = 1_000');
   expect(source).toContain('if (existing?.promise) return existing.promise');
+  expect(source).toContain("contractQuoteRequestStore.get(contractSymbol)?.promise !== promise");
   expect(source).toContain('contractQuoteRequestStore.delete(contractSymbol)');
   expect(source).toContain('await loadContractQuote(contractSymbol)');
+});
+
+test('contract backend reconnect rotates shared authority and supersedes the interrupted MarketView request', () => {
+  const marketStateSource = readSource('components/contract/hooks/useContractMarketState.ts');
+  const marketViewSource = readSource('components/contract/hooks/useContractMarketView.ts');
+
+  expect(marketStateSource).toContain('if (transportRecovery.reconnectGeneration <= 0) return;');
+  expect(marketStateSource).toContain('restartContractMarketShadowSession(contractSymbol);');
+  expect(marketStateSource).toContain('contractQuoteRequestStore.delete(contractSymbol);');
+  expect(marketViewSource).toContain('marketViewAbortControllerRef.current?.abort();');
+  expect(marketViewSource).toContain('setWsState(null);');
+  expect(marketViewSource).toContain('setMarketSessionRefreshKey((value) => value + 1);');
+  expect(marketViewSource).toContain('void refreshMarketView();');
 });
 
 test('contract realtime keeps market symbol ownership separate from chart interval ownership', () => {
@@ -280,4 +297,58 @@ test('contract position tabs use the spot-style compact tab bar and reset scoped
   expect(source).toContain("setInternalScope('current')");
   expect(source).toContain('setTabPage(activeTab, 1)');
   expect(source).toContain('[currentSymbol, onScopeChange]');
+});
+
+test('contract position empty state does not draw an internal divider above the aligned panel bottom', () => {
+  const source = readSource('components/contract/ContractPositionTabs.tsx');
+  const emptyStateSource = source.slice(
+    source.indexOf('function EmptyState'),
+    source.indexOf('function withTimeout'),
+  );
+
+  expect(emptyStateSource).toContain('className="px-2 py-8 text-center"');
+  expect(emptyStateSource).not.toContain('border-b');
+  expect(emptyStateSource).not.toContain('border-white/10');
+});
+
+test('collapsed contract panels align while only the trading rail grows for expanded take-profit and stop-loss fields', () => {
+  const source = readSource('app/contract/page.tsx');
+  const formSource = readSource('components/contract/ContractTradingForm.tsx');
+  const marketPanelsTestId = 'data-testid="contract-market-panels"';
+  const railTestId = 'data-testid="contract-trading-account-rail"';
+  const marketPanelsStart = source.indexOf(marketPanelsTestId);
+  const railStart = source.indexOf(railTestId);
+  const tradingFormStart = source.indexOf('<ContractTradingForm', railStart);
+  const accountPanelStart = source.indexOf('<ContractAccountPanel', railStart);
+
+  expect(source).toContain(
+    'xl:grid-cols-[minmax(0,10.55fr)_minmax(260px,1.85fr)]',
+  );
+  expect(source).toContain(
+    "isTradingTpSlExpanded ? 'xl:items-start' : 'xl:items-stretch'",
+  );
+  expect(source).toContain(
+    'xl:grid-rows-[minmax(max(540px,62vh),max(540px,62vh))_minmax(170px,auto)] xl:items-stretch',
+  );
+  expect(source).toContain(
+    'className="flex min-h-0 min-w-0 flex-col gap-3 xl:col-start-2 xl:row-start-1"',
+  );
+  expect(marketPanelsStart).toBeGreaterThan(-1);
+  expect(railStart).toBeGreaterThan(-1);
+  expect(railStart).toBeGreaterThan(marketPanelsStart);
+  expect(tradingFormStart).toBeGreaterThan(railStart);
+  expect(accountPanelStart).toBeGreaterThan(tradingFormStart);
+  expect(source).toContain('onTpSlExpandedChange={handleTradingTpSlExpandedChange}');
+  expect(source).toContain('ref={tradingAccountRailRef}');
+  expect(source).toContain('style={collapsedTradingRailHeight ? { minHeight: `${collapsedTradingRailHeight}px` } : undefined}');
+  expect(source).toContain("if (!rail || typeof ResizeObserver === 'undefined') return undefined;");
+  expect(source).toContain('if (isTradingTpSlExpandedRef.current) return;');
+  expect(source).toContain('const lastRailSection = rail.lastElementChild;');
+  expect(source).toContain('lastRailSection.getBoundingClientRect().bottom - rail.getBoundingClientRect().top');
+  expect(source).toContain('Array.from(rail.children).forEach((section) => observer.observe(section));');
+  expect(formSource).toContain('onTpSlExpandedChange?: (expanded: boolean) => void;');
+  expect(formSource).toContain('onTpSlExpandedChange?.(enabled);');
+  expect(formSource).toContain('onChange={(event) => setTpSlEnabled(event.target.checked)}');
+  expect(source).not.toContain('xl:col-start-3 xl:row-span-2 xl:row-start-1');
+  expect(source).not.toContain('xl:grid-rows-[minmax(max(540px,62vh),auto)_minmax(170px,auto)]');
 });

@@ -104,6 +104,49 @@ test('real trade is the Contract chart reference price', () => {
   );
 });
 
+test('cached trade from an older provider candle cannot override the active Kline', () => {
+  const authority = buildContractPriceAuthority({
+    symbol: SYMBOL,
+    trade: realTrade({ time: NOW - 1 }),
+    kline: providerKline({ time: NOW }),
+    nowMs: NOW,
+  });
+
+  assert.equal(authority.reference_price.role, 'KLINE_CLOSE');
+  assert.equal(authority.reference_price.value, 2399.5);
+  assert.equal(authority.reference_price.domain, 'KLINE');
+});
+
+test('real trade inside the active provider candle remains the reference price', () => {
+  const authority = buildContractPriceAuthority({
+    symbol: SYMBOL,
+    trade: realTrade({ time: NOW + 10_000 }),
+    kline: providerKline({ time: NOW }),
+    nowMs: NOW + 10_000,
+  });
+
+  assert.equal(authority.reference_price.role, 'LAST_TRADE');
+  assert.equal(authority.reference_price.value, 2400.5);
+});
+
+test('cached trade more than one minute behind a live quote falls back to the ticker', () => {
+  const authority = buildContractPriceAuthority({
+    symbol: SYMBOL,
+    trade: realTrade({ time: NOW - 60_001 }),
+    ticker: closedTicker({
+      time: NOW,
+      freshness: 'LIVE',
+      marketStatus: 'OPEN',
+      marketSessionType: 'REGULAR',
+    }),
+    nowMs: NOW,
+  });
+
+  assert.equal(authority.reference_price.role, 'LAST_PRICE');
+  assert.equal(authority.reference_price.value, 2398.5);
+  assert.equal(authority.reference_price.domain, 'TICKER');
+});
+
 test('synthetic quote trade is rejected and provider KLINE_CLOSE is the only fallback', () => {
   const withFallback = buildContractPriceAuthority({
     symbol: SYMBOL,

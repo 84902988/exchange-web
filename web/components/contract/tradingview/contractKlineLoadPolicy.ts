@@ -93,7 +93,9 @@ export function normalizeContractKlineLoadInterval(value: unknown) {
   return normalized === '1M' ? '1M' : normalized.toLowerCase();
 }
 export function normalizeContractKlineLoadSymbol(value: unknown) {
-  return String(value ?? '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+  // A dot is part of valid provider symbols such as BRK.B. Keep the same
+  // canonical identity through range keys, cache keys, REST and realtime.
+  return String(value ?? '').trim().toUpperCase().replace(/[^A-Z0-9._-]/g, '');
 }
 
 export function getContractKlineLoadPolicy(interval: unknown): ContractKlineLoadPolicy {

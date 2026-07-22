@@ -1,3 +1,5 @@
+import { normalizeContractTimestampMs } from '../contractTimestamp';
+
 export type ContractMarketStoreDomain = 'ticker' | 'depth' | 'trades' | 'kline';
 
 export type ContractMarketStoreTransport = 'REST' | 'WS' | 'CACHE';
@@ -101,14 +103,7 @@ function normalizeNonNegativeNumber(value: unknown): number | null {
 }
 
 function normalizeTimestamp(value: unknown): number | null {
-  if (value === null || value === undefined || value === '') return null;
-  if (typeof value === 'string' && !Number.isFinite(Number(value))) {
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-  }
-  const normalized = Number(value);
-  if (!Number.isFinite(normalized) || normalized <= 0) return null;
-  return normalized < 1_000_000_000_000 ? normalized * 1000 : normalized;
+  return normalizeContractTimestampMs(value);
 }
 
 function normalizeRevision(

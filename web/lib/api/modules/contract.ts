@@ -305,6 +305,7 @@ export type ContractSymbolListResponse = {
 
 export type ContractTickerItem = {
   symbol: string
+  price_precision?: number | null
   market_status?: 'OPEN' | 'CLOSED' | 'UNKNOWN' | string
   market_status_text?: string | null
   market_session_code?: string | null

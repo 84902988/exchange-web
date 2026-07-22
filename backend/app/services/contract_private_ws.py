@@ -638,8 +638,9 @@ def _write_publish_health(redis: Redis, *, status: str, error: Exception | None 
 
 
 def _beat_contract_user_event_subscriber(status: str, *, dispatch_count: int = 0) -> None:
-    redis = _event_redis()
+    redis = None
     try:
+        redis = _event_redis()
         beat_service_heartbeat(
             redis,
             CONTRACT_USER_EVENT_SUBSCRIBER_SERVICE,
@@ -652,10 +653,11 @@ def _beat_contract_user_event_subscriber(status: str, *, dispatch_count: int = 0
     except Exception:
         logger.debug("contract_private_ws_subscriber_heartbeat_failed", exc_info=True)
     finally:
-        try:
-            redis.close()
-        except Exception:
-            pass
+        if redis is not None:
+            try:
+                redis.close()
+            except Exception:
+                pass
 
 
 def _publish_event_to_redis(event: dict[str, Any]) -> None:
@@ -774,9 +776,15 @@ async def _contract_user_event_subscriber_loop(stop_event: asyncio.Event) -> Non
                     await pubsub.unsubscribe(CONTRACT_USER_EVENTS_CHANNEL)
                 except Exception:
                     pass
-                await _close_redis_resource(pubsub)
+                try:
+                    await _close_redis_resource(pubsub)
+                except Exception:
+                    logger.debug("contract private pubsub close failed", exc_info=True)
             if redis is not None:
-                await _close_redis_resource(redis)
+                try:
+                    await _close_redis_resource(redis)
+                except Exception:
+                    logger.debug("contract private redis close failed", exc_info=True)
 
 
 def start_contract_user_event_subscriber() -> None:

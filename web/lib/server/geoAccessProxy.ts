@@ -1,8 +1,6 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
-const ACCESS_COOKIE = 'access_token';
-const REFRESH_COOKIE = 'refresh_token';
 const RESTRICTED_PATH = '/restricted';
 const LEGACY_RESTRICTED_PATH = '/region-restricted';
 const BACKEND_ORIGIN =
@@ -160,17 +158,9 @@ export async function handleGeoAccessProxy(req: NextRequest) {
     return withGeoDebugHeaders(NextResponse.next(), checkStatus, skipReason);
   }
 
-  if (pathname.startsWith('/user')) {
-    const access = req.cookies.get(ACCESS_COOKIE)?.value;
-    const refresh = req.cookies.get(REFRESH_COOKIE)?.value;
-
-    if (!access && !refresh) {
-      const url = req.nextUrl.clone();
-      url.pathname = '/login';
-      url.searchParams.set('next', pathname);
-      return withGeoDebugHeaders(NextResponse.redirect(url), checkStatus, skipReason || 'auth');
-    }
-  }
-
+  // User pages are protected by app/user/layout.tsx via AuthGuard. The proxy
+  // cannot reliably inspect an API-origin HttpOnly cookie when the frontend
+  // and backend use different public hosts, so enforcing auth here can send a
+  // successfully authenticated browser straight back to /login.
   return withGeoDebugHeaders(NextResponse.next(), checkStatus, skipReason);
 }

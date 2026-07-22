@@ -8,6 +8,7 @@
 
 {% block content %}
   {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+  {% set can_manage_bd_rates = is_super_admin or ('bd_commission_rate.manage' in current_admin_permissions) %}
 
   <style>
     .bd-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
@@ -23,9 +24,10 @@
     .bd-note{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .bd-status-cell{white-space:nowrap}
     .bd-qualification-cell{white-space:nowrap}
+    .bd-rate-meta{margin-top:6px;color:var(--muted);font-size:12px}
     .bd-number{font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
     .bd-actions-col,
-    .bd-actions-cell{width:150px;text-align:right}
+    .bd-actions-cell{width:220px;text-align:right}
     .bd-actions-cell{
       vertical-align:middle !important;
     }
@@ -100,6 +102,16 @@
     .bd-modal-form textarea{
       min-height:96px;
     }
+    .bd-rate-summary{
+      display:flex;
+      justify-content:space-between;
+      gap:16px;
+      padding:12px 14px;
+      border:1px solid rgba(255,255,255,.09);
+      border-radius:10px;
+      background:rgba(255,255,255,.03);
+    }
+    .bd-rate-help{color:var(--muted);font-size:12px;line-height:1.6}
     .bd-modal-actions{
       display:flex;
       justify-content:flex-end;
@@ -228,6 +240,7 @@
                   <td class="bd-qualification-cell">
                     {% if item.status == 'APPROVED' %}
                       <span class="admin-badge admin-badge-{% if item.bd_account_status == 'EXPIRED' %}secondary{% else %}{{ item.bd_account_status_badge_class }}{% endif %}">{{ item.bd_account_status_text }}</span>
+                      <div class="bd-rate-meta bd-number">分佣 {{ item.bd_commission_rate_percent }}</div>
                     {% else %}
                       <span class="muted">--</span>
                     {% endif %}
@@ -256,15 +269,28 @@
                       </div>
                     {% elif item.status == 'APPROVED' %}
                       {% if item.can_revoke_bd %}
-                        <form
-                          method="post"
-                          action="/admin/bd/applications/{{ item.id }}/revoke"
-                          class="bd-revoke-form"
-                          onsubmit="return confirm('确认取消该用户 BD 资格？取消后该用户不再作为有效 BD 参与后续分佣，历史记录不会删除。');"
-                        >
-                          <input type="hidden" name="next_path" value="{{ current_url }}" />
-                          <button type="submit" class="btn danger bd-action-btn admin-btn admin-btn-danger admin-btn-sm">取消资格</button>
-                        </form>
+                        <div class="bd-row-actions">
+                          {% if can_manage_bd_rates and item.can_update_bd_rate %}
+                            <button
+                              type="button"
+                              class="btn secondary bd-action-btn admin-btn admin-btn-secondary admin-btn-sm"
+                              data-bd-rate-update
+                              data-application-id="{{ item.id }}"
+                              data-bd-user-id="{{ item.user_id }}"
+                              data-current-rate="{{ item.bd_commission_rate }}"
+                              data-current-percent="{{ item.bd_commission_rate_percent_input }}"
+                            >修改比例</button>
+                          {% endif %}
+                          <form
+                            method="post"
+                            action="/admin/bd/applications/{{ item.id }}/revoke"
+                            class="bd-revoke-form"
+                            onsubmit="return confirm('确认取消该用户 BD 资格？取消后该用户不再作为有效 BD 参与后续分佣，历史记录不会删除。');"
+                          >
+                            <input type="hidden" name="next_path" value="{{ current_url }}" />
+                            <button type="submit" class="btn danger bd-action-btn admin-btn admin-btn-danger admin-btn-sm">取消资格</button>
+                          </form>
+                        </div>
                       {% elif item.can_restore_bd %}
                         <form
                           method="post"
@@ -342,6 +368,49 @@
     </div>
   </div>
 
+  <div id="bdRateModal" class="bd-modal-backdrop" hidden>
+    <div class="bd-review-modal" role="dialog" aria-modal="true" aria-labelledby="bdRateTitle">
+      <div class="bd-modal-head">
+        <div>
+          <div id="bdRateTitle" class="bd-modal-title">修改BD分佣比例</div>
+          <div class="bd-modal-subtitle">用户 <span id="bdRateUserId" class="mono"></span> · 申请单 <span id="bdRateApplicationId" class="mono"></span></div>
+        </div>
+        <button type="button" class="bd-modal-close" data-bd-modal-close aria-label="关闭">×</button>
+      </div>
+      <form id="bdRateForm" method="post" class="bd-modal-form" onsubmit="return confirm('确认修改该 BD 的分佣比例？新比例仅影响修改后新生成的佣金记录。');">
+        <input type="hidden" name="next_path" value="{{ current_url }}" />
+        <input id="bdRateExpected" type="hidden" name="expected_commission_rate" value="" />
+        <div class="bd-rate-summary">
+          <span class="muted">当前分佣比例</span>
+          <strong id="bdRateCurrent" class="bd-number">--</strong>
+        </div>
+        <div class="field">
+          <label for="bdRatePercent">新分佣比例（%）</label>
+          <input
+            id="bdRatePercent"
+            type="number"
+            name="commission_percent"
+            min="0"
+            max="100"
+            step="0.01"
+            required
+            inputmode="decimal"
+            placeholder="例如 40 表示 40%"
+          />
+        </div>
+        <div class="field">
+          <label for="bdRateReason">修改原因</label>
+          <textarea id="bdRateReason" name="change_reason" rows="3" maxlength="500" required placeholder="必填，将写入不可修改的操作记录"></textarea>
+        </div>
+        <div class="bd-rate-help">修改成功后只影响新生成的佣金；已有待发放、已发放和失败记录均保留原比例与原金额。</div>
+        <div class="bd-modal-actions">
+          <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-bd-modal-close>取消</button>
+          <button type="submit" class="btn admin-btn admin-btn-primary">确认修改</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <div id="bdRejectModal" class="bd-modal-backdrop" hidden>
     <div class="bd-review-modal" role="dialog" aria-modal="true" aria-labelledby="bdRejectTitle">
       <div class="bd-modal-head">
@@ -368,10 +437,18 @@
   <script>
     (function(){
       const approveModal = document.getElementById("bdApproveModal");
+      const rateModal = document.getElementById("bdRateModal");
       const rejectModal = document.getElementById("bdRejectModal");
       const approveForm = document.getElementById("bdApproveForm");
+      const rateForm = document.getElementById("bdRateForm");
       const rejectForm = document.getElementById("bdRejectForm");
       const approveApplicationId = document.getElementById("bdApproveApplicationId");
+      const rateApplicationId = document.getElementById("bdRateApplicationId");
+      const rateUserId = document.getElementById("bdRateUserId");
+      const rateExpected = document.getElementById("bdRateExpected");
+      const rateCurrent = document.getElementById("bdRateCurrent");
+      const ratePercent = document.getElementById("bdRatePercent");
+      const rateReason = document.getElementById("bdRateReason");
       const rejectApplicationId = document.getElementById("bdRejectApplicationId");
       const approveRate = document.getElementById("bdApproveRate");
       const approveRemark = document.getElementById("bdApproveRemark");
@@ -391,6 +468,7 @@
 
       function closeModals(){
         approveModal.hidden = true;
+        rateModal.hidden = true;
         rejectModal.hidden = true;
         setBodyLock(false);
       }
@@ -423,11 +501,29 @@
         });
       });
 
+      document.querySelectorAll("[data-bd-rate-update]").forEach(function(button){
+        button.addEventListener("click", function(){
+          const id = getApplicationId(button);
+          if (!id) return;
+          const userId = button.getAttribute("data-bd-user-id") || "";
+          const currentRate = button.getAttribute("data-current-rate") || "";
+          const currentPercent = button.getAttribute("data-current-percent") || "";
+          rateForm.action = "/admin/bd/applications/" + id + "/commission-rate";
+          rateApplicationId.textContent = "#" + id;
+          rateUserId.textContent = userId ? "#" + userId : "--";
+          rateExpected.value = currentRate;
+          rateCurrent.textContent = currentPercent ? currentPercent + "%" : "--";
+          ratePercent.value = currentPercent;
+          rateReason.value = "";
+          openModal(rateModal, ratePercent);
+        });
+      });
+
       document.querySelectorAll("[data-bd-modal-close]").forEach(function(button){
         button.addEventListener("click", closeModals);
       });
 
-      [approveModal, rejectModal].forEach(function(modal){
+      [approveModal, rateModal, rejectModal].forEach(function(modal){
         modal.addEventListener("click", function(event){
           if (event.target === modal) closeModals();
         });

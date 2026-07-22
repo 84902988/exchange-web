@@ -36,7 +36,20 @@ describe('contract selector ticker cache', () => {
 
   it('drops ticker snapshots after the bounded stale-while-revalidate window', () => {
     const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(20_000);
-    writeContractSelectorTickerCache([{ symbol: 'EURUSD_PERP', price: '1.12', change24h: '0.1' }]);
+    writeContractSelectorTickerCache([{
+      symbol: 'EURUSD_PERP',
+      price: '1.14080',
+      change24h: '0.1',
+      displayPricePrecision: 5,
+      pricePrecision: 5,
+    }]);
+
+    expect(readContractSelectorTickerCache()[0]).toMatchObject({
+      symbol: 'EURUSD_PERP',
+      price: '1.14080',
+      displayPricePrecision: 5,
+      pricePrecision: 5,
+    });
 
     nowSpy.mockReturnValue(20_000 + CONTRACT_SELECTOR_TICKER_MAX_STALE_MS + 1);
     expect(readContractSelectorTickerCache()).toEqual([]);

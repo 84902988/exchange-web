@@ -28,4 +28,15 @@ describe('useContractMarketView Price Authority wiring', () => {
     expect(hookSource).not.toMatch(/ContractTradingViewChart/);
     expect(hookSource).not.toMatch(/ContractTradingForm/);
   });
+
+  it('keeps REST, WS and cache trade authority newest-first', () => {
+    expect(hookSource).toMatch(/orderContractTradesNewestFirst/);
+    expect(hookSource).toMatch(
+      /const nextTrades = orderContractTradesNewestFirst\(\s*trades,/,
+    );
+    expect(hookSource).toMatch(
+      /return orderContractTradesNewestFirst\(\[\.\.\.incoming, \.\.\.previous\], limit\)/,
+    );
+    expect(hookSource).not.toMatch(/\[\.\.\.trades\]\.reverse\(\)/);
+  });
 });

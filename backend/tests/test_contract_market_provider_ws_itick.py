@@ -241,7 +241,8 @@ def test_itick_shared_ticker_registration_routes_without_starting_legacy_symbol_
 def test_itick_shared_kline_registration_owns_stable_generation_and_routes_it():
     module = _load_provider_ws_module()
     service = module.ContractMarketProviderWsService()
-    service._itick_transport.notify = lambda _market: None
+    notified = []
+    service._itick_transport.notify = lambda market: notified.append(market)
     key = (module.PROVIDER_ITICK, "EURUSD_PERP", "1m")
 
     ensure_args = {
@@ -258,6 +259,7 @@ def test_itick_shared_kline_registration_owns_stable_generation_and_routes_it():
 
     assert generation == 1
     assert service._kline_generations[key] == generation
+    assert notified == ["forex", "forex"]
     assert service._itick_router.dispatch(
         "forex",
         '{"o":1.14025,"h":1.14029,"l":1.14021,"c":1.14024,"v":291.8,"tu":332.725565,"t":1782889500000,"s":"eurusd","type":"kline@1"}',
@@ -535,6 +537,7 @@ def test_itick_trade_normalizer_marks_live_trade_tick_source():
     assert payload["provider"] == "ITICK"
     assert payload["provider_symbol"] == "AAPL"
     assert payload["ws_symbol"] == "AAPL$US"
+    assert payload["price_field"] == "ld"
     assert payload["price"] == "213.55"
     assert payload["qty"] == "100"
     assert payload["source"] == "LIVE_WS"
@@ -676,6 +679,151 @@ def test_itick_kline_freshness_uses_itick_max_age_in_provider_selection():
     selected = service.select_fresh_kline_for_enabled_providers(Db(), "EURUSD_PERP", "1m")
     assert selected is not None
     assert selected["close"] == "1.14024"
+
+
+def test_itick_event_driven_depth_stays_live_while_shared_transport_is_live(monkeypatch):
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    now_ms = 1_720_000_010_000
+    monkeypatch.setattr(module.time, "time", lambda: now_ms / 1000)
+    monkeypatch.setattr(
+        service._itick_transport,
+        "market_state",
+        lambda _market: {
+            "connected": True,
+            "connection_generation": 7,
+            "last_message_at_ms": now_ms - 250,
+        },
+    )
+    key = (module.PROVIDER_ITICK, "EURUSD_PERP")
+    service._depth_cache[key] = {
+        "symbol": "EURUSD_PERP",
+        "provider": module.PROVIDER_ITICK,
+        "bids": [["1.14190", "1"]],
+        "asks": [["1.14205", "1"]],
+        "updated_at_ms": now_ms - 2_000,
+        "itick_market": "forex",
+        "transport_generation": 7,
+    }
+
+    assert service.get_fresh_provider_ws_depth(
+        "EURUSD_PERP",
+        module.PROVIDER_ITICK,
+        max_age_ms=1_500,
+    ) is not None
+
+    service._depth_cache[key]["received_at_ms"] = now_ms - 5_001
+    service._depth_cache[key]["updated_at_ms"] = now_ms - 5_001
+    freshened = service.get_fresh_provider_ws_depth(
+        "EURUSD_PERP",
+        module.PROVIDER_ITICK,
+        max_age_ms=1_500,
+    )
+    assert freshened is not None
+    assert freshened["depth_frame_received_at_ms"] == now_ms - 5_001
+    assert freshened["received_at_ms"] == now_ms - 250
+    assert freshened["freshness_basis"] == "TRANSPORT_LIVENESS"
+
+
+def test_itick_event_driven_depth_fails_closed_when_transport_is_not_live(monkeypatch):
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    now_ms = 1_720_000_010_000
+    monkeypatch.setattr(module.time, "time", lambda: now_ms / 1000)
+    key = (module.PROVIDER_ITICK, "EURUSD_PERP")
+    service._depth_cache[key] = {
+        "symbol": "EURUSD_PERP",
+        "provider": module.PROVIDER_ITICK,
+        "bids": [["1.14190", "1"]],
+        "asks": [["1.14205", "1"]],
+        "updated_at_ms": now_ms - 5_001,
+        "itick_market": "forex",
+        "transport_generation": 7,
+    }
+
+    states = (
+        {
+            "connected": False,
+            "connection_generation": 7,
+            "last_message_at_ms": now_ms - 250,
+        },
+        {
+            "connected": True,
+            "connection_generation": 8,
+            "last_message_at_ms": now_ms - 250,
+        },
+        {
+            "connected": True,
+            "connection_generation": 7,
+            "last_message_at_ms": now_ms - module.ITICK_SHARED_TRANSPORT_MAX_IDLE_MS - 1,
+        },
+    )
+    for state in states:
+        monkeypatch.setattr(
+            service._itick_transport,
+            "market_state",
+            lambda _market, current=state: current,
+        )
+        assert service.get_fresh_provider_ws_depth(
+            "EURUSD_PERP",
+            module.PROVIDER_ITICK,
+            max_age_ms=1_500,
+        ) is None
+
+
+def test_itick_depth_cache_records_shared_transport_generation(monkeypatch):
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    key = (module.PROVIDER_ITICK, "EURUSD_PERP")
+    service._depth_generations[key] = 11
+    monkeypatch.setattr(
+        service._itick_transport,
+        "market_state",
+        lambda market: {
+            "connected": True,
+            "connection_generation": 4,
+            "last_message_at_ms": 1_720_000_010_000,
+            "market": market,
+        },
+    )
+    subscription = module.ProviderDepthSubscription(
+        local_symbol="EURUSD_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="EURUSD",
+        depth_limit=20,
+        ws_symbol="EURUSD$GB",
+        ws_url="wss://api.itick.org/forex",
+    )
+
+    service._set_depth_cache(
+        subscription,
+        bids={"1.14190": module.Decimal("1")},
+        asks={"1.14205": module.Decimal("1")},
+        generation=11,
+    )
+
+    assert service._depth_cache[key]["itick_market"] == "forex"
+    assert service._depth_cache[key]["transport_generation"] == 4
+
+
+def test_non_itick_depth_keeps_requested_freshness_limit(monkeypatch):
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    now_ms = 1_720_000_010_000
+    monkeypatch.setattr(module.time, "time", lambda: now_ms / 1000)
+    service._depth_cache[(module.PROVIDER_OKX_SWAP, "BTCUSDT_PERP")] = {
+        "symbol": "BTCUSDT_PERP",
+        "provider": module.PROVIDER_OKX_SWAP,
+        "bids": [["66000", "1"]],
+        "asks": [["66001", "1"]],
+        "updated_at_ms": now_ms - 2_000,
+    }
+
+    assert service.get_fresh_provider_ws_depth(
+        "BTCUSDT_PERP",
+        module.PROVIDER_OKX_SWAP,
+        max_age_ms=1_500,
+    ) is None
 
 
 def test_okx_kline_channel_and_normalizer_still_work():
@@ -1144,7 +1292,7 @@ def test_gateway_market_state_cache_is_symbol_scoped():
     assert "kline_current_candle" not in state_message["data"]
 
 
-def test_gateway_market_state_builder_ignores_kline_domain_cache():
+def test_gateway_market_state_builder_uses_only_matching_domain_snapshots():
     module = _load_gateway_module(None)
     gateway = module.ContractMarketGateway()
     symbol = "AAPLUSDT_PERP"
@@ -1166,7 +1314,7 @@ def test_gateway_market_state_builder_ignores_kline_domain_cache():
         }
 
     module.ContractMarketViewDetail = MarketViewModelStub
-    module.build_contract_market_view = build_market_view_stub
+    module.build_contract_market_view_v2 = build_market_view_stub
     gateway._set_latest(module.CONTRACT_MARKET_CACHE_QUOTE, symbol, {"symbol": symbol})
     gateway._set_latest(
         module.CONTRACT_MARKET_CACHE_KLINE,
@@ -1177,7 +1325,9 @@ def test_gateway_market_state_builder_ignores_kline_domain_cache():
 
     state = gateway._build_market_state_from_latest(symbol)
 
-    assert captured["latest_kline"] is None
+    assert captured["kline_snapshot"] is None
+    assert captured["ticker_snapshot"] is not None
+    assert captured["ticker_snapshot"].metadata.symbol == symbol
     assert state == {"symbol": symbol, "display_price": "100"}
 
 
@@ -1198,4 +1348,4 @@ if __name__ == "__main__":
     test_gateway_domain_snapshots_keep_market_and_kline_payloads_separate()
     test_gateway_kline_snapshot_does_not_refresh_market_domain()
     test_gateway_market_state_cache_is_symbol_scoped()
-    test_gateway_market_state_builder_ignores_kline_domain_cache()
+    test_gateway_market_state_builder_uses_only_matching_domain_snapshots()

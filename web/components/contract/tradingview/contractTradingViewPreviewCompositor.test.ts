@@ -66,6 +66,8 @@ function preview(
     receivedAtMs: 2_000,
     previewSequence: 1,
     baseNativeRevision: { epoch: 3, sequence: 8 },
+    baselineSource: 'NATIVE',
+    baselineAnchorOpenTime: null,
     bar: {
       time: OPEN_TIME,
       open: 100,
@@ -90,6 +92,154 @@ test('complete preview replaces only its matching Native OPEN baseline', () => {
   assert.equal(result.accepted, true)
   assert.equal(result.source, 'preview')
   assert.deepEqual(result.bar, preview().bar)
+})
+
+test('validated iTick preview bootstraps before the first versioned Native frame', () => {
+  const compositor = new ContractTradingViewPreviewCompositor({
+    symbol: 'EURUSD_PERP',
+    interval: '1m',
+  })
+  const first = compositor.acceptPreview(preview({
+    symbol: 'EURUSD_PERP',
+    bar: { ...preview().bar, close: 101.5 },
+  }))
+  const next = compositor.acceptPreview(preview({
+    symbol: 'EURUSD_PERP',
+    receivedAtMs: 2_100,
+    previewSequence: 2,
+    bar: { ...preview().bar, close: 102.5, volume: 53 },
+  }))
+
+  assert.equal(first.reason, 'PREVIEW_BOOTSTRAP_ACCEPTED')
+  assert.equal(first.source, 'preview')
+  assert.equal(first.bar?.close, 101.5)
+  assert.equal(next.reason, 'PREVIEW_BOOTSTRAP_ACCEPTED')
+  assert.equal(next.bar?.close, 102.5)
+})
+
+test('all iTick CFD categories open the contiguous next candle from a real trade rollover', () => {
+  const symbols = [
+    'EURUSD_PERP',
+    'XAUUSDT_PERP',
+    'BRENTUSDT_PERP',
+    'NAS100USDT_PERP',
+    'AAPLUSDT_PERP',
+  ];
+
+  for (const symbol of symbols) {
+    const compositor = new ContractTradingViewPreviewCompositor({ symbol, interval: '1m' });
+    compositor.acceptNative(native({ symbol }));
+    const result = compositor.acceptPreview(preview({
+      symbol,
+      openTime: OPEN_TIME + 60_000,
+      baselineSource: 'TRADE_ROLLOVER',
+      baselineAnchorOpenTime: OPEN_TIME,
+      bar: {
+        time: OPEN_TIME + 60_000,
+        open: 103,
+        high: 103,
+        low: 103,
+        close: 103,
+        volume: 2,
+      },
+    }));
+
+    assert.equal(result.reason, 'TRADE_ROLLOVER_ACCEPTED', symbol);
+    assert.equal(result.bar?.time, OPEN_TIME + 60_000, symbol);
+    assert.equal(result.bar?.close, 103, symbol);
+  }
+})
+
+test('trade rollover preview fails closed without an exact adjacent native anchor', () => {
+  const compositor = new ContractTradingViewPreviewCompositor({
+    symbol: 'BRENTUSDT_PERP',
+    interval: '1m',
+  });
+  compositor.acceptNative(native({ symbol: 'BRENTUSDT_PERP' }));
+
+  const rollover = {
+    symbol: 'BRENTUSDT_PERP',
+    openTime: OPEN_TIME + 60_000,
+    baselineSource: 'TRADE_ROLLOVER' as const,
+    baselineAnchorOpenTime: OPEN_TIME,
+    bar: {
+      time: OPEN_TIME + 60_000,
+      open: 103,
+      high: 103,
+      low: 103,
+      close: 103,
+      volume: 2,
+    },
+  };
+
+  assert.equal(
+    compositor.acceptPreview(preview({
+      ...rollover,
+      baselineAnchorOpenTime: OPEN_TIME - 60_000,
+    })).reason,
+    'OPEN_TIME_MISMATCH',
+  );
+  assert.equal(
+    compositor.acceptPreview(preview({
+      ...rollover,
+      generation: 4,
+    })).reason,
+    'GENERATION_MISMATCH',
+  );
+})
+
+test('bootstrap preview rejects rollback before Native authority arrives', () => {
+  const compositor = new ContractTradingViewPreviewCompositor({
+    symbol: 'EURUSD_PERP',
+    interval: '1m',
+  })
+  compositor.acceptPreview(preview({
+    symbol: 'EURUSD_PERP',
+    previewSequence: 2,
+    bar: { ...preview().bar, volume: 53 },
+  }))
+
+  assert.equal(
+    compositor.acceptPreview(preview({
+      symbol: 'EURUSD_PERP',
+      previewSequence: 1,
+      bar: { ...preview().bar, volume: 54 },
+    })).reason,
+    'PREVIEW_SEQUENCE_STALE',
+  )
+  assert.equal(
+    compositor.acceptPreview(preview({
+      symbol: 'EURUSD_PERP',
+      previewSequence: 3,
+      bar: { ...preview().bar, volume: 52 },
+    })).reason,
+    'PREVIEW_VOLUME_STALE',
+  )
+})
+
+test('closed five-minute Native anchor permits only the immediate real-trade rollover', () => {
+  const symbol = 'XAUUSDT_PERP'
+  const compositor = new ContractTradingViewPreviewCompositor({ symbol, interval: '5m' })
+  compositor.acceptNative(native({ symbol, interval: '5m', isClosed: true }))
+
+  const accepted = compositor.acceptPreview(preview({
+    symbol,
+    interval: '5m',
+    openTime: OPEN_TIME + 300_000,
+    baselineSource: 'TRADE_ROLLOVER',
+    baselineAnchorOpenTime: OPEN_TIME,
+    bar: {
+      time: OPEN_TIME + 300_000,
+      open: 103,
+      high: 103,
+      low: 103,
+      close: 103,
+      volume: 2,
+    },
+  }))
+
+  assert.equal(accepted.reason, 'TRADE_ROLLOVER_ACCEPTED')
+  assert.equal(accepted.bar?.time, OPEN_TIME + 300_000)
 })
 
 test('older Native OPEN cannot visually roll back newer trade OHLCV', () => {
@@ -191,6 +341,35 @@ test('closed Native candle wins and prevents preview reopening', () => {
   assert.equal(late.reason, 'NATIVE_CLOSED')
 })
 
+test('higher process generation accepts a backend restart with reset revision sequence', () => {
+  const compositor = new ContractTradingViewPreviewCompositor({
+    symbol: 'BTCUSDT_PERP',
+    interval: '1m',
+  })
+  compositor.acceptNative(native({
+    generation: 1_000_001,
+    revision: { epoch: 1_000_001, sequence: 900 },
+  }))
+
+  const restartedNative = compositor.acceptNative(native({
+    generation: 2_000_001,
+    revision: { epoch: 2_000_001, sequence: 1 },
+    receivedAtMs: 3_000,
+    bar: { ...native().bar, close: 102 },
+  }))
+  const restartedPreview = compositor.acceptPreview(preview({
+    generation: 2_000_001,
+    baseNativeRevision: { epoch: 2_000_001, sequence: 1 },
+    receivedAtMs: 3_100,
+    bar: { ...preview().bar, close: 104, high: 104 },
+  }))
+
+  assert.equal(restartedNative.reason, 'NATIVE_ACCEPTED')
+  assert.equal(restartedNative.bar?.close, 102)
+  assert.equal(restartedPreview.reason, 'PREVIEW_ACCEPTED')
+  assert.equal(restartedPreview.bar?.close, 104)
+})
+
 test('generation, revision, volume and scope mismatches fail closed', () => {
   const compositor = new ContractTradingViewPreviewCompositor({
     symbol: 'BTCUSDT_PERP',
@@ -252,4 +431,13 @@ test('generation, revision, volume and scope mismatches fail closed', () => {
     }).acceptNative(native({ symbol: 'SOLUSDT_PERP', interval: '15m' })).reason,
     'UNSUPPORTED_SCOPE',
   )
+})
+
+test('stock symbols containing a dot keep trade-preview composition enabled', () => {
+  const compositor = new ContractTradingViewPreviewCompositor({
+    symbol: 'BRK.BUSDT_PERP',
+    interval: '1m',
+  })
+
+  assert.equal(compositor.supported, true)
 })

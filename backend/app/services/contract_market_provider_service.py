@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -194,7 +195,9 @@ DEFAULT_SYMBOL_MAPPINGS: dict[tuple[str, str], str] = {
 
 _provider_cache: dict[str, Any] = {"expires_at": 0.0, "items": None}
 _symbol_cache: dict[str, Any] = {"expires_at": 0.0, "items": None}
-_provider_cooldown_until: dict[str, datetime] = {}
+_PROVIDER_COOLDOWN_ALL_ENDPOINTS = "*"
+_provider_cooldown_until: dict[tuple[str, str], datetime] = {}
+_provider_cooldown_lock = threading.RLock()
 _http_session = requests.Session()
 _http_session.trust_env = False
 
@@ -211,6 +214,27 @@ def _normalize_provider_code(value: Any) -> str:
 
 def _normalize_symbol(value: Any) -> str:
     return str(value or "").strip().upper()
+
+
+def _normalize_provider_endpoint_scope(value: Any) -> str:
+    endpoint = str(value or "").strip().lower()
+    if not endpoint:
+        return _PROVIDER_COOLDOWN_ALL_ENDPOINTS
+    if endpoint in {"kline", "kline_history"}:
+        return "kline"
+    return endpoint
+
+
+def _provider_cooldown_key(provider_code: Any, endpoint_type: Any = None) -> tuple[str, str]:
+    return (
+        _normalize_provider_code(provider_code),
+        _normalize_provider_endpoint_scope(endpoint_type),
+    )
+
+
+def _prune_expired_provider_cooldowns_locked(now: datetime) -> None:
+    for key in [key for key, until in _provider_cooldown_until.items() if until <= now]:
+        _provider_cooldown_until.pop(key, None)
 
 
 def normalize_market_provider_base_url(value: Any, provider_code: str) -> Optional[str]:
@@ -402,15 +426,38 @@ def resolve_spot_provider_symbol(
     return _normalize_symbol(fallback_symbol) or local
 
 
-def _raise_if_in_cooldown(provider_code: str) -> None:
-    until = _provider_cooldown_until.get(_normalize_provider_code(provider_code))
-    if until is not None and until > datetime.utcnow():
-        raise ProviderCooldownError("provider is in cooldown")
+def _raise_if_in_cooldown(provider_code: str, endpoint_type: Optional[str] = None) -> None:
+    code = _normalize_provider_code(provider_code)
+    endpoint = _normalize_provider_endpoint_scope(endpoint_type)
+    now = datetime.utcnow()
+    with _provider_cooldown_lock:
+        _prune_expired_provider_cooldowns_locked(now)
+        wildcard_until = _provider_cooldown_until.get(
+            (code, _PROVIDER_COOLDOWN_ALL_ENDPOINTS)
+        )
+        endpoint_until = _provider_cooldown_until.get((code, endpoint))
+        if (
+            (wildcard_until is not None and wildcard_until > now)
+            or (endpoint_until is not None and endpoint_until > now)
+        ):
+            raise ProviderCooldownError("provider is in cooldown")
 
 
-def is_contract_market_provider_in_cooldown(provider_code: str) -> bool:
-    until = _provider_cooldown_until.get(_normalize_provider_code(provider_code))
-    return until is not None and until > datetime.utcnow()
+def is_contract_market_provider_in_cooldown(
+    provider_code: str,
+    endpoint_type: Optional[str] = None,
+) -> bool:
+    code = _normalize_provider_code(provider_code)
+    now = datetime.utcnow()
+    with _provider_cooldown_lock:
+        _prune_expired_provider_cooldowns_locked(now)
+        if endpoint_type is None:
+            return any(key[0] == code for key in _provider_cooldown_until)
+        endpoint = _normalize_provider_endpoint_scope(endpoint_type)
+        return (
+            (code, _PROVIDER_COOLDOWN_ALL_ENDPOINTS) in _provider_cooldown_until
+            or (code, endpoint) in _provider_cooldown_until
+        )
 
 
 def mark_contract_market_provider_failure(
@@ -420,11 +467,15 @@ def mark_contract_market_provider_failure(
     *,
     cooldown_seconds: int = 0,
     market_type: str = MARKET_TYPE_CONTRACT,
+    endpoint_type: Optional[str] = None,
 ) -> None:
     code = _normalize_provider_code(provider_code)
     normalized_type = _normalize_provider_code(market_type or MARKET_TYPE_CONTRACT)
     if cooldown_seconds > 0:
-        _provider_cooldown_until[code] = datetime.utcnow() + timedelta(seconds=int(cooldown_seconds))
+        with _provider_cooldown_lock:
+            _provider_cooldown_until[
+                _provider_cooldown_key(code, endpoint_type)
+            ] = datetime.utcnow() + timedelta(seconds=int(cooldown_seconds))
     try:
         db.execute(
             text(
@@ -454,10 +505,19 @@ def mark_contract_market_provider_success(
     provider_code: str,
     *,
     market_type: str = MARKET_TYPE_CONTRACT,
+    endpoint_type: Optional[str] = None,
 ) -> None:
     code = _normalize_provider_code(provider_code)
     normalized_type = _normalize_provider_code(market_type or MARKET_TYPE_CONTRACT)
-    _provider_cooldown_until.pop(code, None)
+    with _provider_cooldown_lock:
+        if endpoint_type is None:
+            for key in [key for key in _provider_cooldown_until if key[0] == code]:
+                _provider_cooldown_until.pop(key, None)
+        else:
+            _provider_cooldown_until.pop(
+                _provider_cooldown_key(code, endpoint_type),
+                None,
+            )
     try:
         db.execute(
             text(
@@ -568,7 +628,7 @@ def request_contract_market_provider_json(
 ) -> Any:
     if provider.provider_code not in EXTERNAL_PROVIDER_CODES and provider.provider_code not in EXTERNAL_SPOT_PROVIDER_CODES:
         raise MarketDataProviderError(f"provider {provider.provider_code} has no external endpoint")
-    _raise_if_in_cooldown(provider.provider_code)
+    _raise_if_in_cooldown(provider.provider_code, endpoint_type)
     base_url = normalize_market_provider_base_url(provider.base_url, provider.provider_code)
     if not base_url:
         raise MarketDataProviderError("base_url is required")

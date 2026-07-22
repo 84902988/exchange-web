@@ -18,7 +18,7 @@ import {
   updateVipFeePreference,
 } from '@/lib/api/modules/vip';
 import type { VipOverviewResponse } from '@/components/vip/vip.types';
-import { formatFeeRate, formatRcbDiscountPercent, formatRcbPayDiscountText } from '@/components/vip/vip.utils';
+import { formatFeeRate, formatRcbFeePayPercent, resolveRcbFeePayPercent } from '@/components/vip/vip.utils';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import UserSidebar from '@/components/user/UserSidebar';
 import EmptyState from '@/components/ui/EmptyState';
@@ -308,12 +308,14 @@ export default function UserPage() {
   const svipLevel = userSummary?.svip_level_code ?? '--';
   const makerFee = formatFeeRate(userSummary?.effective_spot_maker_fee ?? null);
   const takerFee = formatFeeRate(userSummary?.effective_spot_taker_fee ?? null);
-  const rcbDiscountPercent = vipOverview?.rcb_discount_percent ?? null;
-  const rcbDiscountPercentText = formatRcbDiscountPercent(rcbDiscountPercent);
-  const rcbPayDiscountText = formatRcbPayDiscountText(rcbDiscountPercent);
+  const rcbFeePayPercent = resolveRcbFeePayPercent(
+    vipOverview?.rcb_fee_pay_percent,
+    vipOverview?.rcb_discount_percent,
+  );
+  const rcbFeePayPercentText = formatRcbFeePayPercent(rcbFeePayPercent);
   const localeCode = locale === 'zh-TW' ? 'zh-TW' : locale === 'ja' ? 'ja-JP' : locale === 'en' ? 'en-US' : 'zh-CN';
   const rcbFeeStatusText = isRcbDeductionEnabled
-    ? `${t('rcbFeeEnabledPrefix', 'user')} ${rcbPayDiscountText}${t('rcbFeeEnabledSuffix', 'user')}`
+    ? `${t('rcbFeeEnabledPrefix', 'user')} ${rcbFeePayPercentText}${t('rcbFeeEnabledSuffix', 'user')}`
     : t('rcbFeeDisabledDesc', 'user');
   const identityCard = getIdentityCard(kycStatus, kycLevel, t);
 
@@ -525,7 +527,7 @@ export default function UserPage() {
                   <div>
                     <div className="text-white/70 text-sm">{t('rcbDeduction', 'user') as string}</div>
                     <div className="text-white/40 text-xs mt-1">
-                      {t('rcbDeductionDiscountPrefix', 'user')} {rcbDiscountPercentText} {t('rcbDeductionDiscountSuffix', 'user')}
+                      {t('rcbDeductionDiscountPrefix', 'user')} {rcbFeePayPercentText} {t('rcbDeductionDiscountSuffix', 'user')}
                     </div>
                   </div>
                   <button

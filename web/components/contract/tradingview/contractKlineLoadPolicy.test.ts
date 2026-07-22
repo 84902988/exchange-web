@@ -98,3 +98,18 @@ test('1M stays case-sensitive and range identity excludes request coverage', () 
     'BTCUSDT_PERP|1M|CURRENT',
   );
 });
+
+test('symbol identity preserves provider-significant dots', () => {
+  assert.equal(
+    policy.normalizeContractKlineLoadSymbol(' brk.busdt_perp '),
+    'BRK.BUSDT_PERP',
+  );
+  assert.equal(
+    policy.buildContractKlineRangeKey({
+      symbol: 'brk.busdt_perp',
+      interval: '1m',
+      endTimeMs: null,
+    }),
+    'BRK.BUSDT_PERP|1m|CURRENT',
+  );
+});

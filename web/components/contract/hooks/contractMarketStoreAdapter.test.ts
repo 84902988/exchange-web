@@ -13,6 +13,34 @@ import {
 } from './contractMarketStoreAdapter';
 
 describe('Contract Header realtime Store hydration', () => {
+  it('can hydrate live market-state domains without replaying its embedded K-line', () => {
+    const symbol = 'EURUSD_MARKET_STATE_DOMAIN_TEST_PERP';
+    activateContractMarketShadowSymbol(symbol);
+
+    const results = hydrateContractMarketViewShadow({
+      symbol,
+      ticker: { last_price: '1.14205' },
+      depth: { bids: [['1.14197', '1']], asks: [['1.14212', '1']] },
+      trades: [{ id: 'trade-1', price: '1.14205', qty: '1', time: 1_720_000_000_100 }],
+      kline_current_candle: {
+        interval: '1m',
+        open_time: 1_720_000_000_000,
+        open: '1.14200',
+        high: '1.14210',
+        low: '1.14190',
+        close: '1.14205',
+        volume: '10',
+      },
+    }, 'WS', ['ticker', 'depth', 'trades']);
+
+    expect(results.map((result) => result.entry?.domain)).toEqual([
+      'ticker',
+      'depth',
+      'trades',
+    ]);
+    expect(contractMarketStore.getEntry(symbol, 'kline', '1m')).toBeNull();
+  });
+
   it('returns one stable safe snapshot for the initial empty Store', () => {
     const store = createContractMarketStore();
     store.activateSymbol('BTCUSDT_PERP');
@@ -178,6 +206,53 @@ describe('Contract Header realtime Store hydration', () => {
         bestBid: null,
         bestAsk: null,
         spread: null,
+      });
+  });
+
+  it('lets a newer executable depth recover stale unavailable Header structure', () => {
+    const store = createContractMarketStore();
+    const nowMs = Date.now();
+    store.activateSymbol('NAS100USDT_PERP');
+    store.ingest({
+      symbol: 'NAS100USDT_PERP',
+      domain: 'ticker',
+      data: {
+        display_price: '28943.38',
+        display_state: 'UNAVAILABLE',
+        market_status: 'UNKNOWN',
+        executable: false,
+      },
+      transport: 'WS',
+      source: 'ITICK_QUOTE',
+      provider: 'ITICK',
+      freshness: 'RECENT',
+      eventTimeMs: nowMs - 20,
+    });
+    store.ingest({
+      symbol: 'NAS100USDT_PERP',
+      domain: 'depth',
+      data: {
+        bids: [['29053.88', '1']],
+        asks: [['29054.88', '1']],
+        market_status: 'OPEN',
+        executable: true,
+      },
+      transport: 'WS',
+      source: 'ITICK_DEPTH',
+      provider: 'ITICK',
+      freshness: 'LIVE',
+      eventTimeMs: nowMs - 10,
+    });
+
+    expect(selectContractHeaderStoreSnapshot(store.getState(), 'NAS100USDT_PERP'))
+      .toMatchObject({
+        displayState: 'LIVE_TRADABLE',
+        marketStatus: 'OPEN',
+        executable: true,
+        bestBid: '29053.88',
+        bestAsk: '29054.88',
+        source: 'ITICK_DEPTH',
+        freshness: 'LIVE',
       });
   });
 
@@ -622,6 +697,283 @@ describe('Contract MarketView realtime Store recovery', () => {
         last_price: '101',
         display_state: 'LIVE_TRADABLE',
         execution_mode: 'NATIVE_BBO',
+      });
+  });
+
+  it('advances Forex Header price from a trusted live quote after a full WS market state', () => {
+    const symbol = 'GBPUSD_PERP';
+    activateContractMarketShadowSymbol(symbol);
+    hydrateContractMarketViewShadow({
+      symbol,
+      display_state: 'LIVE_TRADABLE',
+      display_price: '1.33811',
+      display_price_source: 'TRADE_TICK',
+      current_price_source: 'TRADE_TICK',
+      executable: true,
+      ticker: {
+        provider: 'ITICK',
+        last_price: '1.33811',
+        source: 'ITICK_LIVE_WS_DERIVED_BBO',
+        quote_freshness: 'LIVE',
+      },
+      snapshot_metadata: {
+        ticker: {
+          provider: 'ITICK',
+          provider_generation: 7,
+          revision: { epoch: 7, sequence: 20 },
+          provider_event_time_ms: 1_720_000_000_100,
+        },
+      },
+    }, 'WS');
+
+    const result = writeContractMarketShadowDomain({
+      symbol,
+      domain: 'ticker',
+      data: {
+        provider: 'ITICK',
+        last_price: '1.33818',
+        mark_price: '1.33821',
+        source: 'ITICK_LIVE_WS_DERIVED_BBO',
+        quote_freshness: 'LIVE',
+        price_source: 'TRADE_TICK',
+      },
+      transport: 'WS',
+      metadata: {
+        provider: 'ITICK',
+        provider_generation: 7,
+        revision: { epoch: 7, sequence: 21 },
+        provider_event_time_ms: 1_720_000_000_200,
+      },
+    });
+
+    expect(result).toMatchObject({ accepted: true });
+    expect(selectContractHeaderStoreSnapshot(
+      contractMarketStore.getState(),
+      symbol,
+    )).toMatchObject({
+      displayPrice: '1.33818',
+      displayPriceSource: 'TRADE_TICK',
+      markPrice: '1.33821',
+      providerGeneration: 7,
+      revision: { epoch: 7, sequence: 21 },
+    });
+  });
+
+  it('keeps MarketView display authority isolated from a later raw quote increment', () => {
+    const symbol = 'SPX_AUTHORITY_ISOLATION_PERP';
+    activateContractMarketShadowSymbol(symbol);
+    hydrateContractMarketViewShadow({
+      symbol,
+      display_state: 'UNAVAILABLE',
+      display_price: '7490.98',
+      display_price_source: 'KLINE_CLOSE',
+      current_price_source: 'KLINE_CLOSE',
+      executable: false,
+      ticker: {
+        last_price: '7443.29',
+        quote_freshness: 'LAST_VALID',
+        ts: 1_720_000_000_100,
+      },
+    }, 'WS');
+
+    writeContractMarketShadowDomain({
+      symbol,
+      domain: 'ticker',
+      data: {
+        last_price: '0.35',
+        quote_freshness: 'LAST_VALID',
+      },
+      transport: 'WS',
+      metadata: { ts: 1_720_000_000_200 },
+    });
+
+    const snapshot = selectContractMarketViewStoreAuthoritySnapshot(
+      contractMarketStore.getState(),
+      symbol,
+    );
+    expect(snapshot).toMatchObject({
+      displayPrice: '7490.98',
+      displayPriceSource: 'KLINE_CLOSE',
+      displayState: 'UNAVAILABLE',
+      executable: false,
+    });
+  });
+
+  it('recovers stale unavailable structure from a same-symbol live REST view', () => {
+    const symbol = 'SPX_STRUCTURAL_RECOVERY_PERP';
+    const nowMs = Date.now();
+    activateContractMarketShadowSymbol(symbol);
+    hydrateContractMarketViewShadow({
+      symbol,
+      display_state: 'UNAVAILABLE',
+      display_price: '7443.29',
+      display_price_source: 'KLINE_CLOSE',
+      current_price_source: 'KLINE_CLOSE',
+      market_status: 'OPEN',
+      executable: false,
+      reason_code: 'BBO_UNAVAILABLE',
+      ticker: {
+        last_price: '7443.29',
+        provider: 'ITICK',
+        quote_freshness: 'LAST_VALID',
+      },
+    }, 'WS');
+    writeContractMarketShadowDomain({
+      symbol,
+      domain: 'ticker',
+      data: {
+        last_price: '7485.40',
+        provider: 'ITICK',
+        market_status: 'OPEN',
+      },
+      transport: 'WS',
+      metadata: { ts: nowMs - 20, provider: 'ITICK' },
+    });
+    writeContractMarketShadowDomain({
+      symbol,
+      domain: 'depth',
+      data: {
+        bids: [['7481.17', '1']],
+        asks: [['7488.65', '1']],
+        executable: true,
+      },
+      transport: 'WS',
+      metadata: { ts: nowMs - 10, provider: 'ITICK' },
+    });
+
+    const snapshot = selectContractMarketViewStoreAuthoritySnapshot(
+      contractMarketStore.getState(),
+      symbol,
+    );
+    expect(snapshot).toMatchObject({
+      displayState: 'UNAVAILABLE',
+      executable: true,
+      executionBid: '7481.17',
+      executionAsk: '7488.65',
+    });
+
+    const projected = projectContractMarketViewStoreAuthority(snapshot, {
+      symbol,
+      display_symbol: 'SPX/USDT',
+      market_type: 'CONTRACT',
+      category: 'INDEX',
+      market_status: 'OPEN',
+      display_state: 'LIVE_TRADABLE',
+      display_price: '7485.40',
+      display_price_source: 'TRADE_TICK',
+      current_price_source: 'TRADE_TICK',
+      best_bid: '7481.17',
+      best_ask: '7488.65',
+      spread: '7.48',
+      executable: true,
+      execution_bid: '7481.17',
+      execution_ask: '7488.65',
+      execution_mode: 'LIVE_BBO',
+      last_good_bbo_valid: false,
+      reason_code: 'LIVE_BBO',
+      warnings: [],
+      raw_source_summary: {},
+    }, nowMs);
+
+    expect(projected).toMatchObject({
+      display_state: 'LIVE_TRADABLE',
+      display_price: '7485.40',
+      display_price_source: 'TRADE_TICK',
+      executable: true,
+      execution_bid: '7481.17',
+      execution_ask: '7488.65',
+      reason_code: 'LIVE_BBO',
+    });
+    expect(projected?.raw_source_summary).toMatchObject({
+      authority_source: 'CONTRACT_MARKET_STORE_WITH_REST_STRUCTURE',
+    });
+  });
+
+  it('treats explicit null MarketView price as a clear instead of reviving embedded ticker data', () => {
+    const symbol = 'DJI_NULL_AUTHORITY_PERP';
+    activateContractMarketShadowSymbol(symbol);
+    hydrateContractMarketViewShadow({
+      symbol,
+      display_state: 'UNAVAILABLE',
+      display_price: null,
+      display_price_source: 'NONE',
+      current_price_source: 'NONE',
+      executable: false,
+      ticker: {
+        display_price: '0.35',
+        display_price_source: 'LIVE_MID',
+        last_price: '51844.20',
+        ts: 1_720_000_000_300,
+      },
+    }, 'WS');
+
+    const ticker = contractMarketStore.getEntry<Record<string, unknown>>(symbol, 'ticker')?.data;
+    const snapshot = selectContractMarketViewStoreAuthoritySnapshot(
+      contractMarketStore.getState(),
+      symbol,
+    );
+
+    expect(ticker).toMatchObject({
+      display_price: null,
+      display_price_source: 'NONE',
+      current_price_source: 'NONE',
+    });
+    expect(snapshot).toMatchObject({
+      displayPrice: null,
+      displayPriceSource: null,
+      displayState: 'UNAVAILABLE',
+      executable: false,
+    });
+  });
+
+  it('projects the selected BBO domain into canonical live execution authority', () => {
+    const symbol = 'EURUSD_CANONICAL_EXECUTION_PERP';
+    const nowMs = Date.now();
+    activateContractMarketShadowSymbol(symbol);
+    writeContractMarketShadowDomain({
+      symbol,
+      domain: 'ticker',
+      data: {
+        display_price: '1.14025',
+        display_state: 'LIVE_TRADABLE',
+        executable: true,
+        execution_mode: 'NATIVE_BBO',
+        reason_code: 'TICKER_STRUCTURE',
+      },
+      transport: 'WS',
+      metadata: { ts: nowMs - 20, freshness: 'LIVE' },
+    });
+    writeContractMarketShadowDomain({
+      symbol,
+      domain: 'depth',
+      data: {
+        execution_bid: '1.14017',
+        execution_ask: '1.14033',
+        executable: true,
+        execution_mode: 'LIVE_BBO',
+        reason_code: 'LIVE_BBO',
+        depth_freshness: 'LIVE',
+      },
+      transport: 'WS',
+      metadata: { ts: nowMs - 10, freshness: 'LIVE' },
+    });
+
+    const snapshot = selectContractMarketViewStoreAuthoritySnapshot(
+      contractMarketStore.getState(),
+      symbol,
+    );
+    expect(snapshot).toMatchObject({
+      executionMode: 'LIVE_BBO',
+      reasonCode: 'LIVE_BBO',
+      executionBid: '1.14017',
+      executionAsk: '1.14033',
+    });
+
+    expect(projectContractMarketViewStoreAuthority(snapshot, null, nowMs))
+      .toMatchObject({
+        execution_mode: 'LIVE_BBO',
+        depth_freshness: 'LIVE',
+        executable: true,
       });
   });
 });

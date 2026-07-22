@@ -218,6 +218,56 @@ def test_native_rebase_settles_trade_seeded_rollover_without_regressing_ohlcv():
     assert rebased.preview.baseline_anchor_open_time is None
 
 
+def test_late_native_anchor_revision_advances_rollover_cursor_without_regressing_bar():
+    engine = ContractCandlePreviewEngine()
+    engine.accept_native_revision(_native(revision_sequence=8))
+    seeded = engine.accept_trade(
+        _trade(
+            "next-minute-first",
+            "103",
+            "2",
+            event_time_ms=OPEN_TIME + 60_001,
+        )
+    )
+
+    late_anchor = engine.accept_native_revision(
+        _native(
+            close="102",
+            volume="55",
+            quote_volume="5560",
+            revision_sequence=9,
+            is_closed=True,
+        )
+    )
+    continued = engine.accept_trade(
+        _trade(
+            "next-minute-second",
+            "104",
+            "1",
+            event_time_ms=OPEN_TIME + 60_500,
+        )
+    )
+
+    assert seeded.preview is not None
+    assert seeded.preview.revision_sequence == 8
+    assert late_anchor.status is ContractNativePreviewStatus.REBASED
+    assert late_anchor.preview is not None
+    assert late_anchor.preview.open_time == OPEN_TIME + 60_000
+    assert late_anchor.preview.revision_sequence == 9
+    assert late_anchor.preview.preview_sequence == 1
+    assert str(late_anchor.preview.open) == "103"
+    assert str(late_anchor.preview.close) == "103"
+    assert str(late_anchor.preview.volume) == "2"
+    assert late_anchor.preview.baseline_source == "TRADE_ROLLOVER"
+    assert late_anchor.preview.baseline_anchor_open_time == OPEN_TIME
+    assert continued.status is ContractPreviewTradeStatus.APPLIED
+    assert continued.preview is not None
+    assert continued.preview.revision_sequence == 9
+    assert continued.preview.preview_sequence == 2
+    assert str(continued.preview.close) == "104"
+    assert str(continued.preview.volume) == "3"
+
+
 def test_contiguous_rollover_requires_same_generation_and_real_native_anchor():
     engine = ContractCandlePreviewEngine()
     engine.accept_native_revision(_native())
@@ -373,6 +423,30 @@ def test_new_okx_contract_symbol_uses_the_same_preview_capability():
     assert result.preview.symbol == symbol
     assert str(result.preview.close) == "103"
     assert str(result.preview.volume) == "52"
+
+
+def test_itick_stock_symbol_with_dot_uses_trade_preview_capability():
+    engine = ContractCandlePreviewEngine()
+    symbol = "BRK.BUSDT_PERP"
+
+    baseline = engine.accept_native_revision(
+        _native(symbol=symbol, provider="ITICK", quote_volume=None)
+    )
+    result = engine.accept_trade(
+        _trade(
+            "brk-b-tick-1",
+            "503.25",
+            "2",
+            symbol=symbol,
+            provider="ITICK",
+        )
+    )
+
+    assert baseline.status is ContractNativePreviewStatus.BASELINE_CREATED
+    assert result.status is ContractPreviewTradeStatus.APPLIED
+    assert result.preview is not None
+    assert result.preview.symbol == symbol
+    assert str(result.preview.close) == "503.25"
 
 
 def test_itick_contract_uses_the_same_native_baseline_and_trade_ohlcv_preview():

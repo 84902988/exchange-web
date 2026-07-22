@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 
 import pytest
 
@@ -52,7 +53,7 @@ def test_gateway_snapshots_request_provider_ws_warmup() -> None:
         gateway._refresh_symbol_once = lambda symbol, intervals, ensure: calls.append(
             ("full", symbol, intervals[0], ensure)
         )
-        gateway._refresh_market_once = lambda symbol, ensure: calls.append(
+        gateway._refresh_market_once = lambda symbol, ensure, intervals: calls.append(
             ("market", symbol, None, ensure)
         )
         gateway._refresh_kline_once = lambda symbol, interval, ensure: calls.append(
@@ -89,6 +90,40 @@ def test_gateway_uses_itick_cadence_ttl_without_weakening_crypto_ttl(monkeypatch
         ContractMarketDomainName.TICKER,
         provider="OKX_SWAP",
     ) == 1_500
+
+
+def test_itick_depth_transport_liveness_keeps_domain_snapshot_fresh(monkeypatch):
+    monkeypatch.setattr(gateway_module, "_utc_ms", lambda: NOW_MS)
+    gateway = ContractMarketGateway()
+    depth = {
+        "symbol": "EURUSD_PERP",
+        "provider": "ITICK",
+        "provider_symbol": "EURUSD",
+        "source": "LIVE_WS",
+        "quote_source": "LIVE_WS",
+        "bids": [["1.14190", "1"]],
+        "asks": [["1.14205", "1"]],
+        "received_at_ms": NOW_MS - 250,
+        "depth_frame_received_at_ms": NOW_MS - 12_000,
+        "transport_liveness_at_ms": NOW_MS - 250,
+        "freshness_basis": "TRANSPORT_LIVENESS",
+        "provider_generation": 7,
+        "revision_epoch": 7,
+        "revision_sequence": 3,
+    }
+
+    snapshot = gateway._build_domain_snapshot(
+        template=CONTRACT_MARKET_CACHE_DEPTH,
+        symbol="EURUSD_PERP",
+        value=depth,
+        interval=None,
+        authority_payload=depth,
+    )
+
+    assert snapshot is not None
+    assert snapshot.metadata.freshness.value == "LIVE"
+    assert snapshot.metadata.stale is False
+    assert snapshot.metadata.age_ms == 250
 
 
 def _context(
@@ -324,6 +359,69 @@ def test_gateway_contract_preview_advances_close_and_volume_from_same_trade_evid
     assert message["settlement_revision"].endswith(":3:8:1")
 
 
+def test_gateway_equal_timestamp_batch_settles_preview_and_header_on_newest_first_trade(
+    monkeypatch,
+):
+    gateway = ContractMarketGateway()
+    symbol = "EURUSD_PERP"
+    open_time = (NOW_MS // 60_000) * 60_000
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 7,
+    )
+    gateway._accept_candle_preview_native(
+        symbol,
+        "1m",
+        {
+            "provider": "ITICK",
+            "provider_generation": 7,
+            "revision_epoch": 7,
+            "revision_sequence": 10,
+            "open_time": open_time,
+            "open": "1.14060",
+            "high": "1.14060",
+            "low": "1.14060",
+            "close": "1.14060",
+            "volume": "100",
+            "is_closed": False,
+        },
+    )
+    event_time = open_time + 30_000
+    newest_first = [
+        {
+            "id": "newest",
+            "symbol": symbol,
+            "provider": "ITICK",
+            "price": "1.14068",
+            "qty": "1",
+            "time": event_time,
+            "price_source": "TRADE_TICK",
+        },
+        {
+            "id": "older-same-second",
+            "symbol": symbol,
+            "provider": "ITICK",
+            "price": "1.14065",
+            "qty": "1",
+            "time": event_time,
+            "price_source": "TRADE_TICK",
+        },
+    ]
+
+    trade_message, preview_message = gateway._trade_preview_settlement_messages(
+        symbol,
+        ["1m"],
+        newest_first,
+        {"provider": "ITICK", "received_at_ms": event_time + 10},
+    )
+
+    assert preview_message["settlement_trade_id"] == "newest"
+    assert preview_message["preview"]["close"] == "1.14068"
+    assert trade_message["trade"]["id"] == "newest"
+    assert trade_message["trade"]["price"] == preview_message["preview"]["close"]
+
+
 def test_gateway_itick_preview_bootstraps_rest_native_with_live_generation(monkeypatch):
     gateway = ContractMarketGateway()
     symbol = "NAS100USDT_PERP"
@@ -368,6 +466,132 @@ def test_gateway_itick_preview_bootstraps_rest_native_with_live_generation(monke
     assert messages[0]["preview"]["close"] == "28821.84"
     assert messages[0]["preview"]["volume"] == "492"
     assert messages[0]["base_native_revision"] == {"epoch": 7, "sequence": 0}
+
+
+def test_gateway_first_trade_primes_fresh_rest_kline_without_additional_io(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "NAS100USDT_PERP"
+    open_time = (NOW_MS // 60_000) * 60_000
+    monkeypatch.setattr(gateway_module, "_utc_ms", lambda: NOW_MS)
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 7,
+    )
+    native = {
+        "provider": "ITICK",
+        "provider_symbol": "NAS100",
+        "source": "PROVIDER_REST",
+        "received_at_ms": NOW_MS,
+        "open_time": open_time,
+        "open": "28820",
+        "high": "28824",
+        "low": "28818",
+        "close": "28822",
+        "volume": "490",
+        "quote_volume": None,
+        "is_closed": False,
+    }
+    assert gateway._set_latest(
+        CONTRACT_MARKET_CACHE_KLINE,
+        symbol,
+        native,
+        interval="1m",
+        authority_payload=native,
+    )
+    authority_reads = 0
+    original_authority_payload = gateway._kline_authority_payload
+
+    def tracked_authority_payload(*args, **kwargs):
+        nonlocal authority_reads
+        authority_reads += 1
+        return original_authority_payload(*args, **kwargs)
+
+    monkeypatch.setattr(gateway, "_kline_authority_payload", tracked_authority_payload)
+
+    first = gateway._candle_preview_messages(
+        symbol,
+        ["1m"],
+        [{
+            "id": "nas-first-trade",
+            "provider": "ITICK",
+            "price": "28823",
+            "qty": "2",
+            "time": open_time + 30_000,
+        }],
+        {"provider": "ITICK", "received_at_ms": open_time + 30_010},
+    )
+    second = gateway._candle_preview_messages(
+        symbol,
+        ["1m"],
+        [{
+            "id": "nas-second-trade",
+            "provider": "ITICK",
+            "price": "28825",
+            "qty": "1",
+            "time": open_time + 31_000,
+        }],
+        {"provider": "ITICK", "received_at_ms": open_time + 31_010},
+    )
+
+    assert authority_reads == 1
+    assert first[0]["preview"]["close"] == "28823"
+    assert first[0]["preview"]["volume"] == "492"
+    assert first[0]["base_native_revision"] == {"epoch": 7, "sequence": 0}
+    assert second[0]["preview"]["close"] == "28825"
+    assert second[0]["preview"]["volume"] == "493"
+
+
+def test_gateway_does_not_relabel_versioned_kline_from_old_generation(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "EURUSD_PERP"
+    open_time = (NOW_MS // 60_000) * 60_000
+    monkeypatch.setattr(gateway_module, "_utc_ms", lambda: NOW_MS)
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 8,
+    )
+    native = {
+        "provider": "ITICK",
+        "provider_symbol": "EURUSD",
+        "source": "LIVE_WS",
+        "received_at_ms": NOW_MS,
+        "provider_generation": 7,
+        "revision_epoch": 7,
+        "revision_sequence": 12,
+        "open_time": open_time,
+        "open": "1.14000",
+        "high": "1.14020",
+        "low": "1.13990",
+        "close": "1.14010",
+        "volume": "100",
+        "quote_volume": None,
+        "is_closed": False,
+    }
+    assert gateway._set_latest(
+        CONTRACT_MARKET_CACHE_KLINE,
+        symbol,
+        native,
+        interval="1m",
+        authority_payload=native,
+    )
+
+    messages = gateway._candle_preview_messages(
+        symbol,
+        ["1m"],
+        [{
+            "id": "eur-new-generation-trade",
+            "provider": "ITICK",
+            "price": "1.14015",
+            "qty": "2",
+            "time": open_time + 30_000,
+        }],
+        {"provider": "ITICK", "received_at_ms": open_time + 30_010},
+    )
+
+    assert messages == []
+    assert gateway._candle_preview_engine.get_preview(symbol, "1m") is None
 
 
 def test_gateway_five_minute_preview_only_processes_the_subscribed_interval(monkeypatch):
@@ -503,6 +727,511 @@ def test_gateway_carries_native_ticker_status_into_depth_quote(monkeypatch):
     assert captured["status"] is ticker
 
 
+def test_gateway_native_itick_depth_owns_bbo_when_ticker_also_has_native_bbo(monkeypatch):
+    gateway = ContractMarketGateway()
+    ticker = {
+        "provider": "ITICK",
+        "provider_symbol": "NAS100",
+        "last_price": "29145.13",
+        "price_field": "ld",
+        "source": "LIVE_WS",
+    }
+    depth = {
+        "provider": "ITICK",
+        "provider_symbol": "NAS100",
+        "best_bid": "29144.75",
+        "best_ask": "29145.75",
+        "source": "LIVE_WS",
+    }
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_ticker", lambda *_args, **_kwargs: ticker)
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_depth", lambda *_args, **_kwargs: depth)
+    monkeypatch.setattr(
+        gateway,
+        "_prepare_provider_ws_quote_payload",
+        lambda *_args, **_kwargs: {
+            "source": "LIVE_WS",
+            "bid_price": "29144.80",
+            "ask_price": "29145.70",
+        },
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_prepare_provider_ws_depth_quote_payload",
+        lambda _db, _symbol, payload, **_kwargs: {
+            "source": "LIVE_WS",
+            "bid_price": payload["best_bid"],
+            "ask_price": payload["best_ask"],
+        },
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_enrich_provider_ws_ticker_24h",
+        lambda _db, _symbol, payload, **_kwargs: payload,
+    )
+
+    quote = gateway._load_quote_payload(
+        object(),
+        "NAS100USDT_PERP",
+        allow_provider_ws=True,
+        allow_rest_fallback=False,
+    )
+
+    assert quote == {
+        "source": "LIVE_WS",
+        "bid_price": "29144.75",
+        "ask_price": "29145.75",
+    }
+
+
+def test_gateway_native_itick_quote_is_used_only_when_depth_is_absent(monkeypatch):
+    gateway = ContractMarketGateway()
+    native_quote = {
+        "source": "LIVE_WS",
+        "bid_price": "1.14190",
+        "ask_price": "1.14205",
+    }
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: True)
+    monkeypatch.setattr(
+        gateway_module,
+        "select_fresh_provider_ws_ticker",
+        lambda *_args, **_kwargs: {"provider": "ITICK"},
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "select_fresh_provider_ws_depth",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_prepare_provider_ws_quote_payload",
+        lambda *_args, **_kwargs: native_quote,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_enrich_provider_ws_ticker_24h",
+        lambda _db, _symbol, payload, **_kwargs: payload,
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_quote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("REST must not run")),
+    )
+
+    quote = gateway._load_quote_payload(
+        object(),
+        "EURUSD_PERP",
+        allow_provider_ws=True,
+        allow_rest_fallback=True,
+    )
+
+    assert quote is native_quote
+
+
+def test_gateway_does_not_fabricate_bbo_when_itick_depth_is_absent(monkeypatch):
+    gateway = ContractMarketGateway()
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: True)
+    monkeypatch.setattr(
+        gateway_module,
+        "select_fresh_provider_ws_ticker",
+        lambda *_args, **_kwargs: {
+            "provider": "ITICK",
+            "provider_symbol": "DJI",
+            "last_price": "52196.23",
+            "price_field": "ld",
+        },
+    )
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_depth", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gateway, "_prepare_provider_ws_quote_payload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        gateway,
+        "_enrich_provider_ws_ticker_24h",
+        lambda _db, _symbol, payload, **_kwargs: payload,
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_quote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("REST must not run")),
+    )
+
+    quote = gateway._load_quote_payload(
+        object(),
+        "DJIUSDT_PERP",
+        allow_provider_ws=True,
+        allow_rest_fallback=False,
+    )
+
+    assert quote is None
+
+
+def test_gateway_does_not_prepare_itick_latest_price_as_live_cfd_bbo(monkeypatch):
+    gateway = ContractMarketGateway()
+    contract_symbol = type(
+        "ContractSymbolStub",
+        (),
+        {
+            "symbol": "DJIUSDT_PERP",
+            "category": "INDEX",
+            "provider": "ITICK",
+            "provider_symbol": "DJI",
+            "price_precision": 2,
+        },
+    )()
+    monkeypatch.setattr(gateway_module, "_load_contract_symbol", lambda *_args, **_kwargs: contract_symbol)
+    monkeypatch.setattr(gateway_module, "_market_status_for_contract_symbol", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(gateway_module, "_contract_quote_with_status", lambda quote, *_args, **_kwargs: quote)
+
+    quote = gateway._prepare_provider_ws_quote_payload(
+        object(),
+        contract_symbol.symbol,
+        {
+            "symbol": contract_symbol.symbol,
+            "provider": "ITICK",
+            "provider_symbol": "DJI",
+            "last_price": "52196.23",
+            "price_field": "ld",
+            "provider_trading_status": 0,
+            "provider_market_status": "OPEN",
+            "ts": gateway_module.datetime.utcnow(),
+            "received_at_ms": 1_720_000_000_000,
+        },
+    )
+
+    assert quote is None
+
+
+def test_gateway_accepts_native_itick_bbo_independently_of_last_price_field(monkeypatch):
+    gateway = ContractMarketGateway()
+    contract_symbol = type(
+        "ContractSymbolStub",
+        (),
+        {
+            "symbol": "SPXUSDT_PERP",
+            "category": "INDEX",
+            "provider": "ITICK",
+            "provider_symbol": "SPX",
+            "price_precision": 2,
+        },
+    )()
+    monkeypatch.setattr(
+        gateway_module,
+        "_load_contract_symbol",
+        lambda *_args, **_kwargs: contract_symbol,
+    )
+
+    quote = gateway._prepare_provider_ws_quote_payload(
+        object(),
+        contract_symbol.symbol,
+        {
+            "symbol": contract_symbol.symbol,
+            "provider": "ITICK",
+            "provider_symbol": "SPX",
+            "last_price": "0.35",
+            "price_field": "p",
+            "bid_price": "7439.57",
+            "ask_price": "7447.01",
+            "ts": gateway_module.datetime.utcnow(),
+        },
+    )
+
+    assert quote is not None
+    assert quote["bid_price"] == Decimal("7439.57")
+    assert quote["ask_price"] == Decimal("7447.01")
+    assert quote["bbo_authority"] == "ITICK_NATIVE_QUOTE"
+
+
+def _itick_index_trade(*, price: str, event_time_ms: int) -> dict:
+    return {
+        "id": f"DJI:{event_time_ms}:{price}",
+        "symbol": "DJIUSDT_PERP",
+        "provider": "ITICK",
+        "provider_symbol": "DJI",
+        "price": price,
+        "qty": "1",
+        "time": event_time_ms,
+        "ts": event_time_ms,
+        "source": "LIVE_WS",
+        "quote_source": "LIVE_WS",
+        "quote_freshness": "LIVE",
+        "price_source": "TRADE_TICK",
+        "price_field": "ld",
+        "exchange_ts": event_time_ms,
+    }
+
+
+def _itick_index_contract_symbol():
+    return type(
+        "ContractSymbolStub",
+        (),
+        {
+            "symbol": "DJIUSDT_PERP",
+            "category": "INDEX",
+            "provider": "ITICK",
+            "provider_symbol": "DJI",
+            "price_precision": 2,
+            "spread_x": 0,
+        },
+    )()
+
+
+def test_gateway_trade_tick_never_rebases_quote_or_depth_bbo(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "DJIUSDT_PERP"
+    event_time_ms = gateway_module._utc_ms() - 1_000
+    rest_authority = {
+        "provider": "ITICK",
+        "provider_symbol": "DJI",
+        "source": "ITICK",
+        # Reproduce the runtime race: the HTTP bootstrap finishes after the
+        # provider trade was received even though its market value is older.
+        "received_at_ms": event_time_ms + 1_000,
+    }
+    rest_quote = {
+        "symbol": symbol,
+        "provider": "ITICK",
+        "provider_symbol": "DJI",
+        "last_price": "52196.23",
+        "bid_price": "52170.13",
+        "ask_price": "52222.33",
+        "source": "ITICK",
+    }
+    rest_depth = {
+        "symbol": symbol,
+        "provider": "ITICK",
+        "provider_symbol": "DJI",
+        "bids": [["52170.13", "0"]],
+        "asks": [["52222.33", "0"]],
+        "best_bid": "52170.13",
+        "best_ask": "52222.33",
+        "source": "ITICK",
+        "depth_mode": "BBO_ONLY",
+    }
+    assert gateway._set_latest(
+        CONTRACT_MARKET_CACHE_QUOTE,
+        symbol,
+        rest_quote,
+        authority_payload=rest_authority,
+    )
+    assert gateway._set_latest(
+        CONTRACT_MARKET_CACHE_DEPTH,
+        symbol,
+        rest_depth,
+        authority_payload=rest_authority,
+    )
+    gateway._remember_quote_signature(symbol, rest_quote)
+    gateway._remember_depth_signature(symbol, rest_depth)
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_depth", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        gateway_module,
+        "select_fresh_provider_ws_ticker",
+        lambda *_args, **_kwargs: {
+            "provider": "ITICK",
+            "last_price": "52196.23",
+            "bid_price": "52170.13",
+            "ask_price": "52222.33",
+        },
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "_load_contract_symbol",
+        lambda *_args, **_kwargs: _itick_index_contract_symbol(),
+    )
+
+    messages = gateway._itick_trade_derived_bbo_messages(
+        object(),
+        symbol,
+        [_itick_index_trade(price="52270.22", event_time_ms=event_time_ms)],
+        {
+            "provider": "ITICK",
+            "provider_symbol": "DJI",
+            "source": "LIVE_WS",
+            "received_at_ms": event_time_ms + 500,
+            "provider_generation": 1,
+            "revision_epoch": 1,
+            "revision_sequence": 7,
+        },
+    )
+
+    assert messages == []
+    quote = gateway._get_latest(CONTRACT_MARKET_CACHE_QUOTE, symbol)
+    depth = gateway._get_latest(CONTRACT_MARKET_CACHE_DEPTH, symbol)
+    assert quote == rest_quote
+    assert depth == rest_depth
+    assert depth["depth_mode"] == "BBO_ONLY"
+    quote_snapshot = gateway.get_domain_snapshot(
+        ContractMarketDomainName.TICKER,
+        symbol,
+    )
+    depth_snapshot = gateway.get_domain_snapshot(
+        ContractMarketDomainName.DEPTH,
+        symbol,
+    )
+    assert quote_snapshot is not None
+    assert depth_snapshot is not None
+    assert quote_snapshot.metadata.source == ContractMarketDomainSource.REST_SNAPSHOT
+    assert quote_snapshot.metadata.transport == ContractMarketDomainTransport.PROVIDER_REST
+    assert quote_snapshot.metadata.provider_generation is None
+    assert depth_snapshot.metadata.source == ContractMarketDomainSource.REST_SNAPSHOT
+    assert depth_snapshot.metadata.transport == ContractMarketDomainTransport.PROVIDER_REST
+    assert depth_snapshot.metadata.provider_generation is None
+def test_gateway_trade_tick_does_not_create_bbo_when_native_depth_exists(monkeypatch):
+    gateway = ContractMarketGateway()
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: True)
+    monkeypatch.setattr(
+        gateway_module,
+        "select_fresh_provider_ws_depth",
+        lambda *_args, **_kwargs: {
+            "bids": [["52269", "1"]],
+            "asks": [["52271", "1"]],
+        },
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "select_fresh_provider_ws_ticker",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "_load_contract_symbol",
+        lambda *_args, **_kwargs: _itick_index_contract_symbol(),
+    )
+
+    messages = gateway._itick_trade_derived_bbo_messages(
+        object(),
+        "DJIUSDT_PERP",
+        [_itick_index_trade(price="52270.22", event_time_ms=1_720_000_001_000)],
+        {"provider": "ITICK", "source": "LIVE_WS"},
+    )
+
+    assert messages == []
+    assert gateway._get_latest(CONTRACT_MARKET_CACHE_QUOTE, "DJIUSDT_PERP") is None
+
+
+def test_gateway_never_overrides_native_itick_stock_depth_with_trade_derivation(monkeypatch):
+    gateway = ContractMarketGateway()
+    stock_symbol = type(
+        "ContractSymbolStub",
+        (),
+        {
+            "symbol": "AAPLUSDT_PERP",
+            "category": "STOCK",
+            "provider": "ITICK",
+            "provider_symbol": "AAPL",
+            "price_precision": 2,
+            "spread_x": 0,
+        },
+    )()
+    trade = {
+        **_itick_index_trade(price="328.75", event_time_ms=1_720_000_001_000),
+        "symbol": stock_symbol.symbol,
+        "provider_symbol": stock_symbol.provider_symbol,
+    }
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: True)
+    monkeypatch.setattr(
+        gateway_module,
+        "select_fresh_provider_ws_depth",
+        lambda *_args, **_kwargs: {
+            "bids": [["328.74", "1"]],
+            "asks": [["328.76", "1"]],
+        },
+    )
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_ticker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gateway_module, "_load_contract_symbol", lambda *_args, **_kwargs: stock_symbol)
+
+    assert gateway._itick_trade_derived_bbo_messages(
+        object(),
+        stock_symbol.symbol,
+        [trade],
+        {"provider": "ITICK", "source": "LIVE_WS"},
+    ) == []
+
+
+def test_gateway_preserves_native_itick_stock_quote_over_trade_derivation(monkeypatch):
+    gateway = ContractMarketGateway()
+    stock_symbol = type(
+        "ContractSymbolStub",
+        (),
+        {
+            "symbol": "AAPLUSDT_PERP",
+            "category": "STOCK",
+            "provider": "ITICK",
+            "provider_symbol": "AAPL",
+            "price_precision": 2,
+            "spread_x": 0,
+        },
+    )()
+    trade = {
+        **_itick_index_trade(price="328.75", event_time_ms=1_720_000_001_000),
+        "symbol": stock_symbol.symbol,
+        "provider_symbol": stock_symbol.provider_symbol,
+    }
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: True)
+    monkeypatch.setattr(gateway_module, "select_fresh_provider_ws_depth", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        gateway_module,
+        "select_fresh_provider_ws_ticker",
+        lambda *_args, **_kwargs: {"bid_price": "328.74", "ask_price": "328.76"},
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "_load_contract_symbol",
+        lambda *_args, **_kwargs: stock_symbol,
+    )
+
+    assert gateway._itick_trade_derived_bbo_messages(
+        object(),
+        stock_symbol.symbol,
+        [trade],
+        {"provider": "ITICK", "source": "LIVE_WS"},
+    ) == []
+
+
+def test_gateway_never_derives_bbo_from_on_time_or_late_trade_ticks(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "DJIUSDT_PERP"
+    monkeypatch.setattr(gateway_module, "provider_ws_depth_enabled", lambda: False)
+    monkeypatch.setattr(gateway_module, "provider_ws_ticker_enabled", lambda: False)
+    monkeypatch.setattr(
+        gateway_module,
+        "_load_contract_symbol",
+        lambda *_args, **_kwargs: _itick_index_contract_symbol(),
+    )
+    authority = {
+        "provider": "ITICK",
+        "provider_symbol": "DJI",
+        "source": "LIVE_WS",
+        "received_at_ms": 1_720_000_002_005,
+        "provider_generation": 1,
+        "revision_epoch": 1,
+        "revision_sequence": 2,
+    }
+
+    first = gateway._itick_trade_derived_bbo_messages(
+        object(),
+        symbol,
+        [_itick_index_trade(price="52270.22", event_time_ms=1_720_000_002_000)],
+        authority,
+    )
+    late = gateway._itick_trade_derived_bbo_messages(
+        object(),
+        symbol,
+        [_itick_index_trade(price="52000", event_time_ms=1_720_000_001_000)],
+        {**authority, "revision_sequence": 3},
+    )
+
+    assert first == []
+    assert late == []
+    assert gateway._get_latest(CONTRACT_MARKET_CACHE_QUOTE, symbol) is None
+
+
 def test_gateway_reuses_bounded_rest_ticker_evidence_for_partial_ws_frames(monkeypatch):
     gateway = ContractMarketGateway()
     symbol = "EURUSD_PERP"
@@ -608,6 +1337,164 @@ def test_gateway_marks_generic_contiguous_rollover_as_trade_seeded(monkeypatch):
     assert message["preview"]["open_time"] == open_time + 60_000
     assert message["preview"]["close"] == "103"
     assert message["preview"]["volume"] == "2"
+
+
+def test_gateway_preview_never_opens_a_future_provider_bucket(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "EURUSD_PERP"
+    open_time = (NOW_MS // 60_000) * 60_000
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 7,
+    )
+    gateway._accept_candle_preview_native(
+        symbol,
+        "1m",
+        {
+            "provider": "ITICK",
+            "provider_generation": 7,
+            "revision_epoch": 7,
+            "revision_sequence": 4,
+            "open_time": open_time,
+            "open": "1.14000",
+            "high": "1.14020",
+            "low": "1.13990",
+            "close": "1.14010",
+            "volume": "100",
+            "quote_volume": None,
+            "is_closed": False,
+        },
+    )
+
+    before_boundary = gateway._trade_preview_settlement_messages(
+        symbol,
+        ["1m"],
+        [
+            {
+                "id": "eur-future-clock-1",
+                "symbol": symbol,
+                "provider": "ITICK",
+                "price": "1.14015",
+                "qty": "2",
+                # Provider clock is already in the next minute, while this
+                # frame reached the gateway before the local boundary.
+                "time": open_time + 60_500,
+            },
+            {
+                "id": "eur-future-clock-0",
+                "symbol": symbol,
+                "provider": "ITICK",
+                "price": "1.14012",
+                "qty": "1",
+                "time": open_time + 60_200,
+            },
+        ],
+        {"provider": "ITICK", "received_at_ms": open_time + 59_500},
+    )
+
+    assert len(before_boundary) == 2
+    first_trade, first_preview = before_boundary
+    assert first_trade["trade"]["id"] == "eur-future-clock-1"
+    assert first_trade["trade"]["time"] == open_time + 60_500
+    assert first_preview["settlement_trade_id"] == "eur-future-clock-1"
+    assert first_preview["settlement_trade_price"] == "1.14015"
+    assert first_preview["preview"]["open_time"] == open_time
+    assert first_preview["preview"]["baseline_source"] == "NATIVE"
+    assert first_preview["preview"]["close"] == "1.14015"
+    assert first_preview["preview"]["volume"] == "103"
+
+    after_boundary = gateway._trade_preview_settlement_messages(
+        symbol,
+        ["1m"],
+        [{
+            "id": "eur-future-clock-2",
+            "symbol": symbol,
+            "provider": "ITICK",
+            "price": "1.14018",
+            "qty": "3",
+            "time": open_time + 70_100,
+        }],
+        {"provider": "ITICK", "received_at_ms": open_time + 60_100},
+    )
+
+    assert len(after_boundary) == 2
+    second_trade, second_preview = after_boundary
+    assert second_trade["trade"]["time"] == open_time + 70_100
+    assert second_preview["preview"]["open_time"] == open_time + 60_000
+    assert second_preview["preview"]["baseline_source"] == "TRADE_ROLLOVER"
+    assert second_preview["preview"]["close"] == "1.14018"
+
+
+def test_gateway_rollover_preview_tracks_late_anchor_revision(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "XAUUSDT_PERP"
+    open_time = (NOW_MS // 60_000) * 60_000
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 11,
+    )
+    native = {
+        "provider": "ITICK",
+        "provider_generation": 11,
+        "revision_epoch": 11,
+        "open_time": open_time,
+        "open": "4030",
+        "high": "4032",
+        "low": "4029",
+        "close": "4031",
+        "volume": "100",
+        "quote_volume": None,
+        "is_closed": False,
+    }
+    gateway._accept_candle_preview_native(
+        symbol,
+        "1m",
+        {**native, "revision_sequence": 4},
+    )
+    first = gateway._candle_preview_messages(
+        symbol,
+        ["1m"],
+        [{
+            "id": "xau-rollover-1",
+            "provider": "ITICK",
+            "price": "4033",
+            "qty": "2",
+            "time": open_time + 60_010,
+        }],
+        {"provider": "ITICK", "received_at_ms": open_time + 60_010},
+    )
+
+    gateway._accept_candle_preview_native(
+        symbol,
+        "1m",
+        {
+            **native,
+            "close": "4032",
+            "volume": "110",
+            "revision_sequence": 5,
+            "is_closed": True,
+        },
+    )
+    continued = gateway._candle_preview_messages(
+        symbol,
+        ["1m"],
+        [{
+            "id": "xau-rollover-2",
+            "provider": "ITICK",
+            "price": "4034",
+            "qty": "1",
+            "time": open_time + 60_500,
+        }],
+        {"provider": "ITICK", "received_at_ms": open_time + 60_500},
+    )
+
+    assert first[0]["base_native_revision"] == {"epoch": 11, "sequence": 4}
+    assert continued[0]["base_native_revision"] == {"epoch": 11, "sequence": 5}
+    assert continued[0]["preview"]["baseline_source"] == "TRADE_ROLLOVER"
+    assert continued[0]["preview"]["close"] == "4034"
+    assert continued[0]["preview"]["volume"] == "3"
 
 
 def test_gateway_contract_preview_fails_closed_without_native_ohlcv_or_generation(
@@ -814,6 +1701,105 @@ def test_gateway_broadcast_cycle_primes_native_revision_before_trade_preview(mon
     ]
 
 
+def test_gateway_initial_snapshot_primes_native_revision_before_market_trades(monkeypatch):
+    gateway = ContractMarketGateway()
+    calls: list[str] = []
+
+    def refresh_kline(symbol, interval, ensure_provider_ws=False):
+        assert symbol == SYMBOL
+        assert interval == "1m"
+        assert ensure_provider_ws is True
+        calls.append("kline")
+        return {"close": "101"}
+
+    def kline_message(symbol, interval):
+        assert symbol == SYMBOL
+        assert interval == "1m"
+        calls.append("kline_message")
+        return {"type": "contract_kline_update"}
+
+    def refresh_market(symbol, ensure_provider_ws=False, intervals=None):
+        assert symbol == SYMBOL
+        assert ensure_provider_ws is True
+        assert intervals == ["1m"]
+        calls.append("market")
+        return [
+            {"type": "contract_trade"},
+            {"type": "contract_candle_preview_update"},
+        ]
+
+    monkeypatch.setattr(gateway, "_refresh_kline_once", refresh_kline)
+    monkeypatch.setattr(gateway, "_kline_message", kline_message)
+    monkeypatch.setattr(gateway, "_refresh_market_once", refresh_market)
+
+    messages = gateway._refresh_symbol_once(SYMBOL, ["1m"], True)
+
+    assert calls == ["kline", "kline_message", "market"]
+    assert [message["type"] for message in messages] == [
+        "contract_kline_update",
+        "contract_trade",
+        "contract_candle_preview_update",
+    ]
+
+
+def test_gateway_snapshots_embed_bootstrap_preview_for_atomic_client_settlement(monkeypatch):
+    gateway = ContractMarketGateway()
+    preview = {
+        "type": "contract_candle_preview_update",
+        "domain": "kline",
+        "symbol": SYMBOL,
+        "interval": "1m",
+        "preview": {"close": "101", "volume": "11"},
+    }
+
+    monkeypatch.setattr(
+        gateway,
+        "_refresh_symbol_once",
+        lambda *_args, **_kwargs: [
+            {"type": "contract_kline_update"},
+            {"type": "contract_trade"},
+            preview,
+        ],
+    )
+
+    snapshot = asyncio.run(gateway.snapshot(SYMBOL, "1m"))
+
+    assert snapshot["data"]["candle_previews"] == [preview]
+    assert snapshot["data"]["candle_previews"][0] is not preview
+
+
+def test_gateway_market_snapshot_uses_subscribed_intervals_and_embeds_preview(monkeypatch):
+    gateway = ContractMarketGateway()
+    calls: list[tuple[str, bool, list[str]]] = []
+    preview = {
+        "type": "contract_candle_preview_update",
+        "domain": "kline",
+        "symbol": SYMBOL,
+        "interval": "1m",
+        "preview": {"close": "101", "volume": "11"},
+    }
+
+    async def subscribed_intervals(symbol):
+        assert symbol == SYMBOL
+        return ["1m"]
+
+    def refresh_market(symbol, ensure_provider_ws, intervals):
+        calls.append((symbol, ensure_provider_ws, intervals))
+        return [{"type": "contract_trade"}, preview]
+
+    monkeypatch.setattr(
+        gateway_module.contract_market_ws_manager,
+        "subscribed_intervals",
+        subscribed_intervals,
+    )
+    monkeypatch.setattr(gateway, "_refresh_market_once", refresh_market)
+
+    snapshot = asyncio.run(gateway.market_snapshot(SYMBOL))
+
+    assert calls == [(SYMBOL, True, ["1m"])]
+    assert snapshot["data"]["candle_previews"] == [preview]
+
+
 def test_gateway_builds_four_domain_snapshots_without_changing_legacy_payloads():
     gateway = ContractMarketGateway()
     authority = {
@@ -888,11 +1874,62 @@ def test_gateway_builds_four_domain_snapshots_without_changing_legacy_payloads()
         assert snapshot.metadata.provider_generation == 4
 
     assert gateway._get_latest(CONTRACT_MARKET_CACHE_QUOTE, SYMBOL) == ticker
-    envelope = gateway._quote_message(SYMBOL, ticker)
-    assert envelope["data"] == ticker
-    assert "snapshot" not in envelope
-    assert "metadata" not in envelope
-    assert "provider_generation" not in envelope["data"]
+    envelopes = {
+        "ticker": gateway._quote_message(SYMBOL, ticker),
+        "depth": gateway._depth_message(SYMBOL, depth),
+        "trades": gateway._trades_message(SYMBOL, trades),
+    }
+    for domain, envelope in envelopes.items():
+        snapshot = gateway.get_domain_snapshot(
+            ContractMarketDomainName(domain),
+            SYMBOL,
+        )
+        assert snapshot is not None
+        assert envelope["provider"] == "OKX_SWAP"
+        assert envelope["provider_generation"] == 4
+        assert envelope["revision_epoch"] == 4
+        assert envelope["revision_sequence"] == 1
+        assert envelope["revision"] == {
+            "epoch": 4,
+            "sequence": 1,
+            "is_closed": None,
+            "close_state_source": None,
+            "checksum": None,
+        }
+        assert envelope["received_at_ms"] == NOW_MS
+        assert envelope["snapshot_id"] == snapshot.snapshot_id
+        assert "snapshot" not in envelope
+        assert "metadata" not in envelope
+
+    assert envelopes["ticker"]["data"] == ticker
+    assert envelopes["depth"]["data"] == depth
+    assert envelopes["trades"]["data"][0]["id"] == "t-1"
+    assert envelopes["trades"]["data"][0]["price"] == "101"
+    assert "provider_generation" not in envelopes["ticker"]["data"]
+
+    # A mutable compatibility cache must never become a second Header
+    # authority once the accepted domain snapshot has settled at 101.
+    gateway._latest[
+        CONTRACT_MARKET_CACHE_TRADES.format(symbol=SYMBOL)
+    ] = [{"id": "legacy-decoy", "price": "999", "time": NOW_MS + 1}]
+
+    state = gateway._build_market_state_from_latest(SYMBOL)
+    assert state is not None
+    assert state["view_version"] == "2"
+    assert state["authority_source"] == "SNAPSHOT_AUTHORITY"
+    assert state["snapshot_authority"] is True
+    assert state["display_price"] == "101"
+    assert set(state["snapshot_metadata"]) == {
+        "ticker",
+        "depth",
+        "trades",
+        "kline",
+    }
+    for metadata in state["snapshot_metadata"].values():
+        assert metadata["provider"] == "OKX_SWAP"
+        assert metadata["provider_generation"] == 4
+        assert metadata["revision"]["epoch"] == 4
+        assert metadata["revision"]["sequence"] == 1
 
 
 def test_provider_ws_cache_carries_generation_and_rejects_old_writer():

@@ -1065,6 +1065,7 @@ def test_itick_provider_session_policy_normalizes_aapl_xau_and_eurusd_dwm_to_utc
 
         assert [row["open_time"] for row in rows] == [utc_open_time]
         assert captured["interval"] == expected_cache_intervals[interval]
+        assert captured["cache_policy"] == "gap_tolerant"
         assert captured["open_time_validator"](utc_open_time) is True
 
 

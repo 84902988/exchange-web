@@ -354,6 +354,8 @@ function ContractPageContent() {
   const [interval, setIntervalValue] = useState('1m');
   const [chartMode, setChartMode] = useState<ContractChartMode>('candle');
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('orderbook');
+  const [isTradingTpSlExpanded, setIsTradingTpSlExpanded] = useState(false);
+  const [collapsedTradingRailHeight, setCollapsedTradingRailHeight] = useState<number | null>(null);
   const [contractDataScope, setContractDataScope] = useState<ContractDataScope>('current');
   const [contractUserTab, setContractUserTab] = useState<ContractPositionTabKey>('positions');
   const [selectedPriceState, setSelectedPriceState] = useState<{ symbol: string; price: string } | null>(null);
@@ -364,6 +366,8 @@ function ContractPageContent() {
   const [contractPairsLoaded, setContractPairsLoaded] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const tradingAccountRailRef = useRef<HTMLDivElement | null>(null);
+  const isTradingTpSlExpandedRef = useRef(false);
   const pendingNavigationSymbolRef = useRef<string | null>(null);
   const initialContractSymbolRef = useRef(initialContractSymbol);
   const urlContractSymbol = useMemo(
@@ -408,6 +412,41 @@ function ContractPageContent() {
   const selectedPrice = selectedPriceState?.symbol === contractSymbol
     ? selectedPriceState.price
     : null;
+
+  const handleTradingTpSlExpandedChange = useCallback((expanded: boolean) => {
+    isTradingTpSlExpandedRef.current = expanded;
+    setIsTradingTpSlExpanded(expanded);
+  }, []);
+
+  useEffect(() => {
+    isTradingTpSlExpandedRef.current = false;
+    setIsTradingTpSlExpanded(false);
+  }, [contractSymbol]);
+
+  useEffect(() => {
+    const rail = tradingAccountRailRef.current;
+    if (!rail || typeof ResizeObserver === 'undefined') return undefined;
+
+    const syncCollapsedRailHeight = () => {
+      if (isTradingTpSlExpandedRef.current) return;
+      const lastRailSection = rail.lastElementChild;
+      if (!lastRailSection) return;
+      const nextHeight = Math.ceil(
+        lastRailSection.getBoundingClientRect().bottom - rail.getBoundingClientRect().top,
+      );
+      if (nextHeight <= 0) return;
+      setCollapsedTradingRailHeight((currentHeight) => (
+        currentHeight === nextHeight ? currentHeight : nextHeight
+      ));
+    };
+
+    syncCollapsedRailHeight();
+    const observer = new ResizeObserver(syncCollapsedRailHeight);
+    observer.observe(rail);
+    Array.from(rail.children).forEach((section) => observer.observe(section));
+    return () => observer.disconnect();
+  }, []);
+
   const contractChartIntervalOptions = useMemo(
     () => (currentContractUsesValuationPrice ? CONTRACT_TRADFI_INTERVAL_OPTIONS : CONTRACT_INTERVAL_OPTIONS),
     [currentContractUsesValuationPrice],
@@ -528,7 +567,36 @@ function ContractPageContent() {
     () => contractPairs.map((item) => item.symbol),
     [contractPairs],
   );
-  const toolbarPairs = useMemo(() => contractPairs, [contractPairs]);
+  const selectorDisplayPrice = referencePrice.usable
+    ? referencePrice.value
+    : currentPriceReady
+      ? currentPriceNumber
+      : null;
+  const toolbarPairs = useMemo(
+    () => contractPairs.map((item) => {
+      if (item.symbol !== contractSymbol || selectorDisplayPrice === null) return item;
+      return {
+        ...item,
+        price: selectorDisplayPrice,
+        change24h: contractQuote?.price_change_percent_24h ?? item.change24h,
+        priceChangePercent: contractQuote?.price_change_percent_24h ?? item.priceChangePercent,
+        priceChange24h: contractQuote?.price_change_24h ?? item.priceChange24h,
+        high24h: contractQuote?.high_24h ?? item.high24h,
+        low24h: contractQuote?.low_24h ?? item.low24h,
+        quoteFreshness: referencePrice.freshness ?? tickerFreshness ?? item.quoteFreshness,
+        marketStatus: contractMarketStatus ?? item.marketStatus,
+      };
+    }),
+    [
+      contractMarketStatus,
+      contractPairs,
+      contractQuote,
+      contractSymbol,
+      referencePrice.freshness,
+      selectorDisplayPrice,
+      tickerFreshness,
+    ],
+  );
   const toolbarPairSymbols = useMemo(
     () => toolbarPairs.map((item) => item.symbol),
     [toolbarPairs],
@@ -792,7 +860,12 @@ function ContractPageContent() {
           </div>
         ) : null}
 
-        <div className="mt-2 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,8.6fr)_minmax(240px,1.95fr)_minmax(260px,1.85fr)] xl:grid-rows-[minmax(max(540px,62vh),max(540px,62vh))_minmax(170px,auto)] xl:items-stretch">
+        <div className={`mt-2 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,10.55fr)_minmax(260px,1.85fr)] ${isTradingTpSlExpanded ? 'xl:items-start' : 'xl:items-stretch'}`}>
+          <div
+            className="grid min-w-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,8.6fr)_minmax(240px,1.95fr)] xl:grid-rows-[minmax(max(540px,62vh),max(540px,62vh))_minmax(170px,auto)] xl:items-stretch"
+            data-testid="contract-market-panels"
+            style={collapsedTradingRailHeight ? { minHeight: `${collapsedTradingRailHeight}px` } : undefined}
+          >
           <div className={`min-h-[420px] min-w-0 xl:col-start-1 xl:row-start-1 xl:min-h-0 ${currentContractUsesTradfiChartLayout ? 'xl:col-span-2' : ''}`}>
             <div className="flex h-full min-h-0 flex-col overflow-hidden border border-white/10 bg-[#12161c]">
               <div className="min-h-0 flex-1">
@@ -809,7 +882,6 @@ function ContractPageContent() {
                   pricePrecision={currentContractPair?.pricePrecision ?? null}
                   amountPrecision={currentContractPair?.amountPrecision ?? null}
                   referencePrice={referencePrice}
-                  preferReferencePriceOverlay={currentContractUsesValuationPrice}
                   positions={openPositionsForTrading}
                   priceDirection={currentPriceDirection}
                   onLatestKlineCloseChange={handleLatestKlineCloseChange}
@@ -851,6 +923,7 @@ function ContractPageContent() {
               <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
                 <div className={rightPanelTab === 'orderbook' ? 'block h-full min-h-0 min-w-0' : 'hidden h-full min-h-0 min-w-0'}>
                   <ContractFuturesOrderBook
+                    symbol={contractSymbol}
                     priceDirection={currentPriceDirection}
                     pricePrecision={pricePrecision}
                     bids={depthBids}
@@ -931,41 +1004,48 @@ function ContractPageContent() {
               tpSlTriggerPriceType={tpSlTriggerPriceType}
             />
           </div>
-
-          <div className="min-h-[420px] min-w-0 xl:col-start-3 xl:row-start-1 xl:min-h-0">
-            <div className="relative flex min-h-[420px] flex-col overflow-visible border border-white/10 bg-[#12161c] p-1.5 xl:min-h-[max(540px,62vh)] xl:p-2 [@media(max-height:850px)]:xl:min-h-0 [@media(max-height:850px)]:xl:p-1.5">
-              <ContractTradingForm
-                key={contractSymbol}
-                symbol={contractSymbol}
-                quote={contractQuote}
-                marketView={activeContractMarketView}
-                positions={openPositionsForTrading}
-                positionSummaries={positionSummaries}
-                selectedPrice={selectedPrice}
-                bestBid={hookBestBid}
-                bestAsk={hookBestAsk}
-                executionBid={executionBid}
-                executionAsk={executionAsk}
-                executable={contractExecutable}
-                reasonCode={reasonCode}
-                priceAuthority={priceAuthority}
-                pricePrecision={pricePrecision}
-                amountPrecision={currentContractPair?.amountPrecision}
-                quantityUnit={quantityUnit}
-                maxLeverage={maxLeverage}
-                availableMargin={account?.available_margin}
-                isLoggedIn={isLoggedIn && !authLoading}
-                disabled={!!contractAvailabilityError}
-                quoteLoading={quoteStatusLoading}
-                marketUiState={marketUiState}
-                onSuccess={refreshPrivateSilently}
-                tpSlTriggerPriceType={tpSlTriggerPriceType}
-              />
-            </div>
           </div>
 
-          <div className="min-h-[150px] min-w-0 xl:col-start-3 xl:row-start-2 xl:min-h-0">
-            <div className="flex h-full min-h-0 flex-col overflow-y-auto border border-white/10 bg-[#12161c]">
+          <div
+            ref={tradingAccountRailRef}
+            className="flex min-h-0 min-w-0 flex-col gap-3 xl:col-start-2 xl:row-start-1"
+            data-testid="contract-trading-account-rail"
+          >
+            <div className="min-h-[420px] min-w-0 xl:min-h-0">
+              <div className="relative flex min-h-[420px] flex-col overflow-visible border border-white/10 bg-[#12161c] p-1.5 xl:min-h-[max(540px,62vh)] xl:p-2 [@media(max-height:850px)]:xl:min-h-0 [@media(max-height:850px)]:xl:p-1.5">
+                <ContractTradingForm
+                  key={contractSymbol}
+                  symbol={contractSymbol}
+                  quote={contractQuote}
+                  marketView={activeContractMarketView}
+                  positions={openPositionsForTrading}
+                  positionSummaries={positionSummaries}
+                  selectedPrice={selectedPrice}
+                  bestBid={hookBestBid}
+                  bestAsk={hookBestAsk}
+                  executionBid={executionBid}
+                  executionAsk={executionAsk}
+                  executable={contractExecutable}
+                  reasonCode={reasonCode}
+                  priceAuthority={priceAuthority}
+                  pricePrecision={pricePrecision}
+                  amountPrecision={currentContractPair?.amountPrecision}
+                  quantityUnit={quantityUnit}
+                  maxLeverage={maxLeverage}
+                  availableMargin={account?.available_margin}
+                  isLoggedIn={isLoggedIn && !authLoading}
+                  disabled={!!contractAvailabilityError}
+                  quoteLoading={quoteStatusLoading}
+                  marketUiState={marketUiState}
+                  onSuccess={refreshPrivateSilently}
+                  tpSlTriggerPriceType={tpSlTriggerPriceType}
+                  onTpSlExpandedChange={handleTradingTpSlExpandedChange}
+                />
+              </div>
+            </div>
+
+            <div className="min-h-[150px] min-w-0">
+              <div className="flex h-full min-h-0 flex-col overflow-y-auto border border-white/10 bg-[#12161c]">
                 <ContractAccountPanel
                   account={account}
                   isLoggedIn={isLoggedIn && !authLoading}
@@ -975,6 +1055,7 @@ function ContractPageContent() {
                   onNotice={pushNotice}
                   onError={pushError}
                 />
+              </div>
             </div>
           </div>
         </div>

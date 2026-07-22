@@ -31,12 +31,16 @@ export type ContractPreviewInput = Readonly<{
   receivedAtMs: number;
   previewSequence: number;
   baseNativeRevision: ContractPreviewRevision;
+  baselineSource: 'NATIVE' | 'TRADE_ROLLOVER';
+  baselineAnchorOpenTime: number | null;
   bar: ContractPreviewBar;
 }>;
 
 export type ContractPreviewReason =
   | 'NATIVE_ACCEPTED'
   | 'NATIVE_OPEN_DEFERRED_TO_PREVIEW'
+  | 'PREVIEW_BOOTSTRAP_ACCEPTED'
+  | 'TRADE_ROLLOVER_ACCEPTED'
   | 'PREVIEW_ACCEPTED'
   | 'SYMBOL_MISMATCH'
   | 'INTERVAL_MISMATCH'
@@ -66,7 +70,11 @@ type State = {
 };
 
 const SUPPORTED_INTERVALS = new Set(['1m', '5m']);
-const VALID_SYMBOL = /^[A-Z0-9][A-Z0-9_-]*$/;
+const INTERVAL_MS: Readonly<Record<string, number>> = {
+  '1m': 60_000,
+  '5m': 5 * 60_000,
+};
+const VALID_SYMBOL = /^[A-Z0-9][A-Z0-9._-]*$/;
 
 function normalizeSymbol(value: unknown) {
   return String(value ?? '').trim().toUpperCase();
@@ -116,6 +124,21 @@ function previewIsNewer(preview: ContractPreviewInput, native: ContractPreviewNa
     return preview.bar.volume > native.bar.volume;
   }
   return preview.receivedAtMs > native.receivedAtMs;
+}
+
+function isContiguousTradeRollover(
+  preview: ContractPreviewInput,
+  native: ContractPreviewNativeInput,
+) {
+  const intervalMs = INTERVAL_MS[preview.interval];
+  return (
+    intervalMs !== undefined
+    && preview.baselineSource === 'TRADE_ROLLOVER'
+    && preview.baselineAnchorOpenTime === native.openTime
+    && preview.openTime === native.openTime + intervalMs
+    && preview.generation === native.generation
+    && compareRevision(preview.baseNativeRevision, native.revision) === 0
+  );
 }
 
 export class ContractTradingViewPreviewCompositor {
@@ -196,18 +219,80 @@ export class ContractTradingViewPreviewCompositor {
       || !isValidBar(input.bar, input.openTime)
     ) return this.reject('INVALID_BAR');
 
+    const current = this.state.preview;
     const native = this.state.native;
-    if (!native) return this.reject('NATIVE_MISSING');
-    if (native.isClosed) return this.reject('NATIVE_CLOSED');
+    if (!native) {
+      // The backend only emits a complete TRADE_PREVIEW after it has accepted
+      // a provider-native baseline. During first load that preview can arrive
+      // after an unversioned REST bootstrap candle but before the first
+      // versioned provider K-line frame. Treat the already validated preview
+      // as the temporary realtime authority instead of leaving TradingView
+      // frozen until the slower native channel catches up.
+      if (current) {
+        if (input.openTime < current.openTime) return this.reject('OPEN_TIME_MISMATCH');
+        if (input.generation < current.generation) {
+          return this.reject('GENERATION_MISMATCH');
+        }
+        if (input.openTime === current.openTime) {
+          if (input.bar.open !== current.bar.open) return this.reject('OPEN_MISMATCH');
+          if (input.bar.volume < current.bar.volume) {
+            return this.reject('PREVIEW_VOLUME_STALE');
+          }
+          if (input.generation === current.generation) {
+            const comparison = compareRevision(
+              input.baseNativeRevision,
+              current.baseNativeRevision,
+            );
+            if (comparison < 0) return this.reject('BASE_REVISION_STALE');
+            if (
+              comparison === 0
+              && input.previewSequence <= current.previewSequence
+            ) return this.reject('PREVIEW_SEQUENCE_STALE');
+          }
+        }
+      }
+      this.state.preview = {
+        ...input,
+        symbol: this.symbol,
+        interval: this.interval,
+        baseNativeRevision: { ...input.baseNativeRevision },
+        bar: { ...input.bar },
+      };
+      return this.accept('PREVIEW_BOOTSTRAP_ACCEPTED', 'preview', input.bar);
+    }
     if (input.generation !== native.generation) return this.reject('GENERATION_MISMATCH');
-    if (input.openTime !== native.openTime) return this.reject('OPEN_TIME_MISMATCH');
+    if (input.openTime !== native.openTime) {
+      if (!isContiguousTradeRollover(input, native)) {
+        return this.reject('OPEN_TIME_MISMATCH');
+      }
+      if (current) {
+        if (current.openTime > input.openTime) return this.reject('OPEN_TIME_MISMATCH');
+        if (current.openTime === input.openTime) {
+          if (input.bar.open !== current.bar.open) return this.reject('OPEN_MISMATCH');
+          if (input.bar.volume < current.bar.volume) {
+            return this.reject('PREVIEW_VOLUME_STALE');
+          }
+          if (input.previewSequence <= current.previewSequence) {
+            return this.reject('PREVIEW_SEQUENCE_STALE');
+          }
+        }
+      }
+      this.state.preview = {
+        ...input,
+        symbol: this.symbol,
+        interval: this.interval,
+        baseNativeRevision: { ...input.baseNativeRevision },
+        bar: { ...input.bar },
+      };
+      return this.accept('TRADE_ROLLOVER_ACCEPTED', 'preview', input.bar);
+    }
+    if (native.isClosed) return this.reject('NATIVE_CLOSED');
     if (input.bar.open !== native.bar.open) return this.reject('OPEN_MISMATCH');
     const comparison = compareRevision(input.baseNativeRevision, native.revision);
     if (comparison < 0) return this.reject('BASE_REVISION_STALE');
     if (comparison > 0) return this.reject('BASE_REVISION_FUTURE');
     if (input.bar.volume < native.bar.volume) return this.reject('PREVIEW_VOLUME_STALE');
 
-    const current = this.state.preview;
     if (current) {
       const samePreviewBaseline = compareRevision(
         current.baseNativeRevision,

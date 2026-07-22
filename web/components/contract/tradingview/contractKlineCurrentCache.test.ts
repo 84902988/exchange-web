@@ -35,9 +35,15 @@ function loadTypeScriptModule(
 const policyModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractKlineCachePolicy.ts', import.meta.url)),
 );
+const loadPolicyModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./contractKlineLoadPolicy.ts', import.meta.url)),
+);
 const cacheModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractKlineCurrentCache.ts', import.meta.url)),
-  { './contractKlineCachePolicy': policyModule },
+  {
+    './contractKlineCachePolicy': policyModule,
+    './contractKlineLoadPolicy': loadPolicyModule,
+  },
 );
 
 function response(overrides: Record<string, unknown> = {}) {
@@ -77,6 +83,10 @@ test('current cache key normalizes symbol and interval while keeping exact limit
   assert.equal(
     buildKey({ symbol: 'aapl_usdt_perp', interval: '1M', limit: 200 }),
     'UNKNOWN|AAPL_USDT_PERP|1M|200',
+  );
+  assert.equal(
+    buildKey({ category: 'stock', symbol: 'brk.busdt_perp', interval: '1m', limit: 150 }),
+    'STOCK|BRK.BUSDT_PERP|1m|150',
   );
   assert.notEqual(
     buildKey({ symbol: 'BTCUSDT_PERP', interval: '1h', limit: 300 }),

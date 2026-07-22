@@ -71,9 +71,11 @@ export function readContractMarketViewAuthority(
 export function resolveContractMarketViewAuthorityPresentation({
   marketView,
   loading = false,
+  executionReady = null,
 }: {
   marketView?: ContractMarketViewDetail | null;
   loading?: boolean;
+  executionReady?: boolean | null;
 }): ContractMarketViewAuthorityPresentation {
   const authority = readContractMarketViewAuthority(marketView);
   const displayState = authority.displayState;
@@ -117,6 +119,21 @@ export function resolveContractMarketViewAuthorityPresentation({
     return nonTradingPresentation('holiday', displayState);
   }
 
+  // A REST bootstrap can briefly report unavailable before the same-symbol
+  // realtime Store has received a complete ticker + executable BBO.  Callers
+  // may keep that bounded bootstrap window in a fail-closed loading state, but
+  // definitive non-trading sessions above must remain visible immediately.
+  if (loading) {
+    return {
+      state: 'loading',
+      status: 'LOADING',
+      isLoading: true,
+      isRealtime: false,
+      isTradable: false,
+      reason: 'MARKET_VIEW_LOADING',
+    };
+  }
+
   const liveState = displayState === 'LIVE_TRADABLE'
     || displayState === 'REGULAR_OPEN';
   const hasExecutableBbo = authority.executionBid !== null
@@ -127,6 +144,7 @@ export function resolveContractMarketViewAuthorityPresentation({
     && authority.displayPrice !== null
     && authority.executable === true
     && hasExecutableBbo
+    && executionReady !== false
   ) {
     return {
       state: 'live',
@@ -146,6 +164,25 @@ export function resolveContractMarketViewAuthorityPresentation({
     isTradable: false,
     reason: `MARKET_VIEW_${displayState || 'UNAVAILABLE'}`,
   };
+}
+
+export function shouldHoldContractMarketViewBootstrap({
+  marketView,
+  loading = false,
+  graceActive = false,
+  executionReady = null,
+}: {
+  marketView?: ContractMarketViewDetail | null;
+  loading?: boolean;
+  graceActive?: boolean;
+  executionReady?: boolean | null;
+}) {
+  if (loading) return true;
+  if (!graceActive) return false;
+  return resolveContractMarketViewAuthorityPresentation({
+    marketView,
+    executionReady,
+  }).state === 'unavailable';
 }
 
 export function shouldExposeContractMarketDepth(

@@ -36,7 +36,6 @@ import {
 import {
   normalizeContractMarketViewDisplayState,
   readContractMarketViewAuthority,
-  resolveContractMarketViewAuthorityPresentation,
 } from './contractMarketView.utils';
 import {
   resolveContractExecutionPrice,
@@ -87,7 +86,7 @@ type ContractTradingFormProps = {
   isLoggedIn: boolean;
   disabled?: boolean;
   quoteLoading?: boolean;
-  marketUiState?: {
+  marketUiState: {
     label: string;
     isLoading: boolean;
     isTradable: boolean;
@@ -97,6 +96,7 @@ type ContractTradingFormProps = {
   };
   onSuccess: () => Promise<void> | void;
   tpSlTriggerPriceType?: ContractTpSlTriggerPriceType | string | null;
+  onTpSlExpandedChange?: (expanded: boolean) => void;
 };
 
 const DEFAULT_MAX_LEVERAGE = 200;
@@ -241,8 +241,10 @@ export default function ContractTradingForm({
   isLoggedIn,
   disabled = false,
   quoteLoading = false,
+  marketUiState,
   onSuccess,
   tpSlTriggerPriceType,
+  onTpSlExpandedChange,
 }: ContractTradingFormProps) {
   const { t } = useLocaleContext();
   const [positionMode] = useState<PositionMode>('ONEWAY');
@@ -345,7 +347,7 @@ export default function ContractTradingForm({
     () => buildContractTradingFormLegacyMarketRead({
       quote,
       marketView,
-      loading: quoteLoading && !marketView,
+      loading: quoteLoading,
     }),
     [marketView, quote, quoteLoading],
   );
@@ -360,13 +362,7 @@ export default function ContractTradingForm({
     () => readContractMarketViewAuthority(marketView),
     [marketView],
   );
-  const marketViewPresentation = useMemo(
-    () => resolveContractMarketViewAuthorityPresentation({
-      marketView,
-      loading: quoteLoading && !marketView,
-    }),
-    [marketView, quoteLoading],
-  );
+  const marketViewPresentation = marketUiState;
   const executionPrices = useMemo(() => ({
     openLong: resolveContractExecutionPrice({
       authority: priceAuthority,
@@ -570,6 +566,7 @@ export default function ContractTradingForm({
     setTpSlEnabled(enabled);
     setTakeProfitTouched(false);
     setStopLossTouched(false);
+    onTpSlExpandedChange?.(enabled);
   }
 
   function handleTakeProfitPriceChange(value: string) {
@@ -1261,7 +1258,12 @@ function OpenPanel({
           data-testid="contract-trading-form-tp-sl-region"
         >
           <label className="flex cursor-pointer items-center gap-2 text-[12px] text-white/75">
-            <input type="checkbox" checked={tpSlEnabled} onChange={(event) => setTpSlEnabled(event.target.checked)} className="h-3.5 w-3.5 accent-[#f0b90b]" />
+            <input
+              type="checkbox"
+              checked={tpSlEnabled}
+              onChange={(event) => setTpSlEnabled(event.target.checked)}
+              className="h-3.5 w-3.5 accent-[#f0b90b]"
+            />
             {t('takeProfitStopLossShort', 'contracts')}
           </label>
           {tpSlEnabled ? (

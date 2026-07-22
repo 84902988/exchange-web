@@ -30,6 +30,7 @@ from .dividend_job_log import DividendJobLog
 from .bd_account import BdAccount
 from .bd_user_relation import BdUserRelation
 from .bd_commission_record import BdCommissionRecord
+from .bd_commission_rate_change_log import BdCommissionRateChangeLog
 from .bd_commission_job_log import BdCommissionJobLog
 from .bd_application import BdApplication
 from .user_invite_relation import UserInviteRelation
@@ -120,6 +121,7 @@ __all__ = [
     "BdAccount",
     "BdUserRelation",
     "BdCommissionRecord",
+    "BdCommissionRateChangeLog",
     "BdCommissionJobLog",
     "BdApplication",
     "UserInviteRelation",

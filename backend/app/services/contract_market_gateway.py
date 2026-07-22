@@ -54,7 +54,7 @@ from app.services.contract_market_ws import (
     normalize_contract_ws_interval,
     normalize_contract_ws_symbol,
 )
-from app.services.contract_market_view import build_contract_market_view
+from app.services.contract_market_view import build_contract_market_view_v2
 from app.services.contract_candle_preview import (
     CONTRACT_CANDLE_PREVIEW_PROVIDERS,
     SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS,
@@ -79,6 +79,9 @@ from app.services.contract_market_provider_ws import (
 
 logger = logging.getLogger(__name__)
 
+# Kept only to identify and reject legacy cached snapshots created by older
+# workers. Active code no longer emits trade-derived BBO payloads.
+ITICK_LIVE_WS_DERIVED_BBO_SOURCE = "ITICK_LIVE_WS_DERIVED_BBO"
 CONTRACT_MARKET_WS_QUOTE_INTERVAL_SECONDS = 1.0
 CONTRACT_MARKET_WS_DEPTH_LIMIT = 20
 CONTRACT_MARKET_WS_TRADES_LIMIT = 30
@@ -326,6 +329,25 @@ def _trade_event_time_ms(row: dict[str, Any]) -> int | None:
     return None
 
 
+def _trade_candle_event_time_ms(
+    row: dict[str, Any],
+    *,
+    received_at_ms: int,
+) -> int | None:
+    """Keep trade-driven previews out of provider-dated future buckets.
+
+    Provider event time remains the ordering authority whenever it is not ahead
+    of the gateway receipt clock.  Some iTick feeds can lead that clock by
+    several seconds; capping only the candle event time prevents TradingView
+    from receiving a next-minute bar before that minute exists locally.  The
+    original trade payload and provider timestamp remain unchanged.
+    """
+    provider_event_time_ms = _trade_event_time_ms(row)
+    if provider_event_time_ms is None:
+        return None
+    return min(provider_event_time_ms, received_at_ms)
+
+
 def _synthetic_trade(row: dict[str, Any]) -> bool:
     value = row.get("synthetic")
     return value is True or str(value or "").strip().lower() in {"1", "true", "yes"}
@@ -372,14 +394,33 @@ def _truthful_contract_trades(
 ) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         return []
-    truthful: list[dict[str, Any]] = []
-    for item in rows:
+    truthful: list[tuple[int, dict[str, Any]]] = []
+    for index, item in enumerate(rows):
         if not isinstance(item, dict):
             continue
         normalized = _normalize_trade(dict(item), evidence=evidence)
         if _truthful_contract_trade(normalized, symbol=symbol):
-            truthful.append(normalized)
-    return truthful
+            truthful.append((index, normalized))
+    truthful.sort(
+        key=lambda item: (-(_trade_event_time_ms(item[1]) or 0), item[0])
+    )
+    seen: set[str] = set()
+    ordered: list[dict[str, Any]] = []
+    for _, trade in truthful:
+        identity = str(
+            trade.get("id")
+            or trade.get("trade_id")
+            or (
+                f"{_trade_event_time_ms(trade) or 0}:"
+                f"{trade.get('price') or trade.get('last_price') or ''}:"
+                f"{trade.get('qty') or trade.get('amount') or trade.get('quantity') or trade.get('volume') or ''}"
+            )
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        ordered.append(trade)
+    return ordered
 
 
 def _normalize_kline(row: dict[str, Any], *, source: str | None = None) -> dict[str, Any]:
@@ -532,8 +573,9 @@ class ContractMarketGateway:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         normalized_interval = normalize_contract_ws_interval(interval)
         status = "ok"
+        bootstrap_messages: list[dict[str, Any]] = []
         try:
-            await asyncio.to_thread(
+            bootstrap_messages = await asyncio.to_thread(
                 self._refresh_symbol_once,
                 normalized_symbol,
                 [normalized_interval],
@@ -545,20 +587,33 @@ class ContractMarketGateway:
         except Exception:
             status = "error"
             logger.warning("contract_market_gateway_snapshot_failed symbol=%s", normalized_symbol, exc_info=True)
-        return self.snapshot_message(normalized_symbol, normalized_interval, status=status)
+        snapshot = self.snapshot_message(normalized_symbol, normalized_interval, status=status)
+        self._attach_snapshot_candle_previews(snapshot, bootstrap_messages)
+        return snapshot
 
     async def market_snapshot(self, symbol: str) -> dict[str, Any]:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
         status = "ok"
+        bootstrap_messages: list[dict[str, Any]] = []
         try:
-            await asyncio.to_thread(self._refresh_market_once, normalized_symbol, True)
+            active_intervals = await contract_market_ws_manager.subscribed_intervals(
+                normalized_symbol
+            )
+            bootstrap_messages = await asyncio.to_thread(
+                self._refresh_market_once,
+                normalized_symbol,
+                True,
+                active_intervals,
+            )
         except (ContractSymbolNotFound, ContractMarketError):
             status = "unavailable"
             logger.debug("contract_market_gateway_market_snapshot_unavailable symbol=%s", normalized_symbol, exc_info=True)
         except Exception:
             status = "error"
             logger.warning("contract_market_gateway_market_snapshot_failed symbol=%s", normalized_symbol, exc_info=True)
-        return self.market_snapshot_message(normalized_symbol, status=status)
+        snapshot = self.market_snapshot_message(normalized_symbol, status=status)
+        self._attach_snapshot_candle_previews(snapshot, bootstrap_messages)
+        return snapshot
 
     async def kline_snapshot(self, symbol: str, interval: str = "1m") -> dict[str, Any]:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
@@ -614,6 +669,22 @@ class ContractMarketGateway:
                 "status": status,
             },
         }
+
+    @staticmethod
+    def _attach_snapshot_candle_previews(
+        snapshot: dict[str, Any],
+        messages: list[dict[str, Any]] | None,
+    ) -> None:
+        previews = [
+            deepcopy(message)
+            for message in messages or []
+            if isinstance(message, dict)
+            and str(message.get("type") or "").strip().lower()
+            == "contract_candle_preview_update"
+        ]
+        data = snapshot.get("data")
+        if previews and isinstance(data, dict):
+            data["candle_previews"] = previews
 
     def market_snapshot_message(self, symbol: str, *, status: str = "ok") -> dict[str, Any]:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
@@ -946,12 +1017,12 @@ class ContractMarketGateway:
         intervals: list[str],
         ensure_provider_ws: bool = False,
     ) -> list[dict[str, Any]]:
-        messages = self._refresh_market_once(
-            symbol,
-            ensure_provider_ws=ensure_provider_ws,
-            intervals=intervals,
-        )
         normalized_symbol = normalize_contract_ws_symbol(symbol)
+        messages: list[dict[str, Any]] = []
+        # The initial snapshot must obey the same settlement order as the
+        # continuous broadcast loop: native K-line first, then real trades.
+        # Otherwise the first trade preview is rejected without a baseline and
+        # Header can advance while the visible candle waits for another trade.
         for interval in sorted({normalize_contract_ws_interval(item) for item in intervals} or {"1m"}):
             kline = self._refresh_kline_once(
                 normalized_symbol,
@@ -962,6 +1033,11 @@ class ContractMarketGateway:
                 message = self._kline_message(normalized_symbol, interval)
                 if message is not None:
                     messages.append(message)
+        messages.extend(self._refresh_market_once(
+            normalized_symbol,
+            ensure_provider_ws=ensure_provider_ws,
+            intervals=intervals,
+        ))
         return messages
 
     def _refresh_market_once(
@@ -1204,6 +1280,328 @@ class ContractMarketGateway:
                 return item
         return None
 
+    @staticmethod
+    def _provider_payload_has_native_bbo(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        try:
+            bid = Decimal(
+                str(
+                    payload.get("bid_price")
+                    or payload.get("best_bid")
+                    or payload.get("bid")
+                )
+            )
+            ask = Decimal(
+                str(
+                    payload.get("ask_price")
+                    or payload.get("best_ask")
+                    or payload.get("ask")
+                )
+            )
+        except Exception:
+            return False
+        return bid.is_finite() and ask.is_finite() and bid > 0 and ask > bid
+
+    def _next_trade_derived_bbo_authority(
+        self,
+        template: str,
+        symbol: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep trade-derived BBO revisions monotonic inside quote/depth domains.
+
+        Ticker, depth and trade transports have independent provider revision
+        counters.  Reusing the trade counter as a ticker/depth counter can make
+        a valid live trade look like a rollback after one transport reconnects.
+        """
+        authority = dict(payload)
+        domain = _CONTRACT_MARKET_DOMAIN_BY_CACHE.get(template)
+        current = self.get_domain_snapshot(domain, symbol) if domain is not None else None
+        incoming_generation = authority.get("provider_generation")
+        incoming_sequence = authority.get("revision_sequence") or authority.get("revision_seq")
+        generation = incoming_generation
+        sequence = incoming_sequence
+        epoch = authority.get("revision_epoch")
+        if current is not None and str(current.metadata.provider or "").strip().upper() == "ITICK":
+            metadata = current.metadata
+            if metadata.provider_generation is not None:
+                generation = metadata.provider_generation
+            if metadata.revision is not None:
+                if metadata.revision.epoch is not None:
+                    epoch = metadata.revision.epoch
+                if metadata.revision.sequence is not None:
+                    sequence = metadata.revision.sequence + 1
+        if generation is not None:
+            authority["provider_generation"] = generation
+        if epoch is None:
+            epoch = generation
+        if epoch is not None:
+            authority["revision_epoch"] = epoch
+        if sequence is not None:
+            authority["revision_sequence"] = sequence
+        return authority
+
+    def _itick_trade_derived_bbo_messages(
+        self,
+        db: Session,
+        symbol: str,
+        trades: list[dict[str, Any]],
+        trades_authority: Any,
+    ) -> list[dict[str, Any]]:
+        """Never promote trade ticks into executable quote/depth authority.
+
+        Trade ticks remain the realtime authority for Header display and candle
+        preview settlement.  Bid/ask and spread fees must come from provider
+        quote/depth data, so this compatibility hook is intentionally inert.
+        """
+        _ = db, symbol, trades, trades_authority
+        return []
+
+        # Legacy implementation retained below temporarily for local diff
+        # compatibility; it is unreachable by design and no active gateway
+        # path calls this hook.
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        candidates = [
+            trade
+            for trade in trades
+            if isinstance(trade, dict)
+            and str(trade.get("provider") or "").strip().upper() == "ITICK"
+            and str(trade.get("source") or "").strip().upper() == "LIVE_WS"
+            and str(trade.get("price_source") or "").strip().upper() == "TRADE_TICK"
+            and _trade_event_time_ms(trade) is not None
+        ]
+        if not candidates:
+            return []
+        latest_trade = max(candidates, key=lambda trade: _trade_event_time_ms(trade) or 0)
+        trade_event_time_ms = _trade_event_time_ms(latest_trade)
+        if trade_event_time_ms is None:
+            return []
+
+        try:
+            contract_symbol = _load_contract_symbol(db, normalized_symbol)
+            from app.services.contract_market_service import (
+                _uses_itick_latest_price_field,
+            )
+
+            latest_price_driven = _uses_itick_latest_price_field(contract_symbol)
+        except Exception:
+            logger.debug(
+                "contract_market_gateway_trade_derived_bbo_symbol_failed symbol=%s",
+                normalized_symbol,
+                exc_info=True,
+            )
+            return []
+
+        if provider_ws_depth_enabled():
+            native_depth = select_fresh_provider_ws_depth(
+                db,
+                normalized_symbol,
+                max_age_ms=int(
+                    getattr(settings, "CONTRACT_PROVIDER_WS_DEPTH_MAX_AGE_MS", 1500)
+                    or 1500
+                ),
+                ensure_subscription=False,
+            )
+            if (
+                isinstance(native_depth, dict)
+                and native_depth.get("bids")
+                and native_depth.get("asks")
+                and not latest_price_driven
+            ):
+                return []
+
+        if provider_ws_ticker_enabled():
+            native_quote = select_fresh_provider_ws_ticker(
+                db,
+                normalized_symbol,
+                max_age_ms=int(
+                    getattr(settings, "CONTRACT_PROVIDER_WS_TICKER_MAX_AGE_MS", 1500)
+                    or 1500
+                ),
+                ensure_subscription=False,
+            )
+            if (
+                self._provider_payload_has_native_bbo(native_quote)
+                and not latest_price_driven
+            ):
+                return []
+
+        current_quote = self._get_latest(CONTRACT_MARKET_CACHE_QUOTE, normalized_symbol)
+        current_depth = self._get_latest(CONTRACT_MARKET_CACHE_DEPTH, normalized_symbol)
+        current_derived_event_times = [
+            event_time_ms
+            for payload in (current_quote, current_depth)
+            if isinstance(payload, dict)
+            and str(payload.get("source") or "").strip().upper()
+            == ITICK_LIVE_WS_DERIVED_BBO_SOURCE
+            for event_time_ms in [_optional_trade_timestamp_ms(payload.get("ts"))]
+            if event_time_ms is not None
+        ]
+        if current_derived_event_times and trade_event_time_ms <= max(current_derived_event_times):
+            return []
+
+        authority = _authority_mapping(trades_authority)
+        evidence: dict[str, Any] = {
+            key: current_quote.get(key)
+            for key in _CONTRACT_TICKER_24H_FIELDS
+            if isinstance(current_quote, dict) and current_quote.get(key) not in (None, "")
+        }
+        evidence.update(
+            {
+                key: authority.get(key)
+                for key in (
+                    "provider_generation",
+                    "revision_epoch",
+                    "revision_sequence",
+                    "received_at_ms",
+                    "updated_at_ms",
+                )
+                if authority.get(key) is not None
+            }
+        )
+        evidence.update(
+            {
+                "symbol": normalized_symbol,
+                "provider": "ITICK",
+                "provider_symbol": latest_trade.get("provider_symbol")
+                or authority.get("provider_symbol"),
+                "last_price": latest_trade.get("price") or latest_trade.get("last_price"),
+                "price_field": latest_trade.get("price_field"),
+                "price_source": "TRADE_TICK",
+                "source": "LIVE_WS",
+                "quote_source": "LIVE_WS",
+                "quote_freshness": "LIVE",
+                "is_realtime": True,
+                "ts": trade_event_time_ms,
+                "exchange_ts": latest_trade.get("exchange_ts") or trade_event_time_ms,
+            }
+        )
+
+        try:
+            from app.services.contract_market_service import (
+                _depth_from_itick_provider_ws_ticker,
+                _quote_from_itick_provider_ws_ticker,
+            )
+
+            derived_depth = _depth_from_itick_provider_ws_ticker(contract_symbol, evidence)
+            derived_quote = _quote_from_itick_provider_ws_ticker(contract_symbol, evidence)
+            if derived_depth is None or derived_quote is None:
+                return []
+            market_status = _market_status_for_contract_symbol(contract_symbol, evidence)
+            derived_depth = _contract_depth_with_status(
+                derived_depth,
+                market_status,
+                contract_symbol,
+            )
+            derived_quote = _contract_quote_with_status(
+                derived_quote,
+                market_status,
+                contract_symbol,
+            )
+            quote = ContractQuoteResponse(
+                **contract_quote_to_response(derived_quote)
+            ).model_dump()
+            depth = ContractDepthResponse(
+                **contract_depth_to_response(derived_depth)
+            ).model_dump()
+        except Exception:
+            logger.debug(
+                "contract_market_gateway_trade_derived_bbo_prepare_failed symbol=%s",
+                normalized_symbol,
+                exc_info=True,
+            )
+            return []
+
+        messages: list[dict[str, Any]] = []
+        quote_authority = self._next_trade_derived_bbo_authority(
+            CONTRACT_MARKET_CACHE_QUOTE,
+            normalized_symbol,
+            derived_quote,
+        )
+        if (
+            self._quote_signature(quote)
+            != self._last_quote_signature.get(normalized_symbol)
+            and self._set_latest(
+                CONTRACT_MARKET_CACHE_QUOTE,
+                normalized_symbol,
+                quote,
+                authority_payload=quote_authority,
+            )
+        ):
+            self._remember_quote_signature(normalized_symbol, quote)
+            messages.append(self._quote_message(normalized_symbol, quote))
+
+        depth_authority = self._next_trade_derived_bbo_authority(
+            CONTRACT_MARKET_CACHE_DEPTH,
+            normalized_symbol,
+            derived_depth,
+        )
+        if (
+            self._depth_signature(depth)
+            != self._last_depth_signature.get(normalized_symbol)
+            and self._set_latest(
+                CONTRACT_MARKET_CACHE_DEPTH,
+                normalized_symbol,
+                depth,
+                authority_payload=depth_authority,
+            )
+        ):
+            self._remember_depth_signature(normalized_symbol, depth)
+            messages.append(self._depth_message(normalized_symbol, depth))
+        return messages
+
+    def _domain_authority_payload(
+        self,
+        domain: ContractMarketDomainName,
+        symbol: str,
+        *,
+        interval: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        normalized_interval = (
+            normalize_contract_ws_interval(interval)
+            if domain == ContractMarketDomainName.KLINE
+            else None
+        )
+        snapshot = self.get_domain_snapshot(
+            domain,
+            normalized_symbol,
+            interval=normalized_interval,
+        )
+        if snapshot is None:
+            return {}
+        metadata = snapshot.metadata
+        revision = metadata.revision
+        authority = {
+            "source": metadata.source.value,
+            "provider": metadata.provider,
+            "provider_symbol": metadata.provider_symbol,
+            "freshness": metadata.freshness.value,
+            "transport": metadata.transport.value,
+            "cache_origin": metadata.cache_origin.value,
+            "fallback_reason": (
+                metadata.fallback_reason.value
+                if metadata.fallback_reason is not None
+                else None
+            ),
+            "provider_generation": metadata.provider_generation,
+            "revision": revision.model_dump() if revision is not None else None,
+            "revision_epoch": revision.epoch if revision is not None else None,
+            "revision_sequence": revision.sequence if revision is not None else None,
+            "is_closed": revision.is_closed if revision is not None else None,
+            "close_state_source": revision.close_state_source if revision is not None else None,
+            "provider_event_time_ms": metadata.provider_event_time_ms,
+            "received_at_ms": metadata.received_at_ms,
+            "stale": metadata.stale,
+            "snapshot_id": snapshot.snapshot_id,
+        }
+        return {
+            key: value
+            for key, value in authority.items()
+            if value is not None
+        }
+
     def _build_market_state_from_latest(
         self,
         symbol: str,
@@ -1211,22 +1609,42 @@ class ContractMarketGateway:
         contract_symbol: Any = None,
     ) -> dict[str, Any] | None:
         normalized_symbol = normalize_contract_ws_symbol(symbol)
-        quote = self._get_latest(CONTRACT_MARKET_CACHE_QUOTE, normalized_symbol)
-        depth = self._get_latest(CONTRACT_MARKET_CACHE_DEPTH, normalized_symbol)
-        latest_kline = self._get_latest(
-            CONTRACT_MARKET_CACHE_KLINE,
-            normalized_symbol,
-            interval="1m",
-        )
-        if not isinstance(quote, dict) and not isinstance(depth, dict):
+        snapshots = {
+            "ticker": self.get_domain_snapshot(
+                ContractMarketDomainName.TICKER,
+                normalized_symbol,
+            ),
+            "depth": self.get_domain_snapshot(
+                ContractMarketDomainName.DEPTH,
+                normalized_symbol,
+            ),
+            "trades": self.get_domain_snapshot(
+                ContractMarketDomainName.TRADES,
+                normalized_symbol,
+            ),
+            "kline": self.get_domain_snapshot(
+                ContractMarketDomainName.KLINE,
+                normalized_symbol,
+                interval="1m",
+            ),
+        }
+        if snapshots["ticker"] is None and snapshots["depth"] is None:
             return None
-        view = build_contract_market_view(
+
+        # REST Market View and realtime market_state must be projections of
+        # the same accepted domain winners. Building the WS Header from the
+        # legacy mutable caches created a second authority path: Header could
+        # advance on one trade while TradingView settled another snapshot.
+        # Keep BBO, trades and K-line independent, but assemble their public
+        # view through the same snapshot authority contract.
+        view = build_contract_market_view_v2(
             normalized_symbol,
-            quote=quote if isinstance(quote, dict) else None,
-            depth=depth if isinstance(depth, dict) else None,
-            latest_kline=latest_kline if isinstance(latest_kline, dict) else None,
-            latest_trade=self._latest_trade_tick_from_cache(normalized_symbol),
+            ticker_snapshot=snapshots["ticker"],
+            depth_snapshot=snapshots["depth"],
+            trades_snapshot=snapshots["trades"],
+            kline_snapshot=snapshots["kline"],
             contract_symbol=contract_symbol,
+            interval="1m",
         )
         state = ContractMarketViewDetail(**view).model_dump()
         state.pop("kline_current_candle", None)
@@ -1365,27 +1783,30 @@ class ContractMarketGateway:
                     exc_info=True,
                 )
                 return []
+            if not trades:
+                return []
+            new_trades = self._filter_new_trades(normalized_symbol, trades)
+            if not new_trades:
+                return []
+            if not self._set_latest(
+                CONTRACT_MARKET_CACHE_TRADES,
+                normalized_symbol,
+                trades,
+                authority_payload=trades_authority,
+            ):
+                return []
+            self._remember_trade_ids(normalized_symbol, trades)
+            messages = list(
+                self._trade_preview_settlement_messages(
+                    normalized_symbol,
+                    intervals or [],
+                    new_trades,
+                    trades_authority,
+                )
+            )
+            return messages
         finally:
             db.close()
-        if not trades:
-            return []
-        new_trades = self._filter_new_trades(normalized_symbol, trades)
-        if not new_trades:
-            return []
-        if not self._set_latest(
-            CONTRACT_MARKET_CACHE_TRADES,
-            normalized_symbol,
-            trades,
-            authority_payload=trades_authority,
-        ):
-            return []
-        self._remember_trade_ids(normalized_symbol, trades)
-        return self._trade_preview_settlement_messages(
-            normalized_symbol,
-            intervals or [],
-            new_trades,
-            trades_authority,
-        )
 
     def _trade_preview_settlement_messages(
         self,
@@ -1443,10 +1864,32 @@ class ContractMarketGateway:
         if provider not in CONTRACT_CANDLE_PREVIEW_PROVIDERS:
             return []
 
-        ordered_trades = sorted(
-            (item for item in trades if isinstance(item, dict)),
-            key=lambda item: _trade_event_time_ms(item) or 0,
+        received_at_ms = (
+            _optional_trade_timestamp_ms(authority.get("received_at_ms"))
+            or _utc_ms()
         )
+
+        indexed_trades = [
+            (index, item)
+            for index, item in enumerate(trades)
+            if isinstance(item, dict)
+        ]
+        indexed_trades.sort(
+            key=lambda indexed_item: (
+                _trade_candle_event_time_ms(
+                    indexed_item[1],
+                    received_at_ms=received_at_ms,
+                )
+                or 0,
+                _trade_event_time_ms(indexed_item[1]) or 0,
+                -indexed_item[0],
+            ),
+        )
+        # Provider rolling trade windows are newest-first. Apply them to the
+        # candle oldest-first, including the common iTick case where multiple
+        # trades share one second-resolution timestamp. The final preview close
+        # then settles on the same row-zero trade used by Header authority.
+        ordered_trades = [item for _, item in indexed_trades]
         accepted_by_interval: dict[
             str,
             tuple[ContractCandlePreview, int, str, str],
@@ -1473,8 +1916,17 @@ class ContractMarketGateway:
                 continue
             if generation <= 0:
                 continue
+            self._prime_candle_preview_from_authoritative_kline(
+                normalized_symbol,
+                interval,
+                provider=provider,
+                generation=generation,
+            )
             for trade in ordered_trades:
-                event_time_ms = _trade_event_time_ms(trade)
+                event_time_ms = _trade_candle_event_time_ms(
+                    trade,
+                    received_at_ms=received_at_ms,
+                )
                 if event_time_ms is None:
                     continue
                 trade_provider = str(
@@ -1502,10 +1954,6 @@ class ContractMarketGateway:
                 except (TypeError, ValueError):
                     continue
                 if result.status is ContractPreviewTradeStatus.APPLIED and result.preview is not None:
-                    received_at_ms = int(
-                        authority.get("received_at_ms")
-                        or _utc_ms()
-                    )
                     accepted_by_interval[interval] = (
                         result.preview,
                         received_at_ms,
@@ -1526,6 +1974,83 @@ class ContractMarketGateway:
                 settlement_trade_price,
             ) in sorted(accepted_by_interval.items())
         ]
+
+    def _prime_candle_preview_from_authoritative_kline(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        provider: str,
+        generation: int,
+    ) -> bool:
+        """Bridge a first-load provider generation from cached Native OHLCV.
+
+        The initial REST/native K-line can be cached before the provider K-line
+        transport has published its generation.  Real trades may then arrive
+        first and legitimately advance Header while the preview engine still
+        has no baseline.  Reuse only the gateway's complete, fresh K-line
+        authority to initialize that generation; never use Header, quote,
+        depth, BBO or mid-price evidence, and never perform REST I/O here.
+        """
+        normalized_symbol = normalize_contract_ws_symbol(symbol)
+        normalized_interval = normalize_contract_ws_interval(interval)
+        normalized_provider = str(provider or "").strip().upper()
+        if generation <= 0 or self._candle_preview_engine.get_preview(
+            normalized_symbol,
+            normalized_interval,
+        ) is not None:
+            return False
+
+        resolved = self._kline_authority_payload(
+            normalized_symbol,
+            normalized_interval,
+        )
+        if resolved is None:
+            return False
+        payload, _authority = resolved
+        payload_provider = str(payload.get("provider") or "").strip().upper()
+        if payload_provider != normalized_provider:
+            return False
+        try:
+            payload_generation = int(payload.get("provider_generation") or 0)
+        except (TypeError, ValueError):
+            return False
+        if payload_generation > 0 and payload_generation != generation:
+            return False
+
+        self._accept_candle_preview_native(
+            normalized_symbol,
+            normalized_interval,
+            {
+                **payload,
+                "provider_generation": generation,
+                "revision_epoch": payload.get("revision_epoch") or generation,
+                "revision_sequence": (
+                    payload.get("revision_sequence")
+                    or payload.get("revision_seq")
+                    or 0
+                ),
+            },
+        )
+        preview = self._candle_preview_engine.get_preview(
+            normalized_symbol,
+            normalized_interval,
+        )
+        primed = bool(
+            preview is not None
+            and preview.provider == normalized_provider
+            and preview.generation == generation
+        )
+        if primed:
+            logger.debug(
+                "contract_candle_preview_native_cache_primed "
+                "provider=%s symbol=%s interval=%s generation=%s",
+                normalized_provider,
+                normalized_symbol,
+                normalized_interval,
+                generation,
+            )
+        return primed
 
     @staticmethod
     def _candle_preview_message(
@@ -1833,6 +2358,7 @@ class ContractMarketGateway:
         ensure_provider_ws: bool = False,
     ) -> dict[str, Any] | None:
         status_payload: dict[str, Any] | None = None
+        native_ticker_quote: dict[str, Any] | None = None
         if allow_provider_ws and provider_ws_ticker_enabled():
             payload = select_fresh_provider_ws_ticker(
                 db,
@@ -1844,12 +2370,13 @@ class ContractMarketGateway:
                 status_payload = payload
                 prepared_quote = self._prepare_provider_ws_quote_payload(db, symbol, payload)
                 if prepared_quote is not None:
-                    return self._enrich_provider_ws_ticker_24h(
+                    enriched_quote = self._enrich_provider_ws_ticker_24h(
                         db,
                         symbol,
                         prepared_quote,
                         provider_frame=prepared_quote,
                     )
+                    native_ticker_quote = enriched_quote
         if allow_provider_ws and provider_ws_depth_enabled():
             depth = select_fresh_provider_ws_depth(
                 db,
@@ -1874,6 +2401,8 @@ class ContractMarketGateway:
                         prepared_quote,
                         provider_frame=prepared_quote,
                     )
+        if native_ticker_quote is not None:
+            return native_ticker_quote
         if not allow_rest_fallback:
             return None
         return get_contract_quote(db, symbol)
@@ -2023,9 +2552,18 @@ class ContractMarketGateway:
     ) -> dict[str, Any] | None:
         try:
             prepared = deepcopy(quote)
-            if not prepared.get("bid_price") or not prepared.get("ask_price"):
-                return None
             contract_symbol = _load_contract_symbol(db, symbol)
+            from app.services.contract_market_service import (
+                _quote_from_itick_provider_ws_ticker,
+            )
+
+            if str(prepared.get("provider") or "").strip().upper() == "ITICK":
+                prepared = _quote_from_itick_provider_ws_ticker(
+                    contract_symbol,
+                    prepared,
+                )
+                if prepared is None:
+                    return None
             market_status = _market_status_for_contract_symbol(contract_symbol, prepared)
             prepared["symbol"] = normalize_contract_ws_symbol(prepared.get("symbol") or symbol)
             prepared["price_precision"] = int(
@@ -2271,6 +2809,10 @@ class ContractMarketGateway:
         )
 
     def _quote_message(self, symbol: str, quote: dict[str, Any]) -> dict[str, Any]:
+        authority = self._domain_authority_payload(
+            ContractMarketDomainName.TICKER,
+            symbol,
+        )
         return {
             "type": "contract_quote",
             "domain": "market",
@@ -2279,23 +2821,33 @@ class ContractMarketGateway:
             "ts": _timestamp_ms(quote.get("ts")),
             "source": quote.get("source"),
             "quote_source": quote.get("quote_source"),
+            **authority,
             "data": quote,
             "quote": quote,
         }
 
     def _depth_message(self, symbol: str, depth: dict[str, Any]) -> dict[str, Any]:
+        authority = self._domain_authority_payload(
+            ContractMarketDomainName.DEPTH,
+            symbol,
+        )
         return {
             "type": "contract_depth",
             "domain": "market",
             "symbol": normalize_contract_ws_symbol(symbol),
             "market_symbol": _market_symbol(symbol),
             "ts": _timestamp_ms(depth.get("ts")),
+            **authority,
             "data": depth,
             "depth": depth,
         }
 
     def _trade_message(self, symbol: str, trade: dict[str, Any]) -> dict[str, Any]:
         normalized_trade = _normalize_trade(trade)
+        authority = self._domain_authority_payload(
+            ContractMarketDomainName.TRADES,
+            symbol,
+        )
         return {
             "type": "contract_trade",
             "domain": "market",
@@ -2309,6 +2861,7 @@ class ContractMarketGateway:
             "price_source": normalized_trade.get("price_source"),
             "provider": normalized_trade.get("provider"),
             "provider_symbol": normalized_trade.get("provider_symbol"),
+            **authority,
             "data": normalized_trade,
             "trade": normalized_trade,
         }
@@ -2335,6 +2888,10 @@ class ContractMarketGateway:
         )
         normalized_trades = [item for _, item in indexed_trades]
         latest_trade = normalized_trades[0] if normalized_trades else {}
+        authority = self._domain_authority_payload(
+            ContractMarketDomainName.TRADES,
+            symbol,
+        )
         return {
             "type": "contract_trade",
             "domain": "market",
@@ -2348,6 +2905,7 @@ class ContractMarketGateway:
             "price_source": latest_trade.get("price_source"),
             "provider": latest_trade.get("provider"),
             "provider_symbol": latest_trade.get("provider_symbol"),
+            **authority,
             "data": normalized_trades,
             "trades": normalized_trades,
             "trade": normalized_trades[0] if normalized_trades else None,
@@ -2386,36 +2944,11 @@ class ContractMarketGateway:
             or not _non_negative_kline_volume(snapshot.data.get("volume"))
         ):
             return None
-        revision = metadata.revision
-        revision_payload = revision.model_dump() if revision is not None else None
-        authority = {
-            "source": metadata.source.value,
-            "provider": metadata.provider,
-            "provider_symbol": metadata.provider_symbol,
-            "freshness": metadata.freshness.value,
-            "transport": metadata.transport.value,
-            "cache_origin": metadata.cache_origin.value,
-            "fallback_reason": (
-                metadata.fallback_reason.value
-                if metadata.fallback_reason is not None
-                else None
-            ),
-            "provider_generation": metadata.provider_generation,
-            "revision": revision_payload,
-            "revision_epoch": revision.epoch if revision is not None else None,
-            "revision_sequence": revision.sequence if revision is not None else None,
-            "is_closed": revision.is_closed if revision is not None else None,
-            "close_state_source": revision.close_state_source if revision is not None else None,
-            "provider_event_time_ms": metadata.provider_event_time_ms,
-            "received_at_ms": metadata.received_at_ms,
-            "stale": metadata.stale,
-            "snapshot_id": snapshot.snapshot_id,
-        }
-        present_authority = {
-            key: value
-            for key, value in authority.items()
-            if value is not None
-        }
+        present_authority = self._domain_authority_payload(
+            ContractMarketDomainName.KLINE,
+            normalized_symbol,
+            interval=normalized_interval,
+        )
         return ({**snapshot.data, **present_authority}, present_authority)
 
     def _kline_message(

@@ -21,6 +21,8 @@ export type ContractSelectorTickerCacheItem = {
   marketStatus?: string | null;
   marketStatusText?: string | null;
   quoteFreshness?: string | null;
+  displayPricePrecision?: number | null;
+  pricePrecision?: number | null;
   updatedAt: number;
 };
 
@@ -45,6 +47,14 @@ function optionalScalar(value: unknown): TickerScalar | undefined {
 function optionalText(value: unknown): string | null | undefined {
   if (value === null) return null;
   return typeof value === 'string' ? value : undefined;
+}
+
+function optionalPrecision(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  const precision = Number(value);
+  return Number.isInteger(precision) && precision >= 0 && precision <= 12
+    ? precision
+    : undefined;
 }
 
 function sanitizeItem(value: unknown, now = Date.now()): ContractSelectorTickerCacheItem | null {
@@ -75,6 +85,11 @@ function sanitizeItem(value: unknown, now = Date.now()): ContractSelectorTickerC
   const textFields = ['marketStatus', 'marketStatusText', 'quoteFreshness'] as const;
   textFields.forEach((field) => {
     const nextValue = optionalText(item[field]);
+    if (nextValue !== undefined) sanitized[field] = nextValue;
+  });
+  const precisionFields = ['displayPricePrecision', 'pricePrecision'] as const;
+  precisionFields.forEach((field) => {
+    const nextValue = optionalPrecision(item[field]);
     if (nextValue !== undefined) sanitized[field] = nextValue;
   });
 

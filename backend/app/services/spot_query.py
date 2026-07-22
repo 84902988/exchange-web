@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from sqlalchemy import desc, or_
 from sqlalchemy.orm import Session, joinedload
@@ -213,7 +213,13 @@ def get_history_orders(db: Session, user_id: int, symbol: str, limit: int = 100)
 # =========================
 # 4. 成交明细
 # =========================
-def get_my_trades(db: Session, user_id: int, symbol: str, limit: int = 100) -> Dict:
+def get_my_trades(db: Session, user_id: Union[int, str], symbol: str, limit: int = 100) -> Dict:
+    # get_current_user_id currently returns the JWT subject as a string. SQL
+    # comparisons coerce it for us, but Python does not: comparing an integer
+    # buyer_user_id with a string user_id would classify every trade as SELL
+    # and expose the counterparty's fee snapshot. Normalize once at the service
+    # boundary so both the query and the ownership checks use the same type.
+    normalized_user_id = int(user_id)
     pair = _get_pair_by_symbol(db, symbol)
 
     rows = (
@@ -221,8 +227,8 @@ def get_my_trades(db: Session, user_id: int, symbol: str, limit: int = 100) -> D
         .filter(
             Trade.trading_pair_id == pair.id,
             or_(
-                Trade.buyer_user_id == user_id,
-                Trade.seller_user_id == user_id,
+                Trade.buyer_user_id == normalized_user_id,
+                Trade.seller_user_id == normalized_user_id,
             ),
         )
         .order_by(desc(Trade.id))
@@ -232,7 +238,7 @@ def get_my_trades(db: Session, user_id: int, symbol: str, limit: int = 100) -> D
 
     items: List[Dict] = []
     for row in rows:
-        side = "BUY" if row.buyer_user_id == user_id else "SELL"
+        side = "BUY" if row.buyer_user_id == normalized_user_id else "SELL"
         own_order_id = row.buy_order_id if side == "BUY" else row.sell_order_id
         role = "MAKER" if own_order_id == row.maker_order_id else "TAKER"
         trade_fee_amount = getattr(row, "buyer_fee_amount" if side == "BUY" else "seller_fee_amount", None)
@@ -242,7 +248,7 @@ def get_my_trades(db: Session, user_id: int, symbol: str, limit: int = 100) -> D
             fee_log = (
                 db.query(BalanceLog)
                 .filter(
-                    BalanceLog.user_id == user_id,
+                    BalanceLog.user_id == normalized_user_id,
                     BalanceLog.biz_type == "TRADE_FEE",
                     BalanceLog.change_type == "TRADE_FEE_DEBIT",
                     BalanceLog.biz_id == f"{int(row.id)}:{int(own_order_id)}:{side}:{role}",

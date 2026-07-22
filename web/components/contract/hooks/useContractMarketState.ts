@@ -93,13 +93,16 @@ function loadContractQuote(contractSymbol: string) {
     settledAt: existing?.settledAt || 0,
   });
   void promise.then((quote) => {
+    if (contractQuoteRequestStore.get(contractSymbol)?.promise !== promise) return;
     contractQuoteRequestStore.set(contractSymbol, {
       promise: null,
       quote,
       settledAt: Date.now(),
     });
   }).catch(() => {
-    contractQuoteRequestStore.delete(contractSymbol);
+    if (contractQuoteRequestStore.get(contractSymbol)?.promise === promise) {
+      contractQuoteRequestStore.delete(contractSymbol);
+    }
   });
   return promise;
 }
@@ -185,6 +188,7 @@ export function useContractMarketState({
   const [contractAvailabilityError, setContractAvailabilityError] = useState<string | null>(null);
   const contractQuoteRef = useRef<ContractQuoteWithPremiumFields | null>(null);
   const quoteLoadedSymbolRef = useRef<string | null>(null);
+  const quoteRequestSeqRef = useRef(0);
   const previousMarketRealtimeStatusRef = useRef<ContractMarketRealtimeStatus>('idle');
   const transportRecovery = useContractMarketTransportRecovery(
     contractSymbol,
@@ -246,11 +250,14 @@ export function useContractMarketState({
   }, [contractSymbol]);
 
   const refreshContractQuote = useCallback(async () => {
+    const requestSeq = quoteRequestSeqRef.current + 1;
+    quoteRequestSeqRef.current = requestSeq;
     if (quoteLoadedSymbolRef.current !== contractSymbol) {
       setContractQuoteLoading(true);
     }
     try {
       const nextQuote = await loadContractQuote(contractSymbol);
+      if (quoteRequestSeqRef.current !== requestSeq) return;
       const storeResult = hydrateContractMarketRestDomain({
         symbol: contractSymbol,
         domain: 'ticker',
@@ -267,9 +274,12 @@ export function useContractMarketState({
       writeContractQuoteCache(contractSymbol, nextQuote);
       setContractAvailabilityError(null);
     } catch (err) {
+      if (quoteRequestSeqRef.current !== requestSeq) return;
       setContractAvailabilityError(friendlyContractError(err, t));
     } finally {
-      setContractQuoteLoading(false);
+      if (quoteRequestSeqRef.current === requestSeq) {
+        setContractQuoteLoading(false);
+      }
     }
   }, [contractSymbol, t]);
 
@@ -300,6 +310,7 @@ export function useContractMarketState({
     void Promise.resolve().then(() => {
       if (!alive) return;
       setHasHydrated(true);
+      quoteRequestSeqRef.current += 1;
       quoteLoadedSymbolRef.current = null;
       setContractQuoteLoading(true);
       setBestDepth({
@@ -337,6 +348,23 @@ export function useContractMarketState({
     // accepted realtime snapshot for a single short socket reconnect.
     void refreshContractQuote();
   }, [marketRealtimeStatus, refreshContractQuote]);
+
+  useEffect(() => {
+    if (transportRecovery.reconnectGeneration <= 0) return;
+
+    // A backend restart creates a new provider/session lineage even when the
+    // public socket reconnects inside the short visual grace window. Rotate
+    // the Store session before accepting new increments so they cannot inherit
+    // the previous process' display_state/executable authority.
+    restartContractMarketShadowSession(contractSymbol);
+    quoteRequestSeqRef.current += 1;
+    contractQuoteRequestStore.delete(contractSymbol);
+    void refreshContractQuote();
+  }, [
+    contractSymbol,
+    refreshContractQuote,
+    transportRecovery.reconnectGeneration,
+  ]);
 
   useEffect(() => {
     if (!transportRecovery.recoveryExpired) return;

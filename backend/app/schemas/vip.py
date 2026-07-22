@@ -47,6 +47,7 @@ class VipOverviewOut(BaseModel):
     svip_levels: list[VipLevelOut]
     user_summary: VipUserSummaryOut
     auth_state: str = "anonymous"
+    rcb_fee_pay_percent: Optional[str] = None
     rcb_discount_percent: Optional[str] = None
 
 

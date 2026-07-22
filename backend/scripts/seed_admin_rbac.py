@@ -55,6 +55,7 @@ PERMISSIONS: tuple[dict[str, str], ...] = (
     {"code": "dividends.distribute", "name": "分红发放", "group_code": "business"},
     {"code": "bd.view", "name": "BD View", "group_code": "users"},
     {"code": "bd_accounts.manage", "name": "BD账号与审核管理", "group_code": "business"},
+    {"code": "bd_commission_rate.manage", "name": "BD分佣比例管理", "group_code": "business"},
     {"code": "bd_commissions.manage", "name": "BD佣金发放", "group_code": "business"},
     {"code": "invite.view", "name": "Invite View", "group_code": "users"},
     {"code": "invite_commissions.manage", "name": "邀请佣金发放", "group_code": "business"},

@@ -16,6 +16,49 @@ describe('Contract REST bootstrap policy', () => {
     expect(decisions).toEqual([true, false, false, false]);
   });
 
+  test('reasserts one bootstrap when realtime connects before the first usable snapshot', () => {
+    let cursor: ContractRestBootstrapCursor = { key: null, realtimeStatus: 'idle' };
+    const decisions = ['idle', 'connecting', 'connected', 'connected'].map((status) => {
+      const decision = resolveContractRestBootstrap(
+        cursor,
+        'BTCUSDT_PERP|0',
+        status,
+        {
+          hasUsableSnapshot: false,
+          refreshIfConnectedWithoutSnapshot: true,
+        },
+      );
+      cursor = decision.next;
+      return decision.shouldRefresh;
+    });
+
+    expect(decisions).toEqual([true, false, true, false]);
+  });
+
+  test('does not reassert after a one-level stock or CFD BBO snapshot is usable', () => {
+    let cursor: ContractRestBootstrapCursor = { key: null, realtimeStatus: 'idle' };
+    const first = resolveContractRestBootstrap(cursor, 'AAPLUSDT_PERP|0', 'idle', {
+      hasUsableSnapshot: false,
+      refreshIfConnectedWithoutSnapshot: true,
+    });
+    cursor = first.next;
+    const connecting = resolveContractRestBootstrap(cursor, 'AAPLUSDT_PERP|0', 'connecting', {
+      hasUsableSnapshot: true,
+      refreshIfConnectedWithoutSnapshot: true,
+    });
+    cursor = connecting.next;
+    const connected = resolveContractRestBootstrap(cursor, 'AAPLUSDT_PERP|0', 'connected', {
+      hasUsableSnapshot: true,
+      refreshIfConnectedWithoutSnapshot: true,
+    });
+
+    expect([first.shouldRefresh, connecting.shouldRefresh, connected.shouldRefresh]).toEqual([
+      true,
+      false,
+      false,
+    ]);
+  });
+
   test('symbol/session changes and realtime loss each trigger exactly one refresh', () => {
     let cursor: ContractRestBootstrapCursor = { key: null, realtimeStatus: 'idle' };
     const step = (key: string, status: string) => {

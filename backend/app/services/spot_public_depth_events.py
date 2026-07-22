@@ -12,13 +12,15 @@ from uuid import uuid4
 
 from redis import Redis
 
-from app.core.rq import get_redis_url
+from app.core.rq import get_redis_connection, get_redis_url
 from app.db.session import SessionLocal
 from app.services.market_ws import MarketWsManager, market_ws_manager
+from app.services.service_heartbeat import beat_service_heartbeat
 
 
 logger = logging.getLogger(__name__)
 SPOT_PUBLIC_DEPTH_EVENTS_CHANNEL = "spot:public_depth_events"
+SPOT_PUBLIC_DEPTH_EVENT_SUBSCRIBER_SERVICE = "spot_public_depth_event_subscriber"
 SPOT_PUBLIC_DEPTH_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 DEFAULT_SEEN_EVENT_LIMIT = 10_000
 DEFAULT_EVENT_BATCH_SIZE = 256
@@ -242,18 +244,61 @@ def _default_redis_factory() -> Any:
     )
 
 
+def _beat_spot_public_depth_event_subscriber(status: str, dispatch_count: int) -> None:
+    redis = None
+    try:
+        redis = get_redis_connection()
+        beat_service_heartbeat(
+            redis,
+            SPOT_PUBLIC_DEPTH_EVENT_SUBSCRIBER_SERVICE,
+            extra_payload={
+                "loop_status": str(status or "unknown"),
+                "channel": SPOT_PUBLIC_DEPTH_EVENTS_CHANNEL,
+                "dispatch_count": int(dispatch_count or 0),
+            },
+        )
+    except Exception:
+        logger.debug("spot_public_depth_event_subscriber_heartbeat_failed", exc_info=True)
+    finally:
+        if redis is not None:
+            close = getattr(redis, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.debug(
+                        "spot_public_depth_event_subscriber_heartbeat_close_failed",
+                        exc_info=True,
+                    )
+
+
 class SpotPublicDepthEventSubscriber:
     def __init__(
         self,
         *,
         dispatcher: SpotPublicDepthEventDispatcher | None = None,
         redis_factory: Callable[[], Any] = _default_redis_factory,
+        heartbeat: Callable[[str, int], Any] | None = _beat_spot_public_depth_event_subscriber,
     ) -> None:
         self.dispatcher = dispatcher or SpotPublicDepthEventDispatcher()
         self._redis_factory = redis_factory
+        self._heartbeat = heartbeat
+
+    async def _beat(self, status: str, dispatch_count: int) -> None:
+        if self._heartbeat is None:
+            return
+        try:
+            result = await asyncio.to_thread(self._heartbeat, status, dispatch_count)
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:
+            # Observability is best-effort. A heartbeat outage must never tear
+            # down the market-data subscriber it is intended to observe.
+            logger.debug("spot_public_depth_event_subscriber_heartbeat_failed", exc_info=True)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         retry_delay = 1.0
+        dispatch_count = 0
         while not stop_event.is_set():
             redis = None
             pubsub = None
@@ -262,7 +307,13 @@ class SpotPublicDepthEventSubscriber:
                 pubsub = redis.pubsub()
                 await pubsub.subscribe(SPOT_PUBLIC_DEPTH_EVENTS_CHANNEL)
                 retry_delay = 1.0
+                last_heartbeat_at = 0.0
+                await self._beat("subscribed", dispatch_count)
                 while not stop_event.is_set():
+                    now = time.monotonic()
+                    if now - last_heartbeat_at >= 10.0:
+                        await self._beat("subscribed", dispatch_count)
+                        last_heartbeat_at = now
                     message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
                     if not message:
                         continue
@@ -284,11 +335,14 @@ class SpotPublicDepthEventSubscriber:
                         if queued_event is not None:
                             events.append(queued_event)
 
-                    for queued_event in _coalesce_events_by_symbol(events):
+                    coalesced_events = _coalesce_events_by_symbol(events)
+                    for queued_event in coalesced_events:
                         await self.dispatcher.dispatch(queued_event)
+                    dispatch_count += len(coalesced_events)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                await self._beat("reconnecting", dispatch_count)
                 logger.warning("spot_public_depth_event_subscriber_failed", exc_info=True)
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=retry_delay)

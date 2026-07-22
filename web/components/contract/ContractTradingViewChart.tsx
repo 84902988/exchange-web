@@ -26,6 +26,7 @@ import {
 } from './tradingview/contractKlineCachePolicy';
 import {
   normalizeContractKlineLoadInterval,
+  normalizeContractKlineLoadSymbol,
 } from './tradingview/contractKlineLoadPolicy';
 import { createContractKlinePreloadManager } from './tradingview/contractKlinePreloadManager';
 import {
@@ -137,7 +138,6 @@ type ContractTradingViewChartProps = {
   pricePrecision?: number | null;
   amountPrecision?: number | null;
   referencePrice: ContractReferencePrice;
-  preferReferencePriceOverlay?: boolean;
   positions?: ContractPositionItem[];
   priceDirection?: ContractPriceDirection;
   onChartModeChange?: (value: ContractChartMode) => void;
@@ -931,7 +931,7 @@ export class ContractChartLoadingCoordinator {
 }
 
 function normalizeTradingViewSymbol(symbol: string) {
-  return String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+  return normalizeContractKlineLoadSymbol(symbol);
 }
 
 export function resolveContractTradingViewOverlayPrice(
@@ -955,20 +955,16 @@ export function resolveContractTradingViewOverlayPrice(
 }
 
 export function resolveContractTradingViewActiveOverlayPrice(
-  preferReferencePriceOverlay: boolean,
   latestKlinePrice: number | null,
   referenceOverlayPrice: number | null,
 ) {
   const numericReferencePrice = Number(referenceOverlayPrice);
-  if (preferReferencePriceOverlay) {
-    return Number.isFinite(numericReferencePrice) && numericReferencePrice > 0
-      ? numericReferencePrice
-      : null;
+  if (Number.isFinite(numericReferencePrice) && numericReferencePrice > 0) {
+    return numericReferencePrice;
   }
   const numericKlinePrice = Number(latestKlinePrice);
-  if (Number.isFinite(numericKlinePrice) && numericKlinePrice > 0) return numericKlinePrice;
-  return Number.isFinite(numericReferencePrice) && numericReferencePrice > 0
-    ? numericReferencePrice
+  return Number.isFinite(numericKlinePrice) && numericKlinePrice > 0
+    ? numericKlinePrice
     : null;
 }
 
@@ -1080,7 +1076,6 @@ export default function ContractTradingViewChart({
   pricePrecision,
   amountPrecision,
   referencePrice,
-  preferReferencePriceOverlay = false,
   positions = [],
   priceDirection = 'flat',
   onChartModeChange,
@@ -1188,9 +1183,7 @@ export default function ContractTradingViewChart({
   const chartModeRef = useRef(chartMode);
   const displayNameRef = useRef(displayName);
   const canonicalCategoryRef = useRef(canonicalCategory);
-  const preferReferencePriceOverlayRef = useRef(preferReferencePriceOverlay);
   const overlayPriceRef = useRef(resolveContractTradingViewActiveOverlayPrice(
-    preferReferencePriceOverlay,
     null,
     overlayPrice,
   ));
@@ -1232,10 +1225,8 @@ export default function ContractTradingViewChart({
     chartModeRef.current = chartMode;
     displayNameRef.current = displayName;
     canonicalCategoryRef.current = canonicalCategory;
-    preferReferencePriceOverlayRef.current = preferReferencePriceOverlay;
     referenceOverlayPriceRef.current = overlayPrice;
     overlayPriceRef.current = resolveContractTradingViewActiveOverlayPrice(
-      preferReferencePriceOverlayRef.current,
       latestKlineOverlayRef.current.price,
       referenceOverlayPriceRef.current,
     );
@@ -1257,7 +1248,6 @@ export default function ContractTradingViewChart({
     onIntervalChange,
     onLatestKlineCloseChange,
     overlayPrice,
-    preferReferencePriceOverlay,
     positionLines,
     priceDirection,
     widgetInterval,
@@ -1365,7 +1355,6 @@ export default function ContractTradingViewChart({
     effectiveInterval,
     normalizedSymbol,
     overlayPrice,
-    preferReferencePriceOverlay,
     priceDirection,
     updatePriceOverlay,
   ]);
@@ -1377,7 +1366,6 @@ export default function ContractTradingViewChart({
     ensureReferencePriceViewport,
     normalizedSymbol,
     overlayPrice,
-    preferReferencePriceOverlay,
   ]);
 
   useEffect(() => {
@@ -2167,7 +2155,6 @@ export default function ContractTradingViewChart({
           price: nextPrice,
         };
         overlayPriceRef.current = resolveContractTradingViewActiveOverlayPrice(
-          preferReferencePriceOverlayRef.current,
           nextPrice,
           referenceOverlayPriceRef.current,
         );
@@ -2264,8 +2251,8 @@ export default function ContractTradingViewChart({
       overrides: {
         'paneProperties.background': '#12161c',
         'paneProperties.backgroundType': 'solid',
-        'paneProperties.vertGridProperties.color': 'rgba(255,255,255,0.04)',
-        'paneProperties.horzGridProperties.color': 'rgba(255,255,255,0.04)',
+        'paneProperties.vertGridProperties.color': 'rgba(255,255,255,0.14)',
+        'paneProperties.horzGridProperties.color': 'rgba(255,255,255,0.14)',
         'scalesProperties.textColor': 'rgba(255,255,255,0.65)',
         'scalesProperties.showStudyLastValue': false,
         'scalesProperties.showStudyPlotLabels': false,

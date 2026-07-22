@@ -66,6 +66,9 @@ _NON_TRADING_DISPLAY_STATES = {
     SESSION_HOLIDAY,
 }
 _LAST_GOOD_BBO_MAX_AGE_MS = 72 * 60 * 60 * 1000
+_DISPLAY_TRADE_FRESHNESSES = {QUOTE_FRESHNESS_LIVE, "RECENT", "FRESH", "CURRENT"}
+_DISPLAY_TRADE_MAX_QUOTE_LAG_MS = 60_000
+_DISPLAY_TRADE_MAX_FUTURE_SKEW_MS = 30_000
 
 
 def _normalized(value: Any) -> str:
@@ -293,6 +296,39 @@ def _latest_trade_freshness(latest_trade: Optional[dict[str, Any]]) -> Optional[
     if not isinstance(latest_trade, dict):
         return None
     return _optional_normalized(latest_trade.get("quote_freshness") or latest_trade.get("freshness"))
+
+
+def _latest_trade_is_display_eligible(
+    latest_trade: Optional[dict[str, Any]],
+    *,
+    quote_time: Optional[datetime],
+    latest_kline: Optional[dict[str, Any]],
+    now: datetime,
+) -> bool:
+    """Keep Header trade authority on the same fresh market timeline.
+
+    Snapshot freshness alone is insufficient after a process restart because a
+    cached trade can be received again with a new cache timestamp. The provider
+    event time must also belong to the latest native candle (when available),
+    or remain close to the current quote when no candle baseline exists.
+    """
+
+    if _latest_trade_price(latest_trade) is None:
+        return False
+    if _latest_trade_freshness(latest_trade) not in _DISPLAY_TRADE_FRESHNESSES:
+        return False
+    trade_time = _latest_trade_time(latest_trade)
+    if trade_time is None:
+        return False
+    if (trade_time - now).total_seconds() * 1000 > _DISPLAY_TRADE_MAX_FUTURE_SKEW_MS:
+        return False
+    latest_kline_time = _latest_kline_open_time(latest_kline)
+    if latest_kline_time is not None:
+        return trade_time >= latest_kline_time
+    reference_time = quote_time or now
+    return (
+        reference_time - trade_time
+    ).total_seconds() * 1000 <= _DISPLAY_TRADE_MAX_QUOTE_LAG_MS
 
 
 def _normalize_interval(interval: Any) -> str:
@@ -750,8 +786,14 @@ def build_contract_market_view(
         reason_code = "QUOTE_STALE" if display_state == DISPLAY_STATE_EXPIRED else "BBO_UNAVAILABLE"
 
     quote_time = _payload_time(bbo_payload) or _payload_time(quote) or _payload_time(depth)
+    latest_trade_display_eligible = _latest_trade_is_display_eligible(
+        latest_trade,
+        quote_time=quote_time,
+        latest_kline=latest_kline,
+        now=now_dt,
+    )
     current_price_source = display_price_source
-    if not is_crypto and latest_trade_price is not None:
+    if not is_crypto and latest_trade_display_eligible:
         display_price = latest_trade_price
         display_price_source = DISPLAY_PRICE_SOURCE_TRADE_TICK
         current_price_source = DISPLAY_PRICE_SOURCE_TRADE_TICK
@@ -796,6 +838,8 @@ def build_contract_market_view(
         _append_warning_once(source_warnings, "market_price_expired")
     if not has_bbo:
         _append_warning_once(source_warnings, "missing_bbo")
+    if not is_crypto and latest_trade_price is not None and not latest_trade_display_eligible:
+        _append_warning_once(source_warnings, "latest_trade_not_display_eligible")
 
     spread_x = _first_payload_decimal(bbo_payload, quote, depth, key="spread_x") or Decimal("0")
     manual_spread_x = _first_payload_decimal(bbo_payload, quote, depth, key="manual_spread_x") or Decimal("0")

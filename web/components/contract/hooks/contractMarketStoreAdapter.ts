@@ -12,7 +12,9 @@ import {
   type ContractMarketStoreTransport,
 } from '../../../lib/realtime/contractMarketStore';
 import type { ContractMarketRealtimeMessage } from '../../../lib/realtime/contractMarketRealtime';
+import { normalizeContractTimestampMs } from '../../../lib/contractTimestamp';
 import type { ContractMarketViewDetail } from '../../../lib/api/modules/contract';
+import { orderContractTradesNewestFirst } from '../contractTradeOrdering';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -208,15 +210,7 @@ function readBoolean(candidates: readonly (UnknownRecord | null)[], ...keys: str
 }
 
 function readTimestamp(candidates: readonly (UnknownRecord | null)[], ...keys: string[]): number | null {
-  const value = readFirst(candidates, ...keys);
-  if (value === null || value === undefined || value === '') return null;
-  if (typeof value === 'string' && !Number.isFinite(Number(value))) {
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-  }
-  const normalized = Number(value);
-  if (!Number.isFinite(normalized) || normalized <= 0) return null;
-  return normalized < 1_000_000_000_000 ? normalized * 1000 : normalized;
+  return normalizeContractTimestampMs(readFirst(candidates, ...keys));
 }
 
 function readRevision(candidates: readonly (UnknownRecord | null)[]): ContractMarketStoreRevision | null {
@@ -236,16 +230,6 @@ function readRevision(candidates: readonly (UnknownRecord | null)[]): ContractMa
   return Object.values(revision).some((value) => value !== null) ? revision : null;
 }
 
-function tradeIdentity(value: unknown): string {
-  const trade = asRecord(value);
-  if (!trade) return String(value);
-  return String(
-    trade.id
-    ?? trade.trade_id
-    ?? `${trade.time ?? trade.ts ?? trade.timestamp ?? ''}:${trade.price ?? trade.last_price ?? ''}:${trade.qty ?? trade.amount ?? ''}`,
-  );
-}
-
 function mergeRealtimeTrades(symbol: string, incoming: unknown): unknown {
   if (!Array.isArray(incoming)) return incoming;
   const state = contractMarketStore.getState();
@@ -253,19 +237,16 @@ function mergeRealtimeTrades(symbol: string, incoming: unknown): unknown {
   const current = entry?.sessionGeneration === state.sessionGeneration
     ? entry.data
     : null;
-  if (!Array.isArray(current)) return incoming;
-  const seen = new Set<string>();
-  return [...incoming, ...current]
-    .filter((trade) => {
-      const key = tradeIdentity(trade);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .slice(0, 100);
+  return orderContractTradesNewestFirst(
+    Array.isArray(current) ? [...incoming, ...current] : incoming,
+    100,
+  );
 }
 
 const CONTRACT_TICKER_STRUCTURAL_AUTHORITY_FIELDS = [
+  'display_price',
+  'display_price_source',
+  'current_price_source',
   'display_state',
   'executable',
   'reason_code',
@@ -321,6 +302,36 @@ function mergeTickerStructuralAuthority(
     }
   }
   if (!currentStructuralAuthority) return merged;
+  const incomingSource = String(
+    incomingRecord.source ?? incomingRecord.quote_source ?? '',
+  ).trim().toUpperCase();
+  const incomingFreshness = String(
+    incomingRecord.freshness ?? incomingRecord.quote_freshness ?? '',
+  ).trim().toUpperCase();
+  const incomingPriceSource = String(
+    incomingRecord.price_source ?? '',
+  ).trim().toUpperCase();
+  const incomingLastPrice = readPrice(
+    incomingRecord,
+    'last_price',
+    'price',
+    'last',
+  );
+  const isTrustedLivePrice = incomingFreshness === 'LIVE'
+    && Boolean(incomingLastPrice)
+    && (
+      incomingPriceSource === 'TRADE_TICK'
+      || incomingSource === 'LIVE_WS'
+      || incomingSource === 'PROVIDER_WS'
+      || incomingSource === 'ITICK_LIVE_WS_DERIVED_BBO'
+    );
+  if (isTrustedLivePrice) {
+    merged.display_price = incomingLastPrice;
+    merged.display_price_source = incomingPriceSource === 'KLINE_CLOSE'
+      ? 'KLINE_CLOSE'
+      : 'TRADE_TICK';
+    merged.current_price_source = merged.display_price_source;
+  }
   for (const field of CONTRACT_TICKER_STRUCTURAL_AUTHORITY_FIELDS) {
     if (merged[field] === undefined && currentStructuralAuthority[field] !== undefined) {
       merged[field] = currentStructuralAuthority[field];
@@ -396,7 +407,12 @@ function resolveDisplayPrice(
   const explicitSource = normalizeDisplayPriceSource(
     ticker?.display_price_source ?? ticker?.current_price_source ?? ticker?.price_source,
   );
-  if (explicitPrice) {
+  const hasExplicitDisplayAuthority = Boolean(ticker) && (
+    Object.prototype.hasOwnProperty.call(ticker, 'display_price')
+    || Object.prototype.hasOwnProperty.call(ticker, 'display_price_source')
+    || Object.prototype.hasOwnProperty.call(ticker, 'current_price_source')
+  );
+  if (hasExplicitDisplayAuthority) {
     return { displayPrice: explicitPrice, displayPriceSource: explicitSource };
   }
 
@@ -447,8 +463,8 @@ function projectMarketViewTicker(
     'warnings',
   ];
   for (const field of fields) {
-    const fieldValue = view[field];
-    if (fieldValue !== undefined && fieldValue !== null) projected[field] = fieldValue;
+    if (!Object.prototype.hasOwnProperty.call(view, field)) continue;
+    projected[field] = view[field];
   }
   return projected;
 }
@@ -529,6 +545,8 @@ export function selectContractHeaderStoreSnapshot(
   const depth = asRecord(depthEntry?.data);
   const depthBid = readBookBest(depth, 'bid');
   const depthAsk = readBookBest(depth, 'ask');
+  const explicitDepthExecutionBid = readPrice(depth, 'execution_bid');
+  const explicitDepthExecutionAsk = readPrice(depth, 'execution_ask');
   const explicitTickerExecutionBid = readPrice(ticker, 'execution_bid');
   const explicitTickerExecutionAsk = readPrice(ticker, 'execution_ask');
   const tickerProvider = String(tickerEntry?.provider || readValue(ticker, 'provider') || '')
@@ -539,8 +557,41 @@ export function selectContractHeaderStoreSnapshot(
     ?? (allowGenericTickerBbo ? readBookBest(ticker, 'bid') : null);
   const tickerAsk = explicitTickerExecutionAsk
     ?? (allowGenericTickerBbo ? readBookBest(ticker, 'ask') : null);
-  const bestBid = depthBid ?? tickerBid;
-  const bestAsk = depthAsk ?? tickerAsk;
+  const hasDepthBbo = depthBid !== null && depthAsk !== null;
+  const hasDepthExecutionBbo = explicitDepthExecutionBid !== null
+    && explicitDepthExecutionAsk !== null;
+  const bestBid = hasDepthBbo
+    ? depthBid
+    : hasDepthExecutionBbo
+      ? explicitDepthExecutionBid
+      : tickerBid;
+  const bestAsk = hasDepthBbo
+    ? depthAsk
+    : hasDepthExecutionBbo
+      ? explicitDepthExecutionAsk
+      : tickerAsk;
+  const tickerExecutable = typeof ticker?.executable === 'boolean'
+    ? ticker.executable
+    : null;
+  const depthExecutable = typeof depth?.executable === 'boolean'
+    ? depth.executable
+    : null;
+  const bboAuthorityEntry = hasDepthBbo || hasDepthExecutionBbo
+    ? depthEntry
+    : tickerEntry ?? depthEntry;
+  const executable = bboAuthorityEntry === depthEntry
+    ? depthExecutable ?? tickerExecutable
+    : tickerExecutable ?? depthExecutable;
+  const tickerDisplayState = readValue(ticker, 'display_state');
+  const depthDisplayState = readValue(depth, 'display_state');
+  const tickerHasLiveStructure = ['LIVE_TRADABLE', 'REGULAR_OPEN']
+    .includes(String(tickerDisplayState || '').trim().toUpperCase());
+  const depthProvidesLiveStructure = bboAuthorityEntry === depthEntry
+    && executable === true
+    && !depthEntry?.stale;
+  const recoverStructureFromDepth = depthProvidesLiveStructure
+    && (!tickerHasLiveStructure || tickerExecutable !== true || tickerEntry?.stale === true);
+  const structureEntry = recoverStructureFromDepth ? depthEntry : tickerEntry ?? depthEntry;
   const display = resolveDisplayPrice(ticker, bestBid, bestAsk);
   const bid = Number(bestBid);
   const ask = Number(bestAsk);
@@ -550,7 +601,7 @@ export function selectContractHeaderStoreSnapshot(
       ? String(ask - bid)
       : null
   );
-  const authorityEntry = tickerEntry ?? depthEntry;
+  const authorityEntry = structureEntry ?? bboAuthorityEntry;
   const snapshot: ContractHeaderStoreSnapshot = {
     symbol,
     ...display,
@@ -570,21 +621,26 @@ export function selectContractHeaderStoreSnapshot(
     low24h: readPrice(ticker, 'low_24h'),
     baseVolume24h: readValue(ticker, 'base_volume_24h'),
     quoteVolume24h: readValue(ticker, 'quote_volume_24h'),
-    displayState: readValue(ticker, 'display_state') ?? readValue(depth, 'display_state'),
-    marketStatus: readValue(ticker, 'market_status') ?? readValue(depth, 'market_status'),
-    marketSessionType: readValue(ticker, 'market_session_type')
-      ?? readValue(depth, 'market_session_type'),
-    executable: typeof ticker?.executable === 'boolean'
-      ? ticker.executable
-      : typeof depth?.executable === 'boolean'
-        ? depth.executable
-        : null,
-    source: tickerEntry?.source
-      ?? readValue(ticker, 'ticker_source', 'source', 'quote_source')
+    displayState: recoverStructureFromDepth
+      ? depthDisplayState ?? 'LIVE_TRADABLE'
+      : tickerDisplayState ?? depthDisplayState,
+    marketStatus: recoverStructureFromDepth
+      ? readValue(depth, 'market_status') ?? readValue(ticker, 'market_status')
+      : readValue(ticker, 'market_status') ?? readValue(depth, 'market_status'),
+    marketSessionType: recoverStructureFromDepth
+      ? readValue(depth, 'market_session_type') ?? readValue(ticker, 'market_session_type')
+      : readValue(ticker, 'market_session_type') ?? readValue(depth, 'market_session_type'),
+    executable,
+    source: structureEntry?.source
+      ?? (recoverStructureFromDepth
+        ? readValue(depth, 'depth_source', 'source', 'quote_source')
+        : readValue(ticker, 'ticker_source', 'source', 'quote_source'))
       ?? authorityEntry?.source
       ?? null,
-    freshness: tickerEntry?.freshness
-      ?? readValue(ticker, 'ticker_freshness', 'freshness', 'quote_freshness')
+    freshness: structureEntry?.freshness
+      ?? (recoverStructureFromDepth
+        ? readValue(depth, 'depth_freshness', 'freshness', 'quote_freshness')
+        : readValue(ticker, 'ticker_freshness', 'freshness', 'quote_freshness'))
       ?? authorityEntry?.freshness
       ?? null,
     provider: tickerEntry?.provider ?? depthEntry?.provider ?? null,
@@ -689,11 +745,6 @@ export function selectContractMarketViewStoreAuthoritySnapshot(
         ? tickerAsk
         : null;
   const display = resolveDisplayPrice(ticker, bestBid, bestAsk);
-  const executable = typeof ticker?.executable === 'boolean'
-    ? ticker.executable
-    : typeof depth?.executable === 'boolean'
-      ? depth.executable
-      : null;
   const bboAuthorityEntry = hasDepthExecutionBbo
     ? realtimeDepthEntry
     : hasTickerExecutionBbo
@@ -701,8 +752,25 @@ export function selectContractMarketViewStoreAuthoritySnapshot(
       : hasDepthBbo
         ? realtimeDepthEntry
         : hasTickerBbo
-          ? realtimeTickerEntry
-          : undefined;
+        ? realtimeTickerEntry
+        : undefined;
+  const tickerExecutable = typeof ticker?.executable === 'boolean'
+    ? ticker.executable
+    : null;
+  const depthExecutable = typeof depth?.executable === 'boolean'
+    ? depth.executable
+    : null;
+  // Execution follows the domain that supplied the selected BBO. A stale
+  // ticker guard must not disable a newer executable depth snapshot.
+  const executable = bboAuthorityEntry === realtimeDepthEntry
+    ? depthExecutable ?? tickerExecutable
+    : tickerExecutable ?? depthExecutable;
+  const executionMode = bboAuthorityEntry === realtimeDepthEntry
+    ? readValue(depth, 'execution_mode') ?? readValue(ticker, 'execution_mode')
+    : readValue(ticker, 'execution_mode') ?? readValue(depth, 'execution_mode');
+  const executionReasonCode = bboAuthorityEntry === realtimeDepthEntry
+    ? readValue(depth, 'reason_code') ?? readValue(ticker, 'reason_code')
+    : readValue(ticker, 'reason_code') ?? readValue(depth, 'reason_code');
   const executionBid = hasDepthExecutionBbo
     ? explicitDepthExecutionBid
     : hasTickerExecutionBbo
@@ -738,9 +806,9 @@ export function selectContractMarketViewStoreAuthoritySnapshot(
     spread,
     executionBid,
     executionAsk,
-    executionMode: readValue(ticker, 'execution_mode') ?? readValue(depth, 'execution_mode'),
+    executionMode,
     executable,
-    reasonCode: readValue(ticker, 'reason_code') ?? readValue(depth, 'reason_code'),
+    reasonCode: executionReasonCode,
     tickerSource: realtimeTickerEntry?.source
       ?? readValue(ticker, 'ticker_source', 'source', 'quote_source'),
     tickerFreshness: realtimeTickerEntry?.freshness
@@ -789,6 +857,34 @@ export function projectContractMarketViewStoreAuthority(
   baseView: ContractMarketViewDetail | null = null,
   nowMs = Date.now(),
 ): ContractMarketViewDetail | null {
+  const sameSymbolBase = snapshot && normalizeSymbol(baseView?.symbol) === snapshot.symbol
+    ? baseView
+    : null;
+  const snapshotDisplayState = String(snapshot?.displayState || '').trim().toUpperCase();
+  const baseDisplayState = String(sameSymbolBase?.display_state || '').trim().toUpperCase();
+  const baseExecutionBid = Number(sameSymbolBase?.execution_bid);
+  const baseExecutionAsk = Number(sameSymbolBase?.execution_ask);
+  const baseHasExecutableBbo = Number.isFinite(baseExecutionBid)
+    && Number.isFinite(baseExecutionAsk)
+    && baseExecutionBid > 0
+    && baseExecutionAsk >= baseExecutionBid;
+  const baseConfirmsLiveAuthority = (
+    baseDisplayState === 'LIVE_TRADABLE'
+    || baseDisplayState === 'REGULAR_OPEN'
+  ) && sameSymbolBase?.executable === true && baseHasExecutableBbo;
+  const snapshotHasLiveState = snapshotDisplayState === 'LIVE_TRADABLE'
+    || snapshotDisplayState === 'REGULAR_OPEN';
+  const recoverStructureFromBase = Boolean(
+    sameSymbolBase
+    && baseConfirmsLiveAuthority
+    && !snapshotHasLiveState,
+  );
+  const effectiveDisplayPrice = recoverStructureFromBase
+    ? String(sameSymbolBase?.display_price || '') || null
+    : snapshot?.displayPrice || null;
+  const effectiveDisplayState = recoverStructureFromBase
+    ? baseDisplayState
+    : snapshot?.displayState || null;
   const tickerAgeMs = snapshot
     ? Math.max(0, nowMs - snapshot.tickerObservedAtMs)
     : Number.POSITIVE_INFINITY;
@@ -801,8 +897,8 @@ export function projectContractMarketViewStoreAuthority(
     || snapshot.stale
     || snapshot.tickerObservedAtMs <= 0
     || tickerAgeMs > CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS
-    || !snapshot.displayPrice
-    || !snapshot.displayState
+    || !effectiveDisplayPrice
+    || !effectiveDisplayState
   ) {
     return null;
   }
@@ -822,10 +918,11 @@ export function projectContractMarketViewStoreAuthority(
     )
   ) return null;
 
-  const executable = snapshot.executable === true && hasExecutableBbo;
-  const sameSymbolBase = normalizeSymbol(baseView?.symbol) === snapshot.symbol
-    ? baseView
-    : null;
+  const executable = (
+    recoverStructureFromBase
+      ? baseConfirmsLiveAuthority
+      : snapshot.executable === true
+  ) && hasExecutableBbo;
   const observedAtMs = snapshot.observedAtMs > 0 ? snapshot.observedAtMs : nowMs;
   return {
     ...(sameSymbolBase || {}),
@@ -834,34 +931,43 @@ export function projectContractMarketViewStoreAuthority(
     market_type: sameSymbolBase?.market_type || 'CONTRACT',
     category: sameSymbolBase?.category || 'UNKNOWN',
     market_status: snapshot.marketStatus || sameSymbolBase?.market_status || 'UNKNOWN',
-    display_state: snapshot.displayState,
-    display_price: snapshot.displayPrice,
-    display_price_source: snapshot.displayPriceSource
+    display_state: effectiveDisplayState,
+    display_price: effectiveDisplayPrice,
+    display_price_source: (recoverStructureFromBase ? sameSymbolBase?.display_price_source : snapshot.displayPriceSource)
       || sameSymbolBase?.display_price_source
       || 'LIVE_MID',
-    current_price_source: snapshot.displayPriceSource
+    current_price_source: (recoverStructureFromBase ? sameSymbolBase?.current_price_source : snapshot.displayPriceSource)
       || sameSymbolBase?.current_price_source
       || null,
     ticker_source: snapshot.tickerSource,
     ticker_freshness: snapshot.tickerFreshness,
     depth_source: snapshot.depthSource,
-    depth_freshness: snapshot.depthFreshness,
+    // Store freshness/staleness and the selected BBO entry already prove the
+    // realtime execution authority above. Project that result back into the
+    // canonical MarketView vocabulary consumed by PriceAuthority instead of
+    // leaking provider/domain-specific mode names into the execution gate.
+    depth_freshness: executable ? 'LIVE' : snapshot.depthFreshness,
     best_bid: snapshot.bestBid,
     best_ask: snapshot.bestAsk,
     spread: snapshot.spread,
     executable,
     execution_bid: executable ? snapshot.executionBid : null,
     execution_ask: executable ? snapshot.executionAsk : null,
-    execution_mode: snapshot.executionMode || (executable ? 'STORE_REALTIME_BBO' : 'UNAVAILABLE'),
+    execution_mode: executable ? 'LIVE_BBO' : 'UNAVAILABLE',
     last_good_bbo_valid: executable,
     price_age_ms: Math.max(0, nowMs - observedAtMs),
     quote_time: new Date(observedAtMs).toISOString(),
     last_good_at: sameSymbolBase?.last_good_at ?? null,
-    reason_code: snapshot.reasonCode || (executable ? '' : 'STORE_MARKET_NOT_EXECUTABLE'),
+    reason_code: (recoverStructureFromBase ? sameSymbolBase?.reason_code : snapshot.reasonCode)
+      || (executable ? '' : 'STORE_MARKET_NOT_EXECUTABLE'),
     warnings: sameSymbolBase?.warnings || [],
     raw_source_summary: {
       ...(sameSymbolBase?.raw_source_summary || {}),
-      authority_source: 'CONTRACT_MARKET_STORE',
+      authority_source: recoverStructureFromBase
+        ? 'CONTRACT_MARKET_STORE_WITH_REST_STRUCTURE'
+        : 'CONTRACT_MARKET_STORE',
+      store_execution_mode: snapshot.executionMode,
+      store_depth_freshness: snapshot.depthFreshness,
       store_observed_at_ms: observedAtMs,
     },
   };
@@ -1161,15 +1267,10 @@ function normalizeTrades(value: unknown): ContractTradesStoreTrade[] {
     return [{ trade, inputIndex: index }];
   });
 
-  normalized.sort((left, right) => (
-    right.trade.time - left.trade.time || left.inputIndex - right.inputIndex
-  ));
-  const seen = new Set<string>();
-  return normalized.flatMap(({ trade }) => {
-    if (seen.has(trade.id)) return [];
-    seen.add(trade.id);
-    return [trade];
-  }).slice(0, CONTRACT_TRADES_DISPLAY_LIMIT);
+  return orderContractTradesNewestFirst(
+    normalized.map(({ trade }) => trade),
+    CONTRACT_TRADES_DISPLAY_LIMIT,
+  );
 }
 
 type TradesSnapshotCache = {
@@ -1342,14 +1443,13 @@ export function ingestContractMarketWsDomain(params: {
 export function hydrateContractMarketViewShadow(
   value: unknown,
   transport: Extract<ContractMarketStoreTransport, 'REST' | 'WS'>,
+  domains: readonly ContractMarketStoreDomain[] = ['ticker', 'depth', 'trades', 'kline'],
 ): ContractMarketStoreIngestResult[] {
   const view = asRecord(value) as ContractMarketViewShadowPayload | null;
   const symbol = String(view?.symbol ?? '').trim().toUpperCase();
   if (!view || !symbol) return [];
   const snapshotMetadata = asRecord(view.snapshot_metadata);
   const results: ContractMarketStoreIngestResult[] = [];
-  const domains: ContractMarketStoreDomain[] = ['ticker', 'depth', 'trades', 'kline'];
-
   for (const domain of domains) {
     const metadata = snapshotMetadata ? snapshotMetadata[domain] : null;
     const domainData = domain === 'kline'

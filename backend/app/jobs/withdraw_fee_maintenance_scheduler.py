@@ -18,6 +18,53 @@ logger = logging.getLogger(__name__)
 
 _thread: Optional[threading.Thread] = None
 _stop_event: Optional[threading.Event] = None
+_scheduler_health_lock = threading.Lock()
+_scheduler_health: Dict[str, Any] = {
+    "last_tick_at": None,
+    "last_tick_ok": None,
+    "last_tick_error": "",
+    "consecutive_failures": 0,
+}
+
+
+def _scheduler_tick_timestamp() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _record_scheduler_tick(result: Dict[str, Any]) -> None:
+    ok = bool(result.get("ok"))
+    error = str(result.get("error") or "")[:240]
+    if not error and not ok:
+        for item in result.get("results") or []:
+            if item.get("error"):
+                error = str(item.get("error"))[:240]
+                break
+    with _scheduler_health_lock:
+        failures = 0 if ok else int(_scheduler_health.get("consecutive_failures") or 0) + 1
+        _scheduler_health.update(
+            {
+                "last_tick_at": _scheduler_tick_timestamp(),
+                "last_tick_ok": ok,
+                "last_tick_error": error,
+                "consecutive_failures": failures,
+            }
+        )
+
+
+def get_withdraw_fee_scheduler_heartbeat_payload() -> Dict[str, Any]:
+    with _scheduler_health_lock:
+        return dict(_scheduler_health)
+
+
+def _close_scheduler_session(db: Any) -> None:
+    if db is None:
+        return
+    try:
+        db.close()
+    except Exception:
+        # Session cleanup is best-effort. A broken connection must not replace
+        # the tick result or terminate the long-running scheduler loop.
+        logger.warning("[withdraw_fee_maintenance_scheduler] session close failed", exc_info=True)
 
 
 def _global_maintenance_interval_seconds() -> int:
@@ -60,8 +107,9 @@ def _chain_is_due(last_updated_at: Any, interval_seconds: int, now: datetime) ->
 
 
 def process_withdraw_fee_maintenance_scheduler_once() -> Dict[str, Any]:
-    db = SessionLocal()
+    db = None
     try:
+        db = SessionLocal()
         rows = db.execute(
             text(
                 """
@@ -119,12 +167,24 @@ def process_withdraw_fee_maintenance_scheduler_once() -> Dict[str, Any]:
                 not_due_count,
                 failed_count,
             )
-        return {"ok": True, "scanned": len(rows), "results": results}
+        result = {
+            "ok": failed_count == 0,
+            "scanned": len(rows),
+            "enqueued_count": enqueued_count,
+            "duplicate_count": duplicate_count,
+            "not_due_count": not_due_count,
+            "failed_count": failed_count,
+            "results": results,
+        }
+        _record_scheduler_tick(result)
+        return result
     except Exception as exc:
         logger.exception("[withdraw_fee_maintenance_scheduler] enqueue failed")
-        return {"ok": False, "enqueued": False, "error": repr(exc)}
+        result = {"ok": False, "enqueued": False, "error": repr(exc)}
+        _record_scheduler_tick(result)
+        return result
     finally:
-        db.close()
+        _close_scheduler_session(db)
 
 
 def start_withdraw_fee_maintenance_scheduler() -> None:

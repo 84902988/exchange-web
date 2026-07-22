@@ -7,6 +7,7 @@ import {
   normalizeContractKlineAssetClass,
   type ContractKlineAssetClass,
 } from './contractKlineCachePolicy';
+import { normalizeContractKlineLoadSymbol } from './contractKlineLoadPolicy';
 
 export const CONTRACT_KLINE_CURRENT_CACHE_MAX_ENTRIES = 64;
 
@@ -47,7 +48,7 @@ const RECENT_PROVIDER_CACHE_STATUSES = new Set([
 ]);
 
 function normalizeSymbol(symbol: string) {
-  return String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+  return normalizeContractKlineLoadSymbol(symbol);
 }
 
 function normalizeInterval(interval: string) {

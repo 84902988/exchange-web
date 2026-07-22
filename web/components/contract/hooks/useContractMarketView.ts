@@ -41,6 +41,7 @@ import {
   resolveContractRestBootstrap,
   type ContractRestBootstrapCursor,
 } from './contractRestBootstrapPolicy';
+import { resolveContractDepthBootstrapPresentation } from './contractDepthBootstrapPolicy';
 import {
   CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS,
   hydrateContractMarketRestDomain,
@@ -53,6 +54,7 @@ import {
   normalizeContractMarketViewDisplayState,
   readContractMarketViewAuthority,
   resolveContractMarketViewAuthorityPresentation,
+  shouldHoldContractMarketViewBootstrap,
   shouldExposeContractMarketDepth,
   type ContractMarketViewAuthorityState,
 } from '../contractMarketView.utils';
@@ -60,6 +62,7 @@ import {
   buildContractPriceAuthority,
   selectContractReferencePrice,
 } from '../contractPriceAuthority';
+import { orderContractTradesNewestFirst } from '../contractTradeOrdering';
 import { useContractMarketTransportRecovery } from './useContractMarketTransportRecovery';
 
 export type ContractCurrentPriceSource = 'KLINE_CLOSE' | 'LIVE_MID' | 'TRADE_TICK';
@@ -110,6 +113,8 @@ const FUTURES_DEPTH_LIMIT = 20;
 const FUTURES_TRADES_LIMIT = 30;
 const DEPTH_INITIAL_GRACE_MS = 1800;
 const REST_BOOTSTRAP_GRACE_MS = 750;
+const MARKET_VIEW_INITIAL_BOOTSTRAP_GRACE_MS = 1500;
+const MARKET_STATE_STORE_DOMAINS = ['ticker', 'depth', 'trades'] as const;
 
 type ContractDepthSnapshot = {
   symbol?: string | null;
@@ -254,9 +259,7 @@ function normalizeRealtimeLevels(value: unknown): ContractDepthLevel[] {
 }
 
 function normalizeTradeTime(value: unknown) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return Date.now();
-  return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+  return parseContractMarketTimestamp(value as string | number | null | undefined);
 }
 
 function getTradePayloads(message: ContractMarketRealtimeMessage) {
@@ -271,7 +274,7 @@ function extractRealtimeTrades(
   message: ContractMarketRealtimeMessage,
   currentSymbol: string,
 ): ContractMarketTrade[] {
-  return getTradePayloads(message)
+  const normalized = getTradePayloads(message)
     .flatMap((payload) => {
       if (!isRecord(payload)) return [];
       const msgSymbol = String(message.symbol || payload.symbol || '').trim().toUpperCase();
@@ -288,7 +291,15 @@ function extractRealtimeTrades(
         return [];
       }
 
-      const time = normalizeTradeTime(payload.time ?? payload.ts ?? payload.timestamp);
+      const time = normalizeTradeTime(
+        payload.event_time_ms
+        ?? payload.provider_event_time_ms
+        ?? payload.time
+        ?? payload.ts
+        ?? payload.timestamp
+        ?? payload.exchange_ts,
+      );
+      if (time === null) return [];
       const trade: ContractMarketTrade = {
         id: payload.id ? String(payload.id) : `${time}-${price}-${normalizedQty}`,
         price: String(price),
@@ -312,6 +323,7 @@ function extractRealtimeTrades(
       }
       return [trade];
     });
+  return orderContractTradesNewestFirst(normalized, FUTURES_TRADES_LIMIT);
 }
 
 function mergeTrades(
@@ -319,15 +331,7 @@ function mergeTrades(
   previous: ContractMarketTrade[],
   limit = FUTURES_TRADES_LIMIT,
 ) {
-  const seen = new Set<string>();
-  return [...incoming, ...previous]
-    .filter((item) => {
-      const key = String(item.id);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .slice(0, limit);
+  return orderContractTradesNewestFirst([...incoming, ...previous], limit);
 }
 
 function extractRealtimeDepth(
@@ -395,16 +399,7 @@ function maxPrice(levels: ContractDepthLevel[]) {
 }
 
 function getTimestampMillis(value?: string | number | null) {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value > 1_000_000_000_000 ? value : value * 1000;
-  }
-  if (typeof value === 'string' && value.trim()) {
-    const numeric = Number(value);
-    if (Number.isFinite(numeric)) return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return Date.now();
+  return parseContractMarketTimestamp(value) ?? Date.now();
 }
 
 export function useContractMarketView({
@@ -453,6 +448,10 @@ export function useContractMarketView({
   const [priceDirection, setPriceDirection] = useState<ContractPriceDirection>('flat');
   const [storeAuthorityEvaluationTimeMs, setStoreAuthorityEvaluationTimeMs] = useState(0);
   const [marketSessionRefreshKey, setMarketSessionRefreshKey] = useState(0);
+  const [marketViewBootstrapGrace, setMarketViewBootstrapGrace] = useState(() => ({
+    symbol: normalizeContractSymbol(contractSymbol),
+    active: true,
+  }));
   const requestSeqRef = useRef(0);
   const inFlightSymbolRef = useRef<string | null>(null);
   const marketViewAbortControllerRef = useRef<AbortController | null>(null);
@@ -600,12 +599,32 @@ export function useContractMarketView({
   }, [contractSymbol, refreshMarketView]);
 
   useEffect(() => {
+    const symbol = normalizeContractSymbol(contractSymbol);
+    setMarketViewBootstrapGrace({ symbol, active: true });
+    const timer = window.setTimeout(() => {
+      setMarketViewBootstrapGrace((current) => (
+        current.symbol === symbol ? { symbol, active: false } : current
+      ));
+    }, MARKET_VIEW_INITIAL_BOOTSTRAP_GRACE_MS);
+    return () => window.clearTimeout(timer);
+  }, [contractSymbol]);
+
+  useEffect(() => {
     const handleMarketStateMessage = (message: ContractMarketRealtimeMessage) => {
       if (!isContractMarketDomainMessage(message)) return;
       const nextState = extractContractMarketStateMessage(message);
       if (!nextState) return;
       if (normalizeContractSymbol(nextState.symbol) !== normalizeContractSymbol(contractSymbol)) return;
-      const storeResults = hydrateContractMarketViewShadow(nextState, 'WS');
+      // Market-state frames own Header, execution quote/depth and recent trades.
+      // Native K-line authority is ingested only from the dedicated K-line
+      // channel below. Rehydrating the embedded candle on every market-state
+      // tick can replay an older Native OPEN over a newer trade preview and
+      // makes TradingView wait for the next provider candle before recovering.
+      const storeResults = hydrateContractMarketViewShadow(
+        nextState,
+        'WS',
+        MARKET_STATE_STORE_DOMAINS,
+      );
       const tickerAccepted = storeResults.some((result) => (
         result.accepted && result.entry?.domain === 'ticker'
       ));
@@ -639,6 +658,28 @@ export function useContractMarketView({
       updatedAt: null,
     }));
   }, [contractSymbol, transportRecovery.recoveryExpired]);
+
+  useEffect(() => {
+    if (transportRecovery.reconnectGeneration <= 0) return;
+
+    // Supersede a request that may have been left waiting while the backend
+    // process was down. The new Store generation is owned by
+    // useContractMarketState; this hook rehydrates its full MarketView
+    // authority and re-arms depth/trade REST bootstrap for the same symbol.
+    requestSeqRef.current += 1;
+    marketViewAbortControllerRef.current?.abort();
+    marketViewAbortControllerRef.current = null;
+    inFlightSymbolRef.current = null;
+    setWsState(null);
+    setMarketViewError(null);
+    marketViewErrorSymbolRef.current = null;
+    setMarketViewLoading(true);
+    setMarketSessionRefreshKey((value) => value + 1);
+    void refreshMarketView();
+  }, [
+    refreshMarketView,
+    transportRecovery.reconnectGeneration,
+  ]);
 
   const activeRealtimeMarketView = transportRecovery.preserveRealtimeAuthority
     && normalizeContractSymbol(wsState?.symbol) === normalizeContractSymbol(contractSymbol)
@@ -716,7 +757,9 @@ export function useContractMarketView({
     [marketView],
   );
   const rawMarketViewDisplayState = marketViewAuthority.displayState;
-  const quoteStatusLoading = currentMarketViewLoading && !marketView;
+  const marketViewBootstrapGraceActive = marketViewBootstrapGrace.symbol
+    !== normalizeContractSymbol(contractSymbol)
+    || marketViewBootstrapGrace.active;
   const depthBelongsToCurrentSymbol = normalizeContractSymbol(depthState.symbol) === normalizeContractSymbol(contractSymbol);
   const activeDepthAsks = useMemo(
     () => (depthBelongsToCurrentSymbol ? depthState.asks : []),
@@ -726,6 +769,7 @@ export function useContractMarketView({
     () => (depthBelongsToCurrentSymbol ? depthState.bids : []),
     [depthBelongsToCurrentSymbol, depthState.bids],
   );
+  const hasActiveDepthRows = activeDepthAsks.length > 0 || activeDepthBids.length > 0;
   const activeDepthSource = depthBelongsToCurrentSymbol ? depthState.source ?? null : null;
   const activeDepthMode = depthBelongsToCurrentSymbol ? depthState.depth_mode ?? null : null;
   const activeDepthMarketStatus = depthBelongsToCurrentSymbol ? depthState.market_status ?? null : null;
@@ -884,12 +928,17 @@ export function useContractMarketView({
       depthRestBootstrapRef.current,
       bootstrapKey,
       quoteMarketRealtimeStatus,
+      {
+        hasUsableSnapshot: hasActiveDepthRows,
+        refreshIfConnectedWithoutSnapshot: true,
+      },
     );
     depthRestBootstrapRef.current = decision.next;
 
-    // Give the authoritative WS snapshot a short first-load grace period. REST
-    // still runs immediately after a real WS loss.
-    // While realtime is connected, every depth frame comes from the WS Store path.
+    // A connected socket is only transport readiness, not proof that the
+    // current symbol has delivered a depth frame. If WS connects before the
+    // first snapshot, re-arm one REST bootstrap; a later WS frame still wins
+    // through the domain Store's realtime authority checks.
     let bootstrapTimer: number | null = null;
     if (decision.shouldRefresh) {
       if (lostRealtime) void refreshDepth();
@@ -916,6 +965,7 @@ export function useContractMarketView({
     };
   }, [
     contractSymbol,
+    hasActiveDepthRows,
     marketSessionRefreshKey,
     quoteMarketRealtimeStatus,
     refreshDepth,
@@ -946,7 +996,7 @@ export function useContractMarketView({
 
   const applyTradesSnapshot = useCallback((trades: ContractMarketTrade[], options: { loading?: boolean; error?: string | null } = {}) => {
     const requestSymbol = normalizeContractSymbol(contractSymbol);
-    const nextRows = trades.slice(0, FUTURES_TRADES_LIMIT);
+    const nextRows = orderContractTradesNewestFirst(trades, FUTURES_TRADES_LIMIT);
     const latest = nextRows[0] || null;
     setTradesState({
       symbol: requestSymbol,
@@ -983,7 +1033,10 @@ export function useContractMarketView({
     try {
       const trades = await getContractMarketTrades(requestSymbol, FUTURES_TRADES_LIMIT);
       if (!mountedRef.current || tradesRequestSeqRef.current !== requestSeq) return;
-      const nextTrades = [...trades].reverse();
+      const nextTrades = orderContractTradesNewestFirst(
+        trades,
+        FUTURES_TRADES_LIMIT,
+      );
       const storeResult = hydrateContractMarketRestDomain({
         symbol: requestSymbol,
         domain: 'trades',
@@ -1100,7 +1153,7 @@ export function useContractMarketView({
           error: null,
           source: latest?.source || latest?.quote_source || latest?.price_source || null,
           freshness: latest?.quote_freshness || null,
-          updatedAt: latest ? normalizeTradeTime(latest.time ?? latest.ts) : Date.now(),
+          updatedAt: latest ? normalizeTradeTime(latest.time ?? latest.ts) : null,
         };
       });
     };
@@ -1155,9 +1208,13 @@ export function useContractMarketView({
     kline: marketView?.kline_current_candle ? {
       symbol: marketView.symbol,
       close: marketView.kline_current_candle.close,
-      time: marketView.kline_current_candle.updated_at_ms
+      // Reference ordering is bucket based: an older cached trade may not
+      // override the active provider candle. received/updated time is only a
+      // transport timestamp and would incorrectly make every in-bucket trade
+      // look older than the Kline.
+      time: marketView.kline_current_candle.open_time
         ?? marketView.kline_current_candle.time
-        ?? marketView.kline_current_candle.open_time
+        ?? marketView.kline_current_candle.updated_at_ms
         ?? marketView.kline_current_candle.timestamp,
       freshness: marketView.kline_freshness,
       priceSource: marketView.kline_current_candle.price_source,
@@ -1220,9 +1277,20 @@ export function useContractMarketView({
   const marketViewAuthorityPresentation = useMemo(
     () => resolveContractMarketViewAuthorityPresentation({
       marketView,
-      loading: currentMarketViewLoading,
+      executionReady: priceAuthority.executable,
+      loading: shouldHoldContractMarketViewBootstrap({
+        marketView,
+        loading: currentMarketViewLoading,
+        graceActive: marketViewBootstrapGraceActive,
+        executionReady: priceAuthority.executable,
+      }),
     }),
-    [currentMarketViewLoading, marketView],
+    [
+      currentMarketViewLoading,
+      marketView,
+      marketViewBootstrapGraceActive,
+      priceAuthority.executable,
+    ],
   );
 
   const marketUiState = useMemo<ContractMarketUiState>(() => {
@@ -1235,28 +1303,19 @@ export function useContractMarketView({
     t,
   ]);
 
-  const normalizedActiveDepthMode = String(activeDepthMode || '').trim().toUpperCase();
-  const hasRawDepthRows = activeDepthAsks.length > 0 || activeDepthBids.length > 0;
-  const hasFullDepth = normalizedActiveDepthMode === 'FULL_DEPTH';
-  const shouldDelayFallbackDepth = hasRawDepthRows
-    && !hasFullDepth
-    && !fallbackDepthAllowed;
+  const depthBootstrapPresentation = resolveContractDepthBootstrapPresentation(
+    activeDepthMode,
+    hasActiveDepthRows,
+    fallbackDepthAllowed,
+  );
   const depthAsks = useMemo(() => {
-    if (hasFullDepth) return activeDepthAsks;
-    if (fallbackDepthAllowed) return activeDepthAsks;
-    return [];
-  }, [activeDepthAsks, fallbackDepthAllowed, hasFullDepth]);
+    return depthBootstrapPresentation.exposeRows ? activeDepthAsks : [];
+  }, [activeDepthAsks, depthBootstrapPresentation.exposeRows]);
   const depthBids = useMemo(() => {
-    if (hasFullDepth) return activeDepthBids;
-    if (fallbackDepthAllowed) return activeDepthBids;
-    return [];
-  }, [activeDepthBids, fallbackDepthAllowed, hasFullDepth]);
-  const depthMode = hasFullDepth
-    ? activeDepthMode
-    : fallbackDepthAllowed
-      ? activeDepthMode
-      : null;
-  const depthLoading = activeDepthLoading || shouldDelayFallbackDepth;
+    return depthBootstrapPresentation.exposeRows ? activeDepthBids : [];
+  }, [activeDepthBids, depthBootstrapPresentation.exposeRows]);
+  const depthMode = depthBootstrapPresentation.depthMode;
+  const depthLoading = activeDepthLoading || depthBootstrapPresentation.delayRows;
   const depthBestBid = maxPrice(activeDepthBids);
   const depthBestAsk = minPrice(activeDepthAsks);
 
@@ -1451,7 +1510,7 @@ export function useContractMarketView({
     marketStatusText,
     quoteFreshness: marketView?.ticker_freshness ?? null,
     marketSessionType,
-    quoteStatusLoading,
+    quoteStatusLoading: marketUiState.isLoading,
     quoteStatusLabel,
     quoteStatusTone,
     quoteDisplayStatus: marketUiState.status,

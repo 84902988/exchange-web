@@ -27,6 +27,12 @@ EXPECTED_SERVICES: dict[str, str] = {
     ),
 }
 
+SERVICE_DB_POOL_LIMITS: dict[str, tuple[int, int]] = {
+    service_name: ((10, 10) if service_name == "exchange-api.service" else (2, 1))
+    for service_name in EXPECTED_SERVICES
+}
+MAX_TOPOLOGY_DB_CONNECTION_BUDGET = 80
+
 COMMON_REQUIRED_LINES = {
     "Type=simple",
     "WorkingDirectory=/opt/exchange-web/backend",
@@ -71,6 +77,7 @@ def validate_topology(repo_root: Path) -> list[str]:
     systemd_dir = repo_root / "deploy" / "systemd"
     target_path = systemd_dir / "exchange-backend.target"
     exec_starts: dict[str, str] = {}
+    db_connection_budget = 0
 
     for service_name, expected_command in EXPECTED_SERVICES.items():
         path = systemd_dir / service_name
@@ -82,6 +89,15 @@ def validate_topology(repo_root: Path) -> list[str]:
         line_set = set(lines)
         for required_line in sorted(COMMON_REQUIRED_LINES - line_set):
             errors.append(f"{service_name}: missing {required_line}")
+
+        pool_size, max_overflow = SERVICE_DB_POOL_LIMITS[service_name]
+        expected_pool_lines = {
+            f"Environment=DB_POOL_SIZE={pool_size}",
+            f"Environment=DB_MAX_OVERFLOW={max_overflow}",
+        }
+        for required_line in sorted(expected_pool_lines - line_set):
+            errors.append(f"{service_name}: missing role DB pool limit {required_line}")
+        db_connection_budget += pool_size + max_overflow
 
         if not any(line == "Wants=network-online.target redis.service" for line in lines):
             errors.append(f"{service_name}: Redis must be an explicit Wants dependency")
@@ -107,6 +123,12 @@ def validate_topology(repo_root: Path) -> list[str]:
     for command, owners in command_owners.items():
         if len(owners) > 1:
             errors.append(f"duplicate ExecStart owner {command}: {', '.join(sorted(owners))}")
+
+    if db_connection_budget > MAX_TOPOLOGY_DB_CONNECTION_BUDGET:
+        errors.append(
+            "production DB connection budget exceeded: "
+            f"{db_connection_budget} > {MAX_TOPOLOGY_DB_CONNECTION_BUDGET}"
+        )
 
     if not target_path.is_file():
         errors.append("missing service group target: exchange-backend.target")
@@ -145,7 +167,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         "service topology validation passed: "
-        f"{len(EXPECTED_SERVICES)} unique services, API embedded owners disabled, target complete"
+        f"{len(EXPECTED_SERVICES)} unique services, API embedded owners disabled, "
+        f"DB budget {sum(size + overflow for size, overflow in SERVICE_DB_POOL_LIMITS.values())}, target complete"
     )
     return 0
 

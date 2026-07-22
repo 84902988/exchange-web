@@ -117,6 +117,20 @@ def test_invalid_bbo_is_not_executable():
     assert is_executable_contract_quote(_quote(bid_price="223", ask_price="222")) is False
 
 
+def test_trade_derived_bbo_source_is_never_executable():
+    quote = _quote(
+        market_status="OPEN",
+        market_session_type="REGULAR_OPEN",
+        quote_source="ITICK_LIVE_WS_DERIVED_BBO",
+        source="ITICK_LIVE_WS_DERIVED_BBO",
+        quote_freshness="LIVE",
+        mark_price="221.985",
+    )
+
+    assert executable_contract_quote_rejection_reason(quote) == "quote_source_not_executable"
+    assert is_executable_contract_quote(quote) is False
+
+
 if __name__ == "__main__":
     test_closed_last_good_bbo_last_valid_recent_is_not_executable()
     test_closed_last_good_bbo_last_valid_expired_is_not_executable()

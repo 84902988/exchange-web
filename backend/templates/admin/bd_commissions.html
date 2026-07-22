@@ -21,8 +21,16 @@
     .bd-source-meta{margin-top:4px;color:var(--muted);font-size:12px;line-height:1.45;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
     .bd-number{font-family:Consolas,"SFMono-Regular","Liberation Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;letter-spacing:.01em}
     .bd-row-actions{display:flex;align-items:center;gap:8px;flex-wrap:nowrap}
+    .bd-funding-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:14px}
+    .bd-funding-card{padding:14px 16px;border-color:rgba(34,197,94,.28)}
+    .bd-funding-card.is-short{border-color:rgba(239,68,68,.45);background:rgba(127,29,29,.12)}
+    .bd-funding-title{font-size:13px;font-weight:800;margin-bottom:8px}
+    .bd-funding-values{display:flex;flex-wrap:wrap;gap:8px 16px;color:var(--muted);font-size:12px}
+    .bd-funding-values strong{color:var(--text);font-variant-numeric:tabular-nums}
+    .bd-pay-blocked{max-width:180px;color:#fca5a5;font-size:11px;line-height:1.45;white-space:normal}
+    .bd-pay-disabled{cursor:not-allowed;opacity:.55}
     @media (max-width:1180px){.bd-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bd-filter-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media (max-width:720px){.bd-stat-grid,.bd-filter-form,.bd-pay-form{grid-template-columns:1fr}.bd-table{min-width:760px}}
+    @media (max-width:720px){.bd-stat-grid,.bd-funding-grid,.bd-filter-form,.bd-pay-form{grid-template-columns:1fr}.bd-table{min-width:760px}}
   </style>
 
   {% if notice %}
@@ -51,6 +59,27 @@
       <div class="admin-card bd-stat-card"><div class="bd-stat-label">待处理</div><div class="bd-stat-value bd-number">{{ stats.pending_display|default(stats.pending_text|default('0')) }}</div></div>
     </div>
   </section>
+
+  {% if payout_funding %}
+    <section class="page-section">
+      <div class="bd-funding-grid">
+        {% for funding in payout_funding %}
+          <div class="admin-card bd-funding-card {% if not funding.sufficient %}is-short{% endif %}">
+            <div class="bd-funding-title">平台 {{ funding.asset_symbol }} 发放资金</div>
+            <div class="bd-funding-values">
+              <span>待发放 <strong>{{ funding.required_amount }} {{ funding.asset_symbol }}</strong></span>
+              <span>可用 <strong>{{ funding.available_amount }} {{ funding.asset_symbol }}</strong></span>
+              {% if not funding.sufficient %}
+                <span>缺口 <strong>{{ funding.shortage_amount }} {{ funding.asset_symbol }}</strong></span>
+              {% else %}
+                <span><strong>资金充足</strong></span>
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
 
   <section class="page-section two-col">
     <div class="filter-card admin-card">
@@ -101,7 +130,7 @@
           <button type="submit" class="btn admin-btn admin-btn-primary">发放待处理佣金</button>
         </div>
       </form>
-      <p class="muted">只处理 PENDING 记录，最大 500 条；单条失败不会中断整批。</p>
+      <p class="muted">只处理 PENDING 记录，最大 500 条；提交前按资产预检平台资金，余额不足的记录保留待发放并显示原因。</p>
     </div>
   </section>
 
@@ -139,10 +168,15 @@
                   <td>
                     {% if item.status == 'PENDING' %}
                       <div class="bd-row-actions">
-                        <form method="post" action="/admin/bd/commissions/{{ item.id }}/pay" onsubmit="return confirm('确认发放该笔 BD 佣金？');">
-                          <input type="hidden" name="next_path" value="{{ current_url }}" />
-                          <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">发放</button>
-                        </form>
+                        {% if item.payout_allowed %}
+                          <form method="post" action="/admin/bd/commissions/{{ item.id }}/pay" onsubmit="return confirm('确认发放该笔 BD 佣金？');">
+                            <input type="hidden" name="next_path" value="{{ current_url }}" />
+                            <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">发放</button>
+                          </form>
+                        {% else %}
+                          <button type="button" class="btn admin-btn admin-btn-sm bd-pay-disabled" disabled>余额不足</button>
+                          <div class="bd-pay-blocked" title="{{ item.payout_block_reason }}">{{ item.payout_block_reason }}</div>
+                        {% endif %}
                       </div>
                     {% elif item.status == 'PAID' %}
                       <span class="table-inline-note">已发放</span>

@@ -1155,28 +1155,31 @@ test('Kline close remains 99 while last-trade overlay remains 100', () => {
   assert.equal(overlayPrice, 100);
 });
 
-test('tradfi current price line uses the Header price before the latest Kline catches up', () => {
+test('current price line follows the symbol-scoped Header price while Kline catches up', () => {
   assert.equal(
-    chartModule.resolveContractTradingViewActiveOverlayPrice(true, 4059.3, 4060.08),
+    chartModule.resolveContractTradingViewActiveOverlayPrice(4059.3, 4060.08),
     4060.08,
   );
 });
 
-test('tradfi current price line stays hidden until the symbol-scoped Header price is ready', () => {
+test('current price line uses the symbol-scoped Header price until Kline is ready', () => {
   assert.equal(
-    chartModule.resolveContractTradingViewActiveOverlayPrice(true, 4059.3, null),
-    null,
+    chartModule.resolveContractTradingViewActiveOverlayPrice(null, 4060.08),
+    4060.08,
   );
 });
 
-test('legacy crypto overlay keeps latest-Kline then Price Authority fallback precedence', () => {
+test('current price line falls back to the latest Kline when Header is unavailable', () => {
   assert.equal(
-    chartModule.resolveContractTradingViewActiveOverlayPrice(false, 99, 100),
-    99,
+    chartModule.resolveContractTradingViewActiveOverlayPrice(4059.3, null),
+    4059.3,
   );
+});
+
+test('unavailable Kline and Header keep the current price line hidden', () => {
   assert.equal(
-    chartModule.resolveContractTradingViewActiveOverlayPrice(false, null, 100),
-    100,
+    chartModule.resolveContractTradingViewActiveOverlayPrice(null, null),
+    null,
   );
 });
 
