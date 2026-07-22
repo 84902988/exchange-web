@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -28,6 +29,8 @@ from app.services.user_invite_service import (
     normalize_invite_code as normalize_user_invite_code,
     validate_user_invite_code_for_register,
 )
+
+logger = logging.getLogger(__name__)
 
 # =========================
 # Routers（一个文件，两个 router）
@@ -304,7 +307,7 @@ async def verify_otp(request: Request, body: VerifyOtpIn, db: Session = Depends(
 async def register(request: Request, body: RegisterIn, response: Response, db: Session = Depends(get_db)):  # ✅ +response
     trace_id = getattr(request.state, "trace_id", None)
     email = body.email.lower().strip()
-    print(f"LOGIN ENTER email={email} trace_id={trace_id}", flush=True)
+    logger.info("auth_register_attempt trace_id=%s", trace_id)
     invite_info = None
     if body.invite_code is not None:
         invite_info = _resolve_register_invite(db, body.invite_code, body.invite_type)

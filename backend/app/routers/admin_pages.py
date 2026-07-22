@@ -181,10 +181,16 @@ from app.services.admin_queries import (
 )
 from app.services.bd_application_service import (
     BdApplicationReviewError,
+    BdCommissionRateUpdateError,
     approve_bd_application,
     reject_bd_application,
+    update_bd_commission_rate,
 )
-from app.services.bd_commission_service import pay_bd_commission_record
+from app.services.bd_commission_service import (
+    InsufficientPlatformBalanceError,
+    get_platform_bd_commission_available_balances,
+    pay_bd_commission_record,
+)
 from app.services.bd_team_query import (
     BdAccountStatusUpdateError,
     get_admin_bd_team_stats,
@@ -2001,6 +2007,27 @@ def _build_bd_commission_redirect_url(
     return f"{base}{separator}{'&'.join(params)}"
 
 
+def _format_bd_commission_funding_amount(value: Any) -> str:
+    amount = Decimal(str(value or 0))
+    text_value = format(amount, "f").rstrip("0").rstrip(".")
+    return text_value or "0"
+
+
+def _bd_commission_funding_error(
+    *,
+    asset_symbol: str,
+    required_amount: Decimal,
+    available_amount: Decimal,
+) -> str:
+    shortage = max(Decimal(str(required_amount)) - Decimal(str(available_amount)), Decimal("0"))
+    return (
+        f"平台 {asset_symbol} 资金账户余额不足：需要 "
+        f"{_format_bd_commission_funding_amount(required_amount)} {asset_symbol}，当前可用 "
+        f"{_format_bd_commission_funding_amount(available_amount)} {asset_symbol}，还差 "
+        f"{_format_bd_commission_funding_amount(shortage)} {asset_symbol}"
+    )
+
+
 def _build_user_invite_commission_redirect_url(
     *,
     notice: str = "",
@@ -2146,6 +2173,7 @@ _ADMIN_ROLE_PERMISSION_DISPLAY: Dict[str, Dict[str, str]] = {
     "dividends.distribute": {"name": "分红发放管理", "description": "可维护分红配置、计算分红池并执行分红发"},
     "bd.view": {"name": "BD 查看", "description": "可查看 BD 申请、账号和佣金记录"},
     "bd_accounts.manage": {"name": "BD账号与审核管理", "description": "可审核 BD 申请，并启用或停用 BD 账号"},
+    "bd_commission_rate.manage": {"name": "BD分佣比例管理", "description": "可调整生效中 BD 账号的后续分佣比例"},
     "bd_commissions.manage": {"name": "BD佣金发放", "description": "可发放单笔或批量 BD 佣金"},
     "invite.view": {"name": "邀请查", "description": "可查看邀请关系和邀请佣金记"},
     "invite_commissions.manage": {"name": "邀请佣金发", "description": "可发放单笔或批量邀请佣"},
@@ -2221,6 +2249,7 @@ _ADMIN_ROLE_PERMISSION_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "dividends.distribute",
             "bd.view",
             "bd_accounts.manage",
+            "bd_commission_rate.manage",
             "bd_commissions.manage",
             "invite.view",
             "invite_commissions.manage",
@@ -12302,11 +12331,17 @@ def bd_application_approve(
     if redir:
         return redir
 
+    admin = get_admin_from_request(request) or {}
+    try:
+        admin_id = int(admin.get("id"))
+    except (TypeError, ValueError):
+        admin_id = 0
+
     try:
         approve_bd_application(
             db,
             application_id=application_id,
-            reviewed_by=0,
+            reviewed_by=admin_id or None,
             admin_remark=admin_remark,
             commission_rate_override=commission_rate,
         )
@@ -12346,11 +12381,17 @@ def bd_application_reject(
             status_code=302,
         )
 
+    admin = get_admin_from_request(request) or {}
+    try:
+        admin_id = int(admin.get("id"))
+    except (TypeError, ValueError):
+        admin_id = 0
+
     try:
         reject_bd_application(
             db,
             application_id=application_id,
-            reviewed_by=0,
+            reviewed_by=admin_id or None,
             admin_remark=admin_remark,
         )
         db.commit()
@@ -12364,6 +12405,55 @@ def bd_application_reject(
         db.rollback()
         notice = ""
         error = f"Reject BD application failed: {exc}"
+
+    return RedirectResponse(
+        url=_build_bd_application_redirect_url(next_path=next_path, notice=notice, error=error),
+        status_code=302,
+    )
+
+
+@router.post("/bd/applications/{application_id}/commission-rate")
+def bd_application_commission_rate_update(
+    request: Request,
+    application_id: int,
+    commission_percent: str = Form(""),
+    expected_commission_rate: str = Form(""),
+    change_reason: str = Form(""),
+    next_path: str = Form("/admin/bd/applications"),
+    db: Session = Depends(get_db),
+):
+    redir = require_admin_post_permission(request, db, "bd_commission_rate.manage")
+    if redir:
+        return redir
+
+    admin = get_admin_from_request(request) or {}
+    try:
+        admin_id = int(admin.get("id"))
+    except (TypeError, ValueError):
+        admin_id = 0
+
+    try:
+        result = update_bd_commission_rate(
+            db,
+            application_id=application_id,
+            commission_percent=commission_percent,
+            expected_commission_rate=expected_commission_rate,
+            changed_by_admin_id=admin_id,
+            reason=change_reason,
+        )
+        db.commit()
+        new_percent = Decimal(str(result["new_commission_rate"])) * Decimal("100")
+        notice = f"BD用户 {result['bd_user_id']} 的分佣比例已更新为 {new_percent:.2f}%"
+        error = ""
+    except BdCommissionRateUpdateError as exc:
+        db.rollback()
+        notice = ""
+        error = str(exc)
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to update BD commission rate: application_id=%s", application_id)
+        notice = ""
+        error = "修改BD分佣比例失败，请稍后重试"
 
     return RedirectResponse(
         url=_build_bd_application_redirect_url(next_path=next_path, notice=notice, error=error),
@@ -12467,6 +12557,52 @@ def bd_commissions_page(
         user_id=filters["user_id"],
         fee_coin_symbol=filters["fee_coin_symbol"],
     )
+    pending_requirement_rows = (
+        db.query(
+            func.coalesce(BdCommissionRecord.commission_asset_symbol, "RCB"),
+            func.sum(BdCommissionRecord.commission_amount),
+        )
+        .filter(BdCommissionRecord.status == "PENDING")
+        .group_by(func.coalesce(BdCommissionRecord.commission_asset_symbol, "RCB"))
+        .all()
+    )
+    pending_requirements = {
+        str(symbol or "RCB").upper().strip() or "RCB": Decimal(str(amount or 0))
+        for symbol, amount in pending_requirement_rows
+    }
+    platform_balances = get_platform_bd_commission_available_balances(db, pending_requirements.keys())
+    payout_funding = []
+    for symbol, required_amount in sorted(pending_requirements.items()):
+        available_amount = Decimal(str(platform_balances.get(symbol, Decimal("0"))))
+        shortage_amount = max(required_amount - available_amount, Decimal("0"))
+        payout_funding.append(
+            {
+                "asset_symbol": symbol,
+                "required_amount": _format_bd_commission_funding_amount(required_amount),
+                "available_amount": _format_bd_commission_funding_amount(available_amount),
+                "shortage_amount": _format_bd_commission_funding_amount(shortage_amount),
+                "sufficient": shortage_amount <= Decimal("0"),
+            }
+        )
+
+    for item in _result_items(result):
+        if str(item.get("status") or "").upper() != "PENDING":
+            item["payout_allowed"] = False
+            item["payout_block_reason"] = ""
+            continue
+        symbol = str(item.get("commission_asset_symbol") or "RCB").upper().strip() or "RCB"
+        required_amount = Decimal(str(item.get("commission_amount") or 0))
+        available_amount = Decimal(str(platform_balances.get(symbol, Decimal("0"))))
+        item["payout_allowed"] = available_amount >= required_amount
+        item["payout_block_reason"] = (
+            ""
+            if item["payout_allowed"]
+            else _bd_commission_funding_error(
+                asset_symbol=symbol,
+                required_amount=required_amount,
+                available_amount=available_amount,
+            )
+        )
     return render(
         request,
         "admin/bd_commissions.html",
@@ -12480,6 +12616,7 @@ def bd_commissions_page(
             "active": "bd_commissions",
             "filters": filters,
             "stats": result.get("stats") or {},
+            "payout_funding": payout_funding,
             "pagination": {
                 "page": _result_page(result),
                 "page_size": _result_page_size(result),
@@ -13027,6 +13164,14 @@ def bd_commission_pay(
         else:
             notice = ""
             error = f"BD commission record {record_id} is not pending"
+    except InsufficientPlatformBalanceError as exc:
+        db.rollback()
+        notice = ""
+        error = _bd_commission_funding_error(
+            asset_symbol=exc.asset_symbol,
+            required_amount=exc.required_amount,
+            available_amount=exc.available_amount,
+        )
     except Exception as exc:
         db.rollback()
         notice = ""
@@ -13066,16 +13211,31 @@ def bd_commissions_pay_pending(
             .limit(batch_limit)
             .all()
         )
-        record_ids = [int(record_id) for (record_id, _amount, _symbol) in pending_records]
-        submitted_totals: dict[str, Decimal] = {}
-        for _record_id, amount, symbol in pending_records:
+        available_balances = get_platform_bd_commission_available_balances(
+            db,
+            [str(symbol or "RCB") for (_record_id, _amount, symbol) in pending_records],
+        )
+        remaining_balances = dict(available_balances)
+        fundable_records = []
+        blocked_records = []
+        for record_id, amount, symbol in pending_records:
             normalized_symbol = str(symbol or "RCB").upper().strip() or "RCB"
+            required_amount = Decimal(str(amount or 0))
+            available_amount = Decimal(str(remaining_balances.get(normalized_symbol, Decimal("0"))))
+            if required_amount > Decimal("0") and available_amount >= required_amount:
+                fundable_records.append((int(record_id), required_amount, normalized_symbol))
+                remaining_balances[normalized_symbol] = available_amount - required_amount
+            else:
+                blocked_records.append((int(record_id), required_amount, normalized_symbol, available_amount))
+
+        submitted_totals: dict[str, Decimal] = {}
+        for _record_id, amount, normalized_symbol in fundable_records:
             submitted_totals[normalized_symbol] = (
                 submitted_totals.get(normalized_symbol, Decimal("0")) + Decimal(str(amount or 0))
             )
         job_ids = []
         enqueue_errors = []
-        for pending_record_id in record_ids:
+        for pending_record_id, _amount, _symbol in fundable_records:
             try:
                 job_ids.append(
                     enqueue_pay_bd_commission(
@@ -13090,14 +13250,31 @@ def bd_commissions_pay_pending(
             f"{format(total, 'f')} {symbol}" for symbol, total in sorted(submitted_totals.items())
         ) or "0"
         notice = (
-            f"Submitted BD commission payout jobs: {len(job_ids)} records, "
-            f"pending totals: {totals_text}. Refresh later for results."
+            f"已提交 {len(job_ids)} 笔 BD 佣金发放任务，合计：{totals_text}。"
+            if job_ids
+            else ""
         )
         error = ""
+        if blocked_records:
+            blocked_by_asset: dict[str, dict[str, Any]] = {}
+            for _record_id, required_amount, symbol, _available_amount in blocked_records:
+                item = blocked_by_asset.setdefault(
+                    symbol,
+                    {"count": 0, "required": Decimal("0"), "available": available_balances.get(symbol, Decimal("0"))},
+                )
+                item["count"] = int(item["count"]) + 1
+                item["required"] = Decimal(str(item["required"])) + required_amount
+            error = "；".join(
+                f"{symbol} 有 {int(values['count'])} 笔因平台余额不足未提交（待发放 "
+                f"{_format_bd_commission_funding_amount(values['required'])}，可用 "
+                f"{_format_bd_commission_funding_amount(values['available'])}）"
+                for symbol, values in sorted(blocked_by_asset.items())
+            )
         if enqueue_errors:
-            error = "Failed to submit records: " + "; ".join(
+            enqueue_error = "任务提交失败：" + "; ".join(
                 f"{item.get('record_id')}: {item.get('error')}" for item in enqueue_errors[:10]
             )
+            error = f"{error}；{enqueue_error}" if error else enqueue_error
     except Exception as exc:
         db.rollback()
         notice = ""

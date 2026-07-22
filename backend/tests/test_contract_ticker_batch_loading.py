@@ -124,3 +124,59 @@ def test_contract_cfd_batch_omission_does_not_fan_out_single_requests(monkeypatc
 
     assert [item["symbol"] for item in result] == [row.symbol for row in rows]
     assert received_quote_items == [{"s": "EURUSD", "p": "1.12"}, {}]
+
+
+def test_contract_ticker_batch_carries_catalog_price_precision(monkeypatch) -> None:
+    rows = [
+        SimpleNamespace(
+            symbol="EURUSD_PERP",
+            provider="ITICK",
+            provider_symbol="EURUSD",
+            category="FOREX",
+            price_precision=5,
+        ),
+        SimpleNamespace(
+            symbol="USDJPY_PERP",
+            provider="ITICK",
+            provider_symbol="USDJPY",
+            category="FOREX",
+            price_precision=3,
+        ),
+    ]
+
+    class QueryStub:
+        def filter(self, *_args):
+            return self
+
+        def order_by(self, *_args):
+            return self
+
+        def limit(self, _limit):
+            return self
+
+        def all(self):
+            return rows
+
+    db = SimpleNamespace(query=lambda _model: QueryStub())
+    monkeypatch.setattr(contract_market_service, "attach_contract_symbol_market_metadata", lambda *_args: None)
+    monkeypatch.setattr(
+        contract_market_service,
+        "_itick_cfd_tickers_from_symbols",
+        lambda _db, _rows: [
+            {"symbol": "EURUSD_PERP", "last_price": "1.14080"},
+            {"symbol": "USDJPY_PERP", "last_price": "163.009"},
+        ],
+    )
+    monkeypatch.setattr(
+        contract_market_service,
+        "_market_status_for_contract_symbol",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(contract_market_service, "_with_market_status", lambda item, _status: item)
+
+    result = contract_market_service.get_contract_tickers(db, limit=2)
+
+    assert [(item["symbol"], item["price_precision"]) for item in result] == [
+        ("EURUSD_PERP", 5),
+        ("USDJPY_PERP", 3),
+    ]

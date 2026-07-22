@@ -96,8 +96,6 @@ $Roles = @(
     (New-RoleDefinition -Name "rq-payout" -Title "exchange RQ payout" -ScriptRelativePath "backend\scripts\start_rq_worker.py" -Arguments @("payout")),
     (New-RoleDefinition -Name "rq-release" -Title "exchange RQ release" -ScriptRelativePath "backend\scripts\start_rq_worker.py" -Arguments @("release")),
     (New-RoleDefinition -Name "rq-maintenance" -Title "exchange RQ maintenance" -ScriptRelativePath "backend\scripts\start_rq_worker.py" -Arguments @("maintenance")),
-    (New-RoleDefinition -Name "withdraw-fee-scheduler" -Title "exchange withdraw fee scheduler" -ScriptRelativePath "backend\scripts\start_withdraw_fee_scheduler.py"),
-    (New-RoleDefinition -Name "collection-auto-scheduler" -Title "exchange collection auto scheduler" -ScriptRelativePath "backend\scripts\start_collection_auto_scheduler.py"),
     (New-RoleDefinition -Name "spot-match-worker" -Title "exchange spot match worker" -ScriptRelativePath "backend\scripts\start_spot_match_worker.py"),
     (New-RoleDefinition -Name "dealer-loop" -Title "exchange dealer loop" -ScriptRelativePath "backend\scripts\start_dealer_loop.py"),
     (New-RoleDefinition -Name "liquidation-scanner" -Title "exchange liquidation scanner" -ScriptRelativePath "backend\scripts\start_liquidation_scanner.py"),
@@ -105,6 +103,11 @@ $Roles = @(
     (New-RoleDefinition -Name "contract-limit-order-scanner" -Title "exchange contract limit order scanner" -ScriptRelativePath "backend\scripts\start_contract_limit_order_scanner.py"),
     (New-RoleDefinition -Name "contract-accounting-reconciliation-scheduler" -Title "exchange contract accounting reconciliation scheduler" -ScriptRelativePath "backend\scripts\start_contract_accounting_reconciliation_scheduler.py")
 )
+
+# Funds automation is intentionally excluded from the Windows development
+# process group. Production Linux owns these single-instance schedulers via
+# exchange-withdraw-fee-scheduler.service and
+# exchange-collection-auto-scheduler.service under exchange-backend.target.
 
 function Get-ProcessSnapshot {
     $items = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine)

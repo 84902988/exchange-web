@@ -87,3 +87,33 @@ def test_transport_starts_at_most_one_thread_per_market(monkeypatch):
     transport.notify("forex")
 
     assert starts == ["itick-ws-forex"]
+
+
+def test_transport_connection_state_is_generation_scoped(monkeypatch):
+    plan = ItickWsSubscriptionPlan()
+    transport = ItickSharedWsTransport(
+        plan=plan,
+        base_url="wss://api.itick.org",
+        token_provider=lambda: "test-token",
+        message_handler=lambda _market, _message: None,
+    )
+    now_ms = 1_720_000_000_000
+    monkeypatch.setattr(
+        "app.services.contract_itick_ws_transport.time.time",
+        lambda: now_ms / 1000,
+    )
+
+    first_generation = transport._mark_connected("forex")
+    transport._mark_message_received("forex", first_generation)
+    first_state = transport.market_state("forex")
+
+    assert first_state["connected"] is True
+    assert first_state["connection_generation"] == first_generation
+    assert first_state["last_message_age_ms"] == 0
+
+    transport._mark_disconnected("forex", first_generation)
+    assert transport.market_state("forex")["connected"] is False
+
+    second_generation = transport._mark_connected("forex")
+    assert second_generation == first_generation + 1
+    assert transport.market_state("forex")["last_message_at_ms"] is None

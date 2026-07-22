@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import re
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
@@ -70,6 +71,7 @@ from app.services.collection_scan_cache import (
     scan_status_running,
 )
 from app.services.market_cache import clear_market_metadata_cache
+from app.services.market_cache_metrics import get_market_cache_metrics_snapshot
 
 
 logger = logging.getLogger(__name__)
@@ -95,6 +97,7 @@ ADMIN_RQ_QUEUE_NAMES = (
 ADMIN_RQ_WORKER_ONLINE_SECONDS = 60
 ADMIN_HEARTBEAT_SERVICE_NAMES = {
     "withdraw_fee_scheduler",
+    "collection_auto_scheduler",
     "spot_match_worker",
     "dealer_loop",
     "liquidation_scanner",
@@ -102,9 +105,24 @@ ADMIN_HEARTBEAT_SERVICE_NAMES = {
     "contract_limit_order_scanner",
     "contract_accounting_reconciliation_scheduler",
     "contract_user_event_subscriber",
+    "spot_private_event_relay",
+    "spot_private_event_subscriber",
+    "spot_public_depth_event_subscriber",
     "dividend_job",
 }
+ADMIN_LINUX_ONLY_HEARTBEAT_SERVICE_NAMES = {
+    "withdraw_fee_scheduler",
+    "collection_auto_scheduler",
+}
 ADMIN_PAGINATION_ALLOWED_PER_PAGE = (10, 20, 50, 100)
+
+
+def _admin_service_runtime_enabled(service_name: str, platform_name: Optional[str] = None) -> bool:
+    current_platform = str(platform_name or os.name).strip().lower()
+    return not (
+        current_platform == "nt"
+        and str(service_name or "").strip() in ADMIN_LINUX_ONLY_HEARTBEAT_SERVICE_NAMES
+    )
 
 
 def normalize_admin_pagination(
@@ -205,10 +223,19 @@ ADMIN_SERVICE_OVERVIEW_GROUPS = (
                 "key": "withdraw_fee_scheduler",
                 "name": "withdraw fee scheduler",
                 "type": "Scheduler",
-                "expected": "应启动",
+                "expected": "Linux 生产应启动",
                 "impact": "不会自动投递提现手续费维护任务，maintenance worker 可能空转。",
                 "systemd": "exchange-withdraw-fee-scheduler.service",
-                "windows": "python backend/scripts/start_withdraw_fee_scheduler.py",
+                "windows": "Windows 开发进程组不启动",
+            },
+            {
+                "key": "collection_auto_scheduler",
+                "name": "collection auto scheduler",
+                "type": "Scheduler",
+                "expected": "Linux 生产应启动",
+                "impact": "不会自动扫描并创建归集与补 Gas 任务。",
+                "systemd": "exchange-collection-auto-scheduler.service",
+                "windows": "Windows 开发进程组不启动",
             },
             {
                 "key": "spot_match_worker",
@@ -269,7 +296,38 @@ ADMIN_SERVICE_OVERVIEW_GROUPS = (
                 "name": "Contract WS Bridge",
                 "type": "Bridge",
                 "expected": "API process heartbeat",
+                "run_mode": "API 进程内嵌",
                 "impact": "Contract private WebSocket clients may miss TP/SL, liquidation, or order updates in real time.",
+                "systemd": "exchange-api.service",
+                "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
+            },
+            {
+                "key": "spot_private_event_relay",
+                "name": "Spot private event relay",
+                "type": "Bridge",
+                "expected": "API process heartbeat",
+                "run_mode": "API 进程内嵌",
+                "impact": "Spot order and balance events may not be published to private WebSocket subscribers.",
+                "systemd": "exchange-api.service",
+                "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
+            },
+            {
+                "key": "spot_private_event_subscriber",
+                "name": "Spot private WS subscriber",
+                "type": "Bridge",
+                "expected": "API process heartbeat",
+                "run_mode": "API 进程内嵌",
+                "impact": "Spot pages may not receive real-time order or balance updates.",
+                "systemd": "exchange-api.service",
+                "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
+            },
+            {
+                "key": "spot_public_depth_event_subscriber",
+                "name": "Spot public market subscriber",
+                "type": "Bridge",
+                "expected": "API process heartbeat",
+                "run_mode": "API 进程内嵌",
+                "impact": "Spot public depth and trade refresh events may not reach WebSocket clients.",
                 "systemd": "exchange-api.service",
                 "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
             },
@@ -277,10 +335,12 @@ ADMIN_SERVICE_OVERVIEW_GROUPS = (
                 "key": "dividend_job",
                 "name": "dividend job",
                 "type": "Scheduler",
-                "expected": "single instance",
+                "expected": "可选",
+                "run_mode": "API 进程内嵌（可选）",
                 "impact": "SVIP dividends will not be checked or paid automatically.",
                 "systemd": "embedded in exchange-api.service",
                 "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
+                "enabled_env": "ENABLE_DIVIDEND_JOB",
             },
         ),
     },
@@ -563,6 +623,8 @@ def admin_query_rq_status() -> Dict[str, Any]:
 
 
 def _admin_service_status_meta(status_text: str) -> tuple[str, str]:
+    if status_text == "未启用":
+        return status_text, "neutral"
     if status_text in {"可访问", "已连接", "运行中"} or status_text.startswith("worker 数量 "):
         if status_text.endswith(" 0"):
             return status_text, "warning"
@@ -611,7 +673,14 @@ def _admin_service_heartbeat_meta(redis_conn: Any, service_name: str) -> Dict[st
         return {"status": "missing", "observed": "未启动", "observed_badge": "danger", "detail": "", "payload": payload}
 
     age_seconds = heartbeat_age_seconds(payload)
-    if is_heartbeat_alive(payload):
+    heartbeat_alive = is_heartbeat_alive(payload)
+    loop_status = str(payload.get("loop_status") or "").strip().lower()
+    loop_degraded = loop_status in {"error", "failed", "reconnecting"}
+    if heartbeat_alive and (payload.get("last_tick_ok") is False or loop_degraded):
+        observed = "运行异常"
+        badge = "danger"
+        status = "degraded"
+    elif heartbeat_alive:
         observed = "运行中"
         badge = "success"
         status = "alive"
@@ -633,6 +702,14 @@ def _admin_service_heartbeat_meta(redis_conn: Any, service_name: str) -> Dict[st
         detail_parts.append(f"run {payload.get('run_time_utc')} UTC")
     if payload.get("last_check_result"):
         detail_parts.append(f"last check {payload.get('last_check_result')}")
+    if loop_status:
+        detail_parts.append(f"loop {loop_status}")
+    if payload.get("last_tick_at"):
+        detail_parts.append(f"last tick {payload.get('last_tick_at')}")
+    if payload.get("last_tick_ok") is False:
+        detail_parts.append(f"consecutive failures {int(payload.get('consecutive_failures') or 0)}")
+    if payload.get("last_tick_error"):
+        detail_parts.append(f"error {str(payload.get('last_tick_error'))[:120]}")
 
     return {
         "status": status,
@@ -644,35 +721,45 @@ def _admin_service_heartbeat_meta(redis_conn: Any, service_name: str) -> Dict[st
     }
 
 
-def _admin_service_observe_redis_and_workers() -> tuple[bool, dict[str, Dict[str, int]], dict[str, Dict[str, Any]], str]:
+def _admin_service_observe_redis_and_workers(
+    rq_status: Optional[Dict[str, Any]] = None,
+) -> tuple[bool, dict[str, Dict[str, int]], dict[str, Dict[str, Any]], str]:
     worker_counts = _admin_service_empty_worker_counts()
     heartbeats = _admin_service_empty_heartbeats()
     try:
-        from rq import Worker
-
         from app.core.rq import get_redis_connection
 
         connection = get_redis_connection()
         connection.ping()
-        now = datetime.utcnow()
-        for worker in Worker.all(connection=connection):
-            worker_name = str(getattr(worker, "name", "") or "")
-            worker_state = str(getattr(worker, "state", "") or "")
-            last_heartbeat = getattr(worker, "last_heartbeat", None)
-            queue_names = _admin_rq_worker_queue_names(worker)
-            is_online = _admin_rq_worker_is_online(worker, now)
-            bucket = "online" if is_online else "stale"
-            logger.debug(
-                "admin_service_rq_worker_observed name=%s state=%s queues=%s last_heartbeat=%s bucket=%s",
-                worker_name,
-                worker_state,
-                queue_names,
-                _admin_rq_datetime(last_heartbeat),
-                bucket,
-            )
-            for queue_name in queue_names:
-                if queue_name in worker_counts:
-                    worker_counts[queue_name][bucket] += 1
+        if rq_status is not None:
+            for queue in rq_status.get("queues") or []:
+                queue_name = str(queue.get("name") or "")
+                if queue_name not in worker_counts:
+                    continue
+                worker_counts[queue_name]["online"] = int(queue.get("worker_count") or 0)
+                worker_counts[queue_name]["stale"] = int(queue.get("stale_worker_count") or 0)
+        else:
+            from rq import Worker
+
+            now = datetime.utcnow()
+            for worker in Worker.all(connection=connection):
+                worker_name = str(getattr(worker, "name", "") or "")
+                worker_state = str(getattr(worker, "state", "") or "")
+                last_heartbeat = getattr(worker, "last_heartbeat", None)
+                queue_names = _admin_rq_worker_queue_names(worker)
+                is_online = _admin_rq_worker_is_online(worker, now)
+                bucket = "online" if is_online else "stale"
+                logger.debug(
+                    "admin_service_rq_worker_observed name=%s state=%s queues=%s last_heartbeat=%s bucket=%s",
+                    worker_name,
+                    worker_state,
+                    queue_names,
+                    _admin_rq_datetime(last_heartbeat),
+                    bucket,
+                )
+                for queue_name in queue_names:
+                    if queue_name in worker_counts:
+                        worker_counts[queue_name][bucket] += 1
         for service_name in ADMIN_HEARTBEAT_SERVICE_NAMES:
             heartbeats[service_name] = _admin_service_heartbeat_meta(connection, service_name)
         return True, worker_counts, heartbeats, ""
@@ -693,7 +780,14 @@ def admin_query_service_overview() -> Dict[str, Any]:
         for service in group["services"]:
             key = str(service.get("key") or "")
             observed_detail = ""
-            if key == "api":
+            enabled_env = str(service.get("enabled_env") or "").strip()
+            platform_disabled = not _admin_service_runtime_enabled(key)
+            if platform_disabled:
+                observed = "未启用"
+                observed_detail = "Windows 开发环境不运行；Linux 生产环境由 systemd 管理"
+            elif enabled_env and not _admin_runtime_flag_enabled(enabled_env, default=False):
+                observed = "未启用"
+            elif key == "api":
                 observed = "可访问"
             elif key == "redis":
                 observed = "已连接" if redis_connected else "未连接"
@@ -716,7 +810,7 @@ def admin_query_service_overview() -> Dict[str, Any]:
                 observed = "未接心跳 / 需 systemd 观察"
 
             observed_label, observed_badge = _admin_service_status_meta(observed)
-            if key in ADMIN_HEARTBEAT_SERVICE_NAMES:
+            if key in ADMIN_HEARTBEAT_SERVICE_NAMES and observed != "未启用":
                 observed_badge = str((heartbeats.get(key) or {}).get("observed_badge") or observed_badge)
             expected = str(service.get("expected") or "")
             if observed_badge == "success":
@@ -729,7 +823,11 @@ def admin_query_service_overview() -> Dict[str, Any]:
             service_rows.append(
                 {
                     **service,
-                    "run_mode": "独立 systemd 服务",
+                    "run_mode": (
+                        "仅 Linux 独立 systemd 服务"
+                        if platform_disabled
+                        else str(service.get("run_mode") or "独立 systemd 服务")
+                    ),
                     "observed": observed_label,
                     "observed_badge": observed_badge,
                     "observed_detail": observed_detail,
@@ -757,6 +855,13 @@ def _admin_ops_int(value: Any) -> int:
         return int(value or 0)
     except Exception:
         return 0
+
+
+def _admin_runtime_flag_enabled(name: str, *, default: bool = False) -> bool:
+    raw = os.getenv(str(name or "").strip())
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _admin_ops_age_label(age_seconds: Any, fallback: Any = "") -> str:
@@ -798,7 +903,10 @@ def _admin_ops_queue_status(
     failed: int,
 ) -> tuple[str, str, str]:
     if failed > 0:
-        return "failed", "有失败", "danger"
+        # FailedJobRegistry is persistent history until an operator explicitly
+        # retries or removes a job. Keep it visible without presenting one old
+        # registration as proof that the queue is currently down.
+        return "failed_registry", "有失败注册", "warning"
     if queued > 0 or deferred > 0 or scheduled > 0:
         return "backlog", "积压", "warning"
     if online_workers <= 0:
@@ -810,6 +918,8 @@ def _admin_ops_heartbeat_status(heartbeat: Dict[str, Any]) -> tuple[str, str, st
     status = str(heartbeat.get("status") or "").strip().lower()
     if status == "alive":
         return "running", "运行中", "success"
+    if status == "degraded":
+        return "degraded", "运行异常", "danger"
     if status == "timeout":
         return "timeout", "心跳超时", "danger"
     if status == "missing":
@@ -827,7 +937,7 @@ def _admin_ops_queue_service_status(online_workers: int, stale_workers: int) -> 
 
 def admin_query_operations_center() -> Dict[str, Any]:
     rq_status = admin_query_rq_status()
-    redis_connected, worker_counts, heartbeats, service_error = _admin_service_observe_redis_and_workers()
+    redis_connected, worker_counts, heartbeats, service_error = _admin_service_observe_redis_and_workers(rq_status)
     redis_connected = bool(rq_status.get("redis_connected")) and bool(redis_connected)
     rq_summary = rq_status.get("summary") or {}
     queue_heartbeat_map = _admin_ops_queue_heartbeat_map(rq_status)
@@ -876,10 +986,18 @@ def admin_query_operations_center() -> Dict[str, Any]:
 
     heartbeat_specs = (
         {
+            "key": "collection_auto_scheduler",
+            "name": "自动归集扫描",
+            "description": "自动扫描并创建归集与补 Gas 任务",
+            "impact": "归集与补 Gas 任务不会自动创建",
+            "enabled": _admin_service_runtime_enabled("collection_auto_scheduler"),
+        },
+        {
             "key": "withdraw_fee_scheduler",
             "name": "提现手续费维护",
             "description": "自动维护提现手续费",
             "impact": "手续费不会自动更新",
+            "enabled": _admin_service_runtime_enabled("withdraw_fee_scheduler"),
         },
         {
             "key": "dealer_loop",
@@ -918,19 +1036,55 @@ def admin_query_operations_center() -> Dict[str, Any]:
             "impact": "合约页可能无法实时收到后台平仓或成交更新",
         },
         {
+            "key": "spot_private_event_relay",
+            "name": "Spot 事件发布桥",
+            "description": "发布现货订单与余额事件",
+            "impact": "现货订单和余额事件可能无法进入 WebSocket 通道",
+        },
+        {
+            "key": "spot_private_event_subscriber",
+            "name": "Spot 私有 WS Bridge",
+            "description": "订阅现货订单与余额事件并推送给用户",
+            "impact": "现货页可能无法实时收到订单或余额更新",
+        },
+        {
+            "key": "spot_public_depth_event_subscriber",
+            "name": "Spot 公共行情 Bridge",
+            "description": "订阅现货盘口和成交刷新事件并推送到公共 WebSocket",
+            "impact": "现货盘口和成交刷新可能延迟",
+        },
+        {
             "key": "dividend_job",
             "name": "dividend job",
             "description": "SVIP dividend auto job heartbeat.",
             "impact": "SVIP dividends will not be checked or paid automatically.",
+            "enabled": _admin_runtime_flag_enabled("ENABLE_DIVIDEND_JOB", default=False),
         },
     )
     service_rows: list[Dict[str, Any]] = []
     for spec in heartbeat_specs:
+        if spec.get("enabled") is False:
+            service_rows.append(
+                {
+                    "key": spec["key"],
+                    "name": spec["name"],
+                    "status_key": "disabled",
+                    "status_label": "未启用",
+                    "status_badge": "neutral",
+                    "last_heartbeat": "-",
+                    "pid": "-",
+                    "host": "-",
+                    "description": spec["description"],
+                    "impact": "按当前配置无需运行",
+                }
+            )
+            continue
         heartbeat = heartbeats.get(str(spec["key"])) or {}
         status_key, status_label, status_badge = _admin_ops_heartbeat_status(heartbeat)
         payload = heartbeat.get("payload") if isinstance(heartbeat.get("payload"), dict) else {}
         service_rows.append(
             {
+                "key": spec["key"],
                 "name": spec["name"],
                 "status_key": status_key,
                 "status_label": status_label,
@@ -972,6 +1126,7 @@ def admin_query_operations_center() -> Dict[str, Any]:
         status_key, status_label, status_badge = _admin_ops_queue_service_status(online_workers, stale_workers)
         service_rows.append(
             {
+                "key": f"rq_{queue_name}",
                 "name": spec["name"],
                 "status_key": status_key,
                 "status_label": status_label,
@@ -984,13 +1139,15 @@ def admin_query_operations_center() -> Dict[str, Any]:
             }
         )
 
-    abnormal_services = [row for row in service_rows if row["status_key"] != "running"]
+    abnormal_services = [row for row in service_rows if row["status_key"] not in {"running", "disabled"}]
     backlog_rows = [
         row
         for row in queue_rows
         if _admin_ops_int(row.get("queued_count")) + _admin_ops_int(row.get("deferred_count")) + _admin_ops_int(row.get("scheduled_count")) > 0
     ]
     failed_queue_rows = [row for row in queue_rows if _admin_ops_int(row.get("failed_count")) > 0]
+    online_workers = _admin_ops_int(rq_summary.get("worker_count"))
+    stale_workers = _admin_ops_int(rq_summary.get("stale_worker_count"))
 
     queue_impacts = {
         "email": "邮件验证码和通知可能积压。",
@@ -1006,17 +1163,27 @@ def admin_query_operations_center() -> Dict[str, Any]:
     if not redis_connected:
         risk_alerts.append({"level": "danger", "message": "Redis 未连接，队列和常驻服务状态可能无法读取。"})
     if failed_total > 0:
-        risk_alerts.append({"level": "danger", "message": f"检测到 {failed_total} 个失败任务，请查看 RQ 队列详情。"})
+        risk_alerts.append(
+            {
+                "level": "warning",
+                "message": f"检测到 {failed_total} 个 RQ 失败注册（可能包含历史任务），请在队列详情中确认后再重试或清理。",
+            }
+        )
     if abnormal_services:
         risk_alerts.append({"level": "warning", "message": f"检测到 {len(abnormal_services)} 个服务心跳超时或未运行，请检查常驻服务。"})
+    if stale_workers > 0:
+        risk_alerts.append(
+            {
+                "level": "warning",
+                "message": f"检测到 {stale_workers} 个 RQ 过期 worker 注册；不影响当前在线 worker，建议在维护窗口清理 Redis 历史元数据。",
+            }
+        )
     if redis_connected:
         for row in queue_rows:
             if _admin_ops_int(row.get("online_workers")) <= 0:
                 queue_name = str(row.get("name") or "")
                 risk_alerts.append({"level": "warning", "message": f"{queue_name} 队列未运行，{queue_impacts.get(queue_name, '对应任务可能无法执行。')}"})
 
-    online_workers = _admin_ops_int(rq_summary.get("worker_count"))
-    stale_workers = _admin_ops_int(rq_summary.get("stale_worker_count"))
     return {
         "as_of": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "service_error": service_error,
@@ -1027,6 +1194,7 @@ def admin_query_operations_center() -> Dict[str, Any]:
             "redis_status_badge": "success" if redis_connected else "danger",
             "online_workers": online_workers,
             "registered_workers": online_workers + stale_workers,
+            "stale_workers": stale_workers,
             "queued_total": queued_total,
             "failed_total": failed_total,
             "scheduled_total": scheduled_total,
@@ -1039,6 +1207,137 @@ def admin_query_operations_center() -> Dict[str, Any]:
         "failed_queue_rows": failed_queue_rows,
         "abnormal_services": abnormal_services,
     }
+
+
+def _admin_dashboard_operations_snapshot() -> Dict[str, Any]:
+    try:
+        return admin_query_operations_center()
+    except Exception as exc:
+        logger.warning("[dashboard] runtime status query failed: %r", exc)
+        return {
+            "summary": {},
+            "queue_rows": [],
+            "service_rows": [],
+        }
+
+
+def _admin_dashboard_withdraw_fee_status(
+    enabled_count: int,
+    failed_count: int,
+    operations: Dict[str, Any],
+) -> tuple[str, str]:
+    scheduler_row = next(
+        (
+            item
+            for item in operations.get("service_rows") or []
+            if str(item.get("key") or "") == "withdraw_fee_scheduler"
+        ),
+        {},
+    )
+    scheduler_status = str(scheduler_row.get("status_key") or "").strip().lower()
+    if failed_count > 0:
+        return "维护配置有错误", "danger"
+    if enabled_count <= 0:
+        return "未启用", "neutral"
+    if scheduler_status == "running":
+        return "自动维护运行中", "success"
+    if scheduler_status == "disabled":
+        return "Windows 开发环境不启动", "neutral"
+    if scheduler_status == "degraded":
+        return "调度器运行异常", "danger"
+    if scheduler_status in {"offline", "timeout"}:
+        return "配置已启用，调度器未运行", "danger"
+    return "配置已启用，运行状态不可观测", "warning"
+
+
+def _admin_dashboard_runtime_statuses(
+    operations: Optional[Dict[str, Any]] = None,
+) -> list[Dict[str, str]]:
+    if operations is None:
+        operations = _admin_dashboard_operations_snapshot()
+
+    summary = operations.get("summary") or {}
+    redis_ok = str(summary.get("redis_status") or "") == "已连接"
+    queue_rows = operations.get("queue_rows") or []
+    service_rows = operations.get("service_rows") or []
+    missing_queue_count = sum(1 for row in queue_rows if _admin_ops_int(row.get("online_workers")) <= 0)
+    failed_total = _admin_ops_int(summary.get("failed_total"))
+    queued_total = _admin_ops_int(summary.get("queued_total"))
+    stale_workers = _admin_ops_int(summary.get("stale_workers"))
+
+    if not redis_ok:
+        rq_status, rq_tone = "不可用", "danger"
+    elif missing_queue_count > 0:
+        rq_status, rq_tone = f"{missing_queue_count} 个队列无 Worker", "danger"
+    elif failed_total > 0:
+        rq_status, rq_tone = f"有失败注册 {failed_total}", "warning"
+    elif queued_total > 0:
+        rq_status, rq_tone = f"待处理 {queued_total}", "warning"
+    elif stale_workers > 0:
+        rq_status, rq_tone = f"正常（历史注册 {stale_workers}）", "warning"
+    else:
+        rq_status, rq_tone = "正常", "success"
+
+    realtime_service_keys = {
+        "contract_user_event_subscriber",
+        "spot_private_event_relay",
+        "spot_private_event_subscriber",
+        "spot_public_depth_event_subscriber",
+    }
+    realtime_rows = [row for row in service_rows if str(row.get("key") or "") in realtime_service_keys]
+    realtime_abnormal = [row for row in realtime_rows if str(row.get("status_key") or "") != "running"]
+    if not redis_ok:
+        websocket_status, websocket_tone = "不可观测", "danger"
+    elif len(realtime_rows) < len(realtime_service_keys):
+        websocket_status, websocket_tone = "监控不完整", "warning"
+    elif realtime_abnormal:
+        websocket_status, websocket_tone = f"{len(realtime_abnormal)} 项异常", "danger"
+    else:
+        websocket_status, websocket_tone = "运行中", "success"
+
+    try:
+        cache_snapshot = get_market_cache_metrics_snapshot()
+        cache_overview = cache_snapshot.get("overview") or {}
+        cache_degraded = (
+            _admin_ops_int(cache_overview.get("loader_error"))
+            + _admin_ops_int(cache_overview.get("redis_unavailable"))
+        )
+        cache_activity = sum(
+            _admin_ops_int(cache_overview.get(key))
+            for key in ("hit", "miss", "loader_success", "external_api_calls")
+        )
+        if cache_degraded > 0:
+            cache_status, cache_tone = f"今日降级 {cache_degraded}", "warning"
+        elif cache_activity > 0:
+            cache_status, cache_tone = "活跃", "success"
+        else:
+            cache_status, cache_tone = "暂无样本", "neutral"
+    except Exception as exc:
+        logger.warning("[dashboard] market cache status query failed: %r", exc)
+        cache_status, cache_tone = "不可观测", "warning"
+
+    return [
+        {"label": "API", "status": "正常", "tone": "success", "href": "/admin/system/operations"},
+        {
+            "label": "Redis",
+            "status": "已连接" if redis_ok else "未连接",
+            "tone": "success" if redis_ok else "danger",
+            "href": "/admin/system/operations",
+        },
+        {"label": "RQ", "status": rq_status, "tone": rq_tone, "href": "/admin/system/rq"},
+        {
+            "label": "实时事件",
+            "status": websocket_status,
+            "tone": websocket_tone,
+            "href": "/admin/system/services",
+        },
+        {
+            "label": "行情缓存",
+            "status": cache_status,
+            "tone": cache_tone,
+            "href": "/admin/market-cache-monitor",
+        },
+    ]
 
 
 def _unsupported_chain_key() -> str:
@@ -3328,6 +3627,11 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
         item["badge"] = _dashboard_badge(item["tone"])
         item["status"] = "正常" if value <= 0 else "待处理"
 
+    # Dashboard status chips and task rows must share the same Redis/RQ/
+    # heartbeat snapshot. Apart from avoiding a duplicate monitoring query,
+    # this prevents one page render from showing contradictory service states.
+    dashboard_operations = _admin_dashboard_operations_snapshot()
+
     def task_row(label: str, table_name: str, pending: Iterable[str], failed: Iterable[str], href: str, time_column: str = "updated_at") -> Dict[str, Any]:
         try:
             stats = _dashboard_status_counts(db, table_name, pending_statuses=pending, failed_statuses=failed, time_column=time_column)
@@ -3373,13 +3677,17 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
         stats = row[0] if row else {}
         pending_count = int(stats.get("enabled_count") or 0)
         failed_count = int(stats.get("failed_count") or 0)
-        tone = "danger" if failed_count > 0 else ("warning" if pending_count > 0 else "success")
+        status, tone = _admin_dashboard_withdraw_fee_status(
+            pending_count,
+            failed_count,
+            dashboard_operations,
+        )
         return {
             "label": "提现手续费维护",
             "pending": pending_count,
             "failed": failed_count,
             "last_seen": _dashboard_datetime(stats.get("last_seen")),
-            "status": "有错误" if failed_count else ("自动维护启用" if pending_count else "未启用"),
+            "status": status,
             "tone": tone,
             "badge": _dashboard_badge(tone),
             "href": "/admin/asset-configs",
@@ -3416,13 +3724,7 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
     risk_total = sum(int(item.get("value") or 0) for item in risk_items)
     return {
         "as_of": f"{_dashboard_datetime(now)} Asia/Shanghai",
-        "statuses": [
-            {"label": "市场同步", "status": "正常", "tone": "success"},
-            {"label": "Redis", "status": "监控页查看", "tone": "info"},
-            {"label": "RQ", "status": "监控页查看", "tone": "info"},
-            {"label": "WebSocket", "status": "运行中", "tone": "success"},
-            {"label": "行情", "status": "运行中", "tone": "success"},
-        ],
+        "statuses": _admin_dashboard_runtime_statuses(dashboard_operations),
         "core_metrics": core_metrics,
         "fund_flow_rows": fund_flow_rows,
         "trading_ops": trading_ops,
@@ -9458,7 +9760,10 @@ def admin_query_bd_applications(db: Session, filters: Optional[Dict[str, Any]] =
     rows = db.execute(
         text(
             f"""
-            SELECT ba.*, bda.status AS bd_account_status
+            SELECT
+                ba.*,
+                bda.status AS bd_account_status,
+                bda.commission_rate AS bd_commission_rate
             FROM bd_applications ba
             LEFT JOIN bd_accounts bda ON bda.user_id = ba.user_id
             {where_sql}
@@ -9475,6 +9780,7 @@ def admin_query_bd_applications(db: Session, filters: Optional[Dict[str, Any]] =
         status_labels = {"PENDING": "待审核", "APPROVED": "已通过", "REJECTED": "已拒绝", "CANCELED": "已取消", "CANCELLED": "已取消"}
         status_badges = {"PENDING": "warning", "APPROVED": "success", "REJECTED": "danger", "CANCELED": "secondary", "CANCELLED": "secondary"}
         bd_account_status = str(row_dict.get("bd_account_status") or "").strip().upper()
+        bd_commission_rate = row_dict.get("bd_commission_rate")
         bd_account_status_labels = {
             "ACTIVE": "生效中",
             "DISABLED": "已停用",
@@ -9501,8 +9807,24 @@ def admin_query_bd_applications(db: Session, filters: Optional[Dict[str, Any]] =
                 "bd_account_status": bd_account_status,
                 "bd_account_status_text": bd_account_status_labels.get(bd_account_status, "无BD账户"),
                 "bd_account_status_badge_class": bd_account_status_badges.get(bd_account_status, "secondary"),
+                "bd_commission_rate": (
+                    _fmt_admin_decimal(bd_commission_rate, precision=6)
+                    if bd_commission_rate is not None
+                    else ""
+                ),
+                "bd_commission_rate_percent": (
+                    _admin_percent_display(bd_commission_rate)
+                    if bd_commission_rate is not None
+                    else "--"
+                ),
+                "bd_commission_rate_percent_input": (
+                    _fmt_admin_decimal(Decimal(str(bd_commission_rate)) * Decimal("100"), precision=2)
+                    if bd_commission_rate is not None
+                    else ""
+                ),
                 "can_revoke_bd": status_value == "APPROVED" and bd_account_status == "ACTIVE",
                 "can_restore_bd": status_value == "APPROVED" and bd_account_status in {"DISABLED", "INACTIVE", "EXPIRED"},
+                "can_update_bd_rate": status_value == "APPROVED" and bd_account_status == "ACTIVE",
                 "remark": row_dict.get("remark") or "--",
                 "admin_remark": row_dict.get("admin_remark") or "--",
                 "created_at": _admin_datetime_display(row_dict.get("created_at")),
@@ -9703,6 +10025,7 @@ def get_bd_commission_records(
     for row in rows:
         row_dict = dict(row)
         commission_symbol = row_dict.get("commission_asset_symbol") or row_dict.get("fee_coin_symbol") or ""
+        commission_amount = Decimal(str(row_dict.get("commission_amount") or 0))
         status_value = str(row_dict.get("status") or "").upper()
         status_labels = {"PENDING": "待发放", "PAID": "已发放", "FAILED": "失败"}
         items.append(
@@ -9718,6 +10041,8 @@ def get_bd_commission_records(
                 "fee_coin_symbol": row_dict.get("fee_coin_symbol") or "",
                 "original_fee_amount": _fmt_admin_amount_display(row_dict.get("original_fee_amount"), row_dict.get("fee_coin_symbol")),
                 "commission_rate_percent": _admin_percent_display(row_dict.get("commission_rate")),
+                "commission_amount": format(commission_amount, "f"),
+                "commission_asset_symbol": commission_symbol,
                 "commission_text": f"{_fmt_admin_amount_display(row_dict.get('commission_amount'), commission_symbol)} {commission_symbol}".strip(),
                 "pool_amount": _fmt_admin_amount_display(row_dict.get("pool_amount"), commission_symbol),
                 "status": status_value,
@@ -10830,7 +11155,7 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
     if max_leverage < 1 or max_leverage > 200:
         errors.append("最大杠杆必须在 1 到 200 之间")
     if spread_x < 0 or spread_x > 100:
-        errors.append("单边固定加点必须在 0 到 100 U 之间")
+        errors.append("人工单边绝对加点必须在 0 到 100 U 之间")
     if min_quantity < 0 or max_quantity < 0 or min_margin < 0:
         errors.append("交易规则数值不能小于 0")
     if liquidation_threshold < 0 or warning_threshold < 0:

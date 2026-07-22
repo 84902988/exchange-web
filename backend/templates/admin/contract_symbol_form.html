@@ -231,9 +231,9 @@
           <h3 class="form-section-title">风控参数</h3>
           <div class="form-grid">
             <div class="field">
-              <label for="spread_x">单边固定加点（U）</label>
-              <div class="field-help">设置后，买入方向在 ask 基础上加 X，卖出方向在 bid 基础上减 X。该加点通过成交价体现，不作为手续费单独扣除。</div>
-              <input id="spread_x" type="number" min="0" max="100" step="0.01" name="spread_x" value="{{ form.spread_x or '0.0' }}" />
+              <label for="spread_x">人工单边绝对加点（U）</label>
+              <div class="field-help">整体控制该品种的人工单边绝对加点；0 仅关闭人工加点，原始行情自带的买卖价差仍保留。买入执行价 = 原始卖一 + X，卖出执行价 = 原始买一 - X；每次执行的人工加点影响为 X × 数量，行情和数量不变时完整开平往返的人工加点累计约 2X × 数量。加点已体现在成交价中，不会作为手续费重复扣除。</div>
+              <input id="spread_x" type="number" min="0" max="100" step="0.01" name="spread_x" value="{{ form.spread_x or '0.0' }}" placeholder="0 表示关闭人工加点" />
             </div>
             <div class="field">
               <label for="liquidation_threshold">强平阈值</label>

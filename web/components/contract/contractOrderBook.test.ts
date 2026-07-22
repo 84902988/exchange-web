@@ -154,6 +154,7 @@ function makeReferencePrice(overrides: Record<string, unknown> = {}) {
 }
 
 const baseProps = {
+  symbol: 'BTCUSDT_PERP',
   pricePrecision: 2,
   bids,
   asks,
@@ -377,11 +378,62 @@ test('loading a replacement symbol removes previous rows and keeps fixed placeho
 test('symbol-switch loading guard does not render the previous active Store depth', () => {
   resetDisplayMode();
   orderBookStoreSnapshot = makeStoreDepthSnapshot();
-  const tree = renderOrderBook({ bids: [], asks: [], loading: true });
+  const tree = renderOrderBook({
+    symbol: 'ETHUSDT_PERP',
+    bids: [],
+    asks: [],
+    loading: true,
+  });
 
   assert.doesNotMatch(textContent(tree), /101\.00|99\.00/);
   assert.equal(textContent(findByTestId(tree, 'contract-orderbook-empty-state')), '\u52a0\u8f7d\u4e2d');
   assert.equal((tree as RenderNode).props['data-market-authority'], 'LEGACY_FALLBACK');
+});
+
+test('same-symbol Store depth renders immediately while the legacy bootstrap is loading', () => {
+  resetDisplayMode();
+  orderBookStoreSnapshot = makeStoreDepthSnapshot();
+  const tree = renderOrderBook({ bids: [], asks: [], loading: true });
+
+  assert.match(textContent(findByTestId(tree, 'contract-orderbook-ask-rows')), /101\.00/);
+  assert.match(textContent(findByTestId(tree, 'contract-orderbook-bid-rows')), /100\.00/);
+  assert.equal((tree as RenderNode).props['data-market-authority'], 'STORE');
+  assert.equal((tree as RenderNode).props['data-market-symbol'], 'BTCUSDT_PERP');
+});
+
+test('same-symbol stock and CFD BBO Store rows render during legacy bootstrap', () => {
+  for (const symbol of ['AAPLUSDT_PERP', 'EURUSDT_PERP']) {
+    resetDisplayMode();
+    orderBookStoreSnapshot = makeStoreDepthSnapshot({
+      symbol,
+      bids: [{ price: '100', amount: '0' }],
+      asks: [{ price: '101', amount: '0' }],
+      depthMode: 'BBO_ONLY',
+      provider: 'ITICK',
+    });
+    const tree = renderOrderBook({ symbol, bids: [], asks: [], loading: true });
+
+    assert.match(textContent(findByTestId(tree, 'contract-orderbook-ask-rows')), /101\.00/);
+    assert.match(textContent(findByTestId(tree, 'contract-orderbook-bid-rows')), /100\.00/);
+    assert.equal((tree as RenderNode).props['data-market-authority'], 'STORE');
+  }
+});
+
+test('closed or stale Store authority remains fail-closed during legacy bootstrap', () => {
+  resetDisplayMode();
+  orderBookStoreSnapshot = makeStoreDepthSnapshot({
+    bids: [],
+    asks: [],
+    marketStatus: 'CLOSED',
+    executable: false,
+    freshness: 'LAST_GOOD',
+    stale: true,
+  });
+  const tree = renderOrderBook({ bids: [], asks: [], loading: true });
+
+  assert.doesNotMatch(textContent(tree), /101\.00|99\.00/);
+  assert.equal(textContent(findByTestId(tree, 'contract-orderbook-empty-state')), '\u5e02\u573a\u6570\u636e\u4e0d\u53ef\u7528');
+  assert.equal((tree as RenderNode).props['data-market-authority'], 'STORE');
 });
 
 test('MarketView unavailable state never reuses the previous frame or publishes a ratio', () => {

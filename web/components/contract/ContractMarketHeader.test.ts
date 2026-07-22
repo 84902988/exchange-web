@@ -332,18 +332,19 @@ test('tradfi Header keeps all seven metric cards on one xl laptop row', () => {
   assert.doesNotMatch(metrics.props.className, /2xl:grid-cols-7/);
 });
 
-test('crypto Header keeps eight visible metric cards on one xl laptop row without funding rate', () => {
+test('crypto Header keeps seven visible metric cards on one xl laptop row without redundant index or funding cards', () => {
   resetHarness();
   const tree = renderHeader();
-  const metrics = findByClassToken(tree, 'xl:grid-cols-8');
+  const metrics = findByClassToken(tree, 'xl:grid-cols-7');
   const metricTestIds = (Array.isArray(metrics.props.children)
     ? metrics.props.children.flat(Infinity)
     : [metrics.props.children])
     .map((node) => (node as RenderNode | null)?.props?.['data-testid'])
     .filter((value): value is string => typeof value === 'string');
 
-  assert.equal(metricTestIds.length, 8);
+  assert.equal(metricTestIds.length, 7);
   assert.equal(metricTestIds.includes('contract-header-funding-rate'), false);
+  assert.equal(metricTestIds.includes('contract-header-index-price'), false);
 });
 
 test('Header renders the last-trade reference price as its only main price', () => {
@@ -379,6 +380,39 @@ test('Header accepts the legacy page price contract when referencePrice wiring i
   assert.equal(mainPrice.props['data-display-freshness'], 'LIVE');
   assert.equal(mainPrice.props['data-reference-role'], '');
   assert.equal(mainPrice.props.title, '\u6700\u65b0\u6210\u4ea4');
+});
+
+test('Header recovers live structure and BBO from the complete same-symbol page authority', () => {
+  resetHarness();
+  storeSnapshotsBySymbol.BTCUSDT_PERP = makeStoreSnapshot({
+    displayPrice: '1',
+    displayPriceSource: 'TRADE_TICK',
+    displayState: 'UNAVAILABLE',
+    marketStatus: 'UNKNOWN',
+    marketSessionType: null,
+    executable: false,
+    bestBid: '1',
+    bestAsk: '2',
+    spread: '1',
+    source: 'STALE_SNAPSHOT',
+    freshness: 'RECENT',
+  });
+  const tree = renderHeader({
+    referencePrice: makeReferencePrice(64_000),
+  });
+
+  assert.equal(
+    textContent(findByTestId(tree, 'contract-header-market-status')),
+    '\u5b9e\u65f6\u00b7\u4ea4\u6613\u4e2d',
+  );
+  assert.equal(
+    textContent(findByTestId(tree, 'contract-header-best-bid')),
+    '\u4e70\u4e0063,999.0',
+  );
+  assert.equal(
+    textContent(findByTestId(tree, 'contract-header-best-ask')),
+    '\u5356\u4e0064,001.0',
+  );
 });
 
 test('Header does not promote a live midpoint when last trade is unavailable', () => {
@@ -470,7 +504,7 @@ test('Header keeps the reference main price separate from contract product metri
 
   assert.equal(textContent(findByTestId(tree, 'contract-header-display-price')), '100.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c120.0');
-  assert.equal(textContent(findByTestId(tree, 'contract-header-index-price')), '\u6307\u6570\u4ef7\u683c121.0');
+  assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-index-price'), false);
   assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-funding-rate'), false);
 });
 
@@ -557,6 +591,30 @@ test('initial market bootstrap renders loading instead of a false unavailable st
   assert.match(findByTestId(tree, 'contract-header-market-status-dot').props.className, /animate-pulse/);
 });
 
+test('initial Store unavailable snapshot preserves the bounded page loading state', () => {
+  resetHarness();
+  storeSnapshotsBySymbol.BTCUSDT_PERP = makeStoreSnapshot({
+    displayState: 'UNAVAILABLE',
+    marketStatus: 'UNKNOWN',
+    executable: false,
+    bestBid: null,
+    bestAsk: null,
+    freshness: 'MISSING',
+  });
+  const tree = renderHeader({
+    displayPrice: '--',
+    quoteStatusLabel: '行情加载中',
+    quoteStatusTone: 'loading',
+    marketStatus: null,
+    marketSessionType: null,
+    executable: null,
+  });
+  const status = findByTestId(tree, 'contract-header-market-status');
+
+  assert.equal(textContent(status), '加载中·等待行情');
+  assert.equal(status.props['data-market-state'], 'loading');
+});
+
 test('unavailable price/status renders only the user-facing unavailable state', () => {
   resetHarness();
   const tree = renderHeader({
@@ -580,7 +638,7 @@ test('contract metrics remain separate cards without duplicating main price', ()
   const tree = renderHeader();
 
   assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c63,998.0');
-  assert.equal(textContent(findByTestId(tree, 'contract-header-index-price')), '\u6307\u6570\u4ef7\u683c63,997.0');
+  assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-index-price'), false);
   assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-funding-rate'), false);
   assert.equal(textContent(findByTestId(tree, 'contract-header-best-bid')), '\u4e70\u4e0063,999.0');
   assert.equal(textContent(findByTestId(tree, 'contract-header-best-ask')), '\u5356\u4e0064,001.0');
@@ -607,7 +665,7 @@ test('TradFi header omits synthetic funding/index metrics and places executable 
   assert.equal(textContent(findByTestId(tree, 'contract-header-best-ask')), '\u5356\u4e0064,001.0');
 });
 
-test('Header reads display, mark, and index prices from Store and emits a structured diff log', () => {
+test('Header reads display and mark prices from Store while retaining index price in structured diff diagnostics', () => {
   resetHarness();
   storeSnapshotsBySymbol.BTCUSDT_PERP = makeStoreSnapshot({
     displayPrice: '64010',
@@ -623,7 +681,7 @@ test('Header reads display, mark, and index prices from Store and emits a struct
     const tree = renderHeader();
     assert.equal(textContent(findByTestId(tree, 'contract-header-display-price')), '64,010.0');
     assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c64,008.0');
-    assert.equal(textContent(findByTestId(tree, 'contract-header-index-price')), '\u6307\u6570\u4ef7\u683c64,007.0');
+    assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-index-price'), false);
     assert.equal((tree as RenderNode).props['data-market-authority'], 'STORE');
     assert.equal((tree as RenderNode).props['data-provider-generation'], 10);
   } finally {
@@ -653,7 +711,7 @@ test('Header keeps old-hook field fallback when Store has not hydrated that fiel
     const tree = renderHeader();
     assert.equal(textContent(findByTestId(tree, 'contract-header-display-price')), '64,010.0');
     assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c63,998.0');
-    assert.equal(textContent(findByTestId(tree, 'contract-header-index-price')), '\u6307\u6570\u4ef7\u683c63,997.0');
+    assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-index-price'), false);
   } finally {
     console.info = originalInfo;
   }
@@ -689,7 +747,7 @@ test('Header keeps the complete legacy fallback while Store is safely empty', ()
     const tree = renderHeader();
     assert.equal(textContent(findByTestId(tree, 'contract-header-display-price')), '64,000.0');
     assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c63,998.0');
-    assert.equal(textContent(findByTestId(tree, 'contract-header-index-price')), '\u6307\u6570\u4ef7\u683c63,997.0');
+    assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-index-price'), false);
     assert.equal(textContent(findByTestId(tree, 'contract-header-best-bid')), '\u4e70\u4e0063,999.0');
     assert.equal(textContent(findByTestId(tree, 'contract-header-best-ask')), '\u5356\u4e0064,001.0');
     assert.equal(textContent(findByTestId(tree, 'contract-header-spread')), '\u4ef7\u5dee\u6d6e\u52a8');

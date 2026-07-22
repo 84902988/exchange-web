@@ -81,6 +81,10 @@ class ItickSharedWsTransport:
         self._threads: Dict[str, threading.Thread] = {}
         self._stops: Dict[str, threading.Event] = {}
         self._wakes: Dict[str, threading.Event] = {}
+        self._connection_generations: Dict[str, int] = {}
+        self._connected_generations: Dict[str, int] = {}
+        self._connected_at_ms: Dict[str, int] = {}
+        self._last_message_at_ms: Dict[str, int] = {}
 
     def notify(self, market: object) -> None:
         normalized_market = self._plan.normalize_market(market)
@@ -125,14 +129,72 @@ class ItickSharedWsTransport:
             self.stop_market(market)
 
     def debug_state(self) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
         with self._lock:
             return {
                 market: {
                     "alive": thread.is_alive(),
+                    "connected": market in self._connected_generations,
+                    "connection_generation": int(
+                        self._connected_generations.get(market) or 0
+                    ),
+                    "connected_at_ms": self._connected_at_ms.get(market),
+                    "last_message_at_ms": self._last_message_at_ms.get(market),
+                    "last_message_age_ms": (
+                        max(0, now_ms - int(self._last_message_at_ms[market]))
+                        if market in self._last_message_at_ms
+                        else None
+                    ),
                     "plan_revision": self._plan.market_plan(market).revision,
                 }
                 for market, thread in self._threads.items()
             }
+
+    def market_state(self, market: object) -> dict[str, Any]:
+        normalized_market = self._plan.normalize_market(market)
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            generation = int(self._connected_generations.get(normalized_market) or 0)
+            connected_at_ms = self._connected_at_ms.get(normalized_market)
+            last_message_at_ms = self._last_message_at_ms.get(normalized_market)
+            thread = self._threads.get(normalized_market)
+            return {
+                "alive": bool(thread is not None and thread.is_alive()),
+                "connected": generation > 0,
+                "connection_generation": generation,
+                "connected_at_ms": connected_at_ms,
+                "last_message_at_ms": last_message_at_ms,
+                "last_message_age_ms": (
+                    max(0, now_ms - int(last_message_at_ms))
+                    if last_message_at_ms is not None
+                    else None
+                ),
+                "plan_revision": self._plan.market_plan(normalized_market).revision,
+            }
+
+    def _mark_connected(self, market: str) -> int:
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            generation = int(self._connection_generations.get(market) or 0) + 1
+            self._connection_generations[market] = generation
+            self._connected_generations[market] = generation
+            self._connected_at_ms[market] = now_ms
+            self._last_message_at_ms.pop(market, None)
+            return generation
+
+    def _mark_message_received(self, market: str, generation: int) -> None:
+        with self._lock:
+            if self._connected_generations.get(market) != generation:
+                return
+            self._last_message_at_ms[market] = int(time.time() * 1000)
+
+    def _mark_disconnected(self, market: str, generation: int) -> None:
+        with self._lock:
+            if self._connected_generations.get(market) != generation:
+                return
+            self._connected_generations.pop(market, None)
+            self._connected_at_ms.pop(market, None)
+            self._last_message_at_ms.pop(market, None)
 
     def _thread_main(
         self,
@@ -205,22 +267,27 @@ class ItickSharedWsTransport:
         empty = ItickWsMarketPlan(market=market, revision=0, symbols_by_stream=())
         applied = empty
         async with websockets.connect(url, **connect_kwargs) as websocket:
-            while not stop.is_set():
-                desired = self._plan.market_plan(market)
-                for command in build_itick_transport_commands(applied, desired):
-                    await websocket.send(json.dumps(command.payload(), separators=(",", ":")))
-                applied = desired
-                wake.clear()
-                if not desired.symbols_by_stream:
-                    return
-                try:
-                    raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    if wake.is_set():
+            connection_generation = self._mark_connected(market)
+            try:
+                while not stop.is_set():
+                    desired = self._plan.market_plan(market)
+                    for command in build_itick_transport_commands(applied, desired):
+                        await websocket.send(json.dumps(command.payload(), separators=(",", ":")))
+                    applied = desired
+                    wake.clear()
+                    if not desired.symbols_by_stream:
+                        return
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if wake.is_set():
+                            continue
+                        await websocket.send(json.dumps({"ac": "ping", "params": str(int(time.time() * 1000))}))
                         continue
-                    await websocket.send(json.dumps({"ac": "ping", "params": str(int(time.time() * 1000))}))
-                    continue
-                self._message_handler(market, raw_message)
+                    self._mark_message_received(market, connection_generation)
+                    self._message_handler(market, raw_message)
+            finally:
+                self._mark_disconnected(market, connection_generation)
 
     @staticmethod
     async def _wait(stop: threading.Event, wake: threading.Event, seconds: float) -> None:

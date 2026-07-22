@@ -136,6 +136,10 @@ const realtimeKlineSubscriptions: Array<{
   released: boolean;
 }> = [];
 let realtimeDisconnectCalls = 0;
+const realtimeLatestPreviews = new Map<string, any>();
+const realtimePreviewKey = (symbol: string, interval: string) => (
+  `${String(symbol || '').trim().toUpperCase()}:${String(interval || '1m').trim().toLowerCase()}`
+);
 const realtimeStub = {
   beginKlineResolutionTransition(identity: any) {
     realtimeResolutionCalls.push({ op: 'begin', ...identity });
@@ -181,12 +185,21 @@ const realtimeStub = {
     realtimeHandlers.add(handler);
     return () => realtimeHandlers.delete(handler);
   },
+  getLatestPreview(session: { symbol: string; interval: string }) {
+    return realtimeLatestPreviews.get(realtimePreviewKey(session.symbol, session.interval)) ?? null;
+  },
   disconnect() {
     realtimeDisconnectCalls += 1;
   },
 };
 
 function emitRealtime(message: any) {
+  if (String(message?.type || '').toLowerCase().includes('candle_preview')) {
+    realtimeLatestPreviews.set(
+      realtimePreviewKey(message.symbol, message.interval),
+      message,
+    );
+  }
   realtimeHandlers.forEach((handler) => handler(message));
 }
 
@@ -195,14 +208,17 @@ const policyModule = loadTypeScriptModule(
   {},
 );
 
-const currentCacheModule = loadTypeScriptModule(
-  fileURLToPath(new URL('./contractKlineCurrentCache.ts', import.meta.url)),
-  { './contractKlineCachePolicy': policyModule },
-);
-
 const loadPolicyModule = loadTypeScriptModule(
   fileURLToPath(new URL('./contractKlineLoadPolicy.ts', import.meta.url)),
   {},
+);
+
+const currentCacheModule = loadTypeScriptModule(
+  fileURLToPath(new URL('./contractKlineCurrentCache.ts', import.meta.url)),
+  {
+    './contractKlineCachePolicy': policyModule,
+    './contractKlineLoadPolicy': loadPolicyModule,
+  },
 );
 
 const preloadPriorityModule = loadTypeScriptModule(
@@ -223,9 +239,14 @@ const preloadManagerModule = loadTypeScriptModule(
   },
 );
 
+const contractTimestampModule = loadTypeScriptModule(
+  fileURLToPath(new URL('../../../lib/contractTimestamp.ts', import.meta.url)),
+  {},
+);
+
 const marketStoreModule = loadTypeScriptModule(
   fileURLToPath(new URL('../../../lib/realtime/contractMarketStore.ts', import.meta.url)),
-  {},
+  { '../contractTimestamp': contractTimestampModule },
 );
 
 const previewCompositorModule = loadTypeScriptModule(
@@ -281,6 +302,7 @@ test.beforeEach(() => {
   realtimeResolutionCalls.length = 0;
   realtimeKlineSubscriptions.length = 0;
   realtimeDisconnectCalls = 0;
+  realtimeLatestPreviews.clear();
 });
 
 test.afterEach(() => {
@@ -455,6 +477,8 @@ function realtimePreview(params: {
   previewSequence: number;
   receivedAtMs?: number;
   provider?: string;
+  baselineSource?: 'NATIVE' | 'TRADE_ROLLOVER';
+  baselineAnchorOpenTime?: number | null;
 }) {
   const interval = params.interval ?? '1m';
   const provider = params.provider ?? 'OKX_SWAP';
@@ -475,6 +499,8 @@ function realtimePreview(params: {
     revision_sequence: params.sequence,
     preview_sequence: params.previewSequence,
     received_at_ms: params.receivedAtMs ?? params.openTime + 1_000,
+    baseline_source: params.baselineSource ?? 'NATIVE',
+    baseline_anchor_open_time: params.baselineAnchorOpenTime ?? null,
   };
   return {
     type: 'contract_candle_preview_update',
@@ -487,6 +513,8 @@ function realtimePreview(params: {
     provider_generation: params.generation,
     preview_sequence: params.previewSequence,
     received_at_ms: preview.received_at_ms,
+    baseline_source: preview.baseline_source,
+    baseline_anchor_open_time: preview.baseline_anchor_open_time,
     base_native_revision: {
       epoch: params.generation,
       sequence: params.sequence,
@@ -663,6 +691,61 @@ test('trade preview input requires complete live supported-provider OHLCV revisi
   assert.deepEqual(
     toInput(valid, 'BTCUSDT_PERP', '1m')?.bar,
     { time: 1_717_000_000_000, open: 100, high: 103, low: 99, close: 102, volume: 7 },
+  );
+  const rollover = toInput(realtimePreview({
+    symbol: 'BRENTUSDT_PERP',
+    openTime: 1_717_000_060_000,
+    open: '88.90',
+    high: '88.93',
+    low: '88.90',
+    close: '88.92',
+    volume: '3',
+    generation: 7,
+    sequence: 2,
+    previewSequence: 4,
+    provider: 'ITICK',
+    baselineSource: 'TRADE_ROLLOVER',
+    baselineAnchorOpenTime: 1_717_000_000_000,
+  }), 'BRENTUSDT_PERP', '1m');
+  assert.equal(rollover?.baselineSource, 'TRADE_ROLLOVER');
+  assert.equal(rollover?.baselineAnchorOpenTime, 1_717_000_000_000);
+  assert.equal(
+    toInput({
+      ...realtimePreview({
+        symbol: 'BRENTUSDT_PERP',
+        openTime: 1_717_000_060_000,
+        open: '88.90',
+        high: '88.93',
+        low: '88.90',
+        close: '88.92',
+        volume: '3',
+        generation: 7,
+        sequence: 2,
+        previewSequence: 4,
+        provider: 'ITICK',
+        baselineSource: 'TRADE_ROLLOVER',
+        baselineAnchorOpenTime: 1_717_000_000_000,
+      }),
+      baseline_anchor_open_time: null,
+      preview: {
+        ...realtimePreview({
+          symbol: 'BRENTUSDT_PERP',
+          openTime: 1_717_000_060_000,
+          open: '88.90',
+          high: '88.93',
+          low: '88.90',
+          close: '88.92',
+          volume: '3',
+          generation: 7,
+          sequence: 2,
+          previewSequence: 4,
+          provider: 'ITICK',
+        }).preview,
+        baseline_source: 'TRADE_ROLLOVER',
+        baseline_anchor_open_time: null,
+      },
+    }, 'BRENTUSDT_PERP', '1m'),
+    null,
   );
   assert.deepEqual(
     toInput(realtimePreview({
@@ -861,6 +944,38 @@ test('normal current request calls onHistory exactly once and never calls onErro
 });
 
 
+test('dotted stock symbols reach the Contract Kline API unchanged', async () => {
+  const previousRequestKlines = requestKlines;
+  const requests: KlineRequest[] = [];
+  requestKlines = async (params) => {
+    requests.push(params);
+    return metadata([row(1_717_000_000_000, '489.84')]);
+  };
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'BRK.BUSDT_PERP',
+    category: 'STOCK',
+  });
+
+  try {
+    await datafeed.getBars(
+      symbolInfo('BRK.BUSDT_PERP'),
+      '1',
+      period,
+      () => undefined,
+      assert.fail,
+    );
+    assert.ok(requests.length > 0);
+    assert.deepEqual(
+      new Set(requests.map((request) => request.symbol)),
+      new Set(['BRK.BUSDT_PERP']),
+    );
+  } finally {
+    requestKlines = previousRequestKlines;
+    datafeed.destroy();
+  }
+});
+
+
 test('history barrier defers an early Store candle and replays it only after baseline completion', async () => {
   const symbol = 'HISTORY_BARRIER_PERP';
   const baselineTime = 1_717_000_000_000;
@@ -989,6 +1104,73 @@ test('ordinary provider empty history settles once through the error callback', 
 
   assert.equal(historyCalls.length, 0);
   assert.equal(errorCalls, 1);
+});
+
+
+test('older stock daily empty page ends backfill without replacing valid history with Symbol Error', async () => {
+  const dailyBars = utcBoundaryPageEndingAt(
+    '1d',
+    Date.parse('2026-07-21T00:00:00.000Z'),
+    23,
+    '327.47',
+  );
+  let requestCount = 0;
+  requestKlines = async () => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return metadata(dailyBars, {
+        cache_status: 'CONTINUITY_INVALID',
+      });
+    }
+    return metadata([], {
+      cache_status: 'PROVIDER_EMPTY',
+      history_complete: false,
+      has_more_before: null,
+      history_incomplete: true,
+      provider_error_code: 'EMPTY',
+      retryable: true,
+    });
+  };
+  const historyCalls: HistoryCall[] = [];
+  const errors: string[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol: 'AAPLUSDT_PERP',
+    category: 'stock',
+  });
+
+  await datafeed.getBars(
+    symbolInfo('AAPLUSDT_PERP'),
+    '1D',
+    { ...period, countBack: 100 },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    (reason: string) => errors.push(reason),
+  );
+
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 23);
+  assert.equal(historyCalls[0].meta.noData, false);
+  assert.deepEqual(errors, []);
+
+  const earliestBarTime = historyCalls[0].bars[0].time;
+  await datafeed.getBars(
+    symbolInfo('AAPLUSDT_PERP'),
+    '1D',
+    {
+      ...period,
+      firstDataRequest: false,
+      to: Math.floor(earliestBarTime / 1000),
+      countBack: 100,
+    },
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    (reason: string) => errors.push(reason),
+  );
+
+  assert.equal(requestCount, 3);
+  assert.equal(historyCalls.length, 2);
+  assert.deepEqual(historyCalls[1].bars, []);
+  assert.equal(historyCalls[1].meta.noData, true);
+  assert.deepEqual(errors, []);
+  datafeed.destroy();
 });
 
 
@@ -4586,6 +4768,56 @@ test('BTC 1m preview advances close and volume together until the native candle 
   datafeed.destroy();
 });
 
+test('cold bootstrap replays the latest preview after TradingView subscribes', async () => {
+  const symbol = 'ETHUSDT_PERP';
+  const openTime = 1_717_100_020_000;
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol);
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    close: '1923.44',
+    volume: '5',
+    eventTimeMs: openTime + 1_000,
+    generation: 7,
+    sequence: 10,
+  });
+  const preview = realtimePreview({
+    symbol,
+    openTime,
+    open: '1923.44',
+    high: '1923.69',
+    low: '1923.44',
+    close: '1923.69',
+    volume: '7',
+    generation: 7,
+    sequence: 10,
+    previewSequence: 1,
+    receivedAtMs: openTime + 2_000,
+  });
+  realtimeLatestPreviews.set(realtimePreviewKey(symbol, '1m'), preview);
+
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'cold-bootstrap-preview-subscriber',
+  );
+
+  assert.deepEqual(
+    received.map((bar) => ({ close: bar.close, volume: bar.volume })),
+    [
+      { close: 1923.44, volume: 5 },
+      { close: 1923.69, volume: 7 },
+    ],
+  );
+  datafeed.destroy();
+});
+
 
 test('AAPL 5m preview advances the active candle from the settled trade stream', async () => {
   const symbol = 'AAPLUSDT_PERP';
@@ -4635,6 +4867,83 @@ test('AAPL 5m preview advances the active candle from the settled trade stream',
     [
       { close: 329.54, volume: 1000 },
       { close: 329.43, volume: 1002 },
+    ],
+  );
+  datafeed.destroy();
+});
+
+test('iTick preview advances a CFD candle before the first versioned Native frame', async () => {
+  const symbol = 'EURUSD_PERP';
+  const openTime = Date.parse('2026-07-21T11:35:00.000Z');
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  await establishHistoryBaseline(datafeed, symbol);
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'itick-bootstrap-preview-subscriber',
+  );
+
+  // REST can win the initial race and has no provider generation/revision.
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    open: '1.14200',
+    high: '1.14210',
+    low: '1.14190',
+    close: '1.14205',
+    volume: '100',
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime,
+    open: '1.14200',
+    high: '1.14212',
+    low: '1.14190',
+    close: '1.14212',
+    volume: '121',
+    generation: 9,
+    sequence: 1,
+    previewSequence: 1,
+    provider: 'ITICK',
+  }));
+  // Matching Native authority may arrive later and must not roll the visible
+  // close behind the already settled trade preview.
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    open: '1.14200',
+    high: '1.14211',
+    low: '1.14190',
+    close: '1.14211',
+    volume: '120',
+    generation: 9,
+    sequence: 1,
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime,
+    open: '1.14200',
+    high: '1.14213',
+    low: '1.14190',
+    close: '1.14213',
+    volume: '122',
+    generation: 9,
+    sequence: 1,
+    previewSequence: 2,
+    provider: 'ITICK',
+  }));
+
+  assert.deepEqual(
+    received.map((bar) => ({ close: bar.close, volume: bar.volume })),
+    [
+      { close: 1.14205, volume: 100 },
+      { close: 1.14212, volume: 121 },
+      { close: 1.14213, volume: 122 },
     ],
   );
   datafeed.destroy();

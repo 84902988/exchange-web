@@ -87,6 +87,92 @@ def test_ticker_snapshot_carries_authority_metadata_and_schema_version():
     assert snapshot.metadata.completeness.status == ContractMarketDomainCompletenessStatus.COMPLETE
 
 
+def test_live_ws_generation_replaces_newer_received_rest_bootstrap():
+    rest = map_contract_ticker_domain_snapshot(
+        context=_live_context(
+            transport=ContractMarketDomainTransport.PROVIDER_REST,
+            cache_origin=ContractMarketDomainCacheOrigin.NONE,
+            source=ContractMarketDomainSource.REST_SNAPSHOT,
+            provider_generation=None,
+            provider_event_time_ms=None,
+            received_at_ms=NOW_MS,
+            cache_updated_at_ms=None,
+            emitted_at_ms=NOW_MS,
+        ),
+        ticker={"last_price": "100", "bid_price": "99", "ask_price": "101"},
+    )
+    live = map_contract_ticker_domain_snapshot(
+        context=_live_context(
+            provider_generation=7,
+            provider_event_time_ms=NOW_MS - 200,
+            received_at_ms=NOW_MS - 100,
+            cache_updated_at_ms=NOW_MS - 100,
+            emitted_at_ms=NOW_MS + 1,
+        ),
+        ticker={"last_price": "102", "bid_price": "101", "ask_price": "103"},
+    )
+
+    result = compare_contract_market_domain_snapshots(rest, live)
+
+    assert result.accepted is True
+    assert result.reason == ContractMarketDomainSnapshotAuthorityReason.NEW_GENERATION
+
+
+def test_fresh_live_ws_generation_blocks_rest_downgrade_until_ttl_expires():
+    live = map_contract_ticker_domain_snapshot(
+        context=_live_context(
+            provider_generation=7,
+            ttl_ms=1_500,
+            emitted_at_ms=NOW_MS,
+        ),
+        ticker={"last_price": "102", "bid_price": "101", "ask_price": "103"},
+    )
+
+    def rest_snapshot(emitted_at_ms: int):
+        return map_contract_ticker_domain_snapshot(
+            context=_live_context(
+                transport=ContractMarketDomainTransport.PROVIDER_REST,
+                cache_origin=ContractMarketDomainCacheOrigin.NONE,
+                source=ContractMarketDomainSource.REST_SNAPSHOT,
+                provider_generation=None,
+                provider_event_time_ms=None,
+                received_at_ms=emitted_at_ms,
+                cache_updated_at_ms=None,
+                emitted_at_ms=emitted_at_ms,
+            ),
+            ticker={"last_price": "100", "bid_price": "99", "ask_price": "101"},
+        )
+
+    fresh_result = compare_contract_market_domain_snapshots(
+        live,
+        rest_snapshot(NOW_MS + 1),
+    )
+    fallback_result = compare_contract_market_domain_snapshots(
+        live,
+        rest_snapshot(NOW_MS + 1_501),
+    )
+
+    assert fresh_result.accepted is False
+    assert fresh_result.reason == ContractMarketDomainSnapshotAuthorityReason.OLD_GENERATION
+    assert fallback_result.accepted is True
+
+
+def test_itick_trade_derived_bbo_maps_to_live_ws_source():
+    snapshot = map_contract_ticker_domain_snapshot(
+        context=_live_context(provider="ITICK", provider_symbol="DJI"),
+        ticker={
+            "provider": "ITICK",
+            "provider_symbol": "DJI",
+            "source": "ITICK_LIVE_WS_DERIVED_BBO",
+            "last_price": "52331.24",
+            "bid_price": "52305.08",
+            "ask_price": "52357.40",
+        },
+    )
+
+    assert snapshot.metadata.source == ContractMarketDomainSource.LIVE_WS
+
+
 def test_ticker_snapshot_preserves_legacy_model_and_unwrap_is_isolated():
     quote = ContractQuoteResponse(
         symbol="BTCUSDT_PERP",

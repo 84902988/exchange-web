@@ -41,6 +41,7 @@ export type MyBdCommissionRecord = {
   original_fee_amount: string;
   commission_rate: string;
   commission_amount: string;
+  commission_asset_symbol: string;
   pool_amount: string;
   status: string;
   paid_at: string | null;

@@ -40,3 +40,21 @@ def test_spot_okx_release_removes_all_symbol_routes(monkeypatch):
 
     assert len(released) == 4
     assert service._okx_registrations == {}
+
+
+def test_spot_okx_duplicate_ensure_reasserts_shared_transport_liveness(monkeypatch):
+    service = provider_ws.SpotMarketProviderWsService()
+    acquired = []
+    ensured = []
+    monkeypatch.setattr(
+        service._okx_transport,
+        "acquire",
+        lambda subscription, consumer_id, handler: acquired.append((subscription, consumer_id, handler)),
+    )
+    monkeypatch.setattr(service._okx_transport, "ensure_running", ensured.append)
+
+    service.ensure_symbol("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT)
+    service.ensure_symbol("BTCUSDT", provider=provider_ws.PROVIDER_OKX_SPOT)
+
+    assert len(acquired) == 3
+    assert ensured == [item[0] for item in acquired]

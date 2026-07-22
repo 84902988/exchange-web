@@ -35,7 +35,7 @@ def _required_text(value: Any, *, field: str, uppercase: bool = False) -> str:
 def _supported_symbol(value: Any) -> str:
     symbol = _required_text(value, field="symbol", uppercase=True)
     if any(
-        not ((character.isascii() and character.isalnum()) or character in {"_", "-"})
+        not ((character.isascii() and character.isalnum()) or character in {"_", "-", "."})
         for character in symbol
     ):
         raise ValueError(f"invalid contract candle preview symbol: {symbol}")
@@ -364,6 +364,18 @@ class ContractCandlePreviewEngine:
                     revision,
                     None,
                 )
+            if (
+                current is not None
+                and current.trade_seeded_rollover
+                and revision.provider == current.baseline.provider
+                and revision.generation == current.baseline.generation
+                and revision.open_time == current.preview.baseline_anchor_open_time
+            ):
+                return self._accept_trade_seeded_rollover_anchor_revision(
+                    state_key,
+                    revision,
+                    current,
+                )
             if revision.is_closed:
                 return self._accept_native_close(revision, current)
             if revision.bucket_key in self._tombstones:
@@ -540,6 +552,59 @@ class ContractCandlePreviewEngine:
             ContractNativePreviewStatus.CLOSED,
             revision,
             None,
+        )
+
+    def _accept_trade_seeded_rollover_anchor_revision(
+        self,
+        state_key: tuple[str, str],
+        revision: ContractNativeKlineRevision,
+        current: _ActivePreviewState,
+    ) -> ContractNativePreviewResult:
+        """Advance a late prior-bucket cursor without regressing the new bar.
+
+        A real trade may seed the contiguous next bucket before the Native
+        K-line channel publishes its final OPEN/CLOSED revision for the prior
+        bucket.  That later anchor revision is valid evidence, but it must only
+        advance the preview's base cursor; the new bucket's accumulated trade
+        OHLCV remains authoritative until its own Native revision arrives.
+        """
+        anchor = self._rollover_anchors.get(state_key)
+        if (
+            anchor is None
+            or revision.provider != anchor.provider
+            or revision.generation != anchor.generation
+            or revision.open_time != anchor.open_time
+            or revision.revision < anchor.revision
+        ):
+            return ContractNativePreviewResult(
+                ContractNativePreviewStatus.STALE,
+                revision,
+                current.preview,
+            )
+        if revision.revision == anchor.revision:
+            return ContractNativePreviewResult(
+                ContractNativePreviewStatus.DUPLICATE
+                if revision.content_signature == anchor.content_signature
+                else ContractNativePreviewStatus.CONFLICT,
+                revision,
+                current.preview,
+            )
+
+        self._rollover_anchors[state_key] = revision
+        current.baseline = replace(
+            current.baseline,
+            revision_epoch=revision.revision_epoch,
+            revision_sequence=revision.revision_sequence,
+        )
+        current.preview = replace(
+            current.preview,
+            revision_epoch=revision.revision_epoch,
+            revision_sequence=revision.revision_sequence,
+        )
+        return ContractNativePreviewResult(
+            ContractNativePreviewStatus.REBASED,
+            revision,
+            current.preview,
         )
 
     @staticmethod

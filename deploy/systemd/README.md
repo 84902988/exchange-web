@@ -3,6 +3,10 @@
 Production uses systemd as the only process supervisor. Do not run
 `backend/scripts/start_dev_all.ps1`, ad-hoc `uvicorn`, or duplicate scheduler/scanner commands on the server.
 
+The Windows development process group intentionally excludes the withdraw-fee
+and collection-auto schedulers. Linux production owns both funds-automation
+schedulers as dedicated single-instance systemd services.
+
 ## Ownership model
 
 - `exchange-api.service` owns HTTP/WebSocket API traffic.
@@ -11,7 +15,7 @@ Production uses systemd as the only process supervisor. Do not run
 - `exchange-backend.target` groups all 17 services for enable/start/stop and status operations. A member failure does not restart unrelated members.
 - The API unit overrides the three embedded-owner flags to `0`; `.env` cannot accidentally start the same loop in API and a dedicated unit.
 
-Every service uses unbuffered Python output, journald, bounded restart bursts, a 30-second stop timeout, process-tree cleanup, and baseline filesystem/process hardening. Resource limits are intentionally not hard-coded: size CPU and memory limits from measured production load instead of copying development assumptions.
+Every service uses unbuffered Python output, journald, bounded restart bursts, a 30-second stop timeout, process-tree cleanup, and baseline filesystem/process hardening. Database pools are role-bounded: the API may use `10 + 10` connections, while each single-process worker/scheduler/scanner uses `2 + 1`. The complete 17-service topology therefore has a maximum configured SQLAlchemy budget of 68 connections, leaving headroom under the database server limit for migrations, administration, and rolling overlap. CPU and memory limits are intentionally not hard-coded: size them from measured Alibaba Cloud production load instead of copying development assumptions.
 
 ## Install and verify
 
@@ -29,6 +33,8 @@ sudo systemctl enable --now exchange-backend.target
 ```
 
 Keep `/opt/exchange-web/backend/.env` readable by `exchange` but not world-readable. Run database migrations and dependency checks before starting or restarting the target members.
+
+`ENABLE_DIVIDEND_JOB` remains an explicit business switch. When it is disabled, the operations center reports the job as disabled instead of failed. If it is enabled, keep the API at one process unless the dividend owner is first moved to a dedicated single-instance service; multiple API workers must not each own the same dividend schedule.
 
 ## Operational checks
 

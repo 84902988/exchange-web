@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.bd_account import BdAccount
 from app.db.models.bd_application import BdApplication
+from app.db.models.bd_commission_rate_change_log import BdCommissionRateChangeLog
 from app.schemas.bd_application import BdApplicationCreateIn
 
 BD_LEVEL_DEFAULT_RATES = {
@@ -19,6 +20,10 @@ BD_LEVEL_DEFAULT_RATES = {
 
 
 class BdApplicationReviewError(Exception):
+    pass
+
+
+class BdCommissionRateUpdateError(Exception):
     pass
 
 
@@ -122,6 +127,109 @@ def _normalize_apply_level(value: Any) -> str:
     if level not in BD_LEVEL_DEFAULT_RATES:
         raise BdApplicationReviewError(f"Unsupported BD level: {level or '-'}")
     return level
+
+
+def _normalize_commission_rate(value: Any, *, field_name: str) -> Decimal:
+    try:
+        rate = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise BdCommissionRateUpdateError(f"{field_name}格式不正确") from exc
+    if not rate.is_finite() or rate < Decimal("0") or rate > Decimal("1"):
+        raise BdCommissionRateUpdateError(f"{field_name}必须在 0% 到 100% 之间")
+    return rate.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
+def _normalize_commission_percent(value: Any) -> Decimal:
+    try:
+        percent = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise BdCommissionRateUpdateError("请输入正确的BD分佣比例") from exc
+    if not percent.is_finite() or percent < Decimal("0") or percent > Decimal("100"):
+        raise BdCommissionRateUpdateError("BD分佣比例必须在 0% 到 100% 之间")
+    try:
+        rounded_percent = percent.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except InvalidOperation as exc:
+        raise BdCommissionRateUpdateError("BD分佣比例最多保留两位小数") from exc
+    if percent != rounded_percent:
+        raise BdCommissionRateUpdateError("BD分佣比例最多保留两位小数")
+    return (percent / Decimal("100")).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
+def update_bd_commission_rate(
+    db: Session,
+    *,
+    application_id: int,
+    commission_percent: Any,
+    expected_commission_rate: Any,
+    changed_by_admin_id: int,
+    reason: str,
+) -> Dict[str, Any]:
+    reason_text = str(reason or "").strip()
+    if not reason_text:
+        raise BdCommissionRateUpdateError("修改原因不能为空")
+    if len(reason_text) > 500:
+        raise BdCommissionRateUpdateError("修改原因不能超过 500 个字符")
+
+    try:
+        admin_id = int(changed_by_admin_id)
+    except (TypeError, ValueError) as exc:
+        raise BdCommissionRateUpdateError("无法识别当前管理员，请重新登录") from exc
+    if admin_id <= 0:
+        raise BdCommissionRateUpdateError("无法识别当前管理员，请重新登录")
+
+    application = (
+        db.query(BdApplication)
+        .filter(BdApplication.id == int(application_id))
+        .first()
+    )
+    if application is None:
+        raise BdCommissionRateUpdateError("BD申请不存在")
+    if str(application.status or "").strip().upper() != "APPROVED":
+        raise BdCommissionRateUpdateError("只有已通过的BD申请可以修改分佣比例")
+
+    account = (
+        db.query(BdAccount)
+        .filter(BdAccount.user_id == int(application.user_id))
+        .with_for_update()
+        .first()
+    )
+    if account is None:
+        raise BdCommissionRateUpdateError("该用户没有BD账号")
+    if str(account.status or "").strip().upper() != "ACTIVE":
+        raise BdCommissionRateUpdateError("只有生效中的BD账号可以修改分佣比例")
+
+    current_rate = _normalize_commission_rate(account.commission_rate, field_name="当前分佣比例")
+    expected_rate = _normalize_commission_rate(expected_commission_rate, field_name="页面中的原分佣比例")
+    if current_rate != expected_rate:
+        raise BdCommissionRateUpdateError("分佣比例已被其他管理员修改，请刷新页面后重试")
+
+    new_rate = _normalize_commission_percent(commission_percent)
+    if new_rate == current_rate:
+        raise BdCommissionRateUpdateError("新分佣比例与当前比例相同")
+
+    now = datetime.utcnow()
+    account.commission_rate = new_rate
+    account.updated_at = now
+    change_log = BdCommissionRateChangeLog(
+        bd_account_id=int(account.id),
+        bd_user_id=int(account.user_id),
+        application_id=int(application.id),
+        old_commission_rate=current_rate,
+        new_commission_rate=new_rate,
+        changed_by_admin_id=admin_id,
+        reason=reason_text,
+        created_at=now,
+    )
+    db.add(account)
+    db.add(change_log)
+    db.flush()
+    return {
+        "application_id": int(application.id),
+        "bd_user_id": int(account.user_id),
+        "old_commission_rate": current_rate,
+        "new_commission_rate": new_rate,
+        "change_log_id": int(change_log.id),
+    }
 
 
 def _generate_invite_code(db: Session, user_id: int) -> str:

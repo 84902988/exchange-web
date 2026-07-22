@@ -23,6 +23,8 @@ type SettlementRow = {
   paid: string;
 };
 
+const BD_OVERVIEW_REFRESH_INTERVAL_MS = 15_000;
+
 function parseCoinTotals(value: string | null | undefined) {
   const result: Record<string, string> = {};
   const text = String(value || "").trim();
@@ -126,6 +128,7 @@ export default function BdTeamPage() {
   const [siteBaseUrl, setSiteBaseUrl] = useState(process.env.NEXT_PUBLIC_SITE_URL || "");
   const [inviteCopied, setInviteCopied] = useState(false);
   const applyRef = useRef<HTMLDivElement | null>(null);
+  const overviewRefreshInFlightRef = useRef(false);
 
   const isBd = Boolean(data?.is_bd);
   const bdAccountStatus = String(data?.account?.status || "").trim().toUpperCase();
@@ -192,6 +195,37 @@ export default function BdTeamPage() {
       aliveRef.alive = false;
     };
   }, [loadData, reloadKey]);
+
+  useEffect(() => {
+    if (loading || !isBd || typeof window === "undefined") return;
+
+    let active = true;
+    const refreshOverview = async () => {
+      if (document.visibilityState !== "visible" || overviewRefreshInFlightRef.current) return;
+      overviewRefreshInFlightRef.current = true;
+      try {
+        const overview = await getMyBdTeamOverview();
+        if (active) setData(overview);
+      } catch {
+        // Background refresh must not replace an already rendered, usable page with an error state.
+      } finally {
+        overviewRefreshInFlightRef.current = false;
+      }
+    };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void refreshOverview();
+    };
+
+    const timer = window.setInterval(refreshWhenVisible, BD_OVERVIEW_REFRESH_INTERVAL_MS);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    window.addEventListener("focus", refreshWhenVisible);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+      window.removeEventListener("focus", refreshWhenVisible);
+    };
+  }, [isBd, loading]);
 
   useEffect(() => {
     if (loading || isBd || isBdDisabled || typeof window === "undefined") return;

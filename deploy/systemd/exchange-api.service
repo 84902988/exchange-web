@@ -11,6 +11,8 @@ Type=simple
 WorkingDirectory=/opt/exchange-web/backend
 EnvironmentFile=/opt/exchange-web/backend/.env
 Environment=PYTHONUNBUFFERED=1
+Environment=DB_POOL_SIZE=10
+Environment=DB_MAX_OVERFLOW=10
 Environment=EMBED_BACKGROUND_LOOPS_IN_API=0
 Environment=ENABLE_SPOT_AUTO_MATCH_IN_API=0
 Environment=ENABLE_CONTRACT_LIMIT_ORDER_JOB=0

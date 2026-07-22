@@ -20,6 +20,8 @@ export type ContractMarketRealtimeMessage = {
   provider_generation?: number | null;
   received_at_ms?: number | null;
   preview_sequence?: number | null;
+  baseline_source?: string | null;
+  baseline_anchor_open_time?: number | string | null;
   settlement_revision?: string | null;
   base_native_revision?: unknown;
   preview?: unknown;
@@ -71,8 +73,22 @@ type ContractKlineResolutionTransition = Readonly<{
   rollbackTarget: ContractKlineResolutionIdentity | null;
 }>;
 
+type CachedContractPreview = Readonly<{
+  cachedAtMs: number;
+  message: ContractMarketRealtimeMessage;
+}>;
+
+const CONTRACT_PREVIEW_REPLAY_TTL_MS = 15_000;
+const CONTRACT_PREVIEW_REPLAY_MAX_ENTRIES = 12;
+
 function normalizeSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase();
+}
+
+function contractPreviewReplayKey(symbol: string, interval?: string) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  if (!normalizedSymbol) return '';
+  return `${normalizedSymbol}:${normalizeContractMarketInterval(interval)}`;
 }
 
 function normalizeTransitionGeneration(value: unknown) {
@@ -196,6 +212,7 @@ export class ContractMarketRealtimeClient {
   private handlers = new Map<ContractMarketRealtimeEventType, Set<ContractMarketRealtimeHandler>>();
   private statusHandlers = new Set<ContractMarketRealtimeStatusHandler>();
   private status: ContractMarketRealtimeStatus = 'idle';
+  private latestPreviewByKey = new Map<string, CachedContractPreview>();
 
   setSymbol(symbol: string) {
     this.setSession({ symbol, interval: this.requestedInterval });
@@ -209,6 +226,13 @@ export class ContractMarketRealtimeClient {
     const previousSymbol = this.requestedSymbol;
     const previousInterval = this.requestedInterval;
     const previousMode = this.protocolMode;
+    if (
+      previousMode !== 'legacy'
+      || previousSymbol !== nextSymbol
+      || previousInterval !== nextInterval
+    ) {
+      this.clearLatestPreviews();
+    }
     this.protocolMode = 'legacy';
     this.marketSymbol = '';
     this.activeMarketOwner = 0;
@@ -242,6 +266,9 @@ export class ContractMarketRealtimeClient {
     const previousMode = this.protocolMode;
     const previousSymbol = this.marketSymbol;
     const previousKlineSession = this.getActiveKlineSession();
+    if (previousMode !== 'domain' || previousSymbol !== nextSymbol) {
+      this.clearLatestPreviews();
+    }
     const removedActiveKlineOwner = previousKlineSession?.symbol !== nextSymbol
       ? previousKlineSession
       : null;
@@ -281,10 +308,10 @@ export class ContractMarketRealtimeClient {
           removedActiveKlineOwner.interval,
         );
       }
-      this.sendDomainCommand('subscribe', 'market', nextSymbol);
       if (activeKline) {
         this.sendDomainCommand('subscribe', 'kline', activeKline.symbol, activeKline.interval);
       }
+      this.sendDomainCommand('subscribe', 'market', nextSymbol);
     }
 
     return () => {
@@ -487,11 +514,11 @@ export class ContractMarketRealtimeClient {
     } else if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
       this.scheduleConnect(this.requestedSymbol, this.requestedInterval);
     } else {
-      if (previousMode !== 'domain' && this.marketSymbol) {
-        this.sendDomainCommand('subscribe', 'market', this.marketSymbol);
-      }
       if (!this.activeKlineResolution && owner.state === 'ACTIVE') {
         this.switchKlineSession(previousSession, owner);
+      }
+      if (previousMode !== 'domain' && this.marketSymbol) {
+        this.sendDomainCommand('subscribe', 'market', this.marketSymbol);
       }
     }
 
@@ -543,6 +570,18 @@ export class ContractMarketRealtimeClient {
     return this.status;
   }
 
+  getLatestPreview(session: ContractKlineRealtimeSession) {
+    const key = contractPreviewReplayKey(session.symbol, session.interval);
+    if (!key) return null;
+    const cached = this.latestPreviewByKey.get(key);
+    if (!cached) return null;
+    if (Date.now() - cached.cachedAtMs > CONTRACT_PREVIEW_REPLAY_TTL_MS) {
+      this.latestPreviewByKey.delete(key);
+      return null;
+    }
+    return { ...cached.message };
+  }
+
   disconnect() {
     this.closedByClient = true;
     this.clearConnectTimer();
@@ -556,6 +595,7 @@ export class ContractMarketRealtimeClient {
     this.activeMarketOwner = 0;
     this.destroyAllKlineOwners();
     this.clearKlineResolutionState();
+    this.clearLatestPreviews();
     this.setStatus('idle');
 
     if (!this.ws) return;
@@ -694,6 +734,7 @@ export class ContractMarketRealtimeClient {
     this.closedByClient = true;
     this.clearConnectTimer();
     this.clearReconnectTimer();
+    this.clearLatestPreviews();
     this.protocolMode = 'idle';
     this.setStatus('idle');
     if (!this.ws) return;
@@ -725,6 +766,9 @@ export class ContractMarketRealtimeClient {
 
     this.clearConnectTimer();
     this.clearReconnectTimer();
+    // A newly opened socket is a provider-session boundary. Never replay a
+    // preview retained from the previous connection generation.
+    this.clearLatestPreviews();
     this.socketOpenedWithSymbol = symbol;
     this.socketOpenedWithInterval = normalizeContractMarketInterval(interval);
     this.setStatus(this.status === 'disconnected' || this.status === 'reconnecting' ? 'reconnecting' : 'connecting');
@@ -735,12 +779,12 @@ export class ContractMarketRealtimeClient {
     ws.onopen = () => {
       this.setStatus('connected');
       if (this.protocolMode === 'domain') {
-        if (this.marketSymbol) {
-          this.sendDomainCommand('subscribe', 'market', this.marketSymbol);
-        }
         const activeKline = this.getActiveKlineSessionForSymbol(this.marketSymbol || this.requestedSymbol);
         if (activeKline) {
           this.sendDomainCommand('subscribe', 'kline', activeKline.symbol, activeKline.interval);
+        }
+        if (this.marketSymbol) {
+          this.sendDomainCommand('subscribe', 'market', this.marketSymbol);
         }
         return;
       }
@@ -829,7 +873,31 @@ export class ContractMarketRealtimeClient {
   private dispatch(message: ContractMarketRealtimeMessage) {
     const type = String(message.type || '').toLowerCase();
     if (type === 'contract_market_snapshot') {
-      if (this.protocolMode === 'domain' && !isContractMarketDomainMessage(message)) return;
+      if (this.protocolMode === 'domain' && !isContractMarketDomainMessage(message)) {
+        // The server sends one combined snapshot immediately after the socket
+        // opens, before domain commands are read. Accept that no-domain frame
+        // only for the active symbol/resolution; it carries the atomic
+        // K-line -> trade-preview -> market bootstrap needed on first load.
+        const snapshotSymbol = normalizeSymbol(message.symbol || '');
+        const activeKline = this.getActiveKlineSessionForSymbol(
+          this.marketSymbol || this.requestedSymbol,
+        );
+        const activeSymbol = normalizeSymbol(
+          this.marketSymbol || activeKline?.symbol || this.requestedSymbol,
+        );
+        const snapshotInterval = message.interval
+          ? normalizeContractMarketInterval(message.interval)
+          : '';
+        if (
+          !snapshotSymbol
+          || snapshotSymbol !== activeSymbol
+          || (
+            snapshotInterval
+            && activeKline
+            && snapshotInterval !== activeKline.interval
+          )
+        ) return;
+      }
       this.dispatchSnapshot(message);
       return;
     }
@@ -845,6 +913,9 @@ export class ContractMarketRealtimeClient {
         ? isContractKlineDomainMessage(message)
         : isContractMarketDomainMessage(message);
       if (!domainMatches) return;
+    }
+    if (eventType === 'preview') {
+      this.rememberLatestPreview(message);
     }
     if (eventType === 'trade' && Array.isArray(message.candle_previews)) {
       for (const item of message.candle_previews) {
@@ -863,12 +934,52 @@ export class ContractMarketRealtimeClient {
     this.emit(eventType, message);
   }
 
+  private rememberLatestPreview(message: ContractMarketRealtimeMessage) {
+    const key = contractPreviewReplayKey(message.symbol || '', message.interval);
+    if (!key) return;
+    this.latestPreviewByKey.delete(key);
+    this.latestPreviewByKey.set(key, {
+      cachedAtMs: Date.now(),
+      message: { ...message },
+    });
+    while (this.latestPreviewByKey.size > CONTRACT_PREVIEW_REPLAY_MAX_ENTRIES) {
+      const oldestKey = this.latestPreviewByKey.keys().next().value;
+      if (typeof oldestKey !== 'string') break;
+      this.latestPreviewByKey.delete(oldestKey);
+    }
+  }
+
+  private clearLatestPreviews() {
+    this.latestPreviewByKey.clear();
+  }
+
   private dispatchSnapshot(message: ContractMarketRealtimeMessage) {
     const data = message.data && typeof message.data === 'object'
       ? message.data as Record<string, unknown>
       : {};
     const symbol = message.symbol;
     const interval = message.interval;
+    // Prime the native candle, then settle any real-trade preview, before
+    // React consumers observe the matching Header trade from this snapshot.
+    // This mirrors the live K-line -> preview -> trade transport contract and
+    // removes the first-load candle lag on low-frequency CFD symbols.
+    const klines = data.klines && typeof data.klines === 'object'
+      ? data.klines as Record<string, unknown>
+      : {};
+    const kline = interval ? klines[interval] : Object.values(klines)[0];
+    if (kline) {
+      this.emit('kline', { type: 'contract_kline_update', domain: message.domain, symbol, interval, data: kline, kline });
+    }
+    const candlePreviews = Array.isArray(data.candle_previews)
+      ? data.candle_previews
+      : [];
+    for (const item of candlePreviews) {
+      if (!item || typeof item !== 'object') continue;
+      const preview = item as ContractMarketRealtimeMessage;
+      if (getEventType(preview) !== 'preview') continue;
+      if (normalizeSymbol(preview.symbol || '') !== normalizeSymbol(symbol || '')) continue;
+      this.dispatch(preview);
+    }
     const marketState = data.market_state;
     if (marketState) {
       this.emit('state', {
@@ -892,13 +1003,6 @@ export class ContractMarketRealtimeClient {
     const trades = Array.isArray(data.trades) ? data.trades : [];
     if (trades.length > 0) {
       this.emit('trade', { type: 'contract_trade', domain: message.domain, symbol, interval, data: trades, trades });
-    }
-    const klines = data.klines && typeof data.klines === 'object'
-      ? data.klines as Record<string, unknown>
-      : {};
-    const kline = interval ? klines[interval] : Object.values(klines)[0];
-    if (kline) {
-      this.emit('kline', { type: 'contract_kline_update', domain: message.domain, symbol, interval, data: kline, kline });
     }
   }
 

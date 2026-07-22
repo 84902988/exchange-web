@@ -33,6 +33,24 @@ export function formatRcbDiscountPercent(value: string | number | null | undefin
   return `${trimTrailingZeros(percent.toFixed(2))}%`;
 }
 
+export function resolveRcbFeePayPercent(
+  payPercent: string | number | null | undefined,
+  discountPercent: string | number | null | undefined,
+): number | null {
+  const directPayPercent = parsePercent(payPercent);
+  if (directPayPercent !== null) return directPayPercent;
+
+  const legacyDiscountPercent = parsePercent(discountPercent);
+  if (legacyDiscountPercent === null) return null;
+  return 100 - legacyDiscountPercent;
+}
+
+export function formatRcbFeePayPercent(value: string | number | null | undefined): string {
+  const percent = parsePercent(value);
+  if (percent === null) return "--";
+  return `${trimTrailingZeros(percent.toFixed(2))}%`;
+}
+
 export function formatRcbPayDiscountText(value: string | number | null | undefined): string {
   const discountPercent = parsePercent(value);
   if (discountPercent === null) return "--";

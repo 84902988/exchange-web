@@ -28,6 +28,7 @@ import {
 import type { ContractReferencePrice } from './contractPriceAuthority';
 
 type ContractFuturesOrderBookProps = {
+  symbol: string;
   priceDirection?: 'up' | 'down' | 'flat';
   pricePrecision: number;
   bids?: ContractDepthLevel[];
@@ -131,11 +132,15 @@ function resolveStoreDepthStatus(
 export function resolveContractOrderBookMarketRead(
   store: ContractOrderBookStoreSnapshot | null,
   legacy: ContractOrderBookLegacyRead,
+  expectedSymbol?: string | null,
 ): ContractOrderBookMarketRead {
   // During a symbol transition the legacy adapter marks its symbol-scoped
-  // projection as loading before the Store activation effect advances. Keep
-  // that guard so the previous active symbol cannot flash for one render.
-  if (!store || legacy.loading) {
+  // projection as loading before the Store activation effect advances. Match
+  // the Store identity explicitly so the previous symbol can never flash,
+  // while a usable same-symbol Store snapshot can render immediately.
+  const storeMatchesSymbol = !expectedSymbol
+    || normalizeToken(store?.symbol) === normalizeToken(expectedSymbol);
+  if (!store || !storeMatchesSymbol) {
     return { ...legacy, authority: 'LEGACY_FALLBACK', symbol: null };
   }
   const usable = isUsableStoreDepth(store);
@@ -254,6 +259,7 @@ function OrderBookModeIcon({
 }
 
 export default function ContractFuturesOrderBook({
+  symbol,
   priceDirection = 'flat',
   pricePrecision,
   bids: legacyBids = EMPTY_DEPTH_LEVELS,
@@ -305,7 +311,7 @@ export default function ContractFuturesOrderBook({
     legacyStatus,
     legacyStatusLabel,
   ]);
-  const marketRead = resolveContractOrderBookMarketRead(storeSnapshot, legacyRead);
+  const marketRead = resolveContractOrderBookMarketRead(storeSnapshot, legacyRead, symbol);
   const {
     bids,
     asks,

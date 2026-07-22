@@ -366,6 +366,47 @@ def test_public_ws_treats_disconnect_during_domain_snapshot_as_normal_cleanup() 
     asyncio.run(scenario())
 
 
+def test_public_ws_treats_close_during_initial_snapshot_send_as_normal_cleanup() -> None:
+    class ClosingWebSocket:
+        def __init__(self) -> None:
+            self.application_state = WebSocketState.CONNECTING
+            self.client_state = WebSocketState.CONNECTED
+            self.receive_count = 0
+
+        async def accept(self) -> None:
+            self.application_state = WebSocketState.CONNECTED
+
+        async def send_text(self, _payload: str) -> None:
+            self.application_state = WebSocketState.DISCONNECTED
+            raise RuntimeError('Cannot call "send" once a close message has been sent.')
+
+        async def receive(self) -> dict[str, Any]:
+            self.receive_count += 1
+            raise AssertionError("closed socket must not enter the receive loop")
+
+    async def scenario() -> None:
+        manager = ContractMarketWsManager()
+        gateway = GatewayStub()
+        websocket = ClosingWebSocket()
+
+        with (
+            patch.object(contract_market_router, "contract_market_ws_manager", manager),
+            patch.object(contract_market_router, "contract_market_gateway", gateway),
+        ):
+            await contract_market_router.contract_market_public_ws(
+                websocket,
+                symbol="EURUSD_PERP",
+                interval="1m",
+            )
+
+        assert websocket.receive_count == 0
+        assert await manager.subscriber_count("EURUSD_PERP") == 0
+        assert gateway.ensure_calls == ["EURUSD_PERP"]
+        assert gateway.release_calls == ["EURUSD_PERP"]
+
+    asyncio.run(scenario())
+
+
 def test_public_ws_prewarms_gateway_before_initial_snapshot() -> None:
     class DisconnectingWebSocket:
         async def receive(self) -> dict[str, Any]:

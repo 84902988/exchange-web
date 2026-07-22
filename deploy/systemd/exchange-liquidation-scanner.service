@@ -11,6 +11,8 @@ Type=simple
 WorkingDirectory=/opt/exchange-web/backend
 EnvironmentFile=/opt/exchange-web/backend/.env
 Environment=PYTHONUNBUFFERED=1
+Environment=DB_POOL_SIZE=2
+Environment=DB_MAX_OVERFLOW=1
 User=exchange
 Group=exchange
 ExecStart=/opt/exchange-web/.venv/bin/python scripts/start_liquidation_scanner.py

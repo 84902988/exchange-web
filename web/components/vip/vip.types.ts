@@ -49,6 +49,7 @@ export type VipOverviewResponse = {
   svip_levels: VipLevelItem[];
   user_summary: VipUserSummary;
   auth_state: VipAuthState;
+  rcb_fee_pay_percent?: string | null;
   rcb_discount_percent: string | null;
 };
 

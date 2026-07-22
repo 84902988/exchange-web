@@ -139,11 +139,14 @@ def get_vip_overview(
     auth_state: str = "anonymous",
 ) -> dict[str, Any]:
     spot_fee_settings = load_spot_fee_settings(db)
-    rcb_discount_percent = (Decimal("1") - Decimal(str(spot_fee_settings.rcb_fee_discount_rate))) * Decimal("100")
+    rcb_fee_pay_percent = Decimal(str(spot_fee_settings.rcb_fee_discount_rate)) * Decimal("100")
+    rcb_discount_percent = Decimal("100") - rcb_fee_pay_percent
     return {
         "vip_levels": _load_levels(db, "VIP"),
         "svip_levels": _load_levels(db, "SVIP"),
         "user_summary": _load_user_summary(db, user_id),
         "auth_state": auth_state,
+        "rcb_fee_pay_percent": _fmt_percent(rcb_fee_pay_percent),
+        # Compatibility field: existing clients may still consume the fee-savings percentage.
         "rcb_discount_percent": _fmt_percent(rcb_discount_percent),
     }

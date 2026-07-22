@@ -7,7 +7,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 
@@ -314,7 +314,19 @@ class ContractMarketWsManager:
             return sum(1 for websocket in sockets if websocket in self._socket_market_subscriptions)
 
     async def send_to_one(self, websocket: WebSocket, payload: dict[str, Any]) -> None:
-        await websocket.send_text(json.dumps(_to_jsonable(payload), ensure_ascii=False))
+        if not self._socket_connected(websocket):
+            raise WebSocketDisconnect(code=1000)
+        try:
+            await websocket.send_text(json.dumps(_to_jsonable(payload), ensure_ascii=False))
+        except RuntimeError as exc:
+            # The browser may close while a REST-backed snapshot is being
+            # prepared. Starlette reports that normal race as RuntimeError
+            # once its application/client state has transitioned away from
+            # CONNECTED. Translate only that closed-socket case so the router
+            # can run its usual disconnect and provider-release cleanup.
+            if not self._socket_connected(websocket):
+                raise WebSocketDisconnect(code=1000) from exc
+            raise
 
     async def broadcast_to_symbol(self, symbol: str, payload: dict[str, Any]) -> None:
         normalized_symbol = normalize_contract_ws_symbol(symbol)

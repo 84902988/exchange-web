@@ -598,12 +598,33 @@ function getPairChangeValue(pair: GlobalMarketSelectorPair): string | number | n
 function formatPrice(value?: string | number | null, pair?: GlobalMarketSelectorPair | null): string {
   const num = Number(value);
   if (!Number.isFinite(num) || num <= 0) return '--';
-  const pricePrecision = resolveSpotPricePrecision({
+  const pricePrecision = resolveSelectorPricePrecision(value, pair);
+  return formatSpotPrice(num, pricePrecision);
+}
+
+export function resolveSelectorPricePrecision(
+  value?: string | number | null,
+  pair?: GlobalMarketSelectorPair | null,
+): number {
+  const configuredPrecision = resolveSpotPricePrecision({
     displayPricePrecision: pair?.displayPricePrecision,
     pricePrecision: pair?.pricePrecision,
     priceTickSize: pair?.priceTickSize,
   });
-  return formatSpotPrice(num, pricePrecision);
+  const pairCategories = [pair?.assetType, pair?.marketCategory, pair?.marketSubCategory]
+    .map(normalize)
+    .filter(Boolean);
+  if (configuredPrecision !== 0 || !pairCategories.includes('FOREX')) {
+    return configuredPrecision;
+  }
+
+  // A shared-market cache created before the contract catalog arrives can
+  // transiently carry price_precision=0. Preserve provider decimals on first
+  // paint; authoritative ticker/catalog metadata replaces this fallback.
+  const raw = String(value ?? '').trim().replace(/,/g, '');
+  const fractional = raw.match(/\.(\d+)/)?.[1] || '';
+  if (fractional) return Math.min(fractional.length, 12);
+  return normalize(pair?.symbol).includes('JPY') ? 3 : 5;
 }
 
 function hasValidTickerNumber(value?: string | number | null, options: { positiveOnly?: boolean } = {}): boolean {
@@ -886,6 +907,8 @@ function buildContractTickerPair(item: ContractTickerItem): GlobalMarketSelector
 
   return {
     symbol,
+    displayPricePrecision: parseOptionalPrecision(item.price_precision),
+    pricePrecision: parseOptionalPrecision(item.price_precision),
     price: item.last_price ?? item.price ?? null,
     change24h: item.price_change_percent_24h ?? item.change_24h ?? item.priceChangePercent ?? null,
     priceChangePercent: item.price_change_percent_24h ?? item.priceChangePercent ?? null,
@@ -935,12 +958,73 @@ function mergePairMarketData(pair: GlobalMarketSelectorPair, ticker: GlobalMarke
     marketTradingHours: ticker.marketTradingHours ?? pair.marketTradingHours,
     marketSessionType: ticker.marketSessionType ?? pair.marketSessionType,
     quoteFreshness: ticker.quoteFreshness ?? pair.quoteFreshness,
+    displayPricePrecision: ticker.displayPricePrecision ?? pair.displayPricePrecision,
+    pricePrecision: ticker.pricePrecision ?? pair.pricePrecision,
+    priceTickSize: ticker.priceTickSize ?? pair.priceTickSize,
   };
+}
+
+const CONTRACT_SELECTOR_FRESHNESS_RANK: Readonly<Record<string, number>> = {
+  LIVE: 6,
+  RECENT: 5,
+  CACHED: 4,
+  LAST_VALID: 3,
+  LAST_GOOD: 3,
+  STALE: 2,
+  FALLBACK: 1,
+  MISSING: 0,
+  NONE: 0,
+};
+
+function contractSelectorFreshnessRank(value: unknown): number {
+  const normalized = normalizeUnknown(value);
+  return CONTRACT_SELECTOR_FRESHNESS_RANK[normalized] ?? 2;
+}
+
+export function resolveContractSelectorTickerAuthority(params: {
+  batchTicker: GlobalMarketSelectorPair | null;
+  batchUpdatedAt: number | null;
+  quoteTicker: GlobalMarketSelectorPair | null;
+  quoteUpdatedAt: number | null;
+}): GlobalMarketSelectorPair | null {
+  const { batchTicker, quoteTicker } = params;
+  if (!batchTicker) return quoteTicker;
+  if (!quoteTicker) return batchTicker;
+
+  const batchRank = contractSelectorFreshnessRank(batchTicker.quoteFreshness);
+  const quoteRank = contractSelectorFreshnessRank(quoteTicker.quoteFreshness);
+  const batchUpdatedAt = Number(params.batchUpdatedAt || 0);
+  const quoteUpdatedAt = Number(params.quoteUpdatedAt || 0);
+  const quoteWins = quoteRank > batchRank || (
+    quoteRank === batchRank && quoteUpdatedAt > batchUpdatedAt
+  );
+
+  return quoteWins
+    ? mergePairMarketData(batchTicker, quoteTicker)
+    : mergePairMarketData(quoteTicker, batchTicker);
+}
+
+function overlayExternalContractMarketData(
+  pairs: GlobalMarketSelectorPair[],
+  externalPairs: GlobalMarketSelectorPair[],
+): GlobalMarketSelectorPair[] {
+  const externalBySymbol = new Map(
+    externalPairs
+      .filter((pair) => isContractMarketPair(pair) && Number.isFinite(Number(pair.price)) && Number(pair.price) > 0)
+      .map((pair) => [normalize(pair.symbol), pair]),
+  );
+  if (externalBySymbol.size === 0) return pairs;
+
+  return pairs.map((pair) => {
+    const external = externalBySymbol.get(normalize(pair.symbol));
+    return external ? mergePairMarketData(pair, external) : pair;
+  });
 }
 
 function mergePairsWithContractTickerCache(
   pairs: GlobalMarketSelectorPair[],
   tickerCache: Map<string, GlobalMarketSelectorPair>,
+  tickerFetchedAt: Map<string, number>,
 ): GlobalMarketSelectorPair[] {
   return pairs.map((pair) => {
     const ticker = tickerCache.get(pair.symbol);
@@ -965,8 +1049,13 @@ function mergePairsWithContractTickerCache(
       } satisfies GlobalMarketSelectorPair
       : null;
 
-    const tickerMerged = ticker ? mergePairMarketData(pair, ticker) : pair;
-    return quoteTicker ? mergePairMarketData(tickerMerged, quoteTicker) : tickerMerged;
+    const authority = resolveContractSelectorTickerAuthority({
+      batchTicker: ticker || null,
+      batchUpdatedAt: tickerFetchedAt.get(pair.symbol) || null,
+      quoteTicker,
+      quoteUpdatedAt: quoteCache.updatedAt,
+    });
+    return authority ? mergePairMarketData(pair, authority) : pair;
   });
 }
 
@@ -1257,10 +1346,16 @@ export default function GlobalMarketSelector({
       ? internalContractPairs
       : externalPairItems.filter(isContractMarketPair);
 
-    return mergeUniquePairs(
+    const mergedPairs = mergeUniquePairs(
       mergePairsWithTickerCache(spotSource, tickerCacheRef.current),
-      mergePairsWithContractTickerCache(contractSource, contractTickerCacheRef.current),
+      mergePairsWithContractTickerCache(
+        contractSource,
+        contractTickerCacheRef.current,
+        contractTickerFetchedAtRef.current,
+      ),
     ).filter((item) => !isStockQuotePair(item));
+
+    return overlayExternalContractMarketData(mergedPairs, externalPairItems);
   }, [
     contractPairsCacheKey,
     contractTickerCacheVersion,
@@ -1502,6 +1597,8 @@ export default function GlobalMarketSelector({
                   marketStatus: item.marketStatus,
                   marketStatusText: item.marketStatusText,
                   quoteFreshness: item.quoteFreshness,
+                  displayPricePrecision: item.displayPricePrecision,
+                  pricePrecision: item.pricePrecision,
                   updatedAt,
                 })));
               }

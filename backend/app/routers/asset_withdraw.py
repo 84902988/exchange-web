@@ -1616,8 +1616,6 @@ def send_withdraw_code(
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
-    import traceback
-
     trace_id = getattr(request.state, "trace_id", None)
     assert_user_withdraw_unlocked(db, user_id)
     wid = int(payload.withdraw_id)
@@ -1678,9 +1676,13 @@ def send_withdraw_code(
             db.rollback()
             return _err("BAD_STATE", "withdraw status changed, cannot persist code", trace_id, http_status=409)
         db.commit()
-    except Exception as e:
-        print("[withdraw-send-code] DB_UPDATE_FAILED", f"trace_id={trace_id} uid={user_id} wid={wid} err={repr(e)}")
-        traceback.print_exc()
+    except Exception:
+        logger.exception(
+            "withdraw_send_code_db_update_failed trace_id=%s user_id=%s withdraw_id=%s",
+            trace_id,
+            user_id,
+            wid,
+        )
         db.rollback()
         return _err("DB_ERROR", "failed to persist verify code", trace_id, http_status=500)
 
@@ -1689,8 +1691,12 @@ def send_withdraw_code(
 
         enqueue_send_verify_code_email(to_email=to_email, code=code, scene="withdraw", expire_minutes=10)
     except Exception as e:
-        print("[withdraw-send-code] EMAIL_SEND_FAILED", f"trace_id={trace_id} uid={user_id} wid={wid} email={to_email} err={repr(e)}")
-        traceback.print_exc()
+        logger.exception(
+            "withdraw_send_code_email_enqueue_failed trace_id=%s user_id=%s withdraw_id=%s",
+            trace_id,
+            user_id,
+            wid,
+        )
         try:
             db.execute(
                 text(
@@ -1707,13 +1713,22 @@ def send_withdraw_code(
             db.commit()
         except Exception as clear_exc:
             db.rollback()
-            print(
-                "[withdraw-send-code] CLEAR_CODE_FAILED",
-                f"trace_id={trace_id} uid={user_id} wid={wid} err={repr(clear_exc)}",
+            logger.exception(
+                "withdraw_send_code_clear_failed trace_id=%s user_id=%s withdraw_id=%s error_type=%s",
+                trace_id,
+                user_id,
+                wid,
+                type(clear_exc).__name__,
             )
         return _err("EMAIL_SEND_FAILED", str(e), trace_id, http_status=500)
 
-    print(f"[withdraw-email-code] trace_id={trace_id} user_id={user_id} withdraw_id={wid} email={to_email} code={code} expires_at={expires_at.isoformat()}")
+    logger.info(
+        "withdraw_send_code_email_enqueued trace_id=%s user_id=%s withdraw_id=%s expires_at=%s",
+        trace_id,
+        user_id,
+        wid,
+        expires_at.isoformat(),
+    )
     return _ok({"withdraw_id": wid, "status": "VERIFYING", "hint": "email code sent"}, trace_id)
 
 

@@ -49,8 +49,9 @@ async def _close_redis_resource(resource: Any) -> None:
 
 
 def _beat_subscriber(status: str, dispatch_count: int) -> None:
-    redis = get_redis_connection()
+    redis = None
     try:
+        redis = get_redis_connection()
         beat_service_heartbeat(
             redis,
             SPOT_PRIVATE_EVENT_SUBSCRIBER_SERVICE,
@@ -60,10 +61,19 @@ def _beat_subscriber(status: str, dispatch_count: int) -> None:
                 "dispatch_count": int(dispatch_count),
             },
         )
+    except Exception:
+        logger.debug("spot_private_event_subscriber_heartbeat_failed", exc_info=True)
     finally:
-        close = getattr(redis, "close", None)
-        if close is not None:
-            close()
+        if redis is not None:
+            close = getattr(redis, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.debug(
+                        "spot_private_event_subscriber_heartbeat_close_failed",
+                        exc_info=True,
+                    )
 
 
 class SpotPrivateEventDispatcher:
@@ -174,9 +184,13 @@ class SpotPrivateEventSubscriber:
     async def _beat(self, status: str, dispatch_count: int) -> None:
         if self._heartbeat is None:
             return
-        result = await asyncio.to_thread(self._heartbeat, status, dispatch_count)
-        if hasattr(result, "__await__"):
-            await result
+        try:
+            result = await asyncio.to_thread(self._heartbeat, status, dispatch_count)
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:
+            # Monitoring is deliberately isolated from the business event loop.
+            logger.debug("spot_private_event_subscriber_heartbeat_failed", exc_info=True)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         retry_delay = self._retry_delay_seconds
@@ -231,9 +245,15 @@ class SpotPrivateEventSubscriber:
                         await pubsub.unsubscribe(SPOT_PRIVATE_EVENTS_CHANNEL)
                     except Exception:
                         pass
-                    await _close_redis_resource(pubsub)
+                    try:
+                        await _close_redis_resource(pubsub)
+                    except Exception:
+                        logger.debug("spot private pubsub close failed", exc_info=True)
                 if redis is not None:
-                    await _close_redis_resource(redis)
+                    try:
+                        await _close_redis_resource(redis)
+                    except Exception:
+                        logger.debug("spot private redis close failed", exc_info=True)
 
 
 _subscriber_task: asyncio.Task[None] | None = None

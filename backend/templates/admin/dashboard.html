@@ -34,6 +34,13 @@
       color:rgba(255,255,255,.72);
       font-size:12px;
       font-weight:800;
+      text-decoration:none;
+      transition:border-color .16s ease, background .16s ease, color .16s ease;
+    }
+    .dashboard-status-item:hover{
+      color:#fff;
+      border-color:rgba(255,255,255,.22);
+      background:rgba(255,255,255,.055);
     }
     .dashboard-dot{
       width:7px;
@@ -237,9 +244,9 @@
   <div class="dashboard-v2">
     <div class="dashboard-status-bar" aria-label="系统状态">
       {% for item in metrics.statuses %}
-        <span class="dashboard-status-item tone-{{ item.tone or 'neutral' }}">
+        <a href="{{ item.href or '/admin/system/operations' }}" class="dashboard-status-item tone-{{ item.tone or 'neutral' }}">
           <i class="dashboard-dot"></i>{{ item.label }}：{{ item.status }}
-        </span>
+        </a>
       {% endfor %}
     </div>
 

@@ -1537,30 +1537,35 @@ class SpotMarketProviderWsService:
         registration_key = (domain, local_symbol, interval)
         generation_key = (PROVIDER_OKX_SPOT, local_symbol, interval) if domain == "kline" else (PROVIDER_OKX_SPOT, local_symbol)
         with self._lock:
-            if registration_key in self._okx_registrations:
-                return
-            generations = {
-                "depth": self._depth_generations,
-                "ticker": self._ticker_generations,
-                "trades": self._trades_generations,
-                "kline": self._kline_generations,
-            }[domain]
-            generation = generations.get(generation_key, 0) + 1
-            generations[generation_key] = generation
-            handler = {
-                "depth": lambda raw: self._handle_okx_depth_message(subscription, raw, generation),
-                "ticker": lambda raw: self._handle_okx_ticker_message(subscription, raw, generation),
-                "trades": lambda raw: self._handle_okx_trades_message(subscription, raw, generation),
-                "kline": lambda raw: self._handle_okx_kline_message(subscription, raw, generation),
-            }[domain]
-            logical = OkxWsSubscription(
-                "business" if domain == "kline" else "public",
-                subscription.channel,
-                subscription.provider_symbol,
-            )
-            consumer_id = f"spot:{domain}:{local_symbol}:{interval}"
-            self._okx_registrations[registration_key] = (logical, consumer_id)
-            self._remember_provider_task_started_locked(domain, PROVIDER_OKX_SPOT, local_symbol, interval or None)
+            existing_registration = self._okx_registrations.get(registration_key)
+            if existing_registration is not None:
+                logical, _consumer_id = existing_registration
+            else:
+                generations = {
+                    "depth": self._depth_generations,
+                    "ticker": self._ticker_generations,
+                    "trades": self._trades_generations,
+                    "kline": self._kline_generations,
+                }[domain]
+                generation = generations.get(generation_key, 0) + 1
+                generations[generation_key] = generation
+                handler = {
+                    "depth": lambda raw: self._handle_okx_depth_message(subscription, raw, generation),
+                    "ticker": lambda raw: self._handle_okx_ticker_message(subscription, raw, generation),
+                    "trades": lambda raw: self._handle_okx_trades_message(subscription, raw, generation),
+                    "kline": lambda raw: self._handle_okx_kline_message(subscription, raw, generation),
+                }[domain]
+                logical = OkxWsSubscription(
+                    "business" if domain == "kline" else "public",
+                    subscription.channel,
+                    subscription.provider_symbol,
+                )
+                consumer_id = f"spot:{domain}:{local_symbol}:{interval}"
+                self._okx_registrations[registration_key] = (logical, consumer_id)
+                self._remember_provider_task_started_locked(domain, PROVIDER_OKX_SPOT, local_symbol, interval or None)
+        if existing_registration is not None:
+            self._okx_transport.ensure_running(logical)
+            return
         self._okx_transport.acquire(logical, consumer_id, handler)
 
     def _release_okx_shared(self, *, domain: str, local_symbol: str, interval: str = "") -> bool:

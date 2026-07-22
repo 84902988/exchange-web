@@ -234,37 +234,87 @@ export function resolveContractHeaderMarketRead(
   legacy: ContractHeaderLegacyRead,
 ): ContractHeaderMarketRead {
   if (!store) return { ...legacy, authority: 'LEGACY_FALLBACK' };
-  const executable = store.executable ?? legacy.executable;
-  const displayPrice = formatStoreNumber(store.displayPrice, legacy.displayPrice) || legacy.displayPrice;
+  const storeDisplayState = normalizeToken(store.displayState);
+  const storeHasLiveStructure = ['LIVE_TRADABLE', 'REGULAR_OPEN'].includes(storeDisplayState)
+    && store.executable === true;
+  const preserveBootstrapLoading = legacy.quoteStatusTone === 'loading'
+    && (
+      !storeDisplayState
+      || ['LOADING', 'MARKET_DATA_UNAVAILABLE', 'UNAVAILABLE', 'UNKNOWN']
+        .includes(storeDisplayState)
+    );
+  const legacyBid = parseComparableNumber(legacy.bestBid);
+  const legacyAsk = parseComparableNumber(legacy.bestAsk);
+  const legacyHasLiveStructure = legacy.quoteStatusTone === 'live'
+    && legacy.executable === true
+    && legacyBid !== null
+    && legacyAsk !== null
+    && legacyBid > 0
+    && legacyAsk >= legacyBid;
+  // Header reads the low-latency Store directly, but a just-reconnected ticker
+  // can briefly retain unavailable structure while the complete MarketView
+  // REST/depth authority is already live. Keep non-price Store metrics, and
+  // recover structure plus BBO/valuation from that same-symbol authority.
+  const recoverStructureFromLegacy = legacyHasLiveStructure && !storeHasLiveStructure;
+  const executable = recoverStructureFromLegacy
+    ? legacy.executable
+    : store.executable ?? legacy.executable;
+  const displayPrice = recoverStructureFromLegacy
+    ? legacy.displayPrice
+    : formatStoreNumber(store.displayPrice, legacy.displayPrice) || legacy.displayPrice;
   const highLow24h = store.high24h !== null || store.low24h !== null
     ? `${formatStoreNumber(store.high24h, null) || '--'} / ${formatStoreNumber(store.low24h, null) || '--'}`
     : legacy.highLow24h;
   const volumeTurnover24h = store.baseVolume24h !== null || store.quoteVolume24h !== null
     ? `${formatCompactAmount(store.baseVolume24h)} / ${formatCompactAmount(store.quoteVolume24h)}`
     : legacy.volumeTurnover24h;
-  const displayPriceSource = store.displayPriceSource ?? legacy.displayPriceSource;
+  const displayPriceSource = recoverStructureFromLegacy
+    ? legacy.displayPriceSource
+    : store.displayPriceSource ?? legacy.displayPriceSource;
 
   return {
     authority: 'STORE',
     displayPrice,
     change: formatStoreChange(store, legacy.change, legacy.displayPrice),
-    quoteStatusLabel: store.displayState || store.marketStatus || legacy.quoteStatusLabel,
-    quoteStatusTone: resolveStoreQuoteTone(store, executable, legacy.quoteStatusTone),
-    marketStatus: store.marketStatus ?? legacy.marketStatus,
-    tickerSource: store.source ?? legacy.tickerSource,
-    tickerFreshness: store.freshness ?? legacy.tickerFreshness,
-    marketSessionType: store.marketSessionType ?? legacy.marketSessionType,
+    quoteStatusLabel: recoverStructureFromLegacy || preserveBootstrapLoading
+      ? legacy.quoteStatusLabel
+      : store.displayState || store.marketStatus || legacy.quoteStatusLabel,
+    quoteStatusTone: recoverStructureFromLegacy || preserveBootstrapLoading
+      ? legacy.quoteStatusTone
+      : resolveStoreQuoteTone(store, executable, legacy.quoteStatusTone),
+    marketStatus: recoverStructureFromLegacy
+      ? legacy.marketStatus
+      : store.marketStatus ?? legacy.marketStatus,
+    tickerSource: recoverStructureFromLegacy
+      ? legacy.tickerSource
+      : store.source ?? legacy.tickerSource,
+    tickerFreshness: recoverStructureFromLegacy
+      ? legacy.tickerFreshness
+      : store.freshness ?? legacy.tickerFreshness,
+    marketSessionType: recoverStructureFromLegacy
+      ? legacy.marketSessionType
+      : store.marketSessionType ?? legacy.marketSessionType,
     executable,
     displayPriceSource,
     displayPriceLabel: displayPriceSource && displayPriceSource !== legacy.displayPriceSource
       ? displayPriceSource
       : legacy.displayPriceLabel,
-    markPrice: formatStoreNumber(store.markPrice, legacy.markPrice),
-    indexPrice: formatStoreNumber(store.indexPrice, legacy.indexPrice),
+    markPrice: recoverStructureFromLegacy
+      ? legacy.markPrice
+      : formatStoreNumber(store.markPrice, legacy.markPrice),
+    indexPrice: recoverStructureFromLegacy
+      ? legacy.indexPrice
+      : formatStoreNumber(store.indexPrice, legacy.indexPrice),
     fundingRate: formatStoreFunding(store.fundingRate, legacy.fundingRate),
-    bestBid: formatStoreNumber(store.bestBid, legacy.bestBid),
-    bestAsk: formatStoreNumber(store.bestAsk, legacy.bestAsk),
-    spread: formatStoreNumber(store.spread, legacy.spread),
+    bestBid: recoverStructureFromLegacy
+      ? legacy.bestBid
+      : formatStoreNumber(store.bestBid, legacy.bestBid),
+    bestAsk: recoverStructureFromLegacy
+      ? legacy.bestAsk
+      : formatStoreNumber(store.bestAsk, legacy.bestAsk),
+    spread: recoverStructureFromLegacy
+      ? legacy.spread
+      : formatStoreNumber(store.spread, legacy.spread),
     highLow24h,
     volumeTurnover24h,
   };
@@ -544,7 +594,6 @@ export default function ContractMarketHeader({
     displayPriceSource: marketReadDisplayPriceSource,
     displayPriceLabel: marketReadDisplayPriceLabel,
     markPrice,
-    indexPrice,
     bestBid,
     bestAsk,
     highLow24h,
@@ -712,7 +761,7 @@ export default function ContractMarketHeader({
           </div>
         </div>
 
-        <div className={`grid min-w-0 flex-1 grid-cols-2 gap-2 text-[12px] text-gray-300 md:grid-cols-4 ${isTradfi ? 'xl:grid-cols-[1.05fr_0.9fr_0.75fr_1.3fr_1.35fr_0.85fr_0.85fr]' : 'xl:grid-cols-8'}`}>
+        <div className={`grid min-w-0 flex-1 grid-cols-2 gap-2 text-[12px] text-gray-300 md:grid-cols-4 ${isTradfi ? 'xl:grid-cols-[1.05fr_0.9fr_0.75fr_1.3fr_1.35fr_0.85fr_0.85fr]' : 'xl:grid-cols-7'}`}>
           <Metric
             label={t('tradeStatus', 'contracts')}
             testId="contract-header-market-status-card"
@@ -735,7 +784,6 @@ export default function ContractMarketHeader({
             )}
           />
           <Metric label={markPriceLabel || t('markPrice', 'contracts')} testId="contract-header-mark-price" value={markPrice || '--'} />
-          {!isTradfi ? <Metric label={t('indexPrice', 'contracts')} testId="contract-header-index-price" value={indexPrice || '--'} /> : null}
           {!isTradfi ? (
             <>
               <Metric label={labels.bestBid} testId="contract-header-best-bid" value={bestBid || '--'} />

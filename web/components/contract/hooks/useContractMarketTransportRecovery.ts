@@ -11,6 +11,7 @@ export const CONTRACT_MARKET_TRANSPORT_RECOVERY_GRACE_MS = 2_500;
 type ContractMarketTransportRecovery = {
   preserveRealtimeAuthority: boolean;
   recoveryExpired: boolean;
+  reconnectGeneration: number;
 };
 
 export function useContractMarketTransportRecovery(
@@ -18,8 +19,11 @@ export function useContractMarketTransportRecovery(
   realtimeStatus: ContractMarketRealtimeStatus,
 ): ContractMarketTransportRecovery {
   const [phase, setPhase] = useState<'idle' | 'recovering' | 'expired'>('idle');
+  const [reconnectGeneration, setReconnectGeneration] = useState(0);
   const previousSymbolRef = useRef(symbol);
   const previousStatusRef = useRef<ContractMarketRealtimeStatus>(realtimeStatus);
+  const recoveryPendingRef = useRef(false);
+  const recoveryTimerRef = useRef<number | null>(null);
   const sameSymbol = previousSymbolRef.current === symbol;
   const justLostConnection = sameSymbol
     && previousStatusRef.current === 'connected'
@@ -31,18 +35,49 @@ export function useContractMarketTransportRecovery(
     previousSymbolRef.current = symbol;
     previousStatusRef.current = realtimeStatus;
 
-    if (symbolChanged || realtimeStatus === 'connected') {
+    if (symbolChanged) {
+      if (recoveryTimerRef.current !== null) {
+        window.clearTimeout(recoveryTimerRef.current);
+        recoveryTimerRef.current = null;
+      }
+      recoveryPendingRef.current = false;
+      setReconnectGeneration(0);
       setPhase('idle');
-      return undefined;
+      return;
     }
-    if (previousStatus !== 'connected') return undefined;
 
+    if (realtimeStatus === 'connected') {
+      if (recoveryTimerRef.current !== null) {
+        window.clearTimeout(recoveryTimerRef.current);
+        recoveryTimerRef.current = null;
+      }
+      if (recoveryPendingRef.current) {
+        recoveryPendingRef.current = false;
+        setReconnectGeneration((value) => value + 1);
+      }
+      setPhase('idle');
+      return;
+    }
+
+    if (previousStatus !== 'connected') return;
+
+    recoveryPendingRef.current = true;
     setPhase('recovering');
-    const timer = window.setTimeout(() => {
+    if (recoveryTimerRef.current !== null) {
+      window.clearTimeout(recoveryTimerRef.current);
+    }
+    recoveryTimerRef.current = window.setTimeout(() => {
+      recoveryTimerRef.current = null;
       setPhase('expired');
     }, CONTRACT_MARKET_TRANSPORT_RECOVERY_GRACE_MS);
-    return () => window.clearTimeout(timer);
   }, [realtimeStatus, symbol]);
+
+  useEffect(() => () => {
+    if (recoveryTimerRef.current !== null) {
+      window.clearTimeout(recoveryTimerRef.current);
+      recoveryTimerRef.current = null;
+    }
+  }, []);
 
   return {
     preserveRealtimeAuthority: realtimeStatus === 'connected'
@@ -51,5 +86,6 @@ export function useContractMarketTransportRecovery(
     recoveryExpired: sameSymbol
       && realtimeStatus !== 'connected'
       && phase === 'expired',
+    reconnectGeneration: sameSymbol ? reconnectGeneration : 0,
   };
 }

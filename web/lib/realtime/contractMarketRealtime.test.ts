@@ -182,6 +182,49 @@ test('domain mode routes candle preview only through the kline preview channel',
   }
 });
 
+test('latest preview replay is scoped by symbol and interval and cleared at a socket boundary', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+    const preview = {
+      type: 'contract_candle_preview_update',
+      domain: 'kline',
+      symbol: 'BTCUSDT_PERP',
+      interval: '1m',
+      preview: { close: '100', volume: '5' },
+    };
+
+    socket.onmessage?.({ data: JSON.stringify(preview) });
+
+    assert.deepEqual(
+      client.getLatestPreview({ symbol: 'btcusdt_perp', interval: '1m' }),
+      preview,
+    );
+    assert.equal(
+      client.getLatestPreview({ symbol: 'BTCUSDT_PERP', interval: '5m' }),
+      null,
+    );
+    assert.equal(
+      client.getLatestPreview({ symbol: 'ETHUSDT_PERP', interval: '1m' }),
+      null,
+    );
+
+    client.disconnect();
+    assert.equal(
+      client.getLatestPreview({ symbol: 'BTCUSDT_PERP', interval: '1m' }),
+      null,
+    );
+    releaseMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
 
 test('trade settlement emits embedded preview before trade in one websocket task', () => {
   const harness = installRealtimeHarness();
@@ -227,6 +270,96 @@ test('trade settlement emits embedded preview before trade in one websocket task
     assert.deepEqual(trades, [trade]);
     releaseTrade();
     releasePreview();
+    releaseMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+
+test('domain socket subscribes to K-line before market bootstrap', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    const releaseKline = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      () => undefined,
+    );
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+
+    assert.deepEqual(
+      socket.sent
+        .map((item) => JSON.parse(item))
+        .filter((item) => item.op === 'subscribe')
+        .map((item) => item.domain),
+      ['kline', 'market'],
+    );
+
+    releaseKline();
+    releaseMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+
+test('bootstrap snapshot settles K-line then preview before exposing Header trade', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    const events: string[] = [];
+    const releaseKline = client.subscribeKline(
+      { symbol: 'BTCUSDT_PERP', interval: '1m' },
+      () => events.push('kline'),
+    );
+    const releasePreview = client.subscribe('preview', () => events.push('preview'));
+    const releaseTrade = client.subscribe('trade', () => events.push('trade'));
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+    const preview = {
+      type: 'contract_candle_preview_update',
+      domain: 'kline',
+      symbol: 'BTCUSDT_PERP',
+      interval: '1m',
+      preview: { close: '101', volume: '11' },
+    };
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'contract_market_snapshot',
+        symbol: 'BTCUSDT_PERP',
+        interval: '1m',
+        data: {
+          klines: {
+            '1m': {
+              symbol: 'BTCUSDT_PERP',
+              interval: '1m',
+              open_time: 1_717_000_000_000,
+              open: '100',
+              high: '101',
+              low: '99',
+              close: '100.5',
+              volume: '10',
+            },
+          },
+          candle_previews: [preview],
+          trades: [{ id: 'trade-1', price: '101', qty: '1' }],
+        },
+      }),
+    });
+
+    assert.deepEqual(events, ['kline', 'preview', 'trade']);
+
+    releaseTrade();
+    releasePreview();
+    releaseKline();
     releaseMarket();
   } finally {
     harness.restore();

@@ -171,7 +171,7 @@ async def contract_market_public_ws(
             if action == "disconnect":
                 break
             if action == "ping":
-                await websocket.send_json({"type": "pong"})
+                await contract_market_ws_manager.send_to_one(websocket, {"type": "pong"})
                 continue
             domain_result = await handle_contract_ws_domain_command(
                 action=action,

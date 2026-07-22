@@ -78,13 +78,13 @@ def send_email_job(*, to_email: str, subject: str, text_body: str, html_body: st
             from_alias=from_alias,
         )
     except EmailSendError:
-        logger.exception("email job send failed: to_email=%s subject=%s", to_email, subject)
+        logger.exception("email job send failed")
         raise
     except Exception:
-        logger.exception("email job unexpected failure: to_email=%s subject=%s", to_email, subject)
+        logger.exception("email job unexpected failure")
         raise
 
-    logger.info("email job sent: to_email=%s subject=%s", to_email, subject)
+    logger.info("email job sent")
     return {"ok": True, "to_email": str(to_email).strip()}
 
 

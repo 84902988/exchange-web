@@ -10,6 +10,7 @@ import type {
 import { readMarketCache, writeMarketCache } from '@/lib/marketCache';
 
 const CLOSED_QUOTE_CACHE_TTL_MS = 30_000;
+const CONTRACT_TRADES_CACHE_TTL_MS = 5_000;
 const CONTRACT_KLINE_CACHE_VERSION = 2;
 
 export type ContractDepthCache = {
@@ -42,11 +43,13 @@ export type ContractTradesCache = {
 export type ContractMarketCache = {
   quote?: ContractQuote | null;
   lastPrice?: string | number | null;
+  quoteUpdatedAt?: number;
   depth?: ContractDepthCache;
   klines?: Record<string, ContractKlineCache>;
   klineCacheVersion?: number;
   trades?: ContractMarketTrade[];
   tradesLastPrice?: string | number | null;
+  tradesUpdatedAt?: number;
   candles?: CandleItem[];
   volumes?: VolumeItem[];
   updatedAt?: number;
@@ -67,13 +70,24 @@ export function writeContractMarketCache(symbol: string, patch: Partial<Contract
 export function readContractQuoteCache(symbol: string) {
   const cache = readContractMarketCache(symbol);
   const quote = cache?.quote ?? null;
+  const persistedQuoteUpdatedAt = Number(cache?.quoteUpdatedAt ?? 0);
+  const hasQuoteSpecificTimestamp = Number.isFinite(persistedQuoteUpdatedAt) && persistedQuoteUpdatedAt > 0;
+  const isClosedQuote = String(quote?.market_status || '').trim().toUpperCase() === 'CLOSED';
+  const quoteUpdatedAt = hasQuoteSpecificTimestamp
+    ? persistedQuoteUpdatedAt
+    : isClosedQuote
+      ? 0
+      : Number(cache?.updatedAt ?? 0);
   const isStaleClosedQuote =
-    quote?.market_status === 'CLOSED' &&
-    (!cache?.updatedAt || Date.now() - cache.updatedAt > CLOSED_QUOTE_CACHE_TTL_MS);
+    isClosedQuote &&
+    (!quoteUpdatedAt || Date.now() - quoteUpdatedAt > CLOSED_QUOTE_CACHE_TTL_MS);
 
   return {
     quote: isStaleClosedQuote ? null : quote,
-    lastPrice: cache?.lastPrice ?? quote?.last_price ?? quote?.mark_price ?? null,
+    lastPrice: isStaleClosedQuote
+      ? null
+      : cache?.lastPrice ?? quote?.last_price ?? quote?.mark_price ?? null,
+    updatedAt: quoteUpdatedAt || null,
   };
 }
 
@@ -81,6 +95,7 @@ export function writeContractQuoteCache(symbol: string, quote: ContractQuote) {
   writeContractMarketCache(symbol, {
     quote,
     lastPrice: quote.last_price || quote.mark_price,
+    quoteUpdatedAt: Date.now(),
   });
 }
 
@@ -132,10 +147,16 @@ export function writeContractKlineCache(
 export function readContractTradesCache(symbol: string): ContractTradesCache | null {
   const cache = readContractMarketCache(symbol);
   if (!cache?.trades?.length) return null;
+  const tradesUpdatedAt = Number(cache.tradesUpdatedAt ?? 0);
+  if (
+    !Number.isFinite(tradesUpdatedAt)
+    || tradesUpdatedAt <= 0
+    || Date.now() - tradesUpdatedAt > CONTRACT_TRADES_CACHE_TTL_MS
+  ) return null;
   return {
     trades: cache.trades,
     lastPrice: cache.tradesLastPrice,
-    updatedAt: cache.updatedAt,
+    updatedAt: tradesUpdatedAt,
   };
 }
 
@@ -143,5 +164,6 @@ export function writeContractTradesCache(symbol: string, data: Omit<ContractTrad
   writeContractMarketCache(symbol, {
     trades: data.trades,
     tradesLastPrice: data.lastPrice,
+    tradesUpdatedAt: Date.now(),
   });
 }

@@ -1,9 +1,19 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _normalize_market_timestamp(value: Optional[datetime]) -> Optional[datetime]:
+    """Expose every Contract market instant with an explicit UTC offset."""
+
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class ContractQuoteResponse(BaseModel):
@@ -51,6 +61,8 @@ class ContractQuoteResponse(BaseModel):
     source: str
     ts: datetime
 
+    _normalize_timestamps = field_validator("last_good_at", "ts")(_normalize_market_timestamp)
+
 
 class ContractDepthResponse(BaseModel):
     symbol: str
@@ -87,6 +99,8 @@ class ContractDepthResponse(BaseModel):
     source: str
     ts: datetime
 
+    _normalize_timestamps = field_validator("last_good_at", "ts")(_normalize_market_timestamp)
+
 
 class ContractSymbolItem(BaseModel):
     symbol: str
@@ -118,6 +132,7 @@ class ContractSymbolListResponse(BaseModel):
 
 class ContractTickerItem(BaseModel):
     symbol: str
+    price_precision: Optional[int] = None
     market_status: str = "UNKNOWN"
     market_status_text: str = ""
     market_session_code: Optional[str] = None
@@ -134,6 +149,8 @@ class ContractTickerItem(BaseModel):
     quote_volume_24h: Optional[str] = None
     source: Optional[str] = None
     ts: Optional[datetime] = None
+
+    _normalize_timestamps = field_validator("ts")(_normalize_market_timestamp)
 
 
 class ContractTickerListResponse(BaseModel):
@@ -220,3 +237,9 @@ class ContractMarketViewDetail(BaseModel):
     kline: Optional[Dict[str, Any]] = None
     snapshot_metadata: Dict[str, Any] = Field(default_factory=dict)
     raw_source_summary: Dict[str, Any] = Field(default_factory=dict)
+
+    _normalize_timestamps = field_validator(
+        "last_trade_time",
+        "quote_time",
+        "last_good_at",
+    )(_normalize_market_timestamp)

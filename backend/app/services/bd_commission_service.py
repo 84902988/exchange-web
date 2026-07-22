@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
-from typing import Optional
+from typing import Iterable, Optional
 
 from sqlalchemy.orm import Session
 
@@ -19,7 +19,23 @@ SUPPORTED_COMMISSION_ASSETS = {RCB_SYMBOL, USDT_SYMBOL}
 
 
 class InsufficientPlatformBalanceError(ValueError):
-    pass
+    def __init__(
+        self,
+        *,
+        record_id: int,
+        asset_symbol: str,
+        required_amount: Decimal,
+        available_amount: Decimal,
+    ) -> None:
+        self.record_id = int(record_id)
+        self.asset_symbol = str(asset_symbol or "").upper().strip()
+        self.required_amount = _q18(required_amount)
+        self.available_amount = _q18(available_amount)
+        self.shortage_amount = _q18(max(self.required_amount - self.available_amount, Decimal("0")))
+        super().__init__(
+            f"insufficient platform {self.asset_symbol} balance for BD commission record "
+            f"{self.record_id}: required={self.required_amount}, available={self.available_amount}"
+        )
 
 
 def _utc_now() -> datetime:
@@ -48,6 +64,35 @@ def _get_asset_id(db: Session, symbol: str) -> int:
     if asset_id is None:
         raise ValueError(f"asset not configured: {normalized_symbol}")
     return int(asset_id)
+
+
+def get_platform_bd_commission_available_balances(
+    db: Session,
+    asset_symbols: Iterable[str],
+) -> dict[str, Decimal]:
+    symbols = {
+        str(symbol or "").upper().strip()
+        for symbol in asset_symbols
+        if str(symbol or "").upper().strip() in SUPPORTED_COMMISSION_ASSETS
+    }
+    if not symbols:
+        return {}
+
+    rows = (
+        db.query(UserBalance.coin_symbol, UserBalance.available_amount)
+        .filter(
+            UserBalance.user_id == PLATFORM_USER_ID,
+            UserBalance.chain_key == FUNDING_BALANCE_CHAIN_KEY,
+            UserBalance.coin_symbol.in_(symbols),
+        )
+        .all()
+    )
+    balances = {symbol: Decimal("0") for symbol in symbols}
+    for coin_symbol, available_amount in rows:
+        normalized_symbol = str(coin_symbol or "").upper().strip()
+        if normalized_symbol in balances:
+            balances[normalized_symbol] = _q18(_decimal_or_zero(available_amount))
+    return balances
 
 
 def _commission_asset_symbol(record: BdCommissionRecord) -> str:
@@ -221,7 +266,10 @@ def pay_bd_commission_record(db: Session, record_id: int) -> BdCommissionRecord:
 
     if platform_before_available < commission_amount:
         raise InsufficientPlatformBalanceError(
-            f"insufficient platform {commission_asset_symbol} balance for BD commission record {int(record.id)}"
+            record_id=int(record.id),
+            asset_symbol=commission_asset_symbol,
+            required_amount=commission_amount,
+            available_amount=platform_before_available,
         )
 
     bd_after_available = _q18(bd_before_available + commission_amount)

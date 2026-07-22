@@ -325,6 +325,7 @@ def test_subscriber_coalesces_queued_symbols_and_closes_resources():
         subscriber = SpotPublicDepthEventSubscriber(
             dispatcher=dispatcher,  # type: ignore[arg-type]
             redis_factory=lambda: redis,
+            heartbeat=None,
         )
 
         await subscriber.run(stop_event)
@@ -334,5 +335,16 @@ def test_subscriber_coalesces_queued_symbols_and_closes_resources():
         assert pubsub.unsubscribed == [SPOT_PUBLIC_DEPTH_EVENTS_CHANNEL]
         assert pubsub.closed is True
         assert redis.closed is True
+
+    asyncio.run(run())
+
+
+def test_subscriber_heartbeat_failure_is_observability_only():
+    async def run():
+        def broken_heartbeat(_status: str, _dispatch_count: int):
+            raise RuntimeError("heartbeat unavailable")
+
+        subscriber = SpotPublicDepthEventSubscriber(heartbeat=broken_heartbeat)
+        await subscriber._beat("subscribed", 0)
 
     asyncio.run(run())

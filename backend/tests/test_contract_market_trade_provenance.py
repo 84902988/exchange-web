@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from app.routers import contract_market as market_router
 from app.services import contract_market_gateway as gateway_module
+from app.services import contract_market_provider_ws as provider_ws_module
 from app.services import contract_market_service as market_service
 from app.services.contract_market_gateway import (
     CONTRACT_MARKET_CACHE_TRADES,
@@ -163,6 +164,21 @@ def test_gateway_preserves_trade_provenance_without_quote_source_inheritance(mon
     assert message["source"] == "LIVE_WS"
     assert message["quote_freshness"] == "LIVE"
     assert message["price_source"] == "TRADE_TICK"
+
+
+def test_gateway_canonicalizes_provider_trades_newest_first_before_snapshot_use():
+    payload = _valid_ws_trade_payload()
+    older = dict(payload["trades"][0], id="older", time=1_720_000_000_000)
+    newest = dict(payload["trades"][0], id="newest", time=1_720_000_002_000)
+    duplicate_newest = dict(payload["trades"][0], id="newest", time=1_720_000_001_000)
+
+    trades = gateway_module._truthful_contract_trades(
+        [older, newest, duplicate_newest],
+        symbol=SYMBOL,
+        evidence=payload,
+    )
+
+    assert [trade["id"] for trade in trades] == ["newest", "older"]
 
 
 def _valid_ws_trade_payload() -> dict:
@@ -322,7 +338,7 @@ def test_closed_itick_market_returns_empty_trades_without_provider_calls(monkeyp
     monkeypatch.setattr(market_service, "_is_market_closed", lambda *_args: True)
     monkeypatch.setattr(
         market_service,
-        "_get_provider_ws_stock_tick_trade",
+        "_get_provider_ws_itick_trades",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("closed markets must not request WS trades")
         ),
@@ -345,7 +361,7 @@ def test_active_itick_market_fails_closed_when_ws_and_rest_trades_are_unavailabl
     )
     monkeypatch.setattr(market_service, "_market_status_for_contract_symbol", lambda *_args: object())
     monkeypatch.setattr(market_service, "_is_market_closed", lambda *_args: False)
-    monkeypatch.setattr(market_service, "_get_provider_ws_stock_tick_trade", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(market_service, "_get_provider_ws_itick_trades", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(market_service, "_get_itick_stock_tick_trade", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         market_service,
@@ -360,6 +376,187 @@ def test_active_itick_market_fails_closed_when_ws_and_rest_trades_are_unavailabl
         match="CONTRACT_MARKET_PROVIDER_TRADES_UNAVAILABLE",
     ):
         market_service.get_contract_recent_trades(object(), "AAPLUSDT_PERP")
+
+
+@pytest.mark.parametrize(
+    ("symbol", "provider_symbol", "category"),
+    [
+        ("AAPLUSDT_PERP", "AAPL", "STOCK"),
+        ("EURUSD_PERP", "EURUSD", "FOREX"),
+        ("XAGUSDT_PERP", "XAGUSD", "GOLD"),
+        ("BRENTUSDT_PERP", "BRENT", "FUTURES"),
+        ("NAS100USDT_PERP", "NAS100", "INDEX"),
+    ],
+)
+def test_active_itick_tradfi_uses_same_provider_ws_trade_lineage(
+    monkeypatch,
+    symbol,
+    provider_symbol,
+    category,
+):
+    contract_symbol = SimpleNamespace(
+        symbol=symbol,
+        provider="ITICK",
+        provider_symbol=provider_symbol,
+        category=category,
+    )
+    trade = {
+        "id": f"{symbol}-trade",
+        "symbol": symbol,
+        "provider": "ITICK",
+        "provider_symbol": provider_symbol,
+        "price": "101.5",
+        "qty": "2",
+        "time": 1_720_000_000_000,
+        "price_source": "TRADE_TICK",
+        "source": "LIVE_WS",
+        "quote_source": "LIVE_WS",
+        "freshness": "LIVE",
+        "quote_freshness": "LIVE",
+        "synthetic": False,
+    }
+    monkeypatch.setattr(
+        market_service,
+        "_load_contract_symbol",
+        lambda *_args, **_kwargs: contract_symbol,
+    )
+    monkeypatch.setattr(market_service, "_market_status_for_contract_symbol", lambda *_args: object())
+    monkeypatch.setattr(market_service, "_is_market_closed", lambda *_args: False)
+    monkeypatch.setattr(
+        market_service,
+        "_get_provider_ws_itick_trades",
+        lambda *_args, **_kwargs: [trade],
+    )
+    monkeypatch.setattr(
+        market_service,
+        "_get_itick_stock_tick_trade",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fresh provider WS trades must win")
+        ),
+    )
+    monkeypatch.setattr(
+        market_service,
+        "_get_configured_contract_recent_trades",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("iTick TradFi must not fall through to crypto providers")
+        ),
+    )
+
+    assert market_service.get_contract_recent_trades(object(), symbol) == [trade]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "provider_symbol", "category"),
+    [
+        ("EURUSD_PERP", "EURUSD", "FOREX"),
+        ("XAUUSDT_PERP", "XAUUSD", "METAL"),
+        ("OILUSDT_PERP", "OIL", "COMMODITY"),
+        ("SPXUSDT_PERP", "SPX", "INDEX"),
+    ],
+)
+def test_itick_cfd_trade_gap_fails_closed_without_crypto_provider_fallback(
+    monkeypatch,
+    symbol,
+    provider_symbol,
+    category,
+):
+    contract_symbol = SimpleNamespace(
+        symbol=symbol,
+        provider="ITICK",
+        provider_symbol=provider_symbol,
+        category=category,
+    )
+    monkeypatch.setattr(
+        market_service,
+        "_load_contract_symbol",
+        lambda *_args, **_kwargs: contract_symbol,
+    )
+    monkeypatch.setattr(market_service, "_market_status_for_contract_symbol", lambda *_args: object())
+    monkeypatch.setattr(market_service, "_is_market_closed", lambda *_args: False)
+    monkeypatch.setattr(market_service, "_get_provider_ws_itick_trades", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        market_service,
+        "_get_itick_stock_tick_trade",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stock-only REST tick must not serve CFD symbols")
+        ),
+    )
+    monkeypatch.setattr(
+        market_service,
+        "_get_configured_contract_recent_trades",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("iTick CFD must not fall through to crypto providers")
+        ),
+    )
+
+    with pytest.raises(
+        market_service.ContractTradesUnavailable,
+        match="CONTRACT_MARKET_PROVIDER_TRADES_UNAVAILABLE",
+    ):
+        market_service.get_contract_recent_trades(object(), symbol)
+
+
+def test_contract_recent_trade_order_is_newest_first_and_deduplicated():
+    older = {"id": "older", "time": 1_720_000_000_000}
+    newest = {"id": "newest", "event_time_ms": 1_720_000_002_000}
+    duplicate_newest = {"id": "newest", "time": 1_720_000_001_000}
+
+    assert market_service._order_contract_recent_trades(
+        [older, newest, duplicate_newest],
+        limit=30,
+    ) == [newest, older]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "provider": "OKX_SWAP",
+            "provider_symbol": "XAG-USDT-SWAP",
+            "trades": [],
+        },
+        {
+            "provider": "ITICK",
+            "provider_symbol": "XAGUSD",
+            "trades": [
+                {
+                    "id": "wrong-provider-row",
+                    "symbol": "XAGUSDT_PERP",
+                    "provider": "OKX_SWAP",
+                    "provider_symbol": "XAG-USDT-SWAP",
+                    "price": "59.1",
+                    "qty": "1",
+                    "time": 1_720_000_000_000,
+                    "source": "LIVE_WS",
+                    "quote_source": "LIVE_WS",
+                    "freshness": "LIVE",
+                    "quote_freshness": "LIVE",
+                    "price_source": "TRADE_TICK",
+                    "synthetic": False,
+                }
+            ],
+        },
+    ],
+)
+def test_itick_ws_trade_reader_rejects_cross_provider_identity(monkeypatch, payload):
+    contract_symbol = SimpleNamespace(
+        symbol="XAGUSDT_PERP",
+        provider="ITICK",
+        provider_symbol="XAGUSD",
+        category="GOLD",
+    )
+    monkeypatch.setattr(provider_ws_module, "provider_ws_trades_enabled", lambda: True)
+    monkeypatch.setattr(
+        provider_ws_module,
+        "select_fresh_provider_ws_trades",
+        lambda *_args, **_kwargs: payload,
+    )
+
+    assert market_service._get_provider_ws_itick_trades(
+        object(),
+        contract_symbol,
+        limit=30,
+    ) == []
 
 
 def test_rest_route_returns_503_for_provider_trades_unavailable(monkeypatch):

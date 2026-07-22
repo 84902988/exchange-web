@@ -2871,7 +2871,7 @@ function OrderFeedbackBox({ feedback }: { feedback: OrderFeedback }) {
 
 function EmptyState({ title, description }: { title: string; description: string }) {
   return (
-    <div className="border-b border-white/10 px-2 py-8 text-center">
+    <div className="px-2 py-8 text-center">
       <div className="text-[13px] text-white/38">{title}</div>
       <div className="mt-1 text-[12px] text-white/24">{description}</div>
     </div>

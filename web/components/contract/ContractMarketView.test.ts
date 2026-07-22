@@ -6,6 +6,7 @@ import type { ContractMarketViewDetail } from '@/lib/api/modules/contract';
 import {
   readContractMarketViewAuthority,
   resolveContractMarketViewAuthorityPresentation,
+  shouldHoldContractMarketViewBootstrap,
   shouldExposeContractMarketDepth,
 } from './contractMarketView.utils';
 
@@ -141,6 +142,26 @@ test('executable=false disables trading even when display and BBO values exist',
   assert.match(formSource, /const quoteUnavailable = !marketViewPresentation\.isTradable/);
 });
 
+test('live presentation consumes the same execution-ready result as order execution', () => {
+  const marketView = createMarketView();
+  const presentation = resolveContractMarketViewAuthorityPresentation({
+    marketView,
+    executionReady: false,
+  });
+
+  assert.equal(presentation.state, 'unavailable');
+  assert.equal(presentation.isTradable, false);
+  assert.equal(shouldHoldContractMarketViewBootstrap({
+    marketView,
+    graceActive: true,
+    executionReady: false,
+  }), true);
+  assert.equal(resolveContractMarketViewAuthorityPresentation({
+    marketView,
+    executionReady: true,
+  }).state, 'live');
+});
+
 test('STALE and FALLBACK display states never become realtime UI states', () => {
   for (const displayState of ['STALE', 'FALLBACK', 'LAST_GOOD_BBO']) {
     const marketView = createMarketView({ display_state: displayState });
@@ -156,6 +177,43 @@ test('STALE and FALLBACK display states never become realtime UI states', () => 
     marketView: createMarketView({ display_state: 'CLOSED', executable: false }),
   });
   assert.equal(shouldExposeContractMarketDepth(closedPresentation), false);
+});
+
+test('bounded bootstrap masks only transient unavailable states and remains fail closed', () => {
+  const unavailable = createMarketView({
+    display_state: 'MARKET_DATA_UNAVAILABLE',
+    executable: false,
+    execution_bid: null,
+    execution_ask: null,
+  });
+  assert.equal(shouldHoldContractMarketViewBootstrap({
+    marketView: unavailable,
+    graceActive: true,
+  }), true);
+  const loadingPresentation = resolveContractMarketViewAuthorityPresentation({
+    marketView: unavailable,
+    loading: true,
+  });
+  assert.equal(loadingPresentation.state, 'loading');
+  assert.equal(loadingPresentation.isTradable, false);
+
+  assert.equal(shouldHoldContractMarketViewBootstrap({
+    marketView: unavailable,
+    graceActive: false,
+  }), false);
+  assert.equal(resolveContractMarketViewAuthorityPresentation({
+    marketView: unavailable,
+  }).state, 'unavailable');
+
+  const preMarket = createMarketView({ display_state: 'PRE_MARKET', executable: false });
+  assert.equal(shouldHoldContractMarketViewBootstrap({
+    marketView: preMarket,
+    graceActive: true,
+  }), false);
+  assert.equal(resolveContractMarketViewAuthorityPresentation({
+    marketView: preMarket,
+    loading: true,
+  }).state, 'pre_market');
 });
 
 test('leaf components do not rebuild display price, freshness, or session authority', () => {
