@@ -51,6 +51,8 @@ const CONTRACT_SYMBOL_OPTIONS = [
   { contractSymbol: DEFAULT_CONTRACT_SYMBOL, marketSymbol: 'BTCUSDT', pricePrecision: 1 },
 ];
 const CONTRACT_SYMBOL_REQUEST_CACHE_MS = 5_000;
+const CONTRACT_SYMBOL_CATALOG_PAGE_SIZE = 100;
+const CONTRACT_SYMBOL_CATALOG_MAX_PAGES = 10;
 type ContractSymbolRequestEntry = {
   promise: Promise<ContractSymbolListResponse> | null;
   response: ContractSymbolListResponse | null;
@@ -83,6 +85,45 @@ function loadContractSymbols(params: Parameters<typeof getContractSymbols>[0]) {
     contractSymbolRequestStore.delete(key);
   });
   return promise;
+}
+
+async function loadContractSymbolCatalog(): Promise<ContractSymbolListResponse> {
+  const firstPage = await loadContractSymbols({
+    category: 'all',
+    quote: 'all',
+    page: 1,
+    page_size: CONTRACT_SYMBOL_CATALOG_PAGE_SIZE,
+  });
+  const total = Math.max(0, Number(firstPage.total) || firstPage.items.length);
+  const pageCount = Math.min(
+    CONTRACT_SYMBOL_CATALOG_MAX_PAGES,
+    Math.max(1, Math.ceil(total / CONTRACT_SYMBOL_CATALOG_PAGE_SIZE)),
+  );
+  const remainingPages = pageCount > 1
+    ? await Promise.all(Array.from({ length: pageCount - 1 }, (_, index) => (
+        loadContractSymbols({
+          category: 'all',
+          quote: 'all',
+          page: index + 2,
+          page_size: CONTRACT_SYMBOL_CATALOG_PAGE_SIZE,
+        })
+      )))
+    : [];
+  const itemsBySymbol = new Map<string, ContractSymbolItem>();
+  for (const response of [firstPage, ...remainingPages]) {
+    for (const item of response.items) {
+      const symbol = normalizeContractSymbol(item.symbol);
+      if (symbol && !itemsBySymbol.has(symbol)) itemsBySymbol.set(symbol, item);
+    }
+  }
+  const items = [...itemsBySymbol.values()];
+  return {
+    ...firstPage,
+    items,
+    total: Math.max(total, items.length),
+    page: 1,
+    page_size: CONTRACT_SYMBOL_CATALOG_PAGE_SIZE,
+  };
 }
 
 function getContractSymbol(marketSymbol: string) {
@@ -626,9 +667,7 @@ function ContractPageContent() {
   const refreshContractPairs = useCallback(async () => {
     setContractPairsLoading(true);
     const bootstrapSymbol = initialContractSymbolRef.current;
-    let catalogLoaded = false;
-
-    try {
+    const bootstrapTask = (async () => {
       const bootstrapResponse = await loadContractSymbols({
         keyword: bootstrapSymbol,
         page: 1,
@@ -639,18 +678,16 @@ function ContractPageContent() {
       );
       if (bootstrapItem) {
         const bootstrapPair = buildContractPairOption(bootstrapItem, t);
-        setContractPairs((previous) => [
-          bootstrapPair,
-          ...previous.filter((item) => item.symbol !== bootstrapPair.symbol),
-        ]);
+        setContractPairs((previous) => {
+          const existingIndex = previous.findIndex((item) => item.symbol === bootstrapPair.symbol);
+          if (existingIndex < 0) return [bootstrapPair, ...previous];
+          return previous.map((item, index) => index === existingIndex ? bootstrapPair : item);
+        });
       }
-    } catch {
-      // The full catalog remains the fail-closed metadata fallback.
-    }
+    })();
 
-    try {
-      const contractResponse = await loadContractSymbols({ category: 'all', quote: 'all', page: 1, page_size: 100 });
-      catalogLoaded = true;
+    const catalogTask = (async () => {
+      const contractResponse = await loadContractSymbolCatalog();
       const catalogPairs = contractResponse.items.map((item) => buildContractPairOption(item, t));
       setContractPairs((previous) => {
         const bootstrapPair = previous.find((item) => item.symbol === bootstrapSymbol) || null;
@@ -659,16 +696,24 @@ function ContractPageContent() {
         }
         return [bootstrapPair, ...catalogPairs];
       });
-    } catch {
+    })();
+
+    const [bootstrapResult, catalogResult] = await Promise.allSettled([
+      bootstrapTask,
+      catalogTask,
+    ]);
+    if (bootstrapResult.status === 'rejected') {
+      // The full catalog remains the fail-closed metadata fallback.
+    }
+    if (catalogResult.status === 'rejected') {
       setContractPairs((previous) => {
         if (previous.some((item) => item.symbol === DEFAULT_CONTRACT_SYMBOL)) return previous;
         return [getFallbackContractPair(DEFAULT_CONTRACT_SYMBOL, 1, t), ...previous];
       });
-    } finally {
-      setContractPairsLoaded(true);
-      setContractPairsLoading(false);
     }
-    return catalogLoaded;
+    setContractPairsLoaded(true);
+    setContractPairsLoading(false);
+    return catalogResult.status === 'fulfilled';
   }, [t]);
 
   const handleToolbarPairQueryChange = useCallback((query: PairQueryUpdate) => {

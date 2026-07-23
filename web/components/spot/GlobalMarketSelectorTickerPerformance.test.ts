@@ -1,10 +1,23 @@
 import { describe, expect, it } from '@jest/globals';
 import {
   getContractTickerPrefetchSymbols,
+  isTransientContractTickerStartupError,
   resolveContractSelectorTickerAuthority,
   resolveSelectorPricePrecision,
   type GlobalMarketSelectorPair,
 } from './GlobalMarketSelector';
+
+describe('contract selector ticker startup retry policy', () => {
+  it.each([502, 503, 504])('retries transient HTTP %s proxy failures', (status) => {
+    expect(isTransientContractTickerStartupError(new Error(`HTTP Error ${status}:`))).toBe(true);
+  });
+
+  it('retries network failures but not ordinary client errors or aborts', () => {
+    expect(isTransientContractTickerStartupError(Object.assign(new Error('Network error'), { code: 'NETWORK_ERROR' }))).toBe(true);
+    expect(isTransientContractTickerStartupError(new Error('HTTP Error 404: Not Found'))).toBe(false);
+    expect(isTransientContractTickerStartupError(new DOMException('Aborted', 'AbortError'))).toBe(false);
+  });
+});
 
 const pairs: GlobalMarketSelectorPair[] = [
   {

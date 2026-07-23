@@ -683,15 +683,16 @@ export function getContractSymbols(params: {
 export function getContractTickers(params: {
   symbols?: string | string[]
   limit?: number
-} = {}): Promise<ContractTickerListResponse> {
+} = {}, options: Pick<RequestInit, 'signal'> & { maxRetries?: number } = {}): Promise<ContractTickerListResponse> {
   const selectedSymbols = Array.isArray(params.symbols)
     ? params.symbols.map((item) => String(item || '').trim().toUpperCase()).filter(Boolean).join(',')
     : params.symbols
+  const { maxRetries = 1, ...requestOptions } = options
 
   return request<ContractTickerListResponse>(withQuery('/contract/market/tickers', {
     symbols: selectedSymbols,
     limit: params.limit,
-  }))
+  }), requestOptions, 0, maxRetries)
 }
 
 export async function getContractDepth(symbol: string, limit = 20): Promise<ContractDepth> {

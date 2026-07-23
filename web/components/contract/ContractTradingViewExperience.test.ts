@@ -34,13 +34,19 @@ describe('Contract TradingView bootstrap experience', () => {
     expect(pageSource).toContain('amountPrecision={currentContractPair?.amountPrecision ?? null}');
   });
 
-  test('loads current symbol metadata before the full selector catalog', () => {
+  test('loads current symbol metadata in parallel with the paginated selector catalog', () => {
     const bootstrapRequestIndex = pageSource.indexOf('keyword: bootstrapSymbol');
-    const catalogRequestIndex = pageSource.indexOf("loadContractSymbols({ category: 'all'");
+    const catalogRequestIndex = pageSource.indexOf('const catalogTask = (async () => {');
 
     expect(bootstrapRequestIndex).toBeGreaterThan(-1);
     expect(catalogRequestIndex).toBeGreaterThan(bootstrapRequestIndex);
     expect(pageSource).toContain('page_size: 1');
+    expect(pageSource).toContain('const CONTRACT_SYMBOL_CATALOG_PAGE_SIZE = 100;');
+    expect(pageSource).toContain('Math.ceil(total / CONTRACT_SYMBOL_CATALOG_PAGE_SIZE)');
+    expect(pageSource).toContain('await Promise.all(Array.from({ length: pageCount - 1 }');
+    expect(pageSource).toContain('await Promise.allSettled([');
+    expect(pageSource).toContain('bootstrapTask,');
+    expect(pageSource).toContain('catalogTask,');
     expect(pageSource).toContain('The full catalog remains the fail-closed metadata fallback.');
     expect(pageSource).toContain('const retryDelays = [1000, 2000, 5000, 10000]');
     expect(pageSource).toContain('if (disposed || loaded) return;');
