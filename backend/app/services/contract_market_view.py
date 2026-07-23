@@ -858,6 +858,8 @@ def build_contract_market_view(
         "market_type": MARKET_TYPE_CONTRACT,
         "category": category,
         "market_status": market_status,
+        "market_session_type": trading_session.session_type,
+        "session_reason_code": trading_session.reason_code,
         "display_state": display_state,
         "display_price": _format_decimal(display_price),
         "display_price_source": display_price_source,

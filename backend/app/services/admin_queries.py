@@ -11035,6 +11035,11 @@ def _admin_contract_symbol_row(row: Dict[str, Any]) -> Dict[str, Any]:
     closed_market_execution_mode = str(row.get("closed_market_execution_mode") or "DISABLED").strip().upper()
     if closed_market_execution_mode not in {"DISABLED", "LAST_GOOD_BBO"}:
         closed_market_execution_mode = "DISABLED"
+    session_profile_code = str(row.get("session_profile_code") or "UNKNOWN").strip().upper()
+    holiday_calendar_code = str(row.get("holiday_calendar_code") or "").strip().upper()
+    extended_hours_execution_mode = str(
+        row.get("extended_hours_execution_mode") or "DISPLAY_ONLY"
+    ).strip().upper()
     return {
         "id": row.get("id"),
         "symbol": row.get("symbol") or "",
@@ -11049,6 +11054,10 @@ def _admin_contract_symbol_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "closed_market_execution_mode_label": (
             "最后有效买卖价（仅诊断）" if closed_market_execution_mode == "LAST_GOOD_BBO" else "闭市不可交易"
         ),
+        "holiday_calendar_code": holiday_calendar_code,
+        "session_profile_code": session_profile_code,
+        "session_timezone_override": str(row.get("session_timezone_override") or "").strip(),
+        "extended_hours_execution_mode": extended_hours_execution_mode,
         "price_precision": int(row.get("price_precision") or 0),
         "quantity_precision": int(row.get("quantity_precision") or 0),
         "min_quantity": _admin_trade_quantity_display(row.get("min_quantity")),
@@ -11098,6 +11107,12 @@ def _contract_symbol_form_from_payload(payload: Dict[str, Any], existing_symbol:
         "quote_asset": _normalize_code(payload.get("quote_asset") or "USDT"),
         "tp_sl_trigger_price_type": str(payload.get("tp_sl_trigger_price_type") or "MARK_PRICE").strip().upper(),
         "closed_market_execution_mode": mode,
+        "holiday_calendar_code": _normalize_code(payload.get("holiday_calendar_code")),
+        "session_profile_code": _normalize_code(payload.get("session_profile_code")),
+        "session_timezone_override": str(payload.get("session_timezone_override") or "").strip(),
+        "extended_hours_execution_mode": str(
+            payload.get("extended_hours_execution_mode") or "DISPLAY_ONLY"
+        ).strip().upper(),
         "price_precision": str(payload.get("price_precision") or "8").strip(),
         "quantity_precision": str(payload.get("quantity_precision") or "8").strip(),
         "min_quantity": str(payload.get("min_quantity") or "").strip(),
@@ -11117,6 +11132,16 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
     provider_options = {"BINANCE", "ITICK", "INTERNAL"}
     trigger_price_type_options = {"MARK_PRICE", "LAST_PRICE"}
     closed_market_execution_mode_options = {"DISABLED", "LAST_GOOD_BBO"}
+    session_profile_options = {
+        "CRYPTO_24_7",
+        "US_EQUITY",
+        "US_INDEX_EXTENDED",
+        "FOREX_24X5",
+        "METAL_23X5",
+        "ENERGY_CFD",
+    }
+    holiday_calendar_options = {"", "US", "GB"}
+    extended_hours_execution_mode_options = {"DISPLAY_ONLY", "BLOCKED"}
 
     if is_create and not form["symbol"]:
         errors.append("合约代码不能为空")
@@ -11137,6 +11162,35 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
         errors.append("TP/SL trigger price type is invalid")
     if form["closed_market_execution_mode"] not in closed_market_execution_mode_options:
         errors.append("闭市成交模式无效")
+    if form["session_profile_code"] not in session_profile_options:
+        errors.append("交易时段模板不能为空或无效")
+    if form["holiday_calendar_code"] not in holiday_calendar_options:
+        errors.append("假期日历无效")
+    if form["session_profile_code"] in {"US_EQUITY", "US_INDEX_EXTENDED"} and form["holiday_calendar_code"] != "US":
+        errors.append("美股和美国指数时段必须使用 US 假期日历")
+    expected_profile_by_category = {
+        "CRYPTO": "CRYPTO_24_7",
+        "STOCK": "US_EQUITY",
+        "INDEX": "US_INDEX_EXTENDED",
+        "FOREX": "FOREX_24X5",
+        "METAL": "METAL_23X5",
+        "GOLD": "METAL_23X5",
+        "COMMODITY": "ENERGY_CFD",
+        "FUTURES": "ENERGY_CFD",
+    }
+    expected_profile = expected_profile_by_category.get(form["category"])
+    if expected_profile and form["session_profile_code"] != expected_profile:
+        errors.append(f"当前品种类型必须使用交易时段模板 {expected_profile}")
+    if form["category"] == "CFD" and form["session_profile_code"] == "CRYPTO_24_7":
+        errors.append("CFD 品种不能使用数字货币 24×7 时段模板")
+    if form["extended_hours_execution_mode"] not in extended_hours_execution_mode_options:
+        errors.append("盘前盘后执行模式无效")
+    timezone_override = form["session_timezone_override"]
+    if timezone_override:
+        try:
+            ZoneInfo(timezone_override)
+        except Exception:
+            errors.append("时区覆盖必须是有效的 IANA 时区，例如 America/New_York")
 
     price_precision = _parse_int(form["price_precision"], -1)
     quantity_precision = _parse_int(form["quantity_precision"], -1)
@@ -11175,6 +11229,10 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
         "status": _parse_int(form["status"], 1),
         "tp_sl_trigger_price_type": form["tp_sl_trigger_price_type"],
         "closed_market_execution_mode": form["closed_market_execution_mode"],
+        "holiday_calendar_code": form["holiday_calendar_code"] or None,
+        "session_profile_code": form["session_profile_code"],
+        "session_timezone_override": timezone_override or None,
+        "extended_hours_execution_mode": form["extended_hours_execution_mode"],
     }
     return values, errors
 
@@ -11185,7 +11243,9 @@ def admin_get_contract_symbol(db: Session, symbol_id: int) -> Dict[str, Any]:
             """
             SELECT
                 id, symbol, display_name, category, provider, provider_symbol,
-                quote_asset, tp_sl_trigger_price_type, closed_market_execution_mode, price_precision, quantity_precision, min_quantity,
+                quote_asset, tp_sl_trigger_price_type, closed_market_execution_mode,
+                holiday_calendar_code, session_profile_code, session_timezone_override,
+                extended_hours_execution_mode, price_precision, quantity_precision, min_quantity,
                 max_quantity, min_margin, max_leverage, spread_x,
                 liquidation_threshold, warning_threshold, status, created_at, updated_at
             FROM contract_symbols
@@ -11210,12 +11270,16 @@ def admin_create_contract_symbol(db: Session, payload: Dict[str, Any]) -> Dict[s
                 INSERT INTO contract_symbols (
                     symbol, display_name, category, provider, provider_symbol, quote_asset,
                     tp_sl_trigger_price_type, closed_market_execution_mode,
+                    holiday_calendar_code, session_profile_code, session_timezone_override,
+                    extended_hours_execution_mode,
                     price_precision, quantity_precision, min_quantity, max_quantity,
                     min_margin, max_leverage, spread_x, liquidation_threshold,
                     warning_threshold, status, created_at, updated_at
                 ) VALUES (
                     :symbol, :display_name, :category, :provider, :provider_symbol, :quote_asset,
                     :tp_sl_trigger_price_type, :closed_market_execution_mode,
+                    :holiday_calendar_code, :session_profile_code, :session_timezone_override,
+                    :extended_hours_execution_mode,
                     :price_precision, :quantity_precision, :min_quantity, :max_quantity,
                     :min_margin, :max_leverage, :spread_x, :liquidation_threshold,
                     :warning_threshold, :status, UTC_TIMESTAMP(), UTC_TIMESTAMP()
@@ -11260,6 +11324,10 @@ def admin_update_contract_symbol(db: Session, symbol_id: int, payload: Dict[str,
                     quote_asset = :quote_asset,
                     tp_sl_trigger_price_type = :tp_sl_trigger_price_type,
                     closed_market_execution_mode = :closed_market_execution_mode,
+                    holiday_calendar_code = :holiday_calendar_code,
+                    session_profile_code = :session_profile_code,
+                    session_timezone_override = :session_timezone_override,
+                    extended_hours_execution_mode = :extended_hours_execution_mode,
                     price_precision = :price_precision,
                     quantity_precision = :quantity_precision,
                     min_quantity = :min_quantity,
@@ -11355,6 +11423,10 @@ def admin_query_contract_symbols(db: Session, filters: Optional[Dict[str, Any]] 
                     cs.quote_asset,
                     cs.tp_sl_trigger_price_type,
                     cs.closed_market_execution_mode,
+                    cs.holiday_calendar_code,
+                    cs.session_profile_code,
+                    cs.session_timezone_override,
+                    cs.extended_hours_execution_mode,
                     cs.price_precision,
                     cs.quantity_precision,
                     cs.min_quantity,

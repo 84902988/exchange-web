@@ -59,6 +59,9 @@ def executable_contract_quote_rejection_reason(
     quote_freshness = _normalized(quote.get("quote_freshness") if isinstance(quote, dict) else None)
     source = _normalized((quote.get("quote_source") or quote.get("source")) if isinstance(quote, dict) else None)
     market_status = _normalized(quote.get("market_status") if isinstance(quote, dict) else None)
+    execution_state = _normalized(quote.get("execution_state") if isinstance(quote, dict) else None)
+    if execution_state in {"DISPLAY_ONLY", "BLOCKED"}:
+        return _normalized(quote.get("session_reason_code") or execution_state).lower()
     trading_session = resolve_contract_trading_session(
         contract_symbol=contract_symbol,
         quote=quote,

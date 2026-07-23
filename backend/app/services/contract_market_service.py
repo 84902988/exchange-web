@@ -18,8 +18,19 @@ from app.db.models.contract_symbol import ContractSymbol
 from app.services.binance_market_service import BinanceMarketServiceError, binance_market_service
 from app.services.itick_holiday_service import (
     MARKET_STATUS_CLOSED,
+    MARKET_STATUS_HOLIDAY,
+    MARKET_STATUS_TEXT_CLOSED,
+    MARKET_STATUS_TEXT_OPEN,
+    MARKET_STATUS_TEXT_UNKNOWN,
+    MARKET_STATUS_UNKNOWN,
     ItickMarketStatus,
     itick_holiday_service,
+)
+from app.services.contract_session_authority import contract_session_authority
+from app.services.contract_session_profiles import (
+    SESSION_HOLIDAY,
+    SESSION_REGULAR_OPEN,
+    SESSION_UNKNOWN,
 )
 from app.services.itick_market_service import ItickMarketServiceError, itick_market_service
 from app.services.contract_itick_market_resolver import (
@@ -64,9 +75,9 @@ from app.services.contract_ticker_evidence import resolve_contract_ticker_24h_ev
 
 logger = logging.getLogger(__name__)
 
-CONTRACT_MARKET_SESSION_POLICY_VERSION = "v1"
+CONTRACT_MARKET_SESSION_POLICY_VERSION = "v2"
 CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION = "ld"
-CONTRACT_MARKET_STATUS_VERSION = "v2.2"
+CONTRACT_MARKET_STATUS_VERSION = "v3"
 MARKET_STATUS_OPEN = "OPEN"
 _PROVIDER_MARKET_STATUS_TEXT_OPEN = "交易中"
 _PROVIDER_MARKET_STATUS_TEXT_CLOSED = "休市中 · 平台报价"
@@ -432,6 +443,40 @@ def _market_status_for_contract_symbol(
     contract_symbol: ContractSymbol,
     payload: Optional[dict[str, Any]] = None,
 ) -> ItickMarketStatus:
+    configured_profile = str(
+        getattr(contract_symbol, "session_profile_code", "") or ""
+    ).strip().upper()
+    if configured_profile and configured_profile != "UNKNOWN":
+        decision = contract_session_authority.resolve(
+            contract_symbol=contract_symbol,
+            quote=payload,
+            feed_state=_quote_freshness_for_payload(payload) if isinstance(payload, dict) else None,
+        )
+        if decision.session_state == SESSION_REGULAR_OPEN:
+            market_status = MARKET_STATUS_OPEN
+            market_status_text = MARKET_STATUS_TEXT_OPEN
+        elif decision.session_state == SESSION_HOLIDAY:
+            market_status = MARKET_STATUS_HOLIDAY
+            market_status_text = MARKET_STATUS_TEXT_CLOSED
+        elif decision.session_state == SESSION_UNKNOWN:
+            market_status = MARKET_STATUS_UNKNOWN
+            market_status_text = MARKET_STATUS_TEXT_UNKNOWN
+        else:
+            market_status = MARKET_STATUS_CLOSED
+            market_status_text = MARKET_STATUS_TEXT_CLOSED
+        return ItickMarketStatus(
+            market_status=market_status,
+            market_status_text=market_status_text,
+            market_session_code=decision.holiday_calendar_code,
+            market_timezone=decision.timezone_name,
+            market_trading_hours=decision.trading_hours,
+            market_session_type=decision.session_state,
+            feed_state=decision.feed_state,
+            instrument_state=decision.instrument_state,
+            execution_state=decision.execution_state,
+            session_reason_code=decision.reason_code,
+        )
+
     category = _contract_asset_category(contract_symbol)
     provider = str(getattr(contract_symbol, "provider", "") or "").strip().upper()
     if provider != "ITICK":
@@ -583,7 +628,13 @@ def _is_holiday_date(rows: Optional[list[dict[str, Any]]], day: date_cls) -> boo
     if not rows:
         return False
     day_text = day.isoformat()
-    return any(itick_holiday_service._date_matches(row.get("d"), day_text) for row in rows if isinstance(row, dict))
+    for row in rows:
+        if not isinstance(row, dict) or not itick_holiday_service._date_matches(row.get("d"), day_text):
+            continue
+        if itick_holiday_service._early_close_time(str(row.get("v") or "")) is not None:
+            return False
+        return True
+    return False
 
 
 def _is_trading_day(day: date_cls, rows: Optional[list[dict[str, Any]]]) -> bool:
@@ -718,6 +769,9 @@ def _payload_quote_executable(
     contract_symbol: Optional[ContractSymbol] = None,
     require_mark_price: bool = False,
 ) -> bool:
+    execution_state = str(payload.get("execution_state") or "").strip().upper()
+    if execution_state in {"DISPLAY_ONLY", "BLOCKED"}:
+        return False
     return (
         executable_contract_quote_rejection_reason(
             payload,
@@ -3933,9 +3987,8 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
         else:
             raise ContractQuoteUnavailable(f"provider {provider} quote is unavailable")
 
-        if provider == "ITICK":
-            market_status = _market_status_for_contract_symbol(contract_symbol, quote)
-            is_closed_market = _is_market_closed(market_status)
+        market_status = _market_status_for_contract_symbol(contract_symbol, quote)
+        is_closed_market = _is_market_closed(market_status)
         if provider == "ITICK" and not is_closed_market:
             quote = _quote_from_open_market_depth_if_live(
                 contract_symbol,
@@ -4594,9 +4647,8 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
         else:
             raise ContractQuoteUnavailable(f"provider {provider} depth is unavailable")
 
-        if provider == "ITICK":
-            market_status = _market_status_for_contract_symbol(contract_symbol, depth)
-            is_closed_market = _is_market_closed(market_status)
+        market_status = _market_status_for_contract_symbol(contract_symbol, depth)
+        is_closed_market = _is_market_closed(market_status)
         depth["price_precision"] = int(getattr(contract_symbol, "price_precision", depth.get("price_precision") or 8) or 8)
         depth = _freeze_depth_if_closed(depth, market_status, limit=safe_limit, prefer_cached=not is_closed_market)
         if (
@@ -5519,6 +5571,10 @@ def contract_quote_to_response(quote: dict[str, Any]) -> dict[str, Any]:
         "market_timezone": quote.get("market_timezone"),
         "market_trading_hours": quote.get("market_trading_hours"),
         "market_session_type": quote.get("market_session_type"),
+        "feed_state": quote.get("feed_state"),
+        "instrument_state": quote.get("instrument_state"),
+        "execution_state": quote.get("execution_state"),
+        "session_reason_code": quote.get("session_reason_code"),
         "quote_freshness": quote_freshness,
         "quote_source": quote_source,
         "closed_market_execution_mode": quote.get("closed_market_execution_mode") or "DISABLED",
@@ -5571,6 +5627,10 @@ def contract_depth_to_response(depth: dict[str, Any]) -> dict[str, Any]:
         "market_timezone": depth.get("market_timezone"),
         "market_trading_hours": depth.get("market_trading_hours"),
         "market_session_type": depth.get("market_session_type"),
+        "feed_state": depth.get("feed_state"),
+        "instrument_state": depth.get("instrument_state"),
+        "execution_state": depth.get("execution_state"),
+        "session_reason_code": depth.get("session_reason_code"),
         "quote_freshness": quote_freshness,
         "quote_source": quote_source,
         "depth_mode": depth.get("depth_mode") or DEPTH_MODE_FULL_DEPTH,
