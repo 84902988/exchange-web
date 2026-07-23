@@ -132,6 +132,8 @@ type SpotMarketRealtimeConnection = {
   ws: WebSocket | null;
   connectTimer: number | null;
   reconnectTimer: number | null;
+  lastActivityAtMs: number;
+  reconnectAttempt: number;
   status: SpotMarketConnectionStatus;
   closedByClient: boolean;
   domains: Map<SpotMarketRealtimeDomain, Set<string>>;
@@ -139,6 +141,11 @@ type SpotMarketRealtimeConnection = {
 };
 
 const BASE_INTERVAL = '1m';
+const SPOT_WS_HEARTBEAT_INTERVAL_MS = 18_000;
+const SPOT_WS_ACTIVITY_TIMEOUT_MS = 36_000;
+const SPOT_WS_RECONNECT_BASE_MS = 1_500;
+const SPOT_WS_RECONNECT_MAX_MS = 30_000;
+const SPOT_WS_RECONNECT_JITTER_RATIO = 0.2;
 const SPOT_KLINE_INTERVAL_ALIASES: Record<string, string> = {
   '1m': '1m',
   '5m': '5m',
@@ -203,6 +210,8 @@ class SpotMarketRealtimeClient {
   private handlers = new Map<SpotMarketRealtimeEventType, Set<SpotMarketRealtimeHandler>>();
   private statusHandlers = new Set<SpotMarketRealtimeStatusHandler>();
   private status: SpotMarketConnectionStatus = 'closed';
+  private heartbeatTimer: number | null = null;
+  private lifecycleListenersAttached = false;
 
   setSymbol(symbol: string, interval = '1m') {
     if (this.legacySubscriptionId) {
@@ -488,6 +497,8 @@ class SpotMarketRealtimeClient {
     this.connections.clear();
     this.subscriptions.clear();
     this.legacySubscriptionId = null;
+    this.stopHeartbeat();
+    this.detachLifecycleListeners();
     this.setStatus('closed');
   }
 
@@ -502,6 +513,8 @@ class SpotMarketRealtimeClient {
       ws: null,
       connectTimer: null,
       reconnectTimer: null,
+      lastActivityAtMs: 0,
+      reconnectAttempt: 0,
       status: 'closed',
       closedByClient: false,
       domains: new Map<SpotMarketRealtimeDomain, Set<string>>(),
@@ -514,6 +527,7 @@ class SpotMarketRealtimeClient {
   private ensureConnectionOpen(connection: SpotMarketRealtimeConnection) {
     if (typeof window === 'undefined') return;
     connection.closedByClient = false;
+    this.attachLifecycleListeners();
 
     if (
       connection.ws &&
@@ -547,12 +561,21 @@ class SpotMarketRealtimeClient {
       source: 'marketRealtime',
       activeKlineIntervals: Array.from(connection.klineIntervals.keys()),
     });
-    const ws = new WebSocket(buildSpotWsUrl(connection.symbol));
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(buildSpotWsUrl(connection.symbol));
+    } catch {
+      this.setConnectionStatus(connection, 'closed');
+      this.scheduleReconnect(connection);
+      return;
+    }
     connection.ws = ws;
 
     ws.onopen = () => {
       if (connection.ws !== ws) return;
+      connection.lastActivityAtMs = Date.now();
       this.setConnectionStatus(connection, 'open');
+      this.startHeartbeat();
       markSpotKlinePerf('ws_open', {
         symbol: connection.symbol,
         source: 'marketRealtime',
@@ -563,6 +586,9 @@ class SpotMarketRealtimeClient {
     };
 
     ws.onmessage = (event) => {
+      if (connection.ws !== ws) return;
+      connection.lastActivityAtMs = Date.now();
+      connection.reconnectAttempt = 0;
       if (event.data === 'pong') return;
 
       try {
@@ -574,14 +600,15 @@ class SpotMarketRealtimeClient {
     };
 
     ws.onerror = () => {
+      if (connection.ws !== ws) return;
       // ignore transient websocket errors in dev
     };
 
     ws.onclose = () => {
-      if (connection.ws === ws) {
-        connection.ws = null;
-      }
+      if (connection.ws !== ws) return;
+      connection.ws = null;
       this.setConnectionStatus(connection, 'closed');
+      this.refreshHeartbeat();
       markSpotKlinePerf('ws_close', {
         symbol: connection.symbol,
         source: 'marketRealtime',
@@ -592,21 +619,45 @@ class SpotMarketRealtimeClient {
 
       if (connection.closedByClient || !this.hasActiveConnectionDomains(connection)) return;
 
-      this.clearConnectionTimer(connection, 'reconnect');
-      connection.reconnectTimer = window.setTimeout(() => {
-        connection.reconnectTimer = null;
-        this.connect(connection);
-      }, 1500);
+      this.scheduleReconnect(connection);
     };
+  }
+
+  private scheduleReconnect(connection: SpotMarketRealtimeConnection) {
+    if (
+      typeof window === 'undefined'
+      || connection.closedByClient
+      || !this.hasActiveConnectionDomains(connection)
+    ) return;
+
+    this.clearConnectionTimer(connection, 'reconnect');
+    const baseDelay = Math.min(
+      SPOT_WS_RECONNECT_BASE_MS * (2 ** connection.reconnectAttempt),
+      SPOT_WS_RECONNECT_MAX_MS,
+    );
+    const jitter = 1 + ((Math.random() * 2 - 1) * SPOT_WS_RECONNECT_JITTER_RATIO);
+    const delay = Math.round(Math.min(
+      baseDelay * jitter,
+      SPOT_WS_RECONNECT_MAX_MS,
+    ));
+    connection.reconnectAttempt += 1;
+    connection.reconnectTimer = window.setTimeout(() => {
+      connection.reconnectTimer = null;
+      if (connection.closedByClient || !this.hasActiveConnectionDomains(connection)) return;
+      this.connect(connection);
+    }, delay);
   }
 
   private closeConnection(connection: SpotMarketRealtimeConnection, reason: string) {
     connection.closedByClient = true;
     this.clearConnectionTimer(connection, 'connect');
     this.clearConnectionTimer(connection, 'reconnect');
+    connection.lastActivityAtMs = 0;
+    connection.reconnectAttempt = 0;
 
     if (!connection.ws) {
       this.setConnectionStatus(connection, 'closed');
+      this.cleanupIdleClientResources();
       return;
     }
 
@@ -618,6 +669,117 @@ class SpotMarketRealtimeClient {
     ws.onclose = null;
     ws.close(1000, reason);
     this.setConnectionStatus(connection, 'closed');
+    this.cleanupIdleClientResources();
+  }
+
+  private startHeartbeat() {
+    if (this.heartbeatTimer !== null || typeof window === 'undefined') return;
+    this.heartbeatTimer = window.setInterval(() => {
+      for (const connection of this.connections.values()) {
+        this.checkConnectionHealth(connection);
+      }
+    }, SPOT_WS_HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer === null || typeof window === 'undefined') return;
+    window.clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  private refreshHeartbeat() {
+    const hasOpenConnection = Array.from(this.connections.values()).some(
+      (connection) => connection.ws?.readyState === WebSocket.OPEN,
+    );
+    if (hasOpenConnection) {
+      this.startHeartbeat();
+    } else {
+      this.stopHeartbeat();
+    }
+  }
+
+  private checkConnectionHealth(connection: SpotMarketRealtimeConnection) {
+    const ws = connection.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (Date.now() - connection.lastActivityAtMs >= SPOT_WS_ACTIVITY_TIMEOUT_MS) {
+      this.reconnectStaleConnection(connection, ws);
+      return;
+    }
+    try {
+      ws.send('ping');
+    } catch {
+      this.reconnectStaleConnection(connection, ws);
+    }
+  }
+
+  private reconnectStaleConnection(
+    connection: SpotMarketRealtimeConnection,
+    ws: WebSocket,
+  ) {
+    if (connection.ws !== ws) return;
+    connection.ws = null;
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.onclose = null;
+    try {
+      ws.close(4000, 'spot market heartbeat timeout');
+    } catch {
+      // The retired socket must not prevent replacement if close itself fails.
+    }
+    this.setConnectionStatus(connection, 'closed');
+    this.refreshHeartbeat();
+    this.scheduleReconnect(connection);
+  }
+
+  private attachLifecycleListeners() {
+    if (this.lifecycleListenersAttached || typeof window === 'undefined') return;
+    window.addEventListener('online', this.handleConnectionOpportunity);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.lifecycleListenersAttached = true;
+  }
+
+  private detachLifecycleListeners() {
+    if (!this.lifecycleListenersAttached || typeof window === 'undefined') return;
+    window.removeEventListener('online', this.handleConnectionOpportunity);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.lifecycleListenersAttached = false;
+  }
+
+  private handleConnectionOpportunity = () => {
+    for (const connection of this.connections.values()) {
+      if (!this.hasActiveConnectionDomains(connection) || connection.closedByClient) continue;
+      if (connection.ws?.readyState === WebSocket.OPEN) {
+        this.checkConnectionHealth(connection);
+        continue;
+      }
+      if (
+        connection.ws?.readyState === WebSocket.CONNECTING
+        || connection.ws?.readyState === WebSocket.CLOSING
+      ) continue;
+      this.clearConnectionTimer(connection, 'reconnect');
+      this.connect(connection);
+    }
+  };
+
+  private handleVisibilityChange = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+      this.handleConnectionOpportunity();
+    }
+  };
+
+  private cleanupIdleClientResources() {
+    this.refreshHeartbeat();
+    const hasActiveConnection = Array.from(this.connections.values()).some(
+      (connection) => this.hasActiveConnectionDomains(connection),
+    );
+    if (!hasActiveConnection) {
+      this.detachLifecycleListeners();
+    }
   }
 
   private dispatch(message: SpotMarketRealtimeMessage, connection: SpotMarketRealtimeConnection) {

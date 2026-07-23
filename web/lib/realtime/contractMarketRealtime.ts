@@ -80,6 +80,11 @@ type CachedContractPreview = Readonly<{
 
 const CONTRACT_PREVIEW_REPLAY_TTL_MS = 15_000;
 const CONTRACT_PREVIEW_REPLAY_MAX_ENTRIES = 12;
+const CONTRACT_WS_HEARTBEAT_INTERVAL_MS = 18_000;
+const CONTRACT_WS_ACTIVITY_TIMEOUT_MS = 36_000;
+const CONTRACT_WS_RECONNECT_BASE_MS = 1_500;
+const CONTRACT_WS_RECONNECT_MAX_MS = 30_000;
+const CONTRACT_WS_RECONNECT_JITTER_RATIO = 0.2;
 
 function normalizeSymbol(symbol: string) {
   return String(symbol || '').trim().toUpperCase();
@@ -195,6 +200,10 @@ export class ContractMarketRealtimeClient {
   private ws: WebSocket | null = null;
   private connectTimer: number | null = null;
   private reconnectTimer: number | null = null;
+  private heartbeatTimer: number | null = null;
+  private lastSocketActivityAtMs = 0;
+  private reconnectAttempt = 0;
+  private lifecycleListenersAttached = false;
   private socketOpenedWithSymbol = '';
   private socketOpenedWithInterval = '1m';
   private requestedSymbol = '';
@@ -586,6 +595,8 @@ export class ContractMarketRealtimeClient {
     this.closedByClient = true;
     this.clearConnectTimer();
     this.clearReconnectTimer();
+    this.stopHeartbeat();
+    this.detachLifecycleListeners();
     this.socketOpenedWithSymbol = '';
     this.socketOpenedWithInterval = '1m';
     this.requestedSymbol = '';
@@ -734,6 +745,8 @@ export class ContractMarketRealtimeClient {
     this.closedByClient = true;
     this.clearConnectTimer();
     this.clearReconnectTimer();
+    this.stopHeartbeat();
+    this.detachLifecycleListeners();
     this.clearLatestPreviews();
     this.protocolMode = 'idle';
     this.setStatus('idle');
@@ -766,6 +779,8 @@ export class ContractMarketRealtimeClient {
 
     this.clearConnectTimer();
     this.clearReconnectTimer();
+    this.stopHeartbeat();
+    this.attachLifecycleListeners();
     // A newly opened socket is a provider-session boundary. Never replay a
     // preview retained from the previous connection generation.
     this.clearLatestPreviews();
@@ -777,6 +792,9 @@ export class ContractMarketRealtimeClient {
     this.ws = ws;
 
     ws.onopen = () => {
+      if (this.ws !== ws) return;
+      this.lastSocketActivityAtMs = Date.now();
+      this.startHeartbeat();
       this.setStatus('connected');
       if (this.protocolMode === 'domain') {
         const activeKline = this.getActiveKlineSessionForSymbol(this.marketSymbol || this.requestedSymbol);
@@ -799,10 +817,14 @@ export class ContractMarketRealtimeClient {
     };
 
     ws.onmessage = (event) => {
+      if (this.ws !== ws) return;
+      this.lastSocketActivityAtMs = Date.now();
+      this.reconnectAttempt = 0;
       if (event.data === 'pong' || event.data === 'ping') return;
 
       try {
         const message = JSON.parse(event.data) as ContractMarketRealtimeMessage;
+        if (String(message.type || '').toLowerCase() === 'pong') return;
         this.dispatch(message);
       } catch (err) {
         console.warn('[contractMarketRealtime] WS parse error:', err);
@@ -810,29 +832,128 @@ export class ContractMarketRealtimeClient {
     };
 
     ws.onerror = () => {
+      if (this.ws !== ws) return;
       this.setStatus('disconnected');
     };
 
     ws.onclose = () => {
-      if (this.ws === ws) {
-        this.ws = null;
-      }
-
-      const reconnectSymbol = this.marketSymbol || this.getActiveKlineSession()?.symbol || this.requestedSymbol;
-      if (this.closedByClient || !reconnectSymbol) {
-        this.setStatus('idle');
-        return;
-      }
-
-      this.clearReconnectTimer();
-      this.setStatus('reconnecting');
-      this.reconnectTimer = window.setTimeout(() => {
-        const nextSymbol = this.marketSymbol || this.getActiveKlineSession()?.symbol || this.requestedSymbol;
-        if (!nextSymbol) return;
-        this.connect(nextSymbol, this.getActiveKlineSession()?.interval || this.requestedInterval);
-      }, 1500);
+      if (this.ws !== ws) return;
+      this.stopHeartbeat();
+      this.ws = null;
+      this.scheduleReconnect();
     };
   }
+
+  private scheduleReconnect() {
+    const reconnectSymbol = this.marketSymbol || this.getActiveKlineSession()?.symbol || this.requestedSymbol;
+    if (this.closedByClient || !reconnectSymbol) {
+      this.setStatus('idle');
+      return;
+    }
+
+    this.clearReconnectTimer();
+    this.setStatus('reconnecting');
+    const baseReconnectDelay = Math.min(
+      CONTRACT_WS_RECONNECT_BASE_MS * (2 ** this.reconnectAttempt),
+      CONTRACT_WS_RECONNECT_MAX_MS,
+    );
+    const reconnectJitter = 1 + (
+      (Math.random() * 2 - 1) * CONTRACT_WS_RECONNECT_JITTER_RATIO
+    );
+    const reconnectDelay = Math.round(Math.min(
+      baseReconnectDelay * reconnectJitter,
+      CONTRACT_WS_RECONNECT_MAX_MS,
+    ));
+    this.reconnectAttempt += 1;
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      const nextSymbol = this.marketSymbol || this.getActiveKlineSession()?.symbol || this.requestedSymbol;
+      if (!nextSymbol) return;
+      this.connect(nextSymbol, this.getActiveKlineSession()?.interval || this.requestedInterval);
+    }, reconnectDelay);
+  }
+
+  private startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatTimer = window.setInterval(() => {
+      this.checkSocketHealth();
+    }, CONTRACT_WS_HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer === null || typeof window === 'undefined') return;
+    window.clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  private checkSocketHealth() {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const inactiveForMs = Date.now() - this.lastSocketActivityAtMs;
+    if (inactiveForMs >= CONTRACT_WS_ACTIVITY_TIMEOUT_MS) {
+      this.reconnectStaleSocket(ws);
+      return;
+    }
+    try {
+      ws.send('ping');
+    } catch {
+      this.reconnectStaleSocket(ws);
+    }
+  }
+
+  private reconnectStaleSocket(ws: WebSocket) {
+    if (this.ws !== ws) return;
+    this.ws = null;
+    this.stopHeartbeat();
+    this.setStatus('reconnecting');
+    // Keep the current owners intact; the replacement socket replays their
+    // market/K-line subscriptions after the backoff expires.
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.onclose = null;
+    try {
+      ws.close(4000, 'contract market heartbeat timeout');
+    } catch {
+      // The retired socket must not prevent replacement if close itself fails.
+    }
+    this.scheduleReconnect();
+  }
+
+  private attachLifecycleListeners() {
+    if (this.lifecycleListenersAttached || typeof window === 'undefined') return;
+    window.addEventListener('online', this.handleConnectionOpportunity);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.lifecycleListenersAttached = true;
+  }
+
+  private detachLifecycleListeners() {
+    if (!this.lifecycleListenersAttached || typeof window === 'undefined') return;
+    window.removeEventListener('online', this.handleConnectionOpportunity);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.lifecycleListenersAttached = false;
+  }
+
+  private handleConnectionOpportunity = () => {
+    if (this.closedByClient || !this.requestedSymbol) return;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.checkSocketHealth();
+      return;
+    }
+    if (this.ws?.readyState === WebSocket.CONNECTING) return;
+    this.clearReconnectTimer();
+    this.connect(this.requestedSymbol, this.getActiveKlineSession()?.interval || this.requestedInterval);
+  };
+
+  private handleVisibilityChange = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+      this.handleConnectionOpportunity();
+    }
+  };
 
   private sendLegacySubscribeIfOpen(symbol: string, interval = '1m') {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
