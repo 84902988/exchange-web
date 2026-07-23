@@ -1122,20 +1122,19 @@ def get_contract_market_view(db: Session, symbol: str) -> dict[str, Any]:
     contract_symbol = (
         db.query(ContractSymbol)
         .filter(ContractSymbol.symbol == normalized_symbol)
+        .filter(ContractSymbol.status == 1)
         .first()
     )
+    if contract_symbol is None:
+        # Administrative availability is the public control-plane authority.
+        # Do not resurrect a disabled symbol from residual gateway snapshots.
+        raise ContractSymbolNotFound(
+            f"contract symbol {normalized_symbol} not found or disabled"
+        )
     authority = get_contract_market_snapshot_authority(
         normalized_symbol,
         interval=DEFAULT_KLINE_INTERVAL,
     )
-    snapshots = (
-        authority.get("ticker"),
-        authority.get("depth"),
-        authority.get("trades"),
-        authority.get("kline"),
-    )
-    if contract_symbol is None and not any(snapshot is not None for snapshot in snapshots):
-        raise ContractSymbolNotFound(f"contract symbol {normalized_symbol} not found")
     return build_contract_market_view_v2(
         normalized_symbol,
         ticker_snapshot=authority.get("ticker"),

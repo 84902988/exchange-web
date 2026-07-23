@@ -17,6 +17,9 @@ from app.core.content_locale import resolve_content_locale
 from app.db.session import SessionLocal, get_db
 from app.schemas.market import DepthResponse, KlineResponse, TradesResponse
 from app.services.market import (
+    _get_active_pair,
+    filter_active_mobile_market_overview,
+    filter_active_trading_pair_rows,
     get_depth,
     get_klines,
     get_mobile_market_overview,
@@ -112,11 +115,12 @@ def get_tickers(
         query_params=query_params,
     )
     try:
-        return cache_fetch_json(
+        payload = cache_fetch_json(
             cache_key,
             15,
             lambda: get_market_tickers(db=db, symbol=normalized_symbol or None, symbols=",".join(normalized_symbols) or None),
         )
+        return filter_active_trading_pair_rows(db, payload if isinstance(payload, list) else [])
     except Exception:
         logger.exception("get tickers failed")
         raise HTTPException(status_code=500, detail="get tickers failed")
@@ -152,30 +156,18 @@ def get_pairs(
     normalized_keyword = str(keyword or "").strip()
     normalized_page = max(int(page or 1), 1)
     normalized_page_size = max(1, min(int(page_size or 50), 100))
-    cache_key = market_cache_key(
-        "global_selector:pairs:v5",
-        {
-            "market_type": normalized_market_type,
-            "category": normalized_category,
-            "quote": normalized_quote,
-            "keyword": normalized_keyword,
-            "page": normalized_page,
-            "page_size": normalized_page_size,
-        },
-    )
     try:
-        return cache_fetch_json(
-            cache_key,
-            120,
-            lambda: get_market_pairs(
-                db=db,
-                market_type=normalized_market_type,
-                category=normalized_category,
-                quote=normalized_quote,
-                keyword=normalized_keyword or None,
-                page=normalized_page,
-                page_size=normalized_page_size,
-            ),
+        # Enable/disable belongs to the administrative control plane. Keep
+        # market-data caches, but read pair membership from the indexed table
+        # on every catalog request so disabled symbols disappear immediately.
+        return get_market_pairs(
+            db=db,
+            market_type=normalized_market_type,
+            category=normalized_category,
+            quote=normalized_quote,
+            keyword=normalized_keyword or None,
+            page=normalized_page,
+            page_size=normalized_page_size,
         )
     except Exception:
         logger.exception("get pairs failed")
@@ -199,6 +191,7 @@ def mobile_overview(db: Session = Depends(get_db)):
             lambda: get_mobile_market_overview(db=db),
             last_good_ttl_seconds=24 * 60 * 60,
         )
+        payload = filter_active_mobile_market_overview(db, payload)
         if isinstance(payload, dict) and payload.get("is_stale"):
             payload = {
                 **payload,
@@ -443,6 +436,12 @@ async def spot_market_ws(websocket: WebSocket):
     manager_connected = False
 
     try:
+        try:
+            _get_active_pair(db, connected_symbol)
+        except ValueError:
+            await websocket.close(code=1008)
+            return
+
         await market_ws_manager.connect(connected_symbol, websocket, interval=interval)
         manager_connected = True
 
@@ -488,6 +487,15 @@ async def spot_market_ws(websocket: WebSocket):
                     if text.startswith("subscribe:"):
                         new_symbol = text.split(":", 1)[1].upper().strip()
                         if new_symbol and new_symbol != connected_symbol:
+                            try:
+                                # End the current transaction before checking
+                                # control-plane state on this long-lived socket.
+                                db.rollback()
+                                _get_active_pair(db, new_symbol)
+                            except ValueError:
+                                await websocket.close(code=1008)
+                                break
+
                             if manager_connected:
                                 await market_ws_manager.disconnect(connected_symbol, websocket)
 

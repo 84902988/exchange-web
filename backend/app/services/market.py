@@ -9,6 +9,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.datetime_utils import spot_trade_utc_isoformat, spot_trade_utc_timestamp_ms
+from app.db.models.contract_symbol import ContractSymbol
 from app.db.models.market_kline import MarketKline
 from app.db.models.order import Order
 from app.db.models.trade import Trade
@@ -36,6 +37,11 @@ from app.services.binance_market_service import (
 from app.services.itick_market_service import (
     ItickMarketServiceError,
     itick_market_service,
+)
+from app.services.itick_quote_fields import (
+    ITICK_LATEST_PRICE_FIELDS,
+    ITICK_OPEN_PRICE_FIELDS,
+    ITICK_PREVIOUS_CLOSE_FIELDS,
 )
 from app.services.itick_holiday_service import itick_holiday_service
 from app.services.market_domain_snapshot import (
@@ -144,10 +150,11 @@ ITICK_KLINE_TYPES = {
 
 _ITICK_LAST_GOOD_PRICE: Dict[str, Decimal] = {}
 _ITICK_TICKER_CACHE: Dict[str, Tuple[float, TickerItem]] = {}
-_ITICK_TICKER_CACHE_TTL_SECONDS = 30
+_ITICK_TICKER_CACHE_TTL_SECONDS = 15
 _SPOT_LAST_GOOD_TICKERS: Dict[str, TickerItem] = {}
 _SPOT_LAST_GOOD_DEPTHS: Dict[str, DepthResponse] = {}
 _SPOT_LAST_GOOD_TRADES: Dict[str, TradesResponse] = {}
+_CONTRACT_AUTHORITY_SESSION_CACHE_KEY = "market_contract_authority_v2"
 _SPOT_LAST_GOOD_KLINES: Dict[tuple[str, str], dict[str, Any]] = {}
 _SPOT_PROVIDER_LOG_THROTTLE: Dict[tuple[str, str, str, str], float] = {}
 _SPOT_PROVIDER_LOG_THROTTLE_SECONDS = 60
@@ -680,7 +687,14 @@ def _itick_ref_price(pair: TradingPair, *, allow_upstream: bool = True) -> Decim
             payload = _get_itick_quote_payload(pair)
             data = payload.get("data") if isinstance(payload, dict) else None
             if isinstance(data, dict):
-                raw_price = data.get("ld") or data.get("c") or data.get("p")
+                raw_price = next(
+                    (
+                        data.get(field)
+                        for field in ITICK_LATEST_PRICE_FIELDS
+                        if data.get(field) not in (None, "")
+                    ),
+                    None,
+                )
                 price = Decimal(str(raw_price or "0"))
                 if price > 0:
                     price = _round_price(pair, price)
@@ -858,6 +872,126 @@ def _is_contract_pair(pair: TradingPair) -> bool:
     if asset_type in CONTRACT_PAIR_CATEGORIES or market_category in CONTRACT_PAIR_CATEGORIES:
         return True
     return "CONTRACT" in market_sub_category
+
+
+def _contract_pair_symbol_candidate(pair: TradingPair) -> str:
+    symbol = str(getattr(pair, "symbol", "") or "").strip().upper()
+    if not symbol:
+        return ""
+    return symbol if symbol.endswith("_PERP") else f"{symbol}_PERP"
+
+
+def _contract_symbol_row_value(row: Any, name: str, index: int) -> str:
+    value = getattr(row, name, None)
+    if value in (None, ""):
+        try:
+            value = row[index]
+        except (IndexError, KeyError, TypeError):
+            value = None
+    return str(value or "").strip().upper()
+
+
+def _contract_authority(
+    db: Session,
+    symbol_candidates: set[str],
+    provider_candidates: set[str],
+) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+    session_info = getattr(db, "info", None)
+    cached: Dict[str, Any] = {}
+    if isinstance(session_info, dict):
+        cached_value = session_info.get(_CONTRACT_AUTHORITY_SESSION_CACHE_KEY)
+        if isinstance(cached_value, dict):
+            cached = cached_value
+
+    symbol_authority = cached.setdefault("symbols", {})
+    provider_authority = cached.setdefault("providers", {})
+    covered_symbols = cached.setdefault("covered_symbols", set())
+    covered_providers = cached.setdefault("covered_providers", set())
+    missing_symbols = symbol_candidates - covered_symbols
+    missing_providers = provider_candidates - covered_providers
+
+    if missing_symbols or missing_providers:
+        clauses = []
+        if missing_symbols:
+            clauses.append(ContractSymbol.symbol.in_(missing_symbols))
+        if missing_providers:
+            clauses.append(ContractSymbol.provider_symbol.in_(missing_providers))
+        rows = (
+            db.query(
+                ContractSymbol.symbol,
+                ContractSymbol.provider_symbol,
+                ContractSymbol.status,
+            )
+            .filter(or_(*clauses))
+            .all()
+        )
+        for row in rows:
+            symbol = _contract_symbol_row_value(row, "symbol", 0)
+            provider_symbol = _contract_symbol_row_value(row, "provider_symbol", 1)
+            status = _contract_symbol_row_value(row, "status", 2) == "1"
+            if symbol:
+                symbol_authority[symbol] = status
+            if provider_symbol:
+                provider_authority[provider_symbol] = (
+                    provider_authority.get(provider_symbol, False) or status
+                )
+        covered_symbols.update(missing_symbols)
+        covered_providers.update(missing_providers)
+
+    if isinstance(session_info, dict):
+        session_info[_CONTRACT_AUTHORITY_SESSION_CACHE_KEY] = cached
+    return symbol_authority, provider_authority
+
+
+def filter_contract_authorized_trading_pairs(
+    db: Session,
+    pairs: List[TradingPair],
+) -> List[TradingPair]:
+    """Keep spot/unconfigured pairs and exclude explicitly disabled contracts."""
+    normalized_pairs = list(pairs)
+    contract_pairs = [pair for pair in normalized_pairs if _is_contract_pair(pair)]
+    if not contract_pairs:
+        return normalized_pairs
+
+    symbol_candidates = {
+        candidate
+        for pair in contract_pairs
+        if (candidate := _contract_pair_symbol_candidate(pair))
+    }
+    provider_candidates = {
+        provider_symbol
+        for pair in contract_pairs
+        if (provider_symbol := _external_symbol(pair))
+    }
+    symbol_authority, provider_authority = _contract_authority(
+        db,
+        symbol_candidates,
+        provider_candidates,
+    )
+
+    def is_authorized(pair: TradingPair) -> bool:
+        if not _is_contract_pair(pair):
+            return True
+        symbol_candidate = _contract_pair_symbol_candidate(pair)
+        if symbol_candidate in symbol_authority:
+            return symbol_authority[symbol_candidate]
+        provider_symbol = _external_symbol(pair)
+        if provider_symbol in provider_authority:
+            return provider_authority[provider_symbol]
+        return True
+
+    filtered_pairs = [
+        pair
+        for pair in normalized_pairs
+        if is_authorized(pair)
+    ]
+    if len(filtered_pairs) != len(normalized_pairs):
+        logger.debug(
+            "market_contract_membership_pruned requested=%s retained=%s",
+            len(normalized_pairs),
+            len(filtered_pairs),
+        )
+    return filtered_pairs
 
 
 def _pair_base_quote(pair: TradingPair) -> Tuple[str, str]:
@@ -3783,18 +3917,9 @@ def _derive_itick_24h_metrics(
 ) -> Dict[str, Decimal]:
     previous_close = _pick_decimal(
         data,
-        [
-            "yc",
-            "pc",
-            "preClose",
-            "prevClose",
-            "previousClose",
-            "previous_close",
-            "lastClose",
-            "close_yesterday",
-        ],
+        list(ITICK_PREVIOUS_CLOSE_FIELDS),
     )
-    open_price = _pick_decimal(data, ["o", "open", "openPrice", "open_24h"])
+    open_price = _pick_decimal(data, list(ITICK_OPEN_PRICE_FIELDS))
     high_24h = _pick_decimal(data, ["h", "high", "high_price", "highPrice", "high_24h"], last_price)
     low_24h = _pick_decimal(data, ["l", "low", "low_price", "lowPrice", "low_24h"], last_price)
     base_volume_24h = _pick_decimal(data, ["v", "volume", "vol", "volume_24h", "baseVolume", "base_volume_24h"])
@@ -3938,7 +4063,7 @@ def _get_itick_ticker(
     if has_quote_data:
         last_price = context_last_price or _pick_decimal(
             data,
-            ["p", "price", "last", "latest_price", "close", "ld", "c"],
+            list(ITICK_LATEST_PRICE_FIELDS),
         )
     else:
         last_price = context_last_price or _itick_ref_price(pair, allow_upstream=False)
@@ -3996,6 +4121,7 @@ def get_tickers(db: Session) -> TickerListResponse:
         .order_by(TradingPair.is_hot.desc(), TradingPair.sort_order.asc(), TradingPair.symbol.asc())
         .all()
     )
+    pairs = filter_contract_authorized_trading_pairs(db, pairs)
     internal_stats = _build_internal_ticker_stats(
         db,
         [pair for pair in pairs if _normalize_data_source(pair) != DATA_SOURCE_ITICK],
@@ -4034,6 +4160,7 @@ def get_market_tickers(
         query = query.filter(TradingPair.symbol.in_(normalized_symbols))
 
     pairs = query.order_by(TradingPair.is_hot.desc(), TradingPair.sort_order.asc(), TradingPair.symbol.asc()).all()
+    pairs = filter_contract_authorized_trading_pairs(db, pairs)
     logger.debug(
         "market tickers request pairs_count=%s requested_symbols=%s",
         len(pairs),
@@ -4157,6 +4284,7 @@ def get_market_pairs(
 
         filtered_pairs.append(pair)
 
+    filtered_pairs = filter_contract_authorized_trading_pairs(db, filtered_pairs)
     total = len(filtered_pairs)
     offset = (normalized_page - 1) * normalized_page_size
     page_pairs = filtered_pairs[offset : offset + normalized_page_size]
@@ -4183,6 +4311,84 @@ def get_market_pairs(
         "page": normalized_page,
         "page_size": normalized_page_size,
     }
+
+
+def filter_active_trading_pair_rows(
+    db: Session,
+    rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep cached market data, but never cached control-plane membership."""
+    normalized_rows = [row for row in rows if isinstance(row, dict)]
+    symbols = {
+        str(row.get("symbol") or "").upper().strip()
+        for row in normalized_rows
+        if str(row.get("symbol") or "").strip()
+    }
+    if not symbols:
+        return []
+
+    active_rows = (
+        db.query(TradingPair)
+        .filter(TradingPair.symbol.in_(symbols), TradingPair.status == 1)
+        .all()
+    )
+    active_rows = filter_contract_authorized_trading_pairs(db, active_rows)
+    active_symbols = {
+        str(getattr(row, "symbol", None) or row[0]).upper().strip()
+        for row in active_rows
+    }
+    return [
+        row
+        for row in normalized_rows
+        if str(row.get("symbol") or "").upper().strip() in active_symbols
+    ]
+
+
+def filter_active_mobile_market_overview(
+    db: Session,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Prune disabled pairs from cached mobile overview membership."""
+    if not isinstance(payload, dict):
+        return payload
+
+    overview_cards = payload.get("overview_cards")
+    sections = payload.get("sections")
+    rows: List[Dict[str, Any]] = []
+    if isinstance(overview_cards, list):
+        rows.extend(row for row in overview_cards if isinstance(row, dict))
+    if isinstance(sections, list):
+        for section in sections:
+            if isinstance(section, dict) and isinstance(section.get("items"), list):
+                rows.extend(row for row in section["items"] if isinstance(row, dict))
+
+    active_rows = filter_active_trading_pair_rows(db, rows)
+    active_symbols = {
+        str(row.get("symbol") or "").upper().strip()
+        for row in active_rows
+    }
+
+    def keep_active(row: Any) -> bool:
+        return (
+            isinstance(row, dict)
+            and str(row.get("symbol") or "").upper().strip() in active_symbols
+        )
+
+    next_payload = dict(payload)
+    if isinstance(overview_cards, list):
+        next_payload["overview_cards"] = [row for row in overview_cards if keep_active(row)]
+    if isinstance(sections, list):
+        next_sections = []
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            next_section = dict(section)
+            items = section.get("items")
+            if isinstance(items, list):
+                next_section["items"] = [row for row in items if keep_active(row)]
+            next_sections.append(next_section)
+        next_payload["sections"] = next_sections
+    return next_payload
 
 
 def _mobile_market_category(pair_data: Dict[str, Any]) -> str:

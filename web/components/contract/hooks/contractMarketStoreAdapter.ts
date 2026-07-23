@@ -74,6 +74,9 @@ export type ContractMarketViewStoreAuthoritySnapshot = {
   displayState: string | null;
   marketStatus: string | null;
   marketSessionType?: string | null;
+  bboDisplayState?: string | null;
+  bboMarketStatus?: string | null;
+  bboMarketSessionType?: string | null;
   bestBid: string | null;
   bestAsk: string | null;
   spread: string | null;
@@ -89,6 +92,8 @@ export type ContractMarketViewStoreAuthoritySnapshot = {
   hasRealtimeAuthority: boolean;
   hasRealtimeBboAuthority: boolean;
   stale: boolean;
+  tickerStale?: boolean;
+  bboStale?: boolean;
   tickerObservedAtMs: number;
   bboObservedAtMs: number;
   observedAtMs: number;
@@ -788,6 +793,7 @@ export function selectContractMarketViewStoreAuthoritySnapshot(
         : null;
   const hasRealtimeBboAuthority = Boolean(bboAuthorityEntry);
   const bboObservedAtMs = bboAuthorityEntry?.observedAtMs ?? 0;
+  const bboAuthorityData = bboAuthorityEntry === realtimeDepthEntry ? depth : ticker;
   const bid = Number(bestBid);
   const ask = Number(bestAsk);
   const spread = readValue(ticker, 'spread')
@@ -804,6 +810,9 @@ export function selectContractMarketViewStoreAuthoritySnapshot(
     marketStatus: readValue(ticker, 'market_status') ?? readValue(depth, 'market_status'),
     marketSessionType: readValue(ticker, 'market_session_type')
       ?? readValue(depth, 'market_session_type'),
+    bboDisplayState: readValue(bboAuthorityData, 'display_state'),
+    bboMarketStatus: readValue(bboAuthorityData, 'market_status'),
+    bboMarketSessionType: readValue(bboAuthorityData, 'market_session_type'),
     bestBid,
     bestAsk,
     spread,
@@ -830,6 +839,8 @@ export function selectContractMarketViewStoreAuthoritySnapshot(
       realtimeTickerEntry?.stale
       || (executable === true && bboAuthorityEntry?.stale),
     ),
+    tickerStale: realtimeTickerEntry?.stale ?? true,
+    bboStale: bboAuthorityEntry?.stale ?? true,
     tickerObservedAtMs: realtimeTickerEntry?.observedAtMs ?? 0,
     bboObservedAtMs,
     observedAtMs: Math.max(
@@ -866,6 +877,9 @@ export function projectContractMarketViewStoreAuthority(
   const snapshotDisplayState = String(snapshot?.displayState || '').trim().toUpperCase();
   const snapshotMarketStatus = String(snapshot?.marketStatus || '').trim().toUpperCase();
   const snapshotSessionType = String(snapshot?.marketSessionType || '').trim().toUpperCase();
+  const bboDisplayState = String(snapshot?.bboDisplayState || '').trim().toUpperCase();
+  const bboMarketStatus = String(snapshot?.bboMarketStatus || '').trim().toUpperCase();
+  const bboSessionType = String(snapshot?.bboMarketSessionType || '').trim().toUpperCase();
   const baseDisplayState = String(sameSymbolBase?.display_state || '').trim().toUpperCase();
   const baseExecutionBid = Number(sameSymbolBase?.execution_bid);
   const baseExecutionAsk = Number(sameSymbolBase?.execution_ask);
@@ -879,6 +893,8 @@ export function projectContractMarketViewStoreAuthority(
   ) && sameSymbolBase?.executable === true && baseHasExecutableBbo;
   const snapshotHasLiveState = snapshotDisplayState === 'LIVE_TRADABLE'
     || snapshotDisplayState === 'REGULAR_OPEN';
+  const bboHasLiveState = bboDisplayState === 'LIVE_TRADABLE'
+    || bboDisplayState === 'REGULAR_OPEN';
   const nonTradingSessionTokens = [
     'PRE_MARKET',
     'AFTER_HOURS',
@@ -886,8 +902,21 @@ export function projectContractMarketViewStoreAuthority(
     'MARKET_CLOSED',
     'HOLIDAY',
   ];
-  const snapshotIsNonTradingSession = nonTradingSessionTokens.includes(snapshotMarketStatus)
+  const snapshotIsNonTradingSession = nonTradingSessionTokens.includes(snapshotDisplayState)
+    || nonTradingSessionTokens.includes(snapshotMarketStatus)
     || nonTradingSessionTokens.includes(snapshotSessionType);
+  const bboIsNonTradingSession = nonTradingSessionTokens.includes(bboDisplayState)
+    || nonTradingSessionTokens.includes(bboMarketStatus)
+    || nonTradingSessionTokens.includes(bboSessionType);
+  const explicitlyNonTrading = snapshotIsNonTradingSession || bboIsNonTradingSession;
+  const explicitNonTradingState = [
+    snapshotSessionType,
+    snapshotMarketStatus,
+    snapshotDisplayState,
+    bboSessionType,
+    bboMarketStatus,
+    bboDisplayState,
+  ].find((value) => nonTradingSessionTokens.includes(value)) || null;
   const tickerAgeMs = snapshot
     ? Math.max(0, nowMs - snapshot.tickerObservedAtMs)
     : Number.POSITIVE_INFINITY;
@@ -900,16 +929,28 @@ export function projectContractMarketViewStoreAuthority(
     && Number.isFinite(executionAsk)
     && executionBid > 0
     && executionAsk >= executionBid;
+  const tickerStale = snapshot?.tickerStale ?? snapshot?.stale ?? true;
+  const bboStale = snapshot?.bboStale ?? snapshot?.stale ?? true;
+  const hasFreshRealtimeTicker = Boolean(
+    snapshot?.hasRealtimeAuthority
+    && !tickerStale
+    && snapshot.tickerObservedAtMs > 0
+    && tickerAgeMs <= CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS
+    && snapshot.displayPrice
+    && snapshot.displayState,
+  );
   const hasFreshRealtimeBbo = snapshot?.executable === true
     && snapshot.hasRealtimeBboAuthority
+    && !bboStale
     && snapshot.bboObservedAtMs > 0
     && bboAgeMs <= CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS
-    && hasExecutableBbo;
+    && hasExecutableBbo
+    && !explicitlyNonTrading;
   const recoverStructureFromBase = Boolean(
     sameSymbolBase
     && baseConfirmsLiveAuthority
     && !snapshotHasLiveState
-    && !snapshotIsNonTradingSession,
+    && !explicitlyNonTrading,
   );
   // A partial ticker revision can temporarily retain UNAVAILABLE structure
   // after a newer depth domain has proved a complete executable BBO. Promote
@@ -918,23 +959,28 @@ export function projectContractMarketViewStoreAuthority(
   const recoverStructureFromBbo = Boolean(
     !recoverStructureFromBase
     && !snapshotHasLiveState
-    && !snapshotIsNonTradingSession
+    && !explicitlyNonTrading
     && hasFreshRealtimeBbo,
   );
+  const bboMidpoint = hasExecutableBbo
+    ? String(Number(((executionBid + executionAsk) / 2).toPrecision(15)))
+    : null;
   const effectiveDisplayPrice = recoverStructureFromBase
     ? String(sameSymbolBase?.display_price || '') || null
-    : snapshot?.displayPrice || null;
-  const effectiveDisplayState = recoverStructureFromBase
-    ? baseDisplayState
-    : recoverStructureFromBbo
+    : hasFreshRealtimeTicker
+      ? snapshot?.displayPrice || null
+      : String(sameSymbolBase?.display_price || '') || bboMidpoint;
+  const effectiveDisplayState = explicitlyNonTrading
+    ? explicitNonTradingState || 'CLOSED'
+    : recoverStructureFromBase
+      ? baseDisplayState
+      : recoverStructureFromBbo || bboHasLiveState
       ? 'LIVE_TRADABLE'
       : snapshot?.displayState || null;
   if (
     !snapshot
     || !snapshot.hasRealtimeAuthority
-    || snapshot.stale
-    || snapshot.tickerObservedAtMs <= 0
-    || tickerAgeMs > CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS
+    || (!hasFreshRealtimeTicker && !hasFreshRealtimeBbo)
     || !effectiveDisplayPrice
     || !effectiveDisplayState
   ) {
@@ -944,6 +990,7 @@ export function projectContractMarketViewStoreAuthority(
     snapshot.executable === true
     && (
       !snapshot.hasRealtimeBboAuthority
+      || bboStale
       || snapshot.bboObservedAtMs <= 0
       || bboAgeMs > CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS
       || !hasExecutableBbo
@@ -954,8 +1001,19 @@ export function projectContractMarketViewStoreAuthority(
     recoverStructureFromBase
       ? baseConfirmsLiveAuthority
       : snapshot.executable === true
-  ) && hasExecutableBbo && !snapshotIsNonTradingSession;
-  const observedAtMs = snapshot.observedAtMs > 0 ? snapshot.observedAtMs : nowMs;
+  ) && hasFreshRealtimeBbo;
+  const observedAtMs = executable
+    ? snapshot.bboObservedAtMs
+    : hasFreshRealtimeTicker
+      ? snapshot.tickerObservedAtMs
+      : snapshot.observedAtMs > 0
+        ? snapshot.observedAtMs
+        : nowMs;
+  const projectedDisplayPriceSource = hasFreshRealtimeTicker
+    ? snapshot.displayPriceSource
+    : executable
+      ? 'LIVE_MID'
+      : null;
   return {
     ...(sameSymbolBase || {}),
     symbol: snapshot.symbol,
@@ -966,10 +1024,10 @@ export function projectContractMarketViewStoreAuthority(
     market_session_type: snapshot.marketSessionType || sameSymbolBase?.market_session_type || null,
     display_state: effectiveDisplayState,
     display_price: effectiveDisplayPrice,
-    display_price_source: (recoverStructureFromBase ? sameSymbolBase?.display_price_source : snapshot.displayPriceSource)
+    display_price_source: (recoverStructureFromBase ? sameSymbolBase?.display_price_source : projectedDisplayPriceSource)
       || sameSymbolBase?.display_price_source
       || 'LIVE_MID',
-    current_price_source: (recoverStructureFromBase ? sameSymbolBase?.current_price_source : snapshot.displayPriceSource)
+    current_price_source: (recoverStructureFromBase ? sameSymbolBase?.current_price_source : projectedDisplayPriceSource)
       || sameSymbolBase?.current_price_source
       || null,
     ticker_source: snapshot.tickerSource,
@@ -1000,7 +1058,7 @@ export function projectContractMarketViewStoreAuthority(
       ...(sameSymbolBase?.raw_source_summary || {}),
       authority_source: recoverStructureFromBase
         ? 'CONTRACT_MARKET_STORE_WITH_REST_STRUCTURE'
-        : recoverStructureFromBbo
+        : recoverStructureFromBbo || (!hasFreshRealtimeTicker && hasFreshRealtimeBbo)
           ? 'CONTRACT_MARKET_STORE_WITH_BBO_STRUCTURE'
           : 'CONTRACT_MARKET_STORE',
       store_execution_mode: snapshot.executionMode,

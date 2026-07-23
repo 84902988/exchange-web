@@ -24,3 +24,29 @@ test('contract header selector renders a localized perpetual badge before the dr
   expect(badgeBlock).not.toContain('#f0b90b');
   expect(badgeBlock).not.toContain('border');
 });
+
+test('parent-provided contract pairs own selector membership over stale module cache', () => {
+  const source = readFileSync(
+    resolve(process.cwd(), 'components/spot/GlobalMarketSelector.tsx'),
+    'utf8',
+  );
+
+  expect(source).toContain("const contractSource = pairs !== undefined && pageType === 'contract'");
+  expect(source).toContain('? externalContractPairs');
+  expect(source).toContain('current control-plane catalog');
+  expect(source).toContain('administrator has just disabled');
+});
+
+test('parent-provided spot pairs and favorites cannot be resurrected from stale caches', () => {
+  const source = readFileSync(
+    resolve(process.cwd(), 'components/spot/GlobalMarketSelector.tsx'),
+    'utf8',
+  );
+
+  expect(source).toContain("const spotSource = pairs !== undefined && pageType === 'spot'");
+  expect(source).toContain('const parentOwnsFavoriteMarket');
+  expect(source).toContain('onCatalogRefresh');
+  expect(source).toContain('const catalogMembershipRefreshing');
+  expect(source).toContain('spotPairsCacheFetchedAtRef.current.clear()');
+  expect(source).toContain('contractPairsCacheFetchedAtRef.current.clear()');
+});

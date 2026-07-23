@@ -18,7 +18,9 @@ describe('useContractMarketView Price Authority wiring', () => {
     expect(hookSource).toMatch(/source:\s*quote\?\.source \?\? quote\?\.quote_source \?\? fallbackLastPriceSource/);
     expect(hookSource).toMatch(/freshness:\s*quote\?\.quote_freshness \?\? fallbackQuoteFreshness/);
     expect(hookSource).toMatch(/marketStatus:\s*quote\?\.market_status \?\? fallbackMarketStatus/);
-    expect(hookSource).toMatch(/priceAuthority,\s*\n\s*referencePrice,\s*\n\s*displayPrice,/);
+    expect(hookSource).toMatch(
+      /priceAuthority,\s*\n\s*referencePrice,\s*\n\s*linkedMarketAuthority,\s*\n\s*displayPrice,/,
+    );
     expect(hookSource).toMatch(/const displayPrice = marketViewAuthority\.displayPrice;/);
   });
 

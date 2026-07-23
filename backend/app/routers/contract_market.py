@@ -100,6 +100,82 @@ def _load_with_short_session(loader: Callable[[Session], dict]):
         db.close()
 
 
+def _configured_contract_symbol_status(symbol: str) -> Optional[int]:
+    normalized_symbol = normalize_contract_ws_symbol(symbol)
+    if not normalized_symbol:
+        return None
+
+    def load_status(db: Session) -> dict:
+        row = (
+            db.query(ContractSymbol.status)
+            .filter(ContractSymbol.symbol == normalized_symbol)
+            .first()
+        )
+        if row is None:
+            return {"configured": False, "status": None}
+        return {
+            "configured": True,
+            "status": int(getattr(row, "status", None) if getattr(row, "status", None) is not None else row[0]),
+        }
+
+    result = _load_with_short_session(load_status)
+    return result["status"] if result["configured"] else None
+
+
+def _raise_if_configured_contract_symbol_disabled(symbol: str) -> None:
+    if _configured_contract_symbol_status(symbol) == 0:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "CONTRACT_SYMBOL_NOT_FOUND",
+                "message": "contract symbol not found or disabled",
+            },
+        )
+
+
+def _filter_disabled_configured_contract_tickers(data: dict) -> dict:
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items:
+        return data
+    symbols = {
+        str(item.get("symbol") or "").strip().upper()
+        for item in items
+        if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+    }
+    if not symbols:
+        return data
+
+    def load_disabled(db: Session) -> dict:
+        rows = (
+            db.query(ContractSymbol.symbol, ContractSymbol.status)
+            .filter(ContractSymbol.symbol.in_(symbols))
+            .all()
+        )
+        return {
+            "symbols": [
+                str(getattr(row, "symbol", None) or row[0]).strip().upper()
+                for row in rows
+                if int(
+                    getattr(row, "status", None)
+                    if getattr(row, "status", None) is not None
+                    else (row[1] if len(row) > 1 and row[1] is not None else 0)
+                ) != 1
+            ],
+        }
+
+    disabled_symbols = set(_load_with_short_session(load_disabled)["symbols"])
+    if not disabled_symbols:
+        return data
+    next_data = dict(data)
+    next_data["items"] = [
+        item
+        for item in items
+        if not isinstance(item, dict)
+        or str(item.get("symbol") or "").strip().upper() not in disabled_symbols
+    ]
+    return next_data
+
+
 def _normalize_contract_category(value: str) -> str:
     normalized = str(value or "all").strip().lower()
     if normalized in ("", "all"):
@@ -158,6 +234,9 @@ async def contract_market_public_ws(
     if not connected_symbol:
         await websocket.close(code=1008)
         return
+    if _configured_contract_symbol_status(connected_symbol) == 0:
+        await websocket.close(code=1008)
+        return
 
     manager_connected = False
     try:
@@ -184,6 +263,22 @@ async def contract_market_public_ws(
                 break
             if action == "ping":
                 await contract_market_ws_manager.send_to_one(websocket, {"type": "pong"})
+                continue
+            requested_symbol = normalize_contract_ws_symbol(payload.get("symbol") or connected_symbol)
+            if (
+                action == "subscribe"
+                and requested_symbol
+                and _configured_contract_symbol_status(requested_symbol) == 0
+            ):
+                await contract_market_ws_manager.send_to_one(
+                    websocket,
+                    {
+                        "type": "error",
+                        "code": "CONTRACT_SYMBOL_NOT_FOUND",
+                        "message": "contract symbol not found or disabled",
+                        "symbol": requested_symbol,
+                    },
+                )
                 continue
             domain_result = await handle_contract_ws_domain_command(
                 action=action,
@@ -232,20 +327,6 @@ def contract_market_symbols(
     normalized_keyword = str(keyword or "").strip().upper()
     normalized_page = max(int(page or 1), 1)
     normalized_page_size = max(1, min(int(page_size or 50), 100))
-    cache_key = market_cache_key(
-        "contract:symbols",
-        {
-            "session_policy": CONTRACT_MARKET_SESSION_POLICY_VERSION,
-            "market_status": CONTRACT_MARKET_STATUS_VERSION,
-            "forex_price_field": CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION,
-            "category": normalized_category,
-            "quote": normalized_quote,
-            "keyword": normalized_keyword,
-            "page": normalized_page,
-            "page_size": normalized_page_size,
-        },
-    )
-
     def load_data(db: Session) -> dict:
         query = db.query(ContractSymbol).filter(ContractSymbol.status == 1)
         if normalized_category != "all":
@@ -277,7 +358,12 @@ def contract_market_symbols(
         )
         return data.model_dump()
 
-    return ok(data=cache_fetch_json(cache_key, 120, lambda: _load_with_short_session(load_data)), trace_id=trace_id)
+    # Symbol enable/disable is an administrative control-plane decision, not a
+    # high-frequency market datum. Read it from the indexed database query so
+    # a disabled instrument disappears on the next request instead of being
+    # resurrected for up to 120 seconds by an old public catalog snapshot.
+    # The web client already coalesces identical catalog requests for 5 seconds.
+    return ok(data=_load_with_short_session(load_data), trace_id=trace_id)
 
 
 @router.get("/view")
@@ -316,6 +402,7 @@ def contract_market_quote(
 ):
     trace_id = getattr(request.state, "trace_id", None)
     normalized_symbol = str(symbol or "").strip().upper()
+    _raise_if_configured_contract_symbol_disabled(normalized_symbol)
     cache_key = market_cache_key(
         "contract:quote",
         {
@@ -393,7 +480,7 @@ def contract_market_tickers(
             ).model_dump()
         ),
     )
-    return ok(data=data, trace_id=trace_id)
+    return ok(data=_filter_disabled_configured_contract_tickers(data), trace_id=trace_id)
 
 
 @router.get("/depth")
@@ -404,6 +491,7 @@ def contract_market_depth(
 ):
     trace_id = getattr(request.state, "trace_id", None)
     normalized_symbol = str(symbol or "").strip().upper()
+    _raise_if_configured_contract_symbol_disabled(normalized_symbol)
     safe_limit = max(5, min(int(limit or 20), 100))
     cache_key = market_cache_key(
         "contract:depth",

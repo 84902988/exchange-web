@@ -62,6 +62,36 @@ def _open_status() -> service.ItickMarketStatus:
     )
 
 
+def _blocked_open_status() -> service.ItickMarketStatus:
+    return service.ItickMarketStatus(
+        market_status="OPEN",
+        market_status_text="open",
+        market_session_code="US",
+        market_timezone="America/New_York",
+        market_trading_hours="04:00-09:30,09:30-16:00,16:00-20:00",
+        market_session_type="REGULAR_OPEN",
+        feed_state="UNAVAILABLE",
+        instrument_state="UNKNOWN",
+        execution_state="BLOCKED",
+        session_reason_code="FEED_UNAVAILABLE",
+    )
+
+
+def _tradable_open_status() -> service.ItickMarketStatus:
+    return service.ItickMarketStatus(
+        market_status="OPEN",
+        market_status_text="open",
+        market_session_code="US",
+        market_timezone="America/New_York",
+        market_trading_hours="04:00-09:30,09:30-16:00,16:00-20:00",
+        market_session_type="REGULAR_OPEN",
+        feed_state="LIVE",
+        instrument_state="NORMAL",
+        execution_state="TRADABLE",
+        session_reason_code="REGULAR_OPEN",
+    )
+
+
 def _contract(
     symbol: str = "AAPLUSDT_PERP",
     provider_symbol: str = "AAPL",
@@ -366,6 +396,75 @@ def test_open_market_depth_missing_uses_live_quote_bbo():
     assert depth["best_bid"] == Decimal("281.60")
     assert depth["best_ask"] == Decimal("281.88")
     assert saved and saved[0]["bid_price"] == Decimal("281.60")
+
+
+def test_open_market_cfd_quote_bbo_recomputes_status_from_selected_snapshot():
+    _reset_closed_caches()
+    contract = _contract(
+        symbol="DJIUSDT_PERP",
+        provider_symbol="DJI",
+        category="INDEX",
+    )
+    live_ts = datetime.now(timezone.utc)
+    quote = _quote(
+        ts=live_ts,
+        bid="51715.30",
+        ask="51747.02",
+        source="ITICK_QUOTE",
+    )
+    quote.update(
+        {
+            "symbol": contract.symbol,
+            "provider_symbol": contract.provider_symbol,
+        }
+    )
+    status_payloads: list[dict | None] = []
+
+    def resolve_status(_contract_symbol, payload=None):
+        status_payloads.append(payload)
+        if isinstance(payload, dict) and payload.get("source") == "ITICK_QUOTE":
+            return _tradable_open_status()
+        return _blocked_open_status()
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(service, "_load_contract_symbol", return_value=contract))
+        stack.enter_context(
+            patch.object(
+                service,
+                "_market_status_for_contract_symbol",
+                side_effect=resolve_status,
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                service,
+                "_get_itick_cfd_depth",
+                side_effect=service.ItickQuoteUnavailable("depth down"),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                service,
+                "_get_itick_live_quote",
+                return_value=quote,
+            )
+        )
+        stack.enter_context(
+            patch.object(service, "save_last_valid_contract_quote", lambda *args, **kwargs: None)
+        )
+        depth = service.get_contract_depth(DummyDb(), contract.symbol, limit=5)
+
+    assert depth["source"] == "ITICK_QUOTE"
+    assert depth["quote_freshness"] == "LIVE"
+    assert depth["feed_state"] == "LIVE"
+    assert depth["instrument_state"] == "NORMAL"
+    assert depth["execution_state"] == "TRADABLE"
+    assert depth["session_reason_code"] == "REGULAR_OPEN"
+    assert depth["executable"] is True
+    assert depth["best_bid"] == Decimal("51715.30")
+    assert depth["best_ask"] == Decimal("51747.02")
+    assert status_payloads[0] is None
+    assert status_payloads[-1]["source"] == "ITICK_QUOTE"
 
 
 def test_open_market_depth_stale_uses_live_quote_bbo():

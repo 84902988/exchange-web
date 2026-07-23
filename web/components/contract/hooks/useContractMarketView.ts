@@ -29,6 +29,7 @@ import {
   writeContractTradesCache,
 } from '@/lib/contractMarketCache';
 import {
+  isContractSymbolConfigMissingError,
   useContractMarketState,
 } from './useContractMarketState';
 import {
@@ -95,6 +96,16 @@ export type ContractMarketCenterState = {
   displayState: string | null;
   executable: boolean | null;
   updatedAt: number | null;
+};
+
+export type ContractLinkedMarketAuthority = {
+  symbol: string;
+  bestBid: number | null;
+  bestAsk: number | null;
+  valuationPrice: number | null;
+  executable: boolean;
+  reasonCode: string | null;
+  observedAtMs: number | null;
 };
 
 type UseContractMarketViewParams = {
@@ -695,16 +706,19 @@ export function useContractMarketView({
       || !storeMarketViewAuthority?.hasRealtimeAuthority
       || storeMarketViewAuthority.tickerObservedAtMs <= 0
     ) return undefined;
+    const nowMs = Date.now();
     const tickerExpiresAt = storeMarketViewAuthority.tickerObservedAtMs
       + CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS;
-    const bboExpiresAt = storeMarketViewAuthority.executable === true
+    const bboExpiresAt = storeMarketViewAuthority.hasRealtimeBboAuthority
       && storeMarketViewAuthority.bboObservedAtMs > 0
       ? storeMarketViewAuthority.bboObservedAtMs
         + CONTRACT_MARKET_STORE_RECOVERY_MAX_AGE_MS
       : Number.POSITIVE_INFINITY;
-    const expiresAt = Math.min(tickerExpiresAt, bboExpiresAt);
-    const remainingMs = expiresAt - Date.now();
-    if (remainingMs <= 0) return undefined;
+    const expiresAt = [tickerExpiresAt, bboExpiresAt]
+      .filter((candidate) => Number.isFinite(candidate) && candidate > nowMs)
+      .sort((left, right) => left - right)[0];
+    if (!expiresAt) return undefined;
+    const remainingMs = expiresAt - nowMs;
     const timer = window.setTimeout(() => {
       setStoreAuthorityEvaluationTimeMs(Date.now());
     }, remainingMs + 1);
@@ -1265,6 +1279,45 @@ export function useContractMarketView({
     () => selectContractReferencePrice(priceAuthority),
     [priceAuthority],
   );
+  const linkedMarketAuthority = useMemo<ContractLinkedMarketAuthority>(() => {
+    const bestBid = priceAuthority.execution_bid.usable
+      ? priceAuthority.execution_bid.value
+      : null;
+    const bestAsk = priceAuthority.execution_ask.usable
+      ? priceAuthority.execution_ask.value
+      : null;
+    const valuationPrice = bestBid !== null
+      && bestAsk !== null
+      && bestAsk >= bestBid
+      ? (bestBid + bestAsk) / 2
+      : null;
+    const executable = priceAuthority.executable
+      && bestBid !== null
+      && bestAsk !== null
+      && valuationPrice !== null;
+
+    return {
+      symbol: priceAuthority.symbol,
+      bestBid: executable ? bestBid : null,
+      bestAsk: executable ? bestAsk : null,
+      valuationPrice: executable ? valuationPrice : null,
+      executable,
+      reasonCode: executable
+        ? marketViewAuthority.reasonCode
+        : priceAuthority.execution_bid.rejectReason
+          || priceAuthority.execution_ask.rejectReason
+          || marketViewAuthority.reasonCode,
+      observedAtMs: executable
+        ? Math.max(
+          priceAuthority.execution_bid.eventTimeMs ?? 0,
+          priceAuthority.execution_ask.eventTimeMs ?? 0,
+        ) || null
+        : null,
+    };
+  }, [
+    marketViewAuthority.reasonCode,
+    priceAuthority,
+  ]);
 
   const displayPrice = marketViewAuthority.displayPrice;
   const displayPriceSource = displayPrice !== null
@@ -1381,15 +1434,15 @@ export function useContractMarketView({
       bestBid: marketViewAuthority.bestBid,
       bestAsk: marketViewAuthority.bestAsk,
       spread: marketViewAuthority.spread,
-      executionBid: marketViewAuthority.executionBid,
-      executionAsk: marketViewAuthority.executionAsk,
+      executionBid: linkedMarketAuthority.bestBid,
+      executionAsk: linkedMarketAuthority.bestAsk,
       latestTradePrice: latestTradeTickPrice,
       latestTradePriceSource: latestTradeTickPrice !== null ? 'TRADE_TICK' : null,
       klineMode: contractKlineMode,
       klineCurrentCandle: marketView?.kline_current_candle ?? null,
       quoteFreshness: marketView?.ticker_freshness ?? null,
       displayState: marketViewAuthority.displayState,
-      executable: marketViewAuthority.executable,
+      executable: linkedMarketAuthority.executable,
       updatedAt: quoteTime,
     };
   }, [
@@ -1399,6 +1452,7 @@ export function useContractMarketView({
     displayPriceLabel,
     displayPriceSource,
     latestTradeTickPrice,
+    linkedMarketAuthority,
     marketView,
     marketViewAuthority,
   ]);
@@ -1454,11 +1508,17 @@ export function useContractMarketView({
 
   return {
     ...quoteState,
+    // MarketView is the first public bootstrap request on an already-open
+    // realtime connection. Preserve its disabled-symbol signal even when the
+    // quote REST fallback is skipped because the websocket is connected.
+    contractConfigMissing: quoteState.contractConfigMissing
+      || isContractSymbolConfigMissingError(currentMarketViewError),
     marketView,
     marketViewLoading: currentMarketViewLoading,
     marketViewError: currentMarketViewError,
     priceAuthority,
     referencePrice,
+    linkedMarketAuthority,
     displayPrice,
     displayState: rawMarketViewDisplayState,
     displayPriceSource,
@@ -1504,11 +1564,11 @@ export function useContractMarketView({
     bestBid: derivedMarketState.bestBid,
     bestAsk: derivedMarketState.bestAsk,
     spread: derivedMarketState.spread,
-    executable: marketViewAuthority.executable,
-    executionBid: marketViewAuthority.executionBid,
-    executionAsk: marketViewAuthority.executionAsk,
+    executable: linkedMarketAuthority.executable,
+    executionBid: linkedMarketAuthority.bestBid,
+    executionAsk: linkedMarketAuthority.bestAsk,
     executionMode: marketView?.execution_mode ?? null,
-    reasonCode: marketViewAuthority.reasonCode,
+    reasonCode: linkedMarketAuthority.reasonCode,
     warnings: marketView?.warnings ?? [],
     rawSourceSummary: marketView?.raw_source_summary ?? {},
     quote,

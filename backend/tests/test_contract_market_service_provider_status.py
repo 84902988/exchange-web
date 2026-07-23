@@ -122,6 +122,112 @@ def test_itick_index_ws_latest_price_without_native_bbo_is_not_executable_quote(
     assert quote is None
 
 
+def test_itick_index_quote_cache_refreshes_before_executable_freshness_expires():
+    contract_symbol = _symbol("INDEX")
+    cache_key = contract_symbol.symbol.upper()
+    now = datetime.utcnow()
+    service._tradfi_quote_cache[cache_key] = {
+        "ts": now - service._tradfi_index_quote_cache_ttl - timedelta(milliseconds=1),
+        "quote": {
+            "symbol": contract_symbol.symbol,
+            "provider": "ITICK",
+            "provider_symbol": contract_symbol.provider_symbol,
+            "source": "ITICK_QUOTE",
+            "price_field": service.CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION,
+            "ts": now - service._tradfi_index_quote_cache_ttl,
+        },
+    }
+    try:
+        assert service._get_cached_tradfi_quote_for_contract(contract_symbol) is None
+        assert (
+            service._get_cached_tradfi_quote_for_contract(
+                contract_symbol,
+                allow_stale=True,
+            )
+            is not None
+        )
+    finally:
+        service._tradfi_quote_cache.pop(cache_key, None)
+
+
+def test_itick_index_refreshes_shared_bbo_from_quote_endpoint_not_depth(monkeypatch):
+    contract_symbol = _symbol("INDEX")
+    cache_key = contract_symbol.symbol.upper()
+    quote_ts = datetime.utcnow()
+    service._tradfi_quote_cache.pop(cache_key, None)
+    monkeypatch.setattr(
+        service.itick_market_service,
+        "is_quote_depth_cooldown_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        service,
+        "_get_itick_cfd_depth",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("index quote refresh must not depend on native depth")
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_get_itick_cfd_reference_price",
+        lambda _contract_symbol: (
+            Decimal("100"),
+            "ITICK",
+            service.CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION,
+            quote_ts,
+            {
+                "provider_trading_status": 0,
+                "provider_market_status": "OPEN",
+                "price_change_percent_24h": "0.5",
+            },
+        ),
+    )
+
+    try:
+        quote = service._get_itick_live_quote(contract_symbol)
+        cached = service._get_cached_tradfi_quote_for_contract(contract_symbol)
+
+        assert quote["source"] == "ITICK_QUOTE"
+        assert quote["bid_price"] == Decimal("99.95")
+        assert quote["ask_price"] == Decimal("100.05")
+        assert quote["price_field"] == service.CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION
+        assert quote["provider_market_status"] == "OPEN"
+        assert cached is not None
+        assert cached["bid_price"] == Decimal("99.95")
+        assert cached["ask_price"] == Decimal("100.05")
+    finally:
+        service._tradfi_quote_cache.pop(cache_key, None)
+
+
+def test_itick_index_quote_refresh_never_promotes_diagnostic_fallback(monkeypatch):
+    contract_symbol = _symbol("INDEX")
+    cache_key = contract_symbol.symbol.upper()
+    service._tradfi_quote_cache.pop(cache_key, None)
+    monkeypatch.setattr(
+        service.itick_market_service,
+        "is_quote_depth_cooldown_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        service,
+        "_get_itick_cfd_reference_price",
+        lambda _contract_symbol: (
+            Decimal("12345"),
+            "CFD_FALLBACK",
+            None,
+            datetime.utcnow(),
+            {},
+        ),
+    )
+
+    try:
+        with pytest.raises(service.ItickQuoteUnavailable, match="ITICK_QUOTE_UNAVAILABLE"):
+            service._get_itick_live_quote(contract_symbol)
+        assert service._get_cached_tradfi_quote_for_contract(contract_symbol) is None
+    finally:
+        service._tradfi_quote_cache.pop(cache_key, None)
+
+
 def test_itick_cfd_depth_fails_closed_without_native_provider_levels(monkeypatch):
     monkeypatch.setattr(
         service.itick_market_service,

@@ -12,3 +12,13 @@ test('spot market tabs remain readable in the narrow side panel', () => {
   expect(panelSource.match(/shrink-0 whitespace-nowrap/g)).toHaveLength(2);
   expect(panelSource).not.toContain('inline-flex h-10 items-stretch gap-5');
 });
+
+test('spot pair membership is refreshed from the control plane without a page cache', () => {
+  const source = readFileSync(resolve(process.cwd(), 'components/spot/SpotPage.tsx'), 'utf8');
+
+  expect(source).not.toContain('cachedSpotPairPages');
+  expect(source).not.toContain('SPOT_PAIR_PAGE_CACHE_TTL_MS');
+  expect(source).toContain('onCatalogRefresh={refreshSpotPairCatalog}');
+  expect(source).toContain('isSpotPairUnavailableError(spotMarket.error)');
+  expect(source).toContain('router.replace(`/trade/spot?symbol=');
+});

@@ -4768,6 +4768,81 @@ test('BTC 1m preview advances close and volume together until the native candle 
   datafeed.destroy();
 });
 
+test('future-baseline preview is replayed when its matching Native revision arrives', async () => {
+  const symbol = 'DJIUSDT_PERP';
+  const openTime = Date.parse('2026-07-23T15:18:00.000Z');
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    category: 'CFD',
+  });
+  await establishHistoryBaseline(datafeed, symbol);
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'dji-future-preview-replay-subscriber',
+  );
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    open: '51620.15',
+    high: '51632.17',
+    low: '51613.17',
+    close: '51617.17',
+    volume: '543008',
+    eventTimeMs: openTime + 10_000,
+    generation: 7,
+    sequence: 34,
+  });
+
+  // Trade and Native provider channels are independent. The preview for
+  // revision 35 may arrive first and must remain rejected until that Native
+  // baseline exists.
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime,
+    open: '51620.15',
+    high: '51632.17',
+    low: '51601.17',
+    close: '51601.17',
+    volume: '559300',
+    generation: 7,
+    sequence: 35,
+    previewSequence: 1,
+    receivedAtMs: openTime + 18_000,
+    provider: 'ITICK',
+  }));
+  assert.equal(received.at(-1)?.close, 51617.17);
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    open: '51620.15',
+    high: '51632.17',
+    low: '51608.15',
+    close: '51612.17',
+    volume: '550000',
+    eventTimeMs: openTime + 19_000,
+    generation: 7,
+    sequence: 35,
+  });
+
+  assert.deepEqual(
+    received.map((bar) => ({ close: bar.close, low: bar.low, volume: bar.volume })),
+    [
+      { close: 51617.17, low: 51613.17, volume: 543008 },
+      { close: 51612.17, low: 51608.15, volume: 550000 },
+      { close: 51601.17, low: 51601.17, volume: 559300 },
+    ],
+  );
+  datafeed.destroy();
+});
+
 test('same-series history revalidation keeps CFD trade previews live while REST is pending', async () => {
   const symbol = 'XAUUSDT_PERP';
   const openTime = 1_717_100_020_000;

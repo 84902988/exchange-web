@@ -345,7 +345,7 @@ def test_itick_ticker_normalizer_does_not_synthesize_executable_bbo_from_last_pr
         ws_symbol="AAPL",
     )
 
-    payload = service._normalize_itick_ticker(subscription, {"p": "200", "t": 1717000000})
+    payload = service._normalize_itick_ticker(subscription, {"ld": "200", "t": 1717000000})
 
     assert payload is not None
     assert payload["bid_price"] is None
@@ -366,11 +366,54 @@ def test_itick_ticker_normalizer_replaces_missing_provider_time_with_normalized_
         ws_symbol="EURUSD$GB",
     )
 
-    payload = service._normalize_itick_ticker(subscription, {"p": "1.14250", "t": 0})
+    payload = service._normalize_itick_ticker(subscription, {"ld": "1.14250", "t": 0})
 
     assert payload is not None
     assert payload["exchange_ts"] == 1_720_000_000_123
     assert int(payload["ts"].timestamp() * 1000) == 1_720_000_000_123
+
+
+def test_itick_ticker_normalizer_keeps_latest_price_and_previous_close_distinct():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderTickerSubscription(
+        local_symbol="AAPLUSDT_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="AAPL",
+        ws_symbol="AAPL",
+    )
+
+    payload = service._normalize_itick_ticker(
+        subscription,
+        {
+            "ld": "202.50",
+            "p": "200.00",
+            "t": 1_717_000_000_000,
+        },
+    )
+
+    assert payload is not None
+    assert payload["last_price"] == Decimal("202.50")
+    assert payload["price_field"] == "ld"
+    assert payload["open_24h"] == Decimal("200.00")
+    assert payload["price_change_24h"] == Decimal("2.50")
+    assert payload["price_change_percent_24h"] == Decimal("1.2500")
+
+
+def test_itick_ticker_normalizer_does_not_promote_previous_close_to_latest_price():
+    module = _load_provider_ws_module()
+    service = module.ContractMarketProviderWsService()
+    subscription = module.ProviderTickerSubscription(
+        local_symbol="AAPLUSDT_PERP",
+        provider=module.PROVIDER_ITICK,
+        provider_symbol="AAPL",
+        ws_symbol="AAPL",
+    )
+
+    assert service._normalize_itick_ticker(
+        subscription,
+        {"p": "200.00", "t": 1_717_000_000_000},
+    ) is None
 
 
 def test_itick_kline_subscription_resolver_uses_category_endpoint_and_kline_type():

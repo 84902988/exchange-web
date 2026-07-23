@@ -51,6 +51,11 @@ describe('Contract TradingView bootstrap experience', () => {
     expect(pageSource).toContain('const retryDelays = [1000, 2000, 5000, 10000]');
     expect(pageSource).toContain('if (disposed || loaded) return;');
     expect(pageSource).toContain('const contractSymbolRequestStore = new Map<string, ContractSymbolRequestEntry>();');
+    expect(pageSource).toContain('contractSymbolRequestStore.clear();');
+    expect(pageSource).toContain('refreshContractPairs({ dropMissingBootstrap: true })');
+    expect(pageSource).toContain('&& !contractConfigMissing');
+    expect(pageSource).toContain('isMockStockContractSymbol(requestedSymbol)');
+    expect(pageSource).toContain('contractConfigMissing,');
   });
 
   test('gives authoritative realtime a bootstrap grace before REST fallbacks', () => {
