@@ -1,11 +1,10 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { getFinanceAccountOverview, getFinanceProducts, FinanceAccount, FinanceProduct, FinanceProductListResponse } from '@/lib/api';
+import { getFinanceAccountOverview, getFinanceProducts, FinanceAccount, FinanceProduct } from '@/lib/api';
 import { DEFAULT_LANGUAGE, getCurrentLanguage, getTranslatedLabel } from '@/utils/language';
-import { Language, LanguageChangedEvent } from '@/types';
+import { LanguageChangedEvent } from '@/types';
 import EmptyState from '@/components/ui/EmptyState';
-import ErrorBoundary from '@/components/ui/ErrorBoundary';
 import FinanceAccountSummary from '@/components/finance/FinanceAccountSummary';
 import FinanceProductList from '@/components/finance/FinanceProductList';
 import AssetSidebar from '@/components/asset/AssetSidebar';
@@ -137,11 +136,6 @@ export default function FinancePage() {
           <FinanceProductList 
             products={products} 
             loading={loading} 
-            onProductClick={(productId) => {
-              console.log('Product clicked:', productId);
-              // 实际项目中应该跳转到产品详情页
-              // router.push(`/finance/products/${productId}`);
-            }} 
           />
         </div>
       </div>

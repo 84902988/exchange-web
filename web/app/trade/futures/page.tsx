@@ -1,5 +1,5 @@
-import TradingPage from '@/components/trading/TradingPage';
+import { redirect } from 'next/navigation';
 
-export default function StocksContractsPage() {
-  return <TradingPage />;
+export default function FuturesTradingPage() {
+  redirect('/contract');
 }

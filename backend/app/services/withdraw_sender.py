@@ -179,15 +179,12 @@ def _check_erc20_balance(sender: HotWalletSender, token_contract: str, needed_in
     bal = contract.functions.balanceOf(sender.from_address).call()
     bal_int = int(bal)
 
-    # Debug helper: show which wallet/contract is checked and the raw token balance.
-    try:
-        bal_dec = Decimal(bal_int) / (Decimal(10) ** int(token_decimals))
-    except Exception:
-        bal_dec = Decimal("0")
-
-    print(
-        f"[sender-debug] balanceOf addr={_mask_address(sender.from_address)} "
-        f"contract={token_contract} raw={bal_int} decimals={token_decimals} dec={bal_dec}"
+    logger.debug(
+        "withdraw_token_balance_checked from_address=%s token_contract=%s decimals=%s sufficient=%s",
+        _mask_address(sender.from_address),
+        _mask_address(token_contract),
+        token_decimals,
+        bal_int >= int(needed_int),
     )
 
     return {"balance_int": bal_int, "needed_int": int(needed_int), "ok": bal_int >= int(needed_int)}
@@ -676,10 +673,16 @@ def send_withdraw_once(
     ):
         return _keep_frozen(db, withdraw_id, "HOT_WALLET_NOT_CONFIGURED", "热钱包地址配置无效，请联系平台处理。")
 
-    # 关键定位打印：币/链、合约、精度、实际 from_address、提现参数。
-    print(f"[sender-debug] coin={coin_symbol} chain={chain_key} to={to_address} net_amount={net_amount}")
-    print(f"[sender-debug] meta contract={contract or '(native)'} decimals={decimals}")
-    print(f"[sender-debug] hotwallet_from_address={_mask_address(sender.from_address)}")
+    logger.debug(
+        "withdraw_send_prepared coin=%s chain=%s to_address=%s token_contract=%s "
+        "decimals=%s from_address=%s",
+        coin_symbol,
+        chain_key,
+        _mask_address(to_address),
+        _mask_address(contract) if contract else "(native)",
+        decimals,
+        _mask_address(sender.from_address),
+    )
 
     try:
         if contract:

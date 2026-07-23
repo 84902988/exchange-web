@@ -153,11 +153,12 @@ class HotWalletSender:
         self.account = Account.from_key(hot_private_key)
         self.from_address = self.w3.to_checksum_address(self.account.address)
 
-        print("====== HOT WALLET DEBUG ======")
-        print("[hotwallet] chain_key =", chain_key)
-        print("[hotwallet] rpc_url  =", _mask_rpc_url(self.rpc_url))
-        print("[hotwallet] from_address =", _mask_address(self.from_address))
-        print("================================")
+        logger.debug(
+            "hotwallet_initialized chain_key=%s rpc_url=%s from_address=%s",
+            chain_key,
+            _mask_rpc_url(self.rpc_url),
+            _mask_address(self.from_address),
+        )
 
     # ---------- Nonce lock（你原来有 sender_nonce_locks 就保留）
     def _lock_sender_nonce(self, db: Session, wait_seconds: int = 10) -> int:

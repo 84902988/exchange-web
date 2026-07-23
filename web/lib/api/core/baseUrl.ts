@@ -1,5 +1,4 @@
 const LOCAL_API_BASE_URL = "http://127.0.0.1:8000";
-const CPOLAR_IO_API_BASE_URL = "https://moralis-api.cpolar.io";
 
 function getConfiguredApiBaseUrl(): string | null {
   const value = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
@@ -16,11 +15,7 @@ function isLocalApiBaseUrl(value: string): boolean {
 }
 
 function getCpolarIoApiBaseUrl(host: string): string | null {
-  if (host === "moralis-hook.zaf.cpolar.io") {
-    return CPOLAR_IO_API_BASE_URL;
-  }
-
-  if (!host.endsWith(".cpolar.io")) {
+  if (!host.endsWith(".cpolar.io") && !host.endsWith(".cpolar.top")) {
     return null;
   }
 
@@ -53,9 +48,6 @@ export function getRuntimeApiBaseUrl(): string {
       return configuredApiBaseUrl;
     }
 
-    if (host.endsWith(".cpolar.top")) {
-      return CPOLAR_IO_API_BASE_URL;
-    }
   }
 
   return getConfiguredApiBaseUrl() || LOCAL_API_BASE_URL;

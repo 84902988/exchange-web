@@ -176,7 +176,7 @@ export default function TradeScreen() {
 
   const handleBusinessChange = useCallback((key: string) => {
     if (key !== 'spot') {
-      Alert.alert('暂未开放', '当前 V1 仅实现现货交易页。');
+      Alert.alert('暂未开放', '该交易功能暂未开放，请稍后再试。');
       return;
     }
     setActiveBusiness(key);
@@ -212,8 +212,8 @@ export default function TradeScreen() {
 
   const handleSubmit = useCallback(() => {
     Alert.alert(
-      '暂未提交',
-      'TODO：下一步接入 /order/create，并在提交前完成余额、精度和风险校验。',
+      '暂未开放',
+      '下单功能暂未开放，请稍后再试。',
     );
   }, []);
 

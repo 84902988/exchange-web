@@ -80,8 +80,8 @@ def _get_withdraw_log_risk_reason_column(db: Session) -> Optional[str]:
             ).bindparams(bindparam("columns", expanding=True)),
             {"columns": WITHDRAW_LOG_RISK_REASON_COLUMNS},
         ).mappings().all()
-    except Exception as e:
-        print("[withdraw-risk] reason column lookup failed", repr(e))
+    except Exception:
+        logger.exception("withdraw_risk_reason_column_lookup_failed")
         return None
 
     existing = {str(row["column_name"]) for row in rows}
@@ -103,8 +103,8 @@ def _get_withdraw_log_columns(db: Session) -> set[str]:
                 """
             )
         ).mappings().all()
-    except Exception as e:
-        print("[withdraw-list] column lookup failed", repr(e))
+    except Exception:
+        logger.exception("withdraw_log_column_lookup_failed")
         return set()
     return {str(row.get("column_name") or "") for row in rows}
 
@@ -1521,25 +1521,27 @@ def create_withdraw_draft(
     reason_column = _get_withdraw_log_risk_reason_column(db) if need_manual_review else None
 
     if need_manual_review:
-        print(
-            "[withdraw-risk] manual review required",
-            f"trace_id={trace_id}",
-            f"user_id={user_id}",
-            f"symbol={sym}",
-            f"chain_key={ck}",
-            f"amount={amt}",
-            f"reason={risk_reason}",
-            f"force_manual_review={force_manual_review}",
-            f"review_threshold_amount={review_threshold_amount}",
-            f"daily_count={risk.get('daily_count')}",
-            f"daily_withdraw_count_limit={risk.get('daily_withdraw_count_limit')}",
+        logger.info(
+            "withdraw_manual_review_required trace_id=%s user_id=%s symbol=%s "
+            "chain_key=%s amount=%s reason=%s force_manual_review=%s "
+            "review_threshold_amount=%s daily_count=%s daily_withdraw_count_limit=%s",
+            trace_id,
+            user_id,
+            sym,
+            ck,
+            amt,
+            risk_reason,
+            force_manual_review,
+            review_threshold_amount,
+            risk.get("daily_count"),
+            risk.get("daily_withdraw_count_limit"),
         )
         if reason_column is None:
-            print(
-                "[withdraw-risk] no reason column on withdraw_logs; reason logged only",
-                f"trace_id={trace_id}",
-                f"user_id={user_id}",
-                f"reason={risk_reason}",
+            logger.warning(
+                "withdraw_risk_reason_column_missing trace_id=%s user_id=%s reason=%s",
+                trace_id,
+                user_id,
+                risk_reason,
             )
 
     now = _now()

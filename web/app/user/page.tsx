@@ -26,34 +26,6 @@ import UserAvatar from '@/components/user/UserAvatar';
 import { useAuth } from '@/lib/authContext';
 import { getUserAvatarUrl, getUserDisplayName } from '@/lib/userAvatar';
 
-const MOCK_USER_INFO: UserInfo = {
-  id: '0000000000',
-  username: 'Anduin01',
-  email: 'test@example.com',
-  phone: '13800138000',
-  createdAt: '2026-01-01T00:00:00Z',
-  lastLoginAt: '2026-01-05T12:34:56Z',
-  kycLevel: 1,
-  kycStatus: 'APPROVED',
-  nickname: 'Anduin01',
-  avatar: '',
-  accountStatus: 'active',
-  usernameReviewStatus: 'none',
-  nicknameReviewStatus: 'none',
-  avatarReviewStatus: 'none',
-  usernameChangeRecords: [],
-  nicknameChangeRecords: [],
-  avatarChangeRecords: [],
-  lastUsernameChange: '2026-01-01T00:00:00Z',
-  lastNicknameChange: '2026-01-01T00:00:00Z',
-  usernameChangeCount: 0,
-  nicknameChangeCount: 0,
-  usernameChangeResetDate: '2027-01-01T00:00:00Z',
-  nicknameChangeResetDate: '2026-01-08T00:00:00Z',
-  withdrawLocked: false,
-  withdrawLockedReason: '',
-};
-
 const formatDateTime = (value?: string | null, localeCode = 'zh-CN') => {
   if (!value) return '-';
   const date = new Date(value);
@@ -263,7 +235,7 @@ export default function UserPage() {
         }
 
         console.error('Failed to fetch user center data:', e);
-        setUserInfo(MOCK_USER_INFO);
+        setUserInfo(null);
         setFeePreferenceMessage(t('vipFeeLoadFailed', 'user'));
       } finally {
         if (!alive) return;

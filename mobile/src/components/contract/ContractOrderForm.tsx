@@ -187,7 +187,7 @@ function ContractOrderForm({
       <View style={styles.bottomSection}>
         <Text style={styles.loginHint}>
           {isLoggedIn
-            ? '真实提交保留 TODO 风险确认'
+            ? '合约下单功能暂未开放'
             : '登录后可交易，行情/K线可查看'}
         </Text>
 

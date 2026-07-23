@@ -68,8 +68,14 @@ Thumbs.db
 
 # Local artifacts, archives, and temporary work
 docs/
+.codex/
 *-clipboard-*
 pasted-text*.txt
+playwright-report/
+test-results/
+blob-report/
+*.har
+*.trace.zip
 *.zip
 *.7z
 *.tar
