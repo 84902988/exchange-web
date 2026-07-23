@@ -159,6 +159,8 @@ const STOCK_CONTRACT_TICKER_BATCH_SIZE = 20;
 const CONTRACT_TICKER_PREWARM_SIZE = 20;
 const CONTRACT_TICKER_REFRESH_TTL_MS = 25_000;
 const STOCK_CONTRACT_TICKER_REFRESH_TTL_MS = 60_000;
+const CONTRACT_TICKER_RESTART_RETRY_MIN_MS = 250;
+const CONTRACT_TICKER_RESTART_RETRY_JITTER_MS = 250;
 const VISIBLE_TICKER_LOAD_DEBOUNCE_MS = 350;
 const PAIR_SELECTOR_METADATA_CACHE_TTL_MS = 30_000;
 const MARKET_SELECTOR_CACHE_VERSION = 'v3';
@@ -177,6 +179,38 @@ const contractTickerFetchedAtStore = new Map<string, number>();
 const contractTickerBatchHydratingStore = new Set<string>();
 const contractTickerSubscribers = new Set<() => void>();
 let contractTickerPersistenceSeeded = false;
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
+export function isTransientContractTickerStartupError(error: unknown) {
+  if (!(error instanceof Error) || isAbortError(error)) return false;
+  const code = String((error as Error & { code?: unknown }).code ?? '').trim().toUpperCase();
+  return code === 'NETWORK_ERROR'
+    || /^HTTP Error 50[234]:/i.test(error.message)
+    || /\b(fetch failed|network error|failed to fetch)\b/i.test(error.message);
+}
+
+function waitForContractTickerRetry(signal: AbortSignal) {
+  const delayMs = CONTRACT_TICKER_RESTART_RETRY_MIN_MS
+    + Math.floor(Math.random() * CONTRACT_TICKER_RESTART_RETRY_JITTER_MS);
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', handleAbort);
+      resolve();
+    }, delayMs);
+    const handleAbort = () => {
+      window.clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', handleAbort, { once: true });
+  });
+}
 
 function notifyContractTickerSubscribers() {
   contractTickerSubscribers.forEach((subscriber) => subscriber());
@@ -1290,6 +1324,7 @@ export default function GlobalMarketSelector({
   const contractTickerHydratingRef = useRef<Set<string>>(contractTickerHydratingStore);
   const contractTickerFetchedAtRef = useRef<Map<string, number>>(contractTickerFetchedAtStore);
   const contractTickerBatchHydratingRef = useRef<Set<string>>(contractTickerBatchHydratingStore);
+  const contractTickerAbortControllersRef = useRef<Set<AbortController>>(new Set());
   const visibleTickerDebounceRef = useRef<number | null>(null);
   const preloadStartedRef = useRef(false);
   const loadedSpotPairKeysRef = useRef<Set<string>>(new Set());
@@ -1448,6 +1483,11 @@ export default function GlobalMarketSelector({
     };
   }, []);
 
+  useEffect(() => () => {
+    contractTickerAbortControllersRef.current.forEach((controller) => controller.abort());
+    contractTickerAbortControllersRef.current.clear();
+  }, []);
+
   useEffect(() => {
     if (seedPersistedContractTickerCacheOnce() > 0) {
       notifyContractTickerSubscribers();
@@ -1554,6 +1594,8 @@ export default function GlobalMarketSelector({
     notifyContractTickerSubscribers();
 
     const loadTickers = async () => {
+      const controller = new AbortController();
+      contractTickerAbortControllersRef.current.add(controller);
       try {
         const batches: string[][] = [];
         for (let index = 0; index < selectedSymbols.length; index += safeBatchSize) {
@@ -1574,7 +1616,20 @@ export default function GlobalMarketSelector({
             }
             contractTickerBatchHydratingRef.current.add(batchKey);
             try {
-              const response = await getContractTickers({ symbols: batch, limit: batch.length });
+              let response;
+              try {
+                response = await getContractTickers(
+                  { symbols: batch, limit: batch.length },
+                  { signal: controller.signal, maxRetries: 0 },
+                );
+              } catch (error) {
+                if (!isTransientContractTickerStartupError(error) || controller.signal.aborted) throw error;
+                await waitForContractTickerRetry(controller.signal);
+                response = await getContractTickers(
+                  { symbols: batch, limit: batch.length },
+                  { signal: controller.signal, maxRetries: 0 },
+                );
+              }
               const cachedItems = cacheContractTickerItems(
                 contractTickerCacheRef.current,
                 response.items,
@@ -1603,7 +1658,9 @@ export default function GlobalMarketSelector({
                 })));
               }
             } catch (error) {
-              console.warn('GlobalMarketSelector contract ticker batch warning:', error);
+              if (!isAbortError(error)) {
+                console.warn('GlobalMarketSelector contract ticker batch warning:', error);
+              }
             } finally {
               batch.forEach((item) => contractTickerHydratingRef.current.delete(item));
               contractTickerBatchHydratingRef.current.delete(batchKey);
@@ -1615,6 +1672,7 @@ export default function GlobalMarketSelector({
       } catch (error) {
         console.error('GlobalMarketSelector contract ticker load error:', error);
       } finally {
+        contractTickerAbortControllersRef.current.delete(controller);
         selectedSymbols.forEach((item) => contractTickerHydratingRef.current.delete(item));
         notifyContractTickerSubscribers();
       }
