@@ -1601,7 +1601,6 @@ export default function SpotTradingForm({
       setPendingMarketOrderError('');
 
       const result = await createSpotOrder(order.payload);
-      console.log('Order response:', result);
 
       setSuccessMessage(buildOrderSuccessMessage(result, order.payload, copy));
       setAmount('');

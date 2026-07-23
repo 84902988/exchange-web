@@ -13,9 +13,11 @@ from .dealer_risk_hit_log import DealerRiskHitLog
 from .dealer_risk_limit import DealerRiskLimit
 from .trading_pair import TradingPair
 from .order import Order
+from .trade import Trade
 from .vip_fee_level import VipFeeLevel
 from .vip_fee_level_condition import VipFeeLevelCondition
 from .user_transfer import UserTransfer
+from .internal_transfer import InternalTransfer
 from .user_vip_snapshot import UserVipSnapshot
 from .user_rcb_lock import UserRcbLock
 from .user_fee_preference import UserFeePreference
@@ -95,9 +97,11 @@ __all__ = [
     "DealerRiskLimit",
     "TradingPair",
     "Order",
+    "Trade",
     "VipFeeLevel",
     "VipFeeLevelCondition",
     "UserTransfer",
+    "InternalTransfer",
     "UserVipSnapshot",
     "UserRcbLock",
     "UserFeePreference",

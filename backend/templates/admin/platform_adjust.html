@@ -319,7 +319,7 @@
       <div class="section-title">操作说明</div>
       <ol class="muted platform-adjust-help-list">
         <li>当前仅支持平台账户 user_id = {{ platform_user_id }}。</li>
-        <li>本轮仅修改 available_amount，不处理 frozen_amount。</li>
+        <li>本次操作仅修改 available_amount，不处理 frozen_amount。</li>
         <li>调账成功后会同时写入 user_balances、balance_logs、admin_balance_adjust_logs。</li>
         <li>减少余额时会校验可用余额，不能减成负数。</li>
       </ol>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from jose import JWTError
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -17,6 +18,7 @@ router = APIRouter(
 )
 
 SPOT_PRIVATE_WS_AUTH_PROTOCOL = "spot-auth"
+logger = logging.getLogger(__name__)
 
 
 def _private_ws_protocols(websocket: WebSocket) -> list[str]:
@@ -67,8 +69,8 @@ async def spot_private_ws(websocket: WebSocket):
 
     try:
         user_id = _get_user_id_from_websocket(websocket)
-    except Exception as e:
-        print("[spot_private_ws auth error]", repr(e))
+    except Exception:
+        logger.warning("spot_private_ws_auth_rejected")
         await websocket.close(code=1008)
         return
 

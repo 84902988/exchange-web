@@ -241,12 +241,12 @@ def add_address_to_streams(
         addr = addr.lower()
 
     if not addr:
-        print("[moralis] address empty")
+        logger.warning("moralis_address_empty network=%s", nc)
         _sync_chain_watch_status(db, chain_key=chain_key, chain_id=chain_id, status="FAIL", error="address empty")
         return False
 
     if not MORALIS_API_KEY:
-        print("[moralis] MORALIS_API_KEY missing")
+        logger.warning("moralis_api_key_missing network=%s", nc)
         _sync_chain_watch_status(
             db,
             chain_key=chain_key,

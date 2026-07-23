@@ -181,7 +181,7 @@ export default function ContractScreen() {
 
   const handleBusinessChange = useCallback((key: string) => {
     if (key !== 'contract') {
-      Alert.alert('暂未开放', '该入口已预留，V1 当前只实现合约交易主页面。');
+      Alert.alert('暂未开放', '该交易功能暂未开放，请稍后再试。');
       return;
     }
     setActiveBusiness(key);
@@ -236,8 +236,8 @@ export default function ContractScreen() {
 
   const handleSubmit = useCallback(() => {
     Alert.alert(
-      '合约下单未提交',
-      'TODO：已确认真实接口为 /contract/orders/open 与 /contract/orders/close-summary；移动端 V1 本轮先完成行情、账户和交易结构，下单提交继续等待精度、保证金和风险确认。',
+      '暂未开放',
+      '合约下单功能暂未开放，请稍后再试。',
     );
   }, []);
 

@@ -13,7 +13,7 @@ The script:
 - waits for the emulator to become ready
 - runs `adb reverse tcp:8081 tcp:8081`
 - starts Metro in a new PowerShell window only when Metro is not already running on port `8081`
-- runs `npm.cmd run android -- --no-packager` from `D:\exchange-web\mobile`
+- runs `npm.cmd run android -- --no-packager` from the repository's `mobile` directory
 
 On Windows, use `-ExecutionPolicy Bypass` if direct script execution is blocked by local PowerShell policy.
 If Chinese output looks garbled, use Windows Terminal; the script also switches the console to the UTF-8 code page automatically.

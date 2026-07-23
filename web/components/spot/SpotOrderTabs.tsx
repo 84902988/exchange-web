@@ -1746,10 +1746,6 @@ function TradeRecords({
   const { t } = useLocaleContext()
   if (rows.length === 0) return null
 
-  if (process.env.NODE_ENV !== 'production') {
-    console.log('[spot trades rows]', rows.slice(0, 5))
-  }
-
   return (
     <div className="space-y-2 p-2">
       {rows.map((item) => {
@@ -1757,16 +1753,6 @@ function TradeRecords({
         const directFeeDisplay = formatTradeFeeDisplay(item)
         const fallbackFeeDisplay = getTradeOrderFeeDisplay(item, orderFeeDisplayMap)
         const feeDisplay = directFeeDisplay !== '--' ? directFeeDisplay : fallbackFeeDisplay
-
-        if (process.env.NODE_ENV !== 'production') {
-          console.log('[trade fee display]', {
-            id: item.trade_id,
-            fee_amount: item.fee_amount ?? item.feeAmount ?? item.fee,
-            feeAsset: item.fee_asset_symbol || item.feeAssetSymbol || item.fee_asset || item.feeAsset || item.fee_asset_id,
-            fallbackFee: fallbackFeeDisplay,
-            display: feeDisplay,
-          })
-        }
 
         return (
           <div

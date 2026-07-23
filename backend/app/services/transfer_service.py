@@ -46,8 +46,6 @@ class TransferService:
         user_id: int,
         payload: AccountTransferRequest,
     ) -> AccountTransferSubmitData:
-        self._ensure_table(db)
-
         symbol = self._normalize_symbol(payload.symbol)
         from_account = self._normalize_account(payload.from_account, field_name="from_account")
         to_account = self._normalize_account(payload.to_account, field_name="to_account")
@@ -137,8 +135,6 @@ class TransferService:
         from_account: str = "",
         to_account: str = "",
     ) -> AccountTransferRecordsData:
-        self._ensure_table(db)
-
         normalized_page = max(int(page or 1), 1)
         normalized_page_size = max(min(int(page_size or 20), 200), 1)
 
@@ -176,13 +172,6 @@ class TransferService:
             page=normalized_page,
             page_size=normalized_page_size,
         )
-
-    def _ensure_table(self, db: Session) -> None:
-        # 临时最小闭环方案：
-        # 当前对话限制不允许改 app/db/models/__init__.py 或补 Alembic migration，
-        # 因此这里在首次调用时按需建表，保证 /account/transfer 能本地闭环。
-        # 后续应改为正式的 Alembic migration，并把模型纳入统一注册流程。
-        InternalTransfer.__table__.create(bind=db.get_bind(), checkfirst=True)
 
     def _lock_balance(
         self,

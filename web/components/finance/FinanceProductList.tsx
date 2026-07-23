@@ -83,8 +83,10 @@ export default function FinanceProductList({
         {products.map((product) => (
           <div 
             key={product.id} 
-            className="grid grid-cols-12 gap-4 p-4 hover:bg-white/5 transition-colors cursor-pointer"
-            onClick={() => onProductClick?.(product.id)}
+            className={`grid grid-cols-12 gap-4 p-4 transition-colors ${
+              onProductClick ? 'cursor-pointer hover:bg-white/5' : ''
+            }`}
+            onClick={onProductClick ? () => onProductClick(product.id) : undefined}
           >
             <div className="col-span-4 flex items-center">
               <div className="text-white font-medium">{product.name}</div>

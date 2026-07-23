@@ -11,8 +11,6 @@ const allowedDevOrigins = Array.from(
   new Set([
     "127.0.0.1",
     "localhost",
-    "sample-hook.cpolar.io",
-    "sample-hook.zaf.cpolar.io",
     ...configuredDevOrigins,
   ]),
 );

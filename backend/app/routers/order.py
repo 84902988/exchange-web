@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
@@ -21,6 +22,7 @@ from app.services.spot_public_depth_events import publish_spot_public_depth_refr
 
 
 router = APIRouter(prefix="/order", tags=["order"])
+logger = logging.getLogger(__name__)
 
 
 def _fire_and_forget(coro, label: str) -> None:
@@ -29,8 +31,8 @@ def _fire_and_forget(coro, label: str) -> None:
     except RuntimeError:
         try:
             asyncio.run(coro)
-        except Exception as e:
-            print(f"[{label}]", repr(e))
+        except Exception:
+            logger.exception(label)
         return
 
     task = loop.create_task(coro)
@@ -38,8 +40,8 @@ def _fire_and_forget(coro, label: str) -> None:
     def _done_callback(done_task: asyncio.Task) -> None:
         try:
             done_task.result()
-        except Exception as e:
-            print(f"[{label}]", repr(e))
+        except Exception:
+            logger.exception(label)
 
     task.add_done_callback(_done_callback)
 
@@ -128,8 +130,8 @@ def create_order_api(
             ),
             "order private ws push error",
         )
-    except Exception as e:
-        print("[order private ws push error]", repr(e))
+    except Exception:
+        logger.exception("order private ws push error")
 
     for item in extra_private_updates:
         try:
@@ -141,8 +143,8 @@ def create_order_api(
                 ),
                 "order private ws push error",
             )
-        except Exception as e:
-            print("[order private ws push error]", repr(e))
+        except Exception:
+            logger.exception("order private ws push error")
 
     balance_user_ids = {int(user_id)}
     for item in extra_private_updates:
@@ -203,8 +205,8 @@ def cancel_order_api(
             ),
             "order private ws push error",
         )
-    except Exception as e:
-        print("[order private ws push error]", repr(e))
+    except Exception:
+        logger.exception("order private ws push error")
 
     _broadcast_spot_balance_update(int(user_id))
     _broadcast_public_orderbook(order_symbol)
