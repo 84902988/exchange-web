@@ -30,6 +30,11 @@ export type ContractTransferResponse = {
 
 export type ContractQuoteAvailability = {
   market_status?: 'OPEN' | 'CLOSED' | 'UNKNOWN' | string
+  market_session_type?: string | null
+  feed_state?: 'LIVE' | 'STALE' | 'UNAVAILABLE' | string | null
+  instrument_state?: 'NORMAL' | 'SUSPENDED' | 'DELISTED' | 'CIRCUIT_BREAKER' | 'UNKNOWN' | string | null
+  execution_state?: 'TRADABLE' | 'DISPLAY_ONLY' | 'BLOCKED' | string | null
+  session_reason_code?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
   quote_source?: 'LIVE' | 'LAST_GOOD_BBO' | 'LAST_VALID' | 'FALLBACK' | 'STALE' | 'INVALID' | string
   closed_market_execution_mode?: 'DISABLED' | 'LAST_GOOD_BBO' | string
@@ -89,6 +94,8 @@ export type ContractMarketViewDetail = {
   market_type: string
   category: string
   market_status: string
+  market_session_type?: string | null
+  session_reason_code?: string | null
   display_state: ContractMarketViewDisplayState
   display_price?: string | number | null
   display_price_source: string
@@ -196,6 +203,10 @@ export type ContractQuote = ContractQuoteAvailability & {
   market_timezone?: string | null
   market_trading_hours?: string | null
   market_session_type?: string | null
+  feed_state?: string | null
+  instrument_state?: string | null
+  execution_state?: string | null
+  session_reason_code?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
   quote_source?: 'LIVE' | 'LAST_GOOD_BBO' | 'LAST_VALID' | 'FALLBACK' | 'STALE' | 'INVALID' | string
   closed_market_execution_mode?: 'DISABLED' | 'LAST_GOOD_BBO' | string
@@ -247,6 +258,10 @@ export type ContractDepth = {
   market_timezone?: string | null
   market_trading_hours?: string | null
   market_session_type?: string | null
+  feed_state?: string | null
+  instrument_state?: string | null
+  execution_state?: string | null
+  session_reason_code?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
   quote_source?: 'LIVE' | 'LAST_GOOD_BBO' | 'LAST_VALID' | 'FALLBACK' | 'STALE' | 'INVALID' | string
   depth_mode?: ContractDepthMode
@@ -284,6 +299,11 @@ export type ContractSymbolItem = {
   provider_symbol: string
   quote_asset: string
   tp_sl_trigger_price_type?: ContractTpSlTriggerPriceType | string | null
+  closed_market_execution_mode?: 'DISABLED' | 'LAST_GOOD_BBO' | string | null
+  holiday_calendar_code?: string | null
+  session_profile_code?: string | null
+  session_timezone_override?: string | null
+  extended_hours_execution_mode?: 'DISPLAY_ONLY' | 'BLOCKED' | string | null
   price_precision: number
   quantity_precision: number
   max_leverage: number
@@ -294,6 +314,10 @@ export type ContractSymbolItem = {
   market_timezone?: string | null
   market_trading_hours?: string | null
   market_session_type?: string | null
+  feed_state?: string | null
+  instrument_state?: string | null
+  execution_state?: string | null
+  session_reason_code?: string | null
 }
 
 export type ContractSymbolListResponse = {
@@ -312,6 +336,10 @@ export type ContractTickerItem = {
   market_timezone?: string | null
   market_trading_hours?: string | null
   market_session_type?: string | null
+  feed_state?: string | null
+  instrument_state?: string | null
+  execution_state?: string | null
+  session_reason_code?: string | null
   quote_freshness?: 'LIVE' | 'STALE' | 'LAST_VALID' | 'FALLBACK' | string
   last_price?: string | number | null
   price?: string | number | null

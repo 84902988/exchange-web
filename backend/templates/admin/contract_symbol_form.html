@@ -30,6 +30,18 @@
   "DISABLED": "闭市不可交易",
   "LAST_GOOD_BBO": "按最后有效买卖价成交"
 } %}
+{% set session_profile_code_labels = {
+  "CRYPTO_24_7": "数字货币 24×7",
+  "US_EQUITY": "美股现金时段",
+  "US_INDEX_EXTENDED": "美国指数扩展时段",
+  "FOREX_24X5": "外汇 24×5",
+  "METAL_23X5": "贵金属 23×5",
+  "ENERGY_CFD": "能源 CFD"
+} %}
+{% set extended_hours_execution_mode_labels = {
+  "DISPLAY_ONLY": "仅展示，不允许成交",
+  "BLOCKED": "完全禁止"
+} %}
 
 {% block title %}{{ form_title }}{% endblock %}
 {% block page_title %}{{ form_title }}{% endblock %}
@@ -181,10 +193,43 @@
             </div>
             <div class="field">
               <label for="closed_market_execution_mode">闭市成交模式</label>
-              <div class="field-help">股票、指数、贵金属、原油等有交易时段的 CFD 标的默认支持闭市按最后有效买卖价成交；数字货币永续默认不允许闭市或旧价成交。若外部行情长期异常，最后有效报价可能持续作为闭市参考价，后续可按运营需求增加有效期或交易日历控制。</div>
+              <div class="field-help">闭市报价只能作为展示和诊断参考，不能替代实时可执行买一卖一。当前交易守卫仍会禁止闭市成交。</div>
               <select id="closed_market_execution_mode" name="closed_market_execution_mode">
                 {% for option in closed_market_execution_mode_options %}
                   <option value="{{ option }}" {% if (form.closed_market_execution_mode or 'DISABLED') == option %}selected{% endif %}>{{ closed_market_execution_mode_labels.get(option, option) }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field">
+              <label for="session_profile_code">交易时段模板</label>
+              <div class="field-help">必选。决定常规开市、盘前盘后和每日维护时段；运行时不会根据代码后缀猜测。</div>
+              <select id="session_profile_code" name="session_profile_code" required>
+                <option value="" {% if not form.session_profile_code or form.session_profile_code == 'UNKNOWN' %}selected{% endif %}>请选择交易时段模板</option>
+                {% for option in session_profile_code_options %}
+                  <option value="{{ option }}" {% if form.session_profile_code == option %}selected{% endif %}>{{ session_profile_code_labels.get(option, option) }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field">
+              <label for="holiday_calendar_code">假期日历</label>
+              <div class="field-help">美股和美国指数必须选 US。iTick 的 GB 是行情路由命名，不代表 DJI/NAS100/SPX 使用英国日历。</div>
+              <select id="holiday_calendar_code" name="holiday_calendar_code">
+                {% for option in holiday_calendar_code_options %}
+                  <option value="{{ option }}" {% if (form.holiday_calendar_code or '') == option %}selected{% endif %}>{% if option %}{{ option }}{% else %}不使用假期日历{% endif %}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field">
+              <label for="session_timezone_override">时区覆盖</label>
+              <div class="field-help">通常留空并使用模板时区；仅供应商明确例外时填写 IANA 时区。</div>
+              <input id="session_timezone_override" type="text" name="session_timezone_override" value="{{ form.session_timezone_override or '' }}" placeholder="例如 America/New_York" />
+            </div>
+            <div class="field">
+              <label for="extended_hours_execution_mode">盘前盘后模式</label>
+              <div class="field-help">当前默认仅展示，价格可继续变化，但不会被当成常规时段可执行 BBO。</div>
+              <select id="extended_hours_execution_mode" name="extended_hours_execution_mode">
+                {% for option in extended_hours_execution_mode_options %}
+                  <option value="{{ option }}" {% if (form.extended_hours_execution_mode or 'DISPLAY_ONLY') == option %}selected{% endif %}>{{ extended_hours_execution_mode_labels.get(option, option) }}</option>
                 {% endfor %}
               </select>
             </div>
@@ -261,7 +306,9 @@
         var categorySelect = document.getElementById("category");
         var providerSelect = document.getElementById("provider");
         var modeSelect = document.getElementById("closed_market_execution_mode");
-        if (!categorySelect || !providerSelect || !modeSelect) {
+        var profileSelect = document.getElementById("session_profile_code");
+        var calendarSelect = document.getElementById("holiday_calendar_code");
+        if (!categorySelect || !providerSelect || !modeSelect || !profileSelect || !calendarSelect) {
           return;
         }
         var tradfiCategories = {
@@ -275,8 +322,15 @@
           FUTURES: true
         };
         var touched = false;
+        var sessionTouched = false;
         modeSelect.addEventListener("change", function () {
           touched = true;
+        });
+        profileSelect.addEventListener("change", function () {
+          sessionTouched = true;
+        });
+        calendarSelect.addEventListener("change", function () {
+          sessionTouched = true;
         });
         function updateDefaultMode() {
           if (touched) {
@@ -290,8 +344,36 @@
           }
           modeSelect.value = (tradfiCategories[category] || provider === "ITICK") ? "LAST_GOOD_BBO" : "DISABLED";
         }
-        categorySelect.addEventListener("change", updateDefaultMode);
-        providerSelect.addEventListener("change", updateDefaultMode);
+        function updateSessionDefaults() {
+          if (sessionTouched) {
+            return;
+          }
+          var category = String(categorySelect.value || "").toUpperCase();
+          var defaults = {
+            CRYPTO: ["CRYPTO_24_7", ""],
+            STOCK: ["US_EQUITY", "US"],
+            INDEX: ["US_INDEX_EXTENDED", "US"],
+            FOREX: ["FOREX_24X5", ""],
+            METAL: ["METAL_23X5", ""],
+            GOLD: ["METAL_23X5", ""],
+            COMMODITY: ["ENERGY_CFD", ""],
+            FUTURES: ["ENERGY_CFD", ""]
+          };
+          var selected = defaults[category];
+          if (selected) {
+            profileSelect.value = selected[0];
+            calendarSelect.value = selected[1];
+          } else {
+            profileSelect.value = "";
+            calendarSelect.value = "";
+          }
+        }
+        function updateDefaults() {
+          updateDefaultMode();
+          updateSessionDefaults();
+        }
+        categorySelect.addEventListener("change", updateDefaults);
+        providerSelect.addEventListener("change", updateDefaults);
       })();
     </script>
   {% endif %}

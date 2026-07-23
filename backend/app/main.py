@@ -101,6 +101,10 @@ from app.services.spot_public_depth_events import (
     start_spot_public_depth_event_subscriber,
     stop_spot_public_depth_event_subscriber,
 )
+from app.services.contract_calendar_refresh import (
+    start_contract_calendar_refresh,
+    stop_contract_calendar_refresh,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -553,6 +557,11 @@ async def _startup_spot_private_event_bridge():
     start_spot_public_depth_event_subscriber()
 
 
+@app.on_event("startup")
+def _startup_contract_calendar_refresh():
+    start_contract_calendar_refresh()
+
+
 @app.on_event("shutdown")
 def _shutdown():
     global _withdraw_watcher, _contract_tp_sl_job, _contract_limit_order_job
@@ -618,6 +627,11 @@ async def _shutdown_spot_private_event_bridge():
     await stop_spot_public_depth_event_subscriber()
     await stop_spot_private_event_relay()
     await stop_spot_private_event_subscriber()
+
+
+@app.on_event("shutdown")
+async def _shutdown_contract_calendar_refresh():
+    await stop_contract_calendar_refresh()
 
 
 # =========================

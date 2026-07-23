@@ -27,6 +27,10 @@ class ContractQuoteResponse(BaseModel):
     market_timezone: Optional[str] = None
     market_trading_hours: Optional[str] = None
     market_session_type: Optional[str] = None
+    feed_state: Optional[str] = None
+    instrument_state: Optional[str] = None
+    execution_state: Optional[str] = None
+    session_reason_code: Optional[str] = None
     quote_freshness: str = "FALLBACK"
     quote_source: str = "UNKNOWN"
     closed_market_execution_mode: str = "DISABLED"
@@ -75,6 +79,10 @@ class ContractDepthResponse(BaseModel):
     market_timezone: Optional[str] = None
     market_trading_hours: Optional[str] = None
     market_session_type: Optional[str] = None
+    feed_state: Optional[str] = None
+    instrument_state: Optional[str] = None
+    execution_state: Optional[str] = None
+    session_reason_code: Optional[str] = None
     quote_freshness: str = "FALLBACK"
     quote_source: str = "UNKNOWN"
     depth_mode: str = "FULL_DEPTH"
@@ -111,6 +119,10 @@ class ContractSymbolItem(BaseModel):
     quote_asset: str
     tp_sl_trigger_price_type: str = "MARK_PRICE"
     closed_market_execution_mode: str = "DISABLED"
+    holiday_calendar_code: Optional[str] = None
+    session_profile_code: str = "UNKNOWN"
+    session_timezone_override: Optional[str] = None
+    extended_hours_execution_mode: str = "DISPLAY_ONLY"
     price_precision: int = 8
     quantity_precision: int = 8
     max_leverage: int = 1
@@ -121,6 +133,10 @@ class ContractSymbolItem(BaseModel):
     market_timezone: Optional[str] = None
     market_trading_hours: Optional[str] = None
     market_session_type: Optional[str] = None
+    feed_state: Optional[str] = None
+    instrument_state: Optional[str] = None
+    execution_state: Optional[str] = None
+    session_reason_code: Optional[str] = None
 
 
 class ContractSymbolListResponse(BaseModel):
@@ -139,6 +155,10 @@ class ContractTickerItem(BaseModel):
     market_timezone: Optional[str] = None
     market_trading_hours: Optional[str] = None
     market_session_type: Optional[str] = None
+    feed_state: Optional[str] = None
+    instrument_state: Optional[str] = None
+    execution_state: Optional[str] = None
+    session_reason_code: Optional[str] = None
     quote_freshness: str = "FALLBACK"
     last_price: Optional[str] = None
     price_change_24h: Optional[str] = None
@@ -199,6 +219,8 @@ class ContractMarketViewDetail(BaseModel):
     market_type: str = "CONTRACT"
     category: str = "INTERNAL"
     market_status: str = "UNKNOWN"
+    market_session_type: Optional[str] = None
+    session_reason_code: Optional[str] = None
     display_state: str = "UNAVAILABLE"
     display_price: Optional[str] = None
     display_price_source: str = "NONE"

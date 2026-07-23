@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+from typing import Optional
 
 from sqlalchemy import BigInteger, CheckConstraint, DateTime, Index, Integer, Numeric, SmallInteger, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
@@ -45,6 +46,15 @@ class ContractSymbol(Base):
             "closed_market_execution_mode IN ('DISABLED', 'LAST_GOOD_BBO')",
             name="ck_contract_symbols_closed_market_execution_mode",
         ),
+        CheckConstraint(
+            "session_profile_code IN ('UNKNOWN', 'CRYPTO_24_7', 'US_EQUITY', 'US_INDEX_EXTENDED', "
+            "'FOREX_24X5', 'METAL_23X5', 'ENERGY_CFD')",
+            name="ck_contract_symbols_session_profile_code",
+        ),
+        CheckConstraint(
+            "extended_hours_execution_mode IN ('DISPLAY_ONLY', 'BLOCKED')",
+            name="ck_contract_symbols_extended_hours_execution_mode",
+        ),
         Index("idx_contract_symbols_category", "category"),
         Index("idx_contract_symbols_provider", "provider"),
         Index("idx_contract_symbols_status", "status"),
@@ -60,6 +70,14 @@ class ContractSymbol(Base):
     quote_asset: Mapped[str] = mapped_column(String(20), nullable=False, default="USDT")
     tp_sl_trigger_price_type: Mapped[str] = mapped_column(String(20), nullable=False, default="MARK_PRICE")
     closed_market_execution_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="DISABLED")
+    holiday_calendar_code: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    session_profile_code: Mapped[str] = mapped_column(String(32), nullable=False, default="UNKNOWN")
+    session_timezone_override: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    extended_hours_execution_mode: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="DISPLAY_ONLY",
+    )
     price_precision: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
     quantity_precision: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
     min_quantity: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False, default=lambda: Decimal("0"))

@@ -2758,6 +2758,12 @@ class ContractMarketGateway:
                 "low_24h": quote.get("low_24h"),
                 "base_volume_24h": quote.get("base_volume_24h"),
                 "quote_volume_24h": quote.get("quote_volume_24h"),
+                "market_status": quote.get("market_status"),
+                "market_session_type": quote.get("market_session_type"),
+                "feed_state": quote.get("feed_state"),
+                "instrument_state": quote.get("instrument_state"),
+                "execution_state": quote.get("execution_state"),
+                "session_reason_code": quote.get("session_reason_code"),
                 "source": quote.get("source"),
             }
         )
@@ -2793,6 +2799,9 @@ class ContractMarketGateway:
                 "execution_ask": state.get("execution_ask"),
                 "display_state": state.get("display_state"),
                 "executable": state.get("executable"),
+                "market_status": state.get("market_status"),
+                "market_session_type": state.get("market_session_type"),
+                "session_reason_code": state.get("session_reason_code"),
                 "ticker_24h": {
                     key: (state.get("ticker") or {}).get(key)
                     for key in (

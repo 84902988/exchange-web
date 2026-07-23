@@ -36,6 +36,15 @@
     "DISABLED": "闭市不可交易",
     "LAST_GOOD_BBO": "最后有效BBO"
   } %}
+  {% set session_profile_code_labels = {
+    "UNKNOWN": "未配置",
+    "CRYPTO_24_7": "数字货币 24×7",
+    "US_EQUITY": "美股现金时段",
+    "US_INDEX_EXTENDED": "美国指数扩展时段",
+    "FOREX_24X5": "外汇 24×5",
+    "METAL_23X5": "贵金属 23×5",
+    "ENERGY_CFD": "能源 CFD"
+  } %}
   {% set current_url = request.url.path %}
   {% if request.url.query %}
     {% set current_url = request.url.path ~ '?' ~ request.url.query %}
@@ -121,6 +130,9 @@
                 <th class="nowrap">计价币种</th>
                 <th class="nowrap">TP/SL 触发</th>
                 <th class="nowrap">闭市成交</th>
+                <th class="nowrap">交易时段模板</th>
+                <th class="nowrap">假期日历</th>
+                <th class="nowrap">盘前盘后</th>
                 <th class="text-right admin-number">杠杆</th>
                 <th class="text-right admin-number">人工单边绝对加点(U)</th>
                 <th class="text-right admin-number">强平阈值</th>
@@ -141,6 +153,9 @@
                   <td class="mono nowrap">{{ item.quote_asset }}</td>
                   <td><span class="admin-badge admin-badge-secondary">{{ tp_sl_trigger_price_type_labels.get(item.tp_sl_trigger_price_type, item.tp_sl_trigger_price_type_label) }}</span></td>
                   <td><span class="admin-badge admin-badge-secondary">{{ closed_market_execution_mode_labels.get(item.closed_market_execution_mode, item.closed_market_execution_mode_label) }}</span></td>
+                  <td><span class="admin-badge admin-badge-secondary">{{ session_profile_code_labels.get(item.session_profile_code, item.session_profile_code) }}</span></td>
+                  <td class="mono nowrap">{{ item.holiday_calendar_code or '-' }}</td>
+                  <td class="nowrap">{% if item.extended_hours_execution_mode == 'DISPLAY_ONLY' %}仅展示{% else %}禁止{% endif %}</td>
                   <td class="admin-amount">{{ item.leverage_text }}</td>
                   <td class="admin-amount">{{ item.spread_x }}</td>
                   <td class="admin-amount">{{ item.liquidation_threshold }}</td>

@@ -88,8 +88,23 @@ def _load_contract_market_service_module():
     _module(
         "app.services.itick_holiday_service",
         MARKET_STATUS_CLOSED="CLOSED",
+        MARKET_STATUS_HOLIDAY="HOLIDAY",
+        MARKET_STATUS_TEXT_CLOSED="休市中",
+        MARKET_STATUS_TEXT_OPEN="交易中",
+        MARKET_STATUS_TEXT_UNKNOWN="交易时段未知",
+        MARKET_STATUS_UNKNOWN="UNKNOWN",
         ItickMarketStatus=object,
         itick_holiday_service=SimpleNamespace(),
+    )
+    _module(
+        "app.services.contract_session_authority",
+        contract_session_authority=SimpleNamespace(),
+    )
+    _module(
+        "app.services.contract_session_profiles",
+        SESSION_HOLIDAY="HOLIDAY",
+        SESSION_REGULAR_OPEN="REGULAR_OPEN",
+        SESSION_UNKNOWN="UNKNOWN",
     )
     _module(
         "app.services.itick_market_service",

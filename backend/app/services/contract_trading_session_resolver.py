@@ -5,6 +5,8 @@ from datetime import datetime, time as dt_time, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.services.contract_session_authority import contract_session_authority
+
 
 SESSION_PRE_MARKET = "PRE_MARKET"
 SESSION_REGULAR_OPEN = "REGULAR_OPEN"
@@ -226,6 +228,22 @@ def resolve_contract_trading_session(
     depth: Optional[dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> ContractTradingSession:
+    configured_profile = _normalized(_attr(contract_symbol, "session_profile_code"))
+    if configured_profile and configured_profile != "UNKNOWN":
+        decision = contract_session_authority.resolve(
+            contract_symbol=contract_symbol,
+            quote=quote or depth,
+            now=now,
+        )
+        return ContractTradingSession(
+            session_type=decision.session_state,
+            is_regular_open=decision.session_state == SESSION_REGULAR_OPEN,
+            is_extended_hours=decision.session_state in {SESSION_PRE_MARKET, SESSION_AFTER_HOURS},
+            is_holiday=decision.session_state == SESSION_HOLIDAY,
+            trading_allowed=decision.trading_allowed,
+            reason_code=decision.reason_code,
+        )
+
     category = _contract_category(contract_symbol, quote, depth)
     provider = _provider(contract_symbol, quote, depth)
     if category in _CRYPTO_CATEGORIES or provider == "BINANCE":

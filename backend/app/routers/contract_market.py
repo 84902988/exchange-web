@@ -127,6 +127,18 @@ def _contract_symbol_payload(item: ContractSymbol) -> dict:
         "closed_market_execution_mode": str(
             getattr(item, "closed_market_execution_mode", "") or "DISABLED"
         ).strip().upper(),
+        "holiday_calendar_code": str(
+            getattr(item, "holiday_calendar_code", "") or ""
+        ).strip().upper() or None,
+        "session_profile_code": str(
+            getattr(item, "session_profile_code", "") or "UNKNOWN"
+        ).strip().upper(),
+        "session_timezone_override": str(
+            getattr(item, "session_timezone_override", "") or ""
+        ).strip() or None,
+        "extended_hours_execution_mode": str(
+            getattr(item, "extended_hours_execution_mode", "") or "DISPLAY_ONLY"
+        ).strip().upper(),
         "price_precision": item.price_precision,
         "quantity_precision": item.quantity_precision,
         "max_leverage": item.max_leverage,
