@@ -1288,6 +1288,76 @@ def test_gateway_reuses_bounded_rest_ticker_evidence_for_partial_ws_frames(monke
     assert second["quote_volume_24h"] == "296805.11612"
 
 
+def test_gateway_recomputes_24h_change_after_merging_incremental_itick_frame():
+    gateway = ContractMarketGateway()
+    symbol = "BRENTUSDT_PERP"
+    gateway._latest[CONTRACT_MARKET_CACHE_QUOTE.format(symbol=symbol)] = {
+        "symbol": symbol,
+        "last_price": "90.856",
+        "open_24h": "89.363",
+        "price_change_24h": "1.493",
+        "price_change_percent_24h": "1.6707",
+        "high_24h": "91.811",
+        "low_24h": "89.089",
+        "base_volume_24h": "910720",
+        "quote_volume_24h": "82490000",
+    }
+    gateway._last_ticker_24h_refresh_at[symbol] = gateway_module.time.monotonic()
+    incremental_frame = {
+        "symbol": symbol,
+        "provider": "ITICK",
+        "last_price": "90.872",
+        "price_change_24h": "-0.002",
+        "price_change_percent_24h": "-0.002238",
+    }
+
+    enriched = gateway._enrich_provider_ws_ticker_24h(
+        object(),
+        symbol,
+        incremental_frame,
+        provider_frame=incremental_frame,
+    )
+
+    assert enriched["open_24h"] == Decimal("89.363")
+    assert enriched["price_change_24h"] == Decimal("1.509")
+    assert enriched["price_change_percent_24h"] == (
+        Decimal("1.509") / Decimal("89.363") * Decimal("100")
+    )
+    assert enriched["high_24h"] == "91.811"
+
+
+def test_gateway_public_quote_boundary_recomputes_change_from_shared_open_evidence():
+    gateway = ContractMarketGateway()
+    quote = gateway._contract_quote_response({
+        "symbol": "NAS100USDT_PERP",
+        "provider": "ITICK",
+        "provider_symbol": "NDX",
+        "last_price": Decimal("29102.5"),
+        "mark_price": Decimal("29102.5"),
+        "index_price": Decimal("29102.5"),
+        "bid_price": Decimal("29102"),
+        "ask_price": Decimal("29103"),
+        "open_24h": Decimal("29000"),
+        "price_change_24h": Decimal("100"),
+        "price_change_percent_24h": Decimal("0.3448275862068965517"),
+        "high_24h": Decimal("29200"),
+        "low_24h": Decimal("28900"),
+        "base_volume_24h": Decimal("1000"),
+        "quote_volume_24h": Decimal("29000000"),
+        "source": "LIVE_WS",
+        "quote_source": "LIVE_WS",
+        "quote_freshness": "LIVE",
+        "ts": "2026-07-23T02:00:00Z",
+    })
+
+    assert quote["last_price"] == "29102.5"
+    assert quote["open_24h"] == Decimal("29000")
+    assert quote["price_change_24h"] == Decimal("102.5")
+    assert quote["price_change_percent_24h"] == (
+        Decimal("102.5") / Decimal("29000") * Decimal("100")
+    )
+
+
 def test_gateway_marks_generic_contiguous_rollover_as_trade_seeded(monkeypatch):
     gateway = ContractMarketGateway()
     symbol = "SOLUSDT_PERP"
