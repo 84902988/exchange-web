@@ -47,6 +47,11 @@ function loadTypeScriptModule(
 
 function installRealtimeHarness() {
   const sockets: MockWebSocket[] = [];
+  const intervals = new Map<number, () => void>();
+  const windowListeners = new Map<string, Set<() => void>>();
+  const documentListeners = new Map<string, Set<() => void>>();
+  const timeoutDelays: number[] = [];
+  let timerSequence = 0;
 
   class MockWebSocket {
     static readonly CONNECTING = 0;
@@ -77,15 +82,49 @@ function installRealtimeHarness() {
   }
 
   const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
   const originalWebSocket = globalThis.WebSocket;
+  const originalRandom = Math.random;
+  Math.random = () => 0.5;
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
     value: {
-      setTimeout(callback: () => void) {
+      setTimeout(callback: () => void, delay = 0) {
+        timeoutDelays.push(delay);
         callback();
-        return 1;
+        return ++timerSequence;
       },
       clearTimeout() {},
+      setInterval(callback: () => void) {
+        const id = ++timerSequence;
+        intervals.set(id, callback);
+        return id;
+      },
+      clearInterval(id: number) {
+        intervals.delete(id);
+      },
+      addEventListener(type: string, callback: () => void) {
+        const bucket = windowListeners.get(type) ?? new Set();
+        bucket.add(callback);
+        windowListeners.set(type, bucket);
+      },
+      removeEventListener(type: string, callback: () => void) {
+        windowListeners.get(type)?.delete(callback);
+      },
+    },
+  });
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: {
+      visibilityState: 'visible',
+      addEventListener(type: string, callback: () => void) {
+        const bucket = documentListeners.get(type) ?? new Set();
+        bucket.add(callback);
+        documentListeners.set(type, bucket);
+      },
+      removeEventListener(type: string, callback: () => void) {
+        documentListeners.get(type)?.delete(callback);
+      },
     },
   });
   Object.defineProperty(globalThis, 'WebSocket', {
@@ -106,9 +145,24 @@ function installRealtimeHarness() {
     MockWebSocket,
     realtimeModule,
     sockets,
+    timeoutDelays,
+    runHeartbeat() {
+      for (const callback of Array.from(intervals.values())) callback();
+    },
+    intervalCount() {
+      return intervals.size;
+    },
+    emitWindow(type: string) {
+      for (const callback of windowListeners.get(type) ?? []) callback();
+    },
+    emitDocument(type: string) {
+      for (const callback of documentListeners.get(type) ?? []) callback();
+    },
     restore() {
       Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+      Object.defineProperty(globalThis, 'document', { configurable: true, value: originalDocument });
       Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: originalWebSocket });
+      Math.random = originalRandom;
     },
   };
 }
@@ -687,6 +741,122 @@ test('destroyed client generation cannot deliver into a recreated owner', () => 
     releaseFirstMarket();
     releaseRecreatedKline();
     releaseRecreatedMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+test('heartbeat accepts JSON pong as activity and reconnects only after all traffic is stale', () => {
+  const harness = installRealtimeHarness();
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('AAPL_USD');
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+
+    now += 18_000;
+    harness.runHeartbeat();
+    assert.equal(socket.sent.at(-1), 'ping');
+
+    socket.onmessage?.({ data: JSON.stringify({ type: 'pong' }) });
+    now += 35_000;
+    harness.runHeartbeat();
+    assert.equal(socket.readyState, harness.MockWebSocket.OPEN);
+
+    now += 1_001;
+    harness.runHeartbeat();
+    assert.equal(socket.readyState, harness.MockWebSocket.CLOSED);
+    assert.equal(client.getStatus(), 'reconnecting');
+
+    socket.onclose?.();
+    assert.equal(harness.sockets.length, 2);
+    assert.equal(harness.timeoutDelays.at(-1), 1_500);
+    releaseMarket();
+  } finally {
+    Date.now = originalNow;
+    harness.restore();
+  }
+});
+
+test('visible and online checks probe one existing socket without creating another connection', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    const socket = harness.sockets[0];
+    socket.readyState = harness.MockWebSocket.OPEN;
+    socket.onopen?.();
+
+    harness.emitDocument('visibilitychange');
+    harness.emitWindow('online');
+
+    assert.equal(harness.sockets.length, 1);
+    assert.deepEqual(socket.sent.slice(-2), ['ping', 'ping']);
+    releaseMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+test('reconnect delay backs off across failures until a message proves recovery', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('EURUSD');
+    const first = harness.sockets[0];
+    first.readyState = harness.MockWebSocket.OPEN;
+    first.onopen?.();
+    first.onclose?.();
+
+    const second = harness.sockets[1];
+    second.readyState = harness.MockWebSocket.OPEN;
+    second.onopen?.();
+    second.onclose?.();
+
+    assert.deepEqual(harness.timeoutDelays.slice(-2), [1_500, 3_000]);
+
+    const third = harness.sockets[2];
+    third.readyState = harness.MockWebSocket.OPEN;
+    third.onopen?.();
+    third.onmessage?.({ data: JSON.stringify({ type: 'pong' }) });
+    third.onclose?.();
+    assert.equal(harness.timeoutDelays.at(-1), 1_500);
+    releaseMarket();
+  } finally {
+    harness.restore();
+  }
+});
+
+test('a retired socket close cannot stop the replacement heartbeat', () => {
+  const harness = installRealtimeHarness();
+
+  try {
+    const client = new harness.realtimeModule.ContractMarketRealtimeClient();
+    const releaseMarket = client.setMarketSession('BTCUSDT_PERP');
+    const first = harness.sockets[0];
+    first.readyState = harness.MockWebSocket.OPEN;
+    first.onopen?.();
+    const retiredClose = first.onclose;
+    retiredClose?.();
+
+    const replacement = harness.sockets[1];
+    replacement.readyState = harness.MockWebSocket.OPEN;
+    replacement.onopen?.();
+    assert.equal(harness.intervalCount(), 1);
+
+    retiredClose?.();
+    assert.equal(harness.intervalCount(), 1);
+    harness.runHeartbeat();
+    assert.equal(replacement.sent.at(-1), 'ping');
+    assert.equal(harness.sockets.length, 2);
+    releaseMarket();
   } finally {
     harness.restore();
   }
