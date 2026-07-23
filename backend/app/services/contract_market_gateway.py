@@ -55,6 +55,7 @@ from app.services.contract_market_ws import (
     normalize_contract_ws_symbol,
 )
 from app.services.contract_market_view import build_contract_market_view_v2
+from app.services.contract_ticker_evidence import resolve_contract_ticker_24h_evidence
 from app.services.contract_candle_preview import (
     CONTRACT_CANDLE_PREVIEW_PROVIDERS,
     SUPPORTED_CONTRACT_CANDLE_PREVIEW_INTERVALS,
@@ -1179,7 +1180,7 @@ class ContractMarketGateway:
             allow_provider_ws=True,
             ensure_provider_ws=ensure_provider_ws,
         )
-        quote = ContractQuoteResponse(**contract_quote_to_response(quote_payload)).model_dump()
+        quote = self._contract_quote_response(quote_payload)
         if self._set_latest(
             CONTRACT_MARKET_CACHE_QUOTE,
             symbol,
@@ -1499,9 +1500,7 @@ class ContractMarketGateway:
                 market_status,
                 contract_symbol,
             )
-            quote = ContractQuoteResponse(
-                **contract_quote_to_response(derived_quote)
-            ).model_dump()
+            quote = self._contract_quote_response(derived_quote)
             depth = ContractDepthResponse(
                 **contract_depth_to_response(derived_depth)
             ).model_dump()
@@ -1710,7 +1709,7 @@ class ContractMarketGateway:
             db.close()
         if quote_payload is None:
             return []
-        quote = ContractQuoteResponse(**contract_quote_to_response(quote_payload)).model_dump()
+        quote = self._contract_quote_response(quote_payload)
         signature = self._quote_signature(quote)
         if self._last_quote_signature.get(normalized_symbol) == signature:
             return []
@@ -2431,6 +2430,44 @@ class ContractMarketGateway:
             for field in _CONTRACT_TICKER_24H_HEADER_FIELDS
         )
 
+    @staticmethod
+    def _reconcile_ticker_24h_change(evidence: dict[str, Any]) -> dict[str, Any]:
+        """Keep the displayed 24h move tied to one last/open evidence pair.
+
+        Some iTick incremental CFD frames expose ``ch`` as a short-tick delta,
+        even though the cached REST evidence still contains the authoritative
+        rolling/session open. Once those sources are merged, derive both 24h
+        change fields again so a fast frame cannot overwrite the slow baseline
+        with an incompatible value.
+        """
+
+        resolved = resolve_contract_ticker_24h_evidence(
+            last_price=evidence.get("last_price"),
+            open_24h=evidence.get("open_24h"),
+            price_change_24h=evidence.get("price_change_24h"),
+            price_change_percent_24h=evidence.get("price_change_percent_24h"),
+        )
+        if resolved.open_24h is None:
+            return evidence
+        try:
+            last_price = Decimal(str(evidence.get("last_price")))
+        except (ArithmeticError, TypeError, ValueError):
+            return evidence
+        if not last_price.is_finite() or last_price <= 0:
+            return evidence
+        evidence["open_24h"] = resolved.open_24h
+        evidence["price_change_24h"] = resolved.price_change_24h
+        evidence["price_change_percent_24h"] = resolved.price_change_percent_24h
+        return evidence
+
+    def _contract_quote_response(self, quote_payload: Any) -> dict[str, Any]:
+        """Normalize one Quote at the shared cache/WebSocket publication edge."""
+
+        quote = ContractQuoteResponse(
+            **contract_quote_to_response(quote_payload)
+        ).model_dump()
+        return self._reconcile_ticker_24h_change(quote)
+
     def _enrich_provider_ws_ticker_24h(
         self,
         db: Session,
@@ -2454,6 +2491,7 @@ class ContractMarketGateway:
         provider_has_complete_evidence = self._has_complete_header_ticker_24h(provider_frame)
         latest_quote = self._get_latest(CONTRACT_MARKET_CACHE_QUOTE, normalized_symbol)
         self._merge_ticker_24h_fields(prepared, latest_quote)
+        self._reconcile_ticker_24h_change(prepared)
 
         if provider_has_complete_evidence:
             return prepared
@@ -2488,7 +2526,8 @@ class ContractMarketGateway:
             ),
             None,
         )
-        return self._merge_ticker_24h_fields(prepared, ticker, overwrite=True)
+        self._merge_ticker_24h_fields(prepared, ticker, overwrite=True)
+        return self._reconcile_ticker_24h_change(prepared)
 
     def _prepare_provider_ws_depth_quote_payload(
         self,
