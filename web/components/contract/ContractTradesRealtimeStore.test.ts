@@ -2,6 +2,7 @@ import { describe, expect, it } from '@jest/globals';
 import { contractMarketStore } from '../../lib/realtime/contractMarketStore';
 import {
   activateContractMarketShadowSymbol,
+  restartContractMarketShadowSession,
   selectContractTradesStoreSnapshot,
   subscribeContractTradesStore,
   writeContractMarketShadowDomain,
@@ -186,5 +187,32 @@ describe('Contract Trades realtime store adapter', () => {
     });
     expect(tradesNotifications).toBe(1);
     unsubscribe();
+  });
+
+  it('replaces pre-restart trades with the first accepted trade from the new generation', () => {
+    contractMarketStore.resetForTests();
+    activateContractMarketShadowSymbol('NAS100USDT_PERP');
+    writeTrades({
+      symbol: 'NAS100USDT_PERP',
+      trades: [{ id: 'before-restart', price: '28936.24', qty: '1', time: 1_720_000_000_100 }],
+      eventTimeMs: 1_720_000_000_100,
+      generation: 7,
+    });
+
+    restartContractMarketShadowSession('NAS100USDT_PERP');
+    expect(selectTrades()).toBeNull();
+
+    writeTrades({
+      symbol: 'NAS100USDT_PERP',
+      trades: [{ id: 'after-restart', price: '28900.36', qty: '2', time: 1_720_000_010_100 }],
+      eventTimeMs: 1_720_000_010_100,
+      generation: 8,
+    });
+
+    expect(selectTrades()).toMatchObject({
+      symbol: 'NAS100USDT_PERP',
+      providerGeneration: 8,
+      trades: [{ id: 'after-restart', price: '28900.36' }],
+    });
   });
 });

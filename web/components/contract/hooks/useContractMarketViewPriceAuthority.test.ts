@@ -39,4 +39,13 @@ describe('useContractMarketView Price Authority wiring', () => {
     );
     expect(hookSource).not.toMatch(/\[\.\.\.trades\]\.reverse\(\)/);
   });
+
+  it('uses the generation-fenced realtime Store before the local trade cache', () => {
+    expect(hookSource).toMatch(/useContractTradesStoreSnapshot\(\)/);
+    expect(hookSource).toMatch(
+      /const recentTrades = storeTradesBelongToCurrentSymbol[\s\S]*?storeTradesSnapshot\?\.trades[\s\S]*?localTradesBelongToCurrentSymbol/,
+    );
+    expect(hookSource.indexOf('const recentTrades = storeTradesBelongToCurrentSymbol'))
+      .toBeLessThan(hookSource.indexOf('const latestTrade = recentTrades[0]'));
+  });
 });
