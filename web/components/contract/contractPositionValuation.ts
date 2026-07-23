@@ -72,26 +72,35 @@ export function resolveLiveContractPositionValuation({
 }: ResolveLiveContractPositionValuationInput): LiveContractPositionValuation | null {
   const normalizedCurrentSymbol = normalizeContractSymbol(currentSymbol);
   if (
-    !quote ||
     !liveMarketUsable ||
     !normalizedCurrentSymbol ||
-    normalizeContractSymbol(positionSymbol) !== normalizedCurrentSymbol ||
-    normalizeContractSymbol(quote.symbol) !== normalizedCurrentSymbol
+    normalizeContractSymbol(positionSymbol) !== normalizedCurrentSymbol
   ) {
     return null;
   }
 
-  const freshness = String(quote.quote_freshness || '').trim().toUpperCase();
-  if (
-    freshness !== 'LIVE' ||
-    quote.executable !== true ||
-    quote.stale === true ||
-    getContractQuoteDisplayStatus(quote) !== 'LIVE'
-  ) {
-    return null;
+  const authoritativeBid = toPositiveNumber(liveBestBid);
+  const authoritativeAsk = toPositiveNumber(liveBestAsk);
+  const authoritativeMidpoint = authoritativeBid > 0 && authoritativeAsk >= authoritativeBid
+    ? (authoritativeBid + authoritativeAsk) / 2
+    : 0;
+
+  let price = useBboMidpoint ? authoritativeMidpoint : 0;
+  if (price <= 0) {
+    if (!quote || normalizeContractSymbol(quote.symbol) !== normalizedCurrentSymbol) return null;
+
+    const freshness = String(quote.quote_freshness || '').trim().toUpperCase();
+    if (
+      freshness !== 'LIVE' ||
+      quote.executable !== true ||
+      quote.stale === true ||
+      getContractQuoteDisplayStatus(quote) !== 'LIVE'
+    ) {
+      return null;
+    }
+    price = resolveLiveQuotePrice(quote, liveBestBid, liveBestAsk, useBboMidpoint);
   }
 
-  const price = resolveLiveQuotePrice(quote, liveBestBid, liveBestAsk, useBboMidpoint);
   const normalizedSide = String(side || '').trim().toUpperCase();
   const positionQuantity = toPositiveNumber(quantity);
   const positionEntryPrice = toPositiveNumber(entryPrice);

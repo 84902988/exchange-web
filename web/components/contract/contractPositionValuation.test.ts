@@ -40,6 +40,50 @@ test('TradFi position display uses the live BBO midpoint', () => {
   });
 });
 
+test('TradFi position keeps following authoritative BBO while the legacy quote state is recovering', () => {
+  expect(resolveLiveContractPositionValuation({
+    positionSymbol: 'XAUUSDT_PERP',
+    currentSymbol: 'XAUUSDT_PERP',
+    side: 'LONG',
+    quantity: '2',
+    entryPrice: '100',
+    marginAmount: '10',
+    quote: makeQuote({
+      quote_freshness: 'STALE',
+      executable: false,
+      stale: true,
+    }),
+    liveBestBid: '101',
+    liveBestAsk: '103',
+    liveMarketUsable: true,
+    useBboMidpoint: true,
+  })).toEqual({
+    price: 102,
+    unrealizedPnl: 4,
+    roe: 40,
+  });
+});
+
+test('TradFi position can use authoritative BBO without a legacy quote object', () => {
+  expect(resolveLiveContractPositionValuation({
+    positionSymbol: 'XAUUSDT_PERP',
+    currentSymbol: 'XAUUSDT_PERP',
+    side: 'SHORT',
+    quantity: '1',
+    entryPrice: '103',
+    marginAmount: '2',
+    quote: null,
+    liveBestBid: '101',
+    liveBestAsk: '103',
+    liveMarketUsable: true,
+    useBboMidpoint: true,
+  })).toEqual({
+    price: 102,
+    unrealizedPnl: 1,
+    roe: 50,
+  });
+});
+
 test('crypto position display prefers the live quote mark price', () => {
   expect(resolveLiveContractPositionValuation({
     positionSymbol: 'XAUUSDT_PERP',

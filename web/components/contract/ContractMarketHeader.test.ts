@@ -415,6 +415,77 @@ test('Header recovers live structure and BBO from the complete same-symbol page 
   );
 });
 
+test('Header keeps executable Store BBO live while page authority recovers market structure', () => {
+  resetHarness();
+  storeSnapshotsBySymbol.BTCUSDT_PERP = makeStoreSnapshot({
+    displayPrice: '1',
+    displayPriceSource: 'TRADE_TICK',
+    displayState: 'UNAVAILABLE',
+    marketStatus: 'UNKNOWN',
+    marketSessionType: null,
+    executable: true,
+    bestBid: '64110',
+    bestAsk: '64111',
+    spread: '1',
+    source: 'LIVE_WS',
+    freshness: 'LIVE',
+  });
+  const tree = renderHeader({
+    referencePrice: makeReferencePrice(64_110.5),
+  });
+
+  assert.equal(
+    textContent(findByTestId(tree, 'contract-header-market-status')),
+    '\u5b9e\u65f6\u00b7\u4ea4\u6613\u4e2d',
+  );
+  assert.equal(
+    textContent(findByTestId(tree, 'contract-header-best-bid')),
+    '\u4e70\u4e0064,110.0',
+  );
+  assert.equal(
+    textContent(findByTestId(tree, 'contract-header-best-ask')),
+    '\u5356\u4e0064,111.0',
+  );
+});
+
+test('Header reads realtime Store BBO by full contract symbol across contract categories', () => {
+  const cases = [
+    { category: 'crypto', marketSymbol: 'BTCUSDT', storeSymbol: 'BTCUSDT_PERP' },
+    { category: 'forex CFD', marketSymbol: 'EURUSD', storeSymbol: 'EURUSD_PERP' },
+    { category: 'futures CFD', marketSymbol: 'BRENTUSDT', storeSymbol: 'BRENTUSDT_PERP' },
+    { category: 'gold CFD', marketSymbol: 'XAUUSDT', storeSymbol: 'XAUUSDT_PERP' },
+    { category: 'index CFD', marketSymbol: 'NAS100USDT', storeSymbol: 'NAS100USDT_PERP' },
+    { category: 'stock CFD', marketSymbol: 'AAPLUSDT', storeSymbol: 'AAPLUSDT_PERP' },
+  ];
+
+  for (const { category, marketSymbol, storeSymbol } of cases) {
+    resetHarness();
+    storeSnapshotsBySymbol[storeSymbol] = makeStoreSnapshot({
+      symbol: storeSymbol,
+      bestBid: '64110',
+      bestAsk: '64111',
+      spread: '1',
+    });
+    const tree = renderHeader({
+      marketSymbol,
+      storeSymbol,
+      bestBid: '63,999.0',
+      bestAsk: '64,001.0',
+    });
+
+    assert.equal(
+      textContent(findByTestId(tree, 'contract-header-best-bid')),
+      '\u4e70\u4e0064,110.0',
+      `${category} should select Store BBO with ${storeSymbol}`,
+    );
+    assert.equal(
+      textContent(findByTestId(tree, 'contract-header-best-ask')),
+      '\u5356\u4e0064,111.0',
+      `${category} should select Store BBO with ${storeSymbol}`,
+    );
+  }
+});
+
 test('Header does not promote a live midpoint when last trade is unavailable', () => {
   resetHarness();
   storeSnapshotsBySymbol.BTCUSDT_PERP = makeStoreSnapshot({ displayPrice: '101' });
@@ -473,6 +544,25 @@ test('closed market keeps provider last price visible when reference evidence is
   assert.equal(mainPrice.props['data-reference-role'], '');
   assert.equal(mainPrice.props['data-display-source'], 'TRADE_TICK');
   assert.equal(mainPrice.props['data-display-freshness'], 'LAST_VALID');
+  assert.equal(
+    textContent(findByTestId(tree, 'contract-header-market-status')),
+    '\u76d8\u540e\u00b7\u4e0d\u53ef\u4ea4\u6613',
+  );
+});
+
+test('session enum keeps after-hours presentation ahead of generic CLOSED status', () => {
+  resetHarness();
+  const tree = renderHeader({
+    referencePrice: makeReferencePrice(null),
+    displayPrice: '29021.73',
+    displayPriceSource: 'KLINE_CLOSE',
+    quoteStatusLabel: 'CLOSED',
+    quoteStatusTone: 'unavailable',
+    marketStatus: 'CLOSED',
+    marketSessionType: 'AFTER_HOURS',
+    executable: false,
+  });
+
   assert.equal(
     textContent(findByTestId(tree, 'contract-header-market-status')),
     '\u76d8\u540e\u00b7\u4e0d\u53ef\u4ea4\u6613',

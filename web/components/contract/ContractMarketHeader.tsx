@@ -89,6 +89,7 @@ const HEADER_LABELS: Record<string, ContractHeaderLabels> = {
 
 type ContractMarketHeaderProps = {
   marketSymbol: string;
+  storeSymbol?: string;
   isTradfi?: boolean;
   referencePrice?: ContractReferencePrice | null;
   pricePrecision?: number;
@@ -251,11 +252,21 @@ export function resolveContractHeaderMarketRead(
     && legacyAsk !== null
     && legacyBid > 0
     && legacyAsk >= legacyBid;
+  const storeBid = parseComparableNumber(store.bestBid);
+  const storeAsk = parseComparableNumber(store.bestAsk);
+  const storeHasExecutableBbo = store.executable === true
+    && storeBid !== null
+    && storeAsk !== null
+    && storeBid > 0
+    && storeAsk >= storeBid;
   // Header reads the low-latency Store directly, but a just-reconnected ticker
   // can briefly retain unavailable structure while the complete MarketView
   // REST/depth authority is already live. Keep non-price Store metrics, and
-  // recover structure plus BBO/valuation from that same-symbol authority.
+  // recover structure plus valuation from that same-symbol authority. Keep a
+  // complete executable Store BBO independent so a slow ticker/bootstrap read
+  // cannot roll live depth prices back to the legacy snapshot.
   const recoverStructureFromLegacy = legacyHasLiveStructure && !storeHasLiveStructure;
+  const recoverBboFromLegacy = recoverStructureFromLegacy && !storeHasExecutableBbo;
   const executable = recoverStructureFromLegacy
     ? legacy.executable
     : store.executable ?? legacy.executable;
@@ -306,13 +317,13 @@ export function resolveContractHeaderMarketRead(
       ? legacy.indexPrice
       : formatStoreNumber(store.indexPrice, legacy.indexPrice),
     fundingRate: formatStoreFunding(store.fundingRate, legacy.fundingRate),
-    bestBid: recoverStructureFromLegacy
+    bestBid: recoverBboFromLegacy
       ? legacy.bestBid
       : formatStoreNumber(store.bestBid, legacy.bestBid),
-    bestAsk: recoverStructureFromLegacy
+    bestAsk: recoverBboFromLegacy
       ? legacy.bestAsk
       : formatStoreNumber(store.bestAsk, legacy.bestAsk),
-    spread: recoverStructureFromLegacy
+    spread: recoverBboFromLegacy
       ? legacy.spread
       : formatStoreNumber(store.spread, legacy.spread),
     highLow24h,
@@ -410,7 +421,7 @@ export function resolveContractHeaderMarketPresentation({
   }
 
   if (
-    includesAny(statusLabel, ['PRE-MARKET', '\u76d8\u524d', '\u76e4\u524d', '\u30d7\u30ec\u30de\u30fc\u30b1\u30c3\u30c8'])
+    includesAny(statusLabel, ['PRE_MARKET', 'PRE-MARKET', '\u76d8\u524d', '\u76e4\u524d', '\u30d7\u30ec\u30de\u30fc\u30b1\u30c3\u30c8'])
   ) {
     return {
       state: 'pre_market',
@@ -420,7 +431,7 @@ export function resolveContractHeaderMarketPresentation({
     };
   }
   if (
-    includesAny(statusLabel, ['AFTER-HOURS', '\u76d8\u540e', '\u76e4\u5f8C', '\u6642\u9593\u5916'])
+    includesAny(statusLabel, ['AFTER_HOURS', 'AFTER-HOURS', '\u76d8\u540e', '\u76e4\u5f8C', '\u6642\u9593\u5916'])
   ) {
     return {
       state: 'after_hours',
@@ -506,6 +517,7 @@ function isClosedMarketDisplayState(
 
 export default function ContractMarketHeader({
   marketSymbol,
+  storeSymbol,
   isTradfi = false,
   referencePrice,
   pricePrecision = 2,
@@ -539,7 +551,7 @@ export default function ContractMarketHeader({
   const titleUpdateTimerRef = useRef<number | null>(null);
   const titleUpdatedAtRef = useRef(0);
   const labels = getHeaderLabels(locale);
-  const storeSnapshot = useContractHeaderStoreSnapshot(marketSymbol);
+  const storeSnapshot = useContractHeaderStoreSnapshot(storeSymbol || marketSymbol);
   const legacyRead = useMemo<ContractHeaderLegacyRead>(() => ({
     displayPrice: legacyDisplayPrice,
     change: legacyChange ?? null,

@@ -48,6 +48,7 @@ import {
   hydrateContractMarketViewShadow,
   ingestContractMarketWsDomain,
   projectContractMarketViewStoreAuthority,
+  useContractTradesStoreSnapshot,
   useContractMarketViewStoreAuthoritySnapshot,
 } from './contractMarketStoreAdapter';
 import {
@@ -478,6 +479,7 @@ export function useContractMarketView({
     symbolOptionPricePrecision,
   });
   const storeMarketViewAuthority = useContractMarketViewStoreAuthoritySnapshot(contractSymbol);
+  const storeTradesSnapshot = useContractTradesStoreSnapshot();
   const {
     initialDepth,
     marketRealtimeStatus: quoteMarketRealtimeStatus,
@@ -670,7 +672,6 @@ export function useContractMarketView({
     marketViewAbortControllerRef.current?.abort();
     marketViewAbortControllerRef.current = null;
     inFlightSymbolRef.current = null;
-    setWsState(null);
     setMarketViewError(null);
     marketViewErrorSymbolRef.current = null;
     setMarketViewLoading(true);
@@ -974,7 +975,6 @@ export function useContractMarketView({
   useEffect(() => {
     const handleDepthMessage = (message: ContractMarketRealtimeMessage) => {
       if (!isContractMarketDomainMessage(message)) return;
-      if (effectiveMarketStatus === 'CLOSED') return;
 
       // BBO-only providers can publish real bid/ask prices without a usable
       // quantity. Persist the raw authority frame before deriving visual rows;
@@ -992,7 +992,7 @@ export function useContractMarketView({
     };
 
     return contractMarketRealtime.subscribe('depth', handleDepthMessage);
-  }, [applyDepthSnapshot, contractSymbol, effectiveMarketStatus]);
+  }, [applyDepthSnapshot, contractSymbol]);
 
   const applyTradesSnapshot = useCallback((trades: ContractMarketTrade[], options: { loading?: boolean; error?: string | null } = {}) => {
     const requestSymbol = normalizeContractSymbol(contractSymbol);
@@ -1016,14 +1016,6 @@ export function useContractMarketView({
   const refreshTrades = useCallback(async () => {
     const requestSymbol = normalizeContractSymbol(contractSymbol);
     if (!requestSymbol) return;
-    if (effectiveMarketStatus === 'CLOSED') {
-      setTradesState((current) => ({
-        ...current,
-        symbol: requestSymbol,
-        loading: false,
-      }));
-      return;
-    }
     if (tradesInFlightSymbolRef.current === requestSymbol) return;
 
     const requestSeq = tradesRequestSeqRef.current + 1;
@@ -1058,7 +1050,7 @@ export function useContractMarketView({
         tradesInFlightSymbolRef.current = null;
       }
     }
-  }, [applyTradesSnapshot, contractSymbol, effectiveMarketStatus]);
+  }, [applyTradesSnapshot, contractSymbol]);
 
   useEffect(() => {
     const requestSymbol = normalizeContractSymbol(contractSymbol);
@@ -1100,7 +1092,7 @@ export function useContractMarketView({
         }, REST_BOOTSTRAP_GRACE_MS);
       }
     }
-    if (effectiveMarketStatus === 'CLOSED' || quoteMarketRealtimeStatus === 'connected') {
+    if (quoteMarketRealtimeStatus === 'connected') {
       return () => {
         if (bootstrapTimer !== null) window.clearTimeout(bootstrapTimer);
       };
@@ -1125,7 +1117,6 @@ export function useContractMarketView({
   useEffect(() => {
     const handleTradeMessage = (message: ContractMarketRealtimeMessage) => {
       if (!isContractMarketDomainMessage(message)) return;
-      if (effectiveMarketStatus === 'CLOSED') return;
 
       const trades = extractRealtimeTrades(message, contractSymbol);
       if (trades.length === 0) return;
@@ -1159,7 +1150,7 @@ export function useContractMarketView({
     };
 
     return contractMarketRealtime.subscribe('trade', handleTradeMessage);
-  }, [contractSymbol, effectiveMarketStatus]);
+  }, [contractSymbol]);
 
   useEffect(() => {
     const handleKlineMessage = (message: ContractMarketRealtimeMessage) => {
@@ -1176,8 +1167,21 @@ export function useContractMarketView({
     return contractMarketRealtime.subscribe('kline', handleKlineMessage);
   }, []);
 
-  const tradesBelongToCurrentSymbol = normalizeContractSymbol(tradesState.symbol) === normalizeContractSymbol(contractSymbol);
-  const recentTrades = tradesBelongToCurrentSymbol ? tradesState.trades : [];
+  const normalizedCurrentSymbol = normalizeContractSymbol(contractSymbol);
+  const storeTradesBelongToCurrentSymbol = (
+    normalizeContractSymbol(storeTradesSnapshot?.symbol) === normalizedCurrentSymbol
+    && storeTradesSnapshot?.stale !== true
+  );
+  const localTradesBelongToCurrentSymbol = normalizeContractSymbol(tradesState.symbol)
+    === normalizedCurrentSymbol;
+  // Realtime Store is the generation-fenced authority. Local state remains a
+  // bootstrap/cache fallback only; after a socket recovery it must not keep an
+  // older Kline/reference price in front of the newly accepted trade stream.
+  const recentTrades = storeTradesBelongToCurrentSymbol
+    ? storeTradesSnapshot?.trades || []
+    : localTradesBelongToCurrentSymbol
+      ? tradesState.trades
+      : [];
   const latestTrade = recentTrades[0] || null;
   const nextTrade = recentTrades[1] || null;
   const latestTradeNumber = getPositivePrice(latestTrade?.price);
@@ -1199,7 +1203,7 @@ export function useContractMarketView({
     trade: latestTrade ? {
       symbol: contractSymbol,
       price: latestTrade.price,
-      time: latestTrade.time ?? latestTrade.ts,
+      time: latestTrade.time,
       source: latestTrade.source ?? latestTrade.quote_source,
       freshness: latestTrade.quote_freshness,
       priceSource: latestTrade.price_source,
@@ -1476,8 +1480,16 @@ export function useContractMarketView({
     depthStatus,
     depthStatusLabel,
     recentTrades,
-    tradesLoading: tradesBelongToCurrentSymbol ? tradesState.loading : true,
-    tradesError: tradesBelongToCurrentSymbol ? tradesState.error : null,
+    tradesLoading: storeTradesBelongToCurrentSymbol
+      ? false
+      : localTradesBelongToCurrentSymbol
+        ? tradesState.loading
+        : true,
+    tradesError: storeTradesBelongToCurrentSymbol
+      ? null
+      : localTradesBelongToCurrentSymbol
+        ? tradesState.error
+        : null,
     tradesSource: resolvedTradesSource,
     tradesFreshness: resolvedTradesFreshness,
     tradesSourceLabel,

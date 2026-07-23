@@ -889,6 +889,74 @@ describe('Contract MarketView realtime Store recovery', () => {
     });
   });
 
+  it('projects fresh executable BBO over a transient unavailable ticker structure', () => {
+    const nowMs = Date.now();
+    const snapshot = {
+      symbol: 'XAUUSDT_PERP',
+      displayPrice: '4134.52',
+      displayPriceSource: 'TRADE_TICK' as const,
+      displayState: 'UNAVAILABLE',
+      marketStatus: 'OPEN',
+      bestBid: '4131.23',
+      bestAsk: '4137.82',
+      spread: '6.59',
+      executionBid: '4131.23',
+      executionAsk: '4137.82',
+      executionMode: 'NATIVE_BBO',
+      executable: true,
+      reasonCode: 'TICKER_QUOTE_UNAVAILABLE',
+      tickerSource: 'LIVE_WS',
+      tickerFreshness: 'LIVE',
+      depthSource: 'ITICK_DEPTH',
+      depthFreshness: 'LIVE',
+      hasRealtimeAuthority: true,
+      hasRealtimeBboAuthority: true,
+      stale: false,
+      tickerObservedAtMs: nowMs - 20,
+      bboObservedAtMs: nowMs - 10,
+      observedAtMs: nowMs - 10,
+    };
+
+    const projected = projectContractMarketViewStoreAuthority(snapshot, null, nowMs);
+
+    expect(projected).toMatchObject({
+      display_state: 'LIVE_TRADABLE',
+      display_price: '4134.52',
+      executable: true,
+      execution_bid: '4131.23',
+      execution_ask: '4137.82',
+      execution_mode: 'LIVE_BBO',
+      reason_code: 'LIVE_BBO',
+    });
+    expect(projected?.raw_source_summary).toMatchObject({
+      authority_source: 'CONTRACT_MARKET_STORE_WITH_BBO_STRUCTURE',
+    });
+
+    const closed = projectContractMarketViewStoreAuthority({
+      ...snapshot,
+      marketStatus: 'CLOSED',
+    }, null, nowMs);
+    expect(closed).toMatchObject({
+      display_state: 'UNAVAILABLE',
+      executable: false,
+      execution_bid: null,
+      execution_ask: null,
+    });
+
+    const afterHours = projectContractMarketViewStoreAuthority({
+      ...snapshot,
+      marketStatus: 'OPEN',
+      marketSessionType: 'AFTER_HOURS',
+    }, null, nowMs);
+    expect(afterHours).toMatchObject({
+      market_session_type: 'AFTER_HOURS',
+      display_state: 'UNAVAILABLE',
+      executable: false,
+      execution_bid: null,
+      execution_ask: null,
+    });
+  });
+
   it('treats explicit null MarketView price as a clear instead of reviving embedded ticker data', () => {
     const symbol = 'DJI_NULL_AUTHORITY_PERP';
     activateContractMarketShadowSymbol(symbol);

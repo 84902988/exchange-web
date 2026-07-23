@@ -807,6 +807,7 @@ function ContractPageContent() {
       <div className="w-full px-2 py-2 xl:px-3 xl:py-2">
         <ContractMarketHeader
           marketSymbol={marketSymbol}
+          storeSymbol={contractSymbol}
           isTradfi={currentContractUsesTradfiHeader}
           referencePrice={referencePrice}
           pricePrecision={pricePrecision}

@@ -337,7 +337,27 @@ export function useContractMarketState({
     return contractMarketRealtime.setMarketSession(contractSymbol);
   }, [contractSymbol]);
 
-  useEffect(() => contractMarketRealtime.subscribeStatus(setMarketRealtimeStatus), []);
+  useEffect(() => {
+    let previousStatus = contractMarketRealtime.getStatus();
+    return contractMarketRealtime.subscribeStatus((nextStatus) => {
+      const recoveredConnection = (
+        previousStatus !== 'connected'
+        && nextStatus === 'connected'
+      );
+      previousStatus = nextStatus;
+
+      if (recoveredConnection) {
+        // setStatus() runs synchronously inside the realtime singleton before it
+        // replays Market/K-line subscriptions. Rotate the shared Store here so
+        // the new socket's bootstrap snapshot lands in the new session instead
+        // of being invalidated later by a React reconnect effect.
+        restartContractMarketShadowSession(contractSymbol);
+        quoteRequestSeqRef.current += 1;
+        contractQuoteRequestStore.delete(contractSymbol);
+      }
+      setMarketRealtimeStatus(nextStatus);
+    });
+  }, [contractSymbol]);
 
   useEffect(() => {
     const previousStatus = previousMarketRealtimeStatusRef.current;
@@ -352,13 +372,9 @@ export function useContractMarketState({
   useEffect(() => {
     if (transportRecovery.reconnectGeneration <= 0) return;
 
-    // A backend restart creates a new provider/session lineage even when the
-    // public socket reconnects inside the short visual grace window. Rotate
-    // the Store session before accepting new increments so they cannot inherit
-    // the previous process' display_state/executable authority.
-    restartContractMarketShadowSession(contractSymbol);
-    quoteRequestSeqRef.current += 1;
-    contractQuoteRequestStore.delete(contractSymbol);
+    // Store lineage already rotated synchronously at the socket-open boundary,
+    // before the singleton replayed subscriptions. This effect only re-arms
+    // the REST fallback after React observes the recovered transport.
     void refreshContractQuote();
   }, [
     contractSymbol,

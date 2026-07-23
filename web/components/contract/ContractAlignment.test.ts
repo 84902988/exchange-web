@@ -103,7 +103,9 @@ test('contract market view rejects stale symbol data for market, depth, trades, 
   expect(source).toContain('normalizeContractSymbol(wsState?.symbol) === normalizeContractSymbol(contractSymbol)');
   expect(source).toContain('normalizeContractSymbol(restMarketView?.symbol) === normalizeContractSymbol(contractSymbol)');
   expect(source).toContain('depthBelongsToCurrentSymbol');
-  expect(source).toContain('tradesBelongToCurrentSymbol');
+  expect(source).toContain('storeTradesBelongToCurrentSymbol');
+  expect(source).toContain('localTradesBelongToCurrentSymbol');
+  expect(source).toContain('useContractTradesStoreSnapshot()');
   expect(source).toContain('marketViewErrorSymbolRef.current === normalizeContractSymbol(contractSymbol)');
   expect(source).toContain('requestSeqRef.current !== requestSeq');
   expect(source).toContain('marketViewAbortControllerRef.current?.abort()');
@@ -130,7 +132,7 @@ test('Contract Price Authority keeps trade provenance on one evidence row', () =
   );
 
   expect(authoritySection).toContain('price: latestTrade.price');
-  expect(authoritySection).toContain('time: latestTrade.time ?? latestTrade.ts');
+  expect(authoritySection).toContain('time: latestTrade.time');
   expect(authoritySection).toContain('source: latestTrade.source ?? latestTrade.quote_source');
   expect(authoritySection).toContain('freshness: latestTrade.quote_freshness');
   expect(authoritySection).toContain('priceSource: latestTrade.price_source');
@@ -212,6 +214,7 @@ test('contract Header, TradingView, and OrderBook share one reference-price dire
   const marketViewSource = readSource('components/contract/hooks/useContractMarketView.ts');
 
   expect(pageSource).toMatch(/<ContractMarketHeader[\s\S]*?priceDirection=\{currentPriceDirection\}[\s\S]*?\/>/);
+  expect(pageSource).toMatch(/<ContractMarketHeader[\s\S]*?storeSymbol=\{contractSymbol\}[\s\S]*?\/>/);
   expect(pageSource).toMatch(/<ContractTradingViewChart[\s\S]*?priceDirection=\{currentPriceDirection\}[\s\S]*?\/>/);
   expect(pageSource).toMatch(/<ContractFuturesOrderBook[\s\S]*?priceDirection=\{currentPriceDirection\}[\s\S]*?\/>/);
   expect(marketViewSource).toContain('advanceContractPriceDirection(currentState, {');
@@ -249,17 +252,30 @@ test('contract quote refreshes collapse short reconnect bursts without caching f
   expect(source).toContain('await loadContractQuote(contractSymbol)');
 });
 
-test('contract backend reconnect rotates shared authority and supersedes the interrupted MarketView request', () => {
+test('contract backend reconnect rotates shared authority before replay and preserves the arriving MarketView snapshot', () => {
   const marketStateSource = readSource('components/contract/hooks/useContractMarketState.ts');
   const marketViewSource = readSource('components/contract/hooks/useContractMarketView.ts');
 
   expect(marketStateSource).toContain('if (transportRecovery.reconnectGeneration <= 0) return;');
+  expect(marketStateSource).toContain('const recoveredConnection = (');
+  expect(marketStateSource).toContain('if (recoveredConnection) {');
   expect(marketStateSource).toContain('restartContractMarketShadowSession(contractSymbol);');
   expect(marketStateSource).toContain('contractQuoteRequestStore.delete(contractSymbol);');
   expect(marketViewSource).toContain('marketViewAbortControllerRef.current?.abort();');
-  expect(marketViewSource).toContain('setWsState(null);');
+  const reconnectEffect = marketViewSource.slice(
+    marketViewSource.indexOf('if (transportRecovery.reconnectGeneration <= 0) return;'),
+    marketViewSource.indexOf('const projectedMarketViewAuthority'),
+  );
+  expect(reconnectEffect).not.toContain('setWsState(null);');
   expect(marketViewSource).toContain('setMarketSessionRefreshKey((value) => value + 1);');
   expect(marketViewSource).toContain('void refreshMarketView();');
+});
+
+test('closed CFD sessions keep ingesting display trades and depth while execution remains separately gated', () => {
+  const marketViewSource = readSource('components/contract/hooks/useContractMarketView.ts');
+
+  expect(marketViewSource).not.toContain("if (effectiveMarketStatus === 'CLOSED') return;");
+  expect(marketViewSource).toContain("const sessionMode = effectiveMarketStatus === 'CLOSED' ? 'CLOSED' : 'ACTIVE';");
 });
 
 test('contract realtime keeps market symbol ownership separate from chart interval ownership', () => {
