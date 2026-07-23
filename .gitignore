@@ -68,6 +68,8 @@ Thumbs.db
 
 # Local artifacts, archives, and temporary work
 docs/
+*-clipboard-*
+pasted-text*.txt
 *.zip
 *.7z
 *.tar
@@ -84,10 +86,18 @@ tmp2.py
 backend/tmp/
 backend/private/kyc/
 backend/static/uploads/kyc/
+backend/static/uploads/*
 output/
 *-diff.txt
 next
 ffmpeg-*-essentials_build/
+
+# Local diagnostics and experimental market-data work
+backend/scripts/debug_*.py
+backend/scripts/probe_*.py
+backend/scripts/run_*shadow*.py
+backend/app/services/*shadow*.py
+backend/tests/test_*shadow*.py
 
 # Mobile app local artifacts
 mobile/node_modules/
