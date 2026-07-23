@@ -4768,6 +4768,212 @@ test('BTC 1m preview advances close and volume together until the native candle 
   datafeed.destroy();
 });
 
+test('same-series history revalidation keeps CFD trade previews live while REST is pending', async () => {
+  const symbol = 'XAUUSDT_PERP';
+  const openTime = 1_717_100_020_000;
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    category: 'CFD',
+  });
+  await establishHistoryBaseline(datafeed, symbol);
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'cfd-history-revalidation-subscriber',
+  );
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    open: '4136.20',
+    high: '4136.31',
+    low: '4136.20',
+    close: '4136.31',
+    volume: '5',
+    eventTimeMs: openTime + 1_000,
+    generation: 7,
+    sequence: 10,
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime,
+    open: '4136.20',
+    high: '4136.32',
+    low: '4136.20',
+    close: '4136.32',
+    volume: '7',
+    generation: 7,
+    sequence: 10,
+    previewSequence: 1,
+    receivedAtMs: openTime + 2_000,
+    provider: 'ITICK',
+  }));
+
+  currentCacheModule.contractKlineCurrentCache.clear();
+  const pendingHistory = deferred<KlineMetadata>();
+  let historyRequests = 0;
+  requestKlines = async () => {
+    historyRequests += 1;
+    return pendingHistory.promise;
+  };
+  const refresh = datafeed.getBars(
+    symbolInfo(symbol),
+    '1',
+    period,
+    () => undefined,
+    assert.fail,
+  );
+  await waitFor(() => historyRequests === 1, 'same-series history revalidation must remain pending');
+
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime,
+    open: '4136.20',
+    high: '4136.32',
+    low: '4135.79',
+    close: '4135.79',
+    volume: '8',
+    generation: 7,
+    sequence: 10,
+    previewSequence: 2,
+    receivedAtMs: openTime + 3_000,
+    provider: 'ITICK',
+  }));
+
+  assert.deepEqual(
+    received.map((bar) => ({ close: bar.close, volume: bar.volume })),
+    [
+      { close: 4136.31, volume: 5 },
+      { close: 4136.32, volume: 7 },
+      { close: 4135.79, volume: 8 },
+    ],
+  );
+
+  pendingHistory.resolve(metadata([row(openTime, '4136.31')]));
+  await refresh;
+  datafeed.destroy();
+});
+
+test('CFD minute rollover keeps previews live after the first current-bucket Native OPEN', async () => {
+  const symbol = 'XAUUSDT_PERP';
+  const oldOpenTime = Date.parse('2026-07-22T19:35:00.000Z');
+  const currentOpenTime = oldOpenTime + 60_000;
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    category: 'CFD',
+  });
+  await establishHistoryBaseline(datafeed, symbol);
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'cfd-minute-rollover-subscriber',
+  );
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime: oldOpenTime,
+    open: '4135.10',
+    high: '4135.80',
+    low: '4135.00',
+    close: '4135.76',
+    volume: '1100',
+    eventTimeMs: currentOpenTime,
+    generation: 7,
+    sequence: 26,
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime: currentOpenTime,
+    open: '4135.767',
+    high: '4135.775',
+    low: '4135.767',
+    close: '4135.775',
+    volume: '4.4',
+    generation: 7,
+    sequence: 26,
+    previewSequence: 3,
+    receivedAtMs: currentOpenTime + 500,
+    provider: 'ITICK',
+    baselineSource: 'TRADE_ROLLOVER',
+    baselineAnchorOpenTime: oldOpenTime,
+  }));
+
+  // The previous bucket can receive one final open revision after the new
+  // trade bucket is already visible.
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime: oldOpenTime,
+    open: '4135.10',
+    high: '4135.88',
+    low: '4135.00',
+    close: '4135.87',
+    volume: '1110',
+    eventTimeMs: currentOpenTime + 1_000,
+    generation: 7,
+    sequence: 27,
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime: currentOpenTime,
+    open: '4135.767',
+    high: '4135.775',
+    low: '4134.798',
+    close: '4134.798',
+    volume: '435.5',
+    generation: 7,
+    sequence: 27,
+    previewSequence: 53,
+    receivedAtMs: currentOpenTime + 10_000,
+    provider: 'ITICK',
+    baselineSource: 'TRADE_ROLLOVER',
+    baselineAnchorOpenTime: oldOpenTime,
+  }));
+
+  // The first Native OPEN rebases the bucket and restarts preview_sequence.
+  // The next settled trade must update immediately even though its sequence is
+  // numerically lower than the rollover sequence from the previous baseline.
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime: currentOpenTime,
+    open: '4135.77',
+    high: '4135.80',
+    low: '4134.80',
+    close: '4134.80',
+    volume: '734.4',
+    eventTimeMs: currentOpenTime + 11_000,
+    generation: 7,
+    sequence: 28,
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime: currentOpenTime,
+    open: '4135.77',
+    high: '4135.80',
+    low: '4134.71',
+    close: '4134.71',
+    volume: '752.4',
+    generation: 7,
+    sequence: 28,
+    previewSequence: 2,
+    receivedAtMs: currentOpenTime + 11_500,
+    provider: 'ITICK',
+  }));
+
+  assert.equal(received.at(-1)?.close, 4134.71);
+  assert.equal(received.at(-1)?.volume, 752.4);
+  datafeed.destroy();
+});
+
 test('cold bootstrap replays the latest preview after TradingView subscribes', async () => {
   const symbol = 'ETHUSDT_PERP';
   const openTime = 1_717_100_020_000;
@@ -4944,6 +5150,81 @@ test('iTick preview advances a CFD candle before the first versioned Native fram
       { close: 1.14205, volume: 100 },
       { close: 1.14212, volume: 121 },
       { close: 1.14213, volume: 122 },
+    ],
+  );
+  datafeed.destroy();
+});
+
+test('backend reconnect lets the replacement CFD preview bootstrap before the next Native revision', async () => {
+  const symbol = 'NAS100USDT_PERP';
+  const openTime = Date.parse('2026-07-22T22:46:00.000Z');
+  const received: any[] = [];
+  marketStoreModule.contractMarketStore.activateSymbol(symbol);
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    category: 'CFD',
+  });
+  await establishHistoryBaseline(datafeed, symbol);
+  datafeed.subscribeBars(
+    symbolInfo(symbol),
+    '1',
+    (bar: any) => received.push(bar),
+    'cfd-backend-reconnect-subscriber',
+  );
+
+  ingestStoreKline({
+    symbol,
+    interval: '1m',
+    openTime,
+    open: '28904.74',
+    high: '28912.49',
+    low: '28902.24',
+    close: '28909.11',
+    volume: '326',
+    eventTimeMs: openTime + 17_000,
+    generation: 7,
+    sequence: 21,
+  });
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime,
+    open: '28904.74',
+    high: '28912.49',
+    low: '28901.61',
+    close: '28905.61',
+    volume: '446',
+    generation: 7,
+    sequence: 21,
+    previewSequence: 4,
+    receivedAtMs: openTime + 20_000,
+    provider: 'ITICK',
+  }));
+
+  // Socket-open rotates the Store before subscription replay. No new Native
+  // K-line has arrived yet, but the replacement process already emits a
+  // complete trade preview based on its own Native baseline.
+  marketStoreModule.contractMarketStore.restartSession(symbol);
+  emitRealtime(realtimePreview({
+    symbol,
+    openTime,
+    open: '28904.74',
+    high: '28912.49',
+    low: '28900.49',
+    close: '28901.89',
+    volume: '646',
+    generation: 8,
+    sequence: 1,
+    previewSequence: 1,
+    receivedAtMs: openTime + 36_000,
+    provider: 'ITICK',
+  }));
+
+  assert.deepEqual(
+    received.map((bar) => ({ close: bar.close, volume: bar.volume })),
+    [
+      { close: 28909.11, volume: 326 },
+      { close: 28905.61, volume: 446 },
+      { close: 28901.89, volume: 646 },
     ],
   );
   datafeed.destroy();
@@ -5683,6 +5964,12 @@ test('legacy realtime subscribe and snapshot retain the monthly interval', () =>
         return 1;
       },
       clearTimeout() {},
+      setInterval() {
+        return 1;
+      },
+      clearInterval() {},
+      addEventListener() {},
+      removeEventListener() {},
     },
   });
   Object.defineProperty(globalThis, 'WebSocket', {
@@ -5780,6 +6067,12 @@ test('domain-aware interval switches never resubscribe or overwrite the market d
         return 1;
       },
       clearTimeout() {},
+      setInterval() {
+        return 1;
+      },
+      clearInterval() {},
+      addEventListener() {},
+      removeEventListener() {},
     },
   });
   Object.defineProperty(globalThis, 'WebSocket', {

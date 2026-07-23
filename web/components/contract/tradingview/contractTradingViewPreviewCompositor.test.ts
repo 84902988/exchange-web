@@ -186,7 +186,147 @@ test('trade rollover preview fails closed without an exact adjacent native ancho
     })).reason,
     'GENERATION_MISMATCH',
   );
-})
+});
+
+test('first Native OPEN rebases a trade-seeded rollover without losing the settled trade', () => {
+  const compositor = new ContractTradingViewPreviewCompositor({
+    symbol: 'BRENTUSDT_PERP',
+    interval: '1m',
+  });
+  compositor.acceptNative(native({
+    symbol: 'BRENTUSDT_PERP',
+    bar: { ...native().bar, close: 100 },
+  }));
+  const rollover = compositor.acceptPreview(preview({
+    symbol: 'BRENTUSDT_PERP',
+    openTime: OPEN_TIME + 60_000,
+    baselineSource: 'TRADE_ROLLOVER',
+    baselineAnchorOpenTime: OPEN_TIME,
+    bar: {
+      time: OPEN_TIME + 60_000,
+      open: 104,
+      high: 105,
+      low: 104,
+      close: 105,
+      volume: 3,
+    },
+  }));
+
+  const rebased = compositor.acceptNative(native({
+    symbol: 'BRENTUSDT_PERP',
+    openTime: OPEN_TIME + 60_000,
+    revision: { epoch: 1, sequence: 1 },
+    bar: {
+      time: OPEN_TIME + 60_000,
+      open: 101,
+      high: 103,
+      low: 100,
+      close: 102,
+      volume: 2,
+    },
+  }));
+
+  assert.equal(rollover.reason, 'TRADE_ROLLOVER_ACCEPTED');
+  assert.equal(rebased.reason, 'NATIVE_OPEN_REBASED_PREVIEW');
+  assert.equal(rebased.source, 'preview');
+  assert.deepEqual(rebased.bar, {
+    time: OPEN_TIME + 60_000,
+    open: 101,
+    high: 105,
+    low: 100,
+    close: 105,
+    volume: 3,
+  });
+
+  const nextPreview = compositor.acceptPreview(preview({
+    symbol: 'BRENTUSDT_PERP',
+    openTime: OPEN_TIME + 60_000,
+    baseNativeRevision: { epoch: 1, sequence: 1 },
+    previewSequence: 1,
+    baselineSource: 'NATIVE',
+    baselineAnchorOpenTime: null,
+    bar: {
+      time: OPEN_TIME + 60_000,
+      open: 101,
+      high: 106,
+      low: 100,
+      close: 106,
+      volume: 4,
+    },
+  }));
+
+  assert.equal(nextPreview.reason, 'PREVIEW_ACCEPTED');
+  assert.equal(nextPreview.source, 'preview');
+  assert.equal(nextPreview.bar?.close, 106);
+});
+
+for (const symbol of [
+  'BRENTUSDT_PERP',
+  'EURUSD_PERP',
+  'XAUUSDT_PERP',
+  'NAS100USDT_PERP',
+  'BTCUSDT_PERP',
+  'ETHUSDT_PERP',
+]) {
+  for (const interval of ['1m', '5m'] as const) {
+    test(`${symbol} ${interval} shares Native rollover correction without forcing continuity`, () => {
+      const intervalMs = interval === '1m' ? 60_000 : 300_000;
+      const anchorTime = Math.floor(OPEN_TIME / intervalMs) * intervalMs;
+      const nextTime = anchorTime + intervalMs;
+      const compositor = new ContractTradingViewPreviewCompositor({ symbol, interval });
+      compositor.acceptNative(native({
+        symbol,
+        interval,
+        openTime: anchorTime,
+        bar: {
+          time: anchorTime,
+          open: 99,
+          high: 101,
+          low: 98,
+          close: 100,
+          volume: 10,
+        },
+      }));
+      compositor.acceptPreview(preview({
+        symbol,
+        interval,
+        openTime: nextTime,
+        baselineSource: 'TRADE_ROLLOVER',
+        baselineAnchorOpenTime: anchorTime,
+        bar: {
+          time: nextTime,
+          open: 112,
+          high: 113,
+          low: 111,
+          close: 113,
+          volume: 2,
+        },
+      }));
+
+      const result = compositor.acceptNative(native({
+        symbol,
+        interval,
+        openTime: nextTime,
+        revision: { epoch: 3, sequence: 1 },
+        bar: {
+          time: nextTime,
+          open: 110,
+          high: 112,
+          low: 109,
+          close: 111,
+          volume: 1,
+        },
+      }));
+
+      assert.equal(result.reason, 'NATIVE_OPEN_REBASED_PREVIEW');
+      assert.equal(result.bar?.open, 110);
+      assert.equal(result.bar?.close, 113);
+      assert.equal(result.bar?.high, 113);
+      assert.equal(result.bar?.low, 109);
+      assert.notEqual(result.bar?.open, 100, 'a real Native gap must remain visible');
+    });
+  }
+}
 
 test('bootstrap preview rejects rollback before Native authority arrives', () => {
   const compositor = new ContractTradingViewPreviewCompositor({

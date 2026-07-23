@@ -38,6 +38,7 @@ export type ContractPreviewInput = Readonly<{
 
 export type ContractPreviewReason =
   | 'NATIVE_ACCEPTED'
+  | 'NATIVE_OPEN_REBASED_PREVIEW'
   | 'NATIVE_OPEN_DEFERRED_TO_PREVIEW'
   | 'PREVIEW_BOOTSTRAP_ACCEPTED'
   | 'TRADE_ROLLOVER_ACCEPTED'
@@ -188,6 +189,41 @@ export class ContractTradingViewPreviewCompositor {
     };
     this.state.native = nextNative;
     const preview = this.state.preview;
+    if (
+      !input.isClosed
+      && preview
+      && preview.openTime === input.openTime
+      && preview.generation === input.generation
+      && preview.baselineSource === 'TRADE_ROLLOVER'
+    ) {
+      // The first real trade can open the adjacent preview bucket before the
+      // provider K-line channel arrives. Rebase its structural OHLC evidence
+      // onto Native as soon as it does, while retaining the newer settled-trade
+      // close and monotonic volume. This mirrors the backend preview engine and
+      // prevents the temporary trade-seeded open from becoming a visual gap.
+      const rebasedBar: ContractPreviewBar = {
+        time: input.openTime,
+        open: nextNative.bar.open,
+        high: Math.max(nextNative.bar.high, preview.bar.high),
+        low: Math.min(nextNative.bar.low, preview.bar.low),
+        close: preview.bar.close,
+        volume: Math.max(nextNative.bar.volume, preview.bar.volume),
+      };
+      this.state.preview = {
+        ...preview,
+        receivedAtMs: Math.max(preview.receivedAtMs, nextNative.receivedAtMs),
+        baseNativeRevision: { ...nextNative.revision },
+        // preview_sequence is scoped to one Native revision and restarts when
+        // the provider publishes the first Native OPEN for this bucket. The
+        // retained rollover bar still owns the visible close, but its sequence
+        // cannot be compared with previews based on the new Native revision.
+        previewSequence: 0,
+        baselineSource: 'NATIVE',
+        baselineAnchorOpenTime: null,
+        bar: rebasedBar,
+      };
+      return this.accept('NATIVE_OPEN_REBASED_PREVIEW', 'preview', rebasedBar);
+    }
     if (
       !input.isClosed
       && preview

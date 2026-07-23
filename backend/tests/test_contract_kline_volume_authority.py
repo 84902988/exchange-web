@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from app.services import contract_market_service
 from app.services import contract_market_gateway
 from app.services.contract_market_provider_ws import (
@@ -61,6 +63,115 @@ def test_history_authority_filter_rejects_incomplete_ohlcv_rows():
     ])
 
     assert list(rows) == [base]
+
+
+def test_itick_intraday_filter_rejects_rolling_day_summary_after_session_gap(monkeypatch):
+    rows = contract_market_service.ContractKlineResult(
+        [
+            {
+                "open_time": 1_784_754_000_000,
+                "open": "29021.73",
+                "high": "29021.73",
+                "low": "29021.73",
+                "close": "29021.73",
+                "volume": "22",
+            },
+            {
+                "open_time": 1_784_755_320_000,
+                "open": "28811.23",
+                "high": "29197.93",
+                "low": "28811.23",
+                "close": "29021.73",
+                "volume": "46490",
+            },
+        ],
+        origin="PROVIDER",
+        cache_status="REFRESHED",
+    )
+    monkeypatch.setattr(
+        contract_market_service,
+        "_get_cached_tradfi_quote_for_contract",
+        lambda *_args, **_kwargs: {"high_24h": "29197.93", "low_24h": "28811.23"},
+    )
+
+    filtered = contract_market_service._filter_itick_intraday_rolling_summary_rows(
+        SimpleNamespace(symbol="NAS100USDT_PERP", category="INDEX", price_precision=2),
+        "1m",
+        rows,
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0]["open_time"] == 1_784_754_000_000
+    assert filtered.origin == "PROVIDER"
+    assert filtered.cache_status == "REFRESHED"
+
+
+def test_itick_intraday_filter_preserves_real_one_sided_gap(monkeypatch):
+    rows = [
+        {
+            "open_time": 1_784_754_000_000,
+            "open": "100",
+            "high": "101",
+            "low": "99",
+            "close": "100",
+            "volume": "10",
+        },
+        {
+            "open_time": 1_784_755_320_000,
+            "open": "108",
+            "high": "110",
+            "low": "107",
+            "close": "109",
+            "volume": "12",
+        },
+    ]
+    monkeypatch.setattr(
+        contract_market_service,
+        "_get_cached_tradfi_quote_for_contract",
+        lambda *_args, **_kwargs: {"high_24h": "110", "low_24h": "90"},
+    )
+
+    filtered = contract_market_service._filter_itick_intraday_rolling_summary_rows(
+        SimpleNamespace(symbol="NAS100USDT_PERP", category="INDEX", price_precision=2),
+        "1m",
+        rows,
+    )
+
+    assert list(filtered) == rows
+
+
+def test_itick_intraday_filter_rejects_cold_index_summary_signature(monkeypatch):
+    rows = [
+        {
+            "open_time": 1_784_754_000_000,
+            "open": "29021.73",
+            "high": "29021.73",
+            "low": "29021.73",
+            "close": "29021.73",
+            "volume": "22",
+        },
+        {
+            "open_time": 1_784_755_320_000,
+            "open": "28811.23",
+            "high": "29197.93",
+            "low": "28811.23",
+            "close": "29021.73",
+            "volume": "46490",
+        },
+    ]
+    monkeypatch.setattr(
+        contract_market_service,
+        "_get_cached_tradfi_quote_for_contract",
+        lambda *_args, **_kwargs: None,
+    )
+
+    filtered = contract_market_service._filter_itick_intraday_rolling_summary_rows(
+        SimpleNamespace(symbol="NAS100USDT_PERP", category="INDEX", price_precision=2),
+        "1m",
+        rows,
+    )
+
+    assert len(filtered) == 1
 
 
 def test_realtime_provider_adapters_require_volume_without_fabricating_zero():
