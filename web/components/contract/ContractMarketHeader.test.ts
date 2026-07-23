@@ -415,7 +415,7 @@ test('Header recovers live structure and BBO from the complete same-symbol page 
   );
 });
 
-test('Header keeps executable Store BBO live while page authority recovers market structure', () => {
+test('Header keeps linked page BBO authoritative while Store metrics recover', () => {
   resetHarness();
   storeSnapshotsBySymbol.BTCUSDT_PERP = makeStoreSnapshot({
     displayPrice: '1',
@@ -440,15 +440,15 @@ test('Header keeps executable Store BBO live while page authority recovers marke
   );
   assert.equal(
     textContent(findByTestId(tree, 'contract-header-best-bid')),
-    '\u4e70\u4e0064,110.0',
+    '\u4e70\u4e0063,999.0',
   );
   assert.equal(
     textContent(findByTestId(tree, 'contract-header-best-ask')),
-    '\u5356\u4e0064,111.0',
+    '\u5356\u4e0064,001.0',
   );
 });
 
-test('Header reads realtime Store BBO by full contract symbol across contract categories', () => {
+test('Header does not fork linked page BBO across contract categories', () => {
   const cases = [
     { category: 'crypto', marketSymbol: 'BTCUSDT', storeSymbol: 'BTCUSDT_PERP' },
     { category: 'forex CFD', marketSymbol: 'EURUSD', storeSymbol: 'EURUSD_PERP' },
@@ -475,13 +475,13 @@ test('Header reads realtime Store BBO by full contract symbol across contract ca
 
     assert.equal(
       textContent(findByTestId(tree, 'contract-header-best-bid')),
-      '\u4e70\u4e0064,110.0',
-      `${category} should select Store BBO with ${storeSymbol}`,
+      '\u4e70\u4e0063,999.0',
+      `${category} should retain canonical page BBO with ${storeSymbol}`,
     );
     assert.equal(
       textContent(findByTestId(tree, 'contract-header-best-ask')),
-      '\u5356\u4e0064,111.0',
-      `${category} should select Store BBO with ${storeSymbol}`,
+      '\u5356\u4e0064,001.0',
+      `${category} should retain canonical page BBO with ${storeSymbol}`,
     );
   }
 });
@@ -755,7 +755,7 @@ test('TradFi header omits synthetic funding/index metrics and places executable 
   assert.equal(textContent(findByTestId(tree, 'contract-header-best-ask')), '\u5356\u4e0064,001.0');
 });
 
-test('Header reads display and mark prices from Store while retaining index price in structured diff diagnostics', () => {
+test('Header enriches display metrics from Store while linked mark price stays page-owned', () => {
   resetHarness();
   storeSnapshotsBySymbol.BTCUSDT_PERP = makeStoreSnapshot({
     displayPrice: '64010',
@@ -770,7 +770,7 @@ test('Header reads display and mark prices from Store while retaining index pric
   try {
     const tree = renderHeader();
     assert.equal(textContent(findByTestId(tree, 'contract-header-display-price')), '64,010.0');
-    assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c64,008.0');
+    assert.equal(textContent(findByTestId(tree, 'contract-header-mark-price')), '\u6807\u8bb0\u4ef7\u683c63,998.0');
     assert.equal(walk(tree).some((node) => node.props['data-testid'] === 'contract-header-index-price'), false);
     assert.equal((tree as RenderNode).props['data-market-authority'], 'STORE');
     assert.equal((tree as RenderNode).props['data-provider-generation'], 10);

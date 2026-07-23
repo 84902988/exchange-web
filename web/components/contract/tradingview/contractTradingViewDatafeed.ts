@@ -2235,6 +2235,8 @@ export function createContractTradingViewDatafeed({
         return emitRealtimeBar(result.bar, authority, source);
       };
 
+      let deferredFuturePreview: ContractMarketRealtimeMessage | null = null;
+
       const handleStoreEntry = (entry: ContractMarketStoreEntry | null) => {
         const activeSubscription = getActiveSubscription();
         if (!activeSubscription) return;
@@ -2247,6 +2249,7 @@ export function createContractTradingViewDatafeed({
           previewCompositor.reset();
           activeSubscription.lastStoreBarTime = 0;
           activeSubscription.legacyVersionCursor = null;
+          deferredFuturePreview = null;
           return;
         }
         const nextBar = storeKlineEntryToBar(entry, subscriptionSymbol, interval);
@@ -2255,12 +2258,22 @@ export function createContractTradingViewDatafeed({
           activeSubscription.lastStoreBarTime,
           nextBar.time,
         );
-        emitNativeBar(
+        const nativeAccepted = emitNativeBar(
           nextBar,
           storeEntryVersion(entry),
           entry.revision?.isClosed === true,
           'STORE',
         );
+        if (nativeAccepted && deferredFuturePreview) {
+          // A TRADE_PREVIEW can legitimately reach the browser just before
+          // its matching Native revision. The compositor must reject that
+          // future baseline at first. Retain only that one rejected frame and
+          // re-evaluate it immediately after Native advances so the current
+          // candle does not remain frozen until the next provider K-line.
+          const preview = deferredFuturePreview;
+          deferredFuturePreview = null;
+          acceptPreviewMessage(preview);
+        }
       };
 
       const acceptPreviewMessage = (message: ContractMarketRealtimeMessage) => {
@@ -2277,7 +2290,16 @@ export function createContractTradingViewDatafeed({
         );
         if (!input) return;
         const result = previewCompositor.acceptPreview(input);
-        if (!result.accepted || !result.bar) return;
+        if (!result.accepted || !result.bar) {
+          if (result.reason === 'BASE_REVISION_FUTURE') {
+            // One slot per active subscription is sufficient: a newer preview
+            // supersedes an older future-baseline frame, without timers,
+            // polling, or an unbounded queue.
+            deferredFuturePreview = message;
+          }
+          return;
+        }
+        deferredFuturePreview = null;
         emitRealtimeBar(result.bar, 'PREVIEW', 'preview');
       };
 

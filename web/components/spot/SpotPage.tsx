@@ -62,7 +62,6 @@ const EMPTY_MARKET_DATA: SpotHeaderMarketData = {
 const DEFAULT_SPOT_SYMBOL = 'BTCUSDT';
 const DEFAULT_SPOT_INTERVAL = '1m';
 const SPOT_PAIR_PAGE_SIZE = 6;
-const SPOT_PAIR_PAGE_CACHE_TTL_MS = 60_000;
 const SPOT_PAIR_TICKER_BATCH_TTL_MS = 30_000;
 const SPOT_INTERVAL_CHANGE_DEBOUNCE_MS = 150;
 const SPOT_PRIVATE_FOREGROUND_REFRESH_MS = 10000;
@@ -75,7 +74,6 @@ type SpotPairQuery = {
   keyword: string;
 };
 type SpotPairPageResponse = Awaited<ReturnType<typeof getSpotMarketPairs>>;
-const cachedSpotPairPages = new Map<string, { items: SpotPairOption[]; total: number; fetchedAt: number }>();
 const spotPairPageRequests = new Map<string, Promise<SpotPairPageResponse>>();
 const cachedSpotPairTickerBatches = new Map<string, { items: SpotPairOption[]; fetchedAt: number }>();
 const spotPairTickerBatchRequests = new Map<string, Promise<SpotPairOption[]>>();
@@ -91,6 +89,15 @@ function normalizeSpotPageInterval(value: string): string {
   if (normalized === '1d') return '1d';
   if (normalized === '1w') return '1w';
   return normalized;
+}
+
+function isSpotPairUnavailableError(value: string | null | undefined): boolean {
+  const normalized = String(value || '').trim().toLowerCase();
+  return (
+    normalized.includes('trading pair not found') ||
+    normalized.includes('not found or disabled') ||
+    normalized.includes('http error 404')
+  );
 }
 
 function isSpotPageTvDebugEnabled() {
@@ -647,14 +654,11 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
   const accountBalancesRequestSeqRef = useRef(0);
   const lastAccountBalancesStartedAtRef = useRef(0);
   const [pairQuery, setPairQuery] = useState<SpotPairQuery>(() => getInitialPairQuery(initialCategory));
-  const initialPairCache = cachedSpotPairPages.get(getPairQueryKey(getInitialPairQuery(initialCategory)));
-  const [pairOptions, setPairOptions] = useState<SpotPairOption[]>(initialPairCache?.items || []);
-  const [pairOptionsQueryKey, setPairOptionsQueryKey] = useState(
-    initialPairCache ? getPairQueryKey(getInitialPairQuery(initialCategory)) : '',
-  );
-  const [pairTotal, setPairTotal] = useState(initialPairCache?.total || 0);
-  const [pairPage, setPairPage] = useState(initialPairCache?.items.length ? 1 : 0);
-  const [pairOptionsLoading, setPairOptionsLoading] = useState(!initialPairCache);
+  const [pairOptions, setPairOptions] = useState<SpotPairOption[]>([]);
+  const [pairOptionsQueryKey, setPairOptionsQueryKey] = useState('');
+  const [pairTotal, setPairTotal] = useState(0);
+  const [pairPage, setPairPage] = useState(0);
+  const [pairOptionsLoading, setPairOptionsLoading] = useState(true);
   const [pairOptionsLoadingMore, setPairOptionsLoadingMore] = useState(false);
   const pairOptionsRef = useRef<SpotPairOption[]>([]);
   const pairQueryRef = useRef(pairQuery);
@@ -865,24 +869,11 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       const requestId = ++pairRequestIdRef.current;
 
       if (!append) {
-        const cachedPage = cachedSpotPairPages.get(queryKey);
-        if (cachedPage) {
-          setPairOptions(cachedPage.items);
-          setPairOptionsQueryKey(queryKey);
-          setPairTotal(cachedPage.total);
-          setPairPage(1);
-          setPairOptionsLoading(false);
-          if (isFreshTimestamp(cachedPage.fetchedAt, SPOT_PAIR_PAGE_CACHE_TTL_MS)) {
-            void hydratePairTickers(cachedPage.items, queryKey);
-            return;
-          }
-        } else {
-          setPairOptions([]);
-          setPairOptionsQueryKey('');
-          setPairTotal(0);
-          setPairPage(0);
-          setPairOptionsLoading(true);
-        }
+        setPairOptions([]);
+        setPairOptionsQueryKey('');
+        setPairTotal(0);
+        setPairPage(0);
+        setPairOptionsLoading(true);
       } else {
         setPairOptionsLoadingMore(true);
       }
@@ -911,13 +902,6 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
         setPairOptionsQueryKey(queryKey);
         setPairTotal(response.total);
         setPairPage(response.page);
-        if (!append) {
-          cachedSpotPairPages.set(queryKey, {
-            items: mergedPairs,
-            total: response.total,
-            fetchedAt: Date.now(),
-          });
-        }
 
         const currentSymbol = normalizeSpotApiSymbol(symbolRef.current);
         const currentPair = mergedPairs.find((item) => item.symbol === currentSymbol);
@@ -929,7 +913,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       } catch (error) {
         if (requestId === pairRequestIdRef.current) {
           console.error('SpotPage pair list load error:', error);
-          if (!append && !cachedSpotPairPages.has(queryKey)) {
+          if (!append) {
             setPairOptions([]);
           }
         }
@@ -990,19 +974,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
           const map = new Map(prev.map((item) => [item.symbol, item]));
           const previous = map.get(currentSymbol);
           map.set(currentSymbol, previous ? mergeSpotPairOption(previous, nextTicker) : nextTicker);
-          const nextItems = Array.from(map.values());
-          const queryKey = getPairQueryKey(pairQueryRef.current);
-          const cachedPage = cachedSpotPairPages.get(queryKey);
-          if (cachedPage?.items.some((item) => item.symbol === currentSymbol)) {
-            cachedSpotPairPages.set(queryKey, {
-              ...cachedPage,
-              items: cachedPage.items.map((item) =>
-                item.symbol === currentSymbol ? mergeSpotPairOption(item, nextTicker) : item,
-              ),
-              fetchedAt: Date.now(),
-            });
-          }
-          return nextItems;
+          return Array.from(map.values());
         });
       } catch (error) {
         console.warn('SpotPage current pair metadata refresh warning:', error);
@@ -1015,6 +987,34 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
       cancelled = true;
     };
   }, [symbol]);
+
+  useEffect(() => {
+    if (
+      pairOptionsLoading ||
+      pairOptionsLoadingMore ||
+      !isSpotPairUnavailableError(spotMarket.error)
+    ) {
+      return;
+    }
+
+    const activeFallback =
+      pairOptions.find((item) => item.symbol === DEFAULT_SPOT_SYMBOL) ||
+      pairOptions[0];
+    if (!activeFallback || activeFallback.symbol === normalizeSpotApiSymbol(symbol)) {
+      return;
+    }
+
+    setHeaderTicker(activeFallback);
+    setSymbol(activeFallback.symbol);
+    router.replace(`/trade/spot?symbol=${encodeURIComponent(activeFallback.symbol)}`);
+  }, [
+    pairOptions,
+    pairOptionsLoading,
+    pairOptionsLoadingMore,
+    router,
+    spotMarket.error,
+    symbol,
+  ]);
 
   useEffect(() => {
     const category = String(initialCategory || '').trim().toLowerCase();
@@ -1485,6 +1485,11 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     void loadPairPage(pairQueryRef.current, pairPage + 1, true);
   }, [loadPairPage, pairOptions.length, pairOptionsLoading, pairOptionsLoadingMore, pairPage, pairTotal]);
 
+  const refreshSpotPairCatalog = useCallback(
+    () => loadPairPage(pairQueryRef.current, 1, false),
+    [loadPairPage],
+  );
+
   const handleOrderSuccess = useCallback(() => {
     setRefreshKey((v) => v + 1);
     void loadAccountBalances({ force: true, silent: true });
@@ -1694,6 +1699,7 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
               hasMorePairs={pairOptions.length < pairTotal}
               initialCategory={getToolbarInitialCategory(initialCategory)}
               onPairQueryChange={handlePairQueryChange}
+              onCatalogRefresh={refreshSpotPairCatalog}
               onLoadMorePairs={handleLoadMorePairs}
               onSymbolChange={handleSymbolChange}
               onIntervalChange={handleHeaderIntervalChange}

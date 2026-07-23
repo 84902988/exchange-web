@@ -58,14 +58,15 @@ type UrlMarketView = 'DEFAULT' | 'RWA'
 type MarketsTranslator = (key: string, namespace?: 'markets') => string
 
 const TICKER_REFRESH_INTERVAL_MS = 15_000
-const METADATA_REFRESH_INTERVAL_MS = 5 * 60 * 1000
+// Pair enable/disable is control-plane state. Refresh it at a modest cadence;
+// ticker/quote caches remain independent and keep the hot path inexpensive.
+const METADATA_REFRESH_INTERVAL_MS = 30 * 1000
 const PAIRS_PAGE_SIZE = 100
 const TICKER_BATCH_SIZE = 50
 const TICKER_CHUNK_CONCURRENCY = 3
 const CONTRACT_TICKER_BATCH_SIZE = 20
 const INITIAL_PRIORITY_TICKER_LIMIT = 24
 
-let marketsRowsCache: MarketTickerItem[] = []
 let marketsLastUpdatedCache: Date | null = null
 let marketsRowsCacheLoaded = false
 const spotTickerCache = new Map<string, MarketTickerItem>()
@@ -337,7 +338,6 @@ function ensureMarketsRowsCacheLoaded() {
   seedContractTickerCacheFromSelector()
   if (!cached) return
 
-  marketsRowsCache = applyTickerCaches(cached.rows)
   marketsLastUpdatedCache = cached.lastUpdated
 }
 
@@ -925,9 +925,9 @@ function MarketsPageContent() {
   const [search, setSearch] = useState('')
   const [sortState, setSortState] = useState<MarketsSortState | null>(null)
   const requestIdRef = useRef(0)
-  const [rows, setRows] = useState<MarketTickerItem[]>(() => marketsRowsCache)
+  const [rows, setRows] = useState<MarketTickerItem[]>([])
   const rowsRef = useRef<MarketTickerItem[]>(rows)
-  const [loading, setLoading] = useState(() => marketsRowsCache.length === 0)
+  const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const metadataInFlightRef = useRef(false)
@@ -941,7 +941,6 @@ function MarketsPageContent() {
     persist = true,
   ) => {
     const dedupedRows = mergeRowsBySymbol(nextRows)
-    marketsRowsCache = dedupedRows
     marketsLastUpdatedCache = lastUpdatedAt
     rowsRef.current = dedupedRows
     setRows(dedupedRows)
@@ -1086,11 +1085,6 @@ function MarketsPageContent() {
 
   useEffect(() => {
     ensureMarketsRowsCacheLoaded()
-    if (marketsRowsCache.length === 0) return
-
-    rowsRef.current = marketsRowsCache
-    setRows(marketsRowsCache)
-    setLoading(false)
   }, [])
 
   useEffect(() => {
@@ -1108,7 +1102,8 @@ function MarketsPageContent() {
     }
 
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') refreshMarketTickers()
+      if (document.visibilityState !== 'visible') return
+      void refreshMetadata()
     }
 
     void refreshMetadata()

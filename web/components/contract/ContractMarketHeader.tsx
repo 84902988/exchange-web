@@ -213,23 +213,6 @@ function formatCompactAmount(value: string | null) {
   return amount.toFixed(2);
 }
 
-function resolveStoreQuoteTone(
-  store: ContractHeaderStoreSnapshot,
-  executable: boolean | null,
-  fallback: ContractHeaderQuoteStatusTone,
-): ContractHeaderQuoteStatusTone {
-  const displayState = normalizeToken(store.displayState);
-  const freshness = normalizeToken(store.freshness);
-  if (displayState === 'LOADING') return 'loading';
-  if (store.stale || ['STALE', 'LAST_GOOD', 'MISSING'].includes(freshness)) return 'last';
-  if (executable === true && ['LIVE', 'RECENT'].includes(freshness)) return 'live';
-  if (
-    ['PRE_MARKET', 'AFTER_HOURS', 'CLOSED', 'MARKET_CLOSED', 'HOLIDAY', 'EXPIRED', 'UNAVAILABLE']
-      .includes(displayState)
-  ) return 'unavailable';
-  return fallback;
-}
-
 export function resolveContractHeaderMarketRead(
   store: ContractHeaderStoreSnapshot | null,
   legacy: ContractHeaderLegacyRead,
@@ -238,38 +221,17 @@ export function resolveContractHeaderMarketRead(
   const storeDisplayState = normalizeToken(store.displayState);
   const storeHasLiveStructure = ['LIVE_TRADABLE', 'REGULAR_OPEN'].includes(storeDisplayState)
     && store.executable === true;
-  const preserveBootstrapLoading = legacy.quoteStatusTone === 'loading'
-    && (
-      !storeDisplayState
-      || ['LOADING', 'MARKET_DATA_UNAVAILABLE', 'UNAVAILABLE', 'UNKNOWN']
-        .includes(storeDisplayState)
-    );
-  const legacyBid = parseComparableNumber(legacy.bestBid);
-  const legacyAsk = parseComparableNumber(legacy.bestAsk);
   const legacyHasLiveStructure = legacy.quoteStatusTone === 'live'
-    && legacy.executable === true
-    && legacyBid !== null
-    && legacyAsk !== null
-    && legacyBid > 0
-    && legacyAsk >= legacyBid;
-  const storeBid = parseComparableNumber(store.bestBid);
-  const storeAsk = parseComparableNumber(store.bestAsk);
-  const storeHasExecutableBbo = store.executable === true
-    && storeBid !== null
-    && storeAsk !== null
-    && storeBid > 0
-    && storeAsk >= storeBid;
-  // Header reads the low-latency Store directly, but a just-reconnected ticker
-  // can briefly retain unavailable structure while the complete MarketView
-  // REST/depth authority is already live. Keep non-price Store metrics, and
-  // recover structure plus valuation from that same-symbol authority. Keep a
-  // complete executable Store BBO independent so a slow ticker/bootstrap read
-  // cannot roll live depth prices back to the legacy snapshot.
+    && legacy.executable === true;
+  // A just-reconnected ticker can briefly retain unavailable display structure
+  // while the canonical page authority is already live. Store data may enrich
+  // non-linked display metrics, but pricing/status fields stay page-owned.
   const recoverStructureFromLegacy = legacyHasLiveStructure && !storeHasLiveStructure;
-  const recoverBboFromLegacy = recoverStructureFromLegacy && !storeHasExecutableBbo;
-  const executable = recoverStructureFromLegacy
-    ? legacy.executable
-    : store.executable ?? legacy.executable;
+  // Status, execution BBO and valuation are linked fields owned by the page's
+  // canonical MarketView/PriceAuthority. The Header may still read the same
+  // Store for low-cost 24h metrics, but it must never create a second pricing
+  // authority with different freshness or reconnect semantics.
+  const executable = legacy.executable;
   const displayPrice = recoverStructureFromLegacy
     ? legacy.displayPrice
     : formatStoreNumber(store.displayPrice, legacy.displayPrice) || legacy.displayPrice;
@@ -287,45 +249,25 @@ export function resolveContractHeaderMarketRead(
     authority: 'STORE',
     displayPrice,
     change: formatStoreChange(store, legacy.change, legacy.displayPrice),
-    quoteStatusLabel: recoverStructureFromLegacy || preserveBootstrapLoading
-      ? legacy.quoteStatusLabel
-      : store.displayState || store.marketStatus || legacy.quoteStatusLabel,
-    quoteStatusTone: recoverStructureFromLegacy || preserveBootstrapLoading
-      ? legacy.quoteStatusTone
-      : resolveStoreQuoteTone(store, executable, legacy.quoteStatusTone),
-    marketStatus: recoverStructureFromLegacy
-      ? legacy.marketStatus
-      : store.marketStatus ?? legacy.marketStatus,
-    tickerSource: recoverStructureFromLegacy
-      ? legacy.tickerSource
-      : store.source ?? legacy.tickerSource,
-    tickerFreshness: recoverStructureFromLegacy
-      ? legacy.tickerFreshness
-      : store.freshness ?? legacy.tickerFreshness,
-    marketSessionType: recoverStructureFromLegacy
-      ? legacy.marketSessionType
-      : store.marketSessionType ?? legacy.marketSessionType,
+    quoteStatusLabel: legacy.quoteStatusLabel,
+    quoteStatusTone: legacy.quoteStatusTone,
+    marketStatus: legacy.marketStatus,
+    tickerSource: legacy.tickerSource,
+    tickerFreshness: legacy.tickerFreshness,
+    marketSessionType: legacy.marketSessionType,
     executable,
     displayPriceSource,
     displayPriceLabel: displayPriceSource && displayPriceSource !== legacy.displayPriceSource
       ? displayPriceSource
       : legacy.displayPriceLabel,
-    markPrice: recoverStructureFromLegacy
-      ? legacy.markPrice
-      : formatStoreNumber(store.markPrice, legacy.markPrice),
+    markPrice: legacy.markPrice,
     indexPrice: recoverStructureFromLegacy
       ? legacy.indexPrice
       : formatStoreNumber(store.indexPrice, legacy.indexPrice),
     fundingRate: formatStoreFunding(store.fundingRate, legacy.fundingRate),
-    bestBid: recoverBboFromLegacy
-      ? legacy.bestBid
-      : formatStoreNumber(store.bestBid, legacy.bestBid),
-    bestAsk: recoverBboFromLegacy
-      ? legacy.bestAsk
-      : formatStoreNumber(store.bestAsk, legacy.bestAsk),
-    spread: recoverBboFromLegacy
-      ? legacy.spread
-      : formatStoreNumber(store.spread, legacy.spread),
+    bestBid: legacy.bestBid,
+    bestAsk: legacy.bestAsk,
+    spread: legacy.spread,
     highLow24h,
     volumeTurnover24h,
   };
@@ -687,6 +629,7 @@ export default function ContractMarketHeader({
   }, [displayPrice, displaySymbol]);
 
   useEffect(() => {
+    if (process.env.NODE_ENV === 'production') return;
     const differences = getContractHeaderReadDifferences(storeSnapshot, legacyRead);
     if (!storeSnapshot || differences.length === 0) return;
     console.info('[contract-header-market-diff]', {

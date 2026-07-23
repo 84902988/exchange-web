@@ -38,6 +38,18 @@ _CRYPTO_CATEGORIES = {"CRYPTO"}
 _OPEN_MARKET_STATUSES = {"OPEN", "TRADING"}
 _CLOSED_MARKET_STATUSES = {"CLOSED", "SUSPENDED"}
 _HOLIDAY_MARKET_STATUSES = {"HOLIDAY"}
+_BLOCKING_INSTRUMENT_STATES = {
+    "SUSPENDED",
+    "DELISTED",
+    "CIRCUIT_BREAKER",
+}
+_BLOCKING_PROVIDER_MARKET_STATUSES = {
+    "CLOSED",
+    "SUSPENDED",
+    "HOLIDAY",
+    "DELISTED",
+    "CIRCUIT_BREAKER",
+}
 
 
 @dataclass(frozen=True)
@@ -102,6 +114,60 @@ def _first_payload_value(quote: Optional[dict[str, Any]], depth: Optional[dict[s
     if quote_value not in (None, ""):
         return quote_value
     return (depth or {}).get(key)
+
+
+def _positive_number(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _has_valid_bbo(payload: Optional[dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    bid = _positive_number(
+        payload.get("bid_price")
+        or payload.get("best_bid")
+        or payload.get("bid")
+    )
+    ask = _positive_number(
+        payload.get("ask_price")
+        or payload.get("best_ask")
+        or payload.get("ask")
+    )
+    return bid is not None and ask is not None and ask >= bid
+
+
+def _has_blocking_instrument_evidence(payload: Optional[dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if _normalized(payload.get("instrument_state")) in _BLOCKING_INSTRUMENT_STATES:
+        return True
+    if _normalized(payload.get("provider_market_status")) in _BLOCKING_PROVIDER_MARKET_STATUSES:
+        return True
+    try:
+        return int(str(payload.get("provider_trading_status")).strip()) in {1, 2, 3}
+    except (TypeError, ValueError):
+        return False
+
+
+def _session_authority_payload(
+    quote: Optional[dict[str, Any]],
+    depth: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    # Explicit provider suspension/delisting evidence always wins. Otherwise
+    # session feed health follows the same BBO authority as MarketView:
+    # complete depth first, then the quote BBO.
+    for payload in (quote, depth):
+        if _has_blocking_instrument_evidence(payload):
+            return payload
+    if _has_valid_bbo(depth):
+        return depth
+    if _has_valid_bbo(quote):
+        return quote
+    return quote or depth
 
 
 def _raw_session_type(quote: Optional[dict[str, Any]], depth: Optional[dict[str, Any]]) -> str:
@@ -228,11 +294,12 @@ def resolve_contract_trading_session(
     depth: Optional[dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> ContractTradingSession:
+    authority_payload = _session_authority_payload(quote, depth)
     configured_profile = _normalized(_attr(contract_symbol, "session_profile_code"))
     if configured_profile and configured_profile != "UNKNOWN":
         decision = contract_session_authority.resolve(
             contract_symbol=contract_symbol,
-            quote=quote or depth,
+            quote=authority_payload,
             now=now,
         )
         return ContractTradingSession(
@@ -256,7 +323,7 @@ def resolve_contract_trading_session(
             reason_code=REASON_CRYPTO_24_7,
         )
     if category in _US_EQUITY_CATEGORIES:
-        return _resolve_us_equity_session(quote, depth, now)
+        return _resolve_us_equity_session(authority_payload, None, now)
     if category in _PROVIDER_SESSION_CATEGORIES:
-        return _resolve_provider_session(quote, depth)
-    return _resolve_provider_session(quote, depth)
+        return _resolve_provider_session(authority_payload, None)
+    return _resolve_provider_session(authority_payload, None)

@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from app.schemas.contract_market import ContractMarketViewDetail
 from app.schemas.contract_market_domain_snapshot import (
     ContractMarketDomainCacheOrigin,
@@ -291,6 +293,30 @@ def test_public_market_view_reads_authority_bundle(monkeypatch):
     assert view["snapshot_authority"] is True
     assert view["authority_source"] == "SNAPSHOT_AUTHORITY"
     assert view["depth"]["best_bid"] == "100"
+
+
+def test_public_market_view_rejects_disabled_symbol_before_reading_snapshots(monkeypatch):
+    monkeypatch.setattr(
+        market_view,
+        "get_contract_market_snapshot_authority",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled symbol must not read residual snapshots")
+        ),
+    )
+
+    class Query:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return None
+
+    class Db:
+        def query(self, *_args, **_kwargs):
+            return Query()
+
+    with pytest.raises(market_view.ContractSymbolNotFound):
+        market_view.get_contract_market_view(Db(), SYMBOL)
 
 
 def test_execution_view_keeps_legacy_input_adapter_with_quote_only_bbo(monkeypatch):

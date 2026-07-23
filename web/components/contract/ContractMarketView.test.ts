@@ -162,6 +162,20 @@ test('live presentation consumes the same execution-ready result as order execut
   }).state, 'live');
 });
 
+test('background recovery refresh does not demote complete live authority to loading', () => {
+  const marketView = createMarketView();
+  const presentation = resolveContractMarketViewAuthorityPresentation({
+    marketView,
+    loading: true,
+    executionReady: true,
+  });
+
+  assert.equal(presentation.state, 'live');
+  assert.equal(presentation.status, 'LIVE');
+  assert.equal(presentation.isLoading, false);
+  assert.equal(presentation.isTradable, true);
+});
+
 test('STALE and FALLBACK display states never become realtime UI states', () => {
   for (const displayState of ['STALE', 'FALLBACK', 'LAST_GOOD_BBO']) {
     const marketView = createMarketView({ display_state: displayState });

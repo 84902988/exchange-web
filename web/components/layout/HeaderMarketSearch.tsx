@@ -22,37 +22,8 @@ type HeaderMarketSearchProps = {
   triggerRef: RefObject<HTMLButtonElement | null>;
 };
 
-type CachedSearch = {
-  expiresAt: number;
-  results: HeaderMarketSearchResult[];
-};
-
 const SEARCH_DEBOUNCE_MS = 180;
-const SEARCH_CACHE_TTL_MS = 60_000;
-const SEARCH_CACHE_MAX_ENTRIES = 40;
 const SEARCH_RESULT_LIMIT = 8;
-const searchCache = new Map<string, CachedSearch>();
-
-function readCachedSearch(query: string): HeaderMarketSearchResult[] | null {
-  const cached = searchCache.get(query);
-  if (!cached) return null;
-  if (cached.expiresAt <= Date.now()) {
-    searchCache.delete(query);
-    return null;
-  }
-  return cached.results;
-}
-
-function writeCachedSearch(query: string, results: HeaderMarketSearchResult[]) {
-  if (!searchCache.has(query) && searchCache.size >= SEARCH_CACHE_MAX_ENTRIES) {
-    const oldestKey = searchCache.keys().next().value;
-    if (oldestKey) searchCache.delete(oldestKey);
-  }
-  searchCache.set(query, {
-    expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
-    results,
-  });
-}
 
 export default function HeaderMarketSearch({ onClose, triggerRef }: HeaderMarketSearchProps) {
   const router = useRouter();
@@ -97,14 +68,6 @@ export default function HeaderMarketSearch({ onClose, triggerRef }: HeaderMarket
       return;
     }
 
-    const cached = readCachedSearch(normalizedQuery);
-    if (cached) {
-      setResults(cached);
-      setStatus('ready');
-      setActiveIndex(cached.length > 0 ? 0 : -1);
-      return;
-    }
-
     setResults([]);
     setStatus('loading');
     let cancelled = false;
@@ -137,7 +100,6 @@ export default function HeaderMarketSearch({ onClose, triggerRef }: HeaderMarket
         spotResponse.status === 'fulfilled' ? spotResponse.value.items : [],
         contractResponse.status === 'fulfilled' ? contractResponse.value.items : [],
       );
-      writeCachedSearch(normalizedQuery, nextResults);
       setResults(nextResults);
       setStatus('ready');
       setActiveIndex(nextResults.length > 0 ? 0 : -1);

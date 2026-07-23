@@ -577,6 +577,110 @@ describe('Contract MarketView realtime Store recovery', () => {
     expect(projectContractMarketViewStoreAuthority(authority, null, nowMs)).toBeNull();
   });
 
+  it('keeps one linked execution authority when ticker is quiet but realtime depth remains fresh', () => {
+    const store = createContractMarketStore();
+    const nowMs = Date.now();
+    store.activateSymbol('XAUUSDT_PERP');
+    store.ingest({
+      symbol: 'XAUUSDT_PERP',
+      domain: 'ticker',
+      data: {
+        display_price: '4133.54',
+        display_state: 'LIVE_TRADABLE',
+        market_status: 'OPEN',
+        market_session_type: 'REGULAR',
+        executable: true,
+      },
+      transport: 'WS',
+      source: 'ITICK_QUOTE',
+      provider: 'ITICK',
+      freshness: 'LIVE',
+      eventTimeMs: nowMs - 10_000,
+    });
+    store.ingest({
+      symbol: 'XAUUSDT_PERP',
+      domain: 'depth',
+      data: {
+        bids: [['4130.33', '1']],
+        asks: [['4136.86', '1']],
+        display_state: 'LIVE_TRADABLE',
+        market_status: 'OPEN',
+        market_session_type: 'REGULAR',
+        executable: true,
+      },
+      transport: 'WS',
+      source: 'ITICK_DEPTH',
+      provider: 'ITICK',
+      freshness: 'LIVE',
+      eventTimeMs: nowMs - 10,
+    });
+
+    const authority = selectContractMarketViewStoreAuthoritySnapshot(
+      store.getState(),
+      'XAUUSDT_PERP',
+    );
+    const projected = projectContractMarketViewStoreAuthority(authority, null, nowMs);
+
+    expect(authority).toMatchObject({
+      tickerObservedAtMs: nowMs - 10_000,
+      bboObservedAtMs: nowMs - 10,
+      tickerStale: false,
+      bboStale: false,
+      bboDisplayState: 'LIVE_TRADABLE',
+    });
+    expect(projected).toMatchObject({
+      symbol: 'XAUUSDT_PERP',
+      display_state: 'LIVE_TRADABLE',
+      display_price: '4133.595',
+      display_price_source: 'LIVE_MID',
+      executable: true,
+      execution_bid: '4130.33',
+      execution_ask: '4136.86',
+      execution_mode: 'LIVE_BBO',
+      reason_code: 'LIVE_BBO',
+    });
+    expect(projected?.raw_source_summary).toMatchObject({
+      authority_source: 'CONTRACT_MARKET_STORE_WITH_BBO_STRUCTURE',
+    });
+  });
+
+  it('keeps fresh depth fail-closed when either authority explicitly says the session is closed', () => {
+    const nowMs = Date.now();
+    const baseSnapshot = {
+      symbol: 'NAS100USDT_PERP',
+      displayPrice: '28905.61',
+      displayPriceSource: 'KLINE_CLOSE' as const,
+      displayState: 'CLOSED',
+      marketStatus: 'CLOSED',
+      marketSessionType: 'AFTER_HOURS',
+      bboDisplayState: 'LIVE_TRADABLE',
+      bboMarketStatus: 'OPEN',
+      bboMarketSessionType: 'REGULAR',
+      bestBid: '28909.36',
+      bestAsk: '28911.16',
+      spread: '1.8',
+      executionBid: '28909.36',
+      executionAsk: '28911.16',
+      executionMode: 'LIVE_BBO',
+      executable: true,
+      reasonCode: 'LIVE_BBO',
+      tickerSource: 'ITICK_QUOTE',
+      tickerFreshness: 'LIVE',
+      depthSource: 'ITICK_DEPTH',
+      depthFreshness: 'LIVE',
+      hasRealtimeAuthority: true,
+      hasRealtimeBboAuthority: true,
+      stale: false,
+      tickerStale: false,
+      bboStale: false,
+      tickerObservedAtMs: nowMs - 10_000,
+      bboObservedAtMs: nowMs - 10,
+      observedAtMs: nowMs - 10,
+    };
+
+    expect(projectContractMarketViewStoreAuthority(baseSnapshot, null, nowMs)).toBeNull();
+  });
+
   it('does not inherit structural authority from a REST ticker into a WS quote', () => {
     const symbol = 'REST_TO_WS_RECOVERY_TEST_PERP';
     activateContractMarketShadowSymbol(symbol);
@@ -937,7 +1041,7 @@ describe('Contract MarketView realtime Store recovery', () => {
       marketStatus: 'CLOSED',
     }, null, nowMs);
     expect(closed).toMatchObject({
-      display_state: 'UNAVAILABLE',
+      display_state: 'CLOSED',
       executable: false,
       execution_bid: null,
       execution_ask: null,
@@ -950,7 +1054,7 @@ describe('Contract MarketView realtime Store recovery', () => {
     }, null, nowMs);
     expect(afterHours).toMatchObject({
       market_session_type: 'AFTER_HOURS',
-      display_state: 'UNAVAILABLE',
+      display_state: 'AFTER_HOURS',
       executable: false,
       execution_bid: null,
       execution_ask: null,

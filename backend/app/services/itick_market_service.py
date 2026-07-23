@@ -5,6 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from app.services.itick_quote_fields import (
+    ITICK_LATEST_PRICE_FIELDS,
+    ITICK_PREVIOUS_CLOSE_FIELDS,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,7 +35,9 @@ class ItickMarketService:
     REQUEST_TIMEOUT = 5
     STOCK_KLINE_REQUEST_TIMEOUT = 8
     STOCK_KLINE_CACHE_TTL_SECONDS = 45
-    QUOTE_DEPTH_CACHE_TTL_SECONDS = 60
+    QUOTE_CACHE_TTL_SECONDS = 15
+    DEPTH_CACHE_TTL_SECONDS = 60
+    QUOTE_DEPTH_CACHE_TTL_SECONDS = DEPTH_CACHE_TTL_SECONDS
     QUOTE_DEPTH_STALE_TTL_SECONDS = 300
     QUOTE_DEPTH_COOLDOWN_SECONDS = 45
     UPSTREAM_ERROR_LOG_COOLDOWN_SECONDS = 60
@@ -356,6 +363,7 @@ class ItickMarketService:
                     },
                     base_url=self._get_market_base_url(normalized_market),
                     timeout=timeout,
+                    use_cache=use_cache,
                 )
             except ItickMarketRateLimited:
                 break
@@ -431,11 +439,11 @@ class ItickMarketService:
         url = "{0}{1}".format(base_url, path)
         response_cache_key = self._response_cache_key(base_url, path, params)
         if use_cache and self._is_quote_depth_endpoint(path):
-            cached_payload = self._get_response_cache(response_cache_key)
+            cached_payload = self._get_response_cache(response_cache_key, endpoint=path)
             if cached_payload is not None:
                 return cached_payload
         if self._is_quote_depth_endpoint(path) and self.is_quote_depth_cooldown_active():
-            cached_payload = self._get_response_cache(response_cache_key, allow_stale=True)
+            cached_payload = self._get_response_cache(response_cache_key, endpoint=path, allow_stale=True)
             if cached_payload is not None:
                 return cached_payload
             return {"data": [] if path == "/quotes" else {}}
@@ -456,7 +464,7 @@ class ItickMarketService:
         except requests.RequestException as exc:
             self._log_upstream_error(endpoint=path, params=params, error=exc)
             if self._is_quote_depth_endpoint(path):
-                cached_payload = self._get_response_cache(response_cache_key, allow_stale=True)
+                cached_payload = self._get_response_cache(response_cache_key, endpoint=path, allow_stale=True)
                 if cached_payload is not None:
                     logger.warning("itick quote/depth stale cache fallback endpoint=%s params=%s error=%s", path, params, exc)
                     return cached_payload
@@ -466,14 +474,14 @@ class ItickMarketService:
             message = self._extract_error_message(response)
             if response.status_code == 429:
                 self._activate_cooldown(message)
-                cached_payload = self._get_response_cache(response_cache_key, allow_stale=True)
+                cached_payload = self._get_response_cache(response_cache_key, endpoint=path, allow_stale=True)
                 if cached_payload is not None:
                     return cached_payload
                 raise ItickMarketRateLimited(message)
 
             self._log_upstream_error(endpoint=path, params=params, error="{0} {1}".format(response.status_code, message))
             if response.status_code >= 500 and self._is_quote_depth_endpoint(path):
-                cached_payload = self._get_response_cache(response_cache_key, allow_stale=True)
+                cached_payload = self._get_response_cache(response_cache_key, endpoint=path, allow_stale=True)
                 if cached_payload is not None:
                     logger.warning(
                         "itick quote/depth stale cache fallback endpoint=%s params=%s status=%s",
@@ -497,7 +505,7 @@ class ItickMarketService:
         if self._is_quote_depth_endpoint(path) and self._is_payload_rate_limited(payload):
             message = self._payload_error_message(payload)
             self._activate_cooldown(message)
-            cached_payload = self._get_response_cache(response_cache_key, allow_stale=True)
+            cached_payload = self._get_response_cache(response_cache_key, endpoint=path, allow_stale=True)
             if cached_payload is not None:
                 return cached_payload
             raise ItickMarketRateLimited(message)
@@ -527,8 +535,8 @@ class ItickMarketService:
                     (response.text or "")[:300],
                 )
 
-            if use_cache and self._is_quote_depth_endpoint(path):
-                self._set_response_cache(response_cache_key, payload)
+        if use_cache and self._is_quote_depth_endpoint(path):
+            self._set_response_cache(response_cache_key, payload)
 
         return payload
 
@@ -590,8 +598,20 @@ class ItickMarketService:
             self._normalize_code(code),
         )
 
-    def _cache_ttl_seconds(self) -> float:
-        return self._float_env("ITICK_QUOTE_DEPTH_CACHE_TTL_SECONDS", self.QUOTE_DEPTH_CACHE_TTL_SECONDS)
+    def _quote_cache_ttl_seconds(self) -> float:
+        return self._float_env("ITICK_QUOTE_CACHE_TTL_SECONDS", self.QUOTE_CACHE_TTL_SECONDS)
+
+    def _depth_cache_ttl_seconds(self) -> float:
+        legacy_default = self._float_env(
+            "ITICK_QUOTE_DEPTH_CACHE_TTL_SECONDS",
+            self.QUOTE_DEPTH_CACHE_TTL_SECONDS,
+        )
+        return self._float_env("ITICK_DEPTH_CACHE_TTL_SECONDS", legacy_default)
+
+    def _cache_ttl_seconds(self, endpoint: Optional[str] = None) -> float:
+        if endpoint in ("/quote", "/quotes"):
+            return self._quote_cache_ttl_seconds()
+        return self._depth_cache_ttl_seconds()
 
     def _stale_ttl_seconds(self) -> float:
         return self._float_env("ITICK_QUOTE_DEPTH_STALE_TTL_SECONDS", self.QUOTE_DEPTH_STALE_TTL_SECONDS)
@@ -611,7 +631,7 @@ class ItickMarketService:
         if cached is None:
             return None
         cached_at, item = cached
-        ttl = self._stale_ttl_seconds() if allow_stale else self._cache_ttl_seconds()
+        ttl = self._stale_ttl_seconds() if allow_stale else self._quote_cache_ttl_seconds()
         if time.monotonic() - cached_at > ttl:
             return None
         return dict(item)
@@ -626,12 +646,18 @@ class ItickMarketService:
         )
         return "{0}|{1}|{2}".format(str(base_url or "").rstrip("/"), path, sorted_params)
 
-    def _get_response_cache(self, key: str, *, allow_stale: bool = False) -> Any:
+    def _get_response_cache(
+        self,
+        key: str,
+        *,
+        endpoint: Optional[str] = None,
+        allow_stale: bool = False,
+    ) -> Any:
         cached = self._response_cache.get(key)
         if cached is None:
             return None
         cached_at, payload = cached
-        ttl = self._stale_ttl_seconds() if allow_stale else self._cache_ttl_seconds()
+        ttl = self._stale_ttl_seconds() if allow_stale else self._cache_ttl_seconds(endpoint)
         if time.monotonic() - cached_at > ttl:
             return None
         return payload
@@ -699,7 +725,11 @@ class ItickMarketService:
         enriched = dict(item)
         latest_price = self._pick_quote_value(
             enriched,
-            ["p", "price", "last", "latest_price", "close", "ld", "c"],
+            list(ITICK_LATEST_PRICE_FIELDS),
+        )
+        previous_close = self._pick_quote_value(
+            enriched,
+            list(ITICK_PREVIOUS_CLOSE_FIELDS),
         )
         change_percent = self._pick_quote_value(
             enriched,
@@ -736,7 +766,11 @@ class ItickMarketService:
                 # iTick may omit quote turnover; estimate quote turnover from latest price and base volume.
                 quote_volume = volume_number * latest_number
 
-        self._set_quote_default(enriched, ["latest_price", "price"], latest_price)
+        if latest_price not in (None, ""):
+            enriched["latest_price"] = latest_price
+            enriched["price"] = latest_price
+        if previous_close not in (None, ""):
+            enriched["previous_close"] = previous_close
         self._set_quote_default(enriched, ["price_change_percent_24h", "change_percent"], change_percent)
         self._set_quote_default(enriched, ["price_change_24h", "price_change"], change_amount)
         self._set_quote_default(enriched, ["high_24h", "high_price"], high)

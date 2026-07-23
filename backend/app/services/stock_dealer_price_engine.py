@@ -22,6 +22,7 @@ from app.services.itick_market_service import (
     ItickMarketServiceError,
     itick_market_service,
 )
+from app.services.itick_quote_fields import ITICK_LATEST_PRICE_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,7 @@ def _fetch_quote_ref_price(pair: TradingPair) -> Optional[Decimal]:
     if not isinstance(data, dict):
         return None
 
-    return _pick_decimal(data, ("ld", "last", "price", "close", "c", "o"))
+    return _pick_decimal(data, ITICK_LATEST_PRICE_FIELDS)
 
 
 def _get_ref_price(pair: TradingPair, state: StockDealerPriceState, now: float) -> Tuple[Decimal, str]:
@@ -475,7 +476,7 @@ def get_stock_dealer_price_context(
         raise ValueError("trading pair is not a stock dealer price pair")
 
     state = _get_state(trading_pair)
-    ttl = _float_env("STOCK_DEALER_PRICE_TTL_SECONDS", "30")
+    ttl = _float_env("STOCK_DEALER_PRICE_TTL_SECONDS", "15")
     now = time.monotonic()
 
     market_status = _market_status_for_pair(trading_pair)

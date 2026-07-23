@@ -181,7 +181,10 @@ def _load_and_store_json(
     except Exception as exc:
         record_loader_error(key)
         record_error(key=key, error=exc)
-        if fallback_on_error:
+        # A cached public snapshot must never resurrect a symbol that the
+        # administrative control plane removed or disabled.
+        error_code = str(getattr(exc, "code", "") or "").strip().upper()
+        if fallback_on_error and error_code != "CONTRACT_SYMBOL_NOT_FOUND":
             fallback = cache_get_last_good_json(key)
             if fallback is not None:
                 record_last_good_used(key)

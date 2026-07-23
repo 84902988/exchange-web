@@ -27,6 +27,11 @@ from app.services.contract_ticker_evidence import resolve_contract_ticker_24h_ev
 from app.services.contract_itick_ws_message_router import ItickWsMessageRouter
 from app.services.contract_itick_ws_subscription_plan import ItickWsSubscriptionPlan
 from app.services.contract_itick_ws_transport import ItickSharedWsTransport
+from app.services.itick_quote_fields import (
+    ITICK_LATEST_PRICE_FIELDS,
+    ITICK_OPEN_PRICE_FIELDS,
+    ITICK_PREVIOUS_CLOSE_FIELDS,
+)
 from app.services.okx_shared_ws_transport import OkxSharedWsTransport, OkxWsSubscription
 
 
@@ -3236,7 +3241,7 @@ class ContractMarketProviderWsService:
         row_type = str(row.get("type") or row.get("types") or "").strip().lower()
         if row_type and row_type != "tick":
             return False
-        price = _pick_decimal(row, ["ld", "last", "latest_price", "price"])
+        price = _pick_decimal(row, list(ITICK_LATEST_PRICE_FIELDS))
         ts_value = _pick_first_present(row, ["t", "ts", "time", "timestamp"])
         return price is not None and price > 0 and ts_value not in (None, "")
 
@@ -3414,7 +3419,7 @@ class ContractMarketProviderWsService:
     ) -> Optional[dict[str, Any]]:
         price, price_field = _pick_decimal_with_key(
             row,
-            ["ld", "last", "latest_price", "price"],
+            list(ITICK_LATEST_PRICE_FIELDS),
         )
         if price is None or price <= 0:
             return None
@@ -3531,7 +3536,7 @@ class ContractMarketProviderWsService:
     ) -> Optional[dict[str, Any]]:
         last_price, price_field = _pick_decimal_with_key(
             row,
-            ["p", "ld", "last", "latest_price", "price", "close", "c"],
+            list(ITICK_LATEST_PRICE_FIELDS),
         )
         bid_price = _pick_decimal(
             row,
@@ -3579,7 +3584,10 @@ class ContractMarketProviderWsService:
             _pick_first_present(row, ["market_status", "marketStatus"]),
             provider_trading_status=provider_trading_status,
         )
-        open_24h = _pick_decimal(row, ["o", "open", "open_price", "openPrice"])
+        open_24h = _pick_decimal(
+            row,
+            list(ITICK_PREVIOUS_CLOSE_FIELDS) + list(ITICK_OPEN_PRICE_FIELDS),
+        )
         change_evidence = resolve_contract_ticker_24h_evidence(
             last_price=last_price,
             open_24h=open_24h,

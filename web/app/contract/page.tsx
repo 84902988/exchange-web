@@ -76,13 +76,18 @@ function loadContractSymbols(params: Parameters<typeof getContractSymbols>[0]) {
     settledAt: existing?.settledAt || 0,
   });
   void promise.then((response) => {
+    if (contractSymbolRequestStore.get(key)?.promise !== promise) {
+      return;
+    }
     contractSymbolRequestStore.set(key, {
       promise: null,
       response,
       settledAt: Date.now(),
     });
   }).catch(() => {
-    contractSymbolRequestStore.delete(key);
+    if (contractSymbolRequestStore.get(key)?.promise === promise) {
+      contractSymbolRequestStore.delete(key);
+    }
   });
   return promise;
 }
@@ -498,6 +503,7 @@ function ContractPageContent() {
     quantityUnit,
     quote: contractQuote,
     contractAvailabilityError,
+    contractConfigMissing,
     pricePrecision,
     quoteHint,
     marketView: activeContractMarketView,
@@ -506,6 +512,7 @@ function ContractPageContent() {
     displayPriceLabel: currentPriceSourceLabel,
     priceAuthority,
     referencePrice,
+    linkedMarketAuthority,
     depthBids,
     depthAsks,
     depthLoading,
@@ -548,16 +555,8 @@ function ContractPageContent() {
     fallbackMarketStatusText: currentContractPair?.marketStatusText,
     fallbackMarketSessionType: currentContractPair?.marketSessionType,
   });
-  const liveBestBidNumber = Number(hookBestBid);
-  const liveBestAskNumber = Number(hookBestAsk);
-  const liveBboMidpoint = (
-    Number.isFinite(liveBestBidNumber) &&
-    Number.isFinite(liveBestAskNumber) &&
-    liveBestBidNumber > 0 &&
-    liveBestAskNumber >= liveBestBidNumber
-  ) ? (liveBestBidNumber + liveBestAskNumber) / 2 : null;
   const headerMarkOrValuationPrice = currentContractUsesValuationPrice
-    ? liveBboMidpoint ?? contractQuote?.mark_price
+    ? linkedMarketAuthority.valuationPrice ?? contractQuote?.mark_price
     : contractQuote?.mark_price;
   const currentPriceDisplay = currentPriceReady
     ? formatPrice(currentPriceNumber, pricePrecision)
@@ -664,7 +663,16 @@ function ContractPageContent() {
     }
   }, [router]);
 
-  const refreshContractPairs = useCallback(async () => {
+  const refreshContractPairs = useCallback(async ({
+    dropMissingBootstrap = false,
+    force = false,
+  }: {
+    dropMissingBootstrap?: boolean;
+    force?: boolean;
+  } = {}) => {
+    if (force) {
+      contractSymbolRequestStore.clear();
+    }
     setContractPairsLoading(true);
     const bootstrapSymbol = initialContractSymbolRef.current;
     const bootstrapTask = (async () => {
@@ -691,7 +699,11 @@ function ContractPageContent() {
       const catalogPairs = contractResponse.items.map((item) => buildContractPairOption(item, t));
       setContractPairs((previous) => {
         const bootstrapPair = previous.find((item) => item.symbol === bootstrapSymbol) || null;
-        if (!bootstrapPair || catalogPairs.some((item) => item.symbol === bootstrapPair.symbol)) {
+        if (
+          dropMissingBootstrap
+          || !bootstrapPair
+          || catalogPairs.some((item) => item.symbol === bootstrapPair.symbol)
+        ) {
           return catalogPairs;
         }
         return [bootstrapPair, ...catalogPairs];
@@ -715,6 +727,21 @@ function ContractPageContent() {
     setContractPairsLoading(false);
     return catalogResult.status === 'fulfilled';
   }, [t]);
+
+  const refreshContractPairCatalog = useCallback(
+    () => refreshContractPairs({ force: true }),
+    [refreshContractPairs],
+  );
+
+  useEffect(() => {
+    if (!contractConfigMissing) return;
+    // An already-open page can outlive an admin disable. Bypass the short
+    // client request cache and let the active catalog remove the stale
+    // bootstrap pair; the URL ownership effect below then selects a valid
+    // replacement instead of polling the disabled symbol indefinitely.
+    contractSymbolRequestStore.clear();
+    void refreshContractPairs({ dropMissingBootstrap: true });
+  }, [contractConfigMissing, refreshContractPairs]);
 
   const handleToolbarPairQueryChange = useCallback((query: PairQueryUpdate) => {
     if (query.marketType === 'spot') return;
@@ -793,7 +820,11 @@ function ContractPageContent() {
         return;
       }
 
-      if (requestedSymbol && isMockStockContractSymbol(requestedSymbol)) {
+      if (
+        requestedSymbol
+        && !contractConfigMissing
+        && isMockStockContractSymbol(requestedSymbol)
+      ) {
         const requestedDisplaySymbol = formatContractMarketDisplaySymbol(requestedSymbol, 'USDT');
         const mockPair: GlobalMarketSelectorPair = {
           symbol: requestedSymbol,
@@ -835,7 +866,16 @@ function ContractPageContent() {
       }
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [contractPairs, contractPairsLoaded, contractSymbol, router, t, urlContractCategory, urlContractSymbol]);
+  }, [
+    contractConfigMissing,
+    contractPairs,
+    contractPairsLoaded,
+    contractSymbol,
+    router,
+    t,
+    urlContractCategory,
+    urlContractSymbol,
+  ]);
 
   function pushNotice(message: string) {
     setError(null);
@@ -889,6 +929,7 @@ function ContractPageContent() {
               pairs={toolbarPairs}
               pairsLoading={contractPairsLoading}
               onPairQueryChange={handleToolbarPairQueryChange}
+              onCatalogRefresh={refreshContractPairCatalog}
               onSymbolChange={(nextSymbol) => selectContractSymbol(nextSymbol)}
               onIntervalChange={handleContractIntervalChange}
             />
@@ -1020,9 +1061,9 @@ function ContractPageContent() {
               orders={orders}
               trades={trades}
               quote={contractQuote}
-              liveBestBid={hookBestBid}
-              liveBestAsk={hookBestAsk}
-              liveMarketUsable={marketUiState.status === 'LIVE' && contractExecutable === true}
+              liveBestBid={linkedMarketAuthority.bestBid}
+              liveBestAsk={linkedMarketAuthority.bestAsk}
+              liveMarketUsable={marketUiState.status === 'LIVE' && linkedMarketAuthority.executable}
               tradfiSymbols={tradfiContractSymbols}
               pricePrecision={pricePrecision}
               quantityUnit={quantityUnit}

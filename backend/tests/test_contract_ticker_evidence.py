@@ -92,8 +92,8 @@ def test_okx_ticker_normalization_uses_open24h_not_nonexistent_change_field() ->
 def test_itick_ticker_normalization_keeps_negative_signed_evidence() -> None:
     fields = service._extract_itick_24h_ticker_fields(
         {
-            "p": "95",
-            "o": "100",
+            "ld": "95",
+            "p": "100",
             "change": "-5",
             "rate": "-5",
             "h": "102",

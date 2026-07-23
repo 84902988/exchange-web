@@ -10,6 +10,7 @@ import {
   type ContractDepthMode,
   type ContractQuote,
 } from '@/lib/api/modules/contract';
+import { ApiError } from '@/lib/api/core/error';
 import {
   readContractDepthCache,
   readContractQuoteCache,
@@ -157,10 +158,18 @@ export function formatFundingRate(value?: string | number | null) {
   return `${(num * 100).toFixed(4)}%`;
 }
 
-function isContractSymbolConfigMissing(message: string | null) {
-  if (!message) return false;
+export function isContractSymbolConfigMissingError(error: unknown) {
+  const code = error instanceof ApiError
+    ? String(error.code || '').trim().toUpperCase()
+    : '';
+  const message = error instanceof Error ? error.message : String(error || '');
   return (
-    message.includes('contract symbol not found or disabled') ||
+    code === 'CONTRACT_SYMBOL_NOT_FOUND' ||
+    code === 'CONTRACT_SYMBOL_NOT_ENABLED' ||
+    (
+      message.includes('contract symbol') &&
+      message.includes('not found or disabled')
+    ) ||
     message.includes('\u5408\u7ea6\u54c1\u79cd\u672a\u542f\u7528') ||
     message.includes('\u914d\u7f6e\u7f3a\u5931')
   );
@@ -174,6 +183,7 @@ export function useContractMarketState({
   const { t } = useLocaleContext();
   const [hasHydrated, setHasHydrated] = useState(false);
   const [marketRealtimeStatus, setMarketRealtimeStatus] = useState<ContractMarketRealtimeStatus>('idle');
+  const [contractConfigMissing, setContractConfigMissing] = useState(false);
   const [bestDepth, setBestDepth] = useState<BestDepthState>(() => ({
     symbol: contractSymbol,
     bestBid: null,
@@ -241,7 +251,6 @@ export function useContractMarketState({
     };
   }, [bestAsk, bestBid, contractQuote?.mark_price, pricePrecision, t]);
 
-  const contractConfigMissing = isContractSymbolConfigMissing(contractAvailabilityError);
   const quoteHint = contractConfigMissing ? t('contractSymbolConfigMissing', 'contracts') : null;
   const initialDepth = hasHydrated ? readContractDepthCache(contractSymbol) || undefined : undefined;
 
@@ -272,9 +281,11 @@ export function useContractMarketState({
         quote: nextQuote,
       });
       writeContractQuoteCache(contractSymbol, nextQuote);
+      setContractConfigMissing(false);
       setContractAvailabilityError(null);
     } catch (err) {
       if (quoteRequestSeqRef.current !== requestSeq) return;
+      setContractConfigMissing(isContractSymbolConfigMissingError(err));
       setContractAvailabilityError(friendlyContractError(err, t));
     } finally {
       if (quoteRequestSeqRef.current === requestSeq) {
@@ -325,6 +336,7 @@ export function useContractMarketState({
         symbol: contractSymbol,
         quote: cache.quote || null,
       });
+      setContractConfigMissing(false);
       setContractAvailabilityError(null);
     });
 
@@ -419,6 +431,7 @@ export function useContractMarketState({
         quote: mergedQuote,
       });
       writeContractQuoteCache(contractSymbol, mergedQuote);
+      setContractConfigMissing(false);
       setContractAvailabilityError(null);
     };
 
@@ -455,6 +468,7 @@ export function useContractMarketState({
     contractQuote,
     contractQuoteLoading,
     contractAvailabilityError,
+    contractConfigMissing,
     pricePrecision,
     spreadInfo,
     quoteHint,

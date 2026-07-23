@@ -33,6 +33,11 @@ from app.services.contract_session_profiles import (
     SESSION_UNKNOWN,
 )
 from app.services.itick_market_service import ItickMarketServiceError, itick_market_service
+from app.services.itick_quote_fields import (
+    ITICK_LATEST_PRICE_FIELDS,
+    ITICK_OPEN_PRICE_FIELDS,
+    ITICK_PREVIOUS_CLOSE_FIELDS,
+)
 from app.services.contract_itick_market_resolver import (
     ITICK_KLINE_TYPE_BY_INTERVAL,
     ContractItickDwmSessionPolicy,
@@ -125,8 +130,12 @@ _contract_market_symbol_warning_events = {
     "tradfi_cfd_quote_unavailable",
 }
 _contract_market_symbol_warning_cooldown_seconds = 60
-_tradfi_quote_cache_ttl = timedelta(seconds=60)
+_tradfi_quote_cache_ttl = timedelta(seconds=15)
 _tradfi_forex_quote_cache_ttl = timedelta(seconds=2)
+# Index instruments without native depth use quote-derived BBO. Refresh their
+# shared quote cache well before the 30-second executable freshness boundary so
+# the second half of a cache cycle cannot become an avoidable trading outage.
+_tradfi_index_quote_cache_ttl = timedelta(seconds=15)
 _tradfi_kline_cache_ttl = timedelta(seconds=45)
 _contract_ticker_24h_fields = (
     "open_24h",
@@ -242,6 +251,10 @@ class ContractMarketError(RuntimeError):
 
 class ContractSymbolNotFound(ContractMarketError):
     code = "CONTRACT_SYMBOL_NOT_FOUND"
+
+
+class ContractSymbolDisabled(ContractSymbolNotFound):
+    """Configured symbol that the administrative control plane disabled."""
 
 
 class ContractQuoteUnavailable(ContractMarketError):
@@ -1496,11 +1509,12 @@ def _load_contract_symbol(db: Session, symbol: str) -> ContractSymbol:
     item = (
         db.query(ContractSymbol)
         .filter(ContractSymbol.symbol == normalized_symbol)
-        .filter(ContractSymbol.status == 1)
         .first()
     )
     if item is None:
-        raise ContractSymbolNotFound("contract symbol not found or disabled")
+        raise ContractSymbolNotFound("contract symbol not found")
+    if int(getattr(item, "status", 0) or 0) != 1:
+        raise ContractSymbolDisabled("contract symbol not found or disabled")
     attach_contract_symbol_market_metadata(db, item)
     return item
 
@@ -1648,9 +1662,8 @@ def _pick_itick_quote_reference_price(
     *,
     prefer_forex_latest: bool = False,
 ) -> tuple[Optional[Decimal], Optional[str]]:
-    if prefer_forex_latest:
-        return _pick_positive_decimal_with_key(data, ["ld", "last", "price", "latest_price", "close", "c", "p"])
-    return _pick_positive_decimal_with_key(data, ["p", "ld", "last", "price", "latest_price", "close", "c"])
+    del prefer_forex_latest
+    return _pick_positive_decimal_with_key(data, list(ITICK_LATEST_PRICE_FIELDS))
 
 
 def _pick_decimal_present(data: Dict[str, Any], keys: List[str], *, positive: bool = False) -> Optional[Decimal]:
@@ -1724,7 +1737,7 @@ def _extract_itick_24h_ticker_fields(
         last_price=last_price,
         open_24h=_pick_first_present(
             data,
-            ["o", "open", "open_price", "open_24h", "openPrice", "day_open", "dayOpen"],
+            list(ITICK_PREVIOUS_CLOSE_FIELDS) + list(ITICK_OPEN_PRICE_FIELDS),
         ),
         price_change_24h=_pick_first_present(
             data,
@@ -1853,7 +1866,7 @@ def _extract_itick_data_candidates(payload: Any) -> list[Dict[str, Any]]:
 
 def _extract_stock_quote_item(payload: Any) -> Optional[Dict[str, Any]]:
     for item in _extract_itick_data_candidates(payload):
-        if _pick_positive_decimal(item, ["p", "ld", "last", "price", "latest_price", "close", "c"]):
+        if _pick_positive_decimal(item, list(ITICK_LATEST_PRICE_FIELDS)):
             return item
     return None
 
@@ -1881,7 +1894,7 @@ def _get_stock_contract_reference_price(
         raise ItickQuoteUnavailable("ITICK_STOCK_QUOTE_MISSING_PRICE")
 
     price = _require_positive(
-        _pick_positive_decimal(data, ["p", "ld", "last", "price", "latest_price", "close", "c"]),
+        _pick_positive_decimal(data, list(ITICK_LATEST_PRICE_FIELDS)),
         "last_price",
     )
     return (
@@ -2235,7 +2248,11 @@ def _get_cached_tradfi_quote_for_contract(
         cached_quote = _get_cached_tradfi_quote(
             contract_symbol.symbol,
             allow_stale=allow_stale,
-            max_age=_tradfi_forex_quote_cache_ttl if _uses_itick_forex_endpoint(contract_symbol) else None,
+            max_age=(
+                _tradfi_forex_quote_cache_ttl
+                if _uses_itick_forex_endpoint(contract_symbol)
+                else _tradfi_index_quote_cache_ttl
+            ),
         )
         if cached_quote is None:
             return None
@@ -2383,6 +2400,53 @@ def _get_itick_cfd_reference_price(
         _format_decimal(fallback_price),
     )
     return fallback_price, "CFD_FALLBACK", None, datetime.utcnow(), {}
+
+
+def _refresh_itick_quote_derived_bbo(
+    contract_symbol: ContractSymbol,
+) -> dict[str, Any]:
+    """Refresh the shared executable BBO from iTick's quote endpoint.
+
+    iTick's forex/metal/commodity/index namespaces expose their current
+    reference price through the quote endpoint but do not consistently expose
+    native REST depth.  Treating a depth failure as a quote failure leaves the
+    execution BBO stale while trades and K-lines continue.  Refresh the one
+    process-wide quote cache from provider quote evidence instead, and fail
+    closed if only the deterministic diagnostic fallback is available.
+    """
+
+    (
+        reference_price,
+        reference_source,
+        price_field,
+        quote_ts,
+        ticker_evidence,
+    ) = _get_itick_cfd_reference_price(contract_symbol)
+    if reference_source != "ITICK":
+        raise ItickQuoteUnavailable("ITICK_QUOTE_UNAVAILABLE")
+    if (
+        _uses_itick_latest_price_field(contract_symbol)
+        and price_field != CONTRACT_MARKET_FOREX_PRICE_FIELD_VERSION
+    ):
+        raise ItickQuoteUnavailable("ITICK_LATEST_QUOTE_UNAVAILABLE")
+
+    depth = _build_cfd_depth_from_price(
+        contract_symbol=contract_symbol,
+        reference_price=reference_price,
+        source="ITICK_QUOTE",
+        limit=10,
+        price_field=price_field,
+        ts=quote_ts,
+        ticker_24h_fields=ticker_evidence,
+    )
+    quote = _quote_from_cfd_depth(
+        contract_symbol,
+        depth,
+        source="ITICK_QUOTE",
+    )
+    quote.update(ticker_evidence)
+    _cache_tradfi_quote(quote)
+    return quote
 
 
 def _build_cfd_depth_from_price(
@@ -3283,7 +3347,7 @@ def _normalize_itick_stock_tick_trade(
     fallback_id: Any = None,
     source: str = "ITICK_TICK",
 ) -> Optional[dict[str, Any]]:
-    price = _pick_positive_decimal(row, ["ld", "last", "latest_price", "price"])
+    price = _pick_positive_decimal(row, list(ITICK_LATEST_PRICE_FIELDS))
     if price is None or price <= 0:
         return None
     qty = _pick_positive_decimal(row, ["v", "volume", "qty", "quantity", "amount"])
@@ -3873,6 +3937,8 @@ def _get_itick_live_quote(
             return cached_quote
         if itick_market_service.is_quote_depth_cooldown_active():
             raise ItickQuoteUnavailable("ITICK_COOLDOWN_ACTIVE")
+        if _uses_itick_latest_price_field(contract_symbol):
+            return _refresh_itick_quote_derived_bbo(contract_symbol)
         depth = _get_itick_cfd_depth(
             contract_symbol,
             limit=10,
@@ -3927,8 +3993,8 @@ def get_contract_quote(db: Session, symbol: str, *, log_context: str = "contract
     normalized_symbol = _normalize_symbol(symbol)
     try:
         contract_symbol = _load_contract_symbol(db, symbol)
-    except ContractSymbolNotFound:
-        if not _is_stock_contract_symbol(normalized_symbol):
+    except ContractSymbolNotFound as exc:
+        if isinstance(exc, ContractSymbolDisabled) or not _is_stock_contract_symbol(normalized_symbol):
             raise
         market_status = _market_status_for_stock_contract_symbol()
         frozen_quote = _get_closed_quote(normalized_symbol) if _is_market_closed(market_status) else None
@@ -4158,7 +4224,7 @@ def _quote_from_stock_quote_item(
     data: Dict[str, Any],
     source: str = "ITICK_QUOTE",
 ) -> dict[str, Any]:
-    last_price = _pick_positive_decimal(data, ["p", "ld", "last", "price", "latest_price", "close", "c"])
+    last_price = _pick_positive_decimal(data, list(ITICK_LATEST_PRICE_FIELDS))
     price = _require_positive(last_price, "last_price")
     quote_ts = _itick_quote_timestamp(data)
     depth = _build_stock_depth_from_prices(
@@ -4203,7 +4269,7 @@ def _contract_ticker_from_stock_contract(
         data = _extract_stock_quote_item(payload) or {}
     else:
         data = quote_item
-    last_price = _pick_positive_decimal(data, ["p", "ld", "last", "price", "latest_price", "close", "c"])
+    last_price = _pick_positive_decimal(data, list(ITICK_LATEST_PRICE_FIELDS))
     ticker_24h_fields = _extract_itick_24h_ticker_fields(data, last_price=last_price)
     if last_price is not None and last_price > 0:
         quote_ts = _itick_quote_timestamp(data)
@@ -4547,10 +4613,26 @@ def get_contract_tickers(
         }
         items.extend(_stock_contract_tickers_from_symbols(db, code_by_symbol))
     existing_symbols = {str(item.get("symbol") or "").upper() for item in items}
-    missing_stock_symbols = {
+    dynamic_stock_candidates = {
         item: _stock_provider_symbol_from_contract_symbol(item)
         for item in sorted(normalized_symbols)
         if item not in existing_symbols and _is_stock_contract_symbol(item)
+    }
+    configured_dynamic_symbols: set[str] = set()
+    if dynamic_stock_candidates:
+        configured_rows = (
+            db.query(ContractSymbol.symbol)
+            .filter(ContractSymbol.symbol.in_(dynamic_stock_candidates))
+            .all()
+        )
+        configured_dynamic_symbols = {
+            str(getattr(row, "symbol", None) or row[0]).strip().upper()
+            for row in configured_rows
+        }
+    missing_stock_symbols = {
+        symbol: provider_symbol
+        for symbol, provider_symbol in dynamic_stock_candidates.items()
+        if symbol not in configured_dynamic_symbols
     }
     if missing_stock_symbols:
         items.extend(_stock_contract_tickers_from_symbols(db, missing_stock_symbols))
@@ -4584,8 +4666,8 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
     safe_limit = max(5, min(int(limit or 20), 100))
     try:
         contract_symbol = _load_contract_symbol(db, symbol)
-    except ContractSymbolNotFound:
-        if not _is_stock_contract_symbol(normalized_symbol):
+    except ContractSymbolNotFound as exc:
+        if isinstance(exc, ContractSymbolDisabled) or not _is_stock_contract_symbol(normalized_symbol):
             raise
         safe_limit = max(5, min(int(limit or 20), 100))
         market_status = _market_status_for_stock_contract_symbol()
@@ -4679,6 +4761,11 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
                     depth = derived_depth
             except Exception:
                 pass
+        # Execution state must describe the BBO snapshot selected above.  A
+        # live quote-derived BBO must not inherit FEED_UNAVAILABLE from the
+        # failed or stale native-depth attempt.
+        market_status = _market_status_for_contract_symbol(contract_symbol, depth)
+        is_closed_market = _is_market_closed(market_status)
         best_bid = _require_positive(depth.get("best_bid"), "bid_price")
         best_ask = _require_positive(depth.get("best_ask"), "ask_price")
         depth_mid_price = (best_bid + best_ask) / Decimal("2")
@@ -4752,6 +4839,7 @@ def get_contract_depth(db: Session, symbol: str, limit: int = 20, *, allow_fallb
                     )
                     _cache_depth(depth)
                     db.commit()
+                    market_status = _market_status_for_contract_symbol(contract_symbol, depth)
                     return _contract_depth_with_status(depth, market_status, contract_symbol)
             except Exception:
                 db.rollback()
@@ -5413,8 +5501,8 @@ def get_contract_klines(
 
     try:
         contract_symbol = _load_contract_symbol(db, normalized_symbol)
-    except ContractSymbolNotFound:
-        if not _is_stock_contract_symbol(normalized_symbol):
+    except ContractSymbolNotFound as exc:
+        if isinstance(exc, ContractSymbolDisabled) or not _is_stock_contract_symbol(normalized_symbol):
             raise
         provider_symbol = _stock_contract_underlying(normalized_symbol) or normalized_symbol.replace("_PERP", "")
         return _get_stock_contract_klines_from_itick(
@@ -5649,8 +5737,8 @@ def get_contract_recent_trades(db: Session, symbol: str, limit: int = 30) -> lis
     safe_limit = max(1, min(int(limit or 30), 100))
     try:
         contract_symbol = _load_contract_symbol(db, normalized_symbol)
-    except ContractSymbolNotFound:
-        if not _is_stock_contract_symbol(normalized_symbol):
+    except ContractSymbolNotFound as exc:
+        if isinstance(exc, ContractSymbolDisabled) or not _is_stock_contract_symbol(normalized_symbol):
             raise
         if _is_market_closed(_market_status_for_stock_contract_symbol()):
             return []
@@ -5883,6 +5971,7 @@ def get_contract_market_view_legacy_inputs(
     contract_symbol = (
         db.query(ContractSymbol)
         .filter(ContractSymbol.symbol == normalized_symbol)
+        .filter(ContractSymbol.status == 1)
         .first()
     )
     quote: Optional[dict[str, Any]] = None

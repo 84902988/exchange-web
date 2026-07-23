@@ -20,8 +20,8 @@ def test_itick_market_quotes_by_code_uses_one_batch_request(monkeypatch) -> None
         calls.append((path, params, kwargs))
         return {
             "data": [
-                {"s": "EURUSD", "p": "1.12", "o": "1.10"},
-                {"s": "GBPUSD", "p": "1.31", "o": "1.30"},
+                {"s": "EURUSD", "ld": "1.12", "p": "1.10"},
+                {"s": "GBPUSD", "ld": "1.31", "p": "1.30"},
             ]
         }
 

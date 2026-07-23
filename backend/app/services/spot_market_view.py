@@ -8,7 +8,7 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from app.schemas.market import DepthResponse, TradesResponse
-from app.services.market import get_depth, get_klines, get_market_tickers, get_trades
+from app.services.market import _get_active_pair, get_depth, get_klines, get_market_tickers, get_trades
 
 
 SPOT_MARKET_VIEW_BUDGET_SECONDS = 2.8
@@ -338,6 +338,10 @@ def get_spot_market_view(
     normalized_symbol = str(symbol or "").upper().strip()
     if not normalized_symbol:
         raise ValueError("symbol is required")
+    # MarketView is a public bootstrap authority. It must reject a configured
+    # disabled pair before independent domain fallbacks can synthesize an
+    # empty-but-successful view for a symbol that is no longer tradable.
+    _get_active_pair(db, normalized_symbol)
 
     warnings: list[str] = []
     depth: Optional[DepthResponse] = None

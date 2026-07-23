@@ -119,21 +119,6 @@ export function resolveContractMarketViewAuthorityPresentation({
     return nonTradingPresentation('holiday', displayState);
   }
 
-  // A REST bootstrap can briefly report unavailable before the same-symbol
-  // realtime Store has received a complete ticker + executable BBO.  Callers
-  // may keep that bounded bootstrap window in a fail-closed loading state, but
-  // definitive non-trading sessions above must remain visible immediately.
-  if (loading) {
-    return {
-      state: 'loading',
-      status: 'LOADING',
-      isLoading: true,
-      isRealtime: false,
-      isTradable: false,
-      reason: 'MARKET_VIEW_LOADING',
-    };
-  }
-
   const liveState = displayState === 'LIVE_TRADABLE'
     || displayState === 'REGULAR_OPEN';
   const hasExecutableBbo = authority.executionBid !== null
@@ -153,6 +138,22 @@ export function resolveContractMarketViewAuthorityPresentation({
       isRealtime: true,
       isTradable: true,
       reason: `MARKET_VIEW_${displayState}`,
+    };
+  }
+
+  // Reconnect recovery refreshes MarketView in the background. A complete,
+  // same-symbol executable authority above must remain live during that
+  // refresh; otherwise every healthy socket hand-off visibly regresses to
+  // "loading" while price and BBO are still advancing. Loading only masks an
+  // incomplete/unavailable bootstrap and therefore stays fail closed.
+  if (loading) {
+    return {
+      state: 'loading',
+      status: 'LOADING',
+      isLoading: true,
+      isRealtime: false,
+      isTradable: false,
+      reason: 'MARKET_VIEW_LOADING',
     };
   }
 

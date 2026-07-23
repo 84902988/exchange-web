@@ -116,6 +116,7 @@ interface GlobalMarketSelectorProps {
   placement?: 'toolbar' | 'header';
   initialCategory?: PairCategory;
   onPairQueryChange?: (query: PairQueryUpdate) => void;
+  onCatalogRefresh?: () => unknown;
   onLoadMorePairs?: () => void;
 }
 
@@ -1278,6 +1279,7 @@ export default function GlobalMarketSelector({
   placement = 'toolbar',
   initialCategory,
   onPairQueryChange,
+  onCatalogRefresh,
   onLoadMorePairs,
 }: GlobalMarketSelectorProps) {
   const router = useRouter();
@@ -1364,22 +1366,34 @@ export default function GlobalMarketSelector({
     const internalSpotSource = internalSpotPairs.length && internalSpotPairsKey === spotPairsCacheKey
       ? internalSpotPairs
       : [];
-    const spotSource = mergeUniquePairs(
-      externalSpotPairs,
-      internalSpotSource,
-      cachedSpotPairs || [],
-    );
+    // When the page provides a catalog, it owns membership for that market.
+    // Internal caches are still useful for a standalone selector, but must not
+    // resurrect a pair that the latest parent catalog has removed.
+    const spotSource = pairs !== undefined && pageType === 'spot'
+      ? externalSpotPairs
+      : mergeUniquePairs(
+          externalSpotPairs,
+          internalSpotSource,
+          cachedSpotPairs || [],
+        );
 
     const cachedContractPairs =
       readFreshPairCache(contractPairsCacheRef.current, contractPairsCacheFetchedAtRef.current, contractPairsCacheKey) ||
       (!pairKeyword
         ? readFreshPairCache(contractPairsCacheRef.current, contractPairsCacheFetchedAtRef.current, DEFAULT_CONTRACT_PAIRS_CACHE_KEY)
         : undefined);
-    const contractSource = cachedContractPairs?.length
-      ? cachedContractPairs
-      : internalContractPairs.length && internalContractPairsKey === contractPairsCacheKey
-      ? internalContractPairs
-      : externalPairItems.filter(isContractMarketPair);
+    const externalContractPairs = externalPairItems.filter(isContractMarketPair);
+    // A parent-provided list is the current control-plane catalog and owns
+    // membership. The module cache may still contain a symbol that an
+    // administrator has just disabled, so use it only when this selector owns
+    // loading the contract catalog.
+    const contractSource = pairs !== undefined && pageType === 'contract'
+      ? externalContractPairs
+      : cachedContractPairs?.length
+        ? cachedContractPairs
+        : internalContractPairs.length && internalContractPairsKey === contractPairsCacheKey
+          ? internalContractPairs
+          : externalContractPairs;
 
     const mergedPairs = mergeUniquePairs(
       mergePairsWithTickerCache(spotSource, tickerCacheRef.current),
@@ -1400,6 +1414,8 @@ export default function GlobalMarketSelector({
     internalSpotPairs,
     internalSpotPairsKey,
     marketTab,
+    pageType,
+    pairs,
     pairKeyword,
     spotPairsCacheKey,
     tickerCacheVersion,
@@ -1407,10 +1423,14 @@ export default function GlobalMarketSelector({
 
   void contractTickerHydratingVersion;
 
-  const allKnownPairs = useMemo(
-    () => [...externalPairItems, ...internalSpotPairs, ...internalContractPairs],
-    [externalPairItems, internalContractPairs, internalSpotPairs],
-  );
+  const allKnownPairs = useMemo(() => {
+    if (pairs === undefined) {
+      return [...externalPairItems, ...internalSpotPairs, ...internalContractPairs];
+    }
+    return pageType === 'contract'
+      ? [...externalPairItems, ...internalSpotPairs]
+      : [...externalPairItems, ...internalContractPairs];
+  }, [externalPairItems, internalContractPairs, internalSpotPairs, pageType, pairs]);
 
   const currentPair = useMemo(
     () => allKnownPairs.find((item) => normalize(item.symbol) === normalize(symbol)),
@@ -1717,6 +1737,21 @@ export default function GlobalMarketSelector({
     const knownPairs = [...internalSpotPairs, ...internalContractPairs, ...externalPairItems, ...cachedPairs];
 
     return favoriteSymbols.map((favorite) => {
+      const parentOwnsFavoriteMarket =
+        pairs !== undefined &&
+        ((pageType === 'spot' && favorite.market === 'spot') ||
+          (pageType === 'contract' && favorite.market === 'contract'));
+      if (
+        parentOwnsFavoriteMarket &&
+        !externalPairItems.some(
+          (item) =>
+            normalize(item.symbol) === favorite.symbol &&
+            getPairMarket(item) === favorite.market,
+        )
+      ) {
+        return null;
+      }
+
       const knownPair = knownPairs.find(
         (item) => normalize(item.symbol) === favorite.symbol && getPairMarket(item) === favorite.market,
       );
@@ -1759,6 +1794,8 @@ export default function GlobalMarketSelector({
     internalContractPairs,
     internalSpotPairs,
     marketDisplayLabels,
+    pageType,
+    pairs,
     contractTickerCacheVersion,
     tickerCacheVersion,
   ]);
@@ -1908,6 +1945,26 @@ export default function GlobalMarketSelector({
   }, [contractPairsCacheKey, externalPairItems, hydrateTickerSymbols, marketDisplayLabels, pageType, pairs, spotPairsCacheKey]);
 
   useEffect(() => {
+    if (!open || !onCatalogRefresh) return;
+
+    void Promise.resolve(onCatalogRefresh()).catch((error) => {
+      console.warn('GlobalMarketSelector catalog refresh warning:', error);
+    });
+  }, [onCatalogRefresh, open]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    // Opening the selector is the control-plane refresh boundary. Retain the
+    // cached rows/tickers for hot-path data reuse, but expire membership
+    // timestamps so cross-market tabs also revalidate before rendering.
+    spotPairsCacheFetchedAtRef.current.clear();
+    contractPairsCacheFetchedAtRef.current.clear();
+    loadedSpotPairKeysRef.current.clear();
+    loadedContractPairKeysRef.current.clear();
+  }, [open]);
+
+  useEffect(() => {
     if (!open) return;
     if (marketTab === 'favorites') return;
     if (marketTab !== 'crypto' || spotCategory === 'contract') return;
@@ -1924,6 +1981,10 @@ export default function GlobalMarketSelector({
 
   useEffect(() => {
     if (!open || marketTab !== 'crypto' || spotCategory === 'contract') return;
+    if (pageType === 'spot' && pairs !== undefined) {
+      setSpotPairsLoading(false);
+      return;
+    }
 
     const requestId = ++spotRequestIdRef.current;
     const cachedPairs = readFreshPairCache(
@@ -1981,7 +2042,7 @@ export default function GlobalMarketSelector({
     };
 
     void loadSpotPairs();
-  }, [hydrateTickerSymbols, marketDisplayLabels, marketTab, open, pairKeyword, spotCategory, spotPairCategory, spotPairQuote, spotPairsCacheKey]);
+  }, [hydrateTickerSymbols, marketDisplayLabels, marketTab, open, pageType, pairKeyword, pairs, spotCategory, spotPairCategory, spotPairQuote, spotPairsCacheKey]);
 
   useEffect(() => {
     if (!open || !needsContractRows) return;
@@ -2082,11 +2143,22 @@ export default function GlobalMarketSelector({
     ));
   }, [contractCategory, favoritePairs, marketTab, pageType, pairItems, pairMatchesSearch, search, spotCategory, stockCategory]);
 
+  const authoritativeCatalogRefreshing =
+    open &&
+    pairs !== undefined &&
+    pairsLoading &&
+    !pairsLoadingMore;
+  const catalogMembershipRefreshing =
+    authoritativeCatalogRefreshing ||
+    (open && activePairsRefreshing && !pairsLoadingMore);
   const showInitialPairsLoading =
-    filteredPairs.length === 0 &&
-    pairItems.length === 0 &&
-    stablePairRows.length === 0 &&
-    (activePairsRefreshing || pairsLoading);
+    catalogMembershipRefreshing ||
+    (
+      filteredPairs.length === 0 &&
+      pairItems.length === 0 &&
+      stablePairRows.length === 0 &&
+      (activePairsRefreshing || pairsLoading)
+    );
 
   const isSwitchingWithoutRows =
     !pairKeyword &&
@@ -2100,7 +2172,19 @@ export default function GlobalMarketSelector({
         internalContractPairsKey !== contractPairsCacheKey &&
         !contractPairsCacheRef.current.has(contractPairsCacheKey)));
 
-  const displayPairs = isSwitchingWithoutRows ? stablePairRows : filteredPairs;
+  const displayPairs = useMemo(
+    () => catalogMembershipRefreshing
+      ? []
+      : isSwitchingWithoutRows
+        ? stablePairRows
+        : filteredPairs,
+    [
+      catalogMembershipRefreshing,
+      filteredPairs,
+      isSwitchingWithoutRows,
+      stablePairRows,
+    ],
+  );
   const showEmptyPairs = !showInitialPairsLoading && displayPairs.length === 0 && !isSwitchingWithoutRows;
   const emptyPairText = pairKeyword
     ? t('noMatchingPairs', 'markets')
@@ -2321,6 +2405,18 @@ export default function GlobalMarketSelector({
     }
   };
 
+  const handleSelectorToggle = () => {
+    if (!open) {
+      spotPairsCacheFetchedAtRef.current.clear();
+      contractPairsCacheFetchedAtRef.current.clear();
+      loadedSpotPairKeysRef.current.clear();
+      loadedContractPairKeysRef.current.clear();
+      if (needsSpotRows) setSpotPairsLoading(true);
+      if (needsContractRows) setContractPairsLoading(true);
+    }
+    setOpen((value) => !value);
+  };
+
   return (
     <div
       className={
@@ -2340,7 +2436,7 @@ export default function GlobalMarketSelector({
         >
           <button
             type="button"
-            onClick={() => setOpen((value) => !value)}
+            onClick={handleSelectorToggle}
             className={`flex h-full min-w-0 flex-1 items-center text-left text-white outline-none transition-colors focus-visible:bg-white/[0.04] ${
               isHeaderPlacement
                 ? 'gap-2 rounded-lg pl-0 pr-0.5 hover:bg-white/[0.04]'

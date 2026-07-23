@@ -223,6 +223,29 @@ test('contract Header, TradingView, and OrderBook share one reference-price dire
   expect(marketStateSource).not.toContain('latestMarketPriceRef');
 });
 
+test('contract linked valuation and execution consumers share one MarketView authority owner', () => {
+  const pageSource = readSource('app/contract/page.tsx');
+  const hookSource = readSource('components/contract/hooks/useContractMarketView.ts');
+  const headerSource = readSource('components/contract/ContractMarketHeader.tsx');
+  const formSource = readSource('components/contract/ContractTradingForm.tsx');
+
+  expect(hookSource).toContain('const linkedMarketAuthority = useMemo<ContractLinkedMarketAuthority>');
+  expect(hookSource).toContain('valuationPrice: executable ? valuationPrice : null');
+  expect(hookSource).toContain('executionBid: linkedMarketAuthority.bestBid');
+  expect(hookSource).toContain('executionAsk: linkedMarketAuthority.bestAsk');
+  expect(pageSource).toContain('linkedMarketAuthority.valuationPrice ?? contractQuote?.mark_price');
+  expect(pageSource).toMatch(
+    /<ContractPositionTabs[\s\S]*?liveBestBid=\{linkedMarketAuthority\.bestBid\}[\s\S]*?liveBestAsk=\{linkedMarketAuthority\.bestAsk\}[\s\S]*?liveMarketUsable=\{marketUiState\.status === 'LIVE' && linkedMarketAuthority\.executable\}[\s\S]*?\/>/,
+  );
+  expect(pageSource).toMatch(
+    /<ContractTradingForm[\s\S]*?priceAuthority=\{priceAuthority\}[\s\S]*?\/>/,
+  );
+  expect(headerSource).toContain('const executable = legacy.executable;');
+  expect(headerSource).toContain('markPrice: legacy.markPrice');
+  expect(headerSource).toContain('bestBid: legacy.bestBid');
+  expect(formSource).toContain('authority: priceAuthority');
+});
+
 test('every ContractTradingViewChart consumer provides a symbol-matched referencePrice', () => {
   const contractPageSource = readSource('app/contract/page.tsx');
   const stockPageSource = readSource('app/markets/stocks/[symbol]/page.tsx');

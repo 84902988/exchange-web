@@ -128,7 +128,9 @@ def _run_view(
     original_get_trades = spot_market_view.get_trades
     original_get_market_tickers = spot_market_view.get_market_tickers
     original_get_klines = spot_market_view.get_klines
+    original_get_active_pair = spot_market_view._get_active_pair
     try:
+        spot_market_view._get_active_pair = lambda *_args, **_kwargs: object()
         spot_market_view.get_depth = lambda **kwargs: depth if depth is not None else _depth()
         spot_market_view.get_trades = lambda **kwargs: trades if trades is not None else _trades(symbol)
         spot_market_view.get_market_tickers = lambda **kwargs: tickers if tickers is not None else _ticker(symbol)
@@ -143,6 +145,31 @@ def _run_view(
         spot_market_view.get_trades = original_get_trades
         spot_market_view.get_market_tickers = original_get_market_tickers
         spot_market_view.get_klines = original_get_klines
+        spot_market_view._get_active_pair = original_get_active_pair
+
+
+def test_spot_market_view_rejects_disabled_pair_before_loading_domains(monkeypatch) -> None:
+    domain_loader_called = False
+
+    def reject_pair(*_args, **_kwargs):
+        raise ValueError("trading pair not found or disabled")
+
+    def unexpected_domain_load(**_kwargs):
+        nonlocal domain_loader_called
+        domain_loader_called = True
+        raise AssertionError("disabled pair must fail before market domains load")
+
+    monkeypatch.setattr(spot_market_view, "_get_active_pair", reject_pair)
+    monkeypatch.setattr(spot_market_view, "get_depth", unexpected_domain_load)
+
+    try:
+        spot_market_view.get_spot_market_view(db=None, symbol="MFCUSDT")
+    except ValueError as error:
+        assert "disabled" in str(error)
+    else:
+        raise AssertionError("disabled pair must be rejected")
+
+    assert domain_loader_called is False
 
 
 def test_spot_market_view_kline_uses_live_ws_metadata() -> None:

@@ -16,6 +16,7 @@ from app.services.itick_market_service import (
     ItickMarketServiceError,
     itick_market_service,
 )
+from app.services.itick_quote_fields import ITICK_LATEST_PRICE_FIELDS
 from app.services.stock_dealer_price_engine import get_stock_dealer_price_context
 
 
@@ -89,7 +90,7 @@ def _depth_limit(limit: int = 20) -> int:
 
 
 def _trade_context_cache_ttl_seconds() -> float:
-    return _float_env("STOCK_TRADE_CONTEXT_TTL_SECONDS", "30")
+    return _float_env("STOCK_TRADE_CONTEXT_TTL_SECONDS", "15")
 
 
 def _trade_context_cache_key(pair: TradingPair) -> str:
@@ -138,7 +139,7 @@ def _pick_decimal(data: Dict[str, Any], keys: Iterable[str]) -> Optional[Decimal
 
 def get_stock_reference_quote(pair: TradingPair) -> Decimal:
     cache_key = f"{_external_region(pair)}:{_external_symbol(pair)}"
-    cache_ttl = _decimal_env("STOCK_DEALER_QUOTE_TTL_SECONDS", "30")
+    cache_ttl = _decimal_env("STOCK_DEALER_QUOTE_TTL_SECONDS", "15")
     cached = _QUOTE_CACHE.get(cache_key)
     now = time.monotonic()
     if cached is not None and now - cached[0] <= float(cache_ttl):
@@ -156,7 +157,7 @@ def get_stock_reference_quote(pair: TradingPair) -> Decimal:
     if not isinstance(data, dict):
         raise ItickMarketServiceError("iTick quote missing data")
 
-    price = _pick_decimal(data, ("ld", "last", "price", "close", "c", "o"))
+    price = _pick_decimal(data, ITICK_LATEST_PRICE_FIELDS)
     if price is None:
         raise ItickMarketServiceError("iTick quote missing valid price")
     _QUOTE_CACHE[cache_key] = (now, price)
@@ -172,7 +173,7 @@ def _fetch_stock_quote_price(pair: TradingPair) -> Optional[Decimal]:
     if not isinstance(data, dict):
         return None
 
-    return _pick_decimal(data, ("ld", "last", "price", "close", "c", "o"))
+    return _pick_decimal(data, ITICK_LATEST_PRICE_FIELDS)
 
 
 def normalize_stock_depth_levels(raw_levels: Any) -> List[Tuple[Decimal, Decimal]]:
