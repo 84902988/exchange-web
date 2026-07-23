@@ -1607,7 +1607,19 @@ export function createContractTradingViewDatafeed({
       });
       const latestBarKey = buildLatestBarKey(requestSymbol, interval);
       const firstDataRequest = periodParams.firstDataRequest !== false;
-      if (firstDataRequest) {
+      const hasSettledRealtimeBaseline = (
+        historyReadyByLatestBarKey.get(latestBarKey) === true
+        && latestBars.has(latestBarKey)
+        && getContractKlineHighWaterMark(latestBarKey) > 0
+      );
+      if (firstDataRequest && !hasSettledRealtimeBaseline) {
+        // A TradingView reset can issue another firstDataRequest for the same
+        // live series. Keep its already-settled realtime baseline open while
+        // history is revalidated; otherwise trade previews are dropped until
+        // the slower Native K-line/history request completes and Header/price
+        // overlay can visibly outrun the active candle for several seconds.
+        // Cold builds and restored-resolution resets still fail closed because
+        // they do not have a settled baseline for this datafeed instance.
         historyReadyByLatestBarKey.set(latestBarKey, false);
       }
       const requestPlan = resolveContractKlineRequestPlan({
@@ -2226,7 +2238,17 @@ export function createContractTradingViewDatafeed({
       const handleStoreEntry = (entry: ContractMarketStoreEntry | null) => {
         const activeSubscription = getActiveSubscription();
         if (!activeSubscription) return;
-        if (!entry) return;
+        if (!entry) {
+          // A Store session rotation is also a provider-lineage boundary. Drop
+          // the old Native/preview pairing immediately so a complete preview
+          // from the replacement socket can bootstrap the live candle before
+          // the slower provider K-line channel publishes its next revision.
+          realtimeBarFrameCoalescer.cancel();
+          previewCompositor.reset();
+          activeSubscription.lastStoreBarTime = 0;
+          activeSubscription.legacyVersionCursor = null;
+          return;
+        }
         const nextBar = storeKlineEntryToBar(entry, subscriptionSymbol, interval);
         if (!nextBar) return;
         activeSubscription.lastStoreBarTime = Math.max(

@@ -5170,6 +5170,129 @@ def _provider_contract_kline_rows(rows: Any, *, limit: Optional[int] = None) -> 
     return result.with_items(clean_rows[-safe_limit:])
 
 
+def _filter_itick_intraday_rolling_summary_rows(
+    contract_symbol: ContractSymbol,
+    interval: str,
+    rows: Any,
+) -> ContractKlineResult:
+    """Reject iTick rolling-day summaries that are shaped like intraday bars.
+
+    The rejection is deliberately evidence based: the row must arrive after a
+    real-time gap, reproduce both cached 24-hour extremes, and expand beyond
+    the recent provider-bar range on both sides.  A price gap alone is valid
+    market data and is never enough to discard a candle.
+    """
+
+    result = coerce_contract_kline_result(rows)
+    normalized_interval = _normalize_contract_interval(interval)
+    if normalized_interval not in {"1m", "5m", "15m", "30m"} or len(result) < 2:
+        return result
+
+    cached_quote = _get_cached_tradfi_quote_for_contract(contract_symbol, allow_stale=True)
+    day_high = _to_decimal((cached_quote or {}).get("high_24h"))
+    day_low = _to_decimal((cached_quote or {}).get("low_24h"))
+    has_cached_day_extremes = bool(
+        day_high is not None and day_low is not None and day_high > day_low
+    )
+    is_index = _contract_asset_category(contract_symbol) == "INDEX"
+    price_precision = max(0, min(18, int(getattr(contract_symbol, "price_precision", 8) or 8)))
+    price_tolerance = Decimal(1).scaleb(-price_precision)
+
+    def same_price(left: Optional[Decimal], right: Optional[Decimal]) -> bool:
+        return bool(
+            left is not None
+            and right is not None
+            and abs(left - right) <= price_tolerance
+        )
+
+    interval_ms = int(_contract_interval_seconds[normalized_interval] * 1000)
+    kept_rows: list[dict[str, Any]] = []
+    rejected = 0
+    for raw_row in result:
+        row = dict(raw_row) if isinstance(raw_row, dict) else raw_row
+        if not isinstance(row, dict) or not kept_rows:
+            kept_rows.append(row)
+            continue
+
+        candidate_time = _to_timestamp_ms(row.get("open_time") or row.get("time") or row.get("timestamp"))
+        candidate_high = _to_decimal(row.get("high"))
+        candidate_low = _to_decimal(row.get("low"))
+        candidate_open = _to_decimal(row.get("open"))
+        candidate_close = _to_decimal(row.get("close"))
+        previous_time = _to_timestamp_ms(kept_rows[-1].get("open_time"))
+        previous_close = _to_decimal(kept_rows[-1].get("close"))
+        recent_rows = kept_rows[-20:]
+        recent_highs = [
+            value
+            for item in recent_rows
+            if (value := _to_decimal(item.get("high"))) is not None
+        ]
+        recent_lows = [
+            value
+            for item in recent_rows
+            if (value := _to_decimal(item.get("low"))) is not None
+        ]
+        recent_range = (
+            max(recent_highs) - min(recent_lows)
+            if recent_highs and recent_lows
+            else None
+        )
+        candidate_range = (
+            candidate_high - candidate_low
+            if candidate_high is not None and candidate_low is not None
+            else None
+        )
+        has_summary_shape = bool(
+            candidate_time is not None
+            and previous_time is not None
+            and candidate_time - previous_time > interval_ms * 2
+            and recent_highs
+            and recent_lows
+            and candidate_high > max(recent_highs)
+            and candidate_low < min(recent_lows)
+            and recent_range is not None
+            and candidate_range is not None
+            and candidate_range > recent_range * Decimal("2")
+        )
+        matches_cached_day_extremes = bool(
+            has_cached_day_extremes
+            and same_price(candidate_high, day_high)
+            and same_price(candidate_low, day_low)
+        )
+        matches_cold_index_summary_signature = bool(
+            not has_cached_day_extremes
+            and is_index
+            and candidate_open is not None
+            and candidate_close is not None
+            and previous_close is not None
+            and (
+                same_price(candidate_open, candidate_high)
+                or same_price(candidate_open, candidate_low)
+            )
+            and same_price(candidate_close, previous_close)
+            and recent_range is not None
+            and candidate_range is not None
+            and candidate_range > recent_range * Decimal("3")
+        )
+        looks_like_rolling_summary = has_summary_shape and (
+            matches_cached_day_extremes or matches_cold_index_summary_signature
+        )
+        if looks_like_rolling_summary:
+            rejected += 1
+            continue
+        kept_rows.append(row)
+
+    if rejected:
+        logger.warning(
+            "contract_itick_intraday_rolling_summary_rejected symbol=%s interval=%s rejected=%s",
+            contract_symbol.symbol,
+            normalized_interval,
+            rejected,
+        )
+        return result.with_items(kept_rows)
+    return result
+
+
 def _get_stock_contract_klines_from_itick(
     db: Session,
     *,
@@ -5480,6 +5603,11 @@ def get_contract_klines(
         if boundary_rejected:
             return _itick_dwm_boundary_unavailable_result()
         rows = _provider_contract_kline_rows(rows, limit=safe_limit)
+        rows = _filter_itick_intraday_rolling_summary_rows(
+            contract_symbol,
+            normalized_interval,
+            rows,
+        )
         if rows:
             if end_time_ms is None and category != "INDEX":
                 _cache_contract_klines(contract_symbol.symbol, normalized_interval, safe_limit, rows)
