@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-# IMPORTANT:
-# Dividend job currently supports SINGLE INSTANCE ONLY.
-# Do NOT run multiple backend instances with dividend job enabled,
-# otherwise it may cause duplicate distribution.
-# Future improvement: DB lock or Redis distributed lock.
+# Dividend batch execution state machine shared by the guarded manual workflow
+# and the dedicated single-instance automatic scheduler. Eligibility capture
+# remains owned by the independent, no-funds systemd timer.
 
 import logging
-import threading
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -17,27 +14,17 @@ from app.db.models.dividend import DividendPool, DividendPoolItem, UserDividendR
 from app.db.models.dividend_job_log import DividendJobLog
 from app.db.session import SessionLocal
 from app.services.dividend_service import (
+    build_dividend_recovery_preview,
     calculate_dividend_pool,
+    capture_dividend_eligibility_snapshot,
     create_dividend_pool_skeleton,
     distribute_dividend_pool,
     get_dividend_config,
 )
-from app.services.service_heartbeat import start_heartbeat_thread
 
 
-DIVIDEND_JOB_INTERVAL_SECONDS = 60
-DIVIDEND_HEARTBEAT_SERVICE_NAME = "dividend_job"
-DIVIDEND_HEARTBEAT_INTERVAL_SECONDS = 10
-DIVIDEND_HEARTBEAT_TTL_SECONDS = 30
 logger = logging.getLogger(__name__)
-
-_thread: Optional[threading.Thread] = None
-_stop_event: Optional[threading.Event] = None
-_attempted_dates: set[str] = set()
-_lock = threading.Lock()
-_last_check_at: Optional[datetime] = None
-_last_check_result = "NOT_STARTED"
-_last_run_time_utc = "00:10"
+_attempted_auto_dates: set[str] = set()
 
 
 def _utc_now() -> datetime:
@@ -46,57 +33,6 @@ def _utc_now() -> datetime:
 
 def _log(message: str) -> None:
     logger.info("[dividend_job] %s", message)
-
-
-def _iso_utc(value: Optional[datetime]) -> str:
-    if value is None:
-        return ""
-    return value.replace(microsecond=0).isoformat() + "Z"
-
-
-def _update_heartbeat_state(
-    *,
-    run_time_utc: Optional[str] = None,
-    last_check_at: Optional[datetime] = None,
-    last_check_result: Optional[str] = None,
-) -> None:
-    global _last_check_at, _last_check_result, _last_run_time_utc
-    with _lock:
-        if run_time_utc:
-            _last_run_time_utc = str(run_time_utc).strip()
-        if last_check_at is not None:
-            _last_check_at = last_check_at
-        if last_check_result:
-            _last_check_result = str(last_check_result).strip()[:80]
-
-
-def _dividend_heartbeat_payload() -> dict[str, Any]:
-    with _lock:
-        last_check_at = _last_check_at
-        last_check_result = _last_check_result
-        run_time_utc = _last_run_time_utc
-    return {
-        "run_time_utc": run_time_utc,
-        "last_check_at": _iso_utc(last_check_at),
-        "last_check_result": last_check_result,
-    }
-
-
-def _run_time_matches(now_utc: datetime, run_time_utc: str) -> bool:
-    return now_utc.strftime("%H:%M") == str(run_time_utc or "").strip()
-
-
-def _target_dividend_date(now_utc: datetime):
-    return (now_utc.date() - timedelta(days=1))
-
-
-def _mark_attempted_once(dividend_date) -> bool:
-    key = dividend_date.isoformat()
-    with _lock:
-        if key in _attempted_dates:
-            return False
-        _attempted_dates.add(key)
-        return True
 
 
 def _write_job_log(
@@ -231,49 +167,40 @@ def _run_dividend_pool_state_machine(
     return f"EXISTING_{before_status}", step, pool_id, message
 
 
-def process_dividend_job_once(now_utc: Optional[datetime] = None, trigger_type: str = "AUTO") -> str:
+def process_dividend_job_once(
+    now_utc: Optional[datetime] = None,
+    trigger_type: str = "AUTO",
+) -> str:
     now = now_utc or _utc_now()
     db = SessionLocal()
-    dividend_date = None
-    pool_id = None
+    dividend_date = now.date() - timedelta(days=1)
+    pool_id: Optional[int] = None
     step = "CHECK_TIME"
     try:
         config = get_dividend_config(db)
         run_time_utc = str(config.get("run_time_utc") or "00:10").strip()
-        _update_heartbeat_state(run_time_utc=run_time_utc, last_check_at=now)
-        if not _run_time_matches(now, run_time_utc):
-            _update_heartbeat_state(last_check_result="SKIPPED_TIME")
+        if now.strftime("%H:%M") != run_time_utc:
             return "SKIPPED_TIME"
 
-        dividend_date = _target_dividend_date(now)
+        date_key = dividend_date.isoformat()
+        if date_key in _attempted_auto_dates:
+            return "SKIPPED_IN_PROCESS"
+
         _write_job_log(
             run_time=now,
             dividend_date=dividend_date,
             trigger_type=trigger_type,
             status="DUE",
-            step="CHECK_TIME",
-            message=f"dividend job reached configured run_time_utc={run_time_utc}",
+            step=step,
+            message=f"dedicated dividend scheduler reached run_time_utc={run_time_utc}",
         )
-        if not _mark_attempted_once(dividend_date):
-            _write_job_log(
-                run_time=now,
-                dividend_date=dividend_date,
-                trigger_type=trigger_type,
-                status="SKIPPED_IN_PROCESS",
-                step="SKIP",
-                message="当前进程内该分红日期已执行过，跳过",
-            )
-            _update_heartbeat_state(last_check_result="SKIPPED_IN_PROCESS")
-            return "SKIPPED_IN_PROCESS"
-
         result, step, pool_id, message = _run_dividend_pool_state_machine(
             db,
             dividend_date=dividend_date,
             create_source="AUTO",
         )
-
         db.commit()
-        _log(f"success dividend_date={dividend_date}, result={result}")
+        _attempted_auto_dates.add(date_key)
         _write_job_log(
             run_time=now,
             dividend_date=dividend_date,
@@ -283,11 +210,10 @@ def process_dividend_job_once(now_utc: Optional[datetime] = None, trigger_type: 
             pool_id=pool_id,
             message=message,
         )
-        _update_heartbeat_state(last_check_result=result)
         return result
     except Exception as exc:
         db.rollback()
-        _log(f"failed error={repr(exc)}")
+        _log(f"automatic scheduler failed error={repr(exc)}")
         _write_job_log(
             run_time=now,
             dividend_date=dividend_date,
@@ -295,25 +221,53 @@ def process_dividend_job_once(now_utc: Optional[datetime] = None, trigger_type: 
             status="FAILED",
             step=step,
             pool_id=pool_id,
-            message="分红任务执行失败",
+            message="dedicated dividend scheduler failed",
             error_message=repr(exc),
         )
-        _update_heartbeat_state(last_check_result="FAILED")
         return "FAILED"
     finally:
         db.close()
 
 
-def process_dividend_job_for_date(dividend_date, trigger_type: str = "MANUAL_TRIGGER") -> dict[str, Any]:
+def process_dividend_job_for_date(
+    dividend_date,
+    trigger_type: str = "MANUAL_TRIGGER",
+    *,
+    recover_missing_snapshot: bool = False,
+    expected_preview_fingerprint: str = "",
+    operator_id: Optional[int] = None,
+) -> dict[str, Any]:
     now = _utc_now()
     db = SessionLocal()
     pool_id = None
     step = "CHECK_DATE"
+    preview: Optional[dict[str, Any]] = None
+    operator_message = f"operator_id={int(operator_id)}" if operator_id is not None else "operator_id=unknown"
     try:
         if dividend_date is None:
             raise ValueError("dividend_date is required")
         if dividend_date >= now.date():
             raise ValueError("dividend_date must be earlier than current UTC date")
+
+        if recover_missing_snapshot:
+            step = "VERIFY_PREVIEW"
+            preview = build_dividend_recovery_preview(db, dividend_date, now_utc=now)
+            expected = str(expected_preview_fingerprint or "").strip().lower()
+            actual = str(preview.get("fingerprint") or "").strip().lower()
+            if not expected or expected != actual:
+                raise ValueError("DIVIDEND_RECOVERY_PREVIEW_CHANGED")
+            if not bool(preview.get("can_execute")):
+                raise ValueError("DIVIDEND_RECOVERY_PLATFORM_BALANCE_INSUFFICIENT")
+            if str(preview.get("snapshot_source") or "").upper() == "OPS_RECONSTRUCTED":
+                step = "RECOVER_SNAPSHOT"
+                capture_dividend_eligibility_snapshot(
+                    db,
+                    dividend_date,
+                    now_utc=now,
+                    source="OPS_RECOVERY",
+                    created_by=operator_id,
+                    allow_outside_window=True,
+                )
 
         _write_job_log(
             run_time=now,
@@ -321,9 +275,15 @@ def process_dividend_job_for_date(dividend_date, trigger_type: str = "MANUAL_TRI
             trigger_type=trigger_type,
             status="DUE",
             step=step,
-            message="manual trigger reached dividend auto state machine",
+            message=(
+                "operations dividend recovery confirmed; "
+                f"{operator_message}; preview={str(expected_preview_fingerprint or '')[:16]}"
+                if recover_missing_snapshot
+                else "manual trigger reached dividend auto state machine"
+            ),
         )
 
+        step = "CHECK_POOL"
         result, step, pool_id, message = _run_dividend_pool_state_machine(
             db,
             dividend_date=dividend_date,
@@ -337,7 +297,11 @@ def process_dividend_job_for_date(dividend_date, trigger_type: str = "MANUAL_TRI
             status=result,
             step=step,
             pool_id=pool_id,
-            message=message,
+            message=(
+                f"{message}; {operator_message}; preview={str(expected_preview_fingerprint or '')[:16]}"
+                if recover_missing_snapshot
+                else message
+            ),
         )
         return {
             "ok": result != "FAILED",
@@ -345,6 +309,7 @@ def process_dividend_job_for_date(dividend_date, trigger_type: str = "MANUAL_TRI
             "step": step,
             "pool_id": pool_id,
             "message": message,
+            "preview": preview,
         }
     except Exception as exc:
         db.rollback()
@@ -355,7 +320,11 @@ def process_dividend_job_for_date(dividend_date, trigger_type: str = "MANUAL_TRI
             status="FAILED",
             step=step,
             pool_id=pool_id,
-            message="manual dividend auto rerun failed",
+            message=(
+                f"operations dividend recovery failed; {operator_message}"
+                if recover_missing_snapshot
+                else "manual dividend auto rerun failed"
+            ),
             error_message=repr(exc),
         )
         return {
@@ -368,63 +337,3 @@ def process_dividend_job_for_date(dividend_date, trigger_type: str = "MANUAL_TRI
         }
     finally:
         db.close()
-
-
-def start_dividend_job() -> None:
-    global _thread, _stop_event
-
-    if _thread and _thread.is_alive():
-        return
-
-    stop_event = threading.Event()
-
-    def _worker() -> None:
-        _log(f"Dividend job started (single-instance mode), interval={DIVIDEND_JOB_INTERVAL_SECONDS}s")
-        start_heartbeat_thread(
-            DIVIDEND_HEARTBEAT_SERVICE_NAME,
-            interval_sec=DIVIDEND_HEARTBEAT_INTERVAL_SECONDS,
-            ttl_sec=DIVIDEND_HEARTBEAT_TTL_SECONDS,
-            stop_event=stop_event,
-            extra_payload_factory=_dividend_heartbeat_payload,
-        )
-        _write_job_log(
-            run_time=_utc_now(),
-            trigger_type="AUTO",
-            status="THREAD_STARTED",
-            step="START",
-            message="Dividend job thread started",
-        )
-        while not stop_event.is_set():
-            try:
-                process_dividend_job_once()
-            except Exception as exc:
-                now = _utc_now()
-                _log(f"loop error={repr(exc)}")
-                _write_job_log(
-                    run_time=now,
-                    trigger_type="AUTO",
-                    status="THREAD_LOOP_FAILED",
-                    step="LOOP",
-                    message="Dividend job loop failed",
-                    error_message=repr(exc),
-                )
-                _update_heartbeat_state(last_check_at=now, last_check_result="THREAD_LOOP_FAILED")
-            stop_event.wait(DIVIDEND_JOB_INTERVAL_SECONDS)
-        _log("stopped")
-
-    _stop_event = stop_event
-    _thread = threading.Thread(target=_worker, name="dividend-job", daemon=True)
-    _thread.start()
-
-
-def stop_dividend_job() -> None:
-    global _thread, _stop_event
-
-    if _stop_event is not None:
-        _stop_event.set()
-
-    if _thread and _thread.is_alive():
-        _thread.join(timeout=2)
-
-    _thread = None
-    _stop_event = None

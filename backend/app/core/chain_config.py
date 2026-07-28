@@ -91,10 +91,9 @@ def _runtime_address_env(chain_key: str, kind: str) -> str:
 
 
 POLYGON_DEFAULT_RPC_URLS = (
-    "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.drpc.org",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon-rpc.com",
+    "https://tenderly.rpc.polygon.community",
+    "https://polygon.publicnode.com",
 )
 
 BSC_DEFAULT_RPC_URLS = (
@@ -248,7 +247,10 @@ def get_runtime_chain_config_from_row(row: Any, chain_key: str) -> ChainConfig:
     return ChainConfig(
         chain_key=str(row.get("chain_key") or ck).strip().lower(),
         chain_id=_safe_int(row.get("chain_id"), fallback.chain_id),
-        rpc_urls=_merge_urls(db_rpc_urls, fallback.rpc_urls),
+        # A non-empty DB value is the operator-controlled runtime pool.  Do not
+        # append code defaults here: removed or credentialed endpoints would
+        # otherwise keep receiving production requests after an admin update.
+        rpc_urls=db_rpc_urls or fallback.rpc_urls,
         is_eip1559=fallback.is_eip1559,
         confirmations=_safe_int(row.get("confirmations"), fallback.confirmations),
         native_symbol=str(row.get("native_symbol") or "").strip() or fallback.native_symbol,

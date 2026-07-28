@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 
+from app.services.collection_evm_gas_estimator import (
+    EvmGasEstimateResult,
+    SUPPORTED_EVM_GAS_ESTIMATE_CHAINS,
+    bounded_dynamic_gas_buffer,
+    estimate_erc20_transfer_gas_native,
+)
+
 
 DEFAULT_MIN_COLLECT_USDT = {
     "bsc": Decimal("10"),
@@ -189,6 +196,7 @@ def compute_gas_topup_amount(
     chain_key: str,
     current_native_balance: Decimal,
     estimated_required_native: Decimal,
+    estimate_source: Optional[str] = None,
     coin_symbol: Optional[str] = None,
     db=None,
 ) -> GasEvaluationResult:
@@ -197,7 +205,7 @@ def compute_gas_topup_amount(
     current_balance = _to_decimal(current_native_balance)
     estimated_required = _to_decimal(estimated_required_native)
     gas_topup_mode = "DEFAULT"
-    estimate_source = "DEFAULT"
+    resolved_estimate_source = (estimate_source or "DEFAULT").strip().upper()
     min_multiplier = _env_decimal("COLLECTION_GAS_TOPUP_MIN_MULTIPLIER", Decimal("2"))
     safe_multiplier = _env_decimal("COLLECTION_GAS_TOPUP_SAFE_MULTIPLIER", Decimal("3"))
     buffer_amount = _env_decimal(
@@ -218,12 +226,13 @@ def compute_gas_topup_amount(
             chain_key=ck,
             token_symbol=coin_symbol,
             estimated_required_native=estimated_required,
+            estimate_source=resolved_estimate_source,
         )
         gas_topup_mode = str(params.get("gas_topup_mode") or "DEFAULT").upper()
-        estimate_source = str(params.get("estimate_source") or "DEFAULT").upper()
+        resolved_estimate_source = str(params.get("estimate_source") or "DEFAULT").upper()
         estimated_required = _to_decimal(params.get("estimated_required_native"))
         safe_multiplier = _to_decimal(params.get("safe_multiplier"))
-        buffer_amount = _to_decimal(params.get("buffer"))
+        buffer_amount = _to_decimal(params.get("effective_buffer", params.get("buffer")))
         cap_amount = _to_decimal(params.get("cap"))
         min_topup_amount = _to_decimal(params.get("min_topup"))
         max_topup_amount = _to_decimal(params.get("max_topup"))
@@ -235,7 +244,7 @@ def compute_gas_topup_amount(
             chain_key=ck,
             gas_coin_symbol=gas_coin_symbol,
             gas_topup_mode=gas_topup_mode,
-            estimate_source=estimate_source,
+            estimate_source=resolved_estimate_source,
             current_native_balance=current_balance,
             estimated_required_native=estimated_required,
             target_native_balance=current_balance,
@@ -246,6 +255,11 @@ def compute_gas_topup_amount(
         min_required = cap_amount
         target_balance = cap_amount
     else:
+        buffer_amount = bounded_dynamic_gas_buffer(
+            configured_buffer=buffer_amount,
+            estimated_required_native=estimated_required,
+            estimate_source=resolved_estimate_source,
+        )
         min_required = estimated_required * min_multiplier
         target_balance = estimated_required * safe_multiplier + buffer_amount
     if current_balance >= min_required:
@@ -255,7 +269,7 @@ def compute_gas_topup_amount(
             chain_key=ck,
             gas_coin_symbol=gas_coin_symbol,
             gas_topup_mode=gas_topup_mode,
-            estimate_source=estimate_source,
+            estimate_source=resolved_estimate_source,
             current_native_balance=current_balance,
             estimated_required_native=estimated_required,
             target_native_balance=target_balance,
@@ -274,7 +288,7 @@ def compute_gas_topup_amount(
             chain_key=ck,
             gas_coin_symbol=gas_coin_symbol,
             gas_topup_mode=gas_topup_mode,
-            estimate_source=estimate_source,
+            estimate_source=resolved_estimate_source,
             current_native_balance=current_balance,
             estimated_required_native=estimated_required,
             target_native_balance=target_balance,
@@ -287,7 +301,7 @@ def compute_gas_topup_amount(
         chain_key=ck,
         gas_coin_symbol=gas_coin_symbol,
         gas_topup_mode=gas_topup_mode,
-        estimate_source=estimate_source,
+        estimate_source=resolved_estimate_source,
         current_native_balance=current_balance,
         estimated_required_native=estimated_required,
         target_native_balance=target_balance,
@@ -302,20 +316,66 @@ def estimate_token_transfer_gas_native(
     from_address: str,
     to_address: str,
     amount: Decimal,
+    token_decimals: int = 18,
+    db=None,
 ) -> Decimal:
+    return estimate_token_transfer_gas_native_details(
+        chain_key=chain_key,
+        token_contract_address=token_contract_address,
+        token_decimals=token_decimals,
+        from_address=from_address,
+        to_address=to_address,
+        amount=amount,
+        db=db,
+    ).estimated_native_fee
+
+
+def estimate_token_transfer_gas_native_details(
+    *,
+    chain_key: str,
+    token_contract_address: str,
+    token_decimals: int,
+    from_address: str,
+    to_address: str,
+    amount: Decimal,
+    db=None,
+) -> EvmGasEstimateResult:
+    return estimate_erc20_transfer_gas_native(
+        chain_key=chain_key,
+        token_contract_address=token_contract_address,
+        token_decimals=token_decimals,
+        from_address=from_address,
+        to_address=to_address,
+        amount=amount,
+        db=db,
+    )
+
+
+def _fixed_gas_estimate(chain_key: str) -> Decimal:
     ck = _normalize_chain_key(chain_key)
-    if not (token_contract_address or "").strip():
-        raise ValueError("token_contract_address is required")
-    if not (from_address or "").strip():
-        raise ValueError("from_address is required")
-    if not (to_address or "").strip():
-        raise ValueError("to_address is required")
-    if _to_decimal(amount) <= 0:
-        raise ValueError("amount must be > 0")
     return _env_decimal(
         _chain_env_name("COLLECTION_DEFAULT_GAS_NATIVE", ck),
         DEFAULT_GAS_NATIVE.get(ck, Decimal("0.001")),
     )
+
+
+def _fallback_token_transfer_gas_native(
+    *,
+    chain_key: str,
+    coin_symbol: str,
+    db=None,
+) -> tuple[Decimal, str]:
+    if db is not None:
+        try:
+            from app.services.collection_gas_config_service import load_stats_p95_native_fee
+
+            stats = load_stats_p95_native_fee(db, chain_key=chain_key, token_symbol=coin_symbol)
+            historical_fee = _to_decimal(stats.get("p95_native_fee"))
+            if historical_fee > 0:
+                return historical_fee, "STATS_P95_FALLBACK"
+        except Exception:
+            pass
+    return _fixed_gas_estimate(chain_key), "DEFAULT_FALLBACK"
 
 
 def evaluate_collection_candidate(
@@ -327,6 +387,7 @@ def evaluate_collection_candidate(
     token_balance: Decimal,
     native_balance: Decimal,
     token_contract_address: Optional[str] = None,
+    token_decimals: int = 18,
     estimated_gas_native: Optional[Decimal] = None,
     estimated_gas_usdt: Optional[Decimal] = None,
     min_collect_amount: Optional[Decimal] = None,
@@ -338,16 +399,8 @@ def evaluate_collection_candidate(
     token_amount = _to_decimal(token_balance)
     native_amount = _to_decimal(native_balance)
     gas_native = _to_decimal(estimated_gas_native) if estimated_gas_native is not None else None
+    gas_estimate_source = "CALLER_PROVIDED" if estimated_gas_native is not None else "NOT_EVALUATED"
     gas_usdt = _to_decimal(estimated_gas_usdt) if estimated_gas_usdt is not None else None
-
-    if gas_native is None:
-        gas_native = estimate_token_transfer_gas_native(
-            chain_key=ck,
-            token_contract_address=token_contract_address or "0x0000000000000000000000000000000000000000",
-            from_address=from_address,
-            to_address=to_address,
-            amount=max(token_amount, Decimal("0.000000000000000001")),
-        )
 
     min_collect_amount = (
         _to_decimal(min_collect_amount)
@@ -363,11 +416,34 @@ def evaluate_collection_candidate(
         min_collect_amount=min_collect_amount,
         reserve_amount=reserve_amount,
     )
+    if gas_native is None:
+        if should_collect and ck in SUPPORTED_EVM_GAS_ESTIMATE_CHAINS and (token_contract_address or "").strip():
+            try:
+                realtime_estimate = estimate_token_transfer_gas_native_details(
+                    chain_key=ck,
+                    token_contract_address=token_contract_address or "",
+                    token_decimals=token_decimals,
+                    from_address=from_address,
+                    to_address=to_address,
+                    amount=collect_amount,
+                    db=db,
+                )
+                gas_native = realtime_estimate.estimated_native_fee
+                gas_estimate_source = realtime_estimate.source
+            except Exception:
+                gas_native, gas_estimate_source = _fallback_token_transfer_gas_native(
+                    chain_key=ck,
+                    coin_symbol=symbol,
+                    db=db,
+                )
+        else:
+            gas_native = _fixed_gas_estimate(ck)
     gas_eval = compute_gas_topup_amount(
         chain_key=ck,
         coin_symbol=symbol,
         current_native_balance=native_amount,
         estimated_required_native=gas_native,
+        estimate_source=gas_estimate_source,
         db=db,
     )
 

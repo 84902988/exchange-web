@@ -174,10 +174,11 @@ test('contract header receives authoritative MarketView status and does not synt
   expect(hookSource).not.toContain('chartLastClose');
 });
 
-test('TradingView price line shares Header reference price without mutating candles', () => {
+test('TradingView price line uses candle authority with Header reference as bootstrap fallback', () => {
   const pageSource = readSource('app/contract/page.tsx');
   const stockPageSource = readSource('app/markets/stocks/[symbol]/page.tsx');
   const chartSource = readSource('components/contract/ContractTradingViewChart.tsx');
+  const datafeedSource = readSource('components/contract/tradingview/contractTradingViewDatafeed.ts');
 
   expect(pageSource).toMatch(/<ContractTradingViewChart[\s\S]*?referencePrice=\{referencePrice\}[\s\S]*?\/>/);
   expect(pageSource).not.toContain('preferReferencePriceOverlay=');
@@ -191,6 +192,9 @@ test('TradingView price line shares Header reference price without mutating cand
   expect(chartSource).toContain('latestKlineOverlayRef.current = {');
   expect(chartSource).toContain('latestKlineOverlayRef.current.price,');
   expect(chartSource).toContain('onLatestKlineCloseChangeRef.current?.(price);');
+  expect(datafeedSource).toMatch(
+    /activeSubscription\.callback\(nextBar\);\s*notifyLatestBar\(nextBar\);/,
+  );
 });
 
 test('contract TradingView and OrderBook share one referencePrice contract', () => {

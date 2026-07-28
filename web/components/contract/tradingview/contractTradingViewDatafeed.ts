@@ -839,6 +839,22 @@ export function hasExplicitContractHistoryTerminalEvidence(result: unknown) {
   ].includes(cacheStatus);
 }
 
+export function shouldRetryInitialContractHistory(result: unknown) {
+  const record = toRecord(result);
+  return Boolean(
+    record
+    && Array.isArray(record.items)
+    && record.items.length === 0
+    && record.retryable === true
+    && !hasExplicitContractHistoryTerminalEvidence(record)
+  );
+}
+
+function waitForContractKlineInitialRetry() {
+  if (typeof window === 'undefined') return Promise.resolve();
+  return new Promise<void>((resolve) => window.setTimeout(resolve, 350));
+}
+
 export function shouldReportContractHistoryNoData(result: unknown) {
   const record = toRecord(result);
   return Boolean(
@@ -1833,6 +1849,17 @@ export function createContractTradingViewDatafeed({
           }
           result = await loadBars(Date.now() + policy.historyChainDeadlineMs);
         }
+        if (
+          firstDataRequest
+          && result.bars.length === 0
+          && shouldRetryInitialContractHistory(result.lastMetadata)
+          && requestGuard.isActive(requestToken)
+        ) {
+          await waitForContractKlineInitialRetry();
+          if (requestGuard.isActive(requestToken)) {
+            result = await loadBars(Date.now() + policy.historyChainDeadlineMs);
+          }
+        }
         const bars = result.bars
           .filter((bar) => bar.time < toTimeMs)
           .slice(-requiredBars);
@@ -2153,8 +2180,8 @@ export function createContractTradingViewDatafeed({
         );
         activeSubscription.lastEmittedBarFingerprint = fingerprint;
         latestBars.set(latestBarKey, nextBar);
-        notifyLatestBar(nextBar);
         activeSubscription.callback(nextBar);
+        notifyLatestBar(nextBar);
         return true;
       };
 

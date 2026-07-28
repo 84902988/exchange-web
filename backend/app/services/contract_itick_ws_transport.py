@@ -22,6 +22,36 @@ from app.services.contract_itick_ws_subscription_plan import (
 logger = logging.getLogger(__name__)
 
 
+ITICK_WS_AUTH_TIMEOUT_SECONDS = 10.0
+ITICK_WS_HEARTBEAT_INTERVAL_SECONDS = 30.0
+ITICK_WS_RECEIVE_POLL_SECONDS = 1.0
+
+
+def _monotonic_seconds() -> float:
+    return time.monotonic()
+
+
+def _itick_control_response(raw_message: Any) -> Optional[tuple[str, str, str]]:
+    try:
+        message = (
+            json.loads(raw_message)
+            if isinstance(raw_message, (str, bytes, bytearray))
+            else raw_message
+        )
+    except Exception:
+        return None
+    if not isinstance(message, dict):
+        return None
+    action = str(message.get("resAc") or "").strip().lower()
+    if not action:
+        return None
+    return (
+        action,
+        str(message.get("code") or "").strip(),
+        str(message.get("msg") or "").strip(),
+    )
+
+
 @dataclass(frozen=True)
 class ItickWsTransportCommand:
     action: str
@@ -46,13 +76,22 @@ def build_itick_transport_commands(
     for stream in sorted(ITICK_WS_STREAMS):
         previous_symbols = set(previous.symbols_for(stream))
         current_symbols = set(current.symbols_for(stream))
-        removed = tuple(sorted(previous_symbols - current_symbols))
         added = tuple(sorted(current_symbols - previous_symbols))
-        if removed:
-            commands.append(ItickWsTransportCommand("unsubscribe", stream, removed))
         if added:
             commands.append(ItickWsTransportCommand("subscribe", stream, added))
     return tuple(commands)
+
+
+def itick_plan_requires_reconnect(
+    previous: ItickWsMarketPlan,
+    current: ItickWsMarketPlan,
+) -> bool:
+    if previous.market != current.market:
+        raise ValueError("cannot compare iTick websocket plans from different markets")
+    for stream in ITICK_WS_STREAMS:
+        if set(previous.symbols_for(stream)) - set(current.symbols_for(stream)):
+            return True
+    return False
 
 
 def itick_reconnect_delay_seconds(attempt: int, *, jitter: float = 0.0) -> float:
@@ -222,6 +261,7 @@ class ItickSharedWsTransport:
             desired = self._plan.market_plan(market)
             if not desired.symbols_by_stream:
                 return
+            wake.clear()
             try:
                 await self._run_connected(market, stop, wake)
                 attempt = 0
@@ -239,7 +279,25 @@ class ItickSharedWsTransport:
                     delay,
                     exc,
                 )
+                wake.clear()
                 await self._wait(stop, wake, delay)
+
+    @staticmethod
+    async def _await_authenticated(websocket: Any) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + ITICK_WS_AUTH_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError("iTick websocket authentication timed out")
+            raw_message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+            control = _itick_control_response(raw_message)
+            if control is None or control[0] != "auth":
+                continue
+            if control[1] == "1":
+                return
+            reason = control[2] or "rejected"
+            raise ConnectionError(f"iTick websocket authentication failed: {reason}")
 
     async def _run_connected(
         self,
@@ -267,22 +325,45 @@ class ItickSharedWsTransport:
         empty = ItickWsMarketPlan(market=market, revision=0, symbols_by_stream=())
         applied = empty
         async with websockets.connect(url, **connect_kwargs) as websocket:
+            await self._await_authenticated(websocket)
             connection_generation = self._mark_connected(market)
+            next_heartbeat_at = _monotonic_seconds() + ITICK_WS_HEARTBEAT_INTERVAL_SECONDS
             try:
                 while not stop.is_set():
                     desired = self._plan.market_plan(market)
+                    # iTick documents subscribe and ping, but not unsubscribe.
+                    # Sending ac=unsubscribe receives "no action" and the
+                    # provider then closes the socket with code 1000. Rebuild
+                    # the physical connection whenever the applied plan loses
+                    # a symbol so the next authenticated connection can apply
+                    # the latest complete plan without an unsupported command.
+                    if itick_plan_requires_reconnect(applied, desired):
+                        return
                     for command in build_itick_transport_commands(applied, desired):
                         await websocket.send(json.dumps(command.payload(), separators=(",", ":")))
                     applied = desired
                     wake.clear()
                     if not desired.symbols_by_stream:
                         return
-                    try:
-                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        if wake.is_set():
+                    now = _monotonic_seconds()
+                    if now >= next_heartbeat_at:
+                        await websocket.send(json.dumps({
+                            "ac": "ping",
+                            "params": str(int(time.time() * 1000)),
+                        }))
+                        next_heartbeat_at = now + ITICK_WS_HEARTBEAT_INTERVAL_SECONDS
+                        if stop.is_set():
                             continue
-                        await websocket.send(json.dumps({"ac": "ping", "params": str(int(time.time() * 1000))}))
+                    receive_timeout = min(
+                        ITICK_WS_RECEIVE_POLL_SECONDS,
+                        max(0.05, next_heartbeat_at - now),
+                    )
+                    try:
+                        raw_message = await asyncio.wait_for(
+                            websocket.recv(),
+                            timeout=receive_timeout,
+                        )
+                    except asyncio.TimeoutError:
                         continue
                     self._mark_message_received(market, connection_generation)
                     self._message_handler(market, raw_message)

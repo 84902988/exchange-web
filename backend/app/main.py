@@ -320,15 +320,6 @@ app.include_router(withdraw_send.router)
 app.include_router(me_router)
 app.include_router(user_profile_router)
 
-# =========================
-# Withdraw Tx Watcher (SENT -> SUCCESS/FAILED)
-# 说明：
-# - 需要已新增 app/jobs/withdraw_tx_watcher.py
-# - 通过环境变量控制开关，避免 reload / 多进程重复运行。
-#   ENABLE_WITHDRAW_WATCHER=1  (默认开)
-#   WITHDRAW_WATCH_INTERVAL=20 (默认 20s)
-# =========================
-_withdraw_watcher = None
 _contract_tp_sl_job: Optional[ContractTpSlJob] = None
 _contract_limit_order_job: Optional[ContractLimitOrderJob] = None
 _dealer_order_loop_thread: Optional[threading.Thread] = None
@@ -435,28 +426,9 @@ def stop_dealer_order_loop() -> None:
 
 @app.on_event("startup")
 def _startup():
-    global _withdraw_watcher, _contract_tp_sl_job, _contract_limit_order_job
-    _withdraw_watcher = None
+    global _contract_tp_sl_job, _contract_limit_order_job
     _contract_tp_sl_job = None
     _contract_limit_order_job = None
-
-    if not _env_enabled("ENABLE_WITHDRAW_WATCHER", default=True):
-        logger.info("[withdraw_watcher] disabled")
-    else:
-        try:
-            from app.jobs.withdraw_tx_watcher import WithdrawTxWatcher  # noqa: E402
-        except Exception as e:
-            logger.exception("[withdraw_watcher] import failed")
-        else:
-            try:
-                SessionLocal = _get_session_local()
-                interval = int(os.getenv("WITHDRAW_WATCH_INTERVAL", "20"))
-                _withdraw_watcher = WithdrawTxWatcher(SessionLocal, interval_seconds=interval)
-                _withdraw_watcher.start()
-                logger.info("[withdraw_watcher] started interval=%ss", interval)
-            except Exception as e:
-                logger.exception("[withdraw_watcher] start failed")
-                _withdraw_watcher = None
 
     if _env_enabled("ENABLE_SPOT_AUTO_MATCH_IN_API", default=False):
         start_auto_match_worker()
@@ -500,17 +472,6 @@ def _startup():
             _contract_limit_order_job = None
     else:
         logger.info("[contract_limit_order_job] disabled; use backend/scripts/start_contract_limit_order_scanner.py")
-
-    if _env_enabled("ENABLE_DIVIDEND_JOB", default=False):
-        try:
-            from app.jobs.dividend_job import start_dividend_job  # noqa: E402
-
-            # WARNING: dividend job should run in single instance only.
-            start_dividend_job()
-        except Exception as e:
-            logger.exception("[dividend_job] start failed")
-    else:
-        logger.info("[dividend_job] disabled")
 
     if _env_enabled("ENABLE_BD_COMMISSION_JOB", default=False):
         try:
@@ -564,7 +525,7 @@ def _startup_contract_calendar_refresh():
 
 @app.on_event("shutdown")
 def _shutdown():
-    global _withdraw_watcher, _contract_tp_sl_job, _contract_limit_order_job
+    global _contract_tp_sl_job, _contract_limit_order_job
     try:
         stop_auto_match_worker()
         stop_dealer_order_loop()
@@ -574,12 +535,6 @@ def _shutdown():
         if _contract_limit_order_job is not None:
             _contract_limit_order_job.stop()
             logger.debug("[contract_limit_order_job] stopped")
-        try:
-            from app.jobs.dividend_job import stop_dividend_job  # noqa: E402
-
-            stop_dividend_job()
-        except Exception as e:
-            logger.exception("[dividend_job] stop failed")
         try:
             stop_bd_commission_job()
         except Exception as e:
@@ -596,9 +551,6 @@ def _shutdown():
             stop_stock_dealer_trade_job()
         except Exception as e:
             logger.exception("[stock_dealer_trade_job] stop failed")
-        if _withdraw_watcher:
-            _withdraw_watcher.stop()
-            logger.debug("[withdraw_watcher] stopped")
     finally:
         try:
             from app.services.contract_market_provider_ws import stop_contract_provider_ws
@@ -612,7 +564,6 @@ def _shutdown():
             stop_spot_provider_ws()
         except Exception:
             logger.exception("[spot_market_provider_ws] stop failed")
-        _withdraw_watcher = None
         _contract_tp_sl_job = None
         _contract_limit_order_job = None
 

@@ -1,11 +1,32 @@
 import { describe, expect, it } from '@jest/globals';
 import {
   getContractTickerPrefetchSymbols,
+  getVisibleTickerPrefetchLimit,
   isTransientContractTickerStartupError,
   resolveContractSelectorTickerAuthority,
   resolveSelectorPricePrecision,
   type GlobalMarketSelectorPair,
 } from './GlobalMarketSelector';
+
+describe('selector ticker scroll prefetch', () => {
+  it('expands to the batch covering the current stock viewport before the list bottom', () => {
+    expect(getVisibleTickerPrefetchLimit({
+      scrollTop: 20 * 58,
+      clientHeight: 5 * 58,
+      pairCount: 101,
+      batchSize: 20,
+    })).toBe(60);
+  });
+
+  it('caps deep-scroll prefetch at the available pair count', () => {
+    expect(getVisibleTickerPrefetchLimit({
+      scrollTop: 95 * 58,
+      clientHeight: 5 * 58,
+      pairCount: 101,
+      batchSize: 20,
+    })).toBe(101);
+  });
+});
 
 describe('contract selector ticker startup retry policy', () => {
   it.each([502, 503, 504])('retries transient HTTP %s proxy failures', (status) => {
@@ -16,6 +37,16 @@ describe('contract selector ticker startup retry policy', () => {
     expect(isTransientContractTickerStartupError(Object.assign(new Error('Network error'), { code: 'NETWORK_ERROR' }))).toBe(true);
     expect(isTransientContractTickerStartupError(new Error('HTTP Error 404: Not Found'))).toBe(false);
     expect(isTransientContractTickerStartupError(new DOMException('Aborted', 'AbortError'))).toBe(false);
+  });
+
+  it('does not retry an abort wrapped by the shared API request layer', () => {
+    const wrappedAbort = Object.assign(new Error('signal is aborted without reason'), {
+      name: 'ApiError',
+      code: 'NETWORK_ERROR',
+      originalError: new DOMException('Aborted', 'AbortError'),
+    });
+
+    expect(isTransientContractTickerStartupError(wrappedAbort)).toBe(false);
   });
 });
 

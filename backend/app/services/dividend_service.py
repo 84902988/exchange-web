@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -10,7 +12,13 @@ from sqlalchemy.orm import Session
 
 from app.db.models.asset import BalanceLog, UserBalance
 from app.db.models.bd_commission_record import BdCommissionRecord
-from app.db.models.dividend import DividendPool, DividendPoolItem, UserDividendRecord
+from app.db.models.dividend import (
+    DividendEligibilitySnapshot,
+    DividendEligibilitySnapshotItem,
+    DividendPool,
+    DividendPoolItem,
+    UserDividendRecord,
+)
 from app.db.models.system_config import SystemConfig
 from app.db.models.user_invite_commission_record import UserInviteCommissionRecord
 from app.db.models.user_rcb_lock import UserRcbLock
@@ -18,13 +26,17 @@ from app.db.models.vip_fee_level import VipFeeLevel
 from app.db.models.vip_fee_level_condition import VipFeeLevelCondition
 from app.services.balance import FUNDING_BALANCE_CHAIN_KEY
 from app.services.fee_service import PLATFORM_USER_ID
-from app.services.rcb_price_service import get_rcb_price_usdt
+from app.services.rcb_price_service import get_rcb_price_snapshot_usdt
 
 
 DIVIDEND_RUN_TIME_KEY = "dividend_run_time_utc"
 DIVIDEND_RCB_PRICE_SNAPSHOT_TIME_KEY = "dividend_rcb_price_snapshot_time"
 DEFAULT_DIVIDEND_RUN_TIME_UTC = "00:10"
 DEFAULT_DIVIDEND_RCB_PRICE_SNAPSHOT_TIME_UTC = "00:00"
+DIVIDEND_ELIGIBILITY_SNAPSHOT_TIME_UTC = "00:00"
+DIVIDEND_ELIGIBILITY_SNAPSHOT_CAPTURE_GRACE_MINUTES = 15
+MIN_DIVIDEND_RUN_DELAY_MINUTES = 5
+DIVIDEND_RECOVERY_LOOKBACK_DAYS = 60
 RUN_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 SVIP_DIVIDEND_LEVEL_CODES = (
     "SVIP1",
@@ -54,6 +66,44 @@ def _validate_run_time(run_time_utc: str, field_name: str = "dividend run time")
     return value
 
 
+def _minutes_after_midnight(value: str) -> int:
+    hour_text, minute_text = value.split(":", 1)
+    return int(hour_text) * 60 + int(minute_text)
+
+
+def _validate_dividend_schedule(run_time_utc: str, price_snapshot_time_utc: str) -> tuple[str, str]:
+    value = _validate_run_time(run_time_utc, "dividend run time")
+    snapshot_value = _validate_run_time(price_snapshot_time_utc, "RCB price snapshot time")
+    required_run_minute = _minutes_after_midnight(snapshot_value) + MIN_DIVIDEND_RUN_DELAY_MINUTES
+    if _minutes_after_midnight(value) < required_run_minute:
+        raise ValueError(
+            "dividend run time must be at least "
+            f"{MIN_DIVIDEND_RUN_DELAY_MINUTES} minutes after the RCB price snapshot"
+        )
+    return value, snapshot_value
+
+
+def _get_time_config_value(db: Session, config_key: str, default_value: str) -> str:
+    value = (
+        db.query(SystemConfig.config_value)
+        .filter(SystemConfig.config_key == config_key)
+        .scalar()
+    )
+    return str(value or default_value).strip()
+
+
+def get_dividend_rcb_price_snapshot_at(
+    dividend_date: date,
+    snapshot_time_utc: str,
+) -> datetime:
+    normalized = _validate_run_time(snapshot_time_utc, "RCB price snapshot time")
+    hour_text, minute_text = normalized.split(":", 1)
+    return datetime.combine(
+        dividend_date + timedelta(days=1),
+        datetime.min.time(),
+    ).replace(hour=int(hour_text), minute=int(minute_text))
+
+
 def get_dividend_config(db: Session) -> dict[str, Any]:
     configs = {
         item.config_key: item
@@ -77,6 +127,8 @@ def get_dividend_config(db: Session) -> dict[str, Any]:
     return {
         "run_time_utc": run_time,
         "rcb_price_snapshot_time": snapshot_time,
+        "eligibility_snapshot_time_utc": DIVIDEND_ELIGIBILITY_SNAPSHOT_TIME_UTC,
+        "minimum_run_delay_minutes": MIN_DIVIDEND_RUN_DELAY_MINUTES,
         "description": run_time_config.description if run_time_config else "Daily dividend run time in UTC/GMT",
         "rcb_price_snapshot_description": (
             snapshot_time_config.description
@@ -119,7 +171,12 @@ def _set_dividend_time_config(
 
 
 def set_dividend_run_time(db: Session, run_time_utc: str) -> SystemConfig:
-    run_time = _validate_run_time(run_time_utc, "dividend run time")
+    price_snapshot_time = _get_time_config_value(
+        db,
+        DIVIDEND_RCB_PRICE_SNAPSHOT_TIME_KEY,
+        DEFAULT_DIVIDEND_RCB_PRICE_SNAPSHOT_TIME_UTC,
+    )
+    run_time, _ = _validate_dividend_schedule(run_time_utc, price_snapshot_time)
     return _set_dividend_time_config(
         db,
         config_key=DIVIDEND_RUN_TIME_KEY,
@@ -130,12 +187,43 @@ def set_dividend_run_time(db: Session, run_time_utc: str) -> SystemConfig:
 
 def set_dividend_rcb_price_snapshot_time(db: Session, snapshot_time_utc: str) -> SystemConfig:
     snapshot_time = _validate_run_time(snapshot_time_utc, "RCB price snapshot time")
+    run_time = _get_time_config_value(
+        db,
+        DIVIDEND_RUN_TIME_KEY,
+        DEFAULT_DIVIDEND_RUN_TIME_UTC,
+    )
+    _validate_dividend_schedule(run_time, snapshot_time)
     return _set_dividend_time_config(
         db,
         config_key=DIVIDEND_RCB_PRICE_SNAPSHOT_TIME_KEY,
         config_value=snapshot_time,
         description="Daily RCBUSDT price snapshot time in UTC/GMT, HH:MM",
     )
+
+
+def set_dividend_schedule(
+    db: Session,
+    *,
+    run_time_utc: str,
+    rcb_price_snapshot_time_utc: str,
+) -> tuple[SystemConfig, SystemConfig]:
+    run_time, snapshot_time = _validate_dividend_schedule(
+        run_time_utc,
+        rcb_price_snapshot_time_utc,
+    )
+    run_config = _set_dividend_time_config(
+        db,
+        config_key=DIVIDEND_RUN_TIME_KEY,
+        config_value=run_time,
+        description="Daily dividend run time in UTC/GMT, HH:MM",
+    )
+    snapshot_config = _set_dividend_time_config(
+        db,
+        config_key=DIVIDEND_RCB_PRICE_SNAPSHOT_TIME_KEY,
+        config_value=snapshot_time,
+        description="Daily RCBUSDT price snapshot time in UTC/GMT, HH:MM",
+    )
+    return run_config, snapshot_config
 
 
 def get_target_dividend_date(now_utc: datetime) -> date:
@@ -395,17 +483,39 @@ def create_dividend_pool_skeleton(
     if existing is not None:
         return existing
 
+    require_dividend_eligibility_snapshot(db, dividend_date)
     now = _utc_now()
-    normalized_rcb_price = (
-        get_rcb_price_usdt(db)
-        if rcb_price is None
-        else _q18(_decimal_or_zero(rcb_price))
-    )
+    price_snapshot_at: Optional[datetime] = None
+    price_source_trade_id: Optional[int] = None
+    price_source_trade_at: Optional[datetime] = None
+    if rcb_price is None:
+        config = get_dividend_config(db)
+        price_snapshot_at = get_dividend_rcb_price_snapshot_at(
+            dividend_date,
+            str(
+                config.get("rcb_price_snapshot_time")
+                or DEFAULT_DIVIDEND_RCB_PRICE_SNAPSHOT_TIME_UTC
+            ),
+        )
+        if now < price_snapshot_at:
+            raise ValueError(
+                "DIVIDEND_RCB_PRICE_SNAPSHOT_NOT_DUE: "
+                f"snapshot_at={price_snapshot_at.isoformat()}"
+            )
+        normalized_rcb_price, price_source_trade_id, price_source_trade_at = get_rcb_price_snapshot_usdt(
+            db,
+            price_snapshot_at,
+        )
+    else:
+        normalized_rcb_price = _q18(_decimal_or_zero(rcb_price))
     total_fee_usdt = calculate_total_fee_usdt(db, dividend_date, normalized_rcb_price)
     pool = DividendPool(
         dividend_date=dividend_date,
         total_fee_usdt=total_fee_usdt,
         rcb_price_used=normalized_rcb_price,
+        rcb_price_snapshot_at=price_snapshot_at,
+        rcb_price_source_trade_id=price_source_trade_id,
+        rcb_price_source_trade_at=price_source_trade_at,
         total_dividend_usdt=_q18(Decimal("0")),
         total_dividend_rcb=_q18(Decimal("0")),
         status="PENDING",
@@ -447,13 +557,32 @@ def _load_svip_level_rules(db: Session) -> dict[str, dict[str, Any]]:
     }
 
 
-def _load_eligible_svip_users(db: Session, dividend_date: date) -> dict[str, list[int]]:
+def get_dividend_eligibility_snapshot_at(dividend_date: date) -> datetime:
+    return datetime.combine(dividend_date + timedelta(days=1), datetime.min.time())
+
+
+def is_dividend_eligibility_snapshot_capture_window(
+    dividend_date: date,
+    now_utc: datetime,
+) -> bool:
+    snapshot_at = get_dividend_eligibility_snapshot_at(dividend_date)
+    capture_deadline = snapshot_at + timedelta(
+        minutes=DIVIDEND_ELIGIBILITY_SNAPSHOT_CAPTURE_GRACE_MINUTES,
+    )
+    return snapshot_at <= now_utc < capture_deadline
+
+
+def _calculate_eligible_svip_users_at(
+    db: Session,
+    snapshot_at: datetime,
+) -> dict[str, list[dict[str, Any]]]:
     rules = _load_svip_level_rules(db)
-    users_by_level: dict[str, list[int]] = {level_code: [] for level_code in SVIP_DIVIDEND_LEVEL_CODES}
+    users_by_level: dict[str, list[dict[str, Any]]] = {
+        level_code: [] for level_code in SVIP_DIVIDEND_LEVEL_CODES
+    }
     if not rules:
         return users_by_level
 
-    cutoff = datetime.combine(dividend_date, datetime.min.time())
     active_locks = (
         db.query(
             UserRcbLock.user_id,
@@ -463,8 +592,8 @@ def _load_eligible_svip_users(db: Session, dividend_date: date) -> dict[str, lis
         .filter(
             UserRcbLock.asset_symbol == "RCB",
             UserRcbLock.status == "LOCKED",
-            UserRcbLock.start_time < cutoff,
-            UserRcbLock.end_time >= cutoff,
+            UserRcbLock.start_time < snapshot_at,
+            UserRcbLock.end_time >= snapshot_at,
         )
         .all()
     )
@@ -479,6 +608,8 @@ def _load_eligible_svip_users(db: Session, dividend_date: date) -> dict[str, lis
     )
     for user_id, period_amounts in user_period_amounts.items():
         matched_level: Optional[str] = None
+        matched_amount = Decimal("0")
+        matched_rule: dict[str, Any] = {}
         for level_code, rule in sorted_rules:
             eligible_amount = sum(
                 amount
@@ -487,15 +618,395 @@ def _load_eligible_svip_users(db: Session, dividend_date: date) -> dict[str, lis
             )
             if eligible_amount >= rule["min_lock_amount"]:
                 matched_level = level_code
+                matched_amount = eligible_amount
+                matched_rule = rule
         if matched_level is not None:
-            users_by_level[matched_level].append(user_id)
+            users_by_level[matched_level].append(
+                {
+                    "user_id": int(user_id),
+                    "level_code": matched_level,
+                    "qualified_lock_amount": _q18(matched_amount),
+                    "required_lock_amount": _q18(matched_rule["min_lock_amount"]),
+                    "required_lock_period_days": int(matched_rule["lock_period_days"] or 0),
+                    "dividend_rate": _q18(
+                        matched_rule.get("dividend_rate") or SVIP_DIVIDEND_RATE
+                    ),
+                }
+            )
 
-    for level_code, user_ids in users_by_level.items():
+    for level_code, user_rows in users_by_level.items():
         user_limit = rules.get(level_code, {}).get("user_limit")
-        if user_limit is not None and int(user_limit) > 0 and len(user_ids) > int(user_limit):
+        if user_limit is not None and int(user_limit) > 0 and len(user_rows) > int(user_limit):
             raise ValueError(f"{level_code} eligible user count exceeds limit")
 
     return users_by_level
+
+
+def capture_dividend_eligibility_snapshot(
+    db: Session,
+    dividend_date: date,
+    *,
+    now_utc: Optional[datetime] = None,
+    source: str = "AUTO",
+    created_by: Optional[int] = None,
+    allow_outside_window: bool = False,
+) -> tuple[DividendEligibilitySnapshot, bool]:
+    existing = (
+        db.query(DividendEligibilitySnapshot)
+        .filter(DividendEligibilitySnapshot.dividend_date == dividend_date)
+        .with_for_update()
+        .first()
+    )
+    if existing is not None:
+        if str(existing.status or "").upper() != "READY":
+            raise ValueError("DIVIDEND_ELIGIBILITY_SNAPSHOT_NOT_READY")
+        return existing, False
+
+    captured_at = now_utc or _utc_now()
+    snapshot_at = get_dividend_eligibility_snapshot_at(dividend_date)
+    if (
+        not allow_outside_window
+        and not is_dividend_eligibility_snapshot_capture_window(dividend_date, captured_at)
+    ):
+        raise ValueError(
+            "DIVIDEND_ELIGIBILITY_SNAPSHOT_WINDOW_CLOSED: "
+            f"date={dividend_date.isoformat()} snapshot_at={snapshot_at.isoformat()}"
+        )
+    if allow_outside_window and dividend_date >= captured_at.date():
+        raise ValueError("DIVIDEND_RECOVERY_DATE_NOT_FINISHED")
+
+    users_by_level = _calculate_eligible_svip_users_at(db, snapshot_at)
+    eligible_rows = [
+        row
+        for level_code in SVIP_DIVIDEND_LEVEL_CODES
+        for row in users_by_level.get(level_code, [])
+    ]
+    snapshot = DividendEligibilitySnapshot(
+        dividend_date=dividend_date,
+        snapshot_at=snapshot_at,
+        status="READY",
+        source=str(source or "AUTO").strip().upper()[:20],
+        created_by=int(created_by) if created_by is not None else None,
+        eligible_user_count=len(eligible_rows),
+        created_at=captured_at,
+    )
+    db.add(snapshot)
+    db.flush()
+
+    for row in eligible_rows:
+        db.add(
+            DividendEligibilitySnapshotItem(
+                snapshot_id=int(snapshot.id),
+                user_id=int(row["user_id"]),
+                level_code=str(row["level_code"]),
+                qualified_lock_amount=_q18(row["qualified_lock_amount"]),
+                required_lock_amount=_q18(row["required_lock_amount"]),
+                required_lock_period_days=int(row["required_lock_period_days"]),
+                dividend_rate=_q18(row["dividend_rate"]),
+                created_at=captured_at,
+            )
+        )
+    db.flush()
+    return snapshot, True
+
+
+def capture_due_dividend_eligibility_snapshot(
+    db: Session,
+    now_utc: Optional[datetime] = None,
+) -> tuple[Optional[DividendEligibilitySnapshot], bool]:
+    now = now_utc or _utc_now()
+    dividend_date = now.date() - timedelta(days=1)
+    if not is_dividend_eligibility_snapshot_capture_window(dividend_date, now):
+        return None, False
+    return capture_dividend_eligibility_snapshot(db, dividend_date, now_utc=now)
+
+
+def require_dividend_eligibility_snapshot(
+    db: Session,
+    dividend_date: date,
+) -> tuple[DividendEligibilitySnapshot, list[DividendEligibilitySnapshotItem]]:
+    snapshot = (
+        db.query(DividendEligibilitySnapshot)
+        .filter(DividendEligibilitySnapshot.dividend_date == dividend_date)
+        .first()
+    )
+    if snapshot is None:
+        raise ValueError(
+            "DIVIDEND_ELIGIBILITY_SNAPSHOT_MISSING: "
+            f"date={dividend_date.isoformat()}; historical rerun cannot use current lock state"
+        )
+    if str(snapshot.status or "").upper() != "READY":
+        raise ValueError("DIVIDEND_ELIGIBILITY_SNAPSHOT_NOT_READY")
+
+    items = (
+        db.query(DividendEligibilitySnapshotItem)
+        .filter(DividendEligibilitySnapshotItem.snapshot_id == int(snapshot.id))
+        .order_by(DividendEligibilitySnapshotItem.id.asc())
+        .all()
+    )
+    if len(items) != int(snapshot.eligible_user_count or 0):
+        raise ValueError(
+            "DIVIDEND_ELIGIBILITY_SNAPSHOT_INCOMPLETE: "
+            f"expected={int(snapshot.eligible_user_count or 0)} actual={len(items)}"
+        )
+    return snapshot, items
+
+
+def _dividend_recovery_decimal(value: Any) -> str:
+    return format(_q18(_decimal_or_zero(value)), "f")
+
+
+def _dividend_recovery_eligibility_rows(
+    db: Session,
+    dividend_date: date,
+) -> tuple[Optional[DividendEligibilitySnapshot], str, list[dict[str, Any]]]:
+    snapshot = (
+        db.query(DividendEligibilitySnapshot)
+        .filter(DividendEligibilitySnapshot.dividend_date == dividend_date)
+        .first()
+    )
+    if snapshot is not None:
+        snapshot, items = require_dividend_eligibility_snapshot(db, dividend_date)
+        rows = [
+            {
+                "user_id": int(item.user_id),
+                "level_code": str(item.level_code or "").upper(),
+                "qualified_lock_amount": _q18(item.qualified_lock_amount),
+                "required_lock_amount": _q18(item.required_lock_amount),
+                "required_lock_period_days": int(item.required_lock_period_days or 0),
+                "dividend_rate": _q18(item.dividend_rate or SVIP_DIVIDEND_RATE),
+            }
+            for item in items
+        ]
+        return snapshot, str(snapshot.source or "AUTO").upper(), rows
+
+    users_by_level = _calculate_eligible_svip_users_at(
+        db,
+        get_dividend_eligibility_snapshot_at(dividend_date),
+    )
+    rows = [
+        row
+        for level_code in SVIP_DIVIDEND_LEVEL_CODES
+        for row in users_by_level.get(level_code, [])
+    ]
+    return None, "OPS_RECONSTRUCTED", rows
+
+
+def list_dividend_recovery_candidates(
+    db: Session,
+    *,
+    now_utc: Optional[datetime] = None,
+    lookback_days: int = DIVIDEND_RECOVERY_LOOKBACK_DAYS,
+) -> list[dict[str, Any]]:
+    now = now_utc or _utc_now()
+    yesterday = now.date() - timedelta(days=1)
+    bounded_days = min(max(int(lookback_days or 1), 1), 366)
+    start_date = yesterday - timedelta(days=bounded_days - 1)
+    existing_pool_dates = {
+        row[0]
+        for row in (
+            db.query(DividendPool.dividend_date)
+            .filter(
+                DividendPool.dividend_date >= start_date,
+                DividendPool.dividend_date <= yesterday,
+            )
+            .all()
+        )
+    }
+    snapshots = {
+        item.dividend_date: item
+        for item in (
+            db.query(DividendEligibilitySnapshot)
+            .filter(
+                DividendEligibilitySnapshot.dividend_date >= start_date,
+                DividendEligibilitySnapshot.dividend_date <= yesterday,
+            )
+            .all()
+        )
+    }
+    candidates: list[dict[str, Any]] = []
+    current = yesterday
+    while current >= start_date:
+        if current not in existing_pool_dates:
+            snapshot = snapshots.get(current)
+            candidates.append(
+                {
+                    "dividend_date": current.isoformat(),
+                    "snapshot_source": (
+                        str(snapshot.source or "AUTO").upper()
+                        if snapshot is not None
+                        else "OPS_RECONSTRUCTED"
+                    ),
+                    "snapshot_label": (
+                        "已有每日资格快照"
+                        if snapshot is not None
+                        else "提交时自动重建资格"
+                    ),
+                }
+            )
+        current -= timedelta(days=1)
+    return candidates
+
+
+def build_dividend_recovery_preview(
+    db: Session,
+    dividend_date: date,
+    *,
+    now_utc: Optional[datetime] = None,
+) -> dict[str, Any]:
+    now = now_utc or _utc_now()
+    if dividend_date >= now.date():
+        raise ValueError("DIVIDEND_RECOVERY_DATE_NOT_FINISHED")
+
+    existing_pool = (
+        db.query(DividendPool)
+        .filter(DividendPool.dividend_date == dividend_date)
+        .first()
+    )
+    if existing_pool is not None:
+        raise ValueError(
+            "DIVIDEND_RECOVERY_POOL_ALREADY_EXISTS: "
+            f"pool_id={int(existing_pool.id)} status={str(existing_pool.status or '').upper()}"
+        )
+
+    snapshot, snapshot_source, eligibility_rows = _dividend_recovery_eligibility_rows(
+        db,
+        dividend_date,
+    )
+    config = get_dividend_config(db)
+    price_snapshot_at = get_dividend_rcb_price_snapshot_at(
+        dividend_date,
+        str(
+            config.get("rcb_price_snapshot_time")
+            or DEFAULT_DIVIDEND_RCB_PRICE_SNAPSHOT_TIME_UTC
+        ),
+    )
+    if now < price_snapshot_at:
+        raise ValueError("DIVIDEND_RCB_PRICE_SNAPSHOT_NOT_DUE")
+    rcb_price, price_trade_id, price_trade_at = get_rcb_price_snapshot_usdt(
+        db,
+        price_snapshot_at,
+    )
+    total_fee_usdt = calculate_total_fee_usdt(db, dividend_date, rcb_price)
+    rules = _load_svip_level_rules(db)
+    rows_by_level: dict[str, list[dict[str, Any]]] = {
+        level_code: [] for level_code in SVIP_DIVIDEND_LEVEL_CODES
+    }
+    for row in eligibility_rows:
+        level_code = str(row.get("level_code") or "").upper()
+        if level_code not in rows_by_level:
+            raise ValueError(f"unsupported dividend recovery level: {level_code or 'UNKNOWN'}")
+        rows_by_level[level_code].append(row)
+
+    level_previews: list[dict[str, Any]] = []
+    user_previews: list[dict[str, Any]] = []
+    total_credit_usdt = Decimal("0")
+    total_credit_rcb = Decimal("0")
+    for level_code in SVIP_DIVIDEND_LEVEL_CODES:
+        user_rows = sorted(rows_by_level[level_code], key=lambda row: int(row["user_id"]))
+        level_rule = rules.get(level_code, {})
+        snapshot_rates = {
+            _q18(row.get("dividend_rate") or SVIP_DIVIDEND_RATE)
+            for row in user_rows
+        }
+        if len(snapshot_rates) > 1:
+            raise ValueError(f"inconsistent dividend rates in snapshot for {level_code}")
+        dividend_rate = (
+            next(iter(snapshot_rates))
+            if snapshot_rates
+            else _q18(level_rule.get("dividend_rate") or SVIP_DIVIDEND_RATE)
+        )
+        level_fee_usdt = _q18(total_fee_usdt * dividend_rate)
+        user_count = len(user_rows)
+        per_user_usdt = (
+            _q18(level_fee_usdt / Decimal(user_count))
+            if user_count > 0
+            else Decimal("0")
+        )
+        per_user_rcb = (
+            _q18(per_user_usdt / rcb_price)
+            if user_count > 0
+            else Decimal("0")
+        )
+        level_credit_usdt = _q18(per_user_usdt * Decimal(user_count))
+        level_credit_rcb = _q18(per_user_rcb * Decimal(user_count))
+        total_credit_usdt += level_credit_usdt
+        total_credit_rcb += level_credit_rcb
+        level_previews.append(
+            {
+                "level_code": level_code,
+                "dividend_rate": _dividend_recovery_decimal(dividend_rate),
+                "eligible_user_count": user_count,
+                "level_fee_usdt": _dividend_recovery_decimal(level_fee_usdt),
+                "per_user_usdt": _dividend_recovery_decimal(per_user_usdt),
+                "per_user_rcb": _dividend_recovery_decimal(per_user_rcb),
+                "credit_rcb": _dividend_recovery_decimal(level_credit_rcb),
+            }
+        )
+        for row in user_rows:
+            user_previews.append(
+                {
+                    "user_id": int(row["user_id"]),
+                    "level_code": level_code,
+                    "qualified_lock_amount": _dividend_recovery_decimal(
+                        row["qualified_lock_amount"]
+                    ),
+                    "dividend_usdt": _dividend_recovery_decimal(per_user_usdt),
+                    "dividend_rcb": _dividend_recovery_decimal(per_user_rcb),
+                }
+            )
+
+    fingerprint_payload = {
+        "dividend_date": dividend_date.isoformat(),
+        "snapshot_source": snapshot_source,
+        "snapshot_id": int(snapshot.id) if snapshot is not None else None,
+        "price_snapshot_at": price_snapshot_at.isoformat(),
+        "price_trade_id": int(price_trade_id) if price_trade_id is not None else None,
+        "price_trade_at": price_trade_at.isoformat() if price_trade_at is not None else None,
+        "rcb_price": _dividend_recovery_decimal(rcb_price),
+        "total_fee_usdt": _dividend_recovery_decimal(total_fee_usdt),
+        "levels": level_previews,
+        "users": user_previews,
+    }
+    platform_available_rcb = _q18(
+        db.query(UserBalance.available_amount)
+        .filter(
+            UserBalance.user_id == PLATFORM_USER_ID,
+            UserBalance.coin_symbol == DIVIDEND_COIN_SYMBOL,
+            UserBalance.chain_key == DIVIDEND_BALANCE_CHAIN_KEY,
+        )
+        .scalar()
+        or Decimal("0")
+    )
+    total_credit_rcb = _q18(total_credit_rcb)
+    platform_balance_sufficient = platform_available_rcb >= total_credit_rcb
+    fingerprint_payload["platform_available_rcb"] = _dividend_recovery_decimal(
+        platform_available_rcb
+    )
+    fingerprint_payload["platform_balance_sufficient"] = platform_balance_sufficient
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        **fingerprint_payload,
+        "fingerprint": fingerprint,
+        "snapshot_label": (
+            "已有每日资格快照"
+            if snapshot is not None
+            else "系统将按历史锁仓时点自动重建资格快照"
+        ),
+        "eligible_user_count": len(user_previews),
+        "total_credit_usdt": _dividend_recovery_decimal(total_credit_usdt),
+        "total_credit_rcb": _dividend_recovery_decimal(total_credit_rcb),
+        "platform_available_rcb": _dividend_recovery_decimal(platform_available_rcb),
+        "platform_balance_sufficient": platform_balance_sufficient,
+        "can_execute": platform_balance_sufficient,
+    }
 
 
 def calculate_dividend_pool(db: Session, pool_id: int) -> DividendPool:
@@ -535,7 +1046,19 @@ def calculate_dividend_pool(db: Session, pool_id: int) -> DividendPool:
 
     now = _utc_now()
     level_rules = _load_svip_level_rules(db)
-    users_by_level = _load_eligible_svip_users(db, pool.dividend_date)
+    _, eligibility_items = require_dividend_eligibility_snapshot(db, pool.dividend_date)
+    users_by_level: dict[str, list[int]] = {level_code: [] for level_code in SVIP_DIVIDEND_LEVEL_CODES}
+    snapshot_rates_by_level: dict[str, set[Decimal]] = {
+        level_code: set() for level_code in SVIP_DIVIDEND_LEVEL_CODES
+    }
+    for eligibility_item in eligibility_items:
+        level_code = str(eligibility_item.level_code or "").upper()
+        if level_code not in users_by_level:
+            raise ValueError(f"unsupported dividend snapshot level: {level_code or 'UNKNOWN'}")
+        users_by_level[level_code].append(int(eligibility_item.user_id))
+        snapshot_rates_by_level[level_code].add(
+            _q18(eligibility_item.dividend_rate or SVIP_DIVIDEND_RATE)
+        )
     total_fee_usdt = calculate_total_fee_usdt(db, pool.dividend_date, _decimal_or_zero(pool.rcb_price_used))
     rcb_price = _decimal_or_zero(pool.rcb_price_used)
     total_dividend_usdt = Decimal("0")
@@ -545,7 +1068,14 @@ def calculate_dividend_pool(db: Session, pool_id: int) -> DividendPool:
         user_ids = sorted(set(users_by_level.get(level_code, [])))
         eligible_user_count = len(user_ids)
         level_rule = level_rules.get(level_code, {})
-        level_dividend_rate = _decimal_or_zero(level_rule.get("dividend_rate") or SVIP_DIVIDEND_RATE)
+        snapshot_rates = snapshot_rates_by_level[level_code]
+        if len(snapshot_rates) > 1:
+            raise ValueError(f"inconsistent dividend rates in snapshot for {level_code}")
+        level_dividend_rate = (
+            next(iter(snapshot_rates))
+            if snapshot_rates
+            else _decimal_or_zero(level_rule.get("dividend_rate") or SVIP_DIVIDEND_RATE)
+        )
         level_fee_usdt = _q18(total_fee_usdt * level_dividend_rate)
         total_dividend_usdt += level_fee_usdt
 

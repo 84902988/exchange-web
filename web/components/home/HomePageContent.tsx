@@ -55,48 +55,57 @@ function mapAnnouncement(item: LatestAnnouncement): NoticeItem {
 }
 
 export default function HomePageContent() {
-  const { locale, t } = useLocaleContext();
+  const { locale, t, isInitialized } = useLocaleContext();
   const [siteConfig, setSiteConfig] = useState<SiteConfig>(fallbackSiteConfig);
-  const [homeHeroMedia, setHomeHeroMedia] = useState("");
+  const [homeHeroMedia, setHomeHeroMedia] = useState(fallbackSiteConfig.home_hero_image || "");
   const [banners, setBanners] = useState<HomeBanner[]>([]);
   const [announcements, setAnnouncements] = useState<LatestAnnouncement[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (!isInitialized) return;
+
     let cancelled = false;
 
-    async function loadHomeContent() {
-      setLoading(true);
-      try {
-        const [config, bannerResult, announcementResult] = await Promise.all([
-          getSiteConfig(locale),
-          getHomeBanners(locale),
-          getLatestAnnouncements(locale),
-        ]);
-        if (cancelled) return;
-        setSiteConfig({ ...fallbackSiteConfig, ...config });
-        setHomeHeroMedia(config.home_hero_image || "");
-        setBanners(bannerResult.items || []);
-        setAnnouncements(announcementResult.items || []);
-      } catch {
+    setLoading(true);
+    const configRequest = getSiteConfig(locale)
+      .then((config) => {
+        if (!cancelled) {
+          setSiteConfig({ ...fallbackSiteConfig, ...config });
+          setHomeHeroMedia(config.home_hero_image || fallbackSiteConfig.home_hero_image || "");
+        }
+      })
+      .catch(() => {
         if (!cancelled) {
           setSiteConfig(fallbackSiteConfig);
           setHomeHeroMedia(fallbackSiteConfig.home_hero_image || "");
-          setBanners([]);
-          setAnnouncements([]);
         }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      }
-    }
+      });
+    const bannersRequest = getHomeBanners(locale)
+      .then((result) => {
+        if (!cancelled) setBanners(result.items || []);
+      })
+      .catch(() => {
+        if (!cancelled) setBanners([]);
+      });
+    const announcementsRequest = getLatestAnnouncements(locale)
+      .then((result) => {
+        if (!cancelled) setAnnouncements(result.items || []);
+      })
+      .catch(() => {
+        if (!cancelled) setAnnouncements([]);
+      });
 
-    loadHomeContent();
+    void Promise.allSettled([configRequest, bannersRequest, announcementsRequest]).then(() => {
+      if (!cancelled) {
+        setLoading(false);
+      }
+    });
+
     return () => {
       cancelled = true;
     };
-  }, [locale]);
+  }, [isInitialized, locale]);
 
   const promoItems = useMemo(() => banners.map(mapBannerToPromoCard), [banners]);
   const noticeItems = useMemo(() => announcements.map(mapAnnouncement), [announcements]);

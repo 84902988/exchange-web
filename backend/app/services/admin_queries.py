@@ -108,11 +108,14 @@ ADMIN_HEARTBEAT_SERVICE_NAMES = {
     "spot_private_event_relay",
     "spot_private_event_subscriber",
     "spot_public_depth_event_subscriber",
-    "dividend_job",
+    "withdraw_tx_watcher",
+    "dividend_auto_scheduler",
 }
 ADMIN_LINUX_ONLY_HEARTBEAT_SERVICE_NAMES = {
     "withdraw_fee_scheduler",
     "collection_auto_scheduler",
+    "withdraw_tx_watcher",
+    "dividend_auto_scheduler",
 }
 ADMIN_PAGINATION_ALLOWED_PER_PAGE = (10, 20, 50, 100)
 
@@ -332,15 +335,22 @@ ADMIN_SERVICE_OVERVIEW_GROUPS = (
                 "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
             },
             {
-                "key": "dividend_job",
-                "name": "dividend job",
+                "key": "withdraw_tx_watcher",
+                "name": "withdraw tx watcher",
+                "type": "Watcher",
+                "expected": "Linux 生产单实例",
+                "impact": "已上链提现的 SUCCESS/FAILED 状态不会继续确认。",
+                "systemd": "exchange-withdraw-tx-watcher.service",
+                "windows": "Windows 开发进程组不启动",
+            },
+            {
+                "key": "dividend_auto_scheduler",
+                "name": "automatic dividend scheduler",
                 "type": "Scheduler",
-                "expected": "可选",
-                "run_mode": "API 进程内嵌（可选）",
-                "impact": "SVIP dividends will not be checked or paid automatically.",
-                "systemd": "embedded in exchange-api.service",
-                "windows": "python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --access-log",
-                "enabled_env": "ENABLE_DIVIDEND_JOB",
+                "expected": "Linux 生产单实例",
+                "impact": "到达后台配置时间后不会自动计算和发放分红。",
+                "systemd": "exchange-dividend-auto-scheduler.service",
+                "windows": "Windows 开发进程组不启动",
             },
         ),
     },
@@ -780,13 +790,10 @@ def admin_query_service_overview() -> Dict[str, Any]:
         for service in group["services"]:
             key = str(service.get("key") or "")
             observed_detail = ""
-            enabled_env = str(service.get("enabled_env") or "").strip()
             platform_disabled = not _admin_service_runtime_enabled(key)
             if platform_disabled:
                 observed = "未启用"
                 observed_detail = "Windows 开发环境不运行；Linux 生产环境由 systemd 管理"
-            elif enabled_env and not _admin_runtime_flag_enabled(enabled_env, default=False):
-                observed = "未启用"
             elif key == "api":
                 observed = "可访问"
             elif key == "redis":
@@ -855,13 +862,6 @@ def _admin_ops_int(value: Any) -> int:
         return int(value or 0)
     except Exception:
         return 0
-
-
-def _admin_runtime_flag_enabled(name: str, *, default: bool = False) -> bool:
-    raw = os.getenv(str(name or "").strip())
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _admin_ops_age_label(age_seconds: Any, fallback: Any = "") -> str:
@@ -1054,11 +1054,18 @@ def admin_query_operations_center() -> Dict[str, Any]:
             "impact": "现货盘口和成交刷新可能延迟",
         },
         {
-            "key": "dividend_job",
-            "name": "dividend job",
-            "description": "SVIP dividend auto job heartbeat.",
-            "impact": "SVIP dividends will not be checked or paid automatically.",
-            "enabled": _admin_runtime_flag_enabled("ENABLE_DIVIDEND_JOB", default=False),
+            "key": "withdraw_tx_watcher",
+            "name": "withdraw tx watcher",
+            "description": "独立确认已上链提现的 SUCCESS/FAILED 状态。",
+            "impact": "已上链提现状态不会继续确认。",
+            "enabled": _admin_service_runtime_enabled("withdraw_tx_watcher"),
+        },
+        {
+            "key": "dividend_auto_scheduler",
+            "name": "自动分红调度",
+            "description": "按后台配置时间自动计算并发放每日分红。",
+            "impact": "每日分红不会自动计算和发放。",
+            "enabled": _admin_service_runtime_enabled("dividend_auto_scheduler"),
         },
     )
     service_rows: list[Dict[str, Any]] = []
@@ -6566,6 +6573,7 @@ def _admin_system_type_label(value: Any) -> str:
         "AUTO": "自动任务",
         "MANUAL": "手动触发",
         "MANUAL_TRIGGER": "手动补跑",
+        "OPS_RECOVERY": "运营补发",
         "FORCE": "强制释放",
         "RETRY": "重试",
         "ADMIN_BATCH": "后台批量",
@@ -6573,6 +6581,8 @@ def _admin_system_type_label(value: Any) -> str:
         "CHECK_DATE": "检查日期",
         "CHECK_POOL": "检查批次",
         "CREATE_POOL": "创建批次",
+        "VERIFY_PREVIEW": "核对补发预览",
+        "RECOVER_SNAPSHOT": "恢复资格快照",
     }
     return labels.get(normalized, normalized or "-")
 
@@ -12932,6 +12942,11 @@ def _admin_dividend_pool_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "dividend_date": str(row.get("dividend_date") or ""),
         "total_fee_usdt": _fmt_admin_amount_display(row.get("total_fee_usdt"), "USDT"),
         "rcb_price_used": _fmt_admin_amount_display(row.get("rcb_price_used"), "USDT"),
+        "rcb_price_snapshot_at": _admin_datetime_display(row.get("rcb_price_snapshot_at")),
+        "rcb_price_source_trade_id": row.get("rcb_price_source_trade_id") or "-",
+        "rcb_price_source_trade_at": _admin_datetime_display(
+            row.get("rcb_price_source_trade_at")
+        ),
         "total_dividend_rcb": _fmt_admin_amount_display(row.get("total_dividend_rcb"), "RCB"),
         "user_count": int(row.get("user_count") or 0),
         "status": status,
@@ -16555,6 +16570,7 @@ def _admin_collection_batch_item(row: Dict[str, Any]) -> Dict[str, Any]:
                 "address_count": row.get("task_aggregate_count") or row.get("total_tasks"),
                 "success_count": row.get("real_success_tasks") if row.get("real_success_tasks") is not None else row.get("success_tasks"),
                 "failed_count": row.get("aggregate_failed_tasks") if row.get("aggregate_failed_tasks") is not None else row.get("failed_tasks"),
+                "canceled_count": row.get("canceled_count"),
                 "processing_count": row.get("processing_count"),
                 "waiting_count": row.get("waiting_count"),
                 "waiting_gas_count": row.get("waiting_gas_count"),
@@ -16922,6 +16938,7 @@ def _collection_task_batch_status(row: Dict[str, Any]) -> tuple[str, str, str]:
     total = int(row.get("address_count") or 0)
     success = int(row.get("success_count") or 0)
     failed = int(row.get("failed_count") or 0)
+    canceled = int(row.get("canceled_count") or 0)
     processing = int(row.get("processing_count") or 0)
     waiting = int(row.get("waiting_count") or 0)
     waiting_gas = int(row.get("waiting_gas_count") or 0)
@@ -16935,6 +16952,13 @@ def _collection_task_batch_status(row: Dict[str, Any]) -> tuple[str, str, str]:
         return "SUCCESS", "已完成", "success"
     if failed > 0:
         return "FAILED", "有失败", "danger"
+    if total > 0 and canceled >= total:
+        return "CANCELED", "已取消", "neutral"
+    batch_status = str(row.get("batch_status") or "").strip().upper()
+    if batch_status in {"CANCELED", "CANCELLED"}:
+        return "CANCELED", "已取消", "neutral"
+    if batch_status == "PARTIAL" and total > 0 and success + failed + canceled >= total:
+        return "PARTIAL", "部分成功", "warning"
     return str(row.get("batch_status") or "PENDING"), "等待中", "neutral"
 
 
@@ -17891,6 +17915,7 @@ def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = Non
                    cta.address_count,
                    cta.real_success_count AS real_success_tasks,
                     cta.failed_count AS aggregate_failed_tasks,
+                    cta.canceled_count,
                     cta.waiting_count,
                     cta.waiting_gas_count,
                     cta.waiting_collection_count,
@@ -17925,6 +17950,7 @@ def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = Non
                 COUNT(DISTINCT LOWER(ct.from_address)) AS address_count,
                 SUM(CASE WHEN UPPER(ct.status) IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') AND LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND NOT (UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYRUN_%' OR UPPER(COALESCE(ct.tx_hash, '')) LIKE 'DRYGAS_%') THEN 1 ELSE 0 END) AS real_success_count,
                 SUM(CASE WHEN UPPER(ct.status) IN ('FAILED', 'ERROR', 'TIMEOUT') THEN 1 ELSE 0 END) AS failed_count,
+                SUM(CASE WHEN UPPER(ct.status) IN ('CANCELED', 'CANCELLED', 'SKIPPED') THEN 1 ELSE 0 END) AS canceled_count,
                 SUM(CASE WHEN LOWER(COALESCE(ct.tx_hash, '')) LIKE '0x%' AND UPPER(ct.status) NOT IN ('CONFIRMED', 'SUCCESS', 'COMPLETED') THEN 1 ELSE 0 END) AS sent_count,
                 SUM(CASE WHEN UPPER(ct.status) IN ('GAS_REQUIRED', 'WAITING_GAS', 'WAIT_GAS', 'GAS_QUEUED', 'GAS_CONFIRMING', 'WAITING_GAS_CONFIRM', 'PENDING_GAS')
                            AND NOT (
@@ -17970,11 +17996,13 @@ def list_collection_batches(db: Session, filters: Optional[Dict[str, Any]] = Non
             {where_sql}
             ORDER BY
               CASE
-                WHEN COALESCE(cta.task_count, collection_batches.total_tasks, 0) <= 0
-                 AND UPPER(COALESCE(collection_batches.status, '')) IN ('CANCELED', 'CANCELLED') THEN 3
-                WHEN COALESCE(cta.real_success_count, collection_batches.success_tasks, 0) >= COALESCE(cta.task_count, collection_batches.total_tasks, 0)
-                 AND COALESCE(cta.task_count, collection_batches.total_tasks, 0) > 0 THEN 2
-                ELSE 0
+                WHEN UPPER(COALESCE(collection_batches.status, '')) IN ('PENDING', 'RUNNING', 'PROCESSING')
+                  OR COALESCE(cta.waiting_count, 0) > 0
+                  OR COALESCE(cta.processing_count, 0) > 0
+                  OR COALESCE(cta.collecting_count, 0) > 0
+                  OR COALESCE(cta.sent_count, 0) > 0
+                THEN 0
+                ELSE 1
               END ASC,
               created_at DESC, id DESC
             LIMIT :limit OFFSET :offset

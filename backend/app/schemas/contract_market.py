@@ -116,6 +116,8 @@ class ContractSymbolItem(BaseModel):
     category: str
     provider: str
     provider_symbol: str
+    base_asset: str
+    base_asset_logo_url: Optional[str] = None
     quote_asset: str
     tp_sl_trigger_price_type: str = "MARK_PRICE"
     closed_market_execution_mode: str = "DISABLED"

@@ -16,6 +16,8 @@ EXPECTED_SERVICES: dict[str, str] = {
     "exchange-rq-gas.service": "scripts/start_rq_worker.py gas",
     "exchange-rq-maintenance.service": "scripts/start_rq_worker.py maintenance",
     "exchange-withdraw-fee-scheduler.service": "scripts/start_withdraw_fee_scheduler.py",
+    "exchange-withdraw-tx-watcher.service": "scripts/start_withdraw_tx_watcher.py",
+    "exchange-dividend-auto-scheduler.service": "scripts/start_dividend_auto_scheduler.py",
     "exchange-collection-auto-scheduler.service": "scripts/start_collection_auto_scheduler.py",
     "exchange-spot-match-worker.service": "scripts/start_spot_match_worker.py",
     "exchange-dealer-loop.service": "scripts/start_dealer_loop.py",

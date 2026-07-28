@@ -1,0 +1,16 @@
+[Unit]
+Description=Capture daily dividend eligibility at the UTC day boundary
+
+[Timer]
+OnCalendar=*-*-* 00:01:00 UTC
+OnCalendar=*-*-* 00:04:00 UTC
+OnCalendar=*-*-* 00:07:00 UTC
+OnCalendar=*-*-* 00:10:00 UTC
+OnCalendar=*-*-* 00:13:00 UTC
+AccuracySec=30s
+RandomizedDelaySec=0
+Persistent=false
+Unit=exchange-dividend-eligibility-snapshot.service
+
+[Install]
+WantedBy=timers.target

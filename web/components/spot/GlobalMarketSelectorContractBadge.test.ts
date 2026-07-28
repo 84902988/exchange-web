@@ -37,7 +37,7 @@ test('parent-provided contract pairs own selector membership over stale module c
   expect(source).toContain('administrator has just disabled');
 });
 
-test('parent-provided spot pairs and favorites cannot be resurrected from stale caches', () => {
+test('parent-provided pairs remain visible while catalog membership revalidates', () => {
   const source = readFileSync(
     resolve(process.cwd(), 'components/spot/GlobalMarketSelector.tsx'),
     'utf8',
@@ -46,7 +46,10 @@ test('parent-provided spot pairs and favorites cannot be resurrected from stale 
   expect(source).toContain("const spotSource = pairs !== undefined && pageType === 'spot'");
   expect(source).toContain('const parentOwnsFavoriteMarket');
   expect(source).toContain('onCatalogRefresh');
-  expect(source).toContain('const catalogMembershipRefreshing');
+  expect(source).toContain('stablePairRows.length === 0');
+  expect(source).toContain('() => isSwitchingWithoutRows');
+  expect(source).toContain('? stablePairRows');
+  expect(source).not.toContain('catalogMembershipRefreshing ? []');
   expect(source).toContain('spotPairsCacheFetchedAtRef.current.clear()');
   expect(source).toContain('contractPairsCacheFetchedAtRef.current.clear()');
 });

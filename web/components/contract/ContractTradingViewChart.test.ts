@@ -266,6 +266,8 @@ test('TIME keeps the native Spot gradient without changing candle or volume colo
   );
   assert.match(chartModule.CONTRACT_CHART_LOADING_OVERLAY_CLASS_NAME, /pointer-events-none/);
   assert.doesNotMatch(chartModule.CONTRACT_CHART_LOADING_OVERLAY_CLASS_NAME, /pointer-events-auto/);
+  assert.match(chartModule.CONTRACT_CHART_LOADING_OVERLAY_CLASS_NAME, /bg-\[#12161c\]/);
+  assert.doesNotMatch(chartModule.CONTRACT_CHART_LOADING_OVERLAY_CLASS_NAME, /bg-\[#12161c\]\/75/);
 });
 
 
@@ -1144,7 +1146,7 @@ test('closed-market ticker reference produces the same TradingView overlay evide
   assert.equal(overlayPrice, 327.5);
 });
 
-test('Kline close remains 99 while last-trade overlay remains 100', () => {
+test('Header reference remains independent while Kline close is 99', () => {
   const candle = { open: 98, high: 101, low: 97, close: 99 };
   const overlayPrice = chartModule.resolveContractTradingViewOverlayPrice(
     makeReferencePrice(100),
@@ -1155,10 +1157,10 @@ test('Kline close remains 99 while last-trade overlay remains 100', () => {
   assert.equal(overlayPrice, 100);
 });
 
-test('current price line follows the symbol-scoped Header price while Kline catches up', () => {
+test('current price line follows the latest Kline once candle authority is ready', () => {
   assert.equal(
     chartModule.resolveContractTradingViewActiveOverlayPrice(4059.3, 4060.08),
-    4060.08,
+    4059.3,
   );
 });
 
@@ -1169,7 +1171,7 @@ test('current price line uses the symbol-scoped Header price until Kline is read
   );
 });
 
-test('current price line falls back to the latest Kline when Header is unavailable', () => {
+test('current price line keeps the latest Kline when Header is unavailable', () => {
   assert.equal(
     chartModule.resolveContractTradingViewActiveOverlayPrice(4059.3, null),
     4059.3,

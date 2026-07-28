@@ -99,7 +99,7 @@ def confirm_collection_task_tx(db: Session, task_id: int) -> TxConfirmResult:
     if not tx_hash:
         task.last_error = "TX_HASH_EMPTY"
         db.flush()
-        return TxConfirmResult("collection", int(task.id), "", "SKIPPED", None, "TX_HASH_EMPTY")
+        return TxConfirmResult("collection", int(task.id), "", "PENDING", None, "TX_HASH_EMPTY")
 
     if tx_hash.startswith("DRYRUN_"):
         mark_collection_task_confirmed(db, int(task.id), block_number=None)
@@ -140,7 +140,7 @@ def confirm_gas_task_tx(db: Session, task_id: int) -> TxConfirmResult:
     if not tx_hash:
         task.last_error = "TX_HASH_EMPTY"
         db.flush()
-        return TxConfirmResult("gas", int(task.id), "", "SKIPPED", None, "TX_HASH_EMPTY")
+        return TxConfirmResult("gas", int(task.id), "", "PENDING", None, "TX_HASH_EMPTY")
 
     if tx_hash.startswith("DRYGAS_"):
         mark_gas_task_confirmed(db, int(task.id), block_number=None)

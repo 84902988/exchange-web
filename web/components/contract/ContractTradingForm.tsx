@@ -232,6 +232,8 @@ export default function ContractTradingForm({
   positions = [],
   positionSummaries = [],
   selectedPrice,
+  executable,
+  reasonCode,
   priceAuthority,
   pricePrecision,
   amountPrecision,
@@ -385,8 +387,11 @@ export default function ContractTradingForm({
       expectedSymbol: symbol,
     }),
   }), [priceAuthority, symbol]);
-  const resolvedExecutable = marketViewAuthority.executable;
-  const resolvedReasonCode = marketViewAuthority.reasonCode;
+  const resolvedExecutable = typeof executable === 'boolean'
+    ? executable
+    : marketViewAuthority.executable;
+  const resolvedReasonCode = String(reasonCode || '').trim()
+    || marketViewAuthority.reasonCode;
   const reasonCodeUnavailable = isUnavailableExecutionReason(resolvedReasonCode);
   const quoteUnavailable = !marketViewPresentation.isTradable || reasonCodeUnavailable;
   const quoteStatusLoading = marketViewPresentation.isLoading;

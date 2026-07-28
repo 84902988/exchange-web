@@ -25,6 +25,7 @@ from app.services.collection_service import (
     find_active_collection_task_duplicate,
     find_active_gas_task_duplicate,
     find_collection_task_by_idempotency,
+    mark_collection_task_wait_gas,
 )
 
 
@@ -734,6 +735,7 @@ def scan_collection_candidates(
     deadline_monotonic: Optional[float] = None,
     candidate_source: str = "events",
     scan_batch_id: str = "",
+    trigger_type: str = "MANUAL",
 ) -> ScanResult:
     """
     Scan collection candidates from configured deposit addresses.
@@ -1099,6 +1101,7 @@ def scan_collection_candidates(
                     token_balance=token_balance,
                     native_balance=native_balance,
                     token_contract_address=row.get("token_contract_address"),
+                    token_decimals=int(row.get("token_decimals") or 18),
                     min_collect_amount=effective_min_collect_amount,
                     db=db,
                 )
@@ -1385,7 +1388,7 @@ def scan_collection_candidates(
             if not batch:
                 batch = create_collection_batch(
                     db,
-                    trigger_type="MANUAL",
+                    trigger_type=trigger_type,
                     target_address=chain_collection_address,
                     chain_key=row_chain_key or chain_key,
                     coin_symbol=candidate.coin_symbol,
@@ -1453,10 +1456,21 @@ def scan_collection_candidates(
                     estimate_source=evaluation.estimate_source,
                 )
                 task.gas_task_id = gas_task.id
+                gas_task_to_link = gas_task
                 if int(gas_task.id) not in pre_gas_task_ids:
                     created_gas_task_count += 1
                     pre_gas_task_ids.add(int(gas_task.id))
                     created_gas_task_ids.append(int(gas_task.id))
+
+            if evaluation.gas_required and gas_task_to_link is not None:
+                gas_symbol = str(gas_task_to_link.gas_coin_symbol or evaluation.gas_coin_symbol or "").strip().upper()
+                gas_amount = Decimal(str(gas_task_to_link.topup_amount or evaluation.gas_topup_amount or 0))
+                mark_collection_task_wait_gas(
+                    db,
+                    int(task.id),
+                    gas_task_id=int(gas_task_to_link.id),
+                    reason=f"WAIT_GAS:{gas_symbol}:{format(gas_amount, 'f')}",
+                )
 
         finally:
             _finalize_single_tool_scan_row(tool_progress, index, scan_batch_id)
@@ -1574,6 +1588,7 @@ def admin_create_collection_tasks(
     limit: int = 200,
     deadline_monotonic: Optional[float] = None,
     candidate_source: str = "events",
+    trigger_type: str = "MANUAL",
 ) -> ScanResult:
     return scan_collection_candidates(
         db,
@@ -1589,4 +1604,5 @@ def admin_create_collection_tasks(
         create_gas_tasks=True,
         deadline_monotonic=deadline_monotonic,
         candidate_source=candidate_source,
+        trigger_type=trigger_type,
     )

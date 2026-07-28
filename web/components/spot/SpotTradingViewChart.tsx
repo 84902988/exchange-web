@@ -2487,7 +2487,7 @@ export default function SpotTradingViewChart({
       ) : null}
       {showChartLoading ? (
         <div
-          className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-[#12161c]/75"
+          className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-[#12161c]"
           style={{
             backgroundImage:
               'linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px)',

@@ -51,6 +51,9 @@ interface TranslationData {
   activity: {
     [key: string]: string;
   };
+  mastercard?: {
+    [key: string]: string;
+  };
 }
 
 // 语言配置类型定义
@@ -163,7 +166,7 @@ export default function useLocale() {
   }, [loadTranslations]);
 
   // 获取翻译文本
-  const t = useCallback(<T extends string>(key: string, namespace: 'common' | 'auth' | 'home' | 'footer' | 'asset' | 'markets' | 'opportunities' | 'user' | 'committee' | 'contracts' | 'activity' = 'common'): T => {
+  const t = useCallback(<T extends string>(key: string, namespace: 'common' | 'auth' | 'home' | 'footer' | 'asset' | 'markets' | 'opportunities' | 'user' | 'committee' | 'contracts' | 'activity' | 'mastercard' = 'common'): T => {
     const activeTranslations = isInitialized ? translations : DEFAULT_TRANSLATIONS;
     const value = activeTranslations[namespace]?.[key];
     if (typeof value === 'string') return value as T;
@@ -181,6 +184,7 @@ export default function useLocale() {
     changeLocale,
     t,
     isLoading,
+    isInitialized,
     availableLocales: ['en', 'zh', 'zh-TW', 'ja'] as Locale[],
     translations,
   };

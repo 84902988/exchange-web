@@ -297,6 +297,8 @@ export type ContractSymbolItem = {
   rowType?: string | null
   provider: string
   provider_symbol: string
+  base_asset?: string | null
+  base_asset_logo_url?: string | null
   quote_asset: string
   tp_sl_trigger_price_type?: ContractTpSlTriggerPriceType | string | null
   closed_market_execution_mode?: 'DISABLED' | 'LAST_GOOD_BBO' | string | null

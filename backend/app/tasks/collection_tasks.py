@@ -49,6 +49,7 @@ from app.services.collection_service import (
     mark_gas_task_sent,
     mark_gas_task_skipped,
     record_collection_task_failure_note,
+    record_gas_task_failure_note,
     refresh_collection_batch_aggregate,
 )
 from app.services.collection_tx_confirm_service import confirm_collection_task_tx, confirm_gas_task_tx
@@ -1395,6 +1396,100 @@ def _record_collection_continue_failure(collection_task_id: int, message: str) -
         db.close()
 
 
+def _worker_unhandled_failure_message(kind: str, exc: Exception) -> str:
+    detail = " ".join(str(exc).split())[:180]
+    suffix = f":{detail}" if detail else ""
+    return f"UNHANDLED_{kind}_EXCEPTION:{type(exc).__name__}{suffix}"
+
+
+def _record_unhandled_collection_task_failure(task_id: int, exc: Exception) -> None:
+    db_note = SessionLocal()
+    try:
+        record_collection_task_failure_note(
+            db_note,
+            int(task_id),
+            _worker_unhandled_failure_message("COLLECTION", exc),
+        )
+        db_note.commit()
+    except Exception:
+        db_note.rollback()
+        logger.exception("failed to persist unhandled collection task failure task_id=%s", task_id)
+    finally:
+        db_note.close()
+
+
+def _record_unhandled_gas_task_failure(task_id: int, exc: Exception) -> None:
+    db_note = SessionLocal()
+    try:
+        record_gas_task_failure_note(
+            db_note,
+            int(task_id),
+            _worker_unhandled_failure_message("GAS", exc),
+        )
+        db_note.commit()
+    except Exception:
+        db_note.rollback()
+        logger.exception("failed to persist unhandled gas task failure task_id=%s", task_id)
+    finally:
+        db_note.close()
+
+
+def _record_tx_confirm_enqueue_failure(task_type: str, task_id: int, message: str) -> None:
+    db_note = SessionLocal()
+    try:
+        normalized_type = str(task_type or "").strip().lower()
+        if normalized_type == "collection":
+            task = db_note.query(CollectionTask).filter(CollectionTask.id == int(task_id)).first()
+        elif normalized_type == "gas":
+            task = db_note.query(GasTask).filter(GasTask.id == int(task_id)).first()
+        else:
+            raise ValueError(f"unsupported tx confirm task type {task_type!r}")
+        if not task or not str(task.tx_hash or "").strip():
+            return
+        task.last_error = _append_last_error(task.last_error, message)
+        task.updated_at = datetime.utcnow()
+        db_note.commit()
+    except Exception:
+        db_note.rollback()
+        logger.exception(
+            "failed to persist tx_confirm enqueue failure task_type=%s task_id=%s",
+            task_type,
+            task_id,
+        )
+    finally:
+        db_note.close()
+
+
+def _commit_sent_and_enqueue_tx_confirm(
+    db: Session,
+    *,
+    task_type: str,
+    task_id: int,
+    dry_run: bool,
+) -> tuple[str | None, str | None]:
+    db.commit()
+    if dry_run:
+        return None, None
+    normalized_type = str(task_type or "").strip().lower()
+    try:
+        if normalized_type == "collection":
+            job_id = enqueue_tx_confirm_collection_task(int(task_id))
+        elif normalized_type == "gas":
+            job_id = enqueue_tx_confirm_gas_task(int(task_id))
+        else:
+            raise ValueError(f"unsupported tx confirm task type {task_type!r}")
+        return job_id, None
+    except Exception as exc:
+        message = f"TX_CONFIRM_ENQUEUE_FAILED:{type(exc).__name__}:{str(exc)[:180]}"
+        _record_tx_confirm_enqueue_failure(normalized_type, int(task_id), message)
+        logger.exception(
+            "failed to enqueue tx_confirm task_type=%s task_id=%s",
+            normalized_type,
+            task_id,
+        )
+        return None, message
+
+
 def enqueue_collection_after_real_gas_confirmed(
     gas_task_id: int,
     *,
@@ -1825,17 +1920,13 @@ def process_collection_task(task_id: int, *, allow_real_send: bool = False) -> d
             db.commit()
             return {"ok": False, "status": CollectionTaskStatus.FAILED.value, "task_id": task.id, "error": send_result.error_message}
         mark_collection_task_sent(db, task.id, send_result.tx_hash)
-        tx_confirm_job_id = None
-        tx_confirm_enqueue_error = None
-        if not send_result.dry_run:
-            try:
-                tx_confirm_job_id = enqueue_tx_confirm_collection_task(int(task.id))
-            except Exception as exc:
-                tx_confirm_enqueue_error = f"TX_CONFIRM_ENQUEUE_FAILED:{type(exc).__name__}:{str(exc)[:180]}"
-                task.last_error = _append_last_error(task.last_error, tx_confirm_enqueue_error)
-                logger.exception("failed to enqueue tx_confirm for collection task %s", task.id)
         task.last_error = _append_last_error(task.last_error, dryrun_note)
-        db.commit()
+        tx_confirm_job_id, tx_confirm_enqueue_error = _commit_sent_and_enqueue_tx_confirm(
+            db,
+            task_type="collection",
+            task_id=int(task.id),
+            dry_run=bool(send_result.dry_run),
+        )
         return {
             "ok": True,
             "status": CollectionTaskStatus.SENT.value,
@@ -1845,8 +1936,9 @@ def process_collection_task(task_id: int, *, allow_real_send: bool = False) -> d
             "tx_confirm_enqueue_error": tx_confirm_enqueue_error,
             "task_id": task.id,
         }
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        _record_unhandled_collection_task_failure(task_id, exc)
         raise
     finally:
         db.close()
@@ -1908,16 +2000,12 @@ def process_gas_task(task_id: int, *, allow_real_send: bool = False) -> dict[str
             db.commit()
             return {"ok": False, "status": GasTaskStatus.FAILED.value, "task_id": task.id, "error": send_result.error_message}
         mark_gas_task_sent(db, task.id, send_result.tx_hash)
-        tx_confirm_job_id = None
-        tx_confirm_enqueue_error = None
-        if not send_result.dry_run:
-            try:
-                tx_confirm_job_id = enqueue_tx_confirm_gas_task(int(task.id))
-            except Exception as exc:
-                tx_confirm_enqueue_error = f"TX_CONFIRM_ENQUEUE_FAILED:{type(exc).__name__}:{str(exc)[:180]}"
-                task.last_error = _append_last_error(task.last_error, tx_confirm_enqueue_error)
-                logger.exception("failed to enqueue tx_confirm for gas task %s", task.id)
-        db.commit()
+        tx_confirm_job_id, tx_confirm_enqueue_error = _commit_sent_and_enqueue_tx_confirm(
+            db,
+            task_type="gas",
+            task_id=int(task.id),
+            dry_run=bool(send_result.dry_run),
+        )
         return {
             "ok": True,
             "status": GasTaskStatus.SENT.value,
@@ -1927,8 +2015,9 @@ def process_gas_task(task_id: int, *, allow_real_send: bool = False) -> dict[str
             "tx_confirm_enqueue_error": tx_confirm_enqueue_error,
             "task_id": task.id,
         }
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        _record_unhandled_gas_task_failure(task_id, exc)
         raise
     finally:
         db.close()

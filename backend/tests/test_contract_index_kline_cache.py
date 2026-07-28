@@ -330,6 +330,19 @@ def test_index_transient_provider_errors_remain_retryable_and_non_terminal() -> 
         assert metadata["history_incomplete"] is True
 
 
+def test_wrapped_timeout_keeps_provider_error_classification() -> None:
+    try:
+        raise TimeoutError("provider read timed out")
+    except TimeoutError as cause:
+        try:
+            raise RuntimeError("iTick stock market request failed") from cause
+        except RuntimeError as wrapped:
+            code, provider = market_kline_cache._classify_provider_error(wrapped)
+
+    assert code == market_kline_cache.KLINE_PROVIDER_ERROR_TIMEOUT
+    assert provider is None
+
+
 def test_index_transient_error_returns_valid_stale_partial_rows_with_metadata() -> None:
     history_end = _ms(2026, 7, 7, 0)
     stale_rows = [_row(_ms(2026, 7, 3, 14)), _row(_ms(2026, 7, 6, 14))]

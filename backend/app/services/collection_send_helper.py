@@ -1,12 +1,18 @@
 ﻿from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
+import hashlib
+import logging
+import threading
 from typing import Any
 from uuid import uuid4
 
 from eth_account import Account
+from sqlalchemy import text
+from web3 import Web3
 
 from app.core.chain_config import get_runtime_chain_config
 from app.services.solana_client import SOLANA_SENDER_DEPENDENCY_ERROR, send_sol_transfer, send_spl_token_transfer
@@ -28,6 +34,11 @@ ERC20_TRANSFER_ABI = [
     }
 ]
 DEFAULT_EIP1559_PRIORITY_FEE_GWEI = "1"
+EVM_NONCE_LOCK_WAIT_SECONDS = 15
+EVM_RPC_BROADCAST_TIMEOUT_SECONDS = 8
+logger = logging.getLogger(__name__)
+_evm_nonce_locks_guard = threading.Lock()
+_evm_nonce_locks: dict[str, tuple[threading.Lock, int]] = {}
 
 
 @dataclass(frozen=True)
@@ -258,8 +269,45 @@ def _evm_fee_fields(w3) -> tuple[dict[str, int], dict[str, int | str | None]]:
     )
 
 
-def _estimate_gas_with_buffer(w3, tx: dict[str, Any]) -> int:
-    estimate = int(w3.eth.estimate_gas(dict(tx)))
+def _is_insufficient_native_funds_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "insufficient funds" in message
+
+
+def _estimate_gas_with_buffer(
+    w3,
+    tx: dict[str, Any],
+    *,
+    allow_unfunded_sender: bool = False,
+) -> int:
+    try:
+        estimate = int(w3.eth.estimate_gas(dict(tx)))
+    except Exception as exc:
+        if not allow_unfunded_sender or not _is_insufficient_native_funds_error(exc):
+            raise
+
+        # Gas-unit estimation does not require charging the sender. Retry without
+        # fee fields first, then use a read-only state override for stricter nodes.
+        fee_neutral_tx = {
+            key: value
+            for key, value in tx.items()
+            if key not in {"gasPrice", "maxFeePerGas", "maxPriorityFeePerGas"}
+        }
+        try:
+            estimate = int(w3.eth.estimate_gas(fee_neutral_tx))
+        except Exception:
+            from_address = tx.get("from")
+            if not from_address:
+                raise exc
+            try:
+                estimate = int(
+                    w3.eth.estimate_gas(
+                        dict(tx),
+                        state_override={from_address: {"balance": hex(10**30)}},
+                    )
+                )
+            except Exception:
+                raise exc
     return max(estimate, int(estimate * 12 / 10), 21000)
 
 
@@ -278,6 +326,7 @@ def _build_erc20_transfer_tx(
     checksum_token: str,
     token,
     value_int: int,
+    allow_unfunded_sender: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int | str | None]]:
     nonce = w3.eth.get_transaction_count(checksum_from, "pending")
     fee_fields, fee_debug = _evm_fee_fields(w3)
@@ -290,15 +339,171 @@ def _build_erc20_transfer_tx(
         "data": _erc20_transfer_data(token, checksum_to, value_int),
         **fee_fields,
     }
-    tx["gas"] = _estimate_gas_with_buffer(w3, tx)
+    tx["gas"] = _estimate_gas_with_buffer(
+        w3,
+        tx,
+        allow_unfunded_sender=allow_unfunded_sender,
+    )
     return tx, fee_debug
 
 
-def _sign_and_broadcast(w3, private_key: str, tx: dict) -> str:
+def _normalize_evm_tx_hash(value: object) -> str:
+    if hasattr(value, "hex"):
+        text_value = str(value.hex())
+    else:
+        text_value = str(value or "")
+    normalized = text_value.strip().lower()
+    if normalized and not normalized.startswith("0x"):
+        normalized = f"0x{normalized}"
+    return normalized
+
+
+def _is_known_transaction_broadcast_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return any(
+        marker in message
+        for marker in (
+            "already known",
+            "known transaction",
+            "already imported",
+            "transaction already exists",
+        )
+    )
+
+
+def _web3_for_broadcast_rpc(rpc_url: str):
+    return Web3(
+        Web3.HTTPProvider(
+            rpc_url,
+            request_kwargs={"timeout": EVM_RPC_BROADCAST_TIMEOUT_SECONDS},
+        )
+    )
+
+
+def _broadcast_raw_transaction_to_rpc_pool(w3, raw_tx: bytes, rpc_urls: list[str]) -> str:
+    expected_hash = _normalize_evm_tx_hash(Web3.keccak(raw_tx))
+    primary_url = str(getattr(getattr(w3, "provider", None), "endpoint_uri", "") or "").strip()
+    clients: list[tuple[str, object]] = [("primary", w3)]
+    seen_urls = {primary_url} if primary_url else set()
+    for index, rpc_url in enumerate(rpc_urls, start=1):
+        url = str(rpc_url or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        clients.append((f"rpc_{index}", _web3_for_broadcast_rpc(url)))
+
+    acknowledged = 0
+    errors: list[str] = []
+    for label, client in clients:
+        try:
+            returned_hash = _normalize_evm_tx_hash(client.eth.send_raw_transaction(raw_tx))
+            if returned_hash and returned_hash != expected_hash:
+                raise ValueError(f"TX_HASH_MISMATCH:{returned_hash[:18]}")
+            acknowledged += 1
+        except Exception as exc:
+            if _is_known_transaction_broadcast_error(exc):
+                acknowledged += 1
+                continue
+            errors.append(f"{label}:{type(exc).__name__}:{str(exc)[:160]}")
+
+    if acknowledged <= 0:
+        raise RuntimeError("EVM_RPC_BROADCAST_FAILED:" + " | ".join(errors)[:700])
+    if errors:
+        logger.warning(
+            "EVM raw transaction broadcast partially acknowledged tx_hash=%s acknowledged=%s total=%s errors=%s",
+            expected_hash,
+            acknowledged,
+            len(clients),
+            errors,
+        )
+    return expected_hash
+
+
+def _sign_and_broadcast(w3, private_key: str, tx: dict, *, rpc_urls: list[str] | None = None) -> str:
     signed = Account.sign_transaction(tx, private_key)
     raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
-    tx_hash = w3.eth.send_raw_transaction(raw_tx)
-    return tx_hash.hex()
+    if raw_tx is None:
+        raise ValueError("SIGNED_RAW_TRANSACTION_MISSING")
+    return _broadcast_raw_transaction_to_rpc_pool(w3, raw_tx, rpc_urls or [])
+
+
+def _evm_nonce_lock_identity(chain_key: str, from_address: str) -> str:
+    digest = hashlib.sha256(f"{chain_key}:{from_address.lower()}".encode("utf-8")).hexdigest()
+    return f"collection_nonce:{digest[:40]}"
+
+
+@contextmanager
+def _process_nonce_send_lock(lock_name: str):
+    with _evm_nonce_locks_guard:
+        current = _evm_nonce_locks.get(lock_name)
+        lock, waiter_count = current if current is not None else (threading.Lock(), 0)
+        _evm_nonce_locks[lock_name] = (lock, waiter_count + 1)
+    try:
+        with lock:
+            yield
+    finally:
+        with _evm_nonce_locks_guard:
+            current_lock, current_count = _evm_nonce_locks.get(lock_name, (lock, 1))
+            if current_lock is lock and current_count <= 1:
+                _evm_nonce_locks.pop(lock_name, None)
+            elif current_lock is lock:
+                _evm_nonce_locks[lock_name] = (lock, current_count - 1)
+
+
+def _database_dialect_name(db) -> str:
+    if db is None:
+        return ""
+    try:
+        return str(db.get_bind().dialect.name or "").strip().lower()
+    except Exception:
+        return ""
+
+
+@contextmanager
+def _evm_nonce_send_lock(*, db, chain_key: str, from_address: str):
+    """Serialize nonce allocation only for the same EVM chain and sender."""
+
+    lock_name = _evm_nonce_lock_identity(chain_key, from_address)
+    lock_connection = None
+    database_lock_acquired = False
+    with _process_nonce_send_lock(lock_name):
+        try:
+            if _database_dialect_name(db) == "mysql":
+                bind = db.get_bind()
+                engine = getattr(bind, "engine", bind)
+                lock_connection = engine.connect()
+                acquired = lock_connection.execute(
+                    text("SELECT GET_LOCK(:lock_name, :wait_seconds)"),
+                    {"lock_name": lock_name, "wait_seconds": EVM_NONCE_LOCK_WAIT_SECONDS},
+                ).scalar()
+                if int(acquired or 0) != 1:
+                    raise TimeoutError(
+                        f"nonce lock timeout chain={chain_key} sender={from_address[:10]}..."
+                    )
+                database_lock_acquired = True
+            yield
+        finally:
+            if lock_connection is not None:
+                try:
+                    if database_lock_acquired:
+                        released = lock_connection.execute(
+                            text("SELECT RELEASE_LOCK(:lock_name)"),
+                            {"lock_name": lock_name},
+                        ).scalar()
+                        if int(released or 0) != 1:
+                            raise RuntimeError(f"nonce lock release failed result={released!r}")
+                except Exception:
+                    logger.exception(
+                        "failed to release evm nonce lock chain=%s sender=%s",
+                        chain_key,
+                        from_address,
+                    )
+                    try:
+                        lock_connection.invalidate()
+                    except Exception:
+                        logger.exception("failed to invalidate evm nonce lock connection")
+                finally:
+                    lock_connection.close()
 
 
 
@@ -419,19 +624,25 @@ def send_native_gas_topup(
     w3 = get_web3_for_chain(ck, db=db)
     checksum_from = w3.to_checksum_address(matched_address)
     checksum_to = w3.to_checksum_address(to_addr)
-    nonce = w3.eth.get_transaction_count(checksum_from, "pending")
-    fee_fields, _fee_debug = _evm_fee_fields(w3)
-    tx = {
-        "from": checksum_from,
-        "to": checksum_to,
-        "value": int(w3.to_wei(send_amount, "ether")),
-        "nonce": int(nonce),
-        "gas": 21000,
-        "chainId": int(w3.eth.chain_id),
-        **fee_fields,
-    }
     try:
-        tx_hash = _sign_and_broadcast(w3, private_key, tx)
+        with _evm_nonce_send_lock(db=db, chain_key=ck, from_address=checksum_from):
+            nonce = w3.eth.get_transaction_count(checksum_from, "pending")
+            fee_fields, _fee_debug = _evm_fee_fields(w3)
+            tx = {
+                "from": checksum_from,
+                "to": checksum_to,
+                "value": int(w3.to_wei(send_amount, "ether")),
+                "nonce": int(nonce),
+                "gas": 21000,
+                "chainId": int(w3.eth.chain_id),
+                **fee_fields,
+            }
+            tx_hash = _sign_and_broadcast(
+                w3,
+                private_key,
+                tx,
+                rpc_urls=_chain_rpc_urls_from_db(db, ck),
+            )
     except Exception as exc:
         return _dependency_result(
             error_message=f"EVM_NATIVE_SEND_FAILED:{str(exc)[:500]}",
@@ -493,6 +704,7 @@ def preview_erc20_collect_transfer_tx(
         checksum_token=checksum_token,
         token=token,
         value_int=value_int,
+        allow_unfunded_sender=True,
     )
     return {
         "chain_key": ck,
@@ -619,15 +831,21 @@ def send_erc20_collect_transfer(
     token = w3.eth.contract(address=checksum_token, abi=ERC20_TRANSFER_ABI)
     value_int = _decimal_to_token_int(send_amount, token_decimals)
     try:
-        tx, _fee_debug = _build_erc20_transfer_tx(
-            w3,
-            checksum_from=checksum_from,
-            checksum_to=checksum_to,
-            checksum_token=checksum_token,
-            token=token,
-            value_int=value_int,
-        )
-        tx_hash = _sign_and_broadcast(w3, private_key, tx)
+        with _evm_nonce_send_lock(db=db, chain_key=ck, from_address=checksum_from):
+            tx, _fee_debug = _build_erc20_transfer_tx(
+                w3,
+                checksum_from=checksum_from,
+                checksum_to=checksum_to,
+                checksum_token=checksum_token,
+                token=token,
+                value_int=value_int,
+            )
+            tx_hash = _sign_and_broadcast(
+                w3,
+                private_key,
+                tx,
+                rpc_urls=_chain_rpc_urls_from_db(db, ck),
+            )
     except Exception as exc:
         return _dependency_result(
             error_message=f"EVM_ERC20_SEND_FAILED:{str(exc)[:500]}",

@@ -518,6 +518,12 @@ SAFE_CANCEL_GAS_STATUSES = {
     GasTaskStatus.FAILED.value,
 }
 
+TERMINAL_GAS_RESCAN_STATUSES = {
+    GasTaskStatus.FAILED.value,
+    GasTaskStatus.SKIPPED.value,
+    GasTaskStatus.CANCELED.value,
+}
+
 
 def _retryable_failed_clause(model):
     return and_(
@@ -708,6 +714,8 @@ def _recompute_batch_status(batch: CollectionBatch) -> None:
         return
     if int(batch.success_tasks or 0) == total:
         batch.status = CollectionBatchStatus.SUCCESS.value
+    elif int(batch.skipped_tasks or 0) == total:
+        batch.status = CollectionBatchStatus.CANCELED.value
     elif int(batch.success_tasks or 0) == 0 and int(batch.failed_tasks or 0) > 0:
         batch.status = CollectionBatchStatus.FAILED.value
     else:
@@ -829,6 +837,9 @@ def refresh_collection_batch_aggregate(db: Session, batch_id: Optional[int]) -> 
         batch.status = "PROCESSING"
         batch.started_at = batch.started_at or now
         batch.finished_at = None
+    elif skipped_tasks == total_tasks:
+        batch.status = CollectionBatchStatus.CANCELED.value
+        batch.finished_at = batch.finished_at or now
     elif failed_tasks:
         batch.status = CollectionBatchStatus.FAILED.value if failed_tasks == total_tasks else CollectionBatchStatus.PARTIAL.value
         batch.finished_at = batch.finished_at or now
@@ -883,6 +894,120 @@ def _get_gas_task(db: Session, task_id: int) -> GasTask:
     if not task:
         raise ValueError(f"gas task not found: {task_id}")
     return task
+
+
+def _terminal_gas_task_can_release_collections(gas_task: GasTask) -> bool:
+    status = str(gas_task.status or "").strip().upper()
+    if status not in TERMINAL_GAS_RESCAN_STATUSES:
+        return False
+    if _has_any_tx_hash(gas_task.tx_hash):
+        return False
+    if status == GasTaskStatus.FAILED.value and gas_task.next_retry_at is not None:
+        return False
+    return True
+
+
+def _release_linked_collections_after_terminal_gas(db: Session, gas_task: GasTask) -> list[int]:
+    if not _terminal_gas_task_can_release_collections(gas_task):
+        return []
+
+    waiting_statuses = {
+        CollectionTaskStatus.GAS_REQUIRED.value,
+        CollectionTaskStatus.GAS_QUEUED.value,
+        "WAITING_GAS",
+        "WAIT_GAS",
+        "GAS_CONFIRMING",
+        "WAITING_GAS_CONFIRM",
+        "PENDING_GAS",
+    }
+    linked_tasks = (
+        db.query(CollectionTask)
+        .filter(CollectionTask.gas_task_id == int(gas_task.id))
+        .filter(CollectionTask.status.in_(waiting_statuses))
+        .filter(CollectionTask.tx_hash.is_(None) | (CollectionTask.tx_hash == ""))
+        .order_by(CollectionTask.id.asc())
+        .all()
+    )
+    if not linked_tasks:
+        return []
+
+    now = _now()
+    gas_status = str(gas_task.status or "").strip().upper()
+    reason = f"GAS_TASK_TERMINAL_RESCAN_REQUIRED:{gas_status}:GAS_TASK_{int(gas_task.id)}"
+    gas_error = " ".join(str(gas_task.last_error or "").split())[:700]
+    released_ids: list[int] = []
+    batch_ids: set[int] = set()
+    for task in linked_tasks:
+        if task.sent_at or task.confirmed_at or task.block_number:
+            continue
+        task.status = CollectionTaskStatus.FAILED.value
+        task.reason = reason[:255]
+        task.last_error = f"{reason}:{gas_error}"[:1000] if gas_error else reason
+        task.next_retry_at = None
+        task.locked_at = None
+        task.updated_at = now
+        released_ids.append(int(task.id))
+        if task.batch_id is not None:
+            batch_ids.add(int(task.batch_id))
+        _queue_collection_task_changed(db, task)
+
+    for batch_id in sorted(batch_ids):
+        refresh_collection_batch_aggregate(db, batch_id)
+    db.flush()
+    return released_ids
+
+
+def reconcile_terminal_gas_required_collection_tasks(
+    db: Session,
+    *,
+    chain_key: str,
+    limit: int = 100,
+) -> list[int]:
+    ck = _normalize_chain_key(chain_key)
+    terminal_gas_tasks = (
+        db.query(GasTask)
+        .join(CollectionTask, CollectionTask.gas_task_id == GasTask.id)
+        .filter(CollectionTask.chain_key == ck)
+        .filter(
+            CollectionTask.status.in_(
+                {
+                    CollectionTaskStatus.GAS_REQUIRED.value,
+                    CollectionTaskStatus.GAS_QUEUED.value,
+                    "WAITING_GAS",
+                    "WAIT_GAS",
+                    "GAS_CONFIRMING",
+                    "WAITING_GAS_CONFIRM",
+                    "PENDING_GAS",
+                }
+            )
+        )
+        .filter(CollectionTask.tx_hash.is_(None) | (CollectionTask.tx_hash == ""))
+        .filter(GasTask.status.in_(TERMINAL_GAS_RESCAN_STATUSES))
+        .filter(GasTask.tx_hash.is_(None) | (GasTask.tx_hash == ""))
+        .filter(
+            or_(
+                GasTask.status.in_({GasTaskStatus.SKIPPED.value, GasTaskStatus.CANCELED.value}),
+                and_(
+                    GasTask.status == GasTaskStatus.FAILED.value,
+                    GasTask.next_retry_at.is_(None),
+                ),
+            )
+        )
+        .order_by(GasTask.updated_at.asc(), GasTask.id.asc())
+        .limit(max(1, int(limit)))
+        .with_for_update()
+        .all()
+    )
+
+    released_ids: list[int] = []
+    seen_gas_task_ids: set[int] = set()
+    for gas_task in terminal_gas_tasks:
+        gas_task_id = int(gas_task.id)
+        if gas_task_id in seen_gas_task_ids:
+            continue
+        seen_gas_task_ids.add(gas_task_id)
+        released_ids.extend(_release_linked_collections_after_terminal_gas(db, gas_task))
+    return released_ids
 
 
 def collection_task_safe_cancel_block_reason(task: CollectionTask, gas_task: Optional[GasTask] = None) -> str:
@@ -1337,6 +1462,27 @@ def record_collection_task_failure_note(db: Session, task_id: int, message: str)
     return task
 
 
+def record_gas_task_failure_note(db: Session, task_id: int, message: str) -> GasTask:
+    task = _get_gas_task(db, task_id)
+    status_value = str(task.status or "").upper()
+    if task.tx_hash or status_value in {
+        GasTaskStatus.SENT.value,
+        GasTaskStatus.CONFIRMING.value,
+        GasTaskStatus.CONFIRMED.value,
+        GasTaskStatus.CANCELED.value,
+    }:
+        return task
+    task.status = GasTaskStatus.FAILED.value
+    task.last_error = (message or "").strip()[:1000] or "gas task failed"
+    task.next_retry_at = None
+    task.locked_at = None
+    task.updated_at = _now()
+    db.flush()
+    _queue_gas_task_changed(db, task)
+    _release_linked_collections_after_terminal_gas(db, task)
+    return task
+
+
 def mark_collection_task_skipped(db: Session, task_id: int, reason: str) -> CollectionTask:
     task = _get_collection_task(db, task_id)
     if task.status in {
@@ -1439,6 +1585,7 @@ def mark_gas_task_failed(
     task.updated_at = _now()
     db.flush()
     _queue_gas_task_changed(db, task)
+    _release_linked_collections_after_terminal_gas(db, task)
     return task
 
 

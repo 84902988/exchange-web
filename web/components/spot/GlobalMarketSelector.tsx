@@ -162,7 +162,7 @@ const CONTRACT_TICKER_REFRESH_TTL_MS = 25_000;
 const STOCK_CONTRACT_TICKER_REFRESH_TTL_MS = 60_000;
 const CONTRACT_TICKER_RESTART_RETRY_MIN_MS = 250;
 const CONTRACT_TICKER_RESTART_RETRY_JITTER_MS = 250;
-const VISIBLE_TICKER_LOAD_DEBOUNCE_MS = 350;
+const PAIR_SELECTOR_ROW_HEIGHT_PX = 58;
 const PAIR_SELECTOR_METADATA_CACHE_TTL_MS = 30_000;
 const MARKET_SELECTOR_CACHE_VERSION = 'v3';
 const FAVORITE_SYMBOLS_STORAGE_KEY = 'exchange_favorite_symbols_v1';
@@ -182,7 +182,11 @@ const contractTickerSubscribers = new Set<() => void>();
 let contractTickerPersistenceSeeded = false;
 
 function isAbortError(error: unknown) {
-  return error instanceof Error && error.name === 'AbortError';
+  if (!(error instanceof Error)) return false;
+  if (error.name === 'AbortError') return true;
+
+  const originalError = (error as Error & { originalError?: unknown }).originalError;
+  return originalError instanceof Error && originalError.name === 'AbortError';
 }
 
 export function isTransientContractTickerStartupError(error: unknown) {
@@ -191,6 +195,30 @@ export function isTransientContractTickerStartupError(error: unknown) {
   return code === 'NETWORK_ERROR'
     || /^HTTP Error 50[234]:/i.test(error.message)
     || /\b(fetch failed|network error|failed to fetch)\b/i.test(error.message);
+}
+
+export function getVisibleTickerPrefetchLimit({
+  scrollTop,
+  clientHeight,
+  pairCount,
+  batchSize,
+}: {
+  scrollTop: number;
+  clientHeight: number;
+  pairCount: number;
+  batchSize: number;
+}): number {
+  const safePairCount = Math.max(0, Math.floor(pairCount));
+  if (safePairCount === 0) return 0;
+
+  const safeBatchSize = Math.max(1, Math.floor(batchSize));
+  const safeScrollTop = Number.isFinite(scrollTop) ? Math.max(0, scrollTop) : 0;
+  const safeClientHeight = Number.isFinite(clientHeight) ? Math.max(0, clientHeight) : 0;
+  const visibleEnd = Math.ceil((safeScrollTop + safeClientHeight) / PAIR_SELECTOR_ROW_HEIGHT_PX);
+  const bufferedEnd = visibleEnd + safeBatchSize;
+  const batchedLimit = Math.ceil(bufferedEnd / safeBatchSize) * safeBatchSize;
+
+  return Math.min(safePairCount, Math.max(safeBatchSize, batchedLimit));
 }
 
 function waitForContractTickerRetry(signal: AbortSignal) {
@@ -1327,7 +1355,6 @@ export default function GlobalMarketSelector({
   const contractTickerFetchedAtRef = useRef<Map<string, number>>(contractTickerFetchedAtStore);
   const contractTickerBatchHydratingRef = useRef<Set<string>>(contractTickerBatchHydratingStore);
   const contractTickerAbortControllersRef = useRef<Set<AbortController>>(new Set());
-  const visibleTickerDebounceRef = useRef<number | null>(null);
   const preloadStartedRef = useRef(false);
   const loadedSpotPairKeysRef = useRef<Set<string>>(new Set());
   const loadedContractPairKeysRef = useRef<Set<string>>(new Set());
@@ -1678,7 +1705,7 @@ export default function GlobalMarketSelector({
                 })));
               }
             } catch (error) {
-              if (!isAbortError(error)) {
+              if (!controller.signal.aborted && !isAbortError(error)) {
                 console.warn('GlobalMarketSelector contract ticker batch warning:', error);
               }
             } finally {
@@ -2143,22 +2170,11 @@ export default function GlobalMarketSelector({
     ));
   }, [contractCategory, favoritePairs, marketTab, pageType, pairItems, pairMatchesSearch, search, spotCategory, stockCategory]);
 
-  const authoritativeCatalogRefreshing =
-    open &&
-    pairs !== undefined &&
-    pairsLoading &&
-    !pairsLoadingMore;
-  const catalogMembershipRefreshing =
-    authoritativeCatalogRefreshing ||
-    (open && activePairsRefreshing && !pairsLoadingMore);
   const showInitialPairsLoading =
-    catalogMembershipRefreshing ||
-    (
-      filteredPairs.length === 0 &&
-      pairItems.length === 0 &&
-      stablePairRows.length === 0 &&
-      (activePairsRefreshing || pairsLoading)
-    );
+    filteredPairs.length === 0 &&
+    pairItems.length === 0 &&
+    stablePairRows.length === 0 &&
+    (activePairsRefreshing || pairsLoading);
 
   const isSwitchingWithoutRows =
     !pairKeyword &&
@@ -2173,13 +2189,10 @@ export default function GlobalMarketSelector({
         !contractPairsCacheRef.current.has(contractPairsCacheKey)));
 
   const displayPairs = useMemo(
-    () => catalogMembershipRefreshing
-      ? []
-      : isSwitchingWithoutRows
-        ? stablePairRows
-        : filteredPairs,
+    () => isSwitchingWithoutRows
+      ? stablePairRows
+      : filteredPairs,
     [
-      catalogMembershipRefreshing,
       filteredPairs,
       isSwitchingWithoutRows,
       stablePairRows,
@@ -2357,34 +2370,22 @@ export default function GlobalMarketSelector({
     setSearch('');
   };
 
-  const scheduleVisibleTickerExpansion = useCallback(() => {
-    if (!['crypto', 'stock', 'cfd', 'favorites'].includes(marketTab) || visibleTickerLimit >= displayPairs.length) {
-      return;
-    }
-    if (visibleTickerDebounceRef.current) {
-      window.clearTimeout(visibleTickerDebounceRef.current);
-    }
-    const increment = marketTab === 'stock' ? STOCK_CONTRACT_TICKER_BATCH_SIZE : SPOT_TICKER_BATCH_SIZE;
-    visibleTickerDebounceRef.current = window.setTimeout(() => {
-      setVisibleTickerLimit((value) => Math.min(value + increment, displayPairs.length));
-      visibleTickerDebounceRef.current = null;
-    }, VISIBLE_TICKER_LOAD_DEBOUNCE_MS);
-  }, [displayPairs.length, marketTab, visibleTickerLimit]);
-
-  useEffect(() => {
-    return () => {
-      if (visibleTickerDebounceRef.current) {
-        window.clearTimeout(visibleTickerDebounceRef.current);
-      }
-    };
-  }, []);
-
   const handleListScroll = (event: React.UIEvent<HTMLDivElement>) => {
     const element = event.currentTarget;
-    const distanceToBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
-    if (distanceToBottom < 140 && ['crypto', 'stock', 'cfd', 'favorites'].includes(marketTab) && visibleTickerLimit < displayPairs.length) {
-      scheduleVisibleTickerExpansion();
+    if (['crypto', 'stock', 'cfd', 'favorites'].includes(marketTab) && visibleTickerLimit < displayPairs.length) {
+      const batchSize = marketTab === 'stock' ? STOCK_CONTRACT_TICKER_BATCH_SIZE : SPOT_TICKER_BATCH_SIZE;
+      const requiredLimit = getVisibleTickerPrefetchLimit({
+        scrollTop: element.scrollTop,
+        clientHeight: element.clientHeight,
+        pairCount: displayPairs.length,
+        batchSize,
+      });
+      if (requiredLimit > visibleTickerLimit) {
+        setVisibleTickerLimit((value) => Math.max(value, requiredLimit));
+      }
     }
+
+    const distanceToBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
     if (distanceToBottom < 80 && hasMorePairs && !activePairsRefreshing && !pairsLoading && !pairsLoadingMore) {
       onLoadMorePairs?.();
     }
@@ -2398,9 +2399,6 @@ export default function GlobalMarketSelector({
     const element = event.currentTarget;
     const hasScrollableContent = element.scrollHeight > element.clientHeight + 1;
     if (!hasScrollableContent) {
-      if (['crypto', 'stock', 'cfd', 'favorites'].includes(marketTab) && visibleTickerLimit < displayPairs.length) {
-        scheduleVisibleTickerExpansion();
-      }
       onLoadMorePairs?.();
     }
   };

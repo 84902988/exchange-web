@@ -212,12 +212,13 @@ from app.services.collection_candidate_scanner import (
 from app.services.collection_chain_helper import compute_min_collect_amount, get_native_gas_coin_symbol
 from app.services.chain_preflight_service import run_chain_preflight
 from app.services.dividend_service import (
+    build_dividend_recovery_preview,
     calculate_dividend_pool,
     create_dividend_pool_skeleton,
     distribute_dividend_pool,
     get_dividend_config,
-    set_dividend_rcb_price_snapshot_time,
-    set_dividend_run_time,
+    list_dividend_recovery_candidates,
+    set_dividend_schedule,
 )
 from app.jobs.dividend_job import process_dividend_job_for_date
 from app.jobs.db_lifecycle_cleanup_job import (
@@ -2751,6 +2752,7 @@ def _build_dealer_risk_page_context(
 
 
 @router.get("", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse, include_in_schema=False)
 def admin_index(request: Request):
     redir = require_admin(request)
     if redir:
@@ -2844,7 +2846,7 @@ def login_submit(
     db.add(admin_user)
     db.commit()
 
-    resp = RedirectResponse(url="/admin", status_code=302)
+    resp = RedirectResponse(url="/admin/dashboard", status_code=302)
     _set_admin_login_cookies(resp, admin_user)
     return resp
 
@@ -13446,8 +13448,11 @@ def dividend_config_submit(
         return redir
 
     try:
-        set_dividend_run_time(db, run_time_utc)
-        set_dividend_rcb_price_snapshot_time(db, rcb_price_snapshot_time)
+        set_dividend_schedule(
+            db,
+            run_time_utc=run_time_utc,
+            rcb_price_snapshot_time_utc=rcb_price_snapshot_time,
+        )
         db.commit()
     except ValueError as exc:
         db.rollback()
@@ -13572,6 +13577,7 @@ def _admin_guard_dividend_pool_finished_date(db: Session, pool_id: int) -> Optio
 def dividend_pools_page(
     request: Request,
     dividend_date: str = "",
+    recovery_date: str = "",
     status: str = "",
     notice: str = "",
     error: str = "",
@@ -13592,6 +13598,21 @@ def dividend_pools_page(
         "page_size": page_size,
     }
     result = admin_query_dividend_pools(db, filters)
+    recovery_candidates = list_dividend_recovery_candidates(db)
+    recovery_preview = None
+    recovery_preview_error = ""
+    selected_recovery_date = _parse_dividend_date_value(recovery_date)
+    if str(recovery_date or "").strip():
+        if selected_recovery_date is None:
+            recovery_preview_error = "补发日期格式不正确"
+        else:
+            try:
+                recovery_preview = build_dividend_recovery_preview(
+                    db,
+                    selected_recovery_date,
+                )
+            except Exception as exc:
+                recovery_preview_error = f"补发预览生成失败：{exc}"
     return render(
         request,
         "admin/dividend_pools.html",
@@ -13604,6 +13625,10 @@ def dividend_pools_page(
             "filters": filters,
             "utc_today": _admin_dividend_utc_today().isoformat(),
             "utc_yesterday": _admin_dividend_utc_yesterday().isoformat(),
+            "recovery_candidates": recovery_candidates,
+            "recovery_preview": recovery_preview,
+            "recovery_preview_error": recovery_preview_error,
+            "selected_recovery_date": str(recovery_date or "").strip(),
             "pagination": {
                 "page": _result_page(result),
                 "page_size": _result_page_size(result),
@@ -13774,12 +13799,15 @@ def dividend_pool_create(
         return _dividend_error_redirect("/admin/dividend-pools", f"创建分红池失败：{exc}")
 
 
+@router.post("/dividend-pools/recover")
+@router.post("/dividends/recover")
 @router.post("/dividend-pools/rerun-auto")
 @router.post("/dividends/rerun-auto")
 def dividend_pool_rerun_auto(
     request: Request,
     dividend_date: str = Form(...),
     confirm_text: str = Form(...),
+    preview_fingerprint: str = Form(""),
     db: Session = Depends(get_db),
 ):
     redir = require_admin_post_permission(request, db, "dividends.distribute")
@@ -13787,7 +13815,7 @@ def dividend_pool_rerun_auto(
         return redir
 
     if str(confirm_text or "").strip() != "EXECUTE":
-        return _dividend_error_redirect("/admin/dividend-pools", "请输入 EXECUTE 确认补跑")
+        return _dividend_error_redirect("/admin/dividend-pools", "请输入 EXECUTE 确认补发")
 
     parsed_date = _parse_dividend_date_value(dividend_date)
     if parsed_date is None:
@@ -13795,16 +13823,23 @@ def dividend_pool_rerun_auto(
     if parsed_date >= _admin_dividend_utc_today():
         return _dividend_error_redirect("/admin/dividend-pools", "只能补跑已结束的 UTC 日期，不能选择今天或未来日期")
 
-    result = process_dividend_job_for_date(parsed_date, trigger_type="MANUAL_TRIGGER")
+    admin_user = get_admin_from_request(request) or {}
+    result = process_dividend_job_for_date(
+        parsed_date,
+        trigger_type="OPS_RECOVERY",
+        recover_missing_snapshot=True,
+        expected_preview_fingerprint=preview_fingerprint,
+        operator_id=admin_user.get("id"),
+    )
     status = str(result.get("status") or "")
     step = str(result.get("step") or "")
     pool_id = result.get("pool_id")
     if not result.get("ok"):
         error = result.get("error") or result.get("message") or status or "FAILED"
-        return _dividend_error_redirect("/admin/dividend-pools", f"补跑失败：{error}")
+        return _dividend_error_redirect("/admin/dividend-pools", f"补发失败：{error}")
 
     pool_text = f"，pool_id={pool_id}" if pool_id else ""
-    notice = f"补跑完成：date={parsed_date.isoformat()}，status={status}，step={step}{pool_text}"
+    notice = f"补发完成：date={parsed_date.isoformat()}，status={status}，step={step}{pool_text}"
     return RedirectResponse(url=f"/admin/dividend-pools?notice={quote(notice)}", status_code=302)
 
 
